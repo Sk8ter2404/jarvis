@@ -65,10 +65,26 @@ Everything here is stdlib and OS-neutral (no win32, no real JARVIS needed):
     import failure → omitted). Nothing here raises into a request handler.
   • The reply-wait is injected as ``reply_reader`` so a test can stub it (no live
     log to tail) — the default reader tails the newest session log.
+  • Everything read from the RUNNING monolith (camera roster, camera gate, live
+    ACTIONS registry) goes through ``runtime`` (default ``LiveRuntime``), which
+    answers only when this process IS the booted JARVIS; a test passes a fake.
+
+CONTROL ROUTES ADDED 2026-09-30 (web audit)
+===========================================
+  GET  /api/camera-tiles   tiles from the LIVE CAMERAS + Kinect switch, each
+                           with the camera gate's verdict (retrying in N …)
+  POST /api/action         run ONE registered action BY NAME (never typed into
+                           the command channel); side-effect / destructive
+                           names need ``"confirm": true`` (_ACTION_CONFIRM_RULES)
+  POST /api/control        the tray control plane (force_wake, enter_standby,
+                           mute/mic/pause toggles, restart) via tray_commands.json
+  GET  /api/panels, GET /api/panel/<id>/state, POST /api/panel/<id>/action,
+  GET  /api/panel/<id>/stream/<name>   skill-declared panels (core/web_panels.py)
 """
 from __future__ import annotations
 
 import glob
+import hmac
 import json
 import os
 import re
@@ -80,7 +96,11 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import zlib
+from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from core import camera_tiles as _camera_tiles
 
 # ── Optional Flask probe (informational only — we NEVER route through it) ───
 # Documented in the module header: Flask is present in this env for the AirTag
@@ -110,10 +130,13 @@ DEFAULT_ACTION_INDEX_PATH = os.path.join(PROJECT_DIR, "docs", "ACTION_INDEX.md")
 # as a 404 so the panel shows its placeholder rather than a frozen last frame.
 _CAMERA_PREVIEW_STALE_S = 5.0
 
-# The per-camera tiles the dashboard can ask for (?cam=). One tuple, used by BOTH
-# the still route and the stream route (see _preview_path_for) so the two can
-# never drift into disagreeing about which names are valid.
-_CAMERA_PREVIEW_CAMS = ("left", "right", "kinect")
+# The per-camera preview keys the dashboard may ask for (?cam=). One tuple, used
+# by BOTH the still route and the stream route (see _preview_path_for) so the two
+# can never drift into disagreeing about which names are valid - and since
+# 2026-09-30 it is the SAME tuple the monolith's preview writer uses
+# (core/camera_tiles.PREVIEW_KEYS), not a second copy. Which of these the Camera
+# tab actually DRAWS comes from the live CAMERAS roster (_camera_tile_list).
+_CAMERA_PREVIEW_CAMS = _camera_tiles.PREVIEW_KEYS
 
 # ── /api/camera-stream (MJPEG) ───────────────────────────────────────────────
 # WHY THIS EXISTS (measured live 2026-09-04, owner: "the preview of webcams is
@@ -208,6 +231,160 @@ def _camera_live_map(cfg: dict) -> dict:
             info = None
         out[cam] = info is not None and info[2] <= _CAMERA_PREVIEW_STALE_S
     return out
+
+
+# ── the RUNNING JARVIS, as seen from the in-process web server ──────────────
+class NoRuntime:
+    """Nothing is known about a running JARVIS: every reader returns None/''
+    and the dashboard falls back to its defaults. What a bare web process, a
+    test, or headless CI sees."""
+
+    live = False
+
+    def cameras(self):
+        return None
+
+    def kinect_enabled(self):
+        return None
+
+    def gate_key(self, cam) -> str:
+        return ""
+
+    def gate_snapshot(self):
+        return None
+
+    def actions(self):
+        return None
+
+    def speak_sets(self):
+        return None
+
+
+class LiveRuntime(NoRuntime):
+    """Reads the RUNNING monolith - and ONLY when this process IS the booted
+    JARVIS.
+
+    WHY THE __main__ CHECK. The server runs in-process with the main loop
+    (skills/web_interface calls create_server inside JARVIS), and the boot
+    aliases ``sys.modules["bobert_companion"] = sys.modules["__main__"]``, so
+    the two being the SAME object is exactly "this is the live assistant". A
+    test that merely imported the monolith (tests/_monolith_harness) has a
+    different ``__main__`` - the test runner - so it reads nothing here
+    instead of a half-configured test copy. Every reader is a plain attribute
+    read (no import, no device I/O) and never raises."""
+
+    @staticmethod
+    def _bc():
+        try:
+            bc = sys.modules.get("bobert_companion")
+            if bc is not None and bc is sys.modules.get("__main__"):
+                return bc
+        except Exception:
+            pass
+        return None
+
+    @property
+    def live(self):  # type: ignore[override]
+        return self._bc() is not None
+
+    def cameras(self):
+        bc = self._bc()
+        cams = getattr(bc, "CAMERAS", None) if bc is not None else None
+        return list(cams) if isinstance(cams, (list, tuple)) else None
+
+    def kinect_enabled(self):
+        bc = self._bc()
+        if bc is None:
+            return None
+        v = getattr(bc, "KINECT_ENABLED", None)
+        return None if v is None else bool(v)
+
+    def gate_key(self, cam) -> str:
+        bc = self._bc()
+        fn = getattr(bc, "_camera_gate_key", None) if bc is not None else None
+        try:
+            return str(fn(cam)) if callable(fn) else ""
+        except Exception:
+            return ""
+
+    def gate_snapshot(self):
+        bc = self._bc()
+        gate = getattr(bc, "_camera_gate", None) if bc is not None else None
+        try:
+            snap = gate.snapshot() if gate is not None else None
+            return snap if isinstance(snap, dict) else None
+        except Exception:
+            return None
+
+    def actions(self):
+        bc = self._bc()
+        acts = getattr(bc, "ACTIONS", None) if bc is not None else None
+        return acts if isinstance(acts, dict) else None
+
+    def speak_sets(self):
+        bc = self._bc()
+        if bc is None:
+            return None
+        return (set(getattr(bc, "SPEAK_RESULT_VERBATIM_ACTIONS", ()) or ()),
+                set(getattr(bc, "INFORMATIVE_ACTIONS", ()) or ()),
+                set(getattr(bc, "SELF_VOICED_ACTIONS", ()) or ()))
+
+
+def _runtime(cfg: dict):
+    rt = cfg.get("runtime") if isinstance(cfg, dict) else None
+    return rt if rt is not None else NoRuntime()
+
+
+def _camera_tile_list(cfg: dict) -> tuple:
+    """``(tiles, source)``: the tiles the Camera tab draws.
+
+    source "live" - built from the running JARVIS's CAMERAS roster plus its
+    Kinect switch (core/camera_tiles.tiles_from_config), so a camera the owner
+    removed from CAMERAS no longer gets a permanently dark tile. source
+    "default" - no running JARVIS to ask (a bare web process, a test): every
+    preview key, exactly the pre-2026-09-30 behaviour. Never raises."""
+    rt = _runtime(cfg)
+    try:
+        cams = rt.cameras()
+        if cams is not None:
+            tiles = _camera_tiles.tiles_from_config(
+                cams, rt.kinect_enabled(), gate_key=rt.gate_key)
+            return tiles, "live"
+    except Exception:
+        pass
+    labels = {"left": "Left webcam", "right": "Right webcam",
+              "kinect": "Kinect (skeleton)"}
+    return ([{"cam": k, "label": labels.get(k, k),
+              "kind": "kinect" if k == _camera_tiles.KINECT_KEY else "webcam",
+              "gate_key": _camera_tiles.KINECT_KEY
+              if k == _camera_tiles.KINECT_KEY else ""}
+             for k in _CAMERA_PREVIEW_CAMS], "default")
+
+
+def _camera_gate_for(cfg: dict, gate_key: str, snapshot=None):
+    """The camera gate's verdict on one device (core/camera_tiles.gate_summary)
+    or None. ``snapshot`` lets a caller share one snapshot across tiles."""
+    if not gate_key:
+        return None
+    if snapshot is None:
+        snapshot = _runtime(cfg).gate_snapshot()
+    return _camera_tiles.gate_summary(snapshot, gate_key)
+
+
+def camera_tiles_payload(cfg: dict) -> dict:
+    """GET /api/camera-tiles: the tiles to draw, each with the camera gate's
+    verdict ({state, message, retry_in_s} or None). One gate snapshot per
+    request - an in-memory read under the gate's own lock, no device I/O -
+    so it is safe on the Camera tab's slow poll."""
+    tiles, source = _camera_tile_list(cfg)
+    snap = _runtime(cfg).gate_snapshot()
+    out = []
+    for t in tiles:
+        row = {k: t[k] for k in ("cam", "label", "kind")}
+        row["gate"] = _camera_gate_for(cfg, t.get("gate_key", ""), snap)
+        out.append(row)
+    return {"tiles": out, "source": source,
+            "keys": list(_CAMERA_PREVIEW_CAMS)}
 
 
 # -- WHY IS THIS TILE BLANK? (one source of truth) ---------------------------
@@ -452,6 +629,15 @@ _CAMERA_REASONS = {
     "open_quiet":      "Kinect is connected but no new pictures are arriving.",
     "unknown":         "Kinect state unknown.",
     "no_path":         "No preview is configured for this camera.",
+    # 2026-09-30 (web audit). The running JARVIS's CAMERAS roster does not
+    # list this camera (or the Kinect is switched off), so nothing will ever
+    # write its preview: say THAT instead of a forever-dark "Webcam off".
+    "not_configured":  "This camera is not in JARVIS's camera list.",
+    # The camera gate (core/camera_gate.py) is deliberately NOT opening this
+    # device right now. The WHY and the countdown come from the gate itself
+    # (core/camera_tiles.gate_summary) and ride in `detail` + `retry_in_s`, so
+    # the words cannot drift from the rule that produced them.
+    "held_by_gate":    "JARVIS is deliberately not opening this camera right now.",
 }
 
 # The bridge's IN-FLIGHT marker, matched as a substring exactly the way the
@@ -471,6 +657,16 @@ def _reason(cam: str, state: str, detail: str | None = None) -> dict:
            "message": _CAMERA_REASONS.get(state, _CAMERA_REASONS["unknown"])}
     if detail:
         out["detail"] = detail
+    return out
+
+
+def _gate_reason(cam: str, gate: dict) -> dict:
+    """The held_by_gate rung: the table sentence, the gate's own explanation
+    as the (visible) detail, and the countdown the tile uses to stop asking
+    until JARVIS itself will try again."""
+    out = _reason(cam, "held_by_gate", detail=gate.get("message") or None)
+    out["gate_state"] = gate.get("state", "")
+    out["retry_in_s"] = gate.get("retry_in_s")
     return out
 
 
@@ -499,10 +695,26 @@ def _camera_off_reason(cfg: dict, cam: str) -> dict:
         if _camera_streams_saturated():
             return _reason(cam, "stream_busy")
         return _reason(cam, "live")
+    # NOT CONFIGURED (2026-09-30). Only when the running JARVIS was actually
+    # asked (source "live"): its roster has no tile for this key, so no preview
+    # will ever be written. A web process with no JARVIS to ask keeps the old
+    # ladder rather than guessing.
+    tiles, source = _camera_tile_list(cfg)
+    by_key = {t["cam"]: t for t in tiles}
+    if source == "live" and cam not in by_key:
+        if cam == "kinect":
+            return _reason(cam, "disabled",
+                           detail="KINECT_ENABLED is off in the running JARVIS")
+        return _reason(cam, "not_configured",
+                       detail="no CAMERAS entry maps to the %s tile" % cam)
+    gate = _camera_gate_for(cfg, (by_key.get(cam) or {}).get("gate_key", ""))
     if cam != "kinect":
         # Webcams expose no health surface at all, so "no recent frame" is
-        # everything that is actually established. Deliberately routed through NO
+        # everything that is actually established - unless the camera GATE is
+        # the reason, which it says itself. Deliberately routed through NO
         # Kinect signal: a dead Kinect must never alter a webcam's tile.
+        if gate:
+            return _gate_reason(cam, gate)
         return _reason(cam, "webcam_off")
 
     health = _kinect_health()
@@ -517,6 +729,13 @@ def _camera_off_reason(cfg: dict, cam: str) -> dict:
     present, _names, how = _kinect_devices_present()
     if present is False:
         return _reason(cam, "not_detected", detail="device enumeration: %s" % how)
+
+    # RUNG 2b (2026-09-30) - the camera GATE is holding the Kinect (its backoff,
+    # the slow dies-on-open retry, a USB-storm cool-down, a quarantine). That is
+    # an established fact about JARVIS's own behaviour, with a countdown, and it
+    # explains the blank tile better than the bridge's latched open error does.
+    if gate:
+        return _gate_reason(cam, gate)
 
     if health is None:
         return _reason(cam, "unknown",
@@ -721,18 +940,34 @@ def _strip_ansi(line: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", line).replace("\x1b", "")
 
 
-def tail_log(log_dir: str, lines: int) -> dict:
+def tail_log(log_dir: str, lines: int, since: int | None = None,
+             log_name: str | None = None) -> dict:
     """Return the last ``lines`` lines of the newest session log as a dict::
 
-        {"log": "<basename or ''>", "lines": [...], "running": bool}
+        {"log": "<basename or ''>", "lines": [...], "running": bool,
+         "offset": <byte offset the next ?since= should use>,
+         "append": bool}
 
     ``running`` is a best-effort liveness flag: the newest log was written to
     within the last 20 s (the loop logs whisper/vad activity constantly). Never
-    raises — a missing logs dir yields an empty tail with running=False."""
+    raises — a missing logs dir yields an empty tail with running=False.
+
+    INCREMENTAL MODE (2026-09-30 audit). With ``since`` (the ``offset`` a
+    previous answer returned) and ``log_name`` still naming the newest log, only
+    the COMPLETE lines written after that offset come back, with
+    ``append: True``, so the page appends them instead of re-rendering the
+    whole view every second (which wiped any text selection the owner was
+    making). A rotated log, a shrunk file or a stale name falls back to a normal
+    tail with ``append: False``."""
     lines = max(1, min(int(lines or 50), _LOG_TAIL_MAX_LINES))
     lg = _newest_log(log_dir)
     if not lg:
-        return {"log": "", "lines": [], "running": False}
+        return {"log": "", "lines": [], "running": False, "offset": 0,
+                "append": False}
+    if since is not None and log_name == os.path.basename(lg):
+        inc = _tail_since(lg, int(since), lines)
+        if inc is not None:
+            return inc
     try:
         # Don't readlines() the ENTIRE (ever-growing) session log every 1s poll —
         # seek to a bounded tail window and split only that. 256KB comfortably
@@ -744,19 +979,56 @@ def tail_log(log_dir: str, lines: int) -> dict:
             size = f.tell()
             f.seek(max(0, size - _LOG_TAIL_WINDOW_BYTES))
             chunk = f.read()
+        # The offset handed back points just past the LAST COMPLETE line, so a
+        # half-written final line is re-read whole by the next ?since= call.
+        cut = chunk.rfind(b"\n") + 1
+        offset = size - (len(chunk) - cut)
         text = chunk.decode("utf-8", errors="replace")
         tail = [_strip_ansi(l) for l in text.splitlines()[-lines:]]
     except Exception:
-        return {"log": os.path.basename(lg), "lines": [], "running": False}
-    try:
-        running = (time.time() - os.path.getmtime(lg)) < 20.0
-    except Exception:
-        running = False
+        return {"log": os.path.basename(lg), "lines": [], "running": False,
+                "offset": 0, "append": False}
     return {
         "log": os.path.basename(lg),
         "lines": [ln.rstrip("\n") for ln in tail],
-        "running": running,
+        "running": _log_running(lg),
+        "offset": offset,
+        "append": False,
     }
+
+
+def _log_running(lg: str) -> bool:
+    try:
+        return (time.time() - os.path.getmtime(lg)) < 20.0
+    except Exception:
+        return False
+
+
+def _tail_since(lg: str, since: int, lines: int) -> dict | None:
+    """The complete lines written to ``lg`` after byte ``since``, or None when
+    the offset no longer fits the file (rotated / truncated) so the caller
+    falls back to a full tail. A burst larger than the tail window is capped to
+    its last ``lines`` lines. Never raises."""
+    try:
+        size = os.path.getsize(lg)
+        if since < 0 or since > size:
+            return None
+        start = max(since, size - _LOG_TAIL_WINDOW_BYTES)
+        with open(lg, "rb") as f:
+            f.seek(start)
+            chunk = f.read(size - start)
+        cut = chunk.rfind(b"\n") + 1          # complete lines only
+        body = chunk[:cut]
+        if start > since:                     # skipped bytes: drop the partial
+            nl = body.find(b"\n")
+            body = body[nl + 1:] if nl >= 0 else b""
+        text = body.decode("utf-8", errors="replace")
+        new = [_strip_ansi(l) for l in text.splitlines()][-lines:]
+        return {"log": os.path.basename(lg), "lines": new,
+                "running": _log_running(lg), "offset": start + cut,
+                "append": True}
+    except Exception:
+        return None
 
 
 def _read_hud_state(hud_state_path: str) -> dict:
@@ -827,18 +1099,30 @@ def build_status(hud_state_path: str, log_dir: str) -> dict:
         "version": _read_version(),
         "state": _awake_state(hud),
         "running": running,
-        "model": hud.get("last_intent_tag", ""),   # best-effort; routing is the real model view
+        # The REAL brain (2026-09-30 audit: this used to be last_intent_tag,
+        # the model's last [intent:x] tag, shown under a "model" label). The
+        # main loop publishes llm_backend ("anthropic" for Claude, else the
+        # resolved local model tag) - the same field the tray's AI menu reads.
+        "model": _model_label(hud),
+        "llm_backend": str(hud.get("llm_backend") or ""),
+        "last_intent_tag": str(hud.get("last_intent_tag") or ""),
         "routing": (_gpu_summary_routing(gpu)),
         "now_playing": hud.get("now_playing", ""),
         "last_spoken": hud.get("last_spoken", ""),
         "last_transcript": hud.get("last_transcript", ""),
         "gpu_lines": gpu["lines"],
         "gpu_bar": gpu["bar"],
+        # Per-card VRAM (the gpu_lines TOTAL sums every card, which hid how full
+        # the LLM card is behind a second, mostly idle one).
+        "gpus": [{k: g.get(k) for k in ("index", "name", "mem_used_mb",
+                                        "mem_total_mb", "util_pct")}
+                 for g in _nvidia_smi_gpus()],
         # Uptime is None (→ omitted client-side) when no timestamped log exists; a
         # float of seconds otherwise. Kept as raw seconds so the client formats it.
         "uptime": _uptime_seconds(log_dir),
         "ts": time.time(),
     }
+    status.update(_status_flags(hud))
     # air-mouse ARMED/ENGAGED is only present when the skill is loaded in THIS
     # process (see _air_mouse_status). Add the field ONLY when reachable so a bare
     # web process / headless CI simply omits it — the strip renders nothing for it
@@ -847,6 +1131,39 @@ def build_status(hud_state_path: str, log_dir: str) -> dict:
     if am is not None:
         status["air_mouse"] = am
     return status
+
+
+def _model_label(hud: dict) -> str:
+    """Human label for the active brain from hud_state's ``llm_backend``:
+    "Claude" for the anthropic backend, else the local model tag itself; ""
+    when the loop has not published it yet."""
+    b = str(hud.get("llm_backend") or "").strip()
+    if not b:
+        return ""
+    return "Claude (cloud)" if b.lower() in ("anthropic", "claude") else b
+
+
+def _status_flags(hud: dict) -> dict:
+    """The control-plane flags the strip shows, straight from hud_state.json
+    (the tray reads the same keys): awake / standby / sleep, mic + TTS mutes,
+    paused daemons, and what the loop is doing right now. ``standby`` is True
+    for BOTH sleep and wake-word standby - either way the main loop drops a
+    typed command that does not start with the wake word."""
+    sleep = bool(hud.get("sleep_mode"))
+    standby = bool(hud.get("standby_mode"))
+    state = str(hud.get("state") or "").strip().lower()
+    asleep = sleep or standby or state in ("standby", "sleep", "sleeping")
+    return {
+        "awake": not asleep,
+        "standby": asleep,
+        "sleep_mode": sleep,
+        "standby_mode": standby,
+        "mic_muted": bool(hud.get("mic_muted")),
+        "tts_muted": bool(hud.get("tts_muted")),
+        "daemons_paused": bool(hud.get("daemons_paused")),
+        "now_doing": str(hud.get("now_doing") or ""),
+        "active_action": str(hud.get("active_action") or ""),
+    }
 
 
 def _gpu_summary_routing(gpu: dict) -> str:
@@ -959,66 +1276,213 @@ def _uptime_seconds(log_dir: str) -> float | None:
 
 # ── inject channel (append with the SAME atomic pattern the loop drains) ─────
 
+# Serialises the read-modify-write of every JSON command queue this server
+# appends to (the inject queue AND tray_commands.json). ThreadingHTTPServer runs
+# each POST on its own thread; without this two concurrent posts could both
+# read the same list, each append their own item, and the second os.replace
+# would silently DROP the first command (2026-09-30 audit, the same class the
+# _SETTINGS_WRITE_LOCK below fixed for settings writes). The monolith's
+# drainer claims the file by RENAME, which is atomic against our replace.
+_QUEUE_WRITE_LOCK = threading.Lock()
+
+
+def _append_json_queue(path: str, item: dict, *, prefix: str,
+                       indent=None) -> None:
+    """Append ``item`` to the JSON list at ``path`` - read, append, write a
+    temp file in the same dir, os.replace - under _QUEUE_WRITE_LOCK. A
+    missing / corrupt / non-list file starts a fresh list (the drainer may have
+    just renamed it away). Raises on a failed write (the caller reports it)."""
+    with _QUEUE_WRITE_LOCK:
+        items: list = []
+        try:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    raw = f.read().strip()
+                if raw:
+                    decoded, _end = json.JSONDecoder().raw_decode(raw)
+                    if isinstance(decoded, list):
+                        items = decoded
+        except Exception:
+            items = []
+        items.append(item)
+        _dir = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp", prefix=prefix)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(items, f, indent=indent)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            raise
+
+
 def inject_command(text: str, inject_path: str) -> None:
     """Append ``{"text": text, "ts": ...}`` to the inject queue atomically.
 
     Read-modify-write under a fresh temp + os.replace so a concurrent
     ``_drain_injected_command`` (which claims the file by renaming it) never sees
-    a half-written array. If the queue was mid-consume (renamed away) we simply
-    start a fresh list — the loop will drain ours next pass. Matches driver.py's
-    ``inject`` and staging_instance's writer."""
-    items: list = []
-    try:
-        if os.path.exists(inject_path):
-            with open(inject_path, encoding="utf-8") as f:
-                raw = f.read().strip()
-            if raw:
-                decoded = json.loads(raw)
-                if isinstance(decoded, list):
-                    items = decoded
-    except Exception:
-        items = []
-    items.append({"text": text, "ts": time.time()})
-    _dir = os.path.dirname(os.path.abspath(inject_path)) or "."
-    fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp", prefix=".webinject_")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(items, f, indent=2)
-        os.replace(tmp, inject_path)
-    except Exception:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
-        raise
+    a half-written array, and under _QUEUE_WRITE_LOCK so two concurrent posts
+    can neither lose nor duplicate an item. If the queue was mid-consume
+    (renamed away) we simply start a fresh list — the loop will drain ours next
+    pass. Matches driver.py's ``inject`` and staging_instance's writer."""
+    _append_json_queue(inject_path, {"text": text, "ts": time.time()},
+                       prefix=".webinject_", indent=2)
+
+
+# The tray control plane (tray.py -> tray_commands.json -> the monolith's 2 Hz
+# _drain_tray_commands_once -> _dispatch_tray_command). It keeps draining in
+# STANDBY and runs BEFORE any LLM call, which is why the dashboard's controls go
+# here rather than through the inject channel. ONLY these commands are
+# accepted from the web (checked against _dispatch_tray_command's own branches);
+# the ones in _TRAY_CONFIRM need "confirm": true.
+TRAY_WEB_COMMANDS = ("force_wake", "enter_standby", "mute_tts_toggle",
+                     "mic_mute_toggle", "pause_daemons_toggle", "restart")
+_TRAY_CONFIRM = frozenset({"restart"})
+DEFAULT_TRAY_COMMANDS_PATH = os.path.join(PROJECT_DIR, "tray_commands.json")
+
+
+def send_tray_command(cmd: str, tray_path: str, **extra) -> None:
+    """Append ``{"cmd": cmd, "ts": ..., **extra}`` to tray_commands.json with
+    the SAME read-append-temp-replace the tray uses (tray._send_command), under
+    _QUEUE_WRITE_LOCK. Raises on a failed write."""
+    item = {"cmd": cmd, "ts": time.time(), "source": "web"}
+    item.update(extra)
+    _append_json_queue(tray_path, item, prefix="tray_web_")
+
+
+# ── reply capture: what JARVIS actually said for ONE injected turn ───────────
+# The loop's lines for a turn look like this (live session log 2026-09-29):
+#
+#   [22:07:44]   [inject] what time is it
+#   [22:07:45]   JARVIS: [ACTION: get_time] One moment, sir.      <- lead-in
+#   [22:07:45]   [action] get_time: current time is 10:07 PM ...  <- result
+#   [22:07:51]   JARVIS: It is 10:07 PM, sir.                     <- the answer
+#   [22:07:55]   [turn-timing] kind=inject outcome=ok ...         <- turn over
+#   [22:07:55] Listening…
+#
+# The old capture returned ~1 s after the FIRST "JARVIS:" line, so the page
+# showed "[ACTION: get_time] One moment, sir." and never the answer (2026-09-30
+# audit, P0). A fallback that replaces the model's words prints
+# "JARVIS (spoken): ..." after the model's line, and THAT is what was said.
+_LOG_TS_PREFIX_RE = re.compile(r"^\s*\[\d{1,2}:\d{2}:\d{2}\]\s*")
+_REPLY_TAG_RE = re.compile(r"\[\s*(?:ACTION|intent)\s*:[^\]]*\]", re.I)
+_TURN_END_RE = re.compile(r"\[turn-timing\]\s+kind=inject\b", re.I)
+_LOOP_IDLE_RE = re.compile(r"^(?:Listening|Standby|Sleeping)\b", re.I)
+_STANDBY_DROP_RE = re.compile(r"^\[(?:standby|sleeping)\]\s+ignored\b", re.I)
+
+
+def _log_body(line: str) -> str:
+    """A log line without its "[HH:MM:SS]" stamp and indentation."""
+    return _LOG_TS_PREFIX_RE.sub("", line or "").strip()
+
+
+def clean_reply_text(text: str) -> str:
+    """Display form of a reply: [ACTION: ...] / [intent: ...] tags removed and
+    whitespace collapsed."""
+    return re.sub(r"\s{2,}", " ", _REPLY_TAG_RE.sub("", text or "")).strip()
+
+
+def parse_turn_lines(lines) -> dict:
+    """Fold one turn's log lines (everything AFTER its [inject] anchor) into
+    ``{"reply", "lines", "actions", "spoken", "ended", "standby"}``.
+
+    reply: what JARVIS said, for display -
+      * a "JARVIS (spoken): X" line REPLACES the model line it follows;
+      * a model line that carried an [ACTION: ...] tag is a LEAD-IN: when the
+        turn produced anything after it (a follow-up answer, or the action's
+        result for a verbatim action) the lead-in is not the reply;
+      * tags are stripped; a turn with no words at all gives ''.
+    lines: every JARVIS / [action] line, cleaned, in order (the transcript).
+    ended: the turn's own end marker was seen ([turn-timing] kind=inject, or
+    the loop going back to Listening / Standby). standby: the loop ignored the
+    command because JARVIS is asleep. Pure; never raises."""
+    said = []            # [(text, is_lead_in)]
+    actions = []
+    shown = []
+    spoken = False
+    ended = False
+    standby = False
+    for raw in lines or ():
+        body = _log_body(raw)
+        if not body:
+            continue
+        low = body.lower()
+        if _TURN_END_RE.search(body) or _LOOP_IDLE_RE.match(body):
+            ended = True
+            break
+        if _STANDBY_DROP_RE.match(body):
+            standby = True
+            ended = True
+            break
+        if low.startswith("jarvis (spoken):"):
+            txt = clean_reply_text(body.split(":", 1)[1])
+            spoken = True
+            if said:
+                said[-1] = (txt, False)       # it REPLACES the model's line
+            else:
+                said.append((txt, False))
+            shown.append("JARVIS (spoken): " + txt)
+        elif low.startswith("jarvis:"):
+            rest = body.split(":", 1)[1]
+            lead = bool(re.search(r"\[\s*action\s*:", rest, re.I))
+            txt = clean_reply_text(rest)
+            said.append((txt, lead))
+            if txt:
+                shown.append("JARVIS: " + txt)
+        elif low.startswith("[action]"):
+            res = body[len("[action]"):].strip()
+            name, _, out = res.partition(":")
+            actions.append({"name": name.strip(), "result": out.strip()})
+            shown.append("[action] " + res)
+    answers = [t for t, lead in said if t and not lead]
+    if answers:
+        reply = "\n".join(answers)
+    elif actions and any(a["result"] for a in actions):
+        reply = "\n".join(a["result"] for a in actions if a["result"])
+    else:
+        reply = "\n".join(t for t, _lead in said if t)
+    return {"reply": reply, "lines": shown, "actions": actions,
+            "spoken": spoken, "ended": ended, "standby": standby}
 
 
 def wait_for_reply(text: str, log_dir: str, timeout: float) -> dict:
-    """Tail the newest session log from its current end and return JARVIS's reply
-    lines for this utterance. Mirrors run-jarvis/driver.py's wait_for_reply, but
-    trimmed to what the web UI needs.
+    """Tail the newest session log from its current end and return what JARVIS
+    said for THIS injected turn.
 
-    Returns ``{"status": "ok"|"accepted"|"no_log", "lines": [...]}``:
-      • ok       — we captured JARVIS:/[action] line(s) for this turn.
-      • accepted — injected, but no reply text landed within the timeout (the
-                   command still ran; we just didn't see spoken output — e.g. a
-                   pure side-effect action, or JARVIS is asleep and dropped it).
-      • no_log   — no session log exists (JARVIS isn't running); the command was
-                   still queued and will fire when it next boots."""
+    Returns ``{"status", "lines", "reply", "actions", "spoken"}``:
+      • status ok       — the turn ran and its end marker was seen (or reply
+                          lines were captured before the timeout);
+               standby  — JARVIS is asleep and IGNORED the command (the loop
+                          logged "[standby] ignored"); nothing ran;
+               accepted — injected, but nothing captured within the timeout
+                          (the command may still run; e.g. a pure side effect);
+               no_log   — no session log exists (JARVIS isn't running); the
+                          command stays queued for the next boot.
+      • reply — the ANSWER, not the lead-in (see parse_turn_lines).
+
+    The capture STARTS at this command's "[inject] <text>" anchor, so another
+    turn's output is never scraped, and ENDS at this turn's own
+    "[turn-timing] kind=inject" line (or the loop's next "Listening…"), which
+    the main loop prints once per injected turn after everything was said. A
+    second "[inject]" line (the next queued command) also ends it."""
     lg = _newest_log(log_dir)
     if not lg:
-        return {"status": "no_log", "lines": []}
+        return {"status": "no_log", "lines": [], "reply": ""}
     try:
         pos = os.path.getsize(lg)
     except Exception:
-        return {"status": "no_log", "lines": []}
-    snippet = text[:30].lower()
+        return {"status": "no_log", "lines": [], "reply": ""}
+    snippet = (text or "")[:30].lower()
     saw_inject = False
-    lines: list[str] = []
+    turn: list[str] = []
+    buf = ""
     deadline = time.time() + max(1.0, min(float(timeout), _REPLY_TIMEOUT_MAX))
     while time.time() < deadline:
-        time.sleep(0.5)
+        time.sleep(0.25)
         try:
             with open(lg, encoding="utf-8", errors="replace") as f:
                 f.seek(pos)
@@ -1026,30 +1490,33 @@ def wait_for_reply(text: str, log_dir: str, timeout: float) -> dict:
                 pos = f.tell()
         except Exception:
             continue
-        for line in chunk.splitlines():
+        buf += chunk
+        if "\n" not in buf:
+            continue
+        complete, buf = buf.rsplit("\n", 1)      # keep a half-written line
+        for line in complete.split("\n"):
             low = line.lower()
-            # The loop prints "  [inject] <text>" (see _capture_utterance) when it
-            # picks up our command — anchor on it so we don't scrape an unrelated
-            # concurrent turn's output. If we never see the anchor we still return
-            # whatever JARVIS:/[action] lines appeared (best-effort).
-            if "[inject]" in low and snippet and snippet in low:
-                saw_inject = True
-                continue
-            if "jarvis:" in low or "[action]" in low:
-                lines.append(line.rstrip())
-        if saw_inject and lines:
-            # Give a beat for a trailing spoken follow-up line to land, then stop.
-            time.sleep(1.0)
-            try:
-                with open(lg, encoding="utf-8", errors="replace") as f:
-                    f.seek(pos)
-                    for line in f.read().splitlines():
-                        if "jarvis:" in line.lower() or "[action]" in line.lower():
-                            lines.append(line.rstrip())
-            except Exception:
-                pass
-            return {"status": "ok", "lines": lines}
-    return {"status": "ok" if lines else "accepted", "lines": lines}
+            if "[inject]" in low:
+                if not saw_inject and snippet and snippet in low:
+                    saw_inject = True
+                    continue
+                if saw_inject:                   # the NEXT command started
+                    turn.append("[turn-timing] kind=inject (next command)")
+                    continue
+            if saw_inject:
+                turn.append(line)
+        if saw_inject:
+            res = parse_turn_lines(turn)
+            if res["ended"]:
+                status = "standby" if res["standby"] else "ok"
+                return {"status": status, "lines": res["lines"],
+                        "reply": res["reply"], "actions": res["actions"],
+                        "spoken": res["spoken"]}
+    res = parse_turn_lines(turn)
+    got = bool(res["lines"])
+    return {"status": "ok" if got else "accepted", "lines": res["lines"],
+            "reply": res["reply"], "actions": res["actions"],
+            "spoken": res["spoken"]}
 
 
 # ── settings bridge (the FULL settings control panel) ───────────────────────
@@ -1610,6 +2077,59 @@ def _disks_info() -> list:
     return disks
 
 
+# CPU% between two polls, from a MODULE-LEVEL cpu_times() baseline.
+#
+# WHY NOT psutil.cpu_percent(interval=None) (2026-09-30 audit, P0: the System
+# tab read "CPU 0%" permanently). psutil keeps that call's baseline PER THREAD,
+# and returns 0.0 on a thread's first call. ThreadingHTTPServer answers every
+# request on a NEW thread, so every /api/system poll was some thread's first
+# call - 0.0, forever. The baseline therefore lives here, shared by every
+# request thread under a lock. Two polls closer than _CPU_MIN_SAMPLE_S reuse
+# the last figure instead of measuring a few ms of noise.
+_CPU_MIN_SAMPLE_S = 0.5
+_cpu_lock = threading.Lock()
+_cpu_state: dict = {"times": None, "at": 0.0, "pct": None}
+
+
+def _cpu_busy_total(t) -> tuple:
+    """(busy, total) seconds from a psutil cpu_times() tuple. Idle (and
+    iowait, where the platform reports it) count as not busy; guest time is
+    already inside user on Linux, so it is not added twice."""
+    fields = getattr(t, "_fields", None) or ()
+    vals = dict(zip(fields, t)) if fields else {}
+    total = sum(v for k, v in vals.items() if k not in ("guest", "guest_nice"))
+    idle = vals.get("idle", 0.0) + vals.get("iowait", 0.0)
+    return total - idle, total
+
+
+def _cpu_percent(psutil_mod, now: float | None = None):
+    """System-wide CPU % since the previous call from ANY thread, or None when
+    no interval has been measured yet (the very first call takes a 0.1 s
+    sample so the tab never opens on a fake 0%). Never raises."""
+    now = time.monotonic() if now is None else now
+    try:
+        with _cpu_lock:
+            st = _cpu_state
+            if st["times"] is not None and (now - st["at"]) < _CPU_MIN_SAMPLE_S:
+                return st["pct"]
+            prev = st["times"]
+            if prev is None:
+                prev = psutil_mod.cpu_times()
+                time.sleep(0.1)
+            cur = psutil_mod.cpu_times()
+            b0, t0 = _cpu_busy_total(prev)
+            b1, t1 = _cpu_busy_total(cur)
+            dt = t1 - t0
+            pct = None
+            if dt > 0:
+                pct = round(max(0.0, min(100.0, 100.0 * (b1 - b0) / dt)), 1)
+            st.update({"times": cur, "at": now,
+                       "pct": pct if pct is not None else st["pct"]})
+            return st["pct"]
+    except Exception:
+        return None
+
+
 def _system_info(hud_state_path: str, log_dir: str) -> dict:
     """The /api/system payload: GPUs (nvidia-smi), CPU/RAM (psutil), disks, plus
     version/uptime/routing reused from the status sources. EVERY field is always
@@ -1618,7 +2138,7 @@ def _system_info(hud_state_path: str, log_dir: str) -> dict:
     cpu_pct = ram_used = ram_total = None
     try:
         import psutil
-        cpu_pct = psutil.cpu_percent(interval=None)   # rolling avg between polls
+        cpu_pct = _cpu_percent(psutil)
         vm = psutil.virtual_memory()
         ram_used = round((vm.total - vm.available) / 1e9, 1)
         ram_total = round(vm.total / 1e9, 1)
@@ -1684,12 +2204,227 @@ def _parse_action_index(path: str) -> dict:
     return {"actions": actions, "count": len(actions)}
 
 
-def _voices_info() -> dict:
+# ── the Actions tab: LIVE registry + dispatch-by-name (2026-09-30 audit) ──────
+#
+# WHY LIVE. docs/ACTION_INDEX.md is generated from the TRACKED sources, goes
+# stale between regenerations, and (by design, since the same day) never lists
+# the owner's locally-installed private skills. The running JARVIS's ACTIONS
+# dict is the truth, so the tab reads it when the server runs inside JARVIS and
+# falls back to the index only for a bare web process.
+#
+# WHY A DEDICATED ENDPOINT. "Send" used to type the bare action NAME into the
+# command channel, where the LLM re-interpreted it (or refused it). POST
+# /api/action calls the registered handler directly - and because that skips
+# the LLM's judgement entirely, side-effect and destructive names need an
+# explicit confirmation first.
+#
+# _ACTION_CONFIRM_RULES is that DENYLIST: fnmatch patterns on the lower-cased
+# name, each with the reason shown in the confirm prompt. A name matching none
+# runs on one click. Deliberately broad - a spurious prompt costs a click, a
+# missing one can message someone or wipe memory.
+_ACTION_CONFIRM_RULES = (
+    (("*shutdown*", "*restart*", "*reboot*", "*hibernate*", "sleep_pc",
+      "*log_off*", "*logoff*", "*sign_out*", "lock_pc", "lock_screen",
+      "*relaunch*"),
+     "stops or restarts JARVIS or the PC"),
+    (("send_*", "*_send", "reply_*", "*_reply", "text_*", "*_text_*",
+      "email_*", "*_email", "sms_*", "call_*", "answer_call", "decline_call",
+      "post_*", "publish_*", "share_*", "notify_*", "message_*", "*_message",
+      "announce_*", "speak_*", "say_*"),
+     "sends or says something to someone"),
+    (("archive_*", "delete_*", "*_delete", "forget_*", "*_forget", "clear_*",
+      "wipe_*", "reset_*", "*_reset", "purge_*", "remove_*", "*_remove",
+      "erase_*", "empty_*", "drop_*", "scrap_*", "uninstall_*", "unenroll_*",
+      "export_memory", "revoke_*"),
+     "deletes, resets or exports data"),
+    (("start_overnight_upgrade", "*upgrade*", "*self_update*", "apply_*",
+      "install_*", "run_shell", "run_code", "execute_*", "*_execute",
+      "*_script", "code_*", "pip_*", "git_*", "rollback*", "*_rollback"),
+     "changes JARVIS's own code or runs code"),
+    (("type", "type_*", "hotkey", "click", "*_click", "press_*", "kill_*",
+      "close_*", "*_close", "stop_pipeline", "web_interface_off", "*_off_all",
+      "force_*", "switch_llm", "switch_model", "set_model", "use_model"),
+     "acts on the desktop or stops a running service"),
+    (("buy_*", "order_*", "pay_*", "purchase_*", "checkout*", "transfer_*"),
+     "spends money"),
+)
+# Handled by the tray control plane's hardened teardown instead of a request
+# thread (a restart spawns a successor and exits this process mid-response).
+_ACTION_VIA_TRAY = ("restart", "shutdown")
+_ACTION_TIMEOUT_S = 20.0
+_ACTION_MIN_GAP_S = 1.0          # per-name double-click guard
+_action_last_call: dict = {}
+_action_rate_lock = threading.Lock()
+
+
+def action_confirm_reason(name: str) -> str:
+    """The confirm-prompt reason for action ``name``, or '' when it may run
+    on one click (see _ACTION_CONFIRM_RULES)."""
+    n = str(name or "").strip().lower()
+    for patterns, why in _ACTION_CONFIRM_RULES:
+        if any(fnmatchcase(n, p) for p in patterns):
+            return why
+    return ""
+
+
+def _log_info(msg: str) -> None:
+    """One stdout line (the live process tees stdout into the session log).
+    For RARE control events only - never per request. Never raises."""
+    try:
+        print(f"  [web] {msg}", flush=True)
+    except Exception:
+        pass
+
+
+def _registry_names(acts) -> list:
+    """A SNAPSHOT of a live dict's keys. A skill reload may resize ACTIONS
+    while we iterate, so retry on the RuntimeError that raises. Never
+    raises."""
+    for _ in range(3):
+        try:
+            return [str(k) for k in list(acts.keys())]
+        except RuntimeError:
+            time.sleep(0.01)
+        except Exception:
+            return []
+    return []
+
+
+def actions_payload(cfg: dict) -> dict:
+    """GET /api/actions: ``{"actions": [{name, spoken, confirm, why}], "count",
+    "source": "live"|"index", "confirm_rules": [...]}``. Never raises."""
+    rules = [{"patterns": list(p), "why": w} for p, w in _ACTION_CONFIRM_RULES]
+    rt = _runtime(cfg)
+    acts = None
+    try:
+        acts = rt.actions()
+    except Exception:
+        acts = None
+    if acts is not None:
+        sets = None
+        try:
+            sets = rt.speak_sets()
+        except Exception:
+            sets = None
+        verbatim, informative, selfv = sets or (set(), set(), set())
+        rows = []
+        for n in sorted(set(_registry_names(acts))):
+            spoken = ("VERBATIM" if n in verbatim else
+                      "INFORMATIVE" if n in informative else
+                      "SELF-VOICED" if n.lower() in selfv else "neither")
+            why = action_confirm_reason(n)
+            rows.append({"name": n, "spoken": spoken, "confirm": bool(why),
+                         "why": why})
+        return {"actions": rows, "count": len(rows), "source": "live",
+                "confirm_rules": rules}
+    out = _parse_action_index(cfg.get("action_index_path", ""))
+    for a in out["actions"]:
+        why = action_confirm_reason(a["name"])
+        a["confirm"], a["why"] = bool(why), why
+    out["source"] = "index"
+    out["confirm_rules"] = rules
+    return out
+
+
+def run_named_action(cfg: dict, name, arg="", *, confirm: bool = False) -> tuple:
+    """``(http_code, payload)`` for POST /api/action. 400 bad input, 503 no
+    live registry in this process, 404 unknown name, 409 confirmation needed,
+    429 the same name again within _ACTION_MIN_GAP_S. Otherwise the handler
+    runs on a daemon thread and we wait up to _ACTION_TIMEOUT_S: status
+    "done" (with its result), "running" (still going - it keeps running), or
+    "error" (it raised). Never raises."""
+    if not isinstance(name, str) or not name.strip() or len(name) > 80:
+        return 400, {"error": "name must be an action name"}
+    name = name.strip()
+    if arg is None:
+        arg = ""
+    if not isinstance(arg, str) or len(arg) > 2000:
+        return 400, {"error": "arg must be a string of at most 2000 chars"}
+    acts = _runtime(cfg).actions()
+    if acts is None:
+        return 503, {"error": "the live action registry is not reachable - "
+                              "this server is not running inside JARVIS"}
+    fn = acts.get(name)
+    if not callable(fn):
+        return 404, {"error": "unknown action", "name": name}
+    why = action_confirm_reason(name)
+    if why and not confirm:
+        return 409, {"error": "confirmation required", "confirm_required": True,
+                     "name": name, "why": why}
+    now = time.monotonic()
+    with _action_rate_lock:
+        last = _action_last_call.get(name)
+        if last is not None and now - last < _ACTION_MIN_GAP_S:
+            return 429, {"error": "already sent - wait a moment",
+                         "retry_after_s": round(_ACTION_MIN_GAP_S - (now - last), 2)}
+        _action_last_call[name] = now
+    if name in _ACTION_VIA_TRAY:
+        try:
+            send_tray_command(name, cfg["tray_commands_path"], arg=arg)
+        except Exception as e:
+            return 500, {"error": f"control write failed: {e}"}
+        _log_info(f"action {name} queued on the tray control plane")
+        return 200, {"ok": True, "status": "queued", "via": "tray",
+                     "name": name}
+    box: dict = {}
+
+    def _run():
+        try:
+            box["result"] = fn(arg)
+        except Exception as e:           # reported, never raised into HTTP
+            box["error"] = f"{type(e).__name__}: {e}"
+
+    t = threading.Thread(target=_run, daemon=True, name="web-action-" + name)
+    t.start()
+    t.join(float(cfg.get("action_timeout_s", _ACTION_TIMEOUT_S)))
+    if t.is_alive():
+        _log_info(f"action {name} started from the dashboard (still running)")
+        return 200, {"ok": True, "status": "running", "name": name,
+                     "result": ""}
+    if "error" in box:
+        _log_info(f"action {name} raised: {box['error']}")
+        return 200, {"ok": False, "status": "error", "name": name,
+                     "error": box["error"]}
+    res = box.get("result")
+    text = res if isinstance(res, str) else ("" if res is None else str(res))
+    _log_info(f"action {name} ran from the dashboard")
+    return 200, {"ok": True, "status": "done", "name": name,
+                 "result": text[:4000]}
+
+
+def _panel_registry(cfg: dict):
+    """The panel registry this server serves: the one create_server was given,
+    else the process-wide core.web_panels.REGISTRY (what the skill loader
+    fills). An import failure degrades to an empty registry. Never raises."""
+    reg = cfg.get("panels") if isinstance(cfg, dict) else None
+    if reg is not None:
+        return reg
+    try:
+        from core import web_panels
+        return web_panels.REGISTRY
+    except Exception:
+        class _Empty:
+            def list_meta(self):
+                return []
+
+            def state(self, _pid):
+                return 404, {"error": "unknown panel"}
+
+            def call_action(self, *_a, **_k):
+                return 404, {"error": "unknown panel"}
+
+            def stream_source(self, *_a):
+                return None
+        return _Empty()
+
+
+def _voices_info(config_mod=None) -> dict:
     """The /api/voices payload: enrolled voice-clone profiles (name/source and a
     ``usable`` flag straight from the consent gate) plus the active profile, the
     master switch, and the base TTS backend/voice — read live from core. Degrades
     to empty/defaults on any import failure (bare CI). READ-ONLY: it lists profile
-    metadata only and never loads the cloning model."""
+    metadata only and never loads the cloning model. ``config_mod`` stands in
+    for core.config (tests)."""
     profiles: list = []
     active = ""
     enabled = False
@@ -1709,21 +2444,70 @@ def _voices_info() -> dict:
             })
     except Exception:
         profiles = []
+    clone_model = clone_device = ai_backend = local_model = ""
     try:
-        from core import config as _config
+        if config_mod is not None:
+            _config = config_mod
+        else:
+            from core import config as _config
         active = getattr(_config, "VOICE_CLONE_PROFILE", "") or ""
         enabled = bool(getattr(_config, "VOICE_CLONE_ENABLED", False))
         tts_backend = getattr(_config, "TTS_BACKEND", "") or ""
         tts_voice = getattr(_config, "TTS_VOICE", "") or ""
+        clone_model = str(getattr(_config, "VOICE_CLONE_MODEL", "") or "")
+        clone_device = str(getattr(_config, "VOICE_CLONE_DEVICE", "") or "")
+        ai_backend = str(getattr(_config, "AI_BACKEND", "") or "")
+        local_model = str(getattr(_config, "LOCAL_LLM_MODEL", "") or "")
     except Exception:
         pass
+    engine, voice = _base_voice(tts_backend, tts_voice)
+    if enabled and active:
+        summary = "clone '%s' via %s" % (active, clone_model or "chatterbox")
+    else:
+        summary = engine + (" · " + voice if voice else "")
     return {
         "profiles":    profiles,
         "active":      active,
         "enabled":     enabled,
         "tts_backend": tts_backend,
+        # tts_voice is the EDGE voice knob only; `voice` is what the ACTIVE
+        # engine actually uses (2026-09-30 audit: the tab said
+        # "normal (en-GB-RyanNeural)" while Kokoro was speaking).
         "tts_voice":   tts_voice,
+        "engine":      engine,
+        "voice":       voice,
+        "summary":     summary,
+        # For the "use a cloned voice" warning: Chatterbox loads on the GPU
+        # beside the local LLM, and with the 26B model resident that is a known
+        # 24 GB VRAM overload on the owner's card.
+        "clone_model":  clone_model,
+        "clone_device": clone_device,
+        "llm_local":    ai_backend.strip().lower() != "claude",
+        "local_model":  local_model,
     }
+
+
+def _base_voice(tts_backend: str, tts_voice: str) -> tuple:
+    """(engine, voice) the NON-clone TTS path is really using. Kokoro's voice
+    is read from the loaded module when present (core.kokoro_tts._VOICE, set
+    from KOKORO_VOICE at import), never assumed from TTS_VOICE, which only the
+    edge backend reads. Never raises."""
+    b = (tts_backend or "").strip().lower()
+    if b == "kokoro":
+        v = ""
+        try:
+            kt = sys.modules.get("core.kokoro_tts")
+            v = str(getattr(kt, "_VOICE", "") or "") if kt else ""
+        except Exception:
+            v = ""
+        return "kokoro", v or os.environ.get("KOKORO_VOICE", "bm_george")
+    if b == "edge":
+        return "edge", tts_voice or ""
+    if b == "xtts":
+        return "xtts", "voice sample clone"
+    if b == "pyttsx3":
+        return "pyttsx3", "system voice"
+    return (b or "unknown"), ""
 
 
 def _read_json_list(path: str) -> list:
@@ -1815,9 +2599,12 @@ def _read_memory() -> dict:
 
 class _Handler(BaseHTTPRequestHandler):
     """Routes: GET / (dashboard), GET /api/status, GET /api/log/tail, GET
-    /api/settings, POST /api/say, POST /api/settings. The owning server pins
-    config onto the class instance via the ``config`` attribute set in
-    ``create_server`` (a small dict) so handlers are stateless beyond it."""
+    /api/settings, the read-only control-panel GETs (system / actions / voices /
+    memory / camera-*), POST /api/say, POST /api/settings, POST /api/action,
+    POST /api/control, and the skill-panel routes (/api/panels, /api/panel/...).
+    The owning server pins config onto the class instance via the ``config``
+    attribute set in ``create_server`` (a small dict) so handlers are stateless
+    beyond it."""
 
     # Per-request socket timeout (seconds). StreamRequestHandler.setup() applies
     # this to the connection, so an under-delivered Content-Length (a client that
@@ -1858,7 +2645,11 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         if is_page and self.server.config.get("local_bind", True):  # type: ignore[attr-defined]
             return True
-        return self._request_token(query) == token
+        # Constant-time compare (2026-09-30 audit): a plain == leaks how many
+        # leading characters matched through its timing.
+        return hmac.compare_digest(
+            self._request_token(query).encode("utf-8", "replace"),
+            token.encode("utf-8", "replace"))
 
     # ── anti-CSRF / anti-DNS-rebinding for state-changing POSTs ──────────────
     @staticmethod
@@ -1936,6 +2727,43 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json({"error": f"cross-origin request refused ({reason})"},
                         code=403)
 
+    # ── security headers on EVERY response (2026-09-30 audit) ────────────────
+    # The page can inject commands, so it must never render inside someone
+    # else's frame (clickjacking: X-Frame-Options + CSP frame-ancestors), must
+    # not be content-sniffed, and nothing it serves - page, JSON, frames - may
+    # be cached. Added in end_headers so a route cannot forget them; a header
+    # a route already sent (e.g. its own Cache-Control) is not duplicated.
+    _SECURITY_HEADERS = (
+        ("X-Frame-Options", "DENY"),
+        ("Content-Security-Policy",
+         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+         "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+         "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+         "object-src 'none'; form-action 'self'"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "same-origin"),
+        ("Cache-Control", "no-store"),
+    )
+
+    def send_response(self, code, message=None):  # noqa: D401 - base API
+        self._sent_header_names = set()
+        super().send_response(code, message)
+
+    def send_header(self, keyword, value):  # noqa: D401 - base API
+        try:
+            self._sent_header_names.add(str(keyword).lower())
+        except AttributeError:
+            self._sent_header_names = {str(keyword).lower()}
+        super().send_header(keyword, value)
+
+    def end_headers(self):  # noqa: D401 - base API
+        sent = getattr(self, "_sent_header_names", set())
+        for k, v in self._SECURITY_HEADERS:
+            if k.lower() not in sent:
+                super().send_header(k, v)
+        self._sent_header_names = set()
+        super().end_headers()
+
     # ── tiny response helpers ────────────────────────────────────────────────
     def _send_json(self, obj: dict, code: int = 200) -> None:
         body = json.dumps(obj).encode("utf-8")
@@ -1955,6 +2783,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -2008,6 +2837,33 @@ class _Handler(BaseHTTPRequestHandler):
         info = _preview_stat(path)
         if info is None or info[2] > _CAMERA_PREVIEW_STALE_S:
             return self._send_json({"error": "no preview"}, code=404)
+
+        def poll(last):
+            info = _preview_stat(path)
+            if info is None or info[2] > _CAMERA_PREVIEW_STALE_S:
+                return "close", None, None   # camera off -> close -> client shows 'off'
+            key = (info[0], info[1])
+            if key == last:
+                return "wait", None, None
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                # Lost the race with the producer's os.replace — try again on
+                # the next tick rather than tearing the stream down.
+                return "wait", None, None
+            if not data:
+                return "wait", None, None
+            return "frame", key, data
+
+        return self._mjpeg_loop(poll)
+
+    def _mjpeg_loop(self, poll, poll_s: float = _CAMERA_STREAM_POLL_S) -> None:
+        """THE multipart/x-mixed-replace writer, shared by the camera tiles and
+        the skill panels' streams (2026-09-30), so both obey one slot cap and
+        one liveness rule. ``poll(last_key)`` returns ``("frame", key, jpeg)``
+        to push, ``("wait", _, _)`` for nothing new, ``("close", _, _)`` to end
+        the stream. Never raises out of the handler."""
         with _camera_stream_clients_lock:
             if _camera_stream_clients[0] >= _CAMERA_STREAM_MAX_CLIENTS:
                 # Refuse rather than hold yet another worker thread hostage; the
@@ -2037,23 +2893,11 @@ class _Handler(BaseHTTPRequestHandler):
                             return
                 except Exception:
                     return
-                info = _preview_stat(path)
-                if info is None or info[2] > _CAMERA_PREVIEW_STALE_S:
-                    return              # camera off -> close -> client shows 'off'
-                key = (info[0], info[1])
-                if key == last:
-                    time.sleep(_CAMERA_STREAM_POLL_S)
-                    continue
-                try:
-                    with open(path, "rb") as f:
-                        data = f.read()
-                except OSError:
-                    # Lost the race with the producer's os.replace — try again on
-                    # the next tick rather than tearing the stream down.
-                    time.sleep(_CAMERA_STREAM_POLL_S)
-                    continue
-                if not data:
-                    time.sleep(_CAMERA_STREAM_POLL_S)
+                verdict, key, data = poll(last)
+                if verdict == "close":
+                    return
+                if verdict != "frame":
+                    time.sleep(poll_s)
                     continue
                 last = key
                 head = (f"--{_CAMERA_STREAM_BOUNDARY}\r\n"
@@ -2072,6 +2916,39 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             with _camera_stream_clients_lock:
                 _camera_stream_clients[0] -= 1
+
+    def _stream_panel(self, source) -> None:
+        """MJPEG for a skill panel's ``streams`` callable (latest JPEG or None).
+        404 when it has no frame at all; the stream closes once it has returned
+        None for longer than the camera staleness window. A source that raises
+        is treated as "no frame". Same slot cap as the camera tiles."""
+        def grab():
+            try:
+                data = source()
+            except Exception:
+                return None
+            return data if isinstance(data, (bytes, bytearray)) and data else None
+
+        if grab() is None:
+            return self._send_json({"error": "no frame"}, code=404)
+        state = {"none_since": None}
+
+        def poll(last):
+            data = grab()
+            now = time.monotonic()
+            if data is None:
+                if state["none_since"] is None:
+                    state["none_since"] = now
+                if now - state["none_since"] > _CAMERA_PREVIEW_STALE_S:
+                    return "close", None, None
+                return "wait", None, None
+            state["none_since"] = None
+            key = (len(data), zlib.crc32(data))
+            if key == last:
+                return "wait", None, None
+            return "frame", key, bytes(data)
+
+        return self._mjpeg_loop(poll, poll_s=0.05)
 
     def _unauthorized(self) -> None:
         self._send_json({"error": "unauthorized"}, code=401)
@@ -2108,7 +2985,14 @@ class _Handler(BaseHTTPRequestHandler):
                 n = int(query.get("lines", ["50"])[0])
             except (TypeError, ValueError):
                 n = 50
-            return self._send_json(tail_log(cfg["log_dir"], n))
+            since = None
+            if "since" in query:
+                try:
+                    since = int(query.get("since", ["0"])[0])
+                except (TypeError, ValueError):
+                    since = None
+            return self._send_json(tail_log(cfg["log_dir"], n, since=since,
+                                            log_name=query.get("log", [""])[0]))
 
         if path == "/api/settings":
             # The FULL settings snapshot: every schema knob + its current value
@@ -2142,11 +3026,30 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authorized(query, is_page=False):
                 return self._unauthorized()
             try:
-                return self._send_json(
-                    _parse_action_index(cfg["action_index_path"]))
+                return self._send_json(actions_payload(cfg))
             except Exception as e:
                 return self._send_json({"error": f"actions read failed: {e}",
                                         "actions": [], "count": 0}, code=500)
+
+        if path == "/api/camera-tiles":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            try:
+                return self._send_json(camera_tiles_payload(cfg))
+            except Exception as e:
+                return self._send_json({"error": f"camera tiles failed: {e}",
+                                        "tiles": [], "source": "error"},
+                                       code=500)
+
+        if path == "/api/panels":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            return self._send_json({"panels": _panel_registry(cfg).list_meta()})
+
+        if path.startswith("/api/panel/"):
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            return self._get_panel(cfg, path, query)
 
         if path == "/api/voices":
             if not self._authorized(query, is_page=False):
@@ -2280,6 +3183,21 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._unauthorized()
             return self._handle_post_settings(cfg)
 
+        if path == "/api/action":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            return self._handle_post_action(cfg)
+
+        if path == "/api/control":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            return self._handle_post_control(cfg)
+
+        if path.startswith("/api/panel/"):
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            return self._post_panel_action(cfg, path)
+
         if path != "/api/say":
             return self._send_json({"error": "not found"}, code=404)
         if not self._authorized(query, is_page=False):
@@ -2320,11 +3238,18 @@ class _Handler(BaseHTTPRequestHandler):
 
         status = res.get("status", "accepted")
         lines = res.get("lines", []) or []
+        # "reply" is the ANSWER (wait_for_reply folds lead-ins, action results
+        # and "JARVIS (spoken):" overrides - see parse_turn_lines); a stub
+        # reader that only returns lines keeps the old joined-lines reply.
+        reply = res.get("reply")
+        if not isinstance(reply, str) or not reply:
+            reply = "\n".join(lines)
         return self._send_json({
-            "accepted": True,
+            "accepted": True,           # queued; status "standby" = ignored
             "status": status,
-            "reply": "\n".join(lines),
+            "reply": reply,
             "reply_lines": lines,
+            "actions": res.get("actions", []) or [],
         })
 
     def _handle_post_settings(self, cfg: dict) -> None:
@@ -2373,199 +3298,369 @@ class _Handler(BaseHTTPRequestHandler):
             "note": SETTINGS_RESTART_NOTE,
         })
 
+    # ── JSON body helper for the control routes ─────────────────────────────
+    def _json_object_body(self, *, require_json_type: bool = False):
+        """(dict, None) or (None, (code, error)). ``require_json_type`` makes
+        a non-JSON Content-Type a 415 - a cross-site HTML form cannot send
+        application/json without a CORS preflight this server never grants."""
+        if require_json_type:
+            ctype = (self.headers.get("Content-Type", "") or "").lower()
+            if "application/json" not in ctype:
+                return None, (415, "Content-Type must be application/json")
+        raw = self._read_body()
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            return None, (400, "invalid JSON body")
+        if not isinstance(data, dict):
+            return None, (400, "body must be a JSON object")
+        return data, None
+
+    # ── POST /api/action — run ONE registered action BY NAME ────────────────
+    def _handle_post_action(self, cfg: dict) -> None:
+        """Body ``{"name": str, "arg"?: str, "confirm"?: true}``. The action is
+        looked up in the LIVE registry and called directly (a daemon thread,
+        bounded wait) - never typed into the command channel, where the bare
+        name used to be re-interpreted by the LLM. Names matching
+        _ACTION_CONFIRM_RULES answer 409 until the call carries confirm:true;
+        restart/shutdown-shaped names go through the tray control plane (the
+        hardened teardown), never a request thread."""
+        data, err = self._json_object_body(require_json_type=True)
+        if err:
+            return self._send_json({"error": err[1]}, code=err[0])
+        code, payload = run_named_action(
+            cfg, data.get("name"), data.get("arg", ""),
+            confirm=data.get("confirm") is True)
+        return self._send_json(payload, code=code)
+
+    # ── POST /api/control — the tray control plane ──────────────────────────
+    def _handle_post_control(self, cfg: dict) -> None:
+        """Body ``{"cmd": one of TRAY_WEB_COMMANDS, "confirm"?: true}``. Appends
+        to tray_commands.json exactly as the tray does, so it works in standby
+        and without the LLM. restart needs confirm:true."""
+        data, err = self._json_object_body(require_json_type=True)
+        if err:
+            return self._send_json({"error": err[1]}, code=err[0])
+        cmd = data.get("cmd")
+        if cmd not in TRAY_WEB_COMMANDS:
+            return self._send_json({"error": "unknown control",
+                                    "allowed": list(TRAY_WEB_COMMANDS)},
+                                   code=400)
+        if cmd in _TRAY_CONFIRM and data.get("confirm") is not True:
+            return self._send_json({"error": "confirmation required",
+                                    "confirm_required": True, "cmd": cmd},
+                                   code=409)
+        try:
+            send_tray_command(cmd, cfg["tray_commands_path"])
+        except Exception as e:
+            return self._send_json({"error": f"control write failed: {e}"},
+                                   code=500)
+        _log_info(f"control {cmd} queued from the web dashboard")
+        return self._send_json({"ok": True, "queued": cmd})
+
+    # ── skill panels (core/web_panels.py) ───────────────────────────────────
+    _PANEL_PATH_RE = re.compile(
+        r"^/api/panel/([a-z0-9][a-z0-9_-]{0,39})/"
+        r"(state|action|stream/([A-Za-z0-9][A-Za-z0-9_.-]{0,39}))$")
+
+    def _get_panel(self, cfg: dict, path: str, query: dict | None = None) -> None:
+        m = self._PANEL_PATH_RE.match(path)
+        if not m or m.group(2) == "action":
+            return self._send_json({"error": "not found"}, code=404)
+        reg = _panel_registry(cfg)
+        pid = m.group(1)
+        if m.group(2) == "state":
+            code, payload = reg.state(pid)
+            return self._send_json(payload, code=code)
+        src = reg.stream_source(pid, m.group(3))
+        if src is None:
+            return self._send_json({"error": "unknown panel stream"}, code=404)
+        if (query or {}).get("still", [""])[0] in ("1", "true"):
+            # One JPEG (the "snapshot" image widget) instead of a stream.
+            try:
+                data = src()
+            except Exception:
+                data = None
+            if not isinstance(data, (bytes, bytearray)) or not data:
+                return self._send_json({"error": "no frame"}, code=404)
+            return self._send_bytes(bytes(data), "image/jpeg")
+        return self._stream_panel(src)
+
+    def _post_panel_action(self, cfg: dict, path: str) -> None:
+        m = self._PANEL_PATH_RE.match(path)
+        if not m or m.group(2) != "action":
+            return self._send_json({"error": "not found"}, code=404)
+        data, err = self._json_object_body(require_json_type=True)
+        if err:
+            return self._send_json({"error": err[1]}, code=err[0])
+        code, payload = _panel_registry(cfg).call_action(
+            m.group(1), data.get("name"), data.get("args", {}),
+            confirm=data.get("confirm") is True)
+        return self._send_json(payload, code=code)
+
 
 # ── the dashboard page (single inline dark, arc-reactor-cyan HTML/JS) ────────
 
-def _dashboard_html(token: str) -> str:
-    """Return the full dashboard page. Inline CSS/JS only (no external fetches),
-    dark theme with arc-reactor cyan accents. Polls /api/status + /api/log/tail
-    once a second and POSTs typed commands to /api/say. The token (if any) is
-    baked into the JS so the page's own API calls carry it."""
-    # Serialize the token as JSON for the JS context it lands in. <script> is an
-    # HTML raw-text element — character references are NOT decoded there — so
-    # html.escape was the WRONG escaper (a token containing &"'<> reached the JS
-    # as &amp;/&quot;/… and every API call 401'd; a backslash produced an
-    # unterminated JS string). json.dumps escapes quotes, backslashes and
-    # control characters correctly for a JS string literal, and the "</" → "<\/"
-    # replacement keeps a token containing "</script>" from terminating the
-    # inline script early ("\/" is a valid JS string escape equal to "/").
-    tok = json.dumps(token or "").replace("</", "<\\/")
-    # NOTE: literal braces in the CSS/JS are doubled because this is an f-string.
-    return f"""<!doctype html>
+# The page is a PLAIN (raw) string, not an f-string: every brace in the CSS/JS
+# is literal, and the one dynamic value - the JSON-serialised token - is
+# spliced into _TOKEN_SLOT by _dashboard_html. (Until 2026-09-30 this was an
+# f-string with every JS/CSS brace doubled, which made each edit a trap.)
+_TOKEN_SLOT = "__JARVIS_TOKEN_JSON__"
+_DASHBOARD_PAGE = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>JARVIS — Live</title>
 <style>
-  :root {{ --cyan:#22d3ee; --cyan-dim:#0e7490; --bg:#05080d; --panel:#0b1420;
-           --edge:#123; --text:#cfe9f2; --muted:#5b7a86; }}
-  * {{ box-sizing:border-box; }}
-  body {{ margin:0; background:radial-gradient(1200px 600px at 50% -10%, #0a1a26 0%, var(--bg) 60%);
-          color:var(--text); font:14px/1.5 ui-monospace,Menlo,Consolas,monospace; }}
-  /* flex-wrap: at <~780px the 7 nav tabs used to run off-screen with no
-     wrap or scroll — Settings/Memory were unreachable on narrow windows
-     (audit finding 2026-07-10). */
-  header {{ display:flex; align-items:center; gap:14px; padding:14px 18px;
-            border-bottom:1px solid var(--edge); position:sticky; top:0;
-            background:rgba(5,8,13,.9); backdrop-filter:blur(6px);
-            flex-wrap:wrap; }}
-  .reactor {{ width:22px; height:22px; border-radius:50%;
+  /* --muted was #5b7a86 (4.3:1 on the page background - under the 4.5:1 WCAG
+     AA floor for body text, 2026-09-30 audit); #86a3ae is ~7:1. */
+  :root { --cyan:#22d3ee; --cyan-dim:#0e7490; --bg:#05080d; --panel:#0b1420;
+           --edge:#1b3040; --text:#cfe9f2; --muted:#86a3ae; --warn:#f5b942;
+           --bad:#ff6b6b; --good:#2ee6a6; color-scheme:dark; }
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body { margin:0; min-height:100vh;
+          background:var(--bg) radial-gradient(1200px 600px at 50% -10%, #0a1a26 0%, var(--bg) 60%) no-repeat;
+          color:var(--text); font:14px/1.5 ui-monospace,Menlo,Consolas,monospace; }
+  /* THE PHONE LAYOUT (2026-09-30 audit). At 390 px the page was 583 px wide
+     and the tabs sat off-screen: flex-wrap was on <header>, so the whole
+     <nav> wrapped as ONE unbreakable 560 px item. The nav now scrolls
+     horizontally inside its own row (min-width:0 lets it shrink below its
+     content), and the sticky header stays two short rows on a phone. */
+  header { display:flex; align-items:center; gap:10px 14px; padding:10px 18px;
+            border-bottom:1px solid var(--edge); position:sticky; top:0; z-index:20;
+            background:rgba(5,8,13,.94); backdrop-filter:blur(6px);
+            flex-wrap:wrap; }
+  .reactor { width:22px; height:22px; border-radius:50%; flex:0 0 auto;
               background:radial-gradient(circle at 50% 50%, #eafcff, var(--cyan) 45%, var(--cyan-dim) 70%, #04222b 100%);
-              box-shadow:0 0 12px var(--cyan), 0 0 28px var(--cyan-dim); }}
-  h1 {{ font-size:15px; margin:0; letter-spacing:.28em; color:var(--cyan); }}
-  .wrap {{ max-width:1000px; margin:0 auto; padding:16px 18px; }}
-  .strip {{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px; }}
-  .chip {{ background:var(--panel); border:1px solid var(--edge); border-radius:8px;
-           padding:8px 12px; min-width:120px; }}
-  .chip .k {{ color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.12em; }}
-  .chip .v {{ color:var(--cyan); font-size:15px; margin-top:2px; word-break:break-word; }}
-  .dot {{ display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px;
-          background:#666; vertical-align:middle; }}
-  .dot.on {{ background:#2ee6a6; box-shadow:0 0 8px #2ee6a6; }}
-  #log {{ background:#04070c; border:1px solid var(--edge); border-radius:8px;
+              box-shadow:0 0 12px var(--cyan), 0 0 28px var(--cyan-dim); }
+  h1 { font-size:15px; margin:0; letter-spacing:.28em; color:var(--cyan); white-space:nowrap; }
+  .hdr-right { margin-left:auto; order:2; display:flex; align-items:center; gap:12px; }
+  .wrap { max-width:1000px; margin:0 auto; padding:16px 18px 96px; }
+  .strip { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:12px; }
+  .chip { background:var(--panel); border:1px solid var(--edge); border-radius:8px;
+           padding:8px 12px; min-width:120px; flex:0 1 auto; max-width:100%; }
+  .chip .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.12em; }
+  .chip .v { color:var(--cyan); font-size:15px; margin-top:2px; word-break:break-word; }
+  .chip.warn { border-color:#7a5a12; } .chip.warn .v { color:var(--warn); }
+  .chip.bad { border-color:#7a2222; } .chip.bad .v { color:var(--bad); }
+  .chip.wide { flex:1 1 260px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px;
+          background:#666; vertical-align:middle; }
+  .dot.on { background:var(--good); box-shadow:0 0 8px var(--good); }
+  .banner { border:1px solid #7a5a12; background:#1a1405; color:var(--warn);
+            border-radius:10px; padding:10px 14px; margin:0 0 12px; display:flex;
+            flex-wrap:wrap; align-items:center; gap:10px; }
+  .banner[hidden] { display:none; }
+  #log { background:#04070c; border:1px solid var(--edge); border-radius:8px;
           height:52vh; overflow:auto; padding:10px 12px; white-space:pre-wrap;
-          font-size:12.5px; color:#a9c7d1; }}
-  #log .a {{ color:var(--cyan); }}
-  #log .j {{ color:#eafcff; }}
-  form {{ display:flex; gap:8px; margin-top:14px; }}
-  input[type=text] {{ flex:1; background:#04070c; border:1px solid var(--edge);
-           color:var(--text); border-radius:8px; padding:11px 12px; font:inherit; }}
-  input[type=text]:focus {{ outline:none; border-color:var(--cyan); box-shadow:0 0 0 1px var(--cyan-dim); }}
-  button {{ background:var(--cyan-dim); color:#eafcff; border:1px solid var(--cyan);
-            border-radius:8px; padding:0 18px; font:inherit; cursor:pointer; }}
-  button:hover {{ background:var(--cyan); color:#04222b; }}
-  button:disabled {{ opacity:.5; cursor:default; }}
+          font-size:12.5px; color:#a9c7d1; }
+  #log .ln { min-height:1.2em; }
+  #log .a { color:var(--cyan); }
+  #log .j { color:#eafcff; }
+  #log.hide-noise .noise { display:none; }
+  #log .ln[hidden] { display:none; }
+  .logbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:8px 0; }
+  .logbar .search { flex:1 1 200px; margin:0; }
+  form { display:flex; gap:8px; margin-top:14px; }
+  input[type=text] { flex:1; min-width:0; background:#04070c; border:1px solid var(--edge);
+           color:var(--text); border-radius:8px; padding:11px 12px; font:inherit; }
+  input[type=text]:focus { outline:none; border-color:var(--cyan); box-shadow:0 0 0 1px var(--cyan-dim); }
+  button { background:var(--cyan-dim); color:#eafcff; border:1px solid var(--cyan);
+            border-radius:8px; padding:0 18px; min-height:36px; font:inherit; cursor:pointer; }
+  button:hover { background:var(--cyan); color:#04222b; }
+  button:disabled { opacity:.5; cursor:default; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid var(--cyan); outline-offset:2px; }
+  button.danger { background:transparent; color:var(--bad); border-color:#a33; }
+  button.danger:hover { background:#a33; color:#fff; }
+  button.on { background:var(--cyan); color:#04222b; }
   /* Quick-action row: a horizontal, wrapping strip of preset-command buttons.
      They reuse the base button look but are smaller/pill-shaped and ghosted
      (transparent fill) so the primary Send button stays the visual anchor. */
-  .actions {{ display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 6px; }}
-  .actions button {{ padding:7px 13px; font-size:12.5px; border-radius:999px;
-            background:transparent; color:var(--cyan); }}
-  .actions button:hover {{ background:var(--cyan); color:#04222b; }}
+  .actions, .controls { display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 8px; }
+  .actions button, .controls button { padding:7px 13px; min-height:34px; font-size:12.5px; border-radius:999px;
+            background:transparent; color:var(--cyan); }
+  .actions button:hover, .controls button:hover { background:var(--cyan); color:#04222b; }
+  .controls button.on { background:#3a2a05; color:var(--warn); border-color:var(--warn); }
+  .controls button.danger { color:var(--bad); border-color:#a33; }
   /* Auto-refresh toggle in the header — a small inline checkbox + label. */
-  .toggle {{ display:inline-flex; align-items:center; gap:6px; color:var(--muted);
-            font-size:12px; cursor:pointer; user-select:none; }}
-  .toggle input {{ accent-color:var(--cyan); cursor:pointer; }}
-  #reply {{ margin-top:10px; color:#eafcff; min-height:1.4em; }}
-  .muted {{ color:var(--muted); }}
-  /* ── Settings panel ──────────────────────────────────────────────────────
-     A second "view" under the live dashboard. The nav toggles which of the two
-     sections (live / settings) is visible; only one shows at a time so the page
-     stays a single self-contained screen. Same dark arc-reactor-cyan palette. */
-  nav.views {{ display:flex; gap:8px; margin-left:18px; }}
-  nav.views button {{ padding:6px 14px; font-size:12.5px; border-radius:999px;
-            background:transparent; color:var(--cyan); }}
-  nav.views button.active {{ background:var(--cyan); color:#04222b; }}
-  .view[hidden] {{ display:none; }}
+  .toggle { display:inline-flex; align-items:center; gap:6px; color:var(--muted);
+            font-size:12px; cursor:pointer; user-select:none; }
+  .toggle input { accent-color:var(--cyan); cursor:pointer; }
+  #reply { margin-top:10px; color:#eafcff; min-height:1.4em; white-space:pre-wrap; }
+  .muted { color:var(--muted); }
+  .sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+  /* ── Views ───────────────────────────────────────────────────────────────
+     The nav toggles which section is visible; only one shows at a time so the
+     page stays a single self-contained screen. Same arc-reactor-cyan palette. */
+  nav.views { order:1; display:flex; gap:8px; flex:1 1 auto; min-width:0; max-width:100%;
+            flex-wrap:nowrap; overflow-x:auto; overscroll-behavior-x:contain;
+            -webkit-overflow-scrolling:touch; scrollbar-width:thin; padding:2px 0; }
+  nav.views button { flex:0 0 auto; padding:6px 14px; min-height:32px; font-size:12.5px; border-radius:999px;
+            background:transparent; color:var(--cyan); white-space:nowrap; }
+  nav.views button.active { background:var(--cyan); color:#04222b; }
+  .view[hidden] { display:none; }
   /* The prominent wake-word switch sits at the top of Settings so it's the first
      thing the owner sees (the headline "do it all from the web" control). */
-  .wakebanner {{ background:linear-gradient(90deg, #0b1a26, var(--panel));
+  .wakebanner { background:linear-gradient(90deg, #0b1a26, var(--panel));
             border:1px solid var(--cyan-dim); border-radius:10px;
             padding:14px 16px; margin-bottom:16px; display:flex;
-            align-items:center; gap:14px; flex-wrap:wrap; }}
-  .wakebanner .lbl {{ color:var(--cyan); font-size:14px; letter-spacing:.06em; }}
-  .wakebanner .hint {{ color:var(--muted); font-size:12px; flex-basis:100%; }}
+            align-items:center; gap:14px; flex-wrap:wrap; }
+  .wakebanner .lbl { color:var(--cyan); font-size:14px; letter-spacing:.06em; }
+  .wakebanner .hint { color:var(--muted); font-size:12px; flex-basis:100%; }
   /* Each tab-group of settings is a titled card; rows stack inside it. */
-  .sgroup {{ background:var(--panel); border:1px solid var(--edge);
-            border-radius:10px; padding:6px 14px 12px; margin-bottom:14px; }}
-  .sgroup > h2 {{ font-size:12px; text-transform:uppercase; letter-spacing:.16em;
-            color:var(--muted); margin:12px 2px 8px; }}
-  .srow {{ display:flex; align-items:flex-start; gap:12px; padding:9px 2px;
-            border-top:1px solid #0c1a24; flex-wrap:wrap; }}
-  .srow:first-of-type {{ border-top:none; }}
-  .srow .meta {{ flex:1 1 260px; min-width:220px; }}
-  .srow .meta .name {{ color:var(--text); }}
-  .srow .meta .help {{ color:var(--muted); font-size:12px; margin-top:2px; }}
-  .srow .ctl {{ flex:0 0 auto; display:flex; align-items:center; gap:8px; }}
-  .srow .ctl input[type=text], .srow .ctl input[type=number], .srow .ctl select {{
+  .sgroup { background:var(--panel); border:1px solid var(--edge);
+            border-radius:10px; padding:6px 14px 12px; margin-bottom:14px; }
+  .sgroup > h2 { font-size:12px; text-transform:uppercase; letter-spacing:.16em;
+            color:var(--muted); margin:12px 2px 8px; }
+  .srow { display:flex; align-items:flex-start; gap:12px; padding:9px 2px;
+            border-top:1px solid #0c1a24; flex-wrap:wrap; }
+  .srow:first-of-type { border-top:none; }
+  .srow .meta { flex:1 1 260px; min-width:0; }
+  .srow .meta .name { color:var(--text); word-break:break-word; }
+  .srow .meta .help { color:var(--muted); font-size:12px; margin-top:2px; }
+  .srow .ctl { flex:0 1 auto; display:flex; align-items:center; gap:8px; flex-wrap:wrap; max-width:100%; }
+  .srow .ctl input[type=text], .srow .ctl input[type=number], .srow .ctl input[type=password], .srow .ctl select {
             background:#04070c; border:1px solid var(--edge); color:var(--text);
-            border-radius:8px; padding:8px 10px; font:inherit; min-width:160px; }}
-  .srow .ctl input:focus, .srow .ctl select:focus {{ outline:none;
-            border-color:var(--cyan); box-shadow:0 0 0 1px var(--cyan-dim); }}
-  .srow .ctl input[type=checkbox] {{ width:18px; height:18px;
-            accent-color:var(--cyan); cursor:pointer; }}
-  .srow .save {{ padding:7px 12px; font-size:12px; }}
-  .srow .saved {{ color:#2ee6a6; font-size:12px; min-width:1em; }}
-  #settingsNote {{ color:var(--muted); font-size:12px; margin:2px 2px 14px; }}
+            border-radius:8px; padding:8px 10px; font:inherit; min-width:0; width:200px; max-width:100%; }
+  .srow .ctl input:focus, .srow .ctl select:focus { outline:none;
+            border-color:var(--cyan); box-shadow:0 0 0 1px var(--cyan-dim); }
+  .srow .ctl input[type=checkbox] { width:18px; height:18px;
+            accent-color:var(--cyan); cursor:pointer; }
+  .srow .save { padding:7px 12px; font-size:12px; }
+  .srow .saved { color:var(--good); font-size:12px; min-width:1em; }
+  #settingsNote { color:var(--muted); font-size:12px; margin:2px 2px 14px; }
   /* ── Control-panel tabs (System / Actions / Voice / Camera / Memory) ───────
      All reuse the shared palette + the .view[hidden] show/hide mechanic. */
   /* System: a responsive grid of GPU cards + a stat row. */
-  .cards {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
-            gap:12px; margin-bottom:14px; }}
-  .card {{ background:var(--panel); border:1px solid var(--edge);
-           border-radius:10px; padding:12px 14px; }}
-  .card h3 {{ font-size:13px; margin:0 0 8px; color:var(--cyan);
-             word-break:break-word; }}
-  .card .kv {{ display:flex; justify-content:space-between; gap:10px;
-              font-size:12.5px; padding:2px 0; color:#a9c7d1; }}
-  .card .kv b {{ color:var(--text); font-weight:normal; }}
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(240px,100%),1fr));
+            gap:12px; margin-bottom:14px; }
+  .card { background:var(--panel); border:1px solid var(--edge);
+           border-radius:10px; padding:12px 14px; min-width:0; }
+  .card h3 { font-size:13px; margin:0 0 8px; color:var(--cyan);
+             word-break:break-word; }
+  .card .kv { display:flex; justify-content:space-between; gap:10px;
+              font-size:12.5px; padding:2px 0; color:#a9c7d1; }
+  .card .kv b { color:var(--text); font-weight:normal; text-align:right; word-break:break-word; }
   /* A thin VRAM/usage bar: a filled inner track sized by percentage. */
-  .bar {{ height:8px; border-radius:6px; background:#04070c;
-          border:1px solid var(--edge); overflow:hidden; margin:6px 0 8px; }}
-  .bar > i {{ display:block; height:100%; background:linear-gradient(90deg,
-          var(--cyan-dim), var(--cyan)); }}
+  .bar { height:8px; border-radius:6px; background:#04070c;
+          border:1px solid var(--edge); overflow:hidden; margin:6px 0 8px; }
+  .bar > i { display:block; height:100%; background:linear-gradient(90deg,
+          var(--cyan-dim), var(--cyan)); }
   /* A shared search box for the Actions + Memory lists. */
-  .search {{ width:100%; background:#04070c; border:1px solid var(--edge);
+  .search { width:100%; background:#04070c; border:1px solid var(--edge);
           color:var(--text); border-radius:8px; padding:10px 12px; font:inherit;
-          margin-bottom:10px; }}
-  .search:focus {{ outline:none; border-color:var(--cyan);
-          box-shadow:0 0 0 1px var(--cyan-dim); }}
+          margin-bottom:10px; }
+  .search:focus { outline:none; border-color:var(--cyan);
+          box-shadow:0 0 0 1px var(--cyan-dim); }
   /* A scrollable list panel (Actions / Memory facts / episodes). */
-  .listbox {{ background:#04070c; border:1px solid var(--edge); border-radius:8px;
-          max-height:56vh; overflow:auto; }}
-  .lrow {{ display:flex; align-items:center; gap:10px; padding:8px 12px;
-          border-top:1px solid #0c1a24; }}
-  .lrow:first-child {{ border-top:none; }}
-  .lrow .nm {{ flex:1; color:var(--text); word-break:break-word; cursor:pointer; }}
-  .lrow .nm:hover {{ color:var(--cyan); }}
-  .lrow .txt {{ flex:1; color:#a9c7d1; word-break:break-word; }}
+  .listbox { background:#04070c; border:1px solid var(--edge); border-radius:8px;
+          max-height:56vh; overflow:auto; }
+  .lrow { display:flex; align-items:center; gap:10px; padding:8px 12px;
+          border-top:1px solid #0c1a24; flex-wrap:wrap; }
+  .lrow:first-child { border-top:none; }
+  .lrow .nm { flex:1 1 180px; min-width:0; color:var(--text); word-break:break-word; cursor:pointer; }
+  .lrow .nm:hover { color:var(--cyan); }
+  .lrow .txt { flex:1; min-width:0; color:#a9c7d1; word-break:break-word; }
+  .lrow .arg { flex:0 1 150px; min-width:0; padding:6px 8px; font-size:12px; }
   /* A small speak-class chip on each action row. */
-  .schip {{ font-size:10.5px; letter-spacing:.06em; padding:2px 8px;
+  .schip { font-size:10.5px; letter-spacing:.06em; padding:2px 8px;
           border-radius:999px; border:1px solid var(--edge); color:var(--muted);
-          white-space:nowrap; }}
-  .schip.verbatim {{ color:#2ee6a6; border-color:#12604a; }}
-  .schip.informative {{ color:var(--cyan); border-color:var(--cyan-dim); }}
-  .lrow .send {{ padding:5px 12px; font-size:12px; border-radius:999px;
-          background:transparent; color:var(--cyan); }}
-  .lrow .send:hover {{ background:var(--cyan); color:#04222b; }}
-  .count {{ color:var(--muted); font-size:12px; margin:2px 2px 10px; }}
+          white-space:nowrap; }
+  .schip.verbatim { color:var(--good); border-color:#12604a; }
+  .schip.informative { color:var(--cyan); border-color:var(--cyan-dim); }
+  .schip.confirm { color:var(--warn); border-color:#7a5a12; }
+  .lrow .send { padding:5px 12px; min-height:30px; font-size:12px; border-radius:999px;
+          background:transparent; color:var(--cyan); }
+  .lrow .send:hover { background:var(--cyan); color:#04222b; }
+  .count { color:var(--muted); font-size:12px; margin:2px 2px 10px; }
+  #actionResult { white-space:pre-wrap; color:#eafcff; margin:0 2px 10px; min-height:1.2em; }
   /* Voice: a wrapping row of profile buttons + an info strip. */
-  .voicebtns {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }}
-  .voicebtns button {{ padding:8px 14px; font-size:12.5px; border-radius:999px;
-          background:transparent; color:var(--cyan); }}
-  .voicebtns button:hover {{ background:var(--cyan); color:#04222b; }}
-  .voicebtns button.off {{ color:#f0a; border-color:#a05; }}
-  /* Camera: the preview image + an off placeholder. */
-  #camImg {{ max-width:100%; border:1px solid var(--edge); border-radius:10px;
-          background:#04070c; display:none; }}
-  #camOff {{ background:var(--panel); border:1px dashed var(--cyan-dim);
-          border-radius:10px; padding:40px 16px; text-align:center;
-          color:var(--muted); }}
-  /* Per-camera 3-up grid: each tile independent (one dead cam never blanks
-     the row); wraps to a column on narrow windows. */
-  .camgrid {{ display:flex; gap:12px; flex-wrap:wrap; }}
-  .camtile {{ flex:1 1 220px; min-width:180px; margin:0;
+  .voicebtns { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
+  .voicebtns button { padding:8px 14px; font-size:12.5px; border-radius:999px;
+          background:transparent; color:var(--cyan); }
+  .voicebtns button:hover { background:var(--cyan); color:#04222b; }
+  .voicebtns button.off { color:#ff7ad9; border-color:#a05; }
+  /* Per-camera grid: each tile independent (one dead cam never blanks the
+     row); wraps to a column on narrow windows. The tiles are BUILT from
+     /api/camera-tiles (the live CAMERAS roster), never hard-coded. */
+  .camgrid { display:flex; gap:12px; flex-wrap:wrap; }
+  .camtile { flex:1 1 220px; min-width:0; margin:0;
           background:var(--panel); border:1px solid var(--edge);
-          border-radius:10px; padding:8px; }}
-  .camtile img {{ width:100%; border-radius:6px; background:#04070c;
-          display:none; }}
-  /* The placeholder is now the tile's EXPLANATION, not the word "off" (see
+          border-radius:10px; padding:8px; }
+  .camtile img { width:100%; border-radius:6px; background:#04070c;
+          display:none; }
+  /* The placeholder is the tile's EXPLANATION, not the word "off" (see
      _camera_off_reason). Sized to be read at a glance from across the room:
-     13px/1.5 in the main text colour, not the dim muted grey a one-word label
-     could get away with. It wraps - a wrapped honest sentence beats a truncated
-     one - and holds its height so a tile that goes dark doesn't jump the row. */
-  .camtile .camoff {{ border:1px dashed var(--cyan-dim); border-radius:6px;
-          padding:22px 10px; text-align:center; color:var(--text);
+     13px/1.5 in the main text colour. It wraps - a wrapped honest sentence
+     beats a truncated one - and holds its height so a tile that goes dark
+     doesn't jump the row. */
+  .camtile .camoff { border:1px dashed var(--cyan-dim); border-radius:6px;
+          padding:18px 10px; text-align:center; color:var(--text);
           font-size:13px; line-height:1.5; min-height:74px;
-          display:flex; align-items:center; justify-content:center; }}
-  .camtile figcaption {{ color:var(--muted); font-size:12px; margin-top:6px;
-          letter-spacing:.08em; text-transform:uppercase; }}
+          display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; }
+  /* The reason's DETAIL is shown, not hidden in a hover title (a phone has no
+     hover): the gate's countdown, the bridge's error text. */
+  .camtile .camdetail { color:var(--muted); font-size:12px; line-height:1.4; word-break:break-word; }
+  .camtile figcaption { color:var(--muted); font-size:12px; margin-top:6px;
+          letter-spacing:.08em; text-transform:uppercase; }
+  /* ── Skill panels (core/web_panels.py): a generic widget renderer ────── */
+  .pgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(220px,100%),1fr)); gap:12px; }
+  .pw { background:var(--panel); border:1px solid var(--edge); border-radius:10px; padding:10px 12px; min-width:0; }
+  .pw.span { grid-column:1 / -1; }
+  .pw .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.12em; margin-bottom:4px; }
+  .pw .v { color:var(--cyan); font-size:18px; word-break:break-word; }
+  .pw .badge { display:inline-block; padding:2px 10px; border-radius:999px; border:1px solid var(--edge); }
+  .pw .badge.ok { color:var(--good); border-color:#12604a; }
+  .pw .badge.warn { color:var(--warn); border-color:#7a5a12; }
+  .pw .badge.bad { color:var(--bad); border-color:#7a2222; }
+  .pw .badge.info { color:var(--cyan); border-color:var(--cyan-dim); }
+  .pw pre { margin:0; white-space:pre-wrap; word-break:break-word; color:var(--text); font:inherit; }
+  .pw ul { margin:0; padding-left:18px; max-height:220px; overflow:auto; }
+  .pw img { width:100%; border-radius:6px; background:#04070c; }
+  .pw .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .pw input[type=range] { width:100%; accent-color:var(--cyan); }
+  .pw button { padding:8px 14px; }
+  .pw button.hold { min-height:64px; min-width:96px; font-size:15px; touch-action:none;
+          user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
+  .pw button.hold.held { background:var(--cyan); color:#04222b; }
+  .pstale { color:var(--warn); font-size:12px; margin:0 2px 8px; min-height:1.2em; }
+  /* E-stops are PINNED: fixed to the viewport on every tab once a panel
+     declares one, so a stop is never a scroll or a tab away. */
+  #estopDock { position:fixed; right:14px; bottom:14px; z-index:50; display:flex;
+          flex-direction:column; gap:8px; }
+  #estopDock[hidden] { display:none; }
+  #estopDock button { background:#b3121b; color:#fff; border:2px solid #ff9a9a; border-radius:14px;
+          min-height:56px; min-width:120px; font-size:15px; font-weight:bold; letter-spacing:.08em;
+          box-shadow:0 4px 18px rgba(0,0,0,.6); touch-action:manipulation; }
+  #estopDock button:hover { background:#e01e28; color:#fff; }
+  @media (max-width: 640px) {
+    header { padding:8px 10px; gap:6px 10px; }
+    h1 { font-size:13px; letter-spacing:.2em; }
+    nav.views { order:3; flex:1 1 100%; }
+    nav.views button { padding:5px 11px; }
+    .toggle .lbltext { display:none; }
+    .wrap { padding:10px 10px 96px; }
+    .chip { min-width:0; flex:1 1 140px; padding:6px 10px; }
+    .chip .v { font-size:13.5px; }
+    #log { height:46vh; }
+    form button { padding:0 12px; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior:auto !important; } }
 </style></head><body>
-<header><div class="reactor"></div><h1>J.A.R.V.I.S.</h1>
-  <!-- View switcher: LIVE dashboard vs the full SETTINGS control panel. Only one
-       view is shown at a time so the page stays one self-contained screen. -->
-  <nav class="views">
-    <button id="navLive" class="active" type="button">Live</button>
+<header><div class="reactor" aria-hidden="true"></div><h1>J.A.R.V.I.S.</h1>
+  <div class="hdr-right">
+    <label class="toggle" title="Pause/resume live status + log polling">
+      <input id="autorefresh" type="checkbox" checked> <span class="lbltext">auto-refresh</span><span class="sr-only"> (auto-refresh)</span>
+    </label>
+    <span id="conn" class="muted" role="status">connecting…</span>
+  </div>
+  <!-- View switcher. Only one view is shown at a time so the page stays one
+       self-contained screen. Skill panels (core/web_panels.py) append their own
+       buttons here at load. On a phone this row scrolls sideways. -->
+  <nav class="views" id="nav" aria-label="Views">
+    <button id="navLive" class="active" type="button" aria-current="page">Live</button>
     <button id="navSystem" type="button">System</button>
     <button id="navActions" type="button">Actions</button>
     <button id="navVoice" type="button">Voice</button>
@@ -2573,25 +3668,36 @@ def _dashboard_html(token: str) -> str:
     <button id="navMemory" type="button">Memory</button>
     <button id="navSettings" type="button">Settings</button>
   </nav>
-  <label class="toggle" style="margin-left:auto" title="Pause/resume live status + log polling">
-    <input id="autorefresh" type="checkbox" checked> auto-refresh
-  </label>
-  <span id="conn" class="muted">connecting…</span>
 </header>
-<div class="wrap">
-  <!-- ── LIVE VIEW (unchanged dashboard: status strip / quick actions / log /
-       command box) ────────────────────────────────────────────────────────── -->
+<div class="wrap" id="wrap">
+  <!-- ── LIVE VIEW: status strip / standby banner / controls / quick actions /
+       log / command box ──────────────────────────────────────────────────── -->
   <section id="viewLive" class="view">
-    <div class="strip" id="strip"></div>
+    <div class="strip" id="strip" aria-label="Status"></div>
+    <div class="banner" id="standbyBanner" hidden role="status">
+      <span id="standbyText">JARVIS is in standby: a typed command is ignored unless it starts with “JARVIS”.</span>
+      <button type="button" id="standbyWake">Wake him</button>
+    </div>
+    <!-- The tray control plane (POST /api/control → tray_commands.json): works
+         in standby and without the LLM. Restart asks first. -->
+    <div class="controls" id="controls" aria-label="Controls"></div>
     <!-- Quick-action buttons are injected here from the QUICK_ACTIONS array below,
          so presets are edited in ONE data-driven place (no per-button markup). -->
-    <div class="actions" id="actions"></div>
-    <div id="log" class="muted">loading log…</div>
+    <div class="actions" id="actions" aria-label="Quick commands"></div>
+    <div class="logbar">
+      <label class="toggle" title="Hide [kinect-preview], [vad] timeout and [air-mouse] chatter">
+        <input id="noiseToggle" type="checkbox" checked> hide noise
+      </label>
+      <input id="logSearch" class="search" type="text" autocomplete="off"
+             placeholder="Search the log…" aria-label="Search the log">
+    </div>
+    <div id="log" class="muted hide-noise" role="log" aria-live="off" aria-label="Session log" tabindex="0">loading log…</div>
     <form id="say">
+      <label for="text" class="sr-only">Command for JARVIS</label>
       <input id="text" type="text" autocomplete="off" placeholder="Type a command for JARVIS…" autofocus>
       <button id="send" type="submit">Send</button>
     </form>
-    <div id="reply"></div>
+    <div id="reply" aria-live="polite"></div>
   </section>
 
   <!-- ── SETTINGS VIEW (the full control panel) ──────────────────────────────
@@ -2605,7 +3711,7 @@ def _dashboard_html(token: str) -> str:
         <input id="wakeToggle" type="checkbox"> <span class="lbl">Wake-word mode (start in standby)</span>
       </label>
       <button id="wakeSave" class="save" type="button">Save</button>
-      <span id="wakeSaved" class="saved"></span>
+      <span id="wakeSaved" class="saved" aria-live="polite"></span>
       <span class="hint">Boot silent and wait for &ldquo;JARVIS&rdquo; instead of always-listening
         (WAKE_WORD_AUTOSTART). Toggle the neural detector + full standby knobs below too.</span>
     </div>
@@ -2622,148 +3728,264 @@ def _dashboard_html(token: str) -> str:
   </section>
 
   <!-- ── ACTIONS VIEW (the "access everything" tab) ────────────────────────
-       A search box filters the full ~500-action inventory; each row can be Sent
-       straight to /api/say, or its name clicked to drop into the Live command box. -->
+       Built from the LIVE action registry (/api/actions). Send runs the action
+       BY NAME through POST /api/action - side-effect / destructive names ask
+       first. Clicking a name drops it into the Live command box instead. -->
   <section id="viewActions" class="view" hidden>
     <div id="actionsCount" class="count">loading actions…</div>
     <input id="actionsSearch" class="search" type="text" autocomplete="off"
-           placeholder="Search actions… (name)">
+           placeholder="Search actions… (name)" aria-label="Search actions">
+    <div id="actionResult" aria-live="polite"></div>
     <div id="actionsList" class="listbox"></div>
   </section>
 
-  <!-- ── VOICE VIEW (active voice + one button per usable clone profile) ────
-       Read-then-command: each button POSTs a spoken phrase to /api/say (no new
-       write endpoint), so switching a voice goes through the same channel. -->
+  <!-- ── VOICE VIEW (the REAL engine + voice, and one button per usable clone
+       profile). Each button POSTs a spoken phrase to /api/say. -->
   <section id="viewVoice" class="view" hidden>
     <div id="voiceInfo" class="count">loading voices…</div>
     <div id="voiceBtns" class="voicebtns"></div>
   </section>
 
   <!-- ── CAMERA VIEW (live MJPEG streams, one connection per tile) ───────
-       THREE tiles, one per real source: left webcam, right webcam, Kinect.
-       There is deliberately NO unified /api/camera-preview tile — it serves the
-       DEFAULT preview file, which is written from the PRIMARY camera, so it
-       duplicated whichever named tile was primary (2026-09-04, owner-reported:
-       "two of the cameras are the same"). Kinect INFRARED is not a fourth tile:
-       this pykinect2 build exposes has_new_infrared_frame but NOT
-       get_last_infrared_frame, so IR frames can be detected and never read. -->
+       The tiles come from /api/camera-tiles: one per camera in the RUNNING
+       JARVIS's CAMERAS roster, plus the Kinect when it is switched on (a bare
+       web process falls back to left/right/kinect). There is deliberately NO
+       unified /api/camera-preview tile — it serves the DEFAULT preview file,
+       written from the PRIMARY camera, so it duplicated whichever named tile
+       was primary (2026-09-04, owner-reported: "two of the cameras are the
+       same"). Kinect INFRARED is not a tile: this pykinect2 build exposes
+       has_new_infrared_frame but NOT get_last_infrared_frame. -->
   <section id="viewCamera" class="view" hidden>
-    <!-- Per-camera tiles (2026-07-10): every camera streams individually —
-         left/right webcams + Kinect (skeleton-annotated). Each tile shows a
-         dim placeholder when that camera is off/stale, independent of the
-         others, so one dead camera never blanks the row. -->
     <!-- PLACEHOLDER TEXT (2026-09-04, owner: "add the kinect not detected
-         message to the tile"). Each tile's placeholder now carries a SENTENCE
+         message to the tile"). Each tile's placeholder carries a SENTENCE
          fetched from /api/camera-reason on the img `error` event - never on the
-         happy path, so the continuous stream costs exactly what it did before.
-         The words come from the server's ladder (_camera_off_reason), which
-         only says "Kinect not detected" when device enumeration actually came
-         back empty; every other outage gets a message that names what was
-         established and hedges what was not. -->
-    <div class="count">Live cameras — left, right, and the Kinect (skeleton-annotated). Updates while each camera is on.</div>
-    <div class="camgrid">
-      <figure class="camtile">
-        <img id="camLeft" data-cam="left" alt="left webcam">
-        <div class="camoff" id="camLeftOff">checking…</div>
-        <figcaption>Left webcam</figcaption>
-      </figure>
-      <figure class="camtile">
-        <img id="camRight" data-cam="right" alt="right webcam">
-        <div class="camoff" id="camRightOff">checking…</div>
-        <figcaption>Right webcam</figcaption>
-      </figure>
-      <figure class="camtile">
-        <img id="camKinect" data-cam="kinect" alt="kinect">
-        <div class="camoff" id="camKinectOff">checking…</div>
-        <figcaption>Kinect (skeleton)</figcaption>
-      </figure>
-    </div>
+         happy path - and its detail line (the gate's countdown, the bridge's
+         error) is shown under it, not only on hover. -->
+    <div class="count" id="camNote">Live cameras from JARVIS's camera list — each tile updates while its camera is on.</div>
+    <div class="camgrid" id="camgrid"></div>
   </section>
 
   <!-- ── MEMORY VIEW (long-term facts + recent episodes, searchable) ───────── -->
   <section id="viewMemory" class="view" hidden>
     <div id="memCount" class="count">loading memory…</div>
     <input id="memSearch" class="search" type="text" autocomplete="off"
-           placeholder="Search facts…">
+           placeholder="Search facts…" aria-label="Search facts">
     <div id="memFacts" class="listbox"></div>
   </section>
+  <!-- Skill panel views (core/web_panels.py) are appended here at load. -->
 </div>
+<div id="estopDock" hidden aria-label="Emergency stops"></div>
 <script>
-const TOKEN = {tok};
-function hdr() {{ const h = {{'Content-Type':'application/json'}}; if (TOKEN) h['X-Auth-Token']=TOKEN; return h; }}
-function q(u) {{ return TOKEN ? (u + (u.includes('?')?'&':'?') + 'token=' + encodeURIComponent(TOKEN)) : u; }}
+const TOKEN = __JARVIS_TOKEN_JSON__;
+function hdr() { const h = {'Content-Type':'application/json'}; if (TOKEN) h['X-Auth-Token']=TOKEN; return h; }
+function q(u) { return TOKEN ? (u + (u.includes('?')?'&':'?') + 'token=' + encodeURIComponent(TOKEN)) : u; }
+// Per-viewer conveniences only (last tab, the noise filter). Storage can throw
+// (private window, blocked site data), so every access is wrapped and the page
+// works identically without it.
+function lsGet(k, d) { try { const v = window.localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+function lsSet(k, v) { try { window.localStorage.setItem(k, v); } catch (e) {} }
+async function postJSON(url, obj) {
+  const r = await fetch(q(url), {method:'POST', headers:hdr(), body: JSON.stringify(obj||{})});
+  let d = {};
+  try { d = await r.json(); } catch (e) {}
+  return {status: r.status, ok: r.ok, data: d};
+}
 const strip = document.getElementById('strip');
 const logEl = document.getElementById('log');
 const conn  = document.getElementById('conn');
 
-function chip(k, v) {{ const d=document.createElement('div'); d.className='chip';
-  d.innerHTML = '<div class="k">'+k+'</div><div class="v"></div>';
-  d.querySelector('.v').textContent = (v===''||v==null) ? '—' : v; return d; }}
+function chip(k, v, cls) { const d=document.createElement('div'); d.className='chip' + (cls ? ' '+cls : '');
+  d.innerHTML = '<div class="k"></div><div class="v"></div>';
+  d.querySelector('.k').textContent = k;
+  d.querySelector('.v').textContent = (v===''||v==null) ? '—' : v; return d; }
 
 // Format a raw uptime-in-seconds float into a compact "2h13m" / "4m" / "45s".
-function fmtUptime(secs) {{
+function fmtUptime(secs) {
   if (secs==null || isNaN(secs)) return '';
   secs = Math.max(0, Math.floor(secs));
   const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60), s = secs%60;
   if (h) return h+'h'+String(m).padStart(2,'0')+'m';
   if (m) return m+'m'+String(s).padStart(2,'0')+'s';
   return s+'s';
-}}
+}
+function fmtGB(mb) { return (mb==null) ? '?' : (Math.round(mb/102.4)/10).toString(); }
+function shortGpu(name) {
+  return String(name||'').replace(/^NVIDIA\s+/i,'').replace(/^GeForce\s+/i,'');
+}
 
-async function refreshStatus() {{
-  try {{
-    const r = await fetch(q('/api/status'), {{headers:hdr()}});
-    if (r.status===401) {{ conn.textContent='unauthorized — token required'; return; }}
+// ── STATUS STRIP ─────────────────────────────────────────────────────────────
+// Every chip is a field /api/status actually carries. "brain" is the REAL
+// backend/model (hud llm_backend) - it used to show the model's last
+// [intent:x] tag under a "model" label. Each GPU gets its own VRAM chip: the
+// old single TOTAL summed the LLM card with the second card.
+let LAST_STATUS = null;
+async function refreshStatus() {
+  try {
+    const r = await fetch(q('/api/status'), {headers:hdr()});
+    if (r.status===401) { conn.textContent='unauthorized — token required'; return; }
     const s = await r.json();
-    // Clearer online/offline indicator: a coloured dot + explicit word. The dot
-    // is green (glowing) when the loop is live, grey when offline.
+    LAST_STATUS = s;
     conn.textContent = ''; conn.innerHTML =
       '<span class="dot '+(s.running?'on':'')+'"></span>'+(s.running?'live':'offline');
     strip.innerHTML='';
-    // A leading status chip whose whole value is the online/offline dot, so the
-    // strip itself carries a clear liveness signal (not just the header corner).
     const st = chip('online', s.running?'live':'offline');
     st.querySelector('.v').innerHTML =
       '<span class="dot '+(s.running?'on':'')+'"></span>'+(s.running?'live':'offline');
     strip.appendChild(st);
     strip.appendChild(chip('version', s.version));
-    strip.appendChild(chip('state', s.state));
+    strip.appendChild(chip('state', s.standby ? ('STANDBY' + (s.state && !/standby/i.test(s.state) ? ' ('+s.state+')' : '')) : s.state,
+                           s.standby ? 'warn' : ''));
     // Uptime — only when the server could derive it (field present + non-null).
     if (s.uptime!=null) strip.appendChild(chip('uptime', fmtUptime(s.uptime)));
-    strip.appendChild(chip('model / routing', s.routing || s.model));
-    const g = (s.gpu_lines&&s.gpu_lines.length) ? s.gpu_lines[s.gpu_lines.length- (s.routing?2:1)] : '';
-    strip.appendChild(chip('vram', (s.gpu_bar||'') + (g? '  '+g : '')));
+    const brain = chip('brain', s.model || '—');
+    if (s.routing) brain.title = s.routing;
+    strip.appendChild(brain);
+    if (s.routing) strip.appendChild(chip('routing', s.routing));
+    const doing = s.active_action ? ('running: ' + s.active_action) : (s.now_doing || '');
+    if (doing) strip.appendChild(chip('now doing', doing, s.active_action ? 'wide' : ''));
+    if ((s.gpus||[]).length) {
+      for (const g of s.gpus) {
+        const pct = (g.mem_used_mb!=null && g.mem_total_mb) ? Math.round(100*g.mem_used_mb/g.mem_total_mb) : null;
+        strip.appendChild(chip('GPU' + g.index + ' ' + shortGpu(g.name),
+          fmtGB(g.mem_used_mb) + ' / ' + fmtGB(g.mem_total_mb) + ' GB' + (pct!=null ? ' ('+pct+'%)' : ''),
+          (pct!=null && pct >= 92) ? 'bad' : ((pct!=null && pct >= 85) ? 'warn' : '')));
+      }
+    } else {
+      const g = (s.gpu_lines&&s.gpu_lines.length) ? s.gpu_lines[s.gpu_lines.length- (s.routing?2:1)] : '';
+      strip.appendChild(chip('vram', (s.gpu_bar||'') + (g? '  '+g : '')));
+    }
+    strip.appendChild(chip('mic', s.mic_muted ? 'MUTED' : 'on', s.mic_muted ? 'warn' : ''));
+    strip.appendChild(chip('voice out', s.tts_muted ? 'MUTED' : 'on', s.tts_muted ? 'warn' : ''));
+    if (s.daemons_paused) strip.appendChild(chip('daemons', 'paused', 'warn'));
     // Air-mouse chip — ONLY present when build_status could read the skill in-process
     // (s.air_mouse is omitted otherwise). Shows ARMED (+engaged) vs disarmed.
-    if (s.air_mouse) {{
+    if (s.air_mouse) {
       const am = s.air_mouse.armed
         ? ('armed' + (s.air_mouse.engaged ? ' · engaged' : ''))
         : 'disarmed';
       strip.appendChild(chip('air-mouse', am));
-    }}
+    }
     if (s.now_playing) strip.appendChild(chip('now playing', s.now_playing));
-    if (s.last_spoken) strip.appendChild(chip('last said', s.last_spoken));
-  }} catch(e) {{ conn.textContent = 'connection lost'; }}
-}}
+    if (s.last_transcript) strip.appendChild(chip('last heard', s.last_transcript, 'wide'));
+    if (s.last_spoken) strip.appendChild(chip('last said', s.last_spoken, 'wide'));
+    updateControls(s);
+  } catch(e) { conn.textContent = 'connection lost'; }
+}
 
+// ── CONTROLS (the tray control plane) ─────────────────────────────────────────
+// POST /api/control appends to tray_commands.json exactly as the tray menu
+// does; the monolith drains it at 2 Hz even in standby and before any LLM call.
+const controlsEl = document.getElementById('controls');
+const standbyBanner = document.getElementById('standbyBanner');
+const CONTROLS = [
+  {cmd:'force_wake',           label:() => 'Wake',  show:(s) => !s || s.standby},
+  {cmd:'enter_standby',        label:() => 'Standby', show:(s) => !s || !s.standby},
+  {cmd:'mute_tts_toggle',      label:(s) => (s && s.tts_muted) ? 'Unmute voice' : 'Mute voice', on:(s) => s && s.tts_muted},
+  {cmd:'mic_mute_toggle',      label:(s) => (s && s.mic_muted) ? 'Unmute mic' : 'Mute mic', on:(s) => s && s.mic_muted},
+  {cmd:'pause_daemons_toggle', label:(s) => (s && s.daemons_paused) ? 'Resume daemons' : 'Pause daemons', on:(s) => s && s.daemons_paused},
+  {cmd:'restart',              label:() => 'Restart JARVIS', danger:true,
+   confirm:'Restart JARVIS now?\n\nHe goes offline for about a minute and comes back on his own.'},
+];
+async function sendControl(cmd, confirmText) {
+  if (confirmText && !window.confirm(confirmText)) return false;
+  const res = await postJSON('/api/control', {cmd, confirm: !!confirmText});
+  if (res.status===401) { replyEl.textContent='unauthorized'; return false; }
+  if (!res.ok) { replyEl.textContent = 'control failed: ' + (res.data.error || res.status); return false; }
+  replyEl.innerHTML = '<span class="muted">sent: ' + cmd.replace(/_/g,' ') + '</span>';
+  setTimeout(refreshStatus, 900);
+  return true;
+}
+function updateControls(s) {
+  controlsEl.innerHTML = '';
+  for (const c of CONTROLS) {
+    if (c.show && !c.show(s)) continue;
+    const b = document.createElement('button'); b.type='button';
+    b.textContent = c.label(s);
+    if (c.on && c.on(s)) { b.classList.add('on'); b.setAttribute('aria-pressed','true'); }
+    else if (c.on) b.setAttribute('aria-pressed','false');
+    if (c.danger) b.classList.add('danger');
+    b.addEventListener('click', async () => { b.disabled = true;
+      try { await sendControl(c.cmd, c.confirm); } finally { b.disabled = false; } });
+    controlsEl.appendChild(b);
+  }
+  standbyBanner.hidden = !(s && s.standby);
+}
+document.getElementById('standbyWake').addEventListener('click', () => sendControl('force_wake'));
+
+// ── THE LOG ───────────────────────────────────────────────────────────────────
+// APPEND-ONLY (2026-09-30 audit): the view used to be rebuilt from 200 lines
+// every second, which destroyed any text selection. The server now hands back
+// an offset; each poll asks only for what came after it (?since=) and appends
+// those lines. A noise filter (on by default) hides the chatty lines, and the
+// search box hides non-matching lines - both by toggling classes on existing
+// nodes, never by re-rendering.
+const LOG_MAX_LINES = 1500;
+const NOISE_RE = /\[kinect-preview\]|\[vad\] timeout|\[air-mouse\]/i;
+const noiseToggle = document.getElementById('noiseToggle');
+const logSearch = document.getElementById('logSearch');
+let logState = {name: '', offset: null, empty: true};
 let pinned = true;
-logEl.addEventListener('scroll', () => {{
+noiseToggle.checked = lsGet('jarvis.hideNoise', '1') === '1';
+logEl.classList.toggle('hide-noise', noiseToggle.checked);
+noiseToggle.addEventListener('change', () => {
+  logEl.classList.toggle('hide-noise', noiseToggle.checked);
+  lsSet('jarvis.hideNoise', noiseToggle.checked ? '1' : '0');
+});
+function logMatches(el) {
+  const f = (logSearch.value || '').trim().toLowerCase();
+  return !f || el.textContent.toLowerCase().indexOf(f) !== -1;
+}
+let logSearchTimer = null;
+logSearch.addEventListener('input', () => {
+  clearTimeout(logSearchTimer);
+  logSearchTimer = setTimeout(() => {
+    for (const el of logEl.children) el.hidden = !logMatches(el);
+  }, 120);
+});
+logEl.addEventListener('scroll', () => {
   pinned = (logEl.scrollTop + logEl.clientHeight) >= (logEl.scrollHeight - 24);
-}});
-async function refreshLog() {{
-  try {{
-    const r = await fetch(q('/api/log/tail?lines=200'), {{headers:hdr()}});
+});
+function selectionInLog() {
+  try {
+    const sel = window.getSelection();
+    return !!(sel && !sel.isCollapsed && sel.anchorNode && logEl.contains(sel.anchorNode));
+  } catch (e) { return false; }
+}
+function logLine(text) {
+  const d = document.createElement('div');
+  d.className = 'ln' + (/\[action\]/i.test(text) ? ' a' : (/jarvis( \(spoken\))?:/i.test(text) ? ' j' : ''))
+                     + (NOISE_RE.test(text) ? ' noise' : '');
+  d.textContent = text;
+  if (!logMatches(d)) d.hidden = true;
+  return d;
+}
+async function refreshLog() {
+  try {
+    let url = '/api/log/tail?lines=200';
+    if (logState.offset !== null && logState.name)
+      url += '&since=' + logState.offset + '&log=' + encodeURIComponent(logState.name);
+    const r = await fetch(q(url), {headers:hdr()});
     if (r.status===401) return;
     const d = await r.json();
-    const frag = (d.lines||[]).map(l => {{
-      const cls = /\\[action\\]/i.test(l) ? 'a' : (/jarvis:/i.test(l) ? 'j' : '');
-      const esc = l.replace(/&/g,'&amp;').replace(/</g,'&lt;');
-      return cls ? '<span class="'+cls+'">'+esc+'</span>' : esc;
-    }}).join('\\n');
-    logEl.innerHTML = frag || '<span class="muted">(no log yet)</span>';
-    if (pinned) logEl.scrollTop = logEl.scrollHeight;
-  }} catch(e) {{}}
-}}
+    if (!d.append || logState.empty) { logEl.textContent = ''; logState.empty = false; }
+    logEl.classList.remove('muted');
+    const lines = d.lines || [];
+    if (lines.length) {
+      const frag = document.createDocumentFragment();
+      for (const l of lines) frag.appendChild(logLine(l));
+      logEl.appendChild(frag);
+      // Trim from the top; a selection inside the kept lines survives.
+      while (logEl.childElementCount > LOG_MAX_LINES) logEl.removeChild(logEl.firstElementChild);
+    }
+    if (!logEl.childElementCount) {
+      logEl.innerHTML = '<span class="muted">(no log yet)</span>';
+      logState.empty = true;
+    }
+    logState.name = d.log || '';
+    logState.offset = (typeof d.offset === 'number') ? d.offset : null;
+    if (pinned && lines.length && !selectionInLog()) logEl.scrollTop = logEl.scrollHeight;
+  } catch(e) {}
+}
 
 const form = document.getElementById('say');
 const textIn = document.getElementById('text');
@@ -2777,62 +3999,85 @@ const actionsEl = document.getElementById('actions');
 // to /api/say — the SAME inject channel a spoken command uses, so "mouse control on"
 // behaves identically typed, clicked, or spoken.
 const QUICK_ACTIONS = [
-  {{label:'Arm mouse control', cmd:'mouse control on'}},
-  {{label:'Release mouse',     cmd:'mouse control off'}},
-  {{label:"What's my status",  cmd:'system status'}},
-  {{label:'Go to sleep',       cmd:'go to sleep'}},
-  {{label:'Wake up',           cmd:'wake up'}},
+  {label:'Arm mouse control', cmd:'mouse control on'},
+  {label:'Release mouse',     cmd:'mouse control off'},
+  {label:"What's my status",  cmd:'system status'},
+  {label:'Go to sleep',       cmd:'go to sleep'},
+  {label:'Wake up',           cmd:'wake up'},
 ];
+
+// STANDBY GUARD (2026-09-30 audit). In standby the main loop DROPS a typed
+// command that does not start with the wake word ("[standby] ignored"), and
+// the page used to report that as "accepted". Ask first: wake him through the
+// tray channel (which works in standby) and then send, or don't send.
+const WAKE_WORD_RE = /^\s*(hey\s+)?jarvis\b/i;
+const WAKE_UP_RE = /^\s*wake(\s+up)?\s*[.!]?\s*$/i;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // The ONE code path every command goes through — the typed form and every quick
 // button both call this. Disables the sender, shows a pending marker, POSTs the
 // phrase, renders the reply (or a queued/accepted note), and nudges the log.
-async function sendCommand(text, opts) {{
+async function sendCommand(text, opts) {
   text = (text||'').trim(); if (!text) return;
-  opts = opts || {{}};
+  opts = opts || {};
   const btn = opts.button || null;
+  // "wake up" typed in standby would itself be ignored (only the wake WORD
+  // wakes him), so it goes straight to the control plane instead.
+  if (LAST_STATUS && LAST_STATUS.standby && WAKE_UP_RE.test(text)) {
+    await sendControl('force_wake'); return;
+  }
+  if (LAST_STATUS && LAST_STATUS.standby && !WAKE_WORD_RE.test(text)) {
+    const wake = window.confirm('JARVIS is in standby, so he would ignore "' + text + '".\n\n'
+      + 'OK = wake him first, then send it.\nCancel = do not send.');
+    if (!wake) { replyEl.innerHTML = '<span class="muted">not sent (standby).</span>'; return; }
+    if (!(await sendControl('force_wake'))) return;
+    await sleep(1500);
+  }
   sendBtn.disabled = true; if (btn) btn.disabled = true;
   replyEl.textContent = '…';
-  try {{
-    const r = await fetch(q('/api/say'), {{method:'POST', headers:hdr(),
-      body: JSON.stringify({{text}})}});
+  try {
+    const r = await fetch(q('/api/say'), {method:'POST', headers:hdr(),
+      body: JSON.stringify({text})});
     const d = await r.json();
     if (r.status===401) replyEl.textContent = 'unauthorized';
+    else if (d.status==='standby') replyEl.innerHTML = '<span class="muted">JARVIS is in standby and ignored that — press Wake, then send it again.</span>';
     else if (d.reply) replyEl.textContent = d.reply;
     else if (d.status==='no_log') replyEl.innerHTML = '<span class="muted">queued — JARVIS is not running; it will run on next boot.</span>';
     else replyEl.innerHTML = '<span class="muted">accepted (no spoken reply captured).</span>';
-  }} catch(e) {{ replyEl.textContent = 'send failed'; }}
-  finally {{ sendBtn.disabled=false; if (btn) btn.disabled=false; refreshLog(); }}
-}}
+  } catch(e) { replyEl.textContent = 'send failed'; }
+  finally { sendBtn.disabled=false; if (btn) btn.disabled=false; refreshLog(); }
+}
 
 // Render the quick-action buttons from QUICK_ACTIONS. Each POSTs its preset phrase
 // via the shared sendCommand(); the returned reply lands in the existing #reply area.
-QUICK_ACTIONS.forEach(a => {{
+QUICK_ACTIONS.forEach(a => {
   const b = document.createElement('button');
   b.type = 'button'; b.textContent = a.label;
-  b.addEventListener('click', () => sendCommand(a.cmd, {{button:b}}));
+  b.addEventListener('click', () => sendCommand(a.cmd, {button:b}));
   actionsEl.appendChild(b);
-}});
+});
 
-form.addEventListener('submit', async (ev) => {{
+form.addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  await sendCommand(textIn.value);
-  textIn.value=''; textIn.focus();
-}});
+  const t = textIn.value;
+  textIn.value='';
+  await sendCommand(t);
+  textIn.focus();
+});
 
 // ── AUTO-REFRESH TOGGLE ────────────────────────────────────────────────────
-// The checkbox (default ON) gates the 1s/1.5s polls so the user can FREEZE the
-// view to read the log/status. We keep the intervals running but make each tick a
-// no-op while paused (cheaper + simpler than clearing/re-creating timers), and do
-// one immediate refresh when it's switched back on so the view catches up at once.
+// The checkbox (default ON) gates the polls so the user can FREEZE the view.
+// A HIDDEN tab (another app in front, a locked phone) polls nothing at all:
+// pollsWanted() is false until it is visible again, then it catches up at once.
 const autoEl = document.getElementById('autorefresh');
-function autoOn() {{ return autoEl.checked; }}
-autoEl.addEventListener('change', () => {{ if (autoOn()) {{ refreshStatus(); refreshLog(); }} }});
+function autoOn() { return autoEl.checked; }
+function pollsWanted() { return autoOn() && !document.hidden; }
+autoEl.addEventListener('change', () => { if (autoOn()) { refreshStatus(); refreshLog(); } });
 
 // ── SETTINGS CONTROL PANEL ─────────────────────────────────────────────────
 // The full "do it all from the web" panel. It's built ENTIRELY from /api/settings
 // (which serves settings_window.SCHEMA + live values), so it never drifts from the
-// real config. Each control saves INDEPENDENTLY via POST /api/settings {{name,value}}
+// real config. Each control saves INDEPENDENTLY via POST /api/settings {name,value}
 // and shows a per-row confirmation. A save writes the file; the effect lands on the
 // next JARVIS restart (the note the server returns says so).
 const navLive = document.getElementById('navLive');
@@ -2846,8 +4091,8 @@ const wakeSave = document.getElementById('wakeSave');
 const wakeSaved = document.getElementById('wakeSaved');
 
 // Friendly tab titles for the group headings (fallback to the raw key).
-const TAB_TITLES = {{ voice:'Voice / Audio', ai:'AI / Models',
-  privacy:'Privacy / Ambient', integrations:'Integrations', advanced:'Advanced' }};
+const TAB_TITLES = { voice:'Voice / Audio', ai:'AI / Models',
+  privacy:'Privacy / Ambient', integrations:'Integrations', advanced:'Advanced' };
 // The wake-word knob the banner switch drives — the headline control the owner
 // asked for. START_IN_STANDBY is the "Alexa-style wake-word mode" toggle;
 // WAKE_WORD_AUTOSTART (the neural detector) is surfaced as a normal row below.
@@ -2865,60 +4110,70 @@ const viewActions = document.getElementById('viewActions');
 const viewVoice   = document.getElementById('viewVoice');
 const viewCamera  = document.getElementById('viewCamera');
 const viewMemory  = document.getElementById('viewMemory');
+const navEl = document.getElementById('nav');
+const wrapEl = document.getElementById('wrap');
 
-// One registry drives show/hide + nav-active for EVERY view. Settings keeps its
-// own settingsLoaded flag (the wake-word save resets it to force a reload), so it
-// is dispatched specially below; the other lazy tabs use per-tab loaded flags.
-// System + Camera additionally run a while-visible refresh timer (stopped on
-// leave) so their live data updates without touching the other tabs.
-const VIEWS = {{
-  live:     {{nav:navLive,     view:viewLive}},
-  system:   {{nav:navSystem,   view:viewSystem}},
-  actions:  {{nav:navActions,  view:viewActions}},
-  voice:    {{nav:navVoice,    view:viewVoice}},
-  camera:   {{nav:navCamera,   view:viewCamera}},
-  memory:   {{nav:navMemory,   view:viewMemory}},
-  settings: {{nav:navSettings, view:viewSettings}},
-}};
+// One registry drives show/hide + nav-active for EVERY view (skill panels add
+// themselves as 'panel:<id>'). Settings keeps its own settingsLoaded flag (the
+// wake-word save resets it to force a reload); the other lazy tabs use per-tab
+// loaded flags. System, Camera and panels run a while-visible refresh timer
+// (stopped on leave) so their live data updates without touching other tabs.
+const VIEWS = {
+  live:     {nav:navLive,     view:viewLive},
+  system:   {nav:navSystem,   view:viewSystem},
+  actions:  {nav:navActions,  view:viewActions},
+  voice:    {nav:navVoice,    view:viewVoice},
+  camera:   {nav:navCamera,   view:viewCamera},
+  memory:   {nav:navMemory,   view:viewMemory},
+  settings: {nav:navSettings, view:viewSettings},
+};
 let currentView = 'live';
-let systemTimer = null, cameraTimer = null;
+let systemTimer = null, cameraTimer = null, panelTimer = null;
 let actionsLoaded = false, voiceLoaded = false, memoryLoaded = false;
 
-function stopViewTimers() {{
-  if (systemTimer) {{ clearInterval(systemTimer); systemTimer = null; }}
-  if (cameraTimer) {{
+function stopViewTimers() {
+  if (systemTimer) { clearInterval(systemTimer); systemTimer = null; }
+  if (cameraTimer) {
     clearInterval(cameraTimer); cameraTimer = null;
     // An MJPEG stream holds a server worker thread AND one of the browser's ~6
     // connections-per-origin for as long as the <img> keeps its src. Leaving the
     // Camera tab must hand both back.
     stopCameraStreams();
-  }}
-}}
+  }
+  if (panelTimer) { clearInterval(panelTimer); panelTimer = null; }
+  stopPanelMedia();
+}
 
-function showView(which) {{
+function showView(which) {
   if (!VIEWS[which]) which = 'live';
   currentView = which;
-  Object.keys(VIEWS).forEach(k => {{
+  lsSet('jarvis.view', which);
+  Object.keys(VIEWS).forEach(k => {
     const on = (k === which);
     VIEWS[k].view.hidden = !on;
     VIEWS[k].nav.classList.toggle('active', on);
-  }});
+    if (on) VIEWS[k].nav.setAttribute('aria-current', 'page');
+    else VIEWS[k].nav.removeAttribute('aria-current');
+  });
   stopViewTimers();
-  if (which === 'settings') {{ if (!settingsLoaded) loadSettings(); }}
-  else if (which === 'system') {{
+  if (document.hidden) return;              // resumed by the visibilitychange handler
+  if (which === 'settings') { if (!settingsLoaded) loadSettings(); }
+  else if (which === 'system') {
     loadSystem();
-    systemTimer = setInterval(() => {{ if (autoOn()) loadSystem(); }}, 2000);
-  }}
-  else if (which === 'actions') {{ if (!actionsLoaded) {{ loadActions(); actionsLoaded = true; }} }}
-  else if (which === 'voice')   {{ if (!voiceLoaded)   {{ loadVoices();  voiceLoaded  = true; }} }}
-  else if (which === 'memory')  {{ if (!memoryLoaded)  {{ loadMemory();  memoryLoaded = true; }} }}
-  else if (which === 'camera')  {{
-    // refreshCamera() is now a SUPERVISOR tick (re-arms dropped MJPEG streams, or
-    // polls stills in fallback mode) - it no longer sets the frame rate.
-    refreshCamera();
+    systemTimer = setInterval(() => { if (pollsWanted()) loadSystem(); }, 2000);
+  }
+  else if (which === 'actions') { if (!actionsLoaded) { loadActions(); actionsLoaded = true; } }
+  else if (which === 'voice')   { if (!voiceLoaded)   { loadVoices();  voiceLoaded  = true; } }
+  else if (which === 'memory')  { if (!memoryLoaded)  { loadMemory();  memoryLoaded = true; } }
+  else if (which === 'camera')  {
+    // refreshCamera() is a SUPERVISOR tick (re-arms dropped MJPEG streams once
+    // their per-tile backoff allows, or polls stills in fallback mode) - it
+    // does not set the frame rate.
+    loadCameraTiles(true);
     cameraTimer = setInterval(refreshCamera, CAM_TICK_MS);
-  }}
-}}
+  }
+  else if (which.indexOf('panel:') === 0) startPanelView(VIEWS[which].panel);
+}
 navLive.addEventListener('click', () => showView('live'));
 navSystem.addEventListener('click', () => showView('system'));
 navActions.addEventListener('click', () => showView('actions'));
@@ -2927,82 +4182,94 @@ navCamera.addEventListener('click', () => showView('camera'));
 navMemory.addEventListener('click', () => showView('memory'));
 navSettings.addEventListener('click', () => showView('settings'));
 
-// Build ONE control for a schema item, returning {{el, read}} where read() yields
+// A hidden tab stops every stream and timer; coming back restarts the current
+// view and catches the live data up at once.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { stopViewTimers(); return; }
+  showView(currentView);
+  if (autoOn()) { refreshStatus(); refreshLog(); }
+});
+
+// Build ONE control for a schema item, returning {el, read} where read() yields
 // the value to POST. bool→checkbox, enum→select, combo→text+datalist, int/float→
-// number, everything else→text.
-function buildControl(it) {{
+// number, everything else→text. Every control carries an aria-label.
+function buildControl(it) {
   const t = it.type;
+  const label = it.label || it.name;
   // Secret knobs (e.g. the web token) never receive the live value from the
   // server — it's redacted. Render a password field; an EMPTY save means "keep
   // the current secret" (the click handler skips the POST), so a blank field
   // can't wipe an existing token. Type something to replace it.
-  if (it.secret) {{
+  if (it.secret) {
     const inp=document.createElement('input'); inp.type='password';
-    inp.autocomplete='new-password';
+    inp.autocomplete='new-password'; inp.setAttribute('aria-label', label);
     inp.placeholder = it.is_set ? '•••••• (set — type to replace)' : '(not set)';
-    return {{el:inp, read:()=>inp.value, secret:true}};
-  }}
-  if (t === 'bool') {{
+    return {el:inp, read:()=>inp.value, secret:true};
+  }
+  if (t === 'bool') {
     const cb = document.createElement('input'); cb.type='checkbox';
-    cb.checked = !!it.value; return {{el:cb, read:()=>cb.checked}};
-  }}
-  if (t === 'enum') {{
-    const sel = document.createElement('select');
-    (it.choices||[]).forEach(c => {{ const o=document.createElement('option');
+    cb.setAttribute('aria-label', label);
+    cb.checked = !!it.value; return {el:cb, read:()=>cb.checked};
+  }
+  if (t === 'enum') {
+    const sel = document.createElement('select'); sel.setAttribute('aria-label', label);
+    (it.choices||[]).forEach(c => { const o=document.createElement('option');
       o.value=c; o.textContent=c; if (String(it.value)===String(c)) o.selected=true;
-      sel.appendChild(o); }});
-    return {{el:sel, read:()=>sel.value}};
-  }}
-  if (t === 'int' || t === 'float') {{
+      sel.appendChild(o); });
+    return {el:sel, read:()=>sel.value};
+  }
+  if (t === 'int' || t === 'float') {
     const inp=document.createElement('input'); inp.type='number';
+    inp.setAttribute('aria-label', label);
     if (t==='float') inp.step='any';
     inp.value = (it.value==null?'':it.value);
-    return {{el:inp, read:()=> t==='int'?parseInt(inp.value,10):parseFloat(inp.value)}};
-  }}
+    return {el:inp, read:()=> t==='int'?parseInt(inp.value,10):parseFloat(inp.value)};
+  }
   // combo (free text + suggestions), str, device, text, routing → a text input.
   // combo gets a datalist of its suggested choices; the user can still type any.
   const inp=document.createElement('input'); inp.type='text';
+  inp.setAttribute('aria-label', label);
   let val = it.value;
   if (val && typeof val === 'object') val = JSON.stringify(val);   // routing/list → shown as JSON
   inp.value = (val==null?'':val);
-  if (t === 'combo' && (it.choices||[]).length) {{
+  if (t === 'combo' && (it.choices||[]).length) {
     const dl=document.createElement('datalist'); const id='dl_'+it.name;
-    dl.id=id; (it.choices||[]).forEach(c=>{{const o=document.createElement('option');
-      o.value=c; dl.appendChild(o);}}); inp.setAttribute('list', id);
+    dl.id=id; (it.choices||[]).forEach(c=>{const o=document.createElement('option');
+      o.value=c; dl.appendChild(o);}); inp.setAttribute('list', id);
     const frag=document.createDocumentFragment(); frag.appendChild(inp); frag.appendChild(dl);
-    return {{el:frag, read:()=>inp.value, focusEl:inp}};
-  }}
-  return {{el:inp, read:()=>inp.value}};
-}}
+    return {el:frag, read:()=>inp.value, focusEl:inp};
+  }
+  return {el:inp, read:()=>inp.value};
+}
 
-// POST a single {{name,value}} and reflect the outcome in `saved` (a small span).
-async function saveSetting(name, value, saved) {{
+// POST a single {name,value} and reflect the outcome in `saved` (a small span).
+async function saveSetting(name, value, saved) {
   saved.textContent='…'; saved.style.color='var(--muted)';
-  try {{
-    const r = await fetch(q('/api/settings'), {{method:'POST', headers:hdr(),
-      body: JSON.stringify({{name, value}})}});
+  try {
+    const r = await fetch(q('/api/settings'), {method:'POST', headers:hdr(),
+      body: JSON.stringify({name, value})});
     const d = await r.json();
-    if (r.ok && d.ok) {{ saved.textContent='saved ✓'; saved.style.color='#2ee6a6';
-      if (d.note) settingsNote.textContent = d.note; }}
-    else {{ saved.textContent = (d.error||'error'); saved.style.color='#f85149'; }}
-  }} catch(e) {{ saved.textContent='failed'; saved.style.color='#f85149'; }}
-}}
+    if (r.ok && d.ok) { saved.textContent='saved ✓'; saved.style.color='#2ee6a6';
+      if (d.note) settingsNote.textContent = d.note; }
+    else { saved.textContent = (d.error||'error'); saved.style.color='#f85149'; }
+  } catch(e) { saved.textContent='failed'; saved.style.color='#f85149'; }
+}
 
 // Render the whole panel from an /api/settings payload: group by tab, one card per
 // tab, one row per knob (meta + control + per-row Save button + confirmation).
-function renderSettings(payload) {{
+function renderSettings(payload) {
   settingsGroups.innerHTML='';
   const items = payload.settings || [];
   settingsNote.textContent = payload.note || '';
   const tabs = payload.tabs && payload.tabs.length ? payload.tabs
     : Array.from(new Set(items.map(i=>i.tab)));
-  tabs.forEach(tab => {{
+  tabs.forEach(tab => {
     const inTab = items.filter(i => i.tab === tab);
     if (!inTab.length) return;
     const group=document.createElement('div'); group.className='sgroup';
     const h=document.createElement('h2'); h.textContent = TAB_TITLES[tab]||tab;
     group.appendChild(h);
-    inTab.forEach(it => {{
+    inTab.forEach(it => {
       const row=document.createElement('div'); row.className='srow';
       const meta=document.createElement('div'); meta.className='meta';
       meta.innerHTML = '<div class="name"></div>'+(it.help?'<div class="help"></div>':'');
@@ -3013,47 +4280,49 @@ function renderSettings(payload) {{
       ctl.appendChild(c.el);
       const saveBtn=document.createElement('button'); saveBtn.className='save';
       saveBtn.type='button'; saveBtn.textContent='Save';
+      saveBtn.setAttribute('aria-label', 'Save ' + (it.label || it.name));
       const saved=document.createElement('span'); saved.className='saved';
+      saved.setAttribute('aria-live', 'polite');
       // Saved-but-not-yet-live: the file diverges from the running loop's
       // constant, so be honest that this value applies on the next restart.
-      if (it.pending_restart) {{ saved.textContent='pending restart';
-        saved.style.color='var(--muted)'; }}
-      saveBtn.addEventListener('click', () => {{
+      if (it.pending_restart) { saved.textContent='pending restart';
+        saved.style.color='var(--muted)'; }
+      saveBtn.addEventListener('click', () => {
         const v = c.read();
         // Empty save on a secret = "keep the current value" — never POST "" and
         // wipe an existing token by accident.
-        if (c.secret && (v===''||v==null)) {{
+        if (c.secret && (v===''||v==null)) {
           saved.textContent='unchanged'; saved.style.color='var(--muted)'; return;
-        }}
+        }
         saveSetting(it.name, v, saved);
-      }});
+      });
       ctl.appendChild(saveBtn); ctl.appendChild(saved);
       row.appendChild(meta); row.appendChild(ctl);
       group.appendChild(row);
       // Mirror the wake-word row into the top banner switch so the headline
       // toggle and its row stay in sync (the banner is the prominent shortcut).
       if (it.name === WAKE_KEY) wakeToggle.checked = !!it.value;
-    }});
+    });
     settingsGroups.appendChild(group);
-  }});
-}}
+  });
+}
 
-async function loadSettings() {{
-  try {{
-    const r = await fetch(q('/api/settings'), {{headers:hdr()}});
-    if (r.status===401) {{ settingsNote.textContent='unauthorized — token required'; return; }}
+async function loadSettings() {
+  try {
+    const r = await fetch(q('/api/settings'), {headers:hdr()});
+    if (r.status===401) { settingsNote.textContent='unauthorized — token required'; return; }
     const d = await r.json();
     renderSettings(d);
     settingsLoaded = true;
-  }} catch(e) {{ settingsNote.textContent='could not load settings'; }}
-}}
+  } catch(e) { settingsNote.textContent='could not load settings'; }
+}
 
 // The prominent banner switch: saves START_IN_STANDBY directly, then reloads the
 // panel so every mirrored row reflects the new value.
-wakeSave.addEventListener('click', async () => {{
+wakeSave.addEventListener('click', async () => {
   await saveSetting(WAKE_KEY, wakeToggle.checked, wakeSaved);
   settingsLoaded = false; loadSettings();
-}});
+});
 
 // ── SYSTEM TAB ──────────────────────────────────────────────────────────────
 // Live hardware view: a card per GPU (VRAM bar + temp/util/power), a CPU/RAM
@@ -3061,16 +4330,16 @@ wakeSave.addEventListener('click', async () => {{
 const sysMeta = document.getElementById('sysMeta');
 const sysGpus = document.getElementById('sysGpus');
 const sysHost = document.getElementById('sysHost');
-function pctOf(u, t) {{ return (u!=null && t) ? Math.max(0, Math.min(100, Math.round(100*u/t))) : 0; }}
-function kvRow(k, v) {{ const d=document.createElement('div'); d.className='kv';
+function pctOf(u, t) { return (u!=null && t) ? Math.max(0, Math.min(100, Math.round(100*u/t))) : 0; }
+function kvRow(k, v) { const d=document.createElement('div'); d.className='kv';
   d.innerHTML='<span></span><b></b>';
-  d.querySelector('span').textContent=k; d.querySelector('b').textContent=v; return d; }}
-function renderSystem(s) {{
+  d.querySelector('span').textContent=k; d.querySelector('b').textContent=v; return d; }
+function renderSystem(s) {
   sysMeta.textContent = 'version ' + (s.version||'?')
     + (s.uptime!=null ? '  ·  up ' + fmtUptime(s.uptime) : '')
     + (s.routing ? '  ·  ' + s.routing : '');
   sysGpus.innerHTML='';
-  (s.gpus||[]).forEach(g => {{
+  (s.gpus||[]).forEach(g => {
     const c=document.createElement('div'); c.className='card';
     const p=pctOf(g.mem_used_mb, g.mem_total_mb);
     const h=document.createElement('h3');
@@ -3084,12 +4353,12 @@ function renderSystem(s) {{
     c.appendChild(kvRow('Temp', g.temp_c!=null ? g.temp_c + '°C' : 'n/a'));
     c.appendChild(kvRow('Power', g.power_w!=null ? g.power_w + ' W' : 'n/a'));
     sysGpus.appendChild(c);
-  }});
-  if (!(s.gpus||[]).length) {{
+  });
+  if (!(s.gpus||[]).length) {
     const c=document.createElement('div'); c.className='card';
     const h=document.createElement('h3'); h.textContent='GPU'; c.appendChild(h);
     c.appendChild(kvRow('status', 'no nvidia-smi / no GPU')); sysGpus.appendChild(c);
-  }}
+  }
   sysHost.innerHTML='';
   const hc=document.createElement('div'); hc.className='card';
   const hh=document.createElement('h3'); hh.textContent='CPU / Memory'; hc.appendChild(hh);
@@ -3097,7 +4366,7 @@ function renderSystem(s) {{
   hc.appendChild(kvRow('RAM', (s.ram_used_gb!=null && s.ram_total_gb!=null)
     ? s.ram_used_gb + ' / ' + s.ram_total_gb + ' GB' : 'n/a'));
   sysHost.appendChild(hc);
-  (s.disks||[]).forEach(dk => {{
+  (s.disks||[]).forEach(dk => {
     const c=document.createElement('div'); c.className='card';
     const h=document.createElement('h3'); h.textContent='Disk ' + (dk.drive||''); c.appendChild(h);
     const used=(dk.total_gb!=null && dk.free_gb!=null) ? (dk.total_gb - dk.free_gb) : null;
@@ -3108,157 +4377,294 @@ function renderSystem(s) {{
     c.appendChild(kvRow('free', (dk.free_gb!=null?dk.free_gb:'?') + ' / '
       + (dk.total_gb!=null?dk.total_gb:'?') + ' GB'));
     sysHost.appendChild(c);
-  }});
-}}
-async function loadSystem() {{
-  try {{
-    const r = await fetch(q('/api/system'), {{headers:hdr()}});
-    if (r.status===401) {{ sysMeta.textContent='unauthorized — token required'; return; }}
+  });
+}
+async function loadSystem() {
+  try {
+    const r = await fetch(q('/api/system'), {headers:hdr()});
+    if (r.status===401) { sysMeta.textContent='unauthorized — token required'; return; }
     renderSystem(await r.json());
-  }} catch(e) {{ sysMeta.textContent='could not load system info'; }}
-}}
+  } catch(e) { sysMeta.textContent='could not load system info'; }
+}
 
 // ── ACTIONS TAB ─────────────────────────────────────────────────────────────
-// The "access everything" list: search filters the full ~500-action inventory.
-// Each row's name → drops into the Live command box (edit before send); its Send
-// button POSTs the action name straight to /api/say via the shared sendCommand.
+// The "access everything" list, from the LIVE registry (/api/actions). Send
+// runs the action BY NAME through POST /api/action - it no longer types the
+// bare name into the command channel for the LLM to reinterpret. Names the
+// server flags `confirm` (side effects / destructive - see
+// _ACTION_CONFIRM_RULES) ask first. Clicking a name drops it into the Live
+// command box instead (edit before send).
 const actionsCount = document.getElementById('actionsCount');
 const actionsSearch = document.getElementById('actionsSearch');
 const actionsList = document.getElementById('actionsList');
+const actionResult = document.getElementById('actionResult');
 let ALL_ACTIONS = [];
-function speakChipClass(sp) {{
+let ACTIONS_SOURCE = '';
+function speakChipClass(sp) {
   const s=(sp||'').toUpperCase();
   if (s==='VERBATIM') return 'schip verbatim';
   if (s==='INFORMATIVE') return 'schip informative';
   return 'schip';
-}}
-function renderActions(filter) {{
+}
+async function runAction(a, arg, btn) {
+  let confirmed = false;
+  if (a.confirm) {
+    if (!window.confirm('Run "' + a.name + '"?\n\nThis action ' + (a.why || 'has side effects')
+        + '. It runs directly — JARVIS does not double-check it first.')) return;
+    confirmed = true;
+  }
+  if (btn) btn.disabled = true;
+  actionResult.textContent = a.name + ' …';
+  try {
+    let res = await postJSON('/api/action', {name:a.name, arg:arg||'', confirm:confirmed});
+    if (res.status === 409 && res.data.confirm_required && !confirmed) {
+      if (!window.confirm('Run "' + a.name + '"?\n\nThis action ' + (res.data.why || 'has side effects') + '.')) {
+        actionResult.textContent = a.name + ': not run.'; return; }
+      res = await postJSON('/api/action', {name:a.name, arg:arg||'', confirm:true});
+    }
+    const d = res.data || {};
+    if (res.status === 401) actionResult.textContent = 'unauthorized';
+    else if (res.status === 503) actionResult.textContent = a.name + ': ' + (d.error || 'unavailable')
+        + ' — type it in the Live command box instead.';
+    else if (!res.ok) actionResult.textContent = a.name + ': ' + (d.error || ('error ' + res.status));
+    else if (d.status === 'running') actionResult.textContent = a.name + ': started (still running).';
+    else if (d.status === 'queued') actionResult.textContent = a.name + ': queued on the control channel.';
+    else if (d.status === 'error') actionResult.textContent = a.name + ' failed: ' + (d.error || '');
+    else actionResult.textContent = a.name + ': ' + (d.result || 'done.');
+  } catch (e) { actionResult.textContent = a.name + ': send failed'; }
+  finally { if (btn) btn.disabled = false; refreshLog(); }
+}
+function renderActions(filter) {
   const f=(filter||'').trim().toLowerCase();
   actionsList.innerHTML=''; let shown=0, matched=0;
   const frag=document.createDocumentFragment();
-  for (const a of ALL_ACTIONS) {{
+  for (const a of ALL_ACTIONS) {
     if (f && a.name.toLowerCase().indexOf(f)===-1) continue;
     matched++; if (shown>=400) continue;   // cap the DOM; the overflow row below advertises the rest
     const row=document.createElement('div'); row.className='lrow';
     const nm=document.createElement('div'); nm.className='nm'; nm.textContent=a.name;
     nm.title='Click to edit in the Live command box';
-    nm.addEventListener('click', () => {{ textIn.value=a.name; showView('live'); textIn.focus(); }});
+    nm.addEventListener('click', () => { textIn.value=a.name; showView('live'); textIn.focus(); });
     const chip=document.createElement('span'); chip.className=speakChipClass(a.spoken);
     chip.textContent=a.spoken;
+    row.appendChild(nm); row.appendChild(chip);
+    if (a.confirm) {
+      const c=document.createElement('span'); c.className='schip confirm';
+      c.textContent='asks first'; c.title='Confirm needed: ' + (a.why||''); row.appendChild(c);
+    }
+    const arg=document.createElement('input'); arg.type='text'; arg.className='arg';
+    arg.placeholder='arg (optional)'; arg.setAttribute('aria-label', 'Argument for ' + a.name);
     const send=document.createElement('button'); send.type='button';
-    send.className='send'; send.textContent='Send';
-    send.addEventListener('click', () => sendCommand(a.name, {{button:send}}));
-    row.appendChild(nm); row.appendChild(chip); row.appendChild(send);
+    send.className='send' + (a.confirm ? ' danger' : ''); send.textContent='Run';
+    send.setAttribute('aria-label', 'Run ' + a.name);
+    send.addEventListener('click', () => runAction(a, arg.value, send));
+    row.appendChild(arg); row.appendChild(send);
     frag.appendChild(row); shown++;
-  }}
-  if (matched>shown) {{
+  }
+  if (matched>shown) {
     const more=document.createElement('div'); more.className='lrow';
     const m=document.createElement('span'); m.className='muted';
     m.textContent='…'+(matched-shown)+' more — refine your search';
     more.appendChild(m); frag.appendChild(more);
-  }}
+  }
   actionsList.appendChild(frag);
   // The shown qualifier is UNCONDITIONAL: with an empty search the cap still
   // applies, so the header must never claim the full total while rows are cut.
-  actionsCount.textContent = ALL_ACTIONS.length + ' actions  ·  ' + shown + ' shown';
-}}
+  actionsCount.textContent = ALL_ACTIONS.length + ' actions  ·  ' + shown + ' shown'
+    + (ACTIONS_SOURCE === 'live' ? '  ·  live registry' : (ACTIONS_SOURCE ? '  ·  from docs index (JARVIS not reachable)' : ''));
+}
 actionsSearch.addEventListener('input', () => renderActions(actionsSearch.value));
-async function loadActions() {{
-  try {{
-    const r = await fetch(q('/api/actions'), {{headers:hdr()}});
-    if (r.status===401) {{ actionsCount.textContent='unauthorized — token required'; return; }}
+async function loadActions() {
+  try {
+    const r = await fetch(q('/api/actions'), {headers:hdr()});
+    if (r.status===401) { actionsCount.textContent='unauthorized — token required'; return; }
     const d = await r.json();
+    ACTIONS_SOURCE = d.source || '';
     ALL_ACTIONS = (d.actions||[]).slice().sort((a,b)=>a.name.localeCompare(b.name));
     renderActions('');
-  }} catch(e) {{ actionsCount.textContent='could not load actions'; }}
-}}
+  } catch(e) { actionsCount.textContent='could not load actions'; }
+}
 
 // ── VOICE TAB ───────────────────────────────────────────────────────────────
-// Read-then-command: shows the active voice + a button per USABLE clone profile
-// (POSTs "switch to the <name> voice") and a "normal voice" button (POSTs "voice
-// cloning off"), all through the same /api/say inject channel.
+// Shows the REAL engine + voice (it said "normal (en-GB-RyanNeural)" while
+// Kokoro was speaking) and a button per USABLE clone profile (POSTs "switch to
+// the <name> voice") plus a "normal voice" button (POSTs "voice cloning off").
+// Cloning loads Chatterbox on the GPU beside the local LLM - with the 26B model
+// resident that is a known VRAM overload - so a clone button asks first.
 const voiceInfo = document.getElementById('voiceInfo');
 const voiceBtns = document.getElementById('voiceBtns');
-function renderVoices(d) {{
+function cloneWarning(d, name) {
+  const dev = d.clone_device ? (' on ' + d.clone_device) : '';
+  const llm = (d.llm_local && d.local_model) ? (' with the local model ' + d.local_model + ' already loaded') : '';
+  return 'Use the cloned "' + name + '" voice?\n\n'
+    + 'Voice cloning loads the ' + (d.clone_model || 'Chatterbox') + ' model on the GPU' + dev + llm + '. '
+    + 'On this machine that is a known VRAM overload (24 GB card): JARVIS can stall, lose his voice, or crash.\n\n'
+    + 'Continue?';
+}
+function renderVoices(d) {
   const usable=(d.profiles||[]).filter(p=>p.usable);
-  const active = (d.enabled && d.active) ? d.active
-    : ('normal (' + (d.tts_voice||d.tts_backend||'default') + ')');
+  const active = d.summary || ((d.enabled && d.active) ? d.active
+    : ((d.engine || d.tts_backend || 'default') + (d.voice ? ' · ' + d.voice : '')));
   voiceInfo.textContent = 'Active voice: ' + active
-    + '  ·  backend ' + (d.tts_backend||'?')
+    + '  ·  engine ' + (d.engine || d.tts_backend || '?')
     + '  ·  ' + usable.length + ' usable profile(s)';
   voiceBtns.innerHTML='';
-  usable.forEach(p => {{
+  usable.forEach(p => {
     const b=document.createElement('button'); b.type='button';
     b.textContent='Use ' + p.name + (p.source? ' ('+p.source+')':'');
-    b.addEventListener('click', () => sendCommand('switch to the ' + p.name + ' voice', {{button:b}}));
+    b.addEventListener('click', () => {
+      if (!window.confirm(cloneWarning(d, p.name))) return;
+      sendCommand('switch to the ' + p.name + ' voice', {button:b});
+    });
     voiceBtns.appendChild(b);
-  }});
-  if (!usable.length) {{
+  });
+  if (!usable.length) {
     const note=document.createElement('span'); note.className='muted';
     note.style.alignSelf='center'; note.textContent='No usable clone profiles enrolled.  ';
     voiceBtns.appendChild(note);
-  }}
+  }
   const off=document.createElement('button'); off.type='button'; off.className='off';
   off.textContent='Normal voice (cloning off)';
-  off.addEventListener('click', () => sendCommand('voice cloning off', {{button:off}}));
+  off.addEventListener('click', () => sendCommand('voice cloning off', {button:off}));
   voiceBtns.appendChild(off);
-}}
-async function loadVoices() {{
-  try {{
-    const r = await fetch(q('/api/voices'), {{headers:hdr()}});
-    if (r.status===401) {{ voiceInfo.textContent='unauthorized — token required'; return; }}
+}
+async function loadVoices() {
+  try {
+    const r = await fetch(q('/api/voices'), {headers:hdr()});
+    if (r.status===401) { voiceInfo.textContent='unauthorized — token required'; return; }
     renderVoices(await r.json());
-  }} catch(e) {{ voiceInfo.textContent='could not load voices'; }}
-}}
+  } catch(e) { voiceInfo.textContent='could not load voices'; }
+}
 
 // ── CAMERA TAB ──────────────────────────────────────────────────────────────
 // Each tile is an MJPEG STREAM (/api/camera-stream?cam=...): ONE connection the
 // server pushes a new JPEG down the instant JARVIS writes one.
 //
-// It used to re-fetch a STILL every 1000 ms, which pinned the dashboard at 1 fps
-// no matter how fast frames were produced. Measured 2026-09-04 on the live rig: a
-// still request costs ~1.6 ms end to end, so the request was never the cost - the
-// poll interval WAS the frame rate.
+// THE TILES are built from /api/camera-tiles - the RUNNING JARVIS's CAMERAS
+// roster plus the Kinect when it is switched on - instead of a hard-coded
+// left/right/kinect row (2026-09-30 audit: a camera the owner had removed from
+// CAMERAS showed "Webcam off" forever). The same endpoint carries the camera
+// gate's verdict per tile ("retrying in N min"), refreshed every few seconds.
 //
 // On load the tile shows; on error (404 = missing/stale, or the server closing a
 // stream because that camera went off) its own placeholder shows, so one dead
 // camera never blanks the others (2026-07-10 contract, unchanged).
 //
+// BACKOFF (2026-09-30): a dead tile used to be re-armed every CAM_TICK_MS
+// (4x a second, forever). Each tile now waits CAM_TICK_MS * 2^errors before
+// its next try (capped at CAM_BACKOFF_MAX_MS), and no sooner than the camera
+// gate says JARVIS itself will retry. A working tile is unaffected.
+//
 // FALLBACK: if streaming never works in this browser (no tile ever loaded from a
 // stream and every tile has errored repeatedly) we drop back to polling the STILL
-// endpoint every CAM_TICK_MS - still 4x the old rate, identical behaviour.
-const CAM_TICK_MS = 250;          // supervisor tick == still-poll interval
-let   camMode = 'stream';         // 'stream' | 'poll'
-let   camEverStreamed = false;    // a stream has delivered at least one frame
-const camPairs = [
-  ['camLeft', 'camLeftOff'], ['camRight', 'camRightOff'],
-  ['camKinect', 'camKinectOff'],
-].map(([imgId, offId]) => {{
-  const img = document.getElementById(imgId);
-  const off = document.getElementById(offId);
+// endpoint - identical behaviour, same backoff.
+const CAM_TICK_MS = 250;            // supervisor tick == still-poll interval
+const CAM_BACKOFF_MAX_MS = 60000;   // a dead tile re-arms at most once a minute
+const CAM_TILES_REFRESH_MS = 5000;  // gate verdicts / roster refresh
+let   camMode = 'stream';           // 'stream' | 'poll'
+let   camEverStreamed = false;      // a stream has delivered at least one frame
+let   camPairs = [];                // [[img, off], ...] for the tiles on screen
+let   camTiles = [];
+let   camTilesAt = 0, camTilesBusy = false;
+const camGrid = document.getElementById('camgrid');
+const camNote = document.getElementById('camNote');
+
+function camBackoffMs(errs) {
+  return Math.min(CAM_BACKOFF_MAX_MS, CAM_TICK_MS * Math.pow(2, Math.max(0, errs)));
+}
+function camDetail(off, text) {
+  const det = off.querySelector('.camdetail');
+  if (det) det.textContent = text || '';
+}
+function camSay(off, message, detail) {
+  const msg = off.querySelector('.cammsg');
+  if (msg) msg.textContent = message; else off.textContent = message;
+  camDetail(off, detail);
+  off.title = detail || '';
+}
+
+function buildCameraTiles(payload) {
+  const tiles = (payload && payload.tiles) || [];
+  const sig = tiles.map(t => t.cam).join(',');
+  if (camGrid.dataset.sig !== sig) {
+    stopCameraStreams();
+    camGrid.innerHTML = '';
+    camPairs = tiles.map(t => {
+      const fig = document.createElement('figure'); fig.className = 'camtile';
+      const img = document.createElement('img');
+      img.id = 'cam_' + t.cam; img.dataset.cam = t.cam; img.alt = t.label || t.cam;
+      const off = document.createElement('div'); off.className = 'camoff';
+      off.id = 'cam_' + t.cam + 'Off';
+      off.innerHTML = '<div class="cammsg">checking…</div><div class="camdetail"></div>';
+      const cap = document.createElement('figcaption'); cap.textContent = t.label || t.cam;
+      fig.appendChild(img); fig.appendChild(off); fig.appendChild(cap);
+      camGrid.appendChild(fig);
+      wireCameraTile(img, off);
+      return [img, off];
+    });
+    camTiles = camPairs.map(([img]) => img);
+    camGrid.dataset.sig = sig;
+    camNote.textContent = tiles.length
+      ? ('Live cameras from ' + (payload.source === 'live' ? "JARVIS's camera list" : 'the default set (JARVIS not reachable)')
+         + ' — each tile updates while its camera is on.')
+      : 'No cameras are configured in JARVIS (CAMERAS is empty and the Kinect is off).';
+  }
+  // The gate's verdict per tile: shown under a DOWN tile's sentence, and the
+  // earliest moment that tile may re-arm (JARVIS will not open it sooner).
+  const byCam = {};
+  for (const t of tiles) byCam[t.cam] = t;
+  for (const [img, off] of camPairs) {
+    const g = (byCam[img.dataset.cam] || {}).gate;
+    img.dataset.gate = g ? g.state : '';
+    if (g && g.retry_in_s != null) {
+      const until = Date.now() + Math.min(CAM_BACKOFF_MAX_MS, 1000 * g.retry_in_s);
+      if (img.dataset.streaming !== '1') img.dataset.nextTry = String(Math.max(+img.dataset.nextTry || 0, until));
+    }
+    if (g && off.style.display !== 'none' && img.dataset.streaming !== '1') {
+      camDetail(off, g.message);
+      // A tile the gate is holding may never be armed before its countdown,
+      // so it would never fire `error` and never get its sentence: ask now.
+      explainTile(img, off);
+    }
+  }
+}
+function loadCameraTiles(force) {
+  const now = Date.now();
+  if (camTilesBusy || (!force && now - camTilesAt < CAM_TILES_REFRESH_MS)) return;
+  camTilesAt = now; camTilesBusy = true;
+  fetch(q('/api/camera-tiles'), {headers:hdr()})
+    .then(r => r.ok ? r.json() : null)
+    .then(j => { if (j) buildCameraTiles(j); if (force) refreshCamera(); })
+    .catch(() => {})
+    .finally(() => { camTilesBusy = false; });
+}
+
+function wireCameraTile(img, off) {
   img.dataset.errs = '0';
   img.dataset.loadAt = '0';
-  img.addEventListener('load',  () => {{
+  img.dataset.nextTry = '0';
+  img.addEventListener('load',  () => {
     img.style.display='block'; off.style.display='none';
     img.dataset.errs = '0';
+    img.dataset.nextTry = '0';
     img.dataset.loadAt = String(Date.now());
     // Drop the old explanation and the throttle: the NEXT outage may have a
     // different cause, and a stale sentence sitting behind a live tile is
     // exactly the kind of leftover that gets read as current.
-    off.textContent = 'checking\u2026'; off.title = '';
+    camSay(off, 'checking…', '');
     img.dataset.reasonAt = '0';
     if (camMode === 'stream' && img.dataset.streaming === '1') camEverStreamed = true;
-  }});
-  img.addEventListener('error', () => {{
-    img.dataset.errs = String((+img.dataset.errs || 0) + 1);
+  });
+  img.addEventListener('error', () => {
+    const errs = (+img.dataset.errs || 0) + 1;
+    img.dataset.errs = String(errs);
+    img.dataset.nextTry = String(Math.max(+img.dataset.nextTry || 0, Date.now() + camBackoffMs(errs)));
     // Streaming is broken in this browser only if it NEVER worked anywhere.
-    if (camMode === 'stream' && !camEverStreamed &&
+    if (camMode === 'stream' && !camEverStreamed && camPairs.length &&
         camPairs.every(([t]) => (+t.dataset.errs || 0) >= 3)) camMode = 'poll';
     tileDown(img, off);
-  }});
-  return [img, off];
-}});
-const camTiles = camPairs.map(([img]) => img);
+  });
+}
 
 // WHY THE TILE ASKS THE SERVER
 // ---------------------------------
@@ -3269,49 +4675,59 @@ const camTiles = camPairs.map(([img]) => img);
 // untouched: while a camera works this never runs, and neither does the
 // device-enumeration probe behind it.
 //
-// Throttled per tile (REASON_MIN_MS): the supervisor re-arms a dead stream every
-// CAM_TICK_MS, so each failing tile would otherwise ask 4x a second forever. And
-// the supervisor itself only ticks while the Camera tab is open (showView starts
-// cameraTimer, stopViewTimers kills it), so a dashboard sitting on any other tab
-// asks nothing and the device probe never fires at all.
+// Throttled per tile (REASON_MIN_MS), and the supervisor itself only ticks
+// while the Camera tab is open (showView starts cameraTimer, stopViewTimers
+// kills it), so a dashboard sitting on any other tab asks nothing and the
+// device probe never fires at all.
 const REASON_MIN_MS = 4000;
-function explainTile(img, off) {{
+function explainTile(img, off) {
   const now = Date.now();
   if (img.dataset.reasonBusy === '1') return;
   if (now - (+img.dataset.reasonAt || 0) < REASON_MIN_MS) return;
   img.dataset.reasonAt = String(now);
   img.dataset.reasonBusy = '1';
-  fetch(q('/api/camera-reason?cam=' + img.dataset.cam), {{headers:hdr()}})
+  fetch(q('/api/camera-reason?cam=' + img.dataset.cam), {headers:hdr()})
     .then(r => r.ok ? r.json() : null)
-    .then(j => {{
+    .then(j => {
       // Only overwrite while the tile is still DOWN: a frame may have arrived
       // between the error and this reply, and stamping "no picture" over a
       // working tile would be its own little lie.
-      if (j && j.message && off.style.display !== 'none') {{
-        off.textContent = j.message;
-        off.title = j.detail || '';
-      }}
-      // THE WAY OUT.  An `error` clears dataset.streaming, so the CAM_TICK_MS
-      // supervisor re-arms this tile ~4x a second - forever, if the stream is
-      // refused every time (8 slots = 3 tiles x 3 tabs).  camMode's own fallback
-      // cannot rescue it: that needs !camEverStreamed, which the other two
-      // working tiles have already falsified.  So when the SERVER has
-      // established the camera is producing frames, the broken part is this
-      // page's stream: this ONE tile stops asking for one and polls stills
-      // instead - the same tick, but every request now returns a picture.
-      // 'stream_busy' is proof (all slots taken -> the next request IS a 503),
-      // so it demotes at once; 'live' waits for 3 consecutive failures so a
-      // single dropped connection does not cost the session its pushed frames.
-      if (j && img.dataset.mode !== 'poll' &&
+      if (j && j.message && off.style.display !== 'none') {
+        camSay(off, j.message, j.detail || '');
+      }
+      // A camera JARVIS will never write (not in CAMERAS / Kinect off) is
+      // never re-armed: nothing will ever answer.
+      if (j && (j.state === 'not_configured' || j.state === 'disabled')) {
+        img.dataset.mode = 'dead';
+        img.dataset.streaming = '';
+      }
+      // The camera GATE says when JARVIS itself will try again: re-arming the
+      // tile before that only re-asks a question with a known answer.
+      if (j && j.retry_in_s != null) {
+        img.dataset.nextTry = String(Math.max(+img.dataset.nextTry || 0,
+          Date.now() + Math.min(CAM_BACKOFF_MAX_MS, 1000 * j.retry_in_s)));
+      }
+      // THE WAY OUT.  An `error` clears dataset.streaming, so the supervisor
+      // re-arms this tile - forever, if the stream is refused every time (8
+      // slots = 3 tiles x 3 tabs).  camMode's own fallback cannot rescue it:
+      // that needs !camEverStreamed, which the other working tiles have
+      // already falsified.  So when the SERVER has established the camera is
+      // producing frames, the broken part is this page's stream: this ONE tile
+      // stops asking for one and polls stills instead.  'stream_busy' is proof
+      // (all slots taken -> the next request IS a 503), so it demotes at once;
+      // 'live' waits for 3 consecutive failures so a single dropped connection
+      // does not cost the session its pushed frames.
+      if (j && img.dataset.mode !== 'poll' && img.dataset.mode !== 'dead' &&
           (j.state === 'stream_busy' ||
-           (j.state === 'live' && (+img.dataset.errs || 0) >= 3))) {{
+           (j.state === 'live' && (+img.dataset.errs || 0) >= 3))) {
         img.dataset.mode = 'poll';
         img.dataset.streaming = '';
-      }}
-    }})
-    .catch(() => {{}})
-    .finally(() => {{ img.dataset.reasonBusy = ''; }});
-}}
+        img.dataset.nextTry = '0';
+      }
+    })
+    .catch(() => {})
+    .finally(() => { img.dataset.reasonBusy = ''; });
+}
 
 // ── MID-STREAM DEATH ────────────────────────────────────────────────────────
 // THE DEFECT THIS FIXES (2026-09-05): a camera that died WHILE STREAMING left
@@ -3332,9 +4748,7 @@ function explainTile(img, off) {{
 // The tile is therefore supervised on our own clock. Once a second the tick
 // asks /api/camera-live — three os.stat calls, the same staleness rule
 // _stream_camera uses to decide when to close, and deliberately nowhere near
-// the reason ladder or the ~0.7 s device probe. That is one ~60-byte JSON per
-// second while the Camera tab is open (the still-polling design this replaced
-// was already fetching three JPEGs a second) and nothing on any other tab.
+// the reason ladder or the ~0.7 s device probe.
 //
 // It may only ever take a tile DOWN. A fresh FILE is not proof that THIS
 // browser is receiving frames, so bringing a tile up stays the stream's job.
@@ -3343,7 +4757,7 @@ let camLiveAt = 0, camLiveBusy = false;
 
 // The ONE way a tile goes dark, shared by the `error` event and the supervisor,
 // so a tile can never be hidden without also being explained.
-function tileDown(img, off) {{
+function tileDown(img, off) {
   img.style.display='none'; off.style.display='flex';
   img.dataset.streaming = '';                         // let the tick re-arm it
   // Drop the frozen frame and hand back the connection slot. Guarded on the
@@ -3351,65 +4765,71 @@ function tileDown(img, off) {{
   // the re-entry stops after one pass instead of looping.
   if (img.hasAttribute('src')) img.removeAttribute('src');
   explainTile(img, off);
-}}
+}
 
-function checkCameraLiveness() {{
+function checkCameraLiveness() {
   if (camMode !== 'stream') return;    // poll mode 404s on its own every tick
   const now = Date.now();
   if (camLiveBusy || now - camLiveAt < CAM_LIVE_MIN_MS) return;
   camLiveAt = now; camLiveBusy = true;
   const asked = now;
-  fetch(q('/api/camera-live'), {{headers:hdr()}})
+  fetch(q('/api/camera-live'), {headers:hdr()})
     .then(r => r.ok ? r.json() : null)
-    .then(j => {{
+    .then(j => {
       if (!j || !j.cams) return;
-      for (const [img, off] of camPairs) {{
+      for (const [img, off] of camPairs) {
         if (j.cams[img.dataset.cam] !== false) continue;   // fresh, or unknown
         if (img.dataset.streaming !== '1') continue;       // already down
         // A frame landed after we asked, so this answer is out of date — say
         // nothing rather than blanking a camera that just came back.
         if ((+img.dataset.loadAt || 0) > asked) continue;
         tileDown(img, off);
-      }}
-    }})
-    .catch(() => {{}})
-    .finally(() => {{ camLiveBusy = false; }});
-}}
+      }
+    })
+    .catch(() => {})
+    .finally(() => { camLiveBusy = false; });
+}
 
-function startCameraStreams() {{
-  for (const img of camTiles) {{
+function camMayTry(img) {
+  return img.dataset.mode !== 'dead' && Date.now() >= (+img.dataset.nextTry || 0);
+}
+function startCameraStreams() {
+  for (const img of camTiles) {
     if (img.dataset.mode === 'poll') continue;        // demoted: it polls stills
     if (img.dataset.streaming === '1') continue;      // already connected
+    if (!camMayTry(img)) continue;                    // backing off / never configured
     img.dataset.streaming = '1';
     img.src = q('/api/camera-stream?cam=' + img.dataset.cam);
-  }}
-}}
-function stopCameraStreams() {{
-  for (const img of camTiles) {{
+  }
+}
+function stopCameraStreams() {
+  for (const img of camTiles) {
     img.dataset.streaming = '';
     img.removeAttribute('src');                       // aborts the connection
-  }}
-}}
-function pollTile(img) {{
+  }
+}
+function pollTile(img) {
+  if (!camMayTry(img)) return;
   img.dataset.streaming = '';
   img.src = q('/api/camera-preview?cam=' + img.dataset.cam + '&t=' + Date.now());
-}}
-function refreshCamera() {{
+}
+function refreshCamera() {
   // One tick drives both modes: re-arm any dropped stream, or poll stills.
-  if (!autoOn()) {{ stopCameraStreams(); return; }}
-  if (camMode === 'stream') {{
+  if (!autoOn() || document.hidden) { stopCameraStreams(); return; }
+  loadCameraTiles(false);
+  if (camMode === 'stream') {
     // Supervise BEFORE re-arming. The DOM never reports a stream that ENDED
     // (measured — see the MID-STREAM DEATH note above), so this is the only
     // thing on the page that can notice a camera which died while streaming.
     checkCameraLiveness();
     startCameraStreams();
-    // A tile demoted by explainTile polls while the REST of the page still
-    // streams: its stream is the thing that is broken, not the others'.
+    // A tile demoted by the reason check polls while the REST of the page
+    // still streams: its stream is the thing that is broken, not the others'.
     for (const img of camTiles) if (img.dataset.mode === 'poll') pollTile(img);
     return;
-  }}
+  }
   for (const img of camTiles) pollTile(img);
-}}
+}
 
 // ── MEMORY TAB ──────────────────────────────────────────────────────────────
 // Fact + episode counts and a searchable, scrollable list of long-term facts.
@@ -3417,48 +4837,351 @@ const memCount = document.getElementById('memCount');
 const memSearch = document.getElementById('memSearch');
 const memFacts = document.getElementById('memFacts');
 let ALL_FACTS = [];
-function renderFacts(filter) {{
+function renderFacts(filter) {
   const f=(filter||'').trim().toLowerCase();
   memFacts.innerHTML=''; let shown=0, matched=0;
   const frag=document.createDocumentFragment();
-  for (const fact of ALL_FACTS) {{
+  for (const fact of ALL_FACTS) {
     if (f && (fact.text||'').toLowerCase().indexOf(f)===-1) continue;
     matched++; if (shown>=400) continue;   // same DOM cap as renderActions — and the same honest overflow row
     const row=document.createElement('div'); row.className='lrow';
     const txt=document.createElement('div'); txt.className='txt'; txt.textContent=fact.text;
     row.appendChild(txt);
-    if (fact.source) {{ const chip=document.createElement('span'); chip.className='schip';
-      chip.textContent=fact.source; row.appendChild(chip); }}
+    if (fact.source) { const chip=document.createElement('span'); chip.className='schip';
+      chip.textContent=fact.source; row.appendChild(chip); }
     frag.appendChild(row); shown++;
-  }}
-  if (matched>shown) {{
+  }
+  if (matched>shown) {
     const more=document.createElement('div'); more.className='lrow';
     const m=document.createElement('span'); m.className='muted';
     m.textContent='…'+(matched-shown)+' more — refine your search';
     more.appendChild(m); frag.appendChild(more);
-  }}
+  }
   memFacts.appendChild(frag);
   if (!ALL_FACTS.length) memFacts.innerHTML=
     '<div class="lrow"><span class="muted">no facts stored</span></div>';
-}}
+}
 memSearch.addEventListener('input', () => renderFacts(memSearch.value));
-async function loadMemory() {{
-  try {{
-    const r = await fetch(q('/api/memory'), {{headers:hdr()}});
-    if (r.status===401) {{ memCount.textContent='unauthorized — token required'; return; }}
+async function loadMemory() {
+  try {
+    const r = await fetch(q('/api/memory'), {headers:hdr()});
+    if (r.status===401) { memCount.textContent='unauthorized — token required'; return; }
     const d = await r.json();
     ALL_FACTS = d.facts||[];
-    const c = d.counts||{{}};
+    const c = d.counts||{};
     memCount.textContent = (c.facts!=null?c.facts:ALL_FACTS.length) + ' facts · '
       + (c.episodes!=null?c.episodes:0) + ' episodes';
     renderFacts('');
-  }} catch(e) {{ memCount.textContent='could not load memory'; }}
-}}
+  } catch(e) { memCount.textContent='could not load memory'; }
+}
 
+// ── SKILL PANELS (core/web_panels.py) ────────────────────────────────────────
+// Every panel a skill declares in WEB_PANELS becomes a nav tab + a view built by
+// ONE generic widget renderer from its metadata (/api/panels), so most panels
+// need no custom JS. State is polled ONLY while that panel is visible (and the
+// page is), at the panel's poll_ms. Actions go to POST /api/panel/<id>/action,
+// which calls the skill's callable directly (never the LLM).
+//
+// HOLD buttons (momentary control) resend their action at the action's rate_hz
+// while pressed, and send the panel's stop_action the moment the press ends:
+// pointerup / pointercancel / pointerleave, the window losing focus, the tab
+// being hidden, or the view being left. E-STOP buttons are pinned in a fixed
+// dock visible on every tab, stop every hold first, and never ask to confirm.
+let PANELS = [];
+const panelUpdaters = {};        // panel id -> [fn(state)]
+const panelMedia = {};           // panel id -> [img] live stream widgets
+const HOLD_STOPPERS = [];        // every hold button's release function
+const estopDock = document.getElementById('estopDock');
+
+function stopAllHolds() { for (const s of HOLD_STOPPERS) { try { s(); } catch (e) {} } }
+async function panelAction(p, name, args, opts) {
+  opts = opts || {};
+  const meta = (p.actions || {})[name] || {};
+  let confirmed = false;
+  if (meta.confirm && !opts.noConfirm) {
+    if (!window.confirm((meta.danger ? 'DANGER — ' : '') + (meta.label || name) + '?\n\nRun it on "' + p.title + '"?')) return null;
+    confirmed = true;
+  }
+  const out = document.getElementById('pstale_' + p.id);
+  try {
+    const res = await postJSON('/api/panel/' + encodeURIComponent(p.id) + '/action',
+                               {name: name, args: args || {}, confirm: confirmed});
+    if (!opts.quiet && out) {
+      if (res.ok) out.textContent = '';
+      else out.textContent = (meta.label || name) + ': ' + ((res.data && res.data.error) || res.status);
+    } else if (!res.ok && res.status !== 429 && out) {
+      out.textContent = (meta.label || name) + ': ' + ((res.data && res.data.error) || res.status);
+    }
+    return res;
+  } catch (e) { if (out) out.textContent = (meta.label || name) + ': send failed'; return null; }
+}
+function bindHold(btn, p, w) {
+  const rate = ((p.actions || {})[w.action] || {}).rate_hz || 4;
+  let timer = null, active = false;
+  const send = () => panelAction(p, w.action, w.args || {}, {quiet: true, noConfirm: true});
+  const start = (ev) => {
+    if (ev) ev.preventDefault();
+    if (active) return;
+    active = true; btn.classList.add('held'); btn.setAttribute('aria-pressed', 'true');
+    // NO pointer capture: a captured pointer never fires pointerleave, so
+    // sliding off the button would keep driving (measured in headless Edge
+    // 2026-09-30). Touch pointers are captured IMPLICITLY, so release that too.
+    try {
+      if (ev && ev.pointerId != null && btn.hasPointerCapture(ev.pointerId))
+        btn.releasePointerCapture(ev.pointerId);
+    } catch (e) {}
+    send();
+    timer = setInterval(send, Math.max(33, Math.round(1000 / rate)));
+  };
+  const stop = () => {
+    if (!active) return;
+    active = false; btn.classList.remove('held'); btn.setAttribute('aria-pressed', 'false');
+    if (timer) { clearInterval(timer); timer = null; }
+    if (p.stop_action) panelAction(p, p.stop_action, {}, {quiet: true, noConfirm: true});
+  };
+  btn.addEventListener('pointerdown', start);
+  btn.addEventListener('pointerup', stop);
+  btn.addEventListener('pointercancel', stop);
+  btn.addEventListener('pointerleave', stop);
+  btn.addEventListener('keydown', (ev) => { if ((ev.key === ' ' || ev.key === 'Enter') && !ev.repeat) start(ev); });
+  btn.addEventListener('keyup', (ev) => { if (ev.key === ' ' || ev.key === 'Enter') stop(); });
+  btn.addEventListener('contextmenu', (ev) => ev.preventDefault());
+  window.addEventListener('blur', stop);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); });
+  HOLD_STOPPERS.push(stop);
+}
+function pwBox(w, span) {
+  const box = document.createElement('div'); box.className = 'pw' + (span ? ' span' : '');
+  if (w.label) { const k = document.createElement('div'); k.className = 'k'; k.textContent = w.label; box.appendChild(k); }
+  return box;
+}
+function fmtVal(v, unit) {
+  if (v === undefined || v === null || v === '') return '—';
+  if (typeof v === 'object') v = JSON.stringify(v);
+  return String(v) + (unit ? ' ' + unit : '');
+}
+function renderWidget(p, w) {
+  const ups = panelUpdaters[p.id];
+  const t = w.type;
+  if (t === 'estop') {
+    const b = document.createElement('button'); b.type = 'button';
+    b.textContent = (w.label || 'STOP') + ' — ' + p.title;
+    b.setAttribute('aria-label', 'Emergency stop: ' + p.title);
+    b.addEventListener('click', () => { stopAllHolds(); panelAction(p, w.action, {}, {noConfirm: true}); });
+    estopDock.appendChild(b); estopDock.hidden = false;
+    return null;
+  }
+  if (t === 'stat' || t === 'text') {
+    const box = pwBox(w, t === 'text');
+    const v = document.createElement(t === 'text' ? 'pre' : 'div'); v.className = 'v';
+    box.appendChild(v);
+    ups.push((s) => { v.textContent = fmtVal(s[w.key], w.unit); });
+    return box;
+  }
+  if (t === 'badge') {
+    const box = pwBox(w);
+    const v = document.createElement('span'); v.className = 'badge'; box.appendChild(v);
+    ups.push((s) => { const val = s[w.key]; v.textContent = fmtVal(val);
+      v.className = 'badge ' + (((w.map || {})[String(val)]) || 'info'); });
+    return box;
+  }
+  if (t === 'gauge') {
+    const box = pwBox(w);
+    const v = document.createElement('div'); v.className = 'v';
+    const bar = document.createElement('div'); bar.className = 'bar';
+    const fill = document.createElement('i'); bar.appendChild(fill);
+    bar.setAttribute('role', 'meter'); bar.setAttribute('aria-valuemin', w.min); bar.setAttribute('aria-valuemax', w.max);
+    box.appendChild(v); box.appendChild(bar);
+    ups.push((s) => { const val = Number(s[w.key]);
+      const ok = !isNaN(val) && s[w.key] !== null && s[w.key] !== undefined;
+      v.textContent = ok ? fmtVal(val, w.unit) : '—';
+      const pct = ok ? Math.max(0, Math.min(100, 100 * (val - w.min) / (w.max - w.min))) : 0;
+      fill.style.width = pct + '%'; if (ok) bar.setAttribute('aria-valuenow', val); });
+    return box;
+  }
+  if (t === 'events') {
+    const box = pwBox(w, true);
+    const ul = document.createElement('ul'); box.appendChild(ul);
+    ups.push((s) => {
+      const list = Array.isArray(s[w.key]) ? s[w.key].slice(-w.max) : [];
+      ul.innerHTML = '';
+      for (const e of list.reverse()) { const li = document.createElement('li');
+        li.textContent = (e && typeof e === 'object') ? ((e.ts ? e.ts + '  ' : '') + (e.text || JSON.stringify(e))) : String(e);
+        ul.appendChild(li); }
+      if (!list.length) { const li = document.createElement('li'); li.className = 'muted'; li.textContent = '(none)'; ul.appendChild(li); }
+    });
+    return box;
+  }
+  if (t === 'image') {
+    const box = pwBox(w, true);
+    const img = document.createElement('img'); img.alt = w.label || w.stream;
+    img.dataset.src = '/api/panel/' + encodeURIComponent(p.id) + '/stream/' + encodeURIComponent(w.stream);
+    img.dataset.mode = w.mode; img.dataset.refresh = String(w.refresh_ms || 1000);
+    box.appendChild(img);
+    panelMedia[p.id].push(img);
+    return box;
+  }
+  if (t === 'buttons') {
+    const box = pwBox(w, true);
+    const row = document.createElement('div'); row.className = 'row';
+    for (const b of w.buttons) {
+      const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = b.label;
+      const meta = (p.actions || {})[b.action] || {};
+      if (meta.danger) btn.classList.add('danger');
+      btn.addEventListener('click', async () => { btn.disabled = true;
+        try { await panelAction(p, b.action, b.args || {}); } finally { btn.disabled = false; } });
+      row.appendChild(btn);
+    }
+    box.appendChild(row);
+    return box;
+  }
+  if (t === 'input') {
+    const box = pwBox(w, true);
+    const row = document.createElement('form'); row.className = 'row'; row.style.margin = '0';
+    const inp = document.createElement('input'); inp.type = 'text'; inp.placeholder = w.placeholder || '';
+    inp.setAttribute('aria-label', w.label || w.action);
+    const btn = document.createElement('button'); btn.type = 'submit'; btn.textContent = w.button || 'Send';
+    row.appendChild(inp); row.appendChild(btn);
+    row.addEventListener('submit', async (ev) => { ev.preventDefault();
+      const args = {}; args[w.arg] = inp.value;
+      const res = await panelAction(p, w.action, args);
+      if (res && res.ok) inp.value = ''; });
+    box.appendChild(row);
+    return box;
+  }
+  if (t === 'toggle') {
+    const box = pwBox(w);
+    const lab = document.createElement('label'); lab.className = 'toggle';
+    const cb = document.createElement('input'); cb.type = 'checkbox';
+    cb.setAttribute('aria-label', w.label || w.key);
+    lab.appendChild(cb); lab.appendChild(document.createTextNode(' ' + (w.label || w.key)));
+    box.appendChild(lab);
+    let busy = false;
+    cb.addEventListener('change', async () => { busy = true;
+      const args = {}; args[w.arg] = cb.checked;
+      try { await panelAction(p, w.action, args); } finally { busy = false; } });
+    ups.push((s) => { if (!busy && w.key in s) cb.checked = !!s[w.key]; });
+    return box;
+  }
+  if (t === 'slider') {
+    const box = pwBox(w);
+    const v = document.createElement('div'); v.className = 'v';
+    const r = document.createElement('input'); r.type = 'range';
+    r.min = w.min; r.max = w.max; r.step = w.step; r.setAttribute('aria-label', w.label || w.key);
+    box.appendChild(v); box.appendChild(r);
+    let dragging = false;
+    r.addEventListener('input', () => { dragging = true; v.textContent = r.value; });
+    r.addEventListener('change', async () => {
+      const args = {}; args[w.arg] = Number(r.value);
+      try { await panelAction(p, w.action, args); } finally { dragging = false; } });
+    ups.push((s) => { if (!dragging && w.key in s) { r.value = s[w.key]; v.textContent = fmtVal(s[w.key]); } });
+    return box;
+  }
+  if (t === 'hold') {
+    const box = pwBox(w);
+    const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'hold';
+    btn.textContent = w.label || w.action; btn.setAttribute('aria-pressed', 'false');
+    bindHold(btn, p, w);
+    box.appendChild(btn);
+    return box;
+  }
+  return null;
+}
+function buildPanelView(p) {
+  const nav = document.createElement('button'); nav.type = 'button';
+  nav.id = 'navPanel_' + p.id; nav.textContent = p.title;
+  navEl.appendChild(nav);
+  const sec = document.createElement('section'); sec.className = 'view'; sec.hidden = true;
+  sec.id = 'viewPanel_' + p.id;
+  const stale = document.createElement('div'); stale.className = 'pstale'; stale.id = 'pstale_' + p.id;
+  stale.setAttribute('aria-live', 'polite');
+  const grid = document.createElement('div'); grid.className = 'pgrid';
+  sec.appendChild(stale); sec.appendChild(grid);
+  wrapEl.appendChild(sec);
+  panelUpdaters[p.id] = []; panelMedia[p.id] = [];
+  for (const w of (p.layout || [])) {
+    const el = renderWidget(p, w);
+    if (el) grid.appendChild(el);
+  }
+  const key = 'panel:' + p.id;
+  VIEWS[key] = {nav: nav, view: sec, panel: p};
+  nav.addEventListener('click', () => showView(key));
+}
+async function loadPanelState(p) {
+  const out = document.getElementById('pstale_' + p.id);
+  try {
+    const r = await fetch(q('/api/panel/' + encodeURIComponent(p.id) + '/state'), {headers: hdr()});
+    if (!r.ok) { if (out) out.textContent = 'state unavailable (' + r.status + ')'; return; }
+    const d = await r.json();
+    const s = d.state || {};
+    for (const fn of panelUpdaters[p.id] || []) { try { fn(s); } catch (e) {} }
+    if (out) out.textContent = d.stale ? ('stale' + (d.age_s != null ? ' (' + Math.round(d.age_s) + ' s old)' : '')
+      + (d.error ? ': ' + d.error : '')) : '';
+  } catch (e) { if (out) out.textContent = 'state unavailable'; }
+}
+function startPanelView(p) {
+  if (!p) return;
+  if (p.has_state) {
+    loadPanelState(p);
+    panelTimer = setInterval(() => { if (pollsWanted()) loadPanelState(p); }, Math.max(250, p.poll_ms || 1000));
+  }
+  for (const img of panelMedia[p.id] || []) {
+    if (img.dataset.mode === 'snapshot') {
+      const snap = () => { img.src = q(img.dataset.src + '?still=1&t=' + Date.now()); };
+      snap();
+      img._timer = setInterval(() => { if (pollsWanted()) snap(); }, +img.dataset.refresh || 1000);
+    } else {
+      img.src = q(img.dataset.src);
+    }
+  }
+}
+function stopPanelMedia() {
+  stopAllHolds();
+  for (const id of Object.keys(panelMedia)) {
+    for (const img of panelMedia[id]) {
+      if (img._timer) { clearInterval(img._timer); img._timer = null; }
+      img.removeAttribute('src');           // frees the stream slot
+    }
+  }
+}
+async function loadPanels() {
+  try {
+    const r = await fetch(q('/api/panels'), {headers: hdr()});
+    if (!r.ok) return;
+    const d = await r.json();
+    PANELS = d.panels || [];
+    for (const p of PANELS) buildPanelView(p);
+    if (SAVED_VIEW.indexOf('panel:') === 0 && VIEWS[SAVED_VIEW] && currentView === 'live') showView(SAVED_VIEW);
+  } catch (e) {}
+}
+
+// Read the remembered tab ONCE: showView() rewrites it, and a panel tab only
+// exists after loadPanels() has built it.
+const SAVED_VIEW = lsGet('jarvis.view', 'live');
+showView(SAVED_VIEW);
+loadPanels();
 refreshStatus(); refreshLog();
-setInterval(() => {{ if (autoOn()) refreshStatus(); }}, 1500);
-setInterval(() => {{ if (autoOn()) refreshLog(); }}, 1000);
+setInterval(() => { if (pollsWanted()) refreshStatus(); }, 1500);
+setInterval(() => { if (pollsWanted()) refreshLog(); }, 1000);
 </script></body></html>"""
+assert _DASHBOARD_PAGE.count(_TOKEN_SLOT) == 1
+
+
+def _dashboard_html(token: str) -> str:
+    """Return the full dashboard page. Inline CSS/JS only (no external fetches),
+    dark theme with arc-reactor cyan accents. Polls /api/status + /api/log/tail
+    once a second and POSTs typed commands to /api/say. The token (if any) is
+    baked into the JS so the page's own API calls carry it."""
+    # Serialize the token as JSON for the JS context it lands in. <script> is an
+    # HTML raw-text element — character references are NOT decoded there — so
+    # html.escape was the WRONG escaper (a token containing &"'<> reached the JS
+    # as &amp;/&quot;/… and every API call 401'd; a backslash produced an
+    # unterminated JS string). json.dumps escapes quotes, backslashes and
+    # control characters correctly for a JS string literal, and the "</" → "<\/"
+    # replacement keeps a token containing "</script>" from terminating the
+    # inline script early ("\/" is a valid JS string escape equal to "/").
+    tok = json.dumps(token or "").replace("</", "<\\/")
+    return _DASHBOARD_PAGE.replace(_TOKEN_SLOT, tok, 1)
 
 
 # ── server factory + lifecycle ───────────────────────────────────────────────
@@ -3487,7 +5210,11 @@ def create_server(*, bind: str, port: int, token: str = "",
                   user_settings_path: str | None = None,
                   camera_preview_path: str = DEFAULT_CAMERA_PREVIEW_PATH,
                   action_index_path: str = DEFAULT_ACTION_INDEX_PATH,
-                  reply_reader=None) -> ThreadingHTTPServer:
+                  reply_reader=None,
+                  tray_commands_path: str = DEFAULT_TRAY_COMMANDS_PATH,
+                  runtime=None,
+                  panels=None,
+                  action_timeout_s: float = _ACTION_TIMEOUT_S) -> ThreadingHTTPServer:
     """Build (but do not serve) a ThreadingHTTPServer for the web interface.
 
     SECURITY GATE: refuses to construct a server on a NON-LOCAL bind when the
@@ -3551,6 +5278,17 @@ def create_server(*, bind: str, port: int, token: str = "",
         "camera_preview_path": camera_preview_path or DEFAULT_CAMERA_PREVIEW_PATH,
         "action_index_path": action_index_path or DEFAULT_ACTION_INDEX_PATH,
         "reply_reader": reply_reader,
+        # The tray control plane's inbox (POST /api/control, and restart /
+        # shutdown via POST /api/action). Injectable like every path above.
+        "tray_commands_path": tray_commands_path or DEFAULT_TRAY_COMMANDS_PATH,
+        # What the server may read from the running JARVIS (camera roster,
+        # camera gate, live ACTIONS). LiveRuntime answers only inside the booted
+        # assistant; a test passes a fake, and NoRuntime() pins the defaults.
+        "runtime": runtime if runtime is not None else LiveRuntime(),
+        # Skill-declared panels: None = the process-wide core.web_panels
+        # REGISTRY the skill loader fills; a test passes its own PanelRegistry.
+        "panels": panels,
+        "action_timeout_s": float(action_timeout_s),
     }
     return httpd
 

@@ -2668,11 +2668,13 @@ class SkillContributedSpeakSetTests(MonolithGlobalsTestCase):
         if out.returncode != 0:
             self.skipTest("not a git checkout")
 
-        # Files whose leak belongs to a DIFFERENT open finding: a generated doc
-        # and two VIP test fixtures. Listed by PATH only — never by content.
-        # ALLOWED, not required: closing those findings keeps this green.
+        # Files whose leak belongs to a DIFFERENT open finding: two VIP test
+        # fixtures. Listed by PATH only — never by content. ALLOWED, not
+        # required: closing those findings keeps this green. (The generated
+        # docs/ACTION_INDEX.md USED to be listed here; since 2026-09-30 its
+        # generator indexes only git-tracked sources, so it is scanned like
+        # every other file — see tests/test_action_index_privacy.py.)
         elsewhere = {
-            "docs/ACTION_INDEX.md",
             "tests/test_audit_2026_07_14.py",
             "tests/skills/test_vip_intercept.py",
         }

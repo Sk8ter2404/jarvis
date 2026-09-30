@@ -4908,7 +4908,10 @@ def _hud_camera_preview_downscale(frame: "np.ndarray", width: int) -> "np.ndarra
 # small JPEG per camera, same downscale/throttle/atomic contract as the main
 # preview, keyed by the camera's SIDE ("left"/"right") plus "kinect". The web
 # Camera tab requests /api/camera-preview?cam=<key>.
-_HUD_PERCAM_PREVIEW_KEYS = ("left", "right", "kinect")
+# The key vocabulary and the side rule live in core/camera_tiles.py since
+# 2026-09-30: the web dashboard used to carry its OWN copy of this tuple.
+from core import camera_tiles as _camera_tiles  # noqa: E402
+_HUD_PERCAM_PREVIEW_KEYS = _camera_tiles.PREVIEW_KEYS
 _hud_percam_last_write: dict[str, float] = {}
 
 
@@ -4921,13 +4924,9 @@ def _percam_side(cam: dict) -> str:
     """Stable per-camera preview key from the config entry. Label first
     ("Left webcam (left monitor)"), look_x fallback with 0.5 counting as left
     (same rule as skills/camera_system — look_x<0.5 misclassified the live
-    LEFT cam whose look_x is exactly 0.5)."""
-    lbl = str(cam.get("label", "")).lower()
-    if "left" in lbl:
-        return "left"
-    if "right" in lbl:
-        return "right"
-    return "left" if cam.get("look_x", 0.5) <= 0.5 else "right"
+    LEFT cam whose look_x is exactly 0.5). The rule itself lives in
+    core/camera_tiles.percam_side, shared with the web dashboard's tiles."""
+    return _camera_tiles.percam_side(cam)
 
 
 def _hud_percam_preview_write(key: str, frame: "np.ndarray", now: float) -> bool:
@@ -26995,6 +26994,22 @@ def _collect_skill_speak_sets(mod, name: str) -> None:
             print(f"  [skill] {name}: {attr} could not be applied: {_sse}")
 
 
+# Web-dashboard panels contributed by skills at load time (2026-09-30). A skill
+# may define a module-level ``WEB_PANELS`` list of panel specs; the web
+# dashboard renders each as its own tab (core/web_panels.py has the spec, the
+# widget list and the validation rules). Same reason as the two collectors
+# above: a PRIVATE skill's panel - its id, title, device names - stays inside
+# the gitignored skill file, and nothing in the tracked tree has to name it.
+# A reload REPLACES the skill's panels; a bad spec is rejected with one log line
+# and never stops the skill from loading.
+def _collect_skill_web_panels(mod, name: str) -> None:
+    try:
+        from core import web_panels as _web_panels
+        _web_panels.REGISTRY.register_from_module(mod, name)
+    except Exception as _wpe:
+        print(f"  [skill] {name}: WEB_PANELS could not be applied: {_wpe}")
+
+
 def _skill_prompt_examples_block() -> str:
     """The system-prompt block for skill-contributed routing examples, or ''
     when no skill registered any."""
@@ -27089,6 +27104,7 @@ def load_skills():
                     print(f"  [skill] {name}: loaded (no new actions)")
             _collect_skill_prompt_examples(mod, name)
             _collect_skill_speak_sets(mod, name)
+            _collect_skill_web_panels(mod, name)
             _loaded_skill_names.add(name)   # mark loaded only after success
         except Exception as e:
             # Roll back the pre-exec sys.modules insert (it exists so package

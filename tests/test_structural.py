@@ -39,6 +39,10 @@ _IMPORT_LIGHT_CORE = (
     # The proactive-remark text / pacing gate and the sustained face-presence
     # tracker (2026-09-30): stdlib-only, imported at monolith import time.
     "core.proactive_guard", "core.face_presence",
+    # The web dashboard's camera tile roster + skill panel registry
+    # (2026-09-30): stdlib-only; the first is imported at monolith import time,
+    # the second by the skill loader and the web server.
+    "core.camera_tiles", "core.web_panels",
 )
 
 

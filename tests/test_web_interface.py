@@ -188,6 +188,10 @@ class _ServerBase(unittest.TestCase):
     token = ""
     reply_reader = None
 
+    def server_extra(self) -> dict:
+        """Extra create_server kwargs a subclass needs (runtime=, panels=)."""
+        return {}
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.d = self.tmp.name
@@ -204,6 +208,9 @@ class _ServerBase(unittest.TestCase):
         # camera-preview case is deterministic (the file simply doesn't exist).
         self.camera_preview_path = os.path.join(self.d, ".hud_camera_preview.jpg")
         self.action_index_path = os.path.join(self.d, "ACTION_INDEX.md")
+        # The tray control plane's inbox: a real one RESTARTS JARVIS on a
+        # "restart" entry, so a test must never be able to reach the live file.
+        self.tray_path = os.path.join(self.d, "tray_commands.json")
         os.makedirs(self.log_dir, exist_ok=True)
         self.httpd = wi.create_server(
             bind="127.0.0.1", port=0, token=self.token,
@@ -213,6 +220,8 @@ class _ServerBase(unittest.TestCase):
             camera_preview_path=self.camera_preview_path,
             action_index_path=self.action_index_path,
             reply_reader=self.reply_reader,
+            tray_commands_path=self.tray_path,
+            **self.server_extra(),
         )
         self.host, self.port = self.httpd.server_address[:2]
         self.base = f"http://127.0.0.1:{self.port}"
@@ -1402,10 +1411,14 @@ class ControlPanelEndpointTests(_ServerBase):
         self.assertIn("unknown cam", body)
 
     def test_dashboard_has_percam_tiles(self):
+        # 2026-09-30: the tiles are BUILT from /api/camera-tiles (the live
+        # CAMERAS roster) instead of three hard-coded left/right/kinect figures.
         code, body = _get_raw(self.base + "/")
         self.assertEqual(code, 200)
-        for tid in ("camLeft", "camRight", "camKinect", "camgrid"):
+        for tid in ("camgrid", "/api/camera-tiles", "function buildCameraTiles("):
             self.assertIn(tid, body)
+        for hard in ('id="camLeft"', 'id="camRight"', 'id="camKinect"'):
+            self.assertNotIn(hard, body)
 
     def test_dashboard_has_new_nav_ids(self):
         # The five new nav buttons + their view sections + endpoint wiring.
@@ -2435,10 +2448,13 @@ class CameraReasonPlumbingTests(_ReasonBase):
         self.assertEqual(code, 200)
         self.assertIn("/api/camera-reason?cam=", html)
         self.assertIn("explainTile", html)
-        # still exactly the three tiles, and each has its own placeholder
-        for tile in ("camLeftOff", "camRightOff", "camKinectOff"):
-            self.assertIn(tile, html)
-        self.assertEqual(html.count('class="camtile"'), 3)
+        # One figure + one placeholder per tile, built by ONE function from the
+        # roster (no hard-coded figures left to drift from it).
+        build = _js_fn(html, "buildCameraTiles")
+        self.assertIn("off.className = 'camoff'", build)
+        self.assertIn("fig.className = 'camtile'", build)
+        self.assertIn("wireCameraTile(img, off)", build)
+        self.assertEqual(html.count('class="camtile"'), 0)
         # the reason fetch must live on the ERROR path only - never in the tick
         self.assertNotIn("explainTile(",
                          html.split("function refreshCamera")[1])
