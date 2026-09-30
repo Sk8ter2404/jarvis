@@ -36,6 +36,9 @@ _IMPORT_LIGHT_CORE = (
     # The capture-open backoff (R10, 2026-09-29): stdlib-only, imported at
     # monolith import time.
     "core.input_backoff",
+    # The proactive-remark text / pacing gate and the sustained face-presence
+    # tracker (2026-09-30): stdlib-only, imported at monolith import time.
+    "core.proactive_guard", "core.face_presence",
 )
 
 

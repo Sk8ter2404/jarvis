@@ -184,6 +184,54 @@ class RealRepliesKeptTests(_Base):
         self.assertNotIn("[noise]", log)
 
 
+class RepetitionNoiseTests(_Base):
+    """2026-09-30. Live session_2026-09-29_22-06-02.log 22:53:08: the owner
+    mid-conversation, music in the room, peak RMS 0.0119. Whisper produced
+    "I I I I I I I I I I I I I" and JARVIS answered "Very good, sir." — it is
+    not a known hallucination PHRASE, so the R10 gate let it through."""
+
+    LIVE = "I I I I I I I I I I I I I"
+
+    def test_the_live_repetition_is_not_answered_mid_conversation(self):
+        self._owner_spoke()
+        line_at = self._jarvis_says("Of course, sir.")
+        answered, log = self._turn(self.LIVE, at=line_at + 5.0, peak=0.0119)
+        self.assertFalse(answered, "a repeated-word loop was answered")
+        self.assertIn("[noise] ignored (1 distinct word in 13)", log)
+        self.assertNotIn("I I", log, "the transcript was logged")
+
+    def test_other_degenerate_shapes_are_not_answered(self):
+        self._owner_spoke()
+        line_at = self._jarvis_says("Of course, sir.")
+        for text in ("you you you you", "Uh, um, uh, um.",
+                     "Thank you. Thank you. Thank you. Thank you."):
+            answered, log = self._turn(text, at=line_at + 3.0, peak=0.05)
+            self.assertFalse(answered, text)
+            self.assertIn("[noise] ignored (", log)
+
+    def test_emphatic_stop_and_confirmation_words_are_answered(self):
+        self._owner_spoke()
+        line_at = self._jarvis_says("Shall I go ahead, sir?")
+        for text in ("Stop, stop, stop!", "no no no", "yes yes",
+                     "Yes, yes, yes."):
+            answered, log = self._turn(text, at=line_at + 2.0, peak=0.0119)
+            self.assertTrue(answered, text)
+            self.assertNotIn("[noise]", log)
+
+    def test_a_typed_repetition_is_never_filtered(self):
+        answered, log = self._turn(self.LIVE, at=time.monotonic(), peak=0.0,
+                                   injected=True)
+        self.assertTrue(answered)
+        self.assertNotIn("[noise]", log)
+
+    def test_the_kill_switch_covers_it(self):
+        self._p(self.bc, "NOISE_FILTER_ENABLED", False)
+        answered, log = self._turn(self.LIVE, at=time.monotonic(),
+                                   peak=0.0119)
+        self.assertTrue(answered)
+        self.assertNotIn("[noise]", log)
+
+
 class GateBehaviourTests(_Base):
     def test_only_a_line_that_was_heard_opens_the_reply_window(self):
         bc = self.bc

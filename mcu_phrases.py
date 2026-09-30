@@ -52,7 +52,10 @@ MCU_PHRASES: dict[str, list[str]] = {
         "If I may observe, sir...",
         "If I may say so, sir...",
         "I couldn't help but notice...",
-        "You seem rather determined this evening, sir.",
+        # Time-neutral on purpose (2026-09-30): the old "...this evening,
+        # sir." was copied verbatim into spoken remarks at 10 AM. An example
+        # line must never state a time of day — tests/test_proactive_guard.py.
+        "You seem rather determined, sir.",
         "I do try not to judge, sir.",
         "Should I be concerned, sir?",
     ],

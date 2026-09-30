@@ -12,6 +12,9 @@ Pure functions that run on every transcription BEFORE it reaches the LLM:
   hallucination_verdict(...) — (R10) for a transcript that is ONLY a known
                             hallucination phrase: noise (drop), a genuine short
                             reply (keep), or neither (is_valid_speech decides).
+                            Also drops a degenerate transcript — one word over
+                            and over, a run of fillers, near-zero lexical
+                            diversity (repetition_reason) — whatever the context.
 
 Extracted verbatim from bobert_companion.py along with their tuning constants
 so the gate logic is testable in isolation (it had no coverage before) and the
@@ -238,12 +241,92 @@ def _conf_value(conf, key):
         return None
 
 
+# ── Degenerate transcripts: one word over and over (2026-09-30) ─────────────
+#
+# THE LIVE INCIDENT (session_2026-09-29_22-06-02.log, 22:53:08). Mid-evening,
+# the owner in a conversation, sustained room music. Whisper turned 9.8 s of
+# audio into "I I I I I I I I I I I I I" and the main loop answered it as an
+# owner turn ("Very good, sir.") with a full LLM call. It is not a known
+# hallucination PHRASE, so hallucination_verdict let it through, and
+# is_valid_speech saw thirteen words.
+#
+# That shape is Whisper looping, not a person: a person does not say one word
+# thirteen times. repetition_reason() names it — from the words' COUNTS only,
+# never their content — and hallucination_verdict() drops it as noise in ANY
+# context (a conversation does not make "I I I I I" an answer):
+#   * one word repeated: REPEAT_MIN_WORDS+ words, a single distinct word;
+#   * one or two words are nearly all of it: the two commonest words make up
+#     REPEAT_TOP2_SHARE+ of a transcript of REPEAT_TOP2_MIN_WORDS+ words;
+#   * a run of filler syllables: FILLER_RUN_MIN+ words, every one a filler
+#     ("uh um uh", "la la la la");
+#   * near-zero lexical diversity: distinct / total at or under
+#     REPEAT_MAX_DIVERSITY over REPEAT_DIVERSITY_MIN_WORDS+ words.
+# EXEMPT: a transcript made only of REPEAT_EXEMPT_WORDS — stop and
+# confirmation words ("stop stop stop", "no no no", "yes yes"), the wake /
+# attention words and a mic check — is a real, emphatic command; it is left
+# to the other gates exactly as before. Shorter than REPEAT_MIN_WORDS is left
+# to them too ("I I" is already "too short").
+REPEAT_MIN_WORDS           = 3
+REPEAT_TOP2_SHARE          = 0.9
+REPEAT_TOP2_MIN_WORDS      = 6
+FILLER_RUN_MIN             = 3
+REPEAT_MAX_DIVERSITY       = 0.25
+REPEAT_DIVERSITY_MIN_WORDS = 8
+
+REPEAT_EXEMPT_WORDS = frozenset({
+    # stop / cancel
+    "stop", "cancel", "wait", "pause", "quit", "exit", "enough", "halt",
+    # confirmation / refusal
+    "yes", "yeah", "yep", "yup", "no", "nope", "nah", "okay", "ok", "sure",
+    "confirm", "proceed", "continue", "go", "right", "correct", "please",
+    # wake / attention, and a mic check
+    "jarvis", "hey", "hi", "hello", "test", "testing",
+})
+
+FILLER_WORDS = frozenset({
+    "uh", "um", "umm", "uhm", "er", "erm", "ah", "ahh", "aah", "eh", "oh",
+    "ooh", "hmm", "hm", "mm", "mmm", "ha", "haha", "la", "na", "da",
+})
+
+
+def repetition_reason(text) -> str:
+    """Why this transcript is degenerate repetition (numbers only — never a
+    word from it), or "" when it is not (or is exempt, or too short to
+    judge). See the block comment above. Never raises."""
+    try:
+        words = _norm_phrase(text).split()
+        n = len(words)
+        if n < REPEAT_MIN_WORDS:
+            return ""
+        if all(w in REPEAT_EXEMPT_WORDS for w in words):
+            return ""
+        counts: dict = {}
+        for w in words:
+            counts[w] = counts.get(w, 0) + 1
+        distinct = len(counts)
+        if distinct == 1:
+            return f"1 distinct word in {n}"
+        if n >= FILLER_RUN_MIN and all(w in FILLER_WORDS for w in words):
+            return f"filler run of {n} words"
+        if n >= REPEAT_TOP2_MIN_WORDS:
+            top2 = sum(sorted(counts.values(), reverse=True)[:2])
+            if top2 / n >= REPEAT_TOP2_SHARE:
+                return f"2 words are {100 * top2 / n:.0f}% of {n}"
+        if n >= REPEAT_DIVERSITY_MIN_WORDS:
+            diversity = distinct / n
+            if diversity <= REPEAT_MAX_DIVERSITY:
+                return f"lexical diversity {diversity:.2f} over {n} words"
+        return ""
+    except Exception:
+        return ""
+
+
 def hallucination_verdict(text, conf, peak_rms, *, vad_threshold,
                           owner_idle_s=None, since_jarvis_s=None,
                           jarvis_asked=False,
                           prompt_pending=False) -> tuple[str, str]:
     """("noise" | "reply" | "", reason) for one mic transcript. See the block
-    comment above.
+    comments above.
 
     ``owner_idle_s``: seconds since the owner's last accepted turn (None: not
     this session). ``since_jarvis_s``: seconds since JARVIS's last audible
@@ -251,6 +334,10 @@ def hallucination_verdict(text, conf, peak_rms, *, vad_threshold,
     ``prompt_pending``: a confirmation / yes-no prompt awaits an answer.
     Never raises — an internal error returns ("", ""), the old behaviour."""
     try:
+        # Degenerate repetition is noise whatever the context (22:53:08).
+        rep = repetition_reason(text)
+        if rep:
+            return ("noise", rep)
         if not is_hallucination_only(text):
             return ("", "")
         norm = _norm_phrase(text)

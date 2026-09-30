@@ -605,6 +605,11 @@ if _speech_filter_applied:
     print(f"  [speech-filter] per-install overrides: {_speech_filter_applied}")
 WHISPER_TRUST_RMS = _speech_filter_mod.WHISPER_TRUST_RMS
 
+# Proactive-remark gates (2026-09-30): the remark text / pacing checks and the
+# sustained face-presence arithmetic. Both pure stdlib modules.
+import core.proactive_guard as _proactive_guard  # noqa: E402
+import core.face_presence as _face_presence  # noqa: E402
+
 # (LOCAL_LLM_*, ORCHESTRATOR_*, LOCAL_VISION_*, IMAGE_GEN_*, TTS_*, XTTS_*,
 # WHISPER_MODEL — all moved to core/config.py in Phase-1 refactor.
 # Override per-machine by editing core/config.py or by setting the
@@ -1266,6 +1271,33 @@ PROACTIVE_ENABLED       = True
 PROACTIVE_MIN_SILENCE   = 180    # seconds of silence before he MIGHT speak up
 PROACTIVE_MAX_SILENCE   = 900    # by this many seconds, very likely to comment
 PROACTIVE_REQUIRE_FACE  = True   # only comment if a webcam can see you
+# ...and "can see you" means a SUSTAINED face (core/face_presence.py) within
+# this many seconds — no longer any single-frame cascade hit (2026-09-30).
+PROACTIVE_FACE_FRESH_S  = 60
+# The owner must ALSO have spoken to JARVIS (an accepted MIC turn) within this
+# window. 2026-09-30 09:56 / 09:59: two remarks to an empty room — the owner
+# was away and had not said a word all session, while a face-like blob kept
+# the camera gate open. 20 min: a remark is designed to land 3-15 min into a
+# quiet spell (PROACTIVE_MIN_SILENCE..PROACTIVE_MAX_SILENCE; at the ramp's
+# per-check odds one has fired ~90% of the time by minute 10), so 20 min keeps
+# the feature working for someone who just went quiet at the desk with a
+# 5-min margin, while a room he has LEFT gets at most the backed-off remarks
+# below inside one window — never a steady stream.
+PROACTIVE_REQUIRE_OWNER_VOICE  = True
+PROACTIVE_OWNER_VOICE_WINDOW_S = 1200
+# Pacing (core/proactive_guard.rate_verdict). Live 2026-09-29/30 an ignored
+# remark was followed by another every 3-6 min. Now an unanswered remark buys
+# PROACTIVE_COOLDOWN_S (x PROACTIVE_BACKOFF_FACTOR per further unanswered
+# one), PROACTIVE_MAX_UNANSWERED unanswered remarks buy silence until the
+# owner speaks, and ANY generation (spoken or dropped by the text gate) waits
+# PROACTIVE_ATTEMPT_GAP_S before the next — each one is an ~8k-token local
+# prompt that also evicts the conversation's cached prefix.
+PROACTIVE_COOLDOWN_S     = 600
+PROACTIVE_BACKOFF_FACTOR = 2.0
+PROACTIVE_MAX_UNANSWERED = 2
+PROACTIVE_ATTEMPT_GAP_S  = 300
+# How many recent remarks a new one may not repeat (core/proactive_guard).
+PROACTIVE_RECENT_RING    = 8
 
 MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bobert_memory.json")
 
@@ -4510,9 +4542,24 @@ _smooth_y = 0.5
 _last_sent_x = -1.0
 _last_sent_y = -1.0
 
-# Used by proactive idle behavior — last time any camera saw a face
+# Used by proactive idle behavior — the last time a camera CONFIRMED a face:
+# a sustained, qualified detection on fresh frames (_face_presence_note,
+# core/face_presence.py). Before 2026-09-30 any single-frame cascade hit
+# stamped it, and a face-like blob kept "the owner is here" true all day.
 last_face_seen   = 0.0
 last_speech_time = time.time()
+# The last _detect_face() detection in detail, for the presence gate:
+# {"pass": "frontal" | "frontal_relaxed" | "profile" | "profile_mirror",
+#  "w_frac": face width / frame width, "h_frac": ...}, or None (no face).
+# Written by _detect_face on the face-track producer thread and read right
+# after by the same thread. A replaced _detect_face (a test double) leaves it
+# None, so the presence gate counts nothing rather than guessing.
+_face_detect_last: list = [None]
+# Per camera index: the sustained-presence tracker and the fingerprint of the
+# last frame the detector ran on (an identical next frame is a re-served
+# buffer, not evidence). Producer thread only.
+_face_presence_trackers: dict = {}
+_face_presence_fp: dict = {}
 
 # Per-camera awareness — used by where_is_user / see_user actions so Bobert
 # can tell which monitor you're facing. Updated by the face-tracking thread.
@@ -9011,7 +9058,13 @@ def _open_capture_bounded(idx, opener, label: str = "",
 
 
 def _detect_face(frame_bgr: np.ndarray) -> tuple[float, float] | None:
-    """Returns (fx, fy) 0.0–1.0 face-centre coords, or None."""
+    """Returns (fx, fy) 0.0–1.0 face-centre coords, or None.
+
+    Also publishes the detection's detail (which pass found it, the box as a
+    fraction of the frame) in _face_detect_last for the presence gate — a
+    hit from the relaxed (minNeighbors=3) pass steers the eyes but is not evidence
+    that someone is at the desk."""
+    _face_detect_last[0] = None
     if _face_cascade is None:
         return None
     h, w = frame_bgr.shape[:2]
@@ -9025,6 +9078,7 @@ def _detect_face(frame_bgr: np.ndarray) -> tuple[float, float] | None:
     faces = _face_cascade.detectMultiScale(
         gray, scaleFactor=1.05, minNeighbors=4, minSize=(40, 40)
     )
+    found_by = "frontal"
     # Escalation pass: when the strict frontal cascade returns nothing, retry
     # once at minNeighbors=3 but with a larger minSize to keep false positives
     # from tiny shadow artifacts in check. Only runs on frames the strict pass
@@ -9033,6 +9087,7 @@ def _detect_face(frame_bgr: np.ndarray) -> tuple[float, float] | None:
         faces = _face_cascade.detectMultiScale(
             gray, scaleFactor=1.05, minNeighbors=3, minSize=(60, 60)
         )
+        found_by = "frontal_relaxed"
     # Frontal cascade misses heads turned past ~30°. Fall through to the
     # profile cascade — and a mirrored second pass since profileface is
     # trained on left-facing heads only — before giving up.
@@ -9042,6 +9097,7 @@ def _detect_face(frame_bgr: np.ndarray) -> tuple[float, float] | None:
         )
         if len(prof) > 0:
             faces = prof
+            found_by = "profile"
         else:
             mirror = cv2.flip(gray, 1)
             prof_m = _profile_cascade.detectMultiScale(
@@ -9049,14 +9105,50 @@ def _detect_face(frame_bgr: np.ndarray) -> tuple[float, float] | None:
             )
             if len(prof_m) > 0:
                 faces = [(w - x - fw, y, fw, fh) for (x, y, fw, fh) in prof_m]
+                found_by = "profile_mirror"
     if len(faces) == 0:
         return None
     x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])   # largest face
+    try:
+        _face_detect_last[0] = {"pass": found_by,
+                                "w_frac": float(fw) / float(w),
+                                "h_frac": float(fh) / float(h)}
+    except Exception:
+        _face_detect_last[0] = None
     fx = (x + fw / 2) / w
     fy = (y + fh / 2) / h
     if MIRROR_EYES_X: fx = 1.0 - fx
     if MIRROR_EYES_Y: fy = 1.0 - fy
     return fx, fy
+
+
+def _face_presence_note(cam_index, frame, face, now: float | None = None) -> bool:
+    """Face-track producer: feed ONE frame the detector just ran on to that
+    camera's sustained-presence tracker; stamp last_face_seen only when it
+    confirms a face (core/face_presence.py). Returns True when it stamped.
+
+    ``face`` is _detect_face's result for this frame; its detail is read from
+    _face_detect_last. A frame identical to this camera's previous one (a
+    re-served / cached buffer) is ignored — neither a hit nor a miss. This is
+    the ONLY writer of last_face_seen. Never raises."""
+    global last_face_seen
+    try:
+        now = time.time() if now is None else float(now)
+        fp = _face_presence.frame_fingerprint(frame)
+        prev = _face_presence_fp.get(cam_index)
+        _face_presence_fp[cam_index] = fp
+        fresh = fp is not None and fp != prev
+        qualified = bool(face) and _face_presence.qualifies(_face_detect_last[0])
+        tracker = _face_presence_trackers.get(cam_index)
+        if tracker is None:
+            tracker = _face_presence.SustainedFace()
+            _face_presence_trackers[cam_index] = tracker
+        if tracker.observe(now, fresh=fresh, qualified=qualified):
+            last_face_seen = now
+            return True
+    except Exception:
+        logging.exception("[face-track] presence note failed")
+    return False
 
 
 def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC) -> bool:
@@ -10828,6 +10920,12 @@ def _face_tracking_thread_body():
                     logging.exception("[face-track] _detect_face failed; skipping frame")
                     time.sleep(0.5)
                     continue
+                # PRESENCE (the proactive gate): every frame the detector ran
+                # on, hit or miss, feeds this camera's sustained-presence
+                # tracker; only a confirmed face stamps last_face_seen. A
+                # single-frame hit, a relaxed-pass hit, a small face or a
+                # re-served frame no longer counts (2026-09-30).
+                _face_presence_note(cam["index"], frame, face, now_loop)
                 if not face:
                     continue
                 # Record that this specific camera just saw a face
@@ -10889,19 +10987,18 @@ def _face_tracking_thread_body():
                 time.sleep(0.05)
                 continue
 
-            # Decide target eye position by priority
-            global last_face_seen
+            # Decide target eye position by priority. (last_face_seen is NOT
+            # stamped here any more: an eye-steering hit is not presence —
+            # _face_presence_note above is its only writer.)
             now = time.time()
             if primary_face:
                 tx, ty = primary_face
                 primary_seen_recently = now
-                last_face_seen = now
                 _smooth_x += SMOOTH * (tx - _smooth_x)
                 _smooth_y += SMOOTH * (ty - _smooth_y)
             elif side_hit and (now - primary_seen_recently) > 0.4:
                 # Primary has lost the face — follow the side camera
                 tx, ty = side_hit
-                last_face_seen = now
                 _smooth_x += SNAP * (tx - _smooth_x)
                 _smooth_y += SNAP * (ty - _smooth_y)
             else:
@@ -13696,10 +13793,37 @@ def should_be_proactive() -> bool:
         except Exception:
             pass
 
-    # Must be able to see the user (so we're not talking to an empty room)
+    # PRESENCE + PACING (2026-09-30). Live 09:56 / 09:59 JARVIS remarked to an
+    # empty room: the owner was away and had not spoken all session, and a
+    # face-like blob on the camera was enough. Now he must have SPOKEN to
+    # JARVIS recently, a camera must have CONFIRMED a sustained face, and an
+    # ignored remark backs off instead of being followed by another.
+    mono = _proactive_mono()
+    if PROACTIVE_REQUIRE_OWNER_VOICE:
+        voice_at = float(_last_owner_voice_at[0] or 0.0)
+        if not voice_at:
+            return _proactive_hold("owner-voice", "owner has not spoken this "
+                                                  "session")
+        if mono - voice_at > PROACTIVE_OWNER_VOICE_WINDOW_S:
+            return _proactive_hold("owner-voice", f"owner last spoke "
+                                                  f"{mono - voice_at:.0f} s ago")
+    ok, why = _proactive_guard.rate_verdict(
+        mono, remark_times=list(_proactive_remarks_at),
+        owner_turn_at=float(_last_owner_turn_at[0] or 0.0),
+        last_attempt_at=float(_proactive_last_attempt_at[0] or 0.0),
+        cooldown_s=PROACTIVE_COOLDOWN_S, factor=PROACTIVE_BACKOFF_FACTOR,
+        max_unanswered=PROACTIVE_MAX_UNANSWERED,
+        attempt_gap_s=PROACTIVE_ATTEMPT_GAP_S)
+    if not ok:
+        return _proactive_hold("pacing", why)
+
+    # Must be able to see the user (so we're not talking to an empty room):
+    # a SUSTAINED face a camera confirmed (_face_presence_note).
     if PROACTIVE_REQUIRE_FACE:
-        if last_face_seen == 0.0 or (time.time() - last_face_seen) > 60:
-            return False
+        if last_face_seen == 0.0 or (time.time() - last_face_seen) > PROACTIVE_FACE_FRESH_S:
+            return _proactive_hold("face", "no sustained face on a camera")
+    # Every gate is open: the next hold (whatever its kind) is news again.
+    _proactive_hold_logged[0] = ""
 
     # Probability scales from 0 at MIN_SILENCE to 1 at MAX_SILENCE
     span = max(1, PROACTIVE_MAX_SILENCE - PROACTIVE_MIN_SILENCE)
@@ -13709,30 +13833,85 @@ def should_be_proactive() -> bool:
     return random.random() < (progress * 0.35)
 
 
-def generate_proactive_comment() -> str:
-    """Use the LLM + memory to write a brief JARVIS-style observation."""
+def _proactive_hold(kind: str, why: str) -> bool:
+    """should_be_proactive: a presence / pacing gate said no. Logs the reason
+    ONCE per kind of hold (the check runs every ~20 s), and returns False so
+    the caller can `return _proactive_hold(...)`. Never raises."""
+    try:
+        if _proactive_hold_logged[0] != kind:
+            _proactive_hold_logged[0] = kind
+            print(f"  [proactive] holding ({why})")
+    except Exception:
+        pass
+    return False
+
+
+def _proactive_note_spoken(text: str) -> None:
+    """_do_proactive_turn: a remark was voiced — remember it (the repeat
+    ring) and when (the unanswered-remark backoff). Never raises."""
+    try:
+        _proactive_recent.append(str(text))
+        del _proactive_recent[:-max(1, int(PROACTIVE_RECENT_RING))]
+        _proactive_remarks_at.append(_proactive_mono())
+        del _proactive_remarks_at[:-16]
+        _proactive_hold_logged[0] = ""
+    except Exception:
+        pass
+
+
+def generate_proactive_comment(now: float | None = None) -> str:
+    """Use the LLM + memory to write a brief JARVIS-style observation.
+
+    Returns "" when nothing may be said. Every remark is checked before it is
+    returned (core/proactive_guard.check_remark): one that names a time of
+    day the local clock contradicts, copies a persona example, or repeats a
+    recent remark is DROPPED — live 2026-09-29/30 the model answered this
+    prompt with the phrasebook line "You seem rather determined this evening,
+    sir." eight times in one night, and again at ten the next morning."""
     # 2026-09-29: this used to ask for "something you remember they're
     # working on" / "a question about a recent topic" — i.e. it ORDERED the
     # model to volunteer the auto-learned topics and projects, which are
     # speech-recognition guesses (a mis-heard TV line became a "project" it
     # then brought up unprompted). Those lists are hints, never openers.
+    # 2026-09-30: "a light remark about the hour" with no clock in the prompt
+    # invited a guessed hour; the local time now rides in the user message
+    # (the system part stays byte-identical, so its cached prefix holds).
+    now = time.time() if now is None else float(now)
+    lt = time.localtime(now)
     system = _system_prompt + (
         "\n\nYou are now generating a PROACTIVE comment. Your owner has been "
         "quiet for a while but you can see them at their desk. "
         "Pick ONE of: a short interesting fact related to their interests, "
-        "a light remark about the hour, or a check-in. Never raise an "
+        "or a brief check-in. Mention the time of day only if it matches the "
+        "local time given below. Never raise an "
         "auto-learned topic or project from memory: those are unverified and "
-        "may be mis-heard. "
+        "may be mis-heard. Say something NEW in your own words: never reuse "
+        "a line from the phrasebook or the example lines above. "
         "Keep it to ONE sentence. Do not start with 'Hey' or any greeting. "
         "Sound natural, like you just thought of it."
     )
-    user = "(There has been silence. Generate one short proactive comment.)"
+    clock = time.strftime("%I:%M %p", lt).lstrip("0")
+    recent = list(_proactive_recent)
+    user = (f"(Local time: {clock}, {_proactive_guard.day_part(lt.tm_hour)}. "
+            "There has been silence. Generate one short proactive comment.")
+    if recent:
+        user += (" Do not repeat any of these recent remarks: "
+                 + " / ".join(f"'{r}'" for r in recent[-4:]) + ".")
+    user += ")"
     try:
         text = _llm_quick(system=system, user=user, max_tokens=120)
-        return text.strip().split("\n")[0]
+        line = text.strip().split("\n")[0]
     except Exception as e:
         print(f"  [proactive] generation failed: {e}")
         return ""
+    if not line.strip():
+        return ""
+    ok, why = _proactive_guard.check_remark(line, hour=lt.tm_hour,
+                                            recent=recent)
+    if not ok:
+        print(f"  [proactive] dropped ({why})")
+        return ""
+    return line
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -18758,6 +18937,31 @@ _utterance_in_progress = [False]
 # reply, not a turn boundary. Drives the re-prime-after-eviction window
 # (LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S). 0.0 = none yet this process.
 _last_owner_turn_at = [0.0]
+# time.monotonic() of the last accepted owner turn that came from the MIC (not
+# typed / injected / a remote channel). "The owner spoke to JARVIS recently" —
+# the voice half of the proactive-remark presence gate (should_be_proactive).
+# 0.0 = he has not spoken this process.
+_last_owner_voice_at = [0.0]
+# Proactive-remark history (core/proactive_guard): the recent remarks a new
+# one may not repeat, when each spoken remark was made (time.monotonic(), for
+# the unanswered-remark backoff), the last generation attempt (spoken or
+# dropped), and the last hold reason logged (so a held gate logs once).
+_proactive_recent: list = []
+_proactive_remarks_at: list = []
+_proactive_last_attempt_at = [0.0]
+_proactive_hold_logged = [""]
+
+
+def _note_owner_voice() -> None:
+    """Main loop: the accepted owner turn came from the microphone."""
+    _last_owner_voice_at[0] = time.monotonic()
+
+
+def _proactive_mono() -> float:
+    """The proactive gates' clock: time.monotonic(), the same clock as
+    _last_owner_turn_at / _last_owner_voice_at. One seam so a test can
+    replay the live timeline (09:56:22 -> 09:59:54) without sleeping."""
+    return time.monotonic()
 
 
 def _note_conversation_activity(now: float | None = None) -> None:
@@ -31381,6 +31585,9 @@ def _do_proactive_turn(memory: dict):
     pause_face_tracking()
     set_state("thinking")
 
+    # Every generation counts for pacing, spoken or dropped
+    # (PROACTIVE_ATTEMPT_GAP_S, core/proactive_guard.rate_verdict).
+    _proactive_last_attempt_at[0] = _proactive_mono()
     stop_evt = threading.Event()
     anim     = threading.Thread(target=_thinking_loop, args=(stop_evt,), daemon=True)
     anim.start()
@@ -31405,6 +31612,8 @@ def _do_proactive_turn(memory: dict):
                           if not is_self_voiced(r[0])]
     spoken = _apply_quip_layer(spoken, _proactive_results)
     _speak(spoken)
+    if isinstance(spoken, str) and spoken.strip():
+        _proactive_note_spoken(text)
     resume_face_tracking()
 
 
@@ -35037,6 +35246,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # An owner turn (voice or typed): freezes the local prompt
                 # prefix for PROMPT_FREEZE_QUIET_S (_request_prompt_rebuild).
                 _note_owner_turn()
+                # ...and a MIC turn is the voice half of the proactive-remark
+                # presence gate (should_be_proactive).
+                if _injected_text is None:
+                    _note_owner_voice()
                 # Rolling 5-line history feeds the holographic HUD v2
                 # scrolling transcript panel. Cap at 5 entries here so the
                 # JSON file stays small.

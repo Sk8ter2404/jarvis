@@ -1572,6 +1572,9 @@ class ProactiveDecisionTests(_MonolithSec2Base):
                 mock.patch.object(self.bc.random, "random", return_value=0.0):
             self.bc.last_speech_time = time.time() - 1000
             self.bc.last_face_seen = time.time()
+            # Since 2026-09-30 the owner must also have spoken recently (a
+            # MIC turn within PROACTIVE_OWNER_VOICE_WINDOW_S).
+            self.bc._last_owner_voice_at[0] = time.monotonic()
             self.assertTrue(self.bc.should_be_proactive())
 
     def test_high_silence_with_face_skips_when_rng_high(self):

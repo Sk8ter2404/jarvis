@@ -6482,6 +6482,7 @@ class ScanBatch20260708Tests(MonolithGlobalsTestCase):
         bc._focus_until[0] = 1e12          # far-future expiry → block is engaged
         with mock.patch.object(bc, "PROACTIVE_ENABLED", True), \
                 mock.patch.object(bc, "PROACTIVE_REQUIRE_FACE", False), \
+                mock.patch.object(bc, "PROACTIVE_REQUIRE_OWNER_VOICE", False), \
                 mock.patch.object(bc, "_voice_mood_response", None), \
                 mock.patch.object(bc, "last_speech_time", 0.0), \
                 mock.patch("random.random", return_value=0.0):

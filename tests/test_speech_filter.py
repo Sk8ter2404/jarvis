@@ -219,5 +219,89 @@ class HallucinationVerdictTests(unittest.TestCase):
                          "a margin under 1x would drop nothing")
 
 
+class RepetitionNoiseTests(unittest.TestCase):
+    """2026-09-30: a degenerate transcript is noise in ANY context. Live
+    session_2026-09-29_22-06-02.log 22:53:08: mid-conversation, music in the
+    room, Whisper turned 9.8 s of audio into "I I I I I I I I I I I I I" and
+    JARVIS answered it ("Very good, sir.") — it is not a known hallucination
+    phrase and is_valid_speech saw thirteen words."""
+
+    LIVE = "I I I I I I I I I I I I I"
+    VAD = 0.008
+    OK_CONF = {"no_speech_prob": 0.30, "avg_logprob": -0.60}
+    # The owner in a conversation, JARVIS answered 5 s ago: the context in
+    # which the phrase gate would have KEPT a reply.
+    TALKING = {"owner_idle_s": 20.0, "since_jarvis_s": 5.0}
+
+    def _v(self, text, peak=0.0119, **ctx):
+        return sf.hallucination_verdict(text, self.OK_CONF, peak,
+                                        vad_threshold=self.VAD, **ctx)
+
+    def test_the_live_transcript_is_noise_mid_conversation(self):
+        verdict, why = self._v(self.LIVE, **self.TALKING)
+        self.assertEqual((verdict, why), ("noise", "1 distinct word in 13"))
+        # Loud and confident does not rescue it either.
+        self.assertEqual(self._v(self.LIVE, peak=0.2, **self.TALKING)[0],
+                         "noise")
+        # Without the gate is_valid_speech ACCEPTS it — the bug.
+        self.assertTrue(sf.is_valid_speech(self.LIVE, self.OK_CONF, 0.0119)[0])
+
+    def test_degenerate_shapes_are_noise(self):
+        cases = {
+            "you you you": "1 distinct word in 3",
+            "The the the the.": "1 distinct word in 4",
+            "Thank you. Thank you. Thank you. Thank you. Thank you.":
+                "2 words are 100% of 10",
+            "I I I I I you I I I I": "2 words are 100% of 10",
+            "uh um uh": "filler run of 3 words",
+            "Uh, um, er, um.": "filler run of 4 words",
+            "la la la la la": "1 distinct word in 5",
+            "go to go to go to go to go to go": "2 words are 100% of 11",
+            "so it was so it was so it was so it was":
+                "lexical diversity 0.25 over 12 words",
+        }
+        for text, why in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(self._v(text, **self.TALKING),
+                                 ("noise", why))
+
+    def test_stop_and_confirmation_words_are_exempt(self):
+        for text in ("stop", "stop stop stop", "Stop! Stop! Stop! Stop!",
+                     "yes yes", "yes yes yes", "no no no",
+                     "No, no, no, no, no.", "wait wait wait",
+                     "okay okay okay", "Jarvis, Jarvis, Jarvis",
+                     "hello hello hello", "testing testing testing"):
+            with self.subTest(text=text):
+                self.assertEqual(sf.repetition_reason(text), "")
+                self.assertNotEqual(self._v(text, peak=0.05,
+                                            **self.TALKING)[0], "noise")
+
+    def test_real_speech_with_repeats_passes(self):
+        for text in ("oh no no no", "I I I think so", "no I don't think so",
+                     "come on come on", "turn it up, up, up",
+                     "what time is it", "turn off the lights",
+                     "I said I wanted the other one, not that one"):
+            with self.subTest(text=text):
+                self.assertEqual(sf.repetition_reason(text), "")
+
+    def test_too_short_to_judge_is_left_to_the_other_gates(self):
+        for text in ("I I", "uh um", "", None):
+            with self.subTest(text=text):
+                self.assertEqual(sf.repetition_reason(text), "")
+
+    def test_reason_is_numbers_only(self):
+        for text in (self.LIVE, "banana banana banana banana",
+                     "uh um uh um", "red red red red blue red red red red"):
+            with self.subTest(text=text):
+                why = sf.repetition_reason(text)
+                self.assertTrue(why)
+                for word in set(sf._norm_phrase(text).split()):
+                    self.assertNotRegex(why.lower(), r"\b" + word + r"\b")
+
+    def test_never_raises(self):
+        self.assertEqual(sf.repetition_reason(object()), "")
+        self.assertEqual(sf.repetition_reason(12345), "")
+
+
 if __name__ == "__main__":
     unittest.main()

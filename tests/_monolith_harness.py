@@ -229,6 +229,15 @@ _MONOLITH_RESTORE_NAMES = (
     # core.local_traffic is reset in _restore_monolith_pristine.
     "_last_owner_turn_at", "_reprime_primed_at", "_reprime_posts_mark",
     "_learn_pending", "_learn_worker_live",
+    # Proactive-remark gates (2026-09-30): the owner's last MIC turn, the
+    # remark history (repeat ring, spoken-remark times, last attempt, logged
+    # hold) and the face-presence state (the detector's last detail, the
+    # per-camera trackers and frame fingerprints). A leaked voice stamp or
+    # tracker would make a LATER test's should_be_proactive pass or fail for
+    # the wrong reason; a leaked remark would make a later remark a "repeat".
+    "_last_owner_voice_at", "_proactive_recent", "_proactive_remarks_at",
+    "_proactive_last_attempt_at", "_proactive_hold_logged",
+    "_face_detect_last", "_face_presence_trackers", "_face_presence_fp",
     # H-6 (2026-08-20): the abandoned-native-close count. A leaked non-zero
     # value would make every later _refresh_devices test silently defer its
     # reinit — the exact "green for the wrong reason" shape.
