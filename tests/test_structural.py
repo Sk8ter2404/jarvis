@@ -43,6 +43,10 @@ _IMPORT_LIGHT_CORE = (
     # (2026-09-30): stdlib-only; the first is imported at monolith import time,
     # the second by the skill loader and the web server.
     "core.camera_tiles", "core.web_panels",
+    # The NIGHT_QUIET_ENABLED reader: stdlib-only, imported by
+    # core.emotion_tracker at import time (core.tts and core.tone_detector
+    # import it lazily so both still run as scripts).
+    "core.night_quiet",
 )
 
 

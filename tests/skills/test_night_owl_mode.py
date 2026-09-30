@@ -669,7 +669,13 @@ class NightOwlWatchLoopTests(unittest.TestCase):
             yield
 
     def test_auto_engages_inside_window(self):
-        with mock.patch.object(self.mod, "_in_night_window", return_value=True), \
+        # The automatic engage is gated by NIGHT_QUIET_ENABLED and
+        # NIGHT_OWL_AUTO; pin both ON (the shipped defaults) explicitly so a
+        # gitignored user_settings.json with either off cannot flip this test.
+        from core import config as cfg
+        with mock.patch.object(cfg, "NIGHT_QUIET_ENABLED", True, create=True), \
+             mock.patch.object(cfg, "NIGHT_OWL_AUTO", True, create=True), \
+             mock.patch.object(self.mod, "_in_night_window", return_value=True), \
              mock.patch.object(self.mod, "_enter_night_owl") as ent, \
              mock.patch.object(self.mod, "_exit_night_owl") as ext, \
              self._one_iteration():

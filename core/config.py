@@ -703,6 +703,31 @@ FAST_PATHS_ENABLED = True
 # next start.
 TEAMS_NUDGE_ENABLED = False
 
+# ─── Night quieting (core/night_quiet.py) ────────────────────────────────
+# NIGHT_QUIET_ENABLED — the master switch for everything that changes how
+# JARVIS sounds at night because of the CLOCK alone: the 'hushed_late' voice
+# from 23:00 (gain 0.55), the late-night tone and mood from 22:00 (a quieter,
+# slower voice and one-sentence replies), the time-only 'tired' read, the
+# prompt's "a late hour means quietly stressed" rule, the "we've been at this
+# a while" late-hour nudge, the 23:00-07:00 hold on his other proactive lines
+# once you have been silent for 30 minutes, the softer wake greeting and its
+# 01:00-04:59 "Still up, sir?", the 01:00-04:59 spoken remark about the hour,
+# and night-owl mode switching itself on at 23:00. False = his voice, reply
+# length and proactive speech at night are the same as in the daytime. What
+# you ask for still works: "night owl on", or telling him you are tired. Set
+# via user_settings.json; applies on the next start.
+NIGHT_QUIET_ENABLED = True
+
+# ─── Night-owl mode (skills/night_owl_mode.py) ───────────────────────────
+# NIGHT_OWL_AUTO — at 23:00 JARVIS switches night-owl mode on by himself
+# until 06:00: a voice about 15% quieter and about 5% slower, replies kept to
+# one short sentence, no "thinking" filler clip, non-essential announcements
+# (weather, news, banter, wellness, anticipation, screen-watch) held, and the
+# overlay dimmed. False stops the AUTOMATIC switch-on only; "night owl on" /
+# "night owl off" by voice still work. NIGHT_QUIET_ENABLED = False stops it
+# too. Set via user_settings.json; applies on the next start.
+NIGHT_OWL_AUTO = True
+
 
 # ─── Focus mode / do-not-disturb (skills/focus_mode.py) ────────────────
 # FOCUS_MODE_ENABLED — makes the do-not-disturb "focus mode" FEATURE available

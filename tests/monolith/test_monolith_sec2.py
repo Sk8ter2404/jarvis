@@ -1608,6 +1608,16 @@ class LateNightTests(_MonolithSec2Base):
     # so we instead pass explicit `now=` where the API allows, and patch
     # _in_late_night_window for the orchestrator (maybe_late_night_remark).
 
+    def setUp(self):
+        super().setUp()
+        # These pin the remark's behaviour with night quieting ON (the shipped
+        # default). Patch it explicitly so a gitignored user_settings.json with
+        # NIGHT_QUIET_ENABLED false cannot flip them.
+        from core import config as _cfg
+        p = mock.patch.object(_cfg, "NIGHT_QUIET_ENABLED", True, create=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def _at_hour(self, hour):
         """Return an epoch whose LOCAL hour == `hour` today."""
         lt = list(time.localtime())

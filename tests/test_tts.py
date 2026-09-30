@@ -315,6 +315,13 @@ class DetectLateHourTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="jv_tts_")
         self.state = os.path.join(self.tmp, "anticipation_state.json")
         self.addCleanup(self._cleanup)
+        # These pin the detector with night quieting ON (the shipped default).
+        # Patched explicitly so a gitignored user_settings.json with
+        # NIGHT_QUIET_ENABLED false cannot flip them.
+        from core import config as cfg
+        p = mock.patch.object(cfg, "NIGHT_QUIET_ENABLED", True, create=True)
+        p.start()
+        self.addCleanup(p.stop)
 
     def _cleanup(self):
         import shutil
@@ -425,11 +432,14 @@ class DetectContextPresetTests(unittest.TestCase):
             "brisk_alert")
 
     def test_late_hour_second_priority(self):
+        # NIGHT_QUIET_ENABLED patched on explicitly (shipped default): a
+        # gitignored user_settings.json with it off must not flip this test.
+        from core import config as cfg
         late = datetime.datetime(2026, 5, 31, 23, 30, 0)
-        self.assertEqual(
-            tts.detect_context_preset("calm text", peak_rms=0.0,
-                                      now=late, state_path=self.NO_STATE),
-            "hushed_late")
+        with mock.patch.object(cfg, "NIGHT_QUIET_ENABLED", True, create=True):
+            got = tts.detect_context_preset("calm text", peak_rms=0.0,
+                                            now=late, state_path=self.NO_STATE)
+        self.assertEqual(got, "hushed_late")
 
     def test_vocal_stress_third_priority(self):
         self.assertEqual(

@@ -12,6 +12,7 @@ stdlib unittest only.
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from core import emotion_tracker as et
 from core.emotion_tracker import ProsodyHints
@@ -128,8 +129,12 @@ class TiredTests(unittest.TestCase):
 
     def test_late_night_fallback_short_declarative(self):
         # No textual/prosodic signal, but it's 02:00 and the line is short.
+        # NIGHT_QUIET_ENABLED patched on explicitly: a gitignored
+        # user_settings.json with it off must not flip this test.
+        from core import config as cfg
         p = ProsodyHints(hour=2)
-        r = et.classify_emotion("what's the time", p)
+        with mock.patch.object(cfg, "NIGHT_QUIET_ENABLED", True, create=True):
+            r = et.classify_emotion("what's the time", p)
         self.assertEqual(r.label, "tired")
         self.assertIn("late_night", r.reason)
 

@@ -644,6 +644,30 @@ SCHEMA: dict[str, dict] = {
         "help": "Comic timing, and the window in which your 'stop' is heard. "
                 "Applies on the next start.",
     },
+    "NIGHT_QUIET_ENABLED": {
+        "tab": "voice", "label": "Quieter voice at night (by the clock)",
+        "type": "bool", "default": True,
+        "help": "From about 22:00 JARVIS gets quieter, slower and shorter "
+                "because of the time alone: a hushed voice from 23:00, the "
+                "late-night tone and one-sentence replies, a softer wake "
+                "greeting, the 'we've been at this a while' nudge, other "
+                "proactive lines held once you've been silent a while, "
+                "remarks about the hour after 01:00, and night-owl mode "
+                "switching itself on. Off = his voice, reply length and "
+                "proactive speech at night are the same as in the daytime; "
+                "'night owl on' and telling him you're tired still work. "
+                "Applies on the next start.",
+    },
+    "NIGHT_OWL_AUTO": {
+        "tab": "voice", "label": "Night-owl mode switches on by itself at 23:00",
+        "type": "bool", "default": True,
+        "help": "From 23:00 to 06:00: a voice about 15% quieter and a little "
+                "slower, one-short-sentence replies, no 'thinking' filler, "
+                "non-essential announcements (weather, news, banter) held and "
+                "the overlay dimmed. Off = only when you say 'night owl on'. "
+                "'Quieter voice at night' off also stops it. Applies on the "
+                "next start.",
+    },
     "SELF_ECHO_FILTER_ENABLED": {
         "tab": "hearing", "label": "Never answer his own voice",
         "type": "bool", "default": True,
@@ -1599,6 +1623,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Device dialogues", ["SKILL_ROUTES_ENABLED", "DIALOGUE_ENABLED",
                               "DIALOGUE_MAX_S", "DIALOGUE_STOP_LISTEN",
                               "DIALOGUE_BEAT_S"]),
+        ("At night", ["NIGHT_QUIET_ENABLED", "NIGHT_OWL_AUTO"]),
     ],
     "hearing": [
         ("Microphone", ["MICROPHONE_INDEX", "PREFERRED_INPUT_DEVICES",

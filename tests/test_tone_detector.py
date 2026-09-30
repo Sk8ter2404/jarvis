@@ -79,7 +79,11 @@ class LateNightTests(unittest.TestCase):
         # A neutral utterance with no tone signal falls back to 'late_night'
         # ONLY when the clock is in the band. _is_late_night_hour() reads the
         # wall clock with no arg here, so patch it to make the branch deterministic.
-        with mock.patch.object(td, "_is_late_night_hour", return_value=True):
+        # NIGHT_QUIET_ENABLED is patched on explicitly: a gitignored
+        # user_settings.json with it off must not flip this test.
+        from core import config as cfg
+        with mock.patch.object(td, "_is_late_night_hour", return_value=True), \
+             mock.patch.object(cfg, "NIGHT_QUIET_ENABLED", True, create=True):
             self.assertEqual(td.detect_tone("open the notes"), "late_night")
 
     def test_neutral_text_daytime_is_none(self):

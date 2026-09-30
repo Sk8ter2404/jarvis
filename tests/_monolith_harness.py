@@ -74,10 +74,12 @@ def load_monolith():
     os.environ.setdefault("JARVIS_STAGING", "1")
     os.environ.setdefault("JARVIS_TEST_MODE", "1")
     os.environ.setdefault("MUTE_TTS", "1")
-    # A raising action files a self-detected bug report into the outbox bound
-    # to core/bug_reporter.py's __file__ - the LIVE data/bug_reports.jsonl (no
-    # env redirect reaches it; found 2026-09-30 by a write audit). Tests that
-    # exercise the hook set it explicitly and mock auto_capture.
+    # A raising action files a self-detected bug report into the outbox. That
+    # outbox used to be bound to core/bug_reporter.py's __file__ - the LIVE
+    # data/bug_reports.jsonl, which no env redirect reached (found 2026-09-30
+    # by a write audit); it now resolves through core.paths at call time
+    # (data_staging/ here, or the runner's JARVIS_DATA_DIR). Off by default
+    # all the same: tests that exercise the hook set it explicitly.
     os.environ.setdefault("JARVIS_BUG_AUTO_CAPTURE", "0")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if root not in sys.path:

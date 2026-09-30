@@ -916,6 +916,44 @@ class ParseAndRunActionsTests(SectionSixBase):
             bc.parse_and_run_actions("[ACTION: boomer3, x]")
         cap.assert_not_called()
 
+    def test_action_exception_report_never_lands_in_the_live_outbox(self):
+        # 2026-09-30: the REAL auto_capture (not a mock) used to append this
+        # suite's fake '[boomer] ValueError' reports to <checkout>/data/
+        # bug_reports.jsonl, the live outbox. core.bug_reporter now resolves
+        # the outbox through core.paths at call time: here the redirected
+        # JARVIS_DATA_DIR, and the live file is left exactly as it was.
+        import shutil
+        import core.bug_reporter as br
+        from tests import live_data_guard
+        bc = self.bc
+        tmp = tempfile.mkdtemp(prefix="jv_sec6_outbox_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+
+        def _live_outbox_writes():
+            # The guard RECORDS (does not block) writes to live data/ files
+            # other than the shutdown flag; count the ones onto the outbox.
+            return [v for v in live_data_guard.violations()
+                    if v["detail"].endswith("bug_reports.jsonl")]
+        before = len(_live_outbox_writes())
+
+        def boom(_arg):
+            raise ValueError("outbox boom")
+
+        self._with_action("outbox_boomer", boom)
+        self._p(br, "_recent_auto", {})
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(br, "auto_submit_enabled", lambda: False), \
+             mock.patch.dict(bc.os.environ, {"JARVIS_BUG_AUTO_CAPTURE": "1",
+                                             "JARVIS_DATA_DIR": tmp}):
+            bc.parse_and_run_actions("[ACTION: outbox_boomer, x]")
+        with open(os.path.join(tmp, "bug_reports.jsonl"), encoding="utf-8") as fh:
+            rows = [json.loads(ln) for ln in fh]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("outbox boom", rows[0]["summary"])
+        self.assertEqual(len(_live_outbox_writes()), before,
+                         "nothing may be written to the live outbox")
+
     def test_action_exception_auto_submits_when_enabled(self):
         # With both JARVIS_BUG_AUTO_CAPTURE and JARVIS_BUG_AUTO_SUBMIT on, the
         # captured report is also POSTed via the API.

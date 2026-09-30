@@ -363,6 +363,48 @@ class OutboxTests(unittest.TestCase):
             self.assertFalse(bug_reporter.append_outbox({"x": 1}, "/nope/a.jsonl"))
 
 
+class OutboxPathTests(unittest.TestCase):
+    """The default outbox follows core.paths at CALL time. It used to be a
+    private join onto the live data/ bound at import, so a test that ran the
+    monolith's failed-action path (tests/monolith/test_monolith_sec6) wrote a
+    fake '[boomer] ValueError: primary boom' report into the live outbox."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="jv_bug_outbox_")
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+        bug_reporter._recent_auto.clear()
+        self.addCleanup(bug_reporter._recent_auto.clear)
+
+    def test_data_dir_override_is_read_at_call_time(self):
+        with mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": self.d}):
+            self.assertEqual(bug_reporter.outbox_path(),
+                             os.path.join(self.d, "bug_reports.jsonl"))
+
+    def test_staging_process_never_names_the_live_data_dir(self):
+        # The monolith test harness sets JARVIS_STAGING=1, so this is where a
+        # directly-run monolith suite's reports go. The project root is pinned
+        # to a temp dir so the test creates nothing in the checkout.
+        env = {"JARVIS_STAGING": "1", "JARVIS_DATA_DIR": ""}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch("core.paths.PROJECT_DIR", self.d):
+            path = bug_reporter.outbox_path()
+        self.assertEqual(path, os.path.join(self.d, "data_staging",
+                                            "bug_reports.jsonl"))
+
+    def test_default_record_and_auto_capture_land_in_the_redirected_dir(self):
+        target = os.path.join(self.d, "bug_reports.jsonl")
+        with mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": self.d}):
+            bug_reporter.record_bug("user", "redirected")
+            try:
+                raise ValueError("redirected boom")
+            except ValueError as e:
+                self.assertIsNotNone(bug_reporter.auto_capture(
+                    e, where="outbox_path_test", now=1.0))
+        with open(target, encoding="utf-8") as fh:
+            rows = [json.loads(ln) for ln in fh]
+        self.assertEqual([r["kind"] for r in rows], ["user", "auto"])
+
+
 class FormatAndUrlTests(unittest.TestCase):
     def test_auto_issue_has_traceback_section(self):
         rep = bug_reporter.make_report("auto", "Crash", tb="Traceback line")

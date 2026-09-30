@@ -36,6 +36,18 @@ from core.persona import (
 _SIGNATURE_POOL_BLOCK = render_signature_phrase_pool()
 _TONE_MODULATION_BLOCK = render_tone_modulation_block()
 
+# The two CLOCK-ONLY rules in the stress-detection section below: the hour as
+# a stress signal, and daylight as a condition for leaving the calm register.
+# BASE_SYSTEM_PROMPT keeps both (the shipped default); base_system_prompt()
+# drops them while NIGHT_QUIET_ENABLED is off (core/night_quiet.py), so the
+# hour alone never shortens or flattens a reply.
+_LATE_HOUR_STRESS_SIGNAL = (
+    "  • LATE HOUR — local time after 22:00 or before 06:00. After midnight "
+    "the bar drops further; treat every interaction as quietly stressed by "
+    "default unless sir is plainly excited.\n"
+)
+_DAYLIGHT_RETURN_CLAUSE = ", daylight hours"
+
 BASE_SYSTEM_PROMPT = (
     "You are JARVIS, your owner's personal AI assistant. Modelled after the "
     "JARVIS from the Iron Man films — intelligent, observant, dryly witty, "
@@ -262,9 +274,7 @@ BASE_SYSTEM_PROMPT = (
     "'wait', 'no no no', or a clipped imperative with an exclamation). The "
     "outer loop classifies these via the emotion tracker; when the per-turn "
     "USER_TONE hint reads 'stressed' or 'frustrated', that is the signal.\n"
-    "  • LATE HOUR — local time after 22:00 or before 06:00. After midnight "
-    "the bar drops further; treat every interaction as quietly stressed by "
-    "default unless sir is plainly excited.\n"
+    + _LATE_HOUR_STRESS_SIGNAL +
     "  • RAPID OR FRAGMENTED SPEECH — short clipped utterances, repeated "
     "phrases ('I said', 'again', or a 'still' right after a failed attempt "
     "— 'I'm still having USB issues' on its own is a fault report, not "
@@ -288,8 +298,9 @@ BASE_SYSTEM_PROMPT = (
     "  • ONE SENTENCE. Reply length collapses to a single short sentence. No "
     "'Also, sir...' aside, no second clause, no narration.\n"
     "Return to the normal register only when the stress signals clear — "
-    "neutral USER_TONE for a turn or two, no venting keywords, daylight "
-    "hours. Do not announce the shift either way; the cadence change is the "
+    "neutral USER_TONE for a turn or two, no venting keywords"
+    + _DAYLIGHT_RETURN_CLAUSE +
+    ". Do not announce the shift either way; the cadence change is the "
     "tell.\n\n"
     "Voice-emotion routing: every turn a per-utterance USER_TONE hint may be "
     "appended below this prompt — classified from sir's transcript heuristics "
@@ -345,6 +356,28 @@ BASE_SYSTEM_PROMPT = (
     "correctly. Use it sparingly — once or twice a session at most; if "
     "every line is wry the cadence stops being funny."
 )
+
+
+def base_system_prompt(night_quiet=None) -> str:
+    """BASE_SYSTEM_PROMPT as this process should ship it.
+
+    `night_quiet` None reads NIGHT_QUIET_ENABLED at call time
+    (core/night_quiet.py). On: BASE_SYSTEM_PROMPT unchanged. Off: without its
+    two clock-only rules (_LATE_HOUR_STRESS_SIGNAL and the "daylight hours"
+    return condition), so the hour alone never puts JARVIS in the one-sentence
+    extra-calm register; the owner's own stress signals still do.
+    """
+    if night_quiet is None:
+        try:
+            from core.night_quiet import night_quiet_enabled
+            night_quiet = night_quiet_enabled()
+        except Exception:
+            night_quiet = True
+    if night_quiet:
+        return BASE_SYSTEM_PROMPT
+    return (BASE_SYSTEM_PROMPT
+            .replace(_LATE_HOUR_STRESS_SIGNAL, "", 1)
+            .replace(_DAYLIGHT_RETURN_CLAUSE, "", 1))
 
 
 # Document-level safety rules for PC control. SINGLE SOURCE — interpolated into
@@ -1694,9 +1727,10 @@ PC_CONTROL_PROMPT = (
     "                                  weather/news briefings, anticipation,\n"
     "                                  screen_watch) muted. Critical alerts\n"
     "                                  (Bambu failure, timers, VIP calls)\n"
-    "                                  still fire. Auto-engages at 23:00 and\n"
-    "                                  auto-releases at 06:00 or when the\n"
-    "                                  user says 'good morning'.\n"
+    "                                  still fire. Can also auto-engage at\n"
+    "                                  23:00 (a setting the user may have\n"
+    "                                  turned off); releases at 06:00 or when\n"
+    "                                  the user says 'good morning'.\n"
     "    Trigger phrases: 'night owl mode', 'go quiet for the night', 'dim\n"
     "    things down', 'kick on night-owl mode'. Prefer this over focus_mode\n"
     "    when the user is winding down for the night rather than heads-down\n"

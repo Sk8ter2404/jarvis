@@ -22,6 +22,20 @@ import re
 
 TONE_DETECTION_ENABLED = True
 
+
+def night_quiet_enabled() -> bool:
+    """NIGHT_QUIET_ENABLED (core/night_quiet.py), read at call time.
+
+    Imported lazily so this module still imports with no package on sys.path
+    (`python core/tone_detector.py`); there it keeps the old behaviour (on).
+    """
+    try:
+        from core.night_quiet import night_quiet_enabled as _enabled
+    except ImportError:
+        return True
+    return _enabled()
+
+
 _STRESS_SWEAR_WORDS = (
     "fuck", "fucking", "fuckin", "shit", "shitty", "damn", "damnit",
     "dammit", "goddamn", "bullshit", "bloody", "bollocks", "wtf",
@@ -93,6 +107,15 @@ def _is_late_night_hour(now: "datetime.datetime | None" = None) -> bool:
     Callers can pass an explicit datetime (tests, the voice-emotion router)."""
     h = (now or datetime.datetime.now()).hour
     return h >= _LATE_NIGHT_START_HOUR or h < _LATE_NIGHT_END_HOUR
+
+
+def _late_night_tone_applies(now: "datetime.datetime | None" = None) -> bool:
+    """True when the CLOCK alone should put JARVIS in the late-night register:
+    inside the late-night band AND NIGHT_QUIET_ENABLED is on
+    (core/night_quiet.py). The one gate for both clock-driven late-night
+    paths: detect_tone()'s fallback tone and core/voice_emotion's mood. The
+    raw hour test stays in _is_late_night_hour()."""
+    return night_quiet_enabled() and _is_late_night_hour(now)
 
 
 def _clean(text) -> str:
@@ -189,7 +212,8 @@ def detect_tone(user_text: str, prev_user_text: str | None = None,
     has no such signal today. Either one turns a bare 'still' into
     frustration (see _CONTEXT_GATED_FRUSTRATION_WORDS); without them 'still'
     is neutral. 'late_night' is a time-of-day fallback applied only when no
-    other tone fires, so explicit signals still win after midnight.
+    other tone fires, so explicit signals still win after midnight, and only
+    while NIGHT_QUIET_ENABLED is on (see _late_night_tone_applies).
 
     Pure-Python heuristics only — no LLM call, no model load, side-effect free.
     """
@@ -258,7 +282,7 @@ def detect_tone(user_text: str, prev_user_text: str | None = None,
     if has_playful:
         return "playful"
 
-    if _is_late_night_hour():
+    if _late_night_tone_applies():
         return "late_night"
 
     return None

@@ -6,6 +6,7 @@ JARVIS-style line through the pending_speech queue. Inputs:
   • pattern_memory.maybe_pattern_offer()  — strong day-of-week / time-of-day habits
   • focused window dwell                  — long sessions in productivity apps
   • current local time                    — late-hour active sessions
+                                            (only while NIGHT_QUIET_ENABLED)
 
 Gating (all must pass before any trigger is considered):
   • Cooldown:        no more than once every ANTICIPATION_COOLDOWN_MINUTES
@@ -18,7 +19,9 @@ Gating (all must pass before any trigger is considered):
                      no-tracker is treated permissively (don't suppress).
   • Late-night:      between 23:00 and 07:00 we only fire if the user has
                      spoken in the last 30 minutes (no whispering at an
-                     empty desk in the middle of the night).
+                     empty desk in the middle of the night). Only while
+                     NIGHT_QUIET_ENABLED is on: off, the night uses the
+                     daytime gates (the "Not away" one still applies).
   • Probability:     even when a trigger matches, fire with probability
                      FIRE_PROBABILITY (0.35) so the engine feels rare,
                      not punctual.
@@ -50,6 +53,7 @@ if _PROJECT_DIR not in sys.path:
     sys.path.insert(0, _PROJECT_DIR)
 
 from core.atomic_io import _atomic_write_json  # noqa: E402
+from core.night_quiet import night_quiet_enabled  # noqa: E402
 
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _STATE_FILE   = os.path.join(_PROJECT_DIR, "anticipation_state.json")
@@ -415,7 +419,13 @@ def _try_long_dwell(state: dict) -> tuple[str, str]:
 
 def _try_late_hour_active() -> str:
     """If past LATE_HOUR_THRESHOLD_HOUR and user has spoken within the last
-    LATE_HOUR_ACTIVE_WINDOW, suggest pacing."""
+    LATE_HOUR_ACTIVE_WINDOW, suggest pacing.
+
+    Never while NIGHT_QUIET_ENABLED is off (core/night_quiet.py): the nudge
+    is the clock alone, and with no nudge no 'late_hour' trigger reaches
+    anticipation_state.json either (core/tts.py reads it for hushed_late)."""
+    if not night_quiet_enabled():
+        return ""
     now = time.localtime()
     if not (now.tm_hour >= LATE_HOUR_THRESHOLD_HOUR or now.tm_hour < LATE_HOUR_END_HOUR):
         return ""
@@ -434,7 +444,14 @@ def _try_late_hour_active() -> str:
 def _should_skip_late_night() -> bool:
     """Between LATE_HOUR_THRESHOLD_HOUR and LATE_HOUR_END_HOUR, only fire when
     the user has spoken in the last 30 minutes — no whispering at an empty desk
-    at 4am."""
+    at 4am.
+
+    Never skips while NIGHT_QUIET_ENABLED is off (core/night_quiet.py): the
+    hold is the clock alone (the same silence does not hold a line in the
+    daytime), and the loop's separate presence gate (_user_at_desk() is
+    False) still keeps lines away from an empty room, day or night."""
+    if not night_quiet_enabled():
+        return False
     lt = time.localtime()
     if not (lt.tm_hour >= LATE_HOUR_THRESHOLD_HOUR or lt.tm_hour < LATE_HOUR_END_HOUR):
         return False

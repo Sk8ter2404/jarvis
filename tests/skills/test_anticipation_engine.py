@@ -509,6 +509,16 @@ class AnticipationDwellTriggerTests(_EngineTestBase):
 
 
 class AnticipationLateHourTests(_EngineTestBase):
+    def setUp(self):
+        super().setUp()
+        # These pin the late-hour logic with night quieting ON (the shipped
+        # default). Patched explicitly so a gitignored user_settings.json with
+        # NIGHT_QUIET_ENABLED false cannot flip them.
+        from core import config as cfg
+        p = mock.patch.object(cfg, "NIGHT_QUIET_ENABLED", True, create=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_late_hour_active_fires_when_recently_spoke(self):
         with mock.patch.object(self.mod.time, "localtime",
                                return_value=_struct(23, 30)), \

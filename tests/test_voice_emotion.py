@@ -40,9 +40,13 @@ class RouteTests(unittest.TestCase):
         self.assertIn("excited", r["addendum"].lower())
 
     def test_late_night_timestamp_forces_late_night(self):
+        # NIGHT_QUIET_ENABLED patched on explicitly: a gitignored
+        # user_settings.json with it off must not flip this test.
+        from core import config as cfg
         ts = datetime.datetime(2026, 1, 1, 2, 0).timestamp()
-        self.assertEqual(ve.route_voice_emotion("open the notes", now=ts)["mood"],
-                         "late_night")
+        with mock.patch.object(cfg, "NIGHT_QUIET_ENABLED", True, create=True):
+            mood = ve.route_voice_emotion("open the notes", now=ts)["mood"]
+        self.assertEqual(mood, "late_night")
 
     def test_cross_turn_repetition_routes_to_stressed(self):
         # 'frustrated' (from cross-turn restatement) folds into 'stressed'.

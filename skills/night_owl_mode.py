@@ -1,7 +1,9 @@
 """
 Night-owl mode for JARVIS.
 
-Auto-engages at 23:00 local time and runs until 06:00 (configurable). While
+Auto-engages at 23:00 local time and runs until 06:00 (configurable) when the
+NIGHT_QUIET_ENABLED and NIGHT_OWL_AUTO settings are both on (the shipped
+default); with either off it only engages when asked ("night owl on"). While
 active:
 
   • TTS preset is dimmed — gain × 0.85 and rate further slowed ~5pp on top
@@ -18,6 +20,8 @@ active:
     bambu_print_announcer failure/runout/AMS) stay loud.
   • A brief addendum is appended to bobert_companion._system_prompt so the
     LLM knows it's late and should keep replies short and quiet.
+  • The monolith skips its "thinking" filler clip while the mode is active
+    (bobert_companion._filler_suppressed reads is_night_owl_active()).
 
 Auto-disengages at 06:00 OR when the user says "good morning" (the LLM
 emits [ACTION: good_morning] in response to a morning greeting while the
@@ -53,7 +57,7 @@ if _PROJECT_DIR not in sys.path:
 from core.atomic_io import _atomic_write_json  # noqa: E402
 
 # ─── Config ──────────────────────────────────────────────────────────────
-NIGHT_OWL_START_HOUR   = 23     # auto-engage at/after 23:00 local
+NIGHT_OWL_START_HOUR   = 23     # auto-engage at/after 23:00 local (when allowed)
 NIGHT_OWL_END_HOUR     = 6      # auto-disengage at/after 06:00 local
 NIGHT_OWL_OVERLAY_DIM  = 0.4    # 40% opacity per spec
 NIGHT_OWL_GAIN_SCALE   = 0.85   # -15% gain per spec
@@ -431,39 +435,62 @@ def _exit_night_owl(trigger: str = "manual", *, announce: bool = True) -> str:
 
 def _watch_loop():
     """Poll every WATCH_INTERVAL_SECONDS. Auto-engage when the local clock
-    enters the night window; auto-disengage when it leaves OR when the
-    main loop's _last_wake_date flips (i.e. a fresh wake-word in the
-    morning has fired). Crash-resilient — any exception logs and continues."""
+    enters the night window, but only while _auto_enabled() (the
+    NIGHT_QUIET_ENABLED and NIGHT_OWL_AUTO settings); auto-disengage when the
+    window ends. Crash-resilient — any exception logs and continues."""
     # Small startup delay so the skill loader finishes registering everyone.
     time.sleep(8.0)
+    if not _auto_enabled():
+        print("  [night_owl] automatic 23:00 switch-on is OFF "
+              "(NIGHT_QUIET_ENABLED / NIGHT_OWL_AUTO); 'night owl on' still works")
     while True:
         try:
-            in_window = _in_night_window()
-            active = is_night_owl_active()
-            if in_window and not active and not _opted_out_of_this_night():
-                _enter_night_owl(trigger="auto")
-            elif in_window and active:
-                # The window has caught up with a pre-window manual
-                # engagement — from here on the morning rollover applies.
-                _engaged_in_window[0] = True
-            elif not in_window and active and _trigger[0] == "auto":
-                # Only auto-disengage automatically-engaged sessions —
-                # manual engagements stay until the user says so or the
-                # window naturally lapses.
-                _exit_night_owl(trigger="auto_morning")
-            elif not in_window and active and _trigger[0] != "auto" \
-                    and _engaged_in_window[0]:
-                # Manual engagement that the clock has rolled past 06:00:
-                # still auto-disengage so the user isn't stuck in dimmed
-                # mode all day from a forgotten previous-night command.
-                # A manual engage BEFORE 23:00 hasn't hit the window yet
-                # (_engaged_in_window is False), so it stays put instead
-                # of being reverted with a spurious 'Good morning'.
-                _exit_night_owl(trigger="auto_morning")
+            _watch_tick()
             time.sleep(WATCH_INTERVAL_SECONDS)
         except Exception:
             logging.exception("[night_owl] watcher tick failed")
             time.sleep(WATCH_INTERVAL_SECONDS)
+
+
+def _auto_enabled() -> bool:
+    """May the watcher switch the mode on by itself at the start of the night
+    window? Needs BOTH NIGHT_QUIET_ENABLED (the master night-quiet switch) and
+    NIGHT_OWL_AUTO (core/config.py, user_settings.json), read at call time.
+    Only the automatic ENGAGE is gated; a manual engagement still rolls off in
+    the morning. Any trouble reading the settings keeps the old behaviour
+    (on)."""
+    try:
+        from core.night_quiet import night_owl_auto_enabled
+        return night_owl_auto_enabled()
+    except Exception:
+        return True
+
+
+def _watch_tick() -> None:
+    """One watcher decision (split out of _watch_loop so it is testable)."""
+    in_window = _in_night_window()
+    active = is_night_owl_active()
+    if (in_window and not active and not _opted_out_of_this_night()
+            and _auto_enabled()):
+        _enter_night_owl(trigger="auto")
+    elif in_window and active:
+        # The window has caught up with a pre-window manual
+        # engagement — from here on the morning rollover applies.
+        _engaged_in_window[0] = True
+    elif not in_window and active and _trigger[0] == "auto":
+        # Only auto-disengage automatically-engaged sessions —
+        # manual engagements stay until the user says so or the
+        # window naturally lapses.
+        _exit_night_owl(trigger="auto_morning")
+    elif not in_window and active and _trigger[0] != "auto" \
+            and _engaged_in_window[0]:
+        # Manual engagement that the clock has rolled past 06:00:
+        # still auto-disengage so the user isn't stuck in dimmed
+        # mode all day from a forgotten previous-night command.
+        # A manual engage BEFORE 23:00 hasn't hit the window yet
+        # (_engaged_in_window is False), so it stays put instead
+        # of being reverted with a spurious 'Good morning'.
+        _exit_night_owl(trigger="auto_morning")
 
 
 # ─── Action handlers ─────────────────────────────────────────────────────

@@ -36,6 +36,19 @@ from collections import OrderedDict
 from typing import Optional, Tuple
 
 
+def night_quiet_enabled() -> bool:
+    """NIGHT_QUIET_ENABLED (core/night_quiet.py), read at call time.
+
+    Imported lazily so `python core/tts.py` (the self-test below, run with no
+    package on sys.path) still works; there it keeps the old behaviour (on).
+    """
+    try:
+        from core.night_quiet import night_quiet_enabled as _enabled
+    except ImportError:
+        return True
+    return _enabled()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  MUTE_TTS — speakers off, pipeline still alive
 #
@@ -297,7 +310,13 @@ def detect_late_hour(
     where anticipation hasn't fired yet, and the state-file check catches
     daylight-saving / clock-skew edge cases where the trigger fired but the
     local hour rolled back.
+
+    Always False while NIGHT_QUIET_ENABLED is off (core/night_quiet.py): both
+    signals come from the clock alone, and that switch means "sound the same
+    at night as in the daytime".
     """
+    if not night_quiet_enabled():
+        return False
     cur = now if now is not None else datetime.datetime.now()
     try:
         if cur.hour >= int(LATE_HOUR_THRESHOLD_HOUR):
@@ -673,6 +692,9 @@ _INTENT_PRESETS: dict[str, str] = {
 # bad_news preset; late-night gets quiet + slow; excited gets brighter +
 # faster. Tones absent from this mapping fall through to the text-based
 # emotion (detect_tts_emotion) so existing per-phrase cadence still works.
+# The clock reaches 'late_night' only while NIGHT_QUIET_ENABLED is on
+# (core/tone_detector._late_night_tone_applies); with it off, only the owner
+# saying he is tired ('tired' tone → late_night mood) lands on that preset.
 _USER_TONE_TTS: dict[str, str] = {
     "stressed":   "bad_news",      # calm + slower — counterbalance the user's panic
     "frustrated": "bad_news",      # don't add energy to a frustrated user

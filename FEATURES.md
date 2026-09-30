@@ -193,7 +193,7 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
 - **Workshop mode (auto-engaged)** — fires when Bambu Studio / Fusion 360 / SolidWorks / FreeCAD / OnShape / Blender / OpenSCAD / Orca / Prusa / Cura appears. TTS to 70% volume, single-sentence prompt addendum, announces print status if mid-flight.
   - "workshop status" (manual query)
   - Action: `workshop_status`
-- **Night-owl mode** — auto 23:00–06:00. TTS softer + quieter, holographic overlay dimmed to 40%, non-critical nudges suppressed. Critical alerts (print fail, VIP call, timer) still fire. Auto-disengages 06:00 OR "good morning."
+- **Night-owl mode** — auto 23:00–06:00 (settings `NIGHT_OWL_AUTO`, and the master switch `NIGHT_QUIET_ENABLED` that also turns off every other clock-driven night quieting; either off = only on request). TTS softer + quieter, holographic overlay dimmed to 40%, non-critical nudges suppressed. Critical alerts (print fail, VIP call, timer) still fire. Auto-disengages 06:00 OR "good morning."
   - "night owl on", "night owl off", "good morning", "night owl status"
   - Actions: `night_owl_on`/`night_owl_mode`/`enable_night_owl`, `night_owl_off`/`end_night_owl`/`disable_night_owl`, `good_morning`, `night_owl_status`
 - **Suit-up sequence** — cinematic 6–8s warm-restart boot. Arc-reactor spin-up, sequential system-check TTS lines ("Diagnostics: nominal." "Network: online." "Welcome back, sir. Systems are yours."). Fires once per day on first warm restart.

@@ -21,7 +21,7 @@ import re
 
 from core.tone_detector import (
     detect_tone,
-    _is_late_night_hour,
+    _late_night_tone_applies,
     _EXCITEMENT_PHRASES,
     _STRESS_SWEAR_WORDS,
 )
@@ -96,11 +96,13 @@ def route_voice_emotion(user_text: str, now: float | None = None,
     tone = detect_tone(text, prev_user_text=prev_user_text) if text else None
     excited = _detect_excited(text) if text else False
 
-    # Time-of-day branch. _is_late_night_hour expects a datetime, so build one
-    # from `now` when a caller passes a Unix timestamp (tests do this; the live
-    # path leaves now=None and the helper uses the current clock).
+    # Time-of-day branch. The helper expects a datetime, so build one from
+    # `now` when a caller passes a Unix timestamp (tests do this; the live
+    # path leaves now=None and the helper uses the current clock). Always
+    # False while NIGHT_QUIET_ENABLED is off (core/night_quiet.py); a 'tired'
+    # tone from the owner's own words still routes to late_night below.
     when = datetime.datetime.fromtimestamp(now) if now is not None else None
-    late_night = _is_late_night_hour(when)
+    late_night = _late_night_tone_applies(when)
 
     # Bucket detect_tone()'s 7-label output into the 4 router moods.
     # 'frustrated' folds into 'stressed' (same calm + terse strategy).

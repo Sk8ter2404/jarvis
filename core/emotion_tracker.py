@@ -38,6 +38,8 @@ from typing import Optional
 # One definition of "repeating himself", shared with the tone detector so the
 # two classifiers cannot drift apart on it. Stdlib-only, import-light.
 from core.tone_detector import is_restatement
+# NIGHT_QUIET_ENABLED (read at call time) gates the time-only 'tired' read.
+from core.night_quiet import night_quiet_enabled
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -294,6 +296,8 @@ def classify_emotion(
 
     Priority order (first match wins):
         frustrated > stressed > excited > tired > focused > (late_night→tired)
+    The last one is the clock alone and applies only while NIGHT_QUIET_ENABLED
+    is on.
 
     'Frustrated' beats 'stressed' because the response strategy is
     different — frustrated wants an acknowledgement + retry; stressed
@@ -401,10 +405,13 @@ def classify_emotion(
     # normal hours. Treated as tired for delivery (softer / shorter),
     # but only when the utterance is short and declarative — at 2 AM,
     # a long focused engineering ask should stay 'focused', not be
-    # downgraded to a tired register.
-    hour = p.hour if p.hour is not None else _current_hour()
-    if _in_late_night_band(hour) and n_words <= 8 and excl_count == 0:
-        return _build("tired", f"time=late_night hour={hour}")
+    # downgraded to a tired register. The clock alone is the only signal
+    # here, so NIGHT_QUIET_ENABLED off (core/night_quiet.py) skips it; the
+    # 'tired' reads above come from his words or voice and still apply.
+    if night_quiet_enabled():
+        hour = p.hour if p.hour is not None else _current_hour()
+        if _in_late_night_band(hour) and n_words <= 8 and excl_count == 0:
+            return _build("tired", f"time=late_night hour={hour}")
 
     return _EMPTY
 

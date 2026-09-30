@@ -516,6 +516,11 @@ from core.tone_detector import (  # noqa: F401  (re-exported for in-file callers
     _is_late_night_hour,
     _tone_system_addendum,
 )
+# NIGHT_QUIET_ENABLED master switch (read at call time from core.config): gates
+# the clock-driven night quieting here (wake greeting, late-night remark) and in
+# core/tts, core/tone_detector, core/voice_emotion, core/emotion_tracker and the
+# night-owl / anticipation skills. Stdlib-only.
+from core.night_quiet import night_quiet_enabled as _night_quiet_enabled
 
 # Whisper transcription gates (is_valid_speech / is_ambient_music) + their
 # tuning constants live in core/speech_filter.py. Re-export the two functions
@@ -1437,6 +1442,9 @@ ROBOT_URL = f"http://{ROBOT_IP}:{ROBOT_PORT}/command"
 # pipeline reviewer loads that small file when reasoning about the
 # personality block, vs. the full bobert_companion.py.
 from core.prompts import BASE_SYSTEM_PROMPT  # noqa: F401
+# build_system_prompt() starts from this: BASE_SYSTEM_PROMPT, minus its two
+# clock-only rules while NIGHT_QUIET_ENABLED is off (read at call time).
+from core.prompts import base_system_prompt as _base_system_prompt
 
 conversation_history: list[dict] = []
 _system_prompt = BASE_SYSTEM_PROMPT   # extended with memory at startup
@@ -1974,7 +1982,10 @@ def build_system_prompt(memory: dict) -> str:
     # calls build_system_prompt(load_memory()) after every learn) then only
     # re-cache the small memory block instead of re-writing the whole ~43k
     # cached prefix. Nothing memory-derived may sit above the boundary.
-    prompt = BASE_SYSTEM_PROMPT
+    # NIGHT_QUIET_ENABLED off drops the prompt's clock-only late-hour rules
+    # (core/prompts.base_system_prompt); the knob changes only on a restart,
+    # so the cached prefix stays stable within a run.
+    prompt = _base_system_prompt()
 
     # Standing rules from data/chappie_standing_rules.json. Injected before
     # the phrasebook so 'read-before-send', 'no impersonation without explicit
@@ -14329,8 +14340,11 @@ def maybe_late_night_remark(user_text: str, memory: dict) -> str:
         returns a brief acknowledgement.
       - Updates the cooldown timestamp + phrase-rotation cursor when a
         remark is returned.
+
+    Nothing at all while NIGHT_QUIET_ENABLED is off (core/night_quiet.py):
+    the remark is extra speech driven by the clock alone.
     """
-    if not _in_late_night_window():
+    if not _night_quiet_enabled() or not _in_late_night_window():
         return ""
 
     if _matches_suppress_phrase(user_text):
@@ -27630,7 +27644,9 @@ def _pick_wake_variety(from_standby: bool, wake_text: str = "") -> tuple[str, fl
         preferred.add("terse")
     if tone == "playful":
         preferred.add("playful")
-    if tone == "tired" or hour >= 22 or hour < 5:
+    # Soft (and 0.85 volume, below) for a tired owner, or from the clock alone
+    # 22:00-04:59 unless NIGHT_QUIET_ENABLED is off (core/night_quiet.py).
+    if tone == "tired" or (_night_quiet_enabled() and (hour >= 22 or hour < 5)):
         preferred.add("soft")
     # Formal register fits the start of the day and a wake out of standby.
     if from_standby or (5 <= hour < 11):
@@ -27668,6 +27684,7 @@ def context_aware_greeting(from_standby: bool, wake_text: str = "") -> tuple[str
 
     Priority (first match wins):
       1. 01–05 local AND ≥3 wakes in the last 10 min → "Still up, sir?"
+         (only while NIGHT_QUIET_ENABLED is on: a remark about the hour)
       2. 05–11 local AND first wake of the day       → "Good morning, sir."
       3. Bambu H2D actively printing                 → "At your service…"
       4. User out of view on every camera            → quieter "Yes, sir?"
@@ -27693,7 +27710,9 @@ def context_aware_greeting(from_standby: bool, wake_text: str = "") -> tuple[str
     first_of_day = (_last_wake_date[0] != today)
     _last_wake_date[0] = today
 
-    if 1 <= hour < 5 and len(_wake_history) >= 3:
+    # A remark about the hour, from the clock alone, like the late-night
+    # remark: none while NIGHT_QUIET_ENABLED is off (core/night_quiet.py).
+    if _night_quiet_enabled() and 1 <= hour < 5 and len(_wake_history) >= 3:
         return ("Still up, sir?", 1.0)
 
     if 5 <= hour < 12 and first_of_day:

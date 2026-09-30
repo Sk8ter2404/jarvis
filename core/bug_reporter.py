@@ -44,7 +44,22 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _OWNER = os.environ.get("JARVIS_GITHUB_OWNER", "Sk8ter2404")
 _REPO = os.environ.get("JARVIS_GITHUB_REPO", "jarvis")
-_OUTBOX = os.path.join(_ROOT, "data", "bug_reports.jsonl")
+_OUTBOX_NAME = "bug_reports.jsonl"
+
+
+def outbox_path() -> str:
+    """The local outbox for THIS process, resolved at call time through
+    core.paths (JARVIS_DATA_DIR, then data_staging/ for a staging or test
+    process, then the live data/). It used to be a private join onto the live
+    data/, bound at import, so a staging instance and every test that ran the
+    dispatcher's failed-action path wrote fake reports into the owner's live
+    outbox. core.paths is imported lazily (it is stdlib-only as well); if it
+    cannot be imported the old location is kept."""
+    try:
+        from core.paths import data_file
+        return data_file(_OUTBOX_NAME)
+    except Exception:  # pragma: no cover - core.paths is stdlib-only
+        return os.path.join(_ROOT, "data", _OUTBOX_NAME)
 
 
 def _luhn(digits: str) -> bool:
@@ -241,9 +256,12 @@ def capture_exception(exc: BaseException, *, context: Optional[Dict[str, Any]] =
     return make_report("auto", summary, tb=tb, context=context)
 
 
-def append_outbox(report: Dict[str, Any], path: str = _OUTBOX) -> bool:
-    """Append one report as a JSON line to the local outbox. Never raises."""
+def append_outbox(report: Dict[str, Any], path: Optional[str] = None) -> bool:
+    """Append one report as a JSON line to the local outbox (outbox_path()
+    unless `path` is given). Never raises."""
     try:
+        if path is None:
+            path = outbox_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(report, ensure_ascii=False) + "\n")
@@ -254,7 +272,7 @@ def append_outbox(report: Dict[str, Any], path: str = _OUTBOX) -> bool:
 
 def record_bug(kind: str, summary: str, *, detail: str = "", tb: str = "",
                context: Optional[Dict[str, Any]] = None,
-               outbox: str = _OUTBOX) -> Dict[str, Any]:
+               outbox: Optional[str] = None) -> Dict[str, Any]:
     """Make a scrubbed report, persist it to the outbox, and return it."""
     rep = make_report(kind, summary, detail=detail, tb=tb, context=context)
     append_outbox(rep, outbox)
@@ -268,7 +286,7 @@ _recent_auto: Dict[str, float] = {}
 def auto_capture(exc: BaseException, *, where: str = "",
                  context: Optional[Dict[str, Any]] = None,
                  now: Optional[float] = None, window: float = 300.0,
-                 outbox: str = _OUTBOX) -> Optional[Dict[str, Any]]:
+                 outbox: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Rate-limited SELF-detect capture. Build a scrubbed 'auto' report and
     record it to the outbox — UNLESS the same (exception-type, where) pair was
     already recorded within `window` seconds, so a recurring error can't spam
