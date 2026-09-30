@@ -101,11 +101,49 @@ def _clean(text) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+# Words that carry no request of their own: articles, pronouns, auxiliaries,
+# question words, politeness and "again"-type fillers. Comparing requests on
+# these made every pair of short questions a "restatement" (live 2026-09-29:
+# "what time is it" after "what day is it" shared what/is/it -> frustrated ->
+# a stressed voice and 15 min of proactive silence).
+_RESTATE_FILLER = frozenset((
+    "a an the this that these those it its it's i i'm me my you your you're "
+    "we us our he him his she her they them their is are was were be been am "
+    "do does did done can could would will should shall may might must have "
+    "has had what what's whats which who whom whose when where why how "
+    "there here to of for in at by with from as and or but if so then than "
+    "please now just again still keep keeps kept really very jarvis sir hey "
+    "ok okay um uh well also too any some all").split())
+
+# A request that differs only by one of these pairs asks for something else.
+_RESTATE_OPPOSITES = (
+    ("on", "off"), ("up", "down"), ("open", "close"), ("start", "stop"),
+    ("enable", "disable"), ("lock", "unlock"), ("show", "hide"),
+    ("more", "less"), ("louder", "quieter"), ("higher", "lower"),
+    ("increase", "decrease"), ("next", "previous"), ("yes", "no"),
+    ("left", "right"), ("forward", "back"),
+    ("brighter", "dimmer"), ("mute", "unmute"), ("add", "remove"),
+)
+_RESTATE_NUMBER_WORDS = frozenset((
+    "zero one two three four five six seven eight nine ten eleven twelve "
+    "fifteen twenty thirty forty fifty sixty hundred thousand half quarter "
+    "first second third").split())
+
+
+def _restate_words(text) -> set:
+    return {w for w in _clean(text).split() if w not in _RESTATE_FILLER}
+
+
 def is_restatement(user_text: str, prev_user_text) -> bool:
-    """True when ``user_text`` restates ``prev_user_text``: the two share a
-    majority of their words (at least 2). An IDENTICAL previous line does not
-    count -- callers take "previous" from a history the current turn may
-    already sit in, and comparing a line with itself is not repetition.
+    """True when ``user_text`` restates ``prev_user_text``: the same request
+    again, reworded or padded ("turn off the lights" -> "turn off the lights
+    now", "the usb hub keeps dropping out" -> "the usb hub is still dropping
+    out"). Compared on the words that carry the request (fillers dropped):
+    at least 2 shared, and one contains the other or they mostly overlap
+    (Jaccard >= 0.6). A pair that differs by opposites (on/off, up/down) or
+    by a number asks for something else, so it never counts. An IDENTICAL
+    previous line does not count either -- callers take "previous" from a
+    history the current turn may already sit in.
 
     Shared with core.emotion_tracker so both classifiers agree on what
     "repeating himself" means. Never raises: anything that cannot be read as
@@ -117,8 +155,21 @@ def is_restatement(user_text: str, prev_user_text) -> bool:
         prev = _clean(prev_user_text)
         if not prev or not cur or prev == cur:
             return False
-        pw, cw = set(prev.split()), set(cur.split())
-        return len(pw & cw) >= max(2, min(len(pw), len(cw)) // 2)
+        pw, cw = _restate_words(prev), _restate_words(cur)
+        shared = pw & cw
+        if len(shared) < 2:
+            return False
+        only_prev, only_cur = pw - cw, cw - pw
+        for a, b in _RESTATE_OPPOSITES:
+            if ((a in only_prev and b in only_cur)
+                    or (b in only_prev and a in only_cur)):
+                return False
+        if (only_prev & _RESTATE_NUMBER_WORDS
+                and only_cur & _RESTATE_NUMBER_WORDS):
+            return False
+        if pw <= cw or cw <= pw:
+            return True
+        return len(shared) / len(pw | cw) >= 0.6
     except Exception:
         return False
 

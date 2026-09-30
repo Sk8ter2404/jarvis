@@ -166,6 +166,49 @@ class IsRestatementTests(unittest.TestCase):
                 raise ValueError("cannot stringify")
         self.assertFalse(td.is_restatement("open the notes", Boom()))
 
+    # 2026-09-29 live: consecutive DIFFERENT requests were "restatements"
+    # because they shared what/is/it/the, so the owner came out frustrated
+    # (a stressed voice + 15 min of proactive silence) on ordinary turns.
+    def test_different_questions_sharing_fillers_are_not(self):
+        for cur, prev in (
+                ("what time is it", "what day is it"),
+                ("is the robot vacuum docked", "is the robot vacuum charging"),
+                ("send the robot vacuum out for a minute",
+                 "is the robot vacuum docked"),
+                ("what's the weather tomorrow", "what's the weather today"),
+                ("how long until Friday", "how many days until Christmas"),
+                ("what's the capital of Australia", "what time is it")):
+            with self.subTest(cur=cur, prev=prev):
+                self.assertFalse(td.is_restatement(cur, prev))
+
+    def test_opposites_and_numbers_are_new_requests(self):
+        for cur, prev in (
+                ("turn on the desk lamp", "turn off the desk lamp"),
+                ("turn the volume down", "turn the volume up"),
+                ("open the garage door", "close the garage door"),
+                ("set a timer for ten minutes", "set a timer for five minutes"),
+                ("unlock the front door", "lock the front door")):
+            with self.subTest(cur=cur, prev=prev):
+                self.assertFalse(td.is_restatement(cur, prev))
+
+    def test_real_restatements_still_count(self):
+        for cur, prev in (
+                ("turn off the lights now", "turn off the lights"),
+                ("can you turn off the desk lamp", "turn off the desk lamp"),
+                ("please just turn off the desk lamp", "turn off the desk lamp"),
+                ("the usb hub is still dropping out",
+                 "the usb hub keeps dropping out"),
+                ("open my school notes folder", "open the school notes folder")):
+            with self.subTest(cur=cur, prev=prev):
+                self.assertTrue(td.is_restatement(cur, prev))
+
+    def test_different_questions_are_not_frustrated(self):
+        with mock.patch.object(td, "_is_late_night_hour", return_value=False):
+            self.assertIsNone(td.detect_tone("what time is it",
+                                             prev_user_text="what day is it"))
+            self.assertIsNone(td.detect_tone(
+                "turn on the desk lamp", prev_user_text="turn off the desk lamp"))
+
 
 if __name__ == "__main__":
     unittest.main()
