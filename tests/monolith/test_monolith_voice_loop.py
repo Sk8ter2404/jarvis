@@ -892,5 +892,110 @@ class IdleListenYieldTests(_CaptureBase):
                     self.assertEqual(pending.call_count, 2)
 
 
+# ── 2026-10-01 diag batch: the two gaps B062 left ──────────────────────────
+class InjectWaitsForNoCaptureTests(_CaptureBase):
+    """Typed / web / injected commands waited for the current microphone
+    capture: the main loop drains data/injected_commands.json only at the
+    loop top. B062 made an idle listen yield when one arrives; two gaps were
+    left. (1) The yield returned with _utterance_in_progress untouched, so a
+    flag left set by an earlier capture kept the idle re-prime off. (2) A
+    command that landed after the listen's last 0.25 s work check (or with
+    the 20 s window timing out) was not a yield, so _capture_utterance went
+    on to start a PROACTIVE turn - a remark, an LLM call - in front of the
+    command that was already waiting."""
+
+    def _queue_inject_after(self, delay):
+        def write():
+            with open(self.inject_path, "w", encoding="utf-8") as f:
+                json.dump([{"text": "what time is it"}], f)
+        t = threading.Timer(delay, write)
+        t.start()
+        self.addCleanup(t.cancel)
+
+    def test_the_yield_clears_the_utterance_flag(self):
+        bc = self.bc
+        self._mic()
+        bc._utterance_in_progress[0] = True      # left set by an earlier capture
+        self._queue_inject_after(0.3)
+        audio, _ = self._quiet(bc.record_speech, 5, yield_to_work=True)
+        self.assertIsNone(audio)
+        self.assertEqual(bc._capture_yield_reason[0], "work")
+        self.assertFalse(bc._utterance_in_progress[0])
+
+    def _no_speech_pass(self, before_pass=None):
+        """One _capture_utterance pass whose listen ends WITHOUT a yield (the
+        timeout), the command landing in that same instant."""
+        bc = self.bc
+        self._mic()
+        self._p(bc, "_get_realtime_session", return_value=None)
+        self._p(bc, "resume_face_tracking")
+        self._p(bc, "_speak_pending", return_value=False)
+        self._p(bc, "should_be_proactive", return_value=True)
+        proactive = self._p(bc, "_do_proactive_turn")
+        if before_pass:
+            before_pass()
+
+        def rec(timeout=None, **kw):
+            with open(self.inject_path, "w", encoding="utf-8") as f:
+                json.dump([{"text": "typed at the timeout"}], f)
+            os.utime(self.inject_path, None)
+            bc._capture_yield_reason[0] = None
+            return None
+        self._p(bc, "record_speech", side_effect=rec)
+        out, _ = self._quiet(bc._capture_utterance, None, {})
+        self.assertIsNone(out)
+        return proactive
+
+    def test_no_proactive_turn_in_front_of_a_waiting_command(self):
+        proactive = self._no_speech_pass()
+        proactive.assert_not_called()
+
+    def test_a_stuck_inject_file_does_not_silence_proactive_turns(self):
+        # Compared against the pass's own baseline, never tested for
+        # presence: a file that was already there (and cannot be claimed)
+        # is not new work, so it neither hot-loops nor mutes JARVIS forever.
+        bc = self.bc
+
+        def stuck():
+            with open(self.inject_path, "w", encoding="utf-8") as f:
+                json.dump([{"text": "stuck"}], f)
+            st = os.stat(self.inject_path)
+
+            def rec(timeout=None, **kw):
+                os.utime(self.inject_path, ns=(st.st_atime_ns, st.st_mtime_ns))
+                bc._capture_yield_reason[0] = None
+                return None
+            self._stuck_rec = rec
+        self._mic()
+        stuck()
+        self._p(bc, "_get_realtime_session", return_value=None)
+        self._p(bc, "resume_face_tracking")
+        self._p(bc, "_speak_pending", return_value=False)
+        self._p(bc, "should_be_proactive", return_value=True)
+        proactive = self._p(bc, "_do_proactive_turn")
+        self._p(bc, "record_speech", side_effect=self._stuck_rec)
+        out, _ = self._quiet(bc._capture_utterance, None, {})
+        self.assertIsNone(out)
+        proactive.assert_called_once()
+
+    def test_the_realtime_path_holds_the_remark_too(self):
+        bc = self.bc
+        self._mic()
+        self._p(bc, "_get_realtime_session", return_value=object())
+        self._p(bc, "resume_face_tracking")
+        self._p(bc, "_speak_pending", return_value=False)
+        self._p(bc, "should_be_proactive", return_value=True)
+        proactive = self._p(bc, "_do_proactive_turn")
+
+        def rt(timeout=None):
+            with open(self.inject_path, "w", encoding="utf-8") as f:
+                json.dump([{"text": "typed meanwhile"}], f)
+            return None
+        self._p(bc, "_realtime_capture", side_effect=rt)
+        out, _ = self._quiet(bc._capture_utterance, None, {})
+        self.assertIsNone(out)
+        proactive.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

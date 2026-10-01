@@ -14385,6 +14385,22 @@ def _pending_work_signature() -> tuple:
         return ()
 
 
+def _inject_arrived_since(sig_top) -> bool:
+    """True when an injected / typed / web command has landed since
+    ``sig_top`` (a _pending_work_signature() taken at the top of the pass)
+    — its inbox's stamp changed (2026-10-01). Compared, never tested for
+    presence: an inbox already there at the top of the pass (one that cannot
+    be claimed) is not new work, so it can neither hot-loop the loop nor
+    hold off proactive remarks forever. Never raises (False on an error)."""
+    try:
+        if not sig_top:
+            return False
+        now = _pending_work_signature()
+        return bool(now) and now[0] is not None and now[0] != sig_top[0]
+    except Exception:
+        return False
+
+
 def _idle_work_baseline(sig_top: tuple) -> tuple | None:
     """The queued-work baseline for a main-loop idle listen (2026-10-01
     review): the signature taken at the top of the pass, BEFORE its reminder
@@ -16794,6 +16810,10 @@ def record_speech(timeout: float | None = None, *,
                 _next_work_check = time.monotonic() + _WORK_CHECK_S
                 if _pending_work_signature() != _work_sig0:
                     _capture_yield_reason[0] = "work"
+                    # No utterance of THIS capture is in progress (it yields
+                    # only before one starts); a flag an earlier capture left
+                    # set would keep the idle re-prime off (2026-10-01).
+                    _utterance_in_progress[0] = False
                     if _debug_mode[0]:
                         print("  [record_speech] work queued — yielding the "
                               "idle listen to the loop top")
@@ -36598,6 +36618,9 @@ def _capture_utterance(injected_text, memory):
                 if _speak_pending():
                     set_state("idle")
                     return None
+                if _inject_arrived_since(_work_sig_top):
+                    set_state("idle")
+                    return None
                 if should_be_proactive():
                     _do_proactive_turn(memory)
                 set_state("idle")
@@ -36639,6 +36662,13 @@ def _capture_utterance(injected_text, memory):
         if _yielded == "work":
             # The listen ended early for a queued command: the loop top takes
             # it now — no proactive remark in front of it.
+            set_state("idle")
+            return None
+        # A command that landed after the listen's last work check, or with
+        # its window timing out, is not a yield — but it is waiting all the
+        # same: no proactive remark (an LLM call) in front of it either
+        # (2026-10-01).
+        if _inject_arrived_since(_work_sig_top):
             set_state("idle")
             return None
         # No speech within timeout. Should we volunteer something?
