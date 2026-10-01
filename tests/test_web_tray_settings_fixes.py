@@ -69,7 +69,9 @@ class StandbyCommandTests(unittest.TestCase):
             src = f.read()
         body = src[src.index("def _handle_sleep_standby("):]
         body = body[:body.index("\ndef ", 10)]
-        self.assertIn("_standby_wake_carries_command(text)", body)
+        self.assertIn("_standby_wake_carries_command(text,", body)
+        # A typed inject carries a one-word command too ("Jarvis, pause").
+        self.assertIn("typed=injected_text is not None", body)
         self.assertIn("return (text, _wake_conf)", body)
 
     def test_the_banner_matches_what_standby_does(self):

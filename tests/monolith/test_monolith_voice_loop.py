@@ -514,6 +514,50 @@ class StandbyWakeCarryTests(_Base):
                 self.assertIsNone(out)
                 self.assertEqual(self.spoken, ["Yes, sir?"])
 
+    def test_a_typed_one_word_command_is_carried(self):
+        # 2026-10-01 merge audit: "Jarvis, pause" typed on the dashboard in
+        # standby only woke him ("Yes, sir?") and the command never ran.
+        bc = self.bc
+        for text in ("Jarvis, pause", "Jarvis, stop", "Jarvis, mute",
+                     "Jarvis, louder"):
+            with self.subTest(text=text):
+                bc._sleep_mode[0] = True
+                bc._standby_mode[0] = True
+                self.spoken.clear()
+                out, _ = self._quiet(bc._handle_sleep_standby, text)
+                self.assertIsNotNone(out, "the typed command was dropped")
+                self.assertEqual(out[0], text)
+                self.assertEqual(self.spoken, [])
+                self.assertFalse(bc._sleep_mode[0])
+
+    def test_a_typed_greeting_only_still_just_wakes(self):
+        bc = self.bc
+        for text in ("Jarvis", "Jarvis, hello", "Jarvis, wake up",
+                     "hey Jarvis, you there?"):
+            with self.subTest(text=text):
+                bc._sleep_mode[0] = True
+                bc._standby_mode[0] = True
+                self.spoken.clear()
+                out, _ = self._quiet(bc._handle_sleep_standby, text)
+                self.assertIsNone(out)
+                self.assertEqual(self.spoken, ["Yes, sir?"])
+
+    def test_a_spoken_one_word_tail_still_only_wakes(self):
+        # Spoken keeps the 2+ word rule: a one-word tail after a heard
+        # "Jarvis" is too often a Whisper fragment of the room.
+        bc = self.bc
+        self.assertIsNone(self._spoken_wake("Jarvis, pause."))
+        self.assertEqual(self.spoken, ["Yes, sir?"])
+        self.assertFalse(bc._standby_wake_carries_command("Jarvis, pause"))
+        self.assertTrue(bc._standby_wake_carries_command("Jarvis, pause",
+                                                         typed=True))
+        self.assertTrue(bc._standby_wake_carries_command(
+            "Jarvis, pause the music"))
+        self.assertFalse(bc._standby_wake_carries_command("Jarvis",
+                                                          typed=True))
+        self.assertFalse(bc._standby_wake_carries_command("Jarvis, hello",
+                                                          typed=True))
+
     def test_a_standby_wake_opens_the_followup_window(self):
         bc = self.bc
         from core.followup_window import FollowupWindow

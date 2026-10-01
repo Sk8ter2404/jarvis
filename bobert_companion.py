@@ -36590,18 +36590,25 @@ _STANDBY_GREETING_WORDS = frozenset({
 })
 
 
-def _standby_wake_carries_command(text: str) -> bool:
+def _standby_wake_carries_command(text: str, typed: bool = False) -> bool:
     """True when a standby wake utterance LEADS with the wake word and goes on
-    to say something (two or more words) that is not just a wake / greeting
-    ("Jarvis, turn off the lights" — not "Jarvis, wake up"). Only a leading
-    wake counts: that is what lets the carried turn pass the normal-mode
-    background gate (_text_has_wake_prefix). Never raises."""
+    to say something that is not just a wake / greeting ("Jarvis, turn off the
+    lights" — not "Jarvis, wake up"). Only a leading wake counts: that is what
+    lets the carried turn pass the normal-mode background gate
+    (_text_has_wake_prefix).
+
+    Spoken, the rest must be two or more words: a one-word tail after a
+    heard "Jarvis" is too often a Whisper fragment of the room. ``typed``
+    (an inject from the dashboard / tray, 2026-10-01) carries ONE word too -
+    typed text has no hallucination risk, and "Jarvis, pause" / "stop" /
+    "mute" / "louder" typed in standby used to only wake him, with the
+    command never run. A greeting-only rest still just wakes. Never raises."""
     try:
         if not _text_has_wake_prefix(text):
             return False
         rest = _fast_paths._WAKE_LEAD_RE.sub("", (text or "").strip())
         words = _yes_no.normalize(rest).split()
-        if len(words) < 2:
+        if len(words) < (1 if typed else 2):
             return False
         return any(w not in _STANDBY_GREETING_WORDS for w in words)
     except Exception:
@@ -36806,7 +36813,8 @@ def _handle_sleep_standby(injected_text: str | None):
         # refused too — a third try was needed. Hand the WHOLE wake-prefixed
         # utterance back as this pass's turn (the normal gates pass it on its
         # wake prefix); a bare wake / greeting still gets the greeting.
-        if _standby_wake_carries_command(text):
+        if _standby_wake_carries_command(text,
+                                         typed=injected_text is not None):
             print("  [wake] the wake carries a command — running it now")
             if injected_text is None:
                 _tt("begin_voice", _tt_rec_since)
