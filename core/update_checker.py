@@ -146,6 +146,40 @@ def fetch_latest_release(timeout: float = 6.0) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
+def fetch_newest_tag(timeout: float = 6.0) -> Optional[str]:
+    """The highest version TAG on the repo, or None on any failure. Never raises.
+
+    Releases ship as tags; the last GitHub *release object* was cut at v2.0.29
+    (2026-07-10), so `releases/latest` alone reported v2.0.29 as the newest
+    version long after v2.0.15x was live (seen 2026-10-01). The tags list is
+    the source of truth for "is there anything newer"."""
+    token = _token()
+    if not token:
+        return None
+    owner, repo = _owner_repo()
+    url = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"jarvis-update-checker/{LOCAL_VERSION}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        data = _http_get_json(url, headers, timeout)
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    best = None
+    for t in data:
+        name = t.get("name") if isinstance(t, dict) else None
+        if not isinstance(name, str) or parse_version(name) is None:
+            continue
+        if best is None or compare_versions(name, best) == 1:
+            best = name
+    return best
+
+
 def check_for_update(timeout: float = 6.0, current: Optional[str] = None) -> dict:
     """The single entry point. Compare the local build to the latest release.
 
@@ -170,8 +204,9 @@ def check_for_update(timeout: float = 6.0, current: Optional[str] = None) -> dic
             "no GitHub token set (JARVIS_GITHUB_TOKEN / GITHUB_TOKEN); "
             "update check skipped")
         return result
-    rel = fetch_latest_release(timeout=timeout)
-    if not rel:
+    rel = fetch_latest_release(timeout=timeout) or {}
+    newest_tag = fetch_newest_tag(timeout=timeout)
+    if not rel and not newest_tag:
         result["detail"] = "couldn't reach the GitHub releases API"
         return result
     tag = rel.get("tag_name") or rel.get("name") or ""
@@ -179,6 +214,14 @@ def check_for_update(timeout: float = 6.0, current: Optional[str] = None) -> dic
     result["release_url"] = rel.get("html_url")
     result["release_name"] = rel.get("name") or tag or None
     result["published_at"] = rel.get("published_at")
+    if newest_tag and (not tag or compare_versions(newest_tag, tag) == 1):
+        # A tag newer than the last release object (see fetch_newest_tag).
+        owner, repo = _owner_repo()
+        tag = newest_tag
+        result["latest"] = tag
+        result["release_url"] = f"https://github.com/{owner}/{repo}/releases/tag/{tag}"
+        result["release_name"] = tag
+        result["published_at"] = None
     cmp = compare_versions(cur, tag)
     if cmp is None:
         result["detail"] = f"couldn't compare versions ({cur!r} vs {tag!r})"

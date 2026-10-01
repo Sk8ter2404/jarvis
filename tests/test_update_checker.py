@@ -171,6 +171,12 @@ class HttpAndFetchTests(unittest.TestCase):
 
 
 class CheckForUpdateTests(unittest.TestCase):
+    def setUp(self):
+        # The tags lookup is its own call; these release-object tests see none.
+        p = mock.patch.object(uc, "fetch_newest_tag", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_no_token_skips(self):
         with _no_token():
             r = uc.check_for_update(current="1.1.0")
@@ -230,6 +236,52 @@ class CheckForUpdateTests(unittest.TestCase):
         with _no_token():
             r = uc.check_for_update()
         self.assertEqual(r["current"], uc.LOCAL_VERSION)
+
+
+class NewestTagTests(unittest.TestCase):
+    """Releases ship as tags; the last GitHub release OBJECT was v2.0.29, so
+    releases/latest alone called a long-stale version the newest (2026-10-01)."""
+
+    def _tok(self):
+        return mock.patch.dict(os.environ, {"JARVIS_GITHUB_TOKEN": "t"}, clear=False)
+
+    def test_newest_tag_is_the_highest_version(self):
+        tags = [{"name": "v2.0.9"}, {"name": "v2.0.156"}, {"name": "nightly"},
+                {"name": "v2.0.29"}, {"bogus": 1}, "junk"]
+        with self._tok(), mock.patch.object(uc, "_http_get_json", return_value=tags):
+            self.assertEqual(uc.fetch_newest_tag(), "v2.0.156")
+
+    def test_newest_tag_failures_are_none(self):
+        with _no_token():
+            self.assertIsNone(uc.fetch_newest_tag())
+        with self._tok(), mock.patch.object(uc, "_http_get_json", side_effect=OSError("down")):
+            self.assertIsNone(uc.fetch_newest_tag())
+        with self._tok(), mock.patch.object(uc, "_http_get_json", return_value={"x": 1}):
+            self.assertIsNone(uc.fetch_newest_tag())
+
+    def test_a_tag_newer_than_the_last_release_is_the_latest(self):
+        rel = {"tag_name": "v2.0.29", "html_url": "u", "name": "v2.0.29",
+               "published_at": "2026-07-10T04:27:51Z"}
+        with self._tok(),                 mock.patch.object(uc, "fetch_latest_release", return_value=rel),                 mock.patch.object(uc, "fetch_newest_tag", return_value="v2.0.160"):
+            r = uc.check_for_update(current="2.0.157")
+        self.assertTrue(r["checked"])
+        self.assertTrue(r["update_available"])
+        self.assertEqual(r["latest"], "v2.0.160")
+        self.assertTrue(r["release_url"].endswith("/releases/tag/v2.0.160"))
+        self.assertIsNone(r["published_at"])
+
+    def test_running_the_newest_tag_is_up_to_date(self):
+        rel = {"tag_name": "v2.0.29", "html_url": "u", "name": "v2.0.29"}
+        with self._tok(),                 mock.patch.object(uc, "fetch_latest_release", return_value=rel),                 mock.patch.object(uc, "fetch_newest_tag", return_value="v2.0.157"):
+            r = uc.check_for_update(current="2.0.157")
+        self.assertTrue(r["checked"])
+        self.assertFalse(r["update_available"])
+        self.assertEqual(r["latest"], "v2.0.157")
+
+    def test_tags_alone_are_enough(self):
+        with self._tok(),                 mock.patch.object(uc, "fetch_latest_release", return_value=None),                 mock.patch.object(uc, "fetch_newest_tag", return_value="v2.0.158"):
+            r = uc.check_for_update(current="2.0.157")
+        self.assertTrue(r["update_available"])
 
 
 class UpdateMessageTests(unittest.TestCase):
