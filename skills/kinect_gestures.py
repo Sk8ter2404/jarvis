@@ -212,10 +212,22 @@ def _do_raise_hand(bc) -> None:
     nearest tracked body for 0.8 s: a one-arm stretch, a hand on the head, a
     guest. It also drained the queue from a second thread while the main loop
     could be appending to or cancelling it. Now it only tells the owner the
-    action is waiting on his voice. No-op when nothing is queued."""
+    action is waiting on his voice. No-op when nothing is queued.
+
+    Silent while JARVIS is dormant, and a lapsed prompt is expired here
+    instead of nudged (B033 guards): the confirmation TTL is lazy, so a
+    prompt that timed out stays queued until the next utterance, and without
+    these two checks anyone raising a hand in view - overnight included -
+    got "needs a spoken yes" every 30 s for an action that no longer exists."""
     try:
         pending = getattr(bc, "_pending_confirmation", None)
         if not pending:
+            return
+        if _in_standby(bc):
+            print("  [gestures] RAISE_HAND ignored - JARVIS is dormant")
+            return
+        expire = getattr(bc, "_expire_pending_confirmation", None)
+        if callable(expire) and expire():
             return
         print("  [gestures] RAISE_HAND ignored - a pending confirmation needs "
               "a spoken yes")

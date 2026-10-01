@@ -241,12 +241,23 @@ class RaiseHandMappingTests(_Base):
         self.assertEqual(bc._executed, [])
         self.assertEqual(bc._pending_confirmation, [])
         self.assertEqual(bc._lapsed_calls, [True])
+        # The lapse notice replaces the nudge: no "needs a spoken yes" for an
+        # action that is no longer queued.
+        self.assertFalse(any("spoken yes" in s.lower() for s in bc._spoken),
+                         bc._spoken)
 
     def test_dormant_jarvis_ignores_a_raised_hand(self):
-        mod = self._load()
-        bc = _fake_bc(standby=True, pending=[("reset_memory", "")])
-        mod._do_raise_hand(bc)
-        self.assertEqual(bc._executed, [])
+        # Asleep / in standby a raised hand (anyone in view, overnight) must
+        # neither nudge nor touch the queue - not even to expire it.
+        for kw in ({"standby": True}, {"sleep": True}):
+            mod = self._load()
+            bc = _fake_bc(pending=[("reset_memory", "")], lapsed=True, **kw)
+            mod._do_raise_hand(bc)
+            self.assertEqual(bc._executed, [], kw)
+            self.assertEqual(bc._spoken, [], kw)
+            self.assertEqual(bc._lapsed_calls, [], kw)
+            self.assertEqual(bc._pending_confirmation, [("reset_memory", "")],
+                             kw)
 
 
 # ─── SWIPE → stop speech + clear pending ───────────────────────────────────
