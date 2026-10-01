@@ -882,6 +882,17 @@ class HandleNotificationTests(_IsolatedTriageBase):
 # _classify_with_llm — Haiku primary + Ollama fallback.
 # ─────────────────────────────────────────────────────────────────────────
 class ClassifyWithLLMTests(_IsolatedTriageBase):
+    def setUp(self):
+        super().setUp()
+        # The backend's cloud gate (core.cloud_gate, 2026-10-01) is pinned
+        # open: these tests drive the Haiku-primary / Ollama-fallback
+        # mechanics, and a real bobert_companion left in sys.modules by a
+        # monolith test would otherwise answer it from THIS box's settings.
+        # The gate itself is tested in tests/test_config_wiring_fixes.py.
+        gate = mock.patch.object(self.mod, "_cloud_allowed", return_value=True)
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def test_disabled_returns_none(self):
         with mock.patch.object(self.mod, "ENABLE_LLM_CLASSIFIER", False):
             self.assertIsNone(self.mod._classify_with_llm("App", "T", "B"))

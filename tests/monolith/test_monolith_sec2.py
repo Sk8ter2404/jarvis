@@ -2098,7 +2098,11 @@ class HudTrayStateTests(_MonolithSec2Base):
             json.dump(persisted, f)
         called = []
         amb = [False]
-        with mock.patch.object(self.bc, "_ambient_mode_active", amb), \
+        import core.config as _cfg
+        # Resume needs AMBIENT_LISTEN_ENABLED still on (2026-10-01: a stale
+        # hud "on" must not override a Settings "off").
+        with mock.patch.object(_cfg, "AMBIENT_LISTEN_ENABLED", True), \
+                mock.patch.object(self.bc, "_ambient_mode_active", amb), \
                 mock.patch.object(self.bc, "ACTIONS",
                                   {"ambient_listen_start":
                                    lambda _: called.append(1)}):
@@ -2323,7 +2327,9 @@ class RestoreTrayToggleErrorTests(_MonolithSec2Base):
         def _boom(_):
             raise RuntimeError("ambient start blew up")
 
-        with mock.patch.object(self.bc, "_ambient_mode_active", amb), \
+        import core.config as _cfg
+        with mock.patch.object(_cfg, "AMBIENT_LISTEN_ENABLED", True), \
+                mock.patch.object(self.bc, "_ambient_mode_active", amb), \
                 mock.patch.object(self.bc, "ACTIONS",
                                   {"ambient_listen_start": _boom}):
             self.assertIsNone(self.bc._restore_tray_toggle_state())

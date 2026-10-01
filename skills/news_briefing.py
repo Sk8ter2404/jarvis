@@ -273,6 +273,16 @@ _SUMMARY_SYSTEM = (
 )
 
 
+def _cloud_allowed() -> bool:
+    """core.cloud_gate's answer (2026-10-01): may this go to Claude? Unknown
+    = no, so the local model summarises."""
+    try:
+        from core.cloud_gate import chat_cloud_allowed
+        return chat_cloud_allowed()
+    except Exception:
+        return False
+
+
 def _summarize_via_llm(title: str, description: str) -> str:
     """Use the same Anthropic SDK call pattern the rest of JARVIS uses.
     Returns title verbatim on any error, so a flaky LLM never blocks news."""
@@ -294,9 +304,11 @@ def _summarize_via_llm(title: str, description: str) -> str:
         out = re.sub(r"^\s*\[\s*intent\s*:\s*[a-z_]+\s*\]\s*", "", out, flags=re.IGNORECASE)
         return out or title
 
-    # Primary path: Claude (keeps cost low). Only when the backend is Claude
-    # and the SDK imports.
-    if getattr(bc, "AI_BACKEND", "") == "claude":
+    # Primary path: Claude (keeps cost low). Only when the backend is Claude,
+    # the cloud gate allows it and the SDK imports. The gate (core.cloud_gate,
+    # 2026-10-01) adds the chat route: with the claude backend but chat routed
+    # local, headlines used to go to Claude anyway.
+    if getattr(bc, "AI_BACKEND", "") == "claude" and _cloud_allowed():
         try:
             import anthropic  # type: ignore
             model = getattr(bc, "CLAUDE_MODEL", "claude-sonnet-4-6")

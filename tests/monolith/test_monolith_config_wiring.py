@@ -61,15 +61,14 @@ class _Base(MonolithGlobalsTestCase):
 # ──────────────────────────────────────────────────────────────────────────
 
 class OrchestratorCloudGateTests(_Base):
+    """A local-only backend gets no sub-agent fan-out at all (repair pass):
+    the planner, workers and merger would only queue on the one local GPU,
+    so the normal local turn answers the briefing instead."""
+
     def _run(self, backend, route, key="sk-test-not-real"):
         bc = self.bc
-        captured = {}
         fake = types.ModuleType("core.orchestrator")
-
-        def _orchestrate(text, actions, **kw):
-            captured.update(kw)
-            return "Your brief, sir."
-        fake.orchestrate = _orchestrate
+        fake.orchestrate = mock.Mock(return_value="Your brief, sir.")
         self._p(bc, "_orchestrator_enabled", return_value=True)
         self._p(bc, "_is_orchestration_request", return_value=True)
         self._p(bc, "AI_BACKEND", backend)
@@ -80,23 +79,85 @@ class OrchestratorCloudGateTests(_Base):
         with mock.patch.dict(sys.modules, {"core.orchestrator": fake}), \
                 mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": key}):
             handled = self._quiet(bc._maybe_orchestrate, "morning briefing")
-        self.assertTrue(handled)
-        return captured
+        return handled, fake.orchestrate
 
-    def test_local_only_backend_keeps_every_stage_off_the_cloud(self):
+    def test_local_only_backend_never_fans_out(self):
         # The owner's settings: AI_BACKEND=ollama, chat routed local, a key
         # still in the environment.
-        self.assertIs(self._run("ollama", "local")["cloud_allowed"], False)
+        handled, orch = self._run("ollama", "local")
+        self.assertFalse(handled)          # falls through to the normal turn
+        orch.assert_not_called()
+
+    def test_claude_backend_with_chat_routed_local_never_fans_out(self):
+        handled, orch = self._run("claude", "local")
+        self.assertFalse(handled)
+        orch.assert_not_called()
+
+    def test_no_key_never_fans_out(self):
+        handled, orch = self._run("claude", "auto", key="")
+        self.assertFalse(handled)
+        orch.assert_not_called()
+
+    def test_claude_backend_still_fans_out_on_the_cloud(self):
+        handled, orch = self._run("claude", "auto")
+        self.assertTrue(handled)
+        self.assertIs(orch.call_args.kwargs["cloud_allowed"], True)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  B004 (repair) — email triage asks the REAL monolith's cloud gate
+# ──────────────────────────────────────────────────────────────────────────
+
+class EmailTriageCloudGateTests(_Base):
+    """The briefing's email worker (and the normal turn's email_briefing)
+    triages each unread mail with an LLM. It tried Claude Haiku whenever a
+    key was in the environment, so on the owner's settings every sender,
+    subject and body preview still went to the cloud."""
+
+    def setUp(self):
+        super().setUp()
+        from tests._skill_harness import load_skill_isolated
+        self.mod, self.actions = load_skill_isolated("email_triage")
+        d = tempfile.mkdtemp(prefix="cfg_wiring_mail_")
+        self.addCleanup(shutil.rmtree, d, True)
+        self.mod.PENDING_DRAFTS_FILE = os.path.join(d, "pending.json")
+        self.mod.INBOX_INDEX_FILE = os.path.join(d, "index.json")
+        self._p(self.mod, "list_unread", return_value=[
+            {"id": f"m{i}", "backend": "outlook", "from_name": f"Sender {i}",
+             "from_addr": f"s{i}@example.com", "subject": f"Subject {i}",
+             "snippet": "private body text"} for i in range(3)])
+        self.local = self._p(self.bc, "_call_local_llm", return_value="fyi")
+
+    def _brief(self, backend, route):
+        self._p(self.bc, "AI_BACKEND", backend)
+        self.cfg.MODEL_ROUTING["chat"] = route    # harness-owned dict
+        anth = types.ModuleType("anthropic")
+        client = mock.MagicMock()
+        client.messages.create.return_value = types.SimpleNamespace(
+            content=[types.SimpleNamespace(text="urgent")])
+        anth.Anthropic = mock.MagicMock(return_value=client)
+        self.assertIs(sys.modules.get("bobert_companion"), self.bc)
+        with mock.patch.dict(sys.modules, {"anthropic": anth}), \
+                mock.patch.dict(os.environ,
+                                {"ANTHROPIC_API_KEY": "sk-test-not-real"}):
+            out = self.actions["email_briefing"]("")
+        return out, anth
+
+    def test_owners_local_settings_send_no_mail_to_claude(self):
+        out, anth = self._brief("ollama", "local")
+        anth.Anthropic.assert_not_called()
+        self.assertEqual(self.local.call_count, 3)
+        self.assertIn("3 FYI", out)
 
     def test_claude_backend_with_chat_routed_local_stays_local(self):
-        self.assertIs(self._run("claude", "local")["cloud_allowed"], False)
+        out, anth = self._brief("claude", "local")
+        anth.Anthropic.assert_not_called()
+        self.assertEqual(self.local.call_count, 3)
 
-    def test_no_key_means_no_cloud(self):
-        self.assertIs(self._run("claude", "auto", key="")["cloud_allowed"],
-                      False)
-
-    def test_claude_backend_still_uses_the_cloud(self):
-        self.assertIs(self._run("claude", "auto")["cloud_allowed"], True)
+    def test_claude_backend_still_triages_on_claude(self):
+        out, anth = self._brief("claude", "auto")
+        self.assertEqual(anth.Anthropic.call_count, 3)
+        self.local.assert_not_called()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -280,6 +341,40 @@ class AmbientToggleTests(_Base):
         self.stop.assert_called_once_with("")
         with open(path, encoding="utf-8") as f:
             self.assertIs(json.load(f)["AMBIENT_LISTEN_ENABLED"], False)
+
+
+class AmbientRestoreTests(_Base):
+    """AMBIENT_LISTEN_ENABLED is the ambient source of truth (repair pass):
+    a hud_state "on" must not re-open the room mic at boot once the setting
+    is off — e.g. after a Settings / web save of the key to off."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        d = tempfile.mkdtemp(prefix="cfg_wiring_amb_")
+        self.addCleanup(shutil.rmtree, d, True)
+        self.hud = os.path.join(d, "hud_state.json")
+        with open(self.hud, "w", encoding="utf-8") as f:
+            json.dump({"ambient_mode_active": True}, f)
+        self._p(bc, "HUD_STATE_FILE", self.hud)
+        self._p(bc, "HUD_ENABLED", True)
+        self.start = mock.Mock(return_value="on")
+        self._p(bc, "ACTIONS", {"ambient_listen_start": self.start})
+        self.cell = self._p(bc, "_ambient_mode_active", [False])
+
+    def test_setting_off_wins_over_a_stale_hud_on(self):
+        self._p(self.cfg, "AMBIENT_LISTEN_ENABLED", False)
+        self._quiet(self.bc._restore_tray_toggle_state)
+        self.start.assert_not_called()               # the mic stays closed
+        self.assertIs(self.cell[0], False)
+        with open(self.hud, encoding="utf-8") as f:
+            self.assertIs(json.load(f)["ambient_mode_active"], False)
+
+    def test_resumes_while_the_setting_is_on(self):
+        self._p(self.cfg, "AMBIENT_LISTEN_ENABLED", True)
+        self._quiet(self.bc._restore_tray_toggle_state)
+        self.start.assert_called_once_with("")
+        self.assertIs(self.cell[0], True)
 
 
 # ──────────────────────────────────────────────────────────────────────────

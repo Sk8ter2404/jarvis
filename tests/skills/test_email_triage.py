@@ -216,6 +216,14 @@ class EmailTriageTestBase(unittest.TestCase):
         self.mod._gmail_service_cache[0] = None
         self.mod._gmail_unavailable_reason[0] = ""
         self.addCleanup(self._reset_gmail_singletons)
+        # These tests drive the Claude-primary / Ollama-fallback mechanics, so
+        # the backend's cloud gate (core.cloud_gate, 2026-10-01) is pinned
+        # open: a real bobert_companion left in sys.modules by an earlier
+        # monolith test would otherwise answer it from THIS box's settings.
+        # The gate itself is tested in tests/test_config_wiring_fixes.py.
+        gate = mock.patch.object(self.mod, "_cloud_allowed", return_value=True)
+        gate.start()
+        self.addCleanup(gate.stop)
 
     def _reset_gmail_singletons(self):
         self.mod._gmail_service_cache[0] = None

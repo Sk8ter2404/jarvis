@@ -3434,7 +3434,7 @@ def _act_shutdown_jarvis(_: str = "") -> str:
 
 # ─── LLM backend switching (Phase 4K) ──────────────────────────────────
 
-def _apply_chat_brain(bc, route: str, backend: str) -> None:
+def _apply_chat_brain(bc, route: str, backend: str | None) -> None:
     """Point BOTH chat-brain knobs at one brain, live (2026-10-01).
 
     _call_llm picks its branch from MODEL_ROUTING['chat'] FIRST
@@ -3446,11 +3446,15 @@ def _apply_chat_brain(bc, route: str, backend: str) -> None:
     set only the route, so "use Claude" landed on the ollama branch. Both call
     this now. The routing dicts are mutated IN PLACE (model_route reads
     core.config's; model_picker reads the monolith's star-imported alias),
-    never replaced. `bc` may be None (no monolith): only core.config moves."""
+    never replaced. `bc` may be None (no monolith): only core.config moves.
+    `backend` None moves the route only and leaves AI_BACKEND as it is —
+    set_brain('local'): route=local alone keeps chat local, and AI_BACKEND is
+    the GLOBAL cloud switch (vision, the orchestrator, create_skill...)."""
     targets = []
     if bc is not None:
         try:
-            bc.AI_BACKEND = backend
+            if backend is not None:
+                bc.AI_BACKEND = backend
             routing = getattr(bc, "MODEL_ROUTING", None)
             if isinstance(routing, dict):
                 targets.append(routing)
@@ -3469,6 +3473,10 @@ def _apply_chat_brain(bc, route: str, backend: str) -> None:
         routing["chat"] = route
 
 
+# switch_llm is runtime-only; its reply says so (2026-10-01, see below).
+_SWITCH_SESSION_NOTE = " for this session (a restart returns to the saved backend)"
+
+
 def _act_switch_llm(arg: str = "") -> str:
     """Switch AI_BACKEND between Claude and a local Ollama model.
     arg formats: 'claude' | 'anthropic' | '<ollama-model-tag>' (e.g.
@@ -3484,7 +3492,10 @@ def _act_switch_llm(arg: str = "") -> str:
     The chat ROUTE, though, IS read from core.config on every turn
     (model_route('chat')), so the switch moves MODEL_ROUTING['chat'] with
     the backend — see _apply_chat_brain (2026-10-01). Runtime-only: neither
-    knob is persisted, so a restart returns to the saved pair together.
+    knob is persisted, so a restart returns to the saved pair together — and
+    the reply says so (_SWITCH_SESSION_NOTE): the web Settings panel shows
+    the live route against the file as "pending restart", which reads as if
+    a restart would APPLY the switch when it undoes it.
     """
     bc = _bc()
     from core.config import CLAUDE_MODEL
@@ -3504,7 +3515,7 @@ def _act_switch_llm(arg: str = "") -> str:
     if tag in ("claude", "anthropic"):
         _apply_chat_brain(bc, "cloud", "claude")
         _publish_backend("anthropic")
-        return f"switched to claude ({CLAUDE_MODEL})"
+        return f"switched to claude ({CLAUDE_MODEL}){_SWITCH_SESSION_NOTE}"
     def _resolved_local() -> str:
         # What the local brain will ACTUALLY use next turn (the resolver cache),
         # not the vestigial OLLAMA_MODEL constant. 2026-07-14 bug-hunt.
@@ -3517,7 +3528,7 @@ def _act_switch_llm(arg: str = "") -> str:
         _apply_chat_brain(bc, "local", "ollama")
         model = _resolved_local()
         _publish_backend(model)
-        return f"switched to ollama (model: {model})"
+        return f"switched to ollama (model: {model}){_SWITCH_SESSION_NOTE}"
     # explicit model tag — verify it's one we recognise
     if tag in bc._KNOWN_OLLAMA_MODELS or any(tag.startswith(p) for p in
             ("llama", "qwen", "mistral", "mixtral", "phi", "gemma",
@@ -3562,7 +3573,7 @@ def _act_switch_llm(arg: str = "") -> str:
             except Exception:
                 pass
             _publish_backend(concrete)
-            return f"switched to ollama / {concrete}"
+            return f"switched to ollama / {concrete}{_SWITCH_SESSION_NOTE}"
         # Not installed yet — pull in the background, keep the current model.
         try:
             bc._ollama_pull_async(tag)

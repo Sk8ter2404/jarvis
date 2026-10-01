@@ -140,7 +140,11 @@ def run(*, input_fn=input, out=print, env_path: Optional[str] = None,
             if spec:
                 settings[k] = _ask_value(spec, settings.get(k), input_fn)
     try:
-        sw.save_settings(settings, settings_path)
+        # changed=: write only the essentials asked above; every other key
+        # stays as it is on disk, so a hand-set value the schema can't
+        # express (a newer Claude model id) survives the wizard (2026-10-01).
+        sw.save_settings(settings, settings_path,
+                         changed=() if defaults else _ESSENTIALS)
         out(f"\nSaved settings -> {settings_path}")
     except Exception as e:
         out(f"\nCould not save settings: {e}")

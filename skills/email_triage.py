@@ -823,11 +823,25 @@ def _apply_category(handle: dict, verdict: str) -> bool:
 
 # ─── Haiku triage classifier ─────────────────────────────────────────────
 
+def _cloud_allowed() -> bool:
+    """May mail content go to Claude? core.cloud_gate's answer (2026-10-01):
+    the chat path's rule, AI_BACKEND "claude" + a key + chat not routed local.
+    Both helpers below used to try Claude whenever ANTHROPIC_API_KEY was set,
+    so on a local-only install "morning briefing" (email_briefing, up to 15
+    unread) sent every sender, subject and 600-char body preview to Haiku on
+    that key. Unknown = no: the local model answers instead."""
+    try:
+        from core.cloud_gate import chat_cloud_allowed
+        return chat_cloud_allowed()
+    except Exception:
+        return False
+
+
 def _triage_message(msg: dict) -> str | None:
     """Return one of LLM_VERDICTS, or None if the LLM is unavailable."""
     if not ENABLE_LLM_TRIAGE:
         return None
-    _claude_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    _claude_ok = bool(os.environ.get("ANTHROPIC_API_KEY")) and _cloud_allowed()
     if _claude_ok:
         try:
             import anthropic  # type: ignore
@@ -903,7 +917,9 @@ def _generate_draft_reply(thread: dict, user_instructions: str = "") -> str | No
     """Ask Haiku to draft a concise reply for the given thread. Honours
     optional ``user_instructions`` ('keep it short', 'politely decline',
     'agree to Tuesday at 2pm')."""
-    _claude_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    # Same cloud gate as _triage_message (2026-10-01): the thread body goes
+    # to Claude only when the owner's backend allows the cloud.
+    _claude_ok = bool(os.environ.get("ANTHROPIC_API_KEY")) and _cloud_allowed()
     if _claude_ok:
         try:
             import anthropic  # type: ignore

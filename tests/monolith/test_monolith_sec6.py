@@ -2690,9 +2690,13 @@ class OrchestratorGateTests(SectionSixBase):
         spoke = []
         fake_orch = types.ModuleType("core.orchestrator")
         fake_orch.orchestrate = lambda *a, **k: "Here is your brief, sir."
+        # These tests pin _chat_cloud_allowed True: since 2026-10-01 a
+        # local-only backend never fans out (the normal turn answers).
         with mock.patch.object(bc, "_orchestrator_enabled",
                                return_value=True), \
              mock.patch.object(bc, "_is_orchestration_request",
+                               return_value=True), \
+             mock.patch.object(bc, "_chat_cloud_allowed",
                                return_value=True), \
              mock.patch.dict(sys.modules, {"core.orchestrator": fake_orch}), \
              mock.patch.object(bc, "set_state", lambda s: None), \
@@ -2712,6 +2716,8 @@ class OrchestratorGateTests(SectionSixBase):
                                return_value=True), \
              mock.patch.object(bc, "_is_orchestration_request",
                                return_value=True), \
+             mock.patch.object(bc, "_chat_cloud_allowed",
+                               return_value=True), \
              mock.patch.dict(sys.modules, {"core.orchestrator": fake_orch}), \
              mock.patch.object(bc, "set_state", lambda s: None), \
              mock.patch.object(bc, "_trim_conversation_history", lambda: None), \
@@ -2727,6 +2733,8 @@ class OrchestratorGateTests(SectionSixBase):
         with mock.patch.object(bc, "_orchestrator_enabled",
                                return_value=True), \
              mock.patch.object(bc, "_is_orchestration_request",
+                               return_value=True), \
+             mock.patch.object(bc, "_chat_cloud_allowed",
                                return_value=True), \
              mock.patch.dict(sys.modules, {"core.orchestrator": fake_orch}), \
              mock.patch.object(bc, "set_state", lambda s: None), \
@@ -2745,6 +2753,8 @@ class OrchestratorGateTests(SectionSixBase):
         with mock.patch.object(bc, "_orchestrator_enabled",
                                return_value=True), \
              mock.patch.object(bc, "_is_orchestration_request",
+                               return_value=True), \
+             mock.patch.object(bc, "_chat_cloud_allowed",
                                return_value=True), \
              mock.patch.dict(sys.modules, {"core.orchestrator": fake_orch}), \
              mock.patch.object(bc, "set_state", lambda s: None), \

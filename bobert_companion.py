@@ -4704,7 +4704,20 @@ def _restore_tray_toggle_state() -> None:
     if "mic_muted" in persisted:
         _mic_muted[0] = bool(persisted.get("mic_muted"))
     if "ambient_mode_active" in persisted:
-        _ambient_mode_active[0] = bool(persisted.get("ambient_mode_active"))
+        # AMBIENT_LISTEN_ENABLED is the ambient source of truth (2026-10-01):
+        # the voice / tray setter saves it and the boot autostart reads only
+        # it. A hud_state "on" from before the setter saved it — or one that a
+        # Settings / web save of the key to off has overruled since — must not
+        # turn the room mic back on below, so the cell is restored only while
+        # the setting is still on (privacy-safe: a stale "on" costs one
+        # "ambient mode on"; a stale resume would eavesdrop against "off").
+        try:
+            from core import config as _amb_cfg
+            _amb_setting_on = bool(_amb_cfg.AMBIENT_LISTEN_ENABLED)
+        except Exception:
+            _amb_setting_on = False
+        _ambient_mode_active[0] = (bool(persisted.get("ambient_mode_active"))
+                                   and _amb_setting_on)
     if "daemons_paused" in persisted:
         _daemons_paused[0] = bool(persisted.get("daemons_paused"))
     # Settings vs tray for the five cells core/state.py seeds from core.config
@@ -18316,6 +18329,22 @@ def _claude_reachable() -> bool:
         return False
 
 
+def _chat_cloud_allowed() -> bool:
+    """May data from THIS turn go to Claude at all? _claude_reachable() (backend
+    Claude + a key) AND MODEL_ROUTING['chat'] not 'local' — the chat path's own
+    rule, in one place for code that calls Claude OUTSIDE _call_llm: the
+    briefing orchestrator, and (through core.cloud_gate) the skills that build
+    their own anthropic client — email triage, news, notification triage, the
+    phone bridge. 2026-10-01: each of those had its own key-only check, so a
+    local-only install still sent inbox and notification text to the cloud.
+    Never raises; an error counts as "no"."""
+    try:
+        from core.config import model_route as _model_route
+        return bool(_claude_reachable()) and _model_route("chat") != "local"
+    except Exception:
+        return False
+
+
 def _claude_oneshot(system: str, messages: list, max_tokens: int = 500) -> str | None:
     """Single Claude completion used as the cloud fallback when the LOCAL model
     fails on a 'local'-routed turn. Returns the text, or None if the cloud is
@@ -26795,7 +26824,9 @@ def _act_wake_word_mode_set(on: bool) -> str:
         if not isinstance(cur, dict):
             cur = {}
         cur["REQUIRE_WAKE_MODE"] = bool(on)
-        sw.save_settings(cur)
+        # changed=: write this key only — the rest of the file stays as
+        # it is on disk (2026-10-01; see settings_window.save_settings).
+        sw.save_settings(cur, changed=("REQUIRE_WAKE_MODE",))
         persisted = True
     except Exception:
         persisted = False
@@ -33903,6 +33934,23 @@ def _maybe_orchestrate(text: str) -> bool:
     to the normal LLM turn — the orchestrator never blocks a normal request."""
     if not _orchestrator_enabled() or not _is_orchestration_request(text):
         return False
+    # Same cloud gate the chat path uses (2026-10-01). The orchestrator calls
+    # Claude first at every stage (planner, Haiku workers, merger) and only
+    # used Ollama after a Claude exception, so on an AI_BACKEND=ollama /
+    # MODEL_ROUTING chat=local install a "morning briefing" still sent inbox
+    # senders, news and system data to the cloud on whatever key was in the
+    # environment. Decided per call, so a mid-session backend switch counts.
+    # A local-only backend gets no fan-out at all: planner, workers and merger
+    # would queue one after another on the one local GPU (shared with Whisper),
+    # blocking the voice turn for up to the pipeline's 180 s ceiling, and
+    # parallel workers buy nothing there. The normal local turn answers the
+    # briefing instead (its morning_briefing action), as when the orchestrator
+    # is off.
+    _cloud_ok = _chat_cloud_allowed()
+    if not _cloud_ok:
+        print("  [orchestrator] local-only backend — no sub-agent fan-out; "
+              "the normal local turn answers")
+        return False
     try:
         from core.orchestrator import orchestrate as _orchestrate
     except Exception as _e:
@@ -33910,20 +33958,6 @@ def _maybe_orchestrate(text: str) -> bool:
         return False
     print("  [orchestrator] briefing request — fanning out to sub-agents…")
     set_state("thinking")
-    # Same cloud gate the chat path uses (2026-10-01). The orchestrator calls
-    # Claude first at every stage (planner, Haiku workers, merger) and only
-    # used Ollama after a Claude exception, so on an AI_BACKEND=ollama /
-    # MODEL_ROUTING chat=local install a "morning briefing" still sent inbox
-    # senders, news and system data to the cloud on whatever key was in the
-    # environment. Decided per call, so a mid-session backend switch counts.
-    try:
-        from core.config import model_route as _model_route
-        _cloud_ok = bool(_claude_reachable()) and _model_route("chat") != "local"
-    except Exception:
-        _cloud_ok = False
-    if not _cloud_ok:
-        print("  [orchestrator] local-only backend — sub-agents stay on the "
-              "local model")
     try:
         merged = _orchestrate(
             text, ACTIONS,

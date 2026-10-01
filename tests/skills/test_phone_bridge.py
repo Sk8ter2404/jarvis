@@ -718,6 +718,14 @@ class PushToPhoneFanoutTests(unittest.TestCase):
 class LlmFallbackTests(unittest.TestCase):
     def setUp(self):
         self.mod, _ = load_skill_isolated("phone_bridge")
+        # The backend's cloud gate (core.cloud_gate, 2026-10-01) is pinned
+        # open: these tests drive the Claude-primary / Ollama-fallback
+        # mechanics, and a real bobert_companion left in sys.modules by a
+        # monolith test would otherwise answer it from THIS box's settings.
+        # The gate itself is tested in tests/test_config_wiring_fixes.py.
+        gate = mock.patch.object(self.mod, "_cloud_allowed", return_value=True)
+        gate.start()
+        self.addCleanup(gate.stop)
 
     def _fake_anthropic(self, text="Indeed, sir.", raise_exc=None):
         mod = types.ModuleType("anthropic")

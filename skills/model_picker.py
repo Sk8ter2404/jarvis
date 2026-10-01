@@ -281,7 +281,10 @@ def _persist_setting(key: str, value) -> bool:
             current[key] = merged
         else:
             current[key] = value
-        sw.save_settings(current)
+        # changed=: write THIS key only; every other key stays as it is on
+        # disk, so a hand-set value the schema can't express survives
+        # (2026-10-01; see settings_window.save_settings).
+        sw.save_settings(current, changed=(key,))
         return True
     except Exception:
         return False
@@ -572,8 +575,10 @@ def set_model(arg: str) -> str:
 
 def set_brain(arg: str = "") -> str:
     """Switch the CHAT route: local | cloud | auto. Updates + persists
-    MODEL_ROUTING['chat'] and the matching AI_BACKEND (local -> ollama,
-    cloud/auto -> claude). Empty / 'status' arg reports the current route."""
+    MODEL_ROUTING['chat']; cloud/auto also set + persist AI_BACKEND=claude
+    (the chat path needs it). local leaves AI_BACKEND alone: the route alone
+    keeps chat local, and AI_BACKEND is the global cloud switch, so a mixed
+    install keeps its cloud vision. Empty / 'status' arg reports the route."""
     want = (arg or "").strip().lower()
 
     def _current_route() -> str:
@@ -614,7 +619,12 @@ def set_brain(arg: str = "") -> str:
     # failed `AI_BACKEND == "claude"` and landed on the ollama branch: "Chat
     # brain set to Claude, sir" while the local model kept answering. One
     # helper (core.actions._apply_chat_brain) moves both, for switch_llm too.
-    backend = "ollama" if route == "local" else "claude"
+    # "local" moves the route ONLY: AI_BACKEND is the global cloud switch
+    # (_claude_reachable gates vision, the orchestrator, create_skill... on
+    # it), so setting it to ollama here also turned cloud vision off on a
+    # mixed install and saved that for the next boot. route=local alone
+    # already keeps chat on the local branch.
+    backend = None if route == "local" else "claude"
     bc = _monolith()
     try:
         from core.actions import _apply_chat_brain
@@ -631,9 +641,10 @@ def set_brain(arg: str = "") -> str:
         pass
 
     # Persist the pair together: a reboot into route=cloud + AI_BACKEND=ollama
-    # (or the reverse) is the same split brain again.
+    # is the same split brain again. (route=local with either backend is not.)
     persisted = _persist_setting("MODEL_ROUTING", {"chat": route})
-    persisted = _persist_setting("AI_BACKEND", backend) and persisted
+    if backend is not None:
+        persisted = _persist_setting("AI_BACKEND", backend) and persisted
 
     human = {"local": "the local model, sir — $0 per turn",
              "cloud": "Claude, sir",

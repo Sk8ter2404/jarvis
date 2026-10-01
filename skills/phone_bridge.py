@@ -507,6 +507,18 @@ def push_to_phone(message: str,
 
 # ─── Inbound: stateless LLM fallback ────────────────────────────────────
 
+def _cloud_allowed() -> bool:
+    """core.cloud_gate's answer (2026-10-01): may a phone message go to
+    Claude? The fallback below used to try Claude whenever ANTHROPIC_API_KEY
+    was set, so on a local-only install (AI_BACKEND=ollama / chat routed
+    local) the owner's texts still went to the cloud. Unknown = no."""
+    try:
+        from core.cloud_gate import chat_cloud_allowed
+        return chat_cloud_allowed()
+    except Exception:
+        return False
+
+
 def _llm_fallback(text: str) -> str | None:
     """Stateless one-shot LLM call. Returns a reply string, or None when
     no LLM is configured / the call fails. Uses a fresh anthropic client
@@ -516,7 +528,7 @@ def _llm_fallback(text: str) -> str | None:
     Model is overridable via PHONE_BRIDGE_MODEL env var. Falls back to
     bobert_companion.CLAUDE_MODEL, then to _DEFAULT_LLM_MODEL so the
     user only rotates models in one place."""
-    _claude_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    _claude_ok = bool(os.environ.get("ANTHROPIC_API_KEY")) and _cloud_allowed()
     if _claude_ok:
         try:
             import anthropic  # type: ignore

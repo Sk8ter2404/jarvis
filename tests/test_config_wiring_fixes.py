@@ -105,6 +105,158 @@ class OrchestratorCloudGateTests(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  B004 (repair) — skills that build their own anthropic client follow the
+#  same cloud gate: email triage / drafts, news, notifications, phone bridge
+# ──────────────────────────────────────────────────────────────────────────
+
+def _fake_anthropic(text="urgent"):
+    """A stand-in anthropic module; Anthropic.call_count = clients built."""
+    mod = types.ModuleType("anthropic")
+    client = mock.MagicMock(name="anthropic.client")
+    client.messages.create.return_value = types.SimpleNamespace(
+        content=[types.SimpleNamespace(text=text)])
+    mod.Anthropic = mock.MagicMock(return_value=client)
+    return mod
+
+
+def _fake_monolith(cloud_ok, local="fyi"):
+    """A stand-in running monolith: its cloud gate answer + a local model."""
+    bc = types.ModuleType("bobert_companion")
+    bc._chat_cloud_allowed = lambda: cloud_ok
+    bc._call_local_llm = mock.MagicMock(return_value=local)
+    bc.AI_BACKEND = "claude"            # news' own (older) precondition
+    bc.CLAUDE_MODEL = "claude-test"
+    return bc
+
+
+_KEY = {"ANTHROPIC_API_KEY": "sk-test-not-real"}
+
+
+class CloudGateHelperTests(unittest.TestCase):
+    def test_no_monolith_does_not_veto(self):
+        import core.cloud_gate as cg
+        with mock.patch.dict(sys.modules, {"bobert_companion": None}):
+            sys.modules.pop("bobert_companion")
+            self.assertTrue(cg.chat_cloud_allowed())
+
+    def test_the_running_monolith_decides(self):
+        import core.cloud_gate as cg
+        for verdict in (True, False):
+            with mock.patch.dict(sys.modules,
+                                 {"bobert_companion": _fake_monolith(verdict)}):
+                self.assertIs(cg.chat_cloud_allowed(), verdict)
+
+    def test_a_raising_gate_means_no_cloud(self):
+        import core.cloud_gate as cg
+        bc = _fake_monolith(True)
+
+        def _boom():
+            raise RuntimeError("gate broke")
+        bc._chat_cloud_allowed = _boom
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            self.assertFalse(cg.chat_cloud_allowed())
+
+
+class EmailBriefingCloudGateTests(unittest.TestCase):
+    """"Morning briefing" -> email_briefing triages up to 15 unread mails.
+    _triage_message sent each sender, subject and 600-char preview to Claude
+    Haiku whenever a key was in the environment, ignoring AI_BACKEND and the
+    chat route — the owner's local-only box included."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("email_triage")
+        d = tempfile.mkdtemp(prefix="email_gate_")
+        self.addCleanup(shutil.rmtree, d, True)
+        self.mod.PENDING_DRAFTS_FILE = os.path.join(d, "pending.json")
+        self.mod.INBOX_INDEX_FILE = os.path.join(d, "index.json")
+        msgs = [{"id": f"m{i}", "backend": "outlook",
+                 "from_name": f"Sender {i}", "from_addr": f"s{i}@example.com",
+                 "subject": f"Subject {i}", "snippet": "private body text"}
+                for i in range(3)]
+        p = mock.patch.object(self.mod, "list_unread", return_value=msgs)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _brief(self, cloud_ok, local="fyi"):
+        bc = _fake_monolith(cloud_ok, local)
+        anth = _fake_anthropic("urgent")
+        with mock.patch.dict(os.environ, _KEY), \
+                mock.patch.dict(sys.modules, {"anthropic": anth,
+                                              "bobert_companion": bc}):
+            out = self.actions["email_briefing"]("")
+        return out, anth, bc
+
+    def test_local_backend_sends_no_mail_to_claude(self):
+        out, anth, bc = self._brief(cloud_ok=False)
+        anth.Anthropic.assert_not_called()               # nothing left the PC
+        self.assertEqual(bc._call_local_llm.call_count, 3)
+        self.assertIn("3 FYI", out)
+
+    def test_cloud_backend_still_triages_on_claude(self):
+        out, anth, bc = self._brief(cloud_ok=True)
+        self.assertEqual(anth.Anthropic.call_count, 3)
+        bc._call_local_llm.assert_not_called()
+        self.assertIn("urgent message from Sender 0", out)
+
+    def test_draft_reply_stays_local_on_a_local_backend(self):
+        bc = _fake_monolith(False, local="Sounds good. — B")
+        anth = _fake_anthropic("cloud draft")
+        thread = {"from_name": "Frank", "subject": "Plan",
+                  "body_text": "private thread"}
+        with mock.patch.dict(os.environ, _KEY), \
+                mock.patch.dict(sys.modules, {"anthropic": anth,
+                                              "bobert_companion": bc}):
+            out = self.mod._generate_draft_reply(thread)
+        anth.Anthropic.assert_not_called()
+        self.assertEqual(out, "Sounds good. — B")
+
+
+class OtherSkillsCloudGateTests(unittest.TestCase):
+    """The same key-only check was copied into the news summariser (which
+    looked at AI_BACKEND but not the chat route), the notification
+    classifier and the phone-bridge fallback."""
+
+    def _with(self, cloud_ok, local, fn):
+        bc = _fake_monolith(cloud_ok, local)
+        anth = _fake_anthropic("urgent")
+        with mock.patch.dict(os.environ, dict(_KEY,
+                                              PHONE_BRIDGE_MODEL="claude-test")), \
+                mock.patch.dict(sys.modules, {"anthropic": anth,
+                                              "bobert_companion": bc}):
+            out = fn()
+        return out, anth
+
+    def test_news_summary_stays_local_with_chat_routed_local(self):
+        mod, _ = load_skill_isolated("news_briefing")
+        # AI_BACKEND is "claude" on the stand-in: the old check passed.
+        out, anth = self._with(False, "Local summary.",
+                               lambda: mod._summarize_via_llm("Title", "d"))
+        anth.Anthropic.assert_not_called()
+        self.assertEqual(out, "Local summary.")
+
+    def test_notification_classifier_stays_local(self):
+        mod, _ = load_skill_isolated("notification_triage", register=False)
+        out, anth = self._with(False, "fyi",
+                               lambda: mod._classify_with_llm("App", "T", "B"))
+        anth.Anthropic.assert_not_called()
+        self.assertEqual(out, "fyi")
+
+    def test_phone_bridge_fallback_stays_local(self):
+        mod, _ = load_skill_isolated("phone_bridge")
+        out, anth = self._with(False, "Local reply, sir.",
+                               lambda: mod._llm_fallback("hello"))
+        anth.Anthropic.assert_not_called()
+        self.assertEqual(out, "Local reply, sir.")
+
+    def test_cloud_backend_still_uses_claude(self):
+        mod, _ = load_skill_isolated("notification_triage", register=False)
+        out, anth = self._with(True, "fyi",
+                               lambda: mod._classify_with_llm("App", "T", "B"))
+        anth.Anthropic.assert_called_once()
+        self.assertEqual(out, "urgent")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  B050 — browser agent: no sampling params, honest failure, no "400" = cap
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -377,15 +529,38 @@ class ChatBrainSwitchTests(_SettingsFileCase):
         self.assertEqual(doc["MODEL_ROUTING"]["chat"], "cloud")
         self.assertEqual(doc["MODEL_ROUTING"]["vision"], "local")
 
-    def test_set_brain_local_moves_ai_backend_to_ollama(self):
+    def test_set_brain_local_moves_only_the_chat_route(self):
+        # A mixed install: Claude backend, cloud vision. "Use the local brain"
+        # must put CHAT on the local model without flipping AI_BACKEND — the
+        # global cloud switch — which also turned off cloud vision, the
+        # orchestrator and create_skill, and was saved for the next boot.
         from skills import model_picker as M
+        self.write({"AI_BACKEND": "claude",
+                    "MODEL_ROUTING": {"chat": "cloud", "vision": "cloud",
+                                      "ambient": "auto"}})
+        cfg.MODEL_ROUTING.update({"chat": "cloud", "vision": "cloud"})
         fake = types.ModuleType("fake_monolith")
         fake.AI_BACKEND = "claude"
         fake.MODEL_ROUTING = cfg.MODEL_ROUTING
         with mock.patch.object(M, "_monolith", return_value=fake):
             M.set_brain("local")
-        self.assertEqual(fake.AI_BACKEND, "ollama")
-        self.assertEqual(self.read()["AI_BACKEND"], "ollama")
+        self.assertEqual(fake.AI_BACKEND, "claude")
+        self.assertEqual(cfg.model_route("chat"), "local")
+        self.assertEqual(cfg.model_route("vision"), "cloud")
+        doc = self.read()
+        self.assertEqual(doc["AI_BACKEND"], "claude")
+        self.assertEqual(doc["MODEL_ROUTING"]["chat"], "local")
+        self.assertEqual(doc["MODEL_ROUTING"]["vision"], "cloud")
+
+    def test_switch_llm_reply_says_it_lasts_this_session(self):
+        # switch_llm is runtime-only; the web panel then shows the route as
+        # "pending restart", which reads as if a restart would apply it.
+        cfg.MODEL_ROUTING.update({"chat": "local"})
+        bc = self._bc("ollama")
+        with mock.patch.object(A, "_bc", return_value=bc):
+            out = A._act_switch_llm("claude")
+        self.assertIn("for this session", out)
+        self.assertIn("restart returns to the saved backend", out)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -393,27 +568,55 @@ class ChatBrainSwitchTests(_SettingsFileCase):
 # ──────────────────────────────────────────────────────────────────────────
 
 class ToggleSaveKeepsHandSetValuesTests(_SettingsFileCase):
-    def test_hand_set_model_outside_the_choices_survives_a_toggle(self):
-        # A hand-edited value the enum's choices don't list (a newer model id
-        # than the schema knows) loads as the default...
-        self.write({"CLAUDE_MODEL": "claude-hypothetical-9",
-                    "REQUIRE_WAKE_MODE": True})
-        cur = sw.load_settings()
-        self.assertNotEqual(cur["CLAUDE_MODEL"], "claude-hypothetical-9")
-        # ...and the voice toggles' load -> change one key -> save pattern
-        # used to write that default back over it.
-        cur["REQUIRE_WAKE_MODE"] = False
-        sw.save_settings(cur)
-        doc = self.read()
-        self.assertEqual(doc["CLAUDE_MODEL"], "claude-hypothetical-9")
-        self.assertIs(doc["REQUIRE_WAKE_MODE"], False)
+    """A hand-edited value the enum's choices don't list (a newer model id
+    than the schema knows) loads as the default, and every voice toggle's
+    load -> change one key -> save wrote that default back over it. The
+    writers now name the key they changed (save_settings(changed=...)), so
+    only that key is written; guessing "unchanged" from equality (the first
+    fix) could not tell it from an explicit write of the default."""
 
-    def test_a_real_change_to_that_key_is_still_written(self):
-        self.write({"CLAUDE_MODEL": "claude-hypothetical-9"})
-        cur = sw.load_settings()
-        cur["CLAUDE_MODEL"] = "claude-haiku-4-5"
-        sw.save_settings(cur)
-        self.assertEqual(self.read()["CLAUDE_MODEL"], "claude-haiku-4-5")
+    HAND_SET = "claude-hypothetical-9"
+
+    def test_a_voice_toggle_leaves_a_hand_set_model_alone(self):
+        from skills import model_picker as M
+        self.write({"CLAUDE_MODEL": self.HAND_SET,
+                    "MODEL_ROUTING": {"chat": "auto", "vision": "local",
+                                      "ambient": "auto"}})
+        self.assertNotEqual(sw.load_settings()["CLAUDE_MODEL"], self.HAND_SET)
+        self.assertTrue(M._persist_setting("MODEL_ROUTING", {"chat": "local"}))
+        doc = self.read()
+        self.assertEqual(doc["CLAUDE_MODEL"], self.HAND_SET)
+        self.assertEqual(doc["MODEL_ROUTING"],
+                         {"chat": "local", "vision": "local", "ambient": "auto"})
+
+    def test_an_explicit_default_over_a_hand_typo_is_written(self):
+        # set_brain('cloud') writing AI_BACKEND='claude' over a hand-typed
+        # 'Claude' (which core.config would load verbatim, and which fails
+        # every `AI_BACKEND == "claude"` check) must land.
+        from skills import model_picker as M
+        self.write({"AI_BACKEND": "Claude"})
+        self.assertTrue(M._persist_setting("AI_BACKEND", "claude"))
+        self.assertEqual(self.read()["AI_BACKEND"], "claude")
+
+    def test_the_setup_wizard_leaves_a_hand_set_model_alone(self):
+        from tools import setup_wizard as suw
+        self.write({"CLAUDE_MODEL": self.HAND_SET})
+        answers = iter([""] * 20)                  # enter = keep, every row
+        with mock.patch.dict(os.environ, _KEY):
+            code = suw.run(input_fn=lambda _p="": next(answers),
+                           env_path=os.path.join(os.path.dirname(self.path),
+                                                 ".env"),
+                           settings_path=self.path, out=lambda *_: None)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read()["CLAUDE_MODEL"], self.HAND_SET)
+
+    def test_a_whole_document_save_still_heals_a_hand_typo(self):
+        # Without changed= (an explicit whole-document save) every key is
+        # coerced again, as before 2026-10-01: a value the runtime would
+        # mis-read is repaired, not preserved.
+        self.write({"AI_BACKEND": "Claude"})
+        sw.save_settings(sw.load_settings())
+        self.assertEqual(self.read()["AI_BACKEND"], "claude")
 
 
 # ──────────────────────────────────────────────────────────────────────────

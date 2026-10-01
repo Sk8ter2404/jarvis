@@ -108,11 +108,16 @@ def _persist(enabled: Optional[bool] = None, profile: Optional[str] = None) -> N
         current = sw.load_settings()
         if not isinstance(current, dict):
             current = {}
+        changed = []
         if enabled is not None:
             current["VOICE_CLONE_ENABLED"] = bool(enabled)
+            changed.append("VOICE_CLONE_ENABLED")
         if profile is not None:
             current["VOICE_CLONE_PROFILE"] = str(profile)
-        sw.save_settings(current)
+            changed.append("VOICE_CLONE_PROFILE")
+        # changed=: write only these keys; the rest of the file stays as
+        # it is on disk (2026-10-01; see settings_window.save_settings).
+        sw.save_settings(current, changed=changed)
     except Exception:
         # Swallow so a locked/absent file never breaks the action.
         pass

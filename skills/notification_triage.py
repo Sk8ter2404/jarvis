@@ -877,6 +877,18 @@ def _select_action(app: str, title: str, body: str) -> tuple[str, dict | None]:
 
 # ─── Haiku triage classifier ─────────────────────────────────────────────
 
+def _cloud_allowed() -> bool:
+    """core.cloud_gate's answer (2026-10-01): may toast text go to Claude?
+    The classifier used to try Haiku whenever ANTHROPIC_API_KEY was set, so a
+    local-only install (AI_BACKEND=ollama / chat routed local) still sent
+    every notification's app, title and body to the cloud. Unknown = no."""
+    try:
+        from core.cloud_gate import chat_cloud_allowed
+        return chat_cloud_allowed()
+    except Exception:
+        return False
+
+
 def _classify_with_llm(app: str, title: str, body: str) -> str | None:
     """Returns one of {urgent, fyi, newsletter, spam} or None on error.
     Side-effect free; safe to call from the listener thread."""
@@ -908,8 +920,8 @@ def _classify_with_llm(app: str, title: str, body: str) -> str | None:
         return verdict if verdict in LLM_VERDICTS_TO_ACTION else None
 
     # Primary path: Haiku/Claude (keeps cost low). Only attempted when an API
-    # key is present and the SDK imports.
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    # key is present, the cloud gate allows it and the SDK imports.
+    if os.environ.get("ANTHROPIC_API_KEY") and _cloud_allowed():
         try:
             import anthropic  # type: ignore
             client = anthropic.Anthropic()

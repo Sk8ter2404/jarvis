@@ -283,7 +283,10 @@ def _persist_setting(key: str, value) -> bool:
         if not isinstance(current, dict):
             current = {}
         current[key] = value
-        sw.save_settings(current)
+        # changed=: write THIS key only; every other key stays as it is on
+        # disk, so a hand-set value the schema can't express survives
+        # (2026-10-01; see settings_window.save_settings).
+        sw.save_settings(current, changed=(key,))
         return True
     except Exception:
         return False

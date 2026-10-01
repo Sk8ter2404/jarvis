@@ -434,6 +434,14 @@ class NewsSummarizeTests(unittest.TestCase):
     fallback + cleaning + degradation. No real network/LLM."""
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("news_briefing")
+        # The backend's cloud gate (core.cloud_gate, 2026-10-01) is pinned
+        # open: these tests pick the path with the stand-in's AI_BACKEND, and
+        # a real bobert_companion left in sys.modules by a monolith test would
+        # otherwise answer the gate from THIS box's settings. The gate itself
+        # is tested in tests/test_config_wiring_fixes.py.
+        gate = mock.patch.object(self.mod, "_cloud_allowed", return_value=True)
+        gate.start()
+        self.addCleanup(gate.stop)
 
     def _fake_anthropic(self, text=None, raises=False):
         anthropic = types.ModuleType("anthropic")

@@ -2051,7 +2051,8 @@ def _is_schema_default(spec: dict, value) -> bool:
     return values_equal(value, coerce_value(spec, spec.get("default")))
 
 
-def save_settings(values: dict, path: str | None = None) -> None:
+def save_settings(values: dict, path: str | None = None, *,
+                  changed=None) -> None:
     """Persist a WHOLE settings document (the load → change one key → save
     pattern the voice toggles use), atomically.
 
@@ -2064,29 +2065,35 @@ def save_settings(values: dict, path: str | None = None) -> None:
       value, is written as before.
     * Unknown keys in ``values`` pass through verbatim (LOCAL_VISION_MODEL
       used to rely on this; CAMERAS and calibration keys still do).
+    * ``changed`` (2026-10-01): the keys the caller actually set. Only those
+      are written (coerced, by the rules above); every other key stays
+      EXACTLY as it is on disk. Without it every key is re-coerced, and
+      load_settings coerces, so a hand-set value the schema can't express
+      (an enum value newer than its choices, e.g. a Claude model id) loaded
+      as the default and each voice toggle's load -> change one key -> save
+      wrote that default back over it, silently. Only the caller knows
+      "left as loaded" from "set to the default", so it must say: guessing
+      from equality (the first fix) also dropped an explicit write of the
+      default over a hand-typo and stopped healing malformed values.
 
     ``path`` defaults to ``settings_path()`` so a ``JARVIS_SETTINGS_PATH``
     redirect sends the write (and its temp file) to the throwaway file."""
     if path is None:
         path = settings_path()
     on_disk = read_settings_file(path)
-    out: dict = {}
-    for key, value in values.items():
+    if changed is not None:
+        changed = set(changed)
+        out: dict = dict(on_disk)
+        items = [(k, v) for k, v in values.items() if k in changed]
+    else:
+        out = {}
+        items = list(values.items())
+    for key, value in items:
         spec = SCHEMA.get(key)
         if spec is None or spec.get("type") not in _PERSISTED_TYPES:
             out[key] = value
             continue
         coerced = coerce_value(spec, value)
-        if key in on_disk and values_equal(coerced,
-                                           coerce_value(spec, on_disk[key])):
-            # The caller left this key as load_settings gave it: keep the
-            # file's OWN value (2026-10-01). load_settings coerces, so a
-            # hand-set value the schema can't express (an enum value newer
-            # than its choices, e.g. a Claude model id) loaded as the default
-            # and every voice toggle's load -> change one key -> save wrote
-            # that default back over it, silently.
-            out[key] = on_disk[key]
-            continue
         if key not in on_disk and _is_schema_default(spec, coerced):
             continue
         out[key] = coerced
