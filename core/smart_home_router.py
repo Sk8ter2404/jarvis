@@ -1057,19 +1057,85 @@ def _summarize_verdict(action: dict, results: list[dict]) -> str:
     return f"Done, sir — {len(ok)}/{n} device(s)."
 
 
+# Spoken label for a controller skill (catalog records without a room are
+# grouped by who controls them).
+_SKILL_LABELS = {
+    "sh_hue": "Hue", "sh_kasa": "Kasa", "sh_lifx": "LIFX", "sh_govee": "Govee",
+    "sh_ecobee": "Ecobee", "sh_nest": "Nest", "sh_ring": "Ring",
+    "sh_tuya": "Tuya",
+}
+# Names read out before "and N more".
+_CATALOG_SPOKEN_NAMES = 10
+
+CATALOG_EMPTY_LINE = (
+    "No smart-home devices are set up, sir — the catalog is empty. Say "
+    "'discover smart home devices' to scan for them.")
+
+
+def _join_names(names: list[str]) -> str:
+    if len(names) <= 1:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def catalog_summary(catalog) -> str:
+    """The spoken read-out of the REAL device catalog — ONE copy for
+    list_smart_home_devices / smart_home_catalog (skills/smart_home_discover)
+    and smart_home_devices / smart_home_list (here).
+
+    2026-10-01 (09-05 live diagnostic): both read-outs spoke the stale Alexa
+    view — the header's ``device_count`` (left over from whichever build
+    wrote it) and an Alexa-only room grouping that filed every LAN plug under
+    "(unassigned)" — and an empty catalog came out as "0 smart-home devices,
+    sir: ." (live staging log). The count and the names now come from the
+    ``devices`` list itself; a device with no room is grouped by the skill
+    that controls it ("Kasa: Desk Lamp and Office Fan"); a missing, unreadable
+    or empty catalog is said plainly (CATALOG_EMPTY_LINE). Marker-free on
+    purpose: list_smart_home_devices is voiced verbatim, and a FAILURE_MARKER
+    would drop the line. Never raises."""
+    try:
+        raw = (catalog or {}).get("devices") if isinstance(catalog, dict) else None
+        devices = [d for d in raw if isinstance(d, dict)] \
+            if isinstance(raw, list) else []
+    except Exception:
+        devices = []
+    if not devices:
+        return CATALOG_EMPTY_LINE
+    groups: dict[str, list[str]] = {}
+    for d in devices:
+        try:
+            room = str(d.get("alexa_room") or d.get("room") or "").strip()
+            if room:
+                label = room
+            else:
+                skill = (d.get("controller_skill")
+                         or _controller_for(str(d.get("brand") or "")) or "")
+                label = (_SKILL_LABELS.get(skill)
+                         or str(d.get("brand") or "").strip() or "Other")
+            name = str(d.get("name") or "").strip() or "an unnamed device"
+        except Exception:
+            label, name = "Other", "an unnamed device"
+        groups.setdefault(label, []).append(name)
+    n = len(devices)
+    parts: list[str] = []
+    budget = _CATALOG_SPOKEN_NAMES
+    for label, names in groups.items():
+        if budget <= 0:
+            break
+        take = names[:budget]
+        budget -= len(take)
+        parts.append(f"{label}: {_join_names(take)}")
+    omitted = n - (_CATALOG_SPOKEN_NAMES - max(budget, 0))
+    text = (f"{n} smart-home device{'s' if n != 1 else ''}, sir — "
+            + "; ".join(parts))
+    if omitted > 0:
+        text += f", and {omitted} more"
+    return text + "."
+
+
 def smart_home_devices(_: str = "") -> str:
-    """Speakable summary of the cached catalog grouped by room."""
-    catalog = _ensure_catalog()
-    if catalog is None:
-        return "No smart-home catalog yet, sir — run 'discover smart home devices'."
-    rooms: dict[str, list[str]] = {}
-    for d in catalog.get("devices", []) or []:
-        room = d.get("alexa_room") or "(unassigned)"
-        rooms.setdefault(room, []).append(d.get("name") or "(unnamed)")
-    if not rooms:
-        return "The catalog is empty, sir."
-    parts = [f"{len(names)} in {room}" for room, names in sorted(rooms.items())]
-    return f"{catalog.get('device_count', 0)} devices, sir: " + ", ".join(parts) + "."
+    """Speakable summary of the device catalog (see catalog_summary)."""
+    return catalog_summary(_ensure_catalog())
 
 
 def smart_home_router_status(_: str = "") -> str:

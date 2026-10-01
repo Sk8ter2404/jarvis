@@ -1716,19 +1716,23 @@ def _run_wizard_interactive(arg: str = "") -> str:
 
 
 def smart_home_catalog(_: str = "") -> str:
-    """Speak a short summary of the cached catalog."""
+    """Read out the device catalog — list_smart_home_devices / smart_home_catalog.
+
+    2026-10-01: this read the stale Alexa view (the header's device_count,
+    rooms from Alexa only, so every LAN plug was "(unassigned)") and said
+    "0 smart-home devices, sir: ." for an empty catalog. The read-out is now
+    core.smart_home_router.catalog_summary — the same one smart_home_devices
+    speaks — over this skill's own fresh read of the catalog file."""
     cat = _load_catalog()
-    if not cat:
-        return ("No smart-home catalog yet, sir. "
-                "Say 'discover smart home devices' to run the wizard.")
-    n = cat.get("device_count", 0)
-    rooms: dict[str, int] = {}
-    for d in cat.get("devices", []):
-        r = d.get("alexa_room") or "(unassigned)"
-        rooms[r] = rooms.get(r, 0) + 1
-    top = sorted(rooms.items(), key=lambda x: -x[1])[:5]
-    parts = [f"{count} in {room}" for room, count in top]
-    return f"{n} smart-home devices, sir: " + ", ".join(parts) + "."
+    try:
+        from core.smart_home_router import catalog_summary
+    except Exception:   # pragma: no cover - core is in-tree
+        devices = (cat or {}).get("devices") if isinstance(cat, dict) else None
+        if not devices:
+            return ("No smart-home devices are set up, sir — the catalog is "
+                    "empty. Say 'discover smart home devices' to scan for them.")
+        return f"{len(devices)} smart-home devices are in the catalog, sir."
+    return catalog_summary(cat)
 
 
 def smart_home_purge_cookie(_: str = "") -> str:

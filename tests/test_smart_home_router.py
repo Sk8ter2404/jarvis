@@ -1271,8 +1271,9 @@ class FallbackToLiveLanTests(_RouterTestBase):
 # ════════════════════════════════════════════════════════════════════════════
 class SpeakableActionTests(_RouterTestBase):
     def test_devices_no_catalog(self):
-        # No file on disk → _ensure_catalog returns None.
-        self.assertIn("No smart-home catalog",
+        # No file on disk → _ensure_catalog returns None. Said plainly
+        # (2026-10-01, catalog_summary).
+        self.assertIn("No smart-home devices are set up",
                       router.smart_home_devices(""))
 
     def test_devices_empty_catalog(self):
@@ -1282,16 +1283,23 @@ class SpeakableActionTests(_RouterTestBase):
     def test_devices_grouped_by_room(self):
         self._write_catalog(_catalog())
         out = router.smart_home_devices("")
-        self.assertIn("4 devices", out)
-        self.assertIn("2 in Kitchen", out)
-        self.assertIn("1 in Office", out)
+        self.assertIn("4 smart-home devices", out)
+        self.assertIn("Kitchen: Kitchen Ceiling and Kitchen Counter", out)
+        self.assertIn("Office: Office Lamp", out)
 
-    def test_devices_unassigned_room_bucket(self):
+    def test_devices_without_a_room_are_grouped_by_controller(self):
+        # 2026-10-01: no "(unassigned)" Alexa bucket — a roomless device is
+        # filed under the skill that controls it (or "Other").
         self._write_catalog({
             "device_count": 1,
-            "devices": [{"name": "Floating Bulb", "type": "light"}],  # no room
+            "devices": [{"name": "Floating Bulb", "type": "light"},  # no room
+                        {"name": "Desk Plug", "brand": "TP-Link"}],
         })
-        self.assertIn("(unassigned)", router.smart_home_devices(""))
+        out = router.smart_home_devices("")
+        self.assertNotIn("unassigned", out)
+        self.assertIn("Other: Floating Bulb", out)
+        self.assertIn("Kasa: Desk Plug", out)
+        self.assertIn("2 smart-home devices", out)
 
     def test_status_not_loaded(self):
         self.assertIn("Catalog not loaded", router.smart_home_router_status(""))
@@ -1643,7 +1651,8 @@ class LanCatalogConsumabilityTests(_RouterTestBase):
         # writing device_count 0.
         self._write_catalog(self._lan_only_catalog())
         out = router.smart_home_devices("")
-        self.assertIn("5 devices", out)
+        self.assertIn("5 smart-home devices", out)
+        self.assertIn("Kasa:", out)
 
 
 class QueryReplyNoFailureMarkerTests(unittest.TestCase):

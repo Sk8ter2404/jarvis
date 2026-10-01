@@ -80,7 +80,7 @@ class DiscoverDegradationTests(unittest.TestCase):
     def test_catalog_action_when_no_catalog(self):
         with mock.patch.object(self.mod, "_load_catalog", return_value=None):
             out = self.actions["smart_home_catalog"]("")
-        self.assertIn("No smart-home catalog", out)
+        self.assertIn("No smart-home devices are set up", out)
 
 
 class DiscoverBrandMappingTests(unittest.TestCase):
@@ -240,8 +240,8 @@ class DiscoverCatalogActionTests(unittest.TestCase):
         with mock.patch.object(self.mod, "_load_catalog", return_value=cat):
             out = self.actions["smart_home_catalog"]("")
         self.assertIn("3 smart-home devices", out)
-        self.assertIn("2 in Kitchen", out)
-        self.assertIn("1 in Hall", out)
+        self.assertIn("Kitchen: L1 and L2", out)
+        self.assertIn("Hall: T1", out)
 
     def test_purge_cookie_reports_removed_count(self):
         # Pretend both cookie files exist and unlink succeeds.
@@ -2706,6 +2706,94 @@ class PlaywrightBrowserCloseAndUrlBranchTests(unittest.TestCase):
         self.assertIsNotNone(result)
         _jar, raw = result
         self.assertEqual(raw, cookies)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2026-10-01 (09-05 live diagnostic): list_smart_home_devices read the stale
+# Alexa view of the catalog — the header's device_count and an Alexa-only
+# room grouping — instead of the devices the catalog actually holds, and an
+# empty catalog came out as "0 smart-home devices, sir: ." (the live staging
+# log). It must name the real catalog and say plainly when it is empty.
+# ════════════════════════════════════════════════════════════════════════════
+class CatalogListIsTheRealCatalogTests(unittest.TestCase):
+    LAN_ONLY = {
+        "version": 2, "device_count": 9,          # stale header
+        "devices": [
+            {"name": "Desk Lamp", "brand": "TP-Link", "source": "lan:sh_kasa",
+             "alexa_room": "", "controller_skill": "sh_kasa"},
+            {"name": "Office Fan", "brand": "TP-Link", "source": "lan:sh_kasa",
+             "alexa_room": "", "controller_skill": "sh_kasa"},
+        ],
+    }
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("smart_home_discover")
+
+    def _list(self, catalog):
+        with mock.patch.object(self.mod, "_load_catalog", return_value=catalog):
+            return self.actions["list_smart_home_devices"]("")
+
+    def test_an_empty_catalog_is_said_plainly(self):
+        for cat in ({"device_count": 0, "devices": []},
+                    {"version": 1, "device_count": 0, "arp_seen": 35,
+                     "devices": []},
+                    None, {"devices": "garbage"}):
+            with self.subTest(cat=cat):
+                out = self._list(cat)
+                self.assertIn("No smart-home devices are set up", out)
+                self.assertNotIn(": .", out)
+                self.assertNotIn("0 smart-home devices", out)
+
+    def test_the_count_and_names_come_from_the_devices_themselves(self):
+        out = self._list(self.LAN_ONLY)
+        self.assertIn("2 smart-home devices", out)
+        self.assertNotIn("9", out)
+        self.assertIn("Desk Lamp", out)
+        self.assertIn("Office Fan", out)
+
+    def test_lan_devices_are_not_an_unassigned_alexa_room(self):
+        out = self._list(self.LAN_ONLY)
+        self.assertNotIn("unassigned", out)
+        self.assertIn("Kasa", out)
+
+    def test_rooms_are_kept_when_the_catalog_has_them(self):
+        out = self._list({"devices": [
+            {"name": "L1", "alexa_room": "Kitchen"},
+            {"name": "L2", "alexa_room": "Kitchen"},
+            {"name": "T1", "alexa_room": "Hall"}]})
+        self.assertIn("3 smart-home devices", out)
+        self.assertRegex(out, r"Kitchen: L1 and L2")
+        self.assertRegex(out, r"Hall: T1")
+
+    def test_one_device_is_singular(self):
+        out = self._list({"devices": [{"name": "Desk Lamp", "brand": "Kasa"}]})
+        self.assertIn("1 smart-home device,", out)
+
+    def test_a_long_list_is_capped(self):
+        devs = [{"name": f"Plug {i}", "brand": "Kasa"} for i in range(1, 16)]
+        out = self._list({"devices": devs})
+        self.assertIn("15 smart-home devices", out)
+        self.assertIn("and 5 more", out)
+        self.assertNotIn("Plug 15", out)
+
+    def test_the_reply_is_voiced_verbatim(self):
+        # A FAILURE_MARKER would drop the line off the verbatim speak path.
+        from core.failure_markers import FAILURE_MARKERS
+        for cat in (None, {"devices": []}, self.LAN_ONLY):
+            with self.subTest(cat=cat):
+                low = self._list(cat).lower()
+                self.assertFalse([m for m in FAILURE_MARKERS if m in low])
+
+    def test_the_router_list_says_the_same(self):
+        # Stale-duplicate guard: core.smart_home_router.smart_home_devices
+        # (smart_home_devices / smart_home_list) is the same read-out.
+        from core import smart_home_router as router
+        for cat in (None, {"devices": []}, self.LAN_ONLY):
+            with self.subTest(cat=cat):
+                with mock.patch.object(router, "_ensure_catalog",
+                                       return_value=cat):
+                    self.assertEqual(router.smart_home_devices(""),
+                                     self._list(cat))
 
 
 if __name__ == "__main__":
