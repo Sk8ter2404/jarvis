@@ -35172,8 +35172,6 @@ def _requeue_pending_speech(items: list) -> bool:
 # 'Y', but there's no such action registered"), which must not speak while
 # he sleeps - it waits for the wake like any other notice.
 _STANDBY_SPEAKABLE_SOURCES = frozenset({"timer", "schedule", "promise"})
-# The proactive-scheduling batch's names for the same set (one rule, two names).
-_OWNER_REQUESTED_SOURCES = tuple(sorted(_STANDBY_SPEAKABLE_SOURCES))
 
 
 def _pending_source_in(item, sources) -> bool:
@@ -35203,12 +35201,6 @@ def _pending_has_source(sources) -> bool:
         return False
     except Exception:
         return True
-
-
-def _is_owner_requested_entry(item) -> bool:
-    """True for a pending-speech entry the owner asked for (a timer, a
-    scheduled job, a promise): _pending_source_in on the standby set."""
-    return _pending_source_in(item, _STANDBY_SPEAKABLE_SOURCES)
 
 
 def _note_spoken_question(msg: str) -> None:
@@ -35241,15 +35233,13 @@ def _note_spoken_question(msg: str) -> None:
         print(f"  [pending] could not record the spoken question: {_e}")
 
 
-def _speak_pending(only_sources=None, only_owner_requested: bool = False):
+def _speak_pending(only_sources=None):
     """If skills (like the timer) have queued reminders, speak them now.
 
     ``only_sources`` (2026-10-01): speak only entries whose queued ``source``
     (its part before any ":") is in this set and HOLD the rest, in order, for
     a later full drain. Standby passes _STANDBY_SPEAKABLE_SOURCES so a timer
     the owner set plays while JARVIS sleeps; None = speak everything.
-    ``only_owner_requested=True`` is the same as passing
-    _STANDBY_SPEAKABLE_SOURCES.
 
     Race-safe consume-and-rename pattern: we rename the queue file to a
     sibling `.consuming` BEFORE iterating, so any skill that writes a new
@@ -35269,8 +35259,6 @@ def _speak_pending(only_sources=None, only_owner_requested: bool = False):
     # anyway. Never raises.
     # Post-dialogue speech hold (handle.hold_after): leave the queue on disk
     # untouched; it is spoken once the hold passes.
-    if only_owner_requested and only_sources is None:
-        only_sources = _STANDBY_SPEAKABLE_SOURCES
     if _speech_hold_active():
         return False
     if only_sources is None:
