@@ -463,8 +463,8 @@ class RememberedAcrossRestartsTests(unittest.TestCase):
     live-logs B056, whose doo_state_path is the ONE persistence (see
     RestartTests): a restart inside the hold reopens nothing, after it ONE
     drop re-arms the retry. Each "process" is a fresh gate on the same file;
-    the owner's lift forgets the saved run (B083's lift keeps it one death
-    short in memory)."""
+    the owner's lift keeps the run one death short (B083) - in memory and,
+    since the 2026-10-01 merge audit, in the file too."""
 
     def setUp(self):
         import shutil
@@ -495,16 +495,55 @@ class RememberedAcrossRestartsTests(unittest.TestCase):
         self.assertTrue(_slow(g2, KINECT))
         self.assertEqual(spoken2, [], "the same warning again")
 
-    def test_a_lift_forgets_it_and_one_more_death_re_arms_it(self):
+    def test_a_lift_saves_it_one_death_short_and_one_more_death_re_arms_it(self):
+        # The lift drops the hold and the slow retry, but the run is SAVED one
+        # death short (retry 0, no hold) - it used to be forgotten in the file
+        # (2026-10-01 merge audit, see the restart test below).
         g, b, _l, _s = self._process()
         for _ in range(COUNT):
             b.dies_on_open()
         self.assertIn(KINECT, self._saved())
         self.assertTrue(g.lift_quarantine(KINECT))
-        self.assertNotIn(KINECT, self._saved())
+        saved = self._saved()[KINECT]
+        self.assertEqual((saved["count"], saved["retry_s"], saved["until"]),
+                         (COUNT - 1, 0.0, 0.0))
         self.assertTrue(b.dies_on_open())
         self.assertTrue(_slow(g, KINECT))
-        self.assertIn(KINECT, self._saved())
+        self.assertGreater(self._saved()[KINECT]["retry_s"], 0.0)
+
+    def test_a_restart_right_after_the_lift_stays_one_death_short(self):
+        # 2026-10-01 merge audit: only ARMED runs were saved, so a restart
+        # right after "use the Kinect again" forgot the run - a still-broken
+        # Kinect then cost three more USB drops and the spoken warning again.
+        g, b, _l, spoken = self._process()
+        for _ in range(COUNT):
+            b.dies_on_open()
+        self.assertEqual(spoken, [_SAID])
+        self.assertTrue(g.lift_quarantine(KINECT))
+        g2, b2, logs2, spoken2 = self._process()      # a restart
+        self.assertFalse(_slow(g2, KINECT))
+        self.assertTrue(g2.begin(KINECT, BRIDGE).allowed,
+                        "the lift's 'it may be opened now' did not survive")
+        self.assertTrue(any("restored from the last run" in ln
+                            and "1 more" in ln for ln in logs2), logs2)
+        self.assertTrue(b2.dies_on_open())
+        self.assertEqual(len(b2.opens), 1, "the restart relearned the run")
+        self.assertTrue(_slow(g2, KINECT),
+                        "one death after the lift + restart did not re-arm it")
+        self.assertEqual(_dev(g2, KINECT)["slow_retry_s"], RETRY,
+                         "back to the BASE retry, as the lift reply says")
+        self.assertEqual(spoken2, [], "the same warning again")
+
+    def test_a_partial_run_survives_a_restart_and_a_stream_clears_it(self):
+        g, b, _l, _s = self._process()
+        self.assertTrue(b.dies_on_open())             # 1 of COUNT
+        self.assertEqual(self._saved()[KINECT]["count"], 1)
+        g2, b2, _l2, _s2 = self._process()            # a restart
+        self.assertEqual(_dev(g2, KINECT)["dies_on_open"], 1)
+        self.assertFalse(_slow(g2, KINECT))
+        self.assertTrue(b2.open_when_allowed())
+        b2.stream(60.0)                               # streams normally
+        self.assertNotIn(KINECT, self._saved(), "a cleared run stayed saved")
 
 
 class KnobTests(unittest.TestCase):

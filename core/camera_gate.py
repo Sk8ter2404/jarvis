@@ -142,8 +142,10 @@ USB re-enumeration and an audio device-list change for nothing.
 
   survives a restart (2026-10-01)  with ``doo_state_path`` (the monolith
              passes data/camera_gate_doo.json) the run - count, slow retry,
-             hold deadline, when it was said - is saved whenever it is armed,
-             cleared or lifted, and restored at construction. Before this,
+             hold deadline, when it was said - is saved whenever it counts a
+             death, is armed, cleared or lifted, and restored at construction
+             (a run still counting - retry 0, no hold - included, so the
+             one-death-short run after a lift survives a restart too). Before this,
              every deploy / tray restart (14 on 2026-09-30) reopened the
              Kinect three more times - three USB re-enumerations and an audio
              device-list change - and SPOKE the warning again. Now a restart
@@ -680,9 +682,14 @@ class CameraGate:
         return self.dies_on_open_retry_s > 0.0 and self.dies_on_open_window_s > 0.0
 
     def _doo_save(self) -> None:
-        """Write the armed dies-on-open runs to doo_state_path if they changed
-        (2026-10-01). The snapshot is taken under the gate lock, the file is
-        written outside it (atomic: temp file + os.replace). NEVER raises."""
+        """Write the dies-on-open runs to doo_state_path if they changed
+        (2026-10-01): the armed ones (slow retry + hold) AND the ones still
+        counting (retry 0, no hold) - a partial run, or the one-death-short
+        run the owner's lift leaves. Saving only the armed runs meant a
+        restart right after "use the Kinect again" forgot the run, so a
+        still-broken Kinect cost three more USB drops and the spoken warning
+        again. The snapshot is taken under the gate lock, the file is written
+        outside it (atomic: temp file + os.replace). NEVER raises."""
         if not self._doo_dirty or not self._doo_state_path:
             return
         try:
@@ -694,9 +701,11 @@ class CameraGate:
                     devices = {
                         k: {"count": r["doo_count"],
                             "retry_s": r["doo_retry_s"],
-                            "until": r["doo_until"],
+                            "until": (r["doo_until"]
+                                      if r["doo_retry_s"] > 0.0 else 0.0),
                             "said_at": self._doo_said_at.get(k, 0.0)}
-                        for k, r in self._dev.items() if r["doo_retry_s"] > 0.0}
+                        for k, r in self._dev.items()
+                        if r["doo_retry_s"] > 0.0 or r["doo_count"] > 0}
                 path = self._doo_state_path
                 tmp = f"{path}.{os.getpid()}.tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
@@ -731,7 +740,27 @@ class CameraGate:
                         said = float(e.get("said_at") or 0.0)
                     except Exception:
                         continue
-                    if count <= 0 or not retry > 0.0:
+                    if count <= 0:
+                        continue
+                    if not retry > 0.0:
+                        # Still counting (a partial run, or one death short
+                        # after the owner's lift): no hold, no retry - the
+                        # next death is judged against the carried count.
+                        # Capped one short of the verdict: a count alone
+                        # never arms the slow retry.
+                        count = min(count, self.dies_on_open_count - 1)
+                        if count <= 0:
+                            continue
+                        r = self._rec(key)
+                        r["doo_count"] = count
+                        if said and 0.0 <= now - said < DIES_ON_OPEN_SAY_AGAIN_S:
+                            self._doo_said.add(key)
+                            self._doo_said_at[key] = said
+                        left = self.dies_on_open_count - count
+                        lines.append(
+                            f"  [camera-gate] {key}: restored from the last "
+                            f"run - its last {count} open(s) died on open; "
+                            f"{left} more and it goes on the slow retry.")
                         continue
                     r = self._rec(key)
                     r["doo_count"] = count
@@ -779,10 +808,11 @@ class CameraGate:
                           lines: list) -> None:
         """End a dies-on-open run: the device streamed normally."""
         was_slow = r["doo_retry_s"] > 0.0
+        if was_slow or r["doo_count"] > 0:
+            self._doo_dirty = True          # a saved partial run is cleared too
         r["doo_count"] = 0
         r["doo_retry_s"] = 0.0
         if was_slow:
-            self._doo_dirty = True
             lines.append(
                 f"  [camera-gate] {key}: {why} - it no longer dies on open; "
                 f"back on the normal reopen ladder.")
@@ -807,6 +837,7 @@ class CameraGate:
             return
         r["doo_count"] += 1
         n = r["doo_count"]
+        self._doo_dirty = True              # saved even below the verdict
         if n < self.dies_on_open_count:
             return
         retry = min(self.dies_on_open_retry_s
@@ -1437,10 +1468,13 @@ class CameraGate:
                     r["doo_count"] = (max(0, self.dies_on_open_count - 1)
                                       if slow else 0)
                     r["doo_retry_s"] = 0.0
+                    # Saved either way: the one-short run survives a restart
+                    # (2026-10-01 merge audit), a cleared partial run is
+                    # dropped from the file.
+                    self._doo_dirty = True
                     if slow:
                         lifted.append(LIFT_SLOW_RETRY)
                         r["hold_until"] = 0.0
-                        self._doo_dirty = True
                         lines.append(
                             f"  [camera-gate] {key}: the owner asked to use it "
                             f"again - the slow dies-on-open retry is cleared; "
