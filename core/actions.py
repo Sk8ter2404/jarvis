@@ -67,7 +67,19 @@ def _apple_music_app():
 
 # ─── Browser + search basics (zero-or-low bobert_companion deps) ───────
 
+def _site_shortcut_url(name: str) -> "str | None":
+    """SITE_SHORTCUTS (core/stt_vocab.py, 2026-10-01): the URL for a spoken site
+    name ("accelo"), read live from core.config; None when unset or no match."""
+    try:
+        from core import config as _cfg
+        from core import stt_vocab as _sv
+        return _sv.site_shortcut(name, getattr(_cfg, "SITE_SHORTCUTS", None))
+    except Exception:
+        return None
+
+
 def _act_open_url(url: str) -> str:
+    url = _site_shortcut_url(url) or url
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     webbrowser.open(url)
@@ -758,6 +770,10 @@ _APPLE_MUSIC_LAUNCH_ALIASES = frozenset({
 
 
 def _act_launch_app(name: str) -> str:
+    # A named site shortcut ("open Accelo") is a page, not a program.
+    shortcut = _site_shortcut_url(name)
+    if shortcut:
+        return _act_open_url(shortcut)
     bc = _bc()
     # 0) Apple Music (UWP) special-case — launch via AUMID. The Store app
     #    isn't on PATH and os.startfile("apple music") fails, so route it
@@ -2750,6 +2766,7 @@ def _act_open_on_monitor(args: str) -> str:
     if not target:
         return "format: open_on_monitor, <monitor_name> | <url-or-app>"
     # "youtube cello" (the model's "youtube, cello") is a search, not an app.
+    target = _site_shortcut_url(target) or target
     m = _YOUTUBE_SEARCH_RE.match(target)
     if m:
         target = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(m.group(1).strip())

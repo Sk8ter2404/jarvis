@@ -534,6 +534,7 @@ from core.speech_filter import (  # noqa: F401
 # thin route_voice_emotion(user_text, now=None) wrapper (defined below) that
 # supplies the previous utterance from conversation_history.
 from core import voice_emotion as _voice_emotion
+from core import stt_vocab as _stt_vocab  # noqa: E402
 
 # Legacy flat memory store (load_memory / save_memory / _empty_memory) lives in
 # core/legacy_memory.py. configure() is called below — once MEMORY_FILE is final
@@ -16814,18 +16815,21 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # is never silently lost — the difference between "heard you" and a
             # wall of [standby] ignored: ''. The caller's audio already cleared
             # the mic VAD gate, so it is not pure silence.
+            # STT_HOTWORDS (core/stt_vocab.py, 2026-10-01): the owner's names
+            # ("Accelo" came out as "a cello"). None when unset = unchanged.
+            _hot = _stt_vocab.hotwords_arg(globals().get("STT_HOTWORDS"))
             segments_gen, info = _stt.transcribe(
                 audio, language="en",
                 vad_filter=True,
                 vad_parameters=dict(threshold=0.3, min_speech_duration_ms=80),
-                beam_size=5,
+                beam_size=5, hotwords=_hot,
             )
             segments = list(segments_gen)
             if not segments:
                 segments_gen, info = _stt.transcribe(
                     audio, language="en",
                     vad_filter=False,
-                    beam_size=5,
+                    beam_size=5, hotwords=_hot,
                 )
                 segments = list(segments_gen)
             # Native decode completed without a CUDA fault — clear the
@@ -16833,6 +16837,7 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # on CPU int8. 2026-07-08.
             _consecutive_whisper_cuda_failures = 0
             text = " ".join((s.text or "").strip() for s in segments).strip()
+            text = _stt_vocab.apply_replacements(text, globals().get("STT_REPLACEMENTS"))
             if not segments:
                 # info still carries some signal even on empty transcription
                 nsp = float(getattr(info, "no_speech_prob", 1.0) or 1.0)
@@ -16851,7 +16856,8 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
         # Clean decode — reset the consecutive CUDA-failure counter (see the
         # faster-whisper branch above). 2026-07-08.
         _consecutive_whisper_cuda_failures = 0
-        text = result["text"].strip()
+        text = _stt_vocab.apply_replacements(result["text"].strip(),
+                                             globals().get("STT_REPLACEMENTS"))
         segments = result.get("segments", [])
         if not segments:
             return text, {"no_speech_prob": 1.0, "avg_logprob": -10.0}

@@ -776,6 +776,25 @@ class TranscribeTests(MonolithGlobalsTestCase):
         self.assertAlmostEqual(conf["no_speech_prob"], 0.2, places=6)
         self.assertAlmostEqual(conf["avg_logprob"], -0.3, places=6)
 
+    def test_owner_vocabulary_reaches_whisper_and_corrects_the_text(self):
+        # Live 2026-10-01: the owner's helpdesk app came out as "a cello".
+        fake_stt = mock.Mock()
+        info = mock.Mock(no_speech_prob=0.1)
+        fake_stt.transcribe.return_value = (iter([_Seg("open a cello please", 0.1, -0.2)]), info)
+        with mock.patch.object(self.bc, "_ensure_whisper"),                 mock.patch.object(self.bc, "_stt", fake_stt),                 mock.patch.object(self.bc, "_stt_engine", "faster_whisper"),                 mock.patch.object(self.bc, "STT_HOTWORDS", "Zorblat, Flemwick", create=True),                 mock.patch.object(self.bc, "STT_REPLACEMENTS", {"a cello": "Zorblat"}, create=True):
+            text, _conf = self.bc.transcribe(np.zeros(8, dtype=np.float32))
+        self.assertEqual(text, "open Zorblat please")
+        self.assertEqual(fake_stt.transcribe.call_args.kwargs["hotwords"], "Zorblat, Flemwick")
+
+    def test_unset_vocabulary_passes_no_hotwords(self):
+        fake_stt = mock.Mock()
+        info = mock.Mock(no_speech_prob=0.1)
+        fake_stt.transcribe.return_value = (iter([_Seg("open a cello", 0.1, -0.2)]), info)
+        with mock.patch.object(self.bc, "_ensure_whisper"),                 mock.patch.object(self.bc, "_stt", fake_stt),                 mock.patch.object(self.bc, "_stt_engine", "faster_whisper"),                 mock.patch.object(self.bc, "STT_HOTWORDS", "", create=True),                 mock.patch.object(self.bc, "STT_REPLACEMENTS", {}, create=True):
+            text, _conf = self.bc.transcribe(np.zeros(8, dtype=np.float32))
+        self.assertEqual(text, "open a cello")
+        self.assertIsNone(fake_stt.transcribe.call_args.kwargs["hotwords"])
+
     def test_faster_whisper_empty_segments(self):
         fake_stt = mock.Mock()
         info = mock.Mock(no_speech_prob=0.9)

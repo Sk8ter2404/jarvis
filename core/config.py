@@ -535,6 +535,15 @@ REQUIRE_WAKE_MODE = False
 # core/followup_window.py. Set via user_settings.json.
 FOLLOWUP_WINDOW_S = 0.0
 
+# Owner speech vocabulary (core/stt_vocab.py). STT_HOTWORDS: comma-separated names
+# Whisper should expect (faster-whisper "hotwords"). STT_REPLACEMENTS: phrases Whisper
+# keeps mishearing -> what was said ({"a cello": "Accelo"}), whole words, every
+# transcript. SITE_SHORTCUTS: {"name": "https://..."} so "open <name>" (also on a
+# monitor) opens that page. All empty by default; set in user_settings.json.
+STT_HOTWORDS = ""
+STT_REPLACEMENTS: dict = {}
+SITE_SHORTCUTS: dict = {}
+
 # Owner-only learning (core/learn_gate.py). When True, JARVIS learns facts,
 # topics and projects only from turns that were clearly the owner's: typed,
 # led by the wake word (or right after a standby wake), matched to the
