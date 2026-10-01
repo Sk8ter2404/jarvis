@@ -133,8 +133,13 @@ class WinrtAvailableTests(unittest.TestCase):
 # session by its real state; these pin the choices. No test here touches a
 # real SMTC session: transport() is always given a runner.
 
-def _s(app, status, current=False):
-    return {"app": app, "status": status, "current": current}
+def _s(app, status, current=False, music=None, **props):
+    """One SMTC session as choose_transport_target sees it. The Store app is
+    always the "app" music player (what _transport_async assigns)."""
+    if music is None and app == "Apple Music":
+        music = "app"
+    return {"app": app, "status": status, "current": current, "music": music,
+            **props}
 
 
 class ChooseTransportTargetTests(unittest.TestCase):
@@ -177,14 +182,92 @@ class ChooseTransportTargetTests(unittest.TestCase):
         sessions = [_s("Chrome", "playing", True), _s("Apple Music", "paused")]
         self.assertEqual(m.choose_transport_target(sessions, "next"), ("go", 1))
 
-    def test_prev_with_only_a_paused_video_is_none(self):
+    def test_prev_with_only_a_paused_video_is_not_music(self):
+        # Neither skipped nor "nothing is playing": the honest middle.
         self.assertEqual(
             m.choose_transport_target([_s("Chrome", "paused", True)], "prev"),
-            ("none", None))
+            ("not_music", 0))
 
     def test_no_sessions_is_none_for_every_op(self):
         for op in ("pause", "play", "next", "prev"):
             self.assertEqual(m.choose_transport_target([], op), ("none", None), op)
+
+    # ── the web player is the music (2026-10-01, actions-a review) ─────────
+    # The owner's player is the Apple Music WEB player, whose session is
+    # "Chrome". The first fix counted only the Store app as music.
+
+    def test_live_session_shape_never_skips_the_chrome_video(self):
+        # Read live on 2026-10-01: the Store app open but idle ("opened"),
+        # Chrome playing a video (current). "next song" skipped the video.
+        sessions = [_s("Apple Music", "opened"), _s("Chrome", "playing", True)]
+        for op in ("next", "prev"):
+            self.assertEqual(m.choose_transport_target(sessions, op),
+                             ("not_music", 1), op)
+
+    def test_paused_web_player_is_what_next_song_skips(self):
+        # The regression: a paused web player read as "nothing is playing".
+        sessions = [_s("Apple Music", "opened"),
+                    _s("Chrome", "paused", True, music="web")]
+        self.assertEqual(m.choose_transport_target(sessions, "next"), ("go", 1))
+
+    def test_next_skips_the_playing_web_player_not_the_paused_store_app(self):
+        sessions = [_s("Apple Music", "paused"),
+                    _s("Chrome", "playing", True, music="web")]
+        self.assertEqual(m.choose_transport_target(sessions, "next"), ("go", 1))
+
+    def test_resume_prefers_the_web_player_over_the_store_app(self):
+        sessions = [_s("Apple Music", "paused", True),
+                    _s("Chrome", "paused", music="web")]
+        self.assertEqual(m.choose_transport_target(sessions, "play"), ("go", 1))
+
+    def test_the_store_app_is_the_fallback_without_a_web_player(self):
+        sessions = [_s("Chrome", "paused", True), _s("Apple Music", "paused")]
+        self.assertEqual(m.choose_transport_target(sessions, "play"), ("go", 1))
+        self.assertEqual(m.choose_transport_target(sessions, "next"), ("go", 1))
+
+    def test_a_playing_desktop_player_is_still_skipped(self):
+        self.assertEqual(
+            m.choose_transport_target([_s("Spotify", "playing", True)], "next"),
+            ("go", 0))
+
+    def test_pause_still_pauses_a_video(self):
+        # Pausing is never harmful: "pause" stops whatever is playing.
+        self.assertEqual(
+            m.choose_transport_target([_s("Chrome", "playing", True)], "pause"),
+            ("go", 0))
+
+
+class IsWebPlayerSessionTests(unittest.TestCase):
+    def test_a_song_with_artist_and_album_is_the_web_player(self):
+        self.assertTrue(m.is_web_player_session(
+            {"app": "Chrome", "title": "Billie Jean", "artist": "Michael Jackson",
+             "album": "Thriller"}))
+
+    def test_a_video_is_not(self):
+        # YouTube publishes the channel as the artist, and no album.
+        self.assertFalse(m.is_web_player_session(
+            {"app": "Chrome", "title": "Episode 3", "artist": "Some Channel",
+             "album": ""}))
+        self.assertFalse(m.is_web_player_session({"app": "Chrome", "title": "Episode 3"}))
+
+    def test_its_title_in_a_live_web_player_tab_title(self):
+        # The real tab title carries U+200E and an NBSP.
+        titles = ["‎Billie\xa0Jean — Michael Jackson - Apple Music - Google Chrome"]
+        self.assertTrue(m.is_web_player_session(
+            {"app": "Edge", "title": "Billie Jean", "artist": "Michael Jackson"},
+            titles))
+        self.assertFalse(m.is_web_player_session(
+            {"app": "Chrome", "title": "Episode 3"}, titles))
+
+    def test_only_browser_sessions_qualify(self):
+        for app in ("Apple Music", "Spotify", "VLC"):
+            self.assertFalse(m.is_web_player_session(
+                {"app": app, "title": "Billie Jean", "artist": "MJ",
+                 "album": "Thriller"}), app)
+
+    def test_an_empty_title_matches_nothing(self):
+        self.assertFalse(m.is_web_player_session(
+            {"app": "Chrome", "title": ""}, ["Apple Music - Web Player - Google Chrome"]))
 
 
 class TransportTests(unittest.TestCase):
@@ -199,25 +282,37 @@ class TransportTests(unittest.TestCase):
     def test_runner_result_passes_through(self):
         calls = []
 
-        def runner(op, prefer):
-            calls.append((op, prefer))
+        def runner(op, titles):
+            calls.append((op, titles))
             return ("done", "Apple Music")
         self.assertEqual(m.transport("next", runner=runner), ("done", "Apple Music"))
-        self.assertEqual(calls, [("next", "Apple Music")])
+        self.assertEqual(calls, [("next", ())])
+
+    def test_web_player_titles_reach_the_runner(self):
+        seen = []
+
+        def runner(op, titles):
+            seen.append(titles)
+            return ("not_music", "Chrome")
+        self.assertEqual(
+            m.transport("next", web_player_titles=["Apple Music - Web Player - Google Chrome"],
+                        runner=runner),
+            ("not_music", "Chrome"))
+        self.assertEqual(seen, [("Apple Music - Web Player - Google Chrome",)])
 
     def test_runner_error_is_failed_never_raised(self):
-        def runner(op, prefer):
+        def runner(op, titles):
             raise OSError("RPC_E_WRONG_THREAD")
         self.assertEqual(m.transport("pause", runner=runner), ("failed", None))
 
     def test_malformed_runner_result_is_failed(self):
-        self.assertEqual(m.transport("pause", runner=lambda o, p: "yes"),
+        self.assertEqual(m.transport("pause", runner=lambda o, t: "yes"),
                          ("failed", None))
-        self.assertEqual(m.transport("pause", runner=lambda o, p: ("maybe", "x")),
+        self.assertEqual(m.transport("pause", runner=lambda o, t: ("maybe", "x")),
                          ("failed", None))
 
     def test_unknown_op_is_failed_without_running(self):
-        def runner(op, prefer):
+        def runner(op, titles):
             raise AssertionError("must not run")
         self.assertEqual(m.transport("toggle", runner=runner), ("failed", None))
 
@@ -225,7 +320,7 @@ class TransportTests(unittest.TestCase):
         save = (m._last_read,)
         try:
             m._last_read = 12345.0
-            m.transport("pause", runner=lambda o, p: ("done", "Chrome"))
+            m.transport("pause", runner=lambda o, t: ("done", "Chrome"))
             self.assertEqual(m._last_read, 0.0)
         finally:
             (m._last_read,) = save

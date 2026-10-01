@@ -18382,7 +18382,7 @@ def _local_cheatsheet() -> str:
         "  [ACTION: list_playlists]   (points sir to the Apple Music app)   [ACTION: shuffle_library]   shuffle music via Apple Music\n"
         "  [ACTION: open_apple_music]   open Apple Music (the web player)   [ACTION: music_status]   is Apple Music open / what's playing\n"
         "  [ACTION: pause_music]  [ACTION: resume_music]  [ACTION: next_song]  [ACTION: previous_song]  [ACTION: now_playing]   (the Windows media session — app OR browser)\n"
-        "  [ACTION: media_playpause]  [ACTION: media_next]  [ACTION: media_prev]\n"
+        "  [ACTION: media_playpause]  [ACTION: media_next]  [ACTION: media_prev]   raw media-key TOGGLES: only when sir asks for the key itself — never a retry after the four above\n"
         "  [ACTION: volume_up]  [ACTION: volume_down]  [ACTION: volume_mute]  [ACTION: volume_unmute]\n"
         "  [ACTION: set_volume, 30]   <- absolute: 'set the volume to 30 percent'\n"
         "  [ACTION: netflix, <title>]  [ACTION: spotify, <query>]\n"
@@ -25631,6 +25631,24 @@ def _is_apple_music_browser_title(title: str) -> bool:
     return "apple music" in t and any(m in t for m in _MUSIC_BROWSER_MARKERS)
 
 
+def _apple_music_web_player_titles() -> list:
+    """Titles of the browser windows showing the Apple Music web player RIGHT
+    NOW (the live scan only: no 5-minute sighting cache). [] when there are
+    none or pygetwindow is unavailable. Never raises.
+
+    2026-10-01 (actions-a review): the music actions need "is the web player
+    open NOW" and "which track does its tab show" (core.media_now_playing's
+    is_web_player_session matches the media session's title against these).
+    _apple_music_chrome_active answers from the cache too, so it kept
+    reporting the web player for 5 minutes after it was closed."""
+    try:
+        import pygetwindow as gw
+        return [w.title for w in gw.getAllWindows()
+                if _is_apple_music_browser_title(w.title or "")]
+    except Exception:
+        return []
+
+
 def _apple_music_chrome_active() -> bool:
     """Return True iff Apple Music is — or was recently — visible in a
     browser tab (see _is_apple_music_browser_title). iTunes desktop's window
@@ -25651,16 +25669,9 @@ def _apple_music_chrome_active() -> bool:
     _APPLE_MUSIC_SEEN_TTL_SECS — long enough that switching tabs for a
     minute doesn't cause "next song" to suddenly start launching iTunes.
     """
-    try:
-        import pygetwindow as gw
-        for w in gw.getAllWindows():
-            if _is_apple_music_browser_title(w.title or ""):
-                _note_apple_music_seen()
-                return True
-    except ImportError:
-        pass
-    except Exception:
-        pass
+    if _apple_music_web_player_titles():
+        _note_apple_music_seen()
+        return True
     return (time.time() - _apple_music_last_seen[0]) < _APPLE_MUSIC_SEEN_TTL_SECS
 
 

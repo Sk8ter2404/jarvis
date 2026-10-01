@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import unicodedata
 
 # Seconds a snapshot is reused before the next on-demand SMTC read.
 _REFRESH_INTERVAL = 2.0
@@ -90,6 +91,9 @@ async def _read_session_async() -> "dict | None":  # pragma: no cover - winrt-on
         "app": _clean_app(cur.source_app_user_model_id),
         "title": (props.title or "").strip(),
         "artist": (props.artist or "").strip(),
+        # 2026-10-01: lets music_status tell the Apple Music web player (a
+        # song: artist + album) from a video playing in the same browser.
+        "album": (props.album_title or "").strip(),
         "status": status,
         "playing": status == "playing",
     }
@@ -155,62 +159,116 @@ def get_now_playing() -> "dict | None":
 _TRANSPORT_OPS = ("pause", "play", "next", "prev")
 # How long an action thread waits for one SMTC transport call.
 _TRANSPORT_TIMEOUT_S = 3.0
+# Friendly app names (see _clean_app) that are web browsers. A browser
+# session is whatever its active media tab is: the Apple Music web player,
+# or an HBO / YouTube video.
+_BROWSER_APPS = frozenset({"Chrome", "Edge", "Firefox"})
+_BROWSER_AUMID_HINTS = ("brave", "opera", "vivaldi", "chromium")
+# The Microsoft-Store Apple Music app's friendly name (from _clean_app).
+_STORE_APP = "Apple Music"
 
 
-def choose_transport_target(sessions: list, op: str,
-                            prefer_app: str = "Apple Music"
+def _is_browser_app(app) -> bool:
+    a = str(app or "")
+    return a in _BROWSER_APPS or any(h in a.lower() for h in _BROWSER_AUMID_HINTS)
+
+
+def _fold(text) -> str:
+    """Lower-case, NBSP -> space, invisible format characters (the U+200E
+    the web player puts in its tab title) dropped, whitespace collapsed."""
+    t = str(text or "").replace("\xa0", " ")
+    t = "".join(ch for ch in t if unicodedata.category(ch) != "Cf")
+    return " ".join(t.lower().split())
+
+
+def is_web_player_session(info: dict, web_player_titles=()) -> bool:
+    """True when a BROWSER media session is the Apple Music web player (the
+    owner's music player), not a video playing in the same browser. Pure.
+
+    2026-10-01 (actions-a review): the transport chooser counted only the
+    Store app as "the music", so with the live session shape [Store app
+    opened, Chrome playing] "next song" still skipped whatever Chrome played
+    (an HBO / YouTube video: the next episode), and a PAUSED web player read
+    as "nothing playing". Either piece of evidence is enough:
+      * the session publishes a SONG: an artist AND an album (the web player
+        sets both in its media metadata; a video publishes no album, and the
+        live Chrome video read on 2026-10-01 published neither);
+      * its title appears in a live Apple Music web-player window title
+        (``web_player_titles``: the tab title carries the playing track).
+    """
+    if not _is_browser_app(info.get("app")):
+        return False
+    if (info.get("artist") or "").strip() and (info.get("album") or "").strip():
+        return True
+    title = _fold(info.get("title"))
+    return bool(title) and any(title in _fold(t) for t in web_player_titles or ())
+
+
+def choose_transport_target(sessions: list, op: str
                             ) -> "tuple[str, int | None]":
     """Pick which session ``op`` acts on. Pure, so it is tested on any OS.
 
-    ``sessions``: one dict per SMTC session, ``{"app", "status", "current"}``
-    (``status`` from ``_STATUS_NAMES``; ``current`` = it is the OS current
-    session). Returns ``(outcome, index)``: ``("go", i)`` to act on session
-    ``i``, ``("already", i)`` when the request is already true of session
-    ``i`` (pause with nothing playing but something paused; resume while
-    something plays), or ``("none", None)`` when no session fits at all.
+    ``sessions``: one dict per SMTC session, ``{"app", "status", "current",
+    "music"}`` (``status`` from ``_STATUS_NAMES``; ``current`` = it is the OS
+    current session; ``music`` = ``"web"`` for the Apple Music web player,
+    ``"app"`` for the Store app, else falsy). Returns ``(outcome, index)``:
+    ``("go", i)`` to act on session ``i``; ``("already", i)`` when the request
+    is already true of session ``i`` (pause with nothing playing but
+    something paused; resume while something plays); ``("not_music", i)``
+    when next/prev would only skip a browser session that isn't the music (a
+    video, never skipped on "next song"); or ``("none", None)``.
 
-    Preference order, everywhere: the ``prefer_app`` session, then the OS
-    current session, then the first that fits.
+    The music player always wins: the web player first (the owner's player),
+    the Store app only when no web-player session fits; then the OS current
+    session; then list order.
     """
-    def _first(pred):
-        for want in (lambda s: s.get("app") == prefer_app,
-                     lambda s: bool(s.get("current")),
-                     lambda s: True):
-            for i, s in enumerate(sessions):
-                if pred(s) and want(s):
-                    return i
-        return None
+    rank = {"web": 0, "app": 1}
+
+    def _best(pred):
+        found = [(rank.get(s.get("music"), 2), not s.get("current"), i)
+                 for i, s in enumerate(sessions) if pred(s)]
+        return min(found)[2] if found else None
 
     playing = lambda s: s.get("status") == "playing"  # noqa: E731
     paused = lambda s: s.get("status") == "paused"    # noqa: E731
+    music = lambda s: s.get("music") in rank           # noqa: E731
     if op == "pause":
-        i = _first(playing)
+        i = _best(playing)
         if i is not None:
             return "go", i
-        i = _first(paused)
+        i = _best(paused)
         return ("already", i) if i is not None else ("none", None)
     if op == "play":
-        # A paused preferred player wins even over another app's video: the
-        # owner said "resume the MUSIC". Otherwise never start a second,
-        # arbitrary player while something is already playing.
-        for i, s in enumerate(sessions):
-            if s.get("app") == prefer_app and paused(s):
-                return "go", i
-        i = _first(playing)
+        # Music already playing: never start a second player. A paused music
+        # player wins even over another app's video: the owner said "resume
+        # the MUSIC". Otherwise resume only when nothing at all is playing.
+        i = _best(lambda s: music(s) and playing(s))
         if i is not None:
             return "already", i
-        i = _first(paused)
-        return ("go", i) if i is not None else ("none", None)
-    # next / prev: "next SONG" means the music player even while it is
-    # paused; otherwise only a session that is actually playing.
-    for i, s in enumerate(sessions):
-        if s.get("app") == prefer_app and (playing(s) or paused(s)):
+        i = _best(lambda s: music(s) and paused(s))
+        if i is not None:
             return "go", i
-    i = _first(playing)
-    return ("go", i) if i is not None else ("none", None)
+        i = _best(playing)
+        if i is not None:
+            return "already", i
+        i = _best(paused)
+        return ("go", i) if i is not None else ("none", None)
+    # next / prev: "next SONG" means the music player (a playing one before a
+    # paused one), then a playing non-browser player (Spotify, VLC ...).
+    i = _best(lambda s: music(s) and playing(s))
+    if i is None:
+        i = _best(lambda s: music(s) and paused(s))
+    if i is None:
+        i = _best(lambda s: playing(s) and not _is_browser_app(s.get("app")))
+    if i is not None:
+        return "go", i
+    # Only a browser session that isn't the web player is left: skipping it
+    # would skip the video (the next episode). Say so instead.
+    i = _best(lambda s: (playing(s) or paused(s)) and _is_browser_app(s.get("app")))
+    return ("not_music", i) if i is not None else ("none", None)
 
 
-async def _transport_async(op: str, prefer_app: str):  # pragma: no cover - winrt-only
+async def _transport_async(op: str, web_player_titles):  # pragma: no cover - winrt-only
     """One SMTC transport call -> ``(outcome, app)`` (see transport())."""
     from winrt.windows.media.control import (
         GlobalSystemMediaTransportControlsSessionManager as MGR,
@@ -223,10 +281,22 @@ async def _transport_async(op: str, prefer_app: str):  # pragma: no cover - winr
     for s in sessions:
         status = _STATUS_NAMES.get(int(s.get_playback_info().playback_status),
                                    "unknown")
-        infos.append({"app": _clean_app(s.source_app_user_model_id),
-                      "status": status,
-                      "current": s.source_app_user_model_id == cur_id})
-    outcome, idx = choose_transport_target(infos, op, prefer_app)
+        info = {"app": _clean_app(s.source_app_user_model_id),
+                "status": status,
+                "current": s.source_app_user_model_id == cur_id}
+        if _is_browser_app(info["app"]):
+            try:
+                props = await s.try_get_media_properties_async()
+                info.update(title=(props.title or "").strip(),
+                            artist=(props.artist or "").strip(),
+                            album=(props.album_title or "").strip())
+            except Exception:  # noqa: BLE001 - unreadable: not the web player
+                pass
+        info["music"] = ("app" if info["app"] == _STORE_APP else
+                         "web" if is_web_player_session(info, web_player_titles)
+                         else None)
+        infos.append(info)
+    outcome, idx = choose_transport_target(infos, op)
     if idx is None:
         return outcome, None
     app = infos[idx]["app"]
@@ -240,17 +310,22 @@ async def _transport_async(op: str, prefer_app: str):  # pragma: no cover - winr
     return ("done" if ok else "failed"), app
 
 
-def _default_transport(op: str, prefer_app: str):  # pragma: no cover - winrt-only
+def _default_transport(op: str, web_player_titles=()):  # pragma: no cover - winrt-only
     """Run one SMTC transport call on a short-lived worker thread with its own
     event loop, so the WinRT call never runs on the caller's (possibly main)
     thread and a hung call can't freeze it. A timeout reports "failed" — never
-    a fallback key press, which could double-act once the slow call lands."""
+    a fallback key press, which could double-act once the slow call lands.
+
+    This really pauses / skips the owner's media, so the test suite's
+    hermetic guard (tools/hermetic_guard.py) refuses it: an unpinned test
+    can never reach it."""
     box: dict = {}
 
     def _run():
         loop = asyncio.new_event_loop()
         try:
-            box["v"] = loop.run_until_complete(_transport_async(op, prefer_app))
+            box["v"] = loop.run_until_complete(
+                _transport_async(op, tuple(web_player_titles or ())))
         except Exception as e:  # noqa: BLE001 - reported to the caller
             box["e"] = e
         finally:
@@ -264,17 +339,23 @@ def _default_transport(op: str, prefer_app: str):  # pragma: no cover - winrt-on
     return box.get("v", ("failed", None))
 
 
-def transport(op: str, prefer_app: str = "Apple Music",
+_TRANSPORT_OUTCOMES = ("done", "already", "none", "failed", "not_music")
+
+
+def transport(op: str, web_player_titles=(),
               runner=None) -> "tuple[str, str | None] | None":
     """Pause / resume / skip the right media session, idempotently.
 
-    ``op`` is one of ``"pause"``, ``"play"``, ``"next"``, ``"prev"``. Returns
-    ``(outcome, app)`` with outcome ``"done"`` (the session accepted it),
-    ``"already"`` (pause on a paused player, resume while one plays),
-    ``"none"`` (no media session fits) or ``"failed"`` (the session refused,
-    the call errored or timed out). Returns ``None`` ONLY when the SMTC
-    projection is unavailable (CI / Linux / no winrt), so the caller may use
-    its legacy path. Never raises. ``runner`` is the test seam."""
+    ``op`` is one of ``"pause"``, ``"play"``, ``"next"``, ``"prev"``.
+    ``web_player_titles``: the live Apple Music web-player window titles (see
+    is_web_player_session). Returns ``(outcome, app)`` with outcome
+    ``"done"`` (the session accepted it), ``"already"`` (pause on a paused
+    player, resume while one plays), ``"not_music"`` (next/prev with only a
+    browser video to skip, left alone), ``"none"`` (no media session fits)
+    or ``"failed"`` (the session refused, the call errored or timed out).
+    Returns ``None`` ONLY when the SMTC projection is unavailable (CI / Linux
+    / no winrt), so the caller may use its legacy path. Never raises.
+    ``runner(op, web_player_titles)`` is the test seam."""
     global _last_read
     if op not in _TRANSPORT_OPS:
         return ("failed", None)
@@ -283,13 +364,13 @@ def transport(op: str, prefer_app: str = "Apple Music",
             return None
         runner = _default_transport  # pragma: no cover - winrt-only
     try:
-        res = runner(op, prefer_app)
+        res = runner(op, tuple(web_player_titles or ()))
     except Exception as e:  # noqa: BLE001 - never raise into an action
         print(f"  [smtc] transport {op} failed: {type(e).__name__}: {e}",
               flush=True)
         return ("failed", None)
     if (not isinstance(res, tuple) or len(res) != 2
-            or res[0] not in ("done", "already", "none", "failed")):
+            or res[0] not in _TRANSPORT_OUTCOMES):
         return ("failed", None)
     with _lock:  # the cached now-playing snapshot is stale after a transport
         _last_read = 0.0

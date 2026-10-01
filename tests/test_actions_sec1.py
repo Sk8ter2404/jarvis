@@ -376,6 +376,11 @@ class VolumeTests(unittest.TestCase):
             out = A._act_volume_mute("")
         pag.press.assert_called_once_with("volumemute")
         self.assertIn("may have toggled", out)
+        # 2026-10-01 review: no failure marker, or the follow-up loop
+        # re-prompts the LLM, which may send volume_mute again and toggle the
+        # key a second time.
+        from core.failure_markers import FAILURE_MARKERS
+        self.assertEqual([m for m in FAILURE_MARKERS if m in out.lower()], [])
 
     def test_set_volume_rejects_unparseable_and_out_of_range(self):
         fake = mock.Mock()

@@ -47,7 +47,12 @@ pywin32 is C code whose calls are NOT audited, so its input functions
 / ``SendMessage``, ``win32gui.PostMessage`` / ``SendMessage`` /
 ``SendMessageTimeout`` / ``SetForegroundWindow`` / ``BringWindowToTop``) are
 wrapped the browser-guard way: a marked stub on the module attribute, which a
-test's ``mock.patch`` replaces and then restores TO the stub.
+test's ``mock.patch`` replaces and then restores TO the stub. COM / WinRT
+calls are not audited either, so the two real-world effects reached that way
+(``_EFFECT_TARGETS``: pycaw's ``AudioUtilities.GetSpeakers``, the speakers'
+mute / volume, and ``core.media_now_playing._default_transport``, the media
+session's pause / skip) get the same stub, installed by an import hook as the
+REAL module loads (2026-10-01).
 
 WHAT IS REFUSED
 ---------------
@@ -254,6 +259,24 @@ _BLOCKED_MESSAGES = {
 }
 _BLOCKED_MESSAGES.update({m: "WM_MOUSE" for m in range(0x0200, 0x020F)})
 
+# Real-world effects with NO audited call underneath (2026-10-01, actions-a
+# review): COM and WinRT method calls raise no audit event, so the endpoint
+# volume behind volume_mute / volume_unmute / set_volume (pycaw) and the
+# media-session transport behind pause_music / resume_music / next_song /
+# previous_song would really mute the owner's speakers or pause / skip his
+# media from an unpinned test. (The media KEYS those actions used to press go
+# through keybd_event and were refused; their replacements were not.) Each
+# REAL entry point gets a marked stub under the input guard, the pywin32 way;
+# a test that fakes the module in sys.modules, or pins the function, never
+# reaches it. Wrapped as each module is IMPORTED (an import hook), never
+# imported here: importing pycaw would CoInitialize the collecting thread and
+# cost every run the comtypes import. (module, class or None, attribute)
+_EFFECT_TARGETS = (
+    ("core.media_now_playing", None, "_default_transport"),
+    ("pycaw.utils", "AudioUtilities", "GetSpeakers"),
+)
+_EFFECT_MODULES = frozenset(t[0] for t in _EFFECT_TARGETS)
+
 # pywin32 attributes wrapped (their calls are not audited).
 _PYWIN32_TARGETS = (
     ("win32api", ("SetCursorPos", "mouse_event", "keybd_event",
@@ -313,6 +336,8 @@ _input_fn_ptrs: dict[int, str] = {}
 _message_fn_ptrs: dict[int, str] = {}
 _own_names: set[str] = set()
 _atexit_registered = [False]
+_effect_modules: dict[str, object] = {}  # name -> the REAL module wrapped
+_finding = threading.local()      # re-entrancy latch inside the import hook
 _EVENTS = frozenset({
     "socket.connect", "socket.bind", "socket.sendto", "socket.sendmsg",
     "socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr",
@@ -852,6 +877,130 @@ def unwrapped_pywin32() -> list[str]:
     return bad
 
 
+# ─── un-audited real-world effects (COM / WinRT): wrapped on import ────────
+
+def _wrap_effect(module, modname: str, cls_name, name: str) -> None:
+    try:
+        owner = getattr(module, cls_name) if cls_name else module
+        real = getattr(owner, name)
+    except Exception:  # noqa: BLE001 - an attribute this version lacks
+        return
+    if _marked(real):
+        return
+    label = f"{modname}.{cls_name + '.' if cls_name else ''}{name}"
+
+    def stub(*args, **kwargs):
+        if _active("input"):
+            _refuse("input", label, label,
+                    "a real effect on the owner's speakers / media session "
+                    "(a COM / WinRT call no audit event covers)")
+        return real(*args, **kwargs)
+
+    stub.__name__ = getattr(real, "__name__", name)
+    stub.__doc__ = getattr(real, "__doc__", None)
+    stub.__wrapped__ = real
+    setattr(stub, _GUARD_MARK, True)
+    try:
+        raw = owner.__dict__.get(name) if cls_name else None
+        setattr(owner, name,
+                staticmethod(stub) if isinstance(raw, staticmethod) else stub)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _arm_effects_in(modname: str, module) -> None:
+    for mod, cls_name, name in _EFFECT_TARGETS:
+        if mod == modname:
+            _wrap_effect(module, modname, cls_name, name)
+    _effect_modules[modname] = module
+
+
+def _arm_effects() -> None:
+    """Wrap the targets of every effect module that is already imported (the
+    import hook covers the ones imported later) and install that hook once."""
+    for modname in _EFFECT_MODULES:
+        module = sys.modules.get(modname)
+        if module is not None and getattr(module, "__spec__", None) is not None:
+            _arm_effects_in(modname, module)
+    if not any(_marked(f) for f in sys.meta_path):
+        sys.meta_path.insert(0, _EffectImportHook())
+
+
+class _EffectLoader:
+    """Runs the real loader, then wraps the module's effect targets. Every
+    other loader attribute (get_source, resource readers ...) is the real
+    loader's."""
+
+    def __init__(self, real, name: str):
+        self._real = real
+        self._name = name
+
+    def create_module(self, spec):
+        return self._real.create_module(spec)
+
+    def exec_module(self, module):
+        self._real.exec_module(module)
+        try:
+            _arm_effects_in(self._name, module)
+        except Exception:  # noqa: BLE001 - a guard bug must not break an import
+            pass
+
+    def __getattr__(self, attr):
+        return getattr(self._real, attr)
+
+
+class _EffectImportHook:
+    """A ``sys.meta_path`` entry that finds NOTHING itself: for an effect
+    module it asks the finders after it, then swaps in an _EffectLoader so the
+    real module is wrapped the moment it has executed. A module a test put in
+    ``sys.modules`` never reaches a finder, so a fake is never wrapped."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name not in _EFFECT_MODULES or getattr(_finding, "on", False):
+            return None
+        _finding.on = True
+        try:
+            spec = None
+            for finder in list(sys.meta_path):
+                if finder is self or _marked(finder):
+                    continue
+                find = getattr(finder, "find_spec", None)
+                if find is None:
+                    continue
+                spec = find(name, path, target)
+                if spec is not None:
+                    break
+        except Exception:  # noqa: BLE001 - let the normal import machinery try
+            return None
+        finally:
+            _finding.on = False
+        if spec is None or not hasattr(getattr(spec, "loader", None),
+                                       "exec_module"):
+            return None
+        spec.loader = _EffectLoader(spec.loader, name)
+        return spec
+
+
+setattr(_EffectImportHook, _GUARD_MARK, True)
+
+
+def unwrapped_effects() -> list[str]:
+    """Effect targets of a REAL module this guard wrapped that are NOT
+    wrapped right now (a fake module in sys.modules is not checked)."""
+    bad = []
+    for modname, cls_name, name in _EFFECT_TARGETS:
+        module = _effect_modules.get(modname)
+        if module is None or sys.modules.get(modname) is not module:
+            continue
+        try:
+            owner = getattr(module, cls_name) if cls_name else module
+            if not _marked(getattr(owner, name)):
+                bad.append(f"{modname}.{cls_name + '.' if cls_name else ''}{name}")
+        except Exception:  # noqa: BLE001
+            continue
+    return bad
+
+
 def _resolve_user32() -> None:
     """Function-pointer -> name tables for the audited ctypes calls."""
     if sys.platform != "win32" or _input_fn_ptrs:
@@ -926,7 +1075,7 @@ def unarmed_guards() -> list[str]:
             bad.append(guard)
     finally:
         _probing.on = False
-    if "input" not in bad and unwrapped_pywin32():
+    if "input" not in bad and (unwrapped_pywin32() or unwrapped_effects()):
         bad.append("input")
     return bad
 
@@ -948,6 +1097,7 @@ def install(record_only: bool = False, *, env: dict | None = None,
     try:
         if _installed[0]:
             _arm_pywin32()
+            _arm_effects()
             return not _disabled and not _record_only[0]
         _record_only[0] = bool(record_only)
         _disabled.clear()
@@ -960,6 +1110,7 @@ def install(record_only: bool = False, *, env: dict | None = None,
             pass
         _resolve_user32()
         _arm_pywin32()
+        _arm_effects()
         if not _hook_added[0]:
             sys.addaudithook(_hook)
             _hook_added[0] = True

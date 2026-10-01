@@ -472,11 +472,22 @@ class SmtcTransportTests(_BaseActTest):
 
     def sessions(self, *sessions):
         """Pin transport() to the REAL function, with a fake WinRT runner
-        over ``sessions`` that records the op it performs on which app."""
+        over ``sessions`` that records the op it performs on which app. The
+        runner classifies each session the way _transport_async does (the
+        Store app is "app"; a browser session is "web" when
+        is_web_player_session says so), from the web-player titles the
+        action passed in."""
         acted = self.acted
 
-        def runner(op, prefer):
-            outcome, idx = _mnp.choose_transport_target(list(sessions), op, prefer)
+        def runner(op, titles):
+            infos = []
+            for sess in sessions:
+                info = dict(sess)
+                info["music"] = ("app" if info["app"] == "Apple Music" else
+                                 "web" if _mnp.is_web_player_session(info, titles)
+                                 else None)
+                infos.append(info)
+            outcome, idx = _mnp.choose_transport_target(infos, op)
             if idx is None:
                 return outcome, None
             if outcome == "go":
@@ -484,7 +495,13 @@ class SmtcTransportTests(_BaseActTest):
                 return "done", sessions[idx]["app"]
             return outcome, sessions[idx]["app"]
 
-        self.pin_smtc_transport(lambda op: _REAL_TRANSPORT(op, runner=runner))
+        def real(op, web_player_titles=(), **_kw):
+            return _REAL_TRANSPORT(op, web_player_titles=web_player_titles,
+                                   runner=runner)
+
+        p = mock.patch("core.media_now_playing.transport", side_effect=real)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_pause_on_paused_music_does_not_start_it(self):
         self.sessions({"app": "Apple Music", "status": "paused", "current": True})
@@ -544,6 +561,52 @@ class SmtcTransportTests(_BaseActTest):
         out = A._act_next_song("")
         self.bc._media_key_with_focus.assert_not_called()
         self.assertIn("Chrome didn't accept that", out)
+
+    # ── the web player is the music (2026-10-01, actions-a review) ─────────
+    # The owner listens in the Apple Music WEB player (its session is
+    # "Chrome"); the first fix only treated the Store app as the music, so
+    # the live state below still skipped a Chrome video on "next song".
+
+    def test_next_song_in_the_live_session_shape_leaves_the_video_alone(self):
+        # Read live on 2026-10-01: the Store app open but idle, Chrome
+        # playing a video that publishes a title only.
+        self.sessions({"app": "Apple Music", "status": "opened", "current": False},
+                      {"app": "Chrome", "status": "playing", "current": True,
+                       "title": "Episode 3"})
+        out = A._act_next_song("")
+        self.assertEqual(self.acted, [], "skipped the video")
+        self.bc._media_key_with_focus.assert_not_called()
+        self.assertIn("doesn't look like music", out)
+        self.assertIn("Chrome", out)
+        self.assertNotIn(A._NOTHING_PLAYING_MSG, out)
+
+    def test_next_song_skips_a_paused_web_player(self):
+        # A paused web player used to read as "nothing is playing".
+        self.sessions({"app": "Apple Music", "status": "opened", "current": False},
+                      {"app": "Chrome", "status": "paused", "current": True,
+                       "title": "Billie Jean", "artist": "Michael Jackson",
+                       "album": "Thriller"})
+        out = A._act_next_song("")
+        self.assertEqual(self.acted, [("next", "Chrome")])
+        self.assertIn("next track in Chrome", out)
+
+    def test_web_player_recognised_by_its_live_tab_title(self):
+        # No album published: the live web-player window title (read through
+        # the monolith) is what identifies the session as the music.
+        self.bc._apple_music_web_player_titles.return_value = [
+            "Billie Jean \u2014 Michael Jackson - Apple Music - Google Chrome"]
+        self.sessions({"app": "Chrome", "status": "playing", "current": True,
+                       "title": "Billie Jean", "artist": "Michael Jackson"})
+        self.assertEqual(A._act_previous_song(""), "went back a track in Chrome, sir")
+        self.assertEqual(self.acted, [("prev", "Chrome")])
+
+    def test_resume_prefers_the_web_player_over_the_store_app(self):
+        self.sessions({"app": "Apple Music", "status": "paused", "current": True},
+                      {"app": "Chrome", "status": "paused", "current": False,
+                       "title": "Billie Jean", "artist": "Michael Jackson",
+                       "album": "Thriller"})
+        self.assertEqual(A._act_resume_music(""), "resumed Chrome, sir")
+        self.assertEqual(self.acted, [("play", "Chrome")])
 
 
 # ── _act_now_playing ─────────────────────────────────────────────────────────
@@ -685,18 +748,48 @@ class OpenAppleMusicTests(_BaseActTest):
         out = A._act_open_apple_music("")
         self.assertIn("could not open Apple Music", out)
 
+    def test_voice_and_tray_open_the_same_page(self):
+        # tray.py is its own process and isn't imported here; read its
+        # constant from SOURCE so the two copies can't drift apart.
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "tray.py"), encoding="utf-8") as f:
+            src = f.read()
+        tray_url = None
+        for node in ast.parse(src).body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and getattr(node.targets[0], "id", "") == "APPLE_MUSIC_WEB_URL"):
+                tray_url = ast.literal_eval(node.value)
+        self.assertEqual(tray_url, A._APPLE_MUSIC_WEB_URL)
+        self.assertNotIn("'open Apple Music' is unchanged", src)
+
+    def test_an_open_web_player_is_not_opened_again(self):
+        # 2026-10-01 review: every "open Apple Music" stacked another tab.
+        self.bc._apple_music_web_player_titles.return_value = [
+            "Apple Music - Web Player - Google Chrome"]
+        out = A._act_open_apple_music("")
+        self.bc._open_url_in_browser.assert_not_called()
+        self.assertIn("already open in the browser", out)
+
 
 # B089: music_status reports the owner's real player first — the Windows
 # media session, then the browser web player — and only then the Store app.
 class MusicStatusTests(_BaseActTest):
+    WEB = "Apple Music - Web Player - Google Chrome"
+
     def setUp(self):
         super().setUp()
         self.bc._apple_music_chrome_active.return_value = False
+        self.bc._apple_music_web_player_titles.return_value = []
+
+    def web_player_open(self, *titles):
+        self.bc._apple_music_web_player_titles.return_value = list(titles or (self.WEB,))
+        self.bc._apple_music_chrome_active.return_value = True
 
     def test_web_player_open_while_store_app_closed(self):
         # The bug: "doesn't appear to be running" while the web player played.
         self.patch_apple_music_app(running=False, installed=True)
-        self.bc._apple_music_chrome_active.return_value = True
+        self.web_player_open("Billie Jean - Apple Music - Google Chrome")
         self.pin_smtc_snapshot({"app": "Chrome", "title": "Billie Jean",
                                 "artist": "Michael Jackson", "status": "playing",
                                 "playing": True})
@@ -708,7 +801,7 @@ class MusicStatusTests(_BaseActTest):
 
     def test_web_player_track_from_the_tab_title(self):
         self.patch_apple_music_app(running=False)
-        self.bc._apple_music_chrome_active.return_value = True
+        self.web_player_open()
         self.bc._apple_music_title_now_playing.return_value = "Thriller — Michael Jackson"
         out = A._act_music_status("")
         self.assertIn("open in the browser", out)
@@ -716,12 +809,54 @@ class MusicStatusTests(_BaseActTest):
 
     def test_web_player_idle(self):
         self.patch_apple_music_app(running=False)
-        self.bc._apple_music_chrome_active.return_value = True
+        self.web_player_open()
         self.bc._apple_music_title_now_playing.return_value = None
         self.bc._apple_music_loaded_track_from_title.return_value = None
         out = A._act_music_status("")
         self.assertIn("open in the browser", out)
         self.assertIn("nothing is playing", out)
+
+    # ── whose session is it? (2026-10-01, actions-a review) ────────────────
+    def test_a_video_in_the_same_browser_is_not_called_apple_music(self):
+        # The web player is open, but the media session is an HBO video in
+        # Chrome: it used to be reported as Apple Music's track.
+        self.patch_apple_music_app(running=False)
+        self.web_player_open()
+        self.bc._apple_music_title_now_playing.return_value = None
+        self.bc._apple_music_loaded_track_from_title.return_value = None
+        self.pin_smtc_snapshot({"app": "Chrome", "title": "Episode 3", "artist": "",
+                                "status": "playing", "playing": True})
+        out = A._act_music_status("")
+        self.assertIn("nothing is playing in it", out)
+        self.assertIn("Episode 3 is playing in Chrome", out)
+        self.assertNotIn("open in the browser, sir — Episode 3", out)
+
+    def test_a_cache_only_sighting_is_not_reported_as_open(self):
+        # The 5-minute cache kept saying "open" after the tab was closed.
+        self.patch_apple_music_app(running=False)
+        self.bc._apple_music_chrome_active.return_value = True   # cache only
+        self.bc._apple_music_title_now_playing.return_value = None
+        self.bc._apple_music_loaded_track_from_title.return_value = None
+        out = A._act_music_status("")
+        self.assertNotIn("is open in the browser", out)
+        self.assertIn("a few minutes ago", out)
+
+    def test_store_app_running_does_not_claim_a_chrome_video(self):
+        self.patch_apple_music_app(running=True, now_playing=None)
+        self.pin_smtc_snapshot({"app": "Chrome", "title": "Episode 3", "artist": "",
+                                "status": "playing", "playing": True})
+        out = A._act_music_status("")
+        self.assertIn("nothing is playing in it", out)
+        self.assertNotIn("app is running, sir — Episode 3", out)
+
+    def test_store_app_session_is_the_apps(self):
+        self.patch_apple_music_app(running=True, now_playing=None)
+        self.pin_smtc_snapshot({"app": "Apple Music", "title": "Thriller",
+                                "artist": "Michael Jackson", "status": "paused",
+                                "playing": False})
+        self.assertEqual(A._act_music_status(""),
+                         "The Apple Music app is running, sir — Thriller by "
+                         "Michael Jackson is paused in Apple Music.")
 
     def test_store_app_running_with_now_playing(self):
         self.patch_apple_music_app(running=True, now_playing="Thriller")
@@ -1043,6 +1178,25 @@ class CloseBrowserTabTests(_BaseActTest):
         A._act_close_window("Lo-fi beats - YouTube - Google Chrome")
         self.assertFalse(w.closed)
         self.bc.ui_hotkey.assert_called_once_with("ctrl", "w")
+
+    def test_matching_only_the_browser_suffix_closes_nothing(self):
+        # 2026-10-01 review: "close Google" matched " - Google Chrome" and
+        # WM_CLOSEd every tab while YouTube was in front.
+        w = self._chrome("Lo-fi beats - YouTube - Google Chrome")
+        self.bc._find_windows_by_title.return_value = [w]
+        self.bc._read_focused_window.return_value = (0x1234, w.title, None)
+        out = A._act_close_window("google")
+        self.assertFalse(w.closed, "closed the whole browser window")
+        self.bc.ui_hotkey.assert_not_called()
+        self.assertIn("didn't close", out)
+        self.assertIn("only matched the browser's own name", out)
+
+    def test_the_browsers_full_name_still_closes_the_window(self):
+        w = self._chrome("Lo-fi beats - YouTube - Google Chrome")
+        self.bc._find_windows_by_title.return_value = [w]
+        out = A._act_close_window("Google Chrome")
+        self.assertTrue(w.closed)
+        self.bc.ui_hotkey.assert_not_called()
 
     def test_non_browser_windows_still_close(self):
         note = _FakeWindow(title="youtube notes.txt - Notepad")

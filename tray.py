@@ -2387,7 +2387,9 @@ def _on_open_apple_music(icon, item):
     """Open Apple Music in the default browser (the web player). The owner
     listens in Chrome; the old route launched the Store app by AUMID, which he
     doesn't use. Override the URL with JARVIS_APPLE_MUSIC_URL. The voice action
-    'open Apple Music' is unchanged."""
+    'open Apple Music' opens the same page (core/actions.py's
+    _APPLE_MUSIC_WEB_URL, kept equal to APPLE_MUSIC_WEB_URL by a test) through
+    JARVIS's real-browser opener (2026-10-01)."""
     url = _apple_music_url()
     try:
         import webbrowser

@@ -2733,6 +2733,30 @@ class OpenOnMonitorTests(unittest.TestCase):
         self.assertFalse(after.maximized)
         self.assertIn("couldn't find new window", out)
 
+    def test_a_reused_window_ends_the_wait_early_and_is_not_moved(self):
+        # 2026-10-01 review: a single-instance app (VS Code) reuses its open
+        # window, so no fresh window ever appears; the handler waited the
+        # full 15 s and then said it found nothing. It now stops after the
+        # reuse grace and names the window it could move, without moving it.
+        bc = self._bc()
+        existing = _FakeWindow("main.py - Visual Studio Code")
+        existing._hWnd = 0x100
+        gw = self._gw_sequence([[existing]])
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", self.MONS), \
+                mock.patch.dict(sys.modules, {"pygetwindow": gw}), \
+                mock.patch.object(A, "_act_launch_app", return_value="launched"), \
+                mock.patch.object(A.time, "sleep") as sleep, \
+                mock.patch.object(A.time, "time", _clock(step=0.1)):
+            out = A._act_open_on_monitor("left | code")
+        self.assertFalse(existing.maximized)
+        self.assertIsNone(existing.moved_to)
+        self.assertIn("reused your existing 'main.py - Visual Studio Code'", out)
+        self.assertIn("move", out)
+        # Stopped at the reuse grace, well before the 15 s deadline.
+        polls = [c for c in sleep.call_args_list if c.args == (0.2,)]
+        self.assertLess(len(polls), 40)
+
 
 # ===========================================================================
 # _act_move_window_to_monitor  (imports win32gui/win32con -> injected fakes)

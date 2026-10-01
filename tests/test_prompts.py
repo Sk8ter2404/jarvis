@@ -250,5 +250,32 @@ class OvernightUpgradePromptHonestyTests(unittest.TestCase):
         self.assertIn("do NOT promise new features", self.block)
 
 
+class MediaTransportPromptTests(unittest.TestCase):
+    """2026-10-01 (actions-a review): pause_music / resume_music / next_song /
+    previous_song drive the Windows media session and never fall back to a
+    key. A stale NOTE ~80 lines below the rewritten transport text still said
+    they "use OS MEDIA KEYS" and that media_next / media_prev /
+    media_playpause "are equivalent - use either", and the example taught a
+    bare 'pause' -> media_playpause: a blind toggle that STARTS a paused
+    player, and the LLM's natural retry after a reported transport failure."""
+
+    def test_the_stale_equivalence_is_gone(self):
+        self.assertNotIn("OS MEDIA KEYS", PC_CONTROL_PROMPT)
+        self.assertNotIn("are equivalent", PC_CONTROL_PROMPT)
+        self.assertNotIn("both press the OS skip key", PC_CONTROL_PROMPT)
+        self.assertNotIn("→ [ACTION: media_playpause]", PC_CONTROL_PROMPT)
+
+    def test_bare_pause_routes_to_pause_music(self):
+        self.assertIn("'pause' / 'pause it'             → [ACTION: pause_music]",
+                      PC_CONTROL_PROMPT)
+
+    def test_no_retry_with_a_media_key(self):
+        self.assertIn("NEVER retry a transport action with a media_* key",
+                      PC_CONTROL_PROMPT)
+
+    def test_close_window_asks_instead_of_closing_the_browser(self):
+        self.assertIn("never retry with the", PC_CONTROL_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()

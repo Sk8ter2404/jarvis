@@ -1512,6 +1512,17 @@ class LocalCheatsheetTests(MonolithGlobalsTestCase):
         cal_line = out[cal_idx:out.find("\n", cal_idx)]
         self.assertIn("calendar", cal_line.lower())
 
+    def test_media_keys_are_taught_as_toggles_not_a_transport_fallback(self):
+        # 2026-10-01 review: pause_music & co. drive the media session and
+        # never fall back to a key; a bare media_* line next to them read as
+        # an equivalent the local brain could retry with after a failure.
+        with mock.patch.object(self.bc, "ACTIONS", {}):
+            out = self.bc._local_cheatsheet()
+        idx = out.index("[ACTION: media_playpause]")
+        line = out[idx:out.find("\n", idx)]
+        self.assertIn("TOGGLES", line)
+        self.assertIn("never a retry", line)
+
     def test_monitor_actions_teach_the_handlers_argument_order(self):
         # 2026-10-01 (with B092): the local brain's cheatsheet taught
         # open_on_monitor as '<app or url> | <monitor>' (the handler parses

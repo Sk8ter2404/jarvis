@@ -455,6 +455,105 @@ class ArmedByBehaviourTests(_Armed):
                          "mock.patch must restore the guard's stub")
 
 
+# ─── un-audited real-world effects (COM / WinRT), 2026-10-01 ──────────────
+# volume_mute / volume_unmute / set_volume (pycaw) and pause / resume / next /
+# previous (the Windows media session) replaced media KEYS, which the input
+# guard refused, with COM / WinRT calls no audit event covers: an unpinned
+# test would really mute the owner's speakers or pause his media.
+
+class EffectTargetsTests(_Armed):
+
+    def test_the_two_effects_are_targets(self):
+        self.assertIn(("core.media_now_playing", None, "_default_transport"),
+                      hg._EFFECT_TARGETS)
+        self.assertIn(("pycaw.utils", "AudioUtilities", "GetSpeakers"),
+                      hg._EFFECT_TARGETS)
+
+    def test_the_real_media_transport_is_refused_before_it_runs(self):
+        self.require_armed("input")
+        import core.media_now_playing as mnp
+        self.assertTrue(hg._marked(mnp._default_transport))
+        with _ledger_restored(), \
+                mock.patch.object(mnp, "_transport_async",
+                                  side_effect=AssertionError("reached WinRT")):
+            with self.assertRaises(hg.InputGuardError):
+                mnp._default_transport("pause", ())
+            # transport() turns the refusal into an honest "failed".
+            self.assertEqual(mnp.transport("next", runner=mnp._default_transport),
+                             ("failed", None))
+        self.assertEqual(hg.unwrapped_effects(), [])
+
+    def test_a_patched_target_reports_unarmed_and_is_restored(self):
+        import core.media_now_playing as mnp
+        with mock.patch.object(mnp, "_default_transport"):
+            self.assertIn("core.media_now_playing._default_transport",
+                          hg.unwrapped_effects())
+        self.assertEqual(hg.unwrapped_effects(), [],
+                         "mock.patch must restore the guard's stub")
+
+    def test_a_module_imported_later_is_wrapped_and_a_fake_never_is(self):
+        import importlib
+        import tempfile
+        import types
+        tmp = tempfile.mkdtemp()
+        modname = "_hg_effect_probe_mod"
+        with open(os.path.join(tmp, modname + ".py"), "w", encoding="utf-8") as fh:
+            fh.write("class Util:\n"
+                     "    @staticmethod\n"
+                     "    def Speakers():\n"
+                     "        return 'real'\n")
+        targets = hg._EFFECT_TARGETS + ((modname, "Util", "Speakers"),)
+        sys.path.insert(0, tmp)
+        try:
+            with mock.patch.object(hg, "_EFFECT_TARGETS", targets), \
+                    mock.patch.object(hg, "_EFFECT_MODULES",
+                                      frozenset(t[0] for t in targets)):
+                fake = types.ModuleType(modname)
+                fake.Util = type("Util", (), {"Speakers": staticmethod(lambda: "fake")})
+                with mock.patch.dict(sys.modules, {modname: fake}):
+                    mod = importlib.import_module(modname)
+                    self.assertIs(mod, fake)
+                    self.assertFalse(hg._marked(mod.Util.Speakers))
+                sys.modules.pop(modname, None)
+                mod = importlib.import_module(modname)
+                self.assertTrue(hg._marked(mod.Util.Speakers),
+                                "the real module was not wrapped on import")
+                with _ledger_restored(), hg.allow("input"):
+                    self.assertEqual(mod.Util.Speakers(), "real")
+                if "input" not in hg.unarmed_guards():
+                    with _ledger_restored(), self.assertRaises(hg.InputGuardError):
+                        mod.Util.Speakers()
+        finally:
+            sys.path.remove(tmp)
+            sys.modules.pop(modname, None)
+            hg._effect_modules.pop(modname, None)
+
+    def test_real_pycaw_get_speakers_is_wrapped_in_a_fresh_process(self):
+        # Proven in a child process: importing the real pycaw here would
+        # CoInitialize this thread. The child never reaches COM - the stub
+        # refuses first.
+        import importlib.util
+        if sys.platform != "win32" or importlib.util.find_spec("pycaw") is None:
+            self.skipTest("pycaw is not installed here")
+        code = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "from tools import hermetic_guard as hg\n"
+            "hg.install(quiet=True)\n"
+            "from pycaw.pycaw import AudioUtilities\n"
+            "assert hg._marked(AudioUtilities.GetSpeakers), 'not wrapped'\n"
+            "try:\n"
+            "    AudioUtilities.GetSpeakers()\n"
+            "except hg.InputGuardError:\n"
+            "    hg.reset(); print('REFUSED')\n"
+        ) % _PROJECT_ROOT
+        env = {k: v for k, v in os.environ.items()
+               if k not in hg.ENV_ESCAPES.values()}
+        out = subprocess.run([sys.executable, "-B", "-c", code], env=env,
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr[-800:])
+        self.assertIn("REFUSED", out.stdout)
+
+
 # ─── real calls, refused before anything leaves the process ────────────────
 
 class RealCallTests(_Armed):

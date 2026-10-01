@@ -39,7 +39,7 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
 - **List / focus / minimize / close windows**
   - "minimize Chrome", "close the Bambu Studio window", "bring VS Code to the front", "list every open window"
   - Actions: `list_windows`, `focus_window`, `minimize_window`, `close_window`
-  - Closing by a site name ("close YouTube") closes just that browser tab; name the browser ("close Chrome") to close its whole window.
+  - Closing by a site name ("close YouTube") closes just that browser tab; name the browser ("close Chrome") to close its whole window. A word that only matches the browser's own name ("close Google" while YouTube is in front) closes nothing and asks.
 - **Open app on a specific monitor / move existing window** — uses win32 to set position directly, no fragile hotkeys.
   - "open YouTube on the right monitor", "put Chrome on the left monitor", "move Bambu Studio to the top monitor"
   - Actions: `open_on_monitor`, `move_window_to_monitor`
@@ -71,8 +71,10 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
 - **Streaming services** — opens the service, clicks first result, clicks play in one action.
   - "play Stranger Things on Netflix", "put on The Bear on Hulu", "play Bohemian Rhapsody on Spotify", "Succession on Max"
   - Actions: `netflix`, `prime_video`, `disney_plus`, `hulu`, `max`, `spotify`, `apple_music`, `youtube_play`, `play_streaming`
-- **Media keys** — go to whatever app holds media focus; use these when playing in a browser.
-  - "skip this song", "pause", "play"
+- **Pause / resume / skip** — drive the Windows media session of the music player (the Apple Music web player first, then the app): pause only pauses, resume only resumes, and "next song" never skips a video playing in the same browser.
+  - "pause", "resume the music", "skip this song", "previous track"
+  - Actions: `pause_music`, `resume_music`, `next_song`, `previous_song`
+- **Media keys** — raw toggles sent to whatever app holds media focus; only for an explicit "press the play/pause key".
   - Actions: `media_next`, `media_prev`, `media_playpause`
 - **Volume control** — system-wide. Mute and unmute set the state (saying "mute" twice never unmutes).
   - "turn it down", "volume up", "mute", "unmute"

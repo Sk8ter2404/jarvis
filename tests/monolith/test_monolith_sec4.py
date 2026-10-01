@@ -2077,6 +2077,27 @@ class AppleMusicChromeActiveTests(MonolithGlobalsTestCase):
         with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
             self.assertTrue(self.bc._apple_music_chrome_active())
 
+    def test_web_player_titles_are_the_live_scan_only(self):
+        # 2026-10-01 review: music_status / open_apple_music / the transport
+        # chooser need "open NOW", not the 5-minute sighting cache, and the
+        # web player's tab title (it names the playing track).
+        store = mock.MagicMock()
+        store.title = "Apple Music"
+        web = mock.MagicMock()
+        web.title = "Billie Jean - Apple Music - Google Chrome"
+        gw = mock.MagicMock()
+        gw.getAllWindows.return_value = [store, web]
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertEqual(self.bc._apple_music_web_player_titles(),
+                             ["Billie Jean - Apple Music - Google Chrome"])
+        gw.getAllWindows.return_value = []
+        self.bc._apple_music_last_seen[0] = time.time()   # warm cache
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertEqual(self.bc._apple_music_web_player_titles(), [])
+            self.assertTrue(self.bc._apple_music_chrome_active())  # the cache
+        with mock.patch.dict(sys.modules, {"pygetwindow": None}):
+            self.assertEqual(self.bc._apple_music_web_player_titles(), [])
+
     def test_browser_title_predicate(self):
         f = self.bc._is_apple_music_browser_title
         self.assertTrue(f("Apple Music - Web Player - Google Chrome"))

@@ -286,7 +286,10 @@ def _set_system_mute(want_muted: bool) -> str:
     pag = _bc()._get_pyautogui()
     if pag:
         pag.press("volumemute")
-        return ("mute key pressed — I couldn't read the mute state, so it "
+        # No failure-marker words here (core/failure_markers.py): a "failed"
+        # result re-prompts the LLM, which could send volume_mute again and
+        # toggle the key a second time (2026-10-01, actions-a review).
+        return ("mute key pressed — the mute state wasn't readable, so it "
                 "may have toggled the other way, sir")
     return "pyautogui unavailable"
 
@@ -807,7 +810,9 @@ _APPLE_MUSIC_LAUNCH_ALIASES = frozenset({
 
 # The Apple Music web player, the owner's player. Same default and the same
 # JARVIS_APPLE_MUSIC_URL override as tray.py's APPLE_MUSIC_WEB_URL (the tray's
-# "Open Apple Music" item), so voice and tray open the same page.
+# "Open Apple Music" item), so voice and tray open the same page. Not imported
+# from tray.py (the tray is its own process and module); a test keeps the two
+# equal.
 _APPLE_MUSIC_WEB_URL = "https://music.apple.com/"
 
 
@@ -882,6 +887,18 @@ _TRANSPORT_REPLIES = {
 }
 
 
+def _web_player_titles(bc) -> tuple:
+    """The live Apple Music web-player window titles (the monolith's
+    _apple_music_web_player_titles), or () when unreadable. Never raises."""
+    try:
+        titles = bc._apple_music_web_player_titles()
+    except Exception:
+        return ()
+    if not isinstance(titles, (list, tuple)):
+        return ()
+    return tuple(t for t in titles if isinstance(t, str) and t)
+
+
 def _smtc_transport_reply(op: str) -> "str | None":
     """Drive pause/resume/next/previous through the Windows media session
     (SMTC) and return the spoken result, or None when SMTC is unavailable
@@ -896,7 +913,7 @@ def _smtc_transport_reply(op: str) -> "str | None":
     a window just to send a key."""
     try:
         from core.media_now_playing import transport as _smtc_transport
-        res = _smtc_transport(op)
+        res = _smtc_transport(op, web_player_titles=_web_player_titles(_bc()))
     except Exception:
         return None
     if res is None:
@@ -905,6 +922,11 @@ def _smtc_transport_reply(op: str) -> "str | None":
     app = app or "the media player"
     if outcome == "none":
         return _NOTHING_PLAYING_MSG
+    if outcome == "not_music":
+        # next/prev with only a browser VIDEO to skip (2026-10-01 review):
+        # skipping it would jump the HBO / YouTube video to its next episode.
+        return (f"What's playing in {app} doesn't look like music, sir, so I "
+                f"left it alone.")
     if outcome == "failed":
         if app == "the media player":
             return "I couldn't reach the Windows media controls, sir."
@@ -1016,6 +1038,12 @@ def _act_open_apple_music(_: str = "") -> str:
     registers itself as the music.apple.com handler, so the default handler
     can open the app instead of the page."""
     bc = _bc()
+    # Already open in a browser window right now: don't stack another tab or
+    # window on it (each one muddies the later media-session / title reads).
+    # The LIVE scan only: the 5-minute sighting cache would refuse to reopen
+    # a player the owner closed a minute ago. (2026-10-01, actions-a review.)
+    if _web_player_titles(bc):
+        return "Apple Music is already open in the browser, sir."
     url = _apple_music_web_url()
     try:
         how = bc._open_url_in_browser(url)
@@ -1035,14 +1063,22 @@ def _act_music_status(_: str = "") -> str:
     running" while the web player played, and "running, now playing <some
     Chrome tab's title>" when the app was open. Sources now go in the owner's
     order: the Windows media session (what is really playing, any player),
-    the browser web player, and only then the Store app."""
+    the browser web player, and only then the Store app.
+
+    2026-10-01 (actions-a review): the media session is only called Apple
+    Music's when it IS the web player (core.media_now_playing's
+    is_web_player_session) or the Store app — an HBO video in the same
+    Chrome is named as what it is, never as Apple Music's track. And "open
+    in the browser" means a live web-player window; a sighting from the
+    5-minute cache is reported as just that."""
     bc = _bc()
-    playing = None
     try:
         from core.media_now_playing import get_now_playing as _smtc_get
+        from core.media_now_playing import is_web_player_session as _is_web
         snap = _smtc_get()
     except Exception:
-        snap = None
+        snap, _is_web = None, None
+    playing = None
     if snap and snap.get("title"):
         what = snap["title"]
         if snap.get("artist"):
@@ -1050,13 +1086,26 @@ def _act_music_status(_: str = "") -> str:
         verb = "playing" if snap.get("playing") else "paused"
         playing = f"{what} is {verb} in {snap.get('app') or 'your media player'}"
 
+    live = _web_player_titles(bc)
     try:
-        web = bool(bc._apple_music_chrome_active())
+        snap_web = bool(playing and _is_web and _is_web(snap, live))
     except Exception:
-        web = False
-    if web:
-        if playing:
-            return f"Apple Music is open in the browser, sir — {playing}."
+        snap_web = False
+    snap_app = bool(playing and snap.get("app") == "Apple Music")
+
+    head = None
+    if live:
+        head = "Apple Music is open in the browser, sir"
+    else:
+        try:
+            recent = bool(bc._apple_music_chrome_active())
+        except Exception:
+            recent = False
+        if recent:
+            head = "I saw Apple Music in the browser a few minutes ago, sir"
+    if head:
+        if snap_web:
+            return f"{head} — {playing}."
         for reader in ("_apple_music_title_now_playing",
                        "_apple_music_loaded_track_from_title"):
             try:
@@ -1064,10 +1113,11 @@ def _act_music_status(_: str = "") -> str:
             except Exception:
                 track = None
             if track:
-                return (f"Apple Music is open in the browser, sir — now "
-                        f"playing {track}.")
-        return ("Apple Music is open in the browser, sir, but nothing is "
-                "playing right now.")
+                return f"{head} — now playing {track}."
+        other = f" — {playing}" if playing else ""
+        return f"{head}, but nothing is playing in it right now{other}."
+    if snap_web:
+        return f"{playing}, sir — that looks like the Apple Music web player."
 
     amapp = _apple_music_app()
     try:
@@ -1075,7 +1125,7 @@ def _act_music_status(_: str = "") -> str:
     except Exception:
         running = False
     if running:
-        if playing:
+        if snap_app:
             return f"The Apple Music app is running, sir — {playing}."
         try:
             np = amapp.now_playing()
@@ -1083,8 +1133,9 @@ def _act_music_status(_: str = "") -> str:
             np = None
         if np:
             return f"The Apple Music app is running, sir — now playing {np}."
+        other = f" — {playing}" if playing else ""
         return ("The Apple Music app is running, sir, but nothing is playing "
-                "right now.")
+                f"in it right now{other}.")
     if playing:
         return f"Apple Music isn't open, sir — but {playing}."
     return ("Apple Music isn't open, sir — say 'open Apple Music' and I'll "
@@ -1195,6 +1246,7 @@ def _act_close_window(query: str) -> str:
     closed = []
     tabs = []
     skipped = []
+    browser_only = []
     for w in matches:
         # Defence in depth: also check the actual window title we found
         if any(target in (w.title or "").lower() for target in bc.FORBIDDEN_TARGETS):
@@ -1211,6 +1263,13 @@ def _act_close_window(query: str) -> str:
             ok = _close_browser_tab(bc, w)
             (tabs if ok else skipped).append(w.title)
             continue
+        # Matched ONLY through the browser's own suffix, and the query
+        # doesn't name a browser: "close Google" matched " - Google Chrome"
+        # and WM_CLOSEd every tab while YouTube was in front (2026-10-01,
+        # actions-a review). Close nothing; ask.
+        if page is not None and not _query_names_browser(query):
+            browser_only.append(w.title)
+            continue
         try:
             w.close()
             closed.append(w.title)
@@ -1225,7 +1284,31 @@ def _act_close_window(query: str) -> str:
     if skipped:
         parts.append("couldn't bring " + ", ".join(repr(t) for t in skipped)
                      + " to the front, so I left that window open")
+    if browser_only:
+        # Worded as a failure on purpose: the follow-up loop then reports it
+        # (and the prompt tells the LLM to ASK, not to retry with the
+        # browser's name), instead of a silent "Done.".
+        parts.append("didn't close " + ", ".join(repr(t) for t in browser_only)
+                     + f" — '{query.strip()}' only matched the browser's own "
+                     "name, and closing that window would close every tab in "
+                     "it. Say 'close Chrome' (or the browser's name) for the "
+                     "whole window, or name the tab")
     return "; ".join(parts) if parts else "could not close"
+
+
+# Words that name a browser itself: only these close a WHOLE browser window
+# when the query matched nothing but the window's browser suffix.
+_BROWSER_NAME_WORDS = frozenset({
+    "chrome", "edge", "firefox", "mozilla", "brave", "opera", "vivaldi",
+    "chromium", "browser",
+})
+
+
+def _query_names_browser(query: str) -> bool:
+    """True when ``query`` names a browser ("chrome", "close the browser"),
+    so closing the whole browser window is what was asked for."""
+    words = re.findall(r"[a-z]+", (query or "").lower())
+    return any(w in _BROWSER_NAME_WORDS for w in words)
 
 
 def _browser_page_title(bc, title: str) -> "str | None":
@@ -3144,6 +3227,9 @@ _YOUTUBE_SEARCH_RE = re.compile(r"^(?:youtube|you tube)\s+(?:for\s+)?(.+)$", re.
 # Seconds open_on_monitor waits for a fresh window whose title MATCHES the
 # target before settling for a fresh window that doesn't (yet).
 _OPEN_ON_MONITOR_GRACE_S = 2.0
+# Seconds with no fresh window, while a pre-existing window matches the
+# target, before open_on_monitor concludes the app reused that window.
+_OPEN_ON_MONITOR_REUSE_S = 4.0
 
 
 def _window_key(w):
@@ -3213,13 +3299,18 @@ def _act_open_on_monitor(args: str) -> str:
 
     new_window = None
     fallback = None   # a FRESH window that doesn't (yet) match the target
+    reused = None     # a PRE-EXISTING window that matches the target
     started = time.time()
     deadline = started + 15.0
     while time.time() < deadline:
         time.sleep(0.2)
         fresh = []
         for w in gw.getAllWindows():
-            if not w.title or _window_key(w) in hwnds_before:
+            if not w.title:
+                continue
+            if _window_key(w) in hwnds_before:
+                if reused is None and _matches_target(w.title):
+                    reused = w
                 continue
             try:
                 if w.width < 200 or w.height < 200:
@@ -3238,9 +3329,23 @@ def _act_open_on_monitor(args: str) -> str:
         # take the fresh window we saw instead of waiting out the deadline.
         if fallback is not None and time.time() - started >= _OPEN_ON_MONITOR_GRACE_S:
             break
+        # Single-instance apps (VS Code, Spotify, Teams) and a URL that
+        # became a tab reuse a window that was already open: no fresh window
+        # will ever come, and waiting out the full 15 s only to say so was a
+        # UX regression (2026-10-01, actions-a review). Stop early and offer
+        # the move instead of making it: that window may be the owner's
+        # stream (B092).
+        if (fallback is None and reused is not None
+                and time.time() - started >= _OPEN_ON_MONITOR_REUSE_S):
+            break
     if new_window is None:
         new_window = fallback   # still a window from AFTER the launch, never before
 
+    if not new_window and reused is not None:
+        return (f"launched {target}, but it reused your existing "
+                f"'{reused.title}' window rather than opening a new one, so "
+                f"I didn't move it — ask me to move '{reused.title}' to the "
+                f"{monitor_name} monitor if you want it there")
     if not new_window:
         return (f"launched {target}, but couldn't find new window to move it "
                 f"— if it reused a window that was already open, ask me to "
