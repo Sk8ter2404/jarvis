@@ -87,7 +87,9 @@ def _join_wrapped_headers(lines: List[str]) -> List[str]:
 # Which lowercase keywords pull in each section. Keyed by the section header text
 # (without the trailing colon, upper-cased) — matched leniently by substring of
 # the header so exact punctuation need not match. A turn includes a section if
-# ANY of its keywords appears in the (lowercased) user text. Keep these generous:
+# ANY of its keywords appears in the (lowercased) user text AT THE START OF A
+# WORD (see _keyword_hit: "phone" no longer fires inside "microphone"; a
+# keyword may still run on, "print" -> "printing"). Keep these generous:
 # a false include costs a few hundred tokens; a false exclude is caught by the
 # INDEX. Sections with no entry here are treated as niche (index-only unless the
 # header words themselves appear).
@@ -161,9 +163,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # anywhere and the un-anchored turn-it-down/up phrasings only matched
         # the dispatcher's anchored fast-paths (2026-07-21 audit).
         "mute", "turn it down", "turn it up",
-        # 2026-10-01: volume_unmute's own example ('turn the sound back on');
-        # "unmute" already contains "mute".
-        "sound back on",
+        # 2026-10-01: volume_unmute's own example ('turn the sound back on').
+        # "unmute" needs its own entry: keywords match at a word start now,
+        # so "mute" no longer fires inside it.
+        "sound back on", "unmute",
     ],
     "AUDIO OUTPUT DEVICE": [
         "headset", "headphones", "speakers", "output device", "switch audio",
@@ -349,6 +352,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "voice", "tts", "speak like", "sound like", "british", "accent",
         "switch voice", "your voice", "talk like", "edge", "clone voice",
         "kokoro",
+        # The other two backends this body lists ('switch to xtts' is its own
+        # arrow example). They only ever routed by "tts" firing mid-word.
+        "xtts", "pyttsx3", "pyttsx",
     ],
     "VOICE ENROLLMENT / SPEAKER ID": [
         "enroll", "my voice", "learn my voice", "who am i", "speaker",
@@ -802,6 +808,53 @@ _CONVERSION_NEUTRAL_KEYWORDS = frozenset({
 })
 
 
+# Short keywords ("tv", "ram", "hot", "mic", "bed", "obs", "lan") may only take
+# a plural after them; longer ones may run on freely (see _keyword_hit).
+_SHORT_KEYWORD_LEN = 3
+_SHORT_KEYWORD_TAILS = ("", "s", "es")
+
+
+def _keyword_hit(kw: str, low: str) -> bool:
+    """True when ``kw`` occurs in ``low`` (the space-padded, lower-cased turn)
+    starting at a WORD BOUNDARY.
+
+    The router used to test ``kw in low`` — a bare substring — so a keyword
+    that began mid-word routed a section the turn never named (2026-10-01):
+    "phone" inside "microphone" loaded PHONE NOTIFICATIONS + PHONE BRIDGE on
+    every microphone question, "face" inside "interface" FACE RECOGNITION on
+    every web-interface turn, "hot" inside "hotword" / "screenshot" SYSTEM
+    HEALTH, "lan" inside "plans" the network section, "hbo" inside
+    "dashboard" STREAMING SERVICES. A keyword now has to START a word (or
+    itself start with a non-alphanumeric, like the deliberate " c drive").
+
+    The END is still open, because many keywords are stems by design ("print"
+    -> "printing", "remind" -> "reminders", "throttl", "auto switch" ->
+    "auto switching"): except for a SHORT keyword (<= _SHORT_KEYWORD_LEN
+    alphanumerics), which may only take a plural ("tv" -> "tvs", "ram" ->
+    "ram's") — never "hot" -> "hotword", "mic" -> "michael", "ram" ->
+    "random", "bed" -> "bedroom". Multi-word phrases follow the same rule at
+    their first and last word. Never raises."""
+    if not kw or not low:
+        return False
+    n = len(kw)
+    short = n <= _SHORT_KEYWORD_LEN and kw.isalnum()
+    start = 0
+    while True:
+        i = low.find(kw, start)
+        if i < 0:
+            return False
+        start = i + 1
+        if kw[0].isalnum() and i > 0 and low[i - 1].isalnum():
+            continue                        # begins mid-word
+        if short:
+            j = k = i + n
+            while k < len(low) and low[k].isalnum():
+                k += 1
+            if low[j:k] not in _SHORT_KEYWORD_TAILS:
+                continue                    # "hot" -> "hotword"
+        return True
+
+
 def select_sections(user_text: str, sections: List[Tuple[str, str]]) -> Tuple[List[str], List[str]]:
     """Return (included_section_names, dropped_section_names) for `user_text`."""
     low = " " + (user_text or "").lower() + " "
@@ -815,14 +868,17 @@ def select_sections(user_text: str, sections: List[Tuple[str, str]]) -> Tuple[Li
         hit = name.upper() in _ALWAYS
         if not hit:
             # header words present in the query? (generic ones never count
-            # on their own -- see _GENERIC_HEADER_WORDS)
+            # on their own -- see _GENERIC_HEADER_WORDS). Word-start matched
+            # like the keywords: the old " w" / "w " test also took a match
+            # at the END of a longer word ("yourself" loaded every SELF-*
+            # section, "tonight" NIGHT-OWL MODE, "unread" STATUS READ-BACKS).
             words = [w for w in re.split(r"[^a-z0-9]+", name.lower())
                      if len(w) > 3 and w not in _GENERIC_HEADER_WORDS]
-            if any(f" {w}" in low or f"{w} " in low for w in words):
+            if any(_keyword_hit(w, low) for w in words):
                 hit = True
         if not hit:
             for kw in _keywords_for(name):
-                if kw in low and kw not in neutral:
+                if kw not in neutral and _keyword_hit(kw, low):
                     hit = True
                     break
         (included if hit else dropped).append(name)

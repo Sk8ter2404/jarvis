@@ -1176,3 +1176,96 @@ class ReplayRoutingRegressionTests(unittest.TestCase):
                 inc, _ = pr.select_sections(q, self.sections)
                 for h in self.homes:
                     self.assertIn(h, inc)
+
+
+class WordBoundaryKeywordRoutingTests(unittest.TestCase):
+    """2026-10-01: keywords matched as bare SUBSTRINGS, so a keyword that
+    started mid-word routed a section the turn never named: "phone" inside
+    "microphone" loaded PHONE NOTIFICATIONS + PHONE BRIDGE on every mic
+    question (the 2026-09-04 what_microphone near-miss), "face" inside
+    "interface" loaded FACE RECOGNITION on every web-interface turn, "hot"
+    inside "hotword" / "screenshot" loaded SYSTEM HEALTH. A keyword now has to
+    START a word; it may still run on ("print" -> "printing", "auto switch"
+    -> "auto switching"), except a short (<= 3 character) one, which may only
+    take a plural ("tv" -> "tvs", never "hot" -> "hotword")."""
+
+    def setUp(self):
+        _core, self.sections = pr.split_pc_control(FULL)
+
+    def _inc(self, q):
+        return pr.select_sections(q, self.sections)[0]
+
+    def test_microphone_does_not_load_the_phone_sections(self):
+        for q in ("what microphone are you using", "is my microphone working",
+                  "test your microphone"):
+            with self.subTest(q=q):
+                inc = self._inc(q)
+                self.assertNotIn("PHONE NOTIFICATIONS", inc)
+                self.assertNotIn("PHONE BRIDGE", inc)
+                self.assertTrue(any(h.startswith("AUDIO DEVICES") for h in inc),
+                                f"{q!r} lost its own section: {inc}")
+
+    def test_a_real_phone_turn_still_loads_the_phone_sections(self):
+        for q in ("send that to my phone", "notify my phone when it finishes",
+                  "push it to my phones"):
+            with self.subTest(q=q):
+                self.assertIn("PHONE NOTIFICATIONS", self._inc(q))
+
+    def test_mid_word_keywords_no_longer_fire(self):
+        for q, wrong in (("is the web interface on", "FACE RECOGNITION"),
+                         ("stop the hotword", "SYSTEM HEALTH"),
+                         ("screenshot the browser", "SYSTEM HEALTH"),
+                         ("any plans this weekend", "NETWORK / LAN PRESENCE"),
+                         ("turn on the web dashboard", "STREAMING SERVICES"),
+                         ("check Teams", "BAMBU 3D PRINTER"),
+                         ("unit conversion", "CHANGELOG / VERSION"),
+                         ("pick a random song", "SYSTEM HEALTH"),
+                         ("put on the Michael Jackson playlist",
+                          "AUDIO DEVICES — WHICH MICROPHONE AND SPEAKERS ARE IN USE")):
+            with self.subTest(q=q):
+                self.assertNotIn(wrong, self._inc(q))
+
+    def test_word_start_matches_keep_their_suffixes(self):
+        for q, want in (("is it printing", "BAMBU 3D PRINTER"),
+                        ("is auto switching on", "AUDIO OUTPUT DEVICE"),
+                        ("cancel my reminders", "TIMERS / REMINDERS"),
+                        ("is the gpu throttling", "SYSTEM HEALTH"),
+                        ("are the tvs on", "TV DETECTION"),
+                        ("what's eating my ram", "SYSTEM HEALTH"),
+                        ("what's using my ram's headroom", "SYSTEM HEALTH")):
+            with self.subTest(q=q):
+                self.assertIn(want, self._inc(q))
+
+    def test_keywords_that_relied_on_a_mid_word_hit_got_their_own_entry(self):
+        # The only two intended matches the substring rule made: "unmute"
+        # (via "mute") and "xtts" (via "tts"). Both are arrow examples.
+        self.assertIn("MUSIC CONTROLS", self._inc("unmute"))
+        self.assertIn("TTS BACKEND SWITCHING", self._inc("switch to xtts"))
+        self.assertIn("TTS BACKEND SWITCHING", self._inc("use pyttsx3"))
+
+    def test_header_words_also_need_a_word_start(self):
+        # The header-word fallback accepted a match at EITHER edge, so
+        # "yourself" loaded every SELF-* section and "tonight" NIGHT-OWL MODE.
+        for q, wrong in (("restart yourself", "SELF-PRESERVATION"),
+                         ("restart yourself", "SELF-TEST PROBES"),
+                         ("is it going to rain tonight", "NIGHT-OWL MODE")):
+            with self.subTest(q=q, wrong=wrong):
+                self.assertNotIn(wrong, self._inc(q))
+        self.assertIn("NIGHT-OWL MODE", self._inc("night owl mode on"))
+
+    def test_keyword_hit_edges(self):
+        hit = pr._keyword_hit
+        self.assertTrue(hit("phone", " my phone "))
+        self.assertFalse(hit("phone", " microphone "))
+        self.assertTrue(hit("phone", " phone, please "))
+        self.assertTrue(hit("print", " printing "))
+        self.assertTrue(hit("tv", " tvs "))
+        self.assertFalse(hit("hot", " hotword "))
+        self.assertTrue(hit("hot", " too hot! "))
+        self.assertTrue(hit(" c drive", " my c drive "))
+        self.assertFalse(hit(" c drive", " music drive "))
+        self.assertTrue(hit("keep apple music", " keep apple music open "))
+        self.assertTrue(hit("disney+", " watch disney+ now "))
+        self.assertFalse(hit("", " anything "))
+        # A later word-start occurrence still counts after a mid-word one.
+        self.assertTrue(hit("phone", " microphone or phone "))
