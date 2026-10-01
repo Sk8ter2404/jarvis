@@ -2492,6 +2492,12 @@ def _act_see_screen(question: str) -> str:
 
 # ─── Replay last non-destructive action (Phase 4H) ─────────────────────
 
+# "do that again" re-fires only an action this recent (seconds). Two minutes
+# covers "do that again on the left monitor" right after the first run, and
+# no more (2026-10-01).
+_REPLAY_MAX_AGE_S = 120.0
+
+
 def _act_replay_last_action(arg: str = "") -> str:
     """Re-fire the most recent non-destructive action.
 
@@ -2503,6 +2509,12 @@ def _act_replay_last_action(arg: str = "") -> str:
     Destructive actions (close_window, kill_process, restart, upgrade,
     start_overnight_upgrade, run_shell) are refused — the user must re-issue
     the command so it goes through the normal confirmation/pushback path.
+
+    Only a RECENT action replays (2026-10-01): the history kept no age limit,
+    so "do that again" could re-fire whatever ran hours earlier. A draft send
+    is refused too: this path calls the handler directly, past the read-back
+    gate parse_and_run_actions applies (the monolith also stops recording
+    them; this is the second lock on the same door).
     """
     bc = _bc()
     with bc._action_history_lock:
@@ -2513,9 +2525,25 @@ def _act_replay_last_action(arg: str = "") -> str:
     name = last.get("action", "")
     orig_arg = last.get("arg", "") or ""
 
+    try:
+        age = time.time() - float(last.get("at") or 0.0)
+    except (TypeError, ValueError):
+        age = float("inf")
+    if age > _REPLAY_MAX_AGE_S:
+        return "nothing recent to replay, sir — please say the command again"
+
     if name in bc._DESTRUCTIVE_REPLAY_ACTIONS:
         return (f"refusing to replay destructive action '{name}' without "
                 "confirmation — please re-issue the command explicitly")
+
+    try:
+        from core.draft_preview_gate import should_gate as _is_draft_send
+        _draft_send = _is_draft_send(name)
+    except Exception:
+        _draft_send = str(name).lower().startswith("send_")
+    if _draft_send:
+        return (f"refusing to replay '{name}' — a draft is only sent after "
+                "it has been read back; please ask me to send it again")
 
     fn = bc.ACTIONS.get(name)
     if fn is None:

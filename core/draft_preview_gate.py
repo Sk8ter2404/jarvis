@@ -417,14 +417,26 @@ def _readback_text(pending: dict) -> str:
     return f"Reading the draft, sir. {body}"
 
 
+# Draft senders whose names do NOT start with send_. skills/email_triage
+# registers its ONE sender as send_draft, send_pending_draft AND
+# confirm_pending_draft, and core/prompts lists confirm_pending_draft first -
+# so "send that draft" could reach the sender by the one name this gate did
+# not know, and the email went out unheard (2026-10-01). The monolith also
+# gates any handler that IS a send_* handler (bobert_companion._is_draft_send);
+# this list keeps the name rule honest on its own.
+_GATED_ALIASES = frozenset({"confirm_pending_draft"})
+
+
 def should_gate(action_name: str) -> bool:
     """True if this action name should route through the preview gate.
 
     Any action whose name starts with ``send_`` qualifies — that's the
     contract callers rely on, and it intentionally covers send_draft,
     send_pending_draft, plus any future send_* skill register without
-    needing to touch this module."""
-    return bool(action_name) and action_name.lower().startswith("send_")
+    needing to touch this module. The non-send_* aliases of a draft sender
+    in ``_GATED_ALIASES`` qualify too."""
+    n = (action_name or "").lower()
+    return bool(n) and (n.startswith("send_") or n in _GATED_ALIASES)
 
 
 def run_with_gate(action_name: str, arg: str,

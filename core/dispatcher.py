@@ -71,26 +71,56 @@ def _arg_first_group(m: re.Match) -> str:
     return _strip(g) if g else ""
 
 
-def _arg_play_music(m: re.Match) -> str:
-    """Extract artist/song from 'play X' / 'put on X' / 'queue X'.
-
-    If the user said 'play some <X>' or 'play me <X>', drop the filler so
-    iTunes search gets the bare query.
-    """
-    q = _arg_first_group(m).lower()
-    for filler in ("some ", "me some ", "me "):
-        if q.startswith(filler):
-            q = q[len(filler):]
-            break
-    # Preserve original casing where possible: re-extract and apply the
-    # same prefix trim to the cased string.
-    raw = _arg_first_group(m)
+def _strip_play_filler(raw: str) -> str:
+    """Drop a leading 'some ' / 'me some ' / 'me ' (original casing kept)."""
     raw_low = raw.lower()
     for filler in ("some ", "me some ", "me "):
         if raw_low.startswith(filler):
             raw = raw[len(filler):]
             break
     return raw.strip()
+
+
+def _arg_play_music(m: re.Match) -> str:
+    """Extract artist/song from 'play X' / 'put on X' / 'queue X'.
+
+    If the user said 'play some <X>' or 'play me <X>', drop the filler so
+    iTunes search gets the bare query.
+    """
+    # Preserve original casing where possible.
+    return _strip_play_filler(_arg_first_group(m))
+
+
+# A trailing "on <service>" names WHERE to play, so the request is not an
+# Apple Music song search (2026-10-01). Without this rule the music rule took
+# "play Stranger Things on Netflix" whole, and play_music resolved an iTunes
+# SONG for "Stranger Things on Netflix" while the chain still said "music
+# queued". Apple Music itself is deliberately absent: play_music already IS
+# Apple Music.
+_STREAMING_SERVICE_ALT = (
+    r"netflix|you\s?tube|yt|spotify|hulu|disney(?:\s*\+|\s+plus)?"
+    r"|(?:amazon\s+)?prime(?:\s+video)?|amazon|hbo(?:\s+max)?|max"
+)
+
+
+def _canon_streaming_service(svc: str) -> str:
+    """Spoken service name → the _STREAMING_SERVICES key play_streaming takes."""
+    s = re.sub(r"\s+", " ", (svc or "").strip().lower())
+    if s in ("youtube", "you tube", "yt"):
+        return "youtube"
+    if s.startswith("disney"):
+        return "disney_plus"
+    if s.startswith(("amazon", "prime")):
+        return "prime_video"
+    if s.startswith("hbo") or s == "max":
+        return "max"
+    return s  # netflix, spotify, hulu
+
+
+def _arg_play_streaming(m: re.Match) -> str:
+    """'play <title> on <service>' → the 'service|title' play_streaming takes."""
+    title = _strip_play_filler(_strip(m.group(1) or ""))
+    return f"{_canon_streaming_service(m.group(2) or '')}|{title}"
 
 
 # Map common spoken units to seconds (used by both timer and focus rules).
@@ -141,6 +171,17 @@ def _arg_set_timer(m: re.Match) -> str:
 
 # Each rule: (regex_list, action_name, arg_fn, confirmation_phrase, [aliases])
 _INTENT_RULES: list[dict] = [
+    # ── Streaming: 'play X on Netflix' (must come BEFORE the music rule,
+    #    which would otherwise take 'X on Netflix' as a song) ──────────
+    {
+        "patterns": [
+            r"^(?:play|put\s+on|queue(?:\s+up)?)\s+(.+?)\s+on\s+"
+            r"(" + _STREAMING_SERVICE_ALT + r")$",
+        ],
+        "action": "play_streaming",
+        "arg_fn": _arg_play_streaming,
+        "confirmation": "playback started",
+    },
     # ── Music playback ───────────────────────────────────────────────
     {
         "patterns": [
@@ -561,6 +602,28 @@ def _is_failure_result(result) -> bool:
     return any(m in lower for m in _FAIL_MARKERS)
 
 
+# Honest NO-OP results: not errors, but the step did nothing, so the rule's
+# success phrase would be false. "pause the music and turn it down" with
+# nothing playing said "music paused" (2026-10-01). Chain-only on purpose:
+# FAILURE_MARKERS also drives the monolith's failure re-prompt, and the
+# single-command pause_music path already voices these results as they are.
+_CHAIN_NOOP_MARKERS: dict[str, str] = {
+    "nothing seems to be playing": "nothing was playing",
+    "pyautogui unavailable": "media keys unavailable",
+}
+
+
+def _noop_phrase(result) -> str | None:
+    """The consolidated-line phrase for a no-op step result, else None."""
+    if not isinstance(result, str) or not result:
+        return None
+    low = result.lower()
+    for marker, phrase in _CHAIN_NOOP_MARKERS.items():
+        if marker in low:
+            return phrase
+    return None
+
+
 def _failure_phrase(result: str, fallback: str) -> str:
     """Compress a failure result into one short phrase for the consolidated reply."""
     if not isinstance(result, str) or not result.strip():
@@ -655,14 +718,15 @@ def resolve_and_dispatch(
     for step, fn in runnable:
         try:
             rv = fn(step.arg)
-            if _is_failure_result(rv):
+            _noop = _noop_phrase(rv)
+            if _is_failure_result(rv) or _noop:
                 # Action ran without raising but returned a failure marker
-                # — surface the action's own message instead of the
-                # success confirmation so the user hears what went wrong.
+                # (or an honest "did nothing") — surface that instead of the
+                # success confirmation so the user hears what really happened.
                 dispatched.append(ChainStep(
                     action=step.action,
                     arg=step.arg,
-                    confirmation=_failure_phrase(rv, step.confirmation),
+                    confirmation=_noop or _failure_phrase(rv, step.confirmation),
                     source=step.source,
                 ))
             else:

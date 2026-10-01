@@ -381,6 +381,22 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(r["title"], "Holocene")
         bc._note_apple_music_seen.assert_called_once()
 
+    def test_window_title_live_web_player_title_warms_the_cache(self):
+        # B041 (2026-10-01): the real tab title carries a leading LRM and a
+        # NO-BREAK SPACE ("Apple<NBSP>Music"), which a plain "apple music"
+        # substring never matched - so the routing cache was never warmed.
+        gw = _fake_pygetwindow(
+            ["\u200eApple\xa0Music - Web Player - Google Chrome",
+             "\u200eHolocene — Bon Iver – Apple\xa0Music"])
+        bc = types.ModuleType("__main__")
+        bc._note_apple_music_seen = mock.MagicMock()
+        with inject_modules(pygetwindow=gw), \
+             mock.patch.dict(sys.modules, {"__main__": bc}):
+            r = self.mod._sample_window_title()
+        bc._note_apple_music_seen.assert_called()
+        self.assertEqual((r["title"], r["artist"], r["source"]),
+                         ("Holocene", "Bon Iver", "web_apple"))
+
     def test_window_title_apple_note_seen_crash_swallowed(self):
         # _note_apple_music_seen blowing up must not break sampling.
         gw = _fake_pygetwindow(["Song — Artist – Apple Music"])

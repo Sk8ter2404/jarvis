@@ -16,6 +16,34 @@ from unittest import mock
 from tests._skill_harness import load_skill_isolated, no_background_threads
 
 
+# The timer skill saves its timers to <data dir>/timers.json on every change
+# (2026-10-01). Point the data dir at a throwaway folder for this whole module
+# so no test can write the project's live data/ (core.paths resolves it at
+# call time, so the redirect applies to every load of the skill).
+_SAVED_DATA_DIR_ENV = None
+_DATA_TMPDIR = None
+
+
+def setUpModule() -> None:
+    global _SAVED_DATA_DIR_ENV, _DATA_TMPDIR
+    import os
+    import tempfile
+    _SAVED_DATA_DIR_ENV = os.environ.get("JARVIS_DATA_DIR")
+    _DATA_TMPDIR = tempfile.mkdtemp(prefix="jarvis_timer_test_")
+    os.environ["JARVIS_DATA_DIR"] = _DATA_TMPDIR
+
+
+def tearDownModule() -> None:
+    import os
+    import shutil
+    if _SAVED_DATA_DIR_ENV is None:
+        os.environ.pop("JARVIS_DATA_DIR", None)
+    else:
+        os.environ["JARVIS_DATA_DIR"] = _SAVED_DATA_DIR_ENV
+    if _DATA_TMPDIR:
+        shutil.rmtree(_DATA_TMPDIR, ignore_errors=True)
+
+
 def _call_silently(fn, *a, **kw):
     """Invoke fn with stdout swallowed — the _fire closures print a 🔔 line
     that crashes on a cp1252 console when called directly outside the loader."""
@@ -397,6 +425,128 @@ class TimerEnumerateTests(unittest.TestCase):
         self.assertEqual(snap[0]["id"], 1)
         self.assertEqual(snap[0]["message"], "a")
         self.assertIsInstance(snap[0]["fire_at"], float)
+
+
+
+class TimerLabelDoesNotChangeDurationTests(unittest.TestCase):
+    """B037 (2026-10-01): the free-text form parsed the WHOLE argument, so a
+    clock time or a number+unit inside the label changed when the timer fired
+    - silently, since set_timer's result is never spoken."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("timer")
+
+    def test_label_never_changes_the_duration(self):
+        split = self.mod._split_timer_args
+        for arg, secs, label in (
+                ("15 minutes to leave for the 6:30 pm game", 900,
+                 "leave for the 6:30 pm game"),
+                ("30 minutes to check the 3d print", 1800, "check the 3d print"),
+                ("45 minutes for the 2 hour movie", 2700, "the 2 hour movie"),
+                ("an hour to move the car before 5 pm", 3600,
+                 "move the car before 5 pm"),
+                ("half an hour to stretch", 1800, "stretch")):
+            with self.subTest(arg=arg):
+                self.assertEqual(split(arg), (secs, label))
+
+    def test_compound_durations_still_sum(self):
+        split = self.mod._split_timer_args
+        self.assertEqual(split("1 hour 30 minutes for tea"), (5400, "tea"))
+        self.assertEqual(split("1 hour, 30 minutes for tea"), (5400, "tea"))
+        self.assertEqual(split("an hour and a half for tea"), (5400, "tea"))
+        self.assertEqual(split("an hour and 10 minutes to bake"), (4200, "bake"))
+        self.assertEqual(split("tea timer 5 minutes"), (300, "tea"))
+
+
+class TimerPersistenceTests(unittest.TestCase):
+    """B038 (2026-10-01): timers lived only in memory, so any restart other
+    than a blue/green handoff silently dropped reminders JARVIS had already
+    promised. They are now saved on every change and re-armed at boot."""
+
+    def setUp(self):
+        import os
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="jarvis_timer_persist_")
+        env = mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": self.dir})
+        env.start()
+        self.addCleanup(env.stop)
+        self.mod, self.actions = load_skill_isolated("timer")
+        self.mod._timers.clear()
+        self.mod._next_id[0] = 1
+        self.path = os.path.join(self.dir, "timers.json")
+
+    def tearDown(self):
+        import shutil
+        for t, _m, _f in list(self.mod._timers.values()):
+            t.cancel()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _saved(self):
+        import json
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_set_timer_is_saved_and_cancel_removes_it(self):
+        with no_background_threads():
+            self.actions["set_timer"]("45 minutes | move the laundry")
+            self.actions["set_timer"]("2 hours | call the shop")
+        saved = self._saved()
+        self.assertEqual([e["message"] for e in saved],
+                         ["move the laundry", "call the shop"])
+        self.actions["cancel_timer"]("1")
+        self.assertEqual([e["id"] for e in self._saved()], [2])
+        self.actions["cancel_timer"]("all")
+        self.assertEqual(self._saved(), [])
+
+    def test_fired_timer_is_removed_from_the_file(self):
+        with no_background_threads(), \
+                mock.patch.object(self.mod, "_enqueue_speech"), \
+                mock.patch.object(self.mod.threading, "Timer") as T:
+            self.actions["set_timer"]("5 minutes | tea")
+            fire = T.call_args.args[1]
+            self.assertEqual(len(self._saved()), 1)
+            _call_silently(fire)
+        self.assertEqual(self._saved(), [])
+
+    def test_a_restarted_process_re_arms_the_saved_timers(self):
+        with no_background_threads():
+            self.actions["set_timer"]("45 minutes | move the laundry")
+        fire_at = self._saved()[0]["fire_at"]
+        # A brand-new process: a fresh module with no timers in memory.
+        fresh, _acts = load_skill_isolated("timer")
+        fresh._timers.clear()
+        fresh._next_id[0] = 1
+        with no_background_threads():
+            n = fresh.restore_persisted_timers()
+        self.assertEqual(n, 1)
+        self.assertEqual(fresh._timers[1][1], "move the laundry")
+        self.assertAlmostEqual(fresh._timers[1][2], fire_at, places=3)
+        self.assertGreaterEqual(fresh._next_id[0], 2)
+
+    def test_overdue_saved_timer_fires_once_and_is_not_kept(self):
+        import json
+        import time as _t
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump([{"id": 4, "message": "stretch",
+                        "fire_at": _t.time() - 60}], f)
+        with mock.patch.object(self.mod, "_enqueue_speech") as speak:
+            n = self.mod.restore_persisted_timers()
+        self.assertEqual(n, 1)
+        speak.assert_called_once()
+        self.assertIn("stretch", speak.call_args.args[0])
+        # Saved without it, so the NEXT boot doesn't fire it again.
+        self.assertEqual(self._saved(), [])
+
+    def test_no_saved_file_restores_nothing(self):
+        self.assertEqual(self.mod.restore_persisted_timers(), 0)
+
+    def test_unwritable_store_never_breaks_set_timer(self):
+        with no_background_threads(), \
+                mock.patch.object(self.mod, "_atomic_write_json",
+                                  side_effect=OSError("disk full")):
+            out = _call_silently(self.actions["set_timer"], "5 minutes | tea")
+        self.assertIn("#1", out)
+        self.assertEqual(len(self.mod._timers), 1)
 
 
 if __name__ == "__main__":

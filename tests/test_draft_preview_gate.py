@@ -40,6 +40,13 @@ class ShouldGateTests(unittest.TestCase):
         self.assertFalse(gate.should_gate("resend"))           # not a prefix
         self.assertFalse(gate.should_gate(""))
 
+    def test_confirm_pending_draft_alias_is_gated(self):
+        # B093 (2026-10-01): email_triage registers its one sender under
+        # confirm_pending_draft too, and that name skipped the read-back.
+        self.assertTrue(gate.should_gate("confirm_pending_draft"))
+        self.assertTrue(gate.should_gate("Confirm_Pending_Draft"))
+        self.assertFalse(gate.should_gate(None))
+
 
 class MatchesAnyTests(unittest.TestCase):
     def test_whole_word_and_phrases(self):

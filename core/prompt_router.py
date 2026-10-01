@@ -448,9 +448,13 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "BAMBU PRINTER LAN CHECK ALIAS": [
         "print", "printer", "bambu", "3d", "is it printing", "printer online",
     ],
+    # Only ACTION-replay phrasing (2026-10-01). "say again" / "repeat that" /
+    # "come again" / "what did you say" / "one more time" ask JARVIS to SAY
+    # something again (tone_detector.is_repeat_request), yet they loaded the
+    # one section that documents replay_last_action - steering the model to
+    # re-run the last action when the owner only wanted the sentence again.
     "REPLAY": [
-        "replay", "say again", "repeat that", "come again", "what did you say",
-        "one more time",
+        "replay", "do that again", "do it again",
     ],
     # "restart yourself"/"reboot" deliberately NOT here: those phrases mean
     # RESTART, and this section documents only power-off aliases — loading it

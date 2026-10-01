@@ -181,6 +181,10 @@ _MONOLITH_RESTORE_NAMES = (
     "_standby_wake_detector", "_standby_wake_disabled_for_session",
     # ── tray / action-dispatch queues + bookkeeping ────────────────────────
     "_pending_confirmation", "_pending_autocorrect_choice",
+    # The pending-confirmation TTL stamp (2026-10-01). A stamp left by a test
+    # that queued a real confirmation would make a LATER test's hand-built
+    # queue look minutes old and lapse instead of running.
+    "_pending_confirmation_at",
     "_action_error_log", "_action_history",
     "_session_action_counts", "_session_app_names",
     # ── audio / device / capture state ─────────────────────────────────────

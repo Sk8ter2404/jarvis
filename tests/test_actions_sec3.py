@@ -47,6 +47,7 @@ import contextlib
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -1478,6 +1479,10 @@ class ReplayLastActionTests(unittest.TestCase):
     def _bc(self, history, destructive=None):
         bc = _base_bc()
         bc._action_history_lock = mock.MagicMock()
+        # record_action_history always stamps "at"; a fixture entry without
+        # one is taken as just-run (replay refuses stale entries, 2026-10-01).
+        for entry in history:
+            entry.setdefault("at", time.time())
         bc._action_history = history
         bc._DESTRUCTIVE_REPLAY_ACTIONS = set(destructive or
                                              ["close_window", "kill_process"])
@@ -1549,6 +1554,39 @@ class ReplayLastActionTests(unittest.TestCase):
         with _patch_bc(bc):
             out = A._act_replay_last_action()
         self.assertEqual(out, "replayed count: 42")
+
+    # B032 (2026-10-01): replay had no age limit and called a draft sender
+    # directly, past the read-back gate.
+    def test_stale_action_is_not_replayed(self):
+        bc = self._bc([{"action": "set_timer", "arg": "5 minutes",
+                        "at": time.time() - 3600}])
+        fn = mock.Mock(return_value="timer set")
+        bc.ACTIONS = {"set_timer": fn}
+        with _patch_bc(bc):
+            out = A._act_replay_last_action()
+        fn.assert_not_called()
+        self.assertIn("nothing recent to replay", out)
+
+    def test_recent_action_still_replays(self):
+        bc = self._bc([{"action": "set_timer", "arg": "5 minutes",
+                        "at": time.time() - 30}])
+        fn = mock.Mock(return_value="timer set")
+        bc.ACTIONS = {"set_timer": fn}
+        with _patch_bc(bc):
+            out = A._act_replay_last_action()
+        fn.assert_called_once_with("5 minutes")
+        self.assertEqual(out, "replayed set_timer: timer set")
+
+    def test_draft_send_is_never_replayed(self):
+        for name in ("send_draft", "send_vip_reply", "confirm_pending_draft"):
+            with self.subTest(name=name):
+                bc = self._bc([{"action": name, "arg": ""}])
+                fn = mock.Mock(return_value="sent")
+                bc.ACTIONS = {name: fn}
+                with _patch_bc(bc):
+                    out = A._act_replay_last_action()
+                fn.assert_not_called()
+                self.assertIn(f"refusing to replay '{name}'", out)
 
 
 # ===========================================================================

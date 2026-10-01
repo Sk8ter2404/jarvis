@@ -151,7 +151,10 @@ class MatchSingleIntentTests(unittest.TestCase):
     def test_arg_fn_exception_yields_empty_arg(self):
         # If a rule's arg builder raises, _match_segment swallows it and the
         # step is returned with an empty arg rather than aborting the match.
-        with mock.patch.dict(d._INTENT_RULES[0], {"arg_fn": mock.MagicMock(
+        # Located by action, not index: the streaming rule sits ahead of it.
+        music_rule = next(r for r in d._INTENT_RULES
+                          if r["action"] == "play_music")
+        with mock.patch.dict(music_rule, {"arg_fn": mock.MagicMock(
                 side_effect=RuntimeError("arg boom"))}):
             step = d.match_single_intent("play jazz", ACTIONS)
         self.assertIsNotNone(step)
@@ -625,6 +628,92 @@ class SelfVoicedChainTests(unittest.TestCase):
         d.resolve_and_dispatch("play jazz, take a screenshot",
                                self._actions(), is_self_voiced=boom)
         self.assertEqual(len(self.calls), 2)
+
+
+
+# ── B034 (2026-10-01): 'play X on <service>' is a streaming request ─────────
+class StreamingServiceTailTests(unittest.TestCase):
+    """The music rule took 'play Stranger Things on Netflix' whole, so
+    play_music resolved an Apple Music SONG for 'Stranger Things on Netflix'
+    and the chain said 'music queued'."""
+
+    ACTS = ACTIONS + ["play_streaming"]
+
+    def test_chain_routes_service_tail_to_play_streaming(self):
+        res = d.command_chain_resolver(
+            "JARVIS, play Stranger Things on Netflix and turn it up",
+            ["play_music", "play_streaming", "volume_up"])
+        self.assertIsNotNone(res)
+        self.assertEqual(res.steps[0].action, "play_streaming")
+        self.assertEqual(res.steps[0].arg, "netflix|Stranger Things")
+        self.assertEqual(res.steps[1].action, "volume_up")
+
+    def test_single_intent_service_aliases(self):
+        for utt, arg in (
+                ("play lo-fi beats on YouTube", "youtube|lo-fi beats"),
+                ("play some lo-fi on you tube", "youtube|lo-fi"),
+                ("put on The Office on Prime Video", "prime_video|The Office"),
+                ("play Bluey on Disney+", "disney_plus|Bluey"),
+                ("play Bluey on disney plus", "disney_plus|Bluey"),
+                ("play The Last of Us on HBO Max", "max|The Last of Us"),
+                ("queue up Daft Punk on Spotify", "spotify|Daft Punk"),
+                ("play Severance on hulu.", "hulu|Severance")):
+            with self.subTest(utt=utt):
+                step = d.match_single_intent(utt, self.ACTS)
+                self.assertIsNotNone(step)
+                self.assertEqual((step.action, step.arg),
+                                 ("play_streaming", arg))
+
+    def test_plain_play_and_entity_with_on_still_play_music(self):
+        for utt, arg in (("play Earth, Wind and Fire", "Earth, Wind and Fire"),
+                         ("play Michael Jackson", "Michael Jackson"),
+                         ("play Turn On the Bright Lights",
+                          "Turn On the Bright Lights"),
+                         ("play my mix on apple music", "my mix on apple music")):
+            with self.subTest(utt=utt):
+                step = d.match_single_intent(utt, self.ACTS)
+                self.assertEqual((step.action, step.arg), ("play_music", arg))
+
+    def test_service_tail_without_play_streaming_falls_back_to_music(self):
+        # Rule skipped when play_streaming isn't registered: unchanged path.
+        step = d.match_single_intent("play Dark on Netflix", ACTIONS)
+        self.assertEqual(step.action, "play_music")
+
+
+# ── B090 (2026-10-01): a no-op step must not be confirmed as done ──────────
+class ChainNoopResultTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+
+    def _action(self, name, rv="ok"):
+        def fn(arg):
+            self.calls.append((name, arg))
+            return rv
+        return fn
+
+    def test_nothing_playing_is_not_reported_as_paused(self):
+        from core import actions as A
+        actions = {"pause_music": self._action("pause_music",
+                                               A._NOTHING_PLAYING_MSG),
+                   "volume_down": self._action("volume_down", "volume down")}
+        out = d.resolve_and_dispatch(
+            "pause the music and turn the volume down", actions)
+        self.assertNotIn("music paused", out)
+        self.assertEqual(out, "Two things, sir: nothing was playing, volume down.")
+
+    def test_missing_pyautogui_is_not_reported_as_done(self):
+        actions = {"next_song": self._action("next_song", "pyautogui unavailable"),
+                   "screenshot": self._action("screenshot", "captured")}
+        out = d.resolve_and_dispatch("skip this song, take a screenshot", actions)
+        self.assertNotIn("skipped to next track", out)
+        self.assertIn("media keys unavailable", out)
+
+    def test_noop_markers_stay_out_of_the_shared_failure_list(self):
+        # The monolith's _is_failure reads FAILURE_MARKERS: these must not be
+        # there, or the single-command pause path would re-prompt as a failure.
+        from core.failure_markers import FAILURE_MARKERS
+        for marker in d._CHAIN_NOOP_MARKERS:
+            self.assertNotIn(marker, FAILURE_MARKERS)
 
 
 if __name__ == "__main__":

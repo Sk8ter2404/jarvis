@@ -41,6 +41,48 @@ _timers: dict[int, tuple[threading.Timer, str, float]] = {}
 _next_id = [1]
 _lock    = threading.Lock()
 
+# Pending timers survive a restart (2026-10-01). They lived only in _timers,
+# and only a blue/green handoff carried them over - so a crash, the watchdog,
+# tray Restart, "restart yourself" or an upgrade silently dropped every
+# reminder JARVIS had already promised ("will remind you in 45m"). Every
+# set / fire / cancel / restore rewrites this snapshot; boot re-arms it via
+# restore_persisted_timers(). Resolved at call time through core.paths, so a
+# staging process or a test run (JARVIS_DATA_DIR) never touches live data/.
+_TIMERS_FILE_NAME = "timers.json"
+# Serialises snapshot+write so an older snapshot can never land last.
+_persist_lock = threading.Lock()
+
+
+def _timers_file() -> str:
+    from core import paths as _paths
+    return _paths.data_file(_TIMERS_FILE_NAME)
+
+
+def _persist() -> None:
+    """Write the live timers to the timers file. Call with _lock NOT held
+    (enumerate_timers takes it). Never raises: a failed write costs only
+    the restart-survival of this change, never the timer itself."""
+    try:
+        with _persist_lock:
+            _atomic_write_json(_timers_file(), enumerate_timers())
+    except Exception as e:
+        print(f"  [timer] could not save timers ({e})")
+
+
+def restore_persisted_timers() -> int:
+    """Re-arm the timers saved by the previous process. Returns the count
+    restored. restore_timers skips ids already armed (a same-boot handoff
+    restore) and fires overdue ones at once."""
+    try:
+        with open(_timers_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        print(f"  [timer] could not read saved timers ({e})")
+        return 0
+    return restore_timers(data)
+
 
 # Spelled-out small numbers the LLM (and users) emit in voice transcripts:
 # "set a timer for five minutes", "ten min". Kept short — anything bigger is
@@ -302,6 +344,7 @@ def restore_timers(payload: list) -> int:
                 _enqueue_speech(f"Reminder, sir — {_msg}")
                 with _lock:
                     _timers.pop(_tid, None)
+                _persist()
 
             t = threading.Timer(remaining, _fire)
             t.daemon = True
@@ -309,12 +352,45 @@ def restore_timers(payload: list) -> int:
             _timers[tid] = (t, msg, fire_at)
             _next_id[0] = max(_next_id[0], tid + 1)
             restored += 1
+    if restored:
+        # Overdue entries fired above and were never armed: save the set
+        # that IS live, or the next boot would fire them all again.
+        _persist()
     return restored
 
 
 # Words that introduce a label after a duration in free text:
 # "5 minutes FOR tea", "10 min TO check the oven", "30 seconds, then stretch".
 _LABEL_INTRO_RE = re.compile(r"\b(?:for|to|about|that|then|and)\b", re.IGNORECASE)
+
+# What may sit between two parts of ONE duration: "1 hour 30 minutes",
+# "1 hour, 30 minutes", "an hour and 10 minutes".
+_DUR_JOIN_RE = re.compile(r"[\s,]*(?:and\s+)?", re.IGNORECASE)
+# A trailing "and a half" / "a half" ("an hour and a half").
+_DUR_HALF_TAIL_RE = re.compile(r"(?:and\s+)?a\s+half\b", re.IGNORECASE)
+
+
+def _duration_span(raw: str, m: re.Match) -> tuple[int, int]:
+    """(start, end) of the duration phrase that begins at the first
+    duration token `m`: the token, any duration tokens chained right after
+    it, a trailing 'and a half', and a leading 'half'. Nothing past that run
+    is duration - it is the label (2026-10-01)."""
+    start, end = m.start(), m.end()
+    hm = re.search(r"\bhalf\s+$", raw[:start], re.IGNORECASE)
+    if hm:
+        start = hm.start()
+    while True:
+        pos = _DUR_JOIN_RE.match(raw, end).end()
+        d = _DUR_UNIT_RE.match(raw, pos)
+        if d is not None:
+            num_tok = d.group(1) if d.group(1) is not None else d.group(3)
+            if _word_to_num(num_tok) is not None:
+                end = d.end()
+                continue
+        h = _DUR_HALF_TAIL_RE.match(raw, pos)
+        if h is not None:
+            end = h.end()
+        return start, end
 
 
 def _split_timer_args(args: str) -> tuple[int | None, str]:
@@ -342,17 +418,19 @@ def _split_timer_args(args: str) -> tuple[int | None, str]:
     m = _DUR_UNIT_RE.search(raw)
     num_tok = (m.group(1) or m.group(3)) if m else None
     if m and num_tok is not None and _word_to_num(num_tok) is not None:
-        secs = _parse_duration(raw)  # parse the whole thing (handles compounds)
-        before = raw[:m.start()].strip(" ,.-")
+        # Parse ONLY the duration phrase, never the label (2026-10-01). This
+        # parsed the whole argument, so a clock time in the label won ("15
+        # minutes to leave for the 6:30 pm game" fired at 6:30 PM) and a
+        # number+unit in it was added on ("30 minutes to check the 3d print"
+        # became 3 days) - silently: set_timer's result is not spoken.
+        start, end = _duration_span(raw, m)
+        secs = _parse_duration(raw[start:end])
+        before = raw[:start].strip(" ,.-")
         # Label is whatever trails the duration ("for tea"), else whatever
         # preceded it ("tea timer"). Strip a leading "for/to" connector and a
-        # trailing/leading "timer"/"reminder" noise word.
-        after = raw[m.end():].strip(" ,.-")
-        # For compound durations ("1 hour 30 minutes for tea") keep trimming
-        # trailing duration fragments out of `after`, and drop a dangling
-        # "and a half" / "a half" so it doesn't leak into the label.
-        after = _DUR_UNIT_RE.sub("", after)
-        after = re.sub(r"^\s*(?:and\s+)?a\s+half\b", "", after).strip(" ,.-")
+        # trailing/leading "timer"/"reminder" noise word. The span already
+        # took compound parts and "and a half", so the label is left as said.
+        after = raw[end:].strip(" ,.-")
         label = after or before
         label = _LABEL_INTRO_RE.sub("", label, count=1).strip(" ,.-") if label else ""
         label = re.sub(r"\b(?:timer|reminder)\b", "", label, flags=re.IGNORECASE).strip(" ,.-")
@@ -382,12 +460,14 @@ def register(actions):
             _enqueue_speech(f"Reminder, sir — {msg}")
             with _lock:
                 _timers.pop(tid, None)
+            _persist()
 
         t = threading.Timer(secs, _fire)
         t.daemon = True
         t.start()
         with _lock:
             _timers[tid] = (t, msg, time.time() + secs)
+        _persist()
 
         # Human-readable summary of when it'll fire
         if secs < 60:
@@ -424,6 +504,7 @@ def register(actions):
             return f"no timer #{tid}, sir."
         timer, msg, _ = entry
         timer.cancel()
+        _persist()
         return f"cancelled timer #{tid} ('{msg}'), sir."
 
     def cancel_timer(args: str = "") -> str:
@@ -443,6 +524,8 @@ def register(actions):
                 for _tid, (timer, _, _) in list(_timers.items()):
                     timer.cancel()
                 _timers.clear()
+            if count:
+                _persist()
             if not count:
                 return "there are no timers running, sir."
             return f"cancelled {count} timer(s), sir."

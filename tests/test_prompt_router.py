@@ -1147,3 +1147,32 @@ class UnitConversionRoutingRegressionTests(unittest.TestCase):
             with self.subTest(text=text):
                 inc, _ = pr.select_sections(text, self.sections)
                 self.assertIn(home, inc)
+
+
+class ReplayRoutingRegressionTests(unittest.TestCase):
+    """B032 (2026-10-01): "repeat that" / "come again" / "what did you say"
+    ask JARVIS to SAY something again, yet they loaded the one section that
+    documents replay_last_action, steering the model to re-run the owner's
+    last action. Only action-replay phrasing loads it now."""
+
+    def setUp(self):
+        _core, self.sections = pr.split_pc_control(FULL)
+        self.homes = [h for h, b in self.sections if "replay_last_action" in b]
+
+    def test_replay_doc_exists(self):
+        self.assertTrue(self.homes, "some section must document replay_last_action")
+
+    def test_say_it_again_requests_do_not_load_replay(self):
+        for q in ("repeat that", "can you repeat that", "come again?",
+                  "what did you say", "say again", "say that one more time"):
+            with self.subTest(q=q):
+                inc, _ = pr.select_sections(q, self.sections)
+                for h in self.homes:
+                    self.assertNotIn(h, inc)
+
+    def test_action_replay_requests_still_load_replay(self):
+        for q in ("replay that", "do that again", "do it again on the left monitor"):
+            with self.subTest(q=q):
+                inc, _ = pr.select_sections(q, self.sections)
+                for h in self.homes:
+                    self.assertIn(h, inc)

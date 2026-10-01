@@ -138,8 +138,10 @@ class UtteranceRouteDispatchTests(_Base):
             self.assertNotIn("[ACTION", line)
 
     def test_a_confirmable_self_voiced_route_asks_aloud_and_yes_runs_it(self):
-        # The owner's topic "information" contains the CONFIRM_KEYWORDS
-        # substring "format", so the REAL gate defers the self-voiced action.
+        # The owner's topic "formatting" starts with the CONFIRM_KEYWORDS
+        # word "format", so the REAL gate defers the self-voiced action. (This
+        # test used "information" until 2026-10-01 - a keyword buried inside
+        # another word no longer counts, see _needs_confirmation.)
         # A deferred action has said nothing yet: the "say 'yes'" question
         # must be spoken (it used to be blanked as self-voiced, so JARVIS
         # waited silently and the next sentence cancelled it).
@@ -148,19 +150,19 @@ class UtteranceRouteDispatchTests(_Base):
         self._p(bc, "CONFIRM_KEYWORDS", ["format"])
         self._p(bc, "_pending_confirmation", [])
         self._p(bc, "SELF_VOICED_ACTIONS", {"desk_chat"})
-        self._route(lambda t: "[ACTION: desk_chat, information]")
-        out = self._run("Jarvis, talk to the desk device about information.")
-        self.assertIn("REQUIRES CONFIRMATION: desk_chat(information)", out)
+        self._route(lambda t: "[ACTION: desk_chat, formatting]")
+        out = self._run("Jarvis, talk to the desk device about formatting.")
+        self.assertIn("REQUIRES CONFIRMATION: desk_chat(formatting)", out)
         self.assertNotIn("[self-voiced]", out)
         self.llm.assert_not_called()
         self.assertEqual(self.calls["desk_chat"], [])
-        self.assertEqual(bc._pending_confirmation, [("desk_chat", "information")])
+        self.assertEqual(bc._pending_confirmation, [("desk_chat", "formatting")])
         self.assertEqual(len(self.spoken), 1, self.spoken)
         self.assertIn("say 'yes' to proceed", self.spoken[0])
         # ... and the owner's "yes" runs the deferred action.
         self.spoken.clear()
         self.assertTrue(self._quiet(bc.handle_confirmation_response, "yes"))
-        self.assertEqual(self.calls["desk_chat"], ["information"])
+        self.assertEqual(self.calls["desk_chat"], ["formatting"])
         self.assertEqual(bc._pending_confirmation, [])
         self.assertNotIn("Cancelled.", self.spoken)
 

@@ -1917,6 +1917,10 @@ class MediaKeyWithFocusTests(SectionSevenBase):
         super().setUp()
         self._pag = mock.MagicMock()
         self._p(self.bc, "_get_pyautogui", return_value=self._pag)
+        # No Windows media session unless a test says so: the vision-click
+        # branches below only run when nothing could have received the key
+        # (B030, 2026-10-01) - and the live SMTC must never decide a test.
+        self._p(self.bc, "_media_session_present", return_value=None)
 
     def test_pyautogui_unavailable(self):
         self._p(self.bc, "_get_pyautogui", return_value=None)

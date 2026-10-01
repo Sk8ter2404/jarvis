@@ -953,17 +953,39 @@ class MediaKeyWithFocusTests(SectionFiveBase):
         self.assertIn("Spotify", out)
         ui_safe.assert_called_once()
 
-    def test_no_music_window_global_key_then_vision_click(self):
+    def test_no_music_window_no_session_global_key_then_vision_click(self):
+        # No media session: nothing could have received the key, so the
+        # on-screen control is the fallback.
         bc = self.bc
         pag = mock.MagicMock()
         with mock.patch.object(bc, "_get_pyautogui", return_value=pag), \
              mock.patch.object(bc, "_focus_music_window", return_value=None), \
              mock.patch.object(bc, "_ui_safe"), \
+             mock.patch.object(bc, "_media_session_present", return_value=None), \
              mock.patch.object(bc, "find_click_target", return_value=(50, 60)), \
              mock.patch.object(bc, "ui_click") as click:
             out = bc._media_key_with_focus("playpause", "play button", "Play/Pause")
         click.assert_called_once_with(50, 60)
         self.assertIn("clicked on-screen button", out)
+
+    def test_no_music_window_but_a_media_session_never_clicks(self):
+        # B030 (2026-10-01): the global key already reached the session, so a
+        # vision click on top toggled play/pause back (or skipped twice).
+        bc = self.bc
+        pag = mock.MagicMock()
+        with mock.patch.object(bc, "_get_pyautogui", return_value=pag), \
+             mock.patch.object(bc, "_focus_music_window", return_value=None), \
+             mock.patch.object(bc, "_ui_safe") as ui_safe, \
+             mock.patch.object(bc, "_media_session_present",
+                               return_value={"app": "Chrome", "playing": True}), \
+             mock.patch.object(bc, "find_click_target",
+                               return_value=(50, 60)) as find, \
+             mock.patch.object(bc, "ui_click") as click:
+            out = bc._media_key_with_focus("playpause", "play button", "Play/Pause")
+        ui_safe.assert_called_once()          # the key, exactly once
+        find.assert_not_called()
+        click.assert_not_called()
+        self.assertIn("Chrome media session", out)
 
     def test_no_music_window_no_vision_target(self):
         bc = self.bc
@@ -971,6 +993,7 @@ class MediaKeyWithFocusTests(SectionFiveBase):
         with mock.patch.object(bc, "_get_pyautogui", return_value=pag), \
              mock.patch.object(bc, "_focus_music_window", return_value=None), \
              mock.patch.object(bc, "_ui_safe"), \
+             mock.patch.object(bc, "_media_session_present", return_value=None), \
              mock.patch.object(bc, "find_click_target", return_value=None):
             out = bc._media_key_with_focus("playpause", "play button", "Play/Pause")
         self.assertIn("key sent globally", out)
@@ -1019,8 +1042,18 @@ class MaybeReplayTests(SectionFiveBase):
         bc = self.bc
         with mock.patch.object(bc, "_act_replay_last_action",
                                return_value="ok") as act:
-            bc.maybe_replay_last_action("repeat that on monitor 2")
+            bc.maybe_replay_last_action("replay that on monitor 2")
         act.assert_called_once_with("2")
+
+    def test_repeat_that_is_not_an_action_replay(self):
+        # B032 (2026-10-01): "repeat that" means "say that again" everywhere
+        # else; it used to re-run the owner's last action.
+        bc = self.bc
+        with mock.patch.object(bc, "_act_replay_last_action") as act:
+            for phrase in ("repeat that", "repeat it", "Repeat that.",
+                           "repeat the last action"):
+                self.assertIsNone(bc.maybe_replay_last_action(phrase), phrase)
+        act.assert_not_called()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2990,6 +3023,41 @@ class NeedsConfirmationTests(SectionFiveBase):
         bc = self.bc
         with mock.patch.object(bc, "CONFIRM_KEYWORDS", ["delete", "format"]):
             self.assertFalse(bc._needs_confirmation("open_url", "example.com"))
+
+    # B031 (2026-10-01): plain substring matching held songs, searches and
+    # reminders for a spoken "yes" that wake-word mode drops, so they never ran.
+    def test_free_text_media_search_and_timer_args_never_confirm(self):
+        bc = self.bc
+        kws = ["purchase", "buy", "pay", "checkout", "delete", "format",
+               "transfer"]
+        with mock.patch.object(bc, "CONFIRM_KEYWORDS", kws):
+            self.assertFalse(bc._needs_confirmation("play_music", "Payphone"))
+            self.assertFalse(bc._needs_confirmation("apple_music",
+                                                    "Formation by Beyonce"))
+            self.assertFalse(bc._needs_confirmation(
+                "web_search", "information on the truck recall"))
+            self.assertFalse(bc._needs_confirmation(
+                "set_timer", "10 minutes | pay rent"))
+
+    def test_keyword_inside_another_word_does_not_confirm(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CONFIRM_KEYWORDS", ["format", "pay"]):
+            self.assertFalse(bc._needs_confirmation("open_url",
+                                                    "https://x/information"))
+            self.assertFalse(bc._needs_confirmation("open_url",
+                                                    "https://x/prepaid"))
+
+    def test_keyword_at_a_word_start_still_confirms(self):
+        bc = self.bc
+        kws = ["purchase", "pay", "checkout", "delete", "format"]
+        with mock.patch.object(bc, "CONFIRM_KEYWORDS", kws):
+            self.assertTrue(bc._needs_confirmation("open_url",
+                                                   "https://x/payment"))
+            self.assertTrue(bc._needs_confirmation("delete_file", "a.txt"))
+            self.assertTrue(bc._needs_confirmation("open_url",
+                                                   "https://shop/checkout"))
+            self.assertTrue(bc._needs_confirmation("run_shell",
+                                                   "formatting the D drive"))
 
 
 def bc_datetime_mod(bc):

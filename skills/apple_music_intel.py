@@ -71,6 +71,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from collections import Counter, defaultdict
 
 # Direct import of the iTunes COM bridge — the bridge itself is import-cheap
@@ -302,6 +303,24 @@ _SPOTIFY_TITLE_PATTERNS = (
 )
 
 
+def _fold_title(title: str) -> str:
+    """Drop invisible format characters (LRM/RLM, bidi controls, zero-width
+    space, BOM - Unicode category Cf) and fold every space separator (NBSP
+    included) to a plain space, collapsing runs. The live Apple Music web
+    player title is "<U+200E>Apple<NBSP>Music - Web Player - Google Chrome", which
+    a plain "apple music" substring never matched - so this poller never
+    warmed the monolith's routing cache and "pause the music" answered
+    "Nothing seems to be playing" (2026-10-01). Same intent as the monolith's
+    _strip_bidi_and_nbsp, by Unicode category rather than a hand list."""
+    out = []
+    for ch in title or "":
+        cat = unicodedata.category(ch)
+        if cat == "Cf":
+            continue
+        out.append(" " if cat == "Zs" else ch)
+    return " ".join("".join(out).split())
+
+
 def _sample_window_title() -> dict | None:
     """Try to read the now-playing track from a Chrome/Edge tab title that
     matches Apple Music's or Spotify's web-player title format."""
@@ -314,7 +333,7 @@ def _sample_window_title() -> dict | None:
     except Exception:
         return None
     for w in windows:
-        title = (getattr(w, "title", "") or "").strip()
+        title = _fold_title(getattr(w, "title", "") or "")
         if not title:
             continue
         # Apple Music web — most-specific match wins; check before "spotify".

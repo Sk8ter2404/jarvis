@@ -195,10 +195,31 @@ def _do_wave(bc) -> None:
 def _do_raise_hand(bc) -> None:
     """RAISE_HAND → confirm a pending confirmation (equivalent to 'yes').
     No-op when nothing is queued. Reuses handle_confirmation_response so the
-    confirm path (execute + spoken feedback) is identical to a voice 'yes'."""
+    confirm path (execute + spoken feedback) is identical to a voice 'yes'.
+
+    Only a FRESH prompt, and only while JARVIS is awake (2026-10-01). The
+    queue never expired and the gesture checked nothing, so a reset_memory or
+    destructive shell command the owner had refused (his bare "no" is dropped
+    in wake-word mode) ran hours later when anyone in view stretched. Now a
+    lapsed queue is dropped, and a hand confirms only within
+    GESTURE_CONFIRM_MAX_AGE_S of the prompt - fail-closed when the monolith
+    can't say how old it is."""
     try:
         pending = getattr(bc, "_pending_confirmation", None)
         if not pending:
+            return
+        if _in_standby(bc):
+            print("  [gestures] RAISE_HAND ignored - JARVIS is dormant")
+            return
+        expire = getattr(bc, "_expire_pending_confirmation", None)
+        if callable(expire) and expire():
+            return
+        age_fn = getattr(bc, "pending_confirmation_age", None)
+        age = age_fn() if callable(age_fn) else None
+        max_age = float(getattr(bc, "GESTURE_CONFIRM_MAX_AGE_S", 20.0))
+        if age is None or age > max_age:
+            print("  [gestures] RAISE_HAND ignored - the confirmation prompt "
+                  "is not fresh enough to answer by gesture")
             return
         handler = getattr(bc, "handle_confirmation_response", None)
         if callable(handler):

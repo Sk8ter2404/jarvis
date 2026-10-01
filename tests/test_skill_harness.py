@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import ast
 import os
+import shutil
+import tempfile
 import unittest
+from unittest import mock
 
 from tests._skill_harness import (
     SKILL_UTILS_KEYS,
@@ -39,7 +42,12 @@ class SkillHarnessTests(unittest.TestCase):
     def test_timer_action_actually_runs(self):
         # Driving a registered handler end-to-end with the fake utils.
         mod, actions = load_skill_isolated("timer")
-        out = actions["set_timer"]("1 minute | tea")
+        # set_timer saves its timers under the data dir (2026-10-01): keep
+        # that write in a throwaway folder, never the project's live data/.
+        tmp = tempfile.mkdtemp(prefix="jarvis_harness_timer_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": tmp}):
+            out = actions["set_timer"]("1 minute | tea")
         # That armed a REAL threading.Timer, and nothing cancelled it: 60 s
         # later, mid-suite, it fired on its own thread, re-imported the monolith
         # and — wherever that import fails (the CI runner, ci-sim) — appended

@@ -143,8 +143,14 @@ def play_playlist(arg: str) -> str:
         # the word "playlist" so the browser search targets a PLAYLIST, not a
         # song of the same name — without it, "play my workout playlist" made
         # Apple Music search for a track called "workout" and play a random
-        # song (2026-07-06 audit).
-        fb = _apple_music_fallback(name_q + " playlist" + (" shuffle" if shuffle else ""))
+        # song (2026-07-06 audit). The query must END in "playlist": that is
+        # what sends apple_music to its Library > Playlists flow. A trailing
+        # " shuffle" (added until 2026-10-01) broke exactly that match, so
+        # "shuffle my road trip playlist" played one random SONG matching
+        # "road trip playlist shuffle". The web flow then starts the playlist
+        # from its big Play OR Shuffle button (whichever vision finds), so on
+        # this route shuffle is best-effort; the right playlist is not.
+        fb = _apple_music_fallback(name_q + " playlist")
         if fb:
             return fb
         return err or "iTunes isn't reachable right now, sir."
@@ -156,8 +162,9 @@ def play_playlist(arg: str) -> str:
         # Not one of the user's OWN playlists → fall through to Apple Music
         # streaming (e.g. a curated playlist they don't own). The apple_music
         # action speaks its own sensible line, so return it as-is. Include
-        # "playlist" in the query so the search targets a playlist, not a song.
-        fb = _apple_music_fallback(name_q + " playlist" + (" shuffle" if shuffle else ""))
+        # "playlist" in the query so the search targets a playlist, not a song
+        # - and END on it (no " shuffle"), see the branch above (2026-10-01).
+        fb = _apple_music_fallback(name_q + " playlist")
         if fb:
             return fb
         return f"I couldn't find a playlist called '{name_q}', sir."

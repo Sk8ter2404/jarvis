@@ -279,16 +279,22 @@ class AppleMusicFallbackTests(unittest.TestCase):
         am.assert_called_once()
         self.assertEqual(out, "Playing it on Apple Music, sir.")
 
-    def test_fallback_query_carries_shuffle(self):
-        am = mock.Mock(return_value="Shuffling it on Apple Music, sir.")
-        with _patch_client(self.app), \
-                mock.patch.dict(sys.modules, {"__main__": _fake_monolith(am)}):
-            sys.modules.pop("bobert_companion", None)
-            M.play_playlist("shuffle Curated Hype")
-        am.assert_called_once()
-        sent = am.call_args.args[0]
-        self.assertIn("Curated Hype", sent)
-        self.assertTrue(sent.endswith(" shuffle"))
+    def test_shuffle_fallback_query_still_ends_in_playlist(self):
+        # B035 (2026-10-01): this test used to assert the query ENDED in
+        # " shuffle" - green for the wrong reason, because the mocked
+        # apple_music never parsed it. The real router only takes the Library >
+        # Playlists flow for "<name> playlist", so "... playlist shuffle"
+        # played one random song instead of the playlist.
+        for client in ((self.app,), (None, "iTunes isn't running, sir.")):
+            with self.subTest(itunes_up=client[0] is not None):
+                am = mock.Mock(return_value="Playing it on Apple Music, sir.")
+                with _patch_client(*client), \
+                        mock.patch.dict(sys.modules,
+                                        {"__main__": _fake_monolith(am)}):
+                    sys.modules.pop("bobert_companion", None)
+                    M.play_playlist("shuffle Curated Hype")
+                am.assert_called_once()
+                self.assertEqual(am.call_args.args[0], "Curated Hype playlist")
 
     def test_fallback_unavailable_returns_not_found(self):
         # No ACTIONS at all on the monolith → fallback yields None → original

@@ -3232,6 +3232,49 @@ def _save_patterns(entries: list[dict]) -> None:
         print(f"  [patterns] save failed: {e}")
 
 
+def _is_draft_send(name: str, fn=None) -> bool:
+    """True when running action `name` (handler `fn`, looked up when omitted)
+    sends a queued draft, so it must go through the draft read-back gate.
+
+    The gate's own rule is the NAME (send_*, plus the aliases
+    core.draft_preview_gate.should_gate lists). That alone let an alias
+    through: email_triage registers ONE sender under send_draft,
+    send_pending_draft AND confirm_pending_draft, and the prompt lists
+    confirm_pending_draft first - so "send that draft" could send an email
+    the owner never heard read back (B093, 2026-10-01). A handler that is the
+    same function as any send_* action is therefore a draft send too, whatever
+    it is called. Never raises."""
+    try:
+        if _draft_preview_gate is not None:
+            if _draft_preview_gate.should_gate(name):
+                return True
+        elif (name or "").lower().startswith("send_"):
+            return True
+    except Exception:
+        pass
+    try:
+        if fn is None:
+            fn = ACTIONS.get(name)
+        if fn is None:
+            return False
+        return any(str(k).lower().startswith("send_") and v is fn
+                   for k, v in list(ACTIONS.items()))
+    except Exception:
+        return False
+
+
+def _run_draft_gated(name: str, arg: str, fn):
+    """fn(arg), through the draft read-back gate when `name` sends a draft.
+
+    Every path that runs an action it was handed must use this, not fn(arg):
+    parse_and_run_actions, the 'yes' that runs a deferred confirmation and the
+    autocorrect 'did you mean' pick each used to call the sender directly
+    (B093, 2026-10-01)."""
+    if _draft_preview_gate is not None and _is_draft_send(name, fn):
+        return _draft_preview_gate.run_with_gate(name, arg, fn)
+    return fn(arg)
+
+
 def record_action_history(action_name: str, arg: str, result: str) -> None:
     """Append an executed action to the bounded replay deque.
 
@@ -3239,7 +3282,14 @@ def record_action_history(action_name: str, arg: str, result: str) -> None:
     (success or in-action failure both count — the user can replay either).
     Skipped when the replay handler itself fires the action so 'do that
     again, do that again' doesn't recurse into itself.
+
+    A draft send is never recorded (2026-10-01): the entry is written even
+    when the read-back gate HELD the draft ("Holding the draft, sir"), and
+    'do that again' would then fire the sender with no read-back at all -
+    sending the very draft the owner had just declined.
     """
+    if _is_draft_send(action_name):
+        return
     with _action_history_lock:
         _action_history.append({
             "action": action_name,
@@ -23493,11 +23543,32 @@ def _close_browser_windows_matching(terms, only_hwnd=None) -> int:
     return closed
 
 
-def _find_browser_window_matching(terms):
+def _window_handles_snapshot() -> set:
+    """Native handles of every top-level window right now. Taken just BEFORE
+    a media open so the window JARVIS opens can be told apart from the
+    owner's own (see _find_browser_window_matching's `exclude`). Empty set
+    when windows can't be enumerated. Never raises."""
+    try:
+        import pygetwindow as gw
+        return {h for h in (getattr(w, "_hWnd", None) for w in gw.getAllWindows())
+                if h is not None}
+    except Exception:
+        return set()
+
+
+def _find_browser_window_matching(terms, exclude=None):
     """Return the first BROWSER window whose normalized title contains any of
     `terms` (and a browser marker), or None. Used to locate a streaming
     service's just-opened window so vision-capture can be pinned to its
-    monitor. Mirrors _close_browser_windows_matching's matching."""
+    monitor. Mirrors _close_browser_windows_matching's matching.
+
+    `exclude`: handles to skip - the _window_handles_snapshot() taken before
+    the open (2026-10-01). Without it this returned the FIRST match in
+    z-order, which is the owner's own Chrome window whenever its active tab is
+    Apple Music / YouTube and it sits above the new one (a launch from a
+    background process is often refused the foreground). That handle was then
+    recorded as "the window JARVIS opened", maximized, fullscreened - and
+    CLOSED with all its tabs by the next media request."""
     if not terms:
         return None
     try:
@@ -23505,11 +23576,66 @@ def _find_browser_window_matching(terms):
         wins = gw.getAllWindows()
     except Exception:
         return None
+    skip = exclude or ()
     for w in wins:
+        if skip and getattr(w, "_hWnd", None) in skip:
+            continue
         t = _strip_bidi_and_nbsp((getattr(w, "title", "") or "")).lower()
         if t and any(m in t for m in _MUSIC_BROWSER_MARKERS) and any(term in t for term in terms):
             return w
     return None
+
+
+def _adopt_media_window(cfg: dict, service_key: str, before: set) -> None:
+    """Find the browser window a media open just created (a title match that
+    was NOT in the `before` snapshot), record its handle as THE window JARVIS
+    owns for `service_key`, bring it forward, maximize it on-screen, and pin
+    vision capture to its monitor (cfg["vision_monitor"]).
+
+    ONE copy for the search flow and the playlist flow (2026-10-01): the
+    playlist flow had copied only the record + maximize half, so its vision
+    steps photographed the whole 4-monitor desktop, downscaled until playlist
+    tiles were unreadable. No new window → nothing is recorded, adopted or
+    moved: better an extra window left open than the owner's closed."""
+    terms = cfg.get("tab_match")
+    if not terms:
+        return
+    win = _find_browser_window_matching(terms, exclude=before)
+    if win is None:
+        print(f"  [auto-play] no NEW {service_key} window found - not "
+              f"recording a handle", flush=True)
+        return
+    # Record the handle of the window JARVIS just opened so the NEXT media
+    # request closes exactly this window (see _JARVIS_MEDIA_WINDOW_HWND)
+    # instead of any title-substring match — never the user's own browser.
+    hw = getattr(win, "_hWnd", None)
+    if hw is not None:
+        _JARVIS_MEDIA_WINDOW_HWND[service_key] = hw
+    try:
+        win.activate()
+        time.sleep(0.2)
+    except Exception:
+        pass
+    # Pull the window JARVIS JUST OPENED fully on-screen and maximize it
+    # ("windowed full screen"). Chrome's `--new-window` restores to its
+    # last remembered position, which on this rig's negative-origin
+    # monitors (top y=-1440 / left x=-2560) can be a few pixels ABOVE a
+    # monitor's top edge — title bar off-screen, unreachable. We only
+    # ever touch the RECORDED handle (never a title match), so a pre-
+    # existing user window is never moved. No-op / never raises on a bad
+    # handle. The 0.2s activate-sleep above already gave the window a
+    # beat to finish spawning before we read its rect. Maximize keeps
+    # the window on the SAME monitor, so the vision-monitor pin below
+    # (read AFTER this) stays correct.
+    if hw is not None:
+        _ensure_window_visible_maximized(hw)
+    # Pin vision-capture to the single monitor the player window occupies —
+    # otherwise find_click_target photographs the whole multi-monitor virtual
+    # screen and downscales the controls too small to locate.
+    mon = _monitor_name_for_window(win)
+    if mon:
+        cfg["vision_monitor"] = mon
+        print(f"  [auto-play] pinning vision to monitor '{mon}'", flush=True)
 
 
 def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None) -> str:
@@ -24953,6 +25079,9 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     # query path (2026-07-06 audit: this branch was left on legacy mode).
     if not q:
         _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(service_key)
+        # Only a window that did not exist before the open can be the one
+        # JARVIS opened (2026-10-01, see _find_browser_window_matching).
+        _hp_before = _window_handles_snapshot()
         _open_url_in_browser(
             cfg["home"],
             close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
@@ -24964,7 +25093,7 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
         _hp_terms = cfg.get("tab_match")
         if _hp_terms:
             time.sleep(min(2.0, float(cfg.get("load_wait", 2.0))))
-            _hp_win = _find_browser_window_matching(_hp_terms)
+            _hp_win = _find_browser_window_matching(_hp_terms, exclude=_hp_before)
             _hp_hwnd = getattr(_hp_win, "_hWnd", None) if _hp_win is not None else None
             if _hp_hwnd is not None:
                 _JARVIS_MEDIA_WINDOW_HWND[service_key] = _hp_hwnd
@@ -25045,6 +25174,9 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     # 2026-07-06; the query branch (the one that actually runs) was missed.
     # Close ONLY the window JARVIS itself opened last time, or nothing.
     _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(service_key)
+    # Every window that exists BEFORE the open is not the one JARVIS opens
+    # (2026-10-01) - see _find_browser_window_matching's `exclude`.
+    _before = _window_handles_snapshot()
     opened_via = _open_url_in_browser(
         url,
         close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
@@ -25057,44 +25189,14 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     )
     time.sleep(cfg["load_wait"])
 
-    # Pin vision-capture to the single monitor the player window occupies (ANY
-    # service, via its tab_match titles) — otherwise find_click_target
-    # photographs the whole multi-monitor virtual screen and downscales the
-    # controls too small to locate. This makes youtube_play / netflix vision
-    # clicks work on a multi-monitor rig, not just the resolved Apple Music path
-    # (the latter was confirmed live; youtube_play was failing the same way).
-    _vm_terms = cfg.get("tab_match")
-    if _vm_terms:
-        _vw = _find_browser_window_matching(_vm_terms)
-        if _vw is not None:
-            # Record the handle of the window JARVIS just opened so the NEXT
-            # media request closes exactly this window (see _JARVIS_MEDIA_WINDOW_HWND)
-            # instead of any title-substring match — never the user's own browser.
-            _hw = getattr(_vw, "_hWnd", None)
-            if _hw is not None:
-                _JARVIS_MEDIA_WINDOW_HWND[service_key] = _hw
-            try:
-                _vw.activate()
-                time.sleep(0.2)
-            except Exception:
-                pass
-            # Pull the window JARVIS JUST OPENED fully on-screen and maximize it
-            # ("windowed full screen"). Chrome's `--new-window` restores to its
-            # last remembered position, which on this rig's negative-origin
-            # monitors (top y=-1440 / left x=-2560) can be a few pixels ABOVE a
-            # monitor's top edge — title bar off-screen, unreachable. We only
-            # ever touch the RECORDED handle (never a title match), so a pre-
-            # existing user window is never moved. No-op / never raises on a bad
-            # handle. The 0.2s activate-sleep above already gave the window a
-            # beat to finish spawning before we read its rect. Maximize keeps
-            # the window on the SAME monitor, so the vision-monitor pin below
-            # (read AFTER this) stays correct.
-            if _hw is not None:
-                _ensure_window_visible_maximized(_hw)
-            _mon = _monitor_name_for_window(_vw)
-            if _mon:
-                cfg["vision_monitor"] = _mon
-                print(f"  [auto-play] pinning vision to monitor '{_mon}'", flush=True)
+    # Record, focus and maximize the NEW player window, and pin vision-capture
+    # to the single monitor it occupies (ANY service, via its tab_match
+    # titles) — otherwise find_click_target photographs the whole
+    # multi-monitor virtual screen and downscales the controls too small to
+    # locate. This makes youtube_play / netflix vision clicks work on a
+    # multi-monitor rig, not just the resolved Apple Music path (the latter was
+    # confirmed live; youtube_play was failing the same way).
+    _adopt_media_window(cfg, service_key, _before)
 
     strict = bool(cfg.get("verify_play"))
 
@@ -25358,6 +25460,9 @@ def _apple_music_play_playlist(name: str) -> str:
     library_url = "https://music.apple.com/library/playlists"
     service_key = cfg["service_key"]
     _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(service_key)
+    # Only a window that did not exist before the open can be the one JARVIS
+    # opened (2026-10-01, see _find_browser_window_matching).
+    _before = _window_handles_snapshot()
     _open_url_in_browser(
         library_url,
         close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
@@ -25370,15 +25475,12 @@ def _apple_music_play_playlist(name: str) -> str:
     time.sleep(cfg["load_wait"])
 
     # Record the handle of the window we just opened so the title-confirm is
-    # scoped to it and the fullscreen key lands on it — not a stale sibling.
-    _vm_terms = cfg.get("tab_match")
-    if _vm_terms:
-        _vw = _find_browser_window_matching(_vm_terms)
-        if _vw is not None:
-            _hw = getattr(_vw, "_hWnd", None)
-            if _hw is not None:
-                _JARVIS_MEDIA_WINDOW_HWND[service_key] = _hw
-                _ensure_window_visible_maximized(_hw)
+    # scoped to it and the fullscreen key lands on it — not a stale sibling —
+    # and pin every vision step below to its monitor. This block used to stop
+    # at record + maximize, so the tile / sidebar searches and the play step
+    # photographed the whole 4-monitor desktop (2026-10-01).
+    _adopt_media_window(cfg, service_key, _before)
+    _vm = cfg.get("vision_monitor")
 
     if not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
             and _vision_click_backend_available()):
@@ -25399,7 +25501,7 @@ def _apple_music_play_playlist(name: str) -> str:
         f"sidebar 'Playlists' link, and NOT a 'Made For You' header"
     )
     playlist_coords = _streaming_find_with_retry(
-        playlist_hint, attempts=2, wait_between=2.0
+        playlist_hint, attempts=2, wait_between=2.0, monitor=_vm
     )
 
     if playlist_coords is None:
@@ -25409,7 +25511,8 @@ def _apple_music_play_playlist(name: str) -> str:
             flush=True,
         )
         lib_coords = find_click_target(
-            "the 'Library' link in the Apple Music left sidebar"
+            "the 'Library' link in the Apple Music left sidebar",
+            monitor=_vm,
         )
         if lib_coords is not None:
             try:
@@ -25419,7 +25522,8 @@ def _apple_music_play_playlist(name: str) -> str:
             time.sleep(cfg["post_click"])
             pl_coords = find_click_target(
                 "the 'Playlists' sub-link in the Apple Music left sidebar "
-                "(under the Library section)"
+                "(under the Library section)",
+                monitor=_vm,
             )
             if pl_coords is not None:
                 try:
@@ -25428,7 +25532,7 @@ def _apple_music_play_playlist(name: str) -> str:
                     return f"couldn't open Apple Music Playlists — {e}"
                 time.sleep(cfg["post_click"])
         playlist_coords = _streaming_find_with_retry(
-            playlist_hint, attempts=2, wait_between=2.0
+            playlist_hint, attempts=2, wait_between=2.0, monitor=_vm
         )
 
     if playlist_coords is None:
@@ -27138,12 +27242,23 @@ RUN_SHELL_OUTPUT_MAX_CHARS = 4000
 # Media keys — work for Apple Music in browser, Spotify, YouTube, any media app.
 # Use these for streaming services that don't have a COM interface.
 #
-# Chrome (where Apple Music lives) does NOT honor VK_MEDIA_* on a background
-# tab — the key has to land while a music window is foregrounded. Native apps
-# like Spotify/iTunes register a system-wide media-key hook and respond either
-# way, but focusing them costs nothing. So: focus a music window first, send
-# the key, and if no music window exists at all, fall back to clicking a
-# visible Next/Prev/Play button via vision.
+# Windows routes a VK_MEDIA_* key to the CURRENT media session (SMTC) - the
+# one the media flyout shows - and Chrome registers one for a playing tab, so
+# the global key reaches the player even with no music window in front. A
+# music window is still focused first when one exists (it costs nothing). The
+# on-screen vision click is only for when NO media session exists, i.e.
+# nothing could have received the key.
+def _media_session_present():
+    """The current Windows media session ({app,title,...}) read fresh, or
+    None when there is none or it can't be read (no winrt, not Windows).
+    Never raises."""
+    try:
+        from core.media_now_playing import _refresh_once as _smtc_read
+        return _smtc_read()
+    except Exception:
+        return None
+
+
 def _media_key_with_focus(vk: str, vision_hint: str, label: str) -> str:
     pag = _get_pyautogui()
     if not pag:
@@ -27162,9 +27277,18 @@ def _media_key_with_focus(vk: str, vision_hint: str, label: str) -> str:
         _ui_safe(pag, pag.press, vk)
     except UIFailsafeError as _e:
         return str(_e)
-    # Vision fallback: if nothing seems to be hosting music, look for an
+    # The key OR the click, never both (2026-10-01). The click used to follow
+    # the key unconditionally, so whenever a media session existed (the Apple
+    # Music web player in Chrome, Netflix, YouTube) play/pause toggled twice -
+    # nothing changed - and next/previous skipped two tracks, all reported as
+    # success. A session means the key had a recipient: stop here.
+    _session = _media_session_present()
+    if _session:
+        return (f"{label} (no music window found — key sent to the "
+                f"{_session.get('app') or 'active'} media session)")
+    # Vision fallback: nothing could have received the key, so look for an
     # on-screen control. Cheap because we only do this when there's no
-    # focusable music window.
+    # focusable music window and no media session.
     try:
         coords = find_click_target(vision_hint)
     except Exception:
@@ -27240,9 +27364,13 @@ def _substitute_monitor_in_arg(action_name: str, arg: str, monitor: str) -> str:
 # monitors ('left', 'right', 'top', 'middle') actually resolve — a bare digit
 # ('2') has no entry in MONITORS, so _substitute_monitor_in_arg leaves the arg
 # alone and the replay fires on its original monitor rather than a wrong screen.
+# "repeat" is deliberately NOT a verb here (2026-10-01): everywhere else
+# "repeat that" / "repeat it" means "say that again" (tone_detector's
+# is_repeat_request), so the owner asking to hear a sentence again re-ran his
+# last action instead - a second timer, a plug toggled back, a song restarted.
 _REPLAY_VOICE_RE = re.compile(
     r"^(?:please\s+)?"
-    r"(?:do|run|fire|execute|repeat|replay)\s+"
+    r"(?:do|run|fire|execute|replay)\s+"
     r"(?:that|it|the\s+(?:last|previous)(?:\s+(?:thing|action|one|step))?)"
     r"(?:\s+(?:one\s+more\s+time|again|once\s+more))?"
     r"(?:\s+on\s+(?:the\s+)?(?:monitor\s+)?(\w+)(?:\s+monitor)?)?"
@@ -28721,6 +28849,63 @@ ACTIONS["create_skill"] = _act_create_skill
 # (_sleep_mode and _overnight_run_now moved up to the top global state block.)
 _pending_confirmation: list[tuple[str, str]] = []   # list of (action_name, arg)
 
+# How long a deferred confirmation stays answerable (2026-10-01). It used to
+# never expire: in wake-word mode the owner's bare "no" is dropped before it
+# reaches handle_confirmation_response, so a refused reset_memory / destructive
+# shell command stayed armed for hours - and a Kinect raised hand from ANYONE
+# then ran it. The overnight shutdown prompt beside it always expired
+# (SHUTDOWN_PROMPT_TIMEOUT_S); this matches it.
+CONFIRMATION_TTL_S = 45.0
+# A raised hand only confirms a prompt JARVIS spoke moments ago, when the
+# person who asked is the one likely answering - not one from half a minute
+# back.
+GESTURE_CONFIRM_MAX_AGE_S = 20.0
+# time.monotonic() when the current queue was started (its OLDEST entry), 0.0
+# when unknown. Stamped only by _queue_pending_confirmation; an unstamped
+# queue (built by hand) never times out.
+_pending_confirmation_at: list[float] = [0.0]
+
+
+def _queue_pending_confirmation(name: str, arg: str) -> None:
+    """Defer (name, arg) until the owner says yes. Drops a lapsed queue first
+    (silently - we are mid-dispatch), so a new prompt never revives an old,
+    unanswered action, then starts the TTL clock if the queue was empty."""
+    _expire_pending_confirmation(speak=False)
+    if not _pending_confirmation:
+        _pending_confirmation_at[0] = time.monotonic()
+    _pending_confirmation.append((name, arg))
+
+
+def pending_confirmation_age() -> float | None:
+    """Seconds since the pending queue was started, or None when nothing is
+    pending or the queue carries no timestamp. Never raises."""
+    try:
+        at = float(_pending_confirmation_at[0])
+        if not _pending_confirmation or at <= 0.0:
+            return None
+        return max(0.0, time.monotonic() - at)
+    except Exception:
+        return None
+
+
+def _expire_pending_confirmation(speak: bool = True) -> bool:
+    """Drop the pending queue when it is older than CONFIRMATION_TTL_S. Returns
+    True when it lapsed. Logs the count only, never an argument."""
+    age = pending_confirmation_age()
+    if age is None or age <= CONFIRMATION_TTL_S:
+        return False
+    n = len(_pending_confirmation)
+    _pending_confirmation.clear()
+    _pending_confirmation_at[0] = 0.0
+    print(f"  [confirm] {n} pending action(s) lapsed after {age:.0f}s "
+          f"unanswered")
+    if speak:
+        try:
+            _speak("That earlier request has lapsed, sir.")
+        except Exception as _e:
+            print(f"  [confirm] lapse notice failed: {_e}")
+    return True
+
 # Actions whose RESULT contains information the user actually asked for
 # (vs. side-effect-only actions like launching apps). When these run, we do
 # a follow-up LLM call so Bobert can actually report what he found.
@@ -29777,11 +29962,28 @@ def _detect_preemptive_hallucination(
     return None
 
 
+# Actions whose argument is free text (a song, a search, a reminder label) and
+# that cannot spend, delete or format anything whatever the text says. The
+# CONFIRM_KEYWORDS gate used to read their argument like any other: "play
+# Payphone" ('pay'), "play Formation" ('format'), "search for information"
+# ('format'), "remind me in 10 minutes to pay rent" all waited on a spoken
+# "yes" that wake-word mode drops - so the song / search / reminder never ran
+# (2026-10-01).
+_CONFIRM_FREE_TEXT_ACTIONS = frozenset(MUSIC_ACTION_NAMES) | {"web_search", "set_timer"}
+
+
 def _needs_confirmation(name: str, arg: str) -> bool:
     if not CONFIRM_KEYWORDS:
         return False
+    if name in _CONFIRM_FREE_TEXT_ACTIONS:
+        return False
     haystack = f"{name} {arg}".lower()
-    return any(kw in haystack for kw in CONFIRM_KEYWORDS)
+    # A keyword must START a word: a letter right before it means it is the
+    # tail of another word ('information', 'prepay'). '_', '/', digits and the
+    # start of the text all count as a boundary, so 'delete_file',
+    # '/checkout', 'payment' and 'deleting' still match (2026-10-01).
+    return any(re.search(rf"(?<![a-z]){re.escape(kw.lower())}", haystack)
+               for kw in CONFIRM_KEYWORDS)
 
 
 # ── JARVIS pushback ──────────────────────────────────────────────────────
@@ -30628,7 +30830,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             return ""
 
         if _needs_confirmation(name, arg):
-            _pending_confirmation.append((name, arg))
+            _queue_pending_confirmation(name, arg)
             msg = f"⚠  REQUIRES CONFIRMATION: {name}({arg}) — say 'yes' to proceed"
             print(f"  [action] {msg}")
             results.append((name, msg, False))
@@ -30652,7 +30854,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         _pb = _jarvis_pushback(name, arg)
         if _pb:
             objection, reason = _pb
-            _pending_confirmation.append((name, arg))
+            _queue_pending_confirmation(name, arg)
             _pushback_objections.append(objection)
             print(f"  [pushback] {reason} → '{objection}'")
             results.append((name, f"⚠  PUSHBACK: {objection}", False))
@@ -30706,12 +30908,10 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             # through the middleware so the user always hears the draft body
             # read back and gets an 8-second 'shall I send it, sir?' window
             # before the underlying send fires. Pass-through when no draft
-            # is pending or the gate module isn't loaded.
-            if (_draft_preview_gate is not None
-                    and _draft_preview_gate.should_gate(name)):
-                res = _draft_preview_gate.run_with_gate(name, arg, fn)
-            else:
-                res = fn(arg)
+            # is pending or the gate module isn't loaded. _run_draft_gated
+            # also catches a send_* handler registered under another name
+            # (confirm_pending_draft) - see _is_draft_send (2026-10-01).
+            res = _run_draft_gated(name, arg, fn)
             results.append((name, res, name in INFORMATIVE_ACTIONS))
             print(f"  [action] {name}: {res[:120]}{'…' if len(res) > 120 else ''}")
             # Turn grounding ledger: lets a later follow-up round that reads
@@ -31162,7 +31362,9 @@ def handle_autocorrect_disambig_response(user_text: str) -> bool:
     except Exception as _e:
         print(f"  [autocorrect-disambig] confirm TTS failed: {_e}")
     try:
-        res = fn(arg)
+        # Through the draft read-back gate, like parse_and_run_actions: a
+        # guessed send_draft must not send unheard (2026-10-01).
+        res = _run_draft_gated(name, arg, fn)
         print(f"  [action] {name}: {res}")
         record_session_action(name, arg)
         if name != "replay_last_action":
@@ -31182,6 +31384,11 @@ def handle_confirmation_response(user_text: str) -> bool:
     else -> cancel them and return False so the utterance routes normally.
     """
     if not _pending_confirmation:
+        return False
+    # A prompt left unanswered past CONFIRMATION_TTL_S lapses: say so, and let
+    # this utterance route normally instead of running (or cancelling) an
+    # action the owner was asked about long ago (2026-10-01).
+    if _expire_pending_confirmation():
         return False
     # The shared yes/no classifier (2026-10-01, core/yes_no.py). This was a raw
     # prefix test — any(t.startswith(w) for w in ("yes", "confirm", "do it",
@@ -31213,13 +31420,20 @@ def handle_confirmation_response(user_text: str) -> bool:
         # added "Done." on top of it.
         self_voiced_ran: list[str] = []
         fail_markers = tuple(m.lower() for m in FAILURE_MARKERS)
+        _pending_confirmation_at[0] = 0.0
         while _pending_confirmation:
-            name, arg = _pending_confirmation.pop(0)
+            # The Kinect gesture thread drains this same list: whoever loses
+            # the race finds it empty here and must stop, not raise.
+            try:
+                name, arg = _pending_confirmation.pop(0)
+            except IndexError:
+                break
             fn = ACTIONS.get(name)
             if not fn:
                 continue
             try:
-                res = fn(arg)
+                # A deferred draft send still gets its read-back (2026-10-01).
+                res = _run_draft_gated(name, arg, fn)
                 print(f"  [action] {name}: {res}")
                 # A deferral string (a pushback / confirmation / ambiguity
                 # prompt) has said nothing yet, so it takes the normal path
@@ -31288,6 +31502,7 @@ def handle_confirmation_response(user_text: str) -> bool:
         count = len(_pending_confirmation)
         print(f"  [confirm] User declined — cancelling {count} pending action(s)")
         _pending_confirmation.clear()
+        _pending_confirmation_at[0] = 0.0
         _speak("Cancelled.")
     else:
         # Neither yes nor no: the owner moved on to something else. Fail safe
@@ -35715,6 +35930,29 @@ def _blue_green_teardown_and_exit() -> None:   # pragma: no cover - process-term
     _hard_exit(0, clean=True)
 
 
+def _restore_persisted_timers_at_boot() -> int:
+    """Re-arm the timers the previous process saved to disk
+    (skills/timer.py rewrites them on every set / fire / cancel). Before
+    2026-10-01 only a blue/green handoff carried timers over, so any other
+    restart silently dropped reminders JARVIS had already promised. Call
+    AFTER load_skills(). Never on staging: a candidate build must not fire
+    the owner's reminders. Returns the count re-armed; never raises."""
+    if _is_staging():
+        return 0
+    mod = sys.modules.get("skill_timer")
+    fn = getattr(mod, "restore_persisted_timers", None) if mod is not None else None
+    if not callable(fn):
+        return 0
+    try:
+        n = int(fn() or 0)
+    except Exception as _e:
+        print(f"  [timer] re-arm from disk failed: {_e}")
+        return 0
+    if n:
+        print(f"  [timer] re-armed {n} timer(s) from disk")
+    return n
+
+
 def _consume_blue_green_handoff() -> tuple[float | None, list]:
     """Blue-green-2: when relaunched as the new prod after a successful
     upgrade, pull the previous prod's in-flight conversation tail (+ last
@@ -36992,6 +37230,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         else:
             print("  [blue-green] timer restore skipped — "
                   "skill_timer not loaded")
+    # Every OTHER restart (crash, watchdog, tray Restart, "restart yourself",
+    # an upgrade) carried no timers at all; the timer skill now saves them on
+    # every change. Ids already re-armed from the handoff are skipped.
+    _restore_persisted_timers_at_boot()
 
     # Vocal startup — JARVIS "coming online" moment from the films.
     # iron_man_boot.py plays a ~1.5s suit power-on sting, drives a 4.5s

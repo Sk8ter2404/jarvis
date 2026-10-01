@@ -68,12 +68,27 @@ def _fake_bridge(*, enabled=True, available=(True, ""), bodies=None,
     return m
 
 
-def _fake_bc(*, standby=False, sleep=False, pending=None, speaking=False):
+def _fake_bc(*, standby=False, sleep=False, pending=None, speaking=False,
+             pending_age=1.0, lapsed=False):
     bc = types.ModuleType("bobert_companion")
     bc._standby_mode = [bool(standby)]
     bc._sleep_mode = [bool(sleep)]
     bc._standby_auto_engage_lock = threading.Lock()
     bc._pending_confirmation = list(pending or [])
+    # The monolith's confirmation clock (2026-10-01): how old the pending
+    # prompt is (None = unknown), and whether it has lapsed (the real one then
+    # clears the queue and says so).
+    bc.pending_confirmation_age = lambda: (
+        pending_age if bc._pending_confirmation else None)
+    bc._lapsed_calls = []
+
+    def _expire(speak=True):
+        if lapsed and bc._pending_confirmation:
+            bc._pending_confirmation.clear()
+            bc._lapsed_calls.append(speak)
+            return True
+        return False
+    bc._expire_pending_confirmation = _expire
     bc._tts_playback_active = [bool(speaking)]
     bc._barge_in_interrupted = False
 
@@ -179,6 +194,36 @@ class RaiseHandMappingTests(_Base):
     def test_noop_when_nothing_pending(self):
         mod = self._load()
         bc = _fake_bc(pending=[])
+        mod._do_raise_hand(bc)
+        self.assertEqual(bc._executed, [])
+
+    # B033 (2026-10-01): a queued destructive action used to wait forever and
+    # ANY raised hand ran it, however old the prompt and whoever was in view.
+    def test_stale_prompt_is_not_confirmed_by_a_raised_hand(self):
+        mod = self._load()
+        bc = _fake_bc(pending=[("reset_memory", "")], pending_age=600.0)
+        mod._do_raise_hand(bc)
+        self.assertEqual(bc._executed, [])
+        self.assertEqual(bc._pending_confirmation, [("reset_memory", "")])
+
+    def test_prompt_of_unknown_age_is_not_confirmed(self):
+        # Fail closed: a monolith that can't date the prompt gets no gesture.
+        mod = self._load()
+        bc = _fake_bc(pending=[("reset_memory", "")], pending_age=None)
+        mod._do_raise_hand(bc)
+        self.assertEqual(bc._executed, [])
+
+    def test_lapsed_prompt_is_dropped_not_confirmed(self):
+        mod = self._load()
+        bc = _fake_bc(pending=[("reset_memory", "")], lapsed=True)
+        mod._do_raise_hand(bc)
+        self.assertEqual(bc._executed, [])
+        self.assertEqual(bc._pending_confirmation, [])
+        self.assertEqual(bc._lapsed_calls, [True])
+
+    def test_dormant_jarvis_ignores_a_raised_hand(self):
+        mod = self._load()
+        bc = _fake_bc(standby=True, pending=[("reset_memory", "")])
         mod._do_raise_hand(bc)
         self.assertEqual(bc._executed, [])
 
