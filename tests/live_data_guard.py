@@ -140,7 +140,26 @@ import sys
 import tempfile
 import traceback
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The tree whose live state this guard protects. Normally the tree this file
+# lives in. JARVIS_GUARD_LIVE_ROOT re-points it (2026-10-01) — set ONLY by
+# tools/action_smoke.py, which runs its sweep in a throwaway COPY of the code:
+# inside the copy every __file__-bound state path (the speech queue, the
+# inboxes, root *_state.json) belongs to the copy and must be writable, while
+# the REAL tree's stay refused. Honoured only when it names a JARVIS tree (a
+# directory holding bobert_companion.py); anything else is ignored. banner()
+# prints the protected data dir either way.
+_GUARD_ROOT_ENV = "JARVIS_GUARD_LIVE_ROOT"
+
+
+def _protected_root() -> str:
+    own = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    alt = (os.environ.get(_GUARD_ROOT_ENV) or "").strip()
+    if alt and os.path.isfile(os.path.join(alt, "bobert_companion.py")):
+        return os.path.abspath(alt)
+    return own
+
+
+PROJECT_ROOT = _protected_root()
 LIVE_DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 CLEAN_SHUTDOWN_FLAG = os.path.join(LIVE_DATA_DIR, "clean_shutdown.flag")
 

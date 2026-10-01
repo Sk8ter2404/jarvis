@@ -13,36 +13,76 @@ real I/O): see _DENYLIST. Everything else runs, including hardware-touching
 handlers — on the harness their probes fail HONESTLY, and an exception
 (rather than an error string) is exactly the bug class this exists to catch.
 
-Usage:  python tools/action_smoke.py [--json out.json]
-Exit 0 when nothing crashed; 1 when any handler raised.
+Usage:  python tools/action_smoke.py [--json out.json] [--only a,b,c]
+                                     [--no-skills] [--settings FILE]
+                                     [--preflight-only] [--keep-sandbox]
+Exit 0 when nothing crashed; 1 when any handler raised; 2 when the sandbox
+is not hermetic (the sweep refuses to start); 3 when the sweep tried to
+touch the real tree (each attempt was blocked).
+
+HERMETIC SANDBOX (2026-10-01)
+=============================
+The 09-05 live diagnostic: "running action_smoke makes the LIVE JARVIS
+speak fake alerts". The sweep set JARVIS_STAGING=1 and a redirected
+JARVIS_SETTINGS_PATH, but dozens of state paths are bound to their module's
+__file__ and honour no redirect: the pending-speech queue the live loop
+speaks from (bobert_companion.proactive_announce and ~25 skills), the
+inject and tray inboxes, jarvis_todo.md (the overnight pipeline's work
+list), every root *_state.json, data/clean_shutdown.flag. Run from the live
+install, every announcing action ("Reminder, sir — test") landed in the
+live queue. Since 2026-09-30 the test package's live-data guard refuses
+those writes — but only because this tool happens to import tests/, and a
+refusal is not a sandbox: every state-writing action then crashed instead
+of being swept, and JARVIS_ALLOW_LIVE_DATA=1 (or inheriting
+JARVIS_STAGING=0, which `setdefault` kept) reopened the hole.
+
+So the sweep no longer runs in the tree it lives in. The parent copies the
+CODE (git-tracked files, plus untracked skills/*.py) into a fresh temp dir —
+no data/, no queues, no root state — and re-runs itself there with every
+redirect forced (not defaulted) into that copy: JARVIS_DATA_DIR,
+JARVIS_SETTINGS_PATH, JARVIS_LOCK_DIR, JARVIS_STAGING=1, MUTE_TTS=1, and
+JARVIS_GUARD_LIVE_ROOT pointing the live-data guard at the REAL tree, so the
+copy is free to write while any write that reaches the real tree is refused
+and counted. Every __file__-bound path now resolves inside the copy by
+construction. Before a single action runs the child checks (hermetic_problems)
+that the monolith, the data dir, the settings file, the lock dir and all three
+queues are inside the sandbox and outside the real tree, then proves it by
+queueing a probe announcement and finding it in the SANDBOX queue. Anything
+off -> exit 2, nothing swept. The copy is deleted afterwards unless
+--keep-sandbox.
+
+What this does NOT isolate: the network, the GPU and the shared Ollama
+daemon (see the hermetic guard the test package arms; never judge live
+stability while a sweep runs), and the desktop itself (see _DENYLIST_*).
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 
-sys.path.insert(0, ".")
+# The tree this copy of the tool lives in. In the parent that is the real
+# install / worktree; in the child it is the sandbox copy.
+_HERE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# STATE ISOLATION — set BEFORE anything imports the monolith. The first full
-# sweep ran against the LIVE state: an action persisted KINECT_GAZE_ENABLED
-# into data/user_settings.json, which then leaked into unrelated face-tracker
-# unit tests and turned two ci_sim gates red (2026-07-10). JARVIS_STAGING=1
-# flips the blue/green isolation: every module-level state path (locks,
-# settings, data files, logs) is rerouted to the *_staging equivalents, so a
-# sweep can execute settings-toggling actions without mutating the real box.
-os.environ.setdefault("JARVIS_STAGING", "1")
-# …and it happened AGAIN on 2026-07-11: JARVIS_STAGING only rerouted the
-# monolith's own module-level paths — settings_window.settings_path() (the
-# writer every settings-toggling SKILL action uses) honoured only
-# JARVIS_SETTINGS_PATH, so the second sweep also wrote the live file.
-# settings_path() is staging-aware now; this explicit redirect is the
-# belt-and-suspenders so the sweep is safe even if that logic regresses.
-os.environ.setdefault(
-    "JARVIS_SETTINGS_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "data_staging", "user_settings.json"))
+# Env the parent hands the child. _SANDBOX_FLAG marks a child run.
+_SANDBOX_FLAG = "--in-sandbox"
+_REAL_ROOT_ENV = "JARVIS_SMOKE_REAL_ROOT"
+_GUARD_ROOT_ENV = "JARVIS_GUARD_LIVE_ROOT"   # read by tests/live_data_guard.py
+# Inherited escapes that would re-open the hole; never passed to the child.
+_ESCAPE_ENV = ("JARVIS_ALLOW_LIVE_DATA",)
+
+# Top-level directories never copied into the sandbox (runtime state, bulk,
+# VCS) when the tracked-file list is unavailable.
+_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", "data", "data_staging", "logs", "logs_staging",
+    "backups", "_backups", "models", "dist", "node_modules", "screenshots",
+    "camera_previews", "memory", "tts", "Robot Project", ".claude",
+})
 
 # Handlers that must NOT be invoked from a sweep: process control, state
 # wipes, spawning long-lived subprocesses/threads that outlive the harness,
@@ -105,9 +145,256 @@ def _spawns_desktop_windows(name: str, fn) -> bool:
             or name.startswith(("hide_", "dismiss_")))
     return not safe
 
-def main() -> int:
+
+# ── sandbox ────────────────────────────────────────────────────────────────
+
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def _inside(path: str, root: str) -> bool:
+    p, r = _norm(path), _norm(root)
+    try:
+        return os.path.commonpath([p, r]) == r
+    except ValueError:          # different drives
+        return False
+
+
+def hermetic_problems(real_root: str, sandbox_root: str, paths: dict) -> list:
+    """Why the named runtime ``paths`` are NOT hermetic, or [] when every one
+    lies inside ``sandbox_root`` and outside ``real_root``. Also refuses a
+    sandbox that IS, or sits inside, the real tree (copying into a subdir of
+    the live tree would make "inside the sandbox" mean "inside the live
+    tree"). Pure; never raises."""
+    problems = []
+    try:
+        if _inside(sandbox_root, real_root) or _inside(real_root, sandbox_root):
+            problems.append(f"sandbox {sandbox_root!r} overlaps the real tree "
+                            f"{real_root!r}")
+        for label, path in sorted((paths or {}).items()):
+            if not path:
+                problems.append(f"{label}: unresolved")
+                continue
+            if _inside(path, real_root):
+                problems.append(f"{label} -> {path} is inside the real tree "
+                                f"{real_root}")
+            elif not _inside(path, sandbox_root):
+                problems.append(f"{label} -> {path} is outside the sandbox "
+                                f"{sandbox_root}")
+    except Exception as e:      # pragma: no cover - defensive
+        problems.append(f"could not check the sandbox: {e}")
+    return problems
+
+
+def _code_files(real_root: str) -> list:
+    """Relative paths of the code to copy: every git-tracked file, plus any
+    UNTRACKED skills/*.py (gitignored personal skills are code, and the sweep
+    should exercise them). Falls back to a walk that skips the runtime-state
+    and bulk directories and every root-level file but code."""
+    rels = []
+    try:
+        out = subprocess.run(["git", "-C", real_root, "ls-files", "-z"],
+                             capture_output=True, timeout=60, check=True)
+        rels = [r for r in out.stdout.decode("utf-8", "replace").split("\0")
+                if r]
+    except Exception:
+        rels = []
+    if not rels:
+        for base, dirs, files in os.walk(real_root):
+            rel_base = os.path.relpath(base, real_root)
+            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+            for fn in files:
+                if rel_base == "." and not fn.endswith((".py",)) \
+                        and fn != "VERSION":
+                    continue    # root runtime state (*.json, queues, logs)
+                rels.append(os.path.normpath(os.path.join(rel_base, fn)))
+    skills = os.path.join(real_root, "skills")
+    if os.path.isdir(skills):
+        for base, dirs, files in os.walk(skills):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            for fn in files:
+                if fn.endswith(".py"):
+                    rels.append(os.path.relpath(os.path.join(base, fn),
+                                                real_root))
+    seen, out_rels = set(), []
+    for r in rels:
+        k = os.path.normcase(os.path.normpath(r))
+        if k not in seen:
+            seen.add(k)
+            out_rels.append(os.path.normpath(r))
+    return out_rels
+
+
+def build_sandbox(real_root: str, base_dir: str | None = None,
+                  settings: str | None = None) -> str:
+    """Copy the code of ``real_root`` into a fresh temp dir and return the
+    copy's root. It gets an EMPTY data/ (plus, with ``settings``, a copy of
+    that settings file) and no queues or state files at all."""
+    sandbox = tempfile.mkdtemp(prefix="jarvis_action_smoke_", dir=base_dir)
+    tree = os.path.join(sandbox, "tree")
+    for rel in _code_files(real_root):
+        src = os.path.join(real_root, rel)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(tree, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+    os.makedirs(os.path.join(tree, "data"), exist_ok=True)
+    os.makedirs(os.path.join(tree, "locks"), exist_ok=True)
+    if settings:
+        shutil.copy2(settings, os.path.join(tree, "data", "user_settings.json"))
+    return tree
+
+
+def sandbox_env(real_root: str, tree: str, base_env=None) -> dict:
+    """The child's environment: every runtime redirect FORCED into the
+    sandbox copy (never setdefault — an inherited JARVIS_STAGING=0 or a live
+    JARVIS_DATA_DIR must not survive), the live-data guard pointed at the
+    real tree, and the escape hatches stripped."""
+    env = dict(os.environ if base_env is None else base_env)
+    for k in _ESCAPE_ENV:
+        env.pop(k, None)
+    data = os.path.join(tree, "data")
+    env.update({
+        "JARVIS_STAGING": "1",
+        "MUTE_TTS": "1",
+        "JARVIS_TEST_MODE": "1",
+        "JARVIS_BUG_AUTO_CAPTURE": "0",
+        "JARVIS_DATA_DIR": data,
+        "JARVIS_SETTINGS_PATH": os.path.join(data, "user_settings.json"),
+        "JARVIS_LOCK_DIR": os.path.join(tree, "locks"),
+        _GUARD_ROOT_ENV: real_root,
+        _REAL_ROOT_ENV: real_root,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    return env
+
+
+def _arg_value(argv: list, flag: str):
+    if flag in argv:
+        i = argv.index(flag)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def _parent(argv: list) -> int:
+    real_root = _HERE_ROOT
+    settings = _arg_value(argv, "--settings")
+    if settings and not os.path.isfile(settings):
+        print(f"[smoke] --settings {settings!r}: no such file")
+        return 2
+    json_out = _arg_value(argv, "--json")
+    tree = build_sandbox(real_root, settings=settings)
+    sandbox = os.path.dirname(tree)
+    try:
+        env = sandbox_env(real_root, tree)
+        problems = hermetic_problems(real_root, tree, {
+            "data dir": env["JARVIS_DATA_DIR"],
+            "settings": env["JARVIS_SETTINGS_PATH"],
+            "lock dir": env["JARVIS_LOCK_DIR"],
+            "code copy": tree,
+        })
+        if problems:
+            print("[smoke] REFUSED — the sandbox is not hermetic:")
+            for p in problems:
+                print(f"    !! {p}")
+            return 2
+        child_argv = [a for a in argv if a not in ("--keep-sandbox",)]
+        if json_out:
+            i = child_argv.index("--json")
+            child_argv[i + 1] = os.path.join(sandbox, "results.json")
+        if settings:
+            i = child_argv.index("--settings")
+            del child_argv[i:i + 2]
+        print(f"[smoke] sandbox: {tree}", flush=True)
+        cmd = [sys.executable, os.path.join(tree, "tools", "action_smoke.py"),
+               _SANDBOX_FLAG] + child_argv
+        rc = subprocess.call(cmd, cwd=tree, env=env)
+        if json_out and os.path.isfile(os.path.join(sandbox, "results.json")):
+            shutil.copy2(os.path.join(sandbox, "results.json"), json_out)
+            print(f"saved {json_out}")
+        return rc
+    finally:
+        if "--keep-sandbox" in argv:
+            print(f"[smoke] sandbox kept: {sandbox}")
+        else:
+            shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def _child_preflight(bc, real_root: str, tree: str) -> list:
+    """Every runtime path the sweep can write, checked against the real tree
+    BEFORE any action runs, then the speech queue proven by a probe."""
+    from core import paths as _paths
+    try:
+        from tools.settings_window import settings_path as _settings_path
+        settings = _settings_path()
+    except Exception:
+        settings = os.environ.get("JARVIS_SETTINGS_PATH", "")
+    problems = hermetic_problems(real_root, tree, {
+        "monolith": getattr(bc, "__file__", ""),
+        "data dir": _paths.data_dir(create=False),
+        "settings": settings,
+        "lock dir": bc._singleton_lock_dir(),
+        "speech queue": getattr(bc, "PENDING_SPEECH_PATH", ""),
+        "inject queue": getattr(bc, "INJECTED_COMMANDS_PATH", ""),
+        "tray inbox": getattr(bc, "TRAY_COMMANDS_FILE", ""),
+    })
+    if problems:
+        return problems
+    # Prove it: an announcement must land in THIS copy's queue.
+    probe = f"action-smoke sandbox probe {os.getpid()}"
+    queue = bc.PENDING_SPEECH_PATH
+    try:
+        if not bc.proactive_announce(probe, source="action-smoke"):
+            return ["the probe announcement was not queued"]
+        with open(queue, encoding="utf-8") as f:
+            if probe not in f.read():
+                return [f"the probe announcement is not in {queue}"]
+    except Exception as e:
+        return [f"the speech-queue probe failed: {e}"]
+    finally:
+        try:
+            if os.path.exists(queue):
+                os.remove(queue)
+        except Exception:
+            pass
+    return []
+
+
+def _real_tree_escapes(real_root: str) -> list:
+    """Writes the live-data guard refused because they reached the REAL tree."""
+    try:
+        from tests import live_data_guard as g
+        return [v for v in g.violations()
+                if real_root and _norm(real_root) in os.path.normcase(
+                    str(v.get("detail", "")))]
+    except Exception:
+        return []
+
+
+def _child(argv: list) -> int:
+    tree = _HERE_ROOT
+    real_root = os.environ.get(_REAL_ROOT_ENV, "")
+    if not real_root or _inside(tree, real_root):
+        print("[smoke] REFUSED — the child must run inside a sandbox copy "
+              "made by the parent (run tools/action_smoke.py without "
+              f"{_SANDBOX_FLAG}).")
+        return 2
+    sys.path.insert(0, tree)
+    os.chdir(tree)
     from tests._monolith_harness import load_monolith
     bc = load_monolith()
+    problems = _child_preflight(bc, real_root, tree)
+    if problems:
+        print("[smoke] REFUSED — the sweep is not hermetic:")
+        for p in problems:
+            print(f"    !! {p}")
+        return 2
+    print("[smoke] preflight OK — every runtime path is inside the sandbox; "
+          "the probe announcement landed in the sandbox queue")
+    if "--preflight-only" in argv:
+        return 0
     # MIRROR THE BOOT ALIAS (2026-07-14 audit, finding #13). At boot the
     # monolith does `sys.modules["bobert_companion"] = sys.modules["__main__"]`,
     # so ~18 skills bridge back to it with
@@ -124,7 +411,7 @@ def main() -> int:
     # Register the SKILL actions too — the core dict alone is ~135 of the
     # ~529 total. Skill register() functions may start daemon pollers; this
     # is a one-shot process, so they die with it.
-    if "--no-skills" not in sys.argv:
+    if "--no-skills" not in argv:
         try:
             bc.load_skills()
             print(f"[smoke] skills loaded — {len(bc.ACTIONS)} total actions")
@@ -132,7 +419,11 @@ def main() -> int:
             print(f"[smoke] load_skills failed ({type(e).__name__}: {e}) — "
                   f"sweeping core actions only")
     actions: dict = dict(bc.ACTIONS)
-    deny_fns = {id(fn) for name, fn in actions.items()
+    only = _arg_value(argv, "--only")
+    if only:
+        wanted = {n.strip().lower() for n in only.split(",") if n.strip()}
+        actions = {k: v for k, v in actions.items() if k in wanted}
+    deny_fns = {id(fn) for name, fn in bc.ACTIONS.items()
                 if name in _DENYLIST_NAMES}
 
     results = {"ok": [], "honest_fail": [], "empty": [], "crash": [],
@@ -162,6 +453,10 @@ def main() -> int:
         except Exception as e:
             results["crash"].append(f"{name}: {type(e).__name__}: {e}")
 
+    escapes = _real_tree_escapes(real_root)
+    results["blocked_real_tree_writes"] = [
+        f"{v.get('kind')}: {v.get('detail')}" for v in escapes]
+
     print(f"\n=== ACTION SMOKE: {len(actions)} actions in "
           f"{time.time()-t_start:.0f}s ===")
     print(f"  OK:           {len(results['ok'])}")
@@ -170,17 +465,29 @@ def main() -> int:
     print(f"  empty:        {len(results['empty'])}")
     print(f"  skipped:      {len(results['skipped'])} (destructive/denylist)")
     print(f"  CRASH:        {len(results['crash'])}")
+    print(f"  real-tree writes blocked: {len(escapes)}")
     for c in results["crash"]:
         print(f"    !! {c}")
     for e in results["empty"][:15]:
         print(f"    (empty) {e}")
+    for e in results["blocked_real_tree_writes"]:
+        print(f"    !! ESCAPE BLOCKED {e}")
 
-    if "--json" in sys.argv:
-        out_path = sys.argv[sys.argv.index("--json") + 1]
-        with open(out_path, "w", encoding="utf-8") as f:
+    json_out = _arg_value(argv, "--json")
+    if json_out:
+        with open(json_out, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
-        print(f"saved {out_path}")
+    if escapes:
+        return 3
     return 1 if results["crash"] else 0
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if _SANDBOX_FLAG in argv:
+        argv.remove(_SANDBOX_FLAG)
+        return _child(argv)
+    return _parent(argv)
 
 
 if __name__ == "__main__":
