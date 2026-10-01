@@ -540,6 +540,39 @@ class BootDoesNotStreamTestAListedCameraTests(_StormBase):
         self.assertEqual([c.args[0] for c in probe.call_args_list], [42])
         self.assertCountEqual(working, [41, 42])
 
+    # B088 (2026-10-01): the summary lines claimed a stream test that never
+    # ran - "kept without a boot stream test" was followed by "opens cleanly"
+    # / "working" for the SAME camera.
+    def test_preflight_summary_does_not_claim_an_open_it_never_made(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
+             mock.patch.object(bc, "CAMERAS", self._cams()), \
+             mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)), \
+             mock.patch.object(bc, "_probe_camera_index",
+                               mock.Mock(return_value=True)), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            bc._preflight_cameras(timeout_sec=0.1)
+        text = out.getvalue()
+        self.assertNotIn("camera index 41: opens cleanly", text)
+        self.assertIn("camera index 41: on the device list, not stream-tested",
+                      text)
+        # The camera that WAS probed keeps the old wording.
+        self.assertIn("camera index 42: opens cleanly", text)
+
+    def test_cam_probe_summary_does_not_claim_an_open_it_never_made(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
+             mock.patch.object(bc, "CAMERAS", self._cams()), \
+             mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)), \
+             mock.patch.object(bc, "_probe_camera_index",
+                               mock.Mock(return_value=True)), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            bc.probe_cameras_and_update_config()
+        text = out.getvalue()
+        self.assertNotIn("index 41: working", text)
+        self.assertIn("index 41: listed (not stream-tested)", text)
+        self.assertIn("index 42: working", text)
+
 
 class KinectServiceLineTests(_StormBase):
     """While the Kinect runtime service is stopped, the preview does not log a
@@ -665,12 +698,18 @@ class NoDirectShowFallbackTests(_StormBase):
                             for n in notes), notes)
 
     def test_a_directshow_only_device_still_opens(self):
+        # DirectShow-only: absent from the Media Foundation list, present (by
+        # its name) on the DirectShow one. Since 2026-10-01 a named camera MF
+        # does not list is opened only when DirectShow lists THAT name.
         backend = _FakeBackend(
             self.clock, lambda n: ("opened", _Cap(self.clock)),
             resolve=lambda n, idx, name: (idx, "dshow",
-                                          "device is DirectShow-only"))
-        self.assertIsNotNone(self._open(backend))
-        self.assertIsNotNone(self._open(backend))
+                                          "device is DirectShow-only"),
+            names=lambda: ("SynthCam Two",))
+        with mock.patch.object(self.bc, "_dshow_input_devices_gated",
+                               return_value=["SynthCam One"]):
+            self.assertIsNotNone(self._open(backend))
+            self.assertIsNotNone(self._open(backend))
         self.assertEqual([b for _t, b in backend.calls], ["dshow", "dshow"])
 
     def test_no_directshow_fallback_during_a_storm(self):
@@ -684,8 +723,173 @@ class NoDirectShowFallbackTests(_StormBase):
         self.assertEqual(backend.calls, [])
 
 
+class _RosterBackend:
+    """core.camera_backend stand-in with a REAL device roster: the configured
+    webcam is OFF the bus, so DirectShow index 0 and Media Foundation index 0
+    are both the depth sensor's video interface - the rig's 2026-09-29 state.
+    resolve_capture_target follows the real rules (name on the MF list, else
+    the DirectShow name at that index translated to MF, else DirectShow at
+    the index). Every open is recorded; none delivers."""
+
+    MSMF = ("Synth Kinect Sensor", "SynthCam Spare")
+    DSHOW = ["Synth Kinect Sensor", "SynthCam Spare", "Synth Virtual Cam"]
+
+    def __init__(self):
+        self.opened: list = []
+
+    def configured_backend(self):
+        return "msmf"
+
+    def msmf_device_names(self, *a, **k):
+        return self.MSMF
+
+    def webcam_users_now(self, *a, **k):
+        return []
+
+    def resolve_capture_target(self, idx, name=None, dshow_names=None, **k):
+        low = [n.lower() for n in self.MSMF]
+        if name:
+            for i, n in enumerate(low):
+                if str(name).lower() in n:
+                    return i, "msmf", "matched name"
+        if dshow_names and 0 <= int(idx) < len(dshow_names):
+            dn = str(dshow_names[int(idx)]).lower()
+            for i, n in enumerate(low):
+                if n == dn:
+                    return i, "msmf", f"translated dshow {idx} -> msmf {i}"
+        return int(idx), "dshow", "device is DirectShow-only"
+
+    def open_camera(self, idx, *, backend="msmf", outcome=None, **kw):
+        self.opened.append((idx, backend))
+        if isinstance(outcome, dict):
+            outcome["result"] = "not-opened"
+        return None
+
+
+_DESK = {"index": 0, "label": "Right webcam (top of right monitor)",
+         "name": "synthcam desk", "primary": True, "look_x": 0.85,
+         "look_y": 0.5}
+
+
+class WrongDeviceProbeTests(_StormBase):
+    """B025 (2026-10-01): with the configured webcam off the bus at boot, the
+    probe opened a DIFFERENT camera (the depth sensor) under the webcam's gate
+    key, and the boot probes then dropped the webcam - or replaced it with
+    unnamed 'Probed webcam' entries - for the whole session."""
+
+    def _patches(self, backend, cams):
+        bc = self.bc
+        return [mock.patch.object(bc, "_camera_backend", backend),
+                mock.patch.object(bc, "_camera_gate", self.gate, create=True),
+                mock.patch.object(bc, "CAMERAS", [dict(c) for c in cams]),
+                mock.patch.object(bc, "_camera_msmf_seen", set()),
+                mock.patch.object(bc, "_camera_open_last_result", {}),
+                # The open path's DirectShow cache is WARM: the face tracker's
+                # _open_capture resolves the name (_dshow_name_to_index)
+                # before it opens, and the boot probe asks where the camera is
+                # listed before it probes.
+                mock.patch.object(bc, "_dshow_open_devices_cache",
+                                  [list(_RosterBackend.DSHOW), "fp", 0.0]),
+                mock.patch.object(bc, "_dshow_input_devices_gated",
+                                  return_value=list(_RosterBackend.DSHOW))]
+
+    def _run(self, backend, cams, fn):
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(backend, cams):
+                stack.enter_context(p)
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            return fn(), list(self.bc.CAMERAS), dict(
+                self.bc._camera_open_last_result)
+
+    def test_the_probe_does_not_open_another_device(self):
+        backend = _RosterBackend()
+        ok, _cams, _res = self._run(
+            backend, [_DESK],
+            lambda: self.bc._probe_camera_index(0, timeout_sec=0.3))
+        self.assertFalse(ok)
+        self.assertEqual(backend.opened, [],
+                         "the probe stream-started a device that is not the "
+                         "configured webcam")
+
+    def test_the_first_open_after_a_restart_does_not_fall_back(self):
+        # Nothing has been seen on Media Foundation yet this process: the old
+        # rule fell back to DirectShow at the static index.
+        backend = _RosterBackend()
+        cap, _cams, res = self._run(
+            backend, [_DESK],
+            lambda: self.bc._camera_open(0, name="synthcam desk",
+                                         label="synth"))
+        self.assertIsNone(cap)
+        self.assertEqual(backend.opened, [])
+        self.assertEqual(res.get("name:synthcam desk"), "absent")
+
+    def test_a_directshow_only_camera_opens_at_its_own_index(self):
+        backend = _RosterBackend()
+        virt = dict(_DESK, name="synth virtual cam")
+        self._run(backend, [virt],
+                  lambda: self.bc._camera_open(0, name="synth virtual cam",
+                                               label="synth"))
+        self.assertEqual(backend.opened, [(2, "dshow")])
+
+    def _two_cams(self):
+        return [dict(_DESK), dict(_CAM_B)]
+
+    def test_preflight_keeps_a_named_camera_that_did_not_answer(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
+             mock.patch.object(bc, "_camera_boot_presence", return_value=None), \
+             mock.patch.object(bc, "_camera_rescued_by_name", return_value=False), \
+             mock.patch.object(bc, "_probe_camera_index",
+                               side_effect=lambda i, *a, **k: i == 42):
+            _r, cams, _res = self._run(
+                _RosterBackend(), self._two_cams(),
+                lambda: bc._preflight_cameras(timeout_sec=0.05))
+        self.assertIn("synthcam desk", [c.get("name") for c in cams])
+
+    def test_the_boot_probe_keeps_a_named_camera_that_did_not_answer(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
+             mock.patch.object(bc, "_camera_boot_presence", return_value=None), \
+             mock.patch.object(bc, "_camera_rescued_by_name", return_value=False), \
+             mock.patch.object(bc, "_probe_camera_index",
+                               side_effect=lambda i, *a, **k: i == 42):
+            _r, cams, _res = self._run(
+                _RosterBackend(), self._two_cams(),
+                bc.probe_cameras_and_update_config)
+        self.assertIn("synthcam desk", [c.get("name") for c in cams])
+
+    def test_no_index_sweep_replaces_a_named_camera(self):
+        bc = self.bc
+        probe = mock.Mock(side_effect=lambda i, *a, **k: i != 0)
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
+             mock.patch.object(bc, "_camera_boot_presence", return_value=None), \
+             mock.patch.object(bc, "_camera_rescued_by_name", return_value=False), \
+             mock.patch.object(bc, "camera_users_now", return_value=None), \
+             mock.patch.object(bc, "find_camera_locking_processes",
+                               return_value=[]), \
+             mock.patch.object(bc, "_probe_camera_index", probe):
+            (working, _failed), cams, _res = self._run(
+                _RosterBackend(), [_DESK],
+                bc.probe_cameras_and_update_config)
+        self.assertEqual([c.get("name") for c in cams], ["synthcam desk"],
+                         "an index sweep replaced the configured webcam")
+        self.assertEqual([c.args[0] for c in probe.call_args_list], [0],
+                         "other indices were stream-started")
+        self.assertEqual(working, [])
+
+
 class OneDeviceTwoComponentsTests(_StormBase):
     """Two JARVIS components never open the same device back-to-back."""
+
+    def setUp(self):
+        super().setUp()
+        # A fake device list that LISTS the synthetic cameras: the boot probe
+        # asks where a named camera is listed before it probes it (B025,
+        # 2026-10-01), and this machine's real lists have never heard of them.
+        p = mock.patch.object(self.bc, "_camera_backend",
+                              _FakeBackend(self.clock))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _fake_camera_open(self, calls):
         def _open(idx, **kw):

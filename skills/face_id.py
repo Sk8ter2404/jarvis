@@ -127,37 +127,60 @@ def _primary_index() -> int:
     return 0
 
 
-def _grab_frame(index: int):
-    """A copy of the most recent BGR frame for `index` from the monolith's
-    shared _camera_latest_frame cache (copied under _camera_state_lock), or
-    None. NEVER raises."""
+def _grab_frame_ts(index: int):
+    """(frame_copy, ts) for the primary-webcam frame `index`, or (None, None).
+
+    A LIVE frame only (2026-10-01): the monolith's _fresh_camera_frame refuses
+    a cached frame older than its freshness window. The cache is never cleared
+    when a camera dies, so the old straight read handed enroll_face, whoami and
+    face_id_status the last frame of a camera that had been dark for minutes.
+    ts is None on an older monolith without the helper (straight cache read,
+    as before). NEVER raises."""
     bc = _bc()
     if bc is None:
-        return None
+        return None, None
+    fresh = getattr(bc, "_fresh_camera_frame", None)
+    if callable(fresh):
+        try:
+            fr, ts = fresh(index)
+            return fr, ts
+        except Exception:
+            return None, None
     lock = getattr(bc, "_camera_state_lock", None)
     latest = getattr(bc, "_camera_latest_frame", None)
     if latest is None:
-        return None
+        return None, None
     try:
         if lock is not None:
             with lock:
                 fr = latest.get(index)
-                return fr.copy() if fr is not None else None
+                return (fr.copy() if fr is not None else None), None
         fr = latest.get(index)
-        return fr.copy() if fr is not None else None
+        return (fr.copy() if fr is not None else None), None
     except Exception:
-        return None
+        return None, None
+
+
+def _grab_frame(index: int):
+    """A copy of the most recent LIVE BGR frame for `index` from the
+    monolith's shared frame cache, or None (no frame, or only a stale one).
+    NEVER raises."""
+    return _grab_frame_ts(index)[0]
 
 
 def _grab_frames(index: int, n: int = 5, gap_s: float = 0.4) -> list:
     """Collect up to `n` webcam frames over ~n*gap_s seconds (small waits let a
-    new frame arrive between grabs). De-dupes nothing — the engine picks the
-    largest face per frame. NEVER raises."""
+    new frame arrive between grabs). A grab that hands back the SAME frame as
+    the previous one (same producer timestamp) is skipped (2026-10-01): one
+    frozen frame used to be enrolled five times and reported as "5 good
+    views". The engine picks the largest face per frame. NEVER raises."""
     out = []
+    last_ts = None
     for i in range(max(1, n)):
-        fr = _grab_frame(index)
-        if fr is not None:
+        fr, ts = _grab_frame_ts(index)
+        if fr is not None and not (ts is not None and ts == last_ts):
             out.append(fr)
+            last_ts = ts
         if i < n - 1:
             try:
                 time.sleep(max(0.0, gap_s))
@@ -167,7 +190,7 @@ def _grab_frames(index: int, n: int = 5, gap_s: float = 0.4) -> list:
 
 
 def _camera_available(index: int) -> bool:
-    """True if the primary webcam handed us a frame just now."""
+    """True if the primary webcam handed us a LIVE frame just now."""
     return _grab_frame(index) is not None
 
 

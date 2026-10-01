@@ -353,6 +353,12 @@ _MONOLITH_RESTORE_NAMES = (
     # ...and the privacy-log "who is using a webcam" cache (a leaked entry
     # would make the next test's lock decision depend on this one's).
     "_camera_users_cache",
+    # ...and which per-camera preview tiles this process has written
+    # (2026-10-01). A key left by a test that published a tile makes a LATER
+    # test's camera-off pass try to delete that key's file at whatever path is
+    # in force by then - the tree's real data/ once the writer's temp-path
+    # patch has been stopped.
+    "_hud_percam_present",
     # ...and the camera-OPEN path's slot of the same gate, which
     # _dshow_name_to_index() owns. Same hazard as the resolver's cells above and
     # then some: this one is consulted by _open_capture and by the boot rescue,

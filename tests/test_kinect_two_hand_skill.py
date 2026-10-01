@@ -13,6 +13,7 @@ Mocks bodies (joints x/y/z) + Win32 — App-Control-safe, stdlib unittest only.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -315,11 +316,13 @@ class TwoHandControllerTests(_Base):
         """Drive through the grab-hold so the controller is GRABBED on `rect`."""
         c.update(both_engaged=True, hand_dist=dist, midpoint=mid,
                  focused_rect=rect, bounds=self.BOUNDS,
-                 hands=((1000, 700), (1400, 700)))
+                 hands=((1000, 700), (1400, 700)),
+                 left_grip="closed", right_grip="closed")
         clk.advance(0.25)   # past the hold
         d = c.update(both_engaged=True, hand_dist=dist, midpoint=mid,
                      focused_rect=rect, bounds=self.BOUNDS,
-                     hands=((1000, 700), (1400, 700)))
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="closed", right_grip="closed")
         return d
 
     def test_hold_then_grab_captures_rect(self):
@@ -330,7 +333,8 @@ class TwoHandControllerTests(_Base):
         # First frame: HOLDING (active so the air-mouse stands down, but no rect yet).
         d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                      focused_rect=rect, bounds=self.BOUNDS,
-                     hands=((1000, 700), (1400, 700)))
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="closed", right_grip="closed")
         self.assertEqual(d.phase, "holding")
         self.assertTrue(d.active)
         self.assertFalse(d.resizing)
@@ -339,7 +343,8 @@ class TwoHandControllerTests(_Base):
         clk.advance(0.25)
         d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                      focused_rect=rect, bounds=self.BOUNDS,
-                     hands=((1000, 700), (1400, 700)))
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="closed", right_grip="closed")
         self.assertEqual(d.phase, "grabbed")
         self.assertTrue(d.resizing)
         self.assertEqual(d.rect, rect)
@@ -520,7 +525,15 @@ class TwoHandControllerTests(_Base):
                      left_grip="open", right_grip="open")
         self.assertEqual(d.phase, "holding")
         self.assertFalse(c.is_grabbed)
-        # Close the fists → the grab latches on the next confirmed frame.
+        # Close the fists → the hold starts over from the first fist frame
+        # (2026-10-01: fists for the WHOLE hold), and the grab latches once
+        # they have been held through it.
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=rect, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="closed", right_grip="closed")
+        self.assertEqual(d.phase, "holding")
+        clk.advance(0.25)
         d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                      focused_rect=rect, bounds=self.BOUNDS,
                      hands=((1000, 700), (1400, 700)),
@@ -536,11 +549,13 @@ class TwoHandControllerTests(_Base):
         # Both hands up for < the hold, then released → never grabbed (no window move).
         c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                  focused_rect=rect, bounds=self.BOUNDS,
-                 hands=((1000, 700), (1400, 700)))
+                 hands=((1000, 700), (1400, 700)),
+                 left_grip="closed", right_grip="closed")
         clk.advance(0.10)    # still under 0.20 hold
         d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                      focused_rect=rect, bounds=self.BOUNDS,
-                     hands=((1000, 700), (1400, 700)))
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="closed", right_grip="closed")
         self.assertEqual(d.phase, "holding")
         self.assertFalse(d.resizing)
         # Then release.
@@ -555,11 +570,13 @@ class TwoHandControllerTests(_Base):
         # Both hands up over the DESKTOP (no grabbable window → focused_rect None).
         c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                  focused_rect=None, bounds=self.BOUNDS,
-                 hands=((1000, 700), (1400, 700)))
+                 hands=((1000, 700), (1400, 700)),
+                 left_grip="closed", right_grip="closed")
         clk.advance(0.25)
         d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                      focused_rect=None, bounds=self.BOUNDS,
-                     hands=((1000, 700), (1400, 700)))
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="closed", right_grip="closed")
         # Active (air-mouse stands down) but nothing grabbed / moved.
         self.assertTrue(d.active)
         self.assertFalse(d.resizing)
@@ -575,11 +592,13 @@ class TwoHandControllerTests(_Base):
         # grab
         c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                  focused_rect=rect, bounds=self.BOUNDS,
-                 hands=((1000, 700), (1400, 700)))
+                 hands=((1000, 700), (1400, 700)),
+                 left_grip="closed", right_grip="closed")
         clk.advance(0.25)
         c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                  focused_rect=rect, bounds=self.BOUNDS,
-                 hands=((1000, 700), (1400, 700)))
+                 hands=((1000, 700), (1400, 700)),
+                 left_grip="closed", right_grip="closed")
         # One big spread frame: with alpha 0.5 the FIRST output is only PART-WAY to
         # the (step-capped) target — i.e. smoothed, not a jump.
         d = c.update(both_engaged=True, hand_dist=0.80, midpoint=(1200, 700),
@@ -735,6 +754,109 @@ class PollWin32Tests(_Base):
                 clk.advance(0.05)
                 d = mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
         self.assertFalse(d.active)         # one hand → not two-hand mode
+        self.assertEqual(calls, [])
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  B085 (2026-10-01): a STRETCH must not grab the foreground window
+# ══════════════════════════════════════════════════════════════════════════
+class StretchDoesNotGrabTests(_Base):
+    """Both arms straight up with relaxed hands latched the foreground window
+    in 0.2 s (any grip but a double-open on the latch frame), and two-hand
+    skipped the air-mouse's real-input yield and fullscreen-app stand-down."""
+
+    BOUNDS = (0, 0, 2560, 1440)
+
+    def _hold(self, c, clk, *, secs, left="closed", right="closed", rect=None,
+              step=0.05):
+        rect = rect or self._rect
+        d = None
+        t_end = clk.t + secs
+        while clk.t <= t_end:
+            d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                         focused_rect=rect, bounds=self.BOUNDS,
+                         hands=((1000, 700), (1400, 700)),
+                         left_grip=left, right_grip=right)
+            clk.advance(step)
+        return d
+
+    def test_a_stretch_with_relaxed_hands_never_grabs(self):
+        mod = self._load()
+        self._rect = mod.Rect(800, 400, 1600, 1000)
+        clk = _Clock()
+        c = mod.TwoHandController(clock=clk, grab_hold_sec=0.20)
+        # Relaxed / occluded hands read "unknown"; one open, one unknown too.
+        for grips in (("unknown", "unknown"), ("open", "unknown")):
+            c.reset()
+            self._hold(c, clk, secs=1.5, left=grips[0], right=grips[1])
+            self.assertFalse(c.is_grabbed, f"a stretch with {grips} grabbed")
+
+    def test_one_relaxed_frame_restarts_the_hold(self):
+        mod = self._load()
+        self._rect = mod.Rect(800, 400, 1600, 1000)
+        clk = _Clock()
+        c = mod.TwoHandController(clock=clk, grab_hold_sec=0.20)
+        self._hold(c, clk, secs=0.15)                       # fists 0.15 s
+        self._hold(c, clk, secs=0.0, left="unknown")        # one relaxed frame
+        d = self._hold(c, clk, secs=0.10)                   # fists again
+        self.assertEqual(d.phase, "holding")
+        self.assertFalse(c.is_grabbed)
+        d = self._hold(c, clk, secs=0.20)                   # a full hold of fists
+        self.assertTrue(c.is_grabbed)
+
+    def test_default_hold_is_deliberate(self):
+        mod = self._load()
+        self._rect = mod.Rect(800, 400, 1600, 1000)
+        clk = _Clock()
+        c = mod.TwoHandController(clock=clk)                # shipped default
+        self._hold(c, clk, secs=0.30)
+        self.assertFalse(c.is_grabbed, "fists for 0.3 s grabbed the window")
+        self._hold(c, clk, secs=0.40)
+        self.assertTrue(c.is_grabbed)
+
+    def _poll_fists(self, mod, *, secs=1.0, **am_patches):
+        self._not_staging(mod)
+        self._patch_flag(True)
+        calls: list = []
+        fg = lambda: (4242, mod.Rect(800, 400, 1600, 1000))   # noqa: E731
+        swp = lambda hwnd, rect: calls.append((hwnd, rect)) or True  # noqa: E731
+        clk = _Clock()
+        ctrl = mod.TwoHandController(clock=clk, grab_hold_sec=0.20)
+        fists = _both_up_body(left_x=-0.30, right_x=0.30)
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[fists])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False), \
+             contextlib.ExitStack() as stack:
+            for name, fn in am_patches.items():
+                stack.enter_context(mock.patch.object(self._am, name, fn))
+            t_end = clk.t + secs
+            while clk.t <= t_end:
+                mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+                clk.advance(0.05)
+        return ctrl, calls
+
+    def test_control_fists_held_still_do_grab(self):
+        mod = self._load()
+        ctrl, calls = self._poll_fists(
+            mod, real_input_recent=lambda *a, **k: False,
+            _per_app_disabled=lambda: False)
+        self.assertTrue(ctrl.is_grabbed)
+        self.assertTrue(calls)
+
+    def test_no_grab_while_the_owner_is_using_the_real_mouse(self):
+        mod = self._load()
+        ctrl, calls = self._poll_fists(
+            mod, real_input_recent=lambda *a, **k: True,
+            _per_app_disabled=lambda: False)
+        self.assertFalse(ctrl.is_grabbed)
+        self.assertEqual(calls, [])
+
+    def test_no_grab_over_a_fullscreen_game(self):
+        mod = self._load()
+        ctrl, calls = self._poll_fists(
+            mod, real_input_recent=lambda *a, **k: False,
+            _per_app_disabled=lambda: True)
+        self.assertFalse(ctrl.is_grabbed)
         self.assertEqual(calls, [])
 
 
@@ -969,11 +1091,13 @@ class TwoHandDeadManTests(_Base):
     def _grab(self, mod, c, clk, rect):
         c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                  focused_rect=rect, bounds=self.BOUNDS,
-                 hands=((1000, 700), (1400, 700)))
+                 hands=((1000, 700), (1400, 700)),
+                 left_grip="closed", right_grip="closed")
         clk.advance(0.25)
         return c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                         focused_rect=rect, bounds=self.BOUNDS,
-                        hands=((1000, 700), (1400, 700)))
+                        hands=((1000, 700), (1400, 700)),
+                        left_grip="closed", right_grip="closed")
 
     def test_brief_inferred_flicker_holds_the_window(self):
         mod = self._load()
@@ -1040,11 +1164,13 @@ class TwoHandBodyIdPinTests(_Base):
     def _grab(self, mod, c, clk, rect, *, body_id):
         c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                  focused_rect=rect, bounds=self.BOUNDS,
-                 hands=((1000, 700), (1400, 700)), body_id=body_id)
+                 hands=((1000, 700), (1400, 700)), body_id=body_id,
+                 left_grip="closed", right_grip="closed")
         clk.advance(0.25)
         return c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
                         focused_rect=rect, bounds=self.BOUNDS,
-                        hands=((1000, 700), (1400, 700)), body_id=body_id)
+                        hands=((1000, 700), (1400, 700)), body_id=body_id,
+                        left_grip="closed", right_grip="closed")
 
     def test_id_change_releases_grab(self):
         mod = self._load()

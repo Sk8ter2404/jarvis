@@ -64,6 +64,26 @@ def _fake_bridge(bodies):
     return m
 
 
+class _FakeFrame:
+    """Duck-typed BGR frame for the greeting's freshness checks (no numpy on
+    the light tier): 1280 px wide, and a content fingerprint taken from
+    ``payload`` - two frames with the same payload are the same buffer."""
+
+    shape = (720, 1280, 3)
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def copy(self):
+        return self
+
+    def __getitem__(self, _key):
+        return self
+
+    def tobytes(self):
+        return self._payload
+
+
 class _Base(unittest.TestCase):
     def _load(self):
         mod, _ = load_skill_isolated("face_tracker", register=False)
@@ -414,20 +434,19 @@ class NewPeopleTests(_Base):
         two strangers trigger the greeting."""
         ft = self._load()
         bc = _fake_bc()
-        # Webcam frame cache + primary camera, like the monolith exposes. The
-        # frame needs a .copy() (the grab helper copies it under the lock).
+        # Webcam frame cache + primary camera, like the monolith exposes. Each
+        # scan sees a NEW frame (a re-served one is no evidence - 2026-10-01),
+        # and the faces are desk-sized (the presence size floor).
         bc._camera_state_lock = threading.Lock()
         bc.CAMERAS = [{"index": 0, "primary": True, "look_x": 0.85}]
-        frame = mock.MagicMock()
-        frame.copy.return_value = frame
-        bc._camera_latest_frame = {0: frame}
+        bc._camera_latest_frame = {0: _FakeFrame(b"scan-1")}
 
         eng = types.ModuleType("audio.face_id")
         eng.is_available = lambda: (True, "")
         eng.recognize = lambda fr: [
-            {"name": "unknown", "score": 0.1, "bbox": [0, 0, 9, 9]},
-            {"name": "owner",   "score": 0.8, "bbox": [9, 0, 9, 9]},
-            {"name": "unknown", "score": 0.0, "bbox": [18, 0, 9, 9]},
+            {"name": "unknown", "score": 0.1, "bbox": [0, 0, 200, 200]},
+            {"name": "owner",   "score": 0.8, "bbox": [300, 0, 200, 200]},
+            {"name": "unknown", "score": 0.0, "bbox": [600, 0, 200, 200]},
         ]
         self._inject("audio.face_id", eng)
         self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
@@ -435,11 +454,91 @@ class NewPeopleTests(_Base):
         t0 = 1000.0
         ft._apply_greet_new_people(present=True, now=t0, bc=bc)
         self.assertEqual(bc._announced, [])          # confirm window pending
+        bc._camera_latest_frame[0] = _FakeFrame(b"scan-2")
         ft._apply_greet_new_people(
             present=True, now=t0 + ft.GREET_NEW_PEOPLE_CONFIRM_SECONDS + 0.5,
             bc=bc)
         self.assertEqual(len(bc._announced), 1)
         self.assertEqual(bc._announced[0][0], "new_people")
+
+    # ── B084 (2026-10-01) ───────────────────────────────────────────────────
+    def _engine_seeing(self, *bboxes):
+        eng = types.ModuleType("audio.face_id")
+        eng.is_available = lambda: (True, "")
+        eng.recognize = lambda fr: [
+            {"name": "unknown", "score": 0.1, "bbox": list(b)} for b in bboxes]
+        self._inject("audio.face_id", eng)
+
+    def _webcam_bc(self, frame):
+        bc = _fake_bc()
+        bc._camera_state_lock = threading.Lock()
+        bc.CAMERAS = [{"index": 0, "primary": True, "look_x": 0.85}]
+        bc._camera_latest_frame = {0: frame}
+        return bc
+
+    def test_one_stranger_gets_a_singular_line(self):
+        # Both logged greetings fired on ONE unknown face and said "a few
+        # unfamiliar faces" / "these faces".
+        ft = self._load()
+        bc = _fake_bc()
+        self._stub_count(ft, 1)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 0.5, bc=bc)
+        self.assertEqual(len(bc._announced), 1)
+        said = bc._announced[0][1]
+        self.assertFalse(any(said.startswith(ln)
+                             for ln in ft.GREET_NEW_PEOPLE_LINES),
+                         f"a plural crowd line for one face: {said!r}")
+
+    def test_a_face_on_a_tv_across_the_room_does_not_count(self):
+        # 40 px wide on a 1280 px frame: below core.face_presence's size floor
+        # (a face on a screen, not a person at the desk).
+        ft = self._load()
+        self._engine_seeing((100, 100, 40, 40))
+        bc = self._webcam_bc(_FakeFrame(b"tv-1"))
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        bc._camera_latest_frame[0] = _FakeFrame(b"tv-2")
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 0.5, bc=bc)
+        self.assertEqual(bc._announced, [])
+
+    def test_a_re_served_frame_is_not_a_second_sighting(self):
+        # The SAME buffer at every scan (a stalled source re-serving it):
+        # one stale stranger must not satisfy the confirm window.
+        ft = self._load()
+        self._engine_seeing((100, 100, 200, 200))
+        frame = _FakeFrame(b"frozen")
+        bc = self._webcam_bc(frame)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        for dt in (0.0, 2.1, 4.2, self._confirm(ft) + 0.5):
+            ft._apply_greet_new_people(present=True, now=t0 + dt, bc=bc)
+        self.assertEqual(bc._announced, [])
+
+    def test_a_scan_that_cannot_read_does_not_carry_the_count(self):
+        # One sighting, then a scan with no reading, then one more sighting:
+        # the old code kept the first count across the blind scan and greeted.
+        ft = self._load()
+        bc = _fake_bc()
+        seq = iter([1, None, 1])
+        p = mock.patch.object(ft, "_count_unknown_faces",
+                              lambda _bc: next(seq))
+        p.start()
+        self.addCleanup(p.stop)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=t0 + ft.GREET_NEW_PEOPLE_SCAN_INTERVAL + 0.1,
+            bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 0.5, bc=bc)
+        self.assertEqual(bc._announced, [])
 
 
 if __name__ == "__main__":

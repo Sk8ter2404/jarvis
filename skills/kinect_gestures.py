@@ -11,8 +11,12 @@ GESTURE → ACTION MAP
 ====================
   WAVE       → wake JARVIS if it's dormant (the tray force_wake path).
                "You waved me over, sir." No-op if already awake.
-  RAISE_HAND → confirm the pending confirmation if one is queued (the same as
-               saying "yes"). No-op when nothing is pending.
+  RAISE_HAND → NEVER confirms (2026-10-01). Everything that reaches the
+               confirmation queue is a hard gate (a destructive shell command,
+               reset_memory, a delete / buy / pay, a pushback) that needs a
+               SPOKEN yes; a raised hand is a stretch or a hand on the head as
+               often as it is a signal, and it can be anyone the Kinect sees.
+               With something pending it reminds the owner to say yes.
   SWIPE      → "never mind": interrupt any current TTS and clear a pending
                confirmation. The stop/cancel path.
 
@@ -192,41 +196,37 @@ def _do_wave(bc) -> None:
         print(f"  [gestures] wave-wake failed: {e}")
 
 
-def _do_raise_hand(bc) -> None:
-    """RAISE_HAND → confirm a pending confirmation (equivalent to 'yes').
-    No-op when nothing is queued. Reuses handle_confirmation_response so the
-    confirm path (execute + spoken feedback) is identical to a voice 'yes'.
+# One spoken "needs a spoken yes" reminder per this many seconds: a hand held
+# up (or a long stretch) re-fires RAISE_HAND.
+_RAISE_HAND_NUDGE_GAP_S = 30.0
+_raise_hand_nudged_at = [0.0]
 
-    Only a FRESH prompt, and only while JARVIS is awake (2026-10-01). The
-    queue never expired and the gesture checked nothing, so a reset_memory or
-    destructive shell command the owner had refused (his bare "no" is dropped
-    in wake-word mode) ran hours later when anyone in view stretched. Now a
-    lapsed queue is dropped, and a hand confirms only within
-    GESTURE_CONFIRM_MAX_AGE_S of the prompt - fail-closed when the monolith
-    can't say how old it is."""
+
+def _do_raise_hand(bc) -> None:
+    """RAISE_HAND → a reminder, NEVER a confirmation (2026-10-01).
+
+    This used to call handle_confirmation_response("yes") on the gesture
+    poller thread whenever anything was queued. Only the CONFIRM_KEYWORDS and
+    pushback paths queue there - the hard gates whose own comments require a
+    SPOKEN yes - and RAISE_HAND fires on ANY hand above the head of the
+    nearest tracked body for 0.8 s: a one-arm stretch, a hand on the head, a
+    guest. It also drained the queue from a second thread while the main loop
+    could be appending to or cancelling it. Now it only tells the owner the
+    action is waiting on his voice. No-op when nothing is queued."""
     try:
         pending = getattr(bc, "_pending_confirmation", None)
         if not pending:
             return
-        if _in_standby(bc):
-            print("  [gestures] RAISE_HAND ignored - JARVIS is dormant")
+        print("  [gestures] RAISE_HAND ignored - a pending confirmation needs "
+              "a spoken yes")
+        now = time.monotonic()
+        if (_raise_hand_nudged_at[0]
+                and (now - _raise_hand_nudged_at[0]) < _RAISE_HAND_NUDGE_GAP_S):
             return
-        expire = getattr(bc, "_expire_pending_confirmation", None)
-        if callable(expire) and expire():
-            return
-        age_fn = getattr(bc, "pending_confirmation_age", None)
-        age = age_fn() if callable(age_fn) else None
-        max_age = float(getattr(bc, "GESTURE_CONFIRM_MAX_AGE_S", 20.0))
-        if age is None or age > max_age:
-            print("  [gestures] RAISE_HAND ignored - the confirmation prompt "
-                  "is not fresh enough to answer by gesture")
-            return
-        handler = getattr(bc, "handle_confirmation_response", None)
-        if callable(handler):
-            handler("yes")
-            print("  [gestures] RAISE_HAND -> confirmed pending action(s)")
+        _raise_hand_nudged_at[0] = now
+        _speak(bc, "That one needs a spoken yes, sir.")
     except Exception as e:
-        print(f"  [gestures] raise-hand confirm failed: {e}")
+        print(f"  [gestures] raise-hand reminder failed: {e}")
 
 
 def _do_swipe(bc) -> bool:
@@ -527,7 +527,7 @@ def gesture_status(_: str = "") -> str:
     view. 'what gestures can you see' / 'is gesture control on'."""
     enabled = _cfg_flag("KINECT_GESTURES_ENABLED")
     in_view = _body_in_view()
-    gestures = "wave to wake me, raise a hand to confirm, or swipe to cancel"
+    gestures = "wave to wake me, or swipe to cancel"
     if not enabled:
         return ("Gesture control is off, sir — say 'turn on gesture control' to "
                 f"enable it. Once on, you can {gestures}.")
@@ -559,7 +559,7 @@ def gestures_on(_: str = "") -> str:
             pass
     if already:
         return already + sensor_note
-    msg = "Gesture control on, sir — wave to wake me, raise a hand to confirm, swipe to cancel."
+    msg = "Gesture control on, sir — wave to wake me, swipe to cancel."
     if not persisted:
         msg += " (I couldn't save it, so it'll revert on restart.)"
     return msg + sensor_note

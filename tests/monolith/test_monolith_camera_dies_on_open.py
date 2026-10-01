@@ -147,5 +147,45 @@ class UseTheKinectAgainTests(_StormBase):
             self.assertFalse(g.quarantined("name:synthcam one"))
 
 
+@requires_monolith
+class VerdictSurvivesARestartWiringTests(_StormBase):
+    """B083 (2026-10-01): the live process remembers the dies-on-open verdict
+    in its data dir; a staging / test process neither reads nor writes it."""
+
+    _dies_on_open = UseTheKinectAgainTests._dies_on_open
+
+    def _drive(self, fn, *, staging: bool, path: str):
+        from core import paths
+        bc = self.bc
+        g = bc._make_camera_gate(clock=self.clock.time)
+        # The Kinect is ON the (fake) device list: this machine's real one
+        # must not decide whether the gate lets the bridge open it.
+        backend = _FakeBackend(self.clock, names=lambda: (
+            "SynthCam One", "Synth Kinect Sensor"))
+        with mock.patch.object(paths, "is_staging", return_value=staging), \
+             mock.patch.object(paths, "data_file", return_value=path), \
+             mock.patch.object(bc, "_camera_backend", backend), \
+             mock.patch.object(bc, "proactive_announce", return_value=True), \
+             mock.patch("builtins.print"):
+            fn(g)
+            self._dies_on_open(g, 3)
+        return g
+
+    def test_live_remembers_and_staging_does_not(self):
+        import shutil
+        import tempfile
+        fn = getattr(self.bc, "_camera_gate_enable_persistence", None)
+        self.assertTrue(callable(fn), "the monolith never enables persistence")
+        tmp = tempfile.mkdtemp(prefix="jarvis_doo_wiring_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "camera_gate_doo.json")
+        self._drive(fn, staging=True, path=path)
+        self.assertFalse(os.path.exists(path),
+                         "a staging process wrote the live verdict file")
+        self._drive(fn, staging=False, path=path)
+        with open(path, encoding="utf-8") as fh:
+            self.assertIn("kinect", json.load(fh))
+
+
 if __name__ == "__main__":   # pragma: no cover
     unittest.main()

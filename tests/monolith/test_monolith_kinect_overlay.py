@@ -1339,10 +1339,13 @@ class PreviewColorKeepAliveTests(MonolithGlobalsTestCase):
             first = self.bc._compose_kinect_preview(now=1.0)
         self.assertIsNotNone(first)
         self.assertIsNotNone(self.bc._kinect_preview_last_color[0])
-        # Now color returns None (a transient gap). The compose must NOT return
-        # None — it re-serves the last cached color frame (preview stays alive).
+        # Now color returns None (a transient gap, the runtime still open).
+        # The compose must NOT return None — it re-serves the last cached
+        # color frame (preview stays alive).
         with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
                                return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_stream_health",
+                                  return_value={"open": True}), \
                 mock.patch.object(self.bc._kinect_bridge, "get_bodies",
                                   return_value=[]), \
                 mock.patch.object(self.bc, "_read_side_tile_webcams",
@@ -1356,6 +1359,79 @@ class PreviewColorKeepAliveTests(MonolithGlobalsTestCase):
         with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
                                return_value=None):
             self.assertIsNone(self.bc._compose_kinect_preview(now=1.0))
+
+    # ── B026 (2026-10-01): the cache is for a TRANSIENT gap only ───────────
+    def _cache_a_frame(self, now):
+        np = _np()
+        color = np.full((1080, 1920, 3), 60, dtype=np.uint8)
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            self.assertIsNotNone(self.bc._compose_kinect_preview(now=now))
+
+    def _miss(self, now, *, open_):
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_stream_health",
+                                  return_value={"open": open_}), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}), \
+                mock.patch("builtins.print"):
+            return self.bc._compose_kinect_preview(now=now)
+
+    def test_no_runtime_open_drops_the_cache(self):
+        # The camera gate holds the Kinect (dies-on-open retry): no runtime for
+        # 30-60 min. The last frame must NOT stand in for the live webcam.
+        self._cache_a_frame(1.0)
+        self.assertIsNone(self._miss(2.0, open_=False))
+        self.assertIsNone(self.bc._kinect_preview_last_color[0],
+                          "the frozen frame is still cached")
+        # ...and it stays gone when the runtime is back but has no frame yet.
+        self.assertIsNone(self._miss(3.0, open_=True))
+
+    def test_an_old_cached_frame_is_not_re_served(self):
+        self._cache_a_frame(1.0)
+        self.assertIsNone(
+            self._miss(1.0 + self.bc._KINECT_PREVIEW_CACHE_MAX_S + 1.0
+                       if hasattr(self.bc, "_KINECT_PREVIEW_CACHE_MAX_S")
+                       else 7.0, open_=True))
+
+    def test_the_hud_falls_back_to_the_webcam_mirror(self):
+        # _hud_kinect_preview_write returning False is what makes the producer
+        # write the PRIMARY WEBCAM frame instead (`if not
+        # _hud_kinect_preview_write(now_loop): _hud_camera_preview_write(...)`
+        # in the face-track producer), and the 'kinect' per-camera tile is no
+        # longer refreshed - so the web dashboard can say why it is off.
+        bc = self.bc
+        self._cache_a_frame(1.0)
+        shared = mock.Mock(return_value=True)
+        percam = mock.Mock(return_value=True)
+        with mock.patch.object(bc, "_hud_kinect_skeleton_overlay_enabled",
+                               return_value=True), \
+                mock.patch.object(bc, "_hud_cam_preview_last_write", [0.0]), \
+                mock.patch.object(bc, "_hud_camera_preview_write", shared), \
+                mock.patch.object(bc, "_hud_percam_preview_write", percam), \
+                mock.patch.object(bc._kinect_bridge, "get_color_bgr",
+                                  return_value=None), \
+                mock.patch.object(bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=None), \
+                mock.patch.object(bc._kinect_bridge, "get_stream_health",
+                                  return_value={"open": False}), \
+                mock.patch.object(bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}), \
+                mock.patch("builtins.print"):
+            self.assertFalse(bc._hud_kinect_preview_write(10.0))
+        shared.assert_not_called()
+        percam.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1629,6 +1705,8 @@ class StalePreviewBadgeTests(MonolithGlobalsTestCase):
                                return_value=None), \
                 mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
                                   return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_stream_health",
+                                  return_value={"open": True}), \
                 mock.patch.object(self.bc._kinect_bridge, "get_bodies",
                                   return_value=[]), \
                 mock.patch.object(self.bc, "_draw_stale_badge", stale_badge), \
@@ -1656,6 +1734,8 @@ class StalePreviewBadgeTests(MonolithGlobalsTestCase):
                                return_value=None), \
                 mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
                                   return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_stream_health",
+                                  return_value={"open": True}), \
                 mock.patch.object(self.bc._kinect_bridge, "get_bodies",
                                   return_value=[]), \
                 mock.patch.object(self.bc, "_draw_stale_badge", stale_badge), \

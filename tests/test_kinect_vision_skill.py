@@ -16,11 +16,22 @@ from unittest import mock
 from tests._skill_harness import load_skill_isolated, make_fake_skill_utils
 
 
+_LIVE_HEALTH = {"open": True, "color_age_s": 0.03, "body_age_s": 0.03,
+                "depth_pending": True}
+# A published runtime whose sensor stopped streaming (2026-10-01, B087): every
+# getter still re-serves a frozen buffer, only the freshness cells tell.
+_DEAD_HEALTH = {"open": True, "color_age_s": 10.0, "body_age_s": 10.0,
+                "depth_age_s": 10.0, "color_pending": False,
+                "body_pending": False, "depth_pending": False}
+
+
 def _fake_bridge(*, enabled=True, available=(True, ""), presence=None,
                  color_png=b"\x89PNG-kinect", color_bgr=object(),
-                 depth=object(), infrared=None):
+                 depth=object(), infrared=None, health=None):
     """Build a stand-in audio.kinect_bridge module."""
     m = types.ModuleType("audio.kinect_bridge")
+    m.get_stream_health = lambda: dict(_LIVE_HEALTH if health is None
+                                       else health)
     m.get_enabled = lambda: enabled
     m.available = lambda: available
     m.get_presence = lambda: (presence if presence is not None
@@ -29,7 +40,7 @@ def _fake_bridge(*, enabled=True, available=(True, ""), presence=None,
                                     "ts": 0.0})
     m.get_color_png = lambda: color_png
     m.get_color_bgr = lambda require_new=True: color_bgr
-    m.get_depth = lambda: depth
+    m.get_depth = lambda require_new=False: depth
     m.get_infrared_gray = lambda: infrared
     return m
 
@@ -73,6 +84,17 @@ class StatusTests(KinectSkillBase):
         self.assertIn("color", out)        # color stream detected
         self.assertIn("depth", out)        # depth stream detected
         self.assertIn("one person", out)
+
+    def test_status_does_not_call_a_frozen_buffer_streaming(self):
+        # B087 (2026-10-01): every getter still returns bytes (the installed
+        # pykinect2 re-serves its last buffer forever), but no NEW frame has
+        # arrived for 10 s. The old probe said "streaming (color, depth)".
+        actions = self._load(_fake_bridge(health=_DEAD_HEALTH))
+        out = actions["kinect_status"]("")
+        self.assertNotIn("streaming", out)
+        self.assertNotIn("color", out)
+        self.assertNotIn("depth", out)
+        self.assertIn("no frames are arriving", out)
 
     def test_status_off_when_disabled(self):
         actions = self._load(_fake_bridge(enabled=False))

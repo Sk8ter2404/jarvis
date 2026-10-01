@@ -151,6 +151,14 @@ GREET_NEW_PEOPLE_LINES = (
     "I'm seeing several people I don't know, sir — guests, I take it?",
     "A few unfamiliar faces just turned up, sir.",
 )
+# ONE stranger (2026-10-01). GREET_NEW_PEOPLE_MIN_FACES was lowered to 1 for a
+# single newcomer, but the pool above still says "all these new people" / "a
+# few unfamiliar faces" - and a single unknown face is what fired it, twice.
+GREET_NEW_PERSON_LINES = (
+    "Someone new just turned up, sir. I don't recognise them.",
+    "There's a face I don't know, sir. A friend of yours?",
+    "I'm seeing someone I don't recognise, sir — a guest, I take it?",
+)
 # Spoken once after the greeting line so the offer to enrol is discoverable but
 # not pushy. Kept on the SAME utterance to stay within one proactive announce.
 GREET_NEW_PEOPLE_OFFER = (
@@ -222,6 +230,10 @@ _new_people_last_at       = [0.0]
 _new_people_last_line_idx = [-1]
 _new_people_last_scan_at  = [0.0]
 _new_people_last_count    = [0]
+_new_person_last_line_idx = [-1]
+# Content fingerprint of the frame the LAST scan ran on: a frame that comes
+# back identical is a re-served buffer, not a new look at the room.
+_new_people_last_fp       = [None]
 
 # Empty-room → standby bookkeeping. _kinect_empty_since records when the room
 # first went empty (0.0 = currently occupied / unknown); the standby fires only
@@ -982,15 +994,26 @@ def _primary_camera_index(bc) -> int:
 
 
 def _grab_primary_frame(bc):
-    """A copy of the most recent BGR frame for the primary webcam from the
-    monolith's shared _camera_latest_frame cache (copied under _camera_state_-
-    lock), or None. Mirrors skills/face_id._grab_frame. NEVER raises."""
+    """A copy of the most recent LIVE BGR frame for the primary webcam from the
+    monolith's shared frame cache, or None. Mirrors skills/face_id._grab_frame.
+
+    LIVE ONLY (2026-10-01): the cache keeps a dead camera's last frame forever,
+    and the new-people greeting re-scanned that frozen frame every 2 s - one
+    stale stranger satisfied the whole confirm window. The monolith's
+    _fresh_camera_frame refuses an old frame; an older monolith without it
+    gets the straight cache read, as before. NEVER raises."""
     if bc is None:
         return None
+    idx = _primary_camera_index(bc)
+    fresh = getattr(bc, "_fresh_camera_frame", None)
+    if callable(fresh):
+        try:
+            return fresh(idx)[0]
+        except Exception:
+            return None
     latest = getattr(bc, "_camera_latest_frame", None)
     if latest is None:
         return None
-    idx = _primary_camera_index(bc)
     lock = getattr(bc, "_camera_state_lock", None)
     try:
         if lock is not None:
@@ -1023,14 +1046,42 @@ def _count_unknown_faces(bc) -> int | None:
     frame = _grab_primary_frame(bc)
     if frame is None:
         return None
+    # THE 2026-09-30 PRESENCE RULES, APPLIED HERE TOO (2026-10-01). The
+    # proactive-presence stamp got a fresh-frame fingerprint and a size floor
+    # (core/face_presence); this greeting is a second presence decision that
+    # never did, so one unknown face of ANY size - a TV, a photo - in a frame
+    # a stalled source kept re-serving greeted "new people".
+    try:
+        from core import face_presence as _fp
+    except Exception:   # pragma: no cover - core/ ships with the skill
+        _fp = None
+    if _fp is not None:
+        fp = _fp.frame_fingerprint(frame)
+        if fp is not None and fp == _new_people_last_fp[0]:
+            return None     # the same buffer again: no new evidence
+        _new_people_last_fp[0] = fp
     try:
         results = eng.recognize(frame)
     except Exception:
         return None
     if not results:
         return 0
+    try:
+        fw = float(frame.shape[1]) or 1.0
+    except Exception:
+        fw = 0.0
+    floor = _fp.MIN_FACE_FRAC if _fp is not None else 0.0
+
+    def _big_enough(r) -> bool:
+        if fw <= 0.0 or floor <= 0.0:
+            return True
+        try:
+            return float((r.get("bbox") or [0, 0, 0, 0])[2]) / fw >= floor
+        except Exception:
+            return False
     return sum(1 for r in results
-               if isinstance(r, dict) and r.get("name") in (None, "unknown"))
+               if isinstance(r, dict) and r.get("name") in (None, "unknown")
+               and _big_enough(r))
 
 
 def _apply_greet_new_people(present: bool, now: float, bc) -> None:
@@ -1047,6 +1098,7 @@ def _apply_greet_new_people(present: bool, now: float, bc) -> None:
         _new_people_present_since[0] = 0.0
         _new_people_last_scan_at[0] = 0.0
         _new_people_last_count[0] = 0
+        _new_people_last_fp[0] = None
         return
 
     # No body in the room (per the presence signal) → no crowd; disarm. This
@@ -1059,11 +1111,14 @@ def _apply_greet_new_people(present: bool, now: float, bc) -> None:
 
     # Throttle the (relatively expensive) recognition pass: reuse the last count
     # between scans so we still evaluate the confirm/rate-limit gates each tick.
+    # A scan that could not READ (no live frame, the same frame again, engine
+    # not ready) now FAILS CLOSED (2026-10-01): it used to keep the previous
+    # count, so one real sighting carried the whole confirm window across
+    # scans that saw nothing new. Every scan in the window must see it afresh.
     if (now - _new_people_last_scan_at[0]) >= GREET_NEW_PEOPLE_SCAN_INTERVAL:
         count = _count_unknown_faces(bc)
         _new_people_last_scan_at[0] = now
-        if count is not None:
-            _new_people_last_count[0] = count
+        _new_people_last_count[0] = count if count is not None else 0
     unknown = _new_people_last_count[0]
 
     # Fewer than the threshold of strangers (or just the owner / nobody) → not a
@@ -1087,12 +1142,15 @@ def _apply_greet_new_people(present: bool, now: float, bc) -> None:
     if _jarvis_busy(bc):
         return
 
-    line = _pick_line(GREET_NEW_PEOPLE_LINES, _new_people_last_line_idx)
+    if unknown == 1:
+        line = _pick_line(GREET_NEW_PERSON_LINES, _new_person_last_line_idx)
+    else:
+        line = _pick_line(GREET_NEW_PEOPLE_LINES, _new_people_last_line_idx)
     message = line + GREET_NEW_PEOPLE_OFFER
     if _announce(bc, message, source="new_people"):
         _new_people_last_at[0] = now
         print(f"  [face-track] new-people greeting "
-              f"({unknown} unknown faces): {line}")
+              f"({unknown} unknown face{'' if unknown == 1 else 's'}): {line}")
 
 
 def _poll_once(bc) -> None:

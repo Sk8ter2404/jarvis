@@ -298,5 +298,116 @@ class SharedPreviewKeepAliveTests(MonolithGlobalsTestCase):
         self.assertIn("every OTHER camera keeps publishing", blob)
 
 
+
+@requires_monolith
+class PerCameraPreviewRemovalTests(MonolithGlobalsTestCase):
+    """B086 (2026-10-01): the per-camera preview JPEGs
+    (data/.hud_camera_preview_<left|right|kinect>.jpg) had NO remove path. The
+    privacy contract says the preview is removed whenever the camera is off,
+    but only the shared file honoured it: a left-webcam still two days old was
+    found on disk after that camera left CAMERAS. Every path here points at a
+    temp dir - nothing touches the tree's real data/."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        import os
+        import shutil
+        import tempfile
+        import numpy as np
+        bc = self.bc
+        self.tmp = tempfile.mkdtemp(prefix="jarvis_percam_rm_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._path = lambda key: os.path.join(
+            self.tmp, f".hud_camera_preview_{key}.jpg")
+        for p in (mock.patch.object(bc, "_hud_percam_preview_file", self._path),
+                  mock.patch.object(bc, "_HUD_CAM_PREVIEW_FILE",
+                                    os.path.join(self.tmp, ".hud_camera_preview.jpg")),
+                  mock.patch.object(bc, "_hud_percam_last_write", {})):
+            p.start()
+            self.addCleanup(p.stop)
+        present = getattr(bc, "_hud_percam_present", None)
+        if isinstance(present, set):
+            saved = set(present)
+            present.clear()
+            self.addCleanup(lambda: (present.clear(), present.update(saved)))
+        for ev in (bc._face_track_stop, bc._face_track_pause,
+                   bc._face_track_camera_off):
+            ev.clear()
+            self.addCleanup(ev.clear)
+        bc._standby_mode[0] = False
+        self.addCleanup(bc._standby_mode.__setitem__, 0, False)
+        self.frame = np.full((8, 8, 3), 33, dtype=np.uint8)
+        self.cams = [{"index": 0, "label": "Right webcam (top of right monitor)",
+                      "name": "synthcam right", "primary": True,
+                      "look_x": 0.85, "look_y": 0.5}]
+
+    def _exists(self, key):
+        import os
+        return os.path.exists(self._path(key))
+
+    def _one_iteration(self, *, preview_enabled=True):
+        bc = self.bc
+        gate = bc._make_camera_gate()
+        gate.stagger_s = 0.0
+        with mock.patch.object(bc, "CAMERAS", self.cams), \
+             mock.patch.object(bc, "_camera_gate", gate), \
+             mock.patch.object(bc, "_face_track_stop", _OneShotStop()), \
+             mock.patch.object(bc, "_dshow_name_to_index", return_value=0), \
+             mock.patch.object(bc, "_open_capture_bounded",
+                               side_effect=lambda idx, *a, **k:
+                               _LoopCap(self.frame)), \
+             mock.patch.object(bc, "_hud_camera_preview_enabled",
+                               return_value=preview_enabled), \
+             mock.patch.object(bc, "_hud_kinect_preview_write",
+                               return_value=False), \
+             mock.patch.object(bc, "_release_side_tile_webcams_if_open"), \
+             mock.patch.object(bc, "_detect_face", return_value=None), \
+             mock.patch.object(bc, "send"):
+            bc._face_tracking_thread_body()
+
+    def test_standby_removes_the_per_camera_tiles(self):
+        self.assertTrue(self.bc._hud_percam_preview_write(
+            "right", self.frame, 1_000.0))
+        self.assertTrue(self._exists("right"), "setup: no per-camera tile")
+        self.bc._standby_mode[0] = True
+        self._one_iteration()
+        self.assertFalse(self._exists("right"),
+                         "standby left the per-camera frame on disk")
+
+    def test_preview_disabled_removes_the_per_camera_tiles(self):
+        self.assertTrue(self.bc._hud_percam_preview_write(
+            "kinect", self.frame, 1_000.0))
+        self._one_iteration(preview_enabled=False)
+        self.assertFalse(self._exists("kinect"),
+                         "HUD_CAMERA_PREVIEW=False left a per-camera frame")
+
+    def test_producer_start_and_stop_sweep_leftovers(self):
+        # A tile from an EARLIER run (or a camera no longer in CAMERAS - the
+        # owner's removed left webcam): nothing in this process wrote it, so
+        # only a forced sweep reaches it.
+        bc = self.bc
+        with open(self._path("left"), "wb") as fh:
+            fh.write(b"stale")
+        seen_at_start = {}
+
+        def _body():
+            seen_at_start["left"] = self._exists("left")
+            bc._hud_percam_preview_write("right", self.frame, 2_000.0)
+
+        with mock.patch.object(bc, "_face_tracking_thread_body", _body), \
+             mock.patch.object(bc, "_face_track_release_all"), \
+             mock.patch.object(bc, "_face_track_note_stopped"), \
+             mock.patch.object(bc, "_face_track_watchdog"):
+            bc._face_tracking_thread()
+        self.assertFalse(seen_at_start["left"],
+                         "a leftover tile survived the producer's start")
+        self.assertFalse(self._exists("left"))
+        self.assertFalse(self._exists("right"),
+                         "the producer stopped and left its last frame on disk")
+
+
 if __name__ == "__main__":   # pragma: no cover
     unittest.main()

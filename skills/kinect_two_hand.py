@@ -2,13 +2,15 @@
 """
 JARVIS Kinect TWO-HAND pinch-to-resize windows.
 
-When BOTH hands are raised above the shoulder (the SAME raise-to-engage lift gate
-the single-hand air-mouse uses), this poller takes over and lets the owner GRAB
-the foreground window with both hands and resize / move it like a giant photo on a
-touchscreen:
+When BOTH hands are raised above the shoulder (the air-mouse's height-above-
+shoulder lift line - NOT its full passive engage gate, which also wants a
+forward reach), this poller takes over and lets the owner GRAB the foreground
+window with both hands and resize / move it like a giant photo on a touchscreen:
 
-  • GRAB    — both hands engaged and HELD for ~0.2 s. Captures the focused window's
-              rect + the initial 3D hand-distance.
+  • GRAB    — both hands engaged as CLOSED FISTS and HELD for ~0.5 s, while the
+              owner is not using the real mouse/keyboard and no fullscreen
+              game/video is in front. Captures the focused window's rect + the
+              initial 3D hand-distance.
   • RESIZE  — SPREAD the hands apart → the window GROWS; PINCH them together → it
               SHRINKS. The scale is the live hand-distance / the grab hand-distance
               (EMA-smoothed so it is NOT jittery), applied ABOUT THE WINDOW CENTRE
@@ -40,8 +42,9 @@ GATING / SAFETY
 
 This reuses the single-hand air-mouse's sensor plumbing (skills/kinect_air_mouse:
 _hand_sample / ReachBox / _reach_box_for_virtual_desktop / _dist3 / EMA / the lift
-gate) as the single source of truth for reading the Kinect, so the engage gate +
-mirror + projection match the air-mouse exactly.
+line) as the single source of truth for reading the Kinect, so the lift line +
+mirror + projection match the air-mouse exactly - and its real-input yield and
+per-app stand-down gate the GRAB edge (2026-10-01).
 """
 from __future__ import annotations
 
@@ -62,10 +65,12 @@ INITIAL_DELAY_SECONDS = 6.5                   # after the monolith + bridge come
 #   (a touch after the air-mouse's 6.0 so the air-mouse module is importable first)
 _THREAD_NAME = "kinect-two-hand-skill"
 
-# GRAB hold: both hands must stay engaged this long before we capture the window +
-# baseline distance, so a momentary two-hand raise (reaching past the sensor) does
-# not snatch the window. ~0.2 s ≈ 6 frames at 30 Hz.
-GRAB_HOLD_SEC = 0.20
+# GRAB hold: both hands must stay engaged AS CLOSED FISTS this long before we
+# capture the window + baseline distance. 2026-10-01: was 0.20 s with ANY grip
+# but a double-open on the latch frame, so an overhead stretch (arms straight up,
+# relaxed hands the SDK reads as "unknown") latched the foreground window in
+# 6 frames and the next tick moved/resized it. ~0.5 s ≈ 15 frames at 30 Hz.
+GRAB_HOLD_SEC = 0.50
 
 # TWO-HAND DEAD-MAN (FILTER 3): symmetric to the air-mouse's DISENGAGE_GRACE_SEC.
 # A grab may only LATCH on frames where BOTH hands are FULLY Tracked (TrackingState
@@ -435,6 +440,17 @@ class TwoHandController:
             # at grab is already settled (no jump on the first resize frame).
             self._smoothed_dist = self._ema(self._smoothed_dist, hand_dist,
                                             self._dist_alpha)
+            # FISTS FOR THE WHOLE HOLD (2026-10-01). You grab with closed hands;
+            # any frame where either hand is NOT "closed" (open, lasso, or the
+            # SDK's "unknown" for a relaxed/occluded hand) restarts the hold. A
+            # stretch is open or relaxed hands going up, so it can no longer
+            # latch the foreground window on one stray grip frame.
+            both_closed = (str(left_grip).lower() == "closed"
+                           and str(right_grip).lower() == "closed")
+            if not both_closed:
+                self._engaged_since = now
+                return TwoHandDecision(active=True, rect=None, resizing=False,
+                                       phase="holding", hands=hands)
             held = (self._engaged_since is not None
                     and (now - self._engaged_since) >= self._grab_hold_sec)
             if not held:
@@ -446,15 +462,8 @@ class TwoHandController:
                 # the air-mouse still stands down) but grab nothing.
                 return TwoHandDecision(active=True, rect=None, resizing=False,
                                        phase="holding", hands=hands)
-            if both_open:
-                # You grab with FISTS, not open palms: a both-open frame parks in
-                # "holding" instead of snatching the window. This keeps the
-                # open-hands RELEASE above unambiguous (no grab→instant-release
-                # oscillation when the owner raises open hands) — close the fists
-                # to latch. "unknown"/one-open still grabs, so nothing regresses
-                # for callers that don't report grips.
-                return TwoHandDecision(active=True, rect=None, resizing=False,
-                                       phase="holding", hands=hands)
+            # (Open palms never reach here: the fists rule above parks them in
+            # "holding", which also keeps the open-hands RELEASE unambiguous.)
             self._phase = "grabbed"
             self._grab_dist = max(1e-3, float(self._smoothed_dist or hand_dist))
             self._grab_rect = focused_rect
@@ -1000,14 +1009,26 @@ def _poll_once(ctrl: "TwoHandController",
     # On the GRAB edge we need the foreground window rect. We only query Win32 when
     # both hands are up AND we don't already hold a grab (cheap; avoids a per-tick
     # foreground query while idle).
+    #
+    # THE AIR-MOUSE'S SAFETY INPUTS, AT THE GRAB EDGE (2026-10-01). The single-hand
+    # air-mouse yields to real mouse/keyboard input and stands down over a
+    # fullscreen game / video (AIR_MOUSE_PER_APP_DISABLE); two-hand skipped both,
+    # so a stretch over a fullscreen game could grab and move it. Same functions
+    # (single source of truth). Blocked → no window is offered, so the controller
+    # stays "holding" (the air-mouse still stands down) and grabs nothing.
     focused_rect = None
     if both and not ctrl.is_grabbed:
         try:
-            hwnd, focused_rect = foreground_target()
+            blocked = bool(am.real_input_recent() or am._per_app_disabled())
         except Exception:
-            hwnd, focused_rect = 0, None
-        if focused_rect is not None:
-            _grab_hwnd[0] = hwnd
+            blocked = False
+        if not blocked:
+            try:
+                hwnd, focused_rect = foreground_target()
+            except Exception:
+                hwnd, focused_rect = 0, None
+            if focused_rect is not None:
+                _grab_hwnd[0] = hwnd
 
     decision = ctrl.update(both_engaged=both, hand_dist=hand_dist, midpoint=mid,
                            focused_rect=focused_rect, bounds=bounds, hands=hands,

@@ -788,6 +788,15 @@ class CameraLockProcessTests(_MonolithSec2Base):
 
 
 class ProbeCameraIndexTests(_MonolithSec2Base):
+    def setUp(self):
+        # The configured cameras are LISTED (2026-10-01): the probe asks
+        # where a NAMED camera is listed before it opens anything (B025),
+        # and this machine's real device lists must not decide these tests.
+        lp = mock.patch.object(self.bc, "_named_camera_listing",
+                               return_value=("msmf", None))
+        lp.start()
+        self.addCleanup(lp.stop)
+
     def test_returns_true_when_frame_read(self):
         cap = mock.Mock()
         cap.isOpened.return_value = True
@@ -2679,6 +2688,15 @@ class DetectFaceFallbackTests(_MonolithSec2Base):
 #  _probe_camera_index — worker body internals (3060-3076)
 # ───────────────────────────────────────────────────────────────────────────
 class ProbeCameraIndexWorkerTests(_MonolithSec2Base):
+    def setUp(self):
+        # The configured cameras are LISTED (2026-10-01): the probe asks
+        # where a NAMED camera is listed before it opens anything (B025),
+        # and this machine's real device lists must not decide these tests.
+        lp = mock.patch.object(self.bc, "_named_camera_listing",
+                               return_value=("msmf", None))
+        lp.start()
+        self.addCleanup(lp.stop)
+
     def test_worker_exception_during_open_reports_false(self):
         # cv2.VideoCapture raising inside the worker → the worker's
         # `except: pass` (3060-3061) leaves result['ok']=False, release in

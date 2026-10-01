@@ -5,8 +5,9 @@ Loads the skill in isolation (no monolith boot) via the shared harness, with a
 fake kinect_bridge + a fake bobert_companion ('bc') injected into sys.modules.
 No real sensor, no real recognizer poll thread. Asserts:
 
-  * WAVE wakes ONLY when dormant; RAISE_HAND confirms ONLY when a pending
-    confirmation exists; SWIPE interrupts speech + clears the pending queue,
+  * WAVE wakes ONLY when dormant; RAISE_HAND NEVER confirms (it only reminds
+    that a pending action needs a spoken yes); SWIPE interrupts speech +
+    clears the pending queue,
   * _poll_once no-ops when KINECT_GESTURES_ENABLED is False, when staging, and
     when the bridge is absent/disabled,
   * gestures_on persists KINECT_GESTURES_ENABLED via the reused settings writer
@@ -182,20 +183,40 @@ class WaveMappingTests(_Base):
         self.assertFalse(bc._standby_mode[0])
 
 
-# ─── RAISE_HAND → confirm only when pending ────────────────────────────────
+# ─── RAISE_HAND → never confirms (B028, 2026-10-01) ─────────────────────────
 class RaiseHandMappingTests(_Base):
-    def test_confirms_pending(self):
+    """A raised hand used to call handle_confirmation_response("yes") on the
+    poller thread: a one-arm stretch, a hand on the head or a guest's raised
+    hand ran a queued destructive action (everything in that queue is a hard
+    gate that needs a SPOKEN yes)."""
+
+    def test_a_raised_hand_never_confirms(self):
         mod = self._load()
         bc = _fake_bc(pending=[("reset_memory", "")])
         mod._do_raise_hand(bc)
-        self.assertEqual(bc._executed, [("reset_memory", "")])
-        self.assertEqual(bc._pending_confirmation, [])
+        self.assertEqual(bc._executed, [], "a gesture ran a hard-gated action")
+        self.assertEqual(bc._pending_confirmation, [("reset_memory", "")],
+                         "the pending action must stay for the spoken answer")
+
+    def test_it_reminds_once_that_a_spoken_yes_is_needed(self):
+        mod = self._load()
+        bc = _fake_bc(pending=[("reset_memory", "")])
+        mod._do_raise_hand(bc)
+        mod._do_raise_hand(bc)        # a hand held up re-fires the gesture
+        reminders = [s for s in bc._spoken if "spoken yes" in s.lower()]
+        self.assertEqual(len(reminders), 1, bc._spoken)
 
     def test_noop_when_nothing_pending(self):
         mod = self._load()
         bc = _fake_bc(pending=[])
         mod._do_raise_hand(bc)
         self.assertEqual(bc._executed, [])
+        self.assertEqual(bc._spoken, [])
+
+    def test_status_no_longer_advertises_confirm_by_gesture(self):
+        mod = self._load()
+        self._patch_flag(False)
+        self.assertNotIn("confirm", mod.gesture_status("").lower())
 
     # B033 (2026-10-01): a queued destructive action used to wait forever and
     # ANY raised hand ran it, however old the prompt and whoever was in view.
@@ -269,7 +290,8 @@ class DispatchTests(_Base):
         mod = self._load()
         bc = _fake_bc(pending=[("x", "y")])
         mod._dispatch(bc, kg.RAISE_HAND)
-        self.assertEqual(bc._executed, [("x", "y")])
+        self.assertEqual(bc._executed, [])          # B028: never confirms
+        self.assertEqual(bc._pending_confirmation, [("x", "y")])
 
     def test_dispatch_swipe_left_and_right_both_cancel(self):
         for g in (kg.SWIPE_LEFT, kg.SWIPE_RIGHT):

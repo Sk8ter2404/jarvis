@@ -1004,9 +1004,11 @@ KINECT_PRESENCE_WAKE = False
 KINECT_GAZE_ENABLED = False
 # KINECT_GESTURES_ENABLED — when True, a background poller reads the Kinect
 #   skeleton stream (~18 Hz) and maps discrete gestures to actions: WAVE wakes
-#   JARVIS from standby, RAISE_HAND confirms a pending confirmation (like saying
-#   "yes"), and a SWIPE dismisses/cancels (stop speech + clear the pending
-#   confirmation). Off by default; never runs in staging/test. See
+#   JARVIS from standby and a SWIPE dismisses/cancels (stop speech + clear the
+#   pending confirmation). RAISE_HAND never confirms (2026-10-01: a stretch or
+#   a guest's raised hand ran destructive actions) - it only reminds you that a
+#   pending action needs a spoken "yes". Off by default; never runs in
+#   staging/test. See
 #   audio/kinect_gestures.py (recognizer) + skills/kinect_gestures.py (wiring).
 KINECT_GESTURES_ENABLED = False
 # KINECT_POINT_CONTROL_ENABLED — when True, "point-to-control": the owner points

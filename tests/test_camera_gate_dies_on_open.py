@@ -406,7 +406,8 @@ class OwnerLiftTests(unittest.TestCase):
         self.assertEqual(g.begin(KINECT, BRIDGE).reason, "backoff")
         self.assertTrue(g.lift_quarantine(KINECT))
         self.assertFalse(_slow(g, KINECT))
-        self.assertEqual(_dev(g, KINECT)["dies_on_open"], 0)
+        # One short of the verdict (2026-10-01): the next death re-arms it.
+        self.assertEqual(_dev(g, KINECT)["dies_on_open"], COUNT - 1)
         self.assertTrue(g.begin(KINECT, BRIDGE).allowed,
                         "the owner said to use it again; the 30 min hold "
                         "still stood")
@@ -414,15 +415,27 @@ class OwnerLiftTests(unittest.TestCase):
                             for ln in self.logs), self.logs)
         self.assertFalse(g.lift_quarantine(KINECT), "nothing left to lift")
 
-    def test_after_a_lift_a_new_full_run_is_needed_and_is_not_said_again(self):
+    def test_after_a_lift_one_more_death_re_arms_it_and_is_not_said_again(self):
+        # B083 (2026-10-01): the lift reply promises "if it still drops off,
+        # I'll go back to retrying it every thirty minutes" - but a zeroed run
+        # took THREE more deaths (now, +2 min, +5 min on the ladder) first.
         g, b = self.g, self.b
         self.assertTrue(g.lift_quarantine(KINECT))
-        for _ in range(COUNT - 1):
-            self.assertTrue(b.dies_on_open())
-        self.assertFalse(_slow(g, KINECT))
         self.assertTrue(b.dies_on_open())
-        self.assertTrue(_slow(g, KINECT))
+        self.assertTrue(_slow(g, KINECT),
+                        "one death after the lift did not re-arm the retry")
+        self.assertEqual(_dev(g, KINECT)["slow_retry_s"], RETRY,
+                         "back to the BASE retry, as the reply says")
         self.assertEqual(self.spoken, [_SAID], "once per session")
+
+    def test_a_lift_of_a_partial_run_still_starts_over(self):
+        clk = _Clock()
+        g, _logs, _spoken = _gate(clk)
+        b = _Bridge(g, clk)
+        self.assertTrue(b.dies_on_open())             # 1 of COUNT, not slow
+        self.assertFalse(_slow(g, KINECT))
+        g.lift_quarantine(KINECT)
+        self.assertEqual(_dev(g, KINECT)["dies_on_open"], 0)
 
     def test_the_lift_leaves_a_culprit_quarantine_rule_intact(self):
         """lift_quarantine still lifts a quarantine exactly as before."""
@@ -438,6 +451,91 @@ class OwnerLiftTests(unittest.TestCase):
         self.assertFalse(_slow(g, LEFT))
         self.assertTrue(g.lift_quarantine(LEFT))
         self.assertFalse(g.quarantined(LEFT))
+
+
+class RememberedAcrossRestartsTests(unittest.TestCase):
+    """B083 (2026-10-01): the verdict lived in memory, so every restart cost 3
+    more USB drops of the Kinect and its mic array in ~45 s, and the same
+    spoken warning - on every one of 14 restarts in a day. Each "process"
+    here is a fresh gate on the same temp file."""
+
+    def setUp(self):
+        import os
+        import shutil
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="jarvis_doo_persist_")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, "camera_gate_doo.json")
+
+    def _process(self):
+        """A new JARVIS process: a fresh gate that remembers through the file
+        (getattr: the old gate has no persistence and must FAIL below, not
+        raise)."""
+        clk = _Clock()
+        g, logs, spoken = _gate(clk)
+        fn = getattr(g, "enable_persistence", None)
+        if callable(fn):
+            fn(self.path)
+        return g, _Bridge(g, clk), logs, spoken
+
+    def _read(self):
+        import json
+        with open(self.path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_a_restart_needs_one_drop_not_three(self):
+        g, b, _l, spoken = self._process()
+        for _ in range(COUNT):
+            self.assertTrue(b.dies_on_open())
+        self.assertTrue(_slow(g, KINECT))
+        self.assertEqual(spoken, [_SAID])
+        # Restart. The sensor still opens at boot (it may have been fixed)...
+        g2, b2, _l2, spoken2 = self._process()
+        self.assertTrue(g2.begin(KINECT, BRIDGE).allowed,
+                        "a remembered verdict must not block the boot open")
+        g2.cancel(KINECT, BRIDGE)
+        # ...but ONE drop puts a still-broken one straight back on the retry.
+        self.assertTrue(b2.dies_on_open())
+        self.assertTrue(_slow(g2, KINECT),
+                        "the restart relearned the verdict from scratch")
+        self.assertEqual(spoken2, [], "the same warning again, same day")
+
+    def test_a_repaired_sensor_is_forgotten_once_it_streams(self):
+        g, b, _l, _s = self._process()
+        for _ in range(COUNT):
+            b.dies_on_open()
+        self.assertIn(KINECT, self._read())
+        g2, b2, _l2, _s2 = self._process()
+        self.assertTrue(b2.open_when_allowed())
+        b2.clk.advance(WINDOW + 5.0)
+        g2.note_frame(KINECT)                  # streamed past the window
+        self.assertNotIn(KINECT, self._read())
+
+    def test_a_lift_forgets_it(self):
+        g, b, _l, _s = self._process()
+        for _ in range(COUNT):
+            b.dies_on_open()
+        g.lift_quarantine(KINECT)
+        self.assertNotIn(KINECT, self._read())
+
+    def test_a_day_old_verdict_is_not_seeded(self):
+        import json
+        import time as _t
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({KINECT: {"retry_s": RETRY, "said_date": "",
+                                "armed_wall": _t.time() - 2 * 86400.0}}, fh)
+        g, b, _l, _s = self._process()
+        self.assertTrue(b.dies_on_open())
+        self.assertFalse(_slow(g, KINECT), "a stale verdict was seeded")
+
+    def test_no_persistence_without_a_path(self):
+        clk = _Clock()
+        g, _l, _s = _gate(clk)
+        b = _Bridge(g, clk)
+        for _ in range(COUNT):
+            b.dies_on_open()
+        import os
+        self.assertFalse(os.path.exists(self.path))
 
 
 class KnobTests(unittest.TestCase):

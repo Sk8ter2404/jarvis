@@ -76,6 +76,13 @@ class _ProbeWedgeTestBase(MonolithGlobalsTestCase):
         self.addCleanup(p.stop)
         with bc._camera_quarantine_lock:
             bc._camera_quarantine.clear()
+        # The configured cameras are LISTED (2026-10-01): the probe asks
+        # where a NAMED camera is listed before it opens anything (B025),
+        # and this machine's real device lists must not decide these tests.
+        lp = mock.patch.object(bc, "_named_camera_listing",
+                               return_value=("msmf", None))
+        lp.start()
+        self.addCleanup(lp.stop)
         self._wedges: list[threading.Event] = []
         self.addCleanup(self._release_every_wedge)
 

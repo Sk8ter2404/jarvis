@@ -853,6 +853,24 @@ def _make_camera_gate(clock=None):
 
 
 _camera_gate = _make_camera_gate()
+
+
+def _camera_gate_enable_persistence(gate) -> None:
+    """Remember the dies-on-open verdict across restarts (2026-10-01): every
+    restart relearned it at the cost of 3 USB drops of the Kinect and its mic
+    array in ~45 s, plus the same spoken warning (14 restarts on 2026-09-30).
+    Live process only: a staging / test process must neither read the live
+    verdicts nor leave its own behind for the next run. NEVER raises."""
+    try:
+        from core import paths as _paths
+        if gate is None or _paths.is_staging():
+            return
+        gate.enable_persistence(_paths.data_file("camera_gate_doo.json"))
+    except Exception:       # pragma: no cover - defensive
+        logging.exception("[camera-gate] could not enable verdict persistence")
+
+
+_camera_gate_enable_persistence(_camera_gate)
 try:
     _kinect_bridge.set_open_gate(_camera_gate)
 except Exception:          # pragma: no cover - an older bridge without the hook
@@ -5412,6 +5430,10 @@ def _hud_camera_preview_downscale(frame: "np.ndarray", width: int) -> "np.ndarra
 from core import camera_tiles as _camera_tiles  # noqa: E402
 _HUD_PERCAM_PREVIEW_KEYS = _camera_tiles.PREVIEW_KEYS
 _hud_percam_last_write: dict[str, float] = {}
+# Keys this process has written since the last cleanup - the per-camera twin
+# of _hud_cam_preview_file_present, so the per-frame camera-off removal costs
+# nothing when there is nothing to remove (2026-10-01).
+_hud_percam_present: set = set()
 
 
 def _hud_percam_preview_file(key: str) -> str:
@@ -5431,7 +5453,10 @@ def _percam_side(cam: dict) -> str:
 def _hud_percam_preview_write(key: str, frame: "np.ndarray", now: float) -> bool:
     """Per-camera sibling of _hud_camera_preview_write: same downscale, JPEG
     quality, atomic replace and ~6-7 fps throttle, but each key has its OWN
-    throttle clock so three cameras never starve each other. Never raises."""
+    throttle clock so three cameras never starve each other. Same removal
+    contract too: _hud_percam_preview_remove_all() deletes these files when
+    the camera is off, the preview is disabled, and when the producer starts
+    or stops. Never raises."""
     if frame is None or key not in _HUD_PERCAM_PREVIEW_KEYS:
         return False
     if (now - _hud_percam_last_write.get(key, 0.0)) < _HUD_CAM_PREVIEW_MIN_GAP:
@@ -5448,6 +5473,7 @@ def _hud_percam_preview_write(key: str, frame: "np.ndarray", now: float) -> bool
             f.write(buf.tobytes())
         os.replace(tmp, path)
         _hud_percam_last_write[key] = now
+        _hud_percam_present.add(key)
         return True
     except Exception:
         try:
@@ -5456,6 +5482,34 @@ def _hud_percam_preview_write(key: str, frame: "np.ndarray", now: float) -> bool
         except OSError:
             pass
         return False
+
+
+def _hud_percam_preview_remove_all(force: bool = False) -> None:
+    """Delete every per-camera preview JPEG (and a dangling .tmp). Same
+    best-effort, never-raises contract as _hud_camera_preview_remove.
+
+    WHY (2026-10-01). The privacy contract above says the preview is "removed
+    whenever the camera is off", but only the SHARED file had a remove path:
+    the per-camera files outlived standby, HUD_CAMERA_PREVIEW=False, shutdown
+    and a camera's removal from CAMERAS - a left-webcam still taken two days
+    earlier was found on disk with nothing left to ever rewrite or delete it.
+
+    force=True sweeps every key even if this process never wrote it (producer
+    start / exit), which also clears a camera that is no longer configured."""
+    if not force and not _hud_percam_present:
+        return
+    for key in _HUD_PERCAM_PREVIEW_KEYS:
+        try:
+            p = _hud_percam_preview_file(key)
+        except Exception:
+            continue
+        for f in (p, p + ".tmp"):
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except OSError:
+                pass
+    _hud_percam_present.clear()
 
 
 def _hud_camera_preview_write(frame: "np.ndarray", now: float) -> bool:
@@ -6950,6 +7004,44 @@ def _note_camera_gate_refusal(label: str, key: str, component: str, d) -> bool:
         return False
 
 
+def _named_camera_listing(name, *, may_enumerate: bool = True) -> tuple:
+    """Where the NAMED camera ``name`` is listed right now (2026-10-01):
+    ("msmf", None) on the Media Foundation list; ("dshow", i) only on the
+    DirectShow list, at index i (a virtual camera has no MF presence);
+    ("absent", None) on neither; (None, None) when that cannot be told (the
+    backend is pinned to DirectShow, or a list cannot be read). Opens nothing;
+    the DirectShow list is read only through the gated accessor, and only when
+    Media Foundation does not list the name. ``may_enumerate`` False never pays
+    a COLD DirectShow enumeration (the leaky call): with the open path's cache
+    empty the answer is "cannot tell". NEVER raises.
+
+    One answer for _camera_open and the boot probe: "absent" means a camera
+    that is OFF THE BUS, and nothing - no index, no other device - is opened
+    in its place."""
+    try:
+        needle = str(name or "").strip().lower()
+        if (not needle or _camera_backend is None
+                or _camera_backend.configured_backend() != "msmf"):
+            return None, None
+        mf = _camera_backend.msmf_device_names()
+        if mf is None:
+            return None, None
+        if any(needle in str(n or "").lower() for n in mf):
+            return "msmf", None
+        if not may_enumerate and _dshow_open_devices_cache[0] is None:
+            return None, None
+        dnames = _dshow_input_devices_gated(_dshow_open_devices_cache)
+        if not dnames:
+            return None, None
+        live = next((i for i, n in enumerate(dnames)
+                     if needle in str(n or "").lower()), None)
+        if live is None:
+            return "absent", None
+        return "dshow", live
+    except Exception:
+        return None, None
+
+
 def _camera_open(idx, *, name: "str | None" = None,
                  width: "int | None" = None, height: "int | None" = None,
                  require_frame: float = 0.0, label: str = ""):
@@ -7071,6 +7163,35 @@ def _camera_open(idx, *, name: "str | None" = None,
                       "leaky DirectShow open on whatever sits at that index.")
             _camera_open_last_result[_fb_key] = "absent"
             return None
+        # A NAMED CAMERA THAT MEDIA FOUNDATION DOES NOT LIST (2026-10-01).
+        # The rule above only knew devices seen on MSMF earlier THIS process,
+        # so the first open after a restart with the webcam off the bus fell
+        # back to DirectShow at the STATIC index - whatever sits there now
+        # (on this rig the Kinect's video interface). Ask DirectShow for the
+        # NAME instead: a genuinely DirectShow-only camera (a virtual one) is
+        # found and opened at its own index; a real webcam missing from both
+        # lists is absent, and nothing is opened. Only when a list cannot be
+        # read does the old static-index fallback stand. The DirectShow list
+        # comes from the open path's cache, which the face tracker's
+        # _dshow_name_to_index and the boot probe have already filled: this
+        # inner open never pays a COLD leaky enumeration of its own.
+        if name:
+            _where, _live = _named_camera_listing(name, may_enumerate=False)
+            if _where == "absent":
+                key = (idx, name, label, "named-absent")
+                if _camera_backend_notes.get(key) != "absent":
+                    _camera_backend_notes[key] = "absent"
+                    _queue_camera_note(
+                        f"  [camera] {label or ('index ' + str(idx))}: "
+                        f"'{name}' is on neither device list - not opened "
+                        f"(whatever sits at index {idx} now is a different "
+                        f"device); waiting for it to come back.")
+                _camera_open_last_result[_fb_key] = "absent"
+                return None
+            if _where == "dshow" and _live is not None and _live != open_idx:
+                open_idx = _live
+                why = (f"'{name}' is DirectShow-only - found by name at "
+                       f"dshow index {_live}")
     # QUEUED, not printed and not logged. This runs on the throwaway open
     # worker, which may not narrate itself; and logging goes nowhere in the
     # daemon. See _drain_camera_backend_notes, which a joiner calls.
@@ -8228,6 +8349,14 @@ _kinect_preview_color_none_log_last = [0.0]
 # the dim 'LAST FRAME' badge. ~1.5 s: longer than a normal frame interval so a
 # live feed never flickers the badge, short enough that a real freeze shows fast.
 _KINECT_PREVIEW_STALE_BADGE_S = 1.5
+# ...and how long it may be re-served at all (2026-10-01). The cache exists for
+# a TRANSIENT miss right after a runtime reopen; while the camera gate held the
+# Kinect on its 30-60 min dies-on-open retry the runtime was None and the last
+# frame was re-served for HOURS - as the HUD's main picture, in place of the
+# live webcam, with the 'kinect' tile's mtime kept fresh so the web dashboard
+# called it live. Same 5 s as web_interface._CAMERA_PREVIEW_STALE_S; the
+# badge above still marks the 1.5-5 s gap.
+_KINECT_PREVIEW_CACHE_MAX_S = 5.0
 # One-time log latch: True once we've warned that the installed pykinect2 build
 # exposes no IR stream (get_infrared_gray() is None) so a dark room degrades to a
 # dimmed color preview rather than night-vision.
@@ -8585,6 +8714,27 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
             # Color came back None and no IR — fall back to the LAST cached color
             # frame so the skeleton tile shows the last image instead of going dark.
             # Log it (throttled). Only None if we have no cached frame either.
+            # ONLY FOR A TRANSIENT GAP (2026-10-01): a runtime must be open (a
+            # pure cell read - no open attempt) and the frame no older than
+            # _KINECT_PREVIEW_CACHE_MAX_S. Otherwise drop it and return None,
+            # so the caller writes the live primary-webcam mirror and the
+            # 'kinect' tile goes stale (the web then shows WHY it is off).
+            try:
+                _rt_open = bool(_kinect_bridge.get_stream_health().get("open"))
+            except Exception:
+                _rt_open = False
+            _cache_at = _kinect_preview_last_color_at[0]
+            if (not _rt_open or _cache_at <= 0
+                    or (now - _cache_at) > _KINECT_PREVIEW_CACHE_MAX_S):
+                if _kinect_preview_last_color[0] is not None:
+                    print("  [kinect-preview] no live Kinect frame "
+                          + ("(no runtime open)" if not _rt_open else
+                             f"for {max(0.0, now - _cache_at):.0f}s")
+                          + " - dropped the cached frame; the preview shows "
+                            "the webcam")
+                _kinect_preview_last_color[0] = None
+                _kinect_preview_last_color_at[0] = 0.0
+                return None
             _kinect_preview_color_none_logged()
             base = _last_cached_kinect_color()
             if base is None:
@@ -8756,6 +8906,34 @@ _camera_last_read_error_at: dict[int, float] = {}      # index → ts
 _camera_last_frame_at: dict[int, float]      = {}      # index → ts of last good frame
 _camera_wake_attempts: dict[int, int]        = {}      # index → wake attempts since last good frame
 _camera_recoveries: dict[int, int]           = {}      # index → cumulative successful wakes
+
+# ONE FRESHNESS RULE FOR THE FRAME CACHE (2026-10-01). _camera_latest_frame is
+# written only on a good read and never cleared, so after a camera dies, backs
+# off, is benched or the producer stalls it keeps serving the LAST frame for
+# as long as the process lives. see_user, tv_detect, the side tiles and
+# camera_status already judge that frame by its age; face_id (enrol / whoami /
+# face_id_status), guard mode, look_around and the new-people greeting did not
+# - so a frozen frame was enrolled 5 times into the owner's face, "recognised"
+# at an empty desk and diffed against itself by an armed guard that then never
+# alerted. Every such reader asks THIS helper. Same 5 s as see_user
+# (core/actions.py) and camera_system._WEBCAM_LIVE_SECONDS.
+_CAMERA_FRAME_LIVE_S = 5.0
+
+
+def _fresh_camera_frame(idx, max_age_s: float = _CAMERA_FRAME_LIVE_S):
+    """(frame_copy, ts) when the face-track producer delivered a frame for
+    camera ``idx`` within ``max_age_s`` seconds, else (None, None). Takes
+    _camera_state_lock itself - never call it while holding that lock (a
+    plain Lock). NEVER raises."""
+    try:
+        with _camera_state_lock:
+            fr = _camera_latest_frame.get(idx)
+            ts = _camera_last_frame_at.get(idx, 0.0)
+            if fr is None or not ts or (time.time() - ts) > max_age_s:
+                return None, None
+            return fr.copy(), ts
+    except Exception:
+        return None, None
 
 # PREVIEW-RATE DIAGNOSTIC (2026-09-04). A BLOCKING cap.read() is what sets the
 # face-tracking loop's period, and the loop's period is the HUD/web camera
@@ -9937,7 +10115,8 @@ def _face_presence_note(cam_index, frame, face, now: float | None = None) -> boo
     return False
 
 
-def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC) -> bool:
+def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC,
+                        name: "str | None" = None) -> bool:
     """Open a camera index with a hard wall-clock timeout.
 
     A camera open has no timeout of its own and a sick device can fail to
@@ -9951,7 +10130,34 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
     actually opens it is _camera_open()'s business (Media Foundation by
     default since 2026-09-05, with the index translated to match), which is
     also what stopped a dead index in this sweep costing +103 handles a step.
+
+    ``name`` is the CAMERAS name of the camera being probed; when omitted it
+    is looked up from the CAMERAS entry at ``idx`` (a Kinect slot has none).
     """
+    # THE CONFIGURED CAMERA, BY NAME (2026-10-01). The probe used to open a
+    # bare index, so _camera_open mapped "DirectShow index 0" through the
+    # DirectShow name list - and with the configured webcam OFF the bus, the
+    # device now sitting at DirectShow index 0 was the KINECT. The probe
+    # stream-started the Kinect under the webcam's gate key (skipping every
+    # 'kinect' hold), wedged, and boot then dropped the webcam for the
+    # session. With the name, _camera_open opens THAT camera or nothing.
+    _nm = name
+    if _nm is None:
+        try:
+            _pcam = next((c for c in CAMERAS if isinstance(c, dict)
+                          and c.get("index") == idx), None)
+            if _pcam is not None and _camera_gate_key(_pcam) != "kinect":
+                _nm = str(_pcam.get("name") or "").strip() or None
+        except Exception:
+            _nm = None
+    # ...and a named camera that is on NEITHER device list is not probed at
+    # all: there is nothing of it to open, and asking the gate would count a
+    # boot-time "open failure" toward the USB-storm breaker for a camera that
+    # was simply not plugged in.
+    if _nm and _named_camera_listing(_nm)[0] == "absent":
+        print(f"  [cam-probe] index {idx}: '{_nm}' is not on the device list "
+              f"- not opened")
+        return False
     # BENCHED INDEX -> DO NOT OPEN IT AT ALL (2026-09-06). This is the half of
     # the bound that has teeth: scoring strikes on the retirement branch below
     # only counts wedges, it does not stop them. A camera that has already
@@ -9979,7 +10185,7 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
     #      component's min-gap) are WAITED OUT, up to
     #      _CAMERA_PROBE_GATE_PATIENCE_S; a hold (storm / backoff / lock)
     #      means "NOT probed", said out loud, and the device is not touched.
-    _gkey = _camera_gate_key(index=idx)
+    _gkey = _camera_gate_key(index=idx, name=_nm)
     if _camera_gate is not None:
         _age = _camera_gate.recent_success(_gkey, "cam-probe",
                                            _CAMERA_PROBE_VERDICT_REUSE_S)
@@ -10072,7 +10278,7 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
                 # _camera_open(), so the index is translated for whichever
                 # backend is in force and a dead DirectShow index no longer
                 # costs +103 handles per sweep step.
-                cap = _camera_open(idx, label=f"probe index {idx}")
+                cap = _camera_open(idx, name=_nm, label=f"probe index {idx}")
                 if cap is not None:
                     # RETRY reads until the probe deadline — a WARMING camera
                     # opens instantly but returns False frames for its first
@@ -10269,7 +10475,7 @@ def _camera_rescued_by_name(cam: dict, static_idx: int,
             # open in 2.0s' dropped a healthy LEFT cam sitting at its own
             # index. Re-probe HERE at the rescue budget before giving up —
             # a slow warm-up is not a dead device.
-            if _probe_camera_index(live, timeout_sec=timeout_sec):
+            if _probe_camera_index(live, timeout_sec=timeout_sec, name=name):
                 print(f"  [cam-probe] '{name}' at its own index {live} passed "
                       f"the retry-budget probe ({timeout_sec:.1f}s) — keeping "
                       f"it (slow warm-up, not a dead device)")
@@ -10277,7 +10483,7 @@ def _camera_rescued_by_name(cam: dict, static_idx: int,
             print(f"  [cam-probe] '{name}' rescue: still no frames at its own "
                   f"index {live} after {timeout_sec:.1f}s — cannot rescue")
             return False
-        if _probe_camera_index(live, timeout_sec=timeout_sec):
+        if _probe_camera_index(live, timeout_sec=timeout_sec, name=name):
             print(f"  [cam-probe] '{name}' failed at static index {static_idx} "
                   f"but opened at LIVE index {live} (USB re-enumeration shuffle) "
                   f"— keeping it (opener resolves by name)")
@@ -10486,6 +10692,12 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
 
     # Helper: probe a list of indices IN PARALLEL — total time becomes the
     # longest single probe (~3 s) instead of the sum (~30 s for 10 indices).
+    # LISTED IS NOT OPENED (2026-10-01). An index kept on the device-list
+    # check alone was never stream-tested, so the summary below must not call
+    # it "working": the boot log printed "kept without a boot stream test"
+    # and then "working ✓" for the same camera, a claim no open ever backed.
+    _listed_only: set[int] = set()
+
     def _probe_many(indices: list[int]) -> dict[int, bool]:
         results: dict[int, bool] = {}
         threads = []
@@ -10495,6 +10707,7 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
                     print(f"  [cam-probe] index {i}: on the device list - kept "
                           f"without a boot stream test (the face tracker's "
                           f"open is the test)")
+                    _listed_only.add(i)
                     results[i] = True
                     return
                 results[i] = _probe_camera_index(i)
@@ -10535,7 +10748,9 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
     for idx in configured:
         if cfg_results.get(idx, False):
             working_configured.append(idx)
-            print(f"  [cam-probe] index {idx}: working ✓")
+            print(f"  [cam-probe] index {idx}: "
+                  + ("listed (not stream-tested) ✓" if idx in _listed_only
+                     else "working ✓"))
         else:
             # NAME-RESOLUTION RESCUE (2026-07-08): the static index may be stale
             # after a USB shuffle. If the camera's name resolves to a different
@@ -10550,7 +10765,12 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
 
     # Step 2: if any configured cameras worked, keep the original config
     if working_configured:
-        good = [cam for cam in CAMERAS if cam["index"] in working_configured]
+        # A NAMED camera is never dropped here (2026-10-01): one that is off
+        # the bus is the camera gate's job - it is held "absent" and reopened
+        # by name when it returns - while an entry removed from CAMERAS is
+        # gone for the session. Only unnamed (index-only) entries go.
+        good = [cam for cam in CAMERAS if cam["index"] in working_configured
+                or str(cam.get("name") or "").strip()]
         CAMERAS[:] = good
         # PROMOTE a survivor to PRIMARY if the configured primary failed its
         # probe here. Mirrors the _preflight_cameras guard: the HUD preview WRITE
@@ -10566,6 +10786,23 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
                   f"promoted {CAMERAS[0].get('label')} "
                   f"(index {CAMERAS[0].get('index')}) to primary")
         return working_configured, [i for i in configured if i not in working_configured]
+
+    # NAMED CAMERAS ARE NEVER REPLACED BY A SWEEP (2026-10-01). Step 4 below
+    # stream-starts every other index and rewrites CAMERAS with whatever
+    # opened as UNNAMED "Probed webcam" entries - which, with the owner's one
+    # named webcam briefly off the bus, adopted the device he had REMOVED
+    # from CAMERAS (it resets the USB hub) and, with KINECT_AS_CAMERA, turned
+    # the slots into Kinect views for the session. Nothing ever reloads
+    # CAMERAS, so the real webcam never came back. Keep the configuration;
+    # the face tracker's gate-driven absent/return recovery reopens it.
+    _named = [c for c in CAMERAS if isinstance(c, dict)
+              and str(c.get("name") or "").strip()]
+    if _named:
+        print(f"  [cam-probe] no configured camera answered - keeping "
+              f"{', '.join(repr(str(c.get('name'))) for c in _named)} "
+              f"configured (no index sweep); the face tracker reopens a named "
+              f"camera by name when it is back on the bus")
+        return [], configured
 
     # Step 3: short-circuit — if a known webcam-locking app (Teams / Zoom /
     # OBS / Snap Camera) is running, don't bother sweeping. The cameras
@@ -10938,6 +11175,12 @@ def _face_tracking_thread():
 
     Signature and thread target are unchanged, so nothing else moves."""
     _face_track_caps[0] = []
+    # A per-camera preview left by an earlier run (or by a camera no longer in
+    # CAMERAS) has nothing that would ever rewrite or delete it (2026-10-01).
+    try:
+        _hud_percam_preview_remove_all(force=True)
+    except Exception:
+        logging.exception("[face-track] per-camera preview sweep on start")
     _face_track_beat("starting")
     wd_stop = threading.Event()
     wd = threading.Thread(target=_face_track_watchdog, args=(wd_stop,),
@@ -10964,6 +11207,7 @@ def _face_tracking_thread():
         # linger (moved here from the body so it runs on EVERY exit path).
         try:
             _hud_camera_preview_remove()
+            _hud_percam_preview_remove_all(force=True)
         except Exception:
             logging.exception("[face-track] preview remove on shutdown")
         _face_track_beat("stopped")
@@ -11224,6 +11468,7 @@ def _face_tracking_thread_body():
     if not caps:
         print(f"  [face-track] No cameras available. Try: --list-cameras")
         _hud_camera_preview_remove()   # no camera → ensure no stale preview frame
+        _hud_percam_preview_remove_all()
         return
 
     primary_seen_recently = 0.0   # timestamp of last primary detection
@@ -11259,6 +11504,9 @@ def _face_tracking_thread_body():
             # The per-frame write for the primary camera happens below.
             if camera_off or not _hud_camera_preview_enabled():
                 _hud_camera_preview_remove()
+                # ...and the per-camera tiles, which had no remove path at all
+                # (2026-10-01). Cheap per frame: a no-op once they are gone.
+                _hud_percam_preview_remove_all()
                 # SIDE-TILE LEAK FIX (2026-07-08): the composite's persistent
                 # side-tile webcam handles are released by _hud_kinect_preview_
                 # write ONLY on the skeleton-overlay on→off edge. Entering
@@ -34188,6 +34436,10 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
     # against other camera I/O via _camera_io_lock. Fan out across
     # indices so total wall time stays ~timeout_sec instead of N×.
     results: dict[int, bool] = {}
+    # Kept on the device-list check alone - never opened (2026-10-01): the
+    # summary must not report these as "opens cleanly". See the same set in
+    # probe_cameras_and_update_config.
+    listed_only: set[int] = set()
 
     def _check(i: int):
         try:
@@ -34195,6 +34447,7 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
                 print(f"  [preflight] camera index {i}: on the device list - "
                       f"kept without a boot stream test (the face tracker's "
                       f"open is the test)")
+                listed_only.add(i)
                 results[i] = True
                 return
             results[i] = _probe_camera_index(i, timeout_sec=timeout_sec)
@@ -34262,7 +34515,9 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
         if idx is None:
             continue
         if results.get(idx, False):
-            print(f"  [preflight] camera index {idx}: opens cleanly ✓")
+            print(f"  [preflight] camera index {idx}: "
+                  + ("on the device list, not stream-tested ✓"
+                     if idx in listed_only else "opens cleanly ✓"))
         elif _camera_rescued_by_name(
                 cam, idx, timeout_sec=max(timeout_sec * 2.5, 5.0)):
             # Present at a shuffled live index (name-resolved) — keep it, don't
@@ -34273,6 +34528,14 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
             # every boot after the Kinect fell off the DirectShow list and
             # re-enumerated everything (live 2026-07-10).
             pass
+        elif str(cam.get("name") or "").strip():
+            # A NAMED camera is never dropped (2026-10-01) - see the same rule
+            # in probe_cameras_and_update_config: one that is off the bus is
+            # held "absent" by the camera gate and reopened by name when it
+            # returns; an entry removed from CAMERAS is gone for the session.
+            print(f"  [preflight] camera index {idx}: did not answer in "
+                  f"{timeout_sec:.1f}s — kept ('{cam.get('name')}' is reopened "
+                  f"by name when it is back)")
         else:
             print(f"  [preflight] camera index {idx}: failed to open in "
                   f"{timeout_sec:.1f}s — marking bad")

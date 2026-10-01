@@ -19,6 +19,7 @@ accessors never raise and never touch pykinect2 at import time.
 """
 
 import sys
+import time
 
 
 def _bridge():
@@ -49,6 +50,58 @@ def _distance_phrase(metres) -> str:
     return f" about {meters_to_imperial_phrase(metres)} away"
 
 
+# How fresh a color/body frame must be to count as "streaming". The 30 Hz body
+# pump consumes body and primes color, so both ages advance every ~33 ms on a
+# live sensor.
+_STREAM_LIVE_MAX_AGE_S = 1.0
+# Depth has no poller, so its liveness is MEASURED: consume one frame, wait a
+# few depth frames (30 Hz), and require a NEW one to have arrived.
+_DEPTH_LIVE_PROBE_S = 0.15
+
+
+def _live_streams(kb) -> list:
+    """Which Kinect streams are delivering NEW frames right now. NEVER raises.
+
+    STALE DUPLICATE FIXED 2026-10-01. This used to count a stream as live when
+    get_color_bgr(require_new=False) / get_depth() returned non-None - but on
+    the installed pykinect2 build both re-serve a frozen buffer FOREVER (the
+    zero-filled buffers exist from construction), so the probe said "color,
+    depth" about a sensor that had stopped streaming. The bridge grew
+    get_stream_health() for exactly this (its docstring names this probe as the
+    lie) and tools/web_interface.py moved to it; this voice action never did.
+    It reads freshness now, never "did a getter return bytes"."""
+    try:
+        h = kb.get_stream_health() or {}
+    except Exception:
+        h = {}
+
+    def _fresh(key):
+        # The AGE, not *_pending: pending stays True for as long as nobody
+        # consumes the last frame, so a dead pump would pin it (the depth trap).
+        age = h.get(f"{key}_age_s")
+        return age is not None and age < _STREAM_LIVE_MAX_AGE_S
+
+    streams = []
+    if _fresh("color"):
+        streams.append("color")
+    if _fresh("body"):
+        streams.append("body")
+    # Nothing polls depth, so depth_pending stays True after the sensor dies
+    # until somebody consumes the last frame, and depth_age_s only means
+    # "nobody asked recently" (see web_interface's color-only rung). Consume
+    # one, then require a NEW frame within a few frame periods.
+    try:
+        kb.get_depth(require_new=True)
+        time.sleep(_DEPTH_LIVE_PROBE_S)
+        if (kb.get_stream_health() or {}).get("depth_pending"):
+            streams.append("depth")
+    except Exception:
+        pass
+    # Infrared is not probed: the bridge reports it "unsupported" on this
+    # build, and a has_new flag on a fuller build is the same sticky-flag trap.
+    return streams
+
+
 # ─── actions ─────────────────────────────────────────────────────────────
 
 def kinect_status(_: str = "") -> str:
@@ -65,23 +118,13 @@ def kinect_status(_: str = "") -> str:
     if not ok:
         return f"The Kinect isn't available right now, sir — {reason}"
 
-    # Probe which streams are actually delivering frames.
-    streams = []
-    try:
-        if kb.get_color_bgr(require_new=False) is not None:
-            streams.append("color")
-    except Exception:
-        pass
-    try:
-        if kb.get_depth() is not None:
-            streams.append("depth")
-    except Exception:
-        pass
-    try:
-        if kb.get_infrared_gray() is not None:
-            streams.append("infrared")
-    except Exception:
-        pass
+    streams = _live_streams(kb)
+    if not streams:
+        # A published runtime with no frames arriving is the R11 "dies seconds
+        # after every open" Kinect (or a stalled sensor before the bridge's
+        # 4 s stale reset): say so instead of "streaming (no streams yet)".
+        return ("The Kinect is connected, sir, but no frames are arriving "
+                "right now — it may have dropped off.")
 
     presence = {}
     try:
@@ -90,7 +133,7 @@ def kinect_status(_: str = "") -> str:
         presence = {}
     count = int(presence.get("count", 0) or 0)
 
-    stream_str = ", ".join(streams) if streams else "no streams yet"
+    stream_str = ", ".join(streams)
     if count == 0:
         people = "no one in view at the moment"
     elif count == 1:

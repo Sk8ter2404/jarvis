@@ -215,11 +215,34 @@ def _collect_frames() -> list[tuple[str, object]]:
             CAMERAS = []
         lock = getattr(bc, "_camera_state_lock", None)
         latest = getattr(bc, "_camera_latest_frame", {}) or {}
+        # LIVE FRAMES ONLY (2026-10-01). The cache keeps a dead camera's last
+        # frame forever, so an armed guard diffed that frozen frame against
+        # itself, never alerted, and still counted the camera in "I'll be
+        # watching N cameras". The monolith's freshness helper decides; it
+        # takes _camera_state_lock itself, so it is read BEFORE we take it.
+        fresh_fn = getattr(bc, "_fresh_camera_frame", None)
+        live: dict = {}
+        stale_labels: list = []
+        if callable(fresh_fn):
+            for cam in CAMERAS:
+                idx = cam.get("index")
+                try:
+                    fr, _ts = fresh_fn(idx)
+                except Exception:
+                    fr = None
+                if fr is not None:
+                    live[idx] = fr
+                else:
+                    base = f"the {_cam_side(cam)} monitor camera"
+                    stale_labels += [base, f"{base} ({idx})"]
         try:
             def _grab():
                 for cam in CAMERAS:
                     idx = cam.get("index")
-                    fr = latest.get(idx)
+                    if callable(fresh_fn):
+                        fr = live.get(idx)
+                    else:
+                        fr = latest.get(idx)
                     if fr is None:
                         continue
                     side = _cam_side(cam)
@@ -229,17 +252,30 @@ def _collect_frames() -> list[tuple[str, object]]:
                     # defensively (a mis-labelled config could still collide).
                     if any(lbl == label for lbl, _f in frames):
                         label = f"{label} ({idx})"
+                    if callable(fresh_fn):
+                        frames.append((label, fr))   # already a copy
+                        continue
                     try:
                         frames.append((label, fr.copy()))
                     except Exception:
                         frames.append((label, fr))
-            if lock is not None:
+            if lock is not None and not callable(fresh_fn):
                 with lock:
                     _grab()
             else:
                 _grab()
         except Exception:
             pass
+        # A camera that went dark must re-baseline when it returns, not diff
+        # its first new frame against one minutes old. Never a label a LIVE
+        # camera is using this tick (that would blind it).
+        in_use = {lbl for lbl, _f in frames}
+        dropped = [k for k in stale_labels if k not in in_use]
+        if dropped:
+            with _guard_lock:
+                for key in dropped:
+                    _prev_frames.pop(key, None)
+                    _motion_streak.pop(key, None)
 
     # Kinect: only when it's enabled AND streaming.
     if _cfg_flag("KINECT_ENABLED"):

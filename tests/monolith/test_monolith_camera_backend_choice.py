@@ -324,6 +324,15 @@ class CameraOpenRoutingTests(MonolithGlobalsTestCase):
 class CallSiteTests(MonolithGlobalsTestCase):
     """Each live open site reaches for _camera_open, not cv2 directly."""
 
+    def setUp(self):
+        # The configured cameras are LISTED (2026-10-01): the probe asks
+        # where a NAMED camera is listed before it opens anything (B025),
+        # and this machine's real device lists must not decide these tests.
+        lp = mock.patch.object(self.bc, "_named_camera_listing",
+                               return_value=("msmf", None))
+        lp.start()
+        self.addCleanup(lp.stop)
+
     def test_tile_open_uses_the_shared_opener_and_proves_a_frame(self):
         bc = self.bc
         seen = {}

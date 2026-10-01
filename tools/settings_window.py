@@ -1167,10 +1167,10 @@ SCHEMA: dict[str, dict] = {
                 "it with 'calibrate gaze'.",
     },
     "KINECT_GESTURES_ENABLED": {
-        "tab": "cameras", "label": "Gestures (wave, raise hand, swipe)",
+        "tab": "cameras", "label": "Gestures (wave, swipe)",
         "type": "bool", "default": False,
-        "help": "A wave wakes JARVIS from standby, a raised hand confirms like "
-                "'yes', a swipe cancels.",
+        "help": "A wave wakes JARVIS from standby, a swipe cancels. A raised "
+                "hand never confirms - a pending action needs a spoken 'yes'.",
     },
     "KINECT_POINT_CONTROL_ENABLED": {
         "tab": "cameras", "label": "Point at a device to control it",

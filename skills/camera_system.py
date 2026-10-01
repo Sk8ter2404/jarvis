@@ -779,8 +779,23 @@ def _collect_frames() -> list[tuple[str, bytes]]:
             CAMERAS = []
         lock = getattr(bc, "_camera_state_lock", None)
         latest = getattr(bc, "_camera_latest_frame", {}) or {}
+        # LIVE FRAMES ONLY (2026-10-01): the cache keeps a dead webcam's last
+        # frame forever, and look_around described that frozen scene as
+        # current - while camera_status, in this same file, already called the
+        # camera not live (_WEBCAM_LIVE_SECONDS). The monolith's freshness
+        # helper takes _camera_state_lock itself, so it runs outside it.
+        fresh_fn = getattr(bc, "_fresh_camera_frame", None)
         try:
-            if lock is not None:
+            if callable(fresh_fn):
+                for cam in CAMERAS:
+                    try:
+                        fr, _ts = fresh_fn(cam.get("index"))
+                    except Exception:
+                        fr = None
+                    if fr is not None:
+                        side = _cam_side(cam)
+                        raw.append((f"the {side} monitor webcam", fr))
+            elif lock is not None:
                 with lock:
                     for cam in CAMERAS:
                         idx = cam.get("index")
