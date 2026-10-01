@@ -240,13 +240,65 @@ def _act_volume_down(_: str = "") -> str:
     return "pyautogui unavailable"
 
 
-def _act_volume_mute(_: str = "") -> str:
-    bc = _bc()
-    pag = bc._get_pyautogui()
+def _endpoint_volume():
+    """The default render device's IAudioEndpointVolume (pycaw). Raises when
+    pycaw / COM / an output device is unavailable — callers degrade.
+
+    Shared by set_volume and the explicit mute/unmute actions (2026-10-01:
+    lifted out of _act_set_volume so mute can READ the state, not toggle it)."""
+    from pycaw.pycaw import AudioUtilities
+
+    dev = AudioUtilities.GetSpeakers()
+    # Modern pycaw returns an AudioDevice wrapper with a ready-made
+    # EndpointVolume property (verified on-box 2026-07-10); older releases
+    # return the raw COM device needing the Activate+cast dance.
+    vol = getattr(dev, "EndpointVolume", None)
+    if vol is None:
+        from ctypes import POINTER, cast
+
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import IAudioEndpointVolume
+
+        iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        vol = cast(iface, POINTER(IAudioEndpointVolume))
+    return vol
+
+
+def _set_system_mute(want_muted: bool) -> str:
+    """Put the system output INTO the requested mute state and say what
+    happened. Idempotent: "mute" on an already-muted PC stays muted.
+
+    2026-10-01 (B091): volume_mute used to press VK_VOLUME_MUTE, which is a
+    TOGGLE — "JARVIS, mute" while Windows was already muted (the owner mutes
+    it when family is home) turned the speakers back ON while the chain path
+    still said "muted". pycaw's GetMute/SetMute set the state outright. Only
+    when the endpoint can't be read do we fall back to the key, and then we
+    say plainly that it may have toggled."""
+    word = "muted" if want_muted else "unmuted"
+    try:
+        vol = _endpoint_volume()
+        if bool(vol.GetMute()) == want_muted:
+            return f"system audio was already {word}, sir"
+        vol.SetMute(1 if want_muted else 0, None)
+        return f"system audio {word}, sir"
+    except Exception:
+        pass
+    pag = _bc()._get_pyautogui()
     if pag:
         pag.press("volumemute")
-        return "mute toggled"
+        return ("mute key pressed — I couldn't read the mute state, so it "
+                "may have toggled the other way, sir")
     return "pyautogui unavailable"
+
+
+def _act_volume_mute(_: str = "") -> str:
+    return _set_system_mute(True)
+
+
+def _act_volume_unmute(_: str = "") -> str:
+    """'unmute' / 'turn the sound back on'. Added 2026-10-01 alongside the
+    mute fix: unmuting used to work only because mute was a toggle."""
+    return _set_system_mute(False)
 
 
 def _act_set_volume(arg: str = "") -> str:
@@ -271,21 +323,7 @@ def _act_set_volume(arg: str = "") -> str:
         return (f"couldn't parse a volume percent from {arg!r} — "
                 "give a number from 0 to 100")
     try:
-        from pycaw.pycaw import AudioUtilities
-
-        dev = AudioUtilities.GetSpeakers()
-        # Modern pycaw returns an AudioDevice wrapper with a ready-made
-        # EndpointVolume property (verified on-box 2026-07-10); older releases
-        # return the raw COM device needing the Activate+cast dance.
-        vol = getattr(dev, "EndpointVolume", None)
-        if vol is None:
-            from ctypes import POINTER, cast
-
-            from comtypes import CLSCTX_ALL
-            from pycaw.pycaw import IAudioEndpointVolume
-
-            iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            vol = cast(iface, POINTER(IAudioEndpointVolume))
+        vol = _endpoint_volume()
         vol.SetMasterVolumeLevelScalar(n / 100.0, None)
         return f"volume set to {n} percent, sir"
     except Exception as e:
@@ -760,13 +798,22 @@ def _act_apple_music(query: str) -> str:
 
 # ─── App launching (Phase 4D) ──────────────────────────────────────────
 
-# Spoken names that should launch the new UWP Apple Music app via its AUMID
-# (explorer shell:AppsFolder) rather than a doomed exe / startfile lookup —
-# the Store app has no PATH-friendly executable.
+# Spoken names that mean "Apple Music". They open the web player (see
+# _act_open_apple_music) rather than a doomed exe / startfile lookup.
 _APPLE_MUSIC_LAUNCH_ALIASES = frozenset({
     "apple music", "apple music app", "music app", "applemusic",
     "the apple music app",
 })
+
+# The Apple Music web player, the owner's player. Same default and the same
+# JARVIS_APPLE_MUSIC_URL override as tray.py's APPLE_MUSIC_WEB_URL (the tray's
+# "Open Apple Music" item), so voice and tray open the same page.
+_APPLE_MUSIC_WEB_URL = "https://music.apple.com/"
+
+
+def _apple_music_web_url() -> str:
+    return (os.environ.get("JARVIS_APPLE_MUSIC_URL", "").strip()
+            or _APPLE_MUSIC_WEB_URL)
 
 
 def _act_launch_app(name: str) -> str:
@@ -775,17 +822,12 @@ def _act_launch_app(name: str) -> str:
     if shortcut:
         return _act_open_url(shortcut)
     bc = _bc()
-    # 0) Apple Music (UWP) special-case — launch via AUMID. The Store app
-    #    isn't on PATH and os.startfile("apple music") fails, so route it
-    #    through the apple_music_app bridge before the generic resolution.
+    # 0) Apple Music special-case — the web player, like open_apple_music
+    #    (2026-10-01, B089: this used to launch the Store app by AUMID, which
+    #    the owner doesn't use). Must run before the generic resolution:
+    #    os.startfile("apple music") fails.
     if re.sub(r"\s+", " ", (name or "").strip().lower()) in _APPLE_MUSIC_LAUNCH_ALIASES:
-        amapp = _apple_music_app()
-        if amapp is not None:
-            ok, err = amapp.launch()
-            if ok:
-                return "launched Apple Music"
-            return f"could not launch Apple Music: {err}"
-        # Bridge unimportable — fall through to the generic path below.
+        return _act_open_apple_music()
 
     # 1) Known-app table for things shutil.which / os.startfile can't resolve
     #    (e.g. Bambu Studio, which installs to Program Files without a
@@ -816,18 +858,66 @@ def _act_launch_app(name: str) -> str:
 #
 # Classic iTunes is gone (iTunes.Application COM not registered, iTunes.exe
 # absent), so the old _get_itunes() / app.Pause() / app.Play() / CurrentTrack
-# paths are dead. Transport now drives whatever player is live with OS-level
-# MEDIA KEYS: the Apple Music web app (browser-active fast path) OR the new
-# UWP Apple Music app (apple_music_app.is_active_media_app()). Only when
-# NOTHING is playing/running do we return an honest line.
+# paths are dead. Transport drives the Windows media session (SMTC) first —
+# pause only pauses, resume only resumes, on the session actually playing
+# (2026-10-01, B029). Only without SMTC does it fall back to OS-level MEDIA
+# KEYS: the Apple Music web app (browser-active fast path) OR the new UWP
+# Apple Music app (apple_music_app.is_active_media_app()). Only when NOTHING
+# is playing/running do we return an honest line.
 
 _NOTHING_PLAYING_MSG = (
     "Nothing seems to be playing, sir — open Apple Music and I'll take it "
     "from there."
 )
 
+# 2026-10-01 (B029): what each transport op says, keyed by the outcome of
+# core.media_now_playing.transport(). {app} is the session's friendly name.
+_TRANSPORT_REPLIES = {
+    "pause": {"done": "paused {app}, sir",
+              "already": "{app} is already paused, sir"},
+    "play": {"done": "resumed {app}, sir",
+             "already": "{app} is already playing, sir"},
+    "next": {"done": "skipped to the next track in {app}, sir"},
+    "prev": {"done": "went back a track in {app}, sir"},
+}
+
+
+def _smtc_transport_reply(op: str) -> "str | None":
+    """Drive pause/resume/next/previous through the Windows media session
+    (SMTC) and return the spoken result, or None when SMTC is unavailable
+    (CI / Linux / no winrt) so the caller falls back to its media-key path.
+
+    2026-10-01 (B029): the media-key path is a blind TOGGLE sent to whatever
+    session Windows calls current. With the Apple Music app merely running it
+    toggled an HBO video in Chrome on "pause the music", STARTED a paused
+    player on "pause", paused a playing one on "resume", and skipped a video
+    on "next song". transport() picks the session by its real state and calls
+    the idempotent TryPause / TryPlay / TrySkip* on it — and it never focuses
+    a window just to send a key."""
+    try:
+        from core.media_now_playing import transport as _smtc_transport
+        res = _smtc_transport(op)
+    except Exception:
+        return None
+    if res is None:
+        return None
+    outcome, app = res
+    app = app or "the media player"
+    if outcome == "none":
+        return _NOTHING_PLAYING_MSG
+    if outcome == "failed":
+        if app == "the media player":
+            return "I couldn't reach the Windows media controls, sir."
+        return f"{app} didn't accept that, sir."
+    line = _TRANSPORT_REPLIES.get(op, {}).get(outcome)
+    return line.format(app=app) if line else _NOTHING_PLAYING_MSG
+
 
 def _act_pause_music(_: str = "") -> str:
+    smtc = _smtc_transport_reply("pause")
+    if smtc is not None:
+        return smtc
+    # No SMTC (winrt missing): the legacy media-key path below.
     bc = _bc()
     # Browser Apple Music → media key (fast path, unchanged).
     if bc._apple_music_chrome_active():
@@ -841,6 +931,9 @@ def _act_pause_music(_: str = "") -> str:
 
 
 def _act_resume_music(_: str = "") -> str:
+    smtc = _smtc_transport_reply("play")
+    if smtc is not None:
+        return smtc
     bc = _bc()
     if bc._apple_music_chrome_active():
         return _act_media_playpause()
@@ -910,42 +1003,92 @@ def _act_now_playing(_: str = "") -> str:
     return _NOTHING_PLAYING_MSG
 
 
-# ─── Open / status for the new UWP Apple Music app ─────────────────────────
+# ─── Open / status for Apple Music (web player first) ──────────────────────
 
 def _act_open_apple_music(_: str = "") -> str:
-    """Launch the new UWP Apple Music app via its AUMID. 'open Apple Music'."""
-    amapp = _apple_music_app()
-    if amapp is None:
-        return "the Apple Music bridge isn't available, sir."
-    if amapp.is_running():
-        return "Apple Music is already open, sir."
-    ok, err = amapp.launch()
-    if ok:
-        return "launched Apple Music"
-    return f"could not launch Apple Music: {err}"
+    """Open the Apple Music WEB PLAYER in a real browser. 'open Apple Music'.
+
+    2026-10-01 (B089): this launched the Microsoft-Store app by AUMID. The
+    owner listens in Chrome and had the Store app's autostart/keep-open turned
+    off; the tray's "Open Apple Music" was moved to the web player in v2.0.144
+    and this voice copy was left behind (a stale duplicate). Goes through the
+    monolith's _open_url_in_browser, NOT webbrowser.open: the Store app
+    registers itself as the music.apple.com handler, so the default handler
+    can open the app instead of the page."""
+    bc = _bc()
+    url = _apple_music_web_url()
+    try:
+        how = bc._open_url_in_browser(url)
+    except Exception as e:
+        return f"could not open Apple Music in the browser: {e}"
+    if how == "default":
+        return ("no Chrome or Edge found, sir, so I handed Apple Music to the "
+                "default link handler — that may have opened the app instead.")
+    return "opened Apple Music in the browser, sir"
 
 
 def _act_music_status(_: str = "") -> str:
-    """Report whether the Apple Music app is installed / running and what (if
-    anything) it's playing. 'is Apple Music open' / 'music status'."""
-    amapp = _apple_music_app()
-    if amapp is None:
-        return "the Apple Music bridge isn't available, sir."
-    running = amapp.is_running()
-    if not running:
-        # is_installed() is a best-effort PowerShell check; treat False as
-        # 'unknown' rather than a hard claim it's missing.
-        if amapp.is_installed():
-            return "Apple Music is installed but not running, sir."
-        return ("Apple Music doesn't appear to be running, sir — say 'open "
-                "Apple Music' and I'll start it.")
+    """Is Apple Music open, and what is playing? 'is Apple Music open' /
+    'music status'.
+
+    2026-10-01 (B089): this read ONLY the Store app — "doesn't appear to be
+    running" while the web player played, and "running, now playing <some
+    Chrome tab's title>" when the app was open. Sources now go in the owner's
+    order: the Windows media session (what is really playing, any player),
+    the browser web player, and only then the Store app."""
+    bc = _bc()
+    playing = None
     try:
-        np = amapp.now_playing()
+        from core.media_now_playing import get_now_playing as _smtc_get
+        snap = _smtc_get()
     except Exception:
-        np = None
-    if np:
-        return f"Apple Music is running, sir — now playing {np}."
-    return "Apple Music is running, sir, but nothing is playing right now."
+        snap = None
+    if snap and snap.get("title"):
+        what = snap["title"]
+        if snap.get("artist"):
+            what = f"{what} by {snap['artist']}"
+        verb = "playing" if snap.get("playing") else "paused"
+        playing = f"{what} is {verb} in {snap.get('app') or 'your media player'}"
+
+    try:
+        web = bool(bc._apple_music_chrome_active())
+    except Exception:
+        web = False
+    if web:
+        if playing:
+            return f"Apple Music is open in the browser, sir — {playing}."
+        for reader in ("_apple_music_title_now_playing",
+                       "_apple_music_loaded_track_from_title"):
+            try:
+                track = getattr(bc, reader)()
+            except Exception:
+                track = None
+            if track:
+                return (f"Apple Music is open in the browser, sir — now "
+                        f"playing {track}.")
+        return ("Apple Music is open in the browser, sir, but nothing is "
+                "playing right now.")
+
+    amapp = _apple_music_app()
+    try:
+        running = amapp is not None and bool(amapp.is_running())
+    except Exception:
+        running = False
+    if running:
+        if playing:
+            return f"The Apple Music app is running, sir — {playing}."
+        try:
+            np = amapp.now_playing()
+        except Exception:
+            np = None
+        if np:
+            return f"The Apple Music app is running, sir — now playing {np}."
+        return ("The Apple Music app is running, sir, but nothing is playing "
+                "right now.")
+    if playing:
+        return f"Apple Music isn't open, sir — but {playing}."
+    return ("Apple Music isn't open, sir — say 'open Apple Music' and I'll "
+            "open the web player.")
 
 
 # ─── Task queue add (Phase 4D) ─────────────────────────────────────────
@@ -1050,16 +1193,94 @@ def _act_close_window(query: str) -> str:
     if not matches:
         return f"no window matching '{query}'"
     closed = []
+    tabs = []
+    skipped = []
     for w in matches:
         # Defence in depth: also check the actual window title we found
         if any(target in (w.title or "").lower() for target in bc.FORBIDDEN_TARGETS):
+            continue
+        # A browser window's title is its ACTIVE TAB's title, so "close
+        # YouTube" matched the owner's whole Chrome window and WM_CLOSE took
+        # every tab in it (2026-10-01, B040 — the same data loss
+        # skills/youtube_search.py fixed on 2026-07-14). When the query
+        # matched the PAGE part of a browser title, close just that tab.
+        # Only a query that matched the browser part itself ("close chrome")
+        # still closes the window.
+        page = _browser_page_title(bc, w.title)
+        if page is not None and _query_names_page(bc, query, page):
+            ok = _close_browser_tab(bc, w)
+            (tabs if ok else skipped).append(w.title)
             continue
         try:
             w.close()
             closed.append(w.title)
         except Exception:
             pass
-    return f"closed: {', '.join(closed)}" if closed else "could not close"
+    parts = []
+    if closed:
+        parts.append(f"closed: {', '.join(closed)}")
+    if tabs:
+        parts.append("closed just the tab: " + ", ".join(tabs)
+                     + " (the rest of the browser window is untouched)")
+    if skipped:
+        parts.append("couldn't bring " + ", ".join(repr(t) for t in skipped)
+                     + " to the front, so I left that window open")
+    return "; ".join(parts) if parts else "could not close"
+
+
+def _browser_page_title(bc, title: str) -> "str | None":
+    """The page / tab part of a browser window title ("Home - YouTube" for
+    "Home - YouTube - Google Chrome"), or None when the window isn't a
+    browser. Reuses the monolith's single browser-suffix list."""
+    t = bc._strip_bidi_and_nbsp(title or "")
+    low = t.lower()
+    for suf in bc._BROWSER_CHROME_SUFFIXES:
+        if low.endswith(suf):
+            return t[: len(t) - len(suf)].strip()
+    return None
+
+
+def _query_names_page(bc, query: str, page: str) -> bool:
+    """True when ``query`` matched the tab (page) part of a browser title
+    rather than only the browser's own name. A query that carries a browser
+    suffix itself (an LLM copying "YouTube - Google Chrome" from
+    list_windows) is judged by its page part too."""
+    q = _browser_page_title(bc, query)
+    q = (q if q is not None else bc._strip_bidi_and_nbsp(query or "")).strip().lower()
+    return bool(q) and q in page.lower()
+
+
+def _close_browser_tab(bc, w) -> bool:
+    """Close the ACTIVE tab of browser window ``w``: focus it, confirm it
+    really is the foreground window, then Ctrl+W. Returns False — closing
+    NOTHING — when it can't be confirmed in front: Ctrl+W sent to whatever
+    else has focus would close the wrong tab or document."""
+    hwnd = getattr(w, "_hWnd", None)
+    if hwnd is None:
+        return False
+    try:
+        w.activate()
+    except Exception as e:
+        # pygetwindow raises even on success in some allowed cases (see
+        # _act_focus_window); the foreground check below is the real test.
+        msg = str(e).lower()
+        if not ("operation completed successfully" in msg
+                or "error code from windows: 0" in msg):
+            return False
+    time.sleep(0.25)
+    try:
+        fg = bc._read_focused_window()[0]
+    except Exception:
+        fg = None
+    if fg != hwnd:
+        return False
+    if not bc._get_pyautogui():   # ui_hotkey would silently send nothing
+        return False
+    try:
+        bc.ui_hotkey("ctrl", "w")
+    except Exception:
+        return False
+    return True
 
 
 # ─── UI type (Phase 4D) ────────────────────────────────────────────────
@@ -1087,7 +1308,12 @@ def _act_type(text: str) -> str:
 # ─── Music skip/back (Phase 4E) ────────────────────────────────────────
 
 def _act_next_song(_: str = "") -> str:
-    # COM is dead → media keys. Browser Apple Music or the new UWP app both
+    # The Windows media session first (B029, 2026-10-01): skips the music
+    # player's session, never whatever video Windows calls current.
+    smtc = _smtc_transport_reply("next")
+    if smtc is not None:
+        return smtc
+    # No SMTC → media keys. Browser Apple Music or the new UWP app both
     # respond to the OS nexttrack key.
     bc = _bc()
     if bc._apple_music_chrome_active():
@@ -1099,6 +1325,9 @@ def _act_next_song(_: str = "") -> str:
 
 
 def _act_previous_song(_: str = "") -> str:
+    smtc = _smtc_transport_reply("prev")
+    if smtc is not None:
+        return smtc
     bc = _bc()
     if bc._apple_music_chrome_active():
         return _act_media_prev()
@@ -2912,6 +3141,19 @@ def _split_monitor_args(args: str, monitor_first: bool) -> "tuple[str | None, st
 _YOUTUBE_SEARCH_RE = re.compile(r"^(?:youtube|you tube)\s+(?:for\s+)?(.+)$", re.IGNORECASE)
 
 
+# Seconds open_on_monitor waits for a fresh window whose title MATCHES the
+# target before settling for a fresh window that doesn't (yet).
+_OPEN_ON_MONITOR_GRACE_S = 2.0
+
+
+def _window_key(w):
+    """A stable identity for a pygetwindow window: its native handle (titles
+    change under us), or the object itself where there is none (held in the
+    set, so its identity can't be recycled the way a bare id() can)."""
+    hwnd = getattr(w, "_hWnd", None)
+    return hwnd if hwnd is not None else w
+
+
 def _act_open_on_monitor(args: str) -> str:
     """args format: '<monitor_name> | <url-or-app-name>' (or the comma form,
     see _split_monitor_args). Opens the URL or launches the app, then moves the
@@ -2937,7 +3179,15 @@ def _act_open_on_monitor(args: str) -> str:
         import pygetwindow as gw
     except ImportError:
         return "pygetwindow not available — pip install pygetwindow"
-    titles_before = {w.title for w in gw.getAllWindows() if w.title}
+    # Snapshot window HANDLES, not titles (2026-10-01, B092): a title snapshot
+    # let a pre-existing window count as "new" the moment its title changed
+    # (a browser tab moving on to the next video), and the old loop also
+    # accepted ANY pre-existing window whose title matched the target — so
+    # "open Chrome on the left monitor" restored, moved and maximised the
+    # owner's existing Chrome window (e.g. his stream) on the first 0.2 s
+    # poll, before the new window existed, and left the new one where it
+    # opened. Only a window that did not exist before the launch is moved.
+    hwnds_before = {_window_key(w) for w in gw.getAllWindows()}
 
     # Launch the target. Treat as URL if explicit scheme or recognisable
     # domain suffix; otherwise treat as an app name.
@@ -2962,29 +3212,39 @@ def _act_open_on_monitor(args: str) -> str:
         return any(tok in t for tok in target_tokens) if target_tokens else False
 
     new_window = None
-    deadline = time.time() + 15.0
+    fallback = None   # a FRESH window that doesn't (yet) match the target
+    started = time.time()
+    deadline = started + 15.0
     while time.time() < deadline:
         time.sleep(0.2)
-        candidates = []
+        fresh = []
         for w in gw.getAllWindows():
-            if not w.title:
+            if not w.title or _window_key(w) in hwnds_before:
                 continue
             try:
                 if w.width < 200 or w.height < 200:
                     continue   # ignore tiny splash/tooltip windows
             except Exception:
                 pass
-            is_new   = w.title not in titles_before
-            is_match = _matches_target(w.title)
-            if is_new or is_match:
-                candidates.append((w, is_match, is_new))
-        if candidates:
-            candidates.sort(key=lambda c: (c[1] and c[2], c[1], c[2]), reverse=True)
-            new_window = candidates[0][0]
+            fresh.append(w)
+        matched = [w for w in fresh if _matches_target(w.title)]
+        if matched:
+            new_window = matched[0]
             break
+        if fresh and fallback is None:
+            fallback = fresh[0]
+        # A URL target's page title rarely contains its domain token, and a
+        # new window's first title is often "New Tab": after a short grace,
+        # take the fresh window we saw instead of waiting out the deadline.
+        if fallback is not None and time.time() - started >= _OPEN_ON_MONITOR_GRACE_S:
+            break
+    if new_window is None:
+        new_window = fallback   # still a window from AFTER the launch, never before
 
     if not new_window:
-        return f"launched {target}, but couldn't find new window to move it"
+        return (f"launched {target}, but couldn't find new window to move it "
+                f"— if it reused a window that was already open, ask me to "
+                f"move that window to the {monitor_name} monitor")
 
     try:
         new_window.restore()
@@ -3770,6 +4030,7 @@ __all__ = [
     "_act_volume_up",
     "_act_volume_down",
     "_act_volume_mute",
+    "_act_volume_unmute",
     "_act_set_volume",
     # Phase 4B — streaming
     "_act_netflix",

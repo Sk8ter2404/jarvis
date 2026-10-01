@@ -324,10 +324,16 @@ def _sample_window_title() -> dict | None:
             # actual player is the browser. The cache also covers the case
             # where the Apple Music tab is in the background of a Chrome
             # window (Win32 GetWindowText only sees the foreground tab).
+            # Only a BROWSER sighting counts (2026-10-01, B029): the Store
+            # app's own "Apple Music" window used to warm the browser cache on
+            # every poll, so the monolith believed the web player was open for
+            # as long as the app ran. Same predicate as _apple_music_chrome_active.
             try:
                 bc = sys.modules.get("__main__") or sys.modules.get("bobert_companion")
                 if bc is not None and hasattr(bc, "_note_apple_music_seen"):
-                    bc._note_apple_music_seen()
+                    _is_web = getattr(bc, "_is_apple_music_browser_title", None)
+                    if _is_web is None or _is_web(title):
+                        bc._note_apple_music_seen()
             except Exception:
                 pass
             for pat in _APPLE_TITLE_PATTERNS:

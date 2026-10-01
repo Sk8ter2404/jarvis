@@ -2044,7 +2044,7 @@ class AppleMusicChromeActiveTests(MonolithGlobalsTestCase):
 
     def test_live_window_title_match(self):
         win = mock.MagicMock()
-        win.title = "Apple Music — Now Playing"
+        win.title = "Apple Music — Now Playing - Google Chrome"
         gw = mock.MagicMock()
         gw.getAllWindows.return_value = [win]
         self.bc._apple_music_last_seen[0] = 0.0
@@ -2052,6 +2052,39 @@ class AppleMusicChromeActiveTests(MonolithGlobalsTestCase):
             self.assertTrue(self.bc._apple_music_chrome_active())
         # Sighting warmed the cache.
         self.assertGreater(self.bc._apple_music_last_seen[0], 0.0)
+
+    def test_store_app_window_is_not_the_browser_player(self):
+        # B029 (2026-10-01): the Microsoft-Store app's own window is titled
+        # plain "Apple Music". It used to count as the browser web player and
+        # re-warm the 5-minute browser cache on every scan while the app ran.
+        win = mock.MagicMock()
+        win.title = "Apple Music"
+        gw = mock.MagicMock()
+        gw.getAllWindows.return_value = [win]
+        self.bc._apple_music_last_seen[0] = 0.0
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertFalse(self.bc._apple_music_chrome_active())
+        self.assertEqual(self.bc._apple_music_last_seen[0], 0.0)
+
+    def test_real_web_player_title_with_bidi_and_nbsp(self):
+        # The real tab title carries a leading U+200E and an NBSP inside
+        # "Apple Music"; the predicate normalises before matching.
+        win = mock.MagicMock()
+        win.title = "‎Apple\xa0Music - Web Player - Google Chrome"
+        gw = mock.MagicMock()
+        gw.getAllWindows.return_value = [win]
+        self.bc._apple_music_last_seen[0] = 0.0
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertTrue(self.bc._apple_music_chrome_active())
+
+    def test_browser_title_predicate(self):
+        f = self.bc._is_apple_music_browser_title
+        self.assertTrue(f("Apple Music - Web Player - Google Chrome"))
+        self.assertTrue(f("Billie Jean - Apple Music - Google Chrome"))
+        self.assertTrue(f("Billie Jean - Apple Music - Personal - Microsoft Edge"))
+        self.assertFalse(f("Apple Music"))
+        self.assertFalse(f(""))
+        self.assertFalse(f("Lo-fi beats - YouTube - Google Chrome"))
 
     def test_no_window_but_warm_cache(self):
         gw = mock.MagicMock()

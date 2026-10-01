@@ -2675,6 +2675,64 @@ class OpenOnMonitorTests(unittest.TestCase):
             out = A._act_open_on_monitor("left | example.com")
         self.assertIn("failed to move window", out)
 
+    # ── B092 (2026-10-01): never move a window that existed before ───────
+    @staticmethod
+    def _gw_sequence(frames):
+        """Fake pygetwindow whose getAllWindows() walks ``frames`` (the last
+        frame repeats). Frame 0 is the handler's pre-launch snapshot."""
+        mod = types.ModuleType("pygetwindow")
+        state = {"i": 0}
+
+        def _all():
+            i = min(state["i"], len(frames) - 1)
+            state["i"] += 1
+            return list(frames[i])
+
+        mod.getAllWindows = _all
+        return mod
+
+    def test_existing_matching_window_is_left_alone(self):
+        # The owner's Chrome window (playing a stream) is already open; the
+        # NEW Chrome window only appears on the third poll. The old loop
+        # accepted the pre-existing title match on the first poll and moved
+        # + maximised the owner's window instead.
+        bc = self._bc()
+        existing = _FakeWindow("Stream - YouTube - Google Chrome")
+        existing._hWnd = 0x100
+        new = _FakeWindow("New Tab - Google Chrome")
+        new._hWnd = 0x200
+        gw = self._gw_sequence([[existing], [existing], [existing],
+                                [existing, new]])
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", self.MONS), \
+                mock.patch.dict(sys.modules, {"pygetwindow": gw}), \
+                mock.patch.object(A, "_act_launch_app", return_value="launched"), \
+                mock.patch.object(A.time, "sleep"), \
+                mock.patch.object(A.time, "time", _clock()):
+            out = A._act_open_on_monitor("left | chrome")
+        self.assertFalse(existing.maximized, "moved the owner's existing window")
+        self.assertIsNone(existing.moved_to)
+        self.assertTrue(new.maximized)
+        self.assertIn("on left monitor", out)
+
+    def test_existing_window_whose_title_changed_is_not_new(self):
+        # A title snapshot let a pre-existing window count as "new" once its
+        # title changed (the next autoplayed video); handles don't change.
+        bc = self._bc()
+        before = _FakeWindow("Video one - YouTube - Google Chrome")
+        before._hWnd = 0x100
+        after = _FakeWindow("Video two - YouTube - Google Chrome")
+        after._hWnd = 0x100          # same window, new title
+        gw = self._gw_sequence([[before], [after]])
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", self.MONS), \
+                mock.patch.dict(sys.modules, {"pygetwindow": gw}), \
+                mock.patch.object(A.time, "sleep"), \
+                mock.patch.object(A.time, "time", _clock(step=1.0)):
+            out = A._act_open_on_monitor("left | example.com")
+        self.assertFalse(after.maximized)
+        self.assertIn("couldn't find new window", out)
+
 
 # ===========================================================================
 # _act_move_window_to_monitor  (imports win32gui/win32con -> injected fakes)

@@ -161,6 +161,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # anywhere and the un-anchored turn-it-down/up phrasings only matched
         # the dispatcher's anchored fast-paths (2026-07-21 audit).
         "mute", "turn it down", "turn it up",
+        # 2026-10-01: volume_unmute's own example ('turn the sound back on');
+        # "unmute" already contains "mute".
+        "sound back on",
     ],
     "AUDIO OUTPUT DEVICE": [
         "headset", "headphones", "speakers", "output device", "switch audio",

@@ -39,6 +39,10 @@ import unittest
 from unittest import mock
 
 import core.actions as A
+import core.media_now_playing as _mnp
+
+# Captured before any test pins it (the base class patches it per test).
+_REAL_TRANSPORT = _mnp.transport
 
 
 # ── shared helpers ───────────────────────────────────────────────────────────
@@ -101,6 +105,29 @@ class _BaseActTest(unittest.TestCase):
         self._bc_patcher.start()
         self.addCleanup(self._bc_patcher.stop)
         self._injected_modules = []
+        # The Windows media session (SMTC) is pinned OFF by default: on a dev
+        # box with winrt installed, an unpinned transport() would really pause
+        # / skip the owner's media, and a real read would make the music
+        # answers depend on what he is playing. Tests that cover the SMTC
+        # path re-pin it via pin_smtc_transport / pin_smtc_snapshot.
+        self.pin_smtc_transport(None)
+        self.pin_smtc_snapshot(None)
+
+    def pin_smtc_transport(self, result):
+        """Pin core.media_now_playing.transport. ``result`` is its return
+        value, or a callable(op) for per-op results. Returns the mock."""
+        side = (lambda op, *a, **k: result(op)) if callable(result) else None
+        p = mock.patch("core.media_now_playing.transport",
+                       return_value=None if callable(result) else result,
+                       side_effect=side)
+        mk = p.start()
+        self.addCleanup(p.stop)
+        return mk
+
+    def pin_smtc_snapshot(self, snap):
+        p = mock.patch("core.media_now_playing.get_now_playing", return_value=snap)
+        p.start()
+        self.addCleanup(p.stop)
 
     def install_fake_module(self, name, module):
         """Put a fake module in sys.modules for the duration of this test only.
@@ -280,32 +307,37 @@ class AppleMusicTests(_BaseActTest):
 
 # ── _act_launch_app ──────────────────────────────────────────────────────────
 class LaunchAppTests(_BaseActTest):
-    def test_apple_music_launches_via_bridge(self):
-        # "open apple music" routes to the UWP bridge's launch(), NOT a doomed
-        # exe / startfile lookup.
+    # B089 (2026-10-01): "launch apple music" opens the WEB PLAYER (the
+    # owner's player), like open_apple_music — never the Store app by AUMID,
+    # and never a doomed exe / startfile lookup.
+    def test_apple_music_opens_the_web_player(self):
         amapp = self.patch_apple_music_app()
-        amapp.launch.return_value = (True, None)
+        self.bc._open_url_in_browser.return_value = "chrome:webbrowser"
         with mock.patch.object(A.subprocess, "Popen") as popen, \
-                mock.patch.object(A.os, "startfile", create=True) as startfile:
+                mock.patch.object(A.os, "startfile", create=True) as startfile, \
+                mock.patch.dict(os.environ, {"JARVIS_APPLE_MUSIC_URL": ""}):
             out = A._act_launch_app("Apple Music")
-        amapp.launch.assert_called_once_with()
-        self.assertEqual(out, "launched Apple Music")
+        self.bc._open_url_in_browser.assert_called_once_with(
+            "https://music.apple.com/")
+        amapp.launch.assert_not_called()
+        self.assertIn("opened Apple Music in the browser", out)
         popen.assert_not_called()
         startfile.assert_not_called()
         self.bc._resolve_known_app.assert_not_called()
 
-    def test_music_app_alias_launches_via_bridge(self):
+    def test_music_app_alias_opens_the_web_player(self):
         amapp = self.patch_apple_music_app()
+        self.bc._open_url_in_browser.return_value = "chrome"
         out = A._act_launch_app("music app")
-        amapp.launch.assert_called_once_with()
-        self.assertEqual(out, "launched Apple Music")
+        self.bc._open_url_in_browser.assert_called_once()
+        amapp.launch.assert_not_called()
+        self.assertIn("opened Apple Music in the browser", out)
 
-    def test_apple_music_launch_failure_reported(self):
-        amapp = self.patch_apple_music_app()
-        amapp.launch.return_value = (False, "explorer denied")
+    def test_apple_music_open_failure_reported(self):
+        self.bc._open_url_in_browser.side_effect = OSError("no browser")
         out = A._act_launch_app("apple music")
-        self.assertIn("could not launch Apple Music", out)
-        self.assertIn("explorer denied", out)
+        self.assertIn("could not open Apple Music", out)
+        self.assertIn("no browser", out)
 
     def test_known_app_launches(self):
         self.bc._resolve_known_app.return_value = r"C:\Apps\bambu.exe"
@@ -356,10 +388,12 @@ class LaunchAppTests(_BaseActTest):
 
 
 # ── _act_pause_music / _act_resume_music ─────────────────────────────────────
-# Classic iTunes COM is DEAD: pause/resume now press the OS playpause media key
-# when the browser Apple Music tab OR the new UWP Apple Music app is live, and
-# return an honest "nothing's playing" line otherwise. Neither path touches
-# _get_itunes anymore.
+# Classic iTunes COM is DEAD. With the Windows media session (SMTC) available
+# transport goes through it (SmtcTransportTests below). These cover the LEGACY
+# path, taken only when SMTC is unavailable (the base pins transport() to
+# None): the OS playpause media key when the browser Apple Music tab OR the
+# new UWP Apple Music app is live, and an honest "nothing's playing" line
+# otherwise. Neither path touches _get_itunes anymore.
 class PauseResumeMusicTests(_BaseActTest):
     def test_pause_routes_to_media_when_chrome_active(self):
         self.bc._apple_music_chrome_active.return_value = True
@@ -416,6 +450,100 @@ class PauseResumeMusicTests(_BaseActTest):
         out = A._act_resume_music("")
         self.assertIn("Nothing seems to be playing", out)
         self.bc._get_itunes.assert_not_called()
+
+
+# ── B029 (2026-10-01): transport through the Windows media session ───────────
+# The bug: with the Apple Music app merely running, pause/resume/next/previous
+# pressed a blind media-key TOGGLE at whatever Windows called current — an HBO
+# video in Chrome — so "pause" started a paused player, "resume" paused a
+# playing one and "next song" skipped the video. These drive the REAL
+# core.media_now_playing.transport() + choose_transport_target() over a fake
+# set of sessions (the only fake is the WinRT runner), and assert no media key
+# is ever pressed when SMTC answered.
+class SmtcTransportTests(_BaseActTest):
+    def setUp(self):
+        super().setUp()
+        # The Apple Music app is running: on the old code this gate is what
+        # let the blind toggle through.
+        self.bc._apple_music_chrome_active.return_value = True
+        self.patch_apple_music_app(is_active=True, running=True)
+        self.bc._media_key_with_focus.return_value = "media key pressed"
+        self.acted = []
+
+    def sessions(self, *sessions):
+        """Pin transport() to the REAL function, with a fake WinRT runner
+        over ``sessions`` that records the op it performs on which app."""
+        acted = self.acted
+
+        def runner(op, prefer):
+            outcome, idx = _mnp.choose_transport_target(list(sessions), op, prefer)
+            if idx is None:
+                return outcome, None
+            if outcome == "go":
+                acted.append((op, sessions[idx]["app"]))
+                return "done", sessions[idx]["app"]
+            return outcome, sessions[idx]["app"]
+
+        self.pin_smtc_transport(lambda op: _REAL_TRANSPORT(op, runner=runner))
+
+    def test_pause_on_paused_music_does_not_start_it(self):
+        self.sessions({"app": "Apple Music", "status": "paused", "current": True})
+        out = A._act_pause_music("")
+        self.assertEqual(self.acted, [])
+        self.bc._media_key_with_focus.assert_not_called()
+        self.assertIn("already paused", out)
+
+    def test_resume_on_playing_music_does_not_pause_it(self):
+        self.sessions({"app": "Apple Music", "status": "playing", "current": True})
+        out = A._act_resume_music("")
+        self.assertEqual(self.acted, [])
+        self.bc._media_key_with_focus.assert_not_called()
+        self.assertIn("already playing", out)
+
+    def test_resume_the_music_never_toggles_the_video(self):
+        self.sessions({"app": "Chrome", "status": "playing", "current": True},
+                      {"app": "Apple Music", "status": "paused", "current": False})
+        out = A._act_resume_music("")
+        self.assertEqual(self.acted, [("play", "Apple Music")])
+        self.bc._media_key_with_focus.assert_not_called()
+        self.assertEqual(out, "resumed Apple Music, sir")
+
+    def test_next_song_skips_the_music_not_the_video(self):
+        self.sessions({"app": "Chrome", "status": "playing", "current": True},
+                      {"app": "Apple Music", "status": "paused", "current": False})
+        out = A._act_next_song("")
+        self.assertEqual(self.acted, [("next", "Apple Music")])
+        self.bc._media_key_with_focus.assert_not_called()
+        self.assertIn("next track in Apple Music", out)
+
+    def test_previous_song_goes_through_the_session(self):
+        self.sessions({"app": "Apple Music", "status": "playing", "current": True})
+        out = A._act_previous_song("")
+        self.assertEqual(self.acted, [("prev", "Apple Music")])
+        self.bc._media_key_with_focus.assert_not_called()
+        self.assertIn("back a track in Apple Music", out)
+
+    def test_pause_pauses_the_playing_session(self):
+        self.sessions({"app": "Apple Music", "status": "playing", "current": True})
+        self.assertEqual(A._act_pause_music(""), "paused Apple Music, sir")
+        self.assertEqual(self.acted, [("pause", "Apple Music")])
+
+    def test_no_session_is_the_honest_nothing_playing_line(self):
+        self.sessions()
+        self.assertEqual(A._act_next_song(""), A._NOTHING_PLAYING_MSG)
+        self.bc._media_key_with_focus.assert_not_called()
+
+    def test_failed_transport_never_falls_back_to_a_key(self):
+        self.pin_smtc_transport(("failed", None))
+        out = A._act_pause_music("")
+        self.bc._media_key_with_focus.assert_not_called()
+        self.assertIn("couldn't reach the Windows media controls", out)
+
+    def test_session_refusal_is_reported(self):
+        self.pin_smtc_transport(("failed", "Chrome"))
+        out = A._act_next_song("")
+        self.bc._media_key_with_focus.assert_not_called()
+        self.assertIn("Chrome didn't accept that", out)
 
 
 # ── _act_now_playing ─────────────────────────────────────────────────────────
@@ -517,56 +645,114 @@ class NowPlayingTests(_BaseActTest):
 
 
 # ── _act_open_apple_music / _act_music_status ────────────────────────────────
+# B089 (2026-10-01): "open Apple Music" opens the WEB PLAYER through the
+# monolith's real-browser opener (the owner listens in Chrome; the tray moved
+# to the web player in v2.0.144 and this voice copy was left on the Store app).
 class OpenAppleMusicTests(_BaseActTest):
-    def test_already_running(self):
-        self.patch_apple_music_app(running=True)
-        self.assertIn("already open", A._act_open_apple_music(""))
-
-    def test_launches_when_not_running(self):
+    def test_opens_the_web_player_not_the_store_app(self):
         amapp = self.patch_apple_music_app(running=False)
-        amapp.launch.return_value = (True, None)
+        self.bc._open_url_in_browser.return_value = "chrome:webbrowser"
+        with mock.patch.dict(os.environ, {"JARVIS_APPLE_MUSIC_URL": ""}):
+            out = A._act_open_apple_music("")
+        self.bc._open_url_in_browser.assert_called_once_with(
+            "https://music.apple.com/")
+        amapp.launch.assert_not_called()
+        self.assertEqual(out, "opened Apple Music in the browser, sir")
+
+    def test_store_app_running_still_opens_the_web_player(self):
+        amapp = self.patch_apple_music_app(running=True)
+        self.bc._open_url_in_browser.return_value = "chrome"
         out = A._act_open_apple_music("")
-        amapp.launch.assert_called_once_with()
-        self.assertEqual(out, "launched Apple Music")
+        self.bc._open_url_in_browser.assert_called_once()
+        amapp.launch.assert_not_called()
+        self.assertNotIn("already open", out)
 
-    def test_launch_failure_reported(self):
-        amapp = self.patch_apple_music_app(running=False)
-        amapp.launch.return_value = (False, "no explorer")
+    def test_url_override_honoured(self):
+        self.bc._open_url_in_browser.return_value = "chrome"
+        with mock.patch.dict(os.environ,
+                             {"JARVIS_APPLE_MUSIC_URL": "https://example.test/music"}):
+            A._act_open_apple_music("")
+        self.bc._open_url_in_browser.assert_called_once_with(
+            "https://example.test/music")
+
+    def test_default_handler_fallback_is_disclosed(self):
+        self.bc._open_url_in_browser.return_value = "default"
         out = A._act_open_apple_music("")
-        self.assertIn("could not launch Apple Music", out)
-        self.assertIn("no explorer", out)
+        self.assertIn("no Chrome or Edge found", out)
 
-    def test_bridge_unavailable(self):
-        self.patch_apple_music_app_none()
-        self.assertIn("isn't available", A._act_open_apple_music(""))
+    def test_open_failure_reported(self):
+        self.bc._open_url_in_browser.side_effect = RuntimeError("boom")
+        out = A._act_open_apple_music("")
+        self.assertIn("could not open Apple Music", out)
 
 
+# B089: music_status reports the owner's real player first — the Windows
+# media session, then the browser web player — and only then the Store app.
 class MusicStatusTests(_BaseActTest):
-    def test_running_with_now_playing(self):
-        self.patch_apple_music_app(running=True, now_playing="Thriller")
-        out = A._act_music_status("")
-        self.assertIn("running", out)
-        self.assertIn("Thriller", out)
+    def setUp(self):
+        super().setUp()
+        self.bc._apple_music_chrome_active.return_value = False
 
-    def test_running_nothing_playing(self):
-        self.patch_apple_music_app(running=True, now_playing=None)
+    def test_web_player_open_while_store_app_closed(self):
+        # The bug: "doesn't appear to be running" while the web player played.
+        self.patch_apple_music_app(running=False, installed=True)
+        self.bc._apple_music_chrome_active.return_value = True
+        self.pin_smtc_snapshot({"app": "Chrome", "title": "Billie Jean",
+                                "artist": "Michael Jackson", "status": "playing",
+                                "playing": True})
         out = A._act_music_status("")
-        self.assertIn("running", out)
+        self.assertIn("open in the browser", out)
+        self.assertIn("Billie Jean by Michael Jackson is playing in Chrome", out)
+        self.assertNotIn("doesn't appear to be running", out)
+        self.assertNotIn("not running", out)
+
+    def test_web_player_track_from_the_tab_title(self):
+        self.patch_apple_music_app(running=False)
+        self.bc._apple_music_chrome_active.return_value = True
+        self.bc._apple_music_title_now_playing.return_value = "Thriller — Michael Jackson"
+        out = A._act_music_status("")
+        self.assertIn("open in the browser", out)
+        self.assertIn("Thriller — Michael Jackson", out)
+
+    def test_web_player_idle(self):
+        self.patch_apple_music_app(running=False)
+        self.bc._apple_music_chrome_active.return_value = True
+        self.bc._apple_music_title_now_playing.return_value = None
+        self.bc._apple_music_loaded_track_from_title.return_value = None
+        out = A._act_music_status("")
+        self.assertIn("open in the browser", out)
         self.assertIn("nothing is playing", out)
 
-    def test_installed_not_running(self):
+    def test_store_app_running_with_now_playing(self):
+        self.patch_apple_music_app(running=True, now_playing="Thriller")
+        out = A._act_music_status("")
+        self.assertIn("app is running", out)
+        self.assertIn("Thriller", out)
+
+    def test_store_app_running_nothing_playing(self):
+        self.patch_apple_music_app(running=True, now_playing=None)
+        out = A._act_music_status("")
+        self.assertIn("app is running", out)
+        self.assertIn("nothing is playing", out)
+
+    def test_other_player_reported_when_apple_music_closed(self):
+        self.patch_apple_music_app(running=False)
+        self.pin_smtc_snapshot({"app": "Spotify", "title": "Song", "artist": "",
+                                "status": "paused", "playing": False})
+        out = A._act_music_status("")
+        self.assertIn("isn't open", out)
+        self.assertIn("Song is paused in Spotify", out)
+
+    def test_nothing_open_offers_the_web_player(self):
         self.patch_apple_music_app(running=False, installed=True)
         out = A._act_music_status("")
-        self.assertIn("installed but not running", out)
+        self.assertIn("isn't open", out)
+        self.assertIn("web player", out)
 
-    def test_not_running_unknown_install(self):
-        self.patch_apple_music_app(running=False, installed=False)
-        out = A._act_music_status("")
-        self.assertIn("doesn't appear to be running", out)
-
-    def test_bridge_unavailable(self):
+    def test_bridge_unavailable_still_answers(self):
         self.patch_apple_music_app_none()
-        self.assertIn("isn't available", A._act_music_status(""))
+        out = A._act_music_status("")
+        self.assertIn("isn't open", out)
 
 
 # ── _act_queue_task ──────────────────────────────────────────────────────────
@@ -736,6 +922,9 @@ class CloseWindowTests(_BaseActTest):
     def setUp(self):
         super().setUp()
         self.bc.FORBIDDEN_TARGETS = ["bobert_companion", "jarvis terminal"]
+        # The browser-tab check (B040) reads these monolith helpers.
+        self.bc._BROWSER_CHROME_SUFFIXES = (" - google chrome",)
+        self.bc._strip_bidi_and_nbsp = lambda s: s
 
     def test_empty_query(self):
         self.assertIn("format: close_window", A._act_close_window(""))
@@ -777,6 +966,96 @@ class CloseWindowTests(_BaseActTest):
         self.assertEqual(A._act_close_window("notepad"), "could not close")
 
 
+def _monolith_browser_suffixes():
+    """bobert_companion._BROWSER_CHROME_SUFFIXES, read from SOURCE (the light
+    tier never imports the monolith) so these tests use the real list."""
+    import ast
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "bobert_companion.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", "") == "_BROWSER_CHROME_SUFFIXES"):
+            return tuple(ast.literal_eval(node.value))
+    raise AssertionError("_BROWSER_CHROME_SUFFIXES not found in the monolith")
+
+
+# B040 (2026-10-01): a browser window's title is its ACTIVE TAB's title, so
+# "close YouTube" used to WM_CLOSE the owner's whole Chrome window — every
+# tab in it. A query that matched the page part of a browser title now closes
+# just that tab (focus, confirm foreground, Ctrl+W); naming the browser
+# itself still closes the window.
+class CloseBrowserTabTests(_BaseActTest):
+    def setUp(self):
+        super().setUp()
+        self.bc.FORBIDDEN_TARGETS = ["bobert_companion", "jarvis terminal"]
+        self.bc._BROWSER_CHROME_SUFFIXES = _monolith_browser_suffixes()
+        self.bc._strip_bidi_and_nbsp = lambda s: s
+        p = mock.patch.object(A.time, "sleep")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _chrome(self, title, hwnd=0x1234):
+        w = _FakeWindow(title=title)
+        w._hWnd = hwnd
+        return w
+
+    def test_close_site_closes_only_the_tab(self):
+        w = self._chrome("Lo-fi beats - YouTube - Google Chrome")
+        self.bc._find_windows_by_title.return_value = [w]
+        self.bc._read_focused_window.return_value = (0x1234, w.title, None)
+        out = A._act_close_window("youtube")
+        self.assertFalse(w.closed, "the whole browser window was closed")
+        self.assertTrue(w.activated)
+        self.bc.ui_hotkey.assert_called_once_with("ctrl", "w")
+        self.assertIn("closed just the tab", out)
+
+    def test_tab_not_in_front_closes_nothing(self):
+        # Focus didn't land: Ctrl+W would hit whatever else has focus.
+        w = self._chrome("Inbox - Gmail - Google Chrome")
+        self.bc._find_windows_by_title.return_value = [w]
+        self.bc._read_focused_window.return_value = (0x9999, "Notepad", None)
+        out = A._act_close_window("gmail")
+        self.assertFalse(w.closed)
+        self.bc.ui_hotkey.assert_not_called()
+        self.assertIn("left that window open", out)
+
+    def test_window_without_handle_is_left_alone(self):
+        w = _FakeWindow(title="Inbox - Gmail - Google Chrome")
+        self.bc._find_windows_by_title.return_value = [w]
+        out = A._act_close_window("gmail")
+        self.assertFalse(w.closed)
+        self.bc.ui_hotkey.assert_not_called()
+        self.assertIn("left that window open", out)
+
+    def test_naming_the_browser_closes_the_window(self):
+        w = self._chrome("Lo-fi beats - YouTube - Google Chrome")
+        self.bc._find_windows_by_title.return_value = [w]
+        out = A._act_close_window("chrome")
+        self.assertTrue(w.closed)
+        self.bc.ui_hotkey.assert_not_called()
+        self.assertIn("closed:", out)
+
+    def test_full_window_title_from_list_windows_still_closes_the_tab(self):
+        w = self._chrome("Lo-fi beats - YouTube - Google Chrome")
+        self.bc._find_windows_by_title.return_value = [w]
+        self.bc._read_focused_window.return_value = (0x1234, w.title, None)
+        A._act_close_window("Lo-fi beats - YouTube - Google Chrome")
+        self.assertFalse(w.closed)
+        self.bc.ui_hotkey.assert_called_once_with("ctrl", "w")
+
+    def test_non_browser_windows_still_close(self):
+        note = _FakeWindow(title="youtube notes.txt - Notepad")
+        tab = self._chrome("Home - YouTube - Google Chrome")
+        self.bc._find_windows_by_title.return_value = [note, tab]
+        self.bc._read_focused_window.return_value = (0x1234, tab.title, None)
+        out = A._act_close_window("youtube")
+        self.assertTrue(note.closed)
+        self.assertFalse(tab.closed)
+        self.assertIn("closed: youtube notes.txt - Notepad", out)
+        self.assertIn("closed just the tab", out)
+
+
 # ── _act_type ────────────────────────────────────────────────────────────────
 class TypeTests(_BaseActTest):
     def test_refuses_shell_command_without_terminal(self):
@@ -814,9 +1093,10 @@ class TypeTests(_BaseActTest):
 
 # ── _act_next_song / _act_previous_song ──────────────────────────────────────
 class NextPrevSongTests(_BaseActTest):
-    # COM is dead → next/previous press the OS media key when the browser tab
-    # OR the UWP app is live, else an honest line. Never touches _get_itunes /
-    # _run_itunes_com_timeout.
+    # COM is dead. Without SMTC (the base pins transport() to None; the SMTC
+    # path is SmtcTransportTests) next/previous press the OS media key when
+    # the browser tab OR the UWP app is live, else an honest line. Never
+    # touches _get_itunes / _run_itunes_com_timeout.
     def test_next_chrome_active_routes_media(self):
         self.bc._apple_music_chrome_active.return_value = True
         self.bc._media_key_with_focus.return_value = "media next pressed"

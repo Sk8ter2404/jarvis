@@ -391,6 +391,30 @@ class SamplerTests(unittest.TestCase):
             r = self.mod._sample_window_title()
         self.assertEqual(r["source"], "web_apple")
 
+    def test_store_app_window_does_not_warm_the_browser_cache(self):
+        # B029 (2026-10-01): the Store app's own "Apple Music" window used to
+        # warm the monolith's BROWSER-player cache on every poll. The poller
+        # now asks the monolith's shared predicate first.
+        gw = _fake_pygetwindow(["Apple Music"])
+        bc = types.ModuleType("__main__")
+        bc._note_apple_music_seen = mock.MagicMock()
+        bc._is_apple_music_browser_title = mock.MagicMock(return_value=False)
+        with inject_modules(pygetwindow=gw), \
+             mock.patch.dict(sys.modules, {"__main__": bc}):
+            self.mod._sample_window_title()
+        bc._is_apple_music_browser_title.assert_called_once_with("Apple Music")
+        bc._note_apple_music_seen.assert_not_called()
+
+    def test_browser_tab_still_warms_the_cache(self):
+        gw = _fake_pygetwindow(["Holocene — Bon Iver – Apple Music"])
+        bc = types.ModuleType("__main__")
+        bc._note_apple_music_seen = mock.MagicMock()
+        bc._is_apple_music_browser_title = mock.MagicMock(return_value=True)
+        with inject_modules(pygetwindow=gw), \
+             mock.patch.dict(sys.modules, {"__main__": bc}):
+            self.mod._sample_window_title()
+        bc._note_apple_music_seen.assert_called_once()
+
     def test_window_title_apple_present_but_unparseable(self):
         # "apple music" in title but no pattern matches → falls through to None.
         gw = _fake_pygetwindow(["Apple Music"])

@@ -140,6 +140,162 @@ def get_now_playing() -> "dict | None":
     return dict(snap) if snap else None  # pragma: no cover - winrt-only
 
 
+# ─── Transport: pause / play / skip ON a chosen session ────────────────────
+#
+# 2026-10-01 (B029). pause_music / resume_music / next_song / previous_song
+# used to press the OS media keys (playpause / nexttrack / prevtrack). Those
+# are blind TOGGLES aimed at whatever Windows considers the "current" session:
+# with the Apple Music app merely running, "pause the music" toggled an HBO
+# video in Chrome, "pause" on a paused player STARTED it, "resume" on a
+# playing one paused it, and "next song" skipped the video's episode. SMTC can
+# instead call the idempotent TryPause / TryPlay / TrySkip* on ONE session we
+# pick by its real state, so pause can only ever pause and resume can only
+# ever resume (the repo's NEVER TOGGLE BLIND rule, applied to transport).
+
+_TRANSPORT_OPS = ("pause", "play", "next", "prev")
+# How long an action thread waits for one SMTC transport call.
+_TRANSPORT_TIMEOUT_S = 3.0
+
+
+def choose_transport_target(sessions: list, op: str,
+                            prefer_app: str = "Apple Music"
+                            ) -> "tuple[str, int | None]":
+    """Pick which session ``op`` acts on. Pure, so it is tested on any OS.
+
+    ``sessions``: one dict per SMTC session, ``{"app", "status", "current"}``
+    (``status`` from ``_STATUS_NAMES``; ``current`` = it is the OS current
+    session). Returns ``(outcome, index)``: ``("go", i)`` to act on session
+    ``i``, ``("already", i)`` when the request is already true of session
+    ``i`` (pause with nothing playing but something paused; resume while
+    something plays), or ``("none", None)`` when no session fits at all.
+
+    Preference order, everywhere: the ``prefer_app`` session, then the OS
+    current session, then the first that fits.
+    """
+    def _first(pred):
+        for want in (lambda s: s.get("app") == prefer_app,
+                     lambda s: bool(s.get("current")),
+                     lambda s: True):
+            for i, s in enumerate(sessions):
+                if pred(s) and want(s):
+                    return i
+        return None
+
+    playing = lambda s: s.get("status") == "playing"  # noqa: E731
+    paused = lambda s: s.get("status") == "paused"    # noqa: E731
+    if op == "pause":
+        i = _first(playing)
+        if i is not None:
+            return "go", i
+        i = _first(paused)
+        return ("already", i) if i is not None else ("none", None)
+    if op == "play":
+        # A paused preferred player wins even over another app's video: the
+        # owner said "resume the MUSIC". Otherwise never start a second,
+        # arbitrary player while something is already playing.
+        for i, s in enumerate(sessions):
+            if s.get("app") == prefer_app and paused(s):
+                return "go", i
+        i = _first(playing)
+        if i is not None:
+            return "already", i
+        i = _first(paused)
+        return ("go", i) if i is not None else ("none", None)
+    # next / prev: "next SONG" means the music player even while it is
+    # paused; otherwise only a session that is actually playing.
+    for i, s in enumerate(sessions):
+        if s.get("app") == prefer_app and (playing(s) or paused(s)):
+            return "go", i
+    i = _first(playing)
+    return ("go", i) if i is not None else ("none", None)
+
+
+async def _transport_async(op: str, prefer_app: str):  # pragma: no cover - winrt-only
+    """One SMTC transport call -> ``(outcome, app)`` (see transport())."""
+    from winrt.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as MGR,
+    )
+    mgr = await MGR.request_async()
+    sessions = list(mgr.get_sessions())
+    cur = mgr.get_current_session()
+    cur_id = cur.source_app_user_model_id if cur is not None else None
+    infos = []
+    for s in sessions:
+        status = _STATUS_NAMES.get(int(s.get_playback_info().playback_status),
+                                   "unknown")
+        infos.append({"app": _clean_app(s.source_app_user_model_id),
+                      "status": status,
+                      "current": s.source_app_user_model_id == cur_id})
+    outcome, idx = choose_transport_target(infos, op, prefer_app)
+    if idx is None:
+        return outcome, None
+    app = infos[idx]["app"]
+    if outcome != "go":
+        return outcome, app
+    sess = sessions[idx]
+    call = {"pause": sess.try_pause_async, "play": sess.try_play_async,
+            "next": sess.try_skip_next_async,
+            "prev": sess.try_skip_previous_async}[op]
+    ok = await call()
+    return ("done" if ok else "failed"), app
+
+
+def _default_transport(op: str, prefer_app: str):  # pragma: no cover - winrt-only
+    """Run one SMTC transport call on a short-lived worker thread with its own
+    event loop, so the WinRT call never runs on the caller's (possibly main)
+    thread and a hung call can't freeze it. A timeout reports "failed" — never
+    a fallback key press, which could double-act once the slow call lands."""
+    box: dict = {}
+
+    def _run():
+        loop = asyncio.new_event_loop()
+        try:
+            box["v"] = loop.run_until_complete(_transport_async(op, prefer_app))
+        except Exception as e:  # noqa: BLE001 - reported to the caller
+            box["e"] = e
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=_run, name="smtc-transport", daemon=True)
+    t.start()
+    t.join(_TRANSPORT_TIMEOUT_S)
+    if "e" in box:
+        raise box["e"]
+    return box.get("v", ("failed", None))
+
+
+def transport(op: str, prefer_app: str = "Apple Music",
+              runner=None) -> "tuple[str, str | None] | None":
+    """Pause / resume / skip the right media session, idempotently.
+
+    ``op`` is one of ``"pause"``, ``"play"``, ``"next"``, ``"prev"``. Returns
+    ``(outcome, app)`` with outcome ``"done"`` (the session accepted it),
+    ``"already"`` (pause on a paused player, resume while one plays),
+    ``"none"`` (no media session fits) or ``"failed"`` (the session refused,
+    the call errored or timed out). Returns ``None`` ONLY when the SMTC
+    projection is unavailable (CI / Linux / no winrt), so the caller may use
+    its legacy path. Never raises. ``runner`` is the test seam."""
+    global _last_read
+    if op not in _TRANSPORT_OPS:
+        return ("failed", None)
+    if runner is None:
+        if not _winrt_available():
+            return None
+        runner = _default_transport  # pragma: no cover - winrt-only
+    try:
+        res = runner(op, prefer_app)
+    except Exception as e:  # noqa: BLE001 - never raise into an action
+        print(f"  [smtc] transport {op} failed: {type(e).__name__}: {e}",
+              flush=True)
+        return ("failed", None)
+    if (not isinstance(res, tuple) or len(res) != 2
+            or res[0] not in ("done", "already", "none", "failed")):
+        return ("failed", None)
+    with _lock:  # the cached now-playing snapshot is stale after a transport
+        _last_read = 0.0
+    return res
+
+
 def now_playing_text(max_len: int = 60) -> "str | None":
     """One-line ``"Title — Artist"`` (em dash; ``" (paused)"`` suffix when
     paused), or ``None`` when nothing is playing / no title is known."""

@@ -421,6 +421,7 @@ _VOICE_TRIGGER_EXAMPLES: dict[str, list[str]] = {
     "volume_up":       ["volume_up"],
     "volume_down":     ["volume_down"],
     "volume_mute":     ["volume_mute"],
+    "volume_unmute":   ["volume_unmute"],
     "daily_recap":     ["daily_recap"],
     "dossier":         ["dossier"],
     "check_credits":   ["check_credits"],

@@ -264,6 +264,48 @@ class NowPlayingTests(_Base):
         self._inject("pygetwindow", bad)
         self.assertIsNone(am.now_playing())   # swallowed → None
 
+    # B089 (2026-10-01): browser tabs are NOT the Store app's window. The idle
+    # web player and a search page mentioning Apple Music used to come back
+    # as the app's "now playing" track.
+    def test_browser_web_player_tab_is_not_the_app(self):
+        self._inject("pygetwindow", _fake_pgw(
+            ["Apple Music - Web Player - Google Chrome"]))
+        self.assertIsNone(am.now_playing())
+
+    def test_browser_search_tab_is_not_the_app(self):
+        self._inject("pygetwindow", _fake_pgw(
+            ["apple music student discount - Google Search - Google Chrome",
+             "Apple Music"]))
+        self.assertIsNone(am.now_playing())
+
+    def test_app_track_still_read_beside_a_browser_tab(self):
+        self._inject("pygetwindow", _fake_pgw(
+            ["Apple Music - Web Player - Google Chrome",
+             "Bohemian Rhapsody - Apple Music"]))
+        self.assertEqual(am.now_playing(), "Bohemian Rhapsody")
+
+
+class BrowserMarkerParityTests(unittest.TestCase):
+    """The bridge's browser markers mirror the monolith's
+    _MUSIC_BROWSER_MARKERS (read from source: the light tier can't import
+    the monolith). A drift would let the two disagree about which window is
+    the browser player — this repo's stale-duplicate bug class."""
+
+    def test_markers_match_the_monolith(self):
+        import ast
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "bobert_companion.py"),
+                  encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        found = None
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and getattr(node.targets[0], "id", "") == "_MUSIC_BROWSER_MARKERS"):
+                found = ast.literal_eval(node.value)
+        self.assertIsNotNone(found, "_MUSIC_BROWSER_MARKERS not found")
+        self.assertEqual(tuple(found), am._BROWSER_TITLE_MARKERS)
+
 
 class IsActiveMediaAppTests(_Base):
     def test_true_when_running(self):
@@ -278,6 +320,13 @@ class IsActiveMediaAppTests(_Base):
     def test_false_when_neither(self):
         with mock.patch.object(am, "is_running", return_value=False):
             self._inject("pygetwindow", _fake_pgw(["Chrome", "Notepad"]))
+            self.assertFalse(am.is_active_media_app())
+
+    def test_browser_tab_alone_is_not_the_app(self):
+        # B089: the web player in Chrome doesn't make the STORE app active.
+        with mock.patch.object(am, "is_running", return_value=False):
+            self._inject("pygetwindow", _fake_pgw(
+                ["Apple Music - Web Player - Google Chrome"]))
             self.assertFalse(am.is_active_media_app())
 
 

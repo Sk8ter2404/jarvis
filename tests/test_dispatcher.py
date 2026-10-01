@@ -92,6 +92,15 @@ class MatchSingleIntentTests(unittest.TestCase):
         self.assertEqual(self._mi("mute"),
                          ("volume_mute", "", "muted"))
 
+    def test_unmute_has_its_own_route(self):
+        # B091 (2026-10-01): volume_mute now SETS mute, so "unmute" must not
+        # reach it (it used to, and only worked because mute toggled).
+        acts = ACTIONS + ["volume_unmute"]
+        for phrase in ("unmute", "unmute the sound", "turn the sound back on"):
+            self.assertEqual(self._mi(phrase, acts),
+                             ("volume_unmute", "", "unmuted"), phrase)
+        self.assertEqual(self._mi("mute", acts), ("volume_mute", "", "muted"))
+
     def test_screenshot(self):
         self.assertEqual(self._mi("take a screenshot"),
                          ("screenshot", "", "screenshot captured"))

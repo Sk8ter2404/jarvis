@@ -39,6 +39,7 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
 - **List / focus / minimize / close windows**
   - "minimize Chrome", "close the Bambu Studio window", "bring VS Code to the front", "list every open window"
   - Actions: `list_windows`, `focus_window`, `minimize_window`, `close_window`
+  - Closing by a site name ("close YouTube") closes just that browser tab; name the browser ("close Chrome") to close its whole window.
 - **Open app on a specific monitor / move existing window** — uses win32 to set position directly, no fragile hotkeys.
   - "open YouTube on the right monitor", "put Chrome on the left monitor", "move Bambu Studio to the top monitor"
   - Actions: `open_on_monitor`, `move_window_to_monitor`
@@ -73,9 +74,9 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
 - **Media keys** — go to whatever app holds media focus; use these when playing in a browser.
   - "skip this song", "pause", "play"
   - Actions: `media_next`, `media_prev`, `media_playpause`
-- **Volume control** — system-wide.
-  - "turn it down", "volume up", "mute"
-  - Actions: `volume_up`, `volume_down`, `volume_mute`
+- **Volume control** — system-wide. Mute and unmute set the state (saying "mute" twice never unmutes).
+  - "turn it down", "volume up", "mute", "unmute"
+  - Actions: `volume_up`, `volume_down`, `volume_mute`, `volume_unmute`
 - **Auto-routing note**: if Apple Music is open in a browser tab/PWA, iTunes COM actions auto-route to the browser. Use `library:` prefix on `play_music` to force iTunes.
 
 ### Category 5: Apple Music intelligence (taste-aware music)

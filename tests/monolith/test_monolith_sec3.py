@@ -1512,6 +1512,26 @@ class LocalCheatsheetTests(MonolithGlobalsTestCase):
         cal_line = out[cal_idx:out.find("\n", cal_idx)]
         self.assertIn("calendar", cal_line.lower())
 
+    def test_monitor_actions_teach_the_handlers_argument_order(self):
+        # 2026-10-01 (with B092): the local brain's cheatsheet taught
+        # open_on_monitor as '<app or url> | <monitor>' (the handler parses
+        # '<monitor> | <target>', so every call failed "unknown monitor
+        # 'chrome'") and move_window_to_monitor with no window title at all.
+        with mock.patch.object(self.bc, "ACTIONS", {}):
+            out = self.bc._local_cheatsheet()
+        self.assertIn(
+            "[ACTION: open_on_monitor, <left|middle|right|top> | <app or url>]", out)
+        self.assertIn(
+            "[ACTION: move_window_to_monitor, <window title> | "
+            "<left|middle|right|top>]", out)
+        # And the documented order really parses: monitor first.
+        from core.config import MONITORS
+        mon = next(iter(MONITORS))
+        with mock.patch.object(self.bc, "_open_url_new_window", return_value=False), \
+                mock.patch.dict(sys.modules, {"pygetwindow": None}):
+            res = self.bc._act_open_on_monitor(f"{mon} | example.com")
+        self.assertNotIn("unknown monitor", res)
+
 
 # ===========================================================================
 # _call_local_llm — the gating ladder + payload

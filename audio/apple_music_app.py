@@ -204,10 +204,25 @@ def ensure_running(timeout: float = 8.0, poll: float = 0.5) -> tuple[bool, Optio
 
 # ─── now playing (best-effort, window title only) ─────────────────────────
 
+# Title markers of a BROWSER window (a tab, or the web player's own page
+# title). Mirrors bobert_companion._MUSIC_BROWSER_MARKERS — a parity test in
+# tests/test_apple_music_app.py keeps the two copies equal.
+_BROWSER_TITLE_MARKERS = (
+    "web player", "google chrome", "chromium", "microsoft edge",
+    " - edge", " — edge", "mozilla firefox", "brave", "opera",
+)
+
+
 def _music_window_titles() -> list[str]:
     """Return the titles of visible windows that look like the Apple Music
     app. Best-effort via pygetwindow; [] if pygetwindow is absent or errors.
-    Never raises."""
+    Never raises.
+
+    Browser windows are skipped (2026-10-01, B089): a Chrome tab that merely
+    mentions Apple Music ("Apple Music - Web Player - Google Chrome", or a
+    "<query> - Google Search" page) used to come back here, so now_playing()
+    echoed the whole tab title as the Store app's track and music_status
+    reported it as "now playing". This bridge reads the APP's window only."""
     titles: list[str] = []
     try:
         import pygetwindow as gw
@@ -216,7 +231,9 @@ def _music_window_titles() -> list[str]:
     try:
         for w in gw.getAllWindows():
             t = (getattr(w, "title", "") or "").strip()
-            if t and "apple music" in t.lower():
+            low = t.lower()
+            if t and "apple music" in low and not any(
+                    m in low for m in _BROWSER_TITLE_MARKERS):
                 titles.append(t)
     except Exception:
         return titles

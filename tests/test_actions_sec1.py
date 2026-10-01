@@ -319,12 +319,63 @@ class VolumeTests(unittest.TestCase):
         pag.press.assert_called_once_with("volumedown")
         self.assertEqual(out, "volume down")
 
-    def test_volume_mute_presses_key(self):
+    # ── mute / unmute SET the state (B091, 2026-10-01) ──────────────────
+    # volume_mute used to press VK_VOLUME_MUTE, a TOGGLE: "mute" on an
+    # already-muted PC turned the speakers back on. pycaw is ALWAYS faked
+    # here via sys.modules — a real endpoint would mute the dev box.
+    @staticmethod
+    def _pycaw(muted):
+        vol = mock.MagicMock()
+        vol.GetMute.return_value = 1 if muted else 0
+        dev = mock.Mock()
+        dev.EndpointVolume = vol
+        pycaw = mock.MagicMock()
+        pycaw.AudioUtilities.GetSpeakers.return_value = dev
+        return vol, {"pycaw": mock.MagicMock(), "pycaw.pycaw": pycaw}
+
+    def test_volume_mute_sets_mute(self):
         fake, pag = self._bc_with_pag()
-        with _patch_bc(fake):
+        vol, mods = self._pycaw(muted=False)
+        with _patch_bc(fake), mock.patch.dict(sys.modules, mods):
+            out = A._act_volume_mute("")
+        vol.SetMute.assert_called_once_with(1, None)
+        pag.press.assert_not_called()
+        self.assertEqual(out, "system audio muted, sir")
+
+    def test_volume_mute_when_already_muted_never_unmutes(self):
+        fake, pag = self._bc_with_pag()
+        vol, mods = self._pycaw(muted=True)
+        with _patch_bc(fake), mock.patch.dict(sys.modules, mods):
+            out = A._act_volume_mute("")
+        vol.SetMute.assert_not_called()
+        pag.press.assert_not_called()
+        self.assertIn("already muted", out)
+
+    def test_volume_unmute_clears_mute(self):
+        fake, pag = self._bc_with_pag()
+        vol, mods = self._pycaw(muted=True)
+        with _patch_bc(fake), mock.patch.dict(sys.modules, mods):
+            out = A._act_volume_unmute("")
+        vol.SetMute.assert_called_once_with(0, None)
+        pag.press.assert_not_called()
+        self.assertEqual(out, "system audio unmuted, sir")
+
+    def test_volume_unmute_when_not_muted_is_a_no_op(self):
+        fake, pag = self._bc_with_pag()
+        vol, mods = self._pycaw(muted=False)
+        with _patch_bc(fake), mock.patch.dict(sys.modules, mods):
+            out = A._act_volume_unmute("")
+        vol.SetMute.assert_not_called()
+        pag.press.assert_not_called()
+        self.assertIn("already unmuted", out)
+
+    def test_volume_mute_without_pycaw_falls_back_to_the_key_honestly(self):
+        fake, pag = self._bc_with_pag()
+        with _patch_bc(fake), \
+                mock.patch.dict(sys.modules, {"pycaw": None, "pycaw.pycaw": None}):
             out = A._act_volume_mute("")
         pag.press.assert_called_once_with("volumemute")
-        self.assertEqual(out, "mute toggled")
+        self.assertIn("may have toggled", out)
 
     def test_set_volume_rejects_unparseable_and_out_of_range(self):
         fake = mock.Mock()
@@ -378,7 +429,8 @@ class VolumeTests(unittest.TestCase):
             self.assertEqual(A._act_volume_down(""), "pyautogui unavailable")
 
     def test_volume_mute_unavailable(self):
-        with _patch_bc(self._bc_no_pag()):
+        with _patch_bc(self._bc_no_pag()), \
+                mock.patch.dict(sys.modules, {"pycaw": None, "pycaw.pycaw": None}):
             self.assertEqual(A._act_volume_mute(""), "pyautogui unavailable")
 
 

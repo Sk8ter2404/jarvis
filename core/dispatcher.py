@@ -267,6 +267,18 @@ _INTENT_RULES: list[dict] = [
         "arg_fn": lambda m: "",
         "confirmation": "muted",
     },
+    {
+        # 2026-10-01: volume_mute now SETS mute instead of toggling it, so
+        # "unmute" needs its own deterministic route (it used to reach the
+        # toggle). Anchored like the mute rule: "unmute" never matches it.
+        "patterns": [
+            r"^(?:unmute(?:\s+(?:it|that|the\s+(?:sound|music|volume|audio)))?|"
+            r"turn\s+the\s+(?:sound|audio|volume)\s+back\s+on)$",
+        ],
+        "action": "volume_unmute",
+        "arg_fn": lambda m: "",
+        "confirmation": "unmuted",
+    },
 
     # ── Screenshot ────────────────────────────────────────────────────
     {

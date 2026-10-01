@@ -18380,10 +18380,10 @@ def _local_cheatsheet() -> str:
         "  [ACTION: play_music, <artist/song/album>]   play a song/artist/album on Apple Music (music.apple.com)\n"
         "  [ACTION: play_playlist, <name>]   play ANY named playlist — streams it via Apple Music ('shuffle ' prefix shuffles). Use this for every 'play my/the <name> playlist', NOT apple_music.\n"
         "  [ACTION: list_playlists]   (points sir to the Apple Music app)   [ACTION: shuffle_library]   shuffle music via Apple Music\n"
-        "  [ACTION: open_apple_music]   open the Apple Music app   [ACTION: music_status]   is Apple Music installed/running/what's playing\n"
-        "  [ACTION: pause_music]  [ACTION: resume_music]  [ACTION: next_song]  [ACTION: previous_song]  [ACTION: now_playing]   (media keys — work on the app OR browser)\n"
+        "  [ACTION: open_apple_music]   open Apple Music (the web player)   [ACTION: music_status]   is Apple Music open / what's playing\n"
+        "  [ACTION: pause_music]  [ACTION: resume_music]  [ACTION: next_song]  [ACTION: previous_song]  [ACTION: now_playing]   (the Windows media session — app OR browser)\n"
         "  [ACTION: media_playpause]  [ACTION: media_next]  [ACTION: media_prev]\n"
-        "  [ACTION: volume_up]  [ACTION: volume_down]  [ACTION: volume_mute]\n"
+        "  [ACTION: volume_up]  [ACTION: volume_down]  [ACTION: volume_mute]  [ACTION: volume_unmute]\n"
         "  [ACTION: set_volume, 30]   <- absolute: 'set the volume to 30 percent'\n"
         "  [ACTION: netflix, <title>]  [ACTION: spotify, <query>]\n"
         "  [ACTION: youtube_play, <video>]  <- 'play X on youtube': opens, FINDS\n"
@@ -18412,9 +18412,13 @@ def _local_cheatsheet() -> str:
         "  [ACTION: guard_off]   'stand down' / 'disarm' / 'stop guarding'   [ACTION: guard_status]   'are you watching' / 'guard status'\n"
         "  [ACTION: web_search, <query>]   open a web search in the browser\n"
         "  [ACTION: open_url, <url>]   [ACTION: launch_app, <app name>]\n"
-        "  [ACTION: open_on_monitor, <app or url> | <left|middle|right|top>]\n"
+        # Monitor FIRST (2026-10-01): these two lines had the arguments
+        # reversed / the title missing, so a local model that followed them
+        # always got "unknown monitor 'chrome'" or a "format:" error. The
+        # handlers parse '<monitor> | <target>' and '<title> | <monitor>'.
+        "  [ACTION: open_on_monitor, <left|middle|right|top> | <app or url>]\n"
         "  [ACTION: type, <text to type>]   [ACTION: click, <what to click>]\n"
-        "  [ACTION: move_window_to_monitor, <left|middle|right|top>]\n"
+        "  [ACTION: move_window_to_monitor, <window title> | <left|middle|right|top>]\n"
         "  [ACTION: minimize_window]   [ACTION: close_window]\n"
         "  [ACTION: check_system]   [ACTION: system_pulse]   [ACTION: check_print]\n"
         "  [ACTION: show_printer_camera]   'show me the printer camera' / 'pull up the H2D camera' / 'watch the print'   [ACTION: hide_printer_camera]   'close the printer camera'\n"
@@ -25608,10 +25612,30 @@ def _note_apple_music_seen() -> None:
     _apple_music_last_seen[0] = time.time()
 
 
+def _is_apple_music_browser_title(title: str) -> bool:
+    """True when a window title is the Apple Music WEB PLAYER in a browser
+    (a tab or the web-player page), never the Microsoft-Store app's own
+    window, which is titled plain "Apple Music".
+
+    2026-10-01 (B029): the sighting checks matched ANY title containing
+    "apple music", so the Store app's window counted as the browser player
+    and refreshed the 5-minute browser cache every scan while the app was
+    merely open. A browser title always carries one of _MUSIC_BROWSER_MARKERS
+    (the " - Google Chrome" suffix, or the page's "Web Player"), the same
+    browser test _find_music_window ranks by. Titles are normalised first:
+    the real tab title is "<U+200E>Apple<NBSP>Music - Web Player - Google
+    Chrome", which a plain .lower() substring test never matches. Shared by
+    _apple_music_chrome_active and apple_music_intel's poller so the two
+    sighting sources can't drift apart again."""
+    t = _strip_bidi_and_nbsp(title or "").lower()
+    return "apple music" in t and any(m in t for m in _MUSIC_BROWSER_MARKERS)
+
+
 def _apple_music_chrome_active() -> bool:
     """Return True iff Apple Music is — or was recently — visible in a
-    browser tab or Chrome PWA. iTunes desktop's window title is 'iTunes',
-    not 'Apple Music', so this won't false-positive on the COM app.
+    browser tab (see _is_apple_music_browser_title). iTunes desktop's window
+    title is 'iTunes', and the Store app's window has no browser marker, so
+    neither counts as the web player.
 
     Used by the music actions below to short-circuit iTunes COM calls in
     favor of browser media keys / the streaming auto-play pipeline whenever
@@ -25630,8 +25654,7 @@ def _apple_music_chrome_active() -> bool:
     try:
         import pygetwindow as gw
         for w in gw.getAllWindows():
-            title = (w.title or "").lower()
-            if title and "apple music" in title:
+            if _is_apple_music_browser_title(w.title or ""):
                 _note_apple_music_seen()
                 return True
     except ImportError:
@@ -27592,6 +27615,9 @@ ACTIONS = {
     "volume_up":       _act_volume_up,
     "volume_down":     _act_volume_down,
     "volume_mute":     _act_volume_mute,
+    # 2026-10-01: volume_mute now SETS mute (it used to toggle), so unmute
+    # needs its own action - it only ever worked because mute was a toggle.
+    "volume_unmute":   _act_volume_unmute,
     # Absolute volume ("set the volume to 30 percent") — up/down alone made
     # the local model nudge volume_down for set-to-value requests. 2026-07-10.
     "set_volume":      _act_set_volume,
@@ -30245,7 +30271,8 @@ _MISSION_NARRATION_CUES = {
     "media_playpause":  "Toggling playback",
     "volume_up":        "Volume up",
     "volume_down":      "Volume down",
-    "volume_mute":      "Toggling mute",
+    "volume_mute":      "Muting",
+    "volume_unmute":    "Unmuting",
 }
 
 # Spelled-out small numbers for the opening line. >9 falls through to digits.

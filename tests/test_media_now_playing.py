@@ -127,5 +127,109 @@ class WinrtAvailableTests(unittest.TestCase):
             m._available = save
 
 
+# ─── transport (B029, 2026-10-01) ────────────────────────────────────────────
+# pause/resume/next/previous used to press blind media-key TOGGLES at whatever
+# Windows called the current session. choose_transport_target picks the
+# session by its real state; these pin the choices. No test here touches a
+# real SMTC session: transport() is always given a runner.
+
+def _s(app, status, current=False):
+    return {"app": app, "status": status, "current": current}
+
+
+class ChooseTransportTargetTests(unittest.TestCase):
+    def test_pause_on_a_paused_player_is_already_not_a_toggle(self):
+        # The bug: "pause" with the music already paused STARTED it.
+        self.assertEqual(
+            m.choose_transport_target([_s("Apple Music", "paused", True)], "pause"),
+            ("already", 0))
+
+    def test_pause_prefers_the_music_app_when_two_play(self):
+        sessions = [_s("Chrome", "playing", True), _s("Apple Music", "playing")]
+        self.assertEqual(m.choose_transport_target(sessions, "pause"), ("go", 1))
+
+    def test_pause_pauses_what_is_actually_playing(self):
+        sessions = [_s("Apple Music", "paused"), _s("Chrome", "playing", True)]
+        self.assertEqual(m.choose_transport_target(sessions, "pause"), ("go", 1))
+
+    def test_resume_while_playing_is_already_not_a_toggle(self):
+        # The bug: "resume" with the music playing PAUSED it.
+        self.assertEqual(
+            m.choose_transport_target([_s("Apple Music", "playing", True)], "play"),
+            ("already", 0))
+
+    def test_resume_the_music_not_the_video(self):
+        # Apple Music paused, an HBO video playing in Chrome (current):
+        # "resume the music" resumes Apple Music, never toggles Chrome.
+        sessions = [_s("Chrome", "playing", True), _s("Apple Music", "paused")]
+        self.assertEqual(m.choose_transport_target(sessions, "play"), ("go", 1))
+
+    def test_resume_does_not_start_a_second_random_player(self):
+        sessions = [_s("Chrome", "playing", True), _s("Spotify", "paused")]
+        self.assertEqual(m.choose_transport_target(sessions, "play"), ("already", 0))
+
+    def test_resume_falls_back_to_the_current_paused_session(self):
+        sessions = [_s("Spotify", "paused"), _s("Chrome", "paused", True)]
+        self.assertEqual(m.choose_transport_target(sessions, "play"), ("go", 1))
+
+    def test_next_song_targets_the_music_app_not_the_video(self):
+        # The bug: "next song" sent nexttrack to the HBO video (next episode).
+        sessions = [_s("Chrome", "playing", True), _s("Apple Music", "paused")]
+        self.assertEqual(m.choose_transport_target(sessions, "next"), ("go", 1))
+
+    def test_prev_with_only_a_paused_video_is_none(self):
+        self.assertEqual(
+            m.choose_transport_target([_s("Chrome", "paused", True)], "prev"),
+            ("none", None))
+
+    def test_no_sessions_is_none_for_every_op(self):
+        for op in ("pause", "play", "next", "prev"):
+            self.assertEqual(m.choose_transport_target([], op), ("none", None), op)
+
+
+class TransportTests(unittest.TestCase):
+    def test_no_winrt_returns_none_for_the_legacy_path(self):
+        save = m._available
+        try:
+            m._available = False
+            self.assertIsNone(m.transport("pause"))
+        finally:
+            m._available = save
+
+    def test_runner_result_passes_through(self):
+        calls = []
+
+        def runner(op, prefer):
+            calls.append((op, prefer))
+            return ("done", "Apple Music")
+        self.assertEqual(m.transport("next", runner=runner), ("done", "Apple Music"))
+        self.assertEqual(calls, [("next", "Apple Music")])
+
+    def test_runner_error_is_failed_never_raised(self):
+        def runner(op, prefer):
+            raise OSError("RPC_E_WRONG_THREAD")
+        self.assertEqual(m.transport("pause", runner=runner), ("failed", None))
+
+    def test_malformed_runner_result_is_failed(self):
+        self.assertEqual(m.transport("pause", runner=lambda o, p: "yes"),
+                         ("failed", None))
+        self.assertEqual(m.transport("pause", runner=lambda o, p: ("maybe", "x")),
+                         ("failed", None))
+
+    def test_unknown_op_is_failed_without_running(self):
+        def runner(op, prefer):
+            raise AssertionError("must not run")
+        self.assertEqual(m.transport("toggle", runner=runner), ("failed", None))
+
+    def test_transport_invalidates_the_now_playing_cache(self):
+        save = (m._last_read,)
+        try:
+            m._last_read = 12345.0
+            m.transport("pause", runner=lambda o, p: ("done", "Chrome"))
+            self.assertEqual(m._last_read, 0.0)
+        finally:
+            (m._last_read,) = save
+
+
 if __name__ == "__main__":
     unittest.main()
