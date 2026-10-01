@@ -678,5 +678,35 @@ class PromptGuardTests(unittest.TestCase):
         self.assertIn("Never guess a name.", text[guard:guard + 200])
 
 
+
+class TimerListRequestTests(unittest.TestCase):
+    """2026-10-01: "list_timers can make things up" — a whole-utterance
+    timer question is answered from the timer store by the monolith's
+    _run_timer_list_shortcut, never by the model. These pin the classifier."""
+
+    def test_timer_list_questions(self):
+        for q in ("what timers do I have", "what timers are running",
+                  "list my timers", "show me my timers", "Jarvis, any timers?",
+                  "any timers running", "do I have any timers set",
+                  "are there any reminders", "what reminders do I have",
+                  "check my timers please", "how much time is left on my timer",
+                  "how long is left on the tea timer",
+                  "what's left on my timer", "when does my timer go off"):
+            with self.subTest(q=q):
+                self.assertTrue(fp.is_timer_list_request(q))
+
+    def test_not_timer_list_questions(self):
+        for q in ("set a timer for 5 minutes", "cancel my timer",
+                  "remind me in 10 minutes to stretch", "what time is it",
+                  "what times does the store open", "list my schedules",
+                  "kill all timers", "", None):
+            with self.subTest(q=q):
+                self.assertFalse(fp.is_timer_list_request(q))
+
+    def test_match_never_answers_it_itself(self):
+        # The answer is the live timer store's; match() is pure.
+        self.assertIsNone(fp.match("what timers do I have"))
+
+
 if __name__ == "__main__":
     unittest.main()

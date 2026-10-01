@@ -297,6 +297,94 @@ def _enqueue_speech(message: str, key: str | None = None):
             print(f"  [timer] speech-queue write failed ({e}); reminder: {message}")
 
 
+def _spoken_remaining(seconds: int) -> str:
+    """'45 seconds', '4 minutes 10 seconds', '1 hour 5 minutes', '2 days 3
+    hours' — words, because TTS reads "4m" as "4 metres"."""
+    s = max(0, int(seconds))
+
+    def unit(n, word):
+        return f"{n} {word}" + ("" if n == 1 else "s")
+    if s < 60:
+        return unit(s, "second")
+    if s < 3600:
+        m, sec = divmod(s, 60)
+        return unit(m, "minute") + (f" {unit(sec, 'second')}" if sec else "")
+    if s < 86400:
+        h, rest = divmod(s, 3600)
+        m = rest // 60
+        return unit(h, "hour") + (f" {unit(m, 'minute')}" if m else "")
+    d, rest = divmod(s, 86400)
+    h = rest // 3600
+    return unit(d, "day") + (f" {unit(h, 'hour')}" if h else "")
+
+
+def _scheduled_reminder_count() -> int:
+    """How many SPOKEN reminders core.scheduler is holding - jobs that run
+    say_aloud (the schedule_once / schedule_recurring reminder shape), not
+    JARVIS's own housekeeping jobs (the self-diagnostic's interval sweep, the
+    Hue reconnect). 0 when the scheduler is not running. Never raises."""
+    try:
+        from core import scheduler as _sched
+        n = 0
+        for job in _sched.list_jobs() or []:
+            if not isinstance(job, dict):
+                continue
+            steps = [job.get("action")] + [
+                (st or {}).get("action") for st in (job.get("chain") or [])
+                if isinstance(st, dict)]
+            if "say_aloud" in steps:
+                n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def describe_timers(now: float | None = None) -> str:
+    """The real timers, one spoken line — list_timers' answer (2026-10-01).
+
+    The 09-05 live diagnostic: "list_timers can make things up". The store
+    was never wrong; what the owner heard was the MODEL's own words about
+    timers (the monolith now refuses those — see its _TIMER_STATE_CLAIM_RE),
+    next to this action's terse "no active timers" / "#1: 'tea' in 4m 10s"
+    (TTS: "four metres"). This line is built only from _timers: "No timers
+    are running, sir." when there are none, else each timer by number,
+    label and time left in words. Spoken reminders held by the scheduler
+    (schedule_once / schedule_recurring + say_aloud) are a separate list -
+    when any exist the line says so and names the command, instead of
+    implying there are no reminders at all. Marker-free on success (it is
+    voiced verbatim). Never raises."""
+    try:
+        t_now = time.time() if now is None else float(now)
+        with _lock:
+            items = sorted(_timers.items())
+        parts = []
+        for tid, (_t, msg, fire_at) in items:
+            left = _spoken_remaining(int(fire_at - t_now))
+            label = (msg or "").strip()
+            if label and label != "your timer is up":
+                parts.append(f"number {tid}, '{label}', in {left}")
+            else:
+                parts.append(f"number {tid}, in {left}")
+        if not parts:
+            line = "No timers are running, sir."
+        elif len(parts) == 1:
+            line = f"One timer is running, sir: {parts[0]}."
+        else:
+            line = (f"{len(parts)} timers are running, sir: "
+                    + "; ".join(parts) + ".")
+        jobs = _scheduled_reminder_count()
+        if jobs:
+            line += (f" You also have {jobs} scheduled "
+                     f"reminder{'s' if jobs != 1 else ''} — say 'list my "
+                     f"schedules' to hear {'them' if jobs != 1 else 'it'}.")
+        return line
+    except Exception as e:
+        # Never "no timers" on an error: that would be the very invention
+        # this exists to stop. A marker line routes to the failure follow-up.
+        print(f"  [timer] could not describe the timers: {e}")
+        return "I could not read the timer list just now, sir."
+
+
 def enumerate_timers() -> list[dict]:
     """Snapshot every active timer as {id, message, fire_at}.
 
@@ -493,21 +581,9 @@ def register(actions):
         return f"timer #{tid} set — will remind you in {when}"
 
     def list_timers(_: str = "") -> str:
-        with _lock:
-            if not _timers:
-                return "no active timers"
-            now = time.time()
-            lines = []
-            for tid, (_, msg, fire_at) in sorted(_timers.items()):
-                remaining = max(0, int(fire_at - now))
-                if remaining < 60:
-                    rem_str = f"{remaining}s"
-                elif remaining < 3600:
-                    rem_str = f"{remaining // 60}m {remaining % 60}s"
-                else:
-                    rem_str = f"{remaining // 3600}h {(remaining % 3600) // 60}m"
-                lines.append(f"  #{tid}: '{msg}' in {rem_str}")
-            return f"{len(lines)} active timer(s):\n" + "\n".join(lines)
+        """The timers in this process's store, read out as ONE spoken line
+        (it is voiced verbatim). See describe_timers."""
+        return describe_timers()
 
     def _cancel_one(tid: int) -> str:
         with _lock:

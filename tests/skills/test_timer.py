@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sys
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -176,7 +178,7 @@ class TimerSkillTests(unittest.TestCase):
             self.actions["set_timer"]("10 minutes | tea")
             self.actions["set_timer"]("20 minutes | walk")
         listed = self.actions["list_timers"]()
-        self.assertIn("2 active timer", listed)
+        self.assertIn("2 timers are running", listed)
         self.assertIn("tea", listed)
 
         self.assertIn("cancelled timer #1", self.actions["cancel_timer"]("1"))
@@ -188,7 +190,10 @@ class TimerSkillTests(unittest.TestCase):
         self.assertIn("no timer", self.actions["cancel_timer"]("999"))
 
     def test_list_empty(self):
-        self.assertEqual(self.actions["list_timers"](), "no active timers")
+        with mock.patch.object(self.mod, "_scheduled_reminder_count",
+                               return_value=0):
+            self.assertEqual(self.actions["list_timers"](),
+                             "No timers are running, sir.")
 
     # ── restore_timers (blue/green handoff) ──────────────────────────────
     def test_restore_past_timer_fires_immediately(self):
@@ -289,9 +294,10 @@ class TimerSkillTests(unittest.TestCase):
         # Freeze the clock so remaining-time math is exact, not flaky.
         with mock.patch.object(self.mod.time, "time", return_value=now):
             out = self.actions["list_timers"]()
-        self.assertIn("30s", out)
-        self.assertIn("1m 30s", out)
-        self.assertIn("2h 0m", out)
+        # Words, not "30s" / "1m 30s" (TTS read "4m" as "four metres").
+        self.assertIn("'soon', in 30 seconds", out)
+        self.assertIn("'mid', in 1 minute 30 seconds", out)
+        self.assertIn("'far', in 2 hours", out)
 
     # ── cancel_timer: BUG 1 — natural args, honest "no timers" ───────────
     def test_cancel_no_arg_cancels_the_running_one(self):
@@ -592,6 +598,77 @@ class TimerPersistenceTests(unittest.TestCase):
             out = _call_silently(self.actions["set_timer"], "5 minutes | tea")
         self.assertIn("#1", out)
         self.assertEqual(len(self.mod._timers), 1)
+
+
+class ListTimersIsTheStoreTests(unittest.TestCase):
+    """2026-10-01 (09-05 live diagnostic: "list_timers can make things up").
+    The answer is built from the timer store alone, says plainly when it is
+    empty, and points at the scheduler's spoken reminders instead of
+    implying there are none. The monolith half (the model's own timer claims
+    are refused) is tests/monolith/test_monolith_diag_fixes.py."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("timer")
+        self.mod._timers.clear()
+        self.addCleanup(self.mod._timers.clear)
+
+    def _jobs(self, jobs):
+        sched = types.SimpleNamespace(list_jobs=lambda: jobs)
+        return mock.patch.dict(sys.modules, {"core.scheduler": sched})
+
+    def test_no_timers_is_said_plainly(self):
+        with self._jobs([]):
+            out = self.actions["list_timers"]("")
+        self.assertEqual(out, "No timers are running, sir.")
+
+    def test_spoken_scheduler_reminders_are_pointed_at(self):
+        jobs = [{"action": "say_aloud", "arg": "vitamins", "chain": []},
+                {"action": "launch_app", "arg": "x",
+                 "chain": [{"action": "say_aloud", "arg": "done"}]},
+                # JARVIS's own housekeeping is not a reminder
+                {"action": "run_diagnostic", "arg": "", "chain": []},
+                {"action": "hue_retry_connect", "arg": "", "chain": []}]
+        with self._jobs(jobs):
+            out = self.actions["list_timers"]("")
+        self.assertTrue(out.startswith("No timers are running, sir."))
+        self.assertIn("2 scheduled reminders", out)
+        self.assertIn("list my schedules", out)
+
+    def test_one_timer_is_named_with_words(self):
+        now = 1_000_000.0
+        self.mod._timers[4] = (mock.MagicMock(), "check the oven", now + 250)
+        with self._jobs([]):
+            out = self.mod.describe_timers(now=now)
+        self.assertEqual(out, "One timer is running, sir: number 4, "
+                              "'check the oven', in 4 minutes 10 seconds.")
+
+    def test_an_unlabelled_timer_is_not_given_a_label(self):
+        now = 1_000_000.0
+        self.mod._timers[1] = (mock.MagicMock(), "your timer is up", now + 60)
+        with self._jobs([]):
+            out = self.mod.describe_timers(now=now)
+        self.assertEqual(out, "One timer is running, sir: number 1, in "
+                              "1 minute.")
+
+    def test_success_lines_are_voiced_verbatim(self):
+        from core.failure_markers import FAILURE_MARKERS
+        now = 1_000_000.0
+        with self._jobs([{"action": "say_aloud", "chain": []}]):
+            empty = self.mod.describe_timers(now=now)
+            self.mod._timers[1] = (mock.MagicMock(), "tea", now + 90000)
+            one = self.mod.describe_timers(now=now)
+        for line in (empty, one):
+            low = line.lower()
+            self.assertFalse([m for m in FAILURE_MARKERS if m in low], line)
+        self.assertIn("1 day 1 hour", one)
+
+    def test_an_error_is_never_reported_as_no_timers(self):
+        with mock.patch.object(self.mod, "_spoken_remaining",
+                               side_effect=RuntimeError("boom")):
+            self.mod._timers[1] = (mock.MagicMock(), "tea", 1.0)
+            out = self.mod.describe_timers(now=0.0)
+        self.assertNotIn("No timers", out)
+        self.assertIn("could not", out)
 
 
 if __name__ == "__main__":

@@ -30185,6 +30185,50 @@ def _preempt_grounded_by(action_name: str) -> str | None:
 # Each entry is (regex, action_name_or_None, short_description).
 #   action_name in ACTIONS → 'inject': append [ACTION: name] and continue.
 #   action_name is None    → 'refuse': drop spoken text, force re-prompt.
+# A sentence that STATES what timers exist / how long one has left (2026-10-01,
+# the 09-05 live diagnostic: "list_timers can make things up"). The timer store
+# was never wrong — the local model answered "what timers do I have" in its OWN
+# words, with no token (no preemptive pattern knew a timer claim) or as prose in
+# front of [ACTION: list_timers] (answer-first drops only acknowledgements, so
+# the invented sentence was spoken before the real list). Used twice: as a
+# preemptive pattern below (a tokenless claim injects list_timers) and by
+# _drop_timer_claims (whenever list_timers runs, the model's own claims are not
+# voiced). Narrow on purpose: "Timer set for 5 minutes", "I'll remind you in 5
+# minutes" and "your timer is up" state nothing about what is pending.
+_TIMER_NOUN = r"(?:timers?|reminders?|countdowns?)"
+_TIMER_STATE_CLAIM_RE = re.compile(
+    r"\byou(?:'ve|\s+have|\s+(?:currently\s+|still\s+)?(?:have|got))\s+"
+    r"(?:got\s+)?(?:no|\d+|one|two|three|four|five|six|a|an|several|"
+    r"a\s+couple\s+of|just\s+one|only\s+one)\s+(?:[\w'-]+\s+){0,3}?"
+    + _TIMER_NOUN + r"\b"
+    r"|\bthere(?:'s|\s+is|\s+are|'re)\s+(?:currently\s+|still\s+)?"
+    r"(?:no|\d+|one|two|three|four|five|a|an)\s+(?:[\w'-]+\s+){0,3}?"
+    + _TIMER_NOUN + r"\b"
+    r"|\bno\s+(?:active\s+|running\s+|pending\s+)?" + _TIMER_NOUN +
+    r"\s+(?:are\s+|is\s+)?(?:currently\s+)?(?:running|set|active|pending|going)\b"
+    r"|\b\d+\s+(?:minutes?|seconds?|hours?|mins?|secs?)\s+(?:left|remaining|to\s+go)"
+    r"\s+on\s+(?:your|the)\s+(?:[\w'-]+\s+)?timer\b"
+    r"|\b(?:your|the)\s+(?:[\w'-]+\s+){0,2}?timer\s+(?:has|still\s+has|will\s+go\s+off|"
+    r"goes\s+off|is\s+due|is\s+set\s+to\s+go\s+off|ends|finishes)\s+(?:in\s+|at\s+)?"
+    r"(?:about\s+|around\s+)?\d",
+    re.IGNORECASE)
+
+
+def _drop_timer_claims(text: str) -> str:
+    """``text`` without the sentences _TIMER_STATE_CLAIM_RE matches. Called
+    when list_timers ran this turn: its verbatim line is the answer, and the
+    model's own account of the timers is at best a duplicate and at worst
+    an invention. Never raises."""
+    try:
+        if not text or not _TIMER_STATE_CLAIM_RE.search(text):
+            return text
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        kept = [p for p in parts if not _TIMER_STATE_CLAIM_RE.search(p)]
+        return " ".join(kept).strip()
+    except Exception:
+        return text
+
+
 _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] = [
     # Ambient-LEARNING mode (silent standby + fact-extraction, wake on
     # 'JARVIS') is a DIFFERENT feature from the multimodal ambient/eavesdrop
@@ -30383,6 +30427,11 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
         r"\bcpu\s+(?:is\s+)?(?:at\s+|sitting\s+at\s+|running\s+at\s+)\d{1,3}\b",
         re.IGNORECASE),
      "system_pulse", "state system stats from memory"),
+
+    # Timers: "you have a 5-minute tea timer running", "there are no timers",
+    # "your timer has 4 minutes left" — the state of the timer store stated
+    # from memory (2026-10-01). See _TIMER_STATE_CLAIM_RE.
+    (_TIMER_STATE_CLAIM_RE, "list_timers", "state the timers from memory"),
 ]
 
 
@@ -31484,6 +31533,16 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
 
     cleaned = _ACTION_RE.sub(_runner, reply).strip()
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
+
+    # list_timers ran: its verbatim line from the timer store is the answer,
+    # so the model's own account of the timers is not voiced (2026-10-01 —
+    # see _TIMER_STATE_CLAIM_RE for how the invented timers reached him).
+    if any(n == "list_timers" for (n, _r, _i) in results):
+        _no_claims = _drop_timer_claims(cleaned)
+        if _no_claims != cleaned:
+            print("  [timers] dropped the model's own timer claim — the list "
+                  "is read from the timer store")
+            cleaned = _no_claims
 
     # Hallucinated-action detector: if the reply *claims* to have done
     # something but no [ACTION: ...] token actually ran, the LLM is faking
@@ -35940,15 +35999,66 @@ def _run_voice_shortcuts(text: str) -> bool:
         set_state("idle")
         return True
 
-    # "are you ok" / "run a system check" (2026-10-01): the real
-    # self-diagnostic, never the model's guess. See _run_self_check_shortcut.
+    # "are you ok" / "run a system check" and "what timers do I have"
+    # (2026-10-01): answered by the real action, never the model's guess.
+    # See _run_self_check_shortcut / _run_timer_list_shortcut.
     if _run_self_check_shortcut(text):
+        return True
+    if _run_timer_list_shortcut(text):
         return True
 
     # Deterministic fast paths (date math, "what did I just ask", "what's my
     # name"): the last stop before the LLM, so every shortcut above keeps
     # precedence and nothing here ever arms the processing filler.
     return _run_fast_paths(text)
+
+
+def _run_action_shortcut(text: str, kind: str, recognise, action_names,
+                         ack: str = "", empty_reply: str = "") -> bool:
+    """Answer ``text`` with a registered READ-OUT action and no LLM, when
+    ``recognise(text)`` says it is that question (2026-10-01; the shared body
+    of _run_self_check_shortcut and _run_timer_list_shortcut).
+
+    Same contract as _run_fast_paths: gated by FAST_PATHS_ENABLED, logs one
+    "[fast-path] <kind>" line plus the "JARVIS:" transcript line, appends the
+    turn, speaks the action's own result and returns True. The first name in
+    ``action_names`` that is registered runs; with none registered it
+    returns False, so the LLM answers rather than this inventing one. ``ack``
+    (optional) is spoken first, for an action that takes seconds. A raising
+    or empty action speaks ``empty_reply``. Never raises."""
+    if not globals().get("FAST_PATHS_ENABLED", True):
+        return False
+    try:
+        if not recognise(text):
+            return False
+    except Exception:
+        return False
+    fn = None
+    for _name in action_names:
+        fn = ACTIONS.get(_name)
+        if fn is not None:
+            break
+    if fn is None:
+        return False
+    print(f"  [fast-path] {kind}")
+    if ack:
+        try:
+            _speak(ack)
+        except Exception:
+            pass
+    try:
+        result = fn("")
+        reply = result.strip() if isinstance(result, str) else ""
+    except Exception as _e:
+        print(f"  [fast-path] {kind} raised: {_e}")
+        reply = ""
+    if not reply:
+        reply = empty_reply
+    print(f"  JARVIS: {reply}")
+    _append_turn(text, reply)
+    _speak(reply)
+    set_state("idle")
+    return True
 
 
 # The self-diagnostic's action names, preferred first (skills/self_diagnostic
@@ -35968,48 +36078,26 @@ def _run_self_check_shortcut(text: str) -> bool:
     core.fast_paths.is_self_check_request (whole-utterance only); the answer
     is whatever the sweep says — skills/self_diagnostic's _summarise never
     calls an unchecked subsystem nominal. A one-line acknowledgement goes
-    first because the sweep takes a few seconds.
+    first because the sweep takes a few seconds. No diagnostic skill loaded
+    -> False, so the LLM answers (the prompt tells it the action exists)
+    rather than this inventing a pass. Never raises."""
+    return _run_action_shortcut(
+        text, "self-check", _fast_paths.is_self_check_request,
+        _SELF_CHECK_ACTIONS, ack="Running a self-check, sir.",
+        empty_reply=("The self-check did not finish, sir, so I have no result "
+                     "to give you — I won't call anything working that I "
+                     "haven't measured."))
 
-    Same contract as _run_fast_paths: gated by FAST_PATHS_ENABLED, logs one
-    "[fast-path] self-check" line plus the "JARVIS:" transcript line,
-    appends the turn, returns True when it handled the utterance. With no
-    diagnostic skill loaded it returns False, so the LLM answers (and the
-    prompt tells it the action exists) rather than this inventing a pass.
-    Never raises."""
-    if not globals().get("FAST_PATHS_ENABLED", True):
-        return False
-    try:
-        if not _fast_paths.is_self_check_request(text):
-            return False
-    except Exception:
-        return False
-    fn = None
-    for _name in _SELF_CHECK_ACTIONS:
-        fn = ACTIONS.get(_name)
-        if fn is not None:
-            break
-    if fn is None:
-        return False
-    print("  [fast-path] self-check")
-    try:
-        _speak("Running a self-check, sir.")
-    except Exception:
-        pass
-    try:
-        result = fn("")
-        reply = result.strip() if isinstance(result, str) else ""
-    except Exception as _e:
-        print(f"  [fast-path] self-check raised: {_e}")
-        reply = ""
-    if not reply:
-        reply = ("The self-check did not finish, sir, so I have no result "
-                 "to give you — I won't call anything working that I haven't "
-                 "measured.")
-    print(f"  JARVIS: {reply}")
-    _append_turn(text, reply)
-    _speak(reply)
-    set_state("idle")
-    return True
+
+def _run_timer_list_shortcut(text: str) -> bool:
+    """"what timers do I have" / "list my timers" / "how long is left on my
+    timer" -> list_timers' own line from the timer store, with no LLM
+    (2026-10-01; "list_timers can make things up" — the model answered in
+    its own words). Recognition is core.fast_paths.is_timer_list_request.
+    No timer skill loaded -> False. Never raises."""
+    return _run_action_shortcut(
+        text, "timers", _fast_paths.is_timer_list_request, ("list_timers",),
+        empty_reply="I could not read the timer list just now, sir.")
 
 
 # ──────────────────────────────────────────────────────────────────────────

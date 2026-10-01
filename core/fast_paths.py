@@ -559,6 +559,43 @@ def is_self_check_request(text) -> bool:
         return False
 
 
+# ── "what timers do I have" (2026-10-01) ───────────────────────────────────
+# "list_timers can make things up" (09-05 live diagnostic): the local model
+# answered timer questions in its own words. The answer is the timer store's,
+# so a whole-utterance listing question never reaches the model — the
+# monolith's _run_timer_list_shortcut runs list_timers and speaks its line.
+# Setting / cancelling a timer never matches.
+_TIMERS_N = r"(?:timers?|reminders?|countdowns?)"
+_TIMER_STATE_W = r"(?:running|set|going|active|pending|on)"
+_TIMER_LIST_RES = tuple(re.compile(p) for p in (
+    rf"^(?:can you |could you |would you )?(?:list|show|read|tell me|give me|"
+    rf"check|read out|read me)(?: me)?(?: all)?(?: of)? (?:my |the |our |any )?"
+    rf"(?:active |running |current |pending )?{_TIMERS_N}(?: {_TIMER_STATE_W})?$",
+    rf"^(?:what|which) {_TIMERS_N} (?:do i have|have i got|are "
+    rf"{_TIMER_STATE_W}|is {_TIMER_STATE_W}|do i have {_TIMER_STATE_W})$",
+    rf"^(?:do i have|have i got|are there|is there|got) (?:any|a) "
+    rf"(?:active |running |pending )?{_TIMERS_N}(?: {_TIMER_STATE_W})?$",
+    rf"^any (?:active |running |pending )?{_TIMERS_N}(?: {_TIMER_STATE_W})?$",
+    rf"^how (?:much time|long) (?:is |do i have )?(?:left|remaining) on "
+    rf"(?:my|the) (?:\w+ )?timers?$",
+    rf"^what is left on (?:my|the) (?:\w+ )?timers?$",
+    rf"^(?:when|what time) (?:does|will|is) (?:my|the) (?:\w+ )?timer "
+    rf"(?:go off|going off|done|due)$",
+))
+
+
+def is_timer_list_request(text) -> bool:
+    """True for a whole-utterance "what timers / reminders do I have"
+    question. Never raises."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        t = re.sub(r"\s+", " ", normalize(text)).strip()
+        return any(rx.match(t) for rx in _TIMER_LIST_RES)
+    except Exception:
+        return False
+
+
 def match(text, *, now=None, history=(), owner_name="",
           session_turns=None, session_start_lost=False
           ) -> Optional[FastAnswer]:

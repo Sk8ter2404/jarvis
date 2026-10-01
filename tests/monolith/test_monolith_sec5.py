@@ -3026,8 +3026,14 @@ class FabricatedInfoHallucinationTests(SectionFiveBase):
 
     # ── conservative: ordinary prose must NOT trip ───────────────────────
     def test_no_false_positive_on_innocuous_prose(self):
+        # "It's 5 minutes left on your timer, sir." used to sit here as a
+        # not-a-clock example. With no token it is the timer list stated from
+        # memory (the 09-05 "list_timers can make things up" finding), so it
+        # now injects list_timers - pinned in tests/monolith/
+        # test_monolith_diag_fixes.py::TimerClaimTests. "It's N minutes until"
+        # keeps the not-a-clock case covered.
         for reply in (
-            "It's 5 minutes left on your timer, sir.",   # 'it's N' but not a clock
+            "It's 5 minutes until the meeting, sir.",    # 'it's N' but not a clock
             "It's time to head out, sir.",
             "I use version control for that.",
             "You're running late for the meeting.",
