@@ -34,6 +34,7 @@ import shutil
 import sys
 import tempfile
 import textwrap
+import time
 import types
 import unittest
 from collections import OrderedDict
@@ -241,6 +242,53 @@ class StartInStandbyTests(_Base):
         self._restore()
         self.assertFalse(self.sleep[0])
         self.assertFalse(os.path.exists(self.hud_file))
+
+    # 2026-10-01 merge audit: START_IN_STANDBY now applies on every boot that
+    # is not already asleep - which included the blue/green handoff relaunch,
+    # so an upgrade swap mid-conversation brought JARVIS back in standby.
+    def _relaunch_with_handoff(self, payload):
+        """main()'s boot order: _consume_blue_green_handoff, then (much
+        later) _restore_tray_toggle_state. ``payload`` is what
+        consume_handoff_state returns (None = absent or over its TTL)."""
+        bc = self.bc
+        flag = "--resume-handoff-test"
+        bgm = mock.Mock(RESUME_HANDOFF_FLAG=flag)
+        bgm.consume_handoff_state.return_value = payload
+        self._p(bc, "_bgm", bgm)
+        self._p(bc, "BLUE_GREEN_ROLE", "prod")
+        self._p(bc, "_seed_session_opening", return_value=0)
+        self._p(sys, "argv", ["bobert_companion.py", flag])
+        self._quiet(bc._consume_blue_green_handoff)
+        bgm.consume_handoff_state.assert_called_once_with()
+        return self._restore()
+
+    def test_a_handoff_relaunch_comes_back_awake(self):
+        self._persist({"sleep_mode": False, "standby_mode": False})
+        self._cfg(START_IN_STANDBY=True)
+        _, log = self._relaunch_with_handoff(
+            {"signaled_at": time.time(), "conversation_tail": [
+                {"role": "user", "content": "and the next one?"}]})
+        self.assertFalse(self.sleep[0], "an upgrade swap mid-conversation "
+                                        "dropped him into standby")
+        self.assertFalse(self.standby[0])
+        self.assertFalse(self._saved()["sleep_mode"])
+        self.assertIn("START_IN_STANDBY not applied", log)
+
+    def test_a_handoff_relaunch_keeps_a_standby_it_was_in(self):
+        self._persist({"sleep_mode": True, "standby_mode": True})
+        self._cfg(START_IN_STANDBY=False)
+        self._relaunch_with_handoff({"signaled_at": time.time()})
+        self.assertTrue(self.sleep[0])
+        self.assertTrue(self.standby[0])
+
+    def test_no_fresh_handoff_still_applies_the_setting(self):
+        # An absent / over-TTL payload (consume_handoff_state -> None) is an
+        # ordinary boot: START_IN_STANDBY applies as before.
+        self._persist({"sleep_mode": False, "standby_mode": False})
+        self._cfg(START_IN_STANDBY=True)
+        self._relaunch_with_handoff(None)
+        self.assertTrue(self.sleep[0])
+        self.assertTrue(self.standby[0])
 
 
 # ── B016 ───────────────────────────────────────────────────────────────────

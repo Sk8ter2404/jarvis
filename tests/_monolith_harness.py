@@ -185,6 +185,9 @@ _MONOLITH_RESTORE_NAMES = (
     # that queued a real confirmation would make a LATER test's hand-built
     # queue look minutes old and lapse instead of running.
     "_pending_confirmation_at",
+    # Blue/green handoff latch (2026-10-01): a test that consumed a handoff
+    # would make a LATER test's boot restore skip START_IN_STANDBY.
+    "_handoff_resumed",
     "_action_error_log", "_action_history",
     "_session_action_counts", "_session_app_names",
     # ── audio / device / capture state ─────────────────────────────────────

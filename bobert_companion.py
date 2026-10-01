@@ -5050,6 +5050,14 @@ def _publish_audio_state() -> None:
         pass
 
 
+# True once _consume_blue_green_handoff took a FRESH handoff payload (blue/
+# green relaunch as the new prod; consume_handoff_state rejects payloads over
+# its TTL). The swap is mid-session by definition, so the previous prod's
+# persisted sleep/standby state is restored as it was and START_IN_STANDBY is
+# not applied on top of it (_restore_tray_toggle_state, 2026-10-01).
+_handoff_resumed: list[bool] = [False]
+
+
 def _apply_start_in_standby() -> bool:
     """Alexa-style boot: START_IN_STANDBY (env override JARVIS_START_IN_STANDBY)
     comes up SILENT in wake-word standby (say "JARVIS" to wake → it answers →
@@ -5164,7 +5172,14 @@ def _restore_tray_toggle_state() -> None:
     # row) never did anything (2026-10-01). A persisted sleep=True still
     # wins: it is already standby, and the setting can only make it quieter.
     # Env override: JARVIS_START_IN_STANDBY (see _apply_start_in_standby).
-    if not _sleep_mode[0]:
+    # Not on a blue/green handoff relaunch (2026-10-01 merge audit): an
+    # upgrade swap mid-conversation used to bring JARVIS back in standby,
+    # holding every non-owner line until the next "Jarvis". The persisted
+    # state above is the previous prod's live state, so it stands as is.
+    if _handoff_resumed[0]:
+        print("  [tray-restore] blue/green handoff: keeping the previous "
+              "prod's awake/standby state (START_IN_STANDBY not applied)")
+    elif not _sleep_mode[0]:
         _apply_start_in_standby()
     if _tray_wins("audio_processing_enabled"):
         _audio_master_enabled[0] = bool(persisted.get("audio_processing_enabled"))
@@ -36534,6 +36549,7 @@ def _consume_blue_green_handoff() -> tuple[float | None, list]:
         print(f"  [blue-green] handoff consume failed: {_hce}")
         _handoff = None
     if isinstance(_handoff, dict):
+        _handoff_resumed[0] = True
         _tail = _handoff.get("conversation_tail")
         if isinstance(_tail, list) and _tail:
             try:
