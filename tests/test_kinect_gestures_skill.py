@@ -70,17 +70,15 @@ def _fake_bridge(*, enabled=True, available=(True, ""), bodies=None,
 
 
 def _fake_bc(*, standby=False, sleep=False, pending=None, speaking=False,
-             pending_age=1.0, lapsed=False):
+             lapsed=False):
     bc = types.ModuleType("bobert_companion")
     bc._standby_mode = [bool(standby)]
     bc._sleep_mode = [bool(sleep)]
     bc._standby_auto_engage_lock = threading.Lock()
     bc._pending_confirmation = list(pending or [])
-    # The monolith's confirmation clock (2026-10-01): how old the pending
-    # prompt is (None = unknown), and whether it has lapsed (the real one then
-    # clears the queue and says so).
-    bc.pending_confirmation_age = lambda: (
-        pending_age if bc._pending_confirmation else None)
+    # The monolith's confirmation TTL (2026-10-01): whether the pending prompt
+    # has lapsed (the real _expire_pending_confirmation then clears the queue
+    # and says so).
     bc._lapsed_calls = []
 
     def _expire(speak=True):
@@ -218,22 +216,32 @@ class RaiseHandMappingTests(_Base):
         self._patch_flag(False)
         self.assertNotIn("confirm", mod.gesture_status("").lower())
 
-    # B033 (2026-10-01): a queued destructive action used to wait forever and
-    # ANY raised hand ran it, however old the prompt and whoever was in view.
-    def test_stale_prompt_is_not_confirmed_by_a_raised_hand(self):
-        mod = self._load()
-        bc = _fake_bc(pending=[("reset_memory", "")], pending_age=600.0)
-        mod._do_raise_hand(bc)
-        self.assertEqual(bc._executed, [])
-        self.assertEqual(bc._pending_confirmation, [("reset_memory", "")])
+    def test_no_prompt_tells_the_model_a_raised_hand_confirms(self):
+        # The cloud prompt (core/prompts.py) was fixed in the merge, but the
+        # local model's cheat sheet still said "raise hand=confirm", so it
+        # could tell the owner to raise his hand to confirm. Source check: the
+        # light tier cannot import the monolith.
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            os.pardir)
+        with open(os.path.join(root, "bobert_companion.py"),
+                  encoding="utf-8") as f:
+            src = f.read()
+        sheet = src[src.index("def _local_cheatsheet"):]
+        sheet = sheet[:sheet.index("\ndef ", 10)]
+        with open(os.path.join(root, "core", "prompts.py"),
+                  encoding="utf-8") as f:
+            prompts = f.read()
+        for name, text in (("_local_cheatsheet", sheet),
+                           ("core/prompts.py", prompts)):
+            with self.subTest(name):
+                low = text.lower()
+                self.assertNotIn("raise hand=confirm", low)
+                self.assertNotIn("raise hand = confirm", low)
+                self.assertIn("raised hand never confirms", low)
 
-    def test_prompt_of_unknown_age_is_not_confirmed(self):
-        # Fail closed: a monolith that can't date the prompt gets no gesture.
-        mod = self._load()
-        bc = _fake_bc(pending=[("reset_memory", "")], pending_age=None)
-        mod._do_raise_hand(bc)
-        self.assertEqual(bc._executed, [])
-
+    # B033 (2026-10-01): the confirmation TTL is lazy, so a lapsed prompt
+    # stays queued until the next utterance; a raised hand meanwhile drops it
+    # (with the lapse notice) instead of nudging about a dead action.
     def test_lapsed_prompt_is_dropped_not_confirmed(self):
         mod = self._load()
         bc = _fake_bc(pending=[("reset_memory", "")], lapsed=True)

@@ -215,7 +215,8 @@ class PendingConfirmationLifetimeTests(MonolithGlobalsTestCase):
 
         class _Raced(list):
             """Non-empty when checked, empty by the time it is popped - the
-            Kinect gesture thread drained it in between."""
+            Kinect gesture thread cleared it in between (a SWIPE cancel, or a
+            raised hand expiring a lapsed prompt; a gesture never confirms)."""
             def pop(self, *a):
                 self.clear()
                 raise IndexError("pop from empty list")
@@ -225,13 +226,16 @@ class PendingConfirmationLifetimeTests(MonolithGlobalsTestCase):
             self.assertTrue(bc.handle_confirmation_response("yes"))
         self.assertEqual(self.ran, [])
 
-    def test_gesture_age_reflects_the_prompt(self):
+    def test_prompt_age_reflects_the_prompt(self):
+        # The age _expire_pending_confirmation and _reply_prompt_pending read.
         bc = self.bc
         self.assertIsNone(bc.pending_confirmation_age())
         self._defer()
         age = bc.pending_confirmation_age()
         self.assertIsNotNone(age)
-        self.assertLess(age, bc.GESTURE_CONFIRM_MAX_AGE_S)
+        self.assertLess(age, bc.CONFIRMATION_TTL_S)
+        self.assertFalse(hasattr(bc, "GESTURE_CONFIRM_MAX_AGE_S"),
+                         "a raised hand confirms nothing, at any age")
 
 
 # ════════════════════════════════════════════════════════════════════════════

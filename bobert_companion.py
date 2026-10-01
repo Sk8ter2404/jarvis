@@ -18821,7 +18821,7 @@ def _local_cheatsheet() -> str:
         "  [ACTION: enroll_face]   'learn my face' / 'remember my face' / 'this is me'   (face recognition; off by default, opt-in)\n"
         "  [ACTION: whoami]   'who am I' / 'do you recognize me' / \"who's at the desk\"   [ACTION: face_id_status]   'is face recognition on' / 'face id status'\n"
         "  [ACTION: forget_face, <name>]   forget a face   [ACTION: list_enrolled_faces]   who's enrolled\n"
-        "  [ACTION: gesture_status]   'what gestures can you see' / 'is gesture control on'   (Kinect gesture control: wave=wake, raise hand=confirm, swipe=cancel)\n"
+        "  [ACTION: gesture_status]   'what gestures can you see' / 'is gesture control on'   (Kinect gesture control: wave=wake, swipe=cancel; a raised hand NEVER confirms - that needs a spoken 'yes')\n"
         "  [ACTION: gestures_on]   'turn on gesture control' / 'enable gestures'   [ACTION: gestures_off]   'turn off gesture control'\n"
         "  [ACTION: point_calibrate, <device>]   point-to-control: user POINTS at a device + says 'calibrate pointing for the desk lamp' (Kinect; off by default)\n"
         "  [ACTION: point_control, <on|off>]   user is POINTING at a calibrated device — 'turn that on' / 'that one off' fire this; it resolves the point + switches that device\n"
@@ -29274,10 +29274,6 @@ _pending_confirmation: list[tuple[str, str]] = []   # list of (action_name, arg)
 # then ran it. The overnight shutdown prompt beside it always expired
 # (SHUTDOWN_PROMPT_TIMEOUT_S); this matches it.
 CONFIRMATION_TTL_S = 45.0
-# A raised hand only confirms a prompt JARVIS spoke moments ago, when the
-# person who asked is the one likely answering - not one from half a minute
-# back.
-GESTURE_CONFIRM_MAX_AGE_S = 20.0
 # time.monotonic() when the current queue was started (its OLDEST entry), 0.0
 # when unknown. Stamped only by _queue_pending_confirmation; an unstamped
 # queue (built by hand) never times out.
@@ -31840,8 +31836,10 @@ def handle_confirmation_response(user_text: str) -> bool:
         fail_markers = tuple(m.lower() for m in FAILURE_MARKERS)
         _pending_confirmation_at[0] = 0.0
         while _pending_confirmation:
-            # The Kinect gesture thread drains this same list: whoever loses
-            # the race finds it empty here and must stop, not raise.
+            # The Kinect gesture thread can CLEAR this same list (a SWIPE
+            # cancel, or a raised hand expiring a lapsed prompt - a gesture
+            # never confirms): whoever loses the race finds it empty here and
+            # must stop, not raise.
             try:
                 name, arg = _pending_confirmation.pop(0)
             except IndexError:
