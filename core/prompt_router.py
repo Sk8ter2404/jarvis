@@ -437,6 +437,12 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "SELF DIAGNOSTIC": [
         "diagnostic", "health check", "self test", "self-diagnostic",
         "are you ok", "run diagnostics", "check yourself",
+        # 2026-10-01 (09-05 live diagnostic): 'run a system check' loaded only
+        # SYSTEM HEALTH, whose quick CPU/RAM readout then answered it - this
+        # section, home of system_check (the full sweep), had no such entry.
+        "system check", "systems check", "self check", "self-check",
+        "are you alright", "are you all right", "is everything ok",
+        "is everything okay",
     ],
     "STABILITY GATE": ["stability", "safe to upgrade", "stability gate"],
     # 2026-09-29: bare "wake word" used to live here, so every WAKE-WORD MODE

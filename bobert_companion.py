@@ -35940,10 +35940,76 @@ def _run_voice_shortcuts(text: str) -> bool:
         set_state("idle")
         return True
 
+    # "are you ok" / "run a system check" (2026-10-01): the real
+    # self-diagnostic, never the model's guess. See _run_self_check_shortcut.
+    if _run_self_check_shortcut(text):
+        return True
+
     # Deterministic fast paths (date math, "what did I just ask", "what's my
     # name"): the last stop before the LLM, so every shortcut above keeps
     # precedence and nothing here ever arms the processing filler.
     return _run_fast_paths(text)
+
+
+# The self-diagnostic's action names, preferred first (skills/self_diagnostic
+# registers all four on the same run_diagnostic).
+_SELF_CHECK_ACTIONS = ("are_you_ok", "run_diagnostic", "self_diagnostic",
+                       "system_check")
+
+
+def _run_self_check_shortcut(text: str) -> bool:
+    """"are you ok" / "run a system check" / "run a diagnostic" -> run the
+    REAL self-diagnostic and speak its summary, with no LLM (2026-10-01).
+
+    The 09-05 live diagnostic: "are you ok" was answered from the local
+    model's head ("Quite right, sir. Always operational.") even with SELF
+    DIAGNOSTIC in its prompt, and "run a system check" got check_system's
+    CPU/RAM readout because only SYSTEM HEALTH routed on it. Recognition is
+    core.fast_paths.is_self_check_request (whole-utterance only); the answer
+    is whatever the sweep says — skills/self_diagnostic's _summarise never
+    calls an unchecked subsystem nominal. A one-line acknowledgement goes
+    first because the sweep takes a few seconds.
+
+    Same contract as _run_fast_paths: gated by FAST_PATHS_ENABLED, logs one
+    "[fast-path] self-check" line plus the "JARVIS:" transcript line,
+    appends the turn, returns True when it handled the utterance. With no
+    diagnostic skill loaded it returns False, so the LLM answers (and the
+    prompt tells it the action exists) rather than this inventing a pass.
+    Never raises."""
+    if not globals().get("FAST_PATHS_ENABLED", True):
+        return False
+    try:
+        if not _fast_paths.is_self_check_request(text):
+            return False
+    except Exception:
+        return False
+    fn = None
+    for _name in _SELF_CHECK_ACTIONS:
+        fn = ACTIONS.get(_name)
+        if fn is not None:
+            break
+    if fn is None:
+        return False
+    print("  [fast-path] self-check")
+    try:
+        _speak("Running a self-check, sir.")
+    except Exception:
+        pass
+    try:
+        result = fn("")
+        reply = result.strip() if isinstance(result, str) else ""
+    except Exception as _e:
+        print(f"  [fast-path] self-check raised: {_e}")
+        reply = ""
+    if not reply:
+        reply = ("The self-check did not finish, sir, so I have no result "
+                 "to give you — I won't call anything working that I haven't "
+                 "measured.")
+    print(f"  JARVIS: {reply}")
+    _append_turn(text, reply)
+    _speak(reply)
+    set_state("idle")
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -523,6 +523,42 @@ def last_utterance_reply(text, history, *, skip_newest: bool = False) -> str:
 
 # ── the one entry point ────────────────────────────────────────────────────
 
+# ── "are you ok" / "run a system check" (2026-10-01) ──────────────────────
+# The 09-05 live diagnostic: both got a pass from the model's head ("Quite
+# right, sir. Always operational.") or an off-topic CPU readout. The answer
+# needs the LIVE self-diagnostic, so match() never answers these itself — the
+# monolith's _run_self_check_shortcut runs the action and speaks its summary.
+# Whole-utterance only: "are you ok with that" is a conversation, and the
+# liveness questions ("are you there", "can you hear me") keep their own
+# instant answer.
+_OKAY = r"(?:ok|okay|alright|all right)"
+_SELF_CHECK_RES = tuple(re.compile(p) for p in (
+    rf"^(?:are|r) (?:you|u)(?: doing| feeling)? {_OKAY}$",
+    rf"^(?:you|u) {_OKAY}$",
+    rf"^is everything {_OKAY}(?: with you)?$",
+    r"^(?:(?:please )?(?:run|do|perform|start|give me)(?: me)?"
+    r"(?: a| an| the| your)?(?: quick| full| complete)? )?"
+    r"(?:system|systems|self|health) ?(?:check|test|diagnostic|diagnostics)"
+    r"(?: on yourself)?$",
+    r"^(?:please )?(?:run|do|perform|start)(?: a| an| the| your)?"
+    r"(?: full| complete)? (?:self )?diagnostics?$",
+    r"^check yourself$",
+))
+
+
+def is_self_check_request(text) -> bool:
+    """True for a whole-utterance self-check request: "are you ok", "run a
+    system check", "run a diagnostic", "check yourself". Never raises."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        t = normalize(text).replace("-", " ")
+        t = re.sub(r"\s+", " ", t).strip()
+        return any(rx.match(t) for rx in _SELF_CHECK_RES)
+    except Exception:
+        return False
+
+
 def match(text, *, now=None, history=(), owner_name="",
           session_turns=None, session_start_lost=False
           ) -> Optional[FastAnswer]:
