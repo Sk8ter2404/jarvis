@@ -2989,9 +2989,10 @@ def _ambient_learn_from_gated(text: str, memory: dict,
     Every decision logs one concise line ([ambient-learn] ingested … / skipped …
     + reason) so the owner-vs-TV behaviour is observable in the session log.
 
-    Gated FIRST on AMBIENT_LISTEN_ENABLED (the Settings ambient-listening knob);
-    a no-op when off. NEVER raises — a learning hiccup must not break the gate's
-    drop-and-continue."""
+    Gated FIRST on AMBIENT_LISTEN_ENABLED (the Settings ambient-listening knob,
+    which the tray / voice ambient OFF also sets live — core.actions.
+    _act_ambient_mode_set, 2026-10-01); a no-op when off. NEVER raises — a
+    learning hiccup must not break the gate's drop-and-continue."""
     if not AMBIENT_LISTEN_ENABLED:
         return
     if _dialogue_gate_active():
@@ -3955,8 +3956,10 @@ def _write_hud_state(**updates):
     hud_state.json is ALSO the tray's only view of JARVIS (checkmarks, the
     listen tint, standby), so the write is skipped only when BOTH the HUD and
     the tray are off. Gating it on HUD_ENABLED alone froze the tray the moment
-    the on-screen HUD was unticked in Settings (2026-09-30 audit)."""
-    if not (HUD_ENABLED or TRAY_ENABLED):
+    the on-screen HUD was unticked in Settings (2026-09-30 audit). The web
+    dashboard reads the same file for its state / mic / voice chips, so it
+    keeps the writes on as well (2026-10-01)."""
+    if not (HUD_ENABLED or TRAY_ENABLED or WEB_INTERFACE_ENABLED):
         return
     try:
         # Whole read-modify-write under the lock. Previously only the cache
@@ -4867,9 +4870,13 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         # second copy of its cell / hud_state / start-stop logic: that copy
         # never saved AMBIENT_LISTEN_ENABLED (so a tray "off" came back on at
         # the next boot) and never stopped the fact extractor.
-        _reply = _act_ambient_mode_set(not _ambient_effective_on())
-        if str(_reply).startswith("ambient daemon refused"):
-            print(f"  [tray] ambient_mode_toggle: {_reply}")
+        # Guarded so a setter failure still reaches the hud write below.
+        try:
+            _reply = _act_ambient_mode_set(not _ambient_effective_on())
+            if str(_reply).startswith("ambient daemon refused"):
+                print(f"  [tray] ambient_mode_toggle: {_reply}")
+        except Exception as e:
+            print(f"  [tray] ambient_mode_toggle raised: {e}")
         _running = _ambient_listen_running()
         if _running is not None:
             _write_hud_state(ambient_listening=_running)
@@ -4976,6 +4983,21 @@ def _publish_audio_state() -> None:
         pass
 
 
+def _apply_start_in_standby() -> bool:
+    """Alexa-style boot: START_IN_STANDBY (env override JARVIS_START_IN_STANDBY)
+    comes up SILENT in wake-word standby (say "JARVIS" to wake → it answers →
+    back to standby) instead of always-listening. Sets both sleep cells and
+    returns True when it applies."""
+    from core.config import START_IN_STANDBY as _sis_default
+    _sis = (os.environ.get("JARVIS_START_IN_STANDBY", "").strip()
+            or str(_sis_default)).strip().lower()
+    if _sis in {"1", "true", "yes", "on"}:
+        _sleep_mode[0] = True
+        _standby_mode[0] = True
+        return True
+    return False
+
+
 def _restore_tray_toggle_state() -> None:
     """Read hud_state.json and restore the four tray-toggle cells
     (_tts_muted, _ambient_mode_active, _daemons_paused, _debug_mode) so
@@ -4983,19 +5005,28 @@ def _restore_tray_toggle_state() -> None:
     if ambient_mode was on, kick the ambient_listen daemon back on; if
     daemons were paused, push that into diagnostic_daemons + skill state.
     Silent on any failure — a missing or corrupt state file just means
-    we boot with the in-file defaults."""
+    we boot with the in-file defaults (START_IN_STANDBY still applies).
+
+    The toggles that ALSO have a Settings value (debug mode and the four
+    audio stages) restore the tray's choice only while that Settings value
+    is unchanged since the tray value was saved (toggle_cfg_seed, below)."""
     # From here on the cells hold the user's choices (or the defaults, which
     # are right on a fresh install), so a tray (re)launch may publish them.
     _tray_toggles_restored[0] = True
     try:
-        if not os.path.exists(HUD_STATE_FILE):
-            return
-        with open(HUD_STATE_FILE, "r", encoding="utf-8") as f:
-            persisted = json.load(f)
-        if not isinstance(persisted, dict):
-            return
+        persisted = None
+        if os.path.exists(HUD_STATE_FILE):
+            with open(HUD_STATE_FILE, "r", encoding="utf-8") as f:
+                persisted = json.load(f)
     except Exception as e:
         print(f"  [tray-restore] read failed: {e}")
+        persisted = None
+    if not isinstance(persisted, dict):
+        # Nothing to restore, but START_IN_STANDBY is a Settings choice, not
+        # a persisted toggle: a fresh install (no file) or a corrupt one must
+        # still boot in standby. These paths returned before it (2026-10-01).
+        if _apply_start_in_standby():
+            _write_hud_state(sleep_mode=True, standby_mode=True)
         return
 
     if "tts_muted" in persisted:
@@ -5058,17 +5089,16 @@ def _restore_tray_toggle_state() -> None:
         _sleep_mode[0] = bool(persisted.get("sleep_mode"))
     if "standby_mode" in persisted:
         _standby_mode[0] = bool(persisted.get("standby_mode"))
-    # Alexa-style boot: START_IN_STANDBY comes up SILENT in wake-word standby
-    # (say "JARVIS" to wake → it answers → back to standby) instead of always-
-    # listening — UNLESS a persisted crash-survival sleep state already decided.
-    # Env override: JARVIS_START_IN_STANDBY.
-    if "sleep_mode" not in persisted:
-        from core.config import START_IN_STANDBY as _sis_default
-        _sis = (os.environ.get("JARVIS_START_IN_STANDBY", "").strip()
-                or str(_sis_default)).strip().lower()
-        if _sis in {"1", "true", "yes", "on"}:
-            _sleep_mode[0] = True
-            _standby_mode[0] = True
+    # START_IN_STANDBY applies on every boot that is not already asleep. It
+    # used to run only when hud_state.json had NO sleep_mode key — but this
+    # function writes that key back on every boot and the tray publisher
+    # rewrites it every second, so from the second boot on the setting (the
+    # dashboard's headline "Wake-word mode" switch and the Settings window
+    # row) never did anything (2026-10-01). A persisted sleep=True still
+    # wins: it is already standby, and the setting can only make it quieter.
+    # Env override: JARVIS_START_IN_STANDBY (see _apply_start_in_standby).
+    if not _sleep_mode[0]:
+        _apply_start_in_standby()
     if _tray_wins("audio_processing_enabled"):
         _audio_master_enabled[0] = bool(persisted.get("audio_processing_enabled"))
     if _tray_wins("echo_cancel_enabled"):
@@ -37515,11 +37545,28 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # bambu_monitor skills (and the standby / ambient / dashboard state) into
     # hud_state.json so the tray subprocess can show them. tray_ready_pid ends
     # the tray's "starting…".
-    if TRAY_ENABLED:
-        if _tray_process is None:
-            _launch_tray()   # the early launch failed — one more try
+    #
+    # The drainer is the ONLY reader of tray_commands.json, and the tray is not
+    # its only writer: the web dashboard's controls (Wake, Standby, the mutes,
+    # Pause daemons, Restart) and the Settings window's "Save & restart" queue
+    # there too, then report success. Both threads used to sit inside
+    # `if TRAY_ENABLED:`, so unticking the tray icon silently killed every one
+    # of those (2026-10-01). They now run whenever this is the live instance —
+    # NEVER in staging, which shares the live tray_commands.json
+    # (TRAY_COMMANDS_FILE is a fixed project path) and would run the live
+    # JARVIS's commands. Only the tray launch itself depends on TRAY_ENABLED.
+    if TRAY_ENABLED and _tray_process is None:
+        _launch_tray()   # the early launch failed — one more try
+    if not _is_staging():
+        if not TRAY_ENABLED:
+            # _launch_tray (which never runs with the tray off) is what drops
+            # a previous session's stale / lifecycle commands — a leftover
+            # "restart" must not restart this session.
+            for _stale in (TRAY_COMMANDS_FILE, TRAY_COMMANDS_FILE + ".inflight"):
+                _prune_stale_tray_commands(_stale)
         threading.Thread(target=_tray_command_drainer, daemon=True).start()
         threading.Thread(target=_tray_state_publisher, daemon=True).start()
+    if TRAY_ENABLED:
         _write_hud_state(tray_ready_pid=os.getpid())
 
     # Apple Music autostart + keep-alive (both opt-in, default off). When

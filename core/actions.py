@@ -4050,8 +4050,30 @@ def _act_switch_llm(arg: str = "") -> str:
         model = _resolved_local()
         _publish_backend(model)
         return f"switched to ollama (model: {model}){_SWITCH_SESSION_NOTE}"
-    # explicit model tag — verify it's one we recognise
-    if tag in bc._KNOWN_OLLAMA_MODELS or any(tag.startswith(p) for p in
+    # explicit model tag — resolve it against what Ollama has INSTALLED first.
+    # The tray's Local Model picker lists Ollama's own /api/tags, so every tag
+    # it sends is installed; the family-prefix allowlist below used to be the
+    # only gate, and refused installed models outside it (gpt-oss:20b,
+    # laguna-xs-2.1) with "unknown backend tag" while the voice picker
+    # (skills/model_picker.set_model) switched to them (2026-10-01). The
+    # allowlist now only decides whether an UNINSTALLED, free-typed tag is
+    # worth a background pull. An embedding model is never a chat brain.
+    concrete = None
+    try:
+        concrete = bc._ollama_resolve_model(tag)
+    except Exception:
+        concrete = None
+    if not isinstance(concrete, str) or not concrete:
+        concrete = None
+    else:
+        try:
+            from skills.model_picker import _is_embed
+            embed = _is_embed(concrete)
+        except Exception:
+            embed = "embed" in concrete.lower()
+        if embed:
+            concrete = None
+    if concrete or tag in bc._KNOWN_OLLAMA_MODELS or any(tag.startswith(p) for p in
             ("llama", "qwen", "mistral", "mixtral", "phi", "gemma",
              "deepseek", "codellama")):
         _apply_chat_brain(bc, "local", "ollama")
@@ -4069,11 +4091,6 @@ def _act_switch_llm(arg: str = "") -> str:
         # the request to what Ollama actually has; if nothing matches, kick a
         # background pull and leave the working model in place.
         old = _resolved_local()   # the OLD chat tag, before any cache repoint
-        concrete = None
-        try:
-            concrete = bc._ollama_resolve_model(tag)
-        except Exception:
-            concrete = None
         if concrete:
             cache = getattr(bc, "_RESOLVED_LOCAL_LLM_MODEL", None)
             if isinstance(cache, list):

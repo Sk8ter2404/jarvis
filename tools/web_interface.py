@@ -96,6 +96,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 import zlib
 from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1346,10 +1347,18 @@ DEFAULT_TRAY_COMMANDS_PATH = os.path.join(PROJECT_DIR, "tray_commands.json")
 
 
 def send_tray_command(cmd: str, tray_path: str, **extra) -> None:
-    """Append ``{"cmd": cmd, "ts": ..., **extra}`` to tray_commands.json with
-    the SAME read-append-temp-replace the tray uses (tray._send_command), under
-    _QUEUE_WRITE_LOCK. Raises on a failed write."""
-    item = {"cmd": cmd, "ts": time.time(), "source": "web"}
+    """Append ``{"cmd": cmd, "ts": ..., "cid": ..., **extra}`` to
+    tray_commands.json with the SAME read-append-temp-replace the tray uses
+    (tray._send_command), under _QUEUE_WRITE_LOCK. Raises on a failed write.
+
+    Every entry carries a unique ``cid``, exactly like the tray's own. The
+    drainer claims the inbox with an os.replace that this lock cannot see, so
+    a claim landing between our read and our replace makes us write the
+    already-claimed commands BACK; _tray_cid_seen skips a cid it has already
+    dispatched, but an entry WITHOUT one is never de-duplicated - a web
+    mic_mute_toggle ran twice and flipped straight back (2026-10-01)."""
+    item = {"cmd": cmd, "ts": time.time(), "source": "web",
+            "cid": "w" + uuid.uuid4().hex}
     item.update(extra)
     _append_json_queue(tray_path, item, prefix="tray_web_")
 
@@ -1752,7 +1761,16 @@ def _coerce_setting(name: str, value, schema: dict, coerce_value) -> object:
       • unknown key                → 400 (typo / stale client)
       • enum value not in choices  → 400 (invalid choice)
     int/float that won't parse also 400 (coerce_value would swallow it to the
-    default). Everything else defers to coerce_value's tolerant conversion."""
+    default).
+
+    Then the value goes through settings_window.validate_value — the Settings
+    window's OWN strict rule (range / min_exclusive / forbid / nonblank / NaN).
+    This path used to stop at "does it parse", a stale copy of the rule the
+    window tightened in v2.0.146: the panel said "saved" for WEB_INTERFACE_PORT
+    8443 (the AirTag tracker's port) or 70000 — the dashboard then could not
+    bind after the restart — VAD_THRESHOLD 5 (deaf) or 0 (never stops
+    recording), and a blank LOCAL_LLM_MODEL (2026-10-01). One rule for both
+    UIs now; validate_value hands bool / text / routing to coerce_value."""
     spec = schema.get(name)
     if spec is None or spec.get("type") == "status" or name.startswith("_"):
         raise SettingsWriteError(f"unknown setting: {name!r}")
@@ -1805,7 +1823,17 @@ def _coerce_setting(name: str, value, schema: dict, coerce_value) -> object:
                     value = parsed
             except (ValueError, TypeError):
                 pass
-    return coerce_value(spec, value)
+    try:
+        from tools import settings_window as sw
+        validate_value = sw.validate_value
+    except Exception:                              # pragma: no cover
+        validate_value = None
+    if validate_value is None:
+        return coerce_value(spec, value)
+    coerced, err = validate_value(spec, value)
+    if err:
+        raise SettingsWriteError(f"invalid value for {name!r}: {err}")
+    return coerced
 
 
 def _log_warn(msg: str) -> None:
@@ -2219,10 +2247,20 @@ def _parse_action_index(path: str) -> dict:
 # name, each with the reason shown in the confirm prompt. A name matching none
 # runs on one click. Deliberately broad - a spurious prompt costs a click, a
 # missing one can message someone or wipe memory.
+#
+# A NAME rule alone missed ALIASES (2026-10-01): shutdown_jarvis asked first
+# while shut_down / exit_jarvis / quit_jarvis / power_off_jarvis /
+# turn_off_jarvis - the SAME handler - ran on one click, and so did
+# smart_home_purge_cookie (forget_alexa_login's handler) and the code
+# runner's run_python / python / eval_python / compute. So the live paths
+# confirm by HANDLER too (_live_confirm_reason): a name inherits the reason of
+# any other name bound to the same callable. The patterns below name the
+# known aliases as well, for the index fallback, which has no handlers.
 _ACTION_CONFIRM_RULES = (
-    (("*shutdown*", "*restart*", "*reboot*", "*hibernate*", "sleep_pc",
-      "*log_off*", "*logoff*", "*sign_out*", "lock_pc", "lock_screen",
-      "*relaunch*"),
+    (("*shutdown*", "*shut_down*", "*restart*", "*reboot*", "*hibernate*",
+      "sleep_pc", "*log_off*", "*logoff*", "*sign_out*", "lock_pc",
+      "lock_screen", "*relaunch*", "exit_jarvis", "quit_jarvis",
+      "*power_off*", "turn_off_jarvis"),
      "stops or restarts JARVIS or the PC"),
     (("send_*", "*_send", "reply_*", "*_reply", "text_*", "*_text_*",
       "email_*", "*_email", "sms_*", "call_*", "answer_call", "decline_call",
@@ -2230,13 +2268,14 @@ _ACTION_CONFIRM_RULES = (
       "announce_*", "speak_*", "say_*"),
      "sends or says something to someone"),
     (("archive_*", "delete_*", "*_delete", "forget_*", "*_forget", "clear_*",
-      "wipe_*", "reset_*", "*_reset", "purge_*", "remove_*", "*_remove",
+      "wipe_*", "reset_*", "*_reset", "*purge*", "remove_*", "*_remove",
       "erase_*", "empty_*", "drop_*", "scrap_*", "uninstall_*", "unenroll_*",
       "export_memory", "revoke_*"),
      "deletes, resets or exports data"),
     (("start_overnight_upgrade", "*upgrade*", "*self_update*", "apply_*",
-      "install_*", "run_shell", "run_code", "execute_*", "*_execute",
-      "*_script", "code_*", "pip_*", "git_*", "rollback*", "*_rollback"),
+      "install_*", "run_shell", "run_code", "run_python", "python",
+      "eval_python", "compute", "execute_*", "*_execute", "*_script",
+      "code_*", "pip_*", "git_*", "rollback*", "*_rollback"),
      "changes JARVIS's own code or runs code"),
     (("type", "type_*", "hotkey", "click", "*_click", "press_*", "kill_*",
       "close_*", "*_close", "stop_pipeline", "web_interface_off", "*_off_all",
@@ -2247,7 +2286,12 @@ _ACTION_CONFIRM_RULES = (
 )
 # Handled by the tray control plane's hardened teardown instead of a request
 # thread (a restart spawns a successor and exits this process mid-response).
-_ACTION_VIA_TRAY = ("restart", "shutdown")
+# Keyed by the registry name whose HANDLER the tray command runs, and matched
+# by handler (_action_via_tray), so every alias of restart / shutdown_jarvis
+# goes the same way. The old name list held "shutdown", which is no ACTIONS
+# key at all, so every shutdown alias tore JARVIS down on a request thread
+# (2026-10-01).
+_ACTION_VIA_TRAY = (("restart", "restart"), ("shutdown_jarvis", "shutdown"))
 _ACTION_TIMEOUT_S = 20.0
 _ACTION_MIN_GAP_S = 1.0          # per-name double-click guard
 _action_last_call: dict = {}
@@ -2261,6 +2305,43 @@ def action_confirm_reason(name: str) -> str:
     for patterns, why in _ACTION_CONFIRM_RULES:
         if any(fnmatchcase(n, p) for p in patterns):
             return why
+    return ""
+
+
+def _live_confirm_reason(acts, name: str) -> str:
+    """action_confirm_reason for a name in the LIVE registry ``acts``: its own
+    reason, else the reason of any OTHER name bound to the same handler, so an
+    alias can never run on one click while its twin asks first. Never
+    raises."""
+    why = action_confirm_reason(name)
+    if why:
+        return why
+    try:
+        fn = acts.get(name)
+        if fn is None:
+            return ""
+        for other in _registry_names(acts):
+            if other != name and acts.get(other) is fn:
+                why = action_confirm_reason(other)
+                if why:
+                    return why
+    except Exception:
+        pass
+    return ""
+
+
+def _action_via_tray(acts, name: str) -> str:
+    """The tray command that must run action ``name`` (see _ACTION_VIA_TRAY),
+    matched by HANDLER, or ''. Never raises."""
+    try:
+        fn = acts.get(name)
+        if fn is None:
+            return ""
+        for key, cmd in _ACTION_VIA_TRAY:
+            if name == key or acts.get(key) is fn:
+                return cmd
+    except Exception:
+        pass
     return ""
 
 
@@ -2322,7 +2403,7 @@ def actions_payload(cfg: dict) -> dict:
             spoken = ("VERBATIM" if n in verbatim else
                       "INFORMATIVE" if n in informative else
                       "SELF-VOICED" if n.lower() in selfv else "neither")
-            why = action_confirm_reason(n)
+            why = _live_confirm_reason(acts, n)
             vo = _voice_only_hint(cfg, n)
             rows.append({"name": n, "spoken": spoken, "confirm": bool(why),
                          "why": why, "voice_only": vo is not None,
@@ -2368,7 +2449,7 @@ def run_named_action(cfg: dict, name, arg="", *, confirm: bool = False) -> tuple
         return 409, {"error": "voice only - this action needs a fresh spoken "
                               "or typed request" + (": use " + vo if vo else ""),
                      "voice_only": True, "use_instead": vo, "name": name}
-    why = action_confirm_reason(name)
+    why = _live_confirm_reason(acts, name)
     if why and not confirm:
         return 409, {"error": "confirmation required", "confirm_required": True,
                      "name": name, "why": why}
@@ -2379,12 +2460,13 @@ def run_named_action(cfg: dict, name, arg="", *, confirm: bool = False) -> tuple
             return 429, {"error": "already sent - wait a moment",
                          "retry_after_s": round(_ACTION_MIN_GAP_S - (now - last), 2)}
         _action_last_call[name] = now
-    if name in _ACTION_VIA_TRAY:
+    via = _action_via_tray(acts, name)
+    if via:
         try:
-            send_tray_command(name, cfg["tray_commands_path"], arg=arg)
+            send_tray_command(via, cfg["tray_commands_path"], arg=arg)
         except Exception as e:
             return 500, {"error": f"control write failed: {e}"}
-        _log_info(f"action {name} queued on the tray control plane")
+        _log_info(f"action {name} queued on the tray control plane ({via})")
         return 200, {"ok": True, "status": "queued", "via": "tray",
                      "name": name}
     box: dict = {}
@@ -3740,7 +3822,7 @@ _DASHBOARD_PAGE = r"""<!doctype html>
       <button id="wakeSave" class="save" type="button">Save</button>
       <span id="wakeSaved" class="saved" aria-live="polite"></span>
       <span class="hint">Boot silent and wait for &ldquo;JARVIS&rdquo; instead of always-listening
-        (WAKE_WORD_AUTOSTART). Toggle the neural detector + full standby knobs below too.</span>
+        (START_IN_STANDBY). Toggle the neural detector + full standby knobs below too.</span>
     </div>
     <div id="settingsNote" class="muted">loading settings…</div>
     <div id="settingsGroups"></div>
@@ -4037,6 +4119,9 @@ const QUICK_ACTIONS = [
 // command that does not start with the wake word ("[standby] ignored"), and
 // the page used to report that as "accepted". Ask first: wake him through the
 // tray channel (which works in standby) and then send, or don't send.
+// A command that DOES start with the wake word goes straight through: the
+// standby handler runs "Jarvis, <command>" as the turn (2026-10-01), so there
+// is nothing to wake first.
 const WAKE_WORD_RE = /^\s*(hey\s+)?jarvis\b/i;
 const WAKE_UP_RE = /^\s*wake(\s+up)?\s*[.!]?\s*$/i;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }

@@ -3396,9 +3396,15 @@ class SwitchLlmTests(unittest.TestCase):
         bc._get_local_llm_model.return_value = ollama
         bc._ollama_has_model.return_value = True
         # 2026-07-21 audit: the installed check is now _ollama_resolve_model
-        # (exact/sibling-aware). Identity = "the requested tag is installed
-        # verbatim", preserving these tests' original semantics.
-        bc._ollama_resolve_model.side_effect = lambda t: t
+        # (exact/sibling-aware). A tag in `installed` resolves to itself
+        # ("installed verbatim"); anything else is not installed. It used to be
+        # the identity for EVERY tag, which only worked while the family-prefix
+        # allowlist ran first: since 2026-10-01 an installed tag is accepted
+        # whatever its name (the tray picker lists Ollama's own tags).
+        installed = {"qwen2.5:14b", "llama3.1:8b", "mistral-nemo",
+                     "gemma4:12b"}
+        bc._ollama_resolve_model.side_effect = \
+            lambda t: t if t in installed else None
         bc._RESOLVED_LOCAL_LLM_MODEL = [ollama]
         return bc
 

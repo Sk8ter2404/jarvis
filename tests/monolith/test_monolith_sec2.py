@@ -2063,9 +2063,26 @@ class HudTrayStateTests(_MonolithSec2Base):
             "echo_cancel_enabled": True,
             "noise_suppress_enabled": False,
             "agc_enabled": True,
+            # The config values these tray toggles were saved against
+            # (toggle_cfg_seed, 2026-10-01): a tray choice is restored only
+            # while its Settings value is unchanged, so record exactly the
+            # values pinned below.
+            "toggle_cfg_seed": {
+                "debug_mode": False, "audio_processing_enabled": True,
+                "echo_cancel_enabled": False, "noise_suppress_enabled": True,
+                "agc_enabled": False},
         }
         with open(self.hud_file, "w", encoding="utf-8") as f:
             json.dump(persisted, f)
+        import core.config as _cfg
+        for _name, _val in (("VAD_DEBUG", False),
+                            ("AUDIO_PROCESSING_ENABLED", True),
+                            ("AUDIO_ECHO_CANCEL", False),
+                            ("AUDIO_NOISE_SUPPRESS", True),
+                            ("AUDIO_AGC", False)):
+            _p = mock.patch.object(_cfg, _name, _val)
+            _p.start()
+            self.addCleanup(_p.stop)
         tts = [False]
         amb = [False]
         paused = [False]

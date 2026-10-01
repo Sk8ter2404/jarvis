@@ -56,6 +56,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Paths
@@ -2363,13 +2364,18 @@ def effective_warnings(values: dict, find_spec=None) -> dict[str, str]:
 #  Talking to the running JARVIS
 # ──────────────────────────────────────────────────────────────────────────
 def send_tray_command(cmd: str, path: str | None = None, **kwargs) -> bool:
-    """Append ``{"cmd": cmd, "ts": …}`` to the tray command inbox with the same
-    atomic temp+rename pattern as tray.py's ``_send_command`` (a copy of it —
-    this process can't import tray.py). The running JARVIS drains the inbox
-    every 0.5 s; "restart" runs its hardened teardown with no LLM involved.
-    Returns True when the command was written. Never raises."""
+    """Append ``{"cmd": cmd, "ts": …, "cid": …}`` to the tray command inbox
+    with the same atomic temp+rename pattern as tray.py's ``_send_command`` (a
+    copy of it — this process can't import tray.py). The running JARVIS drains
+    the inbox every 0.5 s; "restart" runs its hardened teardown with no LLM
+    involved. Returns True when the command was written. Never raises.
+
+    The unique ``cid`` is the copy's half of the tray's v2.0.144 race fix: a
+    drainer claim landing between our read and our replace makes us write the
+    claimed commands back, and the drainer skips only a cid it has already
+    seen — an entry without one ran twice (2026-10-01)."""
     target = path or TRAY_COMMANDS_FILE
-    payload = {"cmd": cmd, "ts": time.time()}
+    payload = {"cmd": cmd, "ts": time.time(), "cid": "s" + uuid.uuid4().hex}
     payload.update(kwargs)
     try:
         existing = []

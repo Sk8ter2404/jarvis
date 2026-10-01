@@ -586,6 +586,32 @@ class AmbientExtractRegisterTests(unittest.TestCase):
             captured["target"]()
         start.assert_called_once()
 
+    def test_register_autostart_respects_an_explicit_ambient_off(self):
+        """REGRESSION (2026-10-01). "Ambient mode off" (tray or voice) stops
+        this extractor at runtime, but the boot autostart restarted it after
+        every restart. The OFF is now saved as AMBIENT_LISTEN_ENABLED=False
+        (core.actions._act_ambient_mode_set), so with no other ambient source
+        on the autostart never starts."""
+        import threading as _thr
+
+        def _run(listen_on):
+            mod, _ = load_skill_isolated("ambient_multimodal_extract",
+                                         register=False)
+            captured = {}
+
+            def _cfg(name, default):
+                return listen_on if name == "AMBIENT_LISTEN_ENABLED" else False
+
+            with mock.patch.object(_thr.Thread, "start",
+                                   lambda self: captured.__setitem__(
+                                       "t", self._target)), \
+                 mock.patch.object(mod, "_get_config", side_effect=_cfg):
+                mod.register({})
+            return captured
+
+        self.assertNotIn("t", _run(False))
+        self.assertIn("t", _run(True))
+
     def test_register_autostart_bg_swallows_exception(self):
         mod, _ = load_skill_isolated("ambient_multimodal_extract", register=False)
         actions = {}

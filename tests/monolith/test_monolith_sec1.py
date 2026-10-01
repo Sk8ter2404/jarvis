@@ -1464,10 +1464,12 @@ class RobotStateTests(_MonolithTestBase):
 # ──────────────────────────────────────────────────────────────────────────
 class HudStateTests(_MonolithTestBase):
     def test_write_hud_state_noop_when_disabled(self):
-        # Only when BOTH the HUD and the tray are off (hud_state.json is also
-        # the tray's view of JARVIS — see HudOffTrayStillLiveTests).
+        # Only when the HUD, the tray AND the web dashboard are all off
+        # (hud_state.json is also the tray's and the dashboard's view of
+        # JARVIS — see HudOffTrayStillLiveTests).
         with mock.patch.object(self.bc, "HUD_ENABLED", False), \
-             mock.patch.object(self.bc, "TRAY_ENABLED", False):
+             mock.patch.object(self.bc, "TRAY_ENABLED", False), \
+             mock.patch.object(self.bc, "WEB_INTERFACE_ENABLED", False):
             # Should return immediately without touching the cache.
             cache_before = dict(self.bc._hud_state_cache)
             self.bc._write_hud_state(state="ZZZ")

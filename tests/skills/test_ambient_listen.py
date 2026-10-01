@@ -2019,6 +2019,37 @@ class MiscTests(unittest.TestCase):
         a2.assert_called_once()
         a3.assert_called_once()
 
+    def _run_autostart(self, bc):
+        captured = {}
+
+        class _CapThread:
+            def __init__(self, target=None, **kw):
+                captured["target"] = target
+
+            def start(self):
+                pass
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             mock.patch.object(self.mod.threading, "Thread", _CapThread), \
+             mock.patch.object(self.mod.time, "sleep", lambda *_a: None), \
+             mock.patch.object(self.mod, "ambient_listen_start") as start, \
+             mock.patch.object(self.mod, "ambient_audio_start"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.mod.register({})
+            captured["target"]()
+        return start
+
+    def test_register_autostart_respects_an_explicit_ambient_off(self):
+        """REGRESSION (2026-10-01). A tray / voice "ambient mode off" did not
+        survive a restart: this autostart put room transcription back on. The
+        OFF is now saved as AMBIENT_LISTEN_ENABLED=False
+        (core.actions._act_ambient_mode_set), the one key this autostart reads
+        for the mic, so the room mic stays closed even while another ambient
+        source (system audio here) still starts the autostart thread."""
+        bc = _FakeBobert(AMBIENT_LISTEN_ENABLED=False, AMBIENT_AUDIO_ENABLED=True)
+        self._run_autostart(bc).assert_not_called()
+        bc = _FakeBobert(AMBIENT_LISTEN_ENABLED=True)
+        self._run_autostart(bc).assert_called_once()
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Residual edge-path coverage (guards, exception swallows, loop-continue arms).
