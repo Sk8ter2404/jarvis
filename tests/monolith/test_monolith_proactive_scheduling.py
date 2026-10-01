@@ -180,5 +180,115 @@ class StandbyReminderDrainTests(_QueueBase):
         self.assertEqual(len(self.spoke), 2)
 
 
+class RequeueFailureNeverDropsTests(_QueueBase):
+    """2026-10-01 merge audit: _speak_pending requeued its held (standby) and
+    deferred (budget) entries AFTER speaking, ignored the False that
+    _requeue_pending_speech returns, and deleted the claimed snapshot anyway -
+    one refused os.replace dropped every held briefing, alert and offer.
+    A failed requeue now shrinks the snapshot to the unspoken entries and
+    leaves it for the next pass's orphan recovery."""
+
+    WEATHER = {"message": "Weather alert, sir.", "source": "weather"}
+    TIMER = {"message": "Reminder, sir — tea", "source": "timer",
+             "dedupe_key": "timer#1"}
+    OFFER = {"message": "Your print is done, sir.", "source": "device"}
+
+    def _snapshot(self):
+        with open(self.queue + ".consuming", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_standby_held_lines_survive_a_failed_requeue(self):
+        bc = self.bc
+        self._write([self.WEATHER, self.TIMER, self.OFFER])
+        with mock.patch.object(bc, "_requeue_pending_speech",
+                               return_value=False) as rq:
+            self.assertTrue(
+                bc._speak_pending(only_sources=bc._STANDBY_SPEAKABLE_SOURCES))
+        rq.assert_called_once_with([self.WEATHER, self.OFFER])
+        self.assertEqual(self.spoke, [self.TIMER["message"]])
+        # Nothing on disk was lost: the claimed snapshot holds exactly the
+        # two held lines - and not the timer that was already spoken.
+        self.assertEqual(self._snapshot(), [self.WEATHER, self.OFFER])
+
+        # The next standby pass recovers the snapshot into the live queue and
+        # speaks nothing (neither held line is standby-speakable).
+        self.assertFalse(
+            bc._speak_pending(only_sources=bc._STANDBY_SPEAKABLE_SOURCES))
+        self.assertEqual(self._read(), [self.WEATHER, self.OFFER])
+        self.assertFalse(os.path.exists(self.queue + ".consuming"))
+
+        # The wake drain speaks both held lines; the timer is not repeated
+        # even with the recent-speech dedupe cleared (it is simply not queued).
+        bc._recent_spoken_messages.clear()
+        self.assertTrue(bc._speak_pending())
+        self.assertEqual(self.spoke, [self.TIMER["message"],
+                                      self.WEATHER["message"],
+                                      self.OFFER["message"]])
+        self.assertEqual(self._read(), [])
+
+    def test_budget_deferred_tail_survives_a_failed_requeue(self):
+        bc = self.bc
+        self._p(bc, "_PENDING_DRAIN_BUDGET_S", 0.0)
+        a, b, c = ({"message": f"Line {n}, sir."} for n in "abc")
+        self._write([a, b, c])
+        with mock.patch.object(bc, "_requeue_pending_speech",
+                               return_value=False):
+            bc._speak_pending()
+        self.assertEqual(self.spoke, ["Line a, sir."])
+        self.assertEqual(self._snapshot(), [b, c])
+        bc._recent_spoken_messages.clear()
+        bc._speak_pending()
+        bc._speak_pending()
+        self.assertEqual(self.spoke, ["Line a, sir.", "Line b, sir.",
+                                      "Line c, sir."])
+
+    def test_snapshot_rewrite_failure_keeps_the_whole_snapshot(self):
+        # Last resort: when even the shrink fails, the claimed snapshot stays
+        # whole - delayed, never lost; the spoken timer's dedupe key keeps it
+        # from being said twice.
+        bc = self.bc
+        self._write([self.WEATHER, self.TIMER])
+        with mock.patch.object(bc, "_requeue_pending_speech",
+                               return_value=False),                 mock.patch.object(bc, "_rewrite_queue_snapshot",
+                                  return_value=False):
+            bc._speak_pending(only_sources=bc._STANDBY_SPEAKABLE_SOURCES)
+        self.assertEqual(self._snapshot(), [self.WEATHER, self.TIMER])
+        bc._speak_pending()
+        self.assertEqual(self.spoke, [self.TIMER["message"],
+                                      self.WEATHER["message"]])
+
+    def test_recovery_io_error_keeps_the_orphan_and_skips_the_claim(self):
+        # The retry used to discard an orphan on ANY error, I/O included -
+        # so the same refused write that failed the requeue then lost it.
+        bc = self.bc
+        with open(self.queue + ".consuming", "w", encoding="utf-8") as f:
+            json.dump([self.WEATHER], f)
+        self._write([self.OFFER])
+        with mock.patch.object(bc.tempfile, "mkstemp",
+                               side_effect=PermissionError("in use")):
+            self.assertFalse(bc._speak_pending())
+        self.assertEqual(self.spoke, [])
+        self.assertEqual(self._snapshot(), [self.WEATHER])   # not clobbered
+        self.assertEqual(self._read(), [self.OFFER])
+        bc._speak_pending()
+        self.assertEqual(self.spoke, [self.WEATHER["message"],
+                                      self.OFFER["message"]])
+
+    def test_inject_drain_does_not_clobber_a_kept_orphan(self):
+        bc = self.bc
+        inj = os.path.join(self._tmp.name, "injected_commands.json")
+        self._p(bc, "INJECTED_COMMANDS_PATH", inj)
+        with open(inj + ".consuming", "w", encoding="utf-8") as f:
+            json.dump(["orphan-cmd"], f)
+        with open(inj, "w", encoding="utf-8") as f:
+            json.dump(["live-cmd"], f)
+        with mock.patch.object(bc.tempfile, "mkstemp",
+                               side_effect=PermissionError("in use")):
+            self.assertIsNone(bc._drain_injected_command())
+        self.assertTrue(os.path.exists(inj + ".consuming"))
+        self.assertEqual(bc._drain_injected_command(), "orphan-cmd")
+        self.assertEqual(bc._drain_injected_command(), "live-cmd")
+
+
 if __name__ == "__main__":
     unittest.main()

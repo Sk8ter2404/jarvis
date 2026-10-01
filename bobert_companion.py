@@ -34873,7 +34873,7 @@ INJECTED_COMMANDS_PATH = _BLUE_GREEN_PATHS["inject_file"]
 _INJECT_TEST_MODE = os.environ.get("JARVIS_TEST_MODE") == "1"
 
 
-def _recover_orphaned_queue_snapshot(queue_path: str, tag: str) -> None:
+def _recover_orphaned_queue_snapshot(queue_path: str, tag: str) -> bool:
     """Recover an orphaned ``<queue>.consuming`` snapshot left by a crash.
 
     Both JSON-array file queues (injected commands, pending speech) claim
@@ -34892,18 +34892,26 @@ def _recover_orphaned_queue_snapshot(queue_path: str, tag: str) -> None:
       • orphan + live queue    → merge (orphan items first — they are older),
                                  write atomically, remove the orphan;
       • corrupt/unreadable orphan → discard it with a printed warning (same
-                                 policy as the drains' corrupt-JSON branch).
+                                 policy as the drains' corrupt-JSON branch);
+      • an I/O failure (a rename or write refused - e.g. a transient Windows
+        PermissionError) → KEEP the orphan for the next pass (2026-10-01).
+        It used to be discarded like a corrupt one, and _speak_pending leaves
+        a snapshot here precisely when its own queue write just failed, so
+        the retry was likely to fail the same way and drop held lines.
 
-    Never raises. 2026-07-21 audit: 'queue files are never recovered'."""
+    Returns True while an orphan is still on disk after the call (it could
+    not be merged): the caller must NOT claim the queue this pass, because
+    os.replace() onto the snapshot would clobber it. Never raises.
+    2026-07-21 audit: 'queue files are never recovered'."""
     consume_path = queue_path + ".consuming"
     try:
         if not os.path.exists(consume_path):
-            return
+            return False
         if not os.path.exists(queue_path):
             os.replace(consume_path, queue_path)
             print(f"  [{tag}] recovered an orphaned .consuming snapshot "
                   f"from a previous unclean exit")
-            return
+            return False
         with open(consume_path, "r", encoding="utf-8") as f:
             orphan_raw = f.read().strip()
         orphan_items = (json.JSONDecoder().raw_decode(orphan_raw)[0]
@@ -34937,14 +34945,25 @@ def _recover_orphaned_queue_snapshot(queue_path: str, tag: str) -> None:
             if tmp is not None:
                 try: os.unlink(tmp)
                 except Exception: pass
-        os.remove(consume_path)
+        try:
+            os.remove(consume_path)
+        except OSError as _e:
+            # Merged, but the snapshot could not be removed. Its items are in
+            # the live queue now, so the caller's claim may overwrite it.
+            print(f"  [{tag}] merged orphan could not be removed: {_e}")
         print(f"  [{tag}] merged {len(orphan_items)} orphaned item(s) from a "
               f"previous unclean exit back into the queue")
+        return False
+    except OSError as _e:
+        print(f"  [{tag}] orphaned .consuming snapshot kept for the next "
+              f"pass (I/O error): {_e}")
+        return os.path.exists(consume_path)
     except Exception as _e:
         print(f"  [{tag}] orphaned .consuming snapshot unrecoverable — "
               f"discarding: {_e}")
         try: os.remove(consume_path)
         except Exception: pass
+        return False
 
 
 def _drain_injected_command():
@@ -34964,7 +34983,8 @@ def _drain_injected_command():
     The returned entry's "source" lands in _last_inject_source (2026-10-01)
     without changing this function's return value."""
     _last_inject_source[0] = None
-    _recover_orphaned_queue_snapshot(INJECTED_COMMANDS_PATH, "inject")
+    if _recover_orphaned_queue_snapshot(INJECTED_COMMANDS_PATH, "inject"):
+        return None   # an unmerged orphan: claiming now would clobber it
     if not os.path.exists(INJECTED_COMMANDS_PATH):
         return None
     consume_path = INJECTED_COMMANDS_PATH + ".consuming"
@@ -35071,7 +35091,9 @@ _PENDING_DRAIN_BUDGET_S = 25.0
 def _requeue_pending_speech(items: list) -> bool:
     """Put un-spoken announcements back on the pending-speech queue.
 
-    Called when _speak_pending's per-pass budget cuts a drain short. MERGES
+    Called by _speak_pending for the entries it did not speak: the tail its
+    per-pass budget cut short and, in standby, the entries it holds for the
+    wake. MERGES
     rather than clobbers: skills keep writing to a fresh pending_speech.json
     while a drain is in flight (that is the entire point of the
     consume-and-rename claim), so a plain overwrite here would silently drop
@@ -35252,7 +35274,8 @@ def _speak_pending(only_sources=None, only_owner_requested: bool = False):
         # Standby (only_sources) leaves the governor's held line where it is,
         # exactly as before: it would only be held again below.
         _audio_flap_flush()
-    _recover_orphaned_queue_snapshot(PENDING_SPEECH_PATH, "pending")
+    if _recover_orphaned_queue_snapshot(PENDING_SPEECH_PATH, "pending"):
+        return False  # an unmerged orphan: claiming now would clobber it
     if not os.path.exists(PENDING_SPEECH_PATH):
         return False
     # Standby runs this every pass (as often as every 0.3 s while muted):
@@ -35371,9 +35394,23 @@ def _speak_pending(only_sources=None, only_owner_requested: bool = False):
         print(f"  [pending] drain budget ({_PENDING_DRAIN_BUDGET_S:.0f}s) "
               f"reached — deferring {len(deferred)} announcement(s) to the "
               f"next pass")
-    if back:
-        # Held + deferred entries go back in their original queue order.
-        _requeue_pending_speech(back)
+    if back and not _requeue_pending_speech(back):
+        # Held + deferred entries go back in their original queue order. When
+        # that write fails they must not go down with the snapshot (2026-10-01
+        # merge audit: one refused os.replace silently dropped every held
+        # briefing, alert and offer). Shrink the claimed snapshot to exactly
+        # the unspoken entries and leave it on disk: the next pass's orphan
+        # recovery merges it back, so nothing already spoken is said again.
+        # If even that rewrite fails, the whole snapshot stays - a line is
+        # then at worst repeated (bounded by the _speech_was_recently_spoken
+        # dedupe on the keys marked above), never lost.
+        if _rewrite_queue_snapshot(consume_path, back):
+            print(f"  [pending] requeue failed — kept {len(back)} unspoken "
+                  f"announcement(s) in the claimed snapshot for the next pass")
+        else:
+            print(f"  [pending] requeue failed — left the whole claimed "
+                  f"snapshot for the next pass")
+        return spoke_any
     # Snapshot fully consumed — delete it. Any new items written DURING
     # this loop live in a fresh pending_speech.json that the next call
     # will pick up (and that the requeue above merged with, not clobbered).
@@ -35382,6 +35419,33 @@ def _speak_pending(only_sources=None, only_owner_requested: bool = False):
     except Exception:
         pass
     return spoke_any
+
+
+def _rewrite_queue_snapshot(path: str, items: list) -> bool:
+    """Atomically replace the claimed queue snapshot at ``path`` with
+    ``items`` (mkstemp + os.replace, the queue writers' pattern). True when
+    written. Never raises - on failure the snapshot is left as it was."""
+    fd: int = -1
+    tmp: str | None = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                                   suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1   # fdopen took ownership of the descriptor
+            json.dump(list(items), f, indent=2)
+        os.replace(tmp, path)
+        tmp = None
+        return True
+    except Exception as _e:
+        print(f"  [pending] could not rewrite the claimed snapshot: {_e}")
+        return False
+    finally:
+        if fd >= 0:
+            try: os.close(fd)
+            except Exception: pass
+        if tmp is not None:
+            try: os.unlink(tmp)
+            except Exception: pass
 
 # Sub-agent orchestrator (core/orchestrator) — explicit multi-agent briefing
 # requests fan out to parallel READ-ONLY sub-agents (email / calendar / news /
