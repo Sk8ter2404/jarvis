@@ -263,7 +263,8 @@ class RequeueFailureNeverDropsTests(_QueueBase):
         bc = self.bc
         self._write([self.WEATHER, self.TIMER])
         with mock.patch.object(bc, "_requeue_pending_speech",
-                               return_value=False),                 mock.patch.object(bc, "_rewrite_queue_snapshot",
+                               return_value=False), \
+                mock.patch.object(bc, "_rewrite_queue_snapshot",
                                   return_value=False):
             bc._speak_pending(only_sources=bc._STANDBY_SPEAKABLE_SOURCES)
         self.assertEqual(self._snapshot(), [self.WEATHER, self.TIMER])
