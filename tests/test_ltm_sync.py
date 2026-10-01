@@ -211,32 +211,93 @@ class ReflectorSinkTests(unittest.TestCase):
         store = {"facts": ["User lives in Boulder", "User likes tea",
                            "User lives in Denver"], "projects": []}
         saved, rebuild, logged = self._sink(
-            store, [("user lives in boulder", "User lives in Denver")])
+            store, [("contradiction", ("user lives in boulder",),
+                     "User lives in Denver")])
         self.assertEqual(saved[-1]["facts"],
                          ["User likes tea", "User lives in Denver"])
         rebuild.assert_called_once_with()
         self.assertNotIn("Boulder", logged)        # counts only, never text
 
+    def test_a_survivor_store_a_does_not_hold_changes_nothing(self):
+        # 2026-10-01 (adversarial review): the sink wrote the LTM survivor
+        # into store A in the condemned fact's place -- and LTM can still
+        # hold a fact the owner removed from bobert_memory.json (the guest-
+        # learned facts awaiting quarantine). One wrong A/B verdict swapped
+        # the true fact for the removed one, past merge_memory's owner gate.
+        store = {"facts": ["User lives in Boulder", "User likes tea"],
+                 "projects": []}
+        saved, rebuild, _l = self._sink(
+            store, [("contradiction", ("User lives in Boulder",),
+                     "User lives in Denver"),
+                    ("contradiction", ("User likes tea",), None)])
+        self.assertEqual(saved, [])
+        rebuild.assert_not_called()
+
     def test_a_merge_replaces_in_place_then_drops_the_other(self):
         store = {"facts": ["User has a dog", "User likes tea",
                            "User's dog is named Rex"], "projects": []}
         saved, _r, _l = self._sink(store, [
-            ("User's dog is named Rex", "User has a dog named Rex"),
-            ("User has a dog", "User has a dog named Rex")])
+            ("merge", ("User's dog is named Rex", "User has a dog"),
+             "User has a dog named Rex")])
         self.assertEqual(saved[-1]["facts"],
                          ["User likes tea", "User has a dog named Rex"])
 
-    def test_a_secret_shaped_replacement_is_never_written(self):
-        store = {"facts": ["User has a router"], "projects": []}
+    def test_a_merge_with_a_text_store_a_does_not_hold_changes_nothing(self):
+        store = {"facts": ["User has a dog", "User likes tea"],
+                 "projects": []}
+        saved, rebuild, _l = self._sink(store, [
+            ("merge", ("User has a dog", "User's dog is named Rex"),
+             "User has a dog named Rex")])
+        self.assertEqual(saved, [])
+        rebuild.assert_not_called()
+
+    def test_a_merge_chain_applies_in_order(self):
+        store = {"facts": ["a dog", "a dog named Rex", "Rex is brown"],
+                 "projects": []}
         saved, _r, _l = self._sink(store, [
-            ("User has a router", "User's router password is hunter2")])
-        self.assertEqual(saved[-1]["facts"], [])
+            ("merge", ("a dog", "a dog named Rex"), "a dog named Rex"),
+            ("merge", ("a dog named Rex", "Rex is brown"),
+             "a brown dog named Rex")])
+        self.assertEqual(saved[-1]["facts"], ["a brown dog named Rex"])
+
+    def test_a_secret_shaped_merge_is_never_written(self):
+        store = {"facts": ["User has a router", "User's router is new"],
+                 "projects": []}
+        saved, _r, _l = self._sink(store, [
+            ("merge", ("User has a router", "User's router is new"),
+             "User's router password is hunter2")])
+        self.assertEqual(saved, [])
 
     def test_texts_not_in_the_prompt_memory_change_nothing(self):
         store = {"facts": ["User likes tea"], "projects": []}
-        saved, rebuild, _l = self._sink(store, [("User likes coffee", None)])
+        saved, rebuild, _l = self._sink(
+            store, [("contradiction", ("User likes coffee",),
+                     "User likes tea")])
         self.assertEqual(saved, [])
         rebuild.assert_not_called()
+
+    def test_the_real_reflector_never_writes_a_removed_fact_back(self):
+        # End to end through the REAL reflector and the REAL sink: LTM still
+        # holds "Denver" (removed from store A by the owner), the model picks
+        # it, and store A must keep "Boulder" and never gain "Denver".
+        import copy
+        from core import long_term_memory as ltm
+        bc = self.bc
+        store = {"facts": ["User lives in Boulder", "User likes tea"],
+                 "projects": []}
+        saved = []
+        facts = {
+            fid: {"id": fid, "text": text, "source": "merge_memory",
+                  "tags": [], "created_at": ca, "updated_at": ca}
+            for fid, text, ca in (("a", "User lives in Boulder", 1.0),
+                                  ("b", "User lives in Denver", 2.0))}
+        with mock.patch.object(ltm, "_facts", facts),              mock.patch.object(ltm, "ensure_loaded"),              mock.patch.object(ltm, "_embed", lambda texts: [1] * len(texts)),              mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7),              mock.patch.object(ltm, "_chroma_delete"),              mock.patch.object(ltm, "_chroma_upsert"),              mock.patch.object(ltm, "_save_facts_locked"),              mock.patch.object(ltm, "_rebuild_bm25_locked"),              mock.patch.object(ltm, "_reflector_sink", bc._ltm_reflector_sink),              mock.patch.object(bc, "load_memory",
+                               lambda: copy.deepcopy(store)),              mock.patch.object(bc, "save_memory", saved.append),              mock.patch.object(bc, "_request_prompt_rebuild"),              mock.patch("builtins.print"):
+            # Presented newest first: "Denver" is A. "A" keeps Denver.
+            summary = ltm.reflect_and_consolidate(llm_call=lambda p, c: "A")
+        self.assertEqual(summary["contradictions_resolved"], 1)
+        self.assertEqual(sorted(facts), ["b"])          # LTM settled it
+        self.assertEqual(saved, [])                     # store A untouched
 
 
 if __name__ == "__main__":

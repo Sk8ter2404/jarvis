@@ -5,8 +5,9 @@ into the system prompt every turn. Three functions extracted from the monolith:
 
   _empty_memory()        — the schema with sensible empty defaults.
   load_memory()          — read + forward-migrate missing keys; empty when the
-                           file is absent, an empty MARKED unreadable when it
-                           exists but cannot be parsed (2026-10-01).
+                           file is absent or empty, an empty MARKED unreadable
+                           when it has content that cannot be parsed
+                           (2026-10-01).
   save_memory(memory)    — ATOMIC write (tempfile + fsync + os.replace) so a
                            crash/power-loss mid-write can't truncate the live
                            store to empty/half-written JSON (2026-05-30 audit);
@@ -116,9 +117,16 @@ def load_memory() -> dict:
     # stand-in is marked so save_memory refuses it, and the bad file is copied
     # aside. utf-8-sig: a valid file re-saved with a BOM (Windows PowerShell
     # 5.1 Out-File, Notepad "UTF-8 with BOM") is not a broken one.
+    #
+    # An EMPTY (0-byte / whitespace-only) file holds nothing to protect -- the
+    # truncation a pre-atomic writer left behind -- so it is treated as absent
+    # and the next save heals it, as it did before the marker existed.
     try:
         with open(_MEMORY_FILE, encoding="utf-8-sig") as f:
-            mem = json.load(f)
+            raw = f.read()
+        if not raw.strip():
+            return _empty_memory()
+        mem = json.loads(raw)
         if not isinstance(mem, dict):
             raise ValueError(f"top level is {type(mem).__name__}, not an object")
     except Exception as e:

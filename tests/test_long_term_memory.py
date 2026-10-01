@@ -1011,6 +1011,21 @@ class ReflectDegradedTests(_LtmBase):
         self.assertIn("new", ltm._facts)
         self.assertIn("uniq", ltm._facts)
 
+    def test_exact_text_dedupe_keeps_the_trusted_copy(self):
+        # 2026-10-01 (adversarial review of B020): this branch still deleted
+        # the older copy unconditionally, so a migrated fact lost its
+        # trusted label to an untrusted re-learned duplicate.
+        ltm._facts = {
+            "mig": {"id": "mig", "text": "dup", "tags": [],
+                    "source": "bobert_memory_migration",
+                    "created_at": 1.0, "updated_at": 1.0},
+            "amb": {"id": "amb", "text": "dup", "source": "merge_memory",
+                    "tags": [], "created_at": 2.0, "updated_at": 2.0},
+        }
+        summary = ltm.reflect_and_consolidate()
+        self.assertEqual(summary["duplicates_removed"], 1)
+        self.assertEqual(sorted(ltm._facts), ["mig"])
+
     def test_no_duplicates_no_save(self):
         ltm._facts = {
             "a": {"id": "a", "text": "one", "source": "", "tags": [],
@@ -1381,7 +1396,9 @@ class ReflectorInjectionTests(_LtmBase):
                     ("b", "User lives in Denver", 2.0)])
         with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
             ltm.reflect_and_consolidate(llm_call=lambda p, c: "A")
-        self.assertEqual(got, [[("User lives in Boulder",
+        # The kind (2026-10-01 review): the sink may apply an A/B verdict
+        # only as a removal whose survivor it already holds.
+        self.assertEqual(got, [[("contradiction", ("User lives in Boulder",),
                                  "User lives in Denver")]])
 
     def test_a_merge_is_reported_to_the_sink_in_order(self):
@@ -1393,9 +1410,11 @@ class ReflectorInjectionTests(_LtmBase):
         with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
             ltm.reflect_and_consolidate(
                 llm_call=lambda p, c: "MERGE: User has a dog named Rex")
+        # One record carrying BOTH inputs (rewritten first), so the sink
+        # can refuse a merge with a text its store does not hold.
         self.assertEqual(got, [[
-            ("User's dog is named Rex", "User has a dog named Rex"),
-            ("User has a dog", "User has a dog named Rex")]])
+            ("merge", ("User's dog is named Rex", "User has a dog"),
+             "User has a dog named Rex")]])
 
     def test_nothing_settled_reports_nothing_and_a_bad_sink_is_harmless(self):
         got = []
@@ -1554,13 +1573,13 @@ class ForgetSinceTests(_LtmBase):
             "fold": {"id": "fold", "text": "old durable fact", "source": "",
                      "tags": [], "created_at": old_ts, "updated_at": old_ts},
             "fnew": {"id": "fnew", "text": "fact learned just now",
-                     "source": "", "tags": [], "created_at": recent_ts,
-                     "updated_at": recent_ts},
+                     "source": "merge_memory", "tags": [],
+                     "created_at": recent_ts, "updated_at": recent_ts},
         }
         with mock.patch.object(ltm, "_chroma_delete") as cdel:
             res = ltm.forget_since(now - 3600)
         # "fact_texts" (2026-10-01): the caller drops the same facts from
-        # bobert_memory.json, where every one of them was mirrored from.
+        # bobert_memory.json, where merge_memory mirrored them from.
         self.assertEqual(res, {"episodes": 1, "facts": 1, "working": 1,
                                "fact_texts": ["fact learned just now"]})
         # Episodic log: recent line gone, old + unparseable kept, atomic.
@@ -1595,6 +1614,30 @@ class ForgetSinceTests(_LtmBase):
                                "fact_texts": []})
         self.assertFalse(os.path.exists(ltm._EPISODE_LOG + ".tmp"))
         self.assertIn("fold", ltm._facts)
+
+    def test_a_fact_copied_in_inside_the_window_is_not_forgotten(self):
+        # 2026-10-01 (adversarial review of B019): a backfill run, or a
+        # migration re-run at boot after failed chroma upserts, stamps OLD
+        # bobert_memory facts with created_at = the copy time. A forget
+        # within the hour then dropped them here and -- via fact_texts --
+        # from bobert_memory.json too. Only a fact LEARNED in the window
+        # (merge_memory) is forgotten and named; an untagged one is dropped
+        # from this store but never named for bobert_memory.json.
+        now = time.time()
+        recent = now - 600
+        ltm._facts = {
+            fid: {"id": fid, "text": text, "source": src, "tags": [],
+                  "created_at": recent, "updated_at": recent}
+            for fid, text, src in (
+                ("bf", "User's birthday is March 3", "bobert_memory_backfill"),
+                ("mg", "User likes jazz", "bobert_memory_migration"),
+                ("mm", "User's sister lives in Denver", "merge_memory"),
+                ("un", "an untagged fact", ""))}
+        with mock.patch.object(ltm, "_chroma_delete"):
+            res = ltm.forget_since(now - 3600)
+        self.assertEqual(sorted(ltm._facts), ["bf", "mg"])
+        self.assertEqual(res["facts"], 2)
+        self.assertEqual(res["fact_texts"], ["User's sister lives in Denver"])
 
     def test_ts_less_fact_treated_as_old_and_kept(self):
         now = time.time()

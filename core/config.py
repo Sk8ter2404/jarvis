@@ -550,8 +550,10 @@ SITE_SHORTCUTS: dict = {}
 # led by the wake word (or right after a standby wake), matched to the
 # owner's enrolled voiceprint, or a follow-up within LEARN_FOLLOWUP_S of one
 # of those. A voice that scores below LEARN_VOICE_REJECT_BELOW against the
-# enrolled voiceprint never teaches; overheard speech teaches only with a
-# matched voiceprint, and the background ambient extractor stops. Off by
+# enrolled voiceprint never teaches -- a MATCHED one too, the owner's own
+# voice included (2026-10-01), so keep it under the owner's usual match
+# score (voice_id names a speaker from 0.72). Overheard speech teaches only
+# with a matched voiceprint, and the background ambient extractor stops. Off by
 # default: without an enrolled voiceprint or the wake word, almost nothing
 # would teach. Set via user_settings.json; applies on the next start.
 LEARN_ONLY_FROM_OWNER = False

@@ -1581,6 +1581,18 @@ def _act_reset_memory(_: str = "") -> str:
         except Exception as oe:
             ltm_note += (f" — WARNING: this session's opening-utterance "
                          f"record was NOT cleared ({oe})")
+        # This process's conversation history (and the running session
+        # summary built from it) -- in every LLM call until now. BEFORE the
+        # session-summary purge below (2026-10-01): this bumps the summary
+        # generation, so a checkpoint whose LLM call returns during the purge
+        # discards its summary instead of writing the session's row back.
+        try:
+            _forget_live = getattr(bc, "_forget_live_conversation", None)
+            if callable(_forget_live):
+                _forget_live(None)
+        except Exception as ce:
+            ltm_note += (f" — WARNING: this conversation's history was NOT "
+                         f"cleared ({ce})")
         # The pattern store's conversation logs: the session-summary index
         # ("what did we do yesterday") and the verbatim voice-command log
         # (the "where did we leave off" greeting). Backed up first.
@@ -1589,15 +1601,6 @@ def _act_reset_memory(_: str = "") -> str:
         except Exception as pe:
             ltm_note += (f" — WARNING: the session summaries and the "
                          f"voice-command log were NOT cleared ({pe})")
-        # This process's conversation history (and the running session
-        # summary built from it) -- in every LLM call until now.
-        try:
-            _forget_live = getattr(bc, "_forget_live_conversation", None)
-            if callable(_forget_live):
-                _forget_live(None)
-        except Exception as ce:
-            ltm_note += (f" — WARNING: this conversation's history was NOT "
-                         f"cleared ({ce})")
         _pw = _refresh_live_prompt_after_wipe(bc)
         if _pw:
             ltm_note += f" — WARNING: {_pw}"
@@ -1938,18 +1941,12 @@ def _act_forget_last_hour(_: str = "") -> str:
             failures.append(
                 f"this session's opening-utterance record was NOT purged "
                 f"({oe})")
-        # The session-summary index ("what did we do this afternoon"): its
-        # current-session row is re-written by the 10-minute checkpoint.
-        ss_removed = 0
-        try:
-            _n = bc.pattern_memory.forget_session_summaries_since(cutoff)
-            if isinstance(_n, int) and not isinstance(_n, bool):
-                ss_removed = _n
-        except Exception as se:
-            failures.append(f"the session summaries were NOT purged ({se})")
         # This process's conversation history -- in every LLM call, and what
         # "summarise what we talked about" reads -- and the running session
-        # summary, which the next checkpoint would have re-written.
+        # summary, which the next checkpoint would have re-written. BEFORE
+        # the session-summary purge (2026-10-01): this bumps the summary
+        # generation, so a checkpoint whose LLM call returns during the purge
+        # discards its summary instead of writing the forgotten row back.
         live_removed = 0
         try:
             _forget_live = getattr(bc, "_forget_live_conversation", None)
@@ -1960,6 +1957,15 @@ def _act_forget_last_hour(_: str = "") -> str:
         except Exception as ce:
             failures.append(
                 f"this conversation's history was NOT cleared ({ce})")
+        # The session-summary index ("what did we do this afternoon"): its
+        # current-session row is re-written by the 10-minute checkpoint.
+        ss_removed = 0
+        try:
+            _n = bc.pattern_memory.forget_session_summaries_since(cutoff)
+            if isinstance(_n, int) and not isinstance(_n, bool):
+                ss_removed = _n
+        except Exception as se:
+            failures.append(f"the session summaries were NOT purged ({se})")
         _pw = _refresh_live_prompt_after_wipe(bc)
         if _pw:
             failures.append(_pw)
@@ -1978,10 +1984,15 @@ def _act_forget_last_hour(_: str = "") -> str:
             # Normally the same utterances are already counted as logged
             # turns; say so only when nothing else was.
             bits.append(f"{opening_removed} recorded utterance(s)")
-        if live_removed and not bits:
-            bits.append(f"{live_removed} message(s) of this conversation")
         warn = (" — WARNING: " + "; ".join(failures)) if failures else ""
         if not bits:
+            if live_removed:
+                # The history messages carry no timestamps, so the WHOLE
+                # in-context conversation was cleared, however old: say that,
+                # not "forgot N message(s) ... from the last hour" (2026-10-01).
+                return (f"cleared this conversation's context "
+                        f"({live_removed} message(s)); nothing else was "
+                        f"recent enough to forget" + warn)
             return "nothing recent enough to forget" + warn
         return "forgot " + ", ".join(bits) + " from the last hour" + warn
     except Exception as e:

@@ -983,10 +983,14 @@ def set_reflector_llm(fn: Optional[Callable[[str, list], Optional[str]]]) -> Non
 # bobert_memory.json facts -- rendered in full into every system prompt --
 # kept both sides of a contradiction it had "resolved". The monolith wires a
 # sink that applies each decision there too. Contract:
-#   fn([(removed_text, replacement_text_or_None), ...])
-# called once per run, outside _lock, with only the decisions that were
-# actually applied here. Near-duplicate removals are not reported: the
-# legacy store dedupes those itself. A raising sink never breaks the run.
+#   fn([(kind, removed_texts, replacement_text_or_None), ...])
+# in the order applied: ("contradiction", (condemned,), final survivor text
+# or None) and ("merge", (rewritten, merged_away), merged text). The KIND
+# lets the sink tell a model's A/B verdict, which may only REMOVE a text
+# whose survivor it already holds, from a merge rewrite (2026-10-01). Called
+# once per run, outside _lock, with only the decisions actually applied
+# here. Near-duplicate removals are not reported: the legacy store dedupes
+# those itself. A raising sink never breaks the run.
 _reflector_sink: Optional[Callable[[list], None]] = None
 
 
@@ -1000,10 +1004,10 @@ def _may_condemn(condemned_source: str, survivor_source: str) -> bool:
     """THE trusted-source rule, shared by every reflector deletion path: a
     migrated / backfilled fact is never deleted in favour of a fact from an
     untrusted (ambient-extraction) source -- a mis-heard Whisper variant must
-    not delete it (2026-07-21 audit #39). One helper so the near-duplicate,
-    contradiction and MERGE paths cannot drift apart again: until 2026-10-01
-    only the contradiction path applied it, and the other two deleted 5 of
-    the 23 migration-day facts."""
+    not delete it (2026-07-21 audit #39). One helper so the near-duplicate
+    (with or without an embedder), contradiction and MERGE paths cannot
+    drift apart again: until 2026-10-01 only the contradiction path applied
+    it, and the others deleted 5 of the 23 migration-day facts."""
     return not (condemned_source in _TRUSTED_FACT_SOURCES
                 and survivor_source not in _TRUSTED_FACT_SOURCES)
 
@@ -1129,7 +1133,14 @@ def reflect_and_consolidate(
                                           entry["created_at"]
                         else (fid, seen[t])
                     )
-                    # Delete the older duplicate.
+                    # Delete the older duplicate -- unless that would drop a
+                    # trusted (migrated/backfilled) entry for an untrusted
+                    # copy: the same _may_condemn rule as the embedder path
+                    # (2026-10-01). Otherwise the trusted label is lost and
+                    # the contradiction pass may later condemn the survivor.
+                    if not _may_condemn(_facts[older].get("source") or "",
+                                        _facts[newer].get("source") or ""):
+                        older, newer = newer, older
                     if older in _facts:
                         del _facts[older]
                         _chroma_delete(older)
@@ -1145,9 +1156,10 @@ def reflect_and_consolidate(
     # ── pairwise scan
     to_delete: set[str] = set()
     reasons: dict[str, str] = {}    # fid -> why it is deleted (for the log)
-    # Decisions for the sink: a condemned fid -> the fid that survives it
-    # (reported only if the delete goes through, with the survivor's FINAL
-    # text), plus MERGE rewrites already applied in place, in order.
+    # Decisions for the sink: a condemned / merged-away fid -> the fid that
+    # survives it (a contradiction is reported only if the delete goes
+    # through, with the survivor's FINAL text, following merges), plus MERGE
+    # rewrites -- both inputs and the result -- as applied in place, in order.
     sink_on_delete: dict[str, str] = {}
     sink_applied: list = []
     llm_pairs = 0   # contradiction-pass adjudications this run (bounded)
@@ -1251,7 +1263,8 @@ def reflect_and_consolidate(
                             entry["text"] = merged
                             entry["updated_at"] = time.time()
                             _chroma_upsert(ids[i], merged, entry)
-                            sink_applied.append((a_text, merged))
+                            sink_applied.append(
+                                ("merge", (a_text, b_text), merged))
                             texts[i] = merged
                             snapshot_text[ids[i]] = merged
                             to_delete.add(ids[j])
@@ -1289,9 +1302,12 @@ def reflect_and_consolidate(
                     print(f"  [ltm] reflector removed {fid} "
                           f"({snapshot_source.get(fid) or 'unknown source'}, "
                           f"{reasons.get(fid, 'unspecified')})")
-                    if fid in sink_on_delete:
-                        sink_applied.append((snapshot_text.get(fid, ""),
-                                             _final_survivor_text(fid)))
+                    # A merged-away fact was reported with its merge.
+                    if reasons.get(fid) == "contradiction":
+                        sink_applied.append(
+                            ("contradiction",
+                             (snapshot_text.get(fid, ""),),
+                             _final_survivor_text(fid)))
             _save_facts_locked()
             _rebuild_bm25_locked()
     if sink_applied and _reflector_sink is not None:
@@ -1385,10 +1401,17 @@ def forget_since(cutoff_ts: float) -> dict:
     bobert_memory entries. Exceptions propagate: the caller must DISCLOSE a
     failed purge rather than claim success (the silent-survival gap is the
     bug). Returns counts {"episodes": n, "facts": n, "working": n} plus
-    "fact_texts", the texts of the facts it dropped: each was mirrored from
-    bobert_memory.json (merge_memory -> add_fact), and the caller must drop
-    them there too or the "forgotten" fact stays in every system prompt
-    (2026-10-01).
+    "fact_texts", the texts of the dropped facts that were LEARNED in the
+    window (source "merge_memory": mirrored from bobert_memory.json at learn
+    time); the caller must drop them there too or the "forgotten" fact stays
+    in every system prompt (2026-10-01).
+
+    Migrated / backfilled facts (_TRUSTED_FACT_SOURCES) are KEPT whatever
+    their created_at (2026-10-01): it records when an OLD bobert_memory fact
+    was copied in (a backfill run, or a migration re-run at boot after failed
+    chroma upserts), not when the owner taught it, so a forget within the
+    hour after a backfill dropped those facts here and -- through
+    fact_texts -- from bobert_memory.json too, with no backup.
     (2026-07-21 audit #51: forget_last_hour left the hour's verbatim turns
     in episodes.jsonl and its facts in the semantic store.)"""
     counts = {"episodes": 0, "facts": 0, "working": 0, "fact_texts": []}
@@ -1433,6 +1456,8 @@ def forget_since(cutoff_ts: float) -> dict:
         # mirror + chroma per id, then one save + BM25 rebuild at the end.
         doomed = []
         for fid, entry in _facts.items():
+            if (entry.get("source") or "") in _TRUSTED_FACT_SOURCES:
+                continue        # an old fact copied in, not learned (above)
             try:
                 created = float(entry.get("created_at", 0.0))
             except (TypeError, ValueError):
@@ -1441,7 +1466,10 @@ def forget_since(cutoff_ts: float) -> dict:
                 doomed.append(fid)
         for fid in doomed:
             _t = _facts[fid].get("text", "")
-            if isinstance(_t, str) and _t.strip():
+            # Only a fact merge_memory mirrored at learn time names a
+            # bobert_memory.json entry learned in the window.
+            if (isinstance(_t, str) and _t.strip()
+                    and _facts[fid].get("source") == "merge_memory"):
                 counts["fact_texts"].append(_t)
             del _facts[fid]
             _chroma_delete(fid)

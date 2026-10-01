@@ -1286,9 +1286,11 @@ SCHEMA: dict[str, dict] = {
         "type": "float", "default": 0.60, "min": 0, "max": 1,
         "help": "With 'Learn only from me' on: a voice scoring below this "
                 "against your voiceprint is someone else and never teaches, "
-                "even after 'JARVIS'. Raise it if guests still teach him; "
-                "lower it if your own turns are refused. Applies on the next "
-                "start.",
+                "even after 'JARVIS' -- and that includes YOUR voice on a "
+                "turn where it matches below this score, so keep it under "
+                "your usual match score (voice ID names you from 0.72). "
+                "Raise it if guests still teach him; lower it if your own "
+                "turns are refused. Applies on the next start.",
     },
     "AMBIENT_SCREEN_ENABLED": {
         "tab": "privacy", "label": "Ambient screen capture", "type": "bool",

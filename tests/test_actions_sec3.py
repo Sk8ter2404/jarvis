@@ -351,6 +351,20 @@ class ResetMemoryTests(unittest.TestCase):
                 A._act_reset_memory()
             self.assertEqual(order, [("invalidate", None), "save"])
 
+    def test_reset_bumps_the_summary_generation_before_the_purge(self):
+        # 2026-10-01 (adversarial review of B003): the session-summary purge
+        # ran BEFORE _forget_live_conversation bumped the summary generation,
+        # so a checkpoint whose LLM call returned during the purge passed the
+        # generation check and wrote the wiped session's row straight back.
+        with tempfile.TemporaryDirectory() as td:
+            bc, _ = self._bc_with_memory(td)
+            order = []
+            bc._forget_live_conversation.side_effect =                 lambda c: order.append("live")
+            bc.pattern_memory.reset_conversation_logs.side_effect =                 lambda d: order.append("purge")
+            with _patch_bc(bc),                     mock.patch.object(LTM, "reset_all", return_value=0):
+                A._act_reset_memory()
+            self.assertEqual(order, ["live", "purge"])
+
     def test_outer_exception_caught(self):
         bc = _base_bc()
         # _memory_lock that explodes on __enter__ triggers the outer except.
@@ -1003,8 +1017,24 @@ class ForgetLastHourTests(unittest.TestCase):
                 mock.patch.object(A.time, "time", return_value=now), \
                 self._patch_ltm():
             out = A._act_forget_last_hour()
-        self.assertEqual(out, "forgot 4 message(s) of this conversation "
-                              "from the last hour")
+        # 2026-10-01 (adversarial review): the history carries no
+        # timestamps, so the WHOLE in-context conversation goes -- the reply
+        # says so instead of claiming the messages were from the last hour.
+        self.assertEqual(out, "cleared this conversation's context "
+                              "(4 message(s)); nothing else was recent "
+                              "enough to forget")
+
+    def test_forget_bumps_the_summary_generation_before_the_purge(self):
+        # 2026-10-01 (adversarial review of B003): see the reset twin.
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        order = []
+        bc._forget_live_conversation = mock.Mock(
+            side_effect=lambda c: order.append("live") or 0)
+        bc.pattern_memory.forget_session_summaries_since.side_effect =             lambda c: order.append("purge") or 0
+        with _patch_bc(bc),                 mock.patch.object(A.time, "time", return_value=now),                 self._patch_ltm():
+            A._act_forget_last_hour()
+        self.assertEqual(order, ["live", "purge"])
 
     def test_failed_summary_and_history_purges_are_disclosed(self):
         now = 1_700_000_000.0
@@ -1075,6 +1105,32 @@ class ForgetLastHourTests(unittest.TestCase):
         self.assertEqual(saved["facts"], ["User likes jazz"])
         self.assertEqual(saved["projects"], [])
         self.assertEqual(out, "forgot 2 fact(s) from the last hour")
+
+    def test_facts_copied_into_ltm_in_the_hour_stay_in_the_prompt_memory(self):
+        # 2026-10-01 (adversarial review of B019): REAL forget_since. A
+        # backfill run (or a migration re-run at boot) gives OLD
+        # bobert_memory facts a fresh created_at; a forget within the hour
+        # then deleted them from bobert_memory.json too, with no backup.
+        now = 1_700_000_000.0
+        mem = {"topics": [], "sessions": [],
+               "facts": ["User's birthday is March 3", "User likes jazz",
+                         "User's sister lives in Denver"], "projects": []}
+        facts = {
+            fid: {"id": fid, "text": text, "source": src, "tags": [],
+                  "created_at": now - 300, "updated_at": now - 300}
+            for fid, text, src in (
+                ("bf", "User's birthday is March 3", "bobert_memory_backfill"),
+                ("mg", "User likes jazz", "bobert_memory_migration"),
+                ("mm", "User's sister lives in Denver", "merge_memory"))}
+        bc = self._bc(mem)
+        with tempfile.TemporaryDirectory() as td, _patch_bc(bc),                 mock.patch.object(A.time, "time", return_value=now),                 mock.patch.object(LTM, "ensure_loaded"),                 mock.patch.object(LTM, "_facts", facts),                 mock.patch.object(LTM, "_working", []),                 mock.patch.object(LTM, "_EPISODE_LOG",
+                                  os.path.join(td, "episodes.jsonl")),                 mock.patch.object(LTM, "_chroma_delete"),                 mock.patch.object(LTM, "_save_facts_locked"),                 mock.patch.object(LTM, "_rebuild_bm25_locked"):
+            out = A._act_forget_last_hour()
+        self.assertEqual(sorted(facts), ["bf", "mg"])
+        saved = bc.save_memory.call_args[0][0]
+        self.assertEqual(saved["facts"], ["User's birthday is March 3",
+                                          "User likes jazz"])
+        self.assertEqual(out, "forgot 1 fact(s) from the last hour")
 
     def test_a_failed_prompt_memory_fact_removal_is_disclosed(self):
         now = 1_700_000_000.0

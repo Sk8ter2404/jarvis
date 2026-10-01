@@ -6,8 +6,12 @@ Another person's phone call taught him ten "facts about the user" in one
 afternoon. With ``LEARN_ONLY_FROM_OWNER`` on, a turn may teach only when it was
 clearly the owner's:
 
-  * typed / injected (the web page, the tray, say_to_jarvis) — operator input;
-  * led by the wake word ("JARVIS, ..."), or right after a standby wake;
+  * typed / injected from the web page or the tray — operator input. A test
+    harness's inject (tools/say_to_jarvis.py, the run-jarvis driver: tagged
+    "source": "test") never teaches and never opens the window (2026-10-01);
+  * led by the wake word ("JARVIS, ..."), or right after a standby wake —
+    unless the wake capture is confidently someone else's voice
+    (2026-10-01);
   * the owner's enrolled voiceprint matched (core/voice_id, a speaker with the
     ``memory_write`` permission);
   * a follow-up inside a conversation one of the above opened (``window_s``

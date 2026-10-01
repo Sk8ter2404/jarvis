@@ -19627,48 +19627,83 @@ def _ltm_reflector_sink(changes) -> None:
     the semantic store only, so both sides of a contradiction it had
     "resolved" (an old and a new address) stayed in the prompt for good.
 
-    ``changes``: [(removed_text, replacement_text_or_None), ...] in the
-    order they were applied (core/long_term_memory.set_reflector_sink). A
-    removed text found in facts/projects (case-insensitive) is replaced in
-    place by its replacement -- after merge_memory's secret / noise / length
-    guards -- or dropped when the replacement is already listed or absent.
+    ``changes``: [(kind, removed_texts, replacement_or_None), ...] in the
+    order they were applied (core/long_term_memory.set_reflector_sink).
+    Matching is case-insensitive across facts and projects. Store A only
+    ever LOSES or fuses texts it already holds -- never gains one from LTM,
+    which may still hold a fact the owner removed here (a quarantined
+    guest-learned fact), and never bypasses merge_memory's owner gate:
+
+      * "contradiction": the condemned text is dropped only when the
+        survivor is already listed; otherwise store A is left alone, so one
+        wrong A/B verdict from the local model cannot swap a true fact for
+        a removed one (adversarial review, 2026-10-01).
+      * "merge": applied only when BOTH inputs are listed: the first input
+        is replaced in place by the merged text (after merge_memory's secret
+        / noise / length guards; just dropped when the merged text is
+        already listed), the other input dropped.
+
     Runs on the ltm-writer thread; logs counts only, never fact text; never
     raises into the reflector."""
+    def _norm(t):
+        return t.strip() if isinstance(t, str) else ""
+
     try:
-        pairs = [(o.strip(), (n.strip() if isinstance(n, str) else "") or None)
-                 for o, n in (changes or [])
-                 if isinstance(o, str) and o.strip()]
+        recs = []
+        for kind, olds, new in (changes or []):
+            olds = tuple(_norm(o) for o in (olds or ()))
+            if kind in ("contradiction", "merge") and olds and all(olds):
+                recs.append((kind, olds, _norm(new) or None))
     except Exception:
         return
-    if not pairs:
+    if not recs:
         return
     replaced = removed = 0
     try:
         with _memory_lock:
             mem = load_memory()
-            for key in ("facts", "projects"):
-                items = mem.get(key)
-                if not isinstance(items, list):
+            lists = [mem[k] for k in ("facts", "projects")
+                     if isinstance(mem.get(k), list)]
+
+            def _hits(text):
+                lo = text.lower()
+                return [(items, k) for items in lists
+                        for k, x in enumerate(items)
+                        if isinstance(x, str) and x.strip().lower() == lo]
+
+            def _drop(positions):
+                # Highest index first per list, so earlier indices hold.
+                for items, k in sorted(positions, key=lambda p: -p[1]):
+                    del items[k]
+                return len(positions)
+
+            for kind, olds, new in recs:
+                if kind == "contradiction":
+                    if (new and new.lower() != olds[0].lower()
+                            and _hits(new)):
+                        removed += _drop(_hits(olds[0]))
                     continue
-                for old, new in pairs:
-                    lo = old.lower()
-                    hits = [k for k, x in enumerate(items)
-                            if isinstance(x, str) and x.strip().lower() == lo]
-                    if not hits:
-                        continue
-                    use_new = bool(new) and not (_is_secret_fact(new)
-                                                 or _is_internal_noise_fact(new))
-                    if use_new and any(isinstance(x, str)
-                                       and x.strip().lower() == new.lower()
-                                       for x in items):
-                        use_new = False         # already listed: just drop
-                    if use_new:
-                        items[hits[0]] = _clamp_fact_len(new)
-                        replaced += 1
-                        hits = hits[1:]
-                    for k in reversed(hits):
-                        del items[k]
-                        removed += 1
+                # merge
+                if not new or not all(_hits(o) for o in olds):
+                    continue
+                if _is_secret_fact(new) or _is_internal_noise_fact(new):
+                    continue
+                lo_new = new.lower()
+                pos, seen = [], set()
+                for o in olds:
+                    if o.lower() == lo_new:
+                        continue        # the merged text is that input
+                    for items, k in _hits(o):
+                        if (id(items), k) not in seen:
+                            seen.add((id(items), k))
+                            pos.append((items, k))
+                if not pos:
+                    continue
+                if not _hits(new):
+                    items, k = pos.pop(0)
+                    items[k] = _clamp_fact_len(new)
+                    replaced += 1
+                removed += _drop(pos)
             if replaced or removed:
                 save_memory(mem)
     except Exception as e:
@@ -20168,9 +20203,19 @@ _PROMPT_REBUILD_POLL_S = 1.0
 def _apply_prompt_rebuild() -> bool:
     """Rebuild _system_prompt from FRESH memory (learn_from_turn's worker
     writes new facts to disk under _memory_lock, not into main()'s stale
-    `memory` local). Returns True when the prompt actually changed."""
+    `memory` local). Returns True when the prompt actually changed.
+
+    While bobert_memory.json is unreadable (core/legacy_memory marks the
+    empty stand-in it returns), the CURRENT prompt is kept (2026-10-01):
+    rebuilding from the stand-in dropped every fact from the live prompt
+    until a person fixed the file."""
     global _system_prompt
-    new = build_system_prompt(load_memory())
+    mem = load_memory()
+    if isinstance(mem, dict) and mem.get(_legacy_memory._LOAD_FAILED_KEY):
+        print("  [memory] prompt rebuild skipped: the memory store is "
+              "unreadable; keeping the current prompt")
+        return False
+    new = build_system_prompt(mem)
     changed = new != _system_prompt
     _system_prompt = new
     return changed
@@ -35909,8 +35954,14 @@ def _handle_sleep_standby(injected_text: str | None):
         # the wake capture is confidently someone else's voice (2026-10-01).
         # Only the mic branch has a capture; a typed wake passes None. The RAW
         # (pre auto-gain) buffer: voice-ID wants natural audio, as for turns.
+        # A test harness's inject ("source": "test", B023) is not the owner:
+        # it wakes JARVIS but never opens the learn window (2026-10-01).
         if injected_text is not None:
-            _learn_gate_note_wake()
+            if _last_inject_source[0] == "test":
+                print("  [learn-gate] not opening the learn window: "
+                      "test inject")
+            else:
+                _learn_gate_note_wake()
         else:
             _learn_gate_note_wake(_last_capture_audio, SAMPLE_RATE)
         # ...and the wake-word follow-up window too (2026-10-01): only the
@@ -35949,8 +36000,10 @@ def _handle_sleep_standby(injected_text: str | None):
     else:
         # Ambient-learning: the overheard line wasn't a wake word. Persist it
         # (silently) so the fact-extractor can learn from it, then ignore it
-        # for speech purposes as usual.
-        if _ambient_learning[0]:
+        # for speech purposes as usual. Never a test harness's inject
+        # (2026-10-01, B023): it is not overheard speech of the owner.
+        if _ambient_learning[0] and not (injected_text is not None
+                                         and _last_inject_source[0] == "test"):
             _ambient_learning_feed(text)
         # Length only, never the words (2026-10-01): in standby every line
         # the room says lands here, other people's included, and the session

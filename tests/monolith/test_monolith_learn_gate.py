@@ -581,11 +581,13 @@ class MainLoopWiringTests(MonolithGlobalsTestCase):
     def test_a_standby_wake_notes_the_gate(self):
         src = inspect.getsource(self.bc._handle_sleep_standby)
         wake_at = src.index('print("  [wake] Waking up")')
+        greet_at = src.index("context_aware_greeting(", wake_at)
         # 2026-10-01 (B081): a mic wake hands its capture over for the voice
-        # check; a typed wake has no capture.
+        # check; a typed wake has no capture -- and a test harness's typed
+        # wake opens nothing (behaviour pinned in test_monolith_sec7).
         self.assertIn("_learn_gate_note_wake(audio, SAMPLE_RATE)",
-                      src[wake_at:wake_at + 700])
-        self.assertIn("_learn_gate_note_wake()", src[wake_at:wake_at + 700])
+                      src[wake_at:greet_at])
+        self.assertIn("_learn_gate_note_wake()", src[wake_at:greet_at])
 
 
 if __name__ == "__main__":

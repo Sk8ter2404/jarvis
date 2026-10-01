@@ -81,6 +81,22 @@ class LegacyMemoryTests(unittest.TestCase):
         lm.save_memory(lm._empty_memory())
         self.assertEqual(lm.load_memory()["facts"], [])
 
+    def test_an_empty_store_file_heals_on_the_next_save(self):
+        # 2026-10-01 (adversarial review of B024): a 0-byte file (the
+        # truncation a pre-atomic writer left) counted as unreadable, so every
+        # save was refused until a person fixed it; before the marker it
+        # healed itself. It holds nothing to protect: treated as absent.
+        for content in (b"", b"  \r\n"):
+            with self.subTest(content=content):
+                with open(self._path, "wb") as f:
+                    f.write(content)
+                with mock.patch("builtins.print"):
+                    mem = lm.load_memory()
+                self.assertNotIn(lm._LOAD_FAILED_KEY, mem)
+                mem["facts"] = ["x"]
+                lm.save_memory(mem)                 # not refused
+                self.assertEqual(lm.load_memory()["facts"], ["x"])
+
     def test_a_bom_prefixed_store_loads_its_facts(self):
         # A valid file re-saved as UTF-8-with-BOM (Windows PowerShell 5.1
         # Out-File, Notepad) used to read as "unreadable" -> empty -> wiped.

@@ -571,6 +571,33 @@ class HandleSleepStandbyTests(SectionSevenBase):
         self.assertFalse(self.bc._standby_mode[0])
         self._speak.assert_called_once_with("Back online, sir.", volume_scale=1.0)
 
+    def test_a_test_inject_wake_never_opens_the_learn_window(self):
+        # 2026-10-01 (adversarial review of B023): a test harness's injected
+        # "JARVIS" in standby still called _learn_gate_note_wake(), opening
+        # the owner's 90 s learn window for whatever came next. The owner's
+        # own typed wake (web page / tray) still opens it.
+        self._p(self.bc, "context_aware_greeting",
+                return_value=("Back online, sir.", 1.0))
+        self._p(self.bc, "OVERNIGHT_FLAG_FILE",
+                os.path.join(tempfile.gettempdir(), "no_such_overnight_flag.json"))
+        note = self._p(self.bc, "_learn_gate_note_wake")
+        self.bc._last_inject_source[0] = "test"
+        self.bc._handle_sleep_standby("JARVIS")
+        self.assertFalse(self.bc._sleep_mode[0])          # it still wakes
+        note.assert_not_called()
+        self.bc._sleep_mode[0] = True
+        self.bc._last_inject_source[0] = ""
+        self.bc._handle_sleep_standby("JARVIS")
+        note.assert_called_once_with()
+
+    def test_a_test_inject_never_feeds_the_ambient_learner(self):
+        self.bc._ambient_learning[0] = True
+        feed = self._p(self.bc, "_ambient_learning_feed")
+        self.bc._last_inject_source[0] = "test"
+        self.bc._handle_sleep_standby("the meeting is at three tomorrow")
+        feed.assert_not_called()
+        self.assertTrue(self.bc._sleep_mode[0])
+
     def test_injected_non_wake_is_ignored(self):
         # No wake phrase, ambient learning off -> line is simply ignored.
         self._p(self.bc, "_ambient_learning_feed")

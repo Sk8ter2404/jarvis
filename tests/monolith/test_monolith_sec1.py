@@ -3088,6 +3088,23 @@ class MemoryWipeLiveStateTests(_MonolithTestBase):
         self.assertFalse(bc._prompt_rebuild_pending[0])
         reprime.assert_called_once_with()
 
+    def test_an_unreadable_store_keeps_the_current_prompt(self):
+        # 2026-10-01 (adversarial review of B024): while bobert_memory.json
+        # was unreadable every rebuild (post-turn Timer, learn batch, and the
+        # wipe's _rebuild_prompt_now) rendered the empty stand-in, dropping
+        # every fact from the live prompt until a person fixed the file.
+        bc = self.bc
+        bc._system_prompt = "PROMPT WITH THE FACTS"
+        marked = bc._empty_memory()
+        marked[bc._legacy_memory._LOAD_FAILED_KEY] = True
+        with mock.patch.object(bc, "load_memory", return_value=marked), \
+             mock.patch.object(bc, "build_system_prompt",
+                               return_value="PROMPT WITHOUT THE FACTS"), \
+             mock.patch("builtins.print"):
+            self.assertFalse(bc._apply_prompt_rebuild())
+            self.assertFalse(bc._rebuild_prompt_now())
+        self.assertEqual(bc._system_prompt, "PROMPT WITH THE FACTS")
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  _cleanup_old_logs — inner unlink + outer listdir error arms
