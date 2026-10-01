@@ -581,7 +581,6 @@ class TestScanCrashTracesSince(_Base):
         """Real faulthandler.dump_traceback(all_threads=True) text, taken
         with `extra_threads` parked threads alive, from inside `func`
         compiled as if it lived at `path` (so it is the faulting frame)."""
-        import faulthandler
         import threading
         release = threading.Event()
         parked = threading.Barrier(extra_threads + 1)

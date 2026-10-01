@@ -1197,6 +1197,8 @@ class CloseBrowserTabTests(_BaseActTest):
         out = A._act_close_window("Google Chrome")
         self.assertTrue(w.closed)
         self.bc.ui_hotkey.assert_not_called()
+        self.assertIn("closed: Lo-fi beats - YouTube - Google Chrome", out)
+        self.assertNotIn("didn't close", out)
 
     def test_non_browser_windows_still_close(self):
         note = _FakeWindow(title="youtube notes.txt - Notepad")
