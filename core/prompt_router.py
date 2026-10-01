@@ -126,6 +126,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "webcam", "webcams", "cameras working", "camera working",
         "cameras ok", "webcams ok", "cameras still", "webcams still",
         "camera health", "cameras up",
+        # 2026-10-01: camera_unquarantine ("use the Kinect again", "use the left
+        # webcam again") is documented here, but "kinect" alone routed only to
+        # KINECT DEPTH SENSOR, whose kinect_status the model then ran instead.
+        "kinect again", "webcam again", "camera again", "cameras again",
+        "retry the kinect", "retry the camera",
     ],
     "FACE RECOGNITION": [
         "who am i", "recognize", "who is at", "who's at", "face",
