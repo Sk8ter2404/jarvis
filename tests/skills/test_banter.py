@@ -267,17 +267,34 @@ class BanterRepeatQuestionTests(_BanterTestBase):
         self.assertIsNone(self.mod._detect_repeat_question(entries))
 
     def test_picks_most_repeated_bucket(self):
-        # Two distinct repeated utterances; the more frequent one wins.
+        # Two distinct repeated questions; the more frequent one wins.
         entries = [
-            _entry("please open the garage door", 50),
-            _entry("please open the garage door", 40),
-            _entry("please open the garage door", 30),
+            _entry("is the garage door open", 50),
+            _entry("is the garage door open", 40),
+            _entry("is the garage door open", 30),
             _entry("what is the weather today", 20),
             _entry("what is the weather today", 10),
         ]
         tell = self.mod._detect_repeat_question(entries)
         self.assertEqual(tell["n"], 3)
-        self.assertEqual(tell["text"], "please open the garage door")
+        self.assertEqual(tell["text"], "is the garage door open")
+
+    def test_a_repeated_request_is_not_a_repeated_question(self):
+        # Live 2026-10-01: "Jarvis, talk to <the robot>" twice (the owner
+        # wanted a second banter) drew "Asking again won't alter the result".
+        for text in ("Jarvis, talk to the robot vacuum", "play the next song",
+                     "please open the garage door"):
+            with self.subTest(text=text):
+                entries = [_entry(text, 60), _entry(text, 30)]
+                self.assertIsNone(self.mod._detect_repeat_question(entries))
+
+    def test_questions_count_with_or_without_a_question_mark(self):
+        for text in ("Jarvis, what time is it in London",
+                     "remind me what's on tomorrow?",
+                     "how long until the print finishes"):
+            with self.subTest(text=text):
+                entries = [_entry(text, 60), _entry(text, 30)]
+                self.assertIsNotNone(self.mod._detect_repeat_question(entries))
 
 
 # ─── repeat_open detector ──────────────────────────────────────────────────

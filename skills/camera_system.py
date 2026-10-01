@@ -47,6 +47,7 @@ Design notes
   Kinect is dark — it never pretends.
 """
 
+import re
 import sys
 import time
 
@@ -906,6 +907,43 @@ def _cfg_flag_cloud_backend() -> bool:
         return True
 
 
+# ─── "use the Kinect again" route ───────────────────────────────────────
+# The camera gate's own message tells the owner to say "use the Kinect again"
+# to retry a held camera. Left to the LLM, that ran kinect_status instead
+# (live 2026-10-01 13:41), so a route claims the exact request before the LLM
+# (bobert_companion's utterance routes). "again" is required for the plain
+# verbs, so "use the Kinect to look around" is never claimed.
+_RETRY_TARGETS = (
+    (re.compile(r"^kinect$"), "kinect"),
+    (re.compile(r"^left (?:web)?cam(?:era)?$"), "left"),
+    (re.compile(r"^right (?:web)?cam(?:era)?$"), "right"),
+    (re.compile(r"^(?:all (?:the )?)?(?:web)?cam(?:era)?s$"), ""),
+)
+_RETRY_RE = re.compile(
+    r"^(?:(?:hey |ok |okay )?jarvis,? )?(?:please )?"
+    r"(?:(?P<plain>use|try|turn on|start using) (?:the )?(?P<a>[a-z ]+?) again"
+    r"|(?:re-?try|re-?enable|bring back|put back) (?:the )?(?P<b>[a-z ]+?)(?: again)?)"
+    r"(?: now)?(?: please)?$")
+
+
+def _camera_retry_route(text):
+    """Utterance route: "[ACTION: camera_unquarantine, <cam>]" for a clear
+    request to retry a held camera, else None. Never raises."""
+    try:
+        s = " ".join(re.sub(r"[^a-z0-9' ]+", " ", str(text or "").lower()).split())
+        m = _RETRY_RE.match(s)
+        if not m:
+            return None
+        target = (m.group("a") or m.group("b") or "").strip()
+        for rx, arg in _RETRY_TARGETS:
+            if rx.match(target):
+                return ("[ACTION: camera_unquarantine, %s]" % arg if arg
+                        else "[ACTION: camera_unquarantine]")
+        return None
+    except Exception:
+        return None
+
+
 # ─── registration ────────────────────────────────────────────────────────
 
 def register(actions):
@@ -914,6 +952,13 @@ def register(actions):
     actions["where_am_i"]             = where_am_i
     actions["look_around"]            = look_around
     actions["camera_unquarantine"]    = camera_unquarantine
+    try:
+        su = globals().get("skill_utils") or {}
+        reg = su.get("register_utterance_route") if isinstance(su, dict) else None
+        if callable(reg):
+            reg(_camera_retry_route, "camera retry")
+    except Exception:
+        pass
     print("  [camera-system] unified multi-camera actions registered "
           "(camera_status, situational_awareness/where_am_i, look_around, "
           "camera_unquarantine)")

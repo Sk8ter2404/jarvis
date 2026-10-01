@@ -16277,6 +16277,14 @@ def _get_mic_buffer_impl(seconds: float,
                     # don't sit as a second open stream on the same device. The
                     # finally below closes our stream and clears _pathb_mic_active.
                     break
+                if _dialogue_active[0]:
+                    # A device dialogue started mid-capture (2026-10-01): its
+                    # lines wait only ~1 s for the mic (_speak_line), so a
+                    # standby-loop buffer that began just before it held the
+                    # mic for up to 3 s and failed the banter's FIRST line --
+                    # "0 lines, error". The dialogue's own stop-listen never
+                    # comes through here (it opens its own stream), so yield.
+                    break
                 try:
                     frame = q_local.get(timeout=0.2)
                 except queue.Empty:

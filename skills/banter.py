@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import tempfile
 import threading
@@ -322,8 +323,25 @@ def _normalize_text(s: str) -> str:
 
 # ─── tell detection ──────────────────────────────────────────────────────
 
+_QUESTION_LEAD_RE = re.compile(
+    r"^(?:(?:hey |ok |okay )?jarvis,? )?"
+    r"(?:what|whats|what's|when|where|who|whos|who's|why|how|hows|how's|which|"
+    r"is|are|was|were|do|does|did|can|could|will|would|should|have|has)\b")
+
+
+def _looks_like_question(text: str) -> bool:
+    """A question, not a request: a repeated "talk to the robot" / "play it
+    again" asks for the action AGAIN (and gets a new result), so "asking again
+    won't alter the result" was wrong there (live 2026-10-01)."""
+    raw = (text or "").strip()
+    if raw.endswith("?"):
+        return True
+    return bool(_QUESTION_LEAD_RE.match(raw.lower()))
+
+
 def _detect_repeat_question(entries: list[dict]) -> dict | None:
-    """Same canonical utterance ≥ 2× within the last 10 min."""
+    """Same canonical QUESTION ≥ 2× within the last 10 min (a repeated
+    request is not a repeated question)."""
     now = time.time()
     cutoff = now - REPEAT_QUESTION_WINDOW
     recent = [e for e in entries
@@ -336,7 +354,7 @@ def _detect_repeat_question(entries: list[dict]) -> dict | None:
     buckets: dict[str, list[float]] = defaultdict(list)
     for e in recent:
         norm = _normalize_text(e.get("text", ""))
-        if len(norm.split()) < 3:
+        if len(norm.split()) < 3 or not _looks_like_question(e.get("text", "")):
             continue
         buckets[norm].append(float(e["ts"]))
     best_norm = ""

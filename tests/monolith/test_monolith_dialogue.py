@@ -1428,5 +1428,58 @@ class SkillUtilsKeysTests(_Base):
         self.assertEqual(caught, ["tts_muted", "disabled"])
 
 
+# ── a background mic buffer yields to a starting dialogue ────────────────
+@requires_monolith
+class BackgroundBufferYieldsTests(_Base):
+    """Live 2026-10-01 13:48: "Jarvis, talk to <the robot>" ended "0 lines,
+    error" with "[dialogue] mic capture still live; line not spoken". The
+    standby lyric loop's 3 s get_mic_buffer (Path B) had started just before
+    the dialogue; _speak_line waits only ~1 s for the mic, so the FIRST line
+    failed and the banter with it. Path B now yields once a dialogue is active,
+    as it already yields to record_speech."""
+
+    def _capture(self, flip_dialogue):
+        import numpy as np
+        bc = self.bc
+        self._p(bc, "_record_speech_active", [False])
+        self._p(bc, "_pathb_mic_active", [False])
+        if hasattr(self, "_hide_wake_listener"):
+            self._hide_wake_listener()
+        dlg = bc._dialogue_active
+        frame = np.ones((1024, 1), dtype=np.float32) * 0.2
+
+        class _Stream:
+            def __init__(s, *a, **k):
+                s.cb = k["callback"]
+
+            def start(s):
+                s.cb(frame, 1024, None, None)
+                if flip_dialogue:
+                    dlg[0] = True            # the banter starts mid-capture
+                s.cb(frame, 1024, None, None)
+
+        self._p(bc.sd, "InputStream", side_effect=_Stream)
+        self._p(bc, "get_input_device", return_value=3)
+        owned_at_close = []
+        self._p(bc, "_safe_close_stream",
+                side_effect=lambda st, *a, **k: owned_at_close.append(
+                    bc._pathb_mic_active[0]))
+        t0 = time.monotonic()
+        out = bc.get_mic_buffer(0.25, sample_rate=16000)
+        return out, time.monotonic() - t0, owned_at_close
+
+    def test_the_buffer_lets_go_when_a_dialogue_starts(self):
+        out, took, owned_at_close = self._capture(flip_dialogue=True)
+        self.assertIsNone(out)                     # yielded before collecting
+        self.assertLess(took, 1.0)                 # well inside _speak_line's 1 s
+        self.assertEqual(owned_at_close, [True])   # closed, THEN released
+        self.assertFalse(self.bc._pathb_mic_active[0])
+
+    def test_without_a_dialogue_the_buffer_is_unchanged(self):
+        out, _took, _owned = self._capture(flip_dialogue=False)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.size, 2048)
+
+
 if __name__ == "__main__":
     unittest.main()

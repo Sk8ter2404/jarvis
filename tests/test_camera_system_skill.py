@@ -572,5 +572,48 @@ class NoLeakTests(CameraSystemBase):
         self.assertEqual(bc._camera_last_read_error, before_errors)
 
 
+class CameraRetryRouteTests(unittest.TestCase):
+    """"use the Kinect again" (2026-10-01): the camera gate's own message tells
+    the owner to say it; left to the LLM it ran kinect_status instead of the
+    retry. A route now claims the exact request before the LLM."""
+
+    def setUp(self):
+        self.registered = []
+        utils = make_fake_skill_utils()
+        utils["register_utterance_route"] = (
+            lambda fn, name="": self.registered.append((name, fn)) or True)
+        self.mod, _ = load_skill_isolated("camera_system", utils=utils)
+
+    def route(self, text):
+        return self.mod._camera_retry_route(text)
+
+    def test_register_installs_the_route(self):
+        self.assertEqual([n for n, _f in self.registered], ["camera retry"])
+
+    def test_the_live_failure_use_the_kinect_again_retries_it(self):
+        for text in ("use the Kinect again", "Jarvis, use the Kinect again.",
+                     "try the kinect again", "retry the Kinect",
+                     "bring back the Kinect", "please use the Kinect again now"):
+            with self.subTest(text=text):
+                self.assertEqual(self.route(text),
+                                 "[ACTION: camera_unquarantine, kinect]")
+
+    def test_webcams_by_side_and_all(self):
+        self.assertEqual(self.route("use the left webcam again"),
+                         "[ACTION: camera_unquarantine, left]")
+        self.assertEqual(self.route("try the right camera again"),
+                         "[ACTION: camera_unquarantine, right]")
+        self.assertEqual(self.route("use the cameras again"),
+                         "[ACTION: camera_unquarantine]")
+
+    def test_other_kinect_requests_go_to_the_llm(self):
+        for text in ("kinect status", "is the kinect working",
+                     "use the Kinect to look around", "use the kinect",
+                     "try the kinect again later tonight", "use the oven again",
+                     "", None):
+            with self.subTest(text=text):
+                self.assertIsNone(self.route(text))
+
+
 if __name__ == "__main__":
     unittest.main()

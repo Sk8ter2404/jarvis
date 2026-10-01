@@ -103,6 +103,14 @@ def tail_for_response(text: str, timeout_s: float = 30.0) -> None:
 
 
 def main() -> int:
+    # A cp1252 console (Windows, piped output) cannot print the log's dashes
+    # and emoji: the command was queued, then the print raised and the tool
+    # exited 1 (2026-10-01). Replace what the console cannot show instead.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(
         description="Inject a voice-equivalent command into a running JARVIS."
     )
@@ -117,7 +125,7 @@ def main() -> int:
         print("[say_to_jarvis] refused: empty text", file=sys.stderr)
         return 2
     enqueue(text)
-    print(f"[say_to_jarvis] queued: {text!r} → {QUEUE_PATH}")
+    print(f"[say_to_jarvis] queued: {text!r} -> {QUEUE_PATH}")
     if args.wait:
         tail_for_response(text)
     return 0
