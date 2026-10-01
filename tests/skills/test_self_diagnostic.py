@@ -2736,7 +2736,18 @@ class DiskProbeTests(_ProbeTestBase):
         with mock.patch("shutil.disk_usage", return_value=usage):
             r = self.mod._probe_disk()
         self.assertFalse(r["ok"])
-        self.assertIn("GB free", r["error"])
+        self.assertIn("free-space floor", r["error"])
+        self.assertEqual(r["details"]["free_gb"], 0.1)
+
+    def test_low_free_error_text_is_stable_across_sweeps(self):
+        # 2026-10-01 regression: _announce_failures dedups on the error
+        # string, so a live GB figure in it re-spoke every 5-min sweep.
+        errs = []
+        for free in (800 * 1024**2, 700 * 1024**2):
+            usage = (500 * 1024**3, 500 * 1024**3 - free, free)
+            with mock.patch("shutil.disk_usage", return_value=usage):
+                errs.append(self.mod._probe_disk()["error"])
+        self.assertEqual(errs[0], errs[1])
 
     def test_disk_usage_raises(self):
         with mock.patch("shutil.disk_usage", side_effect=OSError("no path")):
@@ -2774,7 +2785,25 @@ class RamProbeTests(_ProbeTestBase):
         with inject_modules(psutil=self._psutil(percent=95.0)):
             r = self.mod._probe_ram()
         self.assertFalse(r["ok"])
-        self.assertIn("95%", r["error"])
+        self.assertIn("ceiling", r["error"])
+        self.assertEqual(r["details"]["percent"], 95.0)
+
+    def test_ram_error_text_is_stable_across_sweeps(self):
+        # 2026-10-01 regression: "RAM at 93%" -> "RAM at 94%" was a new
+        # signature every sweep, so it was re-announced every 5 minutes.
+        errs = []
+        for pct in (93.0, 94.0):
+            with inject_modules(psutil=self._psutil(percent=pct)):
+                errs.append(self.mod._probe_ram()["error"])
+        self.assertEqual(errs[0], errs[1])
+        self.assertNotIn("93", errs[0])
+
+    def test_ram_is_not_a_spoken_high_severity_subsystem(self):
+        # 2026-10-01: system_monitor + system_pulse already speak about high
+        # RAM; the self-diagnostic made a third voice. MED = recorded and
+        # queued, never spoken by _announce_failures.
+        self.assertEqual(self.mod.SUBSYSTEM_SEVERITY["ram"],
+                         self.mod.SEVERITY_MED)
 
     def test_virtual_memory_raises(self):
         with inject_modules(psutil=self._psutil(vm_raises=True)):
@@ -3055,6 +3084,54 @@ class AnnouncementTests(_ProbeTestBase):
             self.mod._announce_failures(run)
             self.mod._announce_failures(run)  # same signature → silent 2nd time
         self.assertEqual(ann.call_count, 1)
+
+    def test_announce_failures_rearms_after_recovery(self):
+        # 2026-10-01 regression: _announced_failure_state was never cleared, so
+        # a stable-text failure that recovered and came back stayed silent for
+        # the life of the process. fail -> pass -> fail must speak twice.
+        failing = {"severity_failed": {"disk": self.mod.SEVERITY_HIGH},
+                   "probes": {"disk": {"ok": False, "error": "floor"}}}
+        passing = {"severity_failed": {},
+                   "probes": {"disk": {"ok": True, "error": None}}}
+        with mock.patch.object(self.mod, "_proactive_announce") as ann, \
+             mock.patch.object(self.mod, "_push_phone"):
+            self.mod._announce_failures(failing)
+            self.mod._announce_failures(failing)   # unchanged: silent
+            self.mod._announce_failures(passing)   # recovered: re-armed
+            self.mod._announce_failures(failing)
+        self.assertEqual(ann.call_count, 2)
+
+    def test_announce_failures_keeps_state_when_probe_did_not_pass(self):
+        # A sweep where the component did not run (absent) or could not look
+        # (unverified: ok False, not in severity_failed) is NOT a recovery.
+        failing = {"severity_failed": {"disk": self.mod.SEVERITY_HIGH},
+                   "probes": {"disk": {"ok": False, "error": "floor"}}}
+        unverified = {"severity_failed": {},
+                      "probes": {"disk": {"ok": False, "tested": False,
+                                          "error": "could not look"}}}
+        with mock.patch.object(self.mod, "_proactive_announce") as ann, \
+             mock.patch.object(self.mod, "_push_phone"):
+            self.mod._announce_failures(failing)
+            self.mod._announce_failures({"severity_failed": {}, "probes": {}})
+            self.mod._announce_failures(unverified)
+            self.mod._announce_failures(failing)
+        self.assertEqual(ann.call_count, 1)
+
+    def test_announce_resource_wording_is_not_down_or_queue_a_fix(self):
+        # 2026-10-01: "system memory appears to be down. I'll queue a fix."
+        # was wrong -- memory/disk run high/full, and they are "not a code fix".
+        for comp, want in (("disk", "project drive is nearly full"),
+                           ("ram", "system memory is running high")):
+            self.mod._announced_failure_state.clear()
+            run = {"severity_failed": {comp: self.mod.SEVERITY_HIGH},
+                   "probes": {comp: {"ok": False, "error": "x"}}}
+            with mock.patch.object(self.mod, "_proactive_announce") as ann, \
+                 mock.patch.object(self.mod, "_push_phone"):
+                self.mod._announce_failures(run)
+            msg = ann.call_args[0][0]
+            self.assertIn(want, msg)
+            self.assertNotIn("appears to be down", msg)
+            self.assertNotIn("queue a fix", msg)
 
     def test_announce_failures_marks_recent_problem(self):
         run = {"severity_failed": {"disk": self.mod.SEVERITY_HIGH},

@@ -590,6 +590,40 @@ class KinectServiceLineTests(_StormBase):
                 bc._kinect_preview_color_none_logged()
         self.assertNotIn("color frame was None", buf.getvalue())
 
+    def test_no_color_none_spam_while_the_camera_gate_holds_the_kinect(self):
+        # 2026-10-01 regression: through each dies-on-open hold (30-60 min) the
+        # line printed every 10 s - 365 of them in one session. Drive the REAL
+        # bridge state: no runtime, a gate refusal remembered for a minute.
+        bc = self.bc
+        kb = bc._kinect_bridge
+        buf = io.StringIO()
+        held = (f"{kb._GATE_ERR_PREFIX} (backoff: its last 3 opens each died "
+                f"within 15s); asking again in 60s")
+        with mock.patch.object(kb, "service_down", return_value=False), \
+             mock.patch.object(kb, "_runtime", [None]), \
+             mock.patch.object(kb, "_open_error", [held]), \
+             mock.patch.object(kb, "_gate_hold_until",
+                               [_real_time.monotonic() + 60.0]), \
+             mock.patch.object(bc, "_kinect_preview_color_none_log_last", [0.0]), \
+             contextlib.redirect_stdout(buf):
+            for _ in range(5):
+                bc._kinect_preview_color_none_logged()
+        self.assertNotIn("color frame was None", buf.getvalue())
+
+    def test_an_open_but_stale_runtime_still_logs(self):
+        bc = self.bc
+        kb = bc._kinect_bridge
+        buf = io.StringIO()
+        with mock.patch.object(kb, "service_down", return_value=False), \
+             mock.patch.object(kb, "_runtime", [object()]), \
+             mock.patch.object(kb, "_open_error", [kb._GATE_ERR_PREFIX]), \
+             mock.patch.object(kb, "_gate_hold_until",
+                               [_real_time.monotonic() + 60.0]), \
+             mock.patch.object(bc, "_kinect_preview_color_none_log_last", [0.0]), \
+             contextlib.redirect_stdout(buf):
+            bc._kinect_preview_color_none_logged()
+        self.assertIn("color frame was None", buf.getvalue())
+
     def test_the_line_still_appears_when_the_service_runs(self):
         bc = self.bc
         buf = io.StringIO()

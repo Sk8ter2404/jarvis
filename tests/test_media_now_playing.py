@@ -328,3 +328,87 @@ class TransportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DefaultReaderThreadTests(unittest.TestCase):
+    """2026-10-01 regression: the WinRT read ran on the CALLER's thread. From
+    the main loop (a COM STA) that raised a handled RPC_E_WRONG_THREAD which
+    faulthandler dumped to crash_traces.log on every utterance (368 MB)."""
+
+    def setUp(self):
+        self._save = (m._read_session_async, m._READ_TIMEOUT_S,
+                      list(getattr(m, "_reader_state", [])))
+        if hasattr(m, "_reader_state"):
+            m._reader_state[:] = [None, None, 0.0]
+
+    def tearDown(self):
+        m._read_session_async, m._READ_TIMEOUT_S, state = self._save
+        if hasattr(m, "_reader_state"):
+            m._reader_state[:] = state or [None, None, 0.0]
+
+    def test_read_runs_off_the_calling_thread(self):
+        import threading
+        seen = {}
+
+        async def _fake():
+            seen["thread"] = threading.current_thread()
+            return {"title": "T", "playing": True}
+
+        m._read_session_async = _fake
+        self.assertEqual(m._default_reader(), {"title": "T", "playing": True})
+        self.assertIsNot(seen["thread"], threading.current_thread())
+
+    def test_read_error_returns_none(self):
+        async def _boom():
+            raise OSError("winrt gone")
+
+        m._read_session_async = _boom
+        self.assertIsNone(m._default_reader())
+
+    def test_hung_read_times_out_and_is_not_stacked(self):
+        import threading
+        release = threading.Event()
+        calls = {"n": 0}
+
+        async def _hang():
+            calls["n"] += 1
+            release.wait(5.0)   # blocks the worker's loop, not the caller
+            return {"title": "late"}
+
+        m._read_session_async = _hang
+        m._READ_TIMEOUT_S = 0.05
+        try:
+            self.assertIsNone(m._default_reader())   # timed out: fail-open
+            self.assertIsNone(m._default_reader())   # still in flight: no 2nd
+            self.assertEqual(calls["n"], 1)
+        finally:
+            release.set()
+            t = getattr(m, "_reader_state", [None])[0]
+            if t is not None:
+                t.join(2.0)
+
+    def test_concurrent_callers_share_one_read(self):
+        import threading
+        release = threading.Event()
+        calls = {"n": 0}
+
+        async def _slow():
+            calls["n"] += 1
+            release.wait(2.0)
+            return {"title": "shared"}
+
+        m._read_session_async = _slow
+        m._READ_TIMEOUT_S = 3.0
+        got = []
+        other = threading.Thread(target=lambda: got.append(m._default_reader()))
+        other.start()
+        for _ in range(200):          # until the first read is in flight
+            if calls["n"]:
+                break
+            threading.Event().wait(0.01)
+        threading.Timer(0.1, release.set).start()
+        mine = m._default_reader()
+        other.join(3.0)
+        self.assertEqual(calls["n"], 1, "a second read was stacked")
+        self.assertEqual(mine, {"title": "shared"})
+        self.assertEqual(got, [{"title": "shared"}])

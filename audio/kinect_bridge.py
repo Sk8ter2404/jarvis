@@ -248,6 +248,20 @@ def service_down() -> bool:
     return bool(_service_down[0])
 
 
+def gate_held() -> bool:
+    """True while the camera gate's refusal of a Kinect open still stands and
+    no runtime is open - the OTHER "deliberately closed" state, next to
+    service_down() (2026-10-01: the preview logged "color frame was None"
+    every 10 s through each 30-60 min dies-on-open hold, 365 lines in one
+    session; the [camera-gate] lines already say why). An open runtime that
+    has gone stale is NOT held: its missing frames are real signal. NEVER
+    raises."""
+    try:
+        return _runtime[0] is None and _gate_held_error() is not None
+    except Exception:
+        return False
+
+
 def _service_blocks_open() -> Optional[str]:
     """The error to return instead of opening, or None to go ahead. Logs the
     stopped state ONCE, and its end once. NEVER raises."""

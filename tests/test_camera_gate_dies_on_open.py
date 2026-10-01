@@ -24,6 +24,9 @@ proven against the old code.
 from __future__ import annotations
 
 import inspect
+import json
+import os
+import tempfile
 import unittest
 
 from core import camera_gate as cg
@@ -456,32 +459,27 @@ class OwnerLiftTests(unittest.TestCase):
 class RememberedAcrossRestartsTests(unittest.TestCase):
     """B083 (2026-10-01): the verdict lived in memory, so every restart cost 3
     more USB drops of the Kinect and its mic array in ~45 s, and the same
-    spoken warning - on every one of 14 restarts in a day. Each "process"
-    here is a fresh gate on the same temp file."""
+    spoken warning - on every one of 14 restarts in a day. Merged with
+    live-logs B056, whose doo_state_path is the ONE persistence (see
+    RestartTests): a restart inside the hold reopens nothing, after it ONE
+    drop re-arms the retry. Each "process" is a fresh gate on the same file;
+    the owner's lift forgets the saved run (B083's lift keeps it one death
+    short in memory)."""
 
     def setUp(self):
-        import os
         import shutil
-        import tempfile
         self.dir = tempfile.mkdtemp(prefix="jarvis_doo_persist_")
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.path = os.path.join(self.dir, "camera_gate_doo.json")
+        self.clk = _Clock(1000.0)
 
     def _process(self):
-        """A new JARVIS process: a fresh gate that remembers through the file
-        (getattr: the old gate has no persistence and must FAIL below, not
-        raise)."""
-        clk = _Clock()
-        g, logs, spoken = _gate(clk)
-        fn = getattr(g, "enable_persistence", None)
-        if callable(fn):
-            fn(self.path)
-        return g, _Bridge(g, clk), logs, spoken
+        g, logs, spoken = _gate(self.clk, doo_state_path=self.path)
+        return g, _Bridge(g, self.clk), logs, spoken
 
-    def _read(self):
-        import json
+    def _saved(self):
         with open(self.path, encoding="utf-8") as fh:
-            return json.load(fh)
+            return json.load(fh)["devices"]
 
     def test_a_restart_needs_one_drop_not_three(self):
         g, b, _l, spoken = self._process()
@@ -489,53 +487,24 @@ class RememberedAcrossRestartsTests(unittest.TestCase):
             self.assertTrue(b.dies_on_open())
         self.assertTrue(_slow(g, KINECT))
         self.assertEqual(spoken, [_SAID])
-        # Restart. The sensor still opens at boot (it may have been fixed)...
         g2, b2, _l2, spoken2 = self._process()
-        self.assertTrue(g2.begin(KINECT, BRIDGE).allowed,
-                        "a remembered verdict must not block the boot open")
-        g2.cancel(KINECT, BRIDGE)
-        # ...but ONE drop puts a still-broken one straight back on the retry.
-        self.assertTrue(b2.dies_on_open())
-        self.assertTrue(_slow(g2, KINECT),
-                        "the restart relearned the verdict from scratch")
-        self.assertEqual(spoken2, [], "the same warning again, same day")
+        self.assertEqual(g2.begin(KINECT, BRIDGE).reason, "backoff",
+                         "a restart inside the hold reopened the sensor")
+        self.assertTrue(b2.dies_on_open())     # waits out the hold, then dies
+        self.assertEqual(len(b2.opens), 1, "the restart relearned the verdict")
+        self.assertTrue(_slow(g2, KINECT))
+        self.assertEqual(spoken2, [], "the same warning again")
 
-    def test_a_repaired_sensor_is_forgotten_once_it_streams(self):
+    def test_a_lift_forgets_it_and_one_more_death_re_arms_it(self):
         g, b, _l, _s = self._process()
         for _ in range(COUNT):
             b.dies_on_open()
-        self.assertIn(KINECT, self._read())
-        g2, b2, _l2, _s2 = self._process()
-        self.assertTrue(b2.open_when_allowed())
-        b2.clk.advance(WINDOW + 5.0)
-        g2.note_frame(KINECT)                  # streamed past the window
-        self.assertNotIn(KINECT, self._read())
-
-    def test_a_lift_forgets_it(self):
-        g, b, _l, _s = self._process()
-        for _ in range(COUNT):
-            b.dies_on_open()
-        g.lift_quarantine(KINECT)
-        self.assertNotIn(KINECT, self._read())
-
-    def test_a_day_old_verdict_is_not_seeded(self):
-        import json
-        import time as _t
-        with open(self.path, "w", encoding="utf-8") as fh:
-            json.dump({KINECT: {"retry_s": RETRY, "said_date": "",
-                                "armed_wall": _t.time() - 2 * 86400.0}}, fh)
-        g, b, _l, _s = self._process()
+        self.assertIn(KINECT, self._saved())
+        self.assertTrue(g.lift_quarantine(KINECT))
+        self.assertNotIn(KINECT, self._saved())
         self.assertTrue(b.dies_on_open())
-        self.assertFalse(_slow(g, KINECT), "a stale verdict was seeded")
-
-    def test_no_persistence_without_a_path(self):
-        clk = _Clock()
-        g, _l, _s = _gate(clk)
-        b = _Bridge(g, clk)
-        for _ in range(COUNT):
-            b.dies_on_open()
-        import os
-        self.assertFalse(os.path.exists(self.path))
+        self.assertTrue(_slow(g, KINECT))
+        self.assertIn(KINECT, self._saved())
 
 
 class KnobTests(unittest.TestCase):
@@ -587,6 +556,99 @@ class KnobTests(unittest.TestCase):
         g.reset()
         self.assertFalse(_slow(g, KINECT))
         self.assertTrue(g.begin(KINECT, BRIDGE).allowed)
+
+
+class RestartTests(unittest.TestCase):
+    """2026-10-01: the run survives a restart (doo_state_path). Live: every
+    one of the 14 restarts on 2026-09-30 reopened the Kinect three more times
+    (three USB re-enumerations, an audio device-list change) and SPOKE the
+    three-sentence warning again - 09:50, 10:13, 10:47, 11:00, ... 15:46."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "camera_gate_doo.json")
+        self.clk = _Clock(1000.0)
+
+    def _new_process(self, **kw):
+        g, logs, spoken = _gate(self.clk, doo_state_path=self.path, **kw)
+        return g, logs, spoken, _Bridge(g, self.clk)
+
+    def _trip(self):
+        g, _logs, spoken, b = self._new_process()
+        for _ in range(COUNT):
+            self.assertTrue(b.dies_on_open())
+        self.assertTrue(_slow(g, KINECT))
+        self.assertEqual(spoken, [_SAID])
+        return g
+
+    def test_a_restart_inside_the_hold_does_not_reopen_it(self):
+        self._trip()
+        self.clk.advance(20 * 60)                  # a deploy 20 min later
+        g, logs, spoken, b = self._new_process()
+        self.assertFalse(b.open_when_allowed(until=self.clk.t + 5 * 60),
+                         "the restart reopened a sensor still on its hold")
+        self.assertEqual(b.opens, [])
+        self.assertEqual(g.begin(KINECT, BRIDGE).reason, "backoff")
+        self.assertTrue(_slow(g, KINECT))
+        self.assertTrue(any("restored" in ln for ln in logs), logs)
+        self.assertEqual(spoken, [])
+
+    def test_after_the_hold_one_more_death_re_arms_it_and_is_not_said(self):
+        self._trip()
+        self.clk.advance(20 * 60)
+        g, _logs, spoken, b = self._new_process()
+        self.assertTrue(b.dies_on_open())          # waits out the hold first
+        self.assertEqual(len(b.opens), 1, "one open, not a fresh run of three")
+        self.assertTrue(_slow(g, KINECT))
+        self.assertAlmostEqual(g.retry_in(KINECT, BRIDGE)[0], RETRY_MAX,
+                               delta=1.0)
+        self.assertEqual(spoken, [], "said again after a restart")
+
+    def test_the_warning_may_be_said_again_after_twelve_hours(self):
+        self._trip()
+        self.clk.advance(13 * 3600)
+        g, _logs, spoken, b = self._new_process()
+        self.assertTrue(b.dies_on_open())
+        self.assertTrue(_slow(g, KINECT))
+        self.assertEqual(len(spoken), 1)
+
+    def test_a_normal_stream_clears_the_saved_run(self):
+        self._trip()
+        self.clk.advance(2 * 3600)
+        g, _logs, _spoken, b = self._new_process()
+        self.assertTrue(b.open_when_allowed())
+        b.stream(60.0)
+        self.assertFalse(_slow(g, KINECT))
+        g2, _l, _s, _b = self._new_process()
+        self.assertFalse(_slow(g2, KINECT))
+        self.assertTrue(g2.begin(KINECT, BRIDGE).allowed)
+
+    def test_the_owners_lift_clears_the_saved_run(self):
+        g = self._trip()
+        self.assertTrue(g.lift_quarantine(KINECT))
+        g2, _l, _s, _b = self._new_process()
+        self.assertFalse(_slow(g2, KINECT))
+        self.assertTrue(g2.begin(KINECT, BRIDGE).allowed)
+
+    def test_a_saved_hold_is_capped_against_a_clock_jump(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "devices": {KINECT: {
+                "count": COUNT, "retry_s": RETRY,
+                "until": self.clk.t + 10 * 86400, "said_at": 0.0}}}, f)
+        g, _l, _s, _b = self._new_process()
+        self.assertTrue(_slow(g, KINECT))
+        self.assertLessEqual(g.retry_in(KINECT, BRIDGE)[0], RETRY_MAX + 1.0)
+
+    def test_no_path_writes_nothing_and_a_garbage_file_is_ignored(self):
+        g, _l, _s = _gate(self.clk)
+        b = _Bridge(g, self.clk)
+        for _ in range(COUNT):
+            self.assertTrue(b.dies_on_open())
+        self.assertEqual(os.listdir(self.tmp), [])
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("not json")
+        g2, _l2, _s2, _b2 = self._new_process()
+        self.assertTrue(g2.begin(KINECT, BRIDGE).allowed)
 
 
 class StormSemanticsTests(unittest.TestCase):

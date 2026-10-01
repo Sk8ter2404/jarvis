@@ -288,15 +288,28 @@ def _user_at_desk() -> bool | None:
 
 
 def _last_speech_age_seconds() -> float | None:
-    """Seconds since the user last spoke, per bobert_companion.last_speech_time.
-    Returns None if the value isn't available."""
+    """Seconds since the owner's last ACCEPTED turn (voice or typed), per
+    bobert_companion._last_owner_turn_at (a one-cell list, time.monotonic()).
+    None = no owner turn yet this process / not available.
+
+    2026-10-01: NOT last_speech_time. _speak() stamps that on every line
+    JARVIS says - including this engine's own late-hour nudge - so with a
+    20 min cooldown and a 30 min window each nudge re-qualified the next:
+    17 "we've been at this a while" lines between 23:02 and 06:12 on
+    2026-09-29 while the owner said nothing. The proactive presence gate
+    (should_be_proactive) already moved to this stamp; this was the copy
+    left behind. A restart resets it to 0, which keeps both late-night gates
+    closed until he actually speaks - the conservative side."""
     bc = sys.modules.get("bobert_companion")
     if bc is None:
         return None
-    ts = getattr(bc, "last_speech_time", None)
-    if not isinstance(ts, (int, float)):
+    cell = getattr(bc, "_last_owner_turn_at", None)
+    if not (isinstance(cell, list) and cell):
         return None
-    return max(0.0, time.time() - float(ts))
+    at = cell[0]
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or at <= 0.0:
+        return None
+    return max(0.0, time.monotonic() - float(at))
 
 
 # ─── dwell tracking ──────────────────────────────────────────────────────

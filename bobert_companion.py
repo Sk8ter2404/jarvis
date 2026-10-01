@@ -822,12 +822,32 @@ def camera_gate_lift(which: str = "") -> list:
         return []
 
 
-def _make_camera_gate(clock=None):
+def _camera_gate_doo_state_path():
+    """Where the gate keeps its dies-on-open runs across restarts
+    (2026-10-01: every restart reopened a dying Kinect three more times and
+    re-spoke the warning). Staging-aware via core.paths; None under a test
+    run, so no test's gate reads or writes a state file it did not ask for.
+    JARVIS_TEST_MODE alone is not enough: a light-tier test can import the
+    real monolith without the monolith harness's env (found 2026-10-01), so
+    an armed tests/live_data_guard (installed by tests/__init__.py for every
+    run) counts too. NEVER raises."""
+    if (os.environ.get("JARVIS_TEST_MODE", "").strip() == "1"
+            or "tests.live_data_guard" in sys.modules):
+        return None
+    try:
+        from core.paths import data_file as _data_file
+        return _data_file("camera_gate_doo.json")
+    except Exception:
+        return None
+
+
+def _make_camera_gate(clock=None, doo_state_path=None):
     """The production gate, from the owner knobs. None only if
     core/camera_gate.py cannot import, in which case every opener behaves
     exactly as it did before the gate existed. ``clock`` exists for tests that
-    freeze time; production uses the gate's default (time.time). NEVER
-    raises."""
+    freeze time; production uses the gate's default (time.time).
+    ``doo_state_path`` (production: _camera_gate_doo_state_path()) makes the
+    dies-on-open runs survive a restart. NEVER raises."""
     if _camera_gate_mod is None:
         return None
     try:
@@ -846,31 +866,14 @@ def _make_camera_gate(clock=None):
             lockers=lambda: _camera_gate_lockers(),
             presence=lambda key: _camera_gate_presence(key),
             labeler=lambda key: _camera_gate_friendly_label(key),
-            clock=clock)
+            clock=clock,
+            doo_state_path=doo_state_path)
     except Exception:       # pragma: no cover - defensive
         logging.exception("[camera-gate] could not build the camera gate")
         return None
 
 
-_camera_gate = _make_camera_gate()
-
-
-def _camera_gate_enable_persistence(gate) -> None:
-    """Remember the dies-on-open verdict across restarts (2026-10-01): every
-    restart relearned it at the cost of 3 USB drops of the Kinect and its mic
-    array in ~45 s, plus the same spoken warning (14 restarts on 2026-09-30).
-    Live process only: a staging / test process must neither read the live
-    verdicts nor leave its own behind for the next run. NEVER raises."""
-    try:
-        from core import paths as _paths
-        if gate is None or _paths.is_staging():
-            return
-        gate.enable_persistence(_paths.data_file("camera_gate_doo.json"))
-    except Exception:       # pragma: no cover - defensive
-        logging.exception("[camera-gate] could not enable verdict persistence")
-
-
-_camera_gate_enable_persistence(_camera_gate)
+_camera_gate = _make_camera_gate(doo_state_path=_camera_gate_doo_state_path())
 try:
     _kinect_bridge.set_open_gate(_camera_gate)
 except Exception:          # pragma: no cover - an older bridge without the hook
@@ -3730,6 +3733,39 @@ def _cleanup_old_logs():
         pass
 
 
+# 2026-10-01: crash_traces.log was append-only forever with no session
+# marker -- it reached 368 MB (8,914 handled-COM-exception dumps from the
+# main-thread SMTC read), the tray's "open crash log" opened all of it, and
+# the 394 real access-violation dumps could not be told apart by session.
+# Archive it at boot once it passes this size (renamed, never deleted).
+CRASH_TRACE_ROTATE_BYTES = 5 * 1024 * 1024
+
+
+def _open_crash_trace_log(path: str):
+    """Open the faulthandler file for this process: archive an oversized
+    previous file to crash_traces.<YYYYmmdd-HHMMSS>.log, then open append-only
+    (unbuffered, a real OS fd faulthandler can write after a native fault)
+    and write one `=== session <time> pid <pid> ===` line so a dump can be
+    tied to the run that wrote it (tools/stability_smoke_test.py scans from
+    its launched pid's marker). Rotation and marker are best-effort."""
+    try:
+        if os.path.getsize(path) > CRASH_TRACE_ROTATE_BYTES:
+            stem, ext = os.path.splitext(path)
+            archived = f"{stem}.{time.strftime('%Y%m%d-%H%M%S')}{ext}"
+            if not os.path.exists(archived):
+                os.replace(path, archived)
+                print(f"  [faulthandler] archived oversized crash log -> {archived}")
+    except Exception:
+        pass   # missing file, or another instance holds it open: keep appending
+    fd = open(path, "ab", buffering=0)
+    try:
+        fd.write((f"\n=== session {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"pid {os.getpid()} ===\n").encode("ascii"))
+    except Exception:
+        pass
+    return fd
+
+
 def setup_logging():
     """Redirect stdout/stderr to a Tee that also writes to a timestamped log
     file. Install a global exception hook so crashes are captured too."""
@@ -3778,7 +3814,7 @@ def setup_logging():
         # SIGSEGV in a C extension can write to it after Python state
         # is unsafe to touch.
         _crash_log_path = os.path.join(LOGS_DIR, "crash_traces.log")
-        _crash_fd = open(_crash_log_path, "ab", buffering=0)
+        _crash_fd = _open_crash_trace_log(_crash_log_path)
         faulthandler.enable(file=_crash_fd, all_threads=True)
         print(f"  [faulthandler] enabled — native crashes -> {_crash_log_path}")
     except Exception as _fh_e:
@@ -8414,9 +8450,18 @@ def _kinect_preview_color_none_logged() -> None:
     try:
         # The bridge has already said, ONCE, that the Kinect runtime service is
         # stopped - every frame is None until someone starts it, so repeating
-        # that here (1,253 lines on 2026-09-29) says nothing new.
+        # that here (1,253 lines on 2026-09-29) says nothing new. 2026-10-01:
+        # the same for the camera gate holding the sensor closed (a 30-60 min
+        # dies-on-open hold logged this every 10 s: 365 lines in one session);
+        # the [camera-gate] lines say why. An open-but-stale runtime still logs.
         try:
             if _kinect_bridge.service_down():
+                return
+        except Exception:
+            pass
+        try:
+            _held = getattr(_kinect_bridge, "gate_held", None)
+            if callable(_held) and _held():
                 return
         except Exception:
             pass
@@ -26307,9 +26352,16 @@ def _last_n_user_commands(n: int = 3) -> list[str]:
     return out
 
 
-def _last_queued_task_line() -> str:
+def _last_queued_task_line(max_age_s: float = WARM_RESTART_WINDOW_SECONDS) -> str:
     """Return the raw line text of the most recently appended USER-facing
     `- [ ]` entry in jarvis_todo.md, or '' if none.
+
+    2026-10-01: only a line whose own `**YYYY-MM-DD[ HH:MM]**` stamp is at
+    most `max_age_s` old counts. The newest user line was a 2026-07-06
+    developer task, and every warm restart on 2026-09-30 (12 of them) greeted
+    the owner with "when we left off you were working on" it, and put that
+    false context into conversation_history. Undated lines (`**P3-5**`,
+    `**doc-1**` backlog items) never count as "what you were working on".
 
     Skips JARVIS's OWN auto-generated maintenance tasks (self-heal, anomaly,
     deep-audit, regression, self-diag, overnight). Those dominate the queue
@@ -26329,9 +26381,24 @@ def _last_queued_task_line() -> str:
     _INTERNAL_TASK = re.compile(
         r'\[\s*(anomaly|regression|self-?heal|self-?diag|deep-?audit|'
         r'overnight|auto|pipeline|diag)\b', re.IGNORECASE)
+    _STAMP = re.compile(r'^- \[ \]\s*\*\*(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}:\d{2}))?')
+    now = time.time()
     for line in reversed(matches):
-        if not _INTERNAL_TASK.search(line):
-            return line
+        if _INTERNAL_TASK.search(line):
+            continue
+        m = _STAMP.match(line)
+        if not m:
+            continue
+        try:
+            ts = time.mktime(time.strptime(f"{m.group(1)} {m.group(2) or '00:00'}",
+                                           "%Y-%m-%d %H:%M"))
+        except Exception:
+            continue
+        if now - ts > max_age_s:
+            # Too old to be "where we left off". Keep scanning rather than
+            # stopping: hand-edited lines can sit below newer ones.
+            continue
+        return line
     return ""
 
 
@@ -26359,12 +26426,19 @@ def _build_session_resume(force: bool = False) -> tuple[str, dict]:
     even days later (the action will then explain the staleness)."""
     last_ts = _last_session_end_ts()
     age = (time.time() - last_ts) if last_ts > 0 else float("inf")
+    # 2026-10-01: a to-do line only names "what you were working on" when it
+    # was queued around the last session. The verbal (force) ask may come days
+    # later, so its window reaches back to the last session plus the usual
+    # warm-restart span.
+    task_window_s = WARM_RESTART_WINDOW_SECONDS
+    if force and age != float("inf"):
+        task_window_s = max(task_window_s, age + WARM_RESTART_WINDOW_SECONDS)
 
     details = {
         "last_session_ts": last_ts,
         "age_seconds":     age,
         "last_commands":   _last_n_user_commands(3),
-        "next_task_line":  _last_queued_task_line(),
+        "next_task_line":  _last_queued_task_line(task_window_s),
         "in_window":       0 < age <= WARM_RESTART_WINDOW_SECONDS,
     }
 
@@ -28575,8 +28649,10 @@ def _audio_music_should_refuse_wake(text: str) -> bool:
 # wake word: the manual wake-word toggle (_require_wake_runtime, for an external
 # TV the OS can't see), the Windows media session (SMTC) reporting PLAYING
 # (covers Chrome/Spotify/Apple Music/YouTube), and the spectral room-music
-# detector. A clear leading "JARVIS …" ALWAYS passes — that's the one-command
-# path. Defaults are behaviour-preserving: toggle off + SMTC absent leaves the
+# detector. The last two are the AUTOMATIC music gates and both obey
+# AMBIENT_MUSIC_REFUSE_WAKE (2026-10-01; SMTC used to ignore it); the manual
+# toggle does not. A clear leading "JARVIS …" ALWAYS passes — that's the
+# one-command path. Defaults are behaviour-preserving: toggle off + SMTC absent leaves the
 # gate identical to the legacy ambient-music check.
 #
 # Live mirror of config.REQUIRE_WAKE_MODE — seeded from the imported constant
@@ -28654,10 +28730,16 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
     is active. Returns ``(refuse, reason)``; reason is "" when not refusing.
 
     A clear leading "JARVIS …" always passes (the one-command path). Otherwise
-    refuse when ANY of: the manual wake-word toggle is on, SMTC reports media
-    playing, or sustained room music is detected (when AMBIENT_MUSIC_REFUSE_WAKE
-    is set). Never raises — on any error it fails OPEN (returns (False, "")) so a
-    gate failure can never silence JARVIS."""
+    refuse when ANY of: the manual wake-word toggle is on, or - only while
+    AMBIENT_MUSIC_REFUSE_WAKE is set - SMTC reports media playing or sustained
+    room music is detected. Never raises — on any error it fails OPEN (returns
+    (False, "")) so a gate failure can never silence JARVIS.
+
+    2026-10-01: the SMTC branch used to run regardless of the flag, so the
+    Settings row "Require 'JARVIS' while music is playing", whose help says to
+    turn it OFF if it keeps cutting you off while your own music is on, did
+    nothing for music played ON the PC (Apple Music / Spotify / Chrome are
+    exactly what SMTC reports) - the most common case."""
     try:
         # Taken by whichever mic turn comes first, wake-prefixed or not.
         _greet_reply = _standby_greet_admit_take()
@@ -28670,10 +28752,12 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
             if _greet_reply:
                 return (False, "standby greeting reply")
             return (True, "wake-word mode")
+        from core.config import AMBIENT_MUSIC_REFUSE_WAKE as _r
+        if not _r:
+            return (False, "")
         if _smtc_media_playing():
             return (True, "media playing")
-        from core.config import AMBIENT_MUSIC_REFUSE_WAKE as _r
-        if _r and _audio_music_should_refuse_wake(text):
+        if _audio_music_should_refuse_wake(text):
             return (True, "room music")
         return (False, "")
     except Exception:
@@ -33952,7 +34036,10 @@ def _overnight_upgrade_thread():  # pragma: no cover - background daemon (while-
     last_cycle_at = 0.0
 
     def _is_idle():
-        # Use last_speech_time — only updated when the user actually speaks.
+        # Use last_speech_time. NOTE (2026-10-01): it is stamped by _speak(),
+        # i.e. on every line JARVIS says, not only after the user speaks - so
+        # proactive speech also counts as activity here (errs toward "not
+        # idle"). _last_owner_turn_at is the owner-only stamp.
         # Do NOT use log file mtime — the overnight engine's own print statements
         # update the log and would falsely mark the user as active mid-cycle.
         return (time.time() - last_speech_time) >= OVERNIGHT_IDLE_MINUTES * 60

@@ -15,6 +15,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import types
 import unittest
 from unittest import mock
 
@@ -433,6 +435,53 @@ class SystemMonitorLoopTests(unittest.TestCase):
             with self.assertRaises(_LoopBreak):
                 self.mod._monitor_loop()
         enq.assert_not_called()
+
+    def _run_one_high_ram_sample(self, pulse_mod):
+        fake = self._make_psutil([10.0, 10.0], [93.0, 93.0])
+        base = 1_700_000_000.0
+        calls = {"n": 0}
+
+        def _sleep(_):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise _LoopBreak
+        mods = {} if pulse_mod is None else {"skill_system_pulse": pulse_mod}
+        with mock.patch.dict(sys.modules, mods), \
+             mock.patch.object(self.mod, "_HAS_PSUTIL", True), \
+             mock.patch.object(self.mod, "psutil", fake), \
+             mock.patch.object(self.mod.time, "time", return_value=base), \
+             mock.patch.object(self.mod.time, "sleep", side_effect=_sleep), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            if pulse_mod is None:
+                sys.modules.pop("skill_system_pulse", None)
+            with self.assertRaises(_LoopBreak):
+                self.mod._monitor_loop()
+        return enq, base
+
+    def test_ram_alert_yields_to_recent_system_pulse_ram_alert(self):
+        # 2026-10-01 regression: the pulse had just spoken about RAM, yet this
+        # monitor spoke too (2026-09-30, three RAM alerts in 3.5 min). A fresh
+        # pulse "ram" stamp now holds the slot.
+        pulse = types.SimpleNamespace(
+            _alert_lock=threading.Lock(),
+            _last_abnormal_alert={"ram": 1_700_000_000.0 - 120.0},
+            PROACTIVE_COOLDOWN_SECONDS=3600)
+        enq, _ = self._run_one_high_ram_sample(pulse)
+        enq.assert_not_called()
+
+    def test_ram_alert_claims_the_shared_pulse_slot(self):
+        # ...and when this monitor speaks first it stamps the pulse's "ram"
+        # key, so the pulse's next 15-min check stays quiet for the hour.
+        pulse = types.SimpleNamespace(
+            _alert_lock=threading.Lock(), _last_abnormal_alert={},
+            PROACTIVE_COOLDOWN_SECONDS=3600)
+        enq, base = self._run_one_high_ram_sample(pulse)
+        enq.assert_called_once()
+        self.assertEqual(pulse._last_abnormal_alert["ram"], base)
+
+    def test_ram_alert_without_pulse_uses_own_cooldown(self):
+        enq, _ = self._run_one_high_ram_sample(None)
+        enq.assert_called_once()
 
     def test_single_low_sample_does_not_evaluate_window(self):
         # First iteration: one sample, window span 0.0 < threshold, RAM low →

@@ -180,9 +180,17 @@ def _latest_session_log() -> str | None:
 
 
 CRASH_TRACES_LOG = os.path.join(LOGS_DIR, "crash_traces.log")
+# 2026-10-01: the file reached 368 MB, and readlines() on all of it was the
+# scan. Only the tail can hold this boot's dumps; read just that.
+_CRASH_SCAN_TAIL_BYTES = 4 * 1024 * 1024
+# A first-chance, HANDLED exception that faulthandler on Windows still dumps:
+# RPC_E_WRONG_THREAD from a WinRT call on the wrong COM apartment. 8,914 of the
+# 9,321 dumps in the live file were this, and the process kept running, so it
+# is never a crash -- reporting it as one failed the gate for nothing.
+_BENIGN_DUMP_HEADERS = ("Windows fatal exception: code 0x8001010e",)
 
 
-def _scan_crash_traces_since(since_epoch: float) -> dict:
+def _scan_crash_traces_since(since_epoch: float, pid: "int | None" = None) -> dict:
     """Scan crash_traces.log for faulthandler dumps written after `since_epoch`.
 
     The session-log scan catches Python-level [FATAL] / Traceback hits, but
@@ -200,6 +208,12 @@ def _scan_crash_traces_since(since_epoch: float) -> dict:
     numpy exception; session log ended at 08:30:21 with no fatal marker, but
     crash_traces.log got the full thread dump 4s later. The scan-session-only
     gate said `ok=True` for that boot even though the process was dead.
+
+    2026-10-01: reads only the last _CRASH_SCAN_TAIL_BYTES; when `pid` is
+    given and its `=== session ... pid <pid> ===` marker (written by
+    bobert_companion._open_crash_trace_log) is in that tail, only dumps after
+    it count; and _BENIGN_DUMP_HEADERS dumps (handled COM exceptions) are
+    skipped.
     """
     result: dict = {
         "path": CRASH_TRACES_LOG,
@@ -217,11 +231,24 @@ def _scan_crash_traces_since(since_epoch: float) -> dict:
     if mtime < since_epoch:
         return result
     try:
-        with open(CRASH_TRACES_LOG, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        with open(CRASH_TRACES_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _CRASH_SCAN_TAIL_BYTES))
+            raw = f.read()
     except OSError as exc:
         result["new_dumps"].append(f"<could not read crash_traces.log: {exc}>")
         return result
+    lines = raw.decode("utf-8", errors="replace").splitlines(keepends=True)
+    if size > _CRASH_SCAN_TAIL_BYTES and lines:
+        lines = lines[1:]   # the cut almost always lands mid-line
+    if pid is not None:
+        marker_tail = f" pid {pid} ==="
+        for i in range(len(lines) - 1, -1, -1):
+            ln = lines[i].rstrip()
+            if ln.startswith("=== session ") and ln.endswith(marker_tail):
+                lines = lines[i + 1:]
+                break
 
     # Faulthandler doesn't timestamp its dumps, so we can't perfectly bound
     # 'since launch' by line. Instead, return the LAST dump as a proxy —
@@ -240,6 +267,9 @@ def _scan_crash_traces_since(since_epoch: float) -> dict:
                 if i > 0 and lines[i - 1].strip():
                     continue
             dump_starts.append(i)
+    # Drop handled-exception dumps (see _BENIGN_DUMP_HEADERS).
+    dump_starts = [i for i in dump_starts
+                   if not lines[i].startswith(_BENIGN_DUMP_HEADERS)]
     if not dump_starts:
         return result
 
@@ -589,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
     # to a dedicated fd that survives the C-level abort and dumps the
     # full thread trace 1-4s later. Skipping this check is how the
     # 08:30 2026-05-30 crash slipped past the gate.
-    crash_dump = _scan_crash_traces_since(launched_at.timestamp() - 10)
+    crash_dump = _scan_crash_traces_since(launched_at.timestamp() - 10, pid=pid)
     checks["crash_traces"] = {
         "path": crash_dump["path"],
         "ok": not crash_dump["new_dumps"],

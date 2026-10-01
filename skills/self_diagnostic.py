@@ -284,7 +284,13 @@ SUBSYSTEM_SEVERITY: dict[str, str] = {
     "skill_imports":    SEVERITY_HIGH,
     "gpu":              SEVERITY_MED,
     "disk":             SEVERITY_HIGH,
-    "ram":              SEVERITY_HIGH,
+    # 2026-10-01: MED, not HIGH. High RAM already has two spoken alerters
+    # (skills/system_monitor.py at 90 %, skills/system_pulse.py at 88 %, which
+    # now share one hourly "ram" cooldown); a HIGH ram probe made a third
+    # voice ("system memory appears to be down. I'll queue a fix.") within
+    # minutes of them on 2026-09-30. MED still records the failure and queues
+    # the repair task -- it just doesn't speak.
+    "ram":              SEVERITY_MED,
     "optional_skills":  SEVERITY_LOW,
 }
 
@@ -979,9 +985,11 @@ _ANNOUNCE_COOLDOWN_S = 6 * 3600   # don't re-announce the same condition
 # (e.g. "claude_api") → the error string we last spoke about. Used by
 # _announce_failures() to suppress re-announcing a HIGH probe that keeps
 # failing for the same reason every sweep (a known, dated outage shouldn't
-# be spoken ×120 over a day). A component clears from re-announcement only
-# when its error text changes; recovery is implicitly handled because a
-# passing probe never reaches the announce path.
+# be spoken ×120 over a day). A component re-announces when its error text
+# changes, or after it has recovered: 2026-10-01 -- recovery used to be
+# "implicitly handled", but nothing ever cleared this dict, so a stable-text
+# failure (mic, disk, ram) was spoken once per process and never again after
+# a pass. _announce_failures now drops a component whose probe passed.
 _announced_failure_state: dict[str, str] = {}
 
 
@@ -3492,8 +3500,14 @@ def _probe_disk() -> dict:
         "free_pct": round(free * 100.0 / total, 1) if total else 0.0,
     }
     if free < DISK_FREE_FLOOR_BYTES:
+        # 2026-10-01: stable text, no live number -- _announce_failures dedups
+        # on the error string, so "only 0.8 GB free" -> "only 0.7 GB free"
+        # re-spoke every 5-min sweep (same trap as _MIC_PASSIVE_SILENT_ERROR).
+        # The measurement stays in details["free_gb"].
+        floor_gb = DISK_FREE_FLOOR_BYTES / (1024**3)
         return _result(False, (_now() - start) * 1000.0,
-                       error=f"only {details['free_gb']} GB free on project drive",
+                       error=f"project drive below the {floor_gb:g} GB "
+                             f"free-space floor",
                        details=details)
     return _result(True, (_now() - start) * 1000.0, details=details)
 
@@ -3518,8 +3532,10 @@ def _probe_ram() -> dict:
         "total_gb": round(vm.total / (1024**3), 1),
     }
     if vm.percent >= RAM_PCT_CEILING:
+        # 2026-10-01: stable text (the live percent is in details["percent"])
+        # so a 93 % -> 94 % drift between sweeps is not a "new" failure.
         return _result(False, (_now() - start) * 1000.0,
-                       error=f"RAM at {vm.percent:.0f}% (ceiling {RAM_PCT_CEILING:.0f}%)",
+                       error=f"RAM above the {RAM_PCT_CEILING:.0f}% ceiling",
                        details=details)
     return _result(True, (_now() - start) * 1000.0, details=details)
 
@@ -3845,11 +3861,20 @@ def _announce_failures(run: dict) -> None:
     once, not every 30-min sweep. We track a per-component state signature
     (component + its error string) in _announced_failure_state and only
     speak about components whose signature changed since we last announced
-    them. A component that recovers and later fails again with a different
-    error re-announces, as does the first occurrence of any failure.
+    them. A component that recovers (its probe passes) and later fails again
+    re-announces, even with the same error text, as does the first occurrence
+    of any failure.
     """
     high = [c for c, s in (run.get("severity_failed") or {}).items()
             if s == SEVERITY_HIGH]
+    # 2026-10-01: re-arm components whose probe PASSED this sweep, so a later
+    # failure with the same (now stable) error text is spoken again instead of
+    # being silenced for the life of the process. Only an explicit pass
+    # re-arms: a probe that did not run, or could not look, keeps its state.
+    probes = run.get("probes") or {}
+    for c in list(_announced_failure_state):
+        if c not in high and (probes.get(c) or {}).get("ok") is True:
+            _announced_failure_state.pop(c, None)
     if not high:
         return
 
@@ -3857,7 +3882,6 @@ def _announce_failures(run: dict) -> None:
     # changed since the last time we spoke about them. The signature folds
     # in the error text so a *different* failure on the same component still
     # surfaces, while a persistent identical failure stays quiet.
-    probes = run.get("probes") or {}
     changed: list[str] = []
     for c in high:
         sig = str((probes.get(c) or {}).get("error") or "failed")
@@ -3884,7 +3908,16 @@ def _announce_failures(run: dict) -> None:
         "ram":              "system memory",
     }
     names = [pretty.get(c, c.replace("_", " ")) for c in changed]
-    if len(names) == 1:
+    # 2026-10-01: resources are not "down" and are "not a code fix" (see
+    # _suggested_files_for) -- "system memory appears to be down. I'll queue
+    # a fix." was wrong on both counts. They get their own plain wording.
+    resource_lines = {
+        "disk": "Sir, the project drive is nearly full.",
+        "ram":  "Sir, system memory is running high.",
+    }
+    if len(changed) == 1 and changed[0] in resource_lines:
+        msg = resource_lines[changed[0]]
+    elif len(names) == 1:
         msg = f"Sir, {names[0]} appears to be down. I'll queue a fix."
     else:
         first = ", ".join(names[:-1])

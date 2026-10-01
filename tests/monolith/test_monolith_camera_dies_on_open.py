@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import sys
 import unittest
 from unittest import mock
 
@@ -68,6 +69,42 @@ class DiesOnOpenKnobTests(_StormBase):
         self.assertEqual(getattr(g, "dies_on_open_retry_s", None), 900.0)
         self.assertEqual(getattr(bc._camera_gate, "dies_on_open_retry_s", None),
                          getattr(bc, _KNOB, None))
+
+
+@requires_monolith
+class DiesOnOpenSurvivesRestartWiringTests(_StormBase):
+    """2026-10-01: the production gate saves its dies-on-open runs to the
+    staging-aware data dir and restores them at boot; the test harness never
+    gets a state file it did not ask for."""
+
+    def test_production_path_is_a_data_file_but_none_under_the_harness(self):
+        import tempfile
+        bc = self.bc
+        self.assertIsNone(bc._camera_gate_doo_state_path())
+        d = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"JARVIS_TEST_MODE": "0"}),              mock.patch("core.paths.data_dir", return_value=d):
+            # Still None: the test run's live-data guard is armed.
+            self.assertIsNone(bc._camera_gate_doo_state_path())
+            with mock.patch.dict(sys.modules):
+                sys.modules.pop("tests.live_data_guard", None)
+                self.assertEqual(bc._camera_gate_doo_state_path(),
+                                 os.path.join(d, "camera_gate_doo.json"))
+        self.assertIsNone(getattr(bc._camera_gate, "_doo_state_path", None))
+
+    def test_the_monolith_gate_restores_a_saved_run(self):
+        import tempfile
+        bc = self.bc
+        path = os.path.join(tempfile.mkdtemp(), "camera_gate_doo.json")
+        now = self.clock.time()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "devices": {"kinect": {
+                "count": 3, "retry_s": 1800.0, "until": now + 1200.0,
+                "said_at": now - 60.0}}}, fh)
+        g = bc._make_camera_gate(clock=self.clock.time, doo_state_path=path)
+        self.assertTrue(g.dies_on_open("kinect"))
+        d = g.begin("kinect", "kinect-bridge")
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.reason, "backoff")
 
 
 @requires_monolith
@@ -150,41 +187,50 @@ class UseTheKinectAgainTests(_StormBase):
 @requires_monolith
 class VerdictSurvivesARestartWiringTests(_StormBase):
     """B083 (2026-10-01): the live process remembers the dies-on-open verdict
-    in its data dir; a staging / test process neither reads nor writes it."""
+    in its data dir; a staging process never touches the live file. Merged
+    with live-logs B056: the ONE mechanism is the gate's doo_state_path, from
+    _camera_gate_doo_state_path() (staging-aware core.paths.data_file)."""
 
     _dies_on_open = UseTheKinectAgainTests._dies_on_open
 
-    def _drive(self, fn, *, staging: bool, path: str):
+    def _drive(self, *, staging: bool):
         from core import paths
         bc = self.bc
-        g = bc._make_camera_gate(clock=self.clock.time)
         # The Kinect is ON the (fake) device list: this machine's real one
         # must not decide whether the gate lets the bridge open it.
         backend = _FakeBackend(self.clock, names=lambda: (
             "SynthCam One", "Synth Kinect Sensor"))
         with mock.patch.object(paths, "is_staging", return_value=staging), \
-             mock.patch.object(paths, "data_file", return_value=path), \
              mock.patch.object(bc, "_camera_backend", backend), \
              mock.patch.object(bc, "proactive_announce", return_value=True), \
              mock.patch("builtins.print"):
-            fn(g)
+            g = bc._make_camera_gate(
+                clock=self.clock.time,
+                doo_state_path=bc._camera_gate_doo_state_path())
             self._dies_on_open(g, 3)
         return g
 
     def test_live_remembers_and_staging_does_not(self):
         import shutil
         import tempfile
-        fn = getattr(self.bc, "_camera_gate_enable_persistence", None)
-        self.assertTrue(callable(fn), "the monolith never enables persistence")
+        from core import paths
         tmp = tempfile.mkdtemp(prefix="jarvis_doo_wiring_")
         self.addCleanup(shutil.rmtree, tmp, True)
-        path = os.path.join(tmp, "camera_gate_doo.json")
-        self._drive(fn, staging=True, path=path)
-        self.assertFalse(os.path.exists(path),
-                         "a staging process wrote the live verdict file")
-        self._drive(fn, staging=False, path=path)
-        with open(path, encoding="utf-8") as fh:
-            self.assertIn("kinect", json.load(fh))
+        live = os.path.join(tmp, "data", "camera_gate_doo.json")
+        os.makedirs(os.path.dirname(live))
+        # A production process: not the test harness, no data-dir override,
+        # the project rooted in the temp dir.
+        with mock.patch.dict(os.environ, {"JARVIS_TEST_MODE": "0"}), \
+             mock.patch.dict(sys.modules), \
+             mock.patch.object(paths, "PROJECT_DIR", tmp):
+            os.environ.pop(paths.DATA_DIR_ENV, None)
+            sys.modules.pop("tests.live_data_guard", None)
+            self._drive(staging=True)
+            self.assertFalse(os.path.exists(live),
+                             "a staging process wrote the live verdict file")
+            self._drive(staging=False)
+        with open(live, encoding="utf-8") as fh:
+            self.assertIn("kinect", json.load(fh)["devices"])
 
 
 if __name__ == "__main__":   # pragma: no cover

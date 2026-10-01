@@ -2303,16 +2303,46 @@ class SessionResumeReaderTests(MonolithGlobalsTestCase):
             self.assertEqual(self.bc._last_n_user_commands(3), [])
 
     # ---- _last_queued_task_line ----
+    @staticmethod
+    def _stamp(hours_ago: float) -> str:
+        return time.strftime("%Y-%m-%d %H:%M",
+                             time.localtime(time.time() - hours_ago * 3600))
+
     def test_last_queued_skips_internal_tasks(self):
         td = tempfile.mkdtemp()
         todo = os.path.join(td, "todo.md")
         with open(todo, "w", encoding="utf-8") as f:
-            f.write("- [ ] **2026-05-30 10:00** [anomaly] — internal burst\n")
-            f.write("- [ ] **2026-05-30 11:00** [feature] — Build the thing.\n")
+            f.write(f"- [ ] **{self._stamp(2)}** [anomaly] — internal burst\n")
+            f.write(f"- [ ] **{self._stamp(1)}** [feature] — Build the thing.\n")
         with mock.patch.object(self.bc, "TODO_FILE", todo):
             line = self.bc._last_queued_task_line()
         self.assertIn("Build the thing", line)
         self.assertNotIn("anomaly", line)
+
+    def test_last_queued_ignores_months_old_user_line(self):
+        # 2026-10-01 regression: a 2026-07-06 developer task was greeted as
+        # "when we left off you were working on ..." at every warm restart.
+        td = tempfile.mkdtemp()
+        todo = os.path.join(td, "todo.md")
+        with open(todo, "w", encoding="utf-8") as f:
+            f.write(f"- [ ] **{self._stamp(90 * 24)}** — Fix window placement.\n")
+            f.write("- [ ] **P3-5** backlog item with no date\n")
+            f.write(f"- [ ] **{self._stamp(1)}** [self-heal] — internal\n")
+        with mock.patch.object(self.bc, "TODO_FILE", todo):
+            self.assertEqual(self.bc._last_queued_task_line(), "")
+            # A wide enough window (the verbal "where did we leave off" days
+            # later) still finds it.
+            self.assertIn("window placement",
+                          self.bc._last_queued_task_line(91 * 86400))
+
+    def test_last_queued_returns_fresh_line_below_stale_ones(self):
+        td = tempfile.mkdtemp()
+        todo = os.path.join(td, "todo.md")
+        with open(todo, "w", encoding="utf-8") as f:
+            f.write(f"- [ ] **{self._stamp(1)}** — Wire the new sensor.\n")
+            f.write(f"- [ ] **{self._stamp(90 * 24)}** — Old moved line.\n")
+        with mock.patch.object(self.bc, "TODO_FILE", todo):
+            self.assertIn("new sensor", self.bc._last_queued_task_line())
 
     def test_last_queued_missing_file(self):
         with mock.patch.object(self.bc, "TODO_FILE",

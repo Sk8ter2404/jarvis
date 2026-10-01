@@ -1236,9 +1236,24 @@ def _request_access(listener) -> str:
         except Exception as e:
             raise RuntimeError(f"RequestAccessAsync wait failed: {e}") from e
     try:
-        return result.name  # winsdk enum exposes .name
+        raw = result.name  # winsdk enum exposes .name
     except Exception:
-        return str(result)
+        raw = str(result)
+    return _normalise_access_name(raw)
+
+
+def _normalise_access_name(raw) -> str:
+    """2026-10-01: winsdk enum names are UPPER-case ("ALLOWED", "DENIED",
+    "UNSPECIFIED"), not the PascalCase this module was written against, so the
+    listener loop's `access != "Allowed"` bailed on every boot even though
+    Windows had granted access -- toast capture never started once (47/47 live
+    session logs: "notification access = ALLOWED; capture disabled until
+    granted"). Normalise once here to the documented 'Allowed'/'Denied'/
+    'Unspecified' spelling; a str(enum) fallback such as
+    "UserNotificationListenerAccessStatus.ALLOWED" keeps only the member."""
+    s = str(raw if raw is not None else "").strip()
+    s = s.rsplit(".", 1)[-1]
+    return s.capitalize() if s else s
 
 
 def _get_notifications(listener):
@@ -1299,7 +1314,9 @@ def _listener_loop() -> None:
         print(f"  [triage] RequestAccessAsync failed: {e}")
         return
     _subsystem_status["listener_access"] = access
-    if access != "Allowed":
+    # 2026-10-01: case-insensitive on purpose -- the real winsdk spelling is
+    # "ALLOWED"; an exact "Allowed" match left capture dead on every boot.
+    if str(access).strip().lower() != "allowed":
         # The user can still grant it via Settings → Privacy → Notifications.
         print(f"  [triage] notification access = {access}; capture disabled until granted.")
         return

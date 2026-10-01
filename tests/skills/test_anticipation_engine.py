@@ -702,7 +702,7 @@ class AnticipationEnvironmentTests(_EngineTestBase):
     # ── _last_speech_age_seconds with a present bc ───────────────────────
     def test_last_speech_age_computes(self):
         bc = types.ModuleType("bobert_companion")
-        bc.last_speech_time = time.time() - 50.0
+        bc._last_owner_turn_at = [time.monotonic() - 50.0]
         with inject_modules(bobert_companion=bc):
             age = self.mod._last_speech_age_seconds()
         self.assertGreaterEqual(age, 49.0)
@@ -710,9 +710,38 @@ class AnticipationEnvironmentTests(_EngineTestBase):
 
     def test_last_speech_age_non_numeric(self):
         bc = types.ModuleType("bobert_companion")
-        bc.last_speech_time = "not-a-number"
+        bc._last_owner_turn_at = ["not-a-number"]
         with inject_modules(bobert_companion=bc):
             self.assertIsNone(self.mod._last_speech_age_seconds())
+
+    def test_last_speech_age_none_before_any_owner_turn(self):
+        bc = types.ModuleType("bobert_companion")
+        bc._last_owner_turn_at = [0.0]
+        bc.last_speech_time = time.time()      # JARVIS just spoke
+        with inject_modules(bobert_companion=bc):
+            self.assertIsNone(self.mod._last_speech_age_seconds())
+
+    # 2026-10-01 regression: JARVIS's OWN speech (last_speech_time, stamped by
+    # _speak) re-qualified the late-hour nudge every 20 min all night.
+    def test_jarvis_speech_is_not_owner_activity(self):
+        bc = types.ModuleType("bobert_companion")
+        bc._last_owner_turn_at = [time.monotonic() - 25 * 60.0]
+        bc.last_speech_time = time.time()      # JARVIS just spoke
+        with inject_modules(bobert_companion=bc):
+            age = self.mod._last_speech_age_seconds()
+        self.assertAlmostEqual(age, 25 * 60.0, delta=5.0)
+
+    def test_late_hour_nudge_stays_silent_when_only_jarvis_spoke(self):
+        from core import config as cfg
+        bc = types.ModuleType("bobert_companion")
+        bc._last_owner_turn_at = [time.monotonic() - 35 * 60.0]
+        bc.last_speech_time = time.time()      # its own last nudge
+        with mock.patch.object(cfg, "NIGHT_QUIET_ENABLED", True, create=True), \
+             mock.patch.object(self.mod.time, "localtime",
+                               return_value=_struct(1, 16)), \
+             inject_modules(bobert_companion=bc):
+            self.assertEqual(self.mod._try_late_hour_active(), "")
+            self.assertTrue(self.mod._should_skip_late_night())
 
     # ── _try_pattern_offer bridge ────────────────────────────────────────
     def test_try_pattern_offer_returns_line(self):

@@ -13,6 +13,7 @@ clock. The body pump is never started.
 """
 from __future__ import annotations
 
+import time
 import types
 import unittest
 from unittest import mock
@@ -109,6 +110,17 @@ class KinectOpensGoThroughTheGateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(self.opens, [])
         self.assertIn("camera gate", err2)
+
+    def test_gate_held_reports_the_standing_refusal(self):
+        # 2026-10-01: the preview stays quiet while this is True (the other
+        # "deliberately closed" state next to service_down()).
+        kb._gate_hold_until[0] = 0.0
+        self.assertFalse(kb.gate_held())
+        self._storm()
+        kb.get_runtime()
+        self.assertTrue(kb.gate_held())
+        kb._gate_hold_until[0] = time.monotonic() - 1.0   # refusal expired
+        self.assertFalse(kb.gate_held())
 
     def test_a_refusal_is_remembered_so_the_pump_does_not_re_ask_every_tick(self):
         self._storm()

@@ -1625,6 +1625,21 @@ class WinsdkProbeTests(_IsolatedTriageBase):
         listener.request_access_async.return_value = _AsyncOpGet("Allowed")  # plain str
         self.assertEqual(self.mod._request_access(listener), "Allowed")
 
+    # 2026-10-01: the REAL winsdk enum names are upper-case. The old mocks used
+    # "Allowed", so the suite passed while the live listener bailed on every
+    # boot with "notification access = ALLOWED; capture disabled".
+    def test_request_access_normalises_real_winsdk_upper_case(self):
+        for raw, want in (("ALLOWED", "Allowed"), ("DENIED", "Denied"),
+                          ("UNSPECIFIED", "Unspecified")):
+            listener = mock.MagicMock()
+            listener.request_access_async.return_value =                 _AsyncOpGet(_AccessResult(raw))
+            self.assertEqual(self.mod._request_access(listener), want)
+
+    def test_request_access_str_enum_fallback_keeps_member(self):
+        listener = mock.MagicMock()
+        listener.request_access_async.return_value =             _AsyncOpGet("UserNotificationListenerAccessStatus.ALLOWED")
+        self.assertEqual(self.mod._request_access(listener), "Allowed")
+
     def test_request_access_manual_poll_raises_wraps(self):
         class _BadOp:
             completed = True
@@ -1754,6 +1769,31 @@ class ListenerLoopTests(_IsolatedTriageBase):
             self.mod._listener_loop()
         self.assertEqual(self.mod._subsystem_status["listener_access"], "Denied")
         self.assertFalse(self.mod._subsystem_status["listening"])
+
+    def test_loop_goes_live_on_real_winsdk_allowed_spelling(self):
+        # 2026-10-01 regression: Windows returns "ALLOWED". Both the raw enum
+        # name fed straight to the loop and the real _request_access path must
+        # reach listening=True instead of "capture disabled until granted".
+        for patch_kw in ({"return_value": "ALLOWED"}, None):
+            self.mod._subsystem_status["listening"] = False
+            listener = mock.MagicMock()
+            listener.request_access_async.return_value =                 _AsyncOpGet(_AccessResult("ALLOWED"))
+            Listener = types.SimpleNamespace(current=listener)
+            sleep_calls = {"n": 0}
+
+            def _sleep(_secs):
+                sleep_calls["n"] += 1
+                if sleep_calls["n"] >= 2:
+                    raise KeyboardInterrupt("stop loop")
+
+            ra = (mock.patch.object(self.mod, "_request_access", **patch_kw)
+                  if patch_kw else contextlib.nullcontext())
+            with mock.patch.object(self.mod.time, "sleep", _sleep),                  mock.patch.object(self.mod, "_probe_winsdk", return_value=True),                  ra,                  mock.patch.object(self.mod, "_get_notifications",
+                                   return_value=[]):
+                self.mod._winsdk_modules["Listener"] = Listener
+                with self.assertRaises(KeyboardInterrupt):
+                    self.mod._listener_loop()
+            self.assertTrue(self.mod._subsystem_status["listening"], patch_kw)
 
     def test_loop_processes_one_batch_then_stops(self):
         # Allowed access; the poll loop runs once, handles a batch, then we

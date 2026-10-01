@@ -3199,6 +3199,48 @@ class SetupLoggingEdgeTests(_MonolithTestBase):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  _open_crash_trace_log — 2026-10-01: archive an oversized crash_traces.log
+#  and mark each session (the file had grown to 368 MB with no markers).
+# ──────────────────────────────────────────────────────────────────────────
+class CrashTraceLogRotationTests(_MonolithTestBase):
+    def _open(self, path):
+        fd = self.bc._open_crash_trace_log(path)
+        self.addCleanup(fd.close)
+        return fd
+
+    def test_oversized_log_is_archived_not_deleted(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "crash_traces.log")
+        with open(path, "wb") as f:
+            f.write(b"Windows fatal exception: code 0x8001010e\n" * 64)
+        with mock.patch.object(self.bc, "CRASH_TRACE_ROTATE_BYTES", 1024):
+            self._open(path)
+        archived = [n for n in os.listdir(d)
+                    if n.startswith("crash_traces.") and n != "crash_traces.log"]
+        self.assertEqual(len(archived), 1)
+        with open(os.path.join(d, archived[0]), "rb") as f:
+            self.assertIn(b"0x8001010e", f.read())
+        with open(path, "rb") as f:
+            fresh = f.read()
+        self.assertNotIn(b"0x8001010e", fresh)
+        self.assertIn(f"pid {os.getpid()} ===".encode(), fresh)
+
+    def test_small_log_is_appended_with_a_session_marker(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "crash_traces.log")
+        with open(path, "wb") as f:
+            f.write(b"older dump\n")
+        fd = self._open(path)
+        fd.write(b"new dump\n")
+        with open(path, "rb") as f:
+            body = f.read().decode("ascii")
+        self.assertEqual(os.listdir(d), ["crash_traces.log"])
+        self.assertTrue(body.startswith("older dump\n"))
+        self.assertRegex(body, r"\n=== session \d{4}-\d{2}-\d{2} "
+                               r"\d{2}:\d{2}:\d{2} pid \d+ ===\nnew dump\n$")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  close_log — write-failure arm
 # ──────────────────────────────────────────────────────────────────────────
 class CloseLogEdgeTests(_MonolithTestBase):

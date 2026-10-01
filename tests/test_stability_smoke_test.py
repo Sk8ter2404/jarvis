@@ -527,6 +527,58 @@ class TestScanCrashTracesSince(_Base):
         self.assertIn("b.py", res["head_signatures"][0])
 
 
+    # ── 2026-10-01: handled COM-exception dumps, session markers, tail read ──
+    def test_benign_wrong_thread_dump_is_not_reported(self):
+        # RPC_E_WRONG_THREAD is a handled first-chance exception that
+        # faulthandler still dumps; the process kept running. Not a crash.
+        dump = (
+            "Windows fatal exception: code 0x8001010e\n"
+            "\n"
+            "Current thread 0x00002 (most recent call first):\n"
+            '  File "C:\\\\JARVIS\\\\core\\\\media_now_playing.py", line 103, in _default_reader\n'
+        )
+        self.write(os.path.join("logs", "crash_traces.log"), dump, mtime=5000)
+        res = S._scan_crash_traces_since(1000.0)
+        self.assertEqual(res["new_dumps"], [])
+        self.assertEqual(res["head_signatures"], [])
+
+    def test_real_dump_before_benign_ones_is_still_reported(self):
+        dump = (
+            "Windows fatal exception: access violation\n"
+            '  File "C:\\\\JARVIS\\\\core\\\\real.py", line 1, in boom\n'
+            "\n"
+            "Windows fatal exception: code 0x8001010e\n"
+            '  File "C:\\\\JARVIS\\\\core\\\\media_now_playing.py", line 103, in r\n'
+        )
+        self.write(os.path.join("logs", "crash_traces.log"), dump, mtime=5000)
+        res = S._scan_crash_traces_since(1000.0)
+        self.assertEqual(len(res["new_dumps"]), 1)
+        self.assertIn("access violation", res["new_dumps"][0])
+
+    def test_pid_marker_bounds_the_scan_to_the_launched_session(self):
+        # An older session's real crash must not fail this boot's gate.
+        body = (
+            "\n=== session 2026-10-01 09:00:00 pid 111 ===\n"
+            "Windows fatal exception: access violation\n"
+            '  File "C:\\\\JARVIS\\\\old.py", line 1, in f\n'
+            "\n=== session 2026-10-01 10:00:00 pid 222 ===\n"
+            "nothing bad happened\n"
+        )
+        self.write(os.path.join("logs", "crash_traces.log"), body, mtime=5000)
+        self.assertEqual(S._scan_crash_traces_since(1000.0, pid=222)["new_dumps"], [])
+        # Without a matching marker the legacy whole-tail behaviour stays.
+        self.assertEqual(
+            len(S._scan_crash_traces_since(1000.0, pid=999)["new_dumps"]), 1)
+
+    def test_only_the_tail_of_a_huge_log_is_read(self):
+        head = "Windows fatal exception: access violation\n  ancient\n\n"
+        body = head + ("x" * 100 + "\n") * 50
+        self.write(os.path.join("logs", "crash_traces.log"), body, mtime=5000)
+        with mock.patch.object(S, "_CRASH_SCAN_TAIL_BYTES", 1024):
+            res = S._scan_crash_traces_since(1000.0)
+        self.assertEqual(res["new_dumps"], [])
+
+
 # ══════════════════════════ _scan_log_for_fatal ═══════════════════════════
 
 class TestScanLogForFatal(_Base):

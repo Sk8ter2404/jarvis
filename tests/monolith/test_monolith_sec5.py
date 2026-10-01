@@ -1620,13 +1620,17 @@ class BackgroundAudioGateTests(SectionFiveBase):
         # state leaks into sibling tests (other classes read these globals).
         self._orig_runtime = bc._require_wake_runtime
         self._orig_cfg = _cfg.REQUIRE_WAKE_MODE
+        self._orig_music = _cfg.AMBIENT_MUSIC_REFUSE_WAKE
         self.addCleanup(self._restore)
         bc._require_wake_runtime = False
         _cfg.REQUIRE_WAKE_MODE = False
+        # The shipped default, not whatever this box's settings say.
+        _cfg.AMBIENT_MUSIC_REFUSE_WAKE = True
 
     def _restore(self):
         self.bc._require_wake_runtime = self._orig_runtime
         self._cfg.REQUIRE_WAKE_MODE = self._orig_cfg
+        self._cfg.AMBIENT_MUSIC_REFUSE_WAKE = self._orig_music
 
     def test_wake_prefix_always_passes(self):
         bc = self.bc
@@ -1676,6 +1680,28 @@ class BackgroundAudioGateTests(SectionFiveBase):
             refuse, why = bc._should_refuse_background_audio("some lyric line")
         self.assertTrue(refuse)
         self.assertEqual(why, "room music")
+
+    # 2026-10-01 regression: the Settings row "Require 'JARVIS' while music is
+    # playing" OFF must also stop the media-session (SMTC) refusal - music
+    # played on the PC itself is the case its help text describes.
+    def test_music_switch_off_lets_pc_media_through(self):
+        bc = self.bc
+        self._cfg.AMBIENT_MUSIC_REFUSE_WAKE = False
+        with mock.patch.object(bc, "_smtc_media_playing",
+                               return_value=True) as smtc,              mock.patch.object(bc, "_audio_music_should_refuse_wake",
+                               return_value=True):
+            refuse, why = bc._should_refuse_background_audio("turn the lights on")
+        self.assertEqual((refuse, why), (False, ""))
+        smtc.assert_not_called()   # no WinRT read when the switch is off
+
+    def test_music_switch_off_keeps_the_manual_wake_mode(self):
+        bc = self.bc
+        self._cfg.AMBIENT_MUSIC_REFUSE_WAKE = False
+        bc._require_wake_runtime = True
+        with mock.patch.object(bc, "_smtc_media_playing", return_value=True),              mock.patch.object(bc, "_followup_window") as fw:
+            fw.admit.return_value = False
+            refuse, why = bc._should_refuse_background_audio("what time is it")
+        self.assertEqual((refuse, why), (True, "wake-word mode"))
 
     def test_gate_never_raises(self):
         bc = self.bc

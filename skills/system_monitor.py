@@ -48,6 +48,30 @@ _last_cpu_alert_at = [0.0]
 _last_ram_alert_at = [0.0]
 
 
+def _claim_shared_ram_alert(now: float) -> bool:
+    """2026-10-01: one spoken high-RAM alert per hour across BOTH alerters.
+    skills/system_pulse.py speaks at 88 % with an hourly per-key cooldown and
+    this monitor at 90 % with its own 10-min one; neither saw the other, so on
+    2026-09-30 the owner heard both (plus self_diagnostic) within 3.5 minutes.
+    Check-and-stamp the pulse's own "ram" stamp under its lock, so whichever
+    fires first holds the slot for PROACTIVE_COOLDOWN_SECONDS. Pulse not
+    loaded -> True (this monitor's own cooldown alone, as before)."""
+    pulse = sys.modules.get("skill_system_pulse")
+    lock = getattr(pulse, "_alert_lock", None)
+    stamps = getattr(pulse, "_last_abnormal_alert", None)
+    cooldown = getattr(pulse, "PROACTIVE_COOLDOWN_SECONDS", None)
+    if lock is None or not isinstance(stamps, dict) or cooldown is None:
+        return True
+    try:
+        with lock:
+            if (now - stamps.get("ram", 0.0)) <= cooldown:
+                return False
+            stamps["ram"] = now
+    except Exception:
+        return True
+    return True
+
+
 def _enqueue_speech(message: str) -> None:
     """Route a proactive announcement through bobert_companion's public
     proactive_announce() API when available, falling back to a direct atomic
@@ -226,7 +250,8 @@ def _monitor_loop():
 
             # RAM single-sample check
             if ram_pct >= RAM_ALERT_PCT:
-                if (now - _last_ram_alert_at[0]) > ALERT_COOLDOWN_SECONDS:
+                if ((now - _last_ram_alert_at[0]) > ALERT_COOLDOWN_SECONDS
+                        and _claim_shared_ram_alert(now)):
                     _enqueue_speech(
                         f"Sir, memory usage is at {ram_pct:.0f} percent. "
                         f"Things may start swapping shortly."

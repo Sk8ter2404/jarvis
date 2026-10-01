@@ -109,7 +109,8 @@ starts reset the hub 8 of 10 times; its sibling on the same hub, 0 of 10.
              friendly label, logged, and shown in snapshot(). A device whose
              own open FAILED never earns a strike - a victim that tried to
              start into a resetting hub is not the thing that reset it.
-             Nothing is persisted: a restart (or lift_quarantine) forgets it.
+             The quarantine is not persisted: a restart (or
+             lift_quarantine) forgets it. (The dies-on-open run below IS.)
 
 ────────────────────────────────────────────────────────────────────────────
 DIES ON OPEN (R11, from the 2026-09-29 19:39-19:59 live log)
@@ -138,17 +139,18 @@ USB re-enumeration and an audio device-list change for nothing.
              "use it again") clears it and allows an open at once - and ONE
              more death after that puts it straight back on the slow retry,
              as the owner's reply promises (2026-10-01).
-  remembered across restarts (2026-10-01). The verdict lived in memory, so
-             every restart relearned it: 3 more USB drops of the Kinect and
-             its mic array in ~45 s, and the same spoken warning, on every one
-             of 14 restarts in a day. With enable_persistence(path) the gate
-             writes {key: retry, when, said} when a device is put on the slow
-             retry (atomically, outside the lock) and, at the next start,
-             seeds a record under PERSIST_MAX_AGE_S old one death short of the
-             verdict: the device still opens at boot (a repaired sensor just
-             works, and its record is dropped once it streams normally), but a
-             still-broken one is back on the slow retry after ONE drop, and
-             the warning is not repeated on the same day. A lift forgets it.
+
+  survives a restart (2026-10-01)  with ``doo_state_path`` (the monolith
+             passes data/camera_gate_doo.json) the run - count, slow retry,
+             hold deadline, when it was said - is saved whenever it is armed,
+             cleared or lifted, and restored at construction. Before this,
+             every deploy / tray restart (14 on 2026-09-30) reopened the
+             Kinect three more times - three USB re-enumerations and an audio
+             device-list change - and SPOKE the warning again. Now a restart
+             inside the hold does not open it at all, the first open after the
+             hold is judged at once (one more death re-arms the doubled
+             retry), and the warning is said at most once per
+             DIES_ON_OPEN_SAY_AGAIN_S. Needs a wall clock (the default).
 
 WHAT IT DELIBERATELY DOES NOT DO: it never closes a stream, never reads a
 frame, never touches a device. It is pure bookkeeping under one lock, with an
@@ -177,6 +179,7 @@ __all__ = [
     "STORM_PROBATION_S", "REOPEN_PROBATION_S", "CULPRIT_WINDOW_S",
     "CULPRIT_THRESHOLD", "DIES_ON_OPEN_WINDOW_S", "DIES_ON_OPEN_COUNT",
     "DIES_ON_OPEN_RETRY_S", "DIES_ON_OPEN_RETRY_MAX_S",
+    "DIES_ON_OPEN_SAY_AGAIN_S",
     "LIFT_QUARANTINE", "LIFT_SLOW_RETRY",
 ]
 
@@ -230,9 +233,9 @@ DIES_ON_OPEN_COUNT = 3
 # the max (or the knob, when the owner set it higher).
 DIES_ON_OPEN_RETRY_S = 1800.0
 DIES_ON_OPEN_RETRY_MAX_S = 3600.0
-# A remembered dies-on-open verdict older than this is not seeded at start
-# (2026-10-01): a day is long enough for the power fault to have been fixed.
-PERSIST_MAX_AGE_S = 86400.0
+# A restored run (doo_state_path) that was already SPOKEN within this long is
+# not spoken again on its next raise - logged only, as within one session.
+DIES_ON_OPEN_SAY_AGAIN_S = 12 * 3600.0
 # How often a caller refused as "quarantined" should ask again. Asking costs a
 # dict lookup; the answer only changes when the owner lifts the quarantine.
 QUARANTINE_POLL_S = 600.0
@@ -339,6 +342,9 @@ class CameraGate:
                  ("the left webcam"). Only called when a device is
                  quarantined or put on the slow dies-on-open retry; a fault
                  falls back to a name built from the key.
+    ``doo_state_path`` - JSON file the dies-on-open runs are saved to and
+                 restored from, so they survive a restart. None (the default,
+                 and every test that does not ask) = nothing on disk.
     """
 
     def __init__(self, *, min_gap_s: float = 10.0,
@@ -363,7 +369,8 @@ class CameraGate:
                  announce: "Callable[[str], None] | None" = None,
                  lockers: "Callable[[], list] | None" = None,
                  presence: "Callable[[str], object] | None" = None,
-                 labeler: "Callable[[str], str] | None" = None) -> None:
+                 labeler: "Callable[[str], str] | None" = None,
+                 doo_state_path: "str | None" = None) -> None:
         self.min_gap_s = self._num(min_gap_s, 10.0)
         self.max_backoff_s = self._num(max_backoff_s, 600.0)
         self.storm_cooldown_s = self._num(storm_cooldown_s, 600.0)
@@ -405,10 +412,11 @@ class CameraGate:
         self._presence = presence
         self._labeler = labeler
         self._lock = threading.RLock()
-        # Dies-on-open persistence (2026-10-01): off until enable_persistence.
-        self._persist_path: "str | None" = None
-        self._persist_write_lock = threading.Lock()
+        self._doo_state_path = doo_state_path or None
+        self._doo_io_lock = threading.Lock()
         self.reset()
+        # NOT inside reset(): a test that resets a gate must stay hermetic.
+        self._doo_load()
 
     @staticmethod
     def _num(v, default: float) -> float:
@@ -442,10 +450,8 @@ class CameraGate:
             self._reopen_at = 0.0             # last successful RE-open ...
             self._reopen_key = ""             # ... of a recovering device
             self._doo_said: set = set()       # keys told "dies on open" (R11)
-            # {key: {"retry_s", "armed_wall", "said_date"}} - what the
-            # persistence file should hold; written when _doo_dirty.
-            self._doo_persisted: dict = {}
-            self._doo_dirty = False
+            self._doo_said_at: dict = {}      # key -> clock time it was said
+            self._doo_dirty = False           # runs changed since last save
 
     def _rec(self, key: str) -> dict:
         r = self._dev.get(key)
@@ -485,6 +491,7 @@ class CameraGate:
 
     def _emit(self, lines: list, spoken: list) -> None:
         """Say what the locked section decided. Outside the lock, guarded."""
+        self._doo_save()
         for ln in lines:
             try:
                 if self._log is not None:
@@ -497,92 +504,6 @@ class CameraGate:
                     self._announce(msg)
             except Exception:
                 pass
-        self._persist_flush()
-
-    # ── dies-on-open persistence (2026-10-01) ─────────────────────────────
-    def enable_persistence(self, path: str) -> int:
-        """Remember dies-on-open verdicts in ``path`` and seed the ones a
-        previous process left (see the module docstring). Returns how many
-        devices were seeded. Call once, right after building the gate. NEVER
-        raises; a missing / unreadable file seeds nothing."""
-        seeded = 0
-        try:
-            self._persist_path = str(path)
-            try:
-                with open(self._persist_path, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-            except Exception:
-                data = {}
-            if not isinstance(data, dict):
-                data = {}
-            wall = time.time()
-            today = time.strftime("%Y-%m-%d", time.localtime(wall))
-            lines: list = []
-            with self._lock:
-                for key, rec in data.items():
-                    key = str(key)
-                    try:
-                        armed = float(rec.get("armed_wall") or 0.0)
-                    except Exception:
-                        armed = 0.0
-                    if not armed or not (0.0 <= wall - armed
-                                         < PERSIST_MAX_AGE_S):
-                        self._doo_dirty = True      # expired: drop it
-                        continue
-                    r = self._rec(key)
-                    r["doo_count"] = max(r["doo_count"],
-                                         self.dies_on_open_count - 1)
-                    self._doo_persisted[key] = dict(rec)
-                    if rec.get("said_date") == today:
-                        self._doo_said.add(key)
-                    seeded += 1
-                    lines.append(
-                        f"  [camera-gate] {key}: it died on every open last "
-                        f"session - one more drop puts it straight back on "
-                        f"the slow retry.")
-            self._emit(lines, [])
-        except Exception:
-            pass
-        return seeded
-
-    def _persist_mark_locked(self, key: str, *, retry_s=None,
-                             said: bool = False, forget: bool = False) -> None:
-        """Record a dies-on-open change for the file. Under self._lock."""
-        if self._persist_path is None:
-            return
-        if forget:
-            if self._doo_persisted.pop(key, None) is not None:
-                self._doo_dirty = True
-            return
-        rec = self._doo_persisted.setdefault(
-            key, {"retry_s": 0.0, "armed_wall": 0.0, "said_date": ""})
-        if retry_s is not None:
-            rec["retry_s"] = float(retry_s)
-            rec["armed_wall"] = time.time()
-        if said:
-            rec["said_date"] = time.strftime("%Y-%m-%d")
-        self._doo_dirty = True
-
-    def _persist_flush(self) -> None:
-        """Write the dies-on-open records if they changed. Outside self._lock
-        (it is only called from _emit); atomic (tmp + os.replace). NEVER
-        raises."""
-        if self._persist_path is None or not self._doo_dirty:
-            return
-        try:
-            with self._persist_write_lock:
-                with self._lock:
-                    if not self._doo_dirty:
-                        return
-                    snap = {k: dict(v) for k, v in self._doo_persisted.items()}
-                    self._doo_dirty = False
-                path = self._persist_path
-                tmp = path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(snap, fh, indent=1, sort_keys=True)
-                os.replace(tmp, path)
-        except Exception:
-            pass
 
     # ── the breaker ───────────────────────────────────────────────────────
     def _storm_tick_locked(self, now: float, lines: list) -> bool:
@@ -757,14 +678,88 @@ class CameraGate:
     def _doo_on_locked(self) -> bool:
         return self.dies_on_open_retry_s > 0.0 and self.dies_on_open_window_s > 0.0
 
+    def _doo_save(self) -> None:
+        """Write the armed dies-on-open runs to doo_state_path if they changed
+        (2026-10-01). The snapshot is taken under the gate lock, the file is
+        written outside it (atomic: temp file + os.replace). NEVER raises."""
+        if not self._doo_dirty or not self._doo_state_path:
+            return
+        try:
+            with self._doo_io_lock:
+                with self._lock:
+                    if not self._doo_dirty:
+                        return
+                    self._doo_dirty = False
+                    devices = {
+                        k: {"count": r["doo_count"],
+                            "retry_s": r["doo_retry_s"],
+                            "until": r["doo_until"],
+                            "said_at": self._doo_said_at.get(k, 0.0)}
+                        for k, r in self._dev.items() if r["doo_retry_s"] > 0.0}
+                path = self._doo_state_path
+                tmp = f"{path}.{os.getpid()}.tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({"version": 1, "devices": devices}, f)
+                os.replace(tmp, path)
+        except Exception:
+            pass
+
+    def _doo_load(self) -> None:
+        """Restore the dies-on-open runs saved by a previous process. The hold
+        is capped at now + the max retry (a clock jump cannot bench a device
+        for good); doo_judged stays -1, so the first stream after the hold is
+        judged normally - a death re-arms the doubled retry, a stream that
+        runs past the window clears the run. NEVER raises."""
+        path = self._doo_state_path
+        if not path:
+            return
+        try:
+            if not self._doo_on_locked() or not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                devices = (json.load(f) or {}).get("devices") or {}
+            now = self._clock()
+            lines: list = []
+            with self._lock:
+                for key, e in devices.items():
+                    try:
+                        key = str(key)
+                        count = int(e.get("count") or 0)
+                        retry = float(e.get("retry_s") or 0.0)
+                        until = float(e.get("until") or 0.0)
+                        said = float(e.get("said_at") or 0.0)
+                    except Exception:
+                        continue
+                    if count <= 0 or not retry > 0.0:
+                        continue
+                    r = self._rec(key)
+                    r["doo_count"] = count
+                    r["doo_retry_s"] = min(retry, self.dies_on_open_retry_max_s)
+                    until = min(until, now + self.dies_on_open_retry_max_s)
+                    if until > now:
+                        r["hold_until"] = r["doo_until"] = until
+                    if said and 0.0 <= now - said < DIES_ON_OPEN_SAY_AGAIN_S:
+                        self._doo_said.add(key)
+                        self._doo_said_at[key] = said
+                    held = (f"held for {_fmt_s(until - now)} more"
+                            if until > now else "its hold has run out")
+                    lines.append(
+                        f"  [camera-gate] {key}: restored from the last run - "
+                        f"its last {count} opens each died on open; {held}, "
+                        f"then retried every {_fmt_s(r['doo_retry_s'])} "
+                        f"until a reopen streams normally.")
+            self._emit(lines, [])
+        except Exception:
+            pass
+
     def _doo_clear_locked(self, key: str, r: dict, why: str,
                           lines: list) -> None:
         """End a dies-on-open run: the device streamed normally."""
         was_slow = r["doo_retry_s"] > 0.0
         r["doo_count"] = 0
         r["doo_retry_s"] = 0.0
-        self._persist_mark_locked(key, forget=True)
         if was_slow:
+            self._doo_dirty = True
             lines.append(
                 f"  [camera-gate] {key}: {why} - it no longer dies on open; "
                 f"back on the normal reopen ladder.")
@@ -797,7 +792,7 @@ class CameraGate:
         r["doo_retry_s"] = retry
         r["hold_until"] = max(r["hold_until"], now + retry)
         r["doo_until"] = r["hold_until"]
-        self._persist_mark_locked(key, retry_s=retry)
+        self._doo_dirty = True
         label = self._label_for(key)
         ladder = (f" instead of every {_fmt_s(self.max_backoff_s)}"
                   if self.max_backoff_s > 0.0 else "")
@@ -809,10 +804,11 @@ class CameraGate:
             f"{_fmt_s(retry)}{ladder} until a reopen streams past "
             f"{win:.0f}s; 'use {label} again' retries it now.")
         if key not in self._doo_said:
-            # ONCE per device per session (and, persisted, per day): a repeat
-            # is logged, not spoken.
+            # ONCE per device per session: a repeat is logged, not spoken.
+            # (With doo_state_path, once per DIES_ON_OPEN_SAY_AGAIN_S across
+            # restarts: _doo_load re-seeds this set.)
             self._doo_said.add(key)
-            self._persist_mark_locked(key, said=True)
+            self._doo_said_at[key] = now
             spoken.append(f"{label[:1].upper()}{label[1:]} drops off USB the "
                           f"moment it starts streaming, sir. That is usually "
                           f"its power supply. I'll only retry it every "
@@ -1418,10 +1414,10 @@ class CameraGate:
                     r["doo_count"] = (max(0, self.dies_on_open_count - 1)
                                       if slow else 0)
                     r["doo_retry_s"] = 0.0
-                    self._persist_mark_locked(key, forget=True)
                     if slow:
                         lifted.append(LIFT_SLOW_RETRY)
                         r["hold_until"] = 0.0
+                        self._doo_dirty = True
                         lines.append(
                             f"  [camera-gate] {key}: the owner asked to use it "
                             f"again - the slow dies-on-open retry is cleared; "

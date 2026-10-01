@@ -14,7 +14,9 @@ so the tray label and the ``now_playing`` action still render on any machine
 
 No background thread: ``get_now_playing()`` reads synchronously on demand and
 caches the result for ~2s, so the (right-click) tray label and the occasional
-voice action stay cheap without leaking a daemon into the test suite.
+voice action stay cheap without leaking a daemon into the test suite. (Each
+read runs on a short-lived worker thread that the caller joins -- see
+``_default_reader`` -- so the CALLER's thread never touches WinRT.)
 """
 from __future__ import annotations
 
@@ -25,6 +27,13 @@ import unicodedata
 
 # Seconds a snapshot is reused before the next on-demand SMTC read.
 _REFRESH_INTERVAL = 2.0
+# Longest a caller waits for one SMTC read before treating it as "nothing
+# playing" (fail-open, same as a failed read).
+_READ_TIMEOUT_S = 1.5
+# The in-flight read, shared by concurrent callers: [thread, result box,
+# time.monotonic() it started]. Guarded by _reader_lock.
+_reader_state: list = [None, None, 0.0]
+_reader_lock = threading.Lock()
 
 _snapshot: dict | None = None      # last read {app,title,artist,status,playing} or None
 _last_read = 0.0
@@ -99,12 +108,41 @@ async def _read_session_async() -> "dict | None":  # pragma: no cover - winrt-on
     }
 
 
-def _default_reader() -> "dict | None":  # pragma: no cover - winrt-only
-    """Synchronous one-shot SMTC read on a private event loop (safe to call
-    from the tray / action threads, which have no running loop)."""
+def _default_reader() -> "dict | None":
+    """Synchronous one-shot SMTC read on a private event loop, run on a
+    short-lived worker thread that the caller joins for up to _READ_TIMEOUT_S.
+
+    2026-10-01: the background-audio gate calls this from the MAIN loop
+    thread (a COM STA). There every WinRT read raised a handled
+    RPC_E_WRONG_THREAD (0x8001010e) about twice, and faulthandler wrote a
+    ~40 KB all-threads dump to logs/crash_traces.log for each one: 8,914 such
+    dumps, 368 MB, burying the real native crashes. The same read from a
+    worker thread (the ambient-learn daemon) produced none. A caller that
+    finds a read already in flight waits for THAT read (within the same
+    budget) instead of stacking another; a read that has outlived the budget
+    is not waited on again - None (not playing), as a timed-out read is."""
+    with _reader_lock:
+        t, box, started = _reader_state
+        if t is None or not t.is_alive():
+            box = {}
+            t = threading.Thread(target=_run_read, args=(box,),
+                                 name="smtc-read", daemon=True)
+            started = time.monotonic()
+            _reader_state[:] = [t, box, started]
+            t.start()
+    left = _READ_TIMEOUT_S - (time.monotonic() - started)
+    if left > 0:
+        t.join(left)
+    return box.get("v")
+
+
+def _run_read(box: dict) -> None:
+    """Worker-thread body for _default_reader: one SMTC read into box["v"]."""
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(_read_session_async())
+        box["v"] = loop.run_until_complete(_read_session_async())
+    except Exception:
+        box["v"] = None
     finally:
         loop.close()
 

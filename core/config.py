@@ -514,10 +514,13 @@ WAKE_WORD_AUTOSTART = False
 # Env override JARVIS_START_IN_STANDBY.
 START_IN_STANDBY = False
 
-# When True (default), JARVIS ignores spoken commands while SUSTAINED room music
-# is playing UNLESS they start with the wake word "JARVIS" — so it doesn't reply
-# to song lyrics it overhears. Set False if it keeps cutting YOU off while your
-# own music plays; you can then talk to it normally over the music.
+# When True (default), JARVIS ignores spoken commands while music is playing -
+# media the PC itself is playing (the Windows media session: Spotify, Apple
+# Music, Chrome...) or SUSTAINED room music heard through the mic - UNLESS they
+# start with the wake word "JARVIS", so it doesn't reply to song lyrics it
+# overhears. Set False if it keeps cutting YOU off while your own music plays;
+# you can then talk to it normally over the music. (Covers both since
+# 2026-10-01; the media-session check used to ignore this switch.)
 AMBIENT_MUSIC_REFUSE_WAKE = True
 
 # Manual "wake-word mode" (Alexa-style): when True, JARVIS ignores EVERY spoken
