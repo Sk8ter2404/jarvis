@@ -165,6 +165,20 @@ class StandbyReminderDrainTests(_QueueBase):
         self.assertFalse(os.path.exists(self.queue + ".consuming"))
         self.assertTrue(self.bc._sleep_mode[0])   # still asleep
 
+    def test_the_broken_schedule_diagnostic_waits_for_the_wake(self):
+        # 2026-10-01 merge audit: "scheduler" (core/scheduler.py _announce,
+        # the no-such-action diagnostic) rode in the standby set and spoke
+        # overnight. A scheduled job's own line is tagged "schedule".
+        self.assertNotIn("scheduler", self.bc._STANDBY_SPEAKABLE_SOURCES)
+        diag = {"message": "Sir, scheduled job j1 tried to run 'x', but "
+                           "there's no such action registered. Nothing ran.",
+                "source": "scheduler"}
+        job = {"message": "Time for your vitamins, sir.", "source": "schedule"}
+        self._write([diag, job])
+        self.bc._handle_sleep_standby(None)
+        self.assertEqual(self.spoke, [job["message"]])
+        self.assertEqual(self._read(), [diag])
+
     def test_nothing_owner_requested_leaves_the_queue_untouched(self):
         self._write([{"message": "Weather alert, sir.", "source": "weather"}])
         before = os.path.getmtime(self.queue)

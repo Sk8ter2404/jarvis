@@ -12660,7 +12660,7 @@ def proactive_announce(message: str, source: str = "skill",
     `source` tags the console fallback log so it's obvious which skill
     produced an announcement that couldn't be written to disk, and is stored
     on the queued entry: in standby/sleep only _STANDBY_SPEAKABLE_SOURCES
-    ("timer", "scheduler", "promise:*") are spoken, the rest wait for wake.
+    ("timer", "schedule", "promise:*") are spoken, the rest wait for wake.
 
     `mood` (optional) is the voice_mood layer opt-in. When set, the drainer
     forwards it as mood= to _speak() so the queued utterance lands with the
@@ -35166,9 +35166,12 @@ def _requeue_pending_speech(items: list) -> bool:
 # the owner's OWN requests: a timer, a scheduled job, a promise JARVIS made
 # ("promise:<origin>"). Everything else — banter, device alerts, briefings,
 # the ambient wake nudge — stays held until he wakes JARVIS.
-# "scheduler" = core/scheduler.py jobs, "schedule" = skills/schedule_manager's
-# voice-armed lines (both tags are live).
-_STANDBY_SPEAKABLE_SOURCES = frozenset({"timer", "scheduler", "schedule", "promise"})
+# "schedule" = a scheduled job's spoken line (skills/schedule_manager's
+# say_aloud step). NOT "scheduler": that tag's only writer is core/scheduler.py
+# _announce, the broken-schedule diagnostic ("scheduled job X tried to run
+# 'Y', but there's no such action registered"), which must not speak while
+# he sleeps - it waits for the wake like any other notice.
+_STANDBY_SPEAKABLE_SOURCES = frozenset({"timer", "schedule", "promise"})
 # The proactive-scheduling batch's names for the same set (one rule, two names).
 _OWNER_REQUESTED_SOURCES = tuple(sorted(_STANDBY_SPEAKABLE_SOURCES))
 
