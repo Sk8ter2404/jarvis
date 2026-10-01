@@ -1263,6 +1263,156 @@ class ReflectorInjectionTests(_LtmBase):
         self.assertIn("mig", ltm._facts)
         self.assertNotIn("amb", ltm._facts)
 
+    # ── B021 (2026-10-01): the verdict was read by its FIRST LETTER, so the
+    # prompt's own "both stay" deleted fact A, "Because..." / "Based on..."
+    # deleted fact A and "As far as I can tell..." / "Agreed" deleted fact B.
+
+    def test_a_chatty_reply_keeps_both_facts(self):
+        for reply in ("Both stay", "Both stay, sir.", "Because they differ",
+                      "Based on these, both are fine", "Agreed, sir.",
+                      "As far as I can tell they are compatible", "KEEP",
+                      "keep", "", "Answer: A"):
+            with self.subTest(reply=reply):
+                self._seed([("a", "fact a text", 1.0),
+                            ("b", "fact b text", 2.0)])
+                with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+                    summary = ltm.reflect_and_consolidate(
+                        llm_call=lambda p, c, r=reply: r)
+                self.assertEqual(summary["contradictions_resolved"], 0)
+                self.assertEqual(summary["merged"], 0)
+                self.assertEqual(sorted(ltm._facts), ["a", "b"])
+                self.assertEqual(ltm._facts["b"]["text"], "fact b text")
+
+    def test_a_bare_verdict_with_the_persona_tail_still_acts(self):
+        for reply, gone in (("B, sir.", "b"), ("**A**", "a"), ("'B'", "b"),
+                            ("A.", "a")):
+            with self.subTest(reply=reply):
+                self._seed([("a", "fact a text", 1.0),
+                            ("b", "fact b text", 2.0)])
+                with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+                    summary = ltm.reflect_and_consolidate(
+                        llm_call=lambda p, c, r=reply: r)
+                self.assertEqual(summary["contradictions_resolved"], 1)
+                self.assertNotIn(gone, ltm._facts)
+
+    def test_merge_without_a_colon_is_not_a_merge(self):
+        # "Merge them, sir" used to replace fact A with the whole reply.
+        self._seed([("a", "fact a text", 1.0), ("b", "fact b text", 2.0)])
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            summary = ltm.reflect_and_consolidate(
+                llm_call=lambda p, c: "Merge them, sir")
+        self.assertEqual(summary["merged"], 0)
+        self.assertEqual(ltm._facts["b"]["text"], "fact b text")
+        self.assertIn("a", ltm._facts)
+
+    def test_merge_text_loses_the_persona_tail(self):
+        self._seed([("a", "fact a text", 1.0), ("b", "fact b text", 2.0)])
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            ltm.reflect_and_consolidate(
+                llm_call=lambda p, c: "MERGE: fused fact, sir.")
+        self.assertEqual(ltm._facts["b"]["text"], "fused fact")
+
+    # ── B020 (2026-10-01): the trusted-source guard covered the A/B path
+    # only; near-duplicates and MERGE still deleted migrated facts.
+
+    def test_merge_never_rewrites_or_deletes_a_trusted_fact(self):
+        for mig_newer in (False, True):
+            with self.subTest(trusted_side="ids[i]" if mig_newer else "ids[j]"):
+                self._seed([("mig", "user's name is Marcus",
+                             2.0 if mig_newer else 1.0,
+                             "bobert_memory_migration"),
+                            ("amb", "user's name is Marcus Lee",
+                             1.0 if mig_newer else 2.0, "merge_memory")])
+                with mock.patch.object(ltm, "_cosine_sim",
+                                       lambda x, y: 0.7):
+                    summary = ltm.reflect_and_consolidate(
+                        llm_call=lambda p, c: "MERGE: user is Marcus Lee")
+                self.assertEqual(summary["merged"], 0)
+                self.assertEqual(ltm._facts["mig"]["text"],
+                                 "user's name is Marcus")
+                self.assertEqual(ltm._facts["amb"]["text"],
+                                 "user's name is Marcus Lee")
+
+    def test_a_near_duplicate_deletes_the_untrusted_side(self):
+        # The trusted fact is the OLDER one (migration day); the newer
+        # near-identical variant is the mis-heard one and goes instead.
+        self._seed([("mig", "user's name is Marcus", 1.0,
+                     "bobert_memory_migration"),
+                    ("amb", "user's name is Markus", 2.0, "merge_memory")])
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.95), \
+             mock.patch("builtins.print") as p:
+            summary = ltm.reflect_and_consolidate()
+        self.assertEqual(summary["duplicates_removed"], 1)
+        self.assertIn("mig", ltm._facts)
+        self.assertNotIn("amb", ltm._facts)
+        # Auditable: the deletion is logged by id and reason, never by text.
+        logged = " ".join(str(c.args[0]) for c in p.call_args_list if c.args)
+        self.assertIn("reflector removed amb", logged)
+        self.assertNotIn("Markus", logged)
+
+    def test_a_near_duplicate_between_equals_still_drops_the_older(self):
+        self._seed([("old", "user's name is Marcus", 1.0, "merge_memory"),
+                    ("new", "user's name is Markus", 2.0, "merge_memory")])
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.95):
+            ltm.reflect_and_consolidate()
+        self.assertNotIn("old", ltm._facts)
+        self.assertIn("new", ltm._facts)
+
+    def test_a_merge_that_looks_like_a_secret_or_a_blob_is_refused(self):
+        for merged in ("the wifi password is hunter2",
+                       "x" * 200):
+            with self.subTest(merged=merged[:20]):
+                self._seed([("a", "fact a text", 1.0),
+                            ("b", "fact b text", 2.0)])
+                with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+                    summary = ltm.reflect_and_consolidate(
+                        llm_call=lambda p, c, m=merged: f"MERGE: {m}")
+                self.assertEqual(summary["merged"], 0)
+                self.assertEqual(sorted(ltm._facts), ["a", "b"])
+
+    # ── B078 (2026-10-01): settled decisions are reported to a sink so the
+    # monolith can apply them to bobert_memory.json's prompt facts.
+
+    def test_a_contradiction_is_reported_to_the_sink(self):
+        got = []
+        ltm.set_reflector_sink(got.append)
+        self.addCleanup(ltm.set_reflector_sink, None)
+        self._seed([("a", "User lives in Boulder", 1.0),
+                    ("b", "User lives in Denver", 2.0)])
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            ltm.reflect_and_consolidate(llm_call=lambda p, c: "A")
+        self.assertEqual(got, [[("User lives in Boulder",
+                                 "User lives in Denver")]])
+
+    def test_a_merge_is_reported_to_the_sink_in_order(self):
+        got = []
+        ltm.set_reflector_sink(got.append)
+        self.addCleanup(ltm.set_reflector_sink, None)
+        self._seed([("a", "User has a dog", 1.0),
+                    ("b", "User's dog is named Rex", 2.0)])
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            ltm.reflect_and_consolidate(
+                llm_call=lambda p, c: "MERGE: User has a dog named Rex")
+        self.assertEqual(got, [[
+            ("User's dog is named Rex", "User has a dog named Rex"),
+            ("User has a dog", "User has a dog named Rex")]])
+
+    def test_nothing_settled_reports_nothing_and_a_bad_sink_is_harmless(self):
+        got = []
+        ltm.set_reflector_sink(got.append)
+        self.addCleanup(ltm.set_reflector_sink, None)
+        self._seed([("a", "fact a text", 1.0), ("b", "fact b text", 2.0)])
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            ltm.reflect_and_consolidate(llm_call=lambda p, c: "Both stay")
+        self.assertEqual(got, [])
+
+        def _boom(_changes):
+            raise RuntimeError("sink down")
+        ltm.set_reflector_sink(_boom)
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            summary = ltm.reflect_and_consolidate(llm_call=lambda p, c: "A")
+        self.assertEqual(summary["contradictions_resolved"], 1)
+
     def test_llm_pair_cap_bounds_adjudications(self):
         calls = []
 
@@ -1409,7 +1559,10 @@ class ForgetSinceTests(_LtmBase):
         }
         with mock.patch.object(ltm, "_chroma_delete") as cdel:
             res = ltm.forget_since(now - 3600)
-        self.assertEqual(res, {"episodes": 1, "facts": 1, "working": 1})
+        # "fact_texts" (2026-10-01): the caller drops the same facts from
+        # bobert_memory.json, where every one of them was mirrored from.
+        self.assertEqual(res, {"episodes": 1, "facts": 1, "working": 1,
+                               "fact_texts": ["fact learned just now"]})
         # Episodic log: recent line gone, old + unparseable kept, atomic.
         with open(ltm._EPISODE_LOG, encoding="utf-8") as f:
             content = f.read()
@@ -1438,7 +1591,8 @@ class ForgetSinceTests(_LtmBase):
         with mock.patch.object(ltm, "_save_facts_locked") as save:
             res = ltm.forget_since(now - 3600)
             save.assert_not_called()
-        self.assertEqual(res, {"episodes": 0, "facts": 0, "working": 0})
+        self.assertEqual(res, {"episodes": 0, "facts": 0, "working": 0,
+                               "fact_texts": []})
         self.assertFalse(os.path.exists(ltm._EPISODE_LOG + ".tmp"))
         self.assertIn("fold", ltm._facts)
 

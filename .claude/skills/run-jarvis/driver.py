@@ -184,7 +184,11 @@ def inject(text: str) -> None:
                 items = []
         except Exception:
             items = []
-    items.append({"text": text, "ts": time.time()})
+    # "source": "test" -- a verification line from this harness is not the
+    # owner speaking, and JARVIS must never learn it as a fact about him
+    # (2026-10-01: typed injects always teach; see bobert_companion's
+    # _last_inject_source).
+    items.append({"text": text, "ts": time.time(), "source": "test"})
     _write_atomic(INJECT, json.dumps(items, indent=2))
 
 

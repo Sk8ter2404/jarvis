@@ -47,21 +47,31 @@ def voice_verdict(name, score, *, enrolled: bool, may_write: bool = True,
     is someone else; between the two it is too close to call. A score of 0 (or
     junk) means no embedding could be computed, which is no evidence at all.
     ``may_write`` False (an enrolled guest without ``memory_write``) makes a
-    match NOT_OWNER: that person may talk to JARVIS but not teach him."""
+    match NOT_OWNER: that person may talk to JARVIS but not teach him.
+
+    ``reject_below`` also binds a MATCHED voice (2026-10-01). It used to be
+    read only when there was no name, and voice_id names a speaker from 0.72
+    up, so every setting from 0.72 to 1.0 behaved exactly like 0.72: the
+    owner raised "Not-you voice score below" because a guest still taught,
+    and a guest scoring 0.78 against his print went on teaching."""
     if not enrolled:
-        return UNAVAILABLE
-    if name:
-        return OWNER if may_write else NOT_OWNER
-    try:
-        s = float(score)
-    except (TypeError, ValueError):
-        return UNAVAILABLE
-    if not math.isfinite(s) or s <= 0.0:
         return UNAVAILABLE
     try:
         floor = float(reject_below)
     except (TypeError, ValueError):
         floor = 0.60
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        s = None
+    if name:
+        if not may_write:
+            return NOT_OWNER
+        if s is not None and math.isfinite(s) and s < floor:
+            return NOT_OWNER    # matched, but under the owner's raised bar
+        return OWNER
+    if s is None or not math.isfinite(s) or s <= 0.0:
+        return UNAVAILABLE
     return NOT_OWNER if s < floor else UNSURE
 
 
@@ -90,10 +100,20 @@ class LearnGate:
             return False
         return 0.0 <= ts - self._last_positive <= self.window_s
 
-    def note_wake(self, ts: float) -> None:
+    def note_wake(self, ts: float, voice: str = UNAVAILABLE) -> bool:
         """A standby wake word ("JARVIS" alone): the owner is starting a
-        conversation, so the next turns are follow-ups."""
+        conversation, so the next turns are follow-ups. Returns whether the
+        window opened.
+
+        A wake in a voice that is confidently NOT the owner's opens nothing
+        (2026-10-01), the same rule decide() applies to a "JARVIS, ..." turn:
+        it used to open the window for anyone, so a guest's standby wake let
+        the guest's UNSURE follow-ups teach. A typed wake, or one with no
+        voice evidence, opens it as before."""
+        if voice == NOT_OWNER:
+            return False
         self._open(float(ts))
+        return True
 
     def decide(self, ts: float, *, injected: bool = False, wake: bool = False,
                voice: str = UNAVAILABLE,

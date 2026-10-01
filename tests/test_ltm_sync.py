@@ -138,6 +138,25 @@ class ReflectorWiringTests(unittest.TestCase):
         with mock.patch.object(self.bc, "_llm_quick", return_value=""):
             self.assertEqual(adapter("prompt", None), "")
 
+    def test_boot_warm_installs_the_reflector_sink(self):
+        # B078 (2026-10-01): the reflector's settled contradictions now reach
+        # the prompt's own fact list through this sink.
+        fake = mock.Mock()
+        fake.list_facts.return_value = []
+        self._run_warm(fake)
+        fake.set_reflector_sink.assert_called_once_with(
+            self.bc._ltm_reflector_sink)
+
+    def test_adapter_leaves_room_for_a_whole_merged_fact(self):
+        # A "MERGE: <fact>" reply was cut mid-word at the old 60-token cap.
+        fake = mock.Mock()
+        fake.list_facts.return_value = []
+        self._run_warm(fake)
+        adapter = fake.set_reflector_llm.call_args[0][0]
+        with mock.patch.object(self.bc, "_llm_quick", return_value="") as mq:
+            adapter("prompt", [])
+        self.assertGreaterEqual(mq.call_args.kwargs.get("max_tokens"), 100)
+
     def test_failed_warm_up_does_not_wire(self):
         fake = mock.Mock()
         fake.ensure_loaded.side_effect = RuntimeError("store locked")
@@ -159,6 +178,65 @@ class ReflectorWiringTests(unittest.TestCase):
         fake._try_import_embedder.side_effect = RuntimeError("no torch")
         self._run_warm(fake)                      # must not raise
         fake.set_reflector_llm.assert_called_once()
+
+
+@requires_monolith
+class ReflectorSinkTests(unittest.TestCase):
+    """B078 (2026-10-01): the LTM reflector settled contradictions in the
+    semantic store only, while bobert_memory.json -- whose facts go into
+    every system prompt -- kept both sides. _ltm_reflector_sink applies each
+    settled decision there. Generic fixtures; the real store is never read."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _sink(self, store, changes):
+        import copy
+        bc = self.bc
+        saved = []
+
+        def _load():
+            return copy.deepcopy(store)
+
+        with mock.patch.object(bc, "load_memory", _load), \
+             mock.patch.object(bc, "save_memory", saved.append), \
+             mock.patch.object(bc, "_request_prompt_rebuild") as rebuild, \
+             mock.patch("builtins.print") as p:
+            bc._ltm_reflector_sink(changes)
+        logged = " ".join(str(c.args[0]) for c in p.call_args_list if c.args)
+        return saved, rebuild, logged
+
+    def test_the_settled_loser_leaves_the_prompt_facts(self):
+        store = {"facts": ["User lives in Boulder", "User likes tea",
+                           "User lives in Denver"], "projects": []}
+        saved, rebuild, logged = self._sink(
+            store, [("user lives in boulder", "User lives in Denver")])
+        self.assertEqual(saved[-1]["facts"],
+                         ["User likes tea", "User lives in Denver"])
+        rebuild.assert_called_once_with()
+        self.assertNotIn("Boulder", logged)        # counts only, never text
+
+    def test_a_merge_replaces_in_place_then_drops_the_other(self):
+        store = {"facts": ["User has a dog", "User likes tea",
+                           "User's dog is named Rex"], "projects": []}
+        saved, _r, _l = self._sink(store, [
+            ("User's dog is named Rex", "User has a dog named Rex"),
+            ("User has a dog", "User has a dog named Rex")])
+        self.assertEqual(saved[-1]["facts"],
+                         ["User likes tea", "User has a dog named Rex"])
+
+    def test_a_secret_shaped_replacement_is_never_written(self):
+        store = {"facts": ["User has a router"], "projects": []}
+        saved, _r, _l = self._sink(store, [
+            ("User has a router", "User's router password is hunter2")])
+        self.assertEqual(saved[-1]["facts"], [])
+
+    def test_texts_not_in_the_prompt_memory_change_nothing(self):
+        store = {"facts": ["User likes tea"], "projects": []}
+        saved, rebuild, _l = self._sink(store, [("User likes coffee", None)])
+        self.assertEqual(saved, [])
+        rebuild.assert_not_called()
 
 
 if __name__ == "__main__":

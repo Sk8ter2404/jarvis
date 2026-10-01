@@ -1456,6 +1456,18 @@ from core.prompts import base_system_prompt as _base_system_prompt
 conversation_history: list[dict] = []
 _system_prompt = BASE_SYSTEM_PROMPT   # extended with memory at startup
 
+# The session's RUNNING summary (2026-10-01; see _session_summary_update):
+# the text so far, the last conversation_history message it covers (by
+# identity), when it was last written (wall clock), the messages the history
+# trim dropped before a checkpoint folded them in, and a generation a memory
+# wipe bumps so an in-flight summary of forgotten turns is discarded.
+_session_summary_lock = threading.Lock()
+_session_running_summary = [""]
+_session_summary_marker: list = [None]
+_session_summary_at = [0.0]
+_session_trimmed: deque = deque(maxlen=400)
+_session_summary_gen = [0]
+
 # Cap the rolling history (10 user+assistant turns). The trim loop was copy-
 # pasted at two call sites with a local MAX_HISTORY each — centralised here so
 # the "trim in pairs from the front" invariant (the Claude API requires the
@@ -1508,10 +1520,16 @@ def _trim_conversation_history(max_history: int = MAX_CONVERSATION_HISTORY) -> N
     """Trim conversation_history IN PLACE (other modules hold the same list):
     chunked, pair-wise, user-first — see _history_trim_count. EVERY trim site
     goes through here, so the chunking and the user-first invariant cannot
-    drift between them."""
+    drift between them.
+
+    The trimmed messages are kept for the session summary until its next
+    checkpoint has folded them in (_session_trimmed, 2026-10-01): a long
+    session used to be summarised from the last ~10 exchanges only."""
     n = _history_trim_count(conversation_history, max_history)
     if n:
-        del conversation_history[:n]
+        with _session_summary_lock:
+            _session_trimmed.extend(conversation_history[:n])
+            del conversation_history[:n]
 
 
 def _append_turn(user: str, assistant: str) -> None:
@@ -1594,6 +1612,8 @@ MAX_FACTS    = 120
 MAX_PROJECTS = 20
 MAX_TOPICS   = 60
 MAX_SESSIONS = 20
+# A topic is a "2-5 word label"; anything near this long is a runaway.
+_MAX_TOPIC_LEN = 80
 
 _memory_lock = threading.RLock()
 
@@ -1637,7 +1657,7 @@ def _owner_vocab() -> frozenset:
 
 
 def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
-                 provenance=None):
+                 provenance=None, epoch=None):
     """Atomically merge new facts/projects/topic into bobert_memory.json.
 
     Holds _memory_lock across load → dedupe → trim → save so concurrent
@@ -1664,6 +1684,11 @@ def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
     that gate; with LEARN_ONLY_FROM_OWNER on (2026-09-30, core/learn_gate.py)
     a dict provenance also needs ``owner_directed`` or ``owner_voice`` for its
     FACTS to land.
+
+    epoch (2026-10-01) — the _learn_epoch an automated learner's batch was
+    taken under. A memory wipe since then (reset / forget the last hour)
+    makes this a no-op, checked under _memory_lock, which the wipe holds
+    while it bumps the epoch. None (deliberate writes) is never dropped.
     """
     # A bare string (a malformed extractor reply) would otherwise be iterated
     # character by character into one-letter "facts"/"projects".
@@ -1704,6 +1729,16 @@ def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
             continue
         new_projects.append(_clamp_fact_len(_p))
     new_topic = new_topic.strip() if isinstance(new_topic, str) else ""
+    # Topics are rendered into every system prompt too ("Topics picked up
+    # from recent conversations"), so they get the SAME secret / noise guards
+    # and a length cap (2026-10-01): a "router password <value>" label used
+    # to reach the prompt -- and the cloud on a local->Claude fallback.
+    if new_topic and (_is_secret_fact(new_topic)
+                      or _is_internal_noise_fact(new_topic)):
+        print("  [memory] dropped candidate topic (secret / internal noise)")
+        new_topic = ""
+    if new_topic:
+        new_topic = _clamp_fact_len(new_topic, _MAX_TOPIC_LEN)
 
     added_facts: list[str] = []
     added_projects: list[str] = []
@@ -1746,6 +1781,9 @@ def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
         return added_facts, added_projects
 
     with _memory_lock:
+        if epoch is not None and epoch != _learn_epoch[0]:
+            print("  [learn] batch from before a memory wipe discarded")
+            return added_facts, added_projects
         memory = load_memory()
         memory.setdefault("facts", [])
         memory.setdefault("projects", [])
@@ -2075,8 +2113,11 @@ def build_system_prompt(memory: dict) -> str:
                    "this list):\n")
         prompt += "\n".join(f"- {p}" for p in memory["projects"])
 
-    if memory["topics"]:
-        recent_topics = memory["topics"][-15:]
+    # Secret-shaped topic labels and session summaries written before their
+    # write guards existed (2026-10-01) are skipped, not sent every turn.
+    recent_topics = [t for t in memory["topics"][-15:]
+                     if not _is_secret_fact(str(t.get("topic", "")))]
+    if recent_topics:
         prompt += ("\n\nTopics picked up from recent conversations "
                    "(auto-learned from speech recognition and possibly "
                    "mis-heard: low-confidence hints only, never volunteer "
@@ -2087,8 +2128,9 @@ def build_system_prompt(memory: dict) -> str:
             for t in recent_topics
         )
 
-    if memory["sessions"]:
-        recent = memory["sessions"][-5:]
+    recent = [x for x in memory["sessions"][-5:]
+              if not _is_secret_fact(str(x.get("summary", "")))]
+    if recent:
         prompt += "\n\nRecent conversation summaries:\n"
         prompt += "\n".join(
             f"- {s['date']} ({s.get('location', '?')}): {s['summary']}"
@@ -2274,6 +2316,18 @@ _learn_pending: list = []          # [(user_msg, ai_reply, owner_directed, conf[
 _learn_worker_live = [False]       # a worker thread owns the queue
 _LEARN_BATCH_MAX = 6
 
+# Memory-wipe generation (2026-10-01). "Reset your memory" / "forget the last
+# hour" bump it (core/actions.py, via _learn_invalidate) while holding
+# _memory_lock. A turn queued for learning BEFORE a wipe carries the old
+# value and is never learned after it: the learn worker waits up to
+# LOCAL_BACKGROUND_MAX_DEFER_S for the owner to go quiet, so the turns spoken
+# just before "forget the last hour" / "yes" used to be extracted AFTER the
+# purge and written back with ts=now -- into the memory just wiped.
+_learn_epoch = [0]
+# The wall-clock window the last wipe forgot, (lo, hi): turns still waiting
+# in the LTM writer's queue from inside it are not recorded afterwards.
+_ltm_forgotten = [(0.0, 0.0)]
+
 # Owner-only learning (core/learn_gate.py, LEARN_ONLY_FROM_OWNER). Every turn
 # (and every standby wake) goes through ONE classifier thread, in order: the
 # voiceprint check costs a resemblyzer embedding, which must never run on the
@@ -2328,21 +2382,65 @@ def _learn_gate_submit(item: tuple) -> None:
         print(f"  [learn-gate] dropped a turn: {type(e).__name__}")
 
 
-def _learn_gate_note_wake() -> None:
+def _learn_gate_note_wake(audio=None, sample_rate: int = 0) -> None:
     """A standby wake word: the owner is starting a conversation. Queued
-    with the turns so the window opens at the right point in the sequence."""
+    with the turns so the window opens at the right point in the sequence.
+
+    ``audio`` / ``sample_rate``: the wake capture (None for a typed wake).
+    Its voice is checked on the learn-gate thread, like a turn's, so a wake
+    in someone else's voice does not open the owner's window (2026-10-01)."""
     if LEARN_ONLY_FROM_OWNER:
-        _learn_gate_submit(("wake", time.monotonic()))
+        _learn_gate_submit(("wake", time.monotonic(), audio, sample_rate))
+
+
+def _learn_invalidate(cutoff_wall: float | None = None) -> int:
+    """A memory wipe is running (core/actions.py): nothing queued for learning
+    before it may land after it. Bumps _learn_epoch and empties _learn_pending
+    (a batch already taken carries the old epoch, and merge_memory drops it);
+    turns still on the learn-gate queue and ambient learners in flight carry
+    the old epoch too and are dropped where they would be queued. Also marks
+    [cutoff_wall, now] (everything, for a reset) as forgotten for the LTM
+    writer's queue. Call holding _memory_lock. Returns the turns dropped."""
+    with _memory_lock:
+        with _learn_lock:
+            _learn_epoch[0] += 1
+            dropped = len(_learn_pending)
+            _learn_pending.clear()
+        _ltm_forgotten[0] = (float(cutoff_wall or 0.0), time.time())
+    if dropped:
+        print(f"  [learn] {dropped} queued turn(s) from before the memory "
+              f"wipe will not be learned")
+    return dropped
+
+
+def _learn_enqueue_current(turn: tuple, epoch) -> bool:
+    """_learn_enqueue, unless the turn was queued before a memory wipe
+    (``epoch`` older than _learn_epoch). The check and the enqueue share
+    _memory_lock with _learn_invalidate, so a wipe cannot slip between them.
+    ``epoch`` None = current (a caller that has no older value)."""
+    with _memory_lock:
+        if epoch is not None and epoch != _learn_epoch[0]:
+            print("  [learn] not learning a turn from before a memory wipe")
+            return False
+        _learn_enqueue(turn)
+    return True
 
 
 def _learn_gate_classify(item: tuple) -> None:
     """Decide one queued item; a turn that may teach joins _learn_pending.
     Logs the decision and the voice score, never the turn's text."""
     if item[0] == "wake":
-        _learn_gate().note_wake(item[1])
+        # The voiceprint check runs here, never on the main loop. A wake with
+        # no capture (typed) is UNAVAILABLE and opens the window as before.
+        _a, _sr = (item[2], item[3]) if len(item) >= 4 else (None, 0)
+        v, s = _learn_voice_verdict(_a, _sr)
+        if not _learn_gate().note_wake(item[1], voice=v):
+            print(f"  [learn-gate] standby wake did not open the window: "
+                  f"not the owner's voice, voice {s:.2f}")
         return
     (_kind, ts, user_msg, ai_reply, owner_directed, conf,
-     injected, wake, audio, sample_rate, voice) = item
+     injected, wake, audio, sample_rate, voice) = item[:11]
+    epoch = item[11] if len(item) > 11 else None
     score = None
     if voice is None:
         if injected:
@@ -2355,7 +2453,8 @@ def _learn_gate_classify(item: tuple) -> None:
     print(f"  [learn-gate] {'learning from' if ok else 'not learning from'} "
           f"this turn: {why}{_score}")
     if ok:
-        _learn_enqueue((user_msg, ai_reply, bool(owner_directed), conf, voice))
+        _learn_enqueue_current(
+            (user_msg, ai_reply, bool(owner_directed), conf, voice), epoch)
 
 
 def _learn_gate_loop() -> None:
@@ -2374,7 +2473,8 @@ def _learn_gate_loop() -> None:
 def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
                     owner_directed: bool = True, conf=None,
                     injected: bool = False, wake: bool = False,
-                    audio=None, sample_rate: int = 0, voice=None):
+                    audio=None, sample_rate: int = 0, voice=None,
+                    epoch=None):
     """Background: extract new facts/projects/topic from this exchange.
 
     ``memory`` is accepted (and deliberately IGNORED) for call-site
@@ -2401,18 +2501,24 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
     typed, wake-word, owner-voice and follow-up turns may teach; anyone
     else's never reaches the extractor. ``voice`` is a verdict the caller
     already has (the ambient path's voice-ID); otherwise ``audio`` is checked
-    against the enrolled voiceprints. Off, these are ignored."""
+    against the enrolled voiceprints. Off, these are ignored.
+
+    ``epoch`` (2026-10-01): the _learn_epoch the caller saw when it heard the
+    turn (the ambient learner waits on its content judge first). A turn from
+    before a memory wipe is never learned after it. None = now."""
     if not LEARN_EVERY_TURN:
         return
     # Nothing heard during a device dialogue (or its tail) is learned.
     if _dialogue_gate_active():
         return
+    ep = _learn_epoch[0] if epoch is None else epoch
     if LEARN_ONLY_FROM_OWNER:
         _learn_gate_submit(("turn", time.monotonic(), user_msg, ai_reply,
                             bool(owner_directed), conf, bool(injected),
-                            bool(wake), audio, sample_rate, voice))
+                            bool(wake), audio, sample_rate, voice, ep))
         return
-    _learn_enqueue((user_msg, ai_reply, bool(owner_directed), conf))
+    _learn_enqueue_current((user_msg, ai_reply, bool(owner_directed), conf),
+                           ep)
 
 
 def _learn_enqueue(turn: tuple) -> None:
@@ -2523,9 +2629,11 @@ def _learn_prompt(batch: list) -> tuple:
     return system, user, 400
 
 
-def _learn_apply(text: str, batch=None) -> None:
+def _learn_apply(text: str, batch=None, epoch=None) -> None:
     """Parse one extraction reply and merge it into memory, gated by the
-    batch's provenance (None = the legacy ungated merge)."""
+    batch's provenance (None = the legacy ungated merge). ``epoch``: the
+    _learn_epoch the batch was taken under; a memory wipe since then makes
+    merge_memory drop it (2026-10-01)."""
     # Extract the FIRST complete JSON object from the response.
     # Using raw_decode instead of a regex so we never accidentally
     # capture two objects (which produces JSONDecodeError: Extra data).
@@ -2547,6 +2655,7 @@ def _learn_apply(text: str, batch=None) -> None:
         new_projects=data.get("new_projects"),
         new_topic=topic,
         provenance=_learn_provenance(batch),
+        epoch=epoch,
     )
 
     added = [f"fact: {f}" for f in added_facts] \
@@ -2606,6 +2715,10 @@ def _learn_worker() -> None:
                                 n += 1
                             batch = head[:n]
                             del _learn_pending[:n]
+                            # A wipe after this point empties the queue and
+                            # bumps the epoch: merge_memory then drops this
+                            # batch (its extraction is still running).
+                            batch_epoch = _learn_epoch[0]
                         if not batch:
                             continue
                         if len(batch) > 1:
@@ -2613,7 +2726,7 @@ def _learn_worker() -> None:
                                   f"queued turns in one call")
                         system, user, max_tokens = _learn_prompt(batch)
                         text = _llm_quick(system, user, max_tokens=max_tokens)
-                    _learn_apply(text or "", batch)
+                    _learn_apply(text or "", batch, epoch=batch_epoch)
                 except Exception as e:
                     # Log to console (which logs to file too) but don't break
                     # the chat -- and keep draining the queue.
@@ -2701,9 +2814,18 @@ def _ambient_owner_voice(audio, sample_rate: int) -> "tuple[bool, str, float]":
         if not _vid.list_enrolled():
             return (False, "unavailable", 0.0)
         name, score = _vid.identify_speaker(audio, sample_rate)
-        if name:
+        # ONE rule for "is this the owner" (2026-10-01): the same verdict the
+        # answered-turn path uses (_learn_voice_verdict), so an enrolled guest
+        # without memory_write -- or a match under the owner's raised
+        # LEARN_VOICE_REJECT_BELOW -- is not "owner" here either. This copy
+        # used to accept ANY enrolled name, so enrolling a family member made
+        # her overheard conversation teach facts about the owner.
+        may_write = bool(name) and _vid.can(name, "memory_write")
+        if _learn_gate_mod.voice_verdict(
+                name, score, enrolled=True, may_write=may_write,
+                reject_below=LEARN_VOICE_REJECT_BELOW) == _learn_gate_mod.OWNER:
             return (True, "owner", float(score))
-        return (True, "unknown", float(score))
+        return (True, "unknown", float(score or 0.0))
     except Exception as _e:
         print(f"  [ambient-learn] voice-ID probe failed: "
               f"{type(_e).__name__}: {_e}")
@@ -2856,6 +2978,10 @@ def _ambient_learn_from_gated(text: str, memory: dict,
         return
     if _dialogue_gate_active():
         return
+    # The memory-wipe generation this utterance was heard in (2026-10-01):
+    # the content judge below can wait minutes for the background slot, and
+    # a "forget the last hour" in between must still forget it.
+    _ep = _learn_epoch[0]
     try:
         snippet = (text or "").strip()
         n = len(snippet)
@@ -2882,7 +3008,8 @@ def _ambient_learn_from_gated(text: str, memory: dict,
                 # topic or project (core/topic_hygiene.py rule 1). The voice
                 # verdict lets owner-only learning keep it (core/learn_gate).
                 learn_from_turn(snippet, "", memory, owner_directed=False,
-                                conf=conf, voice=_learn_gate_mod.OWNER)
+                                conf=conf, voice=_learn_gate_mod.OWNER,
+                                epoch=_ep)
                 print(f"  [ambient-learn] ingested gated text ({n} chars) "
                       f"— owner voice (score={vscore:.2f})")
                 return
@@ -2911,7 +3038,8 @@ def _ambient_learn_from_gated(text: str, memory: dict,
         if not _ambient_should_learn_text(snippet, conf, peak_rms):
             return
 
-        learn_from_turn(snippet, "", memory, owner_directed=False, conf=conf)
+        learn_from_turn(snippet, "", memory, owner_directed=False, conf=conf,
+                        epoch=_ep)
         print(f"  [ambient-learn] ingested gated text ({n} chars) "
               "— no media, voice-ID unavailable (content heuristic passed)")
     except Exception as _e:
@@ -3231,22 +3359,23 @@ def detect_startup_pattern() -> str:
 
 
 def save_session_to_memory(memory: dict):
-    """On shutdown: write a one-sentence summary of this session."""
-    if len(conversation_history) < 4:
+    """On shutdown: write the summary of this WHOLE session -- the running
+    summary the checkpoints keep, updated with whatever came after the last
+    one (_session_summary_update, 2026-10-01; it used to summarise only the
+    trimmed last ~10 exchanges)."""
+    # Snapshot first (under _session_summary_lock), so a background append
+    # (pending-speech / proactive-alert thread) during shutdown can't change
+    # the list mid-iteration.
+    _pending = _session_summary_pending()
+    if _pending is None and not _session_running_summary[0]:
         return
     print("\nSummarising session…")
-    # Snapshot first — list() is an atomic copy under the GIL, so a background
-    # append (pending-speech / proactive-alert thread) during shutdown can't
-    # change the list size mid-iteration and raise RuntimeError.
-    transcript = "\n".join(
-        f"{m['role'].title()}: {m['content']}" for m in list(conversation_history)
-    )
     try:
-        text = _llm_quick(
-            system="Summarise this conversation in ONE sentence. Just the sentence, nothing else.",
-            user=transcript, max_tokens=80,
-        )
-        summary = text.strip().split("\n")[0]
+        if _pending is not None:
+            summary = (_session_summary_update(_pending, record=False)
+                       or _session_running_summary[0])
+        else:
+            summary = _session_running_summary[0]
         if summary:
             session_entry = {
                 "date":     time.strftime("%Y-%m-%d"),
@@ -3292,9 +3421,124 @@ def save_session_to_memory(memory: dict):
 # This periodic checkpoint persists a summary mid-session so a crash loses at
 # most ~10 minutes of recall context. record_session_summary() is idempotent
 # per session (keyed on iso_start), so each checkpoint UPDATES one entry rather
-# than appending duplicates.
+# than appending duplicates -- which is why that entry must be a summary of
+# the WHOLE session so far (the running summary, 2026-10-01), never of the
+# trimmed history window alone.
 _SESSION_CHECKPOINT_INTERVAL_S = 600          # 10 minutes
-_session_checkpoint_last_len   = [0]          # conversation_history len at last checkpoint
+
+
+def _session_summary_pending():
+    """What the next session-summary update would cover, or None when there
+    is nothing new. A snapshot: (gen, backlog, new messages, running summary).
+
+    New = every message after the last one already summarised (found by
+    IDENTITY, not by length: a full history cycles through 14/16/18/20
+    messages, so the old length test skipped checkpoints that had new
+    turns), across the trimmed backlog and the live history. Fewer than four
+    messages and no summary yet is "nothing worth summarising", as before."""
+    with _session_summary_lock:
+        backlog = list(_session_trimmed)
+        seq = backlog + list(conversation_history)
+        marker = _session_summary_marker[0]
+        running = _session_running_summary[0]
+        gen = _session_summary_gen[0]
+    start = 0
+    if marker is not None:
+        for k in range(len(seq) - 1, -1, -1):
+            if seq[k] is marker:
+                start = k + 1
+                break
+    new = [m for m in seq[start:] if isinstance(m, dict)]
+    if not new or (not running and len(new) < 4):
+        return None
+    return gen, backlog, new, running
+
+
+def _session_summary_update(pending, *, record: bool = True) -> str:
+    """Fold `pending` (_session_summary_pending) into the session's RUNNING
+    summary and return it ('' when withheld or empty). Raises when the LLM
+    call does (callers log it).
+
+    2026-10-01: each checkpoint used to summarise only the trimmed history
+    window and REPLACE the session's single row (record_session_summary is
+    keyed on the session start), so everything before the last ~10 exchanges
+    of a long session vanished from "what did we do this afternoon". Now the
+    model gets the summary so far plus only the new turns, and rewrites the
+    summary to cover all of it. A summary that looks like a secret or
+    internal noise is withheld (the same guards as facts: it is rendered
+    into every prompt). ``record`` writes it to the recall index; a memory
+    wipe since `pending` was taken (gen changed) discards the result."""
+    gen, backlog, new, running = pending
+    transcript = "\n".join(
+        f"{str(m.get('role', '')).title()}: {str(m.get('content', ''))[:500]}"
+        for m in new)
+    if running:
+        text = _llm_quick(
+            system=("You keep a running summary of the user's whole "
+                    "conversation session. Rewrite the summary so it covers "
+                    "EVERYTHING: the summary so far plus the new turns. At "
+                    "most two sentences, main topics in order. Just the "
+                    "summary, nothing else."),
+            user=f"Summary so far: {running}\n\nNew turns:\n{transcript}",
+            max_tokens=120,
+        )
+    else:
+        text = _llm_quick(
+            system=("Summarise this conversation in ONE sentence. Just the "
+                    "sentence, nothing else."),
+            user=transcript, max_tokens=80,
+        )
+    summary = (text or "").strip().split("\n")[0].strip()
+    if summary and (_is_secret_fact(summary)
+                    or _is_internal_noise_fact(summary)):
+        print("  [memory] session summary withheld (looks like a secret "
+              "or internal noise)")
+        summary = ""
+    if summary:
+        summary = _clamp_fact_len(summary)
+    with _session_summary_lock:
+        if gen != _session_summary_gen[0]:
+            return ""           # a memory wipe ran meanwhile: forget it
+        if summary and record:
+            pattern_memory.record_session_summary(
+                summary,
+                start_ts=_session_start_time,
+                end_ts=time.time(),
+                location=LOCATION,
+            )
+        # Commit: these messages are summarised (or deliberately skipped).
+        for m in backlog:
+            if _session_trimmed and _session_trimmed[0] is m:
+                _session_trimmed.popleft()
+        _session_summary_marker[0] = new[-1]
+        if summary:
+            _session_running_summary[0] = summary
+            _session_summary_at[0] = time.time()
+    return summary
+
+
+def _forget_live_conversation(cutoff: float | None = None) -> int:
+    """'Forget the last hour' / 'reset your memory' (core/actions.py): drop
+    this process's in-context conversation -- conversation_history, which
+    rides in every LLM call and "summarise what we talked about" reads, and
+    the session summary's backlog -- so the forgotten turns are neither
+    recited nor re-summarised by the next checkpoint (2026-10-01). The
+    messages carry no timestamps (they are API messages), so the whole
+    history goes: the 20-message cap keeps it inside the hour in practice.
+    The running summary goes too unless it was last written before
+    `cutoff` (None = always). Returns the number of messages dropped."""
+    with _session_summary_lock:
+        n = len(conversation_history)
+        # In place (other modules hold the same list). A forget, not a trim:
+        # the one trim site stays _trim_conversation_history.
+        conversation_history.clear()
+        _session_trimmed.clear()
+        _session_summary_marker[0] = None
+        _session_summary_gen[0] += 1
+        if cutoff is None or _session_summary_at[0] >= cutoff:
+            _session_running_summary[0] = ""
+            _session_summary_at[0] = 0.0
+    return n
 
 
 def _session_summary_checkpoint_thread():
@@ -3305,36 +3549,17 @@ def _session_summary_checkpoint_thread():
     time.sleep(_SESSION_CHECKPOINT_INTERVAL_S)
     while True:
         try:
-            # Snapshot under the GIL (list() copy is atomic) so the main thread
-            # appending/popping conversation_history mid-iteration can't raise
-            # "list changed size during iteration" in this background thread.
-            _hist = list(conversation_history)
-            hist_len = len(_hist)
+            # Snapshot (under _session_summary_lock) of what is new since
+            # the last checkpoint -- see _session_summary_pending.
+            _pending = _session_summary_pending()
             # Only checkpoint when there's something new worth summarising.
-            if hist_len >= 4 and hist_len != _session_checkpoint_last_len[0]:
-                transcript = "\n".join(
-                    f"{m['role'].title()}: {m['content']}"
-                    for m in _hist
-                )
+            if _pending is not None:
                 try:
                     # Non-urgent: waits (bounded) while the owner is in a
                     # conversation when it would run on the local model.
                     with _lt.background_work("session-checkpoint"):
-                        text = _llm_quick(
-                            system=("Summarise this conversation in ONE "
-                                    "sentence. Just the sentence, nothing "
-                                    "else."),
-                            user=transcript, max_tokens=80,
-                        )
-                    summary = (text or "").strip().split("\n")[0]
+                        summary = _session_summary_update(_pending)
                     if summary:
-                        pattern_memory.record_session_summary(
-                            summary,
-                            start_ts=_session_start_time,
-                            end_ts=time.time(),
-                            location=LOCATION,
-                        )
-                        _session_checkpoint_last_len[0] = hist_len
                         print(f"  [session-checkpoint] saved: {summary[:80]}")
                 except Exception as _e:
                     print(f"  [session-checkpoint] summary failed: {_e}")
@@ -19303,15 +19528,20 @@ def _ltm_boot_warm() -> None:
         try:
             def _ltm_reflector_llm(prompt, ctx):
                 # Non-urgent background work (see core/local_traffic.py).
+                # 120 tokens (was 60, 2026-10-01): a "MERGE: <fact>" reply
+                # with the persona's ", sir" tail hit the 60 cap and stored
+                # the fused fact cut off mid-word; a fact is <= 300 chars.
                 with _lt.background_work("ltm-reflect"):
                     return _llm_quick(
                         system=prompt,
                         user="\n".join(
                             f"{m.get('role', '')}: {m.get('text', '')}"
                             for m in (ctx or [])),
-                        max_tokens=60,
+                        max_tokens=120,
                     )
             ltm.set_reflector_llm(_ltm_reflector_llm)
+            # ...and apply what it settles to the prompt's own fact list.
+            ltm.set_reflector_sink(_ltm_reflector_sink)
         except Exception as e:
             print(f"  [ltm] reflector wiring failed: {e}")
         # Load the embedder here too (2026-09-29): ensure_loaded() does not,
@@ -19331,14 +19561,25 @@ def _ltm_boot_warm() -> None:
 def _ltm_worker_loop() -> None:
     while True:
         try:
-            role, text = _ltm_queue.get()
+            item = _ltm_queue.get()
+            role, text = item[0], item[1]
+            ts = item[2] if len(item) > 2 else None
         except Exception:
             return
+        # Stamped when the turn HAPPENED (2026-10-01), not when this writer
+        # got to it: the writer can stall behind the reflector for minutes,
+        # and a turn recorded with ts=now survived the "forget the last hour"
+        # that ran in between. Turns from inside the last forgotten window
+        # are not recorded at all.
+        if ts is not None:
+            lo, hi = _ltm_forgotten[0]
+            if hi and lo <= ts <= hi:
+                continue
         ltm = _ltm_module()
         if ltm is None:
             continue
         try:
-            ltm.record_turn(role, text)
+            ltm.record_turn(role, text, ts=ts)
         except Exception as e:
             print(f"  [ltm] record_turn failed: {e}")
 
@@ -19379,6 +19620,67 @@ def _ltm_learn_facts(facts, projects=None) -> None:
         pass
 
 
+def _ltm_reflector_sink(changes) -> None:
+    """Apply the LTM reflector's settled contradictions and merges to store A
+    (bobert_memory.json), whose facts and projects are rendered in full into
+    every system prompt (2026-10-01). The reflector used to settle them in
+    the semantic store only, so both sides of a contradiction it had
+    "resolved" (an old and a new address) stayed in the prompt for good.
+
+    ``changes``: [(removed_text, replacement_text_or_None), ...] in the
+    order they were applied (core/long_term_memory.set_reflector_sink). A
+    removed text found in facts/projects (case-insensitive) is replaced in
+    place by its replacement -- after merge_memory's secret / noise / length
+    guards -- or dropped when the replacement is already listed or absent.
+    Runs on the ltm-writer thread; logs counts only, never fact text; never
+    raises into the reflector."""
+    try:
+        pairs = [(o.strip(), (n.strip() if isinstance(n, str) else "") or None)
+                 for o, n in (changes or [])
+                 if isinstance(o, str) and o.strip()]
+    except Exception:
+        return
+    if not pairs:
+        return
+    replaced = removed = 0
+    try:
+        with _memory_lock:
+            mem = load_memory()
+            for key in ("facts", "projects"):
+                items = mem.get(key)
+                if not isinstance(items, list):
+                    continue
+                for old, new in pairs:
+                    lo = old.lower()
+                    hits = [k for k, x in enumerate(items)
+                            if isinstance(x, str) and x.strip().lower() == lo]
+                    if not hits:
+                        continue
+                    use_new = bool(new) and not (_is_secret_fact(new)
+                                                 or _is_internal_noise_fact(new))
+                    if use_new and any(isinstance(x, str)
+                                       and x.strip().lower() == new.lower()
+                                       for x in items):
+                        use_new = False         # already listed: just drop
+                    if use_new:
+                        items[hits[0]] = _clamp_fact_len(new)
+                        replaced += 1
+                        hits = hits[1:]
+                    for k in reversed(hits):
+                        del items[k]
+                        removed += 1
+            if replaced or removed:
+                save_memory(mem)
+    except Exception as e:
+        print(f"  [ltm] reflector decisions NOT applied to the prompt "
+              f"memory: {type(e).__name__}")
+        return
+    if replaced or removed:
+        print(f"  [ltm] reflector decisions applied to the prompt memory: "
+              f"{replaced} replaced, {removed} removed")
+        _request_prompt_rebuild()
+
+
 def _ltm_enqueue(role: str, text: str) -> None:
     """Queue one turn for background recording. Non-blocking, never raises."""
     global _ltm_queue
@@ -19391,7 +19693,7 @@ def _ltm_enqueue(role: str, text: str) -> None:
             _ltm_worker_started[0] = True
             threading.Thread(target=_ltm_worker_loop, name="ltm-writer",
                              daemon=True).start()
-        _ltm_queue.put_nowait((role, text))
+        _ltm_queue.put_nowait((role, text, time.time()))
     except Exception:
         pass
 
@@ -19871,6 +20173,27 @@ def _apply_prompt_rebuild() -> bool:
     new = build_system_prompt(load_memory())
     changed = new != _system_prompt
     _system_prompt = new
+    return changed
+
+
+def _rebuild_prompt_now() -> bool:
+    """Rebuild _system_prompt NOW, bypassing the prompt-freeze quiet window
+    (2026-10-01). For a memory wipe (core/actions.py reset_memory /
+    forget_last_hour): those run from the spoken "yes" or the tray, neither
+    of which rebuilds, and the next post-turn rebuild was DEFERRED while the
+    owner kept talking -- so "what do you know about me?" right after "memory
+    reset" recited the erased facts from the old prompt. A pending deferred
+    rebuild is folded in. Returns True when the prompt changed; raises when
+    the rebuild does (the caller discloses it)."""
+    with _prompt_rebuild_lock:
+        _prompt_rebuild_pending[0] = False
+    changed = _apply_prompt_rebuild()
+    if changed:
+        try:
+            if _chat_takes_local_branch():
+                _schedule_local_reprime()   # keeps its own gates
+        except Exception:
+            pass
     return changed
 
 
@@ -33902,7 +34225,11 @@ def _drain_injected_command():
 
     An orphaned `.consuming` snapshot from a previous crash is merged
     back BEFORE claiming (see _recover_orphaned_queue_snapshot) —
-    Windows os.replace() would otherwise silently overwrite it."""
+    Windows os.replace() would otherwise silently overwrite it.
+
+    The returned entry's "source" lands in _last_inject_source (2026-10-01)
+    without changing this function's return value."""
+    _last_inject_source[0] = None
     _recover_orphaned_queue_snapshot(INJECTED_COMMANDS_PATH, "inject")
     if not os.path.exists(INJECTED_COMMANDS_PATH):
         return None
@@ -33976,7 +34303,18 @@ def _drain_injected_command():
         text = ""
     if not text:
         return None
+    _last_inject_source[0] = (str(first.get("source") or "")
+                              if isinstance(first, dict) else "")
     return text
+
+
+# Who wrote the inject _drain_injected_command just returned (2026-10-01):
+# "test" for the Claude Code driver (.claude/skills/run-jarvis/driver.py) and
+# tools/say_to_jarvis.py, "" for the owner's web page / tray, None when the
+# turn was not an inject. Every inject used to count as the owner typing, so
+# live-verification lines were learned as facts about him (the learn gate
+# admits a typed turn unconditionally and opens its follow-up window).
+_last_inject_source: list = [None]
 
 # How long ONE _speak_pending() drain may hold the main loop before it hands
 # the tail back to the queue and returns to 'Listening…'.
@@ -35567,8 +35905,14 @@ def _handle_sleep_standby(injected_text: str | None):
             pass
         print("  [wake] Waking up")
         # Owner-only learning: a standby wake opens the follow-up window, so
-        # the conversation it starts can teach (core/learn_gate.py).
-        _learn_gate_note_wake()
+        # the conversation it starts can teach (core/learn_gate.py) -- unless
+        # the wake capture is confidently someone else's voice (2026-10-01).
+        # Only the mic branch has a capture; a typed wake passes None. The RAW
+        # (pre auto-gain) buffer: voice-ID wants natural audio, as for turns.
+        if injected_text is not None:
+            _learn_gate_note_wake()
+        else:
+            _learn_gate_note_wake(_last_capture_audio, SAMPLE_RATE)
         # ...and the wake-word follow-up window too (2026-10-01): only the
         # normal-mode gate used to open it, so even an install with
         # FOLLOWUP_WINDOW_S > 0 dropped the first follow-up after a standby
@@ -36329,7 +36673,13 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
 
     memory = load_memory()
     memory["conversation_count"] += 1
-    save_memory(memory)
+    # An unreadable store is refused by save_memory (core/legacy_memory,
+    # 2026-10-01): saving here used to overwrite it with an empty schema at
+    # every boot after a hand-edit typo. The refusal must not stop startup.
+    try:
+        save_memory(memory)
+    except Exception as _e:
+        print(f"  [memory] boot save skipped: {_e}")
     _system_prompt = build_system_prompt(memory)
 
     if memory["facts"] or memory["sessions"]:
@@ -37119,11 +37469,18 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # whether it was typed, led by the wake word, and whose voice
                 # it was (this turn's RAW capture; None for a typed turn).
                 _typed = _injected_text is not None
-                learn_from_turn(text, reply, memory, conf=conf,
-                                injected=_typed,
-                                wake=_text_has_wake_prefix(text),
-                                audio=None if _typed else _last_capture_audio,
-                                sample_rate=0 if _typed else _last_capture_sr)
+                # A test harness's inject (driver.py / say_to_jarvis) is not
+                # the owner: answered, never learned (2026-10-01). Skipping
+                # the call also keeps it from opening the gate's window.
+                if _typed and _last_inject_source[0] == "test":
+                    print("  [learn-gate] not learning from this turn: "
+                          "test inject")
+                else:
+                    learn_from_turn(text, reply, memory, conf=conf,
+                                    injected=_typed,
+                                    wake=_text_has_wake_prefix(text),
+                                    audio=None if _typed else _last_capture_audio,
+                                    sample_rate=0 if _typed else _last_capture_sr)
 
                 # Ambient-learning 'answer_then_quiet': this normal-mode turn was the
                 # ONE reply granted after the wake word — now drop straight back to

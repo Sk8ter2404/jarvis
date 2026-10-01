@@ -3,6 +3,7 @@ schema, the empty/corrupt fallbacks, the forward-migration of missing keys, and
 the atomic save round-trip (the store is dumped into the prompt every turn, so a
 truncated/corrupt write is a real outage). Uses configure() to point at a temp
 file so the real store is never touched."""
+import codecs
 import json
 import os
 import tempfile
@@ -53,6 +54,42 @@ class LegacyMemoryTests(unittest.TestCase):
         with open(self._path, "w", encoding="utf-8") as f:
             f.write("{ not valid json")
         self.assertEqual(lm.load_memory()["facts"], [])
+
+    def test_an_unreadable_store_is_never_overwritten_by_a_writer(self):
+        # B024 (2026-10-01): load_memory answered ANY read error with a plain
+        # empty schema, and every writer does load -> mutate -> save, so the
+        # next reply's phrase-rotation write replaced the whole store (120
+        # facts, projects, topics, sessions, quarantine) after one hand-edit
+        # typo. The stand-in is marked, save_memory refuses it, and the bad
+        # file is copied aside for the owner to fix.
+        bad = b'{"facts": ["User likes lofi",], "projects": []}'
+        with open(self._path, "wb") as f:
+            f.write(bad)
+        with mock.patch("builtins.print"):
+            mem = lm.load_memory()
+            self.assertEqual(mem["facts"], [])
+            mem["last_used_phrase_by_intent"] = {"greeting": "At your service"}
+            with self.assertRaises(lm.MemoryStoreUnreadable):
+                lm.save_memory(mem)
+        with open(self._path, "rb") as f:
+            self.assertEqual(f.read(), bad)
+        backups = os.listdir(os.path.join(self._tmp.name, "backups"))
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(backups[0].startswith("memory_unreadable_"))
+        # A deliberate fresh write (reset_memory saves _empty_memory() after
+        # its own backup) is still allowed.
+        lm.save_memory(lm._empty_memory())
+        self.assertEqual(lm.load_memory()["facts"], [])
+
+    def test_a_bom_prefixed_store_loads_its_facts(self):
+        # A valid file re-saved as UTF-8-with-BOM (Windows PowerShell 5.1
+        # Out-File, Notepad) used to read as "unreadable" -> empty -> wiped.
+        with open(self._path, "wb") as f:
+            f.write(codecs.BOM_UTF8 + json.dumps({"facts": ["x"]}).encode())
+        m = lm.load_memory()
+        self.assertEqual(m["facts"], ["x"])
+        lm.save_memory(m)                 # not refused
+        self.assertEqual(lm.load_memory()["facts"], ["x"])
 
     def test_load_migrates_missing_keys(self):
         with open(self._path, "w", encoding="utf-8") as f:

@@ -20,6 +20,8 @@ Public API:
   get_patterns()                          — list of detected habit dicts
   maybe_pattern_offer()                   — JARVIS-style offer string
   record_session_summary(summary, ...)    — append one session-level summary
+  forget_session_summaries_since(cutoff)  — purge summaries in a window
+  reset_conversation_logs(backup_dir)     — back up, then clear, both logs
   get_session_summaries(query, ...)       — sessions matching a time phrase
   parse_time_reference(text)              — phrase → (start, end[, hours])
 """
@@ -30,6 +32,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from collections import Counter, defaultdict
@@ -796,6 +799,87 @@ def record_session_summary(summary: str,
                    if e.get("iso_start") != iso_start]
         entries.append(entry)
         _save_sessions_file(entries)
+
+
+def _summary_end_ts(entry: dict) -> float | None:
+    """Epoch end of one session-summary entry: its float ``ts`` (= end_ts),
+    else its ``iso_end``; None for a legacy entry with neither."""
+    try:
+        return float(entry.get("ts"))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return time.mktime(time.strptime(str(entry.get("iso_end")),
+                                         "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+
+
+def _write_sessions_strict(entries: list[dict]) -> None:
+    """Atomic write that RAISES (unlike _save_sessions_file, which only logs):
+    a purge the owner asked for must be disclosed when it fails."""
+    _ensure_dir()
+    tmp = _SESSION_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(entries[-MAX_SESSION_ENTRIES:], f, indent=2)
+    os.replace(tmp, _SESSION_FILE)
+
+
+def forget_session_summaries_since(cutoff_ts: float | None) -> int:
+    """Drop session-summary entries that END at or after ``cutoff_ts`` (epoch
+    seconds); None drops them all. Returns the number dropped.
+
+    "Forget the last hour" left this index alone (2026-10-01), so "what did
+    we do this afternoon" still recited the forgotten hour, and the 10-minute
+    checkpoint re-wrote it. A session that started before the window but ran
+    into it goes whole: its one summary covers both parts. Legacy entries
+    with no end time are kept (old, by the same convention as the other
+    stores). Exceptions propagate so the caller can disclose a failure."""
+    with _session_lock:
+        if not os.path.exists(_SESSION_FILE):
+            return 0
+        with open(_SESSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data if isinstance(data, list) else []
+        keep = []
+        for e in entries:
+            end = _summary_end_ts(e) if isinstance(e, dict) else None
+            if cutoff_ts is None or (end is not None and end >= cutoff_ts):
+                continue
+            keep.append(e)
+        dropped = len(entries) - len(keep)
+        if dropped:
+            _write_sessions_strict(keep)
+        return dropped
+
+
+def reset_conversation_logs(backup_dir: str) -> dict:
+    """"Reset your memory" (2026-10-01): copy session_summaries.json and
+    voice_commands.jsonl into ``backup_dir``, then clear both. They survived a
+    reset, so "what did we do yesterday" and the warm-restart "where did we
+    leave off" greeting still read the erased conversations back. Nothing is
+    cleared unless every copy succeeded; exceptions propagate so the caller
+    can disclose them. Returns {"session_summaries": n, "voice_commands": n}."""
+    counts = {"session_summaries": 0, "voice_commands": 0}
+    with _session_lock, _log_lock:
+        present = [p for p in (_SESSION_FILE, _LOG_FILE) if os.path.exists(p)]
+        if present:
+            os.makedirs(backup_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            for src in present:
+                shutil.copy2(src, os.path.join(
+                    backup_dir, f"pre_reset_{stamp}_{os.path.basename(src)}"))
+        if os.path.exists(_SESSION_FILE):
+            counts["session_summaries"] = len(_load_sessions_file())
+            _write_sessions_strict([])
+        if os.path.exists(_LOG_FILE):
+            with open(_LOG_FILE, "r", encoding="utf-8") as f:
+                counts["voice_commands"] = sum(1 for line in f if line.strip())
+            tmp = _LOG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8"):
+                pass
+            os.replace(tmp, _LOG_FILE)
+    return counts
 
 
 # ── Natural-language time reference parser ──────────────────────────────────

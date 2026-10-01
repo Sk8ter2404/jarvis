@@ -92,5 +92,97 @@ class ForgetVoiceCommandsSinceTests(unittest.TestCase):
                 pattern_memory.forget_voice_commands_since(0.0)
 
 
+class ConversationLogWipeTests(unittest.TestCase):
+    """B003 (2026-10-01): "forget the last hour" and "reset your memory" left
+    memory/session_summaries.json alone ("what did we do this afternoon"
+    recited the forgotten hour, and the 10-minute checkpoint re-wrote it),
+    and a reset also left the verbatim voice-command log."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.sessions = os.path.join(self._tmp.name, "session_summaries.json")
+        self.log = os.path.join(self._tmp.name, "voice_commands.jsonl")
+        for name, path in (("_SESSION_FILE", self.sessions),
+                           ("_LOG_FILE", self.log),
+                           ("_MEM_DIR", self._tmp.name)):
+            p = mock.patch.object(pattern_memory, name, path)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _write_sessions(self, entries):
+        with open(self.sessions, "w", encoding="utf-8") as f:
+            json.dump(entries, f)
+
+    def _read_sessions(self):
+        with open(self.sessions, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_forget_drops_summaries_that_reach_into_the_window(self):
+        now = time.time()
+        today = time.strftime("%Y-%m-%d")
+        self._write_sessions([
+            {"ts": now - 7200, "date": today,
+             "summary": "morning: the garden"},
+            {"ts": now - 600, "date": today, "summary": "booked the dentist"},
+            {"iso_end": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                      time.localtime(now - 60)),
+             "date": today, "summary": "no float ts, recent iso_end"},
+            {"summary": "legacy entry with no end time"},
+        ])
+        dropped = pattern_memory.forget_session_summaries_since(now - 3600)
+        self.assertEqual(dropped, 2)
+        left = [e["summary"] for e in self._read_sessions()]
+        self.assertEqual(left, ["morning: the garden",
+                                "legacy entry with no end time"])
+        self.assertFalse(os.path.exists(self.sessions + ".tmp"))
+        # Recall no longer finds the forgotten hour.
+        got = [e.get("summary") for e in pattern_memory.get_session_summaries(
+            "today", include_legacy=False)]
+        self.assertIn("morning: the garden", got)
+        self.assertNotIn("booked the dentist", got)
+
+    def test_forget_with_nothing_in_the_window_rewrites_nothing(self):
+        now = time.time()
+        self._write_sessions([{"ts": now - 7200, "summary": "old"}])
+        before = os.path.getmtime(self.sessions)
+        self.assertEqual(
+            pattern_memory.forget_session_summaries_since(now - 3600), 0)
+        self.assertEqual(os.path.getmtime(self.sessions), before)
+        self.assertEqual(
+            pattern_memory.forget_session_summaries_since(now - 3600), 0)
+
+    def test_forget_failures_propagate_for_disclosure(self):
+        with open(self.sessions, "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        with self.assertRaises(ValueError):
+            pattern_memory.forget_session_summaries_since(0.0)
+
+    def test_reset_backs_up_then_clears_both_logs(self):
+        self._write_sessions([{"ts": 1.0, "summary": "a"},
+                              {"ts": 2.0, "summary": "b"}])
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write('{"ts": 1, "text": "x"}\n{"text": "legacy, no ts"}\n')
+        backups = os.path.join(self._tmp.name, "backups")
+        counts = pattern_memory.reset_conversation_logs(backups)
+        self.assertEqual(counts, {"session_summaries": 2,
+                                  "voice_commands": 2})
+        self.assertEqual(self._read_sessions(), [])
+        with open(self.log, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "")       # ts-less lines too
+        saved = sorted(os.listdir(backups))
+        self.assertEqual(len(saved), 2)
+        self.assertTrue(all(n.startswith("pre_reset_") for n in saved))
+
+    def test_reset_clears_nothing_when_the_backup_fails(self):
+        self._write_sessions([{"ts": 1.0, "summary": "a"}])
+        with mock.patch.object(pattern_memory.shutil, "copy2",
+                               side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                pattern_memory.reset_conversation_logs(
+                    os.path.join(self._tmp.name, "backups"))
+        self.assertEqual(len(self._read_sessions()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

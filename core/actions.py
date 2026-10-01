@@ -1499,6 +1499,35 @@ def _act_force_backup(_: str = "") -> str:
     return "backup started"
 
 
+def _refresh_live_prompt_after_wipe(bc) -> str:
+    """A memory wipe must reach the LIVE system prompt at once (2026-10-01).
+    Both wipes run from the spoken "yes" (handle_confirmation_response) or
+    the tray, neither of which rebuilds the prompt, and the next post-turn
+    rebuild is deferred while the owner keeps talking (the prompt freeze) --
+    so "what do you know about me?" right after "Done." recited the erased
+    facts. Returns '' or a disclosure for the reply."""
+    try:
+        bc._rebuild_prompt_now()
+        return ""
+    except Exception as e:
+        return (f"the live prompt was NOT refreshed ({e}); the old facts may "
+                f"be used until the next rebuild")
+
+
+def _forget_learning_in_flight(bc, cutoff) -> None:
+    """Nothing queued for learning before a wipe may land after it
+    (2026-10-01): the learner waits up to two minutes for the owner to go
+    quiet, so the turns spoken just before "forget the last hour" / "yes"
+    were extracted AFTER the purge and written back. Call holding
+    bc._memory_lock (merge_memory re-checks under it). Never raises."""
+    try:
+        _inv = getattr(bc, "_learn_invalidate", None)
+        if callable(_inv):
+            _inv(cutoff)
+    except Exception as e:
+        print(f"  [memory] learn queue not invalidated: {e}")
+
+
 def _act_reset_memory(_: str = "") -> str:
     """Snapshot bobert_memory.json to backups/, then re-initialise it
     to the empty schema. Destructive — but the backup is unconditional,
@@ -1509,7 +1538,12 @@ def _act_reset_memory(_: str = "") -> str:
     _ltm_context() retrieves from that store every turn, so leaving it
     intact made a confirmed wipe a lie — JARVIS kept reciting the facts it
     just claimed to have erased (2026-07-21 audit). A failed LTM wipe is
-    DISCLOSED in the reply, never silent."""
+    DISCLOSED in the reply, never silent.
+
+    2026-10-01: also wiped -- each one survived and was read back after a
+    confirmed reset: turns still queued for learning, the session-summary
+    index and the verbatim voice-command log (backed up first), this
+    process's conversation history, and the LIVE system prompt."""
     bc = _bc()
     try:
         with bc._memory_lock:
@@ -1524,6 +1558,7 @@ def _act_reset_memory(_: str = "") -> str:
                     shutil.copy2(bc.MEMORY_FILE, backup_path)
                 except Exception as e:
                     return f"backup failed, refused to wipe: {e}"
+            _forget_learning_in_flight(bc, None)
             bc.save_memory(bc._empty_memory())
         # Long-term store wipe runs OUTSIDE bc._memory_lock so it can't nest
         # with long_term_memory._lock (reset_all takes its own lock).
@@ -1546,6 +1581,26 @@ def _act_reset_memory(_: str = "") -> str:
         except Exception as oe:
             ltm_note += (f" — WARNING: this session's opening-utterance "
                          f"record was NOT cleared ({oe})")
+        # The pattern store's conversation logs: the session-summary index
+        # ("what did we do yesterday") and the verbatim voice-command log
+        # (the "where did we leave off" greeting). Backed up first.
+        try:
+            bc.pattern_memory.reset_conversation_logs(backup_dir)
+        except Exception as pe:
+            ltm_note += (f" — WARNING: the session summaries and the "
+                         f"voice-command log were NOT cleared ({pe})")
+        # This process's conversation history (and the running session
+        # summary built from it) -- in every LLM call until now.
+        try:
+            _forget_live = getattr(bc, "_forget_live_conversation", None)
+            if callable(_forget_live):
+                _forget_live(None)
+        except Exception as ce:
+            ltm_note += (f" — WARNING: this conversation's history was NOT "
+                         f"cleared ({ce})")
+        _pw = _refresh_live_prompt_after_wipe(bc)
+        if _pw:
+            ltm_note += f" — WARNING: {_pw}"
         if existed:
             return (f"memory reset (backup -> backups/"
                     f"{os.path.basename(backup_path)}){ltm_note}")
@@ -1776,12 +1831,19 @@ def _act_forget_last_hour(_: str = "") -> str:
     LTM store (verbatim episodes.jsonl turn log, semantic facts created in the
     window, the in-process working turns), the voice-command pattern log and
     the monolith's in-process record of this session's opening utterances.
-    Facts/projects in bobert_memory are intentionally NOT touched — those
-    are durable knowledge, not session traces. The bobert prune is held
-    under _memory_lock so it can't race with learn_from_turn; the LTM
-    purge runs outside it (long_term_memory takes its own lock). A failed
-    purge of any store is DISCLOSED in the reply — silently leaving the
-    hour on disk was the 2026-07-21 audit bug."""
+    Older facts/projects in bobert_memory are durable knowledge and kept;
+    the ones LEARNED in the window (the LTM facts forget_since drops were
+    mirrored from them) are dropped too (2026-10-01: the reply counted them
+    as forgotten while every prompt still carried them). The bobert prune
+    is held under _memory_lock so it can't race with learn_from_turn; the
+    LTM purge runs outside it (long_term_memory takes its own lock). A
+    failed purge of any store is DISCLOSED in the reply — silently leaving
+    the hour on disk was the 2026-07-21 audit bug.
+
+    2026-10-01: also forgotten -- each one survived and was read back after
+    a confirmed forget: turns still queued for learning, the session-summary
+    index, this process's conversation history (and the running session
+    summary), and the LIVE system prompt is rebuilt at once."""
     bc = _bc()
     try:
         # Numeric epoch cutoff. Entries carry a float ts=time.time() written
@@ -1792,6 +1854,7 @@ def _act_forget_last_hour(_: str = "") -> str:
         # forgotten. Missing/legacy ts defaults to 0 -> treated as old -> kept.
         cutoff = time.time() - 3600
         with bc._memory_lock:
+            _forget_learning_in_flight(bc, cutoff)
             mem = bc.load_memory()
             old_topics  = list(mem.get("topics") or [])
             old_sessions = list(mem.get("sessions") or [])
@@ -1824,6 +1887,34 @@ def _act_forget_last_hour(_: str = "") -> str:
             ltm_counts = ltm.forget_since(cutoff)
         except Exception as le:
             failures.append(f"the conversation log was NOT purged ({le})")
+        fcs = int(ltm_counts.get("facts", 0) or 0)
+        # The facts the LTM purge dropped were mirrored from bobert_memory's
+        # facts/projects (merge_memory -> _ltm_learn_facts): drop the same
+        # texts there, or the "forgotten" fact stays in every system prompt.
+        _gone = {t.strip().lower() for t in (ltm_counts.get("fact_texts")
+                                               or [])
+                 if isinstance(t, str) and t.strip()}
+        if _gone:
+            try:
+                with bc._memory_lock:
+                    mem2 = bc.load_memory()
+                    changed = False
+                    for key in ("facts", "projects"):
+                        items = mem2.get(key)
+                        if not isinstance(items, list):
+                            continue
+                        kept = [x for x in items
+                                if not (isinstance(x, str)
+                                        and x.strip().lower() in _gone)]
+                        if len(kept) != len(items):
+                            mem2[key] = kept
+                            changed = True
+                    if changed:
+                        bc.save_memory(mem2)
+            except Exception as fe:
+                failures.append(f"the facts learned in the last hour were NOT "
+                                f"removed from my main memory ({fe})")
+                fcs = 0
         vc_removed = 0
         try:
             vc_removed = int(
@@ -1847,12 +1938,36 @@ def _act_forget_last_hour(_: str = "") -> str:
             failures.append(
                 f"this session's opening-utterance record was NOT purged "
                 f"({oe})")
+        # The session-summary index ("what did we do this afternoon"): its
+        # current-session row is re-written by the 10-minute checkpoint.
+        ss_removed = 0
+        try:
+            _n = bc.pattern_memory.forget_session_summaries_since(cutoff)
+            if isinstance(_n, int) and not isinstance(_n, bool):
+                ss_removed = _n
+        except Exception as se:
+            failures.append(f"the session summaries were NOT purged ({se})")
+        # This process's conversation history -- in every LLM call, and what
+        # "summarise what we talked about" reads -- and the running session
+        # summary, which the next checkpoint would have re-written.
+        live_removed = 0
+        try:
+            _forget_live = getattr(bc, "_forget_live_conversation", None)
+            if callable(_forget_live):
+                _n = _forget_live(cutoff)
+                if isinstance(_n, int) and not isinstance(_n, bool):
+                    live_removed = _n
+        except Exception as ce:
+            failures.append(
+                f"this conversation's history was NOT cleared ({ce})")
+        _pw = _refresh_live_prompt_after_wipe(bc)
+        if _pw:
+            failures.append(_pw)
 
         bits = []
-        if removed:
-            bits.append(f"{removed} item(s)")
+        if removed + ss_removed:
+            bits.append(f"{removed + ss_removed} item(s)")
         eps = int(ltm_counts.get("episodes", 0) or 0)
-        fcs = int(ltm_counts.get("facts", 0) or 0)
         if eps:
             bits.append(f"{eps} logged turn(s)")
         if fcs:
@@ -1863,6 +1978,8 @@ def _act_forget_last_hour(_: str = "") -> str:
             # Normally the same utterances are already counted as logged
             # turns; say so only when nothing else was.
             bits.append(f"{opening_removed} recorded utterance(s)")
+        if live_removed and not bits:
+            bits.append(f"{live_removed} message(s) of this conversation")
         warn = (" — WARNING: " + "; ".join(failures)) if failures else ""
         if not bits:
             return "nothing recent enough to forget" + warn

@@ -77,6 +77,11 @@ from typing import Callable, Iterable, Optional
 
 from core.atomic_io import _atomic_write_json
 from core import paths as _paths
+# The reflector's MERGE text is a new fact written by a model: it gets the
+# same write-time guards merge_memory applies to every learned fact.
+from core.memory_guards import (
+    _is_secret_fact, _is_internal_noise_fact, MAX_FACT_LEN,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -966,10 +971,81 @@ def set_reflector_llm(fn: Optional[Callable[[str, list], Optional[str]]]) -> Non
     """Install the LLM used by reflect_and_consolidate's contradiction pass.
 
     ``fn`` has the same contract as reflect_and_consolidate's ``llm_call``
-    parameter: fn(prompt, context_msgs) -> ''/'A'/'B'/'MERGE: <text>' (a
-    None/''/raising call means "both facts stay"). Pass None to disable."""
+    parameter: fn(prompt, context_msgs) -> 'A'/'B'/'KEEP'/'MERGE: <text>'
+    (anything else, a None/'' or a raising call means "both facts stay").
+    Pass None to disable."""
     global _reflector_llm
     _reflector_llm = fn
+
+
+# Injected sink for the contradiction pass's decisions (2026-10-01). The
+# reflector settles contradictions in THIS store only, while the monolith's
+# bobert_memory.json facts -- rendered in full into every system prompt --
+# kept both sides of a contradiction it had "resolved". The monolith wires a
+# sink that applies each decision there too. Contract:
+#   fn([(removed_text, replacement_text_or_None), ...])
+# called once per run, outside _lock, with only the decisions that were
+# actually applied here. Near-duplicate removals are not reported: the
+# legacy store dedupes those itself. A raising sink never breaks the run.
+_reflector_sink: Optional[Callable[[list], None]] = None
+
+
+def set_reflector_sink(fn: Optional[Callable[[list], None]]) -> None:
+    """Install (or, with None, remove) the reflector decision sink."""
+    global _reflector_sink
+    _reflector_sink = fn
+
+
+def _may_condemn(condemned_source: str, survivor_source: str) -> bool:
+    """THE trusted-source rule, shared by every reflector deletion path: a
+    migrated / backfilled fact is never deleted in favour of a fact from an
+    untrusted (ambient-extraction) source -- a mis-heard Whisper variant must
+    not delete it (2026-07-21 audit #39). One helper so the near-duplicate,
+    contradiction and MERGE paths cannot drift apart again: until 2026-10-01
+    only the contradiction path applied it, and the other two deleted 5 of
+    the 23 migration-day facts."""
+    return not (condemned_source in _TRUSTED_FACT_SOURCES
+                and survivor_source not in _TRUSTED_FACT_SOURCES)
+
+
+# A local model answering through the JARVIS persona tacks ", sir." onto a
+# bare verdict; strip that before reading the verdict or the merged text.
+# Comma-led only, so a fact that really ends in the word ("...named Sir")
+# keeps it.
+_SIR_TAIL_RE = re.compile(r"\s*[,;]\s*sir\b[\s.!]*$", re.IGNORECASE)
+_MERGE_RE = re.compile(r"^\W*MERGE\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_reflector_verdict(reply) -> tuple[str, str]:
+    """('A' | 'B' | 'MERGE' | 'KEEP', merged_text) for one adjudicator reply.
+
+    STRICT (2026-10-01): the old prefix test read 'Both stay' (the prompt's
+    own words), 'Because...' or 'Based on...' as 'B' and deleted fact A, and
+    'As far as I can tell...' or 'Agreed' as 'A' and deleted fact B. Only a
+    bare A / B (quotes, markdown, a trailing period or ', sir' allowed) or
+    'MERGE: <text>' acts; everything else -- KEEP, '', chatter -- keeps
+    both facts."""
+    raw = (reply or "").strip() if isinstance(reply, str) else ""
+    m = _MERGE_RE.match(raw)
+    if m:
+        merged = _SIR_TAIL_RE.sub("", m.group(1)).strip().strip("'\"`*").strip()
+        return ("MERGE", merged) if merged else ("KEEP", "")
+    core = _SIR_TAIL_RE.sub("", raw).strip().strip("'\"`*. ").upper()
+    if core in ("A", "B"):
+        return core, ""
+    return "KEEP", ""
+
+
+def _merged_text_ok(merged: str, a_text: str, b_text: str) -> bool:
+    """A MERGE reply becomes a stored fact, so it gets merge_memory's write
+    guards (no credential, no internal noise, no runaway length), and it may
+    not grow past its two inputs: survivors absorbing fact after fact in one
+    run grew into blobs until the token cap cut them mid-word."""
+    if not merged or len(merged) > MAX_FACT_LEN:
+        return False
+    if _is_secret_fact(merged) or _is_internal_noise_fact(merged):
+        return False
+    return len(merged) <= len(a_text or "") + len(b_text or "") + 40
 
 
 def _cosine_sim(a, b) -> float:
@@ -996,11 +1072,17 @@ def reflect_and_consolidate(
     Contradiction pass: if an `llm_call` callable is provided, every
     pair with cosine-sim in [0.6, REFLECTOR_DUP_SIM) is passed to it
     along with the small context window. The llm_call should return:
-      - ''      → both facts stay
+      - 'KEEP' / '' / anything unparsed → both facts stay
       - 'A'     → keep A, delete B
       - 'B'     → keep B, delete A
       - 'MERGE: <new text>' → replace BOTH with one new fact
-    A None llm_call simply skips the contradiction pass.
+    (see _parse_reflector_verdict). A None llm_call simply skips the
+    contradiction pass. No path deletes or rewrites a trusted fact in
+    favour of an untrusted one (_may_condemn).
+
+    Applied contradiction / MERGE decisions are reported to the installed
+    sink (set_reflector_sink). Each deletion logs its id, source and reason,
+    never the fact text.
 
     Returns a small summary dict counting actions taken.
     """
@@ -1062,6 +1144,12 @@ def reflect_and_consolidate(
 
     # ── pairwise scan
     to_delete: set[str] = set()
+    reasons: dict[str, str] = {}    # fid -> why it is deleted (for the log)
+    # Decisions for the sink: a condemned fid -> the fid that survives it
+    # (reported only if the delete goes through, with the survivor's FINAL
+    # text), plus MERGE rewrites already applied in place, in order.
+    sink_on_delete: dict[str, str] = {}
+    sink_applied: list = []
     llm_pairs = 0   # contradiction-pass adjudications this run (bounded)
     n = len(ids)
     for i in range(n):
@@ -1080,15 +1168,24 @@ def reflect_and_consolidate(
             sim = _cosine_sim(vecs[i], vecs[j])
             summary["checked_pairs"] += 1
             if sim >= REFLECTOR_DUP_SIM:
-                # near-dup: drop the older one
+                # near-dup: drop the older one -- unless the older one is a
+                # trusted fact and the newer is not (2026-10-01): migrated and
+                # backfilled facts are ALWAYS the older side, and a newer
+                # near-identical variant is exactly what a mis-heard name
+                # looks like. Then the untrusted variant goes instead.
                 a, b = ids[i], ids[j]
                 _before = len(to_delete)
                 with _lock:
                     if (_facts.get(a, {}).get("created_at", 0) <=
                             _facts.get(b, {}).get("created_at", 0)):
-                        to_delete.add(a)
+                        older, newer = a, b
                     else:
-                        to_delete.add(b)
+                        older, newer = b, a
+                if not _may_condemn(snapshot_source.get(older, ""),
+                                    snapshot_source.get(newer, "")):
+                    older = newer
+                to_delete.add(older)
+                reasons.setdefault(older, "duplicate")
                 # Count ACTUAL new deletions, not qualifying pairs — a fact
                 # already condemned must not inflate the tally.
                 if len(to_delete) > _before:
@@ -1106,49 +1203,74 @@ def reflect_and_consolidate(
                 try:
                     verdict = (llm_call(
                         "Two facts about the user. Are they contradictory? "
-                        "Reply 'A' to keep the first, 'B' to keep the second, "
-                        "'MERGE: <new text>' to fuse them, or '' if both stay.",
+                        "Reply with EXACTLY one of: A (keep only the first), "
+                        "B (keep only the second), KEEP (both stay -- the "
+                        "answer whenever they do not contradict), or "
+                        "MERGE: <one fused fact>. No other words.",
                         [{"role": "fact_a", "text": a_text},
                          {"role": "fact_b", "text": b_text}],
                     ) or "").strip()
                 except Exception as e:
                     print(f"  [ltm] reflector llm raised: {e}")
                     verdict = ""
-                if (verdict.upper().startswith("A")
-                        or verdict.upper().startswith("B")):
+                kind, merged = _parse_reflector_verdict(verdict)
+                if kind in ("A", "B"):
                     # 'A' keeps the first presented (ids[i]); 'B' the second.
-                    if verdict.upper().startswith("A"):
+                    if kind == "A":
                         survivor, condemned = ids[i], ids[j]
                     else:
                         survivor, condemned = ids[j], ids[i]
                     # Trusted-source guard: never delete a migrated/backfilled
                     # fact in favour of a survivor from an untrusted (ambient-
                     # extraction) source — both stay. (2026-07-21 audit #39)
-                    if (snapshot_source.get(condemned, "")
-                            in _TRUSTED_FACT_SOURCES
-                            and snapshot_source.get(survivor, "")
-                            not in _TRUSTED_FACT_SOURCES):
+                    if not _may_condemn(snapshot_source.get(condemned, ""),
+                                        snapshot_source.get(survivor, "")):
                         continue
                     to_delete.add(condemned)
+                    reasons[condemned] = "contradiction"
+                    sink_on_delete[condemned] = survivor
                     summary["contradictions_resolved"] += 1
-                elif verdict.upper().startswith("MERGE"):
-                    merged = verdict.split(":", 1)[-1].strip()
-                    if merged:
-                        with _lock:
-                            entry = _facts.get(ids[i])
-                            # Only merge if the survivor still holds the text we
-                            # reasoned about — a concurrent update_fact could
-                            # have changed it out from under us.
-                            if (entry is not None and
-                                    entry.get("text", "") ==
-                                    snapshot_text.get(ids[i])):
-                                entry["text"] = merged
-                                entry["updated_at"] = time.time()
-                                _chroma_upsert(ids[i], merged, entry)
-                                texts[i] = merged
-                                snapshot_text[ids[i]] = merged
-                                to_delete.add(ids[j])
-                                summary["merged"] += 1
+                elif kind == "MERGE":
+                    # A MERGE rewrites ids[i] and deletes ids[j], so a trusted
+                    # fact on EITHER side would lose its text or its label to
+                    # model output (2026-10-01): both stay instead.
+                    if not (_may_condemn(snapshot_source.get(ids[i], ""), "")
+                            and _may_condemn(snapshot_source.get(ids[j], ""),
+                                             "")):
+                        continue
+                    if not _merged_text_ok(merged, a_text, b_text):
+                        continue
+                    with _lock:
+                        entry = _facts.get(ids[i])
+                        # Only merge if the survivor still holds the text we
+                        # reasoned about — a concurrent update_fact could
+                        # have changed it out from under us.
+                        if (entry is not None and
+                                entry.get("text", "") ==
+                                snapshot_text.get(ids[i])):
+                            entry["text"] = merged
+                            entry["updated_at"] = time.time()
+                            _chroma_upsert(ids[i], merged, entry)
+                            sink_applied.append((a_text, merged))
+                            texts[i] = merged
+                            snapshot_text[ids[i]] = merged
+                            to_delete.add(ids[j])
+                            reasons[ids[j]] = f"merged into {ids[i]}"
+                            sink_on_delete[ids[j]] = ids[i]
+                            summary["merged"] += 1
+
+    def _final_survivor_text(fid: str) -> Optional[str]:
+        # Follow survivor -> survivor while the survivor was itself condemned
+        # (a chain within one run); the text of the last one still stored,
+        # or None when it is gone too (the condemned text is then dropped).
+        sv, seen = sink_on_delete.get(fid), {fid}
+        while sv in to_delete and sv in sink_on_delete and sv not in seen:
+            seen.add(sv)
+            sv = sink_on_delete[sv]
+        entry = _facts.get(sv) if sv is not None else None
+        if entry is None or sv in to_delete:
+            return None
+        return entry.get("text") or None
 
     if to_delete:
         with _lock:
@@ -1162,8 +1284,21 @@ def reflect_and_consolidate(
                         entry.get("text", "") == snapshot_text.get(fid):
                     del _facts[fid]
                     _chroma_delete(fid)
+                    # Auditable (2026-10-01): which fact went and why -- id,
+                    # source and reason only, never the fact's text.
+                    print(f"  [ltm] reflector removed {fid} "
+                          f"({snapshot_source.get(fid) or 'unknown source'}, "
+                          f"{reasons.get(fid, 'unspecified')})")
+                    if fid in sink_on_delete:
+                        sink_applied.append((snapshot_text.get(fid, ""),
+                                             _final_survivor_text(fid)))
             _save_facts_locked()
             _rebuild_bm25_locked()
+    if sink_applied and _reflector_sink is not None:
+        try:
+            _reflector_sink(list(sink_applied))
+        except Exception as e:
+            print(f"  [ltm] reflector sink failed: {type(e).__name__}")
     return summary
 
 
@@ -1249,10 +1384,14 @@ def forget_since(cutoff_ts: float) -> dict:
     treated as old, matching _act_forget_last_hour's convention for
     bobert_memory entries. Exceptions propagate: the caller must DISCLOSE a
     failed purge rather than claim success (the silent-survival gap is the
-    bug). Returns counts {"episodes": n, "facts": n, "working": n}.
+    bug). Returns counts {"episodes": n, "facts": n, "working": n} plus
+    "fact_texts", the texts of the facts it dropped: each was mirrored from
+    bobert_memory.json (merge_memory -> add_fact), and the caller must drop
+    them there too or the "forgotten" fact stays in every system prompt
+    (2026-10-01).
     (2026-07-21 audit #51: forget_last_hour left the hour's verbatim turns
     in episodes.jsonl and its facts in the semantic store.)"""
-    counts = {"episodes": 0, "facts": 0, "working": 0}
+    counts = {"episodes": 0, "facts": 0, "working": 0, "fact_texts": []}
     ensure_loaded()
     with _lock:
         # (a) In-process working window — purging only the file would leave
@@ -1301,6 +1440,9 @@ def forget_since(cutoff_ts: float) -> dict:
             if created >= cutoff_ts:
                 doomed.append(fid)
         for fid in doomed:
+            _t = _facts[fid].get("text", "")
+            if isinstance(_t, str) and _t.strip():
+                counts["fact_texts"].append(_t)
             del _facts[fid]
             _chroma_delete(fid)
         if doomed:

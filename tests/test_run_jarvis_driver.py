@@ -286,5 +286,26 @@ class DriverReplyCaptureTests(unittest.TestCase):
         self.assertIn("JARVIS (spoken): A stir-fry, sir.", res["lines"][-1])
 
 
+@unittest.skipUnless(os.path.exists(_DRIVER), "run-jarvis driver not present")
+class DriverInjectSourceTests(unittest.TestCase):
+    """B023 (2026-10-01): a verification line this harness injects is not the
+    owner speaking; it is tagged so JARVIS answers it but never learns it."""
+
+    def test_inject_tags_its_lines_as_test(self):
+        d = _load_driver()
+        tmp = tempfile.mkdtemp(prefix="drv_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        inject = os.path.join(tmp, "injected_commands.json")
+        with mock.patch.object(d, "PROJ", tmp), \
+                mock.patch.object(d, "INJECT", inject):
+            d.inject("what time is it")
+            d.inject("and the date")
+        with open(inject, encoding="utf-8") as f:
+            items = json.load(f)
+        self.assertEqual([i["text"] for i in items],
+                         ["what time is it", "and the date"])
+        self.assertEqual({i.get("source") for i in items}, {"test"})
+
+
 if __name__ == "__main__":
     unittest.main()

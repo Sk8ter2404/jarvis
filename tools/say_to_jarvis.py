@@ -44,7 +44,11 @@ def _read_existing_queue() -> list:
 
 def enqueue(text: str) -> None:
     items = _read_existing_queue()
-    items.append({"text": text, "ts": time.time()})
+    # "source": "test" (2026-10-01): a tester's line is not the owner
+    # speaking, so JARVIS answers it but never learns it as a fact about him
+    # (bobert_companion._last_inject_source). The web page and the tray
+    # leave the field off: those are the owner typing.
+    items.append({"text": text, "ts": time.time(), "source": "test"})
     fd, tmp = tempfile.mkstemp(dir=PROJECT_DIR, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

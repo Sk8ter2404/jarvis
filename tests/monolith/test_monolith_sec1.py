@@ -442,6 +442,36 @@ class MergeMemoryTests(_MonolithTestBase):
         self.assertLessEqual(len(trimmed), self.bc.MAX_FACT_LEN + 1)
         self.assertTrue(trimmed.endswith("…"))
 
+    # ── B082 (2026-10-01): topics are rendered into every prompt like facts
+    # and projects, but got only .strip() -- no secret / noise / length guard.
+
+    def test_a_secret_shaped_topic_is_never_stored(self):
+        with mock.patch("builtins.print"):
+            self.bc.merge_memory(new_facts=["User likes tea"],
+                                 new_topic="router password reset")
+        self.assertEqual(self._store["topics"], [])
+        self.assertIn("User likes tea", self._store["facts"])
+
+    def test_a_runaway_topic_label_is_capped(self):
+        self.bc.merge_memory(new_topic="weekend " * 40)
+        self.assertLessEqual(len(self._store["topics"][-1]["topic"]),
+                             self.bc._MAX_TOPIC_LEN + 1)
+
+    def test_legacy_secret_topics_and_summaries_stay_out_of_the_prompt(self):
+        mem = self.bc._empty_memory()
+        mem["topics"] = [{"date": "2026-09-30",
+                          "topic": "router password zqxtopic"},
+                         {"date": "2026-09-30", "topic": "garden plans"}]
+        mem["sessions"] = [
+            {"date": "2026-09-30",
+             "summary": "Sir read out his api key zqxsummary."},
+            {"date": "2026-09-30", "summary": "Talked about the garden."}]
+        prompt = self.bc.build_system_prompt(mem)
+        self.assertIn("garden plans", prompt)
+        self.assertIn("Talked about the garden.", prompt)
+        self.assertNotIn("zqxtopic", prompt)
+        self.assertNotIn("zqxsummary", prompt)
+
     def test_preexisting_overlong_fact_clamped_on_load(self):
         # A bloated fact already on disk (stored before the cap existed) is
         # repaired in place on the next merge, even when nothing new is added
@@ -733,18 +763,52 @@ class SystemPromptTests(_MonolithTestBase):
         done = threading.Event()
         fake = _types.ModuleType("core.long_term_memory")
 
-        def _rec(role, text):
-            recorded.append((role, text))
+        def _rec(role, text, ts=None):
+            recorded.append((role, text, ts))
             done.set()
         fake.record_turn = _rec
         # Force a fresh queue/worker pair so this test owns the drain.
+        t0 = time.time()
         with mock.patch.object(self.bc, "_ltm_enabled", return_value=True), \
              mock.patch.object(self.bc, "_ltm_module", return_value=fake), \
              mock.patch.object(self.bc, "_ltm_queue", None), \
              mock.patch.object(self.bc, "_ltm_worker_started", [False]):
             self.bc._ltm_enqueue("user", "remember the milk")
             self.assertTrue(done.wait(timeout=5))
-        self.assertEqual(recorded, [("user", "remember the milk")])
+        self.assertEqual([r[:2] for r in recorded],
+                         [("user", "remember the milk")])
+        # 2026-10-01: stamped when the turn was queued, not when the writer
+        # got to it (a stalled writer used to stamp it after a forget).
+        self.assertGreaterEqual(recorded[0][2], t0)
+        self.assertLessEqual(recorded[0][2], time.time())
+
+    def test_ltm_writer_skips_turns_from_the_forgotten_window(self):
+        # B018 (2026-10-01): a turn still queued for the LTM writer when
+        # "forget the last hour" ran was recorded afterwards with ts=now, so
+        # it survived the forget. Turns stamped inside the window are dropped.
+        import types as _types
+        recorded = []
+        done = threading.Event()
+        fake = _types.ModuleType("core.long_term_memory")
+
+        def _rec(role, text, ts=None):
+            recorded.append(text)
+            done.set()
+        fake.record_turn = _rec
+        now = time.time()
+        with mock.patch.object(self.bc, "_ltm_enabled", return_value=True), \
+             mock.patch.object(self.bc, "_ltm_module", return_value=fake), \
+             mock.patch.object(self.bc, "_ltm_queue", None), \
+             mock.patch.object(self.bc, "_ltm_worker_started", [False]), \
+             mock.patch.object(self.bc, "_ltm_forgotten",
+                               [(now - 3600, now + 60)]):
+            self.bc._ltm_enqueue("user", "the forgotten line")
+            # Queued after the window closed: this one IS recorded.
+            with mock.patch.object(self.bc.time, "time",
+                                   return_value=now + 120):
+                self.bc._ltm_enqueue("user", "a later line")
+            self.assertTrue(done.wait(timeout=5))
+        self.assertEqual(recorded, ["a later line"])
 
     def test_ltm_enqueue_noops_when_disabled_or_blank(self):
         with mock.patch.object(self.bc, "_ltm_enabled", return_value=False), \
@@ -2772,7 +2836,7 @@ class SaveSessionEdgeTests(_MonolithTestBase):
 #  _session_summary_checkpoint_thread — single-iteration body
 # ──────────────────────────────────────────────────────────────────────────
 class SessionCheckpointThreadTests(_MonolithTestBase):
-    def _drive_one_iteration(self, *, last_len_val):
+    def _one_pass(self):
         """Run the daemon body exactly once: the leading sleep is a no-op and
         the trailing in-loop sleep raises a sentinel so the ``while True`` loop
         exits after one pass instead of looping forever."""
@@ -2787,19 +2851,27 @@ class SessionCheckpointThreadTests(_MonolithTestBase):
                 raise _StopLoop()
             return None            # the leading pre-loop sleep
 
-        last = self._restore_attr_after("_session_checkpoint_last_len")
-        last[0] = last_len_val
-        hist = self._restore_attr_after("conversation_history")
-        hist.clear()
-        for i in range(4):
-            hist.append({"role": "user", "content": f"u{i}"})
-            hist.append({"role": "assistant", "content": f"a{i}"})
         with mock.patch.object(self.bc.time, "sleep", _sleep):
             try:
                 self.bc._session_summary_checkpoint_thread()
             except _StopLoop:
                 pass
-        return last
+
+    def _drive_one_iteration(self, *, already_summarised):
+        """Seed 8 fresh messages, optionally marked as already summarised
+        (2026-10-01: the checkpoint tracks the last message it summarised
+        by identity, not the history length), and run one pass."""
+        hist = self._restore_attr_after("conversation_history")
+        hist.clear()
+        for i in range(4):
+            hist.append({"role": "user", "content": f"u{i}"})
+            hist.append({"role": "assistant", "content": f"a{i}"})
+        marker = self.bc._session_summary_marker
+        if already_summarised:
+            marker[0] = hist[-1]
+            self.bc._session_running_summary[0] = "Earlier summary."
+        self._one_pass()
+        return marker
 
     def test_checkpoint_writes_summary_when_history_grew(self):
         captured = {}
@@ -2807,30 +2879,105 @@ class SessionCheckpointThreadTests(_MonolithTestBase):
                                return_value="Mid-session summary.\nextra"), \
              mock.patch.object(self.bc.pattern_memory, "record_session_summary",
                                side_effect=lambda s, **k: captured.update(s=s)):
-            last = self._drive_one_iteration(last_len_val=0)
+            marker = self._drive_one_iteration(already_summarised=False)
         self.assertEqual(captured["s"], "Mid-session summary.")
-        self.assertEqual(last[0], 8)   # checkpoint stamps the new length
+        # The checkpoint marks the last message it summarised.
+        self.assertIs(marker[0], self.bc.conversation_history[-1])
+        self.assertEqual(self.bc._session_running_summary[0],
+                         "Mid-session summary.")
 
     def test_checkpoint_skips_when_history_unchanged(self):
-        # last_len already equals the current history length (8) → the
-        # hist_len != last guard is False, so no LLM call / no recall write.
+        # Every message is already summarised → no LLM call / no recall write.
         with mock.patch.object(self.bc, "_llm_quick") as mq, \
              mock.patch.object(self.bc.pattern_memory,
                                "record_session_summary") as mrec:
-            self._drive_one_iteration(last_len_val=8)
+            self._drive_one_iteration(already_summarised=True)
         mq.assert_not_called()
         mrec.assert_not_called()
 
     def test_checkpoint_summary_failure_swallowed(self):
-        # record_session_summary raising is caught by the inner except
-        # (1869-1870); the loop continues to the trailing sleep (our sentinel).
+        # record_session_summary raising is caught by the inner except; the
+        # loop continues to the trailing sleep (our sentinel).
         with mock.patch.object(self.bc, "_llm_quick",
                                return_value="A summary."), \
              mock.patch.object(self.bc.pattern_memory, "record_session_summary",
                                side_effect=RuntimeError("recall boom")):
-            last = self._drive_one_iteration(last_len_val=0)
-        # Failed write → last_len NOT advanced (still 0).
-        self.assertEqual(last[0], 0)
+            marker = self._drive_one_iteration(already_summarised=False)
+        # Failed write → nothing marked summarised (retried next time).
+        self.assertIsNone(marker[0])
+        self.assertEqual(self.bc._session_running_summary[0], "")
+
+    def test_a_long_session_is_summarised_whole_not_just_its_tail(self):
+        # B022 (2026-10-01): each checkpoint summarised only the trimmed
+        # history window (~10 exchanges) and REPLACED the session's single
+        # row, so everything earlier vanished from session recall. Turns the
+        # trim dropped between two checkpoints were never summarised at all.
+        bc = self.bc
+        hist = self._restore_attr_after("conversation_history")
+        hist.clear()
+        for i in range(4):
+            hist.append({"role": "user", "content": f"owner line {i:02d}"})
+            hist.append({"role": "assistant", "content": f"reply {i:02d}"})
+        recorded, prompts = [], []
+
+        def _llm(system=None, user=None, max_tokens=None):
+            prompts.append(user or "")
+            return ["First part of the day.", "The whole session."][
+                len(prompts) - 1]
+
+        with mock.patch.object(bc, "_llm_quick", side_effect=_llm), \
+             mock.patch.object(bc.pattern_memory, "record_session_summary",
+                               side_effect=lambda s, **k: recorded.append(s)):
+            self._one_pass()
+            # 13 more exchanges: the chunked trim drops exchanges 00-07.
+            for i in range(4, 17):
+                bc._append_turn(f"owner line {i:02d}", f"reply {i:02d}")
+            self.assertNotIn("owner line 04",
+                             " ".join(m["content"] for m in hist))
+            self._one_pass()
+        self.assertEqual(recorded, ["First part of the day.",
+                                    "The whole session."])
+        second = prompts[1]
+        self.assertIn("First part of the day.", second)   # the summary so far
+        self.assertIn("owner line 04", second)   # trimmed before it was seen
+        self.assertIn("owner line 16", second)
+        self.assertNotIn("owner line 03", second)   # already summarised
+
+    def test_a_secret_shaped_summary_is_withheld(self):
+        # B082 (2026-10-01): the session summary goes into every prompt
+        # ("Recent conversation summaries") with no secret guard.
+        with mock.patch.object(self.bc, "_llm_quick",
+                               return_value="Sir dictated his wifi password "
+                                            "for the guest network."), \
+             mock.patch.object(self.bc.pattern_memory,
+                               "record_session_summary") as mrec, \
+             mock.patch("builtins.print"):
+            marker = self._drive_one_iteration(already_summarised=False)
+        mrec.assert_not_called()
+        self.assertEqual(self.bc._session_running_summary[0], "")
+        # ...and those turns are not retried forever.
+        self.assertIs(marker[0], self.bc.conversation_history[-1])
+
+    def test_a_repeated_history_length_still_checkpoints_new_turns(self):
+        # B022: a full history cycles through 14/16/18/20 messages, and the
+        # old length test skipped a checkpoint whose length happened to
+        # repeat even though new turns had arrived.
+        bc = self.bc
+        hist = self._restore_attr_after("conversation_history")
+        hist.clear()
+        for i in range(10):
+            hist.append({"role": "user", "content": f"owner line {i:02d}"})
+            hist.append({"role": "assistant", "content": f"reply {i:02d}"})
+        recorded = []
+        with mock.patch.object(bc, "_llm_quick", return_value="Summary."), \
+             mock.patch.object(bc.pattern_memory, "record_session_summary",
+                               side_effect=lambda s, **k: recorded.append(s)):
+            self._one_pass()
+            for i in range(10, 14):      # 20 -> 22 (trim to 14) -> 16/18/20
+                bc._append_turn(f"owner line {i:02d}", f"reply {i:02d}")
+            self.assertEqual(len(hist), 20)
+            self._one_pass()
+        self.assertEqual(len(recorded), 2)
 
     def test_checkpoint_outer_loop_error_swallowed(self):
         # An error in the snapshot/length logic (outside the inner try) is
@@ -2860,6 +3007,86 @@ class SessionCheckpointThreadTests(_MonolithTestBase):
                 pass
         # The outer except absorbed the snapshot error before the LLM was hit.
         mq.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Memory wipes reach the live process state (2026-10-01)
+# ──────────────────────────────────────────────────────────────────────────
+class MemoryWipeLiveStateTests(_MonolithTestBase):
+    """The helpers core/actions.py's reset_memory / forget_last_hour call.
+    B003: the conversation history (in every LLM call) and the running
+    session summary survived a confirmed forget. B017: the live system
+    prompt kept the erased facts while the prompt freeze deferred rebuilds."""
+
+    def _seed(self, n_turns=4):
+        hist = self._restore_attr_after("conversation_history")
+        hist.clear()
+        for i in range(n_turns):
+            hist.append({"role": "user", "content": f"book the dentist {i}"})
+            hist.append({"role": "assistant", "content": f"done {i}"})
+        return hist
+
+    def test_forget_clears_the_history_in_place(self):
+        hist = self._seed()
+        self.bc._session_trimmed.append({"role": "user", "content": "older"})
+        self.bc._session_running_summary[0] = "Booked the dentist."
+        self.bc._session_summary_at[0] = time.time()
+        n = self.bc._forget_live_conversation(time.time() - 3600)
+        self.assertEqual(n, 8)
+        self.assertIs(self.bc.conversation_history, hist)   # same list
+        self.assertEqual(hist, [])
+        self.assertEqual(list(self.bc._session_trimmed), [])
+        # Written inside the hour: it may describe the forgotten turns.
+        self.assertEqual(self.bc._session_running_summary[0], "")
+
+    def test_a_summary_written_before_the_hour_is_kept(self):
+        self._seed()
+        self.bc._session_running_summary[0] = "Morning: the garden."
+        self.bc._session_summary_at[0] = time.time() - 7200
+        self.bc._forget_live_conversation(time.time() - 3600)
+        self.assertEqual(self.bc._session_running_summary[0],
+                         "Morning: the garden.")
+        self.bc._forget_live_conversation(None)          # a full reset
+        self.assertEqual(self.bc._session_running_summary[0], "")
+
+    def test_a_checkpoint_in_flight_during_the_forget_writes_nothing(self):
+        # The checkpoint snapshots, then waits on the LLM; "forget the last
+        # hour" lands meanwhile. Its summary of the forgotten turns must not
+        # be re-written into the recall index.
+        self._seed()
+        pending = self.bc._session_summary_pending()
+
+        def _llm(**_k):
+            self.bc._forget_live_conversation(time.time() - 3600)
+            return "Booked the dentist."
+
+        with mock.patch.object(self.bc, "_llm_quick", side_effect=_llm), \
+             mock.patch.object(self.bc.pattern_memory,
+                               "record_session_summary") as mrec:
+            out = self.bc._session_summary_update(pending)
+        self.assertEqual(out, "")
+        mrec.assert_not_called()
+        self.assertEqual(self.bc._session_running_summary[0], "")
+
+    def test_the_prompt_rebuild_ignores_the_freeze(self):
+        # B017: on the local route mid-conversation _request_prompt_rebuild
+        # only DEFERS; a wipe must reach the live prompt at once.
+        bc = self.bc
+        bc._turn_in_progress[0] = True
+        bc._prompt_rebuild_pending[0] = True
+        with mock.patch.object(bc, "_chat_takes_local_branch",
+                               return_value=True), \
+             mock.patch.object(bc, "load_memory", return_value={}), \
+             mock.patch.object(bc, "build_system_prompt",
+                               return_value="PROMPT WITHOUT THE FACTS"), \
+             mock.patch.object(bc, "_ensure_prompt_rebuild_waiter"), \
+             mock.patch.object(bc, "_schedule_local_reprime") as reprime:
+            self.assertEqual(bc._request_prompt_rebuild(), "deferred")
+            self.assertNotEqual(bc._system_prompt, "PROMPT WITHOUT THE FACTS")
+            self.assertTrue(bc._rebuild_prompt_now())
+        self.assertEqual(bc._system_prompt, "PROMPT WITHOUT THE FACTS")
+        self.assertFalse(bc._prompt_rebuild_pending[0])
+        reprime.assert_called_once_with()
 
 
 # ──────────────────────────────────────────────────────────────────────────

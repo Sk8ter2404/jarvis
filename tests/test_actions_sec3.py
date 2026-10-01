@@ -303,6 +303,54 @@ class ResetMemoryTests(unittest.TestCase):
             self.assertIn("opening-utterance record was NOT cleared", out)
             self.assertIn("record wedged", out)
 
+    # ── 2026-10-01: stores a confirmed reset left behind ──────────────────
+
+    def test_reset_clears_the_logs_the_history_and_the_live_prompt(self):
+        # B003: the session-summary index and the verbatim voice-command log
+        # survived ("what did we do yesterday" still answered), and so did
+        # the conversation history. B017: the live prompt kept the facts.
+        with tempfile.TemporaryDirectory() as td:
+            bc, _ = self._bc_with_memory(td)
+            with _patch_bc(bc), \
+                    mock.patch.object(LTM, "reset_all", return_value=0):
+                out = A._act_reset_memory()
+            bc.pattern_memory.reset_conversation_logs.assert_called_once_with(
+                os.path.join(td, "backups"))
+            bc._forget_live_conversation.assert_called_once_with(None)
+            bc._rebuild_prompt_now.assert_called_once_with()
+            self.assertNotIn("WARNING", out)
+
+    def test_reset_failures_of_the_new_stores_are_disclosed(self):
+        with tempfile.TemporaryDirectory() as td:
+            bc, _ = self._bc_with_memory(td)
+            bc.pattern_memory.reset_conversation_logs.side_effect = \
+                OSError("copy failed")
+            bc._forget_live_conversation.side_effect = RuntimeError("wedged")
+            bc._rebuild_prompt_now.side_effect = RuntimeError("no prompt")
+            with _patch_bc(bc), \
+                    mock.patch.object(LTM, "reset_all", return_value=0):
+                out = A._act_reset_memory()
+            self.assertIn("memory reset (backup -> backups/", out)
+            self.assertIn("the session summaries and the voice-command log "
+                          "were NOT cleared (copy failed)", out)
+            self.assertIn("this conversation's history was NOT cleared "
+                          "(wedged)", out)
+            self.assertIn("the live prompt was NOT refreshed (no prompt)", out)
+
+    def test_reset_invalidates_queued_learning_before_the_wipe_is_saved(self):
+        # B018: a turn queued before the reset was learned straight back
+        # into the memory just wiped.
+        with tempfile.TemporaryDirectory() as td:
+            bc, _ = self._bc_with_memory(td)
+            order = []
+            bc._learn_invalidate = mock.Mock(
+                side_effect=lambda c: order.append(("invalidate", c)))
+            bc.save_memory.side_effect = lambda m: order.append("save")
+            with _patch_bc(bc), \
+                    mock.patch.object(LTM, "reset_all", return_value=0):
+                A._act_reset_memory()
+            self.assertEqual(order, [("invalidate", None), "save"])
+
     def test_outer_exception_caught(self):
         bc = _base_bc()
         # _memory_lock that explodes on __enter__ triggers the outer except.
@@ -914,6 +962,132 @@ class ForgetLastHourTests(unittest.TestCase):
         self.assertIn("WARNING", out)
         self.assertIn("opening-utterance record was NOT purged", out)
         self.assertIn("record wedged", out)
+
+    # ── 2026-10-01: stores a confirmed forget left behind ─────────────────
+
+    def test_forget_purges_the_session_summaries_and_the_live_history(self):
+        # B003: the conversation history (in every LLM call, and what
+        # "summarise what we talked about" reads) and the session-summary
+        # index ("what did we do this afternoon") survived the forget.
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        hist = [{"role": "user", "content": "book the dentist"},
+                {"role": "assistant", "content": "Booked, sir."}]
+        bc.conversation_history = hist
+
+        def _forget_live(cutoff):
+            n = len(hist)
+            hist.clear()
+            return n
+        bc._forget_live_conversation = mock.Mock(side_effect=_forget_live)
+        bc.pattern_memory.forget_session_summaries_since.return_value = 1
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm():
+            out = A._act_forget_last_hour()
+            recall = A._summarise_current_conversation(
+                bc, ("summarise what we talked about",))
+        bc.pattern_memory.forget_session_summaries_since \
+            .assert_called_once_with(now - 3600)
+        bc._forget_live_conversation.assert_called_once_with(now - 3600)
+        self.assertEqual(out, "forgot 1 item(s) from the last hour")
+        self.assertNotIn("dentist", recall)
+        bc._llm_quick.assert_not_called()
+
+    def test_only_the_live_history_had_the_hour(self):
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        bc._forget_live_conversation = mock.Mock(return_value=4)
+        bc.pattern_memory.forget_session_summaries_since.return_value = 0
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm():
+            out = A._act_forget_last_hour()
+        self.assertEqual(out, "forgot 4 message(s) of this conversation "
+                              "from the last hour")
+
+    def test_failed_summary_and_history_purges_are_disclosed(self):
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        bc.pattern_memory.forget_session_summaries_since.side_effect = \
+            RuntimeError("index locked")
+        bc._forget_live_conversation = mock.Mock(
+            side_effect=RuntimeError("history wedged"))
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm():
+            out = A._act_forget_last_hour()
+        self.assertIn("the session summaries were NOT purged (index locked)",
+                      out)
+        self.assertIn("this conversation's history was NOT cleared "
+                      "(history wedged)", out)
+
+    def test_forget_rebuilds_the_live_prompt_and_discloses_a_failure(self):
+        # B017: the wipe never reached the live system prompt.
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm({"episodes": 1, "facts": 0, "working": 0}):
+            out = A._act_forget_last_hour()
+        bc._rebuild_prompt_now.assert_called_once_with()
+        self.assertEqual(out, "forgot 1 logged turn(s) from the last hour")
+        bc = self._bc({"topics": [], "sessions": []})
+        bc._rebuild_prompt_now.side_effect = RuntimeError("prompt wedged")
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm({"episodes": 1, "facts": 0, "working": 0}):
+            out = A._act_forget_last_hour()
+        self.assertIn("WARNING: the live prompt was NOT refreshed "
+                      "(prompt wedged)", out)
+
+    def test_forget_invalidates_queued_learning_under_the_memory_lock(self):
+        # B018: turns queued for learning before the forget were extracted
+        # after it and written back with ts=now.
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        order = []
+        bc._memory_lock.__enter__.side_effect = lambda *a: order.append("lock")
+        bc._learn_invalidate = mock.Mock(
+            side_effect=lambda c: order.append(("invalidate", c)))
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm():
+            A._act_forget_last_hour()
+        self.assertEqual(order[:2], ["lock", ("invalidate", now - 3600)])
+
+    def test_facts_learned_in_the_hour_leave_the_prompt_memory_too(self):
+        # B019: the LTM purge dropped the hour's facts and the reply counted
+        # them, while bobert_memory.json -- every prompt -- kept them.
+        now = 1_700_000_000.0
+        mem = {"topics": [], "sessions": [],
+               "facts": ["User likes jazz", "user's sister lives in Denver"],
+               "projects": ["Building a birdhouse"]}
+        bc = self._bc(mem)
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm({"episodes": 0, "facts": 2, "working": 0,
+                                 "fact_texts": [
+                                     "User's sister lives in Denver",
+                                     "Building a birdhouse"]}):
+            out = A._act_forget_last_hour()
+        saved = bc.save_memory.call_args[0][0]
+        self.assertEqual(saved["facts"], ["User likes jazz"])
+        self.assertEqual(saved["projects"], [])
+        self.assertEqual(out, "forgot 2 fact(s) from the last hour")
+
+    def test_a_failed_prompt_memory_fact_removal_is_disclosed(self):
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": [], "facts": ["x"]})
+        bc.save_memory.side_effect = RuntimeError("store locked")
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm({"episodes": 0, "facts": 1, "working": 0,
+                                 "fact_texts": ["x"]}):
+            out = A._act_forget_last_hour()
+        self.assertNotIn("1 fact(s)", out)
+        self.assertIn("the facts learned in the last hour were NOT removed "
+                      "from my main memory (store locked)", out)
 
     def test_exception_caught(self):
         bc = _base_bc()

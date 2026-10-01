@@ -249,6 +249,19 @@ _MONOLITH_RESTORE_NAMES = (
     # later turn in a queue nobody drains. LEARN_ONLY_FROM_OWNER itself is
     # pinned to the shipped default in MonolithGlobalsTestCase.run.
     "_learn_gate_state", "_learn_gate_live",
+    # Memory-wipe generation + forgotten LTM window (2026-10-01). A leaked
+    # bump would make a LATER test's queued turn look "from before a wipe"
+    # and silently never learn; a leaked window would drop its LTM records.
+    "_learn_epoch", "_ltm_forgotten",
+    # The session's running summary (2026-10-01): its text, last-summarised
+    # message, write time, trimmed backlog and wipe generation. A leaked
+    # summary or marker would make a LATER test's checkpoint / shutdown
+    # summary skip turns or fold in this test's session.
+    "_session_running_summary", "_session_summary_marker",
+    "_session_summary_at", "_session_trimmed", "_session_summary_gen",
+    # Who wrote the last drained inject (2026-10-01): a leaked "test" would
+    # make a later test's typed turn look like a harness line.
+    "_last_inject_source",
     # Proactive-remark gates (2026-09-30): the owner's last MIC turn, the
     # remark history (repeat ring, spoken-remark times, last attempt, logged
     # hold) and the face-presence state (the detector's last detail, the

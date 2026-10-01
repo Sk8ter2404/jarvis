@@ -4,10 +4,13 @@ This is the long-term "what JARVIS knows about its owner" file that gets dumped
 into the system prompt every turn. Three functions extracted from the monolith:
 
   _empty_memory()        — the schema with sensible empty defaults.
-  load_memory()          — read + forward-migrate missing keys; empty on error.
+  load_memory()          — read + forward-migrate missing keys; empty when the
+                           file is absent, an empty MARKED unreadable when it
+                           exists but cannot be parsed (2026-10-01).
   save_memory(memory)    — ATOMIC write (tempfile + fsync + os.replace) so a
                            crash/power-loss mid-write can't truncate the live
-                           store to empty/half-written JSON (2026-05-30 audit).
+                           store to empty/half-written JSON (2026-05-30 audit);
+                           refuses a dict that came from an unreadable store.
 
 The target path and the write lock are INJECTED via configure() rather than
 imported, because bobert_companion picks the path at boot (prod
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -32,6 +36,20 @@ _MEMORY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bobert_memory.json"
 )
 _LOCK: "threading.RLock" = threading.RLock()
+
+# Marker on the dict load_memory() returns for a store that EXISTS but cannot
+# be read. save_memory() refuses such a dict, so no writer can persist it.
+_LOAD_FAILED_KEY = "_load_failed"
+
+
+class MemoryStoreUnreadable(RuntimeError):
+    """save_memory() was handed the empty stand-in for an unreadable store."""
+
+
+# (mtime_ns, size) of the last unreadable file already copied aside and
+# reported, so a store that stays broken is backed up and logged once, not on
+# every one of the dozens of load_memory() calls a session makes.
+_unreadable_noted: list = [None]
 
 
 def configure(memory_file: str, lock=None) -> None:
@@ -60,14 +78,54 @@ def _empty_memory() -> dict:
     }
 
 
+def _note_unreadable(err: Exception) -> None:
+    """Copy an unreadable store aside (backups/memory_unreadable_<ts>.json)
+    and say so loudly, once per distinct file state. Never raises."""
+    try:
+        st = os.stat(_MEMORY_FILE)
+        key = (st.st_mtime_ns, st.st_size)
+    except Exception:
+        key = None
+    if key is not None and _unreadable_noted[0] == key:
+        return
+    _unreadable_noted[0] = key
+    where = "NOT backed up"
+    try:
+        _dir = os.path.join(
+            os.path.dirname(os.path.abspath(_MEMORY_FILE)) or ".", "backups")
+        os.makedirs(_dir, exist_ok=True)
+        dest = os.path.join(
+            _dir, f"memory_unreadable_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        shutil.copy2(_MEMORY_FILE, dest)
+        where = f"copied to backups/{os.path.basename(dest)}"
+    except Exception as e:
+        where = f"NOT backed up ({type(e).__name__})"
+    print(f"  [legacy_memory] UNREADABLE memory store "
+          f"({type(err).__name__}: {err}) -- {where}; refusing to save over "
+          f"it until it is fixed")
+
+
 def load_memory() -> dict:
     if not os.path.exists(_MEMORY_FILE):
         return _empty_memory()
+    # An EXISTING file that cannot be parsed is not "no memory" (2026-10-01).
+    # Every writer does a whole-file load -> mutate -> save, so returning a
+    # plain empty schema here let the next reply's phrase-rotation write (or
+    # the boot conversation_count bump) silently replace all 120 facts,
+    # projects, topics, sessions and quarantine after one hand-edit typo. The
+    # stand-in is marked so save_memory refuses it, and the bad file is copied
+    # aside. utf-8-sig: a valid file re-saved with a BOM (Windows PowerShell
+    # 5.1 Out-File, Notepad "UTF-8 with BOM") is not a broken one.
     try:
-        with open(_MEMORY_FILE, encoding="utf-8") as f:
+        with open(_MEMORY_FILE, encoding="utf-8-sig") as f:
             mem = json.load(f)
-    except Exception:
-        return _empty_memory()
+        if not isinstance(mem, dict):
+            raise ValueError(f"top level is {type(mem).__name__}, not an object")
+    except Exception as e:
+        _note_unreadable(e)
+        mem = _empty_memory()
+        mem[_LOAD_FAILED_KEY] = True
+        return mem
 
     # Migrate old schema (only had facts + sessions): backfill any missing keys.
     base = _empty_memory()
@@ -102,6 +160,13 @@ def save_memory(memory: dict) -> None:
     # bobert_memory.json EMPTY or half-written — a wiped/corrupt memory store
     # (and it's dumped verbatim into the system prompt every turn). os.replace
     # is atomic on both Windows and POSIX. 2026-05-30 file audit.
+    #
+    # A dict load_memory() marked unreadable is refused (2026-10-01): writing
+    # it would replace the owner's whole store with an empty schema. Every
+    # read-modify-write caller already catches a failed save and logs it.
+    if isinstance(memory, dict) and memory.get(_LOAD_FAILED_KEY):
+        raise MemoryStoreUnreadable(
+            "the memory store on disk could not be read; not overwriting it")
     with _LOCK:
         _dir = os.path.dirname(os.path.abspath(_MEMORY_FILE)) or "."
         _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=".mem_", suffix=".tmp")

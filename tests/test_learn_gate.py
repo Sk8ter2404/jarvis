@@ -50,6 +50,19 @@ class VoiceVerdictTests(unittest.TestCase):
         self.assertEqual(lg.voice_verdict(None, 0.5, enrolled=True,
                                           reject_below="junk"), lg.NOT_OWNER)
 
+    def test_raising_the_floor_above_the_match_threshold_binds_a_match(self):
+        # B079 (2026-10-01): voice_id names a speaker from 0.72 up, and the
+        # floor used to be read only when there was NO name, so any setting
+        # from 0.72 to 1.0 acted like 0.72 -- a guest scoring 0.78 against
+        # the owner's print taught whatever the owner set.
+        self.assertEqual(lg.voice_verdict("owner", 0.78, enrolled=True,
+                                          reject_below=0.85), lg.NOT_OWNER)
+        # The shipped floor leaves a normal match the owner's.
+        self.assertEqual(lg.voice_verdict("owner", 0.78, enrolled=True,
+                                          reject_below=0.60), lg.OWNER)
+        self.assertEqual(lg.voice_verdict("owner", 0.90, enrolled=True,
+                                          reject_below=0.85), lg.OWNER)
+
 
 class DecideTests(unittest.TestCase):
     def setUp(self):
@@ -105,6 +118,20 @@ class DecideTests(unittest.TestCase):
         self.gate.note_wake(100.0)
         self.assertTrue(self.gate.decide(105.0)[0])
         self.assertFalse(self.gate.decide(300.0)[0])
+
+    def test_a_standby_wake_in_someone_elses_voice_opens_nothing(self):
+        # B081 (2026-10-01): a wake judged NOT the owner's voice opened the
+        # window anyway, so the guest's UNSURE follow-ups taught as "follow-up
+        # in the owner's conversation". decide() already refused that voice.
+        self.assertFalse(self.gate.note_wake(100.0, voice=lg.NOT_OWNER))
+        self.assertEqual(self.gate.decide(105.0, voice=lg.UNSURE),
+                         (False, "not addressed by the owner"))
+        # No voice evidence (a typed wake) or the owner's voice still opens it.
+        for voice in (lg.UNAVAILABLE, lg.UNSURE, lg.OWNER):
+            with self.subTest(voice=voice):
+                gate = lg.LearnGate(window_s=90)
+                self.assertTrue(gate.note_wake(100.0, voice=voice))
+                self.assertTrue(gate.decide(105.0, voice=lg.UNSURE)[0])
 
     def test_a_turn_from_before_the_window_opened_is_outside_it(self):
         self.gate.note_wake(100.0)
