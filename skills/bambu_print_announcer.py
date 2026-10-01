@@ -87,6 +87,10 @@ _saw_running_this_print = [False]
 _announced_runout       = [False]
 _announced_ams_fault    = [False]
 _announced_completion   = [False]
+# The current file reached an end state (FINISH / FAILED / IDLE) since it was
+# last seen starting — so a PREPARE / RUNNING of the SAME file is a reprint.
+_ended_since_running    = [False]
+_TERMINAL_STATES = ("FINISH", "FAILED", "IDLE")
 # Per-module rate-limit timestamp + lock
 _rate_limit_lock     = threading.Lock()
 _last_announcement_at = [0.0]
@@ -283,6 +287,18 @@ def _poll_loop() -> None:  # pragma: no cover - daemon poll loop; blocks on _sto
                 return
 
 
+def _reset_print_bookkeeping(*, armed: bool) -> None:
+    """Forget the previous print's callouts (a new file, or a reprint)."""
+    _announced_pct.clear()
+    _announced_layers.clear()
+    _armed_for_new_print[0] = armed
+    _saw_running_this_print[0] = False
+    _announced_runout[0] = False
+    _announced_ams_fault[0] = False
+    _announced_completion[0] = False
+    _ended_since_running[0] = False
+
+
 def _check_milestones() -> None:
     state = _read_state()
     if state is None:
@@ -300,17 +316,7 @@ def _check_milestones() -> None:
     ams = state.get("ams_status")
 
     # Reset milestone bookkeeping when the print file changes — same trigger
-    # bambu_monitor uses.
-    #
-    # KNOWN LIMITATION (tracked follow-up): a same-filename REPRINT is NOT reset
-    # here, so re-running the exact same file keeps the populated _announced_*
-    # sets and its 10 %/95 %/layer/completion callouts are silenced until a
-    # different file is printed. A terminal->RUNNING reset would fix it, but the
-    # _armed_for_new_print / priming interaction below needs a deliberate rework
-    # first (that flag is set True on a filename change and on priming and is
-    # never cleared, so a naive reset risks re-enabling mid-print "blurting").
-    # Deferred rather than patched blind. (A previous version of this comment
-    # claimed the terminal->RUNNING reset already existed; it never did.)
+    # bambu_monitor uses. A same-file REPRINT is handled just below.
     if fname and fname != _current_filename[0]:
         # On the very first populated poll after a (re)start the previous
         # filename is None, so we can't tell a fresh print from one already
@@ -323,13 +329,20 @@ def _check_milestones() -> None:
         # never actually watched.
         first_observation = _current_filename[0] is None
         _current_filename[0] = fname
-        _announced_pct.clear()
-        _announced_layers.clear()
-        _armed_for_new_print[0] = not first_observation
-        _saw_running_this_print[0] = False
-        _announced_runout[0] = False
-        _announced_ams_fault[0] = False
-        _announced_completion[0] = False
+        _reset_print_bookkeeping(armed=not first_observation)
+    elif gcode_state in _TERMINAL_STATES:
+        if _current_filename[0] is not None:
+            _ended_since_running[0] = True
+    elif gcode_state in ("PREPARE", "RUNNING") and _ended_since_running[0]:
+        # REPRINT of the same file: the filename-change reset above never
+        # fires, so the last run's 10 %/95 %/layer/completion bookkeeping
+        # silenced every callout of the new run. A file that reached an end
+        # state and is starting again is a new print. It is reset DISarmed,
+        # so its first RUNNING poll goes through the priming branch below:
+        # at a fresh ~0 % priming marks nothing and the callouts fire from
+        # the next poll; if the printer still reports the last run's percent
+        # on that first poll, priming swallows it instead of blurting.
+        _reset_print_bookkeeping(armed=False)
 
     # If JARVIS comes up mid-print, suppress past milestones so we don't blurt
     # 10 % the instant we discover an 80 %-done print.

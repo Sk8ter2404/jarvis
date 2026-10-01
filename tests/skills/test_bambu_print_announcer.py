@@ -66,6 +66,7 @@ class AnnouncerLoadMixin:
         mod._announced_runout[0] = False
         mod._announced_ams_fault[0] = False
         mod._announced_completion[0] = False
+        mod._ended_since_running[0] = False
         mod._last_announcement_at[0] = 0.0
         mod._last_suppressed_reason[0] = ""
         return mod, actions, fake
@@ -193,6 +194,65 @@ class AnnouncerMilestoneTests(AnnouncerLoadMixin, unittest.TestCase):
             mod._check_milestones()
         msgs = [c.args[0] for c in ann.call_args_list]
         self.assertTrue(any("first layer adhesion" in m.lower() for m in msgs))
+
+
+class AnnouncerReprintTests(AnnouncerLoadMixin, unittest.TestCase):
+    """A same-file REPRINT (2026-10-01): the filename never changes, so before
+    the fix the last run's bookkeeping silenced every callout of the new run."""
+
+    def _poll(self, mod, gcode_state, pct, layer=30):
+        state = {"last_update": time.time(), "gcode_state": gcode_state,
+                 "filename": "cube.3mf", "mc_percent": pct, "layer_num": layer,
+                 "total_layer": 300, "mc_remaining": 100}
+        with mock.patch.object(mod, "_read_state", return_value=state),              mock.patch.object(mod, "_proactive_announce",
+                               return_value=True) as ann:
+            mod._check_milestones()
+        return [c.args[0] for c in ann.call_args_list]
+
+    def _finished_first_run(self, mod):
+        mod._armed_for_new_print[0] = True
+        mod._current_filename[0] = "cube.3mf"
+        mod._announced_layers.update({1, 5, 10})   # keep layer callouts out
+        self.assertTrue(any("10%" in m for m in self._poll(mod, "RUNNING", 12)))
+        self._poll(mod, "RUNNING", 50)
+        self.assertIn("Your part is ready, sir.", self._poll(mod, "FINISH", 100))
+
+    def test_reprint_of_the_same_file_announces_again(self):
+        mod, _a, _f = self._load()
+        self._finished_first_run(mod)
+        self.assertEqual(self._poll(mod, "PREPARE", 0), [])
+        self.assertEqual(self._poll(mod, "RUNNING", 0, layer=0), [])   # priming poll
+        msgs = self._poll(mod, "RUNNING", 12, layer=0)
+        self.assertTrue(any("10%" in m for m in msgs), msgs)
+        self.assertIn("Your part is ready, sir.", self._poll(mod, "FINISH", 100))
+
+    def test_stale_percent_on_the_reprints_first_poll_is_not_blurted(self):
+        mod, _a, _f = self._load()
+        self._finished_first_run(mod)
+        # Straight back to RUNNING still carrying the last run's 100 %.
+        self.assertEqual(self._poll(mod, "RUNNING", 100), [])
+
+    def test_pause_and_resume_is_not_a_reprint(self):
+        mod, _a, _f = self._load()
+        mod._armed_for_new_print[0] = True
+        mod._current_filename[0] = "cube.3mf"
+        mod._announced_layers.update({1, 5, 10})
+        self.assertTrue(any("10%" in m for m in self._poll(mod, "RUNNING", 12)))
+        self.assertEqual(self._poll(mod, "PAUSE", 13), [])
+        self.assertEqual(self._poll(mod, "RUNNING", 14), [])
+        self.assertIn(10, mod._announced_pct)
+
+    def test_a_new_file_after_a_finish_keeps_the_old_behaviour(self):
+        mod, _a, _f = self._load()
+        self._finished_first_run(mod)
+        state = {"last_update": time.time(), "gcode_state": "RUNNING",
+                 "filename": "other.3mf", "mc_percent": 12, "layer_num": 30,
+                 "total_layer": 300, "mc_remaining": 100}
+        with mock.patch.object(mod, "_read_state", return_value=state),              mock.patch.object(mod, "_proactive_announce",
+                               return_value=True) as ann:
+            mod._check_milestones()
+        self.assertTrue(any("10%" in c.args[0] for c in ann.call_args_list))
+        self.assertFalse(mod._ended_since_running[0])
 
 
 class AnnouncerRunoutAmsTests(AnnouncerLoadMixin, unittest.TestCase):
