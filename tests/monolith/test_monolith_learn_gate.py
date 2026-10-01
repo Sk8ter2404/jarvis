@@ -584,8 +584,11 @@ class MainLoopWiringTests(MonolithGlobalsTestCase):
         greet_at = src.index("context_aware_greeting(", wake_at)
         # 2026-10-01 (B081): a mic wake hands its capture over for the voice
         # check; a typed wake has no capture -- and a test harness's typed
-        # wake opens nothing (behaviour pinned in test_monolith_sec7).
-        self.assertIn("_learn_gate_note_wake(audio, SAMPLE_RATE)",
+        # wake opens nothing (behaviour pinned in test_monolith_sec7). The
+        # capture is the RAW (pre auto-gain) buffer the standby phase
+        # publishes as _last_capture_audio (the voice-loop batch), not the
+        # boosted local ``audio``: voice-ID wants natural audio.
+        self.assertIn("_learn_gate_note_wake(_last_capture_audio, SAMPLE_RATE)",
                       src[wake_at:greet_at])
         self.assertIn("_learn_gate_note_wake()", src[wake_at:greet_at])
 
