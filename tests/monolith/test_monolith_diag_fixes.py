@@ -448,5 +448,72 @@ class FocusStealGuardTests(MonolithGlobalsTestCase):
         self.assertFalse(self._guard(full, full, fg=0))
 
 
+
+# ── item 8: the web wake-word switch flips REQUIRE_WAKE_MODE live ──────────
+@requires_monolith
+class WakeWordModeTrayTests(MonolithGlobalsTestCase):
+    """The dashboard sends wake_word_mode_on / _off through tray_commands.json;
+    the drainer must run the same live flip as the voice command and publish
+    the state the dashboard's switch shows."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        import core.config as cfg
+        saved_rt, saved_cfg = bc._require_wake_runtime, cfg.REQUIRE_WAKE_MODE
+
+        def restore():
+            bc._require_wake_runtime = saved_rt
+            cfg.REQUIRE_WAKE_MODE = saved_cfg
+        self.addCleanup(restore)
+        self.cfg = cfg
+        self.hud = []
+        for target, name, value in (
+                (bc, "_write_hud_state",
+                 lambda **k: self.hud.append(k)),
+                (bc, "_publish_tray_result", mock.Mock())):
+            p = mock.patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        from tools import settings_window as sw
+        p_save = mock.patch.object(sw, "save_settings")
+        self.save = p_save.start()
+        self.addCleanup(p_save.stop)
+        p_load = mock.patch.object(sw, "load_settings", return_value={})
+        p_load.start()
+        self.addCleanup(p_load.stop)
+
+    def _tray(self, cmd):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.bc._dispatch_tray_command(cmd, {"cmd": cmd, "rid": "r1"})
+        return buf.getvalue()
+
+    def test_on_and_off_apply_live_and_publish(self):
+        bc = self.bc
+        log = self._tray("wake_word_mode_on")
+        self.assertIs(bc._require_wake_runtime, True)
+        self.assertIs(self.cfg.REQUIRE_WAKE_MODE, True)
+        self.assertIn({"require_wake_mode": True}, self.hud)
+        self.assertEqual(self.save.call_args.kwargs.get("changed"),
+                         ("REQUIRE_WAKE_MODE",))
+        self.assertIn("Wake-word mode on", log)
+        bc._publish_tray_result.assert_called_with(
+            "r1", "wake_word_mode_on", mock.ANY)
+        self._tray("wake_word_mode_off")
+        self.assertIs(bc._require_wake_runtime, False)
+        self.assertIn({"require_wake_mode": False}, self.hud)
+
+    def test_the_voice_command_publishes_too(self):
+        self.bc._act_wake_word_mode_set(True)
+        self.assertIn({"require_wake_mode": True}, self.hud)
+
+    def test_boot_publishes_the_configured_value(self):
+        import inspect
+        main = inspect.getsource(self.bc.main)
+        at = main.index("_restore_tray_toggle_state()")
+        self.assertIn("_publish_wake_mode_state()", main[at:at + 400])
+
+
 if __name__ == "__main__":
     unittest.main()

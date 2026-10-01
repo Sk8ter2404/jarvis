@@ -82,11 +82,13 @@ class StandbyCommandTests(unittest.TestCase):
 # ── B014 (web half) ────────────────────────────────────────────────────────
 class WakeBannerHintTests(unittest.TestCase):
     def test_the_hint_names_the_knob_the_switch_drives(self):
+        # 2026-10-01: the switch drives REQUIRE_WAKE_MODE (the owner's
+        # "wake-word mode"), live - see tests/test_web_wake_mode.py.
         page = wi._DASHBOARD_PAGE
-        self.assertIn("const WAKE_KEY = 'START_IN_STANDBY';", page)
+        self.assertIn("const WAKE_KEY = 'REQUIRE_WAKE_MODE';", page)
         banner = page[page.index('<div class="wakebanner">'):]
         banner = banner[:banner.index("</div>")]
-        self.assertIn("(START_IN_STANDBY)", banner)
+        self.assertIn("(REQUIRE_WAKE_MODE)", banner)
         self.assertNotIn("WAKE_WORD_AUTOSTART", banner)
 
 

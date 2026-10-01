@@ -77,7 +77,8 @@ CONTROL ROUTES ADDED 2026-09-30 (web audit)
                            the command channel); side-effect / destructive
                            names need ``"confirm": true`` (_ACTION_CONFIRM_RULES)
   POST /api/control        the tray control plane (force_wake, enter_standby,
-                           mute/mic/pause toggles, restart) via tray_commands.json
+                           mute/mic/pause toggles, restart, wake_word_mode_on/
+                           _off = the pinned switch) via tray_commands.json
   GET  /api/panels, GET /api/panel/<id>/state, POST /api/panel/<id>/action,
   GET  /api/panel/<id>/stream/<name>   skill-declared panels (core/web_panels.py)
 """
@@ -1164,6 +1165,11 @@ def _status_flags(hud: dict) -> dict:
         "daemons_paused": bool(hud.get("daemons_paused")),
         "now_doing": str(hud.get("now_doing") or ""),
         "active_action": str(hud.get("active_action") or ""),
+        # REQUIRE_WAKE_MODE as the RUNNING loop has it (published by
+        # _act_wake_word_mode_set and at boot). None = not published (an
+        # older JARVIS, or none running) - unknown, never reported as off.
+        "require_wake_mode": (bool(hud["require_wake_mode"])
+                              if "require_wake_mode" in hud else None),
     }
 
 
@@ -1341,7 +1347,11 @@ def inject_command(text: str, inject_path: str) -> None:
 # accepted from the web (checked against _dispatch_tray_command's own branches);
 # the ones in _TRAY_CONFIRM need "confirm": true.
 TRAY_WEB_COMMANDS = ("force_wake", "enter_standby", "mute_tts_toggle",
-                     "mic_mute_toggle", "pause_daemons_toggle", "restart")
+                     "mic_mute_toggle", "pause_daemons_toggle", "restart",
+                     # The pinned wake-word switch (2026-10-01): the owner's
+                     # "wake-word mode" is REQUIRE_WAKE_MODE, applied live by
+                     # the same _act_wake_word_mode_set the voice command runs.
+                     "wake_word_mode_on", "wake_word_mode_off")
 _TRAY_CONFIRM = frozenset({"restart"})
 DEFAULT_TRAY_COMMANDS_PATH = os.path.join(PROJECT_DIR, "tray_commands.json")
 
@@ -3813,16 +3823,19 @@ _DASHBOARD_PAGE = r"""<!doctype html>
        The wake-word switch is pinned in the banner at the top; every other knob
        is rendered from /api/settings, grouped by tab, into #settingsGroups. The
        whole thing is built client-side from the schema so the panel never drifts
-       from settings_window.SCHEMA (the single source of truth). -->
+       from settings_window.SCHEMA (the single source of truth). The banner is
+       the one LIVE switch: it drives REQUIRE_WAKE_MODE through the tray control
+       plane, exactly like "wake word mode on/off" by voice. -->
   <section id="viewSettings" class="view" hidden>
     <div class="wakebanner">
       <label class="toggle" style="color:var(--cyan)">
-        <input id="wakeToggle" type="checkbox"> <span class="lbl">Wake-word mode (start in standby)</span>
+        <input id="wakeToggle" type="checkbox"> <span class="lbl">Wake-word mode (answer only when addressed by name)</span>
       </label>
       <button id="wakeSave" class="save" type="button">Save</button>
       <span id="wakeSaved" class="saved" aria-live="polite"></span>
-      <span class="hint">Boot silent and wait for &ldquo;JARVIS&rdquo; instead of always-listening
-        (START_IN_STANDBY). Toggle the neural detector + full standby knobs below too.</span>
+      <span class="hint">Only respond to commands that start with &ldquo;JARVIS&rdquo;
+        (REQUIRE_WAKE_MODE) &mdash; applied live, the same as saying &ldquo;wake word mode
+        on&rdquo;. Booting in standby and the neural wake detector are separate knobs below.</span>
     </div>
     <div id="settingsNote" class="muted">loading settings…</div>
     <div id="settingsGroups"></div>
@@ -3928,12 +3941,20 @@ function shortGpu(name) {
 // [intent:x] tag under a "model" label. Each GPU gets its own VRAM chip: the
 // old single TOTAL summed the LLM card with the second card.
 let LAST_STATUS = null;
+// The wake-word switch was flipped and not saved yet: a status poll must not
+// overwrite what is about to be saved (declared here, before refreshStatus).
+let wakeDirty = false;
 async function refreshStatus() {
   try {
     const r = await fetch(q('/api/status'), {headers:hdr()});
     if (r.status===401) { conn.textContent='unauthorized — token required'; return; }
     const s = await r.json();
     LAST_STATUS = s;
+    // The pinned wake-word switch shows what the RUNNING loop has
+    // (require_wake_mode), not just what the settings file says.
+    const wakeSw = document.getElementById('wakeToggle');
+    if (wakeSw && typeof s.require_wake_mode === 'boolean' && !wakeDirty)
+      wakeSw.checked = s.require_wake_mode;
     conn.textContent = ''; conn.innerHTML =
       '<span class="dot '+(s.running?'on':'')+'"></span>'+(s.running?'live':'offline');
     strip.innerHTML='';
@@ -4207,9 +4228,12 @@ const TAB_TITLES = { voice:'Voice', hearing:'Hearing & Mic', ai:'AI & Models',
   cameras:'Cameras & Kinect', privacy:'Privacy', integrations:'Integrations',
   advanced:'Advanced' };
 // The wake-word knob the banner switch drives — the headline control the owner
-// asked for. START_IN_STANDBY is the "Alexa-style wake-word mode" toggle;
-// WAKE_WORD_AUTOSTART (the neural detector) is surfaced as a normal row below.
-const WAKE_KEY = 'START_IN_STANDBY';
+// asked for. His "wake-word mode" is REQUIRE_WAKE_MODE (respond only when
+// addressed by name, 2026-10-01): the banner applies it LIVE through the tray
+// control plane and shows the running loop's value (status require_wake_mode).
+// START_IN_STANDBY (boot in standby) and WAKE_WORD_AUTOSTART (the neural
+// detector) are ordinary rows below.
+const WAKE_KEY = 'REQUIRE_WAKE_MODE';
 let settingsLoaded = false;
 
 // Element refs for the five control-panel tabs.
@@ -4412,9 +4436,12 @@ function renderSettings(payload) {
       ctl.appendChild(saveBtn); ctl.appendChild(saved);
       row.appendChild(meta); row.appendChild(ctl);
       group.appendChild(row);
-      // Mirror the wake-word row into the top banner switch so the headline
-      // toggle and its row stay in sync (the banner is the prominent shortcut).
-      if (it.name === WAKE_KEY) wakeToggle.checked = !!it.value;
+      // Mirror the wake-word row into the top banner switch — only while the
+      // running loop has not published its live value (that one wins; see
+      // refreshStatus).
+      if (it.name === WAKE_KEY && !wakeDirty
+          && !(LAST_STATUS && typeof LAST_STATUS.require_wake_mode === 'boolean'))
+        wakeToggle.checked = !!it.value;
     });
     settingsGroups.appendChild(group);
   });
@@ -4430,11 +4457,19 @@ async function loadSettings() {
   } catch(e) { settingsNote.textContent='could not load settings'; }
 }
 
-// The prominent banner switch: saves START_IN_STANDBY directly, then reloads the
-// panel so every mirrored row reflects the new value.
+// The prominent banner switch: applies REQUIRE_WAKE_MODE LIVE through the tray
+// control plane (_act_wake_word_mode_set: the running loop, core.config and the
+// settings file - the same path as the voice command), then refreshes the live
+// status and reloads the panel so the mirrored row shows the saved value.
+wakeToggle.addEventListener('change', () => { wakeDirty = true; });
 wakeSave.addEventListener('click', async () => {
-  await saveSetting(WAKE_KEY, wakeToggle.checked, wakeSaved);
-  settingsLoaded = false; loadSettings();
+  const on = wakeToggle.checked;
+  wakeSaved.textContent = '';
+  const ok = await sendControl(on ? 'wake_word_mode_on' : 'wake_word_mode_off');
+  wakeDirty = false;
+  wakeSaved.textContent = ok ? (on ? 'on — live' : 'off — live') : 'not sent';
+  wakeSaved.style.color = ok ? '' : 'var(--bad)';
+  setTimeout(() => { refreshStatus(); settingsLoaded = false; loadSettings(); }, 1200);
 });
 
 // ── SYSTEM TAB ──────────────────────────────────────────────────────────────

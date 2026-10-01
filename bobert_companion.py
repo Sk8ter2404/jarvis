@@ -5008,6 +5008,14 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         _debug_mode[0] = not _debug_mode[0]
         _write_hud_state(debug_mode=bool(_debug_mode[0]))
         print(f"  [tray] debug_mode_toggle -> {_debug_mode[0]}")
+    elif cmd in ("wake_word_mode_on", "wake_word_mode_off"):
+        # The web dashboard's pinned wake-word switch (2026-10-01): the SAME
+        # live flip as the voice command - runtime mirror, core.config, the
+        # settings file, and hud_state.json's require_wake_mode, which the
+        # dashboard shows. A request id gets the spoken line back.
+        result = _act_wake_word_mode_set(cmd == "wake_word_mode_on")
+        _publish_tray_result(str(entry.get("rid") or ""), cmd, result)
+        print(f"  [tray] {cmd} -> {result}")
     elif cmd == "mic_mute_toggle":
         # Mute Mic: drop captured mic input before dispatch (see
         # _capture_utterance) so JARVIS hears nothing and stays idle — distinct
@@ -28277,6 +28285,8 @@ def _act_wake_word_mode_set(on: bool) -> str:
         _cfg.REQUIRE_WAKE_MODE = bool(on)
     except Exception:
         pass
+    # The web dashboard's pinned switch shows the LIVE value (2026-10-01).
+    _publish_wake_mode_state()
     persisted = False
     try:
         from tools import settings_window as sw
@@ -28295,6 +28305,17 @@ def _act_wake_word_mode_set(on: bool) -> str:
         return ("Wake-word mode on, sir — I'll only respond when you start "
                 f"with 'JARVIS', until you turn it off{caveat}.")
     return f"Wake-word mode off, sir — listening normally again{caveat}."
+
+
+def _publish_wake_mode_state() -> None:
+    """Mirror the live wake-word mode (_require_wake_runtime) into
+    hud_state.json as ``require_wake_mode`` — the web dashboard's pinned
+    switch reads it from /api/status (2026-10-01). Called on every flip and
+    once at boot. Never raises."""
+    try:
+        _write_hud_state(require_wake_mode=bool(_require_wake_runtime))
+    except Exception:
+        pass
 
 
 def _act_wake_word_mode_status() -> str:
@@ -38068,6 +38089,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # restore step. Wrapped in try/except — the file may be absent on a
     # fresh install or corrupt after a hard crash.
     _restore_tray_toggle_state()
+    # REQUIRE_WAKE_MODE as this boot has it (config + user settings): the web
+    # dashboard's pinned wake-word switch shows it (2026-10-01).
+    _publish_wake_mode_state()
 
     # ── Ambient-learning boot (see AMBIENT_LEARNING_BOOT) ─────────────────────
     # Set by the upgrade/overnight pipeline when it relaunches JARVIS (or

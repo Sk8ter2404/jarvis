@@ -541,7 +541,7 @@ class SettingsEndpointTests(_ServerBase):
         self.assertIn('id="wakeToggle"', body)       # the prominent wake-word switch
         self.assertIn("Wake-word mode", body)        # its label
         self.assertIn("/api/settings", body)         # the page calls the endpoint
-        self.assertIn("START_IN_STANDBY", body)      # the knob the banner drives
+        self.assertIn("REQUIRE_WAKE_MODE", body)     # the knob the banner drives
 
 
 class SettingsTokenTests(_ServerBase):
