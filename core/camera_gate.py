@@ -452,6 +452,7 @@ class CameraGate:
             self._doo_said: set = set()       # keys told "dies on open" (R11)
             self._doo_said_at: dict = {}      # key -> clock time it was said
             self._doo_dirty = False           # runs changed since last save
+            self._doo_restored: list = []     # keys _doo_load restored
 
     def _rec(self, key: str) -> dict:
         r = self._dev.get(key)
@@ -741,16 +742,38 @@ class CameraGate:
                     if said and 0.0 <= now - said < DIES_ON_OPEN_SAY_AGAIN_S:
                         self._doo_said.add(key)
                         self._doo_said_at[key] = said
-                    held = (f"held for {_fmt_s(until - now)} more"
-                            if until > now else "its hold has run out")
-                    lines.append(
-                        f"  [camera-gate] {key}: restored from the last run - "
-                        f"its last {count} opens each died on open; {held}, "
-                        f"then retried every {_fmt_s(r['doo_retry_s'])} "
-                        f"until a reopen streams normally.")
+                    self._doo_restored.append(key)
+                    lines.append(self._doo_restored_line_locked(key, r, now))
             self._emit(lines, [])
         except Exception:
             pass
+
+    def _doo_restored_line_locked(self, key: str, r: dict, now: float) -> str:
+        until = r["doo_until"]
+        held = (f"held for {_fmt_s(until - now)} more"
+                if until > now else "its hold has run out")
+        return (f"  [camera-gate] {key}: restored from the last run - "
+                f"its last {r['doo_count']} opens each died on open; {held}, "
+                f"then retried every {_fmt_s(r['doo_retry_s'])} "
+                f"until a reopen streams normally.")
+
+    def restored_dies_on_open_lines(self) -> list:
+        """The 'restored from the last run' lines for the runs _doo_load
+        restored that are still armed, as of now. NEVER raises.
+
+        2026-10-01 (review): the monolith builds its gate at IMPORT, before
+        setup_logging() Tees stdout into the session log, so the restore
+        lines _doo_load emits never reached the log under pythonw - the
+        Kinect then sat closed for up to an hour with nothing saying why.
+        The monolith re-logs these once logging is up."""
+        try:
+            now = self._clock()
+            with self._lock:
+                return [self._doo_restored_line_locked(k, self._dev[k], now)
+                        for k in self._doo_restored
+                        if k in self._dev and self._dev[k]["doo_retry_s"] > 0.0]
+        except Exception:
+            return []
 
     def _doo_clear_locked(self, key: str, r: dict, why: str,
                           lines: list) -> None:

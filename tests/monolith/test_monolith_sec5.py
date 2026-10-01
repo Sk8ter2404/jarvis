@@ -1688,7 +1688,8 @@ class BackgroundAudioGateTests(SectionFiveBase):
         bc = self.bc
         self._cfg.AMBIENT_MUSIC_REFUSE_WAKE = False
         with mock.patch.object(bc, "_smtc_media_playing",
-                               return_value=True) as smtc,              mock.patch.object(bc, "_audio_music_should_refuse_wake",
+                               return_value=True) as smtc, \
+             mock.patch.object(bc, "_audio_music_should_refuse_wake",
                                return_value=True):
             refuse, why = bc._should_refuse_background_audio("turn the lights on")
         self.assertEqual((refuse, why), (False, ""))
@@ -1698,7 +1699,8 @@ class BackgroundAudioGateTests(SectionFiveBase):
         bc = self.bc
         self._cfg.AMBIENT_MUSIC_REFUSE_WAKE = False
         bc._require_wake_runtime = True
-        with mock.patch.object(bc, "_smtc_media_playing", return_value=True),              mock.patch.object(bc, "_followup_window") as fw:
+        with mock.patch.object(bc, "_smtc_media_playing", return_value=True), \
+             mock.patch.object(bc, "_followup_window") as fw:
             fw.admit.return_value = False
             refuse, why = bc._should_refuse_background_audio("what time is it")
         self.assertEqual((refuse, why), (True, "wake-word mode"))
@@ -2745,6 +2747,33 @@ class ContextAwareGreetingTests(SectionFiveBase):
             text, vol = bc.context_aware_greeting(from_standby=False)
         self.assertEqual(text, "Still up, sir?")
         self.assertEqual(vol, 1.0)
+
+    def test_pre_wake_silence_is_the_owners_not_jarvis_own_lines(self):
+        # 2026-10-01 review (B059's stale duplicate): JARVIS's own overnight
+        # line a minute ago refreshed last_speech_time, so morning_arrival's
+        # 6-hour gate read ~60 s of "silence" and skipped the greeting. The
+        # gap is measured from the owner's last accepted turn.
+        bc = self.bc
+        import time as _t
+        with mock.patch.object(bc, "_bambu_print_progress", return_value=None), \
+             mock.patch.object(bc, "_user_looking_away", return_value=False), \
+             mock.patch.object(bc, "last_speech_time", _t.time() - 60.0), \
+             mock.patch.object(bc, "_last_owner_turn_at",
+                               [_t.monotonic() - 8 * 3600.0]), \
+             self._patch_now(7):
+            bc.context_aware_greeting(from_standby=True, wake_text="jarvis")
+        self.assertAlmostEqual(bc._pre_wake_silence_seconds[0], 8 * 3600.0,
+                               delta=60.0)
+        # No owner turn yet this process: the last_speech_time measure stands.
+        bc._last_wake_date[0] = None
+        with mock.patch.object(bc, "_bambu_print_progress", return_value=None), \
+             mock.patch.object(bc, "_user_looking_away", return_value=False), \
+             mock.patch.object(bc, "last_speech_time", _t.time() - 600.0), \
+             mock.patch.object(bc, "_last_owner_turn_at", [0.0]), \
+             self._patch_now(7):
+            bc.context_aware_greeting(from_standby=True, wake_text="jarvis")
+        self.assertAlmostEqual(bc._pre_wake_silence_seconds[0], 600.0,
+                               delta=30.0)
 
     def test_good_morning_first_wake(self):
         bc = self.bc

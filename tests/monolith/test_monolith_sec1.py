@@ -3208,6 +3208,13 @@ class CrashTraceLogRotationTests(_MonolithTestBase):
         self.addCleanup(fd.close)
         return fd
 
+    def _archives(self, d):
+        adir = os.path.join(d, self.bc.CRASH_TRACE_ARCHIVE_DIRNAME)
+        if not os.path.isdir(adir):
+            return []
+        return [os.path.join(adir, n) for n in os.listdir(adir)
+                if n.startswith("crash_traces.")]
+
     def test_oversized_log_is_archived_not_deleted(self):
         d = tempfile.mkdtemp()
         path = os.path.join(d, "crash_traces.log")
@@ -3215,15 +3222,40 @@ class CrashTraceLogRotationTests(_MonolithTestBase):
             f.write(b"Windows fatal exception: code 0x8001010e\n" * 64)
         with mock.patch.object(self.bc, "CRASH_TRACE_ROTATE_BYTES", 1024):
             self._open(path)
-        archived = [n for n in os.listdir(d)
-                    if n.startswith("crash_traces.") and n != "crash_traces.log"]
+        archived = self._archives(d)
         self.assertEqual(len(archived), 1)
-        with open(os.path.join(d, archived[0]), "rb") as f:
+        with open(archived[0], "rb") as f:
             self.assertIn(b"0x8001010e", f.read())
         with open(path, "rb") as f:
             fresh = f.read()
         self.assertNotIn(b"0x8001010e", fresh)
         self.assertIn(f"pid {os.getpid()} ===".encode(), fresh)
+
+    def test_archive_survives_the_session_log_cleanup(self):
+        # 2026-10-01 review: an archive beside the session logs ends in .log
+        # and kept its old mtime through the rename, so _cleanup_old_logs
+        # (newest LOG_KEEP_COUNT *.log) deleted it ~50 boots later.
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "crash_traces.log")
+        with open(path, "wb") as f:
+            f.write(b"Windows fatal exception: access violation\n" * 64)
+        old = time.time() - 30 * 86400
+        os.utime(path, (old, old))
+        with mock.patch.object(self.bc, "CRASH_TRACE_ROTATE_BYTES", 1024):
+            self._open(path)
+        keep = 5
+        for i in range(keep + 10):           # more, newer session logs
+            sp = os.path.join(d, f"session_{i:03d}.log")
+            with open(sp, "w") as f:
+                f.write("x")
+            os.utime(sp, (old + 60 + i, old + 60 + i))
+        with mock.patch.object(self.bc, "LOGS_DIR", d), \
+             mock.patch.object(self.bc, "LOG_KEEP_COUNT", keep):
+            self.bc._cleanup_old_logs()
+        archived = self._archives(d)
+        self.assertEqual(len(archived), 1, os.listdir(d))
+        with open(archived[0], "rb") as f:
+            self.assertIn(b"access violation", f.read())
 
     def test_small_log_is_appended_with_a_session_marker(self):
         d = tempfile.mkdtemp()

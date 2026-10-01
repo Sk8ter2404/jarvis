@@ -991,6 +991,13 @@ _ANNOUNCE_COOLDOWN_S = 6 * 3600   # don't re-announce the same condition
 # failure (mic, disk, ram) was spoken once per process and never again after
 # a pass. _announce_failures now drops a component whose probe passed.
 _announced_failure_state: dict[str, str] = {}
+# 2026-10-01 (review): component -> (error text, when) of the last time it
+# was actually SPOKEN. Survives the re-arm above, so a probe that flaps
+# pass/fail with the same text (internet when DNS + ICMP blip, the passive
+# mic's "silent" verdict) is re-spoken at most once per _ANNOUNCE_COOLDOWN_S
+# instead of on every failure that follows a pass (~6x an hour at a 5-min
+# sweep). A different error text still speaks at once.
+_announced_failure_last: dict[str, tuple[str, float]] = {}
 
 
 def _maybe_announce_once(key: str, message: str) -> None:
@@ -3863,7 +3870,9 @@ def _announce_failures(run: dict) -> None:
     speak about components whose signature changed since we last announced
     them. A component that recovers (its probe passes) and later fails again
     re-announces, even with the same error text, as does the first occurrence
-    of any failure.
+    of any failure -- but the same text is re-spoken at most once per
+    _ANNOUNCE_COOLDOWN_S (see _announced_failure_last), so a flapping probe
+    does not speak on every failure that follows a pass.
     """
     high = [c for c, s in (run.get("severity_failed") or {}).items()
             if s == SEVERITY_HIGH]
@@ -3883,16 +3892,25 @@ def _announce_failures(run: dict) -> None:
     # in the error text so a *different* failure on the same component still
     # surfaces, while a persistent identical failure stays quiet.
     changed: list[str] = []
+    sigs: dict[str, str] = {}
+    now = _now()
     for c in high:
         sig = str((probes.get(c) or {}).get("error") or "failed")
+        sigs[c] = sig
         if _announced_failure_state.get(c) != sig:
-            changed.append(c)
+            last_sig, last_at = _announced_failure_last.get(c, ("", 0.0))
+            flapping = (last_sig == sig
+                        and (now - last_at) < _ANNOUNCE_COOLDOWN_S)
+            if not flapping:
+                changed.append(c)
         _announced_failure_state[c] = sig
 
     if not changed:
         # Every HIGH failure this sweep is a known, already-announced
         # condition with an unchanged cause — don't re-speak / re-push.
         return
+    for c in changed:
+        _announced_failure_last[c] = (sigs[c], now)
 
     # Phrase the announcement naturally. Each entry carries its own article
     # ("the Claude API", "a state file", "" for bare nouns) so we never

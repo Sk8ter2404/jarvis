@@ -34,6 +34,13 @@ _READ_TIMEOUT_S = 1.5
 # time.monotonic() it started]. Guarded by _reader_lock.
 _reader_state: list = [None, None, 0.0]
 _reader_lock = threading.Lock()
+# 2026-10-01 (review): a read that hangs past the budget used to be silent -
+# while its worker stays alive every caller gets None at once, so a wedged
+# WinRT read turned the media-playing refusal off for the session with no
+# trace. Each kind of hung-read line ("exceeded", "reused", "returned") is
+# printed at most once per this many seconds (stdout = the session log).
+_HUNG_LOG_GAP_S = 600.0
+_hung_logged_at: dict = {}        # kind -> time.monotonic() last printed
 
 _snapshot: dict | None = None      # last read {app,title,artist,status,playing} or None
 _last_read = 0.0
@@ -120,23 +127,51 @@ def _default_reader() -> "dict | None":
     worker thread (the ambient-learn daemon) produced none. A caller that
     finds a read already in flight waits for THAT read (within the same
     budget) instead of stacking another; a read that has outlived the budget
-    is not waited on again - None (not playing), as a timed-out read is."""
+    is not waited on again - None (not playing), as a timed-out read is.
+    Both cases are logged (rate-limited, _note_hung_read)."""
     with _reader_lock:
         t, box, started = _reader_state
         if t is None or not t.is_alive():
             box = {}
-            t = threading.Thread(target=_run_read, args=(box,),
-                                 name="smtc-read", daemon=True)
             started = time.monotonic()
+            t = threading.Thread(target=_run_read, args=(box, started),
+                                 name="smtc-read", daemon=True)
             _reader_state[:] = [t, box, started]
             t.start()
     left = _READ_TIMEOUT_S - (time.monotonic() - started)
     if left > 0:
         t.join(left)
+        if t.is_alive():
+            _note_hung_read("exceeded", started)
+    elif t.is_alive():
+        _note_hung_read("reused", started)
     return box.get("v")
 
 
-def _run_read(box: dict) -> None:
+def _note_hung_read(kind: str, started: float) -> None:
+    """Print one rate-limited line about a slow SMTC read. NEVER raises."""
+    try:
+        now = time.monotonic()
+        with _reader_lock:
+            last = _hung_logged_at.get(kind, 0.0)
+            if last and (now - last) < _HUNG_LOG_GAP_S:
+                return
+            _hung_logged_at[kind] = now
+        age = now - started
+        if kind == "returned":
+            print(f"  [media] the SMTC read returned after {age:.1f}s "
+                  f"(budget {_READ_TIMEOUT_S:.1f}s); media state is live again.")
+        else:
+            how = ("a caller found it still running"
+                   if kind == "reused" else "it ran out its budget")
+            print(f"  [media] the SMTC read has been running {age:.1f}s "
+                  f"({how}; budget {_READ_TIMEOUT_S:.1f}s) - media reads as "
+                  f"NOT playing until it returns.")
+    except Exception:
+        pass
+
+
+def _run_read(box: dict, started: float = 0.0) -> None:
     """Worker-thread body for _default_reader: one SMTC read into box["v"]."""
     loop = asyncio.new_event_loop()
     try:
@@ -145,6 +180,8 @@ def _run_read(box: dict) -> None:
         box["v"] = None
     finally:
         loop.close()
+        if started and (time.monotonic() - started) > _READ_TIMEOUT_S:
+            _note_hung_read("returned", started)
 
 
 def _refresh_once(reader=None) -> "dict | None":

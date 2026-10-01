@@ -570,6 +570,86 @@ class TestScanCrashTracesSince(_Base):
         self.assertEqual(
             len(S._scan_crash_traces_since(1000.0, pid=999)["new_dumps"]), 1)
 
+    # ── 2026-10-01 review: fixtures from REAL faulthandler output ──
+    # faulthandler is enabled with all_threads=True, so a real dump is the
+    # header, a blank line, then one blank-line-separated 'Thread 0x...'
+    # block per thread plus the 'Current thread' block. The single-block
+    # fixture above passed for the wrong reason: the old scan counted every
+    # 'Thread 0x' block as its own dump and only dropped the benign header.
+    @staticmethod
+    def _real_threads_dump(func, path, extra_threads=2, on_worker=False):
+        """Real faulthandler.dump_traceback(all_threads=True) text, taken
+        with `extra_threads` parked threads alive, from inside `func`
+        compiled as if it lived at `path` (so it is the faulting frame)."""
+        import faulthandler
+        import threading
+        release = threading.Event()
+        parked = threading.Barrier(extra_threads + 1)
+
+        def _park():
+            parked.wait(5)
+            release.wait(10)
+
+        threads = [threading.Thread(target=_park, daemon=True)
+                   for _ in range(extra_threads)]
+        for t in threads:
+            t.start()
+        parked.wait(5)
+        ns: dict = {}
+        exec(compile(f"def {func}(f):\n"
+                     f"    import faulthandler\n"
+                     f"    faulthandler.dump_traceback(file=f, all_threads=True)\n",
+                     path, "exec"), ns)
+        try:
+            with tempfile.TemporaryFile("w+", encoding="utf-8") as f:
+                if on_worker:
+                    w = threading.Thread(target=ns[func], args=(f,), daemon=True)
+                    w.start()
+                    w.join(10)
+                else:
+                    ns[func](f)
+                f.seek(0)
+                text = f.read()
+        finally:
+            release.set()
+            for t in threads:
+                t.join(5)
+        return text
+
+    def test_real_multi_thread_benign_dump_is_not_reported(self):
+        threads = self._real_threads_dump(
+            "_default_reader", "C:\\JARVIS\\core\\media_now_playing.py")
+        # The fixture really has the shape that fooled the old scan.
+        self.assertGreaterEqual(threads.count("\n\nThread 0x") + 1, 2)
+        body = ("\n=== session 2026-10-01 12:00:00 pid 4242 ===\n"
+                "Windows fatal exception: code 0x8001010e\n\n" + threads
+                + "\nWindows fatal exception: code 0x8001010e\n\n" + threads)
+        self.write(os.path.join("logs", "crash_traces.log"), body, mtime=5000)
+        for pid in (4242, None):
+            res = S._scan_crash_traces_since(1000.0, pid=pid)
+            self.assertEqual(res["new_dumps"], [], pid)
+            self.assertEqual(res["head_signatures"], [], pid)
+
+    def test_real_crash_after_benign_dumps_is_reported_with_its_site(self):
+        benign = self._real_threads_dump(
+            "_default_reader", "C:\\JARVIS\\core\\media_now_playing.py")
+        for on_worker in (False, True):
+            crash = self._real_threads_dump(
+                "_ns", "C:\\JARVIS\\core\\audio_processor.py",
+                extra_threads=8, on_worker=on_worker)
+            body = ("\n=== session 2026-10-01 12:00:00 pid 4242 ===\n"
+                    "Windows fatal exception: code 0x8001010e\n\n" + benign
+                    + "\nWindows fatal exception: access violation\n\n" + crash)
+            self.write(os.path.join("logs", "crash_traces.log"), body, mtime=5000)
+            res = S._scan_crash_traces_since(1000.0, pid=4242)
+            self.assertEqual(len(res["new_dumps"]), 1, on_worker)
+            self.assertTrue(res["new_dumps"][0].startswith(
+                "Windows fatal exception: access violation"), on_worker)
+            self.assertIn("Current thread 0x", res["new_dumps"][0], on_worker)
+            self.assertEqual(len(res["head_signatures"]), 1, on_worker)
+            self.assertIn("audio_processor.py", res["head_signatures"][0])
+            self.assertIn("in _ns", res["head_signatures"][0])
+
     def test_only_the_tail_of_a_huge_log_is_read(self):
         head = "Windows fatal exception: access violation\n  ancient\n\n"
         body = head + ("x" * 100 + "\n") * 50

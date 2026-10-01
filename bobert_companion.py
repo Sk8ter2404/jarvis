@@ -1580,8 +1580,9 @@ def _append_turn(user: str, assistant: str) -> None:
 
 # Pre-wake silence snapshot in seconds — captured by context_aware_greeting()
 # at the moment of wake-event detection, BEFORE the greeting bumps
-# last_speech_time. Consumers (e.g. skills/morning_arrival's 6-hour silence
-# gate) read [0] to measure the gap from the user's last interaction without
+# last_speech_time (2026-10-01: measured from the owner's last accepted turn,
+# _last_owner_turn_at, when there is one this process). Consumers (e.g.
+# skills/morning_arrival's 6-hour silence gate) read [0] to measure the gap from the user's last interaction without
 # being clobbered by JARVIS's own greeting reply. Same list-of-one wrapper
 # convention as _last_wake_date so the cross-thread read stays atomic
 # without a lock — see the WHY comment above _last_wake_date if you're
@@ -3739,19 +3740,30 @@ def _cleanup_old_logs():
 # the 394 real access-violation dumps could not be told apart by session.
 # Archive it at boot once it passes this size (renamed, never deleted).
 CRASH_TRACE_ROTATE_BYTES = 5 * 1024 * 1024
+# 2026-10-01 (review): the archive goes into its own SUBFOLDER. A
+# logs\crash_traces.<stamp>.log beside the session logs ends in .log, so
+# _cleanup_old_logs (newest LOG_KEEP_COUNT *.log in LOGS_DIR, by mtime --
+# and a rename keeps the old mtime) deleted it ~50 boots later, taking the
+# real access-violation dumps with it. _cleanup_old_logs never recurses.
+CRASH_TRACE_ARCHIVE_DIRNAME = "crash_archive"
 
 
 def _open_crash_trace_log(path: str):
     """Open the faulthandler file for this process: archive an oversized
-    previous file to crash_traces.<YYYYmmdd-HHMMSS>.log, then open append-only
-    (unbuffered, a real OS fd faulthandler can write after a native fault)
-    and write one `=== session <time> pid <pid> ===` line so a dump can be
-    tied to the run that wrote it (tools/stability_smoke_test.py scans from
-    its launched pid's marker). Rotation and marker are best-effort."""
+    previous file to <dir>/crash_archive/crash_traces.<YYYYmmdd-HHMMSS>.log
+    (out of _cleanup_old_logs' reach), then open append-only (unbuffered, a
+    real OS fd faulthandler can write after a native fault) and write one
+    `=== session <time> pid <pid> ===` line so a dump can be tied to the run
+    that wrote it (tools/stability_smoke_test.py scans from its launched
+    pid's marker). Rotation and marker are best-effort."""
     try:
         if os.path.getsize(path) > CRASH_TRACE_ROTATE_BYTES:
-            stem, ext = os.path.splitext(path)
-            archived = f"{stem}.{time.strftime('%Y%m%d-%H%M%S')}{ext}"
+            archive_dir = os.path.join(os.path.dirname(path),
+                                       CRASH_TRACE_ARCHIVE_DIRNAME)
+            os.makedirs(archive_dir, exist_ok=True)
+            stem, ext = os.path.splitext(os.path.basename(path))
+            archived = os.path.join(
+                archive_dir, f"{stem}.{time.strftime('%Y%m%d-%H%M%S')}{ext}")
             if not os.path.exists(archived):
                 os.replace(path, archived)
                 print(f"  [faulthandler] archived oversized crash log -> {archived}")
@@ -3828,6 +3840,25 @@ def setup_logging():
         _us_err = getattr(_cfg_us, "_USER_SETTINGS_ERROR", None)
         if _us_err:
             print(f"  [config] WARNING: {_us_err}")
+    except Exception:
+        pass
+
+    # 2026-10-01 (review): same for the camera gate -- it is built at IMPORT
+    # and restores a saved dies-on-open run there, so its "restored from the
+    # last run ... held for X more" line never reached the session log under
+    # pythonw, and a Kinect held closed for up to an hour had no explanation.
+    _camera_gate_log_restored_runs()
+
+
+def _camera_gate_log_restored_runs() -> None:
+    """Re-log the dies-on-open runs the gate restored at import (see
+    CameraGate.restored_dies_on_open_lines). NEVER raises."""
+    try:
+        gate = globals().get("_camera_gate")
+        report = getattr(gate, "restored_dies_on_open_lines", None)
+        if callable(report):
+            for ln in report():
+                _camera_gate_log(ln)
     except Exception:
         pass
 
@@ -29180,7 +29211,18 @@ def context_aware_greeting(from_standby: bool, wake_text: str = "") -> tuple[str
     # _pre_wake_silence_seconds[0] for its 6-hour overnight gate; reading
     # last_speech_time directly would always be ~0 by the time the morning
     # chain dispatch loop fires (the wake greeting is already speaking).
-    _pre_wake_silence_seconds[0] = max(0.0, now - last_speech_time)
+    # 2026-10-01 (review; B059's stale duplicate): measure from the OWNER's
+    # last accepted turn (_last_owner_turn_at, time.monotonic(); this standby
+    # wake is not an accepted turn), not last_speech_time -- _speak() stamps
+    # that on every JARVIS line, so JARVIS's own overnight lines (a reminder,
+    # a pattern offer) reset the "silence" and suppressed the morning arrival
+    # greeting. No owner turn yet this process (an overnight restart): the
+    # old last_speech_time measure stands.
+    _owner_at = float(_last_owner_turn_at[0] or 0.0)
+    if _owner_at > 0.0:
+        _pre_wake_silence_seconds[0] = max(0.0, time.monotonic() - _owner_at)
+    else:
+        _pre_wake_silence_seconds[0] = max(0.0, now - last_speech_time)
 
     # Slide the wake-history window — keep only the last 10 minutes.
     _wake_history[:] = [t for t in _wake_history if (now - t) <= 600]

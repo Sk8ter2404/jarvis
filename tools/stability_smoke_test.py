@@ -188,6 +188,8 @@ _CRASH_SCAN_TAIL_BYTES = 4 * 1024 * 1024
 # 9,321 dumps in the live file were this, and the process kept running, so it
 # is never a crash -- reporting it as one failed the gate for nothing.
 _BENIGN_DUMP_HEADERS = ("Windows fatal exception: code 0x8001010e",)
+# The header lines faulthandler starts a dump with (fatal error / Windows SEH).
+_DUMP_HEADERS = ("Fatal Python error:", "Windows fatal exception:")
 
 
 def _scan_crash_traces_since(since_epoch: float, pid: "int | None" = None) -> dict:
@@ -197,8 +199,9 @@ def _scan_crash_traces_since(since_epoch: float, pid: "int | None" = None) -> di
     native crashes (SIGSEGV inside a C extension — sounddevice, numpy, opencv,
     comtypes) bypass the session log entirely and only land here. JARVIS's
     setup_logging() routes faulthandler.enable(file=...) at this exact path;
-    any line starting with 'Fatal Python error:', 'Windows fatal exception:',
-    or 'Thread 0x...' inside a faulthandler dump marks the start of a crash.
+    a line starting with 'Fatal Python error:' or 'Windows fatal exception:'
+    starts a dump (its 'Thread 0x...' blocks belong to it), and a bare
+    'Thread 0x...' block outside any such dump counts as one too.
 
     Returns:
         {"new_dumps": [...], "head_signatures": [...], "since_epoch": ...}
@@ -213,7 +216,7 @@ def _scan_crash_traces_since(since_epoch: float, pid: "int | None" = None) -> di
     given and its `=== session ... pid <pid> ===` marker (written by
     bobert_companion._open_crash_trace_log) is in that tail, only dumps after
     it count; and _BENIGN_DUMP_HEADERS dumps (handled COM exceptions) are
-    skipped.
+    skipped -- the WHOLE dump, every thread block up to the next header.
     """
     result: dict = {
         "path": CRASH_TRACES_LOG,
@@ -252,57 +255,80 @@ def _scan_crash_traces_since(since_epoch: float, pid: "int | None" = None) -> di
 
     # Faulthandler doesn't timestamp its dumps, so we can't perfectly bound
     # 'since launch' by line. Instead, return the LAST dump as a proxy —
-    # faulthandler appends, so the bottom is the most recent crash. A dump
-    # is bracketed by 'Fatal Python error:' / 'Windows fatal exception:' at
-    # its start and 'Current thread' / blank line at its end.
-    dump_starts: list[int] = []
+    # faulthandler appends, so the bottom is the most recent crash.
+    #
+    # 2026-10-01 (review): split the tail into whole DUMPS first. A dump runs
+    # from its 'Fatal Python error:' / 'Windows fatal exception:' header to
+    # the next header (or the next '=== session' marker); with
+    # all_threads=True it holds one blank-line-separated 'Thread 0x...' block
+    # per thread, and those blocks are part of the dump, not new dumps. The
+    # old scan counted every such block as a dump start and only dropped the
+    # benign HEADER line, so a real multi-thread 0x8001010e dump still came
+    # back as a 'native crash' via its first 'Thread 0x' block. A bare
+    # 'Thread 0x' block outside any header dump (file start / after a blank
+    # line) still counts, as before.
+    segments: list[list] = []          # [start, end, benign]
+    in_header_dump = False
+
+    def _close(at: int) -> None:
+        if segments and segments[-1][1] is None:
+            segments[-1][1] = at
+
     for i, ln in enumerate(lines):
-        if (ln.startswith("Fatal Python error:")
-                or ln.startswith("Windows fatal exception:")
-                or ln.startswith("Thread 0x")):
-            # Only treat 'Thread 0x' as a dump start if the previous line
-            # is empty or the file just began — otherwise we'd flag every
-            # thread inside a single dump.
-            if ln.startswith("Thread 0x"):
-                if i > 0 and lines[i - 1].strip():
-                    continue
-            dump_starts.append(i)
-    # Drop handled-exception dumps (see _BENIGN_DUMP_HEADERS).
-    dump_starts = [i for i in dump_starts
-                   if not lines[i].startswith(_BENIGN_DUMP_HEADERS)]
-    if not dump_starts:
+        if ln.startswith("=== session "):
+            _close(i)                  # a new process: nothing carries over
+            in_header_dump = False
+            continue
+        is_header = ln.startswith(_DUMP_HEADERS)
+        is_bare_thread = (not in_header_dump
+                          and ln.startswith("Thread 0x")
+                          and (i == 0 or not lines[i - 1].strip()))
+        if not (is_header or is_bare_thread):
+            continue
+        _close(i)
+        segments.append([i, None,
+                         is_header and ln.startswith(_BENIGN_DUMP_HEADERS)])
+        in_header_dump = is_header
+    _close(len(lines))
+    # Drop handled-exception dumps (see _BENIGN_DUMP_HEADERS) -- whole.
+    real = [seg for seg in segments if not seg[2]]
+    if not real:
         return result
 
-    last_start = dump_starts[-1]
-    # Take up to 40 lines from the last dump for the report.
-    dump = "".join(lines[last_start:last_start + 40])
-    result["new_dumps"].append(dump.rstrip())
+    last_start, last_end, _benign = real[-1]
+    seg_lines = lines[last_start:last_end]
+    # Faulthandler prints 'Current thread 0x... (most recent call first):'
+    # for the thread that faulted -- not necessarily the last block, and with
+    # JARVIS's dozens of threads usually well past the first 40 lines.
+    current_at = next((k for k, ln in enumerate(seg_lines)
+                       if ln.strip().startswith("Current thread 0x")), None)
+    # Report up to 40 lines: the header plus the faulting thread's block.
+    if current_at is not None and current_at >= 40:
+        shown = (seg_lines[:1] + ["  ... (other threads elided)\n"]
+                 + seg_lines[current_at:current_at + 38])
+    else:
+        shown = seg_lines[:40]
+    result["new_dumps"].append("".join(shown).rstrip())
     # Extract a one-line signature for the regression task summary.
     # We want the TOP-of-stack JARVIS frame in the "Current thread" block
     # (which is where the crash actually happened), NOT the deepest one
-    # (which is just <module> at boot). faulthandler prints
-    # 'Current thread 0x... (most recent call first):' as the section
-    # header, then frames in order from top (crash site) to bottom
-    # (<module>). So the FIRST JARVIS frame inside that block is the
-    # site we want.
-    in_current_thread = False
-    for ln in lines[last_start:last_start + 40]:
-        stripped = ln.strip()
-        if stripped.startswith("Current thread "):
-            in_current_thread = True
-            continue
-        if not in_current_thread:
-            continue
-        if not stripped.startswith("File "):
-            continue
-        if "JARVIS" in stripped and "in <module>" not in stripped:
-            # First JARVIS frame inside the current thread = crash site.
-            result["head_signatures"].append(stripped[:200])
-            break
+    # (which is just <module> at boot). Frames are listed from top (crash
+    # site) to bottom (<module>), so the FIRST JARVIS frame inside that
+    # block is the site we want; the block ends at its blank line.
+    if current_at is not None:
+        for ln in seg_lines[current_at + 1:]:
+            stripped = ln.strip()
+            if not stripped:
+                break
+            if not stripped.startswith("File "):
+                continue
+            if "JARVIS" in stripped and "in <module>" not in stripped:
+                result["head_signatures"].append(stripped[:200])
+                break
     # Fallback: if 'Current thread' wasn't present (rare on older dumps),
     # take the topmost JARVIS frame in the whole dump that isn't <module>.
-    if not result["head_signatures"]:
-        for ln in lines[last_start:last_start + 40]:
+    else:
+        for ln in seg_lines:
             stripped = ln.strip()
             if not stripped.startswith("File "):
                 continue

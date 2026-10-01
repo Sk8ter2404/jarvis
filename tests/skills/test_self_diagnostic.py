@@ -3098,8 +3098,38 @@ class AnnouncementTests(_ProbeTestBase):
             self.mod._announce_failures(failing)
             self.mod._announce_failures(failing)   # unchanged: silent
             self.mod._announce_failures(passing)   # recovered: re-armed
+            # Past the same-text floor (see the flapping test below).
+            self._t[0] += self.mod._ANNOUNCE_COOLDOWN_S + 1
             self.mod._announce_failures(failing)
         self.assertEqual(ann.call_count, 2)
+
+    def test_announce_failures_flapping_probe_is_floored(self):
+        # 2026-10-01 review: the re-arm had no dwell, so a HIGH probe that
+        # flapped pass/fail with the same text re-spoke "appears to be down"
+        # on every failure after a pass (every other 5-min sweep). The same
+        # text is now spoken at most once per _ANNOUNCE_COOLDOWN_S; a
+        # different cause still speaks at once.
+        def failing(err):
+            return {"severity_failed": {"internet": self.mod.SEVERITY_HIGH},
+                    "probes": {"internet": {"ok": False, "error": err}}}
+        passing = {"severity_failed": {},
+                   "probes": {"internet": {"ok": True, "error": None}}}
+        with mock.patch.object(self.mod, "_proactive_announce") as ann, \
+             mock.patch.object(self.mod, "_push_phone"):
+            self.mod._announce_failures(failing("dns + icmp failed"))
+            for _ in range(6):                     # 30 min of flapping
+                self._t[0] += 300
+                self.mod._announce_failures(passing)
+                self._t[0] += 300
+                self.mod._announce_failures(failing("dns + icmp failed"))
+            self.assertEqual(ann.call_count, 1)
+            self.mod._announce_failures(passing)
+            self.mod._announce_failures(failing("gateway unreachable"))
+            self.assertEqual(ann.call_count, 2)    # a new cause: spoken
+            self.mod._announce_failures(passing)
+            self._t[0] += self.mod._ANNOUNCE_COOLDOWN_S + 1
+            self.mod._announce_failures(failing("dns + icmp failed"))
+        self.assertEqual(ann.call_count, 3)        # floor elapsed: spoken
 
     def test_announce_failures_keeps_state_when_probe_did_not_pass(self):
         # A sweep where the component did not run (absent) or could not look

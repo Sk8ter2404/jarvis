@@ -82,7 +82,8 @@ class DiesOnOpenSurvivesRestartWiringTests(_StormBase):
         bc = self.bc
         self.assertIsNone(bc._camera_gate_doo_state_path())
         d = tempfile.mkdtemp()
-        with mock.patch.dict(os.environ, {"JARVIS_TEST_MODE": "0"}),              mock.patch("core.paths.data_dir", return_value=d):
+        with mock.patch.dict(os.environ, {"JARVIS_TEST_MODE": "0"}), \
+             mock.patch("core.paths.data_dir", return_value=d):
             # Still None: the test run's live-data guard is armed.
             self.assertIsNone(bc._camera_gate_doo_state_path())
             with mock.patch.dict(sys.modules):
@@ -105,6 +106,45 @@ class DiesOnOpenSurvivesRestartWiringTests(_StormBase):
         d = g.begin("kinect", "kinect-bridge")
         self.assertFalse(d.allowed)
         self.assertEqual(d.reason, "backoff")
+
+    def test_setup_logging_re_logs_the_restored_run(self):
+        # 2026-10-01 review: the gate restores at IMPORT, before setup_logging
+        # Tees stdout into the session log, so under pythonw the "restored
+        # ... held for X more" line was lost. setup_logging re-logs it.
+        import tempfile
+        bc = self.bc
+        path = os.path.join(tempfile.mkdtemp(), "camera_gate_doo.json")
+        now = self.clock.time()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "devices": {"kinect": {
+                "count": 3, "retry_s": 1800.0, "until": now + 1200.0,
+                "said_at": now - 60.0}}}, fh)
+        with mock.patch.object(bc, "_camera_gate_log"):
+            g = bc._make_camera_gate(clock=self.clock.time, doo_state_path=path)
+        logged: list = []
+        with mock.patch.object(bc, "_camera_gate", g), \
+             mock.patch.object(bc, "_camera_gate_log", logged.append):
+            bc._camera_gate_log_restored_runs()
+        self.assertEqual(len(logged), 1, logged)
+        self.assertIn("kinect: restored from the last run", logged[0])
+        self.assertIn("held for", logged[0])
+        # And setup_logging is what calls it.
+        with mock.patch.object(bc, "_camera_gate_log_restored_runs") as relog, \
+             mock.patch.object(bc, "LOGS_DIR", tempfile.mkdtemp()), \
+             mock.patch.object(bc, "LOGGING_ENABLED", True), \
+             mock.patch.object(bc, "_cleanup_old_logs"), \
+             mock.patch.object(bc, "_log_file_handle", None), \
+             mock.patch.object(bc, "_log_file_path", None), \
+             mock.patch.object(bc.sys, "stdout", bc.sys.stdout), \
+             mock.patch.object(bc.sys, "stderr", bc.sys.stderr), \
+             mock.patch.object(bc.sys, "excepthook", bc.sys.excepthook), \
+             mock.patch("faulthandler.enable"):
+            try:
+                bc.setup_logging()
+            finally:
+                if bc._log_file_handle is not None:
+                    bc._log_file_handle.close()
+        relog.assert_called_once_with()
 
 
 @requires_monolith

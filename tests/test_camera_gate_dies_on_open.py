@@ -593,6 +593,28 @@ class RestartTests(unittest.TestCase):
         self.assertTrue(any("restored" in ln for ln in logs), logs)
         self.assertEqual(spoken, [])
 
+    def test_the_restored_run_can_be_re_logged_later(self):
+        # 2026-10-01 review: the monolith builds its gate at import, before
+        # the session log exists, so it re-logs the restore once logging is
+        # up. The report is computed when asked and drops a cleared run.
+        _g0, _l0, _s0, _b0 = self._new_process()     # nothing saved yet
+        self.assertEqual(_g0.restored_dies_on_open_lines(), [])
+        self._trip()
+        self.clk.advance(20 * 60)
+        g, _logs, _spoken, b = self._new_process()
+        self.clk.advance(30.0)                     # boot until logging is up
+        lines = g.restored_dies_on_open_lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn(KINECT, lines[0])
+        self.assertIn("restored from the last run", lines[0])
+        self.assertIn("held for", lines[0])
+        self.clk.advance(2 * 3600)
+        self.assertIn("its hold has run out",
+                      g.restored_dies_on_open_lines()[0])
+        self.assertTrue(b.open_when_allowed())
+        b.stream(60.0)                             # streams normally: cleared
+        self.assertEqual(g.restored_dies_on_open_lines(), [])
+
     def test_after_the_hold_one_more_death_re_arms_it_and_is_not_said(self):
         self._trip()
         self.clk.advance(20 * 60)

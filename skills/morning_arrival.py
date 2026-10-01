@@ -19,10 +19,11 @@ Auto-trigger:
   ONE of {morning_arrival, morning_handoff, morning_briefing} to dispatch
   based on day-of-week / DEFAULT_MORNING_SKILL / time-of-day. When the chain
   picks arrival, it calls _fire_from_chain() here. The skill then verifies
-  that bobert_companion.last_speech_time is at least MIN_SILENCE_HOURS old
-  — this is the "morning arrival" gate; sub-6h gaps fall through silently so
-  the chain can fall back to morning_briefing / morning_handoff on its next
-  selection cycle. Same-day suppression is persisted via
+  that the owner has been silent at least MIN_SILENCE_HOURS before the wake
+  (bobert_companion._pre_wake_silence_seconds; see
+  _silence_hours_since_last_speech) — this is the "morning arrival" gate;
+  sub-6h gaps fall through silently so the chain can fall back to
+  morning_briefing / morning_handoff on its next selection cycle. Same-day suppression is persisted via
   morning_arrival_state.json so a JARVIS restart doesn't re-fire.
 
 Style: dry, JARVIS cadence, no preamble. Sources that fail silently degrade
@@ -180,11 +181,13 @@ def _silence_hours_since_last_speech() -> float | None:
     """Hours of silence at the moment the most recent wake event fired.
 
     Prefers bobert_companion._pre_wake_silence_seconds[0], which captures
-    the gap from `last_speech_time` AT WAKE TIME — before the greeting TTS
-    bumps the timer. Falling back to live `last_speech_time` would always
-    read ~0 by the time the morning chain dispatches us (JARVIS just spoke
-    "Good morning, sir." in response to the wake), defeating the silence
-    gate entirely.
+    the gap AT WAKE TIME — before the greeting TTS bumps the timer. Since
+    2026-10-01 the monolith measures it from the owner's last accepted turn
+    (_last_owner_turn_at), not `last_speech_time`, which JARVIS's own
+    overnight lines kept refreshing. Falling back to live
+    `last_speech_time` would always read ~0 by the time the morning chain
+    dispatches us (JARVIS just spoke "Good morning, sir." in response to the
+    wake), defeating the silence gate entirely.
 
     Returns None when neither value is reachable. Callers should treat
     None as "can't decide — don't block" (i.e. degrade open / fire).
@@ -825,8 +828,8 @@ def _fire_from_chain(reason: str = "morning_chain") -> str:
     TOCTOU-safe pattern verbatim: pre-check → delay → re-check → fire.
 
     Additionally enforces the spec's silence-based gate: we only fire the
-    "Good morning" cold-open when bobert_companion.last_speech_time shows
-    at least MIN_SILENCE_HOURS of silence. If the gate fails the skill
+    "Good morning" cold-open after at least MIN_SILENCE_HOURS of owner
+    silence (_silence_hours_since_last_speech). If the gate fails the skill
     returns '' silently so the morning chain can fall back to its next
     pick (handoff / briefing) for short late-night gaps. Manual triggers
     ("morning arrival") still bypass everything via force=True.

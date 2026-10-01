@@ -387,6 +387,58 @@ class DefaultReaderThreadTests(unittest.TestCase):
             if t is not None:
                 t.join(2.0)
 
+    def test_hung_read_is_logged_rate_limited(self):
+        # 2026-10-01 review: a read hung past the budget made every caller
+        # get None (not playing) with no trace in the log.
+        import contextlib
+        import io
+        import threading
+        release = threading.Event()
+
+        async def _hang():
+            release.wait(5.0)
+            return {"title": "late"}
+
+        logged_at = getattr(m, "_hung_logged_at", {})
+        saved_logged = dict(logged_at)
+        logged_at.clear()
+        self.addCleanup(lambda: (logged_at.clear(),
+                                 logged_at.update(saved_logged)))
+        m._read_session_async = _hang
+        m._READ_TIMEOUT_S = 0.05
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try:
+                self.assertIsNone(m._default_reader())   # ran out its budget
+                self.assertIsNone(m._default_reader())   # reused, still hung
+                self.assertIsNone(m._default_reader())   # rate-limited: quiet
+                self.assertIsNone(m._default_reader())
+            finally:
+                release.set()
+                t = m._reader_state[0]
+                if t is not None:
+                    t.join(2.0)
+        lines = [ln for ln in out.getvalue().splitlines() if "[media]" in ln]
+        self.assertEqual(sum("ran out its budget" in ln for ln in lines), 1,
+                         lines)
+        self.assertEqual(sum("still running" in ln for ln in lines), 1, lines)
+        self.assertEqual(sum("returned after" in ln for ln in lines), 1, lines)
+        self.assertEqual(len(lines), 3, lines)
+
+    def test_a_read_within_budget_logs_nothing(self):
+        import contextlib
+        import io
+
+        async def _fast():
+            return {"title": "T", "playing": True}
+
+        m._read_session_async = _fast
+        m._READ_TIMEOUT_S = 3.0
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(m._default_reader()["title"], "T")
+        self.assertNotIn("[media]", out.getvalue())
+
     def test_concurrent_callers_share_one_read(self):
         import threading
         release = threading.Event()

@@ -1282,6 +1282,35 @@ def _get_notifications(listener):
             raise RuntimeError(f"GetNotificationsAsync wait failed: {e}") from e
 
 
+def _baseline_backlog(notifications) -> bool:
+    """2026-10-01 (review): GetNotificationsAsync returns EVERY toast still in
+    the Action Center, not just new ones. With no fresh dedupe state (first
+    live boot -- capture had never run, so data/notification_dedup.json never
+    existed -- or downtime past _DEDUPE_TTL_SEC) the first poll would have
+    triaged the whole backlog back to back: read-aloud rules speaking old
+    toasts and every unmatched one sent to _classify_with_llm. So when
+    nothing was hydrated, mark the first poll's ids seen (and save them)
+    WITHOUT handling them; only toasts that arrive afterwards are triaged.
+    A short bounce inside the TTL keeps its hydrated ids and still triages
+    what arrived meanwhile. Returns True when the batch was baselined."""
+    with _state_lock:
+        if _seen_ids:
+            return False
+        seeded = 0
+        for n in notifications or []:
+            try:
+                nid = int(getattr(n, "id", 0))
+            except Exception:
+                nid = 0
+            if nid:
+                _seen_ids.add(nid)
+                seeded += 1
+    _maybe_save_dedupe_state()
+    print(f"  [triage] baseline: {seeded} toast(s) already in the Action "
+          f"Center marked seen, not announced.")
+    return True
+
+
 def _listener_loop() -> None:
     """Background poll thread. Reconnects to the listener on transient
     errors and surfaces fatal errors via subsystem_status."""
@@ -1326,6 +1355,7 @@ def _listener_loop() -> None:
     print("  [triage] UserNotificationListener active — toast capture live.")
 
     consecutive_errors = 0
+    baseline_pending = True
     while True:
         if _pause_flag[0]:
             time.sleep(POLL_INTERVAL_SECONDS)
@@ -1334,6 +1364,10 @@ def _listener_loop() -> None:
             notifications = _get_notifications(listener)
             _subsystem_status["last_poll_at"] = time.time()
             consecutive_errors = 0
+            if baseline_pending:
+                if _baseline_backlog(notifications):
+                    notifications = []
+                baseline_pending = False
             for n in notifications:
                 try:
                     _handle_notification(n)

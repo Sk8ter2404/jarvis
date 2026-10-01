@@ -1632,12 +1632,14 @@ class WinsdkProbeTests(_IsolatedTriageBase):
         for raw, want in (("ALLOWED", "Allowed"), ("DENIED", "Denied"),
                           ("UNSPECIFIED", "Unspecified")):
             listener = mock.MagicMock()
-            listener.request_access_async.return_value =                 _AsyncOpGet(_AccessResult(raw))
+            listener.request_access_async.return_value = \
+                _AsyncOpGet(_AccessResult(raw))
             self.assertEqual(self.mod._request_access(listener), want)
 
     def test_request_access_str_enum_fallback_keeps_member(self):
         listener = mock.MagicMock()
-        listener.request_access_async.return_value =             _AsyncOpGet("UserNotificationListenerAccessStatus.ALLOWED")
+        listener.request_access_async.return_value = \
+            _AsyncOpGet("UserNotificationListenerAccessStatus.ALLOWED")
         self.assertEqual(self.mod._request_access(listener), "Allowed")
 
     def test_request_access_manual_poll_raises_wraps(self):
@@ -1777,7 +1779,8 @@ class ListenerLoopTests(_IsolatedTriageBase):
         for patch_kw in ({"return_value": "ALLOWED"}, None):
             self.mod._subsystem_status["listening"] = False
             listener = mock.MagicMock()
-            listener.request_access_async.return_value =                 _AsyncOpGet(_AccessResult("ALLOWED"))
+            listener.request_access_async.return_value = \
+                _AsyncOpGet(_AccessResult("ALLOWED"))
             Listener = types.SimpleNamespace(current=listener)
             sleep_calls = {"n": 0}
 
@@ -1788,7 +1791,10 @@ class ListenerLoopTests(_IsolatedTriageBase):
 
             ra = (mock.patch.object(self.mod, "_request_access", **patch_kw)
                   if patch_kw else contextlib.nullcontext())
-            with mock.patch.object(self.mod.time, "sleep", _sleep),                  mock.patch.object(self.mod, "_probe_winsdk", return_value=True),                  ra,                  mock.patch.object(self.mod, "_get_notifications",
+            with mock.patch.object(self.mod.time, "sleep", _sleep), \
+                 mock.patch.object(self.mod, "_probe_winsdk", return_value=True), \
+                 ra, \
+                 mock.patch.object(self.mod, "_get_notifications",
                                    return_value=[]):
                 self.mod._winsdk_modules["Listener"] = Listener
                 with self.assertRaises(KeyboardInterrupt):
@@ -1798,6 +1804,10 @@ class ListenerLoopTests(_IsolatedTriageBase):
     def test_loop_processes_one_batch_then_stops(self):
         # Allowed access; the poll loop runs once, handles a batch, then we
         # raise from time.sleep to break out of the infinite while.
+        # Dedupe state hydrated from a recent bounce (see _baseline_backlog):
+        # the first poll is triaged, not baselined.
+        with self.mod._state_lock:
+            self.mod._seen_ids.add(424242)
         listener = object()
         Listener = types.SimpleNamespace(current=listener)
         handled = []
@@ -1823,6 +1833,79 @@ class ListenerLoopTests(_IsolatedTriageBase):
                 self.mod._listener_loop()
         self.assertEqual(handled, ["n1", "n2"])
         self.assertTrue(self.mod._subsystem_status["listening"])
+
+    # ── 2026-10-01 review: the Action Center backlog on the first live poll ──
+    def _run_polls(self, batches):
+        """Drive _listener_loop through len(batches) real polls (the real
+        _handle_notification runs) and stop at the sleep after the last."""
+        listener = object()
+        Listener = types.SimpleNamespace(current=listener)
+        sleeps = {"n": 0}
+
+        def _sleep(_secs):
+            # #1 INITIAL_DELAY, then one end-of-iteration sleep per poll.
+            sleeps["n"] += 1
+            if sleeps["n"] > len(batches):
+                raise KeyboardInterrupt("stop loop")
+
+        with mock.patch.object(self.mod.time, "sleep", _sleep), \
+             mock.patch.object(self.mod, "_probe_winsdk", return_value=True), \
+             mock.patch.object(self.mod, "_request_access", return_value="ALLOWED"), \
+             mock.patch.object(self.mod, "_get_notifications",
+                               side_effect=list(batches)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.mod._winsdk_modules["Listener"] = Listener
+            with self.assertRaises(KeyboardInterrupt):
+                self.mod._listener_loop()
+
+    def _backlog(self):
+        return [_make_notification(nid=11, app="Microsoft Teams",
+                                   texts=("Sam", "old DM from yesterday")),
+                _make_notification(nid=12, app="Phone Link",
+                                   texts=("Alex", "old text")),
+                _make_notification(nid=13, app="Discord",
+                                   texts=("server", "old ping"))]
+
+    def test_first_poll_backlog_is_baselined_not_triaged(self):
+        # First live boot: no dedupe state on disk. GetNotificationsAsync
+        # returns every toast still in the Action Center; none of them may be
+        # read aloud or sent to the LLM classifier. A toast that arrives
+        # afterwards is triaged normally.
+        self.mod._rules = [{"id": "teams", "match": {"app_pattern": "(?i)teams"},
+                            "action": "read_aloud", "priority": 50}]
+        fresh = _make_notification(nid=14, app="Microsoft Teams",
+                                   texts=("Sam", "are you around"))
+        with mock.patch.object(self.mod, "_proactive_announce") as ann, \
+             mock.patch.object(self.mod, "_classify_with_llm",
+                               return_value="fyi") as llm, \
+             mock.patch.object(self.mod, "_focus_mode_active", return_value=False):
+            self._run_polls([self._backlog()])
+            ann.assert_not_called()
+            llm.assert_not_called()
+            self.assertEqual(self.mod._recent, [])
+            self.assertTrue({11, 12, 13} <= self.mod._seen_ids)
+            # The baseline is persisted, so a bounce does not replay it.
+            with open(self.mod._DEDUPE_FILE, encoding="utf-8") as f:
+                self.assertTrue({11, 12, 13} <= set(json.load(f)["seen_ids"]))
+            # Next boot-in-TTL / next poll: the backlog stays quiet, the new
+            # toast is announced.
+            self._run_polls([self._backlog() + [fresh]])
+        ann.assert_called_once()
+        self.assertIn("are you around", ann.call_args[0][0])
+
+    def test_hydrated_state_triages_the_first_poll(self):
+        # A short bounce inside _DEDUPE_TTL_SEC hydrates _seen_ids; toasts
+        # that arrived while JARVIS was down are still triaged.
+        with self.mod._state_lock:
+            self.mod._seen_ids.update({11, 12, 13})
+        self.mod._rules = [{"id": "teams", "match": {"app_pattern": "(?i)teams"},
+                            "action": "read_aloud", "priority": 50}]
+        fresh = _make_notification(nid=14, app="Microsoft Teams",
+                                   texts=("Sam", "are you around"))
+        with mock.patch.object(self.mod, "_proactive_announce") as ann, \
+             mock.patch.object(self.mod, "_focus_mode_active", return_value=False):
+            self._run_polls([self._backlog() + [fresh]])
+        ann.assert_called_once()
 
     def test_loop_paused_skips_polling(self):
         listener = object()
