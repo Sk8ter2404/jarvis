@@ -574,18 +574,25 @@ class MicMuteMidCaptureTests(_Base):
         cap, _ = self._quiet(self.bc._capture_utterance, None, {})
         self.assertEqual(cap[0], "hello")
 
-    def test_capture_that_started_muted_is_unchanged(self):
-        # Only the standby path listens while muted; it must not become a
-        # tight open/close loop, so a capture that STARTED muted runs as before.
+    def test_capture_that_starts_muted_opens_nothing(self):
+        # 2026-10-01: mute is a capture-ENTRY rule. A capture that STARTED
+        # muted (the standby loop, a draft / printer confirmation) used to
+        # record as normal; now no stream opens, and the brief idle keeps the
+        # caller's loop from spinning.
         self.muted[0] = True
+        opened = []
 
         def feeder(push, wait_vad):
+            opened.append(True)
             push(6, 0.2)
             wait_vad()
             push(40, 0.0)
         self._harness(feeder)
+        t0 = time.time()
         audio, _ = self._quiet(self.bc.record_speech, 5)
-        self.assertIsNotNone(audio)
+        self.assertIsNone(audio, "a capture that started muted still listened")
+        self.assertEqual(opened, [], "a stream was opened while muted")
+        self.assertGreaterEqual(time.time() - t0, 0.25)   # idles, not spins
 
 
 if __name__ == "__main__":

@@ -148,9 +148,12 @@ _audio_agc_enabled    = [AUDIO_AGC]
 # VAD_DEBUG print sites read _debug_mode[0] at runtime so a toggle
 # takes effect immediately.
 _tts_muted            = [False]
-_mic_muted            = [False]   # tray "Mute Mic": when True, live mic input is
-                                  # dropped before dispatch so JARVIS ignores you
-                                  # (distinct from standby, which is wake-word-only)
+_mic_muted            = [False]   # tray "Mute Mic": when True, no mic capture of
+                                  # any kind opens (2026-10-01: standby, in-turn
+                                  # confirmations, get_mic_buffer, the ambient
+                                  # tap) so JARVIS hears nothing; typed commands
+                                  # still pass (distinct from standby, which is
+                                  # wake-word-only)
 _ambient_mode_active  = [False]
 _daemons_paused       = [False]
 _debug_mode           = [VAD_DEBUG]

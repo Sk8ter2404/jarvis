@@ -565,6 +565,81 @@ class LoaderHookTests(unittest.TestCase):
         self.assertIn("REGISTRY.register_from_module(mod, name)", coll)
 
 
+class _VoiceOnlyRuntime(wi.NoRuntime):
+    """A running JARVIS whose ACTIONS registry is ``acts``."""
+    live = True
+
+    def __init__(self, acts):
+        self._acts = acts
+
+    def actions(self):
+        return self._acts
+
+    def speak_sets(self):
+        return (set(), set(), set())
+
+
+class VoiceOnlyActionTests(unittest.TestCase):
+    """2026-10-01: a skill's VOICE_ONLY_ACTIONS - actions that read the
+    owner's last spoken sentence as proof he asked - are listed as voice-only
+    on the dashboard's Actions page and refused before the handler runs (they
+    could only refuse, and a press marked that sentence as used)."""
+
+    def setUp(self):
+        wi._action_last_call.clear()
+        self.lines = []
+        self.reg = wp.PanelRegistry(log=self.lines.append)
+        self.calls = []
+        self.acts = {"desk_engage": lambda a="": self.calls.append(a) or "x",
+                     "desk_reset": lambda a="": self.calls.append(a) or "x",
+                     "get_time": lambda a="": "noon"}
+        mod = types.ModuleType("skill_desk")
+        mod.VOICE_ONLY_ACTIONS = {"desk_engage": "the Desk device tab's "
+                                                 "Engage button",
+                                  "desk_reset": "the Desk device tab"}
+        self.assertEqual(self.reg.register_from_module(mod, "desk"), 0)
+        self.mod = mod
+        self.cfg = {"runtime": _VoiceOnlyRuntime(self.acts),
+                    "panels": self.reg}
+
+    def test_registry_collects_and_replaces_on_reload(self):
+        self.assertEqual(self.reg.voice_only("desk_engage"),
+                         "the Desk device tab's Engage button")
+        self.assertIsNone(self.reg.voice_only("get_time"))
+        self.mod.VOICE_ONLY_ACTIONS = ["desk_reset"]
+        self.reg.register_from_module(self.mod, "desk")
+        self.assertIsNone(self.reg.voice_only("desk_engage"))
+        self.assertEqual(self.reg.voice_only("desk_reset"), "")
+        self.mod.VOICE_ONLY_ACTIONS = 42
+        self.reg.register_from_module(self.mod, "desk")
+        self.assertIsNone(self.reg.voice_only("desk_reset"))
+        self.assertIn("VOICE_ONLY_ACTIONS", self.lines[-1])
+
+    def test_the_post_refuses_without_calling_the_handler(self):
+        for confirm in (False, True):
+            code, d = wi.run_named_action(self.cfg, "desk_engage", "",
+                                          confirm=confirm)
+            self.assertEqual(code, 409)
+            self.assertTrue(d["voice_only"])
+            self.assertIn("Engage button", d["use_instead"])
+        self.assertEqual(self.calls, [], "a dashboard press ran the handler")
+        code, d = wi.run_named_action(self.cfg, "get_time", "")
+        self.assertEqual((code, d["result"]), (200, "noon"))
+
+    def test_the_list_marks_them(self):
+        rows = {a["name"]: a for a in wi.actions_payload(self.cfg)["actions"]}
+        self.assertTrue(rows["desk_engage"]["voice_only"])
+        self.assertIn("Engage", rows["desk_engage"]["use_instead"])
+        self.assertFalse(rows["get_time"]["voice_only"])
+
+    def test_the_page_disables_run_for_them(self):
+        page = wi._DASHBOARD_PAGE
+        render = page[page.index("function renderActions("):]
+        render = render[:render.index("\nfunction ", 10)]
+        self.assertIn("a.voice_only", render)
+        self.assertIn("send.disabled = true", render)
+
+
 def _declared_panel_ids(path):
     """Literal "id" values of WEB_PANELS specs in one source file (AST only -
     the file is never imported or executed)."""

@@ -356,6 +356,13 @@ _MONOLITH_RESTORE_NAMES = (
     "_turn_hold_until", "_turn_hold_reason", "SELF_VOICED_ACTIONS",
     # (2026-09-30) the once-per-dialogue "yields the microphone" log latch.
     "_dialogue_mic_yield_logged",
+    # Voice-loop cells (2026-10-01): the off-thread in-turn capture's holder
+    # (a leaked Thread would make every later capture yield to it), why the
+    # last idle listen ended early (a leaked "work" would skip a later test's
+    # proactive turn), and the standby-greeting one-shot admit (a leaked
+    # deadline would let a later wake-word-mode gate test admit a turn).
+    "_offthread_capture", "_capture_yield_reason",
+    "_standby_greet_admit_until",
     "_hud_state_cache", "_focused_window_state", "CAMERAS",
     "last_speech_time", "last_face_seen", "_apple_music_last_seen",
     # ── STT / whisper model handles ────────────────────────────────────────

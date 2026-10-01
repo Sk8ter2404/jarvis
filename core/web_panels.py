@@ -83,6 +83,19 @@ Every ``action`` a widget names must be declared in ``actions``; every
 ``stream`` in ``streams``. A spec that breaks any rule is REJECTED whole, with
 one log line naming the rule, and the rest of the skill loads normally.
 
+VOICE-ONLY ACTIONS (2026-10-01)
+===============================
+A skill may also define a module-level ``VOICE_ONLY_ACTIONS``: a dict of voice
+action name -> a short hint naming what to use instead (e.g. the panel button
+that does the same job), or a list of names. These are actions that act only
+on a FRESH SPOKEN (or typed) request - they read the owner's last utterance as
+proof he asked - so running them from the dashboard's generic Actions list can
+never work: they refuse ("binding" / "I need to hear you say ...") and, worse,
+mark that utterance as used. The dashboard lists them as voice-only and the
+POST refuses them before the handler is called. Collected beside WEB_PANELS
+(a reload replaces the skill's entries); a private skill's action names stay
+in its gitignored file.
+
 Stdlib only. Nothing here raises into a caller: registration returns False on
 a bad spec, and the request-path helpers return an HTTP status + payload.
 """
@@ -295,6 +308,7 @@ class PanelRegistry:
             lambda line: print(line, flush=True))
         self._lock = threading.RLock()
         self._panels = {}            # id -> _Panel
+        self._voice_only = {}        # action name -> (owner, hint)
 
     # ── registration ────────────────────────────────────────────────────
     def _say(self, line: str) -> None:
@@ -399,14 +413,58 @@ class PanelRegistry:
             ids = [i for i, p in self._panels.items() if p.owner == owner]
             for i in ids:
                 del self._panels[i]
+            for n in [n for n, (o, _h) in self._voice_only.items()
+                      if o == owner]:
+                del self._voice_only[n]
         return len(ids)
 
+    def _register_voice_only(self, mod, owner: str) -> int:
+        """Collect ``VOICE_ONLY_ACTIONS`` (see the module docstring). A bad
+        entry is skipped with one log line. Never raises."""
+        try:
+            spec = getattr(mod, "VOICE_ONLY_ACTIONS", None)
+            if spec is None:
+                return 0
+            if isinstance(spec, dict):
+                items = list(spec.items())
+            elif isinstance(spec, (list, tuple, set, frozenset)):
+                items = [(n, "") for n in spec]
+            else:
+                self._say("  [web-panels] %s: REJECTED VOICE_ONLY_ACTIONS - "
+                          "must be a dict or a list of names" % owner)
+                return 0
+            added = 0
+            with self._lock:
+                for n, hint in items:
+                    if not isinstance(n, str) or not n.strip():
+                        continue
+                    hint = hint.strip()[:80] if isinstance(hint, str) else ""
+                    self._voice_only[n.strip()] = (owner, hint)
+                    added += 1
+            return added
+        except Exception as e:
+            self._say("  [web-panels] %s: VOICE_ONLY_ACTIONS could not be "
+                      "applied: %s" % (owner, e))
+            return 0
+
+    def voice_only(self, name):
+        """The hint for a voice-only action ("" when it gave none), or None
+        when ``name`` is an ordinary action. Never raises."""
+        try:
+            with self._lock:
+                hit = self._voice_only.get(name)
+            return None if hit is None else hit[1]
+        except Exception:
+            return None
+
     def register_from_module(self, mod, owner: str) -> int:
-        """Collect a just-loaded skill's ``WEB_PANELS``. Replaces whatever
-        the same skill registered before (a reload never duplicates). Returns
-        the number of panels accepted. Never raises."""
+        """Collect a just-loaded skill's ``WEB_PANELS`` (and its
+        ``VOICE_ONLY_ACTIONS``). Replaces whatever the same skill registered
+        before (a reload never duplicates). Returns the number of panels
+        accepted. Never raises."""
         try:
             self.unregister_owner(owner)
+            self._register_voice_only(mod, owner)
             specs = getattr(mod, "WEB_PANELS", None)
             if specs is None:
                 return 0

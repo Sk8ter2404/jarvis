@@ -111,7 +111,7 @@ class RealtimeCaptureWiringTests(_VoiceWiringBase):
         bc = self.bc
         rec_called = {"n": 0}
 
-        def fake_record(timeout=None):
+        def fake_record(timeout=None, **_kw):
             rec_called["n"] += 1
             return None  # simulate silence → capture returns None cleanly
 

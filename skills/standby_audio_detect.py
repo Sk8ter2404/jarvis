@@ -439,9 +439,19 @@ def _suppress_due_to_state(bc) -> bool:
 
     Also skip the WHOLE tick (no get_mic_buffer at all) while a device
     dialogue runs or is in its end tail: its stop-listen owns the mic between
-    lines, and the voices in the room are JARVIS and the device."""
+    lines, and the voices in the room are JARVIS and the device.
+
+    And while the tray's Mute Mic is on (2026-10-01): muted means no capture
+    of any kind. This loop's get_mic_buffer used to open its own stream every
+    tick while muted, run whisper-tiny on the room and could auto-engage
+    standby."""
     try:
         if getattr(bc, "_standby_mode")[0] or getattr(bc, "_sleep_mode")[0]:
+            return True
+    except Exception:
+        pass
+    try:
+        if getattr(bc, "_mic_muted", [False])[0]:
             return True
     except Exception:
         pass

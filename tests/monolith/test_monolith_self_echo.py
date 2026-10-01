@@ -452,7 +452,7 @@ class StandbyPathTests(_Base):
         self._p(bc, "_device_speech_ignored", return_value=False)
         self._quiet(bc._speak, "Your timer is done, sir.")     # 100.0-101.6
 
-        def _rec(timeout=None):
+        def _rec(timeout=None, **_kw):
             bc._last_capture_window[0] = (99.5, 100.4, 102.5)
             return bc.np.zeros(int(bc.SAMPLE_RATE * 1.0), dtype="float32")
         self._p(bc, "record_speech", side_effect=_rec)

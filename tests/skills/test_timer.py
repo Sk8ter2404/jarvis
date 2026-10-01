@@ -343,6 +343,9 @@ class TimerEnqueueSpeechTests(unittest.TestCase):
             with open(qpath, encoding="utf-8") as f:
                 data = _json.load(f)
         self.assertEqual(data[-1]["message"], "file-route")
+        # Tagged like proactive_announce's entries (2026-10-01): standby
+        # speaks only the owner's own reminders, keyed on "source".
+        self.assertEqual(data[-1]["source"], "timer")
 
     def test_enqueue_appends_to_existing_and_ignores_corrupt(self):
         import json as _json

@@ -646,6 +646,16 @@ class SuppressDueToStateTests(unittest.TestCase):
         bc = types.SimpleNamespace()   # none of the probed attrs exist
         self.assertFalse(self.mod._suppress_due_to_state(bc))
 
+    def test_suppress_while_the_mic_is_muted(self):
+        # 2026-10-01: muted = no capture of any kind; the tick used to call
+        # get_mic_buffer (its own stream) and whisper-tiny anyway.
+        bc = types.SimpleNamespace(
+            _standby_mode=[False], _sleep_mode=[False], _mic_muted=[True],
+            _jarvis_played_music_at=[self.mod.time.time() - 600])
+        self.assertTrue(self.mod._suppress_due_to_state(bc))
+        bc._mic_muted[0] = False
+        self.assertFalse(self.mod._suppress_due_to_state(bc))
+
 
 # ─── _load_loop_cfg ──────────────────────────────────────────────────────
 class LoadLoopCfgTests(unittest.TestCase):

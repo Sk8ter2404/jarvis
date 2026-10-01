@@ -706,6 +706,21 @@ class MicWorkerLoopTests(_TmpDirMixin, unittest.TestCase):
         self._run_worker(bc, feed_block=block, wait_returns=[True])
         bc.transcribe.assert_not_called()
 
+    def test_worker_drops_batches_while_the_mic_is_muted(self):
+        # 2026-10-01: the tray's Mute Mic drops every batch like the
+        # daemon-pause guard — nothing heard while muted is transcribed or
+        # written to the transcript log (it used to be both).
+        bc = _FakeBobert(_mic_muted=[True])
+        bc.transcribe = mock.MagicMock(return_value=("x", _good_conf()))
+        bc.is_valid_speech = mock.MagicMock(return_value=(True, "ok"))
+        block = np.ones(16000 * 3, dtype=np.float32) * 0.2
+        self.mod._prev_mic_batch[0] = "half a line"
+        self._run_worker(bc, feed_block=block, wait_returns=[True])
+        bc.transcribe.assert_not_called()
+        self.assertEqual(len(self.mod._buffer), 0)
+        self.assertFalse(os.path.exists(self.mod._AUDIO_JSONL))
+        self.assertIsNone(self.mod._prev_mic_batch[0])
+
     def test_worker_sounddevice_import_failure(self):
         bc = _FakeBobert()
         evt = _ScriptedEvent([True])

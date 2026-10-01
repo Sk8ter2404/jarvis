@@ -769,6 +769,105 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(out.reason, "error")
 
 
+class _LateStopCap:
+    """A stop-listen capture whose verdict is still being transcribed when
+    listen() returns: ``delay`` s later the worker stops the session FIRST
+    and then publishes "stop" - the monolith's _stop_listen_worker order."""
+
+    def __init__(self, session, delay):
+        self.available = True
+        self.beat_voiced = False        # "stop" said mid-line, not in the beat
+        self._evt = threading.Event()
+
+        def land():
+            session.stop("owner_stop")
+            self._evt.set()
+        threading.Timer(delay, land).start()
+
+    def result(self, timeout=0.0):
+        if not self._evt.wait(max(0.0, float(timeout))):
+            return ("pending", "")
+        return ("stop", "")
+
+
+class DeviceAfterDeviceStopTests(unittest.TestCase):
+    """2026-10-01: a stop said over a device line must stop the device line
+    that comes NEXT with no JARVIS line in between - the device cannot be cut
+    once it starts, so its verdict has to land first."""
+
+    def _rig(self, delay=0.25):
+        rig = Rig()
+        rig.listen_caps = []
+        orig = rig.listen
+
+        def listen(until, *, beat_s, max_s):
+            orig(until, beat_s=beat_s, max_s=max_s)
+            cap = _LateStopCap(rig.session, delay)
+            rig.listen_caps.append(cap)
+            return cap
+        rig.listen = listen
+        return rig
+
+    def test_stop_over_chunk_one_stops_chunk_two(self):
+        # A salvaged 91-120 char device line: two chunks, said back to back.
+        rig = self._rig()
+        lines = [dlg.Line("device", "Chunk one. Chunk two.",
+                          ("Chunk one.", "Chunk two.")),
+                 dlg.Line("self", "Noted.", final=True)]
+        out = rig.runner().run("Opening line.", _ready(lines), lambda: [],
+                               script_deadline=time.monotonic() + 2.0,
+                               closings={"owner_stop": "Of course."})
+        self.assertEqual(out.reason, "owner_stop")
+        said = [e[1] for e in rig.log if e[0] == "say"]
+        self.assertEqual(said, ["Chunk one."],
+                         "the device said its next chunk after the stop")
+        self.assertEqual(rig.log[-1][:2], ("self", "Of course."))
+
+    def test_stop_over_the_stall_line_stops_the_first_scripted_line(self):
+        # The script lands DURING the stall line, so the line loop starts at
+        # once - its first line is the device's.
+        rig = self._rig()
+        fut = Future()
+        orig_say = rig.device_say
+
+        def say(chunk):
+            res = orig_say(chunk)
+            if not fut.done():
+                fut.set_result(_lines())
+            return res
+        rig.device_say = say
+        out = rig.runner().run("Opening line.", fut, lambda: [],
+                               script_deadline=time.monotonic() + 2.0,
+                               stall=lambda: "Hold on, thinking.",
+                               closings={"owner_stop": "Of course."})
+        self.assertEqual(out.reason, "owner_stop")
+        said = [e[1] for e in rig.log if e[0] == "say"]
+        self.assertEqual(said, ["Hold on, thinking."])
+
+    def test_a_jarvis_line_in_between_does_not_wait(self):
+        # device -> self -> device: the late verdict cuts JARVIS instead (the
+        # caller's speak_self), so the next device line never waits on it.
+        rig = Rig(cap=FakeCap(beat_voiced=False, delay=5.0))
+        t0 = time.monotonic()
+        out = rig.runner().run("Opening line.", _ready(_lines()), lambda: [],
+                               script_deadline=time.monotonic() + 2.0)
+        self.assertEqual(out.reason, "done")
+        self.assertLess(time.monotonic() - t0, 2.0)
+
+    def test_the_wait_is_bounded(self):
+        # A verdict that never lands costs at most verdict_wait_s.
+        rig = Rig(cap=FakeCap(beat_voiced=False, delay=60.0))
+        lines = [dlg.Line("device", "One. Two.", ("One.", "Two."))]
+        t0 = time.monotonic()
+        out = rig.runner(verdict_wait_s=0.3).run(
+            "Opening line.", _ready(lines), lambda: [],
+            script_deadline=time.monotonic() + 2.0)
+        self.assertEqual(out.reason, "done")
+        self.assertEqual([e[1] for e in rig.log if e[0] == "say"],
+                         ["One.", "Two."])
+        self.assertLess(time.monotonic() - t0, 2.0)
+
+
 class ListenCaptureTests(unittest.TestCase):
     def test_pending_then_result(self):
         cap = dlg.ListenCapture(available=True, beat_voiced=True)

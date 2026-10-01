@@ -498,14 +498,16 @@ class Runner:
     ``device_wait_s`` elapsed) before JARVIS speaks again and before run()
     returns - a closing after a failed say (a "busy" give-up, a stop during
     the retries) included; the session's stop state is checked before every
-    line.
+    line; a device chunk that directly follows another device chunk waits
+    (at most ``verdict_wait_s``) for the previous stop-listen verdict first.
     """
 
     def __init__(self, *, speak_self, device_say, device_done, listen,
                  session, beat_s: float = 0.6, busy_retry_s: float = 2.0,
                  busy_step_s: float = 0.3, clock=time.monotonic,
                  sleep=time.sleep, voiced_wait_s: float = 1.5,
-                 device_wait_s: float = 12.0, done_poll_s: float = 0.05):
+                 device_wait_s: float = 12.0, done_poll_s: float = 0.05,
+                 verdict_wait_s: float = 3.0):
         self.speak_self = speak_self
         self.device_say = device_say
         self.device_done = device_done
@@ -519,9 +521,15 @@ class Runner:
         self.voiced_wait_s = max(0.0, float(voiced_wait_s))
         self.device_wait_s = max(0.0, float(device_wait_s))
         self.done_poll_s = max(0.005, float(done_poll_s))
+        # How long a device line waits for the PREVIOUS line's stop-listen
+        # verdict (see _device_line). Longer than voiced_wait_s: the whole
+        # capture, not just the beat, may still be transcribing.
+        self.verdict_wait_s = max(0.0, float(verdict_wait_s))
         # The finer closing keys the last failed device say named (see
         # DEVICE_CLOSING_KEYS); reset by every run().
         self._closing_keys: tuple = ()
+        # The last device line's stop-listen capture; reset by every run().
+        self._last_cap = None
 
     # -- helpers -------------------------------------------------------
     def _stopped(self) -> Optional[str]:
@@ -575,6 +583,21 @@ class Runner:
         reason to end with. Always returns with the device finished (or
         ``device_wait_s`` spent waiting for it) - a failed say included."""
         for chunk in (line.chunks or (line.text,)):
+            # A device line cannot be cut once said (2026-10-01): a "stop"
+            # the owner said over the PREVIOUS device line is transcribed on
+            # a worker after its listen returned, so with no JARVIS line in
+            # between (chunk 2 of a long line, the first scripted line after
+            # the stall line) its verdict was still pending here and the
+            # device said a whole line after he said stop. Let that verdict
+            # land (bounded) before saying anything more. A verdict that has
+            # landed returns at once; a JARVIS line in between clears it
+            # (run()).
+            prev, self._last_cap = self._last_cap, None
+            if prev is not None and getattr(prev, "available", False):
+                try:
+                    prev.result(self.verdict_wait_s)
+                except Exception:
+                    pass
             r = self._stopped()
             if r:
                 return r
@@ -602,6 +625,7 @@ class Runner:
                                   max_s=self.device_wait_s)
             except Exception:
                 cap = None
+            self._last_cap = cap
             available = bool(getattr(cap, "available", False))
             self._wait_device_done()
             if not available:
@@ -645,6 +669,7 @@ class Runner:
         "error". Never raises."""
         spoken = 0
         self._closing_keys = ()
+        self._last_cap = None
         try:
             r = self._stopped()
             if r:
@@ -701,6 +726,10 @@ class Runner:
                     reason = r
                     break
                 if line.who == "self":
+                    # JARVIS's own line comes between: a late verdict cuts
+                    # HIM (the caller's speak_self), so the next device line
+                    # need not wait on it (see _device_line).
+                    self._last_cap = None
                     r = self._speak(line.text, bool(line.final))
                 else:
                     r = self._device_line(line)

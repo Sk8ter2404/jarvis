@@ -444,6 +444,16 @@ def _trim_buffer(now: float) -> None:
         _buffer.popleft()
 
 
+def _mic_muted_now(b) -> bool:
+    """True while the host's tray "Mute Mic" is on (2026-10-01): the mic
+    worker drops every batch, exactly like the daemon-pause guard. Never
+    raises (False on error, i.e. the old behaviour)."""
+    try:
+        return bool(getattr(b, "_mic_muted", [False])[0])
+    except Exception:
+        return False
+
+
 def _tts_recently_active(b) -> bool:
     """True while JARVIS's own TTS playback is live, or within
     _TTS_ECHO_COOLDOWN_S of the last tick it was seen live. Echo
@@ -994,12 +1004,18 @@ def _worker_loop() -> None:
             _tts_recently_active(b)
             # Daemon-pause guard: drop accumulated chunks so we don't
             # process a wall-of-audio surge when the user un-pauses.
-            # Stream stays open to keep the audio device warm.
-            if _paused[0]:
+            # Stream stays open to keep the audio device warm. The tray's
+            # Mute Mic drops them the same way (2026-10-01): nothing heard
+            # while muted is transcribed or written to the transcript log
+            # (the host's record_speech no longer captures while muted;
+            # this also covers this worker's own stream).
+            if _paused[0] or _mic_muted_now(b):
                 with q_lock:
                     audio_q.clear()
                 pending.clear()
                 pending_samples = 0
+                if not _paused[0]:
+                    _prev_mic_batch[0] = None   # a mute ends any split line
                 _heartbeat = time.time()
                 if _stop_evt.wait(0.5):
                     break

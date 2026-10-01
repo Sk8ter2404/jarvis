@@ -1214,6 +1214,12 @@ SHUTDOWN_PROMPT_NO_PHRASES = (
     "full shutdown", "full shut down",
     "no thanks", "no thank you",
 )
+# The ONE yes/no classifier (2026-10-01): the shutdown prompt, the autocorrect
+# pick and the high-risk action confirmation each had their own word list and
+# matching rule, and they drifted — the confirmation gate's raw startswith
+# cancelled on "Yeah." and CONFIRMED a delete on "Yesterday...", and the
+# shutdown prompt never matched Whisper's punctuated "No.". See core/yes_no.py.
+from core import yes_no as _yes_no  # noqa: E402
 # Goodbye lines spoken before _act_shutdown_jarvis terminates the process.
 # Picked randomly so repeated shutdowns don't feel scripted.
 SHUTDOWN_GOODBYE_LINES = (
@@ -12021,8 +12027,10 @@ def proactive_announce(message: str, source: str = "skill",
     message to pending_speech.json and the main listen loop will drain the
     queue at the next turn boundary. Returns True on successful enqueue.
 
-    `source` is just a tag for the console fallback log so it's obvious which
-    skill produced an announcement that couldn't be written to disk.
+    `source` tags the console fallback log so it's obvious which skill
+    produced an announcement that couldn't be written to disk, and is stored
+    on the queued entry: in standby/sleep only _STANDBY_SPEAKABLE_SOURCES
+    ("timer", "scheduler", "promise:*") are spoken, the rest wait for wake.
 
     `mood` (optional) is the voice_mood layer opt-in. When set, the drainer
     forwards it as mood= to _speak() so the queued utterance lands with the
@@ -12091,7 +12099,10 @@ def proactive_announce(message: str, source: str = "skill",
                         data = []
             except Exception:
                 data = []
-        entry: dict = {"ts": time.time(), "message": message}
+        # `source` is stored too (2026-10-01): standby drains only the owner's
+        # own reminders (timer / scheduler / promise) and holds the rest, so
+        # the drainer has to know which skill queued each line.
+        entry: dict = {"ts": time.time(), "message": message, "source": source}
         if supersede:
             _before = len(data)
             data = [e for e in data
@@ -15678,7 +15689,86 @@ def remove_record_tap(q: "queue.Queue") -> None:
             pass
 
 
-def record_speech(timeout: float | None = None) -> np.ndarray | None:
+# ── one microphone capture at a time (2026-10-01) ─────────────────────────
+# An action started from the web dashboard runs its handler on a web thread,
+# beside the main loop. One that asks the owner something (the printer-setup
+# wizard calls record_speech) opened a SECOND InputStream on the mic while
+# the main loop's own record_speech(timeout=20) was live: the double-open
+# stall the tap paths exist to avoid, both captures transcribing the answer
+# (the main loop's copy logged and fed to the ambient learner — a spoken LAN
+# access code included), and whichever closed first cleared
+# _record_speech_active under the other's live stream, so the PortAudio
+# reinit gate saw no owner (the 0xc0000374 class). An off-thread in-turn
+# capture now registers here and takes the mic over from the main loop, the
+# way a web-started dialogue already does (_dialogue_holds_mic).
+_offthread_capture = [None]          # the Thread of that capture, or None
+_offthread_capture_lock = threading.Lock()
+# How long the off-thread capture waits for the main loop's stream to close
+# (record_speech notices within ~0.1 s; the close itself is bounded at 2 s).
+_OFFTHREAD_TAKEOVER_WAIT_S = 2.5
+# Why the main loop's idle listen returned None early: "work" (an inject /
+# reminder was queued mid-listen) or "mic" (another capture took the mic).
+# Read and cleared by _capture_utterance; None = an ordinary timeout.
+_capture_yield_reason = [None]
+# How often an idle listen checks for queued work.
+_WORK_CHECK_S = 0.25
+
+
+def _offthread_capture_holds_mic() -> bool:
+    """True while an in-turn capture on ANOTHER thread holds the mic (see
+    _record_speech_offthread). A dead holder never counts. Never raises."""
+    try:
+        t = _offthread_capture[0]
+        return (t is not None and t is not threading.current_thread()
+                and t.is_alive())
+    except Exception:
+        return False
+
+
+def _capture_holds_mic() -> bool:
+    """True while something on another thread owns the microphone and this
+    thread's capture must yield: a device dialogue (_dialogue_holds_mic) or
+    an off-thread in-turn capture. Never raises."""
+    return _dialogue_holds_mic() or _offthread_capture_holds_mic()
+
+
+def _record_speech_offthread(timeout):
+    """record_speech for a caller OFF the main thread (2026-10-01).
+
+    Registers this thread as the mic's in-turn capture (one at a time: a
+    second one returns None, nothing heard), waits a bounded moment for the
+    main loop's live listen to see the registration and close its stream,
+    then runs the real capture. The registration is dropped in the finally,
+    after record_speech's own finally has closed the stream and released
+    _record_speech_active."""
+    me = threading.current_thread()
+    with _offthread_capture_lock:
+        holder = _offthread_capture[0]
+        if holder is not None and holder is not me and holder.is_alive():
+            busy, mine = True, False
+        else:
+            busy, mine = False, holder is not me
+            _offthread_capture[0] = me
+    if busy:
+        print("  [record_speech] another action's capture holds the "
+              "microphone — nothing heard")
+        time.sleep(0.5 if timeout is None else min(0.5, max(0.1, timeout)))
+        return None
+    try:
+        deadline = time.monotonic() + _OFFTHREAD_TAKEOVER_WAIT_S
+        while _record_speech_active[0] and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return record_speech(timeout, _offthread_claimed=True)
+    finally:
+        if mine:
+            with _offthread_capture_lock:
+                if _offthread_capture[0] is me:
+                    _offthread_capture[0] = None
+
+
+def record_speech(timeout: float | None = None, *,
+                  yield_to_work: bool = False,
+                  _offthread_claimed: bool = False) -> np.ndarray | None:
     """
     Blocks until the user speaks and finishes, then returns the audio.
     Returns None if `timeout` seconds pass without any speech starting.
@@ -15686,7 +15776,23 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     Uses a callback-based stream because some drivers (notably certain
     gaming headsets) don't honor blocking InputStream.read() — they return
     zero bytes immediately. Callback delivery works on all drivers.
+
+    ``yield_to_work`` (2026-10-01; the main loop's two idle listens pass it):
+    while no utterance has started, return None as soon as new work is queued
+    — a typed / dashboard command or a reminder — instead of holding it for
+    the rest of the 20 s window. In-turn captures (a confirmation, the
+    printer wizard) never pass it: an unrelated inject must not abort them.
+
+    Called OFF the main thread (an action started from the web dashboard),
+    the capture first takes the microphone over from the main loop's own
+    listen — see _record_speech_offthread. ``_offthread_claimed`` is that
+    helper's private re-entry flag.
     """
+    # Why an idle listen returned None early ("work" / "mic"); reported only
+    # to the main loop's idle listens (yield_to_work), which run on the main
+    # thread, so an off-thread capture never clobbers it.
+    if yield_to_work:
+        _capture_yield_reason[0] = None
     # Blue/green: staging has no mic. Sleep briefly so the main loop's
     # busy-wait stays cheap, then yield None — the loop's `if audio is
     # None: continue` short-circuits cleanly and the inject drainer at
@@ -15694,12 +15800,33 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     if _mic_input_disabled():
         time.sleep(0.5 if timeout is None else min(0.5, max(0.1, timeout)))
         return None
+    # Mute Mic is a capture-ENTRY rule (2026-10-01): no stream opens while the
+    # tray's Mute Mic is on. Only _capture_utterance used to check it, so every
+    # other capture that STARTED muted listened as normal — the standby/sleep
+    # loop (full Whisper on every line, logged, fed to the ambient learner and
+    # its tap, woke on "JARVIS"), and the in-turn confirmations (a heard "send
+    # it" sent a draft) — the exact privacy promise the owner muted for. The
+    # brief sleep keeps a caller's loop idling, not spinning; every caller
+    # already treats None as "nothing heard" (draft confirm / the printer
+    # wizard: abort, fail closed).
+    if _mic_muted[0]:
+        time.sleep(0.3 if timeout is None else min(0.3, max(0.1, timeout)))
+        return None
+    # An in-turn capture off the main loop's thread takes the mic over first
+    # (2026-10-01): see _record_speech_offthread.
+    if (not _offthread_claimed
+            and threading.current_thread() is not threading.main_thread()):
+        return _record_speech_offthread(timeout)
     # A device dialogue running on ANOTHER thread (a web panel action) owns
     # the microphone for its stop-listen: open nothing, idle briefly, and let
-    # the caller loop (None = nothing heard). See _dialogue_holds_mic.
-    if _dialogue_holds_mic():
+    # the caller loop (None = nothing heard). See _dialogue_holds_mic. So does
+    # an in-turn capture running off the main loop's thread (2026-10-01,
+    # _capture_holds_mic).
+    if _capture_holds_mic():
         _dialogue_mic_yield_wait(
             0.5 if timeout is None else min(0.5, max(0.1, timeout)))
+        if yield_to_work:
+            _capture_yield_reason[0] = "mic"
         return None
     # Capture-open BACKOFF (2026-09-29, R10): while the microphone will not
     # open, attempts are paced 0.5 -> 5 s instead of retried ~200 times a
@@ -15731,6 +15858,11 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     recording   = False
     silence_n   = 0
     start_time  = time.time()
+    # Queued-work yield (yield_to_work): compared against its value at entry,
+    # never tested for presence, so a file that cannot be claimed is not a
+    # hot loop (the _input_backoff_wait rule).
+    _work_sig0 = _pending_work_signature() if yield_to_work else None
+    _next_work_check = time.monotonic() + _WORK_CHECK_S
     peak_rms    = 0.0
     silent_peak = 0.0   # peak RMS while NOT recording (= ambient floor)
 
@@ -15763,9 +15895,24 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     # re-loops. Any open/start failure below closes the stream and then clears
     # the flag so it is never left stuck True on a stream we don't hold.
     _record_speech_sr[0] = SAMPLE_RATE
-    if not _pa_claim_owner(_record_speech_active):
-        print("  [record_speech] PortAudio reinit in flight — "
-              "skipping this capture cycle")
+    # One capture holds the mic at a time (2026-10-01): the main loop's claim
+    # is refused while an off-thread in-turn capture holds it, and that
+    # capture's claim is refused while the main loop's stream is still live
+    # (it waited a bounded moment for it to close). Both sides used to claim
+    # this boolean unconditionally, so two streams ran on one device and the
+    # first to close cleared the flag under the other's live stream — the
+    # reinit gate then saw no owner (0xc0000374 window).
+    _deny = ((lambda: bool(_record_speech_active[0])) if _offthread_claimed
+             else _offthread_capture_holds_mic)
+    if not _pa_claim_owner(_record_speech_active, deny_if=_deny):
+        if _deny():
+            print("  [record_speech] another capture holds the microphone — "
+                  "skipping this capture cycle")
+            if yield_to_work:
+                _capture_yield_reason[0] = "mic"
+        else:
+            print("  [record_speech] PortAudio reinit in flight — "
+                  "skipping this capture cycle")
         return None
     # If get_mic_buffer Path B is mid-capture on this same device, we've just
     # signalled it to bail (Path B re-checks _record_speech_active every 0.2s and
@@ -15852,11 +15999,11 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     # Mute Mic mid-capture (2026-09-30): the tray's mute used to be checked
     # only BEFORE a listen started, so a capture already running — up to
     # MAX_RECORDING_SECS — still recorded, transcribed and ACTED on what was
-    # said after the click. A capture that STARTED unmuted now stops the moment
-    # mute is set and returns nothing. (One that started muted — only the
-    # standby path does that — keeps its old behaviour, so muting never turns
-    # a listen into a tight open/close loop.)
-    _mute_at_open = bool(_mic_muted[0])
+    # said after the click. A capture now stops the moment mute is set and
+    # returns nothing. (2026-10-01: no capture can START muted any more — see
+    # the entry check above — so the old "one that started muted keeps
+    # listening" carve-out, which kept standby recording through a mute, is
+    # gone.)
     try:  # pragma: no cover - live mic capture loop (blocks on real audio frames until utterance ends)
         while True:
             # Watchdog-driven recovery: if the main-loop watchdog has
@@ -15869,19 +16016,38 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
                       "closing InputStream and returning")
                 _utterance_in_progress[0] = False
                 return None
-            if _mic_muted[0] and not _mute_at_open:
+            if _mic_muted[0]:
                 print("  [record_speech] mic muted mid-capture — stopping, "
                       "nothing kept")
                 _utterance_in_progress[0] = False
                 return None
             # A dialogue started on another thread while this capture was
             # listening (a web panel action): hand it the microphone now —
-            # the finally below closes the stream and drops the claim.
-            if _dialogue_holds_mic():
-                print("  [record_speech] a dialogue needs the microphone — "
-                      "stopping, nothing kept")
+            # the finally below closes the stream and drops the claim. The
+            # same for an in-turn capture started off the main loop's thread
+            # (2026-10-01, a dashboard-run action asking the owner something).
+            if _capture_holds_mic():
+                _who = ("a dialogue" if _dialogue_holds_mic()
+                        else "an action's capture")
+                print(f"  [record_speech] {_who} needs the microphone — "
+                      f"stopping, nothing kept")
                 _utterance_in_progress[0] = False
+                if yield_to_work:
+                    _capture_yield_reason[0] = "mic"
                 return None
+            # Idle listen, new work queued (2026-10-01): a typed / dashboard
+            # command or a reminder waited up to the whole 20 s window (a
+            # quiet room) because it is drained only at the loop top. Checked
+            # only before an utterance starts — one in progress is never cut.
+            if (_work_sig0 is not None and not recording
+                    and time.monotonic() >= _next_work_check):
+                _next_work_check = time.monotonic() + _WORK_CHECK_S
+                if _pending_work_signature() != _work_sig0:
+                    _capture_yield_reason[0] = "work"
+                    if _debug_mode[0]:
+                        print("  [record_speech] work queued — yielding the "
+                              "idle listen to the loop top")
+                    return None
             try:
                 data = audio_q.get(timeout=0.1)
             except queue.Empty:
@@ -16185,6 +16351,14 @@ def _get_mic_buffer_impl(seconds: float,
         # stream — get_input_device() would resolve it to the SYSTEM DEFAULT mic
         # and silently listen (this is what made staging transcribe in standby).
         return None
+    if _mic_muted[0]:
+        # Mute Mic (2026-10-01): this used to check only _mic_input_disabled,
+        # so with the mic muted the standby lyric loop opened its OWN stream
+        # every ~8.5 s (record_speech, muted, holds nothing to tap), ran
+        # whisper-tiny on the room and could auto-engage standby. Muted means
+        # no capture of any kind; the loops below also stop on a mute that
+        # lands mid-capture.
+        return None
     target_sr = int(sample_rate or SAMPLE_RATE)
     need = max(1, int(target_sr * seconds))
 
@@ -16233,6 +16407,8 @@ def _get_mic_buffer_impl(seconds: float,
             while got < need and time.time() < deadline:
                 if not _record_speech_active[0]:
                     break   # record_speech closed the stream mid-tap
+                if _mic_muted[0]:
+                    break   # Mute Mic landed mid-tap (2026-10-01)
                 try:
                     frame = tap_q2.get(timeout=0.2)
                 except queue.Empty:
@@ -16241,8 +16417,8 @@ def _get_mic_buffer_impl(seconds: float,
                 got += int(frame.size)
         finally:
             remove_record_tap(tap_q2)
-        if not tapped:
-            return None
+        if not tapped or _mic_muted[0]:
+            return None   # (muted mid-tap: nothing kept, 2026-10-01)
         out_t = np.concatenate(tapped).astype(np.float32, copy=False)
         return out_t[:need] if out_t.size > need else out_t
 
@@ -16332,6 +16508,9 @@ def _get_mic_buffer_impl(seconds: float,
                     # "0 lines, error". The dialogue's own stop-listen never
                     # comes through here (it opens its own stream), so yield.
                     break
+                if _mic_muted[0]:
+                    # Mute Mic landed mid-capture (2026-10-01): stop now.
+                    break
                 try:
                     frame = q_local.get(timeout=0.2)
                 except queue.Empty:
@@ -16348,8 +16527,8 @@ def _get_mic_buffer_impl(seconds: float,
         # (close-then-release, 2026-08-14) so the flag covers the stream's
         # whole native lifetime.
         _pa_release_owner(_pathb_mic_active)
-    if not chunks2:
-        return None
+    if not chunks2 or _mic_muted[0]:
+        return None   # (muted mid-capture: nothing kept, 2026-10-01)
     out2 = np.concatenate(chunks2).astype(np.float32, copy=False)
     return out2[:need] if out2.size > need else out2
 
@@ -25498,7 +25677,12 @@ def _handle_shutdown_prompt(text: str) -> bool:
         _shutdown_prompt_pending["armed"] = False
         print("  [shutdown] prompt expired — falling through to normal routing")
         return False
-    tl = (text or "").strip().lower()
+    # Words only, wake word dropped (2026-10-01): this was strip().lower(), so
+    # Whisper's punctuated "No." / "Yes." matched no phrase and the shutdown
+    # was cancelled as "unrelated" (live 2026-09-30 08:25) — and in wake-word
+    # mode every spoken answer arrives as "jarvis, no.". Now 'No.' -> 'no',
+    # 'Jarvis, no.' -> 'no', 'No, thanks.' -> 'no thanks'.
+    tl = _yes_no.normalize(text)
     # Clear the flag eagerly so a second-arming or a re-entrant call can't
     # re-trigger this branch. Each dispatch path below is terminal.
     _shutdown_prompt_pending["armed"] = False
@@ -25518,7 +25702,14 @@ def _handle_shutdown_prompt(text: str) -> bool:
         except Exception as _e:
             print(f"  [shutdown] _act_shutdown_jarvis failed: {_e}")
         return True
-    if tl in SHUTDOWN_PROMPT_YES_PHRASES or any(tl.startswith(p + " ") for p in SHUTDOWN_PROMPT_YES_PHRASES):
+    # YES = the shared classifier's clear yes ("Okay.", "Sure.", "Yep, do it")
+    # or one of this prompt's own overnight phrases. A hedged yes ("yes, but
+    # later") is the classifier's "no": neither overnight nor a full power-off
+    # was asked for, so it falls through to the cancel below.
+    _verdict = _yes_no.classify_reply(tl)
+    if _verdict == "yes" or (_verdict == "other" and (
+            tl in SHUTDOWN_PROMPT_YES_PHRASES
+            or any(tl.startswith(p + " ") for p in SHUTDOWN_PROMPT_YES_PHRASES))):
         print(f"  [shutdown] user confirmed overnight ('{tl}') — start_overnight_upgrade")
         try: _act_start_overnight_upgrade()
         except Exception as _e:
@@ -27504,6 +27695,27 @@ _require_wake_runtime = REQUIRE_WAKE_MODE
 from core.followup_window import FollowupWindow as _FollowupWindow  # noqa: E402
 _followup_window = _FollowupWindow(FOLLOWUP_WINDOW_S)
 
+# Standby-wake greeting reply (2026-10-01): a bare "Jarvis" to a sleeping
+# JARVIS is answered with a question ("Yes, sir?"), and in wake-word mode with
+# the follow-up window off the owner's answer — which never repeats "Jarvis" —
+# was then refused as overheard audio. _handle_sleep_standby arms this
+# deadline after the greeting; the NEXT mic turn to reach the gate takes it
+# (one utterance only, so a TV cannot keep it open), and it lapses unused
+# after _STANDBY_GREET_ADMIT_S.
+_STANDBY_GREET_ADMIT_S = 8.0
+_standby_greet_admit_until = [0.0]
+
+
+def _standby_greet_admit_take() -> bool:
+    """Consume the one-shot greeting admit: True when it was armed and has
+    not lapsed. Any call disarms it. Never raises."""
+    try:
+        until = float(_standby_greet_admit_until[0])
+        _standby_greet_admit_until[0] = 0.0
+        return until > 0.0 and time.time() < until
+    except Exception:
+        return False
+
 
 def _text_has_wake_prefix(text: str) -> bool:
     """True if ``text`` is a short utterance led by a wake word
@@ -27552,12 +27764,16 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
     is set). Never raises — on any error it fails OPEN (returns (False, "")) so a
     gate failure can never silence JARVIS."""
     try:
+        # Taken by whichever mic turn comes first, wake-prefixed or not.
+        _greet_reply = _standby_greet_admit_take()
         if _text_has_wake_prefix(text):
             _followup_window.note_addressed()
             return (False, "")
         if _require_wake_runtime:
             if _followup_window.admit():
                 return (False, "follow-up window")
+            if _greet_reply:
+                return (False, "standby greeting reply")
             return (True, "wake-word mode")
         if _smtc_media_playing():
             return (True, "media playing")
@@ -30379,10 +30595,11 @@ def handle_autocorrect_disambig_response(user_text: str) -> bool:
     choice = _pending_autocorrect_choice[0]
     primary_name, primary_arg = choice["primary"]
     secondary_name, secondary_arg = choice["secondary"]
-    t = user_text.strip().lower()
-
-    # Strip punctuation off the edges so 'yes.' / 'second!' still parse.
-    t = t.strip(".!?,;: ")
+    # Words only, wake word and trailing "sir"/"please" dropped (2026-10-01,
+    # core/yes_no.normalize — the one rule all three yes/no routers share):
+    # 'yes.' / 'second!' still parse, and so does 'Jarvis, yes.' — the only
+    # spoken form wake-word mode lets through, which used to be "unrelated".
+    t = _yes_no.normalize(user_text)
 
     # Heuristic: if either action name (or its main token) is mentioned
     # outright, that's the strongest signal. Check the longer name first
@@ -30401,17 +30618,17 @@ def handle_autocorrect_disambig_response(user_text: str) -> bool:
     elif _name_mentioned(secondary_name) and not _name_mentioned(primary_name):
         picked = (secondary_name, secondary_arg)
         reason = "named secondary"
-    elif t in ("yes", "yeah", "yep", "yup", "sure", "ok", "okay",
-               "first", "the first", "first one", "former", "one",
-               "do it", "go ahead", "proceed", "confirm"):
+    elif t in _yes_no.YES_WORDS or t in (
+            "first", "the first", "first one", "former", "one",
+            "do it", "go ahead"):
         picked = (primary_name, primary_arg)
         reason = "affirmative -> primary"
     elif t in ("second", "the second", "second one", "latter", "two",
                "the other", "the other one", "other", "b"):
         picked = (secondary_name, secondary_arg)
         reason = "explicit secondary"
-    elif t in ("no", "nope", "nah", "neither", "cancel", "nevermind",
-               "never mind", "skip", "forget it", "stop"):
+    elif t in _yes_no.NO_WORDS or t in (
+            "neither", "never mind", "skip", "forget it", "no thanks"):
         picked = None
         reason = "negative -> cancel"
     else:
@@ -30484,11 +30701,21 @@ def handle_confirmation_response(user_text: str) -> bool:
     If we're waiting on a confirmation, interpret this user message as either
     yes/no. Returns True if we consumed the message (so main loop should
     skip the normal LLM call). Bobert speaks brief feedback either way.
+
+    yes -> run the queued actions; no -> cancel them (consumed); anything
+    else -> cancel them and return False so the utterance routes normally.
     """
     if not _pending_confirmation:
         return False
-    t = user_text.strip().lower()
-    affirmative = any(t.startswith(w) for w in ("yes", "confirm", "do it", "go ahead", "proceed"))
+    # The shared yes/no classifier (2026-10-01, core/yes_no.py). This was a raw
+    # prefix test — any(t.startswith(w) for w in ("yes", "confirm", "do it",
+    # "go ahead", "proceed")) — with everything else a decline, so "Yeah." /
+    # "Sure." / "Okay." CANCELLED the action, "Jarvis, yes." (the only spoken
+    # form wake-word mode lets through) cancelled too, and "Yesterday...",
+    # "Do it later", "Go ahead and cancel it" and "Confirmation number 5" RAN
+    # the queued delete / purchase / dangerous shell command.
+    verdict = _yes_no.classify_reply(user_text)
+    affirmative = verdict == "yes"
     if affirmative:
         count = len(_pending_confirmation)
         print(f"  [confirm] User confirmed — executing {count} pending action(s)")
@@ -30579,11 +30806,22 @@ def handle_confirmation_response(user_text: str) -> bool:
                   f"talking; no confirmation feedback")
         else:
             _speak("Done.")
-    else:
+    elif verdict == "no":
         count = len(_pending_confirmation)
         print(f"  [confirm] User declined — cancelling {count} pending action(s)")
         _pending_confirmation.clear()
         _speak("Cancelled.")
+    else:
+        # Neither yes nor no: the owner moved on to something else. Fail safe
+        # — the queued action is cancelled, never run — and, like the
+        # autocorrect pick, hand the utterance back so the new command still
+        # routes (it used to be swallowed behind the "Cancelled.").
+        count = len(_pending_confirmation)
+        print(f"  [confirm] unrelated reply — cancelling {count} pending "
+              f"action(s), routing it normally")
+        _pending_confirmation.clear()
+        _speak("Cancelled, sir.")
+        return False
     return True
 
 
@@ -31918,16 +32156,17 @@ _DIALOGUE_MIC_YIELD_WAIT_S = 1.0
 
 
 def _dialogue_mic_yield_wait(max_s: float) -> None:
-    """Idle (bounded by ``max_s``) while _dialogue_holds_mic(); the caller then
-    returns "nothing heard". Logs once per dialogue. Never raises."""
+    """Idle (bounded by ``max_s``) while _capture_holds_mic() — a dialogue or
+    (2026-10-01) an off-thread in-turn capture; the caller then returns
+    "nothing heard". Logs once per dialogue. Never raises."""
     try:
         h = _dialogue_current[0]
-        if _dialogue_mic_yield_logged[0] is not h:
+        if _dialogue_holds_mic() and _dialogue_mic_yield_logged[0] is not h:
             _dialogue_mic_yield_logged[0] = h
             print("  [dialogue] the main loop yields the microphone to a "
                   "dialogue running on another thread")
         deadline = time.monotonic() + max(0.0, float(max_s))
-        while _dialogue_holds_mic() and time.monotonic() < deadline:
+        while _capture_holds_mic() and time.monotonic() < deadline:
             time.sleep(0.05)
     except Exception:
         pass
@@ -33750,8 +33989,53 @@ def _requeue_pending_speech(items: list) -> bool:
         _pending_speech_lock.release()
 
 
-def _speak_pending():
+# Queued-speech sources standby/sleep still speaks (2026-10-01). Every
+# proactive line waits in pending_speech.json, and the only drainer ran in
+# normal mode — so a timer the owner set ("Reminder, sir — <msg>") stayed
+# silent for as long as JARVIS was in standby (music auto-standby included)
+# and played, unannounced as late, whenever he next said "JARVIS". These are
+# the owner's OWN requests: a timer, a scheduled job, a promise JARVIS made
+# ("promise:<origin>"). Everything else — banter, device alerts, briefings,
+# the ambient wake nudge — stays held until he wakes JARVIS.
+_STANDBY_SPEAKABLE_SOURCES = frozenset({"timer", "scheduler", "promise"})
+
+
+def _pending_source_in(item, sources) -> bool:
+    """True when a queued entry's ``source`` (the part before any ":") is in
+    ``sources``. An entry with no source (an older writer) is not. Never
+    raises."""
+    try:
+        src = item.get("source") if isinstance(item, dict) else None
+        return isinstance(src, str) and src.split(":", 1)[0] in sources
+    except Exception:
+        return False
+
+
+def _pending_has_source(sources) -> bool:
+    """Peek (no claim): does the speech queue hold an entry from ``sources``?
+    True on any read error, so the real drain decides. Never raises."""
+    try:
+        with open(PENDING_SPEECH_PATH, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        if not raw:
+            return False
+        items, _ = json.JSONDecoder().raw_decode(raw)
+        if not isinstance(items, list):
+            return True
+        return any(_pending_source_in(e, sources) for e in items)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+
+
+def _speak_pending(only_sources=None):
     """If skills (like the timer) have queued reminders, speak them now.
+
+    ``only_sources`` (2026-10-01): speak only entries whose queued ``source``
+    (its part before any ":") is in this set and HOLD the rest, in order, for
+    a later full drain. Standby passes _STANDBY_SPEAKABLE_SOURCES so a timer
+    the owner set plays while JARVIS sleeps; None = speak everything.
 
     Race-safe consume-and-rename pattern: we rename the queue file to a
     sibling `.consuming` BEFORE iterating, so any skill that writes a new
@@ -33773,9 +34057,16 @@ def _speak_pending():
     # untouched; it is spoken once the hold passes.
     if _speech_hold_active():
         return False
-    _audio_flap_flush()
+    if only_sources is None:
+        # Standby (only_sources) leaves the governor's held line where it is,
+        # exactly as before: it would only be held again below.
+        _audio_flap_flush()
     _recover_orphaned_queue_snapshot(PENDING_SPEECH_PATH, "pending")
     if not os.path.exists(PENDING_SPEECH_PATH):
+        return False
+    # Standby runs this every pass (as often as every 0.3 s while muted):
+    # claim and rewrite the queue only when something in it may be spoken.
+    if only_sources is not None and not _pending_has_source(only_sources):
         return False
     consume_path = PENDING_SPEECH_PATH + ".consuming"
     try:
@@ -33818,7 +34109,14 @@ def _speak_pending():
     # Per-pass budget bookkeeping (see _PENDING_DRAIN_BUDGET_S).
     _drain_started = time.monotonic()
     deferred: list = []
+    held: list = []   # not in only_sources: kept for the full (wake) drain
+    back: list = []   # held + deferred, in queue order, requeued below
     for item in items:
+        if only_sources is not None and not _pending_source_in(item,
+                                                               only_sources):
+            held.append(item)
+            back.append(item)
+            continue
         # ── PER-PASS BUDGET ───────────────────────────────────────
         # Once this pass has spent its budget, stop speaking and hand the rest
         # back to the queue: the loop returns to 'Listening…' so the user can
@@ -33831,6 +34129,7 @@ def _speak_pending():
                         (time.monotonic() - _drain_started)
                         >= _PENDING_DRAIN_BUDGET_S):
             deferred.append(item)
+            back.append(item)
             continue
         msg = item.get("message", "")
         if not msg:
@@ -33871,7 +34170,9 @@ def _speak_pending():
         print(f"  [pending] drain budget ({_PENDING_DRAIN_BUDGET_S:.0f}s) "
               f"reached — deferring {len(deferred)} announcement(s) to the "
               f"next pass")
-        _requeue_pending_speech(deferred)
+    if back:
+        # Held + deferred entries go back in their original queue order.
+        _requeue_pending_speech(back)
     # Snapshot fully consumed — delete it. Any new items written DURING
     # this loop live in a fresh pending_speech.json that the next call
     # will pick up (and that the requeue above merged with, not clobbered).
@@ -34535,8 +34836,9 @@ def _capture_utterance(injected_text, memory):
     # A device dialogue running on ANOTHER thread (started from a web panel
     # action, not inside a voice turn) owns the microphone for its stop-listen:
     # take no capture until it ends. Injected turns above still pass. See
-    # _dialogue_holds_mic.
-    if _dialogue_holds_mic():
+    # _dialogue_holds_mic. So does an action's in-turn capture running off
+    # this thread (2026-10-01, _capture_holds_mic).
+    if _capture_holds_mic():
         _heartbeat()
         _dialogue_mic_yield_wait(0.5)
         return None
@@ -34591,14 +34893,28 @@ def _capture_utterance(injected_text, memory):
 
     # Wait for speech, but only briefly — so we can check proactive
     _tt_rec_since = _tt("now")
-    audio = record_speech(timeout=20)
+    # yield_to_work (2026-10-01): a typed / dashboard command or a reminder
+    # queued during this idle listen ends it at once instead of waiting out
+    # the 20 s window.
+    audio = record_speech(timeout=20, yield_to_work=True)
     if audio is not None:
         # [turn-timing] t0 = this recording's VAD break (see _turn_timing).
         _tt("begin_voice", _tt_rec_since)
 
     if audio is None:
+        _yielded = _capture_yield_reason[0]
+        _capture_yield_reason[0] = None
+        if _yielded == "mic":
+            # Another capture took the microphone: speak nothing over it.
+            set_state("idle")
+            return None
         # First check if any timers/reminders fired and need speaking
         if _speak_pending():
+            set_state("idle")
+            return None
+        if _yielded == "work":
+            # The listen ended early for a queued command: the loop top takes
+            # it now — no proactive remark in front of it.
             set_state("idle")
             return None
         # No speech within timeout. Should we volunteer something?
@@ -34964,17 +35280,66 @@ def _consume_blue_green_handoff() -> tuple[float | None, list]:
     return pending_last_speech, pending_timers
 
 
-def _handle_sleep_standby(injected_text: str | None) -> None:
+# Words a bare wake / greeting is made of: "Jarvis, wake up", "Hey Jarvis, you
+# there?", "Jarvis, good morning", "Jarvis, I need you". A wake utterance whose
+# rest is only these is a wake and gets the greeting; anything else after the
+# wake word is a command (_standby_wake_carries_command).
+_STANDBY_GREETING_WORDS = frozenset({
+    "jarvis", "hey", "hi", "hello", "yo", "ok", "okay", "sir", "buddy",
+    "please", "good", "morning", "afternoon", "evening", "night", "you",
+    "there", "are", "awake", "up", "wake", "waking", "start", "resume",
+    "listening", "come", "back", "i", "im", "need", "its", "me", "again",
+    "still", "here",
+})
+
+
+def _standby_wake_carries_command(text: str) -> bool:
+    """True when a standby wake utterance LEADS with the wake word and goes on
+    to say something (two or more words) that is not just a wake / greeting
+    ("Jarvis, turn off the lights" — not "Jarvis, wake up"). Only a leading
+    wake counts: that is what lets the carried turn pass the normal-mode
+    background gate (_text_has_wake_prefix). Never raises."""
+    try:
+        if not _text_has_wake_prefix(text):
+            return False
+        rest = _fast_paths._WAKE_LEAD_RE.sub("", (text or "").strip())
+        words = _yes_no.normalize(rest).split()
+        if len(words) < 2:
+            return False
+        return any(w not in _STANDBY_GREETING_WORDS for w in words)
+    except Exception:
+        return False
+
+
+def _handle_sleep_standby(injected_text: str | None):
     """SLEEP / STANDBY phase of the main loop: listen only for the wake
     phrase. Either an injected command (which must contain a wake phrase to
     act, per the safety rule) or a fresh mic capture is transcribed; on a wake
     phrase JARVIS clears sleep/standby and greets, otherwise the line is fed to
-    the ambient learner (when active) and ignored. Returns to the caller, which
-    immediately ``continue``s the loop — this phase never falls through to a
-    normal turn, so its early-outs are plain returns.
+    the ambient learner (when active) and ignored.
+
+    Returns None (the caller ``continue``s the loop) — or, when the wake
+    utterance also carried a command ("Jarvis, turn off the lights"), the
+    ``(text, conf)`` of that utterance, which the caller runs as this pass's
+    normal-mode turn instead of capturing a new one (2026-10-01: the command
+    used to be dropped behind a "Yes, sir?").
     """
+    global _last_capture_audio, _last_capture_sr, _last_recording_peak
     _label = "Standby" if _standby_mode[0] else "Sleeping"
     _last_capture_window[0] = None   # self-echo: no stale capture timing
+    # Inject/neural paths have no real capture; the mic path below overwrites.
+    _last_capture_audio = None
+    _last_capture_sr = 0
+    # The owner's own reminders still play while JARVIS sleeps (2026-10-01):
+    # a fired timer used to wait, silent, until the next "JARVIS". Other
+    # queued lines stay held for wake. Every tick (<= ~20 s), so a reminder
+    # plays within a capture window of firing. Never raises.
+    try:
+        _speak_pending(only_sources=_STANDBY_SPEAKABLE_SOURCES)
+    except Exception as _e:
+        print(f"  [pending] standby drain failed: {_e}")
+    _wake_conf = {"no_speech_prob": 0.0, "avg_logprob": -0.1}
+    _tt_rec_since = None
     if injected_text is not None:
         # Honour the spec safety rule: injects only act on a sleeping JARVIS
         # if the text contains a wake phrase. We log + fall through to the
@@ -34985,12 +35350,32 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
         text = injected_text
     else:
         _heartbeat()
+        # Mute Mic (2026-10-01): exactly as _capture_utterance — no capture
+        # at all while muted (standby used to keep recording, transcribing,
+        # logging and waking through a mute). Injects above still wake him.
+        if _mic_muted[0]:
+            time.sleep(0.3)
+            return None
+        # A dialogue or an in-turn capture on another thread holds the mic:
+        # take none (and print no "Standby…" line per pass) until it ends.
+        if _capture_holds_mic():
+            _dialogue_mic_yield_wait(0.5)
+            return None
         if not _input_backoff_quiet():   # R10: see _capture_utterance
             print(f"{_label}… (say 'JARVIS' to wake)")
         set_state("idle")
-        audio = record_speech(timeout=20)
+        _tt_rec_since = _tt("now")
+        # yield_to_work: a typed command or a reminder queued while this idle
+        # listen waits ends it at once (see record_speech).
+        audio = record_speech(timeout=20, yield_to_work=True)
+        _capture_yield_reason[0] = None   # standby just re-loops either way
         if audio is None or len(audio) < SAMPLE_RATE * 0.4:
-            return
+            return None
+        # The RAW capture (pre auto-gain), published the way _capture_utterance
+        # does, so a command carried out of this wake gets voice-ID, the learn
+        # gate and the background-audio learner on its real audio.
+        _last_capture_audio = audio
+        _last_capture_sr = SAMPLE_RATE
         # Feed the chunk to the spectral music detector so the standby loop
         # can spot sustained song audio and refuse lyric near-misses on the
         # wake-word check below. Fed the RAW audio (pre auto-gain) so the
@@ -35021,7 +35406,9 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
         #           later standby tick (the selector latched the failure).
         _wake_hit = _standby_wake_detected(audio)
         if _wake_hit is None:
-            text, _ = _transcribe_capture(audio)
+            # Keep Whisper's conf: a command carried out of the wake below is
+            # judged by the normal turn's speech filter on it.
+            text, _wake_conf = _transcribe_capture(audio)
         else:
             text = "jarvis" if _wake_hit else ""
     # Known-device speech (core/device_speech_filter.py): a line a device in
@@ -35046,8 +35433,10 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
     # stale duplicate that didn't.
     if _WAKE_RE.search(tl):
         if _audio_music_should_refuse_wake(text):
+            # Length only, never the words (2026-10-01, see the ignored
+            # line below).
             print(f"  [{_label.lower()}] wake-word ignored "
-                  f"(music playing, lyric near-miss): '{text[:60]}'")
+                  f"(music playing, lyric near-miss, {len(text or '')} chars)")
             return
         _was_standby = _standby_mode[0]
         # Serialize the wake-clear with the background standby auto-engage
@@ -35081,6 +35470,26 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
         # Owner-only learning: a standby wake opens the follow-up window, so
         # the conversation it starts can teach (core/learn_gate.py).
         _learn_gate_note_wake()
+        # ...and the wake-word follow-up window too (2026-10-01): only the
+        # normal-mode gate used to open it, so even an install with
+        # FOLLOWUP_WINDOW_S > 0 dropped the first follow-up after a standby
+        # wake.
+        _followup_window.note_addressed()
+        # "Jarvis, turn off the lights" said to a sleeping JARVIS (2026-10-01):
+        # the command used to be read for tone and dropped behind a "Yes,
+        # sir?", and in wake-word mode the owner's un-prefixed repeat was then
+        # refused too — a third try was needed. Hand the WHOLE wake-prefixed
+        # utterance back as this pass's turn (the normal gates pass it on its
+        # wake prefix); a bare wake / greeting still gets the greeting.
+        if _standby_wake_carries_command(text):
+            print("  [wake] the wake carries a command — running it now")
+            if injected_text is None:
+                _tt("begin_voice", _tt_rec_since)
+            else:
+                # Same pass-through metadata _capture_utterance gives an inject.
+                _last_recording_peak = max(WHISPER_TRUST_RMS * 2.0,
+                                           _last_recording_peak)
+            return (text, _wake_conf)
         # Context-aware greeting — see context_aware_greeting() for the
         # priority order (late-night repeat > morning-first > mid-print >
         # looking-away > variety bank). The wake text is passed so the variety
@@ -35089,6 +35498,10 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
             from_standby=_was_standby, wake_text=text)
         print(f"  [wake] greeting='{_greeting}' vol={_vol}")
         _speak(_greeting, volume_scale=_vol)
+        # The greeting is a question ("Yes, sir?"): in wake-word mode admit
+        # exactly ONE un-prefixed reply to it (see _should_refuse_background_
+        # audio), even with FOLLOWUP_WINDOW_S at 0.
+        _standby_greet_admit_until[0] = time.time() + _STANDBY_GREET_ADMIT_S
         set_state("idle")
     else:
         # Ambient-learning: the overheard line wasn't a wake word. Persist it
@@ -35096,7 +35509,11 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
         # for speech purposes as usual.
         if _ambient_learning[0]:
             _ambient_learning_feed(text)
-        print(f"  [{_label.lower()}] ignored: '{text[:60]}'")
+        # Length only, never the words (2026-10-01): in standby every line
+        # the room says lands here, other people's included, and the session
+        # log is tailed by the web dashboard. Keep the "[standby] ignored"
+        # prefix — tools/web_interface.py's _STANDBY_DROP_RE keys on it.
+        print(f"  [{_label.lower()}] ignored ({len(text or '')} chars)")
 
 
 def _handle_ambient_music(text: str) -> bool:
@@ -36356,16 +36773,21 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
 
                 # ── SLEEP / STANDBY MODE — only listen for the wake phrase ────────
                 if _sleep_mode[0]:
-                    _handle_sleep_standby(_injected_text)
-                    continue
-                # ── NORMAL MODE ───────────────────────────────────────────────────
-
-                # Capture the next utterance (inject or mic->Whisper) and drain
-                # any queued speech; short-circuit the loop on a reminder /
-                # silence-timeout / too-short clip. See _capture_utterance.
-                _cap = _capture_utterance(_injected_text, memory)
-                if _cap is None:
-                    continue
+                    # A wake that also carried a command ("Jarvis, turn off
+                    # the lights") comes back as this pass's turn and runs
+                    # through every normal-mode gate below (2026-10-01).
+                    _cap = _handle_sleep_standby(_injected_text)
+                    if _cap is None:
+                        continue
+                else:
+                    # ── NORMAL MODE ───────────────────────────────────────────────
+                    # Capture the next utterance (inject or mic->Whisper) and
+                    # drain any queued speech; short-circuit the loop on a
+                    # reminder / silence-timeout / too-short clip. See
+                    # _capture_utterance.
+                    _cap = _capture_utterance(_injected_text, memory)
+                    if _cap is None:
+                        continue
                 text, conf = _cap
 
                 # ── KNOWN-DEVICE SPEECH (core/device_speech_filter.py) ──────────
@@ -36417,8 +36839,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 _bg_gate, _bg_why = _bg_gate_for_turn(
                     text, _injected_text is not None)
                 if _bg_gate:
+                    # The reason and the length only, never the words
+                    # (2026-10-01): this is the gate that drops OTHER people's
+                    # speech, and it printed 40 characters of every line
+                    # into the session log the web dashboard tails — while
+                    # _ambient_learn_from_gated, handed the same text one
+                    # line later, logs "(N chars)".
                     print(f"  [bg-audio] {_bg_why} — ignoring non-wake "
-                          f"utterance: '{text[:40]}'")
+                          f"utterance ({len(text or '')} chars)")
                     # Alexa-mode ambient learning: we won't RESPOND to this gated
                     # (non-wake) utterance, but if ambient-listening is on we still
                     # passively LEARN from it — feed the transcript to the extractor
@@ -36457,9 +36885,13 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                                                 peak_rms=_last_recording_peak,
                                                 reply=(_nv == "reply"))
                 if not valid:
-                    # Show what got dropped so user can tune thresholds if needed
-                    snippet = (text[:60] + "…") if len(text) > 60 else text
-                    print(f"  [filter] dropped: '{snippet}' — {reason}")
+                    # The reason carries the numbers needed to tune the
+                    # thresholds; the words stay out of the log (2026-10-01:
+                    # a dropped line is as likely someone else's as the
+                    # owner's — the same "never the text" rule every newer
+                    # gate in this loop follows).
+                    print(f"  [filter] dropped ({len(text or '')} chars) "
+                          f"— {reason}")
                     set_state("idle")
                     continue
 

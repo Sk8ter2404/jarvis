@@ -231,7 +231,9 @@ def _enqueue_speech(message: str):
                     data = json.load(f)
             except Exception:
                 data = []
-        data.append({"ts": time.time(), "message": message})
+        # Tagged like proactive_announce's entries (2026-10-01): standby
+        # speaks only the owner's own reminders, keyed on "source".
+        data.append({"ts": time.time(), "message": message, "source": "timer"})
         try:
             _atomic_write_json(_SPEECH_QUEUE, data)
         except Exception as e:

@@ -2287,9 +2287,22 @@ def _registry_names(acts) -> list:
     return []
 
 
+def _voice_only_hint(cfg: dict, name):
+    """The skill-declared hint when ``name`` is a VOICE-ONLY action (it acts
+    only on a fresh spoken / typed request, so the generic Actions list can
+    never run it - core/web_panels VOICE_ONLY_ACTIONS); None otherwise.
+    Never raises."""
+    try:
+        fn = getattr(_panel_registry(cfg), "voice_only", None)
+        return fn(name) if callable(fn) else None
+    except Exception:
+        return None
+
+
 def actions_payload(cfg: dict) -> dict:
-    """GET /api/actions: ``{"actions": [{name, spoken, confirm, why}], "count",
-    "source": "live"|"index", "confirm_rules": [...]}``. Never raises."""
+    """GET /api/actions: ``{"actions": [{name, spoken, confirm, why,
+    voice_only, use_instead}], "count", "source": "live"|"index",
+    "confirm_rules": [...]}``. Never raises."""
     rules = [{"patterns": list(p), "why": w} for p, w in _ACTION_CONFIRM_RULES]
     rt = _runtime(cfg)
     acts = None
@@ -2310,8 +2323,10 @@ def actions_payload(cfg: dict) -> dict:
                       "INFORMATIVE" if n in informative else
                       "SELF-VOICED" if n.lower() in selfv else "neither")
             why = action_confirm_reason(n)
+            vo = _voice_only_hint(cfg, n)
             rows.append({"name": n, "spoken": spoken, "confirm": bool(why),
-                         "why": why})
+                         "why": why, "voice_only": vo is not None,
+                         "use_instead": vo or ""})
         return {"actions": rows, "count": len(rows), "source": "live",
                 "confirm_rules": rules}
     out = _parse_action_index(cfg.get("action_index_path", ""))
@@ -2344,6 +2359,15 @@ def run_named_action(cfg: dict, name, arg="", *, confirm: bool = False) -> tuple
     fn = acts.get(name)
     if not callable(fn):
         return 404, {"error": "unknown action", "name": name}
+    # A voice-only action (2026-10-01) reads the owner's last spoken sentence
+    # as proof he asked, so run from here it can only refuse ("binding",
+    # "I need to hear you say ...") - and it marked that sentence as used.
+    # Refused BEFORE the handler is ever called, confirmed or not.
+    vo = _voice_only_hint(cfg, name)
+    if vo is not None:
+        return 409, {"error": "voice only - this action needs a fresh spoken "
+                              "or typed request" + (": use " + vo if vo else ""),
+                     "voice_only": True, "use_instead": vo, "name": name}
     why = action_confirm_reason(name)
     if why and not confirm:
         return 409, {"error": "confirmation required", "confirm_required": True,
@@ -4452,7 +4476,13 @@ function renderActions(filter) {
     const chip=document.createElement('span'); chip.className=speakChipClass(a.spoken);
     chip.textContent=a.spoken;
     row.appendChild(nm); row.appendChild(chip);
-    if (a.confirm) {
+    if (a.voice_only) {
+      // Acts only on a fresh spoken / typed request: Run could never work.
+      const v=document.createElement('span'); v.className='schip';
+      v.textContent='voice only';
+      v.title='Say or type it in the Live command box' + (a.use_instead ? ', or use ' + a.use_instead : '');
+      row.appendChild(v);
+    } else if (a.confirm) {
       const c=document.createElement('span'); c.className='schip confirm';
       c.textContent='asks first'; c.title='Confirm needed: ' + (a.why||''); row.appendChild(c);
     }
@@ -4461,7 +4491,9 @@ function renderActions(filter) {
     const send=document.createElement('button'); send.type='button';
     send.className='send' + (a.confirm ? ' danger' : ''); send.textContent='Run';
     send.setAttribute('aria-label', 'Run ' + a.name);
-    send.addEventListener('click', () => runAction(a, arg.value, send));
+    if (a.voice_only) { send.disabled = true; arg.disabled = true;
+      send.title = 'Voice only' + (a.use_instead ? ' - use ' + a.use_instead : ''); }
+    else send.addEventListener('click', () => runAction(a, arg.value, send));
     row.appendChild(arg); row.appendChild(send);
     frag.appendChild(row); shown++;
   }

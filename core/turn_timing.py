@@ -16,9 +16,10 @@ break for a spoken turn, the inject-queue drain for a typed/injected turn. A
 mark that never happened prints as ``-`` so the schema is fixed and greppable.
 
 An injected turn's offsets EXCLUDE its queue wait: the main loop drains the
-inject queue only at the top of an iteration, which can sit behind a
-record_speech(timeout=20) call, so a web-chat / say_to_jarvis command may wait
-up to ~20 s before its t0. Measure that wait from the queue file's own
+inject queue only at the top of an iteration. Since 2026-10-01 an idle
+record_speech yields to a newly queued command within ~0.25 s, so the wait is
+long only while an utterance is being captured (up to MAX_RECORDING_SECS in a
+noisy room) or a turn is running. Measure that wait from the queue file's own
 timestamp, not from this line.
 
 llm_done and the prompt/eval counters describe the first local-LLM response

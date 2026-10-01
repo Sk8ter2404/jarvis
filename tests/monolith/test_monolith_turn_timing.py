@@ -357,7 +357,7 @@ class TurnLineTests(_Base):
 
         self._p(bc, "_transcribe_capture", side_effect=transcribe)
 
-        def fake_record(timeout=None):
+        def fake_record(timeout=None, **_kw):
             bc._tt("note_vad_break")   # what record_speech does at the break
             return np.zeros(bc.SAMPLE_RATE, dtype=np.float32)
 
