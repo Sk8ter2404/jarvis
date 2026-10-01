@@ -28941,9 +28941,21 @@ def _note_jarvis_line(text: str) -> None:
 
 def _reply_prompt_pending() -> bool:
     """A confirmation, an autocorrect 'did you mean' or the shutdown yes/no
-    prompt is waiting for the owner's answer. Never raises."""
+    prompt is waiting for the owner's answer. Never raises.
+
+    A confirmation counts only while it is still answerable: within
+    CONFIRMATION_TTL_S, or of unknown age (a hand-built queue never lapses).
+    Its TTL is lazy - a lapsed prompt stays queued until the next utterance
+    reaches handle_confirmation_response - so counting it kept the noise
+    gate's "a prompt is waiting" reply exemption on for hours, and a
+    reply-shaped Whisper hallucination then got the lapse notice plus an LLM
+    turn (2026-10-01 merge audit)."""
     try:
-        return bool(_pending_confirmation or _pending_autocorrect_choice
+        confirm = False
+        if _pending_confirmation:
+            age = pending_confirmation_age()
+            confirm = age is None or age <= CONFIRMATION_TTL_S
+        return bool(confirm or _pending_autocorrect_choice
                     or _shutdown_prompt_pending.get("armed"))
     except Exception:
         return False

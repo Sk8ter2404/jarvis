@@ -142,6 +142,49 @@ class LiveIncidentTests(_Base):
         self.assertIn("[noise] ignored", log)
 
 
+class LapsedPromptTests(_Base):
+    """2026-10-01 merge audit: the confirmation TTL is lazy, so a lapsed
+    prompt stays in _pending_confirmation until the next utterance - and
+    _reply_prompt_pending kept counting it, holding the noise gate's "a
+    prompt is waiting for an answer" exemption open for hours."""
+
+    def _queue(self, age_s):
+        bc = self.bc
+        bc._queue_pending_confirmation("synthetic_risky_action", "x")
+        bc._pending_confirmation_at[0] = time.monotonic() - age_s
+
+    def test_only_an_answerable_confirmation_counts(self):
+        bc = self.bc
+        self.assertFalse(bc._reply_prompt_pending())
+        self._queue(5.0)
+        self.assertTrue(bc._reply_prompt_pending())
+        bc._pending_confirmation_at[0] = (time.monotonic()
+                                          - bc.CONFIRMATION_TTL_S - 1.0)
+        self.assertFalse(bc._reply_prompt_pending(), "a lapsed prompt counted")
+        # Unknown age (a hand-built queue, no stamp) still counts.
+        bc._pending_confirmation_at[0] = 0.0
+        self.assertTrue(bc._reply_prompt_pending())
+
+    def test_a_lapsed_prompt_does_not_keep_a_hallucination_as_a_reply(self):
+        bc = self.bc
+        self._queue(3 * 3600.0)                    # queued three hours ago
+        now = time.monotonic()
+        bc._last_owner_turn_at[0] = now - 60.0     # but he spoke a minute ago
+        answered, log = self._turn("Yeah.", at=now, peak=0.0090)
+        self.assertFalse(answered, "a reply-shaped hallucination was kept as "
+                                   "the answer to a prompt that had lapsed")
+        self.assertIn("[noise] ignored", log)
+
+    def test_a_fresh_prompt_still_keeps_the_reply(self):
+        bc = self.bc
+        self._queue(5.0)
+        now = time.monotonic()
+        bc._last_owner_turn_at[0] = now - 60.0
+        answered, log = self._turn("Yeah.", at=now, peak=0.0090)
+        self.assertTrue(answered)
+        self.assertNotIn("[noise]", log)
+
+
 class RealRepliesKeptTests(_Base):
     def test_thank_you_right_after_jarvis_answered_is_answered(self):
         # The owner's quiet desk mic: 1.2x the threshold is where his real
