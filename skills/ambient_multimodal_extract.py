@@ -418,16 +418,24 @@ def register(actions: dict) -> None:
     actions["ambient_extract_status"] = ambient_extract_status
     actions["ambient_extract_now"]    = ambient_extract_now
 
-    # Autostart the extractor when EITHER it's explicitly enabled OR any ambient
-    # CAPTURE source is enabled at boot. Capture (mic / system-audio / screen)
-    # with no extractor running means transcripts pile up in the jsonl logs but
-    # nothing is ever distilled into bobert_memory.json — i.e. "it captures but
-    # doesn't learn". So if the user has turned on any ambient capture, fold the
-    # extractor in automatically rather than requiring a separate toggle. The
-    # voice command "go ambient" starts the extractor directly (see
+    # Autostart the extractor when any ambient CAPTURE source is enabled at
+    # boot. Capture (mic / system-audio / screen) with no extractor running
+    # means transcripts pile up in the jsonl logs but nothing is ever distilled
+    # into bobert_memory.json — i.e. "it captures but doesn't learn". So if the
+    # user has turned on any ambient capture, fold the extractor in
+    # automatically rather than requiring a separate toggle. The voice command
+    # "go ambient" starts the extractor directly (see
     # core.actions._act_ambient_mode_set); this covers the boot-enabled path.
-    _autostart = (_get_config("AMBIENT_EXTRACT_ENABLED", False)
-                  or _get_config("AMBIENT_LISTEN_ENABLED", False)
+    #
+    # AMBIENT_EXTRACT_ENABLED alone no longer starts it (2026-10-01 merge
+    # audit). "Ambient mode off" saves AMBIENT_LISTEN_ENABLED=False and stops
+    # this extractor, but with AMBIENT_EXTRACT_ENABLED on it came straight back
+    # at the next restart and went on folding overheard speech into memory
+    # after the owner said to stand down. So it needs the mic source
+    # (AMBIENT_LISTEN_ENABLED) unless the system-audio or screen source was
+    # explicitly enabled - those have their own toggles, which "ambient mode
+    # off" does not touch.
+    _autostart = (_get_config("AMBIENT_LISTEN_ENABLED", False)
                   or _get_config("AMBIENT_AUDIO_ENABLED", False)
                   or _get_config("AMBIENT_SCREEN_ENABLED", False))
     if _autostart:

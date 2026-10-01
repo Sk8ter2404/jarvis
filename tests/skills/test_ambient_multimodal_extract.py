@@ -612,6 +612,38 @@ class AmbientExtractRegisterTests(unittest.TestCase):
         self.assertNotIn("t", _run(False))
         self.assertIn("t", _run(True))
 
+    def test_extract_enabled_alone_does_not_undo_an_ambient_off(self):
+        """2026-10-01 merge audit: with AMBIENT_EXTRACT_ENABLED on, "ambient
+        mode off" + a restart still autostarted the extractor. It now needs
+        the mic source, unless system audio or the screen was explicitly
+        enabled."""
+        import threading as _thr
+
+        def _run(**on):
+            mod, _ = load_skill_isolated("ambient_multimodal_extract",
+                                         register=False)
+            captured = {}
+
+            def _cfg(name, default):
+                return bool(on.get(name, False))
+
+            with mock.patch.object(_thr.Thread, "start",
+                                   lambda self: captured.__setitem__(
+                                       "t", self._target)), \
+                 mock.patch.object(mod, "_get_config", side_effect=_cfg):
+                mod.register({})
+            return "t" in captured
+
+        # After "ambient mode off": AMBIENT_LISTEN_ENABLED saved False.
+        self.assertFalse(_run(AMBIENT_EXTRACT_ENABLED=True))
+        # An explicitly enabled audio / screen source still feeds it.
+        self.assertTrue(_run(AMBIENT_EXTRACT_ENABLED=True,
+                             AMBIENT_AUDIO_ENABLED=True))
+        self.assertTrue(_run(AMBIENT_EXTRACT_ENABLED=True,
+                             AMBIENT_SCREEN_ENABLED=True))
+        self.assertTrue(_run(AMBIENT_EXTRACT_ENABLED=True,
+                             AMBIENT_LISTEN_ENABLED=True))
+
     def test_register_autostart_bg_swallows_exception(self):
         mod, _ = load_skill_isolated("ambient_multimodal_extract", register=False)
         actions = {}

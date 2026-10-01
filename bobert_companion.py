@@ -1179,9 +1179,14 @@ if WAKE_RESUME_MODE not in ("answer_then_quiet", "stay_talkative"):
 #                                         are charged at ~$0.0001 to keep
 #                                         the tracker active even when only
 #                                         the offline eye is being used.
-#   AMBIENT_EXTRACT_ENABLED             — autostart the fact-extraction loop
-#                                         that fuses mic + audio + screen
-#                                         streams into bobert_memory.json.
+#   AMBIENT_EXTRACT_ENABLED             — the fact-extraction loop that
+#                                         fuses mic + audio + screen streams
+#                                         into bobert_memory.json. It now
+#                                         autostarts only with a capture
+#                                         source on (AMBIENT_LISTEN / AUDIO /
+#                                         SCREEN_ENABLED), so an explicit
+#                                         "ambient mode off" survives a
+#                                         restart (2026-10-01).
 #   AMBIENT_EXTRACT_INTERVAL_S          — seconds between extraction passes.
 #   AMBIENT_EXTRACT_BATCH               — max log lines per extraction pass.
 AMBIENT_AUDIO_ENABLED                  = False
