@@ -108,12 +108,15 @@ file when running tests directly so they can't clobber the live
 
 ## Gotchas (the battle scars)
 
-- **Standby SILENTLY DROPS injected commands.** If JARVIS has dozed
-  (`[standby] ignored: '<your text>'` in the log), the inject is gone. The wake
-  WORD only comes from the mic, so it can't wake the inject path — you must
-  **force-wake via the tray channel**: write `[{"cmd":"force_wake"}]` to
-  `tray_commands.json` (the driver does this automatically and retries once).
-  It dozes on idle and on mis-hearing a sleep phrase, so re-wake per batch.
+- **Standby DROPS an injected command that lacks the wake word.** If JARVIS
+  has dozed, an inject like `what time is it` is gone (`[standby] ignored (N
+  chars)` in the log — the words are no longer logged). One led by the wake
+  word (`Jarvis, what time is it`) wakes him and runs as the turn (`[wake] the
+  wake carries a command — running it now`), and a bare `Jarvis` just greets.
+  To drive an un-prefixed command, **force-wake via the tray channel**: write
+  `[{"cmd":"force_wake"}]` to `tray_commands.json` (the driver does this
+  automatically and retries once, only when the log shows the drop). It dozes
+  on idle and on mis-hearing a sleep phrase, so re-wake per batch.
 - **The 32B local model BRICKS a 24GB GPU.** `qwen2.5:32b` (~22 GB) + on-demand
   vision (~7 GB) + whisper (~1.5 GB) blows past 24 GB → 50 s timeouts and "both
   local and cloud unavailable". A model-resolver preference chain prefers the
@@ -153,7 +156,7 @@ file when running tests directly so they can't clobber the live
 | Symptom | Fix |
 |---|---|
 | `driver.py --status` says False but a window is open | The log wasn't written in 15 s (deep sleep). `--wake`, or `--boot` to be sure. |
-| Inject does nothing, log shows `[standby] ignored` | Force-wake first: `driver.py --wake` (the driver auto-retries once). |
+| Inject does nothing, log shows `[standby] ignored (N chars)` | Force-wake first: `driver.py --wake` (the driver auto-retries once). |
 | "both local and cloud unavailable" / 50 s hangs | The 32B bricked the GPU. Boot with `JARVIS_LOCAL_LLM_MODEL=qwen2.5:14b-instruct-q5_K_M`. |
 | Generation fails but `ollama list` works | SAC blocked `ggml.dll` (event 3077). Restart Ollama; last resort SAC-off. |
 | `run_tests.py` errors on import (numpy/sounddevice) | That's the heavy tier. Use `tools/run_tests_ci_sim.py` (the light/CI tier). |

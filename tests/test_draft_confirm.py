@@ -245,6 +245,22 @@ class HappyPathTests(DraftConfirmTestBase):
             self.assertTrue(self._run("body", "x", companion=bc),
                             f"{word!r} should confirm")
 
+    def test_a_sentence_holding_a_confirm_word_does_not_send(self):
+        # 2026-10-01: a confirm word ANYWHERE used to send the draft (this
+        # gate runs from background threads, so the reply may be overheard).
+        for heard in ("yeah i saw it", "okay what's the weather",
+                      "i'd send it to the whole team instead"):
+            with self.subTest(heard=heard):
+                bc = _fake_companion(heard=heard)
+                self.assertFalse(self._run("body", "x", companion=bc))
+
+    def test_the_capture_is_marked_background(self):
+        # 2026-10-01 review: a nudge's capture must not cut off an utterance
+        # the owner is in the middle of (record_speech(background=True)).
+        bc = _fake_companion(heard="yes")
+        self.assertTrue(self._run("body", "x", companion=bc))
+        self.assertTrue(bc.record_speech.call_args.kwargs.get("background"))
+
     def test_cancel_takes_priority_over_confirm(self):
         # If both a cancel and a confirm word appear, cancel must win (the
         # check order in draft_confirm puts cancel first).

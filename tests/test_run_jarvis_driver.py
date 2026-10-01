@@ -200,6 +200,58 @@ class DriverReplyCaptureTests(unittest.TestCase):
         self.assertIn("It is 3:21 PM, sir.", res["lines"][-1])
         self.assertLess(clock[0] - 1000.0, 20.0)   # nowhere near the 75 s timeout
 
+    def _replay(self, script, text, timeout=30.0):
+        """wait_for_reply over a scripted log: (fake seconds, line) pairs."""
+        tmp = tempfile.mkdtemp(prefix="drv_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log = os.path.join(tmp, "session_x.log")
+        open(log, "w", encoding="utf-8").close()
+        clock = [1000.0]
+
+        def fake_sleep(s):
+            before = clock[0] - 1000.0
+            clock[0] += s
+            now = clock[0] - 1000.0
+            with open(log, "a", encoding="utf-8") as f:
+                for t, line in script:
+                    if before < t <= now:
+                        f.write(line + "\n")
+
+        with mock.patch.object(self.d, "latest_log", return_value=log), \
+                mock.patch.object(self.d.time, "sleep", fake_sleep), \
+                mock.patch.object(self.d.time, "time", lambda: clock[0]):
+            return self.d.wait_for_reply(text, timeout=timeout)
+
+    def test_a_wake_led_standby_inject_runs_and_is_not_retried(self):
+        # 2026-10-01: standby now RUNS a wake-led command. Reading every
+        # "(standby)" inject as dropped force-woke and re-injected it, so the
+        # command ran twice.
+        res = self._replay([
+            (0.5, "[09:00:01]   [inject] (standby) Jarvis, what time is it"),
+            (0.5, "[09:00:01]   [wake] Waking up"),
+            (0.5, "[09:00:01]   [wake] the wake carries a command \u2014 running it now"),
+            (3.0, "[09:00:04]   JARVIS: It is nine o'clock, sir."),
+        ], "Jarvis, what time is it")
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("nine o'clock", res["lines"][-1])
+
+    def test_a_bare_wake_inject_returns_the_greeting(self):
+        res = self._replay([
+            (0.5, "[09:00:01]   [inject] (standby) Jarvis"),
+            (0.5, "[09:00:01]   [wake] Waking up"),
+            (0.5, "[09:00:01]   [wake] greeting='Yes, sir?' vol=1.0"),
+        ], "Jarvis")
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("Yes, sir?", res["lines"][-1])
+
+    def test_an_unprefixed_standby_inject_is_reported_dropped(self):
+        # The drop line carries the length only now, never the words.
+        res = self._replay([
+            (0.5, "[09:00:01]   [inject] (standby) what time is it"),
+            (0.5, "[09:00:01]   [standby] ignored (15 chars)"),
+        ], "what time is it")
+        self.assertEqual(res["status"], "standby_ignored")
+
     def test_wait_for_reply_keeps_the_spoken_fallback_line(self):
         # v2.0.136 logs "JARVIS (spoken): ..." when a fallback replaced the
         # model's reply; a sweep that only saw the "JARVIS:" line judged the

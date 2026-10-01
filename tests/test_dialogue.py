@@ -854,6 +854,24 @@ class DeviceAfterDeviceStopTests(unittest.TestCase):
         self.assertEqual(out.reason, "done")
         self.assertLess(time.monotonic() - t0, 2.0)
 
+    def test_a_silent_capture_is_not_waited_on(self):
+        # 2026-10-01 review: the worker transcribes the whole capture, so
+        # every chunk 2 waited for a full Whisper pass (up to verdict_wait_s)
+        # even when nobody spoke. A capture with no voice cannot hold a stop.
+        cap = FakeCap(beat_voiced=False, delay=60.0)
+        cap.voiced = False
+        rig = Rig(cap=cap)
+        lines = [dlg.Line("device", "One. Two.", ("One.", "Two."))]
+        t0 = time.monotonic()
+        out = rig.runner(verdict_wait_s=1.5).run(
+            "Opening line.", _ready(lines), lambda: [],
+            script_deadline=time.monotonic() + 2.0)
+        self.assertEqual(out.reason, "done")
+        self.assertEqual([e[1] for e in rig.log if e[0] == "say"],
+                         ["One.", "Two."])
+        self.assertLess(time.monotonic() - t0, 1.0,
+                        "chunk two waited on a silent capture's verdict")
+
     def test_the_wait_is_bounded(self):
         # A verdict that never lands costs at most verdict_wait_s.
         rig = Rig(cap=FakeCap(beat_voiced=False, delay=60.0))
@@ -869,6 +887,11 @@ class DeviceAfterDeviceStopTests(unittest.TestCase):
 
 
 class ListenCaptureTests(unittest.TestCase):
+    def test_voiced_defaults_to_true(self):
+        # Unknown = assume voiced: the Runner then waits (the safe side).
+        self.assertTrue(dlg.ListenCapture().voiced)
+        self.assertFalse(dlg.ListenCapture(voiced=False).voiced)
+
     def test_pending_then_result(self):
         cap = dlg.ListenCapture(available=True, beat_voiced=True)
         self.assertEqual(cap.result(0), ("pending", ""))

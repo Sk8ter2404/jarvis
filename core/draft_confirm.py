@@ -57,19 +57,23 @@ from core.atomic_io import _atomic_write_json  # noqa: E402
 # of the rule: the refusal falls back to the generic wording.
 try:                                                       # noqa: E402
     from core.draft_preview_gate import (MUTED_REASON, UNVOICED_REASON,
-                                         publish_held_send, tts_is_muted)
+                                         _is_confirm, publish_held_send,
+                                         tts_is_muted)
 except Exception as _e:  # pragma: no cover - sibling core module is in-tree
     MUTED_REASON = 'tray "Mute TTS" is on'
     UNVOICED_REASON = "the speech path did not voice it"
     tts_is_muted = lambda: False            # noqa: E731 - no local mute rule
     publish_held_send = lambda *a, **k: None  # noqa: E731
+    _is_confirm = lambda heard: False       # noqa: E731 - fail CLOSED
     logging.getLogger(__name__).warning(
         "[draft_confirm] core.draft_preview_gate unavailable (%s) — a held "
         "send will still be refused, but the cause cannot be named", _e)
 
-# Words that count as "yes, send it". Whole-word match,
-# case-insensitive. Kept aligned with core.draft_preview_gate so the user
-# only learns one vocabulary.
+# Words that count as "yes, send it". Kept aligned with
+# core.draft_preview_gate so the user only learns one vocabulary. A reply
+# confirms only when that gate's _is_confirm (core/yes_no.classify_reply)
+# hears a clear, SHORT yes — imported, not mirrored (2026-10-01: a confirm
+# word ANYWHERE used to send, so "Yeah, I saw it" pushed the draft).
 _CONFIRM_KEYWORDS: tuple[str, ...] = (
     "yes", "yeah", "yep", "yup",
     "confirm", "confirmed",
@@ -206,7 +210,12 @@ def _capture_and_transcribe(timeout_s: float) -> str | None:
     if not callable(record) or not callable(transcribe):
         return None
     try:
-        audio = record(timeout=timeout_s)
+        # background=True (2026-10-01 review): this gate runs on a Teams-nudge
+        # / phone-bridge thread with no owner turn behind it, so its capture
+        # lets an utterance the main loop is recording finish instead of
+        # cutting the owner off mid-sentence (bobert_companion
+        # _record_speech_offthread).
+        audio = record(timeout=timeout_s, background=True)
     except Exception as e:
         _log.warning("[draft_confirm] record_speech failed: %s", e)
         return None
@@ -305,7 +314,7 @@ def draft_confirm(text: str, recipient: str = "") -> bool:
                 return False
             if _matches_any(heard, _CANCEL_KEYWORDS):
                 return False
-            if _matches_any(heard, _CONFIRM_KEYWORDS):
+            if _is_confirm(heard):
                 return True
             # Heard something that wasn't yes-shaped or no-shaped.
             # Ambiguous → fail closed.

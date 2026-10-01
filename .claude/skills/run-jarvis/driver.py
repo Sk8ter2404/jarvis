@@ -29,6 +29,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -187,6 +188,10 @@ def inject(text: str) -> None:
     _write_atomic(INJECT, json.dumps(items, indent=2))
 
 
+# The standby / sleep loop's "dropped this line" log lines: "[standby] ignored
+# (N chars)" and the music-refused "[standby] wake-word ignored (...)".
+_STANDBY_DROP_RE = re.compile(r"\[(?:standby|sleeping)\] (?:wake-word )?ignored")
+
 QUIET_S = 3.0          # a plain reply is complete after this much log silence
 ACTION_QUIET_S = 6.0   # after an [action] line: the informative follow-up round
                        # prints "Reading results" up to ~4 s later (seen live)
@@ -220,6 +225,14 @@ def wait_for_reply(text: str, timeout: float = 75.0) -> dict:
     pos = os.path.getsize(lg)
     snippet = text[:30].lower()
     saw_inject = False
+    # A standby inject is no longer always dropped (2026-10-01): one led by
+    # the wake word ("Jarvis, what time is it") wakes JARVIS and runs as the
+    # turn ("[wake] the wake carries a command"), a bare "Jarvis" greets, and
+    # only one WITHOUT the wake word is dropped ("[standby] ignored (N
+    # chars)" - the words are no longer logged). Reading every "(standby)"
+    # inject as dropped force-woke and re-injected a command that was already
+    # running, so it ran twice.
+    standby_inject = False
     lines: list[str] = []
     pending_followup = False
     last_new = time.time()
@@ -238,12 +251,23 @@ def wait_for_reply(text: str, timeout: float = 75.0) -> dict:
             if "[inject]" in low and snippet in low:
                 saw_inject = True
                 last_new = time.time()
-                if "(standby)" in low:
-                    # standby will drop it — caller should --wake and retry.
-                    return {"status": "standby_ignored", "lines": []}
+                standby_inject = "(standby)" in low
                 continue
             if not saw_inject:
                 continue
+            if standby_inject:
+                if _STANDBY_DROP_RE.search(low):
+                    # standby dropped it — caller should --wake and retry.
+                    return {"status": "standby_ignored", "lines": []}
+                if "[wake] the wake carries a command" in low:
+                    standby_inject = False      # the turn runs: collect it
+                    last_new = time.time()
+                    continue
+                if "[wake] greeting=" in low:
+                    # A bare wake: the greeting IS the reply.
+                    lines.append(line.rstrip())
+                    last_new = time.time()
+                    continue
             if "reading results" in low:
                 pending_followup = True
                 last_new = time.time()

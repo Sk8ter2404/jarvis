@@ -513,6 +513,24 @@ class ListenForStopTests(_ListenBase):
         self.assertTrue(cap.beat_voiced)
         self.assertEqual(cap.result(2.0), ("", ""))
 
+    def test_the_capture_reports_whether_it_held_voice(self):
+        # 2026-10-01 review: the Runner skips its verdict wait for a capture
+        # with no voice in it, so _listen_for_stop must say which it was.
+        self._p(self.bc, "transcribe", return_value=("", {}))
+        self.assertTrue(self.listen().voiced)
+
+        class _Silent(_FakeStream):
+            def start(self):
+                import numpy as np
+                for _ in range(8):
+                    self.callback(np.zeros((1024, 1), dtype=np.float32),
+                                  1024, None, None)
+        self.stream_cls.side_effect = _Silent
+        cap = self.listen()
+        self.assertTrue(cap.available)
+        self.assertFalse(cap.voiced)
+        cap.result(2.0)
+
     def test_own_stream_yields_when_playback_starts_elsewhere(self):
         """Another thread starts playing mid-capture (a timer, say): the
         stop-listen closes its own stream at once instead of staying open

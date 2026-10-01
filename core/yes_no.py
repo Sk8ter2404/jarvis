@@ -16,7 +16,12 @@ drifted (2026-10-01 bug-hunt):
   * none of them dropped the wake word, so in wake-word mode — where every
     spoken reply MUST start with "Jarvis" — "Jarvis, yes." was never a yes.
 
-``normalize`` and ``classify_reply`` are the single rule they now share.
+``normalize`` and ``classify_reply`` are the single rule they now share — and
+(2026-10-01 review) so do the older copies: the outbound draft gates
+(core/draft_preview_gate.py, core/draft_confirm.py), which sent a draft on a
+confirm word ANYWHERE in the reply ("Yeah, I saw it"), and the printer setup
+wizard (skills/bambu_setup.py), whose raw startswith took "Yesterday..." /
+"Right, so..." as a yes. Their own words ride on ``extra_yes`` / ``extra_no``.
 
 classify_reply(text) -> "yes" | "no" | "other":
 
@@ -24,13 +29,20 @@ classify_reply(text) -> "yes" | "no" | "other":
               or opens like a yes but carries a hedge ("Do it later", "Go ahead
               and cancel it", "Yes, but wait"). A hedged yes is never a yes: the
               thing being confirmed can be destructive.
-  * "yes"   — a clear yes: a strong yes word first ("Yes, and turn the lights
-              off" is still a yes), or a soft one ("Okay", "Sure") with nothing
-              but filler or another yes after it ("Okay, what's the weather?"
-              is NOT a yes — "okay" there is a discourse marker), or "go ahead"
-              / "do it" / "of course".
-  * "other" — anything else ("Yesterday we...", "Confirmation number 5", a
-              fresh command). Never a yes.
+  * "yes"   — a SHORT clear yes. After a strong yes word ("yes", "yeah",
+              "absolutely") or a strong lead ("go ahead", "do it") only filler,
+              another yes / yes lead, or at most ONE other word may follow
+              ("Yes, delete it", "Yes I am"). After a soft one ("Okay",
+              "Sure") or a sentence-opener lead ("I am", "Please do") nothing
+              but filler or another yes may follow ("Okay, what's the
+              weather?" is NOT a yes — "okay" there is a discourse marker).
+  * "other" — anything else: "Yesterday we...", "Confirmation number 5", a
+              fresh command, and a sentence that merely STARTS with a yes word
+              ("Yeah, I saw that movie last week.", "Yeah, I saw it.",
+              "Absolutely, the game was great.") — 2026-10-01 review: the first cut let any hedge-free
+              sentence after a strong yes word through, so the commonest way
+              people start a sentence confirmed a queued delete. Never a yes;
+              every caller treats it as "cancel / not an answer".
 
 Words match WHOLE: "yesterday" is not "yes", "confirmation" is not "confirm".
 
@@ -40,7 +52,8 @@ from __future__ import annotations
 
 import re
 
-# Clear yes words: the answer stands whatever follows ("Yes, and also ...").
+# Clear yes words: up to _MAX_OTHER_WORDS other words may follow ("Yes,
+# delete it"); a longer sentence is "other" (see classify_reply).
 STRONG_YES = frozenset({
     "yes", "yeah", "yep", "yup", "yea", "ya",
     "confirm", "confirmed", "proceed", "affirmative",
@@ -50,8 +63,24 @@ STRONG_YES = frozenset({
 # so they count only when nothing but filler or another yes follows.
 SOFT_YES = frozenset({"ok", "okay", "sure", "alright", "fine"})
 YES_WORDS = STRONG_YES | SOFT_YES
-# Two-word yes openers.
-YES_LEADS = (("go", "ahead"), ("do", "it"), ("of", "course"))
+# Multi-word yes openers, held to the strong rule ("go ahead and send it").
+STRONG_LEADS = (("go", "ahead"), ("do", "it"), ("of", "course"))
+# ...and to the soft rule: these also open ordinary sentences ("I am going
+# out", "Please do the dishes"), so only filler may follow. "I'm sure." /
+# "I am." answer the pushback "Are you certain?" (2026-10-01).
+SOFT_LEADS = (("go", "for", "it"), ("please", "do"), ("i", "am", "sure"),
+              ("i", "am", "certain"), ("im", "sure"), ("im", "certain"),
+              ("i", "am"), ("sounds", "good"))
+YES_LEADS = STRONG_LEADS + SOFT_LEADS
+# The most "other" words a strong yes / strong lead may carry and still be a
+# yes: "Yes, delete it" passes ("Yes I am" / "Yes, send it" are a yes plus a
+# yes lead); "Yeah, I saw it" and "Yeah, I saw that movie last week" do not
+# (2026-10-01 review).
+_MAX_OTHER_WORDS = 1
+# Openers that look like a yes and are not: sarcasm ("Yeah, right"), a
+# filler ("Ya know..."), "Correct me if I'm wrong...". Always "other".
+_NOT_YES_OPENERS = (("yeah", "right"), ("yea", "right"), ("ya", "right"),
+                    ("yep", "right"), ("ya", "know"), ("correct", "me"))
 
 # Words that open a refusal. ("dont" is "don't" after normalize.)
 NO_WORDS = frozenset({
@@ -68,11 +97,12 @@ HEDGES = NO_WORDS | frozenset({
 # so "Sure, why not." / "Yes, no problem." stay a yes.
 _IDIOMS = (("why", "not"), ("no", "problem"), ("not", "a", "problem"),
            ("no", "worries"))
-# Allowed after a soft yes word or a yes lead without changing the answer.
+# Allowed after any yes word or yes lead without changing the answer.
 FILLER = frozenset({
     "sir", "please", "jarvis", "now", "then", "thanks", "thank", "you",
     "thing", "so", "well", "oh", "um", "uh", "and", "lets", "go", "do",
-    "it", "that", "right", "away", "ahead", "course", "of",
+    "it", "that", "right", "away", "ahead", "course", "of", "for",
+    "certain",
 })
 
 # Leading wake word: "jarvis", "hey jarvis", "ok jarvis", "okay jarvis".
@@ -118,32 +148,84 @@ def _drop_idioms(words: list) -> list:
     return out
 
 
-def classify_reply(text) -> str:
+def hedge_words(words) -> list:
+    """The hedge words (HEDGES) in ``words`` — a list of normalized words —
+    with the affirmative idioms ("why not", "no problem") dropped first. The
+    shutdown prompt uses it on the words after its "no" (2026-10-01): "No,
+    wait." is a cancel there, not a power-off. Never raises."""
+    try:
+        return [w for w in _drop_idioms(list(words or ())) if w in HEDGES]
+    except Exception:
+        return []
+
+
+def _match_lead(words: list, leads) -> int:
+    """Length of the longest lead in ``leads`` that ``words`` opens with, or
+    0."""
+    best = 0
+    for lead in leads:
+        n = len(lead)
+        if n > best and tuple(words[:n]) == tuple(lead):
+            best = n
+    return best
+
+
+def _other_words(rest: list, leads) -> int:
+    """How many words of ``rest`` are not filler, a yes word or part of a
+    yes lead ("Okay, go ahead" -> 0, "Yes, delete it" -> 1)."""
+    n_other = 0
+    i = 0
+    while i < len(rest):
+        n = _match_lead(rest[i:], leads)
+        if n:
+            i += n
+            continue
+        if rest[i] not in FILLER and rest[i] not in YES_WORDS:
+            n_other += 1
+        i += 1
+    return n_other
+
+
+def classify_reply(text, extra_yes=(), extra_no=()) -> str:
     """'yes' | 'no' | 'other' for a reply to a yes/no question (see the
     module docstring). Never raises: any error is 'other', which no caller
-    ever treats as a yes."""
+    ever treats as a yes.
+
+    ``extra_yes``: a caller's own yes leads as word tuples (the draft gate's
+    ("send",) / ("ship", "it"), the printer wizard's ("thats", "right")),
+    held to the SOFT rule — only filler may follow. ``extra_no``: a caller's
+    own refusal words ("wrong", "scrap"), counted like NO_WORDS at the
+    start of the reply."""
     try:
         words = normalize(text).split()
+        # A polite lead-in: "Please, go ahead." -> "go ahead" (but "Please
+        # do." is itself a yes, and "Please." alone stays "other").
+        if (len(words) > 1 and words[0] == "please"
+                and tuple(words[:2]) != ("please", "do")):
+            words = words[1:]
         if not words:
             return "other"
-        if words[0] in NO_WORDS:
+        extra_no = frozenset(extra_no or ())
+        if words[0] in NO_WORDS or words[0] in extra_no:
             return "no"
-        lead = None
-        if words[0] in YES_WORDS:
-            lead = 1
+        extra_yes = tuple(tuple(x) for x in (extra_yes or ()))
+        soft_leads = SOFT_LEADS + extra_yes
+        all_leads = STRONG_LEADS + soft_leads
+        lead = _match_lead(words, all_leads)
+        if lead:
+            soft = _match_lead(words, soft_leads) == lead
+        elif words[0] in YES_WORDS:
+            lead, soft = 1, words[0] in SOFT_YES
         else:
-            for pair in YES_LEADS:
-                if tuple(words[:2]) == pair:
-                    lead = 2
-                    break
-        if lead is None:
             return "other"
-        if any(w in HEDGES for w in _drop_idioms(words[lead:])):
+        rest = _drop_idioms(words[lead:])
+        if any(w in HEDGES or w in extra_no for w in rest):
             return "no"
-        if words[0] in SOFT_YES:
-            rest = _drop_idioms(words[lead:])
-            if any(w not in FILLER and w not in YES_WORDS for w in rest):
-                return "other"
+        if any(tuple(words[:len(o)]) == o for o in _NOT_YES_OPENERS):
+            return "other"
+        n_other = _other_words(rest, all_leads)
+        if n_other > (0 if soft else _MAX_OTHER_WORDS):
+            return "other"
         return "yes"
     except Exception:
         return "other"

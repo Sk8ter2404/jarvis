@@ -204,6 +204,24 @@ class ConfirmTests(_GateHarness):
         fn.assert_not_called()
         self.assertIn("Holding the draft", result)
 
+    def test_a_sentence_holding_a_confirm_word_does_not_send(self):
+        # 2026-10-01: a confirm word ANYWHERE used to clear the gate, so an
+        # overheard line sent the draft. Now only a clear, short yes does
+        # (core/yes_no.classify_reply).
+        for heard in ("yeah i saw it", "okay what's the weather",
+                      "i'd send it to the whole team instead",
+                      "yesterday we talked about it"):
+            with self.subTest(heard=heard):
+                result, fn, _ = self._run(pending=self.PENDING, heard=heard)
+                fn.assert_not_called()
+                self.assertIn("Holding the draft", result)
+
+    def test_a_wake_led_or_casual_yes_sends(self):
+        for heard in ("jarvis, yes.", "sure, send it", "please do"):
+            with self.subTest(heard=heard):
+                result, fn, _ = self._run(pending=self.PENDING, heard=heard)
+                fn.assert_called_once_with("x")
+
 
 class GetPendingRoutingTests(unittest.TestCase):
     """_get_pending routes vip_* actions to skills.vip_intercept and

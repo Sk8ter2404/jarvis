@@ -156,6 +156,22 @@ class BambuSetupParseTests(unittest.TestCase):
         self.assertFalse(self.mod._negative("yes"))
         self.assertFalse(self.mod._negative(""))
 
+    def test_lookalikes_never_confirm(self):
+        # 2026-10-01: the raw startswith confirmed a misheard IP / LAN access
+        # code on each of these (core/yes_no.py is the one rule now).
+        for w in ("Yesterday I changed it", "Right, so what's next?",
+                  "Yeah, I saw that movie last week", "Sure, but wait",
+                  "Correct me if I'm wrong"):
+            with self.subTest(text=w):
+                self.assertFalse(self.mod._affirmative(w))
+
+    def test_a_wake_led_or_casual_yes_confirms(self):
+        for w in ("Jarvis, yes.", "Right.", "That's right.", "Yep, correct",
+                  "Okay."):
+            with self.subTest(text=w):
+                self.assertTrue(self.mod._affirmative(w))
+        self.assertFalse(self.mod._negative("Nobody knows"))
+
     # ── small formatters ─────────────────────────────────────────────────
     def test_format_digits_for_speech(self):
         self.assertEqual(self.mod._format_digits_for_speech("12345678"),

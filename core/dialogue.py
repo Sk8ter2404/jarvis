@@ -124,15 +124,20 @@ class ListenCapture:
 
     ``available`` is False when no capture ran (mic busy, muted, disabled).
     ``beat_voiced`` is True when the short beat after the device finished
-    held voice energy (the owner may be talking). ``result(timeout)`` returns
+    held voice energy (the owner may be talking). ``voiced`` is True when the
+    WHOLE capture did (2026-10-01): a silent capture's verdict cannot be a
+    stop, so the next device line need not wait for it (Runner._device_line);
+    unknown = True (wait). ``result(timeout)`` returns
     ("pending"|"stop"|"wake"|"speech"|"", text) — text only for "speech";
     "pending" while the transcription is still running."""
 
-    __slots__ = ("available", "beat_voiced", "_evt", "_res")
+    __slots__ = ("available", "beat_voiced", "voiced", "_evt", "_res")
 
-    def __init__(self, available: bool = True, beat_voiced: bool = False):
+    def __init__(self, available: bool = True, beat_voiced: bool = False,
+                 voiced: bool = True):
         self.available = bool(available)
         self.beat_voiced = bool(beat_voiced)
+        self.voiced = bool(voiced)
         self._evt = threading.Event()
         self._res = ("", "")
         if not self.available:
@@ -591,9 +596,13 @@ class Runner:
             # device said a whole line after he said stop. Let that verdict
             # land (bounded) before saying anything more. A verdict that has
             # landed returns at once; a JARVIS line in between clears it
-            # (run()).
+            # (run()). A capture that held no voice at all is not waited on
+            # (2026-10-01 review): its verdict cannot be a stop, and waiting
+            # for its full transcription put a pause of up to verdict_wait_s
+            # in the middle of every long device line.
             prev, self._last_cap = self._last_cap, None
-            if prev is not None and getattr(prev, "available", False):
+            if (prev is not None and getattr(prev, "available", False)
+                    and getattr(prev, "voiced", True)):
                 try:
                     prev.result(self.verdict_wait_s)
                 except Exception:

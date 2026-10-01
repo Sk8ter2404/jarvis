@@ -48,6 +48,8 @@ import sys
 import threading
 import time
 
+from core import yes_no as _yes_no
+
 # Bambu's discovery multicast — matches the SSDP convention but on the
 # non-standard port 2021 to avoid colliding with Windows' UPnP service.
 BAMBU_MCAST_GROUP = "239.255.255.250"
@@ -110,25 +112,29 @@ def _listen(timeout: float = VOICE_PROMPT_TIMEOUT) -> str:
         return ""
 
 
+# This wizard's own words on top of core/yes_no's shared vocabulary: "Is
+# that correct?" is answered "Right." / "That's right." / "Wrong.".
+_EXTRA_YES = (("right",), ("thats", "right"), ("thats", "correct"))
+_EXTRA_NO = ("wrong", "incorrect")
+
+
 def _affirmative(text: str) -> bool:
-    """True when the user clearly said yes / correct / confirmed."""
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-    return any(t.startswith(w) for w in (
-        "yes", "yeah", "yep", "yup", "correct", "confirm", "right",
-        "that's right", "that's correct", "affirmative", "sure", "go ahead",
-    ))
+    """True when the user clearly said yes / correct / confirmed.
+
+    The shared classifier (core/yes_no.py, 2026-10-01): this was a raw
+    startswith on yes / right / sure..., so "Yesterday..." and "Right, so
+    what's next" confirmed a misheard IP or LAN access code, and a wake-led
+    "Jarvis, yes." (the only spoken form wake-word mode lets through) did
+    not."""
+    return _yes_no.classify_reply(text, extra_yes=_EXTRA_YES,
+                                  extra_no=_EXTRA_NO) == "yes"
 
 
 def _negative(text: str) -> bool:
-    """True when the user clearly said no / wrong."""
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-    return any(t.startswith(w) for w in (
-        "no", "nope", "wrong", "incorrect", "negative", "cancel", "stop",
-    ))
+    """True when the user clearly said no / wrong (core/yes_no.py: a hedged
+    yes - "yes, but wait" - is a no too; "Nobody..." no longer is)."""
+    return _yes_no.classify_reply(text, extra_yes=_EXTRA_YES,
+                                  extra_no=_EXTRA_NO) == "no"
 
 
 # ── discovery ────────────────────────────────────────────────────────────

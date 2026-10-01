@@ -54,7 +54,34 @@ class ClassifyReplyTests(unittest.TestCase):
                    "Proceed.", "Confirm", "Confirmed.", "Absolutely.",
                    "Yes, please.", "Sure thing.", "Okay, go ahead.",
                    "Sure, why not.", "Yes, no problem", "of course",
-                   "yes and turn off the lights"), "yes")
+                   "Yes, delete it", "Yes I am", "Yes, I'm sure",
+                   "Please, go ahead.", "Yes, that's right",
+                   "Yes, go ahead and do it now"), "yes")
+
+    def test_more_natural_yes_replies(self):
+        # 2026-10-01 review: these were "other" (cancel + route on) - a
+        # second, safe-but-annoying version of the cancel B001 reported.
+        # "I'm sure." / "I am." answer the pushback "Are you certain?".
+        self._all(("Please do.", "Go for it.", "I'm sure.", "I am.",
+                   "I am certain", "Jarvis, I am sure.", "Okay, go for it",
+                   "Sounds good."), "yes")
+
+    def test_a_sentence_that_starts_with_a_yes_word_is_not_a_yes(self):
+        # 2026-10-01 review, probed through the real confirmation gate: on
+        # the first cut a strong yes word followed by ANY hedge-free sentence
+        # was a yes, so each of these RAN a queued delete / purchase /
+        # dangerous shell command (the base code declined them all).
+        self._all(("Yeah, I saw that movie last week.",
+                   "Yep, that is what she said.",
+                   "Absolutely, the game was great.",
+                   "Ya know what I mean?",
+                   "Correct me if I am wrong, the file is big",
+                   "Yeah right",
+                   "Yeah, actually delete the other one",
+                   "Yeah, I saw it", "Yeah, I know",
+                   "yes and turn off the lights",
+                   "I am going to bed", "I am hungry",
+                   "Please do the dishes", "Please."), "other")
 
     def test_lookalikes_are_never_yes(self):
         # A raw startswith confirmed a delete / purchase on each of these.
@@ -77,6 +104,43 @@ class ClassifyReplyTests(unittest.TestCase):
     def test_unrelated(self):
         self._all(("what time is it", "turn on the lights", "", None,
                    "Jarvis.", "I don't know"), "other")
+
+
+class CallerVocabularyTests(unittest.TestCase):
+    """extra_yes / extra_no: the draft gates' "send it" and the printer
+    wizard's "that's right" / "wrong" ride on the same rule (2026-10-01)."""
+
+    SEND = (("send",), ("ship", "it"))
+
+    def test_extra_yes_leads_follow_the_soft_rule(self):
+        for text in ("Send it.", "Okay, send it", "Yes, ship it", "send"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    yes_no.classify_reply(text, extra_yes=self.SEND), "yes")
+        for text in ("Send it to the whole team instead of him",
+                     "Yeah, I saw it", "send it later"):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    yes_no.classify_reply(text, extra_yes=self.SEND), "yes")
+
+    def test_extra_no_words_refuse(self):
+        self.assertEqual(yes_no.classify_reply("Wrong.", extra_no=("wrong",)),
+                         "no")
+        self.assertEqual(yes_no.classify_reply("Wrong."), "other")
+
+    def test_without_extras_a_caller_word_is_not_a_yes(self):
+        self.assertEqual(yes_no.classify_reply("Send it."), "other")
+
+
+class HedgeWordsTests(unittest.TestCase):
+    def test_hedges_found_idioms_skipped(self):
+        # The shutdown prompt reads the words after its "no" with this.
+        self.assertEqual(yes_no.hedge_words(["wait"]), ["wait"])
+        self.assertEqual(yes_no.hedge_words("cancel that".split()),
+                         ["cancel"])
+        self.assertEqual(yes_no.hedge_words(["thanks"]), [])
+        self.assertEqual(yes_no.hedge_words("no problem".split()), [])
+        self.assertEqual(yes_no.hedge_words(None), [])
 
 
 class SharedWordListTests(unittest.TestCase):

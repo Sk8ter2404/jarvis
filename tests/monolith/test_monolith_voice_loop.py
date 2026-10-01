@@ -31,6 +31,7 @@ import inspect
 import io
 import json
 import os
+import queue
 import shutil
 import sys
 import tempfile
@@ -181,8 +182,11 @@ class ConfirmationGateTests(_Base):
         return out
 
     def test_natural_yes_replies_confirm(self):
+        # "Please do." / "Go for it." / "I'm sure." (to the pushback "Are you
+        # certain?") were "other" - cancelled - until the 2026-10-01 review.
         for text in ("Yeah.", "Sure", "okay", "Yep, do it", "Jarvis, yes.",
-                     "Yes."):
+                     "Yes.", "Please do.", "Go for it.", "I'm sure.",
+                     "I am.", "Yes, delete it"):
             with self.subTest(text=text):
                 self.assertTrue(self._answer(text))
                 self.assertEqual(self.ran, ["X"], "a plain yes was cancelled")
@@ -190,9 +194,18 @@ class ConfirmationGateTests(_Base):
                 self.assertEqual(self.bc._pending_confirmation, [])
 
     def test_lookalikes_never_run_the_action(self):
+        # The second row (2026-10-01 review): a sentence that merely STARTS
+        # with a strong yes word ran the queued action on the first cut of
+        # the shared classifier; the base code declined every one of them.
         for text in ("Yesterday we went to the store", "do it later",
                      "Go ahead and cancel it", "Confirmation number 5",
-                     "Yes, but wait"):
+                     "Yes, but wait",
+                     "Yeah, I saw that movie last week.",
+                     "Yep, that is what she said.",
+                     "Absolutely, the game was great.",
+                     "Ya know what I mean?",
+                     "Correct me if I am wrong, the file is big",
+                     "Yeah right", "Yeah, actually delete the other one"):
             with self.subTest(text=text):
                 self._answer(text)
                 self.assertEqual(self.ran, [], "a look-alike confirmed it")
@@ -272,6 +285,29 @@ class ShutdownPromptReplyTests(_Base):
         self.overnight.assert_not_called()
         self.shutdown.assert_not_called()
         self.assertIn("Shutdown cancelled.", self.spoken)
+
+    def test_a_hedged_no_cancels_instead_of_shutting_down(self):
+        # 2026-10-01 review: once the punctuation was dropped these read as
+        # "no wait" etc., matched the NO branch's "no " prefix and powered
+        # JARVIS off; the base code said "Shutdown cancelled." to each.
+        for text in ("No, wait.", "No, cancel that.", "Nope, hold on.",
+                     "No, never mind.", "No, don't.", "Jarvis, no, stop."):
+            with self.subTest(text=text):
+                self.assertFalse(self._reply(text))
+                self.shutdown.assert_not_called()
+                self.overnight.assert_not_called()
+                self.assertIn("Shutdown cancelled.", self.spoken)
+
+    def test_an_emphatic_no_still_shuts_down(self):
+        for text in ("No, no.", "No thank you.", "No overnight."):
+            with self.subTest(text=text):
+                self.assertTrue(self._reply(text))
+                self.shutdown.assert_called_once()
+
+    def test_a_long_yeah_sentence_is_not_an_overnight_yes(self):
+        self.assertFalse(self._reply("Yeah, I saw that movie last week."))
+        self.overnight.assert_not_called()
+        self.shutdown.assert_not_called()
 
 
 # ── B002: Mute Mic is a capture-entry rule ─────────────────────────────────
@@ -432,6 +468,24 @@ class StandbyWakeCarryTests(_Base):
         # The carried turn passes the normal-mode gate on its wake prefix.
         self.assertFalse(bc._should_refuse_background_audio(out[0])[0])
 
+    def test_a_mute_during_the_wake_transcription_drops_the_command(self):
+        # 2026-10-01 review: the carried "Jarvis, <command>" skipped the
+        # muted-during-transcription re-check _capture_utterance makes.
+        bc = self.bc
+        self._p(bc, "record_speech",
+                return_value=bc.np.zeros(bc.SAMPLE_RATE, dtype="float32"))
+
+        def stt(audio):
+            bc._mic_muted[0] = True          # Mute Mic pressed meanwhile
+            return ("Jarvis, unlock the front door", {})
+        self._p(bc, "_transcribe_capture", side_effect=stt)
+        out, log = self._quiet(bc._handle_sleep_standby, None)
+        self.assertIsNone(out, "a command heard as the mic was muted ran")
+        self.assertTrue(bc._sleep_mode[0])
+        self.assertEqual(self.spoken, [])
+        self.assertIn("transcript dropped", log)
+        self.assertNotIn("front door", log)
+
     def test_a_bare_wake_greets_and_admits_exactly_one_reply(self):
         bc = self.bc
         self.assertIsNone(self._spoken_wake("Jarvis."))
@@ -516,6 +570,90 @@ class OffThreadCaptureTests(_CaptureBase):
         self.assertLess(time.time() - t0, 2.0)
         self.assertEqual(mic.opened, 0)
         self.assertEqual(bc._capture_yield_reason[0], "mic")
+
+
+    def test_an_action_capture_is_never_fanned_out_to_the_taps(self):
+        # 2026-10-01 review: the ambient tap transcribed the off-thread
+        # capture too and wrote a spoken LAN access code to its transcript.
+        bc = self.bc
+
+        def frames(push, stream):
+            push(6, 0.2)
+            push(40, 0.0)
+        self._mic(frames)
+        tap = queue.Queue()
+        bc.add_record_tap(tap)
+        self.addCleanup(bc.remove_record_tap, tap)
+        box = {}
+        t = threading.Thread(
+            target=lambda: box.setdefault("a", bc.record_speech(timeout=3)),
+            name="web-action-test")
+        with contextlib.redirect_stdout(io.StringIO()):
+            t.start()
+            t.join(_WAIT)
+        self.assertIsNotNone(box.get("a"))
+        self.assertTrue(tap.empty(), "the action's capture reached a tap")
+        # The main loop's own listen still feeds the taps.
+        self._quiet(bc.record_speech, 3)
+        self.assertFalse(tap.empty())
+
+    def test_a_background_capture_lets_the_owner_finish(self):
+        # 2026-10-01 review: draft_confirm runs from the Teams-nudge / phone
+        # threads; registering cut the owner off mid-sentence. A background
+        # capture waits for the utterance the main loop is recording.
+        bc = self.bc
+        self.addCleanup(bc._utterance_in_progress.__setitem__, 0, False)
+        bg_go = threading.Event()
+        streams = []
+
+        def frames(push, stream):
+            streams.append(stream)
+            if len(streams) > 1:
+                return                    # the background capture: silence
+            push(6, 0.2)                  # the owner starts talking
+            bg_go.wait(_WAIT)
+            for _ in range(8):            # ...and keeps talking
+                push(1, 0.2)
+                time.sleep(0.06)
+            push(40, 0.0)                 # then stops
+        self._mic(frames)
+        box = {}
+
+        def nudge():
+            self._wait_for(lambda: bool(bc._utterance_in_progress[0]),
+                           "the owner's utterance")
+            bg_go.set()
+            box["a"] = bc.record_speech(timeout=0.3, background=True)
+        t = threading.Thread(target=nudge, name="teams-nudge-test")
+        t.start()
+        audio, log = self._quiet(bc.record_speech, 5)    # the main loop
+        t.join(_WAIT)
+        self.assertFalse(t.is_alive())
+        self.assertIsNotNone(audio, "the owner was cut off mid-sentence")
+        self.assertNotIn("needs the microphone", log)
+        self.assertEqual(len(streams), 2, "the background capture never ran")
+        self.assertIsNone(bc._offthread_capture[0])
+
+    def test_no_reminder_is_spoken_over_an_action_capture(self):
+        # 2026-10-01 review: the drain at the top of every pass (~0.5 s while
+        # the action listens) spoke reminders into the action's answer.
+        bc = self.bc
+        self._mic()
+        self._p(bc, "_get_realtime_session", return_value=None)
+        pending = self._p(bc, "_speak_pending", return_value=False)
+        release = threading.Event()
+        holder = threading.Thread(target=release.wait, args=(_WAIT,))
+        holder.start()
+        self.addCleanup(holder.join, _WAIT)
+        self.addCleanup(release.set)
+        bc._offthread_capture[0] = holder
+        self.addCleanup(bc._offthread_capture.__setitem__, 0, None)
+        out, _ = self._quiet(bc._capture_utterance, None, {})
+        self.assertIsNone(out)
+        bc._sleep_mode[0] = True
+        bc._standby_mode[0] = True
+        self._quiet(bc._handle_sleep_standby, None)
+        pending.assert_not_called()
 
 
 # ── B061: dropped lines are logged by length only ──────────────────────────
@@ -617,6 +755,71 @@ class IdleListenYieldTests(_CaptureBase):
         self._mic(frames)
         audio, _ = self._quiet(bc.record_speech, 5, yield_to_work=True)
         self.assertIsNotNone(audio, "the owner's utterance was cut off")
+
+    def _typed_during_the_drain(self):
+        """_speak_pending stands in for a reminder being spoken: the owner
+        types a dashboard command meanwhile. The listen's window is cut to
+        2 s so a missed yield fails fast."""
+        bc = self.bc
+        drains = []
+
+        def drain(*a, **k):
+            drains.append(1)
+            if len(drains) == 1:
+                with open(self.inject_path, "w", encoding="utf-8") as f:
+                    json.dump([{"text": "what time is it"}], f)
+                return True
+            return False
+        self._p(bc, "_speak_pending", side_effect=drain)
+        real = bc.record_speech
+        self._p(bc, "record_speech",
+                side_effect=lambda timeout=None, **kw: real(2.0, **kw))
+
+    def test_a_command_typed_during_the_reminder_drain_ends_the_listen(self):
+        # 2026-10-01 review: the baseline was taken after the drain, so the
+        # command typed while the reminder played was already "seen" and
+        # waited out the whole listen.
+        bc = self.bc
+        self._mic()
+        self._p(bc, "_get_realtime_session", return_value=None)
+        self._p(bc, "resume_face_tracking")
+        proactive = self._p(bc, "should_be_proactive", return_value=True)
+        self._p(bc, "_do_proactive_turn")
+        self._typed_during_the_drain()
+        t0 = time.time()
+        out, _ = self._quiet(bc._capture_utterance, None, {})
+        self.assertIsNone(out)
+        self.assertLess(time.time() - t0, 1.5,
+                        "the typed command waited out the listen")
+        proactive.assert_not_called()
+
+    def test_standby_yields_to_a_command_typed_during_its_drain(self):
+        bc = self.bc
+        self._mic()
+        bc._sleep_mode[0] = True
+        bc._standby_mode[0] = True
+        self._typed_during_the_drain()
+        t0 = time.time()
+        self._quiet(bc._handle_sleep_standby, None)
+        self.assertLess(time.time() - t0, 1.5,
+                        "the typed command waited out the standby listen")
+
+    def test_the_drains_own_queue_claim_is_not_new_work(self):
+        # The drain rewrites the speech queue itself: that alone must not
+        # end the listen (a loop that re-opened the mic every pass).
+        bc = self.bc
+        self._mic()
+        queue_path = bc.PENDING_SPEECH_PATH
+        with open(queue_path, "w", encoding="utf-8") as f:
+            json.dump([{"message": "x"}], f)
+        sig_top = bc._pending_work_signature()
+        os.remove(queue_path)                 # the drain claimed the queue
+        t0 = time.time()
+        audio, _ = self._quiet(bc.record_speech, 1.0, yield_to_work=True,
+                               work_sig0=bc._idle_work_baseline(sig_top))
+        self.assertIsNone(audio)
+        self.assertGreaterEqual(time.time() - t0, 0.9)
+        self.assertIsNone(bc._capture_yield_reason[0])
 
     def test_capture_utterance_runs_no_proactive_turn_on_a_yield(self):
         bc = self.bc

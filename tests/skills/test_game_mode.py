@@ -1226,7 +1226,9 @@ class TestFaceDetectionPauseIsActuallyHeld(_Base):
             "resume_face_tracking() no longer bare-clears _face_track_pause — "
             "if it became ref-counted, game_mode's latch may be removable")
 
-        rec = body.find("audio = record_speech(timeout=20)")
+        # A prefix (2026-10-01): the idle listen now also passes
+        # yield_to_work / work_sig0, which changes nothing here.
+        rec = body.find("audio = record_speech(timeout=20")
         self.assertNotEqual(rec, -1,
                             "the main listen loop's record_speech() moved")
         self.assertIn(

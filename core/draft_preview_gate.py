@@ -45,13 +45,18 @@ import sys
 import time
 from typing import Any, Callable
 
+from core import yes_no as _yes_no
+
 _log = logging.getLogger(__name__)
 
-# Words that count as "yes, send it". Any one of these appearing in the
-# transcribed reply (whole-word match, case-insensitive) clears the gate.
-# Kept aligned with core.draft_confirm so the user only learns one set
-# of voice tokens — the skills/draft_preview_gate.py coordinator routes
-# both gates through the same vocabulary.
+# Words that count as "yes, send it". Kept aligned with core.draft_confirm
+# so the user only learns one set of voice tokens — the
+# skills/draft_preview_gate.py coordinator routes both gates through the same
+# vocabulary. A reply now confirms only when core/yes_no.classify_reply hears
+# a clear, SHORT yes (with "send" / "ship it" as this gate's own yes leads —
+# _SEND_LEADS); this list is the documented vocabulary. Until 2026-10-01 any
+# one of these words ANYWHERE in the reply cleared the gate, so "Yeah, I saw
+# it" or "okay, what's the weather" sent the draft.
 _CONFIRM_KEYWORDS = (
     "yes", "yeah", "yep", "yup",
     "confirm", "confirmed",
@@ -66,6 +71,16 @@ _CANCEL_KEYWORDS = (
     "no", "nope", "cancel", "abort", "stop", "scrap",
     "don't", "do not", "negative", "hold off", "wait",
 )
+
+# This gate's own yes leads on top of core/yes_no's shared vocabulary.
+_SEND_LEADS = (("send",), ("ship", "it"))
+
+
+def _is_confirm(heard: str) -> bool:
+    """A clear, short yes to "Shall I send it?" (core/yes_no.py)."""
+    return _yes_no.classify_reply(heard, extra_yes=_SEND_LEADS,
+                                  extra_no=("scrap",)) == "yes"
+
 
 CONFIRM_TIMEOUT_S = 8.0
 
@@ -469,7 +484,7 @@ def run_with_gate(action_name: str, arg: str,
         return (f"Holding the draft, sir — heard '{heard}'. "
                 "Say 'send' if you change your mind.")
 
-    if _matches_any(heard, _CONFIRM_KEYWORDS):
+    if _is_confirm(heard):
         _log.debug("[draft_gate] confirmed after %.1fs: %r", waited, heard)
         publish_held_send("", "")      # nothing is being held any more
         return fn(arg)

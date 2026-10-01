@@ -13685,6 +13685,24 @@ def _pending_work_signature() -> tuple:
         return ()
 
 
+def _idle_work_baseline(sig_top: tuple) -> tuple | None:
+    """The queued-work baseline for a main-loop idle listen (2026-10-01
+    review): the signature taken at the top of the pass, BEFORE its reminder
+    drain, with only the speech-queue stamp re-read now — the drain's own
+    claim of that queue is not new work, but a command typed (or a tray flag
+    flipped) while a reminder was being spoken IS, so the listen yields to it
+    at its first check instead of holding it for the whole window. None (the
+    listen then takes its own baseline at entry) on any error. Never
+    raises."""
+    try:
+        now = _pending_work_signature()
+        if not sig_top or len(sig_top) != len(now):
+            return None
+        return (sig_top[0], now[1]) + tuple(sig_top[2:])
+    except Exception:
+        return None
+
+
 def _default_capture_endpoint():
     """Windows' live default capture endpoint id, or None. Never raises."""
     try:
@@ -15732,7 +15750,7 @@ def _capture_holds_mic() -> bool:
     return _dialogue_holds_mic() or _offthread_capture_holds_mic()
 
 
-def _record_speech_offthread(timeout):
+def _record_speech_offthread(timeout, *, background: bool = False):
     """record_speech for a caller OFF the main thread (2026-10-01).
 
     Registers this thread as the mic's in-turn capture (one at a time: a
@@ -15740,7 +15758,21 @@ def _record_speech_offthread(timeout):
     main loop's live listen to see the registration and close its stream,
     then runs the real capture. The registration is dropped in the finally,
     after record_speech's own finally has closed the stream and released
-    _record_speech_active."""
+    _record_speech_active.
+
+    ``background``: no owner turn is behind this capture (core/draft_confirm
+    runs from the Teams-nudge / phone-bridge threads), so it must not cut off
+    an utterance the owner is in the middle of — registering stops the main
+    loop's capture at once, mid-sentence (2026-10-01 review). It first waits
+    (bounded by the longest utterance) until the main loop is not recording
+    one. A dashboard action the owner just started still takes the mic at
+    once: his answer is for IT."""
+    if background:
+        _by = (time.monotonic() + MAX_RECORDING_SECS
+               + _OFFTHREAD_TAKEOVER_WAIT_S)
+        while (_utterance_in_progress[0] and _record_speech_active[0]
+               and time.monotonic() < _by):
+            time.sleep(0.05)
     me = threading.current_thread()
     with _offthread_capture_lock:
         holder = _offthread_capture[0]
@@ -15768,6 +15800,8 @@ def _record_speech_offthread(timeout):
 
 def record_speech(timeout: float | None = None, *,
                   yield_to_work: bool = False,
+                  work_sig0: tuple | None = None,
+                  background: bool = False,
                   _offthread_claimed: bool = False) -> np.ndarray | None:
     """
     Blocks until the user speaks and finishes, then returns the audio.
@@ -15782,11 +15816,16 @@ def record_speech(timeout: float | None = None, *,
     — a typed / dashboard command or a reminder — instead of holding it for
     the rest of the 20 s window. In-turn captures (a confirmation, the
     printer wizard) never pass it: an unrelated inject must not abort them.
+    ``work_sig0`` is the queued-work baseline to compare against (see
+    _idle_work_baseline); None = the signature at entry.
 
     Called OFF the main thread (an action started from the web dashboard),
     the capture first takes the microphone over from the main loop's own
-    listen — see _record_speech_offthread. ``_offthread_claimed`` is that
-    helper's private re-entry flag.
+    listen — see _record_speech_offthread. ``background`` (a JARVIS-initiated
+    capture with no owner turn behind it — core/draft_confirm's nudge / phone
+    confirmations) first lets an utterance the main loop is recording finish
+    instead of cutting it. ``_offthread_claimed`` is that helper's private
+    re-entry flag.
     """
     # Why an idle listen returned None early ("work" / "mic"); reported only
     # to the main loop's idle listens (yield_to_work), which run on the main
@@ -15816,7 +15855,7 @@ def record_speech(timeout: float | None = None, *,
     # (2026-10-01): see _record_speech_offthread.
     if (not _offthread_claimed
             and threading.current_thread() is not threading.main_thread()):
-        return _record_speech_offthread(timeout)
+        return _record_speech_offthread(timeout, background=background)
     # A device dialogue running on ANOTHER thread (a web panel action) owns
     # the microphone for its stop-listen: open nothing, idle briefly, and let
     # the caller loop (None = nothing heard). See _dialogue_holds_mic. So does
@@ -15858,15 +15897,25 @@ def record_speech(timeout: float | None = None, *,
     recording   = False
     silence_n   = 0
     start_time  = time.time()
-    # Queued-work yield (yield_to_work): compared against its value at entry,
-    # never tested for presence, so a file that cannot be claimed is not a
-    # hot loop (the _input_backoff_wait rule).
-    _work_sig0 = _pending_work_signature() if yield_to_work else None
+    # Queued-work yield (yield_to_work): compared against a baseline, never
+    # tested for presence, so a file that cannot be claimed is not a hot loop
+    # (the _input_backoff_wait rule). The main loop passes the baseline it
+    # took BEFORE this pass's reminder drain (2026-10-01 review): taken here,
+    # after the drain, a command typed while a reminder was being spoken was
+    # already "seen" and the listen never yielded to it.
+    _work_sig0 = None
+    if yield_to_work:
+        _work_sig0 = work_sig0 if work_sig0 else _pending_work_signature()
     _next_work_check = time.monotonic() + _WORK_CHECK_S
     peak_rms    = 0.0
     silent_peak = 0.0   # peak RMS while NOT recording (= ambient floor)
 
     audio_q: queue.Queue = queue.Queue()
+    # An off-thread in-turn capture (a dashboard-run action asking the owner
+    # something — the printer wizard's LAN access code, a draft confirmation)
+    # is never fanned out to the skill taps (2026-10-01 review): the ambient
+    # tap transcribed it and wrote the spoken access code to its transcript.
+    _fanout = not _offthread_claimed
 
     def _audio_cb(indata, frames, time_info, status):  # pragma: no cover - live mic stream callback
         # indata is (frames, channels); flatten to 1-D mono
@@ -15875,7 +15924,8 @@ def record_speech(timeout: float | None = None, *,
         # Fan out to any skill taps so they never open a competing stream
         # on the same mic (WASAPI contention → the ~70s stall). Cheap +
         # exception-proof so it can't stall this callback.
-        _fanout_record_frame(mono)
+        if _fanout:
+            _fanout_record_frame(mono)
 
     # Resolve the mic index BEFORE claiming ownership. get_input_device()
     # → _refresh_devices() may run PortAudio's sd._terminate()/_initialize()
@@ -25696,7 +25746,23 @@ def _handle_shutdown_prompt(text: str) -> bool:
             print(f"  [shutdown] reinforced shutdown failed: {_e}")
         return True
     # Check NO first so "no overnight" doesn't match YES's "overnight" substring.
-    if tl in SHUTDOWN_PROMPT_NO_PHRASES or any(tl.startswith(p + " ") for p in SHUTDOWN_PROMPT_NO_PHRASES):
+    _no_phrase = next((p for p in SHUTDOWN_PROMPT_NO_PHRASES
+                       if tl == p or tl.startswith(p + " ")), None)
+    if _no_phrase is not None:
+        # A hedged no is a cancel, not a power-off (2026-10-01 review): with
+        # the punctuation now dropped, "No, wait." / "No, cancel that." /
+        # "Nope, hold on." / "No, never mind." / "No, don't." read as
+        # "no wait" etc. and matched the "no " prefix — and NO here means a
+        # full JARVIS shutdown, so an explicit cancel killed the process.
+        # A repeated plain no ("No, no.") is still a no; "no thanks" too.
+        _after = tl[len(_no_phrase):].split()
+        if [w for w in _yes_no.hedge_words(_after)
+                if w not in ("no", "nope", "nah")]:
+            print("  [shutdown] hedged no — cancelling prompt, falling "
+                  "through to normal routing")
+            try: _speak("Shutdown cancelled.")
+            except Exception: pass
+            return False
         print(f"  [shutdown] user declined overnight ('{tl}') — full shutdown")
         try: _act_shutdown_jarvis()
         except Exception as _e:
@@ -25705,11 +25771,15 @@ def _handle_shutdown_prompt(text: str) -> bool:
     # YES = the shared classifier's clear yes ("Okay.", "Sure.", "Yep, do it")
     # or one of this prompt's own overnight phrases. A hedged yes ("yes, but
     # later") is the classifier's "no": neither overnight nor a full power-off
-    # was asked for, so it falls through to the cancel below.
+    # was asked for, so it falls through to the cancel below. The prefix test
+    # is for the overnight phrases only ("start the overnight protocol now"):
+    # a long "Yeah, ..." sentence is the classifier's "other", not a yes
+    # (2026-10-01 review).
     _verdict = _yes_no.classify_reply(tl)
     if _verdict == "yes" or (_verdict == "other" and (
             tl in SHUTDOWN_PROMPT_YES_PHRASES
-            or any(tl.startswith(p + " ") for p in SHUTDOWN_PROMPT_YES_PHRASES))):
+            or any(tl.startswith(p + " ") for p in SHUTDOWN_PROMPT_YES_PHRASES
+                   if "overnight" in p))):
         print(f"  [shutdown] user confirmed overnight ('{tl}') — start_overnight_upgrade")
         try: _act_start_overnight_upgrade()
         except Exception as _e:
@@ -30713,7 +30783,9 @@ def handle_confirmation_response(user_text: str) -> bool:
     # "Sure." / "Okay." CANCELLED the action, "Jarvis, yes." (the only spoken
     # form wake-word mode lets through) cancelled too, and "Yesterday...",
     # "Do it later", "Go ahead and cancel it" and "Confirmation number 5" RAN
-    # the queued delete / purchase / dangerous shell command.
+    # the queued delete / purchase / dangerous shell command. Only a SHORT yes
+    # counts (2026-10-01 review): a sentence that merely starts with "Yeah,"
+    # / "Absolutely," is "other" — cancelled and routed on, never run.
     verdict = _yes_no.classify_reply(user_text)
     affirmative = verdict == "yes"
     if affirmative:
@@ -32694,8 +32766,11 @@ def _listen_for_stop(until, *, beat_s: float | None = None,
         beat = (np.concatenate(frames[beat_idx:]).astype(np.float32,
                                                          copy=False)
                 if beat_idx < len(frames) else None)
+        # voiced (2026-10-01 review): a capture with no voice in it at all
+        # is not waited on by the next device line (core/dialogue.Runner).
         cap = _dlg.ListenCapture(available=True,
-                                 beat_voiced=_voiced(beat))
+                                 beat_voiced=_voiced(beat),
+                                 voiced=_voiced(audio))
         try:
             threading.Thread(target=_stop_listen_worker,
                              args=(cap, audio, beat, cap.beat_voiced, h),
@@ -32709,7 +32784,7 @@ def _listen_for_stop(until, *, beat_s: float | None = None,
 
 def _empty_capture():
     """A capture that ran but heard nothing (the verdict is already "")."""
-    cap = _dlg.ListenCapture(available=True, beat_voiced=False)
+    cap = _dlg.ListenCapture(available=True, beat_voiced=False, voiced=False)
     cap.set_result("", "")
     return cap
 
@@ -34797,9 +34872,17 @@ def _capture_utterance(injected_text, memory):
     _last_capture_sr = 0
     # Self-echo gate: only the mic path below publishes capture timing.
     _last_capture_window[0] = None
+    # The idle listen's queued-work baseline is taken BEFORE the drain below
+    # (see _idle_work_baseline).
+    _work_sig_top = _pending_work_signature()
     # Drain any speech queued between turns (timer reminders, device auto-switch
     # alerts, etc.) so they fire promptly instead of only after a 20s timeout.
-    _speak_pending()
+    # Not while another thread's capture holds the mic (2026-10-01 review): a
+    # dashboard action's question / a draft confirmation is listening, and a
+    # reminder spoken now lands in its answer (this pass repeats ~every 0.5 s
+    # while it waits).
+    if not _capture_holds_mic():
+        _speak_pending()
 
     if injected_text is not None:
         # Inject path: bypass mic + Whisper but route through every downstream
@@ -34894,9 +34977,10 @@ def _capture_utterance(injected_text, memory):
     # Wait for speech, but only briefly — so we can check proactive
     _tt_rec_since = _tt("now")
     # yield_to_work (2026-10-01): a typed / dashboard command or a reminder
-    # queued during this idle listen ends it at once instead of waiting out
-    # the 20 s window.
-    audio = record_speech(timeout=20, yield_to_work=True)
+    # queued during this idle listen — or during the drain above — ends it at
+    # once instead of waiting out the 20 s window.
+    audio = record_speech(timeout=20, yield_to_work=True,
+                          work_sig0=_idle_work_baseline(_work_sig_top))
     if audio is not None:
         # [turn-timing] t0 = this recording's VAD break (see _turn_timing).
         _tt("begin_voice", _tt_rec_since)
@@ -35330,12 +35414,17 @@ def _handle_sleep_standby(injected_text: str | None):
     # Inject/neural paths have no real capture; the mic path below overwrites.
     _last_capture_audio = None
     _last_capture_sr = 0
+    # The idle listen's queued-work baseline, BEFORE the drain below (see
+    # _idle_work_baseline).
+    _work_sig_top = _pending_work_signature()
     # The owner's own reminders still play while JARVIS sleeps (2026-10-01):
     # a fired timer used to wait, silent, until the next "JARVIS". Other
     # queued lines stay held for wake. Every tick (<= ~20 s), so a reminder
-    # plays within a capture window of firing. Never raises.
+    # plays within a capture window of firing. Not while another thread's
+    # capture holds the mic (see _capture_utterance). Never raises.
     try:
-        _speak_pending(only_sources=_STANDBY_SPEAKABLE_SOURCES)
+        if not _capture_holds_mic():
+            _speak_pending(only_sources=_STANDBY_SPEAKABLE_SOURCES)
     except Exception as _e:
         print(f"  [pending] standby drain failed: {_e}")
     _wake_conf = {"no_speech_prob": 0.0, "avg_logprob": -0.1}
@@ -35366,8 +35455,10 @@ def _handle_sleep_standby(injected_text: str | None):
         set_state("idle")
         _tt_rec_since = _tt("now")
         # yield_to_work: a typed command or a reminder queued while this idle
-        # listen waits ends it at once (see record_speech).
-        audio = record_speech(timeout=20, yield_to_work=True)
+        # listen waits — or during the drain above — ends it at once (see
+        # record_speech).
+        audio = record_speech(timeout=20, yield_to_work=True,
+                              work_sig0=_idle_work_baseline(_work_sig_top))
         _capture_yield_reason[0] = None   # standby just re-loops either way
         if audio is None or len(audio) < SAMPLE_RATE * 0.4:
             return None
@@ -35411,6 +35502,14 @@ def _handle_sleep_standby(injected_text: str | None):
             text, _wake_conf = _transcribe_capture(audio)
         else:
             text = "jarvis" if _wake_hit else ""
+        # Muted WHILE Whisper ran (2026-10-01 review): exactly as
+        # _capture_utterance — the transcript is dropped, never acted on (a
+        # carried "Jarvis, <command>" ran anyway), never learned, and only its
+        # length is logged.
+        if _mic_muted[0]:
+            print(f"  [mic-mute] muted during transcription — transcript "
+                  f"dropped ({len(text or '')} chars)")
+            return None
     # Known-device speech (core/device_speech_filter.py): a line a device in
     # the room speaks can never wake JARVIS and is never fed to the ambient
     # learner. Checked BEFORE the wake match — a device boot line led by the
