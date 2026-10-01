@@ -2614,7 +2614,8 @@ class OpenOnMonitorTests(unittest.TestCase):
             out = A._act_open_on_monitor("left | example.com")
         self.assertIn("opened 'example.com' on left monitor", out)
         self.assertTrue(win.maximized)
-        bc._open_url_new_window.assert_called_once_with("example.com")
+        bc._open_url_new_window.assert_called_once_with("example.com",
+                                                         monitor="left")
 
     def test_url_fallback_to_webbrowser(self):
         bc = self._bc()
@@ -3679,7 +3680,8 @@ class MonitorArgsLiveFormTests(unittest.TestCase):
         win = _FakeWindow("cello - YouTube - Google Chrome")
         out, bc, la = self._open("left, youtube, cello", [win])
         bc._open_url_new_window.assert_called_once_with(
-            "https://www.youtube.com/results?search_query=cello")
+            "https://www.youtube.com/results?search_query=cello",
+            monitor="left")
         la.assert_not_called()
         self.assertIn("on left monitor", out)
         self.assertTrue(win.maximized)

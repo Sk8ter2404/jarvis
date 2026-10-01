@@ -3310,7 +3310,9 @@ def _act_open_on_monitor(args: str) -> str:
         re.IGNORECASE,
     )
     if _URL_HINT.match(target):
-        if not bc._open_url_new_window(target):
+        # monitor=: the new window's own placement (visible + maximized,
+        # 2026-10-01) targets the same monitor this action then moves it to.
+        if not bc._open_url_new_window(target, monitor=monitor_name):
             webbrowser.open(target if target.startswith(("http://", "https://"))
                             else "https://" + target)
     else:

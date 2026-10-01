@@ -349,6 +349,20 @@ class OpenUrlNewWindowTests(MonolithGlobalsTestCase):
     def setUpClass(cls):
         cls.bc = load_monolith()
 
+    def setUp(self):
+        super().setUp()
+        # 2026-10-01: the open paths now hand the window they open to a
+        # placement daemon that polls the REAL desktop for it. Never here.
+        for name, value in (("_place_new_browser_window_async",
+                             mock.Mock(return_value=None)),
+                            ("_focus_steal_guard_active",
+                             mock.Mock(return_value=False)),
+                            ("_window_handles_snapshot",
+                             mock.Mock(return_value=set()))):
+            p = mock.patch.object(self.bc, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
     def test_no_chrome_returns_false(self):
         with mock.patch.object(self.bc, "_find_chrome", return_value=None):
             self.assertFalse(self.bc._open_url_new_window("example.com"))
@@ -4016,6 +4030,20 @@ class OpenUrlInBrowserTests(MonolithGlobalsTestCase):
     @classmethod
     def setUpClass(cls):
         cls.bc = load_monolith()
+
+    def setUp(self):
+        super().setUp()
+        # 2026-10-01: the open paths now hand the window they open to a
+        # placement daemon that polls the REAL desktop for it. Never here.
+        for name, value in (("_place_new_browser_window_async",
+                             mock.Mock(return_value=None)),
+                            ("_focus_steal_guard_active",
+                             mock.Mock(return_value=False)),
+                            ("_window_handles_snapshot",
+                             mock.Mock(return_value=set()))):
+            p = mock.patch.object(self.bc, name, value)
+            p.start()
+            self.addCleanup(p.stop)
 
     def test_prefers_webbrowser_get_chrome(self):
         bc = self.bc

@@ -251,5 +251,202 @@ class TimerClaimTests(MonolithGlobalsTestCase):
         self.assertIn("two timers", cleaned)
 
 
+
+# ── item 7: ordinary Chrome windows end up visible + maximized ──────────────
+def _fake_win32(rect, work=(0, 0, 2560, 1440), is_window=True, zoomed=False):
+    w32 = mock.MagicMock(name="win32gui")
+    w32.IsWindow.return_value = is_window
+    w32.IsZoomed.return_value = zoomed
+    w32.GetWindowRect.return_value = rect
+    con = mock.MagicMock(name="win32con")
+    con.SW_RESTORE = 9
+    con.SW_MAXIMIZE = 3
+    api = mock.MagicMock(name="win32api")
+    api.MonitorFromWindow.return_value = 111
+    api.GetMonitorInfo.return_value = {"Work": work, "Monitor": work}
+    return w32, con, api
+
+
+def _win(hwnd, title, w=1200, h=800):
+    return types.SimpleNamespace(_hWnd=hwnd, title=title, width=w, height=h)
+
+
+@requires_monolith
+class OrdinaryBrowserWindowPlacementTests(MonolithGlobalsTestCase):
+    """The streaming paths pull the window JARVIS opened on-screen and
+    maximize it (_adopt_media_window -> _ensure_window_visible_maximized);
+    the ordinary paths (_open_url_in_browser's 'chrome --new-window',
+    _open_url_new_window) never did, so a Chrome window restored to a
+    remembered spot above a negative-origin monitor kept its title bar off
+    the top of the screen (2026-07-07 report, still open on 10-01)."""
+
+    def _p(self, *args, **kwargs):
+        patcher = mock.patch.object(*args, **kwargs)
+        m = patcher.start()
+        self.addCleanup(patcher.stop)
+        return m
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self.popen = self._p(bc.subprocess, "Popen")
+        self._p(bc, "_find_chrome", return_value="chrome.exe")
+        self._p(bc, "_window_handles_snapshot", return_value={1, 2})
+        self._p(bc.webbrowser, "get", side_effect=RuntimeError("no controller"))
+        self.place = self._p(bc, "_place_new_browser_window_async")
+        self._p(bc, "_focus_steal_guard_active", return_value=False)
+
+    def test_open_url_in_browser_places_the_new_window(self):
+        how = self.bc._open_url_in_browser("example.com")
+        self.assertEqual(how, "chrome")
+        self.popen.assert_called_once()
+        self.place.assert_called_once()
+        args, kw = self.place.call_args
+        self.assertEqual(args[0], {1, 2})
+        self.assertIsNone(kw.get("monitor"))
+        self.assertTrue(kw.get("activate"))
+
+    def test_the_monitor_the_request_named_is_passed_through(self):
+        self.bc._open_url_in_browser("example.com", monitor="left")
+        self.assertEqual(self.place.call_args.kwargs.get("monitor"), "left")
+        self.place.reset_mock()
+        self.assertTrue(self.bc._open_url_new_window("example.com",
+                                                     monitor="right"))
+        self.assertEqual(self.place.call_args.kwargs.get("monitor"), "right")
+
+    def test_open_url_new_window_places_the_new_window(self):
+        self.assertTrue(self.bc._open_url_new_window("example.com"))
+        self.place.assert_called_once()
+
+    def test_media_mode_leaves_placement_to_the_adopter(self):
+        self._p(self.bc, "_close_browser_windows_matching", return_value=0)
+        self.bc._open_url_in_browser("example.com", close_matching=["x"])
+        self.place.assert_not_called()
+
+    def test_a_game_in_front_means_no_focus_is_taken(self):
+        self._p(self.bc, "_focus_steal_guard_active", return_value=True)
+        self.bc._open_url_in_browser("example.com")
+        self.assertFalse(self.place.call_args.kwargs.get("activate"))
+
+
+@requires_monolith
+class NewBrowserWindowFinderTests(MonolithGlobalsTestCase):
+    def test_only_a_new_browser_window_is_placed(self):
+        bc = self.bc
+        gw = mock.MagicMock()
+        gw.getAllWindows.return_value = [
+            _win(1, "A stream - Google Chrome"),             # pre-existing
+            _win(5, "Untitled - Notepad"),                    # not a browser
+            _win(6, "tooltip - Google Chrome", w=50, h=20),  # too small
+            _win(7, "New Tab - Google Chrome")]               # THE new one
+        with mock.patch.dict(bc.sys.modules, {"pygetwindow": gw}), \
+                mock.patch.object(bc, "_ensure_window_visible_maximized",
+                                  return_value=True) as ensure:
+            got = bc._place_new_browser_window({1, 2}, monitor="left",
+                                               activate=False, timeout=1.0,
+                                               poll=0.01)
+        self.assertEqual(got, 7)
+        ensure.assert_called_once_with(7, monitor="left", activate=False)
+
+    def test_no_new_window_times_out_quietly(self):
+        bc = self.bc
+        gw = mock.MagicMock()
+        gw.getAllWindows.return_value = [_win(1, "Old - Google Chrome")]
+        with mock.patch.dict(bc.sys.modules, {"pygetwindow": gw}), \
+                mock.patch.object(bc, "_ensure_window_visible_maximized") as ensure:
+            got = bc._place_new_browser_window({1}, timeout=0.05, poll=0.01)
+        self.assertIsNone(got)
+        ensure.assert_not_called()
+
+    def test_the_async_placer_is_a_bounded_daemon(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_place_new_browser_window",
+                               return_value=None) as worker:
+            t = bc._place_new_browser_window_async({1}, monitor=None,
+                                                   activate=True)
+            t.join(5)
+        self.assertTrue(t.daemon)
+        self.assertFalse(t.is_alive())
+        worker.assert_called_once()
+
+
+@requires_monolith
+class EnsureVisibleOnMonitorTests(MonolithGlobalsTestCase):
+    def test_a_named_monitor_is_the_target(self):
+        bc = self.bc
+        # A window on the middle monitor; the request named "left".
+        w32, con, api = _fake_win32((100, 100, 1300, 900))
+        with mock.patch.dict(bc.sys.modules, {"win32gui": w32,
+                                              "win32con": con,
+                                              "win32api": api}), \
+                mock.patch.dict(bc.MONITORS, {"left": (-2560, 0, 2560, 1440)}):
+            self.assertTrue(bc._ensure_window_visible_maximized(
+                4242, monitor="left"))
+        x, y = w32.SetWindowPos.call_args.args[2:4]
+        self.assertTrue(-2560 <= x < 0, x)
+        modes = [c.args[1] for c in w32.ShowWindow.call_args_list]
+        self.assertEqual(modes[-1], con.SW_MAXIMIZE)
+
+    def test_without_activation_nothing_takes_the_foreground(self):
+        bc = self.bc
+        w32, con, api = _fake_win32((100, -80, 1300, 720))   # off the top
+        with mock.patch.dict(bc.sys.modules, {"win32gui": w32,
+                                              "win32con": con,
+                                              "win32api": api}):
+            self.assertTrue(bc._ensure_window_visible_maximized(
+                4242, activate=False))
+        # ShowWindow(SW_RESTORE / SW_MAXIMIZE) activates the window: never.
+        w32.ShowWindow.assert_not_called()
+        args = w32.SetWindowPos.call_args.args
+        self.assertEqual(args[2:6], (0, 0, 2560, 1440))      # fills the work area
+        self.assertTrue(args[6] & 0x0010)                     # SWP_NOACTIVATE
+        self.assertTrue(args[6] & 0x0004)                     # SWP_NOZORDER
+
+    def test_streaming_callers_are_unchanged(self):
+        # The default (activate=True, no monitor) is the old behaviour.
+        bc = self.bc
+        w32, con, api = _fake_win32((100, 100, 1300, 900))
+        with mock.patch.dict(bc.sys.modules, {"win32gui": w32,
+                                              "win32con": con,
+                                              "win32api": api}):
+            self.assertTrue(bc._ensure_window_visible_maximized(4242))
+        w32.SetWindowPos.assert_not_called()
+        modes = [c.args[1] for c in w32.ShowWindow.call_args_list]
+        self.assertEqual(modes, [con.SW_RESTORE, con.SW_MAXIMIZE])
+
+
+@requires_monolith
+class FocusStealGuardTests(MonolithGlobalsTestCase):
+    def _guard(self, fg_rect, mon_rect, cls="UnrealWindow", fg=99):
+        bc = self.bc
+        w32 = mock.MagicMock()
+        w32.GetForegroundWindow.return_value = fg
+        w32.GetClassName.return_value = cls
+        w32.GetWindowRect.return_value = fg_rect
+        w32.IsIconic.return_value = False
+        api = mock.MagicMock()
+        api.GetMonitorInfo.return_value = {"Monitor": mon_rect,
+                                           "Work": mon_rect}
+        with mock.patch.dict(bc.sys.modules, {"win32gui": w32,
+                                              "win32api": api}), \
+                mock.patch.object(bc, "_game_mode_active", return_value=False):
+            return bc._focus_steal_guard_active()
+
+    def test_game_mode_is_a_guard(self):
+        with mock.patch.object(self.bc, "_game_mode_active", return_value=True):
+            self.assertTrue(self.bc._focus_steal_guard_active())
+
+    def test_a_fullscreen_game_in_front_is_a_guard(self):
+        full = (0, 0, 2560, 1440)
+        self.assertTrue(self._guard(full, full))
+
+    def test_a_normal_window_or_the_desktop_is_not(self):
+        full = (0, 0, 2560, 1440)
+        self.assertFalse(self._guard((100, 100, 900, 700), full))
+        self.assertFalse(self._guard(full, full, cls="WorkerW"))
+        self.assertFalse(self._guard(full, full, cls="Chrome_WidgetWin_1"))
+        self.assertFalse(self._guard(full, full, fg=0))
+
+
 if __name__ == "__main__":
     unittest.main()

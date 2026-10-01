@@ -24076,7 +24076,126 @@ def _adopt_media_window(cfg: dict, service_key: str, before: set) -> None:
         print(f"  [auto-play] pinning vision to monitor '{mon}'", flush=True)
 
 
-def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None) -> str:
+# ── ordinary browser windows: visible + maximized (2026-10-01) ────────────
+# The streaming paths adopt the window they open and run it through
+# _ensure_window_visible_maximized; the ordinary paths (_open_url_in_browser's
+# "chrome --new-window", _open_url_new_window) never did, so a Chrome window
+# restored to a remembered spot above a negative-origin monitor opened with
+# its title bar off the top of the screen (owner report 2026-07-07, open
+# since). They now hand the window that APPEARS after the launch to a bounded
+# daemon (_place_new_browser_window_async): it is found by handle (never a
+# title match, so an existing window of his is never moved), pulled
+# on-screen and maximized — on the monitor the request named, if any, and
+# without taking focus while a game holds the screen.
+_NEW_WINDOW_PLACE_TIMEOUT_S = 8.0
+_NEW_WINDOW_PLACE_POLL_S = 0.25
+# Foreground window classes that are never "a game": the desktop / taskbar and
+# browsers (a fullscreen video in Chrome is not a reason to leave a window the
+# owner asked for unmaximized).
+_FOCUS_GUARD_PASS_CLASSES = frozenset({
+    "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+    "Chrome_WidgetWin_1", "MozillaWindowClass",
+})
+
+
+def _focus_steal_guard_active() -> bool:
+    """True when a window JARVIS opens must not take the foreground: game
+    mode is engaged (skills/game_mode), or the foreground window covers its
+    whole monitor and is neither the desktop nor a browser (a fullscreen
+    game, game mode off — its shipped default). Sampled BEFORE the browser
+    launch: a new Chrome window may already hold the foreground by the time
+    it is placed. Never raises (False on any error)."""
+    if _game_mode_active():
+        return True
+    try:
+        import win32gui
+        import win32api
+    except Exception:
+        return False
+    try:
+        fg = win32gui.GetForegroundWindow()
+        if not fg or win32gui.IsIconic(fg):
+            return False
+        if (win32gui.GetClassName(fg) or "") in _FOCUS_GUARD_PASS_CLASSES:
+            return False
+        left, top, right, bot = win32gui.GetWindowRect(fg)
+        ml, mt, mr, mb = win32api.GetMonitorInfo(
+            win32api.MonitorFromWindow(fg, 2))["Monitor"]
+        return left <= ml and top <= mt and right >= mr and bot >= mb
+    except Exception:
+        return False
+
+
+def _find_new_browser_window(before):
+    """The first top-level BROWSER window whose handle is not in ``before``
+    (the snapshot taken just before the launch), or None. Never raises."""
+    try:
+        import pygetwindow as gw
+        wins = gw.getAllWindows()
+    except Exception:
+        return None
+    skip = before or ()
+    for w in wins:
+        hw = getattr(w, "_hWnd", None)
+        if hw is None or hw in skip:
+            continue
+        t = _strip_bidi_and_nbsp((getattr(w, "title", "") or "")).lower()
+        if not t or not any(m in t for m in _MUSIC_BROWSER_MARKERS):
+            continue
+        try:
+            if w.width < 200 or w.height < 200:
+                continue        # a tooltip / popup, not the window
+        except Exception:
+            pass
+        return hw
+    return None
+
+
+def _place_new_browser_window(before, monitor: str | None = None,
+                              activate: bool = True,
+                              timeout: float = _NEW_WINDOW_PLACE_TIMEOUT_S,
+                              poll: float = _NEW_WINDOW_PLACE_POLL_S):
+    """Wait (bounded) for the browser window a launch just opened and make
+    it visible + maximized. Returns its handle, or None when no new window
+    appeared (the URL became a tab in an existing window — nothing to move).
+    Never raises."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        hw = _find_new_browser_window(before)
+        if hw is not None:
+            try:
+                time.sleep(min(0.2, max(0.0, float(poll))))  # let it finish spawning
+            except Exception:
+                pass
+            _ensure_window_visible_maximized(hw, monitor=monitor,
+                                             activate=activate)
+            return hw
+        if time.monotonic() >= deadline:
+            return None
+        try:
+            time.sleep(max(0.01, float(poll)))
+        except Exception:
+            return None
+
+
+def _place_new_browser_window_async(before, monitor: str | None = None,
+                                    activate: bool = True):
+    """_place_new_browser_window on a daemon thread (the open-URL callers
+    must not block the voice turn on a window that may never come); the
+    thread lives at most _NEW_WINDOW_PLACE_TIMEOUT_S. Returns the thread."""
+    def _run():
+        try:
+            _place_new_browser_window(before, monitor=monitor,
+                                      activate=activate)
+        except Exception:
+            pass
+    t = threading.Thread(target=_run, name="browser-window-place", daemon=True)
+    t.start()
+    return t
+
+
+def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None,
+                         monitor: str | None = None) -> str:
     """Open `url` in a REAL web browser, deliberately bypassing the default
     URL handler.
 
@@ -24103,11 +24222,33 @@ def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None) -> str:
 
     Returns a short string naming which path opened it ("chrome",
     "chrome:webbrowser", "edge", or "default") for logging/tests. NEVER raises.
+
+    Outside media mode a window the launch OPENS is made visible + maximized
+    (on ``monitor`` when given) by _place_new_browser_window_async; in media
+    mode the caller adopts it (_adopt_media_window) and does that itself.
     """
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
     media_mode = bool(close_matching) or close_hwnd is not None
+    # Sampled BEFORE the launch (see _focus_steal_guard_active).
+    _place_before = None
+    _place_activate = True
+    if not media_mode:
+        try:
+            _place_before = _window_handles_snapshot()
+            _place_activate = not _focus_steal_guard_active()
+        except Exception:
+            _place_before = None
+
+    def _place_opened():
+        if _place_before is None:
+            return
+        try:
+            _place_new_browser_window_async(_place_before, monitor=monitor,
+                                            activate=_place_activate)
+        except Exception:
+            pass
     if media_mode:
         try:
             n = _close_browser_windows_matching(close_matching, only_hwnd=close_hwnd)
@@ -24126,6 +24267,9 @@ def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None) -> str:
         try:
             browser = webbrowser.get("chrome")
             if browser.open(url):
+                # Usually a tab in an existing window (nothing to place);
+                # a NEW window when Chrome was not running.
+                _place_opened()
                 return "chrome:webbrowser"
         except Exception:
             pass
@@ -24136,6 +24280,7 @@ def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None) -> str:
     if chrome:
         try:
             subprocess.Popen([chrome, "--new-window", url], close_fds=True)
+            _place_opened()
             return "chrome"
         except Exception as e:
             print(f"  [open-url] chrome.exe launch failed: {e}", flush=True)
@@ -24145,6 +24290,7 @@ def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None) -> str:
     if edge:
         try:
             subprocess.Popen([edge, "--new-window", url], close_fds=True)
+            _place_opened()
             return "edge"
         except Exception as e:
             print(f"  [open-url] msedge.exe launch failed: {e}", flush=True)
@@ -24165,24 +24311,39 @@ def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None) -> str:
     return "default"
 
 
-def _open_url_new_window(url: str) -> bool:
+def _open_url_new_window(url: str, monitor: str | None = None) -> bool:
     """Spawn a NEW Chrome window for `url`, leaving any existing Chrome
     windows untouched. Returns True if a new window was spawned, False if
-    Chrome wasn't found (caller should fall back to webbrowser.open)."""
+    Chrome wasn't found (caller should fall back to webbrowser.open).
+
+    The new window is made visible + maximized — on ``monitor`` when the
+    request named one — by _place_new_browser_window_async (2026-10-01; see
+    _NEW_WINDOW_PLACE_TIMEOUT_S), without taking focus while a game holds
+    the screen."""
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     chrome = _find_chrome()
     if not chrome:
         return False
     try:
+        before = _window_handles_snapshot()
+        activate = not _focus_steal_guard_active()
+    except Exception:
+        before, activate = set(), True
+    try:
         # --new-window forces a separate top-level window even when Chrome
         # is already running. Without it, Chrome reuses the most recent
         # window and just adds a tab — which would steal focus from
         # whatever the user was watching there.
         subprocess.Popen([chrome, "--new-window", url], close_fds=True)
-        return True
     except Exception:
         return False
+    try:
+        _place_new_browser_window_async(before, monitor=monitor,
+                                        activate=activate)
+    except Exception:
+        pass
+    return True
 
 
 # Coordinates well outside the virtual screen bounding box for this rig.
@@ -26928,7 +27089,9 @@ def _focus_window_hwnd(hwnd) -> bool:
         return False
 
 
-def _ensure_window_visible_maximized(hwnd, settle: float = 0.0) -> bool:
+def _ensure_window_visible_maximized(hwnd, settle: float = 0.0, *,
+                                     monitor: str | None = None,
+                                     activate: bool = True) -> bool:
     """Pull the window `hwnd` fully on-screen, then MAXIMIZE it — "windowed
     full screen" on whatever monitor it lands on. Returns True if we issued the
     place/maximize, False on a no-op (bad handle / no win32 / not a real
@@ -26961,6 +27124,17 @@ def _ensure_window_visible_maximized(hwnd, settle: float = 0.0) -> bool:
     honour Chrome's remembered monitor, but if the restored rect is entirely
     off every monitor Windows can pick oddly — so we first move the top-left
     inside a real work area, THEN maximize (maximize snaps to that monitor).
+
+    ``monitor`` (2026-10-01): a MONITORS key the request named ("open it on
+    the left monitor") — the window is brought onto THAT monitor's rect
+    instead of whichever one it overlaps. Unknown / None = the old rule.
+
+    ``activate`` (2026-10-01): ShowWindow(SW_RESTORE / SW_MAXIMIZE) ACTIVATES
+    the window, i.e. takes the foreground. With activate=False (a game holds
+    the screen — see _focus_steal_guard_active) no ShowWindow is issued:
+    one SetWindowPos (SWP_NOACTIVATE | SWP_NOZORDER) sizes the window to the
+    target work area instead, so it is visible and full-size without taking
+    focus. The streaming callers keep the default (activate, no monitor).
 
     DEFENSIVE: a 0 / None / non-existent hwnd, missing pywin32, or any Win32
     error is a silent no-op that returns False. NEVER raises — a placement
@@ -27003,16 +27177,39 @@ def _ensure_window_visible_maximized(hwnd, settle: float = 0.0) -> bool:
     # (win32gui lacks them on this box), so resolve from win32api and fall back
     # to the virtual-screen bounding box when they're unavailable.
     wa_left = wa_top = wa_right = wa_bot = None
-    try:
-        import win32api
-        mon = win32api.MonitorFromWindow(h, 2)  # MONITOR_DEFAULTTONEAREST
-        info = win32api.GetMonitorInfo(mon)
-        wa_left, wa_top, wa_right, wa_bot = info["Work"]
-    except Exception:
-        # Fall back to the whole virtual-screen bounding box from MONITORS.
+    named = None
+    if monitor:
         try:
-            vx, vy, vw, vh = _virtual_screen_bounds()
-            wa_left, wa_top, wa_right, wa_bot = vx, vy, vx + vw, vy + vh
+            named = MONITORS.get(str(monitor).strip().lower())
+            if named is not None:
+                mx, my, mw, mh = named
+                wa_left, wa_top, wa_right, wa_bot = mx, my, mx + mw, my + mh
+        except Exception:
+            named = None
+    if named is None:
+        try:
+            import win32api
+            mon = win32api.MonitorFromWindow(h, 2)  # MONITOR_DEFAULTTONEAREST
+            info = win32api.GetMonitorInfo(mon)
+            wa_left, wa_top, wa_right, wa_bot = info["Work"]
+        except Exception:
+            # Fall back to the whole virtual-screen bounding box from MONITORS.
+            try:
+                vx, vy, vw, vh = _virtual_screen_bounds()
+                wa_left, wa_top, wa_right, wa_bot = vx, vy, vx + vw, vy + vh
+            except Exception:
+                return False
+
+    if not activate:
+        # A game holds the screen: fill the target work area with ONE
+        # non-activating move. ShowWindow (restore / maximize) would take the
+        # foreground from it.
+        try:
+            flags = 0x0004 | 0x0010  # SWP_NOZORDER | SWP_NOACTIVATE
+            win32gui.SetWindowPos(
+                h, 0, int(wa_left), int(wa_top), int(wa_right - wa_left),
+                int(wa_bot - wa_top), flags)
+            return True
         except Exception:
             return False
 
@@ -27048,6 +27245,11 @@ def _ensure_window_visible_maximized(hwnd, settle: float = 0.0) -> bool:
         or right > wa_right + tol
         or bot > wa_bot + tol
     )
+    # A NAMED monitor is a destination, not a clamp: a window anywhere else
+    # moves onto it (maximize then snaps to that monitor).
+    if named is not None and not off:
+        cx, cy = (left + right) / 2.0, (top + bot) / 2.0
+        off = not (wa_left <= cx < wa_right and wa_top <= cy < wa_bot)
 
     try:
         # Restore first so a maximized/rolled-up window has a real restore rect
