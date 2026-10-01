@@ -219,7 +219,9 @@ class LearnerProvenanceTests(MonolithGlobalsTestCase):
 
     def test_main_loop_passes_the_turn_confidence(self):
         src = inspect.getsource(self.bc.main)
-        self.assertIn("learn_from_turn(text, reply, memory, conf=conf)", src)
+        # 2026-09-30: the same call now also passes typed / wake / the raw
+        # capture for owner-only learning (test_monolith_learn_gate).
+        self.assertIn("learn_from_turn(text, reply, memory, conf=conf,", src)
 
 
 @requires_monolith

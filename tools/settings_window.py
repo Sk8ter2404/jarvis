@@ -1264,6 +1264,31 @@ SCHEMA: dict[str, dict] = {
         "help": "Passively transcribe surroundings to learn context. OFF "
                 "by default.",
     },
+    "LEARN_ONLY_FROM_OWNER": {
+        "tab": "privacy", "label": "Learn only from me", "type": "bool",
+        "default": False,
+        "help": "Learn facts only from what you type, say after 'JARVIS', say "
+                "in your enrolled voice, or say in a conversation you started. "
+                "Other people in the room never teach him. Without an "
+                "enrolled voiceprint, only typed and 'JARVIS' turns teach. "
+                "Applies on the next start.",
+    },
+    "LEARN_FOLLOWUP_S": {
+        "tab": "privacy", "label": "Your conversation lasts (seconds)",
+        "type": "float", "default": 90.0, "min": 0, "max": 900,
+        "help": "With 'Learn only from me' on: after a turn that was clearly "
+                "yours, follow-ups for this long can teach too (0 = only the "
+                "clearly-yours turns). Applies on the next start.",
+    },
+    "LEARN_VOICE_REJECT_BELOW": {
+        "tab": "privacy", "label": "Not-you voice score below",
+        "type": "float", "default": 0.60, "min": 0, "max": 1,
+        "help": "With 'Learn only from me' on: a voice scoring below this "
+                "against your voiceprint is someone else and never teaches, "
+                "even after 'JARVIS'. Raise it if guests still teach him; "
+                "lower it if your own turns are refused. Applies on the next "
+                "start.",
+    },
     "AMBIENT_SCREEN_ENABLED": {
         "tab": "privacy", "label": "Ambient screen capture", "type": "bool",
         "default": False,
@@ -1695,6 +1720,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Listening & watching", ["AMBIENT_LISTEN_ENABLED",
                                   "AMBIENT_SCREEN_ENABLED",
                                   "SCREENSHOT_PRIVACY_BLOCKLIST"]),
+        ("Who can teach him", ["LEARN_ONLY_FROM_OWNER", "LEARN_FOLLOWUP_S",
+                               "LEARN_VOICE_REJECT_BELOW"]),
         ("Faces", ["FACE_ID_ENABLED", "GREET_NEW_PEOPLE_ENABLED"]),
     ],
     "integrations": [

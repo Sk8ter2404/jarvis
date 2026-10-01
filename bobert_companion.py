@@ -1653,7 +1653,10 @@ def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
     core/topic_hygiene.py: rejected unless owner-directed with a clean
     transcript; otherwise recorded as a sighting and only SURFACED (appended
     to topics / added to projects) once seen in MIN_OWNER_TURNS separate owner
-    turns with a label that is not mostly non-words. Facts are unaffected.
+    turns with a label that is not mostly non-words. Facts are unaffected by
+    that gate; with LEARN_ONLY_FROM_OWNER on (2026-09-30, core/learn_gate.py)
+    a dict provenance also needs ``owner_directed`` or ``owner_voice`` for its
+    FACTS to land.
     """
     # A bare string (a malformed extractor reply) would otherwise be iterated
     # character by character into one-letter "facts"/"projects".
@@ -1697,6 +1700,20 @@ def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
 
     added_facts: list[str] = []
     added_projects: list[str] = []
+
+    # Owner-only learning (core/learn_gate.py): with LEARN_ONLY_FROM_OWNER on,
+    # an automated learner's facts land only when its provenance vouches for
+    # the owner -- an owner-directed turn, or overheard speech whose voiceprint
+    # matched. The learn_from_turn gate already drops other turns before
+    # extraction; this catches the ambient extractor and any future learner.
+    # Counts only in the log, never the fact text.
+    if (new_facts and LEARN_ONLY_FROM_OWNER and isinstance(provenance, dict)
+            and not (provenance.get("owner_directed")
+                     or provenance.get("owner_voice"))):
+        print(f"  [learn-gate] {len(new_facts)} fact(s) from "
+              f"{provenance.get('source') or 'a learner'} not kept: "
+              f"not confirmed as the owner")
+        new_facts = []
 
     # Topic/project write gate (rules 1-2 here, outside the lock: the owner-
     # vocabulary read is file I/O). See the docstring and core/topic_hygiene.
@@ -2246,13 +2263,111 @@ def _parse_json_array(text: str) -> list:
 # rest go in the next call. Each queued turn keeps its own provenance (topic
 # hygiene) and a batch never mixes owner-directed with overheard turns.
 _learn_lock = threading.Lock()
-_learn_pending: list = []          # [(user_msg, ai_reply, owner_directed, conf), ...] oldest first
+_learn_pending: list = []          # [(user_msg, ai_reply, owner_directed, conf[, voice]), ...] oldest first
 _learn_worker_live = [False]       # a worker thread owns the queue
 _LEARN_BATCH_MAX = 6
 
+# Owner-only learning (core/learn_gate.py, LEARN_ONLY_FROM_OWNER). Every turn
+# (and every standby wake) goes through ONE classifier thread, in order: the
+# voiceprint check costs a resemblyzer embedding, which must never run on the
+# main loop, and the follow-up window needs the turns in the order they
+# happened. Survivors join _learn_pending exactly as before.
+from core import learn_gate as _learn_gate_mod  # noqa: E402
+_learn_gate_queue: "queue.Queue | None" = None
+_learn_gate_live = [False]
+_learn_gate_state = [None]         # the LearnGate, built on first use
+
+
+def _learn_gate() -> "_learn_gate_mod.LearnGate":
+    if _learn_gate_state[0] is None:
+        _learn_gate_state[0] = _learn_gate_mod.LearnGate(LEARN_FOLLOWUP_S)
+    return _learn_gate_state[0]
+
+
+def _learn_voice_verdict(audio, sample_rate: int) -> "tuple[str, float]":
+    """(verdict, score) of the turn's raw audio against the enrolled
+    voiceprints (core/learn_gate.voice_verdict). UNAVAILABLE when nobody is
+    enrolled, resemblyzer is missing, or there is no audio. Never raises."""
+    try:
+        if audio is None or int(sample_rate or 0) <= 0:
+            return _learn_gate_mod.UNAVAILABLE, 0.0
+        import core.voice_id as _vid
+        if not _vid.list_enrolled() or not _vid.is_available():
+            return _learn_gate_mod.UNAVAILABLE, 0.0
+        name, score = _vid.identify_speaker(audio, int(sample_rate))
+        may_write = bool(name) and _vid.can(name, "memory_write")
+        return _learn_gate_mod.voice_verdict(
+            name, score, enrolled=True, may_write=may_write,
+            reject_below=LEARN_VOICE_REJECT_BELOW), float(score or 0.0)
+    except Exception as e:
+        print(f"  [learn-gate] voice check failed: {type(e).__name__}")
+        return _learn_gate_mod.UNAVAILABLE, 0.0
+
+
+def _learn_gate_submit(item: tuple) -> None:
+    """Hand one turn / wake to the classifier thread (started on first use).
+    Never blocks, never raises."""
+    global _learn_gate_queue
+    try:
+        if _learn_gate_queue is None:
+            _learn_gate_queue = queue.Queue(maxsize=256)
+        _learn_gate_queue.put_nowait(item)
+        if not _learn_gate_live[0]:
+            _learn_gate_live[0] = True
+            threading.Thread(target=_learn_gate_loop, name="learn-gate",
+                             daemon=True).start()
+    except Exception as e:
+        _learn_gate_live[0] = False
+        print(f"  [learn-gate] dropped a turn: {type(e).__name__}")
+
+
+def _learn_gate_note_wake() -> None:
+    """A standby wake word: the owner is starting a conversation. Queued
+    with the turns so the window opens at the right point in the sequence."""
+    if LEARN_ONLY_FROM_OWNER:
+        _learn_gate_submit(("wake", time.monotonic()))
+
+
+def _learn_gate_classify(item: tuple) -> None:
+    """Decide one queued item; a turn that may teach joins _learn_pending.
+    Logs the decision and the voice score, never the turn's text."""
+    if item[0] == "wake":
+        _learn_gate().note_wake(item[1])
+        return
+    (_kind, ts, user_msg, ai_reply, owner_directed, conf,
+     injected, wake, audio, sample_rate, voice) = item
+    score = None
+    if voice is None:
+        if injected:
+            voice = _learn_gate_mod.UNAVAILABLE
+        else:
+            voice, score = _learn_voice_verdict(audio, sample_rate)
+    ok, why = _learn_gate().decide(ts, injected=injected, wake=wake,
+                                   voice=voice, overheard=not owner_directed)
+    _score = f", voice {score:.2f}" if isinstance(score, float) and score else ""
+    print(f"  [learn-gate] {'learning from' if ok else 'not learning from'} "
+          f"this turn: {why}{_score}")
+    if ok:
+        _learn_enqueue((user_msg, ai_reply, bool(owner_directed), conf, voice))
+
+
+def _learn_gate_loop() -> None:
+    while True:
+        try:
+            item = _learn_gate_queue.get()
+        except Exception:
+            _learn_gate_live[0] = False
+            return
+        try:
+            _learn_gate_classify(item)
+        except Exception as e:
+            print(f"  [learn-gate] classify failed: {type(e).__name__}")
+
 
 def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
-                    owner_directed: bool = True, conf=None):
+                    owner_directed: bool = True, conf=None,
+                    injected: bool = False, wake: bool = False,
+                    audio=None, sample_rate: int = 0, voice=None):
     """Background: extract new facts/projects/topic from this exchange.
 
     ``memory`` is accepted (and deliberately IGNORED) for call-site
@@ -2271,14 +2386,32 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
     (core/topic_hygiene.py). The main loop's answered turn is owner-directed
     and passes that turn's Whisper metadata; the ambient path
     (_ambient_learn_from_gated) passes owner_directed=False, so overheard
-    speech can still teach facts but never a topic or a project."""
+    speech can still teach facts but never a topic or a project.
+
+    ``injected`` / ``wake`` / ``audio`` / ``sample_rate`` / ``voice``
+    (2026-09-30, owner-only learning): with LEARN_ONLY_FROM_OWNER on, the
+    turn first goes through core/learn_gate.py on the learn-gate thread --
+    typed, wake-word, owner-voice and follow-up turns may teach; anyone
+    else's never reaches the extractor. ``voice`` is a verdict the caller
+    already has (the ambient path's voice-ID); otherwise ``audio`` is checked
+    against the enrolled voiceprints. Off, these are ignored."""
     if not LEARN_EVERY_TURN:
         return
     # Nothing heard during a device dialogue (or its tail) is learned.
     if _dialogue_gate_active():
         return
+    if LEARN_ONLY_FROM_OWNER:
+        _learn_gate_submit(("turn", time.monotonic(), user_msg, ai_reply,
+                            bool(owner_directed), conf, bool(injected),
+                            bool(wake), audio, sample_rate, voice))
+        return
+    _learn_enqueue((user_msg, ai_reply, bool(owner_directed), conf))
+
+
+def _learn_enqueue(turn: tuple) -> None:
+    """Queue one turn for extraction and make sure a worker drains it."""
     with _learn_lock:
-        _learn_pending.append((user_msg, ai_reply, bool(owner_directed), conf))
+        _learn_pending.append(turn)
         if _learn_worker_live[0]:
             return          # the live worker picks this turn up
         _learn_worker_live[0] = True
@@ -2310,6 +2443,11 @@ def _learn_provenance(batch) -> dict | None:
         return None
     turns = [_learn_turn_fields(t) for t in batch]
     owner = all(t[2] for t in turns)
+    # Owner-only learning: overheard turns that reached the queue through the
+    # learn gate carry an "owner" voice verdict (5th field); merge_memory
+    # keeps their facts on that (core/learn_gate.py).
+    owner_voice = all(len(t) > 4 and t[4] == _learn_gate_mod.OWNER
+                      for t in batch)
     confs = [t[3] for t in turns if isinstance(t[3], dict)]
     conf = None
     if confs:
@@ -2321,7 +2459,8 @@ def _learn_provenance(batch) -> dict | None:
                     and not isinstance(c.get(key), bool)]
             if vals:
                 conf[key] = pick(vals)
-    return {"owner_directed": owner, "turn_text": turns[-1][0], "conf": conf,
+    return {"owner_directed": owner, "owner_voice": owner_voice,
+            "turn_text": turns[-1][0], "conf": conf,
             "source": "owner turn" if owner else "ambient speech"}
 
 
@@ -2733,9 +2872,10 @@ def _ambient_learn_from_gated(text: str, memory: dict,
                 if not _ambient_should_learn_text(snippet, conf, peak_rms):
                     return
                 # Overheard (not addressed to JARVIS): facts only — never a
-                # topic or project (core/topic_hygiene.py rule 1).
+                # topic or project (core/topic_hygiene.py rule 1). The voice
+                # verdict lets owner-only learning keep it (core/learn_gate).
                 learn_from_turn(snippet, "", memory, owner_directed=False,
-                                conf=conf)
+                                conf=conf, voice=_learn_gate_mod.OWNER)
                 print(f"  [ambient-learn] ingested gated text ({n} chars) "
                       f"— owner voice (score={vscore:.2f})")
                 return
@@ -2744,8 +2884,15 @@ def _ambient_learn_from_gated(text: str, memory: dict,
                   f"(not enrolled owner, score={vscore:.2f}) ({n} chars)")
             return
 
-        # (3) Voice-ID unavailable → media-suppress already passed; apply the
-        # content heuristic to drop stray low-information TV fragments.
+        # (3) Voice-ID unavailable. Owner-only learning (core/learn_gate.py)
+        # never learns overheard speech it cannot attribute to the owner, so
+        # skip the content judge's local-LLM call too.
+        if LEARN_ONLY_FROM_OWNER:
+            print("  [ambient-learn] skipped: owner-only learning and the "
+                  f"voiceprint could not confirm the owner ({n} chars)")
+            return
+        # Otherwise media-suppress already passed; apply the content heuristic
+        # to drop stray low-information TV fragments.
         if n < _AMBIENT_LEARN_MIN_CHARS or len(snippet.split()) < _AMBIENT_LEARN_MIN_WORDS:
             print("  [ambient-learn] skipped: low-information fragment "
                   f"(voice-ID unavailable) ({n} chars)")
@@ -34806,6 +34953,9 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
         except Exception:
             pass
         print("  [wake] Waking up")
+        # Owner-only learning: a standby wake opens the follow-up window, so
+        # the conversation it starts can teach (core/learn_gate.py).
+        _learn_gate_note_wake()
         # Context-aware greeting — see context_aware_greeting() for the
         # priority order (late-night repeat > morning-first > mid-print >
         # looking-away > variety bank). The wake text is passed so the variety
@@ -36308,8 +36458,16 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
 
                 # Real-time learning: extract facts in background (non-blocking).
                 # An answered turn is owner-directed; its Whisper metadata lets
-                # the topic gate refuse a low-confidence transcript.
-                learn_from_turn(text, reply, memory, conf=conf)
+                # the topic gate refuse a low-confidence transcript. With
+                # LEARN_ONLY_FROM_OWNER on, the learn gate also needs to know
+                # whether it was typed, led by the wake word, and whose voice
+                # it was (this turn's RAW capture; None for a typed turn).
+                _typed = _injected_text is not None
+                learn_from_turn(text, reply, memory, conf=conf,
+                                injected=_typed,
+                                wake=_text_has_wake_prefix(text),
+                                audio=None if _typed else _last_capture_audio,
+                                sample_rate=0 if _typed else _last_capture_sr)
 
                 # Ambient-learning 'answer_then_quiet': this normal-mode turn was the
                 # ONE reply granted after the wake word — now drop straight back to

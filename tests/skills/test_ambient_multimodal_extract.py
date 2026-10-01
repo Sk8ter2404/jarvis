@@ -193,6 +193,36 @@ class AmbientExtractRunTests(unittest.TestCase):
         self.assertEqual(self.mod._facts_added_total, 1)
         self.assertEqual(summary["mentions"][0]["text"], "Atlas")
 
+    def test_owner_only_learning_skips_the_llm_pass(self):
+        # 2026-09-30 (core/learn_gate.py): nothing in this overheard stream
+        # can be attributed to the owner, so merge_memory would keep none of
+        # it; the pass must not spend a local-LLM call extracting it.
+        bc = _bc_with()
+        bc.LEARN_ONLY_FROM_OWNER = True
+        now = time.time()
+        audio = [{"ts": now, "source": "mic", "text": "we fly out Tuesday",
+                  "window": ""}]
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_tail_jsonl", side_effect=[audio, []]), \
+             mock.patch.object(self.mod, "_llm_extract") as llm, \
+             mock.patch.object(self.mod, "_merge_into_memory") as merge:
+            summary = self.mod._run_once()
+        llm.assert_not_called()
+        merge.assert_not_called()
+        self.assertEqual(summary["skipped"], "owner-only learning")
+        self.assertEqual(summary["facts_added"], 0)
+
+    def test_owner_only_needs_a_real_true_not_any_truthy_value(self):
+        # A MagicMock attribute (or a junk setting) must not switch it on.
+        bc = _bc_with()
+        now = time.time()
+        audio = [{"ts": now, "source": "mic", "text": "fresh talk", "window": ""}]
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_tail_jsonl", side_effect=[audio, []]), \
+             mock.patch.object(self.mod, "_llm_extract", return_value={}) as llm:
+            self.mod._run_once()
+        llm.assert_called_once()
+
     # ── actions ──────────────────────────────────────────────────────────
     def test_status_off_by_default(self):
         out = self.actions["ambient_extract_status"]("")

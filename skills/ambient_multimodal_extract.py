@@ -16,7 +16,9 @@ small LLM prompt to:
 New facts/projects are appended to bobert_memory.json via the same MAX_*
 ceilings + dedupe pass the live learner uses. Projects from this overheard
 stream are refused by merge_memory's topic gate (core/topic_hygiene.py: only
-owner-directed turns may teach a project); facts are unaffected. The
+owner-directed turns may teach a project); facts are unaffected unless
+LEARN_ONLY_FROM_OWNER is on, when nothing here can be attributed to the
+owner and a pass skips its LLM call (core/learn_gate.py). The
 extractor also writes a per-run summary into data/ambient_extracts.jsonl so
 the user can audit what was learned.
 
@@ -288,6 +290,12 @@ def _run_once() -> dict:
         return summary
 
     window_text = _format_window(merged)
+    # Owner-only learning (core/learn_gate.py): none of this overheard stream
+    # can be attributed to the owner, so merge_memory would keep none of its
+    # facts or projects; skip the LLM call that would extract them.
+    if window_text.strip() and _get_config("LEARN_ONLY_FROM_OWNER", False) is True:
+        summary["skipped"] = "owner-only learning"
+        window_text = ""
     if not window_text.strip():
         with _lock:
             _last_run_at = time.time()

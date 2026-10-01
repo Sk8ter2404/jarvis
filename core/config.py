@@ -535,6 +535,19 @@ REQUIRE_WAKE_MODE = False
 # core/followup_window.py. Set via user_settings.json.
 FOLLOWUP_WINDOW_S = 0.0
 
+# Owner-only learning (core/learn_gate.py). When True, JARVIS learns facts,
+# topics and projects only from turns that were clearly the owner's: typed,
+# led by the wake word (or right after a standby wake), matched to the
+# owner's enrolled voiceprint, or a follow-up within LEARN_FOLLOWUP_S of one
+# of those. A voice that scores below LEARN_VOICE_REJECT_BELOW against the
+# enrolled voiceprint never teaches; overheard speech teaches only with a
+# matched voiceprint, and the background ambient extractor stops. Off by
+# default: without an enrolled voiceprint or the wake word, almost nothing
+# would teach. Set via user_settings.json; applies on the next start.
+LEARN_ONLY_FROM_OWNER = False
+LEARN_FOLLOWUP_S = 90.0
+LEARN_VOICE_REJECT_BELOW = 0.60
+
 # Known-device speech filter (core/device_speech_filter.py). When True, an
 # utterance that matches a line a known device speaks (phrase lists in the
 # gitignored data/device_phrases/*.json) is ignored before the wake gate, the

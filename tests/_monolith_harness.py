@@ -236,6 +236,12 @@ _MONOLITH_RESTORE_NAMES = (
     # core.local_traffic is reset in _restore_monolith_pristine.
     "_last_owner_turn_at", "_reprime_primed_at", "_reprime_posts_mark",
     "_learn_pending", "_learn_worker_live",
+    # Owner-only learning (2026-09-30, core/learn_gate.py): the gate's
+    # follow-up window and its classifier thread's flag. A leaked window would
+    # let a LATER test's unaddressed turn teach; a leaked flag would park every
+    # later turn in a queue nobody drains. LEARN_ONLY_FROM_OWNER itself is
+    # pinned to the shipped default in MonolithGlobalsTestCase.run.
+    "_learn_gate_state", "_learn_gate_live",
     # Proactive-remark gates (2026-09-30): the owner's last MIC turn, the
     # remark history (repeat ring, spoken-remark times, last attempt, logged
     # hold) and the face-presence state (the detector's last detail, the
@@ -598,6 +604,11 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         _saved_force = _cfg.AMBIENT_LEARNING_FORCE_LOCAL
         _cfg.MODEL_ROUTING = {"chat": "auto", "vision": "auto", "ambient": "auto"}
         _cfg.AMBIENT_LEARNING_FORCE_LOCAL = False
+        # The owner's box turns owner-only learning on; every learner test
+        # expects the shipped default (off) unless it patches it on itself.
+        _saved_owner_only = getattr(bc, "LEARN_ONLY_FROM_OWNER", None)
+        if _saved_owner_only is not None:
+            bc.LEARN_ONLY_FROM_OWNER = False
         # Start clean too, not only end clean: anything that ran before the
         # first monolith test (an import-time Kinect pump, a light-tier test)
         # may have left history in the process-wide camera gate.
@@ -610,3 +621,5 @@ class MonolithGlobalsTestCase(unittest.TestCase):
             _heal_leaked_mocks(bc, _before, self.id())
             _cfg.MODEL_ROUTING = _saved_route
             _cfg.AMBIENT_LEARNING_FORCE_LOCAL = _saved_force
+            if _saved_owner_only is not None:
+                bc.LEARN_ONLY_FROM_OWNER = _saved_owner_only
