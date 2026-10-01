@@ -781,7 +781,11 @@ class TranscribeTests(MonolithGlobalsTestCase):
         fake_stt = mock.Mock()
         info = mock.Mock(no_speech_prob=0.1)
         fake_stt.transcribe.return_value = (iter([_Seg("open a cello please", 0.1, -0.2)]), info)
-        with mock.patch.object(self.bc, "_ensure_whisper"),                 mock.patch.object(self.bc, "_stt", fake_stt),                 mock.patch.object(self.bc, "_stt_engine", "faster_whisper"),                 mock.patch.object(self.bc, "STT_HOTWORDS", "Zorblat, Flemwick", create=True),                 mock.patch.object(self.bc, "STT_REPLACEMENTS", {"a cello": "Zorblat"}, create=True):
+        with mock.patch.object(self.bc, "_ensure_whisper"), \
+                mock.patch.object(self.bc, "_stt", fake_stt), \
+                mock.patch.object(self.bc, "_stt_engine", "faster_whisper"), \
+                mock.patch.object(self.bc, "STT_HOTWORDS", "Zorblat, Flemwick", create=True), \
+                mock.patch.object(self.bc, "STT_REPLACEMENTS", {"a cello": "Zorblat"}, create=True):
             text, _conf = self.bc.transcribe(np.zeros(8, dtype=np.float32))
         self.assertEqual(text, "open Zorblat please")
         self.assertEqual(fake_stt.transcribe.call_args.kwargs["hotwords"], "Zorblat, Flemwick")
@@ -790,10 +794,63 @@ class TranscribeTests(MonolithGlobalsTestCase):
         fake_stt = mock.Mock()
         info = mock.Mock(no_speech_prob=0.1)
         fake_stt.transcribe.return_value = (iter([_Seg("open a cello", 0.1, -0.2)]), info)
-        with mock.patch.object(self.bc, "_ensure_whisper"),                 mock.patch.object(self.bc, "_stt", fake_stt),                 mock.patch.object(self.bc, "_stt_engine", "faster_whisper"),                 mock.patch.object(self.bc, "STT_HOTWORDS", "", create=True),                 mock.patch.object(self.bc, "STT_REPLACEMENTS", {}, create=True):
+        with mock.patch.object(self.bc, "_ensure_whisper"), \
+                mock.patch.object(self.bc, "_stt", fake_stt), \
+                mock.patch.object(self.bc, "_stt_engine", "faster_whisper"), \
+                mock.patch.object(self.bc, "STT_HOTWORDS", "", create=True), \
+                mock.patch.object(self.bc, "STT_REPLACEMENTS", {}, create=True):
             text, _conf = self.bc.transcribe(np.zeros(8, dtype=np.float32))
         self.assertEqual(text, "open a cello")
         self.assertIsNone(fake_stt.transcribe.call_args.kwargs["hotwords"])
+
+    def _vocab_patches(self, fake_stt, hotwords):
+        return (mock.patch.object(self.bc, "_ensure_whisper"),
+                mock.patch.object(self.bc, "_stt", fake_stt),
+                mock.patch.object(self.bc, "_stt_engine", "faster_whisper"),
+                mock.patch.object(self.bc, "STT_HOTWORDS", hotwords, create=True),
+                mock.patch.object(self.bc, "STT_REPLACEMENTS", {}, create=True))
+
+    def test_hotword_echo_is_dropped_not_a_turn(self):
+        # Live 2026-10-01 17:32: room noise came back as the hotwords list, starting
+        # with the wake word, and became a turn. It must come back as no speech.
+        fake_stt = mock.Mock()
+        info = mock.Mock(no_speech_prob=0.1)
+        echo = "JARVIS, Zorblat, Flemwick, Quonset, Brindle,"
+        fake_stt.transcribe.return_value = (iter([_Seg(echo, 0.1, -0.2)]), info)
+        p = self._vocab_patches(fake_stt, "JARVIS, Zorblat, Flemwick, Quonset, Brindle")
+        with p[0], p[1], p[2], p[3], p[4]:
+            text, conf = self.bc.transcribe(np.zeros(8, dtype=np.float32))
+        self.assertEqual(text, "")
+        self.assertEqual(conf["no_speech_prob"], 1.0)
+        # and the wake word itself never reached Whisper as a hotword
+        self.assertEqual(fake_stt.transcribe.call_args.kwargs["hotwords"],
+                         "Zorblat, Flemwick, Quonset, Brindle")
+
+    def test_a_real_request_naming_hotwords_survives(self):
+        fake_stt = mock.Mock()
+        info = mock.Mock(no_speech_prob=0.1)
+        said = "Jarvis, open Zorblat and Flemwick on the left monitor please"
+        fake_stt.transcribe.return_value = (iter([_Seg(said, 0.1, -0.2)]), info)
+        p = self._vocab_patches(fake_stt, "Zorblat, Flemwick, Quonset")
+        with p[0], p[1], p[2], p[3], p[4]:
+            text, _conf = self.bc.transcribe(np.zeros(8, dtype=np.float32))
+        self.assertEqual(text, said)
+
+    def test_no_vad_retry_runs_without_hotwords(self):
+        # The retry decodes the clip VAD called non-speech — where the hint echoes.
+        fake_stt = mock.Mock()
+        info = mock.Mock(no_speech_prob=0.1)
+        fake_stt.transcribe.side_effect = [(iter([]), info),
+                                           (iter([_Seg("hello there", 0.1, -0.2)]), info)]
+        p = self._vocab_patches(fake_stt, "Zorblat, Flemwick")
+        with p[0], p[1], p[2], p[3], p[4]:
+            text, _conf = self.bc.transcribe(np.zeros(8, dtype=np.float32))
+        self.assertEqual(text, "hello there")
+        first, retry = fake_stt.transcribe.call_args_list
+        self.assertEqual(first.kwargs["hotwords"], "Zorblat, Flemwick")
+        self.assertTrue(first.kwargs["vad_filter"])
+        self.assertIsNone(retry.kwargs["hotwords"])
+        self.assertFalse(retry.kwargs["vad_filter"])
 
     def test_faster_whisper_empty_segments(self):
         fake_stt = mock.Mock()

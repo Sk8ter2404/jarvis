@@ -17755,6 +17755,9 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # the mic VAD gate, so it is not pure silence.
             # STT_HOTWORDS (core/stt_vocab.py, 2026-10-01): the owner's names
             # ("Accelo" came out as "a cello"). None when unset = unchanged.
+            # The no-VAD retry runs WITHOUT them: its audio is the clip VAD
+            # just called non-speech, exactly where Whisper reads the hint
+            # back as a "transcript" (live 17:32, "JARVIS, Accelo, Entry, ...").
             _hot = _stt_vocab.hotwords_arg(globals().get("STT_HOTWORDS"))
             segments_gen, info = _stt.transcribe(
                 audio, language="en",
@@ -17767,7 +17770,7 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
                 segments_gen, info = _stt.transcribe(
                     audio, language="en",
                     vad_filter=False,
-                    beam_size=5, hotwords=_hot,
+                    beam_size=5, hotwords=None,
                 )
                 segments = list(segments_gen)
             # Native decode completed without a CUDA fault — clear the
@@ -17775,6 +17778,9 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # on CPU int8. 2026-07-08.
             _consecutive_whisper_cuda_failures = 0
             text = " ".join((s.text or "").strip() for s in segments).strip()
+            if _hot and _stt_vocab.is_hotword_echo(text, globals().get("STT_HOTWORDS")):
+                print(f"  [stt] dropped a hotword echo ({len(text)} chars) — noise, not speech")
+                return "", {"no_speech_prob": 1.0, "avg_logprob": -10.0}
             text = _stt_vocab.apply_replacements(text, globals().get("STT_REPLACEMENTS"))
             if not segments:
                 # info still carries some signal even on empty transcription

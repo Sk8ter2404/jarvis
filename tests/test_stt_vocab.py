@@ -29,6 +29,41 @@ class HotwordsTests(unittest.TestCase):
         self.assertLessEqual(len(sv.hotwords_arg(", ".join(["word"] * 500))), 400)
 
 
+class WakeWordNeverAHotwordTests(unittest.TestCase):
+    def test_wake_words_are_stripped(self):
+        self.assertEqual(sv.hotwords_arg("JARVIS, Zorblat, hey  Jarvis, Flemwick, wake up"),
+                         "Zorblat, Flemwick")
+        self.assertIsNone(sv.hotwords_arg("Jarvis"))
+
+    def test_a_name_containing_jarvis_is_kept(self):
+        self.assertEqual(sv.hotwords_arg("Jarvis Rover"), "Jarvis Rover")
+
+
+class HotwordEchoTests(unittest.TestCase):
+    HOT = "JARVIS, Zorblat, Entry, Token, Flemwick, Quonset, 365, Brindle"
+
+    def test_the_live_echo_is_caught(self):
+        # Live 2026-10-01 17:32 shape: the list read back, trailing comma and all.
+        self.assertTrue(sv.is_hotword_echo(
+            "JARVIS, Zorblat, Entry, Token, Flemwick, Quonset, 365, Brindle,", self.HOT))
+        self.assertTrue(sv.is_hotword_echo("Zorblat, Entry, Token.", self.HOT))
+
+    def test_real_requests_survive(self):
+        for said in ("Jarvis, open Zorblat on my left monitor",
+                     "Jarvis open Zorblat and Flemwick please",
+                     "what's the token count on Quonset today",
+                     "Zorblat", "", "hello"):
+            with self.subTest(said=said):
+                self.assertFalse(sv.is_hotword_echo(said, self.HOT))
+
+    def test_no_hotwords_means_no_echo(self):
+        self.assertFalse(sv.is_hotword_echo("Zorblat, Entry, Token", ""))
+        self.assertFalse(sv.is_hotword_echo("Zorblat, Entry, Token", None))
+
+    def test_whole_words_only(self):
+        self.assertFalse(sv.is_hotword_echo("tokens entryway zorblatty", self.HOT))
+
+
 class ReplacementTests(unittest.TestCase):
     MAP = {"a cello": "Zorblat", "zor blat": "Zorblat", "a cello app": "the Zorblat app"}
 

@@ -20,14 +20,54 @@ from __future__ import annotations
 import re
 
 
-def hotwords_arg(hotwords) -> "str | None":
-    """faster-whisper ``hotwords``: a cleaned comma-separated string, or None."""
+# Whisper's ``hotwords`` hint is a decoder prompt, and on noise the model can
+# "transcribe" the prompt itself. Live 2026-10-01 17:32: with "JARVIS, Accelo, ..." as
+# hotwords, a 4 s clip of room noise came back as that very list, and because it began
+# with "JARVIS" it passed the wake gate and became a turn. So the wake words are never
+# sent as hotwords, and a transcript that is just the list read back is dropped.
+_NEVER_HOTWORDS = frozenset({"jarvis", "hey jarvis", "wake", "wake up"})
+_ECHO_MIN_HITS = 3          # distinct hotwords in the transcript
+_ECHO_MIN_COVERAGE = 0.6    # share of the transcript's words that are hotwords
+
+
+def _hotword_list(hotwords) -> "list[str]":
     if isinstance(hotwords, (list, tuple)):
         hotwords = ", ".join(str(h) for h in hotwords)
     if not isinstance(hotwords, str):
-        return None
-    words = [w.strip() for w in hotwords.split(",") if w.strip()]
+        return []
+    return [w.strip() for w in hotwords.split(",") if w.strip()]
+
+
+def hotwords_arg(hotwords) -> "str | None":
+    """faster-whisper ``hotwords``: a cleaned comma-separated string without the wake
+    words, or None."""
+    words = [w for w in _hotword_list(hotwords)
+             if " ".join(w.lower().split()) not in _NEVER_HOTWORDS]
     return ", ".join(words)[:400] or None
+
+
+def is_hotword_echo(text, hotwords) -> bool:
+    """True when `text` is Whisper reading the hotwords hint back instead of speech:
+    at least three distinct hotwords (wake words count here) making up most of it.
+    A real request that names a few of them ("open Accelo and Nextcloud") keeps
+    enough other words to stay well under the bar."""
+    if not text or not isinstance(text, str):
+        return False
+    phrases = {" ".join(w.lower().split()) for w in _hotword_list(hotwords)} | _NEVER_HOTWORDS
+    words = re.findall(r"[\w']+", text.lower())
+    if not words:
+        return False
+    rest = " ".join(words)
+    hits = covered = 0
+    for p in sorted(phrases, key=len, reverse=True):   # "hey jarvis" before "jarvis"
+        pw = re.findall(r"[\w']+", p)
+        if not pw:
+            continue
+        rest, n = re.subn(r"(?<!\S)" + " ".join(map(re.escape, pw)) + r"(?!\S)", " ", rest)
+        if n:
+            hits += 1
+            covered += n * len(pw)
+    return hits >= _ECHO_MIN_HITS and covered / len(words) >= _ECHO_MIN_COVERAGE
 
 
 def apply_replacements(text: str, mapping) -> str:
