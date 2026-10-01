@@ -2687,19 +2687,72 @@ def _act_start_overnight_upgrade(_: str = "") -> str:
 
 # ─── Window placement (Phase 4J) ───────────────────────────────────────
 
+# Monitor words the owner (and the local model) use that are not MONITORS keys
+# (2026-10-01: "put it on the main monitor" failed as "unknown monitor").
+# "main" / "primary" mean the Windows primary display: the one at the origin.
+_MONITOR_FILLER_RE = re.compile(r"\b(?:the|my|monitor|screen|display)\b")
+_PRIMARY_MONITOR_WORDS = ("main", "primary", "center", "centre")
+
+
+def _resolve_monitor(name) -> "str | None":
+    """A MONITORS key for `name` ('left', 'the main monitor', 'Primary'...), else None."""
+    from core.config import MONITORS
+    s = " ".join(_MONITOR_FILLER_RE.sub(" ", str(name or "").lower()).split())
+    if s in MONITORS:
+        return s
+    if s in _PRIMARY_MONITOR_WORDS:
+        for key, rect in MONITORS.items():
+            if tuple(rect[:2]) == (0, 0):
+                return key
+    return None
+
+
+def _split_monitor_args(args: str, monitor_first: bool) -> "tuple[str | None, str]":
+    """(monitor key, the other part) from '<a> | <b>' -- or the comma form the
+    local model writes every time ('left, youtube, cello'; live 2026-10-01: two
+    open_on_monitor calls in a row died on "format:"). The monitor is normally on
+    the documented side; if that side is not a monitor but the other end is, the
+    model swapped them. The monitor is None when neither end names one."""
+    if "|" in args:
+        a, b = (s.strip() for s in args.split("|", 1))
+    else:
+        parts = [p.strip() for p in str(args or "").split(",") if p.strip()]
+        if len(parts) < 2:
+            return None, ""
+        if monitor_first:
+            a, b = parts[0], " ".join(parts[1:])
+        else:
+            a, b = ", ".join(parts[:-1]), parts[-1]
+    mon, other = (a, b) if monitor_first else (b, a)
+    key = _resolve_monitor(mon)
+    if key is None:
+        swapped = _resolve_monitor(other)
+        if swapped is not None:
+            return swapped, mon
+    return key, other
+
+
+_YOUTUBE_SEARCH_RE = re.compile(r"^(?:youtube|you tube)\s+(?:for\s+)?(.+)$", re.IGNORECASE)
+
+
 def _act_open_on_monitor(args: str) -> str:
-    """args format: '<monitor_name> | <url-or-app-name>'
-    Opens the URL or launches the app, then moves the resulting window to
-    the named monitor and maximizes it."""
+    """args format: '<monitor_name> | <url-or-app-name>' (or the comma form,
+    see _split_monitor_args). Opens the URL or launches the app, then moves the
+    resulting window to the named monitor and maximizes it."""
     bc = _bc()
     from core.config import MONITORS
-    if "|" not in args:
+    if "|" not in args and "," not in args:
         return "format: open_on_monitor, <monitor_name> | <url-or-app>"
-    monitor_name, target = (s.strip() for s in args.split("|", 1))
-    monitor_name = monitor_name.lower()
-
-    if monitor_name not in MONITORS:
-        return f"unknown monitor '{monitor_name}'. Available: {list(MONITORS.keys())}"
+    monitor_name, target = _split_monitor_args(args, monitor_first=True)
+    if monitor_name is None:
+        asked = (args.split("|", 1)[0] if "|" in args else args.split(",", 1)[0]).strip().lower()
+        return f"unknown monitor '{asked}'. Available: {list(MONITORS.keys())}"
+    if not target:
+        return "format: open_on_monitor, <monitor_name> | <url-or-app>"
+    # "youtube cello" (the model's "youtube, cello") is a search, not an app.
+    m = _YOUTUBE_SEARCH_RE.match(target)
+    if m:
+        target = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(m.group(1).strip())
     mx, my, mw, mh = MONITORS[monitor_name]
 
     try:
@@ -2780,13 +2833,12 @@ def _act_move_window_to_monitor(args: str) -> str:
     """
     bc = _bc()
     from core.config import MONITORS
-    if "|" not in args:
+    if "|" not in args and "," not in args:
         return "format: move_window_to_monitor, <window_title> | <monitor_name>"
-    title, monitor_name = (s.strip() for s in args.split("|", 1))
-    monitor_name = monitor_name.lower()
-
-    if monitor_name not in MONITORS:
-        return f"unknown monitor '{monitor_name}'. Available: {list(MONITORS.keys())}"
+    monitor_name, title = _split_monitor_args(args, monitor_first=False)
+    if monitor_name is None:
+        asked = (args.split("|", 1)[1] if "|" in args else args.rsplit(",", 1)[-1]).strip().lower()
+        return f"unknown monitor '{asked}'. Available: {list(MONITORS.keys())}"
     mx, my, mw, mh = MONITORS[monitor_name]
 
     if not title:

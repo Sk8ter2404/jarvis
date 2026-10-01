@@ -3270,5 +3270,71 @@ class BcAccessorTests(unittest.TestCase):
             self.assertIs(A._bc(), fake_mod)
 
 
+class MonitorArgsLiveFormTests(unittest.TestCase):
+    """Live 2026-10-01: the local model writes the monitor actions with commas
+    ("open_on_monitor, left, youtube, cello"; "open_on_monitor, main, max") and
+    calls the primary display "main"; every such call died on "format:" or
+    "unknown monitor". Real layout: middle at the origin."""
+    MONS = {"left": (-2560, 0, 2560, 1440), "middle": (0, 0, 2560, 1440),
+            "right": (2560, 0, 2560, 1440), "top": (0, -1440, 2560, 1440)}
+
+    def test_monitor_words(self):
+        with mock.patch("core.config.MONITORS", self.MONS):
+            for word, key in (("left", "left"), ("the LEFT monitor", "left"),
+                              ("main", "middle"), ("my main screen", "middle"),
+                              ("primary", "middle"), ("center", "middle"),
+                              ("ceiling", None), ("", None)):
+                with self.subTest(word=word):
+                    self.assertEqual(A._resolve_monitor(word), key)
+
+    def test_split_forms(self):
+        with mock.patch("core.config.MONITORS", self.MONS):
+            self.assertEqual(A._split_monitor_args("left, youtube, cello", True),
+                             ("left", "youtube cello"))
+            self.assertEqual(A._split_monitor_args("main, max", True), ("middle", "max"))
+            self.assertEqual(A._split_monitor_args("left | example.com", True),
+                             ("left", "example.com"))
+            # swapped by the model
+            self.assertEqual(A._split_monitor_args("max, main", True), ("middle", "max"))
+            self.assertEqual(A._split_monitor_args("max | middle", False), ("middle", "max"))
+            self.assertEqual(A._split_monitor_args("hbo max, main", False), ("middle", "hbo max"))
+            self.assertEqual(A._split_monitor_args("no comma", True), (None, ""))
+
+    def _open(self, args, windows, launch=None):
+        bc = _base_bc()
+        bc._open_url_new_window.return_value = True
+        gw = _fake_gw(windows)
+        with _patch_bc(bc),                 mock.patch("core.config.MONITORS", self.MONS),                 mock.patch.dict(sys.modules, {"pygetwindow": gw}),                 mock.patch.object(A, "_act_launch_app", return_value="launched") as la,                 mock.patch.object(A.time, "sleep"),                 mock.patch.object(A.time, "time", _clock()):
+            out = A._act_open_on_monitor(args)
+        return out, bc, la
+
+    def test_the_live_youtube_call_now_searches(self):
+        win = _FakeWindow("cello - YouTube - Google Chrome")
+        out, bc, la = self._open("left, youtube, cello", [win])
+        bc._open_url_new_window.assert_called_once_with(
+            "https://www.youtube.com/results?search_query=cello")
+        la.assert_not_called()
+        self.assertIn("on left monitor", out)
+        self.assertTrue(win.maximized)
+
+    def test_the_live_main_max_call_now_opens_on_the_middle(self):
+        win = _FakeWindow("Home • HBO Max - Google Chrome")
+        out, _bc, la = self._open("main, max", [win])
+        la.assert_called_once_with("max")
+        self.assertIn("on middle monitor", out)
+
+    def test_move_window_comma_and_main(self):
+        target = mock.Mock()
+        target.title = "Home - HBO Max - Google Chrome"
+        target._hWnd = 7
+        bc = _base_bc()
+        bc._find_windows_by_title.return_value = [target]
+        w32 = mock.Mock()
+        with _patch_bc(bc),                 mock.patch("core.config.MONITORS", self.MONS),                 mock.patch.dict(sys.modules, {"win32gui": w32, "win32con": mock.Mock()}),                 mock.patch.object(A.time, "sleep"):
+            out = A._act_move_window_to_monitor("max, main")
+        bc._find_windows_by_title.assert_called_once_with("max")
+        self.assertIn("to middle monitor", out)
+
+
 if __name__ == "__main__":
     unittest.main()
