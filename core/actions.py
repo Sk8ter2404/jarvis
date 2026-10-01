@@ -1148,10 +1148,34 @@ def _act_ambient_mode_set(active: bool) -> str:
          the mic captured audio but nothing was ever learned — the user's
          "i don't think it's even learning" symptom. The extractor is the same
          one _act_ambient_learning_set starts; we skip it in staging so test
-         injects never write real memory."""
+         injects never write real memory.
+
+    The choice is also AMBIENT_LISTEN_ENABLED, live and in user_settings.json
+    (2026-10-01). The boot autostart (skills/ambient_listen.register) reads
+    only that key, never hud_state, so a voice "stop eavesdropping" lasted one
+    session and the room mic came back on at the next restart — the bug the
+    wake-word setter had until 2026-07-21. The live flag also gates
+    _ambient_learn_from_gated, which kept learning after "off". Saved through
+    the Settings GUI's single-key merge writer; skipped in staging, like the
+    extractor below."""
     bc = _bc()
     bc._ambient_mode_active[0] = bool(active)
     bc._write_hud_state(ambient_mode_active=bool(bc._ambient_mode_active[0]))
+    _on = bool(bc._ambient_mode_active[0])
+    bc.AMBIENT_LISTEN_ENABLED = _on
+    try:
+        import core.config as _cfg
+        _cfg.AMBIENT_LISTEN_ENABLED = _on
+    except Exception:
+        pass
+    _staging = getattr(bc, "_is_staging", lambda: False)
+    caveat = ""
+    if not _staging():
+        try:
+            from tools import settings_window as sw
+            sw.update_settings({"AMBIENT_LISTEN_ENABLED": _on})
+        except Exception:
+            caveat = " (though I couldn't save that for next boot)"
     action_name = "ambient_listen_start" if bc._ambient_mode_active[0] else "ambient_listen_stop"
     fn = bc.ACTIONS.get(action_name)
     if fn is not None:
@@ -1161,7 +1185,6 @@ def _act_ambient_mode_set(active: bool) -> str:
             return f"ambient daemon refused: {e}"
     # Start / stop the fact-extractor alongside the mic daemon so ambient mode
     # genuinely folds overheard speech into long-term memory.
-    _staging = getattr(bc, "_is_staging", lambda: False)
     if not _staging():
         _ext = sys.modules.get("skill_ambient_multimodal_extract")
         if _ext is not None:
@@ -1174,7 +1197,7 @@ def _act_ambient_mode_set(active: bool) -> str:
                 except Exception:
                     pass
     state_word = "active" if bc._ambient_mode_active[0] else "off"
-    return f"Ambient mode {state_word}, sir — Chappie is {'listening quietly and learning' if bc._ambient_mode_active[0] else 'standing down'}."
+    return f"Ambient mode {state_word}, sir — Chappie is {'listening quietly and learning' if bc._ambient_mode_active[0] else 'standing down'}{caveat}."
 
 
 def _act_greet_new_people_set(on: bool) -> str:
@@ -1184,22 +1207,32 @@ def _act_greet_new_people_set(on: bool) -> str:
     setter's idempotent live-toggle shape.
 
     We set the flag on core.config so the face-tracker poller (which re-reads
-    core.config every tick) picks it up WITHOUT a restart. Deliberately NOT
-    persisted to user_settings.json — this is a live, session toggle (like the
-    wake-word-mode setter), so it cleanly reverts on the next boot to the
-    opt-in default. Honest about the face-ID dependency: the greeting needs the
-    webcams to actually recognise faces, so it nudges the user to enable
-    FACE_ID_ENABLED when that's still off."""
+    core.config every tick) picks it up WITHOUT a restart, AND save it to
+    user_settings.json through the Settings GUI's single-key merge writer
+    (2026-10-01). It used to be a session-only toggle on the premise that a
+    boot reverts to the opt-in default — but an owner file holding
+    GREET_NEW_PEOPLE_ENABLED=true reverts it to ON, so "stop greeting people"
+    silently came back at the next restart (the wake-word setter's 2026-07-21
+    bug). Saving is best-effort: on failure the flip holds for this session
+    and the reply says so. Honest about the face-ID dependency: the greeting
+    needs the webcams to actually recognise faces, so it nudges the user to
+    enable FACE_ID_ENABLED when that's still off."""
     try:
         import core.config as _cfg
         _cfg.GREET_NEW_PEOPLE_ENABLED = bool(on)
         face_id_on = bool(getattr(_cfg, "FACE_ID_ENABLED", False))
     except Exception as e:   # pragma: no cover - core.config import never fails here
         return f"I couldn't change the new-people greeting, sir — {e}."
+    try:
+        from tools import settings_window as sw
+        sw.update_settings({"GREET_NEW_PEOPLE_ENABLED": bool(on)})
+        caveat = ""
+    except Exception:
+        caveat = " (though I couldn't save that for next boot)"
     if not on:
-        return "Noted, sir — I'll stop announcing new faces."
+        return f"Noted, sir — I'll stop announcing new faces{caveat}."
     msg = ("Will do, sir — when a few unfamiliar faces turn up I'll say hello "
-           "once.")
+           f"once{caveat}.")
     if not face_id_on:
         msg += (" Note face recognition is still off, so I won't actually spot "
                 "them until you enable it.")
@@ -3401,6 +3434,41 @@ def _act_shutdown_jarvis(_: str = "") -> str:
 
 # ─── LLM backend switching (Phase 4K) ──────────────────────────────────
 
+def _apply_chat_brain(bc, route: str, backend: str) -> None:
+    """Point BOTH chat-brain knobs at one brain, live (2026-10-01).
+
+    _call_llm picks its branch from MODEL_ROUTING['chat'] FIRST
+    (_chat_takes_local_branch -> core.config.model_route) and only then from
+    AI_BACKEND, while _claude_reachable() lets a cloud call through on
+    AI_BACKEND alone. switch_llm used to set only AI_BACKEND — so the tray's
+    "Switch to Claude" ticked Claude, said "switched to claude" and every turn
+    stayed local (now with a paid cloud fallback) — and model_picker.set_brain
+    set only the route, so "use Claude" landed on the ollama branch. Both call
+    this now. The routing dicts are mutated IN PLACE (model_route reads
+    core.config's; model_picker reads the monolith's star-imported alias),
+    never replaced. `bc` may be None (no monolith): only core.config moves."""
+    targets = []
+    if bc is not None:
+        try:
+            bc.AI_BACKEND = backend
+            routing = getattr(bc, "MODEL_ROUTING", None)
+            if isinstance(routing, dict):
+                targets.append(routing)
+            else:
+                setattr(bc, "MODEL_ROUTING", {"chat": route})
+        except Exception:
+            pass
+    try:
+        import core.config as _cfg
+        routing = getattr(_cfg, "MODEL_ROUTING", None)
+        if isinstance(routing, dict) and all(routing is not t for t in targets):
+            targets.append(routing)
+    except Exception:
+        pass
+    for routing in targets:
+        routing["chat"] = route
+
+
 def _act_switch_llm(arg: str = "") -> str:
     """Switch AI_BACKEND between Claude and a local Ollama model.
     arg formats: 'claude' | 'anthropic' | '<ollama-model-tag>' (e.g.
@@ -3412,10 +3480,11 @@ def _act_switch_llm(arg: str = "") -> str:
     at boot, which copies AI_BACKEND + OLLAMA_MODEL into its own
     namespace. Setting `bc.AI_BACKEND = "ollama"` here mutates that
     namespace; every other read in bobert_companion sees the new value
-    via its own globals. core.config.AI_BACKEND stays at the boot value
-    (read-only after import) — that's fine: nothing reads from
-    core.config at runtime, only the wildcard-copied bobert_companion
-    attribute matters.
+    via its own globals. core.config.AI_BACKEND stays at the boot value.
+    The chat ROUTE, though, IS read from core.config on every turn
+    (model_route('chat')), so the switch moves MODEL_ROUTING['chat'] with
+    the backend — see _apply_chat_brain (2026-10-01). Runtime-only: neither
+    knob is persisted, so a restart returns to the saved pair together.
     """
     bc = _bc()
     from core.config import CLAUDE_MODEL
@@ -3433,7 +3502,7 @@ def _act_switch_llm(arg: str = "") -> str:
         except Exception:
             pass
     if tag in ("claude", "anthropic"):
-        bc.AI_BACKEND = "claude"
+        _apply_chat_brain(bc, "cloud", "claude")
         _publish_backend("anthropic")
         return f"switched to claude ({CLAUDE_MODEL})"
     def _resolved_local() -> str:
@@ -3445,7 +3514,7 @@ def _act_switch_llm(arg: str = "") -> str:
             return getattr(bc, "OLLAMA_MODEL", "")
 
     if tag == "ollama":
-        bc.AI_BACKEND = "ollama"
+        _apply_chat_brain(bc, "local", "ollama")
         model = _resolved_local()
         _publish_backend(model)
         return f"switched to ollama (model: {model})"
@@ -3453,7 +3522,7 @@ def _act_switch_llm(arg: str = "") -> str:
     if tag in bc._KNOWN_OLLAMA_MODELS or any(tag.startswith(p) for p in
             ("llama", "qwen", "mistral", "mixtral", "phi", "gemma",
              "deepseek", "codellama")):
-        bc.AI_BACKEND = "ollama"
+        _apply_chat_brain(bc, "local", "ollama")
         bc.OLLAMA_MODEL = tag
         # MAKE THE PICK AUTHORITATIVE (2026-07-14 bug-hunt). Setting OLLAMA_MODEL
         # alone had NO effect — every generation resolves through
@@ -3541,7 +3610,12 @@ def _act_ambient_mode_toggle(_: str = "") -> str:
     # bobert_companion does `from core.actions import *`; if that wildcard were
     # ever dropped the voice toggle would silently break (2026-05-30 audit).
     # The runtime flag still comes from bc — it's the shared state slot.
-    return _act_ambient_mode_set(not _bc()._ambient_mode_active[0])
+    # Flip from what is REALLY running, the tray's rule (2026-10-01): with
+    # AMBIENT_LISTEN_ENABLED the daemon auto-starts while _ambient_mode_active
+    # stays False, so flipping the cell turned a "stop" into a no-op "start"
+    # ("Ambient mode active, sir") and left the room mic transcribing. The tray
+    # copy was fixed on 2026-09-30; this one was missed. One helper now.
+    return _act_ambient_mode_set(not _bc()._ambient_effective_on())
 
 
 __all__ = [

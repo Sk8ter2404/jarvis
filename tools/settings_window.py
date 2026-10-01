@@ -917,7 +917,8 @@ SCHEMA: dict[str, dict] = {
                     "claude-opus-4-6", "claude-opus-4-8"],
         "default": "claude-sonnet-5",
         "help": "Cloud model + est. cost PER CONVERSATION: Haiku ~$0.02, "
-                "Sonnet 5 ~$0.06 (default — near-Opus smarts at Sonnet price), "
+                "Sonnet 5 ~$0.04 (default — near-Opus smarts, cheaper than "
+                "Sonnet 4.6), "
                 "Opus 4.8 ~$0.10 (the ceiling). (Local Ollama is $0 — set the "
                 "backend above to ollama.)",
     },
@@ -2076,6 +2077,16 @@ def save_settings(values: dict, path: str | None = None) -> None:
             out[key] = value
             continue
         coerced = coerce_value(spec, value)
+        if key in on_disk and values_equal(coerced,
+                                           coerce_value(spec, on_disk[key])):
+            # The caller left this key as load_settings gave it: keep the
+            # file's OWN value (2026-10-01). load_settings coerces, so a
+            # hand-set value the schema can't express (an enum value newer
+            # than its choices, e.g. a Claude model id) loaded as the default
+            # and every voice toggle's load -> change one key -> save wrote
+            # that default back over it, silently.
+            out[key] = on_disk[key]
+            continue
         if key not in on_disk and _is_schema_default(spec, coerced):
             continue
         out[key] = coerced

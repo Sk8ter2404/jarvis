@@ -1241,7 +1241,9 @@ class OverallTimeoutBackstopTests(unittest.TestCase):
         hang = __import__("threading").Event()
         self.addCleanup(hang.set)   # release the orphaned worker thread after.
 
-        async def _never_returns(request, actions):
+        async def _never_returns(request, actions, **_kw):
+            # **_kw: orchestrate() forwards the per-call cloud_allowed flag
+            # (2026-10-01 local-only gate).
             hang.wait()             # blocks the worker loop until cleanup.
             return "SHOULD_NOT_SURFACE"
 

@@ -16,7 +16,7 @@ import os
 from typing import List, Optional, Tuple
 
 #: The month these list-price tiers were recorded. They drift; treat as a guide.
-PRICING_AS_OF = "2026-07"
+PRICING_AS_OF = "2026-09"
 
 
 def _conv_tokens() -> Tuple[int, int]:
@@ -113,17 +113,20 @@ def _local_models() -> List[Model]:
 
 
 # Ordered cheapest -> priciest so the list reads as a "how fast it burns" dial.
+# Sonnet 5 lists at $2/$10 per MTok — BELOW Sonnet 4.6's $3/$15 (2026-10-01:
+# it was priced at $3/$15 here, so "model costs" overstated it by 50% and the
+# Opus ratio read ~1.7x instead of ~2.5x). It now sorts ahead of Sonnet 4.6.
 CATALOG: List[Model] = _local_models() + [
     Model("claude-haiku-4-5", "Claude Haiku", "claude", 1.0, 5.0,
           "fastest / cheapest cloud", "snappy + inexpensive; great for everyday"),
+    Model("claude-sonnet-5", "Claude Sonnet 5", "claude", 2.0, 10.0,
+          "balanced (default)", "near-Opus smarts, cheaper than Sonnet 4.6"),
     Model("claude-sonnet-4-6", "Claude Sonnet 4.6", "claude", 3.0, 15.0,
           "balanced (previous gen)", "strong reasoning at a moderate cost"),
-    Model("claude-sonnet-5", "Claude Sonnet 5", "claude", 3.0, 15.0,
-          "balanced (default)", "near-Opus smarts at the same Sonnet price"),
     Model("claude-opus-4-6", "Claude Opus", "claude", 5.0, 25.0,
           "smart / pricier", "previous-gen Opus"),
     Model("claude-opus-4-8", "Claude Opus 4.8", "claude", 5.0, 25.0,
-          "smartest / priciest", "most capable; ~1.7x Sonnet's burn rate"),
+          "smartest / priciest", "most capable; ~2.5x Sonnet 5's burn rate"),
 ]
 
 

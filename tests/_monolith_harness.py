@@ -157,6 +157,13 @@ _MONOLITH_RESTORE_NAMES = (
     "_focus_mode", "_focus_until", "_focus_missed_buffer",
     # ── single-element runtime state slots (core.state) ────────────────────
     "_sleep_mode", "_standby_mode", "_tts_muted", "_ambient_mode_active",
+    # The ambient on/off setter writes the live AMBIENT_LISTEN_ENABLED flag
+    # (2026-10-01); a test that toggled ambient must not leave it set.
+    "AMBIENT_LISTEN_ENABLED",
+    # switch_llm / set_brain now move the chat route with the backend
+    # (2026-10-01, core.actions._apply_chat_brain): the monolith's
+    # star-imported MODEL_ROUTING alias is mutated in place.
+    "MODEL_ROUTING",
     "_daemons_paused", "_debug_mode", "_audio_master_enabled",
     "_audio_aec_enabled", "_audio_ns_enabled", "_audio_agc_enabled",
     "_jarvis_played_music_at", "_ambient_music_last_hit", "_ambient_music_hits",
@@ -602,6 +609,9 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         import core.config as _cfg
         _saved_route = dict(_cfg.MODEL_ROUTING)
         _saved_force = _cfg.AMBIENT_LEARNING_FORCE_LOCAL
+        # The ambient setter mirrors its choice into core.config too
+        # (2026-10-01); restored below like the routing.
+        _saved_ambient = _cfg.AMBIENT_LISTEN_ENABLED
         _cfg.MODEL_ROUTING = {"chat": "auto", "vision": "auto", "ambient": "auto"}
         _cfg.AMBIENT_LEARNING_FORCE_LOCAL = False
         # The owner's box turns owner-only learning on; every learner test
@@ -621,5 +631,6 @@ class MonolithGlobalsTestCase(unittest.TestCase):
             _heal_leaked_mocks(bc, _before, self.id())
             _cfg.MODEL_ROUTING = _saved_route
             _cfg.AMBIENT_LEARNING_FORCE_LOCAL = _saved_force
+            _cfg.AMBIENT_LISTEN_ENABLED = _saved_ambient
             if _saved_owner_only is not None:
                 bc.LEARN_ONLY_FROM_OWNER = _saved_owner_only

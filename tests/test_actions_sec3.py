@@ -3027,6 +3027,14 @@ class ShutdownJarvisTests(unittest.TestCase):
 # _act_switch_llm — backend switching with allowlist
 # ===========================================================================
 class SwitchLlmTests(unittest.TestCase):
+    def setUp(self):
+        # switch_llm moves core.config.MODEL_ROUTING['chat'] with the backend
+        # (2026-10-01, _apply_chat_brain); put the real dict's contents back.
+        import core.config as _cfg
+        routing = _cfg.MODEL_ROUTING
+        saved = dict(routing)
+        self.addCleanup(lambda: (routing.clear(), routing.update(saved)))
+
     def _bc(self, backend="claude", ollama="qwen2.5:14b"):
         bc = mock.Mock()
         bc.AI_BACKEND = backend
@@ -3234,11 +3242,13 @@ class ClearLlmCacheTests(unittest.TestCase):
 
 class AmbientModeToggleTests(unittest.TestCase):
     def test_toggles_via_set_with_negated_flag(self):
-        # _act_ambient_mode_toggle reads bc._ambient_mode_active[0] and calls
-        # _act_ambient_mode_set with the negation. We patch the sibling setter
-        # to observe the argument without driving the daemon plumbing.
+        # _act_ambient_mode_toggle reads bc._ambient_effective_on() (since
+        # 2026-10-01: the running daemon, else _ambient_mode_active[0]) and
+        # calls _act_ambient_mode_set with the negation. We patch the sibling
+        # setter to observe the argument without driving the daemon plumbing.
         bc = mock.Mock()
         bc._ambient_mode_active = [False]
+        bc._ambient_effective_on.return_value = False
         with _patch_bc(bc), \
                 mock.patch.object(A, "_act_ambient_mode_set",
                                   return_value="Ambient mode active, sir.") as mset:
@@ -3249,6 +3259,7 @@ class AmbientModeToggleTests(unittest.TestCase):
     def test_toggles_off_when_currently_on(self):
         bc = mock.Mock()
         bc._ambient_mode_active = [True]
+        bc._ambient_effective_on.return_value = True
         with _patch_bc(bc), \
                 mock.patch.object(A, "_act_ambient_mode_set",
                                   return_value="off") as mset:

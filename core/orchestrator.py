@@ -77,6 +77,17 @@ DEFAULT_MERGER_TIMEOUT_S  = 20.0
 _log = logging.getLogger(__name__)
 
 
+class CloudDisabled(RuntimeError):
+    """Raised in place of a Claude call when the caller passed
+    ``cloud_allowed=False`` (2026-10-01). Every stage already catches a failed
+    Claude call and falls through to local Ollama, then to raw / deterministic
+    data — raising this sends a local-only turn down that SAME path, so the
+    planner, workers and merger never open a cloud connection. Before, a
+    "morning briefing" on an AI_BACKEND=ollama install still sent inbox, news
+    and system data to Claude, because the orchestrator was the one copy of
+    the cloud gate (bobert_companion._claude_reachable) that never got it."""
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  TYPES
 # ──────────────────────────────────────────────────────────────────────────
@@ -377,14 +388,15 @@ def plan_decomposition(
     timeout_s: float = DEFAULT_PLANNER_TIMEOUT_S,
     local_model: str | None = None,
     local_base_url: str = "http://127.0.0.1:11434",
+    cloud_allowed: bool = True,
 ) -> list[SubTask]:
     """Ask the planner LLM to decompose `request` into parallel sub_tasks.
 
     Returns an empty list if no sub-agent is relevant. If Claude is
-    unavailable (e.g. API capped), falls back to a local Ollama model when
-    one is reachable; only if that also fails does it degrade to a single
-    full-request sub_task targeting the first registered sub-agent — better
-    degraded than dark.
+    unavailable (e.g. API capped) or `cloud_allowed` is False (local-only
+    backend), falls back to a local Ollama model when one is reachable; only
+    if that also fails does it degrade to a single full-request sub_task
+    targeting the first registered sub-agent — better degraded than dark.
     """
     if not specs:
         return []
@@ -397,6 +409,8 @@ def plan_decomposition(
     )
     raw: str | None = None
     try:
+        if not cloud_allowed:
+            raise CloudDisabled("cloud disabled: local-only backend")
         raw = _claude_call(
             planner_model,
             _PLANNER_SYSTEM,
@@ -405,7 +419,9 @@ def plan_decomposition(
             timeout_s=timeout_s,
         )
     except Exception as e:
-        _log.warning("orchestrator: planner call failed: %s", e)
+        # A local-only turn is the normal path there, not a failure.
+        (_log.info if isinstance(e, CloudDisabled) else _log.warning)(
+            "orchestrator: planner call failed: %s", e)
         # Claude is down/capped — try a local Ollama model before degrading.
         ollama_model = _resolve_local_model(local_model)
         if ollama_model and _ollama_reachable(local_base_url):
@@ -494,9 +510,12 @@ def _run_worker_sync(
     local_model: str | None,
     local_base_url: str,
     timeout_s: float,
+    cloud_allowed: bool = True,
 ) -> SubTaskResult:
     """Synchronous worker execution. Wrapped in asyncio.to_thread by the
-    parallel dispatcher."""
+    parallel dispatcher. With `cloud_allowed` False a Claude-preferring
+    worker never calls Claude: it goes straight to the local-Ollama /
+    raw-tool-data fallback (see CloudDisabled)."""
     started = time.time()
     backend, model_id = _resolve_worker_model(spec, worker_model, local_model)
     system = _build_worker_system(spec, actions.keys())
@@ -567,6 +586,8 @@ def _run_worker_sync(
             )
         else:
             try:
+                if not cloud_allowed:
+                    raise CloudDisabled("cloud disabled: local-only backend")
                 output = _claude_call(
                     model_id, system, worker_user,
                     max_tokens=600,
@@ -627,6 +648,7 @@ async def dispatch_sub_agents(
     local_base_url: str = "http://127.0.0.1:11434",
     max_parallel: int = DEFAULT_MAX_PARALLEL,
     timeout_s: float = DEFAULT_WORKER_TIMEOUT_S,
+    cloud_allowed: bool = True,
 ) -> list[SubTaskResult]:
     """Run every sub_task concurrently, capped at `max_parallel` in flight."""
     if not sub_tasks:
@@ -672,6 +694,7 @@ async def dispatch_sub_agents(
                         local_model,
                         local_base_url,
                         timeout_s,
+                        cloud_allowed,
                     ),
                     timeout=backstop_s,
                 )
@@ -710,12 +733,14 @@ def merge_results(
     timeout_s: float = DEFAULT_MERGER_TIMEOUT_S,
     local_model: str | None = None,
     local_base_url: str = "http://127.0.0.1:11434",
+    cloud_allowed: bool = True,
 ) -> str:
     """Synthesise sub-agent outputs into a single TTS-ready reply.
 
-    If Claude is unavailable (e.g. API capped), tries a local Ollama model
-    when one is reachable; only if that also fails does it degrade to a
-    deterministic concatenation of the worker outputs.
+    If Claude is unavailable (e.g. API capped) or `cloud_allowed` is False
+    (local-only backend), tries a local Ollama model when one is reachable;
+    only if that also fails does it degrade to a deterministic concatenation
+    of the worker outputs.
     """
     usable = [r for r in results if r.output and not r.error]
     if not usable:
@@ -732,6 +757,8 @@ def merge_results(
         "Compose JARVIS's reply now."
     )
     try:
+        if not cloud_allowed:
+            raise CloudDisabled("cloud disabled: local-only backend")
         return _claude_call(
             merger_model,
             _MERGER_SYSTEM,
@@ -740,7 +767,8 @@ def merge_results(
             timeout_s=timeout_s,
         )
     except Exception as e:
-        _log.warning("orchestrator: merger call failed: %s", e)
+        (_log.info if isinstance(e, CloudDisabled) else _log.warning)(
+            "orchestrator: merger call failed: %s", e)
         # Claude is down/capped — try a local Ollama model before degrading.
         ollama_model = _resolve_local_model(local_model)
         if ollama_model and _ollama_reachable(local_base_url):
@@ -805,7 +833,7 @@ class Orchestrator:
     def list_specs(self) -> list[str]:
         return sorted(self.specs.keys())
 
-    def plan(self, request: str) -> list[SubTask]:
+    def plan(self, request: str, cloud_allowed: bool = True) -> list[SubTask]:
         return plan_decomposition(
             request,
             self.specs,
@@ -813,12 +841,14 @@ class Orchestrator:
             timeout_s=self.planner_timeout_s,
             local_model=self.local_model,
             local_base_url=self.local_base_url,
+            cloud_allowed=cloud_allowed,
         )
 
     async def dispatch(
         self,
         sub_tasks: Sequence[SubTask],
         actions: dict[str, Callable[[str], str]],
+        cloud_allowed: bool = True,
     ) -> list[SubTaskResult]:
         return await dispatch_sub_agents(
             sub_tasks,
@@ -829,9 +859,11 @@ class Orchestrator:
             local_base_url=self.local_base_url,
             max_parallel=self.max_parallel,
             timeout_s=self.worker_timeout_s,
+            cloud_allowed=cloud_allowed,
         )
 
-    def merge(self, request: str, results: Sequence[SubTaskResult]) -> str:
+    def merge(self, request: str, results: Sequence[SubTaskResult],
+              cloud_allowed: bool = True) -> str:
         return merge_results(
             request,
             results,
@@ -839,19 +871,27 @@ class Orchestrator:
             timeout_s=self.merger_timeout_s,
             local_model=self.local_model,
             local_base_url=self.local_base_url,
+            cloud_allowed=cloud_allowed,
         )
 
     async def orchestrate_async(
         self,
         request: str,
         actions: dict[str, Callable[[str], str]],
+        cloud_allowed: bool = True,
     ) -> str:
-        """Full pipeline. Returns empty string if nothing applicable ran."""
-        sub_tasks = self.plan(request)
+        """Full pipeline. Returns empty string if nothing applicable ran.
+
+        `cloud_allowed` is decided PER CALL, never stored on the instance:
+        get_orchestrator() is a lazy singleton that ignores kwargs after the
+        first call, so a constructor flag would freeze the backend seen at
+        the first briefing and miss a mid-session switch (2026-10-01)."""
+        sub_tasks = self.plan(request, cloud_allowed=cloud_allowed)
         if not sub_tasks:
             return ""
-        results = await self.dispatch(sub_tasks, actions)
-        return self.merge(request, results)
+        results = await self.dispatch(sub_tasks, actions,
+                                      cloud_allowed=cloud_allowed)
+        return self.merge(request, results, cloud_allowed=cloud_allowed)
 
     def _overall_timeout_s(self) -> float:
         """Generous wall-clock ceiling for the whole pipeline, derived from the
@@ -869,6 +909,7 @@ class Orchestrator:
         self,
         request: str,
         actions: dict[str, Callable[[str], str]],
+        cloud_allowed: bool = True,
     ) -> str:
         """Sync wrapper around `orchestrate_async`. Safe to call from the
         main turn-based loop, which is itself synchronous."""
@@ -889,7 +930,8 @@ class Orchestrator:
             try:
                 asyncio.set_event_loop(loop)
                 return loop.run_until_complete(
-                    self.orchestrate_async(request, actions)
+                    self.orchestrate_async(request, actions,
+                                           cloud_allowed=cloud_allowed)
                 )
             finally:
                 loop.close()
@@ -935,5 +977,11 @@ def orchestrate(
     actions: dict[str, Callable[[str], str]],
     **kwargs,
 ) -> str:
-    """One-line entrypoint that uses the lazy singleton orchestrator."""
-    return get_orchestrator(**kwargs).orchestrate(request, actions)
+    """One-line entrypoint that uses the lazy singleton orchestrator.
+
+    `cloud_allowed` (default True) is popped out of kwargs and passed per
+    call — see Orchestrator.orchestrate_async for why it is not a
+    constructor argument."""
+    cloud_allowed = bool(kwargs.pop("cloud_allowed", True))
+    return get_orchestrator(**kwargs).orchestrate(
+        request, actions, cloud_allowed=cloud_allowed)

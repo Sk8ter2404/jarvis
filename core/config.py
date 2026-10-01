@@ -154,9 +154,10 @@ PUSHBACK_MAX_CLEAR_PENDING    = 10   # >N pending tasks before clear_tasks asks
 # functional with NO Claude API key / NO credits at all. Claude is a BONUS
 # that sharpens replies when available, not a requirement (see CLAUDE_OPTIONAL).
 AI_BACKEND   = "claude"           # "claude" | "ollama"
-# claude-sonnet-5: near-Opus intelligence at the same list price Sonnet 4.6 had
-# ($3/$15 per MTok) — the best default brain per dollar as of 2026-07. Users who
-# want the ceiling can pick claude-opus-4-8 ($5/$25) in the Settings GUI.
+# claude-sonnet-5: near-Opus intelligence at $2/$10 per MTok — cheaper than
+# Sonnet 4.6's $3/$15 (price corrected 2026-10-01) — the best default brain per
+# dollar. Users who want more can pick claude-opus-4-8 ($5/$25) in the Settings
+# GUI.
 CLAUDE_MODEL = "claude-sonnet-5"
 OLLAMA_MODEL = "llama3"
 

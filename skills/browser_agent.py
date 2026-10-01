@@ -390,10 +390,13 @@ def _make_llm(imports: dict) -> Any:
     model = _model_name()
     # langchain_anthropic uses `model=`, some browser-use ChatAnthropic
     # variants use `model_name=` — try both.
+    # No sampling params (2026-10-01): Claude Sonnet 5 (CLAUDE_MODEL) and newer
+    # reject a non-default temperature/top_p/top_k with HTTP 400. browser-use's
+    # ChatAnthropic accepts temperature=0.0 at construction and then sends it
+    # on EVERY step, so every browser task failed on its first LLM call.
     for kwargs in (
-        {"model": model, "temperature": 0.0},
-        {"model_name": model, "temperature": 0.0},
         {"model": model},
+        {"model_name": model},
     ):
         try:
             return ChatAnthropic(**kwargs)
@@ -496,6 +499,20 @@ async def _run_task_inner(task: str, max_steps: int, headless: bool) -> str:
             final = fn
             break
     if final is None:
+        # A run whose steps all failed (every LLM call rejected, say) still
+        # returns normally: browser-use catches each step error and stops
+        # after max_failures, leaving no final result. Report the last step
+        # error honestly instead of reading out an AgentHistoryList dump
+        # (2026-10-01).
+        try:
+            _errs_fn = getattr(history, "errors", None)
+            _errs = [e for e in ((_errs_fn() if callable(_errs_fn) else None)
+                                 or []) if e]
+        except Exception:
+            _errs = []
+        if _errs:
+            return (f"Browser agent couldn't finish, sir — "
+                    f"{str(_errs[-1]).strip()[:200]}")
         # Last-ditch: stringify the history.
         try:
             final = str(history)[:1200]
@@ -548,10 +565,13 @@ async def _orchestrate(task: str, max_steps: int, headless: bool) -> str:
         # no local fallback. When the Anthropic API is capped/over-quota/rate-
         # limited the underlying call raises with one of these markers — surface
         # a clear message instead of a raw stack so the user knows it's the cap,
-        # not a broken task.
+        # not a broken task. No bare "400" (2026-10-01): Anthropic returns 400
+        # for ANY bad request (a rejected parameter, a malformed prompt), so it
+        # blamed the cap for real request errors. The cap's own 400 says
+        # "usage limits", which the first marker already catches.
         _err = f"{type(e).__name__}: {e}".lower()
         if any(m in _err for m in ("usage limit", "credit", "quota",
-                                   "rate limit", "rate_limit", "400")):
+                                   "rate limit", "rate_limit")):
             return ("Browser automation needs the cloud API, sir, which is "
                     "capped until it resets — I can't drive the browser until "
                     "then.")

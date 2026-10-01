@@ -908,6 +908,12 @@ class AmbientModeSetTests(_BaseActTest):
         super().setUp()
         self.bc._ambient_mode_active = [False]
         self.bc.ACTIONS = {}
+        # The setter mirrors the choice into core.config.AMBIENT_LISTEN_ENABLED
+        # (2026-10-01); put the real module's value back after each test. The
+        # Mock bc's _is_staging() is truthy, so nothing is saved to disk.
+        import core.config as _cfg
+        _saved = _cfg.AMBIENT_LISTEN_ENABLED
+        self.addCleanup(setattr, _cfg, "AMBIENT_LISTEN_ENABLED", _saved)
 
     def test_turn_on_invokes_start_action(self):
         start = mock.Mock(return_value="")

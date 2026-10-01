@@ -1985,6 +1985,14 @@ class SwitchLlmTagIsAuthoritativeTests(unittest.TestCase):
     to qwen2.5:14b" reported success while the box kept answering on gemma4.
     The pick must repoint the resolver cache (only when the tag is installed)."""
 
+    def setUp(self):
+        # switch_llm moves core.config.MODEL_ROUTING['chat'] with the backend
+        # (2026-10-01, _apply_chat_brain); put the real dict's contents back.
+        import core.config as _cfg
+        routing = _cfg.MODEL_ROUTING
+        saved = dict(routing)
+        self.addCleanup(lambda: (routing.clear(), routing.update(saved)))
+
     def _bc(self, installed):
         bc = mock.Mock()
         bc.AI_BACKEND = "claude"

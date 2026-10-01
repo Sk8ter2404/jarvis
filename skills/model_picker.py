@@ -572,7 +572,8 @@ def set_model(arg: str) -> str:
 
 def set_brain(arg: str = "") -> str:
     """Switch the CHAT route: local | cloud | auto. Updates + persists
-    MODEL_ROUTING['chat']. Empty / 'status' arg reports the current route."""
+    MODEL_ROUTING['chat'] and the matching AI_BACKEND (local -> ollama,
+    cloud/auto -> claude). Empty / 'status' arg reports the current route."""
     want = (arg or "").strip().lower()
 
     def _current_route() -> str:
@@ -607,25 +608,32 @@ def set_brain(arg: str = "") -> str:
         return ("Say local, cloud, or auto, sir — local is the free on-device "
                 "model, cloud is Claude, auto uses Claude with a local fallback.")
 
-    # ── live update of MODEL_ROUTING['chat'] (merge, never replace the dict).
+    # ── live update of MODEL_ROUTING['chat'] (merge, never replace the dict)
+    # AND AI_BACKEND with it (2026-10-01). The route alone left AI_BACKEND at
+    # "ollama" on a local-only install, so "cloud" skipped the local branch,
+    # failed `AI_BACKEND == "claude"` and landed on the ollama branch: "Chat
+    # brain set to Claude, sir" while the local model kept answering. One
+    # helper (core.actions._apply_chat_brain) moves both, for switch_llm too.
+    backend = "ollama" if route == "local" else "claude"
     bc = _monolith()
-    if bc is not None:
-        try:
-            routing = getattr(bc, "MODEL_ROUTING", None)
-            if isinstance(routing, dict):
-                routing["chat"] = route
-            else:
-                setattr(bc, "MODEL_ROUTING", {"chat": route})
-        except Exception:
-            pass
     try:
-        import core.config as _cfg
-        if isinstance(getattr(_cfg, "MODEL_ROUTING", None), dict):
-            _cfg.MODEL_ROUTING["chat"] = route
+        from core.actions import _apply_chat_brain
+        _apply_chat_brain(bc, route, backend)
+    except Exception:
+        pass
+    try:
+        if bc is not None and callable(getattr(bc, "_write_hud_state", None)):
+            # Keep the tray's AI-submenu checkmark on the brain in use.
+            bc._write_hud_state(llm_backend=(
+                "anthropic" if backend == "claude"
+                else str(_active_model() or getattr(bc, "LOCAL_LLM_MODEL", ""))))
     except Exception:
         pass
 
+    # Persist the pair together: a reboot into route=cloud + AI_BACKEND=ollama
+    # (or the reverse) is the same split brain again.
     persisted = _persist_setting("MODEL_ROUTING", {"chat": route})
+    persisted = _persist_setting("AI_BACKEND", backend) and persisted
 
     human = {"local": "the local model, sir — $0 per turn",
              "cloud": "Claude, sir",

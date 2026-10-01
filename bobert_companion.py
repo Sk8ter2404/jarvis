@@ -3640,7 +3640,8 @@ try:
             for _hud_k in ("tts_muted", "mic_muted", "sleep_mode", "standby_mode",
                            "ambient_mode_active", "daemons_paused", "debug_mode",
                            "audio_processing_enabled", "echo_cancel_enabled",
-                           "noise_suppress_enabled", "agc_enabled"):
+                           "noise_suppress_enabled", "agc_enabled",
+                           "toggle_cfg_seed"):
                 if _hud_k in _persisted_hud:
                     _hud_state_cache[_hud_k] = _persisted_hud[_hud_k]
 except Exception:
@@ -4265,6 +4266,15 @@ def _ambient_listen_running():
         return None
 
 
+def _ambient_effective_on() -> bool:
+    """Is ambient mode really on? What the mic daemon is doing when the skill
+    is loaded, else the _ambient_mode_active cell. The ONE rule both toggles
+    flip from (2026-10-01): the tray copy was fixed on 2026-09-30 but the voice
+    copy (core.actions._act_ambient_mode_toggle) kept reading the stale cell."""
+    _running = _ambient_listen_running()
+    return bool(_ambient_mode_active[0]) if _running is None else bool(_running)
+
+
 def _web_dashboard_port() -> int:
     """Port of the running web dashboard (0 when it is off). Never raises."""
     try:
@@ -4554,23 +4564,13 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         # same): with AMBIENT_LISTEN_ENABLED the daemon auto-starts while this
         # cell stays False, so flipping the cell would "start" an already
         # running daemon and the click did nothing (2026-09-30 audit).
-        _running = _ambient_listen_running()
-        _current = bool(_ambient_mode_active[0]) if _running is None else _running
-        _ambient_mode_active[0] = not _current
-        _write_hud_state(ambient_mode_active=bool(_ambient_mode_active[0]))
-        # Actually start / stop the ambient_listen daemon so the toggle
-        # has runtime effect. ACTIONS may not contain ambient_listen_*
-        # if the skill failed to load — fall back to a print so the user
-        # still sees something happened.
-        action = "ambient_listen_start" if _ambient_mode_active[0] else "ambient_listen_stop"
-        fn = ACTIONS.get(action)
-        if fn is not None:
-            try:
-                fn("")
-            except Exception as e:
-                print(f"  [tray] ambient_mode_toggle action {action!r} raised: {e}")
-        else:
-            print(f"  [tray] ambient_mode_toggle: {action!r} not registered")
+        # Then apply it through the voice setter (2026-10-01) instead of a
+        # second copy of its cell / hud_state / start-stop logic: that copy
+        # never saved AMBIENT_LISTEN_ENABLED (so a tray "off" came back on at
+        # the next boot) and never stopped the fact extractor.
+        _reply = _act_ambient_mode_set(not _ambient_effective_on())
+        if str(_reply).startswith("ambient daemon refused"):
+            print(f"  [tray] ambient_mode_toggle: {_reply}")
         _running = _ambient_listen_running()
         if _running is not None:
             _write_hud_state(ambient_listening=_running)
@@ -4707,7 +4707,38 @@ def _restore_tray_toggle_state() -> None:
         _ambient_mode_active[0] = bool(persisted.get("ambient_mode_active"))
     if "daemons_paused" in persisted:
         _daemons_paused[0] = bool(persisted.get("daemons_paused"))
-    if "debug_mode" in persisted:
+    # Settings vs tray for the five cells core/state.py seeds from core.config
+    # (2026-10-01). These keys are always in hud_state.json after the first
+    # boot, so restoring them unconditionally meant a Settings / web-panel save
+    # of VAD debug or an audio-cleanup stage (master / AEC / NS / AGC) never
+    # reached the runtime: the tray's old value won every restart, while the
+    # web panel showed the saved value with no pending flag. Record the config
+    # value each tray value was set against (toggle_cfg_seed); the tray value
+    # wins only while that config value is unchanged. A key missing from the
+    # stored seed (a file from before this change) keeps the old tray-wins rule.
+    try:
+        from core import config as _seed_cfg
+        _seed_now = {
+            "debug_mode":               bool(_seed_cfg.VAD_DEBUG),
+            "audio_processing_enabled": bool(_seed_cfg.AUDIO_PROCESSING_ENABLED),
+            "echo_cancel_enabled":      bool(_seed_cfg.AUDIO_ECHO_CANCEL),
+            "noise_suppress_enabled":   bool(_seed_cfg.AUDIO_NOISE_SUPPRESS),
+            "agc_enabled":              bool(_seed_cfg.AUDIO_AGC),
+        }
+    except Exception:
+        _seed_now = None
+    _seed_prev = persisted.get("toggle_cfg_seed")
+    if not isinstance(_seed_prev, dict):
+        _seed_prev = {}
+
+    def _tray_wins(key: str) -> bool:
+        if key not in persisted:
+            return False
+        if _seed_now is None or key not in _seed_prev:
+            return True
+        return bool(_seed_prev.get(key)) == _seed_now[key]
+
+    if _tray_wins("debug_mode"):
         _debug_mode[0] = bool(persisted.get("debug_mode"))
     # task-70: sleep/standby survive bounces. A crash + auto-respawn would
     # otherwise come up "Listening…" and answer the next phrase out loud.
@@ -4726,13 +4757,13 @@ def _restore_tray_toggle_state() -> None:
         if _sis in {"1", "true", "yes", "on"}:
             _sleep_mode[0] = True
             _standby_mode[0] = True
-    if "audio_processing_enabled" in persisted:
+    if _tray_wins("audio_processing_enabled"):
         _audio_master_enabled[0] = bool(persisted.get("audio_processing_enabled"))
-    if "echo_cancel_enabled" in persisted:
+    if _tray_wins("echo_cancel_enabled"):
         _audio_aec_enabled[0] = bool(persisted.get("echo_cancel_enabled"))
-    if "noise_suppress_enabled" in persisted:
+    if _tray_wins("noise_suppress_enabled"):
         _audio_ns_enabled[0] = bool(persisted.get("noise_suppress_enabled"))
-    if "agc_enabled" in persisted:
+    if _tray_wins("agc_enabled"):
         _audio_agc_enabled[0] = bool(persisted.get("agc_enabled"))
 
     # Mirror back so the cache holds the restored values and the next
@@ -4750,6 +4781,8 @@ def _restore_tray_toggle_state() -> None:
         noise_suppress_enabled   = bool(_audio_ns_enabled[0]),
         agc_enabled              = bool(_audio_agc_enabled[0]),
     )
+    if _seed_now is not None:
+        _write_hud_state(toggle_cfg_seed=dict(_seed_now))
     # Publish the active LLM backend so the tray's AI submenu shows the right
     # checkmark on first open (tray reads `llm_backend`: "anthropic" for Claude,
     # else the ollama model tag it matches via .startswith()).
@@ -21999,9 +22032,24 @@ def screenshot_privacy_block_reason() -> str | None:
         _, title, _ = _read_focused_window()
     except Exception:
         return None
-    if not title:
+    return _privacy_blocklist_match(title, blocklist)
+
+
+def _privacy_blocklist_match(title, blocklist=None) -> str | None:
+    """The SCREENSHOT_PRIVACY_BLOCKLIST entry found (case-insensitive
+    substring) in `title`, or None. Split out of
+    screenshot_privacy_block_reason (2026-10-01) so the glance capture can
+    also test the focus tracker's CACHED title — the rect it grabs can come
+    from that cache rather than the live window."""
+    if blocklist is None:
+        try:
+            from core import config as _cfg
+            blocklist = getattr(_cfg, "SCREENSHOT_PRIVACY_BLOCKLIST", ()) or ()
+        except Exception:
+            return None
+    if not blocklist or not title:
         return None
-    low = title.lower()
+    low = str(title).lower()
     for entry in blocklist:
         try:
             needle = str(entry).strip().lower()
@@ -26063,6 +26111,20 @@ def _capture_focused_window_png() -> bytes | None:
     """PNG bytes of just the currently-focused window's region, downscaled
     to vision-friendly dimensions. Returns None if the rect can't be
     obtained or the capture fails."""
+    # Privacy gate (2026-10-01). This is a second, private copy of
+    # take_screenshot's mss/ImageGrab capture and it had left out the
+    # SCREENSHOT_PRIVACY_BLOCKLIST check take_screenshot runs first. ask_vision
+    # only checks the blocklist when it captures itself (png_bytes None), so a
+    # "what's this?" with a password manager or banking window in focus was
+    # captured, described aloud, written to history and cached for
+    # recall_screen. Check the live title AND the tracker's cached title (the
+    # rect below can come from that cache).
+    blocked = (screenshot_privacy_block_reason()
+               or _privacy_blocklist_match(_focused_window_state.get("title")))
+    if blocked:
+        print(f"  [glance] capture refused — private window in focus "
+              f"(matched {blocked!r})")
+        return None
     rect = _focused_window_state.get("rect")
     if not rect:
         _, _, rect = _read_focused_window()
@@ -33848,9 +33910,24 @@ def _maybe_orchestrate(text: str) -> bool:
         return False
     print("  [orchestrator] briefing request — fanning out to sub-agents…")
     set_state("thinking")
+    # Same cloud gate the chat path uses (2026-10-01). The orchestrator calls
+    # Claude first at every stage (planner, Haiku workers, merger) and only
+    # used Ollama after a Claude exception, so on an AI_BACKEND=ollama /
+    # MODEL_ROUTING chat=local install a "morning briefing" still sent inbox
+    # senders, news and system data to the cloud on whatever key was in the
+    # environment. Decided per call, so a mid-session backend switch counts.
+    try:
+        from core.config import model_route as _model_route
+        _cloud_ok = bool(_claude_reachable()) and _model_route("chat") != "local"
+    except Exception:
+        _cloud_ok = False
+    if not _cloud_ok:
+        print("  [orchestrator] local-only backend — sub-agents stay on the "
+              "local model")
     try:
         merged = _orchestrate(
             text, ACTIONS,
+            cloud_allowed=_cloud_ok,
             planner_model=ORCHESTRATOR_PLANNER_MODEL,
             worker_model=ORCHESTRATOR_WORKER_MODEL,
             merger_model=ORCHESTRATOR_MERGER_MODEL,
