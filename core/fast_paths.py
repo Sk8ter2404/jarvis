@@ -34,6 +34,12 @@ the local model is both slow and unreliable at them (live 2026-09-29):
   * "what time is it in London" (v2.0.148): core/world_clock.py. Live
     v2.0.140 get_time (the LOCAL clock) was voiced as "It is 10:17 PM in
     London, sir." when London was at 4:17 AM.
+  * spoken arithmetic, "what's 12 times 7" / "144 divided by 12" / "2 to the
+    power of 10" (2026-10-01): core/spoken_math.py, evaluated exactly. The
+    09-05 live diagnostic found operator words never reached the calculator
+    (the local model answered from its head). Only a WHOLE-utterance
+    expression with a number on both sides of each operator matches; "what
+    times does the store open" falls through untouched.
 
 Recall never returns a recall question itself or a bare wake phrase
 ("Jarvis", "hey Jarvis, wake up"): both are skipped (_skip_for_recall).
@@ -53,13 +59,14 @@ from __future__ import annotations
 import re
 from typing import NamedTuple, Optional
 
-from core import date_math, world_clock
+from core import date_math, spoken_math, world_clock
 from core.date_math import normalize
 
 
 class FastAnswer(NamedTuple):
     kind: str    # "owner-name" | "owner-identity" | "last-utterance" |
-    #              "first-utterance" | "world-clock" | a date_math kind
+    #              "first-utterance" | "world-clock" | "arithmetic" |
+    #              a date_math kind
     reply: str
 
 
@@ -555,6 +562,11 @@ def match(text, *, now=None, history=(), owner_name="",
             got = date_math.answer(text, now)
             if got is not None:
                 return FastAnswer(got.kind, got.reply)
+        # After the date grammars (a date question keeps its own answer);
+        # needs no clock.
+        calc = spoken_math.answer(text)
+        if calc is not None:
+            return FastAnswer("arithmetic", calc.reply)
     except Exception:
         return None
     return None

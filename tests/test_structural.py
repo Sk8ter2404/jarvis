@@ -50,6 +50,9 @@ _IMPORT_LIGHT_CORE = (
     # The world clock (v2.0.148): stdlib zoneinfo only, imported at monolith
     # import time (fast paths + the reply guard).
     "core.world_clock",
+    # Spoken arithmetic (2026-10-01): stdlib only, imported by the prompt
+    # router and the fast paths.
+    "core.spoken_math",
 )
 
 

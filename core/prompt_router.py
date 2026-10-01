@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Tuple
 
+from core.spoken_math import is_arithmetic_request
 from core.units import is_unit_conversion_request
 
 # A section header in PC_CONTROL_PROMPT: an ALL-CAPS "head" at column 0, ending
@@ -808,6 +809,15 @@ _CONVERSION_NEUTRAL_KEYWORDS = frozenset({
 })
 
 
+# Sections a turn implicates by SHAPE rather than by a word (2026-10-01). Spoken
+# arithmetic is the case: "what's 12 times 7" named no PYTHON SANDBOX keyword,
+# so run_python (the calculator) never reached the local model, and an
+# operator word cannot be a keyword on its own ("what times does the store
+# open"). core.spoken_math.is_arithmetic_request wants a number on BOTH sides.
+_PREDICATE_ROUTES = {
+    "PYTHON SANDBOX": is_arithmetic_request,
+}
+
 # Short keywords ("tv", "ram", "hot", "mic", "bed", "obs", "lan") may only take
 # a plural after them; longer ones may run on freely (see _keyword_hit).
 _SHORT_KEYWORD_LEN = 3
@@ -881,6 +891,13 @@ def select_sections(user_text: str, sections: List[Tuple[str, str]]) -> Tuple[Li
                 if kw not in neutral and _keyword_hit(kw, low):
                     hit = True
                     break
+        if not hit:
+            pred = _PREDICATE_ROUTES.get(upper)
+            if pred is not None:
+                try:
+                    hit = bool(pred(user_text))
+                except Exception:
+                    hit = False
         (included if hit else dropped).append(name)
     return included, dropped
 
