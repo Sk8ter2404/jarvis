@@ -248,19 +248,35 @@ _DWELL_REMARK_RE = re.compile(
 )
 _MUSIC_ARG_RE = re.compile(r"['\"]([^'\"]{2,80})['\"]")
 
-# Teams alerts -- lines emitted by teams_screener.py / teams_nudge.py via
-# pending_speech.json end up in the session log when the main loop reads
-# the queue. We look for distinctive phrases that don't appear elsewhere.
-_TEAMS_CALL_RE = re.compile(
-    r"(?:Incoming call from|is calling you|on Teams|teams call|Teams meeting|"
-    r"unread messages on Teams)\b.*?([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)?)?",
-    re.IGNORECASE,
-)
-# Conservative VIP-name extraction: capitalised first name optionally
-# followed by a capitalised last name, after a "from " keyword.
-_FROM_NAME_RE = re.compile(
-    r"\bfrom\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b"
-)
+# Teams alerts -- lines emitted by teams_screener.py / teams_nudge.py.
+# WHICH lines count as Teams events (2026-10-01). The scan used to count ANY
+# line of the day's logs containing "teams call" / "is calling you" / ... and
+# take a caller name from any "from <Name>" on it — so overheard room speech
+# ([bg-audio]), the owner's own transcripts, JARVIS's replies (a check_teams
+# answer "... including one from X"), the recap's own lines and teams_nudge's
+# unread-message nudges (each logged TWICE when unconfirmed) were all spoken
+# back at 22:30 as "took N Teams calls including one from <name>". Now only a
+# line TAGGED by the emitter counts: teams_screener's "[teams-screen] <caller>
+# calling — ..." alert is a call (the caller is read from that line only);
+# teams_nudge's "[teams] nudging: ..." is an unread-message nudge, not a call.
+_LOG_TS_PREFIX_RE = re.compile(r"^\s*\[\d{2}:\d{2}:\d{2}\]\s*")
+_SCREEN_CALL_RE = re.compile(r"^\[teams-screen\]\s+(.+?)\s+(?:is\s+)?calling\b",
+                             re.IGNORECASE)
+_CALLER_NAME_RE = re.compile(r"^[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2}$")
+
+
+def _teams_event(line: str) -> tuple[str, str]:
+    """('call', caller) / ('nudge', '') / ('', '') for one session-log line.
+    The caller is '' unless the screener's line names one plainly."""
+    body = _LOG_TS_PREFIX_RE.sub("", line or "").strip()
+    if body.startswith("[teams] nudging:"):
+        return "nudge", ""
+    if body.lower().startswith("[teams-screen]"):
+        m = _SCREEN_CALL_RE.match(body)
+        if m:
+            who = m.group(1).strip()
+            return "call", (who if _CALLER_NAME_RE.match(who) else "")
+    return "", ""
 
 # Bambu lifecycle phrases the printer-monitor emits.
 _PRINT_STARTED_RE  = re.compile(r"Print started, sir", re.IGNORECASE)
@@ -298,6 +314,7 @@ def _scan_session_logs() -> dict:
     action_counts     = Counter()
     music_titles      = Counter()
     teams_alerts      = 0
+    teams_nudges      = 0
     teams_vips: Counter = Counter()
     print_started     = 0
     print_finished    = 0
@@ -375,19 +392,14 @@ def _scan_session_logs() -> dict:
                             except (ValueError, TypeError):  # pragma: no cover - defensive: _DWELL_REMARK_RE group(2) is always \d+
                                 pass
 
-                    # Teams alerts
-                    low = line.lower()
-                    is_teams_alert = False
-                    if "incoming call from" in low or "is calling you" in low \
-                            or "unread messages on teams" in low \
-                            or "calling — i'd recommend taking it" in low \
-                            or "teams call" in low:
-                        is_teams_alert = True
-                    if is_teams_alert:
+                    # Teams events — emitter-tagged lines only (_teams_event).
+                    kind, caller = _teams_event(line)
+                    if kind == "call":
                         teams_alerts += 1
-                        fm = _FROM_NAME_RE.search(line)
-                        if fm:
-                            teams_vips[fm.group(1).strip()] += 1
+                        if caller:
+                            teams_vips[caller] += 1
+                    elif kind == "nudge":
+                        teams_nudges += 1
 
                     # Bambu lifecycle (raw spoken phrases reach the log via
                     # the "speaking: ..." TTS trace lines).
@@ -413,6 +425,7 @@ def _scan_session_logs() -> dict:
         "music_titles":    music_titles,
         "app_minutes":     app_minutes,
         "teams_alerts":    teams_alerts,
+        "teams_nudges":    teams_nudges,
         "teams_vips":      teams_vips,
         "print_started":   print_started,
         "print_finished":  print_finished,
@@ -585,6 +598,14 @@ def _build_recap() -> str:
             if first_name:
                 teams_chunk += f" including one from {first_name}"
         parts.append(teams_chunk)
+    # Unread-message nudges are not calls, and carry no caller (2026-10-01).
+    teams_nudges = int(report.get("teams_nudges", 0) or 0)
+    if teams_nudges >= 1:
+        if teams_nudges == 1:
+            parts.append("had one unread-message nudge on Teams")
+        else:
+            parts.append(f"had {_number_word(teams_nudges)} unread-message "
+                         f"nudges on Teams")
 
     # 4) Music plays
     music_total = sum(report["action_counts"].get(a, 0) for a in _MUSIC_ACTIONS)

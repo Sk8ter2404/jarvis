@@ -934,6 +934,34 @@ class BootstrapTests(SchedulerTestBase):
                          60 * 60)
         self.assertTrue(inst.kwargs["job_defaults"]["coalesce"])
 
+    def test_in_memory_fallback_is_reported_not_silent(self):
+        # 2026-10-01 regression: SQLAlchemy missing → APScheduler's in-memory
+        # store, every armed job gone at the next restart, and nothing said.
+        payload = self._imports_payload(None)
+        with mock.patch.object(sched, "is_available", return_value=True), \
+             mock.patch.object(sched, "_aps_imports", return_value=payload), \
+             self.assertLogs(sched._log, level="WARNING") as logs:
+            self.assertTrue(sched.bootstrap({"a": lambda x: "x"}))
+        self.assertTrue(any("IN-MEMORY" in m for m in logs.output))
+        self.assertFalse(sched.is_persistent())
+        with mock.patch.object(sched, "list_jobs", return_value=[]), \
+             mock.patch.object(sched, "list_conditions", return_value=[]):
+            self.assertIs(sched.status()["persistent"], False)
+
+    def test_sqlite_store_is_reported_persistent(self):
+        payload = self._imports_payload(_FakeSQLAlchemyJobStore)
+        with mock.patch.object(sched, "is_available", return_value=True), \
+             mock.patch.object(sched, "_aps_imports", return_value=payload):
+            self.assertTrue(sched.bootstrap({"a": lambda x: "x"}))
+        self.assertTrue(sched.is_persistent())
+
+    def test_store_construction_failure_is_not_persistent(self):
+        payload = self._imports_payload(_RaisingSQLAlchemyJobStore)
+        with mock.patch.object(sched, "is_available", return_value=True), \
+             mock.patch.object(sched, "_aps_imports", return_value=payload):
+            self.assertTrue(sched.bootstrap({"a": lambda x: "x"}))
+        self.assertFalse(sched.is_persistent())
+
     def test_bootstrap_is_idempotent(self):
         payload = self._imports_payload(None)
         with mock.patch.object(sched, "is_available", return_value=True), \

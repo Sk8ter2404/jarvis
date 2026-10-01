@@ -127,13 +127,21 @@ def _load_last_fired_date() -> str:
         return ""
 
 
-def _save_last_fired_date(iso_date: str) -> None:
+def _save_last_fired_date(iso_date: str, reason: str = "") -> None:
+    """Persist the same-day flag. `reason` (2026-10-01) records HOW the day
+    was covered — "user-present" / "timed-out" / "manual" — so
+    morning_arrival_v2 can tell a briefing the owner heard from one spoken
+    into an empty room (see owner_heard_briefing_today). The catch-up skip
+    passes no reason: nothing was spoken."""
+    payload = {"last_fired_date": iso_date}
+    if reason:
+        payload["reason"] = reason
     with _state_lock:
         try:
             fd, tmp = tempfile.mkstemp(dir=_PROJECT_DIR, suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump({"last_fired_date": iso_date}, f, indent=2)
+                    json.dump(payload, f, indent=2)
                 os.replace(tmp, _STATE_FILE)
             except Exception:
                 try: os.unlink(tmp)
@@ -337,6 +345,52 @@ def _user_at_desk() -> bool | None:
     return None
 
 
+def owner_heard_briefing_today() -> bool:
+    """True when today's daily briefing was spoken to the owner — fired with
+    him at the desk ("user-present") or on request ("manual"). A "timed-out"
+    fire into an empty room, or the catch-up skip, does NOT count, so the
+    arrival briefing still greets him when he does sit down. Read by
+    morning_arrival_v2 (2026-10-01, one morning briefing per day). Never
+    raises."""
+    try:
+        if not os.path.exists(_STATE_FILE):
+            return False
+        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        return (isinstance(data, dict)
+                and data.get("last_fired_date") == datetime.date.today().isoformat()
+                and data.get("reason") in ("user-present", "manual"))
+    except Exception:
+        return False
+
+
+def _other_morning_briefing_fired_today() -> bool:
+    """True when morning_arrival_v2's presence watcher or one of
+    morning_chain's briefings (arrival / handoff / briefing) already covered
+    today (2026-10-01).
+
+    The codebase means ONE morning briefing per day — v2 and the chain stand
+    down for each other — but this 08:00 briefing was never part of that
+    contract, so a morning at the desk got "Good morning" twice (logs
+    2026-09-29: v2 at 06:00, this at 08:00). Read through the LIVE modules
+    the same way v2 and the chain read each other ('skill_<name>'); False on
+    any failure, so a broken sibling can never silence this briefing."""
+    try:
+        v2 = sys.modules.get("skill_morning_arrival_v2")
+        if v2 is not None and v2._already_fired_today():
+            return True
+    except Exception:
+        pass
+    try:
+        mc = sys.modules.get("skill_morning_chain")
+        if mc is not None and any(mc._skill_already_fired_today(n)
+                                  for n in mc.SKILL_NAMES):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 # ─── briefing assembly ───────────────────────────────────────────────────
 
 def _format_time_phrase(now: time.struct_time) -> str:
@@ -388,7 +442,7 @@ def _fire_briefing(reason: str = "scheduled") -> str:
     text = _build_briefing()
     print(f"  [daily] firing briefing ({reason}): {text}")
     _enqueue_speech(text)
-    _save_last_fired_date(datetime.date.today().isoformat())
+    _save_last_fired_date(datetime.date.today().isoformat(), reason)
     return text
 
 
@@ -416,6 +470,15 @@ def _scheduler_loop() -> None:
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
+            # One morning briefing per day: stand down when the arrival /
+            # chain briefing already covered it, before the presence wait.
+            if _other_morning_briefing_fired_today():
+                _save_last_fired_date(today_iso)
+                print("  [daily] suppressing — morning already briefed "
+                      "(arrival_v2 / morning chain)")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
             # Don't fire if we're way past the scheduled time (e.g. machine
             # was off all day and just booted at 6pm).
             if (now - scheduled).total_seconds() > CATCHUP_WINDOW_MINUTES * 60:
@@ -439,6 +502,14 @@ def _scheduler_loop() -> None:
                 print("  [daily] suppressing — briefing already fired during presence wait")
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
+            # ...and the arrival briefing may have greeted him DURING the wait
+            # (his sitting down is what both of them watch for).
+            if _other_morning_briefing_fired_today():
+                _save_last_fired_date(today_iso)
+                print("  [daily] suppressing — morning already briefed "
+                      "(arrival_v2 / morning chain)")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
             _fire_briefing("user-present" if present else "timed-out")
 
         except Exception:
@@ -453,7 +524,7 @@ def register(actions):
         try:
             text = _build_briefing()
             _enqueue_speech(text)
-            _save_last_fired_date(datetime.date.today().isoformat())
+            _save_last_fired_date(datetime.date.today().isoformat(), "manual")
             return text
         except Exception as e:
             return f"daily briefing failed: {e}"

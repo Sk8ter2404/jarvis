@@ -377,5 +377,65 @@ class CreditsRegisterTests(unittest.TestCase):
         self.assertIn("check_credits", actions)
 
 
+class CreditsCooldownSurvivesRestartTests(unittest.TestCase):
+    """2026-10-01 regression: the 12 h login / 4 h low-balance cooldowns were
+    in-memory only, so every JARVIS restart reset them and each session that
+    ran past the first hourly check spoke the login alert again (seven times
+    across 2026-09-29/30)."""
+
+    def setUp(self):
+        fd, self.state = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.remove(self.state)
+        self.addCleanup(lambda: os.path.exists(self.state) and os.remove(self.state))
+
+    def _session(self):
+        """A fresh module instance — what a JARVIS restart gives — with its
+        state file redirected, registered the way the loader registers it."""
+        from tests._skill_harness import no_background_threads
+        mod, _ = load_skill_isolated("credits_monitor", register=False)
+        mod._STATE_FILE = self.state
+        with no_background_threads():
+            mod.register({})
+        return mod
+
+    def _check(self, mod, reading):
+        with mock.patch.object(mod, "_read_credits_via_vision",
+                               return_value=reading), \
+             mock.patch.object(mod, "_enqueue_speech") as enq:
+            mod._check_and_maybe_alert()
+        return enq
+
+    def test_login_alert_not_repeated_after_a_restart(self):
+        first = self._session()
+        self.assertEqual(self._check(first, (None, "login_required")).call_count, 1)
+        second = self._session()                      # JARVIS restarted
+        self._check(second, (None, "login_required")).assert_not_called()
+
+    def test_low_balance_alert_not_repeated_after_a_restart(self):
+        first = self._session()
+        self.assertEqual(self._check(first, (2.0, "BALANCE: $2.00")).call_count, 1)
+        second = self._session()
+        self._check(second, (2.0, "BALANCE: $2.00")).assert_not_called()
+
+    def test_expired_cooldown_alerts_again(self):
+        import json
+        with open(self.state, "w", encoding="utf-8") as f:
+            json.dump({"last_login_alert_at": time.time() - 13 * 3600}, f)
+        mod = self._session()
+        self.assertEqual(self._check(mod, (None, "login_required")).call_count, 1)
+
+    def test_corrupt_or_future_stamp_is_ignored(self):
+        with open(self.state, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        mod = self._session()
+        self.assertEqual(mod._last_login_alert_at[0], 0.0)
+        import json
+        with open(self.state, "w", encoding="utf-8") as f:
+            json.dump({"last_login_alert_at": time.time() + 10 * 86400}, f)
+        mod = self._session()
+        self.assertEqual(mod._last_login_alert_at[0], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

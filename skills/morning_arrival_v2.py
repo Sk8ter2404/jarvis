@@ -215,6 +215,21 @@ def _chain_morning_briefing_fired_today() -> bool:
         return False
 
 
+def _daily_briefing_heard_today() -> bool:
+    """True when skills/daily_briefing already briefed the owner today — with
+    him at the desk, or on request (its owner_heard_briefing_today). The
+    mirror of daily_briefing's own stand-down (2026-10-01): when the two
+    watch for the same sit-down, whichever speaks first owns the morning.
+    A daily fire into an empty room does not count. False on any failure,
+    including daily_briefing not being loaded."""
+    try:
+        db = sys.modules.get("skill_daily_briefing")
+        fn = getattr(db, "owner_heard_briefing_today", None) if db else None
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
 def _mark_fired(reason: str) -> None:
     state = _load_state()
     state["last_fired_date"] = time.strftime("%Y-%m-%d")
@@ -630,6 +645,11 @@ def _fire_arrival(reason: str, *, force: bool = False) -> str:
         # re-enters here every WATCH_POLL_SECONDS for the rest of the morning
         # window — hours of once-per-second state-file reads and log spam.
         _mark_fired(f"suppressed ({reason}) — morning_chain briefed")
+        return ""
+    if not force and _daily_briefing_heard_today():
+        print(f"  [arrival_v2] suppressing ({reason}) — the daily briefing "
+              f"already briefed him today")
+        _mark_fired(f"suppressed ({reason}) — daily briefing heard")
         return ""
     try:
         text = _build_briefing()

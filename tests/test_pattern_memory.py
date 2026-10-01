@@ -184,5 +184,37 @@ class ConversationLogWipeTests(unittest.TestCase):
         self.assertEqual(len(self._read_sessions()), 1)
 
 
+class JarvisOwnWindowsAreNotHabitsTests(unittest.TestCase):
+    """2026-10-01 regression: the focused window logged at every turn was
+    often one of JARVIS's own (reticle, live-log console), so the owner was
+    offered "You typically check JARVIS LIVE LOG around now, sir"."""
+
+    def _active_app_for(self, title):
+        import sys
+        import types
+        gw = types.ModuleType("pygetwindow")
+        gw.getActiveWindow = lambda: types.SimpleNamespace(title=title)
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            return pattern_memory._get_active_app()
+
+    def test_jarvis_windows_are_not_recorded(self):
+        for title in ("JARVIS LIVE LOG (session_2026-10-01.log)",
+                      "JARVIS Reticle", "JARVIS HUD"):
+            self.assertEqual(self._active_app_for(title), "", title)
+        self.assertNotEqual(self._active_app_for("notes.txt - Notepad"), "")
+
+    def test_already_logged_jarvis_windows_form_no_app_pattern(self):
+        entries = ([{"text": "", "dow": "Monday", "hour": 13,
+                     "app": "JARVIS Reticle"}] * 6
+                   + [{"text": "", "dow": "Tuesday", "hour": 13,
+                       "app": "Teams"}] * 6)
+        with mock.patch.object(pattern_memory, "_load_entries",
+                               return_value=entries):
+            pats = pattern_memory.get_patterns(min_days=0)
+        targets = {p["target"] for p in pats if p["category"] == "app_usage"}
+        self.assertNotIn("JARVIS Reticle", targets)
+        self.assertIn("Teams", targets)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -475,11 +475,28 @@ class BanterZingerTests(_BanterTestBase):
         self.assertIn("47", line)
 
     def test_pick_zinger_repeat_question_interpolates_count(self):
-        nth_variant = "That's the {n}th time you've asked me that today, sir."
+        # 2026-10-01: the count is spoken as an ORDINAL. This test used to pin
+        # the shipped template and assert "the 3th time" — the bug itself.
+        nth_variant = self.mod._ZINGER_BANK["repeat_question"][0]
         with mock.patch.object(self.mod.random, "choice", return_value=nth_variant):
             line = self.mod._pick_zinger(
                 {"tell": "repeat_question", "n": 3, "minutes": 5})
-        self.assertEqual(line, "That's the 3th time you've asked me that today, sir.")
+        self.assertEqual(line, "That's the 3rd time you've asked me that today, sir.")
+
+    def test_pick_zinger_ordinals_never_say_2th_or_3th(self):
+        # Every count-bearing template, every count banter can produce.
+        cases = {"repeat_question": {"n": 2, "minutes": 3},
+                 "repeat_open": {"target": "Chrome", "n": 22}}
+        for tell_name, extra in cases.items():
+            for variant in self.mod._ZINGER_BANK[tell_name]:
+                with mock.patch.object(self.mod.random, "choice",
+                                       return_value=variant):
+                    line = self.mod._pick_zinger(dict(tell=tell_name, **extra))
+                self.assertNotRegex(line, r"\b(?:2|22|3)th\b")
+        self.assertEqual(
+            [self.mod._ordinal(n) for n in (1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 101)],
+            ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th",
+             "21st", "22nd", "23rd", "101st"])
 
     def test_pick_zinger_every_variant_renders_for_every_tell(self):
         # No variant may crash on .format(**tell); each yields non-empty text

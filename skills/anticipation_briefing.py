@@ -417,7 +417,12 @@ def _compose_briefing_line(p: dict) -> str:
         return "Shall I deliver the evening briefing, sir?"
 
     # Generic fall-through: lead-aware prefix plus the pattern_learning
-    # `offer` field (already a complete JARVIS-style sentence).
+    # `offer` field (already a complete JARVIS-style sentence) — except the
+    # line pattern_learning used to INVENT from an unmapped action's name
+    # ("Shall I get time, sir?"), which older snapshots still store
+    # (2026-10-01, same rule as pattern_learning._compose_offer_line).
+    if action and fallback_offer == f"Shall I {action.replace('_', ' ')}, sir?":
+        return ""
     if lead > 0 and fallback_offer:
         return (
             f"In about {lead} minute{'s' if lead != 1 else ''}, sir — "
@@ -482,18 +487,36 @@ def _next_eligible(bypass_throttle: bool) -> tuple[str, dict]:
 
     today = time.strftime("%Y-%m-%d", time.localtime())
     state = _load_state() if not bypass_throttle else {}
+    # The anticipation engine offers the SAME predictions (pattern_learning's
+    # maybe_pattern_offer_v2) under its own once-a-day throttle; honour that
+    # one too so the owner never hears one prediction twice (2026-10-01).
+    shared = {} if bypass_throttle else _load_shared_offer_state()
 
     for p in candidates:
         key = (p.get("key") or "").strip()
         if not key:
             continue
-        if not bypass_throttle and state.get(key) == today:
+        if not bypass_throttle and (state.get(key) == today
+                                    or shared.get(key) == today):
             continue
         line = _compose_briefing_line(p)
         if not line:
             continue
         return line, p
     return "", {}
+
+
+def _load_shared_offer_state() -> dict:
+    """pattern_learning's per-prediction offer throttle ({key: date}), or {}
+    when that skill isn't loaded or can't be read. Never raises."""
+    try:
+        pl = sys.modules.get("skill_pattern_learning")
+        if pl is None:
+            return {}
+        data = pl._load_offer_state()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _mark_fired(pred: dict) -> None:
@@ -505,6 +528,21 @@ def _mark_fired(pred: dict) -> None:
     state[key] = today
     _prune_state(state)
     _save_state(state)
+    # Mirror into pattern_learning's throttle (2026-10-01): two engines
+    # surfaced the same usage_patterns prediction once a day EACH, phrased
+    # differently and minutes apart, so the 60 s speech dedupe rarely caught
+    # the second. One shared key per prediction per day now covers both, and
+    # the boot-time offer, which reads the same throttle.
+    try:
+        pl = sys.modules.get("skill_pattern_learning")
+        if pl is not None:
+            shared = pl._load_offer_state()
+            if isinstance(shared, dict):
+                shared[key] = today
+                pl._prune_state(shared)
+                pl._save_offer_state(shared)
+    except Exception as e:
+        print(f"  [anticipation_briefing] shared offer-state update failed: {e}")
 
 
 # ─── background scheduler ────────────────────────────────────────────────

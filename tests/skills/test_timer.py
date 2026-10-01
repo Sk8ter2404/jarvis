@@ -356,6 +356,51 @@ class TimerEnqueueSpeechTests(unittest.TestCase):
             self.mod._enqueue_speech("hello")
         fake_bc.proactive_announce.assert_called_once_with("hello", source="timer")
 
+    def test_fired_timers_carry_their_own_dedupe_key(self):
+        # 2026-10-01 regression: every unlabelled timer says the SAME text, and
+        # the drainer dropped a line whose text was spoken in the last 60 s,
+        # so a second "30 second timer" went silent. Each fire must hand the
+        # announcer its own timer number as the dedupe key.
+        from tests._skill_harness import no_background_threads
+        self.mod._timers.clear()
+        self.mod._next_id[0] = 1
+        with no_background_threads():
+            self.actions["set_timer"]("30 seconds")
+            self.actions["set_timer"]("30 seconds")
+        fake_bc = mock.MagicMock()
+        with mock.patch("importlib.import_module", return_value=fake_bc):
+            for tid in (1, 2):
+                _call_silently(self.mod._timers[tid][0].function)
+        calls = fake_bc.proactive_announce.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].args[0], calls[1].args[0])   # same text …
+        self.assertEqual([c.kwargs.get("dedupe_key") for c in calls],
+                         ["timer#1", "timer#2"])               # … distinct keys
+        self.assertTrue(all(c.kwargs.get("source") == "timer" for c in calls))
+
+    def test_restore_fire_carries_dedupe_key(self):
+        fake_bc = mock.MagicMock()
+        with mock.patch("importlib.import_module", return_value=fake_bc):
+            _call_silently(self.mod.restore_timers,
+                           [{"id": 9, "message": "stretch", "fire_at": 1.0}])
+        self.assertEqual(
+            fake_bc.proactive_announce.call_args.kwargs.get("dedupe_key"),
+            "timer#9")
+
+    def test_fallback_file_entry_keeps_source_and_key(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            qpath = _os.path.join(d, "pending_speech.json")
+            with mock.patch("importlib.import_module", side_effect=ImportError), \
+                 mock.patch.object(self.mod, "_SPEECH_QUEUE", qpath):
+                self.mod._enqueue_speech("Reminder, sir — x", key="timer#4")
+            with open(qpath, encoding="utf-8") as f:
+                entry = _json.load(f)[-1]
+        self.assertEqual(entry["source"], "timer")
+        self.assertEqual(entry["dedupe_key"], "timer#4")
+
     def test_enqueue_falls_back_to_file_when_announcer_absent(self):
         import json as _json
         import os as _os

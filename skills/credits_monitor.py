@@ -47,7 +47,11 @@ _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _STATE_FILE   = os.path.join(_PROJECT_DIR, "credits_state.json")
 
-# Mutable holders for thread state
+# Mutable holders for thread state. The two alert stamps are PERSISTED in
+# credits_state.json (2026-10-01): held only in memory, the documented 12 h
+# login / 4 h low-balance cooldowns reset at every restart, so each session
+# that ran past the first hourly check spoke the login alert again — seven
+# times across 09-29/09-30, at night too.
 _last_alert_at = [0.0]
 _last_login_alert_at = [0.0]
 _check_lock = threading.Lock()   # serialize: only one check at a time
@@ -97,7 +101,31 @@ def _save_state(balance, raw: str):
                 "checked_at": time.time(),
                 "balance":    balance,
                 "raw":        raw,
+                # The alert cooldowns, so a restart can't reset them.
+                "last_alert_at":       _last_alert_at[0],
+                "last_login_alert_at": _last_login_alert_at[0],
             }, f, indent=2)
+    except Exception:
+        pass
+
+
+def _load_alert_cooldowns() -> None:
+    """Restore the persisted alert stamps into the in-memory cells (keeping
+    whichever is newer). A missing / corrupt file, or a stamp from the
+    future, leaves the cells alone. Never raises."""
+    try:
+        if not os.path.exists(_STATE_FILE):
+            return
+        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        now = time.time()
+        for key, cell in (("last_alert_at", _last_alert_at),
+                          ("last_login_alert_at", _last_login_alert_at)):
+            v = data.get(key)
+            if isinstance(v, (int, float)) and 0 < v <= now + 60:
+                cell[0] = max(cell[0], float(v))
     except Exception:
         pass
 
@@ -175,7 +203,6 @@ def _check_and_maybe_alert():
         except Exception as e:
             print(f"  [credits] background check error: {e}")
             return
-        _save_state(dollars, raw)
         now = time.time()
         if dollars is None:
             if raw == "login_required" and (now - _last_login_alert_at[0]) > 12 * 3600:
@@ -184,6 +211,8 @@ def _check_and_maybe_alert():
                     "console is asking for a login."
                 )
                 _last_login_alert_at[0] = now
+            # Saved AFTER the alert decision so the new stamp is on disk.
+            _save_state(dollars, raw)
             return
         print(f"  [credits] background check: ${dollars:.2f}")
         if dollars < ALERT_THRESHOLD_DOLLARS:
@@ -193,6 +222,7 @@ def _check_and_maybe_alert():
                     f"Only ${dollars:.2f} remaining."
                 )
                 _last_alert_at[0] = now
+        _save_state(dollars, raw)
     finally:
         _check_lock.release()
 
@@ -233,6 +263,9 @@ def register(actions):
             _check_lock.release()
 
     actions["check_credits"] = check_credits
+
+    # Restore the alert cooldowns BEFORE anything can save state or alert.
+    _load_alert_cooldowns()
 
     if ENABLE_BACKGROUND_MONITOR:
         # Guard against duplicate loops on skill reload (load_skills re-execs

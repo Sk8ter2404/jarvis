@@ -708,6 +708,11 @@ class DailySchedulerTests(unittest.TestCase):
         the second pass by having _read_config raise _LoopBreak on call #2, so
         the whole first body (including trailing sleeps/continues) executes."""
         provided_cfg = patches.pop("_read_config", None)
+        # Hermetic by default: the morning-siblings check (2026-10-01) reads
+        # the live arrival_v2 / chain state through sys.modules, so a test
+        # that doesn't drive it pins it to "nothing briefed yet".
+        patches.setdefault("_other_morning_briefing_fired_today",
+                           mock.MagicMock(return_value=False))
         if provided_cfg is None:
             provided_cfg = mock.MagicMock(return_value={
                 "enabled": True, "hour": 8, "minute": 0, "wait_min": 30})
@@ -864,6 +869,87 @@ class DailyRegisterTests(unittest.TestCase):
             mod.register(actions)
         self.assertIn("daily_briefing", actions)   # action still registered
         Thread.assert_not_called()
+
+
+class DailyOneMorningBriefingTests(unittest.TestCase):
+    """2026-10-01 regression: the 08:00 daily briefing never checked whether
+    morning_arrival_v2 (or the morning chain) had already briefed today, so a
+    morning at the desk got "Good morning" twice (logs 2026-09-29: v2 at
+    06:00, daily at 08:00). It now stands down — before the presence wait,
+    and again after it."""
+
+    _run_one_iteration = DailySchedulerTests._run_one_iteration
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("daily_briefing")
+
+    def _fake_v2(self, fired):
+        v2 = types.ModuleType("skill_morning_arrival_v2")
+        v2._already_fired_today = lambda: fired
+        return v2
+
+    def _iteration(self, fire, save, **extra):
+        now = datetime.datetime.now().replace(hour=8, minute=5, second=0,
+                                              microsecond=0)
+        self._run_one_iteration(
+            now=now,
+            _read_config=mock.MagicMock(return_value={
+                "enabled": True, "hour": 8, "minute": 0, "wait_min": 30}),
+            _load_last_fired_date=mock.MagicMock(return_value=""),
+            _wait_for_presence=mock.MagicMock(return_value=True),
+            _save_last_fired_date=save, _fire_briefing=fire, **extra)
+        return now
+
+    def test_stands_down_when_arrival_v2_already_briefed(self):
+        fire, save = mock.MagicMock(), mock.MagicMock()
+        with inject_modules(skill_morning_arrival_v2=self._fake_v2(True),
+                            skill_morning_chain=None):
+            now = self._iteration(
+                fire, save,
+                _other_morning_briefing_fired_today=self.mod._other_morning_briefing_fired_today)
+        fire.assert_not_called()
+        save.assert_called_once_with(now.date().isoformat())
+
+    def test_stands_down_when_v2_briefs_during_the_presence_wait(self):
+        fire, save = mock.MagicMock(), mock.MagicMock()
+        checks = iter([False, True])   # clean before the wait, fired after it
+        self._iteration(fire, save, _other_morning_briefing_fired_today=(
+            mock.MagicMock(side_effect=lambda: next(checks, True))))
+        fire.assert_not_called()
+
+    def test_still_fires_when_nothing_briefed(self):
+        fire, save = mock.MagicMock(), mock.MagicMock()
+        with inject_modules(skill_morning_arrival_v2=self._fake_v2(False),
+                            skill_morning_chain=None):
+            self._iteration(
+                fire, save,
+                _other_morning_briefing_fired_today=self.mod._other_morning_briefing_fired_today)
+        fire.assert_called_once_with("user-present")
+
+    def test_chain_flags_count_too(self):
+        mc = types.ModuleType("skill_morning_chain")
+        mc.SKILL_NAMES = ("arrival", "handoff", "briefing")
+        mc._skill_already_fired_today = lambda n: n == "handoff"
+        with inject_modules(skill_morning_arrival_v2=None, skill_morning_chain=mc):
+            self.assertTrue(self.mod._other_morning_briefing_fired_today())
+        with inject_modules(skill_morning_arrival_v2=None, skill_morning_chain=None):
+            self.assertFalse(self.mod._other_morning_briefing_fired_today())
+
+    def test_owner_heard_only_for_present_or_manual_fires(self):
+        import os as _os
+        import tempfile
+        today = datetime.date.today().isoformat()
+        with tempfile.TemporaryDirectory() as d:
+            state = _os.path.join(d, "daily_briefing_state.json")
+            with mock.patch.object(self.mod, "_PROJECT_DIR", d), \
+                 mock.patch.object(self.mod, "_STATE_FILE", state):
+                for reason, heard in (("user-present", True), ("manual", True),
+                                      ("timed-out", False), ("", False)):
+                    self.mod._save_last_fired_date(today, reason)
+                    self.assertIs(self.mod.owner_heard_briefing_today(), heard,
+                                  reason)
+                self.mod._save_last_fired_date("1999-01-01", "user-present")
+                self.assertFalse(self.mod.owner_heard_briefing_today())
 
 
 if __name__ == "__main__":

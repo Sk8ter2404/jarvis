@@ -33,9 +33,16 @@ Actions registered:
 Module-level helper for other skills:
   is_focus_mode_active() -> bool
 
-Announces on entry:
-  "Holding all non-critical interruptions for N minutes, sir. I'll wake
-   you for VIPs or emergencies only."
+Announces on entry (what this skill ACTUALLY does — 2026-10-01; it used to
+promise "holding all non-critical interruptions ... VIPs or emergencies
+only", but it only silences Windows toasts, Teams and three nudge skills):
+  "Do not disturb for N minutes, sir — Windows notifications are paused,
+   Teams is set to Do Not Disturb, and the banter, wellness and Teams nudges
+   are muted. Timers and print alerts still come through."
+When skills/focus_mode.py drives this skill it engages / ends it QUIETLY
+(the `.quiet` hooks on the action handlers): focus_mode speaks its own line,
+and a line queued here while its gate is closed would be held and then
+recapped as something the owner "missed".
 """
 from __future__ import annotations
 
@@ -61,8 +68,8 @@ TEAMS_GRAPH_TIMEOUT      = 6.0
 
 # Skills whose _enqueue_speech we suppress while focus mode is active.
 # Critical announcements (bambu print failure, timer reminders, audio
-# device drops) stay loud — those are the "VIPs or emergencies" of the
-# announcement copy.
+# device drops) stay loud — the engage line says so ("Timers and print
+# alerts still come through").
 SUPPRESSED_SKILLS = ("banter", "wellness", "teams_nudge")
 
 FOCUS_PROMPT_ADDENDUM = (
@@ -391,8 +398,37 @@ def _start_expiry_thread() -> None:
     _expiry_thread[0] = t
 
 
-def _enter_focus_mode(duration_seconds: int, trigger: str) -> tuple[bool, str]:
-    """Engage focus mode. Returns (was_already_active, summary_message)."""
+def _monolith_focus_active() -> bool:
+    """True while skills/focus_mode.py's announcement gate (the monolith's
+    focus flag) is closed. False when the monolith or the helper is missing,
+    and on any error."""
+    try:
+        bc = sys.modules.get("bobert_companion")
+        fn = getattr(bc, "focus_mode_active", None) if bc is not None else None
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _engage_summary(duration_seconds: int) -> str:
+    """The engage line, built from what really happened (2026-10-01)."""
+    done = []
+    if _focus_assist_was_set[0]:
+        done.append("Windows notifications are paused")
+    if _teams_was_set[0]:
+        done.append("Teams is set to Do Not Disturb")
+    done.append("the banter, wellness and Teams nudges are muted")
+    listed = done[0] if len(done) == 1 else (", ".join(done[:-1]) + ", and " + done[-1])
+    return (f"Do not disturb for {_format_minutes(duration_seconds)}, sir — "
+            f"{listed}. Timers and print alerts still come through.")
+
+
+def _enter_focus_mode(duration_seconds: int, trigger: str,
+                      announce: bool = True) -> tuple[bool, str]:
+    """Engage focus mode. Returns (was_already_active, summary_message).
+
+    `announce=False` (2026-10-01) skips the spoken engage line — used when
+    skills/focus_mode.py chains this engage and speaks its own reply."""
     duration_seconds = max(60, min(int(duration_seconds), MAX_DURATION_SECONDS))
     now = time.time()
     with _mode_lock:
@@ -420,19 +456,19 @@ def _enter_focus_mode(duration_seconds: int, trigger: str) -> tuple[bool, str]:
     _teams_was_set[0]        = _set_teams_presence("DoNotDisturb")
     _start_expiry_thread()
 
-    summary = (
-        f"Holding all non-critical interruptions for "
-        f"{_format_minutes(duration_seconds)}, sir. I'll wake you for "
-        f"VIPs or emergencies only."
-    )
-    _enqueue_speech(summary)
+    summary = _engage_summary(duration_seconds)
+    if announce:
+        _enqueue_speech(summary)
     print(f"  [focus] engaged via {trigger} for {duration_seconds}s — "
           f"focus_assist={_focus_assist_was_set[0]} teams={_teams_was_set[0]}")
     return False, summary
 
 
-def _exit_focus_mode(reason: str = "manual") -> str:
-    """Cancel focus mode. Idempotent."""
+def _exit_focus_mode(reason: str = "manual", announce: bool = True) -> str:
+    """Cancel focus mode. Idempotent.
+
+    `announce=False` (2026-10-01) skips the spoken line — used when
+    skills/focus_mode.py chains this teardown and returns its own recap."""
     with _mode_lock:
         if not _focus_active[0]:
             return "Focus mode was not active, sir."
@@ -461,7 +497,14 @@ def _exit_focus_mode(reason: str = "manual") -> str:
         msg = "Workshop closed, sir — focus mode released."
     else:
         msg = "Focus mode disengaged, sir."
-    _enqueue_speech(msg)
+    # An expiry while focus_mode's gate is still closed (an indefinite block
+    # outlives this skill's 8 h cap, or this deadline lands seconds before
+    # focus_mode's own) must stay quiet: the gate would HOLD the line and the
+    # resume recap would then list "Focus mode complete" as something missed.
+    if reason == "expired" and _monolith_focus_active():
+        announce = False
+    if announce:
+        _enqueue_speech(msg)
     return msg
 
 
@@ -553,6 +596,26 @@ def register(actions):
                 "manual": "manually"}.get(trigger, trigger)
         return (f"Focus mode is engaged ({trig}), sir — about "
                 f"{_format_minutes(remaining)} remaining.")
+
+    # Quiet entry points for skills/focus_mode.py, which captures these
+    # handlers and chains them (2026-10-01). It speaks its own engage reply
+    # and resume recap, so our lines must not be queued: queued while its
+    # gate is closed they were HELD and recapped back to the owner as
+    # something he "missed" ("1 thing — Focus mode disengaged, sir"). Hung
+    # on the handlers so focus_mode reaches exactly the handler it captured.
+    def _quiet_engage(duration_seconds=None) -> str:
+        secs = duration_seconds if duration_seconds else MAX_DURATION_SECONDS
+        return _enter_focus_mode(int(secs), trigger="voice", announce=False)[1]
+
+    def _quiet_end() -> bool:
+        """End quietly; True if focus mode WAS engaged."""
+        with _mode_lock:
+            was = bool(_focus_active[0])
+        _exit_focus_mode(reason="manual", announce=False)
+        return was
+
+    focus_mode.quiet = _quiet_engage
+    end_focus_mode.quiet = _quiet_end
 
     actions["focus_mode"]        = focus_mode
     actions["end_focus_mode"]    = end_focus_mode

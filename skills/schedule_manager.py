@@ -6,7 +6,8 @@ Lets the user say things like::
     "every morning at 8 a.m. brief me on emails and weather and play lo-fi"
     "every thirty minutes run system pulse"
     "remind me in two hours to take a screenshot"
-    "when bambu print finishes proactive_announce sir the print is done"
+    "when the print finishes tell me the print is done"
+          -> schedule_when bambu_print_finished | say_aloud The print is done, sir.
     "list schedules"
     "cancel schedule cron_abcd1234"
 
@@ -15,6 +16,7 @@ Actions registered
     schedule_recurring  <spec> | <action> [arg]
     schedule_once       <when> | <action> [arg]
     schedule_when       <condition> | <action> [arg]
+    say_aloud           <text>   (speak <text>; the step a spoken reminder uses)
     list_schedules
     cancel_schedule     <job_id>
     fire_schedule       <job_id>
@@ -229,6 +231,25 @@ def _format_conditions(conds: list[dict]) -> str:
     return f"{len(conds)} conditional trigger(s), sir:\n" + "\n".join(lines)
 
 
+def _volatile_note(scheduler) -> str:
+    """Spoken suffix for an arm reply when the job store is in memory only.
+
+    2026-10-01: without SQLAlchemy, APScheduler silently falls back to its
+    in-memory store, so every cron / interval / one-shot job vanishes at the
+    next restart (several a day) while the reply said "armed, sir". Say so
+    while the owner is still in the conversation. Empty when the store
+    persists, when the scheduler can't tell (an older core.scheduler), or on
+    any error — this note must never break an arm reply."""
+    try:
+        fn = getattr(scheduler, "is_persistent", None)
+        if callable(fn) and fn() is False:
+            return (" Note, sir: SQLAlchemy isn't installed, so this schedule "
+                    "is held in memory and will not survive a restart.")
+    except Exception:
+        pass
+    return ""
+
+
 # ── action factories ────────────────────────────────────────────────
 def _make_recurring(scheduler) -> Callable[[str], str]:
     def _act(arg: str = "") -> str:
@@ -257,7 +278,8 @@ def _make_recurring(scheduler) -> Callable[[str], str]:
         except Exception as e:
             return f"Schedule failed, sir — {type(e).__name__}: {e}"
         n_chain = f" + {len(chain)} chained step(s)" if chain else ""
-        return f"Recurring schedule '{jid}' armed, sir — {lhs} → {p_action}{n_chain}."
+        return (f"Recurring schedule '{jid}' armed, sir — {lhs} → "
+                f"{p_action}{n_chain}.{_volatile_note(scheduler)}")
     return _act
 
 
@@ -280,6 +302,25 @@ def _build_recurring_job(scheduler, spec: str, action: str, arg: str, chain: lis
     return _parse_cron_phrase(scheduler, spec, action, arg, chain)
 
 
+# Day phrases that legitimately mean "every day" (parse_dow returns None for
+# them, the same None it returns for text it does not understand).
+_ANY_DAY = ("daily", "everyday", "every day", "day", "any", "each day")
+
+
+def _check_dow(dow, dow_part: str) -> None:
+    """Refuse day text parse_dow could not read (2026-10-01).
+
+    A None day_of_week means EVERY day to schedule_cron, so an unrecognised
+    day phrase must never fall through as None: "monday at 9 pm" used to arm
+    a job that fired seven days a week while the reply said it was set as
+    asked. Only the every-day words in _ANY_DAY may yield None."""
+    if dow is None and dow_part and dow_part.strip().lower() not in _ANY_DAY:
+        raise ValueError(
+            f"I didn't recognise '{dow_part}' as a weekday, 'weekdays' or "
+            f"'weekends'"
+        )
+
+
 def _parse_cron_phrase(scheduler, body: str, action: str, arg: str, chain: list[dict]) -> str:
     """Parse "morning at 8am" / "weekdays 9am" / "8:30 pm" → CronTrigger."""
     body = body.strip()
@@ -292,6 +333,11 @@ def _parse_cron_phrase(scheduler, body: str, action: str, arg: str, chain: list[
             body = body[len(filler):].strip()
             low  = body.lower()
             break
+    # Drop connective words ANYWHERE, not just in front (2026-10-01): the
+    # filler strip above only removes a LEADING "at", so "monday at 9 pm" kept
+    # it and the day text became "monday at" — unreadable, and armed daily.
+    body = " ".join(t for t in body.split() if t.lower() not in ("at", "on", "@"))
+    low  = body.lower()
 
     # Try to split into "<dow> <clock>" or just "<clock>".
     tokens = body.split()
@@ -299,19 +345,19 @@ def _parse_cron_phrase(scheduler, body: str, action: str, arg: str, chain: list[
     clock_str = body
     if len(tokens) >= 2:
         # Last 1–2 tokens are the clock, the rest is the dow phrase.
-        # Try the last token as clock; if it fails, try the last two.
+        # Try the last token as clock; if it fails, try the last two. Either
+        # way the day text goes through _check_dow, so both branches refuse
+        # the same unreadable day phrases (the two-token branch had no check).
         if scheduler.parse_clock(tokens[-1]) is not None:
             clock_str = tokens[-1]
             dow_part  = " ".join(tokens[:-1])
             dow = scheduler.parse_dow(dow_part)
-            if dow is None and dow_part:
-                # The "leading" text wasn't a recognised dow phrase — bail
-                # back to treating the whole thing as a clock.
-                clock_str = body
+            _check_dow(dow, dow_part)
         elif scheduler.parse_clock(" ".join(tokens[-2:])) is not None:
             clock_str = " ".join(tokens[-2:])
             dow_part  = " ".join(tokens[:-2])
             dow = scheduler.parse_dow(dow_part)
+            _check_dow(dow, dow_part)
 
     clock = scheduler.parse_clock(clock_str)
     if clock is None:
@@ -351,7 +397,8 @@ def _make_once(scheduler) -> Callable[[str], str]:
             )
         except Exception as e:
             return f"Schedule failed, sir — {type(e).__name__}: {e}"
-        return f"One-shot '{jid}' armed for {when.isoformat()}, sir — → {p_action}."
+        return (f"One-shot '{jid}' armed for {when.isoformat()}, sir — → "
+                f"{p_action}.{_volatile_note(scheduler)}")
     return _act
 
 
@@ -368,17 +415,18 @@ def _make_when(scheduler) -> Callable[[str], str]:
                 + ", ".join(scheduler.available_conditions())
             )
         p_action, p_arg, chain = _parse_action_chain(rhs)
+        cond = _normalise_condition(scheduler, lhs)
         # Auto-derive a stable id from condition + primary action so the
         # user can re-issue the same when-clause without piling up
         # duplicate triggers.
-        tid = f"when_{lhs.strip().lower()}_{p_action}"
+        tid = f"when_{cond.lower()}_{p_action}"
         tid = re.sub(r"[^a-z0-9_]+", "_", tid).strip("_") or "when_trigger"
         bad = _reject_unknown(scheduler, p_action, chain)
         if bad:
             return bad
         try:
             scheduler.schedule_when(
-                name=tid, condition=lhs.strip(),
+                name=tid, condition=cond,
                 action=p_action, arg=p_arg, chain=chain,
             )
         except ValueError as e:
@@ -386,6 +434,78 @@ def _make_when(scheduler) -> Callable[[str], str]:
         except Exception as e:
             return f"Trigger failed, sir — {type(e).__name__}: {e}"
         return f"Conditional trigger '{tid}' armed, sir — when {lhs} → {p_action}."
+    return _act
+
+
+# Spoken verb forms → the tense the registered condition names use.
+_COND_VERB_SUFFIXES = (
+    ("_is_finished", "_finished"), ("_is_done", "_finished"),
+    ("_has_finished", "_finished"), ("_finishes", "_finished"),
+    ("_completes", "_finished"), ("_completed", "_finished"),
+    ("_complete", "_finished"), ("_done", "_finished"),
+    ("_fails", "_failed"), ("_starts", "_started"), ("_begins", "_started"),
+)
+
+
+def _normalise_condition(scheduler, phrase: str) -> str:
+    """Map a spoken condition onto a registered condition name (2026-10-01).
+
+    The prompt taught 'bambu print finishes' / 'when the print finishes', but
+    core.scheduler.schedule_when accepts only exact registered names
+    (bambu_print_finished, disk_low, ...), so every spoken form was refused.
+    Lower-cases, joins words with underscores, drops a leading when/if/the,
+    maps the verb tense (finishes → finished) and tries the 'bambu_' prefix.
+    Returns the phrase unchanged when nothing matches, so the refusal still
+    names what the owner said and lists the real conditions."""
+    raw = (phrase or "").strip()
+    try:
+        known = set(scheduler.available_conditions() or [])
+    except Exception:
+        known = set()
+    if not raw or raw in known:
+        return raw
+    cond = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+    for lead in ("when_", "if_", "once_", "the_"):
+        if cond.startswith(lead):
+            cond = cond[len(lead):]
+    if cond.startswith("the_"):
+        cond = cond[len("the_"):]
+    for old, new in _COND_VERB_SUFFIXES:
+        if cond.endswith(old):
+            cond = cond[: -len(old)] + new
+            break
+    if cond not in known and ("bambu_" + cond) in known:
+        cond = "bambu_" + cond
+    return cond if cond in known else raw
+
+
+def _make_say_aloud() -> Callable[[str], str]:
+    """`say_aloud <text>` — queue <text> to be spoken (2026-10-01).
+
+    The step a spoken scheduled reminder needs: "every morning at 8 remind me
+    to take my vitamins" → schedule_recurring 8am | say_aloud <reminder>.
+    No action could speak arbitrary text before — the prompt's own example
+    named proactive_announce, a Python function, not an action, so every
+    attempt was refused at arm time. Tagged source="schedule" so the standby
+    loop speaks it like the owner's timers."""
+    def _act(arg: str = "") -> str:
+        import sys as _sys
+        text = (arg or "").strip()
+        if not text:
+            return "Format: say_aloud <what to say>"
+        announcer = None
+        for _name in ("bobert_companion", "__main__"):
+            _mod = _sys.modules.get(_name)
+            announcer = getattr(_mod, "proactive_announce", None) if _mod else None
+            if callable(announcer):
+                break
+        if not callable(announcer):
+            return "I can't reach the speech queue to say that, sir."
+        try:
+            ok = announcer(text, source="schedule")
+        except Exception as e:
+            return f"I couldn't queue that line, sir — {type(e).__name__}: {e}"
+        return "Queued to speak, sir." if ok else "I couldn't queue that line, sir."
     return _act
 
 
@@ -454,6 +574,10 @@ def _make_status(scheduler) -> Callable[[str], str]:
                 f"job {m.get('job_id') or 'unknown'} already tried to run "
                 f"'{m.get('action')}' {m.get('count')} time(s) and found nothing"
                 for m in misses) + "."
+        if s.get("persistent") is False:
+            line += (" Job store is in memory, sir — SQLAlchemy isn't "
+                     "installed, so recurring and one-shot schedules vanish "
+                     "at the next restart.")
         if s.get("last_error"):
             line += f" Last error: {s['last_error']}."
         return line
@@ -515,3 +639,4 @@ def register(actions: dict) -> None:
     actions["fire_schedule"]        = _make_fire(scheduler)
     actions["run_schedule"]         = actions["fire_schedule"]
     actions["schedule_status"]      = _make_status(scheduler)
+    actions["say_aloud"]            = _make_say_aloud()

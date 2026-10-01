@@ -148,8 +148,12 @@ class FocusStateMachineTests(unittest.TestCase):
             already, msg = self.mod._enter_focus_mode(5400, trigger="voice")
         self.assertFalse(already)
         self.assertTrue(self.mod.is_focus_mode_active())
-        self.assertIn("Holding all non-critical interruptions", msg)
-        self.assertIn("1 hour 30 minutes", msg)
+        # 2026-10-01: the line says what this skill really does — it used to
+        # promise "holding all non-critical interruptions ... VIPs or
+        # emergencies only", which it never did.
+        self.assertIn("Do not disturb for 1 hour 30 minutes", msg)
+        self.assertIn("Timers and print alerts still come through", msg)
+        self.assertNotIn("VIPs or emergencies", msg)
 
     def test_reenter_extends_not_restarts(self):
         with _neutered_side_effects(self.mod):
@@ -289,7 +293,7 @@ class FocusActionTests(unittest.TestCase):
     def test_focus_mode_action_default_duration(self):
         with _neutered_side_effects(self.mod):
             out = self.actions["focus_mode"]("")   # blank → default 60 min
-        self.assertIn("Holding all non-critical", out)
+        self.assertIn("Do not disturb for 1 hour", out)
         self.assertTrue(self.mod.is_focus_mode_active())
 
     def test_focus_mode_action_custom_duration(self):

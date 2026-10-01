@@ -36,7 +36,7 @@ Actions registered
         (Windows Focus Assist / Teams DoNotDisturb) — see _chain_prior below.
   focus_mode_off / resume / end_focus_mode
         Disengage + return a RECAP one-liner of what was missed, then clear the
-        buffer. EVERY disengage alias first chains the pre-existing
+        buffer. EVERY disengage alias then chains the pre-existing
         dnd_focus_mode teardown so its Windows-Focus-Assist / Teams-presence
         restore runs no matter which phrase the owner used.
   whats_missed / focus_mode_status
@@ -60,8 +60,12 @@ Assist + Teams presence and suppresses a few named skills' nudges. It registers
 it (d < f), so to avoid clobbering its OS-level side effects we capture its
 handlers at register() time and CHAIN them from our BASE handlers: every
 engage-direction alias calls its `focus_mode` first, every disengage-direction
-alias calls its `end_focus_mode` first, and `focus_mode_status` prepends its
-status line. Chaining in the base handlers (2026-07-21 fix) keeps every alias
+alias calls its `end_focus_mode` once our recap is built and our gate is open,
+and `focus_mode_status` prepends its status line. When dnd's handlers carry
+the `.quiet` hooks (2026-10-01) we call those instead, with OUR parsed
+duration, so dnd speaks nothing of its own — its lines contradicted ours and,
+queued while our gate was closed, were recapped back as "missed".
+Chaining in the base handlers (2026-07-21 fix) keeps every alias
 symmetric — previously only the shared names chained, so "resume" /
 "focus_mode_off" left Focus Assist, Teams DND and the nudge suppressors stuck
 on until dnd's own expiry thread fired (up to an hour later), and
@@ -300,14 +304,24 @@ def register(actions):
         # HERE, in the base handler, so every engage alias (focus_mode,
         # focus_mode_on, do_not_disturb, quiet_mode) fires dnd's engage (Focus
         # Assist / Teams presence) exactly once, then engages our state too.
-        # Chain-first so dnd's enqueued engage line speaks before our gate
-        # closes. We return OUR message (dnd's return is discarded).
+        # We return OUR message (dnd's return is discarded).
+        #
+        # 2026-10-01: dnd is engaged QUIETLY (its `.quiet` hook) with OUR
+        # parsed duration. Its own spoken line promised "1 hour ... VIPs or
+        # emergencies only" while this gate holds everything until resume,
+        # and its parser (no "half an hour" / "an hour") fell back to 60 min,
+        # so dnd restored toasts and Teams mid-block. Indefinite → its 8 h
+        # cap. A prior handler without the hook is still called as before.
+        secs = _parse_duration_seconds(args) if args else None
         if _prior_engage is not None:
             try:
-                _prior_engage(args)
+                quiet = getattr(_prior_engage, "quiet", None)
+                if callable(quiet):
+                    quiet(int(secs) if secs and secs > 0 else None)
+                else:
+                    _prior_engage(args)
             except Exception:
                 pass
-        secs = _parse_duration_seconds(args) if args else None
         if secs is not None and secs > 0:
             until = time.time() + secs
             _set_focus(True, until=until)
@@ -320,16 +334,17 @@ def register(actions):
         return "Focus mode on, sir — I'll hold notifications until you resume."
 
     def focus_mode_off(args: str = "") -> str:
-        # Chain dnd_focus_mode's teardown FIRST (Windows Focus Assist / Teams
+        # Chain dnd_focus_mode's teardown (Windows Focus Assist / Teams
         # presence / nudge suppressors) so no disengage alias — focus_mode_off,
         # resume, end_focus_mode — leaves its OS-level side effects stuck on.
         # Safe unconditionally: dnd's _exit_focus_mode is idempotent and just
         # says "was not active" when it never engaged.
-        if _prior_end is not None:
-            try:
-                _prior_end(args)
-            except Exception:
-                pass
+        #
+        # 2026-10-01: the teardown now runs AFTER the recap is built and our
+        # gate is open, and QUIETLY (dnd's `.quiet` hook). It used to run
+        # first, while the gate was still closed, so dnd's own "Focus mode
+        # disengaged, sir." was HELD and the recap reported it as the one
+        # thing the owner missed.
         # Cancel any pending auto-resume first so it can't double-fire.
         _cancel_resume_timer()
         was_active = _is_active()
@@ -338,7 +353,22 @@ def register(actions):
         # we clear here.
         recap = _build_recap(clear=True, prefix="While you were focused, sir")
         _set_focus(False)
+        dnd_was_active = False
+        if _prior_end is not None:
+            try:
+                quiet = getattr(_prior_end, "quiet", None)
+                if callable(quiet):
+                    dnd_was_active = bool(quiet())
+                else:
+                    _prior_end(args)
+            except Exception:
+                pass
         if not was_active:
+            if dnd_was_active:
+                # Only dnd's side was on (the workshop auto-trigger engages dnd
+                # alone): it is off now, so don't claim nothing was on.
+                return ("Focus mode off, sir — Windows notifications and "
+                        "Teams are back to normal.")
             return "Focus mode wasn't on, sir — nothing was held."
         return recap
 

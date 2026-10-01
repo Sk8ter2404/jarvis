@@ -115,6 +115,12 @@ class _BriefingTestBase(unittest.TestCase):
         for name, obj in {"bobert_companion": _benign_bc(**self._BC_ATTRS)}.items():
             self._seeded[name] = sys.modules.get(name, _SENTINEL)
             sys.modules[name] = obj
+        # Hermetic: since 2026-10-01 the throttle is shared with a LOADED
+        # pattern_learning (read in _next_eligible, written in _mark_fired).
+        # One left in sys.modules by another test would point that at its
+        # real offer-state file, so it is absent unless a test installs a fake.
+        self._seeded["skill_pattern_learning"] = sys.modules.pop(
+            "skill_pattern_learning", _SENTINEL)
         self.addCleanup(self._restore_seeded)
         self.mod, self.actions = load_skill_isolated("anticipation_briefing")
         _out = contextlib.redirect_stdout(io.StringIO())
@@ -747,6 +753,47 @@ class BriefingNextEligibleTests(_BriefingTestBase):
         with mock.patch.object(self.mod, "_read_config", return_value=self._cfg()), \
              mock.patch.object(self.mod, "_load_snapshot", return_value={}):
             self.assertEqual(self.mod._next_eligible(bypass_throttle=True), ("", {}))
+
+    # ── 2026-10-01: one throttle shared with the anticipation engine ──────
+    def _fake_pattern_learning(self, state):
+        pl = types.ModuleType("skill_pattern_learning")
+        pl._store = dict(state)
+        pl._load_offer_state = lambda: dict(pl._store)
+        pl._save_offer_state = lambda s: pl._store.clear() or pl._store.update(s)
+        pl._prune_state = lambda s: None
+        return pl
+
+    def test_prediction_the_engine_already_offered_today_is_skipped(self):
+        # The engine (pattern_learning.maybe_pattern_offer_v2) offered this
+        # prediction earlier today; the briefing must not offer it again.
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        pred = {"key": "broad|check_teams|weekday|9-11", "action": "check_teams"}
+        pl = self._fake_pattern_learning({pred["key"]: today})
+        with inject_modules(skill_pattern_learning=pl), \
+             mock.patch.object(self.mod, "_read_config", return_value=self._cfg()), \
+             mock.patch.object(self.mod, "_load_snapshot",
+                               return_value={"precise": [], "broad": []}), \
+             mock.patch.object(self.mod, "_select_predictions", return_value=[pred]), \
+             mock.patch.object(self.mod, "_load_state", return_value={}):
+            self.assertEqual(self.mod._next_eligible(bypass_throttle=False), ("", {}))
+
+    def test_briefing_fire_marks_the_shared_throttle(self):
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        pl = self._fake_pattern_learning({})
+        with inject_modules(skill_pattern_learning=pl), \
+             mock.patch.object(self.mod, "_load_state", return_value={}), \
+             mock.patch.object(self.mod, "_save_state"):
+            self.mod._mark_fired({"key": "broad|check_teams|weekday|9-11"})
+        self.assertEqual(pl._store.get("broad|check_teams|weekday|9-11"), today)
+
+    def test_legacy_invented_offer_is_not_spoken(self):
+        # Snapshots aggregated before 2026-10-01 store "Shall I get time,
+        # sir?" for an action with no curated line; never speak it.
+        self.assertEqual(self.mod._compose_briefing_line(
+            {"action": "get_time", "offer": "Shall I get time, sir?"}), "")
+        self.assertEqual(self.mod._compose_briefing_line(
+            {"action": "x", "offer": "Shall I dim the lights, sir?"}),
+            "Shall I dim the lights, sir?")
 
     def test_next_eligible_no_candidates(self):
         with mock.patch.object(self.mod, "_read_config", return_value=self._cfg()), \

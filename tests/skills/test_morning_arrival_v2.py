@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -887,6 +888,12 @@ class GatherAndFireTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("morning_arrival_v2")
         self.addCleanup(lambda: self.mod._presence_first_seen_at.__setitem__(0, 0.0))
+        # Hermetic: the daily-briefing stand-down (2026-10-01) reads the live
+        # daily_briefing state through sys.modules; these tests don't drive it.
+        _p = mock.patch.object(self.mod, "_daily_briefing_heard_today",
+                               return_value=False)
+        _p.start()
+        self.addCleanup(_p.stop)
 
     def test_gather_sections_collects_all_six(self):
         with mock.patch.object(self.mod, "_section_weather", return_value="W"), \
@@ -1023,6 +1030,45 @@ class GatherAndFireTests(unittest.TestCase):
         self.assertIn("morning_arrival_v2", actions)
         self.assertIn("arrival_briefing_v2", actions)
         self.assertIs(actions["morning_arrival_v2"], actions["arrival_briefing_v2"])
+
+
+class DailyBriefingStandDownTests(unittest.TestCase):
+    """2026-10-01 regression (mirror of daily_briefing's stand-down): when the
+    08:00 daily briefing already spoke to the owner, the arrival briefing must
+    not greet him a second time."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("morning_arrival_v2")
+
+    def _fire(self, heard):
+        db = types.ModuleType("skill_daily_briefing")
+        db.owner_heard_briefing_today = lambda: heard
+        with inject_modules(skill_daily_briefing=db), \
+             mock.patch.object(self.mod, "_already_fired_today", return_value=False), \
+             mock.patch.object(self.mod, "_chain_morning_briefing_fired_today",
+                               return_value=False), \
+             mock.patch.object(self.mod, "_build_briefing",
+                               return_value="[intent:briefing] hi"), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+             mock.patch.object(self.mod, "_mark_fired") as mark, \
+             contextlib.redirect_stdout(io.StringIO()):
+            out = self.mod._fire_arrival("presence")
+        return out, enq, mark
+
+    def test_stands_down_after_a_heard_daily_briefing(self):
+        out, enq, mark = self._fire(True)
+        self.assertEqual(out, "")
+        enq.assert_not_called()
+        mark.assert_called_once()          # covered for the day: watcher idles
+
+    def test_still_briefs_when_daily_was_not_heard(self):
+        out, enq, _ = self._fire(False)
+        self.assertEqual(out, "[intent:briefing] hi")
+        enq.assert_called_once()
+
+    def test_missing_daily_skill_never_blocks(self):
+        with inject_modules(skill_daily_briefing=None):
+            self.assertFalse(self.mod._daily_briefing_heard_today())
 
 
 # ─────────────────────────────────────────────────────────────────────────

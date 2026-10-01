@@ -84,7 +84,9 @@ CALL_WINDOW_HINTS = (
 # Zinger banks. Each tell has 3-5 variants so repeated firings stay fresh.
 _ZINGER_BANK: dict[str, list[str]] = {
     "repeat_question": [
-        "That's the {n}th time you've asked me that today, sir.",
+        # {nth} is the ORDINAL of n ("2nd"), filled by _pick_zinger — a raw
+        # "{n}th" said "the 2th time" / "the 3th time" (2026-10-01).
+        "That's the {nth} time you've asked me that today, sir.",
         # Use {minutes} not {n}: n is the count, minutes is the gap.
         "I have an answer ready, sir — it hasn't changed since you last asked, {minutes} minutes ago.",
         "Asking again won't alter the result, sir.",
@@ -92,7 +94,7 @@ _ZINGER_BANK: dict[str, list[str]] = {
     ],
     "repeat_open": [
         "Opening {target} again, sir. That's {n} times today. Productive, I'm sure.",
-        "{target}, for the {n}th time today. I assume there's a strategy at play.",
+        "{target}, for the {nth} time today. I assume there's a strategy at play.",
         "{target} again, sir? I'm beginning to feel like a doorman.",
     ],
     "tab_clutter": [
@@ -462,13 +464,24 @@ def _detect_music_while_music(entries: list[dict]) -> dict | None:
     return None
 
 
+def _ordinal(n: int) -> str:
+    """1 -> '1st', 2 -> '2nd', 3 -> '3rd', 11 -> '11th', 22 -> '22nd'.
+    Same rule as skills/morning_handoff._ordinal."""
+    if 10 <= n % 100 <= 20:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
 def _pick_zinger(tell: dict) -> str:
     bank = _ZINGER_BANK.get(tell["tell"], [])
     if not bank:
         return ""
     line = random.choice(bank)
+    fields = dict(tell)
+    if isinstance(tell.get("n"), int):
+        fields["nth"] = _ordinal(tell["n"])
     try:
-        return line.format(**tell)
+        return line.format(**fields)
     except Exception:
         return line
 

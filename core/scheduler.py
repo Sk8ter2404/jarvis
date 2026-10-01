@@ -2,7 +2,11 @@
 core.scheduler — APScheduler-backed cron/interval/one-shot/conditional job engine.
 
 Persistent SQLite jobstore at ``data/scheduler.db`` so cron entries survive
-JARVIS restarts.  Three trigger families are supported natively:
+JARVIS restarts — ONLY when SQLAlchemy is installed. Without it APScheduler
+keeps jobs in memory and they are gone at the next restart; ``bootstrap()``
+logs a WARNING, ``is_persistent()`` / ``status()["persistent"]`` report it,
+and skills/schedule_manager says so in every arm reply.  Three trigger
+families are supported natively:
 
     * cron      — ``minute / hour / day / month / day_of_week`` fields
     * interval  — every N seconds/minutes/hours
@@ -172,6 +176,10 @@ _state: dict[str, Any] = {
     "cond_stop":    None,    # threading.Event
     "cond_state":   {},      # condition_name → last_seen_bool (debounce)
     "last_error":   None,
+    # True only when the running scheduler has the SQLite job store
+    # (2026-10-01). False = APScheduler's in-memory store: every cron /
+    # interval / one-shot job vanishes at the next restart.
+    "persistent":   False,
     # UNRESOLVED-ACTION LEDGER (2026-08-20). A scheduled step whose action
     # name isn't in the live ACTIONS dict used to evaporate silently: the
     # miss produced no log, and APScheduler drops run_action's return value
@@ -605,6 +613,15 @@ def bootstrap(actions: dict) -> bool:
         except Exception as e:
             _log.warning("SQLAlchemyJobStore failed (%s) — using in-memory store", e)
             jobstores = {}
+    else:
+        # 2026-10-01: this fallback used to be silent — SQLAlchemy missing
+        # meant every "armed" cron / one-shot job quietly lived in memory and
+        # was gone at the next restart, while the docstring promised the
+        # SQLite store. Say it in the log; status() and the arm replies carry
+        # the same fact to the owner via _state["persistent"].
+        _log.warning("SQLAlchemy not installed — scheduler is IN-MEMORY; "
+                     "cron / interval / one-shot jobs will NOT survive a "
+                     "restart (pip install sqlalchemy)")
 
     BackgroundScheduler = aps["BackgroundScheduler"]
     try:
@@ -644,6 +661,7 @@ def bootstrap(actions: dict) -> bool:
     with _lock:
         _state["scheduler"]  = scheduler
         _state["started_at"] = time.time()
+        _state["persistent"] = "jobstores" in scheduler_kwargs
         # Spin up the condition poller daemon.
         stop = threading.Event()
         _state["cond_stop"] = stop
@@ -672,6 +690,7 @@ def shutdown(wait: bool = False) -> None:
             pass
     with _lock:
         _state["scheduler"] = None
+        _state["persistent"] = False
 
 
 # ── job construction ────────────────────────────────────────────────
@@ -1018,6 +1037,13 @@ def fire_now(job_id: str) -> str:
     return f"job '{job_id}' not found"
 
 
+def is_persistent() -> bool:
+    """True when scheduled jobs survive a restart (the SQLite job store is in
+    use). False before bootstrap and on the in-memory fallback."""
+    with _lock:
+        return bool(_state.get("persistent"))
+
+
 def status() -> dict:
     """One-call health snapshot used by the schedule_status action."""
     with _lock:
@@ -1044,6 +1070,7 @@ def status() -> dict:
         "condition_count":   len(conditions),
         "registered_conditions": available_conditions(),
         "last_error":        last_error,
+        "persistent":        is_persistent(),
         "broken_jobs":       broken,
         "unresolved":        unresolved_actions(),
     }

@@ -12294,7 +12294,8 @@ def _build_focus_recap(*, clear: bool, prefix: str = "While you were focused, si
 def proactive_announce(message: str, source: str = "skill",
                        *, mood: str | None = None,
                        volume_scale: float = 1.0,
-                       supersede: str | None = None) -> bool:
+                       supersede: str | None = None,
+                       dedupe_key: str | None = None) -> bool:
     """Public proactive-speech API for skills.
 
     Skills that want JARVIS to speak something unprompted (print milestones,
@@ -12319,6 +12320,16 @@ def proactive_announce(message: str, source: str = "skill",
     already bounced back). The audio-device governor uses "audio-device".
     Entries without a tag are never touched. A snapshot the drainer has
     already claimed (.consuming) is not rewritten.
+
+    `dedupe_key` (optional, 2026-10-01) is what the drainer's duplicate
+    check compares instead of the text. Two unlabelled timers both say
+    "Reminder, sir — your timer is up"; keyed by their timer number, both
+    are spoken, while the SAME entry landing twice is still dropped. Entries
+    without a key keep the text-based dedupe (the looping-toast guard).
+
+    The `source` tag is also stored on the entry (2026-10-01) so the drainer
+    can pick out owner-requested reminders (timers, promises, schedules) —
+    the standby loop speaks only those while JARVIS is asleep.
     """
     # ── FOCUS MODE GATE ──────────────────────────────────────────────────────
     # This is the whole point of focus / do-not-disturb: while the owner is
@@ -12377,7 +12388,10 @@ def proactive_announce(message: str, source: str = "skill",
         # `source` is stored too (2026-10-01): standby drains only the owner's
         # own reminders (timer / scheduler / promise) and holds the rest, so
         # the drainer has to know which skill queued each line.
-        entry: dict = {"ts": time.time(), "message": message, "source": source}
+        entry: dict = {"ts": time.time(), "message": message,
+                       "source": str(source or "")}
+        if dedupe_key:
+            entry["dedupe_key"] = str(dedupe_key)
         if supersede:
             _before = len(data)
             data = [e for e in data
@@ -34708,7 +34722,11 @@ def _requeue_pending_speech(items: list) -> bool:
 # the owner's OWN requests: a timer, a scheduled job, a promise JARVIS made
 # ("promise:<origin>"). Everything else — banter, device alerts, briefings,
 # the ambient wake nudge — stays held until he wakes JARVIS.
-_STANDBY_SPEAKABLE_SOURCES = frozenset({"timer", "scheduler", "promise"})
+# "scheduler" = core/scheduler.py jobs, "schedule" = skills/schedule_manager's
+# voice-armed lines (both tags are live).
+_STANDBY_SPEAKABLE_SOURCES = frozenset({"timer", "scheduler", "schedule", "promise"})
+# The proactive-scheduling batch's names for the same set (one rule, two names).
+_OWNER_REQUESTED_SOURCES = tuple(sorted(_STANDBY_SPEAKABLE_SOURCES))
 
 
 def _pending_source_in(item, sources) -> bool:
@@ -34740,13 +34758,51 @@ def _pending_has_source(sources) -> bool:
         return True
 
 
-def _speak_pending(only_sources=None):
+def _is_owner_requested_entry(item) -> bool:
+    """True for a pending-speech entry the owner asked for (a timer, a
+    scheduled job, a promise): _pending_source_in on the standby set."""
+    return _pending_source_in(item, _STANDBY_SPEAKABLE_SOURCES)
+
+
+def _note_spoken_question(msg: str) -> None:
+    """Record a queued line that ASKED the owner something in
+    conversation_history, so his answer reaches the LLM with the question in
+    context (2026-10-01). Pattern offers ("Shall I queue your usual mix,
+    sir?") and the recap's closing question were spoken from the queue but
+    never recorded, so even "JARVIS, yes" arrived with nothing to say yes TO
+    — the boot-time offer and the idle proactive turn already record theirs.
+
+    Joins a trailing assistant entry instead of adding a second one in a row
+    (two consecutive assistant turns 400 on Claude — see the late-night remark
+    note in the main loop). An offer spoken into an EMPTY history still cannot
+    lead the messages (the trim drops a leading assistant turn, which Claude
+    rejects), so it is only context once a conversation exists. Never raises.
+    """
+    try:
+        text = re.sub(r"^(?:\s*\[[a-z_]+(?::[^\]]*)?\]\s*)+", "", msg or "").strip()
+        if not text:
+            return
+        if (conversation_history
+                and isinstance(conversation_history[-1], dict)
+                and conversation_history[-1].get("role") == "assistant"):
+            prev = str(conversation_history[-1].get("content") or "").rstrip()
+            conversation_history[-1]["content"] = (prev + " " + text).strip()
+        else:
+            conversation_history.append({"role": "assistant", "content": text})
+        _trim_conversation_history()
+    except Exception as _e:
+        print(f"  [pending] could not record the spoken question: {_e}")
+
+
+def _speak_pending(only_sources=None, only_owner_requested: bool = False):
     """If skills (like the timer) have queued reminders, speak them now.
 
     ``only_sources`` (2026-10-01): speak only entries whose queued ``source``
     (its part before any ":") is in this set and HOLD the rest, in order, for
     a later full drain. Standby passes _STANDBY_SPEAKABLE_SOURCES so a timer
     the owner set plays while JARVIS sleeps; None = speak everything.
+    ``only_owner_requested=True`` is the same as passing
+    _STANDBY_SPEAKABLE_SOURCES.
 
     Race-safe consume-and-rename pattern: we rename the queue file to a
     sibling `.consuming` BEFORE iterating, so any skill that writes a new
@@ -34766,6 +34822,8 @@ def _speak_pending(only_sources=None):
     # anyway. Never raises.
     # Post-dialogue speech hold (handle.hold_after): leave the queue on disk
     # untouched; it is spoken once the hold passes.
+    if only_owner_requested and only_sources is None:
+        only_sources = _STANDBY_SPEAKABLE_SOURCES
     if _speech_hold_active():
         return False
     if only_sources is None:
@@ -34813,8 +34871,12 @@ def _speak_pending(only_sources=None):
     # _RECENT_SPEECH_DEDUPE_WINDOW. Catches the looping-notification bug
     # where the same toast lands in the queue many times in one snapshot
     # (because the upstream listener lost its dedupe state across a
-    # bounce). Timers/promises that intentionally repeat use distinct
-    # message strings, so this won't suppress them.
+    # bounce). The comparison is on the entry's `dedupe_key` when it has one,
+    # else on its text (2026-10-01): every unlabelled timer says the SAME
+    # "Reminder, sir — your timer is up", so a text compare silently dropped
+    # the second timer set within a minute of the first. Timers now key by
+    # their number, so different timers are all spoken while one entry
+    # queued twice is still spoken once.
     spoke_any = False
     seen_in_batch: set[str] = set()
     # Per-pass budget bookkeeping (see _PENDING_DRAIN_BUDGET_S).
@@ -34845,10 +34907,11 @@ def _speak_pending(only_sources=None):
         msg = item.get("message", "")
         if not msg:
             continue
-        if msg in seen_in_batch or _speech_was_recently_spoken(msg):
+        _dkey = str(item.get("dedupe_key") or "") or msg
+        if _dkey in seen_in_batch or _speech_was_recently_spoken(_dkey):
             print(f"  [pending] suppressed duplicate: {msg[:80]}")
             continue
-        seen_in_batch.add(msg)
+        seen_in_batch.add(_dkey)
         print(f"  🔔 [reminder] {msg}")
         try:
             vol = float(item.get("volume_scale", 1.0))
@@ -34868,8 +34931,13 @@ def _speak_pending(only_sources=None):
         _heartbeat()
         try:
             _speak(msg, volume_scale=vol, mood=item_mood)
-            _mark_speech_spoken(msg)
+            _mark_speech_spoken(_dkey)
             spoke_any = True
+            # A queued line that asks something (a pattern offer, the recap's
+            # closing question) goes into the conversation so the owner's
+            # answer has its question (_note_spoken_question).
+            if "?" in msg:
+                _note_spoken_question(msg)
         except Exception as _spe:
             # Don't let one bad TTS attempt nuke the main loop. Print and
             # continue to the next reminder. The snapshot is gone (we
@@ -36083,7 +36151,8 @@ def _handle_sleep_standby(injected_text: str | None):
     # capture holds the mic (see _capture_utterance). Never raises.
     try:
         if not _capture_holds_mic():
-            _speak_pending(only_sources=_STANDBY_SPEAKABLE_SOURCES)
+            if _speak_pending(only_sources=_STANDBY_SPEAKABLE_SOURCES):
+                set_state("idle")
     except Exception as _e:
         print(f"  [pending] standby drain failed: {_e}")
     _wake_conf = {"no_speech_prob": 0.0, "avg_logprob": -0.1}

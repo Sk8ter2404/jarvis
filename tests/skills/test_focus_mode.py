@@ -22,6 +22,8 @@ real thread sleeps, and load_skill_isolated neuters Thread.start at import.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import time
 import types
@@ -484,6 +486,90 @@ class ChainingTests(unittest.TestCase):
                                      f"{name}: disengage alias must not chain "
                                      f"dnd's engage")
                 # else: pure status alias — no chaining requirement.
+
+
+# ─── the REAL dnd_focus_mode chained under focus_mode (2026-10-01) ───────────
+
+_DND_OS_SIDE_EFFECTS = (
+    ("_query_toast_enabled", 1), ("_set_focus_assist", True),
+    ("_set_teams_presence", True), ("_install_nudge_suppressors", None),
+    ("_restore_nudge_suppressors", None), ("_apply_prompt_addendum", None),
+    ("_restore_prompt_addendum", None), ("_start_expiry_thread", None),
+)
+
+
+class RealDndChainTests(unittest.TestCase):
+    """Load the real dnd_focus_mode FIRST (as the skill loader does, d < f),
+    then focus_mode into the same ACTIONS dict. Only dnd's OS side effects
+    (registry, Teams Graph, prompt, threads) are neutered — its spoken lines
+    go through the fake monolith's gated proactive_announce, exactly the
+    path that put "Focus mode disengaged" into the owner's recap."""
+
+    def setUp(self):
+        self.fake_bc = _make_fake_bc()
+        self._saved_main = sys.modules.get("__main__")
+        self._saved_bc = sys.modules.get("bobert_companion")
+        sys.modules["bobert_companion"] = self.fake_bc
+        sys.modules.pop("__main__", None)
+        self.addCleanup(self._restore)
+        actions: dict = {}
+        self.dnd, actions = load_skill_isolated("dnd_focus_mode", actions=actions)
+        self.mod, self.actions = load_skill_isolated("focus_mode", actions=actions)
+        for name, rv in _DND_OS_SIDE_EFFECTS:
+            p = mock.patch.object(self.dnd, name, return_value=rv)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(self.mod, "_arm_resume_timer")
+        p.start()
+        self.addCleanup(p.stop)
+        self.dnd._focus_active[0] = False
+        self.dnd._focus_trigger[0] = ""
+
+    def _restore(self):
+        self.dnd._focus_active[0] = False
+        if self._saved_main is not None:
+            sys.modules["__main__"] = self._saved_main
+        if self._saved_bc is not None:
+            sys.modules["bobert_companion"] = self._saved_bc
+        else:
+            sys.modules.pop("bobert_companion", None)
+
+    def _spoken(self):
+        return [m for m, _s in self.fake_bc._proactive_calls]
+
+    def test_recap_never_lists_jarvis_own_disengage_line(self):
+        self.actions["focus_mode"]("")
+        self.assertTrue(self.dnd.is_focus_mode_active())     # OS side engaged
+        out = self.actions["end_focus_mode"]("")
+        self.assertNotIn("disengaged", out.lower())
+        self.assertIn("nothing came up", out)
+        self.assertFalse(self.dnd.is_focus_mode_active())    # OS side restored
+        # Neither of dnd's own lines was queued or held.
+        self.assertEqual(self.fake_bc._focus_missed_buffer, [])
+        self.assertFalse([m for m in self._spoken()
+                          if "Do not disturb" in m or "Holding" in m
+                          or "disengaged" in m])
+
+    def test_one_parser_decides_the_duration(self):
+        self.actions["focus_mode"]("half an hour")
+        dnd_len = self.dnd._focus_ends_at[0] - self.dnd._focus_started_at[0]
+        self.assertAlmostEqual(dnd_len, 1800, delta=5)       # not dnd's 60-min default
+
+    def test_ending_a_workshop_dnd_does_not_claim_nothing_was_on(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.dnd._enter_focus_mode(3600, trigger="workshop")
+        engage = self._spoken()[-1]
+        self.assertNotIn("VIPs or emergencies", engage)      # honest copy
+        self.assertIn("Timers and print alerts still come through", engage)
+        out = self.actions["end_focus_mode"]("")
+        self.assertNotIn("wasn't on", out)
+        self.assertFalse(self.dnd.is_focus_mode_active())
+
+    def test_dnd_expiry_inside_a_focus_block_is_not_held_as_missed(self):
+        self.actions["focus_mode"]("")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.dnd._exit_focus_mode(reason="expired")
+        self.assertEqual(self.fake_bc.focus_missed_count(), 0)
 
 
 if __name__ == "__main__":

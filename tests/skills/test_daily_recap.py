@@ -75,7 +75,7 @@ class DailyRecapTests(unittest.TestCase):
             "[09:00:01] [action] play_music: 'Michael Jackson Essentials'\n"
             "  You:    play something\n"
             "[09:01:00] [action] focus_window: Bambu Studio - bracket.3mf\n"
-            "Incoming call from Sam Industries on Teams\n"
+            "[09:02:00] [teams-screen] Sam Industries calling — I'd recommend taking it, sir.\n"
             "Print complete, sir\n"
         )
         with mock.patch.object(self.mod, "_todays_log_paths", return_value=["s.log"]), \
@@ -88,6 +88,39 @@ class DailyRecapTests(unittest.TestCase):
         self.assertEqual(rpt["teams_alerts"], 1)
         self.assertEqual(rpt["teams_vips"]["Sam Industries"], 1)
         self.assertGreaterEqual(rpt["app_minutes"]["Bambu Studio"], 1)
+
+    def test_scan_counts_only_emitter_tagged_teams_lines(self):
+        # 2026-10-01 regression: ANY line mentioning a Teams call counted as
+        # one, with a caller taken from any "from <Name>" on it — overheard
+        # speech, transcripts, JARVIS's replies, the recap's own lines and
+        # teams_nudge's (twice-logged) unread nudges were all spoken back at
+        # 22:30 as "took N Teams calls including one from <name>".
+        log = (
+            "[10:00:00] [bg-audio] ignored (wake-word mode): 'Alex is calling you'\n"
+            "  You:    I have a teams call at noon\n"
+            "  JARVIS: You have 2 unread messages on Teams, sir — including one from Robin.\n"
+            "[10:05:00] [filter] dropped: 'teams call from Casey'\n"
+            "[22:30:58] [recap] firing recap (scheduled): took two Teams calls\n"
+            "  🔔 [reminder] [intent:briefing] ... took two Teams calls ...\n"
+            "[11:00:00] [teams] nudging: You have 1 unread message on Teams, sir — from Robin.\n"
+            "[11:00:05] [teams] nudge denied / unconfirmed — dropped: You have 1 unread message on Teams, sir — from Robin.\n"
+        )
+        with mock.patch.object(self.mod, "_todays_log_paths", return_value=["s.log"]), \
+             mock.patch("builtins.open", mock.mock_open(read_data=log)):
+            rpt = self.mod._scan_session_logs()
+        self.assertEqual(rpt["teams_alerts"], 0)
+        self.assertEqual(rpt["teams_vips"], Counter())
+        self.assertEqual(rpt["teams_nudges"], 1)   # a nudge, counted once
+
+    def test_recap_reports_nudges_as_nudges_not_calls(self):
+        report = _empty_report(teams_nudges=2)
+        with mock.patch.object(self.mod, "_scan_session_logs", return_value=report), \
+             mock.patch.object(self.mod, "_supplement_with_pattern_jsonl"), \
+             mock.patch.object(self.mod, "_bambu_now", return_value={}), \
+             mock.patch.object(self.mod, "_count_tasks_completed_today", return_value=0):
+            out = self.mod._build_recap()
+        self.assertIn("two unread-message nudges on Teams", out)
+        self.assertNotIn("Teams call", out)
 
     # ── _supplement_with_pattern_jsonl ───────────────────────────────────
     def test_supplement_with_pattern_jsonl(self):

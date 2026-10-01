@@ -444,10 +444,22 @@ def _verb_for(action: str) -> str:
     return f"runs {action.replace('_', ' ')}"
 
 
+def _generic_offer(action: str) -> str:
+    """The line _offer_for used to invent for an action with no _ACTION_VERB
+    entry. Kept only so offers already stored in the aggregated snapshot can
+    be recognised and dropped (see _compose_offer_line)."""
+    return f"Shall I {action.replace('_', ' ')}, sir?"
+
+
 def _offer_for(action: str) -> str:
+    """The spoken offer for `action`, or "" when it has no curated line.
+
+    2026-10-01: an unmapped action used to get a line built from its NAME —
+    "Shall I get time, sir?" (spoken live for get_time on weekend
+    afternoons). Only actions with a real _ACTION_VERB entry are offered."""
     if action in _ACTION_VERB:
         return _ACTION_VERB[action][1]
-    return f"Shall I {action.replace('_', ' ')}, sir?"
+    return ""
 
 
 def aggregate() -> dict:
@@ -698,6 +710,11 @@ def _save_offer_state(state: dict) -> None:
 def _compose_offer_line(p: dict) -> str:
     action = p.get("action", "")
     offer  = p.get("offer") or _offer_for(action)
+    # A snapshot aggregated before 2026-10-01 still stores the invented
+    # "Shall I <action name>, sir?" line; drop it without waiting for a
+    # re-aggregation (see _offer_for).
+    if action not in _ACTION_VERB and offer == _generic_offer(action):
+        return ""
     arg    = (p.get("common_arg") or "").strip()
     # Specialise: if we know the usual play_music argument (e.g. "michael
     # jackson"), tailor the offer line to it — that's the spec's headline

@@ -246,7 +246,7 @@ def _parse_duration(text: str) -> int | None:
     return secs if secs > 0 else None
 
 
-def _enqueue_speech(message: str):
+def _enqueue_speech(message: str, key: str | None = None):
     """Append a reminder to pending_speech.json for the main loop to speak.
 
     Routes through bobert_companion.proactive_announce() so this skill shares
@@ -255,12 +255,21 @@ def _enqueue_speech(message: str):
     …) and they don't race each other. Falls back to a local atomic write
     only when the parent module isn't loaded yet (import-time registration /
     unit tests) or the announcer call fails — so a broken parent import
-    can't silence a timer."""
+    can't silence a timer.
+
+    `key` (2026-10-01) is the timer's own identity ("timer#3"), handed to the
+    drainer as its dedupe key. Every unlabelled timer speaks the SAME text,
+    and the drainer used to drop a line whose text was spoken in the last
+    60 s — so "set a 30 second timer", then the same again, went silent the
+    second time. Keyed by number, different timers are all spoken."""
     try:
         bc = importlib.import_module("bobert_companion")
         announcer = getattr(bc, "proactive_announce", None)
         if callable(announcer):
-            announcer(message, source="timer")
+            if key:
+                announcer(message, source="timer", dedupe_key=key)
+            else:
+                announcer(message, source="timer")
             return
     except Exception:
         pass
@@ -275,7 +284,10 @@ def _enqueue_speech(message: str):
                 data = []
         # Tagged like proactive_announce's entries (2026-10-01): standby
         # speaks only the owner's own reminders, keyed on "source".
-        data.append({"ts": time.time(), "message": message, "source": "timer"})
+        entry = {"ts": time.time(), "message": message, "source": "timer"}
+        if key:
+            entry["dedupe_key"] = key
+        data.append(entry)
         try:
             _atomic_write_json(_SPEECH_QUEUE, data)
         except Exception as e:
@@ -333,7 +345,7 @@ def restore_timers(payload: list) -> int:
                 # if the announcer ever calls back into this module.
                 _next_id[0] = max(_next_id[0], tid + 1)
                 try:
-                    _enqueue_speech(f"Reminder, sir — {msg}")
+                    _enqueue_speech(f"Reminder, sir — {msg}", key=f"timer#{tid}")
                 except Exception as e:
                     print(f"  [timer] restore-fire failed for #{tid}: {e}")
                 restored += 1
@@ -341,7 +353,7 @@ def restore_timers(payload: list) -> int:
 
             def _fire(_tid=tid, _msg=msg):
                 print(f"  [timer] 🔔 fired #{_tid}: {_msg}")
-                _enqueue_speech(f"Reminder, sir — {_msg}")
+                _enqueue_speech(f"Reminder, sir — {_msg}", key=f"timer#{_tid}")
                 with _lock:
                     _timers.pop(_tid, None)
                 _persist()
@@ -457,7 +469,7 @@ def register(actions):
 
         def _fire():
             print(f"  [timer] 🔔 fired #{tid}: {msg}")
-            _enqueue_speech(f"Reminder, sir — {msg}")
+            _enqueue_speech(f"Reminder, sir — {msg}", key=f"timer#{tid}")
             with _lock:
                 _timers.pop(tid, None)
             _persist()

@@ -57,7 +57,11 @@ class PatternLearningHelperTests(unittest.TestCase):
         self.assertEqual(self.mod._verb_for("do_thing"), "runs do thing")
 
     def test_offer_for_fallback(self):
-        self.assertIn("Shall I", self.mod._offer_for("do_thing"))
+        # 2026-10-01: an action with no curated _ACTION_VERB line is NOT
+        # offered. The old fallback built "Shall I do thing, sir?" from the
+        # action's name ("Shall I get time, sir?" was spoken live).
+        self.assertEqual(self.mod._offer_for("do_thing"), "")
+        self.assertIn("Shall I", self.mod._offer_for("check_system"))
 
     def test_titlecase_keeps_small_words_lower(self):
         self.assertEqual(self.mod._titlecase("michael jackson"), "Michael Jackson")
@@ -91,6 +95,14 @@ class PatternLearningHelperTests(unittest.TestCase):
         out = self.mod._compose_offer_line(
             {"action": "check_teams", "offer": "Shall I check Teams, sir?"})
         self.assertEqual(out, "Shall I check Teams, sir?")
+
+    def test_compose_offer_line_drops_offer_invented_from_action_name(self):
+        # 2026-10-01 regression: "Shall I get time, sir?" was stored in the
+        # aggregated snapshot for get_time (no curated line) and spoken live.
+        # Dropped at compose time, so no re-aggregation is needed.
+        self.assertEqual(self.mod._compose_offer_line(
+            {"action": "get_time", "offer": "Shall I get time, sir?"}), "")
+        self.assertEqual(self.mod._compose_offer_line({"action": "get_time"}), "")
 
 
 class PatternLearningAggregateTests(unittest.TestCase):

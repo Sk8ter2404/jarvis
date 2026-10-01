@@ -13,6 +13,8 @@ Two layers:
 from __future__ import annotations
 
 import datetime
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -734,6 +736,146 @@ class ScheduleCoreContractTests(unittest.TestCase):
             self.assertEqual(
                 core_sched.unknown_actions("ghost", [{"action": "weather"}]),
                 ["ghost"])
+
+
+class _RealParsingScheduler(FakeScheduler):
+    """FakeScheduler with the REAL core.scheduler time/day parsers and
+    condition names, so the spec translation is tested against what ships."""
+
+    def parse_clock(self, s):
+        from core import scheduler as core_sched
+        return core_sched.parse_clock(s)
+
+    def parse_dow(self, s):
+        from core import scheduler as core_sched
+        return core_sched.parse_dow(s)
+
+    def available_conditions(self):
+        from core import scheduler as core_sched
+        return sorted(core_sched._BUILTIN_CONDITIONS)
+
+
+class ScheduleWeekdayAtClockTests(unittest.TestCase):
+    """2026-10-01 regression: "every monday at 9 pm" armed a job that fired
+    EVERY day (the "at" stayed in the day text, parse_dow returned None, and
+    the two-token-clock branch had no bail-out), while the reply said it was
+    set as asked."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("schedule_manager")
+        self.sched = _RealParsingScheduler()
+
+    def _cron(self, spec):
+        self.mod._build_recurring_job(self.sched, spec, "brief", "", [])
+        kind, kw = self.sched.calls[-1]
+        self.assertEqual(kind, "cron")
+        return (kw["hour"], kw["minute"]), kw["day_of_week"]
+
+    def test_weekday_at_split_clock_is_that_weekday(self):
+        self.assertEqual(self._cron("every monday at 9 pm"), ((21, 0), "mon"))
+
+    def test_weekday_at_joined_clock_is_that_weekday(self):
+        self.assertEqual(self._cron("every monday at 9pm"), ((21, 0), "mon"))
+
+    def test_weekdays_at_clock(self):
+        self.assertEqual(self._cron("weekdays at 8 am"), ((8, 0), "mon-fri"))
+
+    def test_every_day_words_still_arm_daily(self):
+        self.assertEqual(self._cron("daily 8am"), ((8, 0), None))
+        self.assertEqual(self._cron("every day at 7"), ((7, 0), None))
+        self.assertEqual(self._cron("8:30 pm"), ((20, 30), None))
+
+    def test_unreadable_day_text_is_refused_not_armed_daily(self):
+        for spec in ("someday at 9 pm", "every blursday at 9pm"):
+            with self.assertRaises(ValueError, msg=spec):
+                self.mod._build_recurring_job(self.sched, spec, "brief", "", [])
+        self.assertEqual(self.sched.calls, [])
+
+    def test_recurring_action_reply_names_the_refusal(self):
+        act = self.mod._make_recurring(self.sched)
+        out = act("someday at 9 pm | brief")
+        self.assertIn("could not parse", out.lower())
+        self.assertIn("someday", out)
+        self.assertEqual(self.sched.calls, [])
+
+
+class ScheduleVolatileStoreNoteTests(unittest.TestCase):
+    """2026-10-01 regression: without SQLAlchemy every armed job lives in
+    memory and is gone at the next restart, but the reply said "armed, sir"
+    and status never mentioned it."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("schedule_manager")
+        self.mod._bootstrap_error = None
+        self.sched = FakeScheduler()
+
+    def test_recurring_and_once_replies_warn_when_in_memory(self):
+        self.sched.is_persistent = lambda: False
+        rec = self.mod._make_recurring(self.sched)("8am | brief")
+        once = self.mod._make_once(self.sched)("in 30 minutes | brief")
+        for out in (rec, once):
+            self.assertIn("armed", out.lower())
+            self.assertIn("will not survive a restart", out)
+
+    def test_no_warning_when_persistent(self):
+        self.sched.is_persistent = lambda: True
+        out = self.mod._make_recurring(self.sched)("8am | brief")
+        self.assertNotIn("restart", out)
+
+    def test_status_reports_in_memory_store(self):
+        base = self.sched.status()
+        self.sched.status = lambda: dict(base, persistent=False)
+        out = self.mod._make_status(self.sched)("")
+        self.assertIn("in memory", out)
+
+
+class ScheduleSpokenReminderTests(unittest.TestCase):
+    """2026-10-01 regression: no action could speak arbitrary text, and the
+    prompt's own example (`... | proactive_announce print done`) plus every
+    spoken condition ('bambu print finishes') were refused at arm time."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("schedule_manager")
+        self.mod._bootstrap_error = None
+
+    def test_say_aloud_is_registered_and_queues_the_text(self):
+        self.assertIn("say_aloud", self.actions)
+        fake_bc = types.ModuleType("bobert_companion")
+        fake_bc.proactive_announce = mock.MagicMock(return_value=True)
+        with mock.patch.dict(sys.modules, {"bobert_companion": fake_bc}):
+            out = self.actions["say_aloud"]("Time to take your vitamins, sir.")
+        fake_bc.proactive_announce.assert_called_once_with(
+            "Time to take your vitamins, sir.", source="schedule")
+        self.assertIn("queued", out.lower())
+
+    def test_say_aloud_blank_and_no_announcer_are_honest(self):
+        self.assertIn("Format:", self.actions["say_aloud"]("   "))
+        with mock.patch.dict(sys.modules, {"bobert_companion": types.ModuleType("bobert_companion")}):
+            out = self.actions["say_aloud"]("hello")
+        self.assertIn("can't reach", out)
+
+    def test_spoken_condition_maps_to_registered_name(self):
+        sched = _RealParsingScheduler(registered={"say_aloud"})
+        act = self.mod._make_when(sched)
+        for spoken in ("bambu print finishes", "when the print finishes",
+                       "the bambu print is done"):
+            out = act(f"{spoken} | say_aloud Your print is done, sir.")
+            self.assertIn("armed", out.lower(), spoken)
+            kind, kw = sched.calls[-1]
+            self.assertEqual(kw["condition"], "bambu_print_finished", spoken)
+            self.assertEqual(kw["action"], "say_aloud")
+        self.assertEqual(self.mod._normalise_condition(sched, "print fails"),
+                         "bambu_print_failed")
+        # Nothing matches → the owner's words come back for the refusal.
+        self.assertEqual(self.mod._normalise_condition(sched, "cpu over 90"),
+                         "cpu over 90")
+
+    def test_prompt_teaches_a_reminder_that_can_arm(self):
+        from core.prompts import PC_CONTROL_PROMPT
+        self.assertNotIn("proactive_announce print done", PC_CONTROL_PROMPT)
+        self.assertNotIn("'bambu\n", PC_CONTROL_PROMPT)
+        self.assertIn("bambu_print_finished | say_aloud", PC_CONTROL_PROMPT)
+        self.assertIn("8am | say_aloud", PC_CONTROL_PROMPT)
 
 
 if __name__ == "__main__":

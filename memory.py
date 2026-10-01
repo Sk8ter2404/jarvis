@@ -134,6 +134,12 @@ _APP_TITLE_TAILS = {
 }
 
 
+def _is_jarvis_window(name: str) -> bool:
+    """True for a window title / logged app name that belongs to JARVIS
+    itself (every JARVIS window title starts with "JARVIS")."""
+    return (name or "").strip().lower().startswith("jarvis")
+
+
 def _get_active_app() -> str:
     """Best-effort canonical name of the currently-focused window's owning
     app. Used to enrich voice-command logs so we can detect 'user typically
@@ -148,6 +154,12 @@ def _get_active_app() -> str:
             return ""
         title = (getattr(w, "title", "") or "").strip()
         if not title:
+            return ""
+        # JARVIS's own windows (HUD, reticle, overlays, the live-log console
+        # — every one is titled "JARVIS ...") are not a habit of the owner's
+        # (2026-10-01): recorded at every turn, they became offers like "You
+        # typically check JARVIS LIVE LOG around now, sir".
+        if _is_jarvis_window(title):
             return ""
         # Try the most common "Doc - App" / "Doc — App" suffix shape first.
         for sep in (" — ", " - ", " – "):
@@ -449,7 +461,8 @@ def get_patterns(min_days: float | None = None) -> list[dict]:
             slot_events[(dow, bucket)].append(extracted)
             slot_hours[(dow, bucket)].append(hour)
         app = (e.get("app") or "").strip()
-        if app:
+        # Skip JARVIS's own windows already in the log (see _get_active_app).
+        if app and not _is_jarvis_window(app):
             slot_apps[(dow, bucket)].append(app)
             # App usage also counts toward the slot's hour profile so the
             # representative hour stays accurate when only ambient signals fire.
