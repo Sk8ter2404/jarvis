@@ -1938,7 +1938,13 @@ def _apply_user_settings() -> None:
             continue          # existing public, non-secret constants only
         cur = g[key]
         if key in _SAFETY_LIST_BASELINE:
-            g[key] = _merge_safety_list(key, val, cur)
+            # Inside a try like every other key: this runs at import, so a
+            # raise here would stop core.config importing and JARVIS booting.
+            # On any error the shipped list stays (2026-10-02 review).
+            try:
+                g[key] = _merge_safety_list(key, val, cur)
+            except Exception:
+                pass
             continue
         # int|None knobs (current value None or a non-bool int) — e.g.
         # MICROPHONE_INDEX / SPEAKER_INDEX — accept an explicit null/blank as

@@ -370,6 +370,18 @@ class SafetyListFloorTests(unittest.TestCase):
                          ["1password", "banking"])
         self.assertEqual(self._warnings(), "")
 
+    def test_a_merge_that_raises_cannot_stop_the_import(self):
+        """_merge_safety_list ran outside the per-key try that guards every
+        other key: had it raised, core.config would have failed to import and
+        JARVIS would not boot (2026-10-02 review). It now fails like any other
+        key: the shipped list stays and the keys after it still apply."""
+        with mock.patch.object(cfg, "_merge_safety_list",
+                               side_effect=RuntimeError("boom")), \
+                mock.patch.object(cfg, "MICROPHONE_INDEX", cfg.MICROPHONE_INDEX):
+            self._apply({"CONFIRM_KEYWORDS": ["wire"], "MICROPHONE_INDEX": 3})
+            self.assertEqual(cfg.MICROPHONE_INDEX, 3)
+        self.assertEqual(cfg.CONFIRM_KEYWORDS, self._orig["CONFIRM_KEYWORDS"])
+
     def test_the_floor_itself_is_not_overridable(self):
         # Underscore-prefixed, so the apply loop skips it like every _ key.
         self._apply({"_SAFETY_LIST_BASELINE": {"CONFIRM_KEYWORDS": []},
