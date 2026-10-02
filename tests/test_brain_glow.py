@@ -3,8 +3,9 @@ that is answering (local model / Claude Sonnet / Opus / any other model).
 
 What is pinned here (light tier — stdlib only, no monolith, no Qt):
 
-  * the colour MAPPING: local = blue, Haiku = green, Sonnet = gold, Opus =
-    violet, Fable = rose, any other cloud model = silver; overrides from
+  * the colour MAPPING: local = blue, Haiku = teal (2026-10-02: apart from
+    the HUD's listening green), Sonnet = gold, Opus = violet, Fable = rose,
+    any other cloud model = silver; overrides from
     BRAIN_GLOW_COLORS are validated (a bad hex or an unknown tier never
     reaches a HUD);
   * the display NAMES the HUD label shows ("Sonnet 5.5", "gemma4 12B");
@@ -25,12 +26,17 @@ stdlib unittest + unittest.mock only (no pytest).
 """
 from __future__ import annotations
 
+import ast
+import colorsys
+import os
 import threading
 import types
 import unittest
 from unittest import mock
 
 from core import brain_glow as BG
+
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 SONNET = "claude-sonnet-5-5"
@@ -85,7 +91,9 @@ class ColorMappingTests(unittest.TestCase):
         self.assertEqual(BG.color_word(BG.color_for(GEMMA, "local")), "blue")
         self.assertEqual(BG.color_word(BG.color_for(SONNET, "cloud")), "gold")
         self.assertEqual(BG.color_word(BG.color_for(OPUS, "cloud")), "violet")
-        self.assertEqual(BG.color_word(BG.color_for(HAIKU, "cloud")), "green")
+        # Haiku is TEAL (owner's call 2026-10-02): its old green read as the
+        # HUD's "listening" green. HaikuTealTests pins the distance.
+        self.assertEqual(BG.color_word(BG.color_for(HAIKU, "cloud")), "teal")
         self.assertEqual(BG.color_word(BG.color_for(FABLE, "cloud")), "rose")
         self.assertEqual(
             BG.color_word(BG.color_for("claude-mythos-1", "cloud")), "silver")
@@ -130,6 +138,84 @@ class ColorMappingTests(unittest.TestCase):
         self.assertEqual(BG.color_word("#FFFFFF"), "white")
         self.assertEqual(BG.color_word("#808080"), "silver")
         self.assertEqual(BG.color_word("not a colour"), "")
+
+
+def _hue_deg(color: str) -> float:
+    r, g, b = (int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+    return colorsys.rgb_to_hls(r, g, b)[0] * 360.0
+
+
+def _hue_gap(a: str, b: str) -> float:
+    d = abs(_hue_deg(a) - _hue_deg(b)) % 360.0
+    return min(d, 360.0 - d)
+
+
+def _unified_hud_listening_color() -> str:
+    """The unified HUD's "listening" accent as "#RRGGBB", read from its SOURCE
+    (the light tier has no PyQt6): the name _accent() maps "listening" to,
+    resolved to its ``NAME = QColor(r, g, b)`` assignment."""
+    path = os.path.join(_PROJECT_DIR, "hud", "jarvis_unified_hud.py")
+    with open(path, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
+    accent = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_accent")
+    table = next(n for n in ast.walk(accent) if isinstance(n, ast.Dict))
+    name = next(v.id for k, v in zip(table.keys, table.values)
+                if isinstance(k, ast.Constant) and k.value == "listening"
+                and isinstance(v, ast.Name))
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == name):
+            continue
+        call = node.value.body if isinstance(node.value, ast.IfExp) else node.value
+        if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                and call.func.id == "QColor" and len(call.args) == 3):
+            rgb = [a.value for a in call.args]
+            return "#" + "".join(f"{int(c):02X}" for c in rgb)
+    raise AssertionError(f"no {name} = QColor(r, g, b) in {path}")
+
+
+class HaikuTealTests(unittest.TestCase):
+    """Owner's call (2026-10-02): Haiku's green (#36D399) sat ~13 degrees of
+    hue from the unified HUD's listening green, so a Haiku ring read as
+    "listening". Haiku is TEAL now — clearly apart from that green AND from
+    the local model's blue."""
+
+    #: Smallest hue gap (degrees) that reads as a different colour on the ring.
+    MIN_GAP = 25.0
+
+    def test_haiku_is_teal(self):
+        haiku = BG.DEFAULT_COLORS["haiku"]
+        self.assertEqual(BG.color_word(haiku), "teal")
+        self.assertEqual(BG.brain_state(HAIKU, "cloud")["color"], haiku.upper())
+
+    def test_teal_is_named_teal_by_hue_too(self):
+        # The spoken word must not hang on the _DEFAULT_WORDS table alone: a
+        # copy of the colour in BRAIN_GLOW_COLORS is named by its hue.
+        haiku = BG.DEFAULT_COLORS["haiku"]
+        with mock.patch.dict(BG._DEFAULT_WORDS, clear=True):
+            self.assertEqual(BG.color_word(haiku), "teal")
+
+    def test_haiku_is_apart_from_the_listening_green(self):
+        listening = _unified_hud_listening_color()
+        self.assertEqual(BG.color_word(listening), "green")
+        haiku = BG.DEFAULT_COLORS["haiku"]
+        self.assertGreaterEqual(_hue_gap(haiku, listening), self.MIN_GAP,
+                                (haiku, listening))
+
+    def test_haiku_is_apart_from_the_local_blue(self):
+        haiku, local = BG.DEFAULT_COLORS["haiku"], BG.DEFAULT_COLORS["local"]
+        self.assertGreaterEqual(_hue_gap(haiku, local), self.MIN_GAP,
+                                (haiku, local))
+
+    def test_the_voice_line_says_teal_for_haiku(self):
+        BG.PUBLISHER.reset()
+        self.addCleanup(BG.PUBLISHER.reset)
+        bc = _bc(takes_local=False, backend="claude", claude=HAIKU)
+        with _settings():
+            self.assertEqual(BG.describe_for_voice(bc, route="cloud"),
+                             " The reactor's glowing teal for Haiku 4.5.")
 
 
 class DisplayNameTests(unittest.TestCase):

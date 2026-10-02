@@ -1720,7 +1720,7 @@ HUD_MONITOR = "top"                # which monitor in MONITORS to anchor to
 # ─── Brain glow (core/brain_glow.py) ─────────────────────────────────────
 # BRAIN_GLOW_ENABLED — a glowing ring around the HUD orb / arc reactor takes
 #   the colour of the brain that is answering: local model = blue, Claude
-#   Sonnet = gold, Opus = violet, Haiku = green, Fable = rose, any other cloud
+#   Sonnet = gold, Opus = violet, Haiku = teal, Fable = rose, any other cloud
 #   model = silver. It changes the moment you switch brains (set_model /
 #   set_brain / switch_llm) and per turn when a turn is really answered by the
 #   other brain (a local turn the cloud had to answer, a cloud turn that fell

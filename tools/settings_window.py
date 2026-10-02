@@ -1705,7 +1705,7 @@ SCHEMA: dict[str, dict] = {
         "type": "bool", "default": True,
         "help": "A glowing ring around the reactor takes the colour of the "
                 "brain that is answering: local model blue, Claude Sonnet "
-                "gold, Opus violet, Haiku green. Changes when you switch "
+                "gold, Opus violet, Haiku teal. Changes when you switch "
                 "brains and when a turn falls back to the other brain. The "
                 "halo keeps the listening / thinking / speaking colours; no "
                 "ring while JARVIS is asleep.",

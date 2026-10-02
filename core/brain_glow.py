@@ -61,11 +61,15 @@ TIERS = ("local", "haiku", "sonnet", "opus", "fable", "cloud")
 
 #: Default glow per tier. The alert red (#ff5b5b) is never a brain colour. A
 #: tier may share a hue with a state colour (Sonnet gold ~ the "thinking"
-#: gold, Haiku green ~ "listening"): the HUDs draw the brain on a ring of its
-#: own and keep the halo for the state, so the two never compete.
+#: gold): the HUDs draw the brain on a ring of its own and keep the halo for
+#: the state, so the two never compete. Haiku is TEAL, not green (owner's
+#: call, 2026-10-02): its old green #36D399 sat ~13 degrees of hue from the
+#: unified HUD's listening green #78EBA8 and read as "listening"; #20B2AA is
+#: ~32 degrees from that green and ~39 from the local blue
+#: (tests/test_brain_glow.HaikuTealTests).
 DEFAULT_COLORS: Dict[str, str] = {
     "local":  "#3D8BFF",   # blue   — the on-device model, $0 per turn
-    "haiku":  "#36D399",   # green  — fast / cheap cloud
+    "haiku":  "#20B2AA",   # teal   — fast / cheap cloud
     "sonnet": "#FFC233",   # gold   — the default cloud brain
     "opus":   "#B05CFF",   # violet — deep work
     "fable":  "#FF5C8A",   # rose   — the priciest
@@ -74,7 +78,7 @@ DEFAULT_COLORS: Dict[str, str] = {
 
 #: Spoken names of the default colours (an override is named by its hue).
 _DEFAULT_WORDS = {
-    "#3D8BFF": "blue", "#36D399": "green", "#FFC233": "gold",
+    "#3D8BFF": "blue", "#20B2AA": "teal", "#FFC233": "gold",
     "#B05CFF": "violet", "#FF5C8A": "rose", "#C8D4E3": "silver",
 }
 
