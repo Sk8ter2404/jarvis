@@ -19658,10 +19658,25 @@ def _ollama_chat_bounded(model, messages):
     Routes through `ollama.Client(timeout=…)` (the host kwargs flow straight to
     the underlying httpx client). Raises on timeout/transport error so the
     caller's existing `except` degrades to its honest cloud/local fallback —
-    NEVER returns a partial/None silently here. 2026-06-06 audit (P1-2)."""
+    NEVER returns a partial/None silently here. 2026-06-06 audit (P1-2).
+
+    Speed plan R5d (2026-10-02): it now sends the same runner options as
+    every other local call (core.ollama_opts.chat_options, num_ctx pinned by
+    _local_num_ctx) and the same keep_alive as _local_chat_payload. It used to
+    send NONE: Ollama keys a loaded runner by (model, options), so this path
+    -- _call_llm / get_followup_response / _llm_quick on AI_BACKEND "ollama"
+    off the local chat route -- would reload the brain at the model's own
+    default window (262144 for gemma4:26b-a4b: a CPU spill, see
+    core/ollama_opts), and its default 5-minute keep_alive cut the residency
+    the chat path asks for. Sampling options stay the server's: they do not
+    key the runner."""
     import ollama
+    from core.ollama_opts import chat_options as _chat_options
     client = ollama.Client(host=LOCAL_LLM_BASE_URL, timeout=_OLLAMA_CHAT_TIMEOUT_S)
-    return client.chat(model=model, messages=messages)
+    return client.chat(
+        model=model, messages=messages,
+        options=_chat_options(model, extra={"num_ctx": _local_num_ctx(model)}),
+        keep_alive="20m")
 
 
 def _llm_brain_is_remote() -> bool:
