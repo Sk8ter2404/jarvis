@@ -865,31 +865,6 @@ class R6ShadowTests(_Base):
         with open(os.path.join(d, "stt_ab.jsonl"), encoding="utf-8") as f:
             self.assertEqual([json.loads(x) for x in f], [{"a": 1}])
 
-    def test_the_shadow_decodes_under_parakeet_lock_end_to_end(self):
-        bc = self.bc
-        eng = _FakeEngine(text="Jarvis what time is it")
-        self._p(bc, "_stt_alt", eng)
-        self._p(bc, "_turn_in_progress", [False])
-        self._p(bc, "_utterance_in_progress", [False])
-        rows = []
-        self._p(bc, "_parakeet_ab_write",
-                side_effect=lambda r: rows.append(r) or True)
-        sh = bc._stt_parakeet.Shadow(
-            lambda a: bc._parakeet_decode(a), bc._parakeet_shadow_busy,
-            bc._parakeet_shadow_judge, lambda r: bc._parakeet_ab_write(r),
-            latch=bc._stt_parakeet.Latch(), log=lambda s: None)
-        self.assertTrue(sh.offer(self.audio, "Jarvis, what time is it?",
-                                 W_RES[1], 1400, 0.05,
-                                 bc._parakeet_shadow_ctx(), start=False))
-        with bc._stt_lock:          # an ambient decode cannot stall it
-            row = sh.process(sh._q.get_nowait())
-        self.assertEqual(rows, [row])
-        self.assertTrue(row["same_words"])
-        self.assertEqual(row["parakeet"]["text"], "Jarvis what time is it")
-        self.assertEqual(eng.calls, 1)
-
-
-
 # ════════════════════════════════════════════════════════════════════════════
 @requires_monolith
 class R6ShadowJudgeTests(_Base):
@@ -1104,6 +1079,104 @@ class R6ShadowJudgeTests(_Base):
         with contextlib.redirect_stdout(io.StringIO()):
             row = self.sh.process(self.sh._q.get_nowait())
         self.assertEqual(row["words"], "kept")
+
+    def test_the_real_shadow_is_wired_as_specified(self):
+        """The REAL _parakeet_shadow (not a test-built one): it waits on the
+        real busy rule, judges with the real judge, writes the real file,
+        shares the latch, and its queue and wait are the bounded ones (R6
+        review: a real shadow built with busy=lambda: False, or an unbounded
+        queue, stayed green)."""
+        bc = self.bc
+        sp = bc._stt_parakeet
+        sh = self.sh
+        self.assertIs(sh._busy, bc._parakeet_shadow_busy)
+        self.assertIs(sh._judge, bc._parakeet_shadow_judge)
+        self.assertIs(sh._write, bc._parakeet_ab_write)
+        self.assertIs(sh.latch, bc._parakeet_latch)
+        self.assertEqual(sh._q.maxsize, sp.SHADOW_QUEUE_MAX)
+        self.assertEqual(sh._wait_s, sp.SHADOW_WAIT_S)
+        self.assertEqual(sp.SHADOW_WAIT_S, 30.0)
+        self.assertEqual(sh._drops.maxlen, sp.SHADOW_DROPS_MAX)
+        self._p(bc, "_mic_muted", [True])
+        self.assertTrue(sh._muted())
+        bc._mic_muted[0] = False
+        self.assertFalse(sh._muted())
+
+    def test_the_real_shadow_decodes_while_stt_lock_is_held(self):
+        """An ambient Whisper decode holds _stt_lock on ANOTHER thread for
+        the whole test; the real shadow's decode must still finish
+        (Event-based: routed through _stt_lock, it never would). Holding the
+        RLock on the shadow's own thread proved nothing."""
+        bc = self.bc
+        eng = _FakeEngine(text="Jarvis what time is it")
+        self._p(bc, "_stt_alt", eng)
+        self.assertTrue(self.sh.offer(self.audio, "Jarvis, what time is it?",
+                                      W_RES[1], 1400, 0.05,
+                                      bc._parakeet_shadow_ctx(self.audio),
+                                      start=False))
+        item = self.sh._q.get_nowait()
+        held, release, done = (threading.Event(), threading.Event(),
+                               threading.Event())
+        box = {}
+
+        def ambient():
+            with bc._stt_lock:
+                held.set()
+                release.wait(10.0)
+
+        def worker():
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    box["row"] = self.sh.process(item)
+            finally:
+                done.set()
+        amb = threading.Thread(target=ambient, daemon=True)
+        amb.start()
+        self.assertTrue(held.wait(5.0))
+        wk = threading.Thread(target=worker, daemon=True)
+        try:
+            wk.start()
+            finished = done.wait(5.0)
+        finally:
+            release.set()
+            amb.join(5.0)
+            wk.join(5.0)
+        self.assertTrue(finished, "the shadow decode waited on _stt_lock")
+        row = box["row"]
+        self.assertEqual(self._rows(), [row])
+        self.assertTrue(row["same_words"])
+        self.assertEqual(row["parakeet"]["text"], "Jarvis what time is it")
+        self.assertEqual(eng.calls, 1)
+
+    def test_the_real_shadow_never_prints_a_transcript(self):
+        # Through the REAL judge, rescue and live outcome, in every gate
+        # state the row can take: stdout gets numbers, never words.
+        bc = self.bc
+        secret = "open the secret project folder"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for kw in ({}, {"_require_wake_runtime": True},
+                       {"_standby_mode": [True], "_sleep_mode": [True]}):
+                for name, value in kw.items():
+                    self._p(bc, name, value)
+                for w_text, p_text in (("Jarvis, " + secret, secret),
+                                       (secret, "[Music] " + secret),
+                                       ("Thank you.", "thank you")):
+                    self._p(bc, "_stt_alt", _FakeEngine(text=p_text))
+                    self.sh.offer(self.audio, w_text, W_RES[1], 900, 0.009,
+                                  bc._parakeet_shadow_ctx(self.audio),
+                                  start=False)
+                    self.sh.process(self.sh._q.get_nowait())
+                    for j_text in (w_text, p_text):
+                        bc._parakeet_shadow_judge(
+                            j_text, W_RES[1], 0.009,
+                            bc._parakeet_shadow_ctx(self.audio))
+        log = out.getvalue()
+        self.assertIn("[stt-shadow]", log)
+        for word in ("secret", "project", "folder", "Music", "Thank",
+                     "thank", "Jarvis", "jarvis"):
+            self.assertNotIn(word, log)
+        self.assertEqual(len(self._rows()), 9)
 
     def test_the_live_outcome(self):
         bc = self.bc
