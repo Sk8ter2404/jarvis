@@ -93,7 +93,8 @@ class OfferTextTests(unittest.TestCase):
                 "Should I attempt to move the existing window to the top "
                 "monitor?",
                 "Shall I, sir, open it on the left monitor?",
-                "Shall I take that as a yes, sir?"):
+                "Shall I take that as a yes, sir?",
+                "Shall I have a quick look at the screen?"):
             with self.subTest(reply=reply):
                 self.assertEqual(O.offer_text(reply), reply)
 

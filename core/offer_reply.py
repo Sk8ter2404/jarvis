@@ -87,6 +87,8 @@ _LEAD_BRIDGE = frozenset({
     "also", "just", "go", "ahead", "and", "now", "then", "quickly", "simply",
     "first", "perhaps", "maybe", "still", "kindly", "instead", "sir",
     "please", "right", "away",
+    # "Shall I have a quick look?"
+    "have", "a", "quick",
 })
 # A verb that opens a rhetorical aside, not an action: "Should I take it
 # personally?", "Can I remind you, sir, that ...?".
