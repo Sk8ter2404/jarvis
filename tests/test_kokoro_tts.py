@@ -517,6 +517,12 @@ class EspeakDllCopyTests(unittest.TestCase):
         self.assertIs(k._engine(), eng)
         self.assertEqual(_dll_copies(self.temp), 1,
                          "the backend's probes must not each copy the dll")
+        # built with the stock call's options (2026-10-02 review: the older
+        # _FakeBackend.built pin now only reaches the fallback constructor)
+        b = k._PHONEMIZER[0]
+        self.assertIsInstance(b, _ChainEspeakBackend)
+        self.assertEqual((b._language, b._preserve_punctuation, b._with_stress),
+                         (k._LANG, True, True))
         self._speak(25)
         self.assertEqual(_dll_copies(self.temp), 1, "no copy per line")
         self.assertIs(k._engine(), eng)
@@ -573,7 +579,7 @@ n = lambda: len(glob.glob(os.path.join(tempfile.gettempdir(), "tmp*", "*espeak*"
 lines = ["All systems are online, sir.", "It is 3.5 degrees; e.g. at 2:30 p.m.",
          "Hello... world? Yes!"]
 r = {"start": n()}
-b = k._one_copy_backend(k._LANG, preserve_punctuation=True, with_stress=True)
+b = k._build_phonemizer()     # the engine's own call, options and all
 r["built"] = n()
 one = [b.phonemize([ln], separator=default_separator, strip=False, njobs=1)
        for ln in lines * 3]
