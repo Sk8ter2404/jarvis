@@ -16,6 +16,11 @@ NO "last device controlled" record - the smart-home router keeps none):
     actions, each stamped) - a device or media action just ran;
   * _jarvis_played_music_at - media JARVIS itself started, which may still be
     playing long after the turn that started it;
+  * media playing RIGHT NOW whoever started it (the Windows media session,
+    SMTC: Spotify started by hand) - review 2026-10-02;
+  * JARVIS's own recent speech (a proactive line - "the chamber light is
+    still on, sir" - or a timer going off): what he just said is what "it"
+    means - review 2026-10-02;
   * Kinect point-to-control, which resolves "turn THAT off" by where the owner
     points (skills/kinect_pointing via core/smart_home_router).
 With any of those, the turn goes to the model as before. With none, JARVIS
@@ -93,22 +98,26 @@ def _recent(age, window: float) -> bool:
 
 
 def referent_question(text, *, prior_turn_age_s=None, last_action_age_s=None,
-                      media_age_s=None, pointing_enabled=False
+                      media_age_s=None, pointing_enabled=False,
+                      media_playing=False, spoke_age_s=None
                       ) -> Optional[str]:
     """The question to ask INSTEAD of calling the model, or None to let the
     turn route as before.
 
     Asks only when ``text`` is a bare pronoun on/off command AND nothing gives
-    "it" a referent: point-to-control is off, the previous owner turn and the
-    last executed action are older than REFERENT_WINDOW_S (or absent), and
+    "it" a referent: point-to-control is off, no media is playing
+    (``media_playing``, the media session), the previous owner turn, the
+    last executed action and JARVIS's own last spoken line
+    (``spoke_age_s``) are older than REFERENT_WINDOW_S (or absent), and
     media JARVIS started is older than MEDIA_REFERENT_WINDOW_S (or absent).
     Ages are seconds; None = none this process."""
     if switch_state(text) is None:
         return None
-    if pointing_enabled:
+    if pointing_enabled or media_playing is True:
         return None
     if (_recent(prior_turn_age_s, REFERENT_WINDOW_S)
             or _recent(last_action_age_s, REFERENT_WINDOW_S)
+            or _recent(spoke_age_s, REFERENT_WINDOW_S)
             or _recent(media_age_s, MEDIA_REFERENT_WINDOW_S)):
         return None
     return clarifying_question(text)

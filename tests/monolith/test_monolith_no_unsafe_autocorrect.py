@@ -142,6 +142,10 @@ class PronounSwitchShortcutTests(_Base):
         self._p(bc, "set_state", lambda *a, **k: None)
         self._p(bc, "_prev_owner_turn_at", [0.0])
         self._p(bc, "_jarvis_played_music_at", [0.0])
+        # Nothing playing, and JARVIS has not spoken lately (both are
+        # referents since 2026-10-02).
+        self._p(bc, "_smtc_media_playing", lambda: False)
+        self._p(bc, "last_speech_time", 0.0)
         bc._action_history.clear()
         import core.config as cfg
         self._p(cfg, "KINECT_POINT_CONTROL_ENABLED", False, create=True)
@@ -173,6 +177,18 @@ class PronounSwitchShortcutTests(_Base):
 
     def test_media_jarvis_started_lets_the_llm_resolve_it(self):
         self.bc._jarvis_played_music_at[0] = time.time() - 600.0
+        self.assertFalse(self.bc._run_pronoun_switch_shortcut("turn it off"))
+
+    def test_media_playing_lets_the_llm_resolve_it(self):
+        # Review 2026-10-02: Spotify started by hand, no recent turn - "it"
+        # is the music, so the model gets the turn.
+        self._p(self.bc, "_smtc_media_playing", lambda: True)
+        self.assertFalse(self.bc._run_pronoun_switch_shortcut("turn it off"))
+        self.assertEqual(self.spoken, [])
+
+    def test_jarvis_speaking_lets_the_llm_resolve_it(self):
+        # A proactive line ("the chamber light is still on, sir") moments ago.
+        self._p(self.bc, "last_speech_time", time.time() - 30.0)
         self.assertFalse(self.bc._run_pronoun_switch_shortcut("turn it off"))
 
     def test_point_to_control_keeps_pronoun_commands(self):

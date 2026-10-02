@@ -84,6 +84,22 @@ class ReferentQuestionTests(unittest.TestCase):
         self.assertIsNone(ps.referent_question("turn it off",
                                                media_age_s=20 * 60.0))
 
+    def test_media_playing_now_is_a_referent(self):
+        # Review 2026-10-02: Spotify the owner started by hand (SMTC reports
+        # it playing) is "it" too - he asked "Turn what off, sir?" before.
+        self.assertIsNone(ps.referent_question("turn it off",
+                                               media_playing=True))
+        self.assertIsNotNone(ps.referent_question("turn it off",
+                                                  media_playing=False))
+
+    def test_jarvis_speaking_a_moment_ago_is_a_referent(self):
+        # A proactive line ("the chamber light is still on, sir"), a timer
+        # going off: what JARVIS just said is what "it" means.
+        self.assertIsNone(ps.referent_question("turn it off",
+                                               spoke_age_s=30.0))
+        self.assertIsNotNone(ps.referent_question(
+            "turn it off", spoke_age_s=ps.REFERENT_WINDOW_S + 60))
+
     def test_point_to_control_owns_pronoun_commands(self):
         # With pointing on, "turn that off" resolves by where he points
         # (skills/kinect_pointing via the smart-home router) - never ask.

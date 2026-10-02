@@ -38000,9 +38000,11 @@ def _run_pronoun_switch_shortcut(text: str) -> bool:
 
     "Nothing to mean" uses what JARVIS tracks (core/pronoun_switch): no owner
     turn in the last REFERENT_WINDOW_S, no action in that window
-    (_action_history), no media JARVIS started in MEDIA_REFERENT_WINDOW_S
-    (_jarvis_played_music_at), and point-to-control off (with it on, "turn
-    that off" resolves by where the owner points). With any of those the turn
+    (_action_history), nothing JARVIS said in that window (last_speech_time:
+    a proactive line, a timer going off), no media JARVIS started in
+    MEDIA_REFERENT_WINDOW_S (_jarvis_played_music_at), no media playing now
+    (_smtc_media_playing - Spotify started by hand), and point-to-control off
+    (with it on, "turn that off" resolves by where the owner points). With any of those the turn
     routes to the model as before - it has the conversation, and a guess onto
     a protected action is refused anyway (_autocorrect_protected).
 
@@ -38021,9 +38023,19 @@ def _run_pronoun_switch_shortcut(text: str) -> bool:
         except Exception:
             pointing = False
         prior, action, media = _pronoun_referent_ages()
+        # Review 2026-10-02: media playing now (whoever started it) and
+        # JARVIS's own line a moment ago are referents too.
+        try:
+            spoke = time.time() - float(globals().get("last_speech_time")
+                                        or 0.0)
+            if spoke < 0.0 or not globals().get("last_speech_time"):
+                spoke = None
+        except Exception:
+            spoke = None
         question = _pronoun_switch.referent_question(
             text, prior_turn_age_s=prior, last_action_age_s=action,
-            media_age_s=media, pointing_enabled=pointing)
+            media_age_s=media, pointing_enabled=pointing,
+            spoke_age_s=spoke, media_playing=bool(_smtc_media_playing()))
     except Exception as _e:
         print(f"  [fast-path] pronoun-switch check failed: {_e}")
         return False
