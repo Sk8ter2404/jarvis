@@ -3406,21 +3406,76 @@ class AutoqueueTests(_ProbeTestBase):
              mock.patch.object(self.mod, "_bc", return_value=bc):
             self.assertIsNone(self.mod._collect_vad_stall_signal())
 
-    def test_collect_vad_stall_detected(self):
+    def _stall_ap(self, *, trip_age, audible_age):
+        """Counters for an awake JARVIS whose capture loop polls fine (1 s
+        ago, session 300 s old) with no VAD trip for ``trip_age`` s (None =
+        never) and no chunk above the audible floor for ``audible_age`` s
+        (None = never this session)."""
         now = self.mod._now()
-        ap = types.ModuleType("core.audio_processor")
-        ap.get_vad_state = lambda: {
-            "last_vad_poll_ts": now - 1.0,         # fresh poll
-            "last_vad_active_ts": now - 200.0,     # no trip for 200s
-            "vad_session_start": now - 300.0,      # long session
-            "total_vad_trips": 4,
-        }
+        ap = fake_audio_processor(now=now, poll_age=1.0,
+                                  audible_age=audible_age, session_age=300.0)
+        ap._vad_state["last_vad_active_ts"] = (
+            0.0 if trip_age is None else now - trip_age)
+        ap._vad_state["total_vad_trips"] = 0 if trip_age is None else 4
+        return ap
+
+    def test_collect_vad_stall_detected(self):
+        # A deaf mic: polling, no trip for 200 s, and nothing above the
+        # audible floor for 200 s either (null frames).
+        ap = self._stall_ap(trip_age=200.0, audible_age=200.0)
         bc = types.SimpleNamespace(_sleep_mode=[False])
         with inject_modules(**{"core.audio_processor": ap}), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             sig = self.mod._collect_vad_stall_signal()
         self.assertIsNotNone(sig)
         self.assertEqual(sig["signature"], "vad_stall")
+        self.assertEqual(sig["seconds_since_active"], 200.0)
+
+    def test_collect_vad_stall_quiet_room_is_not_a_stall(self):
+        # THE FALSE ALARM (39 auto notes, 2026-06-04..10-01). Live 2026-10-01:
+        # peak RMS 0.0055-0.0071 against VAD_THRESHOLD 0.008 — the room was
+        # quiet, not deaf. A chunk crossed the audible floor 2 s ago, so the
+        # mic is alive and nobody speaking for 200 s is not a fault.
+        ap = self._stall_ap(trip_age=200.0, audible_age=2.0)
+        bc = types.SimpleNamespace(_sleep_mode=[False])
+        with inject_modules(**{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            self.assertIsNone(self.mod._collect_vad_stall_signal())
+
+    def test_collect_vad_stall_no_trip_since_boot_quiet_room(self):
+        # The "unknown" variant (6 notes): VAD has never tripped since boot,
+        # yet the mic delivers audible audio — still a quiet room.
+        ap = self._stall_ap(trip_age=None, audible_age=3.0)
+        bc = types.SimpleNamespace(_sleep_mode=[False])
+        with inject_modules(**{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            self.assertIsNone(self.mod._collect_vad_stall_signal())
+
+    def test_collect_vad_stall_no_trip_since_boot_deaf_mic(self):
+        # Never tripped AND never audible this session: a dead mic since boot
+        # (the 2026-08-20 04:00 RMS 0.0000 case). It still queues, and the
+        # note says "since this session started", not "unknown".
+        ap = self._stall_ap(trip_age=None, audible_age=None)
+        bc = types.SimpleNamespace(_sleep_mode=[False])
+        with inject_modules(**{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            sig = self.mod._collect_vad_stall_signal()
+        self.assertIsNotNone(sig)
+        self.assertIsNone(sig["seconds_since_active"])
+        line = self.mod._format_vad_stall_task(sig, [])
+        self.assertNotIn("unknown", line)
+        self.assertIn("since this session started", line)
+
+    def test_collect_vad_stall_needs_a_liveness_verdict(self):
+        # No basis for a verdict (the audible counter is unreadable): never
+        # queue on missing data.
+        ap = self._stall_ap(trip_age=200.0, audible_age=200.0)
+        ap.seconds_since_audible_chunk = mock.MagicMock(
+            side_effect=RuntimeError("x"))
+        bc = types.SimpleNamespace(_sleep_mode=[False])
+        with inject_modules(**{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            self.assertIsNone(self.mod._collect_vad_stall_signal())
 
     def test_collect_vad_stall_poll_stale(self):
         now = self.mod._now()
@@ -3538,8 +3593,10 @@ class AutoqueueTests(_ProbeTestBase):
         self.assertIn("L1", out)
 
     def test_format_vad_stall_task_unknown_secs(self):
+        # VAD never tripped this session: say so, never "in unknown".
         out = self.mod._format_vad_stall_task({"seconds_since_active": None}, [])
-        self.assertIn("unknown", out)
+        self.assertIn("since this session started", out)
+        self.assertNotIn("unknown", out)
 
     def test_format_face_fail_task(self):
         sig = {"cam_index": 0, "consecutive_fails": 6, "max_consecutive_fails": 8,
