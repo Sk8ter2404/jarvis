@@ -1165,10 +1165,11 @@ class PhonePinger:
         """A new print of ``key_name`` started: its finish / fail / pause
         dedupe keys belong to the last run, not this one (a second copy of the
         same file within the hour still gets its own pings)."""
-        prefixes = tuple(f"print:{kind}:{key_name}"
-                         for kind in ("finish", "failed", "pause"))
+        exact = {f"print:finish:{key_name}", f"print:failed:{key_name}"}
+        pause = f"print:pause:{key_name}:"     # + the error code
         with self._lock:
-            for k in [k for k in self._dedupe if k.startswith(prefixes)]:
+            for k in [k for k in self._dedupe
+                      if k in exact or k.startswith(pause)]:
                 self._dedupe.pop(k, None)
                 self._soft_seen.pop(k, None)
 

@@ -720,6 +720,20 @@ class BambuHookTests(unittest.TestCase):
                          "RUNNING", "FAILED")
         self.assertEqual(len(bridge.sent), 4)
 
+    def test_a_new_print_forgets_only_its_own_files_keys(self):
+        """Starting 'cube' again must not reset 'cube 2' (or 'cube-large'):
+        exact keys, not a name prefix."""
+        p, *_ = make()
+        p._dedupe.update({"print:finish:cube": 1.0, "print:finish:cube 2": 1.0,
+                          "print:failed:cube large": 1.0,
+                          "print:pause:cube:5": 1.0,
+                          "print:pause:cube 2:5": 1.0})
+        p.on_bambu_state({"gcode_state": "RUNNING", "filename": "cube.3mf"},
+                         "PREPARE", "RUNNING")
+        self.assertEqual(sorted(p._dedupe),
+                         ["print:failed:cube large", "print:finish:cube 2",
+                          "print:pause:cube 2:5"])
+
     def test_a_resume_does_not_reset_the_pause_report(self):
         """Pause / resume / pause with the same error inside the hour: the
         error was already reported this print."""
