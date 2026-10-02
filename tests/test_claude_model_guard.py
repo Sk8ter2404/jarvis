@@ -402,6 +402,20 @@ class CreateMessageGuardTests(_GuardedBase):
             llm.create_message(client, **kw)
         self.assertEqual(len(client.messages.calls), 2)
 
+    def test_blank_model_is_passed_through_not_called_retired(self):
+        # resolve() returns a blank model as itself (None stays None); that
+        # must never read as "gone" and raise RetiredModelError.
+        for blank in (None, "", "   "):
+            client = _Client()
+            with self.subTest(model=blank):
+                llm.create_message(client, purpose="quick", model=blank,
+                                   max_tokens=8, messages=[])
+                self.assertEqual(len(client.messages.calls), 1)
+        client = _Client()
+        llm.stream_message(client, purpose="voice", model=None,
+                           max_tokens=8, messages=[])
+        self.assertEqual(len(client.messages.calls), 1)
+
     def test_other_errors_pass_through_and_mark_nothing(self):
         client = _Client({"claude-haiku-4-5": RuntimeError("socket reset")})
         for _ in range(2):

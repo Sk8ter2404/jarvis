@@ -287,8 +287,11 @@ def _successor_table() -> dict:
 def _guarded_model(model: Any, where: str = "") -> Any:
     """The model this call should send: the requested one, or its configured
     successor when Anthropic already said the requested one is gone. Raises
-    RetiredModelError when it is gone with no usable successor."""
+    RetiredModelError when it is gone with no usable successor. A blank model
+    passes through untouched (the API's own validation answers it)."""
     from core.claude_model_guard import GUARD, RetiredModelError
+    if not str(model or "").strip():
+        return model
     use = GUARD.resolve(model, _successor_table())
     if use is None:
         raise RetiredModelError(str(model), where)
