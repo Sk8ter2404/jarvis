@@ -96,6 +96,23 @@ CATCHUP_WINDOW_MINUTES = 120
 # least this many times in today's logs.
 DRY_OBS_MIN_COUNT = 3
 
+# The "I ran X N times today -- well above my usual" remark (2026-10-02). Live
+# 2026-10-01 22:12:23: "I ran '<robot> banter' 11 times today -- well above
+# the usual rate, sir." There was no baseline at all (the clause was hard-coded
+# after a count check), and every one of the 11 was the owner's own "Jarvis,
+# talk to <the robot>". Now:
+#   * an [action] line within OWNER_ACTION_WINDOW_S after an owner turn ("You:"
+#     or a dashboard press) is HIS request, not something JARVIS did on its own,
+#     and is not counted;
+#   * "above my usual" needs a real per-day baseline: the same count over the
+#     previous BASELINE_DAYS days of session logs, at least BASELINE_MIN_DAYS
+#     of them, and today >= BASELINE_FACTOR x that average. No baseline, no
+#     remark.
+OWNER_ACTION_WINDOW_S = 300
+BASELINE_DAYS = 7
+BASELINE_MIN_DAYS = 3
+BASELINE_FACTOR = 2.0
+
 # Actions so routine that mentioning them would just be tedious noise.
 _BORING_ACTIONS = {
     "see_screen", "see_user", "which_monitor", "focus_window",
@@ -492,12 +509,16 @@ def _user_at_desk():
 
 # --- session log scraping ------------------------------------------------
 
-def _todays_log_paths() -> list:
-    """All session_<TODAY>_*.log files. Date prefix matches the filename
+def _log_paths_for(day: datetime.date) -> list:
+    """All session_<DAY>_*.log files. Date prefix matches the filename
     convention bobert_companion uses for new session logs."""
-    today_iso = datetime.date.today().isoformat()
-    pattern = os.path.join(_LOGS_DIR, f"session_{today_iso}_*.log")
+    pattern = os.path.join(_LOGS_DIR, f"session_{day.isoformat()}_*.log")
     return sorted(glob.glob(pattern))
+
+
+def _todays_log_paths() -> list:
+    """All session_<TODAY>_*.log files."""
+    return _log_paths_for(datetime.date.today())
 
 
 def _count_voice_interactions_today() -> int:
@@ -539,6 +560,10 @@ def _count_tasks_completed_today() -> int:
 
 _ACTION_RE  = re.compile(r"\[action\]\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:")
 _YOU_RE     = re.compile(r"  You:    (.+?)\s*$")
+# "[HH:MM:SS]" at the start of a session-log line, and the dashboard's own
+# record of a button press (an owner request with no "You:" line).
+_TS_RE      = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\]")
+_WEB_ACTION_RE = re.compile(r"\[web\] action [a-zA-Z_][a-zA-Z0-9_]* ran from the dashboard")
 _PLAY_RE    = re.compile(r"\b(?:play|put on|queue|throw on)\s+(.+?)(?:[.!?]|$)", re.IGNORECASE)
 # Whitelisted "small words" we don't want as the head of a "you kept asking
 # for X" remark.
@@ -548,20 +573,54 @@ _PLAY_STOPWORDS = {
 }
 
 
-def _scan_today_for_patterns():
-    """Return (action_counter, play_phrase_counter, you_count) drawn from
-    today's session logs."""
+def _line_seconds(line: str):
+    """Seconds since midnight from a line's "[HH:MM:SS]" prefix, or None."""
+    m = _TS_RE.match(line)
+    if not m:
+        return None
+    h, mi, se = (int(g) for g in m.groups())
+    return h * 3600 + mi * 60 + se
+
+
+def _scan_logs_for_patterns(paths):
+    """Return (action_counter, play_phrase_counter, you_count) drawn from the
+    given session logs. action_counter holds only the actions JARVIS ran ON
+    ITS OWN: an [action] line within OWNER_ACTION_WINDOW_S after an owner turn
+    ("You:" or a dashboard press) in the same log answered HIS request and is
+    not counted (an untimed line after any owner turn counts as his too - the
+    conservative side: no remark is better than a false one)."""
     actions = Counter()
     plays = Counter()
     you_count = 0
-    for path in _todays_log_paths():
+    for path in paths:
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
+                last_owner = None      # seconds (or "untimed") of the last owner turn
+                prev_t = None
+                day_offset = 0
                 for line in f:
+                    if ("[action]" not in line and "You:" not in line
+                            and "[web] action" not in line):
+                        continue
+                    t = _line_seconds(line)
+                    if t is not None:
+                        if prev_t is not None and t + day_offset < prev_t - 3600:
+                            day_offset += 86400      # the log crossed midnight
+                        t += day_offset
+                        prev_t = t
+                    ym = _YOU_RE.search(line)
+                    if ym or _WEB_ACTION_RE.search(line):
+                        last_owner = t if t is not None else "untimed"
                     m = _ACTION_RE.search(line)
                     if m:
-                        actions[m.group(1)] += 1
-                    ym = _YOU_RE.search(line)
+                        if last_owner is None:
+                            owners = False
+                        elif t is None or last_owner == "untimed":
+                            owners = True
+                        else:
+                            owners = 0 <= t - last_owner <= OWNER_ACTION_WINDOW_S
+                        if not owners:
+                            actions[m.group(1)] += 1
                     if ym:
                         you_count += 1
                         utterance = ym.group(1)
@@ -576,6 +635,35 @@ def _scan_today_for_patterns():
         except Exception:
             continue
     return actions, plays, you_count
+
+
+def _scan_today_for_patterns():
+    """Return (action_counter, play_phrase_counter, you_count) drawn from
+    today's session logs (see _scan_logs_for_patterns)."""
+    return _scan_logs_for_patterns(_todays_log_paths())
+
+
+def _action_baseline(name: str, today: datetime.date | None = None):
+    """(avg_per_day, days) - how often JARVIS ran `name` on its own per day
+    over the previous BASELINE_DAYS days that have session logs. days = how
+    many such days there were (0 = no baseline)."""
+    today = today or datetime.date.today()
+    counts = []
+    for back in range(1, BASELINE_DAYS + 1):
+        paths = _log_paths_for(today - datetime.timedelta(days=back))
+        if not paths:
+            continue
+        counts.append(_scan_logs_for_patterns(paths)[0].get(name, 0))
+    if not counts:
+        return 0.0, 0
+    return sum(counts) / len(counts), len(counts)
+
+
+def _usual_phrase(avg: float) -> str:
+    if avg < 1.0:
+        return "of less than once a day"
+    n = int(round(avg))
+    return "of about once a day" if n == 1 else f"of about {n} a day"
 
 
 def _humanize_count(n: int) -> str:
@@ -602,19 +690,23 @@ def _dry_observation():
                 "A pattern emerges."
             )
 
-    # Otherwise, surface a repeated non-routine action.
+    # Otherwise, surface an action JARVIS ran on its own unusually often -
+    # measured against a real baseline (see OWNER_ACTION_WINDOW_S).
     if actions:
         # Filter out routine/boring actions before picking the top.
         filtered = Counter({k: v for k, v in actions.items()
                             if k not in _BORING_ACTIONS})
-        if filtered:
-            name, n = filtered.most_common(1)[0]
-            if n >= DRY_OBS_MIN_COUNT:
-                spoken = name.replace("_", " ")
-                return (
-                    f"I ran '{spoken}' {_humanize_count(n)} today -- "
-                    "well above the usual rate, sir."
-                )
+        for name, n in filtered.most_common(3):
+            if n < DRY_OBS_MIN_COUNT:
+                break
+            avg, days = _action_baseline(name)
+            if days < BASELINE_MIN_DAYS or n < BASELINE_FACTOR * avg:
+                continue
+            spoken = name.replace("_", " ")
+            return (
+                f"I ran '{spoken}' {_humanize_count(n)} today on my own -- "
+                f"well above my usual {_usual_phrase(avg)}, sir."
+            )
 
     return ""
 
@@ -660,6 +752,29 @@ def _fetch_tomorrow_umbrella() -> str:
         return ""
 
 
+_LEAD_TOMORROW_RE = re.compile(r"^\s*tomorrow\b[\s,]*", re.IGNORECASE)
+
+
+def _tomorrow_line(weather: str, meeting: str) -> str:
+    """One sentence about tomorrow that says "tomorrow" ONCE. Live 2026-10-01
+    22:12:23 it read "For tomorrow, tomorrow looks like a high of ...": a
+    fixed "For tomorrow, " prefix in front of _phrase_tomorrow's own
+    "tomorrow looks like ...", and the meeting phrase ("your first meeting
+    tomorrow is at ...") would have made it three."""
+    weather = (weather or "").strip().rstrip(".")
+    meeting = (meeting or "").strip().rstrip(".")
+    if weather:
+        rest = _LEAD_TOMORROW_RE.sub("", weather)
+        head = ("Tomorrow " + rest) if rest != weather else ("Tomorrow, " + weather)
+        if meeting:
+            head += ", and " + re.sub(r"\s+tomorrow\b", "", meeting, count=1,
+                                      flags=re.IGNORECASE)
+        return head + "."
+    if meeting:
+        return meeting[:1].upper() + meeting[1:] + "."
+    return ""
+
+
 def _build_briefing() -> str:
     interactions = _count_voice_interactions_today()
     completed    = _count_tasks_completed_today()
@@ -692,10 +807,7 @@ def _build_briefing() -> str:
         now_line = "Currently, " + ", ".join(now_bits) + "."
 
     # Tomorrow segment
-    tomorrow_bits = [b for b in (weather, meeting) if b]
-    tomorrow_line = ""
-    if tomorrow_bits:
-        tomorrow_line = "For tomorrow, " + ", and ".join(tomorrow_bits) + "."
+    tomorrow_line = _tomorrow_line(weather, meeting)
 
     pieces = [opener]
     if now_line:

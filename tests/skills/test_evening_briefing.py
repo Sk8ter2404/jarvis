@@ -25,7 +25,9 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
+import os
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -238,12 +240,16 @@ class EveningBriefingTests(unittest.TestCase):
         self.assertIn("pattern emerges", out.lower())
 
     def test_dry_observation_repeated_action(self):
+        # Only against a real baseline (2026-10-02): ~1 a day over a week.
         actions = Counter({"check_weather": 5, "see_screen": 99})  # boring excluded
         with mock.patch.object(self.mod, "_scan_today_for_patterns",
-                               return_value=(actions, Counter(), 10)):
+                               return_value=(actions, Counter(), 10)), \
+             mock.patch.object(self.mod, "_action_baseline",
+                               return_value=(1.2, 7)):
             out = self.mod._dry_observation()
         self.assertIn("check weather", out)
         self.assertIn("five times", out)
+        self.assertIn("well above my usual of about once a day", out)
 
     def test_dry_observation_nothing(self):
         with mock.patch.object(self.mod, "_scan_today_for_patterns",
@@ -310,7 +316,8 @@ class EveningBriefingTests(unittest.TestCase):
         self.assertIn("Good evening, sir. 5 voice interactions", out)
         self.assertIn("2 tasks cleared", out)
         self.assertIn("Currently, the H2D is still printing", out)
-        self.assertIn("For tomorrow,", out)
+        self.assertIn("Tomorrow looks like a high of 18, and your first "
+                      "meeting is at 9 AM.", out)
         self.assertTrue(out.startswith("[intent:briefing]"))  # news included
 
     def test_build_briefing_quiet_day(self):
@@ -1016,9 +1023,140 @@ class BuildBriefingBranchTests(unittest.TestCase):
         self.assertFalse(out.startswith("[intent:briefing]"))   # no news → no tag
 
     def test_only_weather_tomorrow_segment(self):
+        # 2026-10-02: this pinned the live bug ("For tomorrow, tomorrow ...").
         out = self._build(_count_voice_interactions_today=2,
                           _fetch_tomorrow_weather="tomorrow looks like a high of 18")
-        self.assertIn("For tomorrow, tomorrow looks like a high of 18.", out)
+        self.assertIn("Tomorrow looks like a high of 18.", out)
+        self.assertEqual(out.lower().count("tomorrow"), 1, out)
+
+
+
+class EveningLiveReplayTests(unittest.TestCase):
+    """NEW #16 (live 2026-10-01 22:12:23, the evening briefing): "For
+    tomorrow, tomorrow looks like ..." and "I ran '<robot> banter' 11 times
+    today -- well above the usual rate, sir." There was no baseline behind
+    "the usual rate" (a hard-coded clause after a count check), and all 11
+    were the owner's own "Jarvis, talk to <the robot>" requests. Synthetic log
+    lines in the live session-log shape; the logs dir is a temp dir."""
+
+    def setUp(self):
+        self.mod, _ = _load()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        p = mock.patch.object(self.mod, "_LOGS_DIR", self._tmp.name)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _log(self, day, lines, n=0):
+        path = os.path.join(self._tmp.name,
+                            f"session_{day.isoformat()}_1{n}-00-00.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    @staticmethod
+    def _banter_turn(h, m):
+        return [f"[{h:02d}:{m:02d}:00]   You:    Jarvis, talk to the robot",
+                f"[{h:02d}:{m:02d}:00]   JARVIS: [ACTION: robot_banter]",
+                f"[{h:02d}:{m:02d}:28]   [action] robot_banter: Banter "
+                f"finished: 5 lines, done."]
+
+    def test_live_tomorrow_is_said_once(self):
+        line = self.mod._tomorrow_line(
+            "tomorrow looks like a high of 64, low of 48, and partly cloudy",
+            "your first meeting tomorrow is at 9:30 AM with Sam -- standup")
+        self.assertEqual(line.lower().count("tomorrow"), 1, line)
+        self.assertEqual(line, "Tomorrow looks like a high of 64, low of 48, "
+                               "and partly cloudy, and your first meeting is "
+                               "at 9:30 AM with Sam -- standup.")
+        self.assertEqual(self.mod._tomorrow_line("", "your first meeting "
+                                                     "tomorrow is at 9 AM"),
+                         "Your first meeting tomorrow is at 9 AM.")
+        self.assertEqual(self.mod._tomorrow_line("", ""), "")
+        self.assertEqual(self.mod._tomorrow_line("cold and wet", ""),
+                         "Tomorrow, cold and wet.")
+
+    def test_live_briefing_has_no_double_tomorrow(self):
+        with mock.patch.object(self.mod, "_count_voice_interactions_today", return_value=40), \
+             mock.patch.object(self.mod, "_count_tasks_completed_today", return_value=0), \
+             mock.patch.object(self.mod, "_bambu_status", return_value=""), \
+             mock.patch.object(self.mod, "_fetch_tomorrow_weather",
+                               return_value="tomorrow looks like a high of 64, low of 48, and sunny"), \
+             mock.patch.object(self.mod, "_first_meeting_tomorrow", return_value=""), \
+             mock.patch.object(self.mod, "_dry_observation", return_value=""), \
+             mock.patch.object(self.mod, "_fetch_news", return_value=""), \
+             mock.patch.object(self.mod, "_fetch_tomorrow_umbrella", return_value=""):
+            out = self.mod._build_briefing()
+        self.assertNotIn("tomorrow, tomorrow", out.lower())
+        self.assertEqual(out.lower().count("tomorrow"), 1, out)
+
+    def test_live_his_own_banter_requests_are_not_a_remark(self):
+        today = datetime.date.today()
+        lines = []
+        for i in range(11):
+            lines += self._banter_turn(13 + i // 6, (i * 9) % 60)
+        self._log(today, lines)
+        # A busy week of logs, none of them with banter on its own.
+        for back in range(1, 8):
+            self._log(today - datetime.timedelta(days=back),
+                      ["[10:00:00]   You:    what time is it"])
+        out = self.mod._dry_observation()
+        self.assertNotIn("robot banter", out)
+        self.assertNotIn("usual rate", out)
+        actions, _, you = self.mod._scan_today_for_patterns()
+        self.assertEqual(actions["robot_banter"], 0)
+        self.assertEqual(you, 11)
+
+    def test_a_dashboard_press_is_his_request_too(self):
+        today = datetime.date.today()
+        self._log(today, [
+            "[13:53:52]   [web] action robot_banter ran from the dashboard",
+            "[13:54:20]   [action] robot_banter: Banter finished: 5 lines, done."])
+        actions, _, _ = self.mod._scan_today_for_patterns()
+        self.assertEqual(actions["robot_banter"], 0)
+
+    def test_no_baseline_no_above_usual_claim(self):
+        # JARVIS really did run something on its own 5 times today, but there
+        # are no earlier logs to compare against: no claim.
+        today = datetime.date.today()
+        self._log(today, [f"[0{h}:00:00]   [action] check_weather: 54F"
+                          for h in range(1, 6)])
+        actions, _, _ = self.mod._scan_today_for_patterns()
+        self.assertEqual(actions["check_weather"], 5)
+        self.assertEqual(self.mod._dry_observation(), "")
+
+    def test_a_real_baseline_backs_the_claim(self):
+        today = datetime.date.today()
+        self._log(today, [f"[0{h}:00:00]   [action] check_weather: 54F"
+                          for h in range(1, 7)])
+        for back in range(1, 5):          # once a day on its own, 4 days
+            self._log(today - datetime.timedelta(days=back),
+                      ["[06:00:00]   [action] check_weather: 50F"])
+        self.assertEqual(self.mod._action_baseline("check_weather"), (1.0, 4))
+        out = self.mod._dry_observation()
+        self.assertIn("I ran 'check weather' six times today on my own", out)
+        self.assertIn("well above my usual of about once a day", out)
+
+    def test_an_ordinary_day_against_the_baseline_is_not_remarked(self):
+        today = datetime.date.today()
+        self._log(today, [f"[0{h}:00:00]   [action] check_weather: 54F"
+                          for h in range(1, 5)])
+        for back in range(1, 5):          # 3 a day is normal
+            self._log(today - datetime.timedelta(days=back),
+                      [f"[0{h}:00:00]   [action] check_weather: 50F"
+                       for h in range(1, 4)])
+        self.assertEqual(self.mod._dry_observation(), "")
+
+    def test_an_action_long_after_his_turn_is_jarvis_own(self):
+        today = datetime.date.today()
+        self._log(today, ["[09:00:00]   You:    good morning",
+                          "[09:00:10]   [action] check_weather: 50F",
+                          "[11:00:00]   [action] check_weather: 55F",
+                          "[23:59:50]   You:    goodnight",
+                          "[00:00:05]   [action] lights_off: done"])
+        actions, _, _ = self.mod._scan_today_for_patterns()
+        self.assertEqual(actions["check_weather"], 1)   # 11:00 only
+        self.assertEqual(actions["lights_off"], 0)      # across midnight
+
 
 
 # ─────────────────────────────────────────────────────────────────────────
