@@ -703,6 +703,17 @@ Rules:
 """
 
 
+def _coerce_risk(value, default: int = 9) -> int:
+    """``int(value)`` for a reviewer risk_score, or ``default`` when it is not
+    a plain number: a word, a list, or the NaN / Infinity that json.loads
+    accepts. The default 9 fails CLOSED, so an unparseable score is treated
+    as high risk instead of crashing the pipeline (audit A77)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _run_reviewer(task_line: str, plan: dict[str, Any], diff: str, *,
                   claude_path: str,
                   project_dir: str = PROJECT_DIR,
@@ -815,7 +826,7 @@ def _run_reviewer(task_line: str, plan: dict[str, Any], diff: str, *,
         concerns.insert(0, "implementer produced no file changes "
                            "(likely rate-limited or aborted)")
         review["verdict"] = "reject_and_redo"
-        review["risk_score"] = max(int(review.get("risk_score") or 0), 9)
+        review["risk_score"] = max(_coerce_risk(review.get("risk_score") or 0), 9)
         review["concerns"] = concerns
         review["_local_override"] = True
     return review
@@ -1214,10 +1225,7 @@ def run_pipeline_on_task(task_line: str, *, claude_path: str,
     # is escalated to a rejection + rollback. This is also what makes the
     # degraded reviewer paths (infra error / unparseable JSON, scored 8) fail
     # CLOSED instead of shipping unreviewed.
-    try:
-        _score_int = int(score)
-    except (TypeError, ValueError):
-        _score_int = 9  # unparseable score → treat as high risk (fail closed)
+    _score_int = _coerce_risk(score)  # unparseable → high risk (fail closed)
     if verdict in ("approve", "approve_with_warnings") \
             and _score_int >= _max_risk_score():
         concerns = list(concerns) + [

@@ -882,6 +882,23 @@ class RunReviewerTests(_PipeBase):
         self.assertGreaterEqual(r["risk_score"], 9)
         self.assertTrue(r["_local_override"])
 
+    def test_no_change_override_survives_a_malformed_risk_score(self):
+        # Audit A77: valid JSON whose risk_score is not an int ("high", "7.5",
+        # a list, Infinity) crashed the empty-diff override with an unguarded
+        # int() -- ValueError / TypeError / OverflowError out of the reviewer,
+        # and a traceback on the direct --task CLI path. It must fail closed.
+        for raw in ('"high"', '"7.5"', '[7]', '{"n": 7}', 'Infinity', 'NaN'):
+            with self.subTest(risk_score=raw):
+                out = '{"verdict": "approve", "risk_score": %s}' % raw
+                with self._invoke(out=out):
+                    r = P._run_reviewer("t", self._PLAN, "(no file changes)",
+                                        claude_path="/c", project_dir=self.tmp,
+                                        impl_impossible=False,
+                                        impl_already_done=False)
+                self.assertEqual(r["verdict"], "reject_and_redo")
+                self.assertEqual(r["risk_score"], 9)
+                self.assertTrue(r["_local_override"])
+
     def test_no_change_but_impossible_claim_not_overridden(self):
         with self._invoke(out='{"verdict": "approve", "risk_score": 1}'):
             r = P._run_reviewer("t", self._PLAN, "(no file changes)",
@@ -2218,6 +2235,32 @@ class SafetyGateTests(_OrchBase):
         self.assertEqual(self.read("skills/feature.py"), "original body\n")
         self.assertIn("[regression]", self.read("jarvis_todo.md"))
         self.assertIn("safety threshold", "\n".join(lines))
+
+    def test_unparseable_risk_score_fails_closed_instead_of_crashing(self):
+        # Audit A77: the gate's int(score) caught ValueError / TypeError but
+        # not OverflowError, and json.loads turns a reviewer's bare Infinity
+        # into float('inf') -- run_pipeline_on_task raised instead of rolling
+        # back. Every unparseable score is treated as high risk (9).
+        for score in (float("inf"), float("-inf"), "high", None, [9]):
+            with self.subTest(score=score):
+                self.write("skills/feature.py", "original body\n")
+                with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "7"}), \
+                     mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+                     mock.patch.object(P, "_run_implementer",
+                                       side_effect=self._emit_implementer_change()), \
+                     mock.patch.object(P, "_run_reviewer",
+                                       return_value={"verdict": "approve",
+                                                     "risk_score": score,
+                                                     "concerns": []}), \
+                     mock.patch.object(P, "_run_tester") as tester, \
+                     mock.patch.object(P, "_kill_jarvis", return_value=0):
+                    res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                                 project_dir=self.tmp,
+                                                 emit=self.emit)
+                tester.assert_not_called()
+                self.assertFalse(res["ok"])
+                self.assertEqual(res["stage_failed"], "reviewer")
+                self.assertEqual(self.read("skills/feature.py"), "original body\n")
 
     def test_risk_just_below_threshold_proceeds(self):
         # risk_score 6 (< 7) is allowed through to the tester and ticks.
