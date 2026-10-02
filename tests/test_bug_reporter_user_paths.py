@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import errno
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -125,6 +126,34 @@ class UsersPathFalsePositiveTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(bug_reporter.scrub(text), text)
+
+
+class LongSeparatorRunTests(unittest.TestCase):
+    """The run-of-separators rules must stay linear. Tried from every position
+    of a long run of backslashes or slashes, a greedy separator run that is not
+    followed by the expected text backtracks across the whole run, so scrub()
+    went quadratic: tens of seconds for 60k backslashes, where the old rule
+    took well under a second. Each run is now tried from its first character
+    only. The bound is generous; the linear scrub takes milliseconds."""
+
+    def test_a_long_separator_run_scrubs_quickly(self):
+        env = {"USERPROFILE": "", "HOME": "/home/" + NAME,
+               "HOMEDRIVE": "", "HOMEPATH": ""}
+        with mock.patch.dict(os.environ, env):
+            for label, text in (("backslashes", BS * 60_000),
+                                ("slashes", "/" * 60_000)):
+                with self.subTest(run=label):
+                    t0 = time.perf_counter()
+                    out = bug_reporter.scrub(text)
+                    elapsed = time.perf_counter() - t0
+                    self.assertEqual(out, text)
+                    self.assertLess(elapsed, 2.0)
+
+    def test_a_long_run_before_users_still_redacts(self):
+        text = BS * 5_000 + "Users" + BS + NAME + BS + "cfg.json"
+        out = bug_reporter.scrub(text)
+        self.assertNotIn(NAME, out)
+        self.assertTrue(out.endswith("Users" + BS + "<USER>" + BS + "cfg.json"))
 
 
 class ProfileEnvExpansionTests(unittest.TestCase):

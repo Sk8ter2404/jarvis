@@ -122,7 +122,9 @@ _SCRUB_RULES: List[Tuple[Any, Any]] = [
     # and \\?\ paths match but a URL's /users/ does not; and repr()/ascii()
     # escapes (\xf6, \u00f6) inside the name, which used to end the match and
     # leak the rest of a non-ASCII name. The separators are kept as written.
-    (re.compile(r"(?i)((?:[A-Za-z]:[\\/]+|\\+)users[\\/]+)"
+    # A backslash run is only tried from its FIRST backslash (the lookbehind):
+    # tried from every position, a long run made scrub() quadratic.
+    (re.compile(r"(?i)((?:[A-Za-z]:[\\/]+|(?<!\\)\\+)users[\\/]+)"
                 r"(?:\\(?:x[0-9a-f]{2}|u[0-9a-f]{4})|[^\\/\r\n\"'])+"),
      r"\1<USER>"),
     (re.compile(r"(/(?:home|Users)/)[^/\r\n\"']+"), r"\1<USER>"),
@@ -223,7 +225,8 @@ def _home_rules() -> List[Any]:
                 parts = [p for p in re.split(r"[\\/]+", home) if p]
                 if len(parts) < 2 or len(parts[-1]) < 2:
                     continue
-                lead = r"[\\/]+" if home[0] in "\\/" else ""
+                # From the start of a separator run only, as in _SCRUB_RULES.
+                lead = r"(?<![\\/])[\\/]+" if home[0] in "\\/" else ""
                 prefix = r"[\\/]+".join(re.escape(p) for p in parts[:-1])
                 rules.append(re.compile(
                     r"(?i)(" + lead + prefix + r"[\\/]+)"
