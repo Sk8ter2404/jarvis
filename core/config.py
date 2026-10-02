@@ -871,9 +871,11 @@ TURN_PLAY_OPEN_PROBE = True
 # of SMART_TURN_THRESHOLD or more ends the turn there. The 21 chunks stay the
 # ceiling; Silero or Smart Turn missing, failing or too slow = today's turn.
 #   SMART_TURN_MODE   'off'    no models are loaded;
-#                     'shadow' the models run but nothing changes: the log
-#                              gets an [eot-shadow] line saying when Smart
-#                              Turn WOULD have ended the turn;
+#                     'shadow' the models run but nothing changes: each
+#                              owner turn JARVIS accepts gets an
+#                              [eot-shadow] line saying when Smart Turn
+#                              WOULD have ended it (resumed=1: a sound
+#                              above the RMS gate came after that point);
 #                     'on'     Smart Turn ends turns.
 #                     Env JARVIS_SMART_TURN, or user_settings.json.
 #   SMART_TURN_MODEL  the ONNX file (smart-turn-v3.2-cpu.onnx), kept OUTSIDE

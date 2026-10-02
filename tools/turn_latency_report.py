@@ -75,7 +75,10 @@ _TS = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\]")
 _NAME = re.compile(r"session_(\d{4}-\d\d-\d\d)_(\d\d)-(\d\d)-(\d\d)\.log$")
 
 # (label, test) — counted, never printed. "[stt-rescue]" is the tag R6's
-# Whisper rescue prints; "[eot-shadow] ... resumed=1" is R7's would-be cut.
+# Whisper rescue prints; "[eot-shadow] ... resumed=1" is R7's would-be cut
+# (one line per ACCEPTED owner turn; resumed=1 = the RMS gate tripped again
+# after the would-be end — speech, or any sound above it — so an upper
+# bound on cut-offs).
 SAFETY = (
     ("[speak] playback failed", lambda s: "[speak] playback failed" in s),
     ("tts-reaper wedged", lambda s: "tts-reaper wedged" in s),

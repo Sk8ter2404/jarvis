@@ -611,8 +611,11 @@ class EotRecord:
     fire_ms    audio time from the turn's first fed chunk to the end of the
                chunk on which Smart Turn ended (or, in shadow, WOULD have
                ended) the turn; None when it never fired.
-    resumed    1 when the capture heard voice again after fire_ms (its RMS
-               silence count restarted): 'on' would have cut the turn there.
+    resumed    1 when the capture's RMS gate tripped again after fire_ms (its
+               silence count restarted — the owner talking again, or any
+               sound above the gate: a click, a cough; Silero is no longer
+               asked after a fire): 'on' would have cut the capture there.
+               It over-counts cut-offs: every re-trip counts, words or not.
     actual_ms  audio time from the first fed chunk to the last one: where the
                capture really ended. On a resumed=0 shadow turn, actual_ms -
                fire_ms is what 'on' would have saved."""

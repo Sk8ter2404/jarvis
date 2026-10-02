@@ -11,15 +11,23 @@ window, a scripted Smart Turn p). No model file, no real model run.
 
 Pinned here:
   * shadow returns byte-identical audio to off, on a turn it WOULD have cut;
-  * one numeric [eot-shadow] line per turn, and eot / st_p / st_n on the
-    [turn-timing] line;
-  * Silero and Smart Turn hear what Whisper hears: the clip from its first
-    pre-roll sample, x the capture's auto-gain;
+  * one numeric [eot-shadow] line per ACCEPTED owner turn (held from the
+    capture's end until the main loop's "You:" line, so a capture the loop
+    drops — TV refused in wake-word mode, a standby line with no wake word —
+    logs none), and eot / st_p / st_n on the [turn-timing] line;
+  * Silero and Smart Turn hear what Whisper hears: the PROCESSED clip from
+    its first pre-roll sample; Smart Turn the clip so far x ONE gain (as
+    Whisper's clip gets, from the peak so far), Silero each chunk x the gain
+    so far; each capture starts Silero afresh;
   * a mid-sentence pause after a would-be end reports resumed=1;
   * mode 'off' never imports a model runtime; no capture loads a model (only
     the boot warmer does);
-  * a fault in the decider, Silero or Smart Turn never breaks a capture and
-    turns Smart Turn off for the session with one line;
+  * a fault in the decider, Silero, Smart Turn or the hooks themselves (even
+    one whose text cannot be formatted) never breaks a capture or leaves the
+    mic claimed, and turns Smart Turn off for the session with one line;
+  * a Smart Turn check never holds the capture thread past one chunk (64 ms)
+    — one that does turns Smart Turn off — and runs after the speculative
+    snapshot of its chunk;
   * in-turn captures (no smart_endpoint; off the main loop's thread) never
     build a decider, and only the two main-loop listens pass it;
   * mode 'on' (not shipped) ends a complete turn early, with eot=st.
@@ -32,10 +40,12 @@ from __future__ import annotations
 import ast
 import builtins
 import contextlib
+import inspect
 import io
 import os
 import re
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -55,6 +65,9 @@ _LOUD = 0.1     # RMS: loud for the fake Silero at ANY gain (|mean| 0.09)
 _TURN = [0.001] * 20 + [_LOUD] * 30 + [0.0] * 25
 # The same words with a mid-sentence pause (8 silent chunks) before 20 more.
 _PAUSED = [0.001] * 20 + [_LOUD] * 30 + [0.0] * 8 + [_LOUD] * 20 + [0.0] * 25
+# A turn that starts soft and gets loud: the capture's auto-gain falls from
+# x10 (peak 0.02) to x2.5 (peak 0.1) half-way through.
+_RISING = [0.001] * 20 + [0.02] * 10 + [_LOUD] * 20 + [0.0] * 25
 # Smart Turn first runs at the 4th silent chunk (SMART_TURN_MIN_SILENCE_S).
 _FIRE_MS = (_PRE + 30 + 4) * _MS                       # 2,944
 _TURN_MS = (_PRE + 30 + 21) * _MS                      # 4,032
@@ -64,16 +77,27 @@ _SHADOW_LINE = re.compile(r"\[eot-shadow\] fire_ms=(?:\d+|-) "
 
 
 class _RecTurn(_ept.ep.SmartTurn):
-    """SmartTurn that keeps a copy of every clip it is asked about."""
+    """SmartTurn that keeps a copy of every clip it is asked about (and, when
+    `events` is a list, notes ("check", clip chunks) in it)."""
 
     def __init__(self, heard, *a, **k):
         super().__init__(*a, **k)
         self.heard = heard
+        self.events = None
 
     def predict(self, audio, sample_rate=16000):
         import numpy as np
         self.heard.append(np.array(audio, dtype=np.float32, copy=True))
+        if self.events is not None:
+            self.events.append(("check", len(audio) // _CHUNK))
         return super().predict(audio, sample_rate)
+
+
+class _NoStr(Exception):
+    """An exception whose text itself cannot be formatted."""
+
+    def __str__(self):
+        raise ValueError("str() of this exception fails")
 
 
 @requires_monolith
@@ -103,6 +127,10 @@ class _Base(MonolithGlobalsTestCase):
             features=lambda x: np.zeros((80, 800), np.float32),
             clock=self.tsess.clock))
         self._p(bc, "_eot_state", {"ready": False, "off": "", "logged": False})
+        # The held [eot-shadow] line starts empty, and a Smart Turn check is
+        # timed on the fake session's clock (each run costs tsess.costs).
+        self._p(bc, "_eot_shadow_pending", [None])
+        self._p(bc, "_eot_clock", self.tsess.clock)
         self._p(bc, "SMART_TURN_MODE", self.MODE)
         self.timing = tt.TurnTiming(print_fn=lambda line: None)
         self._p(bc, "_turn_timing", self.timing)
@@ -141,9 +169,11 @@ class _Base(MonolithGlobalsTestCase):
         self.assertTrue(self.bc._eot_state["ready"])
         del self.vsess.feeds[:]           # the warm window is no turn's
 
-    def _capture(self, rms_seq, smart=True, **extra):
+    def _capture(self, rms_seq, smart=True, accept=True, **extra):
         """(audio, log) of ONE real record_speech capture of `rms_seq`, as
-        the main loop's listen calls it (smart_endpoint=`smart`)."""
+        the main loop's listen calls it (smart_endpoint=`smart`). `accept`:
+        the main loop then accepts it as the owner's turn — its "You:" line,
+        after which _eot_shadow_flush() logs the turn's [eot-shadow] line."""
         bc = self.bc
         real = bc.record_speech
 
@@ -155,7 +185,31 @@ class _Base(MonolithGlobalsTestCase):
                 contextlib.redirect_stdout(out):
             audio, _decodes = _spec.SpeculativeRealCaptureLoopTests \
                 ._run_capture(self, rms_seq)
+            if accept:
+                bc._eot_shadow_flush()
         return audio, out.getvalue()
+
+    def _flush(self):
+        """What _eot_shadow_flush() logs now (the main loop's "You:")."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.bc._eot_shadow_flush()
+        return out.getvalue()
+
+    def _auto_gain_on(self):
+        """The shipped auto-gain knobs, whatever this box's settings say."""
+        from core import config as cfg
+        for name, val in (("CAPTURE_AUTO_GAIN_ENABLED", True),
+                          ("CAPTURE_AUTO_GAIN_TARGET_PEAK", 0.25),
+                          ("CAPTURE_AUTO_GAIN_MAX", 10.0),
+                          ("CAPTURE_AUTO_GAIN_NOISE_FLOOR", 0.005)):
+            self._p(cfg, name, val)
+
+    def _silero_heard(self, feeds=None):
+        """Every sample the capture stream's Silero was fed, in order."""
+        feeds = self.vsess.feeds if feeds is None else feeds
+        return self.np.concatenate(
+            [f["input"][:, _ept.ep.CONTEXT:].reshape(-1) for f in feeds])
 
     def _off_audio(self, rms_seq):
         """The same capture with no Smart Turn at all (mode 'off')."""
@@ -248,30 +302,87 @@ class ShadowCaptureTests(_Base):
         self.assertEqual((d["eot"], d["st_p"], d["st_n"]), ("rms", "0.5", "4"))
 
     def test_silero_and_smart_turn_hear_what_whisper_hears(self):
-        # Whisper gets apply_capture_auto_gain(clip, peak). Silero must get
-        # the same samples from the clip's FIRST pre-roll sample on, and Smart
-        # Turn the clip so far — not the raw, un-gained capture.
+        # Whisper gets apply_capture_auto_gain(clip, peak), and the clip is
+        # the PROCESSED capture (_process_capture_chunk), not the raw mic.
+        # Silero must get the same samples from the clip's FIRST pre-roll
+        # sample on, and Smart Turn the clip so far — not the raw or the
+        # un-gained capture. The processing stage here is a fixed x0.5, so a
+        # hook fed the raw chunk shows (_run_capture alone turns processing
+        # off: processed == raw there).
+        # Mutation-proven (2026-10-02 repair): feeding `data` instead of
+        # chunks[-1] in record_speech's voiced and silent branches turns this
+        # red; with processing off it stayed green.
         np = self.np
-        from core import config as cfg
-        for name, val in (("CAPTURE_AUTO_GAIN_ENABLED", True),
-                          ("CAPTURE_AUTO_GAIN_TARGET_PEAK", 0.25),
-                          ("CAPTURE_AUTO_GAIN_MAX", 10.0),
-                          ("CAPTURE_AUTO_GAIN_NOISE_FLOOR", 0.005)):
-            self._p(cfg, name, val)
+        bc = self.bc
+        self._auto_gain_on()
+        self._p(bc, "_process_capture_chunk",
+                lambda d, sr, skip_ns=False: d * np.float32(0.5))
         self._warm()
         audio, _log = self._capture(_TURN)
-        whisper, gain = self.bc.apply_capture_auto_gain(
-            audio, self.bc._last_recording_peak)
+        raw = np.concatenate([_spec._mic_frame(r) for r in _TURN])
+        self.assertTrue(np.array_equal(
+            audio, raw[8 * _CHUNK:8 * _CHUNK + len(audio)] * np.float32(0.5)))
+        whisper, gain = bc.apply_capture_auto_gain(
+            audio, bc._last_recording_peak)
         self.assertGreater(gain, 2.0)          # a real gain, not x1
-        silero = np.concatenate(
-            [f["input"][:, _ept.ep.CONTEXT:].reshape(-1)
-             for f in self.vsess.feeds])
+        silero = self._silero_heard()
         # Silero is fed up to the would-be end (shadow stops listening there).
         self.assertEqual(len(silero), _FIRE_MS * 16)
         self.assertTrue(np.array_equal(silero, whisper[:len(silero)]))
         self.assertEqual(len(self.heard_by_turn), 1)
         self.assertTrue(np.array_equal(self.heard_by_turn[0],
                                        whisper[:_FIRE_MS * 16]))
+
+    def test_smart_turn_hears_the_clip_at_one_gain_as_whisper_does(self):
+        # A turn that starts soft and gets loud. Whisper's clip is scaled
+        # ONCE, by the capture's final peak (x2.5 here). Smart Turn must hear
+        # exactly that — the clip so far x the gain from the peak so far,
+        # which is what Whisper would get had the turn ended at the check —
+        # not each chunk x the gain at ITS time (x10 for the soft start, ~4x
+        # too loud). Silero is streamed, so it hears each chunk x the gain so
+        # far.
+        np = self.np
+        bc = self.bc
+        self._auto_gain_on()
+        self._warm()
+        audio, log = self._capture(_RISING)
+        whisper, gain = bc.apply_capture_auto_gain(
+            audio, bc._last_recording_peak)
+        self.assertLess(gain, 3.0)             # the loud part's gain
+        fire = (_PRE + 30 + 4) * _CHUNK        # pre-roll, voice, 4 silent
+        self.assertEqual(self._shadow_lines(log), [
+            f"[eot-shadow] fire_ms={fire * 1000 // 16000} p=0.990 resumed=0 "
+            f"actual_ms={len(audio) * 1000 // 16000}"])
+        self.assertEqual(len(self.heard_by_turn), 1)
+        heard = self.heard_by_turn[0]
+        self.assertEqual(len(heard), fire)
+        self.assertTrue(np.array_equal(heard, whisper[:fire]))
+        # Silero: the soft start at the running gain (x10, not x2.5).
+        soft = slice(0, (_PRE + 10) * _CHUNK)
+        running, g10 = bc.apply_capture_auto_gain(
+            audio[soft], float(np.sqrt(np.mean(audio[_PRE * _CHUNK:
+                                                     (_PRE + 1) * _CHUNK]
+                                               ** 2))))
+        self.assertEqual(g10, 10.0)
+        self.assertTrue(np.array_equal(self._silero_heard()[soft], running))
+
+    def test_each_capture_starts_silero_afresh(self):
+        # The capture stream's Silero carries its recurrent state and context
+        # across chunks; a new capture must not start from the previous one's
+        # (which may have been the TV). The fake session makes it visible:
+        # h_out = h_in + windows, c_out = c_in - windows.
+        # Mutation-proven (2026-10-02 repair): deleting _eot_begin's
+        # _eot_stream.reset() turns this red.
+        np = self.np
+        self._warm()
+        self._capture(_TURN)
+        n = len(self.vsess.feeds)
+        self.assertGreater(n, 1)
+        self.assertTrue(np.any(self.vsess.feeds[-1]["h"] != 0))
+        self._capture(_TURN)
+        first = self.vsess.feeds[n]
+        self.assertTrue(np.all(first["h"] == 0))
+        self.assertTrue(np.all(first["c"] == 0))
 
     def test_a_capture_cut_at_the_utterance_ceiling_is_eot_max(self):
         self._warm()
@@ -298,6 +409,165 @@ class ShadowCaptureTests(_Base):
                 self, [0.001] * 5, tail_silence=0)
         self.assertIsNone(audio)
         self.assertEqual(self._shadow_lines(out.getvalue()), [])
+
+
+class OwnerTurnLineTests(_Base):
+    """One [eot-shadow] line per OWNER TURN, not per capture: the main loop's
+    idle listens capture everything the room says (TV, other people, JARVIS
+    himself), and a line per capture made the shadow data — the resumed=1
+    rate tools/turn_latency_report.py counts, the fire rate — describe the
+    room, not the owner. The line is held from the capture's end and logged
+    right after the main loop's "You:" line; the next loop pass drops it."""
+
+    def test_the_capture_holds_its_line_until_the_turn_is_accepted(self):
+        self._warm()
+        _audio, log = self._capture(_TURN, accept=False)
+        self.assertEqual(self._shadow_lines(log), [])
+        self.assertEqual(self._shadow_lines(self._flush()), [
+            f"[eot-shadow] fire_ms={_FIRE_MS} p=0.990 resumed=0 "
+            f"actual_ms={_TURN_MS}"])
+        self.assertEqual(self._flush(), "")            # once per turn
+
+    def test_the_next_loop_pass_drops_a_turn_that_was_never_accepted(self):
+        self._warm()
+        self._capture(_TURN, accept=False)
+        self.bc._tt_loop_top(None)
+        self.assertEqual(self._flush(), "")
+        self._capture(_TURN, accept=False)
+        self.bc._tt_loop_top("a typed command")
+        self.assertEqual(self._flush(), "")
+
+    def test_an_owner_capture_replaces_the_line_an_in_turn_one_keeps_it(self):
+        bc = self.bc
+        self._warm()
+        self._capture(_TURN, accept=False)
+        self.tsess.ps = [0.2]
+        self._capture(_TURN, accept=False)             # the newer turn
+        self._capture(_TURN, smart=False, accept=False)  # an in-turn capture
+        self.assertEqual(self._shadow_lines(self._flush()), [
+            f"[eot-shadow] fire_ms=- p=0.200 resumed=0 actual_ms={_TURN_MS}"])
+        # An owner listen that hears nothing (no line of its own) still
+        # drops the line before it.
+        self._capture(_TURN, accept=False)
+        real = bc.record_speech
+        with mock.patch.object(
+                bc, "record_speech",
+                lambda timeout=None, **kw: real(0.0, smart_endpoint=True)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            audio, _ = _spec.SpeculativeRealCaptureLoopTests._run_capture(
+                self, [0.001] * 5, tail_silence=0)
+        self.assertIsNone(audio)
+        self.assertEqual(self._flush(), "")
+
+    def _utterance(self, rms_seq, heard_text):
+        """One pass of the main loop's normal-mode turn, its control flow as
+        main() has it (main() cannot run in a test — the wiring test below
+        pins it there): the loop top, _capture_utterance through the REAL
+        record_speech and fake mic (Whisper's text faked), the wake-word gate
+        (_bg_gate_for_turn), then the accepted turn's "You:" mark. Returns
+        (refused, log)."""
+        bc = self.bc
+        real = bc.record_speech
+        kws = []
+
+        def listen(*a, **kw):
+            kws.append(dict(kw))
+            return real(*a, **kw)
+
+        def main_loop_pass(timeout=None, **_kw):
+            bc._tt_loop_top(None)
+            with mock.patch.object(bc, "record_speech", listen):
+                return bc._capture_utterance(None, {})
+
+        self._p(bc, "_get_realtime_session", return_value=None)
+        self._p(bc, "_speak_pending", return_value=False)
+        self._p(bc, "resume_face_tracking")
+        self._p(bc, "_audio_music_feed")
+        self._p(bc, "_transcribe_capture", return_value=(
+            heard_text, {"no_speech_prob": 0.0, "avg_logprob": -0.1}))
+        self._p(bc, "_require_wake_runtime", True)
+        from core.followup_window import FollowupWindow
+        self._p(bc, "_followup_window", FollowupWindow(0))
+        out = io.StringIO()
+        with mock.patch.object(bc, "record_speech", main_loop_pass), \
+                contextlib.redirect_stdout(out):
+            cap, _ = _spec.SpeculativeRealCaptureLoopTests._run_capture(
+                self, rms_seq)
+            self.assertEqual(cap[0], heard_text)
+            refused, _why = bc._bg_gate_for_turn(cap[0], False)
+            if not refused:
+                bc._tt("mark", "you")
+                bc._eot_shadow_flush()
+            else:
+                bc._tt_loop_top(None)     # main() `continue`s to the top
+                bc._eot_shadow_flush()    # (no "You:" — nothing to log)
+        self.assertEqual(kws[0].get("smart_endpoint"), True)
+        return refused, out.getvalue()
+
+    def test_a_refused_capture_logs_no_line_an_accepted_one_logs_one(self):
+        self._warm()
+        refused, log = self._utterance(_TURN, "what is on the telly")
+        self.assertTrue(refused)                       # wake-word mode
+        self.assertEqual(self._shadow_lines(log), [])
+        refused, log = self._utterance(_TURN, "Jarvis, what time is it")
+        self.assertFalse(refused)
+        self.assertEqual(self._shadow_lines(log), [
+            f"[eot-shadow] fire_ms={_FIRE_MS} p=0.990 resumed=0 "
+            f"actual_ms={_TURN_MS}"])
+        self.assertEqual(len(self.made), 2)            # both were measured
+
+    def test_a_standby_capture_that_wakes_nothing_logs_no_line(self):
+        bc = self.bc
+        self._warm()
+        for name in ("_sleep_mode", "_standby_mode"):
+            self._p(bc, name, [True])
+        self._p(bc, "_speak_pending", return_value=False)
+        self._p(bc, "_standby_wake_detected", return_value=None)
+        self._p(bc, "_audio_music_feed")
+        for name in ("_device_speech_ignored", "_dialogue_hold_ignored",
+                     "_self_echo_ignored"):
+            self._p(bc, name, return_value=False)
+        self._p(bc, "_ambient_learning", [False])
+        self._p(bc, "_transcribe_capture", return_value=(
+            "just the telly", {"no_speech_prob": 0.0, "avg_logprob": -0.1}))
+        real = bc.record_speech
+        kws = []
+
+        def listen(*a, **kw):
+            kws.append(dict(kw))
+            return real(*a, **kw)
+
+        def standby_pass(timeout=None, **_kw):
+            bc._tt_loop_top(None)
+            with mock.patch.object(bc, "record_speech", listen):
+                return bc._handle_sleep_standby(None)
+
+        out = io.StringIO()
+        with mock.patch.object(bc, "record_speech", standby_pass), \
+                contextlib.redirect_stdout(out):
+            cap, _ = _spec.SpeculativeRealCaptureLoopTests._run_capture(
+                self, _TURN)
+            bc._tt_loop_top(None)
+            bc._eot_shadow_flush()
+        self.assertIsNone(cap)
+        self.assertEqual(kws[0].get("smart_endpoint"), True)
+        self.assertEqual(len(self.made), 1)
+        self.assertEqual(self._shadow_lines(out.getvalue()), [])
+
+    def test_main_logs_the_line_right_after_the_accepted_turns_you_mark(self):
+        src = inspect.getsource(self.bc.main)
+        mark = '_tt("mark", "you")'
+        flush = "_eot_shadow_flush()"
+        self.assertEqual((src.count(mark), src.count(flush)), (1, 1))
+        self.assertLess(src.index('print(f"  You:    {text}")'),
+                        src.index(mark))
+        between = src[src.index(mark) + len(mark):src.index(flush)]
+        self.assertEqual(between.strip(), "")
+        # ...and the loop top that drops an unaccepted turn's line runs
+        # before either capture of the pass.
+        top = src.index("_tt_loop_top(_injected_text)")
+        self.assertLess(top, src.index("_handle_sleep_standby(_injected_text)"))
+        self.assertLess(top, src.index("_capture_utterance(_injected_text, "))
 
 
 class ModeOffTests(_Base):
@@ -377,6 +647,11 @@ class ShippedRegistrationTests(MonolithGlobalsTestCase):
         self.assertLessEqual(
             sum(1 for n, _ in bc._boot_warmers if n == "smart-turn"), 1)
 
+    def test_a_check_is_timed_on_the_real_clock(self):
+        # The tests time checks on the fake session clock; the shipped one is
+        # the wall-clock-independent perf counter.
+        self.assertIs(self.bc._eot_clock, time.perf_counter)
+
 
 class FaultTests(_Base):
     def test_a_decider_fault_never_breaks_a_capture_and_latches_off(self):
@@ -417,6 +692,100 @@ class FaultTests(_Base):
         self.assertIn("smart turn off for this session (capture hook "
                       "failed: TypeError: bad knob)", log)
 
+    def _no_str_fault(self, where):
+        """A capture whose Smart Turn hook raises _NoStr at `where`: the
+        capture is unchanged, the mic is released, and the one [eot] line
+        names the exception's type (its text cannot be formatted)."""
+        np = self.np
+        bc = self.bc
+        self._warm()
+        off = self._off_audio(_TURN)
+        saved = bc._record_speech_active[0]
+        self.addCleanup(bc._record_speech_active.__setitem__, 0, saved)
+        Spy = self.Spy
+
+        class Bad(Spy):
+            def __init__(s, *a, **k):
+                if where == "build":
+                    raise _NoStr()
+                super().__init__(*a, **k)
+
+            def update(s, chunk, silence_n):
+                if where == "feed" and s._chunks >= 20:
+                    raise _NoStr()
+                return super().update(chunk, silence_n)
+
+            def record(s, eot="rms"):
+                if where == "finish":
+                    raise _NoStr()
+                return super().record(eot)
+
+        self._p(bc._endpointing, "EotDecider", Bad)
+        audio, log = self._capture(_TURN)
+        self.assertTrue(np.array_equal(audio, off))
+        self.assertFalse(bc._record_speech_active[0])
+        self.assertEqual(self._eot_lines(log), [
+            "[eot] smart turn off for this session (capture hook failed: "
+            "_NoStr)"])
+        self.assertEqual(self._shadow_lines(log), [])
+
+    def test_an_unprintable_fault_building_the_decider_never_breaks_it(self):
+        self._no_str_fault("build")
+
+    def test_an_unprintable_fault_feeding_the_decider_never_breaks_it(self):
+        self._no_str_fault("feed")
+
+    def test_an_unprintable_fault_finishing_the_turn_never_breaks_it(self):
+        self._no_str_fault("finish")
+
+    def test_a_raise_out_of_the_hook_setup_still_frees_the_mic(self):
+        # _eot_begin never raises; if it ever did, the capture's own finally
+        # (stream closed, then _record_speech_active dropped) must still run:
+        # a stuck flag defers every device re-enumeration and refuses every
+        # get_mic_buffer claim for the life of the process (record_speech's
+        # H-8 note).
+        bc = self.bc
+        self._warm()
+        saved = bc._record_speech_active[0]
+        self.addCleanup(bc._record_speech_active.__setitem__, 0, saved)
+        marks = []
+        real_mark = bc._filler_capture_mark
+
+        def mark(*a, **k):
+            marks.append(k.get("wait", False))
+            return real_mark(*a, **k)
+
+        self._p(bc, "_filler_capture_mark", mark)
+        self._p(bc, "_eot_begin", side_effect=RuntimeError("setup bug"))
+        with self.assertRaises(RuntimeError):
+            self._capture(_TURN)
+        self.assertFalse(bc._record_speech_active[0])
+        # The entry mark, then the capture's finally (stream closed first).
+        self.assertEqual(marks, [True, False])
+
+    def test_a_fault_in_the_capture_predict_hook_latches_off_once(self):
+        # A fault in R7's own predict closure (around SmartTurn.predict,
+        # which itself never raises) used to be swallowed by the decider for
+        # that turn only: no line, and every later turn built a decider and
+        # logged p=- forever.
+        np = self.np
+        bc = self.bc
+        self._warm()
+        off = self._off_audio(_TURN)
+        self._p(bc._eot_turn, "predict", side_effect=RuntimeError("hook bug"))
+        logs = []
+        for _ in range(3):
+            audio, log = self._capture(_TURN)
+            self.assertTrue(np.array_equal(audio, off))
+            logs.append(log)
+        self.assertEqual(
+            [ln for log in logs for ln in self._eot_lines(log)],
+            ["[eot] smart turn off for this session (capture hook failed: "
+             "RuntimeError: hook bug)"])
+        self.assertEqual(len(self.made), 1)
+        self.assertEqual(self._shadow_lines(logs[0]), [
+            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS}"])
+
     def test_silero_failing_mid_session_changes_nothing_and_latches(self):
         np = self.np
         self._warm()
@@ -452,6 +821,67 @@ class FaultTests(_Base):
         _a, log2 = self._capture(_TURN)
         self.assertEqual(len(self.made), 1)
         self.assertNotIn("[eot", log2)
+
+
+class CaptureThreadCostTests(_Base):
+    """A Smart Turn check runs on the capture thread, inside one 64 ms chunk.
+    It must never make the loop fall behind the microphone — a check late in
+    the silence would delay the fixed 21-chunk end of the turn, which shadow
+    promises to leave alone — nor delay the speculative snapshot of its
+    chunk."""
+
+    def test_a_check_longer_than_one_chunk_turns_smart_turn_off(self):
+        np = self.np
+        self._warm()
+        off = self._off_audio(_TURN)
+        self.tsess.costs = [0.070]       # the turn's first check: 70 ms
+        audio, log = self._capture(_TURN)
+        self.assertTrue(np.array_equal(audio, off))
+        self.assertEqual(self._eot_lines(log), [
+            "[eot] smart turn off for this session (too slow: a check took "
+            "70 ms, over one 64 ms capture chunk)"])
+        # That check's p is not used: no would-be end, no p.
+        self.assertEqual(self._shadow_lines(log), [
+            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS}"])
+        self.assertEqual(self.bc._eot_turn.failed, "")   # 70 < its 150 ms
+        _a, log2 = self._capture(_TURN)
+        self.assertEqual(len(self.made), 1)
+        self.assertNotIn("[eot", log2)
+
+    def test_a_check_inside_one_chunk_is_kept(self):
+        self._warm()
+        self.tsess.costs = [0.060]
+        self.tsess.ps = [0.5]
+        _audio, log = self._capture(_TURN)
+        _audio, log2 = self._capture(_TURN)
+        self.assertEqual(self._eot_lines(log + log2), [])
+        self.assertEqual(len(self.made), 2)
+        self.assertEqual(self._shadow_lines(log2), [
+            f"[eot-shadow] fire_ms=- p=0.500 resumed=0 actual_ms={_TURN_MS}"])
+
+    def test_the_speculative_snapshot_goes_before_a_check_on_its_chunk(self):
+        # Speculative STT (off by default) snapshots at silent chunk 7; a
+        # Smart Turn check landing on the same chunk must not delay it.
+        bc = self.bc
+        self._warm()
+        self._p(bc, "_SPECULATIVE_STT", True)
+        # The first check, at SMART_TURN_MIN_SILENCE_S, on silent chunk 7.
+        self._p(bc, "SMART_TURN_MIN_SILENCE_S", 7 * _MS / 1000.0)
+        events = []
+        bc._eot_turn.events = events
+        real_start = bc._spec_stt_start
+
+        def start(snapshot, peak_rms, n_chunks):
+            events.append(("spec", n_chunks))
+            return real_start(snapshot, peak_rms, n_chunks)
+
+        self._p(bc, "_spec_stt_start", start)
+        _audio, log = self._capture(_TURN)
+        n = _PRE + 30 + 7
+        self.assertEqual(events, [("spec", n), ("check", n)])
+        self.assertEqual(self._shadow_lines(log), [
+            f"[eot-shadow] fire_ms={n * _MS} p=0.990 resumed=0 "
+            f"actual_ms={_TURN_MS}"])
 
 
 class WarmerTests(_Base):
