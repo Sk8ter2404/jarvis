@@ -4,8 +4,8 @@ WHAT WAS MEASURED (frames counted from the runtime's own arrival stamps; no
 image content read). The Kinect v2 on the owner's desk drops off USB (Windows
 Kernel-PnP 1010 "surprise removed") about 7.5 s after ANY process switches the
 sensor on - colour+depth+body, colour only, or IKinectSensor::Open() with no
-reader at all - on a direct root port as well as behind a hub, and never while
-it is closed. JARVIS's verdict ("its stream died ... check its power supply")
+reader at all - on a direct root port as well as behind a hub, and not while
+it stays closed (one more drop can follow a close by ~12-13 s). JARVIS's verdict ("its stream died ... check its power supply")
 was therefore right that frames were lost, but:
 
   * it measured the stream's life from the RESET, 4 s after the last frame
@@ -315,6 +315,20 @@ class RealFrameLossTests(_BridgeBase):
         self.assertTrue(rt.closed)
         self.assertIsNone(kb._runtime[0])
         self.assertIn("body AND color streams stale", out)
+
+    def test_stamps_on_another_clock_cannot_veto_a_real_stall(self):
+        """A runtime whose stamps read as FUTURE on pykinect2's clock (a
+        foreign build stamping time.time(), a fake) cannot vouch for a live
+        stream: the bridge's own clocks decide, so a dead sensor still
+        resets instead of being kept forever."""
+        rt = self._open()
+        now = self._stall(rt)
+        rt._last_color_frame_time = self.perf[0] + 1.7e9
+        rt._last_body_frame_time = self.perf[0] + 1.7e9
+        did, out = self._reset(now)
+        self.assertTrue(did, out)
+        self.assertTrue(rt.closed)
+        self.assertNotIn("still delivering", out)
 
 
 class HonestVerdictTests(_BridgeBase):

@@ -2398,9 +2398,11 @@ _body_pump_lock = threading.Lock()
 # on the owner's desk the Kinect v2 drops off USB (Kernel-PnP 1010 "surprise
 # removed ... missing on the bus") about 7.5 s after ANY process switches the
 # sensor on - colour+depth+body, colour only, or Open() with no reader at all -
-# on a direct Intel root port as well as behind the onboard hub; never while
-# it is closed. It is back ~2 s later and, while the runtime stays open,
-# streams ~6 s and drops again every ~12 s. So the "dies on open" verdict was
+# on a direct Intel root port as well as behind the onboard hub; not while
+# it stays closed (35 s control: 0 drops), though ONE more drop can follow a
+# close by ~12-13 s (17:50:01 on 10-02, 13.3 s after the lab's last close,
+# nothing open in-process). It is back ~2 s later and, while the runtime
+# stays open, streams ~6 s and drops again every ~12 s. So the "dies on open" verdict was
 # REAL frame loss - but the bridge could not SAY so: its reset line only knew
 # that its own two clocks were stale, it told the gate the drop began when it
 # NOTICED (4 s late, so a stream that ran 6.3 s was logged as "died within
@@ -2416,7 +2418,10 @@ _body_pump_lock = threading.Lock()
 # and says what the SDK saw: IKinectSensor::IsAvailable went False within
 # ~20 ms of each PnP removal and True again ~2 s later (16:36:12.811 removal ->
 # False at .832; 16:36:25.117 -> .132), so it is sampled while a stream is
-# quiet.
+# quiet. It is the SDK's evidence, not Windows': once (17:49:34.9, 0.6 s
+# after a reopen that came 1.7 s after the device re-enumerated) it read
+# False for ~2.4 s with NO PnP removal - frames then resumed inside the 4 s
+# window, so nothing was reset. Every reset measured so far matched a removal.
 _LINK_QUIET_SEC = 0.3              # sample the sensor once frames have been quiet this long
 _LINK_SAMPLE_SEC = 0.25            # ...at most this often (a COM property read)
 _LINK_MIN_SAMPLES = 3              # this many "available" reads = it stayed connected
@@ -2424,6 +2429,11 @@ _link_lost_at = [0.0]              # monotonic: first "unavailable" read of this
 _link_samples = [0]                # sensor reads taken during this stall
 _link_sampled_at = [0.0]           # monotonic of the last read
 _lag_said_for: list[Any] = [None]  # id() of the runtime whose "bookkeeping lag" line was logged
+# A runtime stamp more than this far AHEAD of pykinect2's clock is on another
+# clock (a foreign build stamping time.time(), a fake), so it cannot vouch for
+# a live stream. Trusting it would veto EVERY stale reset - a dead sensor
+# never reopened - which is the masking this check must never do.
+_STAMP_FUTURE_TOL_SEC = 1.0
 
 
 def _perf_now() -> float:
@@ -2435,8 +2445,9 @@ def _perf_now() -> float:
 def _runtime_frame_age(rt, attr: str, perf_now: float) -> Optional[float]:
     """Seconds since ``rt``'s own frame thread last stamped ``attr`` (e.g.
     _last_color_frame_time), or None when the runtime carries no usable stamp
-    (a test fake, a foreign build) - the caller then has only the bridge's own
-    clocks to go on. NEVER raises."""
+    (a test fake, a foreign build, a stamp from the future - see
+    _STAMP_FUTURE_TOL_SEC) - the caller then has only the bridge's own clocks
+    to go on. NEVER raises."""
     try:
         t = getattr(rt, attr, None)
         if t is None or isinstance(t, bool):
@@ -2444,7 +2455,10 @@ def _runtime_frame_age(rt, attr: str, perf_now: float) -> Optional[float]:
         t = float(t)
         if t != t:
             return None
-        return perf_now - t
+        age = perf_now - t
+        if age < -_STAMP_FUTURE_TOL_SEC:
+            return None
+        return age
     except Exception:
         return None
 

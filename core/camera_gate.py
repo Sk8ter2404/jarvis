@@ -159,7 +159,8 @@ USB re-enumeration and an audio device-list change for nothing.
              Kinect streams normally for ~6 s and leaves the bus ~7.5 s after
              it is switched on - in any process, with colour only or with no
              reader at all, on a direct root port as well as behind the
-             onboard hub - and never while it is closed. So the verdict
+             onboard hub - and not while it stays closed (one more drop
+             can follow a close by ~12-13 s). So the verdict
              is worded by what the drop SHOWED (note_drop's ``off_bus``; see
              dies_on_open_finding): "drops off USB" + check the power supply
              only when the device was seen leaving the bus, "stays connected"
