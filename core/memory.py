@@ -66,6 +66,7 @@ import copy
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -135,6 +136,10 @@ def _mark_promises_dirty() -> None:
     fire it, so _tick persists the change this pass."""
     _promises_dirty[0] = True
 _loaded: list[bool] = [False]
+# True while the promises file exists but could neither be read nor copied
+# aside (a locked or unreadable file). _save_locked refuses to write then, and
+# _loaded stays False so the next call retries the read (audit A89).
+_load_blocked: list[bool] = [False]
 
 # Condition registry: name -> predicate(promise: dict) -> bool
 _conditions: dict[str, Callable[[dict], bool]] = {}
@@ -161,21 +166,41 @@ def _load_locked() -> None:
     already hold _lock."""
     if _loaded[0]:
         return
-    _loaded[0] = True
     if not os.path.exists(_PROMISES_FILE):
+        _loaded[0], _load_blocked[0] = True, False
         return
     try:
         with open(_PROMISES_FILE, "r", encoding="utf-8") as f:
             raw = f.read().strip()
         if not raw:
+            _loaded[0], _load_blocked[0] = True, False
             return
         decoded, _ = json.JSONDecoder().raw_decode(raw)
         if not isinstance(decoded, list):
-            return
+            raise ValueError(f"top level is a JSON {type(decoded).__name__}, "
+                             f"not a list")
     except Exception as e:
-        print(f"  [promises] failed to load {_PROMISES_FILE}: {e}")
+        # The registry was marked loaded BEFORE this read, so a failed read
+        # left it empty and the next save wrote that empty list over every
+        # promise in the file, with no copy kept (audit A89). Copy the file
+        # aside first; if even that fails, stay unloaded and block saves.
+        bak = _set_aside_unreadable_locked()
+        if bak:
+            print(f"  [promises] failed to load {_PROMISES_FILE}: {e}; kept "
+                  f"the unreadable file as {bak}")
+            _loaded[0], _load_blocked[0] = True, False
+        else:
+            if not _load_blocked[0]:
+                print(f"  [promises] failed to load {_PROMISES_FILE}: {e}; it "
+                      f"could not be copied aside either, so it will not be "
+                      f"overwritten (the read is retried on next use)")
+            _load_blocked[0] = True
         return
+    _loaded[0], _load_blocked[0] = True, False
 
+    # Promises made while an earlier read was blocked are already in memory,
+    # numbered from 1; they are kept, and renumbered below past the file's ids.
+    made_while_blocked = list(_promises)
     max_seen = 0
     for entry in decoded:
         if not isinstance(entry, dict):
@@ -199,11 +224,42 @@ def _load_locked() -> None:
         if entry["id"] > max_seen:
             max_seen = entry["id"]
         _promises.append(entry)
+    if made_while_blocked:
+        taken = {e["id"] for e in _promises[len(made_while_blocked):]}
+        max_seen = max([max_seen] + [p.get("id", 0) for p in made_while_blocked
+                                     if isinstance(p.get("id"), int)])
+        for p in made_while_blocked:
+            if p.get("id") in taken:
+                max_seen += 1
+                p["id"] = max_seen
     _next_id[0] = max_seen + 1
+
+
+def _set_aside_unreadable_locked() -> Optional[str]:
+    """Copy the promises file that failed to load to
+    ``pending_promises.json.corrupt-<stamp>.bak`` and return that path, or None
+    when it cannot be copied. Caller must already hold _lock."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    bak = f"{_PROMISES_FILE}.corrupt-{stamp}.bak"
+    n = 1
+    while os.path.exists(bak):
+        n += 1
+        bak = f"{_PROMISES_FILE}.corrupt-{stamp}-{n}.bak"
+    try:
+        shutil.copy2(_PROMISES_FILE, bak)
+    except Exception:
+        return None
+    return bak
 
 
 def _save_locked() -> None:
     """Atomically write promises to disk. Caller must already hold _lock."""
+    if _load_blocked[0]:
+        # The file on disk could not be read or copied aside: writing now
+        # would replace every promise in it with the in-memory list (A89).
+        print(f"  [promises] not saving: {_PROMISES_FILE} is unreadable and "
+              f"has no copy yet")
+        return
     _ensure_dir()
     now = time.time()
     # Prune promises that are old AND no longer pending.
