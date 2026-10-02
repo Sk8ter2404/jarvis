@@ -30,6 +30,34 @@ from unittest import mock
 
 from audio import audio_switch as A
 
+# ── the monolith is ABSENT for this whole file (2026-10-02) ─────────────────
+# audio_switch.capture_override() reads MICROPHONE_INDEX / PREFERRED_INPUT_
+# DEVICES off sys.modules["bobert_companion"], and skills/audio_autoswitch
+# imports it for config and announcements. In a full run the monolith suite has
+# already loaded the REAL monolith there, imported under the harness's
+# JARVIS_STAGING=1, so it carries the staging posture (MICROPHONE_INDEX = -1):
+# every claim then read "my microphone is switched off in settings (index -1)"
+# and four tests failed on the owner's PC only (CI cannot import the monolith).
+# Run alone, the autoswitch import would load the real monolith from disk.
+# Pin the import system's absent sentinel for the module, the world CI sees;
+# a test that wants a monolith installs a stub with _monolith(...) below.
+_MONOLITH = "bobert_companion"
+_ABSENT = object()
+_saved_monolith = _ABSENT
+
+
+def setUpModule():
+    global _saved_monolith
+    _saved_monolith = sys.modules.get(_MONOLITH, _ABSENT)
+    sys.modules[_MONOLITH] = None
+
+
+def tearDownModule():
+    if _saved_monolith is _ABSENT:
+        sys.modules.pop(_MONOLITH, None)
+    else:
+        sys.modules[_MONOLITH] = _saved_monolith
+
 
 # ── The real 2026-09-04 endpoint list, trimmed to the rows that matter. ──────
 # Both VOID rows read Active in this capture and the headset was POWERED OFF.

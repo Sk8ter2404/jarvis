@@ -31,6 +31,32 @@ from unittest import mock
 
 from tests._skill_harness import load_skill_isolated
 
+# ── the monolith is ABSENT for this whole file (2026-10-02) ─────────────────
+# skills/web_interface._is_staging() asks sys.modules["bobert_companion"] too.
+# In a full run the monolith suite has already loaded the REAL monolith there,
+# imported under the harness's JARVIS_STAGING=1, so its BLUE_GREEN_ROLE is
+# "staging" for the rest of the process. Every start then answered "Not while
+# I'm in staging" and seven tests here failed on the owner's PC only (CI cannot
+# import the monolith, so it is never there). Popping JARVIS_STAGING in setUp
+# could not help: the role was fixed at the monolith's import. Pin the import
+# system's absent sentinel for the module, the same world CI sees.
+_MONOLITH = "bobert_companion"
+_ABSENT = object()
+_saved_monolith = _ABSENT
+
+
+def setUpModule():
+    global _saved_monolith
+    _saved_monolith = sys.modules.get(_MONOLITH, _ABSENT)
+    sys.modules[_MONOLITH] = None
+
+
+def tearDownModule():
+    if _saved_monolith is _ABSENT:
+        sys.modules.pop(_MONOLITH, None)
+    else:
+        sys.modules[_MONOLITH] = _saved_monolith
+
 
 class _FakeInsecureBindError(RuntimeError):
     pass

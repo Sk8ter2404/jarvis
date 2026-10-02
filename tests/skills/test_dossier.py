@@ -38,14 +38,16 @@ def inject_modules(**mods):
     """Temporarily install fake modules into sys.modules, restoring the prior
     state (including absence) on exit so tests stay isolated. Mirrors the
     approved pattern in test_self_diagnostic.py. Pass ``name=None`` to force a
-    module to look un-importable inside the block."""
+    module to look un-importable inside the block: that pins the import
+    system's absent sentinel (``sys.modules[name] = None``), so a
+    ``sys.modules.get`` lookup misses AND ``import name`` raises
+    ModuleNotFoundError. A plain pop let register()'s ``import
+    bobert_companion`` load the REAL monolith from disk on a box with every
+    dependency installed (2026-10-02)."""
     saved: dict[str, object] = {}
     for name, obj in mods.items():
         saved[name] = sys.modules.get(name, _SENTINEL)
-        if obj is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = obj
+        sys.modules[name] = obj          # obj may be None (absent sentinel)
     try:
         yield
     finally:

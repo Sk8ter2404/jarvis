@@ -48,7 +48,12 @@ def inject_modules(**mods):
     leaf is ALSO set on its already-imported parent package (because
     ``from pkg import leaf`` resolves via ``getattr(parent, leaf)``). Restores
     the previous state — including absence — on exit, so tests stay isolated and
-    real modules (numpy etc.) survive untouched. ``obj=None`` forces absence."""
+    real modules (numpy etc.) survive untouched. ``obj=None`` forces absence
+    by pinning the import system's absent sentinel (``sys.modules[name] =
+    None``): a ``sys.modules.get`` lookup misses AND ``import_module`` raises
+    ModuleNotFoundError. A plain pop let _read_config's import load the REAL
+    bobert_companion.py from disk on a box with every dependency installed
+    (2026-10-02)."""
     saved_mod: dict[str, object] = {}
     missing: set[str] = set()
     saved_attr: list = []
@@ -57,7 +62,7 @@ def inject_modules(**mods):
         if saved_mod[name] is _SENTINEL:
             missing.add(name)
         if obj is None:
-            sys.modules.pop(name, None)
+            sys.modules[name] = None     # absent sentinel: lookup AND import miss
         else:
             sys.modules[name] = obj
             if "." in name:

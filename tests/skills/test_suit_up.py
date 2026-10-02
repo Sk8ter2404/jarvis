@@ -50,15 +50,17 @@ def inject_modules(**mods):
     """Temporarily install/remove fake modules in ``sys.modules`` (e.g.
     ``memory``, ``bobert_companion``, ``skill_holographic_overlay``) for the
     duration of a block, restoring prior state — including absence — afterwards.
-    ``obj=None`` removes the module so a lazy import misses. All names used here
-    are flat (non-dotted)."""
+    ``obj=None`` pins the import system's absent sentinel
+    (``sys.modules[name] = None``): a ``sys.modules.get`` lookup misses AND a
+    lazy ``importlib.import_module`` raises ModuleNotFoundError. A plain pop
+    let that import find the REAL bobert_companion.py on disk, so on a box
+    with every dependency installed _resolve_speaker_name read the owner's
+    real headset name instead of falling back (2026-10-02). All names used
+    here are flat (non-dotted)."""
     saved: dict[str, object] = {}
     for name, obj in mods.items():
         saved[name] = sys.modules.get(name, _SENTINEL)
-        if obj is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = obj
+        sys.modules[name] = obj          # obj may be None (absent sentinel)
     try:
         yield
     finally:

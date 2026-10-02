@@ -21,6 +21,9 @@ These tests pin the guard WITHOUT reaching anything:
   they are about;
 * the regression class re-runs every test the audit caught, in-process, and
   requires that it now reaches nothing (the fixes in the tests themselves);
+* the monolith class re-runs every test that injects ``bobert_companion=None``
+  under a sys.meta_path trap, and requires that none of them imports the REAL
+  bobert_companion.py from disk (2026-10-02);
 * the wiring class reads the SOURCE of tests/__init__.py and the runners
   (this repo's #1 bug class is a rule that stops being applied in one copy).
 
@@ -32,11 +35,15 @@ from __future__ import annotations
 import ast
 import contextlib
 import http.server
+import importlib
+import inspect
 import os
 import socket
 import subprocess
 import sys
 import threading
+import traceback
+import types
 import unittest
 import urllib.request
 from unittest import mock
@@ -765,6 +772,291 @@ class FixedOffendersStayHermeticTests(_Armed):
                                  f"{test_id} still reaches {reached}")
                 self.assertEqual(blocks, [],
                                  f"{test_id} still reaches a real browser")
+
+
+# ─── a "monolith absent" test never imports the real monolith, 2026-10-02 ──
+# ~14 test files simulate "the monolith lookup fails" with
+# ``inject_modules(bobert_companion=None)``. Most of their helpers did that
+# with ``sys.modules.pop(name)``. A LOOKUP (sys.modules.get) then misses, as
+# intended. An IMPORT (importlib.import_module / ``import bobert_companion``)
+# does not: it searches sys.path and finds the REAL 43k-line
+# bobert_companion.py. On the light-deps Linux CI that import fails, so the
+# test passed by accident. On the owner's PC it imports and touches real
+# hardware: test_suit_up got his real headset name instead of "system
+# default". Those helpers now pin the import system's absent sentinel
+# (``sys.modules[name] = None``), so the import raises ModuleNotFoundError.
+#
+# The trap goes first on sys.meta_path. Any attempt to FIND bobert_companion
+# on disk while it is armed is recorded and refused, so the real module never
+# executes even if a test regresses. Every test in tests/ that injects
+# ``bobert_companion=None`` is found from the SOURCE (a new site is covered
+# the day it is written) and re-run under the trap; none may make an attempt
+# from its test method. On CI, where the monolith cannot import anyway, the
+# attempt is still seen: the trap refuses it before the import would have
+# failed on a missing dep.
+
+_MONOLITH = "bobert_companion"
+_TESTS_DIR = os.path.join(_PROJECT_ROOT, "tests")
+_ABSENT = object()
+
+# The sites that imported the real monolith before the fix (all four expected
+# a fallback and got whatever the owner's PC answered).
+_MONOLITH_ABSENT_FIXED = (
+    "tests.skills.test_suit_up.SuitUpBuilderTests."
+    "test_resolve_speaker_blank_explicit_falls_back",
+    "tests.skills.test_suit_up.SuitUpBuilderTests."
+    "test_resolve_speaker_whitespace_explicit_falls_back",
+    "tests.skills.test_dossier.DossierRegisterTests."
+    "test_register_wires_all_aliases",
+    "tests.skills.test_weekly_digest_briefing.WeeklyDigestBriefingTests."
+    "test_read_config_no_bc_uses_defaults",
+)
+
+
+class _MonolithImportTrap:
+    """A sys.meta_path finder that finds nothing. For bobert_companion it
+    records where the import came from and refuses it, so a regressed test
+    can never execute the real monolith.
+
+    With ``body_code`` set (a test method's code object), only an attempt made
+    while that method is on the stack lands in ``attempts``; one made by a
+    fixture (setUp -> load_skill_isolated -> a skill's register()) is refused
+    all the same but lands in ``fixture_attempts``. Those are a different
+    leak from the one this class is about, so they are not judged here."""
+
+    def __init__(self):
+        self.attempts: list[str] = []
+        self.fixture_attempts: list[str] = []
+        self.body_code = None
+
+    def _in_body(self) -> bool:
+        if self.body_code is None:
+            return True
+        frame = sys._getframe(2)
+        while frame is not None:
+            if frame.f_code is self.body_code:
+                return True
+            frame = frame.f_back
+        return False
+
+    def find_spec(self, name, path=None, target=None):
+        if name != _MONOLITH:
+            return None
+        site = "?"
+        for frame in reversed(traceback.extract_stack()[:-1]):
+            fname = frame.filename
+            if "importlib" in fname or fname.startswith("<frozen"):
+                continue
+            site = f"{os.path.basename(fname)}:{frame.lineno}"
+            break
+        (self.attempts if self._in_body() else self.fixture_attempts).append(site)
+        raise ModuleNotFoundError(
+            f"[monolith-trap] refused to import the real {name} from disk "
+            f"(from {site})", name=name)
+
+    @contextlib.contextmanager
+    def armed(self):
+        sys.meta_path.insert(0, self)
+        try:
+            yield self
+        finally:
+            with contextlib.suppress(ValueError):
+                sys.meta_path.remove(self)
+
+
+def _injects_monolith_none(func) -> bool:
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if (kw.arg == _MONOLITH and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is None):
+                    return True
+    return False
+
+
+def _monolith_absent_tests() -> list[str]:
+    """The id of every test method under tests/ that passes
+    ``bobert_companion=None`` to a call (the inject_modules helpers)."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(_TESTS_DIR):
+        dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
+        for fname in sorted(filenames):
+            if not (fname.startswith("test_") and fname.endswith(".py")):
+                continue
+            path = os.path.join(dirpath, fname)
+            src = _source(path)
+            if _MONOLITH not in src:
+                continue
+            module = os.path.relpath(path, _PROJECT_ROOT)[:-3].replace(os.sep, ".")
+            for cls in ast.parse(src, path).body:
+                if not isinstance(cls, ast.ClassDef):
+                    continue
+                for func in cls.body:
+                    if (isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and func.name.startswith("test")
+                            and _injects_monolith_none(func)):
+                        found.append(f"{module}.{cls.name}.{func.name}")
+    return found
+
+
+def _test_cases(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from _test_cases(item)
+        else:
+            yield item
+
+
+def _method_code(case):
+    """The code object of a test case's own method, under any decorators
+    (``mock.patch`` keeps ``__wrapped__``); None when it can't be found."""
+    func = getattr(type(case), getattr(case, "_testMethodName", ""), None)
+    try:
+        func = inspect.unwrap(func) if func is not None else None
+    except ValueError:
+        return None
+    return getattr(func, "__code__", None)
+
+
+@contextlib.contextmanager
+def _monolith_popped():
+    saved = sys.modules.pop(_MONOLITH, _ABSENT)
+    try:
+        yield
+    finally:
+        if saved is _ABSENT:
+            sys.modules.pop(_MONOLITH, None)
+        else:
+            sys.modules[_MONOLITH] = saved
+
+
+class MonolithAbsentTestsNeverImportItTests(unittest.TestCase):
+
+    def test_the_trap_sees_a_pop_then_import_but_never_the_sentinel(self):
+        # The old helper semantics (pop, then the code under test imports)
+        # must be caught; the fixed semantics (the None sentinel) must not
+        # even reach a finder. Nothing here can execute the real monolith:
+        # the trap refuses the only two imports that reach a finder.
+        trap = _MonolithImportTrap()
+        with _monolith_popped(), trap.armed():
+            with self.assertRaises(ImportError):
+                importlib.import_module(_MONOLITH)
+            with self.assertRaises(ImportError):
+                __import__(_MONOLITH)
+            # (the recorded site is diagnostic only: under ci_sim the first
+            # frame outside importlib is its import_module shim, not this file)
+            self.assertEqual(len(trap.attempts), 2)
+            sys.modules[_MONOLITH] = None
+            with self.assertRaises(ModuleNotFoundError):
+                importlib.import_module(_MONOLITH)
+            self.assertEqual(len(trap.attempts), 2)
+        self.assertNotIn(trap, sys.meta_path)
+
+    def test_the_trap_tells_the_test_body_from_a_fixture(self):
+        def body():
+            importlib.import_module(_MONOLITH)
+
+        def fixture():
+            importlib.import_module(_MONOLITH)
+        trap = _MonolithImportTrap()
+        trap.body_code = body.__code__
+        with _monolith_popped(), trap.armed():
+            for fn in (fixture, body):
+                with self.assertRaises(ImportError):
+                    fn()
+        self.assertEqual(len(trap.fixture_attempts), 1)
+        self.assertEqual(len(trap.attempts), 1)
+
+    def test_discovery_finds_the_sites_and_the_fixed_ones(self):
+        found = _monolith_absent_tests()
+        self.assertGreaterEqual(len(found), 20, found)
+        self.assertEqual(len(found), len(set(found)))
+        for test_id in _MONOLITH_ABSENT_FIXED:
+            self.assertIn(test_id, found)
+
+    def test_no_monolith_absent_test_imports_the_real_monolith(self):
+        loader = unittest.TestLoader()
+        trap = _MonolithImportTrap()
+        for test_id in _monolith_absent_tests():
+            with self.subTest(test=test_id):
+                suite = loader.loadTestsFromName(test_id)
+                cases = list(_test_cases(suite))
+                self.assertEqual(len(cases), 1, test_id)
+                trap.body_code = _method_code(cases[0])
+                self.assertIsNotNone(trap.body_code, test_id)
+                result = unittest.TestResult()
+                with _ledger_restored(), trap.armed():
+                    n0 = len(trap.attempts)
+                    suite.run(result)
+                    sites = trap.attempts[n0:]
+                self.assertEqual(
+                    [(t.id(), tb.splitlines()[-1]) for t, tb in
+                     result.errors + result.failures], [], test_id)
+                self.assertEqual(
+                    sites, [],
+                    f"{test_id} imported the REAL bobert_companion from disk "
+                    f"(from {sites}). Make its helper pin the absent sentinel "
+                    f"(sys.modules[name] = None) or inject a stub module.")
+
+
+# ─── a staging monolith left loaded by the monolith suite, 2026-10-02 ──────
+# tests/_monolith_harness.load_monolith() imports the REAL monolith with
+# JARVIS_STAGING=1 and leaves both behind for the rest of the run. That is
+# deliberate: several monolith gates read the env var at call time, and the
+# monolith tests rely on it being set suite-wide. The module that stays in
+# sys.modules carries the staging posture fixed at its import: BLUE_GREEN_ROLE
+# "staging", MICROPHONE_INDEX -1. Skill code that looks the monolith up then
+# finds that staging instance. On the owner's PC, seven skills/web_interface
+# tests answered "Not while I'm in staging" and four audio_switch tests read
+# "index -1". CI never loads the monolith, so CI never saw it. Restoring the
+# env var cannot help, because the role was fixed when the module imported.
+# Both files now pin the absent sentinel for their whole module. This re-runs
+# them with a staging stand-in planted the way the monolith suite leaves it,
+# and requires the same outcome as with nothing planted. The import trap is
+# armed for both runs, so neither run can load the real monolith even if a
+# pin regresses.
+
+_STAGING_ORDER_SENSITIVE = ("tests.skills.test_web_interface",
+                            "tests.skills.test_audio_switch")
+
+
+def _staging_monolith_standin():
+    """What the harness-loaded monolith looks like to a skill afterwards."""
+    bc = types.ModuleType(_MONOLITH)
+    bc.BLUE_GREEN_ROLE = "staging"
+    bc._is_staging = lambda: True
+    bc.MICROPHONE_INDEX = -1
+    bc.PREFERRED_INPUT_DEVICES = []
+    return bc
+
+
+def _module_outcome(module_name):
+    result = unittest.TestResult()
+    unittest.TestLoader().loadTestsFromName(module_name).run(result)
+    return (result.testsRun,
+            sorted(t.id() for t, _tb in result.errors + result.failures))
+
+
+class StagingMonolithLeftLoadedTests(unittest.TestCase):
+
+    def test_outcomes_do_not_depend_on_a_loaded_staging_monolith(self):
+        for name in _STAGING_ORDER_SENSITIVE:
+            with self.subTest(module=name):
+                trap = _MonolithImportTrap()
+                with _ledger_restored(), _monolith_popped(), trap.armed():
+                    clean = _module_outcome(name)
+                with _ledger_restored(), _monolith_popped(), trap.armed(), \
+                        mock.patch.dict(os.environ, {"JARVIS_STAGING": "1"}):
+                    sys.modules[_MONOLITH] = _staging_monolith_standin()
+                    planted = _module_outcome(name)
+                self.assertGreater(clean[0], 0, name)
+                self.assertEqual(
+                    planted, clean,
+                    f"{name}: these tests pass or fail depending on whether "
+                    f"the monolith suite ran first. Pin the absent sentinel "
+                    f"for the module (sys.modules['bobert_companion'] = None "
+                    f"in setUpModule).")
+                self.assertEqual(trap.attempts, [], name)
 
 
 # ─── wiring (source) ───────────────────────────────────────────────────────
