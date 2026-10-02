@@ -1535,6 +1535,22 @@ SCHEMA: dict[str, dict] = {
                 "in core/config.py). Once you drag the HUD, its saved position "
                 "wins. Applies on the next start.",
     },
+    # Brain glow (core/brain_glow.py): read live by every publish.
+    "BRAIN_GLOW_ENABLED": {
+        "tab": "advanced", "label": "HUD glow shows which brain answers",
+        "type": "bool", "default": True,
+        "help": "The reactor's outer glow takes the colour of the brain that "
+                "is answering: local model blue, Claude Sonnet gold, Opus "
+                "violet, Haiku green. Changes when you switch brains and when "
+                "a turn falls back to the other brain. The listening / "
+                "thinking / speaking colours stay on the reactor's core.",
+    },
+    "BRAIN_GLOW_LABEL_S": {
+        "tab": "advanced", "label": "Brain name label (seconds)",
+        "type": "float", "default": 4.0, "min": 0, "max": 60,
+        "help": "How long the brain's name shows under the reactor after it "
+                "changes. 0 = colour only, no label.",
+    },
     "TRAY_ENABLED": {
         "tab": "advanced", "label": "System-tray applet", "type": "bool",
         "default": True,
@@ -1815,7 +1831,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                                         "HUE_BRIDGE_IP_HINT"]),
     ],
     "advanced": [
-        ("On screen", ["HUD_ENABLED", "HUD_MONITOR", "TRAY_ENABLED",
+        ("On screen", ["HUD_ENABLED", "HUD_MONITOR", "BRAIN_GLOW_ENABLED",
+                       "BRAIN_GLOW_LABEL_S", "TRAY_ENABLED",
                        "RETICLE_OVERLAY_ENABLED"]),
         ("Behaviour", ["PUSHBACK_ENABLED", "MISSION_NARRATION_ENABLED",
                        "SCREEN_VISION_ENABLED", "PC_CONTROL_ENABLED",

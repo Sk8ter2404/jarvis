@@ -4182,6 +4182,13 @@ def _act_switch_llm(arg: str = "") -> str:
             bc._write_hud_state(llm_backend=value)
         except Exception:
             pass
+        # Brain glow: the HUD takes the colour of the brain the next turn
+        # uses (core/brain_glow; a no-op when nothing changed).
+        try:
+            from core.brain_glow import publish_expected
+            publish_expected(bc, source="switch")
+        except Exception:
+            pass
     if tag in ("claude", "anthropic"):
         _apply_chat_brain(bc, "cloud", "claude")
         _publish_backend("anthropic")

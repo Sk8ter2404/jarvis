@@ -63,6 +63,15 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
+# Brain glow (core/brain_glow.py): hud_state's ``brain`` = the colour + brief
+# name label of the brain that is answering (local blue, Sonnet gold, Opus
+# violet...). Fail-open: a missing helper means no glow, never a dead canvas.
+try:
+    from core.brain_glow import hud_brain as _hud_brain
+except Exception:  # pragma: no cover - core/ always ships next to hud/
+    def _hud_brain(_hud, _now=None):
+        return None
+
 
 TICK_MS = 40  # 25 fps — keeps the pseudo-3D rotation smooth
 
@@ -333,6 +342,12 @@ class WorkshopCanvas:
             mic_level = float(state.get("mic_level", 0.0) or 0.0)
         except (TypeError, ValueError):
             mic_level = 0.0
+        # Brain glow — a missing / garbage ``brain`` key is None (the normal
+        # look), never a raise.
+        try:
+            brain = _hud_brain(state, time.time())
+        except Exception:
+            brain = None
 
         # Smooth amp/mic so the pulse breathes instead of jittering.
         self.last_amp = 0.55 * self.last_amp + 0.45 * max(0.0, min(1.0, tts_amp))
@@ -405,6 +420,12 @@ class WorkshopCanvas:
         # An inner dim track behind the pulsing ring so the breathing is
         # visible by reference even at low amplitude.
         self._circle(self.R_PULSE_BASE - 8, CYAN_DIM, width=1)
+        # Brain glow ring (core/brain_glow): the answering brain's colour,
+        # breathing just inside the state-coloured pulse ring.
+        if brain is not None:
+            self._circle(self.R_PULSE_BASE - 3,
+                         _mix(CYAN_DEEP, brain.color, 0.6 + 0.4 * breath),
+                         width=2)
 
         # ── rotating blade ring (pseudo-3D) ──
         self._draw_blades(base_color, intensity)
@@ -445,6 +466,14 @@ class WorkshopCanvas:
             text=label, fill=label_color, anchor="center",
             font=("Consolas", 11, "bold"),
         )
+        # Brief brain label under the state label, fading out after a change.
+        if brain is not None and brain.label and brain.label_alpha >= 0.15:
+            self.canvas.create_text(
+                self.cx, self.cy + self.R_PULSE_BASE + 38,
+                text=f"◆ {brain.label}",
+                fill=_mix(CYAN_DEEP, brain.color, brain.label_alpha),
+                anchor="center", font=("Consolas", 8, "bold"),
+            )
         # Tiny mode chip in the top-right of the canvas so the user can
         # confirm which mode they're in (ambient vs pulse).
         chip = "PULSE" if mode == "pulse" else "ON"

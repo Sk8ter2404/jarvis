@@ -451,26 +451,70 @@ def _chat_route() -> str:
         return "auto"
 
 
+def _cloud_model_name() -> str:
+    """'Sonnet 5.5' for the live CLAUDE_MODEL (the monolith's copy, which is
+    what _call_llm sends), or '' when it can't be read."""
+    bc = _monolith()
+    tag = getattr(bc, "CLAUDE_MODEL", None) if bc is not None else None
+    if not isinstance(tag, str) or not tag:
+        try:
+            from core.config import CLAUDE_MODEL as tag
+        except Exception:
+            return ""
+    try:
+        from core.brain_glow import display_name
+        return display_name(tag, "cloud")
+    except Exception:
+        return ""
+
+
+def _glow_sentence(route: str) -> str:
+    """The HUD-colour sentence (core/brain_glow): '' when the glow is off or
+    anything fails — the spoken answer never depends on it."""
+    try:
+        from core.brain_glow import describe_for_voice
+        return describe_for_voice(_monolith(), route=route)
+    except Exception:
+        return ""
+
+
 def current_model(arg: str = "") -> str:
     """Report the brain the NEXT chat turn will actually use. Reads the live
     chat route (MODEL_ROUTING['chat'], what set_brain sets) so a 'switch to
     Claude' is reflected — previously this always named the local model even
     when Claude was handling every turn (2026-07-04 live-repro: after 'switch
-    to the cloud model' it still said 'qwen 14B locally, sir')."""
+    to the cloud model' it still said 'qwen 14B locally, sir').
+
+    With the brain glow on (BRAIN_GLOW_ENABLED) it also names the HUD colour
+    ("The reactor's glowing gold for Sonnet 5.5.") — "what brain are you on"."""
     route = _chat_route()
     active = _active_model()
+    glow = _glow_sentence(route)
     if route == "cloud":
-        return "I'm running on Claude in the cloud, sir."
+        name = _cloud_model_name()
+        claude = f"Claude {name}" if name else "Claude"
+        return f"I'm running on {claude} in the cloud, sir.{glow}"
     if route == "auto":
         if active:
             return (f"I'm on auto, sir — Claude when it's reachable, with "
-                    f"{_short_name(active)} locally as the fallback.")
-        return "I'm on auto, sir — Claude when reachable, local as the fallback."
+                    f"{_short_name(active)} locally as the fallback.{glow}")
+        return ("I'm on auto, sir — Claude when reachable, local as the "
+                f"fallback.{glow}")
     # route == "local" (or anything unexpected): report the local model.
     if not active:
         return ("I'm not sure which local model is active, sir — I can't reach "
                 "the model selector right now.")
-    return f"I'm running on {_short_name(active)} locally, sir ({active})."
+    return f"I'm running on {_short_name(active)} locally, sir ({active}).{glow}"
+
+
+def _publish_brain_glow(bc) -> None:
+    """Recolour the HUD for the brain the next turn will use, right after a
+    switch (core/brain_glow). Never raises."""
+    try:
+        from core.brain_glow import publish_expected
+        publish_expected(bc, source="switch")
+    except Exception:
+        pass
 
 
 def set_model(arg: str) -> str:
@@ -554,6 +598,10 @@ def set_model(arg: str) -> str:
     # second VLM / dead tag. No-op for a pinned separate VLM or a text-only
     # target (see _sync_vision_to_chat).
     _sync_vision_to_chat(active, target, persist=True, bc=bc)
+
+    # Brain glow: the HUD takes the new brain's colour now (a no-op while the
+    # chat route is on Claude — the next turn is still served by the cloud).
+    _publish_brain_glow(bc)
 
     # Confirmation, with a one-beat character note on the trade-off.
     note = ""
@@ -639,6 +687,8 @@ def set_brain(arg: str = "") -> str:
                 else str(_active_model() or getattr(bc, "LOCAL_LLM_MODEL", ""))))
     except Exception:
         pass
+    # ...and the HUD glow in the new brain's colour (core/brain_glow).
+    _publish_brain_glow(bc)
 
     # Persist the pair together: a reboot into route=cloud + AI_BACKEND=ollama
     # is the same split brain again. (route=local with either backend is not.)

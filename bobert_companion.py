@@ -4338,6 +4338,44 @@ def _write_hud_state(**updates):
         pass
 
 
+# ── Brain glow (core/brain_glow.py) ─────────────────────────────────────────
+# The HUD glow takes the colour of the brain that ANSWERED: _call_llm resets
+# this thread's slot, every generate that produces the reply notes itself
+# (_call_local_llm's served-via lines, _claude_oneshot, the cloud and ollama
+# branches), and _call_llm publishes the note once the reply is in. A
+# threading.local, because background local calls (learn_from_turn, ambient
+# extract, vision) run on their own threads and must never recolour the orb.
+# The publish writes hud_state.json only when the brain CHANGES.
+_turn_brain_tls = threading.local()
+
+
+def _note_turn_brain(route: str, model) -> None:
+    """Record the brain that just produced a reply on THIS thread. One
+    attribute store: it runs on every local generate."""
+    _turn_brain_tls.served = (route, model)
+
+
+def _publish_turn_brain() -> None:
+    """Publish this thread's noted brain (if any) to the HUD. Never raises."""
+    served = getattr(_turn_brain_tls, "served", None)
+    if not served:
+        return
+    try:
+        from core import brain_glow as _brain_glow
+        _brain_glow.publish(_write_hud_state, served[1], served[0], source="turn")
+    except Exception:
+        pass
+
+
+def _publish_boot_brain_glow() -> None:
+    """Show the brain the first turn will use, at boot. Never raises."""
+    try:
+        from core import brain_glow as _brain_glow
+        _brain_glow.publish_expected(sys.modules[__name__], source="boot")
+    except Exception:
+        pass
+
+
 _hud_process = None
 
 
@@ -5506,6 +5544,8 @@ def _restore_tray_toggle_state() -> None:
                          else str(_RESOLVED_LOCAL_LLM_MODEL[0] or LOCAL_LLM_MODEL)))
     except Exception:
         pass
+    # ...and the HUD glow in that brain's colour (core/brain_glow.py).
+    _publish_boot_brain_glow()
 
     # Bring ambient_listen up if the user had it on last time. ACTIONS
     # was populated by load_skills() already.
@@ -20400,6 +20440,7 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
                       f"{_served_via_suffix(_gen_stats[0])}")
                 _note_prompt_window(sys_prompt, messages, _gen_stats[0],
                                     model)
+                _note_turn_brain("local", model)
                 return text
             if kind == "empty":
                 # 200-OK-but-EMPTY = the model ran but a broken quant / template
@@ -20421,6 +20462,7 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
                         _RESOLVED_LOCAL_LLM_MODEL[0] = alt
                         print(f"  [local-llm] served via {alt} (failed over from {model}) "
                               f"{_served_via_suffix(_gen_stats[0])}")
+                        _note_turn_brain("local", alt)
                         return text2
                     print(f"  [local-llm] failover model `{alt}` returned {kind2} too "
                           f"— treating local as unavailable")
@@ -20551,17 +20593,21 @@ def _claude_oneshot(system: str, messages: list, max_tokens: int = 500) -> str |
         # the call is bounded by _ANTHROPIC_TIMEOUT_S so a hung cloud socket
         # can't freeze the voice thread.
         if _llm_client is not None:
-            return _llm_client.complete(
+            text = _llm_client.complete(
                 model=CLAUDE_MODEL, max_tokens=max_tokens,
                 system=system, messages=messages,
                 timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
             )
-        msg = _claude_create(
-            "voice",
-            model=CLAUDE_MODEL, max_tokens=max_tokens,
-            system=system, messages=messages,
-        )
-        return _claude_reply_text(msg)
+        else:
+            msg = _claude_create(
+                "voice",
+                model=CLAUDE_MODEL, max_tokens=max_tokens,
+                system=system, messages=messages,
+            )
+            text = _claude_reply_text(msg)
+        if text:
+            _note_turn_brain("cloud", CLAUDE_MODEL)
+        return text
     except Exception as _e:
         print(f"  [local-llm] cloud fallback also failed ({type(_e).__name__}: {_e})")
         return None
@@ -22960,6 +23006,8 @@ def _call_llm(user_text: str) -> str:
     # last turn was already consumed by the downstream speaker, and a stale
     # prefix must never strip text from THIS turn's reply.
     _stream_spoken_prefix[0] = ""
+    # Brain glow: whichever generate answers THIS turn notes itself below.
+    _turn_brain_tls.served = None
     conversation_history.append({"role": "user", "content": user_text})
     # Trim BEFORE the API request, not just after (line ~9750). A boot-time /
     # follow-up-loop assistant-only append can leave conversation_history
@@ -23227,6 +23275,9 @@ def _call_llm(user_text: str) -> str:
                     messages=conversation_history,
                 )
                 reply = _claude_reply_text(msg)
+            # Reached only when the cloud call returned (every failure jumps
+            # to the handlers below, whose local fallback notes itself).
+            _note_turn_brain("cloud", CLAUDE_MODEL)
         except anthropic.BadRequestError as _e:
             _s = str(_e).lower()
             if "credit balance" in _s or "too low" in _s or "upgrade or purchase" in _s:
@@ -23284,11 +23335,13 @@ def _call_llm(user_text: str) -> str:
             # every OTHER local call (_call_local_llm) correctly resolved
             # gemma4:12b. The local-only backend was dead on arrival
             # (2026-07-14 audit). _get_local_llm_model() is the single resolver.
+            _ollama_model = _get_local_llm_model()
             resp = _ollama_chat_bounded(
-                _get_local_llm_model(),
+                _ollama_model,
                 [{"role": "system", "content": sys_prompt_now}] + conversation_history,
             )
             reply = resp["message"]["content"]
+            _note_turn_brain("local", _ollama_model)
         except Exception as _e:
             print(f"  [ollama] chat failed: {_e}")
             # Route through the instrumented local fallback like the claude
@@ -23309,6 +23362,9 @@ def _call_llm(user_text: str) -> str:
         reply = "AI backend not configured. Check AI_BACKEND in the script."
 
     _prof("reply_ready", reply[:40].replace("\t", " "))
+    # Brain glow: the HUD takes the colour of the brain that answered (a
+    # hud_state write only when it changed).
+    _publish_turn_brain()
     conversation_history.append({"role": "assistant", "content": reply})
     # A JARVIS reply is conversation activity: it (re)starts the prompt-freeze
     # quiet window (see _request_prompt_rebuild).

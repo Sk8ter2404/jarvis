@@ -1504,6 +1504,28 @@ CONSOLE_MONITOR = "top"
 HUD_ENABLED = True                 # drives the unified HUD at boot
 HUD_MONITOR = "top"                # which monitor in MONITORS to anchor to
 
+# ─── Brain glow (core/brain_glow.py) ─────────────────────────────────────
+# BRAIN_GLOW_ENABLED — the HUD orb / arc-reactor glow takes the colour of the
+#   brain that is answering: local model = blue, Claude Sonnet = gold, Opus =
+#   violet, Haiku = green, Fable = rose, any other cloud model = silver. It
+#   changes the moment you switch brains (set_model / set_brain / switch_llm)
+#   and per turn when a turn is really answered by the other brain (a local
+#   turn the cloud had to answer, a cloud turn that fell back to local). The
+#   state colours (listening / thinking / speaking) stay on the reactor's core;
+#   only the outer glow changes. Off = the HUDs look exactly as before. Read
+#   live on every publish; one hud_state.json write per brain CHANGE, never
+#   per turn.
+# BRAIN_GLOW_LABEL_S — seconds the brain's name shows under the reactor after
+#   a change (0 = colour only, never a label).
+# BRAIN_GLOW_COLORS — per-tier colour overrides, e.g. {"opus": "#FF3B3B"}.
+#   Tiers: local, haiku, sonnet, opus, fable, cloud. Merged over the defaults
+#   in core/brain_glow.DEFAULT_COLORS; a bad hex or unknown tier is ignored.
+#   Not in the Settings window (no colour picker) — set it in
+#   data/user_settings.json.
+BRAIN_GLOW_ENABLED = True
+BRAIN_GLOW_LABEL_S = 4.0
+BRAIN_GLOW_COLORS = {}
+
 # Live camera preview in the HUD — a small downscaled mirror of what JARVIS
 # actually sees (the primary face-tracking frame; with KINECT_AS_CAMERA this is
 # the Kinect 1080p color stream). The main process writes ONE overwriting,

@@ -167,6 +167,9 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
 - **Workshop HUD** (`hud/workshop_hud.py`) — slim top-right corner panel: arc-reactor "power %" from CPU/RAM headroom, CPU/RAM bars.
   - "show the workshop HUD", "hide workshop HUD", "workshop HUD status"
   - Actions: `workshop_hud`, `workshop_hud_on`, `workshop_hud_off`, `workshop_hud_toggle`, `workshop_hud_status`, `hide_workshop_hud`, `show_workshop_hud`
+- **Brain glow** (`core/brain_glow.py`, on by default) — the reactor's outer glow in the unified HUD, the holographic overlay and both arc reactors takes the colour of the brain that is answering: local model blue, Claude Sonnet gold, Opus violet, Haiku green, Fable rose, any other cloud model silver. It changes the moment you switch brains and per turn when a turn is really answered by the other brain (a local turn the cloud had to answer, a cloud turn that fell back to local); the brain's name shows under the reactor for a few seconds. The listening / thinking / speaking colours stay on the reactor's core. Settings: `BRAIN_GLOW_ENABLED`, `BRAIN_GLOW_LABEL_S` (Advanced → On screen), `BRAIN_GLOW_COLORS` (per-tier overrides, user_settings.json only).
+  - "what brain are you on", "what model are you using" (names the colour)
+  - Action: `current_model`
 - **Reticle overlay** (`hud/jarvis_reticle.py`) — translucent target reticle at click/type coordinates during UI automation. No voice commands.
 - **System tray applet** (`tray.py`) — arc-reactor icon tinted by listen state (green awake / gray standby / red muted) + speaking halo + upgrade-queue badge + Bambu print mark. Grouped right-click menu: common toggles + five submenus (Power tools / AI / Memory / Diagnostics / Settings) + About; the Settings submenu opens the standalone **Settings GUI** (`tools/settings_window.py`).
 

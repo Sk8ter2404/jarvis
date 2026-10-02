@@ -61,6 +61,15 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
+# Brain glow (core/brain_glow.py): hud_state's ``brain`` = the colour + brief
+# name label of the brain that is answering (local blue, Sonnet gold, Opus
+# violet...). Fail-open: a missing helper means no glow, never a dead overlay.
+try:
+    from core.brain_glow import hud_brain as _hud_brain
+except Exception:  # pragma: no cover - core/ always ships next to hud/
+    def _hud_brain(_hud, _now=None):
+        return None
+
 # ──────────────────────────────────────────────────────────────────────────
 #  Layout — sized off the monitor passed via CLI args.
 # ──────────────────────────────────────────────────────────────────────────
@@ -401,6 +410,12 @@ class HoloHUD:
             tts_amp     = float(state.get("tts_amplitude", 0.0) or 0.0)
         except (TypeError, ValueError):
             tts_amp = 0.0
+        # Brain glow — a missing / garbage ``brain`` key is None (no ring, no
+        # label: the overlay's normal look), never a raise.
+        try:
+            brain = _hud_brain(state, time.time())
+        except Exception:
+            brain = None
 
         # Night-owl mode dims the overlay. 0.0 / missing == normal opacity;
         # any positive value < 1 dims the window. Applied to the root via
@@ -504,6 +519,23 @@ class HoloHUD:
                 width=1,
             )
         # idle / standby: no halo (lets the reactor sit at rest).
+
+        # ── brain glow ring + brief label (core/brain_glow) ──
+        # A breathing ring in the answering brain's colour, between the outer
+        # action-text ring and the amber listen/speak halo, so the state glow
+        # above keeps its meaning. The label names the brain for a few
+        # seconds after it changes, fading out.
+        if brain is not None:
+            b_breath = 0.5 * (1 + math.sin(self.frame * 0.06))
+            self._ring_track(
+                self.R_GLOW - 14,
+                _mix(PANEL_COLOR, brain.color, 0.70 + 0.30 * b_breath), 2)
+            if brain.label and brain.label_alpha >= 0.15:
+                self._text_at(
+                    self.cx, self.cy - self.R_GLOW - 44, f"◆ {brain.label}",
+                    color=_mix(PANEL_COLOR, brain.color, brain.label_alpha),
+                    size=13, weight="bold",
+                )
 
         # ── status rings (CPU / RAM / Net / Credits) ──
         # Color flips ALERT on high CPU/RAM individually so the offending

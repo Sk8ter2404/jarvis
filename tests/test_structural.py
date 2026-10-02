@@ -59,6 +59,9 @@ _IMPORT_LIGHT_CORE = (
     # The local prompt budget (2026-10-01): stdlib only, imported at
     # monolith import time.
     "core.prompt_budget",
+    # Brain glow (2026-10-02): stdlib only — the HUD subprocesses import its
+    # reader, so it must load with nothing but the standard library.
+    "core.brain_glow",
 )
 
 

@@ -74,6 +74,15 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
+# Brain glow (core/brain_glow.py): hud_state's ``brain`` = the colour + brief
+# name label of the brain that is answering (local blue, Sonnet gold, Opus
+# violet...). Fail-open: a missing helper means no glow, never a dead HUD.
+try:
+    from core.brain_glow import hud_brain as _hud_brain
+except Exception:  # pragma: no cover - core/ always ships next to hud/
+    def _hud_brain(_hud, _now=None):
+        return None
+
 try:
     from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF
     from PyQt6.QtGui import (
@@ -197,6 +206,8 @@ class ArcReactorStatusScene(QGraphicsScene):
         self.state          = "idle"
         self.tts_amp        = 0.0
         self.mic_level      = 0.0
+        # Brain glow: core.brain_glow.HudBrain or None (= the normal look).
+        self.brain          = None
         # Bambu state — only drawn when active.
         self.bambu_active   = False
         self.bambu_percent  = 0
@@ -349,6 +360,11 @@ class ArcReactorStatusScene(QGraphicsScene):
             self.mic_level = float(hud.get("mic_level") or 0.0)
         except (TypeError, ValueError):
             self.mic_level = 0.0
+        # Brain glow — a missing / garbage ``brain`` key is None, never a raise.
+        try:
+            self.brain = _hud_brain(hud, time.time())
+        except Exception:
+            self.brain = None
 
         if _HAS_PSUTIL:
             try:
@@ -385,6 +401,12 @@ class ArcReactorStatusScene(QGraphicsScene):
             return CYAN_DIM
         return CYAN
 
+    def _glow_hex(self):
+        """The brain glow colour ("#RRGGBB"), or None for the normal
+        state-coloured halo (no brain published, glow off, garbage key)."""
+        col = getattr(getattr(self, "brain", None), "color", None)
+        return col if isinstance(col, str) and col else None
+
     @staticmethod
     def _color_for_metric(value: float, warn: float, crit: float) -> QColor:
         if value >= crit:
@@ -415,13 +437,17 @@ class ArcReactorStatusScene(QGraphicsScene):
         cx, cy = self.cx, self.cy
         accent = self._accent_for_state()
 
-        # ── 2. Outer cyan glow halo ───────────────────────────────────
+        # ── 2. Outer glow halo — the BRAIN's colour when one is published
+        # (core/brain_glow), else the state accent. The state colours stay
+        # on the core ring + hub (step 7), so the state still reads.
+        glow_hex = self._glow_hex()
+        halo = QColor(glow_hex) if glow_hex else accent
         glow = QRadialGradient(QPointF(cx, cy), self.R_GLOW)
-        gcol = QColor(accent)
+        gcol = QColor(halo)
         gcol.setAlpha(150)
         glow.setColorAt(0.55, QColor(0, 0, 0, 0))
         glow.setColorAt(0.85, gcol)
-        gouter = QColor(accent)
+        gouter = QColor(halo)
         gouter.setAlpha(0)
         glow.setColorAt(1.0, gouter)
         painter.setBrush(QBrush(glow))
@@ -565,6 +591,21 @@ class ArcReactorStatusScene(QGraphicsScene):
             int(Qt.AlignmentFlag.AlignCenter),
             state_label,
         )
+        # 8b. Brief brain label in the dark band between the hub and the core
+        # ring (on the filled hub it was unreadable), fading out after a
+        # brain change (core/brain_glow).
+        brain = getattr(self, "brain", None)
+        if brain is not None and brain.label and brain.label_alpha > 0.0:
+            bcol = QColor(brain.color)
+            bcol.setAlpha(int(255 * max(0.0, min(1.0, brain.label_alpha))))
+            painter.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+            painter.setPen(QPen(bcol))
+            painter.drawText(
+                QRectF(cx - self.R_CORE, cy - self.R_HUB * 1.2 - 14.0,
+                       2 * self.R_CORE, 12.0),
+                int(Qt.AlignmentFlag.AlignCenter),
+                brain.name.upper() or brain.label,
+            )
 
         # ── 9. Quadrant chip labels at the cardinal corners ───────────
         # Top, right, bottom, left — clipped to the panel so a wide
@@ -695,6 +736,10 @@ class ArcReactorStatusWindow(QWidget):
         glow_fx.setBlurRadius(32)
         glow_fx.setOffset(0, 0)
         self.view.setGraphicsEffect(glow_fx)
+        # Brain glow: the drop-shadow glow follows the brain colour too;
+        # re-tinted only when it changes.
+        self._glow_fx = glow_fx
+        self._glow_fx_hex = None
 
         self.timer = QTimer(self)
         self.timer.setInterval(TICK_MS)
@@ -706,6 +751,14 @@ class ArcReactorStatusWindow(QWidget):
         if not alive:
             self.timer.stop()
             QApplication.instance().quit()
+            return
+        try:
+            hx = self.scene._glow_hex()
+            if hx != self._glow_fx_hex:
+                self._glow_fx.setColor(QColor(hx) if hx else CYAN_BRIGHT)
+                self._glow_fx_hex = hx
+        except Exception:
+            pass
 
 
 def _print_install_hint() -> None:

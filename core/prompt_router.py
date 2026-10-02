@@ -196,6 +196,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "LOCAL MODEL SELECTION": [
         "model", "which model", "local model", "your brain", "ollama", "llm",
         "what model", "running locally",
+        # Brain glow (2026-10-02): "what brain are you on" -> current_model,
+        # which also names the HUD colour. Multi-word only: the bare word
+        # "brain" would load this section for "brainstorm".
+        "what brain", "which brain", "brain are you",
     ],
     # 2026-10-01 live: "how smart are you compared to Claude Opus 5.5" (asked
     # three times) loaded CLAUDE CREDITS + the three SMART HOME sections and

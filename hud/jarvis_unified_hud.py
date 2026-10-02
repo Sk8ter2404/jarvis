@@ -65,6 +65,15 @@ try:
 except Exception:
     pass
 
+# Brain glow (core/brain_glow.py): hud_state's ``brain`` = the colour + brief
+# name label of the brain that is answering (local blue, Sonnet gold, Opus
+# violet...). Fail-open: a missing helper means no glow, never a dead HUD.
+try:
+    from core.brain_glow import hud_brain as _hud_brain
+except Exception:  # pragma: no cover - core/ always ships next to hud/
+    def _hud_brain(_hud, _now=None):
+        return None
+
 try:
     import psutil
     _HAS_PSUTIL = True
@@ -414,6 +423,8 @@ class UnifiedHud(QWidget):
         self.tts_amp = 0.0
         self.mic_level = 0.0
         self.alert_active = False
+        # Brain glow: core.brain_glow.HudBrain or None (= the normal look).
+        self.brain = None
         # Calendar + mail come from the main process via hud_state.json (the
         # HUD subprocess must not import ms_graph — see _SlowData).
         self.next_event: dict | None = None
@@ -651,6 +662,11 @@ class UnifiedHud(QWidget):
             except (TypeError, ValueError):
                 setattr(self, attr, 0.0)
         self.alert_active = bool(hud.get("alert_active"))
+        # Brain glow — a missing / garbage ``brain`` key is None, never a raise.
+        try:
+            self.brain = _hud_brain(hud, time.time())
+        except Exception:
+            self.brain = None
         ne = hud.get("next_event")
         self.next_event = ne if isinstance(ne, dict) else None
         try:
@@ -729,6 +745,30 @@ class UnifiedHud(QWidget):
         if v >= warn:
             return AMBER
         return CYAN
+
+    def _glow_hex(self) -> str | None:
+        """The brain glow colour ("#RRGGBB"), or None for the normal
+        state-coloured halo (no brain published, glow off, garbage key)."""
+        col = getattr(getattr(self, "brain", None), "color", None)
+        return col if isinstance(col, str) and col else None
+
+    def _draw_brain_label(self, p, W, y, s) -> None:
+        """The brief brain-name label under the reactor, fading out with
+        HudBrain.label_alpha. Draws nothing without a brain or once faded."""
+        b = getattr(self, "brain", None)
+        if b is None or not getattr(b, "label", "") or b.label_alpha <= 0.0:
+            return
+        col = QColor(b.color)
+        col.setAlpha(int(255 * max(0.0, min(1.0, b.label_alpha))))
+        f = QFont("Consolas", 1)
+        f.setPixelSize(max(8, int(10 * s)))
+        f.setBold(True)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5 * s)
+        p.setFont(f)
+        p.setPen(QPen(col))
+        p.drawText(QRectF(0, y, W, 14 * s),
+                   int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                   f"◆ {b.label}")
 
     # ── interaction: drag, geometry persistence ──────────────────────────────
     def mousePressEvent(self, e) -> None:
@@ -881,6 +921,8 @@ class UnifiedHud(QWidget):
         cx = W / 2.0
         cy = reactor_top + reactor_size / 2.0
         self._draw_reactor(p, cx, cy, reactor_size * 0.42, accent, s)
+        # 3a. Brain glow label — brief, under the ring, after a brain change.
+        self._draw_brain_label(p, W, reactor_top + reactor_size - 12 * s, s)
 
         # 3b. Live camera preview — picture-in-picture in the top-right corner,
         # in the empty space beside the circular reactor, below the ✕ button.
@@ -1066,16 +1108,25 @@ class UnifiedHud(QWidget):
 
     # ── reactor ───────────────────────────────────────────────────────────────
     def _draw_reactor(self, p, cx, cy, R, accent, s) -> None:
-        # Glow halo.
+        # Glow halo — the BRAIN's colour when one is published (core/
+        # brain_glow), else the state accent. The state colours stay on the
+        # core ring + hub below, so listening/thinking/speaking still read.
+        glow_hex = self._glow_hex()
+        halo = QColor(glow_hex) if glow_hex else accent
         glow = QRadialGradient(QPointF(cx, cy), R * 1.5)
-        g0 = QColor(accent); g0.setAlpha(0)
-        g1 = QColor(accent); g1.setAlpha(120)
-        g2 = QColor(accent); g2.setAlpha(0)
+        g0 = QColor(halo); g0.setAlpha(0)
+        g1 = QColor(halo); g1.setAlpha(120)
+        g2 = QColor(halo); g2.setAlpha(0)
         glow.setColorAt(0.45, g0)
         glow.setColorAt(0.82, g1)
         glow.setColorAt(1.0, g2)
         p.setBrush(QBrush(glow)); p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(QPointF(cx, cy), R * 1.5, R * 1.5)
+        if glow_hex:
+            # A thin brain-coloured rim just outside the metric arcs.
+            rim = QColor(halo); rim.setAlpha(150)
+            p.setPen(QPen(rim, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(cx, cy), R * 1.12, R * 1.12)
 
         outer = QRectF(cx - R, cy - R, 2 * R, 2 * R)
         p.setPen(QPen(CYAN_DIM, 2)); p.setBrush(Qt.BrushStyle.NoBrush)

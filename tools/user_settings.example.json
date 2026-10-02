@@ -117,6 +117,8 @@
   "HUE_BRIDGE_IP_HINT": "",
   "HUD_ENABLED": true,
   "HUD_MONITOR": "top",
+  "BRAIN_GLOW_ENABLED": true,
+  "BRAIN_GLOW_LABEL_S": 4.0,
   "TRAY_ENABLED": true,
   "RETICLE_OVERLAY_ENABLED": true,
   "MODEL_ROUTING": {

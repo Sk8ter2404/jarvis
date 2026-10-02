@@ -505,6 +505,100 @@ class SetBrainTests(unittest.TestCase):
         self.assertNotIn("MODEL_ROUTING", store)
 
 
+# ─── brain glow: the HUD colour follows the brain (core/brain_glow.py) ──────
+class BrainGlowTests(unittest.TestCase):
+    """current_model names the HUD colour ("what brain are you on"), and
+    set_model / set_brain recolour the HUD the moment they switch."""
+
+    def setUp(self):
+        from core import brain_glow
+        self.bg = brain_glow
+        brain_glow.PUBLISHER.reset()
+        self.addCleanup(brain_glow.PUBLISHER.reset)
+        self._settings = mock.patch.object(brain_glow, "settings",
+                                           return_value=(True, 4.0, {}))
+        self._settings.start()
+        self.addCleanup(self._settings.stop)
+        # set_brain moves core.config.MODEL_ROUTING['chat'] in place too.
+        import core.config as cfg
+        routing = cfg.MODEL_ROUTING
+        saved = dict(routing)
+        self.addCleanup(lambda: (routing.clear(), routing.update(saved)))
+
+    def _bc(self, routing, backend="claude", resolved=CHAT_32B):
+        bc = _fake_monolith(resolved=resolved, routing=routing)
+        bc.AI_BACKEND = backend
+        bc.CLAUDE_MODEL = "claude-sonnet-5-5"
+        bc.writes = []
+        bc._write_hud_state = lambda **kw: bc.writes.append(kw)
+        return bc
+
+    @staticmethod
+    def _brains(bc):
+        return [w["brain"] for w in bc.writes if "brain" in w]
+
+    def test_current_model_local_names_blue(self):
+        bc = self._bc({"chat": "local"})
+        with _MonolithCtx(bc):
+            out = M.current_model()
+        self.assertIn("qwen 32B", out)
+        self.assertIn("blue", out)
+
+    def test_current_model_cloud_names_the_model_and_gold(self):
+        bc = self._bc({"chat": "cloud"})
+        with _MonolithCtx(bc):
+            out = M.current_model()
+        self.assertIn("Sonnet 5.5", out)
+        self.assertIn("gold", out)
+        self.assertNotIn("locally", out.lower())
+
+    def test_current_model_auto_names_both_colours(self):
+        bc = self._bc({"chat": "auto"})
+        with _MonolithCtx(bc):
+            out = M.current_model()
+        self.assertIn("gold", out)
+        self.assertIn("blue", out)
+
+    def test_current_model_says_no_colour_when_glow_is_off(self):
+        bc = self._bc({"chat": "local"})
+        with _MonolithCtx(bc), mock.patch.object(
+                self.bg, "settings", return_value=(False, 4.0, {})):
+            out = M.current_model()
+        self.assertNotIn("blue", out)
+        self.assertNotIn("glow", out)
+
+    def test_set_brain_cloud_recolours_the_hud(self):
+        bc = self._bc({"chat": "local"}, backend="ollama")
+        with _MonolithCtx(bc), _patch_persist({}):
+            M.set_brain("cloud")
+        last = self._brains(bc)[-1]
+        self.assertEqual((last["route"], last["tier"], last["source"]),
+                         ("cloud", "sonnet", "switch"))
+
+    def test_set_brain_local_recolours_the_hud(self):
+        bc = self._bc({"chat": "cloud"})
+        with _MonolithCtx(bc), _patch_persist({}):
+            M.set_brain("local")
+        last = self._brains(bc)[-1]
+        self.assertEqual((last["route"], last["model"]), ("local", CHAT_32B))
+
+    def test_set_model_on_the_local_route_recolours_the_hud(self):
+        bc = self._bc({"chat": "local"}, resolved=CHAT_14B)
+        with _patch_tags(), _MonolithCtx(bc), _patch_persist({}), \
+                mock.patch.object(M, "_sync_vision_to_chat"):
+            M.set_model("8b")
+        last = self._brains(bc)[-1]
+        self.assertEqual((last["route"], last["model"]), ("local", CHAT_8B))
+
+    def test_set_model_while_on_claude_keeps_the_cloud_glow(self):
+        # The local tag changed, but the next turn is still served by Claude.
+        bc = self._bc({"chat": "cloud"}, resolved=CHAT_14B)
+        with _patch_tags(), _MonolithCtx(bc), _patch_persist({}), \
+                mock.patch.object(M, "_sync_vision_to_chat"):
+            M.set_model("8b")
+        self.assertTrue(all(b["route"] == "cloud" for b in self._brains(bc)))
+
+
 # ─── _persist_setting REUSES the Settings-GUI writer (no real file) ─────────
 class PersistReuseTests(unittest.TestCase):
     """Prove the persistence path calls tools.settings_window.save_settings
