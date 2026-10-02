@@ -1269,3 +1269,39 @@ class WordBoundaryKeywordRoutingTests(unittest.TestCase):
         self.assertFalse(hit("", " anything "))
         # A later word-start occurrence still counts after a mid-word one.
         self.assertTrue(hit("phone", " microphone or phone "))
+
+
+class RunningCostsRoutingTests(unittest.TestCase):
+    """'How much does it cost to run you' asks what JARVIS COSTS to run
+    (running_costs: electricity + session cloud spend), not the account
+    BALANCE (check_credits, which drives a browser to the billing page). Both
+    directions must reach the local model with the right action, and the
+    prompt must teach which phrase is which."""
+
+    COSTS = ("how much does it cost to run you", "what do you cost",
+             "running costs", "how much do you cost per month")
+    CREDITS = ("how many credits do I have", "check my Anthropic balance")
+
+    # The always-shipped core preamble names check_credits in passing, so a
+    # bare name proves nothing; the section's own example must be there.
+    def test_cost_phrases_ship_running_costs(self):
+        for q in self.COSTS:
+            with self.subTest(q=q):
+                self.assertIn("[ACTION: running_costs]",
+                              pr.slim_pc_control(q, FULL))
+
+    def test_credit_phrases_still_ship_check_credits(self):
+        for q in self.CREDITS:
+            with self.subTest(q=q):
+                self.assertIn("[ACTION: check_credits]",
+                              pr.slim_pc_control(q, FULL))
+
+    def test_prompt_examples_map_each_phrase_to_its_own_action(self):
+        examples = {phrase.lower(): action for phrase, action in
+                    _ARROW_EXAMPLE_RE.findall(" ".join(FULL.split()))}
+        self.assertEqual(examples.get("how much does it cost to run you"),
+                         "running_costs")
+        self.assertEqual(examples.get("how much do you cost per month"),
+                         "running_costs")
+        for q in self.CREDITS:
+            self.assertEqual(examples.get(q.lower()), "check_credits", q)

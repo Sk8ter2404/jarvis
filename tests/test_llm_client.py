@@ -197,5 +197,103 @@ class LogCacheUsageTests(unittest.TestCase):
         self.assertEqual(llm.last_usage["cache_creation"], 0)
 
 
+
+class _Usage:
+    def __init__(self, inp=0, out=0, read=0, write=0):
+        self.input_tokens = inp
+        self.output_tokens = out
+        self.cache_read_input_tokens = read
+        self.cache_creation_input_tokens = write
+
+
+class _UsageMsg(_FakeMsg):
+    def __init__(self, text, usage):
+        super().__init__(text)
+        self.usage = usage
+
+
+class _UsageStream(_FakeStream):
+    def __init__(self, chunks, usage):
+        super().__init__(chunks)
+        self._usage = usage
+
+    def get_final_message(self):
+        return _UsageMsg("".join(self.text_stream), self._usage)
+
+
+class _UsageMessages:
+    def __init__(self, usage):
+        self._usage = usage
+
+    def create(self, **kwargs):
+        return _UsageMsg("hello sir", self._usage)
+
+    def stream(self, **kwargs):
+        return _UsageStream(["Hello", " sir"], self._usage)
+
+
+class _UsageClient:
+    def __init__(self, usage):
+        self.messages = _UsageMessages(usage)
+
+
+class SessionUsageTests(unittest.TestCase):
+    """session_usage: the per-model token tally running_costs prices."""
+
+    def setUp(self):
+        p = mock.patch.object(llm, "session_usage", {})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _create(self, model, usage):
+        return llm.create_message(_UsageClient(usage), model=model,
+                                  max_tokens=10, messages=[])
+
+    def test_create_message_tallies_per_base_model(self):
+        self._create("claude-sonnet-5-5-20261001", _Usage(100, 20, 5000, 300))
+        self._create("claude-sonnet-5-5", _Usage(50, 10))
+        self._create("claude-haiku-4-5", _Usage(7, 3))
+        self.assertEqual(llm.session_usage_snapshot(), {
+            "claude-sonnet-5-5": {"calls": 2, "input": 150, "output": 30,
+                                  "cache_read": 5000, "cache_write": 300},
+            "claude-haiku-4-5": {"calls": 1, "input": 7, "output": 3,
+                                 "cache_read": 0, "cache_write": 0},
+        })
+
+    def test_complete_counts_each_reply_once(self):
+        with mock.patch.object(llm, "_client",
+                               return_value=_UsageClient(_Usage(40, 4))):
+            llm.complete(model="claude-haiku-4-5", messages=[])
+        row = llm.session_usage_snapshot()["claude-haiku-4-5"]
+        self.assertEqual((row["calls"], row["input"], row["output"]),
+                         (1, 40, 4))
+
+    def test_stream_text_counts_the_final_message_once(self):
+        with mock.patch.object(llm, "_client",
+                               return_value=_UsageClient(_Usage(60, 6, 900))):
+            out = llm.stream_text(model="claude-haiku-4-5", messages=[])
+        self.assertEqual(out, "Hello sir")
+        row = llm.session_usage_snapshot()["claude-haiku-4-5"]
+        self.assertEqual((row["calls"], row["input"], row["cache_read"]),
+                         (1, 60, 900))
+
+    def test_replies_without_token_counts_record_nothing(self):
+        cap = {}
+        with _patch(cap):
+            llm.complete(model="m", messages=[])         # no usage block
+            llm.stream_text(model="m", messages=[])      # no final message
+        llm.create_message(_FakeClient(cap, []), model="m", messages=[])
+        self._create("m", mock.MagicMock())               # not integers
+        self._create("m", _Usage())                       # all zero
+        self.assertEqual(llm.session_usage_snapshot(), {})
+
+    def test_snapshot_is_a_copy(self):
+        self._create("claude-haiku-4-5", _Usage(1, 1))
+        snap = llm.session_usage_snapshot()
+        snap["claude-haiku-4-5"]["calls"] = 99
+        self.assertEqual(
+            llm.session_usage_snapshot()["claude-haiku-4-5"]["calls"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

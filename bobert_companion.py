@@ -28909,6 +28909,8 @@ ACTIONS = {
     "llm_costs":          _act_model_costs,
     "model_prices":       _act_model_costs,
     "compare_models":     _act_model_costs,
+    # What it costs to RUN JARVIS: electricity estimate + session cloud spend
+    "running_costs":      _act_running_costs,
     "clear_llm_cache":    _act_clear_llm_cache,
     # Memory submenu
     "show_recent_facts":  _act_show_recent_facts,
@@ -30638,6 +30640,8 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     #   * check_for_updates (+aliases) → core.update_checker.update_message(), always
     #     a sentence; update-awareness was mute on success.
     #   * model_costs (+aliases) → core.model_catalog.format_catalog() readout.
+    #   * running_costs → core.running_costs.report(), three finished sentences
+    #     (electricity estimate, session cloud spend, verdict).
     #   * morning_briefing → the built briefing text (the AUTO path _enqueue_speech()s
     #     the same text; the MANUAL action returned it unspoken AND marked the day
     #     fired, suppressing the auto-briefing — so it was doubly dropped).
@@ -30648,6 +30652,7 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "wake_word_mode_status",
     "check_for_updates", "check_updates", "is_there_an_update",
     "model_costs", "llm_costs", "model_prices", "compare_models",
+    "running_costs",
     "morning_briefing",
     "smart_home_control", "control_device", "control_smart_home",
     "smart_home_router_status",

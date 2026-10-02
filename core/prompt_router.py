@@ -201,6 +201,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "CLAUDE CREDITS": [
         "claude", "credit", "credits", "api", "quota", "budget", "cost",
         "spending", "usage", "token",
+        # check_credits' 'check my Anthropic balance' loaded nothing; the
+        # running_costs phrasings are spelled out so they never ride on the
+        # bare "cost" alone.
+        "anthropic", "running cost", "cost to run", "you cost",
+        "electricity", "power bill",
     ],
     "SYSTEM HEALTH": [
         "health", "cpu", "gpu", "ram", "memory usage", "disk", "temperature",
