@@ -996,6 +996,100 @@ class BootstrapTests(_StateIsolatedTest):
         self.assertIn("ready wait failed", m._state["errors"]["slow"])
 
 
+class BootstrapFailureTests(_StateIsolatedTest):
+    """Audit A45: an exception in the owner's bring-up must not strand the
+    claim. bootstrapped was set and a fresh bootstrap_done event created
+    BEFORE _start_loop_thread(), but the event was only set on success, so
+    after one raise every later bootstrap() -- mcp_reload included -- waited
+    the full _BOOTSTRAP_WAIT_TIMEOUT (90 s) and returned an empty catalog,
+    forever."""
+
+    CFG = {"fs": {"command": "npx", "prefix": "fs"}}
+
+    def setUp(self):
+        super().setUp()
+        m._state["bootstrap_done"] = None
+
+    @staticmethod
+    def _loop_dies(*a, **k):
+        raise RuntimeError("mcp asyncio loop failed to start within 5s")
+
+    @staticmethod
+    def _rcts_ok(coro, loop):
+        coro.close()
+        return FakeFuture(result=(object(), object()))
+
+    def _patches(self, start_loop):
+        return (mock.patch.object(m, "_mcp_imports", return_value=_make_imports()),
+                mock.patch.object(m, "_read_config", return_value=self.CFG),
+                mock.patch.object(m, "_start_loop_thread", side_effect=start_loop),
+                mock.patch.object(m.asyncio, "run_coroutine_threadsafe",
+                                  side_effect=self._rcts_ok))
+
+    def test_loop_start_failure_releases_the_claim_and_the_waiters(self):
+        p1, p2, p3, p4 = self._patches(self._loop_dies)
+        with p1, p2, p3, p4:
+            with self.assertRaises(RuntimeError):   # the caller still hears it
+                m.bootstrap()
+        evt = m._state["bootstrap_done"]
+        self.assertIsNotNone(evt)
+        self.assertTrue(evt.is_set(), "waiters left blocked on the done event")
+        self.assertFalse(m._state["bootstrapped"],
+                         "claim stranded: a retry can never run the bring-up")
+
+    def test_reload_after_a_failed_bootstrap_retries_instead_of_hanging(self):
+        import threading
+        attempts = {"n": 0}
+
+        def start_loop(*a, **k):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                self._loop_dies()
+            m._state["tools"]["fs"] = [FakeTool("read_file", "Read a file.")]
+            return FakeLoop()
+
+        returned = {}
+        p1, p2, p3, p4 = self._patches(start_loop)
+        with p1, p2, p3, p4, \
+             mock.patch.object(m, "_BOOTSTRAP_WAIT_TIMEOUT", 3.0):
+            with self.assertRaises(RuntimeError):
+                m.bootstrap()
+
+            def reload_call():
+                returned["catalog"] = m.bootstrap()
+
+            t = threading.Thread(target=reload_call, daemon=True)
+            t.start()
+            t.join(timeout=1.5)
+            hung = t.is_alive()
+            t.join(timeout=5.0)        # never leave the thread behind the patches
+        self.assertFalse(hung, "second bootstrap() blocked on the done event")
+        self.assertEqual(attempts["n"], 2, "the bring-up was not retried")
+        self.assertEqual([c["action_name"] for c in returned["catalog"]],
+                         ["mcp_fs_read_file"])
+        self.assertTrue(m._state["bootstrap_done"].is_set())
+
+    def test_catalog_failure_after_launch_still_releases_waiters(self):
+        # Servers are already running here, so the claim is KEPT (a retry must
+        # not spawn every server a second time) -- but waiters are released.
+        p1, p2, p3, p4 = self._patches(lambda *a, **k: FakeLoop())
+        with p1, p2, p3, p4, \
+             mock.patch.object(m, "_build_catalog",
+                               side_effect=RuntimeError("catalog boom")):
+            with self.assertRaises(RuntimeError):
+                m.bootstrap()
+        self.assertTrue(m._state["bootstrap_done"].is_set())
+        self.assertTrue(m._state["bootstrapped"])
+        self.assertIn("fs", m._state["shutdown_events"])
+
+    def test_success_still_sets_the_event_once(self):
+        p1, p2, p3, p4 = self._patches(lambda *a, **k: FakeLoop())
+        with p1, p2, p3, p4:
+            m.bootstrap()
+        self.assertTrue(m._state["bootstrap_done"].is_set())
+        self.assertTrue(m._state["bootstrapped"])
+
+
 # ──────────────────────────────────────────────────────────────────────
 # _log_bootstrap_summary
 # ──────────────────────────────────────────────────────────────────────

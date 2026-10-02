@@ -388,46 +388,67 @@ def bootstrap() -> list[dict]:
             done_evt.wait(timeout=_BOOTSTRAP_WAIT_TIMEOUT)
         return _build_catalog()
 
-    loop = _start_loop_thread()
+    # The owner path runs inside try/finally. An exception anywhere in it (the
+    # loop thread not starting within 5 s, a catalog build error) used to leave
+    # `bootstrapped` claimed and the done event never set, so every later
+    # bootstrap() -- mcp_reload included -- waited _BOOTSTRAP_WAIT_TIMEOUT
+    # (90 s) and got an empty catalog, for the rest of the run (audit A45).
+    launched = False
+    try:
+        loop = _start_loop_thread()
 
-    for name, server_cfg in cfg.items():
-        if not isinstance(server_cfg, dict):
-            continue
-        if not server_cfg.get("enabled", True):
-            continue
-        # Schedule the per-server task on the loop and wait for ready.
-        try:
-            spawn_fut = asyncio.run_coroutine_threadsafe(
-                _spawn_server(imports, name, server_cfg), loop,
-            )
-            ready_event, shutdown_event = spawn_fut.result(timeout=10.0)
-        except Exception as e:
-            _log.warning("[mcp] failed to launch '%s': %s", name, e)
+        for name, server_cfg in cfg.items():
+            if not isinstance(server_cfg, dict):
+                continue
+            if not server_cfg.get("enabled", True):
+                continue
+            # Schedule the per-server task on the loop and wait for ready.
+            try:
+                spawn_fut = asyncio.run_coroutine_threadsafe(
+                    _spawn_server(imports, name, server_cfg), loop,
+                )
+                ready_event, shutdown_event = spawn_fut.result(timeout=10.0)
+            except Exception as e:
+                _log.warning("[mcp] failed to launch '%s': %s", name, e)
+                with _lock:
+                    _state["errors"][name] = f"launch failed: {e}"
+                continue
+
             with _lock:
-                _state["errors"][name] = f"launch failed: {e}"
-            continue
+                _state["shutdown_events"][name] = shutdown_event
+            launched = True
 
-        with _lock:
-            _state["shutdown_events"][name] = shutdown_event
+            # Wait for the server to report ready (or fail) before moving on.
+            try:
+                wait_fut = asyncio.run_coroutine_threadsafe(
+                    _wait_event(ready_event, _SERVER_READY_TIMEOUT), loop,
+                )
+                wait_fut.result(timeout=_SERVER_READY_TIMEOUT + 2.0)
+            except Exception as e:
+                _log.warning("[mcp] '%s' did not become ready: %s", name, e)
+                with _lock:
+                    _state["errors"].setdefault(name, f"ready wait failed: {e}")
 
-        # Wait for the server to report ready (or fail) before moving on.
-        try:
-            wait_fut = asyncio.run_coroutine_threadsafe(
-                _wait_event(ready_event, _SERVER_READY_TIMEOUT), loop,
-            )
-            wait_fut.result(timeout=_SERVER_READY_TIMEOUT + 2.0)
-        except Exception as e:
-            _log.warning("[mcp] '%s' did not become ready: %s", name, e)
+        catalog = _build_catalog()
+        _log_bootstrap_summary(cfg, catalog)
+    except Exception as e:
+        _log.warning("[mcp] bootstrap failed: %s", e)
+        if not launched:
+            # Nothing was started, so release the claim: the next
+            # bootstrap() / mcp_reload runs the bring-up again. Once a server
+            # is running the claim stays, or a retry would spawn every server
+            # a second time.
             with _lock:
-                _state["errors"].setdefault(name, f"ready wait failed: {e}")
-
-    catalog = _build_catalog()
-    _log_bootstrap_summary(cfg, catalog)
-    # Bring-up done — release any callers that arrived mid-bootstrap and have
-    # been waiting on the complete catalog. (Set unconditionally so a partial /
-    # error bring-up still unblocks waiters rather than stranding them.)
-    if _state["bootstrap_done"] is not None:
-        _state["bootstrap_done"].set()
+                if _state["bootstrap_done"] is done_evt:
+                    _state["bootstrapped"] = False
+                    _state["started_at"] = None
+        raise
+    finally:
+        # Bring-up done — release any callers that arrived mid-bootstrap and
+        # have been waiting on the complete catalog. (Set unconditionally so a
+        # partial / error bring-up still unblocks waiters rather than
+        # stranding them.)
+        done_evt.set()
     return catalog
 
 
