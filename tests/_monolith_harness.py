@@ -562,8 +562,37 @@ def _restore_monolith_pristine(bc) -> None:
         bc._prompt_budget.OBSERVED_WINDOW.clear()
     except Exception:
         pass
+    # Process-wide state three 2026-10-02 branches added, which the per-test
+    # restore did not know about (integration audit, claude/integrate-1002):
+    #  * the retired-model guard (core.claude_model_guard.GUARD): a model one
+    #    test marked gone would make a LATER test's Claude call raise
+    #    RetiredModelError, and the turn checker's 'on' retry stand down;
+    #  * R5's once-per-caller untagged-call set: a caller one test logged
+    #    would hide the same line from a LATER test;
+    #  * the turn checker's shadow worker queue: a check one test queued
+    #    would run (and write its row) during a LATER test. Drained, bounded.
+    try:
+        from core.claude_model_guard import GUARD as _model_guard
+        _model_guard.reset()
+    except Exception:
+        pass
+    try:
+        bc._untagged_local_seen.clear()
+    except Exception:
+        pass
+    # A worker wedged by some test would cost every LATER test the full bound,
+    # so one timeout switches the drain off for the rest of the process.
+    try:
+        if _TURN_CHECK_DRAIN[0] and not bc._turn_check_flush(2.0):
+            _TURN_CHECK_DRAIN[0] = False
+            print("[monolith-harness] the turn-check worker did not drain "
+                  "in 2 s - no longer draining it between tests",
+                  file=sys.stderr)
+    except Exception:
+        pass
 
 
+_TURN_CHECK_DRAIN = [True]
 _MISSING = object()
 
 
