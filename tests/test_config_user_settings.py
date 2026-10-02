@@ -283,6 +283,123 @@ class UnreadableFileTests(unittest.TestCase):
                       "user_settings.json into the session log")
 
 
+class SafetyListFloorTests(unittest.TestCase):
+    """Audit P3-2: the list branch REPLACED a list wholesale, so a saved
+    "CONFIRM_KEYWORDS": [] (a bad hand edit, a half-written file) made
+    _needs_confirmation return False for every purchase/delete/format, in
+    silence. The shipped entries are now a floor a saved file can add to but
+    never remove, and a save that would shrink a safety list is reported."""
+
+    SHIPPED_CONFIRM = ("purchase", "buy", "pay", "checkout", "delete",
+                       "format", "transfer")
+
+    def setUp(self):
+        self._orig = {k: list(getattr(cfg, k)) for k in
+                      ("CONFIRM_KEYWORDS", "SCREENSHOT_PRIVACY_BLOCKLIST")}
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(cfg, k, v)
+        if hasattr(cfg, "_SAFETY_SETTINGS_WARNINGS"):
+            cfg._SAFETY_SETTINGS_WARNINGS[:] = []
+
+    def _apply(self, fake: dict) -> str:
+        import contextlib
+        import io
+        err = io.StringIO()
+        m = mock.mock_open(read_data=json.dumps(fake))
+        with mock.patch("core.config.os.path.exists", return_value=True), \
+                mock.patch("core.config.open", m, create=True), \
+                contextlib.redirect_stderr(err):
+            cfg._apply_user_settings()
+        return err.getvalue()
+
+    def _warnings(self) -> str:
+        return "\n".join(getattr(cfg, "_SAFETY_SETTINGS_WARNINGS", None) or [])
+
+    def test_empty_confirm_list_keeps_every_shipped_keyword(self):
+        err = self._apply({"CONFIRM_KEYWORDS": []})
+        for kw in self.SHIPPED_CONFIRM:
+            self.assertIn(kw, cfg.CONFIRM_KEYWORDS,
+                          "an empty saved list removed a purchase/delete guard")
+        self.assertIn("CONFIRM_KEYWORDS", err)
+        self.assertIn("CONFIRM_KEYWORDS", self._warnings())
+
+    def test_partial_list_cannot_drop_one_and_says_which(self):
+        kept = [k for k in self.SHIPPED_CONFIRM if k != "pay"]
+        err = self._apply({"CONFIRM_KEYWORDS": kept})
+        self.assertIn("pay", cfg.CONFIRM_KEYWORDS)
+        self.assertIn("pay", err)
+        self.assertIn("pay", self._warnings())
+
+    def test_a_superset_save_adds_entries_without_a_warning(self):
+        saved = [k.upper() if k == "buy" else k for k in self.SHIPPED_CONFIRM]
+        err = self._apply({"CONFIRM_KEYWORDS": saved + ["wire", "uninstall"]})
+        self.assertEqual(cfg.CONFIRM_KEYWORDS,
+                         list(self.SHIPPED_CONFIRM) + ["wire", "uninstall"])
+        self.assertIsInstance(cfg.CONFIRM_KEYWORDS, list)
+        self.assertNotIn("CONFIRM_KEYWORDS", err)
+        self.assertEqual(self._warnings(), "")
+
+    def test_an_extras_only_save_is_unioned_and_reported(self):
+        # Under the old replace semantics this save dropped six keywords.
+        self._apply({"CONFIRM_KEYWORDS": ["wire", "buy"]})
+        self.assertEqual(cfg.CONFIRM_KEYWORDS,
+                         list(self.SHIPPED_CONFIRM) + ["wire"])
+        self.assertIn("delete", self._warnings())
+        self.assertNotIn("buy,", self._warnings())
+
+    def test_non_string_entries_are_dropped_not_crashing_the_gate(self):
+        # _needs_confirmation calls kw.lower(): a null/number entry would raise
+        # inside the confirmation gate.
+        self._apply({"CONFIRM_KEYWORDS": [None, 5, "", "  ", "wire"]})
+        self.assertTrue(all(isinstance(k, str) and k.strip()
+                            for k in cfg.CONFIRM_KEYWORDS))
+        self.assertIn("wire", cfg.CONFIRM_KEYWORDS)
+        self.assertIn("delete", cfg.CONFIRM_KEYWORDS)
+
+    def test_non_list_value_is_ignored_and_reported(self):
+        err = self._apply({"CONFIRM_KEYWORDS": "none"})
+        self.assertEqual(cfg.CONFIRM_KEYWORDS, self._orig["CONFIRM_KEYWORDS"])
+        self.assertIn("CONFIRM_KEYWORDS", err)
+        self.assertIn("not a list", self._warnings())
+
+    def test_blocklist_entries_still_apply(self):
+        self._apply({"SCREENSHOT_PRIVACY_BLOCKLIST": ["1password", "banking"]})
+        self.assertEqual(cfg.SCREENSHOT_PRIVACY_BLOCKLIST,
+                         ["1password", "banking"])
+        self.assertEqual(self._warnings(), "")
+
+    def test_the_floor_itself_is_not_overridable(self):
+        # Underscore-prefixed, so the apply loop skips it like every _ key.
+        self._apply({"_SAFETY_LIST_BASELINE": {"CONFIRM_KEYWORDS": []},
+                     "CONFIRM_KEYWORDS": []})
+        self.assertIn("delete", cfg.CONFIRM_KEYWORDS)
+
+    def test_a_clean_file_clears_old_warnings(self):
+        self._apply({"CONFIRM_KEYWORDS": []})
+        self.assertTrue(self._warnings())
+        self._apply({})
+        self.assertEqual(self._warnings(), "")
+
+    def test_session_log_repeats_the_warnings(self):
+        # Printed at config import, before setup_logging() opens the session
+        # log (and lost entirely under pythonw) -- setup_logging repeats them.
+        import ast
+        import os
+        path = os.path.join(os.path.dirname(os.path.dirname(cfg.__file__)),
+                            "bobert_companion.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "setup_logging")
+        names = {getattr(n, "attr", None) or getattr(n, "value", None)
+                 for n in ast.walk(fn)}
+        self.assertIn("_SAFETY_SETTINGS_WARNINGS", names,
+                      "setup_logging() never repeats a shrunk safety list "
+                      "into the session log")
+
+
 class ModelRoutingTests(unittest.TestCase):
     def test_model_route_default_and_lookup(self):
         self.assertEqual(cfg.model_route("nonexistent_fn"), "auto")

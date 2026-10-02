@@ -131,8 +131,8 @@ BARGE_IN_ENABLED = True
 
 # ─── Safety: hard confirmation keywords ────────────────────────────────
 # Actions matching these always require spoken confirmation ("yes" or
-# "confirm" as the next utterance) before executing. Set to [] to
-# disable (NOT recommended).
+# "confirm" as the next utterance) before executing. user_settings.json can
+# ADD keywords but never remove these (see _SAFETY_LIST_BASELINE, 2026-10-01).
 CONFIRM_KEYWORDS = ["purchase", "buy", "pay", "checkout", "delete", "format", "transfer"]
 
 
@@ -1831,6 +1831,60 @@ def _report_user_settings_failure(path: str, why: str) -> None:
         pass
 
 
+# ── Safety lists: a saved file may ADD entries, never remove shipped ones ──
+# Audit P3-2, 2026-10-01. The list branch below REPLACES a list wholesale, so a
+# saved "CONFIRM_KEYWORDS": [] (a bad hand edit, a half-written file) made
+# bobert_companion._needs_confirmation return False for EVERY purchase, delete
+# and format — with nothing said. The shipped entries, captured HERE before the
+# apply at the bottom of this file, are a floor: a saved list is unioned onto
+# them, and a save that leaves one out (or isn't a list at all) is reported on
+# stderr and kept in _SAFETY_SETTINGS_WARNINGS for setup_logging to repeat into
+# the session log. Underscore-prefixed, so the apply loop can't override the
+# floor itself. SCREENSHOT_PRIVACY_BLOCKLIST ships empty (opt-in), so its floor
+# is empty today; the entries the owner adds still apply unchanged.
+_SAFETY_LIST_BASELINE = {
+    "CONFIRM_KEYWORDS": tuple(CONFIRM_KEYWORDS),
+    "SCREENSHOT_PRIVACY_BLOCKLIST": tuple(SCREENSHOT_PRIVACY_BLOCKLIST),
+}
+_SAFETY_SETTINGS_WARNINGS: list = []
+
+
+def _warn_safety_setting(msg: str) -> None:
+    _SAFETY_SETTINGS_WARNINGS.append(msg)
+    try:
+        import sys
+        print(f"[config] WARNING: {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _merge_safety_list(key: str, val, cur):
+    """The value `key` gets from a saved `val`: the shipped floor plus every
+    saved non-blank string not already in it (case-insensitive). A non-list
+    `val` keeps `cur`. Either way a save that would shrink the list is
+    reported, naming what it left out."""
+    base = list(_SAFETY_LIST_BASELINE[key])
+    if not isinstance(val, (list, tuple)):
+        _warn_safety_setting(
+            f"{key} in user_settings.json is a {type(val).__name__}, not a "
+            f"list — ignored; the built-in safety list stays in force.")
+        return cur
+    saved = [v for v in val if isinstance(v, str) and v.strip()]
+    seen = {b.strip().lower() for b in base}
+    merged = list(base)
+    for v in saved:
+        if v.strip().lower() not in seen:
+            seen.add(v.strip().lower())
+            merged.append(v)
+    wanted = {v.strip().lower() for v in saved}
+    left_out = [b for b in base if b.strip().lower() not in wanted]
+    if left_out:
+        _warn_safety_setting(
+            f"{key} in user_settings.json leaves out {', '.join(left_out)} — "
+            f"built-in safety entries can't be removed, so they stay on.")
+    return type(cur)(merged) if isinstance(cur, (list, tuple)) else merged
+
+
 # Safe + best-effort (the second import-time I/O in this file, after
 # RAG_INDEX_PATHS): we override ONLY a constant that already exists here — so the
 # GUI's schema, which is curated FROM this file, is the allow-list — coerce to
@@ -1840,6 +1894,7 @@ def _report_user_settings_failure(path: str, why: str) -> None:
 def _apply_user_settings() -> None:
     global _USER_SETTINGS_ERROR
     _USER_SETTINGS_ERROR = None
+    _SAFETY_SETTINGS_WARNINGS[:] = []
     path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "data", "user_settings.json")
@@ -1873,6 +1928,9 @@ def _apply_user_settings() -> None:
         if key.startswith("_") or key not in g or key in _ENV_ONLY_KEYS:
             continue          # existing public, non-secret constants only
         cur = g[key]
+        if key in _SAFETY_LIST_BASELINE:
+            g[key] = _merge_safety_list(key, val, cur)
+            continue
         # int|None knobs (current value None or a non-bool int) — e.g.
         # MICROPHONE_INDEX / SPEAKER_INDEX — accept an explicit null/blank as
         # "clear to None" (auto / system-default lookup). A None DEFAULT carries

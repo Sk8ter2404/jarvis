@@ -3875,6 +3875,9 @@ def setup_logging():
         _us_err = getattr(_cfg_us, "_USER_SETTINGS_ERROR", None)
         if _us_err:
             print(f"  [config] WARNING: {_us_err}")
+        # Audit P3-2: a saved safety list that tried to shrink (or wasn't a list).
+        for _us_warn in getattr(_cfg_us, "_SAFETY_SETTINGS_WARNINGS", None) or ():
+            print(f"  [config] WARNING: {_us_warn}")
     except Exception:
         pass
 
