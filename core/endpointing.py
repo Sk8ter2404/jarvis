@@ -42,6 +42,13 @@ model is located with importlib.util.find_spec, which never imports
 faster_whisper. Importing this module therefore pulls in nothing beyond the
 stdlib (tests/test_endpointing.py pins that); EotDecider itself is pure Python
 and never imports anything.
+
+R6 (Parakeet, STT_ENGINE='parakeet') asks one more question of the same
+detector, speech_in_head(): does the clip's first 0.8 s hold speech? Its
+wake-word rescue (core/stt_parakeet.rescue_reason) uses the answer; nothing
+else does, and None (cannot tell) makes the rescue run. Like
+speech_tail_ms() it never raises and follows the same latch-off rules. It is
+asked only when STT_ENGINE is 'parakeet'.
 """
 from __future__ import annotations
 
@@ -241,6 +248,35 @@ class SileroVad:
         if hits.size == 0:
             return None
         return start + (int(hits[-1]) + 1) * WINDOW
+
+    def speech_in_head(self, audio, head_s: float = 0.8,
+                       sample_rate: int = SAMPLE_RATE) -> "bool | None":
+        """Does the clip's first `head_s` seconds hold speech? True when any
+        whole window there scores at or above SPEECH_THRESHOLD, False when
+        none does. None when the clip is not 16 kHz mono float audio, holds
+        less than one window, or the detector is unusable. Speed plan R6's
+        wake-word rescue (core/stt_parakeet.rescue_reason) asks this: did the
+        owner start talking right away, as he does when he says "JARVIS"?
+        About 25 windows for 0.8 s. Never raises."""
+        try:
+            if self._failed or int(sample_rate) != SAMPLE_RATE:
+                return None
+            import numpy as np
+            a = np.asarray(audio, dtype=np.float32)
+            if a.ndim != 1:
+                if a.ndim == 2 and 1 in a.shape:
+                    a = a.reshape(-1)
+                else:
+                    return None
+            n = min(len(a), int(float(head_s) * SAMPLE_RATE)) // WINDOW * WINDOW
+            if n < WINDOW:
+                return None
+            probs = self._probs(np.ascontiguousarray(a[:n]), None)
+            if probs is None:
+                return None
+            return bool(np.any(probs >= SPEECH_THRESHOLD))
+        except Exception:
+            return None
 
     def speech_tail_ms(self, audio, sample_rate: int = SAMPLE_RATE
                        ) -> "int | None":

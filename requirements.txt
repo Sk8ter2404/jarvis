@@ -73,6 +73,7 @@ pyttsx3
 # optional: langchain_anthropic      # pip: langchain-anthropic — alt LLM backend
 # optional: diffusers                # Stable Diffusion image gen (skills/image_gen)
 # optional: google_nest_sdm          # pip: google-nest-sdm — Nest smart-home (skills/sh_nest)
+# optional: onnx_asr                 # pip: onnx-asr — Parakeet STT on the CPU (core/stt_parakeet, STT_ENGINE / STT_SHADOW)
 
 # Streaming realtime voice pipeline (core/realtime_voice.py). OPTIONAL.
 # RealtimeSTT delivers partial Whisper transcripts + VAD endpointing in

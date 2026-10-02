@@ -58,7 +58,12 @@ lead_dropped (NOTE_FIELDS; ``-`` = not measured on this turn):
   clip_ms        length of the clip handed to STT (pre-roll included).
   stt_wait_ms    how long transcribe() waited for _stt_lock (an ambient
                  decode holding Whisper), the turn's own capture only.
-  stt_engine     reserved (R6): which engine decoded the owner's capture.
+  stt_engine     R6 (STT_ENGINE='parakeet' only): which engine's transcript
+                 the turn used — parakeet, parakeet-rescued (Parakeet's text
+                 was empty or lost the wake word; Whisper decoded again),
+                 whisper-fallback (Parakeet failed and latched off on this
+                 capture) or whisper (latched off earlier). ``-`` on the
+                 default Whisper path, shadow mode included.
   load_ms        Ollama load_duration of the answering local-LLM response.
   total_ms       Ollama total_duration of the same response.
   play_open_ms   the answer's first playback, from entering the playback body

@@ -165,6 +165,40 @@ class SpeechTailTests(unittest.TestCase):
         self.assertIsNotNone(v.speech_tail_ms(a))
 
 
+class SpeechInHeadTests(unittest.TestCase):
+    """speech_in_head (speed plan R6): the wake-word rescue's question —
+    does the clip's first 0.8 s hold speech?"""
+
+    def test_speech_at_the_start_is_true(self):
+        v, sess, _ = _vad()
+        self.assertIs(v.speech_in_head(_clip(1.0, 1.0, lead_s=0.2)), True)
+        # Only the head was scored: 0.8 s = 25 whole windows.
+        self.assertEqual(len(sess.batches), 1)
+        self.assertEqual(sess.batches[0].shape[0], int(0.8 * SR) // W)
+
+    def test_speech_only_after_the_head_is_false(self):
+        v, _, _ = _vad()
+        self.assertIs(v.speech_in_head(_clip(1.0, 0.5, lead_s=1.2)), False)
+
+    def test_head_length_is_a_parameter(self):
+        v, _, _ = _vad()
+        clip = _clip(1.0, 0.5, lead_s=1.2)
+        self.assertIs(v.speech_in_head(clip, head_s=1.6), True)
+
+    def test_too_short_wrong_rate_or_shape_is_none(self):
+        v, sess, _ = _vad()
+        self.assertIsNone(v.speech_in_head(np.zeros(W - 1, np.float32)))
+        self.assertIsNone(v.speech_in_head(_clip(1.0, 0.0), sample_rate=8000))
+        self.assertIsNone(v.speech_in_head(np.zeros((2, SR), np.float32)))
+        self.assertEqual(sess.batches, [])
+
+    def test_a_failed_detector_is_none_and_latches(self):
+        v, _, _ = _vad(_FakeSession(fail=RuntimeError("boom")))
+        self.assertIsNone(v.speech_in_head(_clip(1.0, 0.0, lead_s=0.0)))
+        self.assertIn("run failed", v.failed)
+        self.assertIsNone(v.speech_in_head(_clip(1.0, 0.0, lead_s=0.0)))
+
+
 class LatchTests(unittest.TestCase):
     def test_load_failure_latches_and_is_never_retried(self):
         calls = []

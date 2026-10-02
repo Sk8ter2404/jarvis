@@ -16352,7 +16352,10 @@ def _transcribe_capture(audio):
 
     [turn-timing] (speed plan R1): the owner's captures only pass here, so
     this is where clip_ms is noted and the tail_ms probe starts — on a copy,
-    on its own daemon; the (text, conf) below are untouched by it."""
+    on its own daemon; the (text, conf) below are untouched by it.
+
+    Speed plan R6: STT_ENGINE / STT_SHADOW = 'parakeet' route the capture
+    through _transcribe_capture_r6 (both off by default)."""
     _tail_probe_start(audio)
     t = _spec_stt.get("thread")
     if _SPECULATIVE_STT and t is not None and _spec_stt.get("chunks", -1) >= 0:
@@ -16380,7 +16383,196 @@ def _transcribe_capture(audio):
                 print(f"  [spec-stt] used speculative transcript "
                       f"({_spec_stt['chunks']} chunks)")
             return res
+    # Speed plan R6 (core/stt_parakeet.py): None with STT_ENGINE='whisper'
+    # and STT_SHADOW='' (the defaults) — then exactly the line below.
+    _r6 = _stt_r6_route()
+    if _r6 is not None:
+        return _transcribe_capture_r6(audio, _r6)
     return transcribe(audio)
+
+
+# ── Parakeet TDT on the CPU for the owner's captures (speed plan R6) ──────
+# STT_ENGINE='parakeet' decodes the captures that reach _transcribe_capture
+# (the owner's commands and standby wakes) with Parakeet instead of Whisper;
+# STT_SHADOW='parakeet' keeps Whisper and re-decodes each one later for the
+# A/B file. Both OFF by default; see core/stt_parakeet.py and core/config.py.
+#
+#   * Parakeet lives in _stt_alt, NEVER in _stt: skills/self_diagnostic.py's
+#     _probe_stt and every test that patches _stt keep meaning Whisper.
+#   * It decodes under _parakeet_lock, NEVER _stt_lock, so an ambient Whisper
+#     decode holding _stt_lock can never delay the owner's command.
+#   * Whisper stays preloaded (the boot load) as the hot fallback and stays
+#     primary for ambient and in-turn captures.
+#   * Nothing imports onnx_asr / onnxruntime unless a flag is on.
+from core import stt_parakeet as _stt_parakeet  # noqa: E402
+
+_stt_alt = None                       # the Parakeet engine once loaded
+_parakeet_lock = threading.Lock()     # its load + every decode
+_parakeet_latch = _stt_parakeet.Latch()
+
+
+def _stt_r6_route() -> "str | None":
+    """'primary' (STT_ENGINE / JARVIS_STT_ENGINE = 'parakeet'), 'shadow'
+    (STT_SHADOW = 'parakeet' with Whisper primary) or None (both off, the
+    default). Read per call. Never raises."""
+    try:
+        if _stt_parakeet.engine_setting(
+                globals().get("STT_ENGINE")) == "parakeet":
+            return "primary"
+        if _stt_parakeet.shadow_setting(
+                globals().get("STT_SHADOW")) == "parakeet":
+            return "shadow"
+    except Exception:
+        pass
+    return None
+
+
+def _parakeet_engine():
+    """The loaded Parakeet engine (_stt_alt), loading it on first use.
+    Caller holds _parakeet_lock. Raises on failure (the caller latches)."""
+    global _stt_alt
+    if _stt_alt is None:
+        _stt_alt = _stt_parakeet.load(globals().get("PARAKEET_MODEL_DIR"),
+                                      globals().get("PARAKEET_THREADS", 8))
+    return _stt_alt
+
+
+def _parakeet_decode(audio):
+    """One Parakeet decode -> (text, conf), under _parakeet_lock (never
+    _stt_lock). Raises on failure."""
+    with _parakeet_lock:
+        eng = _parakeet_engine()
+        return _stt_parakeet.transcribe(
+            eng, audio, anchors=globals().get("PARAKEET_CONF_ANCHORS"))
+
+
+def _parakeet_post_text(text: str) -> str:
+    """STT_REPLACEMENTS (as for Whisper), then STT_REPLACEMENTS_PARAKEET."""
+    text = _stt_vocab.apply_replacements(text, globals().get("STT_REPLACEMENTS"))
+    return _stt_vocab.apply_replacements(
+        text, globals().get("STT_REPLACEMENTS_PARAKEET"))
+
+
+def _parakeet_rescue(text: str, audio) -> str:
+    """core/stt_parakeet.rescue_reason with the live wake-word mode, the real
+    wake-prefix rule and the Silero head check (the tail probe's detector)."""
+    return _stt_parakeet.rescue_reason(
+        text,
+        wake_mode=lambda: bool(_require_wake_runtime),
+        has_wake_prefix=_text_has_wake_prefix,
+        head_speech=lambda: _tail_vad.speech_in_head(
+            audio, _stt_parakeet.RESCUE_HEAD_S, SAMPLE_RATE))
+
+
+_parakeet_primary = _stt_parakeet.Primary(
+    lambda a: _parakeet_decode(a),
+    lambda a: transcribe(a),
+    latch=_parakeet_latch,
+    post_text=lambda t: _parakeet_post_text(t),
+    rescue=lambda t, a: _parakeet_rescue(t, a),
+    note=lambda v: _tt_note_stat("stt_engine", v),
+    hotwords=lambda: bool(_stt_vocab.hotwords_arg(
+        globals().get("STT_HOTWORDS"))),
+)
+
+
+def _parakeet_shadow_busy() -> bool:
+    """A turn or an utterance is in progress: the shadow decode waits."""
+    return bool(_turn_in_progress[0] or _utterance_in_progress[0])
+
+
+def _parakeet_shadow_ctx() -> dict:
+    """The gate context of THIS capture, read on the voice thread when it is
+    offered (the same state _noise_verdict and the background-audio gate
+    see for this turn). Never raises."""
+    try:
+        now = time.monotonic()
+        owner_at = float(_last_owner_turn_at[0] or 0.0)
+        line_at = float(_last_jarvis_line[0] or 0.0)
+        return {"owner_idle_s": (now - owner_at) if owner_at else None,
+                "since_jarvis_s": (now - line_at) if line_at else None,
+                "jarvis_asked": bool(_last_jarvis_line[1]),
+                "prompt_pending": _reply_prompt_pending(),
+                "wake_mode": bool(_require_wake_runtime),
+                "noise_filter": bool(NOISE_FILTER_ENABLED)}
+    except Exception:
+        return {}
+
+
+def _parakeet_shadow_judge(text, conf, peak, ctx) -> dict:
+    """The real gates' verdicts on one transcript, without their side effects
+    or log lines: the wake rule of _should_refuse_background_audio
+    (wake-word mode and no _text_has_wake_prefix), hallucination_verdict
+    (as _noise_verdict calls it) and is_valid_speech. `accepted` = the turn
+    would have reached "You:"."""
+    ctx = ctx if isinstance(ctx, dict) else {}
+    wake = bool(_text_has_wake_prefix(text))
+    wake_refused = bool(ctx.get("wake_mode")) and not wake
+    verdict, why = "", ""
+    if ctx.get("noise_filter", True):
+        verdict, why = _speech_filter_mod.hallucination_verdict(
+            text, conf, peak, vad_threshold=VAD_THRESHOLD,
+            owner_idle_s=ctx.get("owner_idle_s"),
+            since_jarvis_s=ctx.get("since_jarvis_s"),
+            jarvis_asked=bool(ctx.get("jarvis_asked")),
+            prompt_pending=bool(ctx.get("prompt_pending")))
+    valid, reason = is_valid_speech(text, conf, peak_rms=peak,
+                                    reply=(verdict == "reply"))
+    return {"wake_prefix": wake, "wake_refused": wake_refused,
+            "noise_verdict": verdict, "noise_why": why,
+            "valid": bool(valid), "filter_reason": reason,
+            "accepted": (not wake_refused and verdict != "noise"
+                         and bool(valid))}
+
+
+def _parakeet_ab_write(row) -> bool:
+    """Append one A/B row to the gitignored data/stt_ab.jsonl (staging-aware
+    through core.paths). The words go here only."""
+    from core import paths as _paths
+    return _stt_parakeet.append_jsonl(_paths.data_file("stt_ab.jsonl"), row)
+
+
+_parakeet_shadow = _stt_parakeet.Shadow(
+    lambda a: _parakeet_decode(a),
+    _parakeet_shadow_busy,
+    _parakeet_shadow_judge,
+    _parakeet_ab_write,
+    latch=_parakeet_latch,
+)
+
+
+def _transcribe_capture_r6(audio, route: str):
+    """_transcribe_capture's R6 tail. 'primary': Parakeet decodes (rescue /
+    fallback to transcribe() inside _parakeet_primary). 'shadow': exactly
+    transcribe(), then the capture is offered to the shadow worker (a copy;
+    never blocks)."""
+    if route == "primary":
+        return _parakeet_primary.run(audio)
+    t0 = time.perf_counter()
+    res = transcribe(audio)
+    try:
+        ms = int(round((time.perf_counter() - t0) * 1000.0))
+        text, conf = res
+        _parakeet_shadow.offer(audio, text, conf, ms, _last_recording_peak,
+                               _parakeet_shadow_ctx())
+    except Exception:
+        pass
+    return res
+
+
+def _warm_parakeet() -> None:
+    """Boot warmer (a flag on): load Parakeet and decode 1 s of silence (the
+    first ORT run is the slow one). A failure latches Parakeet off for the
+    session; the "[warm] parakeet failed" line is then its one log line."""
+    try:
+        _parakeet_decode(np.zeros(SAMPLE_RATE, dtype=np.float32))
+    except Exception as e:
+        _parakeet_latch.trip(e, quiet=True)
+        raise
+
+
+if _stt_r6_route() is not None:
+    _register_boot_warmer("parakeet", _warm_parakeet)
 
 # Raw (pre auto-gain) audio + sample-rate of the most recent mic capture, stashed
 # by _capture_utterance so the background-audio gate can run voice-ID on it

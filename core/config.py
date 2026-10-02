@@ -732,6 +732,38 @@ WHISPER_MODEL_CPU   = "small"           # CPU-friendly default when no GPU
 WHISPER_TEMPERATURES = None
 WHISPER_BEAM_SIZE    = 5
 
+
+# ─── Parakeet STT on the CPU (speed plan R6, core/stt_parakeet.py) ─────
+# STT_ENGINE: which engine decodes YOUR spoken commands (the owner's captures
+#   only; ambient listening and in-turn captures always use Whisper, which
+#   stays loaded as the fallback).
+#   'whisper'  → today's behaviour
+#   'parakeet' → NVIDIA Parakeet TDT 0.6B v2 (int8 ONNX, CPU only): roughly
+#                0.15-0.3 s per command instead of ~1.7 s. It ignores
+#                STT_HOTWORDS; a transcript that comes back empty, or (in
+#                wake-word mode) not led by "JARVIS" while the clip starts
+#                with speech, is decoded again by Whisper. Any error switches
+#                back to Whisper for the session.
+#   The JARVIS_STT_ENGINE environment variable overrides this setting.
+# STT_SHADOW: '' (off) | 'parakeet' → Whisper keeps transcribing; Parakeet
+#   re-decodes each command afterwards, while JARVIS is idle, and both
+#   transcripts and the speech gates' verdicts on them go to the gitignored
+#   data/stt_ab.jsonl (the words are written there only, never to the log;
+#   audio is never saved). Use it to compare the two before switching.
+# PARAKEET_MODEL_DIR: the downloaded model folder. PARAKEET_THREADS: CPU
+#   threads for one decode. PARAKEET_CONF_ANCHORS: [[parakeet token
+#   log-probability mean, Whisper-scale avg_logprob], ...] — how Parakeet's
+#   confidence is mapped onto the scale the speech filter's thresholds use
+#   (empty = the built-in calibration). STT_REPLACEMENTS_PARAKEET: like
+#   STT_REPLACEMENTS ({"misheard": "meant"}), applied after it, to Parakeet's
+#   transcripts only. All OFF by default; changes apply on the next start.
+STT_ENGINE                 = "whisper"   # 'whisper' | 'parakeet'
+STT_SHADOW                 = ""          # '' | 'parakeet'
+PARAKEET_MODEL_DIR         = r"C:\JARVIS-models\parakeet-tdt-0.6b-v2-onnx"
+PARAKEET_THREADS           = 8
+PARAKEET_CONF_ANCHORS: list = []
+STT_REPLACEMENTS_PARAKEET: dict = {}
+
 # Per-install speech-filter tuning. The Whisper gate thresholds depend on the
 # MICROPHONE, so an install whose mic differs from the desktop's overrides them
 # here (via user_settings.json) instead of editing core/speech_filter.py and
