@@ -13,7 +13,8 @@ packed." The old overlays were frameless windows with hard-coded geometry and
 no drag/resize handlers — so several literally could not be moved. This one is:
 
   • DRAGGABLE  — click anywhere on the body and drag.
-  • RESIZABLE  — a corner grip (and it reflows proportionally).
+  • RESIZABLE  — a corner grip or Ctrl+mouse wheel (and it reflows
+    proportionally: rings, arcs and text scale with the window).
   • PERSISTENT — position + size are saved to unified_hud_geometry.json and
     restored on the next launch / JARVIS bounce.
   • FEATURE-PACKED — a state-reactive arc-reactor core, four live system arcs
@@ -138,6 +139,24 @@ MIN_W, MIN_H = 300, 380
 # restore clamp, so a stale unified_hud_geometry.json from a since-removed huge
 # monitor can't resurrect an oversized HUD either.
 MAX_W, MAX_H = 900, 1100
+
+# Drawing scale. paintEvent lays every ring, stroke, gap and font out at
+# _paint_scale(window width) times its PAINT_BASE_W-wide design size, so the
+# whole HUD reflows with its window, clamped to [PAINT_S_MIN, PAINT_S_MAX].
+PAINT_BASE_W = 420.0
+PAINT_S_MIN, PAINT_S_MAX = 0.78, 1.7
+
+# Ctrl+mouse-wheel resize (ported from the old corner HUD, hud/jarvis_hud.py).
+# One 120-unit wheel notch scales the window by WHEEL_STEP, aspect ratio kept;
+# a touchpad's smaller deltas scale by the same fraction of a notch, and a
+# notch down undoes a notch up. The wheel only zooms across the widths where
+# the drawing scale follows the window (inside both the paint clamp and
+# MIN_W..MAX_W), so every notch grows or shrinks the rings and text too, never
+# just the window. Height stays inside MIN_H..MAX_H.
+WHEEL_STEP = 1.10
+WHEEL_NOTCH = 120.0
+WHEEL_MIN_W = max(MIN_W, math.ceil(PAINT_BASE_W * PAINT_S_MIN))
+WHEEL_MAX_W = min(MAX_W, math.floor(PAINT_BASE_W * PAINT_S_MAX))
 
 # Stark cyan palette — matches the retired HUDs so the look is continuous.
 if _HAS_PYQT6:
@@ -283,6 +302,46 @@ def _validate_geometry(geo: dict, screens: list, default_xy: tuple) -> dict:
         if not on_screen:
             x, y = int(default_xy[0]), int(default_xy[1])
     return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _paint_scale(width: float) -> float:
+    """The global drawing scale paintEvent uses for a window this wide: the
+    rings, strokes, gaps and fonts are all drawn at this multiple of their
+    PAINT_BASE_W-wide design size."""
+    return max(PAINT_S_MIN, min(PAINT_S_MAX, float(width) / PAINT_BASE_W))
+
+
+def _ctrl_wheel_size(w: int, h: int, delta: float) -> tuple[int, int] | None:
+    """The window size after one Ctrl+wheel event of ``delta`` angle units
+    (+120 = one notch away from the user = grow), or None when the size would
+    not change.
+
+    The size is scaled by WHEEL_STEP per notch with its aspect ratio kept, and
+    the factor is clamped so the width never crosses WHEEL_MIN_W / WHEEL_MAX_W
+    and the height never crosses MIN_H / MAX_H. The clamp only ever stops the
+    size in the direction it is moving: a window already past a bound (the
+    corner grip has no maximum) does not grow further and is not snapped,
+    but shrinks normally toward the range.
+
+    Pure (arithmetic only) so it is unit-testable without Qt or a display."""
+    try:
+        w, h, delta = int(w), int(h), float(delta)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if w <= 0 or h <= 0 or not delta or not math.isfinite(delta):
+        return None
+    try:
+        f = WHEEL_STEP ** (delta / WHEEL_NOTCH)
+    except OverflowError:
+        f = math.inf
+    if f > 1.0:
+        f = min(f, max(1.0, WHEEL_MAX_W / w), max(1.0, MAX_H / h))
+    else:
+        f = max(f, min(1.0, WHEEL_MIN_W / w), min(1.0, MIN_H / h))
+    new_w, new_h = int(round(w * f)), int(round(h * f))
+    if (new_w, new_h) == (w, h):
+        return None
+    return new_w, new_h
 
 
 def _available_screen_rects() -> list:
@@ -806,6 +865,24 @@ class UnifiedHud(QWidget):
         self._reposition_chrome()
         self._save_timer.start()
 
+    def wheelEvent(self, e) -> None:
+        """Ctrl+mouse wheel resizes the HUD, like the old corner HUD did.
+
+        paintEvent lays the rings, arcs and text out from the window size
+        (_paint_scale), so growing the window grows the drawing with it. The
+        resize() goes through resizeEvent and the debounced _save_geometry,
+        so a wheel size persists exactly like a corner-grip size. A plain
+        wheel (no Ctrl) is left to QWidget, as before."""
+        if not (e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            super().wheelEvent(e)
+            return
+        size = _ctrl_wheel_size(self.width(), self.height(),
+                                e.angleDelta().y())
+        if size is not None:
+            self.resize(*size)
+        # Accepted at a bound too: the Ctrl+wheel was meant for the HUD.
+        e.accept()
+
     def _reposition_chrome(self) -> None:
         w, h = self.width(), self.height()
         self.btn_close.setGeometry(w - 30, 10, 22, 22)
@@ -863,7 +940,7 @@ class UnifiedHud(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         W, H = float(self.width()), float(self.height())
-        s = max(0.78, min(1.7, W / 420.0))       # global scale factor
+        s = _paint_scale(W)                      # global scale factor
         pad = 14.0 * s
 
         # 1. Panel backdrop — vertical gradient + cyan rim + soft inner glow.
