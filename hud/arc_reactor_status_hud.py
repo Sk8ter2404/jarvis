@@ -76,12 +76,18 @@ except ImportError:
 
 # Brain glow (core/brain_glow.py): hud_state's ``brain`` = the colour + brief
 # name label of the brain that is answering (local blue, Sonnet gold, Opus
-# violet...). Fail-open: a missing helper means no glow, never a dead HUD.
+# violet...), drawn as a ring of its own — the halo keeps the state colour.
+# Fail-open: a missing helper means no ring, never a dead HUD.
 try:
     from core.brain_glow import hud_brain as _hud_brain
 except Exception:  # pragma: no cover - core/ always ships next to hud/
     def _hud_brain(_hud, _now=None):
         return None
+
+# States in which no brain ring is drawn: the dim reactor reads "asleep".
+_ASLEEP_STATES = ("standby", "sleep", "sleeping")
+# The brain ring's radius, in outer-ring radii: just outside the metric arcs.
+BRAIN_RING_R = 1.12
 
 try:
     from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF
@@ -402,8 +408,11 @@ class ArcReactorStatusScene(QGraphicsScene):
         return CYAN
 
     def _glow_hex(self):
-        """The brain glow colour ("#RRGGBB"), or None for the normal
-        state-coloured halo (no brain published, glow off, garbage key)."""
+        """The brain ring's colour ("#RRGGBB"), or None for no ring: no brain
+        published, glow off, a garbage key — or JARVIS asleep / in standby,
+        where the dim at-rest reactor is the asleep cue."""
+        if str(getattr(self, "state", "") or "").lower() in _ASLEEP_STATES:
+            return None
         col = getattr(getattr(self, "brain", None), "color", None)
         return col if isinstance(col, str) and col else None
 
@@ -437,22 +446,36 @@ class ArcReactorStatusScene(QGraphicsScene):
         cx, cy = self.cx, self.cy
         accent = self._accent_for_state()
 
-        # ── 2. Outer glow halo — the BRAIN's colour when one is published
-        # (core/brain_glow), else the state accent. The state colours stay
-        # on the core ring + hub (step 7), so the state still reads.
-        glow_hex = self._glow_hex()
-        halo = QColor(glow_hex) if glow_hex else accent
+        # ── 2. Outer glow halo — the STATE accent, as before the brain glow.
+        # The answering brain's colour (core/brain_glow) is a ring of its
+        # own (2b): on the halo, Sonnet's gold read as the listening amber
+        # (2026-10-02 review), so the two never share it.
         glow = QRadialGradient(QPointF(cx, cy), self.R_GLOW)
-        gcol = QColor(halo)
+        gcol = QColor(accent)
         gcol.setAlpha(150)
         glow.setColorAt(0.55, QColor(0, 0, 0, 0))
         glow.setColorAt(0.85, gcol)
-        gouter = QColor(halo)
+        gouter = QColor(accent)
         gouter.setAlpha(0)
         glow.setColorAt(1.0, gouter)
         painter.setBrush(QBrush(glow))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QPointF(cx, cy), self.R_GLOW, self.R_GLOW)
+
+        # ── 2b. Brain ring: a soft wide stroke under a crisp one, outside
+        # the metric arcs. None asleep / in standby (the dim look is the cue).
+        glow_hex = self._glow_hex()
+        if glow_hex:
+            r_brain = self.R_OUTER * BRAIN_RING_R
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            soft = QColor(glow_hex)
+            soft.setAlpha(70)
+            painter.setPen(QPen(soft, max(4.0, self.R_OUTER * 0.07)))
+            painter.drawEllipse(QPointF(cx, cy), r_brain, r_brain)
+            rim = QColor(glow_hex)
+            rim.setAlpha(220)
+            painter.setPen(QPen(rim, 2.0))
+            painter.drawEllipse(QPointF(cx, cy), r_brain, r_brain)
 
         # ── 3. Outer ring track (full circle dim cyan) ────────────────
         outer_rect = QRectF(
@@ -595,7 +618,8 @@ class ArcReactorStatusScene(QGraphicsScene):
         # ring (on the filled hub it was unreadable), fading out after a
         # brain change (core/brain_glow).
         brain = getattr(self, "brain", None)
-        if brain is not None and brain.label and brain.label_alpha > 0.0:
+        if (brain is not None and brain.label and brain.label_alpha > 0.0
+                and self._glow_hex() is not None):
             bcol = QColor(brain.color)
             bcol.setAlpha(int(255 * max(0.0, min(1.0, brain.label_alpha))))
             painter.setFont(QFont("Consolas", 7, QFont.Weight.Bold))

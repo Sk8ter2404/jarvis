@@ -76,7 +76,8 @@ class Clock:
 
 
 def make(bridge=None, *, cfg=None, clock=None, idle=3600.0, focus=False,
-         blocked="", pending=None, state_path=None, env=None, spawn=None):
+         blocked="", pending=None, state_path=None, env=None, spawn=None,
+         asleep=False):
     """A PhonePinger on fakes. Returns (pinger, bridge, clock, cfg, logs)."""
     bridge = bridge if bridge is not None else FakeBridge()
     conf = dict(pp.DEFAULTS)
@@ -84,13 +85,14 @@ def make(bridge=None, *, cfg=None, clock=None, idle=3600.0, focus=False,
     clock = clock or Clock()
     logs: list[str] = []
     state = {"idle": idle, "focus": focus, "blocked": blocked,
-             "pending": list(pending or [])}
+             "pending": list(pending or []), "asleep": asleep}
     p = pp.PhonePinger(
         send=bridge.send, configured=bridge.configured,
         cfg=lambda name: conf.get(name),
         wall_now=lambda: clock.wall, mono_now=lambda: clock.mono,
         focus_active=lambda: state["focus"],
         owner_idle_s=lambda: state["idle"],
+        asleep=lambda: state["asleep"],
         blocked=lambda: state["blocked"],
         pending=lambda: state["pending"],
         printer_now=lambda: "",
@@ -124,10 +126,33 @@ class GateTests(unittest.TestCase):
 
     def test_master_switch_off(self):
         p, bridge, *_ = make(cfg={"PHONE_PING_ENABLED": False})
-        self.assertEqual(p.ping("print", "Print finished."), pp.DISABLED)
-        self.assertEqual(p.ping("security", "Intruder.", critical=True),
-                         pp.DISABLED)
+        for cat in ("print", "confirm", "robot"):
+            with self.subTest(cat=cat):
+                self.assertEqual(p.ping(cat, "Print finished."), pp.DISABLED)
         self.assertEqual(bridge.sent, [])
+
+    def test_master_switch_off_never_silences_guard_alerts(self):
+        """2026-10-02 review: "don't ping me" / "turn off phone pings" saved
+        the master switch off and silently ended guard-mode pushes. Security
+        answers to its own switch only."""
+        p, bridge, *_ = make(cfg={"PHONE_PING_ENABLED": False})
+        self.assertEqual(p.ping("security", "Intruder.", critical=True),
+                         pp.QUEUED)
+        self.assertEqual(len(bridge.sent), 1)
+        p, bridge, *_ = make(cfg={"PHONE_PING_ENABLED": False,
+                                  "PHONE_PING_SECURITY": False})
+        self.assertEqual(p.ping("security", "Intruder.", critical=True),
+                         pp.CATEGORY_OFF)
+        self.assertEqual(bridge.sent, [])
+        # ...and never from staging, nor without a bridge.
+        p, bridge, *_ = make(cfg={"PHONE_PING_ENABLED": False},
+                             blocked="staging")
+        self.assertEqual(p.ping("security", "Intruder.", critical=True),
+                         pp.BLOCKED)
+        p, bridge, *_ = make(FakeBridge(configured=False),
+                             cfg={"PHONE_PING_ENABLED": False})
+        self.assertEqual(p.ping("security", "Intruder.", critical=True),
+                         pp.UNCONFIGURED)
 
     def test_each_category_has_its_own_switch(self):
         for cat, flag in (("print", "PHONE_PING_PRINT"),
@@ -144,9 +169,18 @@ class GateTests(unittest.TestCase):
     def test_summary_is_off_by_default(self):
         self.assertIs(pp.DEFAULTS["PHONE_PING_SUMMARY"], False)
         for flag in ("PHONE_PING_ENABLED", "PHONE_PING_PRINT",
-                     "PHONE_PING_CONFIRM", "PHONE_PING_SECURITY",
-                     "PHONE_PING_ROBOT"):
+                     "PHONE_PING_SECURITY", "PHONE_PING_ROBOT"):
             self.assertIs(pp.DEFAULTS[flag], True, flag)
+
+    def test_confirm_pings_are_off_by_default(self):
+        """2026-10-02 review: a confirmation lapses after 45 s, but the ping
+        needs it 2+ minutes old and him 10 minutes away - so every one would
+        be the lapsed "nothing ran" kind, needing nothing from him."""
+        self.assertIs(pp.DEFAULTS["PHONE_PING_CONFIRM"], False)
+        p, bridge, *_ = make(pending=[{"key": "queue:1.0", "age_s": 900.0,
+                                       "text": "waiting", "owner": True}])
+        p.tick()
+        self.assertEqual(bridge.sent, [])
 
     def test_never_from_staging(self):
         p, bridge, *_ = make(blocked="staging")
@@ -231,6 +265,25 @@ class DeliveryTests(unittest.TestCase):
 # ─── presence / focus / quiet hours / rate limit / dedupe ───────────────
 
 class PolicyTests(unittest.TestCase):
+    def test_goodnight_holds_pings_like_quiet_hours(self):
+        """2026-10-02 review: "goodnight" at 22:00 (overnight mode) and a
+        print finishing at 22:30 must not buzz the phone at his bedside: the
+        ping waits for the morning digest, and goes out once he wakes."""
+        clock = Clock(wall=dt.datetime(2026, 10, 2, 22, 30))
+        p, bridge, clock, *_ = make(clock=clock, asleep=True)
+        self.assertEqual(p.ping("print", "Print finished, sir."), pp.QUIET)
+        self.assertEqual(bridge.sent, [])
+        p.tick()                                  # still asleep: held
+        self.assertEqual(bridge.sent, [])
+        # Guard alerts are never held.
+        self.assertEqual(p.ping("security", "Intruder.", critical=True),
+                         pp.QUEUED)
+        p._test_state["asleep"] = False
+        clock.wall = dt.datetime(2026, 10, 3, 7, 5)
+        p.tick()
+        self.assertEqual(len(bridge.sent), 2)
+        self.assertIn("Print finished", bridge.sent[1]["text"])
+
     def test_present_owner_is_not_pinged(self):
         p, bridge, *_ = make(idle=120.0)            # spoke 2 minutes ago
         self.assertEqual(p.ping("print", "Print finished."), pp.PRESENT)
@@ -318,7 +371,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(p.ping("print", "done", dedupe_key="k"), pp.QUEUED)
 
     def test_a_present_outcome_does_not_burn_the_dedupe_key(self):
-        p, bridge, *_ = make(idle=30.0)
+        p, bridge, *_ = make(idle=30.0, cfg={"PHONE_PING_CONFIRM": True})
         self.assertEqual(p.ping("confirm", "waiting", dedupe_key="c"),
                          pp.PRESENT)
         # The retry while he is still here is not journalled twice.
@@ -574,13 +627,108 @@ class BambuHookTests(unittest.TestCase):
         p, bridge, *_ = make()
         p.on_bambu_state(dict(self.SNAP, gcode_state="PAUSE"), "RUNNING", "PAUSE")
         self.assertEqual(bridge.sent, [])
-        snap = dict(self.SNAP, gcode_state="PAUSE", print_error=50348044,
+        snap = dict(self.SNAP, gcode_state="PAUSE", print_error=117473282,
                     layer_num=40)
         p.on_bambu_state(snap, "PAUSE", "PAUSE")
         p.on_bambu_state(snap, "PAUSE", "PAUSE")
         self.assertEqual(len(bridge.sent), 1)
-        self.assertIn("paused with error 50348044 at layer 40",
+        self.assertIn("paused with error 117473282 at layer 40",
                       bridge.sent[0]["text"])
+
+    # -- 2026-10-02 review: the hook runs on EVERY MQTT push --
+    PAUSED = {"gcode_state": "PAUSE", "filename": "cube.3mf",
+              "print_error": 117473282, "layer_num": 9}
+
+    def test_a_pause_seen_after_a_restart_never_pings(self):
+        """The first observation after a restart (prev None), and every push
+        after it while the printer stays paused (prev PAUSE), is not a pause
+        starting: no ping per JARVIS restart (the nightly upgrade too)."""
+        p, bridge, *_ = make()
+        p.on_bambu_state(dict(self.PAUSED), None, "PAUSE")
+        for _ in range(5):
+            p.on_bambu_state(dict(self.PAUSED), "PAUSE", "PAUSE")
+        self.assertEqual(bridge.sent, [])
+
+    def test_a_long_pause_is_one_ping_not_one_an_hour(self):
+        p, bridge, clock, *_ = make()
+        p.on_bambu_state(dict(self.PAUSED), "RUNNING", "PAUSE")
+        for _ in range(6):
+            clock.advance(3600.0)
+            p.on_bambu_state(dict(self.PAUSED), "PAUSE", "PAUSE")
+        self.assertEqual(len(bridge.sent), 1)
+
+    def test_a_new_error_in_the_same_pause_pings_once_more(self):
+        p, bridge, *_ = make()
+        p.on_bambu_state(dict(self.PAUSED), "RUNNING", "PAUSE")
+        p.on_bambu_state(dict(self.PAUSED, print_error=50364437), "PAUSE",
+                         "PAUSE")
+        p.on_bambu_state(dict(self.PAUSED, print_error=50364437), "PAUSE",
+                         "PAUSE")
+        self.assertEqual(len(bridge.sent), 2)
+
+    def test_a_held_pause_is_one_morning_line(self):
+        """In quiet hours a paused printer re-reported for hours is ONE line
+        in the 07:00 digest, not one per hour."""
+        clock = Clock(wall=dt.datetime(2026, 10, 2, 1, 0))
+        p, bridge, clock, *_ = make(clock=clock)
+        p.on_bambu_state(dict(self.PAUSED), "RUNNING", "PAUSE")
+        for _ in range(4):
+            clock.advance(3600.0)
+            p.on_bambu_state(dict(self.PAUSED), "PAUSE", "PAUSE")
+        # The same event re-reported by another source (same key) after the
+        # dedupe window is still one held line.
+        p.ping("print", "The print is paused, sir.",
+               dedupe_key="print:pause:cube:117473282")
+        self.assertEqual(len(p._held), 1)
+        clock.wall = dt.datetime(2026, 10, 2, 7, 1)
+        p.tick()
+        self.assertEqual(len(bridge.sent), 1)
+        self.assertEqual(bridge.sent[0]["text"].count("paused"), 1)
+
+    def test_a_cancelled_print_is_not_a_failure(self):
+        """Cancelling from Bambu Handy or the printer goes FAILED with the
+        cancel code (HMS 0300-400C): he did it himself."""
+        p, bridge, *_ = make()
+        for code in (0x0300400C, "50348044", "0x0300400C"):
+            with self.subTest(code=code):
+                p.on_bambu_state(dict(self.SNAP, gcode_state="FAILED",
+                                      print_error=code), "RUNNING", "FAILED")
+        self.assertEqual(bridge.sent, [])
+        p.on_bambu_state(dict(self.SNAP, gcode_state="FAILED",
+                              print_error=50364437), "RUNNING", "FAILED")
+        self.assertEqual(len(bridge.sent), 1)
+
+    def test_a_reprint_of_the_same_file_pings_again(self):
+        """A second copy of the same file within the hour gets its own finish
+        ping: a new print starting drops the old run's keys."""
+        p, bridge, clock, *_ = make()
+        p.on_bambu_state(dict(self.SNAP), "RUNNING", "FINISH")
+        clock.advance(600.0)
+        p.on_bambu_state(dict(self.SNAP, gcode_state="PREPARE"), "FINISH",
+                         "PREPARE")
+        p.on_bambu_state(dict(self.SNAP, gcode_state="RUNNING"), "PREPARE",
+                         "RUNNING")
+        clock.advance(1200.0)
+        p.on_bambu_state(dict(self.SNAP), "RUNNING", "FINISH")
+        self.assertEqual(len(bridge.sent), 2)
+        # A retry after a failure, too.
+        p.on_bambu_state(dict(self.SNAP, gcode_state="FAILED", print_error=5),
+                         "RUNNING", "FAILED")
+        p.on_bambu_state(dict(self.SNAP, gcode_state="RUNNING"), "FAILED",
+                         "RUNNING")
+        p.on_bambu_state(dict(self.SNAP, gcode_state="FAILED", print_error=5),
+                         "RUNNING", "FAILED")
+        self.assertEqual(len(bridge.sent), 4)
+
+    def test_a_resume_does_not_reset_the_pause_report(self):
+        """Pause / resume / pause with the same error inside the hour: the
+        error was already reported this print."""
+        p, bridge, *_ = make()
+        p.on_bambu_state(dict(self.PAUSED), "RUNNING", "PAUSE")
+        p.on_bambu_state(dict(self.PAUSED, gcode_state="RUNNING"), "PAUSE",
+                         "RUNNING")
+        p.on_bambu_state(dict(self.PAUSED), "RUNNING", "PAUSE")
+        self.assertEqual(len(bridge.sent), 1)
 
     def test_print_switch_off_silences_the_hook(self):
         p, bridge, *_ = make(cfg={"PHONE_PING_PRINT": False})
@@ -623,11 +771,14 @@ class BambuHookTests(unittest.TestCase):
                          "Print finished, sir: 'cube' is done.")
 
 
+_CONFIRM_ON = {"PHONE_PING_CONFIRM": True}
+
+
 class ConfirmTests(unittest.TestCase):
     def test_pings_once_after_n_minutes_while_away(self):
         item = {"key": "queue:1.000", "age_s": 60.0,
                 "text": pp.confirm_text(["reset_memory"], lapsed=True)}
-        p, bridge, *_ = make(pending=[item])
+        p, bridge, *_ = make(pending=[item], cfg=_CONFIRM_ON)
         p.tick()
         self.assertEqual(bridge.sent, [])           # 1 min < 2 min
         item["age_s"] = 11 * 60.0
@@ -643,7 +794,7 @@ class ConfirmTests(unittest.TestCase):
         a lapsed prompt nobody answered all afternoon is ONE ping, not one an
         hour."""
         item = {"key": "queue:9.000", "age_s": 700.0, "text": "waiting"}
-        p, bridge, clock, *_ = make(pending=[item])
+        p, bridge, clock, *_ = make(pending=[item], cfg=_CONFIRM_ON)
         p.tick()
         for _ in range(4):
             clock.advance(3 * 3600)
@@ -653,7 +804,7 @@ class ConfirmTests(unittest.TestCase):
 
     def test_waits_while_he_is_here_then_pings(self):
         item = {"key": "queue:2.000", "age_s": 300.0, "text": "waiting"}
-        p, bridge, *_ = make(pending=[item], idle=60.0)
+        p, bridge, *_ = make(pending=[item], idle=60.0, cfg=_CONFIRM_ON)
         p.tick()
         self.assertEqual(bridge.sent, [])
         p._test_state["idle"] = 700.0
@@ -663,7 +814,8 @@ class ConfirmTests(unittest.TestCase):
     def test_confirm_after_minutes_is_a_setting(self):
         item = {"key": "queue:3.000", "age_s": 300.0, "text": "waiting"}
         p, bridge, *_ = make(pending=[item],
-                             cfg={"PHONE_PING_CONFIRM_AFTER_MIN": 10})
+                             cfg={"PHONE_PING_CONFIRM_AFTER_MIN": 10,
+                                  "PHONE_PING_CONFIRM": True})
         p.tick()
         self.assertEqual(bridge.sent, [])
 
@@ -675,6 +827,50 @@ class ConfirmTests(unittest.TestCase):
         self.assertIn("lapsed", t)
         self.assertIn("is waiting on your yes",
                       pp.confirm_text(["shutdown_pc"], lapsed=False))
+
+    def test_a_prompt_he_did_not_raise_never_pings(self):
+        """A skill's own offer, or a prompt no turn of his raised (the TV, a
+        guest), is not texted - and is not re-checked every tick."""
+        item = {"key": "queue:4.000", "age_s": 900.0, "text": "waiting",
+                "owner": False}
+        p, bridge, *_ = make(pending=[item], cfg=_CONFIRM_ON)
+        p.tick()
+        p.tick()
+        self.assertEqual(bridge.sent, [])
+        self.assertIn("queue:4.000", p._pending_done)
+
+    def test_live_probe_marks_whose_prompt_it_is(self):
+        now = pp.time.monotonic()
+        bc = types.ModuleType("bobert_companion")
+        bc._pending_confirmation = [("reset_memory", "")]
+        bc.CONFIRMATION_TTL_S = 45.0
+        bc._shutdown_prompt_pending = {}
+        cases = (
+            (now - 700.0, now - 705.0, True),    # his turn 5 s before
+            (now - 700.0, now - 1000.0, False),  # a skill's offer, long after
+            (now - 700.0, 0.0, False),           # no turn of his at all
+            (now - 700.0, now - 600.0, False),   # he spoke after it was raised
+        )
+        for at, owner_at, want in cases:
+            with self.subTest(owner_at=owner_at):
+                bc._pending_confirmation_at = [at]
+                bc._last_owner_turn_at = [owner_at]
+                with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+                    items = pp._live_pending()
+                self.assertEqual(items[0]["owner"], want)
+        # The shutdown prompt: armed (wall clock) 600 s ago, his turn 2 s
+        # before it.
+        bc._pending_confirmation = []
+        bc._last_owner_turn_at = [now - 602.0]
+        bc.SHUTDOWN_PROMPT_TIMEOUT_S = 30.0
+        bc._shutdown_prompt_pending = {"armed": True,
+                                       "expires_at": pp.time.time() - 570.0}
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            items = pp._live_pending()
+        self.assertTrue(items[0]["owner"])
+        bc._last_owner_turn_at = [now - 3000.0]
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            self.assertFalse(pp._live_pending()[0]["owner"])
 
     def test_live_probe_reads_names_only(self):
         bc = types.ModuleType("bobert_companion")
@@ -712,9 +908,71 @@ class LiveSeamTests(unittest.TestCase):
     def test_owner_idle_from_the_monolith_stamp(self):
         bc = types.ModuleType("bobert_companion")
         bc._last_owner_turn_at = [pp.time.monotonic() - 125.0]
-        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(pp, "_live_input_idle_s", return_value=None):
             idle = pp._live_owner_idle_s()
         self.assertTrue(124.0 <= idle < 200.0, idle)
+
+    def _awake_bc(self, *, sleep=False, standby=False, muted=False):
+        bc = types.ModuleType("bobert_companion")
+        bc._last_owner_turn_at = [pp.time.monotonic() - 1800.0]
+        bc._sleep_mode = [sleep]
+        bc._standby_mode = [standby]
+        bc._tts_muted = [muted]
+        return bc
+
+    def test_keyboard_and_mouse_input_count_as_present(self):
+        """2026-10-02 review: in wake-word mode he often works at the desk in
+        silence; a print callout said out loud there must not also buzz his
+        phone. Typing within PHONE_PING_AWAY_MIN = here."""
+        bc = self._awake_bc()
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(pp, "_live_input_idle_s", return_value=20.0):
+            idle = pp._live_owner_idle_s()
+        self.assertAlmostEqual(idle, 20.0, delta=1.0)
+        # The turn clock still wins when it is the more recent one.
+        bc._last_owner_turn_at = [pp.time.monotonic() - 5.0]
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(pp, "_live_input_idle_s", return_value=900.0):
+            self.assertLess(pp._live_owner_idle_s(), 60.0)
+
+    def test_input_only_counts_while_jarvis_says_it_out_loud(self):
+        """Asleep, in standby (the standby loop voices only timers and
+        promises) or with his voice muted, JARVIS did NOT say it at the desk:
+        typing there is no reason to hold the ping."""
+        for kw in ({"sleep": True}, {"standby": True}, {"muted": True}):
+            with self.subTest(**kw):
+                bc = self._awake_bc(**kw)
+                with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+                     mock.patch.object(pp, "_live_input_idle_s",
+                                       return_value=20.0):
+                    idle = pp._live_owner_idle_s()
+                self.assertGreater(idle, 1700.0)
+
+    def test_input_idle_probe_off_windows(self):
+        with mock.patch.object(pp.sys, "platform", "linux"):
+            self.assertIsNone(pp._live_input_idle_s())
+
+    def test_overnight_flag_is_asleep(self):
+        d = tempfile.mkdtemp(prefix="jarvis_pp_flag_")
+        self.addCleanup(shutil.rmtree, d, True)
+        flag = os.path.join(d, ".overnight_active")
+        bc = types.ModuleType("bobert_companion")
+        bc.OVERNIGHT_FLAG_FILE = flag
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            self.assertFalse(pp._live_asleep())              # no flag
+            with open(flag, "w", encoding="utf-8") as f:
+                f.write(str(pp.time.time() + 3600))
+            self.assertTrue(pp._live_asleep())               # goodnight
+            with open(flag, "w", encoding="utf-8") as f:
+                f.write(str(pp.time.time() - 60))
+            self.assertFalse(pp._live_asleep())              # expired
+            with open(flag, "w", encoding="utf-8") as f:
+                f.write("garbage")
+            self.assertFalse(pp._live_asleep())
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("bobert_companion", None)
+            self.assertFalse(pp._live_asleep())
 
     def test_focus_reads_either_focus_mode(self):
         bc = types.ModuleType("bobert_companion")

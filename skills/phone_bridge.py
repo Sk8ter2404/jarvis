@@ -1170,8 +1170,11 @@ def phone_ping_status(_: str = "") -> str:
         return "Phone pings aren't available in this build, sir."
     st = _phone_ping.status()
     if not st.get("enabled"):
-        return ("Phone pings are off, sir. Say 'turn on phone pings' and I'll "
-                "text you when something needs you.")
+        msg = ("Phone pings are off, sir. Say 'turn on phone pings' and I'll "
+               "text you when something needs you.")
+        if st.get("configured"):
+            msg += _guard_line()
+        return msg
     if not st.get("configured"):
         return ("Phone pings are on, sir, but your phone isn't connected yet, "
                 "so nothing can go out. Ask me 'how do I connect my phone'.")
@@ -1223,14 +1226,27 @@ def phone_pings_on(_: str = "") -> str:
     return msg
 
 
+def _guard_line() -> str:
+    """What the master switch does NOT cover: guard-mode alerts answer to
+    PHONE_PING_SECURITY alone (core/phone_ping._gate)."""
+    if bool(_cfg("PHONE_PING_SECURITY", True)):
+        return (" Guard-mode alerts still reach your phone; switch those off "
+                "under Guard-mode alerts in Settings.")
+    return " Guard-mode alerts are switched off in Settings too."
+
+
 def phone_pings_off(_: str = "") -> str:
-    """Master switch off (live + saved). notify_phone still works."""
+    """Master switch off (live + saved): no print, confirmation, robot or
+    summary pings. Guard alerts keep their own switch; notify_phone still
+    works."""
     was_on = bool(_cfg("PHONE_PING_ENABLED", True))
     persisted = _set_pings_enabled(False)
     if _phone_ping is not None:
         _phone_ping.stop_watcher()
-    msg = ("Phone pings off, sir. I won't text you unprompted; 'text my phone' "
-           "still works." if was_on else "Phone pings are already off, sir.")
+    msg = ("Phone pings off, sir. I won't text you about prints or anything "
+           "else unprompted; 'text my phone' still works." if was_on
+           else "Phone pings are already off, sir.")
+    msg += _guard_line()
     if not persisted:
         msg += " (I couldn't save it, so it'll revert on restart.)"
     return msg

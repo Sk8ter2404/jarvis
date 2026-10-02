@@ -348,6 +348,9 @@ class WorkshopCanvas:
             brain = _hud_brain(state, time.time())
         except Exception:
             brain = None
+        if jarvis_state in ("standby", "sleep", "sleeping"):
+            # Asleep: the dim reactor is the cue — no brain ring or label.
+            brain = None
 
         # Smooth amp/mic so the pulse breathes instead of jittering.
         self.last_amp = 0.55 * self.last_amp + 0.45 * max(0.0, min(1.0, tts_amp))

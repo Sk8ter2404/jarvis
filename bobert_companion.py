@@ -5107,6 +5107,53 @@ def _drain_tray_commands_once() -> int:
     return n
 
 
+def _force_wake(speak: bool = True, source: str = "tray") -> None:
+    """Wake JARVIS out of sleep / standby with the FULL wake bookkeeping: the
+    tray's "Wake" and the double-clap trigger's "clap to wake"
+    (skills/clap_trigger.py) both call this, so neither keeps a partial copy
+    (2026-10-02 review: the clap's own copy cleared the two flags only, so a
+    clap-wake in overnight mode left the flag file for the engine's next
+    poll to restart into an upgrade mid-use, and the morning chain never saw
+    the day's wake).
+
+    ``speak`` False = no "At your service" (the caller talks). Never raises
+    past a failed spoken line."""
+    # Serialize with the background standby auto-engage daemon (same lock
+    # the wake-word path uses) so an auto-engage firing the instant after
+    # we clear these flags can't re-assert standby and leave JARVIS stuck
+    # asleep with no spoken-wake recourse. 2026-05-30 deep audit.
+    with _standby_auto_engage_lock:
+        _sleep_mode[0]   = False
+        _standby_mode[0] = False
+    # Like the spoken wake: an old music-hit count must not drop him straight
+    # back into standby on the next stray [Music] transcript.
+    _ambient_music_hits[0] = 0
+    _write_hud_state(sleep_mode=False, standby_mode=False)
+    # The same wake bookkeeping as context_aware_greeting (B096): the
+    # pre-wake silence snapshot -- before "At your service" below bumps
+    # last_speech_time -- and today's date, so the morning chain sees the
+    # tray wake as the day's wake event and arrival's silence gate reads
+    # the real overnight gap.
+    try:
+        _note_wake_event()
+    except Exception:
+        pass
+    # Same overnight-flag cleanup the wake-word path uses, so a wake during
+    # overnight mode stops the autonomous engine cleanly (otherwise its next
+    # 60 s poll re-triggers an upgrade cycle in the middle of his use).
+    try:
+        if os.path.exists(OVERNIGHT_FLAG_FILE):
+            os.remove(OVERNIGHT_FLAG_FILE)
+            _write_hud_state(overnight_expiry=0.0)
+    except Exception:
+        pass
+    _write_hud_state(state="Idle")
+    if speak:
+        try: _speak("At your service, sir.")
+        except Exception: pass
+    print(f"  [{source}] force_wake — cleared sleep/standby")
+
+
 def _dispatch_tray_command(cmd: str, entry: dict) -> None:
     """Route a single tray command to the matching JARVIS action handler."""
     if cmd == "enter_standby":
@@ -5118,35 +5165,7 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
                          sleep_mode=True, standby_mode=True)
         print("  [tray] enter_standby — sleep + standby flags set")
     elif cmd == "force_wake":
-        # Serialize with the background standby auto-engage daemon (same lock
-        # the wake-word path uses) so an auto-engage firing the instant after
-        # we clear these flags can't re-assert standby and leave JARVIS stuck
-        # asleep with no spoken-wake recourse. 2026-05-30 deep audit.
-        with _standby_auto_engage_lock:
-            _sleep_mode[0]   = False
-            _standby_mode[0] = False
-        _write_hud_state(sleep_mode=False, standby_mode=False)
-        # The same wake bookkeeping as context_aware_greeting (B096): the
-        # pre-wake silence snapshot -- before "At your service" below bumps
-        # last_speech_time -- and today's date, so the morning chain sees the
-        # tray wake as the day's wake event and arrival's silence gate reads
-        # the real overnight gap.
-        try:
-            _note_wake_event()
-        except Exception:
-            pass
-        # Same overnight-flag cleanup the wake-word path uses, so a wake from
-        # the tray during overnight mode stops the autonomous engine cleanly.
-        try:
-            if os.path.exists(OVERNIGHT_FLAG_FILE):
-                os.remove(OVERNIGHT_FLAG_FILE)
-                _write_hud_state(overnight_expiry=0.0)
-        except Exception:
-            pass
-        _write_hud_state(state="Idle")
-        try: _speak("At your service, sir.")
-        except Exception: pass
-        print("  [tray] force_wake — cleared sleep/standby")
+        _force_wake(speak=True, source="tray")
     elif cmd in ("restart", "shutdown"):
         # LLM-INDEPENDENT CONTROL PLANE (2026-07-14). Restart and shutdown were
         # reachable ONLY as voice/inject ACTIONS — which means they first pass

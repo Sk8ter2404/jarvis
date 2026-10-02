@@ -931,24 +931,29 @@ SCHEMA: dict[str, dict] = {
         "type": "bool", "default": False,
         "help": "Two sharp claps, nothing else loud around them, run the clap "
                 "routine below. Uses the microphone JARVIS already listens on; "
-                "never while he is speaking. 'Clap trigger on/off' by voice "
-                "does the same and saves it here.",
+                "never while he is speaking, during the phone pings' quiet "
+                "hours, in focus or game mode, or while music, a video or "
+                "anything else plays on the speakers. 'Clap trigger on/off' "
+                "by voice does the same and saves it here.",
     },
     "CLAP_TRIGGER_ACTION": {
-        "tab": "hearing", "label": "Clap routine (an action name)",
-        "type": "combo", "default": "predictive_morning_setup",
-        "choices": ["predictive_morning_setup", "acknowledge"],
-        "help": "predictive_morning_setup = set up the workspace (Chrome and "
-                "Apple Music, Teams, volume ~30%). acknowledge = just 'You "
-                "rang, sir?'. Any other action name works too, except power, "
-                "restart, shell, close, delete, send and buy actions, which a "
-                "clap never runs.",
+        "tab": "hearing", "label": "Clap routine",
+        "type": "enum", "default": "acknowledge",
+        "choices": ["acknowledge", "predictive_morning_setup",
+                    "morning_briefing"],
+        "help": "acknowledge = just 'You rang, sir?' (start here: a "
+                "mechanical key or a pen tap can pass for a clap, so listen "
+                "for false triggers first). predictive_morning_setup = set up "
+                "the workspace (Chrome and Apple Music, Teams, volume ~30%). "
+                "morning_briefing = the briefing. A clap runs nothing else. "
+                "'Clap trigger runs the morning setup' by voice sets it too.",
     },
     "CLAP_TRIGGER_WAKE": {
         "tab": "hearing", "label": "Clap to wake",
         "type": "bool", "default": False,
         "help": "A double clap while JARVIS is asleep / in standby wakes him "
-                "and runs the routine. Off = claps are ignored while asleep.",
+                "and runs the routine (never during the quiet hours). Off = "
+                "claps are ignored while asleep.",
     },
     "CLAP_TRIGGER_COOLDOWN_S": {
         "tab": "hearing", "label": "Clap routine cool-down (seconds)",
@@ -1467,28 +1472,32 @@ SCHEMA: dict[str, dict] = {
     "PHONE_PING_ENABLED": {
         "tab": "integrations", "label": "Ping my phone when something needs me",
         "type": "bool", "default": True,
-        "help": "Does nothing until the phone bridge can message you (a "
-                "Telegram token plus your TELEGRAM_USER_ID, or ntfy, or "
-                "Pushover, in .env). Ask 'how do I connect my phone' for the "
-                "steps.",
+        "help": "Print, confirmation and robot pings and the summary. Does "
+                "nothing until the phone bridge can message you (a Telegram "
+                "token plus your TELEGRAM_USER_ID, or ntfy, or Pushover, in "
+                ".env). Ask 'how do I connect my phone' for the steps. Guard "
+                "alerts have their own switch below and ignore this one.",
     },
     "PHONE_PING_PRINT": {
         "tab": "integrations", "label": "Print finished / failed / paused",
         "type": "bool", "default": True,
-        "help": "Bambu printer: a print finished, failed, or paused with an "
-                "error.",
+        "help": "Bambu printer: a print finished, failed (not one you "
+                "cancelled), or paused with an error — once per pause.",
     },
     "PHONE_PING_CONFIRM": {
         "tab": "integrations", "label": "Unanswered confirmation while away",
-        "type": "bool", "default": True,
-        "help": "Something you asked for is waiting on your 'yes' and you've "
-                "stepped away. Only the action's name is sent, never its "
-                "details.",
+        "type": "bool", "default": False,
+        "help": "Something YOU asked for waited on your 'yes' and you stepped "
+                "away. It lapses after 45 seconds, so this is a heads-up that "
+                "nothing ran, not a question. Only the action's name is sent, "
+                "never its details.",
     },
     "PHONE_PING_SECURITY": {
         "tab": "integrations", "label": "Guard-mode alerts",
         "type": "bool", "default": True,
-        "help": "Critical: sent even in quiet hours and focus mode.",
+        "help": "Critical: sent even in quiet hours and focus mode. Its own "
+                "switch: turning phone pings off above does not stop guard "
+                "alerts; turn this off to stop them.",
     },
     "PHONE_PING_ROBOT": {
         "tab": "integrations", "label": "Robot needs attention",
@@ -1517,8 +1526,10 @@ SCHEMA: dict[str, dict] = {
         "tab": "integrations", "label": "Quiet hours start (HH:MM)",
         "type": "combo", "default": "23:00", "nonblank": True,
         "choices": ["21:00", "22:00", "23:00", "00:00"],
-        "help": "Ordinary pings wait until quiet hours end, then arrive as "
-                "one message. Same start and end = no quiet hours.",
+        "help": "Ordinary pings wait until quiet hours end (or you wake "
+                "JARVIS from overnight mode), then arrive as one message. The "
+                "double-clap trigger ignores claps in these hours too. Same "
+                "start and end = no quiet hours.",
     },
     "PHONE_PING_QUIET_END": {
         "tab": "integrations", "label": "Quiet hours end (HH:MM)",
@@ -1529,9 +1540,9 @@ SCHEMA: dict[str, dict] = {
     "PHONE_PING_AWAY_MIN": {
         "tab": "integrations", "label": "Only ping after this long away (min)",
         "type": "float", "default": 10.0, "max": 240,
-        "help": "Minutes since you last said something to JARVIS. While you "
-                "are talking to him he tells you out loud instead. 0 = ping "
-                "anyway.",
+        "help": "Minutes since you last said something to JARVIS — or, while "
+                "he is awake and talking, typed or moved the mouse. While you "
+                "are here he tells you out loud instead. 0 = ping anyway.",
     },
     "PHONE_PING_CONFIRM_AFTER_MIN": {
         "tab": "integrations", "label": "Unanswered confirmation: wait (min)",
@@ -1616,11 +1627,12 @@ SCHEMA: dict[str, dict] = {
     "BRAIN_GLOW_ENABLED": {
         "tab": "advanced", "label": "HUD glow shows which brain answers",
         "type": "bool", "default": True,
-        "help": "The reactor's outer glow takes the colour of the brain that "
-                "is answering: local model blue, Claude Sonnet gold, Opus "
-                "violet, Haiku green. Changes when you switch brains and when "
-                "a turn falls back to the other brain. The listening / "
-                "thinking / speaking colours stay on the reactor's core.",
+        "help": "A glowing ring around the reactor takes the colour of the "
+                "brain that is answering: local model blue, Claude Sonnet "
+                "gold, Opus violet, Haiku green. Changes when you switch "
+                "brains and when a turn falls back to the other brain. The "
+                "halo keeps the listening / thinking / speaking colours; no "
+                "ring while JARVIS is asleep.",
     },
     "BRAIN_GLOW_LABEL_S": {
         "tab": "advanced", "label": "Brain name label (seconds)",

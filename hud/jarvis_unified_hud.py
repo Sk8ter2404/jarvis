@@ -67,12 +67,18 @@ except Exception:
 
 # Brain glow (core/brain_glow.py): hud_state's ``brain`` = the colour + brief
 # name label of the brain that is answering (local blue, Sonnet gold, Opus
-# violet...). Fail-open: a missing helper means no glow, never a dead HUD.
+# violet...), drawn as a ring of its own around the reactor — the halo keeps
+# the state colour. Fail-open: a missing helper means no ring, never a dead HUD.
 try:
     from core.brain_glow import hud_brain as _hud_brain
 except Exception:  # pragma: no cover - core/ always ships next to hud/
     def _hud_brain(_hud, _now=None):
         return None
+
+# States in which no brain ring is drawn: the dim reactor reads "asleep".
+_ASLEEP_STATES = ("standby", "sleep", "sleeping")
+# The brain ring's radius, in reactor radii: just outside the metric arcs.
+BRAIN_RING_R = 1.14
 
 try:
     import psutil
@@ -747,8 +753,11 @@ class UnifiedHud(QWidget):
         return CYAN
 
     def _glow_hex(self) -> str | None:
-        """The brain glow colour ("#RRGGBB"), or None for the normal
-        state-coloured halo (no brain published, glow off, garbage key)."""
+        """The brain ring's colour ("#RRGGBB"), or None for no ring: no brain
+        published, glow off, a garbage key — or JARVIS asleep / in standby,
+        where the dim at-rest reactor is the asleep cue."""
+        if str(getattr(self, "state", "") or "").lower() in _ASLEEP_STATES:
+            return None
         col = getattr(getattr(self, "brain", None), "color", None)
         return col if isinstance(col, str) and col else None
 
@@ -756,7 +765,8 @@ class UnifiedHud(QWidget):
         """The brief brain-name label under the reactor, fading out with
         HudBrain.label_alpha. Draws nothing without a brain or once faded."""
         b = getattr(self, "brain", None)
-        if b is None or not getattr(b, "label", "") or b.label_alpha <= 0.0:
+        if (b is None or not getattr(b, "label", "") or b.label_alpha <= 0.0
+                or self._glow_hex() is None):
             return
         col = QColor(b.color)
         col.setAlpha(int(255 * max(0.0, min(1.0, b.label_alpha))))
@@ -1108,25 +1118,30 @@ class UnifiedHud(QWidget):
 
     # ── reactor ───────────────────────────────────────────────────────────────
     def _draw_reactor(self, p, cx, cy, R, accent, s) -> None:
-        # Glow halo — the BRAIN's colour when one is published (core/
-        # brain_glow), else the state accent. The state colours stay on the
-        # core ring + hub below, so listening/thinking/speaking still read.
-        glow_hex = self._glow_hex()
-        halo = QColor(glow_hex) if glow_hex else accent
+        # Glow halo — the STATE accent (listening green, thinking gold,
+        # speaking cyan, dim asleep), as before the brain glow. The answering
+        # brain's colour (core/brain_glow) is a glowing ring of its own just
+        # outside the metric arcs: 2026-10-02 review — on the halo, Sonnet's
+        # gold read as "thinking" all the time, so the two never share it.
         glow = QRadialGradient(QPointF(cx, cy), R * 1.5)
-        g0 = QColor(halo); g0.setAlpha(0)
-        g1 = QColor(halo); g1.setAlpha(120)
-        g2 = QColor(halo); g2.setAlpha(0)
+        g0 = QColor(accent); g0.setAlpha(0)
+        g1 = QColor(accent); g1.setAlpha(120)
+        g2 = QColor(accent); g2.setAlpha(0)
         glow.setColorAt(0.45, g0)
         glow.setColorAt(0.82, g1)
         glow.setColorAt(1.0, g2)
         p.setBrush(QBrush(glow)); p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(QPointF(cx, cy), R * 1.5, R * 1.5)
+        glow_hex = self._glow_hex()
         if glow_hex:
-            # A thin brain-coloured rim just outside the metric arcs.
-            rim = QColor(halo); rim.setAlpha(150)
-            p.setPen(QPen(rim, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QPointF(cx, cy), R * 1.12, R * 1.12)
+            # The brain ring: a soft wide stroke under a crisp one.
+            soft = QColor(glow_hex); soft.setAlpha(70)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(soft, max(4.0, 7.0 * s)))
+            p.drawEllipse(QPointF(cx, cy), R * BRAIN_RING_R, R * BRAIN_RING_R)
+            rim = QColor(glow_hex); rim.setAlpha(220)
+            p.setPen(QPen(rim, max(1.5, 2.0 * s)))
+            p.drawEllipse(QPointF(cx, cy), R * BRAIN_RING_R, R * BRAIN_RING_R)
 
         outer = QRectF(cx - R, cy - R, 2 * R, 2 * R)
         p.setPen(QPen(CYAN_DIM, 2)); p.setBrush(Qt.BrushStyle.NoBrush)

@@ -179,6 +179,17 @@ class UnifiedHudReaderTests(unittest.TestCase):
         paint = inspect.getsource(self.mod.UnifiedHud.paintEvent)
         self.assertIn("_draw_brain_label", paint)
 
+    def test_no_ring_asleep_or_in_standby(self):
+        """2026-10-02 review: the brain glow at full brightness in standby /
+        sleep took away the asleep cue."""
+        for st in ("Standby", "Sleep", "sleeping"):
+            with self.subTest(state=st):
+                hud = self._bare()
+                self.assertTrue(self._refresh(hud, {"state": st,
+                                                    "brain": _OPUS}))
+                self.assertIsNotNone(hud.brain)
+                self.assertIsNone(hud._glow_hex())
+
 
 class ArcReactorReaderTests(unittest.TestCase):
     def setUp(self):
@@ -222,6 +233,14 @@ class ArcReactorReaderTests(unittest.TestCase):
         import inspect
         src = inspect.getsource(self.mod.ArcReactorStatusScene.drawBackground)
         self.assertIn("_glow_hex", src)
+
+    def test_no_ring_asleep_or_in_standby(self):
+        for st in ("Standby", "Sleep"):
+            with self.subTest(state=st):
+                sc = self._bare()
+                self.assertTrue(self._refresh(sc, {"state": st,
+                                                   "brain": _OPUS}))
+                self.assertIsNone(sc._glow_hex())
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -309,6 +328,17 @@ class _TkFrameMixin:
                 self.assertEqual(_ovals(c), _ovals(base))
                 self.assertEqual(len(_texts(c)), len(_texts(base)))
 
+    def test_no_brain_ring_or_label_asleep(self):
+        """Asleep / in standby the overlay keeps its at-rest look: the brain
+        ring and label are not drawn (2026-10-02 review)."""
+        for st in ("Standby", "Sleep"):
+            with self.subTest(state=st):
+                base = self._frame({"state": st})
+                glow = self._frame({"state": st, "brain": _OPUS})
+                self.assertNotIn(_OPUS["color"].lower(), _colours(glow))
+                self.assertEqual(_ovals(glow), _ovals(base))
+                self.assertFalse(any("OPUS" in t for t in _texts(glow)))
+
     def test_every_state_renders_with_a_brain(self):
         for st in ("Idle", "Listening", "Thinking", "Speaking", "Standby"):
             with self.subTest(state=st):
@@ -347,38 +377,56 @@ def load(fn, name):
     spec.loader.exec_module(m); return m
 
 opus = BG.brain_state("claude-opus-5-5", "cloud", label_s=60.0)
-cases = {"opus": {"brain": opus}, "none": {}, "garbage": {"brain": {"color": "violet"}},
-         "garbage2": {"brain": "opus"}}
+sonnet = BG.brain_state("claude-sonnet-5-5", "cloud", label_s=60.0)
+# (state, hud_state) per case. The ring pixel sits on the brain ring; the halo
+# pixel on the state-coloured halo outside it.
+cases = {"opus": ("idle", {"brain": opus}), "none": ("idle", {}),
+         "garbage": ("idle", {"brain": {"color": "violet"}}),
+         "garbage2": ("idle", {"brain": "opus"}),
+         "think_sonnet": ("thinking", {"brain": sonnet}),
+         "think_none": ("thinking", {}),
+         "standby_opus": ("standby", {"brain": opus}),
+         "standby_none": ("standby", {})}
 out = {"unified": {}, "arc": {}}
+
+def rgb(c):
+    return [c.red(), c.green(), c.blue()]
 
 ju = load("jarvis_unified_hud.py", "_ju_render")
 class Slow:
     def snapshot(self): return {}
-for key, hud_state in cases.items():
+for key, (state, hud_state) in cases.items():
     w = ju.UnifiedHud(0, Slow())
     w.resize(420, 560)
-    w.state = "idle"
+    w.state = state
     w.brain = ju._hud_brain(hud_state, time.time())
     img = w.grab().toImage()
     W, s = 420.0, 1.0
     title_h = 34.0 * s; top = title_h + 12 * s
     size = min(W - 28.0 * s, 560 * 0.40); R = size * 0.42
     cx, cy = W / 2.0, top + size / 2.0
-    c = img.pixelColor(int(cx - 1.23 * R), int(cy))
-    out["unified"][key] = [c.red(), c.green(), c.blue()]
+    out["unified"][key] = {
+        "ring": rgb(img.pixelColor(int(round(cx - ju.BRAIN_RING_R * R)), int(cy))),
+        "halo": rgb(img.pixelColor(int(cx - 1.23 * R), int(cy)))}
     w.timer.stop(); w.cam_timer.stop(); w.deleteLater()
 
 ar = load("arc_reactor_status_hud.py", "_arc_render")
-for key, hud_state in cases.items():
+for key, (state, hud_state) in cases.items():
     sc = ar.ArcReactorStatusScene(320, 320, 0)
+    sc.state = state
     sc.brain = ar._hud_brain(hud_state, time.time())
     img = QImage(320, 320, QImage.Format.Format_ARGB32_Premultiplied)
     img.fill(QColor(0, 0, 0, 0))
     p = QPainter(img)
     sc.render(p, QRectF(0, 0, 320, 320), QRectF(0, 0, 320, 320))
     p.end()
-    c = img.pixelColor(64, 64)
-    out["arc"][key] = [c.red(), c.green(), c.blue()]
+    d_ring = sc.R_OUTER * ar.BRAIN_RING_R / 2 ** 0.5
+    d_halo = sc.R_GLOW * 0.95 / 2 ** 0.5
+    out["arc"][key] = {
+        "ring": rgb(img.pixelColor(int(round(sc.cx - d_ring)),
+                                   int(round(sc.cy - d_ring)))),
+        "halo": rgb(img.pixelColor(int(round(sc.cx - d_halo)),
+                                   int(round(sc.cy - d_halo))))}
 print("RESULT " + json.dumps(out))
 """
 
@@ -392,8 +440,10 @@ def _pyqt6_installed() -> bool:
 
 @unittest.skipUnless(_pyqt6_installed(), "PyQt6 not installed (light tier)")
 class RealRenderTests(unittest.TestCase):
-    """The halo pixel turns violet for an Opus brain and stays the normal
-    cyan with no brain or a garbage brain — and nothing raises."""
+    """The brain RING turns violet for an Opus brain and stays the normal
+    look with no brain or a garbage brain; the HALO keeps the state colour
+    whatever the brain (2026-10-02 review: Sonnet's gold on the halo read as
+    "thinking"); asleep / in standby there is no ring — and nothing raises."""
 
     result: dict = {}
 
@@ -415,18 +465,25 @@ class RealRenderTests(unittest.TestCase):
 
     def _check(self, hud):
         px = self.result[hud]
+        ring = {k: v["ring"] for k, v in px.items()}
+        halo = {k: v["halo"] for k, v in px.items()}
         # Opus violet (#B05CFF) has far more red than the idle cyan (#4CC9FF)
-        # and less green.
-        self.assertGreater(px["opus"][0], px["none"][0] + 20, px)
-        self.assertLess(px["opus"][1], px["none"][1], px)
+        # and reads violet: blue well above green.
+        self.assertGreater(ring["opus"][0], ring["none"][0] + 20, px)
+        self.assertGreater(ring["opus"][2], ring["opus"][1] + 60, px)
         # Garbage renders exactly like no brain at all.
-        self.assertEqual(px["garbage"], px["none"], px)
-        self.assertEqual(px["garbage2"], px["none"], px)
+        self.assertEqual(ring["garbage"], ring["none"], px)
+        self.assertEqual(ring["garbage2"], ring["none"], px)
+        # The halo is the STATE's: a brain never recolours it.
+        self.assertEqual(halo["opus"], halo["none"], px)
+        self.assertEqual(halo["think_sonnet"], halo["think_none"], px)
+        # Asleep / in standby: no ring, the dim at-rest look.
+        self.assertEqual(ring["standby_opus"], ring["standby_none"], px)
 
-    def test_unified_hud_halo(self):
+    def test_unified_hud_ring(self):
         self._check("unified")
 
-    def test_arc_reactor_halo(self):
+    def test_arc_reactor_ring(self):
         self._check("arc")
 
 

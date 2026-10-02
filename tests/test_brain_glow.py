@@ -369,6 +369,24 @@ def _bc(*, takes_local=None, routing=None, backend="claude",
 
 
 class ExpectedBrainTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("JARVIS_LOCAL_LLM_MODEL", None)
+
+    def test_env_override_wins_while_the_resolver_cache_is_cold(self):
+        """The resolver puts JARVIS_LOCAL_LLM_MODEL first; at boot its cache
+        is still cold, so the boot glow must not name the configured tag
+        instead (2026-10-02 review). A warm cache still wins."""
+        import os
+        os.environ["JARVIS_LOCAL_LLM_MODEL"] = "llama3.2:3b"
+        bc = _bc(takes_local=True, local_model=GEMMA)
+        self.assertEqual(BG.expected_brain(bc), ("local", "llama3.2:3b"))
+        bc = _bc(takes_local=True, resolved=QWEN, local_model=GEMMA)
+        self.assertEqual(BG.expected_brain(bc), ("local", QWEN))
+
     def test_local_route_predicate_wins(self):
         self.assertEqual(BG.expected_brain(_bc(takes_local=True, backend="claude")),
                          ("local", GEMMA))

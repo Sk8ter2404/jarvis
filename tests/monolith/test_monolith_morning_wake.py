@@ -151,6 +151,42 @@ class WakeEventBookkeepingTests(_Base):
         self.assertAlmostEqual(bc._pre_wake_silence_seconds[0], 7 * 3600.0,
                                delta=60.0)
 
+    def test_clap_wake_does_the_whole_tray_wake_silently(self):
+        """2026-10-02 review: the double-clap trigger's "clap to wake" kept
+        its own copy that cleared the two flags only — no wake stamp (the
+        morning chain never fired that day) and the overnight flag left for
+        the engine's next poll to restart into an upgrade mid-use. It now
+        calls the tray's _force_wake: same bookkeeping, no "At your
+        service" (the clap routine does the talking)."""
+        bc = self.bc
+        self._owner_last_spoke(7 * 3600.0)
+        bc._sleep_mode[0] = True
+        bc._standby_mode[0] = True
+        self._p(bc, "_ambient_music_hits", [1])
+        with mock.patch.object(bc, "_write_hud_state"), \
+             mock.patch.object(bc, "_speak") as mspeak, \
+             mock.patch.object(bc.os.path, "exists", return_value=True), \
+             mock.patch.object(bc.os, "remove") as mremove, \
+             _fake_now(7):
+            bc._force_wake(speak=False, source="clap")
+        self.assertFalse(bc._sleep_mode[0])
+        self.assertFalse(bc._standby_mode[0])
+        self.assertEqual(bc._last_wake_date[0], "2026-06-01")
+        self.assertAlmostEqual(bc._pre_wake_silence_seconds[0], 7 * 3600.0,
+                               delta=60.0)
+        mremove.assert_called_once_with(bc.OVERNIGHT_FLAG_FILE)
+        self.assertEqual(bc._ambient_music_hits[0], 0)
+        mspeak.assert_not_called()
+
+    def test_the_clap_skill_wakes_through_force_wake(self):
+        """The real skill against the real monolith: a clap-to-wake double
+        clap calls _force_wake(speak=False, source="clap")."""
+        mod, _a = load_skill_isolated("clap_trigger", register=False)
+        bc = self.bc
+        with mock.patch.object(bc, "_force_wake") as fw:
+            mod._wake(bc)
+        fw.assert_called_once_with(speak=False, source="clap")
+
     def test_greeting_reads_first_of_day_before_the_stamp(self):
         # context_aware_greeting now stamps through _note_wake_event; it must
         # still read "first wake of the day" BEFORE that stamp.

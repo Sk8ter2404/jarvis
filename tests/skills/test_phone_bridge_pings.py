@@ -216,7 +216,8 @@ class StatusTests(Base):
         p = pp.get_pinger()
         p.blocked = lambda: ""
         with mock.patch.dict(os.environ, {"NTFY_TOPIC": "t"}, clear=True), \
-             mock.patch.object(_cfg, "PHONE_PING_ROBOT", False):
+             mock.patch.object(_cfg, "PHONE_PING_ROBOT", False), \
+             mock.patch.object(_cfg, "PHONE_PING_CONFIRM", True):
             text = self.actions["phone_ping_status"]("")
         self.assertIn("through ntfy: prints, unanswered confirmations and "
                       "guard alerts.", text)
@@ -224,6 +225,13 @@ class StatusTests(Base):
         self.assertIn("23:00 to 07:00", text)
         self.assertIn("at most 6 an hour", text)
         self.assertIn("0 sent in the last hour.", text)
+
+    def test_off_but_connected_says_guard_alerts_still_go(self):
+        _cfg.PHONE_PING_ENABLED = False
+        with mock.patch.dict(os.environ, {"NTFY_TOPIC": "t"}, clear=True):
+            text = self.actions["phone_ping_status"]("")
+        self.assertIn("Phone pings are off", text)
+        self.assertIn("Guard-mode alerts still reach your phone", text)
 
 
 class ToggleTests(Base):
@@ -239,6 +247,8 @@ class ToggleTests(Base):
             again = self.actions["phone_pings_on"]("")
         self.assertIn("Phone pings off", off)
         self.assertIn("'text my phone' still works", off)
+        # 2026-10-02 review: it says the guard is NOT silenced by this.
+        self.assertIn("Guard-mode alerts still reach your phone", off)
         self.assertIn("Phone pings on", on)
         self.assertIn("already on", again)
         stop.assert_called_once()
@@ -254,6 +264,33 @@ class ToggleTests(Base):
             text = self.actions["phone_pings_on"]("")
         self.assertIn("isn't connected yet", text)
         self.assertTrue(_cfg.PHONE_PING_ENABLED)
+
+    def test_off_with_guard_alerts_switched_off_says_so(self):
+        with mock.patch.object(_cfg, "PHONE_PING_SECURITY", False):
+            text = self.actions["phone_pings_off"]("")
+        self.assertIn("Guard-mode alerts are switched off in Settings too", text)
+
+    def test_dont_ping_me_leaves_the_guard_armed_end_to_end(self):
+        """'don't ping me' -> phone_pings_off saves the master switch off;
+        a guard alert through the bridge's ping_phone still reaches ntfy."""
+        _cfg.PHONE_PING_ENABLED = True
+        self.assertEqual(self.mod._phone_route("don't ping me"),
+                         "[ACTION: phone_pings_off]")
+        fake = _fake_requests()
+        p = pp.get_pinger()
+        p.blocked = lambda: ""
+        p.spawn = lambda job: (job(), True)[1]
+        with mock.patch.dict(os.environ, {"NTFY_TOPIC": "t"}, clear=True), \
+             mock.patch.dict(sys.modules, {"requests": fake}), \
+             mock.patch.object(pp, "stop_watcher"):
+            self.actions["phone_pings_off"]("")
+            self.assertFalse(_cfg.PHONE_PING_ENABLED)
+            self.assertEqual(self.mod.ping_phone("print", "Print finished."),
+                             pp.DISABLED)
+            out = self.mod.ping_phone("security", "Someone is at the desk.",
+                                      critical=True, priority="urgent")
+        self.assertEqual(out, pp.QUEUED)
+        self.assertEqual(fake.post.call_count, 1)
 
     def test_a_failed_save_is_reported(self):
         self.persist.return_value = False

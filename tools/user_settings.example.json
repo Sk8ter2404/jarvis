@@ -51,7 +51,7 @@
 
 
   "CLAP_TRIGGER_ENABLED": false,
-  "CLAP_TRIGGER_ACTION": "predictive_morning_setup",
+  "CLAP_TRIGGER_ACTION": "acknowledge",
   "CLAP_TRIGGER_WAKE": false,
   "CLAP_TRIGGER_COOLDOWN_S": 60.0,
   "CLAP_TRIGGER_MIN_PEAK": 0.12,
@@ -113,7 +113,7 @@
   "DEEP_AUDIT_BUDGET_USD": 5.0,
   "PHONE_PING_ENABLED": true,
   "PHONE_PING_PRINT": true,
-  "PHONE_PING_CONFIRM": true,
+  "PHONE_PING_CONFIRM": false,
   "PHONE_PING_SECURITY": true,
   "PHONE_PING_ROBOT": true,
   "PHONE_PING_SUMMARY": false,

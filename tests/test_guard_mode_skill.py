@@ -361,10 +361,58 @@ class AlertRateLimitTests(GuardBase):
         self.assertTrue(mod._push_alert("x"))
 
     def test_a_switched_off_security_category_is_not_a_push(self):
+        """His own PHONE_PING_SECURITY switch (and staging, and no bridge)
+        stop the guard's push; nothing falls back around them."""
+        for outcome in ("category_off", "blocked", "unconfigured"):
+            with self.subTest(outcome=outcome):
+                phone = _fake_phone()
+                phone.ping_phone = (lambda category, message, _o=outcome,
+                                    **kw: _o)
+                mod, _a = self._load(phone=phone, kinect_enabled=True)
+                self.assertFalse(mod._push_alert("Someone is at the desk, sir."))
+                self.assertEqual(phone.pushes, [])
+
+    def test_a_broken_or_master_gated_policy_still_pushes(self):
+        """2026-10-02 review: "phone pings off" must never quietly disarm the
+        guard's push. If the policy layer is missing / broken, or an older
+        one still answers "disabled" for the general master switch, the alert
+        goes out the old way (push_to_phone, urgent, fire-and-forget)."""
+        for outcome in ("disabled", "unavailable", "failed", "raise"):
+            with self.subTest(outcome=outcome):
+                phone = _fake_phone()
+
+                def _ping(category, message, _o=outcome, **kw):
+                    if _o == "raise":
+                        raise RuntimeError("policy bug")
+                    return _o
+                phone.ping_phone = _ping
+                mod, _a = self._load(phone=phone, kinect_enabled=True)
+                self.assertTrue(mod._push_alert("Someone is at the desk, sir."))
+                self.assertEqual(len(phone.pushes), 1)
+                _msg, kw = phone.pushes[0]
+                self.assertEqual(kw.get("priority"), "urgent")
+                self.assertFalse(kw.get("confirm", True))
+
+    def test_phone_pings_off_keeps_guard_alerts_end_to_end(self):
+        """The real policy (core/phone_ping) behind the real bridge's
+        ping_phone: the master switch off, PHONE_PING_SECURITY on -> the
+        guard's alert is queued to the phone."""
+        from core import config as cfg
+        from core import phone_ping as pp
+        sent = []
+        pinger = pp.PhonePinger(
+            send=lambda text, **kw: sent.append(text) or {"ntfy": True},
+            configured=lambda: True, cfg=lambda n: {
+                "PHONE_PING_ENABLED": False}.get(n, pp.DEFAULTS.get(n)),
+            blocked=lambda: "", state_path=None, log=lambda s: None,
+            spawn=lambda job: (job(), True)[1])
         phone = _fake_phone()
-        phone.ping_phone = lambda category, message, **kw: "category_off"
-        mod, _a = self._load(phone=phone, kinect_enabled=True)
-        self.assertFalse(mod._push_alert("Someone is at the desk, sir."))
+        phone.ping_phone = lambda category, message, **kw: pinger.ping(
+            category, message, **kw)
+        with mock.patch.object(cfg, "PHONE_PING_ENABLED", False, create=True):
+            mod, _a = self._load(phone=phone, kinect_enabled=True)
+            self.assertTrue(mod._push_alert("Someone is at the desk, sir."))
+        self.assertEqual(len(sent), 1)
         self.assertEqual(phone.pushes, [])
 
     def test_staging_suppresses_speech_and_push(self):

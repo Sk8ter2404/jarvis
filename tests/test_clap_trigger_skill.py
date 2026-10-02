@@ -130,6 +130,18 @@ class _Base(unittest.TestCase):
         p = mock.patch.object(self.mod, "_spawn", lambda fn, *a: fn(*a))
         p.start()
         self.addCleanup(p.stop)
+        # Mid-afternoon (the night gate is pinned on its own), and silent
+        # speakers: no test reads the real clock or the real playback meter.
+        import datetime as _dt
+        self.wall = [_dt.datetime(2026, 10, 2, 14, 0)]
+        p = mock.patch.object(self.mod, "_now_local", lambda: self.wall[0])
+        p.start()
+        self.addCleanup(p.stop)
+        self.speaker_peak = [0.0]
+        p = mock.patch.object(self.mod, "_speaker_peak",
+                              lambda: self.speaker_peak[0])
+        p.start()
+        self.addCleanup(p.stop)
         self.mod._reset_state_for_tests()
         from core import self_echo
         self_echo._reset_for_tests()
@@ -266,6 +278,112 @@ class GateTests(_Base):
         self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=105.0),
                          "fired")
 
+    # ── 2026-10-02 review: the gates a false double clap needs ──────────────
+    def test_night_hours_ignore_even_with_clap_to_wake(self):
+        """A false double clap at 3 a.m. must not wake him, set up the desk
+        or speak — the phone pings' quiet hours, read live."""
+        import datetime as _dt
+        self.flag("CLAP_TRIGGER_WAKE", True)
+        for hhmm, fired in (((3, 0), False), ((23, 30), False),
+                            ((6, 59), False), ((7, 0), True), ((22, 59), True)):
+            with self.subTest(at=hhmm):
+                self.mod._reset_state_for_tests()
+                self.wall[0] = _dt.datetime(2026, 10, 2, *hhmm)
+                bc = self.bc(sleep=True, standby=True)
+                out = self.mod.handle_double_clap(bc, _event(), now=10.0)
+                self.assertEqual(out == "fired", fired, out)
+                self.assertEqual(bc._sleep_mode[0], not fired)
+                if not fired:
+                    self.assertIn("night", out)
+                    self.assertEqual(bc._announced, [])
+
+    def test_night_window_is_the_quiet_hours_setting(self):
+        import datetime as _dt
+        self.wall[0] = _dt.datetime(2026, 10, 2, 21, 30)
+        bc = self.bc()
+        self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=10.0),
+                         "fired")
+        self.mod._reset_state_for_tests()
+        self.flag("PHONE_PING_QUIET_START", "21:00")
+        self.assertIn("night", self.mod.handle_double_clap(bc, _event(),
+                                                           now=10.0))
+        self.mod._reset_state_for_tests()
+        self.flag("PHONE_PING_QUIET_END", "21:00")   # start == end: none
+        self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=10.0),
+                         "fired")
+
+    def test_focus_mode_ignores_either_kind(self):
+        bc = self.bc()
+        bc.focus_mode_active = lambda: True
+        self.assertIn("focus", self.mod.handle_double_clap(bc, _event(),
+                                                           now=10.0))
+        self.flag("FOCUS_MODE_ENABLED", False)     # the feature's kill switch
+        self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=10.0),
+                         "fired")
+        # The automatic one (a CAD / slicer window): skills/dnd_focus_mode.
+        self.mod._reset_state_for_tests()
+        dnd = types.ModuleType("skill_dnd_focus_mode")
+        dnd.is_focus_mode_active = lambda: True
+        self.inject("skill_dnd_focus_mode", dnd)
+        self.assertIn("focus", self.mod.handle_double_clap(self.bc(), _event(),
+                                                           now=10.0))
+        self.assertEqual(len(self.setup_calls), 1)
+
+    def test_media_playing_ignores(self):
+        """A video with claps in it, Apple Music, a TV: the monolith's
+        _ambient_media_is_playing (media session / room music / camera)."""
+        bc = self.bc()
+        bc._ambient_media_is_playing = lambda: True
+        self.assertIn("media", self.mod.handle_double_clap(bc, _event(),
+                                                           now=10.0))
+        # No full probe on an older monolith: the media session alone.
+        bc = self.bc()
+        bc._smtc_media_playing = lambda: True
+        self.assertIn("media", self.mod.handle_double_clap(bc, _event(),
+                                                           now=10.0))
+        self.assertEqual(self.setup_calls, [])
+
+    def test_music_jarvis_started_recently_ignores(self):
+        bc = self.bc()
+        bc._jarvis_played_music_at = [time.time() - 120.0]
+        self.assertIn("media", self.mod.handle_double_clap(bc, _event(),
+                                                           now=10.0))
+        bc._jarvis_played_music_at = [time.time() - 3600.0]
+        self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=10.0),
+                         "fired")
+
+    def test_sound_on_the_speakers_ignores(self):
+        bc = self.bc()
+        self.speaker_peak[0] = 0.3          # a game, a call, a clip
+        self.assertIn("speakers", self.mod.handle_double_clap(bc, _event(),
+                                                              now=10.0))
+        self.speaker_peak[0] = 0.001        # a silent device
+        self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=10.0),
+                         "fired")
+
+    def test_an_unreadable_meter_does_not_block(self):
+        bc = self.bc()
+        self.speaker_peak[0] = None
+        self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=10.0),
+                         "fired")
+
+    def test_clap_to_wake_uses_the_monoliths_full_wake(self):
+        """2026-10-02 review: the tray's own wake (_force_wake) — the overnight
+        flag, the morning chain's wake stamp — silently, not a partial copy."""
+        self.flag("CLAP_TRIGGER_WAKE", True)
+        bc = self.bc(sleep=True, standby=True)
+        calls = []
+
+        def _fw(speak=True, source="tray"):
+            calls.append((speak, source))
+            bc._sleep_mode[0] = False
+            bc._standby_mode[0] = False
+        bc._force_wake = _fw
+        self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=10.0),
+                         "fired")
+        self.assertEqual(calls, [(False, "clap")])
+        self.assertEqual(len(self.setup_calls), 1)
+
 
 # ─── the routine ────────────────────────────────────────────────────────────
 class RoutineTests(_Base):
@@ -282,19 +400,70 @@ class RoutineTests(_Base):
         self.assertEqual(bc._announced, [("clap", self.mod.ACK_LINE)])
 
     def test_blank_setting_means_the_default(self):
+        """The default is the acknowledgement (2026-10-02 review): a blank
+        setting never runs the workspace setup."""
         self.flag("CLAP_TRIGGER_ACTION", "  ")
         bc = self.bc()
         self.mod.handle_double_clap(bc, _event(), now=10.0)
-        self.assertEqual(len(self.setup_calls), 1)
+        self.assertEqual(self.setup_calls, [])
+        self.assertEqual(bc._announced, [("clap", self.mod.ACK_LINE)])
 
-    def test_a_configured_safe_action_runs(self):
+    def test_the_morning_briefing_may_run(self):
         calls = []
-        self.flag("CLAP_TRIGGER_ACTION", "weather_briefing")
-        bc = self.bc(actions={"weather_briefing":
+        self.flag("CLAP_TRIGGER_ACTION", "morning_briefing")
+        bc = self.bc(actions={"morning_briefing":
                               lambda _="": calls.append(1) or "Sunny, sir."})
         self.mod.handle_double_clap(bc, _event(), now=10.0)
         self.assertEqual(calls, [1])
         self.assertEqual(bc._announced, [("clap", "Sunny, sir.")])
+
+    def test_an_alias_of_the_setup_runs_by_handler(self):
+        """A name bound to the SAME handler as an allow-listed action runs; a
+        look-alike name bound to something else does not."""
+        self.flag("CLAP_TRIGGER_ACTION", "desk_please")
+        bc = self.bc(actions={"predictive_morning_setup": self.setup_fn,
+                              "desk_please": self.setup_fn})
+        self.mod.handle_double_clap(bc, _event(), now=10.0)
+        self.assertEqual(len(self.setup_calls), 1)
+        ran = []
+        self.mod._reset_state_for_tests()
+        bc = self.bc(actions={"predictive_morning_setup": self.setup_fn,
+                              "desk_please": lambda _="": ran.append(1)})
+        self.mod.handle_double_clap(bc, _event(), now=10.0)
+        self.assertEqual(ran, [])
+        self.assertIn("won't run", bc._announced[0][1])
+
+    def test_only_the_allow_list_runs_on_a_clap(self):
+        """2026-10-02 review: the old word list let these through. An
+        allow-list refuses every one of them, however harmless it sounds."""
+        for name in ("guard_off", "resume_print", "export_memory",
+                     "smart_home_purge_cookie", "scrap_pending_draft",
+                     "archive_email", "archive_message", "text_my_phone",
+                     "notify_phone", "say_aloud", "stop_pipeline",
+                     "web_interface_off", "force_backup", "type", "hotkey",
+                     "click", "set_model", "switch_llm", "hibernate_pc",
+                     "sleep_pc", "lock_pc", "log_off", "sign_out",
+                     "weather_briefing", "unlock_front_door"):
+            with self.subTest(action=name):
+                ran = []
+                self.flag("CLAP_TRIGGER_ACTION", name)
+                bc = self.bc(actions={name: lambda _="": ran.append(1) or "x"})
+                self.mod._reset_state_for_tests()
+                self.mod.handle_double_clap(bc, _event(), now=10.0)
+                self.assertEqual(ran, [], f"{name} ran on a clap")
+                self.assertEqual(len(bc._announced), 1)
+                self.assertIn("won't run", bc._announced[0][1])
+
+    def test_action_risk_is_a_floor_under_the_allow_list(self):
+        """Even an allow-listed name is refused if core/action_risk ever
+        classes it as risky."""
+        with mock.patch("core.action_risk.confirm_reasons",
+                        return_value=("spends money",)):
+            refusal = self.mod._routine_refusal("predictive_morning_setup",
+                                                self.bc())
+        self.assertTrue(refusal)
+        self.assertIsNone(self.mod._routine_refusal(
+            "predictive_morning_setup", self.bc()))
 
     def test_dangerous_actions_never_run_on_a_clap(self):
         for name in ("shutdown_jarvis", "turn_off_jarvis", "restart",
@@ -329,6 +498,83 @@ class RoutineTests(_Base):
         bc = self.bc(actions={"predictive_morning_setup": lambda _="": ""})
         self.mod.handle_double_clap(bc, _event(), now=10.0)
         self.assertEqual(bc._announced, [("clap", self.mod.ACK_LINE)])
+
+
+# ─── the speaker meter probe (fake pycaw / comtypes; never the real device) ──
+class SpeakerMeterProbeTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _a = load_skill_isolated("clap_trigger", register=False)
+        p = mock.patch.object(self.mod.time, "sleep", lambda s: None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _fake_audio(self, peaks=None, activate_raises=False):
+        comtypes = types.ModuleType("comtypes")
+        comtypes.CLSCTX_ALL = 23
+        comtypes.inits = []
+        comtypes.CoInitialize = lambda: comtypes.inits.append(1)
+        pycaw = types.ModuleType("pycaw")
+        pp = types.ModuleType("pycaw.pycaw")
+        reads = list(peaks or [])
+
+        class _Meter:
+            def GetPeakValue(self):
+                return reads.pop(0) if reads else 0.0
+
+        class _Iface:
+            def QueryInterface(self, _iid):
+                return _Meter()
+
+        class _Raw:
+            def Activate(self, *_a):
+                if activate_raises:
+                    raise OSError("no device")
+                return _Iface()
+
+        class IAudioMeterInformation:
+            _iid_ = "meter"
+
+        class AudioUtilities:
+            @staticmethod
+            def GetSpeakers():
+                return types.SimpleNamespace(_dev=_Raw())
+        pp.AudioUtilities = AudioUtilities
+        pp.IAudioMeterInformation = IAudioMeterInformation
+        pycaw.pycaw = pp
+        return {"comtypes": comtypes, "pycaw": pycaw, "pycaw.pycaw": pp}
+
+    def test_off_windows_is_unreadable(self):
+        with mock.patch.object(self.mod.sys, "platform", "linux"):
+            self.assertIsNone(self.mod._speaker_peak())
+            self.assertFalse(self.mod._speaker_output_active())
+
+    def test_reads_the_highest_of_a_few_samples(self):
+        with mock.patch.object(self.mod.sys, "platform", "win32"):
+            with mock.patch.dict(sys.modules, self._fake_audio(
+                    peaks=[0.0, 0.005, 0.4, 0.0])):
+                self.assertAlmostEqual(self.mod._speaker_peak(), 0.4)
+            with mock.patch.dict(sys.modules, self._fake_audio(
+                    peaks=[0.0, 0.005, 0.4, 0.0])):
+                self.assertTrue(self.mod._speaker_output_active())
+
+    def test_silence_reads_quiet(self):
+        mods = self._fake_audio(peaks=[0.0, 0.001, 0.0, 0.002])
+        with mock.patch.object(self.mod.sys, "platform", "win32"), \
+             mock.patch.dict(sys.modules, mods):
+            self.assertLess(self.mod._speaker_peak(), self.mod._OUTPUT_PEAK_MIN)
+            self.assertFalse(self.mod._speaker_output_active())
+
+    def test_a_missing_device_is_unreadable_not_a_raise(self):
+        mods = self._fake_audio(activate_raises=True)
+        with mock.patch.object(self.mod.sys, "platform", "win32"), \
+             mock.patch.dict(sys.modules, mods):
+            self.assertIsNone(self.mod._speaker_peak())
+            self.assertFalse(self.mod._speaker_output_active())
+
+    def test_no_pycaw_is_unreadable(self):
+        with mock.patch.object(self.mod.sys, "platform", "win32"), \
+             mock.patch.dict(sys.modules, {"pycaw": None, "pycaw.pycaw": None}):
+            self.assertIsNone(self.mod._speaker_peak())
 
 
 # ─── the worker: tap -> detector -> handler ─────────────────────────────────
@@ -372,6 +618,55 @@ class WorkerTests(_Base):
         self.assertTrue(self._wait(lambda: self.setup_calls),
                         "the double clap never reached the routine")
         self.assertEqual(len(self.setup_calls), 1)
+
+    def test_a_key_double_tap_never_sets_up_the_desk_by_default(self):
+        """2026-10-02 review: a mechanical key's double tap (four 0.8 ms
+        sub-impulses over 7 ms plus a short rattle, 0.25 s apart, in a quiet
+        room) can pass the detector's click test — the click/clap line sits
+        close to it for synthetic sounds. Whatever the detector decides, the
+        SHIPPED default routine is only "You rang, sir?": the workspace setup
+        never runs."""
+        self.flag("CLAP_TRIGGER_ACTION",
+                  self._shipped_default("CLAP_TRIGGER_ACTION"))
+        rng = np.random.default_rng(1)
+
+        def mech_key(amp):
+            k = np.zeros(int(0.03 * SR))
+            for off, rel in ((0, 1.0), (0.002, 0.7), (0.004, 0.5),
+                             (0.007, 0.35)):
+                i, m = int(off * SR), int(0.0008 * SR)
+                k[i:i + m] += rng.normal(0, amp * rel, m)
+            t = int(0.02 * SR)
+            j = int(0.008 * SR)
+            k[j:j + t] += (rng.normal(0, amp * 0.2, t)
+                           * np.exp(-np.arange(t) / (t / 4)))
+            return k
+
+        room = rng.normal(0, 0.002, int(3.0 * SR))
+        for at in (1.2, 1.45):
+            ev = mech_key(0.1)
+            i = int(at * SR)
+            room[i:i + ev.size] += ev
+        bc = self.bc()
+        q = self._start(bc)
+        self._push(q, room.astype(np.float32))
+        self._wait(lambda: bc._announced, timeout=2.0)
+        self.assertEqual(self.setup_calls, [])
+        for _src, line in bc._announced:
+            self.assertEqual(line, self.mod.ACK_LINE)
+
+    @staticmethod
+    def _shipped_default(key):
+        import ast
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "core", "config.py")
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and getattr(node.targets[0], "id", None) == key):
+                return ast.literal_eval(node.value)
+        raise AssertionError(f"{key} missing from core/config.py")
 
     def test_a_single_clap_through_the_tap_does_nothing(self):
         bc = self.bc()
@@ -467,6 +762,47 @@ class ToggleTests(_Base):
         self.assertIn("clap trigger on", out.lower())
         self.assertIn("workspace", out.lower())
 
+    def test_on_with_the_default_routine_explains_the_trial(self):
+        """Out of the box a clap only answers, and turning it on says so —
+        and how to get the morning setup once it only hears him."""
+        self.flag("CLAP_TRIGGER_ENABLED", False)
+        self.flag("CLAP_TRIGGER_ACTION", "acknowledge")
+        self._writer()
+        with mock.patch.object(self.mod, "_start_worker", return_value=True):
+            out = self.mod.clap_trigger_on("")
+        self.assertIn("You rang, sir?", out)
+        self.assertIn("clap trigger runs the morning setup", out)
+
+    def test_routine_sets_and_saves_only_allow_listed_routines(self):
+        saved = self._writer()
+        from core import config as cfg
+        for arg, want in (("morning setup", "predictive_morning_setup"),
+                          ("set up my workspace", "predictive_morning_setup"),
+                          ("the morning briefing", "morning_briefing"),
+                          ("just answer", "acknowledge"),
+                          ("acknowledge", "acknowledge")):
+            with self.subTest(arg=arg):
+                out = self.mod.clap_trigger_routine(arg)
+                self.assertEqual(cfg.CLAP_TRIGGER_ACTION, want)
+                self.assertEqual(saved.get("CLAP_TRIGGER_ACTION"), want)
+                self.assertIn("Done", out)
+        before = dict(saved)
+        out = self.mod.clap_trigger_routine("shut down the pc")
+        self.assertEqual(saved, before)
+        self.assertEqual(cfg.CLAP_TRIGGER_ACTION, "acknowledge")
+        self.assertIn("which would you like", out)
+
+    def test_routine_mentions_the_trigger_is_off(self):
+        self.flag("CLAP_TRIGGER_ENABLED", False)
+        self._writer()
+        self.assertIn("turn on the clap trigger",
+                      self.mod.clap_trigger_routine("morning setup"))
+
+    def test_status_names_a_routine_a_clap_may_not_run(self):
+        self.flag("CLAP_TRIGGER_ACTION", "run_shell")
+        out = self.mod.clap_trigger_status("")
+        self.assertIn("not one a clap may run", out)
+
     def test_off_persists_and_stops(self):
         saved = self._writer({"CLAP_TRIGGER_ENABLED": True})
         with mock.patch.object(self.mod, "_stop_worker") as stop:
@@ -522,6 +858,16 @@ class RouteTests(_Base):
         "disable clap detection": "[ACTION: clap_trigger_off]",
         "is the clap trigger on?": "[ACTION: clap_trigger_status]",
         "clap trigger status": "[ACTION: clap_trigger_status]",
+        "clap trigger runs the morning setup":
+            "[ACTION: clap_trigger_routine, morning setup]",
+        "make the clap trigger set up my workspace":
+            "[ACTION: clap_trigger_routine, morning setup]",
+        "Jarvis, have the clap trigger give me the morning briefing.":
+            "[ACTION: clap_trigger_routine, morning briefing]",
+        "clap trigger just answers":
+            "[ACTION: clap_trigger_routine, acknowledge]",
+        "set the clap routine to the briefing":
+            "[ACTION: clap_trigger_routine, morning briefing]",
     }
 
     def test_documented_phrases_route(self):
@@ -532,7 +878,9 @@ class RouteTests(_Base):
     def test_unrelated_phrases_do_not(self):
         for text in ("play eric clapton", "turn on the lights",
                      "clap along with me", "what is a clap trigger",
-                     "turn on the trigger", "", None):
+                     "turn on the trigger", "", None,
+                     "make the clap trigger shut down the pc",
+                     "clap trigger runs run_shell"):
             with self.subTest(text=text):
                 self.assertIsNone(self.mod._clap_route(text))
 
@@ -545,7 +893,7 @@ class RegisterTests(unittest.TestCase):
         with mock.patch.object(cfg, "CLAP_TRIGGER_ENABLED", False, create=True):
             mod, actions = load_skill_isolated("clap_trigger", utils=utils)
         for name in ("clap_trigger_on", "clap_trigger_off",
-                     "clap_trigger_status"):
+                     "clap_trigger_status", "clap_trigger_routine"):
             self.assertIn(name, actions)
             self.assertIn(name, mod.SPEAK_VERBATIM_ACTIONS)
         utils["register_utterance_route"].assert_called_once()
@@ -571,7 +919,7 @@ class RegisterTests(unittest.TestCase):
 # ─── settings surface ───────────────────────────────────────────────────────
 class SettingsSurfaceTests(unittest.TestCase):
     KEYS = {"CLAP_TRIGGER_ENABLED": False,
-            "CLAP_TRIGGER_ACTION": "predictive_morning_setup",
+            "CLAP_TRIGGER_ACTION": "acknowledge",
             "CLAP_TRIGGER_WAKE": False,
             "CLAP_TRIGGER_COOLDOWN_S": 60.0,
             "CLAP_TRIGGER_MIN_PEAK": 0.12}
@@ -610,6 +958,14 @@ class SettingsSurfaceTests(unittest.TestCase):
             "CLAP_TRIGGER_ENABLED"]["tab"]) for k in keys}
         self.assertTrue(set(self.KEYS) <= laid_out)
 
+    def test_the_routine_setting_offers_only_the_allow_list(self):
+        from tools import settings_window as sw
+        spec = sw.SCHEMA["CLAP_TRIGGER_ACTION"]
+        self.assertEqual(spec["type"], "enum")
+        mod, _a = load_skill_isolated("clap_trigger", register=False)
+        allowed = set(mod._CLAP_SAFE_ACTIONS) | {"acknowledge"}
+        self.assertTrue(set(spec["choices"]) <= allowed, spec["choices"])
+
     def test_template_carries_the_keys(self):
         import json
         from tools import settings_window as sw
@@ -627,7 +983,9 @@ class PromptRoutingTests(unittest.TestCase):
         for phrase, action in (("turn on the clap trigger", "clap_trigger_on"),
                                ("clap trigger off", "clap_trigger_off"),
                                ("is the clap trigger on", "clap_trigger_status"),
-                               ("turn on clap to wake", "clap_trigger_status")):
+                               ("turn on clap to wake", "clap_trigger_status"),
+                               ("make the clap trigger run the morning setup",
+                                "clap_trigger_routine")):
             with self.subTest(phrase=phrase):
                 slim = pr.slim_pc_control(phrase, PC_CONTROL_PROMPT)
                 self.assertIn(action, slim)

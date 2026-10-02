@@ -966,19 +966,25 @@ SAMPLE_RATE   = 16000              # mic capture sample rate (Hz)
 #   only hears while JARVIS is listening, never while he speaks (his own
 #   playback is gated out too), never on staging. Off by default; "turn on the
 #   clap trigger" / "clap trigger off" toggle it live and persist it.
-# CLAP_TRIGGER_ACTION — the action a double clap runs (no argument). Default =
-#   the morning workspace setup (predictive_morning_setup: Chrome + Apple Music,
-#   Teams, master volume ~30%); "acknowledge" = just "You rang, sir?" (also the
-#   fallback when the action isn't registered). A clap never runs a power /
-#   restart / shell / close / delete / send / buy action, whatever this says.
+# CLAP_TRIGGER_ACTION — what a double clap runs. Default "acknowledge" = just
+#   "You rang, sir?" (2026-10-02 review: a mechanical key's click can pass for a
+#   clap, so until you have heard it answer only your claps a false trigger
+#   costs one line). "predictive_morning_setup" = the morning workspace setup
+#   (Chrome + Apple Music, Teams, master volume ~30%); "morning_briefing" = the
+#   briefing. Those are the ONLY routines a clap runs (an allow-list): any other
+#   name is refused out loud. "Clap trigger runs the morning setup" by voice
+#   sets it too.
 # CLAP_TRIGGER_WAKE — "clap to wake": a double clap while asleep / in standby
 #   wakes JARVIS and runs the routine. Off = claps are ignored while asleep.
+#   Claps are ignored during the quiet hours (PHONE_PING_QUIET_START-END), in
+#   focus mode, in game mode, and while music, a video or anything else is
+#   playing on the speakers.
 # CLAP_TRIGGER_COOLDOWN_S — minimum gap between two routines.
 # CLAP_TRIGGER_MIN_PEAK — how loud a clap must be at the mic (peak sample,
 #   0..1 full scale). Lower it if "clap trigger status" says your claps peak
 #   below it; raise it if knocks across the room fire it.
 CLAP_TRIGGER_ENABLED = False
-CLAP_TRIGGER_ACTION = "predictive_morning_setup"
+CLAP_TRIGGER_ACTION = "acknowledge"
 CLAP_TRIGGER_WAKE = False
 CLAP_TRIGGER_COOLDOWN_S = 60.0
 CLAP_TRIGGER_MIN_PEAK = 0.12
@@ -989,15 +995,21 @@ CLAP_TRIGGER_MIN_PEAK = 0.12
 # bridge (Telegram / ntfy / Pushover in .env). With no bridge configured every
 # ping is a no-op and the boot log says so once; "how do I connect my phone"
 # walks you through the @BotFather steps.
-# PHONE_PING_ENABLED — the master switch. On by default, but it does nothing
-#   until a backend can send an unsolicited message (a Telegram token AND your
+# PHONE_PING_ENABLED — the master switch for print / confirmation / robot
+#   pings and the summary. On by default, but it does nothing until a backend
+#   can send an unsolicited message (a Telegram token AND your
 #   TELEGRAM_USER_ID, or an ntfy topic, or Pushover). "turn off phone pings" /
-#   "turn on phone pings" flip it live and save it.
-# PHONE_PING_PRINT — a print finished, failed, or paused with an error.
-# PHONE_PING_CONFIRM — a confirmation you left unanswered while away (the
-#   action's NAME only, never its argument).
-# PHONE_PING_SECURITY — a guard-mode alert. Critical: it ignores quiet hours,
-#   focus mode and the hourly cap (it has its own ceiling of 20 an hour).
+#   "turn on phone pings" flip it live and save it. Guard alerts are NOT under
+#   it: they have their own switch, PHONE_PING_SECURITY.
+# PHONE_PING_PRINT — a print finished, failed (not one you cancelled), or
+#   paused with an error.
+# PHONE_PING_CONFIRM — OFF by default: a confirmation YOU asked for and left
+#   unanswered while away. A confirmation lapses after 45 s (nothing runs), so
+#   this is a heads-up that it did not happen, not a question (the action's
+#   NAME only, never its argument).
+# PHONE_PING_SECURITY — a guard-mode alert. Its own switch: "phone pings off"
+#   does not stop it. Critical: it ignores quiet hours, focus mode and the
+#   hourly cap (it has its own ceiling of 20 an hour).
 # PHONE_PING_ROBOT — a robot event a skill reports with
 #   skill_utils["ping_phone"]("robot", ...).
 # PHONE_PING_SUMMARY — a once-a-day digest at PHONE_PING_SUMMARY_TIME ("07:30"
@@ -1006,14 +1018,17 @@ CLAP_TRIGGER_MIN_PEAK = 0.12
 # PHONE_PING_MAX_PER_HOUR — ordinary pings in any rolling hour.
 # PHONE_PING_QUIET_START / _END — "HH:MM", local time; ordinary pings are held
 #   and sent as one message when quiet hours end. Equal values = no quiet hours.
+#   Overnight mode ("goodnight", while its flag is set) counts as quiet hours
+#   too. The double-clap trigger ignores claps in this window as well.
 # PHONE_PING_AWAY_MIN — an ordinary ping waits until you have said nothing to
-#   JARVIS for this many minutes (he already told you out loud); 0 = ping even
-#   while you are talking to him.
+#   JARVIS — and, while he is awake and talking, typed or moved the mouse —
+#   for this many minutes (he already told you out loud); 0 = ping even while
+#   you are talking to him.
 # PHONE_PING_CONFIRM_AFTER_MIN — how old an unanswered confirmation must be
 #   before it may ping (it also needs you away, above).
 PHONE_PING_ENABLED = True
 PHONE_PING_PRINT = True
-PHONE_PING_CONFIRM = True
+PHONE_PING_CONFIRM = False
 PHONE_PING_SECURITY = True
 PHONE_PING_ROBOT = True
 PHONE_PING_SUMMARY = False
@@ -1546,14 +1561,15 @@ HUD_ENABLED = True                 # drives the unified HUD at boot
 HUD_MONITOR = "top"                # which monitor in MONITORS to anchor to
 
 # ─── Brain glow (core/brain_glow.py) ─────────────────────────────────────
-# BRAIN_GLOW_ENABLED — the HUD orb / arc-reactor glow takes the colour of the
-#   brain that is answering: local model = blue, Claude Sonnet = gold, Opus =
-#   violet, Haiku = green, Fable = rose, any other cloud model = silver. It
-#   changes the moment you switch brains (set_model / set_brain / switch_llm)
-#   and per turn when a turn is really answered by the other brain (a local
-#   turn the cloud had to answer, a cloud turn that fell back to local). The
-#   state colours (listening / thinking / speaking) stay on the reactor's core;
-#   only the outer glow changes. Off = the HUDs look exactly as before. Read
+# BRAIN_GLOW_ENABLED — a glowing ring around the HUD orb / arc reactor takes
+#   the colour of the brain that is answering: local model = blue, Claude
+#   Sonnet = gold, Opus = violet, Haiku = green, Fable = rose, any other cloud
+#   model = silver. It changes the moment you switch brains (set_model /
+#   set_brain / switch_llm) and per turn when a turn is really answered by the
+#   other brain (a local turn the cloud had to answer, a cloud turn that fell
+#   back to local). The halo and core keep the state colours (listening /
+#   thinking / speaking), so Sonnet's gold never reads as "thinking"; asleep /
+#   in standby there is no ring. Off = the HUDs look exactly as before. Read
 #   live on every publish; one hud_state.json write per brain CHANGE, never
 #   per turn.
 # BRAIN_GLOW_LABEL_S — seconds the brain's name shows under the reactor after

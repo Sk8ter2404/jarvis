@@ -130,6 +130,12 @@ def _kinect_bridge():
         return None
 
 
+# phone_bridge.ping_phone outcomes after which a guard alert is pushed the old
+# way (push_to_phone): the policy layer is missing / broken, or an older one
+# still applies the general phone-ping master switch to security alerts.
+_PING_FALLBACK_OUTCOMES = frozenset({"unavailable", "failed", "disabled"})
+
+
 def _phone_bridge():
     """The live phone_bridge skill module (registered as skill_phone_bridge by
     the loader), or None. Used for the optional push path; absent → no push."""
@@ -469,14 +475,24 @@ def _push_alert(message: str) -> bool:
     # Through the phone-ping policy when this bridge has it (2026-10-02): a
     # CRITICAL "security" ping, so it still ignores quiet hours / focus mode /
     # the hourly cap, but the owner's PHONE_PING_SECURITY switch, the secret
-    # scrubber and the critical ceiling apply. Delivery is queued, so "queued"
-    # is the success outcome here.
+    # scrubber and the critical ceiling apply. The general "phone pings off"
+    # switch does NOT apply to it (core/phone_ping._gate). Delivery is queued,
+    # so "queued" is the success outcome here. When the policy layer itself is
+    # missing or broken ("unavailable" / "failed" / it raised), or an older
+    # policy still answers "disabled" for the master switch, the alert goes
+    # out the old way below: a security push is never lost to a switch that
+    # was about print chatter. Only his own PHONE_PING_SECURITY switch
+    # ("category_off"), staging and a missing bridge stop it.
     ping = getattr(pb, "ping_phone", None)
     if callable(ping):
         try:
-            return ping("security", message, critical=True, priority="urgent",
-                        title="JARVIS guard") == "queued"
+            outcome = ping("security", message, critical=True,
+                           priority="urgent", title="JARVIS guard")
         except Exception:
+            outcome = "failed"
+        if outcome == "queued":
+            return True
+        if outcome not in _PING_FALLBACK_OUTCOMES:
             return False
     fn = getattr(pb, "push_to_phone", None)
     if not callable(fn):

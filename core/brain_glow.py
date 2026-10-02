@@ -4,7 +4,11 @@ The owner's ask (2026-10-02, from the Instagram JARVIS survey): when the active
 brain changes — the local model, Claude Sonnet 5.5, Opus 5.5, any other model,
 and per TURN when one turn is served by the cloud and the next locally — the
 HUD orb / arc reactor glow takes that brain's colour (local = blue, Sonnet =
-gold, Opus = violet...) and a brief label names it.
+gold, Opus = violet...) and a brief label names it. The HUDs draw it as a
+glowing RING of its own around the reactor: the halo keeps the state colour
+(listening / thinking / speaking), so Sonnet's gold never reads as the
+"thinking" gold (2026-10-02 review), and no ring is drawn asleep / in
+standby, where the dim reactor is the cue.
 
 Two halves, one module, stdlib only (imported by the HUD subprocesses, which
 must import cleanly with nothing but the standard library):
@@ -44,6 +48,7 @@ Settings (core/config.py, read live on every publish):
 from __future__ import annotations
 
 import colorsys
+import os
 import re
 import threading
 import time
@@ -54,8 +59,10 @@ from typing import Any, Callable, Dict, Optional, Tuple
 #: Every tier, in the order the settings help lists them.
 TIERS = ("local", "haiku", "sonnet", "opus", "fable", "cloud")
 
-#: Default glow per tier. Chosen to stay clear of the HUDs' own state colours
-#: where it matters: the alert red (#ff5b5b) is never a brain colour.
+#: Default glow per tier. The alert red (#ff5b5b) is never a brain colour. A
+#: tier may share a hue with a state colour (Sonnet gold ~ the "thinking"
+#: gold, Haiku green ~ "listening"): the HUDs draw the brain on a ring of its
+#: own and keep the halo for the state, so the two never compete.
 DEFAULT_COLORS: Dict[str, str] = {
     "local":  "#3D8BFF",   # blue   — the on-device model, $0 per turn
     "haiku":  "#36D399",   # green  — fast / cheap cloud
@@ -371,11 +378,17 @@ def _str_attr(obj: Any, name: str) -> str:
 
 
 def _local_model(bc: Any) -> str:
-    """The local tag the next local turn uses: the resolver cache when warm,
-    else the configured LOCAL_LLM_MODEL (never a network call)."""
+    """The local tag the next local turn uses, in the resolver's own order
+    minus its Ollama probe (the same order core.prompts.self_knowledge_facts
+    reads): the resolver cache when warm, else the JARVIS_LOCAL_LLM_MODEL
+    override (which the resolver puts first — at boot the cache is still
+    cold), else the configured LOCAL_LLM_MODEL. Never a network call."""
     cache = getattr(bc, "_RESOLVED_LOCAL_LLM_MODEL", None) if bc is not None else None
     if isinstance(cache, list) and cache and isinstance(cache[0], str) and cache[0]:
         return cache[0]
+    env = (os.environ.get("JARVIS_LOCAL_LLM_MODEL") or "").strip()
+    if env:
+        return env
     tag = _str_attr(bc, "LOCAL_LLM_MODEL")
     if tag:
         return tag

@@ -8,23 +8,33 @@ the text may contain. The bridge attaches itself at register() time
 message, every ping is a no-op and one line says so.
 
 Categories (each a Settings switch, PHONE_PING_<NAME>):
-  print     a print FINISHED, FAILED, or PAUSED with an error (a hook on
-            skills/bambu_monitor's state-change fan-out; first observation after
-            a restart never pings, so a finished print is not re-sent per boot)
-  confirm   a confirmation he left unanswered while away: the monolith's
+  print     a print FINISHED, FAILED (not one he cancelled), or PAUSED with an
+            error (a hook on skills/bambu_monitor's state-change fan-out, which
+            runs on EVERY MQTT push). Each pings on a real transition only: the
+            first observation after a restart never pings, a pause pings once
+            per pause (per error code), and a new print of the same file starts
+            its own finish / fail pings.
+  confirm   OFF by default: a confirmation HE asked for (an owner turn just
+            before it) and left unanswered while away — the monolith's
             _pending_confirmation queue or the overnight shutdown prompt, older
-            than PHONE_PING_CONFIRM_AFTER_MIN, once per prompt. Action NAMES
-            only - an argument (a shell command, a message body) is never sent.
-  security  a guard-mode alert (skills/guard_mode routes its push through here)
+            than PHONE_PING_CONFIRM_AFTER_MIN, once per prompt. Those lapse
+            after 45 s / 30 s, so this is a heads-up that NOTHING ran, never a
+            question. Action NAMES only - an argument (a shell command, a
+            message body) is never sent.
+  security  a guard-mode alert (skills/guard_mode routes its push through
+            here). Its OWN switch only: "phone pings off" (the master switch)
+            does not silence the guard.
   robot     anything a skill reports with skill_utils["ping_phone"]("robot", …)
   summary   an optional once-a-day digest at PHONE_PING_SUMMARY_TIME
 
 Gates, in order, for an ordinary (non-critical) ping:
   master switch + bridge configured + category switch + never on staging/tests
   -> dedupe (same key within the hour) -> focus mode (dropped) -> he is HERE
-  (an owner turn within PHONE_PING_AWAY_MIN: JARVIS already said it out loud)
-  -> quiet hours (held, then sent as ONE message when they end, or folded into
-  the summary when that is on) -> at most PHONE_PING_MAX_PER_HOUR an hour.
+  (an owner turn within PHONE_PING_AWAY_MIN, or — while JARVIS is awake and
+  voiced, so he did say it out loud — keyboard / mouse input that recent)
+  -> quiet hours, or overnight mode ("goodnight": the overnight flag file)
+  (held, then sent as ONE message when they end, or folded into the summary
+  when that is on) -> at most PHONE_PING_MAX_PER_HOUR an hour.
 A CRITICAL ping (security) skips focus / presence / quiet hours and the hourly
 cap, but has its own ceiling (CRITICAL_MAX_PER_HOUR) so a runaway loop can
 never flood the phone.
@@ -76,7 +86,7 @@ CATEGORY_FLAGS = {
 DEFAULTS: dict[str, Any] = {
     "PHONE_PING_ENABLED": True,
     "PHONE_PING_PRINT": True,
-    "PHONE_PING_CONFIRM": True,
+    "PHONE_PING_CONFIRM": False,
     "PHONE_PING_SECURITY": True,
     "PHONE_PING_ROBOT": True,
     "PHONE_PING_SUMMARY": False,
@@ -90,6 +100,13 @@ DEFAULTS: dict[str, Any] = {
 
 CRITICAL_MAX_PER_HOUR = 20     # a ceiling even for security alerts
 DEDUPE_S = 3600.0              # same dedupe key inside this window = one ping
+# A confirmation counts as HIS when it was queued at most this long after his
+# last accepted turn (a turn's LLM call and action dispatch fit easily); a
+# prompt a skill raised on its own, or a turn that was not his, is older.
+OWNER_PROMPT_WINDOW_S = 120.0
+# Bambu's print_error when a print is CANCELLED (HMS 0300-400C, "the task was
+# canceled"): gcode_state goes FAILED, but he did it himself.
+BAMBU_CANCEL_CODES = frozenset({0x0300400C})
 TICK_S = 30.0                  # watcher cadence
 HELD_MAX = 12                  # quiet-hours backlog kept for the morning
 JOURNAL_MAX = 60               # events remembered for the summary
@@ -316,6 +333,20 @@ def _layer_phrase(snapshot: dict) -> str:
 _PRINT_ACTIVE = frozenset({"RUNNING", "PAUSE", "PREPARE", "SLICING"})
 
 
+def _error_code(value) -> Optional[int]:
+    """A Bambu print_error as an int (the MQTT report sends a decimal int;
+    a decimal or 0x-hex string is accepted too), or None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        s = str(value).strip().lower()
+        return int(s, 16) if s.startswith("0x") else int(s)
+    except (TypeError, ValueError):
+        return None
+
+
 # ─── live seams (each replaceable on a PhonePinger instance) ─────────────
 
 def _bc():
@@ -351,10 +382,54 @@ def _live_focus_active() -> bool:
         return False
 
 
+def _live_input_idle_s() -> Optional[float]:
+    """Seconds since the last keyboard / mouse input on this PC (Win32
+    GetLastInputInfo — the same probe skills/screen_watch and
+    skills/wellness use), or None off Windows / on any error."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+        info = _LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        now_ms = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+        return ((now_ms - int(info.dwTime)) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return None
+
+
+def _live_jarvis_voiced(bc=None) -> bool:
+    """True while JARVIS speaks his proactive lines: awake (not asleep / in
+    standby — the standby loop voices only timers and promises) and his voice
+    not muted. Only then does keyboard input at the desk mean "he heard it"."""
+    bc = bc if bc is not None else _bc()
+    if bc is None:
+        return False
+    try:
+        for name in ("_sleep_mode", "_standby_mode", "_tts_muted"):
+            cell = getattr(bc, name, None)
+            if cell is not None and bool(cell[0]):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _live_owner_idle_s() -> Optional[float]:
-    """Seconds since the owner's last accepted turn (voice or typed; a phone
-    message is not one). Before his first turn this process, counted from when
-    this module loaded — a fresh boot is not proof he left."""
+    """Seconds since the owner was last seen: his last accepted turn (voice or
+    typed; a phone message is not one) — or, while JARVIS is awake and voiced
+    (so a print callout was said out loud at the desk), his last keyboard /
+    mouse input, whichever is more recent. With wake-word mode he often works
+    in silence; typing is him being here. Before his first turn this process
+    the turn clock counts from when this module loaded — a fresh boot is not
+    proof he left."""
     bc = _bc()
     if bc is None:
         return None
@@ -365,7 +440,33 @@ def _live_owner_idle_s() -> Optional[float]:
         at = 0.0
     if at <= 0.0:
         at = _BOOT_MONO
-    return max(0.0, time.monotonic() - at)
+    idle = max(0.0, time.monotonic() - at)
+    if _live_jarvis_voiced(bc):
+        typed = _live_input_idle_s()
+        if typed is not None:
+            idle = min(idle, max(0.0, typed))
+    return idle
+
+
+def _live_asleep() -> bool:
+    """Overnight mode — he said "goodnight" (start_overnight_upgrade wrote the
+    overnight flag file and it has not expired): treated as quiet hours, so a
+    print finishing at 22:30 waits for the morning instead of buzzing the
+    phone at his bedside. Plain sleep / standby are NOT: they are daytime
+    states too (work-mode standby, ambient learning, music standby, "stop
+    listening" on his way out), and pings exist for when he is away."""
+    bc = _bc()
+    path = getattr(bc, "OVERNIGHT_FLAG_FILE", None) if bc is not None else None
+    if not isinstance(path, str) or not path:
+        return False
+    try:
+        if not os.path.exists(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            expiry = float(f.read().strip() or 0.0)
+        return time.time() < expiry
+    except Exception:
+        return False
 
 
 def _live_blocked() -> str:
@@ -378,10 +479,27 @@ def _live_blocked() -> str:
     return ""
 
 
+def _raised_by_owner(bc, started_mono: float) -> bool:
+    """True when a prompt that started at ``started_mono`` (time.monotonic())
+    followed the owner's last accepted turn within OWNER_PROMPT_WINDOW_S —
+    i.e. he asked for it. A prompt a skill raised on its own, or one with no
+    owner turn before it, is not his to be texted about."""
+    try:
+        cell = getattr(bc, "_last_owner_turn_at", None)
+        owner_at = float(cell[0]) if cell else 0.0
+    except Exception:
+        owner_at = 0.0
+    if owner_at <= 0.0:
+        return False
+    gap = started_mono - owner_at
+    return -1.0 <= gap <= OWNER_PROMPT_WINDOW_S
+
+
 def _live_pending() -> list[dict]:
-    """Confirmation prompts waiting on the owner: [{key, age_s, text}]. Reads
-    the monolith's state cells; copies the list first (GIL-atomic), and takes
-    each queued action's NAME only."""
+    """Confirmation prompts waiting on the owner: [{key, age_s, text, owner}].
+    Reads the monolith's state cells; copies the list first (GIL-atomic), and
+    takes each queued action's NAME only. ``owner`` says whether he raised it
+    (_raised_by_owner)."""
     bc = _bc()
     if bc is None:
         return []
@@ -396,7 +514,8 @@ def _live_pending() -> list[dict]:
             age = max(0.0, time.monotonic() - at)
             ttl = float(getattr(bc, "CONFIRMATION_TTL_S", 45.0) or 45.0)
             out.append({"key": f"queue:{at:.3f}", "age_s": age,
-                        "text": confirm_text(names, lapsed=age > ttl)})
+                        "text": confirm_text(names, lapsed=age > ttl),
+                        "owner": _raised_by_owner(bc, at)})
     except Exception:
         pass
     try:
@@ -406,8 +525,12 @@ def _live_pending() -> list[dict]:
             timeout = float(getattr(bc, "SHUTDOWN_PROMPT_TIMEOUT_S", 30.0) or 30.0)
             if expires > 0.0:
                 age = max(0.0, time.time() - (expires - timeout))
+                # The prompt's wall-clock arming time on the monotonic clock
+                # the owner-turn stamp uses.
+                armed_mono = time.monotonic() - age
                 out.append({"key": f"shutdown:{expires:.3f}", "age_s": age,
-                            "text": SHUTDOWN_PROMPT_TEXT})
+                            "text": SHUTDOWN_PROMPT_TEXT,
+                            "owner": _raised_by_owner(bc, armed_mono)})
     except Exception:
         pass
     return out
@@ -468,7 +591,7 @@ def _default_state_path() -> Optional[str]:
 class PhonePinger:
     """All policy state. Every seam is an attribute so a test can pin it:
     send, configured, cfg, wall_now, mono_now, focus_active, owner_idle_s,
-    blocked, pending, printer_now, env, state_path, spawn, log."""
+    asleep, blocked, pending, printer_now, env, state_path, spawn, log."""
 
     def __init__(self, *, send: Optional[Callable] = None,
                  configured: Optional[Callable[[], bool]] = None,
@@ -477,6 +600,7 @@ class PhonePinger:
                  mono_now: Optional[Callable[[], float]] = None,
                  focus_active: Optional[Callable[[], bool]] = None,
                  owner_idle_s: Optional[Callable[[], Optional[float]]] = None,
+                 asleep: Optional[Callable[[], bool]] = None,
                  blocked: Optional[Callable[[], str]] = None,
                  pending: Optional[Callable[[], list]] = None,
                  printer_now: Optional[Callable[[], str]] = None,
@@ -491,6 +615,7 @@ class PhonePinger:
         self.mono_now = mono_now or time.monotonic
         self.focus_active = focus_active or _live_focus_active
         self.owner_idle_s = owner_idle_s or _live_owner_idle_s
+        self.asleep = asleep or _live_asleep
         self.blocked = blocked or _live_blocked
         self.pending = pending or _live_pending
         self.printer_now = printer_now or _live_printer_now
@@ -512,6 +637,10 @@ class PhonePinger:
         self._soft_seen: collections.OrderedDict = collections.OrderedDict()
         self._logged_unconfigured = False
         self._bambu_hooked: Any = None
+        # The pause the printer is in right now, seen START (a transition into
+        # PAUSE): {"name": ..., "codes": {error codes already reported}}. None
+        # outside a pause and for a pause first seen after a restart.
+        self._pause_episode: Optional[dict] = None
         self._q: Optional[queue.Queue] = None
         self._sender: Optional[threading.Thread] = None
         self.last_outcome: dict[str, str] = {}
@@ -560,8 +689,13 @@ class PhonePinger:
 
     def _gate(self, category: str) -> str:
         """'' when this category may ping at all right now, else the reason.
-        Logs the not-configured case ONCE per process."""
-        if not self._flag("PHONE_PING_ENABLED"):
+        Logs the not-configured case ONCE per process.
+
+        "security" (guard-mode alerts) answers to PHONE_PING_SECURITY alone,
+        not the master switch: "turn off phone pings" / "don't ping me" are
+        about print chatter, and must never quietly disarm the guard's push
+        (2026-10-02 review)."""
+        if category != "security" and not self._flag("PHONE_PING_ENABLED"):
             return DISABLED
         if not self.bridge_configured():
             self.log_unconfigured_once()
@@ -613,6 +747,16 @@ class PhonePinger:
         except Exception:
             return False
 
+    def _asleep(self) -> bool:
+        try:
+            return bool(self.asleep())
+        except Exception:
+            return False
+
+    def _quiet_now(self, now_w) -> bool:
+        """Quiet hours, or overnight mode ("goodnight")."""
+        return self.in_quiet_hours(now_w) or self._asleep()
+
     def _count_last_hour(self, now_m: float, *, critical: bool) -> int:
         return sum(1 for t, crit in self._sent_at
                    if crit == critical and now_m - t < 3600.0)
@@ -648,9 +792,12 @@ class PhonePinger:
                 if (isinstance(r, dict) and isinstance(r.get("t"), (int, float))
                         and isinstance(r.get("text"), str)
                         and r.get("cat") in CATEGORIES):
-                    ok.append({"t": float(r["t"]), "cat": r["cat"],
-                               "text": _clip(r["text"]),
-                               "out": str(r.get("out") or "")})
+                    row = {"t": float(r["t"]), "cat": r["cat"],
+                           "text": _clip(r["text"]),
+                           "out": str(r.get("out") or "")}
+                    if isinstance(r.get("key"), str) and r["key"]:
+                        row["key"] = r["key"][:120]
+                    ok.append(row)
             return ok
 
         self._held = _rows("held")[-HELD_MAX:]
@@ -735,7 +882,7 @@ class PhonePinger:
                 out = FOCUS
             elif away_gate and self._owner_present():
                 out = PRESENT
-            elif self.in_quiet_hours(now_w):
+            elif self._quiet_now(now_w):
                 out = QUIET
             elif self._count_last_hour(now_m, critical=False) >= int(
                     self._num("PHONE_PING_MAX_PER_HOUR")):
@@ -758,9 +905,14 @@ class PhonePinger:
                 while len(self._soft_seen) > 64:
                     self._soft_seen.popitem(last=False)
             entry = self._journal_add(now_w.timestamp(), cat, text, out)
-            if out == QUIET:
-                self._held.append({"t": now_w.timestamp(), "cat": cat,
-                                   "text": text, "out": QUIET})
+            if out == QUIET and not (dedupe_key and any(
+                    h.get("key") == dedupe_key for h in self._held)):
+                # One morning line per event, however often it re-reported.
+                row = {"t": now_w.timestamp(), "cat": cat, "text": text,
+                       "out": QUIET}
+                if dedupe_key:
+                    row["key"] = str(dedupe_key)[:120]
+                self._held.append(row)
                 del self._held[:-HELD_MAX]
             if out == QUEUED:
                 self._sent_at.append((now_m, bool(critical)))
@@ -889,6 +1041,13 @@ class PhonePinger:
             key = str(item.get("key") or "")
             if not key or key in self._pending_done:
                 continue
+            if not item.get("owner", True):
+                # Not his: a skill's own offer, or a prompt no turn of his
+                # raised. Never texted; remembered so it is not re-checked.
+                self._pending_done[key] = True
+                while len(self._pending_done) > 64:
+                    self._pending_done.popitem(last=False)
+                continue
             try:
                 age = float(item.get("age_s") or 0.0)
             except (TypeError, ValueError):
@@ -923,7 +1082,7 @@ class PhonePinger:
         summary is about to carry it)."""
         with self._lock:
             self._load()
-            if not self._held or self.in_quiet_hours(now_w):
+            if not self._held or self._quiet_now(now_w):
                 return
             if self._summary_carries_held(now_w):
                 return
@@ -1002,11 +1161,32 @@ class PhonePinger:
         return "\n".join(parts)
 
     # ── event sources ────────────────────────────────────────────────────
+    def _forget_print_keys(self, key_name: str) -> None:
+        """A new print of ``key_name`` started: its finish / fail / pause
+        dedupe keys belong to the last run, not this one (a second copy of the
+        same file within the hour still gets its own pings)."""
+        prefixes = tuple(f"print:{kind}:{key_name}"
+                         for kind in ("finish", "failed", "pause"))
+        with self._lock:
+            for k in [k for k in self._dedupe if k.startswith(prefixes)]:
+                self._dedupe.pop(k, None)
+                self._soft_seen.pop(k, None)
+
     def on_bambu_state(self, snapshot, prev_gcode, gcode_state) -> None:
-        """skills/bambu_monitor state-change hook (runs on the MQTT thread:
-        decides and queues, never sends inline). Pings on a TRANSITION into
-        FINISH / FAILED from an active state, and on a pause with an error;
-        the first observation after a restart (prev None) never pings."""
+        """skills/bambu_monitor state-change hook. It runs on EVERY MQTT push
+        (on the MQTT thread: decides and queues, never sends inline), so each
+        ping keys on a real transition:
+
+          * FINISH / FAILED: the push that moves there from an active state.
+            A FAILED that is Bambu's cancel code (BAMBU_CANCEL_CODES) is him
+            cancelling it, not a failure: no ping.
+          * PAUSE with an error: once per error code per pause, and only for
+            a pause seen to START (a transition into PAUSE) — the first
+            observation after a restart (prev None, or already PAUSE) never
+            pings, and an hour-long pause is not re-sent every hour.
+          * RUNNING after FINISH / FAILED / IDLE / PREPARE / SLICING = a new
+            print: that file's old dedupe keys are dropped, so a reprint gets
+            its own finish / fail ping (bambu_monitor's own new-print rule)."""
         try:
             snap = snapshot if isinstance(snapshot, dict) else {}
             cur = str(gcode_state or "").upper()
@@ -1014,23 +1194,43 @@ class PhonePinger:
             name = _print_name(snap)
             quoted = f"'{name}'" if name else "your print"
             key_name = name or "_anon_"
+            if cur != "PAUSE":
+                self._pause_episode = None
+            if cur == "RUNNING" and prev in ("FINISH", "FAILED", "IDLE",
+                                             "PREPARE", "SLICING"):
+                self._forget_print_keys(key_name)
             if cur == "FINISH" and prev in _PRINT_ACTIVE:
                 self.ping("print", f"Print finished, sir: {quoted} is done.",
                           dedupe_key=f"print:finish:{key_name}")
             elif cur == "FAILED" and prev in _PRINT_ACTIVE:
+                if _error_code(snap.get("print_error")) in BAMBU_CANCEL_CODES:
+                    self.log("print: cancelled, not failed - no ping")
+                    return
                 self.ping("print",
                           f"Print failed{_layer_phrase(snap)}, sir: {quoted}. "
                           f"You'll want to check the printer.",
                           priority="high",
                           dedupe_key=f"print:failed:{key_name}")
             elif cur == "PAUSE":
+                if prev and prev != "PAUSE" and self._pause_episode is None:
+                    self._pause_episode = {"name": key_name, "codes": set()}
+                ep = self._pause_episode
                 err = snap.get("print_error")
-                if err not in (None, 0, "0", "", "00000000"):
-                    self.ping("print",
-                              f"The print is paused with error {err}"
-                              f"{_layer_phrase(snap)}, sir: {quoted} needs "
-                              f"you.", priority="high",
-                              dedupe_key=f"print:pause:{key_name}:{err}")
+                if ep is None or err in (None, 0, "0", "", "00000000"):
+                    return
+                code = str(err)
+                if code in ep["codes"]:
+                    return
+                out = self.ping("print",
+                                f"The print is paused with error {err}"
+                                f"{_layer_phrase(snap)}, sir: {quoted} needs "
+                                f"you.", priority="high",
+                                dedupe_key=f"print:pause:{key_name}:{err}")
+                if out not in _RETRYABLE:
+                    # Reported (or deliberately not: switched off, quiet,
+                    # capped): once per pause. He is here / focus mode = try
+                    # again on a later push while the pause lasts.
+                    ep["codes"].add(code)
         except Exception as e:
             self.log(f"bambu hook failed: {type(e).__name__}")
 

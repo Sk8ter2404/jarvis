@@ -416,6 +416,10 @@ class HoloHUD:
             brain = _hud_brain(state, time.time())
         except Exception:
             brain = None
+        if jarvis_state in ("standby", "sleep", "sleeping"):
+            # Asleep: the overlay rests with no glow at all (no halo, no
+            # brain ring) — that stillness is the asleep cue.
+            brain = None
 
         # Night-owl mode dims the overlay. 0.0 / missing == normal opacity;
         # any positive value < 1 dims the window. Applied to the root via
