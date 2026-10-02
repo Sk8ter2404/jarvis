@@ -1254,7 +1254,13 @@ def _producer_camera_ownership(backend: str) -> dict:
         name    = (cam.get("name") or "").strip()
         label   = cam.get("label") or f"index {cfg_idx}"
         h       = health.get(cfg_idx) or {}
-        last_at = float(h.get("last_frame_at") or 0.0)
+        # A BLACK frame is a successful read too. The producer no longer caches
+        # or stamps one as last_frame_at (it is not a live picture), so it is
+        # read from black_frame_at - otherwise a camera that streams nothing
+        # but black would pass on its last lit frame for 10 s and then look
+        # silent, and the black-frame verdict below could never fire.
+        last_at = max(float(h.get("last_frame_at") or 0.0),
+                      float(h.get("black_frame_at") or 0.0))
         age     = (now - last_at) if last_at else None
         # A BENCHED CAMERA IS NOT OWNED. The producer's quarantine gate is an
         # unconditional `continue` that releases the handle and never opens the
@@ -1299,23 +1305,28 @@ def _producer_latest_frame(cfg_idx):
     or None.
 
     The producer caches every frame it successfully reads, under the same
-    _camera_state_lock and in the same critical section that stamps
-    ``last_frame_at`` — so this is exactly the image the freshness figure is
-    about, obtained without opening anything. That is what lets the
-    no-device-I/O verdict keep the black-frame check instead of quietly
-    dropping it. NEVER raises."""
+    _camera_state_lock and in the same critical section that stamps the
+    freshness figure — so this is exactly the image that figure is about,
+    obtained without opening anything. That is what lets the no-device-I/O
+    verdict keep the black-frame check instead of quietly dropping it. A lit
+    frame goes to ``_camera_latest_frame``; a BLACK one, never a live picture,
+    to ``_camera_latest_black_frame``, which the next lit frame clears — so
+    while it holds one, that is the newest frame. NEVER raises."""
     bc = _bc()
     if bc is None:
         return None
     try:
         store = getattr(bc, "_camera_latest_frame", None)
+        black = getattr(bc, "_camera_latest_black_frame", None) or {}
         if store is None:
             return None
         lock = getattr(bc, "_camera_state_lock", None)
         if lock is None:
-            return store.get(cfg_idx)
+            fr = black.get(cfg_idx)
+            return fr if fr is not None else store.get(cfg_idx)
         with lock:
-            return store.get(cfg_idx)
+            fr = black.get(cfg_idx)
+            return fr if fr is not None else store.get(cfg_idx)
     except Exception:
         return None
 

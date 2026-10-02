@@ -35,7 +35,8 @@ class BlackWebcamFrameTests(MonolithGlobalsTestCase):
         # The frame caches are not in the harness's restore list: isolate them.
         for d in (bc._camera_latest_frame, bc._camera_last_frame_at,
                   bc._camera_last_read_error, bc._camera_last_read_error_at,
-                  getattr(bc, "_camera_black_frame_at", {})):
+                  getattr(bc, "_camera_black_frame_at", {}),
+                  getattr(bc, "_camera_latest_black_frame", {})):
             p = mock.patch.dict(d, clear=True)
             p.start()
             self.addCleanup(p.stop)
@@ -102,6 +103,83 @@ class BlackWebcamFrameTests(MonolithGlobalsTestCase):
             out = actions["camera_status"]("")
         self.assertIn("delivering black frames", out)
         self.assertNotIn("is live", out)
+
+
+@requires_monolith
+class SelfDiagnosticSeesTheBlackRunTests(BlackWebcamFrameTests):
+    """The self-diagnostic's webcam probe judges the PRODUCER's frames when the
+    producer owns the camera (skills/self_diagnostic._producer_latest_frame).
+    Once black frames stopped being cached and stamped, it judged the last LIT
+    frame for 10 s (PASS) and then found no fresh camera at all, so its
+    "the webcam is producing only black frames" finding could never fire
+    (2026-10-02 review). Driven by the REAL producer state, not a fake that
+    holds a fresh black frame the producer can no longer produce."""
+
+    def setUp(self):
+        super().setUp()
+        self.diag, _ = load_skill_isolated("self_diagnostic", register=False)
+
+    def _probe(self):
+        import sys
+        import time
+        import types
+        bc = self.bc
+        cv2_stub = types.ModuleType("cv2")
+        cv2_stub.data = types.SimpleNamespace(haarcascades="/cascades/")
+        opened = []
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc,
+                                           "cv2": cv2_stub}), \
+             mock.patch.object(bc, "CAMERAS", _CAMS), \
+             mock.patch.object(bc, "get_face_track_liveness",
+                               return_value={"at": time.time(),
+                                             "stage": "loop top"}), \
+             mock.patch.object(self.diag, "_camera_backend_name",
+                               return_value="dshow"), \
+             mock.patch.object(self.diag, "_open_probe_capture",
+                               side_effect=lambda idx, *a, **k:
+                               opened.append(idx)), \
+             mock.patch.object(self.diag, "_face_cascade_status",
+                               return_value=(True, "loaded")), \
+             mock.patch.object(self.diag, "_maybe_announce_once"), \
+             mock.patch.object(self.diag.time, "sleep"):
+            res = self.diag._probe_webcam()
+        self.assertNotIn(0, opened, "opened the producer's own camera")
+        return res
+
+    def test_black_frames_after_a_lit_one_are_reported(self):
+        # The lit frame is still in the cache and still "fresh": judging it
+        # passed a camera that has been black ever since.
+        self._run_one_iteration(self.lit)
+        self._run_one_iteration(self.black)
+        res = self._probe()
+        self.assertFalse(res["ok"], "a black webcam passed the self-check")
+        self.assertEqual(res["details"].get("failure_mode"),
+                         "persistent_black_frame")
+
+    def test_a_long_black_run_is_reported_not_unverified(self):
+        # No lit frame inside the freshness window at all.
+        self._run_one_iteration(self.black)
+        res = self._probe()
+        self.assertTrue(res["tested"], res)
+        self.assertEqual(res["details"].get("failure_mode"),
+                         "persistent_black_frame")
+        self.assertEqual(res["details"].get("verified_via"),
+                         "face-track producer telemetry")
+
+    def test_a_dark_room_is_not_a_dead_sensor(self):
+        # Too dark to treat as a live frame, yet not the probe's lens-cap black
+        # (_BLACK_FRAME_MEAN_MIN): no finding, no "check the lens cover".
+        self._run_one_iteration(self.np.full((72, 128, 3), 4, dtype=self.np.uint8))
+        self.assertIn(0, self.bc._camera_black_frame_at, "setup: not a black run")
+        res = self._probe()
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertNotIn("failure_mode", res["details"])
+
+    def test_a_lit_frame_after_the_run_passes_again(self):
+        self._run_one_iteration(self.black)
+        self._run_one_iteration(self.lit)
+        res = self._probe()
+        self.assertTrue(res["ok"], res.get("error"))
 
 
 if __name__ == "__main__":  # pragma: no cover

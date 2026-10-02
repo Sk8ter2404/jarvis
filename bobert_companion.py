@@ -9101,6 +9101,11 @@ _CAMERA_FRAME_LIVE_S = 5.0
 _CAMERA_BLACK_FRAME_MEAN = 10.0
 _CAMERA_BLACK_FRAME_ERROR = "delivering black frames (mean brightness {:.1f}/255)"
 _camera_black_frame_at: dict[int, float] = {}
+# The newest BLACK frame while a black run lasts (dropped with
+# _camera_black_frame_at by the next real frame). Never a live picture: only
+# skills/self_diagnostic reads it, so its "the webcam is producing only black
+# frames" check still sees what the producer reads (2026-10-02 review).
+_camera_latest_black_frame: dict[int, "np.ndarray"] = {}
 _CAMERA_BLACK_WARN_GAP_S = 60.0    # one log line per camera per minute, at most
 _camera_black_warned_at: dict[int, float] = {}
 
@@ -12121,11 +12126,13 @@ def _face_tracking_thread_body():
                 with _camera_state_lock:
                     if _black:
                         _camera_black_frame_at[cam["index"]] = now_loop
+                        _camera_latest_black_frame[cam["index"]] = frame.copy()
                         _camera_last_read_error[cam["index"]] = (
                             _CAMERA_BLACK_FRAME_ERROR.format(_bright))
                         _camera_last_read_error_at[cam["index"]] = now_loop
                     else:
                         _camera_black_frame_at.pop(cam["index"], None)
+                        _camera_latest_black_frame.pop(cam["index"], None)
                         _camera_latest_frame[cam["index"]] = frame.copy()
                         _camera_last_frame_at[cam["index"]] = now_loop
                         # A real frame means whatever transient error we
