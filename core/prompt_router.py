@@ -1054,6 +1054,7 @@ _IT_STATE_WORDS = frozenset({
     "broken", "back", "up", "down", "charged", "connected", "paused",
     "stopped", "printing", "recording", "plugged", "out", "too", "armed",
     "muted", "loading", "frozen", "stuck", "set", "going", "right", "wrong",
+    "doing", "saying", "showing", "reading",
 })
 # "going" above is "is it going" (a print, a download); the weather and
 # small-talk forms are excluded by the word after it:

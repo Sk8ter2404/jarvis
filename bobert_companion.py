@@ -2142,9 +2142,14 @@ def _persist_budget_history_trim(fitted) -> int:
     per-call trim left the re-prime warming the untrimmed history, and every
     later near-limit turn paid a full re-evaluation). Goes through the same
     bookkeeping as _trim_conversation_history (the session summary still
-    folds the messages in). Only when those messages are still the front of
-    the live list. Returns how many went. Never raises."""
+    folds the messages in). Only when the fit FITS - a prompt that cannot fit
+    (a window too small for the system prompt: a 30B-class tag, an observed
+    truncation) sheds its history for that call only, so the conversation is
+    whole again once the window is - and only when those messages are still
+    the front of the live list. Returns how many went. Never raises."""
     try:
+        if not getattr(fitted, "fits", True):
+            return 0
         gone = list(getattr(fitted, "dropped_head", ()) or ())
         if not gone:
             return 0
@@ -38004,7 +38009,8 @@ def _run_pronoun_switch_shortcut(text: str) -> bool:
     a proactive line, a timer going off), no media JARVIS started in
     MEDIA_REFERENT_WINDOW_S (_jarvis_played_music_at), no media playing now
     (_smtc_media_playing - Spotify started by hand), and point-to-control off
-    (with it on, "turn that off" resolves by where the owner points). With any of those the turn
+    (with it on, "turn that off" resolves by where the owner points). With
+    any of those the turn
     routes to the model as before - it has the conversation, and a guess onto
     a protected action is refused anyway (_autocorrect_protected).
 

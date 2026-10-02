@@ -261,6 +261,7 @@ class OversizedTurnTests(_Base):
         self.assertEqual(bc._local_num_ctx("big-test:32b"), 12288)
         history = _long_history(3, n=300)
         payload_on, out_on = self._turn("play some music", history)
+        self.assertEqual(self.bc.conversation_history[:len(history)], history)
         self.assertEqual(len(payload_on["messages"]), 2)
         self.assertEqual(payload_on["messages"][-1]["content"],
                          "play some music")
@@ -272,6 +273,9 @@ class OversizedTurnTests(_Base):
         self.assertEqual(len(notes), 1, out_on)
         self.assertIn("CANNOT FIT", notes[0])
         self.assertIn("(num_ctx 12288)", notes[0])
+        # ...for that call only: the conversation itself keeps its history,
+        # whole again once the window is (never "kept the history trim").
+        self.assertNotIn("kept the history trim", out_on)
 
     def test_kill_switch_restores_the_unbudgeted_prompt(self):
         self._p(self.bc, "_LOCAL_PROMPT_BUDGET", False)

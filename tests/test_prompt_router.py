@@ -1781,7 +1781,8 @@ class FollowupOnlyOnRealReferentsTests(unittest.TestCase):
             with self.subTest(u=u):
                 self.assertFalse(pr.is_elliptical_followup(u))
         for u in ("is it on", "is it done yet", "it's too loud",
-                  "that's too bright", "turn it off", "is that normal"):
+                  "that's too bright", "turn it off", "is that normal",
+                  "what's it doing"):
             with self.subTest(u=u):
                 self.assertTrue(pr.is_elliptical_followup(u))
 
