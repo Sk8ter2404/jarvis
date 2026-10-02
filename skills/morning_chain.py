@@ -7,6 +7,12 @@ exactly ONE of the three morning skills (morning_arrival, morning_handoff,
 morning_briefing) to fire — instead of letting all three fire on the same
 wake event and queue overlapping speech.
 
+The wake event is stamped by bobert_companion._note_wake_event from three
+sources: a standby wake (context_aware_greeting), the tray force_wake, and
+(B096, 2026-10-01) the day's first accepted owner turn from 06:00 on. The last
+one is the owner's real morning: he never puts JARVIS in standby, so before it
+the chain idled every morning for 47 sessions straight.
+
 Why this exists:
   morning_arrival, morning_handoff, and morning_briefing each used to spawn
   their own _watch_for_first_wake daemon. All three watched the same
@@ -38,11 +44,23 @@ Coordination contract with the three skills:
   manual-trigger actions (e.g. "morning arrival"), which always run via
   force=True regardless of the chain.
 
+  A skill that DECLINES (returns "", e.g. arrival's 6-hour silence gate)
+  hands the morning to the next of SKILL_NAMES, once; then the day is done
+  either way (B096: a decline used to leave the day open, so the chain
+  re-picked the same declining skill every 5 s until its hour slot ended).
+
+One morning briefing per day: the chain stands down when any morning
+briefer already spoke today — one of its own three (a manual trigger),
+morning_arrival_v2's presence watcher, or daily_briefing with the owner
+there — and holds while the owner's turn is still being answered (the turn
+that woke the day may itself be "morning briefing").
+
 Failure modes:
   - bobert_companion unavailable → the chain silently disables; the three
     skills remain manually callable.
   - chosen skill module missing or _fire_from_chain attr missing → the chain
-    logs and skips for the day. Manual triggers still work.
+    logs, tries the next pick, and skips for the day. Manual triggers still
+    work.
   - Per-tick exceptions are caught so transient errors can't kill the
     thread.
 """
@@ -192,6 +210,44 @@ def _arrival_v2_fired_today() -> bool:
         return False
 
 
+def _daily_briefing_heard_today() -> bool:
+    """True when skills/daily_briefing already briefed the owner today (with
+    him at the desk, or on request). daily_briefing stands down for the chain
+    (_other_morning_briefing_fired_today) and v2 stands down for daily; this is
+    the chain's half of that contract, which never mattered while the chain
+    could not fire (B096). Read through the live module like v2 does; False on
+    any failure, so a broken daily_briefing can never block a chain decision."""
+    try:
+        db = sys.modules.get("skill_daily_briefing")
+        fn = getattr(db, "owner_heard_briefing_today", None) if db else None
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _morning_already_covered_today() -> bool:
+    """True when ANY morning briefer already spoke today: one of the chain's
+    own three (a manual "morning handoff" counts for an arrival pick too --
+    one morning briefing per day, not one per skill), morning_arrival_v2's
+    presence watcher, or daily_briefing with the owner there."""
+    if any(_skill_already_fired_today(s) for s in SKILL_NAMES):
+        return True
+    return _arrival_v2_fired_today() or _daily_briefing_heard_today()
+
+
+def _owner_turn_in_progress(bc) -> bool:
+    """True while the owner's accepted turn is still being answered
+    (bobert_companion._turn_in_progress, set at "You:", cleared at the next
+    loop top). The day's first turn stamps the wake BEFORE JARVIS replies, and
+    that turn may itself be "morning briefing" -- dispatching now would race
+    the manual briefing it is about to run. False when unreadable."""
+    try:
+        cell = getattr(bc, "_turn_in_progress", None)
+        return bool(cell[0]) if cell is not None else False
+    except Exception:
+        return False
+
+
 # ─── skill dispatch ──────────────────────────────────────────────────────
 
 def _import_skill(short_name: str):
@@ -233,6 +289,31 @@ def _invoke_skill(short_name: str, reason: str) -> bool:
         return False
 
 
+def _dispatch_with_fallback(chosen: str, reason: str) -> str | None:
+    """Fire `chosen`; when it declines or fails, hand the morning to the rest
+    of SKILL_NAMES in order, ONCE each. Returns the skill that handled the day,
+    or None when every pick declined (or a briefer covered the day meanwhile).
+
+    B096: a declining pick (arrival's silence gate returns "") used to leave
+    the day open, so the watcher re-picked the same skill every 5 s until its
+    hour slot ended. Before each fallback the day is re-checked: a pick that
+    declined because a manual briefing landed during its pre-fire delay must
+    not be followed by a second briefing."""
+    order = [chosen] + [s for s in SKILL_NAMES if s != chosen]
+    for i, pick in enumerate(order):
+        if i:
+            if _morning_already_covered_today():
+                print(f"  [morning-chain] '{order[i - 1]}' declined and the "
+                      f"morning is already briefed -- no fallback")
+                return None
+            print(f"  [morning-chain] '{order[i - 1]}' declined -- "
+                  f"trying '{pick}'")
+        if _invoke_skill(pick, reason):
+            return pick
+    print("  [morning-chain] every morning skill declined -- idle for today")
+    return None
+
+
 # ─── wake-event watcher ──────────────────────────────────────────────────
 
 def _watch_for_first_wake() -> None:
@@ -262,8 +343,9 @@ def _watch_for_first_wake() -> None:
                 # lock: writers do `_last_wake_date[0] = today` in-place, the
                 # list identity never changes, and CPython's GIL makes the
                 # index read/write atomic. We read [0] every poll tick to pick
-                # up wake events fired by either context_aware_greeting() (the
-                # wake-word path) or the tray force_wake handler.
+                # up wake events stamped by bc._note_wake_event(): the standby
+                # wake (context_aware_greeting), the tray force_wake handler,
+                # or the day's first accepted owner turn (B096).
                 #
                 # If a future maintainer "simplifies" bc._last_wake_date to a
                 # plain string, this access (`[0]`) will raise TypeError on
@@ -281,24 +363,31 @@ def _watch_for_first_wake() -> None:
 
             if (wake_date == today
                     and CHAIN_START_HOUR <= hour < CHAIN_END_HOUR
-                    and dispatched_for_date != today):
+                    and dispatched_for_date != today
+                    and not _owner_turn_in_progress(bc)):
+                # (A turn still being answered holds the dispatch to the next
+                # tick: see _owner_turn_in_progress.)
                 chosen = _choose_skill_for_today(hour)
-                if _skill_already_fired_today(chosen) or _arrival_v2_fired_today():
+                if _morning_already_covered_today():
                     # Manual trigger, a prior chain dispatch (this JARVIS process
-                    # can't remember across a restart), OR morning_arrival_v2's
-                    # presence-watcher already covered today -- treat the day as
-                    # handled and stop racing. The v2 check mirrors v2's own
-                    # chain-suppression so the two can never double-brief.
+                    # can't remember across a restart), morning_arrival_v2's
+                    # presence-watcher, OR daily_briefing with him there already
+                    # covered today -- treat the day as handled and stop racing.
+                    # The v2 / daily checks mirror their own chain-suppression
+                    # so no two of them can double-brief.
                     print(f"  [morning-chain] today already briefed "
                           f"(pick was '{chosen}') -- chain idle for {today}")
-                    dispatched_for_date = today
                 else:
                     print(f"  [morning-chain] wake @ {hour:02d}:xx, "
                           f"weekday={time.strftime('%A')} — dispatching '{chosen}'")
-                    if _invoke_skill(
-                            chosen,
-                            f"morning chain pick (weekday={time.strftime('%A')}, hour={hour})"):
-                        dispatched_for_date = today
+                    _dispatch_with_fallback(
+                        chosen,
+                        f"morning chain pick (weekday={time.strftime('%A')}, hour={hour})")
+                # One dispatch per wake day, whatever happened: a declining or
+                # failing pick already handed the morning on in
+                # _dispatch_with_fallback, so re-polling every 5 s could only
+                # re-run the same declines (B096).
+                dispatched_for_date = today
         except Exception as e:
             print(f"  [morning-chain] tick error: {e}")
         time.sleep(WATCH_POLL_SECONDS)

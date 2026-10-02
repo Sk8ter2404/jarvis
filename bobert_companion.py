@@ -1583,8 +1583,9 @@ def _append_turn(user: str, assistant: str) -> None:
 # here; that would shadow the imported names and break skills/* readers
 # that access them via the `bobert_companion.*` attribute path.)
 
-# Pre-wake silence snapshot in seconds — captured by context_aware_greeting()
-# at the moment of wake-event detection, BEFORE the greeting bumps
+# Pre-wake silence snapshot in seconds — captured by _note_wake_event() (every
+# wake source: the standby wake, the tray force_wake, the day's first owner
+# turn) at the moment of wake-event detection, BEFORE the greeting bumps
 # last_speech_time (2026-10-01: measured from the owner's last accepted turn,
 # _last_owner_turn_at, when there is one this process). Consumers (e.g.
 # skills/morning_arrival's 6-hour silence gate) read [0] to measure the gap from the user's last interaction without
@@ -4841,12 +4842,13 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
             _sleep_mode[0]   = False
             _standby_mode[0] = False
         _write_hud_state(sleep_mode=False, standby_mode=False)
-        # Mirror context_aware_greeting's bookkeeping so morning_handoff and
-        # any other consumer that watches _last_wake_date sees the tray wake
-        # as the day's first wake event.
+        # The same wake bookkeeping as context_aware_greeting (B096): the
+        # pre-wake silence snapshot -- before "At your service" below bumps
+        # last_speech_time -- and today's date, so the morning chain sees the
+        # tray wake as the day's wake event and arrival's silence gate reads
+        # the real overnight gap.
         try:
-            from datetime import datetime as _dt
-            _last_wake_date[0] = _dt.now().date().isoformat()
+            _note_wake_event()
         except Exception:
             pass
         # Same overnight-flag cleanup the wake-word path uses, so a wake from
@@ -20671,6 +20673,42 @@ def _note_owner_turn() -> None:
     _utterance_in_progress[0] = False
 
 
+# The first accepted owner turn AT OR AFTER this local hour is the day's wake
+# event (B096, 2026-10-01). It is skills/morning_chain.CHAIN_START_HOUR: a turn
+# before the chain's window is the tail of last night, and stamping it would
+# have the chain brief an empty room at 06:00 while he sleeps.
+_OWNER_TURN_WAKE_FROM_HOUR = 6
+
+
+def _note_first_owner_turn_of_day(test_inject: bool = False) -> bool:
+    """Main loop, an accepted owner turn: the day's first one is its wake event.
+
+    B096 (2026-10-01): _last_wake_date -- the morning chain's trigger -- was
+    stamped only by the standby wake (context_aware_greeting) and the tray
+    force_wake. The owner runs with START_IN_STANDBY off and never sleeps
+    JARVIS, so his "Jarvis ..." mornings never stamped it and the chain sat
+    idle for 47 sessions straight. Now the first accepted owner turn (voice or
+    typed) of the day counts too.
+
+    Call it BEFORE the turn is marked (_last_owner_turn_at is still his
+    PREVIOUS turn, so the silence snapshot is the overnight gap, not 0 s) and
+    before JARVIS replies. A test harness inject (driver.py / say_to_jarvis)
+    is not the owner and never wakes the day. True when it stamped."""
+    if test_inject:
+        return False
+    from datetime import datetime as _dt
+    local = _dt.now()
+    if local.hour < _OWNER_TURN_WAKE_FROM_HOUR:
+        return False
+    today = local.date().isoformat()
+    if _last_wake_date[0] == today:
+        return False
+    _note_wake_event(today=today)
+    print(f"  [wake] first owner turn of the day — today's wake "
+          f"(silence before it {_pre_wake_silence_seconds[0] / 3600.0:.1f}h)")
+    return True
+
+
 def _note_turn_boundary() -> None:
     """Main loop, top of every iteration: the previous turn (if any) is over,
     and any capture that did not become a turn was dropped."""
@@ -29520,6 +29558,42 @@ def _pick_wake_variety(from_standby: bool, wake_text: str = "") -> tuple[str, fl
     return (chosen_text, volume)
 
 
+def _note_wake_event(now: float | None = None, today: str | None = None) -> None:
+    """Record a wake event: the pre-wake silence snapshot and today's date in
+    _last_wake_date, the morning chain's trigger (skills/morning_chain.py).
+
+    The ONE bookkeeping path for every wake source -- the standby wake
+    (context_aware_greeting), the tray force_wake, and the day's first
+    accepted owner turn (_note_first_owner_turn_of_day) -- so no source stamps
+    the date without the snapshot (B096, 2026-10-01). Without the snapshot
+    morning_arrival's 6-hour gate fell back to the live last_speech_time,
+    failed, and the chain re-picked arrival every 5 s until 08:00.
+
+    Call it BEFORE JARVIS replies: skills/morning_arrival reads
+    _pre_wake_silence_seconds[0] for its 6-hour overnight gate, and reading
+    last_speech_time directly would always be ~0 by the time the morning
+    chain dispatch loop fires (the wake greeting is already speaking).
+    2026-10-01 (review; B059's stale duplicate): measure from the OWNER's
+    last accepted turn (_last_owner_turn_at, time.monotonic()), not
+    last_speech_time -- _speak() stamps that on every JARVIS line, so JARVIS's
+    own overnight lines (a reminder, a pattern offer) reset the "silence" and
+    suppressed the morning arrival greeting. No owner turn yet this process
+    (an overnight restart): the old last_speech_time measure stands.
+
+    `now` is time.time() (default: now); `today` the local ISO date (default:
+    today) -- context_aware_greeting passes the values it already read."""
+    wall = time.time() if now is None else float(now)
+    _owner_at = float(_last_owner_turn_at[0] or 0.0)
+    if _owner_at > 0.0:
+        _pre_wake_silence_seconds[0] = max(0.0, time.monotonic() - _owner_at)
+    else:
+        _pre_wake_silence_seconds[0] = max(0.0, wall - last_speech_time)
+    if today is None:
+        from datetime import datetime as _dt
+        today = _dt.now().date().isoformat()
+    _last_wake_date[0] = today
+
+
 def context_aware_greeting(from_standby: bool, wake_text: str = "") -> tuple[str, float]:
     """Pick a wake-word greeting that varies with time-of-day, recent wake
     frequency, gaze, printer state, and the tone of the wake utterance.
@@ -29536,23 +29610,6 @@ def context_aware_greeting(from_standby: bool, wake_text: str = "") -> tuple[str
     """
     from datetime import datetime as _dt
     now = time.time()
-    # Snapshot pre-wake silence BEFORE this wake's greeting bumps
-    # last_speech_time downstream. skills/morning_arrival reads
-    # _pre_wake_silence_seconds[0] for its 6-hour overnight gate; reading
-    # last_speech_time directly would always be ~0 by the time the morning
-    # chain dispatch loop fires (the wake greeting is already speaking).
-    # 2026-10-01 (review; B059's stale duplicate): measure from the OWNER's
-    # last accepted turn (_last_owner_turn_at, time.monotonic(); this standby
-    # wake is not an accepted turn), not last_speech_time -- _speak() stamps
-    # that on every JARVIS line, so JARVIS's own overnight lines (a reminder,
-    # a pattern offer) reset the "silence" and suppressed the morning arrival
-    # greeting. No owner turn yet this process (an overnight restart): the
-    # old last_speech_time measure stands.
-    _owner_at = float(_last_owner_turn_at[0] or 0.0)
-    if _owner_at > 0.0:
-        _pre_wake_silence_seconds[0] = max(0.0, time.monotonic() - _owner_at)
-    else:
-        _pre_wake_silence_seconds[0] = max(0.0, now - last_speech_time)
 
     # Slide the wake-history window — keep only the last 10 minutes.
     _wake_history[:] = [t for t in _wake_history if (now - t) <= 600]
@@ -29561,8 +29618,11 @@ def context_aware_greeting(from_standby: bool, wake_text: str = "") -> tuple[str
     local = _dt.now()
     hour  = local.hour
     today = local.date().isoformat()
+    # Read BEFORE _note_wake_event stamps today's date (B096).
     first_of_day = (_last_wake_date[0] != today)
-    _last_wake_date[0] = today
+    # The pre-wake silence snapshot + today's wake date, before this wake's
+    # greeting bumps last_speech_time downstream (_note_wake_event).
+    _note_wake_event(now, today)
 
     # A remark about the hour, from the clock alone, like the late-night
     # remark: none while NIGHT_QUIET_ENABLED is off (core/night_quiet.py).
@@ -38748,6 +38808,16 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
 
                 print(f"  You:    {text}")
                 _tt("mark", "you")
+                # The day's first accepted owner turn is its wake event, the
+                # morning chain's trigger (B096). Stamped BEFORE the turn is
+                # marked just below (the silence snapshot reads his previous
+                # turn) and before JARVIS replies. A test inject never counts.
+                try:
+                    _note_first_owner_turn_of_day(
+                        test_inject=(_injected_text is not None
+                                     and _last_inject_source[0] == "test"))
+                except Exception as _wake_e:
+                    print(f"  [wake] first-turn stamp failed: {_wake_e}")
                 # An owner turn (voice or typed): freezes the local prompt
                 # prefix for PROMPT_FREEZE_QUIET_S (_request_prompt_rebuild).
                 _note_owner_turn()
