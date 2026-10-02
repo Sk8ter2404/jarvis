@@ -773,6 +773,18 @@ class R6RescueGateTests(_Base):
                 self.assertEqual(why, want, (room, text))
 
 
+def _gate(**kw):
+    """A _wake_gate_state snapshot: every gate quiet unless named."""
+    st = {"standby": False, "hold": False, "wake_mode": False,
+          "followup_open": False, "greet_armed": False,
+          "music_refuse": True, "room_music": False, "media_playing": False}
+    st.update(kw)
+    return st
+
+
+GOOD = {"no_speech_prob": 0.0, "avg_logprob": -0.2}
+
+
 # ════════════════════════════════════════════════════════════════════════════
 @requires_monolith
 class R6ShadowTests(_Base):
@@ -794,9 +806,12 @@ class R6ShadowTests(_Base):
         self.assertIs(a, self.audio)
         self.assertEqual((text, conf, peak), (W_RES[0], W_RES[1], 0.031))
         self.assertIsInstance(ms, int)
+        # The fake transcribe took no _stt_lock: its wait is unknown.
+        self.assertIsNone(offer.call_args.kwargs["wait_ms"])
         self.assertEqual(set(ctx), {"owner_idle_s", "since_jarvis_s",
                                     "jarvis_asked", "prompt_pending",
-                                    "wake_mode", "standby", "noise_filter"})
+                                    "wake_mode", "standby", "noise_filter",
+                                    "gate", "preroll"})
         self.assertEqual(self._engine_notes(), [])
 
     def test_a_shadow_fault_never_reaches_the_turn(self):
@@ -819,25 +834,25 @@ class R6ShadowTests(_Base):
     def test_the_judge_runs_the_real_gates(self):
         bc = self.bc
         good = {"no_speech_prob": 0.0, "avg_logprob": -0.2}
-        ctx = {"wake_mode": True, "owner_idle_s": 5.0, "since_jarvis_s": None,
+        gate = _gate(wake_mode=True)
+        ctx = {"owner_idle_s": 5.0, "since_jarvis_s": None,
                "jarvis_asked": False, "prompt_pending": False,
-               "noise_filter": True}
+               "noise_filter": True, "gate": gate}
         j = bc._parakeet_shadow_judge("Jarvis, what time is it?", good,
                                       0.05, ctx)
         self.assertTrue(j["wake_prefix"])
-        self.assertTrue(j["accepted"])
+        self.assertEqual(j["wake_gate"], "")
+        self.assertTrue(j["gates_passed"])
         j = bc._parakeet_shadow_judge("Travis, what time is it?", good,
                                       0.05, ctx)
-        self.assertTrue(j["wake_refused"])
-        self.assertFalse(j["accepted"])
-        j = bc._parakeet_shadow_judge("Thank you.", good, 0.009,
-                                      dict(ctx, wake_mode=False,
-                                           owner_idle_s=None))
+        self.assertEqual(j["wake_gate"], "wake-word mode")
+        self.assertFalse(j["gates_passed"])
+        off = dict(ctx, owner_idle_s=None, gate=_gate())
+        j = bc._parakeet_shadow_judge("Thank you.", good, 0.009, off)
         self.assertEqual(j["noise_verdict"], "noise")
-        self.assertFalse(j["accepted"])
+        self.assertFalse(j["gates_passed"])
         j = bc._parakeet_shadow_judge("", {"no_speech_prob": 1.0,
-                                           "avg_logprob": -10.0},
-                                      0.05, dict(ctx, wake_mode=False))
+                                           "avg_logprob": -10.0}, 0.05, off)
         self.assertFalse(j["valid"])
         self.assertEqual(j["filter_reason"], "empty")
 
@@ -872,6 +887,187 @@ class R6ShadowTests(_Base):
         self.assertTrue(row["same_words"])
         self.assertEqual(row["parakeet"]["text"], "Jarvis what time is it")
         self.assertEqual(eng.calls, 1)
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class R6ShadowJudgeTests(_Base):
+    """The shadow judge asks the LIVE gates' own rules on a snapshot taken
+    when the capture was offered, and the A/B row measures what primary mode
+    would do (R6 review: the judge was a re-implementation that called
+    greeting replies refused, media-playing lines accepted and standby lines
+    accepted; the shadow text skipped the replacements; the rescue and its
+    cost were missing; Whisper's wall time hid its lock wait)."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "STT_SHADOW", "parakeet")
+        self._p(bc, "_turn_in_progress", [False])
+        self._p(bc, "_utterance_in_progress", [False])
+        sh = bc._parakeet_shadow
+        saved = (sh.offered, sh.dropped_full, sh.dropped_busy, sh.rows,
+                 list(getattr(sh, "_drops", ())))
+
+        def _restore():
+            while True:
+                try:
+                    sh._q.get_nowait()
+                except Exception:
+                    break
+            (sh.offered, sh.dropped_full, sh.dropped_busy, sh.rows,
+             drops) = saved
+            if hasattr(sh, "_drops"):
+                sh._drops.clear()
+                sh._drops.extend(drops)
+        _restore()
+        self.addCleanup(_restore)
+        self.sh = sh
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        os.environ["JARVIS_DATA_DIR"] = self.dir
+
+    def _rows(self):
+        path = os.path.join(self.dir, "stt_ab.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(x) for x in f]
+
+    def _judge(self, text, **gate):
+        ctx = {"owner_idle_s": 5.0, "since_jarvis_s": None,
+               "jarvis_asked": False, "prompt_pending": False,
+               "noise_filter": True, "gate": _gate(**gate)}
+        return self.bc._parakeet_shadow_judge(text, GOOD, 0.05, ctx)
+
+    def test_the_judge_asks_the_live_wake_rule(self):
+        bc = self.bc
+        rule = self._p(bc, "_wake_gate_verdict", return_value="sentinel")
+        j = self._judge("Jarvis, what time is it?")
+        self.assertEqual(j["wake_gate"], "sentinel")
+        self.assertFalse(j["gates_passed"])
+        self.assertEqual(rule.call_args.args[0], "Jarvis, what time is it?")
+        rule.return_value = ""
+        self.assertTrue(self._judge("what time is it")["gates_passed"])
+
+    def test_a_greeting_reply_and_a_follow_up_pass_as_live(self):
+        self.assertTrue(self._judge("what time is it", wake_mode=True,
+                                    greet_armed=True)["gates_passed"])
+        self.assertTrue(self._judge("what time is it", wake_mode=True,
+                                    followup_open=True)["gates_passed"])
+
+    def test_media_playing_refuses_a_non_wake_line(self):
+        j = self._judge("turn the lights off", media_playing=True)
+        self.assertEqual(j["wake_gate"], "media playing")
+        self.assertFalse(j["gates_passed"])
+        self.assertTrue(self._judge("Jarvis, turn the lights off",
+                                    media_playing=True)["gates_passed"])
+
+    def test_standby_rows_are_judged_by_the_standby_rule(self):
+        self.assertFalse(self._judge("turn the lights off",
+                                     standby=True)["gates_passed"])
+        self.assertTrue(self._judge("is that you there Jarvis",
+                                    standby=True)["gates_passed"])
+
+    def test_music_markers_are_judged(self):
+        j = self._judge("[Music]")
+        self.assertTrue(j["music_marker"])
+        self.assertFalse(j["gates_passed"])
+
+    def test_the_offer_snapshots_the_gates_without_consuming_them(self):
+        bc = self.bc
+        from core.followup_window import FollowupWindow
+        fw = FollowupWindow(30.0)
+        fw.note_addressed()
+        until = fw._until
+        self._p(bc, "_followup_window", fw)
+        self._p(bc, "_require_wake_runtime", True)
+        bc._standby_greet_admit_until[0] = bc.time.time() + 8.0
+        bc._last_capture_preroll[0] = (len(self.audio), 4096)
+        self._p(bc, "transcribe", return_value=W_RES)
+        offer = self._p(bc._parakeet_shadow, "offer", return_value=True)
+        bc._transcribe_capture(self.audio)
+        ctx = offer.call_args.args[5]
+        self.assertTrue(ctx["gate"]["wake_mode"])
+        self.assertTrue(ctx["gate"]["greet_armed"])
+        self.assertTrue(ctx["gate"]["followup_open"])
+        self.assertIs(ctx["gate"]["media_playing"], False)   # a value
+        self.assertEqual(ctx["preroll"], 4096)
+        self.assertEqual(fw._until, until)
+        self.assertGreater(bc._standby_greet_admit_until[0], 0.0)
+
+    def test_the_shadow_text_gets_the_replacements(self):
+        bc = self.bc
+        self._p(bc, "_stt_alt", _FakeEngine(text="jervis what time is it"))
+        self._p(bc, "STT_REPLACEMENTS", {"jervis": "Jarvis"})
+        self.assertTrue(self.sh.offer(self.audio, "Jarvis, what time is it?",
+                                      W_RES[1], 900, 0.05,
+                                      bc._parakeet_shadow_ctx(self.audio),
+                                      start=False))
+        with contextlib.redirect_stdout(io.StringIO()):
+            row = self.sh.process(self.sh._q.get_nowait())
+        self.assertEqual(row["parakeet"]["text"], "Jarvis what time is it")
+        self.assertTrue(row["same_words"])
+        self.assertEqual(self._rows(), [row])
+
+    def test_the_would_be_rescue_is_the_primary_rule(self):
+        bc = self.bc
+        self._p(bc, "_stt_alt", _FakeEngine(text="Travis, lights"))
+        self._p(bc, "_require_wake_runtime", True)
+        bc._last_capture_preroll[0] = (len(self.audio), 4096)
+        head = self._p(bc._tail_vad, "speech_in_head", return_value=True)
+        ctx = bc._parakeet_shadow_ctx(self.audio)
+        self._p(bc, "_require_wake_runtime", False)   # later: no matter
+        self.sh.offer(self.audio, "Jarvis, lights", W_RES[1], 900, 0.05, ctx,
+                      start=False, wait_ms=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            row = self.sh.process(self.sh._q.get_nowait())
+        self.assertEqual(row["rescue"], "no-wake")
+        self.assertEqual(head.call_args.kwargs["start"], 4096)
+        self.assertEqual(row["primary_ms"],
+                         row["parakeet"]["stt_ms"]
+                         + row["parakeet"]["lock_wait_ms"] + 900)
+
+    def test_whispers_lock_wait_is_measured_apart(self):
+        """An ambient decode holds _stt_lock for ~0.3 s: the row's Whisper
+        stt_ms is the decode alone and the wait is its own number."""
+        bc = self.bc
+        self._p(bc, "_transcribe_impl", return_value=W_RES)
+        offer = self._p(bc._parakeet_shadow, "offer", return_value=True)
+        held, done = threading.Event(), threading.Event()
+
+        def ambient():
+            with bc._stt_lock:
+                held.set()
+                bc.time.sleep(0.3)
+
+        def owner():
+            try:
+                bc._transcribe_capture(self.audio)
+            finally:
+                done.set()
+        amb = threading.Thread(target=ambient, daemon=True)
+        amb.start()
+        self.assertTrue(held.wait(5.0))
+        own = threading.Thread(target=owner, daemon=True)
+        own.start()
+        self.assertTrue(done.wait(5.0))
+        amb.join(5.0)
+        ms = offer.call_args.args[3]
+        wait = offer.call_args.kwargs["wait_ms"]
+        self.assertGreaterEqual(wait, 200)
+        self.assertLess(ms, 150)
+
+    def test_the_live_outcome(self):
+        bc = self.bc
+        self._p(bc, "_last_owner_turn_at", [50.0])
+        self.assertEqual(bc._parakeet_shadow_live(40.0, {}), {"you": True})
+        self.assertEqual(bc._parakeet_shadow_live(60.0, {}), {"you": False})
+        self._p(bc, "_sleep_mode", [False])
+        self._p(bc, "_standby_mode", [False])
+        self.assertEqual(bc._parakeet_shadow_live(60.0, {"standby": True}),
+                         {"you": False, "woke": True})
 
 
 if __name__ == "__main__":

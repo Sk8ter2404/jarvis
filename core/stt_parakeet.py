@@ -60,6 +60,7 @@ a box without them, and a process with both flags off, never imports them
 """
 from __future__ import annotations
 
+import collections
 import importlib.util
 import json
 import math
@@ -90,6 +91,7 @@ RESCUE_LOG_EVERY_S = 60.0
 # The shadow worker (STT_SHADOW). The queue holds at most SHADOW_QUEUE_MAX
 # captures; a capture waits at most SHADOW_WAIT_S for the turn to finish.
 SHADOW_QUEUE_MAX = 4
+SHADOW_DROPS_MAX = 64      # numbers-only rows of refused captures, pending
 SHADOW_WAIT_S = 30.0
 SHADOW_POLL_S = 0.25
 AB_MAX_BYTES = 64 * 1024 * 1024
@@ -441,9 +443,16 @@ def _num(v, nd=4):
     return round(float(v), nd) if _finite(v) else None
 
 
-def _side(text, conf, judged, ms) -> dict:
+def _ms(v):
+    """A whole number of milliseconds, or None."""
+    return int(round(float(v))) if _finite(v) else None
+
+
+def _side(text, conf, judged, ms, wait_ms=None) -> dict:
+    """One engine's half of an A/B row. ``stt_ms`` is its decode alone;
+    ``lock_wait_ms`` the time it waited for its model's lock first."""
     c = conf if isinstance(conf, dict) else {}
-    d = {"text": text or "", "stt_ms": ms,
+    d = {"text": text or "", "stt_ms": _ms(ms), "lock_wait_ms": _ms(wait_ms),
          "no_speech_prob": _num(c.get("no_speech_prob")),
          "avg_logprob": _num(c.get("avg_logprob"))}
     for k in ("tok_lp_mean", "tok_lp_min", "n_tok"):
@@ -475,21 +484,35 @@ class Shadow:
     """STT_SHADOW='parakeet': Whisper's transcript stands; Parakeet decodes
     the same capture LATER and both are judged into the A/B file.
 
-      decode(audio) -> (text, conf)   Parakeet (under _parakeet_lock)
+      decode(audio) -> (text, conf)   Parakeet as primary mode would hand
+                                      the turn its text (under
+                                      _parakeet_lock; the replacements
+                                      applied)
       busy() -> bool                  a turn or an utterance is in progress
-      judge(text, conf, peak, ctx)    the real gates' verdicts (a dict)
+      judge(text, conf, peak, ctx)    the live gates' verdicts (a dict with
+                                      ``gates_passed``)
       write_row(row) -> bool          append to data/stt_ab.jsonl
+      rescue(text, audio, ctx) -> str the reason primary mode would have
+                                      rescued Parakeet's text ('' = none;
+                                      the row's ``rescue``, None when not
+                                      given)
+      live(t, ctx) -> dict            what the live loop did with Whisper's
+                                      text, read once the turn is over (the
+                                      row's ``live``)
 
     offer() never blocks the voice thread: it copies the audio into a
     bounded queue (a full queue drops the capture and counts it). ONE daemon
     takes captures in order; each waits until busy() is False, at most
     SHADOW_WAIT_S from when it was offered (else it is dropped and counted),
-    so the decode never competes with a turn. The log gets numbers only —
-    never either transcript (the words go to the A/B file alone). Clips are
-    never saved. A Parakeet failure trips the shared latch: no more offers.
-    `clock` / `wait` are injectable (tests run without sleeping)."""
+    so the decode never competes with a turn. A dropped capture still leaves
+    a numbers-only row (``dropped``: 'full' | 'busy'), so the A/B file shows
+    what it is missing. The log gets numbers only — never either transcript
+    (the words go to the A/B file alone). Clips are never saved. A Parakeet
+    failure trips the shared latch: no more offers. `clock` / `wait` are
+    injectable (tests run without sleeping)."""
 
     def __init__(self, decode, busy, judge, write_row, *, latch,
+                 rescue=None, live=None,
                  maxsize=SHADOW_QUEUE_MAX, wait_s=SHADOW_WAIT_S,
                  poll_s=SHADOW_POLL_S, log=print, clock=time.monotonic,
                  wait=None, wall=time.time):
@@ -497,8 +520,13 @@ class Shadow:
         self._busy = busy
         self._judge = judge
         self._write = write_row
+        self._rescue = rescue
+        self._live = live
         self.latch = latch
         self._q = queue.Queue(maxsize=max(1, int(maxsize)))
+        # Numbers-only records of captures a full queue refused, written by
+        # the daemon (offer() does no I/O). Bounded.
+        self._drops = collections.deque(maxlen=SHADOW_DROPS_MAX)
         self._wait_s = float(wait_s)
         self._poll_s = float(poll_s)
         self._log = log
@@ -515,27 +543,29 @@ class Shadow:
 
     # -- voice thread --------------------------------------------------------
     def offer(self, audio, text, conf, stt_ms, peak, ctx=None,
-              start: bool = True) -> bool:
+              start: bool = True, wait_ms=None) -> bool:
         """Queue one capture: a COPY of `audio`, Whisper's (text, conf), its
-        decode wall time `stt_ms`, the capture's peak RMS and the gate
-        context `ctx` read now. False (and nothing queued) when the latch is
-        off, the queue is full, or anything fails. Never raises."""
+        decode time `stt_ms` and its wait for _stt_lock `wait_ms`, the
+        capture's peak RMS and the gate context `ctx` read now. False (and
+        nothing queued) when the latch is off, the queue is full, or
+        anything fails. Never raises."""
         try:
             if self.latch.failed:
                 return False
             import numpy as np
-            item = {"t": self._clock(), "wall": self._wall(),
-                    "audio": np.array(audio, dtype=np.float32,
-                                      copy=True).reshape(-1),
+            a = np.array(audio, dtype=np.float32, copy=True).reshape(-1)
+            ctx = dict(ctx) if isinstance(ctx, dict) else {}
+            item = {"t": self._clock(), "wall": self._wall(), "audio": a,
                     "text": text or "",
                     "conf": dict(conf) if isinstance(conf, dict) else {},
-                    "stt_ms": stt_ms, "peak": float(peak or 0.0),
-                    "ctx": dict(ctx) if isinstance(ctx, dict) else {}}
+                    "stt_ms": stt_ms, "wait_ms": wait_ms,
+                    "peak": float(peak or 0.0), "ctx": ctx}
             try:
                 self._q.put_nowait(item)
             except queue.Full:
                 with self._mu:
                     self.dropped_full += 1
+                    self._drops.append(self._drop_row(item, "full"))
                 return False
             with self._mu:
                 self.offered += 1
@@ -564,6 +594,7 @@ class Shadow:
     # -- the daemon ------------------------------------------------------------
     def _run(self) -> None:
         while not self._stop.is_set():
+            self._flush_drops()
             try:
                 item = self._q.get(timeout=1.0)
             except queue.Empty:
@@ -572,6 +603,31 @@ class Shadow:
                 self.process(item)
             except Exception:
                 pass
+
+    def _drop_row(self, item, why: str) -> dict:
+        """The numbers-only row of a dropped capture: no text, no audio."""
+        ctx = item.get("ctx") or {}
+        return {"ts": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                    time.localtime(item["wall"])),
+                "dropped": why,
+                "speech_s": round(len(item["audio"]) / float(SAMPLE_RATE), 3),
+                "wake_mode": bool(ctx.get("wake_mode")),
+                "standby": bool(ctx.get("standby"))}
+
+    def _write_row(self, row) -> bool:
+        try:
+            return bool(self._write(row))
+        except Exception:
+            return False
+
+    def _flush_drops(self) -> None:
+        """Write the numbers-only rows of captures a full queue refused."""
+        while True:
+            with self._mu:
+                if not self._drops:
+                    return
+                row = self._drops.popleft()
+            self._write_row(row)
 
     def wait_idle(self, deadline: float) -> bool:
         """True once busy() is False; False when `deadline` (clock time)
@@ -590,11 +646,14 @@ class Shadow:
 
     def process(self, item) -> "dict | None":
         """One queued capture -> its A/B row (also written), or None when it
-        was dropped (busy past the deadline, latch off, decode failed)."""
+        was dropped (busy past the deadline — a numbers-only row then — the
+        latch off, the decode failed)."""
+        self._flush_drops()
         if not self.wait_idle(item["t"] + self._wait_s):
             with self._mu:
                 self.dropped_busy += 1
                 n = self.dropped_busy
+            self._write_row(self._drop_row(item, "busy"))
             self._say(f"  [stt-shadow] capture dropped: a turn ran past "
                       f"{self._wait_s:.0f} s ({n} dropped)")
             return None
@@ -616,7 +675,28 @@ class Shadow:
             p_judged = self._judge(p_text, p_conf, item["peak"], ctx)
         except Exception:
             p_judged = None
-        p_ms = p_conf.get("stt_ms") if isinstance(p_conf, dict) else None
+        rescue = None
+        if self._rescue is not None:
+            try:
+                rescue = str(self._rescue(p_text, item["audio"], ctx) or "")
+            except Exception:
+                rescue = "check-failed"
+        live = None
+        if self._live is not None:
+            try:
+                live = self._live(item["t"], ctx)
+            except Exception:
+                live = None
+        pc = p_conf if isinstance(p_conf, dict) else {}
+        p_ms, p_wait = pc.get("stt_ms"), pc.get("lock_wait_ms")
+        primary_ms = None
+        if _finite(p_ms):
+            primary_ms = _ms(float(p_ms) + (float(p_wait)
+                                            if _finite(p_wait) else 0.0))
+            if rescue:
+                w_ms = item.get("stt_ms")
+                primary_ms = (_ms(primary_ms + float(w_ms))
+                              if _finite(w_ms) else None)
         row = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S",
                                 time.localtime(item["wall"])),
@@ -626,25 +706,26 @@ class Shadow:
             "standby": bool(ctx.get("standby")),
             "shadow_wait_ms": waited_ms,
             "same_words": _norm_words(w_text) == _norm_words(p_text),
-            "whisper": _side(w_text, w_conf, w_judged, item["stt_ms"]),
-            "parakeet": _side(p_text, p_conf, p_judged, p_ms),
+            "rescue": rescue,
+            "primary_ms": primary_ms,
+            "live": live,
+            "whisper": _side(w_text, w_conf, w_judged, item["stt_ms"],
+                             item.get("wait_ms")),
+            "parakeet": _side(p_text, p_conf, p_judged, p_ms, p_wait),
         }
-        wrote = False
-        try:
-            wrote = bool(self._write(row))
-        except Exception:
-            wrote = False
+        wrote = self._write_row(row)
         with self._mu:
             self.rows += 1 if wrote else 0
             n = self.rows
 
-        def _acc(j):
+        def _g(j):
             return "?" if not isinstance(j, dict) else \
-                ("1" if j.get("accepted") else "0")
+                ("1" if j.get("gates_passed") else "0")
         self._say(f"  [stt-shadow] parakeet {p_ms if p_ms is not None else '?'}"
                   f" ms vs whisper {item['stt_ms']} ms, same words="
-                  f"{int(row['same_words'])}, accepted whisper={_acc(w_judged)}"
-                  f" parakeet={_acc(p_judged)}"
+                  f"{int(row['same_words'])}, gates whisper={_g(w_judged)}"
+                  f" parakeet={_g(p_judged)}"
+                  + (f", rescue={rescue}" if rescue else "")
                   + (f" (row {n})" if wrote else " (row not written)"))
         return row
 

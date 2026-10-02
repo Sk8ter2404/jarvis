@@ -484,10 +484,11 @@ class PrimaryTests(unittest.TestCase):
 
 # ── the shadow worker ─────────────────────────────────────────────────────
 def _judge(text, conf, peak, ctx):
-    return {"accepted": bool(text), "wake_prefix": _prefix(text)}
+    return {"gates_passed": bool(text), "wake_prefix": _prefix(text)}
 
 
-def _shadow(busy=lambda: False, decode=None, maxsize=4, clock=None):
+def _shadow(busy=lambda: False, decode=None, maxsize=4, clock=None,
+            **kw):
     clock = clock or _Clock()
     log, rows, decoded = [], [], []
 
@@ -495,12 +496,13 @@ def _shadow(busy=lambda: False, decode=None, maxsize=4, clock=None):
         decoded.append(a)
         return ("jarvis turn the lights off",
                 {"no_speech_prob": 0.0, "avg_logprob": -0.3, "stt_ms": 150,
-                 "tok_lp_mean": -0.02, "tok_lp_min": -0.2, "n_tok": 9})
+                 "lock_wait_ms": 4, "tok_lp_mean": -0.02, "tok_lp_min": -0.2,
+                 "n_tok": 9})
     sh = sp.Shadow(decode or dec, busy, _judge,
                    lambda r: rows.append(r) or True,
                    latch=sp.Latch(log=log.append), maxsize=maxsize,
                    wait_s=30.0, poll_s=0.25, log=log.append, clock=clock,
-                   wait=clock.wait, wall=lambda: 1_000_000.0)
+                   wait=clock.wait, wall=lambda: 1_000_000.0, **kw)
     return sh, log, rows, decoded, clock
 
 
@@ -521,7 +523,8 @@ class ShadowTests(unittest.TestCase):
         sh, log, rows, decoded, clock = _shadow(busy=lambda: True)
         self.assertTrue(self._offer(sh))
         self.assertIsNone(sh.process(self._take(sh)))
-        self.assertEqual((decoded, rows), ([], []))
+        self.assertEqual(decoded, [])
+        self.assertEqual([r["dropped"] for r in rows], ["busy"])
         self.assertEqual(sh.dropped_busy, 1)
         # It waited (no sleeping: the fake clock) and gave up at 30 s.
         self.assertGreaterEqual(clock.t - 100.0, 30.0)
@@ -549,8 +552,76 @@ class ShadowTests(unittest.TestCase):
         self.assertTrue(row["wake_mode"])
         self.assertFalse(row["standby"])
         self.assertEqual(row["speech_s"], 2.0)
-        self.assertTrue(row["parakeet"]["accepted"])
+        self.assertTrue(row["parakeet"]["gates_passed"])
+        self.assertTrue(any("gates whisper=1 parakeet=1" in ln
+                            for ln in log))
         json.dumps(row)                        # one JSON line
+
+    def test_the_row_records_the_would_be_rescue_and_primary_cost(self):
+        # Primary mode would have rescued (Whisper decodes again): the row
+        # says so, and what primary would have cost — Parakeet, plus
+        # Whisper's decode on a rescue (R6 review, finding 4).
+        seen = []
+
+        def rescue(text, audio, ctx):
+            seen.append((text, len(audio), ctx))
+            return "no-wake"
+        sh, _log, rows, _d, _c = _shadow(rescue=rescue)
+        sh.offer(self.AUDIO, "Travis, lights", W_CONF, 1200, 0.02,
+                 {"wake_mode": True}, start=False, wait_ms=300)
+        row = sh.process(self._take(sh))
+        self.assertEqual(seen, [("jarvis turn the lights off", 32000,
+                                 {"wake_mode": True})])
+        self.assertEqual(row["rescue"], "no-wake")
+        self.assertEqual(row["primary_ms"], 150 + 4 + 1200)
+        sh, _log, rows, _d, _c = _shadow(rescue=lambda t, a, c: "")
+        self._offer(sh)
+        row = sh.process(self._take(sh))
+        self.assertEqual((row["rescue"], row["primary_ms"]), ("", 154))
+        # No rescue callable: unknown, not "no rescue".
+        sh, _log, rows, _d, _c = _shadow()
+        self._offer(sh)
+        self.assertIsNone(sh.process(self._take(sh))["rescue"])
+
+    def test_whispers_lock_wait_is_kept_apart_from_its_decode(self):
+        # Whisper's wall time included the wait for _stt_lock behind an
+        # ambient decode; Parakeet's was pure decode (R6 review, finding 7).
+        sh, _log, rows, _d, _c = _shadow()
+        sh.offer(self.AUDIO, "x", W_CONF, 1200, 0.02, {}, start=False,
+                 wait_ms=300)
+        row = sh.process(self._take(sh))
+        self.assertEqual((row["whisper"]["stt_ms"],
+                          row["whisper"]["lock_wait_ms"]), (1200, 300))
+        self.assertEqual((row["parakeet"]["stt_ms"],
+                          row["parakeet"]["lock_wait_ms"]), (150, 4))
+
+    def test_the_live_outcome_is_recorded(self):
+        seen = []
+
+        def live(t, ctx):
+            seen.append((t, ctx))
+            return {"you": True}
+        sh, _log, rows, _d, clock = _shadow(live=live)
+        self._offer(sh)
+        row = sh.process(self._take(sh))
+        self.assertEqual(row["live"], {"you": True})
+        self.assertEqual(seen, [(100.0, {"wake_mode": True})])
+
+    def test_dropped_captures_leave_a_numbers_only_row(self):
+        # The A/B file must show what it is missing: long turns that ran
+        # past the wait, and captures a full queue refused (R6 review,
+        # finding 8). Numbers only — no text, no audio.
+        sh, log, rows, _d, clock = _shadow(busy=lambda: True, maxsize=1)
+        self.assertTrue(self._offer(sh))
+        self.assertFalse(self._offer(sh))          # full
+        self.assertIsNone(sh.process(self._take(sh)))
+        self.assertEqual([r.get("dropped") for r in rows], ["full", "busy"])
+        for r in rows:
+            self.assertEqual(r["speech_s"], 2.0)
+            self.assertTrue(r["wake_mode"])
+            self.assertEqual(set(r), {"ts", "dropped", "speech_s",
+                                      "wake_mode", "standby"})
+        self.assertEqual((sh.dropped_full, sh.dropped_busy), (1, 1))
 
     def test_never_prints_either_transcript(self):
         sh, log, rows, _d, _c = _shadow()

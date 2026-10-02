@@ -16459,14 +16459,19 @@ def _parakeet_decode(audio, wait_for_load: bool = True):
     raise NotReady at once instead of waiting (R6 review: the load takes
     seconds, a hung onnxruntime load forever, while Whisper sits ready).
     Once loaded, a decode in flight is waited for (it is bounded)."""
+    t0 = time.perf_counter()
     if not _parakeet_lock.acquire(blocking=False):
         if not wait_for_load and _stt_alt is None:
             raise _stt_parakeet.NotReady("Parakeet is still loading")
         _parakeet_lock.acquire()
     try:
+        wait_ms = int(round((time.perf_counter() - t0) * 1000.0))
         eng = _parakeet_engine()
-        return _stt_parakeet.transcribe(
+        text, conf = _stt_parakeet.transcribe(
             eng, audio, anchors=globals().get("PARAKEET_CONF_ANCHORS"))
+        if isinstance(conf, dict):
+            conf["lock_wait_ms"] = wait_ms
+        return text, conf
     finally:
         _parakeet_lock.release()
 
@@ -16504,15 +16509,22 @@ def _capture_preroll_samples(audio) -> "int | None":
         return None
 
 
-def _parakeet_head_speech(audio) -> "bool | None":
+_PREROLL_FROM_STASH = object()
+
+
+def _parakeet_head_speech(audio, preroll=_PREROLL_FROM_STASH
+                          ) -> "bool | None":
     """The rescue's head check: speech in the first RESCUE_HEAD_S of the
     owner's speech — measured from the chunk that tripped record_speech,
     past its pre-roll (R6 review: from the clip's first sample the window
     was 96 % pre-roll and a real wake word never crossed the threshold).
-    None (the rescue then runs) when the pre-roll is unknown or the
+    ``preroll``: its length in samples (the shadow passes the one it
+    snapshotted at the offer); by default record_speech's stash for this
+    clip. None (the rescue then runs) when the pre-roll is unknown or the
     detector cannot tell. Never raises."""
     try:
-        pre = _capture_preroll_samples(audio)
+        pre = (_capture_preroll_samples(audio)
+               if preroll is _PREROLL_FROM_STASH else preroll)
         if pre is None:
             return None
         return _tail_vad.speech_in_head(
@@ -16548,49 +16560,118 @@ def _parakeet_shadow_busy() -> bool:
     return bool(_turn_in_progress[0] or _utterance_in_progress[0])
 
 
-def _parakeet_shadow_ctx() -> dict:
+def _parakeet_shadow_ctx(audio=None) -> dict:
     """The gate context of THIS capture, read on the voice thread when it is
-    offered (the same state _noise_verdict and the background-audio gate
-    see for this turn). Never raises."""
+    offered — before the live gates run on it — so the shadow judge sees
+    the state they saw: the noise verdict's inputs (as _noise_verdict reads
+    them), ``gate`` (_wake_gate_state, peeked, SMTC resolved now) and
+    ``preroll`` (record_speech's pre-roll of ``audio``, for the would-be
+    rescue's head check). Never raises."""
     try:
         now = time.monotonic()
         owner_at = float(_last_owner_turn_at[0] or 0.0)
         line_at = float(_last_jarvis_line[0] or 0.0)
+        gate = _wake_gate_state(resolve_media=True)
         return {"owner_idle_s": (now - owner_at) if owner_at else None,
                 "since_jarvis_s": (now - line_at) if line_at else None,
                 "jarvis_asked": bool(_last_jarvis_line[1]),
                 "prompt_pending": _reply_prompt_pending(),
-                "wake_mode": bool(_require_wake_runtime),
-                "standby": bool(_standby_mode[0] or _sleep_mode[0]),
-                "noise_filter": bool(NOISE_FILTER_ENABLED)}
+                "wake_mode": bool(gate.get("wake_mode")),
+                "standby": bool(gate.get("standby")),
+                "noise_filter": bool(NOISE_FILTER_ENABLED),
+                "gate": gate,
+                "preroll": (_capture_preroll_samples(audio)
+                            if audio is not None else None)}
     except Exception:
         return {}
 
 
 def _parakeet_shadow_judge(text, conf, peak, ctx) -> dict:
-    """The real gates' verdicts on one transcript, without their side effects
-    or log lines: the wake rule of _should_refuse_background_audio
-    (wake-word mode and no _text_has_wake_prefix), hallucination_verdict
-    (as _noise_verdict calls it) and is_valid_speech. `accepted` = the turn
-    would have reached "You:"."""
+    """The live gates' verdicts on one transcript, on the capture's own
+    snapshot (_parakeet_shadow_ctx), without their side effects or log
+    lines — each from the gate's own rule, never a copy:
+
+      wake_gate      _wake_gate_verdict ('' = through; else the gate that
+                     drops it for want of a wake word: standby / sleep,
+                     the post-dialogue hold, wake-word mode with its
+                     follow-up window and greeting reply, media playing,
+                     room music)
+      wake_prefix    _text_has_wake_prefix
+      music_marker   is_ambient_music ([Music] / ♪ markers; main loop)
+      noise_verdict  hallucination_verdict as _noise_verdict calls it, on
+                     the text _wake_lead_canonical hands it (main loop)
+      valid          is_valid_speech, as the main loop calls it
+      gates_passed   standby / sleep: the line would wake JARVIS (the
+                     wake gate); otherwise it would pass every gate above.
+
+    NOT modelled (the row's ``live`` says what the loop really did with
+    Whisper's text): known-device speech, self-echo (timing), the sleep /
+    standby trigger phrases. Never prints."""
     ctx = ctx if isinstance(ctx, dict) else {}
+    gate = ctx.get("gate") if isinstance(ctx.get("gate"), dict) else {}
     wake = bool(_text_has_wake_prefix(text))
-    wake_refused = bool(ctx.get("wake_mode")) and not wake
+    wake_gate = str(_wake_gate_verdict(text, gate) or "")
+    standby = bool(gate.get("standby"))
+    music = bool(is_ambient_music(text))
+    try:
+        canon = _wake_prefix.canonical_wake_text(text)
+        canon = canon if isinstance(canon, str) and canon else text
+    except Exception:
+        canon = text
     verdict, why = "", ""
     if ctx.get("noise_filter", True):
         verdict, why = _speech_filter_mod.hallucination_verdict(
-            text, conf, peak, vad_threshold=VAD_THRESHOLD,
+            canon, conf, peak, vad_threshold=VAD_THRESHOLD,
             owner_idle_s=ctx.get("owner_idle_s"),
             since_jarvis_s=ctx.get("since_jarvis_s"),
             jarvis_asked=bool(ctx.get("jarvis_asked")),
             prompt_pending=bool(ctx.get("prompt_pending")))
-    valid, reason = is_valid_speech(text, conf, peak_rms=peak,
+    valid, reason = is_valid_speech(canon, conf, peak_rms=peak,
                                     reply=(verdict == "reply"))
-    return {"wake_prefix": wake, "wake_refused": wake_refused,
+    if standby:
+        passed = not wake_gate
+    else:
+        passed = (not wake_gate and not music and verdict != "noise"
+                  and bool(valid))
+    return {"wake_prefix": wake, "wake_gate": wake_gate,
+            "music_marker": music,
             "noise_verdict": verdict, "noise_why": why,
             "valid": bool(valid), "filter_reason": reason,
-            "accepted": (not wake_refused and verdict != "noise"
-                         and bool(valid))}
+            "gates_passed": bool(passed)}
+
+
+def _parakeet_shadow_decode(audio):
+    """Parakeet as primary mode would hand the turn its text: the decode
+    (under _parakeet_lock), then _parakeet_post_text (STT_REPLACEMENTS, then
+    STT_REPLACEMENTS_PARAKEET). Raises on failure (the shadow latches)."""
+    text, conf = _parakeet_decode(audio)
+    return _parakeet_post_text(text), conf
+
+
+def _parakeet_shadow_rescue(text, audio, ctx) -> str:
+    """Would primary mode have rescued Parakeet's ``text``? The primary rule
+    (core/stt_parakeet.rescue_reason) on the capture's snapshot: the wake
+    gates as they stood (_wake_gate_verdict on ctx['gate']) and the head
+    check past the pre-roll the offer recorded."""
+    ctx = ctx if isinstance(ctx, dict) else {}
+    gate = ctx.get("gate") if isinstance(ctx.get("gate"), dict) else {}
+    return _stt_parakeet.rescue_reason(
+        text,
+        wake_lost=lambda t: bool(_wake_gate_verdict(t, gate)),
+        head_speech=lambda: _parakeet_head_speech(audio,
+                                                  ctx.get("preroll")))
+
+
+def _parakeet_shadow_live(t_offer, ctx) -> dict:
+    """What the live loop did with Whisper's text, read once the turn is
+    over (the worker waits for that): ``you`` — an owner turn reached
+    "You:" since the offer (_last_owner_turn_at; a typed turn in between
+    would also count); ``woke`` (standby / sleep captures) — JARVIS is
+    awake now."""
+    out = {"you": float(_last_owner_turn_at[0] or 0.0) >= float(t_offer)}
+    if isinstance(ctx, dict) and ctx.get("standby"):
+        out["woke"] = not (_sleep_mode[0] or _standby_mode[0])
+    return out
 
 
 def _parakeet_ab_write(row) -> bool:
@@ -16601,11 +16682,13 @@ def _parakeet_ab_write(row) -> bool:
 
 
 _parakeet_shadow = _stt_parakeet.Shadow(
-    lambda a: _parakeet_decode(a),
+    lambda a: _parakeet_shadow_decode(a),
     _parakeet_shadow_busy,
     _parakeet_shadow_judge,
     _parakeet_ab_write,
     latch=_parakeet_latch,
+    rescue=lambda t, a, c: _parakeet_shadow_rescue(t, a, c),
+    live=lambda t, c: _parakeet_shadow_live(t, c),
 )
 
 
@@ -16616,13 +16699,18 @@ def _transcribe_capture_r6(audio, route: str):
     never blocks)."""
     if route == "primary":
         return _parakeet_primary.run(audio)
+    _stt_wait_tls.ms = None
     t0 = time.perf_counter()
     res = transcribe(audio)
     try:
-        ms = int(round((time.perf_counter() - t0) * 1000.0))
+        wall = int(round((time.perf_counter() - t0) * 1000.0))
+        # transcribe() noted its wait for _stt_lock (an ambient decode):
+        # the row keeps it apart from Whisper's decode time.
+        wait = getattr(_stt_wait_tls, "ms", None)
+        ms = wall - wait if isinstance(wait, int) else wall
         text, conf = res
         _parakeet_shadow.offer(audio, text, conf, ms, _last_recording_peak,
-                               _parakeet_shadow_ctx())
+                               _parakeet_shadow_ctx(audio), wait_ms=wait)
     except Exception:
         pass
     return res
@@ -18763,11 +18851,21 @@ def transcribe(audio: np.ndarray) -> tuple[str, dict]:
     [turn-timing] stt_wait_ms (speed plan R1): the time spent waiting for
     _stt_lock — an ambient decode holding Whisper. TurnTiming keeps it only
     for the turn's own thread, so an ambient worker's wait never lands on
-    the line. Print-only; the lock and the return are unchanged."""
+    the line. Print-only; the lock and the return are unchanged. The same
+    wait is kept per thread in _stt_wait_tls (the R6 shadow's A/B rows)."""
     _stt_w0 = _tt("now")
+    _stt_p0 = time.perf_counter()
     with _stt_lock:
+        _stt_wait_tls.ms = int(round((time.perf_counter() - _stt_p0)
+                                     * 1000.0))
         _tt_note_elapsed("stt_wait_ms", _stt_w0)
         return _transcribe_impl(audio)
+
+
+# transcribe()'s last wait for _stt_lock on THIS thread, in ms (the R6
+# shadow keeps it apart from Whisper's decode time). Thread-local: an
+# ambient decode never overwrites the owner's.
+_stt_wait_tls = threading.local()
 
 
 # THE NO-VAD RETRY IS BOUNDED (2026-10-01, audit P1-1). When Silero VAD finds
