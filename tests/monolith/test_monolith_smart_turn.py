@@ -130,6 +130,7 @@ class _Base(MonolithGlobalsTestCase):
         # The held [eot-shadow] line starts empty, and a Smart Turn check is
         # timed on the fake session's clock (each run costs tsess.costs).
         self._p(bc, "_eot_shadow_pending", [None])
+        self._p(bc, "_eot_slow_checks", [0])
         self._p(bc, "_eot_clock", self.tsess.clock)
         self._p(bc, "SMART_TURN_MODE", self.MODE)
         self.timing = tt.TurnTiming(print_fn=lambda line: None)
@@ -830,23 +831,53 @@ class CaptureThreadCostTests(_Base):
     promises to leave alone — nor delay the speculative snapshot of its
     chunk."""
 
-    def test_a_check_longer_than_one_chunk_turns_smart_turn_off(self):
+    def test_one_slow_check_costs_only_its_own_turn(self):
         np = self.np
         self._warm()
         off = self._off_audio(_TURN)
-        self.tsess.costs = [0.070]       # the turn's first check: 70 ms
+        # The warm's runs are fast; the turn's first check takes 70 ms, then
+        # every later one is fast (costs are indexed by run, warm included).
+        k = len(self.tsess.feeds)
+        self.tsess.costs = [0.010] * k + [0.070, 0.010]
+        self.tsess.ps = [0.5]
         audio, log = self._capture(_TURN)
         self.assertTrue(np.array_equal(audio, off))
-        self.assertEqual(self._eot_lines(log), [
-            "[eot] smart turn off for this session (too slow: a check took "
-            "70 ms, over one 64 ms capture chunk)"])
+        self.assertEqual(self._eot_lines(log), [])
         # That check's p is not used: no would-be end, no p.
         self.assertEqual(self._shadow_lines(log), [
             f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS}"])
         self.assertEqual(self.bc._eot_turn.failed, "")   # 70 < its 150 ms
+        # The next turn still gets Smart Turn, and its fast check counts.
         _a, log2 = self._capture(_TURN)
-        self.assertEqual(len(self.made), 1)
-        self.assertNotIn("[eot", log2)
+        self.assertEqual(len(self.made), 2)
+        self.assertEqual(self._eot_lines(log2), [])
+        self.assertEqual(self._shadow_lines(log2), [
+            f"[eot-shadow] fire_ms=- p=0.500 resumed=0 actual_ms={_TURN_MS}"])
+
+    def test_two_slow_checks_in_a_row_turn_smart_turn_off(self):
+        np = self.np
+        self._warm()
+        off = self._off_audio(_TURN)
+        self.tsess.costs = [0.070]          # every check: 70 ms
+        _a, log1 = self._capture(_TURN)
+        self.assertEqual(self._eot_lines(log1), [])
+        audio, log2 = self._capture(_TURN)
+        self.assertTrue(np.array_equal(audio, off))
+        self.assertEqual(self._eot_lines(log2), [
+            "[eot] smart turn off for this session (too slow: 2 checks in a "
+            "row over one 64 ms capture chunk, the last 70 ms)"])
+        _a, log3 = self._capture(_TURN)
+        self.assertEqual(len(self.made), 2)
+        self.assertNotIn("[eot", log3)
+
+    def test_a_fast_check_between_slow_ones_resets_the_count(self):
+        self._warm()
+        k = len(self.tsess.feeds)
+        self.tsess.costs = [0.010] * k + [0.070, 0.010, 0.070, 0.010]
+        self.tsess.ps = [0.5]
+        logs = "".join(self._capture(_TURN)[1] for _ in range(4))
+        self.assertEqual(self._eot_lines(logs), [])
+        self.assertEqual(len(self.made), 4)
 
     def test_a_check_inside_one_chunk_is_kept(self):
         self._warm()

@@ -16194,9 +16194,10 @@ if TURN_TAIL_PROBE:
 # A Smart Turn check runs on the capture thread (about 25 ms on this CPU,
 # inside one 64 ms chunk), after its chunk's speculative snapshot. One that
 # takes longer than a chunk would make the loop fall behind the microphone —
-# a late check could then delay the fixed 21-chunk end of the turn — so it
-# turns Smart Turn off for the session (stricter than SmartTurn's own 3 in a
-# row over 150 ms).
+# a late check could then delay the fixed 21-chunk end of the turn — so its p
+# is dropped (no early end that turn), and _EOT_SLOW_LIMIT (2) such checks in
+# a row turn Smart Turn off for the session (stricter than SmartTurn's own 3
+# in a row over 150 ms).
 # No capture ever loads a model: the boot warmer loads and warms both, and a
 # capture uses them only after that succeeded. A model that fails or is too
 # slow (at the warm or in a turn), or any fault in these hooks, turns Smart
@@ -16210,8 +16211,13 @@ _eot_turn = _endpointing.SmartTurn(SMART_TURN_MODEL)
 _eot_state = {"ready": False, "off": "", "logged": False}
 # Smart Turn hears the capture's last 8 s: this many 1,024-sample chunks.
 _EOT_TAIL_CHUNKS = _endpointing.ST_SAMPLES // 1024 + 1
-# One check (the gain + Smart Turn) must fit inside one capture chunk.
+# One check (the gain + Smart Turn) must fit inside one capture chunk. A slow
+# check only costs its own turn (no p, no early end); _EOT_SLOW_LIMIT slow
+# checks IN A ROW turn Smart Turn off for the session (2026-10-02: one spike
+# while the PC runs a test suite must not throw away a day's shadow data).
 _EOT_CHECK_BUDGET_S = _endpointing.CHUNK_S             # 64 ms
+_EOT_SLOW_LIMIT = 2
+_eot_slow_checks = [0]                                 # slow checks in a row
 _eot_clock = time.perf_counter                         # times each check
 # The last owner capture's [eot-shadow] line, held until the main loop
 # accepts its turn (_eot_shadow_flush). Main-loop thread only.
@@ -16342,9 +16348,10 @@ class _EotCapture:
     def predict(self):
         """One Smart Turn check: p for the clip so far x ONE auto-gain, from
         the peak so far — the clip Whisper would get had the turn ended here.
-        None (no early end this turn) on a fault, or on a check that took
-        longer than one capture chunk; either turns Smart Turn off for the
-        session. Never raises."""
+        None (no early end this turn) on a fault, which turns Smart Turn off
+        for the session, or on a check that took longer than one capture
+        chunk, which does so only on the _EOT_SLOW_LIMIT-th in a row. Never
+        raises."""
         try:
             t0 = _eot_clock()
             clip, _gain = apply_capture_auto_gain(
@@ -16352,11 +16359,15 @@ class _EotCapture:
             p = self.turn.predict(clip)
             dt = _eot_clock() - t0
             if dt > _EOT_CHECK_BUDGET_S:
-                _eot_latch(f"too slow: a check took {int(round(dt * 1000))} "
-                           f"ms, over one "
-                           f"{int(round(_EOT_CHECK_BUDGET_S * 1000))} ms "
-                           f"capture chunk")
+                _eot_slow_checks[0] += 1
+                if _eot_slow_checks[0] >= _EOT_SLOW_LIMIT:
+                    _eot_latch(f"too slow: {_eot_slow_checks[0]} checks in a "
+                               f"row over one "
+                               f"{int(round(_EOT_CHECK_BUDGET_S * 1000))} ms "
+                               f"capture chunk, the last "
+                               f"{int(round(dt * 1000))} ms")
                 return None
+            _eot_slow_checks[0] = 0
             return p
         except Exception as e:
             _eot_latch(_eot_fault("capture hook failed", e))
