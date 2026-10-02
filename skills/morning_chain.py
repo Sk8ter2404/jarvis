@@ -53,7 +53,8 @@ One morning briefing per day: the chain stands down when any morning
 briefer already spoke today — one of its own three (a manual trigger),
 morning_arrival_v2's presence watcher, or daily_briefing with the owner
 there — and holds while the owner's turn is still being answered (the turn
-that woke the day may itself be "morning briefing").
+that woke the day may itself be "morning briefing") or while JARVIS is
+asleep / in standby (that turn may have been "goodnight").
 
 Failure modes:
   - bobert_companion unavailable → the chain silently disables; the three
@@ -248,6 +249,23 @@ def _owner_turn_in_progress(bc) -> bool:
         return False
 
 
+def _jarvis_asleep(bc) -> bool:
+    """True while JARVIS is in sleep / standby (bobert_companion._sleep_mode,
+    the flag the main loop branches on; standby sets it too). The standby wake
+    and the tray force_wake clear it before they stamp the wake, but the day's
+    first owner TURN can itself be "goodnight" / "standby" / "shut down"
+    (B096): dispatching then runs morning_handoff's predictive setup at a
+    sleeping desk and parks the briefing -- with its stale "It's 6:31 AM" --
+    until the next wake, since standby holds proactive lines. The day stays
+    open, so the next wake inside the window gets the briefing instead.
+    False when unreadable."""
+    try:
+        cell = getattr(bc, "_sleep_mode", None)
+        return bool(cell[0]) if cell is not None else False
+    except Exception:
+        return False
+
+
 # ─── skill dispatch ──────────────────────────────────────────────────────
 
 def _import_skill(short_name: str):
@@ -364,9 +382,11 @@ def _watch_for_first_wake() -> None:
             if (wake_date == today
                     and CHAIN_START_HOUR <= hour < CHAIN_END_HOUR
                     and dispatched_for_date != today
-                    and not _owner_turn_in_progress(bc)):
-                # (A turn still being answered holds the dispatch to the next
-                # tick: see _owner_turn_in_progress.)
+                    and not _owner_turn_in_progress(bc)
+                    and not _jarvis_asleep(bc)):
+                # (A turn still being answered, or a JARVIS put to sleep by
+                # that turn, holds the dispatch to a later tick: see
+                # _owner_turn_in_progress / _jarvis_asleep.)
                 chosen = _choose_skill_for_today(hour)
                 if _morning_already_covered_today():
                     # Manual trigger, a prior chain dispatch (this JARVIS process

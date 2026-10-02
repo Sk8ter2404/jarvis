@@ -404,13 +404,16 @@ class MorningChainOneBriefingTests(unittest.TestCase):
                         if saved is not None else sys.modules.pop("bobert_companion", None))
 
     def _run(self, *, hour=7, chosen="arrival", fired=None, invoke=None,
-             v2=False, daily=False, turn_cell=None, ticks=1, on_sleep=None):
+             v2=False, daily=False, turn_cell=None, sleep_cell=None, ticks=1,
+             on_sleep=None):
         """Run `ticks` watcher ticks; returns (invoked skill names, the invoke
         count seen at each sleep)."""
         bc = types.ModuleType("bobert_companion")
         bc._last_wake_date = [self.TODAY]
         if turn_cell is not None:
             bc._turn_in_progress = turn_cell
+        if sleep_cell is not None:
+            bc._sleep_mode = sleep_cell
         fired = fired if fired is not None else {}
         invoked, seen = [], []
 
@@ -485,6 +488,20 @@ class MorningChainOneBriefingTests(unittest.TestCase):
                 cell[0] = False           # the reply finished; loop top clears it
         invoked, seen = self._run(turn_cell=cell, ticks=2, on_sleep=_on_sleep)
         self.assertEqual(seen, [0, 1])    # nothing while held, then the pick
+        self.assertEqual(invoked, ["arrival"])
+
+    def test_holds_while_the_waking_turn_put_jarvis_to_sleep(self):
+        # The day's first turn was "Jarvis, goodnight" at 06:30 (an
+        # all-nighter): no handoff setup at a sleeping desk, no briefing parked
+        # until the next wake. The day stays open, so his next wake inside the
+        # window gets it.
+        asleep = [True]
+
+        def _on_sleep(n):
+            if n == 2:
+                asleep[0] = False         # "Jarvis" -- awake again
+        invoked, seen = self._run(sleep_cell=asleep, ticks=3, on_sleep=_on_sleep)
+        self.assertEqual(seen, [0, 0, 1])
         self.assertEqual(invoked, ["arrival"])
 
 

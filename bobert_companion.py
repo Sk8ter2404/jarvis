@@ -20693,8 +20693,14 @@ def _note_first_owner_turn_of_day(test_inject: bool = False) -> bool:
     Call it BEFORE the turn is marked (_last_owner_turn_at is still his
     PREVIOUS turn, so the silence snapshot is the overnight gap, not 0 s) and
     before JARVIS replies. A test harness inject (driver.py / say_to_jarvis)
-    is not the owner and never wakes the day. True when it stamped."""
-    if test_inject:
+    is not the owner and never wakes the day. Neither is any turn of the
+    STAGING (green) instance: its turns are the upgrade gate's untagged smoke
+    prompts (staging_instance.DEFAULT_PROMPTS), and it shares this project
+    dir's morning state files -- stamping one during a 06-12 deploy would let
+    green's chain run morning_handoff's predictive setup (Chrome, Teams,
+    master volume) and mark the day briefed, standing prod's own morning
+    briefing down. True when it stamped."""
+    if test_inject or _is_staging():
         return False
     from datetime import datetime as _dt
     local = _dt.now()

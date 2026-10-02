@@ -10,7 +10,8 @@ JARVIS, so his "Jarvis ..." mornings never stamped it: 47 session logs, 47
 
 Pinned here:
   * the day's first accepted owner turn (06:00 on, voice or typed, never a
-    test inject) stamps the wake through the one helper, _note_wake_event,
+    test inject, never a staging instance's smoke prompt) stamps the wake
+    through the one helper, _note_wake_event,
     which also takes the pre-wake silence snapshot -- measured from his
     PREVIOUS turn, so the overnight gap reaches morning_arrival's 6-hour gate;
   * later turns the same day do not re-stamp;
@@ -54,6 +55,9 @@ class _Base(MonolithGlobalsTestCase):
         # JARVIS's own overnight line a minute ago (a reminder): the silence
         # must still be measured from the owner's last turn, not from this.
         self._p(bc, "last_speech_time", time.time() - 60.0)
+        # The harness imports the monolith as the STAGING instance
+        # (JARVIS_STAGING=1); the owner talks to prod.
+        self._p(bc, "BLUE_GREEN_ROLE", "prod")
 
     def _p(self, *args, **kwargs):
         patcher = mock.patch.object(*args, **kwargs)
@@ -114,6 +118,19 @@ class FirstOwnerTurnWakeTests(_Base):
         with _fake_now(7):
             self.assertFalse(bc._note_first_owner_turn_of_day(test_inject=True))
         self.assertIsNone(bc._last_wake_date[0])
+
+    def test_a_staging_instance_turn_never_wakes_the_day(self):
+        # The green candidate's turns are the upgrade gate's untagged smoke
+        # prompts ("are you the new one" at 07:00), and it shares the morning
+        # state files: stamping one would let green's chain run the handoff's
+        # predictive setup and mark the day briefed for prod.
+        bc = self.bc
+        self._owner_last_spoke(8 * 3600.0)
+        self._p(bc, "BLUE_GREEN_ROLE", "staging")
+        with _fake_now(7):
+            self.assertFalse(bc._note_first_owner_turn_of_day())
+        self.assertIsNone(bc._last_wake_date[0])
+        self.assertEqual(bc._pre_wake_silence_seconds[0], 0.0)
 
 
 class WakeEventBookkeepingTests(_Base):
@@ -192,6 +209,7 @@ class ChainEndToEndTests(_Base):
         with _fake_now(7):
             bc._note_first_owner_turn_of_day()
         bc._turn_in_progress[0] = False        # that turn has been answered
+        bc._sleep_mode[0] = False              # ...and JARVIS is awake
 
         chain, _ = load_skill_isolated("morning_chain")
         invoked = []
