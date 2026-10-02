@@ -319,5 +319,298 @@ class PersistentPhonemizerTests(unittest.TestCase):
         self.assertFalse(k._PHON_OFF[0], "a busy lock is not a failure")
 
 
+# ── espeak-ng dll copies in %TEMP% (2026-10-02) ──────────────────────────────
+# phonemizer (phonemizer-fork 3.3.1) copies the dll into a fresh mkdtemp() dir
+# for EVERY EspeakWrapper(), and on Windows deletes it only at exit (atexit),
+# which JARVIS's TerminateProcess exit skips. The fakes below mirror the real
+# construction chain - BaseBackend.__init__ runs the is_available / version /
+# supported_languages probes (each a throwaway wrapper), then
+# BaseEspeakBackend.__init__ builds the wrapper it keeps - and count copies in
+# an injected temp dir. RealEspeakCopyTests checks the same against the real
+# library where it is installed (not on the CI runner).
+_DLL = "espeak-ng.dll"
+
+
+def _dll_copies(root):
+    import glob
+    import os
+    return len(glob.glob(os.path.join(root, "tmp*", _DLL)))
+
+
+class _ChainWrapper:
+    """phonemizer.backend.espeak.wrapper.EspeakWrapper: one dll copy each."""
+
+    def __init__(self):
+        import os
+        import tempfile
+        d = tempfile.mkdtemp()             # the injected temp dir (tempfile.tempdir)
+        with open(os.path.join(d, _DLL), "wb") as f:
+            f.write(b"MZ")
+        self.voice = None
+        self.library_path = os.path.join(d, _DLL)
+
+    @property
+    def version(self):
+        return (1, 52, 0)
+
+    def available_voices(self):
+        return [types.SimpleNamespace(language="en-gb", name="English (GB)"),
+                types.SimpleNamespace(language="en-us", name="English (US)")]
+
+    def set_voice(self, language):
+        if language not in {v.language for v in self.available_voices()}:
+            raise RuntimeError(f'invalid voice code "{language}"')
+        self.voice = language
+
+    def text_to_phonemes(self, line):
+        return f"{self.voice}:{line.lower()}"
+
+
+class _ChainBase:
+    """phonemizer.backend.base.BaseBackend.__init__: the three probes."""
+
+    def __init__(self, language, punctuation_marks=None,
+                 preserve_punctuation=False, logger=None):
+        self.logger = logger or mock.Mock()
+        if not self.is_available():
+            raise RuntimeError("espeak not installed on your system")
+        self.logger.info("initializing backend espeak-%s",
+                         ".".join(str(v) for v in self.version()))
+        if language not in self.supported_languages():
+            raise RuntimeError(f'language "{language}" is not supported')
+        self._language = language
+        self._preserve_punctuation = preserve_punctuation
+
+
+class _ChainEspeakBase(_ChainBase):
+    """phonemizer.backend.espeak.base.BaseEspeakBackend."""
+
+    def __init__(self, language, punctuation_marks=None,
+                 preserve_punctuation=False, logger=None):
+        super().__init__(language, punctuation_marks=punctuation_marks,
+                         preserve_punctuation=preserve_punctuation,
+                         logger=logger)
+        self._espeak = _ChainWrapper()
+
+    @classmethod
+    def is_available(cls):
+        _ChainWrapper()
+        return True
+
+    @classmethod
+    def version(cls):
+        return _ChainWrapper().version
+
+
+class _ChainEspeakBackend(_ChainEspeakBase):
+    """phonemizer.backend.espeak.espeak.EspeakBackend."""
+
+    def __init__(self, language, punctuation_marks=None,
+                 preserve_punctuation=False, with_stress=False, tie=False,
+                 language_switch="keep-flags", words_mismatch="ignore",
+                 logger=None):
+        super().__init__(language, punctuation_marks=punctuation_marks,
+                         preserve_punctuation=preserve_punctuation,
+                         logger=logger)
+        self._espeak.set_voice(language)
+        self._with_stress = with_stress
+
+    @classmethod
+    def supported_languages(cls):
+        return {v.language: v.name for v in _ChainWrapper().available_voices()}
+
+    def phonemize(self, lines, separator=None, strip=False, njobs=1):
+        return [self._espeak.text_to_phonemes(ln) + " ʊ" for ln in lines]
+
+
+def _chain_phonemize(text, language, **kw):
+    """phonemizer.phonemize(): a fresh backend per call (kokoro_onnx's
+    Tokenizer.phonemize, the stock create() path)."""
+    return _ChainEspeakBackend(language, **kw).phonemize([text])[0]
+
+
+class _ChainEngine(_FakeEngine):
+    """kokoro_onnx.Kokoro whose stock create() phonemizes through the fake
+    phonemizer.phonemize(), as kokoro_onnx 0.4.7 does."""
+
+    def create(self, text, *args, **kwargs):
+        if not kwargs.get("is_phonemes"):
+            _chain_phonemize(text, kwargs.get("lang"),
+                             preserve_punctuation=True, with_stress=True)
+        return super().create(text, *args, **kwargs)
+
+
+def _chain_modules(test, eng):
+    """sys.modules fakes for the chain above, so the REAL _engine() /
+    _one_copy_backend() import them; Kokoro() builds `eng`."""
+    def _pkg(name, **attrs):
+        m = types.ModuleType(name)
+        m.__path__ = []
+        m.__dict__.update(attrs)
+        return m
+    mods = {
+        "kokoro_onnx": types.SimpleNamespace(Kokoro=lambda *_a, **_kw: eng),
+        "phonemizer": _pkg("phonemizer", phonemize=_chain_phonemize),
+        "phonemizer.backend": _pkg("phonemizer.backend",
+                                   EspeakBackend=_ChainEspeakBackend),
+        "phonemizer.backend.base": types.SimpleNamespace(BaseBackend=_ChainBase),
+        "phonemizer.backend.espeak": _pkg("phonemizer.backend.espeak"),
+        "phonemizer.backend.espeak.base": types.SimpleNamespace(
+            BaseEspeakBackend=_ChainEspeakBase),
+        "phonemizer.backend.espeak.wrapper": types.SimpleNamespace(
+            EspeakWrapper=_ChainWrapper),
+        "phonemizer.separator": types.SimpleNamespace(
+            default_separator=_SEPARATOR),
+        "espeakng_loader": None,       # the dll wiring is skipped (warning)
+    }
+    p = mock.patch.dict(sys.modules, mods)
+    p.start()
+    test.addCleanup(p.stop)
+
+
+class EspeakDllCopyTests(unittest.TestCase):
+    """At most ONE dll copy per process on the persistent path, none per line."""
+
+    def setUp(self):
+        import tempfile
+        _reset()
+        # numpy imported for the first time INSIDE a patch.dict(sys.modules)
+        # is dropped again when it ends, and numpy cannot be re-imported.
+        importlib.import_module("numpy")
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.temp = self._td.name
+        p = mock.patch.object(tempfile, "tempdir", self.temp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def tearDown(self):
+        _reset()
+
+    def _stack(self, persistent):
+        eng = _ChainEngine()
+        _chain_modules(self, eng)
+        for p in (mock.patch.object(k, "_models_present", return_value=True),
+                  mock.patch.object(k, "_tuned_session", return_value=None),
+                  mock.patch.object(config, "KOKORO_PERSISTENT_PHONEMIZER",
+                                    persistent)):
+            p.start()
+            self.addCleanup(p.stop)
+        return eng
+
+    def _speak(self, n):
+        out = []
+        for i in range(n):
+            k._render(f"Line {i}, sir.", 1.0, out)
+        self.assertEqual(len(out), n, "every line still voiced")
+
+    def test_stock_call_leaves_four_copies_per_line(self):
+        # today's flag-off path, unchanged - and proof the counter sees copies
+        self._stack(persistent=False)
+        self.assertIsNotNone(k._engine())
+        self.assertEqual(_dll_copies(self.temp), 0)
+        self._speak(3)
+        self.assertEqual(_dll_copies(self.temp), 12)
+
+    def test_persistent_backend_is_one_copy_for_the_process(self):
+        eng = self._stack(persistent=True)
+        self.assertIs(k._engine(), eng)
+        self.assertEqual(_dll_copies(self.temp), 1,
+                         "the backend's probes must not each copy the dll")
+        self._speak(25)
+        self.assertEqual(_dll_copies(self.temp), 1, "no copy per line")
+        self.assertIs(k._engine(), eng)
+        self.assertEqual(_dll_copies(self.temp), 1)
+        self.assertFalse(k._PHON_OFF[0])
+        self.assertTrue(all(kw.get("is_phonemes") for _a, kw in eng.raw))
+
+    def test_one_copy_backend_is_the_stock_backend_on_one_wrapper(self):
+        self._stack(persistent=True)
+        b = k._one_copy_backend(k._LANG, preserve_punctuation=True,
+                                with_stress=True)
+        self.assertEqual(_dll_copies(self.temp), 1)
+        self.assertIsInstance(b, _ChainEspeakBackend)
+        self.assertIsInstance(b._espeak, _ChainWrapper)
+        self.assertEqual(b._espeak.voice, k._LANG, "EspeakBackend set-up ran")
+        self.assertTrue(b._with_stress)
+        self.assertTrue(b._preserve_punctuation)
+        self.assertEqual(b.version(), (1, 52, 0))
+        stock = _ChainEspeakBackend(k._LANG, preserve_punctuation=True,
+                                    with_stress=True)
+        self.assertEqual(_dll_copies(self.temp), 5, "stock constructor: four")
+        lines = ["Hello sir.", "All systems online!"]
+        self.assertEqual(b.phonemize(lines), stock.phonemize(lines))
+        with self.assertRaises(RuntimeError):     # language still validated
+            k._one_copy_backend("xx-zz")
+
+    def test_falls_back_to_phonemizers_own_constructor(self):
+        self._stack(persistent=True)
+        with mock.patch.object(k, "_one_copy_backend",
+                               side_effect=AttributeError("internals moved")):
+            b = k._build_phonemizer()
+        self.assertIsInstance(b, _ChainEspeakBackend)
+        self.assertEqual(_dll_copies(self.temp), 4)
+        self.assertFalse(k._PHON_OFF[0], "still the persistent path")
+
+
+class RealEspeakCopyTests(unittest.TestCase):
+    """The real phonemizer + bundled espeak-ng, in a child process whose
+    TEMP/TMP is a fresh directory: the one-copy backend copies the dll once,
+    phonemizing never copies it, and its phonemes match phonemizer's own
+    backend. Skipped where phonemizer is not installed (the CI runner)."""
+
+    _CHILD = r"""
+import glob, json, os, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import espeakng_loader
+from phonemizer.backend import EspeakBackend
+from phonemizer.backend.espeak.wrapper import EspeakWrapper
+from phonemizer.separator import default_separator
+EspeakWrapper.set_library(espeakng_loader.get_library_path())
+EspeakWrapper.set_data_path(espeakng_loader.get_data_path())
+from core import kokoro_tts as k
+n = lambda: len(glob.glob(os.path.join(tempfile.gettempdir(), "tmp*", "*espeak*")))
+lines = ["All systems are online, sir.", "It is 3.5 degrees; e.g. at 2:30 p.m.",
+         "Hello... world? Yes!"]
+r = {"start": n()}
+b = k._one_copy_backend(k._LANG, preserve_punctuation=True, with_stress=True)
+r["built"] = n()
+one = [b.phonemize([ln], separator=default_separator, strip=False, njobs=1)
+       for ln in lines * 3]
+r["lines"] = n()
+s = EspeakBackend(k._LANG, preserve_punctuation=True, with_stress=True)
+r["stock"] = n()
+r["parity"] = one == [s.phonemize([ln], separator=default_separator,
+                                  strip=False, njobs=1) for ln in lines * 3]
+print("RESULT " + json.dumps(r))
+"""
+
+    def test_real_library_one_copy(self):
+        import importlib.util
+        import json
+        import os
+        import subprocess
+        import tempfile
+        for mod in ("phonemizer", "espeakng_loader"):
+            if importlib.util.find_spec(mod) is None:
+                self.skipTest(f"{mod} not installed")
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with tempfile.TemporaryDirectory() as td:
+            env = dict(os.environ, TEMP=td, TMP=td, TMPDIR=td,
+                       PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
+            p = subprocess.run([sys.executable, "-c", self._CHILD, repo],
+                               env=env, capture_output=True, text=True,
+                               encoding="utf-8", timeout=120)
+        got = [ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")]
+        self.assertTrue(got, f"child failed: {p.stderr[-2000:]}")
+        r = json.loads(got[-1][len("RESULT "):])
+        self.assertEqual(r["start"], 0)
+        self.assertEqual(r["built"], 1, "one dll copy for the backend")
+        self.assertEqual(r["lines"], 1, "phonemizing never copies the dll")
+        self.assertGreater(r["stock"], r["lines"],
+                           "the counter must see phonemizer's own copies")
+        self.assertTrue(r["parity"], "same phonemes as phonemizer's backend")
+
+
 if __name__ == "__main__":
     unittest.main()

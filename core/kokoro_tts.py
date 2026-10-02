@@ -30,8 +30,10 @@ by find_spec, so tools/run_tests_ci_sim.py never imports onnxruntime/kokoro.
 SPEED PLAN R4 (2026-10-02), both OFF by default (core/config.py):
   * KOKORO_PERSISTENT_PHONEMIZER — kokoro_onnx's stock create() calls
     phonemizer.phonemize(), which builds a NEW espeak backend on every line
-    (~115 ms) and leaves a copy of espeak-ng.dll in %TEMP% each time
-    (thousands observed). With the flag on, `_engine()` builds ONE backend and
+    (~115 ms) and leaves four copies of espeak-ng.dll in %TEMP% each time
+    (thousands observed). With the flag on, `_engine()` builds ONE backend,
+    on one dll copy for the whole process (`_one_copy_backend`, 2026-10-02;
+    phonemizer's own constructor makes four), and
     `_render` phonemizes on it under `_PHON_LOCK` (espeak-ng is global state),
     exactly as kokoro_onnx's Tokenizer.phonemize would, then calls
     create(..., is_phonemes=True). Every create() then runs under
@@ -182,10 +184,76 @@ def _persistent_wanted() -> bool:
         return False
 
 
+def _one_copy_backend(lang: str, **kw):
+    """phonemizer's EspeakBackend(lang, **kw), built on ONE copy of the
+    espeak-ng dll instead of four (2026-10-02).
+
+    Every EspeakWrapper() makes phonemizer's EspeakAPI copy the dll into a
+    fresh tempfile.mkdtemp() dir and load that copy (espeak-ng is global
+    state, so each wrapper needs its own). On Windows the copy is deleted
+    only by an atexit hook, and JARVIS leaves through TerminateProcess /
+    os._exit, which skip atexit, so every copy stays in %TEMP% for good; the
+    hook also keeps every loaded copy alive until then (measured: +3.3 MB of
+    private memory per stock phonemizer.phonemize() call).
+    A stock EspeakBackend() builds FOUR wrappers: BaseBackend.__init__'s
+    is_available(), version() and supported_languages() probes each build a
+    throwaway one, then BaseEspeakBackend.__init__ builds the one it keeps.
+    So KOKORO_PERSISTENT_PHONEMIZER on still left 4 copies per process, and
+    off leaves 4 per LINE (phonemizer.phonemize() builds a backend per call).
+
+    Here one wrapper is built first and answers the three probes, and the
+    backend keeps that same wrapper: _KeepWrapper sits between EspeakBackend
+    and BaseEspeakBackend in the MRO, so EspeakBackend.__init__'s
+    super().__init__() runs BaseBackend's set-up and keeps `wrapper` instead
+    of building another. The rest of EspeakBackend.__init__ (voice, stress,
+    tie, language switch, words mismatch) runs as shipped, so the phonemes
+    are the stock backend's. Raises on any problem."""
+    from phonemizer.backend import EspeakBackend
+    from phonemizer.backend.base import BaseBackend
+    from phonemizer.backend.espeak.base import BaseEspeakBackend
+    from phonemizer.backend.espeak.wrapper import EspeakWrapper
+
+    wrapper = EspeakWrapper()           # the one dll copy
+
+    class _KeepWrapper(BaseEspeakBackend):
+        def __init__(self, language, punctuation_marks=None,
+                     preserve_punctuation=False, logger=None):
+            BaseBackend.__init__(self, language,
+                                 punctuation_marks=punctuation_marks,
+                                 preserve_punctuation=preserve_punctuation,
+                                 logger=logger)
+            self._espeak = wrapper
+            self.logger.debug("loaded %s", wrapper.library_path)
+
+    class _OneCopyEspeakBackend(EspeakBackend, _KeepWrapper):
+        @classmethod
+        def is_available(cls):
+            return True                 # `wrapper` loaded, or we never got here
+
+        @classmethod
+        def version(cls):
+            return wrapper.version
+
+        @classmethod
+        def supported_languages(cls):
+            # EspeakBackend.supported_languages, on `wrapper`
+            return {v.language: v.name for v in wrapper.available_voices()}
+
+    return _OneCopyEspeakBackend(lang, **kw)
+
+
 def _build_phonemizer():
     """ONE espeak backend with the options kokoro_onnx's stock
-    phonemizer.phonemize() call uses. None — and the stock call for the rest
-    of the session — on any failure. Lazy import (CI-safety). Never raises."""
+    phonemizer.phonemize() call uses, on one dll copy (_one_copy_backend);
+    phonemizer's own constructor (four copies) if that cannot be built.
+    None — and the stock call for the rest of the session — on any failure.
+    Lazy import (CI-safety). Never raises."""
+    try:
+        return _one_copy_backend(_LANG, preserve_punctuation=True,
+                                 with_stress=True)
+    except Exception as e:
+        print(f"  [kokoro] one-copy espeak backend unavailable "
+              f"({type(e).__name__}: {e}); using phonemizer's own constructor")
     try:
         from phonemizer.backend import EspeakBackend
         return EspeakBackend(_LANG, preserve_punctuation=True, with_stress=True)

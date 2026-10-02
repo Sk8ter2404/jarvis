@@ -469,8 +469,9 @@ SENTENCE_TTS_ENABLED = True
 # ─── Kokoro engine speed (speed plan R4, core/kokoro_tts.py) ───────────
 # KOKORO_PERSISTENT_PHONEMIZER: phonemize every line on ONE espeak backend
 # built with the engine, instead of kokoro_onnx's stock call, which builds a
-# fresh backend per line (~115 ms) and leaves a copy of the espeak-ng dll in
-# %TEMP% each time. Phonemizing and rendering are each one-at-a-time; a
+# fresh backend per line (~115 ms) and leaves four copies of the espeak-ng dll
+# in %TEMP% each time (measured 2026-10-02). With it on, the whole process
+# leaves one copy. Phonemizing and rendering are each one-at-a-time; a
 # render that cannot start within the Kokoro synth timeout falls back to the
 # edge voice. Any error switches back to the stock call for the session.
 # KOKORO_RENDER_CACHE: keep finished renders in memory, keyed by a hash of
