@@ -318,6 +318,26 @@ class HtmlSanityTests(_SiteBuilderCase):
         self.assertIn('name="viewport"', html)
         self.assertTrue(html.rstrip().endswith("</html>"))
 
+    def test_no_active_content_survives(self):
+        # The page is written partly from fetched web text, so a prompt
+        # injection could ask for script. The prompt already says "No
+        # JavaScript"; the extractor enforces it: inline scripts, event-handler
+        # attributes, javascript: links and embedded frames are all removed.
+        raw = ("<html><head><title>x</title><script>steal()</script></head>"
+               "<body onload=\"steal()\"><p onclick='x()'>hi</p>"
+               "<a href=\"javascript:steal()\">menu</a>"
+               "<a href=\"https://maps.example.com/?q=shop\">map</a>"
+               "<iframe src=\"https://evil.example.com\"></iframe>"
+               "<object data=\"x.swf\"></object><embed src=\"x.swf\">"
+               "<SCRIPT type=module>later()</SCRIPT></body></html>")
+        html = self.mod._extract_html(raw)
+        low = html.lower()
+        for bad in ("<script", "onload", "onclick", "javascript:", "<iframe",
+                    "<object", "<embed", "steal", "later()"):
+            self.assertNotIn(bad, low)
+        self.assertIn("https://maps.example.com/?q=shop", html)
+        self.assertIn("<p>hi</p>", html)
+
     def test_non_html_replies_are_rejected(self):
         for raw in (None, "", "Sorry, I can't help with that.",
                     "<html><head></head></html>", "</html> <html><body>"):

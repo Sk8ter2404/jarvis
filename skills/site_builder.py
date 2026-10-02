@@ -231,15 +231,33 @@ def _generate_local(system: str, user: str) -> Optional[str]:
 _FENCE_RE = re.compile(r"```[a-zA-Z]*\s*\n(.*?)```", re.DOTALL)
 _EXTERNAL_SCRIPT_RE = re.compile(
     r"<script\b[^>]*\bsrc\s*=[^>]*>.*?</script\s*>", re.IGNORECASE | re.DOTALL)
+# No active content at all: the page is written partly from fetched web text,
+# so an injected "add this script" must never survive. The prompt already asks
+# for no JavaScript; these enforce it.
+_ACTIVE_BLOCK_RE = re.compile(
+    r"<(script|iframe|object)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+_ACTIVE_TAG_RE = re.compile(r"</?(script|iframe|object|embed)\b[^>]*>", re.IGNORECASE)
+_EVENT_ATTR_RE = re.compile(
+    r"""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.IGNORECASE)
+_JS_URL_RE = re.compile(r"""(\b(?:href|src|action)\s*=\s*["']?)\s*javascript:[^"'\s>]*""",
+                        re.IGNORECASE)
+
+
+def _strip_active_content(html: str) -> str:
+    html = _ACTIVE_BLOCK_RE.sub("", html)
+    html = _ACTIVE_TAG_RE.sub("", html)
+    html = _EVENT_ATTR_RE.sub("", html)
+    return _JS_URL_RE.sub(r"\1#", html)
 _VIEWPORT_META = ('<meta name="viewport" '
                   'content="width=device-width, initial-scale=1">')
 
 
 def _extract_html(text: Optional[str]) -> Optional[str]:
     """The HTML document inside a model reply, or None when there is none.
-    Drops Markdown fences and chatter around the document, strips external
-    <script src> tags (the page must stand alone) and adds a viewport meta
-    when the model forgot one."""
+    Drops Markdown fences and chatter around the document, strips all
+    active content (scripts, frames, event handlers, javascript: links - the
+    page must stand alone and stay static) and adds a viewport meta when the
+    model forgot one."""
     if not text:
         return None
     m = _FENCE_RE.search(text)
@@ -256,7 +274,7 @@ def _extract_html(text: Optional[str]) -> Optional[str]:
     low = html.lower()
     if "<body" not in low or "</body>" not in low:
         return None
-    html = _EXTERNAL_SCRIPT_RE.sub("", html)
+    html = _strip_active_content(_EXTERNAL_SCRIPT_RE.sub("", html))
     if 'name="viewport"' not in html.lower():
         html = re.sub(r"(<head\b[^>]*>)", r"\1\n" + _VIEWPORT_META, html,
                       count=1, flags=re.IGNORECASE)
