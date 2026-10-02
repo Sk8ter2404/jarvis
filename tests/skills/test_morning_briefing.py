@@ -712,6 +712,47 @@ class BuildAndFireTests(unittest.TestCase):
             self.mod._fire_from_chain("chain")
         fire.assert_not_called()
 
+    def test_chain_fire_is_opt_in_background_work_waiting_first(self):
+        # Speed plan R5 (2026-10-02 review): the chain's briefing summarises
+        # headlines on the local model from the morning-chain thread, so it is
+        # background work, opt-in (BACKGROUND_TAG_STRICT); the wait for a quiet
+        # moment comes BEFORE _fire_briefing and its same-day re-check.
+        from core import local_traffic as lt
+        events = []
+
+        def _wait():
+            job = lt.current_job()
+            events.append(("wait", job.tag if job else None,
+                           job.opt_in if job else None))
+            return "shadow"
+
+        def _fire(reason, force=False):
+            job = lt.current_job()
+            events.append(("fire", job.tag if job else None, force))
+        with mock.patch.object(self.mod, "_briefing_already_fired_today",
+                               return_value=False), \
+             mock.patch.object(self.mod.time, "sleep"), \
+             mock.patch.object(self.mod, "_wait_for_quiet", side_effect=_wait), \
+             mock.patch.object(self.mod, "_fire_briefing", side_effect=_fire):
+            self.mod._fire_from_chain("chain")
+        self.assertEqual(events, [("wait", "morning-briefing", True),
+                                  ("fire", "morning-briefing", False)])
+        self.assertIsNone(lt.current_job(), "the tag leaked past the fire")
+
+    def test_manual_briefing_is_not_background_work(self):
+        from core import local_traffic as lt
+        mod, actions = load_skill_isolated("morning_briefing")
+        seen = []
+
+        def _build():
+            seen.append(lt.current_job())
+            return "Good morning, sir."
+        with mock.patch.object(mod, "_build_briefing", side_effect=_build), \
+             mock.patch.object(mod, "_show_card_safe"), \
+             mock.patch.object(mod, "_mark_briefing_fired_today"):
+            actions["morning_briefing"]("")
+        self.assertEqual(seen, [None])
+
     def test_mark_briefing_fired_writes_today(self):
         tmp = tempfile.mkdtemp(prefix="mbrief_flag_")
         self.addCleanup(lambda: _rmtree(tmp))

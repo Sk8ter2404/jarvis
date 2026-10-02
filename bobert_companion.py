@@ -23240,8 +23240,8 @@ def _background_defer_reason() -> str | None:
 def _background_tag_strict() -> bool:
     """BACKGROUND_TAG_STRICT (speed plan R5, 2026-10-02): do the background
     callers tagged later (background_work(opt_in=True): the notification
-    classifier, Chappie, the credits monitor, the scheduled evening briefing)
-    wait like the first-tagged ones? Off, they run at once and the gate logs
+    classifier, Chappie, the credits monitor, the scheduled evening briefing,
+    the morning chain's briefing / handoff) wait like the first-tagged ones? Off, they run at once and the gate logs
     "[bg-local] shadow <job> would defer". Read at call time. Never raises
     (False on doubt: a broken switch must not hold a job back)."""
     try:

@@ -37,7 +37,8 @@ The first tags (learn_from_turn, the ambient extractor / judge / screen
 observer, the Teams nudger, the session checkpoint, the LTM reflector) wait
 for real. The background callers found untagged afterwards (the notification
 classifier, Chappie's daemon, the credits monitor, the scheduled evening
-briefing) are tagged ``background_work(tag, opt_in=True)``: such a job waits
+briefing, the morning chain's briefing / handoff) are tagged
+``background_work(tag, opt_in=True)``: such a job waits
 only while the gate's ``strict`` switch is on (the monolith wires it to
 BACKGROUND_TAG_STRICT). With the switch off it runs at once, exactly as it did
 untagged, and logs ONCE per job that it would have waited (shadow), so the

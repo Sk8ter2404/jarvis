@@ -717,17 +717,51 @@ def _fire_handoff(reason: str, *, force: bool = False) -> str:
 
 # ─── chain entry point ───────────────────────────────────────────────────
 
+def _background_work(tag: str):
+    """core.local_traffic.background_work(tag, opt_in=True) -- a speed plan
+    R5 tag, which waits only while BACKGROUND_TAG_STRICT is on -- or a no-op
+    context when core can't be imported. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return _lt.background_work(tag, opt_in=True)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
+def _wait_for_quiet() -> str:
+    """core.local_traffic.wait_for_quiet() for this thread's tagged job: with
+    BACKGROUND_TAG_STRICT on, wait (bounded) until the owner is quiet. The
+    gate outcome, or 'none'. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return _lt.wait_for_quiet()
+    except Exception:
+        return "none"
+
+
 def _fire_from_chain(reason: str = "morning_chain") -> str:
     """Auto-trigger entry called by skills/morning_chain.py once it has
     decided handoff is today's pick. Preserves the original watcher's
     TOCTOU-safe pattern verbatim: pre-check → delay → re-check → fire.
-    Manual triggers ("morning handoff") still bypass via force=True."""
+    Manual triggers ("morning handoff") still bypass via force=True.
+
+    Speed plan R5 (2026-10-02 review): this runs on the morning-chain thread
+    and its sections run one after another with no deadline, so the Teams
+    screenshot read and the headline summaries are background work for the
+    one-slot local model. Opt-in: with BACKGROUND_TAG_STRICT on it first
+    waits (bounded) for a quiet moment -- BEFORE the opener's clock time and
+    the screenshot are taken, and before _fire_handoff's own same-day
+    re-check, so a handoff the owner asked for meanwhile is not repeated.
+    Off: today's timing, plus one shadow line."""
     if _handoff_already_fired_today():
         return ""
     time.sleep(HANDOFF_DELAY_SECONDS)
     if _handoff_already_fired_today():
         return ""
-    return _fire_handoff(reason)
+    with _background_work("morning-handoff"):
+        _wait_for_quiet()
+        return _fire_handoff(reason)
 
 
 # ─── registration ────────────────────────────────────────────────────────

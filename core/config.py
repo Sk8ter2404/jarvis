@@ -295,8 +295,8 @@ LOCAL_REPRIME_AT_BOOT_S = 20.0
 #   this many seconds, so your next turn starts warm. Float; 0.0 turns it off.
 # BACKGROUND_TAG_STRICT (speed plan R5, 2026-10-02) — the background callers
 #   found later (the notification classifier's local fallback, Chappie's
-#   daemon, the credits monitor, the scheduled evening briefing) wait the same
-#   way only when this is True. False (the default) keeps today's timing: they
+#   daemon, the credits monitor, the scheduled evening briefing, the morning
+#   chain's briefing / handoff) wait the same way only when this is True. False (the default) keeps today's timing: they
 #   run at once and the log says "[bg-local] shadow <job> would defer" when
 #   they would have waited. The first-tagged jobs (memory extraction, the
 #   ambient extractor, the Teams check, ...) always wait.

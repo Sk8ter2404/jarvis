@@ -431,17 +431,50 @@ def _fire_briefing(reason: str, *, force: bool = False) -> None:
     _show_card_safe()
 
 
+def _background_work(tag: str):
+    """core.local_traffic.background_work(tag, opt_in=True) -- a speed plan
+    R5 tag, which waits only while BACKGROUND_TAG_STRICT is on -- or a no-op
+    context when core can't be imported. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return _lt.background_work(tag, opt_in=True)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
+def _wait_for_quiet() -> str:
+    """core.local_traffic.wait_for_quiet() for this thread's tagged job: with
+    BACKGROUND_TAG_STRICT on, wait (bounded) until the owner is quiet. The
+    gate outcome, or 'none'. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return _lt.wait_for_quiet()
+    except Exception:
+        return "none"
+
+
 def _fire_from_chain(reason: str = "morning_chain") -> None:
     """Auto-trigger entry called by skills/morning_chain.py once it has
     decided briefing is today's pick. Preserves the original watcher's
     TOCTOU-safe pattern verbatim: pre-check → delay → re-check → fire.
-    Manual triggers ("morning briefing") still bypass via force=True."""
+    Manual triggers ("morning briefing") still bypass via force=True.
+
+    Speed plan R5 (2026-10-02 review): this runs on the morning-chain thread,
+    so its headline summaries (news_briefing) are background work for the
+    one-slot local model, exactly like the scheduled evening briefing's.
+    Opt-in: with BACKGROUND_TAG_STRICT on it first waits (bounded) for a
+    quiet moment, and _fire_briefing's own same-day re-check then runs AFTER
+    that wait, so a "morning briefing" the owner asked for meanwhile is not
+    followed by a second one. Off: today's timing, plus one shadow line."""
     if _briefing_already_fired_today():
         return
     time.sleep(BRIEFING_DELAY_SECONDS)
     if _briefing_already_fired_today():
         return
-    _fire_briefing(reason)
+    with _background_work("morning-briefing"):
+        _wait_for_quiet()
+        _fire_briefing(reason)
 
 
 def register(actions):

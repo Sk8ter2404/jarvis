@@ -1402,6 +1402,57 @@ class SchedulerTests(unittest.TestCase):
             self.mod._fire_briefing("timed-out")
         self.assertEqual(seen, [("evening-briefing", True), ("enqueue", None)])
 
+    def test_no_wait_means_no_second_same_day_check(self):
+        # 2026-10-02 review: with the switch off (outcome 'shadow') or on but
+        # nothing to wait for ('go'), _fire_briefing never reads the state
+        # file again -- today's path, unchanged.
+        for outcome in ("shadow", "go", "none", "off"):
+            with mock.patch.object(self.mod, "_wait_for_quiet",
+                                   return_value=outcome), \
+                 mock.patch.object(self.mod, "_load_last_fired_date") as load, \
+                 mock.patch.object(self.mod, "_build_briefing",
+                                   return_value="Good evening, sir."), \
+                 mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+                 mock.patch.object(self.mod, "_show_card_safe"), \
+                 mock.patch.object(self.mod, "_save_last_fired_date"):
+                self.assertEqual(self.mod._fire_briefing("timed-out"),
+                                 "Good evening, sir.")
+            load.assert_not_called()
+            enq.assert_called_once_with("Good evening, sir.")
+
+    def test_a_briefing_fired_during_the_wait_is_not_repeated(self):
+        # 2026-10-02 review: the scheduler's same-day re-check runs BEFORE
+        # the quiet wait, and the job waits exactly while the owner is
+        # talking -- when he may ask for the briefing himself. After a real
+        # wait the date is checked again and the scheduled one stands down.
+        today = datetime.date.today().isoformat()
+        for outcome in ("released", "forced", "cancelled"):
+            with mock.patch.object(self.mod, "_wait_for_quiet",
+                                   return_value=outcome), \
+                 mock.patch.object(self.mod, "_load_last_fired_date",
+                                   return_value=today), \
+                 mock.patch.object(self.mod, "_build_briefing") as build, \
+                 mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+                 mock.patch.object(self.mod, "_show_card_safe"), \
+                 mock.patch.object(self.mod, "_save_last_fired_date") as save:
+                self.assertEqual(self.mod._fire_briefing("timed-out"), "")
+            build.assert_not_called()
+            enq.assert_not_called()
+            save.assert_not_called()
+        # ...and after a wait with nothing fired meanwhile, it speaks.
+        with mock.patch.object(self.mod, "_wait_for_quiet",
+                               return_value="released"), \
+             mock.patch.object(self.mod, "_load_last_fired_date",
+                               return_value="2000-01-01"), \
+             mock.patch.object(self.mod, "_build_briefing",
+                               return_value="Good evening, sir."), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+             mock.patch.object(self.mod, "_show_card_safe"), \
+             mock.patch.object(self.mod, "_save_last_fired_date"):
+            self.assertEqual(self.mod._fire_briefing("timed-out"),
+                             "Good evening, sir.")
+        enq.assert_called_once_with("Good evening, sir.")
+
     # ── _scheduler_loop single-iteration gating ──────────────────────────
     def _run_one_iteration(self, **patches):
         """Drive _scheduler_loop through exactly one full pass of the body.

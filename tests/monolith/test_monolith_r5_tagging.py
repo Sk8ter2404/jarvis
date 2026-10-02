@@ -11,7 +11,11 @@ fallback (listener thread), Chappie's daemon passes, the hourly credits check
 (a vision read) and the scheduled evening briefing's headline summaries (live
 2026-10-01 22:12: three of them reached the model while the owner's mic was
 recording) -- plus a bounded path (_ollama_chat_bounded) that sent no runner
-options at all.
+options at all. The review added the morning chain's two picks that run the
+same headline summaries (and a Teams screenshot read) from the chain thread
+with no section deadline: morning_briefing and morning_handoff. The scheduled
+briefings wait for a quiet moment BEFORE their same-day re-check, so one the
+owner asks for during the wait is not spoken twice.
 
 WHAT THESE TESTS PIN
 ====================
@@ -209,12 +213,79 @@ class NewlyTaggedCallersDeferTests(_Base):
         self._p(mod, "_enqueue_speech", side_effect=spoken.append)
         self._p(mod, "_show_card_safe")
         self._p(mod, "_save_last_fired_date")
+        self._p(mod, "_load_last_fired_date", return_value="")
         out, log = self._held_during(
             bc._turn_in_progress, lambda: mod._fire_briefing("timed-out"),
             done=lambda: bool(spoken))
         self.assertEqual(out, "urgent")
         self.assertEqual(spoken, ["urgent"])
         self.assertIn("[bg-local] defer evening-briefing (turn)", log)
+
+    def test_evening_briefing_asked_for_during_the_wait_is_not_repeated(self):
+        # 2026-10-02 review: it waits exactly while the owner is talking --
+        # when he may ask for the briefing himself. The manual one marks the
+        # day; the scheduled one must then stand down, not speak it twice.
+        import datetime
+        mod = self._skill("evening_briefing")
+        bc = self.bc
+        fired = [""]
+        built = []
+        self._p(mod, "_build_briefing", side_effect=lambda: built.append(1)
+                or "Good evening, sir.")
+        self._p(mod, "_enqueue_speech")
+        self._p(mod, "_show_card_safe")
+        self._p(mod, "_save_last_fired_date")
+        self._p(mod, "_load_last_fired_date", side_effect=lambda: fired[0])
+
+        def _owner_asks_meanwhile():
+            fired[0] = datetime.date.today().isoformat()
+            return False
+        out, log = self._held_during(
+            bc._turn_in_progress, lambda: mod._fire_briefing("timed-out"),
+            done=_owner_asks_meanwhile)
+        self.assertEqual(out, "")
+        self.assertEqual(built, [], "the scheduled briefing was built anyway")
+        self.assertIn("suppressing (timed-out)", log)
+
+    def test_morning_chain_briefing_waits_before_it_fires(self):
+        mod = self._skill("morning_briefing")
+        bc = self.bc
+        fired = []
+
+        def _fire(reason, force=False):     # stands in for the summaries
+            fired.append(reason)
+            bc._call_local_llm(
+                "sys", [{"role": "user", "content": "Headline: x"}],
+                max_tokens=20)
+        self._p(mod, "_briefing_already_fired_today", return_value=False)
+        self._p(mod, "BRIEFING_DELAY_SECONDS", 0)
+        self._p(mod, "_fire_briefing", side_effect=_fire)
+        _, log = self._held_during(
+            bc._utterance_in_progress, lambda: mod._fire_from_chain("chain"),
+            done=lambda: bool(fired))
+        self.assertEqual(fired, ["chain"])
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("[bg-local] defer morning-briefing (utterance)", log)
+
+    def test_morning_chain_handoff_waits_before_it_fires(self):
+        mod = self._skill("morning_handoff")
+        bc = self.bc
+        fired = []
+
+        def _fire(reason, force=False):     # sections: screenshot + headlines
+            fired.append(reason)
+            return bc._call_local_llm(
+                "sys", [{"role": "user", "content": "Headline: x"}],
+                max_tokens=20)
+        self._p(mod, "_handoff_already_fired_today", return_value=False)
+        self._p(mod, "HANDOFF_DELAY_SECONDS", 0)
+        self._p(mod, "_fire_handoff", side_effect=_fire)
+        out, log = self._held_during(
+            bc._turn_in_progress, lambda: mod._fire_from_chain("chain"),
+            done=lambda: bool(fired))
+        self.assertEqual(out, "urgent")
+        self.assertEqual(fired, ["chain"])
+        self.assertIn("[bg-local] defer morning-handoff (turn)", log)
 
     def test_credits_check_waits_before_it_captures(self):
         mod = self._skill("credits_monitor")

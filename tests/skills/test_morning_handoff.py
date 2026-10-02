@@ -992,6 +992,48 @@ class FireHandoffTests(unittest.TestCase):
         slp.assert_called_once_with(self.mod.HANDOFF_DELAY_SECONDS)
         fire.assert_not_called()
 
+    def test_chain_fire_is_opt_in_background_work_waiting_first(self):
+        # Speed plan R5 (2026-10-02 review): the chain's handoff (a Teams
+        # screenshot read + headline summaries, no section deadline) is
+        # background work, opt-in (BACKGROUND_TAG_STRICT); its wait for a
+        # quiet moment comes BEFORE _fire_handoff (and so before its same-day
+        # re-check, the opener's clock time and the screenshot).
+        from core import local_traffic as lt
+        events = []
+
+        def _wait():
+            job = lt.current_job()
+            events.append(("wait", job.tag if job else None,
+                           job.opt_in if job else None))
+            return "shadow"
+
+        def _fire(reason, force=False):
+            job = lt.current_job()
+            events.append(("fire", job.tag if job else None, force))
+            return "briefing!"
+        with mock.patch.object(self.mod, "_handoff_already_fired_today",
+                               return_value=False), \
+             mock.patch.object(self.mod.time, "sleep"), \
+             mock.patch.object(self.mod, "_wait_for_quiet", side_effect=_wait), \
+             mock.patch.object(self.mod, "_fire_handoff", side_effect=_fire):
+            out = self.mod._fire_from_chain("chain")
+        self.assertEqual(out, "briefing!")
+        self.assertEqual(events, [("wait", "morning-handoff", True),
+                                  ("fire", "morning-handoff", False)])
+        self.assertIsNone(lt.current_job(), "the tag leaked past the fire")
+
+    def test_manual_handoff_is_not_background_work(self):
+        from core import local_traffic as lt
+        mod, actions = load_skill_isolated("morning_handoff")
+        seen = []
+
+        def _fire(reason, force=False):
+            seen.append(lt.current_job())
+            return "[intent:briefing] Good morning."
+        with mock.patch.object(mod, "_fire_handoff", side_effect=_fire):
+            actions["morning_handoff"]("")
+        self.assertEqual(seen, [None])
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # _overnight_print_phrase — skew wording + running/paused branches

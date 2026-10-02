@@ -860,6 +860,21 @@ def _background_work(tag: str):
         return contextlib.nullcontext()
 
 
+def _wait_for_quiet() -> str:
+    """core.local_traffic.wait_for_quiet() for this thread's tagged job: with
+    BACKGROUND_TAG_STRICT on, wait (bounded) until the owner is quiet. The
+    gate outcome, or 'none'. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return _lt.wait_for_quiet()
+    except Exception:
+        return "none"
+
+
+# Gate outcomes that mean the job really waited (core.local_traffic.Pass).
+_QUIET_WAITED = frozenset({"released", "forced", "cancelled"})
+
+
 def _fire_briefing(reason: str = "scheduled") -> str:
     # The SCHEDULED briefing only (the scheduler loop is its one caller; the
     # owner's "evening briefing" action builds its own). Speed plan R5
@@ -869,6 +884,18 @@ def _fire_briefing(reason: str = "scheduled") -> str:
     # BACKGROUND_TAG_STRICT on they wait (bounded) until he is quiet; the
     # briefing is then spoken a little later.
     with _background_work("evening-briefing"):
+        # The wait comes first, so the day's counts are read when it is
+        # spoken. The scheduler's same-day re-check ran BEFORE it, and the
+        # owner may have asked for the briefing himself while it waited (it
+        # waits exactly while he is talking): look again, or he hears it
+        # twice (2026-10-02 review). Only after a real wait, so with the
+        # switch off nothing changes.
+        if (_wait_for_quiet() in _QUIET_WAITED
+                and _load_last_fired_date()
+                == datetime.date.today().isoformat()):
+            print(f"  [evening] suppressing ({reason}) — briefing already "
+                  "fired while it waited for a quiet moment")
+            return ""
         text = _build_briefing()
     print(f"  [evening] firing briefing ({reason}): {text}")
     _enqueue_speech(text)

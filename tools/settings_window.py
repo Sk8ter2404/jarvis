@@ -1110,8 +1110,8 @@ SCHEMA: dict[str, dict] = {
         "tab": "ai", "label": "Also hold the newer background brain work",
         "type": "bool", "default": False,
         "help": "Local brain only: the notification sorter, Chappie, the "
-                "credits check and the scheduled evening briefing also wait "
-                "while you are talking, like memory extraction does. Off: "
+                "credits check and the scheduled evening and morning "
+                "briefings also wait while you are talking, like memory extraction does. Off: "
                 "they run at once and the log notes when they would have "
                 "waited. Applies on the next start.",
     },
