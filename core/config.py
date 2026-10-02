@@ -2096,7 +2096,8 @@ RAG_RERANKER_MODEL  = "BAAI/bge-reranker-base"
 # dumps. "*pass*" also catches names like "compass" or "passport" on purpose:
 # for secrets a missed search beats a leaked one.
 # A file that is already indexed and later matches a pattern is DROPPED from
-# the index on the next scan (the file itself is never touched).
+# the index on the next scan (the file itself is never touched), and search
+# refuses its hits straight away, before that scan has finished.
 # OVERRIDE = REPLACE: a RAG_EXCLUDE_GLOBS saved in data/user_settings.json
 # REPLACES this whole list; it is NOT merged with it. To add a pattern, copy
 # the full list into the settings file and add to the copy — a saved list

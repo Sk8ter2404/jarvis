@@ -173,7 +173,8 @@ _stats = {
 def _norm_path(path) -> str:
     """The form every exclude comparison uses: forward slashes, lower case.
     fnmatch.fnmatch() is case-insensitive on Windows but case-SENSITIVE on
-    Linux, so the matcher lowers both sides and uses fnmatchcase."""
+    Linux, so the matcher lowers both sides and compiles the patterns with
+    fnmatch.translate (a case-sensitive regex) — the same on every OS."""
     return str(path or "").replace("\\", "/").lower()
 
 
@@ -1009,6 +1010,13 @@ def search(query: str, k: int = 5, candidates: int = 25,
             continue
         path = str(meta.get("path", ""))
         if paths and not any(path.startswith(p) for p in paths):
+            continue
+        # Never hand back a file RAG_EXCLUDE_GLOBS now covers. index_once()
+        # drops such chunks only in its clean-up pass AFTER the whole walk
+        # (an hour or more when a big folder was just added), and not at all
+        # when that pass fails; until then a passwords file indexed under an
+        # older list would still be read out. Same check as the walk.
+        if path and _is_excluded(path):
             continue
         # cosine distance → similarity score in (-1, 1]; clip to [0, 1]
         sim = max(0.0, 1.0 - float(dist))

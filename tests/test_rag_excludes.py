@@ -15,7 +15,9 @@ What these tests pin:
   * an owner override saved in user_settings.json REPLACES the list;
   * a file that is already indexed and later matches an exclude is DROPPED
     from the index on the next scan (it used to stay searchable forever,
-    because the garbage-collect pass only removed files missing from disk).
+    because the garbage-collect pass only removed files missing from disk);
+  * search refuses an excluded file's hits at once, before that scan's
+    clean-up pass has run.
 
 All names here are made up. stdlib unittest + unittest.mock only; no chromadb,
 no Ollama, no real folders outside a tempdir.
@@ -388,6 +390,70 @@ class IndexAgreesWithExcludesTests(_ExcludeBase):
         self._seed_chunk(outside)
         rag.index_once()
         self.assertIn("elsewhere.md", self.coll.paths())
+
+
+# ── search refuses excluded hits before the clean-up has run ─────────────
+class _QueryVector(list):
+    def tolist(self):
+        return list(self)
+
+
+class _QueryEmbedder:
+    def encode(self, texts, **_):
+        return [_QueryVector([0.1, 0.2, 0.3]) for _ in texts]
+
+
+class _QueryCollection:
+    """A Chroma collection whose query() returns every seeded chunk."""
+
+    def __init__(self, paths):
+        self.metas = [{"path": p, "filename": p.replace("\\", "/").rsplit(
+            "/", 1)[-1], "chunk_index": 0, "ext": os.path.splitext(p)[1]}
+            for p in paths]
+
+    def query(self, query_embeddings=None, n_results=None, include=None):
+        n = len(self.metas)
+        return {"documents": [[f"chunk {i}" for i in range(n)]],
+                "metadatas": [list(self.metas)],
+                "distances": [[0.1 + 0.01 * i for i in range(n)]]}
+
+
+class SearchNeverReturnsExcludedTests(_ExcludeBase):
+    """index_once() drops an excluded file's chunks only in its clean-up pass
+    AFTER the whole walk, which runs for an hour or more right after a big
+    folder is added. Until then search itself must refuse those hits, or a
+    passwords file indexed under an older list is still read out."""
+
+    def setUp(self):
+        super().setUp()
+        rag.RAG_INDEX_PATHS = [_WIN_ROOT]
+        rag.RAG_EXCLUDE_GLOBS = _shipped_excludes()
+        self.keep = _WIN_ROOT + r"\meeting notes.md"
+        self.journal = _WIN_ROOT + r"\Journal\monday.md"
+        rag._collection = _QueryCollection([
+            self.keep,
+            _WIN_ROOT + r"\Router PASSWORDS.txt",
+            _WIN_ROOT + r"\Clients\Acme\Credentials\wifi.md",
+            _WIN_ROOT + r"\device export.csv",
+            self.journal,
+        ])
+        rag._embed_model = _QueryEmbedder()
+        for target, attr, value in ((rag, "is_available", lambda: True),
+                                    (rag, "RAG_RERANKER_MODEL", ""),
+                                    (rag, "_reranker", None)):
+            p = mock.patch.object(target, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _hit_paths(self):
+        return [h["path"] for h in rag.search("router", k=10)]
+
+    def test_secret_hits_are_never_returned(self):
+        self.assertEqual(self._hit_paths(), [self.keep, self.journal])
+
+    def test_a_runtime_exclude_applies_before_any_scan(self):
+        rag.configure(rag_exclude_globs=_shipped_excludes() + ["*journal*"])
+        self.assertEqual(self._hit_paths(), [self.keep])
 
 
 # ── the live watcher ─────────────────────────────────────────────────────
