@@ -1924,10 +1924,18 @@ class BootFailuresBeyondTheSweepCapTests(_Base):
     def test_byte_offsets_survive_crlf_and_non_ascii(self):
         # The resume point is a BYTE offset: CRLF line ends and a multi-byte
         # character before it must not shift it into the middle of a line.
-        first = self._line("first", error_repr="caf" + chr(0xE9) + " " + chr(0x2603))
-        self._write_raw((first + "\r\n" + self._line("second") + "\r\n")
+        # ensure_ascii=False, or json.dumps escapes the characters to ASCII
+        # and the byte and character counts agree, which tests nothing.
+        first = json.dumps({"kind": "first", "winerror": 5, "errno": 2,
+                            "error_repr": "caf" + chr(0xE9) + " " + chr(0x2603)},
+                           ensure_ascii=False)
+        first_bytes = (first + "\r\n").encode("utf-8")
+        self.assertGreater(len(first_bytes), len(first) + 2)  # really multi-byte
+        self._write_raw(first_bytes + (self._line("second") + "\r\n")
                         .encode("utf-8"))
         self.assertEqual(self._sweep(), 1)
+        # Deferred at the exact byte where the "second" line starts.
+        self.assertEqual(self._offset(), len(first_bytes))
         self.assertEqual(self._sweep(), 1)
         self.assertIn("(second)", self._todo_text())
         self.assertEqual(self._offset(), os.path.getsize(dd.BOOT_FAILURES_FILE))
