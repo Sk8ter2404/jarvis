@@ -1135,17 +1135,23 @@ def _check_boot_failures(queued_so_far: list[int]) -> None:
         last_offset = 0
     if size == last_offset:
         return
+    # Binary, so every line's start is a real byte offset: a kind the
+    # per-sweep cap turns away is DEFERRED by saving the offset at the start
+    # of its line. Saving the end of everything read (as before) dropped it
+    # for good, since the next sweep then saw no new bytes (audit A92).
     try:
-        with open(BOOT_FAILURES_FILE, "r", encoding="utf-8",
-                  errors="replace") as f:
+        with open(BOOT_FAILURES_FILE, "rb") as f:
             f.seek(last_offset)
-            new_lines = f.readlines()
-            new_offset = f.tell()
+            data = f.read()
     except OSError:
         return
+    new_offset = last_offset + len(data)
+    pos = last_offset
     seen_kinds: set[str] = set()
-    for line in new_lines:
-        line = line.strip()
+    for raw_line in data.splitlines(keepends=True):
+        line_start = pos
+        pos += len(raw_line)
+        line = raw_line.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -1157,6 +1163,9 @@ def _check_boot_failures(queued_so_far: list[int]) -> None:
         kind = (obj.get("kind") or "boot_failure").strip()
         if kind in seen_kinds:
             continue
+        if queued_so_far[0] >= ANOMALY_MAX_QUEUED_PER_SWEEP:
+            new_offset = line_start      # re-read from this line next sweep
+            break
         seen_kinds.add(kind)
         iso = obj.get("iso") or _iso(obj.get("ts"))
         err = (obj.get("error_repr") or "").strip()

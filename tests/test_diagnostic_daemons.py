@@ -1859,6 +1859,90 @@ class CheckBootFailuresTests(_Base):
         self.assertEqual(q[0], 0)
 
 
+class BootFailuresBeyondTheSweepCapTests(_Base):
+    """Audit A92: a boot-failure kind the per-sweep cap turns away must be
+    DEFERRED to the next sweep, not dropped. The offset used to jump to the end
+    of everything read even when a later, different kind was refused by the
+    cap, so the next sweep saw no new bytes and that failure was never
+    reported."""
+
+    def _write_raw(self, data: bytes):
+        with open(dd.BOOT_FAILURES_FILE, "ab") as f:
+            f.write(data)
+
+    def _line(self, kind, **extra):
+        rec = {"kind": kind, "winerror": len(kind), "errno": 2}
+        rec.update(extra)
+        return json.dumps(rec)
+
+    def _sweep(self, already=0):
+        q = [already]
+        dd._check_boot_failures(q)
+        return q[0] - already
+
+    def _offset(self):
+        return self._read_state_file()["anomaly_watch"]["last_boot_failure_offset"]
+
+    def test_second_kind_is_queued_on_the_next_sweep(self):
+        self._write_raw((self._line("kindA") + "\n"
+                         + self._line("kindB") + "\n").encode("utf-8"))
+        self.assertEqual(self._sweep(), 1)
+        self.assertIn("(kindA)", self._todo_text())
+        self.assertNotIn("(kindB)", self._todo_text())
+        self.assertEqual(self._sweep(), 1)
+        self.assertIn("(kindB)", self._todo_text())
+        # Fully drained: the offset is at the end and a third sweep is a no-op.
+        self.assertEqual(self._offset(), os.path.getsize(dd.BOOT_FAILURES_FILE))
+        self.assertEqual(self._sweep(), 0)
+
+    def test_every_kind_eventually_reported_in_order(self):
+        kinds = ["alpha", "bravo", "charlie"]
+        self._write_raw("".join(self._line(k) + "\n" for k in kinds)
+                        .encode("utf-8"))
+        for i, k in enumerate(kinds):
+            self.assertEqual(self._sweep(), 1, f"sweep {i + 1} queued nothing")
+            self.assertIn(f"({k})", self._todo_text())
+        self.assertEqual(self._sweep(), 0)
+        self.assertEqual(self._todo_text().count("boot failure detected"), 3)
+
+    def test_cap_already_spent_defers_the_whole_batch(self):
+        self._write_raw((self._line("late") + "\n").encode("utf-8"))
+        self.assertEqual(self._sweep(already=dd.ANOMALY_MAX_QUEUED_PER_SWEEP), 0)
+        self.assertNotIn("(late)", self._todo_text())
+        self.assertEqual(self._sweep(), 1)
+        self.assertIn("(late)", self._todo_text())
+
+    def test_repeat_of_a_queued_kind_does_not_hold_the_offset_back(self):
+        self._write_raw((self._line("same") + "\n" + self._line("same") + "\n"
+                         + self._line("other") + "\n").encode("utf-8"))
+        self.assertEqual(self._sweep(), 1)
+        self.assertEqual(self._sweep(), 1)
+        self.assertIn("(other)", self._todo_text())
+        self.assertEqual(self._todo_text().count("(same)"), 1)
+        self.assertEqual(self._sweep(), 0)
+
+    def test_byte_offsets_survive_crlf_and_non_ascii(self):
+        # The resume point is a BYTE offset: CRLF line ends and a multi-byte
+        # character before it must not shift it into the middle of a line.
+        first = self._line("first", error_repr="caf" + chr(0xE9) + " " + chr(0x2603))
+        self._write_raw((first + "\r\n" + self._line("second") + "\r\n")
+                        .encode("utf-8"))
+        self.assertEqual(self._sweep(), 1)
+        self.assertEqual(self._sweep(), 1)
+        self.assertIn("(second)", self._todo_text())
+        self.assertEqual(self._offset(), os.path.getsize(dd.BOOT_FAILURES_FILE))
+
+    def test_lines_appended_after_a_deferral_are_still_read(self):
+        self._write_raw((self._line("one") + "\n" + self._line("two") + "\n")
+                        .encode("utf-8"))
+        self.assertEqual(self._sweep(), 1)
+        self._write_raw((self._line("three") + "\n").encode("utf-8"))
+        self.assertEqual(self._sweep(), 1)
+        self.assertIn("(two)", self._todo_text())
+        self.assertEqual(self._sweep(), 1)
+        self.assertIn("(three)", self._todo_text())
+
+
 class CheckStuckLoopTests(_Base):
     """The stuck-main-loop detector.
 
