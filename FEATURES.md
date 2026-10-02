@@ -201,7 +201,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Evening briefing** — 22:00 auto. Today's interactions and tasks, the live print, tomorrow's weather and first appointment, an umbrella warning, one dry observation, headlines.
   - "evening briefing", "what's tomorrow looking like"
   - Action: `evening_briefing`
-- **Daily recap** — 22:30 auto end-of-day summary of what you did (app time, prints, calls, music, tasks shipped).
+- **Daily recap** — 22:30 auto end-of-day summary of what you did (app time, prints, calls, music, tasks shipped), ending "Shall I queue the same morning briefing for tomorrow?"
   - "recap my day"
   - Action: `daily_recap`
 - **Calendar** — today, tomorrow, this week or the next two weeks via Microsoft Graph; degrades honestly when Graph isn't signed in.
@@ -210,7 +210,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Weather forecast (hourly + umbrella alert)** — answers for another day too; a proactive watcher announces transitions about two hours out.
   - "what's the weather doing", "should I bring an umbrella", "will it rain tomorrow"
   - Actions: `weather_briefing`, `weather_forecast`
-- **News briefing** — RSS headlines, each rewritten as one sentence.
+- **News briefing** — RSS headlines, each rewritten as one sentence by the model (`NEWS_BRIEFING_SUMMARIZE`, on; off reads the feed titles as they are).
   - "what's in the news", "read me the headlines"
   - Action: `news_briefing`
 
