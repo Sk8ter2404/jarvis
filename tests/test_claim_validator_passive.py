@@ -145,6 +145,80 @@ class PassiveFalsePositiveTests(unittest.TestCase):
                 self.assertIsNone(_flag(text, user="check my inbox"))
 
 
+class ReviewFalsePositiveTests(unittest.TestCase):
+    """Review 2026-10-02. A flagged reply is now WITHHELD and re-prompted,
+    so a false positive no longer costs one extra round: it silences a true
+    reply and asks the model to "emit the real action" (a second toggle of
+    the lamp, a second close of a reopened window). Made-up fixtures."""
+
+    def test_a_report_worded_in_another_family_is_grounded(self):
+        # "switched off" is the switch family's word for what the turn
+        # family's action (smart_home_control) does; "sent to the printer"
+        # is print_document.
+        for text, ran, user in (
+                ("The desk lamp has been switched off, sir.",
+                 ["smart_home_control"], "turn off the desk lamp"),
+                ("The porch lights have been switched on, sir.",
+                 ["smart_home_control"], "porch lights on"),
+                ("I've switched off the desk lamp, sir.",
+                 ["smart_home_control"], "turn off the desk lamp"),
+                ("The invoice has been sent to the printer, sir.",
+                 ["print_document"], "print the invoice"),
+                ("I've sent the invoice to the printer, sir.",
+                 ["print_document"], "print the invoice")):
+            with self.subTest(text=text):
+                self.assertIsNone(_flag(text, ran=ran, user=user))
+        # Still a claim when nothing of either family ran.
+        self.assertIsNotNone(_flag("The desk lamp has been switched off, "
+                                   "sir.", ran=["get_time"],
+                                   user="turn off the desk lamp"))
+
+    def test_thanks_and_news_are_not_commands(self):
+        for user, text in (
+                ("thanks for closing that", "Of course, sir. It has been "
+                                            "closed."),
+                ("thank you jarvis", "My pleasure, sir. Everything has been "
+                                     "taken care of."),
+                ("cheers", "Not at all, sir. It's all been sorted."),
+                ("the dentist appointment got moved",
+                 "Indeed, sir, it has been moved to Thursday."),
+                ("I heard the bakery shut down",
+                 "Yes, sir, it has been closed for good."),
+                ("the parcel came", "Excellent, sir. It has been delivered, "
+                                    "then."),
+                ("my invoice finally sent", "Very good, sir. Everything has "
+                                            "been sent, then.")):
+            with self.subTest(user=user):
+                self.assertIsNone(_flag(text, user=user))
+                self.assertIsNone(cv.find_completed_claim(text,
+                                                          user_text=user))
+
+    def test_a_check_whether_request_asks_about_state(self):
+        self.assertIsNone(_flag("Paint has been closed, sir; it's no longer "
+                                "in the list.", ran=["list_windows"],
+                                user="check whether paint has been closed"))
+
+    def test_requests_still_read_the_passive_claim(self):
+        # Commands, Parakeet's past-tense imperative, request leads, a
+        # present-tense remark that asks for something, and an elliptical
+        # follow-on all keep the rule.
+        for user, text in (
+                ("Jarvis closed paint.", "Very good, sir. Paint has been "
+                                         "closed."),
+                ("please close paint", "Paint has been closed, sir."),
+                ("I need you to close paint", "Paint has been closed, sir."),
+                ("you can close paint", "Paint has been closed, sir."),
+                ("it's far too dark in here", "The lights have been turned "
+                                              "on, sir."),
+                ("I'm bored", "Some music has been queued for you, sir."),
+                ("I'm done with paint", "Paint has been closed, sir."),
+                ("the other one too", "The other one has been closed too, "
+                                      "sir."),
+                ("yes", "It has been closed, sir.")):
+            with self.subTest(user=user):
+                self.assertIsNotNone(_flag(text, user=user))
+
+
 class CompletedClaimTests(unittest.TestCase):
     """find_completed_claim: the streaming flush never voices a claim that
     something ALREADY happened before the reply's actions run. Progressive

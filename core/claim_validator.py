@@ -57,9 +57,11 @@ A reply with no ``[ACTION:]`` token is flagged when it contains:
      has / have / 's been <participle>", "is now <participle>", "was
      successfully <participle>", when the subject is a pronoun or quantifier,
      a word of the owner's utterance, or a thing JARVIS acts on. Not when the
-     owner's turn asks about state ("did you close it?", "has it been sent"),
-     the clause is dated ("since this morning", "an hour ago", "for decades")
-     or has a passive agent ("closed by the court"). See _passive_claim.
+     owner's turn asks about state ("did you close it?", "has it been sent",
+     "check whether it's closed"), thanks JARVIS or reports news ("thanks for
+     closing that", "the meeting got moved" - _owner_states), the clause is
+     dated ("since this morning", "an hour ago", "for decades") or has a
+     passive agent ("closed by the court"). See _passive_claim.
 
 GROUNDING (follow-up rounds)
 ============================
@@ -554,11 +556,62 @@ _OWNER_STATUS_ASK_RE = re.compile(
     r"^(?:has|have|had|is|are|was|were)\s+(?!been\b|being\b)\S+")
 
 
+# "check whether notepad has been closed" asks about state too (review
+# 2026-10-02): the follow-up's "Notepad has been closed, sir" after
+# list_windows reports what it found.
+_OWNER_CHECK_ASK_RE = re.compile(
+    r"^(?:(?:double[-\s]?)?check|see|find\s+out|confirm|verify)\s+"
+    r"(?:whether|if)\b")
+
+
 def _owner_asks_status(user_text: str) -> bool:
     if looks_like_question(user_text):
         return True
     t = _Q_FILLER_RE.sub("", _norm(user_text)).strip()
-    return bool(_OWNER_STATUS_ASK_RE.match(t))
+    return bool(_OWNER_STATUS_ASK_RE.match(t) or _OWNER_CHECK_ASK_RE.match(t))
+
+
+# The owner THANKING JARVIS or TELLING it news, not asking or commanding
+# (review 2026-10-02): "thanks for closing that", "the meeting got moved", "I
+# heard the shop shut down". JARVIS echoing it in the passive ("It has been
+# closed, sir", "it has been moved to Thursday") claims nothing it did - and a
+# flagged reply is withheld and re-prompted ("emit the real action"), so
+# reading it as a claim silences a true reply and invites the "can't actually
+# move the moon" retraction, or a second close of a window the owner reopened.
+#   * thanks / praise opens a statement;
+#   * otherwise a subject or determiner opener ("I", "the", "my", "it") with a
+#     PAST verb after it ("the meeting GOT moved", "my flight LANDED", "I
+#     HEARD ..."). A present-tense remark stays a possible request ("it's too
+#     dark in here", "I'm bored", "I'm done with notepad" - an -ed word after
+#     a copula is an adjective) and so does an elliptical one ("the other one
+#     too"); commands open with their verb ("close it", Parakeet's "Jarvis
+#     closed notepad") or a request lead ("I need you to ...").
+_OWNER_THANKS_RE = re.compile(
+    r"^(?:thanks|thank|cheers|ta|good|great|nice|lovely|perfect|excellent|"
+    r"brilliant|awesome|cool|wow|well\s+done|nicely\s+done)\b")
+_OWNER_OPENER_RE = re.compile(
+    r"^(?:i(?!'m\b|m\b)|i've|ive|we(?!'re\b)|we've|he|she|they(?!'re\b)|"
+    r"you(?!'re\b)|the|a|an|my|our|your|his|her|their|it(?!'s\b)|its|"
+    r"that(?!'s\b)|this|these|those|there(?!'s\b)|apparently|guess|looks|"
+    r"seems)\b")
+_OWNER_COMMAND_LEAD_RE = re.compile(
+    r"^(?:i|we)\s+(?:need|want|would\s+like|'d\s+like|d\s+like)\b"
+    r"|^you\s+(?:can|could|should|may|might|must|need|have\s+to|will|"
+    r"would)\b")
+_OWNER_PAST_RE = re.compile(
+    r"\b(?:got|was|were|had|came|went|did|heard|saw|sent|made|took|left|"
+    r"found|told|said|thought|knew|finally|already|[a-z]{3,}ed)\b")
+
+
+def _owner_states(user_text: str) -> bool:
+    """True when the owner's turn thanks JARVIS or reports news (a past
+    event) rather than commanding or asking - see _OWNER_THANKS_RE."""
+    t = _Q_FILLER_RE.sub("", _norm(user_text)).strip()
+    if not t or _OWNER_COMMAND_LEAD_RE.match(t):
+        return False
+    if _OWNER_THANKS_RE.match(t):
+        return True
+    return bool(_OWNER_OPENER_RE.match(t) and _OWNER_PAST_RE.search(t))
 
 
 def _passive_words(text: str) -> set[str]:
@@ -642,7 +695,8 @@ def find_completed_claim(text: str, *, ran_actions: Iterable[str] = (),
         return None
     ran = _ran_tokens(ran_actions)
     any_ran = bool(ran)
-    passive_ok = not _owner_asks_status(user_text)
+    passive_ok = not (_owner_asks_status(user_text)
+                      or _owner_states(user_text))
     owner_words = _passive_words(_norm(user_text)) if passive_ok else set()
     for ack, ack_text, core in _segments(text):
         if ack == "done" and not any_ran:
@@ -690,10 +744,22 @@ def _ran_tokens(ran_actions: Iterable[str]) -> set[str]:
     return tokens
 
 
+# A claim worded in one family that another family's action carries out
+# (review 2026-10-02): "I've switched off the lamp" / "the lights have been
+# switched on" is what smart_home_control does (the turn family's tokens),
+# and "it has been sent to the printer" is print_document. A flagged reply is
+# withheld, so a report of an action that ran must not be read as a claim.
+# Grounding only - the lenient direction.
+_GROUND_ALSO: dict[str, frozenset[str]] = {
+    "switch": next(t for n, _g, _p, _b, t in _FAMILIES if n == "turn"),
+    "send": frozenset({"print", "printer"}),
+}
+
+
 def _family_tokens(name: str) -> frozenset[str]:
     for fam, _rx, tokens in _COMPILED:
         if fam == name:
-            return tokens
+            return tokens | _GROUND_ALSO.get(name, frozenset())
     return frozenset()
 
 
@@ -799,7 +865,8 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
     working_line = ""                     # a calculate_status phrase
     # Passive completion claims ("<app> has been closed") - see
     # _passive_claim. Not read when the owner's turn asks about state.
-    passive_ok = not _owner_asks_status(user_text)
+    passive_ok = not (_owner_asks_status(user_text)
+                      or _owner_states(user_text))
     owner_words = _passive_words(_norm(user_text)) if passive_ok else set()
     for ack, ack_text, core in _segments(text):
         if ack:

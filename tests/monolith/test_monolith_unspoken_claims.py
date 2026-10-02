@@ -81,12 +81,39 @@ class UnspokenClaimTests(_Base):
 
     def test_parse_withholds_the_prose_and_tells_the_model(self):
         bc = self.bc
+        prev = bc._begin_turn_grounding("close everything but the editor")
+        self.addCleanup(bc._end_turn_grounding, prev)
         cleaned, results = self._quiet(bc.parse_and_run_actions, _LIBERTY)
         self.assertEqual(cleaned, "")
         self.assertEqual([n for n, _r, _i in results], ["_unverified_claim"])
         warn = results[0][1]
         self.assertIn("hallucinated execution", warn)
         self.assertIn("NOT spoken", warn)
+
+    def test_a_proactive_remark_is_not_silenced(self):
+        # Review 2026-10-02: outside a dispatch (the proactive remark) there
+        # is no follow-up round to answer instead, so withholding would only
+        # silence the remark - the prose is kept as before.
+        bc = self.bc
+        self.assertIsNone(getattr(bc._turn_grounding, "frame", None))
+        remark = "Sir, your print job has been completed."
+        cleaned, results = self._quiet(bc.parse_and_run_actions, remark)
+        self.assertEqual(cleaned, remark)
+        self.assertEqual([n for n, _r, _i in results], ["_unverified_claim"])
+        self.assertNotIn("NOT spoken", results[0][1])
+
+    def test_the_proactive_turn_still_speaks_its_remark(self):
+        bc = self.bc
+        remark = "Sir, your print job has been completed."
+        self._p(bc, "generate_proactive_comment", return_value=remark)
+        for name in ("pause_face_tracking", "resume_face_tracking",
+                     "_thinking_loop", "_proactive_note_spoken"):
+            self._p(bc, name)
+        n0 = len(bc.conversation_history)
+        self.addCleanup(lambda: bc.conversation_history.__delitem__(
+            slice(n0, None)))
+        self._quiet(bc._do_proactive_turn, {})
+        self.assertEqual(self.spoken, [remark])
 
     def test_a_report_of_an_action_that_ran_is_still_spoken(self):
         bc = self.bc
@@ -97,6 +124,32 @@ class UnspokenClaimTests(_Base):
         cleaned, results = self._quiet(bc.parse_and_run_actions, reply)
         self.assertEqual(results, [])
         self.assertEqual(cleaned, reply)
+
+    def test_review_false_positives_are_still_spoken(self):
+        # Review 2026-10-02: a withheld reply is silence plus a re-prompt to
+        # "emit the real action", so these true replies must pass untouched:
+        # a report worded in another family than the action that ran, and a
+        # passive echo of the owner's thanks or news.
+        bc = self.bc
+        for user, ran, reply in (
+                ("turn off the desk lamp", ("smart_home_control",
+                                            "lamp: off"),
+                 "The desk lamp has been switched off, sir."),
+                ("thanks for closing that", None,
+                 "Of course, sir. It has been closed."),
+                ("the dentist appointment got moved", None,
+                 "Indeed, sir, it has been moved to Thursday.")):
+            with self.subTest(user=user):
+                prev = bc._begin_turn_grounding(user)
+                try:
+                    if ran:
+                        bc._note_turn_action_ran(*ran)
+                    cleaned, results = self._quiet(bc.parse_and_run_actions,
+                                                   reply)
+                finally:
+                    bc._end_turn_grounding(prev)
+                self.assertEqual(results, [])
+                self.assertEqual(cleaned, reply)
 
     def test_an_answer_with_no_claim_is_untouched(self):
         reply = "[intent:amused] Notepad dates back to 1983, sir."

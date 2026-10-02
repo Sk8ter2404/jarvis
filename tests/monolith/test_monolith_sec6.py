@@ -836,9 +836,15 @@ class ParseAndRunActionsTests(SectionSixBase):
                       list(bc._pending_confirmation))
 
     def test_hallucinated_claim_appended_when_no_action(self):
-        cleaned, results = self.bc.parse_and_run_actions("Restarting now, sir.")
-        # The claim prose is withheld (2026-10-02): the follow-up round
-        # answers instead, like the preemptive refuse below.
+        # Inside a dispatch (its turn ledger open) the claim prose is
+        # withheld (2026-10-02): the follow-up round answers instead, like
+        # the preemptive refuse below.
+        prev = self.bc._begin_turn_grounding("restart")
+        try:
+            cleaned, results = self.bc.parse_and_run_actions(
+                "Restarting now, sir.")
+        finally:
+            self.bc._end_turn_grounding(prev)
         self.assertEqual(cleaned, "")
         self.assertEqual(len(results), 1)
         name, msg, informative = results[0]

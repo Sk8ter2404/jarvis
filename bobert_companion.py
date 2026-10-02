@@ -35818,6 +35818,10 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # withheld: the turn goes straight to the follow-up round, which emits the
     # real action or says it can't. The reply stays in conversation_history;
     # the synthetic result tells the model the owner never heard it.
+    # Only where that follow-up round exists (review 2026-10-02): inside
+    # _run_llm_dispatch, whose turn ledger is open. A proactive remark
+    # (_do_proactive_turn) has no follow-up loop - withholding there would
+    # only silence the remark, so its prose is kept as before.
     if not results:
         try:
             matched = _claim_validator.find_unverified_claim(
@@ -35829,18 +35833,21 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             print(f"  [validation] claim check failed: {_cv_err}")
             matched = None
         if matched:
+            _withhold = getattr(_turn_grounding, "frame", None) is not None
             warn = (
                 f"reply claims '{matched.strip()}' but no [ACTION: ...] token "
-                "was emitted — JARVIS appears to have hallucinated execution. "
-                "That reply was NOT spoken: the owner has not heard it, so "
-                "do not apologise for it or refer to it"
+                "was emitted — JARVIS appears to have hallucinated execution"
+                + (". That reply was NOT spoken: the owner has not heard it, "
+                   "so do not apologise for it or refer to it"
+                   if _withhold else "")
             )
             print(f"  [validation] {warn}")
             results.append(("_unverified_claim", warn, True))
-            if cleaned:
-                print("  [validation] not speaking the unverified claim - "
-                      "the follow-up round answers instead")
-            cleaned = ""
+            if _withhold:
+                if cleaned:
+                    print("  [validation] not speaking the unverified claim "
+                          "- the follow-up round answers instead")
+                cleaned = ""
 
     # Continuation enforcer: when at least one action *did* run, scan the
     # prose for chained-intent phrases ("and read it to you", "then I'll
