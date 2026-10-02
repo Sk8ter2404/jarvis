@@ -914,6 +914,79 @@ class HandoffTests(_Base):
         self.assertIs(config.PROCESSING_FILLER_PRERENDER, False)
 
 
+class _OrderIdle:
+    """A real Event that logs clear / set into `order`."""
+
+    def __init__(self, order):
+        self._e = threading.Event()
+        self._e.set()
+        self._order = order
+
+    def clear(self):
+        self._order.append("idle.clear")
+        self._e.clear()
+
+    def set(self):
+        self._order.append("idle.set")
+        self._e.set()
+
+    def is_set(self):
+        return self._e.is_set()
+
+    def wait(self, timeout=None):
+        return self._e.wait(timeout)
+
+
+class _OrderCell(list):
+    """The device-flag cell, logging every read of it into `order`."""
+
+    def __init__(self, order, init):
+        super().__init__(init)
+        self._order = order
+
+    def __getitem__(self, i):
+        self._order.append("device.read")
+        return super().__getitem__(i)
+
+
+class HandoffOrderTests(_PreBase):
+    """The pre-render half of the race-free handoff (see the comments in
+    _speak_prerender and _filler_play). The pre-render marks itself in flight
+    BEFORE it reads the device flag; _filler_play clears the flag BEFORE it
+    reads the Event (pinned by HandoffTests.test_the_wait_happens_after_the_
+    clip_while_holding_the_lock). With both orders, either the pre-render
+    sees the clip gone and stops, or the filler sees it in flight and waits.
+    Read the flag first and a clip ending in between lets the filler release
+    the lock with no wait while the answer is still rendered outside it.
+    Nothing else catches that swap: every other test is single-threaded or
+    too coarse to land in the gap."""
+
+    def test_in_flight_is_marked_before_the_device_flag_is_read(self):
+        bc = self.bc
+        order = []
+        self._p(bc, "_prerender_idle", _OrderIdle(order))
+        self._p(bc, "_filler_on_device", _OrderCell(order, [True]))
+        self.speak()
+        self.assertEqual(self.plays(), [("play", _PRE, 100)], self.log)
+        self.assertIn("device.read", order)
+        self.assertEqual(order[0], "idle.clear", order)
+        self.assertLess(order.index("idle.clear"),
+                        order.index("device.read"))
+        self.assertEqual(order[-1], "idle.set", order)
+
+    def test_a_clip_gone_before_the_read_still_clears_and_sets(self):
+        # No clip on the device: nothing is rendered, and the in-flight mark
+        # is still cleared then set again (never left clear).
+        bc = self.bc
+        order = []
+        self._p(bc, "_prerender_idle", _OrderIdle(order))
+        self._p(bc, "_filler_on_device", _OrderCell(order, [False]))
+        self.speak()
+        self.assert_today()
+        self.assertEqual(order, ["idle.clear", "device.read", "idle.set"])
+        self.assertTrue(bc._prerender_idle.is_set())
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Phase 1 — real threads (the flag-on twin of RealThreadOrderingTests
 #  .test_a_filler_first_answer_waits, which stays as the default-off proof)
