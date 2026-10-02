@@ -259,6 +259,28 @@ class VolumeRoutingRegressionTests(unittest.TestCase):
                               f"{q!r} must load {h!r} (the set_volume home)")
 
 
+class ReadThisPageRoutingTests(unittest.TestCase):
+    """Live 2026-10-01 20:45: "read this page for me and see if there's any
+    issues" ran see_screen with no SCREEN VISION section loaded - its keywords
+    only knew "screen" phrasings, so the v2.0.159 reading rules in that section
+    never reached the local brain on a "page" request."""
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+        self.homes = [h for h, b in self.sections if "see_screen" in b]
+
+    def test_page_reading_requests_load_the_see_screen_section(self):
+        self.assertTrue(self.homes, "some section must document see_screen")
+        for q in ("read this page for me and see if there's any issues",
+                  "can you read this page",
+                  "what does this article say",
+                  "read this for me",
+                  "summarize what's on the page"):
+            inc, _ = pr.select_sections(q, self.sections)
+            self.assertTrue(set(self.homes) & set(inc),
+                            f"{q!r} must load a see_screen section {self.homes}")
+
+
 class UnifiedCameraRoutingRegressionTests(unittest.TestCase):
     """2026-07-21 audit: the indented 'UNIFIED (…)' sub-header is promoted to
     its own section (the parser matches headers on the stripped line), but its

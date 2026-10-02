@@ -107,6 +107,8 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "SCREEN VISION": [
         "screen", "what's on", "whats on", "looking at", "read the screen",
         "what do you see", "on my screen", "on screen", "see the screen",
+        # Reading requests name the page, not the screen (live 2026-10-01).
+        "this page", "the page", "read this", "this article",
     ],
     "WEBCAM AWARENESS": [
         "camera", "webcam", "see me", "can you see", "pointed at me",
