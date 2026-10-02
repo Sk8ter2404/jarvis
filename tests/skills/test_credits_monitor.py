@@ -111,6 +111,41 @@ class CreditsAlertTests(unittest.TestCase):
         # decimal the TTS reads like a clock time. The raw queued string keeps $.
         self.assertIn("$2.00", enq.call_args.args[0])
 
+    def test_background_cycle_is_opt_in_work_and_waits_before_the_lock(self):
+        # Speed plan R5 (2026-10-02): the hourly cycle is background work,
+        # opt-in (BACKGROUND_TAG_STRICT), and its wait for a quiet moment
+        # comes BEFORE the check lock and the billing-page capture.
+        from core import local_traffic as lt
+        events = []
+
+        def _waiter(kind):
+            job = lt.current_job()
+            events.append(("wait", kind, job.tag if job else None,
+                           job.opt_in if job else None,
+                           self.mod._check_lock.locked()))
+            return "shadow"
+
+        def _read():
+            job = lt.current_job()
+            events.append(("read", job.tag if job else None))
+            return (50.0, "BALANCE: $50.00")
+        bc = types.ModuleType("bobert_companion")
+        bc.wait_for_local_quiet = _waiter
+        with mock.patch.dict("sys.modules", {"bobert_companion": bc}), \
+             mock.patch.object(self.mod, "_read_credits_via_vision",
+                               side_effect=_read), \
+             mock.patch.object(self.mod, "_save_state"), \
+             mock.patch.object(self.mod, "_enqueue_speech"):
+            self.mod._check_and_maybe_alert()
+        self.assertEqual(events, [("wait", "vision", "credits-monitor", True,
+                                   False),
+                                  ("read", "credits-monitor")])
+        self.assertIsNone(lt.current_job())
+
+    def test_quiet_wait_without_a_running_jarvis_is_a_no_op(self):
+        with mock.patch.dict("sys.modules", {"bobert_companion": None}):
+            self.assertEqual(self.mod._wait_for_local_quiet(), "none")
+
     def test_healthy_balance_no_alert(self):
         with mock.patch.object(self.mod, "_read_credits_via_vision",
                                return_value=(50.0, "BALANCE: $50.00")), \

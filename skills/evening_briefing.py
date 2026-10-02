@@ -848,8 +848,28 @@ def _wait_for_presence(max_wait_s: float) -> bool:
     return False
 
 
+def _background_work(tag: str):
+    """core.local_traffic.background_work(tag, opt_in=True) -- a speed plan
+    R5 tag, which waits only while BACKGROUND_TAG_STRICT is on -- or a no-op
+    context when core can't be imported. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return _lt.background_work(tag, opt_in=True)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def _fire_briefing(reason: str = "scheduled") -> str:
-    text = _build_briefing()
+    # The SCHEDULED briefing only (the scheduler loop is its one caller; the
+    # owner's "evening briefing" action builds its own). Speed plan R5
+    # (2026-10-02): its headline summaries are background work for the
+    # one-slot local model -- live on 2026-10-01 three of them reached it
+    # while the owner's mic was still recording -- so with
+    # BACKGROUND_TAG_STRICT on they wait (bounded) until he is quiet; the
+    # briefing is then spoken a little later.
+    with _background_work("evening-briefing"):
+        text = _build_briefing()
     print(f"  [evening] firing briefing ({reason}): {text}")
     _enqueue_speech(text)
     _show_card_safe()

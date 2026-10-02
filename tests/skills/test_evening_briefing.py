@@ -1381,6 +1381,27 @@ class SchedulerTests(unittest.TestCase):
         card.assert_called_once()
         save.assert_called_once()
 
+    def test_scheduled_build_is_opt_in_background_work(self):
+        # Speed plan R5 (2026-10-02): the scheduled briefing's local headline
+        # summaries are background work, opt-in (BACKGROUND_TAG_STRICT); the
+        # speech is queued only after the build, outside the tag.
+        from core import local_traffic as lt
+        seen = []
+
+        def _build():
+            job = lt.current_job()
+            seen.append(None if job is None else (job.tag, job.opt_in))
+            return "Good evening, sir."
+
+        def _enqueue(text):
+            seen.append(("enqueue", lt.current_job()))
+        with mock.patch.object(self.mod, "_build_briefing", side_effect=_build), \
+             mock.patch.object(self.mod, "_enqueue_speech", side_effect=_enqueue), \
+             mock.patch.object(self.mod, "_show_card_safe"), \
+             mock.patch.object(self.mod, "_save_last_fired_date"):
+            self.mod._fire_briefing("timed-out")
+        self.assertEqual(seen, [("evening-briefing", True), ("enqueue", None)])
+
     # ── _scheduler_loop single-iteration gating ──────────────────────────
     def _run_one_iteration(self, **patches):
         """Drive _scheduler_loop through exactly one full pass of the body.

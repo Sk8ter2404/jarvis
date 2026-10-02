@@ -115,6 +115,12 @@ ENABLE_LLM_CLASSIFIER = True         # set False to skip the classifier and just
 LLM_MODEL             = ""           # Claude leg's model; blank = core.config.CLAUDE_FAST_MODEL
 LLM_TIMEOUT_SECONDS   = 6.0
 HIGH_PRIORITY_FLOOR   = 100          # rules with priority >= this bypass focus mode
+# Speed plan R5 (2026-10-02): the classifier's local-model fallback is
+# background work. With BACKGROUND_TAG_STRICT on it waits (bounded) while the
+# owner is talking to the local brain, but never longer than this for a quiet
+# gap -- an urgent toast must not sit out two minutes of conversation; the
+# gate's hard grace still covers a sentence or turn in progress.
+LLM_LOCAL_MAX_DEFER_S = 15.0
 
 _RULES_FILE     = os.path.join(_PROJECT_DIR, "notification_rules.json")
 _DATA_DIR       = os.path.join(_PROJECT_DIR, "data", "notifications")
@@ -893,6 +899,18 @@ def _cloud_allowed() -> bool:
         return False
 
 
+def _background_work(tag: str, **kw):
+    """core.local_traffic.background_work(tag, opt_in=True, ...) -- a speed
+    plan R5 tag, which waits only while BACKGROUND_TAG_STRICT is on -- or a
+    no-op context when core can't be imported. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return _lt.background_work(tag, opt_in=True, **kw)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 # The sorter's backend (2026-10-02): core.config.NOTIFY_SORTER_BACKEND, read
 # at call time. _DEFAULT_SORTER_BACKEND is used only when core.config cannot be
 # read or holds an unknown value; it must equal core.config's shipped default
@@ -963,7 +981,12 @@ def _classify_local(system: str, prompt: str) -> str | None:
         call = getattr(bc, "_call_local_llm", None) if bc is not None else None
         if not callable(call):
             return None
-        local = call(system, [{"role": "user", "content": prompt}], max_tokens=8)
+        # Background work for the one-slot local model (speed plan R5): see
+        # LLM_LOCAL_MAX_DEFER_S.
+        with _background_work("notification-triage",
+                              max_defer_s=LLM_LOCAL_MAX_DEFER_S):
+            local = call(system, [{"role": "user", "content": prompt}],
+                         max_tokens=8)
         return _parse_verdict(local) if local else None
     except Exception as e:
         _log.debug("[triage] local classifier failed: %s", e)

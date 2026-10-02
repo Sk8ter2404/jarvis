@@ -973,6 +973,30 @@ class ClassifyWithLLMTests(_IsolatedTriageBase):
              mock.patch.dict(sys.modules, {"bobert_companion": bc}):
             self.assertIsNone(self.mod._classify_with_llm("App", "T", "B"))
 
+    def test_local_fallback_is_opt_in_background_work(self):
+        # Speed plan R5 (2026-10-02): the listener thread's local call is a
+        # background job for the one-slot model, opt-in (BACKGROUND_TAG_STRICT)
+        # and with its own short cap, so an urgent toast is never held long.
+        from core import local_traffic as lt
+        seen = []
+
+        def _local(system, messages, max_tokens=500):
+            job = lt.current_job()
+            seen.append(None if job is None else
+                        (job.tag, job.opt_in, job.max_defer_s))
+            return "urgent"
+        bc = types.ModuleType("bobert_companion")
+        bc._call_local_llm = _local
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            out = self.mod._classify_with_llm("Teams", "Sam", "call me")
+        self.assertEqual(out, "urgent")
+        self.assertEqual(seen, [("notification-triage", True,
+                                 self.mod.LLM_LOCAL_MAX_DEFER_S)])
+        self.assertGreater(self.mod.LLM_LOCAL_MAX_DEFER_S, 0)
+        self.assertLessEqual(self.mod.LLM_LOCAL_MAX_DEFER_S, 30.0)
+        self.assertIsNone(lt.current_job(), "the tag leaked past the call")
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # NOTIFY_SORTER_BACKEND "local_first" (the 2026-10-02 default): the local

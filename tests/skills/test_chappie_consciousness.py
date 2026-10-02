@@ -536,6 +536,23 @@ class ChappieLLMTests(unittest.TestCase):
         with inject_modules(bobert_companion=bc):
             self.assertEqual(self.mod._llm("s", "u"), "")
 
+    def test_llm_is_opt_in_background_work(self):
+        # Speed plan R5 (2026-10-02): the daemon's passes are background work
+        # for the one-slot local model, opt-in (BACKGROUND_TAG_STRICT).
+        from core import local_traffic as lt
+        seen = []
+
+        def _local(system, messages, max_tokens=600):
+            job = lt.current_job()
+            seen.append(None if job is None else (job.tag, job.opt_in))
+            return "ok"
+        bc = types.ModuleType("bobert_companion")
+        bc._call_local_llm = _local
+        with inject_modules(bobert_companion=bc):
+            self.assertEqual(self.mod._llm("s", "u"), "ok")
+        self.assertEqual(seen, [("chappie", True)])
+        self.assertIsNone(lt.current_job())
+
 
 class ChappieTranscriptIOTests(unittest.TestCase):
     """_read_new_transcripts / _append_episodes / _read_episodes_since /

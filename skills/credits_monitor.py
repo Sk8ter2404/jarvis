@@ -224,9 +224,49 @@ def _read_credits_via_vision():
     return None, answer
 
 
+def _background_work(tag: str):
+    """core.local_traffic.background_work(tag, opt_in=True) -- a speed plan
+    R5 tag, which waits only while BACKGROUND_TAG_STRICT is on -- or a no-op
+    context when core can't be imported. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return _lt.background_work(tag, opt_in=True)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
+def _wait_for_local_quiet() -> str:
+    """The running JARVIS's wait_for_local_quiet("vision"): for this tagged
+    thread, wait (bounded) until a background vision call may run. Never
+    imports the monolith (a bare import is not a running JARVIS); 'none'
+    when it isn't loaded. Never raises."""
+    try:
+        import sys
+        bc = sys.modules.get("bobert_companion")
+        waiter = getattr(bc, "wait_for_local_quiet", None) if bc else None
+        return waiter("vision") if callable(waiter) else "none"
+    except Exception:
+        return "none"
+
+
 def _check_and_maybe_alert():
     """One periodic-monitor cycle. Reads the balance and queues a TTS alert
-    if it has dropped below the configured threshold."""
+    if it has dropped below the configured threshold.
+
+    Speed plan R5 (2026-10-02): the cycle is background work for the one-slot
+    local model (its vision read goes local on a local-vision install), so it
+    is tagged, and with BACKGROUND_TAG_STRICT on it waits (bounded) for a
+    quiet moment BEFORE it takes the check lock and opens the billing page:
+    the capture is fresh when the read goes out, and the owner's own "check my
+    credits" is never told a check is running while this one only waits."""
+    with _background_work("credits-monitor"):
+        _wait_for_local_quiet()
+        _check_and_maybe_alert_now()
+
+
+def _check_and_maybe_alert_now():
+    """The cycle itself (see _check_and_maybe_alert)."""
     if not _check_lock.acquire(blocking=False):
         return   # another check is already running — skip this tick
     try:

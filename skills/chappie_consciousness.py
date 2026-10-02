@@ -181,6 +181,18 @@ def _passes_filter(entry: dict) -> bool:
 
 # ─── claude wrapper ─────────────────────────────────────────────────────
 
+def _background_work(tag: str):
+    """core.local_traffic.background_work(tag, opt_in=True) -- a speed plan
+    R5 tag, which waits only while BACKGROUND_TAG_STRICT is on -- or a no-op
+    context when core can't be imported. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return _lt.background_work(tag, opt_in=True)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def _llm(system: str, user: str, max_tokens: int = 600) -> str:
     """Run Chappie's autonomous consciousness passes on the LOCAL Ollama
     model ONLY. These are background, non-conversational LLM calls, so per the
@@ -188,11 +200,17 @@ def _llm(system: str, user: str, max_tokens: int = 600) -> str:
     only; everything else stays on Max/local — they must never spend cloud
     credits. We call _call_local_llm directly rather than _llm_quick (which
     tries Claude first). Returns "" when the local model is unreachable.
-    2026-05-30 audit."""
+    2026-05-30 audit.
+
+    Speed plan R5 (2026-10-02): only the daemon calls this, and its passes are
+    background work for the one-slot local model, so they are tagged: with
+    BACKGROUND_TAG_STRICT on they wait (bounded) while the owner is talking
+    to the local brain instead of evicting his warm conversation prefix."""
     try:
         bc = sys.modules.get("bobert_companion") or importlib.import_module("bobert_companion")
-        out = bc._call_local_llm(system, [{"role": "user", "content": user}],
-                                 max_tokens=max_tokens)
+        with _background_work("chappie"):
+            out = bc._call_local_llm(system, [{"role": "user", "content": user}],
+                                     max_tokens=max_tokens)
         return (out or "").strip()
     except Exception as e:
         print(f"  [chappie] llm call failed: {e}")
