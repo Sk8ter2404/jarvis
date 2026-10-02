@@ -1217,6 +1217,131 @@ class VramWhisperTests(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  B16  the VRAM bar shows HOW FAR over budget, not just "full"
+# ════════════════════════════════════════════════════════════════════════
+def _recording_bar_fake():
+    """A FakeTk whose Canvas keeps its items, so the VRAM bar can be read
+    back: create_* return ids, coords()/itemconfigure() update them."""
+    fake = FakeTk()
+    base = fake.tk.Canvas
+
+    class BarCanvas(base):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.items = {}
+
+        def _new(self, kind, coords, kw):
+            item = 100 + len(self.items)
+            self.items[item] = {"kind": kind, "coords": list(coords),
+                                "kw": dict(kw)}
+            return item
+
+        def create_rectangle(self, *c, **kw):
+            return self._new("rectangle", c, kw)
+
+        def create_line(self, *c, **kw):
+            return self._new("line", c, kw)
+
+        def create_text(self, *c, **kw):
+            return self._new("text", c, kw)
+
+        def coords(self, item, *c):
+            self.items[item]["coords"] = list(c)
+
+        def itemconfigure(self, item, **kw):
+            self.items[item]["kw"].update(kw)
+
+        itemconfig = itemconfigure
+
+    fake.tk.Canvas = BarCanvas
+    return fake
+
+
+class VramBarOverageTests(_TmpDir):
+    """GUI_REVIEW B16: over budget the bar's fill clamped at full width while
+    the number beside it could read 137%, so 101% and 137% looked the same.
+    Over budget the bar now spans the predicted peak, with a limit mark where
+    the budget runs out, the overage hatched past it, and a "+N GB over"
+    label on the bar."""
+
+    _CW = 700   # FakeTk widgets report winfo_width() == 700
+
+    def _bar(self, total_vram_mb):
+        self.write({"WHISPER_DEVICE": "auto", "RAG_ENABLED": False})
+        fake, app = _app(self, fake=_recording_bar_fake(),
+                         total_vram_mb=total_vram_mb)
+        self.assertIsNotNone(app.vram)
+        app.update_budget()
+        return app
+
+    @staticmethod
+    def _visible(canvas):
+        return [it for it in canvas.items.values()
+                if it["kw"].get("state") != "hidden"]
+
+    def _budget(self, app):
+        wv = app.widget_values()
+        widget = {k: wv[k] for k in sw.VRAM_WATCH_KEYS if k in wv}
+        return sw.budget_from_live_values(
+            sw.resolve_vram_values(widget, app.values),
+            total_mb=app.vram_total_mb)
+
+    def test_over_budget_bar_marks_the_limit_and_labels_the_overage(self):
+        app = self._bar(total_vram_mb=8192)
+        b = self._budget(app)
+        self.assertTrue(b["over"])
+        canvas = app.vram_widgets["canvas"]
+        limit_x = int(self._CW * b["budget_mb"] / b["total_mb"])
+        over_gb = (b["total_mb"] - b["budget_mb"]) / 1024.0
+        texts = [it["kw"].get("text", "") for it in self._visible(canvas)
+                 if it["kind"] == "text"]
+        self.assertTrue(any(f"+{over_gb:.1f} GB over" in t for t in texts),
+                        texts)
+        marks = [it for it in self._visible(canvas) if it["kind"] == "line"
+                 and it["coords"][0] == it["coords"][2] == limit_x]
+        self.assertEqual(len(marks), 1, "no limit mark where the budget ends")
+        # The solid fill stops at the limit; the overage past it is hatched
+        # and runs to the end of the bar.
+        fill = canvas.items[app.vram_widgets["bar_fill"]]
+        self.assertEqual(fill["coords"][2], limit_x)
+        hatched = [it for it in self._visible(canvas)
+                   if it["kind"] == "rectangle" and it["kw"].get("stipple")]
+        self.assertEqual([h["coords"][0] for h in hatched], [limit_x])
+        self.assertEqual([h["coords"][2] for h in hatched], [self._CW])
+
+    def test_within_budget_bar_has_no_overage_marks(self):
+        app = self._bar(total_vram_mb=24576)
+        b = self._budget(app)
+        self.assertFalse(b["over"])
+        canvas = app.vram_widgets["canvas"]
+        visible = self._visible(canvas)
+        self.assertFalse([it for it in visible if it["kind"] in
+                          ("line", "text")])
+        fill = canvas.items[app.vram_widgets["bar_fill"]]
+        self.assertEqual(fill["coords"][2],
+                         int(self._CW * b["total_mb"] / b["budget_mb"]))
+
+    def test_marks_follow_the_budget_back_under(self):
+        app = self._bar(total_vram_mb=8192)
+        app.vram_total_mb = 24576
+        app.update_budget()
+        canvas = app.vram_widgets["canvas"]
+        self.assertFalse([it for it in self._visible(canvas)
+                          if it["kind"] in ("line", "text")])
+
+    def test_layout_helper(self):
+        lay = sw.vram_bar_layout({"total_mb": 137, "budget_mb": 100}, 700)
+        self.assertEqual(lay["limit_px"], int(700 * 100 / 137))
+        self.assertEqual(lay["fill_px"], lay["limit_px"])
+        self.assertIn("over", lay["over_label"])
+        lay = sw.vram_bar_layout({"total_mb": 50, "budget_mb": 100}, 700)
+        self.assertEqual((lay["fill_px"], lay["limit_px"], lay["over_label"]),
+                         (350, None, ""))
+        self.assertEqual(sw.vram_bar_layout({}, 700)["fill_px"], 0)
+        self.assertEqual(sw.vram_bar_layout(None, 0)["limit_px"], None)
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  P1-9  rows whose setting isn't actually in effect say so
 # ════════════════════════════════════════════════════════════════════════
 class EffectiveStateTests(_TmpDir):

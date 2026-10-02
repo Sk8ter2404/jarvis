@@ -2735,6 +2735,31 @@ def budget_parts_text(budget: dict) -> str:
     return " · ".join(parts)
 
 
+def vram_bar_layout(budget: dict, width) -> dict:
+    """Where the VRAM bar's pieces go, ``width`` pixels wide, for a
+    predict_budget() result.
+
+    Within budget the bar spans the usable budget and the fill is the predicted
+    peak. Over budget the fill used to clamp at full width, so 101% and 137%
+    looked the same (GUI_REVIEW B16). The bar then spans the predicted PEAK
+    instead: the solid fill stops at ``limit_px``, where the budget runs out,
+    and the rest of the bar is the overage, drawn hatched and labelled with
+    ``over_label``. ``limit_px`` is None within budget. Never raises."""
+    try:
+        width = max(1, int(width))
+        total = max(0, int((budget or {}).get("total_mb") or 0))
+        cap = max(0, int((budget or {}).get("budget_mb") or 0))
+    except (TypeError, ValueError):
+        return {"fill_px": 0, "limit_px": None, "over_label": ""}
+    if cap <= 0 or total <= cap:
+        frac = min(1.0, total / cap) if cap > 0 else 0.0
+        return {"fill_px": int(width * frac), "limit_px": None,
+                "over_label": ""}
+    limit_px = int(width * cap / total)
+    return {"fill_px": limit_px, "limit_px": limit_px,
+            "over_label": f"+{(total - cap) / 1024.0:.1f} GB over"}
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  Small Tk-free helpers the GUI uses (tested directly)
 # ──────────────────────────────────────────────────────────────────────────
@@ -3492,8 +3517,18 @@ class SettingsApp:
         bar.grid(row=row, column=0, columnspan=3, sticky="we", padx=2,
                  pady=(0, 2))
         fill = bar.create_rectangle(0, 0, 0, 18, fill=OK_GREEN, width=0)
+        # Over budget only (see vram_bar_layout): the overage, hatched, past a
+        # limit mark where the budget runs out, and a "+N GB over" label.
+        over = bar.create_rectangle(0, 0, 0, 18, fill=ERROR, width=0,
+                                    stipple="gray50", state="hidden")
+        limit = bar.create_line(0, 0, 0, 18, fill=FG, width=2, state="hidden")
+        over_text = bar.create_text(0, 9, text="", fill=FG, font=FONT_SMALL,
+                                    anchor="e", state="hidden")
         self.vram_widgets["canvas"] = bar
         self.vram_widgets["bar_fill"] = fill
+        self.vram_widgets["bar_over"] = over
+        self.vram_widgets["bar_limit"] = limit
+        self.vram_widgets["bar_over_text"] = over_text
         bar.bind("<Configure>", lambda *_a: self.update_budget())
         row += 1
         num = tk.Label(parent, text="", bg=BG, fg=FG, font=FONT, anchor="w")
@@ -3605,12 +3640,22 @@ class SettingsApp:
                     cw = 1
                 if cw <= 1:
                     cw = int(700 * self.scale)
-                frac = 0.0
-                if b["budget_mb"] > 0:
-                    frac = min(1.0, b["total_mb"] / b["budget_mb"])
+                lay = vram_bar_layout(b, cw)
                 canvas.coords(self.vram_widgets["bar_fill"], 0, 0,
-                              int(cw * frac), 18)
+                              lay["fill_px"], 18)
                 canvas.itemconfigure(self.vram_widgets["bar_fill"], fill=color)
+                over = self.vram_widgets["bar_over"]
+                limit = self.vram_widgets["bar_limit"]
+                over_text = self.vram_widgets["bar_over_text"]
+                x = lay["limit_px"]
+                if x is not None:
+                    canvas.coords(over, x, 0, cw, 18)
+                    canvas.coords(limit, x, 0, x, 18)
+                    canvas.coords(over_text, cw - 4, 9)
+                    canvas.itemconfigure(over_text, text=lay["over_label"])
+                for item in (over, limit, over_text):
+                    canvas.itemconfigure(
+                        item, state="hidden" if x is None else "normal")
             used = b["total_mb"] / 1024.0
             cap = b["total_card_mb"] / 1024.0
             self.vram_widgets["num"].configure(
