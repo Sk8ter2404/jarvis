@@ -25,9 +25,11 @@ Bugs found are documented in NOTE comments, not fixed.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import core.actions as A
@@ -74,6 +76,47 @@ class OpenUrlTests(unittest.TestCase):
                 mock.patch.object(A.time, "sleep") as msleep:
             A._act_open_url("example.com")
         msleep.assert_called_once_with(3.0)
+
+    def _data_dir(self):
+        data = tempfile.mkdtemp(prefix="open_url_data_")
+        self.addCleanup(shutil.rmtree, data, True)
+        env = mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": data})
+        env.start()
+        self.addCleanup(env.stop)
+        return data
+
+    @staticmethod
+    def _touch(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w", encoding="utf-8").close()
+        return path
+
+    def test_data_dir_html_page_opens_as_its_file_uri(self):
+        # skills/site_builder.py opens the page it saved through this path; a
+        # file: URI used to get "https://" glued on and open nothing.
+        data = self._data_dir()
+        uri = Path(self._touch(
+            os.path.join(data, "sites", "demo", "index.html"))).as_uri()
+        with mock.patch.object(A.webbrowser, "open") as mopen, _no_sleep():
+            out = A._act_open_url(uri)
+        mopen.assert_called_once_with(uri)
+        self.assertIn(uri, out)
+
+    def test_any_other_file_uri_still_gets_the_https_prefix(self):
+        # Only an existing .html page inside the data dir passes: anything
+        # else local could be an executable handed to os.startfile.
+        data = self._data_dir()
+        other = tempfile.mkdtemp(prefix="open_url_other_")
+        self.addCleanup(shutil.rmtree, other, True)
+        page = Path(self._touch(os.path.join(data, "sites", "d", "index.html")))
+        for uri in (Path(self._touch(os.path.join(other, "x.html"))).as_uri(),
+                    Path(self._touch(os.path.join(data, "notes.txt"))).as_uri(),
+                    Path(os.path.join(data, "missing.html")).as_uri(),
+                    page.as_uri() + "?q=1", page.as_uri() + "#top",
+                    "file://server" + page.as_uri()[len("file://"):]):
+            with mock.patch.object(A.webbrowser, "open") as mopen, _no_sleep():
+                A._act_open_url(uri)
+            mopen.assert_called_once_with("https://" + uri)
 
 
 class WebSearchTests(unittest.TestCase):

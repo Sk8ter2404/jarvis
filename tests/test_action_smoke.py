@@ -201,5 +201,12 @@ class GuardRootOverrideTests(unittest.TestCase):
         self.assertEqual(os.path.basename(g.LIVE_DATA_DIR), "data")
 
 
+class DenylistTests(unittest.TestCase):
+    def test_build_website_is_never_swept(self):
+        # Swept with "test" it would pay for an Opus call and open a real
+        # browser tab on the page it saved.
+        self.assertIn("build_website", smoke._DENYLIST_NAMES)
+
+
 if __name__ == "__main__":
     unittest.main()
