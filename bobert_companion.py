@@ -18246,10 +18246,14 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # transcribing; on quiet/desk mics it frequently drops LEGITIMATE
             # speech (a real "JARVIS" scores below the gate) and returns zero
             # segments -> "". Use a permissive threshold, and if it STILL finds
-            # nothing, retry ONCE WITHOUT the VAD filter so a genuine utterance
-            # is never silently lost — the difference between "heard you" and a
-            # wall of [standby] ignored: ''. The caller's audio already cleared
-            # the mic VAD gate, so it is not pure silence.
+            # nothing, retry ONCE WITHOUT the VAD filter so a quiet utterance
+            # is not lost — the difference between "heard you" and a wall of
+            # [standby] ignored: ''. The caller's audio already cleared the mic
+            # VAD gate, so it is not pure silence. The retry only runs for a
+            # clip of at most _STT_NO_VAD_RETRY_MAX_AUDIO_S (10 s) and
+            # recordings run to MAX_RECORDING_SECS (30 s), so a LONGER clip
+            # Silero hears no speech in is dropped without one: the price of
+            # keeping the main loop under the watchdog (audit P1-1).
             # STT_HOTWORDS (core/stt_vocab.py, 2026-10-01): the owner's names
             # ("Accelo" came out as "a cello"). None when unset = unchanged.
             # The no-VAD retry runs WITHOUT them: its audio is the clip VAD
