@@ -405,6 +405,22 @@ class SceneActivationTests(_RouterCase):
         self.assertNotIn("Scene running", out)
         self.assertTrue(_has_failure_marker(out), out)
 
+    def test_no_scene_of_that_name_leaves_a_same_named_light_alone(self):
+        # No scene called "movie night" in the catalog, so want_type='scene'
+        # has nothing to prefer and the light wins the match. Switching that
+        # light on and saying "Scene running" is the false success A50 is
+        # about; nothing may be driven, by Alexa or by the brand skill.
+        self.catalog["devices"] = [
+            {"name": "Movie Night", "alexa_room": "Den", "type": "light",
+             "brand": "Philips Hue", "controller_skill": "sh_hue",
+             "alexa_entity_id": "light-2"}]
+        self.use(_FakeAlexa())
+        out = router.smart_home_control("run the movie night scene")
+        self.assertNotIn("Scene running", out)
+        self.assertIn("scene", out.lower())
+        self.assertEqual(self.alexa.calls, [], "the light must not be switched")
+        self.call_skill.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

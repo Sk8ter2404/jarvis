@@ -1004,8 +1004,29 @@ def smart_home_control(utterance: str = "") -> str:
             return live
         return f"I don't see anything in the catalog matching '{descriptor}', sir."
 
+    # want_type only PREFERS a scene: with no scene of that name a same-named
+    # light still wins, and turning it on is not running a scene (A50).
+    if action.get("verb") == "scene":
+        scenes = [d for d in devices if _could_be_scene(d)]
+        if not scenes:
+            top = devices[0]
+            return (f"I don't see a scene matching '{descriptor}' in the "
+                    f"catalog, sir — {top.get('name') or 'the closest match'} "
+                    f"is a {top.get('type')}, so I left it alone.")
+        devices = scenes
+
     results = [_dispatch_one(d, action) for d in devices]
     return _summarize_results(action, results)
+
+
+def _could_be_scene(device: dict) -> bool:
+    """A catalog record a scene verb may drive: typed a scene (discovery tags
+    Alexa.SceneController as 'scene'), or untyped. Never raises."""
+    try:
+        t = str(device.get("type") or "").strip().lower()
+        return t in ("", "unknown") or "scene" in t
+    except Exception:
+        return False
 
 
 def _summarize_partial(results: list[dict]) -> str:
