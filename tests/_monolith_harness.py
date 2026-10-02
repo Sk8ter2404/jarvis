@@ -254,7 +254,8 @@ _MONOLITH_RESTORE_NAMES = (
     # schedule a real re-prime thread; a leaked worker flag would make every
     # later learn_from_turn queue a turn nobody drains. The shared gate in
     # core.local_traffic is reset in _restore_monolith_pristine.
-    "_last_owner_turn_at", "_reprime_primed_at", "_reprime_posts_mark",
+    "_last_owner_turn_at", "_prev_owner_turn_at",
+    "_reprime_primed_at", "_reprime_posts_mark",
     "_learn_pending", "_learn_worker_live",
     # Owner-only learning (2026-09-30, core/learn_gate.py): the gate's
     # follow-up window and its classifier thread's flag. A leaked window would

@@ -447,6 +447,11 @@ try:
     import command_autocorrect as _cmd_autocorrect  # type: ignore
 except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _cmd_autocorrect = None  # type: ignore
+# A guess may never land on a dangerous action (2026-10-01, see
+# _autocorrect_protected): the shared risk table, and the "turn it off" with no
+# referent question (_run_pronoun_switch_shortcut).
+from core import action_risk as _action_risk  # noqa: E402
+from core import pronoun_switch as _pronoun_switch  # noqa: E402
 _AUTOCORRECT_THRESHOLD = 0.75
 # When two candidates both clear the threshold and sit within this gap of
 # each other, the dispatcher asks 'did you mean X or Y' instead of silently
@@ -21181,6 +21186,11 @@ _utterance_in_progress = [False]
 # reply, not a turn boundary. Drives the re-prime-after-eviction window
 # (LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S). 0.0 = none yet this process.
 _last_owner_turn_at = [0.0]
+# ...and of the owner turn BEFORE it (2026-10-01): _note_owner_turn stamps the
+# current turn before routing, so "was there a turn a moment ago" (the
+# "turn it off" referent check, _run_pronoun_switch_shortcut) reads this one.
+# 0.0 = none this process.
+_prev_owner_turn_at = [0.0]
 # time.monotonic() of the last accepted owner turn that came from the MIC (not
 # typed / injected / a remote channel). "The owner spoke to JARVIS recently" —
 # the voice half of the proactive-remark presence gate (should_be_proactive).
@@ -21221,6 +21231,7 @@ def _note_owner_turn() -> None:
     thread; releasing the capture first opened a window where it saw "no
     capture, no turn, last activity > window ago" and applied the pending
     rebuild at the very start of this turn (a cold turn + a re-prime)."""
+    _prev_owner_turn_at[0] = _last_owner_turn_at[0]
     _last_owner_turn_at[0] = time.monotonic()
     _note_conversation_activity()
     _turn_in_progress[0] = True
@@ -32111,6 +32122,52 @@ def _needs_confirmation(name: str, arg: str) -> bool:
                for kw in CONFIRM_KEYWORDS)
 
 
+# ── Autocorrect safety (2026-10-01) ──────────────────────────────────────
+# Live: for "Jarvis, turn it off" the local model invented [ACTION: shutdown]
+# and the fuzzy action-name corrector routed it to shutdown_jarvis (0.78 over
+# the 0.75 floor): JARVIS shut itself down on a guess. A GUESSED name may never
+# land on an action JARVIS already treats as dangerous. No new hand list - the
+# protected set is the union of the existing classifications:
+#   _FIRE_AND_EXIT_ACTIONS       self-terminating (shutdown aliases, restart,
+#                                upgrade, overnight)
+#   _DESTRUCTIVE_REPLAY_ACTIONS  never re-fired by "do that again"
+#   CONFIRM_KEYWORDS             _needs_confirmation on the name alone
+#   core.action_risk             the web Actions tab's confirm denylist (less
+#                                its "sends" rules: a send_* draft is read back
+#                                before it goes, core/draft_preview_gate)
+# plus any alias bound to the SAME handler as one of those (the web tab's
+# _live_confirm_reason rule), so a skill alias of shutdown_jarvis is covered.
+def _autocorrect_name_protected(name: str) -> bool:
+    """By NAME: ``name`` is in one of the classifications above."""
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    return (n in _FIRE_AND_EXIT_ACTIONS
+            or n in _DESTRUCTIVE_REPLAY_ACTIONS
+            or _needs_confirmation(n, "")
+            or _action_risk.guess_protected(n))
+
+
+def _autocorrect_protected(name: str) -> bool:
+    """True when the autocorrect layer must never route a guessed action name
+    onto ``name`` (or offer it as a "did you mean"): it is protected by name,
+    or bound to the same handler as a name that is. Fails safe: any fault
+    counts as protected."""
+    try:
+        if _autocorrect_name_protected(name):
+            return True
+        fn = ACTIONS.get(name)
+        if fn is None:
+            return False
+        for other, other_fn in list(ACTIONS.items()):
+            if (other_fn is fn and other != name
+                    and _autocorrect_name_protected(other)):
+                return True
+        return False
+    except Exception:
+        return True
+
+
 # ── JARVIS pushback ──────────────────────────────────────────────────────
 # Softer-than-CONFIRM_KEYWORDS safety layer. The hard list above always
 # blocks (delete/format/buy etc.). Pushback handles the gray-zone cases the
@@ -32870,6 +32927,10 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # the pushback objections above — otherwise JARVIS goes silent awaiting a
     # "yes" the user never heard it ask for.
     _confirmation_prompts: list[str] = []
+    # Clarifying questions from a BLOCKED autocorrect guess ("Turn what off,
+    # sir?"). Like a pushback objection, the question replaces the model's
+    # prose, which described the guessed action ("Shutting down, sir.").
+    _autocorrect_clarify: list[str] = []
 
     # Mission narration — pre-scan to count [ACTION:] tokens. When the LLM
     # has chained 3+ actions in one reply, speak an opening line and emit a
@@ -32902,11 +32963,19 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             #                so the next utterance resolves the pick
             #   none       → no candidate cleared the floor; original
             #                'unknown action' path
+            #   blocked    → the guess could land on a protected action
+            #                (_autocorrect_protected: shutdown_jarvis,
+            #                restart, reset_memory, run_shell, ...). Never
+            #                run or offered: dropped, the model's prose is
+            #                not voiced, and JARVIS asks what was meant
+            #                (2026-10-01: an invented 'shutdown' for "turn it
+            #                off" was routed to shutdown_jarvis)
             try:
                 choice = _cmd_autocorrect.autocorrect_command_choice(
                     name, ACTIONS.keys(),
                     threshold=_AUTOCORRECT_THRESHOLD,
                     ambiguity_gap=_AUTOCORRECT_AMBIG_GAP,
+                    protected=_autocorrect_protected,
                 )
             except Exception as _e:
                 print(f"  [autocorrect] scoring failed for {name!r}: {_e}")
@@ -32914,6 +32983,23 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             status = choice.get("status", "none")
             primary = choice.get("primary")
             secondary = choice.get("secondary")
+            if status == "blocked":
+                b_name, b_conf = choice.get("blocked") or primary or ("?", 0.0)
+                print(f"  [autocorrect] {name!r} would only be a guess at "
+                      f"protected {b_name!r} (conf={b_conf:.2f}) — not "
+                      f"running it; asking instead")
+                _autocorrect_clarify.append(
+                    _pronoun_switch.clarifying_question(_turn_user_text()))
+                # Deliberately free of FAILURE_MARKERS and not informative:
+                # a failure would start a follow-up round in which the model
+                # could name the protected action outright.
+                results.append(
+                    (name,
+                     f"⚠  UNCLEAR: '{name}' only resembles the protected "
+                     f"action {b_name} — not guessed; asked what was meant",
+                     False),
+                )
+                return ""
             if status == "silent" and primary and primary[0] in ACTIONS:
                 best, conf = primary
                 print(f"  [autocorrect] {name!r} -> {best!r} (conf={conf:.2f})")
@@ -33193,6 +33279,12 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # _pending_confirmation queue; "yes" will run the deferred actions.
     if _pushback_objections:
         cleaned = " ".join(_pushback_objections)
+
+    # A blocked autocorrect guess: the model's prose told of the action it
+    # guessed at, so it is dropped like a pushback prelude and the owner hears
+    # the question (once, after any objection).
+    if _autocorrect_clarify:
+        cleaned = " ".join(_pushback_objections + _autocorrect_clarify[:1])
 
     # A hard-confirmation (CONFIRM_KEYWORDS) action was deferred onto
     # _pending_confirmation. The prompt MUST be spoken so the user knows a
@@ -33495,8 +33587,11 @@ def handle_autocorrect_disambig_response(user_text: str) -> bool:
     # replay_last_action destructive-action refusal). Also refuse anything the
     # normal path would confirmation- or pushback-gate, so a guessed match
     # can't slip a memory/task wipe (reset_memory, forget_last_hour, clear_tasks)
-    # or any confirm-gated action past with a plain "yes".
-    if (name in _DESTRUCTIVE_REPLAY_ACTIONS
+    # or any confirm-gated action past with a plain "yes". _autocorrect_protected
+    # (2026-10-01) is the full guess-protected set - it adds the shutdown
+    # aliases (_FIRE_AND_EXIT_ACTIONS), which this gate used to let through on
+    # "the first one", and every alias by handler.
+    if (_autocorrect_protected(name)
             or _needs_confirmation(name, arg)
             or _jarvis_pushback(name, arg) is not None):
         print(f"  [autocorrect-disambig] refusing destructive pick {name!r} "
@@ -33741,9 +33836,10 @@ _ANSWER_FIRST_MAX_WORDS = 15
 _ANSWER_FIRST_MAX_ANSWER_WORDS = 30
 # Result prefixes parse_and_run_actions records when it REPLACED or deferred
 # the prose on purpose (pushback objection, CONFIRM_KEYWORDS prompt, autocorrect
-# ambiguity). Those replies are never answer-first candidates.
+# ambiguity, a blocked autocorrect guess). Those replies are never answer-first
+# candidates.
 _ANSWER_FIRST_DEFERRED_PREFIXES = ("⚠  PUSHBACK:", "⚠  REQUIRES CONFIRMATION:",
-                                   "⚠  AMBIGUOUS:")
+                                   "⚠  AMBIGUOUS:", "⚠  UNCLEAR:")
 _ANSWER_FIRST_DIGIT_RE = re.compile(r"\d")
 # Leading prosody tag _speak strips before synthesis (core.tts.parse_wry_tag
 # shape); [intent:] / [mood:] use _INTENT_TAG_RE / _MOOD_TAG_RE.
@@ -37620,10 +37716,88 @@ def _run_voice_shortcuts(text: str) -> bool:
     if _run_timer_list_shortcut(text):
         return True
 
+    # "Jarvis, turn it off" with nothing for "it" to mean (2026-10-01): ask,
+    # never let the model guess. See _run_pronoun_switch_shortcut.
+    if _run_pronoun_switch_shortcut(text):
+        return True
+
     # Deterministic fast paths (date math, "what did I just ask", "what's my
     # name"): the last stop before the LLM, so every shortcut above keeps
     # precedence and nothing here ever arms the processing filler.
     return _run_fast_paths(text)
+
+
+def _pronoun_referent_ages() -> tuple:
+    """(prior owner turn, last executed action, media JARVIS started) ages in
+    seconds for the "turn it off" referent check; None for each that has
+    not happened this process. Never raises."""
+    prior = action = media = None
+    try:
+        prev = float(_prev_owner_turn_at[0] or 0.0)
+        if prev > 0.0:
+            prior = time.monotonic() - prev
+    except Exception:
+        pass
+    try:
+        with _action_history_lock:
+            last = dict(_action_history[-1]) if _action_history else None
+        if last and float(last.get("at") or 0.0) > 0.0:
+            action = time.time() - float(last["at"])
+    except Exception:
+        pass
+    try:
+        played = float(_jarvis_played_music_at[0] or 0.0)
+        if played > 0.0:
+            media = time.time() - played
+    except Exception:
+        pass
+    return prior, action, media
+
+
+def _run_pronoun_switch_shortcut(text: str) -> bool:
+    """A bare "turn it off" / "turn that off" / "switch it on" with NOTHING
+    for "it" to mean gets a short question - "Turn what off, sir?" - and no
+    LLM call (2026-10-01). Live, the local model answered that utterance by
+    inventing [ACTION: shutdown], which the action-name corrector mapped onto
+    shutdown_jarvis.
+
+    "Nothing to mean" uses what JARVIS tracks (core/pronoun_switch): no owner
+    turn in the last REFERENT_WINDOW_S, no action in that window
+    (_action_history), no media JARVIS started in MEDIA_REFERENT_WINDOW_S
+    (_jarvis_played_music_at), and point-to-control off (with it on, "turn
+    that off" resolves by where the owner points). With any of those the turn
+    routes to the model as before - it has the conversation, and a guess onto
+    a protected action is refused anyway (_autocorrect_protected).
+
+    Same contract as _run_fast_paths: gated by FAST_PATHS_ENABLED, logs a
+    "[fast-path]" line and the "JARVIS:" line, appends the turn, speaks,
+    returns True. Never raises: any fault falls through to the LLM."""
+    if not globals().get("FAST_PATHS_ENABLED", True):
+        return False
+    try:
+        if _pronoun_switch.switch_state(text) is None:
+            return False
+        try:
+            import core.config as _cfg_live
+            pointing = bool(getattr(_cfg_live, "KINECT_POINT_CONTROL_ENABLED",
+                                    False))
+        except Exception:
+            pointing = False
+        prior, action, media = _pronoun_referent_ages()
+        question = _pronoun_switch.referent_question(
+            text, prior_turn_age_s=prior, last_action_age_s=action,
+            media_age_s=media, pointing_enabled=pointing)
+    except Exception as _e:
+        print(f"  [fast-path] pronoun-switch check failed: {_e}")
+        return False
+    if not question:
+        return False
+    print("  [fast-path] pronoun-switch: no referent for 'it' — asking")
+    print(f"  JARVIS: {question}")
+    _append_turn(text, question)
+    _speak(question)
+    set_state("idle")
+    return True
 
 
 def _run_action_shortcut(text: str, kind: str, recognise, action_names,

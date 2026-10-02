@@ -110,7 +110,6 @@ import time
 import urllib.parse
 import uuid
 import zlib
-from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core import camera_tiles as _camera_tiles
@@ -2695,36 +2694,17 @@ def _parse_action_index(path: str) -> dict:
 # smart_home_purge_cookie (forget_alexa_login's handler) and the code
 # runner's run_python / python / eval_python / compute. So the live paths
 # confirm by HANDLER too (_live_confirm_reason): a name inherits the reason of
-# any other name bound to the same callable. The patterns below name the
-# known aliases as well, for the index fallback, which has no handlers.
-_ACTION_CONFIRM_RULES = (
-    (("*shutdown*", "*shut_down*", "*restart*", "*reboot*", "*hibernate*",
-      "sleep_pc", "*log_off*", "*logoff*", "*sign_out*", "lock_pc",
-      "lock_screen", "*relaunch*", "exit_jarvis", "quit_jarvis",
-      "*power_off*", "turn_off_jarvis"),
-     "stops or restarts JARVIS or the PC"),
-    (("send_*", "*_send", "reply_*", "*_reply", "text_*", "*_text_*",
-      "email_*", "*_email", "sms_*", "call_*", "answer_call", "decline_call",
-      "post_*", "publish_*", "share_*", "notify_*", "message_*", "*_message",
-      "announce_*", "speak_*", "say_*"),
-     "sends or says something to someone"),
-    (("archive_*", "delete_*", "*_delete", "forget_*", "*_forget", "clear_*",
-      "wipe_*", "reset_*", "*_reset", "*purge*", "remove_*", "*_remove",
-      "erase_*", "empty_*", "drop_*", "scrap_*", "uninstall_*", "unenroll_*",
-      "export_memory", "revoke_*"),
-     "deletes, resets or exports data"),
-    (("start_overnight_upgrade", "*upgrade*", "*self_update*", "apply_*",
-      "install_*", "run_shell", "run_code", "run_python", "python",
-      "eval_python", "compute", "execute_*", "*_execute", "*_script",
-      "code_*", "pip_*", "git_*", "rollback*", "*_rollback"),
-     "changes JARVIS's own code or runs code"),
-    (("type", "type_*", "hotkey", "click", "*_click", "press_*", "kill_*",
-      "close_*", "*_close", "stop_pipeline", "web_interface_off", "*_off_all",
-      "force_*", "switch_llm", "switch_model", "set_model", "use_model"),
-     "acts on the desktop or stops a running service"),
-    (("buy_*", "order_*", "pay_*", "purchase_*", "checkout*", "transfer_*"),
-     "spends money"),
-)
+# any other name bound to the same callable. The patterns name the known
+# aliases as well, for the index fallback, which has no handlers.
+#
+# The rules themselves live in core/action_risk.py since 2026-10-01: the voice
+# dispatcher's fuzzy action-name corrector reads the same classification, so a
+# GUESSED name can never land on shutdown_jarvis / reset_memory / run_shell
+# (live 2026-10-01: an invented [ACTION: shutdown] for "Jarvis, turn it off"
+# was corrected onto shutdown_jarvis). One table, two consumers, no drift.
+from core.action_risk import ACTION_CONFIRM_RULES as _ACTION_CONFIRM_RULES  # noqa: E402
+from core.action_risk import action_confirm_reason  # noqa: E402
+
 # Handled by the tray control plane's hardened teardown instead of a request
 # thread (a restart spawns a successor and exits this process mid-response).
 # Keyed by the registry name whose HANDLER the tray command runs, and matched
@@ -2737,16 +2717,6 @@ _ACTION_TIMEOUT_S = 20.0
 _ACTION_MIN_GAP_S = 1.0          # per-name double-click guard
 _action_last_call: dict = {}
 _action_rate_lock = threading.Lock()
-
-
-def action_confirm_reason(name: str) -> str:
-    """The confirm-prompt reason for action ``name``, or '' when it may run
-    on one click (see _ACTION_CONFIRM_RULES)."""
-    n = str(name or "").strip().lower()
-    for patterns, why in _ACTION_CONFIRM_RULES:
-        if any(fnmatchcase(n, p) for p in patterns):
-            return why
-    return ""
 
 
 def _live_confirm_reason(acts, name: str) -> str:
