@@ -901,6 +901,80 @@ class MicTapSharingTests(_TmpDirMixin, unittest.TestCase):
         self.assertEqual(len(bc._tap_queues), 1)
         bc.remove_record_tap.assert_called_once_with(bc._tap_queues[0])
 
+    def _fake_ap(self):
+        """core.audio_processor stand-in: ``shared`` is the get_processor()
+        singleton the MAIN mic path runs every chunk through; ``private`` is
+        what AudioProcessor() builds. Both pass audio through unchanged."""
+        ap = types.ModuleType("core.audio_processor")
+        shared = mock.MagicMock(name="shared_singleton")
+        shared.process.side_effect = lambda a, **kw: a
+        private = mock.MagicMock(name="private_processor")
+        private.process.side_effect = lambda a, **kw: a
+        private.sample_rate = 16000
+        ap.get_processor = mock.MagicMock(return_value=shared)
+        ap.AudioProcessor = mock.MagicMock(return_value=private)
+        return ap, shared, private
+
+    def test_tap_batches_never_touch_the_shared_processor(self):
+        # Audit P1-8 part 2. The tapped frames are record_speech's own mic
+        # frames, which the main path has ALREADY run through the shared
+        # get_processor() singleton (and counted in the mic-health stats).
+        # Running each 2.5 s batch through it again fed the same audio into
+        # its AGC running-RMS / flatness / noise state twice, skewing the gain
+        # the main mic path depends on. The worker must use its own processor
+        # and record no mic stats for frames the host already measured.
+        bc = self._tap_bobert()
+        bc._audio_master_enabled = [True]
+        self.mod._wake_pattern = None
+        sd = _make_sd(open_raises=AssertionError("no stream on the tap path"))
+        ap, shared, private = self._fake_ap()
+        block = (np.ones(16000 * 3, dtype=np.float32) * 0.2)
+
+        def _on_wait(n):
+            if n == 1:
+                for q in bc._tap_queues:
+                    q.put(block)
+            time.sleep(0.03)
+
+        evt = _ScriptedEvent([False, False, False, True], on_wait=_on_wait)
+        with inject_modules(sounddevice=sd, **{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_stop_evt", evt), \
+             mock.patch.object(self.mod, "_focused_window_title",
+                               return_value="Notepad"):
+            self.mod._worker_loop()
+
+        self.assertEqual(self.mod._buffer[-1]["text"], "tapped speech")
+        shared.process.assert_not_called()
+        private.process.assert_called()
+        self.assertFalse(private.process.call_args.kwargs["record_mic_stats"])
+
+    def test_own_stream_batches_use_the_private_processor_and_count(self):
+        # Fallback path (host without the tap API): still never the shared
+        # singleton, but these frames are measured nowhere else, so they DO
+        # feed the dead-mic stats (real mic, never loopback).
+        bc = _FakeBobert()
+        bc._audio_master_enabled = [True]
+        bc.transcribe = mock.MagicMock(return_value=("fallback speech", _good_conf()))
+        bc.is_valid_speech = mock.MagicMock(return_value=(True, "ok"))
+        bc.is_ambient_music = mock.MagicMock(return_value=False)
+        self.mod._wake_pattern = None
+        block = (np.ones(16000 * 3, dtype=np.float32) * 0.2)
+        stream = _FakeStream(on_start=lambda s: s.feed(block))
+        sd = _make_sd(stream=stream)
+        ap, shared, private = self._fake_ap()
+        evt = _ScriptedEvent([True])
+        with inject_modules(sounddevice=sd, **{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_stop_evt", evt), \
+             mock.patch.object(self.mod, "_focused_window_title",
+                               return_value="Notepad"):
+            self.mod._worker_loop()
+
+        self.assertEqual(self.mod._buffer[0]["text"], "fallback speech")
+        shared.process.assert_not_called()
+        self.assertTrue(private.process.call_args.kwargs["record_mic_stats"])
+
     def test_falls_back_to_stream_when_no_tap_api(self):
         # Host WITHOUT the tap API (older monolith) → the worker must still
         # function via its own dedicated InputStream (the fallback path).

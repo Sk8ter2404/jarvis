@@ -199,27 +199,54 @@ def _identify_speaker_safe(audio: np.ndarray, sample_rate: int) -> tuple[Optiona
         return None, 0.0
 
 
+# The MIC worker's own AudioProcessor (2026-10-01, audit P1-8 part 2). The
+# shared get_processor() singleton belongs to the main mic path: record_speech
+# runs every chunk through it, and its AGC running-RMS, spectral-flatness and
+# noise-spectrum state are tuned on that stream. The tapped frames ARE those
+# same chunks, so sending each batch through the singleton again fed the same
+# audio into that state twice and skewed the gain the wake word depends on.
+# This instance keeps its own state. It never receives feed_playback (only
+# the singleton does), so the worker turns AEC off rather than pretend.
+_mic_processor: list = [None]
+_mic_processor_lock = threading.Lock()
+
+
+def _mic_worker_processor(ap, sample_rate: int):
+    """The mic worker's private AudioProcessor, built on first use and
+    rebuilt only when the sample rate changes (as get_processor does)."""
+    with _mic_processor_lock:
+        proc = _mic_processor[0]
+        if proc is None or getattr(proc, "sample_rate", None) != int(sample_rate):
+            proc = ap.AudioProcessor(sample_rate=int(sample_rate))
+            _mic_processor[0] = proc
+        return proc
+
+
 def _apply_audio_processing(audio: np.ndarray,
                             sample_rate: int,
                             *,
                             enable_aec: bool = True,
                             enable_ns: bool = True,
                             enable_agc: bool = True,
-                            record_mic_stats: bool = True) -> np.ndarray:
+                            record_mic_stats: bool = True,
+                            private: bool = False) -> np.ndarray:
     """Best-effort: route a batch through core/audio_processor before it
     reaches Whisper. Falls back to the raw batch if the module isn't
     importable, the parent has disabled processing, or any layer fails.
     Loopback callers pass enable_aec=False — the loopback signal IS the
     speaker output, so echo cancellation would zero useful audio — and
     record_mic_stats=False so system-audio loudness doesn't pollute the
-    mic-only silent-mic / stress stats (2026-07-14 bug-hunt #17)."""
+    mic-only silent-mic / stress stats (2026-07-14 bug-hunt #17).
+    private=True uses the mic worker's own processor instead of the shared
+    singleton (see _mic_processor)."""
     b = _get_bobert()
     if b is not None and not bool(getattr(b, "_audio_master_enabled", [True])[0]):
         return audio
     try:
         _ensure_project_on_path()
         from core import audio_processor as ap  # type: ignore
-        proc = ap.get_processor(int(sample_rate))
+        proc = (_mic_worker_processor(ap, sample_rate) if private
+                else ap.get_processor(int(sample_rate)))
         return proc.process(
             audio,
             enable_aec=enable_aec,
@@ -1215,10 +1242,15 @@ def _worker_loop() -> None:
                 _prev_mic_batch[0] = None
                 continue
 
-            # Apply the three-layer cleanup (AEC → NS → AGC) so
-            # whatever Whisper sees has JARVIS's own playback,
-            # stationary background noise, and gain drift removed.
-            audio = _apply_audio_processing(audio, sample_rate)
+            # Noise suppression + gain on the worker's OWN processor, never
+            # the main mic path's shared singleton (see _mic_processor). On
+            # the tap path record_speech already measured these frames for
+            # the mic-health stats, so they are not counted twice; frames
+            # from our own stream are measured nowhere else, so they are.
+            audio = _apply_audio_processing(audio, sample_rate,
+                                            enable_aec=False,
+                                            record_mic_stats=tap_q is None,
+                                            private=True)
 
             if stt_yield is not None and stt_yield.must_park():
                 stt_yield.park(audio, rms, time.time(),
