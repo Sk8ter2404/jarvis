@@ -59,6 +59,9 @@ BASE_SYSTEM_PROMPT = (
     "yourself as Gemma, Qwen, Claude, GPT, Llama, or any other model, and never "
     "say you were made by Google, OpenAI, Anthropic, Meta, or Alibaba. If asked "
     "who you are or who created you, you are JARVIS, sir's own assistant. "
+    "That rule is about identity, not secrecy: asked what runs you or how "
+    "capable you are, answer honestly with the engine and its limits (see "
+    "SELF-KNOWLEDGE) — never a deflecting joke. "
     "\n\n"
     "Style: BY DEFAULT respond in 1–2 sentences. LEAD WITH THE VERDICT — the "
     "answer or the headline first, supporting detail (if any) second. Never "
@@ -444,6 +447,331 @@ PC_CONTROL_SAFETY_RULES = (
     "a close name for the RIGHT subject is corrected for you. The wrong "
     "subject is the only thing you must never send.\n\n"
 )
+
+
+# ─── SELF-KNOWLEDGE (2026-10-01) ────────────────────────────────────────
+# Live 2026-10-01 20:56-20:58 the owner asked three times how smart JARVIS is
+# next to Claude Opus 5.5 and other JARVIS-like assistants, and got a joke
+# every time. Nothing in the prompt said what JARVIS runs on, how fast he is,
+# or where he is strong and weak — and BASE_SYSTEM_PROMPT's identity rule
+# ("never introduce yourself as Gemma / Claude") read as "never say".
+#
+# The section is RENDERED, not a literal: the model tags are read at render
+# time (self_knowledge_facts), because set_model / switch_llm change them at
+# runtime and a tag frozen into prompt text is the stale-duplicate bug class.
+# core.prompt_router renders it per turn on the local route, in the volatile
+# tail, so the KV-cached prefix never holds a value that can change.
+# PC_CONTROL_PROMPT carries a STATIC copy (the cloud route ships the full
+# prompt): it names no tag and points at [ACTION: current_model] instead, and
+# it is worded for the cloud model reading it (review 2026-10-02).
+#
+# NUMBERS THAT CHANGE — update the value AND its date when re-measured.
+# Median end-of-speech -> first audio on the live box (core/turn_timing).
+SELF_KNOWLEDGE_TURN_LATENCY_S = 6.8
+SELF_KNOWLEDGE_LATENCY_MEASURED_ON = "2026-10-01"
+# What the latency work is cutting that same measurement toward.
+SELF_KNOWLEDGE_LATENCY_TARGET_S = 2.0
+# Which graphics card runs which stage on the REFERENCE desk. Named only when
+# the brain is on this machine (self_knowledge_facts' brain_remote): an edge
+# node whose brain is another box over the network has neither card (review
+# 2026-10-02). Edit for another box.
+SELF_KNOWLEDGE_BRAIN_GPU = "the RTX 3090"
+SELF_KNOWLEDGE_STT_GPU = "the GTX 1650 SUPER"
+SELF_KNOWLEDGE_HARDWARE_AS_OF = "2026-10-01"
+
+# The speaking voice per TTS backend (core.config TTS_BACKEND, switchable at
+# runtime): (what to call it, whether the text of every reply leaves the
+# machine to be synthesised). Read live, never hand-written into the section
+# (review 2026-10-02: it said "Kokoro on the CPU" while the shipped default is
+# edge-tts, Microsoft's online voice).
+_SELF_KNOWLEDGE_VOICES = {
+    "kokoro": ("the Kokoro voice on this PC's CPU", False),
+    "xtts": ("a cloned XTTS voice on this PC's graphics card", False),
+    "pyttsx3": ("the offline Windows voice", False),
+    "edge": ("Microsoft's online neural voice (edge-tts)", True),
+}
+
+SELF_KNOWLEDGE_HEADER = (
+    "SELF-KNOWLEDGE (how capable you really are — engines, speed, strengths, "
+    "limits):")
+# The section's last line: retarget_self_knowledge finds the end by it.
+_SELF_KNOWLEDGE_LAST_LINE = (
+    "  A bare 'what model are you using' may still take "
+    "[ACTION: current_model].\n\n")
+
+
+def _str_value(value) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def self_knowledge_facts() -> dict:
+    """The live engine facts the SELF-KNOWLEDGE section names, read NOW.
+
+    Never raises and never touches the network: a prompt render must not probe
+    Ollama (bobert_companion._get_local_llm_model can), so the resolver's
+    CACHE is read instead. The monolith is looked up in sys.modules only
+    (boot aliases it as ``bobert_companion``), never imported.
+
+      local_model   resolver cache (what the next local turn runs on;
+                    set_model repoints it) -> JARVIS_LOCAL_LLM_MODEL ->
+                    monolith LOCAL_LLM_MODEL -> core.config.LOCAL_LLM_MODEL —
+                    the resolver's own order, minus its Ollama probe.
+      cloud_model   monolith CLAUDE_MODEL -> core.config.CLAUDE_MODEL.
+      deep_model    core.diagnostic_daemons.DEEP_AUDIT_MODEL (unattended deep
+                    jobs; JARVIS_DEEP_AUDIT_MODEL overrides it there).
+      action_count  distinct HANDLERS in the monolith's ACTIONS (an alias is
+                    not another action), 0 when unknown.
+      tts_backend   monolith TTS_BACKEND (the voice knob switches it live) ->
+                    core.config.TTS_BACKEND.
+      brain_remote  LOCAL_LLM_BASE_URL points off this machine (an edge node;
+                    core.ollama_opts.endpoint_is_remote).
+    """
+    import os
+    import sys
+    facts = {"local_model": "", "cloud_model": "", "deep_model": "",
+             "action_count": 0, "tts_backend": "", "brain_remote": False}
+    bc = sys.modules.get("bobert_companion")
+    try:
+        from core import config as cfg
+    except Exception:
+        cfg = None
+    try:
+        cache = getattr(bc, "_RESOLVED_LOCAL_LLM_MODEL", None)
+        cached = _str_value(cache[0]) if isinstance(cache, list) and cache else ""
+        facts["local_model"] = (
+            cached
+            or _str_value(os.environ.get("JARVIS_LOCAL_LLM_MODEL"))
+            or _str_value(getattr(bc, "LOCAL_LLM_MODEL", None))
+            or _str_value(getattr(cfg, "LOCAL_LLM_MODEL", None)))
+    except Exception:
+        pass
+    try:
+        facts["cloud_model"] = (_str_value(getattr(bc, "CLAUDE_MODEL", None))
+                                or _str_value(getattr(cfg, "CLAUDE_MODEL", None)))
+    except Exception:
+        pass
+    try:
+        from core.diagnostic_daemons import DEEP_AUDIT_MODEL
+        facts["deep_model"] = _str_value(DEEP_AUDIT_MODEL)
+    except Exception:
+        pass
+    try:
+        actions = getattr(bc, "ACTIONS", None)
+        if isinstance(actions, dict):
+            facts["action_count"] = len({id(fn) for fn in actions.values()
+                                         if callable(fn)})
+    except Exception:
+        pass
+    try:
+        facts["tts_backend"] = (
+            _str_value(getattr(bc, "TTS_BACKEND", None))
+            or _str_value(getattr(cfg, "TTS_BACKEND", None))).lower()
+    except Exception:
+        pass
+    try:
+        from core.ollama_opts import endpoint_is_remote
+        url = (_str_value(getattr(bc, "LOCAL_LLM_BASE_URL", None))
+               or _str_value(getattr(cfg, "LOCAL_LLM_BASE_URL", None)))
+        facts["brain_remote"] = bool(endpoint_is_remote(url))
+    except Exception:
+        pass
+    return facts
+
+
+def _model_label(tag: str) -> str:
+    """'Claude Opus 5.5 (claude-opus-5-5)' for a catalogued cloud tag, else
+    the tag itself. Never raises."""
+    if not tag:
+        return ""
+    try:
+        from core.model_catalog import by_id
+        entry = by_id(tag)
+        if entry is not None and entry.backend == "claude":
+            return f"{entry.label} ({tag})"
+    except Exception:
+        pass
+    return tag
+
+
+def _model_name(tag: str) -> str:
+    """'Claude Opus 5.5' for a catalogued cloud tag, else the tag: the form
+    for every mention after the first (review 2026-10-02 - "Claude Opus 5.5
+    (claude-opus-5-5)" appeared three times, inviting the tag to be read out
+    character by character). Never raises."""
+    if not tag:
+        return ""
+    try:
+        from core.model_catalog import by_id
+        entry = by_id(tag)
+        if entry is not None and entry.backend == "claude":
+            return entry.label
+    except Exception:
+        pass
+    return tag
+
+
+def _voice_and_privacy(facts):
+    """(the hardware line, the privacy clause) from the live facts; the
+    hedged forms when ``facts`` is None (the static copy)."""
+    if facts is None:
+        hardware = (f"on the reference desk the local brain runs on "
+                    f"{SELF_KNOWLEDGE_BRAIN_GPU} and Whisper speech "
+                    f"recognition on {SELF_KNOWLEDGE_STT_GPU}; the voice is "
+                    f"whichever engine he has chosen")
+        privacy = ("local-first privacy, so his conversations stay on his "
+                   "own machines unless the cloud is used (an online voice, "
+                   "if chosen, sends your spoken replies out to be "
+                   "synthesised)")
+        return hardware, privacy
+    backend = (facts.get("tts_backend") or "").strip().lower()
+    voice, online = _SELF_KNOWLEDGE_VOICES.get(
+        backend, (f"the {backend} voice" if backend else "your voice engine",
+                  None))
+    if facts.get("brain_remote"):
+        hardware = ("the local brain runs on another machine on his network; "
+                    f"speech recognition and {voice} run on this one")
+        where = "his own machines"
+    else:
+        hardware = (f"the local brain runs on {SELF_KNOWLEDGE_BRAIN_GPU}, "
+                    f"Whisper speech recognition on {SELF_KNOWLEDGE_STT_GPU}, "
+                    f"and {voice}")
+        where = "this machine"
+    privacy = (f"local-first privacy, so his conversations stay on {where} "
+               "unless the cloud is used")
+    if online:
+        privacy += (" - though your spoken replies do go to Microsoft, which "
+                    "the online voice needs to synthesise them")
+    return hardware, privacy
+
+
+def _build_self_knowledge(facts, route: str = "local") -> str:
+    """The section text, one line per point.
+
+    ``facts`` None = the STATIC copy (no model tags) that PC_CONTROL_PROMPT
+    carries, which the CLOUD route reads (the local route swaps
+    PC_CONTROL_PROMPT out and renders the live copy instead). ``route``:
+    "local" - the turn is answered by the local brain (core.prompt_router's
+    per-turn render); "cloud" - by the cloud model (the static copy, and a
+    local turn that failed over to the cloud, retarget_self_knowledge). The
+    cloud form never calls itself the local brain or offers the cloud it is
+    already on (review 2026-10-02)."""
+    cloud_route = route == "cloud" or facts is None
+    if facts is None:
+        engines = ("  Engines: this copy carries no model tags, because they "
+                   "change at runtime. It is the cloud route's copy: unless "
+                   "this turn says otherwise, you are answering on the cloud "
+                   "model, not your local brain (which answers most turns). "
+                   "Asked which model runs you, run [ACTION: current_model] "
+                   "rather than guess a tag.\n")
+        cloud = "the cloud model"
+        deep = "the deep Claude model"
+        actions = "hundreds of"
+    else:
+        local = facts.get("local_model") or "your local model"
+        cloud_tag = facts.get("cloud_model") or ""
+        deep_tag = facts.get("deep_model") or ""
+        cloud_full = _model_label(cloud_tag) or "the cloud model"
+        deep_full = _model_label(deep_tag) or "the deep Claude model"
+        cloud = _model_name(cloud_tag) or "the cloud model"
+        deep = _model_name(deep_tag) or "the deep Claude model"
+        if cloud_route:
+            engines = (f"  Engines (live): this turn is answered by the cloud "
+                       f"model, {cloud_full} - not your local brain, {local}, "
+                       f"which answers most turns. Deep unattended jobs run "
+                       f"on {deep_full}.\n")
+        else:
+            engines = (f"  Engines (live): you are answering on your LOCAL "
+                       f"brain, {local}. Cloud chat runs on {cloud_full}. "
+                       f"Deep unattended jobs run on {deep_full}.\n")
+        count = facts.get("action_count") or 0
+        actions = str(count) if count else "hundreds of"
+    hardware, privacy = _voice_and_privacy(facts)
+    if cloud_route:
+        weak = ("  Weak at: the local brain that answers most turns is an "
+                "open model sized for one graphics card, far below the cloud "
+                "on hard multi-step reasoning, long maths and big code; local "
+                "turns are slow; and you can mishear him.\n")
+        offer = ("  This turn is already on the cloud, so do not offer to "
+                 "switch to it; 'go back to auto' returns him to the local "
+                 f"brain. Never promise {deep} will answer him live: it runs "
+                 "only unattended jobs (the code audit, overnight ideas).\n")
+    else:
+        weak = ("  Weak at: the local brain is an open model sized for one "
+                f"graphics card, far below {deep} on hard multi-step "
+                "reasoning, long maths and big code; turns are slow; and you "
+                "can mishear him.\n")
+        offer = ("  For a genuinely hard question, say plainly that the cloud "
+                 "is stronger and offer it. On his yes, "
+                 f"[ACTION: set_brain, cloud] — {cloud} answers from then on, "
+                 f"and 'go back to auto' returns. Never promise {deep} will "
+                 "answer him live: it runs only unattended jobs (the code "
+                 "audit, overnight ideas).\n")
+    return (
+        SELF_KNOWLEDGE_HEADER + "\n"
+        "  Asked how smart or good you are, what model runs you, or how you "
+        "compare to Claude, Opus, GPT or other JARVIS-style assistants: answer "
+        "HONESTLY and CONCRETELY, in character, from the facts below, in two "
+        "to four plain sentences. Never dodge it with a joke; a dry line may "
+        "FOLLOW the real answer, never replace it. No false modesty, no "
+        "boasting.\n"
+        + engines +
+        f"  Speed: about {SELF_KNOWLEDGE_TURN_LATENCY_S:g} s from the end of "
+        f"his sentence to your first word (median, measured "
+        f"{SELF_KNOWLEDGE_LATENCY_MEASURED_ON}); work is under way to cut it "
+        f"toward ~{SELF_KNOWLEDGE_LATENCY_TARGET_S:g} s.\n"
+        f"  Hardware (as of {SELF_KNOWLEDGE_HARDWARE_AS_OF}): {hardware}.\n"
+        f"  Strong at: {actions} actions across his PC, apps and smart home; "
+        f"cameras and the Kinect; a robot; {privacy}; and memory of him "
+        "across weeks.\n"
+        + weak + offer +
+        "  Never claim to BE Opus, Claude or GPT: you are JARVIS, and naming "
+        "the engine you run on is candour, not a change of identity. Never "
+        "invent benchmark scores or rankings; you have no live data on other "
+        "assistants, so compare on what you know of yourself. Say a model "
+        "tag as a person would ('Gemma 4, 26 billion parameters'), never "
+        "character by character.\n"
+        + _SELF_KNOWLEDGE_LAST_LINE)
+
+
+def render_self_knowledge_section(facts=None, route: str = "local") -> str:
+    """SELF-KNOWLEDGE with LIVE values — ``facts`` None reads them now
+    (self_knowledge_facts). ``route`` "local" is what core.prompt_router
+    ships on the local route; "cloud" is for a turn the cloud model answers.
+    Never raises: any failure returns the static copy."""
+    try:
+        return _build_self_knowledge(
+            self_knowledge_facts() if facts is None else facts, route=route)
+    except Exception:
+        return _SELF_KNOWLEDGE_STATIC
+
+
+def retarget_self_knowledge(text, route: str = "cloud", facts=None):
+    """``text`` with a rendered SELF-KNOWLEDGE section in it re-rendered for
+    ``route``. A local turn that fails over to the cloud
+    (bobert_companion._local_then_cloud_or_honest) carries the LOCAL render
+    in its user message - "you are answering on your LOCAL brain, <tag>" -
+    and the cloud model would then claim to be that model (review
+    2026-10-02). Text without the section, or not a string, comes back
+    unchanged. Never raises."""
+    if not isinstance(text, str):
+        return text
+    try:
+        start = text.find(SELF_KNOWLEDGE_HEADER)
+        if start < 0:
+            return text
+        end = text.find(_SELF_KNOWLEDGE_LAST_LINE, start)
+        if end < 0:
+            return text
+        end += len(_SELF_KNOWLEDGE_LAST_LINE)
+        return (text[:start] + render_self_knowledge_section(facts, route=route)
+                + text[end:])
+    except Exception:
+        return text
+
+
+# The static copy spliced into PC_CONTROL_PROMPT (and so the cloud route).
+_SELF_KNOWLEDGE_STATIC = _build_self_knowledge(None, route="cloud")
+
 
 PC_CONTROL_PROMPT = (
     "\n\nYou can control this PC by including special action tokens in your "
@@ -904,6 +1232,7 @@ PC_CONTROL_PROMPT = (
     "  A smarter / faster / better model for this hardware starts from what\n"
     "  is installed: list_models first, never a made-up comparison.\n"
     "\n"
+    + _SELF_KNOWLEDGE_STATIC +
     "BARGE-IN (conditional — check the prerequisite before you promise it):\n"
     "  Talking over you does NOTHING on its own. The legacy loudness/headset\n"
     "  watcher is hard-disabled in code (its mic-stream teardown crashed the\n"
@@ -1132,7 +1461,10 @@ PC_CONTROL_PROMPT = (
     "                                  plus the printer's gcode state. Use when\n"
     "                                  the user says 'is the printer overlay up',\n"
     "                                  'bambu overlay status', 'where's the print\n"
-    "                                  widget'.\n\n"
+    "                                  widget'.\n"
+    "  show_printer_camera          — open the H2D chamber-camera video panel\n"
+    "    ('show me the printer camera', 'pull up the chamber cam'); NOT\n"
+    "    bambu_overlay_on (status widget). hide_printer_camera closes it.\n\n"
     "CALENDAR (read the user's schedule — prefer this over morning_briefing for\n"
     "any bare 'what's on my calendar / schedule' question; morning_briefing is\n"
     "the whole-briefing re-run, NOT a calendar lookup):\n"

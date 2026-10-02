@@ -78,6 +78,8 @@ NOT_PROACTIVE = {
                                "capture sources",
     "PROACTIVE_REQUIRE_FACE": "a condition on proactive comments",
     "PROACTIVE_REQUIRE_OWNER_VOICE": "a condition on proactive comments",
+    "PRESENCE_HOLD_ENABLED": "a condition on queued proactive lines: they "
+                             "wait while he is away or the room is talking",
     "NEWS_BRIEFING_ENABLED": "headlines inside the morning / evening "
                              "briefings, no thread of its own",
     "NEWS_BRIEFING_SUMMARIZE": "how the briefing headlines are worded",

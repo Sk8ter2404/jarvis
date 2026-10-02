@@ -1039,10 +1039,34 @@ class FollowupRoundIsRatchetedElsewhereTests(unittest.TestCase):
         # wrong reason is worse than no guard.
         body = "\n".join(line.split("#", 1)[0]
                          for line in src[start:end].split("\n"))
-        self.assertIn("_with_turn_context(", body,
-                      "get_followup_response no longer sends a turn context "
-                      "at all — the follow-up round is back to whatever the "
-                      "reused system prompt happens to carry")
+        # Since the local prompt budget (2026-10-01) the follow-up attaches
+        # its turn context through _fit_local_messages, which must itself
+        # attach with _with_turn_context.
+        fit_start = src.index("def _fit_local_messages")
+        fit_body = "\n".join(
+            line.split("#", 1)[0] for line in
+            src[fit_start:src.index("\ndef ", fit_start + 1)].split("\n"))
+        self.assertIn("attach=_with_turn_context", fit_body,
+                      "_fit_local_messages no longer attaches the turn "
+                      "context with _with_turn_context")
+        # Since 2026-10-02 the local round fits through _fit_followup_round
+        # (the owner's request pinned, big results clipped), which must in
+        # turn go through _fit_local_messages.
+        if "_fit_followup_round(" in body:
+            fr_start = src.index("def _fit_followup_round")
+            fr_body = "\n".join(
+                line.split("#", 1)[0] for line in
+                src[fr_start:src.index("\ndef ", fr_start + 1)].split("\n"))
+            self.assertIn("_fit_local_messages(", fr_body,
+                          "_fit_followup_round no longer fits through "
+                          "_fit_local_messages")
+        self.assertTrue(
+            "_with_turn_context(" in body
+            or "_fit_local_messages(" in body
+            or "_fit_followup_round(" in body,
+            "get_followup_response no longer sends a turn context "
+            "at all — the follow-up round is back to whatever the "
+            "reused system prompt happens to carry")
         self.assertIn("_last_turn_pc_block[0]", body,
                       "get_followup_response stopped carrying the primary "
                       "turn's turn_pc_block() bodies (_last_turn_pc_block). "
@@ -1409,3 +1433,426 @@ class GlobeRoutingTests(unittest.TestCase):
                   "ping the router", "what's on the spinner"):
             with self.subTest(q=q):
                 self.assertNotIn("GLOBE", self._inc(q))
+
+
+
+def _names_in(text: str, action: str) -> bool:
+    """True when ``action`` appears as a whole name in ``text`` — the same
+    test the brain eval applies (the model can only emit what it was shown)."""
+    return re.search(r"(?<![a-z0-9_])" + re.escape(action) + r"(?![a-z0-9_])",
+                     text) is not None
+
+
+class BrainEvalRouterMissRegressionTests(unittest.TestCase):
+    """2026-10-01 brain eval: eight utterances whose correct action never
+    reached the local prompt, so no model could pick it. Each case below is
+    the eval's own utterance (and, for a follow-up, its history) and fails
+    when the expected action's name is absent from what the router ships
+    (turn_pc_block + stable_pc_block — the wire layout)."""
+
+    def setUp(self):
+        self.stable = pr.stable_pc_block(FULL)
+
+    def _ships(self, utterance, action, history=None):
+        if history is None:
+            turn = pr.turn_pc_block(utterance, FULL)
+        else:
+            turn = pr.turn_pc_block(utterance, FULL, history=history)
+        self.assertTrue(
+            _names_in(turn + self.stable, action),
+            f"{utterance!r} ships no {action}: the router selected "
+            f"{pr.select_sections(utterance, pr.split_pc_control(FULL)[1])[0]}")
+
+    # -- single-turn misses: vocabulary the keyword lists lacked -----------
+    def test_media05_kill_the_sound_ships_volume_mute(self):
+        self._ships("Jarvis, kill the sound completely.", "volume_mute")
+
+    def test_print04_chamber_cam_ships_show_printer_camera(self):
+        # The action was registered but documented in NO section, so this
+        # needed a prompt line as well as routing.
+        self._ships("Jarvis, let me see the chamber cam on the printer.",
+                    "show_printer_camera")
+
+    def test_sys02_video_memory_ships_gpu_usage(self):
+        self._ships("Jarvis, how much video memory is free right now?",
+                    "gpu_usage")
+
+    def test_cam01_where_am_i_sitting_ships_situational_awareness(self):
+        self._ships("Jarvis, can you tell where I'm sitting right now?",
+                    "situational_awareness")
+
+    def test_mem01_chatting_about_ships_session_memory_recall(self):
+        self._ships("Jarvis, sum up what we've been chatting about today.",
+                    "session_memory_recall")
+
+    def test_mem03_scrub_the_past_hour_ships_forget_last_hour(self):
+        self._ships("Jarvis, scrub everything from the past hour.",
+                    "forget_last_hour")
+
+    # -- follow-ups: the action lives in the PREVIOUS user turn -----------
+    TIMER_HISTORY = [
+        {"role": "user", "content": "Jarvis, set a timer for ten minutes."},
+        {"role": "assistant",
+         "content": "Ten minutes, starting now, sir. [ACTION: set_timer, 10 minutes]"},
+    ]
+    PRINT_HISTORY = [
+        {"role": "user", "content": "Jarvis, how's the print going?"},
+        {"role": "assistant", "content": "Checking, sir. [ACTION: check_print]"},
+        {"role": "assistant",
+         "content": "Layer 212 of 480, sir, about an hour and ten minutes left."},
+    ]
+
+    def test_fu02_cancel_that_after_a_timer_ships_cancel_timer(self):
+        self._ships("Never mind, cancel that.", "cancel_timer",
+                    history=self.TIMER_HISTORY)
+
+    def test_fu08_pause_it_after_a_print_check_ships_pause_print(self):
+        self._ships("Pause it.", "pause_print", history=self.PRINT_HISTORY)
+        # ...without losing what the words alone route to.
+        turn = pr.turn_pc_block("Pause it.", FULL, history=self.PRINT_HISTORY)
+        self.assertTrue(_names_in(turn, "pause_music"))
+
+    def test_history_may_or_may_not_already_hold_the_current_turn(self):
+        # Live: _call_llm appends the turn to conversation_history BEFORE it
+        # builds the prompt. The eval harness passes the prior turns only.
+        u = "Pause it."
+        live = self.PRINT_HISTORY + [{"role": "user", "content": u}]
+        self.assertEqual(pr.turn_pc_block(u, FULL, history=live),
+                         pr.turn_pc_block(u, FULL, history=self.PRINT_HISTORY))
+        self.assertNotEqual(pr.turn_pc_block(u, FULL, history=live),
+                            pr.turn_pc_block(u, FULL))
+
+    def test_slim_prompt_routes_follow_ups_the_same_way(self):
+        # slim_pc_control is the non-split fallback of the same call site.
+        slim = pr.slim_pc_control("Never mind, cancel that.", FULL,
+                                  history=self.TIMER_HISTORY)
+        self.assertTrue(_names_in(slim, "cancel_timer"))
+
+    def test_what_about_tomorrow_inherits_the_weather_turn(self):
+        hist = [{"role": "user", "content": "Jarvis, what's it like outside?"},
+                {"role": "assistant", "content": "One moment, sir."}]
+        self._ships("And what about tomorrow?", "weather_briefing", history=hist)
+
+    def test_a_chain_of_follow_ups_reaches_back_one_more_turn(self):
+        hist = self.TIMER_HISTORY + [
+            {"role": "user", "content": "Make it fifteen."},
+            {"role": "assistant", "content": "Fifteen it is, sir."},
+        ]
+        self._ships("Actually, cancel it.", "cancel_timer", history=hist)
+
+    def test_a_self_contained_turn_does_not_inherit_the_last_topic(self):
+        # Only a SHORT, elliptical turn borrows the previous turn's routing;
+        # a turn that names its own subject must not drag the printer in.
+        for u in ("Jarvis, what's the weather like this afternoon?",
+                  "Jarvis, open Notepad for me.",
+                  "Jarvis, turn on the office lights and set them to fifty percent."):
+            with self.subTest(u=u):
+                self.assertEqual(
+                    pr.turn_pc_block(u, FULL, history=self.PRINT_HISTORY),
+                    pr.turn_pc_block(u, FULL))
+
+    def test_no_history_routes_exactly_as_before(self):
+        for u in ("Pause it.", "Never mind, cancel that.", "turn it off"):
+            with self.subTest(u=u):
+                self.assertEqual(pr.turn_pc_block(u, FULL, history=None),
+                                 pr.turn_pc_block(u, FULL))
+                self.assertEqual(pr.turn_pc_block(u, FULL, history=[]),
+                                 pr.turn_pc_block(u, FULL))
+
+    def test_elliptical_detection(self):
+        ell = pr.is_elliptical_followup
+        for u in ("what about tomorrow", "And what about tomorrow?",
+                  "and the other one", "Pause it.", "Never mind, cancel that.",
+                  "Make them a bit dimmer.", "Jarvis, turn it off.",
+                  "Skip this one."):
+            with self.subTest(u=u):
+                self.assertTrue(ell(u))
+        for u in ("", "Jarvis, open Notepad for me.", "what time is the game",
+                  "set a timer for ten minutes",
+                  # a demonstrative before a noun names its own subject
+                  "what's the weather like this afternoon",
+                  "cancel that timer", "set a timer for one minute",
+                  "turn it off and then open the browser on the left monitor "
+                  "and play some music"):
+            with self.subTest(u=u):
+                self.assertFalse(ell(u))
+
+    def test_the_turns_never_fuse_into_a_phrase(self):
+        # Current + previous are routed as separate lines: a keyword may not
+        # match across the seam ("...that" + "jarvis ..." is not a phrase).
+        text = pr.routing_text("cancel that", [
+            {"role": "user", "content": "timer for ten minutes"}])
+        self.assertIn("\n", text)
+        self.assertTrue(text.startswith("cancel that"))
+        self.assertFalse(pr._keyword_hit("that timer", " " + text + " "))
+
+    def test_the_live_call_site_passes_the_history(self):
+        """Source scan, no import (keeps this file on the light-deps tier):
+        _call_llm must hand the conversation to both router entry points,
+        or the follow-up routing above exists only in tests."""
+        path = os.path.join(_PROJECT, "bobert_companion.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        start = src.index("def _call_llm(")
+        end = src.index("\ndef ", start)
+        body = "\n".join(line.split("#", 1)[0]
+                         for line in src[start:end].split("\n"))
+        self.assertRegex(body, r"turn_pc_block\([^)]*history=")
+        self.assertRegex(body, r"slim_pc_control\([^)]*history=")
+
+
+class BambuCameraDocumentedTests(unittest.TestCase):
+    """show_printer_camera was registered (skills/holographic_overlay) but no
+    PC_CONTROL section documented it, so 'show me the printer camera' could
+    only ever reach the status read-back (bambu_camera_status)."""
+
+    def test_printer_section_documents_show_and_hide(self):
+        _core, sections = pr.split_pc_control(FULL)
+        body = dict(sections)["BAMBU 3D PRINTER"]
+        self.assertTrue(_names_in(body, "show_printer_camera"))
+        self.assertTrue(_names_in(body, "hide_printer_camera"))
+
+    def test_camera_phrasings_route_to_the_printer_section(self):
+        _core, sections = pr.split_pc_control(FULL)
+        for u in ("show me the printer camera", "pull up the chamber cam",
+                  "close the printer camera"):
+            with self.subTest(u=u):
+                self.assertIn("BAMBU 3D PRINTER",
+                              pr.select_sections(u, sections)[0])
+
+
+class SplitTurnBlockTests(unittest.TestCase):
+    """split_turn_block hands the prompt budget (core/prompt_budget) the turn's
+    sections one by one so an overflowing turn can drop whole ones. It must
+    give back exactly the sections turn_pc_block selected, and join back to
+    the identical bytes, or a turn that fits would be sent changed."""
+
+    # Every _SPLIT_CORPUS shape plus a many-section turn (the live overflow
+    # shape: a long list of device / service names) and a runtime-rendered
+    # section (SELF-KNOWLEDGE).
+    _CORPUS = _SPLIT_CORPUS + [
+        "kinect depth, the 3d printer, netflix and hulu, browser agent, "
+        "queue a task",
+        "how smart are you",
+    ]
+
+    def test_round_trips_to_the_same_bytes(self):
+        for u in self._CORPUS:
+            with self.subTest(u=u):
+                block = pr.turn_pc_block(u, FULL)
+                parts = pr.split_turn_block(block)
+                self.assertEqual("\n".join(t for _h, t in parts), block)
+
+    def test_headers_are_the_selected_sections_in_order(self):
+        _core, sections = pr.split_pc_control(FULL)
+        for u in self._CORPUS:
+            with self.subTest(u=u):
+                inc, _drop = pr.select_sections(u, sections)
+                inc = set(inc)
+                want = [h.strip() for h, _b in sections
+                        if h.strip() in inc
+                        and h.strip().upper() not in pr._ALWAYS]
+                got = [h for h, _t in
+                       pr.split_turn_block(pr.turn_pc_block(u, FULL))]
+                self.assertEqual(got, want)
+
+    def test_the_many_section_turn_really_has_many(self):
+        parts = pr.split_turn_block(pr.turn_pc_block(self._CORPUS[-2], FULL))
+        self.assertGreaterEqual(len(parts), 4)
+
+    def test_text_without_headers_is_one_unnamed_part(self):
+        self.assertEqual(pr.split_turn_block(""), [])
+        self.assertEqual(pr.split_turn_block("B" * 50), [("", "B" * 50)])
+        lead = "loose line\nMUSIC CONTROLS:\nbody"
+        self.assertEqual(pr.split_turn_block(lead),
+                         [("", "loose line"), ("MUSIC CONTROLS", "MUSIC CONTROLS:\nbody")])
+
+    def test_never_raises(self):
+        self.assertEqual(pr.split_turn_block(None), [])
+        self.assertEqual(pr.split_turn_block(12345), [("", 12345)])
+
+
+# ── Review fixes (2026-10-02) ─────────────────────────────────────────────
+
+_SELF_TERMINATING = ("shutdown_jarvis", "shut_down", "exit_jarvis",
+                     "quit_jarvis", "power_off_jarvis", "turn_off_jarvis",
+                     "restart", "upgrade", "start_overnight_upgrade")
+
+
+def _hist(*user_turns):
+    out = []
+    for u in user_turns:
+        out.append({"role": "user", "content": u})
+        out.append({"role": "assistant", "content": "Very good, sir."})
+    return out
+
+
+class FollowupNeverInheritsSelfTerminationTests(unittest.TestCase):
+    """Review 2026-10-02 (high): routing on history added the previous turn's
+    self-termination sections to a short follow-up. 'Okay, turn it off.'
+    after a turn that mentioned a shutdown shipped SHUTDOWN ALIASES - the
+    exact name shutdown_jarvis, which runs at once - in the 10-01 incident's
+    own setting. A section documenting a self-terminating action routes only
+    on the current turn's own words."""
+
+    CASES = (
+        ("Jarvis, why did you shut down earlier?", "Okay, turn it off."),
+        ("Restart the router", "Turn it off and on."),
+        ("Should we upgrade the firmware?", "Yes, do that."),
+        ("Jarvis, are you going to restart tonight?", "Pause it."),
+    )
+
+    def test_no_self_terminating_name_rides_the_history(self):
+        for prev, cur in self.CASES:
+            with self.subTest(prev=prev, cur=cur):
+                turn = pr.turn_pc_block(cur, FULL, history=_hist(prev))
+                for name in _SELF_TERMINATING:
+                    self.assertFalse(_names_in(turn, name),
+                                     f"{cur!r} after {prev!r} ships {name}")
+
+    def test_the_current_turn_still_routes_them_on_its_own_words(self):
+        for u, name in (("Jarvis, restart yourself.", "restart"),
+                        ("Jarvis, shut down jarvis completely.",
+                         "shutdown_jarvis")):
+            with self.subTest(u=u):
+                turn = pr.turn_pc_block(u, FULL, history=_hist("hello"))
+                self.assertTrue(_names_in(turn, name))
+
+    def test_which_sections_document_a_self_terminating_action(self):
+        _core, sections = pr.split_pc_control(FULL)
+        flagged = {h.strip() for h, b in sections
+                   if pr.documents_self_terminating_action(b)}
+        self.assertIn("SHUTDOWN ALIASES", flagged)
+        self.assertIn("TASK QUEUE", flagged)
+        # Prose that merely says the word ("persists across restart",
+        # "when did you last upgrade") documents nothing.
+        for name in ("LOCAL MODEL SELECTION", "SKILLS", "CHANGELOG / VERSION",
+                     "STABILITY GATE", "MUSIC CONTROLS"):
+            self.assertNotIn(name, flagged)
+
+    def test_the_names_come_from_the_one_risk_table(self):
+        from core import action_risk
+        self.assertEqual(set(_SELF_TERMINATING),
+                         set(action_risk.SELF_TERMINATING_ACTIONS))
+
+
+class FollowupOnlyOnRealReferentsTests(unittest.TestCase):
+    """Review 2026-10-02 (medium): any short turn with 'it' / "that's" / a
+    leading 'and' counted as elliptical - the expletive 'it' of "how's it
+    going", the acknowledgement "that's great" - and picked up the previous
+    turn's sections (+12.6k chars over a 30-turn conversation)."""
+
+    PREVIOUS = ("play some music", "set a timer for ten minutes",
+                "how hot is the GPU", "what's on my schedule tomorrow")
+    SELF_CONTAINED = ("how's it going", "that's great, thanks",
+                      "is it going to rain tomorrow", "what's it like outside",
+                      "is it a holiday today", "It's cold in here.",
+                      "and play some jazz", "also set a timer",
+                      "that's all, thank you")
+
+    def test_self_contained_short_turns_route_exactly_as_alone(self):
+        for u in self.SELF_CONTAINED:
+            for prev in self.PREVIOUS:
+                with self.subTest(u=u, prev=prev):
+                    self.assertEqual(
+                        pr.turn_pc_block(u, FULL, history=_hist(prev)),
+                        pr.turn_pc_block(u, FULL))
+
+    def test_real_back_references_still_inherit(self):
+        for prev, u, name in (
+                ("turn on the porch light", "is it on?", "smart_home_control"),
+                ("Jarvis, how's the print going?", "is it done yet",
+                 "pause_print"),
+                ("play some music", "that's too loud", "play_music"),
+                ("what's the weather like", "and tomorrow?",
+                 "weather_briefing"),
+                ("set a timer for ten minutes", "Never mind, cancel that.",
+                 "cancel_timer")):
+            with self.subTest(u=u):
+                alone = pr.turn_pc_block(u, FULL)
+                turn = pr.turn_pc_block(u, FULL, history=_hist(prev))
+                self.assertTrue(_names_in(turn, name), u)
+                self.assertFalse(_names_in(alone, name), u)
+
+    def test_elliptical_detection_skips_expletives(self):
+        for u in ("how's it going", "what's it like outside",
+                  "is it going to rain", "it's raining", "that's great",
+                  "that's all"):
+            with self.subTest(u=u):
+                self.assertFalse(pr.is_elliptical_followup(u))
+        for u in ("is it on", "is it done yet", "it's too loud",
+                  "that's too bright", "turn it off", "is that normal",
+                  "what's it doing"):
+            with self.subTest(u=u):
+                self.assertTrue(pr.is_elliptical_followup(u))
+
+    def test_inherited_sections_are_reported_for_the_budget(self):
+        # The prompt budget ranks an inherited section below the turn's own
+        # long-term-memory recall (core.prompt_budget.RANK_INHERITED).
+        hist = _hist("Jarvis, how's the print going?")
+        got = pr.inherited_turn_sections("Pause it.", FULL, history=hist)
+        self.assertIn("BAMBU 3D PRINTER", got)
+        self.assertNotIn("MUSIC CONTROLS", got)      # its own words route it
+        self.assertEqual(pr.inherited_turn_sections("Pause it.", FULL), set())
+        self.assertEqual(
+            pr.inherited_turn_sections("how's it going", FULL, history=hist),
+            set())
+
+
+class SmartDeviceListingRoutingTests(unittest.TestCase):
+    """Review 2026-10-02 (medium): with "smart" a generic header word, a
+    smart-device listing that does not say "home" lost the three SMART HOME
+    sections and saw only audio-device grammar."""
+
+    def test_listing_and_discovery_phrasings_route_smart_home(self):
+        _core, sections = pr.split_pc_control(FULL)
+        for u in ("list my smart devices", "what smart devices do I have",
+                  "scan for smart devices", "discover smart devices",
+                  "list smart devices"):
+            with self.subTest(u=u):
+                inc, _drop = pr.select_sections(u, sections)
+                self.assertIn("SMART HOME DISCOVERY", inc)
+                turn = pr.turn_pc_block(u, FULL)
+                self.assertTrue(_names_in(turn, "list_smart_home_devices"))
+                self.assertTrue(_names_in(turn, "discover_smart_home"))
+
+
+class SelfKnowledgeRoutingPrecisionTests(unittest.TestCase):
+    """Review 2026-10-02: SELF-KNOWLEDGE (~2.1k chars) loaded on 22 of 25
+    unrelated probes - any brand ("use Claude", "play Opus by Eric Prydz"),
+    any comparison ("compared to last week"), the header word "knowledge"."""
+
+    def _routed(self, u):
+        _core, sections = pr.split_pc_control(FULL)
+        return "SELF-KNOWLEDGE" in pr.select_sections(u, sections)[0]
+
+    def test_unrelated_turns_do_not_load_it(self):
+        for u in ("use Claude", "switch to Claude", "how many Claude credits",
+                  "is claude down", "play Opus by Eric Prydz", "open ChatGPT",
+                  "can you open ChatGPT", "open gemini in chrome",
+                  "horoscope for Gemini",
+                  "how does the new iPhone compare to the old one",
+                  "compared to last week how much did I spend",
+                  "how do the Lakers stack up", "is a crow smarter than a dog",
+                  "how good are you at chess",
+                  "how capable is the new Bambu printer",
+                  "how intelligent is the octopus", "to my knowledge it's fine",
+                  "can you play Opus by Eric Prydz",
+                  "what model is the new iPhone"):
+            with self.subTest(u=u):
+                self.assertFalse(self._routed(u))
+
+    def test_questions_about_him_still_load_it(self):
+        for u in ("how smart are you compared to Claude Opus 5.5",
+                  "Jarvis, how smart are you?", "how smart is jarvis",
+                  "how do you compare to other AIs",
+                  "how do you compare to other assistants",
+                  "what model are you running", "what runs you",
+                  "what powers you", "are you smarter than chatgpt",
+                  "how good are you", "what are you running on",
+                  "which model are you", "how do you stack up against gpt",
+                  "are you better than Gemini", "what's your IQ",
+                  "how capable are you really",
+                  "compare yourself to other JARVIS-like assistants"):
+            with self.subTest(u=u):
+                self.assertTrue(self._routed(u))

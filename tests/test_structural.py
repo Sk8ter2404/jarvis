@@ -56,6 +56,9 @@ _IMPORT_LIGHT_CORE = (
     # The speech-queue presence rule (2026-10-02): stdlib only, imported at
     # monolith import time.
     "core.owner_presence",
+    # The local prompt budget (2026-10-01): stdlib only, imported at
+    # monolith import time.
+    "core.prompt_budget",
 )
 
 

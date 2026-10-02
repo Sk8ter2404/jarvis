@@ -45,6 +45,8 @@ from collections import deque
 
 import numpy as np
 
+from core.wake_prefix import has_wake_prefix as _has_wake_prefix
+
 
 # ── tunables ─────────────────────────────────────────────────────────────
 FLATNESS_THRESHOLD       = 0.25     # spectrum below this → tonal/musical
@@ -193,23 +195,15 @@ def should_refuse_wake(text: str) -> bool:
     lyric near-miss rather than a clear standalone wake command."""
     if not is_music_currently_playing():
         return False
-    if not text:
-        return True
-    words = text.strip().lower().split()
-    if not words:
-        return True
-    first = words[0].strip(",.!?")
     # A clear LEADING 'jarvis' is a real wake at ANY length — the user addressed
     # JARVIS by name at the front, so wake even over music (don't discard a real
     # "Jarvis, <full request>" as a lyric just because it runs past 3 words).
-    if first == "jarvis":
-        return False
-    # "hey/ok/okay JARVIS ..." also counts as a clear lead wake.
-    if first in {"hey", "ok", "okay"} and len(words) >= 2 and words[1].strip(",.!?") == "jarvis":
-        return False
-    # Otherwise (no wake word, or 'jarvis' buried mid-sentence) — over music,
-    # treat as a lyric near-miss and refuse.
-    return True
+    # "Leading" is core/wake_prefix.py's rule — the ONE copy, shared with the
+    # wake-word gate (bobert_companion._text_has_wake_prefix): word 1-3 behind
+    # lead interjections ("hey / um / so / what Jarvis ..."). Otherwise (no
+    # wake word, or 'jarvis' buried mid-sentence) — over music, treat as a
+    # lyric near-miss and refuse. Empty text is refused too.
+    return not _has_wake_prefix(text)
 
 
 def music_state_summary() -> str:

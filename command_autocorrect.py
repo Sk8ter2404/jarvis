@@ -24,6 +24,11 @@ The dispatcher also wants top-2 candidates so it can ask 'did you mean X or Y'
 when two distinct actions both clear the threshold within `AMBIGUITY_GAP`.
 Use `autocorrect_command_choice()` for that flow; `autocorrect_command()` keeps
 the legacy single-best-or-None contract.
+
+A guess is never safe to make onto a destructive or self-terminating action:
+the dispatcher passes ``protected=`` (bobert_companion._autocorrect_protected)
+and a guess that could land on one comes back "blocked" instead (2026-10-01:
+an invented 'shutdown' was silently routed to shutdown_jarvis).
 """
 
 from __future__ import annotations
@@ -384,7 +389,7 @@ def _rank_candidates(
     u_norm = _normalise(unknown)
     lexical: list[tuple[str, float]] = []
     for cand in registered:
-        if not cand:
+        if not cand or _polarity_clash(u_norm, cand):
             continue
         c_norm = _normalise(cand)
         if u_norm == c_norm:
@@ -416,22 +421,85 @@ def _rank_candidates(
     return merged
 
 
+# Opposite-meaning words. Many of them are _FILLER_TOKENS (ignored for
+# SIMILARITY so "enable_x" still finds "x"), which made stop_timer and
+# set_timer near-twins: the 2026-10-02 model research saw "never mind, cancel
+# that" -> invented [ACTION: stop_timer] -> routed to set_timer, starting a
+# timer instead of cancelling one. A guess may never flip the owner's intent.
+_OPPOSITES = (
+    (frozenset({"stop", "cancel", "end", "remove", "delete", "clear", "kill",
+                "disable", "off", "close", "pause", "halt", "dismiss", "unset"}),
+     frozenset({"start", "set", "add", "create", "enable", "on", "open",
+                "resume", "play", "begin", "launch", "schedule", "new"})),
+    (frozenset({"mute"}), frozenset({"unmute"})),
+    (frozenset({"lock"}), frozenset({"unlock"})),
+    (frozenset({"hide"}), frozenset({"show"})),
+    (frozenset({"up", "increase", "raise", "louder"}),
+     frozenset({"down", "decrease", "lower", "quieter"})),
+    (frozenset({"connect", "engage", "arm", "pair"}),
+     frozenset({"disconnect", "disengage", "disarm", "unpair"})),
+)
+
+
+def _polarity_clash(unknown: str, candidate: str) -> bool:
+    """True when ``candidate`` means the opposite of ``unknown``: one side has
+    a word from a pair and the other has the opposite word without also
+    carrying the first (so "toggle_on_off" is never an opposite)."""
+    ta = set(_normalise(unknown).split("_"))
+    tb = set(_normalise(candidate).split("_"))
+    for x, y in _OPPOSITES:
+        if (ta & x and tb & y and not tb & x) or (ta & y and tb & x and not tb & y):
+            return True
+    return False
+
+
+def _protected_predicate(protected):
+    """``protected`` (None, a collection of names, or a ``name -> bool``
+    callable) as a predicate that FAILS SAFE: a predicate that raises counts
+    as protected, so a broken classifier can never let a guess through.
+    None when nothing is protected."""
+    if protected is None:
+        return None
+    if callable(protected):
+        check = protected
+    else:
+        names = frozenset(_normalise(str(n)) for n in protected if n)
+        check = lambda name: _normalise(name) in names  # noqa: E731
+
+    def _safe(name: str) -> bool:
+        try:
+            return bool(check(name))
+        except Exception:
+            return True
+    return _safe
+
+
 def autocorrect_command(
     unknown: str,
     registered: Iterable[str],
     threshold: float = 0.75,
     *,
     use_embeddings: bool = True,
+    protected=None,
 ) -> tuple[str | None, float]:
     """
     Find the best-matching registered action for an unrecognised command.
 
     Returns (best_match, confidence). If no candidate clears the threshold,
     returns (None, best_seen_confidence) — callers can log the near-miss
-    without acting on it.
+    without acting on it. With ``protected`` (see autocorrect_command_choice)
+    a guess that would land on a protected action is (None, its score).
     """
     if not unknown:
         return (None, 0.0)
+    if protected is not None:
+        choice = autocorrect_command_choice(
+            unknown, registered, threshold,
+            use_embeddings=use_embeddings, protected=protected)
+        primary = choice.get("primary")
+        if choice["status"] in ("silent", "ambiguous") and primary:
+            return primary
+        return (None, primary[1] if primary else 0.0)
     ranked = _rank_candidates(
         unknown, registered,
         use_embeddings=use_embeddings,
@@ -478,6 +546,18 @@ def autocorrect_command_topk(
 #               callers can log it)
 #   secondary:  (name, score) of the runner-up; None when there isn't one
 #               that matters (only populated for "ambiguous")
+#
+# With ``protected`` (a collection of names or a name -> bool predicate) one
+# more status exists:
+#               "blocked"    → a protected action is among the candidates the
+#                              guess could land on: the best one or any other
+#                              that clears the threshold within ambiguity_gap
+#                              of it. Nothing may be routed OR offered as a
+#                              "did you mean"; the caller drops the action and
+#                              asks the user. ``blocked`` = (name, score) of
+#                              the first protected candidate.
+# Live 2026-10-01: the local model invented [ACTION: shutdown] for "Jarvis,
+# turn it off" and the silent route sent it to shutdown_jarvis (0.78).
 def autocorrect_command_choice(
     unknown: str,
     registered: Iterable[str],
@@ -485,17 +565,35 @@ def autocorrect_command_choice(
     ambiguity_gap: float = 0.10,
     *,
     use_embeddings: bool = True,
+    protected=None,
 ) -> dict:
-    """Pick between silent route, disambiguation prompt, and no-match."""
-    top = autocorrect_command_topk(
-        unknown, registered, k=2, use_embeddings=use_embeddings,
-    )
+    """Pick between silent route, disambiguation prompt, no-match and (with
+    ``protected``) blocked."""
+    is_protected = _protected_predicate(protected)
+    if is_protected is None:
+        top = autocorrect_command_topk(
+            unknown, registered, k=2, use_embeddings=use_embeddings,
+        )
+    else:
+        # Every candidate, so the whole ambiguity window can be inspected.
+        # Same rerank bound as topk(k=2), so the scores are identical.
+        top = (_rank_candidates(unknown, registered,
+                                use_embeddings=use_embeddings,
+                                rerank_top=max(RERANK_FLOOR, 6))
+               if unknown else [])
     if not top:
         return {"status": "none", "primary": None, "secondary": None}
     top1 = top[0]
     top2 = top[1] if len(top) > 1 else None
     if top1[1] < threshold:
         return {"status": "none", "primary": top1, "secondary": None}
+    if is_protected is not None:
+        for cand in top:
+            if cand[1] < threshold or (top1[1] - cand[1]) > ambiguity_gap:
+                break
+            if is_protected(cand[0]):
+                return {"status": "blocked", "primary": top1,
+                        "secondary": None, "blocked": cand}
     if (top2 is not None
             and top2[1] >= threshold
             and (top1[1] - top2[1]) <= ambiguity_gap

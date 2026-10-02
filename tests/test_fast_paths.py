@@ -575,6 +575,24 @@ class WakeOnlyTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(fp.is_wake_only(text))
 
+    def test_a_wake_behind_lead_interjections(self):
+        # 2026-10-01: the wake-word gate admits "Um, Jarvis" (core.wake_prefix,
+        # word 1-3); recall must skip it like a bare "Jarvis", not recite it.
+        for text in ("Um, Jarvis.", "So Jarvis", "what jarvis?",
+                     "uh okay Jarvis, are you there?", "Alright Jarvis, wake up"):
+            with self.subTest(text=text):
+                self.assertTrue(fp.is_wake_only(text))
+        for text in ("Um, Jarvis, open the notes", "I asked Jarvis",
+                     "so um uh Jarvis"):
+            with self.subTest(text=text):
+                self.assertFalse(fp.is_wake_only(text))
+        hist = [{"role": "user", "content": "open the project notes"},
+                {"role": "assistant", "content": "Done, sir."},
+                {"role": "user", "content": "Um, Jarvis."},
+                {"role": "assistant", "content": "Yes, sir?"}]
+        self.assertEqual(fp.prior_owner_utterance(hist),
+                         "open the project notes")
+
 
 class MatchTests(unittest.TestCase):
     def test_date_questions_route_through_date_math(self):

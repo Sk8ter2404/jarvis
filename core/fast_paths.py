@@ -59,7 +59,7 @@ from __future__ import annotations
 import re
 from typing import NamedTuple, Optional
 
-from core import date_math, spoken_math, world_clock
+from core import date_math, spoken_math, wake_prefix, world_clock
 from core.date_math import normalize
 
 
@@ -273,7 +273,16 @@ def is_wake_only(text) -> bool:
     if not isinstance(text, str):
         return False
     t = " ".join(re.sub(r"[^a-z' ]+", " ", text.lower()).split())
-    return bool(t) and bool(_WAKE_ONLY_RE.fullmatch(t))
+    if t and _WAKE_ONLY_RE.fullmatch(t):
+        return True
+    # A wake behind lead interjections ("Um, Jarvis.", "So Jarvis, are you
+    # there?"): the wake-word gate admits it (core.wake_prefix, word 1-3), so
+    # it is a wake here too when nothing but a wake phrase follows the name.
+    if wake_prefix.has_wake_prefix(text):
+        rest = wake_prefix.strip_wake_lead(text)
+        r = " ".join(re.sub(r"[^a-z' ]+", " ", rest.lower()).split())
+        return not r or bool(_WAKE_ONLY_RE.fullmatch(r))
+    return False
 
 
 # A STORED owner utterance that was itself a recall question, for recall to
@@ -353,13 +362,12 @@ def is_last_utterance_question(text, *, loose: bool = False) -> bool:
     return bool(_LOOSE_RECALL_RE.search(t)) and not _PAST_SESSION_RE.search(t)
 
 
-_WAKE_LEAD_RE = re.compile(r"^(?:(?:hey|ok|okay)\s+)?jarvis\b[\s,.:;!-]*",
-                           re.IGNORECASE)
-
-
 def _clean_utterance(s: str) -> str:
     s = " ".join(s.split())
-    s = _WAKE_LEAD_RE.sub("", s).strip() or s
+    # The lead fillers + wake word off the front: core.wake_prefix, the same
+    # rule the wake-word gate admits a turn on (this module used to keep its
+    # own regex that took only "Jarvis" / "hey|ok|okay Jarvis").
+    s = wake_prefix.strip_wake_lead(s).strip() or s
     s = s.rstrip(" ?!.,;:")
     if len(s) > 200:
         s = s[:197].rstrip() + "..."

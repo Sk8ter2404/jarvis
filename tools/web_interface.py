@@ -110,7 +110,6 @@ import time
 import urllib.parse
 import uuid
 import zlib
-from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core import camera_tiles as _camera_tiles
@@ -2695,36 +2694,17 @@ def _parse_action_index(path: str) -> dict:
 # smart_home_purge_cookie (forget_alexa_login's handler) and the code
 # runner's run_python / python / eval_python / compute. So the live paths
 # confirm by HANDLER too (_live_confirm_reason): a name inherits the reason of
-# any other name bound to the same callable. The patterns below name the
-# known aliases as well, for the index fallback, which has no handlers.
-_ACTION_CONFIRM_RULES = (
-    (("*shutdown*", "*shut_down*", "*restart*", "*reboot*", "*hibernate*",
-      "sleep_pc", "*log_off*", "*logoff*", "*sign_out*", "lock_pc",
-      "lock_screen", "*relaunch*", "exit_jarvis", "quit_jarvis",
-      "*power_off*", "turn_off_jarvis"),
-     "stops or restarts JARVIS or the PC"),
-    (("send_*", "*_send", "reply_*", "*_reply", "text_*", "*_text_*",
-      "email_*", "*_email", "sms_*", "call_*", "answer_call", "decline_call",
-      "post_*", "publish_*", "share_*", "notify_*", "message_*", "*_message",
-      "announce_*", "speak_*", "say_*"),
-     "sends or says something to someone"),
-    (("archive_*", "delete_*", "*_delete", "forget_*", "*_forget", "clear_*",
-      "wipe_*", "reset_*", "*_reset", "*purge*", "remove_*", "*_remove",
-      "erase_*", "empty_*", "drop_*", "scrap_*", "uninstall_*", "unenroll_*",
-      "export_memory", "revoke_*"),
-     "deletes, resets or exports data"),
-    (("start_overnight_upgrade", "*upgrade*", "*self_update*", "apply_*",
-      "install_*", "run_shell", "run_code", "run_python", "python",
-      "eval_python", "compute", "execute_*", "*_execute", "*_script",
-      "code_*", "pip_*", "git_*", "rollback*", "*_rollback"),
-     "changes JARVIS's own code or runs code"),
-    (("type", "type_*", "hotkey", "click", "*_click", "press_*", "kill_*",
-      "close_*", "*_close", "stop_pipeline", "web_interface_off", "*_off_all",
-      "force_*", "switch_llm", "switch_model", "set_model", "use_model"),
-     "acts on the desktop or stops a running service"),
-    (("buy_*", "order_*", "pay_*", "purchase_*", "checkout*", "transfer_*"),
-     "spends money"),
-)
+# any other name bound to the same callable. The patterns name the known
+# aliases as well, for the index fallback, which has no handlers.
+#
+# The rules themselves live in core/action_risk.py since 2026-10-01: the voice
+# dispatcher's fuzzy action-name corrector reads the same classification, so a
+# GUESSED name can never land on shutdown_jarvis / reset_memory / run_shell
+# (live 2026-10-01: an invented [ACTION: shutdown] for "Jarvis, turn it off"
+# was corrected onto shutdown_jarvis). One table, two consumers, no drift.
+from core.action_risk import ACTION_CONFIRM_RULES as _ACTION_CONFIRM_RULES  # noqa: E402
+from core.action_risk import action_confirm_reason  # noqa: E402
+
 # Handled by the tray control plane's hardened teardown instead of a request
 # thread (a restart spawns a successor and exits this process mid-response).
 # Keyed by the registry name whose HANDLER the tray command runs, and matched
@@ -2737,16 +2717,6 @@ _ACTION_TIMEOUT_S = 20.0
 _ACTION_MIN_GAP_S = 1.0          # per-name double-click guard
 _action_last_call: dict = {}
 _action_rate_lock = threading.Lock()
-
-
-def action_confirm_reason(name: str) -> str:
-    """The confirm-prompt reason for action ``name``, or '' when it may run
-    on one click (see _ACTION_CONFIRM_RULES)."""
-    n = str(name or "").strip().lower()
-    for patterns, why in _ACTION_CONFIRM_RULES:
-        if any(fnmatchcase(n, p) for p in patterns):
-            return why
-    return ""
 
 
 def _live_confirm_reason(acts, name: str) -> str:
@@ -4676,8 +4646,18 @@ const QUICK_ACTIONS = [
 // tray channel (which works in standby) and then send, or don't send.
 // A command that DOES start with the wake word goes straight through: the
 // standby handler runs "Jarvis, <command>" as the turn (2026-10-01), so there
-// is nothing to wake first.
-const WAKE_WORD_RE = /^\s*(hey\s+)?jarvis\b/i;
+// is nothing to wake first. "Starts with" is core/wake_prefix.py's rule, and
+// this check must never be LOOSER than it: a line the page lets through but
+// the server refuses is dropped in standby (the handler only wakes him), while
+// a line the page holds back just gets the "wake him first?" prompt. So it
+// takes (a) the legacy forms - "Jarvis ...", "hey / ok / okay Jarvis ..." -
+// and (b) the wake word at word 2-3 behind lead interjections ("um, Jarvis,
+// pause"; "all right" counts as two words) only when punctuation sets the name
+// off and no reporting verb follows ("so Jarvis, said what" is a mention).
+// An unpunctuated filler-led line ("um Jarvis pause") gets the prompt.
+// tests/test_wake_prefix.py pins the lists to core/wake_prefix.py and checks
+// that every line this accepts, the server accepts too.
+const WAKE_WORD_RE = /^\s*(?:(?:(?:hey|ok|okay)[,.!?;:-]*\s[\s,.!?;:-]*)?jarvis(?=[,.!?;:\u2026\u2014\u2013"()\[\]\u201c\u201d-]*(?:\s|$))|(?:(?:(?:what|okay|ok|hey|yo|so|umm|um|uhh|uh|oh|alright)[,.!?;:-]*\s[\s,.!?;:-]*){1,2}|all[,.!?;:-]*\s[\s,.!?;:-]*right[,.!?;:-]*\s[\s,.!?;:-]*)jarvis(?:\s*$|\s*[,.!?;:\u2026\u2014\u2013-]+(?=\s|$)(?!\s*(?:said|says|told|tells|thinks|thought|knows|knew|wants|wanted|meant|means|heard|keeps|kept|seems|seemed|sounds|sounded|likes|liked|needs|needed)\b)))/i;
 const WAKE_UP_RE = /^\s*wake(\s+up)?\s*[.!]?\s*$/i;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 

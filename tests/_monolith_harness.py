@@ -259,7 +259,8 @@ _MONOLITH_RESTORE_NAMES = (
     # schedule a real re-prime thread; a leaked worker flag would make every
     # later learn_from_turn queue a turn nobody drains. The shared gate in
     # core.local_traffic is reset in _restore_monolith_pristine.
-    "_last_owner_turn_at", "_reprime_primed_at", "_reprime_posts_mark",
+    "_last_owner_turn_at", "_prev_owner_turn_at",
+    "_reprime_primed_at", "_reprime_posts_mark",
     "_learn_pending", "_learn_worker_live",
     # Cold-first-turn fixes (NEW #8, 2026-10-02): the music-capture streak
     # (a leaked streak would let a LATER test's re-prime run over an
@@ -545,6 +546,13 @@ def _restore_monolith_pristine(bc) -> None:
         bc._input_open_backoff.reset()
     except Exception:
         pass
+    # The local prompt budget's observed window (2026-10-02): a fake Ollama
+    # reply with a small prompt_eval_count reads as a truncation and would
+    # shrink every LATER test's budget. Process-wide, so cleared in place.
+    try:
+        bc._prompt_budget.OBSERVED_WINDOW.clear()
+    except Exception:
+        pass
 
 
 _MISSING = object()
@@ -640,6 +648,22 @@ def _reset_filler_state(bc) -> None:
         c._warming = False
     except Exception:
         pass
+
+
+def shift_monotonic(testcase, seconds: float = 30 * 86400.0) -> None:
+    """Shift time.monotonic() forward for one test, so a stamp of "N seconds
+    ago" (monotonic() - N) stays positive on a freshly booted machine.
+
+    monotonic() counts from boot. After an overnight Windows Update restart
+    (Dell gate 2026-10-02 03:36, ~26 min of uptime) "8 hours ago" came out
+    negative, and the code under test rightly read it as "never" - six tests
+    failed for the machine's uptime, not for a bug."""
+    import time as _time
+    from unittest import mock as _mock
+    real = _time.monotonic
+    patcher = _mock.patch.object(_time, "monotonic", lambda: real() + seconds)
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
 
 
 @requires_monolith

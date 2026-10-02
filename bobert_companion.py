@@ -447,6 +447,11 @@ try:
     import command_autocorrect as _cmd_autocorrect  # type: ignore
 except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _cmd_autocorrect = None  # type: ignore
+# A guess may never land on a dangerous action (2026-10-01, see
+# _autocorrect_protected): the shared risk table, and the "turn it off" with no
+# referent question (_run_pronoun_switch_shortcut).
+from core import action_risk as _action_risk  # noqa: E402
+from core import pronoun_switch as _pronoun_switch  # noqa: E402
 _AUTOCORRECT_THRESHOLD = 0.75
 # When two candidates both clear the threshold and sit within this gap of
 # each other, the dispatcher asks 'did you mean X or Y' instead of silently
@@ -1542,20 +1547,36 @@ def _trimmed_history(history: list,
     return list(history[_history_trim_count(history, max_history):])
 
 
-def _trim_conversation_history(max_history: int = MAX_CONVERSATION_HISTORY) -> None:
+def _trim_conversation_history(max_history: int = MAX_CONVERSATION_HISTORY,
+                               *, drop_front=None) -> int:
     """Trim conversation_history IN PLACE (other modules hold the same list):
     chunked, pair-wise, user-first — see _history_trim_count. EVERY trim site
     goes through here, so the chunking and the user-first invariant cannot
     drift between them.
 
+    ``drop_front`` (2026-10-02): drop exactly these messages instead - the
+    oldest ones a local turn's prompt budget dropped, so the next turn shares
+    its trimmed prefix (_persist_budget_history_trim) - and only while they
+    are still the front of the list, so a concurrent trim is never doubled.
+
     The trimmed messages are kept for the session summary until its next
     checkpoint has folded them in (_session_trimmed, 2026-10-01): a long
-    session used to be summarised from the last ~10 exchanges only."""
-    n = _history_trim_count(conversation_history, max_history)
-    if n:
-        with _session_summary_lock:
+    session used to be summarised from the last ~10 exchanges only. Returns
+    how many went."""
+    with _session_summary_lock:
+        if drop_front is not None:
+            gone = list(drop_front)
+            n = len(gone)
+            if (not n or len(conversation_history) < n
+                    or any(conversation_history[i] is not gone[i]
+                           for i in range(n))):
+                return 0
+        else:
+            n = _history_trim_count(conversation_history, max_history)
+        if n:
             _session_trimmed.extend(conversation_history[:n])
             del conversation_history[:n]
+        return n
 
 
 def _append_turn(user: str, assistant: str) -> None:
@@ -1992,6 +2013,218 @@ def _with_turn_context(messages: list, turn_ctx: str) -> list:
         return messages
     except Exception:
         return messages
+
+
+# LOCAL PROMPT BUDGET (2026-10-01). Ollama silently truncates a prompt longer
+# than num_ctx to its first few tokens + the tail ("truncating input prompt
+# limit=8195 prompt=17958" in its server log), so an overflowing turn reached
+# the model with most of its system prompt gone. Live: 2 turns on 2026-10-01
+# read prompt_eval_count=8195. _fit_local_messages estimates every local
+# prompt and, only when it is over budget, drops the low-rank per-turn parts
+# (the cheap tail), then the oldest history, then the sections, then the rest
+# of the history. It never touches the system prompt or the final message (nor
+# a follow-up round's owner request). Calibration, ranks and trim order:
+# core/prompt_budget.py. Review fixes 2026-10-02: a turn's history trim is kept
+# for good (_persist_budget_history_trim), a prompt that cannot fit still sheds
+# everything it can, a follow-up round clips its results, and a reply whose
+# prompt_eval_count shows Ollama cut the prompt anyway is logged and shrinks
+# the next budgets (_note_prompt_window). JARVIS_LOCAL_PROMPT_BUDGET=0 turns
+# the budget off.
+from core import prompt_budget as _prompt_budget  # noqa: E402
+
+_LOCAL_PROMPT_BUDGET = (os.environ.get("JARVIS_LOCAL_PROMPT_BUDGET", "1")
+                        .strip().lower() not in ("0", "false", "no", "off"))
+
+
+class _BudgetedMessages(list):
+    """A message list _fit_local_messages has already fitted for a
+    ``num_ctx`` window. _call_local_llm leaves it alone when the model it
+    resolved has that same window, instead of measuring it a second time.
+
+    Also carries what the fit did: ``fits``, ``trimmed``, ``ctx_chars`` (the
+    per-turn context actually attached, for the turn-timing line) and
+    ``dropped_head`` (the history messages it dropped, oldest first, for
+    _persist_budget_history_trim)."""
+    num_ctx = 0
+    window = 0
+    fits = True
+    trimmed = False
+    ctx_chars = 0
+    dropped_head = ()
+
+
+def _local_budget_tag() -> str:
+    """The local model tag to size the budget for, without a network probe:
+    the resolved tag once _get_local_llm_model has run, else the configured
+    one. It only picks the window (16k, or 12k for a 30B-class tag), and
+    _call_local_llm re-checks against the tag it actually resolved."""
+    try:
+        return (_RESOLVED_LOCAL_LLM_MODEL[0]
+                or (os.environ.get("JARVIS_LOCAL_LLM_MODEL") or "").strip()
+                or LOCAL_LLM_MODEL)
+    except Exception:
+        return ""
+
+
+def _turn_budget_parts(pc_block: str, addenda=(), inherited=()) -> list:
+    """This turn's per-turn context as prompt_budget.TurnPart's: each routed
+    PC section body (rank SECTION; rank INHERITED for a section named in
+    ``inherited`` - one only the history routed, see
+    prompt_router.inherited_turn_sections), then each non-empty addendum.
+    ``addenda`` is ``[(label, text, rank), ...]``. The parts' texts join to
+    exactly ``pc_block + "".join(addendum texts)``, which is the context
+    string the caller attaches. Never raises: on a fault the whole context is
+    ONE part, so it is still sent (and can still only be dropped whole)."""
+    try:
+        parts = []
+        if pc_block:
+            from core import prompt_router as _pr
+            inh = set(inherited or ())
+            for i, (head, body) in enumerate(_pr.split_turn_block(pc_block)):
+                parts.append(_prompt_budget.TurnPart(
+                    head or "turn sections", ("\n" if i else "") + body,
+                    (_prompt_budget.RANK_INHERITED if head in inh
+                     else _prompt_budget.RANK_SECTION)))
+        for label, text, rank in addenda:
+            if text:
+                parts.append(_prompt_budget.TurnPart(label, text, rank))
+        return parts
+    except Exception:
+        whole = (pc_block or "") + "".join(a[1] for a in addenda if a[1])
+        return ([_prompt_budget.TurnPart("turn context", whole,
+                                         _prompt_budget.RANK_SECTION)]
+                if whole else [])
+
+
+def _fit_local_messages(system: str, messages: list, parts=(), *,
+                        max_tokens: int = 500, where: str = "local",
+                        model_tag: str | None = None,
+                        pin_last_user: bool = False,
+                        log: bool = True) -> list:
+    """``messages`` with the per-turn ``parts`` attached (_with_turn_context),
+    trimmed to the local prompt budget when the whole prompt would overflow
+    the model's window.
+
+    The prompt is measured exactly as _call_local_llm will send it: through
+    _local_chat_prompt (the local-mode directive, the web-search guard). The
+    window is the model's num_ctx, or the smaller one a recent reply showed
+    Ollama really used (_prompt_budget.OBSERVED_WINDOW). ``pin_last_user``
+    keeps the owner's last turn and the chain after it (a follow-up round).
+    A prompt that fits comes back unchanged. A trimmed or still-over prompt
+    prints one ``[prompt-budget]`` line (``log``). Never raises; a fault
+    sends the unbudgeted prompt."""
+    turn_ctx = "".join(p.text for p in parts)
+    if not _LOCAL_PROMPT_BUDGET:
+        return _with_turn_context(messages, turn_ctx)
+    try:
+        num_ctx = _local_num_ctx(model_tag or _local_budget_tag())
+        window = _prompt_budget.OBSERVED_WINDOW.effective(num_ctx)
+        budget = _prompt_budget.budget_for(window, max_tokens)
+
+        def _measure(msgs):
+            s, m = _local_chat_prompt(system, msgs)
+            return _prompt_budget.estimate_chat_tokens(s, m)
+
+        fit = _prompt_budget.fit_chat(list(messages), parts, budget=budget,
+                                      measure=_measure,
+                                      attach=_with_turn_context,
+                                      pin_last_user=pin_last_user)
+        if log and (fit.trimmed or not fit.fits):
+            note = _prompt_budget.describe(fit, where, num_ctx=window)
+            if window < num_ctx:
+                note += (f" [window {window:,}: observed, not the "
+                         f"{num_ctx:,} configured]")
+            print("  " + note)
+        out = _BudgetedMessages(fit.messages)
+        out.num_ctx = num_ctx
+        out.window = window
+        out.fits = fit.fits
+        out.trimmed = fit.trimmed
+        dropped = set(fit.dropped_parts)
+        out.ctx_chars = sum(len(p.text) for p in parts
+                            if p.label not in dropped)
+        out.dropped_head = tuple(list(messages)[:fit.dropped_history])
+        return out
+    except Exception as _e:
+        print(f"  [prompt-budget] {where}: check failed "
+              f"({type(_e).__name__}: {_e}); sent unbudgeted")
+        return _with_turn_context(messages, turn_ctx)
+
+
+def _persist_budget_history_trim(fitted) -> int:
+    """Drop from conversation_history, for good, the oldest messages a turn's
+    budget fit dropped (``fitted.dropped_head``), so the NEXT turn and the
+    idle re-prime share this turn's trimmed prefix (review 2026-10-02: a
+    per-call trim left the re-prime warming the untrimmed history, and every
+    later near-limit turn paid a full re-evaluation). Goes through the same
+    bookkeeping as _trim_conversation_history (the session summary still
+    folds the messages in). Only when the fit FITS - a prompt that cannot fit
+    (a window too small for the system prompt: a 30B-class tag, an observed
+    truncation) sheds its history for that call only, so the conversation is
+    whole again once the window is - and only when those messages are still
+    the front of the live list. Returns how many went. Never raises."""
+    try:
+        if not getattr(fitted, "fits", True):
+            return 0
+        gone = tuple(getattr(fitted, "dropped_head", ()) or ())
+        if not gone:
+            return 0
+        n = _trim_conversation_history(drop_front=gone)
+        if n:
+            print(f"  [prompt-budget] kept the history trim: {n} oldest "
+                  f"message(s) left the conversation")
+        return n
+    except Exception:
+        return 0
+
+
+def _note_prompt_window(sys_prompt: str, messages: list, stats,
+                        model_tag: str = "") -> bool:
+    """After a local reply: compare Ollama's prompt_eval_count with the
+    estimate of what was sent. Far under it (prompt_budget.looks_truncated)
+    means Ollama cut the prompt despite the budget - its runner's window is
+    smaller than num_ctx (the 10-01 incident read limit=8195). Logs one loud
+    ``[prompt-budget] TRUNCATED`` line and the observed window then budgets
+    the next prompts (OBSERVED_WINDOW). Never raises."""
+    try:
+        pe = (stats or {}).get("prompt_eval_count")
+        if pe is None:
+            return False
+        est = _prompt_budget.estimate_chat_tokens(sys_prompt, messages)
+        if not _prompt_budget.OBSERVED_WINDOW.note(est, pe):
+            return False
+        ctx = _local_num_ctx(model_tag) if model_tag else 0
+        print(f"  [prompt-budget] TRUNCATED: Ollama evaluated {int(pe):,} "
+              f"prompt tokens of an estimated ~{est:,} (num_ctx {ctx}) - "
+              f"its runner's window is smaller than configured; the next "
+              f"local prompts are budgeted to {int(pe):,} for "
+              f"{_prompt_budget.OBSERVED_LIMIT_TTL_S / 60:.0f} min")
+        return True
+    except Exception:
+        return False
+
+
+# A short follow-up routes on the previous user turn only while that turn is
+# recent (review 2026-10-02): the same horizon as the "turn it off" referent
+# and "do that again" (core/pronoun_switch.REFERENT_WINDOW_S).
+_FOLLOWUP_ROUTING_MAX_AGE_S = _pronoun_switch.REFERENT_WINDOW_S
+
+
+def _routing_history():
+    """The conversation for the prompt router's follow-up routing, or None
+    when the previous owner turn is older than _FOLLOWUP_ROUTING_MAX_AGE_S
+    (or there was none this process): a turn minutes after the last one is
+    not leaning on it. Never raises."""
+    try:
+        prev = float(_prev_owner_turn_at[0] or 0.0)
+        if prev <= 0.0:
+            return None
+        age = time.monotonic() - prev
+        if age < 0.0 or age > _FOLLOWUP_ROUTING_MAX_AGE_S:
+            return None
+        return list(conversation_history)
+    except Exception:
+        return None
 
 # Phase 4A refactor (2026-05-29): 11 simple _act_* handlers (open_url,
 # web_search, youtube, get_time, screenshot, media_next/prev/playpause,
@@ -19653,6 +19886,17 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     if not _ollama_has_model(model):
         _ollama_pull_async(model)
         return None
+    # Every local call is held to the prompt budget (see _LOCAL_PROMPT_BUDGET).
+    # The turn and follow-up paths fit their own prompts, per-turn sections
+    # included, and pass a _BudgetedMessages; any other caller (the cloud-error
+    # fallback over the full history, a background _llm_quick), or a list
+    # fitted for a different window than the tag resolved here, is fitted
+    # here, history only.
+    if not (isinstance(messages, _BudgetedMessages)
+            and messages.num_ctx == _local_num_ctx(model)):
+        messages = _fit_local_messages(system, messages, (),
+                                       max_tokens=max_tokens, where="call",
+                                       model_tag=model)
     sys_prompt, messages = _local_chat_prompt(system, messages)
     # The last _generate's Ollama counters (prompt_eval / eval), for the
     # served-via line below. All-None until a response arrives.
@@ -19738,6 +19982,8 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             if kind == "ok":
                 print(f"  [local-llm] served via {model} "
                       f"{_served_via_suffix(_gen_stats[0])}")
+                _note_prompt_window(sys_prompt, messages, _gen_stats[0],
+                                    model)
                 return text
             if kind == "empty":
                 # 200-OK-but-EMPTY = the model ran but a broken quant / template
@@ -19918,6 +20164,29 @@ def _local_unavailable_message() -> str:
             "either, sir.")
 
 
+def _self_knowledge_for_cloud(messages: list) -> list:
+    """``messages`` with any LOCAL SELF-KNOWLEDGE render (it rides the turn
+    context of the user message) re-rendered for the cloud route, as a copy.
+    A local turn that fails over to the cloud would otherwise hand Claude
+    "you are answering on your LOCAL brain, <tag>" and it would claim to be
+    that model (review 2026-10-02). Unchanged when there is none. Never
+    raises."""
+    try:
+        from core import prompts as _sk_prompts
+        out = None
+        for i, m in enumerate(messages or ()):
+            content = m.get("content") if isinstance(m, dict) else None
+            if (isinstance(content, str)
+                    and _sk_prompts.SELF_KNOWLEDGE_HEADER in content):
+                if out is None:
+                    out = list(messages)
+                out[i] = dict(m, content=_sk_prompts.retarget_self_knowledge(
+                    content, "cloud"))
+        return out if out is not None else messages
+    except Exception:
+        return messages
+
+
 def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
                                 max_tokens: int = 500) -> str:
     """LOCAL-routed turn with honest resilience. Try the local model; if it
@@ -19939,8 +20208,10 @@ def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
             if t.startswith("[local]"):
                 t = t[len("[local]"):].lstrip()
             return t
-        # Local didn't answer. Prefer the cloud if we can reach it.
-        cloud = _claude_oneshot(sys_prompt, messages, max_tokens=max_tokens)
+        # Local didn't answer. Prefer the cloud if we can reach it - told
+        # it is the cloud answering (_self_knowledge_for_cloud).
+        cloud = _claude_oneshot(sys_prompt, _self_knowledge_for_cloud(messages),
+                                max_tokens=max_tokens)
         if cloud:
             if _sac_blocked_local_recently():
                 print("  [local-llm] SAC blocked the local runner this boot — "
@@ -21197,6 +21468,11 @@ _utterance_in_progress = [False]
 # reply, not a turn boundary. Drives the re-prime-after-eviction window
 # (LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S). 0.0 = none yet this process.
 _last_owner_turn_at = [0.0]
+# ...and of the owner turn BEFORE it (2026-10-01): _note_owner_turn stamps the
+# current turn before routing, so "was there a turn a moment ago" (the
+# "turn it off" referent check, _run_pronoun_switch_shortcut) reads this one.
+# 0.0 = none this process.
+_prev_owner_turn_at = [0.0]
 # time.monotonic() when main() reached the turn loop (0.0 = it never did: an
 # import, a test): the re-prime-after-background reference before the owner's
 # first turn (NEW #8, 2026-10-02).
@@ -21477,6 +21753,7 @@ def _note_owner_turn() -> None:
     thread; releasing the capture first opened a window where it saw "no
     capture, no turn, last activity > window ago" and applied the pending
     rebuild at the very start of this turn (a cold turn + a re-prime)."""
+    _prev_owner_turn_at[0] = _last_owner_turn_at[0]
     _last_owner_turn_at[0] = time.monotonic()
     _note_conversation_activity()
     _turn_in_progress[0] = True
@@ -22328,6 +22605,7 @@ def _call_llm(user_text: str) -> str:
     # route. Empty string = legacy behaviour (everything in the system prompt).
     _turn_ctx = ""
     _stable_split = False
+    _turn_inherited = set()
     if (_chat_route == "local" and _DYNAMIC_LOCAL_PROMPT and _STABLE_LOCAL_PREFIX
             and PC_CONTROL_PROMPT and PC_CONTROL_PROMPT in _system_prompt):
         # CACHE-STABLE SPLIT — see _STABLE_LOCAL_PREFIX. The system prompt keeps
@@ -22341,7 +22619,16 @@ def _call_llm(user_text: str) -> str:
             _base_prompt = _local_stable_system_prompt(_system_prompt)
             if _base_prompt is None:
                 raise RuntimeError("stable layout unavailable")
-            _turn_ctx = _pr.turn_pc_block(user_text, PC_CONTROL_PROMPT)
+            # history= lets a short elliptical follow-up ('Pause it.',
+            # 'never mind, cancel that') also route on the previous user
+            # turn, which is where its subject lives (2026-10-01 brain eval)
+            # - only while that turn is recent (_routing_history). What only
+            # the history routed ranks low in the prompt budget.
+            _route_hist = _routing_history()
+            _turn_ctx = _pr.turn_pc_block(user_text, PC_CONTROL_PROMPT,
+                                          history=_route_hist)
+            _turn_inherited = _pr.inherited_turn_sections(
+                user_text, PC_CONTROL_PROMPT, history=_route_hist)
             _stable_split = True
         except Exception as _pr_err:
             print(f"  [prompt-router] stable split failed ({_pr_err}); "
@@ -22353,7 +22640,8 @@ def _call_llm(user_text: str) -> str:
             and PC_CONTROL_PROMPT and PC_CONTROL_PROMPT in _system_prompt):
         try:
             from core import prompt_router as _pr
-            _slim_pc = _pr.slim_pc_control(user_text, PC_CONTROL_PROMPT)
+            _slim_pc = _pr.slim_pc_control(user_text, PC_CONTROL_PROMPT,
+                                           history=_routing_history())
             # slim_pc_control keeps PC_CONTROL's own preamble but NOT the local
             # anti-hallucination guard (the highest-value instruction on this
             # path). _local_cheatsheet has it; this path did not — restore it
@@ -22365,21 +22653,28 @@ def _call_llm(user_text: str) -> str:
             print(f"  [prompt-router] slim failed ({_pr_err}); full prompt")
             _base_prompt = _system_prompt
 
-    _turn_addenda = (
-        _tone_system_addendum(tone)
-        + route["addendum"]
-        + emotion_addendum
-        + mode_addendum
-        + voice_mood_addendum
+    # Kept as labelled, ranked pieces so the local prompt budget can drop the
+    # least important ones from an overflowing turn (_fit_local_messages);
+    # _turn_addenda is their plain concatenation, in this order.
+    _addenda_parts = [
+        ("tone", _tone_system_addendum(tone), _prompt_budget.RANK_REGISTER),
+        ("voice-mood route", route["addendum"], _prompt_budget.RANK_REGISTER),
+        ("emotion", emotion_addendum, _prompt_budget.RANK_REGISTER),
+        ("agent mode", mode_addendum, _prompt_budget.RANK_MODE),
+        ("voice-mood response", voice_mood_addendum,
+         _prompt_budget.RANK_REGISTER),
         # Per-turn semantic recall from tiered long-term memory. Lives in the
         # VOLATILE tail so it never invalidates the cached stable prefix
         # (see _cached_system_param); '' when disabled / cold / slow.
-        + _ltm_context(user_text)
+        ("long-term memory", _ltm_context(user_text),
+         _prompt_budget.RANK_MEMORY),
         # Phrasebook "last used" rotation hint (2026-09-29): per-turn by
         # nature, so it lives here with the other volatile material and never
         # in the system prompt, where each rotation changed the cached prefix.
-        + _phrase_rotation_hint()
-    )
+        ("phrase rotation", _phrase_rotation_hint(),
+         _prompt_budget.RANK_STYLE_HINT),
+    ]
+    _turn_addenda = "".join(_t for _l, _t, _r in _addenda_parts)
 
     if _stable_split:
         # Cache-stable layout: the system prompt is byte-identical every turn,
@@ -22392,11 +22687,18 @@ def _call_llm(user_text: str) -> str:
         # See _last_turn_pc_block: without this the follow-up round loses the
         # action reference entirely.
         _last_turn_pc_block[0] = _turn_ctx
+        # The local prompt budget's per-turn parts: the section bodies, then
+        # each addendum. They join to exactly the _turn_ctx sent below.
+        _turn_parts = _turn_budget_parts(_turn_ctx, _addenda_parts,
+                                         inherited=_turn_inherited)
         _turn_ctx = _turn_ctx + _turn_addenda
     else:
         sys_prompt_now = _base_prompt + _turn_addenda
         _turn_ctx = ""
         _last_turn_pc_block[0] = ""
+        # Legacy layout: the addenda are in sys_prompt_now and nothing rides
+        # the user message, so the budget can only trim history.
+        _turn_parts = []
     # Remember the split so the follow-up round (get_followup_response) can
     # re-use the very same cached system prompt instead of rebuilding a
     # different one and paying a second full prompt evaluation. (It used to
@@ -22407,7 +22709,11 @@ def _call_llm(user_text: str) -> str:
     _last_stable_sys_prompt[0] = sys_prompt_now if _stable_split else ""
 
     _prof("prompt_end", f"sys={len(sys_prompt_now)} ctx={len(_turn_ctx)}")
-    _tt("set_first", "turn_ctx_chars", len(_turn_ctx))
+    # turn_ctx_chars is what was SENT (review 2026-10-02): the local branch
+    # records it after the prompt budget, with budget_trimmed, so a trimmed
+    # turn never enters the chars-per-token calibration as an untrimmed one.
+    if _chat_route != "local":
+        _tt("set_first", "turn_ctx_chars", len(_turn_ctx))
     _tt("set_first", "sys_chars", len(sys_prompt_now))
     if _chat_route == "local":
         # LOCAL-routed turn: local model is primary. On local failure, fall
@@ -22419,9 +22725,20 @@ def _call_llm(user_text: str) -> str:
         # (_reprime_check_stale).
         _owner_chat_call.active = True
         try:
-            reply = _local_then_cloud_or_honest(
-                sys_prompt_now,
-                _with_turn_context(conversation_history, _turn_ctx))
+            # The per-turn context goes on as ranked parts (they join to
+            # exactly _turn_ctx) so an overflowing turn can shed the least
+            # important ones; a turn that fits is sent byte-for-byte as before.
+            _fitted = _fit_local_messages(sys_prompt_now, conversation_history,
+                                          _turn_parts, max_tokens=500,
+                                          where="turn")
+            _tt("set_first", "turn_ctx_chars",
+                getattr(_fitted, "ctx_chars", len(_turn_ctx))
+                if isinstance(_fitted, _BudgetedMessages) else len(_turn_ctx))
+            _tt("set_first", "budget_trimmed",
+                1 if getattr(_fitted, "trimmed", False) else 0)
+            # The next turn and the idle re-prime share this trimmed prefix.
+            _persist_budget_history_trim(_fitted)
+            reply = _local_then_cloud_or_honest(sys_prompt_now, _fitted)
         finally:
             _owner_chat_call.active = False
     elif AI_BACKEND == "claude":
@@ -28019,9 +28336,9 @@ def _summarise_task_line(line: str) -> str:
 # tell me how much it costs to run you" (22:35). A command is "where we left
 # off" only when it is a request worth resuming: not a hotword echo or a list,
 # not a media / system / window / device command (resuming one would re-run
-# it), not a question, not a greeting or a yes/no.
-_RESUME_WAKE_LEAD_RE = re.compile(
-    r"^\s*(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*", re.IGNORECASE)
+# it), not a question, not a greeting or a yes/no. The wake word is taken
+# off by core/wake_prefix.strip_wake_lead - the one wake-word rule, never a
+# private copy of it here.
 _RESUME_NOT_WORK_RE = re.compile(
     r"^(?:please\s+)?(?:"
     r"play|plays|playing|put on|pause|resume|unpause|skip|next|previous|prev|"
@@ -28062,7 +28379,7 @@ def _resume_command_phrase(cmd) -> str:
             hot = globals().get("STT_HOTWORDS")
         if _stt_vocab.is_hotword_echo(raw, hot):
             return ""
-        s = _RESUME_WAKE_LEAD_RE.sub("", raw).strip()
+        s = _wake_prefix.strip_wake_lead(raw).strip()
         if not s or _resume_list_shaped(s) or s.rstrip().endswith("?"):
             return ""
         if _RESUME_NOT_WORK_RE.match(s) or _RESUME_QUESTION_RE.match(s):
@@ -30900,29 +31217,44 @@ def _standby_greet_admit_take() -> bool:
         return False
 
 
+from core import wake_prefix as _wake_prefix  # noqa: E402
+
+
 def _text_has_wake_prefix(text: str) -> bool:
-    """True if ``text`` is a short utterance led by a wake word
-    ('jarvis'/'hey'/'ok'/'okay'). Mirrors skills/standby_audio_detect.
-    should_refuse_wake's wake detection so the gate agrees with it: a clear
-    leading wake word on a ≤6-word command is the one-command path that always
-    passes the background-audio gate."""
-    if not text:
-        return False
-    words = text.strip().lower().split()
-    if not words:
-        return False
-    first = words[0].strip(",.!?")
-    # A clear leading "jarvis" means the user is addressing JARVIS directly — let
-    # it through at ANY length, so "Jarvis, <a whole sentence>" wakes/reaches him
-    # too, not just a <=6-word command (the old <=6 cap silently swallowed real
-    # requests like "Jarvis, are you positive that's the correct reading?").
-    if first == "jarvis":
-        return True
-    # "hey/ok/okay JARVIS ..." — require 'jarvis' as the 2nd token so ordinary
-    # speech that merely starts with "hey"/"ok" is not mistaken for a wake.
-    if first in {"hey", "ok", "okay"} and len(words) >= 2 and words[1].strip(",.!?") == "jarvis":
-        return True
-    return False
+    """True if ``text`` addresses JARVIS by name at its start: the one-command
+    path that always passes the background-audio gate, opens the follow-up
+    window, lets a standby wake carry its command and tells the learn gate
+    the turn was addressed. Any length after the name ("Jarvis, <a whole
+    sentence>").
+
+    The rule lives in core/wake_prefix.py — the ONE copy, shared with
+    skills/standby_audio_detect.should_refuse_wake and core/fast_paths. Since
+    2026-10-01 the name may be word 1, 2 or 3 behind lead interjections
+    ("What Jarvis what model are you?" was refused live in wake-word mode
+    because only word 1 counted); a mid-sentence mention ("I asked Jarvis
+    yesterday", "tell Jarvis that ...") still is not addressed. Never
+    raises."""
+    return _wake_prefix.has_wake_prefix(text)
+
+
+def _wake_lead_canonical(text: str) -> str:
+    """The main loop's command text for an admitted turn: a filler-led wake
+    ("What Jarvis what model are you?") rewritten to the plain prefix form
+    ("Jarvis what model are you?"), so every handler downstream — lead
+    fillers, yes/no, fast paths, skill routes, the LLM — gets the command
+    exactly as the "Jarvis, ..." path hands it over, wake word stripped
+    wherever that path strips it. Anything else is returned unchanged
+    (core.wake_prefix.canonical_wake_text). Logs that it happened, never the
+    words. Never raises."""
+    try:
+        out = _wake_prefix.canonical_wake_text(text)
+        if isinstance(out, str) and out and out != text:
+            print(f"  [wake] lead before the wake word dropped "
+                  f"({len(text or '')} -> {len(out)} chars)")
+            return out
+    except Exception:
+        pass
+    return text
 
 
 def _smtc_media_playing() -> bool:
@@ -30941,7 +31273,8 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
     """Decide whether to ignore a non-wake utterance because background audio
     is active. Returns ``(refuse, reason)``; reason is "" when not refusing.
 
-    A clear leading "JARVIS …" always passes (the one-command path). Otherwise
+    A clear leading "JARVIS …" always passes (the one-command path; word 1-3
+    behind lead interjections, see _text_has_wake_prefix). Otherwise
     refuse when ANY of: the manual wake-word toggle is on, or - only while
     AMBIENT_MUSIC_REFUSE_WAKE is set - SMTC reports media playing or sustained
     room music is detected. Never raises — on any error it fails OPEN (returns
@@ -32179,19 +32512,34 @@ LONG_RUNNING_ACTIONS: set[str] = {
 # the action's own self-exit timer (1.5–3 s) — so a cosmetic bridge line
 # can land mid-shutdown, producing odd half-spoken utterances after the
 # user already heard the confirmation. Skip the wrapper entirely for them.
-_FIRE_AND_EXIT_ACTIONS: set[str] = {
-    "start_overnight_upgrade",
-    "upgrade",
-    "restart",
-    # All shutdown aliases — their handler schedules os._exit(0) on a 2s
-    # timer, so the quip layer's tail can't land before the process dies.
-    "shutdown_jarvis",
-    "shut_down",
-    "exit_jarvis",
-    "quit_jarvis",
-    "power_off_jarvis",
-    "turn_off_jarvis",
-}
+#
+# The set lives in core/action_risk.py (SELF_TERMINATING_ACTIONS) since
+# 2026-10-02: the prompt router (never inherits a section documenting one)
+# and the dispatcher's self-termination gate (_self_terminating_target: one
+# runs only when the owner's words ask for it) read the same list. Every
+# shutdown alias's handler schedules os._exit(0) on a 2s timer, so the quip
+# layer's tail can't land before the process dies.
+_FIRE_AND_EXIT_ACTIONS: set[str] = set(_action_risk.SELF_TERMINATING_ACTIONS)
+
+
+def _self_terminating_target(name: str, fn=None) -> str:
+    """The self-terminating action (_FIRE_AND_EXIT_ACTIONS) that running
+    ``name`` amounts to - ``name`` itself, or the one whose HANDLER it shares
+    (a skill alias of shutdown_jarvis) - else "". Never raises."""
+    try:
+        n = (name or "").strip().lower()
+        if n in _FIRE_AND_EXIT_ACTIONS:
+            return n
+        if fn is None:
+            fn = ACTIONS.get(n)
+        if fn is None:
+            return ""
+        for other in sorted(_FIRE_AND_EXIT_ACTIONS):
+            if ACTIONS.get(other) is fn:
+                return other
+        return ""
+    except Exception:
+        return ""
 
 # Status lines keyed by action class — picked in this order:
 #   1. service-specific override (Prime Video / Netflix / etc.)
@@ -32826,6 +33174,52 @@ def _needs_confirmation(name: str, arg: str) -> bool:
     # '/checkout', 'payment' and 'deleting' still match (2026-10-01).
     return any(re.search(rf"(?<![a-z]){re.escape(kw.lower())}", haystack)
                for kw in CONFIRM_KEYWORDS)
+
+
+# ── Autocorrect safety (2026-10-01) ──────────────────────────────────────
+# Live: for "Jarvis, turn it off" the local model invented [ACTION: shutdown]
+# and the fuzzy action-name corrector routed it to shutdown_jarvis (0.78 over
+# the 0.75 floor): JARVIS shut itself down on a guess. A GUESSED name may never
+# land on an action JARVIS already treats as dangerous. No new hand list - the
+# protected set is the union of the existing classifications:
+#   _FIRE_AND_EXIT_ACTIONS       self-terminating (shutdown aliases, restart,
+#                                upgrade, overnight)
+#   _DESTRUCTIVE_REPLAY_ACTIONS  never re-fired by "do that again"
+#   CONFIRM_KEYWORDS             _needs_confirmation on the name alone
+#   core.action_risk             the web Actions tab's confirm denylist (less
+#                                its "sends" rules: a send_* draft is read back
+#                                before it goes, core/draft_preview_gate)
+# plus any alias bound to the SAME handler as one of those (the web tab's
+# _live_confirm_reason rule), so a skill alias of shutdown_jarvis is covered.
+def _autocorrect_name_protected(name: str) -> bool:
+    """By NAME: ``name`` is in one of the classifications above."""
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    return (n in _FIRE_AND_EXIT_ACTIONS
+            or n in _DESTRUCTIVE_REPLAY_ACTIONS
+            or _needs_confirmation(n, "")
+            or _action_risk.guess_protected(n))
+
+
+def _autocorrect_protected(name: str) -> bool:
+    """True when the autocorrect layer must never route a guessed action name
+    onto ``name`` (or offer it as a "did you mean"): it is protected by name,
+    or bound to the same handler as a name that is. Fails safe: any fault
+    counts as protected."""
+    try:
+        if _autocorrect_name_protected(name):
+            return True
+        fn = ACTIONS.get(name)
+        if fn is None:
+            return False
+        for other, other_fn in list(ACTIONS.items()):
+            if (other_fn is fn and other != name
+                    and _autocorrect_name_protected(other)):
+                return True
+        return False
+    except Exception:
+        return True
 
 
 # ── JARVIS pushback ──────────────────────────────────────────────────────
@@ -33876,6 +34270,10 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # the pushback objections above — otherwise JARVIS goes silent awaiting a
     # "yes" the user never heard it ask for.
     _confirmation_prompts: list[str] = []
+    # Clarifying questions from a BLOCKED autocorrect guess ("Turn what off,
+    # sir?"). Like a pushback objection, the question replaces the model's
+    # prose, which described the guessed action ("Shutting down, sir.").
+    _autocorrect_clarify: list[str] = []
 
     # Mission narration — pre-scan to count [ACTION:] tokens. When the LLM
     # has chained 3+ actions in one reply, speak an opening line and emit a
@@ -33908,11 +34306,19 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             #                so the next utterance resolves the pick
             #   none       → no candidate cleared the floor; original
             #                'unknown action' path
+            #   blocked    → the guess could land on a protected action
+            #                (_autocorrect_protected: shutdown_jarvis,
+            #                restart, reset_memory, run_shell, ...). Never
+            #                run or offered: dropped, the model's prose is
+            #                not voiced, and JARVIS asks what was meant
+            #                (2026-10-01: an invented 'shutdown' for "turn it
+            #                off" was routed to shutdown_jarvis)
             try:
                 choice = _cmd_autocorrect.autocorrect_command_choice(
                     name, ACTIONS.keys(),
                     threshold=_AUTOCORRECT_THRESHOLD,
                     ambiguity_gap=_AUTOCORRECT_AMBIG_GAP,
+                    protected=_autocorrect_protected,
                 )
             except Exception as _e:
                 print(f"  [autocorrect] scoring failed for {name!r}: {_e}")
@@ -33920,6 +34326,23 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             status = choice.get("status", "none")
             primary = choice.get("primary")
             secondary = choice.get("secondary")
+            if status == "blocked":
+                b_name, b_conf = choice.get("blocked") or primary or ("?", 0.0)
+                print(f"  [autocorrect] {name!r} would only be a guess at "
+                      f"protected {b_name!r} (conf={b_conf:.2f}) — not "
+                      f"running it; asking instead")
+                _autocorrect_clarify.append(
+                    _pronoun_switch.clarifying_question(_turn_user_text()))
+                # Deliberately free of FAILURE_MARKERS and not informative:
+                # a failure would start a follow-up round in which the model
+                # could name the protected action outright.
+                results.append(
+                    (name,
+                     f"⚠  UNCLEAR: '{name}' only resembles the protected "
+                     f"action {b_name} — not guessed; asked what was meant",
+                     False),
+                )
+                return ""
             if status == "silent" and primary and primary[0] in ACTIONS:
                 best, conf = primary
                 print(f"  [autocorrect] {name!r} -> {best!r} (conf={conf:.2f})")
@@ -33958,6 +34381,27 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                       f"(best conf={best_seen:.2f})")
         if fn is None:
             results.append((name, f"unknown action: {name}", False))
+            return ""
+
+        # A self-terminating action runs only on the owner's own words (review
+        # 2026-10-02). It runs at once and nothing else gates it; an inherited
+        # section or the cloud route's full prompt names shutdown_jarvis /
+        # restart exactly, so for an ambiguous "Okay, turn it off." the model
+        # could emit one, and an invented 'exit' (under the autocorrect floor)
+        # became 'unknown action', whose follow-up round could name
+        # exit_jarvis outright. Held like a pushback: the model's prose
+        # ("Shutting down, sir.") is dropped, the owner hears what it would
+        # do, and a spoken yes runs it (handle_confirmation_response). A
+        # dispatch with no owner turn (a proactive remark) never qualifies.
+        _st = _self_terminating_target(name, fn)
+        if _st and not _action_risk.asked_for_self_termination(
+                _st, _turn_user_text()):
+            _st_q = _action_risk.self_termination_question(_st)
+            _queue_pending_confirmation(name, arg)
+            _pushback_objections.append(_st_q)
+            print(f"  [self-term] {name!r} was not asked for in the owner's "
+                  f"words - holding it for a yes")
+            results.append((name, f"⚠  PUSHBACK: {_st_q}", False))
             return ""
 
         # One web page per look-up (2026-10-01): a second web_search /
@@ -34227,6 +34671,12 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     if _pushback_objections:
         cleaned = " ".join(_pushback_objections)
 
+    # A blocked autocorrect guess: the model's prose told of the action it
+    # guessed at, so it is dropped like a pushback prelude and the owner hears
+    # the question (once, after any objection).
+    if _autocorrect_clarify:
+        cleaned = " ".join(_pushback_objections + _autocorrect_clarify[:1])
+
     # A hard-confirmation (CONFIRM_KEYWORDS) action was deferred onto
     # _pending_confirmation. The prompt MUST be spoken so the user knows a
     # verbal "yes" is expected — otherwise JARVIS stalls silently. Append to
@@ -34240,11 +34690,17 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     return cleaned, results
 
 
-def get_followup_response(action_results: list[tuple[str, str]]) -> str:
-    """After informational actions ran, ask the LLM to actually answer the
-    user's original question using the action results."""
+# Spoken when a follow-up round's action results cannot fit the local window
+# even clipped (review 2026-10-02): ends the chain honestly instead of sending
+# a prompt Ollama would cut from the start (the identity and safety rules).
+_FOLLOWUP_TOO_LONG_REPLY = ("Those results came back too long for me to read "
+                            "through properly, sir.")
+
+
+def _followup_extra(action_results) -> str:
+    """The follow-up round's results message (see get_followup_response)."""
     summary = "\n".join(f"- [{name}] returned: {result}" for name, result in action_results)
-    extra = (
+    return (
         "(System: the actions in your previous response just ran. Here is what "
         "they returned:\n\n"
         f"{summary}\n\n"
@@ -34278,6 +34734,45 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         "- When you do have the answer, reply conversationally. Don't paste raw output.)"
     )
 
+
+def _fit_followup_round(local_sys: str, action_results, local_parts):
+    """The local follow-up round's messages, fitted to the budget with the
+    owner's request pinned (review 2026-10-02: on this round the final
+    message is the machine-made results, and the request it exists to
+    finish used to be the first thing dropped). When the results alone
+    overflow, each is clipped (head and tail kept) through
+    prompt_budget.RESULT_CLIP_STEPS. None when even the smallest clip cannot
+    fit: the caller ends the chain instead of sending a prompt Ollama would
+    cut from the start."""
+    def _fit(results, log=True):
+        return _fit_local_messages(
+            local_sys,
+            list(conversation_history)
+            + [{"role": "user", "content": _followup_extra(results)}],
+            local_parts, max_tokens=400, where="follow-up",
+            pin_last_user=True, log=log)
+
+    fitted = _fit(action_results)
+    if getattr(fitted, "fits", True):
+        return fitted
+    for cap in _prompt_budget.RESULT_CLIP_STEPS:
+        clipped = [(n, _prompt_budget.clip_middle(str(r), cap))
+                   for n, r in action_results]
+        fitted = _fit(clipped, log=False)
+        if getattr(fitted, "fits", True):
+            print(f"  [prompt-budget] follow-up: action results clipped to "
+                  f"~{cap:,} chars each to fit the window")
+            return fitted
+    print("  [prompt-budget] follow-up: the results cannot fit even "
+          "clipped - ending the chain")
+    return None
+
+
+def get_followup_response(action_results: list[tuple[str, str]]) -> str:
+    """After informational actions ran, ask the LLM to actually answer the
+    user's original question using the action results."""
+    extra = _followup_extra(action_results)
+
     # Carry the tone of the original user turn into the follow-up so the
     # register doesn't snap back to default mid-chain (e.g. user barks
     # "stop!" → action runs → JARVIS suddenly returns to flowery prose).
@@ -34293,17 +34788,23 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         _mode_add = _mode_addendum()
     except Exception:
         pass
-    _followup_addenda = (
-        _tone_system_addendum(_last_user_tone[0])
-        + _route.get("addendum", "")
-        + _mode_add
+    # Ranked pieces for the local prompt budget (see _call_llm's
+    # _addenda_parts); _followup_addenda is their concatenation, in order.
+    _followup_addenda_parts = [
+        ("tone", _tone_system_addendum(_last_user_tone[0]),
+         _prompt_budget.RANK_REGISTER),
+        ("voice-mood route", _route.get("addendum", ""),
+         _prompt_budget.RANK_REGISTER),
+        ("agent mode", _mode_add, _prompt_budget.RANK_MODE),
         # Phrasebook rotation hint: it used to ride _system_prompt, so the
         # follow-up round (often the reply actually spoken after an action)
         # saw which lines were used last. Now per-turn, it rides with the
-        # other addenda: _local_ctx on the stable local layout, the uncached
-        # tail of sys_prompt_now everywhere else.
-        + _phrase_rotation_hint()
-    )
+        # other addenda: the turn context (_local_parts) on the stable local
+        # layout, the uncached tail of sys_prompt_now everywhere else.
+        ("phrase rotation", _phrase_rotation_hint(),
+         _prompt_budget.RANK_STYLE_HINT),
+    ]
+    _followup_addenda = "".join(_t for _l, _t, _r in _followup_addenda_parts)
     # LEGACY (full-prompt) layout — what every non-local branch below uses, and
     # what _cached_system_param is built to split. The cache-stable layout is
     # applied ONLY inside the local branch, deliberately; see below.
@@ -34351,7 +34852,7 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         # caching, because _cached_system_param returns the string untouched
         # once full_prompt.startswith(_system_prompt) is False. Off the local
         # route we keep the legacy full prompt. 2026-09-06.
-        _local_sys, _local_ctx = sys_prompt_now, ""
+        _local_sys, _local_parts = sys_prompt_now, []
         if _last_stable_sys_prompt[0]:
             _local_sys = _last_stable_sys_prompt[0]
             # Re-send THIS turn's section bodies. That system prompt no longer
@@ -34362,15 +34863,18 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
             # invents plausible-looking tokens that dispatch to nothing. The
             # dropped step the follow-up exists to finish comes from the same user
             # text these bodies were selected for. See _last_turn_pc_block.
-            _local_ctx = _last_turn_pc_block[0] + _followup_addenda
+            # As ranked parts joining to exactly
+            # _last_turn_pc_block[0] + _followup_addenda, so the prompt budget
+            # can shed the least important ones from an overflowing round.
+            _local_parts = _turn_budget_parts(_last_turn_pc_block[0],
+                                              _followup_addenda_parts)
         try:
-            return _local_then_cloud_or_honest(
-                _local_sys,
-                _with_turn_context(
-                    list(conversation_history)
-                    + [{"role": "user", "content": extra}], _local_ctx),
-                max_tokens=400,
-            )
+            _fitted = _fit_followup_round(_local_sys, action_results,
+                                          _local_parts)
+            if _fitted is None:
+                return _FOLLOWUP_TOO_LONG_REPLY
+            return _local_then_cloud_or_honest(_local_sys, _fitted,
+                                               max_tokens=400)
         except Exception:
             # Unexpected raise on the local path (it has its own no-propagate
             # wrapper, so this is belt-and-braces): fall through to the backend
@@ -34516,8 +35020,11 @@ def handle_autocorrect_disambig_response(user_text: str) -> bool:
     # replay_last_action destructive-action refusal). Also refuse anything the
     # normal path would confirmation- or pushback-gate, so a guessed match
     # can't slip a memory/task wipe (reset_memory, forget_last_hour, clear_tasks)
-    # or any confirm-gated action past with a plain "yes".
-    if (name in _DESTRUCTIVE_REPLAY_ACTIONS
+    # or any confirm-gated action past with a plain "yes". _autocorrect_protected
+    # (2026-10-01) is the full guess-protected set - it adds the shutdown
+    # aliases (_FIRE_AND_EXIT_ACTIONS), which this gate used to let through on
+    # "the first one", and every alias by handler.
+    if (_autocorrect_protected(name)
             or _needs_confirmation(name, arg)
             or _jarvis_pushback(name, arg) is not None):
         print(f"  [autocorrect-disambig] refusing destructive pick {name!r} "
@@ -34762,9 +35269,10 @@ _ANSWER_FIRST_MAX_WORDS = 15
 _ANSWER_FIRST_MAX_ANSWER_WORDS = 30
 # Result prefixes parse_and_run_actions records when it REPLACED or deferred
 # the prose on purpose (pushback objection, CONFIRM_KEYWORDS prompt, autocorrect
-# ambiguity). Those replies are never answer-first candidates.
+# ambiguity, a blocked autocorrect guess). Those replies are never answer-first
+# candidates.
 _ANSWER_FIRST_DEFERRED_PREFIXES = ("⚠  PUSHBACK:", "⚠  REQUIRES CONFIRMATION:",
-                                   "⚠  AMBIGUOUS:")
+                                   "⚠  AMBIGUOUS:", "⚠  UNCLEAR:")
 _ANSWER_FIRST_DIGIT_RE = re.compile(r"\d")
 # Leading prosody tag _speak strips before synthesis (core.tts.parse_wry_tag
 # shape); [intent:] / [mood:] use _INTENT_TAG_RE / _MOOD_TAG_RE.
@@ -38699,10 +39207,101 @@ def _run_voice_shortcuts(text: str) -> bool:
     if _run_timer_list_shortcut(text):
         return True
 
+    # "Jarvis, turn it off" with nothing for "it" to mean (2026-10-01): ask,
+    # never let the model guess. See _run_pronoun_switch_shortcut.
+    if _run_pronoun_switch_shortcut(text):
+        return True
+
     # Deterministic fast paths (date math, "what did I just ask", "what's my
     # name"): the last stop before the LLM, so every shortcut above keeps
     # precedence and nothing here ever arms the processing filler.
     return _run_fast_paths(text)
+
+
+def _pronoun_referent_ages() -> tuple:
+    """(prior owner turn, last executed action, media JARVIS started) ages in
+    seconds for the "turn it off" referent check; None for each that has
+    not happened this process. Never raises."""
+    prior = action = media = None
+    try:
+        prev = float(_prev_owner_turn_at[0] or 0.0)
+        if prev > 0.0:
+            prior = time.monotonic() - prev
+    except Exception:
+        pass
+    try:
+        with _action_history_lock:
+            last = dict(_action_history[-1]) if _action_history else None
+        if last and float(last.get("at") or 0.0) > 0.0:
+            action = time.time() - float(last["at"])
+    except Exception:
+        pass
+    try:
+        played = float(_jarvis_played_music_at[0] or 0.0)
+        if played > 0.0:
+            media = time.time() - played
+    except Exception:
+        pass
+    return prior, action, media
+
+
+def _run_pronoun_switch_shortcut(text: str) -> bool:
+    """A bare "turn it off" / "turn that off" / "switch it on" with NOTHING
+    for "it" to mean gets a short question - "Turn what off, sir?" - and no
+    LLM call (2026-10-01). Live, the local model answered that utterance by
+    inventing [ACTION: shutdown], which the action-name corrector mapped onto
+    shutdown_jarvis.
+
+    "Nothing to mean" uses what JARVIS tracks (core/pronoun_switch): no owner
+    turn in the last REFERENT_WINDOW_S, no action in that window
+    (_action_history), nothing JARVIS said in that window (last_speech_time:
+    a proactive line, a timer going off), no media JARVIS started in
+    MEDIA_REFERENT_WINDOW_S (_jarvis_played_music_at), no media playing now
+    (_smtc_media_playing - Spotify started by hand), and point-to-control off
+    (with it on, "turn that off" resolves by where the owner points). With
+    any of those the turn
+    routes to the model as before - it has the conversation, and a guess onto
+    a protected action is refused anyway (_autocorrect_protected).
+
+    Same contract as _run_fast_paths: gated by FAST_PATHS_ENABLED, logs a
+    "[fast-path]" line and the "JARVIS:" line, appends the turn, speaks,
+    returns True. Never raises: any fault falls through to the LLM."""
+    if not globals().get("FAST_PATHS_ENABLED", True):
+        return False
+    try:
+        if _pronoun_switch.switch_state(text) is None:
+            return False
+        try:
+            import core.config as _cfg_live
+            pointing = bool(getattr(_cfg_live, "KINECT_POINT_CONTROL_ENABLED",
+                                    False))
+        except Exception:
+            pointing = False
+        prior, action, media = _pronoun_referent_ages()
+        # Review 2026-10-02: media playing now (whoever started it) and
+        # JARVIS's own line a moment ago are referents too.
+        try:
+            spoke = time.time() - float(globals().get("last_speech_time")
+                                        or 0.0)
+            if spoke < 0.0 or not globals().get("last_speech_time"):
+                spoke = None
+        except Exception:
+            spoke = None
+        question = _pronoun_switch.referent_question(
+            text, prior_turn_age_s=prior, last_action_age_s=action,
+            media_age_s=media, pointing_enabled=pointing,
+            spoke_age_s=spoke, media_playing=bool(_smtc_media_playing()))
+    except Exception as _e:
+        print(f"  [fast-path] pronoun-switch check failed: {_e}")
+        return False
+    if not question:
+        return False
+    print("  [fast-path] pronoun-switch: no referent for 'it' — asking")
+    print(f"  JARVIS: {question}")
+    _append_turn(text, question)
+    _speak(question)
+    set_state("idle")
+    return True
 
 
 def _run_action_shortcut(text: str, kind: str, recognise, action_names,
@@ -39525,9 +40124,10 @@ _STANDBY_GREETING_WORDS = frozenset({
 def _standby_wake_carries_command(text: str, typed: bool = False) -> bool:
     """True when a standby wake utterance LEADS with the wake word and goes on
     to say something that is not just a wake / greeting ("Jarvis, turn off the
-    lights" — not "Jarvis, wake up"). Only a leading wake counts: that is what
-    lets the carried turn pass the normal-mode background gate
-    (_text_has_wake_prefix).
+    lights", "Um, Jarvis, turn off the lights" — not "Jarvis, wake up"). Only
+    a leading wake counts (word 1-3 behind lead interjections,
+    core/wake_prefix.py): that is what lets the carried turn pass the
+    normal-mode background gate (_text_has_wake_prefix).
 
     Spoken, the rest must be two or more words: a one-word tail after a
     heard "Jarvis" is too often a Whisper fragment of the room. ``typed``
@@ -39538,7 +40138,10 @@ def _standby_wake_carries_command(text: str, typed: bool = False) -> bool:
     try:
         if not _text_has_wake_prefix(text):
             return False
-        rest = _fast_paths._WAKE_LEAD_RE.sub("", (text or "").strip())
+        # The lead fillers and the wake word off the front (core.wake_prefix,
+        # the same rule the gate just applied: "Um, Jarvis, turn off the
+        # lights" -> "turn off the lights").
+        rest = _wake_prefix.strip_wake_lead((text or "").strip())
         words = _yes_no.normalize(rest).split()
         if len(words) < (1 if typed else 2):
             return False
@@ -41254,6 +41857,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     ).start()
                     set_state("idle")
                     continue
+
+                # ── WAKE WORD BEHIND A LEAD INTERJECTION (2026-10-01) ───────────
+                # "What Jarvis what model are you?" passed the gate above on its
+                # wake word at word 2; hand every handler below the plain
+                # "Jarvis what model are you?" the prefix path would have
+                # given it (see _wake_lead_canonical). A no-op for any other
+                # text.
+                text = _wake_lead_canonical(text)
 
                 # ── NOISE HEARD AS SPEECH (core/speech_filter.py, R10) ─────────
                 # A transcript that is ONLY a classic Whisper hallucination

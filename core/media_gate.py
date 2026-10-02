@@ -44,6 +44,7 @@ import re
 import time
 
 from core import learn_gate as _lg
+from core import wake_prefix as _wake_prefix
 
 # AudioSessionState: 0 inactive, 1 active, 2 expired.
 _SESSION_ACTIVE = 1
@@ -55,8 +56,8 @@ DROP_LINE = "[media-gate] PC audio playing and not the owner's voice"
 DROP_CUE = "Sorry, sir, I couldn't tell that was you over the audio."
 
 # ── what he says over his own media ───────────────────────────────────────
-_WAKE_LEAD_RE = re.compile(
-    r"^\s*(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*", re.IGNORECASE)
+# (The wake word is taken off by core/wake_prefix.strip_wake_lead, the one
+# wake-word rule.)
 _MEDIA_CONTROL_CORE = (
     r"(?:pause|unpause|resume|mute|unmute)"
     r"(?:\s+(?:it|this|that|the\s+(?:music|video|song|playback|sound|audio|tv)))?"
@@ -86,7 +87,7 @@ def is_media_control(text) -> bool:
     "please" or "a bit" at most. Such a turn passes the gate whatever the
     voice: a reel saying "Jarvis, pause" costs nothing. Never raises."""
     try:
-        s = _WAKE_LEAD_RE.sub("", str(text or "")).replace(",", " ")
+        s = _wake_prefix.strip_wake_lead(str(text or "")).replace(",", " ")
         s = " ".join(s.split())
         return bool(s) and bool(_MEDIA_CONTROL_RE.match(s))
     except Exception:

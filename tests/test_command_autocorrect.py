@@ -210,7 +210,139 @@ class ChoiceTests(EmbeddingsOffMixin, unittest.TestCase):
         self.assertIsNone(choice["secondary"])
 
 
+# ── protected targets: a guess never lands on a destructive action ───────────
+class ProtectedTargetTests(EmbeddingsOffMixin, unittest.TestCase):
+    """2026-10-01: for "Jarvis, turn it off" the local model invented
+    [ACTION: shutdown], and the corrector silently mapped that onto
+    shutdown_jarvis (0.78 > the 0.75 floor), shutting JARVIS down. The
+    ``protected`` argument names the actions a guess may never land on."""
+
+    PROTECTED = frozenset({"shutdown_jarvis"})
+
+    def _choice(self, unknown, acts=ACTIONS, **kw):
+        return ac.autocorrect_command_choice(unknown, acts,
+                                             use_embeddings=False, **kw)
+
+    def test_without_protected_the_guess_still_routes(self):
+        # The mechanism of the live bug, pinned: with no protected set the
+        # legacy contract is unchanged and "shutdown" routes silently.
+        choice = self._choice("shutdown")
+        self.assertEqual(choice["status"], "silent")
+        self.assertEqual(choice["primary"][0], "shutdown_jarvis")
+
+    def test_a_guess_onto_a_protected_action_is_blocked(self):
+        choice = self._choice("shutdown", protected=self.PROTECTED)
+        self.assertEqual(choice["status"], "blocked")
+        self.assertEqual(choice["blocked"][0], "shutdown_jarvis")
+        self.assertGreaterEqual(choice["blocked"][1], 0.75)
+        self.assertIsNone(choice["secondary"])
+
+    def test_protected_may_be_a_predicate(self):
+        choice = self._choice("shutdown",
+                              protected=lambda n: n.startswith("shutdown"))
+        self.assertEqual(choice["status"], "blocked")
+
+    def test_a_protected_runner_up_inside_the_gap_blocks_too(self):
+        # "ambient" ties ambient_mode and ambient_mode_on. Whichever ranks
+        # first, a protected one inside the ambiguity gap means the guess is
+        # not safe to make (or to offer as a "did you mean").
+        acts = ["ambient_mode", "ambient_mode_on", "screenshot", "open_url"]
+        choice = self._choice("ambient", acts,
+                              protected=frozenset({"ambient_mode_on"}))
+        self.assertEqual(choice["status"], "blocked")
+        self.assertEqual(choice["blocked"][0], "ambient_mode_on")
+
+    def test_a_protected_name_far_below_the_winner_does_not_block(self):
+        choice = self._choice("screenshto",
+                              protected=frozenset({"see_screen"}))
+        self.assertEqual(choice["status"], "silent")
+        self.assertEqual(choice["primary"][0], "screenshot")
+
+    def test_a_benign_correction_is_unaffected(self):
+        choice = self._choice("screen_shot", protected=self.PROTECTED)
+        self.assertEqual(choice["status"], "silent")
+        self.assertEqual(choice["primary"][0], "screenshot")
+
+    def test_no_match_stays_none(self):
+        choice = self._choice("zzz_qqq_unmatched", protected=self.PROTECTED)
+        self.assertEqual(choice["status"], "none")
+
+    def test_a_raising_predicate_fails_safe(self):
+        # A broken classifier must never let a guess through.
+        choice = self._choice("screen_shot", protected=lambda n: 1 / 0)
+        self.assertEqual(choice["status"], "blocked")
+
+    def test_autocorrect_command_honours_protected(self):
+        name, score = ac.autocorrect_command("shutdown", ACTIONS,
+                                             use_embeddings=False,
+                                             protected=self.PROTECTED)
+        self.assertIsNone(name)
+        self.assertGreaterEqual(score, 0.75)
+        self.assertEqual(
+            ac.autocorrect_command("screen_shot", ACTIONS,
+                                   use_embeddings=False,
+                                   protected=self.PROTECTED)[0],
+            "screenshot")
+
+
 # ── Embedding availability toggle (no network involved) ──────────────────────
+class OppositeMeaningTests(EmbeddingsOffMixin, unittest.TestCase):
+    """2026-10-02 model research: for "never mind, cancel that" the local brain
+    invented [ACTION: stop_timer], and the corrector routed it to set_timer -
+    starting a timer instead of cancelling one. stop/start/on/off/enable/...
+    are filler tokens for SIMILARITY, so the two scored as near-twins. A guess
+    must never flip the owner's intent: a candidate whose verb is the
+    opposite of the unknown name's is never routed or offered."""
+
+    TIMERS = ["set_timer", "cancel_timer", "list_timers", "volume_up",
+              "volume_down", "lights_on", "lights_off", "mute_audio",
+              "unmute_audio", "start_eavesdropping", "stop_eavesdropping"]
+
+    def _choice(self, unknown, acts=None):
+        return ac.autocorrect_command_choice(unknown, acts or self.TIMERS,
+                                             use_embeddings=False)
+
+    def _picked(self, choice):
+        if choice["status"] == "none":
+            return set()
+        names = {choice["primary"][0]}
+        if choice.get("secondary"):
+            names.add(choice["secondary"][0])
+        return names
+
+    def test_stop_timer_never_becomes_set_timer(self):
+        self.assertNotIn("set_timer", self._picked(self._choice("stop_timer")))
+
+    def test_stop_timer_with_no_same_meaning_action_is_none(self):
+        choice = self._choice("stop_timer", ["set_timer", "list_timers"])
+        self.assertNotIn("set_timer", self._picked(choice))
+
+    def test_same_meaning_correction_still_works(self):
+        self.assertIn("cancel_timer", self._picked(self._choice("cancel_timers")))
+
+    def test_on_off_up_down_mute_never_flip(self):
+        for unknown, never in (("lights_off_now", "lights_on"),
+                               ("turn_lights_on", "lights_off"),
+                               ("volume_down_please", "volume_up"),
+                               ("unmute_audi", "mute_audio"),
+                               ("start_evesdropping", "stop_eavesdropping")):
+            self.assertNotIn(never, self._picked(self._choice(unknown)),
+                             f"{unknown!r} must never become {never!r}")
+
+    def test_typos_keep_their_own_polarity(self):
+        self.assertEqual(self._choice("start_evesdropping")["primary"][0],
+                         "start_eavesdropping")
+        self.assertEqual(self._choice("volume_dwn")["primary"][0], "volume_down")
+
+    def test_clash_rule_itself(self):
+        self.assertTrue(ac._polarity_clash("stop_timer", "set_timer"))
+        self.assertTrue(ac._polarity_clash("lights_on", "lights_off"))
+        self.assertFalse(ac._polarity_clash("stop_timer", "cancel_timer"))
+        self.assertFalse(ac._polarity_clash("screen_shot", "screenshot"))
+        # a candidate carrying both words is not an opposite
+        self.assertFalse(ac._polarity_clash("lights_off", "toggle_lights_on_off"))
+
+
 class EmbeddingToggleTests(unittest.TestCase):
     def tearDown(self):
         ac.enable_embeddings()  # leave the module in its default state

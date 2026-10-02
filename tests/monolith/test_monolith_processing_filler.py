@@ -898,12 +898,19 @@ class ActionCancelTests(_Base):
 
         self._p(bc.threading, "Timer", FakeTimer)
 
-    def _run(self, name):
+    def _run(self, name, said="restart yourself"):
+        # Inside an owner turn whose words ask for it: a self-terminating
+        # action (restart) is held for a yes otherwise (2026-10-02), and a
+        # held action never reaches the filler cancel.
         acts = dict(self.bc.ACTIONS)
         acts[name] = lambda a: "done"
-        with mock.patch.object(self.bc, "ACTIONS", acts), \
-                contextlib.redirect_stdout(io.StringIO()):
-            self.bc.parse_and_run_actions(f"[ACTION: {name}, x]")
+        prev = self.bc._begin_turn_grounding(said)
+        try:
+            with mock.patch.object(self.bc, "ACTIONS", acts), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.bc.parse_and_run_actions(f"[ACTION: {name}, x]")
+        finally:
+            self.bc._end_turn_grounding(prev)
 
     def test_long_running_and_fire_and_exit_cancel(self):
         for name in ("play_streaming", "restart"):
