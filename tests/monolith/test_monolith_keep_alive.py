@@ -38,6 +38,16 @@ class KeepAliveSettingTests(MonolithGlobalsTestCase):
                                       create=True):
                 self.assertEqual(self.bc._local_keep_alive(), "20m")
 
+    def test_a_numeric_string_is_sent_as_a_number(self):
+        # Live 2026-10-02: -1 saved in the settings arrived as "-1", and Ollama
+        # answered HTTP 400 on every local request.
+        for value, want in (("-1", -1), (" 3600 ", 3600), ("+60", 60),
+                            ("24h", "24h"), ("-1m", "-1m")):
+            with self.subTest(value=value), \
+                    mock.patch.object(self.bc, "LOCAL_KEEP_ALIVE", value,
+                                      create=True):
+                self.assertEqual(self.bc._local_keep_alive(), want)
+
     def test_no_local_request_hard_codes_its_own_keep_alive(self):
         src = inspect.getsource(self.bc)
         self.assertNotIn('"keep_alive": "20m"', src)

@@ -20859,6 +20859,12 @@ def _local_keep_alive():
     v = globals().get("LOCAL_KEEP_ALIVE", "20m")
     if isinstance(v, bool) or v is None or (isinstance(v, str) and not v.strip()):
         return "20m"
+    # A bare number saved in the settings arrives as a STRING (the settings
+    # loader keeps the default's type), and Ollama rejects "-1" with HTTP 400
+    # "missing unit in duration" on EVERY local request - live 2026-10-02
+    # 15:05-16:07. A numeric string is sent as the number it spells.
+    if isinstance(v, str) and v.strip().lstrip("+-").isdigit():
+        return int(v.strip())
     return v
 
 
