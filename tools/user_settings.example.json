@@ -48,6 +48,13 @@
   "DEVICE_SPEECH_FILTER_ENABLED": true,
   "MEDIA_VOICE_GATE_ENABLED": true,
   "MEDIA_VOICE_GATE_REJECT_BELOW": 0.45,
+
+
+  "CLAP_TRIGGER_ENABLED": false,
+  "CLAP_TRIGGER_ACTION": "predictive_morning_setup",
+  "CLAP_TRIGGER_WAKE": false,
+  "CLAP_TRIGGER_COOLDOWN_S": 60.0,
+  "CLAP_TRIGGER_MIN_PEAK": 0.12,
   "AI_BACKEND": "claude",
   "CLAUDE_MODEL": "claude-sonnet-5-5",
   "LOCAL_LLM_MODEL": "gemma4:26b-a4b-it-qat",

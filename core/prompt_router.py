@@ -686,6 +686,14 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "ambient learning", "listen and learn", "go quiet", "keep learning",
         "stay talkative", "answer then go quiet",
     ],
+    # The double-clap trigger (skills/clap_trigger.py). Multi-word keywords
+    # only: a bare "clap" would load this for "play Eric Clapton" (keywords
+    # match at a word start and may run on).
+    "CLAP TRIGGER": [
+        "clap trigger", "clap detection", "clap detector", "double clap",
+        "double-clap", "clap twice", "clap to wake", "clap routine",
+        "clapping trigger", "the clapper",
+    ],
     # ── Sections added 2026-09-04 with the reachability work. Documenting an
     # action in core/prompts.py is only HALF of making it reachable: a section
     # the router never selects reaches the model as a name in the capability
@@ -841,6 +849,10 @@ _GENERIC_HEADER_WORDS = frozenset({
     # Heads only SELF-KNOWLEDGE, whose keywords and predicate route it:
     # "to my knowledge it's fine" loaded it (review 2026-10-02).
     "knowledge",
+    # CLAP TRIGGER's header words: the word-start match took "play Eric
+    # Clapton" and "clap along" ("clap") and "trigger the alarm" ("trigger")
+    # into the clap-trigger grammar. Its keyword phrases route it instead.
+    "clap", "trigger",
 })
 
 # Sections always kept even with no keyword hit. Deliberately MINIMAL: only

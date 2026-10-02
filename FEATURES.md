@@ -257,6 +257,10 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
 - **Standby audio detector** — spectral classifier on raw mic chunks; sets internal "music currently playing" state so a wake-word buried in a lyric won't flip JARVIS out of standby.
   - "audio music status"
   - Action: `audio_music_status`
+- **Double-clap trigger** (off by default) — two sharp claps ~0.15-0.7 s apart, with nothing else loud around them, run the clap routine: the morning workspace setup by default (`CLAP_TRIGGER_ACTION`), or just "You rang, sir?". Listens through the main loop's microphone fan-out (never a second stream); 60 s cool-down; never while JARVIS is speaking, in game mode, during sustained music or on staging; asleep only with "clap to wake" (`CLAP_TRIGGER_WAKE`). Speech, beats, typing, knocks, glass taps and doors are rejected by the detector (`core/clap_detector.py`). A clap never runs a power / shell / close / delete / send / buy action.
+  - "turn on the clap trigger", "clap trigger off", "is the clap trigger on"
+  - Actions: `clap_trigger_on`, `clap_trigger_off`, `clap_trigger_status`
+  - Skill: `skills/clap_trigger.py`; Settings: Hearing tab → Double-clap trigger
 
 ---
 

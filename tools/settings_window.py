@@ -924,6 +924,45 @@ SCHEMA: dict[str, dict] = {
                 "your media; raise it if videos still set him off. Applies "
                 "on the next start.",
     },
+    # Double-clap trigger (skills/clap_trigger.py): read live by the skill's
+    # worker / gate / routine; "clap trigger on/off" by voice saves the flag.
+    "CLAP_TRIGGER_ENABLED": {
+        "tab": "hearing", "label": "Double clap runs a routine",
+        "type": "bool", "default": False,
+        "help": "Two sharp claps, nothing else loud around them, run the clap "
+                "routine below. Uses the microphone JARVIS already listens on; "
+                "never while he is speaking. 'Clap trigger on/off' by voice "
+                "does the same and saves it here.",
+    },
+    "CLAP_TRIGGER_ACTION": {
+        "tab": "hearing", "label": "Clap routine (an action name)",
+        "type": "combo", "default": "predictive_morning_setup",
+        "choices": ["predictive_morning_setup", "acknowledge"],
+        "help": "predictive_morning_setup = set up the workspace (Chrome and "
+                "Apple Music, Teams, volume ~30%). acknowledge = just 'You "
+                "rang, sir?'. Any other action name works too, except power, "
+                "restart, shell, close, delete, send and buy actions, which a "
+                "clap never runs.",
+    },
+    "CLAP_TRIGGER_WAKE": {
+        "tab": "hearing", "label": "Clap to wake",
+        "type": "bool", "default": False,
+        "help": "A double clap while JARVIS is asleep / in standby wakes him "
+                "and runs the routine. Off = claps are ignored while asleep.",
+    },
+    "CLAP_TRIGGER_COOLDOWN_S": {
+        "tab": "hearing", "label": "Clap routine cool-down (seconds)",
+        "type": "float", "default": 60.0, "max": 3600,
+        "help": "The routine runs at most once per this many seconds.",
+    },
+    "CLAP_TRIGGER_MIN_PEAK": {
+        "tab": "hearing", "label": "How loud a clap must be (0-1)",
+        "type": "float", "default": 0.12, "min": 0, "min_exclusive": True,
+        "max": 1,
+        "help": "Peak level of a clap at the microphone. 'Clap trigger status' "
+                "tells you how loud your last clap was: lower this if your "
+                "claps fall short, raise it if knocks across the room fire it.",
+    },
 
     # ── AI / Models ────────────────────────────────────────────────────
     "AI_BACKEND": {
@@ -1720,6 +1759,9 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                              "DEVICE_SPEECH_FILTER_ENABLED",
                              "MEDIA_VOICE_GATE_ENABLED",
                              "MEDIA_VOICE_GATE_REJECT_BELOW"]),
+        ("Double-clap trigger", ["CLAP_TRIGGER_ENABLED", "CLAP_TRIGGER_ACTION",
+                                 "CLAP_TRIGGER_WAKE", "CLAP_TRIGGER_COOLDOWN_S",
+                                 "CLAP_TRIGGER_MIN_PEAK"]),
     ],
     "ai": [
         ("Brain", ["AI_BACKEND", "CLAUDE_MODEL", "LOCAL_LLM_MODEL",

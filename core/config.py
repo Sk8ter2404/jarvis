@@ -959,6 +959,31 @@ SILENCE_SECS  = 1.4                # seconds of quiet before processing
 SAMPLE_RATE   = 16000              # mic capture sample rate (Hz)
 
 
+# ─── Double-clap trigger (skills/clap_trigger.py, core/clap_detector.py) ─
+# CLAP_TRIGGER_ENABLED — when True, two sharp claps ~0.15-0.7 s apart with
+#   nothing else loud around them run the clap routine. It listens through the
+#   main loop's mic fan-out (add_record_tap) — never a second stream — so it
+#   only hears while JARVIS is listening, never while he speaks (his own
+#   playback is gated out too), never on staging. Off by default; "turn on the
+#   clap trigger" / "clap trigger off" toggle it live and persist it.
+# CLAP_TRIGGER_ACTION — the action a double clap runs (no argument). Default =
+#   the morning workspace setup (predictive_morning_setup: Chrome + Apple Music,
+#   Teams, master volume ~30%); "acknowledge" = just "You rang, sir?" (also the
+#   fallback when the action isn't registered). A clap never runs a power /
+#   restart / shell / close / delete / send / buy action, whatever this says.
+# CLAP_TRIGGER_WAKE — "clap to wake": a double clap while asleep / in standby
+#   wakes JARVIS and runs the routine. Off = claps are ignored while asleep.
+# CLAP_TRIGGER_COOLDOWN_S — minimum gap between two routines.
+# CLAP_TRIGGER_MIN_PEAK — how loud a clap must be at the mic (peak sample,
+#   0..1 full scale). Lower it if "clap trigger status" says your claps peak
+#   below it; raise it if knocks across the room fire it.
+CLAP_TRIGGER_ENABLED = False
+CLAP_TRIGGER_ACTION = "predictive_morning_setup"
+CLAP_TRIGGER_WAKE = False
+CLAP_TRIGGER_COOLDOWN_S = 60.0
+CLAP_TRIGGER_MIN_PEAK = 0.12
+
+
 # ─── Capture auto-gain (quiet-mic normalization before Whisper) ────────
 # CONSERVATIVE input normalization applied to the recorded float32 buffer
 # right BEFORE faster-whisper sees it, on BOTH the normal turn and the
