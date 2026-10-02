@@ -147,6 +147,16 @@ class ExclaimedUtteranceTableTests(unittest.TestCase):
         "it worked?! why did it crash!!",
         "fuck yes!!",
         "yes!! I said yes!!",
+        # A shouted bare "YES!!" is as often an exasperated answer as joy.
+        "YES!! I restarted it!!",
+        "yes!! just shut up!!",
+        "yeah!! whatever!!",
+        "yes!! you idiot!!",
+        "yeah, finally!! took you long enough!!",
+        # Negations with a typed curly apostrophe (U+2019) count too.
+        "it doesn\u2019t work!! yes I checked!!",
+        "it doesn't work!! it worked yesterday!!",
+        "it doesn\u2019t work!! it worked yesterday!!",
     )
 
     def _route(self, text):
