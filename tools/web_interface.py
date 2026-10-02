@@ -6107,6 +6107,25 @@ def _dashboard_html(token: str) -> str:
 
 # ── server factory + lifecycle ───────────────────────────────────────────────
 
+# A browser tab closed or reloaded while its request was still being answered
+# resets the socket, and the stdlib's handle_error prints a 40-line traceback
+# for it (live 2026-10-01 15:09: WinError 10054 inside _send_json on POST
+# /api/inject). Nothing on our side failed, so a client that hung up gets one
+# line; every other request error keeps the stdlib's full report.
+_CLIENT_GONE_ERRORS = (ConnectionResetError, ConnectionAbortedError,
+                       BrokenPipeError)
+
+
+class _WebServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], _CLIENT_GONE_ERRORS):
+            host = client_address[0] if client_address else "?"
+            print(f"  [web] {host} closed the connection before the reply "
+                  "was sent")
+            return
+        super().handle_error(request, client_address)
+
+
 def _port_actively_served(host: str, port: int, timeout: float = 0.35) -> bool:
     """True when something is ALREADY accepting connections on host:port — the
     signal that binding here would co-bind a live listener (see the SO_REUSEADDR
@@ -6180,7 +6199,7 @@ def create_server(*, bind: str, port: int, token: str = "",
             f"another process (a stale JARVIS or a leaked test server) — refusing "
             f"to co-bind it. Free the port (stop the other process) and retry."
         )
-    httpd = ThreadingHTTPServer((bind, int(port)), _Handler)
+    httpd = _WebServer((bind, int(port)), _Handler)
     # Pin per-server config onto the instance so the stateless handler reads it.
     # user_settings_path resolves to the live data/user_settings.json when the
     # caller didn't override it — done HERE (not as a def-time default) so the

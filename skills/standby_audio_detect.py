@@ -52,6 +52,7 @@ from core.wake_prefix import has_wake_prefix as _has_wake_prefix
 FLATNESS_THRESHOLD       = 0.25     # spectrum below this → tonal/musical
 BASS_RATIO_THRESHOLD     = 0.10     # ≥ 10 % energy in 60-250 Hz band
 MIN_RMS                  = 0.005    # ignore near-silent chunks
+MIN_CLASSIFY_SECONDS     = 0.25     # shorter buffers are skipped (see the loop)
 WINDOW_SECONDS           = 15.0     # sliding window for sustained-music check
 MIN_WINDOW_COVERAGE_SEC  = 5.0      # need ≥ this much audio in window before deciding
 MUSIC_FRACTION_REQUIRED  = 0.75     # ≥ 75 % of recent audio musical → active
@@ -486,6 +487,15 @@ def _background_loop() -> None:
             continue
         if audio is None or audio.size == 0:
             _loop_consecutive[0] = 0
+            continue
+        # TOO-SHORT GATE (2026-10-02 error census). Right after the mic ring
+        # restarts, get_mic_buffer can hand back a 64 ms scrap: whisper-tiny
+        # then transcribes 00:00.064 of audio and librosa warns "n_fft=2048 is
+        # too large for input signal of length=1024". A scrap says nothing
+        # about music either way, so the lyric counter is left as it is - a
+        # song playing through one short read still reaches the threshold.
+        if audio.shape[0] < int(sample_rate * MIN_CLASSIFY_SECONDS):
+            audio = None
             continue
 
         # SILENCE GATE (2026-09-04, TRACK 3 profile). A buffer below MIN_RMS

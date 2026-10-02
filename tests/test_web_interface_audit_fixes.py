@@ -995,5 +995,50 @@ class PageHygieneTests(_ServerBase):
         self.assertIn("document.addEventListener('visibilitychange'", html)
 
 
+
+class ClientGoneQuietTests(unittest.TestCase):
+    """A client that hung up mid-reply gets one line, not a traceback; any
+    other request error keeps the stdlib's full report (2026-10-02 census)."""
+
+    def _server(self):
+        srv = wi._WebServer(("127.0.0.1", 0), wi._Handler,
+                            bind_and_activate=False)
+        self.addCleanup(srv.server_close)
+        return srv
+
+    def _handle(self, srv, exc):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                raise exc
+            except Exception:
+                srv.handle_error(None, ("127.0.0.1", 48254))
+        return out.getvalue(), err.getvalue()
+
+    def test_each_client_gone_error_is_one_line(self):
+        srv = self._server()
+        for exc in (ConnectionResetError(10054, "forcibly closed"),
+                    ConnectionAbortedError(10053, "aborted"),
+                    BrokenPipeError(32, "broken pipe")):
+            with self.subTest(type(exc).__name__):
+                out, err = self._handle(srv, exc)
+                self.assertIn("closed the connection", out)
+                self.assertEqual(out.count("\n"), 1)
+                self.assertNotIn("Traceback", out + err)
+
+    def test_any_other_error_keeps_the_full_report(self):
+        out, err = self._handle(self._server(), ValueError("real bug"))
+        self.assertIn("Traceback", out + err)
+        self.assertIn("ValueError: real bug", out + err)
+
+    def test_create_server_uses_the_quiet_server(self):
+        httpd = wi.create_server(bind="127.0.0.1", port=0, token="",
+                                 runtime=wi.NoRuntime())
+        self.addCleanup(httpd.server_close)
+        self.assertIsInstance(httpd, wi._WebServer)
+
+
 if __name__ == "__main__":
     unittest.main()

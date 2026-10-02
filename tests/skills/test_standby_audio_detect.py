@@ -833,6 +833,28 @@ class BackgroundLoopBodyTests(unittest.TestCase):
             self.mod._background_loop()
         self.assertEqual(self.mod._loop_consecutive[0], 0)
 
+    def test_too_short_buffer_is_skipped_and_keeps_the_count(self):
+        # A 64 ms scrap (1024 samples) is never transcribed or onset-scored,
+        # and a song already counted toward standby keeps its count.
+        bc = self._bc(get_mic_buffer=lambda secs, sample_rate=16000:
+                      _tone(secs=0.064))
+        self.mod._loop_consecutive[0] = 2
+        with inject_modules(bobert_companion=bc),              mock.patch.object(self.mod, "_suppress_due_to_state",
+                               return_value=False),              mock.patch.object(self.mod, "_transcribe_buffer") as tr,              mock.patch.object(self.mod, "_onset_energy") as onset,              self._run_iterations(1):
+            self.mod._background_loop()
+        tr.assert_not_called()
+        onset.assert_not_called()
+        self.assertEqual(self.mod._loop_consecutive[0], 2)
+
+    def test_buffer_at_the_minimum_is_scored(self):
+        bc = self._bc(get_mic_buffer=lambda secs, sample_rate=16000:
+                      _tone(secs=self.mod.MIN_CLASSIFY_SECONDS))
+        with inject_modules(bobert_companion=bc),              mock.patch.object(self.mod, "_suppress_due_to_state",
+                               return_value=False),              mock.patch.object(self.mod, "_transcribe_buffer",
+                               return_value="") as tr,              mock.patch.object(self.mod, "_onset_energy", return_value=0.0),              mock.patch.object(self.mod, "_looks_like_lyrics", return_value=False),              self._run_iterations(1):
+            self.mod._background_loop()
+        tr.assert_called_once()
+
     def test_scoring_exception_releases_buffer_and_continues(self):
         bc = self._bc()
         with inject_modules(bobert_companion=bc), \
