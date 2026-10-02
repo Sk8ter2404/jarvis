@@ -231,6 +231,11 @@ _chroma_lock   = threading.Lock()
 # VRAM + contention). Held only around the encode itself, never a lazy load.
 # (2026-07-08 #15/#28)
 _encode_lock   = threading.Lock()
+# Leaf lock (2026-10-02 review): pairs installing a freshly loaded embedder
+# (_install_embedder) with an index swap's rebinding, so a load that was in
+# flight when the swap landed can never install the stale model. Nothing
+# else is ever acquired while it is held.
+_binding_lock  = threading.Lock()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -339,7 +344,7 @@ def _try_import_chroma():
 
 
 def _try_import_embedder():
-    global _embedder, _embedder_failed_until, _embedder_key
+    global _embedder_failed_until
     # Fast path: already loaded. Avoids serialising every embed call behind
     # the construction lock.
     if _embedder is not None:
@@ -386,9 +391,11 @@ def _try_import_embedder():
             # it never raises).
             dev = _embed_device(_DEFAULT_EMBED_PROFILE)
             print(f"  [ltm] loading embedder {LTM_EMBED_MODEL} on {dev}")
-            _embedder = SentenceTransformer(LTM_EMBED_MODEL, device=dev)
-            _embedder_key = _DEFAULT_EMBED_PROFILE
-            return _embedder
+            # Installed only while the live index is still this profile's
+            # (always, with default settings): _install_embedder.
+            return _install_embedder(
+                SentenceTransformer(LTM_EMBED_MODEL, device=dev),
+                _DEFAULT_EMBED_PROFILE)
         except Exception as e:
             # GPU-first, but degrade to CPU on a cuda OOM / driver hiccup
             # rather than disabling semantic recall entirely. The 3090 can
@@ -397,9 +404,9 @@ def _try_import_embedder():
             if dev == "cuda":
                 print(f"  [ltm] cuda embedder load failed ({e}); retrying on CPU")
                 try:
-                    _embedder = SentenceTransformer(LTM_EMBED_MODEL, device="cpu")
-                    _embedder_key = _DEFAULT_EMBED_PROFILE
-                    return _embedder
+                    return _install_embedder(
+                        SentenceTransformer(LTM_EMBED_MODEL, device="cpu"),
+                        _DEFAULT_EMBED_PROFILE)
                 except Exception as e2:
                     print(f"  [ltm] CPU embedder load also failed: {e2}")
                     _embedder_failed_until = _t.time() + _EMBEDDER_RETRY_COOLDOWN_S
@@ -511,7 +518,7 @@ def _load_bound_profile_embedder_locked():
     would mix two models' vectors in one index: the session falls back to
     the default profile (one log line) and a background rebuild moves the
     index onto it; dense recall is off until that completes."""
-    global _embedder, _embedder_key, _embedder_failed_until
+    global _embedder_failed_until
     key = _index_profile_key
     prof = _EMBED_PROFILES.get(key)
     if prof is None:
@@ -528,9 +535,28 @@ def _load_bound_profile_embedder_locked():
         _note_embed_fallback(key, f"{type(e).__name__}: {e}")
         _maybe_start_reindex()
         return None
-    _embedder = model
-    _embedder_key = key
-    return _embedder
+    return _install_embedder(model, key)
+
+
+def _install_embedder(model, key: str):
+    """Make `model`, just loaded for profile `key`, the live embedder -- unless
+    a background index swap moved the live index to another profile while it
+    loaded (2026-10-02 review). Installing it anyway bound the stale model
+    under its own key: the key check then refused it on every later call and
+    dense recall stayed off for the rest of the session. The swap rebinds
+    under the same lock, so whichever lands second sees the other. Returns
+    the live embedder, or None when none fits the live index."""
+    global _embedder, _embedder_key
+    with _binding_lock:
+        if key == _index_profile_key:
+            _embedder = model
+            _embedder_key = key
+            return model
+        live, live_key = _embedder, _embedder_key
+        now_key = _index_profile_key
+    print(f"  [ltm] embedder for {key} discarded: the index moved to "
+          f"{now_key} while it loaded")
+    return live if (live is not None and live_key == now_key) else None
 
 
 def _collection_metadata(key: str, *, stamp: bool = False) -> dict:
@@ -932,7 +958,7 @@ def _reconcile_chroma_locked() -> int:
 _EMBED_INDEX_FILE = "embed_index.json"
 _REINDEX_BATCH = 8            # facts per encode
 _REINDEX_PAUSE_S = 0.05       # breather between batches
-_REINDEX_BUDGET_S = 1800.0    # whole rebuild, wall clock, then give up
+_REINDEX_BUDGET_S = 1800.0    # the build once the model is loaded, wall clock
 _REINDEX_MAX_ROUNDS = 20      # re-diff passes before giving up
 _reindex_guard = threading.Lock()
 _reindex_thread: Optional[threading.Thread] = None
@@ -1125,7 +1151,6 @@ def _run_reindex(key: str) -> bool:
     cur = (_EMBED_PROFILES.get(_index_profile_key) or {}).get(
         "model") or _index_profile_key
     t0 = time.monotonic()
-    deadline = t0 + _REINDEX_BUDGET_S
     _set_reindex_state("loading", key)
     try:
         from core.log_filters import install_hf_unauthenticated_filter
@@ -1145,6 +1170,11 @@ def _run_reindex(key: str) -> bool:
         else:
             _note_embed_fallback(key, f"{type(e).__name__}: {e}")
         return False
+    # The build budget starts once the model is loaded (2026-10-02 review):
+    # the first load downloads ~0.7 GB, and a budget started before it was
+    # spent on the download, so a slow link threw away a finished download
+    # the moment the first batch checked the clock.
+    deadline = time.monotonic() + _REINDEX_BUDGET_S
     try:
         coll, have, moved = _open_reindex_target(client, key)
     except Exception as e:
@@ -1226,14 +1256,17 @@ def _swap_in_index_locked(key: str, coll, model, n_facts: int, t0: float,
         print(f"  [ltm] memory index rebuild: could not record it ({e}); "
               f"{old_model} stays live")
         return False
-    _collection = coll
-    _collection_name = prof["collection"]
-    _index_profile_key = key
-    _index_dim = int(prof["dim"])
-    _embedder = model
-    _embedder_key = key
-    _embedder_failed_until = 0.0
-    _binding_gen += 1
+    # Under _binding_lock: an embedder load in flight for the old binding
+    # then cannot install itself over this one (_install_embedder).
+    with _binding_lock:
+        _collection = coll
+        _collection_name = prof["collection"]
+        _index_profile_key = key
+        _index_dim = int(prof["dim"])
+        _embedder = model
+        _embedder_key = key
+        _embedder_failed_until = 0.0
+        _binding_gen += 1
     note = ""
     if retire:
         # Cosmetic, after the commit point: label the retired index. If the

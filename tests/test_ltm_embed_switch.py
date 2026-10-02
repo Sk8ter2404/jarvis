@@ -34,6 +34,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -198,6 +199,20 @@ class FakeClient:
     def delete_collection(self, name):
         self.deleted.append(name)
         self.colls.pop(name, None)
+
+
+class _FakeClock:
+    """Stands in for the `time` module inside core.long_term_memory: a
+    monotonic() the test moves by hand, everything else the real module."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
 class _RecordedThread:
@@ -617,6 +632,25 @@ class RebuildTests(_SwitchBase):
         self.assertEqual(ltm.retrieve_facts("User has a dog", k=1)[0]["text"],
                          "User has a dog")
 
+    def test_the_build_budget_starts_after_the_model_load(self):
+        # 2026-10-02 review: the first load downloads ~0.7 GB. A budget that
+        # started before it was spent on the download, so a slow link threw
+        # the finished download away at the first batch.
+        self.seed_legacy()
+        clock = _FakeClock()
+        real_load = ltm._load_profile_model
+
+        def slow_load(key, dev):
+            clock.now += ltm._REINDEX_BUDGET_S + 60.0     # a long download
+            return real_load(key, dev)
+
+        self.want("voyage-4-nano")
+        with mock.patch.object(ltm, "time", clock), \
+                mock.patch.object(ltm, "_load_profile_model", slow_load):
+            self.assertTrue(ltm._run_reindex("voyage-4-nano"))
+        self.assertEqual(ltm._index_profile_key, "voyage-4-nano")
+        self.assertEqual(ltm._reindex_state["state"], "done")
+
     def test_switching_back_rebuilds_bge_and_keeps_both_backups(self):
         self.seed_legacy()
         self.switch_and_build()
@@ -701,6 +735,33 @@ class MixingImpossibleTests(_SwitchBase):
             hits = ltm.retrieve_facts("User has a dog", k=2)
         self.assertEqual(coll.queries, 0)
         self.assertTrue(all("score" not in h for h in hits))
+
+    def test_a_load_that_straddles_a_swap_never_installs_the_stale_model(self):
+        # 2026-10-02 review: a bge load in flight when the background swap
+        # landed installed itself over the swapped-in voyage model; the key
+        # check then refused it on every later call, so dense recall stayed
+        # off for the rest of the session.
+        self.seed_legacy()
+        ltm._embedder = None         # dropped after an encode error / cold
+        self.want("voyage-4-nano")
+        st = sys.modules["sentence_transformers"]
+
+        def load_while_the_swap_lands(model, device=None, **kwargs):
+            if model == _BGE:
+                ltm._reindex_worker()    # the rebuild completes mid-load
+            return FakeST(model, device=device, **kwargs)
+
+        with mock.patch.object(st, "SentenceTransformer",
+                               load_while_the_swap_lands):
+            got = ltm._try_import_embedder()
+        (voy,) = FakeST.of(_VOYAGE)
+        self.assertIs(got, voy)
+        self.assertIs(ltm._try_import_embedder(), voy)
+        self.assertEqual(ltm.retrieve_facts("User has a dog", k=1)[0]["text"],
+                         "User has a dog")
+        self.assertEqual(voy.calls[-1], [_QP + "User has a dog"])
+        self.assertIn("discarded: the index moved to voyage-4-nano",
+                      self.log())
 
     def test_a_collection_stamped_by_another_model_is_never_used(self):
         self.seed_legacy()
