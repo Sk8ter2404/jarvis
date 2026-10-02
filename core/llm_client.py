@@ -256,18 +256,111 @@ def build_request(*, purpose: str = "voice", **kwargs: Any) -> dict:
     return req
 
 
+# ── Retired / unknown model guard (2026-10-02) ───────────────────────────
+#
+# Anthropic answers a request for a retired (or never-existing, or not-for-
+# this-key) model with 404 not_found_error. Every Claude call in the tree comes
+# through create_message / stream_message, so the guard lives HERE, once:
+#   * a not_found answer marks the model gone for the session and logs ONE line
+#     (core.claude_model_guard.GUARD);
+#   * with a successor configured (core.config.CLAUDE_MODEL_SUCCESSORS) the
+#     call is retried once on it, and later calls go straight to it;
+#   * with none, later calls raise RetiredModelError instead of paying the 404
+#     round trip again — a RuntimeError, so the caller's existing fallback (the
+#     local brain, raw tool data, an honest line) runs as it did for the 404.
+# The FIRST not_found still propagates as the SDK's own NotFoundError, so a
+# caller's `except anthropic.APIStatusError` sees exactly what it saw before.
+# With no successor table (the shipped default) a working model is untouched.
+
+
+def _successor_table() -> dict:
+    """core.config.CLAUDE_MODEL_SUCCESSORS, read at call time; {} on any
+    doubt."""
+    try:
+        from core import config as _cfg
+        table = getattr(_cfg, "CLAUDE_MODEL_SUCCESSORS", None)
+        return dict(table) if isinstance(table, dict) else {}
+    except Exception:
+        return {}
+
+
+def _guarded_model(model: Any, where: str = "") -> Any:
+    """The model this call should send: the requested one, or its configured
+    successor when Anthropic already said the requested one is gone. Raises
+    RetiredModelError when it is gone with no usable successor."""
+    from core.claude_model_guard import GUARD, RetiredModelError
+    use = GUARD.resolve(model, _successor_table())
+    if use is None:
+        raise RetiredModelError(str(model), where)
+    return use
+
+
+def _note_if_not_found(model: Any, err: BaseException, where: str = "") -> str:
+    """When ``err`` is Anthropic's not_found answer for ``model``, mark it gone
+    (one log line per model per session) and return the successor to retry on
+    ('' when none, or when ``err`` is some other failure). Never raises."""
+    try:
+        from core.claude_model_guard import GUARD, is_model_not_found, successor_for
+        if not model or not is_model_not_found(err, model):
+            return ""
+        succ = successor_for(model, _successor_table())
+        if succ and GUARD.is_retired(succ):
+            succ = ""
+        GUARD.note_not_found(model, where=where, successor=succ)
+        return succ
+    except Exception:
+        return ""
+
+
+def _note_model_ok(model: Any) -> None:
+    try:
+        from core.claude_model_guard import GUARD
+        GUARD.note_ok(model)
+    except Exception:
+        pass
+
+
 def create_message(client: Any, *, purpose: str = "voice", **kwargs: Any) -> Any:
     """``client.messages.create`` with the per-model request shaping applied.
     Returns the raw Message; read it with ``response_text``. The reply's token
-    usage is added to ``session_usage``."""
-    msg = client.messages.create(**build_request(purpose=purpose, **kwargs))
+    usage is added to ``session_usage``.
+
+    Retired-model guard (see above): a model Anthropic already answered
+    not_found for is swapped for its configured successor, or the call raises
+    ``RetiredModelError`` without touching the network; a fresh not_found is
+    retried once on the successor when one is configured, else re-raised."""
+    model = kwargs.get("model")
+    where = f"a {purpose!r} call"
+    use = _guarded_model(model, where)
+    if use != model:
+        kwargs = dict(kwargs, model=use)
+    # At most two attempts: the model, then (only after its not_found) its
+    # configured successor. ONE call site, so the AST audit still finds
+    # exactly one messages.create here.
+    for attempt in (1, 2):
+        try:
+            msg = client.messages.create(**build_request(purpose=purpose, **kwargs))
+            break
+        except Exception as e:
+            succ = _note_if_not_found(kwargs.get("model"), e, where)
+            if not succ or attempt == 2:
+                raise
+            kwargs = dict(kwargs, model=succ)
+    _note_model_ok(kwargs.get("model"))
     _record_session_usage(kwargs.get("model"), msg)
     return msg
 
 
 def stream_message(client: Any, *, purpose: str = "voice", **kwargs: Any) -> Any:
     """``client.messages.stream`` (a context manager) with the per-model
-    request shaping applied."""
+    request shaping applied. A model already known to be gone is swapped for
+    its successor or raises ``RetiredModelError`` here (see create_message);
+    stream_text notes a fresh not_found, since the request is only sent when
+    the context is entered."""
+    model = kwargs.get("model")
+    use = _guarded_model(model, f"a {purpose!r} call")
+    if use != model:
+        kwargs = dict(kwargs, model=use)
     return client.messages.stream(**build_request(purpose=purpose, **kwargs))
 
 
@@ -403,20 +496,33 @@ def stream_text(
         kwargs["system"] = system
     parts: list[str] = []
     final = None
-    with stream_message(_client(timeout), purpose=purpose, **kwargs) as stream:
-        for chunk in stream.text_stream:
-            parts.append(chunk)
-            if on_delta is not None:
-                try:
-                    on_delta(chunk)
-                except Exception:
-                    pass
-        try:
-            final = stream.get_final_message()
-            _log_cache_usage(getattr(final, "usage", None))
-            _record_session_usage(model, final)
-        except Exception:
-            final = None   # telemetry only — never let it taint a good stream
+    # Retired-model guard (create_message): resolved once up front so the
+    # usage row names the model that actually answered.
+    where = f"a {purpose!r} call"
+    used = _guarded_model(model, where)
+    kwargs["model"] = used
+    try:
+        with stream_message(_client(timeout), purpose=purpose, **kwargs) as stream:
+            for chunk in stream.text_stream:
+                parts.append(chunk)
+                if on_delta is not None:
+                    try:
+                        on_delta(chunk)
+                    except Exception:
+                        pass
+            try:
+                final = stream.get_final_message()
+                _log_cache_usage(getattr(final, "usage", None))
+                _record_session_usage(used, final)
+            except Exception:
+                final = None   # telemetry only — never let it taint a good stream
+    except Exception as e:
+        # The request goes out when the stream opens, so a not_found lands
+        # here: mark the model gone (one line) before the caller's fallback
+        # (the main chat retries complete(), which then uses the successor).
+        _note_if_not_found(used, e, where)
+        raise
+    _note_model_ok(used)
     if final is not None:
         _check_refusal(final)
     if not parts:

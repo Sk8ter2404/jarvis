@@ -57,6 +57,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
+from core.claude_model_guard import RetiredModelError as _RetiredModelError
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  CONFIG (defaults — overridable via bobert_companion module attrs)
@@ -70,8 +72,10 @@ SUB_AGENTS_DIR = os.path.join(_PROJECT_DIR, "skills", "sub_agents")
 # on Claude Haiku 4.5 ($1/$5). NOT Opus 5.5: this runs inside a spoken turn
 # with a 20 s planner timeout, and Opus 5.5 always thinks (~13 s to the first
 # answer token even at effort low, ~22 s at its default) — it would time out.
+# DEFAULT_WORKER_MODEL blank = core.config.CLAUDE_FAST_MODEL, resolved at call
+# time (_resolve_worker_model) so the Haiku id lives in ONE place (2026-10-02).
 DEFAULT_PLANNER_MODEL = "claude-sonnet-5-5"
-DEFAULT_WORKER_MODEL  = "claude-haiku-4-5"
+DEFAULT_WORKER_MODEL  = ""
 DEFAULT_MERGER_MODEL  = "claude-sonnet-5-5"
 
 DEFAULT_MAX_PARALLEL  = 4
@@ -91,6 +95,12 @@ class CloudDisabled(RuntimeError):
     "morning briefing" on an AI_BACKEND=ollama install still sent inbox, news
     and system data to Claude, because the orchestrator was the one copy of
     the cloud gate (bobert_companion._claude_reachable) that never got it."""
+
+
+# A Claude call skipped for a model Anthropic already answered not_found for
+# (core.claude_model_guard, 2026-10-02) is logged at info like CloudDisabled:
+# the guard already said so once, and the stage's local path answers.
+_QUIET_CLOUD_SKIPS = (CloudDisabled, _RetiredModelError)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -431,7 +441,7 @@ def plan_decomposition(
         )
     except Exception as e:
         # A local-only turn is the normal path there, not a failure.
-        (_log.info if isinstance(e, CloudDisabled) else _log.warning)(
+        (_log.info if isinstance(e, _QUIET_CLOUD_SKIPS) else _log.warning)(
             "orchestrator: planner call failed: %s", e)
         # Claude is down/capped — try a local Ollama model before degrading.
         ollama_model = _resolve_local_model(local_model)
@@ -499,12 +509,24 @@ def _build_worker_system(spec: SubAgentSpec, actions: Iterable[str]) -> str:
     return base
 
 
+def _fast_model() -> str:
+    """core.config.CLAUDE_FAST_MODEL ('' if unreadable) — the worker model
+    when none is configured (2026-10-02)."""
+    try:
+        from core import config as _cfg
+        return str(getattr(_cfg, "CLAUDE_FAST_MODEL", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _resolve_worker_model(
     spec: SubAgentSpec,
     worker_model: str,
     local_model: str | None,
 ) -> tuple[str, str]:
-    """Return (backend, model_id). backend is 'claude' or 'ollama'."""
+    """Return (backend, model_id). backend is 'claude' or 'ollama'. A blank
+    worker_model means core.config.CLAUDE_FAST_MODEL."""
+    worker_model = worker_model or _fast_model()
     pref = spec.model_preference.lower()
     if pref == "local" and local_model:
         return "ollama", local_model
@@ -780,7 +802,7 @@ def merge_results(
             purpose="compose",
         )
     except Exception as e:
-        (_log.info if isinstance(e, CloudDisabled) else _log.warning)(
+        (_log.info if isinstance(e, _QUIET_CLOUD_SKIPS) else _log.warning)(
             "orchestrator: merger call failed: %s", e)
         # Claude is down/capped — try a local Ollama model before degrading.
         ollama_model = _resolve_local_model(local_model)

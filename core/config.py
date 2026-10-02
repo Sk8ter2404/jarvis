@@ -165,6 +165,28 @@ AI_BACKEND   = "claude"           # "claude" | "ollama"
 CLAUDE_MODEL = "claude-sonnet-5-5"
 OLLAMA_MODEL = "llama3"
 
+# The small, fast Claude model (2026-10-02): the ONE place its id is written.
+# The notification sorter's and email triage's Claude leg, the briefing
+# orchestrator's per-source workers (ORCHESTRATOR_WORKER_MODEL blank) and the
+# self-diagnostic's API probe (when CLAUDE_MODEL is unset) all read it, so a
+# swap is one line in user_settings.json: "CLAUDE_FAST_MODEL": "<model id>".
+# Haiku 4.5 ($1/$5 per MTok). Anthropic's deprecations page (checked
+# 2026-10-02) lists claude-haiku-4-5-20251001 Active, deprecated N/A,
+# tentative retirement "Not sooner than October 15, 2026", with at least 60
+# days' notice before any retirement.
+CLAUDE_FAST_MODEL = "claude-haiku-4-5"
+
+# Retired-model successors (2026-10-02). When Anthropic answers not_found for
+# a Claude model (retired, or not available to this key), core.llm_client logs
+# ONE line per model per session and, if this maps the model to a replacement,
+# retries on it and keeps using it for the session; with no entry the feature
+# falls back to its local path (the local brain / local vision / raw data) or
+# says honestly that the model is gone. Keys and values are model ids; a
+# snapshot id (…-20251001) also matches its alias entry. Empty by default —
+# Anthropic names a replacement only when it deprecates a model. Example:
+#   "CLAUDE_MODEL_SUCCESSORS": {"claude-haiku-4-5": "claude-sonnet-5-5"}
+CLAUDE_MODEL_SUCCESSORS = {}
+
 # Claude API is an OPTIONAL ENHANCEMENT, never a hard dependency. When True
 # (the default), a missing/capped/errored Claude backend is NOT treated as a
 # failure: startup does not abort, the self-diagnostic does not raise a
@@ -305,6 +327,38 @@ def model_route(function: str) -> str:
     return MODEL_ROUTING.get(function, "auto")
 
 
+# ─── Local-first for the Claude-only features (2026-10-02) ─────────────
+# Features that build their own Claude call outside the chat path. Screen
+# vision needs no key here: MODEL_ROUTING["vision"] = "local" already keeps it
+# (and everything that looks through ask_vision) on the local vision model.
+# The briefing orchestrator's switch is ORCHESTRATOR_BACKEND (its section).
+#
+# NOTIFY_SORTER_BACKEND — who classifies a toast no rule matched
+#   (skills/notification_triage.py): "local_first" | "claude".
+#   "local_first" (default): a one-word classification on the local brain;
+#     Claude (CLAUDE_FAST_MODEL) only when the local brain is unavailable or
+#     its answer is not one of the four labels — and only where the cloud gate
+#     allows (AI_BACKEND claude + a key + chat not routed local), as before.
+#   "claude": Claude first, the local brain as the fallback (the order before
+#     2026-10-02).
+#   On a local-only setup both answer identically: the cloud gate is closed,
+#   so only the local brain ever sees the toast.
+NOTIFY_SORTER_BACKEND = "local_first"
+# BROWSER_AGENT_BACKEND — skills/browser_agent.py: "claude" | "local".
+#   "claude" (default): browser tasks are driven by Claude whenever a key is
+#     set (unchanged). "local": never send page content to Claude. There is no
+#     local browser-driving model, so browser tasks then decline with an
+#     honest line instead of running.
+BROWSER_AGENT_BACKEND = "claude"
+# CREDITS_CHECK_BACKEND — how check_credits (skills/credits_monitor.py) reads
+#   the billing-page screenshot: "auto" | "local".
+#   "auto" (default): through screen vision, routed by MODEL_ROUTING["vision"]
+#     (unchanged). "local": always the local vision model, so the billing page
+#     never goes to Claude; needs local vision to be usable
+#     (LOCAL_VISION_FALLBACK on, or MODEL_ROUTING["vision"] "local").
+CREDITS_CHECK_BACKEND = "auto"
+
+
 # ─── Ambient passive-learning toggles (skills/ambient_listen.py) ───────
 # Settings-GUI / user_settings.json knobs for the passive multimodal
 # daemons. These live here (not as literals in bobert_companion.py) so a
@@ -388,9 +442,22 @@ ENABLE_ORCHESTRATOR             = True
 # per-source workers are tiny summarisers (Claude Haiku 4.5). Not Opus 5.5:
 # the brief is spoken, the planner has a 20 s timeout, and Opus 5.5 always
 # thinks (~13-22 s to the first answer token). 2026-10-01.
+# ORCHESTRATOR_WORKER_MODEL blank = CLAUDE_FAST_MODEL (2026-10-02), so the
+# Haiku id lives in one place; set it to pin the workers to another model.
 ORCHESTRATOR_PLANNER_MODEL      = "claude-sonnet-5-5"
-ORCHESTRATOR_WORKER_MODEL       = "claude-haiku-4-5"
+ORCHESTRATOR_WORKER_MODEL       = ""
 ORCHESTRATOR_MERGER_MODEL       = "claude-sonnet-5-5"
+# ORCHESTRATOR_BACKEND (2026-10-02) — "claude" | "local".
+#   "claude" (default): planner, workers and merger call Claude first and fall
+#     back to the local model only when a Claude call fails (unchanged).
+#   "local": they never call Claude — every stage takes its existing local
+#     path (local Ollama planner / workers / merger, then the raw tool data),
+#     so briefing data (inbox senders, news, system state) stays on this PC.
+#     Slower: the stages queue on the one local GPU. Only matters where the
+#     orchestrator runs at all — on a local-only backend (AI_BACKEND=ollama or
+#     chat routed local) there is no fan-out and the normal local turn
+#     answers the briefing either way.
+ORCHESTRATOR_BACKEND            = "claude"
 ORCHESTRATOR_MAX_PARALLEL       = 4
 ORCHESTRATOR_WORKER_TIMEOUT_S   = 30.0
 ORCHESTRATOR_PLANNER_TIMEOUT_S  = 20.0

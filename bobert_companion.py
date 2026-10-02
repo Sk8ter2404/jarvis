@@ -2471,6 +2471,15 @@ def _claude_reply_text(msg) -> str:
     return _lc.response_text(msg)
 
 
+# Retired-model guard (2026-10-02): core.llm_client raises this INSTEAD of a
+# network call once Anthropic has answered not_found for a model this session
+# and no CLAUDE_MODEL_SUCCESSORS entry replaces it. A RuntimeError, so every
+# `except Exception` fallback here runs as it did for the 404 itself; the
+# vision paths catch it by name to go to the local VLM without a second log
+# line (core.claude_model_guard already said it once).
+from core.claude_model_guard import RetiredModelError as _RetiredModelError  # noqa: E402
+
+
 # ── Local-LLM traffic control (2026-09-29, r6) ───────────────────────────
 # Ollama serves the local brain from ONE slot whose KV cache holds only the
 # most recent request, so any background local call between two owner turns
@@ -25461,6 +25470,14 @@ def take_screenshot(monitor: str | None = None, max_dim: int = 1568) -> bytes | 
         return None
 
 
+# The failure text when SCREEN_VISION_MODEL is retired (Anthropic answered
+# not_found earlier this session) and local vision cannot answer either. In the
+# parenthesised "(vision failed …)" family the callers already recognise.
+_VISION_MODEL_RETIRED_REPLY = (
+    "(vision failed: the Claude vision model is retired — set "
+    "SCREEN_VISION_MODEL to a current model, or route vision to local)")
+
+
 def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
     """Send a screenshot to Claude with a question, return its answer.
 
@@ -25541,6 +25558,13 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
         if local:
             return f"[local-vision] {local}"
         return f"(vision failed: {e})"
+    except _RetiredModelError:
+        # SCREEN_VISION_MODEL is known-retired this session (logged once by
+        # core.claude_model_guard): straight to the local VLM, no new line.
+        local = _call_local_vision(question, [png_bytes])
+        if local:
+            return f"[local-vision] {local}"
+        return _VISION_MODEL_RETIRED_REPLY
     except Exception as e:
         # Catch-all: an empty content list → IndexError on content[0], or
         # `import anthropic` failing → ImportError. Neither is an anthropic.*
@@ -25666,6 +25690,12 @@ def ask_vision_multi(question: str, images: dict[str, bytes]) -> str:
         if local:
             return local
         return f"(vision failed: {e})"
+    except _RetiredModelError:
+        # Known-retired SCREEN_VISION_MODEL (see ask_vision): local VLM, quietly.
+        local = _local_multi_fallback()
+        if local:
+            return local
+        return _VISION_MODEL_RETIRED_REPLY
     except Exception as e:
         # Catch-all (empty content → IndexError, import failure, unexpected
         # SDK error). Without this they'd crash the multi-monitor vision
@@ -40184,14 +40214,22 @@ def _maybe_orchestrate(text: str) -> bool:
     except Exception as _e:
         print(f"  [orchestrator] unavailable: {_e}")
         return False
-    print("  [orchestrator] briefing request — fanning out to sub-agents…")
+    # ORCHESTRATOR_BACKEND "local" (2026-10-02): the owner wants briefing data
+    # kept on this PC even though the cloud is allowed — every stage takes its
+    # existing local path (CloudDisabled → local Ollama → raw tool data).
+    # Default "claude" leaves the Claude-first stages exactly as they were.
+    _stages_local = str(ORCHESTRATOR_BACKEND or "").strip().lower() == "local"
+    print("  [orchestrator] briefing request — fanning out to sub-agents"
+          + (" (local stages, ORCHESTRATOR_BACKEND=local)…" if _stages_local
+             else "…"))
     set_state("thinking")
     try:
         merged = _orchestrate(
             text, ACTIONS,
-            cloud_allowed=_cloud_ok,
+            cloud_allowed=_cloud_ok and not _stages_local,
             planner_model=ORCHESTRATOR_PLANNER_MODEL,
-            worker_model=ORCHESTRATOR_WORKER_MODEL,
+            # Blank = CLAUDE_FAST_MODEL (2026-10-02): one Haiku id in config.
+            worker_model=ORCHESTRATOR_WORKER_MODEL or CLAUDE_FAST_MODEL,
             merger_model=ORCHESTRATOR_MERGER_MODEL,
             max_parallel=ORCHESTRATOR_MAX_PARALLEL,
             worker_timeout_s=ORCHESTRATOR_WORKER_TIMEOUT_S,

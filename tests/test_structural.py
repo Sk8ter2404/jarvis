@@ -62,6 +62,9 @@ _IMPORT_LIGHT_CORE = (
     # Brain glow (2026-10-02): stdlib only — the HUD subprocesses import its
     # reader, so it must load with nothing but the standard library.
     "core.brain_glow",
+    # The retired-model guard (2026-10-02): stdlib only, imported by
+    # core.llm_client (every Claude call) and core.orchestrator.
+    "core.claude_model_guard",
 )
 
 

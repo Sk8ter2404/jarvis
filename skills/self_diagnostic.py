@@ -2953,6 +2953,17 @@ def _probe_stt() -> dict:
 _CLAUDE_API_PROBE_TIMEOUT_S = 12.0
 
 
+def _fast_model() -> str:
+    """core.config.CLAUDE_FAST_MODEL — the probe's model when CLAUDE_MODEL is
+    unset; the one place the Haiku id lives (2026-10-02). '' if unreadable
+    (the probe then reports the API call's own error)."""
+    try:
+        from core import config as _cfg
+        return str(getattr(_cfg, "CLAUDE_FAST_MODEL", "") or "")
+    except Exception:
+        return ""
+
+
 def _probe_claude_api() -> dict:
     start = _now()
     if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
@@ -2969,7 +2980,7 @@ def _probe_claude_api() -> dict:
     bc = _bc()
     model = (getattr(bc, "CLAUDE_MODEL", None) or
              os.environ.get("CLAUDE_MODEL") or
-             "claude-haiku-4-5")
+             _fast_model())
 
     try:
         # SDK-level timeout (httpx) covers the request once it's actually

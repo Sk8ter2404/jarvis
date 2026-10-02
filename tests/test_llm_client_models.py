@@ -571,7 +571,10 @@ class ShippedDefaultsTests(unittest.TestCase):
         self.assertEqual(cfg.SCREEN_VISION_MODEL, "claude-sonnet-5-5")
         self.assertEqual(cfg.ORCHESTRATOR_PLANNER_MODEL, "claude-sonnet-5-5")
         self.assertEqual(cfg.ORCHESTRATOR_MERGER_MODEL, "claude-sonnet-5-5")
-        self.assertEqual(cfg.ORCHESTRATOR_WORKER_MODEL, "claude-haiku-4-5")
+        # 2026-10-02: the workers' blank default follows CLAUDE_FAST_MODEL,
+        # the one place the Haiku id is written.
+        self.assertEqual(cfg.ORCHESTRATOR_WORKER_MODEL, "")
+        self.assertEqual(cfg.CLAUDE_FAST_MODEL, "claude-haiku-4-5")
 
     def test_orchestrator_defaults_match_config(self):
         import core.config as cfg
@@ -586,7 +589,7 @@ class ShippedDefaultsTests(unittest.TestCase):
         import core.config as cfg
         for name in ("CLAUDE_MODEL", "SCREEN_VISION_MODEL",
                      "ORCHESTRATOR_PLANNER_MODEL", "ORCHESTRATOR_MERGER_MODEL",
-                     "ORCHESTRATOR_WORKER_MODEL"):
+                     "ORCHESTRATOR_WORKER_MODEL", "CLAUDE_FAST_MODEL"):
             self.assertNotIn("opus", getattr(cfg, name), name)
 
     def test_deep_jobs_default_to_opus_5_5(self):

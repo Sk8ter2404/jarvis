@@ -1321,8 +1321,28 @@ class ModelConstantTests(unittest.TestCase):
     _DATE_RE = _re.compile(r"\d{8}")
 
     def test_worker_model_is_undated_haiku_alias(self):
-        # The specific value F4 un-pinned: the un-dated Haiku alias.
-        self.assertEqual(orch.DEFAULT_WORKER_MODEL, "claude-haiku-4-5")
+        # The specific value F4 un-pinned: the un-dated Haiku alias. Since
+        # 2026-10-02 it lives ONCE, in core.config.CLAUDE_FAST_MODEL; the
+        # orchestrator's blank default resolves to it at call time.
+        import core.config as cfg
+        self.assertEqual(orch.DEFAULT_WORKER_MODEL, "")
+        self.assertEqual(cfg.CLAUDE_FAST_MODEL, "claude-haiku-4-5")
+        spec = orch.SubAgentSpec(name="w", description="d",
+                                 model_preference="haiku")
+        self.assertEqual(
+            orch._resolve_worker_model(spec, orch.DEFAULT_WORKER_MODEL, None),
+            ("claude", "claude-haiku-4-5"))
+
+    def test_blank_worker_model_follows_claude_fast_model(self):
+        import core.config as cfg
+        spec = orch.SubAgentSpec(name="w", description="d",
+                                 model_preference="haiku")
+        with mock.patch.object(cfg, "CLAUDE_FAST_MODEL", "claude-next-fast"):
+            self.assertEqual(orch._resolve_worker_model(spec, "", None),
+                             ("claude", "claude-next-fast"))
+            # An explicit worker model still wins.
+            self.assertEqual(orch._resolve_worker_model(spec, "claude-w", None),
+                             ("claude", "claude-w"))
 
     def test_no_default_model_constant_is_date_pinned(self):
         for const in ("DEFAULT_PLANNER_MODEL", "DEFAULT_WORKER_MODEL",
@@ -1332,6 +1352,55 @@ class ModelConstantTests(unittest.TestCase):
                 self._DATE_RE.search(val),
                 f"{const}={val!r} is date-pinned; use an un-dated alias",
             )
+
+
+class RetiredModelStageTests(unittest.TestCase):
+    """2026-10-02: once core.llm_client knows a model is gone it raises
+    RetiredModelError instead of calling; each stage takes its local path and
+    logs that at INFO (the guard already said it once), not as a warning."""
+
+    def setUp(self):
+        from core.claude_model_guard import RetiredModelError
+        self.err = RetiredModelError("claude-gone", "a 'plan' call")
+        specs = {"email": orch.SubAgentSpec(name="email", description="mail",
+                                            allowed_actions=["read_email"])}
+        self.specs = specs
+
+    def _raise(self, *a, **k):
+        raise self.err
+
+    def test_planner_falls_to_ollama_and_logs_info_only(self):
+        plan = {"sub_tasks": [{"sub_agent": "email", "task": "check"}]}
+        with mock.patch.object(orch, "_claude_call", side_effect=self._raise), \
+                mock.patch.object(orch, "_resolve_local_model", return_value="llama-x"), \
+                mock.patch.object(orch, "_ollama_reachable", return_value=True), \
+                mock.patch.object(orch, "_ollama_call", return_value=json.dumps(plan)), \
+                self.assertLogs("core.orchestrator", level="INFO") as logs:
+            out = orch.plan_decomposition("brief me", self.specs)
+        self.assertEqual([t.sub_agent for t in out], ["email"])
+        self.assertFalse([r for r in logs.records if r.levelname == "WARNING"
+                          and "planner call failed" in r.getMessage()])
+
+    def test_merger_falls_to_ollama_and_logs_info_only(self):
+        results = [orch.SubTaskResult(sub_agent="email", task="t",
+                                      output="2 unread", duration_s=0.1)]
+        with mock.patch.object(orch, "_claude_call", side_effect=self._raise), \
+                mock.patch.object(orch, "_resolve_local_model", return_value="llama-x"), \
+                mock.patch.object(orch, "_ollama_reachable", return_value=True), \
+                mock.patch.object(orch, "_ollama_call", return_value="You have 2 unread."), \
+                self.assertLogs("core.orchestrator", level="INFO") as logs:
+            out = orch.merge_results("brief me", results)
+        self.assertEqual(out, "You have 2 unread.")
+        self.assertFalse([r for r in logs.records if r.levelname == "WARNING"])
+
+    def test_a_fresh_cloud_failure_is_still_a_warning(self):
+        with mock.patch.object(orch, "_claude_call",
+                               side_effect=RuntimeError("socket reset")), \
+                mock.patch.object(orch, "_resolve_local_model", return_value=None), \
+                mock.patch.object(orch, "_ollama_reachable", return_value=False), \
+                self.assertLogs("core.orchestrator", level="INFO") as logs:
+            orch.plan_decomposition("brief me", self.specs)
+        self.assertTrue([r for r in logs.records if r.levelname == "WARNING"])
 
 
 if __name__ == "__main__":

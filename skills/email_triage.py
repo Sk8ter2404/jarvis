@@ -109,7 +109,7 @@ except Exception:  # pragma: no cover — boot-order safety
 _log = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────────────
-LLM_MODEL                = "claude-haiku-4-5"
+LLM_MODEL                = ""   # blank = core.config.CLAUDE_FAST_MODEL (2026-10-02)
 LLM_TIMEOUT_SECONDS      = 8.0
 # Overall wall-clock budget for the synchronous categorize/briefing loops so a
 # large unread set can't freeze the voice thread for minutes (2026-07-14 #16).
@@ -837,11 +837,25 @@ def _cloud_allowed() -> bool:
         return False
 
 
+def _claude_model() -> str:
+    """LLM_MODEL when set, else core.config.CLAUDE_FAST_MODEL — the one place
+    the Haiku id lives (2026-10-02), so a model swap is one settings line.
+    '' when neither is readable; the Claude leg is then skipped."""
+    if LLM_MODEL:
+        return LLM_MODEL
+    try:
+        from core import config as _cfg
+        return str(getattr(_cfg, "CLAUDE_FAST_MODEL", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _triage_message(msg: dict) -> str | None:
     """Return one of LLM_VERDICTS, or None if the LLM is unavailable."""
     if not ENABLE_LLM_TRIAGE:
         return None
-    _claude_ok = bool(os.environ.get("ANTHROPIC_API_KEY")) and _cloud_allowed()
+    _claude_ok = (bool(os.environ.get("ANTHROPIC_API_KEY")) and _cloud_allowed()
+                  and bool(_claude_model()))
     if _claude_ok:
         try:
             import anthropic  # type: ignore
@@ -885,7 +899,7 @@ def _triage_message(msg: dict) -> str | None:
             client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
             resp = llm_client.create_message(
                 client, purpose="classify",
-                model=LLM_MODEL,
+                model=_claude_model(),
                 max_tokens=8,
                 system=_triage_system,
                 messages=[{"role": "user", "content": prompt}],
@@ -919,7 +933,8 @@ def _generate_draft_reply(thread: dict, user_instructions: str = "") -> str | No
     'agree to Tuesday at 2pm')."""
     # Same cloud gate as _triage_message (2026-10-01): the thread body goes
     # to Claude only when the owner's backend allows the cloud.
-    _claude_ok = bool(os.environ.get("ANTHROPIC_API_KEY")) and _cloud_allowed()
+    _claude_ok = (bool(os.environ.get("ANTHROPIC_API_KEY")) and _cloud_allowed()
+                  and bool(_claude_model()))
     if _claude_ok:
         try:
             import anthropic  # type: ignore
@@ -965,7 +980,7 @@ def _generate_draft_reply(thread: dict, user_instructions: str = "") -> str | No
             client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
             resp = llm_client.create_message(
                 client, purpose="compose",
-                model=LLM_MODEL,
+                model=_claude_model(),
                 max_tokens=600,
                 system=_draft_system,
                 messages=[{"role": "user", "content": prompt}],
