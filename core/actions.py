@@ -1475,6 +1475,25 @@ def _act_show_tasks(_: str = "") -> str:
 
 # ─── Ambient mode setter (Phase 4E) ────────────────────────────────────
 
+def _ambient_start_refused(result) -> bool:
+    """Did ambient_listen_start REFUSE? It says so by RETURNING a line, never
+    by raising: "Ambient mode failed to start, sir: <err>." when the worker
+    died (carries the canonical "failed" FAILURE_MARKER), and "Ambient mode
+    requires an exclusive mic connection — stop the wake-word listener first,
+    sir." when the wake-word detector owns the mic (carries none, so it is
+    named here; tests/test_audit_c5_honesty.py drives the real skill to keep
+    the two in step). Never raises."""
+    try:
+        if not isinstance(result, str):
+            return False
+        from core.failure_markers import FAILURE_MARKERS
+        low = result.lower()
+        return ("requires an exclusive mic" in low
+                or any(m in low for m in FAILURE_MARKERS))
+    except Exception:
+        return False
+
+
 def _act_ambient_mode_set(active: bool) -> str:
     """Force ambient (silent-learning) mode on or off. Mirrors the tray
     dispatcher's ambient_mode_toggle branch so voice and tray follow the
@@ -1500,32 +1519,62 @@ def _act_ambient_mode_set(active: bool) -> str:
     wake-word setter had until 2026-07-21. The live flag also gates
     _ambient_learn_from_gated, which kept learning after "off". Saved through
     the Settings GUI's single-key merge writer; skipped in staging, like the
-    extractor below."""
+    extractor below.
+
+    A refused start is reported, not announced (A44, 2026-10-02):
+    ambient_listen_start refuses by RETURNING a line (see
+    _ambient_start_refused), and that used to fall through to "listening
+    quietly and learning" with the flag already saved ON for every later boot.
+    Now an ON is saved only once the daemon took it; a refusal puts the cell,
+    hud_state and the live flags back, skips the extractor and returns the
+    daemon's own reason with a FAILURE_MARKER so the follow-up loop says so."""
     bc = _bc()
+    _was_flag = getattr(bc, "AMBIENT_LISTEN_ENABLED", False)
     bc._ambient_mode_active[0] = bool(active)
     bc._write_hud_state(ambient_mode_active=bool(bc._ambient_mode_active[0]))
     _on = bool(bc._ambient_mode_active[0])
     bc.AMBIENT_LISTEN_ENABLED = _on
+    _was_cfg = False
     try:
         import core.config as _cfg
+        _was_cfg = getattr(_cfg, "AMBIENT_LISTEN_ENABLED", False)
         _cfg.AMBIENT_LISTEN_ENABLED = _on
     except Exception:
-        pass
+        _cfg = None
     _staging = getattr(bc, "_is_staging", lambda: False)
-    caveat = ""
-    if not _staging():
+
+    def _save() -> str:
+        if _staging():
+            return ""
         try:
             from tools import settings_window as sw
             sw.update_settings({"AMBIENT_LISTEN_ENABLED": _on})
         except Exception:
-            caveat = " (though I couldn't save that for next boot)"
+            return " (though I couldn't save that for next boot)"
+        return ""
+
+    def _refused(why) -> str:
+        bc._ambient_mode_active[0] = False
+        bc._write_hud_state(ambient_mode_active=False)
+        bc.AMBIENT_LISTEN_ENABLED = _was_flag
+        if _cfg is not None:
+            _cfg.AMBIENT_LISTEN_ENABLED = _was_cfg
+        return f"ambient daemon refused: {why}"
+
+    # An OFF is saved before the stop, so it holds for the next boot even if
+    # the stop raises; an ON only after the daemon accepted it (below).
+    caveat = "" if _on else _save()
     action_name = "ambient_listen_start" if bc._ambient_mode_active[0] else "ambient_listen_stop"
     fn = bc.ACTIONS.get(action_name)
     if fn is not None:
         try:
-            fn("")
+            rv = fn("")
         except Exception as e:
-            return f"ambient daemon refused: {e}"
+            return _refused(e) if _on else f"ambient daemon refused: {e}"
+        if _on and _ambient_start_refused(rv):
+            return _refused(str(rv).strip())
+    if _on:
+        caveat = _save()
     # Start / stop the fact-extractor alongside the mic daemon so ambient mode
     # genuinely folds overheard speech into long-term memory.
     if not _staging():
