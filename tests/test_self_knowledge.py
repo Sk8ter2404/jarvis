@@ -197,7 +197,7 @@ class SelfKnowledgeRuntimeValueTests(unittest.TestCase):
 
     def test_cloud_model_and_action_count_are_live(self):
         bc = _fake_monolith(cached=_FAKE_CACHED, cloud=_FAKE_CLOUD,
-                            actions={f"a{i}": None for i in range(417)})
+                            actions=_distinct_actions(417))
         with _Monolith(bc):
             body = prompts.render_self_knowledge_section()
         self.assertIn(_FAKE_CLOUD, body)
@@ -272,7 +272,10 @@ class SelfKnowledgeInstructionTests(unittest.TestCase):
 
     def test_names_the_hardware_split(self):
         self.assertIn("whisper", self.low)
-        self.assertIn("kokoro", self.low)
+        # The voice is the live TTS backend's (review 2026-10-02).
+        with _NoMonolith(), mock.patch.object(cfg, "TTS_BACKEND", "kokoro"):
+            self.assertIn("kokoro",
+                          prompts.render_self_knowledge_section().lower())
 
     def test_static_copy_for_the_cloud_route_points_at_current_model(self):
         # The full PC_CONTROL_PROMPT (cloud route) carries the static copy;
@@ -286,6 +289,136 @@ class SelfKnowledgeInstructionTests(unittest.TestCase):
         # BASE's "never introduce yourself as Gemma / Claude" rule is about
         # identity; it must not read as "never say what runs you".
         self.assertIn("SELF-KNOWLEDGE", prompts.BASE_SYSTEM_PROMPT)
+
+
+# ── Review fixes (2026-10-02) ─────────────────────────────────────────────
+
+def _distinct_actions(n, aliases=0):
+    """``n`` distinct handlers plus ``aliases`` extra names bound to the
+    first one (the real registry has 137 names for 110 handlers)."""
+    acts = {}
+    for i in range(n):
+        acts[f"a{i}"] = (lambda i=i: lambda _a="": str(i))()
+    for j in range(aliases):
+        acts[f"alias{j}"] = acts["a0"]
+    return acts
+
+
+class SelfKnowledgeRouteTests(unittest.TestCase):
+    """Review 2026-10-02: the section reads wrong when the CLOUD model
+    answers - after set_brain cloud the static copy told Claude it was weak,
+    slow and should offer the cloud it was already on, and when a local turn
+    failed over, Claude received the live 'you are answering on your LOCAL
+    brain, <tag>' render and would claim to be that model."""
+
+    def _facts(self, **kw):
+        facts = {"local_model": _FAKE_LOCAL, "cloud_model": "claude-sonnet-5-5",
+                 "deep_model": "claude-opus-5-5", "action_count": 110,
+                 "tts_backend": "kokoro", "brain_remote": False}
+        facts.update(kw)
+        return facts
+
+    def test_the_cloud_render_says_the_cloud_is_answering(self):
+        body = prompts.render_self_knowledge_section(self._facts(),
+                                                     route="cloud")
+        low = body.lower()
+        self.assertNotIn("you are answering on your local brain", low)
+        self.assertIn("answered by the cloud model", low)
+        self.assertIn(_FAKE_LOCAL, body)       # named as the OTHER engine
+        self.assertNotIn("[ACTION: set_brain, cloud]", body)
+        self.assertIn("go back to auto", low)
+        self.assertIn("never claim to be", low)
+
+    def test_the_local_render_is_unchanged_in_substance(self):
+        body = prompts.render_self_knowledge_section(self._facts())
+        self.assertIn("you are answering on your LOCAL brain", body)
+        self.assertIn("[ACTION: set_brain, cloud]", body)
+
+    def test_the_static_copy_is_the_cloud_routes(self):
+        static = dict(pr.split_pc_control(FULL)[1])[SECTION]
+        low = static.lower()
+        self.assertIn("cloud route", low)
+        self.assertNotIn("[ACTION: set_brain, cloud]", static)
+        self.assertNotIn("you are answering on your local brain", low)
+        self.assertIn("[ACTION: current_model]", static)
+
+    def test_a_cloud_fallback_retargets_the_live_render(self):
+        local = prompts.render_self_knowledge_section(self._facts())
+        text = "<turn ctx>" + local + "</turn ctx>how smart are you?"
+        out = prompts.retarget_self_knowledge(text, "cloud",
+                                              facts=self._facts())
+        self.assertNotIn("you are answering on your LOCAL brain", out)
+        self.assertIn("answered by the cloud model", out.lower())
+        self.assertTrue(out.startswith("<turn ctx>"))
+        self.assertTrue(out.endswith("</turn ctx>how smart are you?"))
+        # text without the section is untouched
+        self.assertEqual(prompts.retarget_self_knowledge("hello", "cloud"),
+                         "hello")
+        self.assertEqual(prompts.retarget_self_knowledge(None, "cloud"), None)
+
+    def test_each_model_label_and_tag_is_given_once(self):
+        # "Claude Opus 5.5 (claude-opus-5-5)" appeared three times; a tag
+        # read aloud character by character is what the section forbids.
+        for route in ("local", "cloud"):
+            with self.subTest(route=route):
+                body = prompts.render_self_knowledge_section(self._facts(),
+                                                             route=route)
+                self.assertEqual(body.count("(claude-opus-5-5)"), 1)
+                self.assertEqual(body.count("(claude-sonnet-5-5)"), 1)
+                self.assertIn("Claude Opus 5.5", body)
+
+
+class SelfKnowledgeLiveFactsTests(unittest.TestCase):
+    """Review 2026-10-02: the hardware / voice / privacy facts were a
+    hand-written constant - "the Kokoro voice on the CPU" while the shipped
+    default is edge-tts (Microsoft's online voice, which makes "his
+    conversations stay on this machine" false), the reference desk's GPUs on
+    an edge node whose brain is another machine, and an action count that
+    counted aliases."""
+
+    def _render(self, **attrs):
+        bc = _fake_monolith(cached=_FAKE_CACHED)
+        for k, v in attrs.items():
+            setattr(bc, k, v)
+        with _Monolith(bc):
+            return prompts.render_self_knowledge_section()
+
+    def test_an_online_voice_is_named_and_the_privacy_claim_is_true(self):
+        body = self._render(TTS_BACKEND="edge")
+        self.assertIn("Microsoft", body)
+        self.assertNotIn("Kokoro", body)
+        self.assertIn("go to Microsoft", body)
+
+    def test_a_local_voice_keeps_the_local_privacy_claim(self):
+        body = self._render(TTS_BACKEND="kokoro")
+        self.assertIn("Kokoro", body)
+        self.assertNotIn("Microsoft", body)
+        self.assertIn("stay on this machine", body)
+
+    def test_a_remote_brain_names_no_local_gpu(self):
+        body = self._render(LOCAL_LLM_BASE_URL="http://brain.example:11434",
+                            TTS_BACKEND="kokoro")
+        self.assertIn("another machine", body)
+        self.assertNotIn(prompts.SELF_KNOWLEDGE_BRAIN_GPU, body)
+        self.assertNotIn(prompts.SELF_KNOWLEDGE_STT_GPU, body)
+        local = self._render(LOCAL_LLM_BASE_URL="http://127.0.0.1:11434")
+        self.assertIn(prompts.SELF_KNOWLEDGE_BRAIN_GPU, local)
+
+    def test_the_action_count_counts_handlers_not_aliases(self):
+        body = self._render(ACTIONS=_distinct_actions(417, aliases=25))
+        self.assertIn("417 actions", body)
+        self.assertNotIn("442", body)
+
+    def test_the_backend_is_read_live(self):
+        facts = None
+        bc = _fake_monolith(cached=_FAKE_CACHED)
+        bc.TTS_BACKEND = "xtts"
+        with _Monolith(bc):
+            facts = prompts.self_knowledge_facts()
+        self.assertEqual(facts["tts_backend"], "xtts")
+        with _NoMonolith(), mock.patch.object(cfg, "TTS_BACKEND", "kokoro"):
+            self.assertEqual(prompts.self_knowledge_facts()["tts_backend"],
+                             "kokoro")
 
 
 if __name__ == "__main__":

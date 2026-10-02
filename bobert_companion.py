@@ -20024,6 +20024,29 @@ def _local_unavailable_message() -> str:
             "either, sir.")
 
 
+def _self_knowledge_for_cloud(messages: list) -> list:
+    """``messages`` with any LOCAL SELF-KNOWLEDGE render (it rides the turn
+    context of the user message) re-rendered for the cloud route, as a copy.
+    A local turn that fails over to the cloud would otherwise hand Claude
+    "you are answering on your LOCAL brain, <tag>" and it would claim to be
+    that model (review 2026-10-02). Unchanged when there is none. Never
+    raises."""
+    try:
+        from core import prompts as _sk_prompts
+        out = None
+        for i, m in enumerate(messages or ()):
+            content = m.get("content") if isinstance(m, dict) else None
+            if (isinstance(content, str)
+                    and _sk_prompts.SELF_KNOWLEDGE_HEADER in content):
+                if out is None:
+                    out = list(messages)
+                out[i] = dict(m, content=_sk_prompts.retarget_self_knowledge(
+                    content, "cloud"))
+        return out if out is not None else messages
+    except Exception:
+        return messages
+
+
 def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
                                 max_tokens: int = 500) -> str:
     """LOCAL-routed turn with honest resilience. Try the local model; if it
@@ -20045,8 +20068,10 @@ def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
             if t.startswith("[local]"):
                 t = t[len("[local]"):].lstrip()
             return t
-        # Local didn't answer. Prefer the cloud if we can reach it.
-        cloud = _claude_oneshot(sys_prompt, messages, max_tokens=max_tokens)
+        # Local didn't answer. Prefer the cloud if we can reach it - told
+        # it is the cloud answering (_self_knowledge_for_cloud).
+        cloud = _claude_oneshot(sys_prompt, _self_knowledge_for_cloud(messages),
+                                max_tokens=max_tokens)
         if cloud:
             if _sac_blocked_local_recently():
                 print("  [local-llm] SAC blocked the local runner this boot — "
