@@ -437,6 +437,69 @@ class SupplementEdgeTests(unittest.TestCase):
         self.assertEqual(rpt["action_counts"], Counter())
 
 
+class RecapCountsEachActionOnceTests(unittest.TestCase):
+    """Audit A54 (2026-10-02): every executed action reaches BOTH sources the
+    recap reads. The monolith prints '[action] name: ...' into the session log
+    AND calls record_session_action, which forwards to pattern_learning's
+    log_event and appends the same action to usage_patterns.jsonl. Adding the
+    JSONL on top of the session-log tallies counted every action twice, so
+    the 22:30 recap said "played 6 tracks" for 3."""
+
+    _LOG = (
+        "[21:00:01] [action] play_music: Playing 'The Doors' on Apple Music, sir.\n"
+        "[21:04:10] [action] play_music: Playing 'The Doors' on Apple Music, sir.\n"
+        "[21:09:30] [action] play_music: Playing 'The Doors' on Apple Music, sir.\n"
+        "[21:10:00] [action] see_screen: a terminal window\n"
+    )
+    _EVENTS = [{"action": "play_music", "arg": "The Doors"}] * 3 + [
+        {"action": "see_screen", "arg": ""}]
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("daily_recap")
+
+    def _scanned_report(self):
+        with mock.patch.object(self.mod, "_todays_log_paths", return_value=["s.log"]), \
+             mock.patch("builtins.open", mock.mock_open(read_data=self._LOG)):
+            return self.mod._scan_session_logs()
+
+    def test_supplement_does_not_add_the_jsonl_on_top_of_the_session_log(self):
+        rpt = self._scanned_report()
+        self.assertEqual(rpt["action_counts"]["play_music"], 3)
+        with mock.patch.object(self.mod, "_todays_pattern_events",
+                               return_value=list(self._EVENTS)):
+            self.mod._supplement_with_pattern_jsonl(rpt)
+        self.assertEqual(rpt["action_counts"]["play_music"], 3)
+        self.assertEqual(rpt["action_counts"]["see_screen"], 1)
+        self.assertEqual(rpt["music_titles"]["the doors"], 3)
+
+    def test_spoken_recap_counts_each_play_once(self):
+        with mock.patch.object(self.mod, "_todays_log_paths", return_value=["s.log"]), \
+             mock.patch("builtins.open", mock.mock_open(read_data=self._LOG)), \
+             mock.patch.object(self.mod, "_todays_pattern_events",
+                               return_value=list(self._EVENTS)), \
+             mock.patch.object(self.mod, "_bambu_now", return_value={}), \
+             mock.patch.object(self.mod, "_count_tasks_completed_today",
+                               return_value=0):
+            out = self.mod._build_recap()
+        self.assertIn("played 3 The Doors tracks", out)
+        self.assertNotIn("played 6", out)
+
+    def test_session_log_tallies_stay_when_the_jsonl_is_empty(self):
+        rpt = self._scanned_report()
+        with mock.patch.object(self.mod, "_todays_pattern_events", return_value=[]):
+            self.mod._supplement_with_pattern_jsonl(rpt)
+        self.assertEqual(rpt["action_counts"]["play_music"], 3)
+        self.assertEqual(rpt["music_titles"]["the doors"], 3)
+
+    def test_session_log_tallies_stay_when_no_jsonl_event_names_an_action(self):
+        rpt = self._scanned_report()
+        with mock.patch.object(self.mod, "_todays_pattern_events",
+                               return_value=[{"action": "", "arg": "x"}]):
+            self.mod._supplement_with_pattern_jsonl(rpt)
+        self.assertEqual(rpt["action_counts"]["play_music"], 3)
+        self.assertEqual(rpt["music_titles"]["the doors"], 3)
+
+
 class BambuCrossSkillTests(unittest.TestCase):
     def setUp(self):
         self.mod, _ = load_skill_isolated("daily_recap")

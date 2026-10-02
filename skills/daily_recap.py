@@ -438,22 +438,32 @@ def _scan_session_logs() -> dict:
 def _supplement_with_pattern_jsonl(report: dict) -> None:
     """Fold today's data/usage_patterns.jsonl entries into the report.
     Cheaper, less noisy, and date-tagged -- so when it's available it
-    refines the session-log estimates."""
+    REPLACES the session-log action and music-title tallies. Both sources
+    record every executed action (the monolith prints '[action] name: ...'
+    AND calls record_session_action -> pattern_learning.log_event), so adding
+    one on top of the other counted every action twice (audit A54). The
+    session-log tallies stay as the fallback when the JSONL has nothing."""
     events = _todays_pattern_events()
     if not events:
         return
+    action_counts: Counter = Counter()
+    music_titles: Counter = Counter()
     for e in events:
         action = e.get("action") or ""
         arg = (e.get("arg") or "").strip()
         if not action:
             continue
-        report["action_counts"][action] += 1
+        action_counts[action] += 1
         if action in _MUSIC_ACTIONS and arg:
             # Normalise: lowercase, strip junk so "Michael Jackson Essentials"
             # and "michael jackson essentials" merge.
             key = arg.strip(" .,!?\"'").lower()
             if 2 <= len(key) <= 80:
-                report["music_titles"][key] += 1
+                music_titles[key] += 1
+    if not action_counts:
+        return
+    report["action_counts"] = action_counts
+    report["music_titles"] = music_titles
 
 
 # --- bambu print cross-skill read ----------------------------------------
