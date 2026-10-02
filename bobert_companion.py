@@ -26685,6 +26685,22 @@ def _norm_playlist_text(s: str) -> str:
     return " ".join(s.split())
 
 
+def _title_names_playlist(title: str, name: str) -> bool:
+    """True when a window title LEADS with playlist `name`: the name, then the
+    end of the title or a separator (" - ", an en or em dash, " by "). Merely
+    containing it is not enough: Chrome's find matches substrings, so asking
+    for "Mix" can open "Taylor's Mix", whose title holds "mix" too
+    (2026-10-02 review)."""
+    want = _norm_playlist_text(name)
+    if not want:
+        return False
+    t = _norm_playlist_text(_clean_browser_title(title or ""))
+    if not t.startswith(want):
+        return False
+    rest = t[len(want):]
+    return rest == "" or rest.startswith((" - ", " \u2013 ", " \u2014 ", " by "))
+
+
 def _apple_music_playlist_link(name: str) -> str | None:
     """The owner's direct link for playlist `name` from
     APPLE_MUSIC_PLAYLIST_LINKS ({name: url}), or None. Only an
@@ -26710,20 +26726,20 @@ def _apple_music_keyboard_open_playlist(cfg: dict, name: str) -> bool:
     """Open playlist `name` from the page in JARVIS's media window by keyboard:
     find its name (the sidebar lists every playlist as a link, and so does the
     Library > Playlists grid), Esc, Enter. True only when the window's title
-    then CHANGED to one that names the playlist; otherwise the caller goes on
-    to the vision route."""
+    then CHANGED to one that LEADS with the playlist's name
+    (_title_names_playlist); otherwise the caller goes on to the vision
+    route."""
     hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(cfg.get("service_key"))
     if not hwnd:
         return False
     before = _window_title_for_hwnd(hwnd)
     if not _streaming_find_text_and_activate(cfg, name):
         return False
-    want = _norm_playlist_text(name)
     title = before
     for _ in range(3):
         time.sleep(1.0)
         title = _window_title_for_hwnd(hwnd)
-        if title != before and want in _norm_playlist_text(title):
+        if title != before and _title_names_playlist(title, name):
             print(f"  [auto-play] keyboard opened playlist '{name}' "
                   f"(tab: {title[:70]!r})", flush=True)
             return True

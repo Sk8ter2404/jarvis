@@ -154,6 +154,35 @@ class KeyboardOpenTests(_PlaylistBase):
         self.pv.assert_called_once()
         self.assertEqual(out, "playing 'road trip' on Apple Music")
 
+    def test_a_playlist_whose_name_holds_the_one_asked_for_is_not_it(self):
+        """Chrome's find matches substrings, so asking for "Mix" can land on
+        "Taylor's Mix" earlier on the page and Enter opens it. Its title holds
+        "mix", which used to confirm it: the wrong playlist played and JARVIS
+        said "playing 'Mix'" (2026-10-02 review). Vision gets the next try."""
+        with self._titles(_LIB_TITLE,
+                          "\u200eTaylor\u2019s Mix - Apple Music - Google Chrome"):
+            out = self.bc._apple_music_play_playlist("mix")
+        self.pv.assert_not_called()
+        self.assertTrue(self.find.called, "the vision tile search never ran")
+        self.assertIn("couldn't find a playlist named 'mix'", out)
+
+    def test_the_title_must_lead_with_the_playlist_name(self):
+        names = self.bc._title_names_playlist
+        for title, name in (
+                ("\u200eMix - Apple Music - Google Chrome", "mix"),
+                ("Taylor\u2019s Mix - Apple Music", "taylors mix"),
+                ("Chill - Summer - Apple Music - Google Chrome", "chill - summer"),
+                ("Road Trip by A Curator - Apple Music", "Road Trip"),
+                ("Road Trip", "road trip")):
+            self.assertTrue(names(title, name), (title, name))
+        for title, name in (
+                ("Taylor\u2019s Mix - Apple Music - Google Chrome", "mix"),
+                ("Mixtape - Apple Music - Google Chrome", "mix"),
+                ("Apple Music - Web Player - Google Chrome", "mix"),
+                ("", "mix"),
+                ("Mix - Apple Music", "")):
+            self.assertFalse(names(title, name), (title, name))
+
     def test_an_unconfirmed_keyboard_open_falls_back_to_vision(self):
         # The title never changes: the find matched nothing it could open.
         with self._titles(_LIB_TITLE):
