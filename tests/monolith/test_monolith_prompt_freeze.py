@@ -682,7 +682,7 @@ class ReprimePayloadTests(_Base):
         opts_src = inspect.getsource(self.bc._local_chat_payload)
         self.assertIn("chat_options", opts_src)
         self.assertIn("_local_num_ctx(model_tag)", opts_src)
-        self.assertIn('"keep_alive": "20m"', opts_src)
+        self.assertIn('"keep_alive": _local_keep_alive()', opts_src)
 
 
 # ════════════════════════════════════════════════════════════════════════════

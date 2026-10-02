@@ -19681,7 +19681,7 @@ def _ollama_chat_bounded(model, messages):
     return client.chat(
         model=model, messages=messages,
         options=_chat_options(model, extra={"num_ctx": _local_num_ctx(model)}),
-        keep_alive="20m")
+        keep_alive=_local_keep_alive())
 
 
 def _llm_brain_is_remote() -> bool:
@@ -20674,6 +20674,16 @@ def _local_chat_prompt(system: str, messages: list) -> tuple:
     return sys_prompt, messages
 
 
+def _local_keep_alive():
+    """LOCAL_KEEP_ALIVE (core/config.py): the keep_alive every local-brain
+    request sends, so the chat, warm-up and re-prime paths never disagree.
+    A blank or broken value falls back to today's "20m"."""
+    v = globals().get("LOCAL_KEEP_ALIVE", "20m")
+    if isinstance(v, bool) or v is None or (isinstance(v, str) and not v.strip()):
+        return "20m"
+    return v
+
+
 def _local_chat_payload(model_tag: str, sys_prompt: str, messages: list,
                         max_tokens: int = 500) -> dict:
     """The /api/chat body for one local call — the ONE builder shared by
@@ -20704,7 +20714,7 @@ def _local_chat_payload(model_tag: str, sys_prompt: str, messages: list,
         "options": options,
         # Keep the model resident between turns so a voice burst doesn't pay
         # the ~3-5s reload each time (it competes with whisper on reload).
-        "keep_alive": "20m",
+        "keep_alive": _local_keep_alive(),
     }
     # Thinking models MUST have thinking disabled/minimised for voice —
     # computed per model_tag because the empty-response failover can land
@@ -21134,7 +21144,7 @@ def _warm_up_local_llm_async() -> None:
                 "messages": [{"role": "user", "content": "ok"}],
                 "stream": False,
                 "options": {"num_predict": 1, "num_ctx": _local_num_ctx(model)},
-                "keep_alive": "20m",
+                "keep_alive": _local_keep_alive(),
             }
             with _lt.TRACKER.track():   # JARVIS's own GPU load (system-pulse)
                 r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat",
@@ -21452,7 +21462,7 @@ def _call_local_vision(question: str, png_images: list[bytes],
                 # value for the shared model; a separate VLM keeps Ollama's default
                 # (it should not linger in VRAM beside the brain).
                 if _vision_shares_chat_model():
-                    payload["keep_alive"] = "20m"
+                    payload["keep_alive"] = _local_keep_alive()
                 # Thinking-capable multimodal models (qwen3.x / gemma4) must not spend
                 # seconds reasoning before describing a screen; pure VLMs (qwen2.5vl)
                 # get no think param at all (400 otherwise).

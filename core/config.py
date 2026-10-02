@@ -2194,6 +2194,13 @@ GAME_MODE_VERIFY_DELAY_SECONDS = 8.0
 # state. A mode that claims memory it did not free is the defect this whole
 # feature is written against.
 GAME_MODE_MIN_VRAM_DELTA_MB = 3000
+# How long Ollama keeps the local brain loaded after a request (2026-10-02).
+# Every local chat / warm / re-prime request sends this same value (a request
+# without one resets the resident timer). "20m" = today's behaviour; -1 keeps
+# it loaded until game mode or a restart unloads it - the owner chose that on
+# 2026-10-02 after a 10 s reload on the first command after a 20 min break.
+# Any Ollama duration string ("2h") or a number of seconds also works.
+LOCAL_KEEP_ALIVE = "20m"
 # Re-ping the small model this often so it does not evict on Ollama's clock.
 # `keep_alive: "20m"` is HARDCODED in the chat payload (bobert_companion.py:
 # 11148), so a long keep_alive cannot be pinned from outside — but the refresh
