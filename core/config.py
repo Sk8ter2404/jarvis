@@ -748,10 +748,13 @@ WHISPER_BEAM_SIZE    = 5
 #                Any error switches back to Whisper for the session.
 #   The JARVIS_STT_ENGINE environment variable overrides this setting.
 # STT_SHADOW: '' (off) | 'parakeet' → Whisper keeps transcribing; Parakeet
-#   re-decodes each command afterwards, while JARVIS is idle, and both
-#   transcripts and the speech gates' verdicts on them go to the gitignored
-#   data/stt_ab.jsonl (the words are written there only, never to the log;
-#   audio is never saved). Use it to compare the two before switching.
+#   re-decodes each command (and each standby wake check) afterwards, while
+#   JARVIS is idle, and the speech gates' verdicts on both go to the
+#   gitignored data/stt_ab.jsonl. The words are written there only — never
+#   to the log — and only for a line JARVIS would act on (a line no gate
+#   would pass keeps its numbers, never its words); nothing is recorded
+#   while the mic is muted; audio is never saved. Use it to compare the two
+#   before switching.
 # PARAKEET_MODEL_DIR: the downloaded model folder. PARAKEET_THREADS: CPU
 #   threads for one decode. PARAKEET_CONF_ANCHORS: [[parakeet token
 #   log-probability mean, Whisper-scale avg_logprob], ...] — how Parakeet's

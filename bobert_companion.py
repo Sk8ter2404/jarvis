@@ -16360,9 +16360,11 @@ def _transcribe_capture(audio):
     same gain to its own snapshot from the same (final) peak RMS, so the two
     paths feed faster-whisper identically-scaled samples.
 
-    [turn-timing] (speed plan R1): the owner's captures only pass here, so
-    this is where clip_ms is noted and the tail_ms probe starts — on a copy,
-    on its own daemon; the (text, conf) below are untouched by it.
+    [turn-timing] (speed plan R1): the owner's commands (_capture_utterance)
+    and the standby / sleep wake checks (_handle_sleep_standby) pass here —
+    no ambient or in-turn capture does — so this is where clip_ms is noted
+    and the tail_ms probe starts — on a copy, on its own daemon; the
+    (text, conf) below are untouched by it.
 
     Speed plan R6: STT_ENGINE / STT_SHADOW = 'parakeet' route the capture
     through _transcribe_capture_r6 (both off by default). With Parakeet
@@ -16689,6 +16691,7 @@ _parakeet_shadow = _stt_parakeet.Shadow(
     latch=_parakeet_latch,
     rescue=lambda t, a, c: _parakeet_shadow_rescue(t, a, c),
     live=lambda t, c: _parakeet_shadow_live(t, c),
+    muted=lambda: bool(_mic_muted[0]),
 )
 
 
@@ -16696,12 +16699,17 @@ def _transcribe_capture_r6(audio, route: str):
     """_transcribe_capture's R6 tail. 'primary': Parakeet decodes (rescue /
     fallback to transcribe() inside _parakeet_primary). 'shadow': exactly
     transcribe(), then the capture is offered to the shadow worker (a copy;
-    never blocks)."""
+    never blocks) — unless the mic was muted meanwhile. The shadow keeps the
+    words only of a line the live system acts on (words_kept)."""
     if route == "primary":
         return _parakeet_primary.run(audio)
     _stt_wait_tls.ms = None
     t0 = time.perf_counter()
     res = transcribe(audio)
+    # Muted WHILE Whisper ran: the caller drops this transcript ("don't
+    # listen"), so the A/B file never sees the capture either.
+    if _mic_muted[0]:
+        return res
     try:
         wall = int(round((time.perf_counter() - t0) * 1000.0))
         # transcribe() noted its wait for _stt_lock (an ambient decode):

@@ -462,6 +462,21 @@ def _side(text, conf, judged, ms, wait_ms=None) -> dict:
     return d
 
 
+def words_kept(w_judged, p_judged, live) -> bool:
+    """Does an A/B row keep the two transcripts? Only for a line the live
+    system acts on: either engine's text passes the gates (it would reach
+    "You:" or wake JARVIS), or the live loop did act on it (``live``: you /
+    woke). Any other line is as likely someone else's as the owner's — the
+    rule every speech gate's log line follows — so its row keeps the
+    numbers, the verdicts and the lengths, never the words. A judge error
+    keeps nothing."""
+    for j in (w_judged, p_judged):
+        if isinstance(j, dict) and j.get("gates_passed"):
+            return True
+    return isinstance(live, dict) and bool(live.get("you")
+                                           or live.get("woke"))
+
+
 def append_jsonl(path, row, max_bytes=AB_MAX_BYTES) -> bool:
     """Append one JSON line to `path` unless the file already holds
     `max_bytes`. True when written. Never raises."""
@@ -499,6 +514,13 @@ class Shadow:
       live(t, ctx) -> dict            what the live loop did with Whisper's
                                       text, read once the turn is over (the
                                       row's ``live``)
+      muted() -> bool                 the owner's Mute Mic is on: asked
+                                      before the decode and again before the
+                                      write; muted = nothing is recorded
+
+    PRIVACY: a row keeps the transcripts only when words_kept() says the
+    line is one the live system acts on; otherwise both texts are '' and
+    ``words`` is 'dropped' (their lengths stay, as ``chars``).
 
     offer() never blocks the voice thread: it copies the audio into a
     bounded queue (a full queue drops the capture and counts it). ONE daemon
@@ -512,7 +534,7 @@ class Shadow:
     injectable (tests run without sleeping)."""
 
     def __init__(self, decode, busy, judge, write_row, *, latch,
-                 rescue=None, live=None,
+                 rescue=None, live=None, muted=None,
                  maxsize=SHADOW_QUEUE_MAX, wait_s=SHADOW_WAIT_S,
                  poll_s=SHADOW_POLL_S, log=print, clock=time.monotonic,
                  wait=None, wall=time.time):
@@ -522,6 +544,7 @@ class Shadow:
         self._write = write_row
         self._rescue = rescue
         self._live = live
+        self._muted = muted
         self.latch = latch
         self._q = queue.Queue(maxsize=max(1, int(maxsize)))
         # Numbers-only records of captures a full queue refused, written by
@@ -539,6 +562,7 @@ class Shadow:
         self.offered = 0
         self.dropped_full = 0
         self.dropped_busy = 0
+        self.dropped_muted = 0
         self.rows = 0
 
     # -- voice thread --------------------------------------------------------
@@ -614,7 +638,19 @@ class Shadow:
                 "wake_mode": bool(ctx.get("wake_mode")),
                 "standby": bool(ctx.get("standby"))}
 
+    def _is_muted(self) -> bool:
+        """The owner's Mute Mic is on (an error counts as muted: when in
+        doubt, record nothing)."""
+        if self._muted is None:
+            return False
+        try:
+            return bool(self._muted())
+        except Exception:
+            return True
+
     def _write_row(self, row) -> bool:
+        if self._is_muted():
+            return False
         try:
             return bool(self._write(row))
         except Exception:
@@ -658,6 +694,10 @@ class Shadow:
                       f"{self._wait_s:.0f} s ({n} dropped)")
             return None
         if self.latch.failed:
+            return None
+        if self._is_muted():
+            with self._mu:
+                self.dropped_muted += 1
             return None
         waited_ms = int(round((self._clock() - item["t"]) * 1000.0))
         try:
@@ -713,6 +753,17 @@ class Shadow:
                              item.get("wait_ms")),
             "parakeet": _side(p_text, p_conf, p_judged, p_ms, p_wait),
         }
+        if words_kept(w_judged, p_judged, live):
+            row["words"] = "kept"
+        else:
+            row["words"] = "dropped"
+            for side in ("whisper", "parakeet"):
+                row[side]["chars"] = len(row[side]["text"] or "")
+                row[side]["text"] = ""
+        if self._is_muted():
+            with self._mu:
+                self.dropped_muted += 1
+            return None
         wrote = self._write_row(row)
         with self._mu:
             self.rows += 1 if wrote else 0

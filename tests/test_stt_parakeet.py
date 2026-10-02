@@ -623,6 +623,58 @@ class ShadowTests(unittest.TestCase):
                                       "wake_mode", "standby"})
         self.assertEqual((sh.dropped_full, sh.dropped_busy), (1, 1))
 
+    def test_nothing_is_recorded_while_the_mic_is_muted(self):
+        # The owner said "don't listen": no decode, no row — not even a
+        # numbers-only one (R6 review, finding 2 of the second review).
+        sh, log, rows, decoded, _c = _shadow(muted=lambda: True)
+        self._offer(sh)
+        self.assertIsNone(sh.process(self._take(sh)))
+        self.assertEqual((decoded, rows), ([], []))
+        self.assertEqual(sh.dropped_muted, 1)
+
+    def test_a_mute_during_the_decode_writes_nothing(self):
+        state = {"n": 0}
+
+        def muted():
+            state["n"] += 1
+            return state["n"] > 1           # muted once the decode ran
+        sh, _log, rows, decoded, _c = _shadow(muted=muted)
+        self._offer(sh)
+        self.assertIsNone(sh.process(self._take(sh)))
+        self.assertEqual((len(decoded), rows), (1, []))
+
+    def test_words_are_kept_only_for_a_line_the_gates_would_pass(self):
+        # A line no gate would pass is as likely someone else's as the
+        # owner's: its row keeps the numbers and the verdicts, never the
+        # words (R6 review: standby / room lines went to the file verbatim).
+        def judge(text, conf, peak, ctx):
+            return {"gates_passed": ctx.get("pass") == text}
+        for ctx, live, kept in (
+                ({}, None, False),
+                ({"pass": "Jarvis, turn the lights off"}, None, True),
+                ({"pass": "jarvis turn the lights off"}, None, True),
+                ({}, {"you": True}, True),
+                ({}, {"you": False, "woke": True}, True),
+                ({}, {"you": False}, False)):
+            sh, _log, rows, _d, _c = _shadow(live=lambda t, c, v=live: v)
+            sh._judge = judge
+            sh.offer(self.AUDIO, "Jarvis, turn the lights off", W_CONF,
+                     1500, 0.02, ctx, start=False)
+            row = sh.process(self._take(sh))
+            case = (ctx, live)
+            self.assertEqual(rows, [row], case)
+            if kept:
+                self.assertEqual(row["words"], "kept", case)
+                self.assertEqual(row["whisper"]["text"],
+                                 "Jarvis, turn the lights off", case)
+            else:
+                self.assertEqual(row["words"], "dropped", case)
+                self.assertEqual((row["whisper"]["text"],
+                                  row["parakeet"]["text"]), ("", ""), case)
+                self.assertEqual((row["whisper"]["chars"],
+                                  row["parakeet"]["chars"]), (27, 26), case)
+                self.assertNotIn("lights", json.dumps(row), case)
+
     def test_never_prints_either_transcript(self):
         sh, log, rows, _d, _c = _shadow()
         out = io.StringIO()

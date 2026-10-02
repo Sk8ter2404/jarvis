@@ -1059,6 +1059,52 @@ class R6ShadowJudgeTests(_Base):
         self.assertGreaterEqual(wait, 200)
         self.assertLess(ms, 150)
 
+    def test_a_mute_during_transcription_offers_nothing(self):
+        # Muted WHILE Whisper ran: the caller drops the transcript; the
+        # shadow must not keep it either (R6 review).
+        bc = self.bc
+        self._p(bc, "_mic_muted", [False])
+
+        def tr(audio):
+            bc._mic_muted[0] = True
+            return W_RES
+        self._p(bc, "transcribe", side_effect=tr)
+        offer = self._p(bc._parakeet_shadow, "offer", return_value=True)
+        self.assertIs(bc._transcribe_capture(self.audio), W_RES)
+        offer.assert_not_called()
+
+    def test_a_mute_before_the_shadow_runs_writes_no_row(self):
+        bc = self.bc
+        self._p(bc, "_mic_muted", [False])
+        self._p(bc, "_stt_alt", _FakeEngine(text="Jarvis, lights"))
+        self.sh.offer(self.audio, "Jarvis, lights", W_RES[1], 900, 0.05,
+                      bc._parakeet_shadow_ctx(self.audio), start=False)
+        bc._mic_muted[0] = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(self.sh.process(self.sh._q.get_nowait()))
+        self.assertEqual(self._rows(), [])
+
+    def test_a_standby_line_that_wakes_nobody_keeps_no_words(self):
+        bc = self.bc
+        self._p(bc, "_standby_mode", [True])
+        self._p(bc, "_sleep_mode", [True])
+        self._p(bc, "_stt_alt",
+                _FakeEngine(text="the weather today is nice"))
+        ctx = bc._parakeet_shadow_ctx(self.audio)
+        self.sh.offer(self.audio, "The weather today is nice.", W_RES[1],
+                      900, 0.05, ctx, start=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            row = self.sh.process(self.sh._q.get_nowait())
+        self.assertEqual(row["words"], "dropped")
+        self.assertNotIn("weather", json.dumps(self._rows()))
+        # A standby wake keeps its words.
+        self._p(bc, "_stt_alt", _FakeEngine(text="Jarvis are you there"))
+        self.sh.offer(self.audio, "Jarvis, are you there?", W_RES[1], 900,
+                      0.05, ctx, start=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            row = self.sh.process(self.sh._q.get_nowait())
+        self.assertEqual(row["words"], "kept")
+
     def test_the_live_outcome(self):
         bc = self.bc
         self._p(bc, "_last_owner_turn_at", [50.0])
