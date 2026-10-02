@@ -113,6 +113,9 @@ _DENYLIST_NAMES = {
     # daemon.
     "youtube_direct", "youtube_search_direct", "yt_direct",
     "keep_music_open",
+    # skills/site_builder.py: a paid Opus call for a site about "test",
+    # then a real browser tab on the saved page.
+    "build_website",
     # input injection on the live desktop
     "click", "press", "hotkey", "type", "scroll", "screenshot",
     "run_shell", "launch_app",

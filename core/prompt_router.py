@@ -344,6 +344,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "generate an image", "make a picture", "draw me", "image of",
         "create an image", "sdxl", "picture of", "generate a picture",
     ],
+    "WEBSITE BUILDER": [
+        "website", "web site", "landing page", "web page", "webpage",
+        "homepage", "home page", "site for",
+    ],
     "LOCAL VISION": ["offline vision", "local vision", "vlm"],
     "PERSONAL RAG": [
         "my notes", "my files", "search my", "my documents", "in my files",

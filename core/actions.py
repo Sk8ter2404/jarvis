@@ -78,9 +78,30 @@ def _site_shortcut_url(name: str) -> "str | None":
         return None
 
 
+def _is_data_dir_page(url: str) -> bool:
+    """True for a ``file:`` URI naming an existing .html/.htm page inside
+    JARVIS's own data dir (a page a skill wrote, e.g. skills/site_builder.py).
+    Only those open as-is: any other local file could be an executable, and on
+    Windows webbrowser.open hands the URI to os.startfile. Never raises."""
+    try:
+        import urllib.request
+        from core.paths import data_dir
+        p = urllib.parse.urlparse(url)
+        if (p.scheme.lower() != "file" or p.netloc not in ("", "localhost")
+                or p.params or p.query or p.fragment):
+            return False
+        root = os.path.realpath(data_dir(create=False))
+        path = os.path.realpath(urllib.request.url2pathname(p.path))
+        return (path.lower().endswith((".html", ".htm"))
+                and os.path.commonpath([root, path]) == root
+                and os.path.isfile(path))
+    except Exception:
+        return False
+
+
 def _act_open_url(url: str) -> str:
     url = _site_shortcut_url(url) or url
-    if not url.startswith(("http://", "https://")):
+    if not (url.startswith(("http://", "https://")) or _is_data_dir_page(url)):
         url = "https://" + url
     webbrowser.open(url)
     # Small wait so the page has time to start loading before any follow-up

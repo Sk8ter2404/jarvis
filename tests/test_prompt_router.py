@@ -559,6 +559,39 @@ class BrowserAgentRoutingRegressionTests(unittest.TestCase):
                 f"{action!r} it is documented to fire")
 
 
+class WebsiteBuilderRoutingTests(unittest.TestCase):
+    """skills/site_builder.py's build_website must reach the LOCAL model: the
+    WEBSITE BUILDER section loads (and ships the action name) for the phrasings
+    it documents, and stays out of an unrelated turn."""
+
+    PHRASES = (
+        "build a website for Blue Door Bakery",
+        "make a landing page for my friend's shop",
+        "jarvis, design a web page for the corner cafe",
+        "mock up a homepage for the garage down the road",
+        "can you make a site for my friend's shop in Springfield",
+    )
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+
+    def test_website_builder_is_a_parsed_section_documenting_the_action(self):
+        bodies = dict(self.sections)
+        self.assertIn("WEBSITE BUILDER", bodies)
+        self.assertIn("build_website", bodies["WEBSITE BUILDER"])
+
+    def test_documented_phrasings_load_the_section_and_ship_the_action(self):
+        for q in self.PHRASES:
+            inc, _ = pr.select_sections(q, self.sections)
+            self.assertIn("WEBSITE BUILDER", inc, q)
+            self.assertIn("build_website", pr.slim_pc_control(q, FULL), q)
+
+    def test_unrelated_turn_leaves_it_out(self):
+        inc, _ = pr.select_sections("what's the weather tomorrow",
+                                    self.sections)
+        self.assertNotIn("WEBSITE BUILDER", inc)
+
+
 # A "'phrase' -> [ACTION: name]" example line, whitespace-normalized first so
 # the many examples that wrap the arrow onto the next line still extract.
 _ARROW_EXAMPLE_RE = re.compile(
