@@ -2,9 +2,14 @@
 
 Fakes only: the fact lookup is a stand-in dossier module in sys.modules, the
 cloud call is a patched core.llm_client.complete, the local model is the fake
-skill_utils["local_complete"], the browser is the fake skill_utils["open_url"]
-and the data dir is a temp dir via JARVIS_DATA_DIR. No network, no LLM, no
-browser. Fixtures use generic business names only.
+skill_utils["local_complete"], the browser is the fake skill_utils["open_url"],
+the announce path is a stand-in bobert_companion.proactive_announce and the
+data dir is a temp dir via JARVIS_DATA_DIR. No network, no LLM, no browser.
+
+The build runs on a background worker. Every test replaces the module's
+_start_worker seam with a recorder, then runs the recorded worker itself,
+synchronously — so no real thread is ever started (the one test of the real
+seam mocks threading.Thread). Fixtures use generic business names only.
 """
 from __future__ import annotations
 
@@ -29,6 +34,8 @@ _PAGE = (
     "</body>\n</html>"
 )
 _FACTS = "Blue Door Bakery is a neighbourhood bakery known for sourdough."
+_STARTED = ("Building a site for Blue Door Bakery now, sir — I'll tell you "
+            "when it's ready.")
 _SENTINEL = object()
 
 
@@ -55,6 +62,15 @@ def _dossier(facts=_FACTS):
     return mod
 
 
+class _Run:
+    """One build_website call plus its worker: the immediate reply, every
+    announced line, the cloud-call mock and the captured log."""
+
+    def __init__(self, reply, announced, complete, out):
+        self.reply, self.announced = reply, announced
+        self.complete, self.out = complete, out
+
+
 class _SiteBuilderCase(unittest.TestCase):
     def setUp(self):
         self.data = tempfile.mkdtemp(prefix="site_builder_test_")
@@ -66,14 +82,33 @@ class _SiteBuilderCase(unittest.TestCase):
         self.utils = make_fake_skill_utils()
         self.mod, self.actions = load_skill_isolated(
             "site_builder", utils=self.utils)
+        # The executor seam: record the worker instead of starting a thread.
+        self.real_start_worker = self.mod._start_worker
+        self.started = []
+        self.mod._start_worker = (
+            lambda target, *args: self.started.append((target, args)))
+        # The announce path: a stand-in monolith with proactive_announce.
+        self.announce = mock.MagicMock(name="proactive_announce",
+                                       return_value=True)
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = self.announce
+        cm = _module("bobert_companion", bc)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
 
-    def run_action(self, arg, *, cloud=True, cloud_reply=_PAGE,
-                   local_reply=None, dossier=_SENTINEL):
-        """Run build_website with the gate, the cloud call and the lookup
-        faked. Returns (reply, complete_mock, stdout)."""
+    def run_workers(self):
+        while self.started:
+            target, args = self.started.pop(0)
+            target(*args)
+
+    def run_build(self, arg, *, cloud=True, cloud_reply=_PAGE,
+                  local_reply=None, dossier=_SENTINEL):
+        """build_website(arg) (skipped for arg=None), then every queued
+        worker, with the gate, the cloud call and the lookup faked."""
         self.utils["local_complete"].return_value = local_reply
         if dossier is _SENTINEL:
             dossier = _dossier()
+        before = self.announce.call_count
         out = io.StringIO()
         with mock.patch("core.cloud_gate.chat_cloud_allowed",
                         return_value=cloud), \
@@ -81,8 +116,12 @@ class _SiteBuilderCase(unittest.TestCase):
                            return_value=cloud_reply) as complete, \
                 _module("skill_dossier", dossier), \
                 contextlib.redirect_stdout(out):
-            reply = self.actions["build_website"](arg)
-        return reply, complete, out.getvalue()
+            reply = (None if arg is None
+                     else self.actions["build_website"](arg))
+            self.run_workers()
+        announced = [c.args[0] for c in
+                     self.announce.call_args_list[before:]]
+        return _Run(reply, announced, complete, out.getvalue())
 
     def site_file(self, slug):
         return os.path.join(self.data, "sites", slug, "index.html")
@@ -93,12 +132,123 @@ class RegisterTests(_SiteBuilderCase):
         self.assertIs(self.actions["build_website"], self.mod.build_website)
         self.assertIn("build_website", self.mod.SPEAK_VERBATIM_ACTIONS)
 
-    def test_marks_itself_long_running_on_the_monolith(self):
+    def test_no_longer_marked_long_running(self):
+        # It returns at once now; the mid-task "still working" line would
+        # only ever fire on a stuck enqueue.
         fake_bc = types.ModuleType("bobert_companion")
         fake_bc.LONG_RUNNING_ACTIONS = set()
         with _module("bobert_companion", fake_bc):
             self.mod.register({})
-        self.assertIn("build_website", fake_bc.LONG_RUNNING_ACTIONS)
+        self.assertNotIn("build_website", fake_bc.LONG_RUNNING_ACTIONS)
+
+
+class BackgroundTests(_SiteBuilderCase):
+    def test_returns_at_once_before_any_work(self):
+        with mock.patch("core.llm_client.complete") as complete, \
+                _module("skill_dossier", _dossier()):
+            reply = self.actions["build_website"]("Blue Door Bakery")
+        self.assertEqual(reply, _STARTED)
+        self.assertEqual(len(self.started), 1)
+        complete.assert_not_called()
+        self.utils["local_complete"].assert_not_called()
+        self.announce.assert_not_called()
+        self.utils["open_url"].assert_not_called()
+        self.assertFalse(os.path.exists(os.path.join(self.data, "sites")))
+
+    def test_single_flight(self):
+        first = self.actions["build_website"]("Blue Door Bakery")
+        second = self.actions["build_website"]("Green Gate Garage")
+        self.assertEqual(first, _STARTED)
+        self.assertEqual(second,
+                         "I'm still building the Blue Door Bakery site, sir.")
+        self.assertEqual(len(self.started), 1, "a second worker was started")
+        r = self.run_build(None)          # run only the one queued worker
+        self.assertEqual(len(r.announced), 1)
+        self.assertIn("Blue Door Bakery is ready", r.announced[0])
+        # Finished: the next request starts a new build.
+        self.assertEqual(self.actions["build_website"]("Green Gate Garage"),
+                         "Building a site for Green Gate Garage now, sir — "
+                         "I'll tell you when it's ready.")
+        self.assertEqual(len(self.started), 1)
+
+    def test_completion_announces_once_then_opens_the_page(self):
+        order = mock.Mock()
+        order.attach_mock(self.announce, "announce")
+        order.attach_mock(self.utils["open_url"], "open_url")
+        r = self.run_build("Blue Door Bakery")
+        self.assertEqual(r.reply, _STARTED)
+        self.assertEqual(len(r.announced), 1)
+        self.assertIn("The website for Blue Door Bakery is ready, sir",
+                      r.announced[0])
+        self.assertIn("sites/blue-door-bakery", r.announced[0])
+        self.assertEqual(self.announce.call_args.kwargs,
+                         {"source": "site_builder"})
+        uri = Path(self.site_file("blue-door-bakery")).as_uri()
+        self.utils["open_url"].assert_called_once_with(uri)
+        self.assertEqual([c[0] for c in order.mock_calls],
+                         ["announce", "open_url"])
+
+    def test_failure_announces_honestly_once_and_opens_nothing(self):
+        r = self.run_build("Blue Door Bakery", cloud=False, local_reply=None)
+        self.assertEqual(r.reply, _STARTED)
+        self.assertEqual(r.announced, [
+            "I couldn't build the Blue Door Bakery website, sir — Claude "
+            "isn't available for this, and the local model couldn't write "
+            "the page."])
+        self.utils["open_url"].assert_not_called()
+        self.assertFalse(os.path.exists(os.path.join(self.data, "sites")))
+
+    def test_a_crashing_build_is_announced_and_frees_the_slot(self):
+        with mock.patch.object(self.mod, "_build_site",
+                               side_effect=RuntimeError("boom")):
+            r = self.run_build("Blue Door Bakery")
+        self.assertEqual(r.announced, [
+            "I couldn't build the Blue Door Bakery website, sir — something "
+            "went wrong partway through."])
+        self.assertNotIn("boom", r.out)
+        self.assertEqual(self.actions["build_website"]("Blue Door Bakery"),
+                         _STARTED)
+
+    def test_nothing_is_spoken_without_an_announce_path(self):
+        for label, bc in (
+                ("no monolith", None),
+                ("no proactive_announce", types.ModuleType("bobert_companion")),
+                ("enqueue refused", types.SimpleNamespace(
+                    proactive_announce=mock.MagicMock(return_value=False))),
+                ("enqueue raises", types.SimpleNamespace(
+                    proactive_announce=mock.MagicMock(
+                        side_effect=OSError("disk"))))):
+            with self.subTest(label), _module("bobert_companion", bc):
+                self.utils["open_url"].reset_mock()
+                r = self.run_build("Blue Door Bakery")
+                self.assertEqual(r.reply, _STARTED)
+                self.assertIn("not spoken", r.out)
+                self.assertIn("The website for Blue Door Bakery is ready",
+                              r.out)
+                # The page is still built and opened.
+                self.assertTrue(os.path.isfile(
+                    self.site_file("blue-door-bakery")))
+                self.utils["open_url"].assert_called_once()
+        self.announce.assert_not_called()
+
+    def test_start_failure_frees_the_slot(self):
+        self.mod._start_worker = mock.MagicMock(side_effect=RuntimeError("x"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            reply = self.actions["build_website"]("Blue Door Bakery")
+        self.assertEqual(reply, "I couldn't start building that website, sir.")
+        self.mod._start_worker = (
+            lambda target, *args: self.started.append((target, args)))
+        self.assertEqual(self.actions["build_website"]("Blue Door Bakery"),
+                         _STARTED)
+
+    def test_real_seam_starts_one_daemon_thread(self):
+        target = mock.MagicMock()
+        with mock.patch.object(self.mod.threading, "Thread") as thread:
+            self.real_start_worker(target, "a", "b", "c")
+        thread.assert_called_once_with(target=target, args=("a", "b", "c"),
+                                       daemon=True, name="site-builder")
+        thread.return_value.start.assert_called_once_with()
+        target.assert_not_called()
 
 
 class SlugTests(_SiteBuilderCase):
@@ -128,15 +278,11 @@ class SlugTests(_SiteBuilderCase):
 
 
 class SaveLocationTests(_SiteBuilderCase):
-    def test_page_is_written_in_the_data_dir_and_opened(self):
-        reply, _complete, _out = self.run_action("Blue Door Bakery")
+    def test_page_is_written_in_the_data_dir(self):
+        self.run_build("Blue Door Bakery")
         path = self.site_file("blue-door-bakery")
-        self.assertTrue(os.path.isfile(path), reply)
         with open(path, encoding="utf-8") as f:
             self.assertEqual(f.read(), _PAGE + "\n")
-        self.utils["open_url"].assert_called_once_with(Path(path).as_uri())
-        self.assertIn("opened it in your browser", reply)
-        self.assertIn("sites/blue-door-bakery", reply)
         # Nothing but the one page under the data dir.
         self.assertEqual(os.listdir(os.path.join(self.data, "sites")),
                          ["blue-door-bakery"])
@@ -147,11 +293,14 @@ class SaveLocationTests(_SiteBuilderCase):
                 self.mod._save_site(slug, _PAGE)
         self.assertFalse(os.path.exists(os.path.join(self.data, "escape")))
 
-    def test_open_failure_still_reports_the_saved_page(self):
+    def test_open_failure_is_logged_and_frees_the_slot(self):
         self.utils["open_url"].side_effect = RuntimeError("no browser")
-        reply, _c, _o = self.run_action("Blue Door Bakery")
+        r = self.run_build("Blue Door Bakery")
         self.assertTrue(os.path.isfile(self.site_file("blue-door-bakery")))
-        self.assertIn("couldn't open the browser", reply)
+        self.assertEqual(len(r.announced), 1)
+        self.assertIn("open failed", r.out)
+        self.assertEqual(self.actions["build_website"]("Blue Door Bakery"),
+                         _STARTED)
 
 
 class HtmlSanityTests(_SiteBuilderCase):
@@ -175,8 +324,8 @@ class HtmlSanityTests(_SiteBuilderCase):
             self.assertIsNone(self.mod._extract_html(raw), raw)
 
     def test_prompt_asks_for_every_section_and_forbids_invention(self):
-        _r, complete, _o = self.run_action("Blue Door Bakery | Springfield")
-        kw = complete.call_args.kwargs
+        r = self.run_build("Blue Door Bakery | Springfield")
+        kw = r.complete.call_args.kwargs
         system = kw["system"].lower()
         for part in ("hero", "about", "menu or services", "hours", "location",
                      "contact", "call to action", "no javascript",
@@ -189,97 +338,90 @@ class HtmlSanityTests(_SiteBuilderCase):
                       "Blue+Door+Bakery+Springfield", user)
 
     def test_unusable_model_output_saves_nothing(self):
-        reply, _c, _o = self.run_action("Blue Door Bakery",
-                                        cloud_reply="no page here",
-                                        local_reply="still no page")
+        r = self.run_build("Blue Door Bakery", cloud_reply="no page here",
+                           local_reply="still no page")
         self.assertFalse(os.path.exists(os.path.join(self.data, "sites")))
         self.utils["open_url"].assert_not_called()
-        self.assertIn("couldn't build the website", reply)
+        self.assertEqual(r.announced, [
+            "I couldn't build the Blue Door Bakery website, sir — neither "
+            "Claude nor the local model produced a usable page."])
 
 
 class ModelRoutingTests(_SiteBuilderCase):
     def test_cloud_path_uses_opus_deep(self):
-        reply, complete, _o = self.run_action("Blue Door Bakery")
-        complete.assert_called_once()
-        kw = complete.call_args.kwargs
+        r = self.run_build("Blue Door Bakery")
+        r.complete.assert_called_once()
+        kw = r.complete.call_args.kwargs
         self.assertEqual(kw["model"], "claude-opus-5-5")
         self.assertEqual(kw["purpose"], "deep")
         self.utils["local_complete"].assert_not_called()
-        self.assertNotIn("local model", reply)
+        self.assertNotIn("local model", r.announced[0])
 
     def test_cloud_disabled_uses_the_local_long_reply_path(self):
-        reply, complete, _o = self.run_action(
-            "Blue Door Bakery", cloud=False, local_reply=_PAGE)
-        complete.assert_not_called()
+        r = self.run_build("Blue Door Bakery", cloud=False, local_reply=_PAGE)
+        r.complete.assert_not_called()
         call = self.utils["local_complete"].call_args
         self.assertEqual(call.kwargs["max_tokens"], self.mod.LOCAL_MAX_TOKENS)
         self.assertEqual(call.kwargs["timeout_s"], self.mod.LOCAL_TIMEOUT_S)
         self.assertGreaterEqual(self.mod.LOCAL_MAX_TOKENS, 4096)
         self.assertTrue(os.path.isfile(self.site_file("blue-door-bakery")))
-        self.assertIn("with the local model", reply)
+        self.assertIn("built with the local model", r.announced[0])
 
     def test_no_key_never_calls_the_cloud(self):
         with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
-            _r, complete, _o = self.run_action("Blue Door Bakery",
-                                               local_reply=_PAGE)
-        complete.assert_not_called()
-
-    def test_cloud_disabled_and_no_local_model_declines_honestly(self):
-        reply, complete, _o = self.run_action(
-            "Blue Door Bakery", cloud=False, local_reply=None)
-        complete.assert_not_called()
-        self.assertFalse(os.path.exists(os.path.join(self.data, "sites")))
-        self.utils["open_url"].assert_not_called()
-        self.assertIn("Claude isn't available", reply)
-        self.assertIn("local model couldn't write the page", reply)
+            r = self.run_build("Blue Door Bakery", local_reply=_PAGE)
+        r.complete.assert_not_called()
 
     def test_cloud_failure_falls_back_to_local(self):
-        reply, complete, _o = self.run_action(
-            "Blue Door Bakery", cloud_reply=None, local_reply=_PAGE)
-        complete.assert_called_once()
+        r = self.run_build("Blue Door Bakery", cloud_reply=None,
+                           local_reply=_PAGE)
+        r.complete.assert_called_once()
         self.utils["local_complete"].assert_called_once()
         self.assertTrue(os.path.isfile(self.site_file("blue-door-bakery")))
-        self.assertIn("with the local model", reply)
+        self.assertIn("built with the local model", r.announced[0])
 
 
 class FactsTests(_SiteBuilderCase):
     def test_facts_reach_the_prompt_but_never_the_log(self):
         dossier = _dossier()
-        reply, complete, out = self.run_action(
-            "Blue Door Bakery | Springfield", dossier=dossier)
+        r = self.run_build("Blue Door Bakery | Springfield", dossier=dossier)
         dossier._gather_web.assert_called_once_with(
             "Blue Door Bakery Springfield")
-        self.assertIn(_FACTS, complete.call_args.kwargs["messages"][0]["content"])
-        self.assertNotIn(_FACTS, out)
-        self.assertNotIn("<section", out)          # nor the page itself
-        self.assertNotIn("couldn't find anything", reply)
+        self.assertIn(_FACTS,
+                      r.complete.call_args.kwargs["messages"][0]["content"])
+        self.assertNotIn(_FACTS, r.out)
+        self.assertNotIn("<section", r.out)        # nor the page itself
+        self.assertNotIn("couldn't find anything", r.announced[0])
 
     def test_no_facts_builds_from_the_name_alone_and_says_so(self):
-        reply, complete, _o = self.run_action("Blue Door Bakery",
-                                              dossier=_dossier(""))
+        r = self.run_build("Blue Door Bakery", dossier=_dossier(""))
         self.assertIn("nothing could be fetched",
-                      complete.call_args.kwargs["messages"][0]["content"])
+                      r.complete.call_args.kwargs["messages"][0]["content"])
         self.assertTrue(os.path.isfile(self.site_file("blue-door-bakery")))
-        self.assertIn("couldn't find anything about them online", reply)
-        self.assertIn("the name alone", reply)
+        self.assertIn("couldn't find anything about them online",
+                      r.announced[0])
+        self.assertIn("the name alone", r.announced[0])
 
     def test_no_lookup_helper_loaded_counts_as_no_facts(self):
-        reply, _c, _o = self.run_action("Blue Door Bakery | | sourdough",
-                                        dossier=None)
-        self.assertIn("couldn't find anything about them online", reply)
-        self.assertIn("your notes", reply)
+        r = self.run_build("Blue Door Bakery | | sourdough", dossier=None)
+        self.assertIn("couldn't find anything about them online",
+                      r.announced[0])
+        self.assertIn("your notes", r.announced[0])
 
     def test_failing_lookup_counts_as_no_facts(self):
         dossier = _dossier()
         dossier._gather_web.side_effect = OSError("offline")
-        reply, _c, _o = self.run_action("Blue Door Bakery", dossier=dossier)
-        self.assertIn("couldn't find anything about them online", reply)
+        r = self.run_build("Blue Door Bakery", dossier=dossier)
+        self.assertIn("couldn't find anything about them online",
+                      r.announced[0])
 
     def test_empty_arg_asks_which_business(self):
-        reply, complete, _o = self.run_action("  ")
-        self.assertIn("Which business", reply)
-        complete.assert_not_called()
+        r = self.run_build("  ")
+        self.assertIn("Which business", r.reply)
+        self.assertEqual(self.started, [])
+        r.complete.assert_not_called()
         self.utils["local_complete"].assert_not_called()
+        self.announce.assert_not_called()
 
 
 if __name__ == "__main__":

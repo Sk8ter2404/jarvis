@@ -4,13 +4,15 @@ JARVIS 'site builder' skill — "build a website for <business>".
     'build a website for Blue Door Bakery'
     'make a landing page for my friend's shop, Blue Door Bakery in Springfield'
 
-Flow (one synchronous action; it takes a minute or two, so it is registered
-as long-running and the dispatcher's mid-task status line bridges the wait):
+Flow. The action only validates its argument, starts ONE daemon worker and
+answers at once ("Building a site for <name> now, sir ..."), so the voice
+loop is never blocked; a second request while a build runs is told so and
+starts nothing. The worker:
   1. Facts — the dossier skill's DuckDuckGo Instant Answer fetch (the one
      plain HTTP fetch + search helper in the tree; web_search only opens a
      results page and browse_for drives a whole browser-use agent). Nothing
      found, or the dossier skill not loaded → the page is built from the
-     action argument alone and the spoken summary says so. Fetched text is
+     action argument alone and the announcement says so. Fetched text is
      never logged.
   2. One complete, responsive, self-contained HTML page (hero, about,
      menu/services, hours, location + map link, contact, call to action;
@@ -21,8 +23,12 @@ as long-running and the dispatcher's mid-task status line bridges the wait):
      budget; when that fails too, JARVIS says so and builds nothing.
   3. Saved to <JARVIS data dir>/sites/<slug>/index.html (core.paths, so a
      staging process writes data_staging/). Never anywhere else.
-  4. Opened in the default browser through skill_utils["open_url"].
-  5. Returns a 1-2 sentence summary, spoken verbatim.
+  4. Announces a 1-2 sentence result (or an honest failure, once) through
+     bobert_companion.proactive_announce, the out-of-turn speech queue:
+     focus / do-not-disturb holds it, standby keeps it for the wake, and the
+     main loop speaks it only between turns, never over the owner. No
+     monolith loaded → the result is logged, not spoken.
+  5. Opens the page in the default browser through skill_utils["open_url"].
 
 It NEVER publishes anything online and never contacts the business: the only
 network traffic is the fact lookup and the model call.
@@ -35,13 +41,14 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
 import unicodedata
 import urllib.parse
 from pathlib import Path
 from typing import Optional
 
 
-# The return value is a finished sentence — spoken as-is (load_skills folds
+# The immediate reply is a finished sentence — spoken as-is (load_skills folds
 # this into SPEAK_RESULT_VERBATIM_ACTIONS).
 SPEAK_VERBATIM_ACTIONS = ("build_website",)
 
@@ -258,13 +265,16 @@ def _extract_html(text: Optional[str]) -> Optional[str]:
     return html + "\n"
 
 
-# ─── action ──────────────────────────────────────────────────────────────
+# ─── action ─────────────────────────────────────────────────────────────
 
-def build_website(arg: str = "") -> str:
-    name, city, notes = _parse_arg(arg)
-    if not name:
-        return "Which business should I build the website for, sir?"
+# Single flight: the name of the site being built, or None.
+_build_lock = threading.Lock()
+_state: dict = {"building": None}
 
+
+def _build_site(name: str, city: str, notes: str) -> tuple[str, Optional[str]]:
+    """Gather, generate and save. Returns (the line to announce, the saved
+    page path or None). Runs on the worker thread."""
     facts = _gather_facts(name, city)
     user = _build_prompt(name, city, notes, facts)
 
@@ -278,49 +288,103 @@ def build_website(arg: str = "") -> str:
         html = _extract_html(_generate_local(_SYSTEM_PROMPT, user))
     if html is None:
         if cloud_ok:
-            return ("I couldn't build the website, sir — neither Claude nor "
-                    "the local model produced a usable page.")
-        return ("I can't build that website right now, sir — Claude isn't "
+            return (f"I couldn't build the {name} website, sir — neither "
+                    "Claude nor the local model produced a usable page.", None)
+        return (f"I couldn't build the {name} website, sir — Claude isn't "
                 "available for this, and the local model couldn't write the "
-                "page.")
+                "page.", None)
 
     slug = _slugify(name)
     try:
         path = _save_site(slug, html)
     except Exception as e:
         print(f"  [site-builder] save failed: {type(e).__name__}")
-        return "I wrote the page but couldn't save it to my data folder, sir."
+        return (f"I wrote the {name} page but couldn't save it to my data "
+                "folder, sir.", None)
     print(f"  [site-builder] saved {len(html)} chars "
           f"({'local' if used_local else 'cloud'})")
 
-    opened = False
-    open_url = _su("open_url")
-    if open_url is not None:
-        try:
-            open_url(Path(path).as_uri())
-            opened = True
-        except Exception as e:
-            print(f"  [site-builder] open failed: {type(e).__name__}")
-
     where = f"sites/{slug} in my data folder"
-    reply = (f"I've built a one-page website for {name}"
-             + (" with the local model" if used_local else "")
-             + (f" and opened it in your browser, sir — it's saved under "
-                f"{where}." if opened else
-                f", sir — it's saved under {where}, but I couldn't open the "
-                f"browser."))
+    message = (f"The website for {name} is ready, sir"
+               + (", built with the local model" if used_local else "")
+               + (f" — I'm opening it in your browser now; it's saved under "
+                  f"{where}." if _su("open_url") is not None else
+                  f" — it's saved under {where}."))
     if not facts:
-        reply += (" I couldn't find anything about them online, so it's "
-                  f"built from {'your notes' if notes else 'the name alone'}"
-                  " with placeholders for the details.")
-    return reply
+        message += (" I couldn't find anything about them online, so it's "
+                    f"built from {'your notes' if notes else 'the name alone'}"
+                    " with placeholders for the details.")
+    return message, path
+
+
+def _announce(message: str) -> bool:
+    """Queue ``message`` through the monolith's proactive_announce (see the
+    module docstring for the gates it respects). Never imports the monolith:
+    without one loaded, or when the enqueue fails, the line is logged and
+    nothing is spoken. Never raises."""
+    bc = sys.modules.get("bobert_companion")
+    fn = getattr(bc, "proactive_announce", None) if bc is not None else None
+    if callable(fn):
+        try:
+            if fn(message, source="site_builder"):
+                return True
+        except Exception as e:
+            print(f"  [site-builder] announce failed: {type(e).__name__}")
+    print(f"  [site-builder] not spoken (no announce path): {message}")
+    return False
+
+
+def _open_page(path: str) -> None:
+    open_url = _su("open_url")
+    if open_url is None:
+        return
+    try:
+        open_url(Path(path).as_uri())
+    except Exception as e:
+        print(f"  [site-builder] open failed: {type(e).__name__}")
+
+
+def _build_worker(name: str, city: str, notes: str) -> None:
+    """The background build: announce the result once, then open the page.
+    Always frees the single-flight slot."""
+    try:
+        try:
+            message, path = _build_site(name, city, notes)
+        except Exception as e:
+            print(f"  [site-builder] build failed: {type(e).__name__}")
+            message, path = (f"I couldn't build the {name} website, sir — "
+                             "something went wrong partway through.", None)
+        _announce(message)
+        if path is not None:
+            _open_page(path)
+    finally:
+        with _build_lock:
+            _state["building"] = None
+
+
+def _start_worker(target, *args) -> None:
+    """Run ``target(*args)`` on one daemon thread (the seam tests replace)."""
+    threading.Thread(target=target, args=args, daemon=True,
+                     name="site-builder").start()
+
+
+def build_website(arg: str = "") -> str:
+    name, city, notes = _parse_arg(arg)
+    if not name:
+        return "Which business should I build the website for, sir?"
+    with _build_lock:
+        if _state["building"]:
+            return f"I'm still building the {_state['building']} site, sir."
+        _state["building"] = name
+    try:
+        _start_worker(_build_worker, name, city, notes)
+    except Exception as e:
+        with _build_lock:
+            _state["building"] = None
+        print(f"  [site-builder] could not start the build: {type(e).__name__}")
+        return "I couldn't start building that website, sir."
+    return f"Building a site for {name} now, sir — I'll tell you when it's ready."
 
 
 def register(actions: dict) -> None:
     actions["build_website"] = build_website
-    # A minute or two of model time: let the dispatcher's mid-task status
-    # line bridge the silence (same registration as skills/dossier.py).
-    bc = sys.modules.get("bobert_companion")
-    long_running = getattr(bc, "LONG_RUNNING_ACTIONS", None) if bc else None
-    if isinstance(long_running, set):
-        long_running.add("build_website")
