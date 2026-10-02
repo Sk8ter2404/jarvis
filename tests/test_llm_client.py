@@ -241,9 +241,12 @@ class SessionUsageTests(unittest.TestCase):
     """session_usage: the per-model token tally running_costs prices."""
 
     def setUp(self):
-        p = mock.patch.object(llm, "session_usage", {})
-        p.start()
-        self.addCleanup(p.stop)
+        # The persisted month tally has its own tests (test_llm_usage); keep
+        # its debounce timer out of these.
+        for p in (mock.patch.object(llm, "session_usage", {}),
+                  mock.patch("core.llm_usage.note_usage")):
+            p.start()
+            self.addCleanup(p.stop)
 
     def _create(self, model, usage):
         return llm.create_message(_UsageClient(usage), model=model,

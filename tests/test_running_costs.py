@@ -238,6 +238,13 @@ class CloudCostTests(unittest.TestCase):
     def test_empty_tally_is_free(self):
         self.assertEqual(rc.cloud_cost({}), (0.0, 0, 0))
 
+    def test_month_source_is_the_persisted_tally(self):
+        import core.llm_usage as lu
+        with mock.patch.object(lu, "month_usage", return_value={"x": 1}):
+            self.assertEqual(rc._month_usage(), {"x": 1})
+        with mock.patch.object(lu, "month_usage", side_effect=OSError):
+            self.assertIsNone(rc._month_usage())
+
     def test_reads_the_llm_client_tally(self):
         import core.llm_client as llm
         with mock.patch.object(llm, "session_usage", {
@@ -262,6 +269,16 @@ class SpokenTextTests(unittest.TestCase):
              unpriced_calls=4),
         dict(gpu_w=0.0, cpu_w=20.0, rate=0.0, session_h=1.0, today_h=1.0,
              month_h=1.0, cloud_usd=0.0001, cloud_calls=1),
+        # with a persisted month tally
+        dict(gpu_w=212.4, cpu_w=48.3, rate=0.14, session_h=2.5, today_h=3.2,
+             month_h=74.6, cloud_usd=0.234, cloud_calls=17,
+             month_cloud_usd=4.1049, month_calls=312),
+        dict(gpu_w=None, cpu_w=20.0, rate=0.14, session_h=0.01, today_h=0.01,
+             month_h=0.5, cloud_usd=0.0, cloud_calls=0,
+             month_cloud_usd=1234.567, month_calls=1, month_unpriced=2),
+        dict(gpu_w=None, cpu_w=20.0, rate=0.0, session_h=0.01, today_h=0.01,
+             month_h=0.01, cloud_usd=0.0, cloud_calls=0,
+             month_cloud_usd=0.0, month_calls=0),
     )
 
     def test_two_or_three_plain_sentences_without_markdown(self):
@@ -310,6 +327,35 @@ class SpokenTextTests(unittest.TestCase):
                       text)
         self.assertIn("about $123", text)
 
+    def test_without_a_month_tally_the_verdict_covers_the_session(self):
+        text = rc.compose(**self.CASES[0])
+        self.assertIn("no month-to-date cloud tally yet", text)
+        self.assertNotIn("at list prices", text)
+        self.assertIn("Verdict: about 33 cents this session so far", text)
+
+    def test_month_tally_is_reported_and_drives_the_verdict(self):
+        text = rc.compose(**self.CASES[5])
+        self.assertIn("this session come to about 23 cents across 17 calls, "
+                      "and about $4.10 across 312 calls this month at list "
+                      "prices.", text)
+        self.assertNotIn("no month-to-date", text)
+        # 0.2607 kW x 74.6 h x $0.14 = $2.72 of power + $4.10 of cloud
+        self.assertIn("Verdict: about $6.83 this month so far, mostly the "
+                      "cloud, sir.", text)
+
+    def test_month_tally_with_no_calls_this_session(self):
+        text = rc.compose(**self.CASES[6])
+        self.assertIn("No Claude calls yet this session, and about $1,235 "
+                      "across 3 calls this month at list prices, 2 of them "
+                      "on a model I have no price for.", text)
+        self.assertTrue(text.endswith("this month so far, mostly the cloud, "
+                                      "sir."), text)
+        text = rc.compose(**self.CASES[7])
+        self.assertIn("No Claude calls yet this session, and none so far this "
+                      "month.", text)
+        self.assertTrue(text.endswith(
+            "Verdict: next to nothing so far this month, sir."), text)
+
 
 class ReportTests(unittest.TestCase):
     def test_report_wires_the_live_readings(self):
@@ -325,12 +371,42 @@ class ReportTests(unittest.TestCase):
              mock.patch.object(rc, "persisted_session_spans",
                                return_value=[]), \
              mock.patch.object(rc, "_session_usage", return_value=usage), \
+             mock.patch.object(rc, "_month_usage", return_value=None), \
              mock.patch.object(cfg, "ELECTRICITY_RATE_PER_KWH", 0.14):
             text = rc.report(now=now)
         self.assertIn("GPU is drawing about 150 watts", text)
         self.assertIn("CPU roughly 62", text)
         self.assertIn("for 2 hours today", text)
         self.assertIn("across 3 calls", text)
+        self.assertIn("no month-to-date cloud tally yet", text)
+
+    def test_report_prices_the_persisted_month_tally(self):
+        now = _local(2026, 10, 15, 12)
+        session = {"claude-haiku-4-5": {"calls": 2, "input": 1_000_000,
+                                        "output": 0, "cache_read": 0,
+                                        "cache_write": 0}}
+        month = {"claude-haiku-4-5": {"calls": 40, "input": 3_000_000,
+                                      "output": 0, "cache_read": 0,
+                                      "cache_write": 0},
+                 "claude-mystery-9": {"calls": 1, "input": 5, "output": 5,
+                                      "cache_read": 0, "cache_write": 0}}
+        with mock.patch.object(rc.subprocess, "run", _Run(stdout="0\n")), \
+             mock.patch.object(rc, "_read_cpu_percent", return_value=0.0), \
+             mock.patch.object(rc, "_session_start",
+                               return_value=now - 3600), \
+             mock.patch.object(rc, "persisted_session_spans",
+                               return_value=[]), \
+             mock.patch.object(rc, "_session_usage", return_value=session), \
+             mock.patch.object(rc, "_month_usage", return_value=month), \
+             mock.patch.object(cfg, "ELECTRICITY_RATE_PER_KWH", 0.14):
+            text = rc.report(now=now)
+        price = mc.by_id("claude-haiku-4-5").in_price
+        self.assertIn(f"this session come to about ${price:.2f} "
+                      f"across 2 calls", text)
+        self.assertIn(f"about ${3 * price:.2f} across 41 calls this month at "
+                      f"list prices, 1 of them on a model I have no price "
+                      f"for.", text)
+        self.assertIn("this month so far, mostly the cloud, sir.", text)
 
     def test_missing_nvidia_smi_still_answers(self):
         with mock.patch.object(rc.subprocess, "run",
@@ -339,7 +415,8 @@ class ReportTests(unittest.TestCase):
              mock.patch.object(rc, "_session_start", return_value=None), \
              mock.patch.object(rc, "persisted_session_spans",
                                return_value=[]), \
-             mock.patch.object(rc, "_session_usage", return_value={}):
+             mock.patch.object(rc, "_session_usage", return_value={}), \
+             mock.patch.object(rc, "_month_usage", return_value=None):
             text = rc.report()
         self.assertIn("no GPU power reading", text)
         self.assertTrue(text.endswith("sir."), text)
