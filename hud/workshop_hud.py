@@ -102,7 +102,13 @@ PROJECT_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HUD_STATE_FILE = os.path.join(PROJECT_DIR, "hud_state.json")
 CONTROL_FILE   = os.path.join(PROJECT_DIR, "workshop_hud_state.json")
 GEOM_STATE_DIR = os.path.join(PROJECT_DIR, "data")
-GEOM_STATE_FILE = os.path.join(GEOM_STATE_DIR, "workshop_hud_state.json")
+# Saved drag position. Named *_geometry so it can never be mistaken for the
+# root control file above; it used to share that file's name
+# (data/workshop_hud_state.json). That old file is still read as a fallback
+# until the first save under the new name, so the rename doesn't throw away a
+# position the user dragged to.
+GEOM_STATE_FILE = os.path.join(GEOM_STATE_DIR, "workshop_hud_geometry.json")
+LEGACY_GEOM_STATE_FILE = os.path.join(GEOM_STATE_DIR, "workshop_hud_state.json")
 
 
 def _is_parent_alive(pid: int) -> bool:
@@ -575,9 +581,12 @@ class WorkshopHudWindow(QWidget):
     # ─── persisted geometry ─────────────────────────────────────────────
     def _load_persisted_geometry(self) -> tuple[int | None, int | None]:
         try:
-            if not os.path.exists(GEOM_STATE_FILE):
+            path = GEOM_STATE_FILE
+            if not os.path.exists(path):
+                path = LEGACY_GEOM_STATE_FILE
+            if not os.path.exists(path):
                 return None, None
-            with open(GEOM_STATE_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f) or {}
             x = int(data["x"]) if "x" in data else None
             y = int(data["y"]) if "y" in data else None

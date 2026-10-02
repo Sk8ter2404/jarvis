@@ -58,6 +58,8 @@ On the light-deps CI runner these all skip via @requires_monolith.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -404,6 +406,24 @@ class CaptureUtteranceTests(SectionSevenBase):
         text, _ = self.bc._capture_utterance("play jazz", {"facts": {}})
         self.assertEqual(text, "play jazz")
 
+    def test_a_web_inject_is_logged_with_its_source(self):
+        # 2026-10-02: the dashboard's "What JARVIS did" timeline reads a
+        # turn's source off this line ("[inject] (web) ..."). Any other
+        # source logs the plain line, as before.
+        self._p(self.bc, "_INJECT_TEST_MODE", False)
+        for src, want in (("web", "[inject] (web) play jazz"),
+                          ("test", "[inject] play jazz"),
+                          ("", "[inject] play jazz"),
+                          (None, "[inject] play jazz")):
+            self.bc._last_inject_source[0] = src
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                text, _ = self.bc._capture_utterance("play jazz", {"facts": {}})
+            self.assertEqual(text, "play jazz")
+            self.assertIn(want, buf.getvalue(), src)
+            if src != "web":
+                self.assertNotIn("(web)", buf.getvalue(), src)
+
     def test_no_audio_runs_proactive_and_returns_none(self):
         self._p(self.bc, "record_speech", return_value=None)
         # _speak_pending already False; should_be_proactive True -> proactive turn.
@@ -589,6 +609,17 @@ class HandleSleepStandbyTests(SectionSevenBase):
         self.bc._last_inject_source[0] = ""
         self.bc._handle_sleep_standby("JARVIS")
         note.assert_called_once_with()
+
+    def test_a_web_inject_in_standby_is_logged_with_its_source(self):
+        # 2026-10-02: a dashboard command that wakes him from standby keeps
+        # its source on the line the timeline reads.
+        self._p(self.bc, "_ambient_learning_feed")
+        self.bc._last_inject_source[0] = "web"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.bc._handle_sleep_standby("just talking to myself over here")
+        self.assertIn("[inject] (standby) (web) just talking to myself",
+                      buf.getvalue())
 
     def test_a_test_inject_never_feeds_the_ambient_learner(self):
         self.bc._ambient_learning[0] = True

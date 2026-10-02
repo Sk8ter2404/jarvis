@@ -6,6 +6,13 @@ sets, plus every action registration across skills/ and core/, and writes
 docs/ACTION_INDEX.md. Never imports the monolith (ast.parse only — textual), so
 it is safe to run against a live tree. Run: ``python tools/gen_action_index.py``.
 
+Two coverage columns per action (2026-10-02): ``spoken note`` (speak-set
+membership, including a skill's module-level SPEAK_VERBATIM_ACTIONS /
+INFORMATIVE_ACTIONS / SELF_VOICED_ACTIONS declaration) and ``tested`` (the name
+is a string literal in a tracked tests/**/*.py file).
+tests/test_action_index_coverage.py fails CI when the committed index's action
+names drift from ``collect_rows`` and when the untested count grows.
+
 Registration discovery lives in tools/registration_scan.py — the ONE shared
 home for that rule (audit 2026-07-21: the two regexes that used to live here
 missed every lambda-valued monolith entry and every dict-plus-loop / tuple-
@@ -25,7 +32,7 @@ work-in-progress. When git cannot answer (no git on PATH, not a checkout) the
 fallback is the repo's own ``.gitignore`` patterns, applied conservatively,
 with a warning — never "index everything on disk".
 """
-import collections
+import ast
 import fnmatch
 import glob
 import os
@@ -129,9 +136,75 @@ def _skill_and_core_sources(root):
     )
 
 
-def build_index(root=ROOT, tracked=None):
-    """Return ``(markdown_text, counts, n_groups)`` for the tree at ``root``,
-    reading ONLY publishable (tracked) sources."""
+# ---- coverage columns: spoken note + test reference --------------------------
+
+# A skill's module-level speak-set declarations. When the skill loads,
+# bobert_companion._collect_skill_speak_sets folds them into the monolith's
+# sets; this reads the same declarations from SOURCE.
+SKILL_SPEAK_DECLARATIONS = ("SPEAK_VERBATIM_ACTIONS", "INFORMATIVE_ACTIONS",
+                            "SELF_VOICED_ACTIONS")
+
+
+def declared_speak_names(tree):
+    """``{attr: {names}}`` for a parsed skill's module-level speak-set
+    declarations: a tuple / list / set literal of strings, optionally wrapped
+    in one ``frozenset(...)`` / ``set(...)`` / ``tuple(...)`` / ``list(...)``."""
+    attrs = set(SKILL_SPEAK_DECLARATIONS)
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        hit = {t.id for t in targets if isinstance(t, ast.Name)} & attrs
+        if not hit:
+            continue
+        if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                and value.func.id in ("frozenset", "set", "tuple", "list")
+                and len(value.args) == 1):
+            value = value.args[0]
+        if not isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+            continue
+        names = {e.value.strip() for e in value.elts
+                 if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                 and e.value.strip()}
+        for attr in hit:
+            out.setdefault(attr, set()).update(names)
+    return out
+
+
+def spoken_note(name, verbatim, informative, self_voiced):
+    """The action's spoken-note label. Same precedence and case rule as the
+    runtime lookups and the web panel's live labels (tools/web_interface.py):
+    self-voiced names are stored lower-cased."""
+    if name in verbatim:
+        return "VERBATIM"
+    if name in informative:
+        return "INFORMATIVE"
+    if name.lower() in self_voiced:
+        return "SELF-VOICED"
+    return "neither"
+
+
+def string_literals(path):
+    """Every str constant in the Python file at ``path``, or None when it does
+    not parse. The BYTES are parsed, so a UTF-8 BOM is fine."""
+    try:
+        with open(path, "rb") as f:
+            tree = ast.parse(f.read())
+    except (OSError, SyntaxError, ValueError):
+        return None
+    return {n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+
+
+def collect_rows(root=ROOT, tracked=None):
+    """One dict per registered action, read ONLY from publishable (tracked)
+    sources: ``action``, ``handler``, ``loc``, ``origin``, ``speak`` (the
+    spoken note), ``example``, ``tests`` (tracked tests/ files naming it as a
+    string literal) and ``tested``. Sorted by action name."""
     if tracked is None:
         tracked = git_tracked_files(root)
 
@@ -156,6 +229,7 @@ def build_index(root=ROOT, tracked=None):
 
     informative = extract_set("INFORMATIVE_ACTIONS")
     verbatim = extract_set("SPEAK_RESULT_VERBATIM_ACTIONS")
+    self_voiced = set()   # the monolith's own set starts empty; skills fill it
 
     # ---- 2. skill/core-registered actions (TRACKED sources only) ----
     skill_actions = {}
@@ -167,11 +241,18 @@ def build_index(root=ROOT, tracked=None):
         # `actions["a"] = actions["b"]` (resolved to the target's factory symbol
         # via a fixed point inside the scanner, so chained aliases land right).
         try:
-            regs = registration_scan.scan_file(p, filename=base)
+            tree = ast.parse(read(p))
         except SyntaxError:
             continue   # unparseable file — nothing registerable to index
-        for name, reg in regs.items():
+        for name, reg in registration_scan.scan_registrations(
+                tree, filename=base).items():
             skill_actions[name] = (base, reg.symbol)
+        if base.startswith("skills/"):
+            declared = declared_speak_names(tree)
+            verbatim |= declared.get("SPEAK_VERBATIM_ACTIONS", set())
+            informative |= declared.get("INFORMATIVE_ACTIONS", set())
+            self_voiced |= {n.lower() for n in
+                            declared.get("SELF_VOICED_ACTIONS", ())}
 
     # ---- 3. handler def locations (TRACKED sources only) ----
     def_index = {}
@@ -194,15 +275,19 @@ def build_index(root=ROOT, tracked=None):
         return def_index.get(sym.split(".")[-1], "?")
 
     prompts = read(os.path.join(root, "core", "prompts.py"))
-    tests = {p: read(p) for p in keep(glob.glob(
-        os.path.join(root, "tests", "**", "*.py"), recursive=True))}
+    # ---- 4. test references: string literals in TRACKED tests/**/*.py ----
+    test_literals = {}
+    for p in keep(glob.glob(os.path.join(root, "tests", "**", "*.py"),
+                            recursive=True)):
+        lits = string_literals(p)
+        if lits is not None:   # a file that does not parse tests nothing
+            test_literals[_rel(p, root)] = lits
 
     def has_example(name):
         return bool(re.search(r'ACTION:\s*' + re.escape(name) + r'\b', prompts))
 
     def test_refs(name):
-        return [_rel(p, root) for p, t in tests.items()
-                if ('"' + name + '"') in t or ("'" + name + "'") in t]
+        return sorted(rel for rel, lits in test_literals.items() if name in lits)
 
     # ---- assemble rows ----
     rows = []
@@ -211,25 +296,30 @@ def build_index(root=ROOT, tracked=None):
             sym, origin = actions[name], "monolith"
         else:
             origin, sym = skill_actions[name]
-        speak = "VERBATIM" if name in verbatim else ("INFORMATIVE" if name in informative else "neither")
-        rows.append({"action": name, "handler": sym, "loc": handler_loc(sym), "origin": origin,
-                     "speak": speak, "example": has_example(name), "tests": test_refs(name)})
+        refs = test_refs(name)
+        rows.append({"action": name, "handler": sym, "loc": handler_loc(sym),
+                     "origin": origin,
+                     "speak": spoken_note(name, verbatim, informative, self_voiced),
+                     "example": has_example(name), "tests": refs,
+                     "tested": bool(refs)})
+    return rows
 
-    by_handler = collections.OrderedDict()
-    for r in sorted(rows, key=lambda r: (r["origin"] != "monolith", r["loc"], r["action"])):
-        key = (r["origin"], r["loc"], r["speak"])
-        g = by_handler.setdefault(key, {"aliases": [], "example": False, "tests": set()})
-        g["aliases"].append(r["action"])
-        g["example"] = g["example"] or r["example"]
-        g["tests"].update(r["tests"])
+
+def build_index(root=ROOT, tracked=None):
+    """Return ``(markdown_text, counts, n_handlers)`` for the tree at ``root``,
+    reading ONLY publishable (tracked) sources."""
+    rows = collect_rows(root, tracked=tracked)
+    n_handlers = len({(r["origin"], r["loc"]) for r in rows})
 
     c = {"total": len(rows), "monolith": sum(r["origin"] == "monolith" for r in rows),
          "skill": sum(r["origin"] != "monolith" for r in rows),
          "verbatim": sum(r["speak"] == "VERBATIM" for r in rows),
          "informative": sum(r["speak"] == "INFORMATIVE" for r in rows),
+         "self_voiced": sum(r["speak"] == "SELF-VOICED" for r in rows),
          "neither": sum(r["speak"] == "neither" for r in rows),
          "no_example": sum(not r["example"] for r in rows),
-         "no_tests": sum(not r["tests"] for r in rows)}
+         "tested": sum(r["tested"] for r in rows),
+         "no_tests": sum(not r["tested"] for r in rows)}
 
     def esc(s):
         return str(s).replace("|", "\\|")
@@ -237,34 +327,54 @@ def build_index(root=ROOT, tracked=None):
     out = []
     w = out.append
     w("# JARVIS Action Index\n")
-    w("> Machine-verified inventory of every dispatchable voice action — its handler, whether its")
-    w("> result is spoken (INFORMATIVE = LLM restates / VERBATIM = spoken as-is / neither = only the")
-    w("> preamble is heard), whether it has a `core/prompts.py` routing example, and whether a test")
-    w("> references it. Regenerate with `python tools/gen_action_index.py`.")
+    w("> Machine-checked inventory of every dispatchable voice action — its handler, its spoken")
+    w("> note, whether it has a `core/prompts.py` routing example, and whether a test names it.")
+    w("> Regenerate with `python tools/gen_action_index.py`. CI fails when the action NAMES here")
+    w("> differ from what the generator finds (tests/test_action_index_coverage.py), so adding,")
+    w("> renaming or deleting an action means regenerating this file in the same change.")
     w("> Only git-TRACKED sources are indexed: locally-installed private skills (gitignored) never")
-    w("> appear here. The web dashboard's Actions tab reads the LIVE registry instead.\n")
+    w("> appear here. The web dashboard's Actions tab reads the LIVE registry instead.")
+    w(">")
+    w("> **spoken note** — the action's declared speak routing, the convention the runtime uses:")
+    w("> **VERBATIM** = in `SPEAK_RESULT_VERBATIM_ACTIONS` (bobert_companion.py) or a tracked")
+    w("> skill's module-level `SPEAK_VERBATIM_ACTIONS`, so the result string is spoken as-is;")
+    w("> *INFORMATIVE* = in `INFORMATIVE_ACTIONS` (bobert_companion.py or a skill's module-level")
+    w("> declaration), so a follow-up LLM round restates the result; SELF-VOICED = in a skill's")
+    w("> module-level `SELF_VOICED_ACTIONS`, so the action does all of its own talking; neither =")
+    w("> no spoken note, so only the preamble is heard unless the handler speaks for itself. The")
+    w("> skill declarations are folded into the monolith's sets at load time by")
+    w("> `_collect_skill_speak_sets`; this file reads them from source. A set patched at run time")
+    w("> (inside `register()`, or `register_self_voiced`) is invisible here and shows as neither.")
+    w(">")
+    w("> **tested** — `yes` when the action name is a Python string literal (exact match) in a")
+    w("> git-tracked `tests/**/*.py` file. A ratchet in tests/test_action_index_coverage.py stops")
+    w("> the untested count from growing.\n")
     w("## Summary\n")
     w("| metric | count |\n|---|---|")
     w(f"| Total registered actions (incl. aliases) | {c['total']} |")
     w(f"| — monolith `ACTIONS` dict | {c['monolith']} |")
     w(f"| — skill / core registered | {c['skill']} |")
-    w(f"| VERBATIM speak set | {c['verbatim']} |")
-    w(f"| INFORMATIVE speak set | {c['informative']} |")
-    w(f"| neither set | {c['neither']} |")
-    w(f"| no `prompts.py` example | {c['no_example']} |")
-    w(f"| no test reference | {c['no_tests']} |\n")
-    w("A result in **neither** set is spoken only if the handler self-speaks; otherwise the answer")
-    w("is dropped. That is correct for side-effect actions but is the recurring \"logged but never")
-    w("voiced\" bug for read-outs — see the audit that seeded the 2026-07 read-out completeness sweep.\n")
+    w(f"| tested | {c['tested']} |")
+    w(f"| **untested** (no test names it) | {c['no_tests']} |")
+    w(f"| spoken note: VERBATIM | {c['verbatim']} |")
+    w(f"| spoken note: INFORMATIVE | {c['informative']} |")
+    w(f"| spoken note: SELF-VOICED | {c['self_voiced']} |")
+    w(f"| **no spoken note** (neither) | {c['neither']} |")
+    w(f"| no `prompts.py` example | {c['no_example']} |\n")
+    w("A result with no spoken note is correct for side-effect actions but is the recurring")
+    w("\"logged but never voiced\" bug for read-outs — see the audit that seeded the 2026-07")
+    w("read-out completeness sweep.\n")
     w("## Full index\n")
-    w("Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]` example.\n")
-    w("| action(s) | handler | speak | ex? | tests |")
+    w("One row per action, sorted by name; aliases share their handler's location.")
+    w("`ex?` = has a prompts.py `[ACTION: …]` example.\n")
+    w("| action | handler | spoken note | ex? | tested |")
     w("|---|---|---|:--:|:--:|")
-    badge = {"VERBATIM": "**VERBATIM**", "INFORMATIVE": "*INFORMATIVE*", "neither": "neither"}
-    for (origin, loc, speak), g in by_handler.items():
-        al = ", ".join(f"`{esc(a)}`" for a in sorted(g["aliases"]))
-        w(f"| {al} | `{esc(loc)}` | {badge[speak]} | {'yes' if g['example'] else '—'} | {len(g['tests'])} |")
-    return "\n".join(out) + "\n", c, len(by_handler)
+    badge = {"VERBATIM": "**VERBATIM**", "INFORMATIVE": "*INFORMATIVE*",
+             "SELF-VOICED": "SELF-VOICED", "neither": "neither"}
+    for r in rows:
+        w(f"| `{esc(r['action'])}` | `{esc(r['loc'])}` | {badge[r['speak']]} | "
+          f"{'yes' if r['example'] else '—'} | {'yes' if r['tested'] else 'no'} |")
+    return "\n".join(out) + "\n", c, n_handlers
 
 
 def main(root=ROOT):
@@ -274,8 +384,10 @@ def main(root=ROOT):
     outp = os.path.join(docs, "ACTION_INDEX.md")
     with open(outp, "w", encoding="utf-8", newline="") as f:
         f.write(text)
-    print(f"wrote {outp}: {c['total']} actions, {groups} handler groups, "
-          f"VERBATIM={c['verbatim']} INFORMATIVE={c['informative']} neither={c['neither']}")
+    print(f"wrote {outp}: {c['total']} actions, {groups} handlers, "
+          f"VERBATIM={c['verbatim']} INFORMATIVE={c['informative']} "
+          f"SELF-VOICED={c['self_voiced']} neither={c['neither']}, "
+          f"untested={c['no_tests']}")
     return outp
 
 

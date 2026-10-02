@@ -488,5 +488,392 @@ class TurnTimingTests(unittest.TestCase):
         self.assertEqual(tt.parse_line(None), {})
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Speed plan R1 (2026-10-01): the new fields and TurnTiming.note_stat
+# ════════════════════════════════════════════════════════════════════════════
+_R1_OWNER = ("tail_ms", "clip_ms", "stt_wait_ms", "stt_engine", "eot",
+             "st_p", "st_n", "pre")
+
+
+class R1SchemaTests(unittest.TestCase):
+    def test_new_fields_sit_between_filler_ms_and_lead_dropped(self):
+        f = list(tt.STAT_FIELDS)
+        i = f.index("filler_ms")
+        self.assertEqual(f[i + 1:-1], list(tt.NOTE_FIELDS))
+        self.assertEqual(f[-1], "lead_dropped")
+        self.assertEqual(tt.NOTE_FIELDS, (
+            "tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms", "stt_engine",
+            "load_ms", "total_ms", "play_open_ms", "out_lat_ms",
+            "filler_clip_ms", "eot", "st_p", "st_n", "pre", "cut",
+            "amb_deferred", "cache"))
+        self.assertEqual(len(set(tt.STAT_FIELDS)), len(tt.STAT_FIELDS))
+
+    def test_the_old_fields_keep_their_order(self):
+        old = ("prompt_eval_count", "prompt_eval_ms", "eval_count", "eval_ms",
+               "llm_calls", "turn_ctx_chars", "sys_chars", "followup_rounds",
+               "filler", "filler_ms", "lead_dropped")
+        self.assertEqual([k for k in tt.STAT_FIELDS if k in old], list(old))
+
+
+class NoteStatTests(unittest.TestCase):
+    def setUp(self):
+        self.lines = []
+        self.clock = _ManualClock()
+        self.t = tt.TurnTiming(print_fn=self.lines.append, clock=self.clock)
+
+    def _emit(self):
+        return tt.parse_line(self.t.emit())
+
+    def test_round_trip_with_every_new_field(self):
+        t = self.t
+        t.begin("voice")
+        t.mark("you")
+        values = {"tail_ms": 1410, "clip_ms": 3904, "stt_wait_ms": 0,
+                  "stt_engine": "whisper", "eot": "rms", "st_p": 0.8734,
+                  "st_n": 2, "pre": 1}
+        for k, v in values.items():
+            t.note_stat(k, v)
+        t.note_stat("play_open_ms", 41)
+        t.note_stat("out_lat_ms", 46)
+        t.note_stat("cache", "would-hit")
+        _in_thread(lambda: t.note_stat("filler_clip_ms", 2120))
+        _in_thread(lambda: t.note_stat("cut", 980))
+        _in_thread(lambda: t.note_stat("amb_deferred", 2))
+        t.llm_response(tt.ollama_stats(_FULL))
+        d = self._emit()
+        self.assertEqual(
+            {k: d[k] for k in tt.NOTE_FIELDS},
+            {"tail_ms": "1410", "cap_lag_ms": "-", "clip_ms": "3904",
+             "stt_wait_ms": "0", "stt_engine": "whisper", "load_ms": "13",
+             "total_ms": "3512", "play_open_ms": "41", "out_lat_ms": "46",
+             "filler_clip_ms": "2120", "eot": "rms",
+             "st_p": "0.873", "st_n": "2", "pre": "1", "cut": "980",
+             "amb_deferred": "2", "cache": "would-hit"})
+        self.assertEqual(d["lead_dropped"], "0")
+
+    def test_an_absent_field_prints_dash(self):
+        self.t.begin("inject")
+        d = self._emit()
+        for k in tt.NOTE_FIELDS:
+            self.assertEqual(d[k], "-", k)
+
+    def test_load_and_total_come_only_from_the_answering_response(self):
+        t = self.t
+        t.begin("inject")
+        t.llm_response(dict(tt.ollama_stats(_FULL), load_ms=99, total_ms=1),
+                       served=False)
+        t.llm_response(tt.ollama_stats(_FULL), served=True)
+        t.llm_response(dict(tt.ollama_stats(_FULL), load_ms=7, total_ms=8))
+        d = self._emit()
+        self.assertEqual((d["load_ms"], d["total_ms"]), ("13", "3512"))
+
+    def test_bare_response_leaves_load_and_total_blank(self):
+        self.t.begin("inject")
+        self.t.llm_response(tt.ollama_stats(_BARE))
+        d = self._emit()
+        self.assertEqual((d["load_ms"], d["total_ms"]), ("-", "-"))
+
+    def test_unknown_names_are_refused(self):
+        t = self.t
+        t.begin("inject")
+        t.mark("you")
+        for name in ("bogus", "load_ms", "total_ms", "lead_dropped",
+                     "filler", "first_play", "llm_calls", "cap_lag_ms", "",
+                     None):
+            t.note_stat(name, 12345)
+        line = t.emit()
+        d = tt.parse_line(line)
+        self.assertNotIn("bogus", d)
+        self.assertNotIn("12345", line)
+        self.assertEqual((d["load_ms"], d["lead_dropped"], d["llm_calls"],
+                          d["cap_lag_ms"]), ("-", "0", "0", "-"))
+
+    def test_other_threads_cannot_set_owner_fields(self):
+        t = self.t
+        t.begin("voice")
+        t.mark("you")
+        _in_thread(lambda: [t.note_stat(k, 7) for k in _R1_OWNER])
+        _in_thread(lambda: t.note_stat("play_open_ms", 7))
+        _in_thread(lambda: t.note_stat("out_lat_ms", 7))
+        _in_thread(lambda: t.note_stat("cache", "hit"))
+        d = self._emit()
+        for k in _R1_OWNER + ("play_open_ms", "out_lat_ms", "cache"):
+            self.assertEqual(d[k], "-", k)
+
+    def test_any_thread_fields_are_accepted_from_any_thread(self):
+        t = self.t
+        t.begin("voice")
+        _in_thread(lambda: t.note_stat("filler_clip_ms", 2300))
+        _in_thread(lambda: t.note_stat("cut", 450))
+        _in_thread(lambda: t.note_stat("amb_deferred", 1))
+        d = self._emit()
+        self.assertEqual((d["filler_clip_ms"], d["cut"], d["amb_deferred"]),
+                         ("2300", "450", "1"))
+
+    def test_play_open_follows_the_first_play_rule(self):
+        t = self.t
+        t.begin("voice")
+        t.note_stat("play_open_ms", 5)        # before "you": a reminder
+        t.mark("you")
+
+        def helper():
+            t.note_stat("play_open_ms", 33)
+
+        th = threading.Thread(target=helper, name="stream-tts-flush")
+        t.adopt(th)
+        th.start()
+        th.join(2)
+        t.note_stat("play_open_ms", 99)       # later playbacks: first wins
+        self.assertEqual(self._emit()["play_open_ms"], "33")
+
+    def test_first_value_wins_and_amb_deferred_adds_up(self):
+        t = self.t
+        t.begin("voice")
+        t.note_stat("stt_wait_ms", 12)
+        t.note_stat("stt_wait_ms", 900)       # an in-turn capture's wait
+        for _ in range(3):
+            _in_thread(lambda: t.note_stat("amb_deferred", 1))
+        t.note_stat("amb_deferred", "x")      # not a count: ignored
+        d = self._emit()
+        self.assertEqual((d["stt_wait_ms"], d["amb_deferred"]), ("12", "3"))
+
+    def test_a_lazy_value_is_read_when_the_line_prints(self):
+        t = self.t
+        box = [None]
+        calls = []
+
+        def later():
+            calls.append(1)
+            return box[0]
+
+        t.begin("voice")
+        t.note_stat("tail_ms", later)
+        self.assertEqual(calls, [], "read before the line printed")
+        box[0] = 1288
+        self.assertEqual(self._emit()["tail_ms"], "1288")
+        self.assertEqual(calls, [1])
+
+    def test_a_lazy_value_not_ready_or_failing_prints_dash(self):
+        t = self.t
+
+        def boom():
+            raise RuntimeError("probe died")
+
+        t.begin("voice")
+        t.note_stat("tail_ms", lambda: None)
+        t.note_stat("clip_ms", boom)
+        d = self._emit()
+        self.assertEqual((d["tail_ms"], d["clip_ms"]), ("-", "-"))
+
+    def test_values_stay_one_token(self):
+        t = self.t
+        t.begin("voice")
+        t.note_stat("stt_engine", "whisper large v3")
+        t.note_stat("eot", "")
+        t.note_stat("pre", True)
+        line = t.emit()
+        d = tt.parse_line(line)
+        self.assertEqual(d["stt_engine"], "whisper_large_v3")
+        self.assertEqual((d["eot"], d["pre"]), ("-", "1"))
+        keys = [tok.split("=")[0] for tok in
+                line.split("[turn-timing]")[1].split()]
+        self.assertEqual(keys, ["kind", "outcome", *tt.MARKS, "end",
+                                *tt.STAT_FIELDS])
+
+    def test_without_a_turn_nothing_prints(self):
+        self.t.note_stat("tail_ms", 1)
+        self.t.note_stat("filler_clip_ms", 1)
+        self.assertIsNone(self.t.emit())
+        self.assertEqual(self.lines, [])
+
+    def test_note_stat_never_raises(self):
+        def boom(*a, **k):
+            raise RuntimeError("boom")
+
+        bad = tt.TurnTiming(print_fn=boom, clock=boom)
+        bad.begin("voice")
+        bad.note_stat("tail_ms", 1)
+        bad.note_stat("amb_deferred", object())
+        self.assertIsNone(bad.emit())
+
+
+class R1ReviewFieldTests(unittest.TestCase):
+    """R1 review (2026-10-01): cap_lag_ms travels with the VAD break that is
+    the turn's t0, and out_lat_ms follows the play_open_ms rule."""
+
+    def setUp(self):
+        self.lines = []
+        self.clock = _ManualClock()
+        self.t = tt.TurnTiming(print_fn=self.lines.append, clock=self.clock)
+
+    def _emit(self):
+        return tt.parse_line(self.t.emit())
+
+    def test_the_vad_break_carries_its_capture_lag(self):
+        t = self.t
+        since = t.now()
+        self.clock.advance(2.0)
+        t.note_vad_break(272)
+        t.begin_voice(since)
+        d = self._emit()
+        self.assertEqual((d["vad_break"], d["cap_lag_ms"]), ("0", "272"))
+
+    def test_a_stale_breaks_lag_is_not_adopted(self):
+        t = self.t
+        t.note_vad_break(500)            # an older capture's break
+        self.clock.advance(1.0)
+        since = t.now()
+        t.begin_voice(since)             # this one hit MAX_RECORDING_SECS
+        d = self._emit()
+        self.assertEqual((d["vad_break"], d["cap_lag_ms"]), ("-", "-"))
+
+    def test_a_break_without_a_lag_prints_dash(self):
+        t = self.t
+        since = t.now()
+        t.note_vad_break()
+        t.begin_voice(since)
+        self.assertEqual(self._emit()["cap_lag_ms"], "-")
+        for junk in ("abc", float("nan"), float("inf"), True, object()):
+            t.note_vad_break(junk)
+            t.begin_voice(since)
+            self.assertEqual(self._emit()["cap_lag_ms"], "-", junk)
+
+    def test_cap_lag_comes_only_from_the_break(self):
+        t = self.t
+        since = t.now()
+        self.clock.advance(0.1)
+        t.note_stat("cap_lag_ms", 9)     # pre-turn: never stashed
+        t.note_vad_break()
+        t.begin_voice(since)
+        t.note_stat("cap_lag_ms", 9)     # in-turn: refused too
+        self.assertEqual(self._emit()["cap_lag_ms"], "-")
+
+    def test_reset_forgets_the_lag(self):
+        t = self.t
+        since = t.now()
+        t.note_vad_break(300)
+        t.reset()
+        t.note_vad_break()
+        t.begin_voice(since)
+        self.assertEqual(self._emit()["cap_lag_ms"], "-")
+
+    def test_out_lat_follows_the_play_open_rule(self):
+        t = self.t
+        t.begin("voice")
+        t.note_stat("out_lat_ms", 5)      # before "you": a reminder
+        t.mark("you")
+        _in_thread(lambda: t.note_stat("out_lat_ms", 6))   # a stranger
+        t.note_stat("out_lat_ms", 46)
+        t.note_stat("out_lat_ms", 99)     # later playbacks: first wins
+        self.assertEqual(self._emit()["out_lat_ms"], "46")
+
+
+class PreTurnStashTests(unittest.TestCase):
+    """A standby wake transcribes BEFORE its turn begins (and record_speech
+    runs before every voice turn): begin_voice adopts what its own capture
+    recorded, and nothing older."""
+
+    def setUp(self):
+        self.lines = []
+        self.clock = _ManualClock()
+        self.t = tt.TurnTiming(print_fn=self.lines.append, clock=self.clock)
+
+    def _emit(self):
+        return tt.parse_line(self.t.emit())
+
+    def test_begin_voice_adopts_this_captures_values(self):
+        t = self.t
+        t.note_stat("stt_wait_ms", 999)     # an EARLIER standby capture
+        self.clock.advance(1.0)
+        since = t.now()
+        self.clock.advance(0.5)
+        t.note_vad_break()
+        t.note_stat("clip_ms", 2048)
+        t.note_stat("stt_wait_ms", 31)
+        t.note_stat("tail_ms", lambda: 1344)
+        t.begin_voice(since)
+        t.mark("you")
+        d = self._emit()
+        self.assertEqual((d["vad_break"], d["clip_ms"], d["stt_wait_ms"],
+                          d["tail_ms"]), ("0", "2048", "31", "1344"))
+
+    def test_another_threads_owner_values_are_not_adopted(self):
+        t = self.t
+        since = t.now()
+        self.clock.advance(0.1)
+        # An ambient worker's transcribe while no turn is active.
+        _in_thread(lambda: t.note_stat("stt_wait_ms", 1500))
+        _in_thread(lambda: t.note_stat("amb_deferred", 1))
+        t.begin_voice(since)
+        d = self._emit()
+        self.assertEqual(d["stt_wait_ms"], "-")
+        self.assertEqual(d["amb_deferred"], "1")   # any-thread: adopted
+
+    def test_in_turn_only_values_are_never_stashed(self):
+        t = self.t
+        since = t.now()
+        self.clock.advance(0.1)
+        t.note_stat("play_open_ms", 40)
+        t.note_stat("cache", "hit")
+        _in_thread(lambda: t.note_stat("filler_clip_ms", 2100))
+        _in_thread(lambda: t.note_stat("cut", 500))
+        t.begin_voice(since)
+        t.mark("you")
+        d = self._emit()
+        for k in ("play_open_ms", "cache", "filler_clip_ms", "cut"):
+            self.assertEqual(d[k], "-", k)
+
+    def test_no_since_and_other_kinds_adopt_nothing(self):
+        t = self.t
+        t.note_stat("clip_ms", 100)
+        t.begin_voice(None)
+        self.assertEqual(self._emit()["clip_ms"], "-")
+        t.note_stat("clip_ms", 200)
+        t.begin("inject")
+        self.assertEqual(self._emit()["clip_ms"], "-")
+
+    def test_values_are_adopted_once(self):
+        t = self.t
+        since = t.now()
+        self.clock.advance(0.1)
+        t.note_stat("clip_ms", 300)
+        t.begin_voice(since)
+        self.assertEqual(self._emit()["clip_ms"], "300")
+        t.begin_voice(since)
+        self.assertEqual(self._emit()["clip_ms"], "-")
+
+    def test_the_stash_is_bounded(self):
+        t = self.t
+        for i in range(500):
+            t.note_stat("clip_ms", i)
+            self.clock.advance(0.001)
+        for _ in range(3 * tt._STASH_MAX_KEYS):
+            _in_thread(lambda: t.note_stat("stt_wait_ms", 1))
+        self.assertLessEqual(len(t._stash), tt._STASH_MAX_KEYS)
+        for entries in t._stash.values():
+            self.assertLessEqual(len(entries), tt._STASH_MAX_ENTRIES)
+
+    def test_reset_clears_the_stash_and_the_vad_break(self):
+        t = self.t
+        since = t.now()
+        t.note_vad_break()
+        t.note_stat("clip_ms", 5)
+        t.reset()
+        t.begin_voice(since)
+        d = self._emit()
+        self.assertEqual((d["vad_break"], d["clip_ms"]), ("-", "-"))
+
+    def test_discard_keeps_the_stash(self):
+        # The main loop discards at every loop top, BEFORE record_speech;
+        # a value recorded after that must survive to begin_voice.
+        t = self.t
+        since = t.now()
+        self.clock.advance(0.1)
+        t.note_stat("eot", "rms")
+        t.discard()
+        t.begin_voice(since)
+        self.assertEqual(self._emit()["eot"], "rms")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -528,6 +528,67 @@ class VersionInfoTests(unittest.TestCase):
                 out = A._act_version_info()
             self.assertIn("on June 01 at 11:30 PM", out)
 
+    # -- the release's own date comes from git (2026-10-02) -----------------
+    # No git release writes data/version.json, so on the live box it still
+    # said 2026-05-30 four months on; the answer only looked right because the
+    # VERSION mtime happened to be newer. A release is a commit that sets
+    # VERSION, tagged v<VERSION>: that is the date to report.
+    def _git_release(self, td, when):
+        import shutil
+        import subprocess
+        if shutil.which("git") is None:
+            self.skipTest("git not on PATH")
+        env = dict(os.environ, GIT_COMMITTER_DATE=f"{int(when)} +0000",
+                   GIT_AUTHOR_DATE=f"{int(when)} +0000")
+
+        def g(*args):
+            subprocess.run(["git", "-C", td, *args], check=True,
+                           capture_output=True, text=True, env=env)
+        g("init", "-q")
+        g("config", "user.email", "t@t.com")
+        g("config", "user.name", "t")
+        with open(os.path.join(td, "VERSION"), "w", encoding="utf-8") as f:
+            f.write("9.9.9\n")
+        g("add", "VERSION")
+        g("commit", "-qm", "v9.9.9")
+        g("tag", "v9.9.9")
+
+    def _frozen(self, fixed_now):
+        from datetime import datetime
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+        return mock.patch("datetime.datetime", _FrozenDT)
+
+    def test_git_release_date_beats_a_stale_pipeline_date(self):
+        from datetime import datetime
+        released = datetime(2026, 9, 28, 10, 0, 0)
+        with tempfile.TemporaryDirectory() as td:
+            self._write_version(td, {"last_upgrade_at": "2026-05-30T07:03:19"})
+            self._git_release(td, released.timestamp())
+            # A VERSION mtime older than the pipeline date must not decide it.
+            old = datetime(2026, 5, 1, 9, 0, 0).timestamp()
+            os.utime(os.path.join(td, "VERSION"), (old, old))
+            bc = _base_bc(td)
+            with _patch_bc(bc), self._frozen(datetime(2026, 10, 20, 12, 0, 0)):
+                out = A._act_version_info()
+        self.assertIn("last updated on September 28 at 10:00 AM", out)
+        self.assertNotIn("May", out)
+
+    def test_no_pipeline_file_still_reports_the_release_date(self):
+        # A box with no self-upgrade history (no data/version.json) used to
+        # get no date at all: "I'm on version X, sir."
+        from datetime import datetime
+        released = datetime(2026, 9, 28, 10, 0, 0)
+        with tempfile.TemporaryDirectory() as td:
+            self._git_release(td, released.timestamp())
+            bc = _base_bc(td)
+            with _patch_bc(bc), self._frozen(datetime(2026, 10, 20, 12, 0, 0)):
+                out = A._act_version_info()
+        self.assertIn("last updated on September 28 at 10:00 AM", out)
+
     def test_outer_exception_caught(self):
         # bc.__file__ as a non-string makes os.path.dirname raise -> outer except.
         bc = mock.Mock()

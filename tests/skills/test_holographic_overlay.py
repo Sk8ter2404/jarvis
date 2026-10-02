@@ -15,11 +15,11 @@ separate PyQt/tkinter renderer it spawns as its own subprocess:
 
 The actual Qt rendering lives in those *child-process* scripts. The manager
 ``__init__.py`` itself imports ONLY stdlib (json/logging/os/subprocess/sys/
-threading/time) — no Qt — so its testable surface is pure non-visual logic:
-geometry/layout math, alive/dormant state machines, the atomic control-file
-writers, launch/shutdown lifecycles (missing-script + Popen-failure + idempotent
-paths), the auto-show watcher decisions, every registered voice action, and the
-config-flag auto-launch branches in register().
+threading/time) plus core.atomic_io — no Qt — so its testable surface is pure
+non-visual logic: geometry/layout math, alive/dormant state machines, the
+atomic control-file writers, launch/shutdown lifecycles (missing-script +
+Popen-failure + idempotent paths), the auto-show watcher decisions, every
+registered voice action, and the config-flag auto-launch branches in register().
 
 ISOLATION CONTRACT
   • Every test loads a FRESH module via ``load_skill_isolated`` (the harness
@@ -111,6 +111,13 @@ def _fake_bobert(**flags):
     return bc
 
 
+def _no_temp_files():
+    """Refuse tempfile.mkstemp for the with-block (see _load_isolated)."""
+    return mock.patch.object(
+        tempfile, "mkstemp",
+        side_effect=OSError("[test] no control-file writes during the load"))
+
+
 def _load_isolated(bobert=None):
     """Load the package skill in isolation.
 
@@ -122,16 +129,20 @@ def _load_isolated(bobert=None):
       control-file writes); the watcher-start flags are left absent, so the
       retired watchers stay off on their False fallbacks (core/config.py's
       values) - tests that need one armed pin its flag True.
-    • ``open``/``os.replace`` are stubbed during the load so that even if a
-      surface does auto-launch, its atomic control-file write can't touch a real
-      project file (paths aren't redirected until after the module exists).
+    • ``open``/``os.replace``/``tempfile.mkstemp`` are stubbed during the load
+      so that even if a surface does auto-launch, its atomic control-file write
+      can't touch a real project file (paths aren't redirected until after the
+      module exists). The writers go through core.atomic_io, whose temp file
+      comes from mkstemp + os.fdopen, not ``open``: refusing mkstemp makes the
+      write fail (and the writer swallow it) before anything reaches disk.
     """
     if bobert is None:
         bobert = _fake_bobert(WORKSHOP_HUD_AUTO_LAUNCH=False)
     with inject_modules(bobert_companion=bobert), \
             mock.patch.object(subprocess, "Popen") as popen, \
             mock.patch("builtins.open", mock.mock_open()), \
-            mock.patch.object(os, "replace"):
+            mock.patch.object(os, "replace"), \
+            _no_temp_files():
         popen.return_value = _fake_proc(alive=True)
         mod, actions = load_skill_isolated("holographic_overlay")
     return mod, actions
@@ -152,6 +163,7 @@ class _HoloBase(unittest.TestCase):
         "_WORKSHOP_STATE_FILE", "_HUD_STATE_FILE", "_BAMBU_OVERLAY_STATE_FILE",
         "_WORKSHOP_HUD_CONTROL_FILE", "_WORKSHOP_PRINT_MONITOR_CONTROL_FILE",
         "_ARC_STATUS_CONTROL_FILE", "_STARK_STATUS_CONTROL_FILE",
+        "_BAMBU_CAMERA_HUD_CONTROL_FILE",
     )
     _SCRIPT_ATTRS = (
         "_OVERLAY_SCRIPT", "_WORKSHOP_SCRIPT", "_BAMBU_OVERLAY_SCRIPT",
@@ -277,6 +289,7 @@ class RegisterTests(_HoloBase):
                 mock.patch("os.path.exists", return_value=True), \
                 mock.patch("builtins.open", mock.mock_open()), \
                 mock.patch.object(os, "replace"), \
+                _no_temp_files(), \
                 mock.patch.object(subprocess, "Popen") as popen:
             popen.return_value = _fake_proc(alive=True)
             mod, _actions = load_skill_isolated("holographic_overlay")
@@ -318,6 +331,26 @@ class RegisterTests(_HoloBase):
         self.assertIsNotNone(mod._HOLO_HUD_V2_PROCESS)
         self.assertIsNotNone(mod._ARC_STATUS_PROCESS)
         self.assertIsNotNone(mod._STARK_STATUS_PROCESS)
+
+    def test_auto_launch_during_the_load_writes_nothing_real(self):
+        # The auto-launched surfaces write their control files while the
+        # module still points at the REAL project root. Since the writers moved
+        # to core.atomic_io (mkstemp + os.fdopen, not open()), a load that
+        # stubbed only open/os.replace left a real tmp*.tmp in the project root
+        # per surface.
+        root = self.mod._PROJECT_DIR
+
+        def temps():
+            return {n for n in os.listdir(root) if n.endswith(".tmp")}
+
+        before = temps()
+        self._load_with_flags(
+            WORKSHOP_HUD_AUTO_LAUNCH=True,
+            HOLO_HUD_V2_AUTO_LAUNCH=True,
+            HOLO_ARC_REACTOR_STATUS_AUTO_LAUNCH=True,
+            HOLO_STARK_STATUS_RING_AUTO_LAUNCH=True,
+        )
+        self.assertEqual(temps() - before, set())
 
     def test_optional_surfaces_dormant_by_default(self):
         # All three optional surfaces default OFF (flags absent → getattr False).
@@ -626,6 +659,7 @@ class ControlFileWriterTests(_HoloBase):
          "_WORKSHOP_PRINT_MONITOR_CONTROL_FILE"),
         ("_write_arc_status_control", "_ARC_STATUS_CONTROL_FILE"),
         ("_write_stark_status_control", "_STARK_STATUS_CONTROL_FILE"),
+        ("_write_bambu_camera_hud_control", "_BAMBU_CAMERA_HUD_CONTROL_FILE"),
     )
 
     def test_writer_creates_file_with_payload(self):
@@ -660,6 +694,36 @@ class ControlFileWriterTests(_HoloBase):
             with mock.patch.object(self.mod.os, "replace",
                                    side_effect=OSError("disk full")):
                 getattr(self.mod, fn_name)(mode="on")  # no exception
+
+    def test_writer_survives_a_reader_holding_the_file(self):
+        # Windows refuses the rename (WinError 5 -> PermissionError) while a
+        # HUD process has the control file open for its per-tick read. The
+        # old fixed "<name>.tmp" + bare os.replace swallowed that error, so
+        # the mode switch / retire signal was LOST and a stray .tmp was left
+        # behind. Through core.atomic_io the replace is retried once the
+        # reader lets go. os.name is forced to "nt" (the retry is Windows-only,
+        # exactly as tests/test_atomic_io.py does) so this runs on CI too.
+        from core import atomic_io
+        real_replace = os.replace
+        for fn_name, path_attr in self.WRITERS:
+            path = getattr(self.mod, path_attr)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"mode": "on"}, f)
+            calls = []
+
+            def _replace(src, dst, _calls=calls):
+                _calls.append(dst)
+                if len(_calls) == 1:
+                    raise PermissionError(13, "Access is denied", dst)
+                return real_replace(src, dst)
+
+            with mock.patch.object(atomic_io.os, "name", "nt"),                     mock.patch.object(atomic_io.time, "sleep"),                     mock.patch.object(os, "replace", side_effect=_replace):
+                getattr(self.mod, fn_name)(mode="off")
+            self.assertEqual(self._read_json(path).get("mode"), "off",
+                             msg=f"{fn_name}: the retire signal was lost")
+            self.assertEqual(
+                [n for n in os.listdir(self.tmp) if n.endswith(".tmp")], [],
+                msg=f"{fn_name}: a temp file was left behind")
 
     def test_workshop_state_force_visible_field(self):
         self.mod._write_workshop_state(mode="pulse", force_visible=False)

@@ -58,6 +58,7 @@ request he had. The rules per model are in ``request_options``.
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any, Callable, Optional, Sequence
 
 # Mirror of bobert_companion._ANTHROPIC_TIMEOUT_S. Kept here so the default
@@ -257,8 +258,11 @@ def build_request(*, purpose: str = "voice", **kwargs: Any) -> dict:
 
 def create_message(client: Any, *, purpose: str = "voice", **kwargs: Any) -> Any:
     """``client.messages.create`` with the per-model request shaping applied.
-    Returns the raw Message; read it with ``response_text``."""
-    return client.messages.create(**build_request(purpose=purpose, **kwargs))
+    Returns the raw Message; read it with ``response_text``. The reply's token
+    usage is added to ``session_usage``."""
+    msg = client.messages.create(**build_request(purpose=purpose, **kwargs))
+    _record_session_usage(kwargs.get("model"), msg)
+    return msg
 
 
 def stream_message(client: Any, *, purpose: str = "voice", **kwargs: Any) -> Any:
@@ -410,6 +414,7 @@ def stream_text(
         try:
             final = stream.get_final_message()
             _log_cache_usage(getattr(final, "usage", None))
+            _record_session_usage(model, final)
         except Exception:
             final = None   # telemetry only — never let it taint a good stream
     if final is not None:
@@ -444,3 +449,55 @@ def _log_cache_usage(usage: Any) -> None:
               f"cache_read={read} cache_write={made}")
     except Exception:
         pass
+
+
+# Per-model token totals for THIS process, i.e. this JARVIS session, so "how
+# much does it cost to run you" (core/running_costs.py) prices the session's
+# real cloud usage instead of a per-conversation guess. Every non-streaming
+# Claude call in the tree funnels through create_message() (complete(), the
+# monolith's _claude_create, the orchestrator, the skills) and the one
+# streaming path is stream_text(), which records its final message, so each
+# reply is counted once. core/llm_usage.py folds it, debounced, into the
+# persisted month-to-date file (token counts only).
+#   {base model id: {"calls", "input", "output", "cache_read", "cache_write"}}
+session_usage: dict = {}
+_session_usage_lock = threading.Lock()
+
+_USAGE_FIELDS = (("input", "input_tokens"), ("output", "output_tokens"),
+                 ("cache_read", "cache_read_input_tokens"),
+                 ("cache_write", "cache_creation_input_tokens"))
+
+
+def _record_session_usage(model: Any, msg: Any) -> None:
+    """Add one reply's token usage to ``session_usage``. Telemetry only: never
+    raises, and a reply with no integer token counts (no usage block, a test
+    double) records nothing."""
+    try:
+        usage = getattr(msg, "usage", None)
+        if usage is None:
+            return
+        counts = {}
+        for key, attr in _USAGE_FIELDS:
+            v = getattr(usage, attr, None)
+            ok = isinstance(v, int) and not isinstance(v, bool) and v > 0
+            counts[key] = v if ok else 0
+        if not any(counts.values()):
+            return
+        name = base_model_id(model) or "unknown"
+        with _session_usage_lock:
+            row = session_usage.setdefault(
+                name, {"calls": 0, "input": 0, "output": 0,
+                       "cache_read": 0, "cache_write": 0})
+            row["calls"] += 1
+            for key, v in counts.items():
+                row[key] += v
+        from core import llm_usage
+        llm_usage.note_usage()
+    except Exception:
+        pass
+
+
+def session_usage_snapshot() -> dict:
+    """A copy of ``session_usage``, safe to read while calls are landing."""
+    with _session_usage_lock:
+        return {m: dict(row) for m, row in session_usage.items()}

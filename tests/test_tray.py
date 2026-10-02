@@ -1952,6 +1952,54 @@ class VersionAndUptimeTests(TrayTestBase):
         joined = "\n".join(tray._about_lines())
         self.assertNotIn("Upgrade build", joined)
 
+    # -- Last updated = the release's git date, not the stale CHANGELOG ------
+    # The pipeline's CHANGELOG header is the only thing the old line read, and
+    # no git release writes it: About said "Last upgrade: 2026-05-30 07:03"
+    # on 2.0.159 (2026-10-02).
+    def _git_release(self, version, when):
+        import shutil
+        if shutil.which("git") is None:
+            self.skipTest("git not on PATH")
+        env = dict(os.environ, GIT_COMMITTER_DATE=f"{int(when)} +0000",
+                   GIT_AUTHOR_DATE=f"{int(when)} +0000")
+
+        def g(*args):
+            subprocess.run(["git", "-C", self.dir, *args], check=True,
+                           capture_output=True, text=True, env=env)
+        g("init", "-q")
+        g("config", "user.email", "t@t.com")
+        g("config", "user.name", "t")
+        self._write(tray.RELEASE_VERSION_FILE, version + "\n")
+        g("add", "VERSION")
+        g("commit", "-qm", f"v{version}")
+        g("tag", f"v{version}")
+
+    def test_about_last_updated_is_the_git_release(self):
+        from datetime import datetime
+        released = datetime(2026, 9, 28, 10, 0)
+        self._git_release("2.0.159", released.timestamp())
+        self._write(tray.CHANGELOG_FILE, "## v1.0.17 — 2026-05-30 07:03\n")
+        joined = "\n".join(tray._about_lines())
+        self.assertIn("Last updated:  2026-09-28 10:00", joined)
+        self.assertNotIn("Last upgrade", joined)
+        # The pipeline counter keeps its own date, on its own line.
+        self.assertIn("Upgrade build: v1.0.17, last run 2026-05-30 07:03", joined)
+
+    def test_about_last_updated_outside_a_checkout_uses_version_mtime(self):
+        from datetime import datetime
+        self._write(tray.RELEASE_VERSION_FILE, "2.0.159\n")
+        when = datetime(2026, 9, 27, 8, 15).timestamp()
+        os.utime(tray.RELEASE_VERSION_FILE, (when, when))
+        self.assertIn("Last updated:  2026-09-27 08:15",
+                      "\n".join(tray._about_lines()))
+
+    def test_about_last_updated_takes_a_newer_pipeline_run(self):
+        from datetime import datetime
+        self._git_release("2.0.159", datetime(2026, 9, 28, 10, 0).timestamp())
+        self._write(tray.CHANGELOG_FILE, "## v1.0.18 — 2026-09-29 03:10\n")
+        self.assertIn("Last updated:  2026-09-29 03:10",
+                      "\n".join(tray._about_lines()))
+
     def test_about_shows_the_running_version_and_flags_a_newer_disk(self):
         # After a `git pull` without a restart the VERSION file is ahead of the
         # process. About reports what is RUNNING and says a restart applies it.

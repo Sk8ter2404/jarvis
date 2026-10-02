@@ -1583,8 +1583,9 @@ def _append_turn(user: str, assistant: str) -> None:
 # here; that would shadow the imported names and break skills/* readers
 # that access them via the `bobert_companion.*` attribute path.)
 
-# Pre-wake silence snapshot in seconds — captured by context_aware_greeting()
-# at the moment of wake-event detection, BEFORE the greeting bumps
+# Pre-wake silence snapshot in seconds — captured by _note_wake_event() (every
+# wake source: the standby wake, the tray force_wake, the day's first owner
+# turn) at the moment of wake-event detection, BEFORE the greeting bumps
 # last_speech_time (2026-10-01: measured from the owner's last accepted turn,
 # _last_owner_turn_at, when there is one this process). Consumers (e.g.
 # skills/morning_arrival's 6-hour silence gate) read [0] to measure the gap from the user's last interaction without
@@ -3879,6 +3880,9 @@ def setup_logging():
         _us_err = getattr(_cfg_us, "_USER_SETTINGS_ERROR", None)
         if _us_err:
             print(f"  [config] WARNING: {_us_err}")
+        # Audit P3-2: a saved safety list that tried to shrink (or wasn't a list).
+        for _us_warn in getattr(_cfg_us, "_SAFETY_SETTINGS_WARNINGS", None) or ():
+            print(f"  [config] WARNING: {_us_warn}")
     except Exception:
         pass
 
@@ -4846,12 +4850,13 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
             _sleep_mode[0]   = False
             _standby_mode[0] = False
         _write_hud_state(sleep_mode=False, standby_mode=False)
-        # Mirror context_aware_greeting's bookkeeping so morning_handoff and
-        # any other consumer that watches _last_wake_date sees the tray wake
-        # as the day's first wake event.
+        # The same wake bookkeeping as context_aware_greeting (B096): the
+        # pre-wake silence snapshot -- before "At your service" below bumps
+        # last_speech_time -- and today's date, so the morning chain sees the
+        # tray wake as the day's wake event and arrival's silence gate reads
+        # the real overnight gap.
         try:
-            from datetime import datetime as _dt
-            _last_wake_date[0] = _dt.now().date().isoformat()
+            _note_wake_event()
         except Exception:
             pass
         # Same overnight-flag cleanup the wake-word path uses, so a wake from
@@ -8611,31 +8616,39 @@ def _frame_brightness_for_dark_check(bgr: "np.ndarray | None") -> float:
       • a HIGH PERCENTILE (95th) of the whole frame, so any concentrated bright
         region (a face lit by a monitor anywhere in frame) keeps color.
 
-    Returns 0.0 for None/empty. Pure + cheap; NEVER raises. Only the IR-switch
-    decision uses this; _frame_mean_brightness stays the plain whole-frame mean."""
+    Returns 0.0 for None/empty. Pure + cheap; NEVER raises. The IR switch and
+    the webcam black-frame test (_webcam_frame_brightness, which reads the
+    raising core below so an error is never a black reading) use this score;
+    _frame_mean_brightness stays the plain whole-frame mean."""
     try:
         if bgr is None or getattr(bgr, "size", 0) == 0:
             return 0.0
-        arr = np.asarray(bgr)
-        h = arr.shape[0]
-        w = arr.shape[1] if arr.ndim >= 2 else 0
-        if h <= 0 or w <= 0:
-            return float(np.mean(arr))
-        # Center crop: middle ~40% in each axis (at least 1px so tiny frames work).
-        y0 = int(h * 0.3)
-        y1 = max(y0 + 1, int(h * 0.7))
-        x0 = int(w * 0.3)
-        x1 = max(x0 + 1, int(w * 0.7))
-        center = arr[y0:y1, x0:x1]
-        center_mean = float(np.mean(center)) if center.size else 0.0
-        # 95th percentile over the whole frame catches a bright patch anywhere.
-        try:
-            hi_pct = float(np.percentile(arr, 95.0))
-        except Exception:
-            hi_pct = float(np.max(arr))
-        return max(center_mean, hi_pct)
+        return _dark_check_score(bgr)
     except Exception:
         return 0.0
+
+
+def _dark_check_score(bgr) -> float:
+    """The score behind _frame_brightness_for_dark_check, for a non-empty
+    frame. RAISES on a frame it cannot measure."""
+    arr = np.asarray(bgr)
+    h = arr.shape[0]
+    w = arr.shape[1] if arr.ndim >= 2 else 0
+    if h <= 0 or w <= 0:
+        return float(np.mean(arr))
+    # Center crop: middle ~40% in each axis (at least 1px so tiny frames work).
+    y0 = int(h * 0.3)
+    y1 = max(y0 + 1, int(h * 0.7))
+    x0 = int(w * 0.3)
+    x1 = max(x0 + 1, int(w * 0.7))
+    center = arr[y0:y1, x0:x1]
+    center_mean = float(np.mean(center)) if center.size else 0.0
+    # 95th percentile over the whole frame catches a bright patch anywhere.
+    try:
+        hi_pct = float(np.percentile(arr, 95.0))
+    except Exception:
+        hi_pct = float(np.max(arr))
+    return max(center_mean, hi_pct)
 
 
 def _ir_gray_to_bgr_canvas(ir_gray: "np.ndarray", width: int,
@@ -9086,6 +9099,91 @@ _camera_recoveries: dict[int, int]           = {}      # index → cumulative su
 # alerted. Every such reader asks THIS helper. Same 5 s as see_user
 # (core/actions.py) and camera_system._WEBCAM_LIVE_SECONDS.
 _CAMERA_FRAME_LIVE_S = 5.0
+
+
+# A BLACK FRAME IS NOT A LIVE FRAME (2026-10-01, audit P2-3). When the Kinect
+# saturates the USB controller a webcam can keep "succeeding" - cap.read()
+# returns True - while every frame is black, and the producer cached and
+# stamped those like any other: camera_status said "live", and look_around and
+# face enrolment (behind _fresh_camera_frame) used a black picture. A frame
+# whose brightness is under this is neither cached nor stamped; the camera's
+# read error says so, and _camera_black_frame_at (index -> time of the latest
+# black frame, dropped by the next real one) lets camera_status name it. A
+# pitch-dark room reads the same, and is just as unusable for vision.
+# BRIGHTNESS IS THE DARK-CHECK SCORE, NOT THE WHOLE-FRAME MEAN (2026-10-02
+# review): the larger of the centre crop's mean and the 95th percentile
+# (_frame_brightness_for_dark_check, P2-5). A monitor-lit face on a dark wall,
+# or one lamp in a corner, puts the whole-frame mean under 10 while the picture
+# is perfectly usable; any lit region keeps the frame live, so only a frame
+# that is dark nearly everywhere is black. It is measured on every 4th
+# row/column: the loop reads ~20 frames a second. The other "black" levels
+# judge other things: the Kinect IR switch is "too dark for colour" (16, same
+# score), and the self-diagnostic's _BLACK_FRAME_MEAN_MIN (1.0, whole-frame
+# mean) is "the sensor sees nothing" - a lens cap, not a dark room.
+_CAMERA_BLACK_FRAME_LEVEL = 10.0
+_CAMERA_BLACK_FRAME_ERROR = "delivering black frames (brightness {:.1f}/255)"
+_camera_black_frame_at: dict[int, float] = {}
+# The newest BLACK frame while a black run lasts (dropped with
+# _camera_black_frame_at by the next real frame). Never a live picture: only
+# skills/self_diagnostic reads it, so its "the webcam is producing only black
+# frames" check still sees what the producer reads (2026-10-02 review).
+_camera_latest_black_frame: dict[int, "np.ndarray"] = {}
+# The log names a black run when it STARTS and ENDS, with a reminder every
+# _CAMERA_BLACK_REMIND_S in between. A line a minute per camera for as long as
+# the run lasted was ~1,000 lines a night for a dark room with two webcams
+# (2026-10-02 review). A run starting within _CAMERA_BLACK_WARN_GAP_S of the
+# camera's last line waits out the gap, so a camera flickering at the black
+# level logs at most a start and an end a minute.
+_CAMERA_BLACK_WARN_GAP_S = 60.0
+_CAMERA_BLACK_REMIND_S = 1800.0
+_camera_black_warned_at: dict[int, float] = {}    # index -> its last line
+_camera_black_logged_run: dict[int, bool] = {}    # index -> this run was logged
+
+
+def _webcam_frame_brightness(frame) -> float | None:
+    """Dark-check brightness of a strided sample of ``frame`` (see
+    _CAMERA_BLACK_FRAME_LEVEL), or None when it cannot be measured - which is
+    never treated as black. NEVER raises."""
+    try:
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return None
+        sample = frame[::4, ::4]
+        if getattr(sample, "size", 0) == 0:
+            return None
+        return _dark_check_score(sample)
+    except Exception:
+        return None
+
+
+def _warn_black_camera_frames(label: str, idx: int, mean: float,
+                              now: float) -> None:
+    """One line naming the camera whose frames are black: at the start of a
+    black run, then every _CAMERA_BLACK_REMIND_S while it lasts. Never raises
+    into the tracking loop."""
+    try:
+        logged = _camera_black_logged_run.get(idx, False)
+        gap = _CAMERA_BLACK_REMIND_S if logged else _CAMERA_BLACK_WARN_GAP_S
+        if (now - _camera_black_warned_at.get(idx, 0.0)) < gap:
+            return
+        _camera_black_warned_at[idx] = now
+        _camera_black_logged_run[idx] = True
+        print(f"  [face-track] {label} (index {idx}) is "
+              f"{'still ' if logged else ''}delivering black frames "
+              f"(brightness {mean:.1f}/255) - not treated as live. A "
+              f"saturated USB controller (the Kinect) or an unlit room does this")
+    except Exception:
+        pass
+
+
+def _note_black_camera_frames_ended(label: str, idx: int) -> None:
+    """One line when a black run that was logged ends with a real frame.
+    Never raises into the tracking loop."""
+    try:
+        if _camera_black_logged_run.pop(idx, False):
+            print(f"  [face-track] {label} (index {idx}) is delivering real "
+                  f"frames again")
+    except Exception:
+        pass
 
 
 def _fresh_camera_frame(idx, max_age_s: float = _CAMERA_FRAME_LIVE_S):
@@ -12081,14 +12179,35 @@ def _face_tracking_thread_body():
                 if _camera_gate is not None:
                     _camera_gate.note_frame(_camera_gate_key(cam))
                 # Cache frame for see_user action regardless of face detection
+                # - unless it is BLACK (see _CAMERA_BLACK_FRAME_LEVEL): that is
+                # recorded as the camera's read error, never as a live frame.
+                _bright = _webcam_frame_brightness(frame)
+                _black = _bright is not None and _bright < _CAMERA_BLACK_FRAME_LEVEL
+                _black_run_ended = False
                 with _camera_state_lock:
-                    _camera_latest_frame[cam["index"]] = frame.copy()
-                    _camera_last_frame_at[cam["index"]] = now_loop
-                    # A real frame means whatever transient error we recorded
-                    # has resolved — clear it so see_user reports clean state.
-                    if cam["index"] in _camera_last_read_error:
-                        _camera_last_read_error.pop(cam["index"], None)
-                        _camera_last_read_error_at.pop(cam["index"], None)
+                    if _black:
+                        _camera_black_frame_at[cam["index"]] = now_loop
+                        _camera_latest_black_frame[cam["index"]] = frame.copy()
+                        _camera_last_read_error[cam["index"]] = (
+                            _CAMERA_BLACK_FRAME_ERROR.format(_bright))
+                        _camera_last_read_error_at[cam["index"]] = now_loop
+                    else:
+                        _black_run_ended = (_camera_black_frame_at.pop(
+                            cam["index"], None) is not None)
+                        _camera_latest_black_frame.pop(cam["index"], None)
+                        _camera_latest_frame[cam["index"]] = frame.copy()
+                        _camera_last_frame_at[cam["index"]] = now_loop
+                        # A real frame means whatever transient error we
+                        # recorded has resolved — clear it so see_user reports
+                        # clean state.
+                        if cam["index"] in _camera_last_read_error:
+                            _camera_last_read_error.pop(cam["index"], None)
+                            _camera_last_read_error_at.pop(cam["index"], None)
+                if _black:
+                    _warn_black_camera_frames(cam["label"], cam["index"],
+                                              _bright, now_loop)
+                elif _black_run_ended:
+                    _note_black_camera_frames_ended(cam["label"], cam["index"])
                 # Per-camera preview: EVERY webcam publishes its own tile (the
                 # web Camera tab shows each eye individually); the primary-only
                 # composite below is unchanged. Same enable gate + throttle
@@ -15508,6 +15627,285 @@ def _tt_loop_top(injected_text) -> None:
         _tt("begin", "inject")
 
 
+# ── [turn-timing] speed-plan R1 fields (2026-10-01) ───────────────────────
+# Telemetry only: the measured end of speech (tail_ms), the clip length, the
+# _stt_lock wait, the answer's playback-open time and the filler clip length
+# (field meanings: core/turn_timing.py). Every helper swallows every fault,
+# exactly like _tt(), so none of this can raise into, or change, a turn.
+def _tt_note_stat(name: str, value) -> None:
+    """TurnTiming.note_stat via _tt(). Skills fill a reserved field through
+    it by name (getattr(bc, "_tt_note_stat", None)). Never raises."""
+    _tt("note_stat", name, value)
+
+
+def _tt_note_elapsed(name: str, t0) -> None:
+    """note_stat(name, ms from t0 to now). t0 comes from _tt("now"); None
+    (probe off, or the clock read failed) records nothing. Never raises."""
+    try:
+        if t0 is None:
+            return
+        t1 = _tt("now")
+        if t1 is None:
+            return
+        _tt("note_stat", name, int(round((t1 - t0) * 1000.0)))
+    except Exception:
+        pass
+
+
+def _tt_note_clip_ms(name: str, audio, sr) -> None:
+    """note_stat(name, length of `audio` at `sr` in ms). Never raises."""
+    try:
+        if not sr:
+            return
+        _tt("note_stat", name, int(round(len(audio) * 1000.0 / float(sr))))
+    except Exception:
+        pass
+
+
+def _stream_latency_s(stream, which: int):
+    """A PortAudio stream's reported latency in seconds, or None. sounddevice
+    reads it ONCE when the stream opens and caches it on the object, so this
+    is a plain attribute read — never a native call (the tts-reaper stays
+    the only thread making native calls on a play stream, H-6/H-7). A duplex
+    stream reports (input, output): `which` picks one. Never raises."""
+    try:
+        v = getattr(stream, "latency", None)
+        if isinstance(v, (tuple, list)):
+            v = v[which] if len(v) == 2 else None
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        v = float(v)
+        return v if 0.0 <= v < 10.0 else None   # NaN fails both
+    except Exception:
+        return None
+
+
+def _tt_note_out_latency(stream) -> None:
+    """[turn-timing] out_lat_ms (R1 review, 2026-10-01): the answer's play
+    stream's reported output latency — sd.play() returning means the stream
+    started, not that the first sample is audible. Same thread rule as
+    play_open_ms. Never raises."""
+    try:
+        lat = _stream_latency_s(stream, 1)
+        if lat is not None:
+            _tt("note_stat", "out_lat_ms", int(round(lat * 1000.0)))
+    except Exception:
+        pass
+
+
+def _capture_lag_ms(q, stream, chunk) -> "int | None":
+    """[turn-timing] cap_lag_ms (R1 review, 2026-10-01), taken AT the VAD
+    break: how far the break — t0, a wall-clock instant — trails the clip's
+    last sample. tail_ms is audio time, so EOS -> answer is
+    tail_ms + this + first_play. Two parts:
+      * the chunks still queued behind the capture loop (`q`, the capture
+        queue; the clip ends at the break, so they are not in it) — noise
+        suppression running behind real time shows up here;
+      * the input stream's reported latency (an attribute read, see
+        _stream_latency_s), when it is known.
+    A lower bound: the elapsed part of the newest chunk is not counted.
+    Pure Python, no native call; never consumes the queue. None when the
+    backlog cannot be read. Never raises."""
+    try:
+        backlog = q.qsize() * float(chunk) / float(SAMPLE_RATE)
+    except Exception:
+        return None
+    try:
+        lat = _stream_latency_s(stream, 0) or 0.0
+        return int(round((backlog + lat) * 1000.0))
+    except Exception:
+        return None
+
+
+# tail_ms: record_speech's "21 silent chunks" count cannot measure the real
+# silence wait (a noise spike restarts it, so it is always 1,344 ms by
+# construction). A speech detector over the finished clip can — in audio
+# time; how far the break itself trails the clip is cap_lag_ms
+# (_capture_lag_ms). Its own ORT session (core/endpointing.py), never
+# faster-whisper's _stt_lock singleton.
+# Nothing loads until the boot warmer below or the first capture.
+from core import endpointing as _endpointing  # noqa: E402
+
+_tail_vad = _endpointing.SileroVad()
+# The in-flight probe daemon (one at a time) and whether its latch-off has
+# been reported. Touched only by the capture threads.
+_tail_probe_state = {"thread": None, "off_logged": False}
+
+
+def _tail_probe_start(audio) -> None:
+    """clip_ms now, and tail_ms for this capture: a copy of `audio` (the last
+    MAX_SCAN_S at most) goes to a daemon that runs the detector while Whisper
+    and the brain work — the CPU is idle then. The turn line reads the
+    result when it prints (a lazy note_stat value): ``-`` if not done by
+    then. Never blocks, never raises: one probe in flight (a busy probe
+    skips this capture) and a detector that failed once stays off for the
+    session (TURN_TAIL_PROBE; the failure is logged once)."""
+    try:
+        if not isinstance(audio, np.ndarray) or audio.ndim != 1:
+            return
+        _tt_note_clip_ms("clip_ms", audio, SAMPLE_RATE)
+        if not TURN_TAIL_PROBE:
+            return
+        vad = _tail_vad
+        why = vad.failed
+        if why:
+            if not _tail_probe_state["off_logged"]:
+                _tail_probe_state["off_logged"] = True
+                print(f"  [turn-timing] tail probe off for this session "
+                      f"({why})")
+            return
+        prev = _tail_probe_state["thread"]
+        if prev is not None and prev.is_alive():
+            return
+        keep = int(_endpointing.MAX_SCAN_S * SAMPLE_RATE)
+        clip = np.array(audio[-keep:], dtype=np.float32, copy=True)
+        box = [None]
+
+        def _probe():
+            try:
+                box[0] = vad.speech_tail_ms(clip, SAMPLE_RATE)
+            except Exception:
+                box[0] = None
+
+        th = threading.Thread(target=_probe, daemon=True, name="tail-probe")
+        th.start()
+        _tail_probe_state["thread"] = th
+        _tt("note_stat", "tail_ms", lambda: box[0])
+    except Exception:
+        pass
+
+
+# ── Boot warmers (speed plan R1, 2026-10-01) ─────────────────────────────
+# Optional model warm-ups register here instead of editing main(): R1's
+# Silero tail probe now; R4 (Kokoro openers), R6 (Parakeet) and R7 (Smart
+# Turn) later. main() starts them ONCE, in one daemon, right after the boot
+# Whisper load. Each warmer runs in try/except and prints exactly one
+# "[warm] <name> ok|failed" line; nothing here can block or break boot.
+_boot_warmers: list = []           # [(name, fn)], registration order
+_boot_warmers_started = [False]
+
+
+def _register_boot_warmer(name: str, fn) -> None:
+    """Queue `fn()` for the boot-warmer daemon. A name registered twice
+    keeps its first fn. Never raises."""
+    try:
+        if not callable(fn):
+            return
+        name = str(name)
+        if any(n == name for n, _ in _boot_warmers):
+            return
+        _boot_warmers.append((name, fn))
+    except Exception:
+        pass
+
+
+def _run_boot_warmers_body(jobs) -> None:
+    """The daemon's body: each warmer in order, one line each."""
+    for name, fn in jobs:
+        try:
+            t0 = time.perf_counter()
+            try:
+                fn()
+            except Exception as e:
+                print(f"  [warm] {name} failed ({type(e).__name__}: {e})")
+                continue
+            print(f"  [warm] {name} ok "
+                  f"({int((time.perf_counter() - t0) * 1000)} ms)")
+        except Exception:
+            pass
+
+
+def _run_boot_warmers():
+    """Start the boot-warmer daemon, once per process. Returns the thread, or
+    None (already started, nothing registered, or it could not start).
+    Never blocks, never raises."""
+    try:
+        if _boot_warmers_started[0]:
+            return None
+        _boot_warmers_started[0] = True
+        jobs = list(_boot_warmers)
+        if not jobs:
+            return None
+        th = threading.Thread(target=_run_boot_warmers_body, args=(jobs,),
+                              daemon=True, name="boot-warmers")
+        th.start()
+        return th
+    except Exception as e:
+        try:
+            print(f"  [warm] could not start ({type(e).__name__}: {e})")
+        except Exception:
+            pass
+        return None
+
+
+def _warm_tail_probe() -> None:
+    """Boot warmer: load the tail probe's detector and run it once (the first
+    ORT run is the slow one). A failure latches the probe off; the warmer's
+    "[warm] silero-tail failed" line is then its one log line."""
+    try:
+        _tail_vad.warm()
+    except Exception:
+        _tail_probe_state["off_logged"] = True
+        raise
+
+
+if TURN_TAIL_PROBE:
+    _register_boot_warmer("silero-tail", _warm_tail_probe)
+
+
+# The settings later speed-plan releases A/B on the turn lines, printed once
+# per boot as "[turn-flags] KEY=value ..." so tools/turn_latency_report.py
+# --split flag=KEY can tell which value each session ran with. A name not
+# defined (yet) is skipped. Every value is a bool / number / short word.
+_TURN_FLAG_KEYS = (
+    "TURN_TAIL_PROBE", "TURN_PLAY_OPEN_PROBE",
+    "PROCESSING_FILLER_ENABLED", "PROCESSING_FILLER_DELAY",
+    "PROCESSING_FILLER_STILL_DELAY", "ANSWER_FIRST_ENABLED",
+    "SENTENCE_TTS_ENABLED", "FAST_PATHS_ENABLED",
+    # Reserved for later batches (absent until they ship):
+    "AMBIENT_STT_YIELD", "PROCESSING_FILLER_PRERENDER",
+    "PROCESSING_FILLER_LATE_START_S", "PROCESSING_FILLER_SKIP_PLEASANTRIES",
+    "FILLER_DUCK_HOLD", "KOKORO_PERSISTENT_PHONEMIZER", "KOKORO_RENDER_CACHE",
+    "KOKORO_RENDER_CACHE_PERSIST", "OLLAMA_SERVER_LOG", "LOCAL_NUM_CTX",
+    "BACKGROUND_TAG_STRICT", "STT_ENGINE", "STT_SHADOW", "SMART_TURN_MODE",
+    "SMART_TURN_THRESHOLD", "WHISPER_TEMPERATURES", "WHISPER_BEAM_SIZE",
+    "PROCESSING_FILLER_SOFT_CUT", "LOCAL_PROMPT_PROFILE",
+    "LOCAL_TURN_CTX_IN_HISTORY", "SENTENCE_TTS_MIN_CHARS",
+    "SENTENCE_TTS_LOOKAHEAD_MERGE", "LOCAL_STREAMING_TTS",
+    "TTS_OUTPUT_LATENCY",
+)
+
+
+def _turn_flag_token(v) -> "str | None":
+    """One flag value as a short whitespace-free token; None to skip it."""
+    if v is None or isinstance(v, (bool, int, float)):
+        s = str(v)
+    elif isinstance(v, str):
+        s = v or "''"
+    elif isinstance(v, (list, tuple)) and all(
+            isinstance(x, (bool, int, float, str)) for x in v):
+        s = ",".join(str(x) for x in v) or "()"
+    else:
+        return None
+    s = "_".join(s.split())
+    return s if len(s) <= 40 else None
+
+
+def _log_turn_flags() -> None:
+    """Print the [turn-flags] line (see _TURN_FLAG_KEYS). Never raises."""
+    try:
+        g = globals()
+        parts = []
+        for k in _TURN_FLAG_KEYS:
+            if k in g:
+                tok = _turn_flag_token(g[k])
+                if tok is not None:
+                    parts.append(f"{k}={tok}")
+        print("  [turn-flags] " + " ".join(parts))
+    except Exception:
+        pass
+
+
 _last_recording_peak = 0.0   # set by record_speech, read by callers
 
 # ── SPECULATIVE TRANSCRIPTION (2026-09-06 latency work) ───────────────────
@@ -15704,7 +16102,12 @@ def _transcribe_capture(audio):
 
     `audio` must already be auto-gained — the speculative worker applies the
     same gain to its own snapshot from the same (final) peak RMS, so the two
-    paths feed faster-whisper identically-scaled samples."""
+    paths feed faster-whisper identically-scaled samples.
+
+    [turn-timing] (speed plan R1): the owner's captures only pass here, so
+    this is where clip_ms is noted and the tail_ms probe starts — on a copy,
+    on its own daemon; the (text, conf) below are untouched by it."""
+    _tail_probe_start(audio)
     t = _spec_stt.get("thread")
     if _SPECULATIVE_STT and t is not None and _spec_stt.get("chunks", -1) >= 0:
         # This join is NOT a latency bound, and the comment here used to claim
@@ -15906,6 +16309,17 @@ def _heartbeat():
     _publish_main_loop_heartbeat(now=_main_loop_heartbeat[0])
     if _watchdog_reset_signal.is_set():
         _watchdog_reset_signal.clear()
+
+
+def _dispatch_heartbeat() -> None:
+    """_heartbeat() for parse_and_run_actions, ticked around each action it
+    runs (2026-10-01, audit P1-1): a chain of actions ran back to back with no
+    tick at all, and the follow-up round that runs them is not inside the
+    thinking animation that ticks during an LLM call. ONLY on the main loop's
+    own thread - the beat means "the main loop is alive", so a dispatch on any
+    other thread must never hide a wedged one."""
+    if threading.current_thread() is threading.main_thread():
+        _heartbeat()
 
 
 def _main_loop_watchdog_check(now: float | None = None,
@@ -16992,7 +17406,10 @@ def record_speech(timeout: float | None = None, *,
                             peak_rms, len(chunks))
                     if silence_n >= silence_lim:
                         _prof("vad_break")
-                        _tt("note_vad_break")
+                        # [turn-timing]: t0, plus how far it trails the
+                        # clip's end (cap_lag_ms; pure Python, never raises).
+                        _tt("note_vad_break",
+                            _capture_lag_ms(audio_q, _record_stream, CHUNK))
                         break
                 elif timeout is not None and (time.time() - start_time) >= timeout:
                     if _debug_mode[0]:
@@ -17810,9 +18227,32 @@ def transcribe(audio: np.ndarray) -> tuple[str, dict]:
     decode actually happens. _stt_lock is an RLock, so the nested
     _ensure_whisper() re-acquires it on this thread without deadlocking. This is
     what makes concurrent transcription safe; a race here corrupts native state
-    and terminates the process (0xc0000409)."""
+    and terminates the process (0xc0000409).
+
+    [turn-timing] stt_wait_ms (speed plan R1): the time spent waiting for
+    _stt_lock — an ambient decode holding Whisper. TurnTiming keeps it only
+    for the turn's own thread, so an ambient worker's wait never lands on
+    the line. Print-only; the lock and the return are unchanged."""
+    _stt_w0 = _tt("now")
     with _stt_lock:
+        _tt_note_elapsed("stt_wait_ms", _stt_w0)
         return _transcribe_impl(audio)
+
+
+# THE NO-VAD RETRY IS BOUNDED (2026-10-01, audit P1-1). When Silero VAD finds
+# no speech, _transcribe_impl decodes the clip once more with the VAD off, so a
+# quiet "JARVIS" is not lost. That retry ran at beam 5 with faster-whisper's
+# default temperature fallback (up to 6 decodes, best-of-5 sampling past the
+# first) on a buffer of any length - and on room noise the fallback is exactly
+# what runs to the end. It sat on the main loop between record_speech and the
+# reply with no heartbeat: one leg of the ~64 s watchdog stall. Now it is ONE
+# greedy decode (beam 1, temperature 0) and only for a clip of at most this
+# many seconds; a longer clip with no speech in it is noise. There is no
+# wall-clock timer around it: the native decode cannot be interrupted, and
+# abandoning it would leave it running outside _stt_lock (the 0xc0000409
+# concurrent-decode crash). Bounding the work is what bounds the time.
+_STT_NO_VAD_RETRY_MAX_AUDIO_S = 10.0
+_STT_NO_VAD_RETRY_BEAM = 1
 
 
 def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
@@ -17831,10 +18271,14 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # transcribing; on quiet/desk mics it frequently drops LEGITIMATE
             # speech (a real "JARVIS" scores below the gate) and returns zero
             # segments -> "". Use a permissive threshold, and if it STILL finds
-            # nothing, retry ONCE WITHOUT the VAD filter so a genuine utterance
-            # is never silently lost — the difference between "heard you" and a
-            # wall of [standby] ignored: ''. The caller's audio already cleared
-            # the mic VAD gate, so it is not pure silence.
+            # nothing, retry ONCE WITHOUT the VAD filter so a quiet utterance
+            # is not lost — the difference between "heard you" and a wall of
+            # [standby] ignored: ''. The caller's audio already cleared the mic
+            # VAD gate, so it is not pure silence. The retry only runs for a
+            # clip of at most _STT_NO_VAD_RETRY_MAX_AUDIO_S (10 s) and
+            # recordings run to MAX_RECORDING_SECS (30 s), so a LONGER clip
+            # Silero hears no speech in is dropped without one: the price of
+            # keeping the main loop under the watchdog (audit P1-1).
             # STT_HOTWORDS (core/stt_vocab.py, 2026-10-01): the owner's names
             # ("Accelo" came out as "a cello"). None when unset = unchanged.
             # The no-VAD retry runs WITHOUT them: its audio is the clip VAD
@@ -17853,11 +18297,14 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             )
             segments = list(segments_gen)
             _decoded_with_hot = bool(_hot) and bool(segments)
-            if not segments:
+            # Bounded retry: see _STT_NO_VAD_RETRY_MAX_AUDIO_S.
+            if (not segments and len(audio) <= float(SAMPLE_RATE)
+                    * _STT_NO_VAD_RETRY_MAX_AUDIO_S):
                 segments_gen, info = _stt.transcribe(
                     audio, language="en",
                     vad_filter=False,
-                    beam_size=5, hotwords=None,
+                    beam_size=_STT_NO_VAD_RETRY_BEAM, temperature=0.0,
+                    hotwords=None,
                 )
                 segments = list(segments_gen)
             # Native decode completed without a CUDA fault — clear the
@@ -20929,6 +21376,48 @@ def _note_owner_turn() -> None:
     _music_capture_streak[0] = 0
 
 
+# The first accepted owner turn AT OR AFTER this local hour is the day's wake
+# event (B096, 2026-10-01). It is skills/morning_chain.CHAIN_START_HOUR: a turn
+# before the chain's window is the tail of last night, and stamping it would
+# have the chain brief an empty room at 06:00 while he sleeps.
+_OWNER_TURN_WAKE_FROM_HOUR = 6
+
+
+def _note_first_owner_turn_of_day(test_inject: bool = False) -> bool:
+    """Main loop, an accepted owner turn: the day's first one is its wake event.
+
+    B096 (2026-10-01): _last_wake_date -- the morning chain's trigger -- was
+    stamped only by the standby wake (context_aware_greeting) and the tray
+    force_wake. The owner runs with START_IN_STANDBY off and never sleeps
+    JARVIS, so his "Jarvis ..." mornings never stamped it and the chain sat
+    idle for 47 sessions straight. Now the first accepted owner turn (voice or
+    typed) of the day counts too.
+
+    Call it BEFORE the turn is marked (_last_owner_turn_at is still his
+    PREVIOUS turn, so the silence snapshot is the overnight gap, not 0 s) and
+    before JARVIS replies. A test harness inject (driver.py / say_to_jarvis)
+    is not the owner and never wakes the day. Neither is any turn of the
+    STAGING (green) instance: its turns are the upgrade gate's untagged smoke
+    prompts (staging_instance.DEFAULT_PROMPTS), and it shares this project
+    dir's morning state files -- stamping one during a 06-12 deploy would let
+    green's chain run morning_handoff's predictive setup (Chrome, Teams,
+    master volume) and mark the day briefed, standing prod's own morning
+    briefing down. True when it stamped."""
+    if test_inject or _is_staging():
+        return False
+    from datetime import datetime as _dt
+    local = _dt.now()
+    if local.hour < _OWNER_TURN_WAKE_FROM_HOUR:
+        return False
+    today = local.date().isoformat()
+    if _last_wake_date[0] == today:
+        return False
+    _note_wake_event(today=today)
+    print(f"  [wake] first owner turn of the day — today's wake "
+          f"(silence before it {_pre_wake_silence_seconds[0] / 3600.0:.1f}h)")
+    return True
+
+
 def _note_turn_boundary() -> None:
     """Main loop, top of every iteration: the previous turn (if any) is over,
     and any capture that did not become a turn was dropped."""
@@ -23162,6 +23651,9 @@ def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None
         while True:
             try:
                 if not stream.active:   # False once closed/aborted/finished
+                    # JARVIS_PERF_PROBE only (speed plan R1): with the
+                    # sdplay_* marks this splits a hold into clip + overhead.
+                    _prof("reap_inactive")
                     break
             except Exception:
                 break
@@ -23190,6 +23682,7 @@ def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None
             stream.close(ignore_errors=True)
         except Exception:
             pass
+        _prof("reap_closed")
     finally:
         # H-6: retire the in-flight-close registration made by
         # _pa_close_handoff in play_with_lipsync, BEFORE signalling the caller
@@ -23252,6 +23745,19 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
     # a heap-corrupting teardown, so raise into _speak's existing
     # device-hiccup handler (it logs the line and returns _speak_ok=False to
     # the streaming flush ledger).
+    #
+    # [turn-timing] play_open_ms (speed plan R1; R1 review 2026-10-01): from
+    # HERE — the body's first statement; only play_with_lipsync's self-echo
+    # registration (a lock and a dict insert) runs between _speak's
+    # first_play mark and it — to sd.play() returning with the stream
+    # started, the answer's first playback only
+    # (TurnTiming applies first_play's thread rule). It covers this claim
+    # (up to 1 s while a reinit runs), get_output_device()'s device refresh
+    # (a full PortAudio reinit at worst), the barge-in listener's start and
+    # the duck — not only the duck. out_lat_ms (the stream's reported output
+    # latency) is the rest of the way to the first audible sample. The
+    # duck_* marks are JARVIS_PERF_PROBE-only. Timing only.
+    _tt_open0 = _tt("now") if TURN_PLAY_OPEN_PROBE else None
     if not _pa_claim_owner(_tts_playback_active):
         raise RuntimeError("PortAudio reinit hung >1s — skipping playback")
     # A stale interrupt from a previous utterance (e.g. one that raced the
@@ -23309,10 +23815,14 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
         barge_watch_thread = threading.Thread(target=_barge_watch, daemon=True)
         barge_watch_thread.start()
 
+    # The duck's synchronous session scan, split out under JARVIS_PERF_PROBE
+    # (play_open_ms above already includes it).
+    _prof("duck_start")
     # Duck Chrome / Spotify / Apple Music / Edge so JARVIS sits cleanly
     # over whatever's already playing. Fades down in the background so
     # playback starts immediately; restored in the finally block.
     _audio_ducker.duck()
+    _prof("duck_done")
 
     CHUNK_SECS = 0.033
     chunk_n    = int(sr * CHUNK_SECS)
@@ -23377,6 +23887,7 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
             # what stalled the main loop 100-181 s until the watchdog reaped
             # the process).
             _play_audio_safe()
+            _tt_note_elapsed("play_open_ms", _tt_open0)
             try:
                 _stream = sd.get_stream()
             except Exception:
@@ -23384,6 +23895,9 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
                     "[audio] sd.get_stream() failed — skipping playback reaper")
                 _stream = None
             if _stream is not None:
+                if _tt_open0 is not None:
+                    # Attribute read only (see _stream_latency_s).
+                    _tt_note_out_latency(_stream)
                 _done_evt = threading.Event()
                 _t = threading.Thread(target=_reap_playback,
                                       args=(_stream, _done_evt, audio_secs),
@@ -23440,6 +23954,7 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
             t = threading.Thread(target=_sync, daemon=True)
             t.start()
             _play_audio_safe()
+            _tt_note_elapsed("play_open_ms", _tt_open0)
             # Same single-toucher tts-reaper as the no-robot branch — barge-in
             # works with the robot connected too. Shared _reap_playback body,
             # deliberately NOT a divergent copy (the old _safe_wait_robot twin
@@ -23452,6 +23967,8 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
                     "[audio] sd.get_stream() failed — skipping playback reaper (robot)")
                 _stream = None
             if _stream is not None:
+                if _tt_open0 is not None:
+                    _tt_note_out_latency(_stream)
                 _done_evt = threading.Event()
                 _t = threading.Thread(target=_reap_playback,
                                       args=(_stream, _done_evt, audio_secs),
@@ -24853,6 +25370,35 @@ def _open_url_offscreen_capture(url: str, page_load_wait: float = 6.0) -> tuple[
 
     time.sleep(page_load_wait)
 
+    # Chrome can replace the window found at spawn with another top-level
+    # window while the page loads (live 2026-10-01: GetWindowRect raised
+    # 1400 'Invalid window handle' and check_credits failed). Adopt a NEW
+    # window only if it is already parked off-screen - that one came from
+    # this launch's --window-position. Anything on a real monitor may be a
+    # window the owner just opened, so it is never captured or closed.
+    def _alive(hwnd) -> bool:
+        try:
+            return bool(win32gui.IsWindow(hwnd))
+        except Exception:
+            return False
+
+    def _parked(hwnd) -> bool:
+        try:
+            left, top, _r, _b = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            return False
+        return left >= _OFFSCREEN_X // 2 or top <= _OFFSCREEN_Y // 2
+
+    if not _alive(target_hwnd):
+        replacement = next(
+            (h for h in _enum_chrome_hwnds() - pre if _alive(h) and _parked(h)),
+            None)
+        if replacement is None:
+            print("  [offscreen] capture window closed while the page loaded")
+            return None, "capture_window_closed"
+        print("  [offscreen] capture window was replaced while loading — using the new one")
+        target_hwnd = replacement
+
     png_bytes: bytes | None = None
     try:
         left, top, right, bot = win32gui.GetWindowRect(target_hwnd)
@@ -25086,6 +25632,11 @@ APPLE_MUSIC_TAB_PRE_WAIT    = 1.2   # gap after load before first Tab (search in
 APPLE_MUSIC_TAB_COUNT       = 6     # Tabs to reach the first result (LIVE-TUNE)
 APPLE_MUSIC_TAB_INTERVAL    = 0.18  # delay between Tabs
 APPLE_MUSIC_TAB_POST_WAIT   = 0.6   # gap after the last Tab before Enter
+# Playlist page play trigger, by keyboard (_streaming_find_text_and_activate):
+# the visible label of the button pressed on a playlist's own page. "Shuffle",
+# not "Play": Chrome's find matches substrings, and "Play" hits the sidebar's
+# "Playlists" link first.
+APPLE_MUSIC_PLAYLIST_PLAY_TEXT = "Shuffle"
 
 _STREAMING_SERVICES = {
     "netflix": {
@@ -25715,6 +26266,13 @@ def _streaming_apply_play_strategy(
             return False, "no remembered result coords to double-click"
         ui_double_click(result_coords[0], result_coords[1])
         return True, f"double-clicked first result at {result_coords}"
+    if strategy == "find_text_play":
+        # Keyboard, no vision: press the page's labelled play button (an
+        # Apple Music playlist's "Shuffle") through the browser's find bar.
+        label = cfg.get("keyboard_play_text") or ""
+        if not _streaming_find_text_and_activate(cfg, label):
+            return False, f"couldn't press '{label}' by keyboard"
+        return True, f"pressed '{label}' by keyboard (find + Enter)"
     if strategy == "space":
         # music.apple.com toggles play/pause on SPACE. Focus the music
         # window first so the keypress lands on the right browser window
@@ -25949,6 +26507,65 @@ def _streaming_keyboard_select_first_result(
         f"({tab_count} tabs + enter)",
         flush=True,
     )
+    return True
+
+
+def _window_title_for_hwnd(hwnd) -> str:
+    """Title of the window `hwnd`, or '' (bad handle / no win32). Never raises."""
+    try:
+        import win32gui
+        return win32gui.GetWindowText(int(hwnd)) or ""
+    except Exception:
+        return ""
+
+
+def _media_window_has_focus(hwnd) -> bool:
+    """True only while `hwnd` is the foreground window. Never raises."""
+    try:
+        return bool(hwnd) and _read_focused_window()[0] == hwnd
+    except Exception:
+        return False
+
+
+def _streaming_find_text_and_activate(cfg: dict, text: str) -> bool:
+    """Press the link or button that shows `text` on the page in JARVIS's own
+    media window, by keyboard: Ctrl+F and the text (the browser's find bar
+    selects the first match), Esc (closing the find bar moves focus to the
+    link or button that holds the match), Enter (follows / presses it). No
+    screenshot, no coordinates, no Tab count to tune. Enter, never Space:
+    Space on an unfocused page toggles the player's OLD queue.
+
+    Types only into the window JARVIS opened (the recorded hwnd), and re-checks
+    that it is still the foreground window before EVERY key, so a window the
+    owner clicks into mid-sequence never gets the text or the Enter. Returns
+    True when the whole sequence went to that window. UIFailsafeError
+    propagates (2026-10-02, owner request: "use keyboard navigation or direct
+    playlist links" instead of screen clicks)."""
+    if not UI_AUTOMATION_ENABLED:
+        return False
+    text = (text or "").strip()
+    if not text or not text.isascii() or not text.isprintable():
+        return False   # pyautogui.write cannot type it faithfully
+    hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(cfg.get("service_key"))
+    if not hwnd or not _focus_window_hwnd(hwnd):
+        return False
+    time.sleep(0.15)
+    steps = (
+        (lambda: ui_hotkey("ctrl", "f"), 0.4),
+        (lambda: ui_type(text), 0.6),      # let the find bar settle on a match
+        (lambda: ui_press("esc"), 0.3),
+        (lambda: ui_press("enter"), 0.0),
+    )
+    for send, settle in steps:
+        if not _media_window_has_focus(hwnd):
+            print("  [auto-play] keyboard: the media window lost focus - "
+                  "stopped before typing into another window", flush=True)
+            return False
+        send()
+        if settle:
+            time.sleep(settle)
+    print(f"  [auto-play] keyboard: found '{text}' on the page and pressed "
+          f"Enter on it", flush=True)
     return True
 
 
@@ -26434,20 +27051,112 @@ def _looks_like_playlist_request(q: str) -> tuple[bool, str]:
     return False, s
 
 
+def _norm_playlist_text(s: str) -> str:
+    """Lowercase, invisible marks and NBSP gone, smart quotes folded and
+    apostrophes DROPPED (a spoken 'taylors mix' is the stored "Taylor’s Mix"),
+    whitespace collapsed. For comparing a playlist name with a config key or a
+    window title."""
+    s = _strip_bidi_and_nbsp(s or "").lower()
+    for a in ("’", "‘", "ʼ", "'"):
+        s = s.replace(a, "")
+    return " ".join(s.split())
+
+
+def _title_names_playlist(title: str, name: str) -> bool:
+    """True when a window title LEADS with playlist `name`: the name, then the
+    end of the title or a separator (" - ", an en or em dash, " by "). Merely
+    containing it is not enough: Chrome's find matches substrings, so asking
+    for "Mix" can open "Taylor's Mix", whose title holds "mix" too
+    (2026-10-02 review)."""
+    want = _norm_playlist_text(name)
+    if not want:
+        return False
+    t = _norm_playlist_text(_clean_browser_title(title or ""))
+    if not t.startswith(want):
+        return False
+    rest = t[len(want):]
+    return rest == "" or rest.startswith((" - ", " \u2013 ", " \u2014 ", " by "))
+
+
+def _apple_music_playlist_link(name: str) -> str | None:
+    """The owner's direct link for playlist `name` from
+    APPLE_MUSIC_PLAYLIST_LINKS ({name: url}), or None. Only an
+    https://music.apple.com/ link is used: the media-window handling (tab
+    titles, the reuse-one-window close) assumes the Apple Music web player."""
+    want = _norm_playlist_text(name)
+    try:
+        links = dict(APPLE_MUSIC_PLAYLIST_LINKS or {})
+    except Exception:
+        return None
+    for key, url in links.items():
+        if _norm_playlist_text(str(key)) != want:
+            continue
+        u = str(url or "").strip()
+        if u.startswith("https://music.apple.com/"):
+            return u
+        print(f"  [auto-play] APPLE_MUSIC_PLAYLIST_LINKS['{key}'] is not a "
+              f"https://music.apple.com/ link - ignored", flush=True)
+    return None
+
+
+def _apple_music_keyboard_open_playlist(cfg: dict, name: str) -> bool:
+    """Open playlist `name` from the page in JARVIS's media window by keyboard:
+    find its name (the sidebar lists every playlist as a link, and so does the
+    Library > Playlists grid), Esc, Enter. True only when the window's title
+    then CHANGED to one that LEADS with the playlist's name
+    (_title_names_playlist); otherwise the caller goes on to the vision
+    route."""
+    hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(cfg.get("service_key"))
+    if not hwnd:
+        return False
+    before = _window_title_for_hwnd(hwnd)
+    if not _streaming_find_text_and_activate(cfg, name):
+        return False
+    title = before
+    for _ in range(3):
+        time.sleep(1.0)
+        title = _window_title_for_hwnd(hwnd)
+        if title != before and _title_names_playlist(title, name):
+            print(f"  [auto-play] keyboard opened playlist '{name}' "
+                  f"(tab: {title[:70]!r})", flush=True)
+            return True
+    print(f"  [auto-play] keyboard open of '{name}' not confirmed (tab: "
+          f"{title[:70]!r}) - trying vision", flush=True)
+    return False
+
+
 def _apple_music_play_playlist(name: str) -> str:
-    """Navigate Apple Music's Library > Playlists directly, locate the named
-    playlist via vision, open it, click Play/Shuffle, and verify playback.
-    Unlike the search-based flow, this jumps straight to the saved-playlists
-    view so JARVIS never scrolls aimlessly through search results."""
+    """Play the owner's playlist `name` on the Apple Music web player, without
+    screen vision wherever possible (owner request 2026-06-03, done
+    2026-10-02):
+
+      1. a direct link from APPLE_MUSIC_PLAYLIST_LINKS opens the playlist's
+         own page; otherwise Library > Playlists opens and the playlist is
+         opened by KEYBOARD (find its name, Esc, Enter);
+      2. its "Shuffle" button is pressed by keyboard the same way;
+      3. playback is confirmed (tab title, vision only as the fallback).
+
+    Vision is the LAST fallback at each step: the playlist tile (with the
+    sidebar Library > Playlists clicks) and the large Play/Shuffle button."""
     # Work on a COPY (never mutate the shared _STREAMING_SERVICES template) and
     # disable verify_first: we just navigated to a FRESH Library>Playlists view,
     # so nothing is "already playing" here. Without this, a STALE Apple Music
     # window left from a prior track satisfies the tab-title pre-check and
     # _streaming_play_and_verify skips the real play step, reporting a false
     # success. Mirrors the search flow's per-call cfg copy.
+    # Play order: the keyboard press, a re-check (pressing Shuffle again would
+    # restart the playlist while the confirm catches up), then vision. No
+    # "space": on a fresh page it toggles whatever queue the player restored,
+    # and the title-confirm would pass that off as this playlist.
     cfg = {**_STREAMING_SERVICES["apple_music"], "verify_first": False,
-           "service_key": "apple_music"}
+           "service_key": "apple_music",
+           "keyboard_play_text": APPLE_MUSIC_PLAYLIST_PLAY_TEXT,
+           "play_strategies": ["find_text_play", "recheck", "play_button"]}
     service_label = "Apple Music"
+    vision_ok = bool(SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
+                     and _vision_click_backend_available())
+    if not vision_ok:
+        cfg["play_strategies"] = ["find_text_play", "recheck"]
 
     # Step 1: open Library > Playlists directly. Skips the sidebar clicks
     # when possible; sidebar fallback covers the case where Apple Music
@@ -26463,18 +27172,21 @@ def _apple_music_play_playlist(name: str) -> str:
     # 'f' into the wrong window. Mirror the search flow: close only the window
     # JARVIS opened last time, then record the freshly-opened one.
     library_url = "https://music.apple.com/library/playlists"
+    direct_url = _apple_music_playlist_link(name)
     service_key = cfg["service_key"]
     _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(service_key)
     # Only a window that did not exist before the open can be the one JARVIS
     # opened (2026-10-01, see _find_browser_window_matching).
     _before = _window_handles_snapshot()
     _open_url_in_browser(
-        library_url,
+        direct_url or library_url,
         close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
         close_hwnd=_prior_hwnd,
     )
     print(
-        f"  [auto-play] opened Apple Music Library > Playlists for '{name}'",
+        f"  [auto-play] opened "
+        f"{'the direct link' if direct_url else 'Apple Music Library > Playlists'}"
+        f" for '{name}'",
         flush=True,
     )
     time.sleep(cfg["load_wait"])
@@ -26487,8 +27199,26 @@ def _apple_music_play_playlist(name: str) -> str:
     _adopt_media_window(cfg, service_key, _before)
     _vm = cfg.get("vision_monitor")
 
-    if not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
-            and _vision_click_backend_available()):
+    # Step 2a: already on the playlist's own page (direct link) — straight to
+    # the play step; no tile to find.
+    if direct_url:
+        if not UI_AUTOMATION_ENABLED:
+            return (
+                f"opened your '{name}' playlist on Apple Music, but I couldn't "
+                f"start playback — auto-play needs UI automation (keyboard "
+                f"control)"
+            )
+        return _streaming_play_and_verify(cfg, service_label, name)
+
+    # Step 2b: open the playlist by keyboard from the Library > Playlists page.
+    try:
+        opened = _apple_music_keyboard_open_playlist(cfg, name)
+    except UIFailsafeError as e:
+        return f"couldn't open playlist '{name}' on Apple Music — {e}"
+    if opened:
+        return _streaming_play_and_verify(cfg, service_label, name)
+
+    if not vision_ok:
         return (
             f"opened Apple Music Library > Playlists, but I couldn't start the "
             f"playlist — auto-click needs SCREEN_VISION_ENABLED + "
@@ -26496,9 +27226,9 @@ def _apple_music_play_playlist(name: str) -> str:
             f"vision model)"
         )
 
-    # Step 2: locate the named playlist tile. If the direct URL didn't land
-    # us on the playlists view, fall back to clicking 'Library' then
-    # 'Playlists' in the sidebar before retrying.
+    # Step 2c (vision, the last fallback): locate the named playlist tile. If
+    # the direct URL didn't land us on the playlists view, fall back to
+    # clicking 'Library' then 'Playlists' in the sidebar before retrying.
     playlist_hint = (
         f"the playlist tile, row, or card labelled '{name}' (or a close "
         f"textual match) inside the Apple Music playlists list — pick the "
@@ -26609,7 +27339,9 @@ def get_camera_health() -> dict:
     ``last_read_error`` (str or None), ``last_read_error_at`` (epoch or
     0.0), ``wake_attempts`` (int), ``recoveries`` (int), and
     ``last_read_ms`` (how long the last cap.read() blocked - the slowest
-    camera here is what caps the HUD/web preview frame rate), and the
+    camera here is what caps the HUD/web preview frame rate),
+    ``black_frame_at`` (epoch of its latest BLACK frame while it is still
+    delivering them, else 0.0), and the
     QUARANTINE fields (2026-09-05) - ``quarantined`` / ``quarantine_reason`` /
     ``quarantine_until`` / ``quarantine_since`` / ``quarantine_count`` /
     ``quarantine_strikes`` - which say whether this ONE camera has been benched
@@ -26647,6 +27379,9 @@ def get_camera_health() -> dict:
                 # slowest camera here is the tracking loop's period and
                 # therefore the preview's ceiling (2026-09-04).
                 "last_read_ms":        _camera_read_ms.get(idx, 0.0),
+                # When it last delivered a BLACK frame (0.0 = not in a black
+                # run): read OK, yet nothing to see (2026-10-01).
+                "black_frame_at":      _camera_black_frame_at.get(idx, 0.0),
             }
             # Quarantine state for this index (all-false defaults when the
             # camera has never been benched).
@@ -29043,6 +29778,8 @@ ACTIONS = {
     "llm_costs":          _act_model_costs,
     "model_prices":       _act_model_costs,
     "compare_models":     _act_model_costs,
+    # What it costs to RUN JARVIS: electricity estimate + session cloud spend
+    "running_costs":      _act_running_costs,
     "clear_llm_cache":    _act_clear_llm_cache,
     # Memory submenu
     "show_recent_facts":  _act_show_recent_facts,
@@ -29107,6 +29844,8 @@ skill_utils = {
     "register_self_voiced": lambda n: register_self_voiced(n),
     "is_self_voiced":   lambda n: is_self_voiced(n),
     "register_utterance_route": lambda fn, name="": register_utterance_route(fn, name),
+    # Follow an owner turn's reply (see AFTER-REPLY HOOKS).
+    "register_after_reply": lambda fn: register_after_reply(fn),
 }
 
 # M2 Phase 1 (2026-06-02): typed capability seam. JarvisServices wraps the
@@ -29274,6 +30013,426 @@ def _utterance_route_reply(text: str) -> "str | None":
         print(f"  [skill-route] {label} -> {m.group(1)}")
         return token
     return None
+
+
+# AFTER-REPLY HOOKS (2026-10-01): a skill can follow up an owner turn once its
+# reply has been spoken. Registered at run time with
+# skill_utils["register_after_reply"](fn). For every OWNER turn the LLM path
+# answers -- a mic or a typed turn; never a proactive line, a test harness's
+# inject, a staging turn, a sleep / standby exchange or an ambient
+# answer-then-quiet turn -- each hook is called twice with one ctx dict:
+#   * stage "ready": the reply is final (its actions have run) and is about to
+#     be spoken, so a hook can start slow work (a model call) on a thread of
+#     its own and have it done by the time the reply ends. Its return value is
+#     ignored;
+#   * stage "spoken": the reply and its follow-ups have been spoken, or the
+#     turn was barged / failed. The hook may return ONE callable, an encore,
+#     which the main loop runs once, right after the turn.
+# ctx: stage, user_text, reply_text (the prose the owner heard: action tokens
+# and prosody tags stripped), actions (tuple of the action names that ran; at
+# "spoken" every round's), question (the owner asked a question, or the reply
+# asks him one), barged (an accepted interrupt cut the turn), failed (an
+# action failed, the reply could not be played or the turn raised), typed (a
+# typed / injected turn, not the mic).
+# Rules that must hold:
+#   * a hook never raises into the turn and never holds it up: every call runs
+#     on a short-lived daemon thread, and a stage waits for its hooks together
+#     at most _AFTER_REPLY_BUDGET_S. One hook is never called twice at once (a
+#     call still running skips its next stage), and a hook late
+#     _AFTER_REPLY_MAX_OVERRUNS calls in a row is dropped;
+#   * at most one encore per turn, never after a barged or failed turn, and
+#     not once JARVIS is asleep, in standby or staging. It runs on a daemon
+#     thread of its own and the main loop waits for it at most
+#     _AFTER_REPLY_ENCORE_MAX_S, so the next capture is never held longer. An
+#     encore that talks with a device does it through the dialogue API
+#     (dialogue_session / listen_for_stop), which owns the microphone: while
+#     its session runs on the encore's thread, the main loop's capture yields
+#     to it (_dialogue_holds_mic);
+#   * the log carries a hook's label and timings only, never any text.
+_AFTER_REPLY_HOOKS: list = []          # [{"fn", "key", "label", "late", "busy"}]
+_AFTER_REPLY_MAX_HOOKS = 8
+_AFTER_REPLY_BUDGET_S = 0.05
+_AFTER_REPLY_MAX_OVERRUNS = 3
+_AFTER_REPLY_ENCORE_MAX_S = 30.0       # well inside the 60 s stall watchdog
+# This owner turn's _AfterReplyTurn (the main loop's thread only), and the
+# encore thread started last (one encore at a time).
+_after_reply_turn: list = [None]
+_after_reply_encore_thread: list = [None]
+# Prosody / markup tags ([intent:x], [wry], [mood:x]): never spoken.
+_AFTER_REPLY_TAG_RE = re.compile(r"\[[A-Za-z_]+(?::[^\]\n]*)?\]")
+
+
+def _after_reply_key(fn) -> str:
+    """``module.qualname`` of a named function (a reloaded skill's hook has
+    the same key and replaces its old copy); "" for a lambda or a closure."""
+    try:
+        q = str(getattr(fn, "__qualname__", "") or "")
+        if not q or "<" in q:
+            return ""
+        mod = str(getattr(fn, "__module__", "") or "")
+        return (f"{mod}.{q}" if mod else q)[:80]
+    except Exception:
+        return ""
+
+
+def register_after_reply(fn) -> bool:
+    """Register ``fn(ctx) -> callable | None`` (see _AFTER_REPLY_HOOKS). True
+    once registered: registering the same function again changes nothing and
+    returns True, and a reloaded skill's hook replaces its old copy. False
+    for a non-callable, or when _AFTER_REPLY_MAX_HOOKS hooks are in already."""
+    try:
+        if not callable(fn):
+            return False
+        if any(rec["fn"] is fn for rec in _AFTER_REPLY_HOOKS):
+            return True
+        key = _after_reply_key(fn)
+        rec = {"fn": fn, "key": key, "late": 0, "busy": None,
+               "label": key or f"hook {len(_AFTER_REPLY_HOOKS) + 1}"}
+        for i, old in enumerate(_AFTER_REPLY_HOOKS):
+            if key and old.get("key") == key:
+                _AFTER_REPLY_HOOKS[i] = rec
+                print(f"  [after-reply] replaced {rec['label']}")
+                return True
+        if len(_AFTER_REPLY_HOOKS) >= _AFTER_REPLY_MAX_HOOKS:
+            print(f"  [after-reply] REFUSED a hook: "
+                  f"{_AFTER_REPLY_MAX_HOOKS} are registered already")
+            return False
+        _AFTER_REPLY_HOOKS.append(rec)
+        print(f"  [after-reply] registered {rec['label']}")
+        return True
+    except Exception:
+        return False
+
+
+class _AfterReplyTurn:
+    """One owner turn the after-reply hooks follow (see _after_reply_begin)."""
+
+    def __init__(self, user_text: str, typed: bool):
+        self.user_text = str(user_text or "")
+        self.typed = bool(typed)
+        self.thread = threading.current_thread()
+        self.stage = "armed"            # armed -> ready -> spoken
+        self.ctx: dict = {}
+        self.seq0 = 0                   # _tts_interrupt_seq when the reply began
+        self.actions: list = []         # every round's action names, in order
+        self.failed = False
+        self.readied: list = []         # the hook records called at "ready"
+        self.encore = None              # (callable, label) from "spoken"
+
+    def mine(self, text=None) -> bool:
+        """This thread's turn (and, given ``text``, this utterance's)."""
+        return (self.thread is threading.current_thread()
+                and (text is None or str(text or "") == self.user_text))
+
+
+def _after_reply_overrun(rec: dict, stage: str, what: str) -> None:
+    """Count one late call of hook ``rec``; drop the hook once
+    _AFTER_REPLY_MAX_OVERRUNS calls in a row were late. Never raises."""
+    try:
+        rec["late"] = int(rec.get("late", 0)) + 1
+        n = rec["late"]
+        label = rec.get("label", "hook")
+        print(f"  [after-reply] {label} {stage}: {what} "
+              f"({n}/{_AFTER_REPLY_MAX_OVERRUNS})")
+        if n >= _AFTER_REPLY_MAX_OVERRUNS:
+            _AFTER_REPLY_HOOKS[:] = [r for r in _AFTER_REPLY_HOOKS
+                                     if r is not rec]
+            print(f"  [after-reply] {label} dropped: {n} late calls in a row")
+    except Exception:
+        pass
+
+
+def _after_reply_stage(recs, ctx: dict, busy_wait_s: float = 0.0) -> list:
+    """Call the hooks ``recs`` for one stage, each on a daemon thread of its
+    own (each gets its own copy of ``ctx``), and wait for them together at
+    most _AFTER_REPLY_BUDGET_S -- after up to ``busy_wait_s`` for a hook's
+    previous call to end. Returns [(rec, status, value)] in ``recs`` order.
+    status: "done" (value = what it returned), "error" (it raised), "late"
+    (still running: an overrun), "busy" (its previous call is still running:
+    not called, an overrun) or "skipped" (no thread). Never raises."""
+    stage = str(ctx.get("stage", ""))
+    out: list = []
+    started: list = []
+    try:
+        busy_by = time.monotonic() + max(0.0, float(busy_wait_s))
+        for rec in list(recs):
+            prev = rec.get("busy")
+            if prev is not None and prev.is_alive():
+                rest = busy_by - time.monotonic()
+                if rest > 0:
+                    prev.join(rest)
+                if prev.is_alive():
+                    out.append([rec, "busy", None])
+                    continue
+            rec["busy"] = None
+            box: dict = {}
+
+            def _run(fn=rec["fn"], c=dict(ctx), b=box):
+                try:
+                    b["value"] = fn(c)
+                except BaseException as e:   # a hook never reaches the loop
+                    b["error"] = type(e).__name__
+
+            t = threading.Thread(target=_run, name="after-reply-hook",
+                                 daemon=True)
+            try:
+                t.start()
+            except Exception:
+                out.append([rec, "skipped", None])
+                continue
+            item = [rec, "late", None]
+            out.append(item)
+            started.append((item, t, box))
+        deadline = time.monotonic() + _AFTER_REPLY_BUDGET_S
+        for item, t, box in started:
+            t.join(max(0.0, deadline - time.monotonic()))
+            rec = item[0]
+            if t.is_alive():
+                rec["busy"] = t
+                continue
+            rec["late"] = 0
+            if "error" in box:
+                item[1] = "error"
+                print(f"  [after-reply] {rec.get('label', 'hook')} {stage} "
+                      f"failed: {box['error']}")
+            else:
+                item[1] = "done"
+                item[2] = box.get("value")
+        for rec, status, _value in out:
+            if status == "late":
+                _after_reply_overrun(
+                    rec, stage, f"overran {_AFTER_REPLY_BUDGET_S * 1000:.0f} ms")
+            elif status == "busy":
+                _after_reply_overrun(rec, stage, "still busy with its last call")
+            elif status == "skipped":
+                print(f"  [after-reply] {rec.get('label', 'hook')} {stage}: "
+                      f"no thread; not called")
+    except Exception as e:
+        print(f"  [after-reply] {stage} stage error: {type(e).__name__}")
+    return [tuple(i) for i in out]
+
+
+def _after_reply_plain(text) -> str:
+    """``text`` as it is heard: markup tags and markdown stripped, spaces
+    collapsed. Never raises."""
+    try:
+        s = _AFTER_REPLY_TAG_RE.sub(" ", str(text or ""))
+        try:
+            s = _strip_markdown_for_speech(s)
+        except Exception:
+            pass
+        return " ".join(s.split())
+    except Exception:
+        return ""
+
+
+# "What a lovely day." / "How nice." are exclamations, not questions: the
+# claim validator's question test reads any opening "what" / "how" as one.
+_AFTER_REPLY_EXCLAIM_RE = re.compile(
+    r"^(?:(?:oh|ah|wow|well|gosh|hey|so|jarvis)\W+)*"
+    r"(?:what\s+an?\b"
+    r"|how\s+(?!(?:is|isn'?t|are|aren'?t|was|wasn'?t|were|do|does|did|can|"
+    r"could|would|will|should|shall|may|might|has|have|had|much|many|long|"
+    r"far|old|often|come|about|soon|to|i|you|we|they|he|she|it|the|my|"
+    r"your)\b)[a-z']+\W*$)", re.I)
+
+
+def _after_reply_question(user_text, reply) -> bool:
+    """True when the owner asked a question (core.claim_validator's test: a
+    voice transcript often has no "?"; an exclamation such as "what a lovely
+    day" is not one) or the reply asks him one. True when unsure."""
+    try:
+        user = str(user_text or "").strip()
+        if "?" in str(reply or "") or "?" in user:
+            return True
+        if _AFTER_REPLY_EXCLAIM_RE.match(user):
+            return False
+        return bool(_claim_validator.looks_like_question(user))
+    except Exception:
+        return True
+
+
+def _after_reply_begin(text: str, typed: bool = False):
+    """Arm the after-reply hooks for this owner turn: the main loop calls this
+    right before _run_llm_dispatch. Returns the armed _AfterReplyTurn, or None
+    (nothing armed) when no hook is registered or the turn is not one they
+    follow (see _AFTER_REPLY_HOOKS). Never raises."""
+    _after_reply_turn[0] = None
+    try:
+        if not _AFTER_REPLY_HOOKS or _is_staging():
+            return None
+        if typed and _last_inject_source[0] == "test":
+            return None     # a test harness's inject is not the owner (B023)
+        if _sleep_mode[0] or _standby_mode[0] or _resume_to_ambient[0]:
+            return None     # asleep, or one answer and back to standby
+        turn = _AfterReplyTurn(text, typed)
+        _after_reply_turn[0] = turn
+        return turn
+    except Exception:
+        return None
+
+
+def _after_reply_note(results=(), spoke=None) -> None:
+    """Fold one round's action results -- and the reply's _speak outcome
+    (False: it could not be played) -- into this turn's "spoken" ctx. A no-op
+    unless this thread's armed turn is past "ready". Never raises."""
+    try:
+        turn = _after_reply_turn[0]
+        if turn is None or turn.stage != "ready" or not turn.mine():
+            return
+        for r in results or ():
+            name = str(r[0])
+            if name not in turn.actions:
+                turn.actions.append(name)
+            if len(r) > 1 and _action_result_failed(r[1]):
+                turn.failed = True
+        if spoke is False:
+            turn.failed = True
+    except Exception:
+        pass
+
+
+def _after_reply_ready(text: str, spoken_text: str, action_results,
+                       barged: bool, seq0: int) -> None:
+    """Stage "ready" (see _AFTER_REPLY_HOOKS), from _run_llm_dispatch_body
+    right before the reply is spoken. ``spoken_text`` is what is left to say;
+    the streamed lead (already voiced) is put back for reply_text. A no-op
+    unless the main loop armed THIS turn. Time-boxed; never raises."""
+    try:
+        turn = _after_reply_turn[0]
+        if turn is None or turn.stage != "armed" or not turn.mine(text):
+            return
+        turn.stage = "ready"
+        turn.seq0 = seq0
+        _after_reply_note(action_results)
+        heard = " ".join(p for p in (str(_stream_spoken_prefix[0] or ""),
+                                     "" if barged else str(spoken_text or ""))
+                         if p.strip())
+        reply = _after_reply_plain(heard)
+        turn.ctx = {
+            "stage": "ready", "user_text": turn.user_text,
+            "reply_text": reply, "actions": tuple(turn.actions),
+            "question": _after_reply_question(turn.user_text, reply),
+            "barged": bool(barged), "failed": bool(turn.failed),
+            "typed": turn.typed}
+        for rec, status, _value in _after_reply_stage(list(_AFTER_REPLY_HOOKS),
+                                                      turn.ctx):
+            if status in ("done", "error", "late"):
+                turn.readied.append(rec)
+    except Exception as e:
+        print(f"  [after-reply] ready: {type(e).__name__}")
+
+
+def _after_reply_spoken(text: str, raised: bool = False) -> None:
+    """Stage "spoken" (see _AFTER_REPLY_HOOKS), from _run_llm_dispatch once
+    the whole turn has been said. Keeps the first callable a hook returns as
+    the turn's encore (_after_reply_run_encore runs it) unless the turn was
+    barged or failed; disarms a turn that never reached "ready". Time-boxed;
+    never raises."""
+    try:
+        turn = _after_reply_turn[0]
+        if turn is None or not turn.mine(text):
+            return
+        if turn.stage != "ready":
+            _after_reply_turn[0] = None
+            return
+        turn.stage = "spoken"
+        try:
+            cut = _tts_interrupt_seq[0] != turn.seq0
+        except Exception:
+            cut = False
+        barged = bool(turn.ctx.get("barged")) or bool(cut)
+        failed = bool(turn.failed) or bool(raised)
+        ctx = dict(turn.ctx, stage="spoken", actions=tuple(turn.actions),
+                   barged=barged, failed=failed)
+        recs = [r for r in turn.readied
+                if any(r is h for h in _AFTER_REPLY_HOOKS)]
+        for rec, status, value in _after_reply_stage(
+                recs, ctx, busy_wait_s=_AFTER_REPLY_BUDGET_S):
+            if status != "done" or value is None:
+                continue
+            label = rec.get("label", "hook")
+            if not callable(value):
+                print(f"  [after-reply] {label} returned a non-callable; "
+                      f"ignored")
+            elif barged or failed:
+                print(f"  [after-reply] {label} encore dropped (the turn "
+                      f"{'was barged' if barged else 'failed'})")
+            elif turn.encore is not None:
+                print(f"  [after-reply] {label} encore dropped (one per turn)")
+            else:
+                turn.encore = (value, label)
+        if turn.encore is None:
+            _after_reply_turn[0] = None
+    except Exception as e:
+        print(f"  [after-reply] spoken: {type(e).__name__}")
+        _after_reply_turn[0] = None
+
+
+def _after_reply_encore_refused() -> str:
+    """Why an encore may not start now; "" when it may."""
+    try:
+        if _is_staging():
+            return "staging"
+        if _sleep_mode[0] or _standby_mode[0]:
+            return "asleep"
+        prev = _after_reply_encore_thread[0]
+        if prev is not None and prev.is_alive():
+            return "the last one is still running"
+        return ""
+    except Exception:
+        return "error"
+
+
+def _after_reply_run_encore() -> None:
+    """Run this turn's encore once (see _AFTER_REPLY_HOOKS); the main loop
+    calls this right after the turn. The encore runs on a daemon thread and
+    the loop waits for it at most _AFTER_REPLY_ENCORE_MAX_S, then goes on
+    (a device dialogue still running keeps the microphone). Never raises."""
+    try:
+        turn = _after_reply_turn[0]
+        _after_reply_turn[0] = None
+        if turn is None or turn.encore is None or not turn.mine():
+            return
+        fn, label = turn.encore
+        turn.encore = None
+        why = _after_reply_encore_refused()
+        if why:
+            print(f"  [after-reply] {label} encore skipped ({why})")
+            return
+        done = threading.Event()
+
+        def _run():
+            try:
+                fn()
+            except BaseException as e:   # an encore never reaches the loop
+                print(f"  [after-reply] {label} encore failed: "
+                      f"{type(e).__name__}")
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_run, name="after-reply-encore",
+                             daemon=True)
+        _heartbeat()        # the wait below stays inside the stall watchdog
+        t0 = time.monotonic()
+        try:
+            t.start()
+        except Exception as e:
+            print(f"  [after-reply] {label} encore: no thread "
+                  f"({type(e).__name__})")
+            return
+        _after_reply_encore_thread[0] = t
+        bound = max(0.0, float(_AFTER_REPLY_ENCORE_MAX_S))
+        if done.wait(bound):
+            print(f"  [after-reply] {label} encore done "
+                  f"({time.monotonic() - t0:.1f}s)")
+        else:
+            print(f"  [after-reply] {label} encore still running after "
+                  f"{bound:.0f}s; listening again (a device dialogue keeps "
+                  f"the microphone)")
+        _heartbeat()
+    except Exception as e:
+        print(f"  [after-reply] encore: {type(e).__name__}")
 
 
 def _all_self_voiced(action_results) -> bool:
@@ -30181,6 +31340,42 @@ def _pick_wake_variety(from_standby: bool, wake_text: str = "") -> tuple[str, fl
     return (chosen_text, volume)
 
 
+def _note_wake_event(now: float | None = None, today: str | None = None) -> None:
+    """Record a wake event: the pre-wake silence snapshot and today's date in
+    _last_wake_date, the morning chain's trigger (skills/morning_chain.py).
+
+    The ONE bookkeeping path for every wake source -- the standby wake
+    (context_aware_greeting), the tray force_wake, and the day's first
+    accepted owner turn (_note_first_owner_turn_of_day) -- so no source stamps
+    the date without the snapshot (B096, 2026-10-01). Without the snapshot
+    morning_arrival's 6-hour gate fell back to the live last_speech_time,
+    failed, and the chain re-picked arrival every 5 s until 08:00.
+
+    Call it BEFORE JARVIS replies: skills/morning_arrival reads
+    _pre_wake_silence_seconds[0] for its 6-hour overnight gate, and reading
+    last_speech_time directly would always be ~0 by the time the morning
+    chain dispatch loop fires (the wake greeting is already speaking).
+    2026-10-01 (review; B059's stale duplicate): measure from the OWNER's
+    last accepted turn (_last_owner_turn_at, time.monotonic()), not
+    last_speech_time -- _speak() stamps that on every JARVIS line, so JARVIS's
+    own overnight lines (a reminder, a pattern offer) reset the "silence" and
+    suppressed the morning arrival greeting. No owner turn yet this process
+    (an overnight restart): the old last_speech_time measure stands.
+
+    `now` is time.time() (default: now); `today` the local ISO date (default:
+    today) -- context_aware_greeting passes the values it already read."""
+    wall = time.time() if now is None else float(now)
+    _owner_at = float(_last_owner_turn_at[0] or 0.0)
+    if _owner_at > 0.0:
+        _pre_wake_silence_seconds[0] = max(0.0, time.monotonic() - _owner_at)
+    else:
+        _pre_wake_silence_seconds[0] = max(0.0, wall - last_speech_time)
+    if today is None:
+        from datetime import datetime as _dt
+        today = _dt.now().date().isoformat()
+    _last_wake_date[0] = today
+
+
 def context_aware_greeting(from_standby: bool, wake_text: str = "") -> tuple[str, float]:
     """Pick a wake-word greeting that varies with time-of-day, recent wake
     frequency, gaze, printer state, and the tone of the wake utterance.
@@ -30197,23 +31392,6 @@ def context_aware_greeting(from_standby: bool, wake_text: str = "") -> tuple[str
     """
     from datetime import datetime as _dt
     now = time.time()
-    # Snapshot pre-wake silence BEFORE this wake's greeting bumps
-    # last_speech_time downstream. skills/morning_arrival reads
-    # _pre_wake_silence_seconds[0] for its 6-hour overnight gate; reading
-    # last_speech_time directly would always be ~0 by the time the morning
-    # chain dispatch loop fires (the wake greeting is already speaking).
-    # 2026-10-01 (review; B059's stale duplicate): measure from the OWNER's
-    # last accepted turn (_last_owner_turn_at, time.monotonic(); this standby
-    # wake is not an accepted turn), not last_speech_time -- _speak() stamps
-    # that on every JARVIS line, so JARVIS's own overnight lines (a reminder,
-    # a pattern offer) reset the "silence" and suppressed the morning arrival
-    # greeting. No owner turn yet this process (an overnight restart): the
-    # old last_speech_time measure stands.
-    _owner_at = float(_last_owner_turn_at[0] or 0.0)
-    if _owner_at > 0.0:
-        _pre_wake_silence_seconds[0] = max(0.0, time.monotonic() - _owner_at)
-    else:
-        _pre_wake_silence_seconds[0] = max(0.0, now - last_speech_time)
 
     # Slide the wake-history window — keep only the last 10 minutes.
     _wake_history[:] = [t for t in _wake_history if (now - t) <= 600]
@@ -30222,8 +31400,11 @@ def context_aware_greeting(from_standby: bool, wake_text: str = "") -> tuple[str
     local = _dt.now()
     hour  = local.hour
     today = local.date().isoformat()
+    # Read BEFORE _note_wake_event stamps today's date (B096).
     first_of_day = (_last_wake_date[0] != today)
-    _last_wake_date[0] = today
+    # The pre-wake silence snapshot + today's wake date, before this wake's
+    # greeting bumps last_speech_time downstream (_note_wake_event).
+    _note_wake_event(now, today)
 
     # A remark about the hour, from the clock alone, like the late-night
     # remark: none while NIGHT_QUIET_ENABLED is off (core/night_quiet.py).
@@ -30460,6 +31641,8 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     #   * check_for_updates (+aliases) → core.update_checker.update_message(), always
     #     a sentence; update-awareness was mute on success.
     #   * model_costs (+aliases) → core.model_catalog.format_catalog() readout.
+    #   * running_costs → core.running_costs.report(), three finished sentences
+    #     (electricity estimate, session cloud spend, verdict).
     #   * morning_briefing → the built briefing text (the AUTO path _enqueue_speech()s
     #     the same text; the MANUAL action returned it unspoken AND marked the day
     #     fired, suppressing the auto-briefing — so it was doubly dropped).
@@ -30470,6 +31653,7 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "wake_word_mode_status",
     "check_for_updates", "check_updates", "is_there_an_update",
     "model_costs", "llm_costs", "model_prices", "compare_models",
+    "running_costs",
     "morning_briefing",
     "smart_home_control", "control_device", "control_smart_home",
     "smart_home_router_status",
@@ -32609,6 +33793,9 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             except Exception as _e:
                 print(f"  [mission_narration] cue failed: {_e}")
 
+        # Watchdog beat per action (audit P1-1); ticked again in the finally
+        # so a long last action does not leave the reply on a stale beat.
+        _dispatch_heartbeat()
         _write_hud_state(active_action=name,
                          now_doing=f"EXECUTING: {name}")
         # Mid-task status bridge: for long-running actions, start a timer
@@ -32726,6 +33913,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                 recent_action_at=time.time(),
                 now_doing=_now_doing_label(_current_state_label[0]),
             )
+            _dispatch_heartbeat()
         return ""
 
     # Result hold (2026-10-01): where in `reply` the first tag sits whose
@@ -34459,6 +35647,9 @@ def _filler_play(turn, stage: int) -> str:
         print(f"  [filler] stage {stage}: {text}")
         _prof("filler_play", f"stage={stage}")
         _tt("note_filler")
+        # [turn-timing] filler_clip_ms (speed plan R1): the first clip's
+        # length, so its _SPEAK_LOCK hold splits into clip + overhead.
+        _tt_note_clip_ms("filler_clip_ms", audio, sr)
         # Self-echo content layer: the clip is JARVIS's voice too.
         _se_line = _self_echo.remember(text) if _self_echo_audible() else 0
         try:
@@ -36423,11 +37614,25 @@ def _drain_injected_command():
 
 # Who wrote the inject _drain_injected_command just returned (2026-10-01):
 # "test" for the Claude Code driver (.claude/skills/run-jarvis/driver.py) and
-# tools/say_to_jarvis.py, "" for the owner's web page / tray, None when the
-# turn was not an inject. Every inject used to count as the owner typing, so
-# live-verification lines were learned as facts about him (the learn gate
-# admits a typed turn unconditionally and opens its follow-up window).
+# tools/say_to_jarvis.py, "web" for the owner's web page (2026-10-02), "" for
+# an inject that names no source, None when the turn was not an inject. Every
+# inject used to count as the owner typing, so live-verification lines were
+# learned as facts about him (the learn gate admits a typed turn
+# unconditionally and opens its follow-up window).
 _last_inject_source: list = [None]
+
+
+def _inject_log_tag() -> str:
+    """"(web) " when the inject just drained came from the web dashboard,
+    else "". Goes in the "[inject]" log line, where the dashboard's "What
+    JARVIS did" timeline reads a turn's source (tools/web_interface.py
+    build_timeline). Every reader of that line matches on a substring of the
+    command, so the tag changes nothing for them. Never raises."""
+    try:
+        return "(web) " if _last_inject_source[0] == "web" else ""
+    except Exception:
+        return ""
+
 
 # How long ONE _speak_pending() drain may hold the main loop before it hands
 # the tail back to the queue and returns to 'Listening…'.
@@ -37571,7 +38776,7 @@ def _capture_utterance(injected_text, memory):
             print(f"  [inject] (test-mode) text={text!r} "
                   f"conf={conf} peak_rms={_last_recording_peak:.4f}")
         else:
-            print(f"  [inject] {text}")
+            print(f"  [inject] {_inject_log_tag()}{text}")
         set_state("listening")
         return text, conf
 
@@ -38149,7 +39354,7 @@ def _handle_sleep_standby(injected_text: str | None):
         # existing wake-phrase check below so injects can wake the assistant
         # in exactly the same way a spoken 'JARVIS' would.
         _heartbeat()
-        print(f"  [inject] (standby) {injected_text}")
+        print(f"  [inject] (standby) {_inject_log_tag()}{injected_text}")
         text = injected_text
     else:
         _heartbeat()
@@ -38452,6 +39657,10 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
         # [turn-timing]: the turn's one line, partial when the body raised.
         # A no-op when no turn is active or on another thread's dispatch.
         _tt("emit", _tt_outcome)
+        # After-reply hooks, stage "spoken" (see _AFTER_REPLY_HOOKS): the turn
+        # has been said (after the filler wait above), barged or raised. A
+        # no-op unless the main loop armed this owner turn.
+        _after_reply_spoken(text, raised=_tt_outcome != "ok")
 
 
 def _run_llm_dispatch_body(text: str) -> str:
@@ -38606,8 +39815,12 @@ def _run_llm_dispatch_body(text: str) -> str:
     # Honest close-out bookkeeping (NEW #6) - see _chain_close_out_line.
     _spoke_substance = False
     spoken_text = _drop_stale_offer_asides(spoken_text)
+    # After-reply hooks, stage "ready" (see _AFTER_REPLY_HOOKS): the reply is
+    # final and about to be spoken. A no-op unless the main loop armed this
+    # owner turn; time-boxed, so it never holds up the speech below.
+    _after_reply_ready(text, spoken_text, action_results, _barged, _barge_seq0)
     if spoken_text and not _barged:
-        _speak(spoken_text)
+        _after_reply_note(spoke=_speak(spoken_text))
         _spoke_substance = _says_something(spoken_text)
 
     # Speak verbatim-result actions (version_info, system_pulse, …) directly.
@@ -38739,6 +39952,7 @@ def _run_llm_dispatch_body(text: str) -> str:
             break
         print(f"  JARVIS: {followup}")
         f_spoken, current_results = parse_and_run_actions(followup)
+        _after_reply_note(current_results)
         if not current_results:
             f_spoken = _strip_ack_preface(f_spoken, text)
         elif (depth + 1 < _max_followup and not (
@@ -39094,6 +40308,12 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         print(f"  [local-llm] warm-up launch failed (non-fatal): {_e}")
 
     _ensure_whisper()   # load now so first user utterance isn't delayed
+    # Speed plan R1 (2026-10-01): the optional model warm-ups registered via
+    # _register_boot_warmer start here, in ONE daemon that never blocks boot
+    # (one "[warm] <name> ok|failed" line each), and the latency flags this
+    # session runs with are logged once for tools/turn_latency_report.py.
+    _run_boot_warmers()
+    _log_turn_flags()
 
     # Walk requirements.txt and warn loudly about any missing packages so
     # silent feature-disabling (psutil → no system monitor / no HUD CPU-RAM,
@@ -39823,6 +41043,16 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
 
                 print(f"  You:    {text}")
                 _tt("mark", "you")
+                # The day's first accepted owner turn is its wake event, the
+                # morning chain's trigger (B096). Stamped BEFORE the turn is
+                # marked just below (the silence snapshot reads his previous
+                # turn) and before JARVIS replies. A test inject never counts.
+                try:
+                    _note_first_owner_turn_of_day(
+                        test_inject=(_injected_text is not None
+                                     and _last_inject_source[0] == "test"))
+                except Exception as _wake_e:
+                    print(f"  [wake] first-turn stamp failed: {_wake_e}")
                 # An owner turn (voice or typed): freezes the local prompt
                 # prefix for PROMPT_FREEZE_QUIET_S (_request_prompt_rebuild).
                 _note_owner_turn()
@@ -39937,6 +41167,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     _tt("emit", "shortcut")
                     continue
 
+                # After-reply hooks (see _AFTER_REPLY_HOOKS): arm them for this
+                # owner turn; a no-op when no skill registered one.
+                _after_reply_begin(text, _injected_text is not None)
                 reply = _run_llm_dispatch(text, voice=_injected_text is None)
 
                 # Real-time learning: extract facts in background (non-blocking).
@@ -39992,6 +41225,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 _t = threading.Timer(2.0, _request_prompt_rebuild)
                 _t.daemon = True
                 _t.start()
+
+                # The encore an after-reply hook returned for this turn (at
+                # most one; the wait is bounded by _AFTER_REPLY_ENCORE_MAX_S).
+                _after_reply_run_encore()
 
                 print()
 
@@ -40166,6 +41403,12 @@ def _hard_exit(code: int = 0, *, clean: bool = False) -> None:
     if clean:
         mark_intentional_exit()
         _write_clean_shutdown_flag(force=True)
+    # Persist the month-to-date cloud token tally: atexit never runs past here.
+    try:
+        from core import llm_usage as _llm_usage
+        _llm_usage.flush()
+    except Exception:
+        pass
     _terminate_process_now(code)
 
 

@@ -1,460 +1,747 @@
 # JARVIS Action Index
 
-> Machine-verified inventory of every dispatchable voice action — its handler, whether its
-> result is spoken (INFORMATIVE = LLM restates / VERBATIM = spoken as-is / neither = only the
-> preamble is heard), whether it has a `core/prompts.py` routing example, and whether a test
-> references it. Regenerate with `python tools/gen_action_index.py`.
+> Machine-checked inventory of every dispatchable voice action — its handler, its spoken
+> note, whether it has a `core/prompts.py` routing example, and whether a test names it.
+> Regenerate with `python tools/gen_action_index.py`. CI fails when the action NAMES here
+> differ from what the generator finds (tests/test_action_index_coverage.py), so adding,
+> renaming or deleting an action means regenerating this file in the same change.
 > Only git-TRACKED sources are indexed: locally-installed private skills (gitignored) never
 > appear here. The web dashboard's Actions tab reads the LIVE registry instead.
+>
+> **spoken note** — the action's declared speak routing, the convention the runtime uses:
+> **VERBATIM** = in `SPEAK_RESULT_VERBATIM_ACTIONS` (bobert_companion.py) or a tracked
+> skill's module-level `SPEAK_VERBATIM_ACTIONS`, so the result string is spoken as-is;
+> *INFORMATIVE* = in `INFORMATIVE_ACTIONS` (bobert_companion.py or a skill's module-level
+> declaration), so a follow-up LLM round restates the result; SELF-VOICED = in a skill's
+> module-level `SELF_VOICED_ACTIONS`, so the action does all of its own talking; neither =
+> no spoken note, so only the preamble is heard unless the handler speaks for itself. The
+> skill declarations are folded into the monolith's sets at load time by
+> `_collect_skill_speak_sets`; this file reads them from source. A set patched at run time
+> (inside `register()`, or `register_self_voiced`) is invisible here and shows as neither.
+>
+> **tested** — `yes` when the action name is a Python string literal (exact match) in a
+> git-tracked `tests/**/*.py` file. A ratchet in tests/test_action_index_coverage.py stops
+> the untested count from growing.
 
 ## Summary
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 688 |
-| — monolith `ACTIONS` dict | 140 |
-| — skill / core registered | 548 |
-| VERBATIM speak set | 316 |
-| INFORMATIVE speak set | 79 |
-| neither set | 293 |
-| no `prompts.py` example | 513 |
-| no test reference | 71 |
+| Total registered actions (incl. aliases) | 696 |
+| — monolith `ACTIONS` dict | 142 |
+| — skill / core registered | 554 |
+| tested | 628 |
+| **untested** (no test names it) | 68 |
+| spoken note: VERBATIM | 347 |
+| spoken note: INFORMATIVE | 79 |
+| spoken note: SELF-VOICED | 0 |
+| **no spoken note** (neither) | 270 |
+| no `prompts.py` example | 511 |
 
-A result in **neither** set is spoken only if the handler self-speaks; otherwise the answer
-is dropped. That is correct for side-effect actions but is the recurring "logged but never
-voiced" bug for read-outs — see the audit that seeded the 2026-07 read-out completeness sweep.
+A result with no spoken note is correct for side-effect actions but is the recurring
+"logged but never voiced" bug for read-outs — see the audit that seeded the 2026-07
+read-out completeness sweep.
 
 ## Full index
 
-Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]` example.
+One row per action, sorted by name; aliases share their handler's location.
+`ex?` = has a prompts.py `[ACTION: …]` example.
 
-| action(s) | handler | speak | ex? | tests |
+| action | handler | spoken note | ex? | tested |
 |---|---|---|:--:|:--:|
-| `wake_word_mode_off`, `wake_word_mode_on` | `bobert_companion.py:26493` | neither | — | 2 |
-| `wake_word_mode_status` | `bobert_companion.py:26528` | **VERBATIM** | — | 3 |
-| `ambient_learning_mode`, `ambient_learning_mode_off`, `ambient_learning_mode_on`, `enter_ambient_learning`, `exit_ambient_learning` | `bobert_companion.py:27494` | neither | — | 2 |
-| `wake_resume_answer_then_quiet`, `wake_resume_stay_talkative` | `bobert_companion.py:27530` | neither | — | 2 |
-| `show_tray` | `bobert_companion.py:4109` | **VERBATIM** | — | 1 |
-| `minimize_window` | `core/actions.py:1004` | neither | yes | 0 |
-| `close_window` | `core/actions.py:1022` | neither | yes | 3 |
-| `type` | `core/actions.py:1051` | neither | yes | 31 |
-| `youtube` | `core/actions.py:107` | neither | yes | 5 |
-| `next_song` | `core/actions.py:1073` | *INFORMATIVE* | yes | 2 |
-| `previous_song` | `core/actions.py:1085` | *INFORMATIVE* | yes | 1 |
-| `show_tasks` | `core/actions.py:1097` | *INFORMATIVE* | yes | 1 |
-| `ambient_mode_off`, `ambient_mode_on`, `silent_learning_off`, `silent_learning_on`, `start_eavesdropping`, `stop_eavesdropping` | `core/actions.py:1119` | neither | — | 4 |
-| `greet_new_people_off`, `greet_new_people_on`, `notice_new_people`, `stop_greeting_people` | `core/actions.py:1164` | neither | — | 0 |
-| `get_time` | `core/actions.py:117` | *INFORMATIVE* | — | 11 |
-| `reload_skills` | `core/actions.py:1195` | neither | — | 2 |
-| `show_recent_facts` | `core/actions.py:1222` | **VERBATIM** | — | 4 |
-| `export_memory` | `core/actions.py:1255` | neither | yes | 1 |
-| `screenshot` | `core/actions.py:126` | *INFORMATIVE* | — | 6 |
-| `run_diagnostic` | `core/actions.py:1276` | **VERBATIM** | — | 6 |
-| `show_last_diagnostic` | `core/actions.py:1288` | **VERBATIM** | — | 2 |
-| `play_streaming` | `core/actions.py:1307` | neither | — | 2 |
-| `click` | `core/actions.py:1333` | neither | yes | 6 |
-| `hotkey` | `core/actions.py:1371` | neither | — | 4 |
-| `stop_pipeline` | `core/actions.py:1399` | neither | — | 1 |
-| `force_backup` | `core/actions.py:1430` | neither | — | 3 |
-| `reset_memory` | `core/actions.py:1453` | neither | yes | 5 |
-| `version_info`, `what_version`, `when_updated` | `core/actions.py:1500` | **VERBATIM** | — | 5 |
-| `check_for_updates`, `check_updates`, `is_there_an_update` | `core/actions.py:1580` | **VERBATIM** | yes | 2 |
-| `file_a_bug`, `log_a_bug`, `report_a_bug`, `report_bug` | `core/actions.py:1590` | **VERBATIM** | yes | 2 |
-| `run_smoke_test` | `core/actions.py:1623` | neither | — | 3 |
-| `test_each_skill` | `core/actions.py:1666` | neither | yes | 2 |
-| `forget_last_hour` | `core/actions.py:1714` | neither | yes | 3 |
-| `latency_benchmark` | `core/actions.py:1793` | neither | yes | 2 |
-| `play_music` | `core/actions.py:1824` | *INFORMATIVE* | yes | 20 |
-| `media_next` | `core/actions.py:186` | neither | — | 3 |
-| `where_is_user` | `core/actions.py:1868` | *INFORMATIVE* | — | 0 |
-| `see_screen` | `core/actions.py:1912` | *INFORMATIVE* | yes | 15 |
-| `media_prev` | `core/actions.py:195` | neither | — | 2 |
-| `replay_last_action` | `core/actions.py:1974` | neither | — | 1 |
-| `run_shell` | `core/actions.py:2018` | neither | — | 4 |
-| `media_playpause` | `core/actions.py:204` | neither | yes | 2 |
-| `see_user` | `core/actions.py:2080` | *INFORMATIVE* | — | 1 |
-| `volume_up` | `core/actions.py:213` | neither | — | 6 |
-| `which_monitor` | `core/actions.py:2166` | *INFORMATIVE* | — | 2 |
-| `volume_down` | `core/actions.py:222` | neither | yes | 4 |
-| `volume_mute` | `core/actions.py:231` | neither | yes | 4 |
-| `session_memory_recall` | `core/actions.py:2349` | **VERBATIM** | yes | 0 |
-| `set_volume` | `core/actions.py:240` | neither | yes | 2 |
-| `last_screen`, `previous_screen`, `recall_screen`, `screen_history` | `core/actions.py:2442` | *INFORMATIVE* | yes | 0 |
-| `read_changelog`, `recent_changes`, `show_changelog`, `what_changed`, `whats_new` | `core/actions.py:2509` | **VERBATIM** | yes | 1 |
-| `start_overnight_upgrade` | `core/actions.py:2575` | neither | — | 1 |
-| `open_on_monitor` | `core/actions.py:2627` | neither | — | 1 |
-| `move_window_to_monitor` | `core/actions.py:2707` | neither | yes | 1 |
-| `create_skill` | `core/actions.py:2770` | neither | yes | 0 |
-| `netflix` | `core/actions.py:286` | neither | yes | 7 |
-| `upgrade` | `core/actions.py:2860` | neither | — | 5 |
-| `prime_video` | `core/actions.py:290` | neither | — | 2 |
-| `disney_plus` | `core/actions.py:294` | neither | yes | 2 |
-| `hulu` | `core/actions.py:298` | neither | yes | 1 |
-| `max` | `core/actions.py:302` | neither | yes | 5 |
-| `spotify` | `core/actions.py:306` | neither | yes | 7 |
-| `youtube_play` | `core/actions.py:310` | neither | yes | 1 |
-| `hide_hud` | `core/actions.py:317` | neither | — | 3 |
-| `exit_jarvis`, `power_off_jarvis`, `quit_jarvis`, `shut_down`, `shutdown_jarvis`, `turn_off_jarvis` | `core/actions.py:3186` | neither | — | 5 |
-| `switch_llm` | `core/actions.py:3272` | neither | — | 4 |
-| `find_on_screen` | `core/actions.py:3383` | *INFORMATIVE* | yes | 0 |
-| `clear_llm_cache`, `reset_llm_cache` | `core/actions.py:3398` | neither | — | 1 |
-| `ambient_listening`, `ambient_mode`, `chappie_mode`, `silent_learning` | `core/actions.py:3405` | neither | — | 5 |
-| `show_hud` | `core/actions.py:443` | neither | — | 2 |
-| `toggle_hud` | `core/actions.py:448` | neither | — | 1 |
-| `test_mic` | `core/actions.py:470` | neither | yes | 2 |
-| `test_tts` | `core/actions.py:474` | neither | yes | 1 |
-| `test_vision` | `core/actions.py:478` | neither | yes | 1 |
-| `clear_tasks` | `core/actions.py:484` | neither | yes | 1 |
-| `session_resume` | `core/actions.py:513` | neither | — | 0 |
-| `restart` | `core/actions.py:548` | neither | — | 13 |
-| `switch_llm_picker` | `core/actions.py:627` | neither | — | 0 |
-| `compare_models`, `llm_costs`, `model_costs`, `model_prices` | `core/actions.py:637` | **VERBATIM** | yes | 1 |
-| `show_llm_stats` | `core/actions.py:682` | **VERBATIM** | — | 3 |
-| `press` | `core/actions.py:699` | neither | — | 0 |
-| `open_url` | `core/actions.py:70` | *INFORMATIVE* | — | 14 |
-| `scroll` | `core/actions.py:708` | neither | — | 3 |
-| `list_skills` | `core/actions.py:723` | *INFORMATIVE* | — | 0 |
-| `apple_music` | `core/actions.py:736` | neither | yes | 8 |
-| `launch_app` | `core/actions.py:760` | neither | — | 7 |
-| `search` | `core/actions.py:80` | neither | — | 5 |
-| `web_search` | `core/actions.py:80` | *INFORMATIVE* | — | 5 |
-| `pause_music` | `core/actions.py:814` | *INFORMATIVE* | yes | 2 |
-| `resume_music` | `core/actions.py:827` | *INFORMATIVE* | yes | 2 |
-| `now_playing` | `core/actions.py:837` | *INFORMATIVE* | — | 1 |
-| `open_apple_music` | `core/actions.py:899` | neither | yes | 0 |
-| `music_status` | `core/actions.py:912` | *INFORMATIVE* | yes | 0 |
-| `queue_task` | `core/actions.py:937` | *INFORMATIVE* | yes | 2 |
-| `list_windows` | `core/actions.py:959` | *INFORMATIVE* | — | 0 |
-| `focus_window` | `core/actions.py:971` | neither | — | 2 |
-| `pause_diagnostics` | `core/diagnostic_daemons.py:1599` | neither | — | 1 |
-| `resume_diagnostics` | `core/diagnostic_daemons.py:1603` | neither | — | 1 |
-| `diagnostic_daemon_status`, `diagnostic_status` | `core/diagnostic_daemons.py:1607` | **VERBATIM** | — | 2 |
-| `gate_status`, `stability_gate_status` | `?` | **VERBATIM** | — | 2 |
-| `list_promises` | `core/memory.py:556` | **VERBATIM** | yes | 2 |
-| `cancel_promise` | `core/memory.py:576` | **VERBATIM** | yes | 2 |
-| `smart_home_devices`, `smart_home_list` | `core/smart_home_router.py:1060` | **VERBATIM** | — | 3 |
-| `smart_home_router_status` | `core/smart_home_router.py:1075` | **VERBATIM** | yes | 3 |
-| `refresh_smart_home_router` | `core/smart_home_router.py:1110` | neither | — | 2 |
-| `control_device`, `control_smart_home`, `smart_home_control` | `core/smart_home_router.py:880` | **VERBATIM** | yes | 5 |
-| `control_light`, `control_plug`, `kasa_control` | `core/smart_home_router.py:880` | neither | — | 0 |
-| `resume` | `core/wake_word.py:388` | **VERBATIM** | — | 5 |
-| `morning_tabs` | `skills/_example_skill.py:13` | neither | — | 0 |
-| `vscode_command` | `skills/_example_skill.py:23` | neither | — | 0 |
-| `air_control_on` | `skills/air_control.py:385` | **VERBATIM** | yes | 1 |
-| `air_control_off` | `skills/air_control.py:405` | **VERBATIM** | yes | 1 |
-| `air_control_status` | `skills/air_control.py:414` | **VERBATIM** | yes | 1 |
-| `amazon_orders`, `check_amazon_orders`, `check_orders` | `skills/amazon_order_tracker.py:602` | *INFORMATIVE* | yes | 1 |
-| `recent_deliveries`, `recent_delivery` | `skills/amazon_order_tracker.py:629` | *INFORMATIVE* | — | 1 |
-| `amazon_tracking_status` | `skills/amazon_order_tracker.py:649` | **VERBATIM** | — | 2 |
-| `ambient_listen_start` | `skills/ambient_listen.py:1646` | neither | — | 6 |
-| `ambient_listen_stop` | `skills/ambient_listen.py:1675` | neither | — | 4 |
-| `ambient_audio_start` | `skills/ambient_listen.py:1696` | neither | — | 1 |
-| `ambient_audio_stop` | `skills/ambient_listen.py:1722` | neither | — | 1 |
-| `ambient_screen_start` | `skills/ambient_listen.py:1743` | neither | — | 1 |
-| `ambient_screen_stop` | `skills/ambient_listen.py:1764` | neither | — | 1 |
-| `ambient_full_start` | `skills/ambient_listen.py:1787` | neither | — | 1 |
-| `ambient_full_stop` | `skills/ambient_listen.py:1796` | neither | — | 1 |
-| `ambient_mic_only` | `skills/ambient_listen.py:1804` | neither | — | 1 |
-| `ambient_listen_status` | `skills/ambient_listen.py:1816` | **VERBATIM** | yes | 3 |
-| `ambient_extract_start` | `skills/ambient_multimodal_extract.py:340` | neither | — | 2 |
-| `ambient_extract_stop` | `skills/ambient_multimodal_extract.py:356` | neither | — | 2 |
-| `ambient_extract_status` | `skills/ambient_multimodal_extract.py:377` | **VERBATIM** | yes | 2 |
-| `ambient_extract_now` | `skills/ambient_multimodal_extract.py:393` | neither | — | 1 |
-| `anticipation_briefing_now` | `skills/anticipation_briefing.py:545` | neither | — | 1 |
-| `anticipation_briefing_status` | `skills/anticipation_briefing.py:566` | **VERBATIM** | yes | 2 |
-| `anticipation_status` | `skills/anticipation_engine.py:568` | **VERBATIM** | yes | 2 |
-| `play_unheard` | `skills/apple_music_intel.py:646` | **VERBATIM** | yes | 2 |
-| `play_vibe` | `skills/apple_music_intel.py:734` | **VERBATIM** | yes | 2 |
-| `skip_track` | `skills/apple_music_intel.py:770` | **VERBATIM** | yes | 2 |
-| `music_history` | `skills/apple_music_intel.py:832` | **VERBATIM** | yes | 2 |
-| `music_taste` | `skills/apple_music_intel.py:848` | **VERBATIM** | — | 1 |
-| `music_aggregate` | `skills/apple_music_intel.py:877` | **VERBATIM** | — | 2 |
-| `audio_autoswitch_status` | `skills/audio_autoswitch.py:197` | **VERBATIM** | yes | 1 |
-| `audio_autoswitch_on` | `skills/audio_autoswitch.py:211` | **VERBATIM** | yes | 0 |
-| `audio_autoswitch_off` | `skills/audio_autoswitch.py:217` | **VERBATIM** | yes | 0 |
-| `switch_to_headset`, `use_headset` | `skills/audio_autoswitch.py:222` | **VERBATIM** | yes | 1 |
-| `switch_to_speakers`, `use_speakers` | `skills/audio_autoswitch.py:243` | **VERBATIM** | yes | 1 |
-| `switch_to_headset_mic`, `use_headset_mic` | `skills/audio_autoswitch.py:262` | neither | — | 1 |
-| `switch_to_desk_mic`, `use_desk_mic` | `skills/audio_autoswitch.py:298` | neither | — | 1 |
-| `which_mic_is_active` | `skills/audio_autoswitch.py:312` | neither | — | 1 |
-| `current_mic`, `what_mic`, `what_microphone`, `which_microphone` | `skills/audio_devices.py:303` | neither | yes | 4 |
-| `current_speaker`, `what_speakers`, `which_speakers` | `skills/audio_devices.py:307` | neither | yes | 1 |
-| `audio_devices`, `what_audio_devices` | `skills/audio_devices.py:314` | neither | yes | 3 |
-| `print_status` | `skills/bambu_h2d_voice_companion.py:492` | **VERBATIM** | — | 2 |
-| `check_print` | `skills/bambu_monitor.py:1037` | *INFORMATIVE* | yes | 2 |
-| `how_is_the_print`, `print_details` | `skills/bambu_monitor.py:1072` | *INFORMATIVE* | yes | 2 |
-| `pause_print` | `skills/bambu_print_announcer.py:496` | **VERBATIM** | — | 2 |
-| `resume_print` | `skills/bambu_print_announcer.py:508` | **VERBATIM** | — | 2 |
-| `proactive_announcer_status` | `skills/bambu_print_announcer.py:520` | **VERBATIM** | — | 3 |
-| `bambu_setup`, `configure_printer`, `first_time_printer_setup`, `setup_bambu`, `setup_printer` | `skills/bambu_setup.py:532` | neither | — | 1 |
-| `banter_status` | `skills/banter.py:582` | **VERBATIM** | yes | 2 |
-| `browser_do`, `browser_run`, `browser_task` | `skills/browser_agent.py:630` | *INFORMATIVE* | yes | 2 |
-| `book_appointment` | `skills/browser_agent.py:642` | *INFORMATIVE* | yes | 2 |
-| `fill_form` | `skills/browser_agent.py:656` | *INFORMATIVE* | yes | 2 |
-| `browse_for` | `skills/browser_agent.py:673` | *INFORMATIVE* | yes | 2 |
-| `find_cheapest` | `skills/browser_agent.py:689` | *INFORMATIVE* | yes | 2 |
-| `browser_open` | `skills/browser_agent.py:706` | neither | yes | 1 |
-| `browser_screenshot` | `skills/browser_agent.py:722` | neither | — | 1 |
-| `browser_status` | `skills/browser_agent.py:767` | neither | yes | 1 |
-| `browser_stop` | `skills/browser_agent.py:796` | neither | yes | 1 |
-| `browser_reset_profile` | `skills/browser_agent.py:826` | neither | yes | 2 |
-| `camera_status` | `skills/camera_system.py:435` | **VERBATIM** | — | 3 |
-| `camera_unquarantine` | `skills/camera_system.py:585` | **VERBATIM** | yes | 1 |
-| `situational_awareness`, `where_am_i` | `skills/camera_system.py:634` | **VERBATIM** | — | 2 |
-| `look_around` | `skills/camera_system.py:824` | **VERBATIM** | — | 3 |
-| `chappie_recall_entity` | `skills/chappie_consciousness.py:538` | **VERBATIM** | — | 1 |
-| `chappie_recall_today` | `skills/chappie_consciousness.py:567` | **VERBATIM** | — | 2 |
-| `chappie_status` | `skills/chappie_consciousness.py:609` | **VERBATIM** | — | 2 |
-| `compute`, `eval_python`, `python`, `run_python` | `skills/code_executor.py:395` | *INFORMATIVE* | yes | 8 |
-| `reset_kernel` | `skills/code_executor.py:408` | neither | — | 1 |
-| `check_credits` | `skills/credits_monitor.py:215` | *INFORMATIVE* | yes | 3 |
-| `set_tts_backend` | `skills/custom_voice.py:511` | neither | yes | 1 |
-| `list_tts_backends` | `skills/custom_voice.py:515` | **VERBATIM** | — | 2 |
-| `enroll_xtts_sample` | `skills/custom_voice.py:525` | neither | — | 1 |
-| `daily_briefing` | `skills/daily_briefing.py:452` | neither | yes | 1 |
-| `daily_recap` | `skills/daily_recap.py:735` | neither | yes | 1 |
-| `check_budget` | `skills/disk_budget_watchdog.py:167` | **VERBATIM** | yes | 2 |
-| `focus_mode_status` | `skills/dnd_focus_mode.py:544` | **VERBATIM** | — | 3 |
-| `dossier`, `dossier_on`, `file_on`, `pull_up_dossier`, `pull_up_file`, `what_do_you_have_on`, `whats_on_file` | `skills/dossier.py:666` | neither | yes | 1 |
-| `draft_preview_gate_status`, `outbound_gate_status` | `skills/draft_preview_gate.py:227` | **VERBATIM** | yes | 2 |
-| `list_emails`, `list_unread`, `unread_email`, `unread_emails` | `skills/email_triage.py:1045` | *INFORMATIVE* | — | 1 |
-| `read_email`, `read_message`, `read_thread` | `skills/email_triage.py:1068` | *INFORMATIVE* | — | 1 |
-| `compose_reply`, `draft_reply`, `pre_draft_reply` | `skills/email_triage.py:1089` | *INFORMATIVE* | — | 1 |
-| `confirm_pending_draft`, `send_draft`, `send_pending_draft` | `skills/email_triage.py:1138` | **VERBATIM** | — | 3 |
-| `discard_draft`, `scrap_pending_draft` | `skills/email_triage.py:1157` | **VERBATIM** | — | 2 |
-| `edit_pending_draft` | `skills/email_triage.py:1166` | **VERBATIM** | — | 1 |
-| `list_pending_drafts`, `pending_drafts` | `skills/email_triage.py:1190` | **VERBATIM** | — | 2 |
-| `archive_email`, `archive_message` | `skills/email_triage.py:1200` | **VERBATIM** | — | 3 |
-| `categorise_inbox`, `categorize_inbox`, `triage_inbox` | `skills/email_triage.py:1209` | **VERBATIM** | — | 1 |
-| `email_briefing`, `inbox_briefing` | `skills/email_triage.py:1250` | **VERBATIM** | — | 1 |
-| `email_triage_status` | `skills/email_triage.py:1294` | **VERBATIM** | — | 2 |
-| `enroll_voice`, `learn_my_voice` | `skills/enroll_voice.py:313` | **VERBATIM** | yes | 2 |
-| `identify_speaker`, `who_is_talking`, `whos_talking` | `skills/enroll_voice.py:338` | **VERBATIM** | — | 3 |
-| `enrolled_voices`, `list_enrolled_voices` | `skills/enroll_voice.py:360` | **VERBATIM** | — | 2 |
-| `forget_voice` | `skills/enroll_voice.py:374` | **VERBATIM** | — | 2 |
-| `set_active_speaker` | `skills/enroll_voice.py:386` | **VERBATIM** | — | 2 |
-| `voice_id_status` | `skills/enroll_voice.py:399` | **VERBATIM** | — | 2 |
-| `evening_briefing` | `skills/evening_briefing.py:801` | neither | yes | 3 |
-| `enroll_face`, `learn_my_face`, `remember_my_face` | `skills/face_id.py:197` | **VERBATIM** | — | 2 |
-| `learn_guest`, `learn_their_face`, `remember_their_face`, `remember_this_person` | `skills/face_id.py:257` | **VERBATIM** | — | 2 |
-| `do_you_recognize_me`, `recognize_face`, `who_am_i`, `whoami`, `whos_at_the_desk` | `skills/face_id.py:305` | **VERBATIM** | yes | 3 |
-| `face_id_status` | `skills/face_id.py:357` | **VERBATIM** | — | 1 |
-| `forget_face` | `skills/face_id.py:395` | **VERBATIM** | — | 2 |
-| `list_enrolled_faces` | `skills/face_id.py:416` | **VERBATIM** | — | 2 |
-| `gaze_status` | `skills/face_tracker.py:1305` | **VERBATIM** | — | 2 |
-| `gaze_stats` | `skills/face_tracker.py:1333` | **VERBATIM** | — | 2 |
-| `face_track_status` | `skills/face_tracker.py:1363` | **VERBATIM** | — | 2 |
-| `calibrate_gaze` | `skills/face_tracker.py:1453` | **VERBATIM** | — | 0 |
-| `gaze_calibration_status` | `skills/face_tracker.py:1499` | **VERBATIM** | — | 1 |
-| `forget_gaze_calibration` | `skills/face_tracker.py:1512` | **VERBATIM** | — | 1 |
-| `gaze_tracking_on` | `skills/face_tracker.py:1522` | **VERBATIM** | yes | 0 |
-| `gaze_tracking_off` | `skills/face_tracker.py:1538` | **VERBATIM** | — | 0 |
-| `do_not_disturb`, `focus_mode`, `focus_mode_on`, `quiet_mode` | `skills/focus_mode.py:294` | **VERBATIM** | yes | 5 |
-| `end_focus_mode`, `focus_mode_off` | `skills/focus_mode.py:322` | **VERBATIM** | yes | 3 |
-| `whats_missed` | `skills/focus_mode.py:349` | **VERBATIM** | yes | 1 |
-| `game_mode_status` | `skills/game_mode.py:1921` | neither | — | 3 |
-| `game_mode_on`, `low_power_mode` | `skills/game_mode.py:1976` | neither | — | 1 |
-| `full_power`, `game_mode_off`, `normal_power` | `skills/game_mode.py:2009` | neither | — | 3 |
-| `game_mode_learn_this` | `skills/game_mode.py:2054` | neither | — | 1 |
-| `gpu_status`, `gpu_usage`, `show_vram`, `vram_status`, `whats_loaded` | `skills/gpu_usage.py:218` | **VERBATIM** | yes | 1 |
-| `guard_on` | `skills/guard_mode.py:615` | **VERBATIM** | — | 2 |
-| `guard_off` | `skills/guard_mode.py:649` | **VERBATIM** | — | 3 |
-| `guard_status` | `skills/guard_mode.py:666` | **VERBATIM** | — | 2 |
-| `hardware_sensors` | `skills/hardware_sensors.py:20` | **VERBATIM** | yes | 2 |
-| `headset_on`, `headset_status`, `is_headset_on`, `is_my_headset_on` | `skills/headset_status.py:347` | neither | yes | 2 |
-| `headset_battery`, `headset_battery_level`, `how_much_battery_headset` | `skills/headset_status.py:370` | neither | yes | 1 |
-| `bambu_camera_off`, `hide_bambu_camera`, `hide_printer_camera` | `skills/holographic_overlay/__init__.py:1000` | neither | — | 0 |
-| `bambu_camera`, `bambu_camera_toggle`, `camera_hud`, `print_camera`, `printer_cam`, `printer_camera` | `skills/holographic_overlay/__init__.py:1007` | neither | — | 0 |
-| `bambu_camera_status` | `skills/holographic_overlay/__init__.py:1013` | **VERBATIM** | yes | 1 |
-| `show_workshop_hud`, `workshop_hud_on` | `skills/holographic_overlay/__init__.py:1147` | neither | — | 1 |
-| `hide_workshop_hud`, `workshop_hud_off` | `skills/holographic_overlay/__init__.py:1152` | neither | — | 1 |
-| `workshop_hud`, `workshop_hud_toggle` | `skills/holographic_overlay/__init__.py:1157` | neither | — | 2 |
-| `workshop_hud_status` | `skills/holographic_overlay/__init__.py:1163` | **VERBATIM** | yes | 4 |
-| `print_hud_on`, `show_workshop_print_monitor`, `workshop_print_hud_on`, `workshop_print_monitor_on` | `skills/holographic_overlay/__init__.py:1402` | neither | — | 1 |
-| `hide_workshop_print_monitor`, `print_hud_off`, `workshop_print_hud_off`, `workshop_print_monitor_off` | `skills/holographic_overlay/__init__.py:1409` | neither | — | 1 |
-| `print_hud`, `workshop_print_hud`, `workshop_print_monitor`, `workshop_print_monitor_toggle` | `skills/holographic_overlay/__init__.py:1416` | neither | — | 1 |
-| `workshop_print_monitor_status` | `skills/holographic_overlay/__init__.py:1422` | **VERBATIM** | — | 2 |
-| `arc_reactor_hud`, `holo_hud_v2_on`, `show_holo_hud_v2` | `skills/holographic_overlay/__init__.py:1526` | neither | — | 1 |
-| `hide_holo_hud_v2`, `holo_hud_v2_off` | `skills/holographic_overlay/__init__.py:1531` | neither | — | 1 |
-| `holo_hud_v2`, `holo_hud_v2_toggle`, `holographic_hud_v2` | `skills/holographic_overlay/__init__.py:1536` | neither | — | 1 |
-| `holo_hud_v2_status` | `skills/holographic_overlay/__init__.py:1542` | **VERBATIM** | — | 2 |
-| `arc_reactor_status_on`, `pulse_hud_on`, `show_status_hud`, `status_hud_on`, `status_ring_on` | `skills/holographic_overlay/__init__.py:1660` | neither | — | 1 |
-| `arc_reactor_status_off`, `hide_status_hud`, `pulse_hud_off`, `status_hud_off`, `status_ring_off` | `skills/holographic_overlay/__init__.py:1665` | neither | — | 1 |
-| `arc_reactor_status`, `arc_reactor_status_hud`, `arc_reactor_status_toggle`, `pulse_hud`, `status_hud`, `status_ring` | `skills/holographic_overlay/__init__.py:1670` | neither | — | 3 |
-| `arc_reactor_status_status` | `skills/holographic_overlay/__init__.py:1676` | **VERBATIM** | yes | 2 |
-| `hud_v2_on`, `show_hud_v2`, `show_status_ring_v2`, `stark_status_ring_on`, `status_ring_v2_on` | `skills/holographic_overlay/__init__.py:1809` | neither | — | 1 |
-| `hide_hud_v2`, `hide_status_ring_v2`, `hud_v2_off`, `stark_status_ring_off`, `status_ring_v2_off` | `skills/holographic_overlay/__init__.py:1814` | neither | — | 1 |
-| `hud_v2`, `hud_v2_toggle`, `stark_status_ring`, `stark_status_ring_toggle`, `status_ring_v2` | `skills/holographic_overlay/__init__.py:1819` | neither | — | 1 |
-| `stark_status_ring_status` | `skills/holographic_overlay/__init__.py:1825` | **VERBATIM** | yes | 2 |
-| `holographic_on`, `hud_on`, `show_holo`, `show_holographic_overlay` | `skills/holographic_overlay/__init__.py:322` | neither | — | 3 |
-| `dismiss_holo`, `hide_holo`, `hide_holographic_overlay`, `holographic_off`, `hud_off` | `skills/holographic_overlay/__init__.py:327` | neither | — | 1 |
-| `toggle_holo`, `toggle_holographic_overlay` | `skills/holographic_overlay/__init__.py:332` | neither | — | 1 |
-| `holographic_status` | `skills/holographic_overlay/__init__.py:338` | **VERBATIM** | yes | 2 |
-| `arc_reactor` | `skills/holographic_overlay/__init__.py:464` | neither | — | 2 |
-| `arc_reactor_on`, `holo_workshop`, `holo_workshop_canvas`, `workshop_canvas` | `skills/holographic_overlay/__init__.py:484` | neither | — | 1 |
-| `arc_reactor_off` | `skills/holographic_overlay/__init__.py:489` | neither | — | 1 |
-| `arc_reactor_pulse` | `skills/holographic_overlay/__init__.py:494` | neither | — | 1 |
-| `bambu_overlay_on`, `show_bambu_overlay` | `skills/holographic_overlay/__init__.py:750` | neither | — | 1 |
-| `bambu_overlay_off`, `hide_bambu_overlay` | `skills/holographic_overlay/__init__.py:757` | neither | — | 1 |
-| `bambu_h2d_overlay`, `bambu_overlay`, `bambu_overlay_toggle` | `skills/holographic_overlay/__init__.py:764` | neither | — | 1 |
-| `bambu_overlay_status` | `skills/holographic_overlay/__init__.py:770` | **VERBATIM** | — | 2 |
-| `bambu_camera_on`, `show_bambu_camera`, `show_print_camera`, `show_printer_camera` | `skills/holographic_overlay/__init__.py:993` | neither | — | 0 |
-| `generate_image` | `skills/image_gen.py:361` | **VERBATIM** | — | 2 |
-| `make_picture` | `skills/image_gen.py:386` | **VERBATIM** | yes | 2 |
-| `play_playlist` | `skills/itunes_library.py:136` | **VERBATIM** | yes | 2 |
-| `list_playlists` | `skills/itunes_library.py:176` | **VERBATIM** | yes | 2 |
-| `shuffle_library` | `skills/itunes_library.py:203` | **VERBATIM** | yes | 2 |
-| `keep_music_open` | `skills/itunes_library.py:333` | **VERBATIM** | yes | 2 |
-| `stop_keeping_music_open` | `skills/itunes_library.py:369` | **VERBATIM** | yes | 2 |
-| `air_mouse_on` | `skills/kinect_air_mouse.py:3532` | **VERBATIM** | — | 6 |
-| `air_mouse_off` | `skills/kinect_air_mouse.py:3552` | **VERBATIM** | — | 6 |
-| `air_mouse_status` | `skills/kinect_air_mouse.py:3572` | **VERBATIM** | — | 2 |
-| `air_mouse_arm`, `give_me_the_cursor`, `hand_mouse_on`, `mouse_control_on`, `take_the_cursor` | `skills/kinect_air_mouse.py:3593` | **VERBATIM** | yes | 3 |
-| `air_mouse_disarm`, `hand_mouse_off`, `mouse_control_off`, `release_the_cursor` | `skills/kinect_air_mouse.py:3619` | **VERBATIM** | yes | 2 |
-| `calibrate_air_mouse` | `skills/kinect_air_mouse.py:3642` | **VERBATIM** | — | 1 |
-| `gesture_status` | `skills/kinect_gestures.py:501` | **VERBATIM** | — | 1 |
-| `gestures_on` | `skills/kinect_gestures.py:520` | **VERBATIM** | — | 5 |
-| `gestures_off` | `skills/kinect_gestures.py:544` | **VERBATIM** | — | 5 |
-| `calibrate_pointing`, `point_calibrate` | `skills/kinect_pointing.py:352` | **VERBATIM** | — | 1 |
-| `list_point_targets`, `point_targets` | `skills/kinect_pointing.py:397` | **VERBATIM** | — | 2 |
-| `forget_point_target` | `skills/kinect_pointing.py:420` | **VERBATIM** | — | 2 |
-| `point_at`, `point_control` | `skills/kinect_pointing.py:433` | **VERBATIM** | — | 1 |
-| `point_status` | `skills/kinect_pointing.py:488` | **VERBATIM** | — | 2 |
-| `point_control_on` | `skills/kinect_pointing.py:515` | **VERBATIM** | — | 2 |
-| `point_control_off` | `skills/kinect_pointing.py:533` | **VERBATIM** | — | 2 |
-| `who_is_here` | `skills/kinect_vision.py:103` | **VERBATIM** | — | 1 |
-| `scan_room` | `skills/kinect_vision.py:134` | **VERBATIM** | — | 1 |
-| `kinect_look` | `skills/kinect_vision.py:138` | *INFORMATIVE* | — | 1 |
-| `what_do_you_see_kinect` | `skills/kinect_vision.py:180` | *INFORMATIVE* | — | 1 |
-| `kinect_status` | `skills/kinect_vision.py:54` | **VERBATIM** | — | 1 |
-| `local_describe_screen` | `skills/local_vision.py:121` | *INFORMATIVE* | yes | 1 |
-| `local_click_target_by_description` | `skills/local_vision.py:310` | neither | — | 1 |
-| `mcp_status` | `skills/mcp_tools.py:148` | **VERBATIM** | — | 2 |
-| `mcp_list_tools` | `skills/mcp_tools.py:165` | **VERBATIM** | — | 1 |
-| `mcp_call` | `skills/mcp_tools.py:189` | **VERBATIM** | yes | 1 |
-| `mcp_reload` | `skills/mcp_tools.py:219` | **VERBATIM** | — | 1 |
-| `list_models` | `skills/model_picker.py:407` | **VERBATIM** | yes | 1 |
-| `current_model` | `skills/model_picker.py:451` | **VERBATIM** | yes | 1 |
-| `set_model` | `skills/model_picker.py:473` | **VERBATIM** | yes | 4 |
-| `set_brain` | `skills/model_picker.py:573` | **VERBATIM** | yes | 2 |
-| `arrival_briefing`, `morning_arrival` | `skills/morning_arrival.py:854` | neither | yes | 2 |
-| `arrival_briefing_v2`, `morning_arrival_v2` | `skills/morning_arrival_v2.py:686` | neither | — | 1 |
-| `morning_briefing` | `skills/morning_briefing.py:448` | **VERBATIM** | yes | 9 |
-| `morning_chain_pick` | `skills/morning_chain.py:310` | neither | — | 1 |
-| `morning_handoff` | `skills/morning_handoff.py:736` | neither | yes | 2 |
-| `predictive_morning_setup`, `setup_workspace`, `workspace_setup` | `skills/morning_handoff.py:744` | **VERBATIM** | yes | 2 |
-| `calendar_next`, `calendar_today`, `ms_graph_calendar` | `skills/ms_graph.py:796` | **VERBATIM** | yes | 4 |
-| `list_wifi_clients`, `network_clients`, `who_is_on_the_wifi`, `who_is_on_wifi` | `skills/network_deco.py:693` | *INFORMATIVE* | yes | 2 |
-| `is_printer_online`, `printer_online` | `skills/network_deco.py:709` | **VERBATIM** | yes | 2 |
-| `device_online`, `is_device_online` | `skills/network_deco.py:729` | **VERBATIM** | yes | 2 |
-| `bandwidth_hogs`, `network_usage`, `whats_using_bandwidth` | `skills/network_deco.py:751` | **VERBATIM** | — | 2 |
-| `disable_guest_network`, `kick_guest_network` | `skills/network_deco.py:819` | neither | yes | 1 |
-| `enable_guest_network` | `skills/network_deco.py:823` | neither | — | 1 |
-| `deco_topology` | `skills/network_deco.py:827` | **VERBATIM** | — | 2 |
-| `network_topology` | `skills/network_deco.py:827` | *INFORMATIVE* | — | 2 |
-| `deco_status` | `skills/network_deco.py:843` | **VERBATIM** | — | 2 |
-| `deco_refresh`, `refresh_network` | `skills/network_deco.py:857` | **VERBATIM** | — | 2 |
-| `news_briefing` | `skills/news_briefing.py:382` | neither | yes | 4 |
-| `enable_night_owl`, `night_owl_mode`, `night_owl_on` | `skills/night_owl_mode.py:472` | neither | yes | 3 |
-| `disable_night_owl`, `end_night_owl`, `night_owl_off` | `skills/night_owl_mode.py:475` | neither | yes | 1 |
-| `good_morning` | `skills/night_owl_mode.py:478` | **VERBATIM** | — | 2 |
-| `night_owl_status` | `skills/night_owl_mode.py:486` | **VERBATIM** | yes | 2 |
-| `notification_triage_status`, `triage_status` | `skills/notification_triage.py:1363` | **VERBATIM** | — | 2 |
-| `list_notification_rules` | `skills/notification_triage.py:1389` | **VERBATIM** | — | 2 |
-| `add_notification_rule` | `skills/notification_triage.py:1398` | **VERBATIM** | — | 2 |
-| `remove_notification_rule` | `skills/notification_triage.py:1420` | **VERBATIM** | — | 2 |
-| `list_recent_notifications`, `recent_notifications_summary` | `skills/notification_triage.py:1434` | *INFORMATIVE* | yes | 1 |
-| `pause_notification_triage` | `skills/notification_triage.py:1452` | **VERBATIM** | — | 2 |
-| `resume_notification_triage` | `skills/notification_triage.py:1456` | **VERBATIM** | — | 2 |
-| `obs_start_recording` | `skills/obs_control.py:119` | **VERBATIM** | — | 2 |
-| `obs_stop_recording` | `skills/obs_control.py:138` | **VERBATIM** | — | 2 |
-| `obs_pause_recording` | `skills/obs_control.py:155` | **VERBATIM** | — | 2 |
-| `obs_switch_scene` | `skills/obs_control.py:189` | **VERBATIM** | yes | 2 |
-| `obs_toggle_mute` | `skills/obs_control.py:230` | **VERBATIM** | yes | 2 |
-| `pattern_predictions` | `skills/pattern_learning.py:1069` | **VERBATIM** | yes | 2 |
-| `pattern_offer_now` | `skills/pattern_learning.py:1087` | **VERBATIM** | — | 2 |
-| `pattern_aggregate` | `skills/pattern_learning.py:1092` | **VERBATIM** | — | 2 |
-| `weekly_digest` | `skills/pattern_learning.py:1101` | **VERBATIM** | — | 2 |
-| `pattern_stats` | `skills/pattern_learning.py:1115` | **VERBATIM** | — | 2 |
-| `rag_search`, `search_my_files` | `skills/personal_rag.py:124` | **VERBATIM** | yes | 2 |
-| `rag_search_quiet` | `skills/personal_rag.py:141` | neither | — | 2 |
-| `rag_reindex` | `skills/personal_rag.py:181` | **VERBATIM** | — | 2 |
-| `rag_status` | `skills/personal_rag.py:199` | **VERBATIM** | — | 2 |
-| `rag_configure` | `skills/personal_rag.py:218` | **VERBATIM** | — | 2 |
-| `rag_open_top` | `skills/personal_rag.py:253` | **VERBATIM** | yes | 2 |
-| `notify_phone`, `push_to_phone`, `text_my_phone` | `skills/phone_bridge.py:892` | **VERBATIM** | yes | 2 |
-| `phone_bridge_status`, `phone_status` | `skills/phone_bridge.py:925` | **VERBATIM** | — | 2 |
-| `list_phone_backends` | `skills/phone_bridge.py:957` | **VERBATIM** | — | 2 |
-| `pause_phone_bridge` | `skills/phone_bridge.py:979` | neither | — | 1 |
-| `resume_phone_bridge` | `skills/phone_bridge.py:984` | neither | — | 1 |
-| `print_companion_status` | `skills/proactive_print_companion.py:736` | **VERBATIM** | yes | 2 |
-| `print_companion_history` | `skills/proactive_print_companion.py:760` | neither | — | 1 |
-| `project_status` | `skills/project_status.py:215` | neither | yes | 2 |
-| `robot_status` | `skills/repo_robot.py:195` | **VERBATIM** | yes | 2 |
-| `robot_blocker` | `skills/repo_robot.py:234` | **VERBATIM** | yes | 1 |
-| `next_robot_step` | `skills/repo_robot.py:254` | **VERBATIM** | yes | 1 |
-| `schedule_cron`, `schedule_recurring` | `skills/schedule_manager.py:233` | **VERBATIM** | yes | 3 |
-| `schedule_once` | `skills/schedule_manager.py:329` | **VERBATIM** | yes | 1 |
-| `schedule_when`, `when_condition` | `skills/schedule_manager.py:358` | **VERBATIM** | yes | 1 |
-| `list_schedule`, `list_schedules`, `show_schedules` | `skills/schedule_manager.py:392` | **VERBATIM** | — | 0 |
-| `cancel_schedule`, `remove_schedule` | `skills/schedule_manager.py:407` | **VERBATIM** | — | 1 |
-| `fire_schedule`, `run_schedule` | `skills/schedule_manager.py:422` | **VERBATIM** | — | 1 |
-| `schedule_status` | `skills/schedule_manager.py:434` | **VERBATIM** | — | 1 |
-| `screen_watch_status` | `skills/screen_watch.py:323` | **VERBATIM** | yes | 2 |
-| `are_you_ok`, `self_diagnostic`, `system_check` | `skills/self_diagnostic.py:4288` | **VERBATIM** | — | 5 |
-| `what_is_broken`, `whats_broken` | `skills/self_diagnostic.py:4490` | **VERBATIM** | — | 3 |
-| `diagnostic_history` | `skills/self_diagnostic.py:4525` | **VERBATIM** | — | 2 |
-| `last_diagnostic_run` | `skills/self_diagnostic.py:4557` | **VERBATIM** | — | 2 |
-| `ecobee_request_pin` | `skills/sh_ecobee.py:332` | **VERBATIM** | — | 1 |
-| `ecobee_complete_setup` | `skills/sh_ecobee.py:347` | **VERBATIM** | — | 2 |
-| `ecobee_authorize` | `skills/sh_ecobee.py:385` | **VERBATIM** | — | 1 |
-| `ecobee_list_devices` | `skills/sh_ecobee.py:413` | *INFORMATIVE* | — | 1 |
-| `govee_list`, `govee_list_devices` | `skills/sh_govee.py:388` | *INFORMATIVE* | — | 1 |
-| `hue_retry_connect` | `skills/sh_hue.py:292` | **VERBATIM** | — | 1 |
-| `hue_list`, `hue_list_devices` | `skills/sh_hue.py:463` | *INFORMATIVE* | yes | 1 |
-| `hue_set_bridge_ip` | `skills/sh_hue.py:477` | neither | — | 1 |
-| `kasa_list`, `kasa_list_devices`, `tplink_list` | `skills/sh_kasa.py:501` | *INFORMATIVE* | — | 1 |
-| `lifx_list`, `lifx_list_devices` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | 1 |
-| `nest_authorize` | `skills/sh_nest.py:386` | **VERBATIM** | — | 1 |
-| `nest_list_devices` | `skills/sh_nest.py:409` | *INFORMATIVE* | — | 1 |
-| `ring_authorize` | `skills/sh_ring.py:332` | **VERBATIM** | — | 1 |
-| `ring_list_devices` | `skills/sh_ring.py:406` | *INFORMATIVE* | — | 1 |
-| `smart_life_list`, `tuya_list`, `tuya_list_devices` | `skills/sh_tuya.py:157` | *INFORMATIVE* | — | 1 |
-| `discover_smart_home`, `refresh_smart_home`, `smart_home_discover`, `smart_home_setup` | `skills/smart_home_discover.py:1406` | neither | — | 1 |
-| `list_smart_home_devices`, `smart_home_catalog` | `skills/smart_home_discover.py:1718` | **VERBATIM** | — | 2 |
-| `forget_alexa_login`, `smart_home_purge_cookie` | `skills/smart_home_discover.py:1734` | neither | — | 1 |
-| `last_gate_result`, `last_stability_gate`, `last_stability_gate_result` | `skills/stability_gate_status.py:56` | **VERBATIM** | — | 2 |
-| `audio_music_status` | `skills/standby_audio_detect.py:616` | **VERBATIM** | — | 2 |
-| `status_panel`, `suit_diagnostics`, `system_status` | `skills/status_panel.py:511` | **VERBATIM** | yes | 3 |
-| `suit_up`, `suit_up_sequence` | `skills/suit_up.py:361` | neither | yes | 2 |
-| `check_system` | `skills/system_monitor.py:249` | **VERBATIM** | yes | 3 |
-| `status_report`, `system_pulse` | `skills/system_pulse.py:729` | **VERBATIM** | yes | 5 |
-| `check_teams` | `skills/teams_nudge.py:293` | **VERBATIM** | yes | 4 |
-| `set_timer` | `skills/timer.py:364` | neither | yes | 11 |
-| `list_timers` | `skills/timer.py:401` | **VERBATIM** | — | 1 |
-| `cancel_timer` | `skills/timer.py:427` | **VERBATIM** | yes | 2 |
-| `calibrate_tv_region`, `tv_calibrate` | `skills/tv_detect.py:303` | **VERBATIM** | — | 1 |
-| `tv_detect_status`, `tv_status` | `skills/tv_detect.py:348` | **VERBATIM** | — | 2 |
-| `tv_detect_on` | `skills/tv_detect.py:381` | **VERBATIM** | yes | 1 |
-| `tv_detect_off` | `skills/tv_detect.py:399` | **VERBATIM** | — | 1 |
-| `list_voice_profiles` | `skills/voice_clone.py:123` | **VERBATIM** | yes | 1 |
-| `set_voice_profile`, `switch_voice_profile`, `use_voice_profile` | `skills/voice_clone.py:148` | **VERBATIM** | yes | 1 |
-| `voice_clone_status` | `skills/voice_clone.py:182` | **VERBATIM** | yes | 1 |
-| `disable_voice_clone`, `stop_voice_clone`, `voice_clone_off` | `skills/voice_clone.py:203` | **VERBATIM** | yes | 1 |
-| `wake_listener_start` | `skills/wake_listener.py:403` | neither | yes | 3 |
-| `wake_listener_stop` | `skills/wake_listener.py:420` | neither | — | 2 |
-| `wake_listener_status` | `skills/wake_listener.py:434` | **VERBATIM** | — | 2 |
-| `wake_listener_configure` | `skills/wake_listener.py:460` | neither | — | 1 |
-| `guest_mode_on` | `skills/wake_listener.py:528` | neither | — | 1 |
-| `guest_mode_off` | `skills/wake_listener.py:536` | neither | — | 1 |
-| `voice_gating_on` | `skills/wake_listener.py:543` | neither | — | 1 |
-| `voice_gating_off` | `skills/wake_listener.py:550` | neither | — | 1 |
-| `weather_briefing`, `weather_forecast` | `skills/weather_briefing.py:748` | **VERBATIM** | yes | 11 |
-| `web_interface_on` | `skills/web_interface.py:205` | **VERBATIM** | yes | 1 |
-| `web_interface_off` | `skills/web_interface.py:209` | **VERBATIM** | yes | 2 |
-| `web_interface_status` | `skills/web_interface.py:213` | **VERBATIM** | yes | 1 |
-| `weekly_digest_now` | `skills/weekly_digest_briefing.py:483` | neither | — | 1 |
-| `weekly_digest_status` | `skills/weekly_digest_briefing.py:501` | **VERBATIM** | yes | 3 |
-| `wellness_status` | `skills/wellness.py:331` | **VERBATIM** | yes | 1 |
-| `workshop_status` | `skills/workshop_mode.py:287` | **VERBATIM** | yes | 2 |
-| `youtube_direct`, `youtube_search_direct`, `yt_direct` | `skills/youtube_search.py:195` | **VERBATIM** | — | 2 |
+| `add_notification_rule` | `skills/notification_triage.py:1461` | **VERBATIM** | — | yes |
+| `air_control_off` | `skills/air_control.py:405` | **VERBATIM** | yes | yes |
+| `air_control_on` | `skills/air_control.py:385` | **VERBATIM** | yes | yes |
+| `air_control_status` | `skills/air_control.py:414` | **VERBATIM** | yes | yes |
+| `air_mouse_arm` | `skills/kinect_air_mouse.py:3596` | **VERBATIM** | yes | yes |
+| `air_mouse_disarm` | `skills/kinect_air_mouse.py:3622` | **VERBATIM** | yes | yes |
+| `air_mouse_off` | `skills/kinect_air_mouse.py:3555` | **VERBATIM** | — | yes |
+| `air_mouse_on` | `skills/kinect_air_mouse.py:3535` | **VERBATIM** | — | yes |
+| `air_mouse_status` | `skills/kinect_air_mouse.py:3575` | **VERBATIM** | — | yes |
+| `amazon_orders` | `skills/amazon_order_tracker.py:602` | *INFORMATIVE* | — | yes |
+| `amazon_tracking_status` | `skills/amazon_order_tracker.py:649` | **VERBATIM** | — | yes |
+| `ambient_audio_start` | `skills/ambient_listen.py:1884` | neither | — | yes |
+| `ambient_audio_stop` | `skills/ambient_listen.py:1910` | neither | — | yes |
+| `ambient_extract_now` | `skills/ambient_multimodal_extract.py:401` | neither | — | yes |
+| `ambient_extract_start` | `skills/ambient_multimodal_extract.py:348` | neither | — | yes |
+| `ambient_extract_status` | `skills/ambient_multimodal_extract.py:385` | **VERBATIM** | yes | yes |
+| `ambient_extract_stop` | `skills/ambient_multimodal_extract.py:364` | neither | — | yes |
+| `ambient_full_start` | `skills/ambient_listen.py:1975` | neither | — | yes |
+| `ambient_full_stop` | `skills/ambient_listen.py:1984` | neither | — | yes |
+| `ambient_learning_mode` | `bobert_companion.py:30521` | neither | — | yes |
+| `ambient_learning_mode_off` | `bobert_companion.py:30521` | neither | — | yes |
+| `ambient_learning_mode_on` | `bobert_companion.py:30521` | neither | — | yes |
+| `ambient_listen_start` | `skills/ambient_listen.py:1834` | neither | — | yes |
+| `ambient_listen_status` | `skills/ambient_listen.py:2004` | **VERBATIM** | yes | yes |
+| `ambient_listen_stop` | `skills/ambient_listen.py:1863` | neither | — | yes |
+| `ambient_listening` | `core/actions.py:4228` | neither | — | yes |
+| `ambient_mic_only` | `skills/ambient_listen.py:1992` | neither | — | yes |
+| `ambient_mode` | `core/actions.py:4228` | neither | — | yes |
+| `ambient_mode_off` | `core/actions.py:1478` | neither | — | yes |
+| `ambient_mode_on` | `core/actions.py:1478` | neither | — | yes |
+| `ambient_screen_start` | `skills/ambient_listen.py:1931` | neither | — | yes |
+| `ambient_screen_stop` | `skills/ambient_listen.py:1952` | neither | — | yes |
+| `anticipation_briefing_now` | `skills/anticipation_briefing.py:583` | neither | — | yes |
+| `anticipation_briefing_status` | `skills/anticipation_briefing.py:604` | **VERBATIM** | yes | yes |
+| `anticipation_status` | `skills/anticipation_engine.py:598` | **VERBATIM** | yes | yes |
+| `apple_music` | `core/actions.py:820` | neither | yes | yes |
+| `arc_reactor` | `skills/holographic_overlay/__init__.py:473` | neither | — | yes |
+| `arc_reactor_hud` | `skills/holographic_overlay/__init__.py:1533` | neither | — | yes |
+| `arc_reactor_off` | `skills/holographic_overlay/__init__.py:498` | neither | — | yes |
+| `arc_reactor_on` | `skills/holographic_overlay/__init__.py:493` | neither | — | yes |
+| `arc_reactor_pulse` | `skills/holographic_overlay/__init__.py:503` | neither | — | yes |
+| `arc_reactor_status` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
+| `arc_reactor_status_hud` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
+| `arc_reactor_status_off` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
+| `arc_reactor_status_on` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
+| `arc_reactor_status_status` | `skills/holographic_overlay/__init__.py:1680` | **VERBATIM** | yes | yes |
+| `arc_reactor_status_toggle` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
+| `archive_email` | `skills/email_triage.py:1214` | **VERBATIM** | — | yes |
+| `archive_message` | `skills/email_triage.py:1214` | **VERBATIM** | — | yes |
+| `are_you_ok` | `skills/self_diagnostic.py:4373` | **VERBATIM** | yes | yes |
+| `arrival_briefing` | `skills/morning_arrival.py:857` | neither | yes | yes |
+| `arrival_briefing_v2` | `skills/morning_arrival_v2.py:706` | neither | — | yes |
+| `audio_autoswitch_off` | `skills/audio_autoswitch.py:217` | **VERBATIM** | yes | no |
+| `audio_autoswitch_on` | `skills/audio_autoswitch.py:211` | **VERBATIM** | yes | no |
+| `audio_autoswitch_status` | `skills/audio_autoswitch.py:197` | **VERBATIM** | yes | yes |
+| `audio_devices` | `skills/audio_devices.py:314` | **VERBATIM** | yes | yes |
+| `audio_music_status` | `skills/standby_audio_detect.py:626` | **VERBATIM** | — | yes |
+| `bambu_camera` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
+| `bambu_camera_off` | `skills/holographic_overlay/__init__.py:1012` | neither | — | no |
+| `bambu_camera_on` | `skills/holographic_overlay/__init__.py:1005` | neither | — | no |
+| `bambu_camera_status` | `skills/holographic_overlay/__init__.py:1025` | **VERBATIM** | yes | yes |
+| `bambu_camera_toggle` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
+| `bambu_h2d_overlay` | `skills/holographic_overlay/__init__.py:779` | neither | — | yes |
+| `bambu_overlay` | `skills/holographic_overlay/__init__.py:779` | neither | — | yes |
+| `bambu_overlay_off` | `skills/holographic_overlay/__init__.py:772` | neither | — | yes |
+| `bambu_overlay_on` | `skills/holographic_overlay/__init__.py:765` | neither | — | yes |
+| `bambu_overlay_status` | `skills/holographic_overlay/__init__.py:785` | **VERBATIM** | — | yes |
+| `bambu_overlay_toggle` | `skills/holographic_overlay/__init__.py:779` | neither | — | yes |
+| `bambu_setup` | `skills/bambu_setup.py:538` | neither | — | yes |
+| `bandwidth_hogs` | `skills/network_deco.py:751` | **VERBATIM** | — | yes |
+| `banter_status` | `skills/banter.py:613` | **VERBATIM** | yes | yes |
+| `book_appointment` | `skills/browser_agent.py:683` | *INFORMATIVE* | yes | yes |
+| `browse_for` | `skills/browser_agent.py:714` | *INFORMATIVE* | yes | yes |
+| `browser_do` | `skills/browser_agent.py:671` | *INFORMATIVE* | — | yes |
+| `browser_open` | `skills/browser_agent.py:747` | neither | yes | yes |
+| `browser_reset_profile` | `skills/browser_agent.py:867` | neither | yes | yes |
+| `browser_run` | `skills/browser_agent.py:671` | *INFORMATIVE* | — | yes |
+| `browser_screenshot` | `skills/browser_agent.py:763` | neither | — | yes |
+| `browser_status` | `skills/browser_agent.py:808` | neither | yes | yes |
+| `browser_stop` | `skills/browser_agent.py:837` | neither | yes | yes |
+| `browser_task` | `skills/browser_agent.py:671` | *INFORMATIVE* | yes | yes |
+| `build_website` | `skills/site_builder.py:389` | **VERBATIM** | yes | yes |
+| `calendar_next` | `skills/ms_graph.py:796` | **VERBATIM** | — | yes |
+| `calendar_today` | `skills/ms_graph.py:796` | **VERBATIM** | yes | yes |
+| `calibrate_air_mouse` | `skills/kinect_air_mouse.py:3645` | **VERBATIM** | — | yes |
+| `calibrate_gaze` | `skills/face_tracker.py:1518` | **VERBATIM** | — | no |
+| `calibrate_pointing` | `skills/kinect_pointing.py:355` | **VERBATIM** | — | no |
+| `calibrate_tv_region` | `skills/tv_detect.py:306` | **VERBATIM** | — | yes |
+| `camera_hud` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
+| `camera_status` | `skills/camera_system.py:444` | **VERBATIM** | — | yes |
+| `camera_unquarantine` | `skills/camera_system.py:602` | **VERBATIM** | yes | yes |
+| `cancel_promise` | `core/memory.py:576` | **VERBATIM** | yes | yes |
+| `cancel_schedule` | `skills/schedule_manager.py:527` | **VERBATIM** | — | yes |
+| `cancel_timer` | `skills/timer.py:598` | **VERBATIM** | yes | yes |
+| `categorise_inbox` | `skills/email_triage.py:1223` | **VERBATIM** | — | yes |
+| `categorize_inbox` | `skills/email_triage.py:1223` | **VERBATIM** | — | yes |
+| `chappie_mode` | `core/actions.py:4228` | neither | — | yes |
+| `chappie_recall_entity` | `skills/chappie_consciousness.py:538` | **VERBATIM** | — | yes |
+| `chappie_recall_today` | `skills/chappie_consciousness.py:567` | **VERBATIM** | — | yes |
+| `chappie_status` | `skills/chappie_consciousness.py:609` | **VERBATIM** | — | yes |
+| `check_amazon_orders` | `skills/amazon_order_tracker.py:602` | *INFORMATIVE* | — | yes |
+| `check_budget` | `skills/disk_budget_watchdog.py:167` | **VERBATIM** | yes | yes |
+| `check_credits` | `skills/credits_monitor.py:245` | *INFORMATIVE* | yes | yes |
+| `check_for_updates` | `core/actions.py:2045` | **VERBATIM** | yes | yes |
+| `check_orders` | `skills/amazon_order_tracker.py:602` | *INFORMATIVE* | yes | yes |
+| `check_print` | `skills/bambu_monitor.py:1037` | *INFORMATIVE* | yes | yes |
+| `check_system` | `skills/system_monitor.py:274` | **VERBATIM** | yes | yes |
+| `check_teams` | `skills/teams_nudge.py:293` | **VERBATIM** | yes | yes |
+| `check_updates` | `core/actions.py:2045` | **VERBATIM** | — | yes |
+| `clear_llm_cache` | `core/actions.py:4221` | neither | — | yes |
+| `clear_tasks` | `core/actions.py:558` | neither | yes | yes |
+| `click` | `core/actions.py:1725` | neither | yes | yes |
+| `close_window` | `core/actions.py:1263` | neither | yes | yes |
+| `compare_models` | `core/actions.py:711` | **VERBATIM** | — | yes |
+| `compose_reply` | `skills/email_triage.py:1103` | *INFORMATIVE* | — | no |
+| `compute` | `skills/code_executor.py:395` | *INFORMATIVE* | — | yes |
+| `configure_printer` | `skills/bambu_setup.py:538` | neither | — | yes |
+| `confirm_pending_draft` | `skills/email_triage.py:1152` | **VERBATIM** | — | yes |
+| `control_device` | `core/smart_home_router.py:880` | **VERBATIM** | — | yes |
+| `control_light` | `core/smart_home_router.py:880` | neither | — | no |
+| `control_plug` | `core/smart_home_router.py:880` | neither | — | no |
+| `control_smart_home` | `core/smart_home_router.py:880` | **VERBATIM** | — | yes |
+| `create_skill` | `core/actions.py:3529` | neither | yes | no |
+| `current_mic` | `skills/audio_devices.py:303` | **VERBATIM** | yes | yes |
+| `current_model` | `skills/model_picker.py:454` | **VERBATIM** | yes | yes |
+| `current_speaker` | `skills/audio_devices.py:307` | **VERBATIM** | — | yes |
+| `daily_briefing` | `skills/daily_briefing.py:523` | neither | yes | yes |
+| `daily_recap` | `skills/daily_recap.py:756` | neither | yes | yes |
+| `deco_refresh` | `skills/network_deco.py:857` | **VERBATIM** | — | yes |
+| `deco_status` | `skills/network_deco.py:843` | **VERBATIM** | — | yes |
+| `deco_topology` | `skills/network_deco.py:827` | **VERBATIM** | — | yes |
+| `device_online` | `skills/network_deco.py:729` | **VERBATIM** | — | yes |
+| `diagnostic_daemon_status` | `core/diagnostic_daemons.py:1615` | **VERBATIM** | — | yes |
+| `diagnostic_history` | `skills/self_diagnostic.py:4610` | **VERBATIM** | — | yes |
+| `diagnostic_status` | `core/diagnostic_daemons.py:1615` | **VERBATIM** | — | yes |
+| `disable_guest_network` | `skills/network_deco.py:819` | neither | — | yes |
+| `disable_night_owl` | `skills/night_owl_mode.py:502` | neither | — | yes |
+| `disable_voice_clone` | `skills/voice_clone.py:208` | **VERBATIM** | yes | yes |
+| `discard_draft` | `skills/email_triage.py:1171` | **VERBATIM** | — | yes |
+| `discover_smart_home` | `skills/smart_home_discover.py:1406` | neither | — | yes |
+| `dismiss_holo` | `skills/holographic_overlay/__init__.py:339` | neither | — | yes |
+| `disney_plus` | `core/actions.py:368` | neither | yes | yes |
+| `do_not_disturb` | `skills/focus_mode.py:298` | **VERBATIM** | — | yes |
+| `do_you_recognize_me` | `skills/face_id.py:328` | **VERBATIM** | — | yes |
+| `dossier` | `skills/dossier.py:666` | neither | yes | yes |
+| `dossier_on` | `skills/dossier.py:666` | neither | — | yes |
+| `draft_preview_gate_status` | `skills/draft_preview_gate.py:227` | **VERBATIM** | — | yes |
+| `draft_reply` | `skills/email_triage.py:1103` | *INFORMATIVE* | — | yes |
+| `ecobee_authorize` | `skills/sh_ecobee.py:385` | **VERBATIM** | — | yes |
+| `ecobee_complete_setup` | `skills/sh_ecobee.py:347` | **VERBATIM** | — | yes |
+| `ecobee_list_devices` | `skills/sh_ecobee.py:413` | *INFORMATIVE* | — | yes |
+| `ecobee_request_pin` | `skills/sh_ecobee.py:332` | **VERBATIM** | — | yes |
+| `edit_pending_draft` | `skills/email_triage.py:1180` | **VERBATIM** | — | yes |
+| `email_briefing` | `skills/email_triage.py:1264` | **VERBATIM** | — | yes |
+| `email_triage_status` | `skills/email_triage.py:1308` | **VERBATIM** | — | yes |
+| `enable_guest_network` | `skills/network_deco.py:823` | neither | — | yes |
+| `enable_night_owl` | `skills/night_owl_mode.py:499` | neither | — | yes |
+| `end_focus_mode` | `skills/focus_mode.py:336` | **VERBATIM** | yes | yes |
+| `end_night_owl` | `skills/night_owl_mode.py:502` | neither | — | yes |
+| `enroll_face` | `skills/face_id.py:220` | **VERBATIM** | — | yes |
+| `enroll_voice` | `skills/enroll_voice.py:313` | **VERBATIM** | yes | yes |
+| `enroll_xtts_sample` | `skills/custom_voice.py:525` | neither | — | yes |
+| `enrolled_voices` | `skills/enroll_voice.py:360` | **VERBATIM** | — | yes |
+| `enter_ambient_learning` | `bobert_companion.py:30521` | neither | — | yes |
+| `eval_python` | `skills/code_executor.py:395` | *INFORMATIVE* | — | yes |
+| `evening_briefing` | `skills/evening_briefing.py:801` | neither | yes | yes |
+| `exit_ambient_learning` | `bobert_companion.py:30521` | neither | — | yes |
+| `exit_jarvis` | `core/actions.py:3945` | neither | — | yes |
+| `export_memory` | `core/actions.py:1647` | neither | yes | yes |
+| `face_id_status` | `skills/face_id.py:380` | **VERBATIM** | — | yes |
+| `face_track_status` | `skills/face_tracker.py:1425` | **VERBATIM** | — | yes |
+| `file_a_bug` | `core/actions.py:2055` | **VERBATIM** | — | yes |
+| `file_on` | `skills/dossier.py:666` | neither | — | yes |
+| `fill_form` | `skills/browser_agent.py:697` | *INFORMATIVE* | yes | yes |
+| `find_cheapest` | `skills/browser_agent.py:730` | *INFORMATIVE* | yes | yes |
+| `find_on_screen` | `core/actions.py:4206` | *INFORMATIVE* | yes | no |
+| `fire_schedule` | `skills/schedule_manager.py:542` | **VERBATIM** | — | yes |
+| `first_time_printer_setup` | `skills/bambu_setup.py:538` | neither | — | yes |
+| `focus_mode` | `skills/focus_mode.py:298` | **VERBATIM** | yes | yes |
+| `focus_mode_off` | `skills/focus_mode.py:336` | **VERBATIM** | yes | yes |
+| `focus_mode_on` | `skills/focus_mode.py:298` | **VERBATIM** | yes | yes |
+| `focus_mode_status` | `skills/dnd_focus_mode.py:587` | **VERBATIM** | — | yes |
+| `focus_window` | `core/actions.py:1212` | neither | — | yes |
+| `force_backup` | `core/actions.py:1822` | neither | — | yes |
+| `forget_alexa_login` | `skills/smart_home_discover.py:1738` | neither | — | yes |
+| `forget_face` | `skills/face_id.py:418` | **VERBATIM** | — | yes |
+| `forget_gaze_calibration` | `skills/face_tracker.py:1577` | **VERBATIM** | — | yes |
+| `forget_last_hour` | `core/actions.py:2179` | neither | yes | yes |
+| `forget_point_target` | `skills/kinect_pointing.py:423` | **VERBATIM** | — | yes |
+| `forget_voice` | `skills/enroll_voice.py:374` | **VERBATIM** | — | yes |
+| `full_power` | `skills/game_mode.py:2015` | **VERBATIM** | — | yes |
+| `game_mode_learn_this` | `skills/game_mode.py:2060` | **VERBATIM** | — | yes |
+| `game_mode_off` | `skills/game_mode.py:2015` | **VERBATIM** | — | yes |
+| `game_mode_on` | `skills/game_mode.py:1982` | **VERBATIM** | — | yes |
+| `game_mode_status` | `skills/game_mode.py:1927` | **VERBATIM** | — | yes |
+| `gate_status` | `?` | **VERBATIM** | — | yes |
+| `gaze_calibration_status` | `skills/face_tracker.py:1564` | **VERBATIM** | — | yes |
+| `gaze_stats` | `skills/face_tracker.py:1395` | **VERBATIM** | — | yes |
+| `gaze_status` | `skills/face_tracker.py:1367` | **VERBATIM** | — | yes |
+| `gaze_tracking_off` | `skills/face_tracker.py:1603` | **VERBATIM** | — | no |
+| `gaze_tracking_on` | `skills/face_tracker.py:1587` | **VERBATIM** | yes | no |
+| `generate_image` | `skills/image_gen.py:361` | **VERBATIM** | — | yes |
+| `gesture_status` | `skills/kinect_gestures.py:545` | **VERBATIM** | — | yes |
+| `gestures_off` | `skills/kinect_gestures.py:588` | **VERBATIM** | — | yes |
+| `gestures_on` | `skills/kinect_gestures.py:564` | **VERBATIM** | — | yes |
+| `get_time` | `core/actions.py:150` | *INFORMATIVE* | — | yes |
+| `give_me_the_cursor` | `skills/kinect_air_mouse.py:3596` | **VERBATIM** | — | yes |
+| `globe_clear` | `skills/globe.py:362` | neither | yes | yes |
+| `globe_pin` | `skills/globe.py:327` | neither | yes | yes |
+| `good_morning` | `skills/night_owl_mode.py:505` | **VERBATIM** | — | yes |
+| `govee_list` | `skills/sh_govee.py:388` | *INFORMATIVE* | — | yes |
+| `govee_list_devices` | `skills/sh_govee.py:388` | *INFORMATIVE* | — | no |
+| `gpu_status` | `skills/gpu_usage.py:218` | **VERBATIM** | — | yes |
+| `gpu_usage` | `skills/gpu_usage.py:218` | **VERBATIM** | yes | yes |
+| `greet_new_people_off` | `core/actions.py:1546` | neither | — | no |
+| `greet_new_people_on` | `core/actions.py:1546` | neither | — | no |
+| `guard_off` | `skills/guard_mode.py:685` | **VERBATIM** | — | yes |
+| `guard_on` | `skills/guard_mode.py:651` | **VERBATIM** | — | yes |
+| `guard_status` | `skills/guard_mode.py:702` | **VERBATIM** | — | yes |
+| `guest_mode_off` | `skills/wake_listener.py:536` | neither | — | yes |
+| `guest_mode_on` | `skills/wake_listener.py:528` | neither | — | yes |
+| `hand_mouse_off` | `skills/kinect_air_mouse.py:3622` | **VERBATIM** | — | yes |
+| `hand_mouse_on` | `skills/kinect_air_mouse.py:3596` | **VERBATIM** | — | yes |
+| `hardware_sensors` | `skills/hardware_sensors.py:20` | **VERBATIM** | yes | yes |
+| `headset_battery` | `skills/headset_status.py:370` | **VERBATIM** | yes | yes |
+| `headset_battery_level` | `skills/headset_status.py:370` | **VERBATIM** | — | yes |
+| `headset_on` | `skills/headset_status.py:347` | **VERBATIM** | — | yes |
+| `headset_status` | `skills/headset_status.py:347` | **VERBATIM** | yes | yes |
+| `hide_bambu_camera` | `skills/holographic_overlay/__init__.py:1012` | neither | — | no |
+| `hide_bambu_overlay` | `skills/holographic_overlay/__init__.py:772` | neither | — | yes |
+| `hide_globe` | `skills/globe.py:315` | neither | yes | yes |
+| `hide_holo` | `skills/holographic_overlay/__init__.py:339` | neither | — | yes |
+| `hide_holo_hud_v2` | `skills/holographic_overlay/__init__.py:1538` | neither | — | yes |
+| `hide_holographic_overlay` | `skills/holographic_overlay/__init__.py:339` | neither | — | yes |
+| `hide_hud` | `core/actions.py:391` | neither | — | yes |
+| `hide_hud_v2` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
+| `hide_printer_camera` | `skills/holographic_overlay/__init__.py:1012` | neither | — | no |
+| `hide_status_hud` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
+| `hide_status_ring_v2` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
+| `hide_workshop_hud` | `skills/holographic_overlay/__init__.py:1161` | neither | — | yes |
+| `hide_workshop_print_monitor` | `skills/holographic_overlay/__init__.py:1416` | neither | — | yes |
+| `holo_hud_v2` | `skills/holographic_overlay/__init__.py:1543` | neither | — | yes |
+| `holo_hud_v2_off` | `skills/holographic_overlay/__init__.py:1538` | neither | — | yes |
+| `holo_hud_v2_on` | `skills/holographic_overlay/__init__.py:1533` | neither | — | yes |
+| `holo_hud_v2_status` | `skills/holographic_overlay/__init__.py:1549` | **VERBATIM** | — | yes |
+| `holo_hud_v2_toggle` | `skills/holographic_overlay/__init__.py:1543` | neither | — | yes |
+| `holo_workshop` | `skills/holographic_overlay/__init__.py:493` | neither | — | yes |
+| `holo_workshop_canvas` | `skills/holographic_overlay/__init__.py:493` | neither | — | yes |
+| `holographic_hud_v2` | `skills/holographic_overlay/__init__.py:1543` | neither | — | yes |
+| `holographic_off` | `skills/holographic_overlay/__init__.py:339` | neither | — | yes |
+| `holographic_on` | `skills/holographic_overlay/__init__.py:334` | neither | — | yes |
+| `holographic_status` | `skills/holographic_overlay/__init__.py:350` | **VERBATIM** | yes | yes |
+| `hotkey` | `core/actions.py:1763` | neither | — | yes |
+| `how_is_the_print` | `skills/bambu_monitor.py:1072` | *INFORMATIVE* | yes | yes |
+| `how_much_battery_headset` | `skills/headset_status.py:370` | **VERBATIM** | — | yes |
+| `hud_off` | `skills/holographic_overlay/__init__.py:339` | neither | — | yes |
+| `hud_on` | `skills/holographic_overlay/__init__.py:334` | neither | — | yes |
+| `hud_v2` | `skills/holographic_overlay/__init__.py:1820` | neither | — | yes |
+| `hud_v2_off` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
+| `hud_v2_on` | `skills/holographic_overlay/__init__.py:1810` | neither | — | yes |
+| `hud_v2_toggle` | `skills/holographic_overlay/__init__.py:1820` | neither | — | yes |
+| `hue_list` | `skills/sh_hue.py:463` | *INFORMATIVE* | — | yes |
+| `hue_list_devices` | `skills/sh_hue.py:463` | *INFORMATIVE* | yes | no |
+| `hue_retry_connect` | `skills/sh_hue.py:292` | **VERBATIM** | — | yes |
+| `hue_set_bridge_ip` | `skills/sh_hue.py:477` | neither | — | yes |
+| `hulu` | `core/actions.py:372` | neither | yes | yes |
+| `identify_speaker` | `skills/enroll_voice.py:338` | **VERBATIM** | — | yes |
+| `inbox_briefing` | `skills/email_triage.py:1264` | **VERBATIM** | — | no |
+| `is_device_online` | `skills/network_deco.py:729` | **VERBATIM** | yes | yes |
+| `is_headset_on` | `skills/headset_status.py:347` | **VERBATIM** | — | yes |
+| `is_my_headset_on` | `skills/headset_status.py:347` | **VERBATIM** | — | yes |
+| `is_printer_online` | `skills/network_deco.py:709` | **VERBATIM** | yes | yes |
+| `is_there_an_update` | `core/actions.py:2045` | **VERBATIM** | — | yes |
+| `kasa_control` | `core/smart_home_router.py:880` | neither | — | no |
+| `kasa_list` | `skills/sh_kasa.py:501` | *INFORMATIVE* | — | yes |
+| `kasa_list_devices` | `skills/sh_kasa.py:501` | *INFORMATIVE* | — | no |
+| `keep_music_open` | `skills/itunes_library.py:343` | **VERBATIM** | yes | yes |
+| `kick_guest_network` | `skills/network_deco.py:819` | neither | yes | yes |
+| `kinect_look` | `skills/kinect_vision.py:181` | *INFORMATIVE* | — | yes |
+| `kinect_status` | `skills/kinect_vision.py:107` | **VERBATIM** | — | yes |
+| `last_diagnostic_run` | `skills/self_diagnostic.py:4642` | **VERBATIM** | — | yes |
+| `last_gate_result` | `skills/stability_gate_status.py:56` | **VERBATIM** | — | yes |
+| `last_screen` | `core/actions.py:3093` | *INFORMATIVE* | — | no |
+| `last_stability_gate` | `skills/stability_gate_status.py:56` | **VERBATIM** | — | yes |
+| `last_stability_gate_result` | `skills/stability_gate_status.py:56` | **VERBATIM** | — | yes |
+| `latency_benchmark` | `core/actions.py:2350` | neither | yes | yes |
+| `launch_app` | `core/actions.py:855` | neither | — | yes |
+| `learn_guest` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
+| `learn_my_face` | `skills/face_id.py:220` | **VERBATIM** | — | yes |
+| `learn_my_voice` | `skills/enroll_voice.py:313` | **VERBATIM** | — | yes |
+| `learn_their_face` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
+| `lifx_list` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |
+| `lifx_list_devices` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |
+| `list_emails` | `skills/email_triage.py:1059` | *INFORMATIVE* | — | no |
+| `list_enrolled_faces` | `skills/face_id.py:439` | **VERBATIM** | — | yes |
+| `list_enrolled_voices` | `skills/enroll_voice.py:360` | **VERBATIM** | — | yes |
+| `list_models` | `skills/model_picker.py:410` | **VERBATIM** | yes | yes |
+| `list_notification_rules` | `skills/notification_triage.py:1452` | **VERBATIM** | — | yes |
+| `list_pending_drafts` | `skills/email_triage.py:1204` | **VERBATIM** | — | yes |
+| `list_phone_backends` | `skills/phone_bridge.py:970` | **VERBATIM** | — | yes |
+| `list_playlists` | `skills/itunes_library.py:183` | **VERBATIM** | yes | yes |
+| `list_point_targets` | `skills/kinect_pointing.py:400` | **VERBATIM** | — | yes |
+| `list_promises` | `core/memory.py:556` | **VERBATIM** | yes | yes |
+| `list_recent_notifications` | `skills/notification_triage.py:1497` | *INFORMATIVE* | — | no |
+| `list_schedule` | `skills/schedule_manager.py:512` | **VERBATIM** | — | no |
+| `list_schedules` | `skills/schedule_manager.py:512` | **VERBATIM** | — | no |
+| `list_skills` | `core/actions.py:807` | *INFORMATIVE* | — | no |
+| `list_smart_home_devices` | `skills/smart_home_discover.py:1718` | **VERBATIM** | yes | yes |
+| `list_timers` | `skills/timer.py:583` | **VERBATIM** | — | yes |
+| `list_tts_backends` | `skills/custom_voice.py:515` | **VERBATIM** | — | yes |
+| `list_unread` | `skills/email_triage.py:1059` | *INFORMATIVE* | — | yes |
+| `list_voice_profiles` | `skills/voice_clone.py:128` | **VERBATIM** | yes | yes |
+| `list_wifi_clients` | `skills/network_deco.py:693` | *INFORMATIVE* | — | yes |
+| `list_windows` | `core/actions.py:1200` | *INFORMATIVE* | — | no |
+| `llm_costs` | `core/actions.py:711` | **VERBATIM** | — | yes |
+| `local_click_target_by_description` | `skills/local_vision.py:310` | neither | — | yes |
+| `local_describe_screen` | `skills/local_vision.py:121` | *INFORMATIVE* | yes | yes |
+| `log_a_bug` | `core/actions.py:2055` | **VERBATIM** | — | yes |
+| `look_around` | `skills/camera_system.py:856` | **VERBATIM** | — | yes |
+| `low_power_mode` | `skills/game_mode.py:1982` | **VERBATIM** | — | yes |
+| `make_picture` | `skills/image_gen.py:386` | **VERBATIM** | yes | yes |
+| `max` | `core/actions.py:376` | neither | yes | yes |
+| `mcp_call` | `skills/mcp_tools.py:189` | **VERBATIM** | yes | yes |
+| `mcp_list_tools` | `skills/mcp_tools.py:165` | **VERBATIM** | — | yes |
+| `mcp_reload` | `skills/mcp_tools.py:219` | **VERBATIM** | — | yes |
+| `mcp_status` | `skills/mcp_tools.py:148` | **VERBATIM** | — | yes |
+| `media_next` | `core/actions.py:219` | neither | — | yes |
+| `media_playpause` | `core/actions.py:237` | neither | — | yes |
+| `media_prev` | `core/actions.py:228` | neither | — | yes |
+| `minimize_window` | `core/actions.py:1245` | neither | yes | no |
+| `model_costs` | `core/actions.py:711` | **VERBATIM** | yes | yes |
+| `model_prices` | `core/actions.py:711` | **VERBATIM** | — | yes |
+| `morning_arrival` | `skills/morning_arrival.py:857` | neither | yes | yes |
+| `morning_arrival_v2` | `skills/morning_arrival_v2.py:706` | neither | — | yes |
+| `morning_briefing` | `skills/morning_briefing.py:448` | **VERBATIM** | yes | yes |
+| `morning_chain_pick` | `skills/morning_chain.py:419` | neither | — | yes |
+| `morning_handoff` | `skills/morning_handoff.py:736` | neither | yes | yes |
+| `morning_tabs` | `skills/_example_skill.py:13` | neither | — | no |
+| `mouse_control_off` | `skills/kinect_air_mouse.py:3622` | **VERBATIM** | — | yes |
+| `mouse_control_on` | `skills/kinect_air_mouse.py:3596` | **VERBATIM** | — | yes |
+| `move_window_to_monitor` | `core/actions.py:3467` | neither | yes | yes |
+| `ms_graph_calendar` | `skills/ms_graph.py:796` | **VERBATIM** | — | yes |
+| `music_aggregate` | `skills/apple_music_intel.py:902` | **VERBATIM** | — | yes |
+| `music_history` | `skills/apple_music_intel.py:857` | **VERBATIM** | yes | yes |
+| `music_status` | `core/actions.py:1089` | *INFORMATIVE* | yes | no |
+| `music_taste` | `skills/apple_music_intel.py:873` | **VERBATIM** | — | yes |
+| `nest_authorize` | `skills/sh_nest.py:386` | **VERBATIM** | — | yes |
+| `nest_list_devices` | `skills/sh_nest.py:409` | *INFORMATIVE* | — | yes |
+| `netflix` | `core/actions.py:360` | neither | yes | yes |
+| `network_clients` | `skills/network_deco.py:693` | *INFORMATIVE* | — | yes |
+| `network_topology` | `skills/network_deco.py:827` | *INFORMATIVE* | — | yes |
+| `network_usage` | `skills/network_deco.py:751` | **VERBATIM** | — | yes |
+| `news_briefing` | `skills/news_briefing.py:398` | neither | yes | yes |
+| `next_robot_step` | `skills/repo_robot.py:254` | **VERBATIM** | yes | yes |
+| `next_song` | `core/actions.py:1424` | *INFORMATIVE* | yes | yes |
+| `night_owl_mode` | `skills/night_owl_mode.py:499` | neither | yes | yes |
+| `night_owl_off` | `skills/night_owl_mode.py:502` | neither | yes | yes |
+| `night_owl_on` | `skills/night_owl_mode.py:499` | neither | — | yes |
+| `night_owl_status` | `skills/night_owl_mode.py:513` | **VERBATIM** | yes | yes |
+| `normal_power` | `skills/game_mode.py:2015` | **VERBATIM** | — | yes |
+| `notice_new_people` | `core/actions.py:1546` | neither | — | no |
+| `notification_triage_status` | `skills/notification_triage.py:1426` | **VERBATIM** | — | yes |
+| `notify_phone` | `skills/phone_bridge.py:905` | **VERBATIM** | yes | yes |
+| `now_playing` | `core/actions.py:999` | *INFORMATIVE* | — | yes |
+| `obs_pause_recording` | `skills/obs_control.py:155` | **VERBATIM** | — | yes |
+| `obs_start_recording` | `skills/obs_control.py:119` | **VERBATIM** | — | yes |
+| `obs_stop_recording` | `skills/obs_control.py:138` | **VERBATIM** | — | yes |
+| `obs_switch_scene` | `skills/obs_control.py:189` | **VERBATIM** | yes | yes |
+| `obs_toggle_mute` | `skills/obs_control.py:230` | **VERBATIM** | yes | yes |
+| `open_apple_music` | `core/actions.py:1061` | neither | yes | no |
+| `open_on_monitor` | `core/actions.py:3342` | neither | yes | yes |
+| `open_url` | `core/actions.py:102` | *INFORMATIVE* | — | yes |
+| `outbound_gate_status` | `skills/draft_preview_gate.py:227` | **VERBATIM** | yes | yes |
+| `pattern_aggregate` | `skills/pattern_learning.py:1109` | **VERBATIM** | — | yes |
+| `pattern_offer_now` | `skills/pattern_learning.py:1104` | **VERBATIM** | — | yes |
+| `pattern_predictions` | `skills/pattern_learning.py:1086` | **VERBATIM** | yes | yes |
+| `pattern_stats` | `skills/pattern_learning.py:1132` | **VERBATIM** | — | yes |
+| `pause_diagnostics` | `core/diagnostic_daemons.py:1607` | neither | — | yes |
+| `pause_music` | `core/actions.py:969` | *INFORMATIVE* | yes | yes |
+| `pause_notification_triage` | `skills/notification_triage.py:1515` | **VERBATIM** | — | yes |
+| `pause_phone_bridge` | `skills/phone_bridge.py:992` | neither | — | yes |
+| `pause_print` | `skills/bambu_print_announcer.py:509` | **VERBATIM** | — | yes |
+| `pending_drafts` | `skills/email_triage.py:1204` | **VERBATIM** | — | no |
+| `phone_bridge_status` | `skills/phone_bridge.py:938` | **VERBATIM** | — | yes |
+| `phone_status` | `skills/phone_bridge.py:938` | **VERBATIM** | — | yes |
+| `play_music` | `core/actions.py:2381` | *INFORMATIVE* | yes | yes |
+| `play_playlist` | `skills/itunes_library.py:136` | **VERBATIM** | yes | yes |
+| `play_streaming` | `core/actions.py:1699` | neither | — | yes |
+| `play_unheard` | `skills/apple_music_intel.py:671` | **VERBATIM** | yes | yes |
+| `play_vibe` | `skills/apple_music_intel.py:759` | **VERBATIM** | yes | yes |
+| `point_at` | `skills/kinect_pointing.py:436` | **VERBATIM** | — | no |
+| `point_calibrate` | `skills/kinect_pointing.py:355` | **VERBATIM** | — | yes |
+| `point_control` | `skills/kinect_pointing.py:436` | **VERBATIM** | — | yes |
+| `point_control_off` | `skills/kinect_pointing.py:536` | **VERBATIM** | — | yes |
+| `point_control_on` | `skills/kinect_pointing.py:518` | **VERBATIM** | — | yes |
+| `point_status` | `skills/kinect_pointing.py:491` | **VERBATIM** | — | yes |
+| `point_targets` | `skills/kinect_pointing.py:400` | **VERBATIM** | — | no |
+| `power_off_jarvis` | `core/actions.py:3945` | neither | — | yes |
+| `pre_draft_reply` | `skills/email_triage.py:1103` | *INFORMATIVE* | — | yes |
+| `predictive_morning_setup` | `skills/morning_handoff.py:744` | **VERBATIM** | yes | yes |
+| `press` | `core/actions.py:783` | neither | — | yes |
+| `previous_screen` | `core/actions.py:3093` | *INFORMATIVE* | — | no |
+| `previous_song` | `core/actions.py:1441` | *INFORMATIVE* | yes | yes |
+| `prime_video` | `core/actions.py:364` | neither | — | yes |
+| `print_camera` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
+| `print_companion_history` | `skills/proactive_print_companion.py:760` | neither | — | yes |
+| `print_companion_status` | `skills/proactive_print_companion.py:736` | **VERBATIM** | yes | yes |
+| `print_details` | `skills/bambu_monitor.py:1072` | *INFORMATIVE* | yes | yes |
+| `print_hud` | `skills/holographic_overlay/__init__.py:1423` | neither | — | yes |
+| `print_hud_off` | `skills/holographic_overlay/__init__.py:1416` | neither | — | yes |
+| `print_hud_on` | `skills/holographic_overlay/__init__.py:1409` | neither | — | yes |
+| `print_status` | `skills/bambu_h2d_voice_companion.py:492` | **VERBATIM** | — | yes |
+| `printer_cam` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
+| `printer_camera` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
+| `printer_online` | `skills/network_deco.py:709` | **VERBATIM** | — | yes |
+| `proactive_announcer_status` | `skills/bambu_print_announcer.py:533` | **VERBATIM** | — | yes |
+| `project_status` | `skills/project_status.py:215` | **VERBATIM** | yes | yes |
+| `pull_up_dossier` | `skills/dossier.py:666` | neither | — | yes |
+| `pull_up_file` | `skills/dossier.py:666` | neither | — | yes |
+| `pulse_hud` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
+| `pulse_hud_off` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
+| `pulse_hud_on` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
+| `push_to_phone` | `skills/phone_bridge.py:905` | **VERBATIM** | — | yes |
+| `python` | `skills/code_executor.py:395` | *INFORMATIVE* | — | yes |
+| `queue_task` | `core/actions.py:1178` | *INFORMATIVE* | yes | yes |
+| `quiet_mode` | `skills/focus_mode.py:298` | **VERBATIM** | — | yes |
+| `quit_jarvis` | `core/actions.py:3945` | neither | — | yes |
+| `rag_configure` | `skills/personal_rag.py:218` | **VERBATIM** | — | yes |
+| `rag_open_top` | `skills/personal_rag.py:253` | **VERBATIM** | yes | yes |
+| `rag_reindex` | `skills/personal_rag.py:181` | **VERBATIM** | — | yes |
+| `rag_search` | `skills/personal_rag.py:124` | **VERBATIM** | yes | yes |
+| `rag_search_quiet` | `skills/personal_rag.py:141` | neither | — | yes |
+| `rag_status` | `skills/personal_rag.py:199` | **VERBATIM** | — | yes |
+| `read_changelog` | `core/actions.py:3160` | **VERBATIM** | yes | yes |
+| `read_email` | `skills/email_triage.py:1082` | *INFORMATIVE* | — | yes |
+| `read_message` | `skills/email_triage.py:1082` | *INFORMATIVE* | — | no |
+| `read_thread` | `skills/email_triage.py:1082` | *INFORMATIVE* | — | yes |
+| `recall_screen` | `core/actions.py:3093` | *INFORMATIVE* | yes | no |
+| `recent_changes` | `core/actions.py:3160` | **VERBATIM** | — | yes |
+| `recent_deliveries` | `skills/amazon_order_tracker.py:629` | *INFORMATIVE* | — | yes |
+| `recent_delivery` | `skills/amazon_order_tracker.py:629` | *INFORMATIVE* | — | yes |
+| `recent_notifications_summary` | `skills/notification_triage.py:1497` | *INFORMATIVE* | yes | yes |
+| `recognize_face` | `skills/face_id.py:328` | **VERBATIM** | yes | yes |
+| `refresh_network` | `skills/network_deco.py:857` | **VERBATIM** | — | yes |
+| `refresh_smart_home` | `skills/smart_home_discover.py:1406` | neither | — | yes |
+| `refresh_smart_home_router` | `core/smart_home_router.py:1176` | neither | — | yes |
+| `release_the_cursor` | `skills/kinect_air_mouse.py:3622` | **VERBATIM** | — | yes |
+| `reload_skills` | `core/actions.py:1587` | neither | — | yes |
+| `remember_my_face` | `skills/face_id.py:220` | **VERBATIM** | — | yes |
+| `remember_their_face` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
+| `remember_this_person` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
+| `remove_notification_rule` | `skills/notification_triage.py:1483` | **VERBATIM** | — | yes |
+| `remove_schedule` | `skills/schedule_manager.py:527` | **VERBATIM** | — | yes |
+| `replay_last_action` | `core/actions.py:2572` | neither | — | yes |
+| `report_a_bug` | `core/actions.py:2055` | **VERBATIM** | — | yes |
+| `report_bug` | `core/actions.py:2055` | **VERBATIM** | yes | yes |
+| `reset_kernel` | `skills/code_executor.py:408` | neither | — | yes |
+| `reset_llm_cache` | `core/actions.py:4221` | neither | — | yes |
+| `reset_memory` | `core/actions.py:1874` | neither | yes | yes |
+| `restart` | `core/actions.py:622` | neither | — | yes |
+| `resume` | `core/wake_word.py:388` | **VERBATIM** | — | yes |
+| `resume_diagnostics` | `core/diagnostic_daemons.py:1611` | neither | — | yes |
+| `resume_music` | `core/actions.py:986` | *INFORMATIVE* | yes | yes |
+| `resume_notification_triage` | `skills/notification_triage.py:1519` | **VERBATIM** | — | yes |
+| `resume_phone_bridge` | `skills/phone_bridge.py:997` | neither | — | yes |
+| `resume_print` | `skills/bambu_print_announcer.py:521` | **VERBATIM** | — | yes |
+| `ring_authorize` | `skills/sh_ring.py:332` | **VERBATIM** | — | yes |
+| `ring_list_devices` | `skills/sh_ring.py:406` | *INFORMATIVE* | — | yes |
+| `robot_blocker` | `skills/repo_robot.py:234` | **VERBATIM** | yes | yes |
+| `robot_status` | `skills/repo_robot.py:195` | **VERBATIM** | yes | yes |
+| `run_diagnostic` | `core/actions.py:1668` | **VERBATIM** | — | yes |
+| `run_python` | `skills/code_executor.py:395` | *INFORMATIVE* | yes | yes |
+| `run_schedule` | `skills/schedule_manager.py:542` | **VERBATIM** | — | yes |
+| `run_shell` | `core/actions.py:2638` | neither | — | yes |
+| `run_smoke_test` | `core/actions.py:2088` | neither | — | yes |
+| `running_costs` | `core/actions.py:719` | **VERBATIM** | yes | yes |
+| `say_aloud` | `skills/schedule_manager.py:482` | neither | — | yes |
+| `scan_room` | `skills/kinect_vision.py:177` | **VERBATIM** | — | yes |
+| `schedule_cron` | `skills/schedule_manager.py:254` | **VERBATIM** | — | yes |
+| `schedule_once` | `skills/schedule_manager.py:375` | **VERBATIM** | yes | yes |
+| `schedule_recurring` | `skills/schedule_manager.py:254` | **VERBATIM** | yes | yes |
+| `schedule_status` | `skills/schedule_manager.py:554` | **VERBATIM** | — | yes |
+| `schedule_when` | `skills/schedule_manager.py:405` | **VERBATIM** | yes | yes |
+| `scrap_pending_draft` | `skills/email_triage.py:1171` | **VERBATIM** | — | yes |
+| `screen_history` | `core/actions.py:3093` | *INFORMATIVE* | — | no |
+| `screen_watch_status` | `skills/screen_watch.py:323` | **VERBATIM** | yes | yes |
+| `screenshot` | `core/actions.py:159` | *INFORMATIVE* | — | yes |
+| `scroll` | `core/actions.py:792` | neither | — | yes |
+| `search` | `core/actions.py:113` | neither | — | yes |
+| `search_my_files` | `skills/personal_rag.py:124` | **VERBATIM** | — | yes |
+| `see_screen` | `core/actions.py:2500` | *INFORMATIVE* | yes | yes |
+| `see_user` | `core/actions.py:2700` | *INFORMATIVE* | — | yes |
+| `self_diagnostic` | `skills/self_diagnostic.py:4373` | **VERBATIM** | — | yes |
+| `send_draft` | `skills/email_triage.py:1152` | **VERBATIM** | — | yes |
+| `send_pending_draft` | `skills/email_triage.py:1152` | **VERBATIM** | — | yes |
+| `session_memory_recall` | `core/actions.py:2969` | **VERBATIM** | yes | no |
+| `session_resume` | `core/actions.py:587` | neither | — | no |
+| `set_active_speaker` | `skills/enroll_voice.py:386` | **VERBATIM** | — | yes |
+| `set_brain` | `skills/model_picker.py:576` | **VERBATIM** | yes | yes |
+| `set_model` | `skills/model_picker.py:476` | **VERBATIM** | yes | yes |
+| `set_timer` | `skills/timer.py:544` | neither | yes | yes |
+| `set_tts_backend` | `skills/custom_voice.py:511` | neither | yes | yes |
+| `set_voice_profile` | `skills/voice_clone.py:153` | **VERBATIM** | yes | yes |
+| `set_volume` | `core/actions.py:328` | neither | yes | yes |
+| `setup_bambu` | `skills/bambu_setup.py:538` | neither | — | yes |
+| `setup_printer` | `skills/bambu_setup.py:538` | neither | — | yes |
+| `setup_workspace` | `skills/morning_handoff.py:744` | **VERBATIM** | — | yes |
+| `show_bambu_camera` | `skills/holographic_overlay/__init__.py:1005` | neither | — | no |
+| `show_bambu_overlay` | `skills/holographic_overlay/__init__.py:765` | neither | — | yes |
+| `show_changelog` | `core/actions.py:3160` | **VERBATIM** | — | yes |
+| `show_globe` | `skills/globe.py:298` | neither | yes | yes |
+| `show_holo` | `skills/holographic_overlay/__init__.py:334` | neither | — | yes |
+| `show_holo_hud_v2` | `skills/holographic_overlay/__init__.py:1533` | neither | — | yes |
+| `show_holographic_overlay` | `skills/holographic_overlay/__init__.py:334` | neither | — | yes |
+| `show_hud` | `core/actions.py:517` | neither | — | yes |
+| `show_hud_v2` | `skills/holographic_overlay/__init__.py:1810` | neither | — | yes |
+| `show_last_diagnostic` | `core/actions.py:1680` | **VERBATIM** | — | yes |
+| `show_llm_stats` | `core/actions.py:766` | **VERBATIM** | — | yes |
+| `show_print_camera` | `skills/holographic_overlay/__init__.py:1005` | neither | — | no |
+| `show_printer_camera` | `skills/holographic_overlay/__init__.py:1005` | neither | — | no |
+| `show_recent_facts` | `core/actions.py:1614` | **VERBATIM** | — | yes |
+| `show_schedules` | `skills/schedule_manager.py:512` | **VERBATIM** | — | no |
+| `show_status_hud` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
+| `show_status_ring_v2` | `skills/holographic_overlay/__init__.py:1810` | neither | — | yes |
+| `show_tasks` | `core/actions.py:1456` | *INFORMATIVE* | yes | yes |
+| `show_tray` | `bobert_companion.py:4696` | **VERBATIM** | — | yes |
+| `show_vram` | `skills/gpu_usage.py:218` | **VERBATIM** | — | yes |
+| `show_workshop_hud` | `skills/holographic_overlay/__init__.py:1156` | neither | — | yes |
+| `show_workshop_print_monitor` | `skills/holographic_overlay/__init__.py:1409` | neither | — | yes |
+| `shuffle_library` | `skills/itunes_library.py:210` | **VERBATIM** | yes | yes |
+| `shut_down` | `core/actions.py:3945` | neither | — | yes |
+| `shutdown_jarvis` | `core/actions.py:3945` | neither | — | yes |
+| `silent_learning` | `core/actions.py:4228` | neither | — | no |
+| `silent_learning_off` | `core/actions.py:1478` | neither | — | no |
+| `silent_learning_on` | `core/actions.py:1478` | neither | — | no |
+| `situational_awareness` | `skills/camera_system.py:651` | **VERBATIM** | — | yes |
+| `skip_track` | `skills/apple_music_intel.py:795` | **VERBATIM** | yes | yes |
+| `smart_home_catalog` | `skills/smart_home_discover.py:1718` | **VERBATIM** | — | yes |
+| `smart_home_control` | `core/smart_home_router.py:880` | **VERBATIM** | yes | yes |
+| `smart_home_devices` | `core/smart_home_router.py:1136` | **VERBATIM** | — | yes |
+| `smart_home_discover` | `skills/smart_home_discover.py:1406` | neither | — | yes |
+| `smart_home_list` | `core/smart_home_router.py:1136` | **VERBATIM** | — | yes |
+| `smart_home_purge_cookie` | `skills/smart_home_discover.py:1738` | neither | — | yes |
+| `smart_home_router_status` | `core/smart_home_router.py:1141` | **VERBATIM** | yes | yes |
+| `smart_home_setup` | `skills/smart_home_discover.py:1406` | neither | — | yes |
+| `smart_life_list` | `skills/sh_tuya.py:157` | *INFORMATIVE* | — | no |
+| `spotify` | `core/actions.py:380` | neither | yes | yes |
+| `stability_gate_status` | `?` | **VERBATIM** | — | yes |
+| `stark_status_ring` | `skills/holographic_overlay/__init__.py:1820` | neither | — | yes |
+| `stark_status_ring_off` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
+| `stark_status_ring_on` | `skills/holographic_overlay/__init__.py:1810` | neither | — | yes |
+| `stark_status_ring_status` | `skills/holographic_overlay/__init__.py:1826` | **VERBATIM** | yes | yes |
+| `stark_status_ring_toggle` | `skills/holographic_overlay/__init__.py:1820` | neither | — | yes |
+| `start_eavesdropping` | `core/actions.py:1478` | neither | — | no |
+| `start_overnight_upgrade` | `core/actions.py:3226` | neither | — | yes |
+| `status_hud` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
+| `status_hud_off` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
+| `status_hud_on` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
+| `status_panel` | `skills/status_panel.py:511` | **VERBATIM** | yes | yes |
+| `status_report` | `skills/system_pulse.py:729` | **VERBATIM** | — | yes |
+| `status_ring` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
+| `status_ring_off` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
+| `status_ring_on` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
+| `status_ring_v2` | `skills/holographic_overlay/__init__.py:1820` | neither | — | yes |
+| `status_ring_v2_off` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
+| `status_ring_v2_on` | `skills/holographic_overlay/__init__.py:1810` | neither | — | yes |
+| `stop_eavesdropping` | `core/actions.py:1478` | neither | — | yes |
+| `stop_greeting_people` | `core/actions.py:1546` | neither | — | no |
+| `stop_keeping_music_open` | `skills/itunes_library.py:379` | **VERBATIM** | yes | yes |
+| `stop_pipeline` | `core/actions.py:1791` | neither | — | yes |
+| `stop_voice_clone` | `skills/voice_clone.py:208` | **VERBATIM** | — | yes |
+| `suit_diagnostics` | `skills/status_panel.py:511` | **VERBATIM** | — | yes |
+| `suit_up` | `skills/suit_up.py:361` | neither | yes | yes |
+| `suit_up_sequence` | `skills/suit_up.py:361` | neither | — | yes |
+| `switch_llm` | `core/actions.py:4074` | neither | — | yes |
+| `switch_llm_picker` | `core/actions.py:701` | neither | — | no |
+| `switch_to_desk_mic` | `skills/audio_autoswitch.py:298` | **VERBATIM** | — | yes |
+| `switch_to_headset` | `skills/audio_autoswitch.py:222` | **VERBATIM** | — | no |
+| `switch_to_headset_mic` | `skills/audio_autoswitch.py:262` | **VERBATIM** | — | yes |
+| `switch_to_speakers` | `skills/audio_autoswitch.py:243` | **VERBATIM** | — | no |
+| `switch_voice_profile` | `skills/voice_clone.py:153` | **VERBATIM** | — | yes |
+| `system_check` | `skills/self_diagnostic.py:4373` | **VERBATIM** | yes | yes |
+| `system_pulse` | `skills/system_pulse.py:729` | **VERBATIM** | yes | yes |
+| `system_status` | `skills/status_panel.py:511` | **VERBATIM** | — | yes |
+| `take_the_cursor` | `skills/kinect_air_mouse.py:3596` | **VERBATIM** | — | yes |
+| `test_each_skill` | `core/actions.py:2131` | neither | yes | yes |
+| `test_mic` | `core/actions.py:544` | neither | yes | yes |
+| `test_tts` | `core/actions.py:548` | neither | yes | yes |
+| `test_vision` | `core/actions.py:552` | neither | yes | yes |
+| `text_my_phone` | `skills/phone_bridge.py:905` | **VERBATIM** | — | yes |
+| `toggle_holo` | `skills/holographic_overlay/__init__.py:344` | neither | — | yes |
+| `toggle_holographic_overlay` | `skills/holographic_overlay/__init__.py:344` | neither | — | yes |
+| `toggle_hud` | `core/actions.py:522` | neither | — | yes |
+| `tplink_list` | `skills/sh_kasa.py:501` | *INFORMATIVE* | — | no |
+| `triage_inbox` | `skills/email_triage.py:1223` | **VERBATIM** | — | yes |
+| `triage_status` | `skills/notification_triage.py:1426` | **VERBATIM** | — | yes |
+| `turn_off_jarvis` | `core/actions.py:3945` | neither | — | yes |
+| `tuya_list` | `skills/sh_tuya.py:157` | *INFORMATIVE* | — | yes |
+| `tuya_list_devices` | `skills/sh_tuya.py:157` | *INFORMATIVE* | — | no |
+| `tv_calibrate` | `skills/tv_detect.py:306` | **VERBATIM** | — | no |
+| `tv_detect_off` | `skills/tv_detect.py:402` | **VERBATIM** | — | yes |
+| `tv_detect_on` | `skills/tv_detect.py:384` | **VERBATIM** | yes | yes |
+| `tv_detect_status` | `skills/tv_detect.py:351` | **VERBATIM** | — | yes |
+| `tv_status` | `skills/tv_detect.py:351` | **VERBATIM** | — | yes |
+| `type` | `core/actions.py:1402` | neither | yes | yes |
+| `unread_email` | `skills/email_triage.py:1059` | *INFORMATIVE* | — | yes |
+| `unread_emails` | `skills/email_triage.py:1059` | *INFORMATIVE* | — | no |
+| `upgrade` | `core/actions.py:3619` | neither | — | yes |
+| `use_desk_mic` | `skills/audio_autoswitch.py:298` | **VERBATIM** | — | yes |
+| `use_headset` | `skills/audio_autoswitch.py:222` | **VERBATIM** | yes | yes |
+| `use_headset_mic` | `skills/audio_autoswitch.py:262` | **VERBATIM** | — | yes |
+| `use_speakers` | `skills/audio_autoswitch.py:243` | **VERBATIM** | yes | yes |
+| `use_voice_profile` | `skills/voice_clone.py:153` | **VERBATIM** | — | yes |
+| `version_info` | `core/actions.py:1960` | **VERBATIM** | — | yes |
+| `voice_clone_off` | `skills/voice_clone.py:208` | **VERBATIM** | — | yes |
+| `voice_clone_status` | `skills/voice_clone.py:187` | **VERBATIM** | yes | yes |
+| `voice_gating_off` | `skills/wake_listener.py:550` | neither | — | yes |
+| `voice_gating_on` | `skills/wake_listener.py:543` | neither | — | yes |
+| `voice_id_status` | `skills/enroll_voice.py:399` | **VERBATIM** | — | yes |
+| `volume_down` | `core/actions.py:255` | neither | yes | yes |
+| `volume_mute` | `core/actions.py:318` | neither | yes | yes |
+| `volume_unmute` | `core/actions.py:322` | neither | yes | yes |
+| `volume_up` | `core/actions.py:246` | neither | — | yes |
+| `vram_status` | `skills/gpu_usage.py:218` | **VERBATIM** | — | yes |
+| `vscode_command` | `skills/_example_skill.py:23` | neither | — | no |
+| `wake_listener_configure` | `skills/wake_listener.py:460` | neither | — | yes |
+| `wake_listener_start` | `skills/wake_listener.py:403` | neither | yes | yes |
+| `wake_listener_status` | `skills/wake_listener.py:434` | **VERBATIM** | — | yes |
+| `wake_listener_stop` | `skills/wake_listener.py:420` | neither | — | yes |
+| `wake_resume_answer_then_quiet` | `bobert_companion.py:30557` | neither | — | yes |
+| `wake_resume_stay_talkative` | `bobert_companion.py:30557` | neither | — | yes |
+| `wake_word_mode_off` | `bobert_companion.py:29031` | neither | — | yes |
+| `wake_word_mode_on` | `bobert_companion.py:29031` | neither | — | yes |
+| `wake_word_mode_status` | `bobert_companion.py:29081` | **VERBATIM** | — | yes |
+| `weather_briefing` | `skills/weather_briefing.py:748` | **VERBATIM** | yes | yes |
+| `weather_forecast` | `skills/weather_briefing.py:748` | **VERBATIM** | yes | yes |
+| `web_interface_off` | `skills/web_interface.py:209` | **VERBATIM** | yes | yes |
+| `web_interface_on` | `skills/web_interface.py:205` | **VERBATIM** | yes | yes |
+| `web_interface_status` | `skills/web_interface.py:213` | **VERBATIM** | yes | yes |
+| `web_search` | `core/actions.py:113` | *INFORMATIVE* | — | yes |
+| `weekly_digest` | `skills/pattern_learning.py:1118` | **VERBATIM** | — | yes |
+| `weekly_digest_now` | `skills/weekly_digest_briefing.py:483` | neither | — | yes |
+| `weekly_digest_status` | `skills/weekly_digest_briefing.py:501` | **VERBATIM** | yes | yes |
+| `wellness_status` | `skills/wellness.py:331` | **VERBATIM** | yes | yes |
+| `what_audio_devices` | `skills/audio_devices.py:314` | **VERBATIM** | — | yes |
+| `what_changed` | `core/actions.py:3160` | **VERBATIM** | — | yes |
+| `what_do_you_have_on` | `skills/dossier.py:666` | neither | — | yes |
+| `what_do_you_see_kinect` | `skills/kinect_vision.py:223` | *INFORMATIVE* | — | yes |
+| `what_is_broken` | `skills/self_diagnostic.py:4575` | **VERBATIM** | — | yes |
+| `what_mic` | `skills/audio_devices.py:303` | **VERBATIM** | — | yes |
+| `what_microphone` | `skills/audio_devices.py:303` | **VERBATIM** | yes | yes |
+| `what_speakers` | `skills/audio_devices.py:307` | **VERBATIM** | yes | yes |
+| `what_version` | `core/actions.py:1960` | **VERBATIM** | — | yes |
+| `whats_broken` | `skills/self_diagnostic.py:4575` | **VERBATIM** | — | yes |
+| `whats_loaded` | `skills/gpu_usage.py:218` | **VERBATIM** | — | yes |
+| `whats_missed` | `skills/focus_mode.py:379` | **VERBATIM** | yes | yes |
+| `whats_new` | `core/actions.py:3160` | **VERBATIM** | — | yes |
+| `whats_on_file` | `skills/dossier.py:666` | neither | — | yes |
+| `whats_using_bandwidth` | `skills/network_deco.py:751` | **VERBATIM** | — | yes |
+| `when_condition` | `skills/schedule_manager.py:405` | **VERBATIM** | — | yes |
+| `when_updated` | `core/actions.py:1960` | **VERBATIM** | — | yes |
+| `where_am_i` | `skills/camera_system.py:651` | **VERBATIM** | — | yes |
+| `where_is_user` | `core/actions.py:2425` | *INFORMATIVE* | — | no |
+| `which_mic_is_active` | `skills/audio_autoswitch.py:312` | **VERBATIM** | — | yes |
+| `which_microphone` | `skills/audio_devices.py:303` | **VERBATIM** | — | yes |
+| `which_monitor` | `core/actions.py:2786` | *INFORMATIVE* | — | yes |
+| `which_speakers` | `skills/audio_devices.py:307` | **VERBATIM** | — | yes |
+| `who_am_i` | `skills/face_id.py:328` | **VERBATIM** | — | yes |
+| `who_is_here` | `skills/kinect_vision.py:146` | **VERBATIM** | — | yes |
+| `who_is_on_the_wifi` | `skills/network_deco.py:693` | *INFORMATIVE* | — | yes |
+| `who_is_on_wifi` | `skills/network_deco.py:693` | *INFORMATIVE* | yes | yes |
+| `who_is_talking` | `skills/enroll_voice.py:338` | **VERBATIM** | — | yes |
+| `whoami` | `skills/face_id.py:328` | **VERBATIM** | — | yes |
+| `whos_at_the_desk` | `skills/face_id.py:328` | **VERBATIM** | — | yes |
+| `whos_talking` | `skills/enroll_voice.py:338` | **VERBATIM** | — | yes |
+| `workshop_canvas` | `skills/holographic_overlay/__init__.py:493` | neither | — | yes |
+| `workshop_hud` | `skills/holographic_overlay/__init__.py:1166` | neither | — | yes |
+| `workshop_hud_off` | `skills/holographic_overlay/__init__.py:1161` | neither | — | yes |
+| `workshop_hud_on` | `skills/holographic_overlay/__init__.py:1156` | neither | — | yes |
+| `workshop_hud_status` | `skills/holographic_overlay/__init__.py:1172` | **VERBATIM** | yes | yes |
+| `workshop_hud_toggle` | `skills/holographic_overlay/__init__.py:1166` | neither | — | yes |
+| `workshop_print_hud` | `skills/holographic_overlay/__init__.py:1423` | neither | — | yes |
+| `workshop_print_hud_off` | `skills/holographic_overlay/__init__.py:1416` | neither | — | yes |
+| `workshop_print_hud_on` | `skills/holographic_overlay/__init__.py:1409` | neither | — | yes |
+| `workshop_print_monitor` | `skills/holographic_overlay/__init__.py:1423` | neither | — | yes |
+| `workshop_print_monitor_off` | `skills/holographic_overlay/__init__.py:1416` | neither | — | yes |
+| `workshop_print_monitor_on` | `skills/holographic_overlay/__init__.py:1409` | neither | — | yes |
+| `workshop_print_monitor_status` | `skills/holographic_overlay/__init__.py:1429` | **VERBATIM** | — | yes |
+| `workshop_print_monitor_toggle` | `skills/holographic_overlay/__init__.py:1423` | neither | — | yes |
+| `workshop_status` | `skills/workshop_mode.py:287` | **VERBATIM** | yes | yes |
+| `workspace_setup` | `skills/morning_handoff.py:744` | **VERBATIM** | — | yes |
+| `youtube` | `core/actions.py:140` | neither | yes | yes |
+| `youtube_direct` | `skills/youtube_search.py:195` | **VERBATIM** | — | yes |
+| `youtube_play` | `core/actions.py:384` | neither | yes | yes |
+| `youtube_search_direct` | `skills/youtube_search.py:195` | **VERBATIM** | — | yes |
+| `yt_direct` | `skills/youtube_search.py:195` | **VERBATIM** | — | yes |

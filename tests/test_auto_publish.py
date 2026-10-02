@@ -292,6 +292,55 @@ class ScopedStageRealGitTests(unittest.TestCase):
             self.assertNotIn("transcript", s.lower())
 
 
+class ShippedGitignoreCoversPrivateLeftoversTests(unittest.TestCase):
+    """Audit P0-4 leftovers: `.gitignore` is the PRIMARY guard (`git status`
+    already omits ignored files, so _untracked_to_add never sees them), and it
+    did not name the owner's transcript-mining scratch (`_mine_*`), the voice
+    command test log (VOICE_COMMAND_TESTS.md) or nested Claude worktrees
+    (`.claude/worktrees/` was only in the owner's local .git/info/exclude, which
+    a fresh clone or CI does not have). Runs the REPO'S OWN .gitignore in a
+    throwaway repo, so no local exclude file can make it pass."""
+
+    LEAKS = ("_mine_transcripts.py", "_mine_commands.txt",
+             "tools/_mine_phrases.json", "VOICE_COMMAND_TESTS.md",
+             ".claude/worktrees/wt1/core/x.py")
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        if shutil.which("git") is None:
+            self.skipTest("git not on PATH")
+        self.tmp = tempfile.mkdtemp(prefix="auto_pub_ign_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        subprocess.run(["git", "init", "-q"], cwd=self.tmp, check=True,
+                       capture_output=True, text=True)
+        shutil.copyfile(os.path.join(auto_publish._ROOT, ".gitignore"),
+                        os.path.join(self.tmp, ".gitignore"))
+        for rel in self.LEAKS + ("core/new_feature.py",):
+            path = os.path.join(self.tmp, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("x\n")
+
+    def _runner(self):
+        root = self.tmp
+
+        def runner(cmd, **kw):
+            kw.pop("cwd", None)
+            return subprocess.run(cmd, cwd=root, **kw)
+        return runner
+
+    def test_private_leftovers_are_gitignored(self):
+        for rel in self.LEAKS:
+            with self.subTest(path=rel):
+                self.assertTrue(auto_publish._git_ignores(rel, self._runner()),
+                                "%s is not in the shipped .gitignore" % rel)
+
+    def test_only_the_real_source_file_would_be_staged(self):
+        added = auto_publish._untracked_to_add(self._runner())
+        self.assertEqual(sorted(added), [".gitignore", "core/new_feature.py"])
+
+
 class PushTests(unittest.TestCase):
     def test_push_success(self):
         self.assertTrue(auto_publish.push_branch("b", FakeRunner()))

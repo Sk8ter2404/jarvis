@@ -131,8 +131,8 @@ BARGE_IN_ENABLED = True
 
 # ─── Safety: hard confirmation keywords ────────────────────────────────
 # Actions matching these always require spoken confirmation ("yes" or
-# "confirm" as the next utterance) before executing. Set to [] to
-# disable (NOT recommended).
+# "confirm" as the next utterance) before executing. user_settings.json can
+# ADD keywords but never remove these (see _SAFETY_LIST_BASELINE, 2026-10-01).
 CONFIRM_KEYWORDS = ["purchase", "buy", "pay", "checkout", "delete", "format", "transfer"]
 
 
@@ -318,6 +318,12 @@ def model_route(function: str) -> str:
 #   the local VLM for ambient context. False by default (privacy).
 AMBIENT_LISTEN_ENABLED = False
 AMBIENT_SCREEN_ENABLED = False
+# AMBIENT_STT_YIELD — the ambient mic and system-audio daemons hold a batch
+#   back (instead of transcribing it) while you are speaking to JARVIS, so
+#   they never make your own transcription wait behind them; held batches are
+#   transcribed and kept, in order, once your sentence is done. False by
+#   default. Set via user_settings.json; applies on the next daemon start.
+AMBIENT_STT_YIELD = False
 
 # CHAPPIE_ENABLED — autostart the continuous self-learning daemon
 #   (skills/chappie_consciousness.py). False by default because the daemon
@@ -346,6 +352,12 @@ SCREENSHOT_PRIVACY_BLOCKLIST: list = []
 #   5.0 to match the daemon's prior DEEP_AUDIT_DEFAULT_BUDGET_USD.
 DAILY_BUDGET_USD      = 1.0
 DEEP_AUDIT_BUDGET_USD = 5.0
+
+# ELECTRICITY_RATE_PER_KWH — what the owner pays per kilowatt-hour, used by
+#   the running_costs action (core/running_costs.py) to turn the measured GPU
+#   draw + estimated CPU draw x hours running into an electricity ESTIMATE.
+#   A float so a user_settings.json override like 0.3 keeps its decimals.
+ELECTRICITY_RATE_PER_KWH = 0.14
 
 
 # ─── Sub-agent orchestrator (core/orchestrator.py) ─────────────────────
@@ -453,6 +465,27 @@ XTTS_LANGUAGE     = "en"         # ISO-639-1 hint for XTTS-v2
 # "2:30 p.m." or an ellipsis) -- see core/sentence_tts.py. Changes apply on
 # the next start.
 SENTENCE_TTS_ENABLED = True
+
+# ─── Kokoro engine speed (speed plan R4, core/kokoro_tts.py) ───────────
+# KOKORO_PERSISTENT_PHONEMIZER: phonemize every line on ONE espeak backend
+# built with the engine, instead of kokoro_onnx's stock call, which builds a
+# fresh backend per line (~115 ms) and leaves a copy of the espeak-ng dll in
+# %TEMP% each time. Phonemizing and rendering are each one-at-a-time; a
+# render that cannot start within the Kokoro synth timeout falls back to the
+# edge voice. Any error switches back to the stock call for the session.
+# KOKORO_RENDER_CACHE: keep finished renders in memory, keyed by a hash of
+# model, voice, language, speed and text (the text itself is never stored).
+#   'off'    → no cache (today's behaviour)
+#   'shadow' → fill the cache and log would-hit / would-miss, serve nothing
+#   'on'     → a repeated line plays from the cache instead of re-rendering
+# KOKORO_RENDER_CACHE_MB caps the memory (least recently used goes first);
+# KOKORO_RENDER_CACHE_PERSIST also keeps renders as .npy files under
+# data/tts_cache/ (same cap) so they survive a restart. All OFF until proven.
+# Changes apply on the next start.
+KOKORO_PERSISTENT_PHONEMIZER = False
+KOKORO_RENDER_CACHE          = "off"   # 'off' | 'shadow' | 'on'
+KOKORO_RENDER_CACHE_MB       = 64
+KOKORO_RENDER_CACHE_PERSIST  = False
 
 
 # ─── Local voice-cloning backend (Chatterbox) ──────────────────────────
@@ -758,6 +791,46 @@ PROCESSING_FILLER_STILL_DELAY = 12.0   # s of turn silence before stage 2
 # conversation history. Pushback / confirmation / hallucination replacements
 # are never touched. Changes apply on the next start.
 ANSWER_FIRST_ENABLED = True
+
+# ─── Turn-timing telemetry (speed plan R1, 2026-10-01) ────────────────────
+# Print-only fields on each turn's [turn-timing] line; neither changes what
+# JARVIS hears, says or when (field meanings: core/turn_timing.py).
+# TURN_TAIL_PROBE — measure where the owner's speech really ended: a Silero
+# speech detector (core/endpointing.py, its own ~2 MB CPU session) runs over
+# the last few seconds of each captured clip on a background thread and the
+# line gets tail_ms. Latches off for the session on the first failure (one
+# log line). TURN_PLAY_OPEN_PROBE — time the answer's first playback from
+# entering the playback body to the started stream (play_open_ms) and note
+# that stream's reported output latency (out_lat_ms). Set via
+# user_settings.json; apply on the next start.
+TURN_TAIL_PROBE = True
+TURN_PLAY_OPEN_PROBE = True
+
+# ─── Smart Turn end of turn (speed plan R7, 2026-10-02) ───────────────────
+# record_speech ends every turn after the same 21 silent chunks (1,344 ms),
+# finished sentence or mid-thought pause alike. Smart Turn v3.2 (an ~9 MB
+# audio model, pipecat-ai/smart-turn-v3) hears the capture's last 8 s and says
+# whether the owner has finished. core/endpointing.EotDecider asks it only in
+# a real pause — at least SMART_TURN_MIN_SILENCE_S of RMS silence, a Silero
+# silence run, and SMART_TURN_MIN_SPEECH_S of Silero speech so far — and a p
+# of SMART_TURN_THRESHOLD or more ends the turn there. The 21 chunks stay the
+# ceiling; Silero or Smart Turn missing, failing or too slow = today's turn.
+#   SMART_TURN_MODE   'off'    no models are loaded;
+#                     'shadow' the models run but nothing changes: the log
+#                              gets an [eot-shadow] line saying when Smart
+#                              Turn WOULD have ended the turn;
+#                     'on'     Smart Turn ends turns.
+#                     Env JARVIS_SMART_TURN, or user_settings.json.
+#   SMART_TURN_MODEL  the ONNX file (smart-turn-v3.2-cpu.onnx), kept OUTSIDE
+#                     the repo: never commit a model. Missing = Smart Turn
+#                     latched off (one log line), i.e. 'rms' turns.
+# Set via user_settings.json; applies on the next start.
+SMART_TURN_MODE = (os.getenv("JARVIS_SMART_TURN", "shadow").strip().lower()
+                   or "shadow")
+SMART_TURN_THRESHOLD = 0.7
+SMART_TURN_MIN_SILENCE_S = 0.256
+SMART_TURN_MIN_SPEECH_S = 1.0
+SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
 
 # ─── Deterministic fast paths (core/fast_paths.py + core/date_math.py) ──
 # When True, relative-date questions ("what's the date tomorrow", "how many
@@ -1090,6 +1163,12 @@ KINECT_POINT_CONTROL_ENABLED = False
 #   isn't tracked. See audio/kinect_bridge.get_hand_states() (grip) +
 #   skills/kinect_air_mouse.py (wiring) + hud/jarvis_air_cursor.py (overlay).
 KINECT_AIR_MOUSE_ENABLED = False
+# AIR_MOUSE_LL_HOOK_ENABLED — install the low-level mouse/keyboard hook the
+# air-mouse uses to tell real input from its own (skills/_air_mouse_yield.py).
+# OFF: a Python LL hook puts every input event on the PC behind this process's
+# GIL (~15.6 ms per event measured under JARVIS's load, 311 ms per 20-event
+# burst — games included). The GetLastInputInfo fallback does the job.
+AIR_MOUSE_LL_HOOK_ENABLED = False
 # ─── AIR-MOUSE SMART-ENGAGE knobs (2026-07, feat/smart-engage) ───────────────
 #   The owner's complaint: "hand tracking triggers when it shouldn't; I need a
 #   foolproof way to make it trigger every time I want it but with FEWER false
@@ -1409,6 +1488,12 @@ WEB_INTERFACE_ENABLED = False       # master switch — server only starts when 
 WEB_INTERFACE_PORT    = 8766        # TCP port (8443 is the AirTag tracker — do NOT reuse)
 WEB_INTERFACE_BIND    = "127.0.0.1" # bind address; non-local REQUIRES a token
 WEB_INTERFACE_TOKEN   = ""          # shared secret; MANDATORY for a non-local bind
+# DASHBOARD_SHOW_TRANSCRIPTS — the dashboard's "What JARVIS did" timeline shows
+# what was SAID on each turn (the owner's words, JARVIS's reply) only when this
+# is True AND the browser is on this PC (a loopback request). A LAN client never
+# gets the text, token or not. Off: the timeline shows times, sources, actions
+# and latencies only. Read at boot (applies on the next start).
+DASHBOARD_SHOW_TRANSCRIPTS = False
 
 # ── Retired overlays (all superseded by the unified HUD) ────────────────
 # Each of these used to auto-spawn its own frameless, non-movable widget.
@@ -1592,6 +1677,15 @@ ITUNES_AUTO_LAUNCH = False
 #   it never steals focus on a tick where the app is already up).
 APPLE_MUSIC_AUTOSTART = False
 APPLE_MUSIC_KEEP_OPEN = False
+
+# APPLE_MUSIC_PLAYLIST_LINKS — direct links for "play my X playlist", as
+# {"playlist name": "https://music.apple.com/..."}: the playlist page's address
+# (https://music.apple.com/library/playlist/p.XXXX) or its Share > Copy Link.
+# A named playlist opens straight on its own page, so nothing has to find its
+# tile on screen first. Names match case- and apostrophe-insensitively; only
+# https://music.apple.com/ links are used. Empty = the Library > Playlists
+# route (keyboard first, vision last).
+APPLE_MUSIC_PLAYLIST_LINKS: dict = {}
 
 
 # ─── Overnight self-improvement engine ─────────────────────────────────
@@ -1790,6 +1884,60 @@ def _report_user_settings_failure(path: str, why: str) -> None:
         pass
 
 
+# ── Safety lists: a saved file may ADD entries, never remove shipped ones ──
+# Audit P3-2, 2026-10-01. The list branch below REPLACES a list wholesale, so a
+# saved "CONFIRM_KEYWORDS": [] (a bad hand edit, a half-written file) made
+# bobert_companion._needs_confirmation return False for EVERY purchase, delete
+# and format — with nothing said. The shipped entries, captured HERE before the
+# apply at the bottom of this file, are a floor: a saved list is unioned onto
+# them, and a save that leaves one out (or isn't a list at all) is reported on
+# stderr and kept in _SAFETY_SETTINGS_WARNINGS for setup_logging to repeat into
+# the session log. Underscore-prefixed, so the apply loop can't override the
+# floor itself. SCREENSHOT_PRIVACY_BLOCKLIST ships empty (opt-in), so its floor
+# is empty today; the entries the owner adds still apply unchanged.
+_SAFETY_LIST_BASELINE = {
+    "CONFIRM_KEYWORDS": tuple(CONFIRM_KEYWORDS),
+    "SCREENSHOT_PRIVACY_BLOCKLIST": tuple(SCREENSHOT_PRIVACY_BLOCKLIST),
+}
+_SAFETY_SETTINGS_WARNINGS: list = []
+
+
+def _warn_safety_setting(msg: str) -> None:
+    _SAFETY_SETTINGS_WARNINGS.append(msg)
+    try:
+        import sys
+        print(f"[config] WARNING: {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _merge_safety_list(key: str, val, cur):
+    """The value `key` gets from a saved `val`: the shipped floor plus every
+    saved non-blank string not already in it (case-insensitive). A non-list
+    `val` keeps `cur`. Either way a save that would shrink the list is
+    reported, naming what it left out."""
+    base = list(_SAFETY_LIST_BASELINE[key])
+    if not isinstance(val, (list, tuple)):
+        _warn_safety_setting(
+            f"{key} in user_settings.json is a {type(val).__name__}, not a "
+            f"list — ignored; the built-in safety list stays in force.")
+        return cur
+    saved = [v for v in val if isinstance(v, str) and v.strip()]
+    seen = {b.strip().lower() for b in base}
+    merged = list(base)
+    for v in saved:
+        if v.strip().lower() not in seen:
+            seen.add(v.strip().lower())
+            merged.append(v)
+    wanted = {v.strip().lower() for v in saved}
+    left_out = [b for b in base if b.strip().lower() not in wanted]
+    if left_out:
+        _warn_safety_setting(
+            f"{key} in user_settings.json leaves out {', '.join(left_out)} — "
+            f"built-in safety entries can't be removed, so they stay on.")
+    return type(cur)(merged) if isinstance(cur, (list, tuple)) else merged
+
+
 # Safe + best-effort (the second import-time I/O in this file, after
 # RAG_INDEX_PATHS): we override ONLY a constant that already exists here — so the
 # GUI's schema, which is curated FROM this file, is the allow-list — coerce to
@@ -1799,6 +1947,7 @@ def _report_user_settings_failure(path: str, why: str) -> None:
 def _apply_user_settings() -> None:
     global _USER_SETTINGS_ERROR
     _USER_SETTINGS_ERROR = None
+    _SAFETY_SETTINGS_WARNINGS[:] = []
     path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "data", "user_settings.json")
@@ -1832,6 +1981,15 @@ def _apply_user_settings() -> None:
         if key.startswith("_") or key not in g or key in _ENV_ONLY_KEYS:
             continue          # existing public, non-secret constants only
         cur = g[key]
+        if key in _SAFETY_LIST_BASELINE:
+            # Inside a try like every other key: this runs at import, so a
+            # raise here would stop core.config importing and JARVIS booting.
+            # On any error the shipped list stays (2026-10-02 review).
+            try:
+                g[key] = _merge_safety_list(key, val, cur)
+            except Exception:
+                pass
+            continue
         # int|None knobs (current value None or a non-bool int) — e.g.
         # MICROPHONE_INDEX / SPEAKER_INDEX — accept an explicit null/blank as
         # "clear to None" (auto / system-default lookup). A None DEFAULT carries

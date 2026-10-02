@@ -837,8 +837,21 @@ class InjectHelperTests(unittest.TestCase):
             wi.inject_command("ok", p)
             with open(p, encoding="utf-8") as f:
                 items = json.load(f)
-            self.assertEqual(items, [{"text": items[0]["text"], "ts": items[0]["ts"]}])
+            self.assertEqual(items, [{"text": items[0]["text"], "ts": items[0]["ts"],
+                                      "source": "web"}])
             self.assertEqual(items[0]["text"], "ok")
+
+    def test_inject_is_marked_as_the_web_pages(self):
+        """2026-10-02: "source": "web" makes the main loop log the turn as
+        "[inject] (web) ..." - how the dashboard timeline tells a dashboard
+        turn from any other typed one. Not "test": it is still the owner."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "injected_commands.json")
+            wi.inject_command("open the marble door", p)
+            with open(p, encoding="utf-8") as f:
+                items = json.load(f)
+            self.assertEqual(items[0]["source"], "web")
+            self.assertEqual(items[0]["source"], wi.WEB_INJECT_SOURCE)
 
 
 class SecurityBindTests(unittest.TestCase):

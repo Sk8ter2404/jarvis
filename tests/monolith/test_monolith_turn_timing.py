@@ -727,9 +727,12 @@ class WiringTests(_Base):
     def test_record_speech_notes_the_vad_break(self):
         src = inspect.getsource(self.bc.record_speech)
         brk = src.index('_prof("vad_break")')
-        self.assertLess(brk, src.index('_tt("note_vad_break")'))
-        self.assertLess(src.index('_tt("note_vad_break")'),
-                        src.index(" break\n", brk))
+        note = ('_tt("note_vad_break",\n'
+                '                            _capture_lag_ms(audio_q, '
+                '_record_stream, CHUNK))')
+        self.assertLess(brk, src.index(note))
+        self.assertLess(src.index(note), src.index(" break\n", brk))
+        self.assertEqual(src.count("note_vad_break"), 1)
 
     def test_filler_play_is_noted(self):
         src = inspect.getsource(self.bc._filler_play)
@@ -740,6 +743,860 @@ class WiringTests(_Base):
         src = inspect.getsource(self.bc._run_llm_dispatch_body)
         self.assertLess(src.index('_tt("followup_round")'),
                         src.index("followup = get_followup_response("))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Speed plan R1 (2026-10-01): the new fields through the REAL monolith paths
+# ════════════════════════════════════════════════════════════════════════════
+_R1_RESERVED = ("stt_engine", "eot", "st_p", "st_n", "pre", "cut",
+                "amb_deferred", "cache")
+
+
+class _FakeVad:
+    """Stands in for the Silero tail detector (bc._tail_vad)."""
+
+    def __init__(self, tail=1410, gate=None, failed=""):
+        self.tail = tail
+        self.gate = gate
+        self.failed = failed
+        self.clips = []
+
+    def speech_tail_ms(self, clip, sr):
+        self.clips.append((clip, sr))
+        if self.gate is not None:
+            self.gate.wait(5)
+        return self.tail
+
+
+class _SlowLock:
+    """_stt_lock stand-in: acquiring it 'takes' `wait_s` on the fake clock
+    (an ambient decode held Whisper), then behaves like an RLock."""
+
+    def __init__(self, clock, wait_s):
+        import threading as _th
+        self._clock = clock
+        self._wait = wait_s
+        self._lock = _th.RLock()
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._clock.advance(self._wait)
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        return False
+
+
+def _join_probe(bc):
+    th = bc._tail_probe_state.get("thread")
+    if th is not None:
+        th.join(5)
+
+
+class R1TurnLineTests(TurnLineTests):
+    """The TurnLineTests rig (fake clock, real capture -> dispatch -> _speak)
+    with the R1 seams faked: the Silero detector, the Whisper body and the
+    _stt_lock wait."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        import numpy as np
+        self.np = np
+        self.vad = _FakeVad()
+        self._p(bc, "_tail_vad", self.vad)
+        # A probe left running by an earlier test must not make this
+        # capture skip its own (one probe in flight at a time).
+        self._p(bc, "_tail_probe_state",
+                {"thread": None, "off_logged": False})
+        self._p(bc, "_mic_muted", [False])
+        self._p(bc, "_get_realtime_session", return_value=None)
+        self._p(bc, "resume_face_tracking")
+        self._p(bc, "_audio_music_feed")
+        self._p(bc, "apply_capture_auto_gain",
+                side_effect=lambda a, p: (a, 1.0))
+        self.stt_threads = []
+
+        def stt_impl(audio):
+            self.stt_threads.append(threading.current_thread().name)
+            self.clock.advance(_STT_S)
+            return ("what time is it",
+                    {"no_speech_prob": 0.0, "avg_logprob": -0.1})
+
+        self._p(bc, "_transcribe_impl", side_effect=stt_impl)
+        self._p(bc, "_stt_lock", _SlowLock(self.clock, 0.500))
+        self.audio = np.full(2 * bc.SAMPLE_RATE, 0.01, dtype=np.float32)
+
+        def fake_record(timeout=None, **_kw):
+            bc._tt("note_vad_break")
+            return self.audio
+
+        self._p(bc, "record_speech", side_effect=fake_record)
+
+    def _voice_turn(self, join_probe=True):
+        bc = self.bc
+        bc._tt_loop_top(None)
+        text, conf = self._quiet(bc._capture_utterance, None, {})
+        self.assertEqual(text, "what time is it")
+        if join_probe:
+            _join_probe(bc)
+        bc._tt("mark", "you")
+        self._quiet(bc._run_llm_dispatch, text, voice=True)
+        return self._line()
+
+    def test_voice_turn_line_has_clip_tail_and_stt_wait(self):
+        d = self._voice_turn()
+        self.assertEqual(d["clip_ms"], "2000")
+        self.assertEqual(d["tail_ms"], "1410")
+        # The lock "took" 500 ms, + the one 10 ms clock read after it.
+        self.assertEqual(d["stt_wait_ms"], "510")
+        self.assertEqual((d["load_ms"], d["total_ms"]), ("13", "3512"))
+        for k in _R1_RESERVED:
+            self.assertEqual(d[k], "-", k)
+        # The detector got a COPY of the clip Whisper decoded, at 16 kHz.
+        clip, sr = self.vad.clips[0]
+        self.assertEqual(sr, 16000)
+        self.assertFalse(self.np.shares_memory(clip, self.audio),
+                         "the probe must work on a copy, never a view")
+        self.np.testing.assert_array_equal(clip, self.audio)
+        self.assertEqual(self.stt_threads, [self.owner.name])
+
+    def test_line_order_and_one_line_per_turn(self):
+        self._voice_turn()
+        keys = [tok.split("=")[0] for tok in
+                self.lines[0].split("[turn-timing]")[1].split()]
+        self.assertEqual(keys, ["kind", "outcome", *self.tt.MARKS, "end",
+                                *self.tt.STAT_FIELDS])
+        self.bc._tt("emit", "error")        # the loop's error net
+        self.assertEqual(len(self.lines), 1)
+
+    def test_a_tail_not_ready_by_the_line_prints_dash(self):
+        gate = threading.Event()
+        self.vad.gate = gate
+        self.addCleanup(gate.set)
+        d = self._voice_turn(join_probe=False)
+        self.assertEqual(d["tail_ms"], "-")
+        self.assertEqual(d["clip_ms"], "2000")
+        gate.set()
+        _join_probe(self.bc)
+
+    def test_the_transcript_is_unchanged_by_the_probe(self):
+        bc = self.bc
+        with_probe = self._quiet(bc._transcribe_capture, self.audio)
+        _join_probe(bc)
+        self._p(bc, "TURN_TAIL_PROBE", False)
+        without = self._quiet(bc._transcribe_capture, self.audio)
+        self.assertEqual(with_probe, without)
+
+    def test_another_threads_stt_wait_is_not_on_the_line(self):
+        bc = self.bc
+        bc._tt_loop_top("typed")
+        bc._tt("mark", "you")
+        th = threading.Thread(target=lambda: bc.transcribe(self.audio),
+                              name="ambient-listen")
+        th.start()
+        th.join(5)
+        self.assertEqual(self.stt_threads, ["ambient-listen"])
+        self.assertEqual(self.tt.parse_line(bc._tt("emit"))["stt_wait_ms"],
+                         "-")
+        bc._tt_loop_top("typed")
+        bc._tt("mark", "you")
+        bc.transcribe(self.audio)            # the owner's own decode
+        self.assertEqual(self.tt.parse_line(bc._tt("emit"))["stt_wait_ms"],
+                         "510")
+
+    def test_injected_turn_has_llm_load_and_total_only(self):
+        self._inject_turn()
+        d = self._line()
+        self.assertEqual((d["load_ms"], d["total_ms"]), ("13", "3512"))
+        for k in ("tail_ms", "clip_ms", "stt_wait_ms", "play_open_ms",
+                  "filler_clip_ms") + _R1_RESERVED:
+            self.assertEqual(d[k], "-", k)
+
+    def test_filler_clip_ms_is_the_first_clips_length(self):
+        bc = self.bc
+        np = self.np
+        clips = mock.Mock()
+        clips.available.return_value = ["Processing, sir."]
+        clips.get.side_effect = [(np.zeros(50880, dtype=np.float32), 24000),
+                                 (np.zeros(12000, dtype=np.float32), 24000)]
+        self._p(bc, "_filler_clips", clips)
+        self._p(bc, "_filler_suppressed", return_value=None)
+        bc._processing_filler.claim.return_value = "ok"
+        self.timing.begin("voice")
+        # The filler plays on its own thread: any-thread field.
+        for stage in (1, 2):
+            th = threading.Thread(target=lambda s=stage: self._quiet(
+                bc._filler_play, object(), s), name="processing-filler")
+            th.start()
+            th.join(5)
+        d = self.tt.parse_line(self.timing.emit())
+        self.assertEqual((d["filler"], d["filler_clip_ms"]), ("2", "2120"))
+
+    def test_timing_faults_in_the_probe_never_break_the_turn(self):
+        bc = self.bc
+
+        class Exploding:
+            def __getattr__(self, name):
+                raise RuntimeError("vad exploded")
+
+        self._p(bc, "_tail_vad", Exploding())
+        self._p(bc._tt_mod.TurnTiming, "note_stat",
+                side_effect=RuntimeError("note_stat exploded"))
+        d = self._voice_turn()
+        self.assertEqual(d["kind"], "voice")
+        self.assertEqual(self.played, [24000])
+
+
+for _name in [n for n in vars(TurnLineTests) if n.startswith("test_")]:
+    setattr(R1TurnLineTests, _name, None)
+del _name
+
+
+@requires_monolith
+class R1StandbyWakeTests(_Base):
+    """A standby wake that carries a command transcribes BEFORE its turn
+    begins (_handle_sleep_standby, then begin_voice): the turn must still
+    get that capture's clip / tail / lock-wait fields."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        import numpy as np
+        from core import turn_timing as tt
+        from core.followup_window import FollowupWindow
+        self.tt = tt
+        self.lines = []
+        self.clock = _Clock()
+        self._p(bc, "_turn_timing",
+                tt.TurnTiming(print_fn=self.lines.append, clock=self.clock))
+        for name in ("_mic_muted", "_sleep_mode", "_standby_mode"):
+            cell = getattr(bc, name)
+            saved = cell[0]
+            self.addCleanup(cell.__setitem__, 0, saved)
+        bc._mic_muted[0] = False
+        bc._sleep_mode[0] = True
+        bc._standby_mode[0] = True
+        self._p(bc, "_speak")
+        self._p(bc, "_speak_pending", return_value=False)
+        self._p(bc, "set_state")
+        self._p(bc, "_heartbeat")
+        self._p(bc, "context_aware_greeting", return_value=("Yes, sir?", 1.0))
+        self._p(bc, "OVERNIGHT_FLAG_FILE",
+                os.path.join(tempfile.gettempdir(), "jarvis_r1_no_flag"))
+        self._p(bc, "_learn_gate_note_wake")
+        self._p(bc, "_standby_wake_detected", return_value=None)
+        self._p(bc, "_audio_music_should_refuse_wake", return_value=False)
+        self._p(bc, "_audio_music_feed")
+        self._p(bc, "_device_speech_ignored", return_value=False)
+        self._p(bc, "_dialogue_hold_ignored", return_value=False)
+        self._p(bc, "_self_echo_ignored", return_value=False)
+        self._p(bc, "_followup_window", FollowupWindow(0))
+        self._p(bc, "_require_wake_runtime", True)
+        self._p(bc, "_ambient_learning_feed")
+        self._p(bc, "apply_capture_auto_gain",
+                side_effect=lambda a, p: (a, 1.0))
+        self.vad = _FakeVad(tail=1290)
+        self._p(bc, "_tail_vad", self.vad)
+        # A probe left running by an earlier test must not make this
+        # capture skip its own (one probe in flight at a time).
+        self._p(bc, "_tail_probe_state",
+                {"thread": None, "off_logged": False})
+        self._p(bc, "_stt_lock", _SlowLock(self.clock, 0.250))
+        self._p(bc, "_transcribe_impl", return_value=(
+            "Jarvis, what time is it?",
+            {"no_speech_prob": 0.0, "avg_logprob": -0.2}))
+        self.audio = np.zeros(int(1.5 * bc.SAMPLE_RATE), dtype=np.float32)
+
+        def fake_record(timeout=None, **_kw):
+            bc._tt("note_vad_break")
+            return self.audio
+
+        self._p(bc, "record_speech", side_effect=fake_record)
+
+    def test_the_carried_command_turn_gets_its_capture_fields(self):
+        bc = self.bc
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = bc._handle_sleep_standby(None)
+        self.assertEqual(out[0], "Jarvis, what time is it?")
+        _join_probe(bc)
+        bc._tt("mark", "you")
+        d = self.tt.parse_line(bc._tt("emit"))
+        self.assertEqual((d["kind"], d["vad_break"]), ("voice", "0"))
+        self.assertEqual((d["clip_ms"], d["tail_ms"], d["stt_wait_ms"]),
+                         ("1500", "1290", "260"))
+
+    def test_a_standby_capture_that_wakes_nothing_leaves_no_turn(self):
+        bc = self.bc
+        bc._transcribe_impl.return_value = ("just the telly", {})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(bc._handle_sleep_standby(None))
+        _join_probe(bc)
+        self.assertIsNone(bc._tt("emit"))
+        # ...and the next turn does not inherit that capture's values.
+        bc._tt_loop_top("typed")
+        bc._tt("mark", "you")
+        d = self.tt.parse_line(bc._tt("emit"))
+        self.assertEqual((d["clip_ms"], d["tail_ms"]), ("-", "-"))
+
+
+@requires_monolith
+class R1PlaybackOpenTests(_Base):
+    """play_open_ms through the REAL play_with_lipsync body (fake sd, fake
+    stream): from just before the duck to sd.play() returning."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        from core import turn_timing as tt
+        self.tt = tt
+        self.lines = []
+        self.clock = _Clock()
+        self.timing = tt.TurnTiming(print_fn=self.lines.append,
+                                    clock=self.clock)
+        self._p(bc, "_turn_timing", self.timing)
+        self.stream = mock.Mock()
+        self.stream.active = False
+        self.sd = mock.Mock()
+        self.sd.get_stream.return_value = self.stream
+        layer = mock.Mock()
+        layer.is_muted.return_value = False
+        ducker = mock.Mock()
+        ducker.duck.side_effect = lambda: self.clock.advance(0.200)
+        self.ducker = ducker
+        for name, val in (("sd", self.sd), ("_tts_layer", layer),
+                          ("_audio_ducker", ducker),
+                          ("BARGE_IN_ENABLED", False),
+                          ("ROBOT_ENABLED", False), ("send", mock.Mock())):
+            self._p(bc, name, val)
+        self._p(bc, "get_output_device", return_value=1)
+        self._p(bc, "_write_hud_state")
+        self._p(bc, "_feed_playback_reference")
+
+    def _play(self):
+        import numpy as np
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+
+    def _turn(self, you=True):
+        self.timing.begin("inject")
+        if you:
+            self.timing.mark("you")
+
+    def _emit(self):
+        return self.tt.parse_line(self.timing.emit())
+
+    def test_the_answers_playback_open_is_timed(self):
+        self._turn()
+        self._play()
+        # 200 ms of duck + the one 10 ms clock read after sd.play().
+        self.assertEqual(self._emit()["play_open_ms"], "210")
+        self.sd.play.assert_called_once()
+
+    def test_the_robot_branch_is_timed_too(self):
+        self._p(self.bc, "ROBOT_ENABLED", True)
+        self._turn()
+        self._play()
+        self.assertEqual(self._emit()["play_open_ms"], "210")
+
+    def test_only_the_first_playback_counts(self):
+        self._turn()
+        self._play()
+        self.ducker.duck.side_effect = lambda: self.clock.advance(1.0)
+        self._play()
+        self.assertEqual(self._emit()["play_open_ms"], "210")
+
+    def test_not_before_you_nor_from_another_thread(self):
+        self.stream.latency = 0.0464
+        self._turn(you=False)
+        self._play()                          # a reminder, pre-transcript
+        self.timing.mark("you")
+        th = threading.Thread(target=self._play, name="processing-filler")
+        th.start()
+        th.join(5)
+        d = self._emit()
+        self.assertEqual((d["play_open_ms"], d["out_lat_ms"]), ("-", "-"))
+
+    def test_flag_off_records_nothing(self):
+        self._p(self.bc, "TURN_PLAY_OPEN_PROBE", False)
+        self.stream.latency = 0.0464
+        self._turn()
+        self._play()
+        d = self._emit()
+        self.assertEqual((d["play_open_ms"], d["out_lat_ms"]), ("-", "-"))
+        self.sd.play.assert_called_once()
+
+    # R1 review (2026-10-01): everything between first_play and the open
+    # stream is inside play_open_ms - the PortAudio claim, the output-device
+    # refresh (a full PortAudio reinit at worst) and the barge-in listener,
+    # not only the duck - and the stream's reported output latency is noted.
+    def test_the_setup_before_the_duck_is_timed_too(self):
+        bc = self.bc
+        claim = bc._pa_claim_owner
+
+        def slow_claim(*a, **k):
+            self.clock.advance(0.050)
+            return claim(*a, **k)
+
+        def slow_device():
+            self.clock.advance(0.300)        # a device refresh / reinit
+            return 1
+
+        self._p(bc, "_pa_claim_owner", side_effect=slow_claim)
+        self._p(bc, "get_output_device", side_effect=slow_device)
+        self._turn()
+        self._play()
+        # 50 claim + 300 refresh + 200 duck + the 10 ms read after sd.play().
+        self.assertEqual(self._emit()["play_open_ms"], "560")
+
+    def test_the_output_latency_is_noted_on_both_branches(self):
+        for robot in (False, True):
+            with self.subTest(robot=robot):
+                self._p(self.bc, "ROBOT_ENABLED", robot)
+                self.stream.latency = 0.0464
+                self._turn()
+                self._play()
+                self._play()                  # later playbacks: first wins
+                d = self._emit()
+                self.assertEqual((d["play_open_ms"], d["out_lat_ms"]),
+                                 ("210", "46"))
+
+    def test_an_unknown_output_latency_prints_dash(self):
+        for junk in (mock.Mock(), None, float("nan"), "0.05", -0.01,
+                     (0.01,), True):
+            with self.subTest(latency=junk):
+                self.stream.latency = junk
+                self._turn()
+                self._play()
+                d = self._emit()
+                self.assertEqual(d["out_lat_ms"], "-")
+                self.assertEqual(d["play_open_ms"], "210")
+
+    def test_the_reaper_still_takes_exactly_three_args(self):
+        seen = []
+
+        def reaper(stream, done_evt, audio_secs):
+            seen.append((stream, audio_secs))
+            self.bc._pa_close_done()
+            done_evt.set()
+
+        self._p(self.bc, "_reap_playback", side_effect=reaper)
+        self._turn()
+        self._play()
+        self.assertEqual(seen, [(self.stream, 0.01)])
+        self.assertEqual(self._emit()["play_open_ms"], "210")
+
+    def test_a_timing_fault_never_breaks_playback(self):
+        self._p(self.timing, "now", side_effect=RuntimeError("clock"))
+        self._turn()
+        self._play()
+        self.sd.play.assert_called_once()
+
+
+@requires_monolith
+class R1CaptureLagTests(_Base):
+    """cap_lag_ms through the REAL record_speech (R1 review, 2026-10-01).
+    tail_ms is audio time (last speech -> the clip's last sample); the VAD
+    break, t0, is the wall-clock moment the loop handled that sample, later
+    by the input stream's latency plus every chunk still queued behind it.
+    The break hands that lag to the turn."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        from core import turn_timing as tt
+        self.tt = tt
+        self.timing = tt.TurnTiming(print_fn=lambda line: None,
+                                    clock=_Clock())
+        self._p(bc, "_turn_timing", self.timing)
+        self.lim = int(bc.SILENCE_SECS * bc.SAMPLE_RATE / 1024)
+
+    def _record(self, n_voiced, n_silent, latency):
+        """Queue every frame BEFORE the capture loop reads one (so the
+        backlog at the break is exact), run record_speech, then start the
+        turn the way the main loop does."""
+        bc = self.bc
+        np = bc.np
+
+        class FakeStream:
+            device = 1
+
+            def __init__(self, *a, callback=None, **k):
+                self.cb = callback
+                self.latency = latency
+
+            def start(self):
+                for amp, n in ((0.2, n_voiced), (0.0, n_silent)):
+                    frame = np.full((1024, 1), amp, dtype="float32")
+                    for _ in range(n):
+                        self.cb(frame, 1024, None, None)
+
+        self._p(bc, "_mic_input_disabled", return_value=False)
+        self._p(bc, "_mic_muted", [False])
+        self._p(bc, "_capture_holds_mic", return_value=False)
+        self._p(bc, "_input_backoff_wait", return_value=False)
+        self._p(bc, "get_input_device", return_value=1)
+        self._p(bc, "_safe_close_stream", lambda s: None)
+        self._p(bc.sd, "InputStream", FakeStream)
+        self._p(bc, "_note_live_capture", lambda *a, **k: None)
+        self._p(bc, "_filler_capture_mark", lambda *a, **k: None)
+        self._p(bc, "_fanout_record_frame", lambda *a, **k: None)
+        self._p(bc, "_process_capture_chunk",
+                lambda data, sr, skip_ns=False: data)
+        self._p(bc, "_spec_stt_should_snapshot", return_value=False)
+        self._p(bc, "pause_face_tracking")
+        self._p(bc, "set_state")
+        self._p(bc, "_write_hud_state")
+        self._p(bc, "_heartbeat")
+        self._p(bc, "VAD_THRESHOLD", 0.008)
+        since = self.timing.now()
+        with contextlib.redirect_stdout(io.StringIO()):
+            audio = bc.record_speech(timeout=3)
+        self.assertIsNotNone(audio, "no utterance was captured")
+        # The clip ends at the break: the queued chunks are not in it.
+        self.assertEqual(len(audio), (n_voiced + self.lim) * 1024)
+        self.timing.begin_voice(since)
+        return self.tt.parse_line(self.timing.emit())
+
+    def test_queued_chunks_and_input_latency_make_the_lag(self):
+        # 9 chunks (64 ms each) still queued + 100 ms of input latency.
+        d = self._record(6, self.lim + 9, 0.100)
+        self.assertEqual((d["vad_break"], d["cap_lag_ms"]), ("0", "676"))
+
+    def test_no_backlog_is_the_input_latency_alone(self):
+        d = self._record(6, self.lim, 0.100)
+        self.assertEqual(d["cap_lag_ms"], "100")
+
+    def test_an_unknown_input_latency_leaves_the_backlog(self):
+        d = self._record(6, self.lim + 9, None)
+        self.assertEqual(d["cap_lag_ms"], "576")
+
+    def test_the_helper_never_raises(self):
+        bc = self.bc
+        import queue as _queue
+        q = _queue.Queue()
+        for _ in range(3):
+            q.put(0)
+
+        class S:
+            latency = (0.05, 0.2)        # a duplex stream: (input, output)
+
+        self.assertEqual(bc._capture_lag_ms(q, S(), 1024), 242)
+        S.latency = float("nan")
+        self.assertEqual(bc._capture_lag_ms(q, S(), 1024), 192)
+        self.assertEqual(bc._capture_lag_ms(q, object(), 1024), 192)
+
+        class BadQ:
+            def qsize(self):
+                raise RuntimeError("qsize")
+
+        self.assertIsNone(bc._capture_lag_ms(BadQ(), S(), 1024))
+        self.assertIsNone(bc._capture_lag_ms(q, S(), "x"))
+
+
+@requires_monolith
+class R1ReaperMarkTests(_Base):
+    def _run(self, stream):
+        bc = self.bc
+        tags = []
+        self._p(bc, "_prof", side_effect=lambda tag, extra="": tags.append(tag))
+        done = threading.Event()
+        with mock.patch.object(bc, "_pa_close_done"):
+            bc._reap_playback(stream, done, 0.1)
+        self.assertTrue(done.is_set())
+        return tags
+
+    def test_inactive_then_closed(self):
+        class _Stream:
+            polls = 0
+
+            @property
+            def active(self):
+                _Stream.polls += 1
+                return _Stream.polls < 2
+
+            def stop(self, ignore_errors=True):
+                pass
+
+            def close(self, ignore_errors=True):
+                pass
+
+        self.assertEqual(self._run(_Stream()),
+                         ["reap_inactive", "reap_closed"])
+
+    def test_a_dead_stream_still_marks_closed(self):
+        stream = mock.Mock()
+        type(stream).active = mock.PropertyMock(
+            side_effect=RuntimeError("gone"))
+        self.assertEqual(self._run(stream), ["reap_closed"])
+
+
+@requires_monolith
+class R1TailProbeTests(_Base):
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        import numpy as np
+        from core import turn_timing as tt
+        self.np = np
+        self.tt = tt
+        self.timing = tt.TurnTiming(print_fn=lambda line: None)
+        self._p(bc, "_turn_timing", self.timing)
+        self._p(bc, "transcribe", return_value=("hello", {"x": 1}))
+        self.vad = _FakeVad(tail=777)
+        self._p(bc, "_tail_vad", self.vad)
+        # A probe left running by an earlier test must not make this
+        # capture skip its own (one probe in flight at a time).
+        self._p(bc, "_tail_probe_state",
+                {"thread": None, "off_logged": False})
+        self.audio = np.zeros(bc.SAMPLE_RATE, dtype=np.float32)
+
+    def _capture(self, audio=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            res = self.bc._transcribe_capture(
+                self.audio if audio is None else audio)
+        _join_probe(self.bc)
+        return res, out.getvalue()
+
+    def _line(self):
+        return self.tt.parse_line(self.timing.emit())
+
+    def test_a_latched_detector_is_logged_once_and_skipped(self):
+        self.vad.failed = "load failed: OSError: missing"
+        self.timing.begin("voice")
+        res, log1 = self._capture()
+        _, log2 = self._capture()
+        self.assertEqual(res, ("hello", {"x": 1}))
+        self.assertIn("[turn-timing] tail probe off for this session "
+                      "(load failed: OSError: missing)", log1)
+        self.assertEqual(log2, "")
+        self.assertEqual(self.vad.clips, [])
+        d = self._line()
+        self.assertEqual((d["clip_ms"], d["tail_ms"]), ("1000", "-"))
+
+    def test_a_warmer_failure_is_its_one_log_line(self):
+        bc = self.bc
+
+        class Broken:
+            failed = ""
+
+            def warm(self):
+                Broken.failed = "load failed: X"
+                raise RuntimeError("load failed: X")
+
+        self._p(bc, "_tail_vad", Broken())
+        with self.assertRaises(RuntimeError):
+            bc._warm_tail_probe()
+        _, log = self._capture()
+        self.assertEqual(log, "")
+
+    def test_flag_off_never_runs_the_detector(self):
+        self._p(self.bc, "TURN_TAIL_PROBE", False)
+        self.timing.begin("voice")
+        self._capture()
+        self.assertEqual(self.vad.clips, [])
+        d = self._line()
+        self.assertEqual((d["clip_ms"], d["tail_ms"]), ("1000", "-"))
+
+    def test_one_probe_in_flight(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.vad.gate = gate
+        self.timing.begin("voice")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.bc._transcribe_capture(self.audio)
+            self.bc._transcribe_capture(self.audio)
+        gate.set()
+        _join_probe(self.bc)
+        self.assertEqual(len(self.vad.clips), 1)
+
+    def test_not_an_array_is_ignored(self):
+        self.timing.begin("voice")
+        res, log = self._capture(object())
+        self.assertEqual((res, log), (("hello", {"x": 1}), ""))
+        self.assertEqual(self.vad.clips, [])
+        self.assertEqual(self._line()["clip_ms"], "-")
+
+    def test_a_thread_that_cannot_start_never_breaks_the_capture(self):
+        bc = self.bc
+
+        class NoThread:
+            def __init__(self, *a, **k):
+                raise RuntimeError("can't start new thread")
+
+        self._p(bc.threading, "Thread", NoThread)
+        self.timing.begin("voice")
+        res, _ = self._capture()
+        self.assertEqual(res, ("hello", {"x": 1}))
+        self.assertEqual(self._line()["tail_ms"], "-")
+
+    def test_note_stat_helper_for_skills(self):
+        self.timing.begin("voice")
+        _in = threading.Thread(
+            target=lambda: self.bc._tt_note_stat("amb_deferred", 2))
+        _in.start()
+        _in.join(5)
+        self.assertEqual(self._line()["amb_deferred"], "2")
+
+
+@requires_monolith
+class R1BootWarmerTests(_Base):
+    def setUp(self):
+        super().setUp()
+        self.reg = []
+        self._p(self.bc, "_boot_warmers", self.reg)
+        self._p(self.bc, "_boot_warmers_started", [False])
+
+    def _run(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            th = self.bc._run_boot_warmers()
+            if th is not None:
+                th.join(5)
+        return th, out.getvalue()
+
+    def test_each_warmer_runs_once_in_order_with_one_line(self):
+        bc = self.bc
+        ran = []
+
+        def boom():
+            ran.append("b")
+            raise RuntimeError("no model")
+
+        bc._register_boot_warmer("a", lambda: ran.append("a"))
+        bc._register_boot_warmer("b", boom)
+        bc._register_boot_warmer("c", lambda: ran.append("c"))
+        bc._register_boot_warmer("a", lambda: ran.append("A"))   # dup
+        bc._register_boot_warmer("x", "not callable")
+        th, log = self._run()
+        self.assertIsNotNone(th)
+        self.assertEqual(ran, ["a", "b", "c"])
+        lines = [ln.strip() for ln in log.splitlines()]
+        self.assertEqual(len(lines), 3, lines)
+        self.assertRegex(lines[0], r"^\[warm\] a ok \(\d+ ms\)$")
+        self.assertEqual(lines[1], "[warm] b failed (RuntimeError: no model)")
+        self.assertRegex(lines[2], r"^\[warm\] c ok \(\d+ ms\)$")
+        self.assertEqual(self._run(), (None, ""))     # once per process
+
+    def test_a_hanging_warmer_never_blocks_the_caller(self):
+        bc = self.bc
+        release = threading.Event()
+        self.addCleanup(release.set)
+        bc._register_boot_warmer("slow", lambda: release.wait(10))
+        t0 = time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()):
+            th = bc._run_boot_warmers()
+            self.assertLess(time.monotonic() - t0, 1.0)
+            self.assertTrue(th.daemon)
+            self.assertTrue(th.is_alive())
+            release.set()
+            th.join(5)
+
+    def test_nothing_registered_starts_nothing(self):
+        self.assertEqual(self._run(), (None, ""))
+
+    def test_a_thread_that_cannot_start_never_raises(self):
+        bc = self.bc
+        bc._register_boot_warmer("a", lambda: None)
+
+        class NoThread:
+            def __init__(self, *a, **k):
+                raise RuntimeError("can't start new thread")
+
+        self._p(bc.threading, "Thread", NoThread)
+        th, log = self._run()
+        self.assertIsNone(th)
+        self.assertIn("[warm] could not start", log)
+
+
+
+@requires_monolith
+class R1TurnFlagsTests(_Base):
+    def test_flags_line_has_scalar_tokens_only(self):
+        bc = self.bc
+        self._p(bc, "PROCESSING_FILLER_DELAY", 0.5)
+        self._p(bc, "TURN_TAIL_PROBE", True)
+        out = io.StringIO()
+        # A reserved key the module does not define is left out. Removed here
+        # rather than assumed absent: SMART_TURN_MODE shipped in v2.0.164 and
+        # the old "not defined yet" assertion went red.
+        with mock.patch.dict(bc.__dict__), contextlib.redirect_stdout(out):
+            bc.__dict__.pop("SMART_TURN_MODE", None)
+            bc._log_turn_flags()
+        line = out.getvalue().strip()
+        self.assertTrue(line.startswith("[turn-flags] "), line)
+        kv = dict(tok.split("=", 1) for tok in line.split()[1:])
+        self.assertEqual(kv["PROCESSING_FILLER_DELAY"], "0.5")
+        self.assertEqual(kv["TURN_TAIL_PROBE"], "True")
+        self.assertTrue(set(kv) <= set(bc._TURN_FLAG_KEYS))
+        self.assertNotIn("SMART_TURN_MODE", kv)
+
+    def test_flag_tokens(self):
+        tok = self.bc._turn_flag_token
+        self.assertEqual(tok((0.0, 0.2, 0.4)), "0.0,0.2,0.4")
+        self.assertEqual(tok("shadow mode"), "shadow_mode")
+        self.assertEqual(tok(""), "''")
+        self.assertIsNone(tok({"a": 1}))
+        self.assertIsNone(tok("x" * 41))
+
+
+class R1WiringTests(_Base):
+    def test_the_tail_probe_registers_its_boot_warmer(self):
+        bc = self.bc
+        entry = ("silero-tail", bc._warm_tail_probe)
+        if bc.TURN_TAIL_PROBE:
+            self.assertIn(entry, bc._boot_warmers)
+        else:
+            self.assertNotIn(entry, bc._boot_warmers)
+
+    def test_boot_warmers_start_right_after_the_boot_whisper_load(self):
+        src = inspect.getsource(self.bc.main)
+        w = src.index("_ensure_whisper()   # load now")
+        run = src.index("_run_boot_warmers()", w)
+        flags = src.index("_log_turn_flags()", w)
+        self.assertLess(run, flags)
+        self.assertLess(flags, src.index("check_dependencies()", w))
+        self.assertEqual(src.count("_run_boot_warmers()"), 1)
+
+    def test_transcribe_times_the_lock_and_returns_unchanged(self):
+        src = inspect.getsource(self.bc.transcribe)
+        lock = src.index("with _stt_lock:")
+        note = src.index('_tt_note_elapsed("stt_wait_ms", _stt_w0)')
+        self.assertLess(src.index('_stt_w0 = _tt("now")'), lock)
+        self.assertLess(lock, note)
+        self.assertLess(note, src.index("return _transcribe_impl(audio)"))
+
+    def test_capture_starts_the_probe_before_any_decode(self):
+        src = inspect.getsource(self.bc._transcribe_capture)
+        self.assertLess(src.index("_tail_probe_start(audio)"),
+                        src.index('_spec_stt.get("thread")'))
+
+    def test_playback_open_is_timed_on_both_branches(self):
+        src = inspect.getsource(self.bc._play_with_lipsync_body)
+        self.assertLess(src.index("_tt_open0 = _tt(\"now\")"),
+                        src.index("if not _pa_claim_owner("))
+        self.assertLess(src.index("_tt_open0 = _tt(\"now\")"),
+                        src.index("_audio_ducker.duck()"))
+        self.assertEqual(src.count("_tt_open0 = "), 1)
+        self.assertEqual(src.count("_tt_note_out_latency(_stream)"), 2)
+        self.assertEqual(src.count("_play_audio_safe()\n"
+                                   "            _tt_note_elapsed("
+                                   "\"play_open_ms\", _tt_open0)"), 2)
+        self.assertEqual(src.count("args=(_stream, _done_evt, audio_secs)"),
+                         2)
+
+    def test_filler_clip_is_noted_with_the_filler(self):
+        src = inspect.getsource(self.bc._filler_play)
+        self.assertLess(src.index('_tt("note_filler")'),
+                        src.index('_tt_note_clip_ms("filler_clip_ms", '
+                                  'audio, sr)'))
+
+    def test_reaper_marks(self):
+        src = inspect.getsource(self.bc._reap_playback)
+        self.assertLess(src.index('_prof("reap_inactive")'),
+                        src.index('_prof("reap_closed")'))
 
 
 if __name__ == "__main__":

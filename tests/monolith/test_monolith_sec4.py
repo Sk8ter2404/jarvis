@@ -2915,6 +2915,66 @@ class OffscreenCaptureFlowTests(MonolithGlobalsTestCase):
         self.assertEqual(reason, "printwindow_failed")
         w32.SetWindowPos.assert_called_once()
 
+    def _run_replaced_window(self, replacement_rect):
+        """Spawn finds hwnd 4242; while the page loads Chrome swaps it for
+        hwnd 5353 (4242 is no longer a window). Returns (png, reason, w32)."""
+        w32 = self._win32()
+        w32.GetWindowDC.side_effect = RuntimeError("no DC in tests")
+        states = {"spawned": False, "loaded": False}
+
+        def _enum(cb, _):
+            if states["spawned"]:
+                cb(5353 if states["loaded"] else 4242, None)
+            return True
+        w32.EnumWindows.side_effect = _enum
+        w32.IsWindow.side_effect = lambda h: h != 4242 or not states["loaded"]
+        w32.GetWindowRect.side_effect = lambda h: (
+            replacement_rect if h == 5353 else (0, 0, 800, 600))
+
+        def _popen(*a, **k):
+            states["spawned"] = True
+            return mock.MagicMock()
+
+        def _sleep(secs):
+            if secs >= 1.0:          # the page-load wait
+                states["loaded"] = True
+
+        clock = iter(100.0 + 0.1 * i for i in itertools.count())
+        with mock.patch.dict(sys.modules, {
+                "win32gui": w32, "win32ui": mock.MagicMock(),
+                "win32con": mock.MagicMock(), "ctypes": mock.MagicMock(),
+                "PIL": mock.MagicMock()}), \
+             mock.patch.object(self.bc, "_find_chrome", return_value=r"C:\chrome.exe"), \
+             mock.patch.object(self.bc.subprocess, "Popen", side_effect=_popen), \
+             mock.patch.object(self.bc.time, "sleep", side_effect=_sleep), \
+             mock.patch.object(self.bc.time, "time", side_effect=lambda: next(clock)):
+            png, reason = self.bc._open_url_offscreen_capture("https://example.com")
+        return png, reason, w32
+
+    def test_window_replaced_while_loading_captures_the_parked_replacement(self):
+        # Live 2026-10-01 22:30: the HWND found at spawn was gone after the
+        # page-load wait -> GetWindowRect raised 1400 'Invalid window handle'
+        # and check_credits failed. The replacement window that Chrome parked
+        # off-screen (it honours --window-position) must be captured and
+        # closed instead; the dead handle is never touched again.
+        png, reason, w32 = self._run_replaced_window(
+            (self.bc._OFFSCREEN_X, self.bc._OFFSCREEN_Y,
+             self.bc._OFFSCREEN_X + 1600, self.bc._OFFSCREEN_Y + 1200))
+        self.assertEqual(reason, "printwindow_failed")   # GDI is faked out
+        w32.GetWindowDC.assert_called_with(5353)
+        w32.PostMessage.assert_called_once_with(5353, 0x0010, 0, 0)
+        rect_calls = [c.args[0] for c in w32.GetWindowRect.call_args_list]
+        self.assertNotIn(4242, rect_calls[rect_calls.index(5353):])
+
+    def test_window_replaced_by_an_on_screen_window_is_never_adopted(self):
+        # A NEW window that is on a real monitor may be one the owner just
+        # opened: never park, capture or close it - report the window gone.
+        png, reason, w32 = self._run_replaced_window((0, 0, 1200, 900))
+        self.assertIsNone(png)
+        self.assertEqual(reason, "capture_window_closed")
+        w32.PostMessage.assert_not_called()
+        w32.GetWindowDC.assert_not_called()
+
     def test_enum_callback_and_enumwindows_errors_swallowed(self):
         # Inside _enum_chrome_hwnds: the per-window callback swallows
         # GetClassName errors (lines 7516-7517) and EnumWindows itself is
@@ -4386,7 +4446,10 @@ class LocalVisionColoadGuardTests(MonolithGlobalsTestCase):
         with mock.patch.dict(os.environ, {}, clear=False), \
              mock.patch.object(bc, "_ollama_big_model_resident", return_value=None), \
              mock.patch.object(bc, "_log_gpu_state"), \
+             mock.patch.object(bc, "_cuda0_free_vram_mb", return_value=None), \
              mock.patch.object(bc, "requests") as req:
+            # (free-VRAM probe pinned: the real 4 GB laptop card refused this
+            # call on the Dell gate 2026-10-02.)
             os.environ.pop("JARVIS_ALLOW_VLM_COLOAD", None)
             req.post.return_value = resp
             ps = self._common_patches(bc)

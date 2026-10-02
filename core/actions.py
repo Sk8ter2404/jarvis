@@ -78,9 +78,30 @@ def _site_shortcut_url(name: str) -> "str | None":
         return None
 
 
+def _is_data_dir_page(url: str) -> bool:
+    """True for a ``file:`` URI naming an existing .html/.htm page inside
+    JARVIS's own data dir (a page a skill wrote, e.g. skills/site_builder.py).
+    Only those open as-is: any other local file could be an executable, and on
+    Windows webbrowser.open hands the URI to os.startfile. Never raises."""
+    try:
+        import urllib.request
+        from core.paths import data_dir
+        p = urllib.parse.urlparse(url)
+        if (p.scheme.lower() != "file" or p.netloc not in ("", "localhost")
+                or p.params or p.query or p.fragment):
+            return False
+        root = os.path.realpath(data_dir(create=False))
+        path = os.path.realpath(urllib.request.url2pathname(p.path))
+        return (path.lower().endswith((".html", ".htm"))
+                and os.path.commonpath([root, path]) == root
+                and os.path.isfile(path))
+    except Exception:
+        return False
+
+
 def _act_open_url(url: str) -> str:
     url = _site_shortcut_url(url) or url
-    if not url.startswith(("http://", "https://")):
+    if not (url.startswith(("http://", "https://")) or _is_data_dir_page(url)):
         url = "https://" + url
     webbrowser.open(url)
     # Small wait so the page has time to start loading before any follow-up
@@ -693,6 +714,16 @@ def _act_model_costs(_: str = "") -> str:
     cost', 'how much does each model burn', 'model prices', 'compare models')."""
     from core import model_catalog
     return model_catalog.format_catalog()
+
+
+def _act_running_costs(_: str = "") -> str:
+    """What it costs to RUN JARVIS ('how much does it cost to run you', 'what
+    do you cost', 'running costs'): an electricity estimate from the live GPU
+    + CPU draw over the hours run today / this month, this session's Claude
+    spend, and a one-line verdict (core.running_costs). Not the account
+    balance; that is check_credits."""
+    from core import running_costs
+    return running_costs.report()
 
 
 def _live_backend_and_model() -> tuple[str, str]:
@@ -1936,8 +1967,8 @@ def _act_version_info(_: str = "") -> str:
     was 2.0.104); reporting it would make JARVIS state his version wrong by a
     whole major series.  The release version comes from core/version.py (the
     VERSION file).  Only ``last_upgrade_at`` is read out of the JSON, and even
-    that yields to the VERSION file's mtime when the mtime is newer — see the
-    inline comments below."""
+    that yields to the release's git date when that is newer — see the inline
+    comments below."""
     bc = _bc()
     try:
         from datetime import datetime as _dt
@@ -1945,38 +1976,43 @@ def _act_version_info(_: str = "") -> str:
             from core.version import __version__ as release_ver
         except Exception:
             release_ver = "unknown"
-        _ver_path = os.path.join(
-            os.path.dirname(os.path.abspath(bc.__file__)),
-            "data", "version.json")
-        if not os.path.exists(_ver_path):
-            return f"I'm on version {release_ver}, sir."
-        with open(_ver_path, "r", encoding="utf-8") as _vf:
-            data = json.load(_vf)
+        _root = os.path.dirname(os.path.abspath(bc.__file__))
+        _ver_path = os.path.join(_root, "data", "version.json")
+        data = {}
+        if os.path.exists(_ver_path):
+            with open(_ver_path, "r", encoding="utf-8") as _vf:
+                data = json.load(_vf)
         ver = release_ver  # single-source release version (core/version.py),
         #                    not the self-upgrade pipeline's internal counter
         ts_iso = data.get("last_upgrade_at") or ""
         # last_upgrade_at is written ONLY by the self-upgrade pipeline —
         # releases deployed via git checkout never touch version.json, so
         # the reported date went stale (live bug: v1.99.0 announced as
-        # "last updated on May 30"). The VERSION file's mtime IS the deploy
-        # moment (checkout rewrites it on every release), so use whichever
-        # of the two is newer.
+        # "last updated on May 30"). The release's own date comes from git
+        # (the v<VERSION> tag / the commit that set VERSION; the VERSION mtime
+        # only outside a checkout — core.version.release_timestamp), and
+        # whichever of the two is newer wins. It used to be the VERSION mtime
+        # alone, and only when version.json existed: a box with no pipeline
+        # history never heard a date at all (2026-10-02).
         ts = None
         try:
             ts = _dt.fromisoformat(ts_iso) if ts_iso else None
         except Exception:
             ts = None
         try:
-            _version_file = os.path.join(
-                os.path.dirname(os.path.abspath(bc.__file__)), "VERSION")
-            _mtime = _dt.fromtimestamp(os.path.getmtime(_version_file))
-            if ts is None or _mtime > ts:
-                ts = _mtime
+            from core.version import release_timestamp
+            _rel = release_timestamp(_root)
+            if _rel is not None:
+                _rel_dt = _dt.fromtimestamp(_rel)
+                if ts is None or _rel_dt > ts:
+                    ts = _rel_dt
         except Exception:
             pass
         if ts is None:
             if ts_iso:
                 return f"I'm on version {ver}, last updated {ts_iso}."
+            if not os.path.exists(_ver_path):
+                return f"I'm on version {ver}, sir."
             return f"I'm on version {ver}, sir — no upgrade timestamp on file."
         now = _dt.now()
         same_day = (ts.date() == now.date())
@@ -4322,6 +4358,7 @@ __all__ = [
     "_act_switch_llm_picker",
     "_act_show_llm_stats",
     "_act_model_costs",
+    "_act_running_costs",
     # Phase 4C — UI primitives
     "_act_press",
     "_act_scroll",

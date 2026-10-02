@@ -25,6 +25,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime
 import types
 import unittest
 from unittest import mock
@@ -74,6 +75,14 @@ def inject_modules(**mods):
             elif prev is not _SENTINEL:
                 sys.modules[name] = prev
 
+
+
+def _today_noon() -> float:
+    """Noon today, local time. Episodes stamped "now - N s" fall on YESTERDAY in
+    the first N seconds after midnight (a Dell gate run at 2026-10-02 00:00 failed
+    test_recall_today_keyword_hit that way), so today's fixtures sit at noon."""
+    return time.mktime(datetime.now().replace(
+        hour=12, minute=0, second=0, microsecond=0).timetuple())
 
 class ChappieFilterTests(unittest.TestCase):
     def setUp(self):
@@ -306,7 +315,7 @@ class ChappieRecallActionTests(unittest.TestCase):
         self.assertIn("Nothing on the record", out)
 
     def test_recall_today_lists_today_summaries(self):
-        now = time.time()
+        now = _today_noon()
         self._write_episodes([
             {"start_ts": now - 60, "summary": "discussed the print job",
              "topics": ["3d printing"], "new_entities": []},
@@ -315,7 +324,7 @@ class ChappieRecallActionTests(unittest.TestCase):
         self.assertIn("discussed the print job", out)
 
     def test_recall_today_keyword_filter_miss(self):
-        now = time.time()
+        now = _today_noon()
         self._write_episodes([
             {"start_ts": now - 60, "summary": "talked about lunch",
              "topics": [], "new_entities": []},
@@ -1135,7 +1144,7 @@ class ChappieRecallBranchTests(unittest.TestCase):
         self.assertIn("on file but I don't have specifics", out)
 
     def test_recall_today_keyword_hit(self):
-        now = time.time()
+        now = _today_noon()
         self._write_episodes([
             {"start_ts": now - 120, "summary": "talked about the Kubernetes upgrade",
              "topics": ["devops"], "new_entities": ["Kubernetes"]},
@@ -1154,7 +1163,7 @@ class ChappieRecallBranchTests(unittest.TestCase):
         self.assertIn("tripped reading", out)
 
     def test_recall_today_skips_blank_and_bad_lines(self):
-        now = time.time()
+        now = _today_noon()
         with open(self.episodes, "w", encoding="utf-8") as f:
             f.write("\n")                                    # blank → skipped
             f.write("{not json}\n")                           # malformed → skipped
@@ -1164,7 +1173,7 @@ class ChappieRecallBranchTests(unittest.TestCase):
         self.assertIn("real moment", out)
 
     def test_recall_today_missing_summary_placeholder(self):
-        now = time.time()
+        now = _today_noon()
         self._write_episodes([{"start_ts": now - 30, "topics": [], "new_entities": []}])
         out = self.actions["chappie_recall_today"]("")
         self.assertIn("(no summary)", out)

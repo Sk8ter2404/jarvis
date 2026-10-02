@@ -235,6 +235,12 @@ _MONOLITH_RESTORE_NAMES = (
     # drove a capture would make a LATER test's dispatch print a stray
     # [turn-timing] line into output it asserts on.
     "_turn_timing",
+    # Speed plan R1 (2026-10-01): the tail-probe detector (rebind-restored —
+    # tests patch in a fake) and the boot-warmer registry + its started
+    # latch (a leaked latch would make a later _run_boot_warmers start
+    # nothing). The probe's single-flight cell holds a live Thread, which
+    # cannot be deep-copied: it is reset in _restore_monolith_pristine.
+    "_tail_vad", "_boot_warmers", "_boot_warmers_started",
     # Local prompt-prefix stability (2026-09-29): the conversation-activity
     # gates, the deferred-rebuild and re-prime single-flight cells and the
     # phrase-rotation cache. A leaked _turn_in_progress / pending rebuild /
@@ -281,6 +287,10 @@ _MONOLITH_RESTORE_NAMES = (
     # Who wrote the last drained inject (2026-10-01): a leaked "test" would
     # make a later test's typed turn look like a harness line.
     "_last_inject_source",
+    # After-reply hooks (2026-10-01): the registered hooks, the armed turn and
+    # the last encore thread. A leaked hook would be called by a LATER test's
+    # dispatch; a leaked turn or live encore would arm / refuse one.
+    "_AFTER_REPLY_HOOKS", "_after_reply_turn", "_after_reply_encore_thread",
     # Proactive-remark gates (2026-09-30): the owner's last MIC turn, the
     # remark history (repeat ring, spoken-remark times, last attempt, logged
     # hold) and the face-presence state (the detector's last detail, the
@@ -496,6 +506,14 @@ def _restore_monolith_pristine(bc) -> None:
     _reset_camera_gate(bc)
     try:
         bc._turn_timing.reset()
+    except Exception:
+        pass
+    # R1 tail probe (2026-10-01): a probe thread left by one test would make
+    # a LATER test's capture skip its probe (one in flight at a time), and a
+    # logged latch would hide its "tail probe off" line. Reset in place.
+    try:
+        bc._tail_probe_state["thread"] = None
+        bc._tail_probe_state["off_logged"] = False
     except Exception:
         pass
     # A test that failed while a background job held the shared gate must

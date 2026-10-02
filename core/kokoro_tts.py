@@ -26,6 +26,19 @@ JARVIS is never silenced. Adversarial-review hardening (2026-07-15):
 
 CI SAFETY: the real `import kokoro_onnx` happens ONLY inside `_engine()`, guarded
 by find_spec, so tools/run_tests_ci_sim.py never imports onnxruntime/kokoro.
+
+SPEED PLAN R4 (2026-10-02), both OFF by default (core/config.py):
+  * KOKORO_PERSISTENT_PHONEMIZER — kokoro_onnx's stock create() calls
+    phonemizer.phonemize(), which builds a NEW espeak backend on every line
+    (~115 ms) and leaves a copy of espeak-ng.dll in %TEMP% each time
+    (thousands observed). With the flag on, `_engine()` builds ONE backend and
+    `_render` phonemizes on it under `_PHON_LOCK` (espeak-ng is global state),
+    exactly as kokoro_onnx's Tokenizer.phonemize would, then calls
+    create(..., is_phonemes=True). Every create() then runs under
+    `_RENDER_LOCK`, waiting at most _SYNTH_TIMEOUT_S (→ None → fallback
+    ladder). Any error switches back to the stock call for the session.
+  * KOKORO_RENDER_CACHE — `synthesize()` looks the normalised line up in
+    core/tts_render_cache.py before starting a render ('off' never looks).
 """
 from __future__ import annotations
 
@@ -36,6 +49,10 @@ from typing import Optional, Tuple
 _LOCK = threading.Lock()
 _ENGINE = [None]          # the Kokoro singleton once built
 _FAILED = [False]         # True once construction has failed — do not retry-thrash
+_PHONEMIZER = [None]      # the ONE espeak backend (KOKORO_PERSISTENT_PHONEMIZER)
+_PHON_OFF = [False]       # True once the persistent path failed — stock call for the session
+_PHON_LOCK = threading.Lock()     # one phonemize at a time on the shared backend
+_RENDER_LOCK = threading.Lock()   # one create() at a time (persistent mode)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MODEL = os.environ.get(
@@ -155,6 +172,30 @@ def is_available() -> bool:
     return _models_present()
 
 
+def _persistent_wanted() -> bool:
+    """KOKORO_PERSISTENT_PHONEMIZER, read from core.config at call time;
+    False (today's stock path) on any error."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "KOKORO_PERSISTENT_PHONEMIZER", False))
+    except Exception:
+        return False
+
+
+def _build_phonemizer():
+    """ONE espeak backend with the options kokoro_onnx's stock
+    phonemizer.phonemize() call uses. None — and the stock call for the rest
+    of the session — on any failure. Lazy import (CI-safety). Never raises."""
+    try:
+        from phonemizer.backend import EspeakBackend
+        return EspeakBackend(_LANG, preserve_punctuation=True, with_stress=True)
+    except Exception as e:
+        _PHON_OFF[0] = True
+        print(f"  [kokoro] persistent phonemizer unavailable ({type(e).__name__}: "
+              f"{e}); using kokoro_onnx's stock phonemizer")
+        return None
+
+
 def _engine():
     """Lazy CPU singleton. Builds the espeak-ng phonemizer wiring + the onnx
     Kokoro session ONCE. Any failure is memoized in _FAILED so we never retry —
@@ -194,7 +235,15 @@ def _engine():
                 print(f"  [kokoro] espeak wiring warning ({type(_pe).__name__}: "
                       f"{_pe}); continuing — kokoro may still self-wire")
             from kokoro_onnx import Kokoro
-            _ENGINE[0], _how = _build_engine(Kokoro)
+            eng, _how = _build_engine(Kokoro)
+            # Built after the engine (whose Tokenizer points EspeakWrapper at
+            # the bundled dll) and published before it, so no render can see
+            # the engine without its backend.
+            if _persistent_wanted() and not _PHON_OFF[0]:
+                _PHONEMIZER[0] = _build_phonemizer()
+                if _PHONEMIZER[0] is not None:
+                    _how += ", persistent phonemizer"
+            _ENGINE[0] = eng
             print(f"  [kokoro] CPU engine ready (voice={_VOICE}, {_LANG}) — {_how}")
             return _ENGINE[0]
         except Exception as e:
@@ -204,13 +253,75 @@ def _engine():
             return None
 
 
+def _phonemize(eng, text: str) -> str:
+    """kokoro_onnx's Tokenizer.phonemize(text, _LANG), on the ONE persistent
+    backend: the same strip, line split, separator (phonemizer's default) and
+    strip=False as the stock phonemizer.phonemize() call, then the same
+    post-filter (keep only characters in the model's vocab, strip). Raises
+    on any problem — the caller switches back to the stock call."""
+    from phonemizer.separator import default_separator
+    vocab = eng.tokenizer.vocab
+    # phonemizer.phonemize's own line handling (str2list / _phonemize)
+    lines = [ln.strip(os.linesep)
+             for ln in text.strip().strip(os.linesep).split(os.linesep)]
+    lines = [ln for ln in lines if ln.strip()]
+    if not _PHON_LOCK.acquire(timeout=_SYNTH_TIMEOUT_S):
+        raise TimeoutError(f"phonemizer busy for {_SYNTH_TIMEOUT_S:.0f}s")
+    try:
+        phon = (_PHONEMIZER[0].phonemize(lines, separator=default_separator,
+                                         strip=False, njobs=1)
+                if lines else [])
+    finally:
+        _PHON_LOCK.release()
+    return "".join(p for p in os.linesep.join(phon) if p in vocab).strip()
+
+
+def _latch_stock(e: Exception) -> None:
+    if not _PHON_OFF[0]:
+        _PHON_OFF[0] = True
+        print(f"  [kokoro] persistent phonemizer failed ({type(e).__name__}: "
+              f"{e}); stock phonemizer for the rest of this session")
+
+
+def _create(eng, text: str, speed: float):
+    """eng.create() for one line → (samples, sr). Flag off: exactly the stock
+    call, no lock. Flag on: phonemize on the persistent backend (any error
+    latches back to the stock call), then create() under `_RENDER_LOCK`;
+    None when that lock can't be had within _SYNTH_TIMEOUT_S. Raises what
+    the stock call raises."""
+    if not _persistent_wanted():
+        return eng.create(text, voice=_VOICE, speed=float(speed), lang=_LANG)
+    phonemes = None
+    if _PHONEMIZER[0] is not None and not _PHON_OFF[0]:
+        try:
+            phonemes = _phonemize(eng, text)
+        except Exception as e:
+            _latch_stock(e)
+    if not _RENDER_LOCK.acquire(timeout=_SYNTH_TIMEOUT_S):
+        print(f"  [kokoro] render busy for {_SYNTH_TIMEOUT_S:.0f}s — falling back")
+        return None
+    try:
+        if phonemes is not None:
+            try:
+                return eng.create(phonemes, voice=_VOICE, speed=float(speed),
+                                  lang=_LANG, is_phonemes=True)
+            except Exception as e:
+                _latch_stock(e)
+        return eng.create(text, voice=_VOICE, speed=float(speed), lang=_LANG)
+    finally:
+        _RENDER_LOCK.release()
+
+
 def _render(text: str, speed: float, out: list) -> None:
     try:
         import numpy as np
         eng = _engine()
         if eng is None:
             return
-        samples, sr = eng.create(text, voice=_VOICE, speed=float(speed), lang=_LANG)
+        res = _create(eng, text, speed)
+        if res is None:
+            return
+        samples, sr = res
         a = np.ascontiguousarray(np.asarray(samples, dtype=np.float32).squeeze())
         if a.ndim > 1:                      # coerce any stereo down to mono
             a = a.mean(axis=0).astype(np.float32)
@@ -227,6 +338,26 @@ def synthesize(text: str, speed: float = 1.0) -> Optional[Tuple["object", int]]:
     t = (text or "").strip()
     if not t or not is_available():
         return None
+    t = _normalize(t)
+    # Render cache (KOKORO_RENDER_CACHE, core/tts_render_cache.py): 'off'
+    # never looks; 'shadow' counts would-hit / would-miss and serves nothing;
+    # 'on' returns a hit (a copy) without starting a render.
+    mode, key = _cache_key(t, speed)
+    if key is not None:
+        try:
+            from core import tts_render_cache as _rc
+            hit = _rc.CACHE.lookup(key, serve=(mode == "on"))
+            if hit is not None:
+                return hit, _SR
+        except Exception:
+            pass
+    res = _render_bounded(t, speed)
+    if res is not None and key is not None:
+        _cache_put(key, res)
+    return res
+
+
+def _normalize(t: str) -> str:
     # JARVIS's own number/version normaliser (times, decimals, versions) if present
     # — Kokoro's g2p reads digits literally otherwise ("v2.0.83" → "vee two point…").
     try:
@@ -234,6 +365,58 @@ def synthesize(text: str, speed: float = 1.0) -> Optional[Tuple["object", int]]:
         t = _norm(t)
     except Exception:
         pass
+    return t
+
+
+def _cache_key(t: str, speed: float):
+    """(mode, key) for the normalised line `t`; key is None when the cache is
+    'off' or no key can be made. Never raises."""
+    try:
+        from core import tts_render_cache as _rc
+        mode = _rc.mode()
+        if mode == "off":
+            return mode, None
+        return mode, _rc.make_key(t, speed, _VOICE, _LANG, _MODEL, _VOICES)
+    except Exception:
+        return "off", None
+
+
+def _cache_put(key: str, res) -> bool:
+    """Store a finished render. Only native-rate audio: a hit is served as
+    (audio, _SR). Never raises."""
+    try:
+        if int(res[1]) != _SR:
+            return False
+        from core import tts_render_cache as _rc
+        return _rc.CACHE.put(key, res[0])
+    except Exception:
+        return False
+
+
+def fill_cache(text: str, speed: float = 1.0) -> bool:
+    """Render `text` into the render cache unless it is already there (for
+    tts_render_cache.prefill_openers). Counts no hit or miss and plays
+    nothing. True when a new entry was stored. Never raises."""
+    try:
+        t = (text or "").strip()
+        if not t or not is_available():
+            return False
+        t = _normalize(t)
+        _mode, key = _cache_key(t, speed)
+        if key is None:
+            return False
+        from core import tts_render_cache as _rc
+        if _rc.CACHE.contains(key):
+            return False
+        res = _render_bounded(t, speed)
+        return res is not None and _cache_put(key, res)
+    except Exception:
+        return False
+
+
+def _render_bounded(t: str, speed: float):
+    """`_render` on a daemon thread, bounded by _SYNTH_TIMEOUT_S → (float32
+    mono ndarray, sr) or None."""
     out: list = []
     th = threading.Thread(target=_render, args=(t, speed, out), daemon=True)
     th.start()

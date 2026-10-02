@@ -117,7 +117,16 @@ class ScanFileTests(unittest.TestCase):
         label, lineno, snip = hits[0]
         self.assertEqual(label, "fake-openai")
         self.assertEqual(lineno, 2)
-        self.assertIn("sk-", snip)
+        # The snippet keeps the line's context but MASKS the matched span, so
+        # nothing returned from a scan carries the secret it caught (audit P3-5).
+        self.assertNotIn(FAKE_OPENAI_KEY, snip)
+        self.assertEqual(snip, "key = <fake-openai>")
+
+    def test_snippet_masks_every_rule_on_the_line(self):
+        path = self._write("two.txt", "a TOKEN_ABC123 b " + FAKE_OPENAI_KEY + "\n")
+        for _label, _ln, snip in cnp._scan_file(path, _isolated_rules()):
+            self.assertNotIn("TOKEN_ABC123", snip)
+            self.assertNotIn(FAKE_OPENAI_KEY, snip)
 
     def test_multiple_rules_and_lines(self):
         body = "a TOKEN_ABC123 here\nnothing\nb " + FAKE_OPENAI_KEY + "\n"
@@ -581,6 +590,23 @@ class MainDirectoryScanTests(unittest.TestCase):
         joined = "\n".join(str(c.args[0]) for c in p.call_args_list if c.args)
         self.assertIn("directory", joined)
         self.assertIn("leak.py", joined)
+
+    def test_output_never_echoes_the_matched_text(self):
+        # Audit P3-5: CI runs this gate on a PUBLIC GitHub Actions log, and it
+        # used to print up to 120 chars of every matching line -- reprinting the
+        # very secret it caught. A finding is now path:line [label] and nothing
+        # else from the line (not the match, not its neighbours).
+        self._write("leak.py", "token = HARDHIT_99 near private context\n")
+        self._write("warn.py", "ip = WARNHIT_7 near other context\n")
+        with mock.patch("builtins.print") as p:
+            rc = cnp.main([self.root, "--strict"])
+        self.assertEqual(rc, 1)
+        joined = "\n".join(str(c.args[0]) for c in p.call_args_list if c.args)
+        self.assertIn("leak.py:1  [fx-hard]", joined)
+        self.assertIn("warn.py:1  [fx-warn]", joined)
+        for leaked in ("HARDHIT_99", "WARNHIT_7", "private context",
+                       "other context", "token =", "ip ="):
+            self.assertNotIn(leaked, joined)
 
 
 class MainTrackedScanTests(unittest.TestCase):

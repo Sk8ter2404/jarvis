@@ -272,6 +272,16 @@ class DialogueWrapperTests(unittest.TestCase):
         self.assertTrue(hasattr(JarvisServicesProtocol,
                                 "register_utterance_route"))
 
+    def test_after_reply_hook_is_forwarded_and_degrades(self):
+        hook = lambda ctx: None  # noqa: E731
+        u = {"register_after_reply": mock.MagicMock(return_value=True)}
+        svc = JarvisServices.from_skill_utils(u)
+        self.assertTrue(svc.register_after_reply(hook))
+        u["register_after_reply"].assert_called_once_with(hook)
+        self.assertFalse(JarvisServices.from_skill_utils({})
+                         .register_after_reply(hook))
+        self.assertTrue(hasattr(JarvisServicesProtocol, "register_after_reply"))
+
     def test_unwired_degrades(self):
         svc = JarvisServices.from_skill_utils({})
         self.assertEqual(svc.dialogue_ready(), "disabled")

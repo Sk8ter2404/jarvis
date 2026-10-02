@@ -107,8 +107,10 @@ _wake_history: list[float] = []
 #   • The list *identity* never changes — only its single element does.
 #     This matches the same idiom used by _sleep_mode / _standby_mode /
 #     _wake_history above, and removes the need for a `global`
-#     declaration at every write site (writes happen inside functions
-#     like context_aware_greeting() and the tray force_wake handler).
+#     declaration at every write site (the one writer is
+#     bobert_companion._note_wake_event(), called by
+#     context_aware_greeting(), the tray force_wake handler and, since
+#     B096, the day's first accepted owner turn).
 #
 # DO NOT REFACTOR THIS TO A PLAIN STRING/Optional[str] VARIABLE. The
 # change would type-check, run cleanly under single-threaded tests,

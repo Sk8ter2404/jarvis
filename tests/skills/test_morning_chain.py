@@ -344,10 +344,12 @@ class MorningChainWatcherTests(unittest.TestCase):
                 self.mod._watch_for_first_wake()
         inv.assert_not_called()
 
-    def test_watcher_invoke_failure_leaves_day_undispatched(self):
-        # If _invoke_skill returns False, dispatched_for_date is NOT set, so a
-        # subsequent tick would retry. We run two ticks: invoke fails on the
-        # first, then we break on the second sleep — invoke called twice.
+    def test_watcher_all_declined_tries_each_once_then_idles_for_the_day(self):
+        # B096: a declining pick ("" -> _invoke_skill False) used to leave the
+        # day undispatched, so every 5 s tick re-ran the same decline (arrival
+        # re-polled until 08:00). Now one tick tries the pick, then the rest
+        # of SKILL_NAMES once each, and the day is done: two ticks -> three
+        # invokes (one per skill), not six.
         today = "2026-06-02"
         bc = self._fake_bc(today)
         sleeps = {"n": 0}
@@ -362,11 +364,13 @@ class MorningChainWatcherTests(unittest.TestCase):
                                return_value=types.SimpleNamespace(tm_hour=9)), \
              mock.patch.object(self.mod, "_choose_skill_for_today", return_value="handoff"), \
              mock.patch.object(self.mod, "_skill_already_fired_today", return_value=False), \
+             mock.patch.object(self.mod, "_arrival_v2_fired_today", return_value=False), \
              mock.patch.object(self.mod, "_invoke_skill", return_value=False) as inv, \
              mock.patch.object(self.mod.time, "sleep", side_effect=_sleep):
             with self.assertRaises(_LoopBreak):
                 self.mod._watch_for_first_wake()
-        self.assertEqual(inv.call_count, 2)
+        self.assertEqual([c[0][0] for c in inv.call_args_list],
+                         ["handoff", "arrival", "briefing"])
 
     def test_watcher_tick_exception_is_caught(self):
         # An unexpected error inside the tick body (here _choose_skill_for_today
@@ -383,6 +387,122 @@ class MorningChainWatcherTests(unittest.TestCase):
              mock.patch.object(self.mod.time, "sleep", side_effect=_LoopBreak):
             with self.assertRaises(_LoopBreak):
                 self.mod._watch_for_first_wake()
+
+
+class MorningChainOneBriefingTests(unittest.TestCase):
+    """B096 (2026-10-01): the chain fires again (the day's first owner turn now
+    stamps the wake), so the day it fires must hold ONE morning briefing: a
+    declining pick hands the morning on once, any briefer that already spoke
+    stands the chain down, and the turn that woke the day finishes first."""
+
+    TODAY = "2026-06-02"
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("morning_chain")
+        saved = sys.modules.get("bobert_companion")
+        self.addCleanup(lambda: sys.modules.__setitem__("bobert_companion", saved)
+                        if saved is not None else sys.modules.pop("bobert_companion", None))
+
+    def _run(self, *, hour=7, chosen="arrival", fired=None, invoke=None,
+             v2=False, daily=False, turn_cell=None, sleep_cell=None, ticks=1,
+             on_sleep=None):
+        """Run `ticks` watcher ticks; returns (invoked skill names, the invoke
+        count seen at each sleep)."""
+        bc = types.ModuleType("bobert_companion")
+        bc._last_wake_date = [self.TODAY]
+        if turn_cell is not None:
+            bc._turn_in_progress = turn_cell
+        if sleep_cell is not None:
+            bc._sleep_mode = sleep_cell
+        fired = fired if fired is not None else {}
+        invoked, seen = [], []
+
+        def _invoke(name, reason):
+            invoked.append(name)
+            return invoke(name) if invoke else True
+
+        def _sleep(_):
+            seen.append(len(invoked))
+            if on_sleep:
+                on_sleep(len(seen))
+            if len(seen) >= ticks:
+                raise _LoopBreak
+
+        db = types.ModuleType("skill_daily_briefing")
+        db.owner_heard_briefing_today = lambda: daily
+        with mock.patch.object(self.mod.importlib, "import_module", return_value=bc), \
+             mock.patch.object(self.mod.time, "strftime", return_value=self.TODAY), \
+             mock.patch.object(self.mod.time, "localtime",
+                               return_value=types.SimpleNamespace(tm_hour=hour)), \
+             mock.patch.object(self.mod, "_choose_skill_for_today", return_value=chosen), \
+             mock.patch.object(self.mod, "_skill_already_fired_today",
+                               side_effect=lambda s: bool(fired.get(s))), \
+             mock.patch.object(self.mod, "_arrival_v2_fired_today", return_value=v2), \
+             mock.patch.dict(sys.modules, {"skill_daily_briefing": db}), \
+             mock.patch.object(self.mod, "_invoke_skill", side_effect=_invoke), \
+             mock.patch.object(self.mod.time, "sleep", side_effect=_sleep):
+            with self.assertRaises(_LoopBreak):
+                self.mod._watch_for_first_wake()
+        return invoked, seen
+
+    def test_arrival_decline_hands_the_morning_to_handoff(self):
+        # Arrival's silence gate returned "" -> before B096 the day stayed open
+        # and arrival was re-picked every 5 s; handoff never got its turn.
+        invoked, _ = self._run(invoke=lambda name: name != "arrival")
+        self.assertEqual(invoked, ["arrival", "handoff"])
+
+    def test_no_fallback_when_a_briefing_landed_during_the_decline(self):
+        # Arrival declined because a manual "morning handoff" fired during its
+        # pre-fire delay: handing the morning on now would brief twice.
+        fired = {}
+
+        def _invoke(name):
+            fired["handoff"] = True       # the manual handoff lands meanwhile
+            return False
+        invoked, _ = self._run(fired=fired, invoke=_invoke, ticks=2)
+        self.assertEqual(invoked, ["arrival"])
+
+    def test_stands_down_when_another_chain_skill_fired_today(self):
+        # Today's pick is arrival but "morning handoff" already ran on request:
+        # one morning briefing per day, not one per skill.
+        invoked, _ = self._run(fired={"handoff": True})
+        self.assertEqual(invoked, [])
+
+    def test_stands_down_when_daily_briefing_heard_today(self):
+        # daily_briefing spoke to him at 08:00; his first words at 08:30 must
+        # not bring a second "Good morning" from the chain.
+        invoked, _ = self._run(hour=8, chosen="handoff", daily=True)
+        self.assertEqual(invoked, [])
+
+    def test_keeps_standing_down_when_arrival_v2_fired_today(self):
+        invoked, _ = self._run(v2=True)
+        self.assertEqual(invoked, [])
+
+    def test_holds_until_the_waking_turn_is_answered(self):
+        # The first turn stamps the wake BEFORE JARVIS replies; the chain waits
+        # for that turn to finish (it may itself be "morning briefing").
+        cell = [True]
+
+        def _on_sleep(n):
+            if n == 1:
+                cell[0] = False           # the reply finished; loop top clears it
+        invoked, seen = self._run(turn_cell=cell, ticks=2, on_sleep=_on_sleep)
+        self.assertEqual(seen, [0, 1])    # nothing while held, then the pick
+        self.assertEqual(invoked, ["arrival"])
+
+    def test_holds_while_the_waking_turn_put_jarvis_to_sleep(self):
+        # The day's first turn was "Jarvis, goodnight" at 06:30 (an
+        # all-nighter): no handoff setup at a sleeping desk, no briefing parked
+        # until the next wake. The day stays open, so his next wake inside the
+        # window gets it.
+        asleep = [True]
+
+        def _on_sleep(n):
+            if n == 2:
+                asleep[0] = False         # "Jarvis" -- awake again
+        invoked, seen = self._run(sleep_cell=asleep, ticks=3, on_sleep=_on_sleep)
+        self.assertEqual(seen, [0, 0, 1])
+        self.assertEqual(invoked, ["arrival"])
 
 
 class InvokeSkillDeclineTests(unittest.TestCase):

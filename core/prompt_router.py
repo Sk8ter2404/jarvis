@@ -107,6 +107,8 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "SCREEN VISION": [
         "screen", "what's on", "whats on", "looking at", "read the screen",
         "what do you see", "on my screen", "on screen", "see the screen",
+        # Reading requests name the page, not the screen (live 2026-10-01).
+        "this page", "the page", "read this", "this article",
     ],
     "WEBCAM AWARENESS": [
         "camera", "webcam", "see me", "can you see", "pointed at me",
@@ -201,6 +203,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "CLAUDE CREDITS": [
         "claude", "credit", "credits", "api", "quota", "budget", "cost",
         "spending", "usage", "token",
+        # check_credits' 'check my Anthropic balance' loaded nothing; the
+        # running_costs phrasings are spelled out so they never ride on the
+        # bare "cost" alone.
+        "anthropic", "running cost", "cost to run", "you cost",
+        "electricity", "power bill",
     ],
     "SYSTEM HEALTH": [
         "health", "cpu", "gpu", "ram", "memory usage", "disk", "temperature",
@@ -258,6 +265,14 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "DOSSIER": [
         "dossier", "pull up the file", "file on", "what do you know about",
         "tell me about",
+    ],
+    # skills/globe.py. Bare "where is" / "where's" deliberately NOT here: they
+    # are the package, print, robot-build and where-am-I questions, and the
+    # globe must not ride along on those. "show me where" is the globe's own
+    # phrasing; "pin" is short, so it takes only a plural ("pins"), never
+    # "pinned" / "ping" / "spin".
+    "GLOBE": [
+        "globe", "show me where", "pin", "on the map", "world map",
     ],
     "SUIT-UP CINEMATIC": ["suit up", "suit-up", "boot sequence", "cinematic"],
     "TASK QUEUE": [
@@ -343,6 +358,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "IMAGE GENERATION": [
         "generate an image", "make a picture", "draw me", "image of",
         "create an image", "sdxl", "picture of", "generate a picture",
+    ],
+    "WEBSITE BUILDER": [
+        "website", "web site", "landing page", "web page", "webpage",
+        "homepage", "home page", "site for",
     ],
     "LOCAL VISION": ["offline vision", "local vision", "vlm"],
     "PERSONAL RAG": [

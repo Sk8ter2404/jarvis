@@ -76,7 +76,9 @@ class _Cap:
         import numpy as np
         self.reads += 1
         if self._alive(self._clock.t):
-            return True, np.zeros((8, 8, 3), dtype=np.uint8)
+            # Mid-grey, not zeros: an all-black frame is no longer a live
+            # one (bobert_companion._CAMERA_BLACK_FRAME_LEVEL, 2026-10-01).
+            return True, np.full((8, 8, 3), 128, dtype=np.uint8)
         return False, None
 
     def release(self):

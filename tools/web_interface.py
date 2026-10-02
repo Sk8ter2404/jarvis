@@ -81,11 +81,22 @@ CONTROL ROUTES ADDED 2026-09-30 (web audit)
                            _off = the pinned switch) via tray_commands.json
   GET  /api/panels, GET /api/panel/<id>/state, POST /api/panel/<id>/action,
   GET  /api/panel/<id>/stream/<name>   skill-declared panels (core/web_panels.py)
+
+ROUTES ADDED 2026-10-02
+=======================
+  GET  /api/timeline       "What JARVIS did": the last 50 turns from the session
+                           log (time, source, actions ok/failed, latency); the
+                           words only with DASHBOARD_SHOW_TRANSCRIPTS on AND a
+                           loopback peer (build_timeline)
+  GET  /api/proactive      every proactive / background behaviour and its
+                           switch (PROACTIVE_FEATURES)
+  POST /api/proactive      {"key", "on"}: saves one switch via _write_settings
 """
 from __future__ import annotations
 
 import glob
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -261,6 +272,9 @@ class NoRuntime:
     def speak_sets(self):
         return None
 
+    def flag(self, name):
+        return None
+
 
 class LiveRuntime(NoRuntime):
     """Reads the RUNNING monolith - and ONLY when this process IS the booted
@@ -330,6 +344,13 @@ class LiveRuntime(NoRuntime):
         return (set(getattr(bc, "SPEAK_RESULT_VERBATIM_ACTIONS", ()) or ()),
                 set(getattr(bc, "INFORMATIVE_ACTIONS", ()) or ()),
                 set(getattr(bc, "SELF_VOICED_ACTIONS", ()) or ()))
+
+    def flag(self, name):
+        """The running loop's own value of an on/off constant (its copy of
+        core.config, or one of its own), or None when unknown."""
+        bc = self._bc()
+        v = getattr(bc, name, None) if bc is not None and name else None
+        return v if isinstance(v, bool) else None
 
 
 def _runtime(cfg: dict):
@@ -1327,8 +1348,16 @@ def _append_json_queue(path: str, item: dict, *, prefix: str,
             raise
 
 
+# The inject "source" this page writes. The main loop logs a web inject as
+# "[inject] (web) <text>" (bobert_companion._inject_log_tag), which is how the
+# "What JARVIS did" timeline tells a dashboard turn from any other typed one.
+# Not "test": the owner typing here is still the owner (the learn gate).
+WEB_INJECT_SOURCE = "web"
+
+
 def inject_command(text: str, inject_path: str) -> None:
-    """Append ``{"text": text, "ts": ...}`` to the inject queue atomically.
+    """Append ``{"text": text, "ts": ..., "source": "web"}`` to the inject
+    queue atomically.
 
     Read-modify-write under a fresh temp + os.replace so a concurrent
     ``_drain_injected_command`` (which claims the file by renaming it) never sees
@@ -1336,7 +1365,8 @@ def inject_command(text: str, inject_path: str) -> None:
     can neither lose nor duplicate an item. If the queue was mid-consume
     (renamed away) we simply start a fresh list — the loop will drain ours next
     pass. Matches driver.py's ``inject`` and staging_instance's writer."""
-    _append_json_queue(inject_path, {"text": text, "ts": time.time()},
+    _append_json_queue(inject_path, {"text": text, "ts": time.time(),
+                                     "source": WEB_INJECT_SOURCE},
                        prefix=".webinject_", indent=2)
 
 
@@ -1536,6 +1566,157 @@ def wait_for_reply(text: str, log_dir: str, timeout: float) -> dict:
     return {"status": "ok" if got else "accepted", "lines": res["lines"],
             "reply": res["reply"], "actions": res["actions"],
             "spoken": res["spoken"]}
+
+
+# ── "What JARVIS did" timeline (GET /api/timeline, 2026-10-02) ──────────────
+# The last _TIMELINE_MAX_TURNS turns: when, from where (voice / typed / web),
+# each action run (ok / failed) and the [turn-timing] latency marks. Nothing
+# in the running process keeps that per-turn record (_action_history holds the
+# last 5 actions and no turn; conversation_history holds text and no timing),
+# so it is read from the session logs, READ-ONLY, through the latency report's
+# own parser (tools/turn_latency_report.parse_log) - one [turn-timing] parser.
+#
+# TRANSCRIPTS. What was said (the owner's words and JARVIS's reply) is
+# personal: build_timeline carries it only when asked to (show_text), and the
+# handler asks only when DASHBOARD_SHOW_TRANSCRIPTS is on AND the request's
+# PEER address is loopback (is_local_client) - never for a LAN client, token
+# or no token. No header (Host, X-Forwarded-For) is trusted for that.
+_TIMELINE_MAX_TURNS = 50
+_TIMELINE_MAX_LOGS = 3            # newest session logs read for those turns
+_TIMELINE_TEXT_MAX = 400
+_TIMELINE_INJECT_WEB_RE = re.compile(
+    r"^\[inject\]\s+(?:\(standby\)\s+)?\(web\)(?:\s|$)", re.I)
+_TIMELINE_YOU_RE = re.compile(r"^You:\s*(.*)$")
+# "[action] name: result" / "[action] name failed [class]: error" /
+# "[action] name failed: error" (parse_and_run_actions). Only a plain
+# identifier counts as a name, so no other text can ride out in one.
+_TIMELINE_ACTION_RE = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_.-]{0,63})(\s+failed\b[^:]*)?:\s*(.*)$")
+_TIMELINE_CONFIRM_RE = re.compile(
+    r"REQUIRES CONFIRMATION:\s*([A-Za-z_][A-Za-z0-9_.-]{0,63})\(")
+
+
+def is_local_client(host) -> bool:
+    """True when ``host`` (a request's PEER address, client_address[0]) is
+    loopback - the request came from this machine. An IPv4-mapped IPv6
+    address counts as its IPv4 form; anything unparseable is NOT local."""
+    try:
+        ip = ipaddress.ip_address(str(host or "").strip().split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return bool((mapped or ip).is_loopback)
+
+
+def _transcripts_setting() -> bool:
+    """DASHBOARD_SHOW_TRANSCRIPTS as the running JARVIS has it (core.config;
+    default False). Only a real True turns it on. Never raises."""
+    return _config_value("DASHBOARD_SHOW_TRANSCRIPTS", False) is True
+
+
+def _timeline_action_failed(result: str) -> bool:
+    """The follow-up loop's own failure test (core.failure_markers)."""
+    try:
+        from core.failure_markers import FAILURE_MARKERS
+    except Exception:
+        return False
+    low = (result or "").lower()
+    return any(m.lower() in low for m in FAILURE_MARKERS)
+
+
+def _timeline_action(body: str):
+    """{"name", "status": ok|failed|pending} for one "[action] ..." log body,
+    or None. Carries the action's NAME only - never its result text."""
+    rest = body[len("[action]"):].strip()
+    m = _TIMELINE_CONFIRM_RE.search(rest)
+    if m:
+        return {"name": m.group(1), "status": "pending"}
+    m = _TIMELINE_ACTION_RE.match(rest)
+    if not m:
+        return None
+    failed = bool(m.group(2)) or _timeline_action_failed(m.group(3))
+    return {"name": m.group(1), "status": "failed" if failed else "ok"}
+
+
+def _timeline_entry(turn: dict, rep, show_text: bool) -> dict:
+    """One timeline row from one parse_log(keep_lines=N) turn."""
+    from core.turn_timing import MARKS
+    kv = turn.get("kv") or {}
+    bodies = [_log_body(ln) for ln in turn.get("lines") or ()]
+    # The turn's own lines start at its LAST "You:" line (the loop prints it
+    # once the utterance passed every gate); anything before is idle chatter.
+    you_i = None
+    for i, b in enumerate(bodies):
+        if _TIMELINE_YOU_RE.match(b):
+            you_i = i
+    kind = kv.get("kind", "")
+    if kind == "inject":
+        injects = [b for b in bodies[:you_i] if b.lower().startswith("[inject]")]
+        source = ("web" if injects and _TIMELINE_INJECT_WEB_RE.match(injects[-1])
+                  else "typed")
+    else:
+        source = "voice"
+    after = bodies[you_i + 1:] if you_i is not None else []
+    actions = [a for a in (_timeline_action(b) for b in after
+                           if b.lower().startswith("[action]")) if a]
+    ts = turn.get("ts")
+    entry = {
+        "time": ts.strftime("%H:%M:%S") if ts else "",
+        "date": ts.strftime("%Y-%m-%d") if ts else "",
+        "source": source,
+        "kind": kind,
+        "outcome": kv.get("outcome", ""),
+        "actions": actions,
+        "latency": {
+            "answer_ms": rep._i(kv, "first_play"),
+            "end_ms": rep._i(kv, "end"),
+            "stt_ms": rep._d(kv, "stt_start", "stt_end"),
+            "llm_ms": rep._d(kv, "llm_post", "llm_done"),
+            "filler_ms": rep._i(kv, "filler_ms"),
+        },
+        "marks": {m: rep._i(kv, m) for m in (*MARKS, "end")},
+    }
+    if show_text:
+        you = ("" if you_i is None
+               else _TIMELINE_YOU_RE.match(bodies[you_i]).group(1))
+        entry["you"] = you.strip()[:_TIMELINE_TEXT_MAX]
+        entry["reply"] = parse_turn_lines(after)["reply"][:_TIMELINE_TEXT_MAX]
+    return entry
+
+
+def build_timeline(log_dir: str, *, show_text: bool = False,
+                   limit: int = _TIMELINE_MAX_TURNS) -> dict:
+    """The GET /api/timeline payload, newest turn first::
+
+        {"turns": [{time, date, source, kind, outcome, actions, latency,
+                    marks, you?, reply?}, ...],
+         "count": n, "logs": [basenames read], "show_text": bool}
+
+    Reads the newest _TIMELINE_MAX_LOGS session logs (newest first, until
+    ``limit`` turns are found) READ-ONLY. ``you`` / ``reply`` exist ONLY when
+    ``show_text`` - the caller decides that (see the block comment above)."""
+    from tools import turn_latency_report as rep
+    limit = max(1, min(int(limit), _TIMELINE_MAX_TURNS))
+    try:
+        paths = sorted(glob.glob(os.path.join(log_dir, "session_*.log")),
+                       reverse=True)[:_TIMELINE_MAX_LOGS]
+    except Exception:
+        paths = []
+    turns: list = []
+    read: list = []
+    for p in paths:
+        try:
+            got, _events = rep.parse_log(p, keep_lines=limit)
+        except OSError:
+            continue
+        read.append(os.path.basename(p))
+        turns = got + turns
+        if len(turns) >= limit:
+            break
+    rows = [_timeline_entry(t, rep, show_text) for t in turns[-limit:]]
+    rows.reverse()
+    return {"turns": rows, "count": len(rows), "logs": read,
+            "show_text": bool(show_text)}
 
 
 # ── settings bridge (the FULL settings control panel) ───────────────────────
@@ -1990,6 +2171,256 @@ def _default_user_settings_path() -> str:
         return sw.settings_path()
     except Exception:
         return os.path.join(PROJECT_DIR, "data", "user_settings.json")
+
+
+# ── Proactive features page (GET / POST /api/proactive, 2026-10-02) ─────────
+# ONE list of every behaviour JARVIS starts on his own, with its switch. DATA,
+# not code: the page, the toggle route and the completeness test
+# (tests/test_web_proactive.py, which greps core/config.py and
+# bobert_companion.py for such flags) all read PROACTIVE_FEATURES.
+#
+# "applies" was read off each consumer, not guessed:
+#   restart  the key is a core/config.py constant. A save writes
+#            user_settings.json only (_write_settings) and nothing re-reads that
+#            file while JARVIS runs: every consumer reads the value it booted
+#            with (its thread is started at boot, or it reads the monolith's
+#            boot-time copy / core.config, which the save does not touch).
+#   live     a save takes effect at once (no row is, today).
+#   code     a constant in bobert_companion.py; _apply_user_settings only
+#            reaches core/config.py constants, so the settings file cannot.
+#   always   nothing switches it off.
+# A row is SETTABLE from the page only when its key is a bool row of the
+# Settings schema - the one path _write_settings accepts.
+PROACTIVE_FEATURES = (
+    # ── settable here (Settings schema rows); apply on the next start ──
+    {"key": "AMBIENT_LISTEN_ENABLED", "name": "Ambient listening & learning",
+     "what": "Transcribes speech around the PC in the background and learns "
+             "facts from what it overhears",
+     "applies": "restart",
+     "how": "the listener is started at boot; 'ambient mode on' / 'off' "
+            "switches it now"},
+    {"key": "AMBIENT_SCREEN_ENABLED", "name": "Ambient screen watching",
+     "what": "Reads the screen every so often with the vision model for "
+             "context",
+     "applies": "restart",
+     "how": "started at boot; the ambient_screen_start / ambient_screen_stop "
+            "actions switch it now"},
+    {"key": "TEAMS_NUDGE_ENABLED", "name": "Teams nudger",
+     "what": "Every 10 minutes, reads the screen and says when Teams shows "
+             "unread messages",
+     "applies": "restart", "how": "its thread is started at boot"},
+    {"key": "PROCESSING_FILLER_ENABLED", "name": "Processing filler",
+     "what": "Says a short 'just a moment' line when a spoken reply is slow",
+     "applies": "restart",
+     "how": "the running loop keeps the value it booted with"},
+    {"key": "LOCAL_PREFIX_REPRIME", "name": "Idle re-prime",
+     "what": "After a held-back prompt update, quietly re-sends the prompt to "
+             "the loaded local model so the next reply is fast",
+     "applies": "restart",
+     "how": "the running loop keeps the value it booted with"},
+    {"key": "MISSION_NARRATION_ENABLED", "name": "Mission narration",
+     "what": "Narrates each step of a multi-action plan aloud as it runs",
+     "applies": "restart",
+     "how": "the running loop keeps the value it booted with"},
+    {"key": "NIGHT_QUIET_ENABLED", "name": "Night quiet",
+     "what": "From about 22:00, a quieter, shorter voice and fewer unprompted "
+             "lines",
+     "applies": "restart", "how": "read from the boot-time settings"},
+    {"key": "NIGHT_OWL_AUTO", "name": "Night-owl mode by itself",
+     "what": "Switches night-owl mode on at 23:00: quieter voice, short "
+             "replies, announcements held",
+     "applies": "restart", "how": "read from the boot-time settings"},
+    {"key": "STANDBY_LOOP_ENABLED", "name": "Lyrics auto-standby",
+     "what": "Goes to wake-word-only mode by itself when music with lyrics "
+             "plays",
+     "applies": "restart", "how": "the detector is started at boot"},
+    {"key": "KINECT_PRESENCE_STANDBY", "name": "Standby when the room is empty",
+     "what": "Goes to standby when the Kinect sees nobody (needs room "
+             "presence)",
+     "applies": "restart", "how": "read from the boot-time settings"},
+    {"key": "KINECT_PRESENCE_WAKE", "name": "Wake when someone walks in",
+     "what": "Wakes up when the Kinect sees someone come back (needs room "
+             "presence)",
+     "applies": "restart", "how": "read from the boot-time settings"},
+    {"key": "KINECT_GREET_ON_ENTRY", "name": "Greet on return",
+     "what": "A short greeting when you enter a room that was empty for a "
+             "while",
+     "applies": "restart", "how": "read from the boot-time settings"},
+    {"key": "KINECT_POSTURE_NUDGE", "name": "Posture nudges",
+     "what": "One gentle nudge after a long hunch or a long seated stretch",
+     "applies": "restart", "how": "read from the boot-time settings"},
+    {"key": "GREET_NEW_PEOPLE_ENABLED", "name": "Greet new people",
+     "what": "One short hello when several unfamiliar faces appear (needs "
+             "face recognition)",
+     "applies": "restart",
+     "how": "read from the boot-time settings; 'say hi to guests' switches "
+            "it now"},
+    {"key": "OVERNIGHT_UPGRADE_ENABLED", "name": "Overnight self-upgrade",
+     "what": "Runs the self-upgrade pipeline by itself while the PC is idle",
+     "applies": "restart", "how": "checked once at boot"},
+    {"key": "GAME_MODE_ENABLED", "name": "Game-mode watcher",
+     "what": "Swaps to the smaller game brain by itself while a listed game "
+             "is in front",
+     "applies": "restart",
+     "how": "the watcher is started at boot; 'game mode on' works by voice"},
+    {"key": "AUDIO_AUTOSWITCH_ENABLED", "name": "Headset auto-switch",
+     "what": "Makes the headset the default speakers when it powers on, and "
+             "switches back when it turns off",
+     "applies": "restart", "how": "the watcher is started at boot"},
+    # ── core/config.py constants the Settings window does not list ──
+    {"key": "CHAPPIE_ENABLED", "name": "Chappie (background distillation)",
+     "what": "Silently distils conversations into episodes and facts with the "
+             "cloud model (spends credit)",
+     "applies": "restart",
+     "how": "read once at boot; not in the Settings window, so only a hand "
+            "edit of data/user_settings.json sets it"},
+    {"key": "MID_TASK_STATUS_ENABLED", "name": "Mid-task status line",
+     "what": "Says one short status line when an action is still running "
+             "after 8 seconds",
+     "applies": "restart",
+     "how": "not in the Settings window, so only a hand edit of "
+            "data/user_settings.json sets it"},
+    {"key": "UPDATE_CHECK_ENABLED", "name": "Update check",
+     "what": "Says once when a new release is available",
+     "applies": "restart",
+     "how": "checked once at boot; not in the Settings window, so only a "
+            "hand edit of data/user_settings.json sets it"},
+    {"key": "ROBOT_ENABLED", "name": "Robot reactions",
+     "what": "Mirrors JARVIS's state and lip-sync to the physical robot",
+     "applies": "restart",
+     "how": "not in the Settings window, so only a hand edit of "
+            "data/user_settings.json sets it"},
+    {"key": "APPLE_MUSIC_AUTOSTART", "name": "Music app autostart",
+     "what": "Opens the Apple Music app once when JARVIS starts",
+     "applies": "restart",
+     "how": "checked once at boot; not in the Settings window"},
+    {"key": "APPLE_MUSIC_KEEP_OPEN", "name": "Music app keep-open",
+     "what": "Re-opens the Apple Music app whenever it is closed",
+     "applies": "restart",
+     "how": "checked once at boot; not in the Settings window"},
+    # ── constants of the monolith (bobert_companion.py) ──
+    {"key": "PROACTIVE_ENABLED", "name": "Proactive comments",
+     "what": "After a few minutes of silence, may make one short unprompted "
+             "remark",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "ANTICIPATION_ENABLED", "name": "Anticipation engine",
+     "what": "Volunteers lines about your habits, a long session or the late "
+             "hour",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "ANTICIPATION_BRIEFING_ENABLED", "name": "Anticipation briefing",
+     "what": "Mentions a predicted habit shortly before the time it usually "
+             "comes up",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "WEEKLY_DIGEST_ENABLED", "name": "Weekly habit offers",
+     "what": "Offers day-of-week habits on the days they usually happen",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "DAILY_BRIEFING_ENABLED", "name": "Daily briefing",
+     "what": "A spoken morning summary at a set time",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "EVENING_BRIEFING_ENABLED", "name": "Evening briefing",
+     "what": "A spoken end-of-day summary at a set time",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "DAILY_RECAP_ENABLED", "name": "Daily recap",
+     "what": "A spoken recap of what happened today, late in the evening",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "WEATHER_BRIEFING_PROACTIVE", "name": "Weather alerts",
+     "what": "Warns about a significant weather change a couple of hours "
+             "ahead",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "AMAZON_TRACKING_ENABLED", "name": "Order announcer",
+     "what": "Announces shipping-status changes it finds in the mailbox",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "LEARN_EVERY_TURN", "name": "Learn from every turn",
+     "what": "Extracts facts from each conversation turn in the background",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    {"key": "AMBIENT_AUDIO_ENABLED", "name": "Ambient system-audio capture",
+     "what": "Captures the PC's own audio output for ambient context",
+     "applies": "code", "how": "a constant in bobert_companion.py"},
+    # ── no switch at all ──
+    {"key": "BANTER_ENABLED", "name": "Banter",
+     "what": "Dry quips about habits it notices",
+     "applies": "always",
+     "how": "skills/banter.py reads BANTER_ENABLED but nothing defines it"},
+    {"key": "", "name": "Morning chain",
+     "what": "Runs one morning skill on the day's first wake between 06:00 "
+             "and noon",
+     "applies": "always", "how": "no switch"},
+    {"key": "", "name": "Morning arrival briefing",
+     "what": "One morning briefing once you have been seen at the desk for a "
+             "while",
+     "applies": "always", "how": "no switch"},
+    {"key": "", "name": "Desk-break nudge",
+     "what": "A soft break nudge after 90 minutes at the desk",
+     "applies": "always", "how": "no switch"},
+    {"key": "", "name": "Screen-stare nudge",
+     "what": "Offers a stretch timer after a long idle stare at one window",
+     "applies": "always", "how": "no switch"},
+    {"key": "", "name": "System pulse alerts",
+     "what": "Speaks up when a system reading looks abnormal",
+     "applies": "always", "how": "no switch"},
+    {"key": "", "name": "Promise follow-ups",
+     "what": "Speaks the follow-up when something it promised to watch for "
+             "happens",
+     "applies": "always", "how": "no switch"},
+    {"key": "", "name": "Notification read-out",
+     "what": "Reads Windows notifications aloud when a triage rule says so",
+     "applies": "always", "how": "no switch; its rules decide what is read"},
+    {"key": "", "name": "Diagnostic daemons",
+     "what": "Self-diagnostics, crash watch and anomaly watch in the "
+             "background",
+     "applies": "always",
+     "how": "no switch; the Pause daemons control pauses them now"},
+    {"key": "", "name": "Music auto-standby",
+     "what": "Says so and goes to standby when it keeps hearing music",
+     "applies": "always", "how": "no switch"},
+)
+_PROACTIVE_BY_KEY = {f["key"]: f for f in PROACTIVE_FEATURES if f["key"]}
+PROACTIVE_NOTE = ("Everything JARVIS does on his own. A switch saves the "
+                  "setting; most apply the next time JARVIS starts.")
+
+
+def _proactive_settable(feat: dict, schema: dict) -> bool:
+    """A row the page may switch: a bool Settings-schema row that a save
+    can reach (see PROACTIVE_FEATURES)."""
+    key = feat.get("key") or ""
+    return (feat.get("applies") in ("restart", "live")
+            and (schema.get(key) or {}).get("type") == "bool")
+
+
+def proactive_payload(cfg: dict) -> dict:
+    """GET /api/proactive: one row per PROACTIVE_FEATURES entry with its
+    current value (the RUNNING loop's when this is the live JARVIS, else
+    core.config's; None when unknown), the saved value when the settings file
+    holds one, and pending_restart when the two differ. Never raises."""
+    schema, coerce = _load_settings_schema()
+    saved = _read_saved_settings((cfg or {}).get("user_settings_path"))
+    rt = _runtime(cfg)
+    rows = []
+    for f in PROACTIVE_FEATURES:
+        key = f["key"]
+        row = {"key": key, "name": f["name"], "what": f["what"],
+               "applies": f["applies"], "how": f["how"],
+               "settable": _proactive_settable(f, schema)}
+        if f["applies"] == "always":
+            value = True
+        else:
+            value = rt.flag(key)
+            if value is None and f["applies"] != "code":
+                value = _config_value(key, None)
+        row["value"] = value if isinstance(value, bool) else None
+        if key and key in saved:
+            sv = saved[key]
+            try:
+                if coerce and key in schema:
+                    sv = coerce(schema[key], sv)
+            except Exception:
+                pass
+            if isinstance(sv, bool):
+                row["saved"] = sv
+                row["pending_restart"] = (row["value"] is not None
+                                          and sv != row["value"])
+        rows.append(row)
+    return {"features": rows, "count": len(rows), "note": PROACTIVE_NOTE}
 
 
 # ── control-panel data sources (System / Actions / Voice / Camera / Memory) ──
@@ -2713,8 +3144,9 @@ def _read_memory() -> dict:
 class _Handler(BaseHTTPRequestHandler):
     """Routes: GET / (dashboard), GET /api/status, GET /api/log/tail, GET
     /api/settings, the read-only control-panel GETs (system / actions / voices /
-    memory / camera-*), POST /api/say, POST /api/settings, POST /api/action,
-    POST /api/control, and the skill-panel routes (/api/panels, /api/panel/...).
+    memory / timeline / proactive / camera-*), POST /api/say, POST
+    /api/settings, POST /api/action, POST /api/control, POST /api/proactive,
+    and the skill-panel routes (/api/panels, /api/panel/...).
     The owning server pins config onto the class instance via the ``config``
     attribute set in ``create_server`` (a small dict) so handlers are stateless
     beyond it."""
@@ -3184,6 +3616,32 @@ class _Handler(BaseHTTPRequestHandler):
                                         "counts": {"facts": 0, "episodes": 0}},
                                        code=500)
 
+        if path == "/api/proactive":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            try:
+                return self._send_json(proactive_payload(cfg))
+            except Exception as e:
+                return self._send_json({"error": f"proactive read failed: {e}",
+                                        "features": []}, code=500)
+
+        if path == "/api/timeline":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            # What was said rides along ONLY for a loopback peer with the
+            # setting on - see build_timeline's block comment. "transcripts"
+            # tells the page why the words are missing (no text in it).
+            setting = _transcripts_setting()
+            show = setting and is_local_client(self.client_address[0])
+            try:
+                payload = build_timeline(cfg["log_dir"], show_text=show)
+            except Exception as e:
+                return self._send_json({"error": f"timeline read failed: {e}",
+                                        "turns": [], "count": 0}, code=500)
+            payload["transcripts"] = ("shown" if show else
+                                      "local_only" if setting else "off")
+            return self._send_json(payload)
+
         if path == "/api/camera-preview":
             if not self._authorized(query, is_page=False):
                 return self._unauthorized()
@@ -3305,6 +3763,11 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authorized(query, is_page=False):
                 return self._unauthorized()
             return self._handle_post_control(cfg)
+
+        if path == "/api/proactive":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            return self._handle_post_proactive(cfg)
 
         if path.startswith("/api/panel/"):
             if not self._authorized(query, is_page=False):
@@ -3470,6 +3933,39 @@ class _Handler(BaseHTTPRequestHandler):
                                    code=500)
         _log_info(f"control {cmd} queued from the web dashboard")
         return self._send_json({"ok": True, "queued": cmd})
+
+    # ── POST /api/proactive — switch one proactive feature ───────────────────
+    def _handle_post_proactive(self, cfg: dict) -> None:
+        """Body ``{"key": <a PROACTIVE_FEATURES key>, "on": true|false}``.
+        Saved with _write_settings - the Settings tab's own helper - and only
+        for a row the settings file can reach (_proactive_settable); any
+        other key is refused before anything is written."""
+        data, err = self._json_object_body(require_json_type=True)
+        if err:
+            return self._send_json({"error": err[1]}, code=err[0])
+        key, on = data.get("key"), data.get("on")
+        feat = _PROACTIVE_BY_KEY.get(key) if isinstance(key, str) else None
+        if feat is None:
+            return self._send_json({"error": "not a proactive feature"},
+                                   code=404)
+        if not isinstance(on, bool):
+            return self._send_json({"error": "on must be true or false"},
+                                   code=400)
+        schema, _coerce = _load_settings_schema()
+        if not _proactive_settable(feat, schema):
+            return self._send_json(
+                {"error": f"{key} can't be switched from the settings file "
+                          f"({feat['how']})"}, code=400)
+        try:
+            applied = _write_settings({key: on}, cfg["user_settings_path"])
+        except SettingsWriteError as e:
+            return self._send_json({"error": str(e)}, code=400)
+        except Exception as e:
+            return self._send_json({"error": f"settings write failed: {e}"},
+                                   code=500)
+        return self._send_json({"ok": True, "applied": applied,
+                                "applies": feat["applies"],
+                                "note": SETTINGS_RESTART_NOTE})
 
     # ── skill panels (core/web_panels.py) ───────────────────────────────────
     _PANEL_PATH_RE = re.compile(
@@ -3688,6 +4184,19 @@ _DASHBOARD_PAGE = r"""<!doctype html>
           background:transparent; color:var(--cyan); }
   .lrow .send:hover { background:var(--cyan); color:#04222b; }
   .count { color:var(--muted); font-size:12px; margin:2px 2px 10px; }
+  /* Timeline ("What JARVIS did") and Proactive: they reuse .lrow / .schip and
+     .sgroup / .srow; only the outcome tones and the row layout are new. */
+  .schip.ok { color:var(--good); border-color:#12604a; }
+  .schip.bad { color:var(--bad); border-color:#7a2222; }
+  .schip.pending { color:var(--warn); border-color:#7a5a12; }
+  .lrow.tl .txt { display:flex; flex-wrap:wrap; gap:6px; flex:1 1 240px; }
+  .lrow.tl .schip { max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+  .lrow.tl .tlat { font-size:12px; }
+  .lrow.tl .tsaid { flex-basis:100%; color:#a9c7d1; font-size:12.5px;
+          white-space:pre-wrap; word-break:break-word; }
+  .viewbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .viewbar .count { flex:1 1 200px; }
+  .viewbar button { padding:6px 12px; font-size:12px; margin:0 0 10px; }
   #actionResult { white-space:pre-wrap; color:#eafcff; margin:0 2px 10px; min-height:1.2em; }
   /* Voice: a wrapping row of profile buttons + an info strip. */
   .voicebtns { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
@@ -3782,6 +4291,8 @@ _DASHBOARD_PAGE = r"""<!doctype html>
     <button id="navLive" class="active" type="button" aria-current="page">Live</button>
     <button id="navSystem" type="button">System</button>
     <button id="navActions" type="button">Actions</button>
+    <button id="navTimeline" type="button" title="What JARVIS did">Timeline</button>
+    <button id="navProactive" type="button" title="Proactive features">Proactive</button>
     <button id="navVoice" type="button">Voice</button>
     <button id="navCamera" type="button">Camera</button>
     <button id="navMemory" type="button">Memory</button>
@@ -3859,6 +4370,29 @@ _DASHBOARD_PAGE = r"""<!doctype html>
            placeholder="Search actions… (name)" aria-label="Search actions">
     <div id="actionResult" aria-live="polite"></div>
     <div id="actionsList" class="listbox"></div>
+  </section>
+
+  <!-- ── TIMELINE VIEW ("What JARVIS did", GET /api/timeline) ─────────────
+       The last 50 turns from the session log: time, source (voice / typed /
+       web), each action run (ok / failed) and the turn's latency. What was
+       SAID is in the payload only when DASHBOARD_SHOW_TRANSCRIPTS is on AND
+       this browser is on the JARVIS PC - the server leaves it out otherwise. -->
+  <section id="viewTimeline" class="view" hidden>
+    <div class="viewbar">
+      <div id="tlCount" class="count" role="status">loading timeline…</div>
+      <button id="tlRefresh" type="button">Refresh</button>
+    </div>
+    <div id="tlList" class="listbox" aria-label="Recent turns"></div>
+  </section>
+
+  <!-- ── PROACTIVE VIEW (GET /api/proactive) ──────────────────────────────
+       Every behaviour JARVIS starts on his own, one row each: its settings
+       key, current value, what it does, and whether a change applies live or
+       on the next start. A toggle saves through POST /api/proactive, which
+       writes the setting with the same helper as the Settings tab. -->
+  <section id="viewProactive" class="view" hidden>
+    <div id="proNote" class="count" role="status">loading proactive features…</div>
+    <div id="proList"></div>
   </section>
 
   <!-- ── VOICE VIEW (the REAL engine + voice, and one button per usable clone
@@ -4247,6 +4781,10 @@ const viewActions = document.getElementById('viewActions');
 const viewVoice   = document.getElementById('viewVoice');
 const viewCamera  = document.getElementById('viewCamera');
 const viewMemory  = document.getElementById('viewMemory');
+const navTimeline  = document.getElementById('navTimeline');
+const navProactive = document.getElementById('navProactive');
+const viewTimeline  = document.getElementById('viewTimeline');
+const viewProactive = document.getElementById('viewProactive');
 const navEl = document.getElementById('nav');
 const wrapEl = document.getElementById('wrap');
 
@@ -4259,17 +4797,20 @@ const VIEWS = {
   live:     {nav:navLive,     view:viewLive},
   system:   {nav:navSystem,   view:viewSystem},
   actions:  {nav:navActions,  view:viewActions},
+  timeline: {nav:navTimeline, view:viewTimeline},
+  proactive:{nav:navProactive, view:viewProactive},
   voice:    {nav:navVoice,    view:viewVoice},
   camera:   {nav:navCamera,   view:viewCamera},
   memory:   {nav:navMemory,   view:viewMemory},
   settings: {nav:navSettings, view:viewSettings},
 };
 let currentView = 'live';
-let systemTimer = null, cameraTimer = null, panelTimer = null;
+let systemTimer = null, cameraTimer = null, panelTimer = null, timelineTimer = null;
 let actionsLoaded = false, voiceLoaded = false, memoryLoaded = false;
 
 function stopViewTimers() {
   if (systemTimer) { clearInterval(systemTimer); systemTimer = null; }
+  if (timelineTimer) { clearInterval(timelineTimer); timelineTimer = null; }
   if (cameraTimer) {
     clearInterval(cameraTimer); cameraTimer = null;
     // An MJPEG stream holds a server worker thread AND one of the browser's ~6
@@ -4300,6 +4841,12 @@ function showView(which) {
     systemTimer = setInterval(() => { if (pollsWanted()) loadSystem(); }, 2000);
   }
   else if (which === 'actions') { if (!actionsLoaded) { loadActions(); actionsLoaded = true; } }
+  else if (which === 'timeline') {
+    // Re-reads the session log, so a slow refresh (and a Refresh button).
+    loadTimeline();
+    timelineTimer = setInterval(() => { if (pollsWanted()) loadTimeline(); }, TL_REFRESH_MS);
+  }
+  else if (which === 'proactive') loadProactive();
   else if (which === 'voice')   { if (!voiceLoaded)   { loadVoices();  voiceLoaded  = true; } }
   else if (which === 'memory')  { if (!memoryLoaded)  { loadMemory();  memoryLoaded = true; } }
   else if (which === 'camera')  {
@@ -4314,6 +4861,8 @@ function showView(which) {
 navLive.addEventListener('click', () => showView('live'));
 navSystem.addEventListener('click', () => showView('system'));
 navActions.addEventListener('click', () => showView('actions'));
+navTimeline.addEventListener('click', () => showView('timeline'));
+navProactive.addEventListener('click', () => showView('proactive'));
 navVoice.addEventListener('click', () => showView('voice'));
 navCamera.addEventListener('click', () => showView('camera'));
 navMemory.addEventListener('click', () => showView('memory'));
@@ -5029,6 +5578,151 @@ async function loadMemory() {
       + (c.episodes!=null?c.episodes:0) + ' episodes';
     renderFacts('');
   } catch(e) { memCount.textContent='could not load memory'; }
+}
+
+// ── TIMELINE TAB ("What JARVIS did") ────────────────────────────────────────
+// The last 50 turns from GET /api/timeline, newest first: time, source, each
+// action (ok / failed / asked to confirm) and the turn's latency. "you" and
+// "reply" exist only when the SERVER sent them (DASHBOARD_SHOW_TRANSCRIPTS on
+// and this browser on the JARVIS PC). Every value lands via textContent.
+const tlCount = document.getElementById('tlCount');
+const tlList = document.getElementById('tlList');
+const tlRefresh = document.getElementById('tlRefresh');
+const TL_REFRESH_MS = 30000;
+const TL_WHY = {off: 'words hidden (DASHBOARD_SHOW_TRANSCRIPTS is off)',
+                local_only: 'words hidden: shown only in a browser on the JARVIS PC',
+                shown: 'words shown (this PC only)'};
+const TL_STATUS = {ok: 'ok', failed: 'failed', pending: 'asked to confirm'};
+function fmtMs(v) {
+  if (v == null || isNaN(v)) return '–';
+  return v >= 1000 ? (v / 1000).toFixed(1) + ' s' : v + ' ms';
+}
+function tlChip(text, cls) {
+  const c = document.createElement('span'); c.className = 'schip' + (cls ? ' ' + cls : '');
+  c.textContent = text; return c;
+}
+function renderTimeline(d) {
+  tlList.innerHTML = '';
+  const turns = d.turns || [];
+  const frag = document.createDocumentFragment();
+  for (const t of turns) {
+    const row = document.createElement('div'); row.className = 'lrow tl';
+    const when = tlChip(t.time || '?'); when.title = t.date || ''; row.appendChild(when);
+    row.appendChild(tlChip(String(t.source || '?'), 'informative'));
+    const acts = document.createElement('div'); acts.className = 'txt';
+    const list = t.actions || [];
+    if (!list.length) { const n = document.createElement('span'); n.className = 'muted';
+      n.textContent = 'no actions'; acts.appendChild(n); }
+    for (const a of list) {
+      const st = a.status === 'ok' ? 'ok' : a.status === 'failed' ? 'bad' : 'pending';
+      acts.appendChild(tlChip(String(a.name || '?') + ' · ' + (TL_STATUS[a.status] || String(a.status)), st));
+    }
+    row.appendChild(acts);
+    const L = t.latency || {};
+    const lat = document.createElement('span'); lat.className = 'muted tlat';
+    lat.textContent = 'answer ' + fmtMs(L.answer_ms) + ' · end ' + fmtMs(L.end_ms)
+      + (L.stt_ms != null ? ' · stt ' + fmtMs(L.stt_ms) : '')
+      + (L.llm_ms != null ? ' · llm ' + fmtMs(L.llm_ms) : '')
+      + (t.outcome && t.outcome !== 'ok' ? ' · ' + t.outcome : '');
+    row.appendChild(lat);
+    if (typeof t.you === 'string' || typeof t.reply === 'string') {
+      const said = document.createElement('div'); said.className = 'tsaid';
+      said.textContent = 'You: ' + (t.you || '') + (t.reply ? '\nJARVIS: ' + t.reply : '');
+      row.appendChild(said);
+    }
+    frag.appendChild(row);
+  }
+  tlList.appendChild(frag);
+  if (!turns.length) tlList.innerHTML =
+    '<div class="lrow"><span class="muted">no turns in the session log yet</span></div>';
+}
+async function loadTimeline() {
+  try {
+    const r = await fetch(q('/api/timeline'), {headers:hdr()});
+    if (r.status===401) { tlCount.textContent='unauthorized — token required'; return; }
+    const d = await r.json();
+    if (!r.ok) { tlCount.textContent = 'could not read the timeline: ' + (d.error || r.status); return; }
+    tlCount.textContent = (d.count || 0) + ' recent turns · ' + (TL_WHY[d.transcripts] || '');
+    renderTimeline(d);
+  } catch(e) { tlCount.textContent='could not load the timeline'; }
+}
+tlRefresh.addEventListener('click', loadTimeline);
+
+// ── PROACTIVE TAB ───────────────────────────────────────────────────────────
+// One row per behaviour JARVIS starts on his own (GET /api/proactive): name,
+// settings key, what it does, current value, and whether a change applies
+// live or on the next start. The toggle POSTs /api/proactive {key, on}; the
+// server saves it with the Settings tab's own helper. Rows the settings file
+// cannot reach show a disabled switch and say why. textContent throughout.
+const proNote = document.getElementById('proNote');
+const proList = document.getElementById('proList');
+const PRO_APPLIES = {live: 'applies live', restart: 'applies on the next start',
+                     code: 'set in code, not in the settings file',
+                     always: 'always on'};
+function onOff(v) { return v === true ? 'on' : v === false ? 'off' : 'unknown'; }
+// Returns true when the server saved it; the caller puts the switch back
+// otherwise.
+async function saveProactive(f, on, out) {
+  out.textContent = '…'; out.style.color = 'var(--muted)';
+  try {
+    const res = await postJSON('/api/proactive', {key: f.key, on: on});
+    if (res.ok && res.data.ok) {
+      out.textContent = 'saved ' + onOff(on) + ' · ' + (PRO_APPLIES[res.data.applies] || '');
+      out.style.color = 'var(--good)'; return true;
+    }
+    out.textContent = res.status === 401 ? 'unauthorized'
+      : String(res.data.error || ('error ' + res.status));
+  } catch (e) { out.textContent = 'failed'; }
+  out.style.color = 'var(--bad)'; return false;
+}
+function renderProactive(d) {
+  proList.innerHTML = '';
+  const group = document.createElement('div'); group.className = 'sgroup';
+  const h = document.createElement('h2'); h.textContent = 'Proactive & background behaviour';
+  group.appendChild(h);
+  for (const f of (d.features || [])) {
+    const row = document.createElement('div'); row.className = 'srow';
+    const meta = document.createElement('div'); meta.className = 'meta';
+    const nm = document.createElement('div'); nm.className = 'name';
+    nm.textContent = String(f.name || f.key) + (f.key ? '  (' + String(f.key) + ')' : '');
+    const help = document.createElement('div'); help.className = 'help';
+    help.textContent = String(f.what || '') + ' — ' + (PRO_APPLIES[f.applies] || String(f.applies || ''))
+      + (f.how ? ': ' + f.how : '') + '.';
+    meta.appendChild(nm); meta.appendChild(help);
+    const ctl = document.createElement('div'); ctl.className = 'ctl';
+    const lbl = document.createElement('label'); lbl.className = 'toggle';
+    const cb = document.createElement('input'); cb.type = 'checkbox';
+    // The switch shows what is SAVED (what the next start uses); the label
+    // next to it what is running now.
+    cb.checked = (typeof f.saved === 'boolean' ? f.saved : f.value) === true;
+    cb.disabled = !f.settable;
+    cb.setAttribute('aria-label', String(f.name || f.key));
+    const now = document.createElement('span'); now.textContent = 'now ' + onOff(f.value);
+    lbl.appendChild(cb); lbl.appendChild(now);
+    const out = document.createElement('span'); out.className = 'saved';
+    out.setAttribute('aria-live', 'polite');
+    if (f.pending_restart) { out.textContent = 'saved ' + onOff(f.saved) + ' · pending restart';
+      out.style.color = 'var(--muted)'; }
+    cb.addEventListener('change', async () => {
+      const on = cb.checked; cb.disabled = true;
+      if (!(await saveProactive(f, on, out))) cb.checked = !on;
+      cb.disabled = false;
+    });
+    ctl.appendChild(lbl); ctl.appendChild(out);
+    row.appendChild(meta); row.appendChild(ctl);
+    group.appendChild(row);
+  }
+  proList.appendChild(group);
+}
+async function loadProactive() {
+  try {
+    const r = await fetch(q('/api/proactive'), {headers:hdr()});
+    if (r.status===401) { proNote.textContent='unauthorized — token required'; return; }
+    const d = await r.json();
+    if (!r.ok) { proNote.textContent = 'could not read the features: ' + (d.error || r.status); return; }
+    proNote.textContent = d.note || '';
+    renderProactive(d);
+  } catch(e) { proNote.textContent='could not load proactive features'; }
 }
 
 // ── SKILL PANELS (core/web_panels.py) ────────────────────────────────────────

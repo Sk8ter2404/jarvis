@@ -76,6 +76,18 @@ class AirControlSkillTest(unittest.TestCase):
         self.pg = _fake_pyautogui()
         sys.modules["pyautogui"] = self.pg
         self.mod = None
+        # Never reach the REAL auto-yield watcher (skills/_air_mouse_yield): its
+        # install() puts a system-wide WH_MOUSE_LL / WH_KEYBOARD_LL hook on the
+        # box running the suite (it really installs since the B057 fix), and its
+        # fallback polls that machine's real input, so touching the mouse
+        # mid-run could flake these tests. Patched here, before any _load(), so
+        # a loop that register() auto-starts can't win the race either.
+        # TestAutoYield patches its own fake _yield_mod over this.
+        from skills import _air_mouse_yield as real_yield
+        for name, value in (("install", False), ("real_input_recent", False)):
+            patcher = mock.patch.object(real_yield, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         if self.mod is not None:

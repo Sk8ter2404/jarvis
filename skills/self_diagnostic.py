@@ -1254,7 +1254,13 @@ def _producer_camera_ownership(backend: str) -> dict:
         name    = (cam.get("name") or "").strip()
         label   = cam.get("label") or f"index {cfg_idx}"
         h       = health.get(cfg_idx) or {}
-        last_at = float(h.get("last_frame_at") or 0.0)
+        # A BLACK frame is a successful read too. The producer no longer caches
+        # or stamps one as last_frame_at (it is not a live picture), so it is
+        # read from black_frame_at - otherwise a camera that streams nothing
+        # but black would pass on its last lit frame for 10 s and then look
+        # silent, and the black-frame verdict below could never fire.
+        last_at = max(float(h.get("last_frame_at") or 0.0),
+                      float(h.get("black_frame_at") or 0.0))
         age     = (now - last_at) if last_at else None
         # A BENCHED CAMERA IS NOT OWNED. The producer's quarantine gate is an
         # unconditional `continue` that releases the handle and never opens the
@@ -1299,23 +1305,28 @@ def _producer_latest_frame(cfg_idx):
     or None.
 
     The producer caches every frame it successfully reads, under the same
-    _camera_state_lock and in the same critical section that stamps
-    ``last_frame_at`` — so this is exactly the image the freshness figure is
-    about, obtained without opening anything. That is what lets the
-    no-device-I/O verdict keep the black-frame check instead of quietly
-    dropping it. NEVER raises."""
+    _camera_state_lock and in the same critical section that stamps the
+    freshness figure — so this is exactly the image that figure is about,
+    obtained without opening anything. That is what lets the no-device-I/O
+    verdict keep the black-frame check instead of quietly dropping it. A lit
+    frame goes to ``_camera_latest_frame``; a BLACK one, never a live picture,
+    to ``_camera_latest_black_frame``, which the next lit frame clears — so
+    while it holds one, that is the newest frame. NEVER raises."""
     bc = _bc()
     if bc is None:
         return None
     try:
         store = getattr(bc, "_camera_latest_frame", None)
+        black = getattr(bc, "_camera_latest_black_frame", None) or {}
         if store is None:
             return None
         lock = getattr(bc, "_camera_state_lock", None)
         if lock is None:
-            return store.get(cfg_idx)
+            fr = black.get(cfg_idx)
+            return fr if fr is not None else store.get(cfg_idx)
         with lock:
-            return store.get(cfg_idx)
+            fr = black.get(cfg_idx)
+            return fr if fr is not None else store.get(cfg_idx)
     except Exception:
         return None
 
@@ -4141,9 +4152,18 @@ def _collect_vad_stall_signal() -> dict | None:
     """Return a VAD-stall signal dict, or None when no stall is detected.
 
     A stall is: the input capture loop is actively polling (last_poll_ts
-    fresh, within VAD_STALL window) but no VAD trip has fired for more
-    than _AUTOQUEUE_VAD_STALL_S. Only fires while JARVIS is awake — when
-    sleeping there's no expectation of VAD activity."""
+    fresh, within VAD_STALL window), no VAD trip has fired for more
+    than _AUTOQUEUE_VAD_STALL_S, AND _passive_mic_liveness says the mic is
+    "silent" (nothing above the audible floor for the silent-mic window).
+    Only fires while JARVIS is awake — when sleeping there's no expectation
+    of VAD activity.
+
+    THE LIVENESS GATE (2026-10-01). "No trip for 60 s" alone is a quiet
+    room, not a fault: it fired 39 times (2026-06-04..10-01) on a mic that
+    was plainly working — live peak RMS 0.0055-0.0071 against VAD_THRESHOLD
+    0.008, where a dead mic reads ~1e-5. The audible-floor verdict already
+    exists, so it is reused here rather than a second threshold invented
+    (stale-duplicate rule); "alive" and "nodata" both mean no note."""
     try:
         from core import audio_processor as _ap
     except Exception:
@@ -4181,11 +4201,18 @@ def _collect_vad_stall_signal() -> dict | None:
     trip_age = (now - last_trip) if last_trip else float("inf")
     if trip_age < _AUTOQUEUE_VAD_STALL_S:
         return None
+    # A mic that delivers audible audio is alive: no trip just means nobody
+    # spoke above VAD_THRESHOLD. Only a "silent" verdict (null frames) is a
+    # stall worth a note.
+    liveness = _passive_mic_liveness()
+    if liveness.get("verdict") != "silent":
+        return None
     return {
         "signature":            "vad_stall",
         "seconds_since_active": round(trip_age, 1) if trip_age != float("inf") else None,
         "seconds_since_poll":   round(poll_age, 1),
         "total_vad_trips":      int(st.get("total_vad_trips") or 0),
+        "seconds_since_audible": liveness.get("silence_age_s"),
     }
 
 
@@ -4258,7 +4285,9 @@ def _format_action_error_task(group: dict, log_tail: list[str]) -> str:
 def _format_vad_stall_task(signal: dict, log_tail: list[str]) -> str:
     today = _today_iso_date()
     secs = signal.get("seconds_since_active")
-    secs_str = f"{secs:.0f}s" if isinstance(secs, (int, float)) else "unknown"
+    # None = VAD has never tripped this session (trip_age was inf).
+    secs_str = (f"in {secs:.0f}s" if isinstance(secs, (int, float))
+                else "since this session started")
     log_block = "\n".join(log_tail) if log_tail else "(session log unavailable)"
     repro = ("with JARVIS awake, wait for record_speech to call note_vad_poll "
              "for a full session without ever calling note_vad_active — confirm "
@@ -4273,9 +4302,10 @@ def _format_vad_stall_task(signal: dict, log_tail: list[str]) -> str:
         f"\n  - one-line repro: {repro}"
     )
     return (
-        f"- [ ] **{today}** [self-heal] - Fix: VAD has not tripped in {secs_str} "
-        f"while JARVIS is awake and the capture loop is still polling — likely a "
-        f"silent mic, AEC over-ducking, or a noise gate threshold drift.{payload}"
+        f"- [ ] **{today}** [self-heal] - Fix: VAD has not tripped {secs_str} "
+        f"while JARVIS is awake and the capture loop is still polling, and no "
+        f"chunk has crossed the audible floor either — the mic is delivering "
+        f"null frames (privacy block, mute, or a dead capture device).{payload}"
     )
 
 

@@ -239,6 +239,15 @@ def _redact(s: str) -> str:
     return (s[:120] + " ...") if len(s) > 120 else s
 
 
+def _mask(line: str, rules: list) -> str:
+    """`line` with every span any of `rules` matches replaced by `<label>`, so
+    a finding's snippet never carries the secret it caught (audit P3-5). An
+    empty match is left as it is."""
+    for label, rx in rules:
+        line = rx.sub(lambda m, _l=label: f"<{_l}>" if m.group(0) else "", line)
+    return line
+
+
 def _scan_file(path: str, rules: list) -> list[tuple]:
     # Skip this scanner's own source wherever it lives — its pattern strings
     # would self-match (e.g. when scanning a release-build copy in dist/).
@@ -262,7 +271,7 @@ def _scan_file(path: str, rules: list) -> list[tuple]:
     for i, line in enumerate(text.splitlines(), 1):
         for label, rx in rules:
             if rx.search(line):
-                hits.append((label, i, _redact(line)))
+                hits.append((label, i, _redact(_mask(line, rules))))
     return hits
 
 
@@ -301,15 +310,19 @@ def main(argv: list[str]) -> int:
         for label, ln, snip in _scan_file(path, WARN):
             warn_hits.append((rel, ln, label, snip))
 
+    # A finding is path:line [label] and NOTHING from the line itself. CI runs
+    # this gate on a PUBLIC GitHub Actions log, where printing the matching
+    # line (even cut to 120 chars) reprinted the very secret it had just
+    # caught. path:line is enough to find it locally. Audit P3-5, 2026-10-01.
     print(f"[check_no_pii] scanned {len(files)} files ({scope})")
     if warn_hits:
         print(f"\n  WARN ({len(warn_hits)}) — review before public release:")
-        for rel, ln, label, snip in warn_hits[:200]:
-            print(f"    ~ {rel}:{ln}  [{label}]  {snip}")
+        for rel, ln, label, _snip in warn_hits[:200]:
+            print(f"    ~ {rel}:{ln}  [{label}]")
     if hard_hits:
         print(f"\n  HARD ({len(hard_hits)}) — MUST be removed before commit/ship:")
-        for rel, ln, label, snip in hard_hits[:200]:
-            print(f"    ! {rel}:{ln}  [{label}]  {snip}")
+        for rel, ln, label, _snip in hard_hits[:200]:
+            print(f"    ! {rel}:{ln}  [{label}]")
 
     failed = bool(hard_hits) or (strict and bool(warn_hits))
     if failed:

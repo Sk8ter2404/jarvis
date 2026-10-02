@@ -36,6 +36,7 @@ import json
 import math
 import os
 import sys
+import time
 import tkinter as tk
 
 # hud/ is not a package root — put the project dir on sys.path so
@@ -52,7 +53,11 @@ except ImportError:
     _HAS_PSUTIL = False
 
 
-TICK_MS = 250  # 4 fps — bambu MQTT pushes ~1/min, anything faster is wasted CPU.
+TICK_MS = 250  # 4 fps while the accent pulses after a printer update.
+# Printer data changes about once a minute, so the panel only redraws while it
+# pulses after a change; then it holds one still frame and polls at this pace.
+IDLE_TICK_MS = 1000
+PULSE_AFTER_CHANGE_S = 3.0
 
 BG_KEY        = "#010101"
 PANEL_DARK    = "#04080d"
@@ -170,6 +175,73 @@ def _shorten(text: str, max_len: int) -> str:
     return text[: max_len - 1] + "…"
 
 
+def _panel_fields(state: dict) -> dict:
+    """What the panel shows for ``state``, formatted exactly as it is drawn.
+    The draw code reads these and the redraw signature is built from them, so
+    a value that changes without changing the picture is not a change:
+    bambu_monitor rewrites the state file on every MQTT report with raw float
+    temperatures (219.84 and 220.12 both draw "220°"), the written_at /
+    last_update stamps, and stage / print_error, which are never drawn
+    (2026-10-02 review)."""
+    try:
+        pct = float(state.get("mc_percent") or 0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    try:
+        risk = int(state.get("risk_level") or 0)
+    except (TypeError, ValueError):
+        risk = 0
+
+    gcode = (state.get("gcode_state") or "").upper()
+    chip  = gcode if gcode else "—"
+    if gcode == "RUNNING":
+        chip = "PRINTING"
+    elif gcode == "PAUSE":
+        chip = "PAUSED"
+    elif gcode == "FINISH":
+        chip = "DONE"
+    elif gcode == "FAILED":
+        chip = "FAILED"
+    elif gcode == "PREPARE":
+        chip = "PREPARING"
+
+    layer = state.get("layer_num")
+    total = state.get("total_layer")
+    if layer and total:
+        layer_str = f"Layer {int(layer)} / {int(total)}"
+    elif layer:
+        layer_str = f"Layer {int(layer)}"
+    else:
+        layer_str = "Layer —"
+
+    eta = _format_minutes(state.get("mc_remaining"))
+    note = ""
+    if risk >= 1:
+        note = str(state.get("risk_note")
+                   or ("Risk detected" if risk >= 2 else "Watching"))[:60]
+    return {
+        "pct":     pct,
+        "risk":    risk,
+        "chip":    chip,
+        "fname":   _shorten(state.get("filename") or "(no active print)", 48),
+        "layer":   layer_str,
+        "eta":     f"ETA  {eta}" if eta else "ETA  —",
+        "nozzle":  _format_temp(state.get("nozzle_temper")),
+        "bed":     _format_temp(state.get("bed_temper")),
+        "chamber": _format_temp(state.get("chamber_temper")),
+        "note":    note,
+    }
+
+
+def _render_signature(state: dict) -> str:
+    """Everything the panel draws from ``state`` (_panel_fields), as one
+    comparable string."""
+    try:
+        return json.dumps(_panel_fields(state), sort_keys=True)
+    except Exception:
+        return repr(state)
+
+
 def _risk_palette(risk: int):
     """Return (accent, accent_dim) pair for the given risk_level."""
     if risk >= 2:
@@ -199,6 +271,11 @@ class WorkshopPrintMonitor:
         self.parent_pid = parent_pid
         self.w, self.h = w, h
         self.frame = 0
+        # Redraw-on-change bookkeeping (see tick()).
+        self._signature = None
+        self._changed_at = 0.0
+        self._settled = False
+        self._live_chip = "—"          # the state chip beside the live tick
 
         self.root = tk.Tk()
         self.root.title("JARVIS Workshop Print Monitor")
@@ -270,7 +347,7 @@ class WorkshopPrintMonitor:
             outline=accent_dim, fill="", width=1,
         )
 
-    def _draw_header(self, state: dict, accent: str, accent_dim: str):
+    def _draw_header(self, f: dict, accent: str, accent_dim: str):
         # Title row — left: identity tag, right: state chip + live tick.
         self.canvas.create_text(
             22, 16, anchor="w",
@@ -278,35 +355,36 @@ class WorkshopPrintMonitor:
             fill=TEXT, font=("Consolas", 8, "bold"),
         )
 
-        gcode = (state.get("gcode_state") or "").upper()
-        chip  = gcode if gcode else "—"
-        if gcode == "RUNNING":
-            chip = "PRINTING"
-        elif gcode == "PAUSE":
-            chip = "PAUSED"
-        elif gcode == "FINISH":
-            chip = "DONE"
-        elif gcode == "FAILED":
-            chip = "FAILED"
-        elif gcode == "PREPARE":
-            chip = "PREPARING"
-        # Live tick — alternating ●/○ next to the state chip so the user
-        # can tell at a glance whether the widget is still receiving data.
-        tick_char = "●" if (self.frame % 4 < 2) else "○"
-        chip_text = f"{chip}  {tick_char}"
+        self._live_chip = f["chip"]
         self.canvas.create_text(
             self.w - 22, 16, anchor="e",
-            text=chip_text,
+            text=self._live_tick_text(),
             fill=accent, font=("Consolas", 8, "bold"),
+            tags=("live_tick",),
         )
 
         # Filename underneath the title row.
-        fname = _shorten(state.get("filename") or "(no active print)", 48)
         self.canvas.create_text(
             22, 34, anchor="w",
-            text=fname,
+            text=f["fname"],
             fill=DIM_TEXT, font=("Segoe UI", 9),
         )
+
+    def _live_tick_text(self) -> str:
+        # Live tick — alternating ●/○ next to the state chip so the user
+        # can tell at a glance whether the widget is still running. It flips
+        # every 2 frames; while the panel idles, _blink_live_tick advances it.
+        tick_char = "●" if (self.frame % 4 < 2) else "○"
+        return f"{self._live_chip}  {tick_char}"
+
+    def _blink_live_tick(self):
+        """The idle panel's only drawing: flip the ●/○ in place, so a panel
+        that is still polling never looks like a hung one."""
+        self.frame += 2
+        try:
+            self.canvas.itemconfigure("live_tick", text=self._live_tick_text())
+        except Exception:
+            pass
 
     def _draw_thumbnail(self, pct: float, accent: str, accent_dim: str):
         """A small synthetic build-plate silhouette in the lower-left with
@@ -350,36 +428,24 @@ class WorkshopPrintMonitor:
         )
         return x0 + size_x  # right edge so callers can lay text to the right
 
-    def _draw_layer_eta(self, state: dict, accent: str, accent_dim: str):
-        layer = state.get("layer_num")
-        total = state.get("total_layer")
-        if layer and total:
-            layer_str = f"Layer {int(layer)} / {int(total)}"
-        elif layer:
-            layer_str = f"Layer {int(layer)}"
-        else:
-            layer_str = "Layer —"
+    def _draw_layer_eta(self, f: dict, accent: str, accent_dim: str):
         self.canvas.create_text(
             22, 56, anchor="w",
-            text=layer_str,
+            text=f["layer"],
             fill=TEXT, font=("Segoe UI", 10, "bold"),
         )
-        eta = _format_minutes(state.get("mc_remaining"))
-        eta_str = f"ETA  {eta}" if eta else "ETA  —"
         self.canvas.create_text(
             self.w - 22, 56, anchor="e",
-            text=eta_str,
+            text=f["eta"],
             fill=TEXT, font=("Segoe UI", 10, "bold"),
         )
 
-    def _draw_telemetry(self, state: dict, accent: str, accent_dim: str,
+    def _draw_telemetry(self, f: dict, accent: str, accent_dim: str,
                         text_left_x: int):
         """Right column beside the thumbnail: nozzle / bed / chamber /
         filament. Planner: filament-remaining is not tracked by
         bambu_monitor, so it's always a `—` placeholder."""
-        nozzle = _format_temp(state.get("nozzle_temper"))
-        bed    = _format_temp(state.get("bed_temper"))
-        chamber = _format_temp(state.get("chamber_temper"))
+        nozzle, bed, chamber = f["nozzle"], f["bed"], f["chamber"]
         col_x = text_left_x + 22
         row_y = self.h - 88
         line_h = 18
@@ -430,15 +496,11 @@ class WorkshopPrintMonitor:
             fill=TEXT, font=("Consolas", 7, "bold"),
         )
 
-    def _draw_risk_note(self, state: dict, accent: str):
-        risk = int(state.get("risk_level", 0) or 0)
-        if risk >= 1:
-            note = state.get("risk_note") or (
-                "Risk detected" if risk >= 2 else "Watching"
-            )
+    def _draw_risk_note(self, f: dict, accent: str):
+        if f["note"]:
             self.canvas.create_text(
                 self.w / 2, self.h - 36, anchor="s",
-                text=str(note)[:60],
+                text=f["note"],
                 fill=accent, font=("Segoe UI", 7, "italic"),
             )
 
@@ -452,34 +514,51 @@ class WorkshopPrintMonitor:
             self._on_close()
             return
 
+        # Redrawing the whole canvas 4x a second for data that changes
+        # about once a minute was wasted CPU (GUI_REVIEW B22). Redraw only while
+        # the accent pulses after a change, then draw one still frame and just
+        # poll, more slowly, until the printer state changes again.
+        state = _read_json(STATE_FILE)
+        if not isinstance(state, dict):
+            state = {}
+        now = time.monotonic()
+        signature = _render_signature(state)
+        if signature != self._signature:
+            self._signature = signature
+            self._changed_at = now
+            self._settled = False
+        animating = (now - self._changed_at) < PULSE_AFTER_CHANGE_S
+        if animating or not self._settled:
+            self._render(state, animating)
+            self._settled = not animating
+        else:
+            self._blink_live_tick()
+
+        self.root.after(TICK_MS if animating else IDLE_TICK_MS, self.tick)
+
+    def _render(self, state: dict, animating: bool):
         self.frame += 1
         self.canvas.delete("all")
 
-        state = _read_json(STATE_FILE)
-        try:
-            pct = float(state.get("mc_percent") or 0)
-        except (TypeError, ValueError):
-            pct = 0.0
-        try:
-            risk = int(state.get("risk_level") or 0)
-        except (TypeError, ValueError):
-            risk = 0
+        f = _panel_fields(state)
+        pct, risk = f["pct"], f["risk"]
 
         # Pulse the accent against its dim partner — feels alive without
-        # blinking distractingly.
+        # blinking distractingly. The still frame holds the full accent.
         accent_base, accent_dim = _risk_palette(risk)
-        pulse_t = 0.5 + 0.5 * math.sin(self.frame * 0.18)
-        accent = _mix(accent_dim, accent_base, 0.6 + 0.4 * pulse_t)
+        if animating:
+            pulse_t = 0.5 + 0.5 * math.sin(self.frame * 0.18)
+            accent = _mix(accent_dim, accent_base, 0.6 + 0.4 * pulse_t)
+        else:
+            accent = accent_base
 
         self._draw_panel(accent, accent_dim)
-        self._draw_header(state, accent, accent_dim)
-        self._draw_layer_eta(state, accent, accent_dim)
+        self._draw_header(f, accent, accent_dim)
+        self._draw_layer_eta(f, accent, accent_dim)
         thumb_right = self._draw_thumbnail(pct, accent, accent_dim)
-        self._draw_telemetry(state, accent, accent_dim, thumb_right)
+        self._draw_telemetry(f, accent, accent_dim, thumb_right)
         self._draw_progress_bar(pct, accent, accent_dim)
-        self._draw_risk_note(state, accent)
-
-        self.root.after(TICK_MS, self.tick)
+        self._draw_risk_note(f, accent)
 
 
 def main():

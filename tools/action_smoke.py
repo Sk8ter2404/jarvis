@@ -113,6 +113,9 @@ _DENYLIST_NAMES = {
     # daemon.
     "youtube_direct", "youtube_search_direct", "yt_direct",
     "keep_music_open",
+    # skills/site_builder.py: a paid Opus call for a site about "test",
+    # then a real browser tab on the saved page.
+    "build_website",
     # input injection on the live desktop
     "click", "press", "hotkey", "type", "scroll", "screenshot",
     "run_shell", "launch_app",
@@ -134,7 +137,9 @@ _DENYLIST_MODULES = ("holographic_overlay", "dossier", "suit_up",
                      # JARVIS HUD through this path.
                      "morning_handoff",
                      # every youtube_search action opens a real browser tab
-                     "youtube_search")
+                     "youtube_search",
+                     # show_globe / globe_pin open the holographic globe
+                     "globe")
 
 
 def _spawns_desktop_windows(name: str, fn) -> bool:

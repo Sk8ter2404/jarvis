@@ -259,6 +259,28 @@ class VolumeRoutingRegressionTests(unittest.TestCase):
                               f"{q!r} must load {h!r} (the set_volume home)")
 
 
+class ReadThisPageRoutingTests(unittest.TestCase):
+    """Live 2026-10-01 20:45: "read this page for me and see if there's any
+    issues" ran see_screen with no SCREEN VISION section loaded - its keywords
+    only knew "screen" phrasings, so the v2.0.159 reading rules in that section
+    never reached the local brain on a "page" request."""
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+        self.homes = [h for h, b in self.sections if "see_screen" in b]
+
+    def test_page_reading_requests_load_the_see_screen_section(self):
+        self.assertTrue(self.homes, "some section must document see_screen")
+        for q in ("read this page for me and see if there's any issues",
+                  "can you read this page",
+                  "what does this article say",
+                  "read this for me",
+                  "summarize what's on the page"):
+            inc, _ = pr.select_sections(q, self.sections)
+            self.assertTrue(set(self.homes) & set(inc),
+                            f"{q!r} must load a see_screen section {self.homes}")
+
+
 class UnifiedCameraRoutingRegressionTests(unittest.TestCase):
     """2026-07-21 audit: the indented 'UNIFIED (…)' sub-header is promoted to
     its own section (the parser matches headers on the stripped line), but its
@@ -557,6 +579,39 @@ class BrowserAgentRoutingRegressionTests(unittest.TestCase):
                 "emit no action at all" in slim and action not in slim,
                 f"{q!r}: slim prompt carries the no-action rule but not the "
                 f"{action!r} it is documented to fire")
+
+
+class WebsiteBuilderRoutingTests(unittest.TestCase):
+    """skills/site_builder.py's build_website must reach the LOCAL model: the
+    WEBSITE BUILDER section loads (and ships the action name) for the phrasings
+    it documents, and stays out of an unrelated turn."""
+
+    PHRASES = (
+        "build a website for Blue Door Bakery",
+        "make a landing page for my friend's shop",
+        "jarvis, design a web page for the corner cafe",
+        "mock up a homepage for the garage down the road",
+        "can you make a site for my friend's shop in Springfield",
+    )
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+
+    def test_website_builder_is_a_parsed_section_documenting_the_action(self):
+        bodies = dict(self.sections)
+        self.assertIn("WEBSITE BUILDER", bodies)
+        self.assertIn("build_website", bodies["WEBSITE BUILDER"])
+
+    def test_documented_phrasings_load_the_section_and_ship_the_action(self):
+        for q in self.PHRASES:
+            inc, _ = pr.select_sections(q, self.sections)
+            self.assertIn("WEBSITE BUILDER", inc, q)
+            self.assertIn("build_website", pr.slim_pc_control(q, FULL), q)
+
+    def test_unrelated_turn_leaves_it_out(self):
+        inc, _ = pr.select_sections("what's the weather tomorrow",
+                                    self.sections)
+        self.assertNotIn("WEBSITE BUILDER", inc)
 
 
 # A "'phrase' -> [ACTION: name]" example line, whitespace-normalized first so
@@ -1269,3 +1324,88 @@ class WordBoundaryKeywordRoutingTests(unittest.TestCase):
         self.assertFalse(hit("", " anything "))
         # A later word-start occurrence still counts after a mid-word one.
         self.assertTrue(hit("phone", " microphone or phone "))
+
+
+class RunningCostsRoutingTests(unittest.TestCase):
+    """'How much does it cost to run you' asks what JARVIS COSTS to run
+    (running_costs: electricity + session cloud spend), not the account
+    BALANCE (check_credits, which drives a browser to the billing page). Both
+    directions must reach the local model with the right action, and the
+    prompt must teach which phrase is which."""
+
+    COSTS = ("how much does it cost to run you", "what do you cost",
+             "running costs", "how much do you cost per month")
+    CREDITS = ("how many credits do I have", "check my Anthropic balance")
+
+    # The always-shipped core preamble names check_credits in passing, so a
+    # bare name proves nothing; the section's own example must be there.
+    def test_cost_phrases_ship_running_costs(self):
+        for q in self.COSTS:
+            with self.subTest(q=q):
+                self.assertIn("[ACTION: running_costs]",
+                              pr.slim_pc_control(q, FULL))
+
+    def test_credit_phrases_still_ship_check_credits(self):
+        for q in self.CREDITS:
+            with self.subTest(q=q):
+                self.assertIn("[ACTION: check_credits]",
+                              pr.slim_pc_control(q, FULL))
+
+    def test_prompt_examples_map_each_phrase_to_its_own_action(self):
+        examples = {phrase.lower(): action for phrase, action in
+                    _ARROW_EXAMPLE_RE.findall(" ".join(FULL.split()))}
+        self.assertEqual(examples.get("how much does it cost to run you"),
+                         "running_costs")
+        self.assertEqual(examples.get("how much do you cost per month"),
+                         "running_costs")
+        for q in self.CREDITS:
+            self.assertEqual(examples.get(q.lower()), "check_credits", q)
+
+
+class GlobeRoutingTests(unittest.TestCase):
+    """skills/globe.py (2026-10-02). Both directions: the globe's own phrases
+    must load the GLOBE section with the action they ask for, and the
+    existing "where is ..." / location / weather turns must NOT pick it up
+    (the router has no bare "where is" keyword on purpose) and must keep their
+    own section."""
+
+    def setUp(self):
+        _core, self.sections = pr.split_pc_control(FULL)
+
+    def _inc(self, q):
+        return pr.select_sections(q, self.sections)[0]
+
+    def test_globe_is_a_parsed_section(self):
+        self.assertIn("GLOBE", [h for h, _b in self.sections])
+
+    def test_globe_phrases_load_the_globe_and_ship_their_action(self):
+        for q, action in (("show me the globe", "show_globe"),
+                          ("put the globe on the left monitor", "show_globe"),
+                          ("show me where Tokyo is", "globe_pin"),
+                          ("pin London and New York", "globe_pin"),
+                          ("drop a pin on Paris", "globe_pin"),
+                          ("clear the pins", "globe_clear"),
+                          ("hide the globe", "hide_globe")):
+            with self.subTest(q=q):
+                self.assertIn("GLOBE", self._inc(q))
+                self.assertIn(action, pr.turn_pc_block(q, FULL))
+
+    def test_where_and_weather_turns_keep_their_home_and_skip_the_globe(self):
+        for q, home in (("where's my package", "AMAZON ORDER TRACKER"),
+                        ("where is my package", "AMAZON ORDER TRACKER"),
+                        ("where am I", "UNIFIED"),
+                        ("where is the print at", "BAMBU 3D PRINTER"),
+                        ("where is the robot build at", "REPO ROBOT PROJECT"),
+                        ("what's the weather in Tokyo", "WEATHER BRIEFING"),
+                        ("will it rain tomorrow in London", "WEATHER BRIEFING"),
+                        ("is it going to rain", "WEATHER BRIEFING")):
+            with self.subTest(q=q):
+                inc = self._inc(q)
+                self.assertNotIn("GLOBE", inc)
+                self.assertIn(home, inc)
+
+    def test_pin_keyword_does_not_fire_inside_other_words(self):
+        for q in ("keep the window pinned", "spin up the reactor",
+                  "ping the router", "what's on the spinner"):
+            with self.subTest(q=q):
+                self.assertNotIn("GLOBE", self._inc(q))

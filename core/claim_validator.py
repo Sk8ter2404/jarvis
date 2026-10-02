@@ -74,6 +74,7 @@ import re
 from typing import Iterable, Optional
 
 __all__ = [
+    "asks_owner",
     "find_unverified_claim",
     "is_progress_only",
     "looks_like_question",
@@ -511,6 +512,16 @@ def looks_like_question(user_text: str) -> bool:
     if _POLITE_COMMAND_RE.match(t):
         return False
     return bool(_QUESTION_START_RE.match(t) or t.endswith("?"))
+
+
+def asks_owner(text: str) -> bool:
+    """True when a REPLY asks the owner something: a question anywhere in it
+    or an offer ("Shall I open it", "I'll open it if you'd like", "say the
+    word") — the same offer table that keeps those out of the claim check.
+    Used by core/turn_checker.py: a turn that waits on the owner is never
+    retried."""
+    t = _norm(text)
+    return "?" in t or bool(_OFFER_RE.search(t))
 
 
 # ── the detector ─────────────────────────────────────────────────────────────
