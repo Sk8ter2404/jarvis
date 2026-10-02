@@ -192,6 +192,28 @@ class SpeechInHeadTests(unittest.TestCase):
         self.assertIsNone(v.speech_in_head(np.zeros((2, SR), np.float32)))
         self.assertEqual(sess.batches, [])
 
+    def test_start_skips_a_pre_roll_and_feeds_its_context(self):
+        # R6 review: record_speech puts up to 0.768 s of below-threshold
+        # pre-roll in front of the chunk that tripped it, so the rescue asks
+        # from there. The CONTEXT samples just before `start` feed the first
+        # window, as they would in one long clip.
+        v, sess, _ = _vad()
+        clip = _clip(1.0, 0.5, lead_s=1.2)
+        start = int(1.2 * SR)
+        clip[:start] = np.linspace(0.0, 0.01, start, dtype=np.float32)
+        self.assertIs(v.speech_in_head(clip, 0.8, SR), False)
+        self.assertIs(v.speech_in_head(clip, 0.8, SR, start=start), True)
+        first = sess.batches[-1][0]
+        np.testing.assert_array_equal(first[:ep.CONTEXT],
+                                      clip[start - ep.CONTEXT:start])
+        np.testing.assert_array_equal(first[ep.CONTEXT:],
+                                      clip[start:start + W])
+        self.assertEqual(sess.batches[-1].shape[0], int(0.8 * SR) // W)
+        # After the speech, or past the clip's end: False / None.
+        self.assertIs(v.speech_in_head(clip, 0.8, SR, start=int(2.2 * SR)),
+                      False)
+        self.assertIsNone(v.speech_in_head(clip, 0.8, SR, start=len(clip)))
+
     def test_a_failed_detector_is_none_and_latches(self):
         v, _, _ = _vad(_FakeSession(fail=RuntimeError("boom")))
         self.assertIsNone(v.speech_in_head(_clip(1.0, 0.0, lead_s=0.0)))

@@ -44,7 +44,8 @@ stdlib (tests/test_endpointing.py pins that); EotDecider itself is pure Python
 and never imports anything.
 
 R6 (Parakeet, STT_ENGINE='parakeet') asks one more question of the same
-detector, speech_in_head(): does the clip's first 0.8 s hold speech? Its
+detector, speech_in_head(): do the first 0.8 s of the owner's speech (from
+the chunk that tripped record_speech, past its pre-roll) hold speech? Its
 wake-word rescue (core/stt_parakeet.rescue_reason) uses the answer; nothing
 else does, and None (cannot tell) makes the rescue run. Like
 speech_tail_ms() it never raises and follows the same latch-off rules. It is
@@ -250,14 +251,23 @@ class SileroVad:
         return start + (int(hits[-1]) + 1) * WINDOW
 
     def speech_in_head(self, audio, head_s: float = 0.8,
-                       sample_rate: int = SAMPLE_RATE) -> "bool | None":
-        """Does the clip's first `head_s` seconds hold speech? True when any
-        whole window there scores at or above SPEECH_THRESHOLD, False when
-        none does. None when the clip is not 16 kHz mono float audio, holds
-        less than one window, or the detector is unusable. Speed plan R6's
-        wake-word rescue (core/stt_parakeet.rescue_reason) asks this: did the
-        owner start talking right away, as he does when he says "JARVIS"?
-        About 25 windows for 0.8 s. Never raises."""
+                       sample_rate: int = SAMPLE_RATE,
+                       start: int = 0) -> "bool | None":
+        """Do the `head_s` seconds from sample `start` hold speech? True when
+        any whole window there scores at or above SPEECH_THRESHOLD, False
+        when none does. None when the clip is not 16 kHz mono float audio,
+        holds less than one window from `start`, or the detector is
+        unusable. Speed plan R6's wake-word rescue
+        (core/stt_parakeet.rescue_reason) asks this: did the owner start
+        talking right away, as he does when he says "JARVIS"?
+
+        `start` skips a capture's pre-roll: record_speech puts up to 12
+        below-threshold chunks (0.768 s) in front of the chunk that tripped
+        it, so from the clip's first sample 0.8 s is nearly all pre-roll
+        (R6 review: a real wake word then scored under the threshold on 15
+        of 15 clips). The CONTEXT samples just before `start` feed the first
+        window, as in one long clip. About 25 windows for 0.8 s. Never
+        raises."""
         try:
             if self._failed or int(sample_rate) != SAMPLE_RATE:
                 return None
@@ -268,10 +278,12 @@ class SileroVad:
                     a = a.reshape(-1)
                 else:
                     return None
-            n = min(len(a), int(float(head_s) * SAMPLE_RATE)) // WINDOW * WINDOW
+            s0 = max(0, int(start))
+            n = min(len(a) - s0, int(float(head_s) * SAMPLE_RATE))                 // WINDOW * WINDOW
             if n < WINDOW:
                 return None
-            probs = self._probs(np.ascontiguousarray(a[:n]), None)
+            ctx0 = a[s0 - CONTEXT:s0] if s0 >= CONTEXT else None
+            probs = self._probs(np.ascontiguousarray(a[s0:s0 + n]), ctx0)
             if probs is None:
                 return None
             return bool(np.any(probs >= SPEECH_THRESHOLD))

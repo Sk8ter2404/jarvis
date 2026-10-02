@@ -90,6 +90,7 @@ class _Base(MonolithGlobalsTestCase):
         self._p(bc, "STT_HOTWORDS", "")
         self._p(bc, "STT_REPLACEMENTS", {})
         self._p(bc, "STT_REPLACEMENTS_PARAKEET", {})
+        self._p(bc, "_last_capture_preroll", [None])
         self.notes = []
         self._p(bc, "_tt_note_stat",
                 side_effect=lambda n, v: self.notes.append((n, v)))
@@ -239,6 +240,8 @@ class R6PrimaryTests(_Base):
         bc = self.bc
         self._p(bc, "_stt_alt", _FakeEngine(text="Travis, what time is it?"))
         self._p(bc, "_require_wake_runtime", True)
+        # record_speech's stash for this clip: a full 12-chunk pre-roll.
+        bc._last_capture_preroll[0] = (len(self.audio), 12 * 1024)
         head = self._p(bc._tail_vad, "speech_in_head", return_value=True)
         tr = self._p(bc, "transcribe", return_value=W_RES)
         out = io.StringIO()
@@ -248,6 +251,7 @@ class R6PrimaryTests(_Base):
         tr.assert_called_once()
         head.assert_called_once()
         self.assertEqual(head.call_args.args[1], 0.8)
+        self.assertEqual(head.call_args.kwargs["start"], 12 * 1024)
         self.assertEqual(self._engine_notes(), ["parakeet-rescued"])
         self.assertIn("whisper rescue (no-wake", out.getvalue())
         self.assertNotIn("Travis", out.getvalue())
@@ -334,6 +338,129 @@ class R6PrimaryTests(_Base):
                 bc._warm_parakeet()
         self.assertIn("nope", bc._parakeet_latch.failed)
         self.assertEqual(out.getvalue(), "")   # the [warm] line says it
+
+
+class _OnsetSession:
+    """A Silero stand-in with the real detector's onset lag: a window's speech
+    probability climbs 0.2 for each loud window in a row, so speech crosses
+    SPEECH_THRESHOLD (0.5) on its third loud window. The real detector scored
+    a wake word's first speech window 0.04-0.49 on 15 clips shaped the way
+    record_speech returns them (R6 review, 2026-10-02)."""
+
+    def __init__(self):
+        self.batches = []
+
+    def run(self, _names, feeds):
+        import numpy as np
+        from core import endpointing as ep
+        x = feeds["input"]
+        self.batches.append(x.shape[0])
+        loud = np.abs(x[:, ep.CONTEXT:]).mean(axis=1) > 0.05
+        probs, k = [], 0
+        for hit in loud:
+            k = k + 1 if hit else 0
+            probs.append(min(1.0, 0.2 * k))
+        return (np.asarray(probs, dtype=np.float32).reshape(-1, 1),
+                feeds["h"], feeds["c"])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class R6RescueHeadTests(_Base):
+    """The rescue's "speech in the first 0.8 s" is asked from where the
+    owner's speech starts — the chunk that tripped record_speech — not from
+    the clip's first sample: record_speech puts PRE_BUFFER (12) chunks of
+    below-threshold pre-roll (0.768 s) in front of it (R6 review, finding
+    1). Through the REAL record_speech and the REAL SileroVad (a fake ORT
+    session with the onset lag above)."""
+
+    def setUp(self):
+        super().setUp()
+        self._p(self.bc, "STT_ENGINE", "parakeet")
+        self.lim = int(self.bc.SILENCE_SECS * self.bc.SAMPLE_RATE / 1024)
+
+    def _record(self, n_quiet, n_voiced):
+        bc = self.bc
+        np = bc.np
+        lim = self.lim
+
+        class FakeStream:
+            device = 1
+            latency = 0.0
+
+            def __init__(self, *a, callback=None, **k):
+                self.cb = callback
+
+            def start(self):
+                for amp, n in ((0.001, n_quiet), (0.2, n_voiced),
+                               (0.0, lim)):
+                    frame = np.full((1024, 1), amp, dtype="float32")
+                    for _ in range(n):
+                        self.cb(frame, 1024, None, None)
+
+        self._p(bc, "_mic_input_disabled", return_value=False)
+        self._p(bc, "_mic_muted", [False])
+        self._p(bc, "_capture_holds_mic", return_value=False)
+        self._p(bc, "_input_backoff_wait", return_value=False)
+        self._p(bc, "get_input_device", return_value=1)
+        self._p(bc, "_safe_close_stream", lambda s: None)
+        self._p(bc.sd, "InputStream", FakeStream)
+        self._p(bc, "_note_live_capture", lambda *a, **k: None)
+        self._p(bc, "_filler_capture_mark", lambda *a, **k: None)
+        self._p(bc, "_fanout_record_frame", lambda *a, **k: None)
+        self._p(bc, "_process_capture_chunk",
+                lambda data, sr, skip_ns=False: data)
+        self._p(bc, "_spec_stt_should_snapshot", return_value=False)
+        self._p(bc, "pause_face_tracking")
+        self._p(bc, "set_state")
+        self._p(bc, "_write_hud_state")
+        self._p(bc, "_heartbeat")
+        self._p(bc, "_utterance_in_progress", [False])
+        self._p(bc, "VAD_THRESHOLD", 0.008)
+        with contextlib.redirect_stdout(io.StringIO()):
+            audio = bc.record_speech(timeout=3)
+        self.assertIsNotNone(audio, "no utterance was captured")
+        return audio
+
+    def test_record_speech_publishes_its_pre_roll(self):
+        bc = self.bc
+        audio = self._record(20, 15)
+        self.assertEqual(len(audio), (12 + 15 + self.lim) * 1024)
+        self.assertEqual(bc._last_capture_preroll[0], (len(audio), 12 * 1024))
+        # A capture that started with less than a full ring: what it had.
+        audio = self._record(5, 15)
+        self.assertEqual(bc._last_capture_preroll[0], (len(audio), 5 * 1024))
+
+    def test_a_lost_wake_word_after_a_full_pre_roll_is_rescued(self):
+        bc = self.bc
+        audio = self._record(20, 15)
+        sess = _OnsetSession()
+        self._p(bc, "_tail_vad", bc._endpointing.SileroVad(
+            model_path="silero.onnx", session_factory=lambda p: sess))
+        self._p(bc, "_stt_alt", _FakeEngine(text="Travis, what time is it?"))
+        self._p(bc, "_require_wake_runtime", True)
+        tr = self._p(bc, "transcribe", return_value=W_RES)
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = bc._transcribe_capture(audio)
+        self.assertIs(res, W_RES, "the head check scored the pre-roll")
+        tr.assert_called_once()
+        self.assertEqual(self._engine_notes(), ["parakeet-rescued"])
+        self.assertEqual(sess.batches, [25])    # 0.8 s = 25 windows
+
+    def test_an_unknown_pre_roll_rescues(self):
+        # A clip record_speech did not just return (its length does not
+        # match the stash): the head cannot be placed, so — like an
+        # unusable detector — the rescue runs.
+        bc = self.bc
+        self._p(bc, "_last_capture_preroll", [(123, 0)])
+        head = self._p(bc._tail_vad, "speech_in_head")
+        self._p(bc, "_stt_alt", _FakeEngine(text="Travis, what time is it?"))
+        self._p(bc, "_require_wake_runtime", True)
+        tr = self._p(bc, "transcribe", return_value=W_RES)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIs(bc._transcribe_capture(self.audio), W_RES)
+        tr.assert_called_once()
+        head.assert_not_called()
 
 
 # ════════════════════════════════════════════════════════════════════════════

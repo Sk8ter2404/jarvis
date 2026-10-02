@@ -28,8 +28,9 @@ WHAT PARAKEET LOSES, AND THE RESCUE
     misheard wake word loses the whole turn. The rescue bounds that: when
     Parakeet's text is empty — or, while only a wake word gets through, is
     not led by the wake word while the speech detector hears speech in the
-    clip's first 0.8 s — Whisper decodes the clip once and its transcript is
-    used. Every rescue is counted.
+    first 0.8 s of the owner's speech (from the chunk that tripped the
+    capture, past record_speech's pre-roll) — Whisper decodes the clip once
+    and its transcript is used. Every rescue is counted.
   * Any Parakeet failure latches it off for the session (one log line) and
     Whisper decodes that capture and every later one.
 
@@ -80,7 +81,7 @@ EMPTY_AVG_LOGPROB = -10.0
 # Shortest clip worth a decode; the capture callers never pass one this
 # short (they drop anything under 0.4 s), so this only guards odd input.
 MIN_SAMPLES = 160
-RESCUE_HEAD_S = 0.8        # "speech in the clip's first 0.8 s"
+RESCUE_HEAD_S = 0.8        # "speech in the first 0.8 s past the pre-roll"
 
 # The shadow worker (STT_SHADOW). The queue holds at most SHADOW_QUEUE_MAX
 # captures; a capture waits at most SHADOW_WAIT_S for the turn to finish.
@@ -263,8 +264,9 @@ def rescue_reason(text, *, wake_mode, has_wake_prefix, head_speech) -> str:
       'no-wake' — wake_mode() is on (wake-word mode, or standby / sleep:
                   the monolith's _parakeet_wake_mode), has_wake_prefix(text)
                   is False, and
-                  head_speech() says the clip's first RESCUE_HEAD_S hold
-                  speech — or cannot tell (None): a misheard wake word
+                  head_speech() says the first RESCUE_HEAD_S of the speech
+                  (past the capture's pre-roll) hold speech — or cannot
+                  tell (None): a misheard wake word
                   must not lose the turn.
 
     The callables are read in that order and only when needed. Any error in

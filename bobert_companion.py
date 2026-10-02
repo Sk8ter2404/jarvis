@@ -16465,16 +16465,45 @@ def _parakeet_wake_mode() -> bool:
         return True
 
 
+def _capture_preroll_samples(audio) -> "int | None":
+    """How much of `audio` is record_speech's pre-roll (samples), or None
+    when `audio` is not the clip it last returned (the lengths differ; the
+    auto-gain keeps the length). Never raises."""
+    try:
+        stash = _last_capture_preroll[0]
+        if stash is None or int(len(audio)) != int(stash[0]):
+            return None
+        return max(0, int(stash[1]))
+    except Exception:
+        return None
+
+
+def _parakeet_head_speech(audio) -> "bool | None":
+    """The rescue's head check: speech in the first RESCUE_HEAD_S of the
+    owner's speech — measured from the chunk that tripped record_speech,
+    past its pre-roll (R6 review: from the clip's first sample the window
+    was 96 % pre-roll and a real wake word never crossed the threshold).
+    None (the rescue then runs) when the pre-roll is unknown or the
+    detector cannot tell. Never raises."""
+    try:
+        pre = _capture_preroll_samples(audio)
+        if pre is None:
+            return None
+        return _tail_vad.speech_in_head(
+            audio, _stt_parakeet.RESCUE_HEAD_S, SAMPLE_RATE, start=pre)
+    except Exception:
+        return None
+
+
 def _parakeet_rescue(text: str, audio) -> str:
     """core/stt_parakeet.rescue_reason with the live wake-only state
     (_parakeet_wake_mode), the real wake-prefix rule and the Silero head
-    check (the tail probe's detector)."""
+    check (_parakeet_head_speech, the tail probe's detector)."""
     return _stt_parakeet.rescue_reason(
         text,
         wake_mode=_parakeet_wake_mode,
         has_wake_prefix=_text_has_wake_prefix,
-        head_speech=lambda: _tail_vad.speech_in_head(
-            audio, _stt_parakeet.RESCUE_HEAD_S, SAMPLE_RATE))
+        head_speech=lambda: _parakeet_head_speech(audio))
 
 
 _parakeet_primary = _stt_parakeet.Primary(
@@ -16963,6 +16992,14 @@ _tts_playback_active  = [False]          # True while play_with_lipsync owns the
 # and by the two main-loop capture phases.
 from core import self_echo as _self_echo  # noqa: E402
 _last_capture_window: list = [None]
+# Speed plan R6 (the Parakeet wake-word rescue): the pre-roll of the LAST clip
+# record_speech returned, as (clip samples, pre-roll samples) — the ring of
+# below-threshold chunks put in front of the chunk that tripped the capture
+# (up to PRE_BUFFER = 12 chunks, 0.768 s). The owner's speech starts there,
+# so the rescue's "speech in the first 0.8 s" is asked from there
+# (_capture_preroll_samples). None before the first capture; reset by
+# record_speech itself.
+_last_capture_preroll: list = [None]
 _record_speech_sr     = [SAMPLE_RATE]    # sample rate of the live stream
 # What record_speech's InputStream ACTUALLY opened on, published the moment it
 # starts: {"index", "name", "requested", "via_default", "at"} or None before the
@@ -17489,6 +17526,8 @@ def record_speech(timeout: float | None = None, *,
     _filler_capture_mark(wait=True)
     # Self-echo gate: a fresh capture never inherits the previous one's timing.
     _last_capture_window[0] = None
+    # R6 rescue: nor its pre-roll.
+    _last_capture_preroll[0] = None
     CHUNK       = 1024
     PRE_BUFFER  = 12
     silence_lim = int(SILENCE_SECS * SAMPLE_RATE / CHUNK)
@@ -17501,6 +17540,7 @@ def record_speech(timeout: float | None = None, *,
     _spec_stt_reset()
     pre_ring: list[np.ndarray] = []
     chunks:   list[np.ndarray] = []
+    pre_samples = 0     # the pre-roll put in front of the trip (R6 rescue)
     recording   = False
     silence_n   = 0
     start_time  = time.time()
@@ -17823,6 +17863,8 @@ def record_speech(timeout: float | None = None, *,
                         _se_open_ts,
                         _se_vad_ts - (len(pre_ring) + 1) * CHUNK
                         / float(SAMPLE_RATE or 16000))
+                    pre_samples = int(sum(np.asarray(c).size
+                                          for c in pre_ring))
                     chunks.extend(pre_ring)
                     _heartbeat()
                     print("  🎙  Recording…")
@@ -17923,7 +17965,10 @@ def record_speech(timeout: float | None = None, *,
     # Self-echo gate: publish this utterance's timing for _self_echo_ignored.
     _last_capture_window[0] = (_se_open_ts, _se_vad_ts, _self_echo.now(),
                                _se_clip_ts)
-    return np.concatenate(chunks).flatten()
+    _clip_out = np.concatenate(chunks).flatten()
+    # R6 rescue: where the owner's speech starts in this clip.
+    _last_capture_preroll[0] = (int(_clip_out.size), pre_samples)
+    return _clip_out
 
 
 def apply_capture_auto_gain(audio_f32, peak_rms):
