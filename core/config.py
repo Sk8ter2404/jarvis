@@ -741,9 +741,9 @@ WHISPER_BEAM_SIZE    = 5
 #   'parakeet' → NVIDIA Parakeet TDT 0.6B v2 (int8 ONNX, CPU only): roughly
 #                0.15-0.3 s per command instead of ~1.7 s. It ignores
 #                STT_HOTWORDS; a transcript that comes back empty, or (in
-#                wake-word mode) not led by "JARVIS" while the clip starts
-#                with speech, is decoded again by Whisper. Any error switches
-#                back to Whisper for the session.
+#                wake-word mode, standby or sleep) not led by "JARVIS" while
+#                the clip starts with speech, is decoded again by Whisper.
+#                Any error switches back to Whisper for the session.
 #   The JARVIS_STT_ENGINE environment variable overrides this setting.
 # STT_SHADOW: '' (off) | 'parakeet' → Whisper keeps transcribing; Parakeet
 #   re-decodes each command afterwards, while JARVIS is idle, and both

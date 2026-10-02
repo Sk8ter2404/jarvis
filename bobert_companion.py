@@ -16453,12 +16453,25 @@ def _parakeet_post_text(text: str) -> str:
         text, globals().get("STT_REPLACEMENTS_PARAKEET"))
 
 
+def _parakeet_wake_mode() -> bool:
+    """Only a wake word gets this capture anywhere: wake-word mode is on
+    (_should_refuse_background_audio refuses a mic turn not led by it), or
+    JARVIS is in standby / sleep (the standby loop wakes on it alone). A
+    misheard wake word would lose the turn in either. Never raises."""
+    try:
+        return bool(_require_wake_runtime or _standby_mode[0]
+                    or _sleep_mode[0])
+    except Exception:
+        return True
+
+
 def _parakeet_rescue(text: str, audio) -> str:
-    """core/stt_parakeet.rescue_reason with the live wake-word mode, the real
-    wake-prefix rule and the Silero head check (the tail probe's detector)."""
+    """core/stt_parakeet.rescue_reason with the live wake-only state
+    (_parakeet_wake_mode), the real wake-prefix rule and the Silero head
+    check (the tail probe's detector)."""
     return _stt_parakeet.rescue_reason(
         text,
-        wake_mode=lambda: bool(_require_wake_runtime),
+        wake_mode=_parakeet_wake_mode,
         has_wake_prefix=_text_has_wake_prefix,
         head_speech=lambda: _tail_vad.speech_in_head(
             audio, _stt_parakeet.RESCUE_HEAD_S, SAMPLE_RATE))
@@ -16494,6 +16507,7 @@ def _parakeet_shadow_ctx() -> dict:
                 "jarvis_asked": bool(_last_jarvis_line[1]),
                 "prompt_pending": _reply_prompt_pending(),
                 "wake_mode": bool(_require_wake_runtime),
+                "standby": bool(_standby_mode[0] or _sleep_mode[0]),
                 "noise_filter": bool(NOISE_FILTER_ENABLED)}
     except Exception:
         return {}

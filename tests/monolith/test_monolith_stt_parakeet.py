@@ -85,6 +85,8 @@ class _Base(MonolithGlobalsTestCase):
         self._p(bc, "_SPECULATIVE_STT", False)
         self._p(bc, "_stt_alt", None)
         self._p(bc, "_require_wake_runtime", False)
+        self._p(bc, "_standby_mode", [False])
+        self._p(bc, "_sleep_mode", [False])
         self._p(bc, "STT_HOTWORDS", "")
         self._p(bc, "STT_REPLACEMENTS", {})
         self._p(bc, "STT_REPLACEMENTS_PARAKEET", {})
@@ -251,6 +253,23 @@ class R6PrimaryTests(_Base):
         self.assertNotIn("Travis", out.getvalue())
         self.assertEqual(bc._parakeet_primary.rescues, 1)
 
+    def test_rescue_on_a_lost_wake_word_in_standby(self):
+        # Wake-word mode off, but standby wakes on the wake word alone: a
+        # misheard one would lose the wake just the same.
+        bc = self.bc
+        self._p(bc, "_stt_alt", _FakeEngine(text="Travis, are you there?"))
+        self._p(bc, "_standby_mode", [True])
+        self._p(bc._tail_vad, "speech_in_head", return_value=True)
+        tr = self._p(bc, "transcribe", return_value=W_RES)
+        self.assertIs(bc._transcribe_capture(self.audio), W_RES)
+        tr.assert_called_once()
+        self.assertEqual(self._engine_notes(), ["parakeet-rescued"])
+        self._p(bc, "_standby_mode", [False])
+        self._p(bc, "_sleep_mode", [True])
+        self.assertTrue(bc._parakeet_wake_mode())
+        self._p(bc, "_sleep_mode", [False])
+        self.assertFalse(bc._parakeet_wake_mode())
+
     def test_a_wake_led_transcript_is_not_rescued(self):
         bc = self.bc
         self._p(bc, "_stt_alt", _FakeEngine(text="Hey Jarvis, lights"))
@@ -340,7 +359,7 @@ class R6ShadowTests(_Base):
         self.assertIsInstance(ms, int)
         self.assertEqual(set(ctx), {"owner_idle_s", "since_jarvis_s",
                                     "jarvis_asked", "prompt_pending",
-                                    "wake_mode", "noise_filter"})
+                                    "wake_mode", "standby", "noise_filter"})
         self.assertEqual(self._engine_notes(), [])
 
     def test_a_shadow_fault_never_reaches_the_turn(self):

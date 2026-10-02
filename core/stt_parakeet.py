@@ -24,8 +24,9 @@ WHAT PARAKEET LOSES, AND THE RESCUE
     STT_REPLACEMENTS applies as for Whisper, then STT_REPLACEMENTS_PARAKEET
     maps Parakeet's own mishearings.
   * Wake-word mode refuses any mic turn whose transcript is not led by
-    "JARVIS", so ONE misheard wake word loses the whole turn. The rescue
-    bounds that: when Parakeet's text is empty — or, in wake-word mode, is
+    "JARVIS" (and standby / sleep wake on the wake word alone), so ONE
+    misheard wake word loses the whole turn. The rescue bounds that: when
+    Parakeet's text is empty — or, while only a wake word gets through, is
     not led by the wake word while the speech detector hears speech in the
     clip's first 0.8 s — Whisper decodes the clip once and its transcript is
     used. Every rescue is counted.
@@ -259,7 +260,9 @@ def rescue_reason(text, *, wake_mode, has_wake_prefix, head_speech) -> str:
     text). Only names a reason, never the text:
 
       'empty'   — Parakeet heard nothing;
-      'no-wake' — wake_mode() is on, has_wake_prefix(text) is False, and
+      'no-wake' — wake_mode() is on (wake-word mode, or standby / sleep:
+                  the monolith's _parakeet_wake_mode), has_wake_prefix(text)
+                  is False, and
                   head_speech() says the clip's first RESCUE_HEAD_S hold
                   speech — or cannot tell (None): a misheard wake word
                   must not lose the turn.
@@ -585,6 +588,7 @@ class Shadow:
             "speech_s": round(len(item["audio"]) / float(SAMPLE_RATE), 3),
             "peak": _num(item["peak"]),
             "wake_mode": bool(ctx.get("wake_mode")),
+            "standby": bool(ctx.get("standby")),
             "shadow_wait_ms": waited_ms,
             "same_words": _norm_words(w_text) == _norm_words(p_text),
             "whisper": _side(w_text, w_conf, w_judged, item["stt_ms"]),

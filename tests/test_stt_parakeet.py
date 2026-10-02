@@ -504,6 +504,7 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(row["parakeet"]["stt_ms"], 150)
         self.assertEqual(row["parakeet"]["n_tok"], 9)
         self.assertTrue(row["wake_mode"])
+        self.assertFalse(row["standby"])
         self.assertEqual(row["speech_s"], 2.0)
         self.assertTrue(row["parakeet"]["accepted"])
         json.dumps(row)                        # one JSON line
