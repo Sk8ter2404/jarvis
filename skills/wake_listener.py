@@ -288,13 +288,15 @@ def _guest_mode_active() -> bool:
     """Visitors are here: this skill's own GUEST_MODE_ENABLED (the
     wake_listener_configure knob), or the owner's guest mode
     (core/guest_mode.py, 2026-10-02 -- "guest mode on" / "we have guests"),
-    which also stops JARVIS remembering anything. One switch for both."""
+    which also stops JARVIS remembering anything. One switch for both. The
+    gate opens only for a live flip this run (voices_open), never for the
+    saved flag alone: the bypass still resets on every restart."""
     if GUEST_MODE_ENABLED:
         return True
     try:
         _ensure_core_on_path()
         from core import guest_mode as _gm
-        return _gm.is_on()
+        return _gm.voices_open()
     except Exception:
         return False
 

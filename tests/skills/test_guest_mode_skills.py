@@ -164,8 +164,16 @@ class WakeListenerGuestTests(_GuestOn):
 
     def test_the_owners_guest_mode_opens_the_wake_gate(self):
         self.assertTrue(self._strict())
+        # The boot seed alone (a saved guest mode after a restart) is the
+        # memory half only: the gate stays strict, as the old per-boot
+        # bypass did.
         guest_mode.set_on(True)
+        self.assertTrue(self._strict())
+        # A live "guest mode on" this run opens it.
+        guest_mode.set_voices_open(True)
         self.assertFalse(self._strict())
+        guest_mode.set_on(False)
+        self.assertTrue(self._strict())
 
     def test_register_keeps_the_monoliths_switch(self):
         mono_on, mono_off = mock.Mock(), mock.Mock()

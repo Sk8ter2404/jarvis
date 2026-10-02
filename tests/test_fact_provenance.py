@@ -276,10 +276,32 @@ class GuestModeFlagTests(unittest.TestCase):
         guest_mode.set_on(0)
         self.assertFalse(guest_mode.is_on())
 
+    def test_visitors_voices_are_a_live_session_switch(self):
+        """The voice-ID bypass (visitors' voices pass the gates) needs a live
+        "guest mode on" this run, never just the saved flag, and closes with
+        guest mode (review 2026-10-02: it used to reset on every restart)."""
+        self.assertFalse(guest_mode.voices_open())
+        guest_mode.set_on(True)                # the boot seed: memory only
+        self.assertFalse(guest_mode.voices_open())
+        guest_mode.set_voices_open(True)       # the live voice / web flip
+        self.assertTrue(guest_mode.voices_open())
+        guest_mode.set_on(False)               # off closes the gates too
+        self.assertFalse(guest_mode.voices_open())
+        guest_mode.set_on(True)
+        self.assertFalse(guest_mode.voices_open())
+        # Open without guest mode on is not open.
+        guest_mode.set_on(False)
+        guest_mode.set_voices_open(True)
+        self.assertFalse(guest_mode.voices_open())
+
     def test_never_raises_on_a_broken_slot(self):
         with mock.patch.object(guest_mode, "_on", []):
             self.assertFalse(guest_mode.is_on())
             guest_mode.set_on(True)            # no raise
+            self.assertFalse(guest_mode.voices_open())
+        with mock.patch.object(guest_mode, "_voices", []):
+            self.assertFalse(guest_mode.voices_open())
+            guest_mode.set_voices_open(True)   # no raise
 
     def test_the_module_never_reads_the_owners_settings(self):
         """Importing it must not seed from core.config: a test or tool that
@@ -372,6 +394,22 @@ class GuestModeVoiceCommandLogTests(unittest.TestCase):
             pattern_memory.record_voice_command("play the lighthouse song",
                                                 active_app="")
         ensure.assert_not_called()
+
+
+class ProvenanceRoutingTests(unittest.TestCase):
+    """The local route ships only the prompt sections a turn implicates
+    (core/prompt_router.slim_pc_control): every common way of asking where a
+    fact came from must carry where_learned to the model."""
+
+    def test_every_way_of_asking_reaches_the_action(self):
+        from core.prompt_router import slim_pc_control
+        from core.prompts import PC_CONTROL_PROMPT
+        for said in ("where did you learn that", "who told you that",
+                     "how do you know that", "how did you know that",
+                     "Jarvis, how did you know that?",
+                     "where did you get that from"):
+            self.assertIn("where_learned",
+                          slim_pc_control(said, PC_CONTROL_PROMPT), said)
 
 
 if __name__ == "__main__":

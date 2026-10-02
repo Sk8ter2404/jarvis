@@ -286,7 +286,8 @@ class RecallRecordTests(MonolithGlobalsTestCase):
 
     def test_which_turns_ask_where_a_fact_came_from(self):
         yes = ("where did you learn that", "Jarvis, who told you that?",
-               "how do you know that", "where'd you hear that",
+               "how do you know that", "how did you know that?",
+               "where'd you hear that",
                "what's your source for that", "how did you find out")
         no = ("where is the nearest pharmacy", "do you know that song",
               "tell me what you learned today", "who is on the wifi")
@@ -473,8 +474,82 @@ class GuestModeActionTests(MonolithGlobalsTestCase):
         with mock.patch.object(bc, "GUEST_MODE_ENABLED", False), \
              mock.patch.dict(bc.sys.modules, {"skill_wake_listener": None}):
             self.assertFalse(bc._media_guest_mode())
-            bc._guest_mode.set_on(True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bc._act_guest_mode_set(True)
             self.assertTrue(bc._media_guest_mode())
+
+    def test_a_restart_keeps_the_memory_half_but_closes_the_voice_gates(self):
+        """The voice-ID bypass was always per boot (the wake listener's
+        GUEST_MODE_ENABLED resets on every restart). Guest mode's memory half
+        survives a restart; visitors' voices pass the gates again only after
+        a live "guest mode on" in that run (review 2026-10-02)."""
+        bc = self.bc
+        with mock.patch.object(bc, "GUEST_MODE_ENABLED", False), \
+             mock.patch.dict(bc.sys.modules, {"skill_wake_listener": None}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            bc._act_guest_mode_set(True)
+            self.assertTrue(bc._media_guest_mode())
+            # "Restart": a fresh flag, re-seeded from the saved setting.
+            bc._guest_mode.set_on(False)
+            self.cfg.GUEST_MODE = True
+            bc._guest_mode_boot()
+            self.assertTrue(bc._guest_mode.is_on())    # still remembers nothing
+            self.assertFalse(bc._media_guest_mode())   # but the gates are shut
+            bc._act_guest_mode_set(True)               # said again this run
+            self.assertTrue(bc._media_guest_mode())
+            bc._act_guest_mode_set(False)
+            self.assertFalse(bc._media_guest_mode())
+
+    def _history(self, *lines):
+        return [{"role": "user" if i % 2 == 0 else "assistant", "content": t}
+                for i, t in enumerate(lines)]
+
+    def test_after_the_guests_leave_no_summary_holds_their_turns(self):
+        """Checkpoints run every 10 minutes, so a short visit may see none
+        while guest mode is on. Turning it off must still keep the guests'
+        turns out of every later summary (review 2026-10-02)."""
+        bc = self.bc
+        hist = bc.conversation_history
+        hist[:] = self._history("how is the printer", "The printer is idle.")
+        bc._session_running_summary[0] = "Checked the printer."
+        bc._session_summary_marker[0] = hist[-1]
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc._act_guest_mode_set(True)
+            hist.extend(self._history("Orlo here, I collect stamps",
+                                      "Nice to meet you, Orlo."))
+            bc._act_guest_mode_set(False)
+        hist.extend(self._history("owner line after", "owner reply after"))
+        with mock.patch.object(bc, "_llm_quick",
+                               return_value="Printer, then more.") as llm, \
+             mock.patch.object(bc.pattern_memory, "record_session_summary"):
+            bc._session_summary_update(bc._session_summary_pending())
+        sent = llm.call_args.kwargs.get("user", "")
+        self.assertIn("owner line after", sent)
+        self.assertNotIn("Orlo", sent)
+
+    def test_a_snapshot_taken_in_guest_mode_is_never_summarised(self):
+        """The checkpoint snapshots, then waits (bounded) for a quiet moment:
+        if the guests leave meanwhile, their turns must not go to the model
+        or into the summary."""
+        bc = self.bc
+        hist = bc.conversation_history
+        bc._session_running_summary[0] = "Checked the printer."
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc._act_guest_mode_set(True)
+            hist[:] = self._history("Orlo here", "Hello, Orlo.",
+                                    "I collect stamps", "Splendid.")
+            pending = bc._session_summary_pending()
+            self.assertIsNotNone(pending)
+            bc._act_guest_mode_set(False)
+        with mock.patch.object(bc, "_llm_quick",
+                               return_value="Orlo collects stamps.") as llm, \
+             mock.patch.object(bc.pattern_memory,
+                               "record_session_summary") as rec:
+            self.assertEqual(bc._session_summary_update(pending), "")
+        llm.assert_not_called()
+        rec.assert_not_called()
+        self.assertEqual(bc._session_running_summary[0],
+                         "Checked the printer.")
 
     def test_the_dashboard_buttons_go_through_the_tray_plane(self):
         bc = self.bc

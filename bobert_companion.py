@@ -1103,8 +1103,9 @@ HEADSET_NAME_HINTS      = ["headset", "headphone", "earphone"] + [s.strip() for 
 #                               guests have to re-enable per boot. The
 #                               spoken "guest mode on" is the owner's
 #                               guest mode (core/guest_mode.py, 2026-10-02):
-#                               it opens the same gates, stops JARVIS
-#                               remembering, and persists until turned off.
+#                               it opens the same gates (still per boot:
+#                               voices_open) and stops JARVIS remembering,
+#                               which persists until turned off.
 VOICE_BIOMETRIC_ENABLED   = False
 VOICE_BIOMETRIC_THRESHOLD = 0.72
 GUEST_MODE_ENABLED        = False
@@ -3982,6 +3983,12 @@ def _session_summary_update(pending, *, record: bool = True) -> str:
                         _session_trimmed.popleft()
                 _session_summary_marker[0] = new[-1]
         return ""
+    # A snapshot from before a wipe -- or from guest mode, which bumps the
+    # generation as it ends (_session_summary_skip_guest_turns) -- would be
+    # discarded at the commit below anyway: never send it to the model.
+    with _session_summary_lock:
+        if gen != _session_summary_gen[0]:
+            return ""
     transcript = "\n".join(
         f"{str(m.get('role', '')).title()}: {str(m.get('content', ''))[:500]}"
         for m in new)
@@ -4028,6 +4035,31 @@ def _session_summary_update(pending, *, record: bool = True) -> str:
             _session_running_summary[0] = summary
             _session_summary_at[0] = time.time()
     return summary
+
+
+def _session_summary_skip_guest_turns() -> None:
+    """Guest mode just ended (_act_guest_mode_set; review 2026-10-02): every
+    message so far counts as summarised WITHOUT entering the running
+    summary, so the company's conversation never reaches a later checkpoint
+    or the shutdown summary -- the checkpoint runs every
+    _SESSION_CHECKPOINT_INTERVAL_S, so a shorter visit saw none while guest
+    mode was on. The generation bump makes a checkpoint already in flight
+    (its snapshot may hold the guests' turns) discard its result, as after a
+    wipe; the running summary itself is kept. The history stays in context,
+    so the conversation can still refer back. Never raises."""
+    try:
+        with _session_summary_lock:
+            _session_trimmed.clear()
+            last = None
+            for m in reversed(conversation_history):
+                if isinstance(m, dict):
+                    last = m
+                    break
+            _session_summary_marker[0] = last
+            _session_summary_gen[0] += 1
+    except Exception as e:
+        print(f"  [guest-mode] session summary marker not moved: "
+              f"{type(e).__name__}")
 
 
 def _forget_live_conversation(cutoff: float | None = None) -> int:
@@ -21852,7 +21884,7 @@ _WHERE_LEARNED_RE = re.compile(
     r"pick\s+up)\b"
     r"|\bwhere'?d\s+you\s+(?:learn|hear|get|pick)\b"
     r"|\bwho\s+told\s+you\b"
-    r"|\bhow\s+do\s+you\s+know\s+(?:that|this)\b"
+    r"|\bhow\s+(?:do|did)\s+you\s+know\s+(?:that|this)\b"
     r"|\bwhat'?s\s+your\s+source\b",
     re.IGNORECASE)
 
@@ -31310,9 +31342,21 @@ def _act_guest_mode_set(on: bool) -> str:
     settings file (so it survives a restart until turned off) and
     hud_state.json's ``guest_mode`` (the HUD badge and the dashboard chip).
     Persistence is best-effort: on failure the flip still holds for THIS
-    session and the reply carries a caveat. Returns a JARVIS line."""
+    session and the reply carries a caveat. Returns a JARVIS line.
+
+    Review 2026-10-02: the live flip (this function, never the boot seed)
+    also opens / closes the voice-ID bypass for visitors' voices
+    (core.guest_mode.voices_open), so that security half stays per run as it
+    always was. Ending guest mode marks the conversation so far as
+    summarised without folding it into the session summary
+    (_session_summary_skip_guest_turns): a visit shorter than one checkpoint
+    interval would otherwise be summarised by the next one."""
     on = bool(on)
+    was_on = _guest_mode.is_on()
     _guest_mode.set_on(on)
+    _guest_mode.set_voices_open(on)
+    if was_on and not on:
+        _session_summary_skip_guest_turns()
     try:
         import core.config as _cfg
         _cfg.GUEST_MODE = on
@@ -31353,7 +31397,9 @@ def _guest_mode_boot() -> None:
     """Boot: re-apply the saved guest mode (core.config.GUEST_MODE, which
     _apply_user_settings read from user_settings.json) to the live flag and
     publish it. Done here, not at import, so a process that only imports the
-    monolith never inherits the owner's setting. Never raises."""
+    monolith never inherits the owner's setting. The memory half only: the
+    voice-ID gates stay strict until a live "guest mode on" this run
+    (core.guest_mode.voices_open). Never raises."""
     try:
         import core.config as _cfg
         _guest_mode.set_on(bool(getattr(_cfg, "GUEST_MODE", False)))
@@ -31361,7 +31407,8 @@ def _guest_mode_boot() -> None:
         pass
     if _guest_mode.is_on():
         print("  [guest-mode] ON (saved): answering normally, remembering "
-              "nothing until 'guest mode off'")
+              "nothing until 'guest mode off'; voice-ID gates stay as usual "
+              "until 'guest mode on' is said again")
     _publish_guest_mode_state()
 
 
@@ -32913,8 +32960,9 @@ def _media_probe_result(audio, wait_s: float = _MEDIA_PROBE_WAIT_S) -> "float | 
 def _media_guest_mode() -> bool:
     try:
         # The owner's guest mode (core/guest_mode.py, 2026-10-02) is the same
-        # "visitors are here" switch: their voices pass this gate too.
-        if GUEST_MODE_ENABLED or _guest_mode.is_on():
+        # "visitors are here" switch: their voices pass this gate too -- once
+        # it was turned on live this run, never from the saved flag alone.
+        if GUEST_MODE_ENABLED or _guest_mode.voices_open():
             return True
         _wl = sys.modules.get("skill_wake_listener")
         return bool(getattr(_wl, "GUEST_MODE_ENABLED", False))

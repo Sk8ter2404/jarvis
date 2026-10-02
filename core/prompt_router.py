@@ -710,6 +710,7 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "where did you learn", "where'd you learn", "where did you hear",
         "where'd you hear", "where did you get that", "where'd you get that",
         "who told you", "how do you know that", "how do you know this",
+        "how did you know that", "how did you know this",
         "how did you learn", "how did you find out", "what's your source",
         "where did that come from", "where does that come from",
     ],
