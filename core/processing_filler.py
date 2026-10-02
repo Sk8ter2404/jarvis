@@ -44,7 +44,8 @@ import time
 
 __all__ = [
     "FIRST_LINES", "STILL_LINES", "QUIET_IMPERATIVES", "DEFAULT_FIRST",
-    "DEFAULT_STILL", "normalise_line", "sanitize_delays", "is_quiet_command",
+    "DEFAULT_STILL", "PLEASANTRIES", "normalise_line", "sanitize_delays",
+    "sanitize_late_start", "is_quiet_command", "is_pleasantry",
     "FillerTurn", "ProcessingFiller", "ClipCache",
 ]
 
@@ -89,6 +90,22 @@ QUIET_IMPERATIVES: frozenset[str] = frozenset({
 _QUIET_MAX_WORDS = 3
 _COURTESY_WORDS = frozenset({"jarvis", "sir", "please", "ok", "okay", "just"})
 
+# Pleasantries (speed plan R3, 2026-10-02): a turn that is ONLY one of these
+# phrases needs no "I heard you" line ("Thank you." got the filler 6 times in
+# the 09-29..10-01 logs). A phrase list, not a word count: "thanks" is a
+# pleasantry, "stop the music" is not. An optional leading / trailing
+# "jarvis" / "sir" is allowed. Used by the monolith only when
+# PROCESSING_FILLER_SKIP_PLEASANTRIES is on (the owner's choice; off ships).
+PLEASANTRIES: frozenset[str] = frozenset({
+    "thanks", "thank you", "hello", "hi", "okay", "ok", "good morning",
+    "good night", "cool", "great",
+})
+_PLEASANTRY_EXTRAS = frozenset({"jarvis", "sir"})
+
+# PROCESSING_FILLER_LATE_START_S bounds (speed plan R3). Below the floor,
+# scheduler jitter alone would make every stage-1 line "late".
+_LATE_START_MIN, _LATE_START_MAX = 0.1, 60.0
+
 
 def normalise_line(text: str) -> str:
     """Lowercase, drop ', sir' and punctuation, collapse whitespace. Used to
@@ -127,6 +144,34 @@ def sanitize_delays(first, still) -> tuple[float, float | None]:
     return float(f), float(min(s, _STILL_MAX))
 
 
+def sanitize_late_start(value) -> float | None:
+    """PROCESSING_FILLER_LATE_START_S as a stage-1 retry window in seconds:
+    clamped to [0.1, 60]; None for a value that is not a finite number (the
+    caller then keeps its own window). Never raises."""
+    if isinstance(value, bool):
+        return None
+    f = _to_float(value, float("nan"))
+    if not math.isfinite(f):
+        return None
+    return float(min(max(f, _LATE_START_MIN), _LATE_START_MAX))
+
+
+def is_pleasantry(text: str) -> bool:
+    """True when ``text`` is only a pleasantry from PLEASANTRIES ("Thank
+    you.", "Hello, JARVIS.", "ok sir"), with an optional leading / trailing
+    "jarvis" / "sir". Pure; never raises."""
+    try:
+        clean = re.sub(r"[^a-z' ]+", " ", str(text or "").lower())
+        words = clean.split()
+        while words and words[0] in _PLEASANTRY_EXTRAS:
+            words.pop(0)
+        while words and words[-1] in _PLEASANTRY_EXTRAS:
+            words.pop()
+        return bool(words) and " ".join(words) in PLEASANTRIES
+    except Exception:
+        return False
+
+
 def is_quiet_command(text: str, clipped=None) -> bool:
     """True for a short stop / cancel / quiet utterance ("stop", "shut up
     jarvis", "cancel that"). ``clipped`` is the tone detector's imperative
@@ -154,11 +199,15 @@ class FillerTurn:
     """State of one armed voice turn. Mutated only under the filler lock."""
 
     __slots__ = ("t0", "last_mark", "spoke", "fired", "cancel", "first",
-                 "still", "owner")
+                 "still", "owner", "first_retry")
 
     def __init__(self, t0: float, first: float, still: float | None,
-                 owner: int | None = None):
+                 owner: int | None = None, first_retry: float | None = None):
         self.t0 = t0
+        # Stage 1's retry window for THIS turn, read from the filler's
+        # late_fn at arm() (speed plan R3). None = the filler's own
+        # first_retry_s / first_late_s apply exactly as before.
+        self.first_retry = first_retry
         # Thread ident of the voice turn that armed this (the dispatch
         # thread). Only a mic capture on THIS thread is turn activity -- a
         # background capture (the standby-audio loop polls get_mic_buffer
@@ -180,7 +229,8 @@ class ProcessingFiller:
                  clock=time.monotonic, wait_fn=_default_wait,
                  thread_factory=threading.Thread, retry_s: float = 0.5,
                  max_retry_s: float = 30.0, first_retry_s: float = 3.0,
-                 first_late_s: float | None = None, log_fn=None):
+                 first_late_s: float | None = None, late_fn=None,
+                 log_fn=None):
         self._play_fn = play_fn
         self._suppressed_fn = suppressed_fn
         self._delays_fn = delays_fn
@@ -202,6 +252,12 @@ class ProcessingFiller:
                                   else max(0.0, float(first_late_s)))
         except (TypeError, ValueError):
             self._first_late_s = None
+        # Speed plan R3 (2026-10-02): late_fn() -> stage 1's retry window in
+        # seconds (PROCESSING_FILLER_LATE_START_S), read at every arm() so a
+        # settings change needs no new instance. The turn then also may not
+        # START stage 1 later than min(that window, first_late_s) past
+        # t0 + first. None (or a bad value) = first_retry_s, as before.
+        self._late_fn = late_fn
         self._log_fn = log_fn
         self._lock = threading.Lock()
         self._current: FillerTurn | None = None
@@ -229,7 +285,8 @@ class ProcessingFiller:
             return None
         first, still = sanitize_delays(*self._delays_fn())
         turn = FillerTurn(self._clock(), first, still,
-                          owner=threading.get_ident())
+                          owner=threading.get_ident(),
+                          first_retry=self._read_late())
         with self._lock:
             if self._closed:
                 return None
@@ -315,17 +372,30 @@ class ProcessingFiller:
                 if (t.cancel.is_set() or t.spoke or self._captures > 0
                         or not first_ready or t.first > float(max_first_s)):
                     return ""
-                if self._clock() - t.t0 >= t.first + self._first_window():
+                if self._clock() - t.t0 >= t.first + self._first_window(t):
                     return ""
                 return "pending"
         except Exception:
             return ""
 
-    def _first_window(self) -> float:
+    def _read_late(self) -> float | None:
+        """late_fn()'s window, sanitised; None without late_fn or for a bad
+        value. Never raises."""
+        if self._late_fn is None:
+            return None
+        try:
+            return sanitize_late_start(self._late_fn())
+        except Exception:
+            return None
+
+    def _first_window(self, turn: FillerTurn | None = None) -> float:
         """How long past t0 + first stage 1 may still start."""
+        retry = self._first_retry_s
+        if turn is not None and turn.first_retry is not None:
+            retry = turn.first_retry
         if self._first_late_s is None:
-            return self._first_retry_s
-        return min(self._first_retry_s, self._first_late_s)
+            return retry
+        return min(retry, self._first_late_s)
 
     def _log(self, msg: str) -> None:
         self.last_reason = msg
@@ -437,18 +507,23 @@ class ProcessingFiller:
     def _run(self, turn: FillerTurn) -> None:
         if self._wait(turn.cancel, turn.first):
             return
+        if turn.first_retry is None:
+            retry_cap, late_cap = self._first_retry_s, self._first_late_s
+        else:
+            # R3 late-start knob: the window bounds the retries AND the start.
+            retry_cap, late_cap = turn.first_retry, self._first_window(turn)
         retried = 0.0
         while not turn.spoke:
-            if self._first_late_s is not None:
+            if late_cap is not None:
                 late = self._clock() - (turn.t0 + turn.first)
-                if late > self._first_late_s:
+                if late > late_cap:
                     self._log(f"stage 1 skipped: {late:.1f}s late")
                     break
             try:
                 r = self._play_fn(turn, 1)
             except Exception:
                 r = None
-            if r != "retry" or retried >= self._first_retry_s:
+            if r != "retry" or retried >= retry_cap:
                 break
             retried += self._retry_s
             if self._wait(turn.cancel, self._retry_s):

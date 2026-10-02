@@ -832,6 +832,20 @@ PROCESSING_FILLER_ENABLED     = False
 PROCESSING_FILLER_DELAY       = 2.5    # s after the transcript before stage 1
 PROCESSING_FILLER_STILL_DELAY = 12.0   # s of turn silence before stage 2
 
+# Filler handoff (speed plan R3, 2026-10-02). Every default below is today's
+# behaviour; the owner flips them in user_settings.json (next start).
+# PROCESSING_FILLER_LATE_START_S — stage 1 retries this long past its delay
+# while a capture holds it off, and never STARTS later than that (nor later
+# than the fixed 1 s cap from 2026-10-02, so only values under 1.0 change
+# anything). 0.6 is the plan's pick; clamped to 0.1-60.
+# PROCESSING_FILLER_SKIP_PLEASANTRIES — no filler for a turn that is only
+# "thank you" / "hello" / "okay" / "good night" ... (owner's choice).
+# FILLER_DUCK_HOLD — keep the music ducked from the filler clip through the
+# answer to the end of the turn (one session scan, no swell in between).
+PROCESSING_FILLER_LATE_START_S      = 3.0
+PROCESSING_FILLER_SKIP_PLEASANTRIES = False
+FILLER_DUCK_HOLD                    = False
+
 
 # ─── Answer first (skip the model's short lead-in before a spoken answer) ──
 # 2026-09-29. A reply like "One moment, sir. [ACTION: get_time]" used to speak

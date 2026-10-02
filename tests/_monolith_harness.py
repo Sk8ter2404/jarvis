@@ -230,6 +230,11 @@ _MONOLITH_RESTORE_NAMES = (
     # _reset_filler_state. Tests that need filler state should still patch in
     # a FRESH ProcessingFiller / ClipCache rather than mutate these.
     "_processing_filler", "_filler_clips",
+    # Filler handoff (speed plan R3, 2026-10-02): the turn's duck-hold cell.
+    # A leaked True would make a LATER test's first voice turn give back a
+    # hold it never took (the ducker count itself is reset in
+    # _reset_filler_state).
+    "_filler_duck_held",
     # Per-turn timing line (2026-09-29): rebind-restored, and its active turn
     # dropped in _restore_monolith_pristine — a turn left open by a test that
     # drove a capture would make a LATER test's dispatch print a stray
@@ -646,6 +651,15 @@ def _reset_filler_state(bc) -> None:
             c._clips.clear()
             c._rejected = set()
         c._warming = False
+    except Exception:
+        pass
+    # Speed plan R3: a FILLER_DUCK_HOLD hold left on the shared ducker by a
+    # failed test would make every LATER test's restore() a no-op.
+    try:
+        d = bc._audio_ducker
+        with d._lock:
+            d._holds = 0
+            d._held_ducked = False
     except Exception:
         pass
 

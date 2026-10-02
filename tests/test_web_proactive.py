@@ -74,6 +74,10 @@ NOT_PROACTIVE = {
     "AMBIENT_LEARNING_FORCE_LOCAL": "picks the model ambient learning uses",
     "AMBIENT_MUSIC_REFUSE_WAKE": "a wake-word filter",
     "AMBIENT_STT_YIELD": "scheduling inside ambient listening",
+    "PROCESSING_FILLER_SKIP_PLEASANTRIES": "a condition on the processing "
+                                           "filler (its row)",
+    "FILLER_DUCK_HOLD": "how long the music stays ducked around the filler "
+                        "and the answer",
     "AMBIENT_EXTRACT_ENABLED": "starts nothing; the extractor follows the "
                                "capture sources",
     "PROACTIVE_REQUIRE_FACE": "a condition on proactive comments",

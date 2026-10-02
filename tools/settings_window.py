@@ -1170,6 +1170,28 @@ SCHEMA: dict[str, dict] = {
                 "line. Set at or below the filler delay to turn it off. "
                 "Applies on the next start.",
     },
+    "PROCESSING_FILLER_LATE_START_S": {
+        "tab": "voice", "label": "Filler: latest start (seconds late)",
+        "type": "float", "default": 3.0, "min": 0.1, "max": 60,
+        "help": "How late the 'I heard you' line may still start when "
+                "something holds it off. Only values under 1 change anything "
+                "(a 1-second cap already applies); 0.6 is the speed plan's "
+                "pick. Applies on the next start.",
+    },
+    "PROCESSING_FILLER_SKIP_PLEASANTRIES": {
+        "tab": "voice", "label": "No filler for 'thank you' / 'hello'",
+        "type": "bool", "default": False,
+        "help": "Skip the filler line when all you said was a pleasantry "
+                "(thank you, thanks, hello, hi, okay, good morning, good "
+                "night, cool, great). Applies on the next start.",
+    },
+    "FILLER_DUCK_HOLD": {
+        "tab": "voice", "label": "Keep music ducked from filler to answer",
+        "type": "bool", "default": False,
+        "help": "Music stays turned down from the filler line through the "
+                "answer, instead of coming back up in between. Applies on the "
+                "next start.",
+    },
     "ANSWER_FIRST_ENABLED": {
         "tab": "voice", "label": "Answer first (skip 'one moment' lead-ins)",
         "type": "bool", "default": True,
@@ -1854,7 +1876,10 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Speaking", ["TTS_BACKEND", "TTS_VOICE", "STREAMING_TTS_ENABLED",
                       "SENTENCE_TTS_ENABLED", "ANSWER_FIRST_ENABLED",
                       "PROCESSING_FILLER_ENABLED", "PROCESSING_FILLER_DELAY",
-                      "PROCESSING_FILLER_STILL_DELAY"]),
+                      "PROCESSING_FILLER_STILL_DELAY",
+                      "PROCESSING_FILLER_LATE_START_S",
+                      "PROCESSING_FILLER_SKIP_PLEASANTRIES",
+                      "FILLER_DUCK_HOLD"]),
         ("Voice clone", ["VOICE_CLONE_ENABLED", "VOICE_CLONE_PROFILE",
                          "VOICE_CLONE_MODEL"]),
         ("Wake word & conversation", [

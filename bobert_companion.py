@@ -24674,6 +24674,12 @@ class _AudioDucker:
         # does not swell back up (and restore's synchronous fade-up does not
         # stall) between two sentences of one reply. release() restores.
         self._holds = 0
+        # FILLER_DUCK_HOLD (speed plan R3, off by default): True once a duck()
+        # has scanned the sessions while a hold is up. Every later duck()
+        # under the same hold is then a no-op even when that scan matched
+        # nothing, so the answer after a filler clip pays no second COM
+        # session scan. Cleared when the last hold is released.
+        self._held_ducked = False
 
     def hold(self) -> None:
         with self._lock:
@@ -24683,6 +24689,8 @@ class _AudioDucker:
         with self._lock:
             self._holds = max(0, self._holds - 1)
             last = self._holds == 0
+            if last:
+                self._held_ducked = False
         if last:
             self.restore()
 
@@ -24825,11 +24833,18 @@ class _AudioDucker:
         with self._lock:
             if self._saved:
                 return
+            # One scan per hold (FILLER_DUCK_HOLD only; see _held_ducked).
+            once = (self._holds > 0
+                    and bool(globals().get("FILLER_DUCK_HOLD", False)))
+            if once and self._held_ducked:
+                return
             try:
                 matched = self._enumerate_targets()
             except Exception as e:
                 print(f"  [audio-duck] duck failed: {e}")
                 return
+            if once:
+                self._held_ducked = True
             if not matched:
                 return
             self._saved = matched
@@ -37238,6 +37253,45 @@ def _filler_teardown(reason: str = "") -> None:
         _processing_filler.shutdown(reason)
     except Exception:
         pass
+    _filler_duck_release()
+
+
+# FILLER_DUCK_HOLD (speed plan R3, off by default): the music stays ducked
+# from the filler clip, through the answer, to the end of the turn — today
+# it swells back up between the two and the answer pays a second session
+# scan. _filler_play takes ONE _audio_ducker hold per turn right after an
+# "ok" claim and records it here; _filler_end_turn and _filler_teardown give
+# it back, and the next voice turn's _filler_should_arm drops a stale one,
+# so the ducker's count can never leak. The lock makes take / give atomic
+# (the filler thread takes, the dispatch thread gives).
+_filler_duck_held: list = [False]
+_filler_duck_lock = threading.Lock()
+
+
+def _filler_duck_hold() -> None:
+    """Take the turn's duck hold (at most one at a time). Never raises."""
+    try:
+        with _filler_duck_lock:
+            if _filler_duck_held[0]:
+                return
+            _audio_ducker.hold()
+            _filler_duck_held[0] = True
+    except Exception:
+        pass
+
+
+def _filler_duck_release() -> None:
+    """Give back the filler's duck hold, if one is taken. The ducker's
+    release() runs outside the lock: the last release does restore()'s
+    bounded synchronous fade-up. Never raises."""
+    try:
+        with _filler_duck_lock:
+            if not _filler_duck_held[0]:
+                return
+            _filler_duck_held[0] = False
+        _audio_ducker.release()
+    except Exception:
+        pass
 
 
 def _filler_mic_capture_live() -> bool:
@@ -37381,6 +37435,8 @@ def _filler_play(turn, stage: int) -> str:
         if verdict != "ok":
             return "skipped"
         claimed = True
+        if globals().get("FILLER_DUCK_HOLD", False):
+            _filler_duck_hold()   # given back at the end of the turn
         text = random.choice(avail)
         clip = _filler_clips.get(text)
         if clip is None:
@@ -37433,20 +37489,31 @@ def _filler_warm_if_needed() -> bool:
 def _filler_should_arm(text: str) -> bool:
     """Voice-turn gate on top of _filler_suppressed: never for a stop /
     cancel / quiet command (the owner asked for silence), never on the
-    realtime voice path (its always-open mic would transcribe the clip)."""
+    realtime voice path (its always-open mic would transcribe the clip),
+    and — with PROCESSING_FILLER_SKIP_PLEASANTRIES — never for a bare
+    "thank you" / "hello" / "okay" (core.processing_filler.is_pleasantry).
+    A new voice turn is starting, so a duck hold still recorded from an
+    earlier turn is stale and is given back first."""
+    _filler_duck_release()
     if not globals().get("PROCESSING_FILLER_ENABLED", False):
         return False
     if _realtime_session[0] is not None:
         return False
     clipped = getattr(_tone_detector, "_CLIPPED_IMPERATIVES", None)
-    return not _pf_mod.is_quiet_command(text, clipped)
+    if _pf_mod.is_quiet_command(text, clipped):
+        return False
+    if (globals().get("PROCESSING_FILLER_SKIP_PLEASANTRIES", False)
+            and _pf_mod.is_pleasantry(text)):
+        return False
+    return True
 
 
 def _filler_end_turn(turn) -> None:
     """Dispatch-wrapper epilogue: disarm, then a BOUNDED pure-Event wait so a
     clip claimed just before the turn ended finishes before the main loop
     reopens the mic (it would otherwise be recorded as the next utterance),
-    then warm the cache. Never raises."""
+    then give back the turn's duck hold (FILLER_DUCK_HOLD) and warm the
+    cache. Never raises."""
     try:
         _processing_filler.disarm(turn)
         if turn is not None and _processing_filler.playing():
@@ -37455,6 +37522,7 @@ def _filler_end_turn(turn) -> None:
                       f"{_FILLER_END_WAIT_S:.0f}s; continuing")
     except Exception:
         pass
+    _filler_duck_release()
     _filler_warm_if_needed()
 
 
@@ -37470,6 +37538,9 @@ _processing_filler = _pf_mod.ProcessingFiller(
     delays_fn=lambda: (globals().get("PROCESSING_FILLER_DELAY", 2.5),
                        globals().get("PROCESSING_FILLER_STILL_DELAY", 12.0)),
     first_late_s=_FILLER_FIRST_LATE_S,
+    # Speed plan R3: stage 1's retry window, read at every arm (default 3.0
+    # = the constructor's first_retry_s, so _FILLER_FIRST_LATE_S still rules).
+    late_fn=lambda: globals().get("PROCESSING_FILLER_LATE_START_S", 3.0),
     log_fn=lambda _m: print(f"  [filler] {_m}"),
 )
 
