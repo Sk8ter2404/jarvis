@@ -98,7 +98,7 @@ class _Base(unittest.TestCase):
 # ════════════════════════════════════════════════════════════════════════════
 #  The action's immediate result
 # ════════════════════════════════════════════════════════════════════════════
-class SlowAppResultTests(_Base):
+class _OpenBase(_Base):
     def setUp(self):
         super().setUp()
         p = mock.patch.object(A, "_start_open_watch", return_value=object())
@@ -118,6 +118,8 @@ class SlowAppResultTests(_Base):
             out = A._act_open_on_monitor(args)
         return out, la, gw
 
+
+class SlowAppResultTests(_OpenBase):
     def test_the_live_case_says_it_will_move_teams_when_it_appears(self):
         # Teams closed, nothing of it on screen; no window within the wait.
         other = _win("Inbox - Mail", 0x10)
@@ -365,6 +367,227 @@ class AppWindowMatchTests(_Base):
         self.assertEqual(A._app_words("Microsoft Teams"), ["teams"])
         self.assertEqual(A._app_words("Google Chrome"), ["chrome"])
         self.assertEqual(A._app_words("Microsoft"), ["microsoft"])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Review 2026-10-02: the wrong app's window, a newer request, a browser tab
+# ════════════════════════════════════════════════════════════════════════════
+class WrongAppTests(_OpenBase):
+    """ANY word of a multi-word name inside an exe name made another app's
+    window "the app": "Visual Studio Code" matched bambustudio.exe through
+    "studio", so a slow VS Code start moved the owner's Bambu Studio window
+    and called VS Code "already open"."""
+
+    def test_another_studio_app_is_not_vs_code_and_is_not_moved(self):
+        bambu = _win("Bambu Studio", 0xA0)
+        self.procs[0xA0] = "bambu-studio.exe"
+        out, _la, _gw = self._open([[bambu], [bambu]],
+                                   args="top | Visual Studio Code")
+        self.assertFalse(bambu.maximized)
+        self.assertIsNone(bambu.moved_to)
+        self.assertNotIn("already open", out)
+        self.assertIn("when its window appears", out)
+        self.watch.assert_called_once()
+
+    def test_the_shell_desktop_window_is_never_file_explorer(self):
+        # "Program Manager" is explorer.exe too, and screen-sized.
+        desk = _win("Program Manager", 0xA1, width=1920, height=1080)
+        self.procs[0xA1] = "explorer.exe"
+        out, _la, _gw = self._open([[desk], [desk]],
+                                   args="top | File Explorer")
+        self.assertFalse(desk.maximized)
+        self.assertNotIn("already open", out)
+
+    def test_the_watch_ignores_a_new_window_of_another_studio_app(self):
+        atmel = _win("Solution1 - Atmel Studio", 0xA2)
+        self.procs[0xA2] = "AtmelStudio.exe"
+        clock = _FakeClock()
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = A._watch_for_app_window(
+                _gw_frames([[], [atmel]]), _bc(), "Visual Studio Code",
+                A._app_words("Visual Studio Code"), set(), "top",
+                MONS["top"], timeout_s=3.0, clock=clock, sleep=clock.sleep)
+        self.assertEqual(res, "timeout")
+        self.assertFalse(atmel.maximized)
+
+
+class AppMatchTableTests(_Base):
+    """_is_app_window on real exe / title shapes: the app's own windows
+    match, other apps' windows sharing a word do not."""
+
+    CASES = (
+        # target, process, title, is that app's window
+        ("Microsoft Teams", "ms-teams.exe", "Chat | Microsoft Teams", True),
+        ("Microsoft Teams", "Teams.exe", "Microsoft Teams", True),
+        ("Microsoft Teams", "msedge.exe", "Chat | Microsoft Teams", False),
+        ("Microsoft Teams", "explorer.exe", "Teams - File Explorer", False),
+        ("Microsoft Teams", "notepad.exe", "teams notes.txt - Notepad",
+         False),
+        ("Visual Studio Code", "Code.exe", "app.py - proj - Visual Studio "
+                                           "Code", True),
+        ("Visual Studio Code", "bambu-studio.exe", "Bambu Studio", False),
+        ("Visual Studio Code", "AtmelStudio.exe", "x - Atmel Studio", False),
+        ("Task Manager", "Taskmgr.exe", "Task Manager", True),
+        ("OBS Studio", "obs64.exe", "OBS 30.2 - Profile: A - Scenes: B",
+         True),
+        ("Stream Deck", "StreamDeck.exe", "Stream Deck", True),
+        ("Stream Deck", "streamlabs obs.exe", "Streamlabs Desktop", False),
+        ("File Explorer", "explorer.exe", "Downloads - File Explorer", True),
+        ("File Explorer", "explorer.exe", "Program Manager", False),
+        # The exe name doesn't carry the app's name: its title's last part.
+        ("Outlook", "olk.exe", "Inbox - someone - Outlook", True),
+        ("PowerPoint", "POWERPNT.EXE", "Deck1 - PowerPoint", True),
+        ("Spotify", "Spotify.exe", "Spotify Premium", True),
+        ("Spotify", "chrome.exe", "Spotify - Web Player - Google Chrome",
+         False),
+        ("Google Chrome", "chrome.exe", "New Tab - Google Chrome", True),
+    )
+
+    def test_the_table(self):
+        bc = _bc()
+        for i, (target, proc, title, want) in enumerate(self.CASES):
+            with self.subTest(target=target, proc=proc, title=title):
+                w = _win(title, 0xB00 + i)
+                self.procs[0xB00 + i] = proc
+                self.assertEqual(
+                    A._is_app_window(bc, w, A._app_words(target)), want)
+
+
+class NewerRequestTests(_Base):
+    """A newer request for the same app takes over AT ONCE: the old watch
+    must not move the window after the owner's newer request put it
+    somewhere else."""
+
+    def setUp(self):
+        super().setUp()
+        self.cancel = threading.Event()
+        A._OPEN_WATCHES.clear()
+        A._OPEN_WATCHES["teams"] = self.cancel
+        self.addCleanup(A._OPEN_WATCHES.clear)
+
+    def test_a_new_open_on_monitor_cancels_the_watch_before_it_waits(self):
+        seen = []
+        bc = _bc()
+        gw = _gw_frames([[]])
+
+        def launch(_name):
+            seen.append(self.cancel.is_set())
+            return "launched"
+
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", MONS), \
+                mock.patch.dict(sys.modules, {"pygetwindow": gw}), \
+                mock.patch.object(A, "_act_launch_app", side_effect=launch), \
+                mock.patch.object(A, "_start_open_watch",
+                                  return_value=object()), \
+                mock.patch.object(A.time, "sleep"), \
+                mock.patch.object(A.time, "time", _clock(step=0.5)):
+            A._act_open_on_monitor("left | Teams")
+        self.assertEqual(seen, [True], "the old watch still ran during the "
+                                       "new request's wait")
+
+    def test_moving_the_app_by_hand_cancels_its_watch(self):
+        teams = _win("Chat | Microsoft Teams", 0xC0)
+        self.procs[0xC0] = "ms-teams.exe"
+        bc = _bc()
+        bc._find_windows_by_title.return_value = [teams]
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", MONS), \
+                mock.patch.dict(sys.modules,
+                                {"win32gui": None, "win32con": None}), \
+                mock.patch.object(A.time, "sleep"):
+            teams.resizeTo = mock.Mock()
+            out = A._act_move_window_to_monitor("Microsoft Teams | left")
+        self.assertIn("moved", out)
+        self.assertTrue(self.cancel.is_set())
+        self.assertNotIn("teams", A._OPEN_WATCHES)
+
+    def test_moving_another_app_leaves_the_watch_alone(self):
+        pad = _win("notes.txt - Notepad", 0xC1)
+        self.procs[0xC1] = "notepad.exe"
+        bc = _bc()
+        bc._find_windows_by_title.return_value = [pad]
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", MONS), \
+                mock.patch.dict(sys.modules,
+                                {"win32gui": None, "win32con": None}), \
+                mock.patch.object(A.time, "sleep"):
+            pad.resizeTo = mock.Mock()
+            A._act_move_window_to_monitor("Notepad | left")
+        self.assertFalse(self.cancel.is_set())
+
+    def test_a_cancel_during_the_poll_stops_the_move(self):
+        teams = _win("Microsoft Teams", 0xC2)
+        self.procs[0xC2] = "ms-teams.exe"
+        cancel = threading.Event()
+        clock = _FakeClock()
+
+        def sleep(s):
+            clock.sleep(s)
+            cancel.set()          # the newer request lands mid-sleep
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = A._watch_for_app_window(
+                _gw_frames([[teams]]), _bc(), "Microsoft Teams", ["teams"],
+                set(), "top", MONS["top"], clock=clock, sleep=sleep,
+                cancel=cancel)
+        self.assertEqual(res, "cancelled")
+        self.assertFalse(teams.maximized)
+
+
+class BrowserHostedAppTests(_OpenBase):
+    """Apple Music is the web player in the owner's browser: its launch
+    either finds it already open or opens a TAB. No window of an app ever
+    appears, so "I'll move it when its window appears" was a promise
+    nothing could keep (main offered the move instead)."""
+
+    def test_already_open_in_the_browser_says_so_at_once(self):
+        chrome = _win("Song - Apple Music - Google Chrome", 0xD0)
+        self.procs[0xD0] = "chrome.exe"
+        out, _la, gw = self._open(
+            [[chrome], [chrome]], args="top | Apple Music",
+            launch="Apple Music is already open in the browser, sir.")
+        self.watch.assert_not_called()
+        self.assertNotIn("when its window appears", out)
+        self.assertIn("already open", out)
+        self.assertFalse(chrome.maximized)       # B092: never moved
+        self.assertEqual(gw.calls["i"], 1, "waited for a window that the "
+                                           "launch said already exists")
+
+    def test_the_real_launcher_line_is_the_one_recognised(self):
+        # The check above keys on the launcher's own words: pin them, so a
+        # rewording there can't silently bring the false promise back.
+        bc = _bc()
+        with _patch_bc(bc), \
+                mock.patch.object(A, "_web_player_titles",
+                                  return_value=("Apple Music - Web",)):
+            line = A._act_open_apple_music()
+        self.assertIn("already open", line.lower())
+        self.assertFalse(_is_failure(line), line)
+
+    def test_a_new_tab_in_an_open_browser_window_is_offered(self):
+        before = _win("Inbox - Google Chrome", 0xD1)
+        after = _win("Apple Music - Google Chrome", 0xD1)
+        self.procs[0xD1] = "chrome.exe"
+        out, _la, _gw = self._open([[before], [after]],
+                                   args="top | Apple Music",
+                                   launch="opened Apple Music in the browser,"
+                                          " sir")
+        self.watch.assert_not_called()
+        self.assertIn("reused your existing 'Apple Music - Google Chrome' "
+                      "window", out)
+        self.assertFalse(after.maximized)
+        self.assertNotIn("when its window appears", out)
+
+    def test_a_tab_that_named_the_app_before_the_launch_is_not_reuse(self):
+        # Teams on the web in Chrome while the desktop app starts slowly:
+        # that page is not where the launch went.
+        web = _win("Chat | Microsoft Teams - Google Chrome", 0xD2)
+        self.procs[0xD2] = "chrome.exe"
+        out, _la, _gw = self._open([[web], [web]])
+        self.assertNotIn("reused", out)
+        self.assertIn("when its window appears", out)
+        self.assertFalse(web.maximized)
 
 
 if __name__ == "__main__":

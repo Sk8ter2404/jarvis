@@ -3715,22 +3715,69 @@ def _is_browser_window(bc, w) -> bool:
         return True
 
 
+def _exe_names_app(proc, words) -> bool:
+    """True when executable ``proc`` is the app ``words`` names. Review
+    2026-10-02: ANY one word inside the exe name was enough, so "Visual
+    Studio Code" matched bambu-studio.exe and AtmelStudio.exe through
+    "studio". Now the exe carries EVERY word ("ms-teams" <- teams,
+    "StreamDeck" <- stream deck), or is part of the whole name ("Code" <-
+    visual studio code, "explorer" <- file explorer), or starts with its
+    first word and adds a short tail ("obs64" <- obs studio, "Taskmgr" <-
+    task manager). Never raises."""
+    try:
+        stem = _exe_stem(proc)
+        own = [c for c in (_compact(t) for t in words or ()) if c]
+        if not stem or not own:
+            return False
+        if all(t in stem for t in own):
+            return True
+        if len(stem) >= 4 and stem in "".join(own):
+            return True
+        return (len(own) > 1 and len(own[0]) >= 3
+                and stem.startswith(own[0]) and len(stem) - len(own[0]) <= 4)
+    except Exception:
+        return False
+
+
+# A window title's parts: "Inbox - someone - Outlook", "Chat | Microsoft Teams".
+_TITLE_PART_SPLIT_RE = re.compile(r"\s+[-–—|]\s+")
+
+
+def _title_names_app(title, words) -> bool:
+    """True when the LAST part of ``title`` carries every word - where an
+    app puts its own name ("Deck1 - PowerPoint", "Task Manager"); a document
+    or folder that merely shares the name puts it first ("Teams - File
+    Explorer", "teams notes.txt - Notepad"). Never raises."""
+    try:
+        last = _TITLE_PART_SPLIT_RE.split(str(title or "").strip())[-1].lower()
+        return bool(last) and all(t in last for t in words or ())
+    except Exception:
+        return False
+
+
 def _is_app_window(bc, w, words) -> bool:
     """True when window ``w`` belongs to the app ``words`` names
-    (_app_words): its process executable carries one of them (the v2.0.176
-    process-name match - "ms-teams.exe" for "Microsoft Teams"), or, when the
-    process can't be read or is a shared app host (a packaged app's
-    ApplicationFrameHost.exe), its title carries them all and is not a page
-    in a browser (unless the words name the browser itself). Never raises."""
+    (_app_words): its process executable is that app's (_exe_names_app, the
+    v2.0.176 process-name match - "ms-teams.exe" for "Microsoft Teams"), or
+    its title ends with the app's name (_title_names_app: the exe name of
+    olk.exe / POWERPNT.EXE doesn't say "Outlook" / "PowerPoint", and a
+    packaged app's window belongs to ApplicationFrameHost.exe). A browser's
+    window and its pages are the browser, never another app (unless the
+    words name the browser itself), and the shell's desktop window is never
+    an app's. Never raises."""
     try:
         if not words:
             return False
+        title = (getattr(w, "title", "") or "").strip()
+        if title.lower() in _SHELL_WINDOW_TITLES:
+            return False
         proc = _window_process_name(w)
         if proc and proc.strip().lower() not in _APP_HOST_PROCESSES:
-            stem = _exe_stem(proc)
-            return any(_compact(t) in stem for t in words if _compact(t))
-        title = (getattr(w, "title", "") or "").lower()
-        if not title or not all(t in title for t in words):
+            if _exe_names_app(proc, words):
+                return True
+            if any(b in _exe_stem(proc) for b in _BROWSER_PROCESS_WORDS):
+                return False
+        if not _title_names_app(title, words):
             return False
         if _browser_page_title(bc, title) is not None:
             return _query_names_browser(" ".join(words))
@@ -3794,6 +3841,11 @@ def _watch_for_app_window(gw, bc, target, words, hwnds_before, monitor_name,
                 if (_window_key(w) in hwnds_before or not _usable_window(w)
                         or not _is_app_window(bc, w, words)):
                     continue
+                # A newer request (or the owner's own move) may have landed
+                # while this poll slept: it owns the window now.
+                if cancel is not None and cancel.is_set():
+                    print(f"{tag} a newer request took over the window watch")
+                    return "cancelled"
                 after = float(waited_s) + (clock() - start)
                 try:
                     _place_on_monitor(w, rect[0], rect[1], sleep)
@@ -3812,12 +3864,49 @@ def _watch_for_app_window(gw, bc, target, words, hwnds_before, monitor_name,
         return "timeout"
 
 
+def _watch_key(words, target="") -> str:
+    return " ".join(words or ()) or str(target or "").lower()
+
+
+def _cancel_open_watch(words, target="") -> bool:
+    """Stop the background watch for this app, if one is running (review
+    2026-10-02: a newer open_on_monitor for the same app used to stop it only
+    when ITS OWN 15 s wait ended, so the old watch could still move the window
+    to the old monitor after the new request had put it on the new one).
+    Returns True when one was stopped. Never raises."""
+    try:
+        with _OPEN_WATCHES_LOCK:
+            old = _OPEN_WATCHES.pop(_watch_key(words, target), None)
+        if old is None:
+            return False
+        old.set()
+        return True
+    except Exception:
+        return False
+
+
+def _cancel_watches_for_window(bc, w) -> None:
+    """The owner had window ``w`` moved (move_window_to_monitor): a watch
+    still waiting to move a window of the same app would undo that, so it
+    stops. Never raises."""
+    try:
+        with _OPEN_WATCHES_LOCK:
+            keys = list(_OPEN_WATCHES)
+        for key in keys:
+            if _is_app_window(bc, w, key.split()):
+                if _cancel_open_watch(key.split()):
+                    print(f"  [open-on-monitor] {key}: moved by request - "
+                          f"stopped its window watch")
+    except Exception:
+        pass
+
+
 def _start_open_watch(gw, bc, target, words, hwnds_before, monitor_name,
                       rect, waited_s) -> "threading.Thread | None":
     """Run _watch_for_app_window on a daemon thread - never on the voice
     turn. A watch already running for the same app is told to stop first.
     Returns the thread, None when it could not start. Never raises."""
-    key = " ".join(words) or str(target).lower()
+    key = _watch_key(words, target)
     cancel = threading.Event()
     with _OPEN_WATCHES_LOCK:
         old = _OPEN_WATCHES.get(key)
@@ -3912,8 +4001,31 @@ def _act_open_on_monitor(args: str) -> str:
     # The app's OWN windows that were open before the launch (process-name
     # matched, _is_app_window): the only evidence that it was "already open".
     app_words = [] if is_url else _app_words(target)
+    # This request owns the app's window now: a watch an earlier request
+    # left running must not move it after this one does (review 2026-10-02).
+    if app_words:
+        _cancel_open_watch(app_words, target)
     existing = {_window_key(w) for w in windows_before
                 if _usable_window(w) and _is_app_window(bc, w, app_words)}
+    # Wait for a window matching the target to appear.
+    target_tokens = [
+        tok for tok in re.split(r"[\s_\-]+", target.lower()) if len(tok) >= 3
+    ]
+
+    def _page_names_target(w) -> bool:
+        # A browser window whose ACTIVE page carries every word of the
+        # target ("Apple Music - Google Chrome"): a web app's tab.
+        try:
+            page = _browser_page_title(bc, getattr(w, "title", "") or "")
+            return (page is not None and bool(target_tokens)
+                    and all(tok in page.lower() for tok in target_tokens))
+        except Exception:
+            return False
+
+    # Browser windows whose page already named the app before the launch
+    # (Teams on the web while the desktop app starts): not where it went.
+    named_before = {_window_key(w) for w in windows_before
+                    if _page_names_target(w)}
     if is_url:
         # monitor=: the new window's own placement (visible + maximized,
         # 2026-10-01) targets the same monitor this action then moves it to.
@@ -3924,11 +4036,15 @@ def _act_open_on_monitor(args: str) -> str:
         launched = _act_launch_app(target)
         if _launch_failed(launched):
             return launched
-
-    # Wait for a window matching the target to appear.
-    target_tokens = [
-        tok for tok in re.split(r"[\s_\-]+", target.lower()) if len(tok) >= 3
-    ]
+        if "already open" in str(launched or "").lower() and not existing:
+            # The launcher itself found the app running where no window of
+            # it is ours to move - Apple Music's web player in the owner's
+            # browser (review 2026-10-02): no new window is coming, and a
+            # browser window may be his stream (B092). Say so; never promise
+            # a move nothing will make.
+            return (f"{target} is already open in your browser, so I didn't "
+                    f"move that window — ask me to move it to the "
+                    f"{monitor_name} monitor if you want it there")
 
     def _matches_target(w) -> bool:
         t = (w.title or "").lower()
@@ -3938,10 +4054,15 @@ def _act_open_on_monitor(args: str) -> str:
 
     def _reusable(w) -> bool:
         # A URL may become a tab of a window that was already open; an app
-        # may bring forward its own window from before the launch.
+        # may bring forward its own window from before the launch, or (a web
+        # app such as the Apple Music player) open as a NEW tab in a browser
+        # window that was already open - its page names the app only now.
         if is_url:
             return _matches_target(w)
-        return _window_key(w) in existing
+        key = _window_key(w)
+        return key in existing or (key not in named_before
+                                   and _page_names_target(w)
+                                   and _is_browser_window(bc, w))
 
     new_window = None
     fallback = None   # a FRESH window that doesn't (yet) match the target
@@ -4073,6 +4194,9 @@ def _act_move_window_to_monitor(args: str) -> str:
             target.resizeTo(mw, mh)
             time.sleep(0.1)
             target.maximize()
+            # An open_on_monitor watch for this app would undo the move.
+            if _OPEN_WATCHES:
+                _cancel_watches_for_window(bc, target)
             return f"moved '{target.title}' to {monitor_name} monitor (pygetwindow)"
         except Exception as e:
             return f"could not move '{target.title}': {e}"
@@ -4085,6 +4209,8 @@ def _act_move_window_to_monitor(args: str) -> str:
         win32gui.SetWindowPos(hwnd, 0, mx, my, mw, mh, flags)
         time.sleep(0.1)
         win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+        if _OPEN_WATCHES:
+            _cancel_watches_for_window(bc, target)
         return f"moved '{target.title}' to {monitor_name} monitor"
     except Exception as e:
         return f"could not move '{target.title}': {e}"
