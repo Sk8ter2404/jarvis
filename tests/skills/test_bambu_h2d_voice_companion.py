@@ -690,5 +690,96 @@ class VoiceCompanionStatusBranchTests(VoiceCompanionMixin, unittest.TestCase):
         self.assertIn("layer 5 of 50", out)
 
 
+class VoiceCompanionReprintTests(VoiceCompanionMixin, unittest.TestCase):
+    """A same-file REPRINT (audit A55, 2026-10-02). The per-print bookkeeping
+    reset only when the FILENAME changed, so re-running the exact same file
+    kept the last run's milestones and its layer-shift / AMS / failed flags:
+    every one of those callouts stayed silent for the new run. v2.0.158 fixed
+    the same bug in bambu_print_announcer only. Driven through the real
+    bambu_monitor hook entry point, one snapshot per state-change pass."""
+
+    def _snap(self, mod, gcode_state, pct, filename="cube.3mf", **extra):
+        snap = {"filename": filename, "mc_percent": pct, "mc_remaining": 60}
+        snap.update(extra)
+        with mock.patch.object(mod, "_gated_announce") as gated, \
+             mock.patch.object(mod, "_direct_enqueue") as direct:
+            mod._on_bambu_state_change(snap, self._prev, gcode_state)
+        self._prev = gcode_state
+        return ([c.args[0] for c in gated.call_args_list],
+                [c.args[0] for c in direct.call_args_list])
+
+    def _watched_first_run(self, mod, end_state="FINISH"):
+        self._prev = None
+        self.assertEqual(self._snap(mod, "RUNNING", 0), ([], []))
+        for pct in (25, 50, 75, 100):
+            gated, _ = self._snap(mod, "RUNNING", pct)
+            self.assertTrue(any(f"Print at {pct}%" in m for m in gated), gated)
+        self._snap(mod, end_state, 100)
+
+    def test_reprint_of_the_same_file_announces_milestones_again(self):
+        for end_state in ("FINISH", "IDLE"):
+            with self.subTest(end_state=end_state):
+                mod, _a = self._load()
+                self._watched_first_run(mod, end_state)
+                # The reprint starts: PREPARE still carries the last run's
+                # 100 %, then the first RUNNING poll reads a fresh 0 %.
+                self.assertEqual(self._snap(mod, "PREPARE", 100), ([], []))
+                self.assertEqual(self._snap(mod, "RUNNING", 0), ([], []))
+                gated, _ = self._snap(mod, "RUNNING", 25)
+                self.assertTrue(any("Print at 25%" in m for m in gated), gated)
+
+    def test_reprint_rearms_layer_shift_ams_and_failed_alerts(self):
+        mod, _a = self._load()
+        self._prev = None
+        self._snap(mod, "RUNNING", 0)
+        _, direct = self._snap(mod, "RUNNING", 40, layer_num=88,
+                               print_error="layer shift detected",
+                               ams_status="ams spool jam")
+        self.assertTrue(any("Layer shift detected" in m for m in direct), direct)
+        self.assertTrue(any("AMS appears to be unwell" in m for m in direct), direct)
+        _, direct = self._snap(mod, "FAILED", 40, layer_num=88)
+        self.assertTrue(any("print has failed" in m for m in direct), direct)
+        # Same file, printed again.
+        self.assertEqual(self._snap(mod, "PREPARE", 0), ([], []))
+        self._snap(mod, "RUNNING", 0)
+        _, direct = self._snap(mod, "RUNNING", 30, layer_num=60,
+                               print_error="layer shift detected",
+                               ams_status="ams spool jam")
+        self.assertTrue(any("Layer shift detected on layer 60" in m
+                            for m in direct), direct)
+        self.assertTrue(any("AMS appears to be unwell" in m for m in direct), direct)
+        _, direct = self._snap(mod, "FAILED", 30, layer_num=60)
+        self.assertTrue(any("print has failed at layer 60" in m
+                            for m in direct), direct)
+
+    def test_stale_percent_on_the_reprints_first_poll_is_not_blurted(self):
+        mod, _a = self._load()
+        self._watched_first_run(mod)
+        # Straight back to RUNNING still carrying the last run's 100 %.
+        self.assertEqual(self._snap(mod, "RUNNING", 100), ([], []))
+        self.assertEqual(self._snap(mod, "RUNNING", 100), ([], []))
+
+    def test_pause_and_resume_is_not_a_reprint(self):
+        mod, _a = self._load()
+        self._prev = None
+        self._snap(mod, "RUNNING", 0)
+        gated, direct = self._snap(mod, "RUNNING", 25,
+                                   print_error="layer shift detected")
+        self.assertTrue(any("Print at 25%" in m for m in gated), gated)
+        self.assertTrue(any("Layer shift detected" in m for m in direct), direct)
+        self.assertEqual(self._snap(mod, "PAUSE", 26,
+                                    print_error="layer shift detected"), ([], []))
+        self.assertEqual(self._snap(mod, "RUNNING", 27,
+                                    print_error="layer shift detected"), ([], []))
+        self.assertIn(25, mod._announced_milestones)
+
+    def test_a_new_file_after_a_finish_keeps_the_old_behaviour(self):
+        mod, _a = self._load()
+        self._watched_first_run(mod)
+        # A different file is a new print by name: reset, not primed.
+        gated, _ = self._snap(mod, "RUNNING", 30, filename="other.3mf")
+        self.assertTrue(any("Print at 25%" in m for m in gated), gated)
+
+
 if __name__ == "__main__":
     unittest.main()

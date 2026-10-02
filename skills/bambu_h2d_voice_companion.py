@@ -77,6 +77,13 @@ _announced_layer_shift: list = [False]
 _announced_ams_error: list   = [False]
 _announced_failed: list      = [False]
 _hook_registered: list       = [False]
+# The current file reached an end state (FINISH / FAILED / IDLE) since it was
+# last seen starting, so a PREPARE / RUNNING of the SAME file is a reprint
+# (mirrors bambu_print_announcer, v2.0.158). After a reprint reset the first
+# RUNNING snapshot pre-marks the milestones it has already passed.
+_ended_since_running: list   = [False]
+_prime_on_next_running: list = [False]
+_TERMINAL_STATES = ("FINISH", "FAILED", "IDLE")
 
 # Late-registration retry. Skills load in sorted() filename order, so
 # this module loads BEFORE bambu_monitor and the first hook attempt in
@@ -302,6 +309,31 @@ def _on_bambu_state_change(snapshot: dict, prev_gcode, gcode_state: str) -> None
         print(f"  [bambu_voice] state-change hook crashed: {e}")
 
 
+def _reset_print_bookkeeping(*, prime_on_running: bool) -> None:
+    """Forget the previous print's callouts (a new file, or a reprint).
+    Caller holds _state_lock."""
+    _announced_milestones.clear()
+    _announced_error_codes.clear()
+    _announced_layer_shift[0] = False
+    _announced_ams_error[0]   = False
+    _announced_failed[0]      = False
+    _ended_since_running[0]   = False
+    _prime_on_next_running[0] = prime_on_running
+
+
+def _premark_passed_milestones(pct) -> None:
+    """Mark the milestones ``pct`` has already passed as announced, so a
+    print we did not watch from the start never blurts them."""
+    try:
+        cur_pct = float(pct) if pct is not None else None
+    except (TypeError, ValueError):
+        cur_pct = None
+    if cur_pct is not None:
+        for threshold in _MILESTONES:
+            if cur_pct >= threshold:
+                _announced_milestones.add(threshold)
+
+
 def _process_snapshot(snapshot: dict, gcode_state: str) -> None:
     """Walk a single bambu_monitor state snapshot and decide which
     announcements to queue. Caller holds _state_lock."""
@@ -313,10 +345,9 @@ def _process_snapshot(snapshot: dict, gcode_state: str) -> None:
     err         = snapshot.get("print_error")
     ams         = snapshot.get("ams_status")
 
-    # New-print detection — keyed on filename change. We deliberately
-    # don't try to detect a fresh start from gcode_state alone here
-    # because bambu_monitor already does that and double-resetting our
-    # bookkeeping mid-print would cause repeated announcements.
+    # New-print detection — keyed on a filename change, plus a same-file
+    # REPRINT (an end state, then PREPARE / RUNNING again). A pause/resume
+    # is neither, so mid-print bookkeeping is never reset twice.
     if fname and fname != _current_filename[0]:
         # On the very first populated snapshot after a (re)start the
         # previous filename is None, so a print already mid-flight is
@@ -327,20 +358,24 @@ def _process_snapshot(snapshot: dict, gcode_state: str) -> None:
         # print sits at ~0%, so nothing gets pre-marked).
         first_observation = _current_filename[0] is None
         _current_filename[0] = fname
-        _announced_milestones.clear()
-        _announced_error_codes.clear()
-        _announced_layer_shift[0] = False
-        _announced_ams_error[0]   = False
-        _announced_failed[0]      = False
+        _reset_print_bookkeeping(prime_on_running=False)
         if first_observation:
-            try:
-                cur_pct = float(pct) if pct is not None else None
-            except (TypeError, ValueError):
-                cur_pct = None
-            if cur_pct is not None:
-                for threshold in _MILESTONES:
-                    if cur_pct >= threshold:
-                        _announced_milestones.add(threshold)
+            _premark_passed_milestones(pct)
+    elif gcode_state in _TERMINAL_STATES:
+        if _current_filename[0] is not None:
+            _ended_since_running[0] = True
+    elif gcode_state in ("PREPARE", "RUNNING") and _ended_since_running[0]:
+        # REPRINT of the same file: the filename-change reset above never
+        # fires, so the last run's milestones and its layer-shift / AMS /
+        # failed flags silenced every callout of the new run (audit A55).
+        # The first RUNNING snapshot after this reset is primed below: at a
+        # fresh ~0% that marks nothing, while a stale 100% carried over from
+        # the last run is swallowed instead of blurted.
+        _reset_print_bookkeeping(prime_on_running=True)
+
+    if _prime_on_next_running[0] and gcode_state == "RUNNING":
+        _prime_on_next_running[0] = False
+        _premark_passed_milestones(pct)
 
     # Coerce pct once.
     try:
