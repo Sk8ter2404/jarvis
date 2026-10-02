@@ -1691,6 +1691,47 @@ def _read_version_and_upgrade() -> tuple[str, str]:
     return version, upgrade_at
 
 
+def _release_timestamp() -> float | None:
+    """When the release on disk was made (epoch s), or None: the v<VERSION>
+    tag / the commit that set VERSION, the VERSION mtime outside a checkout
+    (core.version.release_timestamp, one copy for the tray and the spoken
+    version answer)."""
+    try:
+        from core.version import release_timestamp
+        return release_timestamp(PROJECT_DIR)
+    except Exception:
+        return None
+
+
+def _last_updated_text(pipeline_at: str) -> str:
+    """'YYYY-MM-DD HH:MM' of the newest of the release on disk and the
+    self-upgrade pipeline's own last run, or '' when neither is known.
+
+    The 'Last upgrade' line used to be the pipeline's CHANGELOG header alone,
+    which no git release writes: it read 2026-05-30 07:03 four months and
+    ~140 releases later (2026-10-02)."""
+    from datetime import datetime
+    best = None
+    ts = _release_timestamp()
+    if ts is not None:
+        try:
+            best = datetime.fromtimestamp(ts)
+        except (OverflowError, OSError, ValueError):
+            best = None
+    raw = (pipeline_at or "").strip()
+    if raw and raw != "unknown":
+        try:
+            p = datetime.fromisoformat(raw)
+            if p.tzinfo is not None:
+                p = p.astimezone().replace(tzinfo=None)
+            if best is None or p > best:
+                best = p
+        except ValueError:
+            if best is None:
+                return raw
+    return best.strftime("%Y-%m-%d %H:%M") if best is not None else ""
+
+
 def _parent_started_at() -> float:
     """Start time (epoch s) of the LIVE parent JARVIS process, or 0.0. psutil
     reads it straight from the OS, so it can't be stale."""
@@ -1804,15 +1845,21 @@ def _about_lines() -> list[str]:
     commit = _git_commit()
     if commit:
         lines.append(f"Commit:        {commit}")
+    # When the code on disk last changed: the release's git date or the
+    # pipeline's last run, whichever is newer (_last_updated_text).
+    updated = _last_updated_text(upgrade_at)
+    if updated:
+        lines.append(f"Last updated:  {updated}")
     # The self-upgrade pipeline's internal counter (e.g. v1.0.17) + its
     # timestamp — shown only when there's real upgrade history AND it differs
     # from the release version. A fresh clone (no pipeline runs) just shows the
-    # release version, never a confusing 'Upgrade build: unknown'.
+    # release version, never a confusing 'Upgrade build: unknown'. Its own
+    # date rides on this line, so it can't pass for the last update.
     if build and build not in ("unknown", release, f"v{release}"):
-        lines.append(f"Upgrade build: {build}"
+        ran = (f", last run {upgrade_at}"
+               if upgrade_at and upgrade_at != "unknown" else "")
+        lines.append(f"Upgrade build: {build}{ran}"
                      + ("" if _upgrades_enabled(data) else " (upgrades off)"))
-    if upgrade_at and upgrade_at != "unknown":
-        lines.append(f"Last upgrade:  {upgrade_at}")
     lines += [
         f"Uptime:        {uptime}",
         "",

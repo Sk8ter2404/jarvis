@@ -35,3 +35,53 @@ VERSION = __version__
 def version_string() -> str:
     """Human-facing release string, e.g. ``2.0.29``."""
     return __version__
+
+
+def _git_out(root: str, *args: str) -> str:
+    """stdout of ``git -C root <args>``, or '' on any failure. Never raises."""
+    import subprocess
+    import sys
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    try:
+        r = subprocess.run(["git", "-C", root, *args], capture_output=True,
+                           text=True, timeout=3, creationflags=flags)
+    except Exception:
+        return ""
+    return (r.stdout or "").strip() if r.returncode == 0 else ""
+
+
+def release_timestamp(project_dir: str | None = None) -> float | None:
+    """Epoch seconds of the release on disk in ``project_dir`` (default: this
+    checkout), or None. Call-time only: importing this module stays one read.
+
+    A release is a git commit that bumps VERSION, tagged ``v<VERSION>``. It
+    never writes data/version.json: that file is the self-upgrade pipeline's
+    own counter and timestamp, and it sat at 1.0.17 / 2026-05-30 for four
+    months while the releases moved on to 2.0.x (2026-10-02). So the date
+    comes from git: the tag's commit date, else the date of the last commit
+    that changed VERSION. A tree that is not its own git checkout (a copy, a
+    zip, a temp dir inside some other repo) uses the VERSION file's mtime."""
+    root = os.path.abspath(project_dir or os.path.dirname(_VERSION_FILE))
+    vfile = os.path.join(root, "VERSION")
+    top = _git_out(root, "rev-parse", "--show-toplevel")
+    if top and (os.path.normcase(os.path.realpath(top))
+                == os.path.normcase(os.path.realpath(root))):
+        try:
+            with open(vfile, "r", encoding="utf-8") as fh:
+                ver = fh.read().strip()
+        except OSError:
+            ver = ""
+        queries = []
+        if ver and all(c.isalnum() or c in ".-+_" for c in ver):
+            queries.append(("log", "-1", "--format=%ct", f"refs/tags/v{ver}", "--"))
+        queries.append(("log", "-1", "--format=%ct", "--", "VERSION"))
+        for q in queries:
+            out = _git_out(root, *q)
+            try:
+                return float(out.splitlines()[0])
+            except (IndexError, ValueError):
+                continue
+    try:
+        return os.path.getmtime(vfile)
+    except OSError:
+        return None
