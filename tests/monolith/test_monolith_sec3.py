@@ -1759,6 +1759,7 @@ class CallLocalVisionTests(MonolithGlobalsTestCase):
                 mock.patch.object(self.bc, "_ollama_alive", return_value=True), \
                 mock.patch.object(self.bc, "_ollama_has_model", return_value=True), \
                 mock.patch.object(self.bc, "_log_gpu_state"), \
+                mock.patch.object(self.bc, "_cuda0_free_vram_mb", return_value=None), \
                 mock.patch.object(self.bc, "requests", fake_req):
             out = self.bc._call_local_vision("describe", [b"\x89PNG-bytes"])
         self.assertEqual(out, "a cat")
@@ -2704,7 +2705,11 @@ class EnsureWhisperFallbackTests(MonolithGlobalsTestCase):
                 mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3"), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "small"), \
+                mock.patch.object(self.bc, "_whisper_cuda_plan",
+                                  return_value=("float16", False, "test card")), \
                 mock.patch.dict(sys.modules, {"faster_whisper": fake_fw}):
+            # The VRAM plan reads the REAL card (int8 below 8 GB): pinned, or a
+            # 4 GB laptop GPU fails this test (Dell gate 2026-10-02).
             self.bc._ensure_whisper()
         self.assertIs(self.bc._stt, good)
         self.assertEqual(self.bc._stt_device, "cpu")
@@ -3616,6 +3621,10 @@ class CallLocalVisionBranchTests(MonolithGlobalsTestCase):
             mock.patch.object(self.bc, "_ollama_alive", return_value=True),
             mock.patch.object(self.bc, "_ollama_has_model", return_value=True),
             mock.patch.object(self.bc, "_log_gpu_state"),
+            # The free-VRAM gate reads the REAL card: a 4 GB laptop GPU refused
+            # every call here (Dell gate 2026-10-02) while a 24 GB desktop passed.
+            # None = probe unavailable, the gate's documented no-NVIDIA path.
+            mock.patch.object(self.bc, "_cuda0_free_vram_mb", return_value=None),
             mock.patch.object(self.bc, "requests", fake_req),
         ]
 

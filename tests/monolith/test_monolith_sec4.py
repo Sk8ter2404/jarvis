@@ -4446,7 +4446,10 @@ class LocalVisionColoadGuardTests(MonolithGlobalsTestCase):
         with mock.patch.dict(os.environ, {}, clear=False), \
              mock.patch.object(bc, "_ollama_big_model_resident", return_value=None), \
              mock.patch.object(bc, "_log_gpu_state"), \
+             mock.patch.object(bc, "_cuda0_free_vram_mb", return_value=None), \
              mock.patch.object(bc, "requests") as req:
+            # (free-VRAM probe pinned: the real 4 GB laptop card refused this
+            # call on the Dell gate 2026-10-02.)
             os.environ.pop("JARVIS_ALLOW_VLM_COLOAD", None)
             req.post.return_value = resp
             ps = self._common_patches(bc)
