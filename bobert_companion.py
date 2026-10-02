@@ -1266,6 +1266,9 @@ SHUTDOWN_PROMPT_NO_PHRASES = (
 # cancelled on "Yeah." and CONFIRMED a delete on "Yesterday...", and the
 # shutdown prompt never matched Whisper's punctuated "No.". See core/yes_no.py.
 from core import yes_no as _yes_no  # noqa: E402
+# A yes to JARVIS's own offer carries the offer out (2026-10-02) - see
+# _note_open_offer / _take_open_offer and core/offer_reply.py.
+from core import offer_reply as _offer_reply  # noqa: E402
 # Goodbye lines spoken before _act_shutdown_jarvis terminates the process.
 # Picked randomly so repeated shutdowns don't feel scripted.
 SHUTDOWN_GOODBYE_LINES = (
@@ -23768,6 +23771,11 @@ def _call_llm(user_text: str) -> str:
     # and memory around it are untouched. 2026-07-15.
     _prof("prompt_start")
     _base_prompt = _system_prompt
+    # The owner's yes to JARVIS's own offer (_take_open_offer, 2026-10-02):
+    # "Jarvis, yes." routes no section by itself, so the sections also route
+    # on the offer's words, and a note tells the brain to carry it out.
+    _offer_yes = str(_accepted_offer[0] or "")
+    _offer_route = [_offer_yes] if _offer_yes else None
     # Per-turn material that must NOT sit in the cached prefix on the local
     # route. Empty string = legacy behaviour (everything in the system prompt).
     _turn_ctx = ""
@@ -23793,7 +23801,8 @@ def _call_llm(user_text: str) -> str:
             # the history routed ranks low in the prompt budget.
             _route_hist = _routing_history()
             _turn_ctx = _pr.turn_pc_block(user_text, PC_CONTROL_PROMPT,
-                                          history=_route_hist)
+                                          history=_route_hist,
+                                          also=_offer_route)
             _turn_inherited = _pr.inherited_turn_sections(
                 user_text, PC_CONTROL_PROMPT, history=_route_hist)
             _stable_split = True
@@ -23808,7 +23817,8 @@ def _call_llm(user_text: str) -> str:
         try:
             from core import prompt_router as _pr
             _slim_pc = _pr.slim_pc_control(user_text, PC_CONTROL_PROMPT,
-                                           history=_routing_history())
+                                           history=_routing_history(),
+                                           also=_offer_route)
             # slim_pc_control keeps PC_CONTROL's own preamble but NOT the local
             # anti-hallucination guard (the highest-value instruction on this
             # path). _local_cheatsheet has it; this path did not — restore it
@@ -23840,6 +23850,11 @@ def _call_llm(user_text: str) -> str:
         # in the system prompt, where each rotation changed the cached prefix.
         ("phrase rotation", _phrase_rotation_hint(),
          _prompt_budget.RANK_STYLE_HINT),
+        # Last, nearest the owner's words; ranked with the action grammar,
+        # since it IS what this turn has to do.
+        ("accepted offer",
+         _offer_reply.directive(_offer_yes) if _offer_yes else "",
+         _prompt_budget.RANK_SECTION),
     ]
     _turn_addenda = "".join(_t for _l, _t, _r in _addenda_parts)
 
@@ -35772,6 +35787,103 @@ def _drop_stale_offer_asides(text):
         return text
 
 
+# ── A yes to JARVIS's own offer (2026-10-02) ──────────────────────────────
+# Live 14:48:08 a turn ended "...Should I attempt to move the existing window
+# to the top monitor?"; at 14:48:26 the owner said "Jarvis, yes." and JARVIS
+# answered with a quip and did nothing. The high-risk confirmation queue only
+# holds actions the DISPATCHER deferred, so nothing knew this yes answered an
+# offer, and the model got a bare "yes". (move_window_to_monitor sits in the
+# always-on section, so that grammar WAS in front of it; an offer whose action
+# lives in a routed section would not have been - "yes" routes none.)
+#   * When a turn's chain ends, the offer its last reply ENDS with (one that
+#     names a concrete action, core.offer_reply.offer_text) is the open offer
+#     (_note_open_offer). A barge, a close-out line, a self-voiced action, a
+#     dispatcher confirmation or an autocorrect question closes it instead -
+#     that question is the turn's real one.
+#   * The next owner turn takes it (_take_open_offer). Only a clear yes
+#     (core.yes_no.classify_reply, wake word dropped; a hedged yes is a no),
+#     with no other owner turn in between and within OFFER_YES_TTL_S of the
+#     offer, is an acceptance. _call_llm then routes the turn's sections on
+#     the offer's words too and adds a note telling the brain to emit the
+#     offered action; the action goes through parse_and_run_actions, so the
+#     confirmation, pushback and self-termination gates all still apply.
+# The follow-up horizon: a yes later than this is not leaning on the offer.
+OFFER_YES_TTL_S = _FOLLOWUP_ROUTING_MAX_AGE_S
+_open_offer = _offer_reply.OpenOffer(OFFER_YES_TTL_S)
+# The offer THIS turn accepted, for _call_llm; "" outside that call.
+_accepted_offer: list = [""]
+
+
+def _offer_dropped_as_stale(offer) -> bool:
+    """True when the offer's last sentence is an "Also, ..." aside that
+    repeats an earlier turn's offer: _drop_stale_offer_asides kept it from
+    being spoken, so it is not open. Quiet (that drop was already logged).
+    Never raises."""
+    try:
+        pieces = [p for p in _OFFER_SENTENCE_SPLIT_RE.split(str(offer or ""))
+                  if p.strip()]
+        if not pieces or not _offer_ledger:
+            return False
+        body = _LEADING_BRACKET_TAGS_RE.sub("", pieces[-1]).strip()
+        return bool(body and _ASIDE_OPENER_RE.match(body)
+                    and _OFFER_MARK_RE.search(body)
+                    and _repeats_closed_offer(_offer_words(body)))
+    except Exception:
+        return False
+
+
+def _note_open_offer(texts, *, skip: bool = False) -> str:
+    """Record the offer a finished turn ENDED on as the open offer (see the
+    section comment), or close it. ``texts``: the turn's replies as the model
+    wrote them, the last one said last. ``skip``: the turn ended on something
+    else (a barge, a close-out line, a self-voiced action). Call it BEFORE
+    _record_turn_offers adds this turn to the stale-offer ledger. Returns
+    the open offer, "" when none. Never raises."""
+    try:
+        texts = list(texts or ())
+        if (skip or not texts or _pending_confirmation
+                or _pending_autocorrect_choice):
+            _open_offer.clear()
+            return ""
+        offer = _open_offer.note(texts[-1])
+        if offer and _offer_dropped_as_stale(offer):
+            _open_offer.clear()
+            return ""
+        if offer:
+            print(f"  [offer-yes] open offer: {offer[:90]!r}")
+        return offer
+    except Exception:
+        try:
+            _open_offer.clear()
+        except Exception:
+            pass
+        return ""
+
+
+def _take_open_offer(text) -> str:
+    """This owner turn takes the open offer (every turn does; the slot is
+    empty afterwards). Returns the offer when ``text`` accepts it - a clear,
+    prompt yes with no owner turn in between - else "". Never raises."""
+    try:
+        outcome, offer = _open_offer.take(
+            text, since=float(_prev_owner_turn_at[0] or 0.0))
+    except Exception:
+        return ""
+    if outcome == "yes":
+        print(f"  [offer-yes] sir said yes to {offer[:90]!r} - asking the "
+              f"brain to carry it out")
+        return offer
+    if outcome == "expired":
+        print(f"  [offer-yes] the offer is more than {OFFER_YES_TTL_S:.0f} s "
+              f"old - this turn does not answer it")
+    elif outcome == "stale":
+        print("  [offer-yes] another turn came after the offer - this turn "
+              "does not answer it")
+    elif outcome == "no":
+        print("  [offer-yes] not a clear yes - the offer is closed")
+    return ""
+
+
 def _note_once_per_turn_ran(name, arg, result, ran_here) -> None:
     """Record a successful web_search / open_url of this reply into
     ``ran_here`` (see _once_per_turn_refusal). Never raises."""
@@ -42808,6 +42920,9 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
                                   _ACTION_RE.sub(" ", back)).strip()
                 if b_spoken and not _turn_check_barged(barge_seq0):
                     _speak(b_spoken)
+        # The retry replaced the turn's reply: its offer, if it ends on one,
+        # is the open one (_note_open_offer).
+        _note_open_offer(texts, skip=_turn_check_barged(barge_seq0))
         _record_turn_offers(texts)
         return "spoken"
     finally:
@@ -43051,6 +43166,10 @@ def _run_llm_dispatch_body(text: str) -> str:
         _barge_seq0 = _tts_interrupt_seq[0]
     except Exception:
         _barge_seq0 = 0
+    # Every owner turn takes the offer the previous turn ended on; a clear,
+    # prompt yes accepts it and _call_llm hands it to the brain (see
+    # _take_open_offer, 2026-10-02).
+    _offer_yes = _take_open_offer(text)
     # Glance-response fast path: if the focused window changed in the
     # last few seconds AND the utterance is ambiguous ("what is
     # this?" / "should I worry?" / "wait, what?" / "explain"), grab
@@ -43068,7 +43187,8 @@ def _run_llm_dispatch_body(text: str) -> str:
     _instant_on = _instant is not None and _instant_actions_mode() == "on"
     if _instant_on:
         _route_reply = _instant.token
-    _glance_reply = (None if _route_reply is not None
+    # A yes to an offer is never a glance question.
+    _glance_reply = (None if _route_reply is not None or _offer_yes
                      else maybe_glance_response(text))
     if _route_reply is not None:
         reply = _route_reply
@@ -43108,8 +43228,14 @@ def _run_llm_dispatch_body(text: str) -> str:
         _last_stable_sys_prompt[0] = ""
         _last_turn_pc_block[0] = ""
     else:
-        reply = get_response_with_animation(text)
+        _accepted_offer[0] = _offer_yes
+        try:
+            reply = get_response_with_animation(text)
+        finally:
+            _accepted_offer[0] = ""
     print(f"  JARVIS: {reply}")
+    if _offer_yes and not _ACTION_RE.search(str(reply or "")):
+        print("  [offer-yes] the reply to the accepted offer named no action")
 
     # Execute any [ACTION: ...] tokens, get the cleaned text for TTS
     spoken_text, action_results = parse_and_run_actions(reply)
@@ -43434,6 +43560,11 @@ def _run_llm_dispatch_body(text: str) -> str:
                                          "content": _close})
         except Exception as _co_err:
             print(f"  [close-out] could not speak it: {_co_err}")
+    # The offer this turn ENDED on is open for the next owner turn's yes
+    # (_note_open_offer, 2026-10-02) - unless the turn ended on something
+    # else. Before the ledger records this chain's offers as closed.
+    _note_open_offer(_chain_texts,
+                     skip=bool(_barged or _close or _self_voiced_only))
     # The chain is over: its offers are closed (NEW #13) - a later turn's
     # "Also, …" aside that repeats one is not spoken.
     _record_turn_offers(_chain_texts)

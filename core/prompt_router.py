@@ -1309,9 +1309,22 @@ def _match_sections(parts: List[str], sections: List[Tuple[str, str]]) -> set:
     return hits
 
 
-def _select(user_text: str, sections: List[Tuple[str, str]], history=None):
+def _also_parts(also) -> List[str]:
+    """The extra routing texts (see select_sections ``also``), one line each,
+    blanks dropped. Never raises."""
+    try:
+        if isinstance(also, str):
+            also = [also]
+        return [" ".join(str(a).split()) for a in (also or ())
+                if str(a or "").strip()]
+    except Exception:
+        return []
+
+
+def _select(user_text: str, sections: List[Tuple[str, str]], history=None,
+            also=None):
     """``(included, dropped, inherited)`` - see select_sections. ``inherited``
-    is the set of included sections only the history routed."""
+    is the set of included sections only the history (or ``also``) routed."""
     own = _match_sections([user_text or ""], sections)
     inherited: set = set()
     parts = _routing_parts(user_text, history)
@@ -1319,6 +1332,7 @@ def _select(user_text: str, sections: List[Tuple[str, str]], history=None):
             own - {n for n in own if n.upper() in _ALWAYS}):
         # "and play some jazz": a request of its own, which routes itself.
         parts = parts[:1]
+    parts = parts + _also_parts(also)
     if len(parts) > 1:
         bodies = {h.strip(): b for h, b in sections}
         for name in _match_sections(parts, sections) - own:
@@ -1334,7 +1348,7 @@ def _select(user_text: str, sections: List[Tuple[str, str]], history=None):
 
 
 def select_sections(user_text: str, sections: List[Tuple[str, str]],
-                    history=None) -> Tuple[List[str], List[str]]:
+                    history=None, also=None) -> Tuple[List[str], List[str]]:
     """Return (included_section_names, dropped_section_names) for `user_text`.
 
     ``history`` (optional, chat messages) lets a short elliptical follow-up
@@ -1342,8 +1356,14 @@ def select_sections(user_text: str, sections: List[Tuple[str, str]],
     to a section that documents a self-terminating action (those route on
     the turn's own words only), and not for a longer "and ..." turn whose
     own words already route something. Without it, or on any other turn,
-    routing is exactly the words of ``user_text``."""
-    included, dropped, _inherited = _select(user_text, sections, history)
+    routing is exactly the words of ``user_text``.
+
+    ``also`` (optional, a string or strings) is more text to route on, with
+    the same self-terminating exclusion as the history: JARVIS's own offer
+    when this turn is the owner's yes to it (2026-10-02, core.offer_reply -
+    "Jarvis, yes." routes nothing by itself)."""
+    included, dropped, _inherited = _select(user_text, sections, history,
+                                            also)
     return included, dropped
 
 
@@ -1379,17 +1399,19 @@ def _section_text(header: str, body: str) -> str:
     return out if isinstance(out, str) and out.strip() else body
 
 
-def slim_pc_control(user_text: str, pc_control: str, history=None) -> str:
+def slim_pc_control(user_text: str, pc_control: str, history=None,
+                    also=None) -> str:
     """Build a slimmed PC_CONTROL for this turn: core preamble + the sections the
     text implicates + a one-line INDEX of what was left out (so the model still
     knows those capabilities exist). Falls back to the full text if parsing finds
-    no sections. ``history``: see select_sections. Never raises — a bad parse
-    returns the full prompt."""
+    no sections. ``history`` / ``also``: see select_sections. Never raises — a
+    bad parse returns the full prompt."""
     try:
         core, sections = split_pc_control(pc_control)
         if not sections:
             return pc_control
-        included, dropped = select_sections(user_text, sections, history)
+        included, dropped = select_sections(user_text, sections, history,
+                                            also)
         inc_set = set(included)
         parts = [core]
         for header, body in sections:
@@ -1491,21 +1513,24 @@ def stable_pc_block(pc_control: str) -> str:
     return out
 
 
-def turn_pc_block(user_text: str, pc_control: str, history=None) -> str:
+def turn_pc_block(user_text: str, pc_control: str, history=None,
+                  also=None) -> str:
     """The VOLATILE half: the bodies of the sections `user_text` implicates.
 
     ``history`` (the chat so far) lets a short elliptical follow-up ('Pause
     it.', 'what about tomorrow') also route on the previous user turn — see
-    routing_text. Returns '' when the turn implicates nothing beyond the
-    always-on section set, so a turn that needs no extra instructions costs
-    the cache nothing at all. Never raises — on a parse failure it returns
-    the FULL section text, which is slower but never less informed than
-    slim_pc_control was."""
+    routing_text; ``also`` adds more text to route on (select_sections).
+    Returns '' when the turn implicates nothing beyond the always-on section
+    set, so a turn that needs no extra instructions costs the cache nothing
+    at all. Never raises — on a parse failure it returns the FULL section
+    text, which is slower but never less informed than slim_pc_control
+    was."""
     try:
         _core, sections = split_pc_control(pc_control)
         if not sections:
             return ""
-        included, _dropped = select_sections(user_text, sections, history)
+        included, _dropped = select_sections(user_text, sections, history,
+                                             also)
         inc = set(included)
         bodies = [_section_text(h, b) for h, b in sections
                   if h.strip() in inc and h.strip().upper() not in _ALWAYS]

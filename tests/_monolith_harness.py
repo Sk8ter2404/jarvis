@@ -154,6 +154,10 @@ _MONOLITH_RESTORE_NAMES = (
     # a LATER test's "Also, …" aside or put the unread-search guard into its
     # local prompt.
     "_offer_ledger", "_last_web_search_at",
+    # The offer a dispatch test's turn ended on is answered by a LATER test's
+    # "yes" otherwise (2026-10-02, _note_open_offer); the accepted-offer cell
+    # with it. The OpenOffer itself is cleared in _restore_monolith_pristine.
+    "_accepted_offer",
     # ── wake / greeting bookkeeping (re-exported from core.state) ──────────
     "_last_wake_date", "_wake_history", "_pre_wake_silence_seconds",
     # ── focus mode / do-not-disturb (skills/focus_mode.py drives these) ─────
@@ -572,6 +576,13 @@ def _restore_monolith_pristine(bc) -> None:
     # shrink every LATER test's budget. Process-wide, so cleared in place.
     try:
         bc._prompt_budget.OBSERVED_WINDOW.clear()
+    except Exception:
+        pass
+    # The open offer (core.offer_reply.OpenOffer, 2026-10-02): one process-
+    # wide instance, so a turn one test ended on an offer would hand a LATER
+    # test's "yes" an OFFER ACCEPTED note. Cleared in place.
+    try:
+        bc._open_offer.clear()
     except Exception:
         pass
     # Process-wide state three 2026-10-02 branches added, which the per-test

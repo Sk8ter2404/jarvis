@@ -68,6 +68,9 @@ _IMPORT_LIGHT_CORE = (
     # Instant actions (2026-10-02): stdlib + core modules that do no I/O at
     # import, imported at monolith import time.
     "core.instant_actions",
+    # A yes to JARVIS's own offer (2026-10-02): stdlib + core.yes_no,
+    # imported at monolith import time.
+    "core.offer_reply",
 )
 
 
