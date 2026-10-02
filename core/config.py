@@ -1450,6 +1450,12 @@ WEB_INTERFACE_ENABLED = False       # master switch — server only starts when 
 WEB_INTERFACE_PORT    = 8766        # TCP port (8443 is the AirTag tracker — do NOT reuse)
 WEB_INTERFACE_BIND    = "127.0.0.1" # bind address; non-local REQUIRES a token
 WEB_INTERFACE_TOKEN   = ""          # shared secret; MANDATORY for a non-local bind
+# DASHBOARD_SHOW_TRANSCRIPTS — the dashboard's "What JARVIS did" timeline shows
+# what was SAID on each turn (the owner's words, JARVIS's reply) only when this
+# is True AND the browser is on this PC (a loopback request). A LAN client never
+# gets the text, token or not. Off: the timeline shows times, sources, actions
+# and latencies only. Read at boot (applies on the next start).
+DASHBOARD_SHOW_TRANSCRIPTS = False
 
 # ── Retired overlays (all superseded by the unified HUD) ────────────────
 # Each of these used to auto-spawn its own frameless, non-movable widget.

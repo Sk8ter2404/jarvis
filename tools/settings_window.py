@@ -1637,6 +1637,14 @@ SCHEMA: dict[str, dict] = {
                 "for a non-localhost bind). Treat it like a password — anyone "
                 "with it can command JARVIS from any device on your LAN.",
     },
+    "DASHBOARD_SHOW_TRANSCRIPTS": {
+        "tab": "advanced", "label": "Show what was said in the web timeline",
+        "type": "bool", "default": False,
+        "help": "The dashboard's 'What JARVIS did' timeline shows each turn's "
+                "words only when this is on AND the browser is on this PC — "
+                "never to another device on your network. Applies on the next "
+                "start.",
+    },
 }
 
 # Field types whose key is a real persisted setting (everything except the
@@ -1750,7 +1758,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                        "OVERNIGHT_UPGRADE_ENABLED"]),
         ("Debug", ["VAD_DEBUG"]),
         ("Web interface", ["WEB_INTERFACE_ENABLED", "WEB_INTERFACE_PORT",
-                           "WEB_INTERFACE_BIND", "WEB_INTERFACE_TOKEN"]),
+                           "WEB_INTERFACE_BIND", "WEB_INTERFACE_TOKEN",
+                           "DASHBOARD_SHOW_TRANSCRIPTS"]),
     ],
 }
 

@@ -191,6 +191,21 @@ class ReplyCaptureTests(unittest.TestCase):
         self.assertEqual(res["reply"], "It is 10:07 PM, sir.")
         self.assertLess(took, 8.0, "the end marker should end the wait, not the timeout")
 
+    def test_wait_for_reply_anchors_on_a_web_tagged_inject_line(self):
+        """2026-10-02: the loop logs a dashboard command as
+        "[inject] (web) <text>"; the reply capture still finds its turn."""
+        with tempfile.TemporaryDirectory() as d:
+            log_dir, lg = self._log(d)
+            self._append_later(lg, [
+                (0.3, "[10:00:01]   [inject] (web) what time is it\n"
+                      "[10:00:01]   You:    what time is it\n"
+                      "[10:00:02]   JARVIS: It is ten, sir.\n"
+                      "[10:00:03]   [turn-timing] kind=inject outcome=ok\n"),
+            ])
+            res = wi.wait_for_reply("what time is it", log_dir, timeout=15.0)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["reply"], "It is ten, sir.")
+
     def test_wait_for_reply_ignores_another_commands_output(self):
         with tempfile.TemporaryDirectory() as d:
             log_dir, lg = self._log(d)

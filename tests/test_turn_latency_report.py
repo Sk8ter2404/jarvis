@@ -317,6 +317,33 @@ class ParseTests(_LogDir):
         paths, turns, _ = rep.load(self.dir)
         self.assertEqual(turns, [])
 
+    def test_keep_lines_gives_the_last_turns_their_own_lines(self):
+        """The dashboard timeline's view (2026-10-02): each of the last N
+        turns carries the stamped lines since the previous [turn-timing]
+        line; older turns carry none, and the report never asks for them."""
+        self.write("session_2026-10-02_09-00-00.log",
+                   "[09:00:01]   You:    zebra one\n" + _voice("09:00:05")
+                   + "[09:00:06]   You:    zebra two\n"
+                   + "unstamped continuation\n"
+                   + "[09:00:07]   [action] get_time: nine\n"
+                   + _voice("09:00:09")
+                   + "[09:00:10]   [turn-flags] X=1\n"
+                   + "[09:00:11]   You:    zebra three\n"
+                   + _voice("09:00:15"))
+        path = os.path.join(self.dir, "session_2026-10-02_09-00-00.log")
+        turns, _ = rep.parse_log(path, keep_lines=2)
+        self.assertNotIn("lines", turns[0])
+        self.assertEqual(turns[1]["lines"], [
+            "[09:00:06]   You:    zebra two",
+            "[09:00:07]   [action] get_time: nine"])
+        self.assertEqual(turns[2]["lines"], [
+            "[09:00:10]   [turn-flags] X=1",
+            "[09:00:11]   You:    zebra three"])
+        self.assertEqual(turns[2]["flags"], {"X": "1"})
+        plain, _ = rep.parse_log(path)
+        self.assertFalse(any("lines" in t for t in plain))
+        self.assertEqual([t["kv"] for t in plain], [t["kv"] for t in turns])
+
     def test_lines_without_a_timestamp_or_kind_are_skipped(self):
         self.write("session_2026-10-02_09-00-00.log",
                    _voice("09:00:05").split("]", 1)[1]
