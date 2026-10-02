@@ -12,7 +12,9 @@ blue_green_manager.is_staging and the monolith's own singleton-lock choice).
 SAFETY: the old script did all of its work AT IMPORT -- importing it killed the
 running JARVIS and relaunched it. So every test first checks, by AST and before
 anything imports the file, that it has no import-time side effects, and only
-then loads it. psutil and winreg are fakes; nothing is killed or spawned.
+then loads it -- with psutil, winreg, Popen and os.system faked during the
+load too, in case the scan misses something. psutil and winreg are fakes;
+nothing is killed or spawned.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ import ast
 import importlib.util
 import io
 import os
+import subprocess
 import sys
 import types
 import unittest
@@ -31,7 +34,9 @@ _PATH = os.path.join(_ROOT, "tools", "bounce_jarvis.py")
 
 # Calls that act on the box (kill, spawn, sleep, registry, exit).
 _ACTING_CALLS = {"kill", "terminate", "process_iter", "Popen", "run", "call",
-                 "sleep", "OpenKey", "QueryValueEx", "exit", "main"}
+                 "check_call", "check_output", "system", "startfile",
+                 "sleep", "OpenKey", "QueryValueEx", "exit", "main",
+                 "kill_live_jarvis"}
 
 
 def _is_main_guard(node) -> bool:
@@ -88,6 +93,16 @@ def _fake_psutil(procs):
     return m
 
 
+def _refusing_psutil():
+    m = types.ModuleType("psutil")
+
+    def _process_iter(*_a, **_k):
+        raise AssertionError("tools/bounce_jarvis.py scanned processes at "
+                             "import time")
+    m.process_iter = _process_iter
+    return m
+
+
 def _fake_winreg():
     m = types.ModuleType("winreg")
     m.HKEY_CURRENT_USER = object()
@@ -113,7 +128,16 @@ class BounceJarvisTargetsTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("_bounce_jarvis_under_test",
                                                       _PATH)
         mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        # Second net: the AST scan is a heuristic, so the load itself also
+        # runs with psutil, winreg, Popen and os.system faked. A process scan
+        # or spawn the scan missed raises here instead of reaching the box.
+        def _refuse(*_a, **_k):
+            raise AssertionError("tools/bounce_jarvis.py acted at import time")
+        with mock.patch.dict(sys.modules, {"psutil": _refusing_psutil(),
+                                           "winreg": _fake_winreg()}), \
+             mock.patch.object(subprocess, "Popen", side_effect=_refuse), \
+             mock.patch.object(os, "system", side_effect=_refuse):
+            spec.loader.exec_module(mod)
         return mod
 
     def _kill(self, mod, procs):
