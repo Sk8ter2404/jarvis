@@ -457,14 +457,17 @@ if __name__ == "__main__":
 class LLHookOffByDefaultTests(unittest.TestCase):
     """B057 review (2026-10-01): a working LL hook puts every input event on the PC
     behind this process's GIL (~15.6 ms per event under JARVIS's load). It is
-    OFF unless AIR_MOUSE_LL_HOOK_ENABLED is True; the polling fallback serves."""
+    OFF unless AIR_MOUSE_LL_HOOK_ENABLED is True; the polling fallback serves.
+
+    These call _start_hook_thread() directly, NOT install(): in the full suite
+    another test's background air-mouse poller can call install() first and
+    flip the shared _installed flag (a race the first version of this test lost
+    on the Dell runner). _start_hook_thread() never reads that flag."""
 
     def setUp(self):
         self.y = _yield_mod()
-        _reset(self.y)
-        self.addCleanup(_reset, self.y)
 
-    def _install_with(self, flag):
+    def _start_with(self, flag):
         cfg = types.ModuleType("core.config")
         if flag is not None:
             cfg.AIR_MOUSE_LL_HOOK_ENABLED = flag
@@ -479,27 +482,26 @@ class LLHookOffByDefaultTests(unittest.TestCase):
                 started.append(True)
 
         out = io.StringIO()
+        warned = [False]
+        # A user32 stand-in so the probe passes on any OS (Linux CI has no windll).
         with mock.patch.dict(sys.modules, {"core.config": cfg,
-                                           "bobert_companion": bc}), \
-                mock.patch.object(self.y.threading, "Thread", _T), \
-                mock.patch.object(self.y.time, "sleep", lambda s: None), \
-                redirect_stdout(out):
-            ok = self.y.install()
+                                           "bobert_companion": bc}),                 mock.patch.object(self.y.threading, "Thread", _T),                 mock.patch.object(ctypes, "windll",
+                                  types.SimpleNamespace(user32=object()), create=True),                 mock.patch.object(self.y, "_warned", warned),                 redirect_stdout(out):
+            ok = self.y._start_hook_thread()
         return ok, started, out.getvalue()
 
     def test_off_by_default_starts_no_hook_thread(self):
         for flag in (None, False, "yes"):
             with self.subTest(flag=flag):
-                _reset(self.y)
-                ok, started, out = self._install_with(flag)
+                ok, started, out = self._start_with(flag)
                 self.assertFalse(ok)
                 self.assertEqual(started, [])
                 self.assertIn("AIR_MOUSE_LL_HOOK_ENABLED=False", out)
 
     def test_enabled_starts_the_hook_thread(self):
-        ok, started, _out = self._install_with(True)
+        ok, started, _out = self._start_with(True)
+        self.assertTrue(ok)
         self.assertEqual(started, [True])
-        self.assertFalse(ok)          # the fake thread never flips _hook_ok
 
     def test_the_monolith_value_wins_over_config(self):
         cfg = types.ModuleType("core.config")

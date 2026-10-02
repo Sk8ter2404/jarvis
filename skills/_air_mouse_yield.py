@@ -298,33 +298,12 @@ def install() -> bool:
     tick; on failure logs ONE warning and arms the GetLastInputInfo fallback.
     Returns True when the LL hook is active, False when running on the fallback.
     NEVER raises."""
-    global _installed, _thread
+    global _installed
     with _install_lock:
         if _installed:
             return _hook_ok
         _installed = True
-        if not _ll_hook_enabled():
-            # 2026-10-01 (B057 review): with the ctypes types fixed the hook
-            # really installs — and then every mouse/keyboard event on the PC
-            # waits for this Python callback, which needs the GIL of a process
-            # running ~3 cores of work: ~15.6 ms per event measured, 311 ms for
-            # a 20-event burst (games included). Off by default until a
-            # GIL-free design (separate process / raw input) lands; the
-            # GetLastInputInfo fallback keeps the real-input yield working.
-            _warn_once("off by setting: AIR_MOUSE_LL_HOOK_ENABLED=False")
-            return False
-        try:
-            import ctypes  # noqa: F401  (probe availability before spawning)
-            _ = ctypes.windll.user32
-        except Exception:
-            _warn_once("ctypes/user32 unavailable")
-            return False
-        try:
-            _thread = threading.Thread(target=_hook_thread, daemon=True,
-                                       name="kinect-air-mouse-yield-hook")
-            _thread.start()
-        except Exception as e:   # pragma: no cover - thread spawn is platform I/O
-            _warn_once(f"hook thread failed to start: {e}")
+        if not _start_hook_thread():
             return False
     # Give the thread a moment to set up the hooks (it flips _hook_ok). Brief +
     # bounded so a wedged install can't hang the caller.
@@ -333,6 +312,36 @@ def install() -> bool:
             break
         time.sleep(0.005)
     return _hook_ok
+
+
+def _start_hook_thread() -> bool:
+    """The setting gate, the user32 probe and the hook thread start (install()
+    holds _install_lock). True when the thread was started. Never raises."""
+    global _thread
+    if not _ll_hook_enabled():
+        # 2026-10-01 (B057 review): with the ctypes types fixed the hook
+        # really installs — and then every mouse/keyboard event on the PC
+        # waits for this Python callback, which needs the GIL of a process
+        # running ~3 cores of work: ~15.6 ms per event measured, 311 ms for
+        # a 20-event burst (games included). Off by default until a
+        # GIL-free design (separate process / raw input) lands; the
+        # GetLastInputInfo fallback keeps the real-input yield working.
+        _warn_once("off by setting: AIR_MOUSE_LL_HOOK_ENABLED=False")
+        return False
+    try:
+        import ctypes  # noqa: F401  (probe availability before spawning)
+        _ = ctypes.windll.user32
+    except Exception:
+        _warn_once("ctypes/user32 unavailable")
+        return False
+    try:
+        _thread = threading.Thread(target=_hook_thread, daemon=True,
+                                   name="kinect-air-mouse-yield-hook")
+        _thread.start()
+    except Exception as e:   # pragma: no cover - thread spawn is platform I/O
+        _warn_once(f"hook thread failed to start: {e}")
+        return False
+    return True
 
 
 def _ll_hook_enabled() -> bool:
