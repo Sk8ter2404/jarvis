@@ -1875,10 +1875,15 @@ class StreamingAutoPlayTests(MonolithGlobalsTestCase):
              mock.patch.object(self.bc, "ui_click"), \
              mock.patch.object(self.bc, "_streaming_go_fullscreen"), \
              mock.patch.object(self.bc, "_ensure_window_visible_maximized") as place, \
+             mock.patch.object(self.bc, "_streaming_page_wall",
+                               return_value="") as wall, \
              mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND, {}, clear=True):
             self.bc._streaming_auto_play("netflix", "the matrix")
             # Capture inside the patch.dict scope (it restores on exit).
             recorded = self.bc._JARVIS_MEDIA_WINDOW_HWND.get("netflix")
+        # The pinned page gets the sign-in look (S5, 2026-10-02) - faked
+        # here: a real one would photograph the live monitor.
+        wall.assert_called_once()
         place.assert_called_once_with(909)
         # And the handle was recorded for safe reuse/close next time.
         self.assertEqual(recorded, 909)
