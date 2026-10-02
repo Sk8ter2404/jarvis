@@ -121,6 +121,11 @@ _SCRUB_RULES: List[Tuple[Any, Any]] = [
     # Before the IP/HEX rules (a spaced/contiguous card never reaches <HEX>,
     # which needs a contiguous 32+ hex run).
     (re.compile(r"\b(?:\d[ -]?){12,18}\d\b"), _card_sub),
+    # US Social Security numbers, 3-2-4 dashed. The phone rule below wants
+    # 3-3-4 groups, so an SSN in a log or transcript used to pass through to a
+    # public GitHub issue untouched (audit P3-6). Dashes required and no digit
+    # either side, so dates (4-2-2) and longer id runs are left alone.
+    (re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)"), "<SSN>"),
     # North-American phone numbers — conservative: a separator between the
     # 3-3-4 groups is REQUIRED, so a bare 10-digit id/timestamp isn't caught.
     (re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]\d{3}"

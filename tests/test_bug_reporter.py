@@ -145,6 +145,23 @@ class CardAndPhoneScrubTests(unittest.TestCase):
             self.assertIn("<PHONE>", out, raw)
             self.assertNotIn(last4, out, raw)
 
+    def test_ssn_redacted(self):
+        # Audit P3-6: the phone rule wants 3-3-4 digits, so a 3-2-4 SSN fell
+        # through every rule and would be posted to a public GitHub issue.
+        # Built by concatenation, like the phone/card fixtures above.
+        ssn = "078-05-" + "1120"
+        for text in ("ssn " + ssn + " on file", "id=" + ssn, ssn):
+            out = bug_reporter.scrub(text)
+            self.assertIn("<SSN>", out, text)
+            self.assertNotIn("1120", out, text)
+            self.assertNotIn("078-05", out, text)
+
+    def test_ssn_rule_leaves_dates_and_longer_runs_alone(self):
+        for text in ("2026-10-01", "build 1078-05-1120", "ref 078-05-11201"):
+            self.assertNotIn("<SSN>", bug_reporter.scrub(text), text)
+        # and a dashed NANP phone is still a phone, not an SSN
+        self.assertIn("<PHONE>", bug_reporter.scrub("555-987-" + "6543"))
+
     def test_plain_10_digit_id_not_phone(self):
         # A bare 10-digit run (e.g. a unix timestamp) has no separators, so the
         # conservative phone rule must leave it alone.
