@@ -1543,6 +1543,58 @@ class PulseLiveGpuAlertTests(unittest.TestCase):
         self.assertIn("gpu", out)
         self.assertEqual(self.slept, [])
 
+    # ── review repair (2026-10-02): the pinned GPU, and who carries it ──────
+    # The branch's own captured sample (_PMON_SAMPLE) kept the alert: chrome
+    # at 16 % on the 3090 counted as "someone else's load" next to
+    # llama-server at 99 %, and a live idle reading here shows claude.exe at
+    # 11 %. Only the PINNED GPU's processes count, and the load is the model
+    # server's when it carries most of it.
+    _SAMPLE_ROWS = [("chrome.exe", 18860, 16, 0),
+                    ("llama-server.ex", 47536, 99, 0),
+                    ("pythonw.exe", 43176, 59, 1)]
+
+    def _qualify_pinned(self, rows, pinned, own_pid=4242):
+        with mock.patch.object(self.mod, "_read_pinned_gpus",
+                               return_value=pinned, create=True):
+            return self._qualify(self.LIVE, procs=rows, own_pid=own_pid)
+
+    def test_the_captured_sample_is_the_model_server(self):
+        for own in (43176, 4242):
+            with self.subTest(own_pid=own):
+                out, logged = self._qualify_pinned(self._SAMPLE_ROWS, {0},
+                                                   own_pid=own)
+                self.assertNotIn("gpu", out, logged)
+                self.assertIn("local model server", logged)
+
+    def test_the_model_server_carrying_most_of_it_without_gpu_indices(self):
+        out, _ = self._qualify_pinned(self._SAMPLE_ROWS, None)
+        self.assertNotIn("gpu", out)
+
+    def test_another_gpus_process_does_not_count(self):
+        rows = [("llama-server.ex", 1, 99, 0), ("blender.exe", 2, 80, 1)]
+        out, _ = self._qualify_pinned(rows, {0})
+        self.assertNotIn("gpu", out)
+
+    def test_a_game_on_the_pinned_gpu_still_alerts(self):
+        rows = [("fortniteclient-", 9001, 95, 0),
+                ("llama-server.ex", 47536, 12, 0)]
+        out, _ = self._qualify_pinned(rows, {0})
+        self.assertIn("gpu", out)
+
+    def test_parse_pmon_keeps_the_gpu_index_when_asked(self):
+        self.assertEqual(self.mod._parse_pmon(_PMON_SAMPLE, with_gpu=True),
+                         self._SAMPLE_ROWS)
+
+    def test_pinned_gpus_from_per_gpu_utilisation(self):
+        out = types.SimpleNamespace(stdout="0, 100\n1, 59\n")
+        with mock.patch.object(self.mod.shutil, "which",
+                               return_value="nvidia-smi"), \
+                mock.patch.object(self.mod.subprocess, "run",
+                                  return_value=out):
+            self.assertEqual(self.mod._read_pinned_gpus(), {0})
+        with mock.patch.object(self.mod.shutil, "which", return_value=None):
+            self.assertIsNone(self.mod._read_pinned_gpus())
+
     # ── nvidia-smi pmon ──────────────────────────────────────────────────
     def test_parse_pmon_real_sample(self):
         self.assertEqual(self.mod._parse_pmon(_PMON_SAMPLE),

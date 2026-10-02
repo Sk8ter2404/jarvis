@@ -719,11 +719,11 @@ def _drop_self_inflicted_gpu(pulse: dict, reasons: list, *,
 # the local model server and JARVIS itself.
 
 def _gpu_busy_processes() -> list | None:
-    """[(image_lower, pid, sm_pct)] for every process using the GPU's SMs at or
-    above GPU_PROC_BUSY_SM_PCT, from one `nvidia-smi pmon -c 1 -s u` sample.
-    None when the per-process reading is unavailable (no nvidia-smi, an error,
-    no header): the caller then cannot attribute the load and keeps the
-    reason. Never raises."""
+    """[(image_lower, pid, sm_pct, gpu_index)] for every process using a GPU's
+    SMs at or above GPU_PROC_BUSY_SM_PCT, from one `nvidia-smi pmon -c 1 -s u`
+    sample. None when the per-process reading is unavailable (no nvidia-smi,
+    an error, no header): the caller then cannot attribute the load and keeps
+    the reason. Never raises."""
     try:
         exe = shutil.which("nvidia-smi")
         if not exe:
@@ -733,15 +733,44 @@ def _gpu_busy_processes() -> list | None:
             capture_output=True, text=True, timeout=6.0,
             creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
         )
-        return _parse_pmon(out.stdout or "")
+        return _parse_pmon(out.stdout or "", with_gpu=True)
     except Exception:
         return None
 
 
-def _parse_pmon(text: str) -> list | None:
+def _read_pinned_gpus() -> set | None:
+    """The indices of the GPUs at or over GPU_UTIL_ABNORMAL_PCT right now
+    (`nvidia-smi --query-gpu=index,utilization.gpu`), or None when that
+    cannot be read. Never raises."""
+    try:
+        exe = shutil.which("nvidia-smi")
+        if not exe:
+            return None
+        out = subprocess.run(
+            [exe, "--query-gpu=index,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2.0,
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+        )
+        pinned: set = set()
+        seen = False
+        for line in (out.stdout or "").splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                continue
+            seen = True
+            if int(parts[1]) >= GPU_UTIL_ABNORMAL_PCT:
+                pinned.add(int(parts[0]))
+        return pinned if seen else None
+    except Exception:
+        return None
+
+
+def _parse_pmon(text: str, with_gpu: bool = False) -> list | None:
     """Parse `nvidia-smi pmon -s u` output (see _gpu_busy_processes). The
     column layout differs by driver, so it is read from the '# gpu pid ...'
-    header. None when there is no header. Never raises."""
+    header. None when there is no header. ``with_gpu`` adds each row's GPU
+    index (None when the column is unreadable). Never raises."""
     try:
         cols = None
         busy: list = []
@@ -770,7 +799,12 @@ def _parse_pmon(text: str) -> list | None:
                 continue
             # The image name is the LAST column and may itself hold spaces.
             image = " ".join(fields[len(cols) - 1:]).strip().lower()
-            busy.append((image, pid, sm))
+            if with_gpu:
+                gpu_raw = row.get("gpu", "-")
+                gpu = int(gpu_raw) if gpu_raw.isdigit() else None
+                busy.append((image, pid, sm, gpu))
+            else:
+                busy.append((image, pid, sm))
         return busy if cols is not None else None
     except Exception:
         return None
@@ -782,15 +816,20 @@ def _is_local_model_server(image: str) -> bool:
 
 
 def _qualify_gpu_reason(pulse: dict, reasons: list, *, sample=None,
-                        sleep=None, busy_procs=None, own_pid=None
-                        ) -> tuple[dict, list]:
+                        sleep=None, busy_procs=None, own_pid=None,
+                        pinned_gpus=None) -> tuple[dict, list]:
     """Return (pulse, reasons) with the 'gpu' reason removed unless the GPU is
     genuinely and unexpectedly busy:
       1. GPU_HIGH_SAMPLES_REQUIRED samples (this one + fresh reads
          GPU_RESAMPLE_GAP_S apart) must all be pinned;
-      2. the processes carrying the load (nvidia-smi pmon) must include
-         something other than the local model server and JARVIS's own
-         process. Unattributable load (pmon unavailable) is kept.
+      2. on the PINNED GPU(s) (per-GPU utilisation; every GPU when that is
+         unknown), the load must be someone else's: processes other than the
+         local model server and JARVIS's own, carrying more of it than the
+         model server does. Unattributable load (pmon unavailable, nobody
+         busy on the pinned GPU) is kept.
+    Review repair (2026-10-02): any process at 10 % on EITHER GPU used to
+    count, so the branch's own captured sample (llama-server 99 %, chrome
+    16 % on the 3090) kept the alert, and an idle claude.exe reads 11 %.
     Other reasons are untouched. Never raises (on an error: unchanged)."""
     try:
         if not any(k == "gpu" for k, _ in reasons):
@@ -813,13 +852,22 @@ def _qualify_gpu_reason(pulse: dict, reasons: list, *, sample=None,
                 return pulse, others
         procs = busy_procs()
         if procs:
-            foreign = [p for p in procs
-                       if not _is_local_model_server(p[0]) and p[1] != own]
-            if not foreign:
-                who = ("the local model server"
-                       if any(_is_local_model_server(p[0]) for p in procs)
+            rows = [(p[0], p[1], p[2], p[3] if len(p) > 3 else None)
+                    for p in procs]
+            if any(r[3] is not None for r in rows):
+                pinned = (pinned_gpus or _read_pinned_gpus)()
+                if pinned:
+                    rows = [r for r in rows if r[3] is None or r[3] in pinned]
+            if not rows:
+                return pulse, reasons     # nobody busy on the pinned GPU
+            server_sm = sum(r[2] for r in rows if _is_local_model_server(r[0]))
+            foreign = [r for r in rows
+                       if not _is_local_model_server(r[0]) and r[1] != own]
+            foreign_sm = sum(r[2] for r in foreign)
+            if not foreign or server_sm > foreign_sm:
+                who = ("the local model server" if server_sm
                        else "JARVIS's own processing")
-                names = ", ".join(sorted({p[0] for p in procs}))
+                names = ", ".join(sorted({r[0] for r in rows}))
                 print(f"  [pulse] gpu reading suppressed ({who} is busy: "
                       f"{names})")
                 return pulse, others
