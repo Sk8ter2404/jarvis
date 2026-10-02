@@ -40906,11 +40906,19 @@ def _fresh_diagnostic_status(arg: str = "") -> str:
     keeps the fast fallback: no self-check loaded, or a sweep that raises or
     returns nothing -> the counters, said to be possibly stale. The boot
     registers this over skills/self_diagnostic's last-run summary, after
-    load_skills. Never raises."""
+    load_skills. Never raises.
+
+    The tray's async wrapper (_act_run_diagnostic_tray) is skipped: it holds
+    run_diagnostic until the skill overrides it and never returns a sweep's
+    result ("self_diagnostic skill not loaded" / "diagnostic sweep started"),
+    so with the skill not loaded the answer is the counters, not that line
+    (review 2026-10-02)."""
+    tray_only = globals().get("_act_run_diagnostic_tray")
     sweep = None
     for _name in _SELF_CHECK_ACTIONS:
-        sweep = ACTIONS.get(_name)
-        if sweep is not None:
+        _fn = ACTIONS.get(_name)
+        if _fn is not None and _fn is not tray_only:
+            sweep = _fn
             break
     from core import diagnostic_daemons as _dd
     return _dd.fresh_diagnostic_status(sweep)

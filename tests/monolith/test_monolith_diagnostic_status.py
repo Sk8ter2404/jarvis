@@ -69,6 +69,34 @@ class FreshDiagnosticStatusTests(MonolithGlobalsTestCase):
         self.assertTrue(out.endswith(COUNTERS), out)
         self.assertNotIn("nominal", out.lower())
 
+    def test_the_tray_wrapper_is_not_a_sweep(self):
+        # Review 2026-10-02: until the self_diagnostic skill loads, the
+        # monolith's own ACTIONS["run_diagnostic"] is the tray's async wrapper
+        # (_act_run_diagnostic_tray, pinned by AST in
+        # tests/test_diagnostic_status_fresh.py). It never returns a sweep's
+        # result: "self_diagnostic skill not loaded", or "diagnostic sweep
+        # started" with the answer going to the log. With the skill not loaded
+        # it is all the lookup finds, so "diagnostic status" read that raw
+        # line out instead of the counters.
+        self.acts["run_diagnostic"] = self.bc._act_run_diagnostic_tray
+        with mock.patch.object(self.bc, "_selfdiag_module", return_value=None), \
+                mock.patch.object(self.bc, "_tray_async") as spawn:
+            out = self.bc._fresh_diagnostic_status("")
+        spawn.assert_not_called()
+        self.assertIn("not loaded", out)
+        self.assertIn("may be stale", out)
+        self.assertTrue(out.endswith(COUNTERS), out)
+
+    def test_the_skill_sweep_still_wins_over_the_tray_wrapper(self):
+        sweep = mock.Mock(return_value=SUMMARY)
+        self.acts["run_diagnostic"] = self.bc._act_run_diagnostic_tray
+        self.acts["system_check"] = sweep
+        with mock.patch.object(self.bc, "_selfdiag_module", return_value=None), \
+                mock.patch.object(self.bc, "_tray_async") as spawn:
+            self.assertEqual(self.bc._fresh_diagnostic_status(""), SUMMARY)
+        sweep.assert_called_once_with("")
+        spawn.assert_not_called()
+
     def test_never_the_old_counters_when_the_sweep_answers(self):
         self.acts["are_you_ok"] = mock.Mock(return_value=SUMMARY)
         self.dd.diagnostic_daemon_status_spoken.reset_mock()

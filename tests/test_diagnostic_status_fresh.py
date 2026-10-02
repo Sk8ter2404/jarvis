@@ -224,6 +224,22 @@ class MonolithWiringTests(unittest.TestCase):
         self.assertIn("are_you_ok", names)
         self.assertNotIn("diagnostic_status", names)
 
+    def test_the_tray_wrapper_holds_a_self_check_name_until_the_skill_loads(self):
+        # Premise of FreshDiagnosticStatusTests.test_the_tray_wrapper_is_not_a_sweep
+        # (tests/monolith): the import-time ACTIONS literal registers the
+        # tray's async wrapper under run_diagnostic, one of
+        # _SELF_CHECK_ACTIONS. The wrapper never returns a sweep's result, so
+        # until the skill overrides it the fresh handler must skip it.
+        literal = next(n.value for n in self.tree.body
+                       if isinstance(n, ast.Assign)
+                       and isinstance(n.value, ast.Dict)
+                       and any(isinstance(t, ast.Name) and t.id == "ACTIONS"
+                               for t in n.targets))
+        held = {k.value: ast.unparse(v)
+                for k, v in zip(literal.keys, literal.values)
+                if isinstance(k, ast.Constant)}
+        self.assertEqual(held.get("run_diagnostic"), "_act_run_diagnostic_tray")
+
 
 class RoutingTests(unittest.TestCase):
     FULL = prompts.PC_CONTROL_PROMPT

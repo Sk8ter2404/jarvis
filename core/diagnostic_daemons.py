@@ -1590,7 +1590,9 @@ def diagnostic_daemon_status() -> dict[str, Any]:
 
 
 def diagnostic_daemon_status_spoken(_: str = "") -> str:
-    """Voice-friendly status summary for 'JARVIS, diagnostic status'."""
+    """Voice-friendly counters summary for 'JARVIS, diagnostic daemon status'
+    (act_diagnostic_status); also the possibly-stale fallback of
+    fresh_diagnostic_status, which now answers 'diagnostic status'."""
     s = diagnostic_daemon_status()
     if s["paused"]:
         prefix = "Diagnostics are paused, sir. "
