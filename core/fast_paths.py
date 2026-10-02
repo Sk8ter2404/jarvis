@@ -34,6 +34,10 @@ the local model is both slow and unreliable at them (live 2026-09-29):
   * "what time is it in London" (v2.0.148): core/world_clock.py. Live
     v2.0.140 get_time (the LOCAL clock) was voiced as "It is 10:17 PM in
     London, sir." when London was at 4:17 AM.
+  * "what time is it" / "what's the time" / "what's the date and time"
+    (2026-10-02): the time HERE, from the same ``now`` (local_time_answer).
+    Live it went through the LLM's get_time round (~4 s) while the date and
+    the world clock were instant.
   * spoken arithmetic, "what's 12 times 7" / "144 divided by 12" / "2 to the
     power of 10" (2026-10-01): core/spoken_math.py, evaluated exactly. The
     09-05 live diagnostic found operator words never reached the calculator
@@ -65,8 +69,8 @@ from core.date_math import normalize
 
 class FastAnswer(NamedTuple):
     kind: str    # "owner-name" | "owner-identity" | "last-utterance" |
-    #              "first-utterance" | "world-clock" | "arithmetic" |
-    #              a date_math kind
+    #              "first-utterance" | "world-clock" | "time" |
+    #              "arithmetic" | a date_math kind
     reply: str
 
 
@@ -604,6 +608,78 @@ def is_timer_list_request(text) -> bool:
         return False
 
 
+# ── "what time is it" (2026-10-02) ─────────────────────────────────────────
+# Live 10:27:33 "Jarvis, what time is it?" went through the LLM ("One moment,
+# sir. [ACTION: get_time]", a second round, ~4 s) while "what day is it" and
+# "what time is it in London" never touched it. Not the wake word, the "?" or
+# the routing order (normalize peels the first two; the fast paths run before
+# any LLM call): no grammar answered the LOCAL time. date_math answers dates
+# only and world_clock a named place or zone only. Whole utterance only, so
+# "what time is my meeting", "what time does the store open", "what time is it
+# there" and a time somewhere else fall through untouched.
+_TIME_HERE = r"(?: here| at the moment| currently)?"
+_TIME_RES = tuple(re.compile(p + _TIME_HERE) for p in (
+    r"what time is it",
+    r"what is the (?:(?:current|local|exact) )?time",
+    r"what time (?:have you got|do you have)",
+    r"(?:do|have) you (?:have|got) the time",
+    r"time check",
+))
+# Shapes that are a time question only after an ask lead ("do you know what
+# time it is", "could you tell me the time"): bare, "the time" is a noun.
+_TIME_AFTER_ASK_RES = tuple(re.compile(p + _TIME_HERE) for p in (
+    r"what time it is",
+    r"the (?:(?:current|local|exact) )?time",
+))
+_DATE_TIME_RE = re.compile(
+    r"what is the (?:current )?(?:date and (?:the )?time|time and (?:the )?date)"
+    r"|what (?:day and time|time and day) is it")
+_TIME_ASK_LEAD_RE = re.compile(
+    r"^(?:(?:can|could|would|will) you(?: please)? tell me|"
+    r"(?:please )?tell me|do you (?:happen to )?know|"
+    r"i (?:want|need|would like|d like) to know|any idea)\b\s*")
+_TIME_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                  "Saturday", "Sunday")
+_TIME_MONTHS = ("January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November",
+                "December")
+
+
+def _clock_text(t) -> str:
+    """ "10:27 AM" (no leading zero), the get_time / world_clock style."""
+    h = t.hour % 12 or 12
+    return f"{h}:{t.minute:02d} {'AM' if t.hour < 12 else 'PM'}"
+
+
+def local_time_answer(text, now) -> Optional[FastAnswer]:
+    """FastAnswer("time", "It's 10:27 AM, sir.") for a whole-utterance
+    question about the time HERE asked at ``now`` (a datetime; its own wall
+    clock), "It's 10:27 AM on Friday, October 2, 2026, sir." when the date is
+    asked too; None for anything else. Never raises."""
+    try:
+        import datetime as _dt
+        if not isinstance(now, _dt.datetime) or not isinstance(text, str):
+            return None
+        t = re.sub(r"\s+", " ", normalize(text)).strip()
+        if not t or len(t) > 80:
+            return None
+        asked = False
+        m = _TIME_ASK_LEAD_RE.match(t)
+        if m:
+            t, asked = t[m.end():].strip(), True
+        clock = _clock_text(now)
+        if _DATE_TIME_RE.fullmatch(t):
+            day = (f"{_TIME_WEEKDAYS[now.weekday()]}, "
+                   f"{_TIME_MONTHS[now.month - 1]} {now.day}, {now.year}")
+            return FastAnswer("time", f"It's {clock} on {day}, sir.")
+        res = _TIME_RES + (_TIME_AFTER_ASK_RES if asked else ())
+        if any(rx.fullmatch(t) for rx in res):
+            return FastAnswer("time", f"It's {clock}, sir.")
+    except Exception:
+        return None
+    return None
+
+
 def match(text, *, now=None, history=(), owner_name="",
           session_turns=None, session_start_lost=False
           ) -> Optional[FastAnswer]:
@@ -640,6 +716,11 @@ def match(text, *, now=None, history=(), owner_name="",
             clock = world_clock.answer(text, now)
             if clock is not None:
                 return FastAnswer(clock.kind, clock.reply)
+            # The time HERE (2026-10-02): after the world clock, so a place
+            # or zone keeps its own answer.
+            here = local_time_answer(text, now)
+            if here is not None:
+                return here
             got = date_math.answer(text, now)
             if got is not None:
                 return FastAnswer(got.kind, got.reply)
