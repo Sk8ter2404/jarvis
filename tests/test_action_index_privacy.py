@@ -135,6 +135,49 @@ class GeneratorIndexesOnlyTrackedFilesTests(unittest.TestCase):
         text, _counts, _groups = self.gen.build_index(self.tmp)
         self.assertNotIn("test_privateword", text)
 
+    def test_gitignored_skill_on_disk_changes_nothing_in_the_output(self):
+        """The coverage columns (2026-10-02) read more of each source: a
+        skill's speak-set declarations and every test file's string literals.
+        A gitignored skills/*.py ON DISK that declares speak routing for a
+        PUBLIC action, plus a gitignored test naming that action, must leave
+        the output exactly as if neither file existed."""
+        _write(self.tmp, "skills/public_quiet.py",
+               _SKILL.format(name="public_quiet"))
+        _write(self.tmp, "skills/privateword_speaker.py",
+               'SPEAK_VERBATIM_ACTIONS = ("public_quiet",)\n\n\n'
+               + _SKILL.format(name="privateword_spoken_action"))
+        _write(self.tmp, "tests/test_privateword_speaker.py",
+               'NAME = "public_quiet"\n')
+        with open(os.path.join(self.tmp, ".gitignore"), "a",
+                  encoding="utf-8", newline="\n") as f:
+            f.write("skills/privateword_speaker.py\n"
+                    "tests/test_privateword_speaker.py\n")
+        self._git_add_tracked()
+        subprocess.run(["git", "-C", self.tmp, "add", "skills/public_quiet.py"],
+                       capture_output=True, timeout=60, check=True)
+        ignored = subprocess.run(
+            ["git", "-C", self.tmp, "check-ignore",
+             "skills/privateword_speaker.py",
+             "tests/test_privateword_speaker.py"],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(ignored.stdout.split(),
+                         ["skills/privateword_speaker.py",
+                          "tests/test_privateword_speaker.py"],
+                         "fixture is vacuous: git does not ignore the files")
+
+        with open(self.gen.main(root=self.tmp), encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn("privateword", text)
+        rows = [ln for ln in text.splitlines()
+                if ln.startswith("| `public_quiet` |")]
+        self.assertEqual(len(rows), 1, text)
+        cells = [c.strip() for c in rows[0].strip().strip("|").split("|")]
+        self.assertEqual(cells[2], "neither",
+                         "a gitignored skill's speak declaration reached the "
+                         "public index's spoken note")
+        self.assertEqual(cells[4], "no",
+                         "a gitignored test file counted as a test reference")
+
     def test_no_git_fallback_still_drops_gitignored_files(self):
         """When git cannot answer, the .gitignore patterns decide - and they
         can only ever EXCLUDE. The fallback also says so, loudly."""
