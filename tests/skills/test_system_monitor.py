@@ -85,9 +85,23 @@ class SystemMonitorReportTests(unittest.TestCase):
         self.assertIn("Chrome is, as usual, the primary offender", out)
 
     def test_generic_offender_phrasing(self):
+        # Spoken the way he would say it (2026-10-02): no ".exe", and one
+        # period - it used to read "blender.exe is the primary offender..".
         out = self._run_report(cpu=50, ram_pct=50,
                                top=[("blender.exe", 70.0)])
-        self.assertIn("blender.exe is the primary offender", out)
+        self.assertIn("Blender is the primary offender. C drive", out)
+        self.assertNotIn(".exe", out)
+        self.assertNotIn("..", out)
+
+    def test_defender_named_as_defender_in_the_report(self):
+        out = self._run_report(cpu=95, ram_pct=50, top=[("MsMpEng.exe", 80.0)])
+        self.assertIn("Windows Defender is the primary offender", out)
+        self.assertNotIn("MsMpEng", out)
+
+    def test_own_process_in_the_report(self):
+        out = self._run_report(cpu=95, ram_pct=50,
+                               top=[(self.mod._SELF_KEY, 80.0)])
+        self.assertIn("Most of that is my own speech recognition", out)
 
     def test_disk_line_included(self):
         out = self._run_report(cpu=10, ram_pct=30, disk=(123.0, 1000.0))
@@ -391,7 +405,8 @@ class SystemMonitorLoopTests(unittest.TestCase):
         enq.assert_called_once()
         msg = enq.call_args[0][0]
         self.assertIn("pinned above 90 percent", msg)
-        self.assertIn("blender.exe", msg)
+        self.assertIn("Blender appears to be the culprit", msg)
+        self.assertNotIn(".exe", msg)
         self.assertGreater(self.mod._last_cpu_alert_at[0], 0.0)
 
     def test_high_ram_single_sample_queues_alert(self):
@@ -608,6 +623,174 @@ class SystemMonitorRegisterTests(unittest.TestCase):
             mod.register(actions)
         self.assertIn("check_system", actions)
         Thread.assert_not_called()
+
+
+
+class _CT:
+    """psutil.Process.cpu_times() stand-in."""
+    def __init__(self, user, system=0.0):
+        self.user = user
+        self.system = system
+
+
+class SystemMonitorCulpritTests(unittest.TestCase):
+    """NEW #14 (live 2026-10-01). 18:14:56, over a show: "MsMpEng.exe appears
+    to be the culprit. You may want to investigate" - a routine Defender scan.
+    22:06:12: "python.exe ..." - JARVIS's own process. Both culprits came from
+    ONE 0.5 s _top_processes(1) sample taken after the window, spoken as the
+    raw image name. Now: averaged over the window, named the way he would say
+    it, maintenance log-only, JARVIS itself = "my own speech recognition"."""
+
+    N = 13          # samples 6 s apart: the window fills and the alert fires
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_monitor")
+        self.mod._last_cpu_alert_at[0] = 0.0
+        self.mod._last_ram_alert_at[0] = 0.0
+
+    def _psutil(self, rates):
+        """A psutil whose process_iter reports, on its k-th call, each pid's
+        CPU time as rate * 6 s * k (rates: {pid: (name, cpu_s_per_s)})."""
+        fake = mock.MagicMock()
+        fake.cpu_percent.side_effect = [96.0] * self.N
+        fake.virtual_memory.side_effect = [_VM(40.0, 8.0)] * self.N
+        fake.cpu_count.return_value = 8
+        calls = {"k": 0}
+
+        def _iter(_attrs=None):
+            calls["k"] += 1
+            out = []
+            for pid, (name, rate) in rates.items():
+                p = mock.MagicMock()
+                p.pid = pid
+                p.info = {"name": name,
+                          "cpu_times": _CT(rate * 6.0 * calls["k"])}
+                out.append(p)
+            return out
+        fake.process_iter.side_effect = _iter
+        return fake
+
+    def _run(self, rates, *, instant_top):
+        """Drive _monitor_loop through one full high window. `instant_top` is
+        what the old one-instant _top_processes(1) sample would have said."""
+        base = 1_700_000_000.0
+        ticks = iter(base + 6.0 * i for i in range(self.N + 5))
+
+        def _sleep(_):
+            if self.mod._last_cpu_alert_at[0] > 0.0:
+                raise _LoopBreak
+        with mock.patch.object(self.mod, "_HAS_PSUTIL", True), \
+             mock.patch.object(self.mod, "psutil", self._psutil(rates)), \
+             mock.patch.object(self.mod.time, "time", lambda: next(ticks)), \
+             mock.patch.object(self.mod.time, "sleep", side_effect=_sleep), \
+             mock.patch.object(self.mod, "_top_processes",
+                               return_value=instant_top), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+             mock.patch("builtins.print") as pr:
+            with self.assertRaises(_LoopBreak):
+                self.mod._monitor_loop()
+        logged = " ".join(str(c.args[0]) for c in pr.call_args_list if c.args)
+        spoken = [c.args[0] for c in enq.call_args_list]
+        return spoken, logged
+
+    def test_live_18_14_defender_scan_is_logged_not_spoken(self):
+        spoken, logged = self._run(
+            {101: ("MsMpEng.exe", 6.5), 102: ("chrome.exe", 0.4),
+             103: ("System Idle Process", 1.0)},
+            instant_top=[("MsMpEng.exe", 41.0)])
+        self.assertEqual(spoken, [], "a routine Defender scan was announced")
+        self.assertIn("Windows Defender (msmpeng.exe", logged)
+        self.assertIn("routine maintenance, not announced", logged)
+        # The window still counts: no re-log every 5 s.
+        self.assertGreater(self.mod._last_cpu_alert_at[0], 0.0)
+
+    def test_live_22_06_own_process_is_my_own_speech_recognition(self):
+        own = os.getpid()
+        spoken, _ = self._run({own: ("python.exe", 5.0),
+                               202: ("chrome.exe", 0.5)},
+                              instant_top=[("python.exe", 60.0)])
+        self.assertEqual(len(spoken), 1)
+        self.assertIn("mostly my own speech recognition", spoken[0])
+        self.assertNotIn("python", spoken[0].lower())
+
+    def test_the_culprit_is_averaged_over_the_window(self):
+        # Chrome burned the minute; Blender only tops the final instant.
+        spoken, _ = self._run({301: ("chrome.exe", 5.0),
+                               302: ("blender.exe", 0.2)},
+                              instant_top=[("blender.exe", 90.0)])
+        self.assertEqual(len(spoken), 1)
+        self.assertIn("Chrome appears to be the culprit", spoken[0])
+        self.assertNotIn("lender", spoken[0])
+
+    def test_no_baseline_falls_back_to_the_instant_sample(self):
+        spoken, _ = self._run({}, instant_top=[("blender.exe", 90.0)])
+        self.assertEqual(len(spoken), 1)
+        self.assertIn("Blender appears to be the culprit", spoken[0])
+
+    def test_no_culprit_at_all_is_still_reported(self):
+        spoken, _ = self._run({}, instant_top=[])
+        self.assertEqual(spoken, ["Sir, CPU usage has been pinned above 90 "
+                                  "percent for most of the past minute. You "
+                                  "may want to investigate."])
+
+    # ── the pure helpers ─────────────────────────────────────────────────
+    def test_window_culprit_math(self):
+        base = {1: ("chrome.exe", 100.0), 2: ("MsMpEng.exe", 50.0),
+                0: ("System Idle Process", 1000.0)}
+        now = {1: ("chrome.exe", 130.0), 2: ("MsMpEng.exe", 60.0),
+               0: ("System Idle Process", 1400.0),
+               3: ("new.exe", 20.0)}          # started inside the window
+        key, pct = self.mod._window_culprit(base, now, 60.0, own_pid=999,
+                                            ncpu=4)
+        self.assertEqual(key, "chrome.exe")
+        self.assertAlmostEqual(pct, 30.0 / 60.0 / 4 * 100.0)
+        self.assertIsNone(self.mod._window_culprit({}, now, 60.0))
+        self.assertIsNone(self.mod._window_culprit(base, now, 0.0))
+
+    def test_window_culprit_reused_pid_counts_from_zero(self):
+        base = {7: ("old.exe", 500.0)}
+        now = {7: ("other.exe", 12.0)}
+        key, _ = self.mod._window_culprit(base, now, 60.0, own_pid=1, ncpu=1)
+        self.assertEqual(key, "other.exe")
+
+    def test_spoken_names(self):
+        f = self.mod._spoken_process_name
+        self.assertEqual(f("MsMpEng.exe"), "Windows Defender")
+        self.assertEqual(f("TiWorker.exe"), "Windows Update")
+        self.assertEqual(f("chrome.exe"), "Chrome")
+        self.assertEqual(f("FortniteClient-Win64-Shipping.exe"), "Fortnite")
+        self.assertEqual(f("blender.exe"), "Blender")
+        self.assertEqual(f("SomeTool.EXE"), "SomeTool")
+        self.assertEqual(f(self.mod._SELF_KEY), "my own speech recognition")
+        self.assertEqual(f(""), "an unnamed process")
+
+    def test_alert_lines(self):
+        line = self.mod._cpu_alert_line
+        self.assertIsNone(line("msmpeng.exe"))
+        self.assertIsNone(line("searchindexer.exe"))
+        self.assertNotIn("?", line("chrome.exe"))
+        self.assertIn("Chrome appears to be the culprit", line("chrome.exe"))
+
+    def test_top_processes_marks_jarvis_itself(self):
+        own = os.getpid()
+
+        def _proc(name, cpu, pid):
+            p = mock.MagicMock()
+            p.pid = pid
+            p.info = {"name": name}
+            p.cpu_percent.side_effect = [0.0, cpu]
+            return p
+        fake = mock.MagicMock()
+        fake.process_iter.return_value = [_proc("python.exe", 70.0, own),
+                                          _proc("python.exe", 5.0, own + 1)]
+        fake.NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+        fake.AccessDenied = type("AccessDenied", (Exception,), {})
+        with mock.patch.object(self.mod, "_HAS_PSUTIL", True), \
+             mock.patch.object(self.mod, "psutil", fake), \
+             mock.patch.object(self.mod.time, "sleep"):
+            top = self.mod._top_processes(2)
+        self.assertEqual(top[0], (self.mod._SELF_KEY, 70.0))
+        self.assertEqual(top[1], ("python.exe", 5.0))
 
 
 if __name__ == "__main__":

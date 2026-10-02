@@ -9,6 +9,17 @@ Background monitor:
   Polls CPU + RAM every 5 seconds. If CPU stays above CPU_ALERT_PCT for
   CPU_ALERT_SUSTAIN_SECONDS, or RAM goes above RAM_ALERT_PCT at any sample,
   queues a spoken alert. Cooldown prevents repeats.
+
+  The CPU culprit (2026-10-02) is the process that used the most CPU over the
+  WHOLE window (per-process CPU time at the window's first high sample vs at
+  the alert), named the way he would say it ("Windows Defender", "Chrome",
+  never "MsMpEng.exe"). Routine Windows maintenance (a Defender scan, Search
+  indexing, Windows Update) is logged, not announced; JARVIS's own process is
+  "my own speech recognition". Live 2026-10-01: "MsMpEng.exe appears to be the
+  culprit. You may want to investigate" over a show at 18:14:56 (a routine
+  Defender scan), and "python.exe ..." at 22:06:12 (JARVIS itself) - each named
+  from one 0.5 s sample taken after the window. The spoken alert waits for the
+  owner like every queued line (the presence hold in _speak_pending).
 """
 import json
 import logging
@@ -46,6 +57,153 @@ _speech_lock = threading.Lock()
 _alert_lock = threading.Lock()
 _last_cpu_alert_at = [0.0]
 _last_ram_alert_at = [0.0]
+
+# ─── naming the CPU culprit (2026-10-02) ─────────────────────────────────
+# The key _top_processes / _window_culprit use for JARVIS's own process.
+_SELF_KEY = "__jarvis__"
+# Image name (lower-case) -> how he would say it.
+_FRIENDLY_PROCESS_NAMES = {
+    "msmpeng.exe": "Windows Defender",
+    "mpdefendercoreservice.exe": "Windows Defender",
+    "nissrv.exe": "Windows Defender",
+    "mssense.exe": "Windows Defender",
+    "searchindexer.exe": "Windows Search indexing",
+    "searchprotocolhost.exe": "Windows Search indexing",
+    "searchfilterhost.exe": "Windows Search indexing",
+    "tiworker.exe": "Windows Update",
+    "trustedinstaller.exe": "Windows Update",
+    "mousocoreworker.exe": "Windows Update",
+    "usoclient.exe": "Windows Update",
+    "wuauclt.exe": "Windows Update",
+    "sihclient.exe": "Windows Update",
+    "dismhost.exe": "Windows Update",
+    "compattelrunner.exe": "Windows telemetry",
+    "defrag.exe": "the drive optimiser",
+    "chrome.exe": "Chrome",
+    "msedge.exe": "Edge",
+    "msedgewebview2.exe": "an Edge web view",
+    "firefox.exe": "Firefox",
+    "ms-teams.exe": "Teams",
+    "teams.exe": "Teams",
+    "explorer.exe": "File Explorer",
+    "dwm.exe": "the desktop compositor",
+    "code.exe": "VS Code",
+    "claude.exe": "the Claude app",
+    "obs64.exe": "OBS",
+    "bambu-studio.exe": "Bambu Studio",
+    "bambustudio.exe": "Bambu Studio",
+    "nextcloud.exe": "Nextcloud",
+    "onedrive.exe": "OneDrive",
+    "llama-server.exe": "the local model server",
+    "ollama.exe": "the local model server",
+    "fortniteclient-win64-shipping.exe": "Fortnite",
+}
+# Routine Windows maintenance: a sustained CPU window it causes is LOGGED, not
+# spoken - there is nothing for him to investigate, and it runs whenever the
+# machine is idle (exactly when he is watching a show or away).
+_MAINTENANCE_PROCESSES = frozenset({
+    "msmpeng.exe", "mpdefendercoreservice.exe", "nissrv.exe", "mssense.exe",
+    "searchindexer.exe", "searchprotocolhost.exe", "searchfilterhost.exe",
+    "tiworker.exe", "trustedinstaller.exe", "mousocoreworker.exe",
+    "usoclient.exe", "wuauclt.exe", "sihclient.exe", "dismhost.exe",
+    "compattelrunner.exe", "defrag.exe",
+})
+_IDLE_NAMES = frozenset({"system idle process", "idle"})
+
+
+def _spoken_process_name(name: str) -> str:
+    """How to say a process image name: the friendly map, JARVIS's own process
+    as "my own speech recognition", else the image without ".exe"."""
+    key = (name or "").strip().lower()
+    if key == _SELF_KEY:
+        return "my own speech recognition"
+    if key in _FRIENDLY_PROCESS_NAMES:
+        return _FRIENDLY_PROCESS_NAMES[key]
+    stem = (name or "").strip()
+    if stem.lower().endswith(".exe"):
+        stem = stem[:-4]
+    if stem.islower():
+        stem = stem[:1].upper() + stem[1:]
+    return stem or "an unnamed process"
+
+
+def _is_maintenance(name: str) -> bool:
+    return (name or "").strip().lower() in _MAINTENANCE_PROCESSES
+
+
+def _proc_cpu_snapshot() -> dict:
+    """{pid: (image_name, cpu_seconds)} for every process right now (user +
+    system CPU time). {} when unavailable. Never raises."""
+    if not _HAS_PSUTIL:
+        return {}
+    snap: dict = {}
+    try:
+        for p in psutil.process_iter(["name", "cpu_times"]):
+            try:
+                info = p.info or {}
+                ct = info.get("cpu_times")
+                if ct is None:
+                    continue
+                name = info.get("name") or f"pid {p.pid}"
+                snap[int(p.pid)] = (str(name),
+                                    float(ct.user) + float(ct.system))
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return snap
+
+
+def _window_culprit(base: dict, now: dict, elapsed_s: float, *,
+                    own_pid: int | None = None,
+                    ncpu: int | None = None) -> tuple | None:
+    """(name_key, avg_pct) for the process image that used the most CPU
+    between two _proc_cpu_snapshot()s taken elapsed_s apart - averaged over
+    the window, not one instant. avg_pct is a share of the whole machine
+    (cpu_percent's scale). JARVIS's own pid is keyed _SELF_KEY; a process that
+    started inside the window counts all its CPU time. None when there is
+    nothing to compare. Never raises."""
+    try:
+        if not base or not now or not elapsed_s or elapsed_s <= 0:
+            return None
+        own = os.getpid() if own_pid is None else int(own_pid)
+        if ncpu is None:
+            try:
+                ncpu = int(psutil.cpu_count() or 1)
+            except Exception:
+                ncpu = 1
+        totals: dict = {}
+        for pid, (name, cpu_now) in now.items():
+            prev = base.get(pid)
+            start = prev[1] if (prev is not None and prev[0] == name) else 0.0
+            used = cpu_now - start
+            if used <= 0:
+                continue
+            key = _SELF_KEY if pid == own else name.lower()
+            if key in _IDLE_NAMES:
+                continue
+            totals[key] = totals.get(key, 0.0) + used
+        if not totals:
+            return None
+        key = max(totals, key=totals.get)
+        return key, totals[key] / float(elapsed_s) / max(1, int(ncpu)) * 100.0
+    except Exception:
+        return None
+
+
+def _cpu_alert_line(culprit_key: str | None) -> str | None:
+    """The spoken sustained-CPU alert, or None when the culprit is routine
+    Windows maintenance (log-only)."""
+    head = ("Sir, CPU usage has been pinned above 90 percent for most of the "
+            "past minute")
+    if not culprit_key:
+        return head + ". You may want to investigate."
+    if _is_maintenance(culprit_key):
+        return None
+    if culprit_key == _SELF_KEY:
+        return head + " — mostly my own speech recognition."
+    return (f"{head} — {_spoken_process_name(culprit_key)} appears to be the "
+            f"culprit. You may want to investigate.")
 
 
 def _claim_shared_ram_alert(now: float) -> bool:
@@ -122,10 +280,13 @@ def _top_processes(n: int = 3) -> list[tuple[str, float]]:
         procs.append(p)
     time.sleep(0.5)
     rated = []
+    own = os.getpid()
     for p in procs:
         try:
             cpu = p.cpu_percent(None)
             name = p.info.get("name") or f"pid {p.pid}"
+            if getattr(p, "pid", None) == own:
+                name = _SELF_KEY      # JARVIS itself, not "python.exe"
             rated.append((name, cpu))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -187,10 +348,14 @@ def _build_report() -> str:
     )
     if top:
         primary = top[0][0]
+        # No closing period: the return below ends this sentence (it used to
+        # read "the primary offender.. C drive has ...").
         if "chrome" in primary.lower():
-            cpu_ram += f". Chrome is, as usual, the primary offender."
+            cpu_ram += ". Chrome is, as usual, the primary offender"
+        elif primary == _SELF_KEY:
+            cpu_ram += ". Most of that is my own speech recognition"
         else:
-            cpu_ram += f". {primary} is the primary offender."
+            cpu_ram += f". {_spoken_process_name(primary)} is the primary offender"
 
     # Sentence 3 — disk + network
     extras = []
@@ -216,6 +381,9 @@ def _monitor_loop():
 
     # (timestamp, was_high) — pruned to last CPU_ALERT_SUSTAIN_SECONDS each tick.
     cpu_samples: deque[tuple[float, bool]] = deque()
+    # (timestamp, _proc_cpu_snapshot()) taken at each HIGH sample, pruned the
+    # same way: the oldest one is the culprit baseline for the window.
+    proc_snaps: deque[tuple[float, dict]] = deque()
     while True:
         try:
             cpu_pct = psutil.cpu_percent(interval=POLL_INTERVAL_SECONDS)
@@ -223,9 +391,15 @@ def _monitor_loop():
             now = time.time()
 
             cpu_samples.append((now, cpu_pct >= CPU_ALERT_PCT))
+            if cpu_pct >= CPU_ALERT_PCT:
+                snap = _proc_cpu_snapshot()
+                if snap:
+                    proc_snaps.append((now, snap))
             cutoff = now - CPU_ALERT_SUSTAIN_SECONDS
             while cpu_samples and cpu_samples[0][0] < cutoff:
                 cpu_samples.popleft()
+            while proc_snaps and proc_snaps[0][0] < cutoff:
+                proc_snaps.popleft()
 
             # Only evaluate once the window is mostly filled, so we don't alert
             # off a single sample at startup.
@@ -235,18 +409,32 @@ def _monitor_loop():
                 high_count = sum(1 for _, h in cpu_samples if h)
                 if high_count / len(cpu_samples) >= CPU_HIGH_SAMPLE_RATIO:
                     if (now - _last_cpu_alert_at[0]) > ALERT_COOLDOWN_SECONDS:
-                        top = _top_processes(1)
-                        culprit = (f" — {top[0][0]} appears to be the culprit"
-                                   if top else "")
-                        _enqueue_speech(
-                            f"Sir, CPU usage has been pinned above 90 percent "
-                            f"for most of the past minute{culprit}. You may "
-                            f"want to investigate."
-                        )
+                        # The culprit is averaged over the window; one
+                        # instant's top process only when no baseline exists.
+                        culprit = None
+                        if proc_snaps:
+                            base_ts, base_snap = proc_snaps[0]
+                            culprit = _window_culprit(base_snap,
+                                                      _proc_cpu_snapshot(),
+                                                      now - base_ts)
+                        if culprit is None:
+                            top = _top_processes(1)
+                            culprit = ((top[0][0].lower(), top[0][1])
+                                       if top else None)
+                        key = culprit[0] if culprit else None
+                        line = _cpu_alert_line(key)
+                        if line:
+                            _enqueue_speech(line)
+                        else:
+                            print(f"  [sysmon] CPU pinned for the past minute by "
+                                  f"{_spoken_process_name(key)} ({key}, "
+                                  f"{culprit[1]:.0f}% avg) — routine maintenance, "
+                                  f"not announced")
                         with _alert_lock:
                             _last_cpu_alert_at[0] = now
                         # Clear so the next alert needs a fresh window of evidence.
                         cpu_samples.clear()
+                        proc_snaps.clear()
 
             # RAM single-sample check
             if ram_pct >= RAM_ALERT_PCT:
