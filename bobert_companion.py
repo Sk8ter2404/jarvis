@@ -24524,6 +24524,35 @@ def _open_url_offscreen_capture(url: str, page_load_wait: float = 6.0) -> tuple[
 
     time.sleep(page_load_wait)
 
+    # Chrome can replace the window found at spawn with another top-level
+    # window while the page loads (live 2026-10-01: GetWindowRect raised
+    # 1400 'Invalid window handle' and check_credits failed). Adopt a NEW
+    # window only if it is already parked off-screen - that one came from
+    # this launch's --window-position. Anything on a real monitor may be a
+    # window the owner just opened, so it is never captured or closed.
+    def _alive(hwnd) -> bool:
+        try:
+            return bool(win32gui.IsWindow(hwnd))
+        except Exception:
+            return False
+
+    def _parked(hwnd) -> bool:
+        try:
+            left, top, _r, _b = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            return False
+        return left >= _OFFSCREEN_X // 2 or top <= _OFFSCREEN_Y // 2
+
+    if not _alive(target_hwnd):
+        replacement = next(
+            (h for h in _enum_chrome_hwnds() - pre if _alive(h) and _parked(h)),
+            None)
+        if replacement is None:
+            print("  [offscreen] capture window closed while the page loaded")
+            return None, "capture_window_closed"
+        print("  [offscreen] capture window was replaced while loading — using the new one")
+        target_hwnd = replacement
+
     png_bytes: bytes | None = None
     try:
         left, top, right, bot = win32gui.GetWindowRect(target_hwnd)
