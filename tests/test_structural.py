@@ -71,6 +71,10 @@ _IMPORT_LIGHT_CORE = (
     # A yes to JARVIS's own offer (2026-10-02): stdlib + core.yes_no,
     # imported at monolith import time.
     "core.offer_reply",
+    # The verified streaming links, the opened-by-JARVIS ledger and the
+    # monitor geometry (2026-10-02 streaming-control fixes): stdlib-only,
+    # imported at monolith import time and by core.dispatcher.
+    "core.streaming_search", "core.opened_ledger", "core.monitor_geometry",
 )
 
 
