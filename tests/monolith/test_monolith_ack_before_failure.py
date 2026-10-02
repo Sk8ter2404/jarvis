@@ -172,11 +172,12 @@ class FollowupRoundTests(_AckBase):
     def test_followup_ack_is_kept_when_nothing_would_report_it(self):
         # The same (action, result) already failed this chain, so the loop
         # stops after this round: dropping the acknowledgement would leave
-        # the round silent. It is spoken as before.
+        # the round silent. It is spoken as before - and since the failure
+        # was never reported, the honest close-out (NEW #6) now says so.
         self.followup.side_effect = [
             f"{_ACK} [ACTION: rover_explore, 60]", _FOLLOWUP, ""]
         self._run(f"[ACTION: rover_explore, 60] {_ACK}")
-        self.assertEqual(self.spoken, [_ACK])
+        self.assertEqual(self.spoken, [_ACK, self.bc._CLOSE_OUT_GENERIC])
 
 
 class StreamedAckTests(_AckBase):

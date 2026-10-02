@@ -75,6 +75,7 @@ from typing import Iterable, Optional
 
 __all__ = [
     "find_unverified_claim",
+    "is_progress_only",
     "looks_like_question",
     "strip_ack_preface",
 ]
@@ -531,6 +532,55 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
         # A summary of this turn's results, or a filler preface on an answer.
         return None
     return phrase
+
+
+# "I'm running the numbers now, sir" / "I am still reading the page": JARVIS
+# narrating its own LOOK-UP work in progress. A short list of work verbs on
+# purpose - "I'm playing it now, sir" reports a result, it is not a promise.
+_WORK_PROGRESS_RE = re.compile(
+    r"^(?:i'?m|i\s+am)\s+(?:now\s+|just\s+|currently\s+|still\s+|already\s+)?"
+    r"(?:running|working|checking|looking|reading|searching|scanning|"
+    r"calculating|computing|crunching|cross[-\s]?referencing|analy[sz]ing|"
+    r"reviewing|processing|gathering|pulling|fetching|digging|trying|"
+    r"attempting|thinking|compiling|going\s+through)\b")
+# A promise glued onto content ("the printer is offline, I'll keep trying")
+# is split off so the content still counts.
+_PROMISE_SPLIT_RE = re.compile(
+    r"(?:,\s*|\s+and\s+|\s+but\s+)"
+    r"(?=(?:i'?ll|i\s+will|let\s+me|i'?m\s+going\s+to)\b)")
+_DIGIT_RE = re.compile(r"\d")
+
+
+def is_progress_only(text: str) -> bool:
+    """True when ``text`` tells the owner nothing beyond "I'm on it": it is
+    empty, or every clause is a pending acknowledgement ("On it, sir"), a
+    promise of a further step ("I'll have those results for you in a
+    moment", "Let me take a look", "One moment") or narration of look-up work
+    in progress ("I'm running the numbers now"). False as soon as one clause
+    carries anything else - an answer, a figure, a report ("Done, sir",
+    "Playing it now, sir"), a refusal ("I'm afraid the printer isn't
+    reachable") or a question back to the owner. Used to decide whether a
+    follow-up chain that stopped early owes the owner a close-out line."""
+    if not text or not text.strip():
+        return True
+    for ack, _ack_text, core in _segments(text):
+        if ack == "done":
+            return False
+        if not core:
+            continue
+        if core.endswith("?"):
+            return False
+        for part in _PROMISE_SPLIT_RE.split(core):
+            part = _strip_leadins(part.strip(" ,"))
+            if not part:
+                continue
+            if _DIGIT_RE.search(part):
+                return False
+            if _WORK_PROGRESS_RE.match(part) or _PROMISE_RE.search(part):
+                continue
+            if _substantive(part):
+                return False
+    return True
 
 
 def strip_ack_preface(text: str, user_text: str, *,

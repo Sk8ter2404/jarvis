@@ -31341,9 +31341,17 @@ _CONTINUATION_INTENTS: list[tuple[re.Pattern, str, str]] = [
                 r"(?:screen\s?shot|screen\s+capture)\b",
                 re.IGNORECASE),
      "screenshot", "take a screenshot"),
-    # "search for X" / "google it" / "look that up"
-    (re.compile(r"\b(?:search\s+(?:for\s+|the\s+web\s+(?:for\s+)?)?\S+|"
-                r"google\s+\S+|look\s+(?:that|it|this)\s+up)\b",
+    # "search for X" / "google it" / "look that up" / "run a quick search".
+    # VERB forms only (2026-10-01): the old "search <any word>" also matched
+    # the NOUN "search results" ("I'll have to try a fresh capture … the
+    # search results suggest GGUF"), so a search that had already run was
+    # flagged as dropped and run again - a second identical Google tab.
+    (re.compile(r"\b(?:search\s+(?:for|the\s+web|online|again|it\s+up|"
+                r"that\s+up)\b|"
+                r"(?:run|do|try)\s+(?:a|another)\s+(?:quick\s+|fresh\s+|new\s+)?"
+                r"(?:web\s+|google\s+)?search\b|"
+                r"google\s+(?:it|that|this|them|for|the|a|an|some)\b|"
+                r"look\s+(?:that|it|this|them)\s+up|look\s+up\b)",
                 re.IGNORECASE),
      "web_search", "search the web"),
     # "set a timer" / "start a timer"
@@ -31377,13 +31385,19 @@ def _detect_dropped_steps(reply_text: str,
 
     Only flags actions that (a) are currently registered in ACTIONS — so
     skill-provided actions don't fire false positives when the skill failed
-    to load — and (b) were not already emitted in this reply, and
+    to load — and (b) were not already emitted in this reply NOR run
+    successfully earlier this turn (the grounding ledger, 2026-10-01: live,
+    a web_search that had run 80 s earlier was "missing" and ran again), and
     (c) appear within _CONTINUATION_WINDOW characters after an explicit
     future-tense marker like "I'll" / "let me" / "then I'll"."""
     prose = _ACTION_RE.sub(" ", reply_text)
     marker_ends = [m.end() for m in _FUTURE_MARKER_RE.finditer(prose)]
     if not marker_ends:
         return []
+    try:
+        emitted_actions = set(emitted_actions) | set(_turn_actions_ran())
+    except Exception:
+        emitted_actions = set(emitted_actions or ())
     # ALIAS-AWARE satisfaction (2026-07-08): the LLM may back a promised step
     # with a REGISTERED ALIAS of the canonical action — a different name bound
     # to the SAME handler fn in ACTIONS (e.g. 'grab_screen' aliasing
@@ -31506,6 +31520,113 @@ def _result_hold_cut(reply: str, cleaned: str, cut: int, name: str) -> str:
         return cleaned
 
 
+# ── One web page per look-up (NEW #6, 2026-10-01) ───────────────────────────
+# Live 2026-10-01 21:00:41: the fifth follow-up round re-ran the IDENTICAL
+# web_search of 20:59:13 and a second Google tab opened. The follow-up loop's
+# _loop_actions guard does stop a chain that repeats web_search / open_url,
+# but only AFTER the repeat has run - and once it stops, nothing ever reads
+# the new tab. So within one turn (the grounding ledger's span) a web_search
+# or open_url that already ran in an EARLIER round is refused before it runs,
+# and so is the same one with the same argument twice in one reply. Two
+# different sites in ONE reply ("open GitHub and Gmail") still both open.
+# Outside a turn (the proactive path) the ledger is empty: nothing refused.
+_ONCE_PER_TURN_ACTIONS = ("web_search", "open_url")
+
+
+def _once_per_turn_kind(name) -> str:
+    """'web_search' / 'open_url' when ``name`` is one of them or a registered
+    alias of one (the same handler in ACTIONS); "" otherwise. Never raises."""
+    try:
+        n = str(name or "").strip().lower()
+        if n in _ONCE_PER_TURN_ACTIONS:
+            return n
+        fn = ACTIONS.get(n)
+        if fn is None:
+            return ""
+        for kind in _ONCE_PER_TURN_ACTIONS:
+            if ACTIONS.get(kind) is fn:
+                return kind
+    except Exception:
+        pass
+    return ""
+
+
+def _once_per_turn_arg(arg) -> str:
+    return re.sub(r"\s+", " ", str(arg or "")).strip().lower()
+
+
+def _once_per_turn_refusal(name, arg, ran_before, ran_here) -> str:
+    """The refusal result for a web_search / open_url that must not run
+    again this turn, or "" to let it run. ``ran_before``: action names that
+    ran successfully in EARLIER rounds of this turn; ``ran_here``: (kind,
+    arg) pairs run by the current reply so far. Never raises."""
+    try:
+        kind = _once_per_turn_kind(name)
+        if not kind:
+            return ""
+        if any(_once_per_turn_kind(n) == kind for n in ran_before or ()):
+            return (f"refused: {kind} already ran earlier this turn and its "
+                    f"page is still open - running it again only opens "
+                    f"another tab. Read what is open with see_screen, or "
+                    f"answer from what you have.")
+        if (kind, _once_per_turn_arg(arg)) in (ran_here or ()):
+            return (f"refused: the same {kind} already ran in this reply")
+    except Exception:
+        return ""
+    return ""
+
+
+# ── Honest close-out (NEW #6, 2026-10-01) ───────────────────────────────────
+# Live 2026-10-01 21:00:50: after five follow-up rounds the loop guard stopped
+# the chain; the last thing said was "I'm running the numbers now, sir; I'll
+# have those results for you in a moment." and then nothing - 102.9 s, no
+# answer. When a chain of follow-up rounds is stopped with results still
+# unreported (a loop / repeat guard, or the depth cap) and NOTHING of
+# substance was said this turn - only pending acknowledgements, promises and
+# narration of look-up work (claim_validator.is_progress_only) - one short
+# honest line closes the turn. A turn that said anything real (an answer, a
+# report, a figure, a refusal, a verbatim result), a barged turn, a turn with
+# no follow-up round and a chain that simply finished never get one.
+_CLOSE_OUT_WEB = ("I'm afraid I couldn't get a proper answer out of that, "
+                  "sir — it's still open in your browser.")
+_CLOSE_OUT_GENERIC = "I'm afraid I couldn't finish that one, sir."
+
+
+def _says_something(text) -> bool:
+    """True when ``text`` (as spoken) tells the owner more than "I'm on it".
+    Never raises: on a fault, True (no close-out - the old behaviour)."""
+    try:
+        return not _claim_validator.is_progress_only(str(text or ""))
+    except Exception:
+        return True
+
+
+def _chain_close_out_line(*, cut: str, rounds: int, spoke_substance: bool,
+                          barged: bool) -> str:
+    """The close-out line for a follow-up chain that a guard stopped before
+    it told the owner anything, or "" (see the section comment). Never
+    raises."""
+    try:
+        if barged or not cut or rounds < 1 or spoke_substance:
+            return ""
+        if any(_once_per_turn_kind(n) for n in _turn_actions_ran()):
+            return _CLOSE_OUT_WEB
+        return _CLOSE_OUT_GENERIC
+    except Exception:
+        return ""
+
+
+def _note_once_per_turn_ran(name, arg, result, ran_here) -> None:
+    """Record a successful web_search / open_url of this reply into
+    ``ran_here`` (see _once_per_turn_refusal). Never raises."""
+    try:
+        kind = _once_per_turn_kind(name)
+        if kind and not _action_result_failed(result):
+            ran_here.add((kind, _once_per_turn_arg(arg)))
+    except Exception:
+        pass
+
+
 def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]:
     """
     Find all [ACTION: ...] tokens, execute whitelisted ones, defer risky ones
@@ -31590,6 +31711,10 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # whole turn — follow-ups included. See _reset_see_screen_budget().
 
     results: list[tuple[str, str, bool]] = []
+    # What already ran this turn BEFORE this reply (earlier rounds), and the
+    # once-per-turn actions run by this reply so far - _once_per_turn_refusal.
+    _ran_before_reply = _turn_actions_ran()
+    _once_ran_here: set = set()
     # JARVIS-style objection lines accumulated during this dispatch. Any
     # pushback that fired replaces the LLM's spoken prose so the user hears
     # the objection, not the original "I'll close them all, sir." prelude.
@@ -31683,6 +31808,16 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             results.append((name, f"unknown action: {name}", False))
             return ""
 
+        # One web page per look-up (2026-10-01): a second web_search /
+        # open_url later in the same turn opened a duplicate tab live - see
+        # _once_per_turn_refusal.
+        _again = _once_per_turn_refusal(name, arg, _ran_before_reply,
+                                        _once_ran_here)
+        if _again:
+            print(f"  [action] {name}: {_again}")
+            results.append((name, _again, False))
+            return ""
+
         if _needs_confirmation(name, arg):
             _queue_pending_confirmation(name, arg)
             msg = f"⚠  REQUIRES CONFIRMATION: {name}({arg}) — say 'yes' to proceed"
@@ -31772,6 +31907,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             # this result back pass the claim validators (no-op outside a
             # dispatch; failures are not recorded).
             _note_turn_action_ran(name, res)
+            _note_once_per_turn_ran(name, arg, res, _once_ran_here)
             record_session_action(name, arg)
             # Replay-last-action history. Skip when the replay handler itself
             # is the action so the deque continues to point at the real target.
@@ -37670,8 +37806,11 @@ def _run_llm_dispatch_body(text: str) -> str:
         spoken_text = ""
     elif not _self_voiced_only:
         spoken_text = _apply_quip_layer(spoken_text, action_results)
+    # Honest close-out bookkeeping (NEW #6) - see _chain_close_out_line.
+    _spoke_substance = False
     if spoken_text and not _barged:
         _speak(spoken_text)
+        _spoke_substance = _says_something(spoken_text)
 
     # Speak verbatim-result actions (version_info, system_pulse, …) directly.
     # Their result is a finished sentence the user asked for, but they're not
@@ -37717,6 +37856,11 @@ def _run_llm_dispatch_body(text: str) -> str:
         _max_followup = 8
     if _self_voiced_only:
         current_results = []
+    _spoke_substance = _spoke_substance or bool(_spoke_verbatim)
+    # Why the chain stopped with results still unreported ("" = it did not)
+    # and how many follow-up rounds ran.
+    _chain_cut = ""
+    _followup_rounds = 0
     for depth in range(_max_followup):
         # A self-voiced result is neither news to report nor a failure to
         # explain: the action already said what it had to.
@@ -37743,6 +37887,7 @@ def _run_llm_dispatch_body(text: str) -> str:
             print(f"  [follow-up] action(s) failing repeatedly with the same "
                   f"result ({', '.join(sorted(n for n, _ in _failing_repeat))})"
                   f" — stopping")
+            _chain_cut = "repeating failure"
             break
         _failed_seen |= _failing_now
         # SUCCESS-repeat break (mirror of the failure-repeat break above): if a
@@ -37755,6 +37900,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         if _info_seen and not (_info_now - _info_seen):
             print("  [follow-up] informative result(s) repeating with no new "
                   "progress — stopping")
+            _chain_cut = "no new progress"
             break
         _info_seen |= _info_now
         # Loop detection: actions that should only fire ONCE per chain.
@@ -37772,6 +37918,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         _repeating = {n for n, _ in informative} & _chain_seen & _loop_actions
         if _repeating:
             print(f"  [follow-up] loop detected ({', '.join(_repeating)}) — stopping")
+            _chain_cut = "loop detected"
             break
         # If a terminal action has already run once, don't loop again —
         # the follow-up that reports the balance is the final word.
@@ -37784,6 +37931,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         set_state("thinking")
         _tt("followup_round")
         followup = get_followup_response(informative)
+        _followup_rounds += 1
         if not followup:
             break
         print(f"  JARVIS: {followup}")
@@ -37814,11 +37962,38 @@ def _run_llm_dispatch_body(text: str) -> str:
             pass
         if f_spoken and not _barged:
             _speak(f_spoken)
+            _spoke_substance = _spoke_substance or _says_something(f_spoken)
         # A follow-up reply can itself emit a verbatim-result action (e.g. the
         # LLM chains system_pulse). Voice its result here too, deduped against
         # the follow-up prose just spoken.
         if not _barged:
-            _spoke_verbatim |= _speak_verbatim_results(current_results, f_spoken)
+            _round_verbatim = _speak_verbatim_results(current_results, f_spoken)
+            _spoke_verbatim |= _round_verbatim
+            _spoke_substance = _spoke_substance or bool(_round_verbatim)
+    else:
+        # Depth cap: the last round's results were never read back.
+        if any(not is_self_voiced(n) and (i or _is_failure(r))
+               for (n, r, i) in current_results):
+            _chain_cut = "depth cap"
+    # Honest close-out (NEW #6, 2026-10-01): a chain that stops while the
+    # owner has heard nothing but "On it, sir" and promises must not end in
+    # silence - see _chain_close_out_line.
+    try:
+        _barged = _tts_interrupt_seq[0] != _barge_seq0
+    except Exception:
+        pass
+    _close = _chain_close_out_line(
+        cut=_chain_cut, rounds=_followup_rounds, spoke_substance=_spoke_substance,
+        barged=_barged)
+    if _close:
+        print(f"  [close-out] the chain stopped ({_chain_cut}) with nothing "
+              f"reported to sir — saying so")
+        try:
+            _speak(_close)
+            conversation_history.append({"role": "assistant",
+                                         "content": _close})
+        except Exception as _co_err:
+            print(f"  [close-out] could not speak it: {_co_err}")
     # TRIM after the follow-up chain (2026-07-07 bug-hunt, MED). Each depth
     # iteration appends an assistant message but _call_llm only trims ONCE,
     # BEFORE this loop runs — so a multi-step chain (depth cap 8, agent mode 24)
