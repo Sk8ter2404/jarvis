@@ -155,5 +155,70 @@ class ReturnDrainTests(unittest.TestCase):
         self.assertEqual(op.source_root("x"), "")
 
 
+class ReviewRepairTests(unittest.TestCase):
+    """2026-10-02 review repairs. The recap fold cut the H2D error alert to
+    "While you were away, sir: Slight problem." (printer and error code
+    gone), any drain after a hold said "while you were away" even when he
+    never left (room talk, standby, a speech hold), an urgent alert had no
+    way past the hold, and Whisper's stock outro lines over a video counted
+    as people talking."""
+
+    NOW = 1_000_000.0
+    H2D = ("Slight problem, sir — your H2D appears to be unwell. Error code "
+           "0300-0100 on layer 142.")
+
+    def _e(self, msg, src, age, **extra):
+        return dict({"ts": self.NOW - age, "message": msg, "source": src},
+                    **extra)
+
+    def test_a_stale_printer_alert_is_spoken_whole(self):
+        for src in ("bambu", "bambu_voice_companion", "print_companion"):
+            with self.subTest(src=src):
+                item = self._e(self.H2D, src, 1800)
+                out, dropped, folded = op.plan_return_drain(
+                    [item], now=self.NOW, stale_s=600)
+                self.assertEqual(out, [item])
+                self.assertEqual((dropped, folded), ([], []))
+
+    def test_an_urgent_entry_is_never_folded_or_dropped(self):
+        item = self._e("The Zorblat is on fire, sir.", "wellness", 1800,
+                       urgent=True)
+        out, dropped, folded = op.plan_return_drain([item], now=self.NOW,
+                                                    stale_s=600)
+        self.assertEqual(out, [item])
+        self.assertEqual((dropped, folded), ([], []))
+        self.assertTrue(op.is_urgent(item))
+        self.assertFalse(op.is_urgent(self._e("x", "bambu", 1)))
+        self.assertFalse(op.is_urgent({"urgent": "yes"}))
+        self.assertFalse(op.is_urgent(None))
+
+    def test_a_fragment_is_never_two_words(self):
+        frag = op.recap_fragment("Slight problem, sir — the disk is nearly "
+                                 "full on drive D. Shall I look?")
+        self.assertGreaterEqual(len(frag.split()), 4, frag)
+        self.assertIn("disk is nearly full", frag)
+        self.assertNotIn("sir", frag)
+
+    def test_the_away_wording_only_after_he_was_away(self):
+        items = [self._e("GPU pinned at 100 percent, sir.", "pulse", 1800)]
+        away, _, _ = op.plan_return_drain(items, now=self.NOW, stale_s=600)
+        self.assertTrue(away[0]["message"].startswith("While you were away"))
+        here, _, _ = op.plan_return_drain(items, now=self.NOW, stale_s=600,
+                                          away=False)
+        self.assertTrue(here[0]["message"].startswith("Earlier, sir:"),
+                        here[0]["message"])
+        self.assertNotIn("away", here[0]["message"])
+
+    def test_whisper_stock_lines_are_not_room_talk(self):
+        for noise in ("I'll see you next time.",
+                      "See you in the next video.",
+                      "I'm going to show you what I'm going to show you.",
+                      "Thanks for watching, and please subscribe."):
+            with self.subTest(noise=noise):
+                self.assertFalse(op.counts_as_room_talk(noise))
+        self.assertTrue(op.counts_as_room_talk(
+            "I'll see you at the game next time, then"))
+
+
 if __name__ == "__main__":
     unittest.main()

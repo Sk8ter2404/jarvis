@@ -190,16 +190,27 @@ def _gated_announce(message: str) -> None:
     _direct_enqueue(message)
 
 
-def _direct_enqueue(message: str) -> None:
+def _direct_enqueue(message: str, urgent: bool = False) -> None:
     """Bypass the rate-limit — used for error / FAILED / layer-shift
     callouts where suppressing the alert because a 50% milestone
     happened to fire 90s earlier would be the wrong trade-off.
     Prefer bobert_companion.proactive_announce when reachable so the
-    main listen loop can voice it at the next turn boundary."""
+    main listen loop can voice it at the next turn boundary.
+
+    ``urgent`` (2026-10-02): the problem callouts pass it, so the drain
+    speaks them through the owner-away / room-talk hold
+    (core/owner_presence.is_urgent); a milestone falling back here does
+    not."""
     try:
         bc = importlib.import_module("bobert_companion")
         fn = getattr(bc, "proactive_announce", None)
         if callable(fn):
+            if urgent:
+                try:
+                    fn(message, source="bambu_voice_companion", urgent=True)
+                    return
+                except TypeError:
+                    pass        # an older announcer: say it without the flag
             fn(message, source="bambu_voice_companion")
             return
     except Exception:
@@ -207,6 +218,12 @@ def _direct_enqueue(message: str) -> None:
     bm = _get_bambu_module()
     if bm is not None and hasattr(bm, "_enqueue_speech"):
         try:
+            if urgent:
+                try:
+                    bm._enqueue_speech(message, urgent=True)
+                    return
+                except TypeError:
+                    pass
             bm._enqueue_speech(message)
             return
         except Exception:
@@ -221,7 +238,10 @@ def _direct_enqueue(message: str) -> None:
                 data = []
         if not isinstance(data, list):
             data = []
-        data.append({"ts": time.time(), "message": message})
+        entry = {"ts": time.time(), "message": message}
+        if urgent:
+            entry["urgent"] = True
+        data.append(entry)
         _atomic_write_json(_SPEECH_QUEUE, data)
     except Exception as e:
         print(f"  [bambu_voice] speech-queue write failed ({e}); alert: {message}")
@@ -350,7 +370,8 @@ def _process_snapshot(snapshot: dict, gcode_state: str) -> None:
         layer_phrase = f" on layer {layer}" if layer else ""
         _direct_enqueue(
             f"Layer shift detected{layer_phrase}, sir — "
-            f"I'm afraid we have a problem."
+            f"I'm afraid we have a problem.",
+            urgent=True,
         )
 
     # AMS issue (non-runout fault). bambu_print_announcer already
@@ -360,7 +381,8 @@ def _process_snapshot(snapshot: dict, gcode_state: str) -> None:
         _announced_ams_error[0] = True
         _direct_enqueue(
             "I'm afraid the AMS appears to be unwell, sir — "
-            "you may want to check the spools."
+            "you may want to check the spools.",
+            urgent=True,
         )
 
     # FAILED — distinct from bambu_monitor's "Print has failed at layer
@@ -370,7 +392,8 @@ def _process_snapshot(snapshot: dict, gcode_state: str) -> None:
         layer_phrase = f" at layer {layer}" if layer else ""
         _direct_enqueue(
             f"I'm afraid the print has failed{layer_phrase}, sir. "
-            f"You'll want to take a look."
+            f"You'll want to take a look.",
+            urgent=True,
         )
 
 

@@ -454,17 +454,27 @@ _print_start_ts: list           = [0.0]
 _print_initial_estimate_min: list = [None]
 
 
-def _enqueue_speech(message: str) -> None:
+def _enqueue_speech(message: str, urgent: bool = False) -> None:
     """Route a proactive announcement through bobert_companion's public
     proactive_announce() API when available, falling back to a direct atomic
     write against pending_speech.json if the parent module hasn't loaded yet
     (e.g. unit test, import-time skill registration before bobert_companion
-    finishes initialising)."""
+    finishes initialising).
+
+    ``urgent`` (2026-10-02): an error code or a failed print. The drain
+    speaks it through the owner-away / room-talk hold instead of letting it
+    wait behind his own video (core/owner_presence.is_urgent)."""
     try:
         import importlib
         bc = importlib.import_module("bobert_companion")
         announcer = getattr(bc, "proactive_announce", None)
         if callable(announcer):
+            if urgent:
+                try:
+                    announcer(message, source="bambu", urgent=True)
+                    return
+                except TypeError:
+                    pass        # an older announcer: say it without the flag
             announcer(message, source="bambu")
             return
     except Exception:
@@ -480,7 +490,10 @@ def _enqueue_speech(message: str) -> None:
                     data = json.load(f)
             except Exception:
                 data = []
-        data.append({"ts": time.time(), "message": message})
+        entry = {"ts": time.time(), "message": message}
+        if urgent:
+            entry["urgent"] = True
+        data.append(entry)
         try:
             _atomic_write_json(_SPEECH_QUEUE, data)
         except Exception as e:
@@ -975,7 +988,8 @@ def _handle_state_change() -> None:
                 layer_str = f" on layer {layer}" if layer else ""
                 _enqueue_speech(
                     f"Slight problem, sir — your H2D appears to be unwell. "
-                    f"Error code {key}{layer_str}."
+                    f"Error code {key}{layer_str}.",
+                    urgent=True,
                 )
                 rstate[err_key] = {"ts": time.time(), "fname": fname}
                 _save_reminder_persistence(rstate)
@@ -994,7 +1008,8 @@ def _handle_state_change() -> None:
                 layer_str = f" at layer {layer}" if layer else ""
                 _enqueue_speech(
                     f"I'm afraid the print has failed{layer_str}, sir. "
-                    "You'll want to check the printer."
+                    "You'll want to check the printer.",
+                    urgent=True,
                 )
                 rstate[failed_key] = {"ts": time.time(), "fname": fname}
                 _save_reminder_persistence(rstate)

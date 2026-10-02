@@ -12842,7 +12842,8 @@ def proactive_announce(message: str, source: str = "skill",
                        volume_scale: float = 1.0,
                        supersede: str | None = None,
                        dedupe_key: str | None = None,
-                       offer: bool = False) -> bool:
+                       offer: bool = False,
+                       urgent: bool = False) -> bool:
     """Public proactive-speech API for skills.
 
     Skills that want JARVIS to speak something unprompted (print milestones,
@@ -12883,6 +12884,11 @@ def proactive_announce(message: str, source: str = "skill",
     wake-word-mode form of "shall I ...?", skills/anticipation_engine). The
     drainer records it in conversation_history like a question, so his
     "JARVIS, do it" reaches the LLM with the offer in context.
+
+    `urgent` (2026-10-02) marks a line that must not wait: a print failure,
+    a printer error code, a layer shift. The speech-queue drain speaks it
+    through the owner-away and room-talk holds and never folds it into a
+    recap (core/owner_presence.is_urgent). Focus mode still holds it.
     """
     # ── FOCUS MODE GATE ──────────────────────────────────────────────────────
     # This is the whole point of focus / do-not-disturb: while the owner is
@@ -12947,6 +12953,8 @@ def proactive_announce(message: str, source: str = "skill",
             entry["dedupe_key"] = str(dedupe_key)
         if offer:
             entry["offer"] = True
+        if urgent:
+            entry["urgent"] = True
         if supersede:
             _before = len(data)
             data = [e for e in data
@@ -21234,15 +21242,79 @@ _last_room_talk_at = [0.0]
 _presence_gate_armed = [False]
 # The last hold reason logged by the drain, so a held queue logs once per kind.
 _presence_hold_logged = [""]
+# True once a drain held the queue because the owner was AWAY; the return
+# drain's recap says "While you were away" only then (2026-10-02 - after room
+# talk or standby he never left). Consumed by the drain that speaks them.
+_presence_away_seen = [False]
 
 
-def _note_room_talk(text: str) -> None:
-    """Main loop: a non-wake capture was dropped at the background-audio gate.
-    Three or more words = the room is talking (a lone "Thank you." is Whisper
-    noise). Never raises."""
+# The voice check behind a room-talk stamp while the PC plays audio runs off
+# the main loop, one at a time (True while one is running).
+_room_talk_voice_busy = [False]
+
+
+def _room_talk_spawn(fn, *args) -> None:
+    """Run ``fn(*args)`` on a short-lived daemon thread (a test seam)."""
+    threading.Thread(target=fn, args=args, name="room-talk-voice",
+                     daemon=True).start()
+
+
+def _room_talk_voice_check(audio, sr: int, stamp_at: float) -> None:
+    """Off the main loop: stamp room talk only when the capture is the
+    owner's own voice (he is talking over his media). Never raises."""
     try:
-        if _owner_presence_mod.counts_as_room_talk(text):
-            _last_room_talk_at[0] = _proactive_mono()
+        voice, _score = _learn_voice_verdict(
+            audio, sr, reject_below=float(MEDIA_VOICE_GATE_REJECT_BELOW))
+        if voice == _learn_gate_mod.OWNER:
+            _last_room_talk_at[0] = max(float(_last_room_talk_at[0] or 0.0),
+                                        float(stamp_at))
+    except Exception:
+        pass
+    finally:
+        _room_talk_voice_busy[0] = False
+
+
+def _note_room_talk(text: str, conf=None) -> None:
+    """Main loop: a non-wake capture was dropped at the background-audio gate.
+    Three or more words = the room is talking (a lone "Thank you." or one of
+    Whisper's stock outro lines is noise). Never raises.
+
+    2026-10-02 review repair: in wake-word mode every lyric and video line was
+    dropped here and stamped, so while his own music or a video played every
+    queued line waited until 45 s after it stopped. Now a line the speech
+    filter rejects (``conf``: Whisper's scores) is never room talk, and while
+    the PC is playing audio (the capture's media probe, else the media
+    session) a line counts only in the owner's own voice - checked off the
+    main loop (_room_talk_voice_check)."""
+    try:
+        if not _owner_presence_mod.counts_as_room_talk(text):
+            return
+        if conf is not None:
+            try:
+                ok, _why = is_valid_speech(
+                    text, conf, peak_rms=float(_last_recording_peak or 0.0))
+            except Exception:
+                ok = True
+            if not ok:
+                return
+        stamp_at = _proactive_mono()
+        audio, sr = _last_capture_audio, int(_last_capture_sr or 0)
+        if audio is None or sr <= 0:
+            _last_room_talk_at[0] = stamp_at
+            return
+        peak = _media_probe_result(audio, wait_s=0.0)
+        smtc = _smtc_media_playing() if peak is None else False
+        if not _media_gate.audio_playing(peak, smtc,
+                                         threshold=float(MEDIA_VOICE_GATE_PEAK)):
+            _last_room_talk_at[0] = stamp_at
+            return
+        if _room_talk_voice_busy[0]:
+            return
+        _room_talk_voice_busy[0] = True
+        try:
+            _room_talk_spawn(_room_talk_voice_check, audio, sr, stamp_at)
+        except Exception:
+            _room_talk_voice_busy[0] = False
     except Exception:
         pass
 
@@ -37845,9 +37917,10 @@ def _pending_source_in(item, sources) -> bool:
         return False
 
 
-def _pending_has_source(sources) -> bool:
-    """Peek (no claim): does the speech queue hold an entry from ``sources``?
-    True on any read error, so the real drain decides. Never raises."""
+def _pending_has_source(sources, urgent: bool = False) -> bool:
+    """Peek (no claim): does the speech queue hold an entry from ``sources``
+    (or, with ``urgent``, any entry flagged urgent)? True on any read error,
+    so the real drain decides. Never raises."""
     try:
         with open(PENDING_SPEECH_PATH, "r", encoding="utf-8") as f:
             raw = f.read().strip()
@@ -37856,7 +37929,9 @@ def _pending_has_source(sources) -> bool:
         items, _ = json.JSONDecoder().raw_decode(raw)
         if not isinstance(items, list):
             return True
-        return any(_pending_source_in(e, sources) for e in items)
+        return any(_pending_source_in(e, sources)
+                   or (urgent and _owner_presence_mod.is_urgent(e))
+                   for e in items)
     except FileNotFoundError:
         return False
     except Exception:
@@ -37922,6 +37997,8 @@ def _speak_pending(only_sources=None):
     if _speech_hold_active():
         return False
     _return_drain = False
+    _return_away = False
+    _hold_urgent = False
     if only_sources is None:
         # Standby (only_sources) leaves the governor's held line where it is,
         # exactly as before: it would only be held again below.
@@ -37941,14 +38018,23 @@ def _speak_pending(only_sources=None):
             if _presence_hold_logged[0] != _kind:
                 _presence_hold_logged[0] = _kind
                 print(f"  [pending] holding queued speech: {_hold}")
+            if _kind == "owner away":
+                _presence_away_seen[0] = True
             only_sources = _owner_presence_mod.EXEMPT_SOURCES
+            # An URGENT line (a print failure, a printer error code) is
+            # spoken through the hold (2026-10-02, core/owner_presence.
+            # is_urgent): it used to wait behind his own video indefinitely.
+            _hold_urgent = True
         else:
             _presence_hold_logged[0] = ""
             _return_drain = bool(PRESENCE_HOLD_ENABLED
                                  and _presence_gate_armed[0])
+            _return_away = bool(_presence_away_seen[0])
+            _presence_away_seen[0] = False
     # Standby runs this every pass (as often as every 0.3 s while muted):
     # claim and rewrite the queue only when something in it may be spoken.
-    if only_sources is not None and not _pending_has_source(only_sources):
+    if only_sources is not None and not _pending_has_source(
+            only_sources, urgent=_hold_urgent):
         return False
     consume_path = PENDING_SPEECH_PATH + ".consuming"
     try:
@@ -37984,7 +38070,8 @@ def _speak_pending(only_sources=None):
         # become ONE short "While you were away" recap, and a stale
         # moment-line (a break nudge, a habit offer) is simply over.
         items, _dropped, _folded = _owner_presence_mod.plan_return_drain(
-            items, now=time.time(), stale_s=PRESENCE_STALE_STATUS_S)
+            items, now=time.time(), stale_s=PRESENCE_STALE_STATUS_S,
+            away=_return_away)
         for _e in _dropped:
             print(f"  [pending] expired while away ({_e.get('source', '?')}): "
                   f"{str(_e.get('message', ''))[:80]}")
@@ -38015,8 +38102,10 @@ def _speak_pending(only_sources=None):
     held: list = []   # not in only_sources: kept for the full (wake) drain
     back: list = []   # held + deferred, in queue order, requeued below
     for item in items:
-        if only_sources is not None and not _pending_source_in(item,
-                                                               only_sources):
+        if (only_sources is not None
+                and not _pending_source_in(item, only_sources)
+                and not (_hold_urgent
+                         and _owner_presence_mod.is_urgent(item))):
             held.append(item)
             back.append(item)
             continue
@@ -41091,7 +41180,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     # The room is talking: queued proactive lines wait
                     # ROOM_TALK_HOLD_S (_presence_hold_reason) instead of
                     # talking over it (live 21:16:10).
-                    _note_room_talk(text)
+                    _note_room_talk(text, conf)
                     # Alexa-mode ambient learning: we won't RESPOND to this gated
                     # (non-wake) utterance, but if ambient-listening is on we still
                     # passively LEARN from it — feed the transcript to the extractor

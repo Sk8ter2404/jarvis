@@ -365,6 +365,35 @@ class BambuStateChangeTests(unittest.TestCase):
         self.assertTrue(hit)
         self.assertIn("layer 142", hit[0])
 
+    def _run_calls(self):
+        with mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            self.mod._handle_state_change()
+        return enq.call_args_list
+
+    def test_error_and_failure_lines_are_queued_urgent(self):
+        # Review repair (2026-10-02): these waited behind the presence /
+        # room-talk hold like a status line (his own video kept the hold up).
+        self.mod._last_gcode_state[0] = "RUNNING"
+        self.mod._current_print_filename[0] = "cube"
+        self.mod._announced_start[0] = True
+        self._set(gcode_state="RUNNING", filename="cube.3mf",
+                  print_error=8451, layer_num=142)
+        err = [c for c in self._run_calls() if "Error code 8451" in c.args[0]]
+        self.assertTrue(err)
+        self.assertIs(err[0].kwargs.get("urgent"), True)
+        self._set(gcode_state="FAILED", filename="cube.3mf", layer_num=150)
+        bad = [c for c in self._run_calls() if "failed" in c.args[0].lower()]
+        self.assertTrue(bad)
+        self.assertIs(bad[0].kwargs.get("urgent"), True)
+
+    def test_a_milestone_is_not_urgent(self):
+        self.mod._last_gcode_state[0] = "IDLE"
+        self._set(gcode_state="RUNNING", filename="cube.3mf", mc_percent=0,
+                  mc_remaining=252)
+        calls = [c for c in self._run_calls() if "Print started" in c.args[0]]
+        self.assertTrue(calls)
+        self.assertFalse(calls[0].kwargs.get("urgent", False))
+
     def test_inflight_error_deduped(self):
         self.mod._last_gcode_state[0] = "RUNNING"
         self.mod._current_print_filename[0] = "cube"
@@ -653,6 +682,25 @@ class BambuEnqueueSpeechTests(unittest.TestCase):
         bc.proactive_announce.assert_called_once()
         self.assertEqual(bc.proactive_announce.call_args.kwargs.get("source"),
                          "bambu")
+
+    def test_urgent_reaches_proactive_announce(self):
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = mock.MagicMock(return_value=True)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            self.mod._enqueue_speech("the print has failed, sir", urgent=True)
+        self.assertIs(bc.proactive_announce.call_args.kwargs.get("urgent"),
+                      True)
+
+    def test_urgent_with_an_older_announcer_still_speaks(self):
+        calls = []
+
+        def _old(message, source="skill"):
+            calls.append((message, source))
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = _old
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            self.mod._enqueue_speech("the print has failed, sir", urgent=True)
+        self.assertEqual(calls, [("the print has failed, sir", "bambu")])
 
     def test_announce_raises_falls_through_to_file(self):
         # proactive_announce IS present but raises → the except swallows it and

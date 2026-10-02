@@ -35,11 +35,26 @@ import re
 EXEMPT_SOURCES = frozenset({"timer", "schedule", "promise", "guard"})
 
 # Lines he asked for that keep their value however late they are: a stale one
-# is spoken whole, never reduced to a recap fragment.
+# is spoken whole, never reduced to a recap fragment. The printer's lines too
+# (2026-10-02 review repair): the fold cut "Slight problem, sir - your H2D
+# appears to be unwell. Error code 0300-0100 on layer 142." to "Slight
+# problem." - the printer and the code were the whole point.
 KEEP_WHOLE_SOURCES = frozenset({
     "morning", "arrival", "evening", "daily", "news", "recap", "handoff",
     "weekly_digest_briefing", "anticipation_briefing", "focus", "focus_mode",
+    "bambu", "bambu_voice_companion", "print_companion",
 })
+
+
+def is_urgent(entry) -> bool:
+    """A queued entry flagged ``urgent`` (proactive_announce(urgent=True):
+    a print failure, a printer error code, a layer shift) is spoken through
+    the presence and room-talk holds and is never folded or expired - like
+    the EXEMPT_SOURCES, but per line rather than per skill (2026-10-02)."""
+    try:
+        return isinstance(entry, dict) and entry.get("urgent") is True
+    except Exception:
+        return False
 
 # Lines about a MOMENT (a nudge to take a break, a habit offer, a greeting, a
 # banter line): once stale they are simply over, so they are dropped (with a
@@ -106,14 +121,45 @@ def room_talk_recent(talk_age_s, window_s: float) -> bool:
     return _fresh(talk_age_s, window_s)
 
 
+# Whisper's stock lines - the outro of every video it was trained on - that
+# it writes over music, a reel or room noise (live 22:00-22:24 on 2026-10-01:
+# "I'll see you next time." 7 times, "I'm going to show you what I'm going to
+# show you." about 7 times). The whole line is the phrase, nothing more.
+_STOCK_LINE_RE = re.compile(
+    r"^(?:(?:and\s+)?(?:i'?ll\s+|we'?ll\s+)?see\s+you\s+(?:guys\s+)?"
+    r"(?:next\s+time|in\s+the\s+next\s+(?:one|video|episode)|soon|later)|"
+    r"(?:thanks|thank\s+you)\s+(?:so\s+much\s+)?for\s+watching"
+    r"(?:\s+and\s+(?:please\s+)?(?:like\s+and\s+)?subscribe)?|"
+    r"(?:please\s+)?(?:like\s+and\s+)?subscribe(?:\s+to\s+(?:my|the|our)"
+    r"\s+channel)?|bye(?:\s+bye)?(?:\s+everyone)?)$")
+
+
+def _self_repeating(words: list) -> bool:
+    """One phrase said twice ("I'm going to show you what I'm going to show
+    you"): the line's first run of three or more words comes back later."""
+    n = len(words)
+    for size in range(min(6, n // 2), 2, -1):
+        head = words[:size]
+        for i in range(size, n - size + 1):
+            if words[i:i + size] == head:
+                return True
+    return False
+
+
 def counts_as_room_talk(text: str) -> bool:
     """A dropped non-wake capture is room talk when it holds at least three
     words - "Thank you." / "You" / "Bye bye." are the classic Whisper noise
     hallucinations on a quiet room, not a conversation (and a conversation
-    that is really happening produces longer lines within the hold window)."""
+    that is really happening produces longer lines within the hold window).
+    Whisper's stock outro lines and a line that repeats its own opening are
+    noise too (2026-10-02)."""
     try:
-        words = re.findall(r"[A-Za-z0-9']+", text or "")
-        return len(words) >= 3
+        words = [w.lower() for w in re.findall(r"[A-Za-z0-9']+", text or "")]
+        if len(words) < 3:
+            return False
+        if _STOCK_LINE_RE.match(" ".join(words).replace(",", "")):
+            return False
+        return not _self_repeating(words)
     except Exception:
         return False
 
@@ -127,15 +173,29 @@ _TRAIL_SIR_RE = re.compile(r"[,\s]*\bsir\b\s*$", re.IGNORECASE)
 _CLAUSE_CUT_RE = re.compile(r"(?<=[^\s])(?:[.!?](?:\s|$)|\s[—–]\s|;\s|\s-\s)")
 
 
+_MID_SIR_RE = re.compile(r",\s*sir\b(?=\s*[,—–;:.!?-])", re.IGNORECASE)
+_FRAGMENT_MIN_WORDS = 4     # a shorter first clause takes the next one too
+
+
 def recap_fragment(message: str) -> str:
-    """The first clause of a queued line, vocative and tags stripped, short
-    enough to name in a recap. '' when nothing speakable is left."""
+    """The opening of a queued line - its first clause, or as many clauses
+    as it takes to say at least _FRAGMENT_MIN_WORDS words ("Slight problem"
+    alone says nothing, 2026-10-02) - with the vocative and tags stripped,
+    short enough to name in a recap. '' when nothing speakable is left."""
     try:
         text = _TAG_RE.sub("", str(message or "")).strip()
         text = _LEAD_SIR_RE.sub("", text).strip()
-        m = _CLAUSE_CUT_RE.search(text)
-        if m:
-            text = text[:m.start() + 1] if text[m.start()] in ".!?" else text[:m.start()]
+        text = _MID_SIR_RE.sub("", text)
+        start = 0
+        while True:
+            m = _CLAUSE_CUT_RE.search(text, start)
+            if not m:
+                break
+            cut = m.start() + 1 if text[m.start()] in ".!?" else m.start()
+            if len(text[:cut].split()) >= _FRAGMENT_MIN_WORDS:
+                text = text[:cut]
+                break
+            start = m.end()
         text = text.strip().rstrip(".!?,;:—–- ").strip()
         text = _TRAIL_SIR_RE.sub("", text).strip().rstrip(",;:—–- ").strip()
         if len(text) > _FRAGMENT_MAX:
@@ -146,9 +206,11 @@ def recap_fragment(message: str) -> str:
         return ""
 
 
-def recap_line(fragments: list, extra: int = 0) -> str:
+def recap_line(fragments: list, extra: int = 0, *, away: bool = True) -> str:
     """'While you were away, sir: A; B; and C, plus 2 more.' — '' when there
-    is nothing to name. Never asks a question (nothing on the queue may end
+    is nothing to name. ``away`` False (the lines waited for another reason:
+    room talk, standby, a speech hold - he never left) says 'Earlier, sir:'
+    instead (2026-10-02). Never asks a question (nothing on the queue may end
     unanswerable in wake-word mode)."""
     frags = [f for f in (fragments or []) if f]
     if not frags:
@@ -159,12 +221,14 @@ def recap_line(fragments: list, extra: int = 0) -> str:
         listed = "; ".join(frags[:-1]) + "; and " + frags[-1]
     if extra > 0:
         listed += f", plus {extra} more"
-    return f"While you were away, sir: {listed}."
+    lead = "While you were away, sir" if away else "Earlier, sir"
+    return f"{lead}: {listed}."
 
 
 def plan_return_drain(items: list, *, now: float, stale_s: float,
                       exempt=EXEMPT_SOURCES, keep_whole=KEEP_WHOLE_SOURCES,
-                      expire_quietly=EXPIRE_QUIETLY_SOURCES) -> tuple:
+                      expire_quietly=EXPIRE_QUIETLY_SOURCES,
+                      away: bool = True) -> tuple:
     """What a drain does with the claimed queue now that the owner is here.
 
     Returns (items_out, dropped, folded):
@@ -174,8 +238,11 @@ def plan_return_drain(items: list, *, now: float, stale_s: float,
                   the newest line per source is the one named.
       dropped   - stale moment-lines (expire_quietly) left unspoken.
       folded    - the stale status lines the recap stands for.
-    Entries with no usable 'ts' count as fresh. Never raises: on an error the
-    queue is returned unchanged."""
+    Entries with no usable 'ts' count as fresh; an urgent entry (is_urgent)
+    is never folded or dropped. ``away``: whether the owner was away while
+    they waited - only then does the recap say "While you were away"
+    (recap_line). Never raises: on an error the queue is returned
+    unchanged."""
     try:
         out: list = []
         dropped: list = []
@@ -191,7 +258,8 @@ def plan_return_drain(items: list, *, now: float, stale_s: float,
             except (TypeError, ValueError):
                 age = 0.0
             stale = age > float(stale_s)
-            if not stale or root in exempt or root in keep_whole:
+            if (not stale or root in exempt or root in keep_whole
+                    or is_urgent(item)):
                 out.append(item)
                 continue
             if root in expire_quietly:
@@ -214,7 +282,8 @@ def plan_return_drain(items: list, *, now: float, stale_s: float,
                 if frag and frag not in frags:
                     frags.append(frag)
             named = frags[:_RECAP_NAMED]
-            line = recap_line(named, extra=len(frags) - len(named))
+            line = recap_line(named, extra=len(frags) - len(named),
+                              away=away)
             if line:
                 out.insert(recap_at, {"ts": float(now), "message": line,
                                       "source": _RECAP_SOURCE})

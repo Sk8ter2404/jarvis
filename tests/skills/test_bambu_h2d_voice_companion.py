@@ -523,6 +523,31 @@ class VoiceCompanionAnnounceRoutingTests(VoiceCompanionMixin, unittest.TestCase)
         self.assertEqual(bc.proactive_announce.call_args.kwargs.get("source"),
                          "bambu_voice_companion")
 
+    def test_problem_callouts_are_urgent_and_milestones_are_not(self):
+        # Review repair (2026-10-02): layer shift / AMS / FAILED must not
+        # wait behind the presence or room-talk hold.
+        mod, _a = self._load()
+        mod._current_filename[0] = "cube"
+        with mock.patch.object(mod, "_gated_announce"), \
+             mock.patch.object(mod, "_direct_enqueue") as direct:
+            with mod._state_lock:
+                mod._process_snapshot({"filename": "cube.3mf",
+                                       "print_error": "layer shift detected",
+                                       "layer_num": 88}, "RUNNING")
+                mod._process_snapshot({"filename": "cube.3mf",
+                                       "layer_num": 90}, "FAILED")
+        self.assertTrue(direct.call_args_list)
+        for c in direct.call_args_list:
+            self.assertIs(c.kwargs.get("urgent"), True, c)
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = mock.MagicMock(return_value=True)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            mod._direct_enqueue("alert sir", urgent=True)
+            mod._direct_enqueue("Print at 50%, sir.")
+        kw = [c.kwargs for c in bc.proactive_announce.call_args_list]
+        self.assertIs(kw[0].get("urgent"), True)
+        self.assertFalse(kw[1].get("urgent", False))
+
     def test_direct_enqueue_bobert_announce_raises_falls_through(self):
         # bobert_companion present and proactive_announce IS callable but
         # raises → the except swallows it and we fall through to the bambu

@@ -268,6 +268,12 @@ class ReturnRecapTests(_Base):
                      self._e(CREDITS, "credits", age_s=32 * 60),
                      self._e(PULSE, "pulse", age_s=29 * 60),
                      self._e(fresh, "bambu", age_s=60)])
+        # They waited because he was away (the recap says so only then).
+        self.input_age[0] = float("inf")
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [])
+        self.assertIn("holding queued speech: owner away", log)
+        self.input_age[0] = 3.0      # he sat down
         _, log = self._drain()
         self.assertEqual(len(self.spoke), 2, self.spoke)
         recap = self.spoke[0]
@@ -339,6 +345,131 @@ class HelperTests(_Base):
         self.assertFalse(self.bc._presence_gate_armed[0])
 
 
+H2D = ("Slight problem, sir — your H2D appears to be unwell. Error code "
+       "0300-0100 on layer 142.")
+
+
+class UrgentTests(_Base):
+    """Review repair (2026-10-02): a print failure or a printer error code
+    waited behind the hold like a status line - while the owner's own video
+    played, indefinitely. An entry queued urgent (proactive_announce(...,
+    urgent=True)) is spoken through the away and room-talk holds."""
+
+    def test_an_urgent_line_is_spoken_into_the_hold_and_the_rest_waits(self):
+        self._write([self._e(WELLNESS, "wellness"),
+                     dict(self._e(H2D, "bambu"), urgent=True)])
+        self._drain()
+        self.assertEqual(self.spoke, [H2D])
+        self.assertEqual([e["source"] for e in self._read()], ["wellness"])
+
+    def test_an_urgent_line_is_spoken_over_room_talk(self):
+        self._owner_spoke(60)
+        self.bc._note_room_talk("so anyway I told him we'd be there by eight")
+        self._write([dict(self._e(H2D, "bambu"), urgent=True)])
+        self._drain()
+        self.assertEqual(self.spoke, [H2D])
+
+    def test_the_same_line_without_the_flag_still_waits(self):
+        self._write([self._e(H2D, "bambu")])
+        self._drain()
+        self.assertEqual(self.spoke, [])
+
+    def test_proactive_announce_stores_the_flag(self):
+        self.assertTrue(self.bc.proactive_announce(H2D, source="bambu",
+                                                   urgent=True))
+        self.assertTrue(self.bc.proactive_announce(WELLNESS,
+                                                   source="wellness"))
+        got = self._read()
+        self.assertIs(got[0].get("urgent"), True)
+        self.assertNotIn("urgent", got[1])
+
+
+class RecapWordingTests(_Base):
+    """Review repair (2026-10-02): every drain after a hold said "While you
+    were away, sir" - after room talk too, when he never left."""
+
+    def test_after_room_talk_the_recap_does_not_say_away(self):
+        self._owner_spoke(60)
+        self.bc._note_room_talk("so anyway I told him we'd be there by eight")
+        self._write([self._e(PULSE, "pulse", age_s=30 * 60)])
+        _, log = self._drain()
+        self.assertIn("holding queued speech: room talk", log)
+        self.mono[0] += self.bc.ROOM_TALK_HOLD_S + 1
+        self._owner_spoke(60)
+        self._drain()
+        self.assertEqual(len(self.spoke), 1, self.spoke)
+        self.assertTrue(self.spoke[0].startswith("Earlier, sir:"),
+                        self.spoke[0])
+
+    def test_after_he_was_away_it_does(self):
+        self._write([self._e(PULSE, "pulse", age_s=30 * 60)])
+        _, log = self._drain()
+        self.assertIn("holding queued speech: owner away", log)
+        self.input_age[0] = 3.0
+        self._drain()
+        self.assertTrue(self.spoke[0].startswith("While you were away, sir:"),
+                        self.spoke)
+
+
+class RoomTalkMediaTests(_Base):
+    """Review repair (2026-10-02): in wake-word mode every lyric and video
+    line of three words or more was dropped at the background-audio gate and
+    stamped "room talk", so while his music or a video played every queued
+    line waited until 45 s after it stopped. With the PC playing audio, a
+    dropped line is room talk only in HIS voice; a line the speech filter
+    rejects is never room talk."""
+
+    LYRIC = "and the night is young and the lights are on"
+
+    def setUp(self):
+        super().setUp()
+        import numpy as np
+        self._owner_spoke(60)
+        self._p(self.bc, "_last_capture_audio",
+                np.zeros(16000 * 3, dtype=np.float32))
+        self._p(self.bc, "_last_capture_sr", 16000)
+        self._p(self.bc, "_room_talk_spawn",
+                side_effect=lambda fn, *a: fn(*a), create=True)
+        self.voice = self._p(self.bc, "_learn_voice_verdict",
+                             return_value=(self.bc._learn_gate_mod.NOT_OWNER,
+                                           0.43))
+
+    def _talk(self, text, peak, conf=None):
+        with mock.patch.object(self.bc, "_media_probe_result",
+                               return_value=peak, create=True):
+            if conf is None:
+                self.bc._note_room_talk(text)
+            else:
+                self.bc._note_room_talk(text, conf)
+
+    def test_media_playing_and_not_his_voice_is_not_room_talk(self):
+        self._talk(self.LYRIC, peak=0.4)
+        self._write([self._e(WELLNESS, "wellness")])
+        self._drain()
+        self.assertEqual(self.spoke, [WELLNESS])
+
+    def test_his_own_voice_over_the_media_is_room_talk(self):
+        self.voice.return_value = (self.bc._learn_gate_mod.OWNER, 0.81)
+        self._talk("so anyway I told him we'd be there by eight", peak=0.4)
+        self._write([self._e(WELLNESS, "wellness")])
+        self._drain()
+        self.assertEqual(self.spoke, [])
+
+    def test_no_media_is_room_talk_without_a_voice_check(self):
+        self._talk("so anyway I told him we'd be there by eight", peak=0.0)
+        self.voice.assert_not_called()
+        self._write([self._e(WELLNESS, "wellness")])
+        self._drain()
+        self.assertEqual(self.spoke, [])
+
+    def test_a_line_the_speech_filter_rejects_is_not_room_talk(self):
+        self._talk("so anyway I told him we'd be there by eight", peak=0.0,
+                   conf={"no_speech_prob": 0.97, "avg_logprob": -2.4})
+        self._write([self._e(WELLNESS, "wellness")])
+        self._drain()
+        self.assertEqual(self.spoke, [WELLNESS])
+
+
 class PolledInputTests(_Base):
     """Review repair (2026-10-02). "Injected input never counts" held only
     for the low-level hook, and the hook is off by default
@@ -405,7 +536,7 @@ class WiringTests(_Base):
     def test_the_bg_gate_drop_stamps_room_talk_before_it_continues(self):
         src = inspect.getsource(self.bc.main)
         drop = src.index("— ignoring non-wake ")
-        stamp = src.index("_note_room_talk(text)")
+        stamp = src.index("_note_room_talk(text, conf)")
         self.assertLess(drop, stamp)
         self.assertLess(stamp, src.index("continue", stamp))
         self.assertLess(src.index("_bg_gate_for_turn("), stamp)
