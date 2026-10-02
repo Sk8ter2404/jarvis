@@ -30,8 +30,8 @@
 | Total registered actions (incl. aliases) | 696 |
 | — monolith `ACTIONS` dict | 142 |
 | — skill / core registered | 554 |
-| tested | 628 |
-| **untested** (no test names it) | 68 |
+| tested | 632 |
+| **untested** (no test names it) | 64 |
 | spoken note: VERBATIM | 347 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
@@ -68,9 +68,9 @@ One row per action, sorted by name; aliases share their handler's location.
 | `ambient_extract_stop` | `skills/ambient_multimodal_extract.py:364` | neither | — | yes |
 | `ambient_full_start` | `skills/ambient_listen.py:1975` | neither | — | yes |
 | `ambient_full_stop` | `skills/ambient_listen.py:1984` | neither | — | yes |
-| `ambient_learning_mode` | `bobert_companion.py:30521` | neither | — | yes |
-| `ambient_learning_mode_off` | `bobert_companion.py:30521` | neither | — | yes |
-| `ambient_learning_mode_on` | `bobert_companion.py:30521` | neither | — | yes |
+| `ambient_learning_mode` | `bobert_companion.py:30854` | neither | — | yes |
+| `ambient_learning_mode_off` | `bobert_companion.py:30854` | neither | — | yes |
+| `ambient_learning_mode_on` | `bobert_companion.py:30854` | neither | — | yes |
 | `ambient_listen_start` | `skills/ambient_listen.py:1834` | neither | — | yes |
 | `ambient_listen_status` | `skills/ambient_listen.py:2004` | **VERBATIM** | yes | yes |
 | `ambient_listen_stop` | `skills/ambient_listen.py:1863` | neither | — | yes |
@@ -105,7 +105,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `audio_autoswitch_on` | `skills/audio_autoswitch.py:211` | **VERBATIM** | yes | no |
 | `audio_autoswitch_status` | `skills/audio_autoswitch.py:197` | **VERBATIM** | yes | yes |
 | `audio_devices` | `skills/audio_devices.py:314` | **VERBATIM** | yes | yes |
-| `audio_music_status` | `skills/standby_audio_detect.py:626` | **VERBATIM** | — | yes |
+| `audio_music_status` | `skills/standby_audio_detect.py:620` | **VERBATIM** | — | yes |
 | `bambu_camera` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
 | `bambu_camera_off` | `skills/holographic_overlay/__init__.py:1012` | neither | — | no |
 | `bambu_camera_on` | `skills/holographic_overlay/__init__.py:1005` | neither | — | no |
@@ -212,10 +212,10 @@ One row per action, sorted by name; aliases share their handler's location.
 | `enroll_voice` | `skills/enroll_voice.py:313` | **VERBATIM** | yes | yes |
 | `enroll_xtts_sample` | `skills/custom_voice.py:525` | neither | — | yes |
 | `enrolled_voices` | `skills/enroll_voice.py:360` | **VERBATIM** | — | yes |
-| `enter_ambient_learning` | `bobert_companion.py:30521` | neither | — | yes |
+| `enter_ambient_learning` | `bobert_companion.py:30854` | neither | — | yes |
 | `eval_python` | `skills/code_executor.py:395` | *INFORMATIVE* | — | yes |
 | `evening_briefing` | `skills/evening_briefing.py:801` | neither | yes | yes |
-| `exit_ambient_learning` | `bobert_companion.py:30521` | neither | — | yes |
+| `exit_ambient_learning` | `bobert_companion.py:30854` | neither | — | yes |
 | `exit_jarvis` | `core/actions.py:3945` | neither | — | yes |
 | `export_memory` | `core/actions.py:1647` | neither | yes | yes |
 | `face_id_status` | `skills/face_id.py:380` | **VERBATIM** | — | yes |
@@ -285,7 +285,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `hide_holographic_overlay` | `skills/holographic_overlay/__init__.py:339` | neither | — | yes |
 | `hide_hud` | `core/actions.py:391` | neither | — | yes |
 | `hide_hud_v2` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
-| `hide_printer_camera` | `skills/holographic_overlay/__init__.py:1012` | neither | — | no |
+| `hide_printer_camera` | `skills/holographic_overlay/__init__.py:1012` | neither | — | yes |
 | `hide_status_hud` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
 | `hide_status_ring_v2` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
 | `hide_workshop_hud` | `skills/holographic_overlay/__init__.py:1161` | neither | — | yes |
@@ -544,7 +544,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `self_diagnostic` | `skills/self_diagnostic.py:4373` | **VERBATIM** | — | yes |
 | `send_draft` | `skills/email_triage.py:1152` | **VERBATIM** | — | yes |
 | `send_pending_draft` | `skills/email_triage.py:1152` | **VERBATIM** | — | yes |
-| `session_memory_recall` | `core/actions.py:2969` | **VERBATIM** | yes | no |
+| `session_memory_recall` | `core/actions.py:2969` | **VERBATIM** | yes | yes |
 | `session_resume` | `core/actions.py:587` | neither | — | no |
 | `set_active_speaker` | `skills/enroll_voice.py:386` | **VERBATIM** | — | yes |
 | `set_brain` | `skills/model_picker.py:576` | **VERBATIM** | yes | yes |
@@ -568,13 +568,13 @@ One row per action, sorted by name; aliases share their handler's location.
 | `show_last_diagnostic` | `core/actions.py:1680` | **VERBATIM** | — | yes |
 | `show_llm_stats` | `core/actions.py:766` | **VERBATIM** | — | yes |
 | `show_print_camera` | `skills/holographic_overlay/__init__.py:1005` | neither | — | no |
-| `show_printer_camera` | `skills/holographic_overlay/__init__.py:1005` | neither | — | no |
+| `show_printer_camera` | `skills/holographic_overlay/__init__.py:1005` | neither | — | yes |
 | `show_recent_facts` | `core/actions.py:1614` | **VERBATIM** | — | yes |
 | `show_schedules` | `skills/schedule_manager.py:512` | **VERBATIM** | — | no |
 | `show_status_hud` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
 | `show_status_ring_v2` | `skills/holographic_overlay/__init__.py:1810` | neither | — | yes |
 | `show_tasks` | `core/actions.py:1456` | *INFORMATIVE* | yes | yes |
-| `show_tray` | `bobert_companion.py:4696` | **VERBATIM** | — | yes |
+| `show_tray` | `bobert_companion.py:4929` | **VERBATIM** | — | yes |
 | `show_vram` | `skills/gpu_usage.py:218` | **VERBATIM** | — | yes |
 | `show_workshop_hud` | `skills/holographic_overlay/__init__.py:1156` | neither | — | yes |
 | `show_workshop_print_monitor` | `skills/holographic_overlay/__init__.py:1409` | neither | — | yes |
@@ -602,7 +602,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `stark_status_ring_on` | `skills/holographic_overlay/__init__.py:1810` | neither | — | yes |
 | `stark_status_ring_status` | `skills/holographic_overlay/__init__.py:1826` | **VERBATIM** | yes | yes |
 | `stark_status_ring_toggle` | `skills/holographic_overlay/__init__.py:1820` | neither | — | yes |
-| `start_eavesdropping` | `core/actions.py:1478` | neither | — | no |
+| `start_eavesdropping` | `core/actions.py:1478` | neither | — | yes |
 | `start_overnight_upgrade` | `core/actions.py:3226` | neither | — | yes |
 | `status_hud` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
 | `status_hud_off` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
@@ -678,11 +678,11 @@ One row per action, sorted by name; aliases share their handler's location.
 | `wake_listener_start` | `skills/wake_listener.py:403` | neither | yes | yes |
 | `wake_listener_status` | `skills/wake_listener.py:434` | **VERBATIM** | — | yes |
 | `wake_listener_stop` | `skills/wake_listener.py:420` | neither | — | yes |
-| `wake_resume_answer_then_quiet` | `bobert_companion.py:30557` | neither | — | yes |
-| `wake_resume_stay_talkative` | `bobert_companion.py:30557` | neither | — | yes |
-| `wake_word_mode_off` | `bobert_companion.py:29031` | neither | — | yes |
-| `wake_word_mode_on` | `bobert_companion.py:29031` | neither | — | yes |
-| `wake_word_mode_status` | `bobert_companion.py:29081` | **VERBATIM** | — | yes |
+| `wake_resume_answer_then_quiet` | `bobert_companion.py:30890` | neither | — | yes |
+| `wake_resume_stay_talkative` | `bobert_companion.py:30890` | neither | — | yes |
+| `wake_word_mode_off` | `bobert_companion.py:29348` | neither | — | yes |
+| `wake_word_mode_on` | `bobert_companion.py:29348` | neither | — | yes |
+| `wake_word_mode_status` | `bobert_companion.py:29398` | **VERBATIM** | — | yes |
 | `weather_briefing` | `skills/weather_briefing.py:748` | **VERBATIM** | yes | yes |
 | `weather_forecast` | `skills/weather_briefing.py:748` | **VERBATIM** | yes | yes |
 | `web_interface_off` | `skills/web_interface.py:209` | **VERBATIM** | yes | yes |
