@@ -1052,6 +1052,12 @@ KINECT_POINT_CONTROL_ENABLED = False
 #   isn't tracked. See audio/kinect_bridge.get_hand_states() (grip) +
 #   skills/kinect_air_mouse.py (wiring) + hud/jarvis_air_cursor.py (overlay).
 KINECT_AIR_MOUSE_ENABLED = False
+# AIR_MOUSE_LL_HOOK_ENABLED — install the low-level mouse/keyboard hook the
+# air-mouse uses to tell real input from its own (skills/_air_mouse_yield.py).
+# OFF: a Python LL hook puts every input event on the PC behind this process's
+# GIL (~15.6 ms per event measured under JARVIS's load, 311 ms per 20-event
+# burst — games included). The GetLastInputInfo fallback does the job.
+AIR_MOUSE_LL_HOOK_ENABLED = False
 # ─── AIR-MOUSE SMART-ENGAGE knobs (2026-07, feat/smart-engage) ───────────────
 #   The owner's complaint: "hand tracking triggers when it shouldn't; I need a
 #   foolproof way to make it trigger every time I want it but with FEWER false

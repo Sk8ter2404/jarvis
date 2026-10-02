@@ -303,6 +303,16 @@ def install() -> bool:
         if _installed:
             return _hook_ok
         _installed = True
+        if not _ll_hook_enabled():
+            # 2026-10-01 (B057 review): with the ctypes types fixed the hook
+            # really installs — and then every mouse/keyboard event on the PC
+            # waits for this Python callback, which needs the GIL of a process
+            # running ~3 cores of work: ~15.6 ms per event measured, 311 ms for
+            # a 20-event burst (games included). Off by default until a
+            # GIL-free design (separate process / raw input) lands; the
+            # GetLastInputInfo fallback keeps the real-input yield working.
+            _warn_once("off by setting: AIR_MOUSE_LL_HOOK_ENABLED=False")
+            return False
         try:
             import ctypes  # noqa: F401  (probe availability before spawning)
             _ = ctypes.windll.user32
@@ -323,6 +333,17 @@ def install() -> bool:
             break
         time.sleep(0.005)
     return _hook_ok
+
+
+def _ll_hook_enabled() -> bool:
+    """AIR_MOUSE_LL_HOOK_ENABLED from the running monolith (owner settings
+    applied) or core.config; False when unreadable."""
+    import sys
+    for mod in (sys.modules.get("bobert_companion"), sys.modules.get("core.config")):
+        v = getattr(mod, "AIR_MOUSE_LL_HOOK_ENABLED", None) if mod is not None else None
+        if isinstance(v, bool):
+            return v
+    return False
 
 
 def _warn_once(msg: str) -> None:
