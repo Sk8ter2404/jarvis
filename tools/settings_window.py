@@ -152,6 +152,15 @@ OLLAMA_MODEL_FALLBACK = [
     "qwen3:14b",                            # needs think:false (handled in-app)
     "llama3.1:8b-instruct-q5_K_M",
 ]
+# The Claude models the "Claude model" and "Retry a failed turn on" rows
+# offer: current models first, then the older ones (still selectable — the
+# per-model request shaping in core.llm_client sends an older model exactly
+# what it accepts). One list, so the two rows can never offer different sets.
+CLAUDE_MODEL_CHOICES = [
+    "claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5",
+    "claude-fable-5-1", "claude-sonnet-5", "claude-sonnet-4-6",
+    "claude-opus-4-8", "claude-opus-4-6",
+]
 # Tag substrings that are NOT chat models (embedding / vision) — excluded from
 # the chat-model dropdown. Mirrors skills/model_picker's markers.
 _NON_CHAT_MARKERS = (
@@ -978,12 +987,7 @@ SCHEMA: dict[str, dict] = {
     },
     "CLAUDE_MODEL": {
         "tab": "ai", "label": "Claude model", "type": "enum",
-        # Current models first, then the older ones (still selectable — the
-        # per-model request shaping in core.llm_client sends an older model
-        # exactly what it accepts).
-        "choices": ["claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5",
-                    "claude-fable-5-1", "claude-sonnet-5", "claude-sonnet-4-6",
-                    "claude-opus-4-8", "claude-opus-4-6"],
+        "choices": list(CLAUDE_MODEL_CHOICES),
         "default": "claude-sonnet-5-5",
         "help": "Cloud model + est. cost PER CONVERSATION: Haiku 4.5 ~$0.02 "
                 "(fastest), Sonnet 5.5 ~$0.04 (default — near-Opus smarts at "
@@ -1109,6 +1113,26 @@ SCHEMA: dict[str, dict] = {
                 "conversation to the already-loaded local brain so your "
                 "FIRST question is as fast as the rest. Same safeguards as "
                 "the re-warm above (0 = off). Applies on the next start.",
+    },
+    "TURN_CHECK_MODE": {
+        "tab": "ai", "label": "Check each turn for a failed reply",
+        "type": "enum", "choices": ["off", "shadow", "on"],
+        "default": "shadow",
+        "help": "After each turn, check whether the reply claimed an "
+                "action that never ran, ran nothing for a clear command, or "
+                "named an action that does not exist. shadow = only log it "
+                "(data/turn_check.jsonl holds kinds and action names, never "
+                "your words); on = say 'One moment, sir.' and retry that "
+                "turn once on Claude (a paid cloud call; needs Claude allowed "
+                "for chat: backend claude, a key, chat not routed local); "
+                "off = no check. Applies on the next start.",
+    },
+    "TURN_CHECK_ESCALATE_MODEL": {
+        "tab": "ai", "label": "Retry a failed turn on", "type": "enum",
+        "choices": list(CLAUDE_MODEL_CHOICES),
+        "default": "claude-sonnet-5-5",
+        "help": "The Claude model a failed turn is retried on when the "
+                "check above is 'on'. Applies on the next start.",
     },
     "STREAMING_TTS_ENABLED": {
         "tab": "voice", "label": "Speak while replies stream", "type": "bool",
@@ -1878,6 +1902,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                    "LOCAL_PREFIX_REPRIME", "LOCAL_BACKGROUND_MAX_DEFER_S",
                    "LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S",
                    "LOCAL_REPRIME_AT_BOOT_S"]),
+        ("Turn checker", ["TURN_CHECK_MODE", "TURN_CHECK_ESCALATE_MODEL"]),
         ("Background work", ["ENABLE_ORCHESTRATOR", "TEAMS_NUDGE_ENABLED"]),
         ("Spending caps", ["DAILY_BUDGET_USD", "DEEP_AUDIT_BUDGET_USD"]),
     ],

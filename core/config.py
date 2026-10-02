@@ -890,6 +890,27 @@ SMART_TURN_MIN_SILENCE_S = 0.256
 SMART_TURN_MIN_SPEECH_S = 1.0
 SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
 
+# ─── Turn checker (core/turn_checker.py, 2026-10-02) ──────────────────────
+# After every LLM turn (spoken or typed) the checker asks whether the reply
+# failed in a way a retry on Claude would fix: it claimed an action that never
+# ran ("Done, sir." and nothing happened), ran nothing for a clear command, or
+# named an action that does not exist. Route, glance, barged and self-voiced
+# turns are never checked.
+#   TURN_CHECK_MODE   'off'    no check at all;
+#                     'shadow' check only: a "[turn-check]" log line for a
+#                              failed turn and one row per checked turn in
+#                              data/turn_check.jsonl (kind, confidence and
+#                              action names - never the words);
+#                     'on'     a failed turn at or above the checker's bar is
+#                              retried ONCE on Claude, after "One moment,
+#                              sir.", when the cloud is allowed for chat
+#                              (backend claude, a key, chat not routed local).
+#                     Any other value reads as 'shadow'.
+#   TURN_CHECK_ESCALATE_MODEL  the Claude model that retry runs on.
+# Set via user_settings.json; applies on the next start.
+TURN_CHECK_MODE = "shadow"
+TURN_CHECK_ESCALATE_MODEL = "claude-sonnet-5-5"
+
 # ─── Deterministic fast paths (core/fast_paths.py + core/date_math.py) ──
 # When True, relative-date questions ("what's the date tomorrow", "how many
 # days until Christmas", "how long until Friday"), "what did I just ask you"

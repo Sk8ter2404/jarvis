@@ -16462,6 +16462,8 @@ _TURN_FLAG_KEYS = (
     "PROCESSING_FILLER_ENABLED", "PROCESSING_FILLER_DELAY",
     "PROCESSING_FILLER_STILL_DELAY", "ANSWER_FIRST_ENABLED",
     "SENTENCE_TTS_ENABLED", "FAST_PATHS_ENABLED",
+    # 'on' adds a cloud retry to a failed turn (_turn_check_after_chain).
+    "TURN_CHECK_MODE",
     # Reserved for later batches (absent until they ship):
     "AMBIENT_STT_YIELD", "PROCESSING_FILLER_PRERENDER",
     "PROCESSING_FILLER_LATE_START_S", "PROCESSING_FILLER_SKIP_PLEASANTRIES",
@@ -20935,13 +20937,18 @@ def _chat_cloud_allowed() -> bool:
         return False
 
 
-def _claude_oneshot(system: str, messages: list, max_tokens: int = 500) -> str | None:
+def _claude_oneshot(system: "str | list", messages: list,
+                    max_tokens: int = 500,
+                    model: str | None = None) -> str | None:
     """Single Claude completion used as the cloud fallback when the LOCAL model
     fails on a 'local'-routed turn. Returns the text, or None if the cloud is
     unreachable / errors (caller then emits the honest both-down message).
-    Mirrors the timeout + client-reuse the main _call_llm Claude path uses."""
+    Mirrors the timeout + client-reuse the main _call_llm Claude path uses.
+    ``model`` defaults to CLAUDE_MODEL; the turn checker's retry passes
+    TURN_CHECK_ESCALATE_MODEL (see _turn_check_escalate)."""
     if not _claude_reachable():
         return None
+    model = model or CLAUDE_MODEL
     try:
         # Prefer the shared, instrumented client wrapper (same path _call_llm
         # uses); fall back to a direct anthropic client otherwise. Either way
@@ -20949,19 +20956,19 @@ def _claude_oneshot(system: str, messages: list, max_tokens: int = 500) -> str |
         # can't freeze the voice thread.
         if _llm_client is not None:
             text = _llm_client.complete(
-                model=CLAUDE_MODEL, max_tokens=max_tokens,
+                model=model, max_tokens=max_tokens,
                 system=system, messages=messages,
                 timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
             )
         else:
             msg = _claude_create(
                 "voice",
-                model=CLAUDE_MODEL, max_tokens=max_tokens,
+                model=model, max_tokens=max_tokens,
                 system=system, messages=messages,
             )
             text = _claude_reply_text(msg)
         if text:
-            _note_turn_brain("cloud", CLAUDE_MODEL)
+            _note_turn_brain("cloud", model)
         return text
     except Exception as _e:
         print(f"  [local-llm] cloud fallback also failed ({type(_e).__name__}: {_e})")
@@ -41474,6 +41481,408 @@ def _handle_sleep_triggers(text: str) -> bool:
     return False
 
 
+# ── Turn checker wiring (TURN_CHECK_MODE, 2026-10-02) ───────────────────────
+# core/turn_checker.py is the pure DECISION half (did this turn fail in a way
+# a retry on Claude would fix?); this is the live half. _run_llm_dispatch_body
+# calls _turn_check_after_chain ONCE, after the follow-up chain and its
+# close-out line. 'off' returns before any work; 'shadow' runs the pure check
+# (well under a millisecond for a typical turn), prints one "[turn-check]"
+# line for a failed turn and appends one row per checked turn to
+# data/turn_check.jsonl; 'on' may also retry the turn once on Claude
+# (_turn_check_escalate). PRIVACY: the row and the log line carry kinds,
+# confidences, verdict.reason (fixed wording + registered action names) and
+# action names - never the owner's words or the reply text.
+try:
+    from core import turn_checker as _turn_checker  # noqa: E402
+except Exception as _tc_import_err:  # pragma: no cover - import-light module
+    _turn_checker = None
+    print(f"  [turn-check] unavailable ({type(_tc_import_err).__name__}: "
+          f"{_tc_import_err})")
+
+_TURN_CHECK_MODES = ("off", "shadow", "on")
+_TURN_CHECK_LOG_NAME = "turn_check.jsonl"
+_TURN_CHECK_LOG_MAX_BYTES = 8 * 1024 * 1024   # ~50k rows; then rows stop
+_TURN_CHECK_MAX_NAMES = 16                    # action names kept per list
+# Set while a retry runs on this thread: a turn is never escalated twice,
+# even if an action of the retry dispatches a turn of its own.
+_turn_check_tls = threading.local()
+# 'shadow' checks run on ONE daemon worker, so the voice thread only queues
+# them (a typical check plus its row is ~0.6 ms; a reply naming an unknown
+# action costs autocorrect scoring over the whole registry, tens of ms).
+# Bounded: a full queue drops the check, never the turn.
+_TURN_CHECK_QUEUE_MAX = 32
+_turn_check_jobs: "queue.Queue" = queue.Queue(maxsize=_TURN_CHECK_QUEUE_MAX)
+_turn_check_worker: list = [None]
+_turn_check_worker_lock = threading.Lock()
+
+
+def _turn_check_mode() -> str:
+    """TURN_CHECK_MODE normalised to 'off' | 'shadow' | 'on'. Anything else -
+    a typo, a blank, a non-string - reads as 'shadow'. Never raises."""
+    try:
+        mode = str(globals().get("TURN_CHECK_MODE", "shadow")).strip().lower()
+    except Exception:
+        return "shadow"
+    return mode if mode in _TURN_CHECK_MODES else "shadow"
+
+
+def _turn_check_emitted(texts) -> list:
+    """The names in every [ACTION: name ...] token of ``texts`` (this turn's
+    replies as the model wrote them), lower-cased, in order."""
+    return [m.group(1).strip().lower()
+            for t in texts or () for m in _ACTION_RE.finditer(str(t or ""))]
+
+
+def _turn_check_result_held(result) -> bool:
+    """An action result that did NOT run: it waits on the owner (a hard
+    confirmation, a pushback, an autocorrect question)."""
+    return (isinstance(result, str)
+            and result.startswith(_ANSWER_FIRST_DEFERRED_PREFIXES))
+
+
+def _turn_check_ran(results) -> list:
+    """Names of the actions that actually ran this turn, from every round's
+    (name, result, informative) tuples. Never a synthetic result (a leading
+    "_": _unverified_claim, _dropped_step, _preemptive_hallucinated_claim),
+    an unknown name, or an action held for the owner."""
+    out = []
+    for r in results or ():
+        try:
+            name, res = str(r[0] or "").strip().lower(), r[1]
+        except Exception:
+            continue
+        if (not name or name.startswith("_") or _turn_check_result_held(res)
+                or (isinstance(res, str)
+                    and res.startswith("unknown action:"))):
+            continue
+        out.append(name)
+    return out
+
+
+def _turn_check_names(names) -> list:
+    """Action names as a row keeps them: unique, sorted, capped."""
+    return sorted({str(n)[:64] for n in names or () if n})[
+        :_TURN_CHECK_MAX_NAMES]
+
+
+def _turn_check_log_path() -> str:
+    """data/turn_check.jsonl, staging-aware through core.paths."""
+    from core import paths as _paths
+    return _paths.data_file(_TURN_CHECK_LOG_NAME)
+
+
+def _turn_check_write_row(row, log_path_fn=None) -> bool:
+    """Append one row to data/turn_check.jsonl (gitignored; ``log_path_fn``
+    defaults to _turn_check_log_path). Best effort: False on any failure,
+    never raises."""
+    try:
+        path = (log_path_fn or _turn_check_log_path)()
+        return bool(_stt_parakeet.append_jsonl(
+            path, row, max_bytes=_TURN_CHECK_LOG_MAX_BYTES))
+    except Exception:
+        return False
+
+
+def _turn_check_barged(barge_seq0) -> bool:
+    try:
+        return _tts_interrupt_seq[0] != barge_seq0
+    except Exception:
+        return False
+
+
+def _turn_check_anchor(user_text):
+    """Index of this turn's user message in conversation_history (the last
+    user message with exactly these words), or None. Caller holds
+    _session_summary_lock."""
+    for i in range(len(conversation_history) - 1, -1, -1):
+        m = conversation_history[i]
+        if (isinstance(m, dict) and m.get("role") == "user"
+                and m.get("content") == user_text):
+            return i
+    return None
+
+
+def _turn_check_retry_messages(user_text):
+    """The history the retry is sent: everything up to and including this
+    turn's user message, so none of this turn's failed replies (and nothing
+    appended after it) goes to Claude. None when the turn is not found."""
+    with _session_summary_lock:
+        at = _turn_check_anchor(user_text)
+        if at is None:
+            return None
+        return [dict(m) for m in conversation_history[:at + 1]]
+
+
+def _turn_check_replace_history(user_text, failed_texts, new_texts) -> int:
+    """Put ``new_texts`` (the retry) in place of this turn's failed assistant
+    messages (the replies in ``failed_texts`` after this turn's user
+    message), so the history never holds both. Returns how many went."""
+    failed = {t for t in failed_texts or () if isinstance(t, str) and t}
+    new_msgs = [{"role": "assistant", "content": t}
+                for t in new_texts or () if t]
+    with _session_summary_lock:
+        at = _turn_check_anchor(user_text)
+        if at is None:
+            conversation_history.extend(new_msgs)
+            return 0
+        # One in-place slice assignment over this turn's tail (other modules
+        # hold the same list; the front, where the trim works, is untouched).
+        tail = conversation_history[at + 1:]
+        gone = {j for j, m in enumerate(tail)
+                if isinstance(m, dict) and m.get("role") == "assistant"
+                and m.get("content") in failed}
+        put = min(gone) if gone else 0     # where the first failed reply was
+        kept = [m for j, m in enumerate(tail) if j not in gone]
+        conversation_history[at + 1:] = kept[:put] + new_msgs + kept[put:]
+        return len(gone)
+
+
+def _turn_check_retry_note(verdict) -> str:
+    """The system-side note the retry carries: the failure kind and the
+    checker's reason (fixed wording + registered names, no transcript)."""
+    return ("\n\n(System: this is a RETRY. Your previous reply to the owner's "
+            f"last message failed the turn check - {verdict.kind}: "
+            f"{verdict.reason}. Answer that message again from the start, as "
+            "JARVIS. Emit a real [ACTION: name, argument] token for anything "
+            "you do, using only action names from your instructions; never "
+            "say you did something without its token; if it cannot be done, "
+            "say so plainly.)")
+
+
+def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0) -> str:
+    """'on' mode: retry this turn ONCE on Claude (TURN_CHECK_ESCALATE_MODEL).
+
+    Speaks ONE_MOMENT_LINE, sends the stable system prompt plus a note
+    naming the failure and the history up to this turn's user message (the
+    failed local replies left out), runs the reply's actions with ONE
+    parse_and_run_actions, strips an acknowledgement preface as the first
+    reply's is, puts it in the history in place of the failed reply(s) and
+    speaks it. Real results the owner should hear are read back with at most
+    ONE get_followup_response, whose own [ACTION:] tokens are not run. A
+    failed or empty cloud call prints a line and stops: the local reply was
+    already spoken. Returns the outcome for the row."""
+    model = str(globals().get("TURN_CHECK_ESCALATE_MODEL") or "").strip() \
+        or CLAUDE_MODEL
+    _turn_check_tls.escalating = True
+    try:
+        _speak(_turn_checker.ONE_MOMENT_LINE)
+        set_state("thinking")
+        _heartbeat()
+        msgs = _turn_check_retry_messages(user_text)
+        if not msgs:
+            print("  [turn-check] this turn is no longer in the history - "
+                  "not retrying")
+            return "no-history"
+        system = _cached_system_param(_system_prompt
+                                      + _turn_check_retry_note(verdict))
+        retry = _claude_oneshot(system, _self_knowledge_for_cloud(msgs),
+                                max_tokens=500, model=model)
+        if not (isinstance(retry, str) and retry.strip()):
+            print(f"  [turn-check] the {model} retry returned nothing - the "
+                  f"local reply stands")
+            return "empty"
+        _publish_turn_brain()
+        print(f"  JARVIS (retry): {retry}")
+        if _turn_check_barged(barge_seq0):
+            print("  [turn-check] barged during the retry - not running it")
+            return "barged"
+        spoken, results = parse_and_run_actions(retry)
+        if not results:
+            spoken = _strip_ack_preface(spoken, user_text)
+        _gone = _turn_check_replace_history(user_text, failed_texts, [retry])
+        print(f"  [turn-check] the retry replaced {_gone} failed "
+              f"reply(s) in the history")
+        if spoken and not _turn_check_barged(barge_seq0):
+            _speak(spoken)
+        if not _turn_check_barged(barge_seq0):
+            _speak_verbatim_results(results, spoken)
+        texts = [retry]
+        # One read-back, only for real results the owner should hear (never
+        # a synthetic "_" result: that would ask for a round we don't run).
+        info = [(n, r) for (n, r, i) in results
+                if not str(n).startswith("_") and not is_self_voiced(n)
+                and (i or _action_result_failed(r))]
+        if info and not _turn_check_barged(barge_seq0):
+            set_state("thinking")
+            _heartbeat()
+            back = get_followup_response(info)
+            if back:
+                print(f"  JARVIS (retry read-back): {back}")
+                texts.append(back)
+                conversation_history.append({"role": "assistant",
+                                             "content": back})
+                if _ACTION_RE.search(back):
+                    print("  [turn-check] the read-back named an action - "
+                          "not run (one retry round only)")
+                b_spoken = re.sub(r"\s{2,}", " ",
+                                  _ACTION_RE.sub(" ", back)).strip()
+                if b_spoken and not _turn_check_barged(barge_seq0):
+                    _speak(b_spoken)
+        _record_turn_offers(texts)
+        return "spoken"
+    finally:
+        _turn_check_tls.escalating = False
+
+
+def _turn_check_worker_loop() -> None:
+    """The shadow-mode worker: runs each queued check, one at a time, off the
+    voice thread. Never exits, never raises."""
+    while True:
+        job = _turn_check_jobs.get()
+        try:
+            job()
+        except Exception:
+            pass
+        finally:
+            _turn_check_jobs.task_done()
+
+
+def _turn_check_submit(job) -> bool:
+    """Queue ``job`` for the worker, started on first use. False when the
+    queue is full or the worker cannot start: that check is dropped and the
+    turn is unaffected. Never raises; never blocks."""
+    try:
+        t = _turn_check_worker[0]
+        if t is None or not t.is_alive():
+            with _turn_check_worker_lock:
+                t = _turn_check_worker[0]
+                if t is None or not t.is_alive():
+                    t = threading.Thread(target=_turn_check_worker_loop,
+                                         name="turn-check", daemon=True)
+                    t.start()
+                    _turn_check_worker[0] = t
+        _turn_check_jobs.put_nowait(job)
+        return True
+    except Exception:
+        return False
+
+
+def _turn_check_flush(timeout: float = 5.0) -> bool:
+    """Wait, at most ``timeout`` s, until every queued check has run. True
+    when the queue drained. For tests and tooling - never the voice thread."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    cv = _turn_check_jobs.all_tasks_done
+    with cv:
+        while _turn_check_jobs.unfinished_tasks:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            cv.wait(left)
+    return True
+
+
+def _turn_check_judge(mode, user_text, chain_texts, chain_results,
+                      registered, *, asked, needs_confirmation, cloud_allowed,
+                      out=None, log_path_fn=None, close_line="",
+                      barge_seq0=0):
+    """The back half of _turn_check_after_chain: the verdict, the
+    "[turn-check]" line (to ``out``, the stdout that was live when the turn
+    ended), the jsonl row (at ``log_path_fn()``) and, in 'on' mode, the
+    retry. Runs on the worker in 'shadow', on the voice thread in 'on'.
+    Returns the Verdict."""
+    emitted = _turn_check_emitted(chain_texts)
+    ran = _turn_check_ran(chain_results)
+    verdict = _turn_checker.check_turn(
+        user_text, " ".join(str(t or "") for t in chain_texts or ()),
+        emitted, ran, registered, asked_question=True if asked else None)
+    would = _turn_checker.should_escalate(
+        verdict, cloud_allowed=cloud_allowed,
+        already_escalated=bool(getattr(_turn_check_tls, "escalating", False)),
+        needs_confirmation=needs_confirmation)
+    escalate = mode == "on" and would
+    row = {"ts": round(time.time(), 3), "mode": mode, "kind": verdict.kind,
+           "confidence": round(float(verdict.confidence), 2),
+           "would_escalate": bool(would), "cloud_allowed": cloud_allowed,
+           "needs_confirmation": needs_confirmation, "escalated": False,
+           "emitted": _turn_check_names(emitted),
+           "ran": _turn_check_names(ran)}
+    try:
+        if verdict.kind != _turn_checker.OK:
+            if escalate:
+                model = (str(globals().get("TURN_CHECK_ESCALATE_MODEL")
+                             or "").strip() or CLAUDE_MODEL)
+                why = f"escalating to {model}"
+            elif would:
+                why = "would escalate"
+            elif verdict.confidence < _turn_checker.ESCALATE_MIN_CONFIDENCE:
+                why = "below bar"
+            elif needs_confirmation:
+                why = "not escalated: a confirmation is pending"
+            elif not cloud_allowed:
+                why = "not escalated: the cloud is not allowed for chat"
+            else:
+                why = "not escalated"
+            print(f"  [turn-check] {verdict.kind} "
+                  f"conf={verdict.confidence:.2f} ({verdict.reason}) - {why}",
+                  file=out if out is not None else sys.stdout)
+        if escalate:
+            row["escalated"] = True
+            row["retry"] = "error"
+            failed = list(chain_texts or ()) + ([close_line]
+                                                if close_line else [])
+            try:
+                row["retry"] = _turn_check_escalate(user_text, verdict,
+                                                    failed, barge_seq0)
+            except Exception as e:
+                print(f"  [turn-check] the retry failed - "
+                      f"{type(e).__name__}: {str(e)[:120]}; the local reply "
+                      f"stands")
+    finally:
+        _turn_check_write_row(row, log_path_fn)
+    return verdict
+
+
+def _turn_check_after_chain(user_text, chain_texts, chain_results, *,
+                            skip=False, close_line="", barge_seq0=0):
+    """Check one finished turn (TURN_CHECK_MODE); see the block comment
+    above. ``chain_texts``: the first reply and every follow-up as the model
+    wrote them; ``chain_results``: every round's (name, result, informative)
+    tuples; ``skip``: a route-reply, glance, barged or self-voiced turn (not
+    checked); ``close_line``: the close-out line spoken (and recorded), if
+    any.
+
+    On the voice thread this only snapshots what the check needs (the end-of-
+    turn state: the registry, a pending confirmation or autocorrect question,
+    the cloud gate, the live stdout). 'shadow' queues the rest for the worker
+    and returns None; 'on' judges here, since a retry has to happen now, and
+    returns the Verdict. 'off' and a skipped turn return None before any
+    work."""
+    mode = _turn_check_mode()
+    if mode == "off" or skip or _turn_checker is None:
+        return None
+    results = list(chain_results or ())
+    held = any(isinstance(r, (tuple, list)) and len(r) > 1
+               and _turn_check_result_held(r[1]) for r in results)
+    confirm_held = any(
+        isinstance(r, (tuple, list)) and len(r) > 1 and isinstance(r[1], str)
+        and r[1].startswith(("⚠  REQUIRES CONFIRMATION:",
+                             "⚠  PUSHBACK:"))
+        for r in results)
+    kwargs = dict(
+        asked=held or bool(_pending_autocorrect_choice),
+        needs_confirmation=bool(_pending_confirmation) or confirm_held,
+        cloud_allowed=bool(_chat_cloud_allowed()),
+        out=sys.stdout, log_path_fn=_turn_check_log_path,
+        close_line=close_line, barge_seq0=barge_seq0)
+    args = (mode, user_text, list(chain_texts or ()), results,
+            list(ACTIONS))     # one C-level copy; skills may register
+    if mode == "shadow":
+        _turn_check_submit(lambda: _turn_check_judge_guarded(args, kwargs))
+        return None
+    return _turn_check_judge(*args, **kwargs)
+
+
+def _turn_check_judge_guarded(args, kwargs):
+    """The worker's job: _turn_check_judge with any exception caught and
+    printed, as the dispatch body's own guard prints it."""
+    try:
+        return _turn_check_judge(*args, **kwargs)
+    except Exception as e:
+        print(f"  [turn-check] skipped - {type(e).__name__}: {str(e)[:120]}",
+              file=kwargs.get("out") or sys.stdout)
+        return None
+
+
 def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
     """One LLM turn (see _run_llm_dispatch_body), optionally wrapped in the
     processing filler (2026-09-29).
@@ -41723,6 +42132,9 @@ def _run_llm_dispatch_body(text: str) -> str:
     # Every reply of this turn as the model wrote it - their offers are
     # recorded (closed) when the chain ends; see _record_turn_offers.
     _chain_texts = [reply]
+    # Every (name, result, informative) tuple of every round - the turn
+    # checker's "what ran" (see _turn_check_after_chain).
+    _chain_results = list(action_results)
     # Why the chain stopped with results still unreported ("" = it did not)
     # and how many follow-up rounds ran.
     _chain_cut = ""
@@ -41808,6 +42220,7 @@ def _run_llm_dispatch_body(text: str) -> str:
             break
         print(f"  JARVIS: {followup}")
         f_spoken, current_results = parse_and_run_actions(followup)
+        _chain_results.extend(current_results)
         _last_round_ran = bool(current_results)
         _after_reply_note(current_results)
         if not current_results:
@@ -41879,6 +42292,20 @@ def _run_llm_dispatch_body(text: str) -> str:
     # The chain is over: its offers are closed (NEW #13) - a later turn's
     # "Also, …" aside that repeats one is not spoken.
     _record_turn_offers(_chain_texts)
+    # Turn checker (TURN_CHECK_MODE, core/turn_checker.py): did this turn fail
+    # in a way a retry on Claude would fix? 'off' returns at once, 'shadow'
+    # only logs; 'on' may retry it once. Before the trim, so a retry's reply
+    # replaces the failed one(s) in the history that the trim then bounds.
+    # Never allowed to break the turn.
+    try:
+        _turn_check_after_chain(
+            text, _chain_texts, _chain_results,
+            skip=(_route_reply is not None or _glance_reply is not None
+                  or _barged or _self_voiced_only),
+            close_line=_close, barge_seq0=_barge_seq0)
+    except Exception as _tc_err:
+        print(f"  [turn-check] skipped - {type(_tc_err).__name__}: "
+              f"{str(_tc_err)[:120]}")
     # TRIM after the follow-up chain (2026-07-07 bug-hunt, MED). Each depth
     # iteration appends an assistant message but _call_llm only trims ONCE,
     # BEFORE this loop runs — so a multi-step chain (depth cap 8, agent mode 24)
