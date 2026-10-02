@@ -202,6 +202,32 @@ class CameraStatusTests(CameraSystemBase):
         out = actions["camera_status"]("")
         self.assertIn("dark", out.lower())
 
+    def test_black_frame_webcam_is_named_not_live(self):
+        # Audit P2-3: idx1 still has a 2 s-old real frame, but the producer
+        # has been reading only black frames since (_camera_black_frame_at) -
+        # the Kinect saturating USB. That is not a live webcam.
+        bc = _fake_monolith(frame_ages={0: 0.2, 1: 2.0})
+        bc._camera_black_frame_at = {1: time.time() - 0.3}
+        bridge = _fake_bridge(available=(False, "no sensor"))
+        mod, actions = self._load(bc=bc, bridge=bridge)
+        left = [c for c in mod._webcam_health() if c["index"] == 1][0]
+        self.assertFalse(left["live"])
+        self.assertTrue(left["black"])
+        out = actions["camera_status"]("")
+        self.assertIn("the left monitor webcam is delivering black frames", out)
+        self.assertIn("the right monitor webcam is live", out)
+        self.assertNotIn("both live", out)
+
+    def test_old_black_frame_mark_does_not_stick(self):
+        # A black run that ended (mark older than the live window) with fresh
+        # real frames since is just a live webcam.
+        bc = _fake_monolith(frame_ages={0: 0.2, 1: 0.2})
+        bc._camera_black_frame_at = {1: time.time() - 30.0}
+        _mod, actions = self._load(bc=bc, bridge=_fake_bridge(available=(False, "x")))
+        out = actions["camera_status"]("")
+        self.assertNotIn("black frames", out)
+        self.assertIn("both live", out)
+
     def test_kinect_enabled_but_unavailable_reported_dark(self):
         # Kinect is opted-in (configured) but the sensor won't open. It still
         # counts toward the headline (the user HAS three cameras) but is named

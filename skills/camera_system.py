@@ -223,10 +223,11 @@ _WEBCAM_LIVE_SECONDS = 5.0
 def _webcam_health() -> list[dict]:
     """One entry per configured webcam (core.config.CAMERAS), each:
         {"index": int, "label": str, "primary": bool, "side": "left"|"right",
-         "live": bool, "age": float|None, "seen_face": bool,
+         "live": bool, "black": bool, "age": float|None, "seen_face": bool,
          "last_error": str|None}
     `live` is True when the face-track thread has a frame newer than
-    _WEBCAM_LIVE_SECONDS for that index. Reads under _camera_state_lock so it
+    _WEBCAM_LIVE_SECONDS for that index and the camera is not currently
+    delivering black frames (`black`). Reads under _camera_state_lock so it
     never races the writer. Returns [] when the monolith / config isn't loaded.
     NEVER raises."""
     out: list[dict] = []
@@ -242,6 +243,7 @@ def _webcam_health() -> list[dict]:
     frame_at = getattr(bc, "_camera_last_frame_at", {}) or {}
     seen_at = getattr(bc, "_camera_last_seen", {}) or {}
     errors = getattr(bc, "_camera_last_read_error", {}) or {}
+    black_at = getattr(bc, "_camera_black_frame_at", {}) or {}
 
     def _read_snapshot():
         for cam in CAMERAS:
@@ -250,13 +252,19 @@ def _webcam_health() -> list[dict]:
             age = (now - last_at) if last_at else None
             face_at = seen_at.get(idx, 0.0) or 0.0
             _side = _cam_side(cam)
+            # Reading fine but every frame black (the monolith's
+            # _CAMERA_BLACK_FRAME_MEAN): never live, whatever the last real
+            # frame's age.
+            _black_ts = black_at.get(idx, 0.0) or 0.0
+            black = bool(_black_ts and (now - _black_ts) <= _WEBCAM_LIVE_SECONDS)
             out.append({
                 "index": idx,
                 "label": cam.get("label", f"camera {idx}"),
                 "primary": bool(cam.get("primary")),
                 "side": _side,
                 "live": bool(last_at and age is not None
-                             and age <= _WEBCAM_LIVE_SECONDS),
+                             and age <= _WEBCAM_LIVE_SECONDS and not black),
+                "black": black,
                 "age": (round(age, 1) if age is not None else None),
                 "seen_face": bool(face_at and (now - face_at) <= _WEBCAM_LIVE_SECONDS),
                 "last_error": errors.get(idx),
@@ -443,13 +451,15 @@ def camera_status(_: str = "") -> str:
         return ("I can't reach the camera system right now, sir — the tracker "
                 "may not have started yet.")
 
-    # Webcam clauses.
+    # Webcam clauses. A webcam delivering black frames gets its own clause
+    # below rather than a bare "dark".
     live = [c for c in health if c["live"]]
-    dark = [c for c in health if not c["live"]]
+    black = [c for c in health if not c["live"] and c.get("black")]
+    dark = [c for c in health if not c["live"] and not c.get("black")]
     cam_total = len(health) + (1 if kin.get("configured") else 0)
 
     parts: list[str] = []
-    if health:
+    if live or dark:
         if not dark:
             # All webcams live.
             if len(live) == 1:
@@ -470,6 +480,12 @@ def camera_status(_: str = "") -> str:
             parts.append(
                 "the " + " and ".join(c["side"] for c in dark)
                 + (" one is dark" if len(dark) == 1 else " ones are dark"))
+    if black:
+        parts.append(
+            "the " + " and ".join(c["side"] for c in black)
+            + (" monitor webcam is" if len(black) == 1 else " monitor webcams are")
+            + " delivering black frames - its USB link may be saturated, or "
+              "the room is unlit")
 
     # Kinect clause.
     if kin.get("configured"):

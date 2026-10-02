@@ -9088,6 +9088,50 @@ _camera_recoveries: dict[int, int]           = {}      # index → cumulative su
 _CAMERA_FRAME_LIVE_S = 5.0
 
 
+# A BLACK FRAME IS NOT A LIVE FRAME (2026-10-01, audit P2-3). When the Kinect
+# saturates the USB controller a webcam can keep "succeeding" - cap.read()
+# returns True - while every frame is black, and the producer cached and
+# stamped those like any other: camera_status said "live", and look_around and
+# face enrolment (behind _fresh_camera_frame) used a black picture. A frame
+# whose mean brightness is under this is neither cached nor stamped; the
+# camera's read error says so, and _camera_black_frame_at (index -> time of the
+# latest black frame, dropped by the next real one) lets camera_status name it.
+# A pitch-dark room reads the same, and is just as unusable for vision. The
+# mean is taken on every 4th row/column: the loop reads ~20 frames a second.
+_CAMERA_BLACK_FRAME_MEAN = 10.0
+_CAMERA_BLACK_FRAME_ERROR = "delivering black frames (mean brightness {:.1f}/255)"
+_camera_black_frame_at: dict[int, float] = {}
+_CAMERA_BLACK_WARN_GAP_S = 60.0    # one log line per camera per minute, at most
+_camera_black_warned_at: dict[int, float] = {}
+
+
+def _webcam_frame_brightness(frame) -> float | None:
+    """Mean brightness of a strided sample of ``frame`` (see
+    _CAMERA_BLACK_FRAME_MEAN), or None when it cannot be measured - which is
+    never treated as black. NEVER raises."""
+    try:
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return None
+        return _frame_mean_brightness(frame[::4, ::4])
+    except Exception:
+        return None
+
+
+def _warn_black_camera_frames(label: str, idx: int, mean: float,
+                              now: float) -> None:
+    """Throttled one-liner naming the camera whose frames are black. Never
+    raises into the tracking loop."""
+    try:
+        if (now - _camera_black_warned_at.get(idx, 0.0)) < _CAMERA_BLACK_WARN_GAP_S:
+            return
+        _camera_black_warned_at[idx] = now
+        print(f"  [face-track] {label} (index {idx}) is delivering black frames "
+              f"(mean brightness {mean:.1f}/255) - not treated as live. A "
+              f"saturated USB controller (the Kinect) or an unlit room does this")
+    except Exception:
+        pass
+
+
 def _fresh_camera_frame(idx, max_age_s: float = _CAMERA_FRAME_LIVE_S):
     """(frame_copy, ts) when the face-track producer delivered a frame for
     camera ``idx`` within ``max_age_s`` seconds, else (None, None). Takes
@@ -12070,14 +12114,29 @@ def _face_tracking_thread_body():
                 if _camera_gate is not None:
                     _camera_gate.note_frame(_camera_gate_key(cam))
                 # Cache frame for see_user action regardless of face detection
+                # - unless it is BLACK (see _CAMERA_BLACK_FRAME_MEAN): that is
+                # recorded as the camera's read error, never as a live frame.
+                _bright = _webcam_frame_brightness(frame)
+                _black = _bright is not None and _bright < _CAMERA_BLACK_FRAME_MEAN
                 with _camera_state_lock:
-                    _camera_latest_frame[cam["index"]] = frame.copy()
-                    _camera_last_frame_at[cam["index"]] = now_loop
-                    # A real frame means whatever transient error we recorded
-                    # has resolved — clear it so see_user reports clean state.
-                    if cam["index"] in _camera_last_read_error:
-                        _camera_last_read_error.pop(cam["index"], None)
-                        _camera_last_read_error_at.pop(cam["index"], None)
+                    if _black:
+                        _camera_black_frame_at[cam["index"]] = now_loop
+                        _camera_last_read_error[cam["index"]] = (
+                            _CAMERA_BLACK_FRAME_ERROR.format(_bright))
+                        _camera_last_read_error_at[cam["index"]] = now_loop
+                    else:
+                        _camera_black_frame_at.pop(cam["index"], None)
+                        _camera_latest_frame[cam["index"]] = frame.copy()
+                        _camera_last_frame_at[cam["index"]] = now_loop
+                        # A real frame means whatever transient error we
+                        # recorded has resolved — clear it so see_user reports
+                        # clean state.
+                        if cam["index"] in _camera_last_read_error:
+                            _camera_last_read_error.pop(cam["index"], None)
+                            _camera_last_read_error_at.pop(cam["index"], None)
+                if _black:
+                    _warn_black_camera_frames(cam["label"], cam["index"],
+                                              _bright, now_loop)
                 # Per-camera preview: EVERY webcam publishes its own tile (the
                 # web Camera tab shows each eye individually); the primary-only
                 # composite below is unchanged. Same enable gate + throttle
@@ -26634,7 +26693,9 @@ def get_camera_health() -> dict:
     ``last_read_error`` (str or None), ``last_read_error_at`` (epoch or
     0.0), ``wake_attempts`` (int), ``recoveries`` (int), and
     ``last_read_ms`` (how long the last cap.read() blocked - the slowest
-    camera here is what caps the HUD/web preview frame rate), and the
+    camera here is what caps the HUD/web preview frame rate),
+    ``black_frame_at`` (epoch of its latest BLACK frame while it is still
+    delivering them, else 0.0), and the
     QUARANTINE fields (2026-09-05) - ``quarantined`` / ``quarantine_reason`` /
     ``quarantine_until`` / ``quarantine_since`` / ``quarantine_count`` /
     ``quarantine_strikes`` - which say whether this ONE camera has been benched
@@ -26672,6 +26733,9 @@ def get_camera_health() -> dict:
                 # slowest camera here is the tracking loop's period and
                 # therefore the preview's ceiling (2026-09-04).
                 "last_read_ms":        _camera_read_ms.get(idx, 0.0),
+                # When it last delivered a BLACK frame (0.0 = not in a black
+                # run): read OK, yet nothing to see (2026-10-01).
+                "black_frame_at":      _camera_black_frame_at.get(idx, 0.0),
             }
             # Quarantine state for this index (all-false defaults when the
             # camera has never been benched).
