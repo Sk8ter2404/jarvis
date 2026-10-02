@@ -64,6 +64,11 @@ jobs:
         # (tools/run_coverage.py --full, deps present) — it can't import on the
         # bare CI runner, so it stays out of this gate. Floor sits below the
         # baseline so it guards regressions without flaking.
+        # The coverage run holds ~6.4 GB resident for 21k tests (2026-10-02);
+        # mem_guard's 8 GB default (sized for the owner's desktop) left under
+        # 1 GB of headroom, so this job runs with 12 GB of the runner's 16 GB.
+        env:
+          JARVIS_TEST_MEM_CAP_GB: "12"
         run: python tools/run_coverage.py --xml --fail-under 80
 
       - name: Upload coverage.xml

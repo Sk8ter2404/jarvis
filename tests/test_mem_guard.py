@@ -333,6 +333,32 @@ class PlatformDispatchTests(unittest.TestCase):
             self.assertEqual(mem_guard._apply_posix_rlimit(1 << 33), "RLIMIT_AS")
         self.assertEqual(fake.calls, [(9, (1 << 33, -1))])
 
+    def test_posix_rlimit_also_caps_glibc_arenas(self):
+        """RLIMIT_AS bounds RESERVED address space, and glibc reserves a 64 MB
+        arena per thread: measured 2026-10-02 on Linux, the coverage run hit the
+        8 GB cap (VSZ 7.99994 GB) with only 6.3 GB resident and died with
+        MemoryError; with 2 arenas VSZ peaked at 7.11 GB and it passed. The
+        ceiling must cap the arenas too, and children inherit the setting."""
+        fake = self._fake_resource(hard=-1)
+        calls = []
+        with mock.patch.dict(sys.modules, {"resource": fake}), \
+             mock.patch.object(mem_guard, "_cap_glibc_arenas",
+                               side_effect=lambda n: calls.append(n) or True), \
+             mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MALLOC_ARENA_MAX", None)
+            mem_guard._apply_posix_rlimit(1 << 33)
+            self.assertEqual(os.environ.get("MALLOC_ARENA_MAX"), "2")
+        self.assertEqual(calls, [2])
+        self.assertEqual(fake.calls, [(9, (1 << 33, -1))])
+
+    def test_an_arena_cap_failure_never_loses_the_ceiling(self):
+        fake = self._fake_resource(hard=-1)
+        with mock.patch.dict(sys.modules, {"resource": fake}), \
+             mock.patch.object(mem_guard, "_cap_glibc_arenas",
+                               side_effect=OSError("no glibc")):
+            self.assertEqual(mem_guard._apply_posix_rlimit(1 << 33), "RLIMIT_AS")
+        self.assertEqual(fake.calls, [(9, (1 << 33, -1))])
+
     def test_posix_rlimit_never_tries_to_raise_the_hard_limit(self):
         """An unprivileged process cannot raise its hard limit — asking would
         just throw and lose the ceiling entirely, so clamp under it instead."""

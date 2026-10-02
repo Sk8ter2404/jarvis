@@ -245,10 +245,35 @@ def _apply_windows_job_object(limit_bytes: int) -> str:
     return "Job Object"
 
 
+_GLIBC_ARENAS = 2
+
+
+def _cap_glibc_arenas(n: int) -> bool:
+    """mallopt(M_ARENA_MAX, n) on glibc. RLIMIT_AS bounds RESERVED address
+    space, and glibc reserves a 64 MB arena per thread (up to 8 x cores), so a
+    thread-heavy run hits the cap with far less in use: 2026-10-02 the Linux
+    coverage run died with MemoryError at VSZ 7.99994 GB / RSS 6.3 GB under the
+    8 GB cap; with 2 arenas VSZ peaked at 7.11 GB and it passed. Raises when
+    there is no glibc (the caller treats that as best effort)."""
+    import ctypes
+    import ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    M_ARENA_MAX = -8
+    return bool(libc.mallopt(M_ARENA_MAX, int(n)))
+
+
 def _apply_posix_rlimit(limit_bytes: int) -> str:
-    """Cap this process with RLIMIT_AS. Raises on failure; returns the label."""
+    """Cap this process with RLIMIT_AS (and glibc's arena count, so the cap
+    bounds memory in use rather than per-thread reservations). Raises on
+    failure; returns the label."""
     import resource  # POSIX-only: imported inside the branch
 
+    # Children read MALLOC_ARENA_MAX at start-up; this process via mallopt.
+    os.environ.setdefault("MALLOC_ARENA_MAX", str(_GLIBC_ARENAS))
+    try:
+        _cap_glibc_arenas(_GLIBC_ARENAS)
+    except Exception:
+        pass  # not glibc (musl, macOS): the address-space cap still applies
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)
     target = limit_bytes
     if hard != resource.RLIM_INFINITY:
