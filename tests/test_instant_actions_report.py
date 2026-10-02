@@ -19,7 +19,7 @@ import unittest
 from core import instant_actions as ia
 from tools import instant_actions_report as rep
 
-NOW = 1759406400.0          # 2026-10-02 12:00:00 UTC
+NOW = 1790942400.0          # 2026-10-02 12:00:00 UTC
 DAY = 86400.0
 
 
