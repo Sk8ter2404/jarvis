@@ -1186,14 +1186,23 @@ def parse_when(token: str) -> datetime | None:
             seconds = n * 3600
         return now + timedelta(seconds=seconds)
 
+    # The two clock branches below build the target as a NAIVE local wall
+    # time and only then attach the zone through _make_aware, which picks the
+    # offset in force on THAT date. ``now``'s tzinfo is a fixed offset (what
+    # astimezone() returns), so replacing the hour on now + 1 day kept today's
+    # offset: across a DST change "tomorrow at 9am" fired an hour off (A93).
+    today = now.replace(tzinfo=None)
+
+    def _at(day: datetime, h: int, mm: int) -> datetime:
+        return _make_aware(day.replace(hour=h, minute=mm, second=0, microsecond=0))
+
     # tomorrow [at] <clock>
     m = re.match(r"^tomorrow(?:\s+at)?\s+(.+)$", txt)
     if m:
         clock = parse_clock(m.group(1))
         if clock is not None:
             h, mm = clock
-            base = (now + timedelta(days=1)).replace(hour=h, minute=mm, second=0, microsecond=0)
-            return base
+            return _at(today + timedelta(days=1), h, mm)
 
     # today [at] <clock>
     m = re.match(r"^today(?:\s+at)?\s+(.+)$", txt)
@@ -1201,11 +1210,11 @@ def parse_when(token: str) -> datetime | None:
         clock = parse_clock(m.group(1))
         if clock is not None:
             h, mm = clock
-            base = now.replace(hour=h, minute=mm, second=0, microsecond=0)
+            base = _at(today, h, mm)
             # A "today at <past-time>" would otherwise schedule in the past and
             # an immediate-misfire would fire it instantly. Roll to tomorrow.
             if base <= now:
-                base = base + timedelta(days=1)
+                base = _at(today + timedelta(days=1), h, mm)
             return base
 
     # ISO / datetime
