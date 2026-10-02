@@ -83,6 +83,9 @@ EMPTY_AVG_LOGPROB = -10.0
 # short (they drop anything under 0.4 s), so this only guards odd input.
 MIN_SAMPLES = 160
 RESCUE_HEAD_S = 0.8        # "speech in the first 0.8 s past the pre-roll"
+# The rescue's log line: the first one, then at most one per this many
+# seconds (with how many were not logged). Every rescue is still counted.
+RESCUE_LOG_EVERY_S = 60.0
 
 # The shadow worker (STT_SHADOW). The queue holds at most SHADOW_QUEUE_MAX
 # captures; a capture waits at most SHADOW_WAIT_S for the turn to finish.
@@ -285,6 +288,11 @@ def rescue_reason(text, *, wake_lost, head_speech) -> str:
         return "check-failed"
 
 
+class NotReady(Exception):
+    """The owner's decode found Parakeet still loading (the boot warmer holds
+    the model's lock): Whisper decodes this capture, nothing latches."""
+
+
 class Latch:
     """Parakeet's off switch for the session, shared by the primary path, the
     shadow worker and the boot warmer. Thread-safe; logs once."""
@@ -326,10 +334,14 @@ class Primary:
       hotwords() -> bool               STT_HOTWORDS is set (then logged once)
 
     run() returns what the turn uses. Never raises past whisper(): a
-    Parakeet failure latches off (one log line) and Whisper decodes."""
+    Parakeet failure latches off (one log line) and Whisper decodes. A
+    decode that raises NotReady (the model is still loading) is Whisper's
+    too, without latching ('whisper-loading'). The rescue line is logged
+    once, then at most once per RESCUE_LOG_EVERY_S (`clock`)."""
 
     def __init__(self, decode, whisper, *, latch, post_text=None,
-                 rescue=None, note=None, hotwords=None, log=print):
+                 rescue=None, note=None, hotwords=None, log=print,
+                 clock=time.monotonic):
         self._decode = decode
         self._whisper = whisper
         self.latch = latch
@@ -339,8 +351,11 @@ class Primary:
         self._note = note or (lambda v: None)
         self._hotwords = hotwords or (lambda: False)
         self._log = log
+        self._clock = clock
         self._mu = threading.Lock()
         self._hot_logged = False
+        self._rescue_logged_at = None
+        self._rescue_quiet = 0
         self.decodes = 0
         self.rescues = 0
 
@@ -374,6 +389,9 @@ class Primary:
         try:
             text, conf = self._decode(audio)
             text = self._post(text)
+        except NotReady:
+            self._note_engine("whisper-loading")
+            return self._whisper(audio)
         except Exception as e:
             self.latch.trip(e)
             self._note_engine("whisper-fallback")
@@ -382,11 +400,27 @@ class Primary:
             self.decodes += 1
         why = self._rescue(text, audio)
         if why:
+            line = None
             with self._mu:
                 self.rescues += 1
                 n, of = self.rescues, self.decodes
-            self._say(f"  [stt] parakeet -> whisper rescue ({why}; {n} of "
-                      f"{of} parakeet decodes)")
+                try:
+                    now = float(self._clock())
+                except Exception:
+                    now = None
+                last = self._rescue_logged_at
+                if (last is None or now is None
+                        or now - last >= RESCUE_LOG_EVERY_S):
+                    quiet, self._rescue_quiet = self._rescue_quiet, 0
+                    self._rescue_logged_at = now
+                    line = (f"  [stt] parakeet -> whisper rescue ({why}; {n}"
+                            f" of {of} parakeet decodes"
+                            + (f"; {quiet} more not logged" if quiet else "")
+                            + ")")
+                else:
+                    self._rescue_quiet += 1
+            if line:
+                self._say(line)
             self._note_engine("parakeet-rescued")
             return self._whisper(audio)
         self._note_engine("parakeet")

@@ -436,6 +436,42 @@ class PrimaryTests(unittest.TestCase):
         self.assertEqual(p.run(self.AUDIO)[0], "Jarvis, lights")
         self.assertEqual(w.calls, [])
 
+    def test_not_ready_falls_back_without_latching(self):
+        # The model is still loading (the boot warmer holds its lock): this
+        # capture is Whisper's, nothing latches, the next one tries again.
+        calls = []
+
+        def dec(a):
+            calls.append(1)
+            if len(calls) == 1:
+                raise sp.NotReady("loading")
+            return ("Jarvis, lights", {})
+        p, w, log, notes = _primary(dec)
+        self.assertEqual(p.run(self.AUDIO), w.res)
+        self.assertEqual(p.latch.failed, "")
+        self.assertEqual(p.run(self.AUDIO)[0], "Jarvis, lights")
+        self.assertEqual(notes, ["whisper-loading", "parakeet"])
+        self.assertEqual((p.decodes, len(w.calls), log), (1, 1, []))
+
+    def test_the_rescue_line_is_rate_limited(self):
+        # One line, then at most one per RESCUE_LOG_EVERY_S carrying how
+        # many were not logged — every rescue is still counted.
+        clock = _Clock(t=1000.0)
+        log, notes = [], []
+        p = sp.Primary(lambda a: ("", {}), _Whisper(), latch=sp.Latch(),
+                       note=notes.append, log=log.append, clock=clock)
+        for _ in range(4):
+            p.run(self.AUDIO)
+        self.assertEqual(len(log), 1)
+        self.assertIn("rescue (empty; 1 of 1 parakeet decodes)", log[0])
+        clock.t += sp.RESCUE_LOG_EVERY_S
+        p.run(self.AUDIO)
+        self.assertEqual(len(log), 2)
+        self.assertIn("rescue (empty; 5 of 5 parakeet decodes; 3 more not "
+                      "logged)", log[1])
+        self.assertEqual(p.rescues, 5)
+        self.assertEqual(notes, ["parakeet-rescued"] * 5)
+
     def test_hotwords_ignored_is_logged_once(self):
         p, _w, log, _n = _primary(lambda a: ("Jarvis, x y", {}), hot=True)
         p.run(self.AUDIO)

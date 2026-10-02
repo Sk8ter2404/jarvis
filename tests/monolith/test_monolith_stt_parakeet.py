@@ -72,13 +72,15 @@ class _Base(MonolithGlobalsTestCase):
         # Parakeet's session state is process-wide: start and end clean.
         latch, prim, shadow = (bc._parakeet_latch, bc._parakeet_primary,
                                bc._parakeet_shadow)
-        saved = (latch.failed, prim.decodes, prim.rescues, prim._hot_logged)
+        saved = (latch.failed, prim.decodes, prim.rescues, prim._hot_logged,
+                 prim._rescue_logged_at, prim._rescue_quiet)
 
         def _restore():
-            (latch.failed, prim.decodes, prim.rescues,
-             prim._hot_logged) = saved
+            (latch.failed, prim.decodes, prim.rescues, prim._hot_logged,
+             prim._rescue_logged_at, prim._rescue_quiet) = saved
         latch.failed = ""
-        prim.decodes = prim.rescues = 0
+        prim.decodes = prim.rescues = prim._rescue_quiet = 0
+        prim._rescue_logged_at = None
         self.addCleanup(_restore)
         self._p(bc, "STT_ENGINE", "whisper")
         self._p(bc, "STT_SHADOW", "")
@@ -352,6 +354,68 @@ class R6PrimaryTests(_Base):
         self._p(bc._stt_parakeet, "load", return_value=_Eng())
         bc._warm_parakeet()
         self.assertEqual(seen, [(bc.SAMPLE_RATE, "float32", 0.0)])
+
+    def test_the_owners_turn_never_waits_on_the_boot_load(self):
+        """The boot warmer holds _parakeet_lock while onnxruntime loads the
+        model (seconds; a hung load would be forever). The owner's capture
+        must not wait behind it: Whisper decodes this one ('whisper-loading',
+        no latch), and the next capture after the load is Parakeet's (R6
+        review, finding 3). Event-based."""
+        bc = self.bc
+        eng = _FakeEngine(text="Jarvis, lights")
+        started, release, done = (threading.Event(), threading.Event(),
+                                  threading.Event())
+
+        def slow_load(model_dir, threads):
+            started.set()
+            release.wait(10.0)
+            return eng
+        self._p(bc._stt_parakeet, "load", side_effect=slow_load)
+        tr = self._p(bc, "transcribe", return_value=W_RES)
+        box = {}
+
+        def owner():
+            try:
+                box["res"] = bc._transcribe_capture(self.audio)
+            finally:
+                done.set()
+        warm = threading.Thread(target=bc._warm_parakeet, daemon=True)
+        own = threading.Thread(target=owner, daemon=True)
+        warm.start()
+        self.assertTrue(started.wait(5.0))
+        try:
+            own.start()
+            finished = done.wait(5.0)
+        finally:
+            release.set()
+            warm.join(5.0)
+            own.join(5.0)
+        self.assertTrue(finished, "the owner's turn waited on the boot load")
+        self.assertIs(box["res"], W_RES)
+        tr.assert_called_once()
+        self.assertEqual(self._engine_notes(), ["whisper-loading"])
+        self.assertEqual(bc._parakeet_latch.failed, "")
+        self.assertEqual(bc._parakeet_primary.decodes, 0)
+        # Loaded: the next capture is Parakeet's.
+        self.assertEqual(bc._transcribe_capture(self.audio)[0],
+                         "Jarvis, lights")
+        self.assertEqual(self._engine_notes(), ["whisper-loading",
+                                                "parakeet"])
+
+    def test_the_boot_warmer_also_warms_the_rescue_detector(self):
+        # The rescue's head check runs Silero on the turn thread; with
+        # TURN_TAIL_PROBE off nothing else would load it before the first
+        # wake-word capture (R6 review, finding 9).
+        bc = self.bc
+        self._p(bc._stt_parakeet, "load", return_value=_FakeEngine())
+        warm = self._p(bc._tail_vad, "warm", return_value=True)
+        bc._warm_parakeet()
+        warm.assert_called_once_with()
+        # A detector that will not load costs Parakeet nothing: no latch,
+        # no raise (the head check then answers None and the rescue runs).
+        warm.side_effect = RuntimeError("no silero")
+        bc._warm_parakeet()
+        self.assertEqual(bc._parakeet_latch.failed, "")
 
     def test_a_failing_boot_warmer_latches_quietly_and_raises(self):
         bc = self.bc

@@ -16437,13 +16437,25 @@ def _parakeet_engine():
     return _stt_alt
 
 
-def _parakeet_decode(audio):
+def _parakeet_decode(audio, wait_for_load: bool = True):
     """One Parakeet decode -> (text, conf), under _parakeet_lock (never
-    _stt_lock). Raises on failure."""
-    with _parakeet_lock:
+    _stt_lock). Raises on failure.
+
+    ``wait_for_load=False`` (the owner's captures): while the model is still
+    loading — the boot warmer holds _parakeet_lock and _stt_alt is None —
+    raise NotReady at once instead of waiting (R6 review: the load takes
+    seconds, a hung onnxruntime load forever, while Whisper sits ready).
+    Once loaded, a decode in flight is waited for (it is bounded)."""
+    if not _parakeet_lock.acquire(blocking=False):
+        if not wait_for_load and _stt_alt is None:
+            raise _stt_parakeet.NotReady("Parakeet is still loading")
+        _parakeet_lock.acquire()
+    try:
         eng = _parakeet_engine()
         return _stt_parakeet.transcribe(
             eng, audio, anchors=globals().get("PARAKEET_CONF_ANCHORS"))
+    finally:
+        _parakeet_lock.release()
 
 
 def _parakeet_post_text(text: str) -> str:
@@ -16507,7 +16519,7 @@ def _parakeet_rescue(text: str, audio) -> str:
 
 
 _parakeet_primary = _stt_parakeet.Primary(
-    lambda a: _parakeet_decode(a),
+    lambda a: _parakeet_decode(a, wait_for_load=False),
     lambda a: transcribe(a),
     latch=_parakeet_latch,
     post_text=lambda t: _parakeet_post_text(t),
@@ -16606,12 +16618,21 @@ def _transcribe_capture_r6(audio, route: str):
 def _warm_parakeet() -> None:
     """Boot warmer (a flag on): load Parakeet and decode 1 s of silence (the
     first ORT run is the slow one). A failure latches Parakeet off for the
-    session; the "[warm] parakeet failed" line is then its one log line."""
+    session; the "[warm] parakeet failed" line is then its one log line.
+
+    Then the rescue's speech detector (_tail_vad), which would otherwise
+    load on the turn thread at the first wake-word check when
+    TURN_TAIL_PROBE is off. Its failure costs Parakeet nothing: the head
+    check answers None and the rescue runs."""
     try:
         _parakeet_decode(np.zeros(SAMPLE_RATE, dtype=np.float32))
     except Exception as e:
         _parakeet_latch.trip(e, quiet=True)
         raise
+    try:
+        _tail_vad.warm()
+    except Exception:
+        pass
 
 
 if _stt_r6_route() is not None:
