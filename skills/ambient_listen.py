@@ -816,6 +816,96 @@ def _hamming(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
 
 
+# ── STT yield to the owner's turn (AMBIENT_STT_YIELD, speed plan R2) ──────
+# Both workers decode through bobert_companion.transcribe(), which shares one
+# STT lock with the owner's own speech-to-text, so an ambient batch decoding
+# when the owner finishes a sentence makes that transcription wait behind it.
+# With the flag on, a batch that is ready while the owner is mid-utterance
+# (_utterance_in_progress) is parked here instead of transcribed; it has
+# already passed the RMS / dialogue / audio-processing steps. Parked batches
+# are transcribed oldest-first once the flag clears, before any newer batch,
+# and are kept exactly like a live one except: their capture time and window
+# are used, and they never nudge a wake. Bounded: at most
+# AMBIENT_YIELD_MAX_BATCHES are parked (the oldest is dropped and counted),
+# and a flag still set after AMBIENT_YIELD_MAX_DEFER_S is treated as stale -
+# decoding goes on, so a stuck flag can never silence ambient. Flag off: no
+# _SttYield exists and the workers make exactly the calls they always did.
+AMBIENT_YIELD_MAX_DEFER_S = 15
+AMBIENT_YIELD_MAX_BATCHES = 6
+_AMBIENT_YIELD_LOG_EVERY = 10   # one count line per this many parked batches
+
+
+def _yield_mono() -> float:
+    """The STT yield's clock (time.monotonic). One seam for the tests."""
+    return time.monotonic()
+
+
+class _SttYield:
+    """One worker's parked batches (see above). Used only on that worker's
+    thread. Each item is (audio, rms, capture ts, ctx); ctx holds the window
+    attribution taken when the batch was parked."""
+
+    def __init__(self, b, tag: str):
+        self._b = b
+        self._tag = tag
+        self.parked: "deque[tuple]" = deque(maxlen=AMBIENT_YIELD_MAX_BATCHES)
+        self.deferred = 0      # batches parked
+        self.dropped = 0       # parked batches pushed out by a full deque
+        self._busy_since: Optional[float] = None
+        self._stale_logged = False
+
+    def owner_busy(self) -> bool:
+        """True while the owner's utterance is in progress, unless the flag
+        has stayed set past AMBIENT_YIELD_MAX_DEFER_S. Never raises."""
+        try:
+            busy = bool(getattr(self._b, "_utterance_in_progress", [False])[0])
+        except Exception:
+            busy = False
+        if not busy:
+            self._busy_since = None
+            self._stale_logged = False
+            return False
+        now = _yield_mono()
+        if self._busy_since is None:
+            self._busy_since = now
+        if now - self._busy_since <= AMBIENT_YIELD_MAX_DEFER_S:
+            return True
+        if not self._stale_logged:
+            self._stale_logged = True
+            print(f"  [{self._tag}] owner-turn flag set for over "
+                  f"{AMBIENT_YIELD_MAX_DEFER_S}s - transcribing anyway")
+        return False
+
+    def must_park(self) -> bool:
+        """The current batch waits: the owner is speaking, or older batches
+        are still parked (order is kept)."""
+        return bool(self.parked) or self.owner_busy()
+
+    def park(self, audio, rms: float, ts: float, ctx: dict) -> None:
+        if len(self.parked) == self.parked.maxlen:
+            self.dropped += 1
+        self.parked.append((audio, rms, ts, ctx))
+        self.deferred += 1
+        # Counts only - never the transcript (there is none yet anyway).
+        if (self.deferred - 1) % _AMBIENT_YIELD_LOG_EVERY == 0:
+            print(f"  [{self._tag}] yielded to the owner's turn: "
+                  f"{self.deferred} batch(es) deferred, {self.dropped} dropped")
+        # One call per parked batch: the host adds 1 to amb_deferred on its
+        # turn-timing line (a host without the hook is simply not told).
+        note = getattr(self._b, "_tt_note_stat", None)
+        if callable(note):
+            try:
+                note("amb_deferred", 1)
+            except Exception:
+                pass
+
+    def ready(self):
+        """Yield parked batches oldest-first while the owner stays quiet;
+        re-checked before each one, so a new sentence stops the drain."""
+        while self.parked and not self.owner_busy():
+            yield self.parked.popleft()
+
+
 # ── mic worker (ambient-mode-1, unchanged behaviour) ─────────────────────
 
 def _worker_loop() -> None:
@@ -995,6 +1085,75 @@ def _worker_loop() -> None:
     samples_per_batch = int(sample_rate * batch_secs)
     pending: list[np.ndarray] = []
     pending_samples = 0
+    # AMBIENT_STT_YIELD: None when the flag is off (see _SttYield).
+    stt_yield = (_SttYield(b, "ambient-listen")
+                 if getattr(b, "AMBIENT_STT_YIELD", False) is True else None)
+
+    def _keep_batch(audio, rms, cap_ts=None, ctx=None):
+        """Transcribe one batch and keep it. cap_ts / ctx are set only for a
+        batch the STT yield parked: it keeps its capture time and window, and
+        never nudges a wake (the moment has passed)."""
+        global _last_error
+        try:
+            text, conf = transcribe(audio)
+        except Exception as e:
+            _last_error = f"transcribe failed: {e}"
+            print(f"  [ambient-listen] {_last_error}")
+            return
+
+        if not text:
+            return
+        # Known-device speech: checked on EVERY transcript (so the
+        # split-line join below always sees the previous fragment), acted
+        # on after the existing gates. Never buffered (so never learned
+        # from) and never a wake nudge. Source name only in the log.
+        # A parked batch joins split lines by its capture time (only the
+        # 6 s gap decides: a silence between parked batches is not replayed).
+        if cap_ts is None:
+            _dev = _device_speech_batch_source(text)
+        else:
+            _dev = _device_speech_batch_source(text, now=cap_ts)
+        if is_ambient_music(text):
+            return
+        if callable(is_valid_speech):
+            ok, _reason = is_valid_speech(text, conf, peak_rms=rms)
+            if not ok:
+                return
+        if _dev:
+            print(f"  [ambient-listen] device speech ignored ({_dev})")
+            return
+
+        # Identify the speaker for this batch BEFORE persisting so
+        # downstream consumers (anticipation, banter, per-speaker
+        # routing) see a stable speaker_id on every transcript. The
+        # call is best-effort: None when resemblyzer is missing, no
+        # one is enrolled, or the embedding doesn't clear the
+        # confidence threshold — single-user mode stays untouched.
+        speaker_id, speaker_score = _identify_speaker_safe(audio, sample_rate)
+
+        entry = {
+            "ts": time.time() if cap_ts is None else cap_ts,
+            "text": text,
+            "no_speech_prob": float(conf.get("no_speech_prob", 1.0)),
+            "avg_logprob":    float(conf.get("avg_logprob", -10.0)),
+            "rms":            rms,
+            "speaker_id":     speaker_id,
+            "speaker_score":  float(speaker_score),
+        }
+        with _lock:
+            _buffer.append(entry)
+            _trim_buffer(entry["ts"])
+            _persist_state()
+        # Mirror the mic transcript into the multimodal log too so
+        # the extractor sees all three streams in one place.
+        mirror = dict(entry)
+        mirror["source"] = "mic"
+        mirror["window"] = (_focused_window_title() if ctx is None
+                            else ctx["window"])
+        _append_jsonl(_AUDIO_JSONL, mirror)
+        _rotate_jsonl_if_needed(_AUDIO_JSONL)
+        if cap_ts is None:
+            _maybe_nudge_wake(text)
 
     try:
         while not _stop_evt.is_set():
@@ -1020,6 +1179,13 @@ def _worker_loop() -> None:
                 if _stop_evt.wait(0.5):
                     break
                 continue
+
+            # Parked batches go first, once the owner's turn is over.
+            if stt_yield is not None:
+                for parked in stt_yield.ready():
+                    _keep_batch(*parked)
+                    if _stop_evt.is_set():
+                        break
 
             with q_lock:
                 while audio_q:
@@ -1054,59 +1220,11 @@ def _worker_loop() -> None:
             # stationary background noise, and gain drift removed.
             audio = _apply_audio_processing(audio, sample_rate)
 
-            try:
-                text, conf = transcribe(audio)
-            except Exception as e:
-                _last_error = f"transcribe failed: {e}"
-                print(f"  [ambient-listen] {_last_error}")
+            if stt_yield is not None and stt_yield.must_park():
+                stt_yield.park(audio, rms, time.time(),
+                               {"window": _focused_window_title()})
                 continue
-
-            if not text:
-                continue
-            # Known-device speech: checked on EVERY transcript (so the
-            # split-line join below always sees the previous fragment), acted
-            # on after the existing gates. Never buffered (so never learned
-            # from) and never a wake nudge. Source name only in the log.
-            _dev = _device_speech_batch_source(text)
-            if is_ambient_music(text):
-                continue
-            if callable(is_valid_speech):
-                ok, _reason = is_valid_speech(text, conf, peak_rms=rms)
-                if not ok:
-                    continue
-            if _dev:
-                print(f"  [ambient-listen] device speech ignored ({_dev})")
-                continue
-
-            # Identify the speaker for this batch BEFORE persisting so
-            # downstream consumers (anticipation, banter, per-speaker
-            # routing) see a stable speaker_id on every transcript. The
-            # call is best-effort: None when resemblyzer is missing, no
-            # one is enrolled, or the embedding doesn't clear the
-            # confidence threshold — single-user mode stays untouched.
-            speaker_id, speaker_score = _identify_speaker_safe(audio, sample_rate)
-
-            entry = {
-                "ts": time.time(),
-                "text": text,
-                "no_speech_prob": float(conf.get("no_speech_prob", 1.0)),
-                "avg_logprob":    float(conf.get("avg_logprob", -10.0)),
-                "rms":            rms,
-                "speaker_id":     speaker_id,
-                "speaker_score":  float(speaker_score),
-            }
-            with _lock:
-                _buffer.append(entry)
-                _trim_buffer(entry["ts"])
-                _persist_state()
-            # Mirror the mic transcript into the multimodal log too so
-            # the extractor sees all three streams in one place.
-            mirror = dict(entry)
-            mirror["source"] = "mic"
-            mirror["window"] = _focused_window_title()
-            _append_jsonl(_AUDIO_JSONL, mirror)
-            _rotate_jsonl_if_needed(_AUDIO_JSONL)
-            _maybe_nudge_wake(text)
+            _keep_batch(audio, rms)
     except Exception as e:
         _last_error = f"worker crashed: {e}"
         print(f"  [ambient-listen] {_last_error}")
@@ -1177,7 +1295,7 @@ def _find_loopback_device(sd) -> Optional[int]:
 def _audio_worker_loop() -> None:
     """WASAPI loopback worker: capture system audio output, Whisper it,
     append to data/ambient_transcripts.jsonl tagged source='system_audio'."""
-    global _audio_heartbeat, _audio_last_error, _audio_entries_total
+    global _audio_heartbeat, _audio_last_error
 
     _ensure_project_on_path()
     try:
@@ -1303,6 +1421,56 @@ def _audio_worker_loop() -> None:
     samples_per_batch = int(dev_sr * batch_secs)
     pending: list[np.ndarray] = []
     pending_samples = 0
+    # AMBIENT_STT_YIELD: None when the flag is off (see _SttYield).
+    stt_yield = (_SttYield(b, "ambient-audio")
+                 if getattr(b, "AMBIENT_STT_YIELD", False) is True else None)
+
+    def _keep_batch(audio, rms, cap_ts=None, ctx=None):
+        """Transcribe one batch and log it. cap_ts / ctx are set only for a
+        batch the STT yield parked: it keeps its capture time and window."""
+        global _audio_last_error, _audio_entries_total
+        try:
+            text, conf = transcribe(audio)
+        except Exception as e:
+            _audio_last_error = f"transcribe failed: {e}"
+            print(f"  [ambient-audio] {_audio_last_error}")
+            return
+
+        if not text:
+            return
+        if is_ambient_music(text):
+            return
+        # Re-use the mic's hallucination gate but skip the wake-word
+        # check — system audio is allowed to be free-form.
+        if callable(is_valid_speech):
+            ok, _reason = is_valid_speech(text, conf, peak_rms=rms)
+            if not ok:
+                return
+
+        # Loopback audio sometimes carries a recognisable speaker
+        # too (a Teams call, a YouTube clip of a known voice) — try
+        # to ID them so downstream behaviour (e.g. "your mother is
+        # on a call") has the same speaker_id schema as mic entries.
+        speaker_id, speaker_score = _identify_speaker_safe(audio, sample_rate)
+
+        entry = {
+            "ts": time.time() if cap_ts is None else cap_ts,
+            "source": "system_audio",
+            "text": text,
+            "no_speech_prob": float(conf.get("no_speech_prob", 1.0)),
+            "avg_logprob":    float(conf.get("avg_logprob", -10.0)),
+            "rms": rms,
+            "window": (_focused_window_title() if ctx is None
+                       else ctx["window"]),
+            "proc":   _focused_proc_name() if ctx is None else ctx["proc"],
+            "speaker_id":    speaker_id,
+            "speaker_score": float(speaker_score),
+        }
+        _append_jsonl(_AUDIO_JSONL, entry)
+        _rotate_jsonl_if_needed(_AUDIO_JSONL)
+        with _lock:
+            _audio_entries_total += 1
+            _persist_state()
 
     try:
         while not _audio_stop_evt.is_set():
@@ -1316,6 +1484,13 @@ def _audio_worker_loop() -> None:
                 if _audio_stop_evt.wait(1.0):
                     break
                 continue
+
+            # Parked batches go first, once the owner's turn is over.
+            if stt_yield is not None:
+                for parked in stt_yield.ready():
+                    _keep_batch(*parked)
+                    if _audio_stop_evt.is_set():
+                        break
 
             with q_lock:
                 while audio_q:
@@ -1363,47 +1538,12 @@ def _audio_worker_loop() -> None:
                                             enable_ns=False,
                                             record_mic_stats=False)
 
-            try:
-                text, conf = transcribe(audio)
-            except Exception as e:
-                _audio_last_error = f"transcribe failed: {e}"
-                print(f"  [ambient-audio] {_audio_last_error}")
+            if stt_yield is not None and stt_yield.must_park():
+                stt_yield.park(audio, rms, time.time(),
+                               {"window": _focused_window_title(),
+                                "proc": _focused_proc_name()})
                 continue
-
-            if not text:
-                continue
-            if is_ambient_music(text):
-                continue
-            # Re-use the mic's hallucination gate but skip the wake-word
-            # check — system audio is allowed to be free-form.
-            if callable(is_valid_speech):
-                ok, _reason = is_valid_speech(text, conf, peak_rms=rms)
-                if not ok:
-                    continue
-
-            # Loopback audio sometimes carries a recognisable speaker
-            # too (a Teams call, a YouTube clip of a known voice) — try
-            # to ID them so downstream behaviour (e.g. "your mother is
-            # on a call") has the same speaker_id schema as mic entries.
-            speaker_id, speaker_score = _identify_speaker_safe(audio, sample_rate)
-
-            entry = {
-                "ts": time.time(),
-                "source": "system_audio",
-                "text": text,
-                "no_speech_prob": float(conf.get("no_speech_prob", 1.0)),
-                "avg_logprob":    float(conf.get("avg_logprob", -10.0)),
-                "rms": rms,
-                "window": _focused_window_title(),
-                "proc":   _focused_proc_name(),
-                "speaker_id":    speaker_id,
-                "speaker_score": float(speaker_score),
-            }
-            _append_jsonl(_AUDIO_JSONL, entry)
-            _rotate_jsonl_if_needed(_AUDIO_JSONL)
-            with _lock:
-                _audio_entries_total += 1
-                _persist_state()
+            _keep_batch(audio, rms)
     except Exception as e:
         _audio_last_error = f"audio worker crashed: {e}"
         print(f"  [ambient-audio] {_audio_last_error}")
