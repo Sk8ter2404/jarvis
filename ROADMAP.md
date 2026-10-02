@@ -13,13 +13,13 @@ Status: ☐ todo · ◐ in progress · ☑ done.
 
 ## Where it stands today
 
-*Status lines refreshed 2026-10-02 (v2.0.173); the survey text below them is
+*Status lines refreshed 2026-10-02 (v2.0.174); the survey text below them is
 from 2026-07-09.*
 
 ~530K lines of tracked Python (~230K outside `tests/`), local-first Windows
 voice assistant. `mic → Whisper (Parakeet optional) → the local Ollama brain or
 Claude emits [ACTION: …] → ~440 handlers (705 action names) → edge-TTS /
-Kokoro`. Release `VERSION` 2.0.173, every release tagged from
+Kokoro`. Release `VERSION` 2.0.174, every release tagged from
 `v1.0.0-beta.1`; the self-upgrade pipeline's internal CHANGELOG counter is a
 SEPARATE axis. CI runs the light test tier on Linux and gates coverage at 80%.
 Genuinely strong: mature voice stack, cloud-optional (the local model answers
