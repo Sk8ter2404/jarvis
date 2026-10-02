@@ -505,6 +505,8 @@ class RagRegisterConfigPushTests(unittest.TestCase):
                                "http://cfg:1/api/embeddings", create=True), \
              mock.patch.object(real_cfg, "RAG_RERANKER_MODEL",
                                "cfg-rerank", create=True), \
+             mock.patch.object(real_cfg, "RAG_EXCLUDE_GLOBS",
+                               ["*cfg-secret*"], create=True), \
              mock.patch.object(self.mod, "_rag", return_value=rag), \
              mock.patch.object(self.mod, "RAG_AUTOSTART", True), \
              mock.patch.object(_thr.Thread, "start",
@@ -512,6 +514,7 @@ class RagRegisterConfigPushTests(unittest.TestCase):
             self.mod.register(actions)
         rag.configure.assert_called_once_with(
             rag_index_paths=["X:/docs"],
+            rag_exclude_globs=["*cfg-secret*"],
             rag_embed_model="cfg-embed",
             rag_ollama_endpoint="http://cfg:1/api/embeddings",
             rag_reranker_model="cfg-rerank",
@@ -530,10 +533,11 @@ class RagRegisterConfigPushTests(unittest.TestCase):
         from core import config as real_cfg
         rag = _fake_rag(available=False)  # unavailable → no autostart thread
         rag.RAG_INDEX_PATHS = ["D:/fallback-docs"]
+        rag.RAG_EXCLUDE_GLOBS = ["*fallback-secret*"]
         rag.RAG_EMBED_MODEL = "fallback-embed"
         rag.RAG_OLLAMA_ENDPOINT = "http://fallback:11434/api/embeddings"
         rag.RAG_RERANKER_MODEL = "fallback-rerank"
-        keys = ("RAG_INDEX_PATHS", "RAG_EMBED_MODEL",
+        keys = ("RAG_INDEX_PATHS", "RAG_EXCLUDE_GLOBS", "RAG_EMBED_MODEL",
                 "RAG_OLLAMA_ENDPOINT", "RAG_RERANKER_MODEL")
         saved = {k: getattr(real_cfg, k) for k in keys if hasattr(real_cfg, k)}
         actions = {}
@@ -548,11 +552,42 @@ class RagRegisterConfigPushTests(unittest.TestCase):
                 setattr(real_cfg, k, v)
         rag.configure.assert_called_once_with(
             rag_index_paths=["D:/fallback-docs"],
+            rag_exclude_globs=["*fallback-secret*"],
             rag_embed_model="fallback-embed",
             rag_ollama_endpoint="http://fallback:11434/api/embeddings",
             rag_reranker_model="fallback-rerank",
         )
         self.assertIn("rag_search", actions)
+
+    def test_exclude_push_reaches_the_real_indexer(self):
+        # End to end with the REAL indexer code (its heavy deps are lazy, and
+        # autostart is off, so nothing imports chromadb): the list in
+        # core.config is what the indexer then filters with. setUp's stub
+        # owns sys.modules["core.rag_indexer"], so load a private copy of the
+        # real file — nothing else ever sees it.
+        import importlib.util
+        import os
+        from core import config as real_cfg
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "core", "rag_indexer.py")
+        spec = importlib.util.spec_from_file_location("_rag_indexer_e2e", path)
+        real_rag = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real_rag)
+        self.assertTrue(hasattr(real_rag, "_is_excluded"))
+        owner_list = ["*/Private/*", "*diary*"]
+        with mock.patch.object(real_cfg, "RAG_ENABLED", True, create=True), \
+             mock.patch.object(real_cfg, "RAG_INDEX_PATHS",
+                               ["X:/docs"], create=True), \
+             mock.patch.object(real_cfg, "RAG_EXCLUDE_GLOBS", owner_list,
+                               create=True), \
+             mock.patch.object(self.mod, "_rag", return_value=real_rag), \
+             mock.patch.object(self.mod, "RAG_AUTOSTART", False):
+            self.mod.register({})
+        self.assertEqual(real_rag.RAG_EXCLUDE_GLOBS, owner_list)
+        self.assertIsNot(real_rag.RAG_EXCLUDE_GLOBS, owner_list)  # a copy
+        self.assertTrue(real_rag._is_excluded(r"X:\docs\My Diary.md"))
+        self.assertTrue(real_rag._is_excluded("X:/docs/private/plan.md"))
+        self.assertFalse(real_rag._is_excluded("X:/docs/plan.md"))
 
 
 class RagConfigDeadKnobInvariantTests(unittest.TestCase):

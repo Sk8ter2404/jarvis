@@ -2079,6 +2079,43 @@ RAG_INDEX_PATHS = [
 RAG_EMBED_MODEL     = "nomic-embed-text"
 RAG_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/embeddings"
 RAG_RERANKER_MODEL  = "BAAI/bge-reranker-base"
+# RAG_EXCLUDE_GLOBS — what file search must never read. fnmatch globs, matched
+# case-insensitively, with / and \ treated alike. Two kinds:
+#   * a pattern WITH a slash is matched against the whole path
+#     ("*/node_modules/*" skips every node_modules folder);
+#   * a pattern WITHOUT a slash is matched against the file's NAME and the
+#     name of every folder between the watched root and the file, so
+#     "*password*" skips "Router Passwords.txt" AND "Passwords/bank.md".
+#     Folders at or above the watched root (your user folder, the root
+#     itself) are never tested, so a root under ".../Compass/" still works.
+# The first block is the indexer's structural skips. The second is the
+# secret-shaped names: passwords, secrets, credentials, tokens, API and
+# private keys, .env / id_rsa / .pem / .key / .pfx / .kdbx files, wallets,
+# recovery and backup codes, BitLocker, 2FA, and device-inventory exports.
+# The third is every .csv / .tsv export: they often hold credential or device
+# dumps. "*pass*" also catches names like "compass" or "passport" on purpose:
+# for secrets a missed search beats a leaked one.
+# A file that is already indexed and later matches a pattern is DROPPED from
+# the index on the next scan (the file itself is never touched).
+# OVERRIDE = REPLACE: a RAG_EXCLUDE_GLOBS saved in data/user_settings.json
+# REPLACES this whole list; it is NOT merged with it. To add a pattern, copy
+# the full list into the settings file and add to the copy — a saved list
+# without the secret patterns lets secret files be indexed again.
+RAG_EXCLUDE_GLOBS = [
+    # structural
+    "*/.git/*", "*/node_modules/*", "*/__pycache__/*", "*/.venv/*",
+    "*/venv/*", "*/dist/*", "*/build/*", "*/.cache/*", "*/.next/*",
+    "*/Library/Caches/*", "*/AppData/Local/*", "*/AppData/Roaming/*",
+    "*.tmp", "*.lock", "*.cache",
+    # secret-shaped names
+    "*pass*", "*password*", "*passwd*", "*secret*", "*credential*",
+    "*creds*", "*token*", "*apikey*", "*api?key*", "*private?key*",
+    "*privatekey*", "*.env*", "*id_rsa*", "*.pem*", "*.key*", "*.pfx*",
+    "*.kdbx*", "*wallet*", "*recovery*", "*bitlocker*", "*2fa*",
+    "*backup?codes*", "*backupcodes*", "*level?devices*",
+    # spreadsheet exports
+    "*.csv", "*.tsv",
+]
 
 
 # ─── Robot eye / mouth scaling (Phase 1E) ──────────────────────────────

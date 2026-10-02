@@ -217,7 +217,9 @@ def rag_status(_: str = "") -> str:
 def rag_configure(arg: str = "") -> str:
     """Set RAG_* config at runtime. Format: 'key=value' (key is the
     lowercased suffix after RAG_, e.g. 'embed_model', 'index_paths').
-    `index_paths` and `exclude_globs` accept comma-separated values."""
+    `index_paths` and `exclude_globs` accept comma-separated values, and
+    REPLACE the current list (for exclude_globs that includes the shipped
+    secret-file patterns, until the next restart)."""
     rag = _rag()
     if rag is None:
         return "Personal RAG module not loaded, sir."
@@ -319,10 +321,14 @@ def register(actions: dict) -> None:
     # manual rag_configure voice action. Safe at register time — no
     # embedder/reranker/collection singleton exists yet, so the
     # invalidation branches in rag_indexer.configure() are no-ops.
+    # RAG_EXCLUDE_GLOBS rides along so a list saved in user_settings.json
+    # (which REPLACES the shipped secret-file excludes — see core/config.py)
+    # is what the indexer actually filters with.
     try:
         from core import config as _cfg
         rag.configure(
             rag_index_paths=list(getattr(_cfg, "RAG_INDEX_PATHS", rag.RAG_INDEX_PATHS)),
+            rag_exclude_globs=list(getattr(_cfg, "RAG_EXCLUDE_GLOBS", rag.RAG_EXCLUDE_GLOBS)),
             rag_embed_model=getattr(_cfg, "RAG_EMBED_MODEL", rag.RAG_EMBED_MODEL),
             rag_ollama_endpoint=getattr(_cfg, "RAG_OLLAMA_ENDPOINT", rag.RAG_OLLAMA_ENDPOINT),
             rag_reranker_model=getattr(_cfg, "RAG_RERANKER_MODEL", rag.RAG_RERANKER_MODEL),

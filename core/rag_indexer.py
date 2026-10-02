@@ -41,7 +41,8 @@ Public API
 
 Configuration (read at start time; override via configure()):
     RAG_INDEX_PATHS       — list of folders to index
-    RAG_EXCLUDE_GLOBS     — fnmatch patterns to skip (node_modules, .git, …)
+    RAG_EXCLUDE_GLOBS     — fnmatch patterns to skip (node_modules, .git,
+                            secret-shaped names, .csv/.tsv; core/config.py)
     RAG_EMBED_MODEL       — Ollama embedding model name (default: nomic-embed-text)
     RAG_OLLAMA_ENDPOINT   — Ollama embeddings HTTP endpoint
     RAG_EMBED_BATCH       — chunks per HTTP batch (parallel POSTs)
@@ -56,10 +57,12 @@ Configuration (read at start time; override via configure()):
 from __future__ import annotations
 
 import fnmatch
+import functools
 import hashlib
 import json
 import os
 import queue
+import re
 import threading
 import time
 import urllib.error
@@ -98,12 +101,13 @@ def _default_index_paths() -> list[str]:
 
 # ── tunables (overridable via configure()) ───────────────────────────
 RAG_INDEX_PATHS: list[str] = _default_index_paths()
-RAG_EXCLUDE_GLOBS: list[str] = [
-    "*/.git/*", "*/node_modules/*", "*/__pycache__/*", "*/.venv/*",
-    "*/venv/*", "*/dist/*", "*/build/*", "*/.cache/*", "*/.next/*",
-    "*/Library/Caches/*", "*/AppData/Local/*", "*/AppData/Roaming/*",
-    "*.tmp", "*.lock", "*.cache",
-]
+# ONE copy of the exclude list: core/config.py (structural skips + secret-
+# shaped names + .csv/.tsv exports; matching rules documented there). It used
+# to be a second, private list here that knew no secret names. No fallback on
+# purpose: if core.config cannot import, this module does not import either,
+# and personal_rag reports RAG offline instead of indexing with no excludes.
+from core.config import RAG_EXCLUDE_GLOBS as _CONFIG_EXCLUDE_GLOBS  # noqa: E402
+RAG_EXCLUDE_GLOBS: list[str] = list(_CONFIG_EXCLUDE_GLOBS)
 RAG_EMBED_MODEL: str = "nomic-embed-text"
 RAG_OLLAMA_ENDPOINT: str = "http://127.0.0.1:11434/api/embeddings"
 RAG_EMBED_BATCH: int = 16  # parallel POSTs per encode() call
@@ -166,11 +170,65 @@ _stats = {
 
 
 # ── helpers ──────────────────────────────────────────────────────────
-def _is_excluded(path: str) -> bool:
-    norm = path.replace("\\", "/")
-    for pat in RAG_EXCLUDE_GLOBS:
-        if fnmatch.fnmatch(norm, pat):
-            return True
+def _norm_path(path) -> str:
+    """The form every exclude comparison uses: forward slashes, lower case.
+    fnmatch.fnmatch() is case-insensitive on Windows but case-SENSITIVE on
+    Linux, so the matcher lowers both sides and uses fnmatchcase."""
+    return str(path or "").replace("\\", "/").lower()
+
+
+@functools.lru_cache(maxsize=8)
+def _compiled_excludes(globs: tuple) -> tuple:
+    """(whole-path regex, name regex) for one exclude list; None when that
+    kind has no patterns. A pattern with a slash is a whole-path pattern; one
+    without is a name pattern (see _is_excluded)."""
+    path_parts: list[str] = []
+    name_parts: list[str] = []
+    for g in globs:
+        pat = _norm_path(g).strip()
+        if not pat:
+            continue
+        (path_parts if "/" in pat else name_parts).append(fnmatch.translate(pat))
+    path_rx = re.compile("|".join(path_parts)) if path_parts else None
+    name_rx = re.compile("|".join(name_parts)) if name_parts else None
+    return path_rx, name_rx
+
+
+def _names_below_root(norm: str) -> list[str]:
+    """The file's name plus the name of every folder between the watched root
+    holding `norm` (the longest matching RAG_INDEX_PATHS entry) and the file.
+    Folders at or above the root are left out, so a user folder that happens
+    to contain "pass" or "token" can't hide everything under it. A path under
+    no root yields its file name only."""
+    best = ""
+    for root in RAG_INDEX_PATHS or ():
+        r = _norm_path(root).rstrip("/")
+        if r and len(r) > len(best) and norm.startswith(r + "/"):
+            best = r
+    rel = norm[len(best) + 1:] if best else norm.rsplit("/", 1)[-1]
+    return [part for part in rel.split("/") if part]
+
+
+def _is_excluded(path: str, is_dir: bool = False) -> bool:
+    """True when RAG_EXCLUDE_GLOBS says never to read `path`.
+
+    Case-insensitive, / and \\ alike, on both sides. A pattern containing a
+    slash ("*/node_modules/*") is matched against the whole path (and, for a
+    folder, the path plus a trailing slash). A pattern without one
+    ("*password*", "*.csv") is matched against the file name and every folder
+    name below the watched root — so the walk, the watcher and the index's
+    garbage-collect pass all agree on what is excluded."""
+    globs = RAG_EXCLUDE_GLOBS
+    if isinstance(globs, str):          # one pattern, not its letters
+        globs = [globs]
+    path_rx, name_rx = _compiled_excludes(
+        tuple(g for g in (globs or ()) if isinstance(g, str)))
+    norm = _norm_path(path).rstrip("/")
+    if path_rx is not None and (path_rx.match(norm) or (
+            is_dir and path_rx.match(norm + "/"))):
+        return True
+    if name_rx is not None:
+        return any(name_rx.match(n) for n in _names_below_root(norm))
     return False
 
 
@@ -529,12 +587,11 @@ def _iter_files(root: str) -> Iterable[str]:
     """Recursively walk `root`, yielding absolute paths of supported,
     non-excluded files within the size budget."""
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune excluded directories cheaply by filtering dirnames.
+        # Prune excluded directories cheaply by filtering dirnames — through
+        # the same _is_excluded the watcher and the GC pass use.
         keep = []
         for d in dirnames:
-            full = os.path.join(dirpath, d).replace("\\", "/")
-            if any(fnmatch.fnmatch(full + "/", p) or fnmatch.fnmatch(full, p)
-                   for p in RAG_EXCLUDE_GLOBS):
+            if _is_excluded(os.path.join(dirpath, d), is_dir=True):
                 continue
             keep.append(d)
         dirnames[:] = keep
@@ -723,23 +780,37 @@ def index_once(progress: Optional[Callable[[str, int], None]] = None,
         if _stop_flag.is_set():
             break
 
-    # Garbage-collect: drop chunks whose file_id no longer appears on disk.
+    # Garbage-collect: drop chunks whose file no longer exists on disk, AND
+    # chunks of a file that now matches RAG_EXCLUDE_GLOBS. The second half is
+    # new: a file indexed before its pattern was added (a passwords file, a
+    # .csv device export) used to stay searchable forever, because the walk
+    # merely stopped visiting it while the file itself stayed on disk.
+    excluded_dropped = 0
     try:
         coll = _get_collection()
         existing = coll.get(include=["metadatas"])
         metas = existing.get("metadatas") or []
         ids = existing.get("ids") or []
-        stale_ids = [
-            cid for cid, m in zip(ids, metas)
-            if isinstance(m, dict)
-            and m.get("file_id") not in seen_files
-            and m.get("path")
-            and not os.path.isfile(str(m.get("path", "")))
-        ]
+        excluded_memo: dict[str, bool] = {}
+        stale_ids: list = []
+        for cid, m in zip(ids, metas):
+            if not isinstance(m, dict) or not m.get("path"):
+                continue
+            p = str(m.get("path", ""))
+            if p not in excluded_memo:
+                excluded_memo[p] = _is_excluded(p)
+            if excluded_memo[p]:
+                stale_ids.append(cid)
+            elif m.get("file_id") not in seen_files and not os.path.isfile(p):
+                stale_ids.append(cid)
         if stale_ids:
             coll.delete(ids=stale_ids)
+        excluded_dropped = sum(1 for hit in excluded_memo.values() if hit)
+        if excluded_dropped:
+            print(f"  [rag] dropped {excluded_dropped} file(s) from the index "
+                  f"that now match RAG_EXCLUDE_GLOBS")
     except Exception:
-        pass
+        excluded_dropped = 0
 
     with _lock:
         _last_full_scan_ts = time.time()
@@ -749,6 +820,7 @@ def index_once(progress: Optional[Callable[[str, int], None]] = None,
             "files_indexed_total": _stats["files_indexed"],
             "chunks_written_total": _stats["chunks_written"],
             "errors": _stats["errors"],
+            "excluded_dropped": excluded_dropped,
             "ts": _last_full_scan_ts,
         }
 
@@ -800,13 +872,20 @@ def _start_watchdog() -> bool:
         def on_any_event(self, event):  # noqa: ARG002
             if event.is_directory:
                 return
-            path = getattr(event, "dest_path", "") or event.src_path
-            if not path or not _supported(path) or _is_excluded(path):
-                return
-            try:
-                _event_q.put_nowait(path)
-            except Exception:
-                pass
+            # A rename (dest_path set) queues the NEW name to index AND the
+            # OLD one, which no longer exists, so the drain deletes its
+            # chunks. Without the old one, a note renamed to an excluded
+            # name ("passwords.txt") stayed searchable under its old name
+            # until the next full scan.
+            dest = getattr(event, "dest_path", "") or ""
+            src = getattr(event, "src_path", "") or ""
+            for path in ((dest, src) if dest else (src,)):
+                if not path or not _supported(path) or _is_excluded(path):
+                    continue
+                try:
+                    _event_q.put_nowait(path)
+                except Exception:
+                    pass
 
     obs = Observer()
     handler = _Handler()
