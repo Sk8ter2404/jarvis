@@ -241,6 +241,27 @@ class LooksLikeQuestionTests(unittest.TestCase):
                 self.assertFalse(cv.looks_like_question(text))
 
 
+class AsksOwnerTests(unittest.TestCase):
+    """asks_owner reads a REPLY: does it wait on the owner (a question or an
+    offer)? core/turn_checker.py never retries such a turn."""
+
+    def test_questions_and_offers(self):
+        for text in ("For how long, sir?", "Which room, sir?",
+                     "Done, sir. Anything else?",
+                     "[intent:curious] Shall I open it for you, sir",
+                     "I'll queue some jazz if you'd like, sir.",
+                     "Say the word and I'll start it, sir."):
+            with self.subTest(text=text):
+                self.assertTrue(cv.asks_owner(text))
+
+    def test_statements(self):
+        for text in ("Very good, sir.", "I've set a timer, sir.",
+                     "It is 3:15 PM, sir.", "Let me know if you need me.",
+                     "[intent:query] On it.", "", "   "):
+            with self.subTest(text=text):
+                self.assertFalse(cv.asks_owner(text))
+
+
 class LibertyAndLookupClaimTests(unittest.TestCase):
     """Live v2.0.131 (2026-09-29): "tell me something interesting" ->
     "I've taken the liberty of searching for something truly fascinating,
