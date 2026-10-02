@@ -253,7 +253,7 @@ def _webcam_health() -> list[dict]:
             face_at = seen_at.get(idx, 0.0) or 0.0
             _side = _cam_side(cam)
             # Reading fine but every frame black (the monolith's
-            # _CAMERA_BLACK_FRAME_MEAN): never live, whatever the last real
+            # _CAMERA_BLACK_FRAME_LEVEL): never live, whatever the last real
             # frame's age.
             _black_ts = black_at.get(idx, 0.0) or 0.0
             black = bool(_black_ts and (now - _black_ts) <= _WEBCAM_LIVE_SECONDS)

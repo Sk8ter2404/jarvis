@@ -8611,31 +8611,39 @@ def _frame_brightness_for_dark_check(bgr: "np.ndarray | None") -> float:
       • a HIGH PERCENTILE (95th) of the whole frame, so any concentrated bright
         region (a face lit by a monitor anywhere in frame) keeps color.
 
-    Returns 0.0 for None/empty. Pure + cheap; NEVER raises. Only the IR-switch
-    decision uses this; _frame_mean_brightness stays the plain whole-frame mean."""
+    Returns 0.0 for None/empty. Pure + cheap; NEVER raises. The IR switch and
+    the webcam black-frame test (_webcam_frame_brightness, which reads the
+    raising core below so an error is never a black reading) use this score;
+    _frame_mean_brightness stays the plain whole-frame mean."""
     try:
         if bgr is None or getattr(bgr, "size", 0) == 0:
             return 0.0
-        arr = np.asarray(bgr)
-        h = arr.shape[0]
-        w = arr.shape[1] if arr.ndim >= 2 else 0
-        if h <= 0 or w <= 0:
-            return float(np.mean(arr))
-        # Center crop: middle ~40% in each axis (at least 1px so tiny frames work).
-        y0 = int(h * 0.3)
-        y1 = max(y0 + 1, int(h * 0.7))
-        x0 = int(w * 0.3)
-        x1 = max(x0 + 1, int(w * 0.7))
-        center = arr[y0:y1, x0:x1]
-        center_mean = float(np.mean(center)) if center.size else 0.0
-        # 95th percentile over the whole frame catches a bright patch anywhere.
-        try:
-            hi_pct = float(np.percentile(arr, 95.0))
-        except Exception:
-            hi_pct = float(np.max(arr))
-        return max(center_mean, hi_pct)
+        return _dark_check_score(bgr)
     except Exception:
         return 0.0
+
+
+def _dark_check_score(bgr) -> float:
+    """The score behind _frame_brightness_for_dark_check, for a non-empty
+    frame. RAISES on a frame it cannot measure."""
+    arr = np.asarray(bgr)
+    h = arr.shape[0]
+    w = arr.shape[1] if arr.ndim >= 2 else 0
+    if h <= 0 or w <= 0:
+        return float(np.mean(arr))
+    # Center crop: middle ~40% in each axis (at least 1px so tiny frames work).
+    y0 = int(h * 0.3)
+    y1 = max(y0 + 1, int(h * 0.7))
+    x0 = int(w * 0.3)
+    x1 = max(x0 + 1, int(w * 0.7))
+    center = arr[y0:y1, x0:x1]
+    center_mean = float(np.mean(center)) if center.size else 0.0
+    # 95th percentile over the whole frame catches a bright patch anywhere.
+    try:
+        hi_pct = float(np.percentile(arr, 95.0))
+    except Exception:
+        hi_pct = float(np.max(arr))
+    return max(center_mean, hi_pct)
 
 
 def _ir_gray_to_bgr_canvas(ir_gray: "np.ndarray", width: int,
@@ -9093,13 +9101,22 @@ _CAMERA_FRAME_LIVE_S = 5.0
 # returns True - while every frame is black, and the producer cached and
 # stamped those like any other: camera_status said "live", and look_around and
 # face enrolment (behind _fresh_camera_frame) used a black picture. A frame
-# whose mean brightness is under this is neither cached nor stamped; the
-# camera's read error says so, and _camera_black_frame_at (index -> time of the
-# latest black frame, dropped by the next real one) lets camera_status name it.
-# A pitch-dark room reads the same, and is just as unusable for vision. The
-# mean is taken on every 4th row/column: the loop reads ~20 frames a second.
-_CAMERA_BLACK_FRAME_MEAN = 10.0
-_CAMERA_BLACK_FRAME_ERROR = "delivering black frames (mean brightness {:.1f}/255)"
+# whose brightness is under this is neither cached nor stamped; the camera's
+# read error says so, and _camera_black_frame_at (index -> time of the latest
+# black frame, dropped by the next real one) lets camera_status name it. A
+# pitch-dark room reads the same, and is just as unusable for vision.
+# BRIGHTNESS IS THE DARK-CHECK SCORE, NOT THE WHOLE-FRAME MEAN (2026-10-02
+# review): the larger of the centre crop's mean and the 95th percentile
+# (_frame_brightness_for_dark_check, P2-5). A monitor-lit face on a dark wall,
+# or one lamp in a corner, puts the whole-frame mean under 10 while the picture
+# is perfectly usable; any lit region keeps the frame live, so only a frame
+# that is dark nearly everywhere is black. It is measured on every 4th
+# row/column: the loop reads ~20 frames a second. The other "black" levels
+# judge other things: the Kinect IR switch is "too dark for colour" (16, same
+# score), and the self-diagnostic's _BLACK_FRAME_MEAN_MIN (1.0, whole-frame
+# mean) is "the sensor sees nothing" - a lens cap, not a dark room.
+_CAMERA_BLACK_FRAME_LEVEL = 10.0
+_CAMERA_BLACK_FRAME_ERROR = "delivering black frames (brightness {:.1f}/255)"
 _camera_black_frame_at: dict[int, float] = {}
 # The newest BLACK frame while a black run lasts (dropped with
 # _camera_black_frame_at by the next real frame). Never a live picture: only
@@ -9111,13 +9128,16 @@ _camera_black_warned_at: dict[int, float] = {}
 
 
 def _webcam_frame_brightness(frame) -> float | None:
-    """Mean brightness of a strided sample of ``frame`` (see
-    _CAMERA_BLACK_FRAME_MEAN), or None when it cannot be measured - which is
+    """Dark-check brightness of a strided sample of ``frame`` (see
+    _CAMERA_BLACK_FRAME_LEVEL), or None when it cannot be measured - which is
     never treated as black. NEVER raises."""
     try:
         if frame is None or getattr(frame, "size", 0) == 0:
             return None
-        return _frame_mean_brightness(frame[::4, ::4])
+        sample = frame[::4, ::4]
+        if getattr(sample, "size", 0) == 0:
+            return None
+        return _dark_check_score(sample)
     except Exception:
         return None
 
@@ -9131,7 +9151,7 @@ def _warn_black_camera_frames(label: str, idx: int, mean: float,
             return
         _camera_black_warned_at[idx] = now
         print(f"  [face-track] {label} (index {idx}) is delivering black frames "
-              f"(mean brightness {mean:.1f}/255) - not treated as live. A "
+              f"(brightness {mean:.1f}/255) - not treated as live. A "
               f"saturated USB controller (the Kinect) or an unlit room does this")
     except Exception:
         pass
@@ -12119,10 +12139,10 @@ def _face_tracking_thread_body():
                 if _camera_gate is not None:
                     _camera_gate.note_frame(_camera_gate_key(cam))
                 # Cache frame for see_user action regardless of face detection
-                # - unless it is BLACK (see _CAMERA_BLACK_FRAME_MEAN): that is
+                # - unless it is BLACK (see _CAMERA_BLACK_FRAME_LEVEL): that is
                 # recorded as the camera's read error, never as a live frame.
                 _bright = _webcam_frame_brightness(frame)
-                _black = _bright is not None and _bright < _CAMERA_BLACK_FRAME_MEAN
+                _black = _bright is not None and _bright < _CAMERA_BLACK_FRAME_LEVEL
                 with _camera_state_lock:
                     if _black:
                         _camera_black_frame_at[cam["index"]] = now_loop

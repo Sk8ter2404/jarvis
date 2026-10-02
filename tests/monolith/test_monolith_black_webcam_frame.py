@@ -25,8 +25,8 @@ _CAMS = [{"index": 0, "label": "Right webcam (top of right monitor)",
           "look_x": 0.85, "look_y": 0.5}]
 
 
-@requires_monolith
-class BlackWebcamFrameTests(MonolithGlobalsTestCase):
+class _ProducerHarness(MonolithGlobalsTestCase):
+    """setUp + one REAL producer iteration; no tests of its own."""
 
     def setUp(self):
         import numpy as np
@@ -64,6 +64,10 @@ class BlackWebcamFrameTests(MonolithGlobalsTestCase):
             bc._face_tracking_thread_body()
         self.assertGreater(cap.reads, 0, "setup wrong: the camera was never read")
 
+
+@requires_monolith
+class BlackWebcamFrameTests(_ProducerHarness):
+
     def test_a_lit_frame_is_cached_as_live(self):
         """Control, so the black case below cannot pass for the wrong reason."""
         self._run_one_iteration(self.lit)
@@ -92,6 +96,35 @@ class BlackWebcamFrameTests(MonolithGlobalsTestCase):
         self.assertNotIn(0, bc._camera_black_frame_at)
         self.assertIsNone(bc._camera_last_read_error.get(0))
 
+    def test_a_dim_room_with_a_lit_face_is_live(self):
+        """A monitor-lit face on a dark wall: the WHOLE-frame mean is under the
+        black level (about 6/255), yet the picture is perfectly usable. The
+        P2-5 note on _frame_brightness_for_dark_check is about exactly this
+        frame; the black test must not drop it (2026-10-02 review)."""
+        frame = self.np.full((72, 128, 3), 2, dtype=self.np.uint8)
+        frame[29:44, 52:77] = 120                       # the face, ~4% of it
+        self.assertLess(float(frame.mean()), 10.0, "setup: not a dim frame")
+        self._run_one_iteration(frame)
+        bc = self.bc
+        self.assertNotIn(0, bc._camera_black_frame_at,
+                         "a dim but usable picture was called black")
+        fr, _ts = bc._fresh_camera_frame(0)
+        self.assertIsNotNone(fr)
+
+    def test_a_bright_corner_alone_keeps_the_frame_live(self):
+        # A lamp in the corner of an otherwise dark room: still a picture.
+        frame = self.np.full((72, 128, 3), 1, dtype=self.np.uint8)
+        frame[0:20, 0:40] = 90                          # ~9% of the frame
+        self._run_one_iteration(frame)
+        self.assertNotIn(0, self.bc._camera_black_frame_at)
+
+    def test_an_unmeasurable_frame_is_not_black(self):
+        """_webcam_frame_brightness promises None - never 'black' - when it
+        cannot measure a frame; a helper that returns 0.0 on its own error must
+        not turn that error into a black reading."""
+        weird = self.np.array([[["x"] * 3] * 8] * 8, dtype=object)
+        self.assertIsNone(self.bc._webcam_frame_brightness(weird))
+
     def test_camera_status_says_black_frames_not_live(self):
         """The spoken surface: what the producer wrote, read by the real skill."""
         self._run_one_iteration(self.black)
@@ -106,7 +139,7 @@ class BlackWebcamFrameTests(MonolithGlobalsTestCase):
 
 
 @requires_monolith
-class SelfDiagnosticSeesTheBlackRunTests(BlackWebcamFrameTests):
+class SelfDiagnosticSeesTheBlackRunTests(_ProducerHarness):
     """The self-diagnostic's webcam probe judges the PRODUCER's frames when the
     producer owns the camera (skills/self_diagnostic._producer_latest_frame).
     Once black frames stopped being cached and stamped, it judged the last LIT
