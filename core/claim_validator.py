@@ -348,7 +348,8 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 # is twelve", "I've calculated it, sir: 391". A calculate-family claim in a
 # reply that carries one is the working shown, not an invented action.
 _ARITH_RESULT_RE = re.compile(
-    r"(?:\bis|\bequals|=|\bcomes\s+(?:out\s+)?to|\bgives|\bmakes|:)\s*"
+    r"(?:\bis|'s|\bequals|=|\bcomes\s+(?:out\s+)?(?:to|at)|"
+    r"\bworks\s+out\s+(?:to|at)|\bgives|\bmakes|:)\s*"
     r"(?:about\s+|roughly\s+|approximately\s+|exactly\s+|around\s+)?"
     r"(?:-?\d|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
     r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"

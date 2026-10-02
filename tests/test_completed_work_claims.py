@@ -94,7 +94,9 @@ class CalculateFamilyTests(unittest.TestCase):
         for text in ("Let me calculate that: fifteen percent of eighty is "
                      "twelve, sir.",
                      "I've calculated it, sir: 391.",
-                     "Calculating: 100 °F is 37.8 °C, sir."):
+                     "Calculating: 100 °F is 37.8 °C, sir.",
+                     "Calculating... that's 12, sir.",
+                     "It works out to 391, sir - I've calculated it."):
             with self.subTest(text=text):
                 self.assertIsNone(cv.find_unverified_claim(
                     text, user_text="what's fifteen percent of eighty"))
