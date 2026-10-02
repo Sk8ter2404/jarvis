@@ -122,6 +122,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "all cameras", "every camera", "both cameras", "camera status",
         "what cameras", "where am i", "what am i doing", "what's my status",
         "look around", "see everywhere",
+        # 2026-10-01 brain eval (cam-01): 'can you tell where I'm sitting'
+        # loaded nothing, so situational_awareness never reached the model.
+        "where i'm sitting", "where im sitting", "where i am sitting",
+        "am i sitting", "where i'm standing", "where i am standing",
+        "am i standing", "how far back am i",
         # 2026-09-06 live regression: "are both webcams ok" and "can you check
         # if both webcams are still working" BOTH emitted system_pulse and
         # answered with CPU/memory percentages, never mentioning a camera. The
@@ -170,6 +175,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # "unmute" needs its own entry: keywords match at a word start now,
         # so "mute" no longer fires inside it.
         "sound back on", "unmute",
+        # 2026-10-01 brain eval (media-05): 'kill the sound completely'
+        # loaded nothing, so volume_mute never reached the model. Verb +
+        # object only: a bare "sound" would ride every "sounds good".
+        "kill the sound", "cut the sound", "kill the audio", "cut the audio",
+        "kill the volume", "turn off the sound", "turn the sound off",
     ],
     "AUDIO OUTPUT DEVICE": [
         "headset", "headphones", "speakers", "output device", "switch audio",
@@ -256,10 +266,18 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         " c drive", " c: drive", "disk space", "drive space", "free space",
         "space left", "space is left", "much space", "storage", "hard drive",
         "ssd", "usb",
+        # 2026-10-01 brain eval (sys-02): 'how much video memory is free'
+        # loaded MUSIC + VIDEO PLAYBACK and both memory sections on the
+        # header words "video" / "memory", but never this one (gpu_usage).
+        "video memory", "graphics memory", "gpu memory",
     ],
     "BAMBU 3D PRINTER": [
         "print", "printer", "printing", "bambu", "3d", "filament", "nozzle",
         "bed", "spool", "ams", "h2d", "gcode", "slice",
+        # 2026-10-01 brain eval (print-04): the chamber-camera panel
+        # (show_printer_camera) is documented here now; 'pull up the chamber
+        # cam' names no other printer word.
+        "chamber cam",
     ],
     "MORNING BRIEFING": [
         "briefing", "brief me", "morning briefing", "good morning", "my day",
@@ -323,6 +341,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # at all ("recap" alone reaches only DAILY RECAP, an app-usage summary).
         # session_memory_recall summarises THIS session too — see its body.
         "talked about", "discussed", "our conversation", "this conversation",
+        # 2026-10-01 brain eval (mem-01): 'sum up what we've been chatting
+        # about today' loaded nothing — "talked about" has no other tense.
+        "chatting about", "chatted about", "been chatting",
+        "been talking about", "we've been talking", "we were talking",
+        "sum up what we", "sum up our",
     ],
     "SESSION RESUME": [
         "resume", "continue", "where were we", "pick up", "carry on",
@@ -602,6 +625,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # 2026-09-29: the section's own future-day example ('will it rain
         # tomorrow') loaded only EVENING / DAILY BRIEFING via "tomorrow".
         "will it rain", "going to rain", "chance of rain",
+        # 2026-10-01: "what's it like outside" named no weather word, so its
+        # follow-up 'and what about tomorrow?' had nothing to inherit.
+        "like outside",
     ],
     "PATTERN LEARNING": [
         "my patterns", "my habits", "learned about me", "my routine",
@@ -696,6 +722,15 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "forget everything", "erase your memory", "forget all of it",
         "start over and forget", "scrub the last hour",
         "never happened",
+        # 2026-10-01 brain eval (mem-03): 'scrub everything from the past
+        # hour' loaded only TIMERS (on "hour"), so forget_last_hour never
+        # reached the model. "past hour" was spelled nowhere; every entry is
+        # a removal verb or the 'everything from the … hour' shape.
+        "scrub everything", "scrub the past hour", "forget the past hour",
+        "wipe the last hour", "wipe the past hour", "erase the last hour",
+        "erase the past hour", "clear the last hour", "clear the past hour",
+        "delete the last hour", "delete the past hour",
+        "everything from the last hour", "everything from the past hour",
     ],
     "PENDING PROMISES": [
         "promise", "promises", "waiting on", "still pending", "owe me",
@@ -924,11 +959,132 @@ def _keyword_hit(kw: str, low: str) -> bool:
         return True
 
 
-def select_sections(user_text: str, sections: List[Tuple[str, str]]) -> Tuple[List[str], List[str]]:
-    """Return (included_section_names, dropped_section_names) for `user_text`."""
+# ── Follow-up routing (2026-10-01 brain eval) ────────────────────────────
+# A follow-up names its subject only in an EARLIER turn. 'Never mind, cancel
+# that.' after 'set a timer for ten minutes' routed nothing, so cancel_timer
+# never reached the model; 'Pause it.' after "how's the print going?" routed
+# MUSIC CONTROLS alone, so pause_print was invisible and pause_music the only
+# pause on offer. When THIS turn is short and elliptical, the router also
+# reads the previous user turn (and one more if that one was elliptical too).
+# Words alone still route as before; history can only ADD sections, and only
+# on a short elliptical turn, so an ordinary turn's prompt does not grow.
+_FOLLOWUP_MAX_WORDS = 6
+_FOLLOWUP_MAX_HOPS = 2
+# Not counted toward the word limit (wake word, fillers, acknowledgements).
+_FOLLOWUP_FILLERS = frozenset({
+    "jarvis", "hey", "ok", "okay", "please", "sir", "um", "uh", "oh", "ha",
+    "hm", "hmm", "well", "so", "right",
+})
+# A word that always points back at something the turn does not name.
+_FOLLOWUP_REFERENTS = frozenset({
+    "it", "them", "they", "other", "same", "again", "that's",
+})
+# Demonstratives point back only when they stand ALONE ('cancel that', 'is
+# that normal', 'skip this one'). Before a noun they are determiners and the
+# turn names its own subject: 'this afternoon', 'that timer'.
+_FOLLOWUP_DEMONSTRATIVES = frozenset({"this", "that", "these", "those"})
+_FOLLOWUP_DEMONSTRATIVE_NEXT = frozenset({
+    "one", "ones", "again", "too", "instead", "now", "for", "to", "on", "off",
+    "up", "down", "in", "into", "out", "over", "back",
+})
+_FOLLOWUP_COPULAS = frozenset({"is", "was", "are", "were", "isn't", "wasn't"})
+# Openers that continue the previous request ('what about tomorrow').
+_FOLLOWUP_LEADS = ("what about", "how about", "and", "also", "never mind",
+                   "nevermind")
+
+
+def is_elliptical_followup(user_text: str) -> bool:
+    """True when ``user_text`` is a short turn that leans on an earlier one:
+    at most _FOLLOWUP_MAX_WORDS words (fillers and the wake word not
+    counted) AND either a back-reference ('it', 'them', 'cancel that', 'the
+    other one') or a continuing opener ('what about …', 'and …', 'never
+    mind'). Never raises."""
+    try:
+        words = [w for w in re.findall(r"[a-z0-9']+", (user_text or "").lower())
+                 if w not in _FOLLOWUP_FILLERS]
+    except Exception:
+        return False
+    if not words or len(words) > _FOLLOWUP_MAX_WORDS:
+        return False
+    joined = " ".join(words)
+    if any(joined == lead or joined.startswith(lead + " ")
+           for lead in _FOLLOWUP_LEADS):
+        return True
+    for i, w in enumerate(words):
+        if w in _FOLLOWUP_REFERENTS:
+            return True
+        if w in _FOLLOWUP_DEMONSTRATIVES and (
+                i == len(words) - 1
+                or words[i + 1] in _FOLLOWUP_DEMONSTRATIVE_NEXT
+                or (i > 0 and words[i - 1] in _FOLLOWUP_COPULAS)):
+            return True
+    return False
+
+
+def _message_text(content) -> str:
+    """Plain text of a chat message's content (a string, or a list of
+    content blocks as the cloud API takes them)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return ""
+
+
+def _prior_user_turns(history, current: str) -> List[str]:
+    """The user turns before ``current``, newest first. ``history`` may end
+    with ``current`` itself (live: _call_llm appends the turn before building
+    the prompt) or stop just before it (the eval harness); both work."""
+    users = []
+    for msg in history or ():
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text = _message_text(msg.get("content")).strip()
+            if text:
+                users.append(text)
+    if users and users[-1] == (current or "").strip():
+        users.pop()
+    return users[::-1]
+
+
+def _routing_parts(user_text: str, history=None) -> List[str]:
+    """``[user_text]``, or — for a short elliptical follow-up with history —
+    ``[user_text, previous user turn(, the one before)]``. Never raises."""
+    text = user_text or ""
+    try:
+        if not history or not is_elliptical_followup(text):
+            return [text]
+        parts = [text]
+        for prev in _prior_user_turns(history, text)[:_FOLLOWUP_MAX_HOPS]:
+            parts.append(" ".join(prev.split()))
+            if not is_elliptical_followup(prev):
+                break
+        return parts
+    except Exception:
+        return [text]
+
+
+def routing_text(user_text: str, history=None) -> str:
+    """The text the router matches keywords against: ``user_text`` alone,
+    or — for a short elliptical follow-up — ``user_text`` plus the previous
+    user turn(s), one per line. Lines never fuse: no keyword spans a newline,
+    so "cancel that" + "timer ..." cannot form a phrase neither turn said."""
+    return "\n".join(_routing_parts(user_text, history))
+
+
+def select_sections(user_text: str, sections: List[Tuple[str, str]],
+                    history=None) -> Tuple[List[str], List[str]]:
+    """Return (included_section_names, dropped_section_names) for `user_text`.
+
+    ``history`` (optional, chat messages) lets a short elliptical follow-up
+    route on the previous user turn as well — see routing_text. Without it,
+    or on any other turn, routing is exactly the words of ``user_text``."""
+    parts = _routing_parts(user_text, history)
+    user_text = "\n".join(parts)
     low = " " + (user_text or "").lower() + " "
     neutral = (_CONVERSION_NEUTRAL_KEYWORDS
-               if is_unit_conversion_request(user_text) else frozenset())
+               if any(is_unit_conversion_request(p) for p in parts)
+               else frozenset())
     included: List[str] = []
     dropped: List[str] = []
     for header, _body in sections:
@@ -954,7 +1110,7 @@ def select_sections(user_text: str, sections: List[Tuple[str, str]]) -> Tuple[Li
             pred = _PREDICATE_ROUTES.get(upper)
             if pred is not None:
                 try:
-                    hit = bool(pred(user_text))
+                    hit = any(bool(pred(p)) for p in parts)
                 except Exception:
                     hit = False
         (included if hit else dropped).append(name)
@@ -993,16 +1149,17 @@ def _section_text(header: str, body: str) -> str:
     return out if isinstance(out, str) and out.strip() else body
 
 
-def slim_pc_control(user_text: str, pc_control: str) -> str:
+def slim_pc_control(user_text: str, pc_control: str, history=None) -> str:
     """Build a slimmed PC_CONTROL for this turn: core preamble + the sections the
     text implicates + a one-line INDEX of what was left out (so the model still
     knows those capabilities exist). Falls back to the full text if parsing finds
-    no sections. Never raises — a bad parse returns the full prompt."""
+    no sections. ``history``: see select_sections. Never raises — a bad parse
+    returns the full prompt."""
     try:
         core, sections = split_pc_control(pc_control)
         if not sections:
             return pc_control
-        included, dropped = select_sections(user_text, sections)
+        included, dropped = select_sections(user_text, sections, history)
         inc_set = set(included)
         parts = [core]
         for header, body in sections:
@@ -1104,18 +1261,21 @@ def stable_pc_block(pc_control: str) -> str:
     return out
 
 
-def turn_pc_block(user_text: str, pc_control: str) -> str:
+def turn_pc_block(user_text: str, pc_control: str, history=None) -> str:
     """The VOLATILE half: the bodies of the sections `user_text` implicates.
 
-    Returns '' when the turn implicates nothing beyond the always-on section
-    set, so a turn that needs no extra instructions costs the cache nothing at
-    all. Never raises — on a parse failure it returns the FULL section text,
-    which is slower but never less informed than slim_pc_control was."""
+    ``history`` (the chat so far) lets a short elliptical follow-up ('Pause
+    it.', 'what about tomorrow') also route on the previous user turn — see
+    routing_text. Returns '' when the turn implicates nothing beyond the
+    always-on section set, so a turn that needs no extra instructions costs
+    the cache nothing at all. Never raises — on a parse failure it returns
+    the FULL section text, which is slower but never less informed than
+    slim_pc_control was."""
     try:
         _core, sections = split_pc_control(pc_control)
         if not sections:
             return ""
-        included, _dropped = select_sections(user_text, sections)
+        included, _dropped = select_sections(user_text, sections, history)
         inc = set(included)
         bodies = [_section_text(h, b) for h, b in sections
                   if h.strip() in inc and h.strip().upper() not in _ALWAYS]

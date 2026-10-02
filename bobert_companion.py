@@ -21860,7 +21860,11 @@ def _call_llm(user_text: str) -> str:
             _base_prompt = _local_stable_system_prompt(_system_prompt)
             if _base_prompt is None:
                 raise RuntimeError("stable layout unavailable")
-            _turn_ctx = _pr.turn_pc_block(user_text, PC_CONTROL_PROMPT)
+            # history= lets a short elliptical follow-up ('Pause it.',
+            # 'never mind, cancel that') also route on the previous user
+            # turn, which is where its subject lives (2026-10-01 brain eval).
+            _turn_ctx = _pr.turn_pc_block(user_text, PC_CONTROL_PROMPT,
+                                          history=list(conversation_history))
             _stable_split = True
         except Exception as _pr_err:
             print(f"  [prompt-router] stable split failed ({_pr_err}); "
@@ -21872,7 +21876,8 @@ def _call_llm(user_text: str) -> str:
             and PC_CONTROL_PROMPT and PC_CONTROL_PROMPT in _system_prompt):
         try:
             from core import prompt_router as _pr
-            _slim_pc = _pr.slim_pc_control(user_text, PC_CONTROL_PROMPT)
+            _slim_pc = _pr.slim_pc_control(user_text, PC_CONTROL_PROMPT,
+                                           history=list(conversation_history))
             # slim_pc_control keeps PC_CONTROL's own preamble but NOT the local
             # anti-hallucination guard (the highest-value instruction on this
             # path). _local_cheatsheet has it; this path did not — restore it
