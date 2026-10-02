@@ -239,6 +239,19 @@ def _boot_overlay_active(boot_phase: str, boot_started_at: float,
             and (now - boot_started_at) <= (boot_duration + 0.5))
 
 
+GUEST_BADGE_TEXT = "◉ GUEST MODE · NOT REMEMBERING"
+
+
+def _hud_guest_badge(hud) -> str:
+    """The guest-mode badge text while hud_state.json's ``guest_mode`` is a
+    real True (published by bobert_companion._act_guest_mode_set and at
+    boot), else ''. Pure, so it is unit-testable without Qt."""
+    try:
+        return GUEST_BADGE_TEXT if hud.get("guest_mode") is True else ""
+    except Exception:
+        return ""
+
+
 def _camera_preview_fresh_at(now: float) -> bool:
     """True iff the live camera-preview JPEG exists and was written within the
     last CAMERA_PREVIEW_STALE_S seconds. The writer removes the file when the
@@ -514,6 +527,8 @@ class UnifiedHud(QWidget):
         self.alert_active = False
         # Brain glow: core.brain_glow.HudBrain or None (= the normal look).
         self.brain = None
+        # Guest mode badge text ('' = off): see _hud_guest_badge.
+        self.guest_badge = ""
         # Calendar + mail come from the main process via hud_state.json (the
         # HUD subprocess must not import ms_graph — see _SlowData).
         self.next_event: dict | None = None
@@ -751,6 +766,7 @@ class UnifiedHud(QWidget):
             except (TypeError, ValueError):
                 setattr(self, attr, 0.0)
         self.alert_active = bool(hud.get("alert_active"))
+        self.guest_badge = _hud_guest_badge(hud)
         # Brain glow — a missing / garbage ``brain`` key is None, never a raise.
         try:
             self.brain = _hud_brain(hud, time.time())
@@ -1037,6 +1053,19 @@ class UnifiedHud(QWidget):
         # Divider.
         p.setPen(QPen(PANEL_RIM, 1))
         p.drawLine(QPointF(pad, title_h + 6 * s), QPointF(W - pad, title_h + 6 * s))
+        # Guest mode badge (2026-10-02): JARVIS answers but remembers nothing.
+        # Top-left under the divider, clear of the reactor ring and of the
+        # camera preview in the top-right corner.
+        if self.guest_badge:
+            fg = QFont("Consolas", 1)
+            fg.setPixelSize(int(10 * s))
+            fg.setBold(True)
+            p.setFont(fg)
+            p.setPen(QPen(AMBER))
+            p.drawText(QRectF(pad, title_h + 8 * s, W - 2 * pad, 14 * s),
+                       int(Qt.AlignmentFlag.AlignLeft
+                           | Qt.AlignmentFlag.AlignVCenter),
+                       self.guest_badge)
 
         # 3. Reactor disc (core + four metric arcs).
         reactor_top = title_h + 12 * s

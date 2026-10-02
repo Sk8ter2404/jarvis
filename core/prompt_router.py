@@ -697,6 +697,22 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "ambient learning", "listen and learn", "go quiet", "keep learning",
         "stay talkative", "answer then go quiet",
     ],
+    # Guest mode (2026-10-02). The header word "guest" already routes
+    # "guest mode ..." / "the guests have left"; these catch the other ways
+    # of saying visitors are here or gone.
+    "GUEST MODE": [
+        "guest mode", "we have company", "we've got company", "got company",
+        "company over", "visitors are here", "visitors have left",
+        "visitors left", "people over", "have people over",
+    ],
+    # "Where did you learn that" (where_learned, 2026-10-02).
+    "PROVENANCE": [
+        "where did you learn", "where'd you learn", "where did you hear",
+        "where'd you hear", "where did you get that", "where'd you get that",
+        "who told you", "how do you know that", "how do you know this",
+        "how did you learn", "how did you find out", "what's your source",
+        "where did that come from", "where does that come from",
+    ],
     # The double-clap trigger (skills/clap_trigger.py). Multi-word keywords
     # only: a bare "clap" would load this for "play Eric Clapton" (keywords
     # match at a word start and may run on).

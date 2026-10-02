@@ -105,7 +105,9 @@ class MergeMemoryGateTests(_StoreBase):
         self.assertEqual(self.store["topics"], [])
         kinds = sorted(c["kind"] for c in self.store["topic_candidates"])
         self.assertEqual(kinds, ["project", "topic"])
-        self.bc._ltm_learn_facts.assert_called_with([], [])
+        # Nothing mirrored into the semantic store (and so no provenance
+        # records for it: the kwarg is the fact-provenance map, 2026-10-02).
+        self.bc._ltm_learn_facts.assert_called_with([], [], provenance=None)
 
     def test_second_separate_owner_turn_surfaces_it(self):
         self.merge("I'm building a garden shed", topic="garden shed",

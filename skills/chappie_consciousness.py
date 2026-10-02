@@ -501,11 +501,24 @@ def _process_facts_once(cursors: dict) -> int:
 
 # ─── background daemon ─────────────────────────────────────────────────
 
+def _guest_mode_on() -> bool:
+    """Guest mode (core/guest_mode.py) is on. False when unreadable."""
+    try:
+        from core import guest_mode as _gm
+        return _gm.is_on()
+    except Exception:
+        return False
+
+
 def _chappie_loop():
     print("  [chappie] consciousness thread online")
     while True:
         try:
             time.sleep(SLEEP_TICK_SEC)
+            # Guest mode (core/guest_mode.py, 2026-10-02): no episode or fact
+            # is written while visitors are here; the cursors wait.
+            if _guest_mode_on():
+                continue
             now = time.time()
             cursors = _load_cursors()
             ran = False

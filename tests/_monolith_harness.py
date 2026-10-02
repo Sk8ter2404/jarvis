@@ -297,6 +297,10 @@ _MONOLITH_RESTORE_NAMES = (
     # Who wrote the last drained inject (2026-10-01): a leaked "test" would
     # make a later test's typed turn look like a harness line.
     "_last_inject_source",
+    # The facts the last recall put in the prompt (2026-10-02, fact
+    # provenance): a leaked record would answer a LATER test's "where did
+    # you learn that" with this test's fact.
+    "_ltm_last_recalled",
     # After-reply hooks (2026-10-01): the registered hooks, the armed turn and
     # the last encore thread. A leaked hook would be called by a LATER test's
     # dispatch; a leaked turn or live encore would arm / refuse one.
@@ -530,6 +534,14 @@ def _restore_monolith_pristine(bc) -> None:
     # not make every later tagged call wait out the deferral cap.
     try:
         bc._lt.GATE.reset()
+    except Exception:
+        pass
+    # Guest mode (core/guest_mode.py, 2026-10-02): one process-wide flag. A
+    # test that left it on would make every LATER test's merge_memory /
+    # learn_from_turn / LTM write a silent no-op (green or red for the wrong
+    # reason). The shipped state is off.
+    try:
+        bc._guest_mode.set_on(False)
     except Exception:
         pass
     # Audio flap governor (2026-09-29): one process-wide instance, rebound

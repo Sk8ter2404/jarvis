@@ -40,6 +40,8 @@ Registered actions
     wake_listener_status   — short human-readable status string
     wake_listener_configure — change runtime config; arg is "key=value"
     guest_mode_on / guest_mode_off — toggle gating bypass for visitors
+        (only when the monolith has none: its guest mode, core/guest_mode.py,
+        is canonical, and the gate honours it -- see _guest_mode_active)
     voice_gating_on / voice_gating_off — toggle biometric gate entirely
 
 If `openwakeword` / `pvporcupine` aren't installed the skill loads
@@ -282,13 +284,28 @@ def _identify_recent_speaker() -> tuple[Optional[str], float]:
     return speaker, float(score)
 
 
+def _guest_mode_active() -> bool:
+    """Visitors are here: this skill's own GUEST_MODE_ENABLED (the
+    wake_listener_configure knob), or the owner's guest mode
+    (core/guest_mode.py, 2026-10-02 -- "guest mode on" / "we have guests"),
+    which also stops JARVIS remembering anything. One switch for both."""
+    if GUEST_MODE_ENABLED:
+        return True
+    try:
+        _ensure_core_on_path()
+        from core import guest_mode as _gm
+        return _gm.is_on()
+    except Exception:
+        return False
+
+
 def _gate_is_strict() -> bool:
     """True iff the wake event should be rejected when voice ID returns
     no match. False whenever any precondition for strict gating fails —
     that's the permissive fallback path."""
     if not VOICE_BIOMETRIC_ENABLED:
         return False
-    if GUEST_MODE_ENABLED:
+    if _guest_mode_active():
         return False
     _ensure_core_on_path()
     try:
@@ -476,7 +493,7 @@ def wake_listener_status(_: str = "") -> str:
         enrolled_n = len(voice_id.list_enrolled())
     except Exception:
         pass
-    gate = ("guest" if GUEST_MODE_ENABLED
+    gate = ("guest" if _guest_mode_active()
             else ("on" if VOICE_BIOMETRIC_ENABLED else "off"))
     gate_str = (f"gate {gate} (threshold {VOICE_BIOMETRIC_THRESHOLD:.2f}, "
                 f"{enrolled_n} enrolled)")
@@ -598,8 +615,14 @@ def register(actions: dict) -> None:
     actions["wake_listener_stop"] = wake_listener_stop
     actions["wake_listener_status"] = wake_listener_status
     actions["wake_listener_configure"] = wake_listener_configure
-    actions["guest_mode_on"] = guest_mode_on
-    actions["guest_mode_off"] = guest_mode_off
+    # The monolith's guest_mode_on / _off (2026-10-02) are the canonical
+    # "visitors are here" switch -- persisted, shown on the HUD, and they stop
+    # JARVIS remembering -- and _guest_mode_active reads them. Registering
+    # this skill's narrower toggles over them would silently swap the owner's
+    # guest mode for a voice-gate-only one, so they register only where the
+    # monolith has none.
+    actions.setdefault("guest_mode_on", guest_mode_on)
+    actions.setdefault("guest_mode_off", guest_mode_off)
     actions["voice_gating_on"] = voice_gating_on
     actions["voice_gating_off"] = voice_gating_off
 

@@ -661,6 +661,17 @@ AMBIENT_MUSIC_REFUSE_WAKE = True
 # user_settings.json, and the voice action toggles it live at runtime.
 REQUIRE_WAKE_MODE = False
 
+# Guest mode (2026-10-02): visitors are in the room. JARVIS answers every turn
+# as usual but writes NOTHING to long-term memory -- no learned facts,
+# projects, topics, episodes, session summaries or voice-command log entries
+# -- until it is turned off. Off by default; flipped by voice ("guest mode
+# on", "we have guests", "the guests have left") or the web dashboard, and
+# the flip is saved here through user_settings.json like REQUIRE_WAKE_MODE,
+# so it stays on across restarts until turned off. The live flag is
+# core/guest_mode.py, seeded from this at boot (bobert_companion
+# _guest_mode_boot).
+GUEST_MODE = False
+
 # Follow-up window for wake-word mode, in seconds. After the user addresses
 # JARVIS by its wake word, follow-ups inside this window need no wake word, and
 # each admitted one extends it. 0 (default) = strict wake-word mode, unchanged.

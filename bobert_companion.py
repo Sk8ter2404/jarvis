@@ -1100,7 +1100,11 @@ HEADSET_NAME_HINTS      = ["headset", "headphone", "earphone"] + [s.strip() for 
 #                               need 0.65-0.68 for a single wake utterance.
 #   GUEST_MODE_ENABLED        — temporary bypass for visitors. Resets to
 #                               False on every wake_listener restart, so
-#                               guests have to re-enable per boot.
+#                               guests have to re-enable per boot. The
+#                               spoken "guest mode on" is the owner's
+#                               guest mode (core/guest_mode.py, 2026-10-02):
+#                               it opens the same gates, stops JARVIS
+#                               remembering, and persists until turned off.
 VOICE_BIOMETRIC_ENABLED   = False
 VOICE_BIOMETRIC_THRESHOLD = 0.72
 GUEST_MODE_ENABLED        = False
@@ -1703,6 +1707,9 @@ from core.failure_markers import (  # noqa: E402
 # See core/topic_hygiene.py for the rules; merge_memory applies them to every
 # caller that passes `provenance`.
 from core import topic_hygiene as _topic_hygiene  # noqa: E402
+# Guest mode (2026-10-02): visitors in the room, so nothing is learned or
+# recorded -- one live flag every writer below reads (core/guest_mode.py).
+from core import guest_mode as _guest_mode  # noqa: E402
 
 
 def _owner_vocab() -> frozenset:
@@ -1750,6 +1757,17 @@ def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
     taken under. A memory wipe since then (reset / forget the last hour)
     makes this a no-op, checked under _memory_lock, which the wipe holds
     while it bumps the epoch. None (deliberate writes) is never dropped.
+
+    Fact provenance (2026-10-02): a dict provenance may carry ``origins``,
+    one {speaker, source, utterance, ts} per turn the batch covered
+    (_learn_provenance). Each fact or project mirrored into the semantic
+    store records the origin it most likely came from
+    (_fact_provenance_map); without origins, one is derived from
+    owner_voice / owner_directed. bobert_memory.json keeps bare strings.
+
+    Guest mode (core/guest_mode.py) on: NOTHING is written -- no fact,
+    project, topic or topic sighting, from any caller. Counts only in the
+    log.
     """
     # A bare string (a malformed extractor reply) would otherwise be iterated
     # character by character into one-letter "facts"/"projects".
@@ -1757,6 +1775,17 @@ def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
         new_facts = [new_facts]
     if isinstance(new_projects, str):
         new_projects = [new_projects]
+    if _guest_mode.is_on():
+        _n = (sum(1 for f in (new_facts or []) if isinstance(f, str)
+                  and f.strip())
+              + sum(1 for p in (new_projects or []) if isinstance(p, str)
+                    and p.strip())
+              + (1 if isinstance(new_topic, str) and new_topic.strip()
+                 else 0))
+        if _n:
+            print(f"  [guest-mode] {_n} memory item(s) not kept: guest mode "
+                  f"is on")
+        return [], []
     _raw_facts = [f.strip() for f in (new_facts or [])
                   if isinstance(f, str) and f.strip()]
     # Drop anything that looks like a credential before it can be stored.
@@ -1920,8 +1949,50 @@ def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
     # learns — not just the 23 facts frozen on migration day. Fire-and-forget,
     # gated, exception-isolated (see _ltm_learn_facts): it can never block or
     # break this write, and store A (bobert_memory.json) is already saved above.
-    _ltm_learn_facts(added_facts, added_projects)
+    _ltm_learn_facts(added_facts, added_projects,
+                     provenance=_fact_provenance_map(
+                         provenance, added_facts + added_projects))
     return added_facts, added_projects
+
+
+def _fact_provenance_map(provenance, texts) -> "dict | None":
+    """{text: provenance record} for the facts / projects one merge_memory
+    call added, or None when the caller vouched for them itself (provenance
+    None, the legacy contract: no record). Each text gets the origin of the
+    turn it most likely came from (long_term_memory.pick_origin); a learner
+    that passes no origins gets one derived from its flags: the voice
+    verdict for the speaker, "ambient" for overheard speech. Never raises,
+    never logs the sentence."""
+    if not isinstance(provenance, dict) or not texts:
+        return None
+    try:
+        if not _ltm_enabled():
+            return None
+        ltm = _ltm_module()
+        if ltm is None:
+            return None
+        origins = [o for o in (provenance.get("origins") or [])
+                   if isinstance(o, dict)]
+        if not origins:
+            origins = [{
+                "speaker": "owner" if provenance.get("owner_voice")
+                else "unknown",
+                "source": ("ambient" if not provenance.get("owner_directed")
+                           else "voice"),
+                "utterance": str(provenance.get("turn_text") or ""),
+                "ts": time.time()}]
+        out = {}
+        for t in texts:
+            if isinstance(t, str) and t.strip():
+                o = ltm.pick_origin(t, origins)
+                if o is not None:
+                    out[t.strip()] = ltm.make_provenance(
+                        speaker=o.get("speaker"), source=o.get("source"),
+                        utterance=o.get("utterance") or "", ts=o.get("ts"))
+        return out or None
+    except Exception as e:
+        print(f"  [ltm] provenance not recorded: {type(e).__name__}")
+        return None
 
 
 # Phase 3 refactor (2026-05-29): the ~1160-line PC_CONTROL_PROMPT
@@ -2762,6 +2833,8 @@ def _learn_gate_classify(item: tuple) -> None:
     (_kind, ts, user_msg, ai_reply, owner_directed, conf,
      injected, wake, audio, sample_rate, voice) = item[:11]
     epoch = item[11] if len(item) > 11 else None
+    origin = item[12] if len(item) > 12 and isinstance(item[12], dict) \
+        else None
     score = None
     if voice is None:
         if injected:
@@ -2774,8 +2847,12 @@ def _learn_gate_classify(item: tuple) -> None:
     print(f"  [learn-gate] {'learning from' if ok else 'not learning from'} "
           f"this turn: {why}{_score}")
     if ok:
-        _learn_enqueue_current(
-            (user_msg, ai_reply, bool(owner_directed), conf, voice), epoch)
+        turn = (user_msg, ai_reply, bool(owner_directed), conf, voice)
+        if origin is not None:
+            # The speaker is the verdict just reached (fact provenance).
+            turn += (dict(origin, speaker=(
+                "owner" if voice == _learn_gate_mod.OWNER else "unknown")),)
+        _learn_enqueue_current(turn, epoch)
 
 
 def _learn_gate_loop() -> None:
@@ -2791,11 +2868,38 @@ def _learn_gate_loop() -> None:
             print(f"  [learn-gate] classify failed: {type(e).__name__}")
 
 
+def _learn_channel(owner_directed: bool, injected: bool) -> str:
+    """How a turn reached JARVIS, for the provenance of what it teaches
+    (core/long_term_memory): "ambient" (overheard, not addressed to him),
+    "web" (typed into the dashboard -- _last_inject_source, set by the drain
+    of THIS turn), "typed" (any other inject) or "voice"."""
+    if not owner_directed:
+        return "ambient"
+    if injected:
+        try:
+            return "web" if _last_inject_source[0] == "web" else "typed"
+        except Exception:
+            return "typed"
+    return "voice"
+
+
+def _learn_origin(user_msg: str, channel: str, voice=None) -> dict:
+    """One queued turn's origin: who (the voice verdict: "owner" only for a
+    matched owner voiceprint), how (_learn_channel), the sentence and when.
+    merge_memory turns it into the provenance of each fact the turn
+    teaches. Held in memory only; never logged."""
+    return {"speaker": ("owner" if voice == _learn_gate_mod.OWNER
+                        else "unknown"),
+            "source": channel,
+            "utterance": user_msg if isinstance(user_msg, str) else "",
+            "ts": time.time()}
+
+
 def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
                     owner_directed: bool = True, conf=None,
                     injected: bool = False, wake: bool = False,
                     audio=None, sample_rate: int = 0, voice=None,
-                    epoch=None):
+                    epoch=None, channel=None):
     """Background: extract new facts/projects/topic from this exchange.
 
     ``memory`` is accepted (and deliberately IGNORED) for call-site
@@ -2826,19 +2930,32 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
 
     ``epoch`` (2026-10-01): the _learn_epoch the caller saw when it heard the
     turn (the ambient learner waits on its content judge first). A turn from
-    before a memory wipe is never learned after it. None = now."""
+    before a memory wipe is never learned after it. None = now.
+
+    ``channel`` (2026-10-02, fact provenance): "voice" / "typed" / "web" /
+    "ambient"; None derives it (_learn_channel). Each queued turn carries
+    its origin (_learn_origin) as its 6th field; the speaker is filled in
+    from the voice verdict once it is known.
+
+    Guest mode (core/guest_mode.py) on: nothing is queued at all."""
     if not LEARN_EVERY_TURN:
+        return
+    if _guest_mode.is_on():
         return
     # Nothing heard during a device dialogue (or its tail) is learned.
     if _dialogue_gate_active():
         return
     ep = _learn_epoch[0] if epoch is None else epoch
+    if channel is None:
+        channel = _learn_channel(bool(owner_directed), bool(injected))
     if LEARN_ONLY_FROM_OWNER:
         _learn_gate_submit(("turn", time.monotonic(), user_msg, ai_reply,
                             bool(owner_directed), conf, bool(injected),
-                            bool(wake), audio, sample_rate, voice, ep))
+                            bool(wake), audio, sample_rate, voice, ep,
+                            _learn_origin(user_msg, channel)))
         return
-    _learn_enqueue_current((user_msg, ai_reply, bool(owner_directed), conf),
+    _learn_enqueue_current((user_msg, ai_reply, bool(owner_directed), conf,
+                            voice, _learn_origin(user_msg, channel, voice)),
                            ep)
 
 
@@ -2893,9 +3010,13 @@ def _learn_provenance(batch) -> dict | None:
                     and not isinstance(c.get(key), bool)]
             if vals:
                 conf[key] = pick(vals)
+    # Fact provenance (2026-10-02): every turn's origin (6th field,
+    # _learn_origin), so merge_memory can tell which turn each fact came from.
+    origins = [t[5] for t in batch if len(t) > 5 and isinstance(t[5], dict)]
     return {"owner_directed": owner, "owner_voice": owner_voice,
             "turn_text": turns[-1][0], "conf": conf,
-            "source": "owner turn" if owner else "ambient speech"}
+            "source": "owner turn" if owner else "ambient speech",
+            "origins": origins}
 
 
 def _learn_prompt(batch: list) -> tuple:
@@ -3299,6 +3420,10 @@ def _ambient_learn_from_gated(text: str, memory: dict,
     if not AMBIENT_LISTEN_ENABLED:
         return
     if _dialogue_gate_active():
+        return
+    # Guest mode: overheard speech is a visitor's as likely as the owner's;
+    # nothing is learned (and the content judge's LLM call is skipped).
+    if _guest_mode.is_on():
         return
     # The memory-wipe generation this utterance was heard in (2026-10-01):
     # the content judge below can wait minutes for the background slot, and
@@ -3734,7 +3859,11 @@ def save_session_to_memory(memory: dict):
     """On shutdown: write the summary of this WHOLE session -- the running
     summary the checkpoints keep, updated with whatever came after the last
     one (_session_summary_update, 2026-10-01; it used to summarise only the
-    trimmed last ~10 exchanges)."""
+    trimmed last ~10 exchanges). Guest mode on: nothing is written
+    (core/guest_mode.py)."""
+    if _guest_mode.is_on():
+        print("\n  [guest-mode] session summary not saved: guest mode is on")
+        return
     # Snapshot first (under _session_summary_lock), so a background append
     # (pending-speech / proactive-alert thread) during shutdown can't change
     # the list mid-iteration.
@@ -3839,8 +3968,20 @@ def _session_summary_update(pending, *, record: bool = True) -> str:
     summary to cover all of it. A summary that looks like a secret or
     internal noise is withheld (the same guards as facts: it is rendered
     into every prompt). ``record`` writes it to the recall index; a memory
-    wipe since `pending` was taken (gen changed) discards the result."""
+    wipe since `pending` was taken (gen changed) discards the result.
+
+    Guest mode on (core/guest_mode.py): no LLM call and nothing recorded;
+    the new messages are marked summarised WITHOUT entering the running
+    summary, so the company's conversation never reaches a later summary."""
     gen, backlog, new, running = pending
+    if _guest_mode.is_on():
+        with _session_summary_lock:
+            if gen == _session_summary_gen[0]:
+                for m in backlog:
+                    if _session_trimmed and _session_trimmed[0] is m:
+                        _session_trimmed.popleft()
+                _session_summary_marker[0] = new[-1]
+        return ""
     transcript = "\n".join(
         f"{str(m.get('role', '')).title()}: {str(m.get('content', ''))[:500]}"
         for m in new)
@@ -5342,6 +5483,11 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         result = _act_wake_word_mode_set(cmd == "wake_word_mode_on")
         _publish_tray_result(str(entry.get("rid") or ""), cmd, result)
         print(f"  [tray] {cmd} -> {result}")
+    elif cmd in ("guest_mode_on", "guest_mode_off"):
+        # The web dashboard's guest-mode button (2026-10-02): the SAME flip as
+        # the voice command (live flag, config, settings file, hud_state).
+        result = _act_guest_mode_set(cmd == "guest_mode_on")
+        _publish_tray_result(str(entry.get("rid") or ""), cmd, result)
     elif cmd == "mic_mute_toggle":
         # Mute Mic: drop captured mic input before dispatch (see
         # _capture_utterance) so JARVIS hears nothing and stays idle — distinct
@@ -21694,6 +21840,30 @@ _ltm_queue: "queue.Queue[tuple[str, str]] | None" = None
 _ltm_worker_started = [False]
 _LTM_RETRIEVE_BUDGET_S = 0.6   # max wall-clock a turn will wait on recall
 _LTM_RETRIEVE_K = 6
+# The facts the most recent recall put in the prompt (_ltm_context):
+# {"ts": float, "facts": [fact entry, ...]}, or None. In memory only; read by
+# the "where did you learn that" action (_act_where_learned, 2026-10-02).
+_ltm_last_recalled: list = [None]
+
+# "Where did you learn that" and its kin: a turn asking where a recalled fact
+# came from. _ltm_context leaves the recall record alone for these turns.
+_WHERE_LEARNED_RE = re.compile(
+    r"\b(?:where|how)\s+(?:did|do)\s+you\s+(?:learn|hear|get|find\s+out|"
+    r"pick\s+up)\b"
+    r"|\bwhere'?d\s+you\s+(?:learn|hear|get|pick)\b"
+    r"|\bwho\s+told\s+you\b"
+    r"|\bhow\s+do\s+you\s+know\s+(?:that|this)\b"
+    r"|\bwhat'?s\s+your\s+source\b",
+    re.IGNORECASE)
+
+
+def is_where_learned_question(text) -> bool:
+    """True for "where did you learn that" / "who told you that" / "how do
+    you know that" and kin. Never raises."""
+    try:
+        return bool(_WHERE_LEARNED_RE.search(str(text or "")))
+    except Exception:
+        return False
 
 
 def _ltm_enabled() -> bool:
@@ -21800,7 +21970,7 @@ def _ltm_worker_loop() -> None:
             print(f"  [ltm] record_turn failed: {e}")
 
 
-def _ltm_learn_facts(facts, projects=None) -> None:
+def _ltm_learn_facts(facts, projects=None, provenance=None) -> None:
     """Mirror newly-learned durable facts/projects into the SEMANTIC LTM store
     (chroma vectors + facts.json + BM25) via long_term_memory.add_fact, which
     embeds (bge-small) and upserts with its own exact-text dedupe. Fire-and-
@@ -21810,9 +21980,13 @@ def _ltm_learn_facts(facts, projects=None) -> None:
     and the semantic store were never wired together, so 97+ facts learned after
     migration day never became fuzzy-searchable. Gated on _ltm_enabled() (which
     also honours the JARVIS_STAGING guard) so blue/green test injects can't
-    pollute the real store."""
-    if not _ltm_enabled():
+    pollute the real store.
+
+    ``provenance``: {text: provenance record} (_fact_provenance_map); each
+    text's record is stored with it. Guest mode on: nothing is mirrored."""
+    if not _ltm_enabled() or _guest_mode.is_on():
         return
+    prov = provenance if isinstance(provenance, dict) else {}
     items = [(f, "learned") for f in (facts or [])] + \
             [(p, "project") for p in (projects or [])]
     items = [(t.strip(), tag) for (t, tag) in items
@@ -21826,7 +22000,8 @@ def _ltm_learn_facts(facts, projects=None) -> None:
     def _worker():
         for text, tag in items:
             try:
-                ltm.add_fact(text, source="merge_memory", tags=[tag])
+                ltm.add_fact(text, source="merge_memory", tags=[tag],
+                             provenance=prov.get(text))
             except Exception as e:
                 print(f"  [ltm] learn_fact failed: {e}")
 
@@ -21933,9 +22108,12 @@ def _ltm_reflector_sink(changes) -> None:
 
 
 def _ltm_enqueue(role: str, text: str) -> None:
-    """Queue one turn for background recording. Non-blocking, never raises."""
+    """Queue one turn for background recording. Non-blocking, never raises.
+    Guest mode on (core/guest_mode.py): the turn is not recorded."""
     global _ltm_queue
     if not _ltm_enabled() or not text or not text.strip():
+        return
+    if _guest_mode.is_on():
         return
     try:
         if _ltm_queue is None:
@@ -21974,9 +22152,11 @@ def _ltm_context(user_text: str) -> str:
     if not done.wait(timeout=_LTM_RETRIEVE_BUDGET_S):
         return ""
     lines = []
+    recalled = []
     for f in result[:_LTM_RETRIEVE_K]:
         t = (f.get("text") or "").strip() if isinstance(f, dict) else ""
         if t:
+            recalled.append(f)
             # Projects mirrored here by merge_memory are auto-learned from
             # speech (2026-09-29 topic hygiene): mark them so recall of a
             # mis-heard one is never restated as what sir is working on.
@@ -21986,6 +22166,11 @@ def _ltm_context(user_text: str) -> str:
             lines.append(f"- {t[:300]}")
     if not lines:
         return ""
+    # What "where did you learn that" asks about (_act_where_learned): the
+    # facts this turn put in front of the model. The question itself recalls
+    # facts too, which must not replace the ones it is asking about.
+    if not is_where_learned_question(user_text):
+        _ltm_last_recalled[0] = {"ts": time.time(), "facts": recalled}
     return ("\n\n# RELEVANT LONG-TERM MEMORY (retrieved for this turn; use "
             "when helpful, ignore when not)\n" + "\n".join(lines))
 
@@ -31116,6 +31301,145 @@ def _act_wake_word_mode_status() -> str:
     return f"Wake-word mode is {mode}, sir, {media}."
 
 
+# ── guest mode (visitors in the room: answer normally, learn nothing) ─────
+# core/guest_mode.py holds the one live flag; every memory writer reads it.
+# Persisted exactly like wake-word mode (core.config + user_settings.json via
+# the Settings writer) and re-applied at boot by _guest_mode_boot.
+def _act_guest_mode_set(on: bool) -> str:
+    """Turn guest mode on/off: the live flag, the config constant, the
+    settings file (so it survives a restart until turned off) and
+    hud_state.json's ``guest_mode`` (the HUD badge and the dashboard chip).
+    Persistence is best-effort: on failure the flip still holds for THIS
+    session and the reply carries a caveat. Returns a JARVIS line."""
+    on = bool(on)
+    _guest_mode.set_on(on)
+    try:
+        import core.config as _cfg
+        _cfg.GUEST_MODE = on
+    except Exception:
+        pass
+    _publish_guest_mode_state()
+    persisted = False
+    try:
+        from tools import settings_window as sw
+        cur = sw.load_settings()
+        if not isinstance(cur, dict):
+            cur = {}
+        cur["GUEST_MODE"] = on
+        sw.save_settings(cur, changed=("GUEST_MODE",))
+        persisted = True
+    except Exception:
+        persisted = False
+    print(f"  [guest-mode] {'on' if on else 'off'}"
+          f"{'' if persisted else ' (not saved for the next start)'}")
+    caveat = "" if persisted else " (though I couldn't save that for next boot)"
+    if on:
+        return ("Guest mode on, sir: I'll answer as usual, but I won't "
+                f"remember anything said until you turn it off{caveat}.")
+    return f"Guest mode off, sir: I'm remembering things again{caveat}."
+
+
+def _publish_guest_mode_state() -> None:
+    """Mirror the live guest mode into hud_state.json as ``guest_mode``: the
+    unified HUD's badge and the web dashboard's chip read it. Called on
+    every flip and once at boot. Never raises."""
+    try:
+        _write_hud_state(guest_mode=bool(_guest_mode.is_on()))
+    except Exception:
+        pass
+
+
+def _guest_mode_boot() -> None:
+    """Boot: re-apply the saved guest mode (core.config.GUEST_MODE, which
+    _apply_user_settings read from user_settings.json) to the live flag and
+    publish it. Done here, not at import, so a process that only imports the
+    monolith never inherits the owner's setting. Never raises."""
+    try:
+        import core.config as _cfg
+        _guest_mode.set_on(bool(getattr(_cfg, "GUEST_MODE", False)))
+    except Exception:
+        pass
+    if _guest_mode.is_on():
+        print("  [guest-mode] ON (saved): answering normally, remembering "
+              "nothing until 'guest mode off'")
+    _publish_guest_mode_state()
+
+
+def _act_guest_mode_status() -> str:
+    """Is guest mode on? One spoken line."""
+    if _guest_mode.is_on():
+        return ("Guest mode is on, sir: I'm answering as usual but not "
+                "remembering anything said.")
+    return "Guest mode is off, sir: I'm remembering things as usual."
+
+
+# ── "where did you learn that" (fact provenance, 2026-10-02) ──────────────
+# A recall older than this is not what "that" refers to.
+_WHERE_LEARNED_MAX_AGE_S = 900.0
+_WHERE_LEARNED_FACT_CHARS = 90
+
+
+def _last_assistant_text() -> str:
+    """JARVIS's most recent reply in conversation_history, skipping the
+    where_learned turn's own action reply. '' when there is none."""
+    try:
+        for m in reversed(list(conversation_history)):
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            c = m.get("content")
+            text = c if isinstance(c, str) else str(c or "")
+            if "where_learned" in text:
+                continue
+            return text
+    except Exception:
+        pass
+    return ""
+
+
+def _act_where_learned(_: str = "") -> str:
+    """Where the fact JARVIS just drew on came from: who said it (the voice-
+    ID verdict), how it reached him (voice / typed / web page / overheard)
+    and when -- from the provenance core/long_term_memory stored with it.
+    "That" is the most recent recall (_ltm_last_recalled): of the facts it
+    put in the prompt, the one sharing the most words with JARVIS's last
+    reply, else the top-ranked one. The source sentence itself is never in
+    the reply (it is logged and may be re-spoken; it stays on disk)."""
+    rec = _ltm_last_recalled[0]
+    facts = rec.get("facts") if isinstance(rec, dict) else None
+    try:
+        fresh = (time.time() - float(rec.get("ts") or 0.0)
+                 <= _WHERE_LEARNED_MAX_AGE_S) if facts else False
+    except Exception:
+        fresh = False
+    if not facts or not fresh:
+        return ("I haven't drawn on anything from my long-term memory just "
+                "now, sir, so there's nothing to trace.")
+    ltm = _ltm_module()
+    if ltm is None:
+        return "My long-term memory isn't available right now, sir."
+    facts = [f for f in facts if isinstance(f, dict)]
+    if not facts:
+        return ("I haven't drawn on anything from my long-term memory just "
+                "now, sir, so there's nothing to trace.")
+    reply = _last_assistant_text()
+    best, best_n = facts[0], 0
+    for f in facts:
+        n = ltm.word_overlap(f.get("text"), reply)
+        if n > best_n:
+            best, best_n = f, n
+    text = " ".join(str(best.get("text") or "").split())
+    if len(text) > _WHERE_LEARNED_FACT_CHARS:
+        text = text[:_WHERE_LEARNED_FACT_CHARS - 1].rstrip() + "…"
+    prov = ltm.fact_provenance(best)
+    if prov is None:
+        return (f"I don't have a note of where \"{text}\" came from, sir: I "
+                "learned it before I started keeping track.")
+    how = ltm.describe_provenance(prov)
+    tail = (" I've kept the exact words on this PC."
+            if prov.get("utterance") else "")
+    return f"\"{text}\": {how}, sir.{tail}"
+
+
 # Whitelist of actions Bobert is allowed to perform
 ACTIONS = {
     "open_url":        _act_open_url,
@@ -31199,6 +31523,13 @@ ACTIONS = {
     "wake_word_mode_on":     lambda _="": _act_wake_word_mode_set(True),
     "wake_word_mode_off":    lambda _="": _act_wake_word_mode_set(False),
     "wake_word_mode_status": lambda _="": _act_wake_word_mode_status(),
+    # Guest mode (2026-10-02): visitors in the room -- answer normally, but
+    # write nothing to long-term memory until turned off. Persists.
+    "guest_mode_on":         lambda _="": _act_guest_mode_set(True),
+    "guest_mode_off":        lambda _="": _act_guest_mode_set(False),
+    "guest_mode_status":     lambda _="": _act_guest_mode_status(),
+    # "Where did you learn that": the provenance of the last recalled fact.
+    "where_learned":         _act_where_learned,
     # Voice-triggered full shutdown (graceful — distinct from upgrade/restart).
     # Triggered by the SHUTDOWN_TRIGGER_PHRASES pre-router after the user
     # answers 'no' to the "overnight first?" prompt, or directly by the LLM
@@ -32179,8 +32510,11 @@ def _ambient_learning_feed(text: str) -> None:
     owns distillation). Empty / 1-2 word transcripts are dropped: Whisper
     emits stray single tokens ('you', 'thanks') on near-silence and they carry
     no durable signal. In staging the write is redirected to a *.staging.jsonl
-    sibling so test injects never pollute real memory."""
+    sibling so test injects never pollute real memory. Guest mode on
+    (core/guest_mode.py): nothing is written."""
     try:
+        if _guest_mode.is_on():
+            return
         t = (text or "").strip()
         if len(t) < 8 or len(t.split()) < 3:
             return
@@ -32578,7 +32912,9 @@ def _media_probe_result(audio, wait_s: float = _MEDIA_PROBE_WAIT_S) -> "float | 
 
 def _media_guest_mode() -> bool:
     try:
-        if GUEST_MODE_ENABLED:
+        # The owner's guest mode (core/guest_mode.py, 2026-10-02) is the same
+        # "visitors are here" switch: their voices pass this gate too.
+        if GUEST_MODE_ENABLED or _guest_mode.is_on():
             return True
         _wl = sys.modules.get("skill_wake_listener")
         return bool(getattr(_wl, "GUEST_MODE_ENABLED", False))
@@ -33375,6 +33711,10 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     #     follow-up, so they are unaffected here). smart_home_router_status likewise.
     "weather_briefing", "weather_forecast",
     "wake_word_mode_status",
+    # Guest mode status and "where did you learn that" (2026-10-02): one
+    # finished sentence each. The provenance answer never carries the source
+    # sentence, so speaking it verbatim cannot leak it into a prompt.
+    "guest_mode_status", "where_learned",
     "check_for_updates", "check_updates", "is_there_an_update",
     "model_costs", "llm_costs", "model_prices", "compare_models",
     "running_costs",
@@ -34159,6 +34499,20 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
         r"(?:going\s+into|entering|enabling|turning\s+on)\s+music\s+mode)\b",
         re.IGNORECASE),
      "wake_word_mode_on", "enable wake-word mode"),
+
+    # Guest mode (2026-10-02): the model saying it has switched guest mode on
+    # or off without the token would leave memory writes as they were. OFF
+    # before ON, as above; both setters are idempotent.
+    (re.compile(
+        r"\b(?:turning\s+off|switching\s+off|disabling|exiting|leaving|"
+        r"ending)\s+guest\s+mode\b",
+        re.IGNORECASE),
+     "guest_mode_off", "disable guest mode"),
+    (re.compile(
+        r"\b(?:enabling|turning\s+on|switching\s+(?:to|into|on)|entering|"
+        r"going\s+into|activating)\s+guest\s+mode\b",
+        re.IGNORECASE),
+     "guest_mode_on", "enable guest mode"),
 
     # Camera movement — no concrete action exists for physically panning the
     # webcams (they're fixed). When the LLM claims to move them, refuse and
@@ -43387,6 +43741,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     print(f"Vision: {'on' if SCREEN_VISION_ENABLED else 'off'}  |  "
           f"UI automation: {'on' if UI_AUTOMATION_ENABLED else 'off'}  |  "
           f"Skills: {'on' if SKILLS_ENABLED else 'off'}")
+
+    # Guest mode survives a restart until turned off (2026-10-02). Seeded
+    # BEFORE the skills load: their ambient daemons read it from the start.
+    _guest_mode_boot()
 
     # Load any installed skills now so their actions are available
     load_skills()

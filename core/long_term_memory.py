@@ -51,10 +51,33 @@ texts on a background thread and swapped in only when complete, with the old
 index kept as a .bak. A model that cannot load falls back to bge-small with
 one log line. See the SAFE RE-INDEX section.
 
+Fact provenance (2026-10-02)
+───────────────────────────
+A fact written through add_fact(..., provenance=...) remembers WHERE it came
+from, under its "provenance" key: the voice-ID verdict of the speaker
+("owner" / "unknown"), how it reached JARVIS ("voice" / "typed" / "web" /
+"ambient"), the sentence it was learned from (cut to UTTERANCE_MAX_CHARS) and
+when that sentence was heard. Kept apart from the entry's own "source", which
+names the WRITER ("merge_memory", "bobert_memory_migration", ...) and is what
+the reflector's trusted-source rule reads. Facts stored before this have no
+provenance key and load, retrieve and reflect exactly as before;
+fact_provenance() returns None for them. PRIVACY: the sentence lives in
+facts.json only — never in Chroma metadata, never in a log line.
+
+Guest mode (core/guest_mode.py): while it is on, add_fact and record_turn
+write nothing (deletions and the reflector still run).
+
 Public API
 ──────────
   ensure_loaded()                              -> None    # idempotent boot
-  add_fact(text, *, source='', tags=None)      -> str id
+  add_fact(text, *, source='', tags=None,
+           provenance=None)                    -> str id ('' in guest mode)
+  make_provenance(speaker=, source=,
+                  utterance='', ts=None)       -> dict
+  fact_provenance(entry)                       -> dict | None
+  pick_origin(text, origins)                   -> dict | None
+  word_overlap(a, b)                           -> int
+  describe_provenance(prov, now=None)          -> str
   update_fact(fact_id, text)                   -> bool
   delete_fact(fact_id)                         -> bool
   list_facts(limit=None)                       -> list[dict]
@@ -86,6 +109,7 @@ import uuid
 from typing import Callable, Iterable, Optional
 
 from core.atomic_io import _atomic_write_json
+from core import guest_mode as _guest_mode
 from core import paths as _paths
 # The reflector's MERGE text is a new fact written by a model: it gets the
 # same write-time guards merge_memory applies to every learned fact.
@@ -792,8 +816,12 @@ def _embed(texts: list[str]):
 
 
 def _chroma_meta(meta: dict) -> dict:
-    """Chroma metadata can't hold nested lists — flatten tags to a CSV."""
+    """Chroma metadata can't hold nested lists — flatten tags to a CSV. Nor a
+    nested dict: a fact's provenance (and the sentence it carries) stays in
+    facts.json only (privacy), on every path that writes Chroma - the live
+    upsert and the background re-index alike."""
     safe_meta = dict(meta)
+    safe_meta.pop("provenance", None)
     if isinstance(safe_meta.get("tags"), list):
         safe_meta["tags"] = ",".join(str(t) for t in safe_meta["tags"])
     return safe_meta
@@ -1362,14 +1390,185 @@ def _new_fact_id(text: str) -> str:
     return f"fact_{h}_{uuid.uuid4().hex[:6]}"
 
 
+# ── Fact provenance (see the module docstring) ────────────────────────────
+PROVENANCE_SPEAKERS = ("owner", "unknown")
+PROVENANCE_SOURCES = ("voice", "typed", "web", "ambient")
+UTTERANCE_MAX_CHARS = 200
+
+
+def _clip_utterance(utterance) -> str:
+    """The source sentence as stored: one line, at most UTTERANCE_MAX_CHARS
+    (an ellipsis marks a cut). Never raises."""
+    if not isinstance(utterance, str):
+        return ""
+    u = " ".join(utterance.split())
+    if len(u) > UTTERANCE_MAX_CHARS:
+        u = u[:UTTERANCE_MAX_CHARS - 1].rstrip() + "…"
+    return u
+
+
+def _prov_ts(ts) -> Optional[float]:
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    ts = float(ts)
+    # Epoch seconds: NaN / inf / negative / millisecond values are not one.
+    return ts if 0 < ts < 1e11 else None
+
+
+def make_provenance(*, speaker: str, source: str, utterance: str = "",
+                    ts: Optional[float] = None) -> dict:
+    """A fact's provenance record. ``speaker``: the voice-ID verdict, "owner"
+    or "unknown" (anything else counts as "unknown"). ``source``: "voice",
+    "typed", "web" or "ambient" ("unknown" for anything else). ``utterance``:
+    the sentence it came from, clipped. ``ts``: when that was heard (now when
+    absent). Never raises."""
+    spk = speaker if speaker in PROVENANCE_SPEAKERS else "unknown"
+    src = source if source in PROVENANCE_SOURCES else "unknown"
+    return {"speaker": spk, "source": src,
+            "utterance": _clip_utterance(utterance),
+            "ts": _prov_ts(ts) or time.time()}
+
+
+def fact_provenance(entry) -> Optional[dict]:
+    """The provenance of one fact entry, normalised, or None when it has none
+    (every fact stored before 2026-10-02) or what is on disk is not a record
+    (persisted state is an input surface). Never raises."""
+    try:
+        prov = entry.get("provenance") if isinstance(entry, dict) else None
+        if not isinstance(prov, dict):
+            return None
+        spk = prov.get("speaker")
+        src = prov.get("source")
+        return {"speaker": spk if spk in PROVENANCE_SPEAKERS else "unknown",
+                "source": src if src in PROVENANCE_SOURCES else "unknown",
+                "utterance": _clip_utterance(prov.get("utterance")),
+                "ts": _prov_ts(prov.get("ts"))}
+    except Exception:
+        return None
+
+
+_ORIGIN_STOP = frozenset({
+    "the", "and", "for", "that", "this", "with", "you", "your", "user",
+    "users", "are", "was", "his", "her", "has", "have", "had", "not", "but",
+    "from", "they", "their", "she", "him", "its", "our", "who", "what",
+    "jarvis", "sir", "please", "remember", "just", "also",
+})
+
+
+def _origin_words(text) -> set:
+    out = set()
+    for t in _tokenize(text if isinstance(text, str) else ""):
+        if t.endswith("'s"):
+            t = t[:-2]
+        t = t.strip("'")
+        if len(t) > 3 and t.endswith("s"):
+            t = t[:-1]
+        if len(t) >= 3 and t not in _ORIGIN_STOP:
+            out.add(t)
+    return out
+
+
+def word_overlap(a, b) -> int:
+    """How many content words two texts share (case, plural and possessive
+    folded; short and filler words ignored). Never raises."""
+    try:
+        return len(_origin_words(a) & _origin_words(b))
+    except Exception:
+        return 0
+
+
+def pick_origin(text: str, origins) -> Optional[dict]:
+    """Which of several candidate origins (dicts with an "utterance") a fact
+    most likely came from: the one sharing the most content words with it,
+    the most recent (last) on a tie. One extraction can cover several queued
+    turns, and the fact's text says which. None when there are none. Never
+    raises."""
+    try:
+        cands = [o for o in (origins or []) if isinstance(o, dict)]
+        if not cands:
+            return None
+        best, best_n = cands[-1], -1
+        for o in cands:
+            n = word_overlap(text, o.get("utterance"))
+            if n >= best_n:
+                best, best_n = o, n
+        return best
+    except Exception:
+        return None
+
+
+def _spoken_when(ts: Optional[float], now: Optional[float] = None) -> str:
+    """'today at 3:12 PM' / 'yesterday at ...' / 'on Thursday 2 October at
+    ...' in local time; '' with no timestamp."""
+    if ts is None:
+        return ""
+    try:
+        now = time.time() if now is None else float(now)
+        lt, ln = time.localtime(ts), time.localtime(now)
+        clock = time.strftime("%I:%M %p", lt).lstrip("0")
+        day = _dt.date(lt.tm_year, lt.tm_mon, lt.tm_mday)
+        today = _dt.date(ln.tm_year, ln.tm_mon, ln.tm_mday)
+        if day == today:
+            return f"today at {clock}"
+        if (today - day).days == 1:
+            return f"yesterday at {clock}"
+        date = f"{time.strftime('%A', lt)} {lt.tm_mday} {time.strftime('%B', lt)}"
+        if lt.tm_year != ln.tm_year:
+            date += f" {lt.tm_year}"
+        return f"on {date} at {clock}"
+    except Exception:
+        return ""
+
+
+def describe_provenance(prov, now: Optional[float] = None) -> str:
+    """One spoken clause for a provenance record: who said it, how it reached
+    JARVIS and when -- e.g. "you told me by voice, today at 3:12 PM". Never
+    the sentence itself (it stays in the local store). '' for no record.
+    Never raises."""
+    p = prov if isinstance(prov, dict) else None
+    if p is None:
+        return ""
+    owner = p.get("speaker") == "owner"
+    src = p.get("source")
+    if src == "voice":
+        who = ("you told me by voice" if owner else
+               "I heard it said aloud, in a voice I couldn't confirm as yours")
+    elif src == "typed":
+        who = "it was typed to me"
+    elif src == "web":
+        who = "it was typed into my web page"
+    elif src == "ambient":
+        who = ("I overheard you say it, though you weren't talking to me"
+               if owner else
+               "I overheard it in the room, from a voice I couldn't "
+               "confirm as yours")
+    else:
+        who = ("you told me" if owner else
+               "it came from someone I couldn't confirm as you")
+    when = _spoken_when(_prov_ts(p.get("ts")), now)
+    return f"{who}, {when}" if when else who
+
+
 def add_fact(text: str,
              *,
              source: str = "",
-             tags: Optional[Iterable[str]] = None) -> str:
-    """Insert a new semantic fact. Returns the new id."""
+             tags: Optional[Iterable[str]] = None,
+             provenance: Optional[dict] = None) -> str:
+    """Insert a new semantic fact. Returns the new id (an existing fact with
+    the same text returns ITS id and keeps its own provenance).
+
+    ``provenance``: where the fact came from -- a make_provenance() record
+    (or the same keys), normalised and stored under the entry's
+    "provenance". None stores none, as for every fact before 2026-10-02.
+
+    Guest mode (core/guest_mode.py) on: nothing is written and '' is
+    returned."""
     if not text or not text.strip():
         raise ValueError("add_fact: empty text")
     text = text.strip()
+    if _guest_mode.is_on():
+        print("  [ltm] guest mode: a fact was not stored")
+        return ""
     ensure_loaded()
     with _lock:
         # De-dupe by exact text — common when a fact extractor re-emits an
@@ -1387,6 +1586,12 @@ def add_fact(text: str,
             "created_at": now,
             "updated_at": now,
         }
+        if isinstance(provenance, dict):
+            entry["provenance"] = make_provenance(
+                speaker=provenance.get("speaker"),
+                source=provenance.get("source"),
+                utterance=provenance.get("utterance") or "",
+                ts=provenance.get("ts"))
         _facts[fid] = entry
         _chroma_upsert(fid, text, entry)
         _save_facts_locked()
@@ -1588,9 +1793,12 @@ def _append_episode_locked(entry: dict) -> None:
 def record_turn(role: str, text: str, *, ts: Optional[float] = None) -> None:
     """Record one conversational turn. Pushes into both working memory and
     the episodic log. Empty texts and known wake-only utterances are
-    dropped at the call site (mirroring memory.record_voice_command)."""
+    dropped at the call site (mirroring memory.record_voice_command).
+    Guest mode (core/guest_mode.py) on: nothing is recorded."""
     global _turns_since_reflect
     if not text or not text.strip():
+        return
+    if _guest_mode.is_on():
         return
     role = (role or "user").strip().lower() or "user"
     ts = ts or time.time()

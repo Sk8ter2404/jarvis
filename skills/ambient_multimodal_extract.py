@@ -92,6 +92,15 @@ def _get_config(name: str, default):
     return getattr(b, name, default)
 
 
+def _guest_mode_on() -> bool:
+    """Guest mode (core/guest_mode.py) is on. False when unreadable."""
+    try:
+        from core import guest_mode as _gm
+        return _gm.is_on()
+    except Exception:
+        return False
+
+
 def _tail_jsonl(path: str, n: int) -> list[dict]:
     if not os.path.exists(path) or n <= 0:
         return []
@@ -295,6 +304,11 @@ def _run_once() -> dict:
     # facts or projects; skip the LLM call that would extract them.
     if window_text.strip() and _get_config("LEARN_ONLY_FROM_OWNER", False) is True:
         summary["skipped"] = "owner-only learning"
+        window_text = ""
+    # Guest mode (core/guest_mode.py): merge_memory keeps nothing while it is
+    # on, so the pass skips the LLM call as well.
+    if window_text.strip() and _guest_mode_on():
+        summary["skipped"] = "guest mode"
         window_text = ""
     if not window_text.strip():
         with _lock:

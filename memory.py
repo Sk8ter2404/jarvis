@@ -202,9 +202,18 @@ def record_voice_command(text: str, active_app: str | None = None) -> None:
 
     `active_app` defaults to the currently-focused window's app name so the
     log can support 'you typically check Teams around now' anticipations.
-    Callers may pass an explicit value (or '') to override or disable."""
+    Callers may pass an explicit value (or '') to override or disable.
+
+    Guest mode on (core/guest_mode.py, 2026-10-02): nothing is logged -- a
+    visitor's words must not become the owner's habits or vocabulary."""
     if not text:
         return
+    try:
+        from core import guest_mode as _guest_mode
+        if _guest_mode.is_on():
+            return
+    except Exception:
+        pass
     cleaned = text.strip()
     if not cleaned:
         return

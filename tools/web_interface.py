@@ -91,6 +91,11 @@ ROUTES ADDED 2026-10-02
   GET  /api/proactive      every proactive / background behaviour and its
                            switch (PROACTIVE_FEATURES)
   POST /api/proactive      {"key", "on"}: saves one switch via _write_settings
+  GET  /api/memory         now with each fact's provenance (who / how / when);
+                           the sentence it came from under the timeline's
+                           transcript rule (_read_memory)
+  POST /api/control        + guest_mode_on / guest_mode_off (status
+                           ``guest_mode``: answering, remembering nothing)
 """
 from __future__ import annotations
 
@@ -1191,6 +1196,10 @@ def _status_flags(hud: dict) -> dict:
         # older JARVIS, or none running) - unknown, never reported as off.
         "require_wake_mode": (bool(hud["require_wake_mode"])
                               if "require_wake_mode" in hud else None),
+        # Guest mode (2026-10-02, published by _act_guest_mode_set and at
+        # boot): JARVIS answers but remembers nothing. None = not published.
+        "guest_mode": (bool(hud["guest_mode"])
+                       if "guest_mode" in hud else None),
     }
 
 
@@ -1381,7 +1390,10 @@ TRAY_WEB_COMMANDS = ("force_wake", "enter_standby", "mute_tts_toggle",
                      # The pinned wake-word switch (2026-10-01): the owner's
                      # "wake-word mode" is REQUIRE_WAKE_MODE, applied live by
                      # the same _act_wake_word_mode_set the voice command runs.
-                     "wake_word_mode_on", "wake_word_mode_off")
+                     "wake_word_mode_on", "wake_word_mode_off",
+                     # Guest mode (2026-10-02): the same _act_guest_mode_set
+                     # the voice command runs.
+                     "guest_mode_on", "guest_mode_off")
 _TRAY_CONFIRM = frozenset({"restart"})
 DEFAULT_TRAY_COMMANDS_PATH = os.path.join(PROJECT_DIR, "tray_commands.json")
 
@@ -3036,7 +3048,7 @@ def _read_json_list(path: str) -> list:
         return []
 
 
-def _read_memory() -> dict:
+def _read_memory(show_utterances: bool = False) -> dict:
     """The /api/memory payload: long-term semantic FACTS + recent EPISODES with
     counts. Deliberately READ-ONLY and CHEAP — we NEVER call the module's
     ensure_loaded() (which would rebuild the BM25 index / run first-boot
@@ -3045,10 +3057,16 @@ def _read_memory() -> dict:
     otherwise read the JSON mirror + episode JSONL straight off disk. Degrades to
     empty on any failure. Shape::
 
-        {"facts": [{text, source, tags, updated_at}],
+        {"facts": [{text, source, tags, updated_at, provenance}],
          "episodes": [{text, role, iso}],  # newest-first, capped
          "counts": {"facts": N, "episodes": M}}
-    """
+
+    ``provenance`` (2026-10-02): where the fact came from -- {speaker,
+    source, ts}, or None for a fact stored before provenance existed. The
+    SENTENCE it was learned from is personal, like a transcript: it rides
+    along as ``provenance.utterance`` only when ``show_utterances`` (the
+    handler's DASHBOARD_SHOW_TRANSCRIPTS + loopback-peer rule, the same as
+    the timeline's)."""
     facts: list = []
     episodes: list = []
     try:
@@ -3069,13 +3087,25 @@ def _read_memory() -> dict:
                 raw_facts = list(getattr(ltm, "_facts", {}).values())
         if raw_facts is None:
             raw_facts = _read_json_list(getattr(ltm, "_FACTS_JSON", ""))
+        prov_of = getattr(ltm, "fact_provenance", None)
         for fentry in raw_facts:
             if isinstance(fentry, dict) and str(fentry.get("text", "")).strip():
+                prov = prov_of(fentry) if callable(prov_of) else None
+                if isinstance(prov, dict):
+                    shown = {"speaker": prov.get("speaker"),
+                             "source": prov.get("source"),
+                             "ts": prov.get("ts")}
+                    if show_utterances and prov.get("utterance"):
+                        shown["utterance"] = prov.get("utterance")
+                    prov = shown
+                else:
+                    prov = None
                 facts.append({
                     "text":       str(fentry.get("text", "")),
                     "source":     fentry.get("source", ""),
                     "tags":       fentry.get("tags", []),
                     "updated_at": fentry.get("updated_at"),
+                    "provenance": prov,
                 })
     except Exception:
         facts = []
@@ -3579,8 +3609,16 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/memory":
             if not self._authorized(query, is_page=False):
                 return self._unauthorized()
+            # A fact's source sentence rides along ONLY for a loopback peer
+            # with DASHBOARD_SHOW_TRANSCRIPTS on (the timeline's rule);
+            # "utterances" tells the page why it is missing.
+            setting = _transcripts_setting()
+            show = setting and is_local_client(self.client_address[0])
             try:
-                return self._send_json(_read_memory())
+                payload = _read_memory(show_utterances=show)
+                payload["utterances"] = ("shown" if show else
+                                         "local_only" if setting else "off")
+                return self._send_json(payload)
             except Exception as e:
                 return self._send_json({"error": f"memory read failed: {e}",
                                         "facts": [], "episodes": [],
@@ -4492,6 +4530,8 @@ async function refreshStatus() {
     strip.appendChild(chip('mic', s.mic_muted ? 'MUTED' : 'on', s.mic_muted ? 'warn' : ''));
     strip.appendChild(chip('voice out', s.tts_muted ? 'MUTED' : 'on', s.tts_muted ? 'warn' : ''));
     if (s.daemons_paused) strip.appendChild(chip('daemons', 'paused', 'warn'));
+    // Guest mode: answering, but remembering nothing (hud guest_mode).
+    if (s.guest_mode) strip.appendChild(chip('guest mode', 'ON · not remembering', 'warn'));
     // Air-mouse chip — ONLY present when build_status could read the skill in-process
     // (s.air_mouse is omitted otherwise). Shows ARMED (+engaged) vs disarmed.
     if (s.air_mouse) {
@@ -4518,6 +4558,8 @@ const CONTROLS = [
   {cmd:'mute_tts_toggle',      label:(s) => (s && s.tts_muted) ? 'Unmute voice' : 'Mute voice', on:(s) => s && s.tts_muted},
   {cmd:'mic_mute_toggle',      label:(s) => (s && s.mic_muted) ? 'Unmute mic' : 'Mute mic', on:(s) => s && s.mic_muted},
   {cmd:'pause_daemons_toggle', label:(s) => (s && s.daemons_paused) ? 'Resume daemons' : 'Pause daemons', on:(s) => s && s.daemons_paused},
+  {cmd:'guest_mode_on',        label:() => 'Guest mode', show:(s) => !s || !s.guest_mode},
+  {cmd:'guest_mode_off',       label:() => 'End guest mode', on:() => true, show:(s) => s && s.guest_mode},
   {cmd:'restart',              label:() => 'Restart JARVIS', danger:true,
    confirm:'Restart JARVIS now?\n\nHe goes offline for about a minute and comes back on his own.'},
 ];
@@ -5523,6 +5565,20 @@ const memCount = document.getElementById('memCount');
 const memSearch = document.getElementById('memSearch');
 const memFacts = document.getElementById('memFacts');
 let ALL_FACTS = [];
+// Where a fact came from (provenance, 2026-10-02): who said it (the voice-ID
+// verdict), how it reached JARVIS, and when. The sentence itself is only in
+// the payload for a browser on the JARVIS PC with DASHBOARD_SHOW_TRANSCRIPTS
+// on; every value lands via textContent.
+const PROV_WHO = {owner: 'you', unknown: 'unconfirmed voice'};
+const PROV_VIA = {voice: 'voice', typed: 'typed', web: 'web page', ambient: 'overheard'};
+function provLabel(p) {
+  if (!p) return 'source not recorded';
+  const via = PROV_VIA[p.source] || 'unknown';
+  const who = (p.source === 'typed' || p.source === 'web') ? ''
+    : (PROV_WHO[p.speaker] || 'unknown') + ' · ';
+  const when = p.ts ? ' · ' + new Date(p.ts * 1000).toLocaleString() : '';
+  return who + via + when;
+}
 function renderFacts(filter) {
   const f=(filter||'').trim().toLowerCase();
   memFacts.innerHTML=''; let shown=0, matched=0;
@@ -5535,6 +5591,12 @@ function renderFacts(filter) {
     row.appendChild(txt);
     if (fact.source) { const chip=document.createElement('span'); chip.className='schip';
       chip.textContent=fact.source; row.appendChild(chip); }
+    const pv=document.createElement('span'); pv.className='schip';
+    pv.textContent=provLabel(fact.provenance); pv.title='where this fact came from';
+    row.appendChild(pv);
+    if (fact.provenance && fact.provenance.utterance) {
+      const said=document.createElement('span'); said.className='muted';
+      said.textContent='“' + fact.provenance.utterance + '”'; row.appendChild(said); }
     frag.appendChild(row); shown++;
   }
   if (matched>shown) {

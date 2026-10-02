@@ -101,10 +101,12 @@ class LearnFromTurnGateTests(_GateBase):
     def test_owner_voice_teaches_and_carries_the_verdict(self):
         self.verdicts = [(self.lg.OWNER, 0.81)]
         self.turn()
-        u, a, owner, conf, voice = self.enqueued[0]
+        # 6th field (2026-10-02): the turn's origin, for fact provenance.
+        u, a, owner, conf, voice, origin = self.enqueued[0]
         self.assertTrue(owner)
         self.assertEqual(conf, _CLEAR)
         self.assertEqual(voice, self.lg.OWNER)
+        self.assertEqual(origin["speaker"], "owner")
 
     def test_a_follow_up_in_the_owners_conversation_teaches(self):
         self.turn("jarvis what's on my calendar", wake=True)
@@ -199,7 +201,11 @@ class GateOffTests(MonolithGlobalsTestCase):
              mock.patch.object(bc, "_learn_gate_submit") as sub:
             bc.learn_from_turn("anything at all", "ok", {}, conf=_CLEAR,
                                audio=object(), sample_rate=16000)
-        self.assertEqual(got, [("anything at all", "ok", True, _CLEAR)])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][:4], ("anything at all", "ok", True, _CLEAR))
+        # 5th / 6th fields (2026-10-02): no voice verdict, and the origin.
+        self.assertIsNone(got[0][4])
+        self.assertEqual(got[0][5]["source"], "voice")
         vv.assert_not_called()
         sub.assert_not_called()
 

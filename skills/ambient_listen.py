@@ -616,7 +616,17 @@ def _maybe_nudge_wake(text: str) -> None:
 
 def _append_jsonl(path: str, entry: dict) -> None:
     """Append one JSON object as a line. Caller is responsible for any
-    rotation logic — this is a thin wrapper to keep the daemons readable."""
+    rotation logic — this is a thin wrapper to keep the daemons readable.
+
+    Guest mode on (core/guest_mode.py, 2026-10-02): nothing is appended --
+    these logs feed the fact extractor and Chappie's episodes, and what is
+    said or shown while visitors are here must not reach either."""
+    try:
+        from core import guest_mode as _guest_mode
+        if _guest_mode.is_on():
+            return
+    except Exception:
+        pass
     _ensure_data_dir()
     try:
         with open(path, "a", encoding="utf-8") as f:
