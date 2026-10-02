@@ -721,6 +721,19 @@ PROCESSING_FILLER_STILL_DELAY = 12.0   # s of turn silence before stage 2
 # are never touched. Changes apply on the next start.
 ANSWER_FIRST_ENABLED = True
 
+# ─── Turn-timing telemetry (speed plan R1, 2026-10-01) ────────────────────
+# Print-only fields on each turn's [turn-timing] line; neither changes what
+# JARVIS hears, says or when (field meanings: core/turn_timing.py).
+# TURN_TAIL_PROBE — measure where the owner's speech really ended: a Silero
+# speech detector (core/endpointing.py, its own ~2 MB CPU session) runs over
+# the last few seconds of each captured clip on a background thread and the
+# line gets tail_ms. Latches off for the session on the first failure (one
+# log line). TURN_PLAY_OPEN_PROBE — time the answer's first playback from the
+# music duck to the open stream (play_open_ms). Set via user_settings.json;
+# apply on the next start.
+TURN_TAIL_PROBE = True
+TURN_PLAY_OPEN_PROBE = True
+
 # ─── Deterministic fast paths (core/fast_paths.py + core/date_math.py) ──
 # When True, relative-date questions ("what's the date tomorrow", "how many
 # days until Christmas", "how long until Friday"), "what did I just ask you"

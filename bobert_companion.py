@@ -15485,6 +15485,228 @@ def _tt_loop_top(injected_text) -> None:
         _tt("begin", "inject")
 
 
+# ── [turn-timing] speed-plan R1 fields (2026-10-01) ───────────────────────
+# Telemetry only: the measured end of speech (tail_ms), the clip length, the
+# _stt_lock wait, the answer's playback-open time and the filler clip length
+# (field meanings: core/turn_timing.py). Every helper swallows every fault,
+# exactly like _tt(), so none of this can raise into, or change, a turn.
+def _tt_note_stat(name: str, value) -> None:
+    """TurnTiming.note_stat via _tt(). Skills fill a reserved field through
+    it by name (getattr(bc, "_tt_note_stat", None)). Never raises."""
+    _tt("note_stat", name, value)
+
+
+def _tt_note_elapsed(name: str, t0) -> None:
+    """note_stat(name, ms from t0 to now). t0 comes from _tt("now"); None
+    (probe off, or the clock read failed) records nothing. Never raises."""
+    try:
+        if t0 is None:
+            return
+        t1 = _tt("now")
+        if t1 is None:
+            return
+        _tt("note_stat", name, int(round((t1 - t0) * 1000.0)))
+    except Exception:
+        pass
+
+
+def _tt_note_clip_ms(name: str, audio, sr) -> None:
+    """note_stat(name, length of `audio` at `sr` in ms). Never raises."""
+    try:
+        if not sr:
+            return
+        _tt("note_stat", name, int(round(len(audio) * 1000.0 / float(sr))))
+    except Exception:
+        pass
+
+
+# tail_ms: record_speech's "21 silent chunks" count cannot measure the real
+# silence wait (a noise spike restarts it, so it is always 1,344 ms by
+# construction). A speech detector over the finished clip can. Its own ORT
+# session (core/endpointing.py), never faster-whisper's _stt_lock singleton.
+# Nothing loads until the boot warmer below or the first capture.
+from core import endpointing as _endpointing  # noqa: E402
+
+_tail_vad = _endpointing.SileroVad()
+# The in-flight probe daemon (one at a time) and whether its latch-off has
+# been reported. Touched only by the capture threads.
+_tail_probe_state = {"thread": None, "off_logged": False}
+
+
+def _tail_probe_start(audio) -> None:
+    """clip_ms now, and tail_ms for this capture: a copy of `audio` (the last
+    MAX_SCAN_S at most) goes to a daemon that runs the detector while Whisper
+    and the brain work — the CPU is idle then. The turn line reads the
+    result when it prints (a lazy note_stat value): ``-`` if not done by
+    then. Never blocks, never raises: one probe in flight (a busy probe
+    skips this capture) and a detector that failed once stays off for the
+    session (TURN_TAIL_PROBE; the failure is logged once)."""
+    try:
+        if not isinstance(audio, np.ndarray) or audio.ndim != 1:
+            return
+        _tt_note_clip_ms("clip_ms", audio, SAMPLE_RATE)
+        if not TURN_TAIL_PROBE:
+            return
+        vad = _tail_vad
+        why = vad.failed
+        if why:
+            if not _tail_probe_state["off_logged"]:
+                _tail_probe_state["off_logged"] = True
+                print(f"  [turn-timing] tail probe off for this session "
+                      f"({why})")
+            return
+        prev = _tail_probe_state["thread"]
+        if prev is not None and prev.is_alive():
+            return
+        keep = int(_endpointing.MAX_SCAN_S * SAMPLE_RATE)
+        clip = np.array(audio[-keep:], dtype=np.float32, copy=True)
+        box = [None]
+
+        def _probe():
+            try:
+                box[0] = vad.speech_tail_ms(clip, SAMPLE_RATE)
+            except Exception:
+                box[0] = None
+
+        th = threading.Thread(target=_probe, daemon=True, name="tail-probe")
+        th.start()
+        _tail_probe_state["thread"] = th
+        _tt("note_stat", "tail_ms", lambda: box[0])
+    except Exception:
+        pass
+
+
+# ── Boot warmers (speed plan R1, 2026-10-01) ─────────────────────────────
+# Optional model warm-ups register here instead of editing main(): R1's
+# Silero tail probe now; R4 (Kokoro openers), R6 (Parakeet) and R7 (Smart
+# Turn) later. main() starts them ONCE, in one daemon, right after the boot
+# Whisper load. Each warmer runs in try/except and prints exactly one
+# "[warm] <name> ok|failed" line; nothing here can block or break boot.
+_boot_warmers: list = []           # [(name, fn)], registration order
+_boot_warmers_started = [False]
+
+
+def _register_boot_warmer(name: str, fn) -> None:
+    """Queue `fn()` for the boot-warmer daemon. A name registered twice
+    keeps its first fn. Never raises."""
+    try:
+        if not callable(fn):
+            return
+        name = str(name)
+        if any(n == name for n, _ in _boot_warmers):
+            return
+        _boot_warmers.append((name, fn))
+    except Exception:
+        pass
+
+
+def _run_boot_warmers_body(jobs) -> None:
+    """The daemon's body: each warmer in order, one line each."""
+    for name, fn in jobs:
+        try:
+            t0 = time.perf_counter()
+            try:
+                fn()
+            except Exception as e:
+                print(f"  [warm] {name} failed ({type(e).__name__}: {e})")
+                continue
+            print(f"  [warm] {name} ok "
+                  f"({int((time.perf_counter() - t0) * 1000)} ms)")
+        except Exception:
+            pass
+
+
+def _run_boot_warmers():
+    """Start the boot-warmer daemon, once per process. Returns the thread, or
+    None (already started, nothing registered, or it could not start).
+    Never blocks, never raises."""
+    try:
+        if _boot_warmers_started[0]:
+            return None
+        _boot_warmers_started[0] = True
+        jobs = list(_boot_warmers)
+        if not jobs:
+            return None
+        th = threading.Thread(target=_run_boot_warmers_body, args=(jobs,),
+                              daemon=True, name="boot-warmers")
+        th.start()
+        return th
+    except Exception as e:
+        try:
+            print(f"  [warm] could not start ({type(e).__name__}: {e})")
+        except Exception:
+            pass
+        return None
+
+
+def _warm_tail_probe() -> None:
+    """Boot warmer: load the tail probe's detector and run it once (the first
+    ORT run is the slow one). A failure latches the probe off; the warmer's
+    "[warm] silero-tail failed" line is then its one log line."""
+    try:
+        _tail_vad.warm()
+    except Exception:
+        _tail_probe_state["off_logged"] = True
+        raise
+
+
+if TURN_TAIL_PROBE:
+    _register_boot_warmer("silero-tail", _warm_tail_probe)
+
+
+# The settings later speed-plan releases A/B on the turn lines, printed once
+# per boot as "[turn-flags] KEY=value ..." so tools/turn_latency_report.py
+# --split flag=KEY can tell which value each session ran with. A name not
+# defined (yet) is skipped. Every value is a bool / number / short word.
+_TURN_FLAG_KEYS = (
+    "TURN_TAIL_PROBE", "TURN_PLAY_OPEN_PROBE",
+    "PROCESSING_FILLER_ENABLED", "PROCESSING_FILLER_DELAY",
+    "PROCESSING_FILLER_STILL_DELAY", "ANSWER_FIRST_ENABLED",
+    "SENTENCE_TTS_ENABLED", "FAST_PATHS_ENABLED",
+    # Reserved for later batches (absent until they ship):
+    "AMBIENT_STT_YIELD", "PROCESSING_FILLER_PRERENDER",
+    "PROCESSING_FILLER_LATE_START_S", "PROCESSING_FILLER_SKIP_PLEASANTRIES",
+    "FILLER_DUCK_HOLD", "KOKORO_PERSISTENT_PHONEMIZER", "KOKORO_RENDER_CACHE",
+    "KOKORO_RENDER_CACHE_PERSIST", "OLLAMA_SERVER_LOG", "LOCAL_NUM_CTX",
+    "BACKGROUND_TAG_STRICT", "STT_ENGINE", "STT_SHADOW", "SMART_TURN_MODE",
+    "SMART_TURN_THRESHOLD", "WHISPER_TEMPERATURES", "WHISPER_BEAM_SIZE",
+    "PROCESSING_FILLER_SOFT_CUT", "LOCAL_PROMPT_PROFILE",
+    "LOCAL_TURN_CTX_IN_HISTORY", "SENTENCE_TTS_MIN_CHARS",
+    "SENTENCE_TTS_LOOKAHEAD_MERGE", "LOCAL_STREAMING_TTS",
+    "TTS_OUTPUT_LATENCY",
+)
+
+
+def _turn_flag_token(v) -> "str | None":
+    """One flag value as a short whitespace-free token; None to skip it."""
+    if v is None or isinstance(v, (bool, int, float)):
+        s = str(v)
+    elif isinstance(v, str):
+        s = v or "''"
+    elif isinstance(v, (list, tuple)) and all(
+            isinstance(x, (bool, int, float, str)) for x in v):
+        s = ",".join(str(x) for x in v) or "()"
+    else:
+        return None
+    s = "_".join(s.split())
+    return s if len(s) <= 40 else None
+
+
+def _log_turn_flags() -> None:
+    """Print the [turn-flags] line (see _TURN_FLAG_KEYS). Never raises."""
+    try:
+        g = globals()
+        parts = []
+        for k in _TURN_FLAG_KEYS:
+            if k in g:
+                tok = _turn_flag_token(g[k])
+                if tok is not None:
+                    parts.append(f"{k}={tok}")
+        print("  [turn-flags] " + " ".join(parts))
+    except Exception:
+        pass
+
+
 _last_recording_peak = 0.0   # set by record_speech, read by callers
 
 # ── SPECULATIVE TRANSCRIPTION (2026-09-06 latency work) ───────────────────
@@ -15681,7 +15903,12 @@ def _transcribe_capture(audio):
 
     `audio` must already be auto-gained — the speculative worker applies the
     same gain to its own snapshot from the same (final) peak RMS, so the two
-    paths feed faster-whisper identically-scaled samples."""
+    paths feed faster-whisper identically-scaled samples.
+
+    [turn-timing] (speed plan R1): the owner's captures only pass here, so
+    this is where clip_ms is noted and the tail_ms probe starts — on a copy,
+    on its own daemon; the (text, conf) below are untouched by it."""
+    _tail_probe_start(audio)
     t = _spec_stt.get("thread")
     if _SPECULATIVE_STT and t is not None and _spec_stt.get("chunks", -1) >= 0:
         # This join is NOT a latency bound, and the comment here used to claim
@@ -17787,8 +18014,15 @@ def transcribe(audio: np.ndarray) -> tuple[str, dict]:
     decode actually happens. _stt_lock is an RLock, so the nested
     _ensure_whisper() re-acquires it on this thread without deadlocking. This is
     what makes concurrent transcription safe; a race here corrupts native state
-    and terminates the process (0xc0000409)."""
+    and terminates the process (0xc0000409).
+
+    [turn-timing] stt_wait_ms (speed plan R1): the time spent waiting for
+    _stt_lock — an ambient decode holding Whisper. TurnTiming keeps it only
+    for the turn's own thread, so an ambient worker's wait never lands on
+    the line. Print-only; the lock and the return are unchanged."""
+    _stt_w0 = _tt("now")
     with _stt_lock:
+        _tt_note_elapsed("stt_wait_ms", _stt_w0)
         return _transcribe_impl(audio)
 
 
@@ -22833,6 +23067,9 @@ def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None
         while True:
             try:
                 if not stream.active:   # False once closed/aborted/finished
+                    # JARVIS_PERF_PROBE only (speed plan R1): with the
+                    # sdplay_* marks this splits a hold into clip + overhead.
+                    _prof("reap_inactive")
                     break
             except Exception:
                 break
@@ -22861,6 +23098,7 @@ def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None
             stream.close(ignore_errors=True)
         except Exception:
             pass
+        _prof("reap_closed")
     finally:
         # H-6: retire the in-flight-close registration made by
         # _pa_close_handoff in play_with_lipsync, BEFORE signalling the caller
@@ -22980,10 +23218,17 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
         barge_watch_thread = threading.Thread(target=_barge_watch, daemon=True)
         barge_watch_thread.start()
 
+    # [turn-timing] play_open_ms (speed plan R1): from here — the duck's
+    # synchronous session scan — to sd.play() returning with the stream open,
+    # the answer's first playback only (TurnTiming applies first_play's
+    # thread rule). The duck_* marks are JARVIS_PERF_PROBE-only. Timing only.
+    _tt_open0 = _tt("now") if TURN_PLAY_OPEN_PROBE else None
+    _prof("duck_start")
     # Duck Chrome / Spotify / Apple Music / Edge so JARVIS sits cleanly
     # over whatever's already playing. Fades down in the background so
     # playback starts immediately; restored in the finally block.
     _audio_ducker.duck()
+    _prof("duck_done")
 
     CHUNK_SECS = 0.033
     chunk_n    = int(sr * CHUNK_SECS)
@@ -23048,6 +23293,7 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
             # what stalled the main loop 100-181 s until the watchdog reaped
             # the process).
             _play_audio_safe()
+            _tt_note_elapsed("play_open_ms", _tt_open0)
             try:
                 _stream = sd.get_stream()
             except Exception:
@@ -23111,6 +23357,7 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
             t = threading.Thread(target=_sync, daemon=True)
             t.start()
             _play_audio_safe()
+            _tt_note_elapsed("play_open_ms", _tt_open0)
             # Same single-toucher tts-reaper as the no-robot branch — barge-in
             # works with the robot connected too. Shared _reap_playback body,
             # deliberately NOT a divergent copy (the old _safe_wait_robot twin
@@ -33590,6 +33837,9 @@ def _filler_play(turn, stage: int) -> str:
         print(f"  [filler] stage {stage}: {text}")
         _prof("filler_play", f"stage={stage}")
         _tt("note_filler")
+        # [turn-timing] filler_clip_ms (speed plan R1): the first clip's
+        # length, so its _SPEAK_LOCK hold splits into clip + overhead.
+        _tt_note_clip_ms("filler_clip_ms", audio, sr)
         # Self-echo content layer: the clip is JARVIS's voice too.
         _se_line = _self_echo.remember(text) if _self_echo_audible() else 0
         try:
@@ -38131,6 +38381,12 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         print(f"  [local-llm] warm-up launch failed (non-fatal): {_e}")
 
     _ensure_whisper()   # load now so first user utterance isn't delayed
+    # Speed plan R1 (2026-10-01): the optional model warm-ups registered via
+    # _register_boot_warmer start here, in ONE daemon that never blocks boot
+    # (one "[warm] <name> ok|failed" line each), and the latency flags this
+    # session runs with are logged once for tools/turn_latency_report.py.
+    _run_boot_warmers()
+    _log_turn_flags()
 
     # Walk requirements.txt and warn loudly about any missing packages so
     # silent feature-disabling (psutil → no system monitor / no HUD CPU-RAM,
