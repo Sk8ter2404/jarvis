@@ -292,7 +292,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Status panel ("suit diagnostics")** — the full multi-line readout plus a HUD card.
   - "system status", "suit diagnostics"
   - Actions: `status_panel`, `system_status`, `suit_diagnostics`
-- **Self-diagnostic** — sweeps webcam, mic, TTS, STT, GPU, disk and RAM and speaks a summary; also runs every 30 minutes. Four diagnostic daemons (self-diag, deep audit, crash watcher, anomaly watcher) run alongside.
+- **Self-diagnostic** — sweeps webcam, mic, TTS, STT, GPU, disk and RAM and speaks a summary; also runs in the background, about every 5 minutes from the self-diag daemon plus a 30-minute schedule. Four diagnostic daemons (self-diag, deep audit, crash watcher, anomaly watcher) run alongside.
   - "are you ok", "what is broken", "run a diagnostic", "pause the diagnostics"
   - Actions: `self_diagnostic` / `run_diagnostic` / `system_check` / `are_you_ok`, `whats_broken`, `diagnostic_history`, `last_diagnostic_run`, `show_last_diagnostic`, `diagnostic_status`, `diagnostic_daemon_status`, `pause_diagnostics`, `resume_diagnostics`
 - **Self-test probes** — check one subsystem; the verdict goes to the console log, not the voice.
@@ -368,9 +368,9 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Upgrade pipeline** — hands the task queue to Claude Code: kills JARVIS, runs Claude Code on the pending tasks, relaunches when done. Guarded by `OVERNIGHT_UPGRADE_ENABLED`, which ships off, so a stray "go ahead" can't start it.
   - "upgrade yourself", "apply the changes"
   - Action: `upgrade`
-- **Overnight upgrade engine** — the autonomous improvement loop (generate ideas, queue them, run the pipeline, repeat while idle) (off by default - setting `OVERNIGHT_UPGRADE_ENABLED`); with it off only the quiet-standby half runs.
+- **Overnight upgrade engine** — the autonomous improvement loop (generate ideas, queue them, run the pipeline, repeat while idle) (off by default - setting `OVERNIGHT_UPGRADE_ENABLED`). With it on, `start_overnight_upgrade` also puts JARVIS into silent standby for the night; with it off the action changes nothing and JARVIS stays awake (no standby).
   - "start overnight upgrade", "improve yourself while I sleep"
-  - **Goodnight phrasings always fire this**: "goodnight", "good night", "I'm going to bed", "heading to bed", "going to sleep", "I'm off to bed", "time to sleep"
+  - The prompt sends bedtime phrasings here too: "goodnight", "good night", "I'm going to bed", "heading to bed", "going to sleep", "I'm off to bed", "time to sleep" — so with the engine off they do not put him to sleep either; a sleep phrase ("go to sleep", "stand by") is what quiets him.
   - Actions: `start_overnight_upgrade`, `stop_pipeline`
 - **Pattern learning** — nightly aggregator over `data/usage_patterns.jsonl` (03:00), weekly digest on Mondays; feeds the anticipation engine.
   - "what patterns have you learned", "what have you noticed about my habits"
@@ -500,7 +500,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Phone push** — Telegram, ntfy or Pushover; prefix `!urgent` / `!high` for priority.
   - "send the print status to my phone", "text my phone <message>", "phone status"
   - Actions: `notify_phone` / `push_to_phone` / `text_my_phone`, `phone_status`, `list_phone_backends`, `pause_phone_bridge`, `resume_phone_bridge`
-- **Phone pings** (`core/phone_ping.py`, `PHONE_PING_ENABLED` on, but a no-op with one boot line until a phone bridge is configured) — JARVIS texts your phone unprompted only when something needs you: a print finished, failed (not one you cancelled) or paused with an error (once per pause); a guard-mode alert (its own switch — "turn off phone pings" never silences the guard); a talking-device skill that needs you (`skill_utils["ping_phone"]`); and, off by default, a confirmation you asked for and left to lapse while away (the action's name only, `PHONE_PING_CONFIRM`) and a daily summary (`PHONE_PING_SUMMARY`). Nothing pings while you are talking to him or, while he is awake, working at the PC (he says it out loud), in focus mode, or 23:00–07:00 / after "goodnight" (held, then sent as one message), except guard alerts; at most 6 an hour; secrets are scrubbed from every text.
+- **Phone pings** (`core/phone_ping.py`, `PHONE_PING_ENABLED` on, but a no-op with one boot line until a phone bridge is configured) — JARVIS texts your phone unprompted only when something needs you: a print finished, failed (not one you cancelled) or paused with an error (once per pause); a guard-mode alert (its own switch — "turn off phone pings" never silences the guard); a talking-device skill that needs you (`skill_utils["ping_phone"]`); and, off by default, a confirmation you asked for and left to lapse while away (the action's name only, `PHONE_PING_CONFIRM`) and a daily summary (`PHONE_PING_SUMMARY`). Nothing pings while you are talking to him or, while he is awake, working at the PC (he says it out loud), in focus mode, or 23:00–07:00 / in overnight mode (held, then sent as one message), except guard alerts; at most 6 an hour; secrets are scrubbed from every text.
   - "how do I connect my phone" (the setup steps), "phone ping status", "turn off phone pings", "send a test ping"
   - Actions: `phone_setup_help`, `phone_ping_status`, `phone_pings_on`, `phone_pings_off`, `phone_ping_test`
   - Settings: Integrations tab → Phone pings
@@ -559,7 +559,7 @@ A desk robot companion over Wi-Fi is driven by a private skill that is not in th
 
 ### Category 26: Speech recognition, speed work & turn telemetry
 
-The "speed plan" work: every change ships off or in a log-only shadow mode and is judged by the per-turn timing line before it is switched on.
+The "speed plan" work: each new engine ships off or in a log-only shadow mode and is judged by the per-turn timing line before it is switched on. The telemetry, the local prompt cache and answer-first are on.
 
 - **Turn-timing telemetry** (`core/turn_timing.py`) — every voice or typed turn prints one `[turn-timing]` line with millisecond stage marks (end of speech, Whisper, the model call and its prompt-cache figures, actions, synthesis, first audio) plus the measured real end of speech (`TURN_TAIL_PROBE`, a small Silero detector run after the clip) and playback-open time (`TURN_PLAY_OPEN_PROBE`); both probes are log-only and on. `python tools/turn_latency_report.py <logs>` prints p50 / p90 per stage from those lines (counts only, never transcripts).
 - **Parakeet speech-to-text** (`core/stt_parakeet.py`; off by default - settings `STT_ENGINE`, `STT_SHADOW`) — NVIDIA Parakeet TDT 0.6B v2 (int8 ONNX, CPU only) for the owner's commands and the standby wake checks, roughly 0.15–0.3 s per command instead of ~1.7 s. `STT_ENGINE = "parakeet"` uses it, with Whisper kept loaded as the fallback (an empty transcript, or one the wake gates would drop, is decoded again by Whisper; any error switches back for the session). `STT_SHADOW = "parakeet"` is the A/B mode: Whisper keeps transcribing and Parakeet re-decodes each command afterwards while JARVIS is idle, writing both engines' gate verdicts to the gitignored `data/stt_ab.jsonl` (words only for a line JARVIS would act on, nothing while the mic is muted, audio never saved).
@@ -582,8 +582,8 @@ The "speed plan" work: every change ships off or in a log-only shadow mode and i
   - Otherwise one of 12 phrases tagged formal / terse / playful / soft / general.
 - **Barge-in** — say "JARVIS" while he's talking to cut TTS mid-sentence, on speakers as well as headsets. Requires the wake-word detector to be running (`wake_listener_start`); it does not autostart, so talking over him does nothing on its own. Refused while the sentence being spoken contains "jarvis" (echo safety). The legacy loudness/headset watcher is hard-disabled (its mic-stream teardown crashed the audio stack).
 - **Presence hold** (on by default - setting `PRESENCE_HOLD_ENABLED`) — queued proactive lines wait while you are away or the room is talking (another conversation, someone else's speech); your own reminders (timers, schedules, promises) and guard alerts still speak. When you are back, stale status lines are folded into one short "While you were away" recap (`core/owner_presence.py`).
-- **Goodnight = overnight standby** — any bedtime phrasing fires `start_overnight_upgrade` and silences JARVIS until morning; the improvement engine itself runs only when `OVERNIGHT_UPGRADE_ENABLED` is on.
-- **Shutdown asks first** — the ambiguous shutdown phrases are intercepted before the model so JARVIS can ask "overnight first?"; a short yes or "overnight" runs overnight, "no" / "just shut down" powers off, and a hedged no never powers off.
+- **Goodnight** — any bedtime phrasing fires `start_overnight_upgrade`. With `OVERNIGHT_UPGRADE_ENABLED` on, that silences JARVIS until morning and runs the improvement engine; with it off (the shipped default) the action changes nothing and JARVIS stays awake.
+- **Shutdown asks first** — the ambiguous shutdown phrases are intercepted before the model so JARVIS can ask "overnight first?"; a short yes or "overnight" runs `start_overnight_upgrade` (which does nothing while the engine is off), "no" / "just shut down" powers off, and a hedged no never powers off.
 - **Workshop auto-engagement** — opening any CAD/slicer app drops TTS volume 30%, shortens replies and engages focus mode for an hour (released when the app closes).
 - **Session resume greeting** — a restart within 18 h of the last session (but not within 15 minutes of it) offers to pick the thread back up.
 - **Promises ("I'll let you know when…")** — skills register a deferred announcement via `skill_utils["make_promise"]` (e.g. "tell me when the print finishes"); list or cancel them by voice.

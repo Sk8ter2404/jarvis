@@ -58,13 +58,13 @@ while a real neural detector (`core/wake_word.py`) sits unused.
 - **DECIDED: Rust.** `native/jarvis-audio/` has the IPC protocol, cpal capture,
   a ring buffer and VAD/endpointing; wake word + the named-pipe transport are
   next, and nothing in Python uses it yet.
-- ◐ In the Python pipeline meanwhile (the "speed plan", each step off or
-  shadow-only until measured): per-turn `[turn-timing]` telemetry, Parakeet STT
-  on the CPU with a shadow A/B mode, Whisper decode knobs, Smart Turn
-  end-of-turn (shadow), Kokoro phonemizer + render cache, and a cache-stable
-  local prompt with idle re-prime.
+- ◐ In the Python pipeline meanwhile (the "speed plan"): per-turn
+  `[turn-timing]` telemetry and a cache-stable local prompt with idle re-prime
+  are on; Parakeet STT on the CPU with a shadow A/B mode, Whisper decode
+  knobs, Smart Turn end-of-turn (shadow) and the Kokoro phonemizer + render
+  cache ship off or shadow-only until measured.
 
-### M2 · De-monolith via process isolation  ◐ (groundwork only, unwired)
+### M2 · De-monolith via process isolation  ◐ (groundwork only)
 The monolith + ~17 shared global-state slots + ~30 `global`-rebound singletons +
 ~50 JSON files as IPC are the core maintainability liability — and the worst
 shape for a file an LLM rewrites daily.
@@ -74,9 +74,10 @@ shape for a file an LLM rewrites daily.
   IPC bus instead of 50 racy JSON files.
 - Formalize `skill_utils` into a typed service interface; retire `global`
   rebinds cluster-by-cluster via the `core/actions._bc()` extraction seam.
-- Built, not yet wired: the in-process bus (`core/message_bus.py`), its
-  cross-process wire format (`core/bus_transport.py`) and the typed skill
-  seam (`core/services.py`).
+- The typed skill seam (`core/services.py`) is wired: the loader injects it
+  into every skill as `services`, and two skills use it so far. Built, not
+  yet wired: the in-process bus (`core/message_bus.py`) and its
+  cross-process wire format (`core/bus_transport.py`).
 
 ### M3 · Trustworthy self-evolution  ◐  ([PR: feat/safe-self-upgrade])
 The pipeline edits its own 101K-LOC brain unattended; the safety gaps were the
