@@ -1340,6 +1340,45 @@ class VramBarOverageTests(_TmpDir):
         self.assertEqual(sw.vram_bar_layout({}, 700)["fill_px"], 0)
         self.assertEqual(sw.vram_bar_layout(None, 0)["limit_px"], None)
 
+    def test_layout_reports_which_case_it_drew(self):
+        self.assertTrue(sw.vram_bar_layout(
+            {"total_mb": 137, "budget_mb": 100}, 700)["over"])
+        self.assertFalse(sw.vram_bar_layout(
+            {"total_mb": 100, "budget_mb": 100}, 700)["over"])
+        self.assertFalse(sw.vram_bar_layout({}, 700)["over"])
+        self.assertFalse(sw.vram_bar_layout({"total_mb": "x"}, 700)["over"])
+
+    def test_zero_budget_card_is_all_overage_not_an_empty_bar(self):
+        # 2026-10-02: a card at or under the headroom has a usable budget of
+        # 0. predict_budget() calls any load on it over, but the layout drew
+        # an empty, unmarked bar — the same picture as nothing loaded at all.
+        lay = sw.vram_bar_layout({"total_mb": 2048, "budget_mb": 0}, 700)
+        self.assertTrue(lay["over"])
+        self.assertEqual((lay["fill_px"], lay["limit_px"]), (0, 0))
+        self.assertEqual(lay["over_label"], "+2.0 GB over")
+        # Nothing loaded on that card is still an empty, unmarked bar.
+        lay = sw.vram_bar_layout({"total_mb": 0, "budget_mb": 0}, 700)
+        self.assertEqual((lay["fill_px"], lay["limit_px"], lay["over"]),
+                         (0, None, False))
+
+    def test_zero_budget_card_paints_the_hatched_overage(self):
+        # 1 GB card: below the ~1.5 GB headroom, so the usable budget is 0.
+        app = self._bar(total_vram_mb=1024)
+        b = self._budget(app)
+        self.assertEqual(b["budget_mb"], 0)
+        self.assertTrue(b["over"])
+        canvas = app.vram_widgets["canvas"]
+        visible = self._visible(canvas)
+        hatched = [it for it in visible
+                   if it["kind"] == "rectangle" and it["kw"].get("stipple")]
+        self.assertEqual([(h["coords"][0], h["coords"][2]) for h in hatched],
+                         [(0, self._CW)])
+        texts = [it["kw"].get("text", "") for it in visible
+                 if it["kind"] == "text"]
+        over_gb = b["total_mb"] / 1024.0
+        self.assertTrue(any(f"+{over_gb:.1f} GB over" in t for t in texts),
+                        texts)
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  P1-9  rows whose setting isn't actually in effect say so

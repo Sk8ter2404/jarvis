@@ -2988,20 +2988,29 @@ def vram_bar_layout(budget: dict, width) -> dict:
     looked the same (GUI_REVIEW B16). The bar then spans the predicted PEAK
     instead: the solid fill stops at ``limit_px``, where the budget runs out,
     and the rest of the bar is the overage, drawn hatched and labelled with
-    ``over_label``. ``limit_px`` is None within budget. Never raises."""
+    ``over_label``. ``limit_px`` is None within budget; ``over`` says which
+    case was drawn. Never raises.
+
+    2026-10-02: a card at or under the headroom has a usable budget of 0, and
+    predict_budget() calls ANY load on it over (``total > budget``) — but this
+    returned an empty, unmarked bar for it, so the one card with no room at
+    all looked like the card with nothing loaded. The whole bar is the
+    overage there: the limit sits at 0 and the label carries the full load."""
     try:
         width = max(1, int(width))
         total = max(0, int((budget or {}).get("total_mb") or 0))
         cap = max(0, int((budget or {}).get("budget_mb") or 0))
     except (TypeError, ValueError):
-        return {"fill_px": 0, "limit_px": None, "over_label": ""}
-    if cap <= 0 or total <= cap:
+        return {"fill_px": 0, "limit_px": None, "over_label": "",
+                "over": False}
+    if total <= cap:
         frac = min(1.0, total / cap) if cap > 0 else 0.0
         return {"fill_px": int(width * frac), "limit_px": None,
-                "over_label": ""}
+                "over_label": "", "over": False}
     limit_px = int(width * cap / total)
     return {"fill_px": limit_px, "limit_px": limit_px,
-            "over_label": f"+{(total - cap) / 1024.0:.1f} GB over"}
+            "over_label": f"+{(total - cap) / 1024.0:.1f} GB over",
+            "over": True}
 
 
 # ──────────────────────────────────────────────────────────────────────────
