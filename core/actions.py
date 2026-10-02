@@ -1364,8 +1364,15 @@ def _close_refused(err) -> bool:
     return "access is denied" in msg or "error code from windows: 5 " in msg
 
 
+# The shell's own desktop window ("Program Manager", explorer.exe). WM_CLOSE
+# on it opens Windows' "Shut Down Windows" dialog, so "close_window,
+# explorer.exe" must reach File Explorer windows only (review 2026-10-02).
+_SHELL_WINDOW_TITLES = frozenset({"program manager"})
+
+
 def _windows_of_process(exe: str) -> list:
-    """Titled windows whose process executable is ``exe`` (case-insensitive)."""
+    """Titled windows whose process executable is ``exe`` (case-insensitive),
+    never the shell's desktop window."""
     try:
         import pygetwindow as gw
         windows = gw.getAllWindows()
@@ -1374,7 +1381,8 @@ def _windows_of_process(exe: str) -> list:
     want = exe.strip().lower()
     out = []
     for w in windows:
-        if not (getattr(w, "title", "") or "").strip():
+        title = (getattr(w, "title", "") or "").strip()
+        if not title or title.lower() in _SHELL_WINDOW_TITLES:
             continue
         name = _window_process_name(w)
         if name and name.strip().lower() == want:

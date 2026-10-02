@@ -72,9 +72,9 @@ class TerminalFailureTests(_Base):
     def test_a_terminal_result_in_a_follow_up_round_ends_the_chain(self):
         # The live opening: an unverified claim (never spoken), then the
         # follow-up round's real action, which Windows refuses.
-        self._dispatch("Jarvis closed task manager.",
-                       "[intent:confirmation] Very good, sir. Task Manager "
-                       "has been closed.",
+        self._dispatch("Jarvis closed the task manager app.",
+                       "[intent:confirmation] Very good, sir. The task "
+                       "manager app has been closed.",
                        ["[intent:confirmation] Right away, sir. "
                         "[ACTION: close_window, taskmgr.exe]",
                         "[ACTION: see_screen, task manager]",

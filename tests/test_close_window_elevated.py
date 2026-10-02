@@ -169,6 +169,22 @@ class TargetResolutionTests(_Base):
         self.assertIn("Task Manager runs as administrator",
                       fm.terminal_failure_text(out))
 
+    def test_a_process_name_never_reaches_the_desktop_window(self):
+        # Review 2026-10-02: explorer.exe also owns the desktop ("Program
+        # Manager"); WM_CLOSE on it opens Windows' shut-down dialog.
+        desk = _Win("Program Manager", 0x30)
+        files = _Win("Downloads - File Explorer", 0x31)
+        self.procs.update({0x30: "explorer.exe", 0x31: "explorer.exe"})
+        self._all_windows([desk, files])
+        out = A._act_close_window("explorer.exe")
+        self.assertTrue(files.closed)
+        self.assertFalse(desk.closed)
+        self.assertNotIn("Program Manager", out)
+        self._all_windows([desk])
+        self.assertEqual(A._act_close_window("explorer.exe"),
+                         "no window matching 'explorer.exe'")
+        self.assertFalse(desk.closed)
+
     def test_a_monitor_suffix_resolves_to_the_title(self):
         w = _Win("Task Manager", 0x10)
         self.bc._find_windows_by_title.side_effect = (
