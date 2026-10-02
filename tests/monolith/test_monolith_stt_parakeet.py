@@ -231,6 +231,44 @@ class R6PrimaryTests(_Base):
         self.assertEqual(eng.calls, 1)
         self.assertEqual(self._engine_notes(), ["parakeet"])
 
+    def test_speculative_stt_stands_aside(self):
+        """JARVIS_SPECULATIVE_STT=1 with Parakeet primary: no speculative
+        Whisper snapshot is started, and one already standing is not
+        joined — it would pre-empt Parakeet with Whisper's text (R6 review,
+        finding 6)."""
+        bc = self.bc
+        self._p(bc, "_SPECULATIVE_STT", True)
+        self.assertFalse(bc._spec_stt_should_snapshot(7, 7, 20, 6))
+        self._p(bc, "STT_ENGINE", "whisper")
+        self.assertTrue(bc._spec_stt_should_snapshot(7, 7, 20, 6))
+        self._p(bc, "STT_ENGINE", "parakeet")
+        done = threading.Thread(target=lambda: None)
+        done.start()
+        done.join()
+        spec = dict(bc._spec_stt, thread=done, chunks=12,
+                    result=("speculative words", {}))
+        self._p(bc, "_spec_stt", spec)
+        self._p(bc, "_stt_alt", _FakeEngine(text="turn the lights off"))
+        self.assertEqual(bc._transcribe_capture(self.audio)[0],
+                         "turn the lights off")
+        self.assertEqual(self._engine_notes(), ["parakeet"])
+
+    def test_the_turn_flags_line_shows_the_engine_in_effect(self):
+        # JARVIS_STT_ENGINE overrides the config value: the boot line (which
+        # turn_latency_report --split flag=STT_ENGINE reads) says so.
+        bc = self.bc
+        self._p(bc, "STT_ENGINE", "whisper")
+        os.environ["JARVIS_STT_ENGINE"] = "parakeet"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bc._log_turn_flags()
+        self.assertIn(" STT_ENGINE=parakeet", out.getvalue())
+        os.environ.pop("JARVIS_STT_ENGINE")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bc._log_turn_flags()
+        self.assertIn(" STT_ENGINE=whisper", out.getvalue())
+
     def test_parakeet_never_lands_in_stt(self):
         bc = self.bc
         sentinel = object()

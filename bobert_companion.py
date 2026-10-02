@@ -16138,13 +16138,18 @@ def _turn_flag_token(v) -> "str | None":
 
 
 def _log_turn_flags() -> None:
-    """Print the [turn-flags] line (see _TURN_FLAG_KEYS). Never raises."""
+    """Print the [turn-flags] line (see _TURN_FLAG_KEYS). Never raises.
+    STT_ENGINE is the engine in effect: the JARVIS_STT_ENGINE environment
+    override included (speed plan R6)."""
     try:
         g = globals()
         parts = []
         for k in _TURN_FLAG_KEYS:
             if k in g:
-                tok = _turn_flag_token(g[k])
+                v = g[k]
+                if k == "STT_ENGINE" and g.get("_stt_parakeet") is not None:
+                    v = g["_stt_parakeet"].engine_setting(v)
+                tok = _turn_flag_token(v)
                 if tok is not None:
                     parts.append(f"{k}={tok}")
         print("  [turn-flags] " + " ".join(parts))
@@ -16283,6 +16288,11 @@ def _spec_stt_should_snapshot(silence_n: int, spec_at: int, n_chunks: int,
         return False
     if n_chunks < spec_min_chunks:
         return False
+    # Speed plan R6: with Parakeet primary the owner's capture is Parakeet's
+    # (_transcribe_capture skips the join too); a Whisper bet here would only
+    # take _stt_lock from the rescue's own Whisper decode.
+    if _stt_r6_route() == "primary":
+        return False
     t = _spec_stt["thread"]
     return t is None or not t.is_alive()
 
@@ -16355,10 +16365,16 @@ def _transcribe_capture(audio):
     on its own daemon; the (text, conf) below are untouched by it.
 
     Speed plan R6: STT_ENGINE / STT_SHADOW = 'parakeet' route the capture
-    through _transcribe_capture_r6 (both off by default)."""
+    through _transcribe_capture_r6 (both off by default). With Parakeet
+    primary a speculative Whisper decode is never joined (nor started:
+    _spec_stt_should_snapshot) — its text would pre-empt Parakeet's."""
     _tail_probe_start(audio)
+    # Speed plan R6 (core/stt_parakeet.py): None with STT_ENGINE='whisper'
+    # and STT_SHADOW='' (the defaults) — then exactly transcribe() below.
+    _r6 = _stt_r6_route()
     t = _spec_stt.get("thread")
-    if _SPECULATIVE_STT and t is not None and _spec_stt.get("chunks", -1) >= 0:
+    if (_SPECULATIVE_STT and _r6 != "primary" and t is not None
+            and _spec_stt.get("chunks", -1) >= 0):
         # This join is NOT a latency bound, and the comment here used to claim
         # it was ("Bounded: a wedged decode must not hold the voice thread").
         # It cannot be one, by construction: transcribe() below acquires
@@ -16383,9 +16399,6 @@ def _transcribe_capture(audio):
                 print(f"  [spec-stt] used speculative transcript "
                       f"({_spec_stt['chunks']} chunks)")
             return res
-    # Speed plan R6 (core/stt_parakeet.py): None with STT_ENGINE='whisper'
-    # and STT_SHADOW='' (the defaults) — then exactly the line below.
-    _r6 = _stt_r6_route()
     if _r6 is not None:
         return _transcribe_capture_r6(audio, _r6)
     return transcribe(audio)
