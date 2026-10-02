@@ -30,7 +30,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith
+from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith, shift_monotonic
 from tests._skill_harness import load_skill_isolated
 
 
@@ -49,6 +49,7 @@ def _fake_now(hour, day=1):
 @requires_monolith
 class _Base(MonolithGlobalsTestCase):
     def setUp(self):
+        shift_monotonic(self)   # 'hours ago' stays valid right after a reboot
         bc = self.bc
         bc._last_wake_date[0] = None
         bc._pre_wake_silence_seconds[0] = 0.0

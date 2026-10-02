@@ -36,7 +36,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith
+from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith, shift_monotonic
 
 
 # ── Small fakes for the lazily-imported Win32 / window libraries ────────────
@@ -2753,6 +2753,7 @@ class ContextAwareGreetingTests(SectionFiveBase):
         # line a minute ago refreshed last_speech_time, so morning_arrival's
         # 6-hour gate read ~60 s of "silence" and skipped the greeting. The
         # gap is measured from the owner's last accepted turn.
+        shift_monotonic(self)   # 'eight hours ago' stays valid after a reboot
         bc = self.bc
         import time as _t
         with mock.patch.object(bc, "_bambu_print_progress", return_value=None), \

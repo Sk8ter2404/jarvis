@@ -32,7 +32,7 @@ import time
 import unittest
 from unittest import mock
 
-from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith
+from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith, shift_monotonic
 
 OK_CONF = {"no_speech_prob": 0.30, "avg_logprob": -0.60}
 GREETING = ("Welcome back, sir. When we left off you were tidying the "
@@ -50,6 +50,7 @@ class _Base(MonolithGlobalsTestCase):
 
     def setUp(self):
         super().setUp()
+        shift_monotonic(self)   # 'an hour ago' stays valid right after a reboot
         bc = self.bc
         self._p(bc, "NOISE_FILTER_ENABLED", True, create=True)
         self._p(bc, "VAD_THRESHOLD", 0.008)

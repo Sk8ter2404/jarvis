@@ -634,6 +634,22 @@ def _reset_filler_state(bc) -> None:
         pass
 
 
+def shift_monotonic(testcase, seconds: float = 30 * 86400.0) -> None:
+    """Shift time.monotonic() forward for one test, so a stamp of "N seconds
+    ago" (monotonic() - N) stays positive on a freshly booted machine.
+
+    monotonic() counts from boot. After an overnight Windows Update restart
+    (Dell gate 2026-10-02 03:36, ~26 min of uptime) "8 hours ago" came out
+    negative, and the code under test rightly read it as "never" - six tests
+    failed for the machine's uptime, not for a bug."""
+    import time as _time
+    from unittest import mock as _mock
+    real = _time.monotonic
+    patcher = _mock.patch.object(_time, "monotonic", lambda: real() + seconds)
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+
+
 @requires_monolith
 class MonolithGlobalsTestCase(unittest.TestCase):
     """Base for every monolith test class.
