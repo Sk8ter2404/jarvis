@@ -186,6 +186,7 @@ class WakeWordDetector:
         cooldown_secs: float = COOLDOWN_SECS,
         on_detect: Optional[Callable[[dict], None]] = None,
         use_silero_vad: bool = False,
+        device_provider: Optional[Callable[[], Optional[int]]] = None,
     ) -> None:
         self.engine = (engine or "off").lower().strip()
         self.wake_words = list(wake_words or DEFAULT_WAKE_WORDS)
@@ -195,6 +196,9 @@ class WakeWordDetector:
         self.cooldown_secs = float(cooldown_secs)
         self.on_detect = on_detect
         self.use_silero_vad = bool(use_silero_vad)
+        # Asked for the input device at EVERY stream open (2026-10-02, see
+        # _open_stream). None = always open on ``device``, as before.
+        self.device_provider = device_provider
 
         # 2026-07-08: bound the events queue so a caller that only uses
         # on_detect (the real path) can't let this grow without limit.
@@ -344,15 +348,48 @@ class WakeWordDetector:
                     # next callback.
                     print(f"  [wake-word] _on_frame raised: {e!r}")
 
+        # The mic is resolved at EVERY open when the owner passed a provider
+        # (2026-10-02): start() and the resume() after a PortAudio device
+        # refresh then open the mic the owner's capture uses NOW. ``device``
+        # alone is fixed when the detector is built, and its None default is
+        # not "the current default" either - PortAudio freezes the default
+        # input at Pa_Initialize, so it is the mic picked at boot. A provider
+        # that raises keeps the last device.
+        if self.device_provider is not None:
+            try:
+                self.device = self.device_provider()
+            except Exception as e:
+                print(f"  [wake-word] input device lookup failed ({e!r}); "
+                      f"keeping device={self.device!r}")
+
         try:
-            self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype="float32",
-                blocksize=frame_size,
-                device=self.device,
-                callback=_cb,
-            )
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=frame_size,
+                    device=self.device,
+                    callback=_cb,
+                )
+            except Exception as e:
+                # A provider-picked device that will not open (a stale index
+                # after a hotplug) gets the main capture's one retry, on the
+                # system default - what this detector always opened before
+                # it had a provider, so following the mic is never worse.
+                if self.device_provider is None or self.device is None:
+                    raise
+                print(f"  [wake-word] input device {self.device!r} would not "
+                      f"open ({e}); retrying with the system default")
+                self.device = None
+                self._stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=frame_size,
+                    device=None,
+                    callback=_cb,
+                )
             self._stream.start()
             return True
         except Exception as e:

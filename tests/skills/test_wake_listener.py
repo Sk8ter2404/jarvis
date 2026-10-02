@@ -28,8 +28,10 @@ stdlib ``unittest`` + ``unittest.mock`` only. No personal data; no real secrets.
 from __future__ import annotations
 
 import contextlib
+import io
 import queue
 import sys
+import threading
 import types
 import unittest
 from unittest import mock
@@ -1220,6 +1222,131 @@ class AutostartTests(unittest.TestCase):
         with mock.patch.object(mod.threading, "Thread") as T:
             mod.register({})
         T.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# _current_input_device — the wake listener opens the CURRENT mic
+# ──────────────────────────────────────────────────────────────────────
+def _fake_host(mic=None):
+    """A bobert_companion stand-in with the main capture's resolver."""
+    bc = types.ModuleType("bobert_companion")
+    bc.mic = mic
+    bc.calls = 0
+
+    def get_input_device():
+        bc.calls += 1
+        return bc.mic
+    bc.get_input_device = get_input_device
+    bc._device_cache = {"in": mic}
+    bc._device_refresh_lock = threading.Lock()
+    return bc
+
+
+class _FakeStream:
+    instances: list = []
+
+    def __init__(self, **kwargs):
+        self.device = kwargs.get("device")
+        _FakeStream.instances.append(self)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class CurrentInputDeviceTests(unittest.TestCase):
+    """2026-10-02: the detector listened on WAKE_WORD_DEVICE's None - PortAudio's
+    default input as frozen at boot - while the main capture opens whatever
+    bobert_companion.get_input_device() resolves at that moment
+    (MICROPHONE_INDEX, PREFERRED_INPUT_DEVICES, else the live Windows
+    default). The detector now asks the same resolver at every stream open."""
+
+    def setUp(self):
+        self.mod, self.actions = load_listener()
+        self.addCleanup(lambda: setattr(self.mod, "_detector", None))
+        _FakeStream.instances.clear()
+
+    def test_follows_the_main_capture_resolver_at_each_call(self):
+        host = _fake_host(mic=5)
+        with inject_modules(bobert_companion=host):
+            self.assertEqual(self.mod._current_input_device(), 5)
+            host.mic = 9                      # the owner switched mics
+            self.assertEqual(self.mod._current_input_device(), 9)
+        self.assertEqual(host.calls, 2)
+
+    def test_an_explicit_device_wins(self):
+        # wake_listener_configure device=2 is the owner's explicit choice.
+        self.mod.WAKE_WORD_DEVICE = 2
+        host = _fake_host(mic=5)
+        with inject_modules(bobert_companion=host):
+            self.assertEqual(self.mod._current_input_device(), 2)
+        self.assertEqual(host.calls, 0)
+
+    def test_no_monolith_is_the_system_default(self):
+        with inject_modules(bobert_companion=None, __main__=None):
+            self.assertIsNone(self.mod._current_input_device())
+
+    def test_a_resolver_error_is_the_system_default(self):
+        host = _fake_host(mic=5)
+
+        def _boom():
+            raise RuntimeError("PortAudio not initialised")
+        host.get_input_device = _boom
+        with inject_modules(bobert_companion=host):
+            self.assertIsNone(self.mod._current_input_device())
+
+    def test_inside_a_device_refresh_reads_the_fresh_pick(self):
+        # _refresh_devices resumes the detector with its non-reentrant lock
+        # held and the cache already re-picked; get_input_device() would
+        # re-enter _refresh_devices there, so it must not be called.
+        host = _fake_host(mic=5)
+        host._device_cache["in"] = 7
+        host._device_refresh_lock.acquire()
+        self.addCleanup(host._device_refresh_lock.release)
+        with inject_modules(bobert_companion=host):
+            self.assertEqual(self.mod._current_input_device(), 7)
+        self.assertEqual(host.calls, 0)
+
+    def test_the_detector_is_built_with_the_provider(self):
+        fake_ww = types.ModuleType("core.wake_word")
+        captured = {}
+
+        def _ctor(**kwargs):
+            captured.update(kwargs)
+            return FakeDetector()
+        fake_ww.WakeWordDetector = _ctor
+        with inject_modules(**{"core.wake_word": fake_ww}):
+            self.mod._get_detector()
+        self.assertIs(captured["device_provider"],
+                      self.mod._current_input_device)
+
+    def test_start_and_a_refresh_resume_open_the_main_capture_mic(self):
+        # The real detector, a fake PortAudio and a fake host: start opens
+        # the mic the main capture uses now; after the owner switches mics,
+        # the device refresh's pause/resume reopens on the NEW one.
+        import core.wake_word as ww
+        host = _fake_host(mic=3)
+        sd = types.ModuleType("sounddevice")
+        sd.InputStream = _FakeStream
+        with inject_modules(bobert_companion=host, sounddevice=sd), \
+                mock.patch.object(ww.WakeWordDetector, "_init_openwakeword"), \
+                mock.patch.object(self.mod, "_start_voice_tap"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertIn("Listening", self.actions["wake_listener_start"](""))
+            det = self.mod._detector
+            host.mic = 8
+            host._device_cache["in"] = 8
+            with host._device_refresh_lock:   # as _refresh_devices holds it
+                det.pause()
+                self.assertTrue(det.resume())
+            self.actions["wake_listener_stop"]("")
+        self.assertEqual([s.device for s in _FakeStream.instances], [3, 8])
+        self.assertEqual(host.calls, 1)   # the start; the resume read the cache
 
 
 if __name__ == "__main__":

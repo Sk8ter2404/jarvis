@@ -24,6 +24,7 @@ stdlib ``unittest`` + ``unittest.mock`` only. No personal data; no real secrets.
 from __future__ import annotations
 
 import contextlib
+import io
 import math
 import os
 import queue
@@ -858,6 +859,112 @@ class OpenStreamTests(unittest.TestCase):
                 stream.feed(np.zeros(cap + 5000, dtype=np.float32))
         # After draining, residual buffer is whatever < frame_size remained.
         self.assertLess(d._buf.size, frame_size)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# device_provider — the mic is resolved at every open (2026-10-02)
+# ──────────────────────────────────────────────────────────────────────
+class DeviceProviderTests(unittest.TestCase):
+    """The detector's mic was fixed when it was built - and its None default
+    is PortAudio's default input as frozen at Pa_Initialize, i.e. the mic
+    picked at boot. With a ``device_provider`` the device is asked for at
+    EVERY stream open: start(), and resume() after a device refresh."""
+
+    def setUp(self):
+        FakeInputStream.instances.clear()
+
+    def test_no_provider_keeps_the_constructed_device(self):
+        d = ww.WakeWordDetector(engine="openwakeword", device=4)
+        with inject_modules(sounddevice=make_fake_sd()):
+            self.assertTrue(d._open_stream())
+        self.assertEqual(FakeInputStream.instances[-1].device, 4)
+
+    def test_start_opens_the_mic_the_provider_names_now(self):
+        current = {"mic": 5}
+        d = ww.WakeWordDetector(engine="openwakeword",
+                                device_provider=lambda: current["mic"])
+        with inject_modules(sounddevice=make_fake_sd()), \
+                mock.patch.object(d, "_init_openwakeword"):
+            self.assertTrue(d.start())
+            d.stop()
+        self.assertEqual(FakeInputStream.instances[-1].device, 5)
+        self.assertEqual(d.device, 5)
+
+    def test_resume_after_a_device_refresh_opens_the_current_mic(self):
+        current = {"mic": 3}
+        d = ww.WakeWordDetector(engine="openwakeword",
+                                device_provider=lambda: current["mic"])
+        with inject_modules(sounddevice=make_fake_sd()):
+            self.assertTrue(d._open_stream())
+            d._running = True
+            d.pause()
+            current["mic"] = 7           # the owner switched microphones
+            self.assertTrue(d.resume())
+        self.assertEqual([s.device for s in FakeInputStream.instances],
+                         [3, 7])
+
+    def test_provider_none_is_the_system_default(self):
+        d = ww.WakeWordDetector(engine="openwakeword", device=6,
+                                device_provider=lambda: None)
+        with inject_modules(sounddevice=make_fake_sd()):
+            self.assertTrue(d._open_stream())
+        self.assertIsNone(FakeInputStream.instances[-1].device)
+
+    def test_provider_error_keeps_the_last_device_and_still_opens(self):
+        def _boom():
+            raise RuntimeError("no enumeration")
+        d = ww.WakeWordDetector(engine="openwakeword", device=2,
+                                device_provider=_boom)
+        with inject_modules(sounddevice=make_fake_sd()), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(d._open_stream())
+        self.assertEqual(FakeInputStream.instances[-1].device, 2)
+        self.assertIn("input device lookup failed", out.getvalue())
+
+    @staticmethod
+    def _refusing(*bad, attempts=None):
+        class _Picky(FakeInputStream):
+            def __init__(self, **kw):
+                if attempts is not None:
+                    attempts.append(kw.get("device"))
+                if kw.get("device") in bad:
+                    raise RuntimeError(f"Error querying device {kw['device']}")
+                super().__init__(**kw)
+        return _Picky
+
+    def test_a_picked_device_that_will_not_open_falls_back_to_the_default(self):
+        # A stale index after a hotplug: the main capture's one retry, on the
+        # system default - what the detector opened before it had a provider.
+        d = ww.WakeWordDetector(engine="openwakeword",
+                                device_provider=lambda: 9)
+        sd = make_fake_sd(stream_cls=self._refusing(9))
+        with inject_modules(sounddevice=sd), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(d._open_stream())
+        self.assertEqual([s.device for s in FakeInputStream.instances], [None])
+        self.assertIsNone(d.device)
+        self.assertIn("retrying with the system default", out.getvalue())
+
+    def test_the_fallback_failing_too_is_a_plain_failed_open(self):
+        attempts: list = []
+        d = ww.WakeWordDetector(engine="openwakeword",
+                                device_provider=lambda: 9)
+        sd = make_fake_sd(stream_cls=self._refusing(9, None,
+                                                    attempts=attempts))
+        with inject_modules(sounddevice=sd), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(d._open_stream())
+        self.assertEqual(attempts, [9, None])
+        self.assertIsNone(d._stream)
+
+    def test_without_a_provider_a_failed_open_is_not_retried(self):
+        attempts: list = []
+        d = ww.WakeWordDetector(engine="openwakeword", device=9)
+        sd = make_fake_sd(stream_cls=self._refusing(9, attempts=attempts))
+        with inject_modules(sounddevice=sd), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(d._open_stream())
+        self.assertEqual(attempts, [9])
 
 
 # ──────────────────────────────────────────────────────────────────────

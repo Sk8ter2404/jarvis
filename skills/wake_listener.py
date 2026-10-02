@@ -377,6 +377,41 @@ def _on_detect(evt: dict) -> None:
     t.start()
 
 
+def _current_input_device() -> Optional[int]:
+    """The input device the detector opens RIGHT NOW (2026-10-02).
+
+    An explicit WAKE_WORD_DEVICE (wake_listener_configure device=N) wins.
+    Otherwise it is the device the main capture opens: bobert_companion.
+    get_input_device(), which honours MICROPHONE_INDEX and
+    PREFERRED_INPUT_DEVICES and follows the live Windows default. The
+    detector used to keep WAKE_WORD_DEVICE's None, i.e. PortAudio's default
+    input as frozen at boot — after a mic switch it kept the old mic, and
+    with the main capture pinned to a device it listened on a different one.
+
+    The detector calls this at every stream open (core.wake_word
+    device_provider): wake_listener_start, and the resume after a device
+    refresh. _refresh_devices runs that resume with its non-reentrant
+    _device_refresh_lock held and the cache already re-picked, so while the
+    lock is held this reads that fresh pick instead of calling
+    get_input_device(), whose own _refresh_devices could block on the lock.
+    None = the system default, as before (also with no monolith loaded).
+    Never raises."""
+    if WAKE_WORD_DEVICE is not None:
+        return WAKE_WORD_DEVICE
+    bobert = sys.modules.get("bobert_companion") or sys.modules.get("__main__")
+    getter = getattr(bobert, "get_input_device", None)
+    if not callable(getter):
+        return None
+    try:
+        lock = getattr(bobert, "_device_refresh_lock", None)
+        if lock is not None and lock.locked():
+            cache = getattr(bobert, "_device_cache", None)
+            return cache.get("in") if isinstance(cache, dict) else None
+        return getter()
+    except Exception:
+        return None
+
+
 def _get_detector():
     """Lazy import so a missing openwakeword/porcupine install can't
     crash skill loading."""
@@ -396,6 +431,7 @@ def _get_detector():
         device=WAKE_WORD_DEVICE,
         on_detect=_on_detect,
         use_silero_vad=WAKE_WORD_USE_SILERO_VAD,
+        device_provider=_current_input_device,
     )
     return _detector
 
