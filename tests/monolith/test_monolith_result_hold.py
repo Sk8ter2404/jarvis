@@ -133,6 +133,45 @@ class LiveRepliesTests(_HoldBase):
         self.assertEqual(self.spoken, [real])
 
 
+class VerbatimReadOutTests(_HoldBase):
+    """Review repair (2026-10-02): a status read-out whose result is spoken
+    word for word (current_model, list_models, system_pulse ...) is the
+    answer, so the model's own guess written after its token is not voiced
+    either. Live 20:57:17: "One moment, sir. [ACTION: current_model] I'm
+    running on your local Ollama baseline, sir." was spoken, then the real
+    "I'm running on gemma4 locally, sir (...)"."""
+
+    _R_205717 = ("[intent:confirmation] One moment, sir. [ACTION: "
+                 "current_model] I'm running on your local Ollama baseline, "
+                 "sir.")
+    _MODEL = "I'm running on gemma4 locally, sir (gemma4:26b-a4b-it-qat)."
+
+    def setUp(self):
+        super().setUp()
+        self.bc.ACTIONS["current_model"] = lambda a="": self._MODEL
+
+    def test_the_guess_after_a_read_out_token_is_held(self):
+        cleaned, _r, printed = self._parse(self._R_205717)
+        self.assertNotIn("Ollama baseline", cleaned)
+        self.assertIn("[result-hold]", printed)
+
+    def test_205717_in_a_full_dispatch_speaks_only_the_real_answer(self):
+        self._run(self._R_205717, text="Jarvis, what model are you running?")
+        spoken = self._all_spoken()
+        self.assertNotIn("Ollama baseline", spoken)
+        self.assertIn(self._MODEL, self.spoken)
+        self.assertIn("Ollama baseline", self._history_text(),
+                      "only the audio goes; the reply is remembered")
+
+    def test_a_read_out_with_nothing_to_say_keeps_the_prose(self):
+        # An empty result is never voiced, so holding the prose would leave
+        # the turn silent.
+        self.bc.ACTIONS["current_model"] = lambda a="": ""
+        cleaned, _r, printed = self._parse(self._R_205717)
+        self.assertIn("Ollama baseline", cleaned)
+        self.assertNotIn("[result-hold]", printed)
+
+
 class ScopeTests(_HoldBase):
     def test_prose_before_the_look_up_token_is_spoken(self):
         cleaned, _r, _p = self._parse(

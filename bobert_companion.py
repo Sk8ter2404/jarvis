@@ -33321,15 +33321,19 @@ def _world_clock_check(reply: str):
 # BEFORE that action's token is spoken; the follow-up round, which has seen
 # the result, says the rest. The full reply stays in conversation_history.
 # Side-effect actions that succeeded (volume_up, launch_app) keep their prose:
-# nothing comes back that could contradict it.
+# nothing comes back that could contradict it. A read-out whose result is
+# voiced word for word (SPEAK_RESULT_VERBATIM_ACTIONS: current_model,
+# list_models, system_pulse ...) holds too (2026-10-02): its result IS the
+# answer, and live 20:57:17 the model's guess ("your local Ollama baseline")
+# was spoken right before the real one ("gemma4").
 _RESULT_HOLD_TAIL_TAGS_RE = re.compile(r"(?:\s*\[[^\]\n]*\])+\s*$")
 
 
 def _result_hold_name(new_results) -> str:
     """The name of the first action in ``new_results`` (one token's
     (name, result, informative) entries) whose result the model has not seen
-    yet: an informative action that ran, or one that failed or refused.
-    Synthetic, self-voiced and deliberately deferred results (confirmation,
+    yet: an informative action that ran, one that failed or refused, or a
+    read-out whose result will be voiced verbatim. Synthetic, self-voiced and deliberately deferred results (confirmation,
     pushback, ambiguity) never hold. "" when none. Never raises."""
     try:
         for name, result, info in new_results or ():
@@ -33340,6 +33344,13 @@ def _result_hold_name(new_results) -> str:
                     _ANSWER_FIRST_DEFERRED_PREFIXES):
                 continue
             if info or _failed_or_refused_actions([(n, result, info)]):
+                return n
+            # A read-out whose result is voiced word for word is the answer
+            # (2026-10-02 review repair; live 20:57:17 "[ACTION: current_model]
+            # I'm running on your local Ollama baseline" was spoken before the
+            # real "gemma4"). Only when something WILL be voiced: an empty
+            # read-out leaves the prose as the only answer.
+            if _verbatim_result_text(n, result):
                 return n
     except Exception:
         return ""
