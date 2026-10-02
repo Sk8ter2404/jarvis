@@ -2296,13 +2296,17 @@ class StateFilesProbeTests(_ProbeTestBase):
 class BambuProbeTests(_ProbeTestBase):
     def setUp(self):
         super().setUp()
-        # Shield every Bambu test from the REAL skills.bambu_monitor, whose
+        # Shield every Bambu test from the REAL bambu_monitor, whose
         # is_printer_offline() imports bobert_companion → sys.exit(0). A benign
         # fake (offline=False) lets the probe fall through to the MQTT path;
-        # individual tests can still override it.
-        bm = types.ModuleType("skills.bambu_monitor")
+        # individual tests can still override it. The probe reads the LIVE
+        # module, sys.modules["skill_bambu_monitor"] (NEW #3, 2026-10-02: the
+        # old `from skills import bambu_monitor` imported a never-started
+        # duplicate), so that is the name shielded - a leftover from another
+        # test module must not reach the probe either.
+        bm = types.ModuleType("skill_bambu_monitor")
         bm.is_printer_offline = lambda: False
-        self._bm_cm = inject_modules(**{"skills.bambu_monitor": bm})
+        self._bm_cm = inject_modules(**{"skill_bambu_monitor": bm})
         self._bm_cm.__enter__()
         self.addCleanup(lambda: self._bm_cm.__exit__(None, None, None))
 
@@ -2328,10 +2332,10 @@ class BambuProbeTests(_ProbeTestBase):
     def test_printer_offline_skips(self):
         bc = types.SimpleNamespace(BAMBU_PRINTER_IP="1.2.3.4",
                                    BAMBU_ACCESS_CODE="code", BAMBU_SERIAL="ser")
-        bm = types.ModuleType("skills.bambu_monitor")
+        bm = types.ModuleType("skill_bambu_monitor")
         bm.is_printer_offline = lambda: True
         with mock.patch.object(self.mod, "_bc", return_value=bc), \
-             inject_modules(**{"skills.bambu_monitor": bm}):
+             inject_modules(**{"skill_bambu_monitor": bm}):
             r = self.mod._probe_bambu()
         self.assertTrue(r["ok"])
         self.assertIn("offline", r["details"]["skipped"])
@@ -3892,10 +3896,10 @@ class MiscExceptionTests(_ProbeTestBase):
         # which we make missing so we get a clean error result.
         bc = types.SimpleNamespace(BAMBU_PRINTER_IP="1.2.3.4",
                                    BAMBU_ACCESS_CODE="c", BAMBU_SERIAL="s")
-        bm = types.ModuleType("skills.bambu_monitor")
+        bm = types.ModuleType("skill_bambu_monitor")
         bm.is_printer_offline = mock.MagicMock(side_effect=RuntimeError("query boom"))
         with mock.patch.object(self.mod, "_bc", return_value=bc), \
-             inject_modules(**{"skills.bambu_monitor": bm}), \
+             inject_modules(**{"skill_bambu_monitor": bm}), \
              block_import("paho"):
             r = self.mod._probe_bambu()
         self.assertFalse(r["ok"])

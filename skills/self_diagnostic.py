@@ -3200,6 +3200,12 @@ def _probe_state_files() -> dict:
 
 
 # ─── Probe 9: Bambu MQTT ─────────────────────────────────────────────────
+# The live Bambu monitor's first connect is judged only after this long (or
+# after its first failed attempt). The boot sweep runs ON_BOOT_DELAY_SECONDS
+# (60 s) after load, by which time paho has finished at least one attempt.
+_BAMBU_FIRST_CONNECT_GRACE_S = 45.0
+
+
 def _probe_bambu() -> dict:
     start = _now()
     bc = _bc()
@@ -3220,19 +3226,55 @@ def _probe_bambu() -> dict:
         return _result(True, 0.0,
                        details={"skipped": "Bambu printer not configured"})
 
-    # If bambu_monitor has already decided the printer is offline/asleep,
-    # skip the 5s MQTT connect entirely. Otherwise this probe fires on
-    # every boot sweep and spams "Bambu MQTT connect timed out (5s)" as a
-    # LOW-severity FAIL even when the printer is just powered down.
-    try:
-        from skills import bambu_monitor as _bm  # type: ignore
-        if getattr(_bm, "is_printer_offline", None) and _bm.is_printer_offline():
+    # Ask the LIVE monitor (NEW #3, 2026-10-02). This used to be
+    # `from skills import bambu_monitor`, which imports a SECOND, never-started
+    # copy of the skill (the loader registers the live one as
+    # sys.modules["skill_bambu_monitor"]): no session, no status, so its
+    # is_printer_offline() was ALWAYS True and this probe ALWAYS skipped - it
+    # reported the printer PASS all evening on 2026-10-01 while the monitor
+    # never connected once.
+    _bm = sys.modules.get("skill_bambu_monitor")
+    if _bm is not None:
+        # No session since JARVIS started is a FAIL with the monitor's own
+        # reason and hint - once an attempt has failed, or the first connect
+        # has had its grace. A monitor still on its first attempt is not
+        # judged (that is the early-boot window the skip below protects).
+        try:
+            _cs = getattr(_bm, "connection_status", None)
+            _st = _cs() if callable(_cs) else None
+        except Exception:
+            _st = None
+        if (isinstance(_st, dict) and _st.get("monitor_running")
+                and not _st.get("ever_connected")):
+            _fails = int(_st.get("failures") or 0)
+            _age = float(_st.get("age_s") or 0.0)
+            if _fails > 0 or _age >= _BAMBU_FIRST_CONNECT_GRACE_S:
+                _why = str(_st.get("reason") or "no answer yet").rstrip(".")
+                _hint = str(_st.get("hint") or "").strip()
+                return _result(
+                    False, (_now() - start) * 1000.0,
+                    error=(f"Bambu printer: no MQTT session since JARVIS "
+                           f"started ({_why}; {_fails} failed attempt"
+                           f"{'' if _fails == 1 else 's'}). {_hint}").strip(),
+                    details={"ip": ip, "state": _st.get("state"),
+                             "kind": _st.get("kind"), "failures": _fails})
             return _result(True, 0.0,
-                           details={"skipped": "printer offline (monitor backed off)",
+                           details={"skipped": "monitor still connecting "
+                                               "(first attempt pending)",
                                     "ip": ip})
-    except Exception:
-        # If we can't import or query, just fall through to the real probe.
-        pass
+        # If the monitor has already decided the printer is offline/asleep
+        # (after a session this boot), skip the 5s MQTT connect entirely.
+        # Otherwise this probe fires on every boot sweep and spams "Bambu
+        # MQTT connect timed out (5s)" as a LOW-severity FAIL even when the
+        # printer is just powered down.
+        try:
+            if getattr(_bm, "is_printer_offline", None) and _bm.is_printer_offline():
+                return _result(True, 0.0,
+                               details={"skipped": "printer offline (monitor backed off)",
+                                        "ip": ip})
+        except Exception:
+            # If we can't query, just fall through to the real probe.
+            pass
 
     try:
         import paho.mqtt.client as mqtt  # type: ignore

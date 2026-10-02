@@ -54,6 +54,7 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 
@@ -203,6 +204,239 @@ _monitor_stop_evt = [threading.Event()]
 # client object exists immediately, so we can't infer reachability from its
 # presence alone. Tracked as a one-element list so nested closures can mutate.
 _mqtt_connected_ok: list = [False]
+
+# ─── Connection health (NEW #3, 2026-10-02) ───────────────────────────────
+# Live 2026-10-01: status, progress callouts and finish alerts were dead from
+# 19:44 all evening and NOT ONE line said so. connect_async + loop_start
+# retried a refused connect silently (only on_connect logged, and it never
+# fired), and "how's my print" could not say why. Every connection state
+# CHANGE is now logged once with its reason; a failed attempt is classified
+# with one bounded TCP probe; "never connected since boot" is tracked for the
+# replies and the self-check. ``ever_connected`` is per PROCESS: a setup-wizard
+# restart of the monitor does not reset it.
+_CONNECT_PORT = 8883
+# Windows reports a REFUSED connect only after ~2.1 s (it re-sends the SYN
+# after the RST: measured 2.06 s on this PC, 2026-10-02). A shorter timeout
+# turns "port closed - LAN mode off" into "nothing answered - is it on?".
+_CONNECT_PROBE_TIMEOUT_S = 5.0
+_conn_lock = threading.Lock()
+_conn: dict = {}
+
+
+def _reset_connection_health() -> None:
+    """Back to "never started" (module load; tests)."""
+    with _conn_lock:
+        _conn.clear()
+        _conn.update({
+            "state": "not started",  # connecting/connected/failed/disconnected/stopped
+            "kind": "",              # refused/timeout/unreachable/auth/rejected/tls/dropped/error
+            "reason": "",
+            "ip": "",
+            "changed_at": 0.0,
+            "started_at": 0.0,
+            "failures": 0,           # failed attempts since the last success
+            "ever_connected": False,
+            "connected_at": 0.0,
+            "lost_at": 0.0,
+        })
+
+
+_reset_connection_health()
+
+# Hints by failure kind, spoken after the reason. {ip} = the configured IP.
+_CONN_HINTS = {
+    "refused": ("Check that LAN-only or developer mode is still on in the "
+                "printer's network settings - an update or a toggle can "
+                "switch it off - and that {ip} still belongs to the printer."),
+    "timeout": ("Check that the printer is powered on and awake, and that "
+                "its address is still {ip} - the router may have given it a "
+                "new one."),
+    "unreachable": ("Check that the printer is powered on and on the "
+                    "network, and that its address is still {ip}."),
+    "auth": ("It rejected the access code. The code changes whenever LAN mode "
+             "is switched on again - read the new one off the printer's "
+             "screen and run the printer setup."),
+    "rejected": ("Check LAN-only or developer mode and the access code in "
+                 "the printer's network settings."),
+    "tls": ("Port {port} answers but the secure connection failed. Check "
+            "LAN-only or developer mode, and that {ip} is the printer."),
+    "dropped": "I'll keep trying to reconnect.",
+    "error": ("Check that the printer is on, in LAN-only or developer mode, "
+              "and still at {ip}."),
+}
+
+
+def _note_conn(state: str, reason: str = "", kind: str = "", *,
+               ip: str | None = None, failed: bool = False) -> None:
+    """Record a connection event; LOG it only when the state, the kind or
+    the reason changed, so a printer refusing every 60-600 s reconnect
+    writes one line, not one per attempt. Never raises."""
+    try:
+        now = time.time()
+        with _conn_lock:
+            prev = (_conn.get("state"), _conn.get("kind"), _conn.get("reason"))
+            if ip is not None:
+                _conn["ip"] = ip
+            if failed:
+                _conn["failures"] = int(_conn.get("failures") or 0) + 1
+            if state == "connected":
+                _conn["failures"] = 0
+                _conn["ever_connected"] = True
+                _conn["connected_at"] = now
+            if state == "disconnected" and prev[0] == "connected":
+                _conn["lost_at"] = now
+            changed = prev != (state, kind, reason)
+            if changed:
+                _conn.update(state=state, kind=kind, reason=reason,
+                             changed_at=now)
+            failures = _conn["failures"]
+            never = not _conn["ever_connected"]
+        if changed:
+            tail = f" ({reason})" if reason else ""
+            extra = ""
+            if state in ("failed", "disconnected") and never:
+                extra = " - no session since JARVIS started"
+            elif state == "failed" and failures > 1:
+                extra = f" - {failures} failed attempts"
+            print(f"  [bambu] connection: {prev[0]} -> {state}{tail}{extra}")
+    except Exception:
+        pass
+
+
+def _classify_connect_failure(ip: str, port: int = _CONNECT_PORT,
+                              timeout: float = _CONNECT_PROBE_TIMEOUT_S
+                              ) -> tuple[str, str]:
+    """(kind, reason) for a failed MQTT connect, from ONE bounded TCP connect
+    to the same port (paho's on_connect_fail carries no exception). Runs on
+    paho's own network thread between its 60-600 s retries. Never raises."""
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+        try:
+            s.close()
+        except Exception:
+            pass
+        return ("tls", f"{ip} accepts port {port} but the MQTT/TLS "
+                       f"handshake failed")
+    except ConnectionRefusedError:
+        return ("refused", f"{ip} answers, but it refused the connection "
+                           f"on port {port}, the printer's LAN port")
+    except (socket.timeout, TimeoutError):
+        return ("timeout", f"nothing answered at {ip} port {port} within "
+                           f"{timeout:.0f} seconds")
+    except OSError as e:
+        code = getattr(e, "winerror", None) or getattr(e, "errno", None)
+        if code in (10065, 10051, 113, 101, 65, 51):
+            return ("unreachable", f"{ip} is unreachable from this PC")
+        return ("error", f"connecting to {ip} port {port} failed "
+                         f"({type(e).__name__}: {e})")
+    except Exception as e:
+        return ("error", f"connecting to {ip} port {port} failed "
+                         f"({type(e).__name__})")
+
+
+_CONNACK_REASONS = {
+    1: ("rejected", "the printer rejected the MQTT protocol version"),
+    2: ("rejected", "the printer rejected the client id"),
+    3: ("rejected", "the printer's MQTT service is unavailable"),
+    4: ("auth", "the printer rejected the access code"),
+    5: ("auth", "the printer refused the login (not authorised)"),
+    134: ("auth", "the printer rejected the access code"),
+    135: ("auth", "the printer refused the login (not authorised)"),
+}
+
+
+def _connack_reason(rc) -> tuple[str, str]:
+    """(kind, reason) for a non-zero CONNACK code (paho 1.x int or 2.x
+    ReasonCode). Never raises."""
+    try:
+        code = int(getattr(rc, "value", rc))
+    except Exception:
+        return ("rejected", f"the printer refused the connection ({rc})")
+    return _CONNACK_REASONS.get(
+        code, ("rejected", f"the printer refused the connection (code {code})"))
+
+
+def connection_status() -> dict:
+    """A snapshot of the monitor's connection health, for the spoken replies
+    and the self-check. Keys: state, kind, reason, ip, failures,
+    ever_connected, never_connected_since_boot, monitor_running, started_at,
+    age_s (since this monitor started), changed_at, connected_at, lost_at,
+    hint. Never raises."""
+    try:
+        with _conn_lock:
+            st = dict(_conn)
+        now = time.time()
+        st["monitor_running"] = _mqtt_client[0] is not None
+        st["never_connected_since_boot"] = not st.get("ever_connected")
+        started = float(st.get("started_at") or 0.0)
+        st["age_s"] = (now - started) if started else 0.0
+        hint = _CONN_HINTS.get(st.get("kind") or "", "")
+        st["hint"] = hint.format(ip=st.get("ip") or "the configured address",
+                                 port=_CONNECT_PORT) if hint else ""
+        return st
+    except Exception:
+        return {"state": "unknown", "kind": "", "reason": "", "ip": "",
+                "failures": 0, "ever_connected": False,
+                "never_connected_since_boot": True, "monitor_running": False,
+                "started_at": 0.0, "age_s": 0.0, "changed_at": 0.0,
+                "connected_at": 0.0, "lost_at": 0.0, "hint": ""}
+
+
+def _clock_phrase(ts: float) -> str:
+    try:
+        lt = time.localtime(ts)
+        return f"{lt.tm_hour % 12 or 12}:{lt.tm_min:02d} " \
+               f"{'AM' if lt.tm_hour < 12 else 'PM'}"
+    except Exception:
+        return "earlier"
+
+
+def _no_status_reply() -> str:
+    """What to say when there is no printer status at all - WHY, and the
+    hint that fits, instead of "either it isn't reachable or ..."."""
+    st = connection_status()
+    state = st.get("state")
+    reason = (st.get("reason") or "").rstrip(".")
+    hint = st.get("hint") or ""
+    if state in ("failed", "disconnected") and reason:
+        if st.get("never_connected_since_boot"):
+            head = ("I haven't been able to reach the printer since I "
+                    f"started, sir: {reason}.")
+        else:
+            head = (f"I lost the printer connection at "
+                    f"{_clock_phrase(st.get('lost_at') or st.get('changed_at') or 0)}"
+                    f", sir: {reason}.")
+        return f"{head} {hint}".strip()
+    if state == "connected":
+        return ("I'm connected to the printer, sir, but it hasn't sent a "
+                "status yet. Ask again in a moment.")
+    if state == "connecting" and float(st.get("age_s") or 0.0) < 60.0:
+        return ("I don't have a fresh status from the printer yet, sir - "
+                "I'm still connecting to it.")
+    return ("I don't have a fresh status from the printer yet, sir. "
+            "Either it isn't reachable or the monitor hasn't connected.")
+
+
+def _stale_prefix(last_update: float) -> str:
+    """A lead-in for a snapshot that is old because the link is down, so an
+    hour-old layer count is not reported as live. '' when it is fresh or
+    the link is up. Never raises."""
+    try:
+        if not last_update:
+            return ""
+        age = time.time() - float(last_update)
+        if age <= OFFLINE_THRESHOLD_SECONDS:
+            return ""
+        st = connection_status()
+        if st.get("state") not in ("failed", "disconnected"):
+            return ""
+        mins = max(1, int(round(age / 60.0)))
+        reason = (st.get("reason") or "").rstrip(".")
+        why = f" ({reason})" if reason else ""
+        return (f"The printer connection is down{why}, sir. As of "
+                f"{_format_minutes(mins)} ago: ")
+    except Exception:
+        return ""
 
 # Milestone bookkeeping — reset whenever a new print starts so the same
 # print only announces each threshold once.
@@ -797,16 +1031,35 @@ def _start_mqtt(ip: str, access: str, serial: str):
         if rc == 0:
             _mqtt_connected_ok[0] = True
             print(f"  [bambu] MQTT connected, subscribing to {topic}")
+            _note_conn("connected", f"MQTT session up at {ip}")
             client.subscribe(topic)
         else:
             _mqtt_connected_ok[0] = False
             print(f"  [bambu] MQTT connect failed rc={rc}")
+            kind, reason = _connack_reason(rc)
+            _note_conn("failed", reason, kind, failed=True)
+
+    def _on_connect_fail(client, userdata, *args, **kwargs):
+        # NEW #3: paho calls this when the TCP/TLS connect itself fails (a
+        # refused port, no answer) - the case that used to retry silently.
+        # It carries no exception, so classify with one bounded TCP probe.
+        _mqtt_connected_ok[0] = False
+        try:
+            kind, reason = _classify_connect_failure(ip)
+        except Exception as e:
+            kind, reason = "error", f"connect to {ip} failed ({type(e).__name__})"
+        _note_conn("failed", reason, kind, failed=True)
 
     def _on_disconnect(client, userdata, *args, **kwargs):
         # paho 1.x signature: (client, userdata, rc). 2.x adds flags+properties.
-        # We don't care about rc here — just flip the reachability flag so
-        # is_printer_offline() can back off downstream probes.
+        # Flip the reachability flag so is_printer_offline() can back off
+        # downstream probes, and log the drop (NEW #3) when a session was up.
+        was_up = _mqtt_connected_ok[0]
         _mqtt_connected_ok[0] = False
+        if was_up:
+            rc = args[1] if len(args) >= 2 else (args[0] if args else "")
+            _note_conn("disconnected", f"the printer connection dropped "
+                                       f"(reason {rc})", "dropped")
 
     # paho-mqtt 2.x requires callback_api_version as a kwarg; 1.x rejects it.
     _client_kwargs = {
@@ -820,6 +1073,7 @@ def _start_mqtt(ip: str, access: str, serial: str):
     client.tls_set(cert_reqs=mqtt.ssl.CERT_NONE)
     client.tls_insecure_set(True)
     client.on_connect = _on_connect
+    client.on_connect_fail = _on_connect_fail
     client.on_disconnect = _on_disconnect
     client.on_message = _on_message
     # Throttle paho's automatic reconnects. With a chronically offline printer
@@ -832,6 +1086,11 @@ def _start_mqtt(ip: str, access: str, serial: str):
     except Exception:
         pass
     try:
+        with _conn_lock:
+            _conn["started_at"] = time.time()
+            _conn["failures"] = 0
+        _note_conn("connecting", f"connecting to {ip} port {_CONNECT_PORT}",
+                   ip=ip)
         client.connect_async(ip, 8883, keepalive=60)
         client.loop_start()
         return client
@@ -840,6 +1099,8 @@ def _start_mqtt(ip: str, access: str, serial: str):
         # hostname), not on network failure — those surface via on_connect
         # with a non-zero rc. Treat any raise here as a hard failure.
         print(f"  [bambu] could not schedule connect to {ip}:8883 — {e}")
+        _note_conn("failed", f"could not schedule a connect to {ip}: {e}",
+                   "error", failed=True)
         return None
 
 
@@ -932,6 +1193,7 @@ def stop_monitor() -> None:
     _mqtt_client[0] = None
     _poll_thread[0] = None
     _mqtt_connected_ok[0] = False
+    _note_conn("stopped", "monitor stopped")
     # Join the old thread (short timeout — it's blocked on stop_evt.wait, which
     # the set() above already released) so it can't outlive its MQTT client.
     if old_thread is not None and old_thread is not threading.current_thread():
@@ -1043,19 +1305,19 @@ def register(actions):
             fname       = _strip_filename(_state.get("filename") or "")
             last_update = _state.get("last_update", 0.0)
 
-        if last_update == 0.0:
-            return ("I don't have a fresh status from the printer yet, sir. "
-                    "Either it isn't reachable or the monitor hasn't connected.")
+        if not last_update:
+            # NEW #3: say WHY (refused / no answer / bad code) and the hint.
+            return _no_status_reply()
 
         if gcode_state in ("IDLE", "", None) and not layer:
-            return "No active print, sir. The printer is idle."
+            return _stale_prefix(last_update) + "No active print, sir. The printer is idle."
 
         if gcode_state == "FINISH":
             who = f" of '{fname}'" if fname else ""
-            return f"The print{who} has finished, sir."
+            return _stale_prefix(last_update) + f"The print{who} has finished, sir."
 
         if gcode_state == "PAUSE":
-            return "The print is currently paused, sir."
+            return _stale_prefix(last_update) + "The print is currently paused, sir."
 
         parts = []
         if fname:
@@ -1067,7 +1329,7 @@ def register(actions):
         remaining_str = _format_minutes(remaining) if remaining else ""
         if remaining_str:
             parts.append(f"about {remaining_str} remaining")
-        return ", ".join(parts) + ", sir."
+        return _stale_prefix(last_update) + ", ".join(parts) + ", sir."
 
     def how_is_the_print(_: str = "") -> str:
         """Return ETA + current layer + nozzle/bed temps as a one-line
@@ -1083,16 +1345,16 @@ def register(actions):
             bed            = _state.get("bed_temper")
             last_update    = _state.get("last_update", 0.0)
 
-        if last_update == 0.0:
-            return ("I don't have a fresh status from the printer yet, sir. "
-                    "Either it isn't reachable or the monitor hasn't connected.")
+        if not last_update:
+            # NEW #3: say WHY (refused / no answer / bad code) and the hint.
+            return _no_status_reply()
 
         if gcode_state in ("IDLE", "", None) and not layer:
-            return "No active print, sir. The printer is idle."
+            return _stale_prefix(last_update) + "No active print, sir. The printer is idle."
 
         if gcode_state == "FINISH":
             who = f" of '{fname}'" if fname else ""
-            return f"The print{who} has finished, sir."
+            return _stale_prefix(last_update) + f"The print{who} has finished, sir."
 
         nozzle_str = _format_temp(nozzle)
         bed_str    = _format_temp(bed)
@@ -1104,7 +1366,8 @@ def register(actions):
         temp_tail = (" — " + " and ".join(temp_parts)) if temp_parts else ""
 
         if gcode_state == "PAUSE":
-            return f"The print is currently paused, sir{temp_tail}."
+            return (_stale_prefix(last_update)
+                    + f"The print is currently paused, sir{temp_tail}.")
 
         parts = []
         if fname:
@@ -1116,7 +1379,8 @@ def register(actions):
         remaining_str = _format_minutes(remaining) if remaining else ""
         if remaining_str:
             parts.append(f"about {remaining_str} remaining")
-        return ", ".join(parts) + f"{temp_tail}, sir."
+        return (_stale_prefix(last_update) + ", ".join(parts)
+                + f"{temp_tail}, sir.")
 
     actions["check_print"]      = check_print
     actions["how_is_the_print"] = how_is_the_print

@@ -444,7 +444,18 @@ def _build_print_status_line() -> str:
     if state is None:
         return ("The H2D monitor isn't running, sir — I can't see the "
                 "printer at the moment.")
-    if state.get("last_update", 0.0) == 0.0:
+    if not state.get("last_update"):
+        # NEW #3 (2026-10-02): the monitor knows WHY there is no status
+        # (refused / no answer / bad access code) and the hint that fits.
+        bm = _get_bambu_module()
+        why = getattr(bm, "_no_status_reply", None)
+        if callable(why):
+            try:
+                line = why()
+                if isinstance(line, str) and line.strip():
+                    return line
+            except Exception:
+                pass
         return ("I don't have a fresh status from the printer yet, sir. "
                 "Either it isn't reachable or the monitor hasn't "
                 "connected.")
