@@ -311,10 +311,11 @@ def _paint_scale(width: float) -> float:
     return max(PAINT_S_MIN, min(PAINT_S_MAX, float(width) / PAINT_BASE_W))
 
 
-def _ctrl_wheel_size(w: int, h: int, delta: float) -> tuple[int, int] | None:
-    """The window size after one Ctrl+wheel event of ``delta`` angle units
-    (+120 = one notch away from the user = grow), or None when the size would
-    not change.
+def _ctrl_wheel_exact(w: float, h: float,
+                      delta: float) -> tuple[float, float] | None:
+    """The un-rounded window size after one Ctrl+wheel event of ``delta``
+    angle units (+120 = one notch away from the user = grow), or None when
+    the bounds leave it unchanged.
 
     The size is scaled by WHEEL_STEP per notch with its aspect ratio kept, and
     the factor is clamped so the width never crosses WHEEL_MIN_W / WHEEL_MAX_W
@@ -323,12 +324,18 @@ def _ctrl_wheel_size(w: int, h: int, delta: float) -> tuple[int, int] | None:
     corner grip has no maximum) does not grow further and is not snapped,
     but shrinks normally toward the range.
 
+    Kept un-rounded so wheelEvent can carry the fraction of a pixel from one
+    event to the next: a touchpad or a pinch (Windows sends a pinch as
+    Ctrl+wheel) delivers a notch as many small deltas, and rounding each one
+    on its own drops 1-unit deltas outright and bends the aspect ratio.
+
     Pure (arithmetic only) so it is unit-testable without Qt or a display."""
     try:
-        w, h, delta = int(w), int(h), float(delta)
+        w, h, delta = float(w), float(h), float(delta)
     except (TypeError, ValueError, OverflowError):
         return None
-    if w <= 0 or h <= 0 or not delta or not math.isfinite(delta):
+    if (not math.isfinite(w) or not math.isfinite(h) or w <= 0 or h <= 0
+            or not delta or not math.isfinite(delta)):
         return None
     try:
         f = WHEEL_STEP ** (delta / WHEEL_NOTCH)
@@ -338,7 +345,24 @@ def _ctrl_wheel_size(w: int, h: int, delta: float) -> tuple[int, int] | None:
         f = min(f, max(1.0, WHEEL_MAX_W / w), max(1.0, MAX_H / h))
     else:
         f = max(f, min(1.0, WHEEL_MIN_W / w), min(1.0, MIN_H / h))
-    new_w, new_h = int(round(w * f)), int(round(h * f))
+    if f == 1.0:
+        return None
+    return w * f, h * f
+
+
+def _ctrl_wheel_size(w: int, h: int, delta: float) -> tuple[int, int] | None:
+    """The whole-pixel window size after one Ctrl+wheel event on a ``w`` x
+    ``h`` window with no fraction carried over (wheelEvent's first event, or
+    its first after the grip moved the window), or None when the size would
+    not change. See _ctrl_wheel_exact for the scaling and the bounds."""
+    try:
+        w, h = int(w), int(h)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    exact = _ctrl_wheel_exact(w, h, delta)
+    if exact is None:
+        return None
+    new_w, new_h = int(round(exact[0])), int(round(exact[1]))
     if (new_w, new_h) == (w, h):
         return None
     return new_w, new_h
@@ -872,14 +896,26 @@ class UnifiedHud(QWidget):
         (_paint_scale), so growing the window grows the drawing with it. The
         resize() goes through resizeEvent and the debounced _save_geometry,
         so a wheel size persists exactly like a corner-grip size. A plain
-        wheel (no Ctrl) is left to QWidget, as before."""
+        wheel (no Ctrl) is left to QWidget, as before.
+
+        The un-rounded size is carried from one event to the next for as
+        long as the window still has the whole-pixel size this handler last
+        asked for, so small touchpad / pinch deltas add up and rounding
+        never bends the shape. Any other size (the grip moved it, the window
+        system refused the resize, a fresh launch) restarts from the size
+        the window really has."""
         if not (e.modifiers() & Qt.KeyboardModifier.ControlModifier):
             super().wheelEvent(e)
             return
-        size = _ctrl_wheel_size(self.width(), self.height(),
-                                e.angleDelta().y())
-        if size is not None:
-            self.resize(*size)
+        cur = (self.width(), self.height())
+        memo = getattr(self, "_wheel_exact", None)   # (asked, un-rounded)
+        start = memo[1] if memo is not None and memo[0] == cur else cur
+        exact = _ctrl_wheel_exact(start[0], start[1], e.angleDelta().y())
+        if exact is not None:
+            size = (int(round(exact[0])), int(round(exact[1])))
+            self._wheel_exact = (size, exact)
+            if size != cur:
+                self.resize(*size)
         # Accepted at a bound too: the Ctrl+wheel was meant for the HUD.
         e.accept()
 

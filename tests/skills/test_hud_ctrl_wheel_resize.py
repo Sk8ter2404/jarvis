@@ -11,6 +11,9 @@ WHY THIS EXISTS
       lays everything out from ``_paint_scale(width)``);
     * the width stays inside WHEEL_MIN_W..WHEEL_MAX_W (the widths where the
       drawing scale follows the window) and the height inside MIN_H..MAX_H;
+    * a notch delivered as many small deltas (touchpad, pinch, smooth-scroll
+      mouse) adds up to one notch: the handler carries the un-rounded size
+      between events, so 1-unit deltas still move it and the shape holds;
     * the size persists the way a grip size does (resize -> resizeEvent ->
       the debounced ``_save_geometry`` -> unified_hud_geometry.json);
     * a plain wheel (no Ctrl) still goes to QWidget, as before.
@@ -357,6 +360,86 @@ class WheelEventHandlerTests(unittest.TestCase):
         self.assertEqual((restored["w"], restored["h"]), (462, 616))
 
 
+class SubNotchWheelTests(unittest.TestCase):
+    """Touchpads, pinch-to-zoom (Windows sends a pinch as Ctrl+wheel) and
+    smooth-scrolling mice deliver a notch as many small deltas. Each event
+    used to round the window to whole pixels on its own, so a 1-unit delta
+    never moved it at all and 2-4-unit deltas bent the shape (420x560 grew to
+    714x854, not 714x952). The handler now carries the un-rounded size from
+    one event to the next while nothing else has resized the window."""
+
+    def setUp(self):
+        self.m = _load_hud_no_pyqt(self, "_ju_wheel_subnotch_ut")
+        p = mock.patch.object(self.m, "Qt", _FAKE_QT)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(self.m.QWidget, "wheelEvent", create=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _hud(self, w=420, h=560):
+        """A HUD whose resize() really changes width()/height(), the way
+        QWidget.resize does, and counts its calls."""
+        size = {"w": w, "h": h}
+        hud = object.__new__(self.m.UnifiedHud)
+        hud.width = lambda: size["w"]
+        hud.height = lambda: size["h"]
+        hud.resizes = []
+
+        def resize(nw, nh):
+            hud.resizes.append((nw, nh))
+            size["w"], size["h"] = nw, nh
+        hud.resize = resize
+        hud.size_ = size
+        return hud
+
+    def _scroll(self, hud, delta, count):
+        for _ in range(count):
+            ev = _FakeWheel(delta, _CTRL)
+            hud.wheelEvent(ev)
+            self.assertTrue(ev.accepted)
+        return hud.width(), hud.height()
+
+    def test_one_unit_deltas_add_up_to_a_notch(self):
+        hud = self._hud()
+        self.assertEqual(self._scroll(hud, 1, NOTCH), (462, 616))
+        self.assertEqual(self._scroll(hud, -1, NOTCH), (420, 560))
+
+    def test_small_deltas_keep_the_shape_all_the_way_to_the_bounds(self):
+        m = self.m
+        for delta in (2, 3, 4, 8):
+            with self.subTest(delta=delta):
+                hud = self._hud()
+                w, h = self._scroll(hud, delta, 20 * NOTCH // delta)
+                self.assertEqual(w, m.WHEEL_MAX_W)
+                self.assertAlmostEqual(h / w, 560 / 420, delta=0.003)
+                w, h = self._scroll(hud, -delta, 40 * NOTCH // delta)
+                self.assertEqual(w, m.WHEEL_MIN_W)
+                self.assertAlmostEqual(h / w, 560 / 420, delta=0.003)
+
+    def test_a_pinch_out_and_back_lands_where_it_started(self):
+        hud = self._hud()
+        self._scroll(hud, 3, 80)
+        self.assertNotEqual((hud.width(), hud.height()), (420, 560))
+        self.assertEqual(self._scroll(hud, -3, 80), (420, 560))
+
+    def test_a_grip_resize_between_events_restarts_from_the_real_size(self):
+        hud = self._hud()
+        self._scroll(hud, 1, 1)                # sub-pixel: no resize yet
+        self.assertEqual(hud.resizes, [])
+        hud.size_.update(w=500, h=600)         # the corner grip moved it
+        self.assertEqual(self._scroll(hud, NOTCH, 1), (550, 660))
+
+    def test_a_refused_resize_restarts_from_the_real_size(self):
+        # If the window system keeps the old size, the next notch must start
+        # from the size the window really has, not from the one it asked for.
+        hud = self._hud()
+        hud.resize = mock.Mock(name="resize")  # size never changes
+        self._scroll(hud, NOTCH, 2)
+        self.assertEqual(hud.resize.call_args_list,
+                         [mock.call(462, 616), mock.call(462, 616)])
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Real offscreen render (PyQt6 installed only), in a subprocess
 # ════════════════════════════════════════════════════════════════════════════
@@ -440,6 +523,11 @@ out["max"] = snap()
 for _ in range(20):
     wheel(-120, C)
 out["min"] = snap()
+w.resize(420, 560)
+app.processEvents()
+for _ in range(120):                    # one notch as 1-unit touchpad deltas
+    wheel(1, C)
+out["touch"] = snap()
 out["bounds"] = [getattr(ju, n, None)
                  for n in ("WHEEL_MIN_W", "WHEEL_MAX_W", "PAINT_BASE_W")]
 w.hide(); w.deleteLater()
@@ -517,6 +605,11 @@ class RealOffscreenWheelTests(unittest.TestCase):
         self.assertAlmostEqual(r["min"]["s"], lo / base, places=6)
         self.assertGreater(r["max"]["R"], r["up"]["R"])
         self.assertLess(r["min"]["R"], r["base"]["R"])
+
+    def test_one_unit_touchpad_deltas_add_up_to_a_notch(self):
+        r = self.result
+        self.assertEqual((r["touch"]["w"], r["touch"]["h"]), (462, 616), r)
+        self.assertAlmostEqual(r["touch"]["R"], r["up"]["R"], places=3)
 
 
 if __name__ == "__main__":
