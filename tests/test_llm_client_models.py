@@ -619,6 +619,36 @@ class ShippedDefaultsTests(unittest.TestCase):
                     offenders.append(f"{_rel(p)}:{node.lineno}")
         self.assertEqual(offenders, [])
 
+    def test_haiku_id_is_written_only_in_config_and_model_tables(self):
+        # 2026-10-02: a Haiku swap (its tentative retirement is "not sooner
+        # than" 2026-10-15) must be ONE settings line — CLAUDE_FAST_MODEL.
+        # Allowed besides core/config.py: the model tables that describe
+        # models rather than pick one (the price catalog, the per-model
+        # request rules, the Settings model picker's choices). Tracked files
+        # only: an owner's gitignored personal skill is not this repo's.
+        import subprocess
+        allowed = {"core/config.py", "core/model_catalog.py",
+                   "core/llm_client.py", "tools/settings_window.py"}
+        try:
+            listed = subprocess.run(
+                ["git", "-C", _ROOT, "ls-files", "*.py"], capture_output=True,
+                text=True, timeout=30, check=True).stdout.split()
+        except Exception as e:  # pragma: no cover - git is on every runner
+            self.skipTest(f"git ls-files unavailable: {e}")
+        tracked = [p for p in listed if not p.startswith("tests/")]
+        self.assertGreater(len(tracked), 50)        # the scan saw the tree
+        offenders = []
+        for rel in tracked:
+            tree = _parse(os.path.join(_ROOT, rel))
+            if tree is None:
+                continue
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                        and node.value.strip().startswith("claude-haiku-4-5")
+                        and rel not in allowed):
+                    offenders.append(f"{rel}:{node.lineno}")
+        self.assertEqual(offenders, [])
+
     def test_catalog_prices_and_prefix_collision(self):
         import core.model_catalog as mc
         rows = {"claude-sonnet-5-5": ("Claude Sonnet 5.5", 2.0, 10.0),

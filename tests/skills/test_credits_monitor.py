@@ -437,5 +437,62 @@ class CreditsCooldownSurvivesRestartTests(unittest.TestCase):
         self.assertEqual(mod._last_login_alert_at[0], 0.0)
 
 
+class CreditsCheckBackendTests(unittest.TestCase):
+    """CREDITS_CHECK_BACKEND (2026-10-02): "auto" reads the billing screenshot
+    through ask_vision (unchanged); "local" always uses the local vision model
+    so the billing page never goes to Claude."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("credits_monitor")
+        import core.config as cfg
+        self.cfg = cfg
+
+    def _read(self, backend, *, local="BALANCE: $12.34", enabled=True):
+        bc = _fake_companion(vision="BALANCE: $99.00")
+        bc._call_local_vision = mock.MagicMock(return_value=local)
+        bc.SCREEN_VISION_ENABLED = enabled
+        with mock.patch.object(self.cfg, "CREDITS_CHECK_BACKEND", backend), \
+                mock.patch.object(self.mod, "_import_companion", return_value=bc):
+            return self.mod._read_credits_via_vision(), bc
+
+    def test_shipped_default_is_auto(self):
+        self.assertEqual(self.cfg.CREDITS_CHECK_BACKEND, "auto")
+
+    def test_auto_reads_through_ask_vision(self):
+        (dollars, _), bc = self._read("auto")
+        self.assertAlmostEqual(dollars, 99.00)
+        bc.ask_vision.assert_called_once()
+        bc._call_local_vision.assert_not_called()
+
+    def test_local_never_calls_ask_vision(self):
+        (dollars, raw), bc = self._read("local")
+        self.assertAlmostEqual(dollars, 12.34)
+        self.assertTrue(raw.startswith("[local-vision] "))
+        bc.ask_vision.assert_not_called()
+        png_list = bc._call_local_vision.call_args.args[1]
+        self.assertEqual(png_list, ["PNGBYTES"])
+
+    def test_local_with_no_usable_local_vision_says_so(self):
+        (dollars, raw), bc = self._read("local", local=None)
+        self.assertIsNone(dollars)
+        self.assertIn("local vision unavailable", raw)
+        bc.ask_vision.assert_not_called()
+
+    def test_local_honours_screen_vision_disabled(self):
+        (dollars, raw), bc = self._read("local", enabled=False)
+        self.assertIsNone(dollars)
+        self.assertIn("disabled", raw)
+        bc._call_local_vision.assert_not_called()
+
+    def test_local_login_wall_still_parsed(self):
+        (dollars, raw), _ = self._read("local", local="LOGIN_REQUIRED")
+        self.assertIsNone(dollars)
+        self.assertEqual(raw, "login_required")
+
+    def test_unknown_value_means_auto(self):
+        (dollars, _), bc = self._read("cloud-please")
+        bc.ask_vision.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

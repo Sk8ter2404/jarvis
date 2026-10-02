@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import os
 import sys
 import types
@@ -1638,6 +1639,152 @@ class StartLoopThreadTests(_BrowserAgentTestBase):
                 mock.patch.object(self.mod.threading, "Event", _NeverReadyEvent):
             with self.assertRaises(RuntimeError):
                 self.mod._start_loop_thread()
+
+
+# ─── 2026-10-02: BROWSER_AGENT_BACKEND + the retired-model guard ───────────
+
+def _not_found_text(model):
+    return ("Error code: 404 - {'type': 'error', 'error': {'type': "
+            f"'not_found_error', 'message': 'model: {model}'}}}}")
+
+
+class _ProviderError(Exception):
+    """browser-use's ModelProviderError shape (status_code + the SDK text)."""
+
+    def __init__(self, message, status_code=502):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+class _HistoryWithErrors:
+    """Every step failed: no final result, the step errors recorded."""
+
+    def __init__(self, errors):
+        self._errors = errors
+
+    def final_result(self):
+        return None
+
+    def errors(self):
+        return list(self._errors)
+
+
+class BackendSwitchAndRetiredModelTests(_BrowserAgentTestBase):
+    def setUp(self):
+        super().setUp()
+        import core.config as cfg
+        import core.claude_model_guard as mg
+        self.cfg, self.mg = cfg, mg
+        mg.GUARD.reset()
+        self.addCleanup(mg.GUARD.reset)
+        self.out = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.out)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    def _sync(self, submit_result="task ran"):
+        with mock.patch.object(self.mod, "_submit",
+                               return_value=_ImmediateFuture(result=submit_result)) as sub:
+            out = self.mod._run_task_sync("book a haircut", timeout=1)
+        return out, sub
+
+    def _guard_lines(self):
+        return [ln for ln in self.out.getvalue().splitlines()
+                if "[model-guard]" in ln]
+
+    def test_shipped_default_is_claude_and_tasks_run(self):
+        self.assertEqual(self.cfg.BROWSER_AGENT_BACKEND, "claude")
+        out, sub = self._sync()
+        self.assertEqual(out, "task ran")
+        sub.assert_called_once()
+
+    def test_local_backend_declines_before_anything_runs(self):
+        with mock.patch.object(self.cfg, "BROWSER_AGENT_BACKEND", "local"):
+            out, sub = self._sync()
+        self.assertEqual(out, self.mod._LOCAL_BACKEND_REPLY)
+        sub.assert_not_called()
+
+    def test_local_backend_through_the_voice_action(self):
+        with mock.patch.object(self.cfg, "BROWSER_AGENT_BACKEND", "local"), \
+                mock.patch.object(self.mod, "is_available", return_value=True), \
+                mock.patch.object(self.mod, "_submit") as sub:
+            out = self.actions["browser_task"]("find the cheapest flight")
+        self.assertIn("stay local", out)
+        sub.assert_not_called()
+
+    def test_unknown_backend_value_keeps_the_default(self):
+        with mock.patch.object(self.cfg, "BROWSER_AGENT_BACKEND", "banana"):
+            self.assertEqual(self.mod._backend(), "claude")
+
+    def test_known_retired_model_declines_honestly(self):
+        self.mg.GUARD.note_not_found("claude-sonnet-5")
+        with mock.patch.dict(os.environ, {"BROWSER_AGENT_MODEL": "claude-sonnet-5"}):
+            out, sub = self._sync()
+        sub.assert_not_called()
+        self.assertIn("claude-sonnet-5", out)
+        self.assertIn("no longer available", out)
+
+    def test_retired_model_with_a_successor_runs_on_it(self):
+        self.mg.GUARD.note_not_found("claude-sonnet-5")
+        with mock.patch.object(self.cfg, "CLAUDE_MODEL_SUCCESSORS",
+                               {"claude-sonnet-5": "claude-opus-4-8"}), \
+                mock.patch.dict(os.environ, {"BROWSER_AGENT_MODEL": "claude-sonnet-5"}):
+            self.assertEqual(self.mod._model_name(), "claude-opus-4-8")
+            out, sub = self._sync()
+        self.assertEqual(out, "task ran")
+        sub.assert_called_once()
+
+    def test_no_gone_model_means_the_model_is_not_resolved(self):
+        # The common path must not resolve the model (which can reach for the
+        # monolith) just to check the guard.
+        with mock.patch.object(self.mod, "_model_name") as name:
+            self._sync()
+        name.assert_not_called()
+
+    def test_not_found_raised_by_the_run_is_reported_plainly_once(self):
+        self.mod._state["model"] = "claude-sonnet-5"
+        err = _ProviderError(_not_found_text("claude-sonnet-5"), 404)
+        for _ in range(2):
+            with mock.patch.object(self.mod, "_run_task_inner",
+                                   new=mock.AsyncMock(side_effect=err)), \
+                    mock.patch.object(self.mod, "_close_browser_async",
+                                      new=mock.AsyncMock()):
+                out = _run_coro(self.mod._orchestrate("task", 5, True))
+            self.assertIn("no longer available", out)
+            self.assertNotIn("not_found_error", out)   # no raw error body
+        self.assertTrue(self.mg.GUARD.is_retired("claude-sonnet-5"))
+        self.assertEqual(len(self._guard_lines()), 1)
+
+    def test_every_step_failing_not_found_is_reported_plainly(self):
+        class _Agent(_FakeAgent):
+            async def run(self, **kwargs):
+                return _HistoryWithErrors(
+                    [f"ModelProviderError: {_not_found_text('claude-sonnet-5')}"] * 3)
+        with mock.patch.object(self.mod, "_bu_imports",
+                               return_value=_imports(agent=_Agent)), \
+                mock.patch.object(self.mod, "_model_name",
+                                  return_value="claude-sonnet-5"), \
+                mock.patch.object(self.mod, "_make_browser",
+                                  new=mock.AsyncMock(return_value=_FakeBrowser())):
+            out = _run_coro(self.mod._run_task_inner("do a thing", 5, True))
+        self.assertIn("no longer available", out)
+        self.assertTrue(self.mg.GUARD.is_retired("claude-sonnet-5"))
+
+    def test_other_step_errors_are_still_reported_as_before(self):
+        class _Agent(_FakeAgent):
+            async def run(self, **kwargs):
+                return _HistoryWithErrors(["timeout waiting for selector"])
+        with mock.patch.object(self.mod, "_bu_imports",
+                               return_value=_imports(agent=_Agent)), \
+                mock.patch.object(self.mod, "_model_name",
+                                  return_value="claude-sonnet-5"), \
+                mock.patch.object(self.mod, "_make_browser",
+                                  new=mock.AsyncMock(return_value=_FakeBrowser())):
+            out = _run_coro(self.mod._run_task_inner("do a thing", 5, True))
+        self.assertIn("couldn't finish", out)
+        self.assertIn("timeout waiting for selector", out)
+        self.assertEqual(self.mg.GUARD.retired_models(), [])
 
 
 if __name__ == "__main__":

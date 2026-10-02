@@ -138,6 +138,35 @@ def _import_companion():
     return importlib.import_module("bobert_companion")
 
 
+# CREDITS_CHECK_BACKEND (core.config, 2026-10-02): "auto" reads the billing
+# screenshot through ask_vision (routed by MODEL_ROUTING["vision"], unchanged);
+# "local" always uses the local vision model, so the billing page never goes to
+# Claude. Unknown / unreadable values mean "auto" — the shipped default.
+_CREDITS_BACKENDS = ("auto", "local")
+
+
+def _credits_backend() -> str:
+    try:
+        from core import config as _cfg
+        v = str(getattr(_cfg, "CREDITS_CHECK_BACKEND", "") or "").strip().lower()
+    except Exception:
+        v = ""
+    return v if v in _CREDITS_BACKENDS else "auto"
+
+
+def _ask_local_vision(bc, question: str, png: bytes) -> str:
+    """The local vision model's answer, in ask_vision's own shapes: tagged
+    "[local-vision] …" on success, a parenthesised failure line otherwise.
+    Never calls Claude. Honours SCREEN_VISION_ENABLED like ask_vision."""
+    if not getattr(bc, "SCREEN_VISION_ENABLED", True):
+        return "(screen vision is disabled — set SCREEN_VISION_ENABLED = True)"
+    local = bc._call_local_vision(question, [png])
+    if local:
+        return f"[local-vision] {local}"
+    return ("(local vision unavailable — CREDITS_CHECK_BACKEND is local; turn "
+            "on LOCAL_VISION_FALLBACK or route vision to local)")
+
+
 def _read_credits_via_vision():
     """Open billing page in an OFF-SCREEN Chrome window, vision-read the
     balance, then close it. The window is parked outside the virtual screen
@@ -169,7 +198,10 @@ def _read_credits_via_vision():
     )
 
     try:
-        answer = bc.ask_vision(question, png).strip()
+        if _credits_backend() == "local":
+            answer = _ask_local_vision(bc, question, png).strip()
+        else:
+            answer = bc.ask_vision(question, png).strip()
     except Exception as e:
         answer = f"vision_failed: {e}"
 

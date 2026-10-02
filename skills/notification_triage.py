@@ -12,7 +12,7 @@ one through a tunable rules engine. Each rule fires one of four actions:
   log          — capture in data/notifications/<date>.jsonl, no audio
   drop         — silent, not even logged (used for marketing / steam
                  friend online / generic OS upgrade nags)
-  classify     — defer to the Haiku triage classifier (the fallthrough
+  classify     — defer to the triage classifier (the fallthrough
                  default when no explicit rule matches)
 
 Rules live in ``notification_rules.json`` at the project root (created on
@@ -24,8 +24,12 @@ first boot from DEFAULT_RULES if missing). Each rule is a dict with:
   - reason      free-text describing why the rule exists (read by the
                 voice action list_notification_rules)
 
-The Haiku classifier is invoked only when no rule matches AND
-``ENABLE_LLM_CLASSIFIER`` is True AND ``ANTHROPIC_API_KEY`` is set. It
+The classifier is invoked only when no rule matches AND
+``ENABLE_LLM_CLASSIFIER`` is True. Since 2026-10-02 it asks the LOCAL brain
+first and Claude (core.config.CLAUDE_FAST_MODEL) only when the local brain is
+unavailable or its answer is unusable, and only where the cloud gate allows
+(key set, AI_BACKEND claude, chat not routed local);
+``NOTIFY_SORTER_BACKEND = "claude"`` restores the old Claude-first order. It
 returns a single token (``urgent`` / ``fyi`` / ``newsletter`` / ``spam``)
 which is mapped to read_aloud / log / log / drop respectively. A
 positive classification gets cached for SNOOZE_SECONDS so a Slack
@@ -107,8 +111,8 @@ ASYNC_OP_TIMEOUT_SECONDS = 5.0       # ceiling for the manual IAsyncOperation po
 SNOOZE_SECONDS        = 300          # don't re-speak / re-classify identical toast within 5 min
 MAX_NOTIFICATION_LOG  = 250          # recent_notifications ring buffer size in memory
 MAX_SPOKEN_BODY_CHARS = 220          # truncate long bodies before TTS
-ENABLE_LLM_CLASSIFIER = True         # set False to skip Haiku and just `log` unmatched
-LLM_MODEL             = "claude-haiku-4-5"
+ENABLE_LLM_CLASSIFIER = True         # set False to skip the classifier and just `log` unmatched
+LLM_MODEL             = ""           # Claude leg's model; blank = core.config.CLAUDE_FAST_MODEL
 LLM_TIMEOUT_SECONDS   = 6.0
 HIGH_PRIORITY_FLOOR   = 100          # rules with priority >= this bypass focus mode
 
@@ -164,7 +168,7 @@ DEFAULT_RULES: list[dict] = [
         },
         "action": "classify",
         "priority": 40,
-        "reason": "Hand new mail to Haiku for urgent/fyi/newsletter triage.",
+        "reason": "Hand new mail to the triage classifier (urgent/fyi/newsletter).",
     },
     # ── Silent log ─────────────────────────────────────────────────────
     {
@@ -875,7 +879,7 @@ def _select_action(app: str, title: str, body: str) -> tuple[str, dict | None]:
     return "classify", None
 
 
-# ─── Haiku triage classifier ─────────────────────────────────────────────
+# ─── Triage classifier (local brain first, Claude fallback) ──────────────
 
 def _cloud_allowed() -> bool:
     """core.cloud_gate's answer (2026-10-01): may toast text go to Claude?
@@ -889,9 +893,122 @@ def _cloud_allowed() -> bool:
         return False
 
 
+# The sorter's backend (2026-10-02): core.config.NOTIFY_SORTER_BACKEND, read
+# at call time. _DEFAULT_SORTER_BACKEND is used only when core.config cannot be
+# read or holds an unknown value; it must equal core.config's shipped default
+# (pinned by tests/skills/test_notification_triage.py).
+_SORTER_BACKENDS = ("local_first", "claude")
+_DEFAULT_SORTER_BACKEND = "local_first"
+
+# Words that flip a label's meaning ("non-urgent", "not spam"): a reply that
+# carries one is unusable unless it OPENS with a label.
+_NEGATIONS = frozenset({"not", "non", "no", "never"})
+
+
+def _sorter_backend() -> str:
+    """"local_first" or "claude" (see core.config.NOTIFY_SORTER_BACKEND)."""
+    try:
+        from core import config as _cfg
+        v = str(getattr(_cfg, "NOTIFY_SORTER_BACKEND", "") or "").strip().lower()
+    except Exception:
+        v = ""
+    return v if v in _SORTER_BACKENDS else _DEFAULT_SORTER_BACKEND
+
+
+def _claude_model() -> str:
+    """LLM_MODEL when set, else core.config.CLAUDE_FAST_MODEL (the one place
+    the Haiku id lives, 2026-10-02). '' when neither is readable — the Claude
+    leg is then skipped."""
+    if LLM_MODEL:
+        return LLM_MODEL
+    try:
+        from core import config as _cfg
+        return str(getattr(_cfg, "CLAUDE_FAST_MODEL", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _parse_verdict(text) -> str | None:
+    """One of the four labels from a model reply, or None when the reply is
+    unusable. Accepted: the label as the FIRST word, in any case and wrapping
+    ("Urgent.", "**fyi**", "spam - marketing"), or a short reply (at most four
+    words) naming exactly ONE label and no negation ("Label: newsletter").
+    Rejected: empty / non-text, two different labels ("urgent or fyi"), a
+    negated label ("non-urgent", "not spam"), anything longer. A rejected
+    reply makes the caller try the next backend instead of guessing."""
+    if not isinstance(text, str):
+        return None
+    t = text.strip().lower()
+    if t.startswith("[local]"):
+        t = t[len("[local]"):]
+    words = re.findall(r"[a-z]+", t)
+    if not words:
+        return None
+    if words[0] in LLM_VERDICTS_TO_ACTION:
+        return words[0]
+    if len(words) > 4 or _NEGATIONS.intersection(words):
+        return None
+    found = {w for w in words if w in LLM_VERDICTS_TO_ACTION}
+    return found.pop() if len(found) == 1 else None
+
+
+def _classify_local(system: str, prompt: str) -> str | None:
+    """The local brain's label, or None when it is unavailable or its answer
+    is unusable. Uses the RUNNING monolith only (it aliases itself into
+    sys.modules as bobert_companion before any skill runs); it never imports
+    one — importing the monolith from a skill thread would boot its
+    import-time machinery a second time."""
+    try:
+        bc = sys.modules.get("bobert_companion")
+        call = getattr(bc, "_call_local_llm", None) if bc is not None else None
+        if not callable(call):
+            return None
+        local = call(system, [{"role": "user", "content": prompt}], max_tokens=8)
+        return _parse_verdict(local) if local else None
+    except Exception as e:
+        _log.debug("[triage] local classifier failed: %s", e)
+        return None
+
+
+def _classify_claude(system: str, prompt: str) -> str | None:
+    """Claude's label (CLAUDE_FAST_MODEL), or None. Attempted only when an API
+    key is present, the cloud gate allows it and the SDK imports. A retired
+    model is handled by core.llm_client's guard: one log line per session,
+    then None here without another network call (or its configured
+    successor answers)."""
+    if not (os.environ.get("ANTHROPIC_API_KEY") and _cloud_allowed()):
+        return None
+    model = _claude_model()
+    if not model:
+        return None
+    try:
+        import anthropic  # type: ignore
+        from core import llm_client
+        client = anthropic.Anthropic()
+        msg = llm_client.create_message(
+            client, purpose="classify",
+            model=model,
+            max_tokens=8,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=LLM_TIMEOUT_SECONDS,
+        )
+        # Text blocks by TYPE; a refusal / text-less reply raises into the
+        # except below -> None -> the other backend / log.
+        return _parse_verdict(llm_client.response_text(msg))
+    except Exception as e:
+        _log.debug("[triage] Claude classifier failed: %s", e)
+        return None
+
+
 def _classify_with_llm(app: str, title: str, body: str) -> str | None:
     """Returns one of {urgent, fyi, newsletter, spam} or None on error.
-    Side-effect free; safe to call from the listener thread."""
+    Side-effect free; safe to call from the listener thread.
+
+    Order per NOTIFY_SORTER_BACKEND (2026-10-02): "local_first" asks the local
+    brain and falls back to Claude only when the local brain is unavailable or
+    its answer is unusable; "claude" is the old order (Claude, then local).
+    Either way Claude sees the toast only where the cloud gate allows it."""
     if not ENABLE_LLM_CLASSIFIER:
         return None
 
@@ -914,48 +1031,11 @@ def _classify_with_llm(app: str, title: str, body: str) -> str | None:
     _system = ("You are a precise notification triage classifier. "
                "Respond with one of: urgent, fyi, newsletter, spam.")
 
-    def _parse_verdict(text: str) -> str | None:
-        verdict = text.strip().lower().split()[0] if text.strip() else ""
-        verdict = re.sub(r"[^a-z]", "", verdict)
-        return verdict if verdict in LLM_VERDICTS_TO_ACTION else None
-
-    # Primary path: Haiku/Claude (keeps cost low). Only attempted when an API
-    # key is present, the cloud gate allows it and the SDK imports.
-    if os.environ.get("ANTHROPIC_API_KEY") and _cloud_allowed():
-        try:
-            import anthropic  # type: ignore
-            from core import llm_client
-            client = anthropic.Anthropic()
-            msg = llm_client.create_message(
-                client, purpose="classify",
-                model=LLM_MODEL,
-                max_tokens=8,
-                system=_system,
-                messages=[{"role": "user", "content": prompt}],
-                timeout=LLM_TIMEOUT_SECONDS,
-            )
-            # Text blocks by TYPE; a refusal / text-less reply raises into the
-            # except below -> local fallback.
-            text = llm_client.response_text(msg)
-            verdict = _parse_verdict(text)
-            if verdict:
-                return verdict
-        except Exception as e:
-            _log.debug("[triage] Haiku classifier failed, trying local: %s", e)
-
-    # Fallback path: local Ollama model (used while the Claude API is capped
-    # or whenever the primary path raises / has no key). Parsed identically.
-    try:
-        bc = sys.modules.get("bobert_companion") or importlib.import_module("bobert_companion")
-        local = bc._call_local_llm(
-            _system, [{"role": "user", "content": prompt}], max_tokens=8)
-        if local:
-            verdict = _parse_verdict(local)
-            if verdict:
-                return verdict
-    except Exception as e:
-        _log.debug("[triage] local classifier failed: %s", e)
-    return None
+    if _sorter_backend() == "claude":
+        return (_classify_claude(_system, prompt)
+                or _classify_local(_system, prompt))
+    return (_classify_local(_system, prompt)
+            or _classify_claude(_system, prompt))
 
 
 # ─── Speech queue + focus-mode integration ───────────────────────────────

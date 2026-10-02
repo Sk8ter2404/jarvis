@@ -107,6 +107,7 @@ _state: dict[str, Any] = {
     "finished_at":   None,
     "last_result":   None,
     "last_error":    None,
+    "model":         None,    # the Claude model the current / last run uses
 }
 
 
@@ -309,17 +310,98 @@ def _model_name() -> str:
                 picked = str(m)
         except Exception:
             pass
-    if not picked:
-        return BROWSER_AGENT_DEFAULT_MODEL
+    # Retired-model guard (2026-10-02): a model Anthropic already answered
+    # not_found for this session is swapped for its CLAUDE_MODEL_SUCCESSORS
+    # entry; with none it is returned as-is and _run_task_sync declines the
+    # task (_retired_model_reply) before a browser is opened.
+    picked = _guard_successor(picked or BROWSER_AGENT_DEFAULT_MODEL)
     try:
         from core.llm_client import rejects_forced_tool_choice
         if rejects_forced_tool_choice(picked):
             print(f"  [browser-agent] {picked} rejects forced tool use, which "
                   f"browser-use needs — using {BROWSER_AGENT_DEFAULT_MODEL}")
-            return BROWSER_AGENT_DEFAULT_MODEL
+            return _guard_successor(BROWSER_AGENT_DEFAULT_MODEL)
     except Exception:
         pass
     return picked
+
+
+# ── backend switch + retired-model guard (2026-10-02) ──────────────
+# core.config.BROWSER_AGENT_BACKEND: "claude" (default — browser tasks are
+# driven by Claude whenever a key is set, as before) or "local" (never send
+# page content to Claude). There is no local browser-driving model, so "local"
+# makes every browser task decline honestly instead of running.
+_BACKENDS = ("claude", "local")
+
+_LOCAL_BACKEND_REPLY = (
+    "The browser agent only runs on Claude, sir, and it's set to stay local "
+    "(BROWSER_AGENT_BACKEND), so I won't send the page to the cloud.")
+
+
+def _backend() -> str:
+    try:
+        from core import config as _cfg
+        v = str(getattr(_cfg, "BROWSER_AGENT_BACKEND", "") or "").strip().lower()
+    except Exception:
+        v = ""
+    return v if v in _BACKENDS else "claude"
+
+
+def _successor_table() -> dict:
+    try:
+        from core import config as _cfg
+        table = getattr(_cfg, "CLAUDE_MODEL_SUCCESSORS", None)
+        return dict(table) if isinstance(table, dict) else {}
+    except Exception:
+        return {}
+
+
+def _guard_successor(model: str) -> str:
+    """``model``, or its configured successor when Anthropic already answered
+    not_found for it this session. Never raises."""
+    try:
+        from core.claude_model_guard import GUARD
+        use = GUARD.resolve(model, _successor_table())
+        return use if use else model
+    except Exception:
+        return model
+
+
+def _retired_model_reply(model: str) -> str:
+    return (f"The browser agent's Claude model, {model}, is no longer "
+            f"available from Anthropic, sir — set BROWSER_AGENT_MODEL, or add "
+            f"a replacement to CLAUDE_MODEL_SUCCESSORS, and I'll drive the "
+            f"browser again.")
+
+
+def _retired_current_model() -> str:
+    """The model a task would use, when Anthropic already answered not_found
+    for it this session and no successor replaces it; '' otherwise. Resolves
+    the model (_model_name) only when the guard holds a gone model at all, so
+    the common path adds nothing."""
+    try:
+        from core.claude_model_guard import GUARD
+        if not GUARD.retired_models():
+            return ""
+        model = _model_name()
+        return model if GUARD.is_retired(model) else ""
+    except Exception:
+        return ""
+
+
+def _note_not_found(err: Any, model: str) -> bool:
+    """When ``err`` (an exception or a browser-use step error string) is
+    Anthropic's not_found answer for ``model``, mark the model gone (one log
+    line per model per session) and return True. Never raises."""
+    try:
+        from core.claude_model_guard import GUARD, is_model_not_found, successor_for
+        if not model or not is_model_not_found(err, model):
+            return False
+        GUARD.note_not_found(model, where="the browser agent",
+                             successor=successor_for(model, _successor_table()))
+        return True
+    except Exception:
+        return False
 
 
 # ── bg loop ────────────────────────────────────────────────────────
@@ -411,6 +493,8 @@ def _make_llm(imports: dict) -> Any:
     if ChatAnthropic is None:
         return None
     model = _model_name()
+    with _lock:
+        _state["model"] = model   # which model a not_found answer is about
     # langchain_anthropic uses `model=`, some browser-use ChatAnthropic
     # variants use `model_name=` — try both. NO temperature: browser-use
     # forwards a non-None temperature straight to messages.create, and Claude
@@ -532,6 +616,12 @@ async def _run_task_inner(task: str, max_steps: int, headless: bool) -> str:
         except Exception:
             _errs = []
         if _errs:
+            # A retired / unknown model fails EVERY step with the same 404;
+            # say that plainly (once in the log) instead of reading the raw
+            # error body aloud (2026-10-02).
+            _model = _state.get("model") or ""
+            if any(_note_not_found(str(x), _model) for x in _errs):
+                return _retired_model_reply(_model)
             return (f"Browser agent couldn't finish, sir — "
                     f"{str(_errs[-1]).strip()[:200]}")
         # Last-ditch: stringify the history.
@@ -590,6 +680,9 @@ async def _orchestrate(task: str, max_steps: int, headless: bool) -> str:
         # for ANY bad request (a rejected parameter, a malformed prompt), so it
         # blamed the cap for real request errors. The cap's own 400 says
         # "usage limits", which the first marker already catches.
+        _model = _state.get("model") or ""
+        if _note_not_found(e, _model):
+            return _retired_model_reply(_model)
         _err = f"{type(e).__name__}: {e}".lower()
         if any(m in _err for m in ("usage limit", "credit", "quota",
                                    "rate limit", "rate_limit")):
@@ -646,7 +739,16 @@ def _run_task_sync(
     """Submit `task` and block until it finishes OR `timeout` elapses.
     Past the timeout we return a "still running, poll browser_status"
     message rather than killing the agent — long browser tasks are
-    legitimate (booking flow w/ 2FA may take minutes)."""
+    legitimate (booking flow w/ 2FA may take minutes).
+
+    Declines before anything runs (2026-10-02) when BROWSER_AGENT_BACKEND is
+    "local", or when the model is one Anthropic already answered not_found
+    for this session with no CLAUDE_MODEL_SUCCESSORS replacement."""
+    if _backend() == "local":
+        return _LOCAL_BACKEND_REPLY
+    _gone = _retired_current_model()
+    if _gone:
+        return _retired_model_reply(_gone)
     try:
         fut = _submit(task, max_steps=max_steps, headless=headless)
     except RuntimeError as e:

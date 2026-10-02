@@ -892,6 +892,13 @@ class ClassifyWithLLMTests(_IsolatedTriageBase):
         gate = mock.patch.object(self.mod, "_cloud_allowed", return_value=True)
         gate.start()
         self.addCleanup(gate.stop)
+        # These pin the "claude" backend's order (Claude first, local
+        # fallback) — the default before 2026-10-02. The local-first default
+        # is covered by LocalFirstSorterTests below.
+        import core.config as cfg
+        backend = mock.patch.object(cfg, "NOTIFY_SORTER_BACKEND", "claude")
+        backend.start()
+        self.addCleanup(backend.stop)
 
     def test_disabled_returns_none(self):
         with mock.patch.object(self.mod, "ENABLE_LLM_CLASSIFIER", False):
@@ -965,6 +972,215 @@ class ClassifyWithLLMTests(_IsolatedTriageBase):
         with mock.patch.dict(os.environ, {}, clear=True), \
              mock.patch.dict(sys.modules, {"bobert_companion": bc}):
             self.assertIsNone(self.mod._classify_with_llm("App", "T", "B"))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# NOTIFY_SORTER_BACKEND "local_first" (the 2026-10-02 default): the local
+# brain classifies; Claude only when the local brain is unavailable or its
+# answer is unusable, and only where the cloud gate allows.
+# ─────────────────────────────────────────────────────────────────────────
+class LocalFirstSorterTests(_IsolatedTriageBase):
+    def setUp(self):
+        super().setUp()
+        import core.config as cfg
+        import core.claude_model_guard as mg
+        self.cfg = cfg
+        self.mg = mg
+        mg.GUARD.reset()
+        self.addCleanup(mg.GUARD.reset)
+        backend = mock.patch.object(cfg, "NOTIFY_SORTER_BACKEND", "local_first")
+        backend.start()
+        self.addCleanup(backend.stop)
+        self.gate = mock.patch.object(self.mod, "_cloud_allowed", return_value=True)
+        self.gate.start()
+        self.addCleanup(self.gate.stop)
+
+    # ── fakes ────────────────────────────────────────────────────────────
+    def _brain(self, reply=None, exc=None):
+        bc = types.ModuleType("bobert_companion")
+        if exc is not None:
+            bc._call_local_llm = mock.MagicMock(side_effect=exc)
+        else:
+            bc._call_local_llm = mock.MagicMock(return_value=reply)
+        return bc
+
+    def _claude(self, text="fyi", exc=None):
+        client = mock.MagicMock()
+        if exc is not None:
+            client.messages.create.side_effect = exc
+        else:
+            blk = types.SimpleNamespace(type="text", text=text)
+            client.messages.create.return_value = types.SimpleNamespace(
+                content=[blk], stop_reason="end_turn", usage=None)
+        fake = types.ModuleType("anthropic")
+        fake.Anthropic = mock.MagicMock(return_value=client)
+        return fake, client
+
+    def _classify(self, bc, anthropic_mod=None, key="sk-test-not-real"):
+        mods = {"bobert_companion": bc}
+        if anthropic_mod is not None:
+            mods["anthropic"] = anthropic_mod
+        env = {"ANTHROPIC_API_KEY": key} if key else {}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.dict(sys.modules, mods), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return self.mod._classify_with_llm("Teams", "Sam", "are you around?")
+
+    # ── defaults ─────────────────────────────────────────────────────────
+    def test_shipped_default_is_local_first_and_the_skill_fallback_agrees(self):
+        import ast
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "core", "config.py")
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        lits = {n.targets[0].id: n.value.value for n in tree.body
+                if isinstance(n, ast.Assign) and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)
+                and isinstance(n.value, ast.Constant)}
+        self.assertEqual(lits["NOTIFY_SORTER_BACKEND"], "local_first")
+        self.assertEqual(self.mod._DEFAULT_SORTER_BACKEND,
+                         lits["NOTIFY_SORTER_BACKEND"])
+        self.assertIn(lits["NOTIFY_SORTER_BACKEND"], self.mod._SORTER_BACKENDS)
+
+    def test_unknown_backend_value_means_local_first(self):
+        with mock.patch.object(self.cfg, "NOTIFY_SORTER_BACKEND", "banana"):
+            self.assertEqual(self.mod._sorter_backend(), "local_first")
+        with mock.patch.object(self.cfg, "NOTIFY_SORTER_BACKEND", " Claude "):
+            self.assertEqual(self.mod._sorter_backend(), "claude")
+
+    # ── the local answer is parsed and validated ─────────────────────────
+    def test_local_label_wins_and_claude_is_never_asked(self):
+        fake, client = self._claude("spam")
+        bc = self._brain("Urgent.")
+        self.assertEqual(self._classify(bc, fake), "urgent")
+        bc._call_local_llm.assert_called_once()
+        fake.Anthropic.assert_not_called()
+        client.messages.create.assert_not_called()
+        # The local call is the short classification (8 tokens).
+        self.assertEqual(bc._call_local_llm.call_args.kwargs["max_tokens"], 8)
+
+    def test_parse_verdict_accepts_and_rejects(self):
+        accept = {
+            "urgent": "urgent", "Urgent.": "urgent", "**fyi**": "fyi",
+            "spam - marketing": "spam", "NEWSLETTER\n": "newsletter",
+            "[local] spam": "spam", "Label: newsletter": "newsletter",
+            "fyi, not urgent": "fyi",
+        }
+        for text, want in accept.items():
+            with self.subTest(text=text):
+                self.assertEqual(self.mod._parse_verdict(text), want)
+        reject = ("", "   ", None, 42, "banana", "urgent or fyi?".replace(
+            "urgent", "maybe urgent"), "non-urgent", "not spam",
+            "I think this one is probably fyi for the user",
+            "label: urgent or fyi", "???")
+        for text in reject:
+            with self.subTest(text=text):
+                self.assertIsNone(self.mod._parse_verdict(text))
+
+    # ── fallback to Claude ───────────────────────────────────────────────
+    def test_unusable_local_answer_falls_back_to_claude(self):
+        fake, client = self._claude("fyi")
+        bc = self._brain("Hmm, hard to say.")
+        self.assertEqual(self._classify(bc, fake), "fyi")
+        client.messages.create.assert_called_once()
+        self.assertEqual(client.messages.create.call_args.kwargs["model"],
+                         self.cfg.CLAUDE_FAST_MODEL)
+
+    def test_local_brain_unavailable_falls_back_to_claude(self):
+        for bc in (self._brain(None), self._brain(""),
+                   self._brain(exc=RuntimeError("ollama down"))):
+            fake, client = self._claude("newsletter")
+            with self.subTest(bc=bc._call_local_llm):
+                self.assertEqual(self._classify(bc, fake), "newsletter")
+                client.messages.create.assert_called_once()
+
+    def test_no_running_monolith_is_unavailable_not_imported(self):
+        fake, client = self._claude("urgent")
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}, clear=True), \
+                mock.patch.dict(sys.modules, {"anthropic": fake}):
+            sys.modules.pop("bobert_companion", None)
+            with mock.patch.object(self.mod.importlib, "import_module") as imp:
+                out = self.mod._classify_with_llm("App", "T", "B")
+            imp.assert_not_called()
+        self.assertEqual(out, "urgent")
+
+    def test_closed_cloud_gate_means_local_only(self):
+        # The owner's all-local setup: the gate is closed, so an unusable
+        # local answer is logged, never sent to Claude.
+        self.gate.stop()
+        fake, client = self._claude("urgent")
+        with mock.patch.object(self.mod, "_cloud_allowed", return_value=False):
+            self.assertIsNone(self._classify(self._brain("no idea"), fake))
+            self.assertEqual(self._classify(self._brain("spam"), fake), "spam")
+        fake.Anthropic.assert_not_called()
+        self.gate.start()
+
+    def test_no_key_means_local_only(self):
+        fake, client = self._claude("urgent")
+        self.assertIsNone(self._classify(self._brain(None), fake, key=""))
+        fake.Anthropic.assert_not_called()
+
+    def test_both_unusable_yields_none(self):
+        fake, _ = self._claude("probably important")
+        self.assertIsNone(self._classify(self._brain("dunno"), fake))
+        fake, _ = self._claude(exc=RuntimeError("529 overloaded"))
+        self.assertIsNone(self._classify(self._brain(None), fake))
+
+    def test_claude_backend_keeps_the_old_order(self):
+        fake, client = self._claude("urgent")
+        bc = self._brain("spam")
+        with mock.patch.object(self.cfg, "NOTIFY_SORTER_BACKEND", "claude"):
+            self.assertEqual(self._classify(bc, fake), "urgent")
+        bc._call_local_llm.assert_not_called()
+
+    def test_llm_model_override_and_blank_default(self):
+        self.assertEqual(self.mod.LLM_MODEL, "")
+        self.assertEqual(self.mod._claude_model(), self.cfg.CLAUDE_FAST_MODEL)
+        with mock.patch.object(self.cfg, "CLAUDE_FAST_MODEL", "claude-new-fast"):
+            self.assertEqual(self.mod._claude_model(), "claude-new-fast")
+        with mock.patch.object(self.mod, "LLM_MODEL", "claude-pinned"):
+            self.assertEqual(self.mod._claude_model(), "claude-pinned")
+
+    # ── a retired Claude model ───────────────────────────────────────────
+    def test_retired_claude_model_logs_once_and_stops_calling(self):
+        class _NotFound(Exception):
+            status_code = 404
+            body = {"type": "error", "error": {
+                "type": "not_found_error", "message": "model: claude-haiku-4-5"}}
+        fake, client = self._claude(exc=_NotFound("Error code: 404"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for _ in range(3):
+                # Local answer unusable every time → Claude fallback attempted.
+                self.assertIsNone(self._classify_loud(self._brain("hmm"), fake))
+            # The local brain still sorts toasts normally afterwards.
+            self.assertEqual(self._classify_loud(self._brain("fyi"), fake), "fyi")
+        self.assertEqual(client.messages.create.call_count, 1)
+        lines = [ln for ln in out.getvalue().splitlines() if "[model-guard]" in ln]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("claude-haiku-4-5", lines[0])
+
+    def _classify_loud(self, bc, anthropic_mod):
+        """_classify without swallowing stdout (the caller captures it)."""
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}, clear=True), \
+                mock.patch.dict(sys.modules, {"bobert_companion": bc,
+                                              "anthropic": anthropic_mod}):
+            return self.mod._classify_with_llm("App", "T", "B")
+
+    # ── end to end through the triage pipeline ───────────────────────────
+    def test_unmatched_toast_is_read_aloud_on_a_local_urgent(self):
+        self.mod._rules = []                 # nothing matches → classify
+        bc = self._brain("urgent")
+        with mock.patch.object(self.mod, "_proactive_announce") as ann, \
+                mock.patch.object(self.mod, "_focus_mode_active", return_value=False), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            self.mod._handle_notification(
+                _make_notification(nid=4242, app="SomeApp",
+                                   texts=("Sam", "call me now")))
+        self.assertEqual(self.mod._recent[-1]["llm_verdict"], "urgent")
+        self.assertEqual(self.mod._recent[-1]["action"], "read_aloud")
+        ann.assert_called_once()
 
 
 # ─────────────────────────────────────────────────────────────────────────
