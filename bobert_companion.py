@@ -9123,8 +9123,16 @@ _camera_black_frame_at: dict[int, float] = {}
 # skills/self_diagnostic reads it, so its "the webcam is producing only black
 # frames" check still sees what the producer reads (2026-10-02 review).
 _camera_latest_black_frame: dict[int, "np.ndarray"] = {}
-_CAMERA_BLACK_WARN_GAP_S = 60.0    # one log line per camera per minute, at most
-_camera_black_warned_at: dict[int, float] = {}
+# The log names a black run when it STARTS and ENDS, with a reminder every
+# _CAMERA_BLACK_REMIND_S in between. A line a minute per camera for as long as
+# the run lasted was ~1,000 lines a night for a dark room with two webcams
+# (2026-10-02 review). A run starting within _CAMERA_BLACK_WARN_GAP_S of the
+# camera's last line waits out the gap, so a camera flickering at the black
+# level logs at most a start and an end a minute.
+_CAMERA_BLACK_WARN_GAP_S = 60.0
+_CAMERA_BLACK_REMIND_S = 1800.0
+_camera_black_warned_at: dict[int, float] = {}    # index -> its last line
+_camera_black_logged_run: dict[int, bool] = {}    # index -> this run was logged
 
 
 def _webcam_frame_brightness(frame) -> float | None:
@@ -9144,15 +9152,31 @@ def _webcam_frame_brightness(frame) -> float | None:
 
 def _warn_black_camera_frames(label: str, idx: int, mean: float,
                               now: float) -> None:
-    """Throttled one-liner naming the camera whose frames are black. Never
-    raises into the tracking loop."""
+    """One line naming the camera whose frames are black: at the start of a
+    black run, then every _CAMERA_BLACK_REMIND_S while it lasts. Never raises
+    into the tracking loop."""
     try:
-        if (now - _camera_black_warned_at.get(idx, 0.0)) < _CAMERA_BLACK_WARN_GAP_S:
+        logged = _camera_black_logged_run.get(idx, False)
+        gap = _CAMERA_BLACK_REMIND_S if logged else _CAMERA_BLACK_WARN_GAP_S
+        if (now - _camera_black_warned_at.get(idx, 0.0)) < gap:
             return
         _camera_black_warned_at[idx] = now
-        print(f"  [face-track] {label} (index {idx}) is delivering black frames "
+        _camera_black_logged_run[idx] = True
+        print(f"  [face-track] {label} (index {idx}) is "
+              f"{'still ' if logged else ''}delivering black frames "
               f"(brightness {mean:.1f}/255) - not treated as live. A "
               f"saturated USB controller (the Kinect) or an unlit room does this")
+    except Exception:
+        pass
+
+
+def _note_black_camera_frames_ended(label: str, idx: int) -> None:
+    """One line when a black run that was logged ends with a real frame.
+    Never raises into the tracking loop."""
+    try:
+        if _camera_black_logged_run.pop(idx, False):
+            print(f"  [face-track] {label} (index {idx}) is delivering real "
+                  f"frames again")
     except Exception:
         pass
 
@@ -12143,6 +12167,7 @@ def _face_tracking_thread_body():
                 # recorded as the camera's read error, never as a live frame.
                 _bright = _webcam_frame_brightness(frame)
                 _black = _bright is not None and _bright < _CAMERA_BLACK_FRAME_LEVEL
+                _black_run_ended = False
                 with _camera_state_lock:
                     if _black:
                         _camera_black_frame_at[cam["index"]] = now_loop
@@ -12151,7 +12176,8 @@ def _face_tracking_thread_body():
                             _CAMERA_BLACK_FRAME_ERROR.format(_bright))
                         _camera_last_read_error_at[cam["index"]] = now_loop
                     else:
-                        _camera_black_frame_at.pop(cam["index"], None)
+                        _black_run_ended = (_camera_black_frame_at.pop(
+                            cam["index"], None) is not None)
                         _camera_latest_black_frame.pop(cam["index"], None)
                         _camera_latest_frame[cam["index"]] = frame.copy()
                         _camera_last_frame_at[cam["index"]] = now_loop
@@ -12164,6 +12190,8 @@ def _face_tracking_thread_body():
                 if _black:
                     _warn_black_camera_frames(cam["label"], cam["index"],
                                               _bright, now_loop)
+                elif _black_run_ended:
+                    _note_black_camera_frames_ended(cam["label"], cam["index"])
                 # Per-camera preview: EVERY webcam publishes its own tile (the
                 # web Camera tab shows each eye individually); the primary-only
                 # composite below is unchanged. Same enable gate + throttle

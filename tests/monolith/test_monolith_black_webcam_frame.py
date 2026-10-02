@@ -36,7 +36,9 @@ class _ProducerHarness(MonolithGlobalsTestCase):
         for d in (bc._camera_latest_frame, bc._camera_last_frame_at,
                   bc._camera_last_read_error, bc._camera_last_read_error_at,
                   getattr(bc, "_camera_black_frame_at", {}),
-                  getattr(bc, "_camera_latest_black_frame", {})):
+                  getattr(bc, "_camera_latest_black_frame", {}),
+                  getattr(bc, "_camera_black_warned_at", {}),
+                  getattr(bc, "_camera_black_logged_run", {})):
             p = mock.patch.dict(d, clear=True)
             p.start()
             self.addCleanup(p.stop)
@@ -136,6 +138,52 @@ class BlackWebcamFrameTests(_ProducerHarness):
             out = actions["camera_status"]("")
         self.assertIn("delivering black frames", out)
         self.assertNotIn("is live", out)
+
+
+@requires_monolith
+class BlackRunLogTests(_ProducerHarness):
+    """A dark room overnight logged one line a minute per camera, all night
+    (about 1,000 lines with two webcams, 2026-10-02 review). The log says when
+    a run starts and ends, with a long-interval reminder in between."""
+
+    def _lines(self, fn):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        return [ln for ln in buf.getvalue().splitlines() if "black frames" in ln
+                or "real frames again" in ln]
+
+    def test_an_hour_of_black_frames_is_a_few_lines_not_sixty(self):
+        bc = self.bc
+
+        def _hour():
+            for t in range(0, 3601):                 # one frame a second
+                bc._warn_black_camera_frames("Right webcam", 0, 2.0,
+                                             1_000_000.0 + t)
+        lines = self._lines(_hour)
+        self.assertGreaterEqual(len(lines), 1, "the run start was not logged")
+        self.assertLessEqual(len(lines), 3, lines)
+
+    def test_the_end_of_a_logged_run_is_logged_once(self):
+        def _run():
+            self._run_one_iteration(self.black)      # run starts: logged
+            self._run_one_iteration(self.lit)        # run ends: logged
+            self._run_one_iteration(self.lit)        # nothing new
+        lines = self._lines(_run)
+        self.assertEqual(len([ln for ln in lines if "black frames" in ln]), 1,
+                         lines)
+        self.assertEqual(len([ln for ln in lines if "real frames again" in ln]),
+                         1, lines)
+
+    def test_a_flickering_camera_cannot_flood_either(self):
+        def _flicker():
+            for _ in range(4):
+                self._run_one_iteration(self.black)
+                self._run_one_iteration(self.lit)
+        lines = self._lines(_flicker)
+        self.assertLessEqual(len(lines), 2, lines)
 
 
 @requires_monolith
