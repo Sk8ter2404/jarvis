@@ -55,7 +55,14 @@ except ImportError:
     _HAS_PSUTIL = False
 
 
-TICK_MS = 200  # 5 fps — the data refreshes once a minute, anything faster is wasted CPU
+TICK_MS = 200  # 5 fps while the accent pulses after a printer update.
+# Printer data changes about once a minute, so the panel only redraws while it
+# pulses after a change; then it holds one still frame and polls at this pace.
+IDLE_TICK_MS = 1000
+PULSE_AFTER_CHANGE_S = 3.0
+# Stamps bambu_monitor rewrites on every MQTT report. The panel never shows
+# them, so on their own they are not a change worth a redraw.
+_UNDRAWN_KEYS = ("written_at", "last_update")
 
 BG_KEY        = "#010101"
 PANEL_DARK    = "#04080d"
@@ -106,6 +113,16 @@ def _read_state() -> dict:
             return json.load(f)
     except Exception:
         return {}
+
+
+def _render_signature(state: dict) -> str:
+    """Everything the panel draws from ``state``, as one comparable string."""
+    try:
+        return json.dumps(
+            {k: v for k, v in state.items() if k not in _UNDRAWN_KEYS},
+            sort_keys=True, default=str)
+    except Exception:
+        return repr(state)
 
 
 def _hex_to_rgb(h: str):
@@ -182,6 +199,10 @@ class BambuOverlay:
         self.parent_pid = parent_pid
         self.w, self.h = w, h
         self.frame = 0
+        # Redraw-on-change bookkeeping (see tick()).
+        self._signature = None
+        self._changed_at = 0.0
+        self._settled = False
 
         self.root = tk.Tk()
         self.root.title("JARVIS Bambu H2D Overlay")
@@ -390,10 +411,30 @@ class BambuOverlay:
             self._on_close()
             return
 
+        # Redrawing the whole canvas 5x a second for data that changes
+        # about once a minute was wasted CPU (GUI_REVIEW B22). Redraw only while
+        # the accent pulses after a change, then draw one still frame and just
+        # poll, more slowly, until the printer state changes again.
+        state = _read_state()
+        if not isinstance(state, dict):
+            state = {}
+        now = time.monotonic()
+        signature = _render_signature(state)
+        if signature != self._signature:
+            self._signature = signature
+            self._changed_at = now
+            self._settled = False
+        animating = (now - self._changed_at) < PULSE_AFTER_CHANGE_S
+        if animating or not self._settled:
+            self._render(state, animating)
+            self._settled = not animating
+
+        self.root.after(TICK_MS if animating else IDLE_TICK_MS, self.tick)
+
+    def _render(self, state: dict, animating: bool):
         self.frame += 1
         self.canvas.delete("all")
 
-        state = _read_state()
         try:
             pct = float(state.get("mc_percent") or 0)
         except (TypeError, ValueError):
@@ -405,16 +446,18 @@ class BambuOverlay:
 
         # Animate a subtle pulse on the accent border by mixing the
         # accent with its dim partner — feels alive without being noisy.
+        # The still frame holds the full accent.
         accent_base, accent_dim = _risk_palette(risk)
-        pulse_t = 0.5 + 0.5 * math.sin(self.frame * 0.18)
-        accent = _mix(accent_dim, accent_base, 0.6 + 0.4 * pulse_t)
+        if animating:
+            pulse_t = 0.5 + 0.5 * math.sin(self.frame * 0.18)
+            accent = _mix(accent_dim, accent_base, 0.6 + 0.4 * pulse_t)
+        else:
+            accent = accent_base
 
         self._draw_panel(accent, accent_dim)
         self._draw_text_block(state, accent, accent_dim)
         self._draw_progress_bar(pct, accent, accent_dim)
         self._draw_thumbnail(pct, accent, accent_dim)
-
-        self.root.after(TICK_MS, self.tick)
 
 
 def main():
