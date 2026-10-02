@@ -30196,29 +30196,44 @@ def _standby_greet_admit_take() -> bool:
         return False
 
 
+from core import wake_prefix as _wake_prefix  # noqa: E402
+
+
 def _text_has_wake_prefix(text: str) -> bool:
-    """True if ``text`` is a short utterance led by a wake word
-    ('jarvis'/'hey'/'ok'/'okay'). Mirrors skills/standby_audio_detect.
-    should_refuse_wake's wake detection so the gate agrees with it: a clear
-    leading wake word on a ≤6-word command is the one-command path that always
-    passes the background-audio gate."""
-    if not text:
-        return False
-    words = text.strip().lower().split()
-    if not words:
-        return False
-    first = words[0].strip(",.!?")
-    # A clear leading "jarvis" means the user is addressing JARVIS directly — let
-    # it through at ANY length, so "Jarvis, <a whole sentence>" wakes/reaches him
-    # too, not just a <=6-word command (the old <=6 cap silently swallowed real
-    # requests like "Jarvis, are you positive that's the correct reading?").
-    if first == "jarvis":
-        return True
-    # "hey/ok/okay JARVIS ..." — require 'jarvis' as the 2nd token so ordinary
-    # speech that merely starts with "hey"/"ok" is not mistaken for a wake.
-    if first in {"hey", "ok", "okay"} and len(words) >= 2 and words[1].strip(",.!?") == "jarvis":
-        return True
-    return False
+    """True if ``text`` addresses JARVIS by name at its start: the one-command
+    path that always passes the background-audio gate, opens the follow-up
+    window, lets a standby wake carry its command and tells the learn gate
+    the turn was addressed. Any length after the name ("Jarvis, <a whole
+    sentence>").
+
+    The rule lives in core/wake_prefix.py — the ONE copy, shared with
+    skills/standby_audio_detect.should_refuse_wake and core/fast_paths. Since
+    2026-10-01 the name may be word 1, 2 or 3 behind lead interjections
+    ("What Jarvis what model are you?" was refused live in wake-word mode
+    because only word 1 counted); a mid-sentence mention ("I asked Jarvis
+    yesterday", "tell Jarvis that ...") still is not addressed. Never
+    raises."""
+    return _wake_prefix.has_wake_prefix(text)
+
+
+def _wake_lead_canonical(text: str) -> str:
+    """The main loop's command text for an admitted turn: a filler-led wake
+    ("What Jarvis what model are you?") rewritten to the plain prefix form
+    ("Jarvis what model are you?"), so every handler downstream — lead
+    fillers, yes/no, fast paths, skill routes, the LLM — gets the command
+    exactly as the "Jarvis, ..." path hands it over, wake word stripped
+    wherever that path strips it. Anything else is returned unchanged
+    (core.wake_prefix.canonical_wake_text). Logs that it happened, never the
+    words. Never raises."""
+    try:
+        out = _wake_prefix.canonical_wake_text(text)
+        if isinstance(out, str) and out and out != text:
+            print(f"  [wake] lead before the wake word dropped "
+                  f"({len(text or '')} -> {len(out)} chars)")
+            return out
+    except Exception:
+        pass
+    return text
 
 
 def _smtc_media_playing() -> bool:
@@ -30237,7 +30252,8 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
     """Decide whether to ignore a non-wake utterance because background audio
     is active. Returns ``(refuse, reason)``; reason is "" when not refusing.
 
-    A clear leading "JARVIS …" always passes (the one-command path). Otherwise
+    A clear leading "JARVIS …" always passes (the one-command path; word 1-3
+    behind lead interjections, see _text_has_wake_prefix). Otherwise
     refuse when ANY of: the manual wake-word toggle is on, or - only while
     AMBIENT_MUSIC_REFUSE_WAKE is set - SMTC reports media playing or sustained
     room music is detected. Never raises — on any error it fails OPEN (returns
@@ -38284,9 +38300,10 @@ _STANDBY_GREETING_WORDS = frozenset({
 def _standby_wake_carries_command(text: str, typed: bool = False) -> bool:
     """True when a standby wake utterance LEADS with the wake word and goes on
     to say something that is not just a wake / greeting ("Jarvis, turn off the
-    lights" — not "Jarvis, wake up"). Only a leading wake counts: that is what
-    lets the carried turn pass the normal-mode background gate
-    (_text_has_wake_prefix).
+    lights", "Um, Jarvis, turn off the lights" — not "Jarvis, wake up"). Only
+    a leading wake counts (word 1-3 behind lead interjections,
+    core/wake_prefix.py): that is what lets the carried turn pass the
+    normal-mode background gate (_text_has_wake_prefix).
 
     Spoken, the rest must be two or more words: a one-word tail after a
     heard "Jarvis" is too often a Whisper fragment of the room. ``typed``
@@ -38297,7 +38314,10 @@ def _standby_wake_carries_command(text: str, typed: bool = False) -> bool:
     try:
         if not _text_has_wake_prefix(text):
             return False
-        rest = _fast_paths._WAKE_LEAD_RE.sub("", (text or "").strip())
+        # The lead fillers and the wake word off the front (core.wake_prefix,
+        # the same rule the gate just applied: "Um, Jarvis, turn off the
+        # lights" -> "turn off the lights").
+        rest = _wake_prefix.strip_wake_lead((text or "").strip())
         words = _yes_no.normalize(rest).split()
         if len(words) < (1 if typed else 2):
             return False
@@ -39942,6 +39962,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     ).start()
                     set_state("idle")
                     continue
+
+                # ── WAKE WORD BEHIND A LEAD INTERJECTION (2026-10-01) ───────────
+                # "What Jarvis what model are you?" passed the gate above on its
+                # wake word at word 2; hand every handler below the plain
+                # "Jarvis what model are you?" the prefix path would have
+                # given it (see _wake_lead_canonical). A no-op for any other
+                # text.
+                text = _wake_lead_canonical(text)
 
                 # ── NOISE HEARD AS SPEECH (core/speech_filter.py, R10) ─────────
                 # A transcript that is ONLY a classic Whisper hallucination

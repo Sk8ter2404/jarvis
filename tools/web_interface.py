@@ -4676,8 +4676,10 @@ const QUICK_ACTIONS = [
 // tray channel (which works in standby) and then send, or don't send.
 // A command that DOES start with the wake word goes straight through: the
 // standby handler runs "Jarvis, <command>" as the turn (2026-10-01), so there
-// is nothing to wake first.
-const WAKE_WORD_RE = /^\s*(hey\s+)?jarvis\b/i;
+// is nothing to wake first. "Starts with" is core/wake_prefix.py's rule: the
+// wake word at word 1-3 behind lead interjections ("um, Jarvis, pause");
+// tests/test_wake_prefix.py pins this filler list to WAKE_LEAD_FILLERS.
+const WAKE_WORD_RE = /^\s*(?:(?:what|okay|ok|hey|yo|so|umm|um|uhh|uh|oh|alright|all\s+right)[\s,.!?;:-]+){0,2}jarvis\b/i;
 const WAKE_UP_RE = /^\s*wake(\s+up)?\s*[.!]?\s*$/i;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 

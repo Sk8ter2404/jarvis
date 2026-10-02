@@ -206,6 +206,21 @@ class WakeGatingTests(unittest.TestCase):
                                return_value=True):
             self.assertTrue(self.mod.should_refuse_wake("baby tonight"))
 
+    def test_wake_in_the_first_three_words_over_music(self):
+        # 2026-10-01: the same core.wake_prefix rule as the wake-word gate —
+        # "What Jarvis what model are you?" is a wake, a mention is a lyric.
+        with mock.patch.object(self.mod, "is_music_currently_playing",
+                               return_value=True):
+            self.assertFalse(self.mod.should_refuse_wake(
+                "What Jarvis what model are you?"))
+            self.assertFalse(self.mod.should_refuse_wake("um jarvis pause"))
+            self.assertTrue(self.mod.should_refuse_wake(
+                "I asked jarvis yesterday"))
+            self.assertTrue(self.mod.should_refuse_wake(
+                "so um uh jarvis play music"))
+            self.assertTrue(self.mod.should_refuse_wake(
+                "so jarvis said it would rain"))
+
 
 class FeedAudioStateMachineTests(unittest.TestCase):
     def setUp(self):
