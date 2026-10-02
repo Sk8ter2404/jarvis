@@ -2756,11 +2756,16 @@ class CallLocalLlmWebSearchGuardTests(MonolithGlobalsTestCase):
             return _FakeResp(ok=True, json_data={"message": {"content": "ok sir"}})
         fake_req.post.side_effect = _post
         # A web_search was fired but never followed by a see_screen read, and
-        # the owner has since spoken again (the shape a real turn has).
+        # the owner has since spoken again (the shape a real turn has). Since
+        # NEW #13 (2026-10-01) the guard needs that search to be RECENT
+        # (OFFER_TTL_S) - a 35-minute-old one was offered back live - so the
+        # search is stamped as having just run.
         msgs = [{"role": "user", "content": "search the census"},
                 {"role": "assistant", "content": "[ACTION: web_search, census]"},
                 {"role": "user", "content": "so what did it say"}]
         with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(self.bc, "_last_web_search_at",
+                                  [time.time()]), \
                 mock.patch.object(self.bc, "_STABLE_LOCAL_PREFIX",
                                   stable_prefix), \
                 mock.patch.object(self.bc, "_ollama_alive", return_value=True), \

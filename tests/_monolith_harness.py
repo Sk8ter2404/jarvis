@@ -149,6 +149,11 @@ def load_monolith():
 _MONOLITH_RESTORE_NAMES = (
     # ── conversation + memory buffers ──────────────────────────────────────
     "conversation_history",
+    # Closed offers of finished turns + the last web_search stamp (NEW #13,
+    # 2026-10-01): a dispatch test leaves both behind, and either would drop
+    # a LATER test's "Also, …" aside or put the unread-search guard into its
+    # local prompt.
+    "_offer_ledger", "_last_web_search_at",
     # ── wake / greeting bookkeeping (re-exported from core.state) ──────────
     "_last_wake_date", "_wake_history", "_pre_wake_silence_seconds",
     # ── focus mode / do-not-disturb (skills/focus_mode.py drives these) ─────

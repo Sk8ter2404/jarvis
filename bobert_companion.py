@@ -18964,6 +18964,66 @@ def _local_cheatsheet() -> str:
     return out
 
 
+# ── Stale offers (NEW #13, 2026-10-01) ──────────────────────────────────────
+# Live 2026-10-01: the 21:00 "better models" chain ended on a web_search whose
+# page nobody read; 35 minutes later both replies to "how's my print doing?"
+# (21:36:14, 21:36:33) ended "Also, I've opened those search results in your
+# browser; shall I read them to you via screen vision?". _local_chat_prompt's
+# unread-search guard below scans the last six history messages with no
+# notion of turns or time, and it TOLD the model to "offer to read the
+# results via see_screen". Nothing ever closed that offer.
+#   * The guard keeps its offer wording only while the search's own turn is
+#     running (the grounding ledger shows the web_search). For a search from
+#     an earlier turn it only forbids inventing the results, and once
+#     OFFER_TTL_S has passed since the search (or none ran this process) it
+#     is gone.
+#   * Every offer a turn makes is recorded when its chain ends
+#     (_record_turn_offers). A later turn's "Also, …" / "Incidentally, …"
+#     aside that repeats one is not spoken (_drop_stale_offer_asides); the
+#     rest of the reply is. The prompt's adjacent-fact rule says the same.
+OFFER_TTL_S = 600.0
+_last_web_search_at: list = [0.0]       # time.time() of the last web_search
+_SEARCH_GUARD_OPEN = (
+    "IMPORTANT: a web search was just fired but the results have "
+    "not been read. Do NOT fabricate or claim source attributions. "
+    "Acknowledge the search was opened in the browser and offer to "
+    "read the results via see_screen.\n\n"
+)
+_SEARCH_GUARD_CLOSED = (
+    "IMPORTANT: a web search ran earlier but its results were never read. "
+    "Do NOT fabricate or claim what it found. That offer is closed: do not "
+    "bring the search up again unless sir asks about it.\n\n"
+)
+
+
+def _note_web_search_ran(name, result) -> None:
+    """Stamp _last_web_search_at when a web_search (or an alias) succeeded.
+    Never raises."""
+    try:
+        if (_once_per_turn_kind(name) == "web_search"
+                and not _action_result_failed(result)):
+            _last_web_search_at[0] = time.time()
+    except Exception:
+        pass
+
+
+def _unread_search_guard() -> str:
+    """The guard text for a web_search in history that no see_screen read:
+    the open-chain text while this turn ran the search, the closed text for
+    an earlier turn's search younger than OFFER_TTL_S, else "". Never
+    raises."""
+    try:
+        if any(_once_per_turn_kind(n) == "web_search"
+               for n in _turn_actions_ran()):
+            return _SEARCH_GUARD_OPEN
+        at = float(_last_web_search_at[0] or 0.0)
+        if at and time.time() - at < OFFER_TTL_S:
+            return _SEARCH_GUARD_CLOSED
+    except Exception:
+        pass
+    return ""
+
+
 def _local_chat_prompt(system: str, messages: list) -> tuple:
     """The local call's final (system prompt, messages): the cheatsheet swap,
     the web-search anti-fabrication guard and the _LOCAL_MODE_DIRECTIVE tail.
@@ -19001,13 +19061,11 @@ def _local_chat_prompt(system: str, messages: list) -> tuple:
                 last_search_idx = i
             if "[ACTION: see_screen" in content:
                 last_see_idx = i
+        _search_guard = ""
         if last_search_idx >= 0 and last_see_idx <= last_search_idx:
-            _search_guard = (
-                "IMPORTANT: a web search was just fired but the results have "
-                "not been read. Do NOT fabricate or claim source attributions. "
-                "Acknowledge the search was opened in the browser and offer to "
-                "read the results via see_screen.\n\n"
-            )
+            # Turn- and age-aware since 2026-10-01 - see _unread_search_guard.
+            _search_guard = _unread_search_guard()
+        if _search_guard:
             if _STABLE_LOCAL_PREFIX:
                 # Under the cache-stable layout this must NOT go on the front
                 # of the system prompt: a per-turn prepend moves the divergence
@@ -31616,6 +31674,96 @@ def _chain_close_out_line(*, cut: str, rounds: int, spoke_substance: bool,
         return ""
 
 
+_OFFER_LEDGER_MAX = 16
+_OFFER_LEDGER_KEEP_S = 2 * 3600.0
+_offer_ledger: list = []     # {"words": frozenset, "at": time.time()}
+_OFFER_MARK_RE = re.compile(
+    r"\b(?:shall\s+i|should\s+i|would\s+you\s+like|want\s+me\s+to|"
+    r"do\s+you\s+want|if\s+you'?d\s+like)\b|\?", re.IGNORECASE)
+_ASIDE_OPENER_RE = re.compile(
+    r"^(?:also|incidentally|for\s+what\s+it'?s\s+worth|by\s+the\s+way|"
+    r"oh,?\s+and|and\s+also)\b", re.IGNORECASE)
+_OFFER_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+_LEADING_BRACKET_TAGS_RE = re.compile(r"^(?:\s*\[[^\]\n]*\])+\s*")
+_OFFER_STOPWORDS = frozenset({
+    "also", "incidentally", "worth", "what", "about", "shall", "should",
+    "would", "like", "want", "your", "yours", "them", "they", "those",
+    "these", "that", "this", "with", "have", "i've", "you'd", "you're",
+    "from", "into", "there", "their", "just", "sir", "well", "will", "then",
+    "some", "more", "still", "again", "please", "perhaps", "quite"})
+_STALE_OFFER_OVERLAP = 0.6
+
+
+def _offer_words(sentence) -> frozenset:
+    words = re.findall(r"[a-z']+", str(sentence or "").lower().replace("’", "'"))
+    return frozenset(w for w in words
+                     if len(w) >= 4 and w not in _OFFER_STOPWORDS)
+
+
+def _offer_sentences(text) -> list:
+    """The offer / question sentences of one reply, tokens and tags removed."""
+    prose = re.sub(r"\[[^\]\n]*\]", " ", _ACTION_RE.sub(" ", str(text or "")))
+    return [s.strip() for s in _OFFER_SENTENCE_SPLIT_RE.split(prose)
+            if s.strip() and _OFFER_MARK_RE.search(s)]
+
+
+def _record_turn_offers(texts) -> None:
+    """Record the offers in a finished turn's replies (``texts``: the first
+    reply and every follow-up, as the model wrote them). Ages out entries
+    older than _OFFER_LEDGER_KEEP_S and keeps the newest _OFFER_LEDGER_MAX.
+    Never raises."""
+    try:
+        now = time.time()
+        _offer_ledger[:] = [e for e in _offer_ledger
+                            if now - float(e.get("at", 0.0)) < _OFFER_LEDGER_KEEP_S]
+        for text in texts or ():
+            for sentence in _offer_sentences(text):
+                words = _offer_words(sentence)
+                if len(words) >= 2:
+                    _offer_ledger.append({"words": words, "at": now})
+        del _offer_ledger[:-_OFFER_LEDGER_MAX]
+    except Exception:
+        pass
+
+
+def _repeats_closed_offer(words) -> bool:
+    try:
+        for entry in _offer_ledger:
+            old = entry.get("words") or frozenset()
+            if words and old and (len(words & old) / min(len(words), len(old))
+                                  >= _STALE_OFFER_OVERLAP):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _drop_stale_offer_asides(text):
+    """``text`` (about to be spoken) without any "Also, …" / "Incidentally,
+    …" aside that offers again what an EARLIER turn offered (the ledger only
+    holds offers of finished turns). Other sentences, new offers and a direct
+    answer about the old offer are kept. Never raises."""
+    try:
+        if not text or not _offer_ledger:
+            return text
+        kept, dropped = [], []
+        for piece in _OFFER_SENTENCE_SPLIT_RE.split(str(text)):
+            body = _LEADING_BRACKET_TAGS_RE.sub("", piece).strip()
+            if (body and _ASIDE_OPENER_RE.match(body)
+                    and _OFFER_MARK_RE.search(body)
+                    and _repeats_closed_offer(_offer_words(body))):
+                dropped.append(body)
+                continue
+            kept.append(piece)
+        if not dropped:
+            return text
+        print(f"  [stale-offer] not repeating an earlier turn's offer: "
+              f"{dropped[0][:90]!r}")
+        return " ".join(p.strip() for p in kept if p.strip())
+    except Exception:
+        return text
+
+
 def _note_once_per_turn_ran(name, arg, result, ran_here) -> None:
     """Record a successful web_search / open_url of this reply into
     ``ran_here`` (see _once_per_turn_refusal). Never raises."""
@@ -31908,6 +32056,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             # dispatch; failures are not recorded).
             _note_turn_action_ran(name, res)
             _note_once_per_turn_ran(name, arg, res, _once_ran_here)
+            _note_web_search_ran(name, res)
             record_session_action(name, arg)
             # Replay-last-action history. Skip when the replay handler itself
             # is the action so the deque continues to point at the real target.
@@ -37808,6 +37957,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         spoken_text = _apply_quip_layer(spoken_text, action_results)
     # Honest close-out bookkeeping (NEW #6) - see _chain_close_out_line.
     _spoke_substance = False
+    spoken_text = _drop_stale_offer_asides(spoken_text)
     if spoken_text and not _barged:
         _speak(spoken_text)
         _spoke_substance = _says_something(spoken_text)
@@ -37857,6 +38007,9 @@ def _run_llm_dispatch_body(text: str) -> str:
     if _self_voiced_only:
         current_results = []
     _spoke_substance = _spoke_substance or bool(_spoke_verbatim)
+    # Every reply of this turn as the model wrote it - their offers are
+    # recorded (closed) when the chain ends; see _record_turn_offers.
+    _chain_texts = [reply]
     # Why the chain stopped with results still unreported ("" = it did not)
     # and how many follow-up rounds ran.
     _chain_cut = ""
@@ -37932,6 +38085,8 @@ def _run_llm_dispatch_body(text: str) -> str:
         _tt("followup_round")
         followup = get_followup_response(informative)
         _followup_rounds += 1
+        if followup:
+            _chain_texts.append(followup)
         if not followup:
             break
         print(f"  JARVIS: {followup}")
@@ -37960,6 +38115,7 @@ def _run_llm_dispatch_body(text: str) -> str:
             _barged = _tts_interrupt_seq[0] != _barge_seq0
         except Exception:
             pass
+        f_spoken = _drop_stale_offer_asides(f_spoken)
         if f_spoken and not _barged:
             _speak(f_spoken)
             _spoke_substance = _spoke_substance or _says_something(f_spoken)
@@ -37994,6 +38150,9 @@ def _run_llm_dispatch_body(text: str) -> str:
                                          "content": _close})
         except Exception as _co_err:
             print(f"  [close-out] could not speak it: {_co_err}")
+    # The chain is over: its offers are closed (NEW #13) - a later turn's
+    # "Also, …" aside that repeats one is not spoken.
+    _record_turn_offers(_chain_texts)
     # TRIM after the follow-up chain (2026-07-07 bug-hunt, MED). Each depth
     # iteration appends an assistant message but _call_llm only trims ONCE,
     # BEFORE this loop runs — so a multi-step chain (depth cap 8, agent mode 24)

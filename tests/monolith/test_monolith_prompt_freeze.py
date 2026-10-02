@@ -660,10 +660,15 @@ class ReprimePayloadTests(_Base):
         self.assertNotIn("t-u0", [m.get("content") for m in prime["messages"]])
 
     def test_web_search_guard_does_not_break_the_match(self):
+        # A RECENT search, so the guard is really in both payloads (NEW #13:
+        # it expires OFFER_TTL_S after the search).
+        self._p(self.bc, "_last_web_search_at", [time.time()])
         hist = [{"role": "user", "content": "search for otters"},
                 {"role": "assistant",
                  "content": "[ACTION: web_search, otters] Searching, sir."}]
-        self._assert_prime_matches_next_turn(hist, "what did it find")
+        _prime, real = self._assert_prime_matches_next_turn(
+            hist, "what did it find")
+        self.assertIn("IMPORTANT: a web search", real["messages"][-1]["content"])
 
     def test_no_payload_without_the_stable_layout(self):
         self._p(self.bc, "_STABLE_LOCAL_PREFIX", False)
