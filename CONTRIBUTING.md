@@ -43,7 +43,7 @@ python tools/run_tests.py <name>      # one file, e.g. `timer` or `skills.test_s
 python tools/run_tests.py -v          # verbose
 python tools/run_coverage.py          # coverage over core/ + skills/ + tools/
 python tools/audit_codebase.py        # static auditor — LOCAL only, must report 0 findings
-python -m pyflakes tests              # lint the test code
+python -m pyflakes tests core skills tools adapters hud   # lint (what CI lints)
 python tools/check_no_pii.py          # leak gate — no owner PII / secrets tracked
 ```
 
@@ -73,6 +73,10 @@ function. It's auto-loaded at boot. See [`skills/_example_skill.py`](skills/_exa
 for the canonical template. The contract:
 
 ```python
+# Injected by the loader before this file runs; this line keeps the injected
+# dict and gives pyflakes (which CI runs over skills/) a definition to see.
+skill_utils = globals().get("skill_utils", {})
+
 def my_action(arg: str) -> str:
     # Do something; return a short string JARVIS will speak.
     skill_utils["open_url"]("https://example.com")   # injected helpers
@@ -99,7 +103,7 @@ and mock external I/O; assert on real behaviour, not just types.
 Run the gates and keep them green:
 
 ```powershell
-python tools/run_tests.py && python tools/audit_codebase.py && python -m pyflakes tests && python tools/check_no_pii.py
+python tools/run_tests.py && python tools/audit_codebase.py && python -m pyflakes tests core skills tools adapters hud && python tools/check_no_pii.py
 ```
 
 - Don't commit secrets or personal data — `check_no_pii.py` is the gate.

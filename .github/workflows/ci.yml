@@ -7,9 +7,9 @@ name: CI
 #     (tests/_skill_harness.load_skill_isolated raises unittest.SkipTest),
 #   * the full end-to-end pipeline is validated separately, locally, by
 #     tools/staging_integration.py (NOT run here — it needs a real boot + key).
-# What this gate proves on every push/PR: the tree compiles, the test code is
-# lint-clean, the unit suite passes, the codebase auditor is clean, and unit
-# coverage holds above the floor.
+# What this gate proves on every push/PR: the tree compiles, the test code and
+# the light-tier packages are lint-clean, the unit suite passes, the codebase
+# auditor is clean, and unit coverage holds above the floor.
 
 on:
   push:
@@ -43,8 +43,14 @@ jobs:
       - name: Syntax sweep (compileall)
         run: python -m compileall -q core skills tools tests adapters hud
 
-      - name: Lint test code (pyflakes)
-        run: python -m pyflakes tests
+      - name: Lint (pyflakes)
+        # Widened 2026-10-02 from tests/ alone to every light-tier package, so
+        # an undefined name (a NameError waiting for its code path) fails CI
+        # instead of the owner's next voice turn. bobert_companion.py is not
+        # linted yet: it gets added once its own findings are cleared. Keep
+        # tools/run_tests_ci_sim.py's _PYFLAKES_DIRS in lockstep (a test pins
+        # the two together).
+        run: python -m pyflakes tests core skills tools adapters hud
 
       - name: PII / secret leak gate
         run: python tools/check_no_pii.py

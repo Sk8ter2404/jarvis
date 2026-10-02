@@ -15,6 +15,10 @@ _OffMainMonolithImportTripwire fails a ci-sim run when any thread but the main
 one freshly imports bobert_companion — the deterministic precondition of the
 v2.0.128 race (a leaked poller re-running the always-failing monolith import).
 Driven here through find_spec() directly: nothing is really imported.
+
+The pyflakes gate (2026-10-02) lints the folders ci.yml lints, pinned to the
+workflow's own pyflakes line, and skips git-ignored private files that CI's
+fresh checkout never holds.
 stdlib unittest only; nothing is run.
 """
 from __future__ import annotations
@@ -27,6 +31,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -137,6 +142,100 @@ class OffMainMonolithImportTripwireTests(unittest.TestCase):
                         body.index(".discover("))
         self.assertIn("tripwire.report()", body)
         self.assertIn("and trip_ok", body)
+
+
+def _write(root: str, rel: str) -> None:
+    path = os.path.join(root, *rel.split("/"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("x = 1\n")
+
+
+class PyflakesGateTests(unittest.TestCase):
+    """The pyflakes gate (widened past tests/ on 2026-10-02): ci-sim lints the
+    same folders as ci.yml, and only what CI's fresh checkout would hold."""
+
+    def _workflow_pyflakes_args(self) -> list[str]:
+        with open(os.path.join(_ROOT, ".github", "workflows", "ci.yml"),
+                  encoding="utf-8") as f:
+            runs = [ln.strip() for ln in f
+                    if ln.strip().startswith("run:") and "-m pyflakes" in ln]
+        self.assertEqual(len(runs), 1, f"expected ONE pyflakes step: {runs}")
+        return runs[0].split("-m pyflakes", 1)[1].split()
+
+    def test_folders_match_the_workflow_step(self):
+        self.assertEqual(list(cs._PYFLAKES_DIRS), self._workflow_pyflakes_args(),
+                         "ci-sim and ci.yml lint different folders")
+
+    def test_the_gate_runs_those_folders(self):
+        gates = dict(cs._CI_GATES)
+        self.assertEqual(gates["pyflakes"],
+                         ["-m", "pyflakes", *cs._PYFLAKES_DIRS])
+
+    def test_every_lint_target_exists(self):
+        for d in cs._PYFLAKES_DIRS:
+            self.assertTrue(os.path.exists(os.path.join(_ROOT, d)), d)
+
+    def _tree(self) -> str:
+        root = tempfile.mkdtemp(prefix="cisim_lint_")
+        self.addCleanup(shutil.rmtree, root, True)
+        for rel in ("tests/test_a.py", "core/a.py", "skills/public.py",
+                    "skills/private.py", "skills/pkg/inner.py",
+                    "skills/notes.md"):
+            _write(root, rel)
+        return root
+
+    def test_no_ignored_files_means_the_ci_argv_unchanged(self):
+        root = self._tree()
+        dirs = ("tests", "core", "skills")
+        self.assertEqual(cs._lint_targets(root, dirs, []), list(dirs))
+
+    def test_a_folder_with_an_ignored_file_is_expanded_without_it(self):
+        root = self._tree()
+        got = cs._lint_targets(root, ("tests", "core", "skills"),
+                               ["skills/private.py"])
+        self.assertEqual(got[:2], ["tests", "core"],
+                         "folders without private files stay whole")
+        norm = [p.replace(os.sep, "/") for p in got[2:]]
+        self.assertEqual(norm, ["skills/public.py", "skills/pkg/inner.py"])
+
+    def test_gate_argv_leaves_other_gates_alone(self):
+        argv = ["tools/check_no_pii.py"]
+        with mock.patch.object(cs, "_git_ignored_py",
+                               side_effect=AssertionError("not consulted")):
+            self.assertIs(cs._gate_argv(_ROOT, "check_no_pii", argv), argv)
+
+    def test_gate_argv_is_the_ci_argv_on_a_clean_checkout(self):
+        argv = dict(cs._CI_GATES)["pyflakes"]
+        with mock.patch.object(cs, "_git_ignored_py", return_value=[]):
+            self.assertIs(cs._gate_argv(_ROOT, "pyflakes", argv), argv)
+
+    def test_gate_argv_skips_a_private_file(self):
+        root = self._tree()
+        with mock.patch.object(cs, "_PYFLAKES_DIRS", ("core", "skills")), \
+                mock.patch.object(cs, "_git_ignored_py",
+                                  return_value=["skills/private.py"]):
+            got = cs._gate_argv(root, "pyflakes", ["unused"])
+        self.assertEqual(got[:3], ["-m", "pyflakes", "core"])
+        self.assertNotIn("private.py", " ".join(got))
+
+    def test_git_unavailable_means_no_ignored_files(self):
+        with mock.patch.object(cs.subprocess, "run",
+                               side_effect=OSError("no git")):
+            self.assertEqual(cs._git_ignored_py(_ROOT, ("skills",)), [])
+
+    def test_git_failure_means_no_ignored_files(self):
+        done = mock.Mock(returncode=128, stdout="skills/x.py\n")
+        with mock.patch.object(cs.subprocess, "run", return_value=done):
+            self.assertEqual(cs._git_ignored_py(_ROOT, ("skills",)), [])
+
+    def test_only_python_files_are_reported(self):
+        done = mock.Mock(returncode=0,
+                         stdout="skills/x.py\nskills/__pycache__/x.pyc\n"
+                                "tools/notes.txt\n")
+        with mock.patch.object(cs.subprocess, "run", return_value=done):
+            self.assertEqual(cs._git_ignored_py(_ROOT, ("skills", "tools")),
+                             ["skills/x.py"])
 
 
 if __name__ == "__main__":

@@ -205,6 +205,11 @@ def _make_windows_absent() -> None:
             del sys.modules[mod]
 
 
+# The folders ci.yml's "Lint (pyflakes)" step lints (widened from tests/ alone
+# on 2026-10-02). tests/test_run_tests_ci_sim.py pins this tuple to the
+# workflow's own pyflakes line, so the two cannot drift apart silently.
+_PYFLAKES_DIRS = ("tests", "core", "skills", "tools", "adapters", "hud")
+
 # The non-test CI gate steps from .github/workflows/ci.yml. Run as clean
 # subprocesses (exactly how CI runs each step) BEFORE the in-process platform
 # flip, so a lint / syntax / PII regression is caught locally instead of on the
@@ -212,9 +217,63 @@ def _make_windows_absent() -> None:
 _CI_GATES = (
     ("compileall", ["-m", "compileall", "-q",
                     "core", "skills", "tools", "tests", "adapters", "hud"]),
-    ("pyflakes tests", ["-m", "pyflakes", "tests"]),
+    ("pyflakes", ["-m", "pyflakes", *_PYFLAKES_DIRS]),
     ("check_no_pii", ["tools/check_no_pii.py"]),
 )
+
+
+def _git_ignored_py(root: str, dirs) -> list[str]:
+    """Git-IGNORED ``.py`` files under ``dirs`` (paths relative to ``root``), or
+    [] when git cannot say (not a checkout, git missing, timeout)."""
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--others", "--ignored", "--exclude-standard",
+             "--", *dirs],
+            cwd=root, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    return [p for p in proc.stdout.splitlines() if p.endswith(".py")]
+
+
+def _lint_targets(root: str, dirs, ignored) -> list[str]:
+    """What to hand pyflakes so it sees what CI's FRESH CHECKOUT sees.
+
+    CI lints a clone, which holds only tracked files. The owner's tree also
+    holds git-ignored private skills and tools/*_local.py that CI never lints,
+    so linting the bare folders here would fail the gate on files CI cannot
+    see (2026-10-02, when the gate grew past tests/). A folder with no ignored
+    .py file is passed whole, exactly as ci.yml passes it; a folder that has
+    one is expanded to its other .py files, which keeps the command line short
+    (only the folders holding private files expand)."""
+    skip = {os.path.normcase(os.path.normpath(p)) for p in ignored}
+    targets: list[str] = []
+    for d in dirs:
+        prefix = os.path.normcase(os.path.normpath(d)) + os.sep
+        if not any(p.startswith(prefix) for p in skip):
+            targets.append(d)
+            continue
+        for dirpath, dirnames, filenames in os.walk(os.path.join(root, d)):
+            dirnames.sort()
+            for fn in sorted(filenames):
+                if not fn.endswith(".py"):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                if os.path.normcase(rel) not in skip:
+                    targets.append(rel)
+    return targets
+
+
+def _gate_argv(root: str, label: str, argv: list[str]) -> list[str]:
+    """The argv a gate really runs with. Only the pyflakes gate differs from
+    _CI_GATES, and only in a tree that holds git-ignored .py files."""
+    if label != "pyflakes":
+        return argv
+    ignored = _git_ignored_py(root, _PYFLAKES_DIRS)
+    if not ignored:
+        return argv
+    return ["-m", "pyflakes", *_lint_targets(root, _PYFLAKES_DIRS, ignored)]
 
 
 def _redirect_lock_dir_to_throwaway() -> None:
@@ -245,6 +304,7 @@ def _run_ci_gates(root: str) -> bool:
     print("--- CI gate steps (mirror of ci.yml non-test steps) ---")
     for label, argv in _CI_GATES:
         try:
+            argv = _gate_argv(root, label, argv)
             proc = subprocess.run([sys.executable, *argv], cwd=root,
                                   capture_output=True, text=True)
         except Exception as exc:  # pragma: no cover - defensive
