@@ -787,8 +787,21 @@ class BambuHookTests(unittest.TestCase):
 
 _CONFIRM_ON = {"PHONE_PING_CONFIRM": True}
 
+def _shift_monotonic(tc, seconds=30 * 86400.0):
+    """Shift time.monotonic() forward for one test. monotonic() counts from boot,
+    so "N seconds ago" (monotonic() - N) is negative on a freshly booted CI
+    runner and phone_ping rightly reads it as "never" (v2.0.171 GitHub CI: 4
+    tests red with owner_at=-421.1 and idle=207 s of uptime)."""
+    real = pp.time.monotonic
+    patcher = mock.patch.object(pp.time, "monotonic", lambda: real() + seconds)
+    patcher.start()
+    tc.addCleanup(patcher.stop)
+
 
 class ConfirmTests(unittest.TestCase):
+    def setUp(self):
+        _shift_monotonic(self)
+
     def test_pings_once_after_n_minutes_while_away(self):
         item = {"key": "queue:1.000", "age_s": 60.0,
                 "text": pp.confirm_text(["reset_memory"], lapsed=True)}
@@ -919,6 +932,9 @@ class ConfirmTests(unittest.TestCase):
 
 
 class LiveSeamTests(unittest.TestCase):
+    def setUp(self):
+        _shift_monotonic(self)
+
     def test_owner_idle_from_the_monolith_stamp(self):
         bc = types.ModuleType("bobert_companion")
         bc._last_owner_turn_at = [pp.time.monotonic() - 125.0]
