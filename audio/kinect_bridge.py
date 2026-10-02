@@ -401,7 +401,38 @@ _WEDGED_CACHE_SEC = 90.0
 # (single-consumer) sensor with concurrent PyKinectRuntime() opens. The publish of
 # the winning runtime still happens under _lock; this only serialises the slow
 # verify so the loser waits for the winner instead of racing it (M2).
+#
+# reset_if_body_stale HOLDS IT TOO, from dropping a dead runtime until that
+# runtime is closed (2026-10-02). Every PyKinectRuntime binds the ONE
+# process-wide sensor (GetDefaultKinectSensor) and its close() calls
+# IKinectSensor::Close() on it, which is NOT reference-counted: measured
+# 2026-10-02 16:34 (scratchpad kinect_lab/shared_close_probe.py), two runtimes
+# held the same sensor pointer and closing the first stopped the second's
+# colour, body and depth frames at once (30/30/30 frames in the second before,
+# 0/0/0 in the 2 s after). The reset used to null the cell, release its lock,
+# talk to the camera gate and only THEN close the old handle - so a 30 Hz
+# poller could open a fresh runtime in between and have it killed by our own
+# close, a JARVIS-made "stream died on open".
 _open_attempt_lock = threading.Lock()
+# What a caller is told while reset_if_body_stale holds the open lock. NOT a
+# failed open: it earns no negative-cache cooldown (see _publish_open_failure),
+# so the reopen follows the moment the old handle is closed. Carries the
+# "open already in progress" marker so the dashboard's Kinect tile reads it as
+# an open in flight, not a failure (tools/web_interface._KINECT_OPEN_IN_PROGRESS).
+_RESET_IN_PROGRESS = ("Kinect open already in progress - the stale-stream "
+                      "reset is closing the old runtime")
+# True only while reset_if_body_stale holds the open lock. A flag of its own,
+# not the shared error cell: a torn-down runtime must still read exactly as it
+# did (open False, no recorded error) once the reset is over - the
+# dashboard's not_open_no_error rung depends on it.
+_reset_in_progress = [False]
+# Failed opens that TOUCHED the sensor (its constructor raised, or the stream
+# verify gauntlet got no frames) used to be silent - only the negative cache
+# remembered them, so a log could not tell "nothing opened it" from "an open
+# failed" (2026-10-02 diagnosis). Logged once per distinct reason per
+# _OPEN_FAIL_SAY_AGAIN_S.
+_OPEN_FAIL_SAY_AGAIN_S = 600.0
+_open_fail_said: dict = {}         # reason -> monotonic when it was logged
 
 
 # ─── PER-BODY FIELDS THE BRIDGE USED TO THROW AWAY (2026-09-04 capability audit)
@@ -602,6 +633,7 @@ def _publish_runtime(rt) -> Any:
             # instance's older perf_counter stamps (perf_counter is process-wide,
             # so cross-instance comparisons are meaningless).
             _last_depth_frame_at[0] = now0
+            _clear_link_watch()
             for _attr, _cell in (("_last_color_frame_time", _color_time_seen),
                                  ("_last_body_frame_time", _body_time_seen),
                                  ("_last_depth_frame_time", _depth_time_seen)):
@@ -667,6 +699,8 @@ def _open_runtime_locked():
         rt0 = _runtime[0]
         if rt0 is not None:
             return rt0, None
+        if _reset_in_progress[0]:
+            return None, _RESET_IN_PROGRESS
         return None, (_open_error[0] or "Kinect open already in progress")
     try:
         rt0 = _runtime[0]
@@ -768,6 +802,11 @@ def _publish_open_failure(err: str) -> None:
     land back on the voice loop. Disabled-by-config is cheap to re-check, so it
     earns no cooldown; only a real failed open (import/open error, or the
     expensive wedged no-frames verify) does. 2026-07-14 bug-hunt."""
+    if err.startswith(_RESET_IN_PROGRESS):
+        # Not a failure: the stale-stream reset is closing the old handle
+        # (it holds the open lock for that). Nothing is latched and nothing
+        # cooled down - the next ask reopens at once.
+        return
     _open_error[0] = err
     if "disabled" in err:
         return
@@ -783,6 +822,29 @@ def _publish_open_failure(err: str) -> None:
         return
     cool = _WEDGED_CACHE_SEC if "no frames" in err else _NEGATIVE_CACHE_SEC
     _negative_until[0] = time.monotonic() + cool
+    if err.startswith(_SENSOR_OPEN_FAILURES):
+        _say_open_failure(err, cool)
+
+
+# The two failures that mean an open REALLY touched the sensor (see the
+# returns in _open_runtime_locked). Import / disabled / gate / service / "in
+# progress" never reached it.
+_SENSOR_OPEN_FAILURES = ("could not open Kinect sensor", "Kinect opened but")
+
+
+def _say_open_failure(err: str, cool: float) -> None:
+    """Log a failed sensor open once per reason per _OPEN_FAIL_SAY_AGAIN_S.
+    NEVER raises."""
+    try:
+        now = time.monotonic()
+        said = _open_fail_said.get(err)
+        if said is not None and 0.0 <= now - said < _OPEN_FAIL_SAY_AGAIN_S:
+            return
+        _open_fail_said[err] = now
+        print(f"  [kinect] open failed: {err} - not retrying for "
+              f"{cool:.0f}s{_ms()}")
+    except Exception:   # pragma: no cover - defensive: print on a closed stream
+        pass
 
 
 def available() -> tuple[bool, str]:
@@ -810,6 +872,8 @@ def available() -> tuple[bool, str]:
     # _WEDGED_CACHE_SEC here too, so an available() call can't stomp the 90 s
     # cooldown get_runtime() set down to 5 s. 2026-07-14 bug-hunt.
     _publish_open_failure(err or "Kinect unavailable")
+    if err and err.startswith(_RESET_IN_PROGRESS):
+        return False, err               # told, never latched (see above)
     return False, _open_error[0]
 
 
@@ -2329,6 +2393,115 @@ _body_pump_thread: list[Any] = [None]
 _body_pump_stop = threading.Event()
 _body_pump_lock = threading.Lock()
 
+# ─── REAL frame loss, and whether the sensor left the bus (2026-10-02) ────
+# THE MEASUREMENTS (scratchpad kinect_lab/, 2026-10-02, counting frames only):
+# on the owner's desk the Kinect v2 drops off USB (Kernel-PnP 1010 "surprise
+# removed ... missing on the bus") about 7.5 s after ANY process switches the
+# sensor on - colour+depth+body, colour only, or Open() with no reader at all -
+# on a direct Intel root port as well as behind the onboard hub; never while
+# it is closed. It is back ~2 s later and, while the runtime stays open,
+# streams ~6 s and drops again every ~12 s. So the "dies on open" verdict was
+# REAL frame loss - but the bridge could not SAY so: its reset line only knew
+# that its own two clocks were stale, it told the gate the drop began when it
+# NOTICED (4 s late, so a stream that ran 6.3 s was logged as "died within
+# 10.3 s"), and nothing in the log separated "the device dropped off USB" from
+# "frames stopped while it stayed connected". A standalone test that counted
+# has_new_*_frame() polls (permanently True on this pykinect2 build) then
+# "streamed for 60 s" through five bus drops and sent the diagnosis back into
+# JARVIS.
+#
+# Now the reset needs the runtime's OWN arrival stamps (_last_*_frame_time,
+# advanced only by handle_*_arrived) to agree that no colour or body frame
+# arrived for BODY_STALE_RESET_SEC, reports the drop from the last real frame,
+# and says what the SDK saw: IKinectSensor::IsAvailable went False within
+# ~20 ms of each PnP removal and True again ~2 s later (16:36:12.811 removal ->
+# False at .832; 16:36:25.117 -> .132), so it is sampled while a stream is
+# quiet.
+_LINK_QUIET_SEC = 0.3              # sample the sensor once frames have been quiet this long
+_LINK_SAMPLE_SEC = 0.25            # ...at most this often (a COM property read)
+_LINK_MIN_SAMPLES = 3              # this many "available" reads = it stayed connected
+_link_lost_at = [0.0]              # monotonic: first "unavailable" read of this stall
+_link_samples = [0]                # sensor reads taken during this stall
+_link_sampled_at = [0.0]           # monotonic of the last read
+_lag_said_for: list[Any] = [None]  # id() of the runtime whose "bookkeeping lag" line was logged
+
+
+def _perf_now() -> float:
+    """pykinect2's clock (its time.clock is patched to perf_counter), so a
+    runtime's _last_*_frame_time can be aged. A function so tests can pin it."""
+    return time.perf_counter()
+
+
+def _runtime_frame_age(rt, attr: str, perf_now: float) -> Optional[float]:
+    """Seconds since ``rt``'s own frame thread last stamped ``attr`` (e.g.
+    _last_color_frame_time), or None when the runtime carries no usable stamp
+    (a test fake, a foreign build) - the caller then has only the bridge's own
+    clocks to go on. NEVER raises."""
+    try:
+        t = getattr(rt, attr, None)
+        if t is None or isinstance(t, bool):
+            return None
+        t = float(t)
+        if t != t:
+            return None
+        return perf_now - t
+    except Exception:
+        return None
+
+
+def _sensor_available(rt) -> Optional[bool]:
+    """The SDK's own answer to "is the sensor connected": IKinectSensor's
+    IsAvailable on the runtime's sensor. None when it cannot be asked (a
+    closed runtime has no _sensor, a fake has none, the read raised). NEVER
+    raises."""
+    try:
+        sensor = getattr(rt, "_sensor", None)
+        if sensor is None:
+            return None
+        v = sensor.IsAvailable
+        return v if isinstance(v, bool) else bool(v)
+    except Exception:
+        return None
+
+
+def _clear_link_watch() -> None:
+    """A real frame arrived, or a runtime was published or dropped: the next
+    stall starts with no evidence."""
+    _link_lost_at[0] = 0.0
+    _link_samples[0] = 0
+    _link_sampled_at[0] = 0.0
+
+
+def _watch_sensor_link(now: Optional[float] = None) -> None:
+    """While the open runtime's frames have been quiet for _LINK_QUIET_SEC,
+    ask the sensor whether it is still connected (at most every
+    _LINK_SAMPLE_SEC) and remember the first "no" of this stall, so the
+    stale reset can say whether the device dropped off USB. Never called
+    while frames flow, so a healthy stream costs nothing. Under _lock: close()
+    cannot release the sensor mid-read. NEVER raises."""
+    try:
+        if _runtime[0] is None:
+            return
+        now = time.monotonic() if now is None else now
+        last = max(_last_body_frame_at[0], _last_color_frame_at[0])
+        if last <= 0.0 or (now - last) < _LINK_QUIET_SEC:
+            return
+        if _link_sampled_at[0] and (now - _link_sampled_at[0]) < _LINK_SAMPLE_SEC:
+            return
+        with _lock:
+            rt = _runtime[0]
+            if rt is None:
+                return
+            _link_sampled_at[0] = now
+            avail = _sensor_available(rt)
+            if avail is None:
+                return
+            _link_samples[0] += 1
+            if avail is False and not _link_lost_at[0]:
+                _link_lost_at[0] = now
+    except Exception:   # pragma: no cover - defensive: odd cells / runtime
+        pass
+
 
 def _pump_is_alive() -> bool:
     """True iff the body pump thread exists and is running. A cheap read used by
@@ -2367,6 +2540,8 @@ def note_body_frame_seen(now: Optional[float] = None) -> None:
     Called by get_bodies() on a real frame AND by the pump, so a healthy stream
     keeps the clock current and never trips the stale-reset."""
     _last_body_frame_at[0] = time.monotonic() if now is None else now
+    if _link_samples[0] or _link_lost_at[0]:
+        _clear_link_watch()             # the stall (if any) is over
     _gate_note_frame()
 
 
@@ -2376,6 +2551,8 @@ def note_color_frame_seen(now: Optional[float] = None) -> None:
     tick, so a healthy color stream keeps this current and the stale-reset can tell
     "body quiet but color live" (a body dropout) from "the whole runtime is dead"."""
     _last_color_frame_at[0] = time.monotonic() if now is None else now
+    if _link_samples[0] or _link_lost_at[0]:
+        _clear_link_watch()             # the stall (if any) is over
     _gate_note_frame()
 
 
@@ -2436,55 +2613,149 @@ def reset_if_body_stale(now: Optional[float] = None) -> bool:
     pump re-primed body) but the preview's color often did not, so the skeleton
     froze then went dark. Requiring BOTH planes quiet means a body dropout whose
     color is still flowing NO LONGER kills the runtime, so the preview keeps
-    rendering; a genuinely dead sensor (no body AND no color) still resets."""
-    with _lock:
-        body_stale = _body_frame_is_stale(now)
-        color_stale = _color_frame_is_stale(now)
-        if not (body_stale and color_stale):
-            return False
-        rt = _runtime[0]
-        _runtime[0] = None
-        # Re-seed BOTH clocks so the freshly-reopened runtime gets a full window to
-        # start streaming before it could be judged stale again.
-        stamp = time.monotonic() if now is None else now
-        _last_body_frame_at[0] = stamp
-        _last_color_frame_at[0] = stamp
-        # Zero the per-stream seen-cells: the dead instance's frame-time stamps
-        # must not carry over to the reopened one (_publish_runtime re-seeds them
-        # from the fresh instance on the next successful open).
-        _color_time_seen[0] = 0.0
-        _body_time_seen[0] = 0.0
-        _depth_time_seen[0] = 0.0
-        _last_depth_frame_at[0] = stamp
-        print("  [kinect] body AND color streams stale > "
-              f"{BODY_STALE_RESET_SEC:.0f}s - resetting runtime to reopen a live "
-              f"stream{_ms()}")
-    # A sensor that WAS streaming just went quiet on both planes: that is a
-    # device DROP to the camera gate (one input to the USB-storm breaker), and
-    # the reopen the pump is about to try is a RECOVERY, which spends a backoff
-    # rung - so a sensor that keeps dying is reopened at 30/60/120/300/600 s,
-    # not every BODY_STALE_RESET_SEC. A sensor that dies within seconds of
-    # EVERY open (R11: it drops off USB as soon as it streams - measured
-    # 2026-09-29) is then put on the gate's slow dies-on-open retry (30 min,
-    # then hourly) and the owner is told once. Outside _lock: the gate may log.
-    _gate_call("unhold", _GATE_KEY, _GATE_COMPONENT)
-    _gate_call("note_drop", _GATE_KEY, _GATE_COMPONENT)
-    # We already nulled the cached cell under the lock; explicitly release the
-    # old handle (outside the lock) so the sensor frees promptly before the next
-    # get_runtime() reopens it. Same best-effort close idiom close() uses; older
-    # builds without .close() rely on __del__.
-    if rt is not None:
-        closer = getattr(rt, "close", None)
-        if callable(closer):
-            try:
-                closer()
-            except Exception:   # pragma: no cover - defensive: close on a half-dead runtime
-                pass
+    rendering; a genuinely dead sensor (no body AND no color) still resets.
+
+    ONLY ON REAL FRAME LOSS (2026-10-02). The bridge's two clocks say when it
+    last CONSUMED a frame; the runtime's own _last_*_frame_time stamps say when
+    one last ARRIVED. A reset - and the camera gate's "dies on open" verdict it
+    feeds - now needs both to agree. A runtime whose colour or body frames are
+    still arriving is left alone (logged once: that is a bookkeeping fault in
+    the bridge, not a dying sensor). Fakes and builds without the stamps fall
+    back to the bridge's clocks alone, as before.
+
+    THE OLD HANDLE IS CLOSED BEFORE ANYTHING CAN REOPEN (2026-10-02): the whole
+    drop -> tell the gate -> close runs under _open_attempt_lock, because
+    closing the old runtime closes the ONE shared sensor (see the lock's
+    comment). A caller that asks meanwhile is told _RESET_IN_PROGRESS (no
+    cooldown) or simply waits for the lock, then opens a sensor that is really
+    closed.
+
+    THE GATE IS TOLD THE TRUTH: the drop began at the last real frame (not
+    BODY_STALE_RESET_SEC later, when the bridge noticed), and whether the SDK
+    reported the sensor DISCONNECTED during the stall (see _watch_sensor_link)
+    - so its verdict says "drops off USB" only when the device really did."""
+    # Cheap lock-free pre-check: the pump calls this ~30 times a second.
+    if not (_body_frame_is_stale(now) and _color_frame_is_stale(now)):
+        return False
+    if not _open_attempt_lock.acquire(timeout=0.5):
+        # An open is in flight (so there is no published runtime to reset);
+        # the next tick looks again.
+        return False
+    try:
+        with _lock:
+            body_stale = _body_frame_is_stale(now)
+            color_stale = _color_frame_is_stale(now)
+            if not (body_stale and color_stale):
+                return False
+            rt = _runtime[0]
+            stamp = time.monotonic() if now is None else now
+            # REAL frame loss: the runtime's own arrival stamps must agree.
+            perf_now = _perf_now()
+            ages = [a for a in (
+                _runtime_frame_age(rt, "_last_color_frame_time", perf_now),
+                _runtime_frame_age(rt, "_last_body_frame_time", perf_now))
+                if a is not None]
+            if ages and min(ages) <= BODY_STALE_RESET_SEC:
+                if _lag_said_for[0] != id(rt):
+                    _lag_said_for[0] = id(rt)
+                    print(f"  [kinect] the bridge's frame clocks are stale but "
+                          f"the sensor is still delivering (newest frame "
+                          f"{max(0.0, min(ages)):.1f}s ago) - NOT resetting it; "
+                          f"that is a bridge bookkeeping fault, not a dying "
+                          f"sensor{_ms()}")
+                return False
+            # How long the stream has really been silent: since the bridge
+            # last consumed a REAL frame (the pump reads within ~33 ms of an
+            # arrival; measured to track the runtime's stamps within 0.07 s).
+            last_seen = max(_last_body_frame_at[0], _last_color_frame_at[0])
+            quiet_s = max(0.0, stamp - last_seen)
+            lost_at = _link_lost_at[0]
+            if lost_at:
+                off_bus: Optional[bool] = True
+                lost_after = max(0.0, lost_at - last_seen)
+            elif _link_samples[0] >= _LINK_MIN_SAMPLES:
+                off_bus, lost_after = False, 0.0
+            else:
+                off_bus, lost_after = None, 0.0
+            _clear_link_watch()
+            _runtime[0] = None
+            # Re-seed BOTH clocks so the freshly-reopened runtime gets a full window to
+            # start streaming before it could be judged stale again.
+            _last_body_frame_at[0] = stamp
+            _last_color_frame_at[0] = stamp
+            # Zero the per-stream seen-cells: the dead instance's frame-time stamps
+            # must not carry over to the reopened one (_publish_runtime re-seeds them
+            # from the fresh instance on the next successful open).
+            _color_time_seen[0] = 0.0
+            _body_time_seen[0] = 0.0
+            _depth_time_seen[0] = 0.0
+            _last_depth_frame_at[0] = stamp
+            # Anyone who asks while the old handle closes is told so - and is
+            # neither latched nor put on a cooldown (_publish_open_failure).
+            _reset_in_progress[0] = True
+            cause = f"no colour or body frame for {quiet_s:.1f}s"
+            if off_bus is True:
+                seen = (f"; the sensor dropped off USB - the Kinect runtime "
+                        f"reported it disconnected (first seen "
+                        f"{lost_after:.1f}s after its last frame)")
+            elif off_bus is False:
+                seen = ("; the sensor stayed connected - the Kinect runtime "
+                        "never reported it unavailable")
+            else:
+                seen = ""
+            print("  [kinect] body AND color streams stale > "
+                  f"{BODY_STALE_RESET_SEC:.0f}s - resetting runtime to reopen a live "
+                  f"stream ({cause}{seen}){_ms()}")
+        # A sensor that WAS streaming just went quiet on both planes: that is a
+        # device DROP to the camera gate (one input to the USB-storm breaker), and
+        # the reopen the pump is about to try is a RECOVERY, which spends a backoff
+        # rung - so a sensor that keeps dying is reopened at 30/60/120/300/600 s,
+        # not every BODY_STALE_RESET_SEC. A sensor that dies within seconds of
+        # EVERY open (R11; measured 2026-10-02: it drops off USB ~7.5 s after it
+        # is switched on, whatever reads it) is then put on the gate's slow
+        # dies-on-open retry (30 min, then hourly) and the owner is told once.
+        # Outside _lock: the gate may log.
+        _gate_call("unhold", _GATE_KEY, _GATE_COMPONENT)
+        _gate_note_drop(quiet_s, cause, off_bus)
+        # Release the old handle BEFORE the open lock: its close() closes the
+        # one shared sensor, so nothing may have opened a new runtime on it
+        # yet. Same best-effort close idiom close() uses; older builds without
+        # .close() rely on __del__.
+        if rt is not None:
+            closer = getattr(rt, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:   # pragma: no cover - defensive: close on a half-dead runtime
+                    pass
+    finally:
+        _reset_in_progress[0] = False
+        _open_attempt_lock.release()
     # The reopen is driven by the pump; if the pump thread has died, the reset we
     # just performed would never be followed by a reopen and the sensor would stay
     # dark. Make sure the pump is alive so the next tick reopens the live stream (L2).
     _ensure_pump_alive()
     return True
+
+
+def _gate_note_drop(quiet_s: float, cause: str,
+                    off_bus: Optional[bool]) -> None:
+    """Report the stale-stream drop to the camera gate: when it began (seconds
+    before now - the gate keeps its own clock), what was seen, and whether the
+    SDK said the sensor left the bus. A gate without those keywords still gets
+    the drop. NEVER raises."""
+    g = _open_gate[0]
+    if g is None:
+        return
+    try:
+        g.note_drop(_GATE_KEY, _GATE_COMPONENT, onset_ago=float(quiet_s),
+                    cause=cause, off_bus=off_bus)
+        return
+    except TypeError:
+        pass
+    except Exception:
+        return
+    _gate_call("note_drop", _GATE_KEY, _GATE_COMPONENT)
 
 
 def _pump_tick() -> None:
@@ -2514,6 +2785,9 @@ def _pump_tick() -> None:
     # reopened runtime gets color re-primed immediately rather than staying cold
     # (which is what made get_color_bgr(require_new=False) keep returning None).
     _prime_color_frame()
+    # While the stream is quiet, ask the SDK whether the sensor is still
+    # connected, so a reset can say "it dropped off USB" only when it did.
+    _watch_sensor_link()
     # Layer 2: reset a runtime ONLY when BOTH body AND color have gone quiet (a
     # body-only dropout whose color is fine must not tear down the preview).
     try:
@@ -2636,6 +2910,7 @@ def close(final: bool = False) -> None:
     with _lock:
         rt = _runtime[0]
         _runtime[0] = None
+        _clear_link_watch()
         if rt is None:
             return
         # PyKinectRuntime exposes .close() in recent builds; older ones rely on

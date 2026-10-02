@@ -260,9 +260,9 @@ class KinectOpensGoThroughTheGateTests(unittest.TestCase):
         self.assertEqual(len(self.opens), 3)
         self.assertEqual(
             spoken,
-            ["The Kinect drops off USB the moment it starts streaming, sir. "
-             "That is usually its power supply. I'll only retry it every "
-             "thirty minutes."])
+            ["The Kinect's stream keeps dying a few seconds after every "
+             "start, sir. If it's dropping off USB, check its power supply. "
+             "I'll only retry it every thirty minutes."])
         # The owner has seen to its power: the lift reaches the sensor at the
         # bridge's next re-ask (at most a minute away), not in 30 minutes.
         self.assertLessEqual(kb._gate_hold_until[0] - kb.time.monotonic(),

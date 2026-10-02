@@ -84,7 +84,7 @@ class ReplyNamesTheHoldTests(_LiftBase):
         said = self._say("kinect")
         self.assertIn("the Kinect is back in use", said)
         self.assertIn("slow retry", said)
-        self.assertIn("dropping off USB the moment it started streaming", said)
+        self.assertIn("dropping out a few seconds after each start", said)
         self.assertIn("every thirty minutes", said)
         self.assertNotIn("hub drops out", said)
         self.assertFalse(self.g.dies_on_open("kinect"))

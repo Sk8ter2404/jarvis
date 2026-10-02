@@ -154,6 +154,20 @@ USB re-enumeration and an audio device-list change for nothing.
              retry), and the warning is said at most once per
              DIES_ON_OPEN_SAY_AGAIN_S. Needs a wall clock (the default).
 
+  measured (2026-10-02)  "within about a second" above was the stale check's
+             view. Counting frames from the runtime's own arrival stamps, the
+             Kinect streams normally for ~6 s and leaves the bus ~7.5 s after
+             it is switched on - in any process, with colour only or with no
+             reader at all, on a direct root port as well as behind the
+             onboard hub - and never while it is closed. So the verdict
+             is worded by what the drop SHOWED (note_drop's ``off_bus``; see
+             dies_on_open_finding): "drops off USB" + check the power supply
+             only when the device was seen leaving the bus, "stays connected"
+             when it was seen not to. The bridge now reports the drop from the
+             LAST REAL FRAME (``onset_ago``), so "died 6.3s after it opened"
+             is the stream's real life, not that plus the 4 s it took to
+             notice.
+
 WHAT IT DELIBERATELY DOES NOT DO: it never closes a stream, never reads a
 frame, never touches a device. It is pure bookkeeping under one lock, with an
 injectable clock, so every rule here is unit-testable on a runner with no
@@ -183,6 +197,7 @@ __all__ = [
     "DIES_ON_OPEN_RETRY_S", "DIES_ON_OPEN_RETRY_MAX_S",
     "DIES_ON_OPEN_SAY_AGAIN_S",
     "LIFT_QUARANTINE", "LIFT_SLOW_RETRY",
+    "dies_on_open_finding", "dies_on_open_spoken",
 ]
 
 # ── the numbers (the three owner knobs are in core/config.py) ──────────────
@@ -225,8 +240,9 @@ CULPRIT_WINDOW_S = 5.0
 CULPRIT_THRESHOLD = 2
 CULPRIT_MEMORY_S = 3600.0
 # DIES ON OPEN (R11): a full drop that begins within this long of the device's
-# last successful open means the stream died on arrival (the live case: gone
-# within ~1 s, reported by the stale-stream check ~4-5 s after the open)...
+# last successful open means the stream died on arrival (the live case,
+# measured 2026-10-02: ~6 s of frames, off the bus ~7.5 s after the sensor is
+# switched on, noticed by the stale-stream check 4 s after the last frame)...
 DIES_ON_OPEN_WINDOW_S = 15.0
 # ...this many of them in a row, with no normal stream in between...
 DIES_ON_OPEN_COUNT = 3
@@ -322,6 +338,53 @@ def _fmt_s(seconds: float) -> str:
     if s >= 90.0:
         return f"{s / 60.0:.0f} min"
     return f"{s:.0f}s"
+
+
+# ── the dies-on-open verdict, worded by what the drop SHOWED (2026-10-02) ──
+# The old verdict said every such device "drops off as soon as it starts
+# streaming (check its power supply)" whatever was seen. Measured 2026-10-02:
+# the Kinect streams normally for ~6 s and leaves the bus ~7.5 s after it is
+# switched on - with nothing reading it, and on a direct root port as well as
+# behind a hub - so "as soon as it starts streaming" sent the owner moving USB
+# ports, and the phrase was said even for a device the caller had seen stay
+# connected. ``off_bus`` is the drop's evidence: True = it left the bus (the
+# Kinect SDK reported the sensor unavailable, or the device vanished from the
+# device list), False = it stayed connected, None = nobody could tell. Power
+# is offered as a thing to CHECK, never asserted.
+def dies_on_open_finding(off_bus: "bool | None") -> str:
+    """The log line's finding for a device that dies on open. NEVER raises."""
+    if off_bus is True:
+        return ("It drops off USB a few seconds after every start: the "
+                "device or its power supply is at fault (check the power "
+                "supply first), not the way it is opened.")
+    if off_bus is False:
+        return ("It stays connected while its stream stops, so this is not "
+                "a USB or power drop.")
+    return ("Whether it drops off USB could not be seen; if it does, check "
+            "its power supply.")
+
+
+def dies_on_open_spoken(label: str, off_bus: "bool | None",
+                        retry_s: float) -> str:
+    """The ONE spoken line for a device put on the slow retry. NEVER
+    raises."""
+    try:
+        name = str(label or "").strip() or "a camera"
+        cap = name[:1].upper() + name[1:]
+        when = minutes_phrase(retry_s)
+        if off_bus is True:
+            return (f"{cap} drops off USB a few seconds after every start, "
+                    f"sir. That's a hardware fault - check its power supply "
+                    f"first. I'll only retry it every {when}.")
+        if off_bus is False:
+            return (f"{cap}'s stream keeps dying a few seconds after every "
+                    f"start, sir, though it stays connected. I'll only retry "
+                    f"it every {when}.")
+        return (f"{cap}'s stream keeps dying a few seconds after every "
+                f"start, sir. If it's dropping off USB, check its power "
+                f"supply. I'll only retry it every {when}.")
+    except Exception:   # pragma: no cover - defensive: odd label
+        return "A camera keeps dying a few seconds after every start, sir."
 
 
 class CameraGate:
@@ -476,7 +539,11 @@ class CameraGate:
                  # counted, or proven by a late frame), and the slow retry
                  # interval armed (0.0 = on the normal ladder).
                  "doo_count": 0, "doo_judged": -1, "doo_retry_s": 0.0,
-                 "doo_until": 0.0}
+                 "doo_until": 0.0,
+                 # ...and what the last counted death showed (2026-10-02):
+                 # True = the device left the bus, False = it stayed
+                 # connected, None = nobody could tell. Words the verdict.
+                 "doo_off_bus": None}
             self._dev[key] = r
         return r
 
@@ -703,7 +770,8 @@ class CameraGate:
                             "retry_s": r["doo_retry_s"],
                             "until": (r["doo_until"]
                                       if r["doo_retry_s"] > 0.0 else 0.0),
-                            "said_at": self._doo_said_at.get(k, 0.0)}
+                            "said_at": self._doo_said_at.get(k, 0.0),
+                            "off_bus": r["doo_off_bus"]}
                         for k, r in self._dev.items()
                         if r["doo_retry_s"] > 0.0 or r["doo_count"] > 0}
                 path = self._doo_state_path
@@ -738,6 +806,9 @@ class CameraGate:
                         retry = float(e.get("retry_s") or 0.0)
                         until = float(e.get("until") or 0.0)
                         said = float(e.get("said_at") or 0.0)
+                        off_bus = e.get("off_bus")
+                        if not isinstance(off_bus, bool):
+                            off_bus = None      # absent (an older file) / junk
                     except Exception:
                         continue
                     if count <= 0:
@@ -753,6 +824,7 @@ class CameraGate:
                             continue
                         r = self._rec(key)
                         r["doo_count"] = count
+                        r["doo_off_bus"] = off_bus
                         if said and 0.0 <= now - said < DIES_ON_OPEN_SAY_AGAIN_S:
                             self._doo_said.add(key)
                             self._doo_said_at[key] = said
@@ -764,6 +836,7 @@ class CameraGate:
                         continue
                     r = self._rec(key)
                     r["doo_count"] = count
+                    r["doo_off_bus"] = off_bus
                     r["doo_retry_s"] = min(retry, self.dies_on_open_retry_max_s)
                     until = min(until, now + self.dies_on_open_retry_max_s)
                     if until > now:
@@ -812,6 +885,7 @@ class CameraGate:
             self._doo_dirty = True          # a saved partial run is cleared too
         r["doo_count"] = 0
         r["doo_retry_s"] = 0.0
+        r["doo_off_bus"] = None
         if was_slow:
             lines.append(
                 f"  [camera-gate] {key}: {why} - it no longer dies on open; "
@@ -819,9 +893,12 @@ class CameraGate:
 
     def _dies_on_open_locked(self, key: str, r: dict, now: float,
                              onset: float, lines: list,
-                             spoken: list) -> None:
+                             spoken: list, off_bus: "bool | None" = None,
+                             cause: str = "") -> None:
         """A FULL drop of ``key`` beginning at ``onset`` was just counted.
-        Judge its stream (once): died on arrival, or streamed normally."""
+        Judge its stream (once): died on arrival, or streamed normally.
+        ``off_bus`` is what the drop showed (True: the device left the bus;
+        False: it stayed connected; None: unknown) - it words the verdict."""
         if not self._doo_on_locked() or r["quarantined"]:
             return
         ok_at = r["stream_ok_at"]
@@ -836,6 +913,7 @@ class CameraGate:
                         f"dropped", lines)
             return
         r["doo_count"] += 1
+        r["doo_off_bus"] = off_bus
         n = r["doo_count"]
         self._doo_dirty = True              # saved even below the verdict
         if n < self.dies_on_open_count:
@@ -850,11 +928,12 @@ class CameraGate:
         label = self._label_for(key)
         ladder = (f" instead of every {_fmt_s(self.max_backoff_s)}"
                   if self.max_backoff_s > 0.0 else "")
+        seen = f" ({cause})" if cause else ""
         lines.append(
-            f"  [camera-gate] {key} ({label}): its stream died within "
-            f"{max(0.0, lived):.1f}s of opening - {n} opens in a row "
-            f"have died within {win:.0f}s, so it drops off as soon as it "
-            f"starts streaming (check its power supply). Retrying it every "
+            f"  [camera-gate] {key} ({label}): its stream died "
+            f"{max(0.0, lived):.1f}s after it opened{seen} - {n} opens in a "
+            f"row have died within {win:.0f}s. "
+            f"{dies_on_open_finding(off_bus)} Retrying it every "
             f"{_fmt_s(retry)}{ladder} until a reopen streams past "
             f"{win:.0f}s; 'use {label} again' retries it now.")
         if key not in self._doo_said:
@@ -863,10 +942,7 @@ class CameraGate:
             # restarts: _doo_load re-seeds this set.)
             self._doo_said.add(key)
             self._doo_said_at[key] = now
-            spoken.append(f"{label[:1].upper()}{label[1:]} drops off USB the "
-                          f"moment it starts streaming, sir. That is usually "
-                          f"its power supply. I'll only retry it every "
-                          f"{minutes_phrase(retry)}.")
+            spoken.append(dies_on_open_spoken(label, off_bus, retry))
 
     def _evaluate_locked(self, now: float, lines: list, spoken: list) -> None:
         # drops: (t, key, kind, onset); fails: (t, key, onset)
@@ -1241,7 +1317,9 @@ class CameraGate:
                   kind: str = KIND_CAMERA,
                   now: "float | None" = None, *,
                   onset: "float | None" = None, cause: str = "",
-                  minor: bool = False) -> bool:
+                  minor: bool = False,
+                  onset_ago: "float | None" = None,
+                  off_bus: "bool | None" = None) -> bool:
         """A device that was delivering has stopped (a camera's read-failure
         escalation, the Kinect's stale-stream reset, an audio endpoint that
         vanished). Counted ONCE per stream per device - a camera failing for a
@@ -1261,12 +1339,24 @@ class CameraGate:
                    rules, but unless the camera is also gone from the device
                    list it never re-trips the breaker ALONE on probation. A
                    later full burst on the same stream still counts.
+        ``onset_ago`` the same as ``onset``, as SECONDS BEFORE NOW - for a
+                   caller on another clock (the Kinect bridge times its
+                   streams on time.monotonic; this gate's clock is
+                   injectable). Used when ``onset`` is None; same clamp.
+        ``off_bus`` the caller's own evidence of whether the device LEFT
+                   THE BUS at this drop (the Kinect bridge reads the SDK's
+                   IsAvailable): True / False / None (cannot tell - then a
+                   camera gone from the device list counts as True). It
+                   words a dies-on-open verdict; it changes no decision.
 
         Returns True iff this call tripped the breaker. NEVER raises."""
         try:
             now = self._clock() if now is None else now
             try:
-                o = now if onset is None else float(onset)
+                if onset is None and onset_ago is not None:
+                    o = now - max(0.0, float(onset_ago))
+                else:
+                    o = now if onset is None else float(onset)
                 o = max(now - 60.0, min(o, now)) if o == o else now
             except Exception:
                 o = now
@@ -1301,8 +1391,11 @@ class CameraGate:
                     # stream it ended. One failed read of a camera still on
                     # the device list is not a dead stream.
                     if kind == KIND_CAMERA and (gone or not minor):
+                        bus = (True if (off_bus is True or gone) else
+                               False if off_bus is False else None)
                         self._dies_on_open_locked(key, r, now, o,
-                                                  lines, spoken)
+                                                  lines, spoken,
+                                                  off_bus=bus, cause=cause)
             self._emit(lines, spoken)
             return tripped
         except Exception:
@@ -1458,7 +1551,7 @@ class CameraGate:
                 if r["doo_retry_s"] > 0.0 or r["doo_count"]:
                     slow = r["doo_retry_s"] > 0.0
                     # ONE TRY, AS PROMISED (2026-10-01). The reply to "use
-                    # the Kinect again" says "if it still drops off, I'll go
+                    # the Kinect again" says "if it still drops out, I'll go
                     # back to retrying it every thirty minutes" - but a zeroed
                     # count took THREE more deaths (now, then 2 and 5 minutes
                     # later on the ladder) before the slow retry came back.
@@ -1536,6 +1629,9 @@ class CameraGate:
                             if (now - t) < CULPRIT_MEMORY_S]),
                         "dies_on_open": r["doo_count"],
                         "slow_retry_s": r["doo_retry_s"],
+                        # what the last counted death showed (True: it left
+                        # the bus, False: it stayed connected, None: unknown)
+                        "slow_retry_off_bus": r["doo_off_bus"],
                     }
                 q_keys = [k for k, r in self._dev.items() if r["quarantined"]]
                 slow = {k: {"label": self._label_for(k),

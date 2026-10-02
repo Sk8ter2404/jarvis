@@ -592,9 +592,9 @@ def _lift_reply(lifted: list, bc) -> str:
         subj = pron if s_all else " and ".join(slow)
         parts.append(
             f"{subj[:1].upper()}{subj[1:]} {'was' if single else 'were'} on "
-            f"the slow retry for dropping off USB the moment {pron} started "
-            f"streaming, so I'll try {_obj(slow)} now; if {pron} still "
-            f"{'drops' if single else 'drop'} off, I'll go back to retrying "
+            f"the slow retry for dropping out a few seconds after each start, "
+            f"so I'll try {_obj(slow)} now; if {pron} still "
+            f"{'drops' if single else 'drop'} out, I'll go back to retrying "
             f"{_obj(slow)} {_slow_retry_phrase(bc)}.")
     return " ".join(parts)
 
@@ -603,8 +603,8 @@ def camera_unquarantine(arg: str = "") -> str:
     """Lift what the camera gate is holding a camera back with - the owner has
     seen to it. Two holds: the session QUARANTINE (its stream start kept
     knocking the USB hub offline; it has been moved to another port) and the
-    slow DIES-ON-OPEN retry (v2.0.137: it dropped off USB the moment it started
-    streaming; its power has been seen to). The reply says which one was
+    slow DIES-ON-OPEN retry (v2.0.137: its stream died a few seconds after each
+    start; its power has been seen to). The reply says which one was
     lifted. ``arg`` narrows it ("left", "right", "kinect"); empty lifts every
     held camera. NEVER raises."""
     bc = _bc()

@@ -777,8 +777,8 @@ def _camera_gate_is_quarantined(key: str) -> bool:
 def camera_gate_lift_quarantine(which: str = "") -> list:
     """Lift the camera gate's session QUARANTINE (a device whose stream start
     kept knocking the USB hub offline) - the owner says it has been moved to
-    another port - and its slow DIES-ON-OPEN retry (R11: a device that drops
-    off USB the moment it starts streaming, retried only every half hour; the
+    another port - and its slow DIES-ON-OPEN retry (R11: a device whose stream
+    dies a few seconds after each start, retried only every half hour; the
     owner has seen to its power). ``which`` narrows it ("left", "right",
     "kinect", or part of a spoken label); empty lifts every such device.
     Returns the spoken labels lifted; camera_gate_lift() says which hold each

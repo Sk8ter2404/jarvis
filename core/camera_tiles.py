@@ -144,11 +144,26 @@ def gate_summary(snapshot, key) -> "dict | None":
         hold = float(dev.get("hold_s") or 0.0)
         slow = float(dev.get("slow_retry_s") or 0.0)
         if slow > 0.0 and hold > 0.0:
+            # Worded by what its last death SHOWED (core/camera_gate.py
+            # dies_on_open_finding, 2026-10-02): "dropped off USB" and the
+            # power check only when it was seen leaving the bus.
+            off_bus = dev.get("slow_retry_off_bus")
+            waits = (fmt_wait(slow), fmt_wait(hold))
+            if off_bus is True:
+                msg = ("It dropped off USB a few seconds after each start, "
+                       "so JARVIS only retries it every %s - next try in %s. "
+                       "Check its power supply." % waits)
+            elif off_bus is False:
+                msg = ("Its stream died a few seconds after each start "
+                       "though it stayed connected, so JARVIS only retries "
+                       "it every %s - next try in %s." % waits)
+            else:
+                msg = ("Its stream died within seconds of each start, so "
+                       "JARVIS only retries it every %s - next try in %s. If "
+                       "it is dropping off USB, check its power supply."
+                       % waits)
             return {"state": "slow_retry", "retry_in_s": hold,
-                    "message": ("It dropped off USB each time it started "
-                                "streaming, so JARVIS only retries it every "
-                                "%s - next try in %s. Check its power supply."
-                                % (fmt_wait(slow), fmt_wait(hold)))}
+                    "message": msg}
         if dev.get("absent"):
             return {"state": "absent", "retry_in_s": None,
                     "message": ("It vanished from the device list (a USB "

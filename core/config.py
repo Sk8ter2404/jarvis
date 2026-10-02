@@ -1355,12 +1355,13 @@ CAMERA_STORM_PROBATION_S    = 180.0
 CAMERA_CULPRIT_WINDOW_S     = 5.0
 CAMERA_CULPRIT_THRESHOLD    = 2
 # CAMERA_DIES_ON_OPEN_RETRY_S — (R11) a camera or Kinect whose stream dies
-#   within 15 s of each of 3 opens in a row (it drops off USB the moment it
-#   starts streaming - usually its power supply) is retried only this often,
-#   doubling to at most an hour, instead of every 10 minutes. JARVIS says so
-#   once per session; a reopen that streams normally, or "use the Kinect
-#   again", puts it back at once. Measured 2026-09-29: the Kinect dropped off
-#   USB within ~1 s of every reopen for 20 minutes. 0 disables it.
+#   within 15 s of each of 3 opens in a row (it drops out a few seconds after
+#   each start - when it leaves the bus, usually its power supply) is retried
+#   only this often, doubling to at most an hour, instead of every 10
+#   minutes. JARVIS says so once per session; a reopen that streams normally,
+#   or "use the Kinect again", puts it back at once. Measured 2026-10-02: the
+#   Kinect streams ~6 s, then drops off USB ~7.5 s after it is switched on,
+#   whatever reads it and on any port. 0 disables it.
 CAMERA_DIES_ON_OPEN_RETRY_S = 1800.0
 # CAMERA_OPEN_MIN_GAP_S — two different JARVIS components (face tracker, boot
 #   probe, self-diagnostic, side tiles, Kinect bridge) never open the same

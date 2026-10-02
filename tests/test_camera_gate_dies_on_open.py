@@ -45,9 +45,11 @@ RETRY = getattr(cg, "DIES_ON_OPEN_RETRY_S", 1800.0)
 RETRY_MAX = getattr(cg, "DIES_ON_OPEN_RETRY_MAX_S", 3600.0)
 LADDER_CAP = 600.0
 
-_SAID = ("The Kinect drops off USB the moment it starts streaming, sir. That "
-         "is usually its power supply. I'll only retry it every thirty "
-         "minutes.")
+# No caller here says whether the device left the bus, so the verdict is
+# the "could not be seen" one (2026-10-02: worded by what the drop showed).
+_SAID = ("The Kinect's stream keeps dying a few seconds after every start, "
+         "sir. If it's dropping off USB, check its power supply. I'll only "
+         "retry it every thirty minutes.")
 
 
 class _Clock:
@@ -352,9 +354,9 @@ class CountRuleTests(unittest.TestCase):
         self.assertTrue(_slow(g, LEFT))
         self.assertEqual(
             self.spoken,
-            ["The left webcam drops off USB the moment it starts streaming, "
-             "sir. That is usually its power supply. I'll only retry it every "
-             "thirty minutes."])
+            ["The left webcam's stream keeps dying a few seconds after every "
+             "start, sir. If it's dropping off USB, check its power supply. "
+             "I'll only retry it every thirty minutes."])
 
     def test_one_failed_read_is_not_a_dead_stream(self):
         g = self.g
@@ -389,7 +391,7 @@ class CountRuleTests(unittest.TestCase):
         for _ in range(COUNT):
             self.assertTrue(other.dies_on_open())
         self.assertEqual(len(self.spoken), 2, self.spoken)
-        self.assertTrue(self.spoken[1].startswith("The left webcam drops off"))
+        self.assertTrue(self.spoken[1].startswith("The left webcam's stream"))
         self.assertEqual(sorted(g.dies_on_open()), sorted([KINECT, LEFT]))
 
 

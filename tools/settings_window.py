@@ -1821,8 +1821,9 @@ SCHEMA: dict[str, dict] = {
         "tab": "cameras", "label": "Camera that drops out on every start: retry every (seconds)",
         "type": "float", "default": 1800.0, "max": 86400,
         "help": "A camera or the Kinect whose video dies within seconds of "
-                "each of three starts in a row (it drops off USB as soon as "
-                "it streams, usually a power problem) is retried only this "
+                "each of three starts in a row (it drops out a few seconds "
+                "after each start - when it falls off USB, usually a power "
+                "problem) is retried only this "
                 "often, doubling to at most an hour, instead of every 10 "
                 "minutes. JARVIS tells you once; 'use the Kinect again' "
                 "retries it now. 0 = off. Applies on the next start.",
