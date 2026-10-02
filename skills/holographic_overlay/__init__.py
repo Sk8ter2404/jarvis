@@ -86,6 +86,17 @@ _OVERLAY_LOCK = threading.Lock()
 _PROJECT_DIR = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+
+if _PROJECT_DIR not in sys.path:  # pragma: no cover - import-time sys.path guard; root already on path under the test harness
+    sys.path.insert(0, _PROJECT_DIR)
+
+# Every control/state file below goes through the shared writer: a unique
+# mkstemp temp (a fixed "<name>.tmp" collided between two writers) and a
+# Windows PermissionError retry on the replace. A renderer polls these files
+# every tick, and when its read overlapped the rename the old bare os.replace
+# hit WinError 5 and the mode switch / retire signal was silently lost.
+from core.atomic_io import _atomic_write_json  # noqa: E402
+
 _OVERLAY_SCRIPT = os.path.join(_PROJECT_DIR, "hud", "jarvis_holo.py")
 
 # Holographic HUD v2 — Iron Man arc-reactor ring (PyQt6 + QGraphicsView).
@@ -369,10 +380,7 @@ def _write_workshop_state(**updates):
             except Exception:
                 existing = {}
         existing.update(updates)
-        tmp = _WORKSHOP_STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(existing, f)
-        os.replace(tmp, _WORKSHOP_STATE_FILE)
+        _atomic_write_json(_WORKSHOP_STATE_FILE, existing, indent=None)
     except Exception:
         # State file is a nice-to-have for mid-flight mode switching.
         # If we can't write it, the existing CLI default still applies.
@@ -846,10 +854,7 @@ def _write_bambu_camera_hud_control(**updates) -> None:
             except Exception:
                 existing = {}
         existing.update(updates)
-        tmp = _BAMBU_CAMERA_HUD_CONTROL_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(existing, f)
-        os.replace(tmp, _BAMBU_CAMERA_HUD_CONTROL_FILE)
+        _atomic_write_json(_BAMBU_CAMERA_HUD_CONTROL_FILE, existing, indent=None)
     except Exception:
         # Control file is a nice-to-have; terminate() is the fallback.
         pass
@@ -1069,10 +1074,7 @@ def _write_workshop_hud_control(**updates) -> None:
             except Exception:
                 existing = {}
         existing.update(updates)
-        tmp = _WORKSHOP_HUD_CONTROL_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(existing, f)
-        os.replace(tmp, _WORKSHOP_HUD_CONTROL_FILE)
+        _atomic_write_json(_WORKSHOP_HUD_CONTROL_FILE, existing, indent=None)
     except Exception:
         # Control file is a nice-to-have — terminate() is the fallback.
         pass
@@ -1202,10 +1204,7 @@ def _write_workshop_print_monitor_control(**updates) -> None:
             except Exception:
                 existing = {}
         existing.update(updates)
-        tmp = _WORKSHOP_PRINT_MONITOR_CONTROL_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(existing, f)
-        os.replace(tmp, _WORKSHOP_PRINT_MONITOR_CONTROL_FILE)
+        _atomic_write_json(_WORKSHOP_PRINT_MONITOR_CONTROL_FILE, existing, indent=None)
     except Exception:
         # Control file is best-effort — terminate() is the fallback.
         pass
@@ -1581,10 +1580,7 @@ def _write_arc_status_control(**updates) -> None:
             except Exception:
                 existing = {}
         existing.update(updates)
-        tmp = _ARC_STATUS_CONTROL_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(existing, f)
-        os.replace(tmp, _ARC_STATUS_CONTROL_FILE)
+        _atomic_write_json(_ARC_STATUS_CONTROL_FILE, existing, indent=None)
     except Exception:
         # Control file is a nice-to-have; terminate() is the fallback.
         pass
@@ -1736,10 +1732,7 @@ def _write_stark_status_control(**updates) -> None:
             except Exception:
                 existing = {}
         existing.update(updates)
-        tmp = _STARK_STATUS_CONTROL_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(existing, f)
-        os.replace(tmp, _STARK_STATUS_CONTROL_FILE)
+        _atomic_write_json(_STARK_STATUS_CONTROL_FILE, existing, indent=None)
     except Exception:
         # Control file is a nice-to-have; terminate() is the fallback.
         pass

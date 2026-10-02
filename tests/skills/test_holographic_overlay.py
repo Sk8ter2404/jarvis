@@ -15,11 +15,11 @@ separate PyQt/tkinter renderer it spawns as its own subprocess:
 
 The actual Qt rendering lives in those *child-process* scripts. The manager
 ``__init__.py`` itself imports ONLY stdlib (json/logging/os/subprocess/sys/
-threading/time) — no Qt — so its testable surface is pure non-visual logic:
-geometry/layout math, alive/dormant state machines, the atomic control-file
-writers, launch/shutdown lifecycles (missing-script + Popen-failure + idempotent
-paths), the auto-show watcher decisions, every registered voice action, and the
-config-flag auto-launch branches in register().
+threading/time) plus core.atomic_io — no Qt — so its testable surface is pure
+non-visual logic: geometry/layout math, alive/dormant state machines, the
+atomic control-file writers, launch/shutdown lifecycles (missing-script +
+Popen-failure + idempotent paths), the auto-show watcher decisions, every
+registered voice action, and the config-flag auto-launch branches in register().
 
 ISOLATION CONTRACT
   • Every test loads a FRESH module via ``load_skill_isolated`` (the harness
@@ -152,6 +152,7 @@ class _HoloBase(unittest.TestCase):
         "_WORKSHOP_STATE_FILE", "_HUD_STATE_FILE", "_BAMBU_OVERLAY_STATE_FILE",
         "_WORKSHOP_HUD_CONTROL_FILE", "_WORKSHOP_PRINT_MONITOR_CONTROL_FILE",
         "_ARC_STATUS_CONTROL_FILE", "_STARK_STATUS_CONTROL_FILE",
+        "_BAMBU_CAMERA_HUD_CONTROL_FILE",
     )
     _SCRIPT_ATTRS = (
         "_OVERLAY_SCRIPT", "_WORKSHOP_SCRIPT", "_BAMBU_OVERLAY_SCRIPT",
@@ -626,6 +627,7 @@ class ControlFileWriterTests(_HoloBase):
          "_WORKSHOP_PRINT_MONITOR_CONTROL_FILE"),
         ("_write_arc_status_control", "_ARC_STATUS_CONTROL_FILE"),
         ("_write_stark_status_control", "_STARK_STATUS_CONTROL_FILE"),
+        ("_write_bambu_camera_hud_control", "_BAMBU_CAMERA_HUD_CONTROL_FILE"),
     )
 
     def test_writer_creates_file_with_payload(self):
@@ -660,6 +662,36 @@ class ControlFileWriterTests(_HoloBase):
             with mock.patch.object(self.mod.os, "replace",
                                    side_effect=OSError("disk full")):
                 getattr(self.mod, fn_name)(mode="on")  # no exception
+
+    def test_writer_survives_a_reader_holding_the_file(self):
+        # Windows refuses the rename (WinError 5 -> PermissionError) while a
+        # HUD process has the control file open for its per-tick read. The
+        # old fixed "<name>.tmp" + bare os.replace swallowed that error, so
+        # the mode switch / retire signal was LOST and a stray .tmp was left
+        # behind. Through core.atomic_io the replace is retried once the
+        # reader lets go. os.name is forced to "nt" (the retry is Windows-only,
+        # exactly as tests/test_atomic_io.py does) so this runs on CI too.
+        from core import atomic_io
+        real_replace = os.replace
+        for fn_name, path_attr in self.WRITERS:
+            path = getattr(self.mod, path_attr)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"mode": "on"}, f)
+            calls = []
+
+            def _replace(src, dst, _calls=calls):
+                _calls.append(dst)
+                if len(_calls) == 1:
+                    raise PermissionError(13, "Access is denied", dst)
+                return real_replace(src, dst)
+
+            with mock.patch.object(atomic_io.os, "name", "nt"),                     mock.patch.object(atomic_io.time, "sleep"),                     mock.patch.object(os, "replace", side_effect=_replace):
+                getattr(self.mod, fn_name)(mode="off")
+            self.assertEqual(self._read_json(path).get("mode"), "off",
+                             msg=f"{fn_name}: the retire signal was lost")
+            self.assertEqual(
+                [n for n in os.listdir(self.tmp) if n.endswith(".tmp")], [],
+                msg=f"{fn_name}: a temp file was left behind")
 
     def test_workshop_state_force_visible_field(self):
         self.mod._write_workshop_state(mode="pulse", force_visible=False)
