@@ -106,7 +106,9 @@ to surface cold-boot regressions.
 Voice triggers (registered actions)
 -----------------------------------
     run_diagnostic / system_check / are_you_ok    — fire immediate run.
-    diagnostic_status                              — terse last-run summary.
+    diagnostic_status                              — terse last-run summary
+                                                     (the boot swaps in a FRESH
+                                                     sweep, 2026-10-02).
     whats_broken                                   — read open self-diag tasks.
     diagnostic_history [N]                         — last N runs summary.
     last_diagnostic_run                            — raw JSON of last run.
@@ -4769,7 +4771,7 @@ def register(actions: dict) -> None:
     actions["system_check"]        = run_diagnostic
     actions["are_you_ok"]          = run_diagnostic
     actions["self_diagnostic"]     = run_diagnostic
-    actions["diagnostic_status"]   = diagnostic_status   # INTENTIONAL_WRAP: bobert_companion re-asserts the diagnostic_daemons version after skills load (~13435), by design
+    actions["diagnostic_status"]   = diagnostic_status   # INTENTIONAL_WRAP: after skills load bobert_companion re-registers it as _fresh_diagnostic_status (a FRESH sweep; owner's decision 2026-10-02), by design
     actions["whats_broken"]        = whats_broken
     actions["what_is_broken"]      = whats_broken
     actions["diagnostic_history"]  = diagnostic_history

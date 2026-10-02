@@ -40898,6 +40898,24 @@ def _run_self_check_shortcut(text: str) -> bool:
                      "haven't measured."))
 
 
+def _fresh_diagnostic_status(arg: str = "") -> str:
+    """The "diagnostic status" action (owner's decision, 2026-10-02): a FRESH
+    self-check — the same real sweep "are you ok" runs since v2.0.159, the
+    first registered of _SELF_CHECK_ACTIONS — instead of the daemon counters
+    it used to read back. core.diagnostic_daemons.fresh_diagnostic_status
+    keeps the fast fallback: no self-check loaded, or a sweep that raises or
+    returns nothing -> the counters, said to be possibly stale. The boot
+    registers this over skills/self_diagnostic's last-run summary, after
+    load_skills. Never raises."""
+    sweep = None
+    for _name in _SELF_CHECK_ACTIONS:
+        sweep = ACTIONS.get(_name)
+        if sweep is not None:
+            break
+    from core import diagnostic_daemons as _dd
+    return _dd.fresh_diagnostic_status(sweep)
+
+
 def _run_timer_list_shortcut(text: str) -> bool:
     """"what timers do I have" / "list my timers" / "how long is left on my
     timer" -> list_timers' own line from the timer store, with no LLM
@@ -43388,12 +43406,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         ACTIONS["pause_diagnostics"]    = _diag_daemons.act_pause_diagnostics
         ACTIONS["resume_diagnostics"]   = _diag_daemons.act_resume_diagnostics
         ACTIONS["diagnostic_daemon_status"] = _diag_daemons.act_diagnostic_status
-        # Override the self_diagnostic.diagnostic_status entry so the same
-        # voice phrase ("diagnostic status") now reports daemon last-run +
-        # budget + findings instead of only the self-diag sweep summary.
-        # Self-diag's terse summary is still reachable via "last diagnostic
-        # run" / "are you ok".
-        ACTIONS["diagnostic_status"] = _diag_daemons.act_diagnostic_status
+        # "diagnostic status" — owner's decision, 2026-10-02: a FRESH
+        # self-check, the same real sweep "are you ok" runs since v2.0.159
+        # (_fresh_diagnostic_status), NOT the daemon last-run counters this
+        # line used to install on purpose. The counters stay on "diagnostic
+        # daemon status" above and are the fast fallback when the sweep does
+        # not finish (said to be possibly stale). Still overrides
+        # skills/self_diagnostic's last-run summary, after load_skills.
+        ACTIONS["diagnostic_status"] = _fresh_diagnostic_status
     except Exception as _e:
         print(f"  [diag-daemons] startup failed: {_e}")
 

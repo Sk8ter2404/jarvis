@@ -47,6 +47,9 @@ Lifecycle
                                   repair for a stale pause; see its docstring.
     diagnostic_daemon_status()  — dict snapshot of last-run times, budget
                                   remaining, pending findings count.
+    fresh_diagnostic_status(sweep) — the "diagnostic status" answer: a FRESH
+                                  self-check, the counters as a possibly-stale
+                                  fallback (owner's decision, 2026-10-02).
 
 Failure policy: every external operation (event log probe, Anthropic API
 call, file write) is wrapped so a single failure cannot crash the daemon.
@@ -1623,3 +1626,53 @@ def act_resume_diagnostics(_: str = "") -> str:
 
 def act_diagnostic_status(_: str = "") -> str:
     return diagnostic_daemon_status_spoken(_)
+
+
+# ─────────────── "diagnostic status" = a FRESH self-check ────────────────
+# Owner's decision (2026-10-02): saying "diagnostic status" reports a FRESH
+# self-check, the same real sweep "are you ok" runs since v2.0.159, not the
+# counters above (only as fresh as the last background run). The counters
+# stay on "diagnostic daemon status" (act_diagnostic_status) and are the FAST
+# fallback here. bobert_companion._fresh_diagnostic_status passes the sweep.
+
+def fresh_diagnostic_status(sweep: Any = None) -> str:
+    """The "diagnostic status" answer: run ``sweep`` (the self-diagnostic
+    action, called with "") and return its own summary, which never calls an
+    unchecked subsystem nominal. No sweep, a sweep that raises, or one that
+    returns nothing -> the daemon counters, led by a sentence saying they may
+    be stale; never a pass. A fresh answer still says when the background
+    diagnostics are paused (the counters reply always did).
+
+    Every sentence of its own is marker-free (core.failure_markers):
+    diagnostic_status is spoken verbatim, and a marker would hand the reply to
+    an LLM re-wording instead. Never raises."""
+    if callable(sweep):
+        try:
+            result = sweep("")
+        except Exception as e:
+            print(f"  [diag-daemons] diagnostic status: the fresh self-check "
+                  f"raised {type(e).__name__}: {e}")
+            result = None
+        reply = result.strip() if isinstance(result, str) else ""
+        if reply:
+            try:
+                paused = bool(_read_state().get("paused"))
+            except Exception:
+                paused = False
+            if paused:
+                reply += " The background diagnostics are still paused."
+            return reply
+        lead = "The fresh self-check did not finish, sir"
+    else:
+        lead = "The self-check is not loaded, sir"
+    print("  [diag-daemons] diagnostic status: no fresh result — reading back "
+          "the counters")
+    try:
+        counters = str(diagnostic_daemon_status_spoken() or "").strip()
+    except Exception as e:
+        print(f"  [diag-daemons] diagnostic status: counters unavailable: {e}")
+        counters = ""
+    if counters:
+        return (f"{lead}, so these are the last recorded counters, and they "
+                f"may be stale. {counters}")
+    return f"{lead}, and there are no recorded counters to read back either."
