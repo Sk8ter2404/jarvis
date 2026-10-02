@@ -10,8 +10,9 @@ utterances (`'turn off the office light'`, `'set bedroom to 65'`,
 
 Resolution order for a target device:
   1. Direct brand skill (skills/sh_<brand>.py) — preferred.
-  2. Alexa cookie fallback via `alexapy.AlexaAPI.set_appliance_state` — only
-     used if every direct path raises or returns an error.
+  2. Alexa cookie fallback via `alexapy.AlexaAPI.set_light_state` — only
+     used if every direct path raises or returns an error. A scene goes here
+     directly: no brand skill activates scenes.
 
 When the catalog is missing/empty, or a control command matches nothing in
 it, the router falls through to `skills.sh_kasa.smart_home_control` — the
@@ -639,10 +640,9 @@ def _action_to_kwargs(action: dict) -> dict[str, Any]:
         # a kwarg, so _action_to_kwargs returned {} and _dispatch_one refused
         # with "nothing to do" — even though the scene verb, the discovery
         # type='scene', and the "Scene running" summary all exist. An Alexa
-        # scene is activated by turning its entity ON (set_appliance_state
-        # entity "ON"), so `on=True` drives it through the existing dispatch/
-        # Alexa path. `on` is a standard kwarg every set_state accepts, so this
-        # is safe even if the device unexpectedly routes to a brand skill.
+        # scene is activated by turning its entity ON (a set_light_state
+        # turnOn), so `on=True` drives it through the Alexa path, which
+        # _dispatch_one takes directly for a scene (A50).
         out["on"] = True
     if "brightness" in action and action["brightness"] is not None:
         out["brightness"] = int(action["brightness"])
@@ -684,10 +684,40 @@ def _alexa_login() -> Any:
     return login
 
 
+def _phoenix_failure(resp: Any) -> str | None:
+    """Why Amazon's /api/phoenix/state reply is NOT a success, or None when
+    every control request came back code SUCCESS. alexapy returns the parsed
+    JSON even when Amazon refused, so a call that returned is not a call that
+    worked. Never raises."""
+    try:
+        if not isinstance(resp, dict):
+            return "Amazon sent no control response"
+        errors = resp.get("errors") or []
+        if errors:
+            e = errors[0] if isinstance(errors[0], dict) else {}
+            why = e.get("code") or e.get("message") or str(errors[0])
+            return f"Amazon refused it ({why})"
+        responses = resp.get("controlResponses") or []
+        if not responses:
+            return "Amazon sent no control response"
+        for r in responses:
+            code = r.get("code") if isinstance(r, dict) else r
+            if code != "SUCCESS":
+                return f"Amazon reported {code}"
+        return None
+    except Exception as e:
+        return f"unreadable alexa reply: {e}"
+
+
 def _alexa_set_state(device: dict, kwargs: dict) -> dict:
     """Last-resort: drive the device through Alexa's smart-home graph using
-    the cached cookie. Only on_off / brightness / setpoint can be sent via
-    this path reliably; color/scene fall back to a polite refusal."""
+    the cached cookie. Power on/off and brightness go through
+    AlexaAPI.set_light_state — the static control call alexapy 1.29.22 really
+    has (A50, 2026-10-02: the old set_appliance_state exists in no installed
+    alexapy, so this whole path was dead). A scene entity gets the same turnOn.
+    Success is claimed only when Amazon's reply says SUCCESS, so whether a
+    scene really ran is Amazon's answer, not ours; color / setpoint fall back
+    to a polite refusal."""
     entity_id = device.get("alexa_entity_id")
     if not entity_id:
         return {"error": "no alexa entity id on device"}
@@ -718,20 +748,30 @@ def _alexa_set_state(device: dict, kwargs: dict) -> dict:
     except Exception:
         return {"error": "asyncio runner unavailable"}
 
+    # "Set to 50%" is spoken on success, so a level must really be sent.
+    brightness = kwargs.get("brightness") if target == "ON" else None
+
     async def _go() -> dict:
         try:
-            if target and hasattr(AlexaAPI, "set_appliance_state"):
-                await AlexaAPI.set_appliance_state(login, entity_id, target)
-                return {"ok": True, "path": "alexa", "set": target}
+            setter = getattr(AlexaAPI, "set_light_state", None)
+            if target and callable(setter):
+                resp = await setter(
+                    login, entity_id, power_on=(target == "ON"),
+                    brightness=None if brightness is None else int(brightness))
+                why = _phoenix_failure(resp)
+                if why:
+                    return {"error": why}
+                out = {"ok": True, "path": "alexa", "set": target}
+                if brightness is not None:
+                    out["brightness"] = int(brightness)
+                return out
             return {"error": "no compatible alexapy call available"}
         except Exception as e:
             return {"error": f"alexa call failed: {e}"}
 
     try:
         # Bounded so a stalled Amazon endpoint can't wedge the voice dispatch
-        # thread (2026-07-14 bug-hunt #12 — defensive; the current alexapy build
-        # has no set_appliance_state so this path returns fast today, but the
-        # bound protects if a future build restores it).
+        # thread (2026-07-14 bug-hunt #12).
         return _run(_go(), timeout=8.0)
     except Exception as e:
         return {"error": f"alexa fallback runner failed: {e}"}
@@ -744,6 +784,16 @@ def _dispatch_one(device: dict, action: dict) -> dict:
     kwargs = _action_to_kwargs(action)
     if not kwargs:
         return {"error": "nothing to do (action had no recognised parameters)"}
+
+    # A scene is an Alexa SceneController entity and no brand skill knows
+    # scenes, so it goes straight to Alexa (A50): a brand skill sent on=True
+    # could at best fail, at worst switch a same-named bulb and have the
+    # summary call the scene running.
+    if action.get("verb") == "scene":
+        result = _alexa_set_state(device, kwargs)
+        result["device"] = device.get("name")
+        result["path"] = result.get("path") or "alexa-failed"
+        return result
 
     brand = device.get("brand") or ""
     skill_name = device.get("controller_skill") or _controller_for(brand)
@@ -940,6 +990,8 @@ def smart_home_control(utterance: str = "") -> str:
         want_type = "thermostat"
     elif action.get("verb") in ("lock", "unlock"):
         want_type = "lock"
+    elif action.get("verb") == "scene":
+        want_type = "scene"   # A50: a light scoring the same must not win
     elif "color" in action or "brightness" in action or "color_temperature" in action:
         want_type = "light"
 

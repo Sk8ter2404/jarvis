@@ -734,7 +734,7 @@ class AlexaSetStateTests(_RouterTestBase):
         # alexapy + AlexaAPI present, but importing the async runner fails.
         alexapy = types.ModuleType("alexapy")
         alexapy.AlexaAPI = types.SimpleNamespace(
-            set_appliance_state=lambda *a, **k: None)
+            set_light_state=lambda *a, **k: None)
         disc = types.ModuleType("skills.smart_home_discover")
         # Deliberately omit `_run_async` so `from ... import _run_async` raises.
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
@@ -746,12 +746,16 @@ class AlexaSetStateTests(_RouterTestBase):
     def test_happy_on(self):
         calls = {}
 
-        async def _set_appliance_state(login, entity, target):
-            calls["args"] = (login, entity, target)
+        # The real alexapy 1.29.22 call: static set_light_state(login,
+        # entity_id, power_on=..., brightness=...) -> /api/phoenix/state JSON.
+        async def _set_light_state(login, entity, power_on=True,
+                                   brightness=None):
+            calls["args"] = (login, entity, power_on, brightness)
+            return _phoenix_ok(entity)
 
         alexapy = types.ModuleType("alexapy")
         alexapy.AlexaAPI = types.SimpleNamespace(
-            set_appliance_state=_set_appliance_state)
+            set_light_state=_set_light_state)
         disc = types.ModuleType("skills.smart_home_discover")
         # A faithful, synchronous stand-in for the discover skill's asyncio
         # runner: run the coroutine to completion and return its result.
@@ -765,14 +769,15 @@ class AlexaSetStateTests(_RouterTestBase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["set"], "ON")
         self.assertEqual(out["path"], "alexa")
-        self.assertEqual(calls["args"], (login, "ent-1", "ON"))
+        self.assertEqual(calls["args"], (login, "ent-1", True, None))
 
     def test_brightness_only_maps_to_on(self):
-        async def _set_appliance_state(login, entity, target):
-            return None
+        async def _set_light_state(login, entity, power_on=True,
+                                   brightness=None):
+            return _phoenix_ok(entity)
         alexapy = types.ModuleType("alexapy")
         alexapy.AlexaAPI = types.SimpleNamespace(
-            set_appliance_state=_set_appliance_state)
+            set_light_state=_set_light_state)
         disc = types.ModuleType("skills.smart_home_discover")
         disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
@@ -782,11 +787,12 @@ class AlexaSetStateTests(_RouterTestBase):
         self.assertEqual(out["set"], "ON")
 
     def test_off_target(self):
-        async def _set_appliance_state(login, entity, target):
-            return None
+        async def _set_light_state(login, entity, power_on=True,
+                                   brightness=None):
+            return _phoenix_ok(entity)
         alexapy = types.ModuleType("alexapy")
         alexapy.AlexaAPI = types.SimpleNamespace(
-            set_appliance_state=_set_appliance_state)
+            set_light_state=_set_light_state)
         disc = types.ModuleType("skills.smart_home_discover")
         disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
@@ -797,11 +803,12 @@ class AlexaSetStateTests(_RouterTestBase):
 
     def test_no_compatible_call(self):
         # color-only request → target stays None → "no compatible call".
-        async def _set_appliance_state(login, entity, target):
-            return None
+        async def _set_light_state(login, entity, power_on=True,
+                                   brightness=None):
+            return _phoenix_ok(entity)
         alexapy = types.ModuleType("alexapy")
         alexapy.AlexaAPI = types.SimpleNamespace(
-            set_appliance_state=_set_appliance_state)
+            set_light_state=_set_light_state)
         disc = types.ModuleType("skills.smart_home_discover")
         disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
@@ -811,10 +818,10 @@ class AlexaSetStateTests(_RouterTestBase):
                                           {"color": (1, 2, 3)})
         self.assertIn("no compatible alexapy call", out["error"])
 
-    def test_no_set_appliance_state_method(self):
-        # AlexaAPI present but lacks set_appliance_state → inner branch refuses.
+    def test_no_set_light_state_method(self):
+        # AlexaAPI present but lacks set_light_state → inner branch refuses.
         alexapy = types.ModuleType("alexapy")
-        alexapy.AlexaAPI = types.SimpleNamespace()  # no set_appliance_state
+        alexapy.AlexaAPI = types.SimpleNamespace()  # no set_light_state
         disc = types.ModuleType("skills.smart_home_discover")
         disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
@@ -824,11 +831,12 @@ class AlexaSetStateTests(_RouterTestBase):
         self.assertIn("no compatible alexapy call", out["error"])
 
     def test_alexa_call_raises_inside_coro(self):
-        async def _set_appliance_state(login, entity, target):
+        async def _set_light_state(login, entity, power_on=True,
+                                   brightness=None):
             raise RuntimeError("graph 500")
         alexapy = types.ModuleType("alexapy")
         alexapy.AlexaAPI = types.SimpleNamespace(
-            set_appliance_state=_set_appliance_state)
+            set_light_state=_set_light_state)
         disc = types.ModuleType("skills.smart_home_discover")
         disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
@@ -838,11 +846,12 @@ class AlexaSetStateTests(_RouterTestBase):
         self.assertIn("alexa call failed", out["error"])
 
     def test_runner_itself_raises(self):
-        async def _set_appliance_state(login, entity, target):
-            return None
+        async def _set_light_state(login, entity, power_on=True,
+                                   brightness=None):
+            return _phoenix_ok(entity)
         alexapy = types.ModuleType("alexapy")
         alexapy.AlexaAPI = types.SimpleNamespace(
-            set_appliance_state=_set_appliance_state)
+            set_light_state=_set_light_state)
 
         def _boom_runner(coro):
             coro.close()   # avoid 'coroutine never awaited' warning
@@ -854,6 +863,12 @@ class AlexaSetStateTests(_RouterTestBase):
                              **{"skills.smart_home_discover": disc}):
             out = router._alexa_set_state(self._device(), {"on": True})
         self.assertIn("alexa fallback runner failed", out["error"])
+
+
+def _phoenix_ok(entity_id):
+    """What /api/phoenix/state answers when Amazon accepted the request."""
+    return {"controlResponses": [{"entityId": entity_id, "code": "SUCCESS"}],
+            "errors": []}
 
 
 def _drain(coro):

@@ -5,14 +5,20 @@ A44 - "ambient mode on" announced "Chappie is listening quietly and learning"
       even when the mic daemon REFUSED to start (it refuses by returning a line,
       not by raising), and it had already saved AMBIENT_LISTEN_ENABLED=True, so
       the refused start persisted across reboots with no daemon running.
+A50 - scenes never activated, and the whole Alexa fallback was dead: it called
+      AlexaAPI.set_appliance_state, which the installed alexapy (1.29.22) does
+      not have. The call that exists is the static set_light_state(login,
+      entity_id, power_on=..., brightness=...), a PUT to /api/phoenix/state
+      whose JSON reply says per entity whether Amazon accepted it.
 
-Hermetic: no real device, network or mic. Every settings write goes to a temp
-file.
+Hermetic: no real device, network, mic or Alexa call. Every settings write goes
+to a temp file; alexapy and the discover skill's async runner are faked.
 
     python -B -m unittest tests.test_audit_c5_honesty
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shutil
@@ -24,6 +30,7 @@ from unittest import mock
 
 import core.actions as A
 import core.config as cfg
+from core import smart_home_router as router
 from core.failure_markers import FAILURE_MARKERS
 
 # The skill's own refusal lines (skills/ambient_listen.py ambient_listen_start).
@@ -201,6 +208,202 @@ class RealSkillRefusalTests(_AmbientCase):
         self.assertTrue(_has_failure_marker(out), out)
         self.assertIs(self.bc._ambient_mode_active[0], False)
         self.assertIsNot(self.saved(), True)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  A50 - the Alexa fallback calls what alexapy 1.29.22 really has, and a
+#        scene is claimed "running" only when Amazon says SUCCESS
+# ──────────────────────────────────────────────────────────────────────────
+
+def _drain(coro):
+    """Run a coroutine that never really awaits; return its value."""
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        return stop.value
+    raise AssertionError("coroutine did not complete synchronously")
+
+
+def _phoenix_ok(entity_id):
+    return {"controlResponses": [{"entityId": entity_id, "entityType": "ENTITY",
+                                  "code": "SUCCESS"}],
+            "errors": []}
+
+
+class _FakeAlexa:
+    """Stand-in for alexapy 1.29.22's AlexaAPI control surface: ONLY the static
+    set_light_state that the real class has (no set_appliance_state). Records
+    every call; replies like /api/phoenix/state."""
+
+    def __init__(self, reply=None, signature_of=None):
+        self.calls = []
+        self._reply = reply
+        self._sig = signature_of
+        fake = self
+
+        async def set_light_state(*args, **kwargs):
+            if fake._sig is not None:
+                fake._sig.bind(*args, **kwargs)   # TypeError on a wrong shape
+            fake.calls.append((args, kwargs))
+            if fake._reply is not None:
+                return fake._reply
+            return _phoenix_ok(args[1] if len(args) > 1 else kwargs.get("entity_id"))
+
+        self.api = types.SimpleNamespace(set_light_state=set_light_state)
+
+    def modules(self):
+        alexapy = types.ModuleType("alexapy")
+        alexapy.AlexaAPI = self.api
+        disc = types.ModuleType("skills.smart_home_discover")
+        disc._run_async = lambda coro, timeout=None: _drain(coro)
+        return {"alexapy": alexapy, "skills.smart_home_discover": disc}
+
+    def power_on_arg(self, call):
+        args, kwargs = call
+        if "power_on" in kwargs:
+            return kwargs["power_on"]
+        return args[2] if len(args) > 2 else True
+
+
+class _RouterCase(unittest.TestCase):
+    def setUp(self):
+        self.login = object()
+        p = mock.patch.object(router, "_alexa_login", return_value=self.login)
+        p.start()
+        self.addCleanup(p.stop)
+        self.alexa = _FakeAlexa()
+
+    def use(self, alexa):
+        self.alexa = alexa
+        _swap_modules(self, alexa.modules())
+
+
+class AlexaFallbackRealApiTests(_RouterCase):
+
+    def _dev(self, eid="ent-1"):
+        return {"name": "Office Lamp", "alexa_entity_id": eid}
+
+    def test_on_goes_through_set_light_state(self):
+        self.use(_FakeAlexa())
+        out = router._alexa_set_state(self._dev(), {"on": True})
+        self.assertNotIn("error", out)
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(len(self.alexa.calls), 1)
+        args, _kw = self.alexa.calls[0]
+        self.assertIs(args[0], self.login)
+        self.assertEqual(args[1], "ent-1")
+        self.assertIs(self.alexa.power_on_arg(self.alexa.calls[0]), True)
+
+    def test_off_sends_power_off(self):
+        self.use(_FakeAlexa())
+        out = router._alexa_set_state(self._dev(), {"on": False})
+        self.assertTrue(out.get("ok"))
+        self.assertIs(self.alexa.power_on_arg(self.alexa.calls[0]), False)
+
+    def test_brightness_is_sent_not_dropped(self):
+        # "Set to 50%" is spoken on success, so the level must really be sent.
+        self.use(_FakeAlexa())
+        out = router._alexa_set_state(self._dev(), {"on": True, "brightness": 50})
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(self.alexa.calls[0][1].get("brightness"), 50)
+
+    def test_amazon_refusal_is_an_error_not_a_success(self):
+        reply = {"controlResponses": [],
+                 "errors": [{"entity": {"entityId": "ent-1"},
+                             "code": "ENDPOINT_UNREACHABLE",
+                             "message": "device offline"}]}
+        self.use(_FakeAlexa(reply=reply))
+        out = router._alexa_set_state(self._dev(), {"on": True})
+        self.assertIn("error", out)
+        self.assertIn("ENDPOINT_UNREACHABLE", out["error"])
+
+    def test_a_non_success_code_is_an_error(self):
+        reply = {"controlResponses": [{"entityId": "ent-1", "code": "FAILURE"}],
+                 "errors": []}
+        self.use(_FakeAlexa(reply=reply))
+        out = router._alexa_set_state(self._dev(), {"on": True})
+        self.assertIn("error", out)
+        self.assertIn("FAILURE", out["error"])
+
+    def test_an_empty_reply_is_an_error(self):
+        self.use(_FakeAlexa(reply={}))
+        out = router._alexa_set_state(self._dev(), {"on": True})
+        self.assertIn("error", out)
+
+
+@unittest.skipUnless(
+    __import__("importlib").util.find_spec("alexapy") is not None,
+    "alexapy not installed (the light CI runner) - contract runs locally")
+class InstalledAlexapyContractTests(_RouterCase):
+    """Bind the router's call against the INSTALLED alexapy's real signature,
+    so a fake shaped by the test's author cannot hide drift (the old fakes
+    offered a set_appliance_state that no installed alexapy had)."""
+
+    def test_call_binds_to_the_real_set_light_state(self):
+        import alexapy
+        real = getattr(alexapy.AlexaAPI, "set_light_state", None)
+        self.assertTrue(callable(real), "installed alexapy has no set_light_state")
+        self.use(_FakeAlexa(signature_of=inspect.signature(real)))
+        out = router._alexa_set_state(
+            {"name": "Office Lamp", "alexa_entity_id": "ent-1"},
+            {"on": True, "brightness": 40})
+        self.assertTrue(out.get("ok"), out)
+        self.assertEqual(len(self.alexa.calls), 1)
+
+
+class SceneActivationTests(_RouterCase):
+    """End to end through smart_home_control with a catalog holding an Alexa
+    scene entity and a light that ties it on name score."""
+
+    def setUp(self):
+        super().setUp()
+        self.catalog = {"devices": [
+            # Listed FIRST and scores the same as the scene for "movie night".
+            {"name": "Night", "alexa_room": "Movie Room", "type": "light",
+             "brand": "Philips Hue", "controller_skill": "sh_hue",
+             "alexa_entity_id": "light-1"},
+            {"name": "Movie Night", "alexa_room": "", "type": "scene",
+             "brand": "Philips Hue", "controller_skill": "sh_hue",
+             "alexa_entity_id": "scene-1"},
+        ]}
+        p = mock.patch.object(router, "_ensure_catalog",
+                              return_value=self.catalog)
+        p.start()
+        self.addCleanup(p.stop)
+        self.skill = mock.patch.object(
+            router, "_call_skill",
+            return_value={"error": "bulb 'Movie Night' not found on bridge"})
+        self.call_skill = self.skill.start()
+        self.addCleanup(self.skill.stop)
+
+    def test_run_the_scene_activates_the_scene_entity(self):
+        self.use(_FakeAlexa())
+        out = router.smart_home_control("run the movie night scene")
+        self.assertTrue(out.startswith("Scene running"), out)
+        self.assertIn("Movie Night", out)
+        self.assertEqual([c[0][1] for c in self.alexa.calls], ["scene-1"],
+                         "only the scene entity may be driven, never the light")
+        self.assertIs(self.alexa.power_on_arg(self.alexa.calls[0]), True)
+        # No brand skill knows scenes: one would at best fail, at worst switch
+        # a same-named bulb and report the scene as running.
+        self.call_skill.assert_not_called()
+
+    def test_scene_amazon_refused_is_not_reported_running(self):
+        reply = {"controlResponses": [],
+                 "errors": [{"code": "INVALID_ACTION", "message": "no scene"}]}
+        self.use(_FakeAlexa(reply=reply))
+        out = router.smart_home_control("run the movie night scene")
+        self.assertNotIn("Scene running", out)
+        self.assertTrue(_has_failure_marker(out), out)
+        self.assertIn("INVALID_ACTION", out)
+
+    def test_scene_with_no_usable_alexapy_call_says_so(self):
+        alexa = _FakeAlexa()
+        alexa.api = types.SimpleNamespace()     # an alexapy with no control call
+        self.use(alexa)
+        out = router.smart_home_control("run the movie night scene")
+        self.assertNotIn("Scene running", out)
+        self.assertTrue(_has_failure_marker(out), out)
 
 
 if __name__ == "__main__":
