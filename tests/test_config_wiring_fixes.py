@@ -249,9 +249,24 @@ class OtherSkillsCloudGateTests(unittest.TestCase):
         self.assertEqual(out, "Local reply, sir.")
 
     def test_cloud_backend_still_uses_claude(self):
+        # NOTIFY_SORTER_BACKEND "claude" (the order before 2026-10-02):
+        # Claude first on a cloud backend, the gate does not block it.
+        import core.config as cfg
         mod, _ = load_skill_isolated("notification_triage", register=False)
-        out, anth = self._with(True, "fyi",
-                               lambda: mod._classify_with_llm("App", "T", "B"))
+        with mock.patch.object(cfg, "NOTIFY_SORTER_BACKEND", "claude"):
+            out, anth = self._with(
+                True, "fyi", lambda: mod._classify_with_llm("App", "T", "B"))
+        anth.Anthropic.assert_called_once()
+        self.assertEqual(out, "urgent")
+
+    def test_cloud_backend_reaches_claude_when_local_first_is_unusable(self):
+        # The local_first default (2026-10-02): an unusable local answer on a
+        # cloud backend still falls back to Claude through the open gate.
+        import core.config as cfg
+        mod, _ = load_skill_isolated("notification_triage", register=False)
+        with mock.patch.object(cfg, "NOTIFY_SORTER_BACKEND", "local_first"):
+            out, anth = self._with(
+                True, "no idea", lambda: mod._classify_with_llm("App", "T", "B"))
         anth.Anthropic.assert_called_once()
         self.assertEqual(out, "urgent")
 
