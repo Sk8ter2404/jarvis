@@ -1152,15 +1152,15 @@ class R6ShadowJudgeTests(_Base):
         # Through the REAL judge, rescue and live outcome, in every gate
         # state the row can take: stdout gets numbers, never words.
         bc = self.bc
-        secret = "open the secret project folder"
+        words = "open the secret project folder"
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             for kw in ({}, {"_require_wake_runtime": True},
                        {"_standby_mode": [True], "_sleep_mode": [True]}):
                 for name, value in kw.items():
                     self._p(bc, name, value)
-                for w_text, p_text in (("Jarvis, " + secret, secret),
-                                       (secret, "[Music] " + secret),
+                for w_text, p_text in (("Jarvis, " + words, words),
+                                       (words, "[Music] " + words),
                                        ("Thank you.", "thank you")):
                     self._p(bc, "_stt_alt", _FakeEngine(text=p_text))
                     self.sh.offer(self.audio, w_text, W_RES[1], 900, 0.009,
