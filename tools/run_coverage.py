@@ -175,6 +175,7 @@ def main(argv: list[str]) -> int:
     # tests/__init__.py armed it already - idempotent.
     from tools import hermetic_guard
     hermetic_guard.install()
+    del tests  # the chokepoint import was for its side effect only (pyflakes)
     # THEN THE TIME CEILING (tools/test_watchdog.py) — mem_guard bounds what a
     # run may ALLOCATE, this bounds how long it may STALL. Coverage instruments
     # every executed line, so this run is legitimately several times slower than

@@ -1039,7 +1039,6 @@ class HUD:
         # (which lives at top-center, y=8). Width is measured naively from
         # the text length so different version strings sit neatly.
         pad_x = 8
-        pad_y = 4
         badge_w = max(70, 7 * len(badge_text) + 2 * pad_x)
         badge_h = 18
         x2 = HUD_W - 6

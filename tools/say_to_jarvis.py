@@ -87,7 +87,7 @@ def tail_for_response(text: str, timeout_s: float = 30.0) -> None:
         f.seek(0, os.SEEK_END)
         start = time.time()
         saw_inject = False
-        marker_inject = f"[inject]"
+        marker_inject = "[inject]"
         marker_reply  = "JARVIS:"
         while time.time() - start < timeout_s:
             line = f.readline()

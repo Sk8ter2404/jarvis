@@ -4,12 +4,9 @@ Goal: surface EVERY smart-home device, not just the ones that answered the
 first quick broadcast. No cloud/Amazon needed."""
 import asyncio
 import concurrent.futures as cf
-import json
 import re
 import socket
 import subprocess
-import sys
-import time
 
 CF = 0x08000000  # CREATE_NO_WINDOW
 

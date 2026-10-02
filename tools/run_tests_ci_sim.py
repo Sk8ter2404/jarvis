@@ -422,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
     # tests/__init__.py armed it already - idempotent.
     from tools import hermetic_guard
     hermetic_guard.install()
+    del tests  # the chokepoint import was for its side effect only (pyflakes)
     # THEN THE TIME CEILING — the sibling of the memory ceiling above. mem_guard
     # bounds what a run may ALLOCATE; this bounds how long it may STALL, which
     # is the failure the memory guard structurally cannot see (a hang is not an

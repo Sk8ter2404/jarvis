@@ -120,7 +120,8 @@ from core import camera_tiles as _camera_tiles
 # a boot log can say "(flask present, using stdlib anyway)" but the server is
 # always the stdlib ThreadingHTTPServer below.
 try:  # pragma: no cover - trivial import probe; result only affects a log line
-    import flask as _flask  # noqa: F401
+    import flask as _flask
+    del _flask  # probe only — pyflakes ignores `# noqa` (2026-10-02)
     FLASK_AVAILABLE = True
 except Exception:  # pragma: no cover
     FLASK_AVAILABLE = False

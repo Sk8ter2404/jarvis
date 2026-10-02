@@ -86,8 +86,8 @@ import re
 import sys
 import traceback
 import types
-from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, field
+from collections import defaultdict
+from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2017,7 +2017,6 @@ def check_action_smoke_tests(skill_files: list[str]) -> tuple[list[Finding], dic
 
         for path in sorted(skill_files):
             rel = _rel(path)
-            stem = os.path.splitext(os.path.basename(path))[0]
             prof = _profile_skill(path)
             for action_name in prof["actions"]:
                 if action_name in _NO_SMOKE_TEST:
@@ -3074,10 +3073,10 @@ def main() -> int:
 
     if not args.quiet:
         sev_counts = {s: sum(1 for f in findings if f.severity == s) for s in ("P0", "P1", "P2")}
-        print(f"=== AUDIT COMPLETE ===")
+        print("=== AUDIT COMPLETE ===")
         print(f"Files audited: {len(files)}")
         print(f"Findings: {len(findings)}  (P0={sev_counts['P0']} P1={sev_counts['P1']} P2={sev_counts['P2']})")
-        print(f"Report:   audit_report.json + audit_report.md")
+        print("Report:   audit_report.json + audit_report.md")
         # Surface up to 5 P0/P1 findings inline
         critical = [f for f in findings if f.severity in ("P0", "P1")]
         if critical:
