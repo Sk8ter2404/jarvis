@@ -137,7 +137,9 @@ _DENYLIST_MODULES = ("holographic_overlay", "dossier", "suit_up",
                      # JARVIS HUD through this path.
                      "morning_handoff",
                      # every youtube_search action opens a real browser tab
-                     "youtube_search")
+                     "youtube_search",
+                     # show_globe / globe_pin open the holographic globe
+                     "globe")
 
 
 def _spawns_desktop_windows(name: str, fn) -> bool:

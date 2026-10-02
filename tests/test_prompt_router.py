@@ -1360,3 +1360,52 @@ class RunningCostsRoutingTests(unittest.TestCase):
                          "running_costs")
         for q in self.CREDITS:
             self.assertEqual(examples.get(q.lower()), "check_credits", q)
+
+
+class GlobeRoutingTests(unittest.TestCase):
+    """skills/globe.py (2026-10-02). Both directions: the globe's own phrases
+    must load the GLOBE section with the action they ask for, and the
+    existing "where is ..." / location / weather turns must NOT pick it up
+    (the router has no bare "where is" keyword on purpose) and must keep their
+    own section."""
+
+    def setUp(self):
+        _core, self.sections = pr.split_pc_control(FULL)
+
+    def _inc(self, q):
+        return pr.select_sections(q, self.sections)[0]
+
+    def test_globe_is_a_parsed_section(self):
+        self.assertIn("GLOBE", [h for h, _b in self.sections])
+
+    def test_globe_phrases_load_the_globe_and_ship_their_action(self):
+        for q, action in (("show me the globe", "show_globe"),
+                          ("put the globe on the left monitor", "show_globe"),
+                          ("show me where Tokyo is", "globe_pin"),
+                          ("pin London and New York", "globe_pin"),
+                          ("drop a pin on Paris", "globe_pin"),
+                          ("clear the pins", "globe_clear"),
+                          ("hide the globe", "hide_globe")):
+            with self.subTest(q=q):
+                self.assertIn("GLOBE", self._inc(q))
+                self.assertIn(action, pr.turn_pc_block(q, FULL))
+
+    def test_where_and_weather_turns_keep_their_home_and_skip_the_globe(self):
+        for q, home in (("where's my package", "AMAZON ORDER TRACKER"),
+                        ("where is my package", "AMAZON ORDER TRACKER"),
+                        ("where am I", "UNIFIED"),
+                        ("where is the print at", "BAMBU 3D PRINTER"),
+                        ("where is the robot build at", "REPO ROBOT PROJECT"),
+                        ("what's the weather in Tokyo", "WEATHER BRIEFING"),
+                        ("will it rain tomorrow in London", "WEATHER BRIEFING"),
+                        ("is it going to rain", "WEATHER BRIEFING")):
+            with self.subTest(q=q):
+                inc = self._inc(q)
+                self.assertNotIn("GLOBE", inc)
+                self.assertIn(home, inc)
+
+    def test_pin_keyword_does_not_fire_inside_other_words(self):
+        for q in ("keep the window pinned", "spin up the reactor",
+                  "ping the router", "what's on the spinner"):
+            with self.subTest(q=q):
+                self.assertNotIn("GLOBE", self._inc(q))
