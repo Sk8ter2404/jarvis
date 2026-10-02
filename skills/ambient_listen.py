@@ -662,7 +662,6 @@ def _focused_window_title() -> str:
         if sys.platform != "win32":
             return ""
         import ctypes
-        from ctypes import wintypes
         user32 = ctypes.windll.user32
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
@@ -2036,7 +2035,7 @@ def ambient_listen_status(_: str = "") -> str:
         mic_line = (f"mic ON {uptime}s, {mic_entries} entries, last "
                     f"{last_str}: {snippet!r}{health}")
     else:
-        mic_line = f"mic OFF" + (f" (last error: {err})" if err else "")
+        mic_line = "mic OFF" + (f" (last error: {err})" if err else "")
 
     audio_line = (f"audio {'ON' if audio_running else 'OFF'} "
                   f"({audio_total} entries"

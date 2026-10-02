@@ -337,7 +337,7 @@ def ecobee_request_pin(_: str = "") -> str:
     if err:
         return err
     print()
-    print(f"  [sh-ecobee] Open https://www.ecobee.com/consumerportal/")
+    print("  [sh-ecobee] Open https://www.ecobee.com/consumerportal/")
     print(f"             -> My Apps -> Add Application -> enter PIN: {pin}")
     print("              Then say 'ecobee complete setup' to finish.")
     return (f"Ecobee PIN: {pin}, sir. Add it under My Apps at "
@@ -399,7 +399,7 @@ def _run_ecobee_wizard_interactive() -> str:
     if err:
         return err
     print()
-    print(f"  [sh-ecobee] Open https://www.ecobee.com/consumerportal/")
+    print("  [sh-ecobee] Open https://www.ecobee.com/consumerportal/")
     print(f"             -> My Apps -> Add Application -> enter PIN: {pin}")
     print("              Then press <enter> here to exchange the PIN for tokens.")
     try:

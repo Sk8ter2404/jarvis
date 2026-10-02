@@ -888,7 +888,6 @@ def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
     if am is None:
         return
     try:
-        import json
         path = am.AIR_CURSOR_STATE_FILE
         hands = decision.hands
         if not decision.active or not hands or hands[0] is None or hands[1] is None:

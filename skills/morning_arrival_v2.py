@@ -340,7 +340,7 @@ def _section_teams() -> str:
         return ""
     top = (result.get("top_sender") or "").strip()
     if count == 1:
-        return f"one new Teams message" + (f" from {top}" if top else "")
+        return "one new Teams message" + (f" from {top}" if top else "")
     if top:
         return f"{count} new Teams messages, one from {top}"
     return f"{count} new Teams messages"

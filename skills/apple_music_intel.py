@@ -689,7 +689,11 @@ def _act_play_unheard(arg: str = "") -> str:
     skipped = _session_skipped_keys()
 
     try:
-        import pythoncom  # noqa: F401  (already coinit'd inside itunes_bridge.get_client)
+        # (COM is already coinit'd inside itunes_bridge.get_client.) The
+        # pythoncom import stays — a missing pywin32 still lands in the except
+        # below — but the name is dropped: pyflakes ignores noqa (2026-10-02).
+        import pythoncom
+        del pythoncom
         lib = app.LibraryPlaylist
         # Walk the library top-down but cap iteration so very large libs
         # don't stall the loop. iTunes COM exposes Tracks as a 1-based

@@ -362,7 +362,7 @@ def _enter_night_owl(trigger: str = "manual", *, announce: bool = True) -> str:
     trigger and return a status line without re-announcing."""
     with _mode_lock:
         if _night_owl_active[0]:
-            return f"Night-owl mode already engaged, sir."
+            return "Night-owl mode already engaged, sir."
         _night_owl_active[0] = True
         _started_at[0]       = time.time()
         _trigger[0]          = trigger

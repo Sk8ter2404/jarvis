@@ -716,7 +716,7 @@ def _act_dossier(arg: str) -> str:
         lines.append("  web abstract: " + _shorten_sentence(data["web"], 280))
     else:
         lines.append("  web abstract: (unavailable)")
-    lines.append(f"  HUD card displayed on the top monitor.")
+    lines.append("  HUD card displayed on the top monitor.")
     lines.append(f"  Spoken summary: {data['summary']}")
     return "\n".join(lines)
 

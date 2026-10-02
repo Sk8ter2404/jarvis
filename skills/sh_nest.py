@@ -171,7 +171,6 @@ async def _build_client_async() -> Any:
         # google-nest-sdm API: AbstractAuth subclass needed in newer versions.
         # We use the low-level Token approach via aiohttp_oauth2 if available;
         # otherwise fall back to the legacy AccessTokenAuth.
-        AuthClass = getattr(_auth, "AbstractAuth", None)
         AccessTokenAuth = getattr(_auth, "AccessTokenAuth", None)
         session = aiohttp.ClientSession()
         if AccessTokenAuth is not None:
@@ -248,7 +247,6 @@ def list_devices() -> list[dict]:
     client, project_id, _session = c
     try:
         async def _go():
-            mgr = _dm.DeviceManager()
             devices = await client.request("get", f"enterprises/{project_id}/devices")
             return devices
         devices = _run_async(_go())
@@ -258,7 +256,6 @@ def list_devices() -> list[dict]:
     items = (devices or {}).get("devices", []) if isinstance(devices, dict) else []
     out: list[dict] = []
     for d in items:
-        traits = d.get("traits") or {}
         dtype = d.get("type", "")
         is_thermo = "sdm.devices.types.THERMOSTAT" in dtype
         is_cam = "sdm.devices.types.CAMERA" in dtype or "DOORBELL" in dtype

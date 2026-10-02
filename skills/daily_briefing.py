@@ -40,7 +40,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.request
 
 from core.atomic_io import _atomic_write_json
 

@@ -141,7 +141,8 @@ def _probe_tts_lib() -> bool:
     if _HAS_TTS_LIB is not None:
         return _HAS_TTS_LIB
     try:
-        import TTS  # noqa: F401 — only here to confirm the package resolves
+        import TTS  # only here to confirm the package resolves
+        del TTS     # ...so drop the name: pyflakes ignores noqa (2026-10-02)
         _HAS_TTS_LIB = True
     except Exception as e:
         _HAS_TTS_LIB = False

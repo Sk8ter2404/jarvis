@@ -703,10 +703,10 @@ async def _login_via_playwright(
         return None
 
     print()
-    print(f"  [sh-discover] Opening a Chromium window so you can sign in to Amazon.")
-    print(f"                Complete sign-in normally (CAPTCHA / 2FA included);")
-    print(f"                JARVIS will capture the session cookies automatically")
-    print(f"                once Amazon redirects you off the /ap/signin page.")
+    print("  [sh-discover] Opening a Chromium window so you can sign in to Amazon.")
+    print("                Complete sign-in normally (CAPTCHA / 2FA included);")
+    print("                JARVIS will capture the session cookies automatically")
+    print("                once Amazon redirects you off the /ap/signin page.")
     print(f"                Timeout: {int(timeout_seconds)}s.")
     print()
 
@@ -1765,7 +1765,6 @@ def register(actions: dict) -> None:
 if __name__ == "__main__":
     # Interactive sign-in path. Voice actions route here via the CLI
     # hint to keep input() / getpass() off the main audio loop.
-    import sys
     cli_arg = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
     result = _run_wizard_interactive(cli_arg)
     print()

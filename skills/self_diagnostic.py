@@ -113,15 +113,12 @@ Voice triggers (registered actions)
 """
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import json
 import logging
 import os
 import queue
 import re
 import socket
-import struct
 import subprocess
 import sys
 import threading
@@ -1356,10 +1353,13 @@ def _face_cascade_status(cv2_mod) -> "tuple[bool, str]":
 def _probe_webcam() -> dict:
     start = _now()
     try:
-        import cv2  # type: ignore  # noqa: F401 — availability check before taking the lock
+        import cv2  # type: ignore — availability check before taking the lock
     except Exception as e:
         return _result(False, (_now() - start) * 1000.0,
                        error=f"opencv not importable: {e}")
+    # Availability only, as in _attempt_camera_wake: drop the name so pyflakes
+    # (which ignores noqa) stays clean now that CI lints skills/ (2026-10-02).
+    del cv2
 
     # 2026-07-21 audit: every in-process cv2.VideoCapture open/release must
     # hold bobert_companion._camera_io_lock — overlapping open/release in

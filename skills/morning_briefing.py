@@ -25,11 +25,9 @@ Style is authentic JARVIS — dry, two or three sentences, no preamble.
 import importlib
 import json
 import os
-import re
 import sys
 import threading
 import time
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 from core.atomic_io import _atomic_write_json

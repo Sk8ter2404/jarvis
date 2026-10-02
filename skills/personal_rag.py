@@ -43,7 +43,6 @@ import os
 import sys
 import threading
 import time
-from typing import Optional
 
 
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

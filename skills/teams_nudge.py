@@ -278,9 +278,9 @@ def _monitor_loop():  # pragma: no cover - non-terminating background daemon (sl
                     print(f"  [teams] nudging: {payload}")
                     _enqueue_speech(payload)
                 elif has_unread and payload == "snoozed":
-                    print(f"  [teams] unread detected — snoozed")
+                    print("  [teams] unread detected — snoozed")
                 else:
-                    print(f"  [teams] clear")
+                    print("  [teams] clear")
             except Exception as e:
                 print(f"  [teams] check error: {e}")
             time.sleep(CHECK_INTERVAL_SECONDS)

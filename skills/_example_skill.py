@@ -9,6 +9,12 @@ and restart Bobert.
 
 import time
 
+# The skill loader injects `skill_utils` into this module BEFORE executing it
+# (load_skills sets mod.skill_utils, then exec_module), so this line keeps the
+# injected dict. It also gives the name a definition pyflakes can see: CI lints
+# skills/ (2026-10-02), and a bare injected name reads as "undefined name".
+skill_utils = globals().get("skill_utils", {})
+
 
 def open_morning_tabs(_: str = "") -> str:
     """Open the user's usual morning browser tabs."""

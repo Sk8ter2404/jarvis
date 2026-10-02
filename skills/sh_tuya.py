@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import os
 import threading
-from typing import Any
 
 # STAGING ISOLATION (2026-07-21): resolve through core.paths so a
 # JARVIS_STAGING process writes data_staging/ instead of the live data/.

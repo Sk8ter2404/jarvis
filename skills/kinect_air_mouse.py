@@ -2553,7 +2553,6 @@ def _publish_overlay_state(decision: AirMouseDecision, visible: bool,
     the overlay position the ring at the hand; the state is "prime" and visible so
     the ring shows without a solid reticle."""
     try:
-        import json
         prime = getattr(decision, "prime", 0.0) or 0.0
         priming = prime > 0.0 and decision.cursor is None
         if decision.cursor is not None:

@@ -94,7 +94,7 @@ import tempfile
 import threading
 import time
 import traceback
-from typing import Any, Callable
+from typing import Any
 
 # Project-root onto sys.path so `core.*` resolves whether this module is
 # loaded as `skills.phone_bridge` or run standalone.
@@ -222,7 +222,6 @@ _polling_thread    = [None]            # type: ignore[var-annotated]
 def _load_state() -> None:
     """Restore persisted state from data/phone_bridge_state.json (if any).
     Tolerates partial / corrupt files — falls back to defaults."""
-    global _persisted
     if not os.path.exists(_STATE_FILE):
         return
     try:
