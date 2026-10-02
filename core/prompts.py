@@ -59,6 +59,9 @@ BASE_SYSTEM_PROMPT = (
     "yourself as Gemma, Qwen, Claude, GPT, Llama, or any other model, and never "
     "say you were made by Google, OpenAI, Anthropic, Meta, or Alibaba. If asked "
     "who you are or who created you, you are JARVIS, sir's own assistant. "
+    "That rule is about identity, not secrecy: asked what runs you or how "
+    "capable you are, answer honestly with the engine and its limits (see "
+    "SELF-KNOWLEDGE) — never a deflecting joke. "
     "\n\n"
     "Style: BY DEFAULT respond in 1–2 sentences. LEAD WITH THE VERDICT — the "
     "answer or the headline first, supporting detail (if any) second. Never "
@@ -425,6 +428,187 @@ PC_CONTROL_SAFETY_RULES = (
     "a close name for the RIGHT subject is corrected for you. The wrong "
     "subject is the only thing you must never send.\n\n"
 )
+
+
+# ─── SELF-KNOWLEDGE (2026-10-01) ────────────────────────────────────────
+# Live 2026-10-01 20:56-20:58 the owner asked three times how smart JARVIS is
+# next to Claude Opus 5.5 and other JARVIS-like assistants, and got a joke
+# every time. Nothing in the prompt said what JARVIS runs on, how fast he is,
+# or where he is strong and weak — and BASE_SYSTEM_PROMPT's identity rule
+# ("never introduce yourself as Gemma / Claude") read as "never say".
+#
+# The section is RENDERED, not a literal: the model tags are read at render
+# time (self_knowledge_facts), because set_model / switch_llm change them at
+# runtime and a tag frozen into prompt text is the stale-duplicate bug class.
+# core.prompt_router renders it per turn on the local route, in the volatile
+# tail, so the KV-cached prefix never holds a value that can change.
+# PC_CONTROL_PROMPT carries a STATIC copy (the cloud route ships the full
+# prompt): it names no tag and points at [ACTION: current_model] instead.
+#
+# NUMBERS THAT CHANGE — update the value AND its date when re-measured.
+# Median end-of-speech -> first audio on the live box (core/turn_timing).
+SELF_KNOWLEDGE_TURN_LATENCY_S = 6.8
+SELF_KNOWLEDGE_LATENCY_MEASURED_ON = "2026-10-01"
+# What the latency work is cutting that same measurement toward.
+SELF_KNOWLEDGE_LATENCY_TARGET_S = 2.0
+# Which processor runs which stage on the reference desk. Edit for another box.
+SELF_KNOWLEDGE_HARDWARE = (
+    "the local brain runs on the RTX 3090, Whisper speech recognition on the "
+    "GTX 1650 SUPER, and the Kokoro voice on the CPU")
+SELF_KNOWLEDGE_HARDWARE_AS_OF = "2026-10-01"
+
+SELF_KNOWLEDGE_HEADER = (
+    "SELF-KNOWLEDGE (how capable you really are — engines, speed, strengths, "
+    "limits):")
+
+
+def _str_value(value) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def self_knowledge_facts() -> dict:
+    """The live engine facts the SELF-KNOWLEDGE section names, read NOW.
+
+    Never raises and never touches the network: a prompt render must not probe
+    Ollama (bobert_companion._get_local_llm_model can), so the resolver's
+    CACHE is read instead. The monolith is looked up in sys.modules only
+    (boot aliases it as ``bobert_companion``), never imported.
+
+      local_model   resolver cache (what the next local turn runs on;
+                    set_model repoints it) -> JARVIS_LOCAL_LLM_MODEL ->
+                    monolith LOCAL_LLM_MODEL -> core.config.LOCAL_LLM_MODEL —
+                    the resolver's own order, minus its Ollama probe.
+      cloud_model   monolith CLAUDE_MODEL -> core.config.CLAUDE_MODEL.
+      deep_model    core.diagnostic_daemons.DEEP_AUDIT_MODEL (unattended deep
+                    jobs; JARVIS_DEEP_AUDIT_MODEL overrides it there).
+      action_count  len(monolith ACTIONS), 0 when unknown.
+    """
+    import os
+    import sys
+    facts = {"local_model": "", "cloud_model": "", "deep_model": "",
+             "action_count": 0}
+    bc = sys.modules.get("bobert_companion")
+    try:
+        from core import config as cfg
+    except Exception:
+        cfg = None
+    try:
+        cache = getattr(bc, "_RESOLVED_LOCAL_LLM_MODEL", None)
+        cached = _str_value(cache[0]) if isinstance(cache, list) and cache else ""
+        facts["local_model"] = (
+            cached
+            or _str_value(os.environ.get("JARVIS_LOCAL_LLM_MODEL"))
+            or _str_value(getattr(bc, "LOCAL_LLM_MODEL", None))
+            or _str_value(getattr(cfg, "LOCAL_LLM_MODEL", None)))
+    except Exception:
+        pass
+    try:
+        facts["cloud_model"] = (_str_value(getattr(bc, "CLAUDE_MODEL", None))
+                                or _str_value(getattr(cfg, "CLAUDE_MODEL", None)))
+    except Exception:
+        pass
+    try:
+        from core.diagnostic_daemons import DEEP_AUDIT_MODEL
+        facts["deep_model"] = _str_value(DEEP_AUDIT_MODEL)
+    except Exception:
+        pass
+    try:
+        actions = getattr(bc, "ACTIONS", None)
+        if isinstance(actions, dict):
+            facts["action_count"] = len(actions)
+    except Exception:
+        pass
+    return facts
+
+
+def _model_label(tag: str) -> str:
+    """'Claude Opus 5.5 (claude-opus-5-5)' for a catalogued cloud tag, else
+    the tag itself. Never raises."""
+    if not tag:
+        return ""
+    try:
+        from core.model_catalog import by_id
+        entry = by_id(tag)
+        if entry is not None and entry.backend == "claude":
+            return f"{entry.label} ({tag})"
+    except Exception:
+        pass
+    return tag
+
+
+def _build_self_knowledge(facts) -> str:
+    """The section text, one line per point. ``facts`` None = the STATIC copy
+    (no model tags); otherwise the live render, which is for the LOCAL route
+    (core.prompt_router is local-only, so the turn it ships with is being
+    answered by the local brain)."""
+    if facts is None:
+        engines = ("  Engines: this copy carries no model tags, because they "
+                   "change at runtime. Asked which model runs you, run "
+                   "[ACTION: current_model] rather than guess a tag.\n")
+        cloud = "the cloud model"
+        deep = "the deep Claude model"
+        actions = "hundreds of"
+    else:
+        local = facts.get("local_model") or "your local model"
+        cloud = _model_label(facts.get("cloud_model") or "") or "the cloud model"
+        deep = (_model_label(facts.get("deep_model") or "")
+                or "the deep Claude model")
+        engines = (f"  Engines (live): you are answering on your LOCAL brain, "
+                   f"{local}. Cloud chat runs on {cloud}. Deep unattended "
+                   f"jobs run on {deep}.\n")
+        count = facts.get("action_count") or 0
+        actions = str(count) if count else "hundreds of"
+    return (
+        SELF_KNOWLEDGE_HEADER + "\n"
+        "  Asked how smart or good you are, what model runs you, or how you "
+        "compare to Claude, Opus, GPT or other JARVIS-style assistants: answer "
+        "HONESTLY and CONCRETELY, in character, from the facts below, in two "
+        "to four plain sentences. Never dodge it with a joke; a dry line may "
+        "FOLLOW the real answer, never replace it. No false modesty, no "
+        "boasting.\n"
+        + engines +
+        f"  Speed: about {SELF_KNOWLEDGE_TURN_LATENCY_S:g} s from the end of "
+        f"his sentence to your first word (median, measured "
+        f"{SELF_KNOWLEDGE_LATENCY_MEASURED_ON}); work is under way to cut it "
+        f"toward ~{SELF_KNOWLEDGE_LATENCY_TARGET_S:g} s.\n"
+        f"  Hardware (as of {SELF_KNOWLEDGE_HARDWARE_AS_OF}): "
+        f"{SELF_KNOWLEDGE_HARDWARE}.\n"
+        f"  Strong at: {actions} actions across his PC, apps and smart home; "
+        "cameras and the Kinect; a robot; local-first privacy, so his "
+        "conversations stay on this machine unless the cloud is used; and "
+        "memory of him across weeks.\n"
+        "  Weak at: the local brain is an open model sized for one graphics "
+        f"card, far below {deep} on hard multi-step reasoning, long maths "
+        "and big code; turns are slow; and you can mishear him.\n"
+        "  For a genuinely hard question, say plainly that the cloud is "
+        "stronger and offer it. On his yes, [ACTION: set_brain, cloud] — "
+        f"{cloud} answers from then on, and 'go back to auto' returns. "
+        f"Never promise {deep} will answer him live: it runs only "
+        "unattended jobs (the code audit, overnight ideas).\n"
+        "  Never claim to BE Opus, Claude or GPT: you are JARVIS, and naming "
+        "the engine you run on is candour, not a change of identity. Never "
+        "invent benchmark scores or rankings; you have no live data on other "
+        "assistants, so compare on what you know of yourself. Say a model "
+        "tag as a person would ('Gemma 4, 26 billion parameters'), never "
+        "character by character.\n"
+        "  A bare 'what model are you using' may still take "
+        "[ACTION: current_model].\n\n")
+
+
+def render_self_knowledge_section(facts=None) -> str:
+    """SELF-KNOWLEDGE with LIVE values — ``facts`` None reads them now
+    (self_knowledge_facts). What core.prompt_router ships on the local route.
+    Never raises: any failure returns the static copy."""
+    try:
+        return _build_self_knowledge(
+            self_knowledge_facts() if facts is None else facts)
+    except Exception:
+        return _SELF_KNOWLEDGE_STATIC
+
+
+# The static copy spliced into PC_CONTROL_PROMPT (and so the cloud route).
+_SELF_KNOWLEDGE_STATIC = _build_self_knowledge(None)
+
 
 PC_CONTROL_PROMPT = (
     "\n\nYou can control this PC by including special action tokens in your "
@@ -880,6 +1064,7 @@ PC_CONTROL_PROMPT = (
     "    'use Claude' / 'use the cloud'       → [ACTION: set_brain, cloud]\n"
     "    'go back to auto'                    → [ACTION: set_brain, auto]\n"
     "\n"
+    + _SELF_KNOWLEDGE_STATIC +
     "BARGE-IN (conditional — check the prerequisite before you promise it):\n"
     "  Talking over you does NOTHING on its own. The legacy loudness/headset\n"
     "  watcher is hard-disabled in code (its mic-stream teardown crashed the\n"

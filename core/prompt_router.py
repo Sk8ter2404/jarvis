@@ -186,6 +186,30 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "model", "which model", "local model", "your brain", "ollama", "llm",
         "what model", "running locally",
     ],
+    # 2026-10-01 live: "how smart are you compared to Claude Opus 5.5" (asked
+    # three times) loaded CLAUDE CREDITS + the three SMART HOME sections and
+    # got a joke each time; "how do you compare to other AIs" loaded nothing.
+    # Its body is rendered per turn from live values (_RUNTIME_SECTIONS).
+    "SELF-KNOWLEDGE": [
+        # how capable
+        "how smart are you", "how smart you are", "how smart is jarvis",
+        "how intelligent", "how clever are you", "how capable",
+        "how good are you", "how good is jarvis", "your iq",
+        "smarter than", "dumber than", "better than you",
+        # what runs him
+        "what model", "which model are you", "what are you running on",
+        "what runs you", "what powers you", "what llm",
+        # comparisons
+        "compare to", "compared to", "compare with", "compared with",
+        "compare yourself", "how do you compare", "stack up",
+        "you versus", "you vs", "better model", "smarter model",
+        # the others. "other ai" is spelled out per ending: bare it would
+        # fire on "the other air purifier".
+        "opus", "claude", "gpt", "chatgpt", "gemini",
+        "other ais", "other ai ", "other ai?", "other ai.",
+        "other assistant", "other jarvis", "jarvis-like", "jarvis like",
+        "assistants like you",
+    ],
     "BARGE-IN": ["interrupt", "barge", "stop talking", "cut you off"],
     "TIMERS / REMINDERS": [
         "timer", "remind", "reminder", "alarm", "wake me", "in a minute",
@@ -765,6 +789,16 @@ _GENERIC_HEADER_WORDS = frozenset({
     # on it alone put wake_listener_stop next to wake_word_mode_off for
     # 'turn off wake word mode'; the two keyword lists tell them apart.
     "wake",
+    # 2026-10-01: "how smart are you" loaded SMART HOME, SMART HOME DISCOVERY
+    # and the PER-BRAND LIST on "smart" alone — lights grammar for a question
+    # about intelligence. Their keywords ("smart home", "list smart", ...)
+    # and the header word "home" still route every real smart-home turn.
+    "smart",
+    # Heads SELF-PRESERVATION, SELF DIAGNOSTIC, SELF-TEST PROBES and
+    # SELF-KNOWLEDGE, so "run a self test" (or "take a selfie": the match is
+    # word-START) loaded all four. Each has its own keywords or other header
+    # words ("preservation", "diagnostic", "self test", "knowledge").
+    "self",
 })
 
 # Sections always kept even with no keyword hit. Deliberately MINIMAL: only
@@ -927,6 +961,38 @@ def select_sections(user_text: str, sections: List[Tuple[str, str]]) -> Tuple[Li
     return included, dropped
 
 
+# Sections whose body is RENDERED from live runtime values each time it ships,
+# instead of PC_CONTROL_PROMPT's static text (2026-10-01). SELF-KNOWLEDGE names
+# the active local model tag, which set_model changes at runtime — a tag frozen
+# into the prompt would be the stale-duplicate bug class. The static copy in
+# PC_CONTROL_PROMPT still parses, routes and indexes like any other section;
+# only the text handed to the model is swapped. Rendering happens in the
+# per-turn halves (slim_pc_control / turn_pc_block), never in stable_pc_block,
+# so the KV-cached prefix stays byte-identical whatever model is loaded.
+def _render_self_knowledge() -> str:
+    from core.prompts import render_self_knowledge_section
+    return render_self_knowledge_section()
+
+
+_RUNTIME_SECTIONS = {
+    "SELF-KNOWLEDGE": _render_self_knowledge,
+}
+
+
+def _section_text(header: str, body: str) -> str:
+    """The text to ship for a selected section: its live render when it has
+    one (_RUNTIME_SECTIONS), else ``body``. Never raises — a failed render
+    ships the static body."""
+    render = _RUNTIME_SECTIONS.get(header.strip().upper())
+    if render is None:
+        return body
+    try:
+        out = render()
+    except Exception:
+        return body
+    return out if isinstance(out, str) and out.strip() else body
+
+
 def slim_pc_control(user_text: str, pc_control: str) -> str:
     """Build a slimmed PC_CONTROL for this turn: core preamble + the sections the
     text implicates + a one-line INDEX of what was left out (so the model still
@@ -941,7 +1007,7 @@ def slim_pc_control(user_text: str, pc_control: str) -> str:
         parts = [core]
         for header, body in sections:
             if header.strip() in inc_set:
-                parts.append(body)
+                parts.append(_section_text(header, body))
         if dropped:
             parts.append(
                 "\n\nADDITIONAL CAPABILITIES (ask and I'll use them; full "
@@ -1051,7 +1117,7 @@ def turn_pc_block(user_text: str, pc_control: str) -> str:
             return ""
         included, _dropped = select_sections(user_text, sections)
         inc = set(included)
-        bodies = [b for h, b in sections
+        bodies = [_section_text(h, b) for h, b in sections
                   if h.strip() in inc and h.strip().upper() not in _ALWAYS]
         return "\n".join(bodies)
     except Exception:
