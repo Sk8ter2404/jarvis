@@ -1519,7 +1519,11 @@ class R1TurnFlagsTests(_Base):
         self._p(bc, "PROCESSING_FILLER_DELAY", 0.5)
         self._p(bc, "TURN_TAIL_PROBE", True)
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        # A reserved key the module does not define is left out. Removed here
+        # rather than assumed absent: SMART_TURN_MODE shipped in v2.0.164 and
+        # the old "not defined yet" assertion went red.
+        with mock.patch.dict(bc.__dict__), contextlib.redirect_stdout(out):
+            bc.__dict__.pop("SMART_TURN_MODE", None)
             bc._log_turn_flags()
         line = out.getvalue().strip()
         self.assertTrue(line.startswith("[turn-flags] "), line)
@@ -1527,7 +1531,7 @@ class R1TurnFlagsTests(_Base):
         self.assertEqual(kv["PROCESSING_FILLER_DELAY"], "0.5")
         self.assertEqual(kv["TURN_TAIL_PROBE"], "True")
         self.assertTrue(set(kv) <= set(bc._TURN_FLAG_KEYS))
-        self.assertNotIn("SMART_TURN_MODE", kv)     # not defined yet
+        self.assertNotIn("SMART_TURN_MODE", kv)
 
     def test_flag_tokens(self):
         tok = self.bc._turn_flag_token
