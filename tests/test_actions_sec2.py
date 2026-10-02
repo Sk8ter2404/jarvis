@@ -1194,7 +1194,7 @@ class CloseBrowserTabTests(_BaseActTest):
     def test_the_browsers_full_name_still_closes_the_window(self):
         w = self._chrome("Lo-fi beats - YouTube - Google Chrome")
         self.bc._find_windows_by_title.return_value = [w]
-        A._act_close_window("Google Chrome")
+        out = A._act_close_window("Google Chrome")
         self.assertTrue(w.closed)
         self.bc.ui_hotkey.assert_not_called()
         self.assertIn("closed: Lo-fi beats - YouTube - Google Chrome", out)

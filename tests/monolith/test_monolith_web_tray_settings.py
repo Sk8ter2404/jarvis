@@ -34,6 +34,7 @@ import shutil
 import sys
 import tempfile
 import textwrap
+import time
 import types
 import unittest
 from collections import OrderedDict
