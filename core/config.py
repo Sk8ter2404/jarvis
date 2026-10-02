@@ -660,6 +660,11 @@ PRESENCE_HOLD_ENABLED        = True
 OWNER_PRESENT_VOICE_WINDOW_S = 600
 OWNER_PRESENT_FACE_WINDOW_S  = 120
 OWNER_PRESENT_INPUT_WINDOW_S = 300
+# The input watcher's polling fallback (the low-level hook is off by default,
+# AIR_MOUSE_LL_HOOK_ENABLED) counts injected input - an automation driving the
+# PC - like his. Polled input is presence only when his voice or a face was
+# seen within this many seconds (2026-10-02).
+OWNER_PRESENT_POLLED_INPUT_BACKUP_S = 900
 ROOM_TALK_HOLD_S             = 45
 PRESENCE_STALE_STATUS_S      = 600
 

@@ -339,6 +339,66 @@ class HelperTests(_Base):
         self.assertFalse(self.bc._presence_gate_armed[0])
 
 
+class PolledInputTests(_Base):
+    """Review repair (2026-10-02). "Injected input never counts" held only
+    for the low-level hook, and the hook is off by default
+    (AIR_MOUSE_LL_HOOK_ENABLED False): every October live session logged
+    "LL hook unavailable ... falling back to GetLastInputInfo polling". On
+    that fallback the OS idle timer counts AFK-Helper / automation input as
+    the owner's, so the 19:05 empty-room nudge would happen again. Driven
+    through the REAL skills._air_mouse_yield in fallback mode, with the OS
+    idle timer faked to "input 5 s ago" (the automation)."""
+
+    def setUp(self):
+        super().setUp()
+        from skills import _air_mouse_yield as y
+        self.y = y
+        for name, val in (("_installed", True), ("_hook_ok", False),
+                          ("_last_self_action_wall", float("-inf")),
+                          ("_last_real_input", float("-inf")),
+                          ("_last_hook_event", float("-inf"))):
+            self._p(y, name, val)
+        self._p(y, "_os_last_input_age_s", return_value=5.0)
+        self._p(self.bc, "_yield_watch_mod", return_value=y)
+
+    def test_polled_input_alone_is_not_presence(self):
+        self.assertEqual(self.bc._physical_input_age_s(), float("inf"))
+        self.assertFalse(self.bc._owner_present())
+
+    def test_the_19_05_nudge_waits_in_the_empty_room(self):
+        self._write([self._e(WELLNESS, "wellness")])
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [], "an automation's input is not him")
+        self.assertIn("holding queued speech: owner away", log)
+
+    def test_polled_input_backed_by_his_voice_counts(self):
+        self._owner_spoke(12 * 60)     # voice alone is stale by now
+        self.assertLess(self.bc._physical_input_age_s(), 60.0)
+        self.assertTrue(self.bc._owner_present())
+
+    def test_polled_input_backed_by_a_face_counts(self):
+        self.bc.last_face_seen = time.time() - 5 * 60
+        self.assertLess(self.bc._physical_input_age_s(), 60.0)
+
+    def test_old_backing_does_not_count(self):
+        self._owner_spoke(60 * 60)
+        self.bc.last_face_seen = time.time() - 60 * 60
+        self.assertEqual(self.bc._physical_input_age_s(), float("inf"))
+
+    def test_a_live_hook_needs_no_backing(self):
+        now = time.monotonic()
+        self._p(self.y, "_hook_ok", True)
+        self._p(self.y, "_last_hook_event", now)
+        self._p(self.y, "_last_real_input", now - 3.0)
+        self.assertEqual(self.y.input_source(), "hook")
+        self.assertLess(self.bc._physical_input_age_s(), 30.0)
+
+    def test_input_source_names_the_fallback(self):
+        self.assertEqual(self.y.input_source(), "poll")
+        self._p(self.y, "_installed", False)
+        self.assertEqual(self.y.input_source(), "none")
+
+
 class WiringTests(_Base):
     """Source-level: main() cannot run in a test."""
 

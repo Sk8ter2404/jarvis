@@ -218,6 +218,34 @@ def seconds_since_real_input(now: "Optional[float]" = None) -> float:
         return float("inf")
 
 
+def input_source() -> str:
+    """Where seconds_since_real_input()'s answer comes from right now:
+      "hook" - the low-level hook is installed and not blind: an injected
+               event never counts;
+      "poll" - the GetLastInputInfo fallback (the hook is off by setting -
+               AIR_MOUSE_LL_HOOK_ENABLED - failed to install, or went
+               blind): the OS idle timer counts INJECTED input too (an
+               automation driving the PC, AFK-Helper);
+      "none" - install() never ran: only the test seam can have set the
+               stamp, and nothing polls the OS.
+    Callers that must not mistake an automation for the owner (presence,
+    wellness) treat "poll" as unproven. NEVER raises (a fault reads
+    "poll")."""
+    try:
+        if not _installed:
+            return "none"
+        if not _hook_ok:
+            return "poll"
+        with _lock:
+            last_hook_event = _last_hook_event
+        age_s = _os_last_input_age_s()
+        if age_s is not None and _hook_looks_stale(age_s, last_hook_event):
+            return "poll"
+        return "hook"
+    except Exception:
+        return "poll"
+
+
 def real_input_recent(window: float, now: "Optional[float]" = None) -> bool:
     """True when REAL input occurred within the last `window` seconds — i.e. the
     air-mouse must YIELD (force-disengage) and stay SUPPRESSED. NEVER raises."""

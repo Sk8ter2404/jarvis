@@ -21273,8 +21273,10 @@ def _presence_watch_start() -> bool:
             except Exception:
                 hooked = False
             if not hooked:
-                print("  [presence] physical-input hook unavailable — input "
-                      "falls back to the OS idle timer (injected input counts)")
+                print("  [presence] physical-input hook unavailable — the OS "
+                      "idle timer counts injected input too, so it is "
+                      "presence only with his voice or a face in the last "
+                      f"{OWNER_PRESENT_POLLED_INPUT_BACKUP_S / 60:.0f} min")
         _presence_gate_armed[0] = True
         return True
     except Exception as _e:
@@ -21282,14 +21284,43 @@ def _presence_watch_start() -> bool:
         return False
 
 
+# Polled input needs a witness (2026-10-02 review repair). The low-level hook
+# is off by default (AIR_MOUSE_LL_HOOK_ENABLED) and every October live session
+# logged "LL hook unavailable ... falling back to ... polling": on that path
+# the OS idle timer counts AFK-Helper and automation input as his, which is
+# exactly the 19:05 empty-room nudge. Polled input is presence only when his
+# voice or a face backs it up within OWNER_PRESENT_POLLED_INPUT_BACKUP_S.
+def _polled_input_backed() -> bool:
+    """His mic turn or a face within OWNER_PRESENT_POLLED_INPUT_BACKUP_S.
+    Never raises (False)."""
+    try:
+        window = float(OWNER_PRESENT_POLLED_INPUT_BACKUP_S)
+        voice_at = float(_last_owner_voice_at[0] or 0.0)
+        if voice_at > 0.0 and 0.0 <= _proactive_mono() - voice_at <= window:
+            return True
+        face_at = float(last_face_seen or 0.0)
+        if face_at > 0.0 and 0.0 <= time.time() - face_at <= window:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _physical_input_age_s() -> float:
     """Seconds since the last PHYSICAL keyboard / mouse input (injected input
-    excluded); inf when unknown. Never raises."""
+    excluded); inf when unknown. On the watcher's polling fallback
+    (input_source() == "poll") the reading cannot tell an automation from him,
+    so it counts only when _polled_input_backed. Never raises."""
     try:
         y = _yield_watch_mod()
         if y is None:
             return float("inf")
-        return max(0.0, float(y.seconds_since_real_input()))
+        age = max(0.0, float(y.seconds_since_real_input()))
+        source = getattr(y, "input_source", None)
+        if (callable(source) and source() == "poll"
+                and not _polled_input_backed()):
+            return float("inf")
+        return age
     except Exception:
         return float("inf")
 
