@@ -1753,7 +1753,33 @@ BAMBU_CAMERA_AUTO_WHILE_PRINTING = False
 AUDIO_AUTOSWITCH_ENABLED  = os.getenv("JARVIS_AUDIO_AUTOSWITCH", "").lower() in ("1", "true", "yes", "on")
 AUDIO_AUTOSWITCH_HEADSET  = os.getenv("JARVIS_AUDIO_HEADSET", "")    # e.g. "CORSAIR VOID ELITE"
 AUDIO_AUTOSWITCH_FALLBACK = os.getenv("JARVIS_AUDIO_FALLBACK", "")   # e.g. "Realtek USB2.0 Audio"
-AUDIO_AUTOSWITCH_POLL_S   = float(os.getenv("JARVIS_AUDIO_POLL_S", "3.0"))
+
+
+def _env_float(name: str, default: float) -> float:
+    """float(os.getenv(name)), or `default` when it is unset or blank. A value
+    that is not a finite number also gets `default`, plus ONE warning line on
+    stderr: this runs at import, and the monolith imports core.config at module
+    top level, so a bare float("abc") here stopped JARVIS from booting at all
+    (audit A86)."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("not finite")
+        return value
+    except (TypeError, ValueError):
+        try:
+            import sys
+            print(f"[config] WARNING: {name}={raw[:40]!r} is not a number; "
+                  f"using the default {default}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        return default
+
+
+AUDIO_AUTOSWITCH_POLL_S   = _env_float("JARVIS_AUDIO_POLL_S", 3.0)
 
 # The INPUT half — make the MICROPHONE follow the headset's power too.
 # Separate from AUDIO_AUTOSWITCH_ENABLED and OFF by default: it writes the
@@ -1792,7 +1818,7 @@ AUDIO_AUTOSWITCH_MIC_FALLBACK = os.getenv("JARVIS_AUDIO_MIC_FALLBACK", "")  # e.
 # deliberately sits behind that warning rather than racing it.
 # <= 0 switches the watchdog off entirely (the ON side then behaves as it did
 # before 2026-09-05, i.e. fire-once-and-never-re-check).
-AUDIO_AUTOSWITCH_MIC_SILENT_S = float(os.getenv("JARVIS_AUDIO_MIC_SILENT_S", "60.0"))
+AUDIO_AUTOSWITCH_MIC_SILENT_S = _env_float("JARVIS_AUDIO_MIC_SILENT_S", 60.0)
 
 
 # ─── Audio-device flap damping (bobert_companion + core/audio_flap.py) ─
