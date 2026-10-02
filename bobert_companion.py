@@ -16158,6 +16158,189 @@ if TURN_TAIL_PROBE:
     _register_boot_warmer("silero-tail", _warm_tail_probe)
 
 
+# ── Smart Turn end of turn (speed plan R7, 2026-10-02) ───────────────────
+# The owner's turn captures — the two main-loop listens, which pass
+# record_speech(smart_endpoint=True) — stream what Whisper will hear into a
+# Silero detector and, in a real pause, ask Smart Turn v3.2 whether he has
+# finished (core/endpointing.EotDecider; the knobs are SMART_TURN_* in
+# core/config.py). This release ships SMART_TURN_MODE='shadow': nothing ends a
+# turn early; the log gets one "[eot-shadow] fire_ms= p= resumed= actual_ms="
+# line per turn and the [turn-timing] line eot / st_p / st_n, and the owner
+# promotes to 'on' from that data. In-turn captures (a spoken access code, a
+# draft confirmation, any capture off the main loop's thread) never get a
+# decider: they keep the fixed 21-chunk wait.
+# No capture ever loads a model: the boot warmer loads and warms both, and a
+# capture uses them only after that succeeded. A model that fails or is too
+# slow (at the warm or in a turn), or any fault in these hooks, turns Smart
+# Turn off for the session with one log line: every later turn is today's.
+# Mode 'off' registers no warmer and builds no decider (onnxruntime is never
+# imported for it).
+_eot_stream = _endpointing.SileroStream()    # its OWN session, not _tail_vad's
+_eot_turn = _endpointing.SmartTurn(SMART_TURN_MODEL)
+# ready: the boot warmer warmed both models. off: why Smart Turn is off for
+# the session ('' = usable). logged: that one line is out.
+_eot_state = {"ready": False, "off": "", "logged": False}
+# Smart Turn hears the capture's last 8 s: this many 1,024-sample chunks.
+_EOT_TAIL_CHUNKS = _endpointing.ST_SAMPLES // 1024 + 1
+
+
+def _eot_mode() -> str:
+    """SMART_TURN_MODE normalised: 'off', 'shadow' or 'on' (anything else is
+    'off'). Never raises."""
+    try:
+        m = str(SMART_TURN_MODE).strip().lower()
+        return m if m in _endpointing.MODES else "off"
+    except Exception:
+        return "off"
+
+
+def _eot_latch(why: str, *, quiet: bool = False) -> None:
+    """Smart Turn off for the rest of the session: no later capture builds a
+    decider. One log line per session (`quiet`: the caller's own line is
+    it). Never raises."""
+    try:
+        if not _eot_state["off"]:
+            _eot_state["off"] = str(why) or "failed"
+        if not _eot_state["logged"]:
+            _eot_state["logged"] = True
+            if not quiet:
+                print(f"  [eot] smart turn off for this session "
+                      f"({_eot_state['off']})")
+    except Exception:
+        pass
+
+
+def _eot_model_failure() -> str:
+    """Why a model latched itself off ('' while both are usable). Never
+    raises."""
+    try:
+        if _eot_stream.failed:
+            return f"silero: {_eot_stream.failed}"
+        if _eot_turn.failed:
+            return f"smart turn: {_eot_turn.failed}"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return ""
+
+
+def _warm_smart_turn() -> None:
+    """Boot warmer (R7): load the capture stream's Silero session and Smart
+    Turn and run each on zeros (Smart Turn's I/O names and shapes are
+    checked, and a warm call over 150 ms latches it off — SmartTurn.warm).
+    Only a full success lets captures use them; Smart Turn is not even loaded
+    when Silero failed. A failure turns Smart Turn off for the session: the
+    warmer's "[warm] smart-turn failed (...)" line is its one log line."""
+    try:
+        try:
+            _eot_stream.warm()
+        except Exception as e:
+            raise RuntimeError(f"silero: {e}") from None
+        try:
+            _eot_turn.warm()
+        except Exception as e:
+            raise RuntimeError(f"smart turn: {e}") from None
+    except Exception as e:
+        _eot_latch(str(e), quiet=True)
+        raise
+    _eot_state["ready"] = True
+
+
+def _eot_register_warmer() -> None:
+    """The one Smart Turn boot warmer, unless SMART_TURN_MODE is 'off'."""
+    if _eot_mode() != "off":
+        _register_boot_warmer("smart-turn", _warm_smart_turn)
+
+
+_eot_register_warmer()
+
+
+class _EotCapture:
+    """One owner capture's Smart Turn hooks (R7). record_speech calls feed()
+    for EVERY chunk it appends to the clip — the pre-roll at the VAD trip and
+    each voiced chunk with silence_n 0 (the decider's note that he is
+    talking), each silent one with its silence count, before its own
+    21-chunk break — and finish() when the capture ended on a break. Every
+    method swallows every fault: a fault turns Smart Turn off for the session
+    and the rest of this capture runs exactly as without it."""
+
+    __slots__ = ("dec", "tail", "dead")
+
+    def __init__(self, dec, tail):
+        self.dec = dec
+        self.tail = tail          # the last ~8 s as heard, for Smart Turn
+        self.dead = False
+
+    def feed(self, chunk, peak_rms, silence_n) -> bool:
+        """Feed `chunk` as Whisper will hear it (x the capture's auto-gain so
+        far, from peak_rms: apply_capture_auto_gain, the same call the clip
+        gets). True only when Smart Turn ends the turn in mode 'on' — never
+        in 'shadow'."""
+        if self.dead:
+            return False
+        try:
+            heard, _gain = apply_capture_auto_gain(chunk, peak_rms)
+            self.tail.append(heard)
+            end = self.dec.update(heard, silence_n)
+            return self.dec.mode == "on" and bool(end)
+        except Exception as e:
+            self.dead = True
+            _eot_latch(f"capture hook failed: {type(e).__name__}: {e}")
+            return False
+
+    def finish(self, eot: str) -> None:
+        """The capture ended (`eot`: 'rms', its 21-chunk break, or 'max'):
+        the [eot-shadow] line (shadow mode) and eot / st_p / st_n for the turn
+        line — numbers only, never anything that was said. A model that
+        latched off during the turn then turns Smart Turn off for the session
+        (one line)."""
+        try:
+            if not self.dead:
+                rec = self.dec.record(eot)
+                line = rec.shadow_line()
+                if line:
+                    print(f"  {line}")
+                for name, value in rec.stats().items():
+                    _tt_note_stat(name, value)
+            why = _eot_model_failure()
+            if why:
+                _eot_latch(why)
+        except Exception as e:
+            _eot_latch(f"capture hook failed: {type(e).__name__}: {e}")
+
+
+def _eot_begin(smart_endpoint: bool, offthread: bool):
+    """This capture's _EotCapture, or None: not an owner turn capture
+    (`smart_endpoint` False, or an off-thread in-turn capture), mode 'off',
+    the models not warmed (yet), or Smart Turn off for the session. Starts
+    the Silero stream afresh. Never raises."""
+    try:
+        if not smart_endpoint or offthread:
+            return None
+        mode = _eot_mode()
+        if mode == "off" or not _eot_state["ready"] or _eot_state["off"]:
+            return None
+        why = _eot_model_failure()
+        if why:
+            _eot_latch(why)
+            return None
+        _eot_stream.reset()
+        tail = deque(maxlen=_EOT_TAIL_CHUNKS)
+        turn = _eot_turn
+
+        def _predict():
+            return turn.predict(np.concatenate(tail))
+
+        dec = _endpointing.EotDecider(
+            mode, vad=_eot_stream.feed, predict=_predict,
+            threshold=SMART_TURN_THRESHOLD,
+            min_silence_s=SMART_TURN_MIN_SILENCE_S,
+            min_speech_s=SMART_TURN_MIN_SPEECH_S)
+        return _EotCapture(dec, tail)
+    except Exception as e:
+        _eot_latch(f"capture hook failed: {type(e).__name__}: {e}")
+        return None
+
+
 # The settings later speed-plan releases A/B on the turn lines, printed once
 # per boot as "[turn-flags] KEY=value ..." so tools/turn_latency_report.py
 # --split flag=KEY can tell which value each session ran with. A name not
@@ -17635,6 +17818,7 @@ def record_speech(timeout: float | None = None, *,
                   yield_to_work: bool = False,
                   work_sig0: tuple | None = None,
                   background: bool = False,
+                  smart_endpoint: bool = False,
                   _offthread_claimed: bool = False) -> np.ndarray | None:
     """
     Blocks until the user speaks and finishes, then returns the audio.
@@ -17659,6 +17843,13 @@ def record_speech(timeout: float | None = None, *,
     confirmations) first lets an utterance the main loop is recording finish
     instead of cutting it. ``_offthread_claimed`` is that helper's private
     re-entry flag.
+
+    ``smart_endpoint`` (speed plan R7; ONLY the main loop's two owner-turn
+    listens pass it): run the Smart Turn end-of-turn hooks on this capture
+    (_eot_begin / _EotCapture) unless SMART_TURN_MODE is 'off'. In 'shadow'
+    (the shipped default) the capture and its audio are exactly as without
+    it; only 'on' may end the turn before the 21-chunk wait. In-turn captures
+    never pass it, and an off-thread capture ignores it.
     """
     # Why an idle listen returned None early ("work" / "mic"); reported only
     # to the main loop's idle listens (yield_to_work), which run on the main
@@ -17879,6 +18070,10 @@ def record_speech(timeout: float | None = None, *,
         return None
     # The stream is open and running: a backoff episode (if any) is over.
     _input_open_succeeded()
+    # Smart Turn (R7): None unless this is an owner-turn capture and the
+    # models are warm. How the capture ended, for its eot stat.
+    _eot = _eot_begin(smart_endpoint, _offthread_claimed)
+    _eot_why = "rms"
     record_start_ts = 0.0   # set when recording actually begins (VAD trip)
     _se_vad_ts = _se_open_ts  # the same instant on the self-echo clock
     _se_clip_ts = _se_open_ts
@@ -17969,6 +18164,7 @@ def record_speech(timeout: float | None = None, *,
             if recording and (time.time() - record_start_ts) > MAX_RECORDING_SECS:
                 print(f"  [record_speech] max utterance "
                       f"{MAX_RECORDING_SECS:.0f}s reached — finalizing")
+                _eot_why = "max"
                 break
 
             rms = float(np.sqrt(np.mean(data ** 2)))
@@ -18055,12 +18251,21 @@ def record_speech(timeout: float | None = None, *,
                     pre_samples = int(sum(np.asarray(c).size
                                           for c in pre_ring))
                     chunks.extend(pre_ring)
+                    # Smart Turn hears the clip from its first sample: the
+                    # pre-roll joins it here, so it is fed here.
+                    if _eot is not None:
+                        for _pre in pre_ring:
+                            _eot.feed(_pre, peak_rms, 0)
                     _heartbeat()
                     print("  🎙  Recording…")
                     pause_face_tracking()
                     set_state("listening")
                 chunks.append(processed.copy())
                 silence_n = 0
+                # Smart Turn: voice (silence_n 0) — after a would-be end,
+                # this is what marks the turn resumed=1.
+                if _eot is not None:
+                    _eot.feed(chunks[-1], peak_rms, 0)
                 _prof("voiced")
                 # A voiced frame arrived AFTER a speculative snapshot, so that
                 # snapshot is no longer this utterance — invalidate it. This is
@@ -18076,6 +18281,11 @@ def record_speech(timeout: float | None = None, *,
                 if recording:
                     chunks.append(processed.copy())
                     silence_n += 1
+                    # Smart Turn (R7), asked BEFORE the fixed break below:
+                    # True only in mode 'on' (never 'shadow') when Smart Turn
+                    # says the owner has finished.
+                    _eot_end = (_eot is not None
+                                and _eot.feed(chunks[-1], peak_rms, silence_n))
                     # Speculative transcription: bet the utterance is over and
                     # hide Whisper inside the remaining hangover. Only one
                     # decode in flight at a time (a resumed-then-paused
@@ -18087,7 +18297,7 @@ def record_speech(timeout: float | None = None, *,
                         _spec_stt_start(
                             np.concatenate(chunks).flatten(),
                             peak_rms, len(chunks))
-                    if silence_n >= silence_lim:
+                    if silence_n >= silence_lim or _eot_end:
                         _prof("vad_break")
                         # [turn-timing]: t0, plus how far it trails the
                         # clip's end (cap_lag_ms; pure Python, never raises).
@@ -18151,6 +18361,9 @@ def record_speech(timeout: float | None = None, *,
     if not chunks:
         _utterance_in_progress[0] = False  # pragma: no cover - defensive
         return None  # pragma: no cover - defensive: the loop only breaks after recording began, so chunks is never empty here
+    # Smart Turn (R7): the [eot-shadow] line and the turn's eot / st_p / st_n.
+    if _eot is not None:
+        _eot.finish(_eot_why)
     # Self-echo gate: publish this utterance's timing for _self_echo_ignored.
     _last_capture_window[0] = (_se_open_ts, _se_vad_ts, _self_echo.now(),
                                _se_clip_ts)
@@ -40338,7 +40551,8 @@ def _capture_utterance(injected_text, memory):
     # queued during this idle listen — or during the drain above — ends it at
     # once instead of waiting out the 20 s window.
     audio = record_speech(timeout=20, yield_to_work=True,
-                          work_sig0=_idle_work_baseline(_work_sig_top))
+                          work_sig0=_idle_work_baseline(_work_sig_top),
+                          smart_endpoint=True)   # R7: the owner's turn
     if audio is not None:
         # [turn-timing] t0 = this recording's VAD break (see _turn_timing).
         _tt("begin_voice", _tt_rec_since)
@@ -40859,9 +41073,11 @@ def _handle_sleep_standby(injected_text: str | None):
         _tt_rec_since = _tt("now")
         # yield_to_work: a typed command or a reminder queued while this idle
         # listen waits — or during the drain above — ends it at once (see
-        # record_speech).
+        # record_speech). smart_endpoint (R7): a wake-word turn is the
+        # owner's turn too.
         audio = record_speech(timeout=20, yield_to_work=True,
-                              work_sig0=_idle_work_baseline(_work_sig_top))
+                              work_sig0=_idle_work_baseline(_work_sig_top),
+                              smart_endpoint=True)
         _capture_yield_reason[0] = None   # standby just re-loops either way
         if audio is None or len(audio) < SAMPLE_RATE * 0.4:
             return None
