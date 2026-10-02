@@ -31445,6 +31445,67 @@ def _world_clock_check(reply: str):
         return None
 
 
+# ── Result hold (NEW #1, 2026-10-01) ────────────────────────────────────────
+# A reply is written in ONE pass, before any of its actions run, so prose
+# after an [ACTION:] token whose result the model has not seen is a guess.
+# Live 2026-10-01: "[ACTION: see_screen, …] I've reviewed the search results,
+# sir; it seems most improvements … involve 'distilled' versions" (20:59:41 -
+# vision had answered file-not-found), "… [ACTION: see_screen, …] I've got it
+# now, sir; the search results suggest looking into GGUF quantization"
+# (21:00:24 - both captures were refused for budget), "[ACTION:
+# how_is_the_print] I'm afraid I can't check the printer's status until you
+# give me a moment to run the diagnostic" (21:36:14). The streaming flush
+# never voices anything at or after the first '[' (_SentenceFlushBuffer), and
+# the claim validators judge only replies that ran nothing, so these were
+# spoken whole. Rule: when an action's result goes back to the model (an
+# INFORMATIVE_ACTIONS member) or an action failed / refused, only the prose
+# BEFORE that action's token is spoken; the follow-up round, which has seen
+# the result, says the rest. The full reply stays in conversation_history.
+# Side-effect actions that succeeded (volume_up, launch_app) keep their prose:
+# nothing comes back that could contradict it.
+_RESULT_HOLD_TAIL_TAGS_RE = re.compile(r"(?:\s*\[[^\]\n]*\])+\s*$")
+
+
+def _result_hold_name(new_results) -> str:
+    """The name of the first action in ``new_results`` (one token's
+    (name, result, informative) entries) whose result the model has not seen
+    yet: an informative action that ran, or one that failed or refused.
+    Synthetic, self-voiced and deliberately deferred results (confirmation,
+    pushback, ambiguity) never hold. "" when none. Never raises."""
+    try:
+        for name, result, info in new_results or ():
+            n = str(name or "").strip().lower()
+            if not n or n.startswith("_") or is_self_voiced(n):
+                continue
+            if not isinstance(result, str) or result.startswith(
+                    _ANSWER_FIRST_DEFERRED_PREFIXES):
+                continue
+            if info or _failed_or_refused_actions([(n, result, info)]):
+                return n
+    except Exception:
+        return ""
+    return ""
+
+
+def _result_hold_cut(reply: str, cleaned: str, cut: int, name: str) -> str:
+    """``cleaned`` (the reply minus its tokens) cut down to the prose before
+    ``reply[cut:]`` - the token of action ``name`` - with any bracket tags
+    left dangling at its end removed. Logs what was held. On any fault the
+    text is returned unchanged (the old behaviour)."""
+    try:
+        head = _ACTION_RE.sub(" ", reply[:cut])
+        head = _RESULT_HOLD_TAIL_TAGS_RE.sub("", head)
+        head = re.sub(r"\s{2,}", " ", head).strip()
+        tail = re.sub(r"\[[^\]\n]*\]", " ", _ACTION_RE.sub(" ", reply[cut:]))
+        held = len(tail.split())
+        if held:
+            print(f"  [result-hold] not speaking {held} word(s) written after "
+                  f"[ACTION: {name}] - its result goes back to the model first")
+        return head
+    except Exception:
+        return cleaned
+
+
 def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]:
     """
     Find all [ACTION: ...] tokens, execute whitelisted ones, defer risky ones
@@ -31779,8 +31840,23 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             )
         return ""
 
-    cleaned = _ACTION_RE.sub(_runner, reply).strip()
+    # Result hold (2026-10-01): where in `reply` the first tag sits whose
+    # result the model has not seen yet - see _result_hold_cut.
+    _hold_at: list[tuple[int, str]] = []
+
+    def _runner_holding(match):
+        n0 = len(results)
+        out = _runner(match)
+        if not _hold_at:
+            _held = _result_hold_name(results[n0:])
+            if _held:
+                _hold_at.append((match.start(), _held))
+        return out
+
+    cleaned = _ACTION_RE.sub(_runner_holding, reply).strip()
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    if _hold_at:
+        cleaned = _result_hold_cut(reply, cleaned, *_hold_at[0])
 
     # list_timers ran: its verbatim line from the timer store is the answer,
     # so the model's own account of the timers is not voiced (2026-10-01 —

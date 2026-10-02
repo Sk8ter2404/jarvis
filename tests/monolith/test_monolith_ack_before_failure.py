@@ -11,7 +11,10 @@ harness), plus the REAL _SentenceFlushBuffer for the streamed half:
 
   * a pure acknowledgement is not voiced when an action of the same reply
     failed or refused - before OR after the [ACTION:] marker; it stays in
-    conversation_history; content after it is still spoken;
+    conversation_history; content after it (before the marker) is still
+    spoken. Since the result hold (NEW #1, 2026-10-01) nothing written AFTER
+    the marker of a failed action is spoken at all - see
+    tests/monolith/test_monolith_result_hold.py;
   * a successful action keeps it; answer-first is unchanged;
   * follow-up rounds apply the same rule, but only while the next round will
     still report the failure;
@@ -86,8 +89,10 @@ class LiveTurnTests(_AckBase):
         self.assertEqual(self.spoken, [_FOLLOWUP])
         self.assertIn(_ACK, self._history_text(),
                       "only the audio goes; the reply is remembered")
-        self.assertIn("[ack-hold] dropped the acknowledgement (3 words)",
-                      printed)
+        # The acknowledgement sits AFTER the marker of the failed action, so
+        # the result hold drops it before the ack-hold looks (NEW #1).
+        self.assertIn("[result-hold] not speaking 3 word(s) written after "
+                      "[ACTION: rover_explore]", printed)
 
     def test_ack_before_the_marker_is_not_spoken(self):
         self._run(f"{_ACK} [ACTION: rover_explore, 60]")
@@ -112,8 +117,15 @@ class LiveTurnTests(_AckBase):
 
     def test_content_after_the_ack_is_still_spoken(self):
         tail = "The rover has a full battery."
-        self._run(f"[ACTION: rover_explore, 60] {_ACK} {tail}")
+        self._run(f"{_ACK} {tail} [ACTION: rover_explore, 60]")
         self.assertEqual(self.spoken, [tail, _FOLLOWUP])
+
+    def test_content_after_the_failed_marker_is_not_spoken(self):
+        # Written before the action ran, so it may contradict the failure;
+        # the follow-up, which has seen the failure, speaks (NEW #1).
+        tail = "The rover has a full battery."
+        self._run(f"[ACTION: rover_explore, 60] {_ACK} {tail}")
+        self.assertEqual(self.spoken, [_FOLLOWUP])
 
     def test_leading_tags_stay_on_the_remaining_content(self):
         tail = "The rover has a full battery."

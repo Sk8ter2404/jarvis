@@ -380,6 +380,20 @@ def base_system_prompt(night_quiet=None) -> str:
             .replace(_DAYLIGHT_RETURN_CLAUSE, "", 1))
 
 
+# Result hold (2026-10-01): a reply is written before its actions run, so
+# anything after a look-up token is a guess - live, "I've reviewed the search
+# results, sir…" right after a see_screen that had failed. The dispatcher
+# also refuses to speak it (bobert_companion._result_hold_cut); this rule
+# stops the model writing it. Interpolated into PC_CONTROL_SAFETY_RULES below
+# so every route ships it.
+RESULT_HOLD_RULE = (
+    "An action that LOOKS SOMETHING UP (see_screen, web_search, get_time, "
+    "check_print, any list or status) hands its result back to you in the "
+    "next round. End your reply at its token: never describe, guess or "
+    "summarise what it will find, and never say you have read or reviewed "
+    "it. Nothing after that token is spoken.\n\n"
+)
+
 # Document-level safety rules for PC control. SINGLE SOURCE — interpolated into
 # the PC_CONTROL_PROMPT preamble below (the prompt_router keeps the preamble in
 # its always-shipped `core`, so the slim local path carries these on EVERY turn)
@@ -394,6 +408,7 @@ PC_CONTROL_SAFETY_RULES = (
     "'checkout', 'delete', 'transfer' are automatically held for confirmation. "
     "The user must say 'yes' before they execute. Never try to bypass this.\n\n"
     "If unsure whether to take an action, ASK FIRST.\n\n"
+    + RESULT_HOLD_RULE +
     "An action's name must MATCH what sir asked about. If none does, emit no "
     "action at all.\n"
     "A near-miss is worse than nothing. Sir asked which MICROPHONE was in use "
