@@ -199,6 +199,9 @@ LIVE_ROOT_STATE_FILES = frozenset({
     "arc_reactor_status_state.json",
     "stark_status_ring_state.json",
     "bambu_camera_hud_state.json",
+    # The holographic globe's on/off + pins control file (skills/globe.py
+    # writes it, hud/globe_hud.py polls it).
+    "globe_hud_state.json",
     "hud_card_state.json",
     "ambient_listen_state.json",
     "anticipation_state.json",

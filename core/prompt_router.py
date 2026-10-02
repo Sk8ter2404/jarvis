@@ -259,6 +259,14 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "dossier", "pull up the file", "file on", "what do you know about",
         "tell me about",
     ],
+    # skills/globe.py. Bare "where is" / "where's" deliberately NOT here: they
+    # are the package, print, robot-build and where-am-I questions, and the
+    # globe must not ride along on those. "show me where" is the globe's own
+    # phrasing; "pin" is short, so it takes only a plural ("pins"), never
+    # "pinned" / "ping" / "spin".
+    "GLOBE": [
+        "globe", "show me where", "pin", "on the map", "world map",
+    ],
     "SUIT-UP CINEMATIC": ["suit up", "suit-up", "boot sequence", "cinematic"],
     "TASK QUEUE": [
         "task queue", "queue this", "offload", "claude code", "add a task",
