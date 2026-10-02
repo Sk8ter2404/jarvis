@@ -274,6 +274,36 @@ class CloseOutTests(_ChainBase):
         self.assertEqual(self.spoken, ["Louder, sir."])
         self.assertNotIn("[close-out]", printed)
 
+    def test_a_chain_that_ends_on_a_promise_gets_a_close_out(self):
+        # Review repair (2026-10-02): the guards are not the only way a chain
+        # ends on a promise. The follow-up after the search says "I'm running
+        # the numbers now, sir; I'll have those results for you in a moment."
+        # with no token, the loop simply finishes - and nothing follows.
+        printed = self._dispatch(_R_205910, [
+            "[intent:briefing] I'm running the numbers now, sir; I'll have "
+            "those results for you in a moment.",
+        ])
+        self.assertIn("[close-out]", printed)
+        self.assertIn("I'm afraid", self.spoken[-1])
+        self.assertIn("browser", self.spoken[-1])
+
+    def test_a_follow_up_that_ends_on_an_answer_gets_no_close_out(self):
+        printed = self._dispatch(_R_205910, [
+            "Qwen3 at four-bit looks like your best fit, sir.",
+        ])
+        self.assertNotIn("[close-out]", printed)
+        self.assertEqual(self.spoken[-1],
+                         "Qwen3 at four-bit looks like your best fit, sir.")
+
+    def test_a_follow_up_whose_action_succeeds_gets_no_close_out(self):
+        # "Opening the top result" + an open_url that ran is not a promise
+        # left hanging: the action did what the line said.
+        printed = self._dispatch(_R_205910, [
+            "Opening the top result for you now, sir. [ACTION: open_url, "
+            "example.com]",
+        ])
+        self.assertNotIn("[close-out]", printed)
+
     def test_a_barged_turn_says_nothing_more(self):
         bc = self.bc
 

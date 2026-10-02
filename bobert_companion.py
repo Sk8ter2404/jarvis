@@ -33442,7 +33442,9 @@ def _once_per_turn_refusal(name, arg, ran_before, ran_here) -> str:
 # narration of look-up work (claim_validator.is_progress_only) - one short
 # honest line closes the turn. A turn that said anything real (an answer, a
 # report, a figure, a refusal, a verbatim result), a barged turn, a turn with
-# no follow-up round and a chain that simply finished never get one.
+# no follow-up round and a chain that simply finished never get one. A chain
+# whose last follow-up ran no action and said only progress or promises
+# counts as stopped too ("ended on a promise", 2026-10-02 review repair).
 _CLOSE_OUT_WEB = ("I'm afraid I couldn't get a proper answer out of that, "
                   "sir — it's still open in your browser.")
 _CLOSE_OUT_GENERIC = "I'm afraid I couldn't finish that one, sir."
@@ -39886,6 +39888,10 @@ def _run_llm_dispatch_body(text: str) -> str:
     # and how many follow-up rounds ran.
     _chain_cut = ""
     _followup_rounds = 0
+    # Did the LAST follow-up round run any action? (None = no round yet.) A
+    # round that ran nothing ends the chain on its words alone - see the
+    # "ended on a promise" close-out below.
+    _last_round_ran = None
     for depth in range(_max_followup):
         # A self-voiced result is neither news to report nor a failure to
         # explain: the action already said what it had to.
@@ -39963,6 +39969,7 @@ def _run_llm_dispatch_body(text: str) -> str:
             break
         print(f"  JARVIS: {followup}")
         f_spoken, current_results = parse_and_run_actions(followup)
+        _last_round_ran = bool(current_results)
         _after_reply_note(current_results)
         if not current_results:
             f_spoken = _strip_ack_preface(f_spoken, text)
@@ -40004,6 +40011,13 @@ def _run_llm_dispatch_body(text: str) -> str:
         if any(not is_self_voiced(n) and (i or _is_failure(r))
                for (n, r, i) in current_results):
             _chain_cut = "depth cap"
+    # A chain can also stop on its own words (2026-10-02 review repair): the
+    # last follow-up ran nothing and said only "I'm running the numbers now,
+    # sir; I'll have those results for you in a moment." No guard fired, so
+    # nothing followed. _chain_close_out_line still speaks only when NOTHING
+    # of substance was said this turn.
+    if not _chain_cut and _followup_rounds and _last_round_ran is False:
+        _chain_cut = "ended on a promise"
     # Honest close-out (NEW #6, 2026-10-01): a chain that stops while the
     # owner has heard nothing but "On it, sir" and promises must not end in
     # silence - see _chain_close_out_line.
