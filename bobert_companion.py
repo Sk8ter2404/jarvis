@@ -1695,6 +1695,8 @@ from core.memory_guards import (  # noqa: E402,F401
 # Canonical action-result failure markers, shared with core/dispatcher.py so the
 # follow-up-loop _is_failure() check below can't drift from the dispatcher's.
 from core.failure_markers import FAILURE_MARKERS  # noqa: E402
+from core.failure_markers import (  # noqa: E402
+    terminal_failure_text as _terminal_failure_text)
 
 # Write-time quality gates for auto-learned TOPICS / PROJECTS (2026-09-29: a
 # mis-heard TV line became a standing "project" the model then volunteered).
@@ -36438,7 +36440,16 @@ def _verbatim_result_text(name, result) -> str:
     "" when it would voice nothing: the action is not in
     SPEAK_RESULT_VERBATIM_ACTIONS, the result is empty, or it is a failure
     ("could not read version info: …" belongs to the failure follow-up path,
-    not a verbatim read-back)."""
+    not a verbatim read-back).
+
+    A TERMINAL failure (core.failure_markers.TERMINAL_FAILURE_PREFIX, any
+    action - 2026-10-02: "Task Manager runs as administrator, sir; Windows
+    won't let me close it from here.") is the exception: its line is already
+    phrased for the owner and no follow-up round may retry it, so it is
+    voiced word for word and the follow-up loop stops on it."""
+    _terminal = _terminal_failure_text(result)
+    if _terminal:
+        return _terminal
     if not name or str(name).lower() not in SPEAK_RESULT_VERBATIM_ACTIONS:
         return ""
     text = (result or "").strip() if isinstance(result, str) else ""
@@ -42790,6 +42801,19 @@ def _run_llm_dispatch_body(text: str) -> str:
     # "ended on a promise" close-out below.
     _last_round_ran = None
     for depth in range(_max_followup):
+        # A TERMINAL failure (2026-10-02, core.failure_markers: "Task Manager
+        # runs as administrator, sir; Windows won't let me close it from
+        # here.") was voiced word for word with its reply
+        # (_speak_verbatim_results). No follow-up round may retry what
+        # Windows refused: its line is the chain's last word.
+        _terminal_lines = list(dict.fromkeys(
+            _terminal_failure_text(r) for (_n, r, _i) in current_results
+            if _terminal_failure_text(r)))
+        if _terminal_lines:
+            print("  [follow-up] terminal failure reported - stopping")
+            conversation_history.append({"role": "assistant",
+                                         "content": " ".join(_terminal_lines)})
+            break
         # A self-voiced result is neither news to report nor a failure to
         # explain: the action already said what it had to.
         informative = [

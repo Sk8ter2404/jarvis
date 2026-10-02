@@ -1260,8 +1260,182 @@ def _act_minimize_window(query: str) -> str:
     return f"minimized: {', '.join(done)}" if done else "could not minimize"
 
 
+# ── close_window targets the owner can't see in a title (2026-10-02) ───────
+# Live 12:00:18-12:01:04 the model asked close_window for "taskmgr.exe" (the
+# PROCESS name) and for "Task Manager | left" (the move_window_to_monitor
+# format), and both were "no window matching". A query that names a process
+# resolves to that process's windows; a trailing "| <monitor>" names the
+# monitor, which narrows several matches.
+_EXE_QUERY_RE = re.compile(r"^[\w .()&+-]+\.exe$", re.IGNORECASE)
+# PROCESS_QUERY_LIMITED_INFORMATION / TOKEN_QUERY / TokenElevation.
+_PQLI, _TOKEN_QUERY, _TOKEN_ELEVATION = 0x1000, 0x0008, 20
+
+
+def _window_pid(w) -> "int | None":
+    """The process id owning pygetwindow window ``w``, or None (no native
+    handle, not Windows, any fault)."""
+    hwnd = getattr(w, "_hWnd", None)
+    if not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        pid = wintypes.DWORD(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(
+            wintypes.HWND(hwnd), ctypes.byref(pid))
+        return int(pid.value) or None
+    except Exception:
+        return None
+
+
+def _window_process_name(w) -> "str | None":
+    """The executable name ("Taskmgr.exe") of the process owning ``w``, or
+    None when it can't be read."""
+    pid = _window_pid(w)
+    if not pid:
+        return None
+    try:
+        import psutil
+        return psutil.Process(pid).name()
+    except Exception:
+        return None
+
+
+def _process_token_elevated(pid: int) -> "bool | None":
+    """True / False when the process's token says it is / isn't elevated,
+    None when it can't be read. Query-only handles, always closed."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        adv = ctypes.windll.advapi32
+        hproc = k32.OpenProcess(_PQLI, False, int(pid))
+        if not hproc:
+            return None
+        try:
+            htok = wintypes.HANDLE()
+            if not adv.OpenProcessToken(hproc, _TOKEN_QUERY,
+                                        ctypes.byref(htok)):
+                return None
+            try:
+                elevated = wintypes.DWORD(0)
+                size = wintypes.DWORD(0)
+                if not adv.GetTokenInformation(
+                        htok, _TOKEN_ELEVATION, ctypes.byref(elevated),
+                        ctypes.sizeof(elevated), ctypes.byref(size)):
+                    return None
+                return bool(elevated.value)
+            finally:
+                k32.CloseHandle(htok)
+        finally:
+            k32.CloseHandle(hproc)
+    except Exception:
+        return None
+
+
+def _self_is_elevated() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _window_is_elevated(w) -> bool:
+    """True when ``w`` belongs to an elevated ("run as administrator")
+    process and JARVIS itself is not elevated - Windows' UIPI then refuses
+    our WM_CLOSE. False when unknown."""
+    pid = _window_pid(w)
+    if not pid or _self_is_elevated():
+        return False
+    return _process_token_elevated(pid) is True
+
+
+def _close_refused(err) -> bool:
+    """True when a close attempt failed because Windows denied it
+    (ERROR_ACCESS_DENIED: UIPI blocking a message to a higher-integrity
+    window). pygetwindow raises "Error code from Windows: 5 - Access is
+    denied."."""
+    if isinstance(err, PermissionError):
+        return True
+    if getattr(err, "winerror", None) == 5:
+        return True
+    msg = str(err).lower()
+    return "access is denied" in msg or "error code from windows: 5 " in msg
+
+
+def _windows_of_process(exe: str) -> list:
+    """Titled windows whose process executable is ``exe`` (case-insensitive)."""
+    try:
+        import pygetwindow as gw
+        windows = gw.getAllWindows()
+    except Exception:
+        return []
+    want = exe.strip().lower()
+    out = []
+    for w in windows:
+        if not (getattr(w, "title", "") or "").strip():
+            continue
+        name = _window_process_name(w)
+        if name and name.strip().lower() == want:
+            out.append(w)
+    return out
+
+
+def _split_close_query(query: str) -> "tuple[str, str | None]":
+    """(title query, monitor key) from "<title> | <monitor>" (either order);
+    the whole query and None when the pipe does not name a monitor."""
+    if "|" in query:
+        a, b = (s.strip() for s in query.split("|", 1))
+        for title, mon in ((a, b), (b, a)):
+            key = _resolve_monitor(mon)
+            if key is not None and title:
+                return title, key
+    return query.strip(), None
+
+
+def _on_monitor(w, key: str) -> bool:
+    """True when the centre of window ``w`` lies on monitor ``key``."""
+    try:
+        from core.config import MONITORS
+        x, y, mw, mh = MONITORS[key]
+        cx = float(w.left) + float(w.width) / 2.0
+        cy = float(w.top) + float(w.height) / 2.0
+        return x <= cx < x + mw and y <= cy < y + mh
+    except Exception:
+        return False
+
+
+def _app_label(title: str) -> str:
+    """A short spoken name for a window: "Administrator: Command Prompt" ->
+    "Command Prompt", "Report - Some App" -> "Some App"."""
+    t = re.sub(r"^\s*administrator\s*:\s*", "", str(title or ""),
+               flags=re.IGNORECASE).strip()
+    if " - " in t:
+        t = t.rsplit(" - ", 1)[-1].strip() or t
+    return t[:48].strip() or "That window"
+
+
+def _elevated_close_line(denied: list, n_closed: int) -> str:
+    """The terminal result for windows Windows would not let JARVIS close."""
+    from core.failure_markers import TERMINAL_FAILURE_PREFIX
+    name = _app_label(denied[0])
+    if n_closed:
+        other = ("the other window" if n_closed == 1
+                 else f"the other {n_closed} windows")
+        line = (f"I closed {other}, sir, but {name} runs as administrator; "
+                "Windows won't let me close it from here.")
+    else:
+        line = (f"{name} runs as administrator, sir; Windows won't let me "
+                "close it from here.")
+    return TERMINAL_FAILURE_PREFIX + line
+
+
 def _act_close_window(query: str) -> str:
-    """Close a window by partial title match. Refuses to close Bobert's host."""
+    """Close a window by partial title match. Refuses to close Bobert's host.
+    A process name ("taskmgr.exe") and a "<title> | <monitor>" query resolve
+    too; a window Windows won't let JARVIS close (elevated) gets one honest
+    TERMINAL line (core.failure_markers) that ends the follow-up chain."""
     bc = _bc()
     if not query.strip():
         return "format: close_window, <window title>"
@@ -1271,13 +1445,20 @@ def _act_close_window(query: str) -> str:
             f"REFUSED: '{query}' looks like your own host process. "
             f"Closing it would kill the session. Ask the user to close it manually."
         )
-    matches = bc._find_windows_by_title(query)
+    title_q, monitor = _split_close_query(query)
+    matches = bc._find_windows_by_title(title_q)
+    if not matches and _EXE_QUERY_RE.match(title_q):
+        matches = _windows_of_process(title_q)
+    if monitor and len(matches) > 1:
+        on_it = [w for w in matches if _on_monitor(w, monitor)]
+        matches = on_it or matches
     if not matches:
         return f"no window matching '{query}'"
     closed = []
     tabs = []
     skipped = []
     browser_only = []
+    denied = []
     for w in matches:
         # Defence in depth: also check the actual window title we found
         if any(target in (w.title or "").lower() for target in bc.FORBIDDEN_TARGETS):
@@ -1304,8 +1485,14 @@ def _act_close_window(query: str) -> str:
         try:
             w.close()
             closed.append(w.title)
-        except Exception:
-            pass
+        except Exception as e:
+            # Windows refused (2026-10-02 live: Task Manager runs elevated).
+            # Checked only after a failed close, so a close that works never
+            # queries the process.
+            if _close_refused(e) or _window_is_elevated(w):
+                denied.append(w.title)
+    if denied:
+        return _elevated_close_line(denied, len(closed) + len(tabs))
     parts = []
     if closed:
         parts.append(f"closed: {', '.join(closed)}")

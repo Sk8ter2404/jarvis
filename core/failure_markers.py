@@ -51,3 +51,24 @@ FAILURE_MARKERS: tuple[str, ...] = (
     "didn't",
     "wouldn't",
 )
+
+
+# ── Terminal failures (2026-10-02) ──────────────────────────────────────────
+# A failure no retry can fix, already phrased for the owner: live 12:00:40,
+# close_window on Task Manager (an elevated window; Windows' UIPI refuses a
+# normal-integrity WM_CLOSE) answered "could not close", and the follow-up
+# loop went round close_window / see_screen with new arguments until the depth
+# cap. An action returns TERMINAL_FAILURE_PREFIX + the owner-facing line
+# instead. The prefix carries "failed", so every FAILURE_MARKERS consumer above
+# still reads a failure (the chain resolver never confirms it as done); the
+# monolith speaks the line verbatim (_verbatim_result_text) and ends the
+# follow-up chain on it.
+TERMINAL_FAILURE_PREFIX = "failed (final): "
+
+
+def terminal_failure_text(result) -> str:
+    """The owner-facing line of a terminal failure result, else ""."""
+    if not isinstance(result, str) or not result.startswith(
+            TERMINAL_FAILURE_PREFIX):
+        return ""
+    return result[len(TERMINAL_FAILURE_PREFIX):].strip()
