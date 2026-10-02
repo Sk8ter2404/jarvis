@@ -42856,12 +42856,23 @@ def _run_llm_dispatch_body(text: str) -> str:
         # failed again was never reported). Still bounded by _max_followup.
         _failing_now = {n for (n, r) in informative if _is_failure(r)}
         _failing_repeat = _failing_now & _failed_seen
+        # An IDENTICAL failure (same action, same result) is a repeat even
+        # after a success of that action cleared it (the reset below).
+        _failing_repeat |= {n for (n, r) in informative
+                            if _is_failure(r) and (n, r) in _info_seen}
         if _failing_repeat:
             print(f"  [follow-up] {', '.join(sorted(_failing_repeat))} failed "
                   f"again this chain — stopping")
             _chain_cut = _CUT_REPEATED_FAILURE
             break
         _failed_seen |= _failing_now
+        # ... "again" means with no success of that action in between
+        # (review 2026-10-02): click 'Liked Songs' fails, a retry works, then
+        # click 'Play' fails - a different step of a chain that is moving,
+        # not the same failure twice. A round where the action only
+        # succeeded clears it; a round where it also failed does not.
+        _failed_seen -= ({n for (n, r, _i) in current_results
+                          if not _is_failure(r)} - _failing_now)
         # SUCCESS-repeat break (mirror of the failure-repeat break above): if a
         # whole round adds NO new informative (name, result) pair — every result
         # this round was already seen earlier in the chain — the chain is going

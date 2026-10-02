@@ -85,6 +85,64 @@ class FailureCircleTests(_Base):
         self.assertNotIn("failed again", printed)
         self.assertNotIn("[close-out]", printed)
 
+    def test_a_success_in_between_is_progress_not_a_repeat(self):
+        # Review 2026-10-02: a multi-step chain that keeps moving. The same
+        # action fails on two DIFFERENT steps with a success of it in
+        # between - that is not the same failure twice.
+        self._stub("see_screen", "The music app shows a sidebar.",
+                   "The saved songs list is open.")
+        self._stub("click", "could not find 'Saved Songs'",
+                   "clicked: Saved Songs", "could not find 'Play'",
+                   "clicked: Play")
+        printed = self._run(
+            "play my saved songs", "[ACTION: click, Saved Songs]",
+            ["[ACTION: see_screen, music app] "
+             "[ACTION: click, Saved Songs tab]",
+             "[ACTION: click, Play]",
+             "[ACTION: see_screen, music app] "
+             "[ACTION: click, the play button]",
+             "Your saved songs are playing, sir."])
+        self.assertEqual(len(self.calls["click"]), 4)
+        self.assertNotIn("failed again", printed)
+        self.assertNotIn("[close-out]", printed)
+        self.assertEqual(self.spoken[-1], "Your saved songs are playing, sir.")
+
+    def test_the_identical_failure_after_a_success_still_stops(self):
+        # The success cleared click's name, but the same failure coming back
+        # word for word is still a repeat - and is reported by the close-out
+        # (the "no new progress" stop would have stayed quiet after the
+        # substantive line of the first round).
+        bc = self.bc
+        self._stub("see_screen", "The music app shows a sidebar.",
+                   "The saved songs list is open.")
+        self._stub("click", "could not find 'Play'", "clicked: Saved Songs",
+                   "could not find 'Play'")
+        printed = self._run(
+            "play my saved songs", "[ACTION: click, Play]",
+            ["I'm afraid there is no Play button in view, sir. "
+             "[ACTION: see_screen, music app] [ACTION: click, Saved Songs]",
+             "[ACTION: click, Play]",
+             "Playing, sir."])
+        self.assertEqual(len(self.calls["click"]), 3)
+        self.assertIn("click failed again", printed)
+        self.assertEqual(self.spoken[-1], bc._CLOSE_OUT_GENERIC)
+
+    def test_a_round_that_also_failed_does_not_clear_it(self):
+        # Mixed round: one close worked, the other failed. The retry of the
+        # one that failed is still its second failure.
+        bc = self.bc
+        self._stub("close_window", "closed: Paint", "could not close",
+                   "could not close")
+        printed = self._run(
+            "close paint and the calculator",
+            "[ACTION: close_window, paint] [ACTION: close_window, calculator]",
+            ["[ACTION: close_window, Calculator]",
+             "[ACTION: close_window, the calculator app]"])
+        self.assertEqual(self.calls["close_window"],
+                         ["paint", "calculator", "Calculator"])
+        self.assertIn("close_window failed again", printed)
+        self.assertEqual(self.spoken[-1], bc._CLOSE_OUT_GENERIC)
+
     def test_different_actions_failing_once_each_keep_going(self):
         self._stub("focus_window", "no window matching 'notes'")
         self._stub("close_window", "could not close")
