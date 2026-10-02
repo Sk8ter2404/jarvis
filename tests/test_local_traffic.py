@@ -400,5 +400,212 @@ class TrackerTests(unittest.TestCase):
         lt.TRACKER.reset()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Speed plan R5 (2026-10-02): opt-in tags, the strict switch, per-job caps
+# ════════════════════════════════════════════════════════════════════════════
+def _strict_gate(reason_box, strict, cap=30.0, grace=2.0, log=None):
+    return lt.BackgroundGate(lambda: reason_box[0], lambda: cap,
+                             hard_grace_s=grace, poll_s=0.01,
+                             log=log if log is not None else (lambda m: None),
+                             strict=strict)
+
+
+def _bg_slot(g, tag, **kw):
+    """On this (non-main) thread: run one tagged job's slot; returns
+    (outcome, slot held inside, slot held after)."""
+    with lt.background_work(tag, **kw):
+        with lt.slot(g) as p:
+            held = g.busy()
+        return (p.outcome if p is not None else None), held, g.busy()
+
+
+class OptInShadowTests(unittest.TestCase):
+    """An opt-in job with the strict switch OFF behaves exactly as untagged
+    (no wait, no slot) and only LOGS, once, that it would have waited."""
+
+    def test_switch_off_runs_at_once_mid_turn_and_logs_once(self):
+        box, logs = ["turn"], []
+        g = _strict_gate(box, strict=lambda: False, log=logs.append)
+
+        def _job():
+            with lt.background_work("chappie", opt_in=True):
+                with lt.slot(g) as p1:
+                    first = (p1.outcome, p1.holds, g.busy())
+                with lt.slot(g) as p2:       # a second POST of the same job
+                    second = p2.outcome
+            return first, second
+        t0 = time.monotonic()
+        th, out = _run_in_thread(_job)
+        th.join(5)
+        self.assertFalse(th.is_alive(), "a shadow job waited")
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertEqual(out["value"], (("shadow", False, False), "shadow"))
+        self.assertEqual(logs, ["  [bg-local] shadow chappie would defer "
+                                "(turn)"],
+                         "one line per job, numbers and tags only")
+
+    def test_switch_off_and_quiet_logs_nothing(self):
+        box, logs = [None], []
+        g = _strict_gate(box, strict=lambda: False, log=logs.append)
+        th, out = _run_in_thread(_bg_slot, g, "chappie", opt_in=True)
+        th.join(5)
+        self.assertEqual(out["value"], ("shadow", False, False))
+        self.assertEqual(logs, [])
+
+    def test_disabled_gate_logs_no_shadow(self):
+        box, logs = ["turn"], []
+        g = _strict_gate(box, strict=lambda: False, cap=0.0, log=logs.append)
+        th, _ = _run_in_thread(_bg_slot, g, "chappie", opt_in=True)
+        th.join(5)
+        self.assertEqual(logs, [], "a disabled gate would hold nothing")
+
+    def test_switch_on_waits_like_any_tagged_job(self):
+        box = ["turn"]
+        g = _strict_gate(box, strict=lambda: True)
+        th, out = _run_in_thread(_bg_slot, g, "notification-triage",
+                                 opt_in=True)
+        time.sleep(0.15)
+        self.assertTrue(th.is_alive(), "ran in the middle of the owner's turn")
+        box[0] = None
+        th.join(5)
+        self.assertEqual(out["value"], ("released", True, False))
+
+    def test_unconfigured_switch_means_wait(self):
+        box = ["utterance"]
+        g = _strict_gate(box, strict=None)
+        self.assertTrue(g.strict())
+        th, out = _run_in_thread(_bg_slot, g, "chappie", opt_in=True)
+        time.sleep(0.15)
+        self.assertTrue(th.is_alive())
+        box[0] = None
+        th.join(5)
+        self.assertEqual(out["value"][0], "released")
+
+    def test_broken_switch_never_holds_a_job_back(self):
+        def _boom():
+            raise RuntimeError("settings unreadable")
+        box = ["turn"]
+        g = _strict_gate(box, strict=_boom)
+        self.assertFalse(g.strict())
+        th, out = _run_in_thread(_bg_slot, g, "chappie", opt_in=True)
+        th.join(5)
+        self.assertFalse(th.is_alive())
+        self.assertEqual(out["value"][0], "shadow")
+
+    def test_the_switch_never_touches_the_first_tagged_jobs(self):
+        # learn_from_turn & co. are not opt-in: switch off, they still wait.
+        box = ["turn"]
+        g = _strict_gate(box, strict=lambda: False)
+        th, out = _run_in_thread(_bg_slot, g, "learn_from_turn")
+        time.sleep(0.15)
+        self.assertTrue(th.is_alive())
+        box[0] = None
+        th.join(5)
+        self.assertEqual(out["value"][0], "released")
+
+    def test_nested_opt_in_keeps_the_outer_strict_job(self):
+        box = ["turn"]
+        g = _strict_gate(box, strict=lambda: False)
+
+        def _nested():
+            with lt.background_work("session-checkpoint"):
+                with lt.background_work("chappie", opt_in=True) as job:
+                    with lt.slot(g) as p:
+                        return job.tag, job.opt_in, p.outcome
+        th, out = _run_in_thread(_nested)
+        time.sleep(0.15)
+        self.assertTrue(th.is_alive(), "the inner opt-in tag unheld the job")
+        box[0] = None
+        th.join(5)
+        self.assertEqual(out["value"], ("session-checkpoint", False,
+                                        "released"))
+
+    def test_untagged_and_main_thread_unaffected(self):
+        box = ["turn"]
+        g = _strict_gate(box, strict=lambda: True)
+        with lt.background_work("chappie", opt_in=True):
+            with lt.slot(g) as p:          # main thread
+                self.assertIsNone(p)
+
+        def _owner():
+            with lt.slot(g) as p:
+                return p
+        th, out = _run_in_thread(_owner)
+        th.join(5)
+        self.assertFalse(th.is_alive(), "an owner call waited")
+        self.assertIsNone(out["value"])
+
+    def test_wait_for_quiet_reports_shadow(self):
+        box = ["turn"]
+        g = _strict_gate(box, strict=lambda: False)
+
+        def _bg():
+            with lt.background_work("credits-monitor", opt_in=True):
+                return lt.wait_for_quiet(g)
+        th, out = _run_in_thread(_bg)
+        th.join(5)
+        self.assertEqual(out["value"], "shadow")
+
+    def test_configure_installs_the_switch(self):
+        g = lt.BackgroundGate(log=lambda m: None)
+        self.assertTrue(g.strict())
+        g.configure(strict=lambda: False)
+        self.assertFalse(g.strict())
+        g.configure(strict=None)            # None leaves it as it is
+        self.assertFalse(g.strict())
+
+
+class JobCapTests(unittest.TestCase):
+    """max_defer_s gives ONE job a shorter soft cap; never a longer one, and
+    the hard grace still bounds a turn in progress."""
+
+    def test_clean_cap(self):
+        for bad in (None, 0, 0.0, -1, "x", True, False, object()):
+            self.assertIsNone(lt._clean_cap(bad), bad)
+        self.assertEqual(lt._clean_cap(15), 15.0)
+        self.assertEqual(lt._clean_cap("2.5"), 2.5)
+
+    def test_job_cap_shortens_a_quiet_window_wait(self):
+        box = ["conversation"]
+        g = _strict_gate(box, strict=lambda: True, cap=60.0, grace=60.0)
+        t0 = time.monotonic()
+        th, out = _run_in_thread(_bg_slot, g, "notification-triage",
+                                 opt_in=True, max_defer_s=0.2)
+        th.join(5)
+        self.assertFalse(th.is_alive(), "the job's own cap was ignored")
+        self.assertEqual(out["value"][0], "forced")
+        self.assertLess(time.monotonic() - t0, 3.0)
+
+    def test_job_cap_still_waits_out_a_turn_up_to_the_hard_grace(self):
+        box = ["turn"]
+        g = _strict_gate(box, strict=lambda: True, cap=60.0, grace=0.4)
+        t0 = time.monotonic()
+        th, out = _run_in_thread(_bg_slot, g, "notification-triage",
+                                 opt_in=True, max_defer_s=0.1)
+        time.sleep(0.25)
+        self.assertTrue(th.is_alive(), "forced into the middle of the turn")
+        th.join(5)
+        self.assertFalse(th.is_alive(), "unbounded wait")
+        self.assertEqual(out["value"][0], "forced")
+        self.assertLess(time.monotonic() - t0, 3.0)
+
+    def test_job_cap_never_lengthens_the_gate_cap(self):
+        box = ["conversation"]
+        g = _strict_gate(box, strict=lambda: True, cap=0.2, grace=60.0)
+        th, out = _run_in_thread(_bg_slot, g, "x", opt_in=True,
+                                 max_defer_s=60.0)
+        th.join(5)
+        self.assertFalse(th.is_alive())
+        self.assertEqual(out["value"][0], "forced")
+
+    def test_acquire_takes_the_job_cap(self):
+        box = ["conversation"]
+        g = _gate(box, cap=60.0, grace=60.0)
+        th, out = _run_in_thread(g.acquire, "x", max_defer_s=0.2)
+        th.join(5)
+        self.assertFalse(th.is_alive())
+        self.assertEqual(out["value"].outcome, "forced")
+
+
 if __name__ == "__main__":
     unittest.main()

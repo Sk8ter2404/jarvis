@@ -293,9 +293,17 @@ LOCAL_REPRIME_AT_BOOT_S = 20.0
 #   quietly re-send your conversation's prompt to the already-loaded model
 #   (the same small re-prime as above, same safeguards) if you spoke within
 #   this many seconds, so your next turn starts warm. Float; 0.0 turns it off.
+# BACKGROUND_TAG_STRICT (speed plan R5, 2026-10-02) — the background callers
+#   found later (the notification classifier's local fallback, Chappie's
+#   daemon, the credits monitor, the scheduled evening briefing) wait the same
+#   way only when this is True. False (the default) keeps today's timing: they
+#   run at once and the log says "[bg-local] shadow <job> would defer" when
+#   they would have waited. The first-tagged jobs (memory extraction, the
+#   ambient extractor, the Teams check, ...) always wait.
 # Changes apply on the next start.
 LOCAL_BACKGROUND_MAX_DEFER_S = 120.0
 LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S = 600.0
+BACKGROUND_TAG_STRICT = False
 
 # When True, every ambient/background one-shot LLM call (memory extraction,
 # proactive comments, the ambient extractor — everything routed through

@@ -20797,7 +20797,9 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     # background slot across the POST and its failover; an untagged call
     # (the owner's turn, follow-ups, owner actions) passes straight
     # through. Afterwards a request made outside a turn schedules the idle
-    # re-prime: it just replaced Ollama's one-slot cache.
+    # re-prime: it just replaced Ollama's one-slot cache. An UNTAGGED call
+    # from another thread mid-turn is named in the log (speed plan R5c).
+    _note_untagged_local_call("chat", sys._getframe(1))
     try:
         with _lt.slot():
             text, kind = _generate(model)
@@ -21324,7 +21326,9 @@ def _call_local_vision(question: str, png_images: list[bytes],
     # A TAGGED background caller waits for the owner to go quiet HERE, before
     # the residency / free-VRAM checks below, so they (and the warm/cold
     # timeout) describe the moment of the POST, not the moment it queued.
-    # A no-op for the owner's own request and on the main thread.
+    # A no-op for the owner's own request and on the main thread. An
+    # UNTAGGED call from another thread mid-turn is named in the log (R5c).
+    _note_untagged_local_call("vision", sys._getframe(1))
     _lt.wait_for_quiet()
     # VRAM brick guard (REVIEW_FINDINGS_2 P0-2/P0-3): if the big 30B-class brain
     # is already pinned in VRAM, loading the VLM on top co-loads a 2nd model and
@@ -23218,11 +23222,74 @@ def _background_defer_reason() -> str | None:
     return None
 
 
+def _background_tag_strict() -> bool:
+    """BACKGROUND_TAG_STRICT (speed plan R5, 2026-10-02): do the background
+    callers tagged later (background_work(opt_in=True): the notification
+    classifier, Chappie, the credits monitor, the scheduled evening briefing)
+    wait like the first-tagged ones? Off, they run at once and the gate logs
+    "[bg-local] shadow <job> would defer". Read at call time. Never raises
+    (False on doubt: a broken switch must not hold a job back)."""
+    try:
+        return bool(BACKGROUND_TAG_STRICT)
+    except Exception:
+        return False
+
+
 _lt.GATE.configure(defer_reason=_background_defer_reason,
-                   max_defer_s=_local_bg_max_defer_s)
+                   max_defer_s=_local_bg_max_defer_s,
+                   strict=_background_tag_strict)
 
 # Public for skills (they may also import core.local_traffic directly).
 background_local_work = _lt.background_work
+
+
+# ── untagged background local calls: log-only (speed plan R5c, 2026-10-02) ─
+# Only a TAGGED job waits in the gate, so a background thread that forgot its
+# tag POSTs straight into the owner's sentence or turn and the gate never sees
+# it. In the 09-29..10-02 logs the background calls inside a logged turn were
+# tagged jobs forced past their cap (or the pre-tag learn worker), but the
+# untagged scheduled evening briefing hit a capture that never became a turn
+# -- invisible to [turn-timing]. This names such a caller. A local POST from a
+# thread that is neither the main loop, a tagged job nor an owner chat call,
+# made while the owner is mid-sentence or mid-turn on the local route, logs
+# ONE line per caller (thread numbers folded) -- never any text. An owner
+# helper off the main thread (the glance worker, a phone-bridge reply) can
+# show up too: the line is a pointer for a human, not a verdict, and it
+# changes nothing.
+_untagged_local_seen: set = set()
+_UNTAGGED_LOCAL_SEEN_MAX = 64
+_UNTAGGED_LOCAL_WRAPPERS = frozenset(_tt_mod.LLM_WRAPPERS | {
+    "ask_vision", "ask_vision_multi", "_local_multi_fallback",
+    "_call_local_vision", "_llm", "<lambda>"})
+_UNTAGGED_LOCAL_DIGITS = re.compile(r"\d+")
+
+
+def _note_untagged_local_call(kind: str, frame=None) -> str | None:
+    """Log (once per caller) a `kind` ('chat' / 'vision' / 'complete') local
+    call that the gate cannot hold although the owner is mid-sentence or
+    mid-turn. `frame` is the frame that asked for the call. Returns the
+    caller tag when it logged, else None. Never raises."""
+    try:
+        if (_lt.current_job() is not None
+                or threading.current_thread() is threading.main_thread()):
+            return None
+        if _in_owner_chat_call():
+            return None
+        reason = _background_defer_reason()
+        if reason not in _lt.HARD_REASONS:
+            return None
+        caller = (_tt_mod.caller_tag(frame, wrappers=_UNTAGGED_LOCAL_WRAPPERS)
+                  if frame is not None else "?")
+        key = f"{kind}:" + _UNTAGGED_LOCAL_DIGITS.sub("N", caller)
+        if (key in _untagged_local_seen
+                or len(_untagged_local_seen) >= _UNTAGGED_LOCAL_SEEN_MAX):
+            return None
+        _untagged_local_seen.add(key)
+        print(f"  [bg-local] untagged {kind} call during the owner's "
+              f"{reason}: caller={caller}")
+        return caller
+    except Exception:
+        return None
 
 
 def _vision_goes_local() -> bool:
@@ -38505,6 +38572,7 @@ def _local_complete(system: str, messages: list, *, max_tokens: int = 220,
             payload["format"] = json_schema
         t = max(1.0, float(timeout_s))
         timeout = (min(5.0, t), t)
+        _note_untagged_local_call("complete", sys._getframe(1))
         with _lt.slot():
             did_post = True
             with _lt.TRACKER.track():

@@ -213,6 +213,23 @@ class StructuralInvariantTests(unittest.TestCase):
         self.assertIn("0.0 turns it off", block)
         self.assertIn("apply on the next start", block)
 
+    def test_background_tag_strict_ships_off_and_is_documented(self):
+        # Speed plan R5 (2026-10-02): the later-tagged background callers
+        # keep today's timing unless the owner turns this on. A bool, so a
+        # saved true/false survives _apply_user_settings; the shipped literal
+        # is read from the source (a box's own user_settings.json may set it).
+        with open(config.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("\nBACKGROUND_TAG_STRICT = False\n", src)
+        self.assertIsInstance(config.BACKGROUND_TAG_STRICT, bool)
+        block = src[src.index("# BACKGROUND_TAG_STRICT"):
+                    src.index("BACKGROUND_TAG_STRICT = False")]
+        self.assertIn("shadow", block)
+        self.assertIn("apply on the next start", block)
+        from tools import settings_window as sw
+        spec = sw.SCHEMA["BACKGROUND_TAG_STRICT"]
+        self.assertEqual((spec["type"], spec["default"]), ("bool", False))
+
     def test_sentence_tts_ships_on_and_says_next_start(self):
         # 2026-09-29: per-sentence Kokoro speech is ON by default (a bool, so
         # _apply_user_settings keeps a saved true/false), and its comment

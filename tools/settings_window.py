@@ -1106,6 +1106,15 @@ SCHEMA: dict[str, dict] = {
                 "your next turn is fast. Same safeguards as the re-warm above "
                 "(0 = off). Applies on the next start.",
     },
+    "BACKGROUND_TAG_STRICT": {
+        "tab": "ai", "label": "Also hold the newer background brain work",
+        "type": "bool", "default": False,
+        "help": "Local brain only: the notification sorter, Chappie, the "
+                "credits check and the scheduled evening briefing also wait "
+                "while you are talking, like memory extraction does. Off: "
+                "they run at once and the log notes when they would have "
+                "waited. Applies on the next start.",
+    },
     "LOCAL_REPRIME_AT_BOOT_S": {
         "tab": "ai", "label": "Warm the local brain after start (seconds)",
         "type": "float", "default": 20.0, "max": 3600,
@@ -1934,7 +1943,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Speed", ["FAST_PATHS_ENABLED", "PROMPT_FREEZE_QUIET_S",
                    "LOCAL_PREFIX_REPRIME", "LOCAL_BACKGROUND_MAX_DEFER_S",
                    "LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S",
-                   "LOCAL_REPRIME_AT_BOOT_S"]),
+                   "BACKGROUND_TAG_STRICT", "LOCAL_REPRIME_AT_BOOT_S"]),
         ("Turn checker", ["TURN_CHECK_MODE", "TURN_CHECK_ESCALATE_MODEL"]),
         ("Background work", ["ENABLE_ORCHESTRATOR", "TEAMS_NUDGE_ENABLED"]),
         ("Spending caps", ["DAILY_BUDGET_USD", "DEEP_AUDIT_BUDGET_USD"]),

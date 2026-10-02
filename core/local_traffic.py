@@ -31,6 +31,20 @@ WHAT THIS MODULE HOLDS (stdlib only, so the CI-light tier covers it)
   idle re-prime can tell whether its warm prefix was evicted before the next
   turn used it).
 
+SPEED PLAN R5 (2026-10-02): THE CALLERS TAGGED LATER
+====================================================
+The first tags (learn_from_turn, the ambient extractor / judge / screen
+observer, the Teams nudger, the session checkpoint, the LTM reflector) wait
+for real. The background callers found untagged afterwards (the notification
+classifier, Chappie's daemon, the credits monitor, the scheduled evening
+briefing) are tagged ``background_work(tag, opt_in=True)``: such a job waits
+only while the gate's ``strict`` switch is on (the monolith wires it to
+BACKGROUND_TAG_STRICT). With the switch off it runs at once, exactly as it did
+untagged, and logs ONCE per job that it would have waited (shadow), so the
+switch can be judged from the log before it is flipped. ``max_defer_s`` gives
+one job a shorter soft cap than the gate's (a notification should not sit out
+two minutes of conversation); the hard grace still bounds it.
+
 Log lines carry numbers and caller tags only -- never prompt or speech text.
 """
 from __future__ import annotations
@@ -53,12 +67,17 @@ DEFAULT_POLL_S = 0.5
 class Job:
     """The background job the current thread is running (see background_work)."""
 
-    __slots__ = ("tag", "started_at", "cancel")
+    __slots__ = ("tag", "started_at", "cancel", "opt_in", "max_defer_s",
+                 "shadow_logged")
 
-    def __init__(self, tag: str, started_at: float, cancel=None):
+    def __init__(self, tag: str, started_at: float, cancel=None, *,
+                 opt_in: bool = False, max_defer_s=None):
         self.tag = tag
         self.started_at = started_at
         self.cancel = cancel
+        self.opt_in = bool(opt_in)
+        self.max_defer_s = _clean_cap(max_defer_s)
+        self.shadow_logged = False
 
 
 _tls = threading.local()
@@ -73,20 +92,38 @@ def _clean_tag(tag) -> str:
     return t[:48] or "background"
 
 
+def _clean_cap(v):
+    """A job's own soft cap: a positive float, or None (use the gate's).
+    Anything else -- zero, negative, junk -- is None. Never raises."""
+    try:
+        if v is None or isinstance(v, bool):
+            return None
+        f = float(v)
+        return f if f > 0 else None
+    except Exception:
+        return None
+
+
 @contextlib.contextmanager
-def background_work(tag: str = "background", cancel=None, clock=None):
+def background_work(tag: str = "background", cancel=None, clock=None, *,
+                    opt_in: bool = False, max_defer_s=None):
     """Mark the calling thread as doing NON-URGENT background local-model work.
 
     `tag` names the job in log lines (a caller name, never user text).
     `cancel` is an optional zero-arg callable; when it returns True a waiting
     job stops waiting and runs at once (a daemon being stopped should not sit
     out the whole deferral). Nested use keeps the OUTER job, so one job's
-    total wait is bounded once, from when it first started waiting."""
+    total wait is bounded once, from when it first started waiting.
+    `opt_in` (speed plan R5): the job waits only while the gate's strict
+    switch is on; otherwise it runs at once and logs, once, that it would
+    have waited. `max_defer_s`: this job's own soft cap when shorter than the
+    gate's (None = the gate's)."""
     outer = getattr(_tls, "job", None)
     if outer is not None:
         yield outer
         return
-    job = Job(_clean_tag(tag), (clock or time.monotonic)(), cancel)
+    job = Job(_clean_tag(tag), (clock or time.monotonic)(), cancel,
+              opt_in=opt_in, max_defer_s=max_defer_s)
     _tls.job = job
     try:
         yield job
@@ -186,7 +223,8 @@ class Pass:
     'go' (no wait), 'released' (waited, then the conversation went quiet),
     'forced' (max deferral reached), 'cancelled' (the job's cancel fired),
     'reentrant' (this thread already holds the slot), 'off' (gate disabled
-    or main thread). `holds` says whether release() must free the slot."""
+    or main thread), 'shadow' (an opt-in job while the strict switch is off:
+    it did not wait). `holds` says whether release() must free the slot."""
 
     __slots__ = ("outcome", "waited_s", "holds", "tag")
 
@@ -204,14 +242,18 @@ class BackgroundGate:
     defer_reason() -> None when a background request may run now, else a
     short reason string ('conversation', or one of HARD_REASONS).
     max_defer_s() -> the soft cap in seconds (<= 0 disables the gate: every
-    acquire returns at once and nothing is serialised)."""
+    acquire returns at once and nothing is serialised).
+    strict() -> may an opt-in job (background_work(opt_in=True)) wait? None
+    (unconfigured) = yes; a raising predicate = no."""
 
     def __init__(self, defer_reason=None, max_defer_s=None, *,
                  hard_grace_s: float = DEFAULT_HARD_GRACE_S,
-                 poll_s: float = DEFAULT_POLL_S, clock=None, log=None):
+                 poll_s: float = DEFAULT_POLL_S, clock=None, log=None,
+                 strict=None):
         self._cond = threading.Condition(threading.Lock())
         self._defer_reason = defer_reason
         self._max_defer_s = max_defer_s
+        self._strict_src = strict
         self._hard_grace_s = float(hard_grace_s)
         self._poll_s = float(poll_s)
         self._clock = clock or time.monotonic
@@ -226,12 +268,14 @@ class BackgroundGate:
         self._depth = 0
 
     def configure(self, *, defer_reason=None, max_defer_s=None,
-                  hard_grace_s=None, poll_s=None) -> None:
+                  hard_grace_s=None, poll_s=None, strict=None) -> None:
         with self._cond:
             if defer_reason is not None:
                 self._defer_reason = defer_reason
             if max_defer_s is not None:
                 self._max_defer_s = max_defer_s
+            if strict is not None:
+                self._strict_src = strict
             if hard_grace_s is not None:
                 self._hard_grace_s = float(hard_grace_s)
             if poll_s is not None:
@@ -252,12 +296,50 @@ class BackgroundGate:
         except Exception:
             return DEFAULT_MAX_DEFER_S
 
+    def _job_cap(self, max_defer_s=None) -> float:
+        """The soft cap for one acquire: the gate's, or the job's own when
+        that is shorter. A disabled gate (cap <= 0) stays disabled."""
+        cap = self._cap()
+        own = _clean_cap(max_defer_s)
+        if cap > 0 and own is not None:
+            return min(cap, own)
+        return cap
+
     def _reason(self):
         try:
             fn = self._defer_reason
             return fn() if fn is not None else None
         except Exception:
             return None     # a broken predicate must never hold a job back
+
+    def strict(self) -> bool:
+        """May an opt-in job wait? Unconfigured = yes (it then behaves like
+        every other tagged job); a raising predicate = no, because a broken
+        switch must never hold a job back. Never raises."""
+        try:
+            src = self._strict_src
+            if src is None:
+                return True
+            return bool(src() if callable(src) else src)
+        except Exception:
+            return False
+
+    def note_shadow(self, job):
+        """An opt-in `job` is about to run unheld (strict off). Log ONCE per
+        job, and only when the gate would have held it right now, that it
+        would have waited. Returns the reason it would have waited, or None.
+        Never raises."""
+        try:
+            if self._job_cap(getattr(job, "max_defer_s", None)) <= 0:
+                return None             # a disabled gate holds nothing
+            reason = self._reason()
+            if reason is not None and job is not None and not job.shadow_logged:
+                job.shadow_logged = True
+                self._say(f"  [bg-local] shadow {job.tag} would defer "
+                          f"({reason})")
+            return reason
+        except Exception:
+            return None
 
     @staticmethod
     def _cancelled(cancel) -> bool:
@@ -286,7 +368,9 @@ class BackgroundGate:
             return len(self._queue)
 
     def acquire(self, tag: str = "background", started_at=None,
-                cancel=None) -> Pass:
+                cancel=None, max_defer_s=None) -> Pass:
+        """Wait (bounded) for the slot. `max_defer_s` is the job's own soft
+        cap; it only ever shortens the gate's."""
         tag = _clean_tag(tag)
         if _is_main_thread():
             return Pass("off", tag=tag)
@@ -296,7 +380,7 @@ class BackgroundGate:
             if self._holder is me:
                 self._depth += 1
                 return Pass("reentrant", holds=True, tag=tag)
-        cap = self._cap()
+        cap = self._job_cap(max_defer_s)
         if cap <= 0:
             return Pass("off", tag=tag)
         now = self._clock()
@@ -311,7 +395,7 @@ class BackgroundGate:
                 while True:
                     now = self._clock()
                     waited = now - start
-                    cap = self._cap()
+                    cap = self._job_cap(max_defer_s)
                     reason = self._reason()
                     self._drop_dead_holder()
                     head_free = (self._holder is None
@@ -392,13 +476,20 @@ def slot(gate=None):
     """Hold the background slot for the current thread's background job while
     it POSTs to the local model. A no-op (yields None) for an untagged thread
     -- the owner's turn and anything the owner asked for -- and on the main
-    thread. Re-entrant per thread."""
+    thread. Re-entrant per thread. An opt-in job (speed plan R5) while the
+    gate's strict switch is off yields Pass('shadow') at once: it never
+    waits, never takes the slot, and logs once when it would have waited."""
     g = GATE if gate is None else gate
     job = current_job()
     if job is None or _is_main_thread():
         yield None
         return
-    p = g.acquire(job.tag, started_at=job.started_at, cancel=job.cancel)
+    if job.opt_in and not g.strict():
+        g.note_shadow(job)
+        yield Pass("shadow", tag=job.tag)
+        return
+    p = g.acquire(job.tag, started_at=job.started_at, cancel=job.cancel,
+                  max_defer_s=job.max_defer_s)
     try:
         yield p
     finally:
@@ -408,7 +499,8 @@ def slot(gate=None):
 def wait_for_quiet(gate=None) -> str:
     """For a tagged background job about to CAPTURE its input (a screenshot):
     wait until a background request may run, then return at once (the slot
-    is taken again by the POST itself). Returns the Pass outcome, or 'none'
-    for an untagged / main-thread caller."""
+    is taken again by the POST itself). Returns the Pass outcome ('shadow'
+    for an opt-in job with the strict switch off), or 'none' for an untagged /
+    main-thread caller."""
     with slot(gate) as p:
         return p.outcome if p is not None else "none"
