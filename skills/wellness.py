@@ -5,8 +5,14 @@ presence.
 Concept: a "focus block" is a continuous stretch in which JARVIS has reason to
 believe the user is actively at the desk. Reasons (any one is enough):
   • face_tracker has recently seen the user at a monitor (not "away"),
-  • workshop_mode is engaged (a CAD / slicer app is open),
-  • the system has registered keyboard/mouse input within RECENT_INPUT_WINDOW.
+  • PHYSICAL keyboard/mouse input within RECENT_INPUT_WINDOW (the monolith's
+    _physical_input_age_s: a low-level hook that ignores INJECTED input),
+  • the owner spoke to JARVIS (an accepted MIC turn) within RECENT_VOICE_WINDOW.
+2026-10-02: an open CAD / slicer app (workshop mode) and the OS idle timer
+(GetLastInputInfo, which counts injected input) no longer count. Live
+2026-10-01 19:05 the "hour and a half" nudge fired for a block that held 38
+minutes of empty room: the owner left at 18:27 while an autonomous session
+kept driving this PC's mouse and keyboard.
 
 The block survives short interruptions — a 30-second glance away, a quick
 walk to grab coffee — but resets when no presence signal has fired for
@@ -24,6 +30,9 @@ Gates (all must allow before nudging):
   • bobert_companion._sleep_mode[0] / _standby_mode[0] must be False
   • No window matches CALL_WINDOW_HINTS (Teams / Zoom / Meet / Webex / Discord)
   • skill_bambu_monitor must not report an active print (gcode_state RUNNING)
+  • the room must not be talking (bobert_companion._room_talk_recent: non-wake
+    speech captured in the last ROOM_TALK_HOLD_S; live 21:16:10 the nudge
+    talked over people mid-conversation)
 
 Actions registered:
   wellness_status — verbally report current block length, snooze remaining,
@@ -54,7 +63,8 @@ _speech_lock = threading.Lock()
 WELLNESS_POLL_SECONDS    = 60.0
 FOCUS_BLOCK_SECONDS      = 90 * 60   # 90 minutes uninterrupted to trigger
 BREAK_RESET_SECONDS      = 5 * 60    # no presence for 5 min resets the block
-RECENT_INPUT_WINDOW      = 5 * 60    # keyboard/mouse within 5 min counts as present
+RECENT_INPUT_WINDOW      = 5 * 60    # PHYSICAL keyboard/mouse within 5 min counts as present
+RECENT_VOICE_WINDOW      = 10 * 60   # an owner MIC turn within 10 min counts as present
 SNOOZE_SECONDS           = 60 * 60   # 1 hour cooldown after a fired nudge
 INITIAL_DELAY_SECONDS    = 120.0     # let JARVIS boot before we start counting
 
@@ -120,22 +130,39 @@ def _enqueue_speech(message: str) -> None:
 
 # ── Presence signals ──────────────────────────────────────────────────────
 
-def _get_system_idle_seconds() -> float:
-    """Seconds since the last keyboard/mouse input system-wide (Windows).
-    Returns a very large value on non-Windows / on failure so missing input
-    info isn't interpreted as "user is here"."""
+def _monolith():
+    """The running bobert_companion module, or None (isolated tests)."""
+    return sys.modules.get("bobert_companion")
+
+
+def _physical_input_seconds() -> float:
+    """Seconds since the last PHYSICAL keyboard/mouse input — injected input
+    (an automation driving this PC) never counts. Read through the monolith's
+    _physical_input_age_s (the low-level-hook watcher it arms at boot).
+    A very large value when unknown, so missing input info is never read as
+    "user is here"."""
+    bc = _monolith()
+    fn = getattr(bc, "_physical_input_age_s", None) if bc is not None else None
+    if not callable(fn):
+        return float("inf")
     try:
-        from ctypes import Structure, c_uint, sizeof, windll, byref
-        class _LASTINPUTINFO(Structure):
-            _fields_ = [("cbSize", c_uint), ("dwTime", c_uint)]
-        info = _LASTINPUTINFO()
-        info.cbSize = sizeof(info)
-        if not windll.user32.GetLastInputInfo(byref(info)):
+        age = float(fn())
+    except Exception:
+        return float("inf")
+    return age if age >= 0.0 else float("inf")
+
+
+def _owner_voice_seconds() -> float:
+    """Seconds since the owner's last accepted MIC turn
+    (bobert_companion._last_owner_voice_at, time.monotonic()); inf when none
+    this process or unknown."""
+    bc = _monolith()
+    cell = getattr(bc, "_last_owner_voice_at", None) if bc is not None else None
+    try:
+        at = cell[0] if isinstance(cell, list) and cell else 0.0
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or at <= 0.0:
             return float("inf")
-        millis = windll.kernel32.GetTickCount() - info.dwTime
-        if millis < 0:
-            return float("inf")
-        return millis / 1000.0
+        return max(0.0, time.monotonic() - float(at))
     except Exception:
         return float("inf")
 
@@ -163,29 +190,26 @@ def _face_tracker_at_desk() -> bool | None:
     return None
 
 
-def _workshop_mode_active() -> bool:
-    mod = sys.modules.get("skill_workshop_mode")
-    if mod is None:
-        return False
-    try:
-        flag = getattr(mod, "_workshop_active", None)
-        return bool(flag and flag[0])
-    except Exception:
-        return False
-
-
 def _recent_input() -> bool:
-    """True if there's been keyboard/mouse input within RECENT_INPUT_WINDOW."""
-    return _get_system_idle_seconds() <= RECENT_INPUT_WINDOW
+    """True if there's been PHYSICAL keyboard/mouse input within
+    RECENT_INPUT_WINDOW."""
+    return _physical_input_seconds() <= RECENT_INPUT_WINDOW
+
+
+def _recent_voice() -> bool:
+    """True if the owner spoke to JARVIS within RECENT_VOICE_WINDOW."""
+    return _owner_voice_seconds() <= RECENT_VOICE_WINDOW
 
 
 def _user_present() -> bool:
-    """Composite presence signal — any one source is sufficient."""
+    """Composite presence signal — a face, physical input or the owner's
+    voice; any one is sufficient. Nothing else (an open app, injected input)
+    stands in for a person."""
     if _face_tracker_at_desk() is True:
         return True
-    if _workshop_mode_active():
-        return True
     if _recent_input():
+        return True
+    if _recent_voice():
         return True
     return False
 
@@ -237,6 +261,20 @@ def _bambu_print_active() -> bool:
         return False
 
 
+def _people_talking() -> bool:
+    """True while the room is talking (bobert_companion._room_talk_recent:
+    non-wake speech captured in the last ROOM_TALK_HOLD_S). False when the
+    monolith isn't loaded."""
+    bc = _monolith()
+    fn = getattr(bc, "_room_talk_recent", None) if bc is not None else None
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        return False
+
+
 def _gate_reasons() -> list[str]:
     reasons: list[str] = []
     if _is_sleep_or_standby():
@@ -245,6 +283,8 @@ def _gate_reasons() -> list[str]:
         reasons.append("on a call")
     if _bambu_print_active():
         reasons.append("Bambu print active")
+    if _people_talking():
+        reasons.append("people talking")
     return reasons
 
 
@@ -335,11 +375,13 @@ def register(actions):
             last_seen = _last_presence_at[0]
             last_fire = _last_nudge_at[0]
         block = (now - started) if started else 0.0
-        idle  = _get_system_idle_seconds()
+        idle  = _physical_input_seconds()
         gates = _gate_reasons()
         gate_str = ", ".join(gates) if gates else "none"
 
         if not started:
+            if idle == float("inf"):
+                return "No active focus block, sir."
             return (f"No active focus block, sir — last input "
                     f"{_fmt_duration(idle)} ago.")
 

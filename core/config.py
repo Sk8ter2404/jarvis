@@ -609,6 +609,27 @@ SELF_ECHO_FILTER_ENABLED = True
 SELF_ECHO_WINDOW_S       = 20.0
 SELF_ECHO_TAIL_S         = 0.8
 
+# Presence hold for queued proactive speech (core/owner_presence.py). Live
+# 2026-10-01 the wellness nudge, the credits nag and a GPU pulse were spoken
+# into an empty room (he left at 18:27), and a wellness nudge talked over
+# people mid-conversation (21:16). The speech-queue drain now holds every line
+# except his own reminders (timer / schedule / promise) and the guard alert
+# while he is away or the room is talking. "Here" = an owner MIC turn within
+# OWNER_PRESENT_VOICE_WINDOW_S, a sustained face within
+# OWNER_PRESENT_FACE_WINDOW_S, or PHYSICAL keyboard / mouse input (injected
+# input never counts) within OWNER_PRESENT_INPUT_WINDOW_S. Non-wake speech
+# captured within ROOM_TALK_HOLD_S holds the queue too. When he is back, a
+# held status line older than PRESENCE_STALE_STATUS_S is folded into one short
+# "While you were away" recap instead of being read out on its own.
+# PRESENCE_HOLD_ENABLED False = the drain speaks everything at once, as
+# before. Set via user_settings.json; applies on the next start.
+PRESENCE_HOLD_ENABLED        = True
+OWNER_PRESENT_VOICE_WINDOW_S = 600
+OWNER_PRESENT_FACE_WINDOW_S  = 120
+OWNER_PRESENT_INPUT_WINDOW_S = 300
+ROOM_TALK_HOLD_S             = 45
+PRESENCE_STALE_STATUS_S      = 600
+
 # Device dialogues (core/dialogue.py): a skill that owns a talking device can
 # run a short scripted back-and-forth between JARVIS and it through the
 # skill_utils "dialogue_session" / "speak_line" / "listen_for_stop" hooks.

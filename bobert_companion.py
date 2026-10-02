@@ -20737,6 +20737,138 @@ def _note_owner_voice() -> None:
     _last_owner_voice_at[0] = time.monotonic()
 
 
+# ── owner presence (core/owner_presence.py, 2026-10-02) ────────────────────
+# Live 2026-10-01 the owner left at ~18:27 and three queued lines (wellness
+# 19:05, credits 19:33, GPU pulse 19:36) were spoken into the empty room; at
+# 21:16 a wellness nudge talked over a live conversation. _speak_pending drained
+# every source with no presence check. ONE helper now answers "is he here":
+# an owner MIC turn, a sustained face, or PHYSICAL input. Single-element cells,
+# the GIL-atomic idiom of this file.
+from core import owner_presence as _owner_presence_mod  # noqa: E402
+# time.monotonic() of the last non-wake speech the main loop captured and
+# dropped at the background-audio gate (people, or a show, talking). 0.0 = none.
+_last_room_talk_at = [0.0]
+# True once the boot path started the physical-input watcher. Until then the
+# presence hold stays open: with no sensor armed (a bare import, a test, a
+# failed start) "nobody seen" means "unknown", never "away".
+_presence_gate_armed = [False]
+# The last hold reason logged by the drain, so a held queue logs once per kind.
+_presence_hold_logged = [""]
+
+
+def _note_room_talk(text: str) -> None:
+    """Main loop: a non-wake capture was dropped at the background-audio gate.
+    Three or more words = the room is talking (a lone "Thank you." is Whisper
+    noise). Never raises."""
+    try:
+        if _owner_presence_mod.counts_as_room_talk(text):
+            _last_room_talk_at[0] = _proactive_mono()
+    except Exception:
+        pass
+
+
+def _yield_watch_mod():
+    """skills/_air_mouse_yield (the real-input watcher the Kinect air-mouse
+    shares): a low-level mouse / keyboard hook that ignores INJECTED events
+    (LLMHF_INJECTED / LLKHF_INJECTED). None when it cannot load."""
+    try:
+        from skills import _air_mouse_yield as _y
+        return _y
+    except Exception:
+        return None
+
+
+def _presence_watch_start() -> bool:
+    """Boot: start the physical-input watcher (idempotent - the air-mouse may
+    already have installed it) and arm the presence hold. Off when
+    PRESENCE_HOLD_ENABLED is False. Returns whether the hold is armed. Never
+    raises."""
+    try:
+        if not PRESENCE_HOLD_ENABLED:
+            return False
+        y = _yield_watch_mod()
+        if y is not None:
+            try:
+                hooked = bool(y.install())
+            except Exception:
+                hooked = False
+            if not hooked:
+                print("  [presence] physical-input hook unavailable — input "
+                      "falls back to the OS idle timer (injected input counts)")
+        _presence_gate_armed[0] = True
+        return True
+    except Exception as _e:
+        print(f"  [presence] could not start: {_e}")
+        return False
+
+
+def _physical_input_age_s() -> float:
+    """Seconds since the last PHYSICAL keyboard / mouse input (injected input
+    excluded); inf when unknown. Never raises."""
+    try:
+        y = _yield_watch_mod()
+        if y is None:
+            return float("inf")
+        return max(0.0, float(y.seconds_since_real_input()))
+    except Exception:
+        return float("inf")
+
+
+def _owner_presence() -> "tuple[bool, str]":
+    """(present, why) — THE presence rule (core/owner_presence.presence_verdict):
+    an owner MIC turn within OWNER_PRESENT_VOICE_WINDOW_S, a sustained face
+    within OWNER_PRESENT_FACE_WINDOW_S, or physical input within
+    OWNER_PRESENT_INPUT_WINDOW_S. Fails open (True) on any error."""
+    try:
+        mono = _proactive_mono()
+        voice_at = float(_last_owner_voice_at[0] or 0.0)
+        voice_age = (mono - voice_at) if voice_at > 0.0 else None
+        face_at = float(last_face_seen or 0.0)
+        face_age = (time.time() - face_at) if face_at > 0.0 else None
+        return _owner_presence_mod.presence_verdict(
+            voice_age_s=voice_age, face_age_s=face_age,
+            input_age_s=_physical_input_age_s(),
+            voice_window_s=OWNER_PRESENT_VOICE_WINDOW_S,
+            face_window_s=OWNER_PRESENT_FACE_WINDOW_S,
+            input_window_s=OWNER_PRESENT_INPUT_WINDOW_S)
+    except Exception as _e:
+        return True, f"presence check failed ({_e})"
+
+
+def _owner_present() -> bool:
+    """Is the owner here to hear a proactive line? See _owner_presence."""
+    return bool(_owner_presence()[0])
+
+
+def _room_talk_recent() -> bool:
+    """Non-wake speech was captured within ROOM_TALK_HOLD_S. Never raises."""
+    try:
+        at = float(_last_room_talk_at[0] or 0.0)
+        if at <= 0.0:
+            return False
+        return _owner_presence_mod.room_talk_recent(_proactive_mono() - at,
+                                                    ROOM_TALK_HOLD_S)
+    except Exception:
+        return False
+
+
+def _presence_hold_reason() -> str:
+    """Why the speech-queue drain must hold non-exempt lines right now ('' =
+    speak). Open (never holds) until the boot path armed it, or with
+    PRESENCE_HOLD_ENABLED off. Never raises (fails open)."""
+    try:
+        if not PRESENCE_HOLD_ENABLED or not _presence_gate_armed[0]:
+            return ""
+        if _room_talk_recent():
+            return "room talk"
+        present, why = _owner_presence()
+        if not present:
+            return f"owner away ({why})"
+        return ""
+    except Exception:
+        return ""
+
+
 def _proactive_mono() -> float:
     """The proactive gates' clock: time.monotonic(), the same clock as
     _last_owner_turn_at / _last_owner_voice_at. One seam so a test can
@@ -36314,6 +36446,7 @@ def _speak_pending(only_sources=None):
     # untouched; it is spoken once the hold passes.
     if _speech_hold_active():
         return False
+    _return_drain = False
     if only_sources is None:
         # Standby (only_sources) leaves the governor's held line where it is,
         # exactly as before: it would only be held again below.
@@ -36322,6 +36455,22 @@ def _speak_pending(only_sources=None):
         return False  # an unmerged orphan: claiming now would clobber it
     if not os.path.exists(PENDING_SPEECH_PATH):
         return False
+    if only_sources is None:
+        # PRESENCE HOLD (2026-10-02, core/owner_presence.py). While the owner
+        # is away, or the room is talking, only his own reminders and the
+        # guard alert are spoken; everything else waits, in order, untouched
+        # on disk (the peek below never claims a queue with nothing to say).
+        _hold = _presence_hold_reason()
+        if _hold:
+            _kind = _hold.split(" (", 1)[0]
+            if _presence_hold_logged[0] != _kind:
+                _presence_hold_logged[0] = _kind
+                print(f"  [pending] holding queued speech: {_hold}")
+            only_sources = _owner_presence_mod.EXEMPT_SOURCES
+        else:
+            _presence_hold_logged[0] = ""
+            _return_drain = bool(PRESENCE_HOLD_ENABLED
+                                 and _presence_gate_armed[0])
     # Standby runs this every pass (as often as every 0.3 s while muted):
     # claim and rewrite the queue only when something in it may be spoken.
     if only_sources is not None and not _pending_has_source(only_sources):
@@ -36354,6 +36503,23 @@ def _speak_pending(only_sources=None):
         try: os.remove(consume_path)
         except Exception: pass
         return False
+    if _return_drain and isinstance(items, list):
+        # He is here: a status line that waited longer than
+        # PRESENCE_STALE_STATUS_S is not read out on its own — the stale ones
+        # become ONE short "While you were away" recap, and a stale
+        # moment-line (a break nudge, a habit offer) is simply over.
+        items, _dropped, _folded = _owner_presence_mod.plan_return_drain(
+            items, now=time.time(), stale_s=PRESENCE_STALE_STATUS_S)
+        for _e in _dropped:
+            print(f"  [pending] expired while away ({_e.get('source', '?')}): "
+                  f"{str(_e.get('message', ''))[:80]}")
+        for _e in _folded:
+            print(f"  [pending] folded into the recap ({_e.get('source', '?')}): "
+                  f"{str(_e.get('message', ''))[:80]}")
+        if not items:
+            try: os.remove(consume_path)
+            except Exception: pass
+            return False
     # Speak each reminder under its own try/except so a single edge-tts
     # failure doesn't crash the main loop or strand the rest of the queue.
     # Second-layer dedup: skip messages we've already spoken inside the
@@ -39317,6 +39483,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # Warm the local model's prompt cache for the first turn (the boot is
         # done: the system prompt has its final, post-skills shape).
         _start_boot_reprime()
+        # Arm the presence hold on queued proactive speech (starts the
+        # physical-input watcher; see _presence_watch_start).
+        _presence_watch_start()
         while True:
             try:
                 if _blue_green_loop_tick():
@@ -39415,6 +39584,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     # line later, logs "(N chars)".
                     print(f"  [bg-audio] {_bg_why} — ignoring non-wake "
                           f"utterance ({len(text or '')} chars)")
+                    # The room is talking: queued proactive lines wait
+                    # ROOM_TALK_HOLD_S (_presence_hold_reason) instead of
+                    # talking over it (live 21:16:10).
+                    _note_room_talk(text)
                     # Alexa-mode ambient learning: we won't RESPOND to this gated
                     # (non-wake) utterance, but if ambient-listening is on we still
                     # passively LEARN from it — feed the transcript to the extractor

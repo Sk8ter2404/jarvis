@@ -1,8 +1,13 @@
 """Logic tests for skills/wellness.py.
 
 Targets the focus-block presence tracker and its gating:
-  • _user_present — composite signal (face_tracker OR workshop OR recent input).
-  • _gate_reasons — sleep/standby, on-a-call, Bambu-print-active suppressors.
+  • _user_present — composite signal (face_tracker OR PHYSICAL input OR the
+    owner's voice). Since 2026-10-02 an open workshop app and the OS idle
+    timer (GetLastInputInfo counts injected input) no longer count: live
+    2026-10-01 19:05 the "hour and a half" nudge fired for a block holding 38
+    minutes of empty room while an automation drove the PC.
+  • _gate_reasons — sleep/standby, on-a-call, Bambu-print-active and
+    people-talking suppressors (live 21:16:10: the nudge talked over people).
   • _poll_once — the block-start / break-reset / threshold / snooze / gate
     state machine that decides whether a nudge fires (time + presence controlled,
     _enqueue_speech patched so no real speech is queued).
@@ -32,40 +37,79 @@ class _LoopBreak(BaseException):
     the loop's own `except Exception`."""
 
 
+def _fake_bc(*, input_age=float("inf"), voice_at=0.0, room_talk=False):
+    """A bobert_companion stand-in exposing exactly what wellness reads."""
+    bc = types.ModuleType("bobert_companion")
+    bc._physical_input_age_s = lambda: input_age
+    bc._last_owner_voice_at = [voice_at]
+    bc._room_talk_recent = lambda: room_talk
+    bc._sleep_mode = [False]
+    bc._standby_mode = [False]
+    return bc
+
+
 class WellnessPresenceTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("wellness")
 
+    def _present(self, bc, *, face=None):
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(self.mod, "_face_tracker_at_desk",
+                               return_value=face):
+            return self.mod._user_present()
+
     def test_user_present_via_face_tracker(self):
-        with mock.patch.object(self.mod, "_face_tracker_at_desk", return_value=True), \
-             mock.patch.object(self.mod, "_workshop_mode_active", return_value=False), \
-             mock.patch.object(self.mod, "_recent_input", return_value=False):
-            self.assertTrue(self.mod._user_present())
+        self.assertTrue(self._present(_fake_bc(), face=True))
 
-    def test_user_present_via_workshop(self):
-        with mock.patch.object(self.mod, "_face_tracker_at_desk", return_value=None), \
-             mock.patch.object(self.mod, "_workshop_mode_active", return_value=True), \
-             mock.patch.object(self.mod, "_recent_input", return_value=False):
-            self.assertTrue(self.mod._user_present())
+    def test_user_present_via_physical_input(self):
+        self.assertTrue(self._present(_fake_bc(input_age=30.0)))
 
-    def test_user_present_via_recent_input(self):
-        with mock.patch.object(self.mod, "_face_tracker_at_desk", return_value=None), \
-             mock.patch.object(self.mod, "_workshop_mode_active", return_value=False), \
-             mock.patch.object(self.mod, "_recent_input", return_value=True):
-            self.assertTrue(self.mod._user_present())
+    def test_user_present_via_owner_voice(self):
+        self.assertTrue(self._present(
+            _fake_bc(voice_at=time.monotonic() - 60)))
 
     def test_user_absent_when_all_signals_negative(self):
-        with mock.patch.object(self.mod, "_face_tracker_at_desk", return_value=False), \
-             mock.patch.object(self.mod, "_workshop_mode_active", return_value=False), \
-             mock.patch.object(self.mod, "_recent_input", return_value=False):
-            self.assertFalse(self.mod._user_present())
+        self.assertFalse(self._present(
+            _fake_bc(input_age=self.mod.RECENT_INPUT_WINDOW + 1,
+                     voice_at=time.monotonic() - self.mod.RECENT_VOICE_WINDOW - 1),
+            face=False))
 
-    def test_recent_input_uses_idle_window(self):
-        with mock.patch.object(self.mod, "_get_system_idle_seconds", return_value=10.0):
+    def test_live_19_05_injected_input_is_not_presence(self):
+        # The OS idle timer says "input 5 s ago" - an automation's SendInput -
+        # while the injected-input-aware watcher has seen no physical input
+        # since the owner left (38.5 min). No face, no voice.
+        ct = _fake_ctypes(tick=10_000, dw_time=5_000)
+        with mock.patch.dict(sys.modules, {"ctypes": ct}):
+            self.assertFalse(self._present(_fake_bc(input_age=38 * 60 + 29)))
+
+    def test_an_open_workshop_app_is_not_presence(self):
+        wm = types.ModuleType("skill_workshop_mode")
+        wm._workshop_active = [True]
+        with mock.patch.dict(sys.modules, {"skill_workshop_mode": wm}):
+            self.assertFalse(self._present(_fake_bc()))
+
+    def test_no_monolith_means_unknown_not_present(self):
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("bobert_companion", None)
+            with mock.patch.object(self.mod, "_face_tracker_at_desk",
+                                   return_value=None):
+                self.assertFalse(self.mod._user_present())
+
+    def test_recent_input_uses_the_window(self):
+        with mock.patch.object(self.mod, "_physical_input_seconds",
+                               return_value=10.0):
             self.assertTrue(self.mod._recent_input())
-        with mock.patch.object(self.mod, "_get_system_idle_seconds",
+        with mock.patch.object(self.mod, "_physical_input_seconds",
                                return_value=self.mod.RECENT_INPUT_WINDOW + 1):
             self.assertFalse(self.mod._recent_input())
+
+    def test_a_broken_reader_is_unknown(self):
+        bc = _fake_bc()
+        bc._physical_input_age_s = lambda: (_ for _ in ()).throw(OSError("x"))
+        bc._last_owner_voice_at = None
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            self.assertEqual(self.mod._physical_input_seconds(), float("inf"))
+            self.assertEqual(self.mod._owner_voice_seconds(), float("inf"))
 
 
 class WellnessGateTests(unittest.TestCase):
@@ -77,6 +121,18 @@ class WellnessGateTests(unittest.TestCase):
              mock.patch.object(self.mod, "_is_in_call", return_value=False), \
              mock.patch.object(self.mod, "_bambu_print_active", return_value=False):
             self.assertEqual(self.mod._gate_reasons(), [])
+
+    def test_live_21_16_people_talking_is_a_gate(self):
+        # The desk mic was capturing (and dropping, wake-word mode) a live
+        # conversation when the nudge talked over it.
+        for talking, want in ((True, ["people talking"]), (False, [])):
+            with self.subTest(talking=talking), \
+                 mock.patch.dict(sys.modules, {"bobert_companion":
+                                               _fake_bc(room_talk=talking)}), \
+                 mock.patch.object(self.mod, "_is_in_call", return_value=False), \
+                 mock.patch.object(self.mod, "_bambu_print_active",
+                                   return_value=False):
+                self.assertEqual(self.mod._gate_reasons(), want)
 
     def test_gates_collect_all_active_reasons(self):
         with mock.patch.object(self.mod, "_is_sleep_or_standby", return_value=True), \
@@ -181,7 +237,7 @@ class WellnessFormatAndStatusTests(unittest.TestCase):
         self.assertIn(self.mod._pick_nudge_line(), self.mod.NUDGE_LINES)
 
     def test_status_no_block(self):
-        with mock.patch.object(self.mod, "_get_system_idle_seconds", return_value=30.0), \
+        with mock.patch.object(self.mod, "_physical_input_seconds", return_value=30.0), \
              mock.patch.object(self.mod, "_gate_reasons", return_value=[]):
             out = self.actions["wellness_status"]("")
         self.assertIn("no active focus block", out.lower())
@@ -189,7 +245,7 @@ class WellnessFormatAndStatusTests(unittest.TestCase):
     def test_status_running_block(self):
         self.mod._block_started_at[0] = time.time() - 1800   # 30 min
         self.mod._last_presence_at[0] = time.time()
-        with mock.patch.object(self.mod, "_get_system_idle_seconds", return_value=5.0), \
+        with mock.patch.object(self.mod, "_physical_input_seconds", return_value=5.0), \
              mock.patch.object(self.mod, "_gate_reasons", return_value=[]):
             out = self.actions["wellness_status"]("")
         self.assertIn("focus block running", out.lower())
@@ -198,7 +254,7 @@ class WellnessFormatAndStatusTests(unittest.TestCase):
     def test_status_reports_active_gates(self):
         self.mod._block_started_at[0] = time.time() - 1800
         self.mod._last_presence_at[0] = time.time()
-        with mock.patch.object(self.mod, "_get_system_idle_seconds", return_value=5.0), \
+        with mock.patch.object(self.mod, "_physical_input_seconds", return_value=5.0), \
              mock.patch.object(self.mod, "_gate_reasons", return_value=["on a call"]):
             out = self.actions["wellness_status"]("")
         self.assertIn("on a call", out)
@@ -206,7 +262,7 @@ class WellnessFormatAndStatusTests(unittest.TestCase):
 
 def _fake_ctypes(*, get_input_ok=1, tick=10_000, dw_time=4_000,
                  raise_on_import=False):
-    """A ctypes stand-in covering exactly what _get_system_idle_seconds pulls:
+    """A ctypes stand-in covering what the OS idle timer read pulls:
     Structure / c_uint / sizeof / windll / byref. GetLastInputInfo populates the
     struct's dwTime (mimicking the by-pointer fill) and returns get_input_ok;
     GetTickCount returns tick. idle_ms = tick - dw_time."""
@@ -236,33 +292,6 @@ def _fake_ctypes(*, get_input_ok=1, tick=10_000, dw_time=4_000,
     kernel32.GetTickCount = lambda: tick
     ct.windll = types.SimpleNamespace(user32=user32, kernel32=kernel32)
     return ct
-
-
-class WellnessIdleSecondsTests(unittest.TestCase):
-    def setUp(self):
-        self.mod, self.actions = load_skill_isolated("wellness")
-
-    def test_idle_seconds_success(self):
-        ct = _fake_ctypes(tick=10_000, dw_time=4_000)   # 6000 ms idle
-        with mock.patch.dict(sys.modules, {"ctypes": ct}):
-            self.assertAlmostEqual(self.mod._get_system_idle_seconds(), 6.0)
-
-    def test_idle_seconds_api_returns_zero_is_infinite(self):
-        ct = _fake_ctypes(get_input_ok=0)
-        with mock.patch.dict(sys.modules, {"ctypes": ct}):
-            self.assertEqual(self.mod._get_system_idle_seconds(), float("inf"))
-
-    def test_idle_seconds_negative_delta_is_infinite(self):
-        # GetTickCount wrapped (tick < dwTime) → negative millis → inf, never a
-        # bogus "user is here" tiny value.
-        ct = _fake_ctypes(tick=1_000, dw_time=5_000)
-        with mock.patch.dict(sys.modules, {"ctypes": ct}):
-            self.assertEqual(self.mod._get_system_idle_seconds(), float("inf"))
-
-    def test_idle_seconds_exception_is_infinite(self):
-        ct = _fake_ctypes(raise_on_import=True)
-        with mock.patch.dict(sys.modules, {"ctypes": ct}):
-            self.assertEqual(self.mod._get_system_idle_seconds(), float("inf"))
 
 
 class WellnessFaceTrackerTests(unittest.TestCase):
@@ -314,41 +343,6 @@ class WellnessFaceTrackerTests(unittest.TestCase):
     def test_none_when_monitor_unknown_value(self):
         self._install({"last_sample_at": 123.0, "current_monitor": "elsewhere"})
         self.assertIsNone(self.mod._face_tracker_at_desk())
-
-
-class WellnessWorkshopModeTests(unittest.TestCase):
-    def setUp(self):
-        self.mod, self.actions = load_skill_isolated("wellness")
-        self._saved = sys.modules.get("skill_workshop_mode")
-        self.addCleanup(self._restore)
-
-    def _restore(self):
-        if self._saved is not None:
-            sys.modules["skill_workshop_mode"] = self._saved
-        else:
-            sys.modules.pop("skill_workshop_mode", None)
-
-    def test_false_when_module_absent(self):
-        sys.modules.pop("skill_workshop_mode", None)
-        self.assertFalse(self.mod._workshop_mode_active())
-
-    def test_true_when_active_flag_set(self):
-        wm = types.ModuleType("skill_workshop_mode")
-        wm._workshop_active = [True]
-        with mock.patch.dict(sys.modules, {"skill_workshop_mode": wm}):
-            self.assertTrue(self.mod._workshop_mode_active())
-
-    def test_false_when_flag_clear(self):
-        wm = types.ModuleType("skill_workshop_mode")
-        wm._workshop_active = [False]
-        with mock.patch.dict(sys.modules, {"skill_workshop_mode": wm}):
-            self.assertFalse(self.mod._workshop_mode_active())
-
-    def test_false_when_attr_access_raises(self):
-        wm = mock.MagicMock()
-        type(wm)._workshop_active = mock.PropertyMock(side_effect=RuntimeError("x"))
-        with mock.patch.dict(sys.modules, {"skill_workshop_mode": wm}):
-            self.assertFalse(self.mod._workshop_mode_active())
 
 
 class WellnessSleepStandbyGateTests(unittest.TestCase):

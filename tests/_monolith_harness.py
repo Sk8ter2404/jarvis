@@ -282,6 +282,10 @@ _MONOLITH_RESTORE_NAMES = (
     # the wrong reason; a leaked remark would make a later remark a "repeat".
     "_last_owner_voice_at", "_proactive_recent", "_proactive_remarks_at",
     "_proactive_last_attempt_at", "_proactive_hold_logged",
+    # The speech-queue presence hold (2026-10-02): the last room-talk stamp,
+    # the boot arm (a leaked True would hold a LATER test's queue for an
+    # "absent" owner) and the logged hold kind.
+    "_last_room_talk_at", "_presence_gate_armed", "_presence_hold_logged",
     "_face_detect_last", "_face_presence_trackers", "_face_presence_fp",
     # "What was the first thing I asked" (v2.0.148): the session's opening
     # owner utterances. A test that recorded one would make a LATER test's

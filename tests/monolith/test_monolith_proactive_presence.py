@@ -622,9 +622,9 @@ class PresenceConsumersTests(_Base):
         self._p(ft, "_read_kinect_presence", return_value=None)
         self._p(ft, "_kinect_gaze_monitor", return_value=None)
         self._p(ft, "_apply_greet_new_people")
-        # Keyboard / mouse and workshop mode must not stand in for a face.
+        # Keyboard / mouse must not stand in for a face (workshop mode no
+        # longer counts as presence at all, 2026-10-02).
         self._p(self.well, "_recent_input", return_value=False)
-        self._p(self.well, "_workshop_mode_active", return_value=False)
         self.arrive._presence_first_seen_at[0] = 0.0
         self.addCleanup(self.arrive._presence_first_seen_at.__setitem__, 0,
                         0.0)
