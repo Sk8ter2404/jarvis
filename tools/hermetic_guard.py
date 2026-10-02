@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Process-wide refusal of a TEST RUN reaching the real world around it: the
 network (and the live local services), the owner's keyboard / mouse / windows,
-and live-hardware probes.
+live-hardware probes, and the owner's screen.
 
 THE FINDINGS (2026-09-30)
 =========================
@@ -25,10 +25,16 @@ written for: **a unit test must never touch a real browser, camera, mic,
 sensor, or network.** ``tools/browser_guard.py`` (browsers),
 ``tests/live_data_guard.py`` (the owner's live ``data/``) and
 ``tools/mem_guard.py`` (RAM) cover the others; this module is the network /
-input / hardware-probe sibling.
+input / hardware-probe / screen sibling.
 
-THREE GUARDS, ONE CHOKEPOINT
-============================
+A tripwire run of the monolith tier on 2026-10-02 found the screen version:
+``test_space_fires_when_enter_did_not_start`` photographed the owner's whole
+virtual desktop twice per run (``find_click_target`` -> ``take_screenshot`` ->
+the real mss, with the ``PIL.ImageGrab`` fallback behind it), even with vision
+OFF - vision declined only AFTER the capture.
+
+FOUR GUARDS, ONE CHOKEPOINT
+===========================
 One ``sys.addaudithook`` hook. CPython raises the audit events this reads from
 C, below every library: ``socket.connect`` / ``bind`` / ``sendto`` /
 ``sendmsg`` / ``getaddrinfo`` / ``gethostbyname`` / ``gethostbyaddr`` (so
@@ -52,7 +58,9 @@ calls are not audited either, so the two real-world effects reached that way
 (``_EFFECT_TARGETS``: pycaw's ``AudioUtilities.GetSpeakers``, the speakers'
 mute / volume, and ``core.media_now_playing._default_transport``, the media
 session's pause / skip) get the same stub, installed by an import hook as the
-REAL module loads (2026-10-01).
+REAL module loads (2026-10-01). So do the screen-capture entry points
+(``_SCREEN_TARGETS``: mss's ``grab`` and ``PIL.ImageGrab.grab``, whose Windows
+grab is C code no audit event covers), 2026-10-02.
 
 WHAT IS REFUSED
 ---------------
@@ -99,6 +107,20 @@ file launcher - ``LAUNCHER_PROGRAMS`` (``xdg-open``, ``open``, ``explorer``
 shell command line (``SHELL_LAUNCHERS``), and ``os.startfile``: each opens a
 file in its registered app on the owner's desktop.
 
+``[screen-guard]`` (raises ``ScreenGuardError``, an ``OSError`` - "the capture
+failed", the display-less CI runner's own answer, so ``take_screenshot``
+returns None): reading the pixels of the real screen. Two layers. The entry
+points (``_SCREEN_TARGETS``) refuse before a library opens anything:
+``mss.base.MSS.grab`` (every mss backend and ``shot()`` go through it; making
+an ``MSS()`` to read the monitor GEOMETRY is not a capture and passes) and
+``PIL.ImageGrab.grab`` (pyautogui / pyscreeze screenshots use it too). Under
+them the audit hook refuses the raw GDI copies a ctypes caller makes:
+``gdi32.BitBlt`` / ``StretchBlt`` whose SOURCE is a screen or window DC (a
+memory-DC to memory-DC blit, or one with no source, is ordinary drawing and
+passes), and ``user32.PrintWindow`` aimed at another process's window (the
+offscreen capture's route). A hook cannot be displaced by a test's
+``mock.patch``, so a regressed stub still meets it on Windows.
+
 REPORTING
 ---------
 Every refusal is recorded with the test that made it (the running unittest
@@ -116,9 +138,10 @@ A test that genuinely needs one of these opts in explicitly::
 
 (also usable as a decorator; it covers every thread while it is open).
 A human driving the real thing by hand sets ``JARVIS_ALLOW_REAL_NETWORK=1``,
-``JARVIS_ALLOW_REAL_INPUT=1`` or ``JARVIS_ALLOW_HARDWARE_PROBES=1`` - each is
-announced loudly in the banner. ``install(record_only=True)`` records without
-refusing, for confirming a suspected offender.
+``JARVIS_ALLOW_REAL_INPUT=1``, ``JARVIS_ALLOW_HARDWARE_PROBES=1`` or
+``JARVIS_ALLOW_SCREEN_CAPTURE=1`` - each is announced loudly in the banner.
+``install(record_only=True)`` records without refusing, for confirming a
+suspected offender.
 
 CONTRACT
 --------
@@ -144,13 +167,14 @@ import threading
 import typing
 
 _TAGS = {"network": "[network-guard]", "input": "[input-guard]",
-         "probe": "[probe-guard]"}
-GUARDS = ("network", "input", "probe")
+         "probe": "[probe-guard]", "screen": "[screen-guard]"}
+GUARDS = ("network", "input", "probe", "screen")
 
 ENV_ESCAPES = {
     "network": "JARVIS_ALLOW_REAL_NETWORK",
     "input": "JARVIS_ALLOW_REAL_INPUT",
     "probe": "JARVIS_ALLOW_HARDWARE_PROBES",
+    "screen": "JARVIS_ALLOW_SCREEN_CAPTURE",
 }
 _ALLOW_WORDS = frozenset({"1", "true", "yes", "on", "allow", "enable",
                           "enabled"})
@@ -277,6 +301,33 @@ _EFFECT_TARGETS = (
 )
 _EFFECT_MODULES = frozenset(t[0] for t in _EFFECT_TARGETS)
 
+# The screen-capture entry points, wrapped the same way under the screen
+# guard (2026-10-02). mss: every backend (GDI, X11/XCB, macOS) and shot() /
+# save() read pixels through the base class's grab(); "MSS" is that class in
+# mss >= 10, "MSSBase" in 9 (an alias of it in 10 - wrapped once). PIL:
+# ImageGrab.grab, whose Windows path is Image.core.grabscreen_win32 - C code
+# no audit event sees. Same (module, class or None, attribute) shape.
+_SCREEN_TARGETS = (
+    ("mss.base", "MSS", "grab"),
+    ("mss.base", "MSSBase", "grab"),
+    ("PIL.ImageGrab", None, "grab"),
+)
+_SCREEN_MODULES = frozenset(t[0] for t in _SCREEN_TARGETS)
+_EFFECT_REASONS = {
+    "input": ("a real effect on the owner's speakers / media session (a COM "
+              "/ WinRT call no audit event covers)"),
+    "screen": "a real capture of the owner's screen",
+}
+
+# ... and under them, the raw GDI copies a ctypes caller makes (audited, so
+# not displaceable). (dll, function): the blits read their SOURCE DC (argument
+# 5) - refused when it is a screen / window DC, not a memory DC; PrintWindow
+# copies window argument 0 - refused when it is another process's window.
+_BLIT_FUNCTIONS = ("BitBlt", "StretchBlt")
+_SCREEN_FUNCTIONS = (("gdi32", "BitBlt"), ("gdi32", "StretchBlt"),
+                     ("user32", "PrintWindow"))
+_OBJ_MEMDC = 10                   # GetObjectType() of a memory DC
+
 # pywin32 attributes wrapped (their calls are not audited).
 _PYWIN32_TARGETS = (
     ("win32api", ("SetCursorPos", "mouse_event", "keybd_event",
@@ -313,8 +364,12 @@ class ProbeGuardError(FileNotFoundError):
     """A test tried to launch a live-hardware / live-service probe."""
 
 
+class ScreenGuardError(OSError):
+    """A test tried to capture the real screen."""
+
+
 class Refusal(typing.NamedTuple):
-    guard: str        # "network" | "input" | "probe"
+    guard: str        # "network" | "input" | "probe" | "screen"
     api: str          # the audited operation, e.g. "socket.connect"
     target: str       # what it was aimed at
     test_id: str      # the unittest method (or the one running at the time)
@@ -334,6 +389,7 @@ _probing = threading.local()      # set while unarmed_guards() probes
 _busy = threading.local()         # re-entrancy latch inside the hook
 _input_fn_ptrs: dict[int, str] = {}
 _message_fn_ptrs: dict[int, str] = {}
+_screen_fn_ptrs: dict[int, tuple[str, str]] = {}   # -> (dll, function)
 _own_names: set[str] = set()
 _atexit_registered = [False]
 _effect_modules: dict[str, object] = {}  # name -> the REAL module wrapped
@@ -588,6 +644,50 @@ def input_verdict(function: str, args: tuple, foreign=None) -> str | None:
     return None
 
 
+_get_object_type: list = [None]
+
+
+def _screen_dc(hdc) -> bool:
+    """True when device context ``hdc`` is a screen / window DC (its pixels
+    are the owner's screen); False for no DC (a source-less raster op) or a
+    memory DC (ordinary offscreen drawing). Unknown -> True (refuse). Never
+    raises."""
+    h = _int_arg(hdc)
+    if not h:
+        return False
+    try:
+        import ctypes
+        fn = _get_object_type[0]
+        if fn is None:
+            fn = ctypes.WinDLL("gdi32").GetObjectType
+            fn.argtypes = [ctypes.c_void_p]
+            fn.restype = ctypes.c_uint32
+            _get_object_type[0] = fn
+        return int(fn(h)) != _OBJ_MEMDC
+    except Exception:  # noqa: BLE001 - cannot tell: treat it as the screen
+        return True
+
+
+def screen_verdict(function: str, args: tuple, screen_dc=None,
+                   foreign=None) -> str | None:
+    """Why this GDI / user32 call must be refused, or None. ``screen_dc(hdc)``
+    answers "is that DC the real screen?" and ``foreign(hwnd)`` "is that
+    window another process's?" (defaults: always yes)."""
+    screen_dc = screen_dc if screen_dc is not None else (lambda _d: True)
+    foreign = foreign if foreign is not None else (lambda _h: True)
+    if function in _BLIT_FUNCTIONS:
+        source = args[5] if len(args) > 5 else None
+        if screen_dc(source):
+            return f"{function} from a screen / window DC reads the owner's screen"
+        return None
+    if function == "PrintWindow":
+        if foreign(args[0] if args else None):
+            return ("PrintWindow copies another process's window (the "
+                    "owner's desktop)")
+        return None
+    return None
+
+
 # ─── recording ─────────────────────────────────────────────────────────────
 
 def _short(path: str) -> str:
@@ -712,6 +812,8 @@ def _refuse(guard: str, api: str, target: str, why: str):
         raise NetworkGuardError(errno.ECONNREFUSED, msg)
     if guard == "input":
         raise InputGuardError(errno.EACCES, msg)
+    if guard == "screen":
+        raise ScreenGuardError(errno.EACCES, msg)
     raise ProbeGuardError(errno.ENOENT, msg, target)
 
 
@@ -725,7 +827,7 @@ def _describe_addr(args) -> str:
 
 
 _REFUSALS = (NetworkGuardError, InputGuardError, ProbeGuardError,
-             socket.gaierror)
+             ScreenGuardError, socket.gaierror)
 
 
 def _hook(event, args):
@@ -754,14 +856,23 @@ def _decide(event, args) -> None:
             _refuse("network", event, _describe_addr(args), why)
         return
     if event == "ctypes.call_function":
+        ptr = args[0] if args else None
+        call_args = args[1] if len(args) > 1 and isinstance(
+            args[1], tuple) else ()
+        screen_fn = _screen_fn_ptrs.get(ptr)
+        if screen_fn:
+            if _active("screen"):
+                dll, name = screen_fn
+                why = screen_verdict(name, call_args, screen_dc=_screen_dc,
+                                     foreign=_foreign_window)
+                if why:
+                    _refuse("screen", f"{dll}.{name}", name, why)
+            return
         if not _active("input"):
             return
-        ptr = args[0] if args else None
         name = _input_fn_ptrs.get(ptr) or _message_fn_ptrs.get(ptr)
         if not name:
             return
-        call_args = args[1] if len(args) > 1 and isinstance(
-            args[1], tuple) else ()
         why = input_verdict(name, call_args, foreign=_foreign_window)
         if why:
             _refuse("input", f"user32.{name}", name, why)
@@ -877,9 +988,22 @@ def unwrapped_pywin32() -> list[str]:
     return bad
 
 
-# ─── un-audited real-world effects (COM / WinRT): wrapped on import ────────
+# ─── un-audited real-world effects (COM / WinRT) and the screen-capture ────
+# ─── entry points: wrapped on import ───────────────────────────────────────
 
-def _wrap_effect(module, modname: str, cls_name, name: str) -> None:
+def _wrapped_targets() -> tuple:
+    """(guard, module, class or None, attribute) for every entry point wrapped
+    on import. Read at call time, so a patched target table is honoured."""
+    return (tuple(("input",) + tuple(t) for t in _EFFECT_TARGETS)
+            + tuple(("screen",) + tuple(t) for t in _SCREEN_TARGETS))
+
+
+def _wrapped_modules() -> frozenset:
+    return frozenset(_EFFECT_MODULES) | frozenset(_SCREEN_MODULES)
+
+
+def _wrap_effect(module, modname: str, cls_name, name: str,
+                 guard: str = "input") -> None:
     try:
         owner = getattr(module, cls_name) if cls_name else module
         real = getattr(owner, name)
@@ -888,12 +1012,11 @@ def _wrap_effect(module, modname: str, cls_name, name: str) -> None:
     if _marked(real):
         return
     label = f"{modname}.{cls_name + '.' if cls_name else ''}{name}"
+    why = _EFFECT_REASONS[guard]
 
     def stub(*args, **kwargs):
-        if _active("input"):
-            _refuse("input", label, label,
-                    "a real effect on the owner's speakers / media session "
-                    "(a COM / WinRT call no audit event covers)")
+        if _active(guard):
+            _refuse(guard, label, label, why)
         return real(*args, **kwargs)
 
     stub.__name__ = getattr(real, "__name__", name)
@@ -909,16 +1032,16 @@ def _wrap_effect(module, modname: str, cls_name, name: str) -> None:
 
 
 def _arm_effects_in(modname: str, module) -> None:
-    for mod, cls_name, name in _EFFECT_TARGETS:
+    for guard, mod, cls_name, name in _wrapped_targets():
         if mod == modname:
-            _wrap_effect(module, modname, cls_name, name)
+            _wrap_effect(module, modname, cls_name, name, guard)
     _effect_modules[modname] = module
 
 
 def _arm_effects() -> None:
-    """Wrap the targets of every effect module that is already imported (the
+    """Wrap the targets of every wrapped module that is already imported (the
     import hook covers the ones imported later) and install that hook once."""
-    for modname in _EFFECT_MODULES:
+    for modname in _wrapped_modules():
         module = sys.modules.get(modname)
         if module is not None and getattr(module, "__spec__", None) is not None:
             _arm_effects_in(modname, module)
@@ -950,13 +1073,13 @@ class _EffectLoader:
 
 
 class _EffectImportHook:
-    """A ``sys.meta_path`` entry that finds NOTHING itself: for an effect
+    """A ``sys.meta_path`` entry that finds NOTHING itself: for a wrapped
     module it asks the finders after it, then swaps in an _EffectLoader so the
     real module is wrapped the moment it has executed. A module a test put in
     ``sys.modules`` never reaches a finder, so a fake is never wrapped."""
 
     def find_spec(self, name, path=None, target=None):
-        if name not in _EFFECT_MODULES or getattr(_finding, "on", False):
+        if name not in _wrapped_modules() or getattr(_finding, "on", False):
             return None
         _finding.on = True
         try:
@@ -984,11 +1107,14 @@ class _EffectImportHook:
 setattr(_EffectImportHook, _GUARD_MARK, True)
 
 
-def unwrapped_effects() -> list[str]:
-    """Effect targets of a REAL module this guard wrapped that are NOT
-    wrapped right now (a fake module in sys.modules is not checked)."""
+def unwrapped_effects(guard: str | None = None) -> list[str]:
+    """Wrapped targets (of ``guard``, default every guard) of a REAL module
+    this guard wrapped that are NOT wrapped right now (a fake module in
+    sys.modules is not checked)."""
     bad = []
-    for modname, cls_name, name in _EFFECT_TARGETS:
+    for g, modname, cls_name, name in _wrapped_targets():
+        if guard is not None and g != guard:
+            continue
         module = _effect_modules.get(modname)
         if module is None or sys.modules.get(modname) is not module:
             continue
@@ -1021,11 +1147,29 @@ def _resolve_user32() -> None:
                 table[ptr] = name
 
 
+def _resolve_screen_functions() -> None:
+    """Function-pointer -> (dll, name) table for the audited GDI copies."""
+    if sys.platform != "win32" or _screen_fn_ptrs:
+        return
+    try:
+        import ctypes
+    except Exception:  # noqa: BLE001 - no ctypes: nothing to watch
+        return
+    for dll, name in _SCREEN_FUNCTIONS:
+        try:
+            fn = getattr(ctypes.WinDLL(dll), name)
+            ptr = ctypes.cast(fn, ctypes.c_void_p).value
+        except Exception:  # noqa: BLE001 - an export / DLL this Windows lacks
+            continue
+        if ptr:
+            _screen_fn_ptrs[ptr] = (dll, name)
+
+
 # ─── opt-in ────────────────────────────────────────────────────────────────
 
 @contextlib.contextmanager
 def allow(*guards: str, reason: str = ""):
-    """Let the named guards (default: all three) through while the block is
+    """Let the named guards (default: all four) through while the block is
     open - on every thread. Also a decorator. ``reason`` is documentation."""
     names = guards or GUARDS
     for g in names:
@@ -1060,23 +1204,36 @@ def unarmed_guards() -> list[str]:
     cursor = [p for p, n in _input_fn_ptrs.items() if n == "SetCursorPos"]
     if cursor:        # (a box with no user32 has no input calls to watch)
         probes["input"] = ("ctypes.call_function", (cursor[0], (0, 0)))
+    blit = [p for p, fn in _screen_fn_ptrs.items() if fn[1] == "BitBlt"]
+    if blit:          # a 1x1 copy from handle 1: never a memory DC
+        probes["screen"] = ("ctypes.call_function",
+                            (blit[0], (0, 0, 0, 1, 1, 1, 0, 0, 0x00CC0020)))
     _probing.on = True
     try:
         for guard in GUARDS:
             if guard not in probes:
-                continue              # input on a box with no user32 to watch
+                # No foreign function to probe on this box (no user32 /
+                # gdi32): its wrapped entry points still refuse while it is
+                # active, so a disabled guard must still be reported.
+                if not _active(guard):
+                    bad.append(guard)
+                continue
             event, args = probes[guard]
             try:
                 sys.audit(event, *args)
-            except (NetworkGuardError, InputGuardError, ProbeGuardError):
+            except (NetworkGuardError, InputGuardError, ProbeGuardError,
+                    ScreenGuardError):
                 continue
             except Exception:  # noqa: BLE001 - someone else's hook refused it
                 pass
             bad.append(guard)
     finally:
         _probing.on = False
-    if "input" not in bad and (unwrapped_pywin32() or unwrapped_effects()):
+    if "input" not in bad and (unwrapped_pywin32()
+                               or unwrapped_effects("input")):
         bad.append("input")
+    if "screen" not in bad and unwrapped_effects("screen"):
+        bad.append("screen")
     return bad
 
 
@@ -1090,7 +1247,7 @@ def banner() -> str:
 
 def install(record_only: bool = False, *, env: dict | None = None,
             quiet: bool = False) -> bool:
-    """Arm the three guards. Returns True when every guard refuses.
+    """Arm the four guards. Returns True when every guard refuses.
 
     Idempotent and REPAIRING: a later call re-wraps any pywin32 function a
     test displaced. Never raises. Prints one banner line on the first call."""
@@ -1109,6 +1266,7 @@ def install(record_only: bool = False, *, env: dict | None = None,
         except Exception:  # noqa: BLE001
             pass
         _resolve_user32()
+        _resolve_screen_functions()
         _arm_pywin32()
         _arm_effects()
         if not _hook_added[0]:
@@ -1122,7 +1280,7 @@ def install(record_only: bool = False, *, env: dict | None = None,
         off = [g for g in GUARDS if g in _disabled]
         if _record_only[0]:
             text = ("[hermetic-guard] RECORD-ONLY - network / input / probe "
-                    "reaches are ALLOWED THROUGH and merely logged")
+                    "/ screen reaches are ALLOWED THROUGH and merely logged")
         elif not on:
             text = "[hermetic-guard] NOT armed"
         else:
@@ -1140,7 +1298,8 @@ def install(record_only: bool = False, *, env: dict | None = None,
     except Exception as exc:  # noqa: BLE001 - a guard must never fail a run
         _banner[0] = (f"[hermetic-guard] WARNING: could NOT arm "
                       f"({type(exc).__name__}: {exc}) - this run CAN reach "
-                      f"the network, real input and live hardware")
+                      f"the network, real input, live hardware and the "
+                      f"screen")
         if not quiet:
             print(_banner[0], flush=True)
         return False
