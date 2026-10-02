@@ -2403,12 +2403,16 @@ def _learn_gate() -> "_learn_gate_mod.LearnGate":
 
 
 def _learn_voice_verdict(audio, sample_rate: int,
-                         reject_below: "float | None" = None) -> "tuple[str, float]":
+                         reject_below: "float | None" = None,
+                         any_enrolled: bool = False) -> "tuple[str, float]":
     """(verdict, score) of the turn's raw audio against the enrolled
     voiceprints (core/learn_gate.voice_verdict). UNAVAILABLE when nobody is
     enrolled, resemblyzer is missing, or there is no audio. Never raises.
     ``reject_below``: the "not the owner" floor; None = LEARN_VOICE_REJECT_BELOW
-    (the media gate passes its own, MEDIA_VOICE_GATE_REJECT_BELOW)."""
+    (the media gate passes its own, MEDIA_VOICE_GATE_REJECT_BELOW).
+    ``any_enrolled``: any enrolled person who matches counts as OWNER, not
+    only one allowed to teach (the media gate asks "is this a person in the
+    room or the video?", not "may this voice teach?" - 2026-10-02)."""
     try:
         if reject_below is None:
             reject_below = LEARN_VOICE_REJECT_BELOW
@@ -2418,7 +2422,8 @@ def _learn_voice_verdict(audio, sample_rate: int,
         if not _vid.list_enrolled() or not _vid.is_available():
             return _learn_gate_mod.UNAVAILABLE, 0.0
         name, score = _vid.identify_speaker(audio, int(sample_rate))
-        may_write = bool(name) and _vid.can(name, "memory_write")
+        may_write = bool(name) and (bool(any_enrolled)
+                                    or _vid.can(name, "memory_write"))
         return _learn_gate_mod.voice_verdict(
             name, score, enrolled=True, may_write=may_write,
             reject_below=reject_below), float(score or 0.0)
@@ -31092,15 +31097,59 @@ def _media_voice_gate(text: str, injected: bool = False) -> bool:
         if _media_guest_mode():
             print(f"  [media-gate] PC audio playing; guest mode — allowed ({meter})")
             return False
-        voice, score = _learn_voice_verdict(
-            audio, sr, reject_below=float(MEDIA_VOICE_GATE_REJECT_BELOW))
+        # Over his media he mostly controls it (2026-10-02 review repair):
+        # a short media control runs whatever the voice.
+        if _media_gate.is_media_control(text):
+            print(f"  [media-gate] PC audio playing; a media control — "
+                  f"allowed ({meter})")
+            return False
+        floor = float(MEDIA_VOICE_GATE_REJECT_BELOW)
+        voice, score = _learn_voice_verdict(audio, sr, reject_below=floor,
+                                            any_enrolled=True)
+        how = ""
+        if voice == _learn_gate_mod.NOT_OWNER:
+            # "Jarvis, ..." leads the capture; on a long one the media behind
+            # him dominates the rest (live 22:59:47, 20.7 s, 0.50). Score the
+            # leading speech before calling it someone else's.
+            lead = _media_gate.leading_speech_window(audio, sr)
+            if lead is not None:
+                v2, s2 = _learn_voice_verdict(lead, sr, reject_below=floor,
+                                              any_enrolled=True)
+                if v2 in (_learn_gate_mod.OWNER, _learn_gate_mod.UNSURE):
+                    voice, score, how = v2, s2, ", leading speech"
         drop, line = _media_gate.decide(True, voice)
         if line:
-            print(f"  {line} ({meter}, voice {float(score or 0.0):.2f}, "
+            print(f"  {line} ({meter}, voice {float(score or 0.0):.2f}{how}, "
                   f"{len(text or '')} chars)")
         return bool(drop)
     except Exception:
         return False
+
+
+# A dropped turn that was addressed to JARVIS gets one short spoken cue, at
+# most once per this many seconds (2026-10-02 review repair): silence left
+# the owner guessing whether he had been heard over his own video.
+_MEDIA_DROP_CUE_GAP_S = 60.0
+_media_drop_cue_at = [0.0]
+
+
+def _media_gate_drop_cue(text: str) -> None:
+    """The media gate just dropped this mic turn. When it was led by the
+    wake word, say core/media_gate.DROP_CUE ("Sorry, sir, I couldn't tell
+    that was you over the audio.") so he knows to say it again or pause the
+    video - never the words, at most once per _MEDIA_DROP_CUE_GAP_S, and
+    nothing for a line that was not addressed to JARVIS. Never raises."""
+    try:
+        if not _text_has_wake_prefix(text):
+            return
+        now = time.monotonic()
+        last = float(_media_drop_cue_at[0] or 0.0)
+        if last > 0.0 and now - last < _MEDIA_DROP_CUE_GAP_S:
+            return
+        _media_drop_cue_at[0] = now
+        _speak(_media_gate.DROP_CUE)
+    except Exception:
+        pass
 
 
 def _device_speech_ignored(text: str, injected: bool = False) -> bool:
@@ -41235,6 +41284,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # (live 22:28:50, "Jarvis, find me a restaurant ..." ran). Mic
                 # turns only; logs numbers, never the words. _media_voice_gate.
                 if _media_voice_gate(text, _injected_text is not None):
+                    _media_gate_drop_cue(text)
                     set_state("idle")
                     continue
 

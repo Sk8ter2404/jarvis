@@ -904,6 +904,26 @@ SCHEMA: dict[str, dict] = {
                 "gets through; no phrase files = nothing filtered. Applies on "
                 "the next start.",
     },
+    "MEDIA_VOICE_GATE_ENABLED": {
+        "tab": "hearing", "label": "Ignore other voices while the PC plays audio",
+        "type": "bool", "default": True,
+        "help": "While a video, a reel or music plays on this PC, a 'JARVIS, "
+                "...' in a voice that is clearly not yours is ignored (a reel "
+                "once ran a command). 'Stop', pause / next / volume commands "
+                "always get through, and an ignored 'JARVIS, ...' gets a "
+                "short 'couldn't tell that was you'. Turn it off if it keeps "
+                "missing you. Applies on the next start.",
+    },
+    "MEDIA_VOICE_GATE_REJECT_BELOW": {
+        "tab": "hearing", "label": "Not-you voice score while audio plays",
+        "type": "float", "default": 0.45, "min": 0, "max": 1,
+        "help": "With the setting above on: while the PC plays audio, a voice "
+                "scoring below this against your voiceprint is someone else "
+                "and is ignored. Your own commands over a video have scored "
+                "0.48-0.52, the reel 0.43. Lower it if he ignores you over "
+                "your media; raise it if videos still set him off. Applies "
+                "on the next start.",
+    },
 
     # ── AI / Models ────────────────────────────────────────────────────
     "AI_BACKEND": {
@@ -1697,7 +1717,9 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Speech recognition", ["WHISPER_DEVICE", "WHISPER_MODEL_CUDA"]),
         ("What he ignores", ["SELF_ECHO_FILTER_ENABLED", "SELF_ECHO_WINDOW_S",
                              "SELF_ECHO_TAIL_S", "NOISE_FILTER_ENABLED",
-                             "DEVICE_SPEECH_FILTER_ENABLED"]),
+                             "DEVICE_SPEECH_FILTER_ENABLED",
+                             "MEDIA_VOICE_GATE_ENABLED",
+                             "MEDIA_VOICE_GATE_REJECT_BELOW"]),
     ],
     "ai": [
         ("Brain", ["AI_BACKEND", "CLAUDE_MODEL", "LOCAL_LLM_MODEL",

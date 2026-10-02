@@ -613,13 +613,17 @@ LEARN_VOICE_REJECT_BELOW = 0.60
 # media session's "playing" when the meter can't be read), a mic turn whose
 # voice scores below MEDIA_VOICE_GATE_REJECT_BELOW against the enrolled owner
 # voiceprint is dropped ("[media-gate] PC audio playing and not the owner's
-# voice"). The reel scored 0.43; the owner's own wake-word turns 0.63-0.68, so a
-# too-close-to-call voice still runs. Nobody enrolled / voice-ID unavailable ->
-# allowed and logged. Typed turns, a stop word and guest mode always pass. Set
-# via user_settings.json; applies on the next start.
+# voice"). The reel scored 0.43. The owner's own commands OVER media scored
+# 0.48-0.52 on the same buffer (21:43:17, 22:59:47, 13:57:08 - 2026-10-02
+# review repair), so the floor is 0.45, a short media control ("pause", "next
+# song", "turn it down") always runs, a long capture is scored again on its
+# leading speech, and a dropped "Jarvis, ..." gets one short spoken cue.
+# Nobody enrolled / voice-ID unavailable -> allowed and logged. Typed turns, a
+# stop word and guest mode always pass. Set via user_settings.json (Settings,
+# Hearing); applies on the next start.
 MEDIA_VOICE_GATE_ENABLED = True
 MEDIA_VOICE_GATE_PEAK = 0.01
-MEDIA_VOICE_GATE_REJECT_BELOW = 0.55
+MEDIA_VOICE_GATE_REJECT_BELOW = 0.45
 
 # Known-device speech filter (core/device_speech_filter.py). When True, an
 # utterance that matches a line a known device speaks (phrase lists in the

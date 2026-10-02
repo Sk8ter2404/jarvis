@@ -44,12 +44,18 @@ REEL = ("Jarvis, find me a restaurant in Brickell, Miami, that doesn't already "
 
 
 class _FakeVoiceId:
-    """core.voice_id stand-in: one enrolled owner, a fixed (name, score)."""
+    """core.voice_id stand-in: one enrolled owner, a fixed (name, score).
+    ``short``: the (name, score) for a clip of at most 4 s (the leading
+    speech window), when it should differ from the whole capture's.
+    ``may_write``: what can(name, "memory_write") answers."""
 
-    def __init__(self, name, score, enrolled=True, available=True):
+    def __init__(self, name, score, enrolled=True, available=True,
+                 short=None, may_write=True):
         self.name, self.score = name, score
         self.enrolled, self.available = enrolled, available
+        self.short, self.may_write = short, may_write
         self.calls = 0
+        self.lengths = []
 
     def list_enrolled(self):
         return ["owner"] if self.enrolled else []
@@ -59,10 +65,14 @@ class _FakeVoiceId:
 
     def identify_speaker(self, audio, sr):
         self.calls += 1
+        n = len(audio) if audio is not None else 0
+        self.lengths.append(n)
+        if self.short is not None and sr and n <= 4 * sr:
+            return self.short
         return self.name, self.score
 
     def can(self, name, cap):
-        return True
+        return self.may_write
 
 
 @requires_monolith
@@ -78,10 +88,10 @@ class _Base(MonolithGlobalsTestCase):
         bc._last_capture_audio = self.audio
         bc._last_capture_sr = 16000
         self.addCleanup(self._restore)
+        # MEDIA_VOICE_GATE_REJECT_BELOW is the SHIPPED default (2026-10-02:
+        # a test pinned at 0.55 hid that the owner's own turns score 0.48-0.52).
         for p in (mock.patch.object(bc, "MEDIA_VOICE_GATE_ENABLED", True, create=True),
                   mock.patch.object(bc, "MEDIA_VOICE_GATE_PEAK", 0.01, create=True),
-                  mock.patch.object(bc, "MEDIA_VOICE_GATE_REJECT_BELOW", 0.55,
-                                    create=True),
                   mock.patch.object(bc, "GUEST_MODE_ENABLED", False),
                   mock.patch.object(bc, "_smtc_media_playing", return_value=False)):
             p.start()
@@ -138,6 +148,106 @@ class ReelReplayTests(_Base):
         with mock.patch.object(self.bc, "_smtc_media_playing", return_value=True):
             drop, _lines, _vid = self._gate(REEL, peak=None)
         self.assertTrue(drop)
+
+
+class OwnerOverMediaTests(_Base):
+    """Review repair (2026-10-02). The 0.55 floor rested on "his wake-word
+    turns score 0.63-0.68", but his own commands over media scored lower on
+    the same buffer the gate checks: 21:43:17 "Jarvis plays Skrillex
+    Essentials on YouTube." 0.52 (music detected just before), 22:59:47
+    "Jarvis, what time is it? ..." 0.50 (a 20.7 s capture, mostly video),
+    13:57:08 0.48. With PC audio playing those were dropped in silence; the
+    live reel scored 0.43."""
+
+    def test_his_live_turns_over_media_run(self):
+        for text, score in (("Jarvis plays Skrillex Essentials on YouTube.", 0.52),
+                            ("Jarvis, what time is it?", 0.50),
+                            ("Jarvis, you did not program me to say that?", 0.48)):
+            with self.subTest(score=score):
+                drop, lines, _v = self._gate(text, vid=_FakeVoiceId(None, score))
+                self.assertFalse(drop, lines)
+
+    def test_media_controls_pass_whatever_the_voice(self):
+        for text in ("Jarvis, pause.", "Jarvis, next song",
+                     "Jarvis, turn it down", "Jarvis, volume down"):
+            with self.subTest(text=text):
+                drop, lines, vid = self._gate(text, vid=_FakeVoiceId(None, 0.30))
+                self.assertFalse(drop)
+                self.assertEqual(vid.calls, 0)
+                self.assertTrue(any("media control" in ln for ln in lines), lines)
+
+    def test_the_leading_speech_rescues_a_long_capture(self):
+        # 22:59:47: his "Jarvis, what time is it?" at the start, the video
+        # under the rest of a 20.7 s capture.
+        bc = self.bc
+        audio = np.zeros(16000 * 20, dtype=np.float32)
+        audio[16000:16000 * 3] = 0.3
+        audio[16000 * 4:] = 0.05
+        bc._last_capture_audio = audio
+        vid = _FakeVoiceId(None, 0.38, short=(None, 0.61))
+        drop, lines, _v = self._gate("Jarvis, what time is it? This team is "
+                                     "going to be building the data center",
+                                     vid=vid)
+        self.assertFalse(drop, lines)
+        self.assertEqual(vid.calls, 2)
+        self.assertLessEqual(min(vid.lengths), 16000 * 4)
+        self.assertTrue(any("leading speech" in ln for ln in lines), lines)
+
+    def test_a_long_reel_capture_stays_dropped(self):
+        bc = self.bc
+        audio = np.zeros(16000 * 20, dtype=np.float32)
+        audio[16000:] = 0.2
+        bc._last_capture_audio = audio
+        drop, _lines, vid = self._gate(
+            REEL, vid=_FakeVoiceId(None, 0.40, short=(None, 0.41)))
+        self.assertTrue(drop)
+        self.assertEqual(vid.calls, 2)
+
+    def test_an_enrolled_guest_is_a_person_not_a_reel(self):
+        # A guest without memory_write is NOT_OWNER to the learn gate, which
+        # dropped every command of theirs while audio played.
+        drop, lines, _v = self._gate("Jarvis, what is the weather tomorrow",
+                                     vid=_FakeVoiceId("guest", 0.81,
+                                                      may_write=False))
+        self.assertFalse(drop, lines)
+
+
+class DropCueTests(_Base):
+    """Review repair (2026-10-02): a dropped turn that was addressed to
+    JARVIS ("Jarvis, ...") gets a short spoken cue instead of silence, so
+    the owner knows to say it again (or pause the video) - at most once a
+    minute, never for a line that was not led by the wake word."""
+
+    def setUp(self):
+        super().setUp()
+        self.said = []
+        p = mock.patch.object(self.bc, "_speak",
+                              side_effect=lambda t, *a, **k: self.said.append(t))
+        p.start()
+        self.addCleanup(p.stop)
+        cell = getattr(self.bc, "_media_drop_cue_at", None)
+        if isinstance(cell, list) and cell:
+            cell[0] = 0.0
+
+    def test_a_wake_led_drop_is_answered_once(self):
+        bc = self.bc
+        with mock.patch("builtins.print"):
+            bc._media_gate_drop_cue(REEL)
+            bc._media_gate_drop_cue(REEL)
+        self.assertEqual(len(self.said), 1, self.said)
+        self.assertIn("sir", self.said[0])
+        self.assertNotIn("restaurant", self.said[0])
+
+    def test_a_line_without_the_wake_word_gets_no_cue(self):
+        with mock.patch("builtins.print"):
+            self.bc._media_gate_drop_cue("find me a restaurant in Brickell")
+        self.assertEqual(self.said, [])
+
+    def test_the_cue_never_raises(self):
+        with mock.patch.object(self.bc, "_speak",
+                               side_effect=RuntimeError("tts")), \
+                mock.patch("builtins.print"):
+            self.bc._media_gate_drop_cue(REEL)
 
 
 class PassThroughTests(_Base):
@@ -257,8 +367,11 @@ class WiringTests(_Base):
                       "reply = _run_llm_dispatch(text",
                       "learn_from_turn(text, reply, memory"):
             self.assertLess(at, src.index(later), later)
-        tail = src[at:at + 200]
+        tail = src[at:at + 300]
         self.assertIn("continue", tail)
+        self.assertIn("_media_gate_drop_cue(text)", tail)
+        self.assertLess(tail.index("_media_gate_drop_cue(text)"),
+                        tail.index("continue"))
 
     def test_both_capture_paths_start_the_probe(self):
         for fn in (self.bc._capture_utterance, self.bc._handle_sleep_standby):
@@ -273,8 +386,21 @@ class WiringTests(_Base):
         self.assertIs(cfg.MEDIA_VOICE_GATE_ENABLED, True)
         self.assertIsInstance(cfg.MEDIA_VOICE_GATE_PEAK, float)
         self.assertIsInstance(cfg.MEDIA_VOICE_GATE_REJECT_BELOW, float)
-        self.assertLess(cfg.MEDIA_VOICE_GATE_REJECT_BELOW, 0.63)   # owner's lowest live score
-        self.assertGreater(cfg.MEDIA_VOICE_GATE_REJECT_BELOW, 0.43)  # the live reel
+        # His own live turns over media scored 0.48-0.52 (13:57:08, 22:59:47,
+        # 21:43:17); the live reel 0.43.
+        self.assertLess(cfg.MEDIA_VOICE_GATE_REJECT_BELOW, 0.48)
+        self.assertGreater(cfg.MEDIA_VOICE_GATE_REJECT_BELOW, 0.43)
+
+    def test_the_settings_page_has_the_switch_and_the_floor(self):
+        import importlib
+        sw = importlib.import_module("tools.settings_window")
+        import core.config as cfg
+        row = sw.SCHEMA["MEDIA_VOICE_GATE_ENABLED"]
+        self.assertEqual(row["type"], "bool")
+        self.assertIs(row["default"], cfg.MEDIA_VOICE_GATE_ENABLED)
+        floor = sw.SCHEMA["MEDIA_VOICE_GATE_REJECT_BELOW"]
+        self.assertEqual(floor["type"], "float")
+        self.assertEqual(floor["default"], cfg.MEDIA_VOICE_GATE_REJECT_BELOW)
 
 
 if __name__ == "__main__":

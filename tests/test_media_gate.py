@@ -124,5 +124,63 @@ class DecideTests(unittest.TestCase):
                 self.assertEqual(mg.decide(False, v), (False, ""))
 
 
+class MediaControlTests(unittest.TestCase):
+    """Review repair (2026-10-02): what he says OVER his media is mostly
+    about the media. Short media-control commands always pass the gate - a
+    reel saying "Jarvis, pause" costs nothing."""
+
+    def test_media_controls_pass(self):
+        for text in ("Jarvis, pause.", "Jarvis pause it", "Jarvis, resume",
+                     "Jarvis, next song", "Jarvis, skip this one",
+                     "Jarvis, previous track", "Hey Jarvis, turn it down",
+                     "Jarvis, turn the volume down a bit", "Jarvis, mute",
+                     "Jarvis, quieter please", "Jarvis, louder",
+                     "Jarvis, volume up", "Jarvis, stop the music",
+                     "Jarvis, unpause"):
+            with self.subTest(text=text):
+                self.assertTrue(mg.is_media_control(text))
+
+    def test_other_commands_do_not(self):
+        for text in ("Jarvis, find me a restaurant in Brickell, Miami, that "
+                     "doesn't already have a website",
+                     "Jarvis, what time is it?",
+                     "Jarvis, find the next restaurant on the list and "
+                     "build a website for them now",
+                     "Jarvis, play Skrillex on YouTube", "", None):
+            with self.subTest(text=text):
+                self.assertFalse(mg.is_media_control(text))
+
+
+class LeadingSpeechTests(unittest.TestCase):
+    """Review repair (2026-10-02): live 22:59:47 the owner's "Jarvis, what
+    time is it?" led a 20.7 s capture that was mostly the video behind him,
+    and the whole capture scored 0.50. The wake word and his command are at
+    the START of the capture, so that part is scored too."""
+
+    def test_the_window_starts_at_the_speech_onset(self):
+        import numpy as np
+        sr = 16000
+        audio = np.zeros(sr * 20, dtype=np.float32)
+        audio[sr * 2:sr * 4] = 0.3                    # his words at 2-4 s
+        audio[sr * 6:] = 0.05                         # the video after
+        win = mg.leading_speech_window(audio, sr, seconds=3.0)
+        self.assertIsNotNone(win)
+        self.assertEqual(len(win), sr * 3)
+        self.assertGreater(float(abs(win).max()), 0.29)
+        self.assertGreater(float((abs(win) > 0.29).mean()), 0.5)
+
+    def test_a_short_capture_has_no_separate_window(self):
+        import numpy as np
+        self.assertIsNone(mg.leading_speech_window(
+            np.ones(16000 * 3, dtype=np.float32), 16000, seconds=3.0))
+
+    def test_silence_or_junk_has_no_window(self):
+        import numpy as np
+        self.assertIsNone(mg.leading_speech_window(
+            np.zeros(16000 * 20, dtype=np.float32), 16000))
+        self.assertIsNone(mg.leading_speech_window(None, 16000))
+        self.assertIsNone(mg.leading_speech_window([1, 2], 0))
+
+
 if __name__ == "__main__":
     unittest.main()

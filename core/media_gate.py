@@ -21,10 +21,26 @@ confidently someone else's voice:
     unavailable (nobody enrolled, no resemblyzer, no audio) keeps today's
     behaviour.
 
+REVIEW REPAIR (2026-10-02). The floor rested on "his wake-word turns score
+0.63-0.68", but his own commands OVER media scored lower on the same buffer the
+gate checks: 21:43:17 "Jarvis plays Skrillex Essentials on YouTube." 0.52,
+22:59:47 "Jarvis, what time is it? ..." 0.50 (a 20.7 s capture, mostly the
+video), 13:57:08 0.48 - each dropped in silence while audio played. So:
+
+  * the floor is 0.45 (the reel scored 0.43; core/config.py);
+  * a short media-control command ("pause", "next song", "turn it down")
+    always passes: over his media that is mostly what he says
+    (is_media_control);
+  * a long capture is scored again on its LEADING speech, where "Jarvis, ..."
+    is, before it is called someone else's (leading_speech_window);
+  * a dropped "Jarvis, ..." gets one short spoken cue (DROP_CUE) instead of
+    silence (bobert_companion._media_gate_drop_cue).
+
 Pure decisions plus one pycaw reader with injectable seams; never raises.
 """
 from __future__ import annotations
 
+import re
 import time
 
 from core import learn_gate as _lg
@@ -33,6 +49,86 @@ from core import learn_gate as _lg
 _SESSION_ACTIVE = 1
 
 DROP_LINE = "[media-gate] PC audio playing and not the owner's voice"
+
+# Spoken when a dropped turn was addressed to JARVIS: a statement, never a
+# question (in wake-word mode he could not answer it without the wake word).
+DROP_CUE = "Sorry, sir, I couldn't tell that was you over the audio."
+
+# ── what he says over his own media ───────────────────────────────────────
+_WAKE_LEAD_RE = re.compile(
+    r"^\s*(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*", re.IGNORECASE)
+_MEDIA_CONTROL_CORE = (
+    r"(?:pause|unpause|resume|mute|unmute)"
+    r"(?:\s+(?:it|this|that|the\s+(?:music|video|song|playback|sound|audio|tv)))?"
+    r"|(?:skip|next|previous|prev)"
+    r"(?:\s+(?:it|this|that|one|song|track|video|episode|chapter|"
+    r"this\s+(?:one|song|track|video)|the\s+(?:song|track|video)))?"
+    r"|(?:go\s+)?back\s+(?:a|one)\s+(?:song|track)"
+    r"|louder|quieter|softer"
+    r"|(?:volume|sound)\s+(?:up|down)"
+    r"|turn\s+(?:it|this|that|the\s+(?:music|volume|video|sound|tv))"
+    r"\s+(?:up|down|off)"
+    r"|turn\s+(?:up|down)\s+(?:the\s+)?(?:music|volume|video|sound|tv)"
+    r"|(?:stop|kill)\s+(?:the\s+)?(?:music|video|song|playback|sound|audio)"
+    r"|(?:lower|raise)\s+(?:the\s+)?(?:volume|music|sound)")
+_MEDIA_CONTROL_TAIL = (
+    r"(?:\s+(?:a\s+(?:bit|little|touch|notch)|please|for\s+me|now|sir|"
+    r"right\s+now|again|thanks|thank\s+you|a\s+little\s+bit))*")
+_MEDIA_CONTROL_RE = re.compile(
+    r"^(?:please\s+)?(?:" + _MEDIA_CONTROL_CORE + r")" + _MEDIA_CONTROL_TAIL
+    + r"[\s.!?]*$", re.IGNORECASE)
+
+
+def is_media_control(text) -> bool:
+    """True when ``text`` (wake word allowed in front) is nothing but a
+    media control: pause / resume / mute / skip / next / previous / volume
+    up or down / louder / quieter / turn it down / stop the music, with a
+    "please" or "a bit" at most. Such a turn passes the gate whatever the
+    voice: a reel saying "Jarvis, pause" costs nothing. Never raises."""
+    try:
+        s = _WAKE_LEAD_RE.sub("", str(text or "")).replace(",", " ")
+        s = " ".join(s.split())
+        return bool(s) and bool(_MEDIA_CONTROL_RE.match(s))
+    except Exception:
+        return False
+
+
+def leading_speech_window(audio, sample_rate, *, seconds: float = 3.0,
+                          min_extra_s: float = 1.0, frame_s: float = 0.02,
+                          pre_s: float = 0.15):
+    """The first ``seconds`` of speech in a capture, from its onset (the first
+    20 ms frame at a quarter of the capture's loud level, less ``pre_s``), or
+    None when the capture is not at least ``min_extra_s`` longer than that
+    (scoring it again would score the same audio), silent, or unreadable.
+    "Jarvis, ..." is at the start of a capture; on a long one the media behind
+    him dominates the rest (live 22:59:47: a 20.7 s capture scored 0.50).
+    Never raises."""
+    try:
+        import numpy as np
+        sr = int(sample_rate or 0)
+        if audio is None or sr <= 0:
+            return None
+        a = np.asarray(audio, dtype=np.float32).reshape(-1)
+        n_win = int(float(seconds) * sr)
+        if n_win <= 0 or a.size < n_win + int(float(min_extra_s) * sr):
+            return None
+        hop = max(1, int(float(frame_s) * sr))
+        n_frames = a.size // hop
+        if n_frames < 2:
+            return None
+        frames = a[:n_frames * hop].reshape(n_frames, hop)
+        rms = np.sqrt((frames * frames).mean(axis=1))
+        loud = float(np.percentile(rms, 95))
+        if not loud > 1e-4:
+            return None
+        above = np.nonzero(rms >= 0.25 * loud)[0]
+        if above.size == 0:
+            return None
+        start = max(0, int(above[0]) * hop - int(float(pre_s) * sr))
+        start = min(start, a.size - n_win)
+        return a[start:start + n_win]
+    except Exception:
+        return None
 
 
 def _pycaw_sessions():

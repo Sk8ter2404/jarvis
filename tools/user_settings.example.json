@@ -46,6 +46,8 @@
   "AUDIO_AUTOSWITCH_MIC": false,
   "AUDIO_AUTOSWITCH_MIC_FALLBACK": "",
   "DEVICE_SPEECH_FILTER_ENABLED": true,
+  "MEDIA_VOICE_GATE_ENABLED": true,
+  "MEDIA_VOICE_GATE_REJECT_BELOW": 0.45,
   "AI_BACKEND": "claude",
   "CLAUDE_MODEL": "claude-sonnet-5-5",
   "LOCAL_LLM_MODEL": "gemma4:26b-a4b-it-qat",
