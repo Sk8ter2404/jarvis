@@ -190,7 +190,9 @@ class SessionResumeTests(SectionFiveBase):
     def test_warm_restart_with_task_uses_at_your_service(self):
         bc = self.bc
         import time as _t
-        warm_ts = _t.time() - 60  # 1 minute ago -> inside 18h window
+        # 30 min ago: inside the 18h window and past the SESSION_RESUME_QUIET_S
+        # restart quiet (2026-10-01) -- a restart minutes later gets no greeting.
+        warm_ts = _t.time() - 30 * 60
         with mock.patch.object(bc, "_last_session_end_ts", return_value=warm_ts), \
              mock.patch.object(bc, "_last_queued_task_line",
                                return_value="- [ ] **2026-01-01 09:00** [task] — refactor the parser"):
@@ -203,7 +205,7 @@ class SessionResumeTests(SectionFiveBase):
     def test_warm_restart_no_work_uses_im_afraid(self):
         bc = self.bc
         import time as _t
-        warm_ts = _t.time() - 120
+        warm_ts = _t.time() - 30 * 60   # past the restart quiet
         with mock.patch.object(bc, "_last_session_end_ts", return_value=warm_ts):
             text, details = bc._build_session_resume(force=False)
         self.assertTrue(details["in_window"])
@@ -213,19 +215,22 @@ class SessionResumeTests(SectionFiveBase):
     def test_warm_restart_falls_back_to_last_command(self):
         bc = self.bc
         import time as _t
-        warm_ts = _t.time() - 90
+        warm_ts = _t.time() - 30 * 60   # past the restart quiet
+        # A resumable request. Since 2026-10-01 a device / media / window
+        # command ("Open the garage door.") is not "where we left off" -- resuming
+        # it would re-run it (tests/monolith/test_monolith_session_resume.py).
         with mock.patch.object(bc, "_last_session_end_ts", return_value=warm_ts), \
              mock.patch.object(bc, "_last_n_user_commands",
-                               return_value=["Open the garage door."]):
+                               return_value=["Draft the garage door schedule."]):
             text, details = bc._build_session_resume(force=False)
         # No task line, but a recent command -> work derived from it (lowercased).
-        self.assertEqual(details["work"], "open the garage door")
-        self.assertIn("open the garage door", text)
+        self.assertEqual(details["work"], "draft the garage door schedule")
+        self.assertIn("you'd asked me to draft the garage door schedule", text)
 
     def test_warm_restart_uses_session_summary_when_no_command(self):
         bc = self.bc
         import time as _t
-        warm_ts = _t.time() - 90
+        warm_ts = _t.time() - 30 * 60   # past the restart quiet
         with mock.patch.object(bc, "_last_session_end_ts", return_value=warm_ts), \
              mock.patch.object(bc.pattern_memory, "get_session_summaries",
                                return_value=[{"summary": "Debugged the audio pipeline. Other stuff."}]):
@@ -237,7 +242,7 @@ class SessionResumeTests(SectionFiveBase):
     def test_summary_lookup_exception_is_swallowed(self):
         bc = self.bc
         import time as _t
-        warm_ts = _t.time() - 90
+        warm_ts = _t.time() - 30 * 60   # past the restart quiet
         with mock.patch.object(bc, "_last_session_end_ts", return_value=warm_ts), \
              mock.patch.object(bc.pattern_memory, "get_session_summaries",
                                side_effect=RuntimeError("db down")):
@@ -249,7 +254,7 @@ class SessionResumeTests(SectionFiveBase):
     def test_maybe_greeting_latches_once(self):
         bc = self.bc
         import time as _t
-        warm_ts = _t.time() - 60
+        warm_ts = _t.time() - 30 * 60   # past the restart quiet
         bc._session_resume_done[0] = False
         with mock.patch.object(bc, "_last_session_end_ts", return_value=warm_ts):
             first = bc.maybe_session_resume_greeting()
@@ -268,10 +273,10 @@ class SessionResumeTests(SectionFiveBase):
 
     def test_warm_restart_long_summary_first_sentence_truncated(self):
         # 8920-8922: no task line + no recent command, but a session summary
-        # whose first sentence exceeds 90 chars -> work is truncated to 87 + "…".
+        # whose first sentence exceeds 90 chars -> work is cut at a word + "…".
         bc = self.bc
         import time as _t
-        warm_ts = _t.time() - 90
+        warm_ts = _t.time() - 30 * 60   # past the restart quiet
         long_first = ("Refactored the entire audio capture and playback "
                       "pipeline including the noise cancellation stages and "
                       "the barge-in watchdog")
@@ -280,8 +285,11 @@ class SessionResumeTests(SectionFiveBase):
              mock.patch.object(bc.pattern_memory, "get_session_summaries",
                                return_value=[{"summary": long_first + ". Tail."}]):
             text, details = bc._build_session_resume(force=False)
+        # Cut on a word boundary (2026-10-01, _cut_at_word), never mid-word.
         self.assertTrue(details["work"].endswith("…"))
-        self.assertEqual(len(details["work"]), 88)   # 87 chars + the ellipsis
+        self.assertLessEqual(len(details["work"]), 90)
+        self.assertTrue(long_first.startswith(details["work"][:-1] + " "),
+                        details["work"])
         self.assertIn(details["work"], text)
 
     def test_maybe_greeting_age_print_exception_swallowed(self):

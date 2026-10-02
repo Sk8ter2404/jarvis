@@ -26784,19 +26784,150 @@ def _last_queued_task_line(max_age_s: float = WARM_RESTART_WINDOW_SECONDS) -> st
     return ""
 
 
+# Small words a cut must never end on ("...to the r…" / "...stages and the…").
+_CUT_DANGLING = frozenset({
+    "and", "or", "but", "nor", "the", "a", "an", "to", "of", "with", "for",
+    "in", "on", "at", "by", "from", "into", "while", "which", "that", "so",
+    "as", "than", "then", "my", "your", "its", "their"})
+
+
+def _cut_at_word(text, limit: int = 90) -> str:
+    """`text` (whitespace collapsed) cut to at most `limit` characters on a
+    boundary (2026-10-01; the greeting used to hard-cut at 87, "...to the r…"
+    and "...for the time, whic…"). A clause break (", " "; " " — ") in the
+    back half wins and needs no ellipsis; otherwise the last whole word, minus
+    any dangling "and" / "the" / "to", plus "…". A single overlong word is
+    hard-cut. Never raises; junk gives ""."""
+    try:
+        s = " ".join(str(text).split()) if text is not None else ""
+        if len(s) <= limit:
+            return s
+        best = -1
+        for sep in (", ", "; ", " — ", " – ", " - "):
+            i = s.rfind(sep, 0, limit)
+            if i >= limit // 2:
+                best = max(best, i)
+        if best > 0:
+            return s[:best].rstrip(" ,;:—–-")
+        k = s.rfind(" ", 0, limit)
+        if k <= 0:
+            return s[:max(1, limit - 1)] + "…"
+        words = s[:k].split()
+        while len(words) > 1 and words[-1].lower().strip(",;:—–-") in _CUT_DANGLING:
+            words.pop()
+        return " ".join(words).rstrip(" ,;:—–-") + "…"
+    except Exception:
+        return ""
+
+
+def _speakable_text(s: str) -> str:
+    """Code identifiers made sayable for TTS: backticks dropped, `name()` ->
+    name, snake_case -> words, and word/word -> word word ("open_url/browser"
+    was read aloud at 17:33:37). File names like tray.py are left alone."""
+    try:
+        s = str(s or "").replace("`", "")
+        s = re.sub(r"(\w)\(\)", r"\1", s)
+        s = re.sub(r"(?<=[A-Za-z0-9])_+(?=[A-Za-z0-9])", " ", s)
+        s = re.sub(r"(?<=\w)/(?=\w)", " ", s)
+        return " ".join(s.split())
+    except Exception:
+        return str(s or "")
+
+
 def _summarise_task_line(line: str) -> str:
     """Strip the `- [ ] **YYYY-MM-DD HH:MM** [tag] — ` prefix and return a
     short JARVIS-readable phrase for the description portion. Splits on
     sentence-ending punctuation (period/colon followed by whitespace) so
-    inline file paths like 'tray.py' don't truncate the summary."""
+    inline file paths like 'tray.py' don't truncate the summary.
+
+    2026-10-01: also stops at the first clause dash / semicolon (the
+    headline before " — " is the task), makes code identifiers speakable,
+    and any remaining cut lands on a word boundary (_cut_at_word)."""
     s = line.strip()
     s = re.sub(r'^- \[ \]\s*', '', s)
     s = re.sub(r'^\*\*[^*]+\*\*\s*(?:\[[^\]]+\]\s*)?[—–-]+\s*', '', s)
     m = re.search(r'[.!?:]\s', s)
-    first = (s[:m.start()] if m else s).strip().rstrip(",;:")
-    if len(first) > 90:
-        first = first[:87].rstrip() + "…"
-    return first
+    first = (s[:m.start()] if m else s).strip()
+    first = re.split(r'\s[—–]\s|\s-\s|;\s', first, maxsplit=1)[0]
+    first = _speakable_text(first).strip().rstrip(",;:")
+    return _cut_at_word(first, 90)
+
+
+# The resume greeting's "you'd asked me to X" (2026-10-01). Live, the newest
+# voice command was used word for word: the hotwords list read back (19:44),
+# "jarvis plays skrillex essentials on youtube" (21:49) and "jarvis, can you
+# tell me how much it costs to run you" (22:35). A command is "where we left
+# off" only when it is a request worth resuming: not a hotword echo or a list,
+# not a media / system / window / device command (resuming one would re-run
+# it), not a question, not a greeting or a yes/no.
+_RESUME_WAKE_LEAD_RE = re.compile(
+    r"^\s*(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*", re.IGNORECASE)
+_RESUME_NOT_WORK_RE = re.compile(
+    r"^(?:please\s+)?(?:"
+    r"play|plays|playing|put on|pause|resume|unpause|skip|next|previous|prev|"
+    r"stop|shuffle|repeat|mute|unmute|volume|louder|quieter|turn|"
+    r"set (?:a |an |the |my )?(?:timer|alarm|reminder|volume)|remind|"
+    r"open|launch|close|quit|exit|move|moved|put|minimi[sz]e|maximi[sz]e|"
+    r"focus|switch|show|hide|restart|reboot|shut|shutdown|sleep|go to sleep|"
+    r"stand ?by|go on standby|wake|update|upgrade|thanks?|thank you|"
+    r"never ?mind|cancel|good (?:night|morning|evening|afternoon)|"
+    r"hello|hi|hey|yes|yeah|no|nope|okay|ok)\b", re.IGNORECASE)
+_RESUME_QUESTION_RE = re.compile(
+    r"^(?:what|what's|whats|when|where|who|whose|why|how|how's|hows|which|"
+    r"tell me|(?:is|isn't|are|aren't|am|was|were|can|can't|could|would|will|"
+    r"won't|do|does|did|didn't|should|shall|have|has)\s+(?:you|i|we|they|he|"
+    r"she|it|there|that|this)\b)", re.IGNORECASE)
+
+
+def _resume_list_shaped(s: str) -> bool:
+    """Three or more comma / semicolon items, nearly all one or two words:
+    a name list (the hint read back), not a request."""
+    parts = [p.strip() for p in re.split(r"[,;]", s or "") if p.strip()]
+    if len(parts) < 3:
+        return False
+    return sum(1 for p in parts if len(p.split()) <= 2) / len(parts) >= 0.75
+
+
+def _resume_command_phrase(cmd) -> str:
+    """The resumable request in one logged voice command ("Jarvis, do the
+    skit." -> "do the skit"), or "" when the command is not one (see above).
+    Lower-cased, wake word and end punctuation stripped. Never raises."""
+    try:
+        raw = " ".join(str(cmd or "").split())
+        if not raw or len(raw) > 90:
+            return ""
+        try:
+            hot = _stt_vocab.live_hotwords(globals().get("STT_HOTWORDS"))
+        except Exception:
+            hot = globals().get("STT_HOTWORDS")
+        if _stt_vocab.is_hotword_echo(raw, hot):
+            return ""
+        s = _RESUME_WAKE_LEAD_RE.sub("", raw).strip()
+        if not s or _resume_list_shaped(s) or s.rstrip().endswith("?"):
+            return ""
+        if _RESUME_NOT_WORK_RE.match(s) or _RESUME_QUESTION_RE.match(s):
+            return ""
+        s = s.rstrip(" .!?,;:").lower()
+        if (not s or s in SLEEP_PHRASES or s in WAKE_PHRASES
+                or _WAKE_RE.fullmatch(s)):
+            return ""
+        return s
+    except Exception:
+        return ""
+
+
+# No auto-greeting this soon after the last session (2026-10-01): a quick
+# restart is deliberate (a tray restart, an upgrade) and the owner is already
+# mid-task; live 21:49:25 "when we left off you were working on jarvis plays
+# skrillex..." came 6 minutes after one, with the music already playing.
+SESSION_RESUME_QUIET_S = 15 * 60
+
+
+def _resume_clause(work: str, kind: str) -> str:
+    """"you'd asked me to X" for a voice command, else "you were working on X"."""
+    if kind == "command":
+        return f"you'd asked me to {work}"
+    return f"you were working on {work}"
 
 
 def _build_session_resume(force: bool = False) -> tuple[str, dict]:
@@ -26822,19 +26953,31 @@ def _build_session_resume(force: bool = False) -> tuple[str, dict]:
         "last_commands":   _last_n_user_commands(3),
         "next_task_line":  _last_queued_task_line(task_window_s),
         "in_window":       0 < age <= WARM_RESTART_WINDOW_SECONDS,
+        # A restart minutes after the last session: no auto-greeting (the
+        # verbal ask still answers). SESSION_RESUME_QUIET_S, 2026-10-01.
+        "quick_restart":   (not force) and 0 < age < SESSION_RESUME_QUIET_S,
     }
 
     if not force and not details["in_window"]:
         return ("", details)
+    if details["quick_restart"]:
+        return ("", details)
 
     # Pick the strongest available "X" for "you were working on X".
     work = ""
+    work_kind = ""
     if details["next_task_line"]:
         work = _summarise_task_line(details["next_task_line"])
-    if not work and details["last_commands"]:
-        first_cmd = details["last_commands"][0].rstrip(".!?")
-        if len(first_cmd) <= 90 and first_cmd:
-            work = first_cmd.lower()
+        work_kind = "task" if work else ""
+    if not work:
+        # The newest of the last few commands that is a request worth
+        # resuming — never an echo, a list, a media / system command or a
+        # question, and never with the wake word (2026-10-01).
+        for _cmd in details["last_commands"] or ():
+            _phrase = _resume_command_phrase(_cmd)
+            if _phrase:
+                work, work_kind = _phrase, "command"
+                break
 
     last_summary = ""
     try:
@@ -26844,10 +26987,10 @@ def _build_session_resume(force: bool = False) -> tuple[str, dict]:
     except Exception:
         pass
     if not work and last_summary:
-        work = last_summary.split(".", 1)[0].strip()
-        if len(work) > 90:
-            work = work[:87].rstrip() + "…"
+        work = _cut_at_word(last_summary.split(".", 1)[0].strip(), 90)
+        work_kind = "summary" if work else ""
     details["work"]         = work
+    details["work_kind"]    = work_kind
     details["last_summary"] = last_summary
 
     # When age is outside the warm-restart window but we're answering the
@@ -26861,8 +27004,8 @@ def _build_session_resume(force: bool = False) -> tuple[str, dict]:
         when = f"{hrs} hours" if hrs < 48 else f"{int(round(age / 86400.0))} days"
         if work:
             return (f"I'm afraid our last session was rather a while ago — "
-                    f"about {when}, sir. When we left off you were working "
-                    f"on {work}.", details)
+                    f"about {when}, sir. When we left off "
+                    f"{_resume_clause(work, work_kind)}.", details)
         return (f"I'm afraid our last session was rather a while ago — "
                 f"about {when}, sir. The thread has likely gone cold.",
                 details)
@@ -26871,9 +27014,9 @@ def _build_session_resume(force: bool = False) -> tuple[str, dict]:
     # preset fires when we have something concrete to resume.
     if work:
         return (
-            f"Welcome back, sir. When we left off you were working on "
-            f"{work} — shall I resume, or is there something else? "
-            f"At your service.",
+            f"Welcome back, sir. When we left off "
+            f"{_resume_clause(work, work_kind)} — shall I resume, or is "
+            f"there something else? At your service.",
             details,
         )
     # Warm restart but no concrete X — embed "I'm afraid" so the bad_news
@@ -26897,6 +27040,15 @@ def maybe_session_resume_greeting() -> str:
             age_h = details.get("age_seconds", 0.0) / 3600.0
             print(f"  [session_resume] warm-restart greeting "
                   f"(last session {age_h:.1f}h ago)")
+        except Exception:
+            pass
+    else:
+        try:
+            if details.get("quick_restart"):
+                print(f"  [session_resume] no greeting: restart "
+                      f"{details.get('age_seconds', 0.0) / 60.0:.0f} min after "
+                      f"the last session (quiet under "
+                      f"{SESSION_RESUME_QUIET_S // 60} min)")
         except Exception:
             pass
     return text
