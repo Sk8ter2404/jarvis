@@ -1471,6 +1471,52 @@ class SeeScreenTests(unittest.TestCase):
         q_used = bc.ask_vision_multi.call_args[0][0]
         self.assertIn("Describe in detail", q_used)
 
+    # Live 2026-10-01 20:45: "read this page for me and see if there's any
+    # issues" → [ACTION: screenshot] then [ACTION: see_screen, <the saved file
+    # name>]; vision answered "you haven't provided the image file ..." and the
+    # chain re-captured until its depth cap.
+    def _asked(self, raw, user_text=""):
+        bc = self._bc()
+        bc._turn_user_text.return_value = user_text
+        bc.take_all_monitor_screenshots.return_value = {"m": b"PNG"}
+        bc.ask_vision_multi.return_value = "ok"
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", {"m": (0, 0, 1, 1)}):
+            A._act_see_screen(raw)
+        return bc.ask_vision_multi.call_args[0][0]
+
+    def test_a_file_name_is_never_the_question(self):
+        said = "Jarvis read this page for me and see if there's any issues"
+        for raw in ("screenshot_20261001_204510.png",
+                    "C:\\JARVIS\\screenshots\\screenshot_20261001_204510.png",
+                    "screenshot_20261001_204510", "page.jpg", "  shot.PNG. "):
+            with self.subTest(raw=raw):
+                q = self._asked(raw, said)
+                self.assertNotIn(".png", q.lower())
+                self.assertNotIn("screenshot_2026", q)
+                self.assertIn("read this page", q)
+
+    def test_a_file_name_with_no_turn_text_gets_the_default(self):
+        q = self._asked("screenshot_20261001_204510.png", "")
+        self.assertIn("Describe in detail", q)
+        self.assertIn("wrong", q)
+
+    def test_real_questions_pass_through(self):
+        for raw in ("what's on screen", "is the png export button greyed out",
+                    "read the error in the dialog", "what does page.jpg show in the title"):
+            with self.subTest(raw=raw):
+                self.assertEqual(self._asked(raw, "anything"), raw)
+
+    def test_a_non_string_turn_text_is_ignored(self):
+        bc = self._bc()
+        bc._turn_user_text.side_effect = RuntimeError("no frame")
+        bc.take_all_monitor_screenshots.return_value = {"m": b"PNG"}
+        bc.ask_vision_multi.return_value = "ok"
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", {"m": (0, 0, 1, 1)}):
+            A._act_see_screen("screenshot_20261001_204510.png")
+        self.assertIn("Describe in detail", bc.ask_vision_multi.call_args[0][0])
+
 
 # ===========================================================================
 # _act_replay_last_action

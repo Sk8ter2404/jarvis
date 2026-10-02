@@ -2430,6 +2430,37 @@ def _act_where_is_user(_: str = "") -> str:
 
 # ─── Vision: see_screen with multi-monitor capture (Phase 4H) ──────────
 
+# A see_screen "question" that is really a file reference: the model chained
+# [ACTION: screenshot] → [ACTION: see_screen, screenshot_20261001_204510.png]
+# (live 2026-10-01 20:45, "read this page for me and see if there's any
+# issues"); the vision model then answered "you haven't provided the image
+# file ...", JARVIS said the screenshot didn't come through, and the chain
+# re-captured until its depth cap. The capture is always fresh, so a file
+# name carries no meaning here — ask the owner's own words instead.
+_SEE_SCREEN_FILE_REF_RE = re.compile(
+    r"(?ix) (?:^|[\s\\/\"'(])"
+    r"(?: screenshot_\d{8}_\d{6}(?:\.\w+)?"
+    r"  | [\w.-]+\.(?:png|jpe?g|bmp|gif|webp|tiff?) )"
+    r"[\s\"').,]*$"
+    r"| ^\s*[a-z]:[\\/]")
+_SEE_SCREEN_DEFAULT_Q = (
+    "Describe in detail what is currently on the screen, and point out "
+    "anything that looks wrong (errors, warnings, typos, broken layout).")
+
+
+def _see_screen_question(raw: str, user_text: str = "") -> str:
+    """The question to ask vision: `raw` unless it is empty or a file
+    reference; then the owner's own words for this turn, else the default."""
+    q = (raw or "").strip()
+    if q and not _SEE_SCREEN_FILE_REF_RE.search(q):
+        return q
+    ut = " ".join((user_text or "").split())
+    if ut:
+        return (f'The owner asked: "{ut}". Answer that from what is on '
+                "the screen.")
+    return _SEE_SCREEN_DEFAULT_Q
+
+
 def _act_see_screen(question: str) -> str:
     bc = _bc()
     # Privacy gate: refuse (spoken) before spending the per-intent budget if a
@@ -2440,7 +2471,11 @@ def _act_see_screen(question: str) -> str:
         return bc.SCREENSHOT_PRIVACY_REFUSAL
     from core.config import MONITORS
     monitor, question = bc._parse_monitor_prefix(question)
-    q = question.strip() or "Describe in detail what is currently on the screen."
+    try:
+        _ut = bc._turn_user_text()
+    except Exception:
+        _ut = ""
+    q = _see_screen_question(question, _ut if isinstance(_ut, str) else "")
 
     # Per-intent budget guard. parse_and_run_actions resets the counter at
     # the start of every dispatch; once exhausted, refuse with a hint that
