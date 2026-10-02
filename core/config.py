@@ -573,6 +573,21 @@ LEARN_ONLY_FROM_OWNER = False
 LEARN_FOLLOWUP_S = 90.0
 LEARN_VOICE_REJECT_BELOW = 0.60
 
+# Media gate (core/media_gate.py, 2026-10-01). Live 22:28:50 an Instagram reel
+# playing on this PC said "Jarvis, find me a restaurant ... build a website" and
+# JARVIS ran it. While another app on the PC is producing sound (an active
+# playback session's peak meter at or above MEDIA_VOICE_GATE_PEAK, 0..1; the OS
+# media session's "playing" when the meter can't be read), a mic turn whose
+# voice scores below MEDIA_VOICE_GATE_REJECT_BELOW against the enrolled owner
+# voiceprint is dropped ("[media-gate] PC audio playing and not the owner's
+# voice"). The reel scored 0.43; the owner's own wake-word turns 0.63-0.68, so a
+# too-close-to-call voice still runs. Nobody enrolled / voice-ID unavailable ->
+# allowed and logged. Typed turns, a stop word and guest mode always pass. Set
+# via user_settings.json; applies on the next start.
+MEDIA_VOICE_GATE_ENABLED = True
+MEDIA_VOICE_GATE_PEAK = 0.01
+MEDIA_VOICE_GATE_REJECT_BELOW = 0.55
+
 # Known-device speech filter (core/device_speech_filter.py). When True, an
 # utterance that matches a line a known device speaks (phrase lists in the
 # gitignored data/device_phrases/*.json) is ignored before the wake gate, the

@@ -2401,11 +2401,16 @@ def _learn_gate() -> "_learn_gate_mod.LearnGate":
     return _learn_gate_state[0]
 
 
-def _learn_voice_verdict(audio, sample_rate: int) -> "tuple[str, float]":
+def _learn_voice_verdict(audio, sample_rate: int,
+                         reject_below: "float | None" = None) -> "tuple[str, float]":
     """(verdict, score) of the turn's raw audio against the enrolled
     voiceprints (core/learn_gate.voice_verdict). UNAVAILABLE when nobody is
-    enrolled, resemblyzer is missing, or there is no audio. Never raises."""
+    enrolled, resemblyzer is missing, or there is no audio. Never raises.
+    ``reject_below``: the "not the owner" floor; None = LEARN_VOICE_REJECT_BELOW
+    (the media gate passes its own, MEDIA_VOICE_GATE_REJECT_BELOW)."""
     try:
+        if reject_below is None:
+            reject_below = LEARN_VOICE_REJECT_BELOW
         if audio is None or int(sample_rate or 0) <= 0:
             return _learn_gate_mod.UNAVAILABLE, 0.0
         import core.voice_id as _vid
@@ -2415,7 +2420,7 @@ def _learn_voice_verdict(audio, sample_rate: int) -> "tuple[str, float]":
         may_write = bool(name) and _vid.can(name, "memory_write")
         return _learn_gate_mod.voice_verdict(
             name, score, enrolled=True, may_write=may_write,
-            reject_below=LEARN_VOICE_REJECT_BELOW), float(score or 0.0)
+            reject_below=reject_below), float(score or 0.0)
     except Exception as e:
         print(f"  [learn-gate] voice check failed: {type(e).__name__}")
         return _learn_gate_mod.UNAVAILABLE, 0.0
@@ -29367,6 +29372,123 @@ def _bg_gate_for_turn(text: str, injected: bool) -> "tuple[bool, str]":
     return _should_refuse_background_audio(text)
 
 
+# ── media gate (core/media_gate.py, 2026-10-01) ───────────────────────────
+# Live 22:28:50: an Instagram reel playing on this PC said "Jarvis, find me a
+# restaurant ... build a website", its leading "Jarvis" passed
+# _bg_gate_for_turn (the one-command path), and JARVIS ran it. While another
+# app on the PC is producing sound, a mic turn in a voice that is confidently
+# not the owner's is dropped. The playback meter is read on a short-lived
+# thread started when each mic capture ends (_media_probe_start), so it runs
+# while Whisper decodes and costs the turn nothing; the voiceprint check runs
+# only when audio was playing.
+from core import media_gate as _media_gate  # noqa: E402
+_media_probe: list = [None]       # {"audio_id", "peak", "done", "thread"}
+_MEDIA_PROBE_WAIT_S = 0.3
+
+
+def _media_probe_read() -> "float | None":
+    """The PC's playback peak right now, JARVIS's own process excluded."""
+    return _media_gate.pc_audio_peak((os.getpid(),))
+
+
+def _media_probe_start(audio) -> None:
+    """Begin reading the playback meter for the capture `audio` (the raw
+    buffer the gate will check). Never blocks, never raises, and never stacks
+    threads: while a previous read is still stuck (a wedged audio service),
+    this capture reads as unknown."""
+    try:
+        if not MEDIA_VOICE_GATE_ENABLED or audio is None:
+            return
+        prev = _media_probe[0]
+        done = threading.Event()
+        st = {"audio_id": id(audio), "peak": None, "done": done, "thread": None}
+        if prev and prev.get("thread") is not None and prev["thread"].is_alive():
+            st["thread"] = prev["thread"]
+            done.set()
+            _media_probe[0] = st
+            return
+
+        def _run():
+            try:
+                st["peak"] = _media_probe_read()
+            except Exception:
+                st["peak"] = None
+            finally:
+                done.set()
+        t = threading.Thread(target=_run, name="media-probe", daemon=True)
+        st["thread"] = t
+        _media_probe[0] = st
+        t.start()
+    except Exception:
+        pass
+
+
+def _media_probe_result(audio, wait_s: float = _MEDIA_PROBE_WAIT_S) -> "float | None":
+    """The playback peak measured for the capture `audio`, waiting at most
+    `wait_s` for it (a capture with no probe gets one now). None = unknown."""
+    st = _media_probe[0]
+    if not st or st.get("audio_id") != id(audio):
+        _media_probe_start(audio)
+        st = _media_probe[0]
+        if not st or st.get("audio_id") != id(audio):
+            return None
+    if not st["done"].wait(max(0.0, float(wait_s))):
+        return None
+    return st.get("peak")
+
+
+def _media_guest_mode() -> bool:
+    try:
+        if GUEST_MODE_ENABLED:
+            return True
+        _wl = sys.modules.get("skill_wake_listener")
+        return bool(getattr(_wl, "GUEST_MODE_ENABLED", False))
+    except Exception:
+        return False
+
+
+def _media_voice_gate(text: str, injected: bool = False) -> bool:
+    """True when the caller must DROP this mic turn: the PC was playing audio
+    for the capture and the voice is confidently not the owner's (under
+    MEDIA_VOICE_GATE_REJECT_BELOW; core/media_gate.decide). Logs one line with
+    numbers only, never the words. Typed / injected turns, a stop word, guest
+    mode and a turn with no raw capture always pass; voice-ID unavailable is
+    allowed and logged. Off when MEDIA_VOICE_GATE_ENABLED is False. Never
+    raises; any error fails OPEN (False)."""
+    try:
+        if injected or not MEDIA_VOICE_GATE_ENABLED:
+            return False
+        audio, sr = _last_capture_audio, int(_last_capture_sr or 0)
+        if audio is None or sr <= 0:
+            return False
+        peak = _media_probe_result(audio)
+        smtc = _smtc_media_playing() if peak is None else False
+        if not _media_gate.audio_playing(peak, smtc,
+                                         threshold=float(MEDIA_VOICE_GATE_PEAK)):
+            return False
+        meter = (f"peak {float(peak):.2f}" if peak is not None
+                 else "meter unreadable, media session playing")
+        try:
+            from core import device_speech_filter as _dsf
+            if _dsf.has_stop_word(text):
+                print(f"  [media-gate] PC audio playing; a stop word — allowed ({meter})")
+                return False
+        except Exception:
+            pass
+        if _media_guest_mode():
+            print(f"  [media-gate] PC audio playing; guest mode — allowed ({meter})")
+            return False
+        voice, score = _learn_voice_verdict(
+            audio, sr, reject_below=float(MEDIA_VOICE_GATE_REJECT_BELOW))
+        drop, line = _media_gate.decide(True, voice)
+        if line:
+            print(f"  {line} ({meter}, voice {float(score or 0.0):.2f}, "
+                  f"{len(text or '')} chars)")
+        return bool(drop)
+    except Exception:
+        return False
+
+
 def _device_speech_ignored(text: str, injected: bool = False) -> bool:
     """Known-device speech gate (core/device_speech_filter.py).
 
@@ -37247,6 +37369,8 @@ def _capture_utterance(injected_text, memory):
     # wants natural, un-normalized audio, so capture it here before auto-gain.
     _last_capture_audio = audio
     _last_capture_sr = SAMPLE_RATE
+    # Media gate: read the PC's playback level now, while Whisper decodes.
+    _media_probe_start(audio)
 
     # CONSERVATIVE auto-gain: a quiet mic records speech too softly for Whisper
     # (empty transcript). Boost a sub-target buffer toward a usable peak just
@@ -37716,6 +37840,8 @@ def _handle_sleep_standby(injected_text: str | None):
         # gate and the background-audio learner on its real audio.
         _last_capture_audio = audio
         _last_capture_sr = SAMPLE_RATE
+        # Media gate: a command carried out of this wake is checked too.
+        _media_probe_start(audio)
         # Feed the chunk to the spectral music detector so the standby loop
         # can spot sustained song audio and refuse lyric near-misses on the
         # wake-word check below. Fed the RAW audio (pre auto-gain) so the
@@ -39334,6 +39460,15 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     # gate in this loop follows).
                     print(f"  [filter] dropped ({len(text or '')} chars) "
                           f"— {reason}")
+                    set_state("idle")
+                    continue
+
+                # ── MEDIA GATE (core/media_gate.py, 2026-10-01) ─────────────────
+                # The PC was playing audio for this capture and the voice is
+                # confidently not the owner's: a reel / video talking, not him
+                # (live 22:28:50, "Jarvis, find me a restaurant ..." ran). Mic
+                # turns only; logs numbers, never the words. _media_voice_gate.
+                if _media_voice_gate(text, _injected_text is not None):
                     set_state("idle")
                     continue
 
