@@ -41,6 +41,16 @@ is missing, the corresponding feature degrades:
 
 Importing this module NEVER crashes the companion even with no extras.
 
+Embedder switch (MEMORY_EMBED_MODEL, 2026-10-02)
+────────────────────────────────────────────────
+core/config.MEMORY_EMBED_MODEL picks the embedder ("BAAI/bge-small-en-v1.5"
+= the default and the index exactly as before; "voyage-4-nano" = opt-in).
+The live index is bound to the model that built it and is never searched or
+written with another; a different setting is rebuilt from the stored fact
+texts on a background thread and swapped in only when complete, with the old
+index kept as a .bak. A model that cannot load falls back to bge-small with
+one log line. See the SAFE RE-INDEX section.
+
 Public API
 ──────────
   ensure_loaded()                              -> None    # idempotent boot
@@ -136,6 +146,78 @@ REFLECTOR_MAX_LLM_PAIRS = 20
 # migrated/backfilled fact. (2026-07-21 audit #39)
 _TRUSTED_FACT_SOURCES = {"bobert_memory_migration", "bobert_memory_backfill"}
 
+# ──────────────────────────────────────────────────────────────────────────
+#  EMBEDDER PROFILES — the MEMORY_EMBED_MODEL switch (2026-10-02)
+# ──────────────────────────────────────────────────────────────────────────
+# One entry per model the semantic index may be built with. The default,
+# bge-small, is loaded and called EXACTLY as before the switch existed: no
+# prompts, no extra load kwargs, the legacy collection, no manifest file.
+#
+# voyage-4-nano won the 2026-10-02 memory A/B on the owner's own 236 facts
+# (the right fact ranked first 49/50 vs 39/50 for bge-small; +33 ms per
+# recall on the CPU; rerankers only made it slower and worse). Its entry is
+# that A/B's loading recipe, unchanged: sentence-transformers with
+# trust_remote_code (one ~100-line bidirectional-Qwen3 file, read and benign
+# -- pinned to the revision that was read, so an upstream push cannot swap
+# the code), fp32 on the CPU (the config asks for bf16, 2-7x slower on this
+# AVX2-only CPU), MRL-truncated to 512-d (scored the same as 2048-d), and the
+# model card's query / document prompts prepended as plain text, then
+# L2-normalised by encode() after the truncation.
+#
+# Vectors from two models are not comparable, so each index is BOUND to the
+# profile that built it (the SAFE RE-INDEX section below): a vector is only
+# ever written to, or searched against, the collection of its own profile.
+_DEFAULT_EMBED_PROFILE = "bge-small"
+_EMBED_PROFILES: dict[str, dict] = {
+    "bge-small": {
+        "model":        LTM_EMBED_MODEL,
+        "dim":          384,
+        "collection":   LTM_COLLECTION,
+        "query_prefix": "",
+        "doc_prefix":   "",
+        "load_kwargs":  {},
+        "fp32":         False,
+        # "" = the LTM_EMBED_DEVICE knob, else auto (cuda if present), as ever.
+        "device":       "",
+        # REFLECTOR_DUP_SIM (0.92) was tuned on this model's cosine range.
+        "reflector_calibrated": True,
+    },
+    "voyage-4-nano": {
+        "model":        "voyageai/voyage-4-nano",
+        "dim":          512,
+        "collection":   LTM_COLLECTION + "__voyage-4-nano-512",
+        "query_prefix": ("Represent the query for retrieving supporting "
+                         "documents: "),
+        "doc_prefix":   "Represent the document for retrieval: ",
+        "load_kwargs":  {
+            "revision":          "67fabc9bef010dabc5f6024aa1b1b6b93410426f",
+            "trust_remote_code": True,
+            "truncate_dim":      512,
+        },
+        "fp32":         True,
+        # The A/B ran it on the CPU: no VRAM taken from the local brain. An
+        # explicit LTM_EMBED_DEVICE still wins.
+        "device":       "cpu",
+        # Its cosine range was never measured against REFLECTOR_DUP_SIM, and
+        # that threshold DELETES facts: until it is calibrated, the reflector
+        # removes exact duplicates only on this model.
+        "reflector_calibrated": False,
+    },
+}
+# Accepted spellings of MEMORY_EMBED_MODEL (compared lower-cased).
+_EMBED_PROFILE_ALIASES = {
+    "":                        "bge-small",
+    "bge-small":               "bge-small",
+    "bge-small-en-v1.5":       "bge-small",
+    "baai/bge-small-en-v1.5":  "bge-small",
+    "voyage":                  "voyage-4-nano",
+    "voyage-4-nano":           "voyage-4-nano",
+    "voyageai/voyage-4-nano":  "voyage-4-nano",
+}
+# Index binding of a collection whose stored stamp names another model than
+# the manifest says: nothing embeds for it, so it is never read or written.
+_UNBOUND_PROFILE = "unbound"
+
 _lock = threading.RLock()
 
 # Dedicated locks guarding lazy construction of heavyweight singletons.
@@ -170,6 +252,25 @@ _bm25_index    = None
 _bm25_corpus_ids: list[str] = []
 _bm25_corpus:    list[list[str]] = []
 
+# The live index binding (2026-10-02, MEMORY_EMBED_MODEL): which profile
+# built the collection being served, its Chroma name, its dimension (None =
+# unknown: the legacy, manifest-less index, checked by nothing new), and the
+# profile _embedder was loaded for. ensure_loaded() reads them from
+# embed_index.json; without that file they stay these defaults, i.e. today's
+# bge-small index. Only _swap_in_index_locked() changes them at runtime.
+_index_profile_key = _DEFAULT_EMBED_PROFILE
+_collection_name   = LTM_COLLECTION
+_index_dim: Optional[int] = None
+_embedder_key      = _DEFAULT_EMBED_PROFILE
+# Bumped by every index swap. retrieve_facts() reads it before it takes the
+# collection and embeds the query, and drops the dense half if it moved: a
+# query vector from one model can then never search the other's index.
+_binding_gen = 0
+# Set (to the profile key) once that profile's model failed to load in this
+# process: MEMORY_EMBED_MODEL then resolves to the default for the session.
+_embed_fallback_from: Optional[str] = None
+_embed_notes_printed: set = set()   # one-time log lines already printed
+
 # In-memory mirror of the semantic facts list. Keyed by id. Persisted to
 # _FACTS_JSON so the BM25 path works even without ChromaDB.
 _facts: dict[str, dict] = {}
@@ -196,11 +297,13 @@ _writes_since_rotate = 0
 # ──────────────────────────────────────────────────────────────────────────
 
 def _try_import_chroma():
-    global _chroma_client, _collection
+    global _chroma_client, _collection, _index_profile_key
     # Fast path: already initialised. Reading a single Python attribute is
     # atomic so the unlocked check is safe.
     if _collection is not None:
         return _collection
+    if _index_profile_key == _UNBOUND_PROFILE:
+        return None     # refused below; a background rebuild replaces it
     with _chroma_lock:
         # Re-check under the lock: another thread may have built it while we
         # were blocked.
@@ -213,10 +316,22 @@ def _try_import_chroma():
         try:
             os.makedirs(_CHROMA_DIR, exist_ok=True)
             _chroma_client = chromadb.PersistentClient(path=_CHROMA_DIR)
-            _collection = _chroma_client.get_or_create_collection(
-                name=LTM_COLLECTION,
-                metadata={"hnsw:space": "cosine"},
+            coll = _chroma_client.get_or_create_collection(
+                name=_collection_name,
+                metadata=_collection_metadata(_index_profile_key),
             )
+            # 2026-10-02: a collection stamped by another model than the one
+            # the manifest binds it to is never read or written with this
+            # one (only a hand-edited store gets here).
+            stamped = _stamped_model(coll)
+            want = (_EMBED_PROFILES.get(_index_profile_key) or {}).get("model")
+            if stamped and want and stamped != want:
+                print(f"  [ltm] index {_collection_name} holds {stamped} "
+                      f"vectors, not {want}; semantic recall is off until "
+                      f"it is rebuilt")
+                _index_profile_key = _UNBOUND_PROFILE
+                return None
+            _collection = coll
             return _collection
         except Exception as e:
             print(f"  [ltm] chroma init failed: {e}")
@@ -224,11 +339,13 @@ def _try_import_chroma():
 
 
 def _try_import_embedder():
-    global _embedder, _embedder_failed_until
+    global _embedder, _embedder_failed_until, _embedder_key
     # Fast path: already loaded. Avoids serialising every embed call behind
     # the construction lock.
     if _embedder is not None:
-        return _embedder
+        # 2026-10-02: the loaded model must be the one that built the live
+        # index; anything else would mix two models' vectors in one index.
+        return _embedder if _embedder_key == _index_profile_key else None
     import time as _t
     # Backoff: a recent load failure stands down instead of hot-retrying the full
     # model load on every embed call (the churn that stressed the box on
@@ -241,7 +358,7 @@ def _try_import_embedder():
         # cold callers each instantiate SentenceTransformer (~6 GB transient
         # RAM each) and race on the assignment below.
         if _embedder is not None:
-            return _embedder
+            return _embedder if _embedder_key == _index_profile_key else None
         if _embedder_failed_until and _t.time() < _embedder_failed_until:
             return None
         # The model pull draws huggingface_hub's "You are sending
@@ -257,26 +374,20 @@ def _try_import_embedder():
         except Exception:
             _embedder_failed_until = _t.time() + _EMBEDDER_RETRY_COOLDOWN_S
             return None
+        if _index_profile_key != _DEFAULT_EMBED_PROFILE:
+            # An index built by another MEMORY_EMBED_MODEL profile (2026-10-02).
+            # The default profile keeps the untouched path below.
+            return _load_bound_profile_embedder_locked()
         try:
             # Honour the LTM_EMBED_DEVICE knob (config/user_settings); "" keeps
             # the historical auto-pick (cuda if present). "cpu" frees ~0.4GB of
             # VRAM for the local LLM at a negligible latency cost. 2026-07-10.
-            dev = ""
-            try:
-                from core import config as _cfg
-                dev = (getattr(_cfg, "LTM_EMBED_DEVICE", "") or "").strip().lower()
-            except Exception:
-                dev = ""
-            if not dev:
-                dev = "cpu"
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        dev = "cuda"
-                except Exception:
-                    pass
+            # One resolver for every profile since 2026-10-02 (_embed_device;
+            # it never raises).
+            dev = _embed_device(_DEFAULT_EMBED_PROFILE)
             print(f"  [ltm] loading embedder {LTM_EMBED_MODEL} on {dev}")
             _embedder = SentenceTransformer(LTM_EMBED_MODEL, device=dev)
+            _embedder_key = _DEFAULT_EMBED_PROFILE
             return _embedder
         except Exception as e:
             # GPU-first, but degrade to CPU on a cuda OOM / driver hiccup
@@ -287,6 +398,7 @@ def _try_import_embedder():
                 print(f"  [ltm] cuda embedder load failed ({e}); retrying on CPU")
                 try:
                     _embedder = SentenceTransformer(LTM_EMBED_MODEL, device="cpu")
+                    _embedder_key = _DEFAULT_EMBED_PROFILE
                     return _embedder
                 except Exception as e2:
                     print(f"  [ltm] CPU embedder load also failed: {e2}")
@@ -303,6 +415,183 @@ def _try_import_bm25():
         return True
     except Exception:
         return False
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  EMBEDDER PROFILE HELPERS (MEMORY_EMBED_MODEL, 2026-10-02)
+# ──────────────────────────────────────────────────────────────────────────
+
+def _note_embed_once(tag: str, line: str) -> None:
+    """Print `line` the first time `tag` is seen in this process."""
+    if tag in _embed_notes_printed:
+        return
+    _embed_notes_printed.add(tag)
+    print(line)
+
+
+def _configured_embed_model() -> str:
+    """MEMORY_EMBED_MODEL from core.config (user_settings.json overridable),
+    read at call time; '' when unset or unreadable."""
+    try:
+        from core import config as _cfg
+        return str(getattr(_cfg, "MEMORY_EMBED_MODEL", "") or "")
+    except Exception:
+        return ""
+
+
+def _desired_profile_key() -> str:
+    """The profile the index SHOULD be built with: MEMORY_EMBED_MODEL, or
+    the default when it is unknown or its model already failed to load in
+    this process (each case logs one line, once)."""
+    raw = _configured_embed_model().strip()
+    key = _EMBED_PROFILE_ALIASES.get(raw.lower())
+    if key is None:
+        _note_embed_once(
+            "unknown:" + raw,
+            f"  [ltm] MEMORY_EMBED_MODEL {raw!r} is not a known memory "
+            f"embedder ({', '.join(sorted(_EMBED_PROFILES))}); using "
+            f"{LTM_EMBED_MODEL}")
+        key = _DEFAULT_EMBED_PROFILE
+    if key == _embed_fallback_from:
+        key = _DEFAULT_EMBED_PROFILE
+    return key
+
+
+def _note_embed_fallback(key: str, why: str) -> None:
+    """`key`'s model cannot load: use the default profile for the rest of
+    the session, and say so in ONE clear line."""
+    global _embed_fallback_from
+    if key == _DEFAULT_EMBED_PROFILE:
+        return              # nothing to fall back to; the caller logs it
+    _embed_fallback_from = key
+    model = (_EMBED_PROFILES.get(key) or {}).get("model") or key
+    _note_embed_once(
+        "fallback:" + key,
+        f"  [ltm] memory embedder {model} could not load ({why[:200]}); "
+        f"falling back to {LTM_EMBED_MODEL} for this session")
+
+
+def _embed_device(key: str) -> str:
+    """Torch device for `key`: the LTM_EMBED_DEVICE knob when set, else the
+    profile's own pick, else the historical auto-pick (cuda if present)."""
+    dev = ""
+    try:
+        from core import config as _cfg
+        dev = (getattr(_cfg, "LTM_EMBED_DEVICE", "") or "").strip().lower()
+    except Exception:
+        dev = ""
+    if not dev:
+        dev = (_EMBED_PROFILES.get(key) or {}).get("device") or ""
+    if not dev:
+        dev = "cpu"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                dev = "cuda"
+        except Exception:
+            pass
+    return dev
+
+
+def _load_profile_model(key: str, dev: str):
+    """Construct one profile's SentenceTransformer (raises on failure). The
+    default profile is SentenceTransformer(model, device=dev), as ever."""
+    from sentence_transformers import SentenceTransformer
+    prof = _EMBED_PROFILES[key]
+    kwargs = dict(prof.get("load_kwargs") or {})
+    if prof.get("fp32"):
+        import torch
+        kwargs["model_kwargs"] = {"dtype": torch.float32}
+    return SentenceTransformer(prof["model"], device=dev, **kwargs)
+
+
+def _load_bound_profile_embedder_locked():
+    """Load the embedder of a NON-default index binding. Caller holds
+    _embedder_lock. A model that cannot load never gets a stand-in -- that
+    would mix two models' vectors in one index: the session falls back to
+    the default profile (one log line) and a background rebuild moves the
+    index onto it; dense recall is off until that completes."""
+    global _embedder, _embedder_key, _embedder_failed_until
+    key = _index_profile_key
+    prof = _EMBED_PROFILES.get(key)
+    if prof is None:
+        if key != _UNBOUND_PROFILE:
+            _note_embed_fallback(key, "not a known memory embedder")
+            _maybe_start_reindex()
+        return None
+    dev = _embed_device(key)
+    try:
+        print(f"  [ltm] loading embedder {prof['model']} on {dev}")
+        model = _load_profile_model(key, dev)
+    except Exception as e:
+        _embedder_failed_until = time.time() + _EMBEDDER_RETRY_COOLDOWN_S
+        _note_embed_fallback(key, f"{type(e).__name__}: {e}")
+        _maybe_start_reindex()
+        return None
+    _embedder = model
+    _embedder_key = key
+    return _embedder
+
+
+def _collection_metadata(key: str, *, stamp: bool = False) -> dict:
+    """Chroma metadata for a new collection of profile `key`. The legacy
+    default index keeps its exact historical metadata unless `stamp` (the
+    re-indexer stamps everything it builds); every other profile is always
+    stamped with its model and dimension."""
+    meta = {"hnsw:space": "cosine"}
+    prof = _EMBED_PROFILES.get(key)
+    if prof is not None and (stamp or key != _DEFAULT_EMBED_PROFILE):
+        meta["embed_model"] = prof["model"]
+        meta["embed_dim"] = int(prof["dim"])
+    return meta
+
+
+def _stamped_model(coll) -> str:
+    """The embed_model stamp on a Chroma collection ('' = unstamped)."""
+    try:
+        meta = getattr(coll, "metadata", None) or {}
+        return str(meta.get("embed_model") or "") if isinstance(meta, dict) else ""
+    except Exception:
+        return ""
+
+
+def _query_text(q: str) -> str:
+    """A retrieval query as the live index's model expects it."""
+    return (_EMBED_PROFILES.get(_index_profile_key) or {}).get(
+        "query_prefix", "") + q
+
+
+def _doc_text(t: str) -> str:
+    """A stored fact as the live index's model expects it (the Chroma
+    document itself always stays the raw fact text)."""
+    return (_EMBED_PROFILES.get(_index_profile_key) or {}).get(
+        "doc_prefix", "") + t
+
+
+def _dims_ok(vec) -> bool:
+    """False when the live index's dimension is known and `vec` (one row)
+    does not have it. The legacy manifest-less index has no recorded
+    dimension, so nothing about it changes."""
+    if not _index_dim:
+        return True
+    try:
+        return len(vec) == _index_dim
+    except Exception:
+        return False
+
+
+def _reflector_semantic_ok() -> bool:
+    """Whether the reflector's similarity passes may run on the live index's
+    model -- REFLECTOR_DUP_SIM DELETES facts, so only on a calibrated one."""
+    prof = _EMBED_PROFILES.get(_index_profile_key) or {}
+    if prof.get("reflector_calibrated"):
+        return True
+    _note_embed_once(
+        "reflector:" + str(_index_profile_key),
+        f"  [ltm] reflector: similarity passes are off on "
+        f"{prof.get('model') or _index_profile_key} until REFLECTOR_DUP_SIM "
+        f"is calibrated for it; exact duplicates are still removed")
+    return False
 
 
 def is_available() -> dict:
@@ -467,18 +756,27 @@ def _embed(texts: list[str]):
             return None
 
 
+def _chroma_meta(meta: dict) -> dict:
+    """Chroma metadata can't hold nested lists — flatten tags to a CSV."""
+    safe_meta = dict(meta)
+    if isinstance(safe_meta.get("tags"), list):
+        safe_meta["tags"] = ",".join(str(t) for t in safe_meta["tags"])
+    return safe_meta
+
+
 def _chroma_upsert(fid: str, text: str, meta: dict) -> bool:
     coll = _try_import_chroma()
     if coll is None:
         return False
-    vec = _embed([text])
+    vec = _embed([_doc_text(text)])
     if vec is None:
         return False
+    if _index_dim and not _dims_ok(vec[0]):
+        print(f"  [ltm] chroma upsert refused: the vector does not fit the "
+              f"{_index_dim}-d index")
+        return False
     try:
-        # Chroma metadata can't hold nested lists — flatten tags to a CSV.
-        safe_meta = dict(meta)
-        if isinstance(safe_meta.get("tags"), list):
-            safe_meta["tags"] = ",".join(str(t) for t in safe_meta["tags"])
+        safe_meta = _chroma_meta(meta)
         # upsert: replace any prior chunk for this id.
         try:
             coll.delete(ids=[fid])
@@ -608,6 +906,374 @@ def _reconcile_chroma_locked() -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  SAFE RE-INDEX — switching MEMORY_EMBED_MODEL (2026-10-02)
+# ──────────────────────────────────────────────────────────────────────────
+# The rules:
+#   * ONE binding is live: _collection + _index_profile_key + _embedder (for
+#     that profile). Every live write and every query goes through it, so a
+#     query is always embedded by the model that built the index it searches.
+#   * A different MEMORY_EMBED_MODEL never touches the live binding. A daemon
+#     thread builds the new profile's OWN collection from the stored fact
+#     texts (facts.json is the source of truth), with its own model instance,
+#     in small batches that each wait for a gap in the conversation
+#     (core/local_traffic) -- never holding _lock while it embeds, so no voice
+#     turn waits on it. Wall-clock budget _REINDEX_BUDGET_S; on any failure
+#     the old index simply stays live and the next start tries again.
+#   * Facts added / edited / removed meanwhile land in the old index as
+#     usual; the builder re-diffs the store against what it has built until
+#     a check under _lock finds nothing left, and swaps IN THAT SAME HOLD.
+#   * The swap writes embed_index.json first (the commit point), then labels
+#     the retired collection "<name>.bak". Nothing is ever deleted: older
+#     .bak collections, and anything that had to be moved out of the way,
+#     stay in the store and in the manifest's "backups" list.
+#   * A model that cannot load falls back to the default profile with one log
+#     line (_note_embed_fallback) -- it is never replaced by another model on
+#     the same index.
+_EMBED_INDEX_FILE = "embed_index.json"
+_REINDEX_BATCH = 8            # facts per encode
+_REINDEX_PAUSE_S = 0.05       # breather between batches
+_REINDEX_BUDGET_S = 1800.0    # whole rebuild, wall clock, then give up
+_REINDEX_MAX_ROUNDS = 20      # re-diff passes before giving up
+_reindex_guard = threading.Lock()
+_reindex_thread: Optional[threading.Thread] = None
+_reindex_state: dict = {"state": "idle"}
+
+
+def _embed_index_path() -> str:
+    # Derived from _DATA_DIR at call time, so a repointed store (staging,
+    # tests) carries its manifest with it.
+    return os.path.join(_DATA_DIR, _EMBED_INDEX_FILE)
+
+
+def _read_embed_index() -> Optional[dict]:
+    """The index manifest, or None when absent (the legacy default index)
+    or unreadable. Never raises."""
+    path = _embed_index_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        act = data.get("active") if isinstance(data, dict) else None
+        if (isinstance(act, dict) and isinstance(act.get("profile"), str)
+                and isinstance(act.get("collection"), str)
+                and act["collection"]):
+            return data
+        raise ValueError("no active index recorded")
+    except Exception as e:
+        _note_embed_once("manifest", f"  [ltm] {_EMBED_INDEX_FILE} unreadable "
+                         f"({type(e).__name__}); using the default index")
+        return None
+
+
+def _resolve_index_binding_locked() -> None:
+    """Bind the live index to what embed_index.json records. Caller holds
+    _lock; runs first in ensure_loaded(), before anything opens Chroma.
+    Without the file this leaves the defaults: today's bge-small index."""
+    global _index_profile_key, _collection_name, _index_dim
+    man = _read_embed_index()
+    if man is None:
+        return
+    act = man["active"]
+    _index_profile_key = act["profile"]
+    _collection_name = act["collection"]
+    dim = act.get("dim")
+    _index_dim = dim if isinstance(dim, int) and dim > 0 else None
+
+
+def _set_reindex_state(state: str, target: str = "", note: str = "") -> None:
+    global _reindex_state
+    _reindex_state = {"state": state, "target": target, "note": note,
+                      "ts": time.time()}
+
+
+def _maybe_start_reindex() -> bool:
+    """Start the background rebuild when the wanted profile differs from the
+    one that built the live index. Cheap, never blocks, never raises; a
+    no-op with default settings, without a Chroma client, before the store
+    is loaded, or while a rebuild is already running."""
+    global _reindex_thread
+    try:
+        if not _loaded:
+            return False        # ensure_loaded() calls back once it is
+        if _desired_profile_key() == _index_profile_key:
+            return False
+        if _chroma_client is None:
+            _try_import_chroma()
+        if _chroma_client is None:
+            return False        # no real store: nothing to rebuild
+        with _reindex_guard:
+            if _reindex_thread is not None and _reindex_thread.is_alive():
+                return False
+            t = threading.Thread(target=_reindex_worker, name="ltm-reindex",
+                                 daemon=True)
+            _reindex_thread = t
+            t.start()
+        return True
+    except Exception as e:
+        print(f"  [ltm] memory index rebuild not started: {e}")
+        return False
+
+
+def _reindex_worker() -> None:
+    """Body of the ltm-reindex thread: converge the live index onto the
+    wanted profile. A target whose model fails to load becomes the default
+    (fallback) and the loop runs once more for it."""
+    try:
+        for _ in range(3):
+            target = _desired_profile_key()
+            if target == _index_profile_key:
+                return
+            if _run_reindex(target):
+                return
+            if _desired_profile_key() == target:
+                return          # not a load failure: the next start retries
+    except Exception as e:
+        _set_reindex_state("failed", note=type(e).__name__)
+        print(f"  [ltm] memory index rebuild stopped ({type(e).__name__}: "
+              f"{e}); the current index stays live")
+
+
+def _chroma_collection_names(client) -> set:
+    names = set()
+    for c in (client.list_collections() or []):
+        names.add(str(getattr(c, "name", c)))
+    return names
+
+
+def _free_bak_name(base: str, taken: set) -> str:
+    """'<base>.bak', or a timestamped variant when that is taken (an older
+    backup is never overwritten)."""
+    cand = base + ".bak"
+    if cand not in taken:
+        return cand
+    stem = base + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+    cand, n = stem, 2
+    while cand in taken:
+        cand, n = f"{stem}-{n}", n + 1
+    return cand
+
+
+def _open_reindex_target(client, key: str):
+    """(collection, {fid: text already in it}, [moved-aside entries]) for
+    profile `key`'s collection. A partial build of the same model (an
+    interrupted earlier run) is completed rather than redone; a collection
+    by that name holding anything else is renamed aside, never emptied."""
+    prof = _EMBED_PROFILES[key]
+    name = prof["collection"]
+    moved = []
+    coll = None
+    names = _chroma_collection_names(client)
+    if name in names:
+        coll = client.get_collection(name)
+        meta = getattr(coll, "metadata", None) or {}
+        stamped = _stamped_model(coll)
+        try:
+            stamped_dim = int(meta.get("embed_dim") or 0)
+        except Exception:
+            stamped_dim = 0
+        same = (stamped == prof["model"] and stamped_dim == prof["dim"])
+        legacy_default = (not stamped and key == _DEFAULT_EMBED_PROFILE
+                          and name == LTM_COLLECTION)
+        if not (same or legacy_default):
+            bak = _free_bak_name(name, names)
+            coll.modify(name=bak)
+            moved.append({"profile": "", "model": stamped or "unknown",
+                          "collection": bak, "retired_at": time.time()})
+            coll = None
+    if coll is None:
+        coll = client.get_or_create_collection(
+            name=name, metadata=_collection_metadata(key, stamp=True))
+    got = coll.get(include=["documents"]) or {}
+    have = {str(i): (d or "") for i, d in
+            zip(got.get("ids") or [], got.get("documents") or [])}
+    return coll, have, moved
+
+
+def _reindex_encode(model, prof: dict, texts: list):
+    """Embed one batch of fact texts with the builder's OWN model, waiting
+    first for a gap in the conversation (bounded by the gate's own caps).
+    Raises if a vector does not have the profile's dimension."""
+    def _go():
+        return model.encode(
+            [prof["doc_prefix"] + t for t in texts],
+            convert_to_numpy=True, normalize_embeddings=True,
+            show_progress_bar=False)
+    try:
+        from core import local_traffic as _lt
+    except Exception:
+        _lt = None
+    if _lt is None:
+        vecs = _go()
+    else:
+        with _lt.background_work("ltm-reindex"):
+            with _lt.slot():
+                vecs = _go()
+    if len(vecs) != len(texts) or any(len(v) != prof["dim"] for v in vecs):
+        raise ValueError(f"{prof['model']} returned vectors that are not "
+                         f"{prof['dim']}-d")
+    return vecs
+
+
+def _run_reindex(key: str) -> bool:
+    """Build profile `key`'s index from the stored fact texts and swap it in.
+    True once swapped; False (old index still live) on any failure."""
+    prof = _EMBED_PROFILES.get(key)
+    client = _chroma_client
+    if prof is None or client is None:
+        return False
+    cur = (_EMBED_PROFILES.get(_index_profile_key) or {}).get(
+        "model") or _index_profile_key
+    t0 = time.monotonic()
+    deadline = t0 + _REINDEX_BUDGET_S
+    _set_reindex_state("loading", key)
+    try:
+        from core.log_filters import install_hf_unauthenticated_filter
+        install_hf_unauthenticated_filter()
+    except Exception:
+        pass
+    try:
+        dev = _embed_device(key)
+        print(f"  [ltm] memory index: building a {prof['model']} index on "
+              f"{dev} in the background ({cur} stays live until it is done)")
+        model = _load_profile_model(key, dev)
+    except Exception as e:
+        _set_reindex_state("failed", key, "model load")
+        if key == _DEFAULT_EMBED_PROFILE:
+            print(f"  [ltm] memory index rebuild: {prof['model']} could not "
+                  f"load ({type(e).__name__}: {e}); the current index stays")
+        else:
+            _note_embed_fallback(key, f"{type(e).__name__}: {e}")
+        return False
+    try:
+        coll, have, moved = _open_reindex_target(client, key)
+    except Exception as e:
+        _set_reindex_state("failed", key, "open collection")
+        print(f"  [ltm] memory index rebuild: could not open "
+              f"{prof['collection']} ({type(e).__name__}: {e}); {cur} stays")
+        return False
+    _set_reindex_state("building", key)
+    for _round in range(_REINDEX_MAX_ROUNDS):
+        with _lock:
+            want = {fid: (e.get("text") or "") for fid, e in _facts.items()}
+            put = [fid for fid, t in want.items() if have.get(fid) != t]
+            drop = [fid for fid in have if fid not in want]
+            if not put and not drop:
+                return _swap_in_index_locked(key, coll, model, len(want),
+                                             t0, moved)
+            metas = {fid: _chroma_meta(_facts[fid]) for fid in put}
+        try:
+            if drop:
+                coll.delete(ids=drop)
+                for fid in drop:
+                    have.pop(fid, None)
+            for i in range(0, len(put), _REINDEX_BATCH):
+                if time.monotonic() > deadline:
+                    _set_reindex_state("failed", key, "time budget")
+                    print(f"  [ltm] memory index rebuild ran past "
+                          f"{int(_REINDEX_BUDGET_S)} s; {cur} stays live, "
+                          f"the next start resumes it")
+                    return False
+                batch = put[i:i + _REINDEX_BATCH]
+                texts = [want[fid] for fid in batch]
+                vecs = _reindex_encode(model, prof, texts)
+                coll.delete(ids=batch)
+                coll.add(ids=batch, embeddings=vecs.tolist(),
+                         documents=texts,
+                         metadatas=[metas[fid] for fid in batch])
+                for fid, t in zip(batch, texts):
+                    have[fid] = t
+                time.sleep(_REINDEX_PAUSE_S)
+        except Exception as e:
+            _set_reindex_state("failed", key, type(e).__name__)
+            print(f"  [ltm] memory index rebuild failed ({type(e).__name__}: "
+                  f"{e}); {cur} stays live")
+            return False
+    _set_reindex_state("failed", key, "did not settle")
+    print(f"  [ltm] memory index rebuild did not settle in "
+          f"{_REINDEX_MAX_ROUNDS} passes; {cur} stays live")
+    return False
+
+
+def _swap_in_index_locked(key: str, coll, model, n_facts: int, t0: float,
+                          moved: list) -> bool:
+    """Make the finished `key` index the live one. Caller holds _lock, so no
+    write can land between the builder's last check and this swap."""
+    global _collection, _collection_name, _index_profile_key, _index_dim
+    global _embedder, _embedder_key, _embedder_failed_until, _binding_gen
+    prof = _EMBED_PROFILES[key]
+    old_coll, old_name, old_key = _collection, _collection_name, _index_profile_key
+    old_model = (_EMBED_PROFILES.get(old_key) or {}).get("model") or old_key
+    man = _read_embed_index() or {}
+    # The collection going live is no longer a backup, whatever it was.
+    backups = [b for b in (man.get("backups") or []) if isinstance(b, dict)
+               and b.get("collection") != prof["collection"]]
+    backups += moved
+    now = time.time()
+    active = {"profile": key, "model": prof["model"], "dim": prof["dim"],
+              "collection": prof["collection"], "facts": n_facts,
+              "built_at": now}
+    retire = old_coll is not None and old_name != prof["collection"]
+    if retire:
+        backups.append({"profile": old_key, "model": old_model,
+                        "collection": old_name, "retired_at": now})
+    try:
+        _ensure_dirs()
+        _atomic_write_json(_embed_index_path(),
+                           {"active": active, "backups": backups})
+    except Exception as e:
+        _set_reindex_state("failed", key, "manifest write")
+        print(f"  [ltm] memory index rebuild: could not record it ({e}); "
+              f"{old_model} stays live")
+        return False
+    _collection = coll
+    _collection_name = prof["collection"]
+    _index_profile_key = key
+    _index_dim = int(prof["dim"])
+    _embedder = model
+    _embedder_key = key
+    _embedder_failed_until = 0.0
+    _binding_gen += 1
+    note = ""
+    if retire:
+        # Cosmetic, after the commit point: label the retired index. If the
+        # rename fails it is still kept, under its old name.
+        try:
+            bak = _free_bak_name(old_name,
+                                 _chroma_collection_names(_chroma_client))
+            old_coll.modify(name=bak)
+            backups[-1]["collection"] = bak
+            _atomic_write_json(_embed_index_path(),
+                               {"active": active, "backups": backups})
+            note = f"; the previous index is kept as {bak}"
+        except Exception as e:
+            note = (f"; the previous index is kept as {old_name} (not "
+                    f"renamed: {type(e).__name__})")
+    _set_reindex_state("done", key)
+    print(f"  [ltm] memory index rebuilt with {prof['model']} ({n_facts} "
+          f"facts, {prof['dim']}-d) in {time.monotonic() - t0:.1f} s{note}")
+    return True
+
+
+def _purge_from_backups(ids: list) -> None:
+    """Remove `ids` from every backup collection the manifest lists. Used by
+    forget_since(): a fact the owner asked to forget must not live on in a
+    retired index. Best effort, never raises."""
+    if not ids or _chroma_client is None:
+        return
+    man = _read_embed_index() or {}
+    for b in (man.get("backups") or []):
+        name = b.get("collection") if isinstance(b, dict) else None
+        if not name:
+            continue
+        try:
+            _chroma_client.get_collection(name).delete(ids=list(ids))
+        except Exception as e:
+            print(f"  [ltm] backup index {name}: purge failed "
+                  f"({type(e).__name__})")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  PUBLIC API — boot
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -619,6 +1285,9 @@ def ensure_loaded() -> None:
         if _loaded:
             return
         _ensure_dirs()
+        # 2026-10-02: bind the live index (embed_index.json) BEFORE anything
+        # below opens Chroma or embeds; without the file nothing changes.
+        _resolve_index_binding_locked()
         _load_facts_locked()
         # Migration runs even when chromadb isn't installed — the JSON
         # mirror + BM25 path still benefits from the imported facts.
@@ -634,6 +1303,9 @@ def ensure_loaded() -> None:
         # trim bounds the file regardless of how often the process restarts.
         _rotate_episodes_locked()
         _loaded = True
+        # 2026-10-02: a MEMORY_EMBED_MODEL other than the index's own starts
+        # the background rebuild (a no-op with default settings).
+        _maybe_start_reindex()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -745,9 +1417,16 @@ def retrieve_facts(query: str, k: int = RETRIEVE_K) -> list[dict]:
     # store and needs no _lock either. Only the brief bm25 / _facts reads + the
     # score blend below run under _lock.
     dense_scores: dict[str, float] = {}
+    # Read BEFORE the collection and the query vector are taken (2026-10-02):
+    # if a background rebuild swaps the index in between, the two may come
+    # from different models, so the dense half sits this query out.
+    gen = _binding_gen
     coll = _try_import_chroma()
     if coll is not None:
-        vec = _embed([q])
+        vec = _embed([_query_text(q)])
+        if vec is not None and (gen != _binding_gen
+                                or (_index_dim and not _dims_ok(vec[0]))):
+            vec = None
         if vec is not None:
             try:
                 res = coll.query(
@@ -1120,7 +1799,11 @@ def reflect_and_consolidate(
         if len(ids) < 2:
             return summary
 
-    vecs = _embed(texts)
+    # 2026-10-02: the similarity passes run only on a model REFLECTOR_DUP_SIM
+    # was calibrated for (_reflector_semantic_ok); otherwise, exactly as with
+    # no embedder, only exact duplicates go.
+    vecs = (_embed([_doc_text(t) for t in texts])
+            if _reflector_semantic_ok() else None)
     if vecs is None:
         # No embedder → skip semantic dedupe but still do exact-text dedupe.
         with _lock:
@@ -1375,10 +2058,12 @@ def reset_all() -> int:
             try:
                 with _chroma_lock:
                     if _chroma_client is not None:
-                        _chroma_client.delete_collection(LTM_COLLECTION)
+                        # The LIVE index (2026-10-02: per MEMORY_EMBED_MODEL
+                        # profile; LTM_COLLECTION with default settings).
+                        _chroma_client.delete_collection(_collection_name)
                         _collection = _chroma_client.get_or_create_collection(
-                            name=LTM_COLLECTION,
-                            metadata={"hnsw:space": "cosine"},
+                            name=_collection_name,
+                            metadata=_collection_metadata(_index_profile_key),
                         )
                     elif fact_ids:
                         coll.delete(ids=fact_ids)
@@ -1476,6 +2161,9 @@ def forget_since(cutoff_ts: float) -> dict:
         if doomed:
             _save_facts_locked()
             _rebuild_bm25_locked()
+            # ...and from any index retired by an embedder switch
+            # (2026-10-02): a forgotten fact must not survive in a .bak.
+            _purge_from_backups(doomed)
         counts["facts"] = len(doomed)
     return counts
 
@@ -1505,6 +2193,15 @@ def status() -> dict:
             "facts_path":  _FACTS_JSON,
             "episode_log": _EPISODE_LOG,
             "migrated":    os.path.exists(_MIGRATE_FLAG),
+            # 2026-10-02: which model built the live index, which one is
+            # wanted, and how a switch between them is going.
+            "embedder": {
+                "index_profile": _index_profile_key,
+                "index_collection": _collection_name,
+                "wanted_profile": _desired_profile_key(),
+                "fallback_from": _embed_fallback_from,
+                "rebuild": dict(_reindex_state),
+            },
         }
 
 
@@ -1512,6 +2209,7 @@ def config_summary() -> dict:
     return {
         "LTM_COLLECTION":             LTM_COLLECTION,
         "LTM_EMBED_MODEL":            LTM_EMBED_MODEL,
+        "MEMORY_EMBED_MODEL":         _configured_embed_model(),
         "WORKING_WINDOW":             WORKING_WINDOW,
         "EPISODE_MAX_LINES":          EPISODE_MAX_LINES,
         "RETRIEVE_K":                 RETRIEVE_K,

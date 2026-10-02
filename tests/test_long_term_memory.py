@@ -192,6 +192,14 @@ class _LtmBase(unittest.TestCase):
         ltm._writes_since_rotate = 0
         ltm._reflector_llm = None
         FakeEmbedder.instances = 0
+        # Pin the embedder switch to the shipped default (2026-10-02): the
+        # live user_settings.json may opt into another MEMORY_EMBED_MODEL,
+        # and nothing here may start a rebuild that loads a real model.
+        # tests/test_ltm_embed_switch.py covers the switch with fakes.
+        pin = mock.patch("core.config.MEMORY_EMBED_MODEL", ltm.LTM_EMBED_MODEL,
+                         create=True)
+        pin.start()
+        self.addCleanup(pin.stop)
 
     def tearDown(self):
         for a, v in self._orig_paths.items():

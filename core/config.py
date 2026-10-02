@@ -74,6 +74,20 @@ LTM_ENABLED = True
 # needs it. The old "" auto-default silently loaded it on CUDA on this box. Set
 # "" to restore auto (cuda if available), or a specific device to override.
 LTM_EMBED_DEVICE = "cpu"
+# Which model embeds long-term memory for search (2026-10-02, opt-in).
+#   "BAAI/bge-small-en-v1.5" (default) -> today's index, untouched.
+#   "voyage-4-nano" -> voyageai/voyage-4-nano on the CPU, 512-d. On the
+#     owner's 236 real facts it ranked the right one first 49/50 vs 39/50 for
+#     bge-small, at +33 ms per recall; about 0.7 GB downloaded on first use.
+# Switching rebuilds the index from the stored fact texts on a background
+# thread: the old index keeps answering until the new one is complete, and
+# is then kept as a .bak, never deleted. If the model cannot load, JARVIS
+# logs one line and stays on bge-small. Applies on the next start.
+MEMORY_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# The shipped value, captured before _apply_user_settings() can overwrite the
+# public constant (same idiom as _SHIPPED_LOCAL_LLM_MODEL): lets a test pin
+# "the default is today's model" on a box whose user_settings.json opted in.
+_SHIPPED_MEMORY_EMBED_MODEL = MEMORY_EMBED_MODEL
 
 # ─── Streaming TTS (sentence-flush) ────────────────────────────────────
 # Speak the first complete, action-free sentence(s) of a Claude reply WHILE
