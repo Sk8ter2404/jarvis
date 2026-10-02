@@ -2507,7 +2507,7 @@ def _main(argv) -> int:
         print(f"  battery   : {batt if batt is not None else 'unknown'}")
         ep = find_active(args.headset)
         print(f"  endpoint  : {ep[1] if ep else 'no ACTIVE playback endpoint'}")
-        print(f"              (endpoint state does NOT imply power — see find_active)")
+        print("              (endpoint state does NOT imply power — see find_active)")
         prob = fallback_problem(args.fallback)
         if prob:
             print(f"  fallback  : UNUSABLE — {prob}")
@@ -2524,8 +2524,8 @@ def _main(argv) -> int:
             mprob = mic_fallback_problem(args.mic_fallback, rows=rows)
             print(f"  mic fb    : {'UNUSABLE — ' + mprob if mprob else find_active_capture(args.mic_fallback, rows=rows)[1]}")
         else:
-            print(f"  mic fb    : (none configured — the input half has nothing "
-                  f"to fall back to)")
+            print("  mic fb    : (none configured — the input half has nothing "
+                  "to fall back to)")
         return 0
 
     if args.test:
