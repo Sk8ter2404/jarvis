@@ -226,6 +226,30 @@ class NotAYesTests(_OfferBase):
         self.assertIn("another turn came after the offer", printed)
         self.assertEqual(self.calls["move_window_to_monitor"], [])
 
+    def test_a_yes_to_a_queued_question_spoken_after_the_offer(self):
+        # Review 2026-10-02: a pattern offer spoken from the queue after the
+        # turn's offer (_note_spoken_question records it) is what "yes" then
+        # answers - the turn's older offer must not run.
+        self.brain = self.obedient()
+        self._turn("Jarvis, open the chat app on the top monitor.")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.bc._note_spoken_question("Shall I queue your usual mix, sir?")
+        printed = self._turn("Jarvis, yes.")
+        self.assertEqual(self.calls["move_window_to_monitor"], [])
+        self.assertNotIn("OFFER ACCEPTED", self.prompts[-1])
+        self.assertIn("said something else after the offer", printed)
+
+    def test_a_yes_after_a_proactive_comment_does_not_answer_the_offer(self):
+        self.brain = self.obedient()
+        self._turn("Jarvis, open the chat app on the top monitor.")
+        # _do_proactive_turn records its line like this.
+        self.bc.conversation_history.append(
+            {"role": "assistant",
+             "content": "Sir, would you like me to start the focus timer?"})
+        self._turn("Jarvis, yes.")
+        self.assertEqual(self.calls["move_window_to_monitor"], [])
+        self.assertNotIn("OFFER ACCEPTED", self.prompts[-1])
+
     def test_an_offer_of_nothing_in_particular_is_not_opened(self):
         self.brain = self.obedient(
             offer_reply="Would you like to hear more about it, sir?")
@@ -251,6 +275,23 @@ class GatesStillApplyTests(_OfferBase):
         self.assertEqual(bc._pending_confirmation, [("restart", "")])
         self.assertIn("[self-term]", printed)
         # The held action is the turn's question now, not the offer.
+        self.assertEqual(bc._open_offer.peek(), "")
+
+    def test_a_turn_holding_a_confirmation_opens_no_offer(self):
+        # The held action's "say yes to proceed" is the turn's real question:
+        # an offer the same reply ends on must not also be open, or one yes
+        # would answer both (mutation-checked: the _pending_confirmation
+        # skip in _note_open_offer had no test).
+        bc = self.bc
+        self._stub("delete_file", "deleted")
+        self._p(bc, "_needs_confirmation", lambda n, a: n == "delete_file")
+        self.brain = lambda p: ("Very well, sir. [ACTION: delete_file, old "
+                                "export] Shall I also clear the downloads "
+                                "folder?")
+        printed = self._turn("Jarvis, delete the old export.")
+        self.assertEqual(bc._pending_confirmation,
+                         [("delete_file", "old export")])
+        self.assertNotIn("[offer-yes] open offer", printed)
         self.assertEqual(bc._open_offer.peek(), "")
 
     def test_an_offered_confirm_gated_action_still_asks(self):

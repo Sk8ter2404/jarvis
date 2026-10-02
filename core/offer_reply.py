@@ -77,6 +77,23 @@ ACTION_VERBS = frozenset("""
     unmute unpin update write
 """.split())
 
+# Words that may stand between the offer lead and its verb ("Shall I ALSO
+# mute it?", "Would you like me to GO AHEAD AND close it?", "Shall I, SIR,
+# open it?"). The verb must be the FIRST other word (review 2026-10-02): JARVIS's
+# dry asides carry an action verb in a clause about something else ("Should I
+# be worried that you keep asking me to OPEN it?", "Can I just say that was a
+# bold MOVE?"), and a joking yes to one told the brain to run it.
+_LEAD_BRIDGE = frozenset({
+    "also", "just", "go", "ahead", "and", "now", "then", "quickly", "simply",
+    "first", "perhaps", "maybe", "still", "kindly", "instead", "sir",
+    "please", "right", "away",
+})
+# A verb that opens a rhetorical aside, not an action: "Should I take it
+# personally?", "Can I remind you, sir, that ...?".
+_RHETORICAL_RE = re.compile(
+    r"\btake\s+(?:it|that|this)\s+personally\b"
+    r"|\bremind\s+you\b(?:\s*,?\s*sir\s*,?)?\s+that\b",
+    re.IGNORECASE)
 # "Shall I do that?" points back at an earlier sentence of the same reply.
 _DO_BACKREF_RE = re.compile(
     r"\b(?:do|go\s+ahead\s+with)\s+(?:that|it|so|this)\b", re.IGNORECASE)
@@ -103,11 +120,18 @@ def _leads(sentence: str) -> list:
 
 
 def _verbs_after_lead(sentence: str) -> bool:
-    """True when ``sentence`` carries an offer lead followed by an action
-    verb."""
+    """True when ``sentence`` carries an offer lead whose first word after
+    it (past a short bridge, _LEAD_BRIDGE) is an action verb, and is not a
+    rhetorical aside (_RHETORICAL_RE)."""
+    if _RHETORICAL_RE.search(sentence):
+        return False
     for m in _leads(sentence):
-        if any(w in ACTION_VERBS for w in _words(sentence[m.end():])):
-            return True
+        for w in _words(sentence[m.end():]):
+            if w in _LEAD_BRIDGE:
+                continue
+            if w in ACTION_VERBS:
+                return True
+            break
     return False
 
 

@@ -35802,8 +35802,9 @@ def _drop_stale_offer_asides(text):
 #     that question is the turn's real one.
 #   * The next owner turn takes it (_take_open_offer). Only a clear yes
 #     (core.yes_no.classify_reply, wake word dropped; a hedged yes is a no),
-#     with no other owner turn in between and within OFFER_YES_TTL_S of the
-#     offer, is an acceptance. _call_llm then routes the turn's sections on
+#     with no other owner turn in between, nothing JARVIS said after it (a
+#     queued question or a proactive comment, _offer_is_last_said) and
+#     within OFFER_YES_TTL_S of the offer, is an acceptance. _call_llm then routes the turn's sections on
 #     the offer's words too and adds a note telling the brain to emit the
 #     offered action; the action goes through parse_and_run_actions, so the
 #     confirmation, pushback and self-termination gates all still apply.
@@ -35860,14 +35861,38 @@ def _note_open_offer(texts, *, skip: bool = False) -> str:
         return ""
 
 
+def _offer_is_last_said(offer) -> bool:
+    """True when JARVIS has said nothing since ``offer``: the history's last
+    assistant entry still ends on it. Review 2026-10-02: a queued pattern
+    offer ("Shall I queue your usual mix, sir?", _note_spoken_question) or a
+    proactive comment (_do_proactive_turn) spoken after the turn's offer is
+    recorded there, and it is what a yes then answers - not the older offer.
+    One check over the history instead of a clear() at every speaker. Never
+    raises (False)."""
+    try:
+        for m in reversed(conversation_history):
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                content = m.get("content")
+                return (isinstance(content, str)
+                        and _offer_reply.offer_text(content) == offer)
+        return False
+    except Exception:
+        return False
+
+
 def _take_open_offer(text) -> str:
     """This owner turn takes the open offer (every turn does; the slot is
     empty afterwards). Returns the offer when ``text`` accepts it - a clear,
-    prompt yes with no owner turn in between - else "". Never raises."""
+    prompt yes with no owner turn in between and nothing said by JARVIS
+    after it (_offer_is_last_said) - else "". Never raises."""
     try:
         outcome, offer = _open_offer.take(
             text, since=float(_prev_owner_turn_at[0] or 0.0))
     except Exception:
+        return ""
+    if outcome == "yes" and not _offer_is_last_said(offer):
+        print("  [offer-yes] JARVIS said something else after the offer - "
+              "this turn does not answer it")
         return ""
     if outcome == "yes":
         print(f"  [offer-yes] sir said yes to {offer[:90]!r} - asking the "

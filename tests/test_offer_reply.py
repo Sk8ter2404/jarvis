@@ -69,6 +69,34 @@ class OfferTextTests(unittest.TestCase):
     def test_never_raises(self):
         self.assertEqual(O.offer_text(object()), "")
 
+    def test_a_rhetorical_question_is_not_an_offer(self):
+        # Review 2026-10-02: the verb used to count ANYWHERE after the lead,
+        # so JARVIS's dry asides - an action verb in a clause about something
+        # else - became offers, and a joking "yes" told the brain to emit an
+        # action (here: open the app) the owner never asked for.
+        for reply in (
+                "Should I be worried that you keep asking me to open the "
+                "chat app?",
+                "Can I just say, sir, that was a bold move?",
+                "May I point out that you asked me to close it an hour ago?",
+                "Could I suggest you take a break?",
+                "May I ask why you want to delete it?",
+                "Can I remind you, sir, that the last time it crashed?",
+                "Should I take it personally?"):
+            with self.subTest(reply=reply):
+                self.assertEqual(O.offer_text(reply), "")
+
+    def test_the_verb_may_follow_a_short_bridge(self):
+        for reply in (
+                "Shall I also mute the speakers?",
+                "Would you like me to go ahead and close it?",
+                "Should I attempt to move the existing window to the top "
+                "monitor?",
+                "Shall I, sir, open it on the left monitor?",
+                "Shall I take that as a yes, sir?"):
+            with self.subTest(reply=reply):
+                self.assertEqual(O.offer_text(reply), reply)
+
 
 class _Clock:
     def __init__(self, t=1000.0):
