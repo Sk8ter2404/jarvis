@@ -16453,16 +16453,17 @@ def _parakeet_post_text(text: str) -> str:
         text, globals().get("STT_REPLACEMENTS_PARAKEET"))
 
 
-def _parakeet_wake_mode() -> bool:
-    """Only a wake word gets this capture anywhere: wake-word mode is on
-    (_should_refuse_background_audio refuses a mic turn not led by it), or
-    JARVIS is in standby / sleep (the standby loop wakes on it alone). A
-    misheard wake word would lose the turn in either. Never raises."""
-    try:
-        return bool(_require_wake_runtime or _standby_mode[0]
-                    or _sleep_mode[0])
-    except Exception:
-        return True
+def _parakeet_wake_lost(text: str) -> bool:
+    """Would the live wake gates drop ``text`` right now for want of a wake
+    word (_wake_gate_verdict on a peeked _wake_gate_state)? Then a misheard
+    "JARVIS" would lose the turn or the wake: wake-word mode (unless the
+    follow-up window or the standby greeting reply would admit the line),
+    media playing or sustained room music with AMBIENT_MUSIC_REFUSE_WAKE,
+    the post-dialogue hold, and the standby / sleep loop (the wake word
+    anywhere; leading over room music). Nothing is consumed; SMTC is asked
+    only for a line the background gate would otherwise pass. Raises on a
+    failure (the rescue then runs)."""
+    return bool(_wake_gate_verdict(text, _wake_gate_state()))
 
 
 def _capture_preroll_samples(audio) -> "int | None":
@@ -16496,13 +16497,12 @@ def _parakeet_head_speech(audio) -> "bool | None":
 
 
 def _parakeet_rescue(text: str, audio) -> str:
-    """core/stt_parakeet.rescue_reason with the live wake-only state
-    (_parakeet_wake_mode), the real wake-prefix rule and the Silero head
-    check (_parakeet_head_speech, the tail probe's detector)."""
+    """core/stt_parakeet.rescue_reason with the live wake gates
+    (_parakeet_wake_lost) and the Silero head check (_parakeet_head_speech,
+    the tail probe's detector)."""
     return _stt_parakeet.rescue_reason(
         text,
-        wake_mode=_parakeet_wake_mode,
-        has_wake_prefix=_text_has_wake_prefix,
+        wake_lost=_parakeet_wake_lost,
         head_speech=lambda: _parakeet_head_speech(audio))
 
 
@@ -31564,25 +31564,165 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
     try:
         # Taken by whichever mic turn comes first, wake-prefixed or not.
         _greet_reply = _standby_greet_admit_take()
-        if _text_has_wake_prefix(text):
+        # The decision itself is _bg_refuse_rule (the one copy, which the R6
+        # Parakeet rescue and shadow judge also ask); the side effects —
+        # admit() extending the follow-up window, note_addressed() opening
+        # it, the greeting take above — happen here only.
+        refuse, why = _bg_refuse_rule(
+            text, wake_mode=bool(_require_wake_runtime),
+            followup=_followup_window.admit, greet_reply=_greet_reply,
+            music_refuse=_ambient_music_refuse_wake,
+            media_playing=_smtc_media_playing,
+            room_music=lambda: _audio_music_should_refuse_wake(text))
+        if why == _BG_WAKE_PREFIX:
             _followup_window.note_addressed()
             return (False, "")
-        if _require_wake_runtime:
-            if _followup_window.admit():
-                return (False, "follow-up window")
-            if _greet_reply:
-                return (False, "standby greeting reply")
-            return (True, "wake-word mode")
-        from core.config import AMBIENT_MUSIC_REFUSE_WAKE as _r
-        if not _r:
-            return (False, "")
-        if _smtc_media_playing():
-            return (True, "media playing")
-        if _audio_music_should_refuse_wake(text):
-            return (True, "room music")
-        return (False, "")
+        return (refuse, why)
     except Exception:
         return (False, "")
+
+
+_BG_WAKE_PREFIX = "wake prefix"
+
+
+def _ambient_music_refuse_wake() -> bool:
+    """core.config.AMBIENT_MUSIC_REFUSE_WAKE, read now (Settings can change
+    it while JARVIS runs)."""
+    from core.config import AMBIENT_MUSIC_REFUSE_WAKE as _r
+    return bool(_r)
+
+
+def _bg_refuse_rule(text: str, *, wake_mode: bool, followup,
+                    greet_reply: bool, music_refuse, media_playing,
+                    room_music) -> "tuple[bool, str]":
+    """The background-audio gate's DECISION, with no side effects — the one
+    copy. _should_refuse_background_audio runs it on the live state;
+    _wake_gate_verdict (speed plan R6: the Parakeet rescue and the shadow
+    judge) runs it on a peeked snapshot.
+
+    ``(refuse, reason)``. A wake-led ``text`` (_text_has_wake_prefix) is
+    ``(False, _BG_WAKE_PREFIX)``; the live caller then opens the follow-up
+    window. ``followup``, ``music_refuse``, ``media_playing`` and
+    ``room_music`` are zero-argument callables, asked in this order and only
+    when the decision needs them (admit() extends the window; SMTC may do a
+    synchronous read); ``wake_mode`` and ``greet_reply`` are values. Raises
+    what they raise (the live gate fails open)."""
+    if _text_has_wake_prefix(text):
+        return (False, _BG_WAKE_PREFIX)
+    if wake_mode:
+        if followup():
+            return (False, "follow-up window")
+        if greet_reply:
+            return (False, "standby greeting reply")
+        return (True, "wake-word mode")
+    if not music_refuse():
+        return (False, "")
+    if media_playing():
+        return (True, "media playing")
+    if room_music():
+        return (True, "room music")
+    return (False, "")
+
+
+def _wake_word_heard(text: str) -> bool:
+    """The wake word anywhere in ``text`` (the word-boundary _WAKE_RE): what
+    wakes the standby / sleep loop and what lets a mic line through the
+    post-dialogue hold. The one copy both use, and _wake_gate_verdict."""
+    return bool(_WAKE_RE.search((text or "").strip().lower()))
+
+
+def _room_music_playing() -> bool:
+    """The spectral detector's sustained-music state (the standby skill's
+    is_music_currently_playing; False when the skill is not loaded) — the
+    state _audio_music_should_refuse_wake asks, read without a text. Never
+    raises."""
+    mod = sys.modules.get("skill_standby_audio_detect")
+    if mod is None:
+        return False
+    try:
+        return bool(mod.is_music_currently_playing())
+    except Exception:
+        return False
+
+
+def _wake_gate_state(resolve_media: bool = False) -> dict:
+    """The live wake gates' inputs NOW, PEEKED — nothing is consumed: the
+    follow-up window is not extended and the standby greeting admit stays
+    armed (speed plan R6; the rescue asks this between the decode and the
+    real gates, and the shadow judge snapshots it for later).
+
+      standby        the standby / sleep loop has this capture
+      hold           the post-dialogue turn hold is on
+      wake_mode      wake-word mode (_require_wake_runtime)
+      followup_open  the follow-up window would admit a non-wake line
+      greet_armed    the standby greeting reply would admit one
+      music_refuse   AMBIENT_MUSIC_REFUSE_WAKE
+      room_music     sustained room music (_room_music_playing)
+      media_playing  SMTC reports media playing: the _smtc_media_playing
+                     callable, asked only if a verdict needs it — or, with
+                     ``resolve_media``, its answer now, read only when the
+                     background gate could ask it (no standby, no wake-word
+                     mode, the music switch on)
+
+    A read that fails takes its gate's fail-open value. Never raises."""
+    st: dict = {}
+
+    def _read(name, fn):
+        try:
+            st[name] = bool(fn())
+        except Exception:
+            st[name] = False
+
+    _read("standby", lambda: _sleep_mode[0] or _standby_mode[0])
+    _read("hold", lambda: time.monotonic() < float(_turn_hold_until[0]))
+    _read("wake_mode", lambda: _require_wake_runtime)
+    _read("followup_open", lambda: _followup_window.remaining_s() > 0.0)
+    _read("greet_armed", lambda: (
+        float(_standby_greet_admit_until[0]) > 0.0
+        and time.time() < float(_standby_greet_admit_until[0])))
+    _read("music_refuse", _ambient_music_refuse_wake)
+    _read("room_music", _room_music_playing)
+    st["media_playing"] = _smtc_media_playing
+    if resolve_media:
+        if st["standby"] or st["wake_mode"] or not st["music_refuse"]:
+            st["media_playing"] = False
+        else:
+            _read("media_playing", _smtc_media_playing)
+    return st
+
+
+def _wake_gate_verdict(text: str, st: dict) -> str:
+    """'' when the live wake gates would let ``text`` through in state ``st``
+    (_wake_gate_state), else the gate that would drop it for want of a wake
+    word, in the order the loops run them:
+
+      'dialogue hold'  the post-dialogue hold (_wake_word_heard)
+      'standby'        the standby / sleep loop: no wake word anywhere
+      'standby music'  ...or one buried mid-line over sustained room music
+                       (the standby skill's should_refuse_wake: refused
+                       unless _text_has_wake_prefix)
+      otherwise _bg_refuse_rule's reason: 'wake-word mode', 'media
+                       playing', 'room music'
+
+    Built only from the gates' own rules (_wake_word_heard,
+    _text_has_wake_prefix, _bg_refuse_rule). Raises on a bad state."""
+    if st.get("hold") and not _wake_word_heard(text):
+        return "dialogue hold"
+    if st.get("standby"):
+        if not _wake_word_heard(text):
+            return "standby"
+        if st.get("room_music") and not _text_has_wake_prefix(text):
+            return "standby music"
+        return ""
+    media = st.get("media_playing")
+    refuse, why = _bg_refuse_rule(
+        text, wake_mode=bool(st.get("wake_mode")),
+        followup=lambda: bool(st.get("followup_open")),
+        greet_reply=bool(st.get("greet_armed")),
+        music_refuse=lambda: bool(st.get("music_refuse")),
+        media_playing=media if callable(media) else (lambda: bool(media)),
+        room_music=lambda: bool(st.get("room_music")))
+    return why if refuse else ""
 
 
 def _bg_gate_for_turn(text: str, injected: bool) -> "tuple[bool, str]":
@@ -36849,7 +36989,7 @@ def _dialogue_hold_ignored(text: str, injected: bool = False) -> bool:
             return False
         if time.monotonic() >= float(_turn_hold_until[0]):
             return False
-        if _WAKE_RE.search((text or "").lower()):
+        if _wake_word_heard(text):
             return False
         print(f"  [dialogue-hold] ignored ({_turn_hold_reason[0] or 'hold'})")
         return True
@@ -40563,8 +40703,9 @@ def _handle_sleep_standby(injected_text: str | None):
     # Word-boundary wake match (2026-07-14 bug-hunt). Was `any(wp in tl ...)` —
     # a raw substring test that fires on "awakened"/"jar visit"; the ambient
     # listener already used a word-boundary regex, and this standby gate was the
-    # stale duplicate that didn't.
-    if _WAKE_RE.search(tl):
+    # stale duplicate that didn't. _wake_word_heard is that regex: the one
+    # copy the dialogue hold and the R6 rescue also use.
+    if _wake_word_heard(text):
         if _audio_music_should_refuse_wake(text):
             # Length only, never the words (2026-10-01, see the ignored
             # line below).

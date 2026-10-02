@@ -29,6 +29,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 import textwrap
 import threading
@@ -91,6 +92,15 @@ class _Base(MonolithGlobalsTestCase):
         self._p(bc, "STT_REPLACEMENTS", {})
         self._p(bc, "STT_REPLACEMENTS_PARAKEET", {})
         self._p(bc, "_last_capture_preroll", [None])
+        # The live wake gates' state, isolated from this PC (R6 review: the
+        # rescue asks every one of them): no media session, no room-music
+        # skill, no post-dialogue hold, no greeting admit, no follow-up.
+        from core.followup_window import FollowupWindow
+        self._p(bc, "_smtc_media_playing", return_value=False)
+        self._set_module("skill_standby_audio_detect", None)
+        self._p(bc, "_turn_hold_until", [0.0])
+        self._p(bc, "_standby_greet_admit_until", [0.0])
+        self._p(bc, "_followup_window", FollowupWindow(0))
         self.notes = []
         self._p(bc, "_tt_note_stat",
                 side_effect=lambda n, v: self.notes.append((n, v)))
@@ -102,6 +112,20 @@ class _Base(MonolithGlobalsTestCase):
         m = patcher.start()
         self.addCleanup(patcher.stop)
         return m
+
+    def _set_module(self, name, mod):
+        """sys.modules[name] = mod for this test (None = not loaded, as
+        the monolith's sys.modules.get lookups see it); only that key is
+        restored."""
+        had, old = name in sys.modules, sys.modules.get(name)
+        sys.modules[name] = mod
+
+        def _restore():
+            if had:
+                sys.modules[name] = old
+            else:
+                sys.modules.pop(name, None)
+        self.addCleanup(_restore)
 
     def _engine_notes(self):
         return [v for n, v in self.notes if n == "stt_engine"]
@@ -270,9 +294,9 @@ class R6PrimaryTests(_Base):
         self.assertEqual(self._engine_notes(), ["parakeet-rescued"])
         self._p(bc, "_standby_mode", [False])
         self._p(bc, "_sleep_mode", [True])
-        self.assertTrue(bc._parakeet_wake_mode())
+        self.assertTrue(bc._parakeet_wake_lost("Travis, are you there?"))
         self._p(bc, "_sleep_mode", [False])
-        self.assertFalse(bc._parakeet_wake_mode())
+        self.assertFalse(bc._parakeet_wake_lost("Travis, are you there?"))
 
     def test_a_wake_led_transcript_is_not_rescued(self):
         bc = self.bc
@@ -461,6 +485,190 @@ class R6RescueHeadTests(_Base):
             self.assertIs(bc._transcribe_capture(self.audio), W_RES)
         tr.assert_called_once()
         head.assert_not_called()
+
+
+def _load_music_skill():
+    """The REAL skills/standby_audio_detect, under the name the monolith
+    looks it up by (sys.modules['skill_standby_audio_detect'])."""
+    import importlib.util
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    spec = importlib.util.spec_from_file_location(
+        "skill_standby_audio_detect",
+        os.path.join(root, "skills", "standby_audio_detect.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ════════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class R6RescueGateTests(_Base):
+    """The rescue fires whenever the LIVE wake gates would drop Parakeet's
+    text for want of a wake word — not only in wake-word mode and standby
+    (R6 review, finding 2 / finding 10): media playing or sustained room
+    music with AMBIENT_MUSIC_REFUSE_WAKE, the post-dialogue hold; and not
+    when the live gates would let the text through: the follow-up window,
+    the standby greeting reply, a standby wake word anywhere in the line.
+    The state is peeked, never consumed."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        import core.config as cfg
+        from core.followup_window import FollowupWindow
+        self._p(bc, "STT_ENGINE", "parakeet")
+        bc._last_capture_preroll[0] = (len(self.audio), 0)
+        self.head = self._p(bc._tail_vad, "speech_in_head",
+                            return_value=True)
+        self.tr = self._p(bc, "transcribe", return_value=W_RES)
+        self.fw = FollowupWindow(30.0)
+        self._p(bc, "_followup_window", self.fw)
+        self.smtc = bc._smtc_media_playing        # _Base: False
+        self._p(cfg, "AMBIENT_MUSIC_REFUSE_WAKE", True)
+        self.skill = _load_music_skill()
+        self.room = self._p(self.skill, "is_music_currently_playing",
+                            return_value=False)
+        self._set_module("skill_standby_audio_detect", self.skill)
+
+    def _run(self, text):
+        bc = self.bc
+        self._p(bc, "_stt_alt", _FakeEngine(text=text))
+        self.tr.reset_mock()
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = bc._transcribe_capture(self.audio)
+        return res is W_RES
+
+    def test_media_playing_with_wake_mode_off_rescues(self):
+        self.smtc.return_value = True
+        self.assertTrue(self._run("Travis, pause the music"))
+        self.tr.assert_called_once()
+        # ...and the live gate agrees the line would have been refused.
+        self.assertEqual(self.bc._should_refuse_background_audio(
+            "Travis, pause the music"), (True, "media playing"))
+
+    def test_sustained_room_music_with_wake_mode_off_rescues(self):
+        self.room.return_value = True
+        self.assertTrue(self._run("Travis, pause the music"))
+
+    def test_the_music_switch_off_keeps_parakeets_text(self):
+        import core.config as cfg
+        self._p(cfg, "AMBIENT_MUSIC_REFUSE_WAKE", False)
+        self.smtc.return_value = True
+        self.room.return_value = True
+        self.assertFalse(self._run("Travis, pause the music"))
+
+    def test_the_post_dialogue_hold_rescues(self):
+        bc = self.bc
+        bc._turn_hold_until[0] = bc.time.monotonic() + 30.0
+        self.assertTrue(self._run("Travis, stop"))
+
+    def test_a_wake_led_line_never_asks_smtc(self):
+        self.smtc.side_effect = AssertionError("SMTC read for a wake line")
+        self.assertFalse(self._run("Jarvis, pause the music"))
+        self.smtc.assert_not_called()
+        self.head.assert_not_called()
+
+    def test_an_open_follow_up_window_is_peeked_not_extended(self):
+        bc = self.bc
+        self._p(bc, "_require_wake_runtime", True)
+        self.fw.note_addressed()
+        until = self.fw._until
+        self.assertFalse(self._run("and the kitchen too"))
+        self.assertEqual(self.fw._until, until)   # admit() not called
+
+    def test_an_armed_greeting_reply_is_peeked_not_taken(self):
+        bc = self.bc
+        self._p(bc, "_require_wake_runtime", True)
+        bc._standby_greet_admit_until[0] = bc.time.time() + 8.0
+        self.assertFalse(self._run("what time is it"))
+        self.assertGreater(bc._standby_greet_admit_until[0], 0.0)
+
+    def test_standby_wakes_on_the_wake_word_anywhere(self):
+        # Standby wakes on the wake word anywhere in the line, so a
+        # mid-sentence "Jarvis" from Parakeet would wake: keep it (the old
+        # prefix rule rescued it and could lose the wake to Whisper).
+        bc = self.bc
+        self._p(bc, "_standby_mode", [True])
+        self._p(bc, "_sleep_mode", [True])
+        self.assertFalse(bc._text_has_wake_prefix("is that you there Jarvis"))
+        self.assertFalse(self._run("is that you there Jarvis"))
+        self.assertTrue(self._run("is that you there Travis"))
+
+    def test_standby_over_room_music_needs_the_wake_prefix(self):
+        # The standby lyric guard: over sustained room music a mid-line
+        # wake word is refused, so it is rescued.
+        bc = self.bc
+        self._p(bc, "_standby_mode", [True])
+        self._p(bc, "_sleep_mode", [True])
+        self.room.return_value = True
+        self.assertTrue(bc._audio_music_should_refuse_wake(
+            "is that you there Jarvis"))
+        self.assertTrue(self._run("is that you there Jarvis"))
+        self.assertFalse(self._run("Jarvis, are you there"))
+
+    def test_the_live_gate_and_the_verdict_share_one_rule(self):
+        # One copy: the live background gate and the rescue's verdict both
+        # ask _bg_refuse_rule (a re-implemented verdict stays green here).
+        bc = self.bc
+        rule = self._p(bc, "_bg_refuse_rule",
+                       return_value=(True, "sentinel"))
+        self.assertEqual(bc._should_refuse_background_audio("x"),
+                         (True, "sentinel"))
+        self.assertEqual(bc._wake_gate_verdict("x", bc._wake_gate_state()),
+                         "sentinel")
+        self.assertEqual(rule.call_count, 2)
+        heard = self._p(bc, "_wake_word_heard", return_value=False)
+        bc._turn_hold_until[0] = bc.time.monotonic() + 30.0
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(bc._dialogue_hold_ignored("Jarvis, stop"))
+        self.assertEqual(bc._wake_gate_verdict("Jarvis, stop",
+                                               bc._wake_gate_state()),
+                         "dialogue hold")
+        self.assertEqual(heard.call_count, 2)
+
+    def test_the_verdict_matches_the_live_gate_in_every_state(self):
+        import itertools
+        bc = self.bc
+        texts = ("Jarvis, pause the music", "pause the music",
+                 "um Jarvis what time is it", "I told Jarvis yesterday", "")
+        for wm, music, media, room, fw, greet in itertools.product(
+                (False, True), repeat=6):
+            import core.config as cfg
+            self._p(cfg, "AMBIENT_MUSIC_REFUSE_WAKE", music)
+            self._p(bc, "_require_wake_runtime", wm)
+            self.smtc.return_value = media
+            self.room.return_value = room
+            for text in texts:
+                self.fw._until = 0.0
+                if fw:
+                    self.fw.note_addressed()
+                bc._standby_greet_admit_until[0] = (
+                    bc.time.time() + 8.0 if greet else 0.0)
+                why = bc._wake_gate_verdict(text, bc._wake_gate_state())
+                snap = bc._wake_gate_state(resolve_media=True)
+                why_snap = bc._wake_gate_verdict(text, snap)
+                live = bc._should_refuse_background_audio(text)
+                case = (wm, music, media, room, fw, greet, text)
+                self.assertEqual(bool(why), live[0], case)
+                if live[0]:
+                    self.assertEqual(why, live[1], case)
+                self.assertEqual(why_snap, why, case)
+
+    def test_the_standby_lyric_guard_is_the_skills_rule(self):
+        bc = self.bc
+        self._p(bc, "_standby_mode", [True])
+        self._p(bc, "_sleep_mode", [True])
+        for room in (False, True):
+            self.room.return_value = room
+            for text in ("Jarvis", "Jarvis, lights", "hey there Jarvis",
+                         "um Jarvis lights", "jar visit", "nothing here"):
+                why = bc._wake_gate_verdict(text, bc._wake_gate_state())
+                heard = bc._wake_word_heard(text)
+                want = ("standby" if not heard else
+                        "standby music" if self.skill.should_refuse_wake(text)
+                        else "")
+                self.assertEqual(why, want, (room, text))
 
 
 # ════════════════════════════════════════════════════════════════════════════

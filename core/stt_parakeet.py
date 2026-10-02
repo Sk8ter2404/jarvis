@@ -24,10 +24,11 @@ WHAT PARAKEET LOSES, AND THE RESCUE
     STT_REPLACEMENTS applies as for Whisper, then STT_REPLACEMENTS_PARAKEET
     maps Parakeet's own mishearings.
   * Wake-word mode refuses any mic turn whose transcript is not led by
-    "JARVIS" (and standby / sleep wake on the wake word alone), so ONE
+    "JARVIS" (so do music with AMBIENT_MUSIC_REFUSE_WAKE and the
+    post-dialogue hold; standby / sleep wake on the wake word alone), so ONE
     misheard wake word loses the whole turn. The rescue bounds that: when
-    Parakeet's text is empty — or, while only a wake word gets through, is
-    not led by the wake word while the speech detector hears speech in the
+    Parakeet's text is empty — or the live wake gates would drop it for
+    want of a wake word while the speech detector hears speech in the
     first 0.8 s of the owner's speech (from the chunk that tripped the
     capture, past record_speech's pre-roll) — Whisper decodes the clip once
     and its transcript is used. Every rescue is counted.
@@ -256,27 +257,25 @@ def transcribe(engine, audio, anchors=None, clock=time.perf_counter):
 
 
 # ── the rescue ────────────────────────────────────────────────────────────
-def rescue_reason(text, *, wake_mode, has_wake_prefix, head_speech) -> str:
+def rescue_reason(text, *, wake_lost, head_speech) -> str:
     """Why Whisper must decode this capture after all ('' = keep Parakeet's
     text). Only names a reason, never the text:
 
       'empty'   — Parakeet heard nothing;
-      'no-wake' — wake_mode() is on (wake-word mode, or standby / sleep:
-                  the monolith's _parakeet_wake_mode), has_wake_prefix(text)
-                  is False, and
+      'no-wake' — wake_lost(text): the live wake gates would drop the line
+                  for want of a wake word (wake-word mode, music with
+                  AMBIENT_MUSIC_REFUSE_WAKE, the post-dialogue hold,
+                  standby / sleep: the monolith's _parakeet_wake_lost), and
                   head_speech() says the first RESCUE_HEAD_S of the speech
                   (past the capture's pre-roll) hold speech — or cannot
-                  tell (None): a misheard wake word
-                  must not lose the turn.
+                  tell (None): a misheard wake word must not lose the turn.
 
     The callables are read in that order and only when needed. Any error in
     them rescues ('check-failed'): a slower turn, never a lost one."""
     try:
         if not (text or "").strip():
             return "empty"
-        if not wake_mode():
-            return ""
-        if has_wake_prefix(text):
+        if not wake_lost(text):
             return ""
         speech = head_speech()
         if speech is None or speech:
@@ -322,7 +321,7 @@ class Primary:
       post_text(text) -> text          STT_REPLACEMENTS, then
                                        STT_REPLACEMENTS_PARAKEET
       rescue(text, audio) -> str       rescue_reason() with the live wake
-                                       mode and the Silero head check
+                                       gates and the Silero head check
       note(value)                      [turn-timing] stt_engine
       hotwords() -> bool               STT_HOTWORDS is set (then logged once)
 

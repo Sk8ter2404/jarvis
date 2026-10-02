@@ -313,8 +313,8 @@ class RescueReasonTests(unittest.TestCase):
             if isinstance(head, Exception):
                 raise head
             return head
-        why = sp.rescue_reason(text, wake_mode=lambda: wake,
-                               has_wake_prefix=_prefix,
+        why = sp.rescue_reason(text,
+                               wake_lost=lambda t: wake and not _prefix(t),
                                head_speech=head_speech)
         return why, len(calls)
 
@@ -334,6 +334,13 @@ class RescueReasonTests(unittest.TestCase):
         self.assertEqual(self._r("turn the lights off", wake=False), ("", 0))
         self.assertEqual(self._r("he said something", head=False),
                          ("", 1))
+
+    def test_wake_lost_is_asked_about_the_text(self):
+        seen = []
+        why = sp.rescue_reason("Travis, lights",
+                               wake_lost=lambda t: seen.append(t) or True,
+                               head_speech=lambda: True)
+        self.assertEqual((why, seen), ("no-wake", ["Travis, lights"]))
 
     def test_a_failing_check_rescues(self):
         self.assertEqual(self._r("Travis", head=RuntimeError("x")),
@@ -359,7 +366,7 @@ def _primary(decode, whisper=None, wake=False, head=True, post=None,
         decode, w, latch=sp.Latch(log=log.append),
         post_text=post,
         rescue=lambda t, a: sp.rescue_reason(
-            t, wake_mode=lambda: wake, has_wake_prefix=_prefix,
+            t, wake_lost=lambda x: wake and not _prefix(x),
             head_speech=lambda: head),
         note=notes.append, hotwords=lambda: hot, log=log.append)
     return p, w, log, notes
@@ -596,8 +603,8 @@ class ImportHygieneTests(unittest.TestCase):
                 "from core import config; "
                 "assert sp.engine_setting(config.STT_ENGINE) == 'whisper'; "
                 "assert sp.shadow_setting(config.STT_SHADOW) == ''; "
-                "sp.map_conf([-0.1]); sp.rescue_reason('', wake_mode=None, "
-                "has_wake_prefix=None, head_speech=None); "
+                "sp.map_conf([-0.1]); sp.rescue_reason('', wake_lost=None, "
+                "head_speech=None); "
                 "print(sorted(m for m in ('onnx_asr', 'onnxruntime', "
                 "'numpy') if m in sys.modules))")
         out = subprocess.run([sys.executable, "-c", code, _ROOT],
