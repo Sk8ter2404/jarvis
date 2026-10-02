@@ -48,7 +48,7 @@ HEARD = "It is, sir. Sunny."
 # "typed").
 CTX_KEYS = {"stage", "user_text", "reply_text", "actions", "question",
             "barged", "failed", "typed"}
-SECRET = "the owner's private words"
+OWNER_WORDS = "the owner's private words"
 
 
 class _Hook:
@@ -76,7 +76,7 @@ class _Hook:
         if stage in self.sleep_s:
             time.sleep(self.sleep_s[stage])
         if stage in self.raise_at:
-            raise RuntimeError(SECRET)
+            raise RuntimeError(OWNER_WORDS)
         return self.encore if stage == "spoken" else None
 
     def stages(self):
@@ -495,16 +495,16 @@ class IsolationTests(_AfterReplyBase):
         self.assertEqual(self.spoken, [REPLY])
         self.assertIn("ready failed: RuntimeError", out)
         self.assertIn("spoken failed: RuntimeError", out)
-        self.assertNotIn(SECRET, out)
+        self.assertNotIn(OWNER_WORDS, out)
         self.assertEqual(self.bc._AFTER_REPLY_HOOKS[0]["late"], 0)
 
     def test_a_raising_encore_never_reaches_the_loop(self):
-        enc = self.encore(raise_exc=ValueError(SECRET))
+        enc = self.encore(raise_exc=ValueError(OWNER_WORDS))
         self.hook(encore=enc)
         out = self.turn()
         self.assertEqual(enc.runs, ["after-reply-encore"])
         self.assertIn("encore failed: ValueError", out)
-        self.assertNotIn(SECRET, out)
+        self.assertNotIn(OWNER_WORDS, out)
 
     def test_a_non_callable_return_is_ignored(self):
         self.hook(encore="not callable")
