@@ -3124,5 +3124,280 @@ class DialogueHoldTests(_TmpDirMixin, unittest.TestCase):
         self.assertEqual(self.mod._audio_entries_total, 0)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# AMBIENT_STT_YIELD (speed plan R2): ambient Whisper defers to the owner's
+# turn instead of competing with it for the shared STT lock.
+# ─────────────────────────────────────────────────────────────────────────
+class SttYieldTests(_TmpDirMixin, unittest.TestCase):
+    """With the flag on, a batch that is ready while the owner is mid-
+    utterance (_utterance_in_progress) is parked instead of transcribed;
+    parked batches are transcribed oldest-first once the flag clears. Each
+    test drives a worker synchronously over scripted steps: batch number n is
+    a constant block of amplitude n/100, transcribed as "line n"."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("ambient_listen")
+        self._redirect_paths()
+        self.mod._buffer.clear()
+        self.mod._last_error = None
+        self.mod._audio_entries_total = 0
+        self.mod._audio_last_error = None
+        self.mod._wake_pattern = None
+        self.mod._prev_mic_batch[:] = [None, 0.0]
+        self.addCleanup(self.mod._prev_mic_batch.__setitem__,
+                        slice(None), [None, 0.0])
+        self.clock = [0.0]       # the yield's monotonic clock
+        self.calls_at = []       # transcribe() calls so far, per step
+
+    def _bc(self, flag=True):
+        bc = _FakeBobert(_utterance_in_progress=[False],
+                         _audio_master_enabled=[False],   # raw audio in
+                         AMBIENT_AUDIO_CHUNK_DURATION_SECONDS=5.0)
+        if flag is not None:
+            bc.AMBIENT_STT_YIELD = flag
+        bc.transcribe = mock.MagicMock(
+            side_effect=lambda a: (f"line {self._n(a)}", _good_conf()))
+        bc.is_valid_speech = mock.MagicMock(return_value=(True, "ok"))
+        bc.is_ambient_music = mock.MagicMock(return_value=False)
+        return bc
+
+    @staticmethod
+    def _n(audio):
+        return int(round(float(audio[0]) * 100))
+
+    def _heard(self, bc):
+        """Batch numbers transcribe() was given, in call order."""
+        return [self._n(c.args[0]) for c in bc.transcribe.call_args_list]
+
+    def _drive(self, bc, steps, *, loopback=False, extra=()):
+        """Run the mic (or loopback) worker once over ``steps``. Step k is
+        (busy, n, t): the owner flag and the yield clock are set, then batch
+        n is captured (None = a tick with no new audio). Returns the log."""
+        samples = 16000 * (6 if loopback else 3)
+
+        def _apply(k):
+            if k >= len(steps):
+                return
+            busy, n, t = steps[k]
+            self.calls_at.append(bc.transcribe.call_count)
+            bc._utterance_in_progress[0] = busy
+            self.clock[0] = t
+            if n is not None:
+                stream.feed(np.full(samples, n / 100.0, dtype=np.float32))
+
+        stream = _FakeStream(on_start=lambda s: _apply(0))
+        sd = (AudioWorkerLoopTests._loopback_sd(self, native_sr=16000)
+              if loopback else _make_sd())
+        sd._stream_holder["stream"] = stream
+        evt = _ScriptedEvent([False] * (len(steps) - 1) + [True],
+                             on_wait=_apply)
+        log = io.StringIO()
+        with contextlib.ExitStack() as st:
+            st.enter_context(inject_modules(sounddevice=sd))
+            st.enter_context(mock.patch.object(self.mod, "_get_bobert",
+                                               return_value=bc))
+            st.enter_context(mock.patch.object(
+                self.mod, "_audio_stop_evt" if loopback else "_stop_evt", evt))
+            st.enter_context(mock.patch.object(
+                self.mod, "_yield_mono", side_effect=lambda: self.clock[0],
+                create=True))
+            # The focused window names the clock, so a parked batch shows
+            # whether it kept its capture-time attribution.
+            st.enter_context(mock.patch.object(
+                self.mod, "_focused_window_title",
+                side_effect=lambda: f"win@{self.clock[0]:g}"))
+            st.enter_context(mock.patch.object(
+                self.mod, "_focused_proc_name", return_value="player.exe"))
+            for cm in extra:
+                st.enter_context(cm)
+            st.enter_context(contextlib.redirect_stdout(log))
+            (self.mod._audio_worker_loop if loopback
+             else self.mod._worker_loop)()
+        return log.getvalue()
+
+    def _jsonl(self):
+        if not os.path.exists(self.mod._AUDIO_JSONL):
+            return []
+        with open(self.mod._AUDIO_JSONL, encoding="utf-8") as f:
+            return [json.loads(ln) for ln in f if ln.strip()]
+
+    # ── parking ──────────────────────────────────────────────────────────
+    def test_mic_batch_is_not_transcribed_while_the_owner_speaks(self):
+        bc = self._bc()
+        log = self._drive(bc, [(True, 11, 0.0)])
+        bc.transcribe.assert_not_called()
+        self.assertEqual(len(self.mod._buffer), 0)
+        self.assertEqual(self._jsonl(), [])
+        # One count line (counts only, never a transcript).
+        self.assertEqual(log.count("yielded to the owner's turn"), 1)
+        self.assertIn("1 batch(es) deferred, 0 dropped", log)
+        self.assertIsNone(self.mod._last_error)
+
+    def test_loopback_batch_is_not_transcribed_while_the_owner_speaks(self):
+        bc = self._bc()
+        self._drive(bc, [(True, 11, 0.0)], loopback=True)
+        bc.transcribe.assert_not_called()
+        self.assertEqual(self.mod._audio_entries_total, 0)
+        self.assertEqual(self._jsonl(), [])
+
+    # ── release: order, capture time, attribution ───────────────────────
+    def test_mic_parked_batches_go_first_in_order_after_release(self):
+        bc = self._bc()
+        spy = mock.patch.object(self.mod, "_device_speech_batch_source",
+                                wraps=self.mod._device_speech_batch_source)
+        with spy as dev:
+            self._drive(bc, [(True, 11, 0.0), (True, 12, 3.0),
+                             (False, 13, 6.0)])
+        self.assertEqual(self.calls_at, [0, 0, 0])   # nothing while busy
+        self.assertEqual(self._heard(bc), [11, 12, 13])
+        texts = [e["text"] for e in self.mod._buffer]
+        self.assertEqual(texts, ["line 11", "line 12", "line 13"])
+        # Parked batches join split lines (and are stamped) by capture time;
+        # the live batch makes exactly the call it always made.
+        c11, c12, c13 = dev.call_args_list
+        self.assertEqual(c11.args, ("line 11",))
+        self.assertEqual(c11.kwargs["now"], self.mod._buffer[0]["ts"])
+        self.assertEqual(c12.kwargs["now"], self.mod._buffer[1]["ts"])
+        self.assertLessEqual(self.mod._buffer[0]["ts"],
+                             self.mod._buffer[1]["ts"])
+        self.assertEqual(c13, mock.call("line 13"))
+        self.assertEqual([m["window"] for m in self._jsonl()],
+                         ["win@0", "win@3", "win@6"])
+
+    def test_mic_parked_batch_is_kept_on_an_idle_tick(self):
+        # No new audio after the owner's turn: the parked batch is still
+        # transcribed and kept, it does not wait for the next loud batch.
+        bc = self._bc()
+        self._drive(bc, [(True, 11, 0.0), (False, None, 4.0)])
+        self.assertEqual(self.calls_at, [0, 0])   # parked, then released
+        self.assertEqual(self._heard(bc), [11])
+        self.assertEqual([e["text"] for e in self.mod._buffer], ["line 11"])
+        self.assertEqual(self._jsonl()[0]["source"], "mic")
+
+    def test_loopback_parked_batch_logged_in_order_after_release(self):
+        bc = self._bc()
+        self._drive(bc, [(True, 11, 0.0), (False, 12, 7.0)], loopback=True)
+        self.assertEqual(self.calls_at, [0, 0])
+        self.assertEqual(self._heard(bc), [11, 12])
+        rows = self._jsonl()
+        self.assertEqual([r["text"] for r in rows], ["line 11", "line 12"])
+        self.assertEqual([r["window"] for r in rows], ["win@0", "win@7"])
+        self.assertTrue(all(r["source"] == "system_audio" for r in rows))
+        self.assertEqual(self.mod._audio_entries_total, 2)
+
+    # ── bounds ───────────────────────────────────────────────────────────
+    def test_parked_batches_are_bounded_and_overflow_is_counted(self):
+        bc = self._bc()
+        bc._tt_note_stat = mock.MagicMock()
+        steps = [(True, n, 0.0) for n in range(11, 19)] + [(False, None, 1.0)]
+        with mock.patch.object(self.mod, "_AMBIENT_YIELD_LOG_EVERY", 1):
+            log = self._drive(bc, steps)
+        self.assertEqual(self.mod.AMBIENT_YIELD_MAX_BATCHES, 6)
+        # 8 parked into 6 slots: the two oldest were dropped.
+        self.assertEqual(self._heard(bc), [13, 14, 15, 16, 17, 18])
+        self.assertIn("8 batch(es) deferred, 2 dropped", log)
+        self.assertEqual(log.count("yielded to the owner's turn"), 8)
+        self.assertNotIn("line 1", log)   # counts only, never transcripts
+        self.assertEqual(bc._tt_note_stat.call_args_list,
+                         [mock.call("amb_deferred", 1)] * 8)
+
+    def test_default_logs_one_count_line_per_ten_deferrals(self):
+        bc = self._bc()
+        log = self._drive(bc, [(True, n, 0.0) for n in range(11, 23)])
+        self.assertEqual(log.count("yielded to the owner's turn"), 2)
+        self.assertIn("11 batch(es) deferred, 5 dropped", log)
+
+    def test_parked_batch_never_nudges_a_wake(self):
+        import re
+        bc = self._bc()
+        bc._sleep_mode = [False]
+        bc._standby_mode = [True]          # the one state that nudges
+        bc.proactive_announce = mock.MagicMock()
+        bc.transcribe.side_effect = (
+            lambda a: (f"hey jarvis, line {self._n(a)}", _good_conf()))
+        self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
+        self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = 0.0
+        self._drive(bc, [(True, 11, 0.0), (False, None, 4.0)])
+        self.assertEqual([e["text"] for e in self.mod._buffer],
+                         ["hey jarvis, line 11"])
+        bc.proactive_announce.assert_not_called()
+        # The same words in a live batch still nudge.
+        self._drive(bc, [(False, 12, 5.0)])
+        bc.proactive_announce.assert_called_once()
+
+    def test_stale_owner_flag_never_silences_ambient(self):
+        bc = self._bc()
+        cap = self.mod.AMBIENT_YIELD_MAX_DEFER_S
+        self.assertEqual(cap, 15)
+        log = self._drive(bc, [(True, 11, 0.0), (True, 12, 10.0),
+                               (True, 13, cap + 1.0), (True, 14, cap + 4.0)])
+        # Parked while the flag was fresh; past the cap everything is
+        # transcribed, oldest first, although the flag never cleared.
+        self.assertEqual(self.calls_at, [0, 0, 0, 3])
+        self.assertEqual(self._heard(bc), [11, 12, 13, 14])
+        self.assertEqual(log.count("transcribing anyway"), 1)
+
+    # ── flag off ─────────────────────────────────────────────────────────
+    def _call_sequence(self, flag):
+        """Every host + helper call one flag-off run makes, in order, with
+        arrays reduced to their batch number and dicts to their text."""
+        bc = self._bc(flag=flag)
+        bc._tt_note_stat = mock.MagicMock()
+        rec = mock.MagicMock()
+        for name in ("transcribe", "is_ambient_music", "is_valid_speech"):
+            rec.attach_mock(getattr(bc, name), name)
+        spies = []
+        for name in ("_dialogue_holds_batches", "_apply_audio_processing",
+                     "_device_speech_batch_source", "_identify_speaker_safe",
+                     "_persist_state", "_append_jsonl", "_maybe_nudge_wake"):
+            p = mock.patch.object(self.mod, name,
+                                  wraps=getattr(self.mod, name))
+            spies.append(p)
+        # Flag off builds no yield and never reads its clock (create=True
+        # lets this same test run against the pre-flag code).
+        never = (mock.patch.object(self.mod, "_SttYield", create=True,
+                                   side_effect=AssertionError("built")),
+                 mock.patch.object(self.mod, "_yield_mono", create=True,
+                                   side_effect=AssertionError("clock")))
+
+        def _norm(v):
+            if isinstance(v, np.ndarray):
+                return ("batch", self._n(v))
+            if isinstance(v, dict):
+                return ("row", v.get("text"))
+            return v
+
+        with contextlib.ExitStack() as st:
+            mocks = [st.enter_context(p) for p in spies]
+            for p, m in zip(spies, mocks):
+                rec.attach_mock(m, p.attribute)
+            # The owner is speaking throughout.
+            self._drive(bc, [(True, 11, 0.0), (True, 12, 30.0)], extra=never)
+        self.assertIsNone(self.mod._last_error)
+        bc._tt_note_stat.assert_not_called()
+        seq = [(c[0], tuple(_norm(a) for a in c[1]),
+                tuple(sorted((k, _norm(v)) for k, v in c[2].items())))
+               for c in rec.mock_calls]
+        return seq, [e["text"] for e in self.mod._buffer]
+
+    def test_flag_off_makes_exactly_todays_calls(self):
+        absent, kept_absent = self._call_sequence(flag=None)
+        self.mod._buffer.clear()
+        os.unlink(self.mod._AUDIO_JSONL)
+        off, kept_off = self._call_sequence(flag=False)
+        self.assertEqual(off, absent)
+        self.assertEqual(kept_off, kept_absent)
+        self.assertEqual(kept_off, ["line 11", "line 12"])
+        per_batch = ["_dialogue_holds_batches", "_apply_audio_processing",
+                     "transcribe", "_device_speech_batch_source",
+                     "is_ambient_music", "is_valid_speech",
+                     "_identify_speaker_safe", "_persist_state",
+                     "_append_jsonl", "_maybe_nudge_wake"]
+        self.assertEqual([c[0] for c in off], per_batch * 2)
+        self.assertEqual(off[3], ("_device_speech_batch_source",
+                                  ("line 11",), ()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -318,6 +318,12 @@ def model_route(function: str) -> str:
 #   the local VLM for ambient context. False by default (privacy).
 AMBIENT_LISTEN_ENABLED = False
 AMBIENT_SCREEN_ENABLED = False
+# AMBIENT_STT_YIELD — the ambient mic and system-audio daemons hold a batch
+#   back (instead of transcribing it) while you are speaking to JARVIS, so
+#   they never make your own transcription wait behind them; held batches are
+#   transcribed and kept, in order, once your sentence is done. False by
+#   default. Set via user_settings.json; applies on the next daemon start.
+AMBIENT_STT_YIELD = False
 
 # CHAPPIE_ENABLED — autostart the continuous self-learning daemon
 #   (skills/chappie_consciousness.py). False by default because the daemon
