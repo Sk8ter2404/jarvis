@@ -1012,7 +1012,10 @@ SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
 #                     'on'     a failed turn at or above the checker's bar is
 #                              retried ONCE on Claude, after "One moment,
 #                              sir.", when the cloud is allowed for chat
-#                              (backend claude, a key, chat not routed local).
+#                              (backend claude, a key, chat not routed local)
+#                              and the model is not one Anthropic already
+#                              answered not_found for this session (then its
+#                              CLAUDE_MODEL_SUCCESSORS entry, or no retry).
 #                     Any other value reads as 'shadow'.
 #   TURN_CHECK_ESCALATE_MODEL  the Claude model that retry runs on.
 # Set via user_settings.json; applies on the next start.

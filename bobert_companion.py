@@ -16473,6 +16473,9 @@ _TURN_FLAG_KEYS = (
     "SENTENCE_TTS_ENABLED", "FAST_PATHS_ENABLED",
     # 'on' adds a cloud retry to a failed turn (_turn_check_after_chain).
     "TURN_CHECK_MODE",
+    # 'on' answers a basic command with no LLM call (_instant_action_for):
+    # the biggest per-turn latency switch of the 2026-10-02 batch.
+    "INSTANT_ACTIONS_MODE",
     # Reserved for later batches (absent until they ship):
     "AMBIENT_STT_YIELD", "PROCESSING_FILLER_PRERENDER",
     "PROCESSING_FILLER_LATE_START_S", "PROCESSING_FILLER_SKIP_PLEASANTRIES",
@@ -42210,8 +42213,32 @@ def _turn_check_retry_note(verdict) -> str:
             "say so plainly.)")
 
 
-def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0) -> str:
-    """'on' mode: retry this turn ONCE on Claude (TURN_CHECK_ESCALATE_MODEL).
+def _turn_check_escalate_target() -> tuple:
+    """(configured, use) for a turn-check retry. ``configured`` is
+    TURN_CHECK_ESCALATE_MODEL (blank = CLAUDE_MODEL); ``use`` is the model the
+    call would really go to: the same one, its CLAUDE_MODEL_SUCCESSORS entry
+    once Anthropic answered not_found for it this session, or None when it is
+    known to be gone with no usable successor. core.llm_client would then
+    raise RetiredModelError without a network call, so a retry could only say
+    ONE_MOMENT_LINE and then nothing - on every failed turn (2026-10-02
+    integration audit: the turn checker x the retired-model guard). One rule,
+    the guard's own (_guarded_model). Never raises; doubt = the configured
+    model, exactly as before the guard."""
+    model = (str(globals().get("TURN_CHECK_ESCALATE_MODEL") or "").strip()
+             or CLAUDE_MODEL)
+    try:
+        from core import llm_client as _lc
+        return model, _lc._guarded_model(model, "the turn checker's retry")
+    except _RetiredModelError:
+        return model, None
+    except Exception:
+        return model, model
+
+
+def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
+                         model=None) -> str:
+    """'on' mode: retry this turn ONCE on Claude (TURN_CHECK_ESCALATE_MODEL,
+    or ``model``: the guard-resolved one _turn_check_judge picked).
 
     Speaks ONE_MOMENT_LINE, sends the stable system prompt plus a note
     naming the failure and the history up to this turn's user message (the
@@ -42222,18 +42249,22 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0) -> str:
     ONE get_followup_response, whose own [ACTION:] tokens are not run. A
     failed or empty cloud call prints a line and stops: the local reply was
     already spoken. Returns the outcome for the row."""
-    model = str(globals().get("TURN_CHECK_ESCALATE_MODEL") or "").strip() \
-        or CLAUDE_MODEL
+    model = (str(model or "").strip()
+             or str(globals().get("TURN_CHECK_ESCALATE_MODEL") or "").strip()
+             or CLAUDE_MODEL)
     _turn_check_tls.escalating = True
     try:
-        _speak(_turn_checker.ONE_MOMENT_LINE)
-        set_state("thinking")
-        _heartbeat()
+        # Found BEFORE "One moment, sir.": with nothing to retry, the line
+        # would promise a retry that never comes (2026-10-02 integration
+        # audit, the same broken-promise shape as a retired model).
         msgs = _turn_check_retry_messages(user_text)
         if not msgs:
             print("  [turn-check] this turn is no longer in the history - "
                   "not retrying")
             return "no-history"
+        _speak(_turn_checker.ONE_MOMENT_LINE)
+        set_state("thinking")
+        _heartbeat()
         system = _cached_system_param(_system_prompt
                                       + _turn_check_retry_note(verdict))
         retry = _claude_oneshot(system, _self_knowledge_for_cloud(msgs),
@@ -42351,18 +42382,29 @@ def _turn_check_judge(mode, user_text, chain_texts, chain_results,
         already_escalated=bool(getattr(_turn_check_tls, "escalating", False)),
         needs_confirmation=needs_confirmation)
     escalate = mode == "on" and would
+    # The retry's model, as the retired-model guard resolves it: one the
+    # guard knows is gone (no successor) is never retried - "One moment,
+    # sir." would be followed by nothing (see _turn_check_escalate_target).
+    configured, use = (_turn_check_escalate_target() if escalate
+                       else ("", None))
+    gone = configured if escalate and use is None else ""
+    if gone:
+        escalate = False
     row = {"ts": round(time.time(), 3), "mode": mode, "kind": verdict.kind,
            "confidence": round(float(verdict.confidence), 2),
            "would_escalate": bool(would), "cloud_allowed": cloud_allowed,
            "needs_confirmation": needs_confirmation, "escalated": False,
            "emitted": _turn_check_names(emitted),
            "ran": _turn_check_names(ran)}
+    if gone:
+        row["retry"] = "retired"
     try:
         if verdict.kind != _turn_checker.OK:
             if escalate:
-                model = (str(globals().get("TURN_CHECK_ESCALATE_MODEL")
-                             or "").strip() or CLAUDE_MODEL)
-                why = f"escalating to {model}"
+                why = f"escalating to {use}"
+            elif gone:
+                why = (f"not escalated: {gone} is retired (Anthropic answered "
+                       f"not_found this session)")
             elif would:
                 why = "would escalate"
             elif verdict.confidence < _turn_checker.ESCALATE_MIN_CONFIDENCE:
@@ -42383,7 +42425,8 @@ def _turn_check_judge(mode, user_text, chain_texts, chain_results,
                                                 if close_line else [])
             try:
                 row["retry"] = _turn_check_escalate(user_text, verdict,
-                                                    failed, barge_seq0)
+                                                    failed, barge_seq0,
+                                                    model=use)
             except Exception as e:
                 print(f"  [turn-check] the retry failed - "
                       f"{type(e).__name__}: {str(e)[:120]}; the local reply "
