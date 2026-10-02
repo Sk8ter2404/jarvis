@@ -25200,6 +25200,11 @@ APPLE_MUSIC_TAB_PRE_WAIT    = 1.2   # gap after load before first Tab (search in
 APPLE_MUSIC_TAB_COUNT       = 6     # Tabs to reach the first result (LIVE-TUNE)
 APPLE_MUSIC_TAB_INTERVAL    = 0.18  # delay between Tabs
 APPLE_MUSIC_TAB_POST_WAIT   = 0.6   # gap after the last Tab before Enter
+# Playlist page play trigger, by keyboard (_streaming_find_text_and_activate):
+# the visible label of the button pressed on a playlist's own page. "Shuffle",
+# not "Play": Chrome's find matches substrings, and "Play" hits the sidebar's
+# "Playlists" link first.
+APPLE_MUSIC_PLAYLIST_PLAY_TEXT = "Shuffle"
 
 _STREAMING_SERVICES = {
     "netflix": {
@@ -25829,6 +25834,13 @@ def _streaming_apply_play_strategy(
             return False, "no remembered result coords to double-click"
         ui_double_click(result_coords[0], result_coords[1])
         return True, f"double-clicked first result at {result_coords}"
+    if strategy == "find_text_play":
+        # Keyboard, no vision: press the page's labelled play button (an
+        # Apple Music playlist's "Shuffle") through the browser's find bar.
+        label = cfg.get("keyboard_play_text") or ""
+        if not _streaming_find_text_and_activate(cfg, label):
+            return False, f"couldn't press '{label}' by keyboard"
+        return True, f"pressed '{label}' by keyboard (find + Enter)"
     if strategy == "space":
         # music.apple.com toggles play/pause on SPACE. Focus the music
         # window first so the keypress lands on the right browser window
@@ -26063,6 +26075,65 @@ def _streaming_keyboard_select_first_result(
         f"({tab_count} tabs + enter)",
         flush=True,
     )
+    return True
+
+
+def _window_title_for_hwnd(hwnd) -> str:
+    """Title of the window `hwnd`, or '' (bad handle / no win32). Never raises."""
+    try:
+        import win32gui
+        return win32gui.GetWindowText(int(hwnd)) or ""
+    except Exception:
+        return ""
+
+
+def _media_window_has_focus(hwnd) -> bool:
+    """True only while `hwnd` is the foreground window. Never raises."""
+    try:
+        return bool(hwnd) and _read_focused_window()[0] == hwnd
+    except Exception:
+        return False
+
+
+def _streaming_find_text_and_activate(cfg: dict, text: str) -> bool:
+    """Press the link or button that shows `text` on the page in JARVIS's own
+    media window, by keyboard: Ctrl+F and the text (the browser's find bar
+    selects the first match), Esc (closing the find bar moves focus to the
+    link or button that holds the match), Enter (follows / presses it). No
+    screenshot, no coordinates, no Tab count to tune. Enter, never Space:
+    Space on an unfocused page toggles the player's OLD queue.
+
+    Types only into the window JARVIS opened (the recorded hwnd), and re-checks
+    that it is still the foreground window before EVERY key, so a window the
+    owner clicks into mid-sequence never gets the text or the Enter. Returns
+    True when the whole sequence went to that window. UIFailsafeError
+    propagates (2026-10-02, owner request: "use keyboard navigation or direct
+    playlist links" instead of screen clicks)."""
+    if not UI_AUTOMATION_ENABLED:
+        return False
+    text = (text or "").strip()
+    if not text or not text.isascii() or not text.isprintable():
+        return False   # pyautogui.write cannot type it faithfully
+    hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(cfg.get("service_key"))
+    if not hwnd or not _focus_window_hwnd(hwnd):
+        return False
+    time.sleep(0.15)
+    steps = (
+        (lambda: ui_hotkey("ctrl", "f"), 0.4),
+        (lambda: ui_type(text), 0.6),      # let the find bar settle on a match
+        (lambda: ui_press("esc"), 0.3),
+        (lambda: ui_press("enter"), 0.0),
+    )
+    for send, settle in steps:
+        if not _media_window_has_focus(hwnd):
+            print("  [auto-play] keyboard: the media window lost focus - "
+                  "stopped before typing into another window", flush=True)
+            return False
+        send()
+        if settle:
+            time.sleep(settle)
+    print(f"  [auto-play] keyboard: found '{text}' on the page and pressed "
+          f"Enter on it", flush=True)
     return True
 
 
@@ -26548,20 +26619,96 @@ def _looks_like_playlist_request(q: str) -> tuple[bool, str]:
     return False, s
 
 
+def _norm_playlist_text(s: str) -> str:
+    """Lowercase, invisible marks and NBSP gone, smart quotes folded and
+    apostrophes DROPPED (a spoken 'taylors mix' is the stored "Taylor’s Mix"),
+    whitespace collapsed. For comparing a playlist name with a config key or a
+    window title."""
+    s = _strip_bidi_and_nbsp(s or "").lower()
+    for a in ("’", "‘", "ʼ", "'"):
+        s = s.replace(a, "")
+    return " ".join(s.split())
+
+
+def _apple_music_playlist_link(name: str) -> str | None:
+    """The owner's direct link for playlist `name` from
+    APPLE_MUSIC_PLAYLIST_LINKS ({name: url}), or None. Only an
+    https://music.apple.com/ link is used: the media-window handling (tab
+    titles, the reuse-one-window close) assumes the Apple Music web player."""
+    want = _norm_playlist_text(name)
+    try:
+        links = dict(APPLE_MUSIC_PLAYLIST_LINKS or {})
+    except Exception:
+        return None
+    for key, url in links.items():
+        if _norm_playlist_text(str(key)) != want:
+            continue
+        u = str(url or "").strip()
+        if u.startswith("https://music.apple.com/"):
+            return u
+        print(f"  [auto-play] APPLE_MUSIC_PLAYLIST_LINKS['{key}'] is not a "
+              f"https://music.apple.com/ link - ignored", flush=True)
+    return None
+
+
+def _apple_music_keyboard_open_playlist(cfg: dict, name: str) -> bool:
+    """Open playlist `name` from the page in JARVIS's media window by keyboard:
+    find its name (the sidebar lists every playlist as a link, and so does the
+    Library > Playlists grid), Esc, Enter. True only when the window's title
+    then CHANGED to one that names the playlist; otherwise the caller goes on
+    to the vision route."""
+    hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(cfg.get("service_key"))
+    if not hwnd:
+        return False
+    before = _window_title_for_hwnd(hwnd)
+    if not _streaming_find_text_and_activate(cfg, name):
+        return False
+    want = _norm_playlist_text(name)
+    title = before
+    for _ in range(3):
+        time.sleep(1.0)
+        title = _window_title_for_hwnd(hwnd)
+        if title != before and want in _norm_playlist_text(title):
+            print(f"  [auto-play] keyboard opened playlist '{name}' "
+                  f"(tab: {title[:70]!r})", flush=True)
+            return True
+    print(f"  [auto-play] keyboard open of '{name}' not confirmed (tab: "
+          f"{title[:70]!r}) - trying vision", flush=True)
+    return False
+
+
 def _apple_music_play_playlist(name: str) -> str:
-    """Navigate Apple Music's Library > Playlists directly, locate the named
-    playlist via vision, open it, click Play/Shuffle, and verify playback.
-    Unlike the search-based flow, this jumps straight to the saved-playlists
-    view so JARVIS never scrolls aimlessly through search results."""
+    """Play the owner's playlist `name` on the Apple Music web player, without
+    screen vision wherever possible (owner request 2026-06-03, done
+    2026-10-02):
+
+      1. a direct link from APPLE_MUSIC_PLAYLIST_LINKS opens the playlist's
+         own page; otherwise Library > Playlists opens and the playlist is
+         opened by KEYBOARD (find its name, Esc, Enter);
+      2. its "Shuffle" button is pressed by keyboard the same way;
+      3. playback is confirmed (tab title, vision only as the fallback).
+
+    Vision is the LAST fallback at each step: the playlist tile (with the
+    sidebar Library > Playlists clicks) and the large Play/Shuffle button."""
     # Work on a COPY (never mutate the shared _STREAMING_SERVICES template) and
     # disable verify_first: we just navigated to a FRESH Library>Playlists view,
     # so nothing is "already playing" here. Without this, a STALE Apple Music
     # window left from a prior track satisfies the tab-title pre-check and
     # _streaming_play_and_verify skips the real play step, reporting a false
     # success. Mirrors the search flow's per-call cfg copy.
+    # Play order: the keyboard press, a re-check (pressing Shuffle again would
+    # restart the playlist while the confirm catches up), then vision. No
+    # "space": on a fresh page it toggles whatever queue the player restored,
+    # and the title-confirm would pass that off as this playlist.
     cfg = {**_STREAMING_SERVICES["apple_music"], "verify_first": False,
-           "service_key": "apple_music"}
+           "service_key": "apple_music",
+           "keyboard_play_text": APPLE_MUSIC_PLAYLIST_PLAY_TEXT,
+           "play_strategies": ["find_text_play", "recheck", "play_button"]}
     service_label = "Apple Music"
+    vision_ok = bool(SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
+                     and _vision_click_backend_available())
+    if not vision_ok:
+        cfg["play_strategies"] = ["find_text_play", "recheck"]
 
     # Step 1: open Library > Playlists directly. Skips the sidebar clicks
     # when possible; sidebar fallback covers the case where Apple Music
@@ -26577,18 +26724,21 @@ def _apple_music_play_playlist(name: str) -> str:
     # 'f' into the wrong window. Mirror the search flow: close only the window
     # JARVIS opened last time, then record the freshly-opened one.
     library_url = "https://music.apple.com/library/playlists"
+    direct_url = _apple_music_playlist_link(name)
     service_key = cfg["service_key"]
     _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(service_key)
     # Only a window that did not exist before the open can be the one JARVIS
     # opened (2026-10-01, see _find_browser_window_matching).
     _before = _window_handles_snapshot()
     _open_url_in_browser(
-        library_url,
+        direct_url or library_url,
         close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
         close_hwnd=_prior_hwnd,
     )
     print(
-        f"  [auto-play] opened Apple Music Library > Playlists for '{name}'",
+        f"  [auto-play] opened "
+        f"{'the direct link' if direct_url else 'Apple Music Library > Playlists'}"
+        f" for '{name}'",
         flush=True,
     )
     time.sleep(cfg["load_wait"])
@@ -26601,8 +26751,26 @@ def _apple_music_play_playlist(name: str) -> str:
     _adopt_media_window(cfg, service_key, _before)
     _vm = cfg.get("vision_monitor")
 
-    if not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
-            and _vision_click_backend_available()):
+    # Step 2a: already on the playlist's own page (direct link) — straight to
+    # the play step; no tile to find.
+    if direct_url:
+        if not UI_AUTOMATION_ENABLED:
+            return (
+                f"opened your '{name}' playlist on Apple Music, but I couldn't "
+                f"start playback — auto-play needs UI automation (keyboard "
+                f"control)"
+            )
+        return _streaming_play_and_verify(cfg, service_label, name)
+
+    # Step 2b: open the playlist by keyboard from the Library > Playlists page.
+    try:
+        opened = _apple_music_keyboard_open_playlist(cfg, name)
+    except UIFailsafeError as e:
+        return f"couldn't open playlist '{name}' on Apple Music — {e}"
+    if opened:
+        return _streaming_play_and_verify(cfg, service_label, name)
+
+    if not vision_ok:
         return (
             f"opened Apple Music Library > Playlists, but I couldn't start the "
             f"playlist — auto-click needs SCREEN_VISION_ENABLED + "
@@ -26610,9 +26778,9 @@ def _apple_music_play_playlist(name: str) -> str:
             f"vision model)"
         )
 
-    # Step 2: locate the named playlist tile. If the direct URL didn't land
-    # us on the playlists view, fall back to clicking 'Library' then
-    # 'Playlists' in the sidebar before retrying.
+    # Step 2c (vision, the last fallback): locate the named playlist tile. If
+    # the direct URL didn't land us on the playlists view, fall back to
+    # clicking 'Library' then 'Playlists' in the sidebar before retrying.
     playlist_hint = (
         f"the playlist tile, row, or card labelled '{name}' (or a close "
         f"textual match) inside the Apple Music playlists list — pick the "

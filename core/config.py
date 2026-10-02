@@ -1634,6 +1634,15 @@ ITUNES_AUTO_LAUNCH = False
 APPLE_MUSIC_AUTOSTART = False
 APPLE_MUSIC_KEEP_OPEN = False
 
+# APPLE_MUSIC_PLAYLIST_LINKS — direct links for "play my X playlist", as
+# {"playlist name": "https://music.apple.com/..."}: the playlist page's address
+# (https://music.apple.com/library/playlist/p.XXXX) or its Share > Copy Link.
+# A named playlist opens straight on its own page, so nothing has to find its
+# tile on screen first. Names match case- and apostrophe-insensitively; only
+# https://music.apple.com/ links are used. Empty = the Library > Playlists
+# route (keyboard first, vision last).
+APPLE_MUSIC_PLAYLIST_LINKS: dict = {}
+
 
 # ─── Overnight self-improvement engine ─────────────────────────────────
 # OVERNIGHT_UPGRADE_ENABLED = True means the background thread polls
