@@ -282,10 +282,23 @@ STRESS_RMS_THRESHOLD: float = 0.08     # peak RMS over the recent window
 # small and unambiguous — false positives are worse than misses because the
 # brisk_alert preset is conspicuously different from a normal reply.
 _EMERGENCY_KEYWORDS: tuple[str, ...] = (
-    "fuck", "shit", "help",
+    "fuck", "shit",
 )
 _EMERGENCY_KEYWORD_RE = re.compile(
     r"\b(" + "|".join(re.escape(w) for w in _EMERGENCY_KEYWORDS) + r")\b",
+    re.IGNORECASE,
+)
+
+# 'help' used to be a bare keyword above, so every routine request ("can you
+# help me find that file", "help me draft an email") came out brisk_alert
+# (audit A90). It now counts only as a CRY for help: repeated ("help help",
+# "help! help!"), "help (me) (right) now", or shouted at the start of a clause
+# ("Help!", "Help me!", "Jarvis, help!", "somebody help!").
+_HELP_CRY_RE = re.compile(
+    r"\bhelp[\s,.!?]+help\b"
+    r"|\bhelp\s+(?:me\s+)?(?:right\s+)?now\b"
+    r"|(?:^\s*|[,.;:!?]\s*|\b(?:somebody|someone|anybody|anyone|please)\s+)"
+    r"help(?:\s+me)?\s*!",
     re.IGNORECASE,
 )
 
@@ -371,14 +384,17 @@ def detect_stress_from_rms(
 
 
 def detect_emergency_keywords(user_text: Optional[str]) -> bool:
-    """True when `user_text` contains an emergency keyword as a whole word.
+    """True when `user_text` contains an emergency keyword as a whole word,
+    or a cry for help (_HELP_CRY_RE). A bare 'help' in a request is not one.
 
     Anchored on word boundaries so 'helpful' does not trip 'help' and a
     chat about /shittake mushrooms/ doesn't trip 'shit'.
     """
     if not user_text:
         return False
-    return _EMERGENCY_KEYWORD_RE.search(str(user_text)) is not None
+    text = str(user_text)
+    return (_EMERGENCY_KEYWORD_RE.search(text) is not None
+            or _HELP_CRY_RE.search(text) is not None)
 
 
 def detect_context_preset(

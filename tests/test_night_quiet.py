@@ -320,10 +320,11 @@ class HushedLatePresetTests(_NoStateFile):
         self.assertEqual((name, preset["gain"]), ("neutral", 1.0))
 
     def test_off_still_lets_an_emergency_word_through(self):
-        # Not a night rule: brisk_alert for 'help' is clock-independent.
+        # Not a night rule: brisk_alert for a cry for help is clock-independent
+        # (a bare 'help' is no emergency at any hour, audit A90).
         with _quiet(False):
             self.assertEqual(tts.detect_context_preset(
-                "help", peak_rms=0.0, now=LATE, state_path=self.state),
+                "help me now", peak_rms=0.0, now=LATE, state_path=self.state),
                 "brisk_alert")
 
 

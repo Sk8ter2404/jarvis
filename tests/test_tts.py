@@ -170,6 +170,46 @@ class EmergencyKeywordTests(unittest.TestCase):
         self.assertFalse(tts.detect_emergency_keywords(""))
 
 
+class BareHelpIsNotAnEmergencyTests(unittest.TestCase):
+    """Audit A90: 'help' sat in _EMERGENCY_KEYWORDS as a bare word, so every
+    routine request ("can you help me find that file") forced brisk_alert, the
+    most intrusive preset (+15% rate, +7Hz, gain 1.10). Only a cry for help
+    (shouted, repeated, or "help me now") is an emergency; profanity is
+    unchanged."""
+
+    DAY = datetime.datetime(2026, 5, 31, 12, 0, 0)
+    NO_STATE = "C:/__jv_no_anticipation__.json"
+
+    def _ctx(self, text):
+        return tts.detect_context_preset(text, peak_rms=0.0, now=self.DAY,
+                                         state_path=self.NO_STATE)
+
+    def test_routine_help_requests_get_no_context_preset(self):
+        for text in ("help", "Help.", "help me draft an email",
+                     "can you help me find that file",
+                     "I need help with my homework", "please help",
+                     "what does help do", "thanks for the help!",
+                     "can you help me with this, please?"):
+            with self.subTest(text=text):
+                self.assertFalse(tts.detect_emergency_keywords(text))
+                self.assertIsNone(self._ctx(text))
+
+    def test_routine_help_request_keeps_the_normal_preset(self):
+        name, _preset = tts.resolve_tts_preset(
+            "Very good, sir.", None, user_text="help me draft an email",
+            peak_rms=0.0, now=self.DAY, state_path=self.NO_STATE)
+        self.assertEqual(name, "confirmation")
+
+    def test_a_cry_for_help_is_still_an_emergency(self):
+        for text in ("help me now", "Help!", "help!", "Help me!",
+                     "somebody help!", "help help", "help, help!",
+                     "help! help!", "Jarvis, help!", "help me right now",
+                     "shit", "oh fuck"):
+            with self.subTest(text=text):
+                self.assertTrue(tts.detect_emergency_keywords(text))
+                self.assertEqual(self._ctx(text), "brisk_alert")
+
+
 class RenderCacheTests(unittest.TestCase):
     def setUp(self):
         tts.tts_cache_clear()
