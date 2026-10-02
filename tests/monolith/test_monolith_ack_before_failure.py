@@ -169,15 +169,16 @@ class FollowupRoundTests(_AckBase):
         self.assertNotIn(_ACK, self.spoken)
         self.assertEqual(self.spoken[-1], _FOLLOWUP)
 
-    def test_followup_ack_is_kept_when_nothing_would_report_it(self):
-        # The same (action, result) already failed this chain, so the loop
-        # stops after this round: dropping the acknowledgement would leave
-        # the round silent. It is spoken as before - and since the failure
-        # was never reported, the honest close-out (NEW #6) now says so.
+    def test_followup_ack_is_dropped_when_the_repeat_stop_reports_it(self):
+        # The same action already failed this chain, so the loop stops after
+        # this round (2026-10-02: keyed on the action name) and the honest
+        # close-out reports the failure. The acknowledgement in front of the
+        # failed retry is not spoken: "Right away, sir." followed by "I'm
+        # afraid I couldn't finish that one" contradicted itself.
         self.followup.side_effect = [
             f"{_ACK} [ACTION: rover_explore, 60]", _FOLLOWUP, ""]
         self._run(f"[ACTION: rover_explore, 60] {_ACK}")
-        self.assertEqual(self.spoken, [_ACK, self.bc._CLOSE_OUT_GENERIC])
+        self.assertEqual(self.spoken, [self.bc._CLOSE_OUT_GENERIC])
 
 
 class StreamedAckTests(_AckBase):

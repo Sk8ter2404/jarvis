@@ -776,10 +776,12 @@ class RunLlmDispatchTests(SectionSevenBase):
         # Exactly one follow-up round for the failing action (retry), then stop.
         self.assertEqual(gfr.call_count, 1)
 
-    def test_failed_action_different_result_keeps_chain_alive(self):
+    def test_a_failing_action_gets_one_retry_then_the_chain_stops(self):
         # A failing action retried with a DIFFERENT argument (→ different
-        # result text) is a new approach, not a stuck loop — the chain must
-        # continue until an identical (action, result) repeat shows up.
+        # result text) gets one follow-up round; when the same action fails
+        # again the chain stops (2026-10-02: keyed on the action NAME - live,
+        # close_window / see_screen with a new argument every round ran to
+        # the depth cap, no (action, result) pair ever repeating).
         self._p(self.bc, "maybe_glance_response", return_value=None)
         self._p(self.bc, "get_response_with_animation",
                 return_value="[ACTION: click, the bookmark]")
@@ -791,9 +793,9 @@ class RunLlmDispatchTests(SectionSevenBase):
         ])
         gfr = self._p(self.bc, "get_followup_response", return_value="Trying another way, sir.")
         self.bc._run_llm_dispatch("click my bookmark")
-        # Round 1: first failure → follow-up (new approach). Round 2: new
-        # result → follow-up again. Round 3: identical repeat → stop.
-        self.assertEqual(gfr.call_count, 2)
+        # Round 1: first failure → follow-up (new approach). Round 2: click
+        # failed again, with a new result → stop.
+        self.assertEqual(gfr.call_count, 1)
 
     def test_followup_depth_falls_back_on_import_error(self):
         # If core.mode_router.followup_loop_depth import fails, depth falls

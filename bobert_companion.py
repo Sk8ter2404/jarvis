@@ -35229,6 +35229,11 @@ def _once_per_turn_refusal(name, arg, ran_before, ran_here) -> str:
 _CLOSE_OUT_WEB = ("I'm afraid I couldn't get a proper answer out of that, "
                   "sir — it's still open in your browser.")
 _CLOSE_OUT_GENERIC = "I'm afraid I couldn't finish that one, sir."
+# The follow-up loop's cut when the same action fails in a second round
+# (2026-10-02). Unlike the other cuts, that last failure was never reported -
+# the chain stops before the round that would read it back - so the close-out
+# is spoken even when earlier rounds said something of substance.
+_CUT_REPEATED_FAILURE = "repeating failure"
 
 
 def _says_something(text) -> bool:
@@ -35243,10 +35248,14 @@ def _says_something(text) -> bool:
 def _chain_close_out_line(*, cut: str, rounds: int, spoke_substance: bool,
                           barged: bool) -> str:
     """The close-out line for a follow-up chain that a guard stopped before
-    it told the owner anything, or "" (see the section comment). Never
-    raises."""
+    it told the owner anything, or "" (see the section comment). A chain
+    stopped because the same action failed again (_CUT_REPEATED_FAILURE) gets
+    it even after something was said: that failure was never reported
+    (2026-10-02). Never raises."""
     try:
-        if barged or not cut or rounds < 1 or spoke_substance:
+        if barged or not cut or rounds < 1:
+            return ""
+        if spoke_substance and cut != _CUT_REPEATED_FAILURE:
             return ""
         if any(_once_per_turn_kind(n) for n in _turn_actions_ran()):
             return _CLOSE_OUT_WEB
@@ -42765,10 +42774,12 @@ def _run_llm_dispatch_body(text: str) -> str:
 
     current_results = action_results
     _chain_seen: set[str] = set()   # loop-break: actions already fired this chain
-    # (action, result) pairs that already failed once this chain — see below.
-    _failed_seen: set[tuple[str, str]] = set()
+    # Action NAMES that already failed in an earlier round of this chain -
+    # see the failure-repeat break below.
+    _failed_seen: set[str] = set()
     # Every informative (name, result) pair seen this chain — successes too.
-    # Mirrors _failed_seen so a chain that keeps re-reporting the SAME
+    # The success-side sibling of _failed_seen (kept on PAIRS: a success with
+    # new content is progress) so a chain that keeps re-reporting the SAME
     # successful result (no new pair in a whole round) breaks instead of
     # looping to the depth cap. 2026-07-08.
     _info_seen: set[tuple[str, str]] = set()
@@ -42822,24 +42833,26 @@ def _run_llm_dispatch_body(text: str) -> str:
         ]
         if not informative:
             break
-        # Break the re-prompt loop when a failing action is repeating WITH
-        # THE SAME RESULT. Re-prompting the LLM on an identically-failing
-        # action just burns 1–3 s LLM round-trips with no progress (the
-        # 2026-05-30 audit's multi-second voice stall). But keying this on
-        # the action NAME alone (the old behaviour) also killed the chain
-        # when the LLM tried a genuinely DIFFERENT approach with the same
-        # action — e.g. click 'bookmarks toolbar item' after click 'the
-        # bookmark' failed — which is why JARVIS gave up after ~3 steps on
-        # simple UI tasks. Key on (action, result): an identical repeat is
-        # no-progress → stop; a different argument/error is new information
-        # → let the chain keep working (still bounded by _max_followup).
-        _failing_now = {(n, r) for (n, r) in informative if _is_failure(r)}
+        # Break the re-prompt loop when an action FAILS AGAIN. Re-prompting the
+        # LLM on a failing action burns 1–3 s LLM round-trips with no
+        # progress (the 2026-05-30 audit's multi-second voice stall). From
+        # 2026-07 this was keyed on (action, result) so a genuinely different
+        # approach with the same action could keep trying - but live
+        # 2026-10-02 12:00:18-12:01:04 that let close_window / see_screen /
+        # close_window / see_screen ... run to the depth cap, every failure
+        # with a NEW argument and error ("no window matching 'taskmgr.exe'",
+        # "could not close", "no window matching 'Task Manager | left'"), so
+        # none ever counted as a repeat. Keyed on the action NAME: one retry
+        # with a different approach still runs, and the second round in
+        # which the same action fails stops the chain; the honest close-out
+        # below then says so once (_chain_close_out_line: the attempt that
+        # failed again was never reported). Still bounded by _max_followup.
+        _failing_now = {n for (n, r) in informative if _is_failure(r)}
         _failing_repeat = _failing_now & _failed_seen
         if _failing_repeat:
-            print(f"  [follow-up] action(s) failing repeatedly with the same "
-                  f"result ({', '.join(sorted(n for n, _ in _failing_repeat))})"
-                  f" — stopping")
-            _chain_cut = "repeating failure"
+            print(f"  [follow-up] {', '.join(sorted(_failing_repeat))} failed "
+                  f"again this chain — stopping")
+            _chain_cut = _CUT_REPEATED_FAILURE
             break
         _failed_seen |= _failing_now
         # SUCCESS-repeat break (mirror of the failure-repeat break above): if a
@@ -42895,13 +42908,13 @@ def _run_llm_dispatch_body(text: str) -> str:
         _after_reply_note(current_results)
         if not current_results:
             f_spoken = _strip_ack_preface(f_spoken, text)
-        elif (depth + 1 < _max_followup and not (
-                {(n, r) for (n, r, _i) in current_results
-                 if not is_self_voiced(n) and _is_failure(r)}
-                & _failed_seen)):
-            # Same rule as the first reply, but only while the next round
-            # will still REPORT the failure: a pair already seen this chain
-            # stops the loop above, and then this line is all that is said.
+        elif depth + 1 < _max_followup:
+            # Same rule as the first reply, but only while something will
+            # still REPORT the failure: the next round, or - when this action
+            # already failed earlier in the chain - the repeat stop's honest
+            # close-out (2026-10-02; before, that "Certainly, sir." was the
+            # last thing said about an action that had just failed again).
+            # At the depth cap this line may be all that is said, so it stays.
             f_spoken, _ack_cut = _drop_ack_before_failure(f_spoken,
                                                           current_results)
             if _ack_cut:
