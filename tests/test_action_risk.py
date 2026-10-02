@@ -66,5 +66,78 @@ class SingleSourceTests(unittest.TestCase):
         self.assertEqual(ar.GUESS_PROTECTED_REASONS, cats - {ar.SENDS})
 
 
+class SelfTerminationTests(unittest.TestCase):
+    """Review 2026-10-02: a self-terminating action emitted by the model by
+    its EXACT name runs at once, with no confirmation - and an inherited
+    section or the cloud route's full prompt hands the model that name for
+    an ambiguous "Okay, turn it off.". It runs only when the owner's own
+    words ask for it (asked_for_self_termination); otherwise JARVIS asks."""
+
+    def test_the_set_is_every_shutdown_alias_restart_and_upgrade(self):
+        self.assertEqual(ar.SELF_TERMINATING_ACTIONS, frozenset({
+            "start_overnight_upgrade", "upgrade", "restart",
+            "shutdown_jarvis", "shut_down", "exit_jarvis", "quit_jarvis",
+            "power_off_jarvis", "turn_off_jarvis"}))
+        for name in ar.SELF_TERMINATING_ACTIONS:
+            self.assertTrue(ar.guess_protected(name), name)
+
+    def test_the_owner_asking_grounds_it(self):
+        for name, said in (
+                ("shutdown_jarvis", "Jarvis, shut down."),
+                ("shutdown_jarvis", "shut down now please"),
+                ("shutdown_jarvis", "Jarvis, turn yourself off."),
+                ("turn_off_jarvis", "turn off Jarvis"),
+                ("power_off_jarvis", "power off completely"),
+                ("exit_jarvis", "Jarvis, exit."),
+                ("quit_jarvis", "okay quit"),
+                ("shut_down", "go offline for the night"),
+                ("restart", "Jarvis, restart."),
+                ("restart", "restart yourself"),
+                ("restart", "reboot please"),
+                ("restart", "restart and upgrade"),
+                ("upgrade", "upgrade yourself"),
+                ("upgrade", "restart and upgrade"),
+                ("upgrade", "apply the changes"),
+                ("start_overnight_upgrade", "Goodnight, Jarvis."),
+                ("start_overnight_upgrade", "I'm off to bed"),
+                ("start_overnight_upgrade", "time to sleep"),
+                ("start_overnight_upgrade", "run overnight")):
+            with self.subTest(name=name, said=said):
+                self.assertTrue(ar.asked_for_self_termination(name, said))
+
+    def test_anything_else_does_not(self):
+        for name, said in (
+                ("shutdown_jarvis", "Okay, turn it off."),      # the incident
+                ("shutdown_jarvis", "Jarvis, turn it off."),
+                ("exit_jarvis", "turn it off"),
+                ("shutdown_jarvis", "shut down the PC"),
+                ("shutdown_jarvis", "shut it down"),
+                ("quit_jarvis", "quit Spotify"),
+                ("exit_jarvis", "exit full screen"),
+                ("restart", "Restart the router"),
+                ("restart", "Turn it off and on."),
+                ("restart", "restart Spotify"),
+                ("upgrade", "Yes, do that."),
+                ("upgrade", "upgrade the firmware"),
+                ("start_overnight_upgrade", "turn it off"),
+                ("shutdown_jarvis", ""),
+                ("shutdown_jarvis", None)):
+            with self.subTest(name=name, said=said):
+                self.assertFalse(ar.asked_for_self_termination(name, said))
+
+    def test_other_actions_are_not_this_gates_business(self):
+        for name in ("play_music", "close_window", "reset_memory", ""):
+            self.assertTrue(ar.asked_for_self_termination(name, "anything"))
+
+    def test_the_question_names_what_would_happen(self):
+        self.assertIn("shut me down", ar.self_termination_question("exit_jarvis"))
+        self.assertIn("restart me", ar.self_termination_question("restart"))
+        self.assertIn("overnight", ar.self_termination_question(
+            "start_overnight_upgrade"))
+        self.assertIn("upgrade", ar.self_termination_question("upgrade"))
+        for name in ar.SELF_TERMINATING_ACTIONS:
+            self.assertIn("yes", ar.self_termination_question(name).lower())
+
+
 if __name__ == "__main__":
     unittest.main()

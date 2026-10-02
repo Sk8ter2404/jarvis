@@ -31473,19 +31473,34 @@ LONG_RUNNING_ACTIONS: set[str] = {
 # the action's own self-exit timer (1.5–3 s) — so a cosmetic bridge line
 # can land mid-shutdown, producing odd half-spoken utterances after the
 # user already heard the confirmation. Skip the wrapper entirely for them.
-_FIRE_AND_EXIT_ACTIONS: set[str] = {
-    "start_overnight_upgrade",
-    "upgrade",
-    "restart",
-    # All shutdown aliases — their handler schedules os._exit(0) on a 2s
-    # timer, so the quip layer's tail can't land before the process dies.
-    "shutdown_jarvis",
-    "shut_down",
-    "exit_jarvis",
-    "quit_jarvis",
-    "power_off_jarvis",
-    "turn_off_jarvis",
-}
+#
+# The set lives in core/action_risk.py (SELF_TERMINATING_ACTIONS) since
+# 2026-10-02: the prompt router (never inherits a section documenting one)
+# and the dispatcher's self-termination gate (_self_terminating_target: one
+# runs only when the owner's words ask for it) read the same list. Every
+# shutdown alias's handler schedules os._exit(0) on a 2s timer, so the quip
+# layer's tail can't land before the process dies.
+_FIRE_AND_EXIT_ACTIONS: set[str] = set(_action_risk.SELF_TERMINATING_ACTIONS)
+
+
+def _self_terminating_target(name: str, fn=None) -> str:
+    """The self-terminating action (_FIRE_AND_EXIT_ACTIONS) that running
+    ``name`` amounts to - ``name`` itself, or the one whose HANDLER it shares
+    (a skill alias of shutdown_jarvis) - else "". Never raises."""
+    try:
+        n = (name or "").strip().lower()
+        if n in _FIRE_AND_EXIT_ACTIONS:
+            return n
+        if fn is None:
+            fn = ACTIONS.get(n)
+        if fn is None:
+            return ""
+        for other in sorted(_FIRE_AND_EXIT_ACTIONS):
+            if ACTIONS.get(other) is fn:
+                return other
+        return ""
+    except Exception:
+        return ""
 
 # Status lines keyed by action class — picked in this order:
 #   1. service-specific override (Prime Video / Netflix / etc.)
@@ -33038,6 +33053,27 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                       f"(best conf={best_seen:.2f})")
         if fn is None:
             results.append((name, f"unknown action: {name}", False))
+            return ""
+
+        # A self-terminating action runs only on the owner's own words (review
+        # 2026-10-02). It runs at once and nothing else gates it; an inherited
+        # section or the cloud route's full prompt names shutdown_jarvis /
+        # restart exactly, so for an ambiguous "Okay, turn it off." the model
+        # could emit one, and an invented 'exit' (under the autocorrect floor)
+        # became 'unknown action', whose follow-up round could name
+        # exit_jarvis outright. Held like a pushback: the model's prose
+        # ("Shutting down, sir.") is dropped, the owner hears what it would
+        # do, and a spoken yes runs it (handle_confirmation_response). A
+        # dispatch with no owner turn (a proactive remark) never qualifies.
+        _st = _self_terminating_target(name, fn)
+        if _st and not _action_risk.asked_for_self_termination(
+                _st, _turn_user_text()):
+            _st_q = _action_risk.self_termination_question(_st)
+            _queue_pending_confirmation(name, arg)
+            _pushback_objections.append(_st_q)
+            print(f"  [self-term] {name!r} was not asked for in the owner's "
+                  f"words - holding it for a yes")
+            results.append((name, f"⚠  PUSHBACK: {_st_q}", False))
             return ""
 
         if _needs_confirmation(name, arg):

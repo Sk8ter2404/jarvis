@@ -199,5 +199,93 @@ class PronounSwitchShortcutTests(_Base):
         self.assertEqual(bc._prev_owner_turn_at[0], first)
 
 
+@requires_monolith
+class SelfTerminationNeedsTheOwnersWordsTests(_Base):
+    """Review 2026-10-02 (high + low): the autocorrect block stops a GUESS,
+    but an exact self-terminating name ran at once. A section inherited
+    through history (or the cloud route's full prompt) names shutdown_jarvis
+    / restart exactly, so for an ambiguous "Okay, turn it off." the model
+    could emit [ACTION: shutdown_jarvis]; and an invented 'exit' (0.68, under
+    the floor) became 'unknown action', whose follow-up round could name
+    exit_jarvis outright. A self-terminating action now runs only when the
+    owner's own words ask for it; otherwise it is held for a spoken yes."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self.restart = mock.Mock(return_value="Restarting, sir.")
+        self.overnight = mock.Mock(return_value="Standing by, sir.")
+        self.acts.update({
+            "exit_jarvis": self.shutdown,
+            "restart": self.restart,
+            "start_overnight_upgrade": self.overnight,
+        })
+        self._p(bc, "_pending_confirmation", [])
+        self._p(bc, "_pending_confirmation_at", [0.0])
+
+    def test_the_exact_name_is_held_when_the_owner_did_not_ask(self):
+        bc = self.bc
+        cleaned, results = self._dispatch(
+            "Shutting down, sir. [ACTION: shutdown_jarvis]",
+            user_text="Okay, turn it off.")
+        self.shutdown.assert_not_called()
+        # The model's prose ("Shutting down") is not voiced: the question is.
+        self.assertEqual(cleaned,
+                         bc._action_risk.self_termination_question(
+                             "shutdown_jarvis"))
+        self.assertEqual(bc._pending_confirmation, [("shutdown_jarvis", "")])
+        name, res, info = results[0]
+        self.assertEqual(name, "shutdown_jarvis")
+        self.assertTrue(res.startswith("⚠  PUSHBACK:"), res)
+        self.assertFalse(bc._action_result_failed(res))
+
+    def test_a_follow_up_round_naming_exit_jarvis_is_held(self):
+        # The 'none' autocorrect branch: 'exit' -> unknown action -> a
+        # follow-up round in which the model names exit_jarvis itself.
+        self._dispatch("[ACTION: exit_jarvis]", user_text="Jarvis, turn it off.")
+        self.shutdown.assert_not_called()
+        self.assertEqual(self.bc._pending_confirmation, [("exit_jarvis", "")])
+
+    def test_an_alias_bound_to_the_shutdown_handler_is_held(self):
+        self.acts["bye_bye"] = self.shutdown
+        self._dispatch("[ACTION: bye_bye]", user_text="turn it off")
+        self.shutdown.assert_not_called()
+
+    def test_restart_the_router_does_not_restart_jarvis(self):
+        self._dispatch("[ACTION: restart]", user_text="Jarvis, restart the router.")
+        self.restart.assert_not_called()
+
+    def test_the_owner_asking_runs_it_at_once(self):
+        for reply, said, fn in (
+                ("[ACTION: shutdown_jarvis]",
+                 "Jarvis, please shut down now, I'm done for today.",
+                 self.shutdown),
+                ("[ACTION: restart]", "Jarvis, restart yourself.", self.restart),
+                ("[ACTION: start_overnight_upgrade]", "Goodnight, Jarvis.",
+                 self.overnight)):
+            with self.subTest(said=said):
+                fn.reset_mock()
+                self._dispatch(reply, user_text=said)
+                fn.assert_called_once()
+
+    def test_no_owner_turn_never_self_terminates(self):
+        # A proactive remark is dispatched with no turn frame at all.
+        cleaned, _results = self.bc.parse_and_run_actions(
+            "[ACTION: shutdown_jarvis]")
+        self.shutdown.assert_not_called()
+        self.assertIn("shut me down", cleaned)
+
+    def test_a_spoken_yes_then_runs_it(self):
+        bc = self.bc
+        self._dispatch("[ACTION: shutdown_jarvis]", user_text="turn it off")
+        self.shutdown.assert_not_called()
+        self.assertTrue(bc.handle_confirmation_response("yes"))
+        self.shutdown.assert_called_once()
+
+    def test_fire_and_exit_is_the_one_risk_table(self):
+        self.assertEqual(set(self.bc._FIRE_AND_EXIT_ACTIONS),
+                         set(self.bc._action_risk.SELF_TERMINATING_ACTIONS))
+
+
 if __name__ == "__main__":
     unittest.main()

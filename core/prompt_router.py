@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Tuple
 
+from core.action_risk import SELF_TERMINATING_ACTIONS
 from core.spoken_math import is_arithmetic_request
 from core.units import is_unit_conversion_request
 
@@ -201,24 +202,20 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     # got a joke each time; "how do you compare to other AIs" loaded nothing.
     # Its body is rendered per turn from live values (_RUNTIME_SECTIONS).
     "SELF-KNOWLEDGE": [
-        # how capable
+        # Only phrasings that are about HIM on their own. A brand ("use
+        # Claude", "play Opus by Eric Prydz") or a bare comparison ("compared
+        # to last week") is not: review 2026-10-02 found 22 of 25 unrelated
+        # probes loading this ~2.1k-char section. "you" + a comparison + an
+        # AI name, and "how good are you" (but not "... at chess"), route
+        # through is_self_knowledge_request (_PREDICATE_ROUTES).
         "how smart are you", "how smart you are", "how smart is jarvis",
-        "how intelligent", "how clever are you", "how capable",
-        "how good are you", "how good is jarvis", "your iq",
-        "smarter than", "dumber than", "better than you",
-        # what runs him
-        "what model", "which model are you", "what are you running on",
-        "what runs you", "what powers you", "what llm",
-        # comparisons
-        "compare to", "compared to", "compare with", "compared with",
-        "compare yourself", "how do you compare", "stack up",
-        "you versus", "you vs", "better model", "smarter model",
-        # the others. "other ai" is spelled out per ending: bare it would
-        # fire on "the other air purifier".
-        "opus", "claude", "gpt", "chatgpt", "gemini",
-        "other ais", "other ai ", "other ai?", "other ai.",
-        "other assistant", "other jarvis", "jarvis-like", "jarvis like",
-        "assistants like you",
+        "how clever are you", "how intelligent are you",
+        "how capable are you", "your iq", "smarter than you",
+        "dumber than you", "better than you",
+        "what runs you", "what powers you", "what are you running on",
+        "which model are you", "what model are you",
+        "compare yourself", "how do you compare",
+        "other jarvis", "jarvis-like", "assistants like you",
     ],
     "BARGE-IN": ["interrupt", "barge", "stop talking", "cut you off"],
     "TIMERS / REMINDERS": [
@@ -386,6 +383,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     ],
     "SKILLS": ["learn", "teach yourself", "new skill", "teach you", "can you learn"],
     "SMART HOME": [
+        # Review 2026-10-02: with "smart" a generic header word, a listing
+        # that never says "home" ("list my smart devices") lost all three
+        # SMART HOME sections. "smart device" runs on to "devices".
+        "smart device",
         "light", "lights", "hue", "govee", "lifx", "kasa", "ecobee", "nest",
         "thermostat", "plug", "bulb", "dim", "brighten", "turn on the",
         "turn off the", "smart home", "lamp",
@@ -489,6 +490,8 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "email", "inbox", "gmail", "outlook", "unread", "mail", "my emails",
     ],
     "SMART HOME DISCOVERY": [
+        "smart device", "my smart", "discover smart", "scan for smart",
+        "find smart",
         "discover devices", "find my lights", "scan for devices", "find devices",
     ],
     "TV DETECTION": ["tv", "television", "is the tv"],
@@ -663,6 +666,7 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "cloning", "normal voice", "what voices",
     ],
     "SMART HOME — PER-BRAND LIST": [
+        "smart device",
         "list my lights", "list plugs", "which lights", "hue list", "govee list",
         "kasa list", "per brand", "brand list", "list smart",
         # documented triggers that used to route only on the header word
@@ -832,8 +836,11 @@ _GENERIC_HEADER_WORDS = frozenset({
     # Heads SELF-PRESERVATION, SELF DIAGNOSTIC, SELF-TEST PROBES and
     # SELF-KNOWLEDGE, so "run a self test" (or "take a selfie": the match is
     # word-START) loaded all four. Each has its own keywords or other header
-    # words ("preservation", "diagnostic", "self test", "knowledge").
+    # words ("preservation", "diagnostic", "self test").
     "self",
+    # Heads only SELF-KNOWLEDGE, whose keywords and predicate route it:
+    # "to my knowledge it's fine" loaded it (review 2026-10-02).
+    "knowledge",
 })
 
 # Sections always kept even with no keyword hit. Deliberately MINIMAL: only
@@ -903,13 +910,48 @@ _CONVERSION_NEUTRAL_KEYWORDS = frozenset({
 })
 
 
+# SELF-KNOWLEDGE by shape (review 2026-10-02): an AI brand or a comparison
+# word alone is not a question about JARVIS ("use Claude", "compared to last
+# week"); "you" + a comparison + an AI / model name is.
+_SK_WAKE_LEAD_RE = re.compile(r"^\W*(?:(?:hey|ok|okay)\W+)?jarvis\b\W*")
+_SK_YOU_RE = re.compile(r"\b(?:you|you're|youre|your|yourself|jarvis)\b")
+_SK_COMPARE_RE = re.compile(
+    r"\b(?:compar\w*|stacks?\s+up|versus|vs|smarter|dumber|better|worse|"
+    r"faster|slower|stronger|weaker|more\s+capable|as\s+good\s+as)\b")
+_SK_OTHER_AI_RE = re.compile(
+    r"\b(?:claude|opus|sonnet|haiku|gpt\w*|chatgpt|gemini|llama|gemma|qwen|"
+    r"mistral|copilot|siri|alexa|grok|other\s+ais?|other\s+assistants?|"
+    r"models?|ai\s+assistants?|llms?)\b")
+_SK_HOW_GOOD_RE = re.compile(
+    r"\bhow\s+(?:good|smart|intelligent|clever|capable|bright|advanced|"
+    r"powerful)\s+(?:are\s+you|is\s+jarvis)\b(?!\s+at\b)")
+
+
+def is_self_knowledge_request(user_text: str) -> bool:
+    """A question about JARVIS's own capability against other AIs: "how good
+    are you" (not "how good are you at chess"), or "you" + a comparison + an
+    AI name / "other assistants" ("are you smarter than ChatGPT", "how do you
+    stack up against GPT"). A leading wake word is not the "you". Never
+    raises."""
+    try:
+        low = _SK_WAKE_LEAD_RE.sub("", str(user_text or "").lower())
+        if _SK_HOW_GOOD_RE.search(low):
+            return True
+        return bool(_SK_YOU_RE.search(low) and _SK_COMPARE_RE.search(low)
+                    and _SK_OTHER_AI_RE.search(low))
+    except Exception:
+        return False
+
+
 # Sections a turn implicates by SHAPE rather than by a word (2026-10-01). Spoken
 # arithmetic is the case: "what's 12 times 7" named no PYTHON SANDBOX keyword,
 # so run_python (the calculator) never reached the local model, and an
 # operator word cannot be a keyword on its own ("what times does the store
 # open"). core.spoken_math.is_arithmetic_request wants a number on BOTH sides.
+# SELF-KNOWLEDGE: is_self_knowledge_request above.
 _PREDICATE_ROUTES = {
     "PYTHON SANDBOX": is_arithmetic_request,
+    "SELF-KNOWLEDGE": is_self_knowledge_request,
 }
 
 # Short keywords ("tv", "ram", "hot", "mic", "bed", "obs", "lan") may only take
@@ -976,8 +1018,9 @@ _FOLLOWUP_FILLERS = frozenset({
     "hm", "hmm", "well", "so", "right",
 })
 # A word that always points back at something the turn does not name.
+# ("it" and "that's" are judged by position: _followup_kind.)
 _FOLLOWUP_REFERENTS = frozenset({
-    "it", "them", "they", "other", "same", "again", "that's",
+    "them", "they", "other", "same", "again",
 })
 # Demonstratives point back only when they stand ALONE ('cancel that', 'is
 # that normal', 'skip this one'). Before a noun they are determiners and the
@@ -989,36 +1032,118 @@ _FOLLOWUP_DEMONSTRATIVE_NEXT = frozenset({
 })
 _FOLLOWUP_COPULAS = frozenset({"is", "was", "are", "were", "isn't", "wasn't"})
 # Openers that continue the previous request ('what about tomorrow').
-_FOLLOWUP_LEADS = ("what about", "how about", "and", "also", "never mind",
-                   "nevermind")
+_FOLLOWUP_LEADS = ("what about", "how about", "never mind", "nevermind")
+# "and ..." / "also ..." continue it only as a FRAGMENT ("and tomorrow?",
+# "and the bedroom"): "and play some jazz" is a request of its own (review
+# 2026-10-02). Up to this many words after the conjunction is a fragment;
+# a longer one inherits only when its own words route nothing.
+_FOLLOWUP_CONJUNCTIONS = ("and", "also")
+_FOLLOWUP_FRAGMENT_MAX_WORDS = 2
+# Review 2026-10-02: "it" in subject position is often EXPLETIVE - "how's it
+# going", "what's it like outside", "is it going to rain", "it's cold" -
+# and pointed back at nothing, yet routed the previous turn's sections in. In
+# those positions "it" counts only before a word that describes a THING's
+# state ("is it on", "is it done yet", "it's too loud").
+_EXPLETIVE_IT_BEFORE = frozenset({
+    "is", "was", "will", "would", "isn't", "wasn't", "what's", "whats",
+    "how's", "hows", "where's", "when's",
+})
+_IT_STATE_WORDS = frozenset({
+    "on", "off", "done", "finished", "working", "running", "playing", "open",
+    "closed", "ready", "over", "still", "loud", "quiet", "bright", "dim",
+    "broken", "back", "up", "down", "charged", "connected", "paused",
+    "stopped", "printing", "recording", "plugged", "out", "too", "armed",
+    "muted", "loading", "frozen", "stuck", "set", "going", "right", "wrong",
+})
+# "going" above is "is it going" (a print, a download); the weather and
+# small-talk forms are excluded by the word after it:
+_IT_GOING_EXPLETIVE_NEXT = frozenset({"to", "gonna", ""})
+# "that's" + one of these is an acknowledgement ("that's great, thanks",
+# "that's all"), not a pointer at a thing.
+_THATS_ACK = frozenset({
+    "", "great", "good", "fine", "perfect", "cool", "awesome", "nice",
+    "right", "correct", "true", "enough", "all", "it", "okay", "ok",
+    "alright", "amazing", "wonderful", "brilliant", "excellent",
+    "interesting", "funny", "hilarious", "fair", "lovely", "helpful",
+    "impressive", "incredible", "fantastic", "neat", "sweet", "kind",
+    "weird", "crazy", "wild", "sad", "unfortunate", "terrible", "awful",
+    "what", "how", "why", "life", "fun",
+})
+
+
+def _it_points_back(words: List[str], i: int) -> bool:
+    """Whether ``words[i]`` ("it" / "it's") points back at a thing."""
+    w = words[i]
+    prev = words[i - 1] if i > 0 else ""
+    nxt = words[i + 1] if i + 1 < len(words) else ""
+    nxt2 = words[i + 2] if i + 2 < len(words) else ""
+    if w in ("it's", "its"):
+        state, after = nxt, nxt2
+    elif prev in _EXPLETIVE_IT_BEFORE:
+        state, after = nxt, nxt2
+    elif nxt in ("is", "was", "will"):
+        state, after = nxt2, (words[i + 3] if i + 3 < len(words) else "")
+    else:
+        return True                  # "turn it off", "pause it", "make it 15"
+    if state == "going":
+        return after not in _IT_GOING_EXPLETIVE_NEXT and prev not in (
+            "how's", "hows")
+    return state in _IT_STATE_WORDS
+
+
+def _followup_kind(user_text: str) -> str:
+    """Why ``user_text`` leans on an earlier turn: "referent" (a word that
+    points back), "lead" (a continuing opener or a short "and ..."
+    fragment), "conjunction" (a longer "and ..." / "also ..."), or "" (it
+    does not). Never raises."""
+    try:
+        words = [w for w in re.findall(r"[a-z0-9']+", (user_text or "").lower())
+                 if w not in _FOLLOWUP_FILLERS]
+    except Exception:
+        return ""
+    if not words or len(words) > _FOLLOWUP_MAX_WORDS:
+        return ""
+    for i, w in enumerate(words):
+        if w in ("it", "it's", "its"):
+            if w != "its" or i == 0:
+                if _it_points_back(words, i):
+                    return "referent"
+            continue
+        if w == "that's":
+            if (words[i + 1] if i + 1 < len(words) else "") not in _THATS_ACK:
+                return "referent"
+            continue
+        if w in _FOLLOWUP_REFERENTS:
+            return "referent"
+        if w in _FOLLOWUP_DEMONSTRATIVES and (
+                i == len(words) - 1
+                or words[i + 1] in _FOLLOWUP_DEMONSTRATIVE_NEXT
+                or (i > 0 and words[i - 1] in _FOLLOWUP_COPULAS)):
+            return "referent"
+    rest = words
+    conj = False
+    while rest and rest[0] in _FOLLOWUP_CONJUNCTIONS:
+        rest = rest[1:]
+        conj = True
+    joined = " ".join(rest)
+    if any(joined == lead or joined.startswith(lead + " ")
+           for lead in _FOLLOWUP_LEADS):
+        return "lead"
+    if conj:
+        return ("lead" if len(rest) <= _FOLLOWUP_FRAGMENT_MAX_WORDS
+                else "conjunction")
+    return ""
 
 
 def is_elliptical_followup(user_text: str) -> bool:
     """True when ``user_text`` is a short turn that leans on an earlier one:
     at most _FOLLOWUP_MAX_WORDS words (fillers and the wake word not
-    counted) AND either a back-reference ('it', 'them', 'cancel that', 'the
-    other one') or a continuing opener ('what about …', 'and …', 'never
-    mind'). Never raises."""
-    try:
-        words = [w for w in re.findall(r"[a-z0-9']+", (user_text or "").lower())
-                 if w not in _FOLLOWUP_FILLERS]
-    except Exception:
-        return False
-    if not words or len(words) > _FOLLOWUP_MAX_WORDS:
-        return False
-    joined = " ".join(words)
-    if any(joined == lead or joined.startswith(lead + " ")
-           for lead in _FOLLOWUP_LEADS):
-        return True
-    for i, w in enumerate(words):
-        if w in _FOLLOWUP_REFERENTS:
-            return True
-        if w in _FOLLOWUP_DEMONSTRATIVES and (
-                i == len(words) - 1
-                or words[i + 1] in _FOLLOWUP_DEMONSTRATIVE_NEXT
-                or (i > 0 and words[i - 1] in _FOLLOWUP_COPULAS)):
-            return True
-    return False
+    counted) AND either a back-reference ('it' as an object or with a
+    thing's state - 'turn it off', 'is it done yet' - 'them', 'cancel that',
+    'the other one'; not the expletive 'it' of "how's it going" or the
+    acknowledgement "that's great") or a continuing opener ('what about …',
+    'never mind', 'and …'). Never raises."""
+    return bool(_followup_kind(user_text))
 
 
 def _message_text(content) -> str:
@@ -1072,21 +1197,46 @@ def routing_text(user_text: str, history=None) -> str:
     return "\n".join(_routing_parts(user_text, history))
 
 
-def select_sections(user_text: str, sections: List[Tuple[str, str]],
-                    history=None) -> Tuple[List[str], List[str]]:
-    """Return (included_section_names, dropped_section_names) for `user_text`.
+# A section that documents a self-terminating action (core.action_risk:
+# shutdown_jarvis and its aliases, restart, upgrade, start_overnight_upgrade)
+# names an action that runs at once with no confirmation. Review 2026-10-02:
+# 'Okay, turn it off.' after "why did you shut down earlier?" inherited
+# SHUTDOWN ALIASES, putting the exact name shutdown_jarvis in front of the
+# model in the 10-01 incident's own setting. Such a section routes only on
+# the current turn's OWN words, never through history. "Documents" means the
+# name as an identifier (shutdown_jarvis), as an action token ([ACTION:
+# restart]) or as a list entry ("  restart      — relaunch ..."); prose that
+# merely says "restart" ("persists across restart") is not.
+_SELF_TERM_UNDERSCORED = sorted(n for n in SELF_TERMINATING_ACTIONS if "_" in n)
+_SELF_TERM_BARE = sorted(n for n in SELF_TERMINATING_ACTIONS if "_" not in n)
+_SELF_TERM_DOC_RE = re.compile(
+    r"(?<![a-z0-9_])(?:" + "|".join(map(re.escape, _SELF_TERM_UNDERSCORED))
+    + r")(?![a-z0-9_])"
+    + r"|\[ACTION:\s*(?:" + "|".join(map(re.escape, sorted(SELF_TERMINATING_ACTIONS)))
+    + r")\b"
+    + r"|^[ \t]+(?:" + "|".join(map(re.escape, _SELF_TERM_BARE))
+    + r")[ \t]{2,}", re.MULTILINE)
 
-    ``history`` (optional, chat messages) lets a short elliptical follow-up
-    route on the previous user turn as well — see routing_text. Without it,
-    or on any other turn, routing is exactly the words of ``user_text``."""
-    parts = _routing_parts(user_text, history)
+
+def documents_self_terminating_action(body: str) -> bool:
+    """True when a section ``body`` documents a self-terminating action (see
+    _SELF_TERM_DOC_RE). Never raises; a fault counts as True (the section
+    then just routes on the turn's own words)."""
+    try:
+        return bool(_SELF_TERM_DOC_RE.search(body or ""))
+    except Exception:
+        return True
+
+
+def _match_sections(parts: List[str], sections: List[Tuple[str, str]]) -> set:
+    """Names of the sections ``parts`` (one or more turns' text, matched as
+    separate lines) route to, the always-on set included."""
     user_text = "\n".join(parts)
     low = " " + (user_text or "").lower() + " "
     neutral = (_CONVERSION_NEUTRAL_KEYWORDS
                if any(is_unit_conversion_request(p) for p in parts)
                else frozenset())
-    included: List[str] = []
-    dropped: List[str] = []
+    hits = set()
     for header, _body in sections:
         name = header.strip()
         upper = name.upper()
@@ -1113,7 +1263,46 @@ def select_sections(user_text: str, sections: List[Tuple[str, str]],
                     hit = any(bool(pred(p)) for p in parts)
                 except Exception:
                     hit = False
-        (included if hit else dropped).append(name)
+        if hit:
+            hits.add(name)
+    return hits
+
+
+def _select(user_text: str, sections: List[Tuple[str, str]], history=None):
+    """``(included, dropped, inherited)`` - see select_sections. ``inherited``
+    is the set of included sections only the history routed."""
+    own = _match_sections([user_text or ""], sections)
+    inherited: set = set()
+    parts = _routing_parts(user_text, history)
+    if len(parts) > 1 and _followup_kind(user_text) == "conjunction" and (
+            own - {n for n in own if n.upper() in _ALWAYS}):
+        # "and play some jazz": a request of its own, which routes itself.
+        parts = parts[:1]
+    if len(parts) > 1:
+        bodies = {h.strip(): b for h, b in sections}
+        for name in _match_sections(parts, sections) - own:
+            if not documents_self_terminating_action(bodies.get(name, "")):
+                inherited.add(name)
+    keep = own | inherited
+    included: List[str] = []
+    dropped: List[str] = []
+    for header, _body in sections:
+        name = header.strip()
+        (included if name in keep else dropped).append(name)
+    return included, dropped, inherited
+
+
+def select_sections(user_text: str, sections: List[Tuple[str, str]],
+                    history=None) -> Tuple[List[str], List[str]]:
+    """Return (included_section_names, dropped_section_names) for `user_text`.
+
+    ``history`` (optional, chat messages) lets a short elliptical follow-up
+    route on the previous user turn as well - see routing_text - but never
+    to a section that documents a self-terminating action (those route on
+    the turn's own words only), and not for a longer "and ..." turn whose
+    own words already route something. Without it, or on any other turn,
+    routing is exactly the words of ``user_text``."""
+    included, dropped, _inherited = _select(user_text, sections, history)
     return included, dropped
 
 
@@ -1285,6 +1474,26 @@ def turn_pc_block(user_text: str, pc_control: str, history=None) -> str:
             return "\n".join(b for _h, b in split_pc_control(pc_control)[1])
         except Exception:
             return pc_control
+
+
+def inherited_turn_sections(user_text: str, pc_control: str,
+                            history=None) -> set:
+    """The section names turn_pc_block ships for ``user_text`` ONLY because
+    of ``history`` (a short follow-up's inherited routing), always-on ones
+    excluded. The local prompt budget ranks these below the turn's own
+    long-term-memory recall (core.prompt_budget.RANK_INHERITED), so a
+    spurious inheritance is the first thing an overflowing turn sheds.
+    Never raises; set() on any fault."""
+    if not history:
+        return set()
+    try:
+        _core, sections = split_pc_control(pc_control)
+        if not sections:
+            return set()
+        _inc, _drop, inherited = _select(user_text, sections, history)
+        return {n for n in inherited if n.upper() not in _ALWAYS}
+    except Exception:
+        return set()
 
 
 def split_turn_block(block: str) -> List[Tuple[str, str]]:
