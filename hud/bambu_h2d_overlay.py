@@ -60,9 +60,6 @@ TICK_MS = 200  # 5 fps while the accent pulses after a printer update.
 # pulses after a change; then it holds one still frame and polls at this pace.
 IDLE_TICK_MS = 1000
 PULSE_AFTER_CHANGE_S = 3.0
-# Stamps bambu_monitor rewrites on every MQTT report. The panel never shows
-# them, so on their own they are not a change worth a redraw.
-_UNDRAWN_KEYS = ("written_at", "last_update")
 
 BG_KEY        = "#010101"
 PANEL_DARK    = "#04080d"
@@ -113,16 +110,6 @@ def _read_state() -> dict:
             return json.load(f)
     except Exception:
         return {}
-
-
-def _render_signature(state: dict) -> str:
-    """Everything the panel draws from ``state``, as one comparable string."""
-    try:
-        return json.dumps(
-            {k: v for k, v in state.items() if k not in _UNDRAWN_KEYS},
-            sort_keys=True, default=str)
-    except Exception:
-        return repr(state)
 
 
 def _hex_to_rgb(h: str):
@@ -179,6 +166,71 @@ def _shorten_filename(name: str, max_len: int = 28) -> str:
     if len(name) <= max_len:
         return name
     return name[: max_len - 1] + "…"
+
+
+def _panel_fields(state: dict) -> dict:
+    """What the panel shows for ``state``, formatted exactly as it is drawn.
+    The draw code reads these and the redraw signature is built from them, so
+    a value that changes without changing the picture is not a change:
+    bambu_monitor rewrites the state file on every MQTT report with raw float
+    temperatures (219.84 and 220.12 both draw "220°"), the written_at /
+    last_update stamps, and stage / print_error, which are never drawn
+    (2026-10-02 review)."""
+    try:
+        pct = float(state.get("mc_percent") or 0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    try:
+        risk = int(state.get("risk_level") or 0)
+    except (TypeError, ValueError):
+        risk = 0
+
+    gcode = (state.get("gcode_state") or "").upper()
+    chip  = gcode if gcode else "—"
+    if gcode == "RUNNING":
+        chip = "PRINTING"
+    elif gcode == "PAUSE":
+        chip = "PAUSED"
+    elif gcode == "FINISH":
+        chip = "DONE"
+    elif gcode == "FAILED":
+        chip = "FAILED"
+
+    layer = state.get("layer_num")
+    total = state.get("total_layer")
+    if layer and total:
+        layer_str = f"Layer {int(layer)} / {int(total)}"
+    elif layer:
+        layer_str = f"Layer {int(layer)}"
+    else:
+        layer_str = "Layer —"
+
+    eta = _format_minutes(state.get("mc_remaining"))
+    note = ""
+    if risk >= 1:
+        note = str(state.get("risk_note")
+                   or ("Risk detected" if risk >= 2 else "Watching"))[:42]
+    return {
+        "pct":     pct,
+        "risk":    risk,
+        "fname":   _shorten_filename(state.get("filename") or "", max_len=34),
+        "chip":    chip,
+        "layer":   layer_str,
+        "eta":     f"ETA {eta}" if eta else "ETA —",
+        "nozzle":  _format_temp(state.get("nozzle_temper")),
+        "bed":     _format_temp(state.get("bed_temper")),
+        "chamber": _format_temp(state.get("chamber_temper")),
+        "note":    note,
+    }
+
+
+def _render_signature(state: dict) -> str:
+    """Everything the panel draws from ``state`` (_panel_fields), as one
+    comparable string."""
+    try:
+        return json.dumps(_panel_fields(state), sort_keys=True)
+    except Exception:
+        return repr(state)
 
 
 def _risk_palette(risk: int):
@@ -322,87 +374,60 @@ class BambuOverlay:
                 outline="", fill=accent,
             )
 
-    def _draw_text_block(self, state: dict, accent: str, accent_dim: str):
+    def _draw_text_block(self, f: dict, accent: str, accent_dim: str):
         """Right column: layer, ETA, temps. Stays put regardless of the
-        thumbnail in the lower left."""
+        thumbnail in the lower left. ``f`` is _panel_fields(state)."""
         col_x = 72  # right of the thumbnail
         # Filename on the top line (above the progress bar, full width).
-        fname = _shorten_filename(state.get("filename") or "", max_len=34)
         self.canvas.create_text(
             12, 18, anchor="w",
-            text=fname,
+            text=f["fname"],
             fill=TEXT, font=("Segoe UI", 9, "bold"),
         )
         # State chip on the right edge of the title line.
-        gcode = (state.get("gcode_state") or "").upper()
-        chip  = gcode if gcode else "—"
-        if gcode == "RUNNING":
-            chip = "PRINTING"
-        elif gcode == "PAUSE":
-            chip = "PAUSED"
-        elif gcode == "FINISH":
-            chip = "DONE"
-        elif gcode == "FAILED":
-            chip = "FAILED"
         self.canvas.create_text(
             self.w - 12, 18, anchor="e",
-            text=chip,
+            text=f["chip"],
             fill=accent, font=("Consolas", 7, "bold"),
         )
 
         # Layer / total — directly under the filename.
-        layer = state.get("layer_num")
-        total = state.get("total_layer")
-        if layer and total:
-            layer_str = f"Layer {int(layer)} / {int(total)}"
-        elif layer:
-            layer_str = f"Layer {int(layer)}"
-        else:
-            layer_str = "Layer —"
         self.canvas.create_text(
             12, 36, anchor="w",
-            text=layer_str,
+            text=f["layer"],
             fill=DIM_TEXT, font=("Segoe UI", 8),
         )
 
         # ETA on the right of the layer line.
-        eta = _format_minutes(state.get("mc_remaining"))
-        eta_str = f"ETA {eta}" if eta else "ETA —"
         self.canvas.create_text(
             self.w - 12, 36, anchor="e",
-            text=eta_str,
+            text=f["eta"],
             fill=DIM_TEXT, font=("Segoe UI", 8),
         )
 
         # Temps — beside the thumbnail.
-        nozzle = _format_temp(state.get("nozzle_temper"))
-        bed    = _format_temp(state.get("bed_temper"))
-        chamber = state.get("chamber_temper")
         self.canvas.create_text(
             col_x, 82, anchor="w",
-            text=f"Nozzle {nozzle}",
+            text=f"Nozzle {f['nozzle']}",
             fill=TEXT, font=("Segoe UI", 8),
         )
         self.canvas.create_text(
             col_x, 100, anchor="w",
-            text=f"Bed    {bed}",
+            text=f"Bed    {f['bed']}",
             fill=TEXT, font=("Segoe UI", 8),
         )
-        chamber_str = _format_temp(chamber)
-        if chamber_str != "—":
+        if f["chamber"] != "—":
             self.canvas.create_text(
                 col_x, 118, anchor="w",
-                text=f"Chmbr  {chamber_str}",
+                text=f"Chmbr  {f['chamber']}",
                 fill=DIM_TEXT, font=("Segoe UI", 8),
             )
 
         # Risk note (only when risk > 0).
-        risk = int(state.get("risk_level", 0) or 0)
-        if risk >= 1:
-            note = state.get("risk_note") or ("Risk detected" if risk >= 2 else "Watching")
+        if f["note"]:
             self.canvas.create_text(
                 self.w / 2, self.h - 8, anchor="s",
-                text=str(note)[:42],
+                text=f["note"],
                 fill=accent, font=("Segoe UI", 7, "italic"),
             )
 
@@ -435,14 +460,8 @@ class BambuOverlay:
         self.frame += 1
         self.canvas.delete("all")
 
-        try:
-            pct = float(state.get("mc_percent") or 0)
-        except (TypeError, ValueError):
-            pct = 0.0
-        try:
-            risk = int(state.get("risk_level") or 0)
-        except (TypeError, ValueError):
-            risk = 0
+        f = _panel_fields(state)
+        pct, risk = f["pct"], f["risk"]
 
         # Animate a subtle pulse on the accent border by mixing the
         # accent with its dim partner — feels alive without being noisy.
@@ -455,7 +474,7 @@ class BambuOverlay:
             accent = accent_base
 
         self._draw_panel(accent, accent_dim)
-        self._draw_text_block(state, accent, accent_dim)
+        self._draw_text_block(f, accent, accent_dim)
         self._draw_progress_bar(pct, accent, accent_dim)
         self._draw_thumbnail(pct, accent, accent_dim)
 
