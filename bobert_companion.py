@@ -28973,6 +28973,8 @@ skill_utils = {
     "register_self_voiced": lambda n: register_self_voiced(n),
     "is_self_voiced":   lambda n: is_self_voiced(n),
     "register_utterance_route": lambda fn, name="": register_utterance_route(fn, name),
+    # Follow an owner turn's reply (see AFTER-REPLY HOOKS).
+    "register_after_reply": lambda fn: register_after_reply(fn),
 }
 
 # M2 Phase 1 (2026-06-02): typed capability seam. JarvisServices wraps the
@@ -29125,6 +29127,426 @@ def _utterance_route_reply(text: str) -> "str | None":
         print(f"  [skill-route] {label} -> {m.group(1)}")
         return token
     return None
+
+
+# AFTER-REPLY HOOKS (2026-10-01): a skill can follow up an owner turn once its
+# reply has been spoken. Registered at run time with
+# skill_utils["register_after_reply"](fn). For every OWNER turn the LLM path
+# answers -- a mic or a typed turn; never a proactive line, a test harness's
+# inject, a staging turn, a sleep / standby exchange or an ambient
+# answer-then-quiet turn -- each hook is called twice with one ctx dict:
+#   * stage "ready": the reply is final (its actions have run) and is about to
+#     be spoken, so a hook can start slow work (a model call) on a thread of
+#     its own and have it done by the time the reply ends. Its return value is
+#     ignored;
+#   * stage "spoken": the reply and its follow-ups have been spoken, or the
+#     turn was barged / failed. The hook may return ONE callable, an encore,
+#     which the main loop runs once, right after the turn.
+# ctx: stage, user_text, reply_text (the prose the owner heard: action tokens
+# and prosody tags stripped), actions (tuple of the action names that ran; at
+# "spoken" every round's), question (the owner asked a question, or the reply
+# asks him one), barged (an accepted interrupt cut the turn), failed (an
+# action failed, the reply could not be played or the turn raised), typed (a
+# typed / injected turn, not the mic).
+# Rules that must hold:
+#   * a hook never raises into the turn and never holds it up: every call runs
+#     on a short-lived daemon thread, and a stage waits for its hooks together
+#     at most _AFTER_REPLY_BUDGET_S. One hook is never called twice at once (a
+#     call still running skips its next stage), and a hook late
+#     _AFTER_REPLY_MAX_OVERRUNS calls in a row is dropped;
+#   * at most one encore per turn, never after a barged or failed turn, and
+#     not once JARVIS is asleep, in standby or staging. It runs on a daemon
+#     thread of its own and the main loop waits for it at most
+#     _AFTER_REPLY_ENCORE_MAX_S, so the next capture is never held longer. An
+#     encore that talks with a device does it through the dialogue API
+#     (dialogue_session / listen_for_stop), which owns the microphone: while
+#     its session runs on the encore's thread, the main loop's capture yields
+#     to it (_dialogue_holds_mic);
+#   * the log carries a hook's label and timings only, never any text.
+_AFTER_REPLY_HOOKS: list = []          # [{"fn", "key", "label", "late", "busy"}]
+_AFTER_REPLY_MAX_HOOKS = 8
+_AFTER_REPLY_BUDGET_S = 0.05
+_AFTER_REPLY_MAX_OVERRUNS = 3
+_AFTER_REPLY_ENCORE_MAX_S = 30.0       # well inside the 60 s stall watchdog
+# This owner turn's _AfterReplyTurn (the main loop's thread only), and the
+# encore thread started last (one encore at a time).
+_after_reply_turn: list = [None]
+_after_reply_encore_thread: list = [None]
+# Prosody / markup tags ([intent:x], [wry], [mood:x]): never spoken.
+_AFTER_REPLY_TAG_RE = re.compile(r"\[[A-Za-z_]+(?::[^\]\n]*)?\]")
+
+
+def _after_reply_key(fn) -> str:
+    """``module.qualname`` of a named function (a reloaded skill's hook has
+    the same key and replaces its old copy); "" for a lambda or a closure."""
+    try:
+        q = str(getattr(fn, "__qualname__", "") or "")
+        if not q or "<" in q:
+            return ""
+        mod = str(getattr(fn, "__module__", "") or "")
+        return (f"{mod}.{q}" if mod else q)[:80]
+    except Exception:
+        return ""
+
+
+def register_after_reply(fn) -> bool:
+    """Register ``fn(ctx) -> callable | None`` (see _AFTER_REPLY_HOOKS). True
+    once registered: registering the same function again changes nothing and
+    returns True, and a reloaded skill's hook replaces its old copy. False
+    for a non-callable, or when _AFTER_REPLY_MAX_HOOKS hooks are in already."""
+    try:
+        if not callable(fn):
+            return False
+        if any(rec["fn"] is fn for rec in _AFTER_REPLY_HOOKS):
+            return True
+        key = _after_reply_key(fn)
+        rec = {"fn": fn, "key": key, "late": 0, "busy": None,
+               "label": key or f"hook {len(_AFTER_REPLY_HOOKS) + 1}"}
+        for i, old in enumerate(_AFTER_REPLY_HOOKS):
+            if key and old.get("key") == key:
+                _AFTER_REPLY_HOOKS[i] = rec
+                print(f"  [after-reply] replaced {rec['label']}")
+                return True
+        if len(_AFTER_REPLY_HOOKS) >= _AFTER_REPLY_MAX_HOOKS:
+            print(f"  [after-reply] REFUSED a hook: "
+                  f"{_AFTER_REPLY_MAX_HOOKS} are registered already")
+            return False
+        _AFTER_REPLY_HOOKS.append(rec)
+        print(f"  [after-reply] registered {rec['label']}")
+        return True
+    except Exception:
+        return False
+
+
+class _AfterReplyTurn:
+    """One owner turn the after-reply hooks follow (see _after_reply_begin)."""
+
+    def __init__(self, user_text: str, typed: bool):
+        self.user_text = str(user_text or "")
+        self.typed = bool(typed)
+        self.thread = threading.current_thread()
+        self.stage = "armed"            # armed -> ready -> spoken
+        self.ctx: dict = {}
+        self.seq0 = 0                   # _tts_interrupt_seq when the reply began
+        self.actions: list = []         # every round's action names, in order
+        self.failed = False
+        self.readied: list = []         # the hook records called at "ready"
+        self.encore = None              # (callable, label) from "spoken"
+
+    def mine(self, text=None) -> bool:
+        """This thread's turn (and, given ``text``, this utterance's)."""
+        return (self.thread is threading.current_thread()
+                and (text is None or str(text or "") == self.user_text))
+
+
+def _after_reply_overrun(rec: dict, stage: str, what: str) -> None:
+    """Count one late call of hook ``rec``; drop the hook once
+    _AFTER_REPLY_MAX_OVERRUNS calls in a row were late. Never raises."""
+    try:
+        rec["late"] = int(rec.get("late", 0)) + 1
+        n = rec["late"]
+        label = rec.get("label", "hook")
+        print(f"  [after-reply] {label} {stage}: {what} "
+              f"({n}/{_AFTER_REPLY_MAX_OVERRUNS})")
+        if n >= _AFTER_REPLY_MAX_OVERRUNS:
+            _AFTER_REPLY_HOOKS[:] = [r for r in _AFTER_REPLY_HOOKS
+                                     if r is not rec]
+            print(f"  [after-reply] {label} dropped: {n} late calls in a row")
+    except Exception:
+        pass
+
+
+def _after_reply_stage(recs, ctx: dict, busy_wait_s: float = 0.0) -> list:
+    """Call the hooks ``recs`` for one stage, each on a daemon thread of its
+    own (each gets its own copy of ``ctx``), and wait for them together at
+    most _AFTER_REPLY_BUDGET_S -- after up to ``busy_wait_s`` for a hook's
+    previous call to end. Returns [(rec, status, value)] in ``recs`` order.
+    status: "done" (value = what it returned), "error" (it raised), "late"
+    (still running: an overrun), "busy" (its previous call is still running:
+    not called, an overrun) or "skipped" (no thread). Never raises."""
+    stage = str(ctx.get("stage", ""))
+    out: list = []
+    started: list = []
+    try:
+        busy_by = time.monotonic() + max(0.0, float(busy_wait_s))
+        for rec in list(recs):
+            prev = rec.get("busy")
+            if prev is not None and prev.is_alive():
+                rest = busy_by - time.monotonic()
+                if rest > 0:
+                    prev.join(rest)
+                if prev.is_alive():
+                    out.append([rec, "busy", None])
+                    continue
+            rec["busy"] = None
+            box: dict = {}
+
+            def _run(fn=rec["fn"], c=dict(ctx), b=box):
+                try:
+                    b["value"] = fn(c)
+                except BaseException as e:   # a hook never reaches the loop
+                    b["error"] = type(e).__name__
+
+            t = threading.Thread(target=_run, name="after-reply-hook",
+                                 daemon=True)
+            try:
+                t.start()
+            except Exception:
+                out.append([rec, "skipped", None])
+                continue
+            item = [rec, "late", None]
+            out.append(item)
+            started.append((item, t, box))
+        deadline = time.monotonic() + _AFTER_REPLY_BUDGET_S
+        for item, t, box in started:
+            t.join(max(0.0, deadline - time.monotonic()))
+            rec = item[0]
+            if t.is_alive():
+                rec["busy"] = t
+                continue
+            rec["late"] = 0
+            if "error" in box:
+                item[1] = "error"
+                print(f"  [after-reply] {rec.get('label', 'hook')} {stage} "
+                      f"failed: {box['error']}")
+            else:
+                item[1] = "done"
+                item[2] = box.get("value")
+        for rec, status, _value in out:
+            if status == "late":
+                _after_reply_overrun(
+                    rec, stage, f"overran {_AFTER_REPLY_BUDGET_S * 1000:.0f} ms")
+            elif status == "busy":
+                _after_reply_overrun(rec, stage, "still busy with its last call")
+            elif status == "skipped":
+                print(f"  [after-reply] {rec.get('label', 'hook')} {stage}: "
+                      f"no thread; not called")
+    except Exception as e:
+        print(f"  [after-reply] {stage} stage error: {type(e).__name__}")
+    return [tuple(i) for i in out]
+
+
+def _after_reply_plain(text) -> str:
+    """``text`` as it is heard: markup tags and markdown stripped, spaces
+    collapsed. Never raises."""
+    try:
+        s = _AFTER_REPLY_TAG_RE.sub(" ", str(text or ""))
+        try:
+            s = _strip_markdown_for_speech(s)
+        except Exception:
+            pass
+        return " ".join(s.split())
+    except Exception:
+        return ""
+
+
+# "What a lovely day." / "How nice." are exclamations, not questions: the
+# claim validator's question test reads any opening "what" / "how" as one.
+_AFTER_REPLY_EXCLAIM_RE = re.compile(
+    r"^(?:(?:oh|ah|wow|well|gosh|hey|so|jarvis)\W+)*"
+    r"(?:what\s+an?\b"
+    r"|how\s+(?!(?:is|isn'?t|are|aren'?t|was|wasn'?t|were|do|does|did|can|"
+    r"could|would|will|should|shall|may|might|has|have|had|much|many|long|"
+    r"far|old|often|come|about|soon|to|i|you|we|they|he|she|it|the|my|"
+    r"your)\b)[a-z']+\W*$)", re.I)
+
+
+def _after_reply_question(user_text, reply) -> bool:
+    """True when the owner asked a question (core.claim_validator's test: a
+    voice transcript often has no "?"; an exclamation such as "what a lovely
+    day" is not one) or the reply asks him one. True when unsure."""
+    try:
+        user = str(user_text or "").strip()
+        if "?" in str(reply or "") or "?" in user:
+            return True
+        if _AFTER_REPLY_EXCLAIM_RE.match(user):
+            return False
+        return bool(_claim_validator.looks_like_question(user))
+    except Exception:
+        return True
+
+
+def _after_reply_begin(text: str, typed: bool = False):
+    """Arm the after-reply hooks for this owner turn: the main loop calls this
+    right before _run_llm_dispatch. Returns the armed _AfterReplyTurn, or None
+    (nothing armed) when no hook is registered or the turn is not one they
+    follow (see _AFTER_REPLY_HOOKS). Never raises."""
+    _after_reply_turn[0] = None
+    try:
+        if not _AFTER_REPLY_HOOKS or _is_staging():
+            return None
+        if typed and _last_inject_source[0] == "test":
+            return None     # a test harness's inject is not the owner (B023)
+        if _sleep_mode[0] or _standby_mode[0] or _resume_to_ambient[0]:
+            return None     # asleep, or one answer and back to standby
+        turn = _AfterReplyTurn(text, typed)
+        _after_reply_turn[0] = turn
+        return turn
+    except Exception:
+        return None
+
+
+def _after_reply_note(results=(), spoke=None) -> None:
+    """Fold one round's action results -- and the reply's _speak outcome
+    (False: it could not be played) -- into this turn's "spoken" ctx. A no-op
+    unless this thread's armed turn is past "ready". Never raises."""
+    try:
+        turn = _after_reply_turn[0]
+        if turn is None or turn.stage != "ready" or not turn.mine():
+            return
+        for r in results or ():
+            name = str(r[0])
+            if name not in turn.actions:
+                turn.actions.append(name)
+            if len(r) > 1 and _action_result_failed(r[1]):
+                turn.failed = True
+        if spoke is False:
+            turn.failed = True
+    except Exception:
+        pass
+
+
+def _after_reply_ready(text: str, spoken_text: str, action_results,
+                       barged: bool, seq0: int) -> None:
+    """Stage "ready" (see _AFTER_REPLY_HOOKS), from _run_llm_dispatch_body
+    right before the reply is spoken. ``spoken_text`` is what is left to say;
+    the streamed lead (already voiced) is put back for reply_text. A no-op
+    unless the main loop armed THIS turn. Time-boxed; never raises."""
+    try:
+        turn = _after_reply_turn[0]
+        if turn is None or turn.stage != "armed" or not turn.mine(text):
+            return
+        turn.stage = "ready"
+        turn.seq0 = seq0
+        _after_reply_note(action_results)
+        heard = " ".join(p for p in (str(_stream_spoken_prefix[0] or ""),
+                                     "" if barged else str(spoken_text or ""))
+                         if p.strip())
+        reply = _after_reply_plain(heard)
+        turn.ctx = {
+            "stage": "ready", "user_text": turn.user_text,
+            "reply_text": reply, "actions": tuple(turn.actions),
+            "question": _after_reply_question(turn.user_text, reply),
+            "barged": bool(barged), "failed": bool(turn.failed),
+            "typed": turn.typed}
+        for rec, status, _value in _after_reply_stage(list(_AFTER_REPLY_HOOKS),
+                                                      turn.ctx):
+            if status in ("done", "error", "late"):
+                turn.readied.append(rec)
+    except Exception as e:
+        print(f"  [after-reply] ready: {type(e).__name__}")
+
+
+def _after_reply_spoken(text: str, raised: bool = False) -> None:
+    """Stage "spoken" (see _AFTER_REPLY_HOOKS), from _run_llm_dispatch once
+    the whole turn has been said. Keeps the first callable a hook returns as
+    the turn's encore (_after_reply_run_encore runs it) unless the turn was
+    barged or failed; disarms a turn that never reached "ready". Time-boxed;
+    never raises."""
+    try:
+        turn = _after_reply_turn[0]
+        if turn is None or not turn.mine(text):
+            return
+        if turn.stage != "ready":
+            _after_reply_turn[0] = None
+            return
+        turn.stage = "spoken"
+        try:
+            cut = _tts_interrupt_seq[0] != turn.seq0
+        except Exception:
+            cut = False
+        barged = bool(turn.ctx.get("barged")) or bool(cut)
+        failed = bool(turn.failed) or bool(raised)
+        ctx = dict(turn.ctx, stage="spoken", actions=tuple(turn.actions),
+                   barged=barged, failed=failed)
+        recs = [r for r in turn.readied
+                if any(r is h for h in _AFTER_REPLY_HOOKS)]
+        for rec, status, value in _after_reply_stage(
+                recs, ctx, busy_wait_s=_AFTER_REPLY_BUDGET_S):
+            if status != "done" or value is None:
+                continue
+            label = rec.get("label", "hook")
+            if not callable(value):
+                print(f"  [after-reply] {label} returned a non-callable; "
+                      f"ignored")
+            elif barged or failed:
+                print(f"  [after-reply] {label} encore dropped (the turn "
+                      f"{'was barged' if barged else 'failed'})")
+            elif turn.encore is not None:
+                print(f"  [after-reply] {label} encore dropped (one per turn)")
+            else:
+                turn.encore = (value, label)
+        if turn.encore is None:
+            _after_reply_turn[0] = None
+    except Exception as e:
+        print(f"  [after-reply] spoken: {type(e).__name__}")
+        _after_reply_turn[0] = None
+
+
+def _after_reply_encore_refused() -> str:
+    """Why an encore may not start now; "" when it may."""
+    try:
+        if _is_staging():
+            return "staging"
+        if _sleep_mode[0] or _standby_mode[0]:
+            return "asleep"
+        prev = _after_reply_encore_thread[0]
+        if prev is not None and prev.is_alive():
+            return "the last one is still running"
+        return ""
+    except Exception:
+        return "error"
+
+
+def _after_reply_run_encore() -> None:
+    """Run this turn's encore once (see _AFTER_REPLY_HOOKS); the main loop
+    calls this right after the turn. The encore runs on a daemon thread and
+    the loop waits for it at most _AFTER_REPLY_ENCORE_MAX_S, then goes on
+    (a device dialogue still running keeps the microphone). Never raises."""
+    try:
+        turn = _after_reply_turn[0]
+        _after_reply_turn[0] = None
+        if turn is None or turn.encore is None or not turn.mine():
+            return
+        fn, label = turn.encore
+        turn.encore = None
+        why = _after_reply_encore_refused()
+        if why:
+            print(f"  [after-reply] {label} encore skipped ({why})")
+            return
+        done = threading.Event()
+
+        def _run():
+            try:
+                fn()
+            except BaseException as e:   # an encore never reaches the loop
+                print(f"  [after-reply] {label} encore failed: "
+                      f"{type(e).__name__}")
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_run, name="after-reply-encore",
+                             daemon=True)
+        _heartbeat()        # the wait below stays inside the stall watchdog
+        t0 = time.monotonic()
+        try:
+            t.start()
+        except Exception as e:
+            print(f"  [after-reply] {label} encore: no thread "
+                  f"({type(e).__name__})")
+            return
+        _after_reply_encore_thread[0] = t
+        bound = max(0.0, float(_AFTER_REPLY_ENCORE_MAX_S))
+        if done.wait(bound):
+            print(f"  [after-reply] {label} encore done "
+                  f"({time.monotonic() - t0:.1f}s)")
+        else:
+            print(f"  [after-reply] {label} encore still running after "
+                  f"{bound:.0f}s; listening again (a device dialogue keeps "
+                  f"the microphone)")
+        _heartbeat()
+    except Exception as e:
+        print(f"  [after-reply] encore: {type(e).__name__}")
 
 
 def _all_self_voiced(action_results) -> bool:
@@ -37863,6 +38285,10 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
         # [turn-timing]: the turn's one line, partial when the body raised.
         # A no-op when no turn is active or on another thread's dispatch.
         _tt("emit", _tt_outcome)
+        # After-reply hooks, stage "spoken" (see _AFTER_REPLY_HOOKS): the turn
+        # has been said (after the filler wait above), barged or raised. A
+        # no-op unless the main loop armed this owner turn.
+        _after_reply_spoken(text, raised=_tt_outcome != "ok")
 
 
 def _run_llm_dispatch_body(text: str) -> str:
@@ -38014,8 +38440,12 @@ def _run_llm_dispatch_body(text: str) -> str:
         spoken_text = ""
     elif not _self_voiced_only:
         spoken_text = _apply_quip_layer(spoken_text, action_results)
+    # After-reply hooks, stage "ready" (see _AFTER_REPLY_HOOKS): the reply is
+    # final and about to be spoken. A no-op unless the main loop armed this
+    # owner turn; time-boxed, so it never holds up the speech below.
+    _after_reply_ready(text, spoken_text, action_results, _barged, _barge_seq0)
     if spoken_text and not _barged:
-        _speak(spoken_text)
+        _after_reply_note(spoke=_speak(spoken_text))
 
     # Speak verbatim-result actions (version_info, system_pulse, …) directly.
     # Their result is a finished sentence the user asked for, but they're not
@@ -38132,6 +38562,7 @@ def _run_llm_dispatch_body(text: str) -> str:
             break
         print(f"  JARVIS: {followup}")
         f_spoken, current_results = parse_and_run_actions(followup)
+        _after_reply_note(current_results)
         if not current_results:
             f_spoken = _strip_ack_preface(f_spoken, text)
         elif (depth + 1 < _max_followup and not (
@@ -39298,6 +39729,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     _tt("emit", "shortcut")
                     continue
 
+                # After-reply hooks (see _AFTER_REPLY_HOOKS): arm them for this
+                # owner turn; a no-op when no skill registered one.
+                _after_reply_begin(text, _injected_text is not None)
                 reply = _run_llm_dispatch(text, voice=_injected_text is None)
 
                 # Real-time learning: extract facts in background (non-blocking).
@@ -39353,6 +39787,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 _t = threading.Timer(2.0, _request_prompt_rebuild)
                 _t.daemon = True
                 _t.start()
+
+                # The encore an after-reply hook returned for this turn (at
+                # most one; the wait is bounded by _AFTER_REPLY_ENCORE_MAX_S).
+                _after_reply_run_encore()
 
                 print()
 

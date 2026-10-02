@@ -48,6 +48,8 @@ SKILL_UTILS_KEYS = (
     "local_complete", "register_self_voiced", "is_self_voiced",
     # Utterance routes (2026-09-29).
     "register_utterance_route",
+    # After-reply hooks (2026-10-01).
+    "register_after_reply",
 )
 
 # Top-level module names whose import failure indicates a REAL bug (a broken
@@ -78,6 +80,8 @@ def make_fake_skill_utils(**overrides):
     # A route registration is accepted but never called: the fake has no LLM
     # dispatch, so a test that needs routing calls the route itself.
     utils["register_utterance_route"].return_value = True
+    # Likewise an after-reply hook: accepted, never called (no turns here).
+    utils["register_after_reply"].return_value = True
     utils.update(overrides)
     return utils
 

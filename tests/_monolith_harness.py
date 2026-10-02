@@ -275,6 +275,10 @@ _MONOLITH_RESTORE_NAMES = (
     # Who wrote the last drained inject (2026-10-01): a leaked "test" would
     # make a later test's typed turn look like a harness line.
     "_last_inject_source",
+    # After-reply hooks (2026-10-01): the registered hooks, the armed turn and
+    # the last encore thread. A leaked hook would be called by a LATER test's
+    # dispatch; a leaked turn or live encore would arm / refuse one.
+    "_AFTER_REPLY_HOOKS", "_after_reply_turn", "_after_reply_encore_thread",
     # Proactive-remark gates (2026-09-30): the owner's last MIC turn, the
     # remark history (repeat ring, spoken-remark times, last attempt, logged
     # hold) and the face-presence state (the detector's last detail, the

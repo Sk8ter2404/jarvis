@@ -56,6 +56,8 @@ skill sees identical semantics whether it goes through the dict or this object:
     monolith without the hooks simply never runs a dialogue.
   * **Utterance routes** (``register_utterance_route`` → ``False``) — an older
     monolith leaves every request to the LLM.
+  * **After-reply hooks** (``register_after_reply`` → ``False``) — an older
+    monolith never follows up an owner turn's reply.
 
 Stdlib-only by contract
 ------------------------
@@ -121,6 +123,7 @@ class JarvisServicesProtocol(Protocol):
     def is_self_voiced(self, name: str) -> bool: ...
     def register_utterance_route(self, fn: Callable[[str], Optional[str]],
                                  name: str = "") -> bool: ...
+    def register_after_reply(self, fn: Callable[[dict], Any]) -> bool: ...
 
 
 # Sentinel that means "no backing callable was wired for this key". Distinct from
@@ -324,3 +327,10 @@ class JarvisServices:
         (an older monolith simply leaves routing to the LLM)."""
         return bool(self._call("register_utterance_route", fn, name,
                                _default=False))
+
+    def register_after_reply(self, fn: Callable[[dict], Any]) -> bool:
+        """Follow up owner turns: ``fn(ctx)`` is called at the reply's
+        "ready" and "spoken" stages and may return one encore callable at
+        "spoken" (the monolith's AFTER-REPLY HOOKS block has the contract).
+        False when refused or unwired (an older monolith never calls it)."""
+        return bool(self._call("register_after_reply", fn, _default=False))
