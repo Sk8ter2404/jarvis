@@ -1285,3 +1285,34 @@ def turn_pc_block(user_text: str, pc_control: str, history=None) -> str:
             return "\n".join(b for _h, b in split_pc_control(pc_control)[1])
         except Exception:
             return pc_control
+
+
+def split_turn_block(block: str) -> List[Tuple[str, str]]:
+    """Split a turn_pc_block() string back into its sections, in order:
+    ``[(header, text), ...]`` where ``"\\n".join(texts) == block`` exactly.
+
+    The prompt budget (core/prompt_budget) drops whole sections from an
+    overflowing turn, so it needs them one by one. Every body starts with
+    its own header line and holds no other line that matches _HEADER_RE (a
+    line that matches IS a header to split_pc_control), so splitting at
+    those lines gets back exactly the selected sections. Text before the
+    first header, which a real block never has, comes back under header ''.
+    Never raises; on any fault the whole block is one part."""
+    if not block:
+        return []
+    try:
+        out: List[Tuple[str, str]] = []
+        cur_head = ""
+        cur: List[str] = []
+        for ln in block.split("\n"):
+            m = _HEADER_RE.match(ln.strip())
+            if m and cur:
+                out.append((cur_head, "\n".join(cur)))
+                cur = []
+            if m:
+                cur_head = m.group("head").strip()
+            cur.append(ln)
+        out.append((cur_head, "\n".join(cur)))
+        return out
+    except Exception:
+        return [("", block)]

@@ -1993,6 +1993,104 @@ def _with_turn_context(messages: list, turn_ctx: str) -> list:
     except Exception:
         return messages
 
+
+# LOCAL PROMPT BUDGET (2026-10-01). Ollama silently truncates a prompt longer
+# than num_ctx to its first few tokens + the tail ("truncating input prompt
+# limit=8195 prompt=17958" in its server log), so an overflowing turn reached
+# the model with most of its system prompt gone. Live: 2 turns on 2026-10-01
+# read prompt_eval_count=8195. _fit_local_messages estimates every local
+# prompt and, only when it is over budget, drops the oldest history, then the
+# lowest-priority per-turn parts, then the rest of the history. It never
+# touches the system prompt or the final message. Calibration, ranks and trim
+# order: core/prompt_budget.py. Set JARVIS_LOCAL_PROMPT_BUDGET=0 to turn it off.
+from core import prompt_budget as _prompt_budget  # noqa: E402
+
+_LOCAL_PROMPT_BUDGET = (os.environ.get("JARVIS_LOCAL_PROMPT_BUDGET", "1")
+                        .strip().lower() not in ("0", "false", "no", "off"))
+
+
+class _BudgetedMessages(list):
+    """A message list _fit_local_messages has already fitted for a
+    ``num_ctx`` window. _call_local_llm leaves it alone when the model it
+    resolved has that same window, instead of measuring it a second time."""
+    num_ctx = 0
+
+
+def _local_budget_tag() -> str:
+    """The local model tag to size the budget for, without a network probe:
+    the resolved tag once _get_local_llm_model has run, else the configured
+    one. It only picks the window (16k, or 12k for a 30B-class tag), and
+    _call_local_llm re-checks against the tag it actually resolved."""
+    try:
+        return (_RESOLVED_LOCAL_LLM_MODEL[0]
+                or (os.environ.get("JARVIS_LOCAL_LLM_MODEL") or "").strip()
+                or LOCAL_LLM_MODEL)
+    except Exception:
+        return ""
+
+
+def _turn_budget_parts(pc_block: str, addenda=()) -> list:
+    """This turn's per-turn context as prompt_budget.TurnPart's: each routed
+    PC section body (rank SECTION), then each non-empty addendum. ``addenda``
+    is ``[(label, text, rank), ...]``. The parts' texts join to exactly
+    ``pc_block + "".join(addendum texts)``, which is the context string the
+    caller attaches. Never raises: on a fault the whole context is ONE part,
+    so it is still sent (and can still only be dropped whole)."""
+    try:
+        parts = []
+        if pc_block:
+            from core import prompt_router as _pr
+            for i, (head, body) in enumerate(_pr.split_turn_block(pc_block)):
+                parts.append(_prompt_budget.TurnPart(
+                    head or "turn sections", ("\n" if i else "") + body,
+                    _prompt_budget.RANK_SECTION))
+        for label, text, rank in addenda:
+            if text:
+                parts.append(_prompt_budget.TurnPart(label, text, rank))
+        return parts
+    except Exception:
+        whole = (pc_block or "") + "".join(a[1] for a in addenda if a[1])
+        return ([_prompt_budget.TurnPart("turn context", whole,
+                                         _prompt_budget.RANK_SECTION)]
+                if whole else [])
+
+
+def _fit_local_messages(system: str, messages: list, parts=(), *,
+                        max_tokens: int = 500, where: str = "local",
+                        model_tag: str | None = None) -> list:
+    """``messages`` with the per-turn ``parts`` attached (_with_turn_context),
+    trimmed to the local prompt budget when the whole prompt would overflow
+    the model's window.
+
+    The prompt is measured exactly as _call_local_llm will send it: through
+    _local_chat_prompt (the local-mode directive, the web-search guard). A
+    prompt that fits comes back unchanged. A trimmed or still-over prompt
+    prints one ``[prompt-budget]`` line. Never raises; a fault sends the
+    unbudgeted prompt."""
+    turn_ctx = "".join(p.text for p in parts)
+    if not _LOCAL_PROMPT_BUDGET:
+        return _with_turn_context(messages, turn_ctx)
+    try:
+        num_ctx = _local_num_ctx(model_tag or _local_budget_tag())
+        budget = _prompt_budget.budget_for(num_ctx, max_tokens)
+
+        def _measure(msgs):
+            s, m = _local_chat_prompt(system, msgs)
+            return _prompt_budget.estimate_chat_tokens(s, m)
+
+        fit = _prompt_budget.fit_chat(list(messages), parts, budget=budget,
+                                      measure=_measure,
+                                      attach=_with_turn_context)
+        if fit.trimmed or not fit.fits:
+            print("  " + _prompt_budget.describe(fit, where, num_ctx=num_ctx))
+        out = _BudgetedMessages(fit.messages)
+        out.num_ctx = num_ctx
+        return out
+    except Exception as _e:
+        print(f"  [prompt-budget] {where}: check failed "
+              f"({type(_e).__name__}: {_e}); sent unbudgeted")
+        return _with_turn_context(messages, turn_ctx)
+
 # Phase 4A refactor (2026-05-29): 11 simple _act_* handlers (open_url,
 # web_search, youtube, get_time, screenshot, media_next/prev/playpause,
 # volume_up/down/mute) live in core/actions.py and are re-exported by
@@ -19528,6 +19626,17 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     if not _ollama_has_model(model):
         _ollama_pull_async(model)
         return None
+    # Every local call is held to the prompt budget (see _LOCAL_PROMPT_BUDGET).
+    # The turn and follow-up paths fit their own prompts, per-turn sections
+    # included, and pass a _BudgetedMessages; any other caller (the cloud-error
+    # fallback over the full history, a background _llm_quick), or a list
+    # fitted for a different window than the tag resolved here, is fitted
+    # here, history only.
+    if not (isinstance(messages, _BudgetedMessages)
+            and messages.num_ctx == _local_num_ctx(model)):
+        messages = _fit_local_messages(system, messages, (),
+                                       max_tokens=max_tokens, where="call",
+                                       model_tag=model)
     sys_prompt, messages = _local_chat_prompt(system, messages)
     # The last _generate's Ollama counters (prompt_eval / eval), for the
     # served-via line below. All-None until a response arrives.
@@ -21889,21 +21998,28 @@ def _call_llm(user_text: str) -> str:
             print(f"  [prompt-router] slim failed ({_pr_err}); full prompt")
             _base_prompt = _system_prompt
 
-    _turn_addenda = (
-        _tone_system_addendum(tone)
-        + route["addendum"]
-        + emotion_addendum
-        + mode_addendum
-        + voice_mood_addendum
+    # Kept as labelled, ranked pieces so the local prompt budget can drop the
+    # least important ones from an overflowing turn (_fit_local_messages);
+    # _turn_addenda is their plain concatenation, in this order.
+    _addenda_parts = [
+        ("tone", _tone_system_addendum(tone), _prompt_budget.RANK_REGISTER),
+        ("voice-mood route", route["addendum"], _prompt_budget.RANK_REGISTER),
+        ("emotion", emotion_addendum, _prompt_budget.RANK_REGISTER),
+        ("agent mode", mode_addendum, _prompt_budget.RANK_MODE),
+        ("voice-mood response", voice_mood_addendum,
+         _prompt_budget.RANK_REGISTER),
         # Per-turn semantic recall from tiered long-term memory. Lives in the
         # VOLATILE tail so it never invalidates the cached stable prefix
         # (see _cached_system_param); '' when disabled / cold / slow.
-        + _ltm_context(user_text)
+        ("long-term memory", _ltm_context(user_text),
+         _prompt_budget.RANK_MEMORY),
         # Phrasebook "last used" rotation hint (2026-09-29): per-turn by
         # nature, so it lives here with the other volatile material and never
         # in the system prompt, where each rotation changed the cached prefix.
-        + _phrase_rotation_hint()
-    )
+        ("phrase rotation", _phrase_rotation_hint(),
+         _prompt_budget.RANK_STYLE_HINT),
+    ]
+    _turn_addenda = "".join(_t for _l, _t, _r in _addenda_parts)
 
     if _stable_split:
         # Cache-stable layout: the system prompt is byte-identical every turn,
@@ -21916,11 +22032,17 @@ def _call_llm(user_text: str) -> str:
         # See _last_turn_pc_block: without this the follow-up round loses the
         # action reference entirely.
         _last_turn_pc_block[0] = _turn_ctx
+        # The local prompt budget's per-turn parts: the section bodies, then
+        # each addendum. They join to exactly the _turn_ctx sent below.
+        _turn_parts = _turn_budget_parts(_turn_ctx, _addenda_parts)
         _turn_ctx = _turn_ctx + _turn_addenda
     else:
         sys_prompt_now = _base_prompt + _turn_addenda
         _turn_ctx = ""
         _last_turn_pc_block[0] = ""
+        # Legacy layout: the addenda are in sys_prompt_now and nothing rides
+        # the user message, so the budget can only trim history.
+        _turn_parts = []
     # Remember the split so the follow-up round (get_followup_response) can
     # re-use the very same cached system prompt instead of rebuilding a
     # different one and paying a second full prompt evaluation. (It used to
@@ -21943,9 +22065,14 @@ def _call_llm(user_text: str) -> str:
         # (_reprime_check_stale).
         _owner_chat_call.active = True
         try:
+            # The per-turn context goes on as ranked parts (they join to
+            # exactly _turn_ctx) so an overflowing turn can shed the least
+            # important ones; a turn that fits is sent byte-for-byte as before.
             reply = _local_then_cloud_or_honest(
                 sys_prompt_now,
-                _with_turn_context(conversation_history, _turn_ctx))
+                _fit_local_messages(sys_prompt_now, conversation_history,
+                                    _turn_parts, max_tokens=500,
+                                    where="turn"))
         finally:
             _owner_chat_call.active = False
     elif AI_BACKEND == "claude":
@@ -33133,17 +33260,23 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         _mode_add = _mode_addendum()
     except Exception:
         pass
-    _followup_addenda = (
-        _tone_system_addendum(_last_user_tone[0])
-        + _route.get("addendum", "")
-        + _mode_add
+    # Ranked pieces for the local prompt budget (see _call_llm's
+    # _addenda_parts); _followup_addenda is their concatenation, in order.
+    _followup_addenda_parts = [
+        ("tone", _tone_system_addendum(_last_user_tone[0]),
+         _prompt_budget.RANK_REGISTER),
+        ("voice-mood route", _route.get("addendum", ""),
+         _prompt_budget.RANK_REGISTER),
+        ("agent mode", _mode_add, _prompt_budget.RANK_MODE),
         # Phrasebook rotation hint: it used to ride _system_prompt, so the
         # follow-up round (often the reply actually spoken after an action)
         # saw which lines were used last. Now per-turn, it rides with the
-        # other addenda: _local_ctx on the stable local layout, the uncached
-        # tail of sys_prompt_now everywhere else.
-        + _phrase_rotation_hint()
-    )
+        # other addenda: the turn context (_local_parts) on the stable local
+        # layout, the uncached tail of sys_prompt_now everywhere else.
+        ("phrase rotation", _phrase_rotation_hint(),
+         _prompt_budget.RANK_STYLE_HINT),
+    ]
+    _followup_addenda = "".join(_t for _l, _t, _r in _followup_addenda_parts)
     # LEGACY (full-prompt) layout — what every non-local branch below uses, and
     # what _cached_system_param is built to split. The cache-stable layout is
     # applied ONLY inside the local branch, deliberately; see below.
@@ -33191,7 +33324,7 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         # caching, because _cached_system_param returns the string untouched
         # once full_prompt.startswith(_system_prompt) is False. Off the local
         # route we keep the legacy full prompt. 2026-09-06.
-        _local_sys, _local_ctx = sys_prompt_now, ""
+        _local_sys, _local_parts = sys_prompt_now, []
         if _last_stable_sys_prompt[0]:
             _local_sys = _last_stable_sys_prompt[0]
             # Re-send THIS turn's section bodies. That system prompt no longer
@@ -33202,13 +33335,19 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
             # invents plausible-looking tokens that dispatch to nothing. The
             # dropped step the follow-up exists to finish comes from the same user
             # text these bodies were selected for. See _last_turn_pc_block.
-            _local_ctx = _last_turn_pc_block[0] + _followup_addenda
+            # As ranked parts joining to exactly
+            # _last_turn_pc_block[0] + _followup_addenda, so the prompt budget
+            # can shed the least important ones from an overflowing round.
+            _local_parts = _turn_budget_parts(_last_turn_pc_block[0],
+                                              _followup_addenda_parts)
         try:
             return _local_then_cloud_or_honest(
                 _local_sys,
-                _with_turn_context(
+                _fit_local_messages(
+                    _local_sys,
                     list(conversation_history)
-                    + [{"role": "user", "content": extra}], _local_ctx),
+                    + [{"role": "user", "content": extra}], _local_parts,
+                    max_tokens=400, where="follow-up"),
                 max_tokens=400,
             )
         except Exception:

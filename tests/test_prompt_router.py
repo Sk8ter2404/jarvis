@@ -1039,10 +1039,22 @@ class FollowupRoundIsRatchetedElsewhereTests(unittest.TestCase):
         # wrong reason is worse than no guard.
         body = "\n".join(line.split("#", 1)[0]
                          for line in src[start:end].split("\n"))
-        self.assertIn("_with_turn_context(", body,
-                      "get_followup_response no longer sends a turn context "
-                      "at all — the follow-up round is back to whatever the "
-                      "reused system prompt happens to carry")
+        # Since the local prompt budget (2026-10-01) the follow-up attaches
+        # its turn context through _fit_local_messages, which must itself
+        # attach with _with_turn_context.
+        fit_start = src.index("def _fit_local_messages")
+        fit_body = "\n".join(
+            line.split("#", 1)[0] for line in
+            src[fit_start:src.index("\ndef ", fit_start + 1)].split("\n"))
+        self.assertIn("attach=_with_turn_context", fit_body,
+                      "_fit_local_messages no longer attaches the turn "
+                      "context with _with_turn_context")
+        self.assertTrue(
+            "_with_turn_context(" in body
+            or "_fit_local_messages(" in body,
+            "get_followup_response no longer sends a turn context "
+            "at all — the follow-up round is back to whatever the "
+            "reused system prompt happens to carry")
         self.assertIn("_last_turn_pc_block[0]", body,
                       "get_followup_response stopped carrying the primary "
                       "turn's turn_pc_block() bodies (_last_turn_pc_block). "
@@ -1595,3 +1607,54 @@ class BambuCameraDocumentedTests(unittest.TestCase):
             with self.subTest(u=u):
                 self.assertIn("BAMBU 3D PRINTER",
                               pr.select_sections(u, sections)[0])
+
+
+class SplitTurnBlockTests(unittest.TestCase):
+    """split_turn_block hands the prompt budget (core/prompt_budget) the turn's
+    sections one by one so an overflowing turn can drop whole ones. It must
+    give back exactly the sections turn_pc_block selected, and join back to
+    the identical bytes, or a turn that fits would be sent changed."""
+
+    # Every _SPLIT_CORPUS shape plus a many-section turn (the live overflow
+    # shape: a long list of device / service names) and a runtime-rendered
+    # section (SELF-KNOWLEDGE).
+    _CORPUS = _SPLIT_CORPUS + [
+        "kinect depth, the 3d printer, netflix and hulu, browser agent, "
+        "queue a task",
+        "how smart are you",
+    ]
+
+    def test_round_trips_to_the_same_bytes(self):
+        for u in self._CORPUS:
+            with self.subTest(u=u):
+                block = pr.turn_pc_block(u, FULL)
+                parts = pr.split_turn_block(block)
+                self.assertEqual("\n".join(t for _h, t in parts), block)
+
+    def test_headers_are_the_selected_sections_in_order(self):
+        _core, sections = pr.split_pc_control(FULL)
+        for u in self._CORPUS:
+            with self.subTest(u=u):
+                inc, _drop = pr.select_sections(u, sections)
+                inc = set(inc)
+                want = [h.strip() for h, _b in sections
+                        if h.strip() in inc
+                        and h.strip().upper() not in pr._ALWAYS]
+                got = [h for h, _t in
+                       pr.split_turn_block(pr.turn_pc_block(u, FULL))]
+                self.assertEqual(got, want)
+
+    def test_the_many_section_turn_really_has_many(self):
+        parts = pr.split_turn_block(pr.turn_pc_block(self._CORPUS[-2], FULL))
+        self.assertGreaterEqual(len(parts), 4)
+
+    def test_text_without_headers_is_one_unnamed_part(self):
+        self.assertEqual(pr.split_turn_block(""), [])
+        self.assertEqual(pr.split_turn_block("B" * 50), [("", "B" * 50)])
+        lead = "loose line\nMUSIC CONTROLS:\nbody"
+        self.assertEqual(pr.split_turn_block(lead),
+                         [("", "loose line"), ("MUSIC CONTROLS", "MUSIC CONTROLS:\nbody")])
+
+    def test_never_raises(self):
+        self.assertEqual(pr.split_turn_block(None), [])
+        self.assertEqual(pr.split_turn_block(12345), [("", 12345)])

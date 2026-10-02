@@ -53,6 +53,9 @@ _IMPORT_LIGHT_CORE = (
     # Spoken arithmetic (2026-10-01): stdlib only, imported by the prompt
     # router and the fast paths.
     "core.spoken_math",
+    # The local prompt budget (2026-10-01): stdlib only, imported at
+    # monolith import time.
+    "core.prompt_budget",
 )
 
 
