@@ -27,15 +27,15 @@
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 692 |
+| Total registered actions (incl. aliases) | 696 |
 | — monolith `ACTIONS` dict | 142 |
-| — skill / core registered | 550 |
-| tested | 623 |
+| — skill / core registered | 554 |
+| tested | 627 |
 | **untested** (no test names it) | 69 |
 | spoken note: VERBATIM | 347 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
-| **no spoken note** (neither) | 266 |
+| **no spoken note** (neither) | 270 |
 | no `prompts.py` example | 511 |
 
 A result with no spoken note is correct for side-effect actions but is the recurring
@@ -256,6 +256,8 @@ One row per action, sorted by name; aliases share their handler's location.
 | `gestures_on` | `skills/kinect_gestures.py:564` | **VERBATIM** | — | yes |
 | `get_time` | `core/actions.py:150` | *INFORMATIVE* | — | yes |
 | `give_me_the_cursor` | `skills/kinect_air_mouse.py:3596` | **VERBATIM** | — | yes |
+| `globe_clear` | `skills/globe.py:362` | neither | yes | yes |
+| `globe_pin` | `skills/globe.py:327` | neither | yes | yes |
 | `good_morning` | `skills/night_owl_mode.py:505` | **VERBATIM** | — | yes |
 | `govee_list` | `skills/sh_govee.py:388` | *INFORMATIVE* | — | yes |
 | `govee_list_devices` | `skills/sh_govee.py:388` | *INFORMATIVE* | — | no |
@@ -277,6 +279,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `headset_status` | `skills/headset_status.py:347` | **VERBATIM** | yes | yes |
 | `hide_bambu_camera` | `skills/holographic_overlay/__init__.py:1007` | neither | — | no |
 | `hide_bambu_overlay` | `skills/holographic_overlay/__init__.py:764` | neither | — | yes |
+| `hide_globe` | `skills/globe.py:315` | neither | yes | yes |
 | `hide_holo` | `skills/holographic_overlay/__init__.py:328` | neither | — | yes |
 | `hide_holo_hud_v2` | `skills/holographic_overlay/__init__.py:1539` | neither | — | yes |
 | `hide_holographic_overlay` | `skills/holographic_overlay/__init__.py:328` | neither | — | yes |
@@ -556,6 +559,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `show_bambu_camera` | `skills/holographic_overlay/__init__.py:1000` | neither | — | no |
 | `show_bambu_overlay` | `skills/holographic_overlay/__init__.py:757` | neither | — | yes |
 | `show_changelog` | `core/actions.py:3155` | **VERBATIM** | — | yes |
+| `show_globe` | `skills/globe.py:298` | neither | yes | yes |
 | `show_holo` | `skills/holographic_overlay/__init__.py:323` | neither | — | yes |
 | `show_holo_hud_v2` | `skills/holographic_overlay/__init__.py:1534` | neither | — | yes |
 | `show_holographic_overlay` | `skills/holographic_overlay/__init__.py:323` | neither | — | yes |
