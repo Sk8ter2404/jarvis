@@ -502,9 +502,10 @@ class R1SchemaTests(unittest.TestCase):
         self.assertEqual(f[i + 1:-1], list(tt.NOTE_FIELDS))
         self.assertEqual(f[-1], "lead_dropped")
         self.assertEqual(tt.NOTE_FIELDS, (
-            "tail_ms", "clip_ms", "stt_wait_ms", "stt_engine", "load_ms",
-            "total_ms", "play_open_ms", "filler_clip_ms", "eot", "st_p",
-            "st_n", "pre", "cut", "amb_deferred", "cache"))
+            "tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms", "stt_engine",
+            "load_ms", "total_ms", "play_open_ms", "out_lat_ms",
+            "filler_clip_ms", "eot", "st_p", "st_n", "pre", "cut",
+            "amb_deferred", "cache"))
         self.assertEqual(len(set(tt.STAT_FIELDS)), len(tt.STAT_FIELDS))
 
     def test_the_old_fields_keep_their_order(self):
@@ -533,6 +534,7 @@ class NoteStatTests(unittest.TestCase):
         for k, v in values.items():
             t.note_stat(k, v)
         t.note_stat("play_open_ms", 41)
+        t.note_stat("out_lat_ms", 46)
         t.note_stat("cache", "would-hit")
         _in_thread(lambda: t.note_stat("filler_clip_ms", 2120))
         _in_thread(lambda: t.note_stat("cut", 980))
@@ -541,9 +543,10 @@ class NoteStatTests(unittest.TestCase):
         d = self._emit()
         self.assertEqual(
             {k: d[k] for k in tt.NOTE_FIELDS},
-            {"tail_ms": "1410", "clip_ms": "3904", "stt_wait_ms": "0",
-             "stt_engine": "whisper", "load_ms": "13", "total_ms": "3512",
-             "play_open_ms": "41", "filler_clip_ms": "2120", "eot": "rms",
+            {"tail_ms": "1410", "cap_lag_ms": "-", "clip_ms": "3904",
+             "stt_wait_ms": "0", "stt_engine": "whisper", "load_ms": "13",
+             "total_ms": "3512", "play_open_ms": "41", "out_lat_ms": "46",
+             "filler_clip_ms": "2120", "eot": "rms",
              "st_p": "0.873", "st_n": "2", "pre": "1", "cut": "980",
              "amb_deferred": "2", "cache": "would-hit"})
         self.assertEqual(d["lead_dropped"], "0")
@@ -575,14 +578,15 @@ class NoteStatTests(unittest.TestCase):
         t.begin("inject")
         t.mark("you")
         for name in ("bogus", "load_ms", "total_ms", "lead_dropped",
-                     "filler", "first_play", "llm_calls", "", None):
+                     "filler", "first_play", "llm_calls", "cap_lag_ms", "",
+                     None):
             t.note_stat(name, 12345)
         line = t.emit()
         d = tt.parse_line(line)
         self.assertNotIn("bogus", d)
         self.assertNotIn("12345", line)
-        self.assertEqual((d["load_ms"], d["lead_dropped"], d["llm_calls"]),
-                         ("-", "0", "0"))
+        self.assertEqual((d["load_ms"], d["lead_dropped"], d["llm_calls"],
+                          d["cap_lag_ms"]), ("-", "0", "0", "-"))
 
     def test_other_threads_cannot_set_owner_fields(self):
         t = self.t
@@ -590,9 +594,10 @@ class NoteStatTests(unittest.TestCase):
         t.mark("you")
         _in_thread(lambda: [t.note_stat(k, 7) for k in _R1_OWNER])
         _in_thread(lambda: t.note_stat("play_open_ms", 7))
+        _in_thread(lambda: t.note_stat("out_lat_ms", 7))
         _in_thread(lambda: t.note_stat("cache", "hit"))
         d = self._emit()
-        for k in _R1_OWNER + ("play_open_ms", "cache"):
+        for k in _R1_OWNER + ("play_open_ms", "out_lat_ms", "cache"):
             self.assertEqual(d[k], "-", k)
 
     def test_any_thread_fields_are_accepted_from_any_thread(self):
@@ -690,6 +695,77 @@ class NoteStatTests(unittest.TestCase):
         bad.note_stat("tail_ms", 1)
         bad.note_stat("amb_deferred", object())
         self.assertIsNone(bad.emit())
+
+
+class R1ReviewFieldTests(unittest.TestCase):
+    """R1 review (2026-10-01): cap_lag_ms travels with the VAD break that is
+    the turn's t0, and out_lat_ms follows the play_open_ms rule."""
+
+    def setUp(self):
+        self.lines = []
+        self.clock = _ManualClock()
+        self.t = tt.TurnTiming(print_fn=self.lines.append, clock=self.clock)
+
+    def _emit(self):
+        return tt.parse_line(self.t.emit())
+
+    def test_the_vad_break_carries_its_capture_lag(self):
+        t = self.t
+        since = t.now()
+        self.clock.advance(2.0)
+        t.note_vad_break(272)
+        t.begin_voice(since)
+        d = self._emit()
+        self.assertEqual((d["vad_break"], d["cap_lag_ms"]), ("0", "272"))
+
+    def test_a_stale_breaks_lag_is_not_adopted(self):
+        t = self.t
+        t.note_vad_break(500)            # an older capture's break
+        self.clock.advance(1.0)
+        since = t.now()
+        t.begin_voice(since)             # this one hit MAX_RECORDING_SECS
+        d = self._emit()
+        self.assertEqual((d["vad_break"], d["cap_lag_ms"]), ("-", "-"))
+
+    def test_a_break_without_a_lag_prints_dash(self):
+        t = self.t
+        since = t.now()
+        t.note_vad_break()
+        t.begin_voice(since)
+        self.assertEqual(self._emit()["cap_lag_ms"], "-")
+        for junk in ("abc", float("nan"), float("inf"), True, object()):
+            t.note_vad_break(junk)
+            t.begin_voice(since)
+            self.assertEqual(self._emit()["cap_lag_ms"], "-", junk)
+
+    def test_cap_lag_comes_only_from_the_break(self):
+        t = self.t
+        since = t.now()
+        self.clock.advance(0.1)
+        t.note_stat("cap_lag_ms", 9)     # pre-turn: never stashed
+        t.note_vad_break()
+        t.begin_voice(since)
+        t.note_stat("cap_lag_ms", 9)     # in-turn: refused too
+        self.assertEqual(self._emit()["cap_lag_ms"], "-")
+
+    def test_reset_forgets_the_lag(self):
+        t = self.t
+        since = t.now()
+        t.note_vad_break(300)
+        t.reset()
+        t.note_vad_break()
+        t.begin_voice(since)
+        self.assertEqual(self._emit()["cap_lag_ms"], "-")
+
+    def test_out_lat_follows_the_play_open_rule(self):
+        t = self.t
+        t.begin("voice")
+        t.note_stat("out_lat_ms", 5)      # before "you": a reminder
+        t.mark("you")
+        _in_thread(lambda: t.note_stat("out_lat_ms", 6))   # a stranger
+        t.note_stat("out_lat_ms", 46)
+        t.note_stat("out_lat_ms", 99)     # later playbacks: first wins
+        self.assertEqual(self._emit()["out_lat_ms"], "46")
 
 
 class PreTurnStashTests(unittest.TestCase):

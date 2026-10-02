@@ -15520,10 +15520,67 @@ def _tt_note_clip_ms(name: str, audio, sr) -> None:
         pass
 
 
+def _stream_latency_s(stream, which: int):
+    """A PortAudio stream's reported latency in seconds, or None. sounddevice
+    reads it ONCE when the stream opens and caches it on the object, so this
+    is a plain attribute read — never a native call (the tts-reaper stays
+    the only thread making native calls on a play stream, H-6/H-7). A duplex
+    stream reports (input, output): `which` picks one. Never raises."""
+    try:
+        v = getattr(stream, "latency", None)
+        if isinstance(v, (tuple, list)):
+            v = v[which] if len(v) == 2 else None
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        v = float(v)
+        return v if 0.0 <= v < 10.0 else None   # NaN fails both
+    except Exception:
+        return None
+
+
+def _tt_note_out_latency(stream) -> None:
+    """[turn-timing] out_lat_ms (R1 review, 2026-10-01): the answer's play
+    stream's reported output latency — sd.play() returning means the stream
+    started, not that the first sample is audible. Same thread rule as
+    play_open_ms. Never raises."""
+    try:
+        lat = _stream_latency_s(stream, 1)
+        if lat is not None:
+            _tt("note_stat", "out_lat_ms", int(round(lat * 1000.0)))
+    except Exception:
+        pass
+
+
+def _capture_lag_ms(q, stream, chunk) -> "int | None":
+    """[turn-timing] cap_lag_ms (R1 review, 2026-10-01), taken AT the VAD
+    break: how far the break — t0, a wall-clock instant — trails the clip's
+    last sample. tail_ms is audio time, so EOS -> answer is
+    tail_ms + this + first_play. Two parts:
+      * the chunks still queued behind the capture loop (`q`, the capture
+        queue; the clip ends at the break, so they are not in it) — noise
+        suppression running behind real time shows up here;
+      * the input stream's reported latency (an attribute read, see
+        _stream_latency_s), when it is known.
+    A lower bound: the elapsed part of the newest chunk is not counted.
+    Pure Python, no native call; never consumes the queue. None when the
+    backlog cannot be read. Never raises."""
+    try:
+        backlog = q.qsize() * float(chunk) / float(SAMPLE_RATE)
+    except Exception:
+        return None
+    try:
+        lat = _stream_latency_s(stream, 0) or 0.0
+        return int(round((backlog + lat) * 1000.0))
+    except Exception:
+        return None
+
+
 # tail_ms: record_speech's "21 silent chunks" count cannot measure the real
 # silence wait (a noise spike restarts it, so it is always 1,344 ms by
-# construction). A speech detector over the finished clip can. Its own ORT
-# session (core/endpointing.py), never faster-whisper's _stt_lock singleton.
+# construction). A speech detector over the finished clip can — in audio
+# time; how far the break itself trails the clip is cap_lag_ms
+# (_capture_lag_ms). Its own ORT session (core/endpointing.py), never
+# faster-whisper's _stt_lock singleton.
 # Nothing loads until the boot warmer below or the first capture.
 from core import endpointing as _endpointing  # noqa: E402
 
@@ -17196,7 +17253,10 @@ def record_speech(timeout: float | None = None, *,
                             peak_rms, len(chunks))
                     if silence_n >= silence_lim:
                         _prof("vad_break")
-                        _tt("note_vad_break")
+                        # [turn-timing]: t0, plus how far it trails the
+                        # clip's end (cap_lag_ms; pure Python, never raises).
+                        _tt("note_vad_break",
+                            _capture_lag_ms(audio_q, _record_stream, CHUNK))
                         break
                 elif timeout is not None and (time.time() - start_time) >= timeout:
                     if _debug_mode[0]:
@@ -23161,6 +23221,19 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
     # a heap-corrupting teardown, so raise into _speak's existing
     # device-hiccup handler (it logs the line and returns _speak_ok=False to
     # the streaming flush ledger).
+    #
+    # [turn-timing] play_open_ms (speed plan R1; R1 review 2026-10-01): from
+    # HERE — the body's first statement; only play_with_lipsync's self-echo
+    # registration (a lock and a dict insert) runs between _speak's
+    # first_play mark and it — to sd.play() returning with the stream
+    # started, the answer's first playback only
+    # (TurnTiming applies first_play's thread rule). It covers this claim
+    # (up to 1 s while a reinit runs), get_output_device()'s device refresh
+    # (a full PortAudio reinit at worst), the barge-in listener's start and
+    # the duck — not only the duck. out_lat_ms (the stream's reported output
+    # latency) is the rest of the way to the first audible sample. The
+    # duck_* marks are JARVIS_PERF_PROBE-only. Timing only.
+    _tt_open0 = _tt("now") if TURN_PLAY_OPEN_PROBE else None
     if not _pa_claim_owner(_tts_playback_active):
         raise RuntimeError("PortAudio reinit hung >1s — skipping playback")
     # A stale interrupt from a previous utterance (e.g. one that raced the
@@ -23218,11 +23291,8 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
         barge_watch_thread = threading.Thread(target=_barge_watch, daemon=True)
         barge_watch_thread.start()
 
-    # [turn-timing] play_open_ms (speed plan R1): from here — the duck's
-    # synchronous session scan — to sd.play() returning with the stream open,
-    # the answer's first playback only (TurnTiming applies first_play's
-    # thread rule). The duck_* marks are JARVIS_PERF_PROBE-only. Timing only.
-    _tt_open0 = _tt("now") if TURN_PLAY_OPEN_PROBE else None
+    # The duck's synchronous session scan, split out under JARVIS_PERF_PROBE
+    # (play_open_ms above already includes it).
     _prof("duck_start")
     # Duck Chrome / Spotify / Apple Music / Edge so JARVIS sits cleanly
     # over whatever's already playing. Fades down in the background so
@@ -23301,6 +23371,9 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
                     "[audio] sd.get_stream() failed — skipping playback reaper")
                 _stream = None
             if _stream is not None:
+                if _tt_open0 is not None:
+                    # Attribute read only (see _stream_latency_s).
+                    _tt_note_out_latency(_stream)
                 _done_evt = threading.Event()
                 _t = threading.Thread(target=_reap_playback,
                                       args=(_stream, _done_evt, audio_secs),
@@ -23370,6 +23443,8 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
                     "[audio] sd.get_stream() failed — skipping playback reaper (robot)")
                 _stream = None
             if _stream is not None:
+                if _tt_open0 is not None:
+                    _tt_note_out_latency(_stream)
                 _done_evt = threading.Event()
                 _t = threading.Thread(target=_reap_playback,
                                       args=(_stream, _done_evt, audio_secs),

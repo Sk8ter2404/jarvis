@@ -727,9 +727,12 @@ class WiringTests(_Base):
     def test_record_speech_notes_the_vad_break(self):
         src = inspect.getsource(self.bc.record_speech)
         brk = src.index('_prof("vad_break")')
-        self.assertLess(brk, src.index('_tt("note_vad_break")'))
-        self.assertLess(src.index('_tt("note_vad_break")'),
-                        src.index(" break\n", brk))
+        note = ('_tt("note_vad_break",\n'
+                '                            _capture_lag_ms(audio_q, '
+                '_record_stream, CHUNK))')
+        self.assertLess(brk, src.index(note))
+        self.assertLess(src.index(note), src.index(" break\n", brk))
+        self.assertEqual(src.count("note_vad_break"), 1)
 
     def test_filler_play_is_noted(self):
         src = inspect.getsource(self.bc._filler_play)
@@ -1105,20 +1108,70 @@ class R1PlaybackOpenTests(_Base):
         self.assertEqual(self._emit()["play_open_ms"], "210")
 
     def test_not_before_you_nor_from_another_thread(self):
+        self.stream.latency = 0.0464
         self._turn(you=False)
         self._play()                          # a reminder, pre-transcript
         self.timing.mark("you")
         th = threading.Thread(target=self._play, name="processing-filler")
         th.start()
         th.join(5)
-        self.assertEqual(self._emit()["play_open_ms"], "-")
+        d = self._emit()
+        self.assertEqual((d["play_open_ms"], d["out_lat_ms"]), ("-", "-"))
 
     def test_flag_off_records_nothing(self):
         self._p(self.bc, "TURN_PLAY_OPEN_PROBE", False)
+        self.stream.latency = 0.0464
         self._turn()
         self._play()
-        self.assertEqual(self._emit()["play_open_ms"], "-")
+        d = self._emit()
+        self.assertEqual((d["play_open_ms"], d["out_lat_ms"]), ("-", "-"))
         self.sd.play.assert_called_once()
+
+    # R1 review (2026-10-01): everything between first_play and the open
+    # stream is inside play_open_ms - the PortAudio claim, the output-device
+    # refresh (a full PortAudio reinit at worst) and the barge-in listener,
+    # not only the duck - and the stream's reported output latency is noted.
+    def test_the_setup_before_the_duck_is_timed_too(self):
+        bc = self.bc
+        claim = bc._pa_claim_owner
+
+        def slow_claim(*a, **k):
+            self.clock.advance(0.050)
+            return claim(*a, **k)
+
+        def slow_device():
+            self.clock.advance(0.300)        # a device refresh / reinit
+            return 1
+
+        self._p(bc, "_pa_claim_owner", side_effect=slow_claim)
+        self._p(bc, "get_output_device", side_effect=slow_device)
+        self._turn()
+        self._play()
+        # 50 claim + 300 refresh + 200 duck + the 10 ms read after sd.play().
+        self.assertEqual(self._emit()["play_open_ms"], "560")
+
+    def test_the_output_latency_is_noted_on_both_branches(self):
+        for robot in (False, True):
+            with self.subTest(robot=robot):
+                self._p(self.bc, "ROBOT_ENABLED", robot)
+                self.stream.latency = 0.0464
+                self._turn()
+                self._play()
+                self._play()                  # later playbacks: first wins
+                d = self._emit()
+                self.assertEqual((d["play_open_ms"], d["out_lat_ms"]),
+                                 ("210", "46"))
+
+    def test_an_unknown_output_latency_prints_dash(self):
+        for junk in (mock.Mock(), None, float("nan"), "0.05", -0.01,
+                     (0.01,), True):
+            with self.subTest(latency=junk):
+                self.stream.latency = junk
+                self._turn()
+                self._play()
+                d = self._emit()
+                self.assertEqual(d["out_lat_ms"], "-")
+                self.assertEqual(d["play_open_ms"], "210")
 
     def test_the_reaper_still_takes_exactly_three_args(self):
         seen = []
@@ -1139,6 +1192,107 @@ class R1PlaybackOpenTests(_Base):
         self._turn()
         self._play()
         self.sd.play.assert_called_once()
+
+
+@requires_monolith
+class R1CaptureLagTests(_Base):
+    """cap_lag_ms through the REAL record_speech (R1 review, 2026-10-01).
+    tail_ms is audio time (last speech -> the clip's last sample); the VAD
+    break, t0, is the wall-clock moment the loop handled that sample, later
+    by the input stream's latency plus every chunk still queued behind it.
+    The break hands that lag to the turn."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        from core import turn_timing as tt
+        self.tt = tt
+        self.timing = tt.TurnTiming(print_fn=lambda line: None,
+                                    clock=_Clock())
+        self._p(bc, "_turn_timing", self.timing)
+        self.lim = int(bc.SILENCE_SECS * bc.SAMPLE_RATE / 1024)
+
+    def _record(self, n_voiced, n_silent, latency):
+        """Queue every frame BEFORE the capture loop reads one (so the
+        backlog at the break is exact), run record_speech, then start the
+        turn the way the main loop does."""
+        bc = self.bc
+        np = bc.np
+
+        class FakeStream:
+            device = 1
+
+            def __init__(self, *a, callback=None, **k):
+                self.cb = callback
+                self.latency = latency
+
+            def start(self):
+                for amp, n in ((0.2, n_voiced), (0.0, n_silent)):
+                    frame = np.full((1024, 1), amp, dtype="float32")
+                    for _ in range(n):
+                        self.cb(frame, 1024, None, None)
+
+        self._p(bc, "_mic_input_disabled", return_value=False)
+        self._p(bc, "_mic_muted", [False])
+        self._p(bc, "_capture_holds_mic", return_value=False)
+        self._p(bc, "_input_backoff_wait", return_value=False)
+        self._p(bc, "get_input_device", return_value=1)
+        self._p(bc, "_safe_close_stream", lambda s: None)
+        self._p(bc.sd, "InputStream", FakeStream)
+        self._p(bc, "_note_live_capture", lambda *a, **k: None)
+        self._p(bc, "_filler_capture_mark", lambda *a, **k: None)
+        self._p(bc, "_fanout_record_frame", lambda *a, **k: None)
+        self._p(bc, "_process_capture_chunk",
+                lambda data, sr, skip_ns=False: data)
+        self._p(bc, "_spec_stt_should_snapshot", return_value=False)
+        self._p(bc, "pause_face_tracking")
+        self._p(bc, "set_state")
+        self._p(bc, "_write_hud_state")
+        self._p(bc, "_heartbeat")
+        self._p(bc, "VAD_THRESHOLD", 0.008)
+        since = self.timing.now()
+        with contextlib.redirect_stdout(io.StringIO()):
+            audio = bc.record_speech(timeout=3)
+        self.assertIsNotNone(audio, "no utterance was captured")
+        # The clip ends at the break: the queued chunks are not in it.
+        self.assertEqual(len(audio), (n_voiced + self.lim) * 1024)
+        self.timing.begin_voice(since)
+        return self.tt.parse_line(self.timing.emit())
+
+    def test_queued_chunks_and_input_latency_make_the_lag(self):
+        # 9 chunks (64 ms each) still queued + 100 ms of input latency.
+        d = self._record(6, self.lim + 9, 0.100)
+        self.assertEqual((d["vad_break"], d["cap_lag_ms"]), ("0", "676"))
+
+    def test_no_backlog_is_the_input_latency_alone(self):
+        d = self._record(6, self.lim, 0.100)
+        self.assertEqual(d["cap_lag_ms"], "100")
+
+    def test_an_unknown_input_latency_leaves_the_backlog(self):
+        d = self._record(6, self.lim + 9, None)
+        self.assertEqual(d["cap_lag_ms"], "576")
+
+    def test_the_helper_never_raises(self):
+        bc = self.bc
+        import queue as _queue
+        q = _queue.Queue()
+        for _ in range(3):
+            q.put(0)
+
+        class S:
+            latency = (0.05, 0.2)        # a duplex stream: (input, output)
+
+        self.assertEqual(bc._capture_lag_ms(q, S(), 1024), 242)
+        S.latency = float("nan")
+        self.assertEqual(bc._capture_lag_ms(q, S(), 1024), 192)
+        self.assertEqual(bc._capture_lag_ms(q, object(), 1024), 192)
+
+        class BadQ:
+            def qsize(self):
+                raise RuntimeError("qsize")
+
+        self.assertIsNone(bc._capture_lag_ms(BadQ(), S(), 1024))
+        self.assertIsNone(bc._capture_lag_ms(q, S(), "x"))
 
 
 @requires_monolith
@@ -1418,7 +1572,11 @@ class R1WiringTests(_Base):
     def test_playback_open_is_timed_on_both_branches(self):
         src = inspect.getsource(self.bc._play_with_lipsync_body)
         self.assertLess(src.index("_tt_open0 = _tt(\"now\")"),
+                        src.index("if not _pa_claim_owner("))
+        self.assertLess(src.index("_tt_open0 = _tt(\"now\")"),
                         src.index("_audio_ducker.duck()"))
+        self.assertEqual(src.count("_tt_open0 = "), 1)
+        self.assertEqual(src.count("_tt_note_out_latency(_stream)"), 2)
         self.assertEqual(src.count("_play_audio_safe()\n"
                                    "            _tt_note_elapsed("
                                    "\"play_open_ms\", _tt_open0)"), 2)

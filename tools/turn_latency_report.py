@@ -6,12 +6,25 @@ Speed plan R1 (2026-10-01). Every voice / typed turn prints ONE
 prints p50 / p90 per stage plus the end-to-end metrics the speed plan judges
 every later change by:
 
-  EOS -> answer       tail_ms + first_play   (mic turns; measured end of speech)
+  EOS -> answer       tail_ms + cap_lag_ms + first_play   (measured end of
+                      speech; tail_ms is audio time up to the clip's last
+                      sample, cap_lag_ms how far the VAD break trailed it)
+  EOS -> answer       tail_ms + first_play   (audio-domain part only: leaves
+                      out the capture lag, so it reads low by cap_lag_ms)
   EOS -> answer       1344 + first_play      (the pre-R1 assumption, for the
                                               old baseline and for lines that
                                               carry no tail_ms)
-  EOS -> audible      EOS -> answer + play_open_ms
-  EOS -> first sound  tail_ms + min(filler_ms, first_play)
+  EOS -> stream open  EOS -> answer + play_open_ms   (playback body entered
+                      -> sd.play() returned with the stream started)
+  EOS -> audible      EOS -> stream open + out_lat_ms   (PortAudio's reported
+                      output latency of that stream)
+  EOS -> first sound  tail_ms + cap_lag_ms + min(filler_ms, first_play)
+
+Every EOS row takes ONLY mic turns whose t0 is their VAD break
+(vad_break=0). A capture cut at MAX_RECORDING_SECS never breaks on silence:
+its t0 falls back to the stream close and its tail is ~0 (speech still
+going), so it has no end of speech to measure from. Such a turn still counts
+in every stage row that does not assume one.
 
 Mic turns (kind=voice) and typed / injected turns (kind=inject) are reported
 separately, mic turns also split filler / no filler (or by --split).
@@ -33,6 +46,13 @@ without one (older logs, or a key it did not print) groups as "?".
 
 The 2026-10-01 15:16:47 turn is excluded by default (attributed to Plan A's
 own live benchmark, unverified); --no-default-exclude keeps it.
+
+COVERAGE: JARVIS deletes all but its newest LOG_KEEP_COUNT (50) .log files at
+every boot (bobert_companion._cleanup_old_logs) — about 3-4 days at the
+2026-09-29/30 restart rate. The report prints the span its turns actually
+cover and warns when --since reaches back before the oldest session log. To
+baseline a longer window (or keep the "before" side of a --split flag=KEY
+A/B), copy the log folder out of the install first and pass --logs <copy>.
 """
 from __future__ import annotations
 
@@ -45,6 +65,7 @@ import sys
 
 DEFAULT_LOG_DIR = r"C:\JARVIS\logs"
 ASSUMED_TAIL_MS = 1344          # 21 chunks x 64 ms: the pre-R1 silence wait
+LOG_KEEP_COUNT = 50             # bobert_companion.LOG_KEEP_COUNT (test-pinned)
 DEFAULT_EXCLUDE = ("2026-10-01 15:16:47",)
 SPLITS = ("filler", "eot", "stt_engine", "pre", "cut", "cache", "day",
           "flag=<KEY>")
@@ -176,42 +197,73 @@ def _nonneg(v):
     return v if v is not None and v >= 0 else None
 
 
+def _add(*xs):
+    """Sum of the values; None when any is unknown."""
+    return None if any(x is None for x in xs) else sum(xs)
+
+
+def _at_vad(kv, v):
+    """`v` for a turn whose t0 IS its VAD break (vad_break=0); None for any
+    other — a MAX_RECORDING_SECS capture has no end of speech (docstring)."""
+    return v if kv.get("vad_break") == "0" else None
+
+
+def _eos_to_t0(kv):
+    """End of speech -> the VAD break: tail_ms (audio time) + cap_lag_ms."""
+    return _at_vad(kv, _add(_i(kv, "tail_ms"), _i(kv, "cap_lag_ms")))
+
+
 def _eos_answer(kv):
-    tail, fp = _i(kv, "tail_ms"), _i(kv, "first_play")
-    return None if tail is None or fp is None else tail + fp
+    return _add(_eos_to_t0(kv), _i(kv, "first_play"))
+
+
+def _eos_answer_audio(kv):
+    return _at_vad(kv, _add(_i(kv, "tail_ms"), _i(kv, "first_play")))
+
+
+def _eos_answer_assumed(kv):
+    return _at_vad(kv, _add(ASSUMED_TAIL_MS, _i(kv, "first_play")))
+
+
+def _eos_stream_open(kv):
+    return _add(_eos_answer(kv), _i(kv, "play_open_ms"))
+
+
+def _eos_audible(kv):
+    return _add(_eos_stream_open(kv), _i(kv, "out_lat_ms"))
 
 
 def _eos_first_sound(kv):
-    tail, fp, fm = _i(kv, "tail_ms"), _i(kv, "first_play"), _i(kv, "filler_ms")
-    if tail is None:
-        return None
-    firsts = [x for x in (fp, fm) if x is not None]
-    return tail + min(firsts) if firsts else None
+    base = _eos_to_t0(kv)
+    firsts = [x for x in (_i(kv, "first_play"), _i(kv, "filler_ms"))
+              if x is not None]
+    return None if base is None or not firsts else base + min(firsts)
 
 
 # (label, fn(kv) -> int | None). Mic turns.
 E2E_MIC = (
-    ("EOS->answer       tail_ms+first_play", _eos_answer),
-    ("EOS->answer       1344+first_play",
-     lambda kv: (None if _i(kv, "first_play") is None
-                 else ASSUMED_TAIL_MS + _i(kv, "first_play"))),
-    ("EOS->audible      +play_open_ms",
-     lambda kv: (None if _eos_answer(kv) is None
-                 or _i(kv, "play_open_ms") is None
-                 else _eos_answer(kv) + _i(kv, "play_open_ms"))),
-    ("EOS->first sound  tail_ms+min(filler,first)", _eos_first_sound),
+    ("EOS->answer       tail+lag+first_play", _eos_answer),
+    ("EOS->answer       tail_ms+first_play", _eos_answer_audio),
+    ("EOS->answer       1344+first_play", _eos_answer_assumed),
+    ("EOS->stream open  +play_open_ms", _eos_stream_open),
+    ("EOS->audible      +play_open_ms+out_lat_ms", _eos_audible),
+    ("EOS->first sound  tail+lag+min(filler,first)", _eos_first_sound),
 )
 # Typed turns have no capture: their clock starts at the inject drain.
 E2E_TYPED = (
     ("drain->answer     first_play", lambda kv: _i(kv, "first_play")),
-    ("drain->audible    first_play+play_open_ms",
-     lambda kv: (None if _i(kv, "first_play") is None
-                 or _i(kv, "play_open_ms") is None
-                 else _i(kv, "first_play") + _i(kv, "play_open_ms"))),
+    ("drain->stream open first_play+play_open_ms",
+     lambda kv: _add(_i(kv, "first_play"), _i(kv, "play_open_ms"))),
+    ("drain->audible    +out_lat_ms",
+     lambda kv: _add(_i(kv, "first_play"), _i(kv, "play_open_ms"),
+                     _i(kv, "out_lat_ms"))),
 )
 
 STAGES = (
-    ("tail_ms          end of speech->VAD break", lambda kv: _i(kv, "tail_ms")),
+    ("tail_ms          end of speech->clip end",
+     lambda kv: _at_vad(kv, _i(kv, "tail_ms"))),
+    ("cap_lag_ms       clip end->VAD break",
+     lambda kv: _at_vad(kv, _i(kv, "cap_lag_ms"))),
     ("clip_ms          captured clip", lambda kv: _i(kv, "clip_ms")),
     ("pre_stt          vad_break->stt_start",
      lambda kv: _d(kv, "vad_break", "stt_start")),
@@ -237,8 +289,10 @@ STAGES = (
      lambda kv: _nonneg(_d(kv, "actions_done", "synth_start"))),
     ("synth            synth_start->first_play",
      lambda kv: _d(kv, "synth_start", "first_play")),
-    ("play_open_ms     duck->stream open",
+    ("play_open_ms     play entry->stream started",
      lambda kv: _i(kv, "play_open_ms")),
+    ("out_lat_ms       reported output latency",
+     lambda kv: _i(kv, "out_lat_ms")),
     ("filler_ms        t0->first filler clip", lambda kv: _i(kv, "filler_ms")),
     ("filler_clip_ms   first filler clip", lambda kv: _i(kv, "filler_clip_ms")),
     ("you->first_play", lambda kv: _d(kv, "you", "first_play")),
@@ -340,12 +394,31 @@ def build_report(log_dir, since=None, until=None, kinds=("voice", "inject"),
             dropped += 1
             continue
         sel.append(t)
+    starts = [d for d in (session_start(p) for p in paths) if d is not None]
+    oldest = min(starts) if starts else None
     lines = ["JARVIS turn latency report (ms; read-only, numbers only)"]
-    lines.append(f"logs: {log_dir}  ({len(paths)} session files)")
+    lines.append(f"logs: {log_dir}  ({len(paths)} session files"
+                 + (f", oldest log starts {oldest:%Y-%m-%d %H:%M:%S})"
+                    if oldest else ")"))
     win = (f"{since:%Y-%m-%d %H:%M:%S}" if since else "start") + " .. " + \
         (f"{until:%Y-%m-%d %H:%M:%S}" if until else "end")
     lines.append(f"window: {win}   outcome: {outcome}   "
                  f"excluded: {dropped} turn(s)")
+    # What the logs actually hold for that window (see COVERAGE above).
+    if sel:
+        first = min(t["ts"] for t in sel)
+        last = max(t["ts"] for t in sel)
+        lines.append(f"covered: {first:%Y-%m-%d %H:%M:%S} .. "
+                     f"{last:%Y-%m-%d %H:%M:%S}  (first .. last turn)")
+    else:
+        lines.append("covered: no turns")
+    if since is not None and oldest is not None and oldest > since:
+        lines.append(
+            f"WARNING: the oldest session log starts "
+            f"{oldest:%Y-%m-%d %H:%M:%S}, after --since "
+            f"{since:%Y-%m-%d %H:%M:%S}: JARVIS keeps only its newest "
+            f"{LOG_KEEP_COUNT} .log files, so earlier turns may be gone. "
+            f"Baseline from a copy of the logs (--logs <copy>).")
     counts = {}
     for t in sel:
         key = (t["kv"].get("kind", "?"), t["kv"].get("outcome", "?"))

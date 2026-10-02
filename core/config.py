@@ -728,9 +728,10 @@ ANSWER_FIRST_ENABLED = True
 # speech detector (core/endpointing.py, its own ~2 MB CPU session) runs over
 # the last few seconds of each captured clip on a background thread and the
 # line gets tail_ms. Latches off for the session on the first failure (one
-# log line). TURN_PLAY_OPEN_PROBE — time the answer's first playback from the
-# music duck to the open stream (play_open_ms). Set via user_settings.json;
-# apply on the next start.
+# log line). TURN_PLAY_OPEN_PROBE — time the answer's first playback from
+# entering the playback body to the started stream (play_open_ms) and note
+# that stream's reported output latency (out_lat_ms). Set via
+# user_settings.json; apply on the next start.
 TURN_TAIL_PROBE = True
 TURN_PLAY_OPEN_PROBE = True
 

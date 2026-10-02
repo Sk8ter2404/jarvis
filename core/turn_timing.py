@@ -9,10 +9,10 @@ first audio out) into ONE line per turn::
 you=1584 llm_post=1650 llm_done=4410 actions_done=4418 synth_start=4420 \
 first_play=5120 end=5890 prompt_eval_count=11873 prompt_eval_ms=2702 \
 eval_count=84 eval_ms=790 llm_calls=1 turn_ctx_chars=1342 sys_chars=31012 \
-followup_rounds=0 filler=0 filler_ms=- tail_ms=1410 clip_ms=3904 \
-stt_wait_ms=0 stt_engine=- load_ms=13 total_ms=3512 play_open_ms=41 \
-filler_clip_ms=- eot=- st_p=- st_n=- pre=- cut=- amb_deferred=- cache=- \
-lead_dropped=0
+followup_rounds=0 filler=0 filler_ms=- tail_ms=1410 cap_lag_ms=128 \
+clip_ms=3904 stt_wait_ms=0 stt_engine=- load_ms=13 total_ms=3512 \
+play_open_ms=41 out_lat_ms=46 filler_clip_ms=- eot=- st_p=- st_n=- pre=- \
+cut=- amb_deferred=- cache=- lead_dropped=0
 
 Offsets are integer milliseconds from the turn's t0: the record_speech VAD
 break for a spoken turn, the inject-queue drain for a typed/injected turn. A
@@ -42,19 +42,32 @@ measures the real answer rather than the lead-in.
 Speed-plan R1 fields (2026-10-01), printed after filler_ms and before
 lead_dropped (NOTE_FIELDS; ``-`` = not measured on this turn):
 
-  tail_ms        measured end of speech -> end of the captured clip, i.e. the
-                 real silence wait before the VAD break: a speech detector
-                 (core/endpointing.py, Silero) run over the clip on a daemon.
-                 EOS -> first answer audio is ``tail_ms + first_play``.
+  tail_ms        measured end of speech -> the captured clip's last sample,
+                 in AUDIO time: a speech detector (core/endpointing.py,
+                 Silero) run over the clip on a daemon. Only a capture that
+                 ended on its VAD break (vad_break=0) ends at an end of
+                 speech; one cut at MAX_RECORDING_SECS prints vad_break=-.
+  cap_lag_ms     how far the VAD break (t0, a wall-clock instant) trails the
+                 clip's last sample: the input stream's reported latency plus
+                 the chunks still queued behind the capture loop when it
+                 broke (noise suppression running behind real time). A lower
+                 bound (the elapsed part of the newest chunk is not counted).
+                 Set by note_vad_break with the break itself, so it is only
+                 ever on the turn whose t0 IS that break. EOS -> first answer
+                 audio is ``tail_ms + cap_lag_ms + first_play``.
   clip_ms        length of the clip handed to STT (pre-roll included).
   stt_wait_ms    how long transcribe() waited for _stt_lock (an ambient
                  decode holding Whisper), the turn's own capture only.
   stt_engine     reserved (R6): which engine decoded the owner's capture.
   load_ms        Ollama load_duration of the answering local-LLM response.
   total_ms       Ollama total_duration of the same response.
-  play_open_ms   the answer's first playback: just before the music duck to
-                 the return of sd.play(), i.e. part of the gap between
-                 first_play and the first audible sample.
+  play_open_ms   the answer's first playback, from entering the playback body
+                 (before the PortAudio claim, the output-device refresh, the
+                 barge-in listener and the music duck) to sd.play() returning
+                 with the stream started.
+  out_lat_ms     that stream's output latency as PortAudio reported it at
+                 open — the rest of the way to the first audible sample. EOS
+                 -> audible is EOS -> first_play + play_open_ms + out_lat_ms.
   filler_clip_ms length of the first processing-filler clip played.
   eot st_p st_n  reserved (R7): end-of-turn verdict, Smart Turn p, checks.
   pre            reserved (R3): 1 when the answer was pre-rendered.
@@ -63,7 +76,8 @@ lead_dropped (NOTE_FIELDS; ``-`` = not measured on this turn):
   cache          reserved (R4): Kokoro render-cache verdict.
 
 They are set through TurnTiming.note_stat (load_ms / total_ms come with the
-answering response through llm_response), so later batches only fill a slot.
+answering response through llm_response, cap_lag_ms with the VAD break through
+note_vad_break), so later batches only fill a slot.
 
 Contracts (the monolith relies on every one):
   * print-only: nothing here changes behaviour, and no method ever raises;
@@ -97,18 +111,23 @@ _AFTER_YOU = frozenset(("synth_start", "first_play"))
 # Speed-plan R1 fields (see the module docstring). Inserted BEFORE
 # lead_dropped, which stays last: tests/test_turn_timing.py pins that, and the
 # log tools read every field by key (parse_line), never by position.
-NOTE_FIELDS = ("tail_ms", "clip_ms", "stt_wait_ms", "stt_engine", "load_ms",
-               "total_ms", "play_open_ms", "filler_clip_ms", "eot", "st_p",
-               "st_n", "pre", "cut", "amb_deferred", "cache")
+NOTE_FIELDS = ("tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms",
+               "stt_engine", "load_ms", "total_ms", "play_open_ms",
+               "out_lat_ms", "filler_clip_ms", "eot", "st_p", "st_n", "pre",
+               "cut", "amb_deferred", "cache")
 
 # Stats fields, printed after the marks in this order.
 STAT_FIELDS = ("prompt_eval_count", "prompt_eval_ms", "eval_count", "eval_ms",
                "llm_calls", "turn_ctx_chars", "sys_chars", "followup_rounds",
                "filler", "filler_ms", *NOTE_FIELDS, "lead_dropped")
 
-# The names note_stat accepts: every R1 field but load_ms / total_ms, which
-# only the answering response supplies (llm_response) — one writer each.
-_NOTE_NAMES = frozenset(NOTE_FIELDS) - {"load_ms", "total_ms"}
+# The R1 fields kept in a turn's notes (printed from there): all but
+# load_ms / total_ms, which only the answering response supplies
+# (llm_response).
+_NOTE_PRINTED = frozenset(NOTE_FIELDS) - {"load_ms", "total_ms"}
+# The names note_stat accepts: those, but cap_lag_ms, which only the VAD
+# break supplies (note_vad_break) — one writer each.
+_NOTE_NAMES = _NOTE_PRINTED - {"cap_lag_ms"}
 
 # Thread rules for note_stat (everything else follows mark(owner_only=True)):
 #   * any thread — the filler clip, a soft cut on the playback reaper, the
@@ -116,7 +135,7 @@ _NOTE_NAMES = frozenset(NOTE_FIELDS) - {"load_ms", "total_ms"}
 #   * like first_play — only after "you", from the turn's thread or a helper
 #     it adopted, so a reminder or tray line played first is not the answer.
 _ANY_THREAD_NAMES = frozenset(("filler_clip_ms", "cut", "amb_deferred"))
-_AFTER_YOU_NAMES = frozenset(("play_open_ms", "cache"))
+_AFTER_YOU_NAMES = frozenset(("play_open_ms", "out_lat_ms", "cache"))
 # Counts that add up over the turn instead of keeping the first value.
 _ADDITIVE_NAMES = frozenset(("amb_deferred",))
 # Any-thread names that may arrive before their turn begins and be adopted
@@ -270,6 +289,8 @@ class TurnTiming:
         self._print = print_fn if print_fn is not None else print
         self._clock = clock if clock is not None else time.perf_counter
         self._turn = None
+        # (clock, cap_lag_ms or None) of the last VAD break: ONE assignment,
+        # so a reader never pairs one break's time with another's lag.
         self._last_vad = None
         # note_stat values that arrived while NO turn was active, keyed by the
         # writer's thread ident (or _ANY): [(clock, name, value), ...]. A
@@ -284,11 +305,22 @@ class TurnTiming:
         except Exception:
             return None
 
-    def note_vad_break(self) -> None:
+    def note_vad_break(self, lag_ms=None) -> None:
         """record_speech's end-of-utterance break. Only remembered; the turn
-        that consumes it begins in the capture path (begin_voice)."""
+        that consumes it begins in the capture path (begin_voice).
+
+        `lag_ms`: how far this break trails the clip's last sample (the
+        cap_lag_ms field; record_speech's _capture_lag_ms). Kept WITH the
+        break, so only the turn that starts at this break prints it; anything
+        that is not a finite whole number of ms is dropped."""
         try:
-            self._last_vad = self._clock()
+            lag = None
+            if lag_ms is not None and not isinstance(lag_ms, bool):
+                try:
+                    lag = int(lag_ms)
+                except Exception:
+                    lag = None
+            self._last_vad = (self._clock(), lag)
         except Exception:
             pass
 
@@ -307,15 +339,19 @@ class TurnTiming:
     def begin_voice(self, since=None) -> None:
         """Start a spoken turn at the last VAD break, provided that break
         happened at or after `since` (the clock value taken just before the
-        record_speech call); otherwise at now. vad_break is offset 0."""
+        record_speech call); otherwise at now. vad_break is offset 0, and
+        the break's cap_lag_ms comes with it."""
         try:
-            vad = self._last_vad
+            last = self._last_vad
+            vad, lag = last if last is not None else (None, None)
             use_vad = vad is not None and (since is None or vad >= since)
             self.begin("voice", t0=vad if use_vad else None)
             with self._lock:
                 t = self._turn
                 if t is not None and use_vad:
                     t["marks"]["vad_break"] = vad
+                    if lag is not None:
+                        t["notes"]["cap_lag_ms"] = lag
                 # Adopt the stats this capture recorded before the turn
                 # existed: the caller's own pre-turn notes plus the any-thread
                 # ones, stamped at or after `since` (older ones belong to an
@@ -420,18 +456,20 @@ class TurnTiming:
     def note_stat(self, name: str, value) -> None:
         """Record one speed-plan field (NOTE_FIELDS) for the active turn.
 
-        Refuses any other name. The first value wins (amb_deferred adds up).
-        Thread rules: the turn's own thread only, like
-        mark(owner_only=True) — except filler_clip_ms / cut / amb_deferred
-        (any thread) and play_open_ms / cache (like first_play: after "you",
-        from the turn's thread or an adopted helper).
+        Refuses any other name (and cap_lag_ms: note_vad_break's). The
+        first value wins (amb_deferred adds up). Thread rules: the turn's own
+        thread only, like mark(owner_only=True) — except filler_clip_ms /
+        cut / amb_deferred (any thread) and play_open_ms / out_lat_ms / cache
+        (like first_play: after "you", from the turn's thread or an adopted
+        helper).
 
         With NO active turn, a value is kept for the turn that is about to
         begin: a standby wake transcribes its capture before begin_voice, and
         record_speech runs before every voice turn. begin_voice(since) adopts
         the caller's own values (amb_deferred: anyone's) stamped at or after
         `since`; everything else ages out of a small bounded stash.
-        play_open_ms / cache / filler_clip_ms / cut need a live turn.
+        play_open_ms / out_lat_ms / cache / filler_clip_ms / cut need a live
+        turn.
 
         `value` may be a zero-argument callable (a result still being worked
         out on a daemon, e.g. tail_ms): it is called once when the line is
@@ -610,7 +648,7 @@ def format_line(turn: dict, end, outcome: str = "ok") -> str:
     for k in STAT_FIELDS:
         if k == "filler_ms":
             parts.append(f"filler_ms={_off(t0, turn['filler_at'])}")
-        elif k in _NOTE_NAMES:
+        elif k in _NOTE_PRINTED:
             parts.append(f"{k}={_note_value(notes.get(k))}")
         else:
             v = vals.get(k)

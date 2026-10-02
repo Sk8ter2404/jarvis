@@ -7,9 +7,12 @@ record_speech ends a capture after 21 silent 64 ms chunks (1,344 ms) in a row.
 counting chunks since the last loud one therefore ALWAYS gives exactly 1,344
 ms and cannot measure the real wait. This module runs a speech detector over
 the finished clip instead and reports how long the clip ran on after the last
-speech window: ``tail_ms``, the real wait from end of speech to the VAD break.
-The [turn-timing] line prints it; EOS -> first answer audio is then
-``tail_ms + first_play`` (core/turn_timing.py).
+speech window: ``tail_ms``, in AUDIO time (last speech window -> the clip's
+last sample). The VAD break — the turn's t0 — is the wall-clock moment the
+capture loop handled that last sample, which trails it by the capture lag
+(the input stream's latency plus any chunks still queued behind the loop);
+the [turn-timing] line prints that as ``cap_lag_ms``. EOS -> first answer
+audio is then ``tail_ms + cap_lag_ms + first_play`` (core/turn_timing.py).
 
 SileroVad opens its OWN onnxruntime session on faster-whisper's bundled
 ``assets/silero_vad_v6.onnx`` (intra-op 1, inter-op 1, spin-wait off). It never
