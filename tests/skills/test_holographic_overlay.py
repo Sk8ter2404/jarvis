@@ -111,6 +111,13 @@ def _fake_bobert(**flags):
     return bc
 
 
+def _no_temp_files():
+    """Refuse tempfile.mkstemp for the with-block (see _load_isolated)."""
+    return mock.patch.object(
+        tempfile, "mkstemp",
+        side_effect=OSError("[test] no control-file writes during the load"))
+
+
 def _load_isolated(bobert=None):
     """Load the package skill in isolation.
 
@@ -122,16 +129,20 @@ def _load_isolated(bobert=None):
       control-file writes); the watcher-start flags are left absent, so the
       retired watchers stay off on their False fallbacks (core/config.py's
       values) - tests that need one armed pin its flag True.
-    • ``open``/``os.replace`` are stubbed during the load so that even if a
-      surface does auto-launch, its atomic control-file write can't touch a real
-      project file (paths aren't redirected until after the module exists).
+    • ``open``/``os.replace``/``tempfile.mkstemp`` are stubbed during the load
+      so that even if a surface does auto-launch, its atomic control-file write
+      can't touch a real project file (paths aren't redirected until after the
+      module exists). The writers go through core.atomic_io, whose temp file
+      comes from mkstemp + os.fdopen, not ``open``: refusing mkstemp makes the
+      write fail (and the writer swallow it) before anything reaches disk.
     """
     if bobert is None:
         bobert = _fake_bobert(WORKSHOP_HUD_AUTO_LAUNCH=False)
     with inject_modules(bobert_companion=bobert), \
             mock.patch.object(subprocess, "Popen") as popen, \
             mock.patch("builtins.open", mock.mock_open()), \
-            mock.patch.object(os, "replace"):
+            mock.patch.object(os, "replace"), \
+            _no_temp_files():
         popen.return_value = _fake_proc(alive=True)
         mod, actions = load_skill_isolated("holographic_overlay")
     return mod, actions
@@ -278,6 +289,7 @@ class RegisterTests(_HoloBase):
                 mock.patch("os.path.exists", return_value=True), \
                 mock.patch("builtins.open", mock.mock_open()), \
                 mock.patch.object(os, "replace"), \
+                _no_temp_files(), \
                 mock.patch.object(subprocess, "Popen") as popen:
             popen.return_value = _fake_proc(alive=True)
             mod, _actions = load_skill_isolated("holographic_overlay")
@@ -319,6 +331,26 @@ class RegisterTests(_HoloBase):
         self.assertIsNotNone(mod._HOLO_HUD_V2_PROCESS)
         self.assertIsNotNone(mod._ARC_STATUS_PROCESS)
         self.assertIsNotNone(mod._STARK_STATUS_PROCESS)
+
+    def test_auto_launch_during_the_load_writes_nothing_real(self):
+        # The auto-launched surfaces write their control files while the
+        # module still points at the REAL project root. Since the writers moved
+        # to core.atomic_io (mkstemp + os.fdopen, not open()), a load that
+        # stubbed only open/os.replace left a real tmp*.tmp in the project root
+        # per surface.
+        root = self.mod._PROJECT_DIR
+
+        def temps():
+            return {n for n in os.listdir(root) if n.endswith(".tmp")}
+
+        before = temps()
+        self._load_with_flags(
+            WORKSHOP_HUD_AUTO_LAUNCH=True,
+            HOLO_HUD_V2_AUTO_LAUNCH=True,
+            HOLO_ARC_REACTOR_STATUS_AUTO_LAUNCH=True,
+            HOLO_STARK_STATUS_RING_AUTO_LAUNCH=True,
+        )
+        self.assertEqual(temps() - before, set())
 
     def test_optional_surfaces_dormant_by_default(self):
         # All three optional surfaces default OFF (flags absent → getattr False).
