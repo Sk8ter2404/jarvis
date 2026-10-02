@@ -16231,6 +16231,17 @@ def _heartbeat():
         _watchdog_reset_signal.clear()
 
 
+def _dispatch_heartbeat() -> None:
+    """_heartbeat() for parse_and_run_actions, ticked around each action it
+    runs (2026-10-01, audit P1-1): a chain of actions ran back to back with no
+    tick at all, and the follow-up round that runs them is not inside the
+    thinking animation that ticks during an LLM call. ONLY on the main loop's
+    own thread - the beat means "the main loop is alive", so a dispatch on any
+    other thread must never hide a wedged one."""
+    if threading.current_thread() is threading.main_thread():
+        _heartbeat()
+
+
 def _main_loop_watchdog_check(now: float | None = None,
                               threshold: float | None = None) -> bool:
     """One tick of the watchdog. Returns True if a stall was detected and
@@ -18148,6 +18159,22 @@ def transcribe(audio: np.ndarray) -> tuple[str, dict]:
         return _transcribe_impl(audio)
 
 
+# THE NO-VAD RETRY IS BOUNDED (2026-10-01, audit P1-1). When Silero VAD finds
+# no speech, _transcribe_impl decodes the clip once more with the VAD off, so a
+# quiet "JARVIS" is not lost. That retry ran at beam 5 with faster-whisper's
+# default temperature fallback (up to 6 decodes, best-of-5 sampling past the
+# first) on a buffer of any length - and on room noise the fallback is exactly
+# what runs to the end. It sat on the main loop between record_speech and the
+# reply with no heartbeat: one leg of the ~64 s watchdog stall. Now it is ONE
+# greedy decode (beam 1, temperature 0) and only for a clip of at most this
+# many seconds; a longer clip with no speech in it is noise. There is no
+# wall-clock timer around it: the native decode cannot be interrupted, and
+# abandoning it would leave it running outside _stt_lock (the 0xc0000409
+# concurrent-decode crash). Bounding the work is what bounds the time.
+_STT_NO_VAD_RETRY_MAX_AUDIO_S = 10.0
+_STT_NO_VAD_RETRY_BEAM = 1
+
+
 def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
     """Returns (text, confidence) where confidence has no_speech_prob and avg_logprob.
     Abstracts over faster-whisper (preferred, GPU-accelerated on 3090) and
@@ -18181,11 +18208,14 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
                 beam_size=5, hotwords=_hot,
             )
             segments = list(segments_gen)
-            if not segments:
+            # Bounded retry: see _STT_NO_VAD_RETRY_MAX_AUDIO_S.
+            if (not segments and len(audio) <= float(SAMPLE_RATE)
+                    * _STT_NO_VAD_RETRY_MAX_AUDIO_S):
                 segments_gen, info = _stt.transcribe(
                     audio, language="en",
                     vad_filter=False,
-                    beam_size=5, hotwords=None,
+                    beam_size=_STT_NO_VAD_RETRY_BEAM, temperature=0.0,
+                    hotwords=None,
                 )
                 segments = list(segments_gen)
             # Native decode completed without a CUDA fault — clear the
@@ -32573,6 +32603,9 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             except Exception as _e:
                 print(f"  [mission_narration] cue failed: {_e}")
 
+        # Watchdog beat per action (audit P1-1); ticked again in the finally
+        # so a long last action does not leave the reply on a stale beat.
+        _dispatch_heartbeat()
         _write_hud_state(active_action=name,
                          now_doing=f"EXECUTING: {name}")
         # Mid-task status bridge: for long-running actions, start a timer
@@ -32688,6 +32721,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                 recent_action_at=time.time(),
                 now_doing=_now_doing_label(_current_state_label[0]),
             )
+            _dispatch_heartbeat()
         return ""
 
     cleaned = _ACTION_RE.sub(_runner, reply).strip()
