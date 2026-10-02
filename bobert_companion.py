@@ -40842,6 +40842,133 @@ def _run_timer_list_shortcut(text: str) -> bool:
         empty_reply="I could not read the timer list just now, sir.")
 
 
+# ── Instant actions (2026-10-02) ─────────────────────────────────────────
+# Volume, media transport, lights on/off and "pause the print" without the
+# brain (core/instant_actions.py has the rules and why each exclusion is
+# there). INSTANT_ACTIONS_MODE (core.config):
+#   shadow (default) _run_llm_dispatch_body still asks the brain; this side
+#          logs "[instant] would run <action> without the brain" and, after
+#          the first parse_and_run_actions, whether the brain ran the same
+#          action: one row in data/instant_actions.jsonl (time + action names
+#          only). tools/instant_actions_report.py scores it.
+#   on     the action's token is the turn's reply and runs exactly like an
+#          utterance route (same bookkeeping, no LLM call); its own result,
+#          or a short acknowledgement, is what the owner hears, and no
+#          follow-up round asks the brain to restate it. A FAILED action still
+#          gets the normal failure follow-up, so a failure is never silent.
+#   off    nothing is matched or logged.
+from core import instant_actions as _instant_actions  # noqa: E402
+
+
+def _instant_actions_mode() -> str:
+    """INSTANT_ACTIONS_MODE as 'shadow' / 'on' / 'off' (unknown = shadow)."""
+    return _instant_actions.normalize_mode(
+        globals().get("INSTANT_ACTIONS_MODE", _instant_actions.DEFAULT_MODE))
+
+
+def _instant_actions_log_path() -> str:
+    """data/instant_actions.jsonl for THIS process: core.paths, so staging
+    and JARVIS_DATA_DIR redirect it. A seam for tests."""
+    from core import paths as _paths
+    return _paths.data_file(_instant_actions.LOG_NAME)
+
+
+def _instant_action_blocked(name: str, arg: str) -> bool:
+    """True when ``name`` must be left to the brain because running it could
+    need the owner's yes: CONFIRM_KEYWORDS (_needs_confirmation), a
+    protected or self-terminating action, or a pushback objection - the
+    gates parse_and_run_actions applies, asked BEFORE the turn commits to the
+    instant path. Fails safe: any fault is True."""
+    try:
+        if _needs_confirmation(name, arg) or _autocorrect_protected(name):
+            return True
+        if _self_terminating_target(name):
+            return True
+        return _jarvis_pushback(name, arg) is not None
+    except Exception:
+        return True
+
+
+def _instant_same_handler(a: str, b: str) -> bool:
+    """Both action names are bound to one handler (an alias pair such as
+    smart_home_control / control_device)."""
+    fa, fb = ACTIONS.get(a), ACTIONS.get(b)
+    return fa is not None and fa is fb
+
+
+def _instant_action_for(text: str):
+    """The core.instant_actions.InstantAction this owner turn matches (and
+    the "[instant]" log line), or None. None when INSTANT_ACTIONS_MODE is
+    off or PC control is off (no action may run then). Never raises."""
+    mode = _instant_actions_mode()
+    if mode == "off" or not globals().get("PC_CONTROL_ENABLED", True):
+        return None
+    try:
+        hit = _instant_actions.match(
+            text, ACTIONS.keys(),
+            allow=globals().get("INSTANT_ACTIONS_ALLOW", ()),
+            blocked=_instant_action_blocked)
+    except Exception as _e:
+        print(f"  [instant] match failed: {type(_e).__name__}")
+        return None
+    if hit is None:
+        return None
+    if mode == "on":
+        print(f"  [instant] {hit.action} without the brain")
+    else:
+        print(f"  [instant] would run {hit.action} without the brain")
+    return hit
+
+
+def _instant_action_after_run(hit, spoken_text, action_results, *,
+                              ran: bool, brain: bool):
+    """After the turn's FIRST parse_and_run_actions. ``ran``: the instant
+    token was the reply (mode on). ``brain``: the brain wrote the reply
+    (shadow); a glance reply is neither and is not scored.
+
+    shadow: log whether the brain ran ``hit.action`` (or an alias of it).
+    on:     log whether it ran cleanly and, when it did, mark its result not
+            informative (no follow-up LLM round to restate it) and speak its
+            own result or the short acknowledgement - a verbatim-result action
+            is voiced by _speak_verbatim_results as usual. A failed or
+            deferred result is left alone for the normal failure path.
+    Returns (spoken_text, action_results). Never raises."""
+    try:
+        if ran:
+            mine = [r for (n, r, _i) in action_results or ()
+                    if str(n or "").lower() == hit.action]
+            ok = bool(mine) and all(
+                isinstance(r, str) and not r.lstrip().startswith("⚠")
+                and not _action_result_failed(r) for r in mine)
+            _instant_actions.append_row(
+                _instant_actions_log_path(),
+                _instant_actions.on_row(hit.action, ok))
+            if not ok:
+                print(f"  [instant] {hit.action} did not run cleanly - the "
+                      f"normal failure path reports it")
+                return spoken_text, action_results
+            action_results = [
+                (n, r, False if str(n or "").lower() == hit.action else i)
+                for (n, r, i) in action_results]
+            if hit.action not in SPEAK_RESULT_VERBATIM_ACTIONS:
+                spoken_text = _instant_actions.spoken_line(hit, mine[-1])
+            return spoken_text, action_results
+        if brain:
+            ran_names = _instant_actions.brain_ran(action_results,
+                                                   ACTIONS.keys())
+            agree = _instant_actions.agrees(hit.action, ran_names,
+                                            same_handler=_instant_same_handler)
+            _instant_actions.append_row(
+                _instant_actions_log_path(),
+                _instant_actions.shadow_row(hit.action, ran_names, agree))
+            print(f"  [instant] brain ran "
+                  f"{', '.join(ran_names) or 'no action'} - "
+                  f"{'agrees' if agree else 'disagrees'} with {hit.action}")
+    except Exception as _e:
+        print(f"  [instant] bookkeeping failed: {type(_e).__name__}")
+    return spoken_text, action_results
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  Experimental low-latency voice wiring (opt-in, default-off, fail-safe)
 # ──────────────────────────────────────────────────────────────────────────
@@ -42391,6 +42518,15 @@ def _run_llm_dispatch_body(text: str) -> str:
     # A skill's utterance route (see _UTTERANCE_ROUTES) claims an exact request
     # before the glance check and the LLM: its action token IS the reply.
     _route_reply = _utterance_route_reply(text)
+    # Instant actions (2026-10-02): a basic volume / media / lights / print-
+    # pause command (_instant_action_for). Mode "on" makes its token the reply
+    # and it runs exactly like a route below; "shadow" only logs it, and the
+    # brain's reply is scored against it after the first parse_and_run_actions
+    # (_instant_action_after_run).
+    _instant = None if _route_reply is not None else _instant_action_for(text)
+    _instant_on = _instant is not None and _instant_actions_mode() == "on"
+    if _instant_on:
+        _route_reply = _instant.token
     _glance_reply = (None if _route_reply is not None
                      else maybe_glance_response(text))
     if _route_reply is not None:
@@ -42437,6 +42573,12 @@ def _run_llm_dispatch_body(text: str) -> str:
     # Execute any [ACTION: ...] tokens, get the cleaned text for TTS
     spoken_text, action_results = parse_and_run_actions(reply)
     _tt("mark", "actions_done", owner_only=True)
+    # Instant actions: score the brain (shadow) or settle the instant turn so
+    # no follow-up round asks the brain to restate it (on).
+    if _instant is not None:
+        spoken_text, action_results = _instant_action_after_run(
+            _instant, spoken_text, action_results, ran=_instant_on,
+            brain=not _instant_on and _glance_reply is None)
     # Sentence-flush streaming TTS: the leading sentence(s) may already have
     # been voiced while the reply streamed (_call_llm's flush buffer). Strip
     # exactly that prefix so they aren't spoken twice; if the whole reply was

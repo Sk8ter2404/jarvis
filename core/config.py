@@ -1015,6 +1015,28 @@ TURN_CHECK_ESCALATE_MODEL = "claude-sonnet-5-5"
 # user_settings.json; applies on the next start.
 FAST_PATHS_ENABLED = True
 
+# ─── Instant actions (core/instant_actions.py, 2026-10-02) ──────────────
+# A basic command — volume up / down / mute / unmute, pause / resume / next /
+# previous track, lights on / off, pause the print — matched by anchored,
+# precision-first rules. Never a question, a "can you ...?" ask, two commands
+# in one sentence, a pronoun ("turn it up") or anything that needs a yes.
+# INSTANT_ACTIONS_MODE:
+#   "shadow" (default) the brain still answers every turn. The action that
+#            WOULD have run and whether the brain ran the same one go to
+#            data/instant_actions.jsonl (time + action names only, never the
+#            owner's words). Score it: python tools/instant_actions_report.py
+#   "on"     the action runs at once with a short spoken line; no LLM call.
+#   "off"    nothing is matched or logged.
+# INSTANT_ACTIONS_ALLOW: the registered action names it may run. It can only
+# narrow core/instant_actions.RULE_ACTIONS (a name no rule produces is
+# ignored). Set via user_settings.json; applies on the next start.
+INSTANT_ACTIONS_MODE = "shadow"
+INSTANT_ACTIONS_ALLOW = [
+    "volume_up", "volume_down", "volume_mute", "volume_unmute",
+    "pause_music", "resume_music", "next_song", "previous_song",
+    "smart_home_control", "pause_print",
+]
+
 # ─── Teams unread-message nudger (skills/teams_nudge.py) ──────────────────
 # The background loop screenshots the screen every 10 minutes and asks the
 # vision model whether Teams shows an unread badge. Off by default

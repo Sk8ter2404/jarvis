@@ -1081,6 +1081,19 @@ SCHEMA: dict[str, dict] = {
                 "exactly, without the AI model. Anything else still goes to "
                 "the model. Applies on the next start.",
     },
+    "INSTANT_ACTIONS_MODE": {
+        "tab": "ai", "label": "Instant actions (volume, music, lights, print pause)",
+        "type": "enum", "choices": ["shadow", "on", "off"],
+        "default": "shadow",
+        "help": "shadow = the AI model still answers, and JARVIS only logs "
+                "the action it would have run instantly and whether the "
+                "model agreed (data/instant_actions.jsonl: times and action "
+                "names, never your words). on = 'volume up', 'pause the "
+                "music', 'next song', 'turn off the lights', 'pause the "
+                "print' run at once, without the model. off = neither. "
+                "Questions and 'can you ...?' always go to the model. "
+                "Applies on the next start.",
+    },
     "TEAMS_NUDGE_ENABLED": {
         "tab": "ai", "label": "Teams unread-message nudger (background)",
         "type": "bool", "default": False,
@@ -1940,7 +1953,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                    "LOCAL_LLM_FALLBACK", "LOCAL_VISION_FALLBACK",
                    "AMBIENT_LEARNING_FORCE_LOCAL", "GAME_MODE_ENABLED"]),
         ("Memory", ["LTM_ENABLED", "RAG_ENABLED"]),
-        ("Speed", ["FAST_PATHS_ENABLED", "PROMPT_FREEZE_QUIET_S",
+        ("Speed", ["FAST_PATHS_ENABLED", "INSTANT_ACTIONS_MODE",
+                   "PROMPT_FREEZE_QUIET_S",
                    "LOCAL_PREFIX_REPRIME", "LOCAL_BACKGROUND_MAX_DEFER_S",
                    "LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S",
                    "BACKGROUND_TAG_STRICT", "LOCAL_REPRIME_AT_BOOT_S"]),

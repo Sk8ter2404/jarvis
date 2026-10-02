@@ -65,6 +65,9 @@ _IMPORT_LIGHT_CORE = (
     # The retired-model guard (2026-10-02): stdlib only, imported by
     # core.llm_client (every Claude call) and core.orchestrator.
     "core.claude_model_guard",
+    # Instant actions (2026-10-02): stdlib + core modules that do no I/O at
+    # import, imported at monolith import time.
+    "core.instant_actions",
 )
 
 
