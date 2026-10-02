@@ -38,6 +38,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import webbrowser
@@ -3649,6 +3650,31 @@ _OPEN_ON_MONITOR_GRACE_S = 2.0
 # Seconds with no fresh window, while a pre-existing window matches the
 # target, before open_on_monitor concludes the app reused that window.
 _OPEN_ON_MONITOR_REUSE_S = 4.0
+# How long open_on_monitor waits on the voice turn for the new window.
+_OPEN_ON_MONITOR_WAIT_S = 15.0
+# A slow-starting app (2026-10-02 live, 14:47:52: Teams, closed since the
+# morning, showed no window inside the 15 s wait, and was still windowless 46 s
+# after the launch) is then watched for this much longer OFF the voice thread,
+# and its window is moved when it appears. Bounded; one log line either way.
+_OPEN_ON_MONITOR_WATCH_S = 30.0
+_OPEN_ON_MONITOR_WATCH_POLL_S = 0.5
+# Words that name a vendor or a kind of program, not one app: "Microsoft
+# Teams" is ms-teams.exe, never every "Microsoft ..." window on the desktop.
+_APP_GENERIC_WORDS = frozenset({
+    "microsoft", "google", "adobe", "apple", "the", "app", "application",
+    "desktop", "client", "new", "classic", "windows", "for", "and",
+})
+# The browser executables' name words (the process-name half of
+# _is_browser_window; the title half is the monolith's suffix list).
+_BROWSER_PROCESS_WORDS = ("chrome", "msedge", "firefox", "brave", "opera",
+                          "vivaldi", "chromium", "iexplore")
+# Processes that host OTHER apps' windows (packaged apps such as Calculator):
+# their name says nothing about the app, so the title decides.
+_APP_HOST_PROCESSES = frozenset({"applicationframehost.exe"})
+# The background watches by target: a newer request for the same app takes
+# over (the older one stops), so one window is never moved twice.
+_OPEN_WATCHES: dict = {}
+_OPEN_WATCHES_LOCK = threading.Lock()
 
 
 def _window_key(w):
@@ -3659,10 +3685,191 @@ def _window_key(w):
     return hwnd if hwnd is not None else w
 
 
+def _app_words(target) -> list:
+    """The words of an app name that identify THAT app ("Microsoft Teams" ->
+    ["teams"]); all its words when every one is generic."""
+    toks = [t for t in re.split(r"[^a-z0-9+#]+", str(target or "").lower())
+            if len(t) >= 3]
+    own = [t for t in toks if t not in _APP_GENERIC_WORDS]
+    return own or toks
+
+
+def _compact(s) -> str:
+    return re.sub(r"[^a-z0-9+#]", "", str(s or "").lower())
+
+
+def _exe_stem(proc) -> str:
+    return _compact(re.sub(r"\.exe$", "", str(proc or "").strip(), flags=re.I))
+
+
+def _is_browser_window(bc, w) -> bool:
+    """True when ``w`` is a web browser's window (its process, or its title's
+    browser suffix). Never raises: on a fault True, so a window that may be
+    the owner's stream is never moved (B092)."""
+    try:
+        proc = _window_process_name(w)
+        if proc and proc.strip().lower() not in _APP_HOST_PROCESSES:
+            return any(b in _exe_stem(proc) for b in _BROWSER_PROCESS_WORDS)
+        return _browser_page_title(bc, getattr(w, "title", "") or "") is not None
+    except Exception:
+        return True
+
+
+def _is_app_window(bc, w, words) -> bool:
+    """True when window ``w`` belongs to the app ``words`` names
+    (_app_words): its process executable carries one of them (the v2.0.176
+    process-name match - "ms-teams.exe" for "Microsoft Teams"), or, when the
+    process can't be read or is a shared app host (a packaged app's
+    ApplicationFrameHost.exe), its title carries them all and is not a page
+    in a browser (unless the words name the browser itself). Never raises."""
+    try:
+        if not words:
+            return False
+        proc = _window_process_name(w)
+        if proc and proc.strip().lower() not in _APP_HOST_PROCESSES:
+            stem = _exe_stem(proc)
+            return any(_compact(t) in stem for t in words if _compact(t))
+        title = (getattr(w, "title", "") or "").lower()
+        if not title or not all(t in title for t in words):
+            return False
+        if _browser_page_title(bc, title) is not None:
+            return _query_names_browser(" ".join(words))
+        return True
+    except Exception:
+        return False
+
+
+def _usable_window(w) -> bool:
+    """A titled window big enough to be an app's own (not a splash, tooltip
+    or tray stub) - or minimized, which Windows reports as a tiny icon rect.
+    Never raises."""
+    try:
+        if not (getattr(w, "title", "") or "").strip():
+            return False
+        if getattr(w, "isMinimized", False) is True:
+            return True
+        return not (w.width < 200 or w.height < 200)
+    except Exception:
+        return True
+
+
+def _place_on_monitor(w, mx, my, sleep=None) -> None:
+    """Restore ``w``, move it onto the monitor whose origin is (mx, my) and
+    maximize it there. Raises what pygetwindow raises."""
+    sleep = sleep or time.sleep
+    w.restore()
+    sleep(0.1)
+    w.moveTo(mx + 50, my + 50)
+    sleep(0.1)
+    w.maximize()
+
+
+def _watch_for_app_window(gw, bc, target, words, hwnds_before, monitor_name,
+                          rect, *, waited_s=0.0, timeout_s=None, poll_s=None,
+                          clock=None, sleep=None, cancel=None) -> str:
+    """Wait (on a background thread) up to ``timeout_s`` for a NEW window of
+    the app ``target`` (one not in ``hwnds_before``, _is_app_window) and move
+    it to ``monitor_name`` (``rect`` = MONITORS[monitor_name]). Prints one
+    line. Returns "moved", "move-failed", "timeout" or "cancelled" (a newer
+    request took over: ``cancel`` set). ``clock`` / ``sleep`` are injectable
+    for tests. Never raises."""
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    timeout_s = _OPEN_ON_MONITOR_WATCH_S if timeout_s is None else timeout_s
+    poll_s = _OPEN_ON_MONITOR_WATCH_POLL_S if poll_s is None else poll_s
+    tag = f"  [open-on-monitor] {target}:"
+    try:
+        start = clock()
+        deadline = start + float(timeout_s)
+        while clock() < deadline:
+            if cancel is not None and cancel.is_set():
+                print(f"{tag} a newer request took over the window watch")
+                return "cancelled"
+            sleep(poll_s)
+            try:
+                windows = gw.getAllWindows()
+            except Exception:
+                windows = []
+            for w in windows:
+                if (_window_key(w) in hwnds_before or not _usable_window(w)
+                        or not _is_app_window(bc, w, words)):
+                    continue
+                after = float(waited_s) + (clock() - start)
+                try:
+                    _place_on_monitor(w, rect[0], rect[1], sleep)
+                except Exception as e:
+                    print(f"{tag} its window appeared {after:.0f} s after the "
+                          f"launch but could not be moved: {e}")
+                    return "move-failed"
+                print(f"{tag} its window appeared {after:.0f} s after the "
+                      f"launch - moved it to the {monitor_name} monitor")
+                return "moved"
+        print(f"{tag} no window within {float(waited_s) + float(timeout_s):.0f}"
+              f" s of the launch - left it to open where it opens")
+        return "timeout"
+    except Exception as e:
+        print(f"{tag} the window watch stopped: {e}")
+        return "timeout"
+
+
+def _start_open_watch(gw, bc, target, words, hwnds_before, monitor_name,
+                      rect, waited_s) -> "threading.Thread | None":
+    """Run _watch_for_app_window on a daemon thread - never on the voice
+    turn. A watch already running for the same app is told to stop first.
+    Returns the thread, None when it could not start. Never raises."""
+    key = " ".join(words) or str(target).lower()
+    cancel = threading.Event()
+    with _OPEN_WATCHES_LOCK:
+        old = _OPEN_WATCHES.get(key)
+        if old is not None:
+            old.set()
+        _OPEN_WATCHES[key] = cancel
+
+    def _run():
+        try:
+            _watch_for_app_window(gw, bc, target, words, hwnds_before,
+                                  monitor_name, rect, waited_s=waited_s,
+                                  cancel=cancel)
+        finally:
+            with _OPEN_WATCHES_LOCK:
+                if _OPEN_WATCHES.get(key) is cancel:
+                    del _OPEN_WATCHES[key]
+
+    try:
+        t = threading.Thread(target=_run, name="open-on-monitor-watch",
+                             daemon=True)
+        t.start()
+        return t
+    except Exception:
+        with _OPEN_WATCHES_LOCK:
+            if _OPEN_WATCHES.get(key) is cancel:
+                del _OPEN_WATCHES[key]
+        return None
+
+
+def _launch_failed(result) -> bool:
+    """True when _act_launch_app's result says the launch itself failed."""
+    try:
+        if not isinstance(result, str):
+            return False
+        from core.failure_markers import FAILURE_MARKERS
+        low = result.lower()
+        return any(m in low for m in FAILURE_MARKERS)
+    except Exception:
+        return False
+
+
 def _act_open_on_monitor(args: str) -> str:
     """args format: '<monitor_name> | <url-or-app-name>' (or the comma form,
     see _split_monitor_args). Opens the URL or launches the app, then moves the
-    resulting window to the named monitor and maximizes it."""
+    resulting window to the named monitor and maximizes it.
+
+    An app whose window has not appeared when the wait ends is watched in the
+    background (_start_open_watch) and moved when it does; the result says
+    so, and never calls the app "already open" unless a window of it was
+    found BEFORE the launch - that window is then moved at once (2026-10-02).
+    A browser's existing window is never moved (B092: it may be the owner's
+    stream); that case still only offers."""
     bc = _bc()
     from core.config import MONITORS
     if "|" not in args and "," not in args:
@@ -3692,7 +3899,8 @@ def _act_open_on_monitor(args: str) -> str:
     # owner's existing Chrome window (e.g. his stream) on the first 0.2 s
     # poll, before the new window existed, and left the new one where it
     # opened. Only a window that did not exist before the launch is moved.
-    hwnds_before = {_window_key(w) for w in gw.getAllWindows()}
+    windows_before = list(gw.getAllWindows())
+    hwnds_before = {_window_key(w) for w in windows_before}
 
     # Launch the target. Treat as URL if explicit scheme or recognisable
     # domain suffix; otherwise treat as an app name.
@@ -3700,29 +3908,46 @@ def _act_open_on_monitor(args: str) -> str:
         r"^(?:https?://|[\w\-]+\.(?:com|net|org|io|gov|edu|co|app|dev|me|tv|ai|so|xyz)(?:/|$))",
         re.IGNORECASE,
     )
-    if _URL_HINT.match(target):
+    is_url = bool(_URL_HINT.match(target))
+    # The app's OWN windows that were open before the launch (process-name
+    # matched, _is_app_window): the only evidence that it was "already open".
+    app_words = [] if is_url else _app_words(target)
+    existing = {_window_key(w) for w in windows_before
+                if _usable_window(w) and _is_app_window(bc, w, app_words)}
+    if is_url:
         # monitor=: the new window's own placement (visible + maximized,
         # 2026-10-01) targets the same monitor this action then moves it to.
         if not bc._open_url_new_window(target, monitor=monitor_name):
             webbrowser.open(target if target.startswith(("http://", "https://"))
                             else "https://" + target)
     else:
-        _act_launch_app(target)
+        launched = _act_launch_app(target)
+        if _launch_failed(launched):
+            return launched
 
     # Wait for a window matching the target to appear.
     target_tokens = [
         tok for tok in re.split(r"[\s_\-]+", target.lower()) if len(tok) >= 3
     ]
 
-    def _matches_target(title: str) -> bool:
-        t = (title or "").lower()
-        return any(tok in t for tok in target_tokens) if target_tokens else False
+    def _matches_target(w) -> bool:
+        t = (w.title or "").lower()
+        if target_tokens and any(tok in t for tok in target_tokens):
+            return True
+        return not is_url and _is_app_window(bc, w, app_words)
+
+    def _reusable(w) -> bool:
+        # A URL may become a tab of a window that was already open; an app
+        # may bring forward its own window from before the launch.
+        if is_url:
+            return _matches_target(w)
+        return _window_key(w) in existing
 
     new_window = None
     fallback = None   # a FRESH window that doesn't (yet) match the target
-    reused = None     # a PRE-EXISTING window that matches the target
+    reused = None     # a PRE-EXISTING window the launch may have reused
     started = time.time()
-    deadline = started + 15.0
+    deadline = started + _OPEN_ON_MONITOR_WAIT_S
     while time.time() < deadline:
         time.sleep(0.2)
         fresh = []
@@ -3730,7 +3955,7 @@ def _act_open_on_monitor(args: str) -> str:
             if not w.title:
                 continue
             if _window_key(w) in hwnds_before:
-                if reused is None and _matches_target(w.title):
+                if reused is None and _reusable(w):
                     reused = w
                 continue
             try:
@@ -3739,7 +3964,7 @@ def _act_open_on_monitor(args: str) -> str:
             except Exception:
                 pass
             fresh.append(w)
-        matched = [w for w in fresh if _matches_target(w.title)]
+        matched = [w for w in fresh if _matches_target(w)]
         if matched:
             new_window = matched[0]
             break
@@ -3753,35 +3978,56 @@ def _act_open_on_monitor(args: str) -> str:
         # Single-instance apps (VS Code, Spotify, Teams) and a URL that
         # became a tab reuse a window that was already open: no fresh window
         # will ever come, and waiting out the full 15 s only to say so was a
-        # UX regression (2026-10-01, actions-a review). Stop early and offer
-        # the move instead of making it: that window may be the owner's
-        # stream (B092).
+        # UX regression (2026-10-01, actions-a review).
         if (fallback is None and reused is not None
                 and time.time() - started >= _OPEN_ON_MONITOR_REUSE_S):
             break
     if new_window is None:
         new_window = fallback   # still a window from AFTER the launch, never before
 
-    if not new_window and reused is not None:
+    if new_window:
+        try:
+            _place_on_monitor(new_window, mx, my)
+        except Exception as e:
+            return f"opened {target} but failed to move window: {e}"
+        return f"opened '{target}' on {monitor_name} monitor (at {mx},{my})"
+
+    if reused is not None:
+        if not is_url and not _is_browser_window(bc, reused):
+            # The app was open before the launch and brought its own window
+            # forward: that is the window the owner meant - move it now.
+            try:
+                _place_on_monitor(reused, mx, my)
+            except Exception as e:
+                return (f"{target} was already open, but I failed to move its "
+                        f"'{reused.title}' window: {e}")
+            return (f"{target} was already open, so I moved its "
+                    f"'{reused.title}' window to the {monitor_name} monitor")
+        # A browser window that was already open (a URL became one of its
+        # tabs) may be the owner's stream (B092): offer, never move.
         return (f"launched {target}, but it reused your existing "
                 f"'{reused.title}' window rather than opening a new one, so "
                 f"I didn't move it — ask me to move '{reused.title}' to the "
                 f"{monitor_name} monitor if you want it there")
-    if not new_window:
-        return (f"launched {target}, but couldn't find new window to move it "
-                f"— if it reused a window that was already open, ask me to "
-                f"move that window to the {monitor_name} monitor")
-
-    try:
-        new_window.restore()
-        time.sleep(0.1)
-        new_window.moveTo(mx + 50, my + 50)
-        time.sleep(0.1)
-        new_window.maximize()
-    except Exception as e:
-        return f"opened {target} but failed to move window: {e}"
-
-    return f"opened '{target}' on {monitor_name} monitor (at {mx},{my})"
+    if is_url:
+        # Only what was seen: a browser window open before the launch is
+        # where the page most likely went.
+        if any(_usable_window(w) and _is_browser_window(bc, w)
+               for w in windows_before):
+            return (f"opened {target}, but couldn't find new window to move "
+                    f"it — it probably opened as a tab in a browser window "
+                    f"that was already open; ask me to move that window to "
+                    f"the {monitor_name} monitor if you want it there")
+        return f"opened {target}, but couldn't find new window to move it"
+    # The app is still starting (no window of it existed before the launch,
+    # none has appeared yet): keep watching off the voice thread.
+    if _start_open_watch(gw, bc, target, app_words, hwnds_before,
+                         monitor_name, (mx, my, mw, mh),
+                         waited_s=time.time() - started) is None:
+        return (f"launched {target}, but couldn't find its window to move it "
+                f"to the {monitor_name} monitor yet")
+    return (f"launched {target}; I'll move it to the {monitor_name} monitor "
+            f"when its window appears")
 
 
 def _act_move_window_to_monitor(args: str) -> str:

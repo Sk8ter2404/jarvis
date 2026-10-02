@@ -2681,9 +2681,29 @@ def _clock(start=100.0, step=0.1):
 class OpenOnMonitorTests(unittest.TestCase):
     MONS = {"left": (0, 0, 1920, 1080), "right": (1920, 0, 1920, 1080)}
 
+    def setUp(self):
+        # A window's process name by its fake handle (none by default: the
+        # handler then judges by title). Never a real GetWindowThreadProcessId
+        # on a made-up handle - a 16-bit HWND can name a real window.
+        self.procs = {}
+        p = mock.patch.object(
+            A, "_window_process_name",
+            side_effect=lambda w: self.procs.get(getattr(w, "_hWnd", None)))
+        p.start()
+        self.addCleanup(p.stop)
+        # The slow-app background watch (2026-10-02) never starts a real
+        # thread here; tests/test_open_on_monitor_slow_app.py covers it.
+        p = mock.patch.object(A, "_start_open_watch", return_value=object())
+        self.watch = p.start()
+        self.addCleanup(p.stop)
+
     def _bc(self):
         bc = _base_bc()
         bc._open_url_new_window.return_value = True
+        # Faithful browser-title helpers (the monolith's suffix list).
+        bc._strip_bidi_and_nbsp = lambda s: s
+        bc._BROWSER_CHROME_SUFFIXES = (" - google chrome", " — google chrome",
+                                       " - microsoft edge", " - mozilla firefox")
         return bc
 
     def test_bad_format(self):
@@ -2879,14 +2899,16 @@ class OpenOnMonitorTests(unittest.TestCase):
         self.assertFalse(after.maximized)
         self.assertIn("couldn't find new window", out)
 
-    def test_a_reused_window_ends_the_wait_early_and_is_not_moved(self):
+    def test_the_apps_own_window_from_before_the_launch_is_moved_at_once(self):
         # 2026-10-01 review: a single-instance app (VS Code) reuses its open
         # window, so no fresh window ever appears; the handler waited the
-        # full 15 s and then said it found nothing. It now stops after the
-        # reuse grace and names the window it could move, without moving it.
+        # full 15 s and then said it found nothing. It stops after the reuse
+        # grace - and (2026-10-02) a window of that app that was open BEFORE
+        # the launch is the one the owner meant: it is moved now, not offered.
         bc = self._bc()
         existing = _FakeWindow("main.py - Visual Studio Code")
         existing._hWnd = 0x100
+        self.procs[0x100] = "Code.exe"
         gw = self._gw_sequence([[existing]])
         with _patch_bc(bc), \
                 mock.patch("core.config.MONITORS", self.MONS), \
@@ -2895,13 +2917,36 @@ class OpenOnMonitorTests(unittest.TestCase):
                 mock.patch.object(A.time, "sleep") as sleep, \
                 mock.patch.object(A.time, "time", _clock(step=0.1)):
             out = A._act_open_on_monitor("left | code")
-        self.assertFalse(existing.maximized)
-        self.assertIsNone(existing.moved_to)
-        self.assertIn("reused your existing 'main.py - Visual Studio Code'", out)
-        self.assertIn("move", out)
+        self.assertTrue(existing.maximized)
+        self.assertEqual(existing.moved_to, (50, 50))
+        self.assertIn("code was already open, so I moved its "
+                      "'main.py - Visual Studio Code' window to the left "
+                      "monitor", out)
+        self.watch.assert_not_called()
         # Stopped at the reuse grace, well before the 15 s deadline.
         polls = [c for c in sleep.call_args_list if c.args == (0.2,)]
         self.assertLess(len(polls), 40)
+
+    def test_a_browser_window_from_before_the_launch_is_still_only_offered(self):
+        # B092 stays: "open Chrome on the left monitor" with no new window
+        # never moves the owner's existing Chrome window (his stream).
+        bc = self._bc()
+        existing = _FakeWindow("Stream - YouTube - Google Chrome")
+        existing._hWnd = 0x100
+        self.procs[0x100] = "chrome.exe"
+        gw = self._gw_sequence([[existing]])
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", self.MONS), \
+                mock.patch.dict(sys.modules, {"pygetwindow": gw}), \
+                mock.patch.object(A, "_act_launch_app", return_value="launched"), \
+                mock.patch.object(A.time, "sleep"), \
+                mock.patch.object(A.time, "time", _clock(step=0.1)):
+            out = A._act_open_on_monitor("left | chrome")
+        self.assertFalse(existing.maximized)
+        self.assertIsNone(existing.moved_to)
+        self.assertIn("reused your existing 'Stream - YouTube - Google Chrome'",
+                      out)
+        self.watch.assert_not_called()
 
 
 # ===========================================================================
