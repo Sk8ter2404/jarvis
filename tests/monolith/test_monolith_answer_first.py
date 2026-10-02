@@ -306,11 +306,20 @@ class EveryActionAnswersTests(_Base):
         self._run(f"{_LEAD} [ACTION: volume_up] [ACTION: weather_briefing]")
         self.assertEqual(self.spoken, [_LEAD, _ANSWER])
 
+    def _asked_to_go(self):
+        """A self-terminating action runs only inside an owner turn whose
+        words ask for it (2026-10-02); _run_llm_dispatch opens that frame,
+        the body these tests drive does not."""
+        bc = self.bc
+        prev = bc._begin_turn_grounding("Jarvis, shut down now.")
+        self.addCleanup(bc._end_turn_grounding, prev)
+
     def test_fire_and_exit_plus_verbatim_is_spoken(self):
         bc = self.bc
         name = sorted(bc._FIRE_AND_EXIT_ACTIONS)[0]
         bc.ACTIONS[name] = lambda a="": "scheduled"
         lead = "Right away, sir."
+        self._asked_to_go()
         self._run(f"{lead} [ACTION: weather_briefing] [ACTION: {name}]")
         self.assertEqual(self.spoken[0], lead)
 
@@ -323,6 +332,7 @@ class EveryActionAnswersTests(_Base):
         self._p(bc, "SPEAK_RESULT_VERBATIM_ACTIONS",
                 set(bc.SPEAK_RESULT_VERBATIM_ACTIONS) | {name})
         bc.ACTIONS[name] = lambda a="": "Going down now."
+        self._asked_to_go()
         printed = self._run(f"{_LEAD} [ACTION: {name}]")
         self.assertEqual(self.spoken[0], _LEAD)
         self.assertNotIn("[answer-first]", printed)

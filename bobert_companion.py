@@ -1547,20 +1547,36 @@ def _trimmed_history(history: list,
     return list(history[_history_trim_count(history, max_history):])
 
 
-def _trim_conversation_history(max_history: int = MAX_CONVERSATION_HISTORY) -> None:
+def _trim_conversation_history(max_history: int = MAX_CONVERSATION_HISTORY,
+                               *, drop_front=None) -> int:
     """Trim conversation_history IN PLACE (other modules hold the same list):
     chunked, pair-wise, user-first — see _history_trim_count. EVERY trim site
     goes through here, so the chunking and the user-first invariant cannot
     drift between them.
 
+    ``drop_front`` (2026-10-02): drop exactly these messages instead - the
+    oldest ones a local turn's prompt budget dropped, so the next turn shares
+    its trimmed prefix (_persist_budget_history_trim) - and only while they
+    are still the front of the list, so a concurrent trim is never doubled.
+
     The trimmed messages are kept for the session summary until its next
     checkpoint has folded them in (_session_trimmed, 2026-10-01): a long
-    session used to be summarised from the last ~10 exchanges only."""
-    n = _history_trim_count(conversation_history, max_history)
-    if n:
-        with _session_summary_lock:
+    session used to be summarised from the last ~10 exchanges only. Returns
+    how many went."""
+    with _session_summary_lock:
+        if drop_front is not None:
+            gone = list(drop_front)
+            n = len(gone)
+            if (not n or len(conversation_history) < n
+                    or any(conversation_history[i] is not gone[i]
+                           for i in range(n))):
+                return 0
+        else:
+            n = _history_trim_count(conversation_history, max_history)
+        if n:
             _session_trimmed.extend(conversation_history[:n])
             del conversation_history[:n]
+        return n
 
 
 def _append_turn(user: str, assistant: str) -> None:
@@ -2150,19 +2166,13 @@ def _persist_budget_history_trim(fitted) -> int:
     try:
         if not getattr(fitted, "fits", True):
             return 0
-        gone = list(getattr(fitted, "dropped_head", ()) or ())
+        gone = tuple(getattr(fitted, "dropped_head", ()) or ())
         if not gone:
             return 0
-        n = len(gone)
-        with _session_summary_lock:
-            if (len(conversation_history) < n
-                    or any(conversation_history[i] is not gone[i]
-                           for i in range(n))):
-                return 0
-            _session_trimmed.extend(conversation_history[:n])
-            del conversation_history[:n]
-        print(f"  [prompt-budget] kept the history trim: {n} oldest "
-              f"message(s) left the conversation")
+        n = _trim_conversation_history(drop_front=gone)
+        if n:
+            print(f"  [prompt-budget] kept the history trim: {n} oldest "
+                  f"message(s) left the conversation")
         return n
     except Exception:
         return 0
