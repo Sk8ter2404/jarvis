@@ -3745,7 +3745,8 @@ class DispatchTrayCommandEdgeTests(_MonolithTestBase):
             self.bc._dispatch_tray_command("trigger_overnight", {})  # 2602-2603
 
     def test_ambient_toggle_action_raises_swallowed(self):
-        # The registered ambient action raising is caught (2636-2637).
+        # The registered ambient action raising is caught (2636-2637), and
+        # the mode is NOT left on with no daemon running (A44, 2026-10-02).
         active = self._restore_attr_after("_ambient_mode_active")
         active[0] = False
         boom = mock.Mock(side_effect=RuntimeError("ambient boom"))
@@ -3753,7 +3754,7 @@ class DispatchTrayCommandEdgeTests(_MonolithTestBase):
                                {"ambient_listen_start": boom}), \
              mock.patch.object(self.bc, "_write_hud_state"):
             self.bc._dispatch_tray_command("ambient_mode_toggle", {})
-        self.assertTrue(active[0])
+        self.assertFalse(active[0])
         boom.assert_called_once_with("")
 
     def test_ambient_toggle_action_not_registered(self):
