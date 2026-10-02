@@ -381,9 +381,31 @@ class ClaudeCallTests(unittest.TestCase):
         self.assertNotIn("timeout", cls.last_kwargs)
 
     def test_claude_call_content_none(self):
-        # getattr(msg, "content", []) falls back when content is None.
+        # A reply with no text block at all (content None, or a 5.x reply whose
+        # thinking used the whole max_tokens) RAISES core.llm_client.
+        # CloudEmptyReplyError — a RuntimeError — so each stage's existing
+        # except-Exception fallback (local Ollama, then degrade) runs, instead
+        # of an empty plan / an empty spoken brief. 2026-10-01.
+        from core import llm_client
         self._patch_anthropic(canned=_FakeMessage(None))
-        self.assertEqual(orch._claude_call("m", "s", "u"), "")
+        with self.assertRaises(llm_client.CloudEmptyReplyError):
+            orch._claude_call("m", "s", "u")
+
+    def test_claude_call_refusal_raises(self):
+        from core import llm_client
+        msg = _FakeMessage([_FakeBlock("partial")])
+        msg.stop_reason = "refusal"
+        self._patch_anthropic(canned=msg)
+        with self.assertRaises(llm_client.CloudRefusalError):
+            orch._claude_call("m", "s", "u")
+
+    def test_claude_call_stage_purpose_shapes_a_5_5_request(self):
+        cls = self._patch_anthropic(canned=_FakeMessage([_FakeBlock("ok")]))
+        orch._claude_call("claude-sonnet-5-5", "s", "u", max_tokens=600,
+                          purpose="plan")
+        self.assertEqual(cls.last_kwargs["extra_body"],
+                         {"output_config": {"effort": "low"}})
+        self.assertEqual(cls.last_kwargs["max_tokens"], 4096)
 
     def test_claude_call_propagates_exception(self):
         self._patch_anthropic(exc=RuntimeError("api down"))

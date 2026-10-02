@@ -4078,6 +4078,24 @@ class StreamingTtsTests(_MonolithTestBase):
         # downstream speaker voices the fallback reply in full
         self.assertEqual(self.bc._stream_spoken_prefix[0], "")
 
+    def test_call_llm_stream_refusal_skips_the_blocking_retry(self):
+        # 2026-10-01: a refusal (HTTP 200, stop_reason "refusal") is the
+        # model's answer, not a wire blip — re-asking non-streamed would only
+        # repeat it while the owner waits. It goes straight to the local
+        # fallback, and nothing empty is spoken.
+        from core import llm_client
+        spoken = []
+        client, calls = self._fake_llm_client(
+            stream_exc=llm_client.CloudRefusalError(
+                "declined", stop_reason="refusal"))
+        reply = self._run_call_llm(
+            client, spoken,
+            extra_patches=[mock.patch.object(
+                self.bc, "_local_fallback_or",
+                lambda _sys, msg: "Local brain answering, sir.")])
+        self.assertEqual(calls, {"stream": 1, "complete": 0})
+        self.assertEqual(reply, "Local brain answering, sir.")
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Wake-word barge-in (feat/barge-in): request_tts_interrupt + the

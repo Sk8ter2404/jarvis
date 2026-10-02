@@ -16,7 +16,7 @@ import os
 from typing import List, Optional, Tuple
 
 #: The month these list-price tiers were recorded. They drift; treat as a guide.
-PRICING_AS_OF = "2026-09"
+PRICING_AS_OF = "2026-10"
 
 
 def _conv_tokens() -> Tuple[int, int]:
@@ -113,20 +113,29 @@ def _local_models() -> List[Model]:
 
 
 # Ordered cheapest -> priciest so the list reads as a "how fast it burns" dial.
-# Sonnet 5 lists at $2/$10 per MTok — BELOW Sonnet 4.6's $3/$15 (2026-10-01:
-# it was priced at $3/$15 here, so "model costs" overstated it by 50% and the
-# Opus ratio read ~1.7x instead of ~2.5x). It now sorts ahead of Sonnet 4.6.
+# Prices re-read from Anthropic's model docs 2026-10-01. The 5.x models think
+# before they answer and that thinking is billed as output, so a 5.x
+# conversation can cost more than the flat profile below suggests.
 CATALOG: List[Model] = _local_models() + [
     Model("claude-haiku-4-5", "Claude Haiku", "claude", 1.0, 5.0,
           "fastest / cheapest cloud", "snappy + inexpensive; great for everyday"),
+    Model("claude-sonnet-5-5", "Claude Sonnet 5.5", "claude", 2.0, 10.0,
+          "balanced (default)", "the current Sonnet; near-Opus smarts at the "
+          "Sonnet price"),
     Model("claude-sonnet-5", "Claude Sonnet 5", "claude", 2.0, 10.0,
-          "balanced (default)", "near-Opus smarts, cheaper than Sonnet 4.6"),
+          "balanced (previous gen)", "the previous Sonnet, same price as 5.5"),
     Model("claude-sonnet-4-6", "Claude Sonnet 4.6", "claude", 3.0, 15.0,
-          "balanced (previous gen)", "strong reasoning at a moderate cost"),
+          "balanced (older gen)", "strong reasoning at a moderate cost"),
+    Model("claude-opus-5-5", "Claude Opus 5.5", "claude", 4.0, 20.0,
+          "smart / deep work", "the current Opus; always thinks first, so "
+          "slower to start — best for long, unattended jobs"),
     Model("claude-opus-4-6", "Claude Opus", "claude", 5.0, 25.0,
-          "smart / pricier", "previous-gen Opus"),
+          "smart / pricier", "older Opus"),
     Model("claude-opus-4-8", "Claude Opus 4.8", "claude", 5.0, 25.0,
-          "smartest / priciest", "most capable; ~2.5x Sonnet 5's burn rate"),
+          "smart / pricier", "previous-gen Opus"),
+    Model("claude-fable-5-1", "Claude Fable 5.1", "claude", 10.0, 50.0,
+          "smartest / priciest", "the most capable model; ~5x Sonnet's burn "
+          "rate"),
 ]
 
 
@@ -136,14 +145,23 @@ def catalog() -> List[Model]:
 
 
 def by_id(model_id: str) -> Optional[Model]:
-    """The catalog entry whose id matches ``model_id`` (exact, or by prefix for
-    Ollama tags like ``qwen2.5:14b-instruct-q5_K_M``), or None."""
+    """The catalog entry whose id matches ``model_id`` — exactly, or else the
+    LONGEST entry id it starts with (Ollama tags like
+    ``qwen2.5:14b-instruct-q5_K_M``, dated Claude snapshots) — or None.
+
+    Longest-prefix, not first-prefix: ``claude-sonnet-5-5`` starts with
+    ``claude-sonnet-5``, so a first-match scan priced Sonnet 5.5 as Sonnet 5
+    whenever the older row came first."""
     if not model_id:
         return None
     for m in CATALOG:
-        if m.id == model_id or model_id.startswith(m.id):
+        if m.id == model_id:
             return m
-    return None
+    best: Optional[Model] = None
+    for m in CATALOG:
+        if model_id.startswith(m.id) and (best is None or len(m.id) > len(best.id)):
+            best = m
+    return best
 
 
 def _fmt_usd(x: float) -> str:

@@ -1258,7 +1258,7 @@ def _suspend_luxuries(notes: list, applied: dict) -> None:
     #
     # The saving was never measured, either. The three local daemons are
     # interval pollers holding no model (SELF_DIAG_INTERVAL_S = 300 s), and the
-    # "paid deep audit" calls claude-sonnet-5 (:122) — a CLOUD model this box
+    # "paid deep audit" calls DEEP_AUDIT_MODEL (claude-opus-5-5) — a CLOUD model this box
     # cannot reach at all (AI_BACKEND=ollama, no key; see the header). Zero
     # VRAM, zero resident GB. Rule 3 above applies: no measurement, no claim,
     # and here not even a cost to justify the risk.

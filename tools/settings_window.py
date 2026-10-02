@@ -914,14 +914,19 @@ SCHEMA: dict[str, dict] = {
     },
     "CLAUDE_MODEL": {
         "tab": "ai", "label": "Claude model", "type": "enum",
-        "choices": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-sonnet-5",
-                    "claude-opus-4-6", "claude-opus-4-8"],
-        "default": "claude-sonnet-5",
-        "help": "Cloud model + est. cost PER CONVERSATION: Haiku ~$0.02, "
-                "Sonnet 5 ~$0.04 (default — near-Opus smarts, cheaper than "
-                "Sonnet 4.6), "
-                "Opus 4.8 ~$0.10 (the ceiling). (Local Ollama is $0 — set the "
-                "backend above to ollama.)",
+        # Current models first, then the older ones (still selectable — the
+        # per-model request shaping in core.llm_client sends an older model
+        # exactly what it accepts).
+        "choices": ["claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5",
+                    "claude-fable-5-1", "claude-sonnet-5", "claude-sonnet-4-6",
+                    "claude-opus-4-8", "claude-opus-4-6"],
+        "default": "claude-sonnet-5-5",
+        "help": "Cloud model + est. cost PER CONVERSATION: Haiku 4.5 ~$0.02 "
+                "(fastest), Sonnet 5.5 ~$0.04 (default — near-Opus smarts at "
+                "Sonnet price), Opus 5.5 ~$0.08 (always thinks first: slower "
+                "to start), Fable 5.1 ~$0.20 (the ceiling). Older models stay "
+                "selectable. (Local Ollama is $0 — set the backend above to "
+                "ollama.)",
     },
     "LOCAL_LLM_MODEL": {
         "tab": "ai", "label": "Local LLM model (Ollama, $0)", "type": "combo",

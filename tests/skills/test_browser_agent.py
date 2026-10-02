@@ -524,6 +524,32 @@ class ModelNameTests(_BrowserAgentTestBase):
                 _inject_modules(bobert_companion=fake):
             self.assertEqual(self.mod._model_name(), "claude-sonnet-5")
 
+    # 2026-10-01: browser-use 0.12.9 forces tool_choice {"type": "tool"} for
+    # every agent step; Sonnet 5.5 / Opus 5.5 / Fable 5.1 400 on that. JARVIS's
+    # own CLAUDE_MODEL is now claude-sonnet-5-5, so mirroring it verbatim would
+    # break every browser task — those ids are swapped for Sonnet 5.
+    def test_mirrored_5_5_model_is_swapped_for_sonnet_5(self):
+        for current in ("claude-sonnet-5-5", "claude-opus-5-5",
+                        "claude-fable-5-1", "claude-sonnet-5-5-20260928"):
+            fake = types.ModuleType("bobert_companion")
+            fake.CLAUDE_MODEL = current
+            with self.subTest(current=current), \
+                    mock.patch.dict(os.environ, {}, clear=True), \
+                    _inject_modules(bobert_companion=fake):
+                self.assertEqual(self.mod._model_name(), "claude-sonnet-5")
+
+    def test_env_override_that_rejects_forced_tools_is_swapped_too(self):
+        with mock.patch.dict(os.environ,
+                             {"BROWSER_AGENT_MODEL": "claude-opus-5-5"}):
+            self.assertEqual(self.mod._model_name(),
+                             self.mod.BROWSER_AGENT_DEFAULT_MODEL)
+
+    def test_models_that_accept_forced_tools_pass_through(self):
+        for ok in ("claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8"):
+            with self.subTest(ok=ok), \
+                    mock.patch.dict(os.environ, {"BROWSER_AGENT_MODEL": ok}):
+                self.assertEqual(self.mod._model_name(), ok)
+
 
 class MakeBrowserTests(_BrowserAgentTestBase):
     def test_browser_none_returns_none(self):
@@ -644,6 +670,14 @@ class MakeLlmTests(_BrowserAgentTestBase):
             llm = self.mod._make_llm(_imports(chat=_FakeLLM))
         self.assertIsInstance(llm, _FakeLLM)
         self.assertEqual(llm.kw.get("model"), "m-1")
+
+    def test_never_passes_temperature(self):
+        # browser-use forwards a non-None temperature to messages.create, and
+        # Claude Opus 4.7+ / Sonnet 5+ return 400 for a non-default value.
+        with mock.patch.object(self.mod, "_model_name",
+                               return_value="claude-sonnet-5"):
+            llm = self.mod._make_llm(_imports(chat=_FakeLLM))
+        self.assertEqual(llm.kw, {"model": "claude-sonnet-5"})
 
     def test_model_name_kwarg_variant(self):
         # Class that only accepts model_name= → loop reaches 2nd combo.

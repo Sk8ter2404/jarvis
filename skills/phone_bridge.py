@@ -146,7 +146,9 @@ _LLM_MAX_TOKENS        = 400
 # Stateless LLM call used to answer phone messages that aren't named
 # actions. Mirrors bobert_companion.CLAUDE_MODEL by default but can be
 # overridden so phone questions don't burn the user's main model budget.
-_DEFAULT_LLM_MODEL     = "claude-sonnet-4-6"
+# This literal is only the last-resort fallback (no env override, monolith
+# not importable) - kept equal to core.config.CLAUDE_MODEL's default.
+_DEFAULT_LLM_MODEL     = "claude-sonnet-5-5"
 
 # Severity → ntfy / pushover headers
 _NTFY_PRIORITY_MAP = {
@@ -556,20 +558,19 @@ def _llm_fallback(text: str) -> str | None:
     )
     if _claude_ok:
         try:
+            from core import llm_client
             client = anthropic.Anthropic()
-            msg = client.messages.create(
+            # "voice": a reply the owner reads on his phone - effort low + a
+            # max_tokens floor on the 5.x thinking models.
+            msg = llm_client.create_message(
+                client, purpose="voice",
                 model=model,
                 max_tokens=_LLM_MAX_TOKENS,
                 system=sys_prompt,
                 messages=[{"role": "user", "content": text}],
                 timeout=_LLM_TIMEOUT_SECONDS,
             )
-            out = ""
-            for block in getattr(msg, "content", []) or []:
-                t = getattr(block, "text", None)
-                if isinstance(t, str):
-                    out += t
-            out = out.strip()
+            out = llm_client.response_text(msg).strip()
             if out:
                 return out
         except Exception as e:

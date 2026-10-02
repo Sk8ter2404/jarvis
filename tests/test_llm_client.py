@@ -107,7 +107,7 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(out, "Hello sir")
 
 
-class FirstTextTests(unittest.TestCase):
+class ResponseTextTests(unittest.TestCase):
     def test_skips_leading_non_text_block(self):
         class ToolBlock:
             pass
@@ -115,25 +115,23 @@ class FirstTextTests(unittest.TestCase):
         class Msg:
             content = [ToolBlock(), _FakeBlock("real text")]
 
-        self.assertEqual(llm._first_text(Msg()), "real text")
+        self.assertEqual(llm.response_text(Msg()), "real text")
 
-    def test_falls_back_to_historical_access_when_no_str_text(self):
-        # No block exposes a *str* `.text` (here `.text` is None on every block),
-        # so the loop finds nothing and the function falls back to the historical
-        # `msg.content[0].text` access rather than silently returning "".
-        sentinel = object()
-
+    def test_no_str_text_raises_instead_of_returning_garbage(self):
+        # No block exposes a *str* `.text`. The old _first_text fell back to
+        # `msg.content[0].text` and handed that object to the caller; on a
+        # thinking model block 0 is a thinking block, so that path either
+        # crashed with AttributeError or spoke nothing. It now raises the typed
+        # CloudEmptyReplyError (a RuntimeError) so the caller's existing
+        # cloud-failure fallback runs. 2026-10-01.
         class Blk:
-            text = None        # non-str → loop skips it
+            text = None        # non-str → skipped
 
         class Msg:
-            # content[0].text is the historical fallback value.
             content = [Blk()]
 
-        Msg.content[0].text = sentinel
-        # With text re-set to a sentinel object (still non-str) the loop skips
-        # it, and the fallback returns content[0].text verbatim.
-        self.assertIs(llm._first_text(Msg()), sentinel)
+        with self.assertRaises(llm.CloudEmptyReplyError):
+            llm.response_text(Msg())
 
 
 class ClientFactoryTests(unittest.TestCase):

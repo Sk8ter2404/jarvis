@@ -65,9 +65,14 @@ from typing import Any, Callable, Iterable, Sequence
 _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SUB_AGENTS_DIR = os.path.join(_PROJECT_DIR, "skills", "sub_agents")
 
-DEFAULT_PLANNER_MODEL = "claude-sonnet-5"
+# 2026-10-01: planner + merger on Claude Sonnet 5.5 ($2/$10 per MTok) at effort
+# low (core.llm_client purposes "plan" / "compose"), the tiny per-source workers
+# on Claude Haiku 4.5 ($1/$5). NOT Opus 5.5: this runs inside a spoken turn
+# with a 20 s planner timeout, and Opus 5.5 always thinks (~13 s to the first
+# answer token even at effort low, ~22 s at its default) — it would time out.
+DEFAULT_PLANNER_MODEL = "claude-sonnet-5-5"
 DEFAULT_WORKER_MODEL  = "claude-haiku-4-5"
-DEFAULT_MERGER_MODEL  = "claude-sonnet-5"
+DEFAULT_MERGER_MODEL  = "claude-sonnet-5-5"
 
 DEFAULT_MAX_PARALLEL  = 4
 DEFAULT_WORKER_TIMEOUT_S = 30.0
@@ -207,9 +212,19 @@ def _claude_call(
     user: str,
     max_tokens: int = 600,
     timeout_s: float | None = None,
+    purpose: str = "quick",
 ) -> str:
-    """One-shot Claude messages.create. Returns assistant text or raises."""
+    """One-shot Claude messages.create. Returns assistant text or raises.
+
+    ``purpose`` is the core.llm_client tuning for this stage — "plan" for the
+    planner, "quick" for a worker, "compose" for the merger — which sets effort
+    and the max_tokens floor for the 5.x thinking models (see
+    core.llm_client.request_options). The reply is read by block TYPE, and a
+    refusal / text-less reply raises core.llm_client.CloudReplyError, so every
+    stage's existing ``except Exception`` fallback runs instead of an empty
+    plan or an empty spoken brief."""
     import anthropic
+    from core import llm_client
     client = anthropic.Anthropic()
     kwargs: dict[str, Any] = {
         "model": model,
@@ -221,13 +236,8 @@ def _claude_call(
         # The SDK accepts a per-request `timeout`. Older versions ignore it
         # silently rather than raise.
         kwargs["timeout"] = timeout_s
-    msg = client.messages.create(**kwargs)
-    parts = []
-    for block in getattr(msg, "content", []) or []:
-        text = getattr(block, "text", None)
-        if isinstance(text, str):
-            parts.append(text)
-    return "".join(parts).strip()
+    msg = llm_client.create_message(client, purpose=purpose, **kwargs)
+    return llm_client.response_text(msg).strip()
 
 
 def _ollama_call(
@@ -417,6 +427,7 @@ def plan_decomposition(
             user,
             max_tokens=600,
             timeout_s=timeout_s,
+            purpose="plan",
         )
     except Exception as e:
         # A local-only turn is the normal path there, not a failure.
@@ -592,6 +603,7 @@ def _run_worker_sync(
                     model_id, system, worker_user,
                     max_tokens=600,
                     timeout_s=timeout_s,
+                    purpose="quick",
                 )
             except Exception as claude_err:
                 # Claude down/capped — retry once on a local Ollama model if
@@ -765,6 +777,7 @@ def merge_results(
             user,
             max_tokens=500,
             timeout_s=timeout_s,
+            purpose="compose",
         )
     except Exception as e:
         (_log.info if isinstance(e, CloudDisabled) else _log.warning)(

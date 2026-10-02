@@ -2968,8 +2968,12 @@ def _probe_claude_api() -> dict:
         # stall hit the previous 8 s outer cap; observed p95 across 99
         # successful runs is 3.2 s, so 12 s leaves comfortable headroom
         # without masking a genuinely-dead endpoint.
+        from core import llm_client
         client = anthropic.Anthropic(timeout=_CLAUDE_API_PROBE_TIMEOUT_S)
-        client.messages.create(
+        # "ping": effort low on the 5.x models, the 1-token cap kept (the
+        # reply is never read - only whether the API answered).
+        llm_client.create_message(
+            client, purpose="ping",
             model=model,
             max_tokens=1,
             messages=[{"role": "user", "content": "ping"}],

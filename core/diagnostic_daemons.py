@@ -126,15 +126,23 @@ try:
 except Exception:
     DEEP_AUDIT_DEFAULT_BUDGET_USD = 5.0
 DEEP_AUDIT_MODEL = os.environ.get(
-    "JARVIS_DEEP_AUDIT_MODEL", "claude-sonnet-5"
+    "JARVIS_DEEP_AUDIT_MODEL", "claude-opus-5-5"
 )
-# Sonnet 5: $2 in / $10 out per million (corrected 2026-10-01; it said $3/$15).
-# A typical audit run sends ~30 KB of code (~10k tokens) and gets back ~2 KB
-# (~500 tokens) of JSON. Estimated cost per run ≈ $0.025; the 0.05 below
-# deliberately over-counts — the safe side for a budget cap. We use this
+# Claude Opus 5.5 (owner decision 2026-10-01: deep, non-latency-bound jobs run
+# on Opus): $4 in / $20 out per million. A typical audit run sends ~30 KB of
+# code (~10k tokens, ≈ $0.04) and gets back ~2 KB (~500 tokens) of JSON — plus
+# the model's thinking, which is billed as output even though it isn't
+# returned (effort "medium" via core.llm_client's "deep" purpose; allow a few
+# thousand tokens, ≈ $0.06). Estimated cost per run ≈ $0.10. We use this
 # estimate for the budget counter — actual usage may differ; the daily cap is
 # a safety net not an accounting tool.
-DEEP_AUDIT_ESTIMATED_COST_PER_RUN_USD = 0.05
+DEEP_AUDIT_ESTIMATED_COST_PER_RUN_USD = 0.10
+# Per-attempt request timeout. Opus 5.5 always thinks before it answers (about
+# 22 s to the first answer token at its default effort, per Artificial Analysis
+# 2026-10-01), so the old 60 s cap sized for Sonnet is too tight; 120 s still
+# keeps a wedged HTTPS connection from hanging this daemon thread for the
+# SDK's ~10 min default.
+DEEP_AUDIT_TIMEOUT_S = 120
 
 THREAD_JOIN_TIMEOUT_S = 5.0
 
@@ -825,22 +833,21 @@ def _call_anthropic_auditor(prompt: str) -> str | None:
     try:
         # Explicit request timeout so a wedged HTTPS connection can't hang this
         # daemon thread for the SDK's ~10min default and stall graceful
-        # shutdown — cap the whole call at 60s and fall through to None on
-        # timeout. 2026-07-08.
-        client = anthropic.Anthropic(timeout=60)
-        resp = client.messages.create(
+        # shutdown — cap each attempt at DEEP_AUDIT_TIMEOUT_S and fall through
+        # to None on timeout. 2026-07-08 (60 s); 120 s for Opus 2026-10-01.
+        from core import llm_client
+        client = anthropic.Anthropic(timeout=DEEP_AUDIT_TIMEOUT_S)
+        # "deep": effort medium + a 16k max_tokens floor on the 5.x thinking
+        # models (thinking counts toward max_tokens).
+        resp = llm_client.create_message(
+            client, purpose="deep",
             model=DEEP_AUDIT_MODEL,
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
         )
-        # Collect text from all content blocks; some SDK versions return a
-        # list with multiple TextBlocks.
-        parts: list[str] = []
-        for block in getattr(resp, "content", []) or []:
-            text = getattr(block, "text", None)
-            if text:
-                parts.append(text)
-        return "\n".join(parts).strip() or None
+        # Text of every TEXT block (a 5.x reply opens with a thinking block);
+        # a refusal / text-less reply raises CloudReplyError → None below.
+        return llm_client.response_text(resp).strip() or None
     except Exception as e:
         # Do NOT dump a full traceback here. This daemon is non-essential and
         # runs on a timer; when the Claude API is capped/throttled it raised a
@@ -952,7 +959,7 @@ def _deep_audit_loop() -> None:
             if state.get("paused"):
                 continue
             # BILLING-RULE GATE (2026-05-30 log-audit): this daemon calls the
-            # Claude API directly on metered CREDITS (claude-sonnet-4-6) for
+            # Claude API directly on metered CREDITS (DEEP_AUDIT_MODEL) for
             # autonomous background code-auditing. The user's standing rule is
             # "API credits for conversational turns ONLY — everything else runs
             # on the Max subscription or not at all." So gate the credit-spend

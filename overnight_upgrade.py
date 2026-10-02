@@ -51,6 +51,12 @@ OVERNIGHT_END_HOUR      = 0      # set both to 0 to always allow; close the wind
 POLL_INTERVAL           = 300    # seconds between idle checks (5 min)
 MAX_IDEAS_PER_CYCLE     = 8      # don't flood the queue
 DRY_RUN                 = "--dry-run" in sys.argv
+# Model for the Anthropic-API fallback of idea generation (used only when the
+# Claude Code CLI fails). An unattended, non-latency-bound deep job, so it runs
+# on Claude Opus 5.5 ($4/$20 per MTok) at effort medium via core.llm_client's
+# "deep" purpose. Was claude-sonnet-4-5, deprecated 2026-09-30 (retires
+# 2026-11-30).
+IDEAS_API_MODEL         = "claude-opus-5-5"
 
 # ── paths ────────────────────────────────────────────────────────────────────
 
@@ -577,10 +583,15 @@ def _generate_ideas_via_api(system_block: str, user_block: str) -> list[str]:
         return []
 
     try:
+        from core import llm_client
         client = anthropic.Anthropic(api_key=api_key)
-        _log("  [ideas-api] calling claude-sonnet-4-5 via Anthropic API…")
-        msg = client.messages.create(
-            model="claude-sonnet-4-5",
+        _log(f"  [ideas-api] calling {IDEAS_API_MODEL} via Anthropic API…")
+        # "deep": effort medium + a 16k max_tokens floor (Opus 5.5 always
+        # thinks, and thinking counts toward max_tokens). No explicit timeout:
+        # the SDK sizes the non-streaming timeout from max_tokens (600 s here).
+        msg = llm_client.create_message(
+            client, purpose="deep",
+            model=IDEAS_API_MODEL,
             max_tokens=4096,
             system=system_block,
             messages=[{"role": "user", "content": user_block}],
@@ -590,9 +601,8 @@ def _generate_ideas_via_api(system_block: str, user_block: str) -> list[str]:
         return []
 
     try:
-        raw = "".join(
-            getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text"
-        ).strip()
+        # Text blocks by TYPE; a refusal / text-less reply raises here.
+        raw = llm_client.response_text(msg).strip()
     except Exception as e:
         _log(f"  [ideas-api] could not extract text from response: {e}")
         return []
@@ -606,7 +616,7 @@ def _generate_ideas_via_api(system_block: str, user_block: str) -> list[str]:
         with open(OVERNIGHT_LOG, "a", encoding="utf-8") as f:
             f.write("\n" + "─" * 60 + "\n")
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] API DUMP\n")
-            f.write(f"  model: claude-sonnet-4-5\n")
+            f.write(f"  model: {IDEAS_API_MODEL}\n")
             f.write(f"  raw ({len(raw)} chars):\n{raw}\n")
             f.write("─" * 60 + "\n")
     except Exception:

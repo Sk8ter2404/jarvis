@@ -47,7 +47,7 @@
   "AUDIO_AUTOSWITCH_MIC_FALLBACK": "",
   "DEVICE_SPEECH_FILTER_ENABLED": true,
   "AI_BACKEND": "claude",
-  "CLAUDE_MODEL": "claude-sonnet-5",
+  "CLAUDE_MODEL": "claude-sonnet-5-5",
   "LOCAL_LLM_MODEL": "gemma4:26b-a4b-it-qat",
   "LOCAL_VISION_MODEL": "gemma4:26b-a4b-it-qat",
   "CLAUDE_OPTIONAL": true,

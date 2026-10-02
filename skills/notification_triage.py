@@ -924,19 +924,19 @@ def _classify_with_llm(app: str, title: str, body: str) -> str | None:
     if os.environ.get("ANTHROPIC_API_KEY") and _cloud_allowed():
         try:
             import anthropic  # type: ignore
+            from core import llm_client
             client = anthropic.Anthropic()
-            msg = client.messages.create(
+            msg = llm_client.create_message(
+                client, purpose="classify",
                 model=LLM_MODEL,
                 max_tokens=8,
                 system=_system,
                 messages=[{"role": "user", "content": prompt}],
                 timeout=LLM_TIMEOUT_SECONDS,
             )
-            text = ""
-            for block in getattr(msg, "content", []) or []:
-                t = getattr(block, "text", None)
-                if isinstance(t, str):
-                    text += t
+            # Text blocks by TYPE; a refusal / text-less reply raises into the
+            # except below -> local fallback.
+            text = llm_client.response_text(msg)
             verdict = _parse_verdict(text)
             if verdict:
                 return verdict

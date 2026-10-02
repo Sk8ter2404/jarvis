@@ -2322,7 +2322,7 @@ def _act_latency_benchmark(_: str = "") -> str:
             # Resolve the backend label INSIDE the worker, not at dispatch. The
             # old code closed over core.config's boot values, while _llm_quick
             # picks its backend live — so a local round-trip could be timed and
-            # then labelled "claude/claude-sonnet-5". A benchmark that misnames
+            # then labelled "claude/<CLAUDE_MODEL>". A benchmark that misnames
             # what it just measured is worse than no benchmark.
             t0 = time.time()
             reply = bc._llm_quick(

@@ -2199,6 +2199,34 @@ def _anthropic_client(timeout: float | None = None,
     )
 
 
+def _claude_create(purpose: str, client=None, **kwargs):
+    """The ONE place this file sends a DIRECT Claude request (the
+    ``_llm_client.complete`` / ``stream_text`` paths are shaped inside
+    core.llm_client): ``messages.create`` through core.llm_client's per-model
+    shaping (effort / max_tokens floor for the 5.x thinking models, sampling
+    params stripped where rejected — see core.llm_client.request_options).
+    ``purpose`` is one of core.llm_client.PURPOSES; ``client`` defaults to
+    _anthropic_client().
+
+    Imports core.llm_client locally on purpose: the module-level ``_llm_client``
+    alias is the optional high-level wrapper (tests swap it for fakes or None
+    to drive the direct path), while this shaping must apply on that direct
+    path too."""
+    from core import llm_client as _lc
+    if client is None:
+        client = _anthropic_client()
+    return _lc.create_message(client, purpose=purpose, **kwargs)
+
+
+def _claude_reply_text(msg) -> str:
+    """Reply text read by block TYPE (a 5.x reply can open with a thinking
+    block, so ``content[0].text`` is wrong). Raises core.llm_client.
+    CloudReplyError on a refusal or a text-less reply, so the caller's existing
+    cloud-failure fallback runs instead of an empty string being spoken."""
+    from core import llm_client as _lc
+    return _lc.response_text(msg)
+
+
 # ── Local-LLM traffic control (2026-09-29, r6) ───────────────────────────
 # Ollama serves the local brain from ONE slot whose KV cache holds only the
 # most recent request, so any background local call between two owner turns
@@ -2272,12 +2300,13 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
         if AI_BACKEND == "claude":
             import anthropic
             try:
-                msg = _anthropic_client().messages.create(
+                msg = _claude_create(
+                    "quick",
                     model=CLAUDE_MODEL, max_tokens=max_tokens,
                     system=system,
                     messages=[{"role": "user", "content": user}],
                 )
-                return msg.content[0].text
+                return _claude_reply_text(msg)
             except Exception as e:
                 # Cloud unavailable — route this one-shot through the local
                 # model so learning doesn't stall while the cap is active.
@@ -19263,13 +19292,14 @@ def _claude_oneshot(system: str, messages: list, max_tokens: int = 500) -> str |
             return _llm_client.complete(
                 model=CLAUDE_MODEL, max_tokens=max_tokens,
                 system=system, messages=messages,
-                timeout=_ANTHROPIC_TIMEOUT_S,
+                timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
             )
-        msg = _anthropic_client().messages.create(
+        msg = _claude_create(
+            "voice",
             model=CLAUDE_MODEL, max_tokens=max_tokens,
             system=system, messages=messages,
         )
-        return msg.content[0].text
+        return _claude_reply_text(msg)
     except Exception as _e:
         print(f"  [local-llm] cloud fallback also failed ({type(_e).__name__}: {_e})")
         return None
@@ -21414,7 +21444,7 @@ def _call_llm(user_text: str) -> str:
                             model=CLAUDE_MODEL, max_tokens=500,
                             system=_sys_param, messages=conversation_history,
                             timeout=_ANTHROPIC_TIMEOUT_S,
-                            on_delta=_flush_buf.feed,
+                            on_delta=_flush_buf.feed, purpose="voice",
                         )
                     except Exception as _stream_err:
                         # Stream failed mid-flight (network blip, SDK quirk).
@@ -21429,10 +21459,21 @@ def _call_llm(user_text: str) -> str:
                               f"to complete(): {_stream_err}")
                         _flush_buf.join()
                         _stream_spoken_prefix[0] = _flush_buf.spoken_prefix
+                        # A refusal / text-less reply (core.llm_client.
+                        # CloudReplyError) is the model's answer, not a network
+                        # blip: re-asking non-streamed would just repeat it
+                        # while the owner waits. Straight to the fallback below.
+                        try:
+                            from core.llm_client import (
+                                CloudReplyError as _CloudReplyError)
+                        except Exception:
+                            _CloudReplyError = ()
+                        if isinstance(_stream_err, _CloudReplyError):
+                            raise
                         reply = _llm_client.complete(
                             model=CLAUDE_MODEL, max_tokens=500,
                             system=_sys_param, messages=conversation_history,
-                            timeout=_ANTHROPIC_TIMEOUT_S,
+                            timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
                         )
                     else:
                         # Let the early sentences finish before the caller
@@ -21445,15 +21486,16 @@ def _call_llm(user_text: str) -> str:
                     reply = _llm_client.complete(
                         model=CLAUDE_MODEL, max_tokens=500,
                         system=_sys_param, messages=conversation_history,
-                        timeout=_ANTHROPIC_TIMEOUT_S,
+                        timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
                     )
             else:
-                msg = _anthropic_client().messages.create(
+                msg = _claude_create(
+                    "voice",
                     model=CLAUDE_MODEL, max_tokens=500,
                     system=_sys_param,
                     messages=conversation_history,
                 )
-                reply = msg.content[0].text
+                reply = _claude_reply_text(msg)
         except anthropic.BadRequestError as _e:
             _s = str(_e).lower()
             if "credit balance" in _s or "too low" in _s or "upgrade or purchase" in _s:
@@ -23257,7 +23299,8 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
 
     try:
         b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
-        msg = _anthropic_client().messages.create(
+        msg = _claude_create(
+            "vision",
             model=SCREEN_VISION_MODEL, max_tokens=500,
             messages=[{
                 "role": "user",
@@ -23269,7 +23312,7 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
                 ],
             }],
         )
-        return msg.content[0].text.strip()
+        return _claude_reply_text(msg).strip()
     except anthropic.APIStatusError as e:
         # 4xx/5xx from Claude (rate limit, credit exhausted, server error,
         # auth) — exactly the case the local VLM fallback was built for.
@@ -23389,11 +23432,12 @@ def ask_vision_multi(question: str, images: dict[str, bytes]) -> str:
             })
         content.append({"type": "text", "text": question})
 
-        msg = _anthropic_client().messages.create(
+        msg = _claude_create(
+            "vision",
             model=SCREEN_VISION_MODEL, max_tokens=800,
             messages=[{"role": "user", "content": content}],
         )
-        return msg.content[0].text.strip()
+        return _claude_reply_text(msg).strip()
     except anthropic.APIStatusError as e:
         # 4xx/5xx from Claude (rate limit, credit exhausted, server error,
         # auth) — exactly the case the local VLM fallback was built for.
@@ -31670,13 +31714,14 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
                 return _llm_client.complete(
                     model=CLAUDE_MODEL, max_tokens=400,
                     system=_sys_param, messages=msgs,
-                    timeout=_ANTHROPIC_TIMEOUT_S,
+                    timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
                 )
-            msg = _anthropic_client().messages.create(
+            msg = _claude_create(
+                "voice",
                 model=CLAUDE_MODEL, max_tokens=400,
                 system=_sys_param, messages=msgs,
             )
-            return msg.content[0].text
+            return _claude_reply_text(msg)
         elif AI_BACKEND == "ollama":
             msgs = ([{"role": "system", "content": sys_prompt_now}]
                     + list(conversation_history)
@@ -34548,7 +34593,8 @@ def _preflight_api_key(timeout_sec: float = 10.0) -> tuple[bool, str]:
             # max_retries=0: this is a REACHABILITY probe. Retrying it just makes
             # "is Claude up?" take three times longer to answer "no".
             client = _anthropic_client(timeout=timeout_sec, max_retries=0)
-            client.messages.create(
+            _claude_create(
+                "ping", client,
                 model=CLAUDE_MODEL,
                 max_tokens=1,
                 messages=[{"role": "user", "content": "."}],

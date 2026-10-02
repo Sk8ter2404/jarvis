@@ -283,20 +283,43 @@ def _ssrf_guard(arg: str) -> str | None:
 
 
 # ── model selection ────────────────────────────────────────────────
+# The browser agent stays on Claude Sonnet 5 (2026-10-01). browser-use 0.12.9's
+# ChatAnthropic gets every agent step's structured output by FORCING the tool
+# (tool_choice {"type": "tool"}), and Sonnet 5.5 / Opus 5.5 / Fable 5.1 reject
+# forced tool_choice with a 400 — so mirroring JARVIS's CLAUDE_MODEL
+# (claude-sonnet-5-5) would fail every browser task on its first step. Sonnet 5
+# still accepts forced tool use on the Claude API, at the same $2/$10 price.
+BROWSER_AGENT_DEFAULT_MODEL = "claude-sonnet-5"
+
+
 def _model_name() -> str:
     """Mirror whatever JARVIS itself is using so the user only has to
-    rotate models in one place."""
+    rotate models in one place — except a model that rejects forced
+    tool_choice (see BROWSER_AGENT_DEFAULT_MODEL), which browser-use cannot
+    drive; that one is swapped for BROWSER_AGENT_DEFAULT_MODEL."""
     env = os.environ.get("BROWSER_AGENT_MODEL")
+    picked = ""
     if env:
-        return env
+        picked = env
+    else:
+        try:
+            import bobert_companion  # type: ignore
+            m = getattr(bobert_companion, "CLAUDE_MODEL", None)
+            if m:
+                picked = str(m)
+        except Exception:
+            pass
+    if not picked:
+        return BROWSER_AGENT_DEFAULT_MODEL
     try:
-        import bobert_companion  # type: ignore
-        m = getattr(bobert_companion, "CLAUDE_MODEL", None)
-        if m:
-            return str(m)
+        from core.llm_client import rejects_forced_tool_choice
+        if rejects_forced_tool_choice(picked):
+            print(f"  [browser-agent] {picked} rejects forced tool use, which "
+                  f"browser-use needs — using {BROWSER_AGENT_DEFAULT_MODEL}")
+            return BROWSER_AGENT_DEFAULT_MODEL
     except Exception:
         pass
-    return "claude-sonnet-5"
+    return picked
 
 
 # ── bg loop ────────────────────────────────────────────────────────
@@ -389,11 +412,9 @@ def _make_llm(imports: dict) -> Any:
         return None
     model = _model_name()
     # langchain_anthropic uses `model=`, some browser-use ChatAnthropic
-    # variants use `model_name=` — try both.
-    # No sampling params (2026-10-01): Claude Sonnet 5 (CLAUDE_MODEL) and newer
-    # reject a non-default temperature/top_p/top_k with HTTP 400. browser-use's
-    # ChatAnthropic accepts temperature=0.0 at construction and then sends it
-    # on EVERY step, so every browser task failed on its first LLM call.
+    # variants use `model_name=` — try both. NO temperature: browser-use
+    # forwards a non-None temperature straight to messages.create, and Claude
+    # Opus 4.7+ / Sonnet 5+ reject a non-default value with a 400.
     for kwargs in (
         {"model": model},
         {"model_name": model},

@@ -48,7 +48,7 @@ PC_CONTROL_ENABLED = True
 # JARVIS can see and reason about what's on the screen via Claude's
 # vision-capable model.
 SCREEN_VISION_ENABLED = True
-SCREEN_VISION_MODEL   = "claude-sonnet-5"
+SCREEN_VISION_MODEL   = "claude-sonnet-5-5"
 
 
 # ─── UI automation ─────────────────────────────────────────────────────
@@ -154,11 +154,15 @@ PUSHBACK_MAX_CLEAR_PENDING    = 10   # >N pending tasks before clear_tasks asks
 # functional with NO Claude API key / NO credits at all. Claude is a BONUS
 # that sharpens replies when available, not a requirement (see CLAUDE_OPTIONAL).
 AI_BACKEND   = "claude"           # "claude" | "ollama"
-# claude-sonnet-5: near-Opus intelligence at $2/$10 per MTok — cheaper than
-# Sonnet 4.6's $3/$15 (price corrected 2026-10-01) — the best default brain per
-# dollar. Users who want more can pick claude-opus-4-8 ($5/$25) in the Settings
-# GUI.
-CLAUDE_MODEL = "claude-sonnet-5"
+# claude-sonnet-5-5 (owner decision 2026-10-01): the current Sonnet, $2/$10 per
+# MTok — the same price as Sonnet 5 and stronger. It thinks by default (effort
+# `high` → ~13 s to the first answer token), so every call is shaped by
+# core.llm_client.request_options (voice = effort low, ~1.2 s; max_tokens
+# floor 2048). Chat stays LOCAL-first per MODEL_ROUTING; this is the
+# cloud fallback / cloud route. Unattended deep jobs (deep code audit, overnight
+# ideas) use claude-opus-5-5 ($4/$20) — never a voice path, it always thinks.
+# The ceiling, claude-fable-5-1 ($10/$50), is selectable in the Settings GUI.
+CLAUDE_MODEL = "claude-sonnet-5-5"
 OLLAMA_MODEL = "llama3"
 
 # Claude API is an OPTIONAL ENHANCEMENT, never a hard dependency. When True
@@ -368,9 +372,13 @@ DEEP_AUDIT_BUDGET_USD = 5.0
 # each fired brief costs a planner + parallel-worker + merger LLM fan-out.
 # Set False (or it's also gateable via JARVIS_ENABLE_ORCHESTRATOR) to disable.
 ENABLE_ORCHESTRATOR             = True
-ORCHESTRATOR_PLANNER_MODEL      = "claude-sonnet-5"
+# Planner + merger on Claude Sonnet 5.5 at effort low (core.llm_client); the
+# per-source workers are tiny summarisers (Claude Haiku 4.5). Not Opus 5.5:
+# the brief is spoken, the planner has a 20 s timeout, and Opus 5.5 always
+# thinks (~13-22 s to the first answer token). 2026-10-01.
+ORCHESTRATOR_PLANNER_MODEL      = "claude-sonnet-5-5"
 ORCHESTRATOR_WORKER_MODEL       = "claude-haiku-4-5"
-ORCHESTRATOR_MERGER_MODEL       = "claude-sonnet-5"
+ORCHESTRATOR_MERGER_MODEL       = "claude-sonnet-5-5"
 ORCHESTRATOR_MAX_PARALLEL       = 4
 ORCHESTRATOR_WORKER_TIMEOUT_S   = 30.0
 ORCHESTRATOR_PLANNER_TIMEOUT_S  = 20.0

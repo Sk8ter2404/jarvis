@@ -881,19 +881,19 @@ def _triage_message(msg: dict) -> str | None:
             # voice/dispatch thread — an un-capped client turns the 8s
             # per-attempt timeout into a ~24-40s stall per message.
             # 2026-07-14 bug-hunt #16.
+            from core import llm_client
             client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
-            resp = client.messages.create(
+            resp = llm_client.create_message(
+                client, purpose="classify",
                 model=LLM_MODEL,
                 max_tokens=8,
                 system=_triage_system,
                 messages=[{"role": "user", "content": prompt}],
                 timeout=LLM_TIMEOUT_SECONDS,
             )
-            text = ""
-            for block in getattr(resp, "content", []) or []:
-                t = getattr(block, "text", None)
-                if isinstance(t, str):
-                    text += t
+            # Text blocks by TYPE; a refusal / text-less reply raises into the
+            # except below -> local fallback.
+            text = llm_client.response_text(resp)
             verdict = _parse_verdict(text)
             if verdict:
                 return verdict
@@ -961,19 +961,17 @@ def _generate_draft_reply(thread: dict, user_instructions: str = "") -> str | No
             # voice/dispatch thread — an un-capped client turns the 8s
             # per-attempt timeout into a ~24-40s stall per message.
             # 2026-07-14 bug-hunt #16.
+            from core import llm_client
             client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
-            resp = client.messages.create(
+            resp = llm_client.create_message(
+                client, purpose="compose",
                 model=LLM_MODEL,
                 max_tokens=600,
                 system=_draft_system,
                 messages=[{"role": "user", "content": prompt}],
                 timeout=LLM_TIMEOUT_SECONDS * 2,
             )
-            text = ""
-            for block in getattr(resp, "content", []) or []:
-                t = getattr(block, "text", None)
-                if isinstance(t, str):
-                    text += t
+            text = llm_client.response_text(resp)
             result = _finish_draft(text)
             if result:
                 return result

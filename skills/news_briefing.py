@@ -311,15 +311,19 @@ def _summarize_via_llm(title: str, description: str) -> str:
     if getattr(bc, "AI_BACKEND", "") == "claude" and _cloud_allowed():
         try:
             import anthropic  # type: ignore
-            model = getattr(bc, "CLAUDE_MODEL", "claude-sonnet-4-6")
-            msg = anthropic.Anthropic().messages.create(
+            from core import llm_client
+            model = getattr(bc, "CLAUDE_MODEL", "") or "claude-sonnet-5-5"
+            # "quick": effort low + a max_tokens floor on the 5.x thinking
+            # models (a 120-token cap can be eaten by thinking).
+            msg = llm_client.create_message(
+                anthropic.Anthropic(), purpose="quick",
                 model=model,
                 max_tokens=120,
                 system=_SUMMARY_SYSTEM,
                 messages=[{"role": "user", "content": user_text}],
                 timeout=_LLM_TIMEOUT_SECONDS,
             )
-            return _clean(msg.content[0].text)
+            return _clean(llm_client.response_text(msg))
         except Exception as e:
             print(f"  [news] LLM summary failed, trying local: {e}")
 
