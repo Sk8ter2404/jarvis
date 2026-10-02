@@ -347,6 +347,12 @@ SCREENSHOT_PRIVACY_BLOCKLIST: list = []
 DAILY_BUDGET_USD      = 1.0
 DEEP_AUDIT_BUDGET_USD = 5.0
 
+# ELECTRICITY_RATE_PER_KWH — what the owner pays per kilowatt-hour, used by
+#   the running_costs action (core/running_costs.py) to turn the measured GPU
+#   draw + estimated CPU draw x hours running into an electricity ESTIMATE.
+#   A float so a user_settings.json override like 0.3 keeps its decimals.
+ELECTRICITY_RATE_PER_KWH = 0.14
+
 
 # ─── Sub-agent orchestrator (core/orchestrator.py) ─────────────────────
 # Decompose complex requests into parallel sub-tasks dispatched to

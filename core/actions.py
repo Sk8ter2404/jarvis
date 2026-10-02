@@ -695,6 +695,16 @@ def _act_model_costs(_: str = "") -> str:
     return model_catalog.format_catalog()
 
 
+def _act_running_costs(_: str = "") -> str:
+    """What it costs to RUN JARVIS ('how much does it cost to run you', 'what
+    do you cost', 'running costs'): an electricity estimate from the live GPU
+    + CPU draw over the hours run today / this month, this session's Claude
+    spend, and a one-line verdict (core.running_costs). Not the account
+    balance; that is check_credits."""
+    from core import running_costs
+    return running_costs.report()
+
+
 def _live_backend_and_model() -> tuple[str, str]:
     """The backend and model JARVIS is ACTUALLY using this second.
 
@@ -4246,6 +4256,7 @@ __all__ = [
     "_act_switch_llm_picker",
     "_act_show_llm_stats",
     "_act_model_costs",
+    "_act_running_costs",
     # Phase 4C — UI primitives
     "_act_press",
     "_act_scroll",
