@@ -240,11 +240,23 @@ def _wait_for_local_quiet() -> str:
     """The running JARVIS's wait_for_local_quiet("vision"): for this tagged
     thread, wait (bounded) until a background vision call may run. Never
     imports the monolith (a bare import is not a running JARVIS); 'none'
-    when it isn't loaded. Never raises."""
+    when it isn't loaded. Never raises.
+
+    With CREDITS_CHECK_BACKEND "local" the read goes to the local vision model
+    whatever MODEL_ROUTING["vision"] says, so the monolith's routing answer
+    ('cloud' when vision is not routed local) does not apply: the cycle waits
+    on the shared gate like any local read, BEFORE the capture (2026-10-02
+    integration audit - otherwise the wait happened inside _call_local_vision,
+    after the billing page was already captured, with the owner mid-turn)."""
     try:
         import sys
         bc = sys.modules.get("bobert_companion")
-        waiter = getattr(bc, "wait_for_local_quiet", None) if bc else None
+        if bc is None:
+            return "none"
+        if _credits_backend() == "local":
+            from core import local_traffic as _lt
+            return _lt.wait_for_quiet()
+        waiter = getattr(bc, "wait_for_local_quiet", None)
         return waiter("vision") if callable(waiter) else "none"
     except Exception:
         return "none"

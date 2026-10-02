@@ -529,5 +529,68 @@ class CreditsCheckBackendTests(unittest.TestCase):
         bc.ask_vision.assert_called_once()
 
 
+class CreditsLocalBackendWaitTests(unittest.TestCase):
+    """2026-10-02 integration audit (speed plan R5's tag x local-features'
+    CREDITS_CHECK_BACKEND): with the backend "local" the read goes to the
+    local vision model whatever MODEL_ROUTING["vision"] says, so the hourly
+    cycle waits on the shared gate BEFORE the capture even when the running
+    JARVIS reports vision as cloud-routed. It used to skip that wait (the
+    monolith answered 'cloud') and wait inside _call_local_vision instead,
+    after the billing page had been captured mid-conversation."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("credits_monitor")
+        self.mod._last_alert_at[0] = 0.0
+        self.mod._last_login_alert_at[0] = 0.0
+        import core.config as cfg
+        self.cfg = cfg
+
+    def _cycle(self, backend):
+        from core import local_traffic as lt
+        events = []
+
+        def _monolith_waiter(kind):
+            events.append(("monolith-wait", kind))
+            return "cloud"            # vision is not routed local here
+
+        def _gate_wait(gate=None):
+            job = lt.current_job()
+            events.append(("gate-wait", job.tag if job else None,
+                           job.opt_in if job else None,
+                           self.mod._check_lock.locked()))
+            return "go"
+
+        def _read():
+            events.append(("read",))
+            return (50.0, "BALANCE: $50.00")
+
+        bc = types.ModuleType("bobert_companion")
+        bc.wait_for_local_quiet = _monolith_waiter
+        with mock.patch.object(self.cfg, "CREDITS_CHECK_BACKEND", backend), \
+             mock.patch.dict("sys.modules", {"bobert_companion": bc}), \
+             mock.patch.object(lt, "wait_for_quiet", side_effect=_gate_wait), \
+             mock.patch.object(self.mod, "_read_credits_via_vision",
+                               side_effect=_read), \
+             mock.patch.object(self.mod, "_save_state"), \
+             mock.patch.object(self.mod, "_enqueue_speech"):
+            self.mod._check_and_maybe_alert()
+        self.assertIsNone(lt.current_job(), "the tag leaked past the cycle")
+        return events
+
+    def test_local_backend_waits_on_the_gate_before_the_capture(self):
+        self.assertEqual(self._cycle("local"),
+                         [("gate-wait", "credits-monitor", True, False),
+                          ("read",)])
+
+    def test_auto_backend_still_asks_the_running_jarvis(self):
+        self.assertEqual(self._cycle("auto"),
+                         [("monolith-wait", "vision"), ("read",)])
+
+    def test_no_running_jarvis_is_still_a_no_op(self):
+        with mock.patch.object(self.cfg, "CREDITS_CHECK_BACKEND", "local"), \
+             mock.patch.dict("sys.modules", {"bobert_companion": None}):
+            self.assertEqual(self.mod._wait_for_local_quiet(), "none")
+
+
 if __name__ == "__main__":
     unittest.main()
