@@ -40,6 +40,23 @@ def _has_failure_marker(text: str) -> bool:
     return any(m in low for m in FAILURE_MARKERS)
 
 
+_ABSENT = object()
+
+
+def _swap_modules(case: unittest.TestCase, mods: dict) -> None:
+    """Install ``mods`` into sys.modules for one test and put back exactly
+    those keys afterwards (absence included). Not mock.patch.dict: that also
+    drops every module FIRST imported during the test, and numpy refuses a
+    second load in one process."""
+    for name, mod in mods.items():
+        prior = sys.modules.get(name, _ABSENT)
+        sys.modules[name] = mod
+        if prior is _ABSENT:
+            case.addCleanup(sys.modules.pop, name, None)
+        else:
+            case.addCleanup(sys.modules.__setitem__, name, prior)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  A44 - a refused ambient start is reported, rolled back and never saved
 # ──────────────────────────────────────────────────────────────────────────
@@ -70,10 +87,7 @@ class _AmbientCase(unittest.TestCase):
         self.ext = types.ModuleType("skill_ambient_multimodal_extract")
         self.ext.ambient_extract_start = mock.Mock(return_value="")
         self.ext.ambient_extract_stop = mock.Mock(return_value="")
-        mods = mock.patch.dict(sys.modules,
-                               {"skill_ambient_multimodal_extract": self.ext})
-        mods.start()
-        self.addCleanup(mods.stop)
+        _swap_modules(self, {"skill_ambient_multimodal_extract": self.ext})
 
     def write(self, doc):
         with open(self.path, "w", encoding="utf-8") as f:
@@ -175,14 +189,9 @@ class RealSkillRefusalTests(_AmbientCase):
 
     def test_real_exclusive_mic_refusal_is_reported(self):
         from tests._skill_harness import load_skill_isolated
-        prior = sys.modules.get("skill_ambient_listen")
-
-        def _restore():
-            if prior is None:
-                sys.modules.pop("skill_ambient_listen", None)
-            else:
-                sys.modules["skill_ambient_listen"] = prior
-        self.addCleanup(_restore)
+        # The loader registers sys.modules["skill_ambient_listen"]; the swap
+        # puts back whatever was there once the test ends.
+        _swap_modules(self, {"skill_ambient_listen": None})
         mod, _ = load_skill_isolated("ambient_listen", register=False)
         with mock.patch.object(mod, "_wake_listener_active", return_value=True):
             self.bc.ACTIONS = {"ambient_listen_start": mod.ambient_listen_start}
