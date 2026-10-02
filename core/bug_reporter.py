@@ -112,7 +112,19 @@ _SCRUB_RULES: List[Tuple[Any, Any]] = [
     # connection-string password: scheme://user:pass@host  (user may be empty)
     (re.compile(r"(://[^:/@\s]*):[^@/\s]+@"), r"\1:<REDACTED>@"),
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "<EMAIL>"),
-    (re.compile(r"([A-Za-z]:\\Users\\)[^\\/\r\n\"']+"), r"\1<USER>"),
+    # Windows profile dirs, in EVERY shape a path takes into a report (audit
+    # A48). str(OSError) shows the filename through repr(), which DOUBLES each
+    # backslash, and the old one-backslash rule let that -- the most common
+    # exception shape -- through with the account name intact. So: any run of
+    # \ or / as the separator (single, repr-doubled, JSON-of-repr, forward,
+    # mixed); "users" in any case (os.path.normcase writes c:\users\...); a
+    # drive letter or a backslash right before it, so UNC (\\host\c$\Users\..)
+    # and \\?\ paths match but a URL's /users/ does not; and repr()/ascii()
+    # escapes (\xf6, \u00f6) inside the name, which used to end the match and
+    # leak the rest of a non-ASCII name. The separators are kept as written.
+    (re.compile(r"(?i)((?:[A-Za-z]:[\\/]+|\\+)users[\\/]+)"
+                r"(?:\\(?:x[0-9a-f]{2}|u[0-9a-f]{4})|[^\\/\r\n\"'])+"),
+     r"\1<USER>"),
     (re.compile(r"(/(?:home|Users)/)[^/\r\n\"']+"), r"\1<USER>"),
     # MAC before the IP rules so its hex groups aren't partially eaten.
     (re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"), "<MAC>"),
@@ -181,6 +193,49 @@ def _gate_patterns() -> Tuple[List[Tuple[Any, str]], List[Any]]:
     return result
 
 
+_HOME_RULES_CACHE: Dict[Tuple[str, ...], List[Any]] = {}
+
+
+def _home_rules() -> List[Any]:
+    """Patterns for the RUNNING user's own home directory, from the expanded
+    value of %USERPROFILE%, $HOME, %HOMEDRIVE%%HOMEPATH% and ``~`` (audit A48).
+
+    A profile outside C:\\Users -- redirected, roaming, D:\\Profiles\\<name>,
+    /srv/homes/<name> -- has no shape the path rules know, so it is matched by
+    value: every separator as any run of \\ or /, any case, the name redacted
+    to <USER> and the rest kept. A bare root or a one-character name is skipped
+    (too broad to redact by value). Cached per distinct set of values; never
+    raises."""
+    try:
+        env = os.environ
+        found: List[str] = []
+        for cand in (env.get("USERPROFILE") or "", env.get("HOME") or "",
+                     (env.get("HOMEDRIVE") or "") + (env.get("HOMEPATH") or ""),
+                     os.path.expanduser("~")):
+            cand = (cand or "").strip()
+            if cand and cand != "~" and cand not in found:
+                found.append(cand)
+        key = tuple(found)
+        rules = _HOME_RULES_CACHE.get(key)
+        if rules is None:
+            rules = []
+            for home in key:
+                parts = [p for p in re.split(r"[\\/]+", home) if p]
+                if len(parts) < 2 or len(parts[-1]) < 2:
+                    continue
+                lead = r"[\\/]+" if home[0] in "\\/" else ""
+                prefix = r"[\\/]+".join(re.escape(p) for p in parts[:-1])
+                rules.append(re.compile(
+                    r"(?i)(" + lead + prefix + r"[\\/]+)"
+                    + re.escape(parts[-1]) + r"(?![\w-])"))
+            if len(_HOME_RULES_CACHE) > 8:
+                _HOME_RULES_CACHE.clear()
+            _HOME_RULES_CACHE[key] = rules
+        return rules
+    except Exception:  # pragma: no cover - defensive; scrub must never raise
+        return []
+
+
 def scrub(text: str) -> str:
     """Redact personal data/secrets from `text`. Conservative by design.
 
@@ -188,10 +243,13 @@ def scrub(text: str) -> str:
     (``tools/check_no_pii.py`` HARD+WARN, incl. the owner's gitignored
     ``pii_local.py`` on the owner's box) so a report can't leak owner-identifying
     data the public-repo gate would reject — the footer's "scrubbed" claim holds.
+    The running user's own home directory goes first, by value (_home_rules).
     """
     if not text:
         return ""
     out = str(text)
+    for pat in _home_rules():
+        out = pat.sub(r"\1<USER>", out)
     for pat, repl in _SCRUB_RULES:
         out = pat.sub(repl, out)
     for pat, repl in _gate_patterns()[0]:
