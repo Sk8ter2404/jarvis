@@ -10,7 +10,7 @@ The brain is **local-first**. A local Ollama model is the always-on baseline (sh
 - **`auto`** (the shipped default) — Claude answers when a key is configured and reachable; the local model takes over on any failure (no key, no credits, a rate limit, a network or server error).
 - **`cloud`** — Claude, today the same as `auto`.
 
-`AI_BACKEND = "ollama"` runs everything locally, and `CLAUDE_OPTIONAL` (on by default) means a missing or capped Claude key is never treated as a fault. Vision and background learning have their own routes (`MODEL_ROUTING["vision"]`, `["ambient"]`). The cloud models are Claude Sonnet 5.5 for voice (`CLAUDE_MODEL`), Opus 5.5 for unattended deep jobs, and Fable 5.1 selectable in Settings. "Use local" / "use Claude" / "go auto" switch the chat route by voice (`set_brain`).
+`AI_BACKEND = "ollama"` runs everything locally, and `CLAUDE_OPTIONAL` (on by default) means a missing or capped Claude key is never treated as a fault. Vision and background learning have their own routes (`MODEL_ROUTING["vision"]`, `["ambient"]`). The cloud models are Claude Sonnet 5.5 for voice (`CLAUDE_MODEL`), Opus 5.5 for unattended deep jobs, and Fable 5.1 selectable in Settings. "Use the local model" / "use the cloud model" / "switch your brain to auto" switch the chat route by voice (`set_brain`).
 
 Requests reach an action through several layers, in order:
 
@@ -34,7 +34,7 @@ Around that sit the proactive background daemons (print monitor and announcers, 
 | `core/` modules | 104 | `core/*.py` minus `__init__.py` |
 | PC-control prompt sections | 101 | `core.prompt_router.split_pc_control(core.prompts.PC_CONTROL_PROMPT)` |
 | Settings in the Settings window | 151 (+11 status rows) | entries of `tools/settings_window.py` `SCHEMA`, minus the `_status_*` / `_view_*` rows |
-| Monolith lines | 42,958 | `wc -l bobert_companion.py` at this build (v2.0.172) |
+| Monolith lines | 42,958 | `wc -l bobert_companion.py` at this build (v2.0.173) |
 
 Two of the 705 names (`morning_tabs`, `vscode_command`) belong to `skills/_example_skill.py`, which the loader skips, so a running install has 703. MCP servers add `mcp_<server>_<tool>` actions at runtime, and locally installed private skills (gitignored) add their own; neither is counted or documented here. Regenerate the full per-action table with `python tools/gen_action_index.py`.
 
@@ -344,7 +344,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 ### Category 14: Self-management & learning
 
 - **AI brain selection** — which local model serves turns (switched live, persisted) and which route chat takes (see Overview).
-  - "what model are you using", "use the fast one", "use local only", "use Claude"
+  - "what model are you using", "use the fast one", "use local only", "use the cloud model"
   - Actions: `current_model`, `list_models`, `set_model`, `set_brain` (`local` / `cloud` / `auto`), `switch_llm`
 - **Self-knowledge** — "how smart are you", "how do you compare to Claude" get an honest answer from live engine facts (which brain, which speech engines, measured speed, strengths and limits) instead of a joke; the facts are rendered per turn, never frozen into the prompt.
 - **Model costs** — each model's estimated cost per conversation, and call stats for the active one.
@@ -451,7 +451,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Gestures** (off by default - setting `KINECT_GESTURES_ENABLED`) — wave to wake, swipe to stop speech and cancel a pending confirmation. A raised hand never confirms anything (a confirmation always needs a spoken yes); with something pending it reminds you to say yes. Gesture barge-in is a separate opt-in (`JARVIS_GESTURE_BARGE_IN` environment variable).
   - "turn on kinect gestures", "what gestures can you see through the kinect"
   - Actions: `gestures_on`, `gestures_off`, `gesture_status`
-- **Air-mouse** (off by default - setting `KINECT_AIR_MOUSE_ENABLED`) — raise a hand above the shoulder to take the cursor; close the left/right hand to left/right-click, hold to drag. "Arm" relaxes the strict pose gate. The low-level input hook that hands the cursor back when you touch the real mouse is a separate opt-in (`AIR_MOUSE_LL_HOOK_ENABLED`).
+- **Air-mouse** (off by default - setting `KINECT_AIR_MOUSE_ENABLED`) — raise a hand above the shoulder to take the cursor; close the left/right hand to left/right-click, hold to drag. "Arm" relaxes the strict pose gate. Touching the real mouse or keyboard always takes the cursor back; the low-level input hook that tells real input from the air-mouse's own is a separate opt-in (`AIR_MOUSE_LL_HOOK_ENABLED`, off because it puts every input event on the PC behind JARVIS's process; an idle-time check does the job without it).
   - "turn on the air mouse", "take the cursor", "release the cursor", "calibrate the air mouse"
   - Actions: `air_mouse_on` / `air_mouse_off` / `air_mouse_status`, `air_mouse_arm` (aliases `take_the_cursor`, `give_me_the_cursor`, `mouse_control_on`, `hand_mouse_on`), `air_mouse_disarm`, `calibrate_air_mouse`
 - **Air control** (off by default - setting `AIR_CONTROL_ENABLED`) — movie-style spatial hand mouse: reach toward the sensor, fist to grab and drag across monitors, squeeze to click, point to scroll.
