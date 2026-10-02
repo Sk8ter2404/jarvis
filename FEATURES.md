@@ -279,6 +279,10 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
 - **Goodnight = overnight upgrade** — any bedtime phrasing fires `start_overnight_upgrade` and silences JARVIS until morning.
 - **Workshop auto-engagement** — opening any CAD/slicer app drops TTS volume 30%, shortens replies, auto-engages focus mode for an hour (auto-releases when app closes).
 - **Promises ("I'll let you know when…")** — skills register deferred announcement via `skill_utils["make_promise"]` (e.g. "tell me when the print finishes", "let me know when the bed cools").
+- **Phone pings** — through the phone bridge (Telegram / ntfy / Pushover), JARVIS texts your phone unprompted ONLY when something needs you: a print finished, failed or paused with an error; a confirmation you left unanswered while away (the action's name only, never its details); a guard-mode alert; a robot that needs you (`skill_utils["ping_phone"]("robot", …)`); and an optional daily summary. Nothing pings while you are talking to him (he says it out loud), in focus mode, or 23:00–07:00 (held, then sent as one message), except guard alerts; at most 6 an hour; secrets are scrubbed from every text. No bridge configured = a no-op with one boot line.
+  - "how do I connect my phone" (the @BotFather steps), "phone ping status", "turn off phone pings", "send a test ping"
+  - Actions: `phone_setup_help`, `phone_ping_status`, `phone_pings_on`, `phone_pings_off`, `phone_ping_test`
+  - `core/phone_ping.py` + `skills/phone_bridge.py`; Settings: Integrations tab → Phone pings
 
 ---
 

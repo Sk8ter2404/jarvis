@@ -466,6 +466,18 @@ def _push_alert(message: str) -> bool:
     pb = _phone_bridge()
     if pb is None:
         return False
+    # Through the phone-ping policy when this bridge has it (2026-10-02): a
+    # CRITICAL "security" ping, so it still ignores quiet hours / focus mode /
+    # the hourly cap, but the owner's PHONE_PING_SECURITY switch, the secret
+    # scrubber and the critical ceiling apply. Delivery is queued, so "queued"
+    # is the success outcome here.
+    ping = getattr(pb, "ping_phone", None)
+    if callable(ping):
+        try:
+            return ping("security", message, critical=True, priority="urgent",
+                        title="JARVIS guard") == "queued"
+        except Exception:
+            return False
     fn = getattr(pb, "push_to_phone", None)
     if not callable(fn):
         return False

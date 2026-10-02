@@ -50,6 +50,8 @@ SKILL_UTILS_KEYS = (
     "register_utterance_route",
     # After-reply hooks (2026-10-01).
     "register_after_reply",
+    # Proactive phone pings (core/phone_ping.py, 2026-10-02).
+    "ping_phone",
 )
 
 # Top-level module names whose import failure indicates a REAL bug (a broken
@@ -82,6 +84,8 @@ def make_fake_skill_utils(**overrides):
     utils["register_utterance_route"].return_value = True
     # Likewise an after-reply hook: accepted, never called (no turns here).
     utils["register_after_reply"].return_value = True
+    # No phone in a test: every ping reports the no-bridge outcome.
+    utils["ping_phone"].return_value = "unconfigured"
     utils.update(overrides)
     return utils
 

@@ -336,6 +336,37 @@ class AlertRateLimitTests(GuardBase):
         self.assertFalse(kw.get("confirm", True))
         self.assertEqual(kw.get("priority"), "urgent")
 
+    def test_push_goes_through_the_phone_ping_policy_when_present(self):
+        """2026-10-02: a bridge exposing ping_phone gets a CRITICAL "security"
+        ping (quiet hours / focus / the hourly cap do not hold it, but the
+        PHONE_PING_SECURITY switch and the secret scrubber apply) instead of a
+        raw push_to_phone."""
+        phone = _fake_phone()
+        phone.pings = []
+
+        def _ping(category, message, **kw):
+            phone.pings.append((category, message, kw))
+            return "queued"
+        phone.ping_phone = _ping
+        mod, _a = self._load(phone=phone, kinect_enabled=True)
+        kin = {"present": True, "count": 1, "nearest_m": 1.5}
+        mod._guard_tick([], kin, "t1", now=100.0)
+        self.assertEqual(phone.pushes, [])
+        self.assertEqual(len(phone.pings), 1)
+        cat, msg, kw = phone.pings[0]
+        self.assertEqual(cat, "security")
+        self.assertTrue(msg)
+        self.assertIs(kw.get("critical"), True)
+        self.assertEqual(kw.get("priority"), "urgent")
+        self.assertTrue(mod._push_alert("x"))
+
+    def test_a_switched_off_security_category_is_not_a_push(self):
+        phone = _fake_phone()
+        phone.ping_phone = lambda category, message, **kw: "category_off"
+        mod, _a = self._load(phone=phone, kinect_enabled=True)
+        self.assertFalse(mod._push_alert("Someone is at the desk, sir."))
+        self.assertEqual(phone.pushes, [])
+
     def test_staging_suppresses_speech_and_push(self):
         bc = _fake_monolith()
         phone = _fake_phone()

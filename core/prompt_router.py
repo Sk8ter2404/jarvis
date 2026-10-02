@@ -507,6 +507,13 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "DECO MESH NETWORK": ["deco", "mesh", "router"],
     "NOTIFICATION TRIAGE": ["notification", "notifications", "alerts", "my alerts"],
     "PHONE BRIDGE": ["phone bridge", "my phone"],
+    # Proactive phone pings (core/phone_ping.py). The header word "phone"
+    # already routes most turns; these catch the ones that never say it.
+    "PHONE PINGS": [
+        "phone ping", "ping my phone", "pinging my phone", "pinging me",
+        "ping me", "test ping", "botfather", "bot father", "telegram bot",
+        "connect my phone", "text me when", "message me when",
+    ],
     "SELF DIAGNOSTIC": [
         "diagnostic", "health check", "self test", "self-diagnostic",
         "are you ok", "run diagnostics", "check yourself",

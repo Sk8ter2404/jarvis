@@ -58,6 +58,8 @@ skill sees identical semantics whether it goes through the dict or this object:
     monolith leaves every request to the LLM.
   * **After-reply hooks** (``register_after_reply`` → ``False``) — an older
     monolith never follows up an owner turn's reply.
+  * **Phone pings** (``ping_phone`` → ``"unavailable"``) — an older monolith
+    never texts the owner unprompted.
 
 Stdlib-only by contract
 ------------------------
@@ -124,6 +126,9 @@ class JarvisServicesProtocol(Protocol):
     def register_utterance_route(self, fn: Callable[[str], Optional[str]],
                                  name: str = "") -> bool: ...
     def register_after_reply(self, fn: Callable[[dict], Any]) -> bool: ...
+
+    # — proactive phone pings —
+    def ping_phone(self, category: str, message: str, **kwargs: Any) -> str: ...
 
 
 # Sentinel that means "no backing callable was wired for this key". Distinct from
@@ -334,3 +339,11 @@ class JarvisServices:
         "spoken" (the monolith's AFTER-REPLY HOOKS block has the contract).
         False when refused or unwired (an older monolith never calls it)."""
         return bool(self._call("register_after_reply", fn, _default=False))
+
+    # ── proactive phone pings (core/phone_ping.py, 2026-10-02) ─────────────
+    def ping_phone(self, category: str, message: str, **kwargs: Any) -> str:
+        """Text the owner's phone if core/phone_ping's policy allows it.
+        Returns the outcome ("queued" when it went out to the sender);
+        "unavailable" when unwired (an older monolith has no pings)."""
+        return str(self._call("ping_phone", category, message,
+                              _default="unavailable", **kwargs))

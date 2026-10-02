@@ -1461,6 +1461,83 @@ SCHEMA: dict[str, dict] = {
         "help": "PRESENT if any one channel (Telegram / ntfy / Pushover) is set.",
         "match": "any",
     },
+    # Phone pings (core/phone_ping.py): read live on every ping, so a change
+    # here applies at once. "turn off / on phone pings" by voice saves
+    # PHONE_PING_ENABLED.
+    "PHONE_PING_ENABLED": {
+        "tab": "integrations", "label": "Ping my phone when something needs me",
+        "type": "bool", "default": True,
+        "help": "Does nothing until the phone bridge can message you (a "
+                "Telegram token plus your TELEGRAM_USER_ID, or ntfy, or "
+                "Pushover, in .env). Ask 'how do I connect my phone' for the "
+                "steps.",
+    },
+    "PHONE_PING_PRINT": {
+        "tab": "integrations", "label": "Print finished / failed / paused",
+        "type": "bool", "default": True,
+        "help": "Bambu printer: a print finished, failed, or paused with an "
+                "error.",
+    },
+    "PHONE_PING_CONFIRM": {
+        "tab": "integrations", "label": "Unanswered confirmation while away",
+        "type": "bool", "default": True,
+        "help": "Something you asked for is waiting on your 'yes' and you've "
+                "stepped away. Only the action's name is sent, never its "
+                "details.",
+    },
+    "PHONE_PING_SECURITY": {
+        "tab": "integrations", "label": "Guard-mode alerts",
+        "type": "bool", "default": True,
+        "help": "Critical: sent even in quiet hours and focus mode.",
+    },
+    "PHONE_PING_ROBOT": {
+        "tab": "integrations", "label": "Robot needs attention",
+        "type": "bool", "default": True,
+        "help": "A robot skill reporting it needs you.",
+    },
+    "PHONE_PING_SUMMARY": {
+        "tab": "integrations", "label": "Daily summary",
+        "type": "bool", "default": False,
+        "help": "One message a day at the time below: what happened since "
+                "the last one, including anything quiet hours held back.",
+    },
+    "PHONE_PING_SUMMARY_TIME": {
+        "tab": "integrations", "label": "Summary time (HH:MM)",
+        "type": "combo", "default": "07:30", "nonblank": True,
+        "choices": ["07:00", "07:30", "08:00", "21:00", "22:00"],
+        "help": "Local time. Morning (07:30) or nightly (22:00).",
+    },
+    "PHONE_PING_MAX_PER_HOUR": {
+        "tab": "integrations", "label": "Most pings in an hour",
+        "type": "int", "default": 6, "max": 60,
+        "help": "Ordinary pings in any rolling hour; security alerts don't "
+                "count.",
+    },
+    "PHONE_PING_QUIET_START": {
+        "tab": "integrations", "label": "Quiet hours start (HH:MM)",
+        "type": "combo", "default": "23:00", "nonblank": True,
+        "choices": ["21:00", "22:00", "23:00", "00:00"],
+        "help": "Ordinary pings wait until quiet hours end, then arrive as "
+                "one message. Same start and end = no quiet hours.",
+    },
+    "PHONE_PING_QUIET_END": {
+        "tab": "integrations", "label": "Quiet hours end (HH:MM)",
+        "type": "combo", "default": "07:00", "nonblank": True,
+        "choices": ["06:00", "07:00", "08:00", "09:00"],
+        "help": "Local time.",
+    },
+    "PHONE_PING_AWAY_MIN": {
+        "tab": "integrations", "label": "Only ping after this long away (min)",
+        "type": "float", "default": 10.0, "max": 240,
+        "help": "Minutes since you last said something to JARVIS. While you "
+                "are talking to him he tells you out loud instead. 0 = ping "
+                "anyway.",
+    },
+    "PHONE_PING_CONFIRM_AFTER_MIN": {
+        "tab": "integrations", "label": "Unanswered confirmation: wait (min)",
+        "type": "float", "default": 2.0, "max": 240,
+        "help": "How old an unanswered confirmation must be before it pings.",
+    },
     # Moved from the AI tab, where it had nothing to do with models (P1-11).
     "STREAMING_AUTO_FULLSCREEN": {
         "tab": "integrations", "label": "Auto-fullscreen TV shows & movies",
@@ -1826,6 +1903,13 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                          "_status_azure_tts", "_status_elevenlabs",
                          "_status_bambu", "_status_govee", "_status_hue",
                          "_status_obs", "_status_deco", "_status_phone"]),
+        ("Phone pings", ["PHONE_PING_ENABLED", "PHONE_PING_PRINT",
+                         "PHONE_PING_CONFIRM", "PHONE_PING_SECURITY",
+                         "PHONE_PING_ROBOT", "PHONE_PING_SUMMARY",
+                         "PHONE_PING_SUMMARY_TIME", "PHONE_PING_MAX_PER_HOUR",
+                         "PHONE_PING_QUIET_START", "PHONE_PING_QUIET_END",
+                         "PHONE_PING_AWAY_MIN",
+                         "PHONE_PING_CONFIRM_AFTER_MIN"]),
         ("Media", ["STREAMING_AUTO_FULLSCREEN"]),
         ("Notes (not read by JARVIS)", ["OBS_HOST_HINT", "OBS_PORT_HINT",
                                         "HUE_BRIDGE_IP_HINT"]),

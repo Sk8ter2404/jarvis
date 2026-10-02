@@ -30757,6 +30757,19 @@ ACTIONS = {
 SKILLS_DIR         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 PENDING_SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pending_skills")
 
+def _ping_phone(category, message, **kw) -> str:
+    """skill_utils["ping_phone"]: text the owner's phone if core/phone_ping's
+    policy allows it (category switch, he is away, quiet hours, focus mode,
+    the hourly cap; secrets scrubbed). A no-op returning "unconfigured" until
+    the phone bridge can send. Categories: print / confirm / security / robot.
+    Feature-detect the key: an older JARVIS simply lacks it."""
+    try:
+        from core import phone_ping as _pp
+    except Exception:
+        return "unavailable"
+    return _pp.ping(category, message, **kw)
+
+
 # Utilities skills can import. We assign these here so skill modules can
 # import them via:  from bobert_companion import skill_utils
 skill_utils = {
@@ -30795,6 +30808,9 @@ skill_utils = {
     "register_utterance_route": lambda fn, name="": register_utterance_route(fn, name),
     # Follow an owner turn's reply (see AFTER-REPLY HOOKS).
     "register_after_reply": lambda fn: register_after_reply(fn),
+    # Proactive phone pings (core/phone_ping.py, 2026-10-02), e.g. a robot
+    # skill: skill_utils["ping_phone"]("robot", "It's stuck under the desk").
+    "ping_phone":       lambda *a, **kw: _ping_phone(*a, **kw),
 }
 
 # M2 Phase 1 (2026-06-02): typed capability seam. JarvisServices wraps the

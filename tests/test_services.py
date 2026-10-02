@@ -282,6 +282,16 @@ class DialogueWrapperTests(unittest.TestCase):
                          .register_after_reply(hook))
         self.assertTrue(hasattr(JarvisServicesProtocol, "register_after_reply"))
 
+    def test_ping_phone_is_forwarded_and_degrades(self):
+        u = {"ping_phone": mock.MagicMock(return_value="queued")}
+        svc = JarvisServices.from_skill_utils(u)
+        self.assertEqual(svc.ping_phone("robot", "Stuck.", critical=False),
+                         "queued")
+        u["ping_phone"].assert_called_with("robot", "Stuck.", critical=False)
+        self.assertEqual(JarvisServices.from_skill_utils({})
+                         .ping_phone("robot", "Stuck."), "unavailable")
+        self.assertTrue(hasattr(JarvisServicesProtocol, "ping_phone"))
+
     def test_unwired_degrades(self):
         svc = JarvisServices.from_skill_utils({})
         self.assertEqual(svc.dialogue_ready(), "disabled")

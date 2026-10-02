@@ -58,6 +58,16 @@ Outbound use from other skills:
   Broadcasts to every configured backend in one call. Failures on one
   backend don't block the others. Returns a dict of {backend: success}.
 
+Proactive pings (core/phone_ping.py, 2026-10-02):
+  register() attaches this bridge to core.phone_ping, which decides when
+  JARVIS texts the owner unprompted (a print finished / failed, a confirmation
+  left unanswered while he is away, a guard alert, a robot that needs him, an
+  optional daily summary) — rate-limited, quiet hours, focus mode, per-category
+  Settings switches, secrets scrubbed. Other skills call
+  skill_utils["ping_phone"](category, message) or ping_phone() below. Without
+  a backend that can send UNSOLICITED (Telegram needs TELEGRAM_USER_ID too),
+  every ping is a no-op and one boot line says so.
+
 Actions registered:
   notify_phone <message>            send via every configured backend
   push_to_phone <message>           alias for notify_phone
@@ -67,6 +77,10 @@ Actions registered:
   list_phone_backends               show configured / unconfigured backends
   pause_phone_bridge                stop inbound polling
   resume_phone_bridge               restart inbound polling
+  phone_setup_help                  "how do I connect my phone" — BotFather steps
+  phone_ping_status                 are proactive pings on, which kinds, limits
+  phone_pings_on / phone_pings_off  the master switch (live + saved)
+  phone_ping_test                   send one fixed test ping now
 """
 from __future__ import annotations
 
@@ -74,6 +88,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -124,6 +139,20 @@ except Exception as _dc_err:
     _log.warning("[phone] draft_confirm unavailable (%s); pushes will "
                  "fail-closed unless confirm=False is passed explicitly",
                  _dc_err)
+
+# Proactive-ping policy (core/phone_ping.py). Stdlib-only; None only if core
+# itself is broken, and then every ping action says so.
+try:
+    from core import phone_ping as _phone_ping
+except Exception as _pp_err:   # pragma: no cover - core is in-tree
+    _phone_ping = None  # type: ignore[assignment]
+    _log.warning("[phone] core.phone_ping unavailable (%s); no proactive pings",
+                 _pp_err)
+
+# Spoken verbatim (the monolith collects this from every skill).
+SPEAK_VERBATIM_ACTIONS = ("phone_setup_help", "phone_ping_status",
+                          "phone_pings_on", "phone_pings_off",
+                          "phone_ping_test")
 
 # ─── Config ──────────────────────────────────────────────────────────────
 TELEGRAM_API_BASE      = "https://api.telegram.org"
@@ -269,6 +298,26 @@ def _pushover_configured() -> bool:
 
 def any_backend_configured() -> bool:
     return _telegram_configured() or _ntfy_configured() or _pushover_configured()
+
+
+def can_push_unsolicited() -> bool:
+    """True when at least one backend can message the owner WITHOUT him
+    writing first: Telegram only with a TELEGRAM_USER_ID to send to (a token
+    alone can only reply), ntfy or Pushover whenever set."""
+    return ((_telegram_configured() and bool(_telegram_whitelist()))
+            or _ntfy_configured() or _pushover_configured())
+
+
+def configured_backend_names() -> list[str]:
+    """The backends a proactive ping would go out on, in send order."""
+    names = []
+    if _telegram_configured() and _telegram_whitelist():
+        names.append("telegram")
+    if _ntfy_configured():
+        names.append("ntfy")
+    if _pushover_configured():
+        names.append("pushover")
+    return names
 
 
 # ─── Outbound senders ───────────────────────────────────────────────────
@@ -1000,6 +1049,296 @@ def resume_phone_bridge(_: str = "") -> str:
     return "Phone bridge polling resumed, sir."
 
 
+# ─── Proactive pings (core/phone_ping.py) ───────────────────────────────
+
+def _bridge_send(text: str, *, priority: str = "normal", title: str = "JARVIS",
+                 category: str = "ping") -> dict[str, bool] | None:
+    """core.phone_ping's sender. Fire-and-forget (confirm=False): the policy
+    layer composed the text itself, and a read-back would wait on a mic the
+    owner is, by definition, away from."""
+    return push_to_phone(text, priority=priority, source=f"ping:{category}",
+                         title=title or "JARVIS", confirm=False)
+
+
+def ping_phone(category: str, message: str, **kwargs) -> str:
+    """Public: ask core.phone_ping to text the owner if — and only if — the
+    category, his presence, quiet hours, focus mode and the hourly cap allow
+    it. Returns the outcome ("queued" when it went out to the sender)."""
+    if _phone_ping is None:
+        return "unavailable"
+    return _phone_ping.ping(category, message, **kwargs)
+
+
+def _cfg(name: str, default=None):
+    """A live core.config value (the Settings window and the voice toggle
+    change it at run time)."""
+    try:
+        from core import config as _c
+        return getattr(_c, name, default)
+    except Exception:
+        return default
+
+
+def _persist_setting(key: str, value) -> bool:
+    """The Settings writer every voice toggle uses."""
+    try:
+        from tools import settings_window as sw
+    except Exception:
+        return False
+    try:
+        current = sw.load_settings()
+        if not isinstance(current, dict):
+            current = {}
+        current[key] = value
+        sw.save_settings(current, changed=(key,))
+        return True
+    except Exception:
+        return False
+
+
+def _set_pings_enabled(on: bool) -> bool:
+    """Flip PHONE_PING_ENABLED live and save it. False when the save failed
+    (the flip then lasts until the next restart)."""
+    try:
+        import core.config as _c
+        _c.PHONE_PING_ENABLED = bool(on)
+    except Exception:
+        pass
+    return _persist_setting("PHONE_PING_ENABLED", bool(on))
+
+
+_SETUP_STEPS = (
+    "Here's how to connect your phone, sir. One: in Telegram, message "
+    "@BotFather, send /newbot, and choose a name and a username ending in "
+    "'bot'. BotFather replies with a token. Two: put that token in the .env "
+    "file in my folder as TELEGRAM_BOT_TOKEN. Three: message @userinfobot to "
+    "get your numeric user ID, and add it as TELEGRAM_USER_ID. Four: open a "
+    "chat with your new bot and press Start, so it's allowed to message you. "
+    "Five: restart me, then say 'send a test ping'. If you'd rather not use "
+    "Telegram, an ntfy topic in NTFY_TOPIC works for one-way pings."
+)
+
+_SETUP_NEEDS_USER_ID = (
+    "You're nearly there, sir: the bot token is set, but I need your Telegram "
+    "user ID before I can message you. Message @userinfobot on Telegram, put "
+    "the number it gives you in the .env file in my folder as "
+    "TELEGRAM_USER_ID, open a chat with your bot and press Start, then "
+    "restart me and say 'send a test ping'."
+)
+
+_TEST_TEXT = "Test ping from JARVIS, sir. Your phone is connected."
+
+_PING_CATEGORY_WORDS = (
+    ("print", "prints"), ("confirm", "unanswered confirmations"),
+    ("security", "guard alerts"), ("robot", "the robot"),
+)
+
+
+def phone_setup_help(_: str = "") -> str:
+    """'How do I connect my phone' — the BotFather steps (or, when a backend
+    is already set, how to check it)."""
+    names = configured_backend_names()
+    if names:
+        return (f"Your phone is already connected through "
+                f"{' and '.join(names)}, sir. Say 'send a test ping' to check "
+                f"it, or 'phone ping status' to see what I'll text you about.")
+    if _telegram_configured() and not _telegram_whitelist():
+        return _SETUP_NEEDS_USER_ID
+    return _SETUP_STEPS
+
+
+def _join_words(words: list[str]) -> str:
+    if len(words) <= 1:
+        return "".join(words)
+    return ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def _ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 90:
+        return f"{minutes} minutes ago"
+    hours = minutes // 60
+    return f"{hours} hour{'s' if hours != 1 else ''} ago"
+
+
+def phone_ping_status(_: str = "") -> str:
+    """Are proactive pings on, through what, about what, within what limits."""
+    if _phone_ping is None:
+        return "Phone pings aren't available in this build, sir."
+    st = _phone_ping.status()
+    if not st.get("enabled"):
+        return ("Phone pings are off, sir. Say 'turn on phone pings' and I'll "
+                "text you when something needs you.")
+    if not st.get("configured"):
+        return ("Phone pings are on, sir, but your phone isn't connected yet, "
+                "so nothing can go out. Ask me 'how do I connect my phone'.")
+    cats = st.get("categories") or {}
+    kinds = [label for cat, label in _PING_CATEGORY_WORDS if cats.get(cat)]
+    via = _join_words(configured_backend_names()) or "the phone bridge"
+    parts = [f"Phone pings are on, sir, through {via}: "
+             + (_join_words(kinds) + "." if kinds
+                else "every kind is switched off in Settings.")]
+    if cats.get("summary"):
+        parts.append(f"The daily summary goes out at {st.get('summary_time')}.")
+    else:
+        parts.append("The daily summary is off.")
+    parts.append(f"Quiet hours run {st.get('quiet_start')} to "
+                 f"{st.get('quiet_end')}, except guard alerts; at most "
+                 f"{st.get('max_per_hour')} an hour.")
+    sent = int(st.get("sent_last_hour") or 0) + int(
+        st.get("critical_last_hour") or 0)
+    line = f"{sent} sent in the last hour."
+    last = st.get("last")
+    if isinstance(last, dict) and last.get("t"):
+        word = dict(_PING_CATEGORY_WORDS).get(last.get("cat"), last.get("cat"))
+        line += f" The last one went out {_ago(time.time() - last['t'])}, " \
+                f"about {word}."
+    parts.append(line)
+    held = int(st.get("held") or 0)
+    if held:
+        parts.append(f"{held} {'is' if held == 1 else 'are'} waiting for the "
+                     f"end of quiet hours.")
+    if st.get("blocked"):
+        parts.append("This is a staging instance, so none go out from here.")
+    return " ".join(parts)
+
+
+def phone_pings_on(_: str = "") -> str:
+    """Master switch on (live + saved) and start the watcher."""
+    was_on = bool(_cfg("PHONE_PING_ENABLED", True))
+    persisted = _set_pings_enabled(True)
+    if not can_push_unsolicited():
+        msg = ("Phone pings are on, sir, but your phone isn't connected yet. "
+               "Ask me 'how do I connect my phone'.")
+    else:
+        if _phone_ping is not None:
+            _phone_ping.start_watcher()
+        msg = ("Phone pings are already on, sir." if was_on else
+               "Phone pings on, sir. I'll text you when something needs you.")
+    if not persisted:
+        msg += " (I couldn't save it, so it'll revert on restart.)"
+    return msg
+
+
+def phone_pings_off(_: str = "") -> str:
+    """Master switch off (live + saved). notify_phone still works."""
+    was_on = bool(_cfg("PHONE_PING_ENABLED", True))
+    persisted = _set_pings_enabled(False)
+    if _phone_ping is not None:
+        _phone_ping.stop_watcher()
+    msg = ("Phone pings off, sir. I won't text you unprompted; 'text my phone' "
+           "still works." if was_on else "Phone pings are already off, sir.")
+    if not persisted:
+        msg += " (I couldn't save it, so it'll revert on restart.)"
+    return msg
+
+
+def phone_ping_test(_: str = "") -> str:
+    """Send one fixed test ping right now (it skips the quiet-hours / presence
+    gates: he asked for it). Never from a staging instance."""
+    if not can_push_unsolicited():
+        return ("Your phone isn't connected yet, sir, so there's nowhere to "
+                "send it. Ask me 'how do I connect my phone'.")
+    blocked = ""
+    if _phone_ping is not None:
+        try:
+            blocked = _phone_ping.get_pinger().blocked() or ""
+        except Exception:
+            blocked = ""
+    if blocked:
+        return "Not from the staging instance, sir."
+    results = push_to_phone(_TEST_TEXT, priority="normal", source="ping:test",
+                            title="JARVIS", confirm=False) or {}
+    sent = [b for b, ok in results.items() if ok]
+    failed = [b for b, ok in results.items() if not ok]
+    if sent and not failed:
+        return f"Test ping sent through {' and '.join(sent)}, sir."
+    if sent:
+        return (f"Test ping sent through {' and '.join(sent)}, but "
+                f"{' and '.join(failed)} failed, sir.")
+    return ("The test ping failed on every backend, sir. Say 'phone status' "
+            "for the last error.")
+
+
+# ── utterance route: the exact phrasings, before the LLM ─────────────────
+_PHONE_NOUN = r"(?:phone|cell ?phone|mobile(?: phone)?|iphone|android(?: phone)?)"
+_RLEAD = r"^(?:(?:hey |ok |okay )?jarvis )?(?:please )?(?:can you |could you )?"
+_RTAIL = r"(?: (?:please|sir|jarvis|now))*$"
+_PINGS = r"(?:the )?phone pings?"
+_PHONE_ROUTES = (
+    (re.compile(_RLEAD + r"(?:"
+                r"(?:how (?:do|can|should|would) i|how to|help me|show me how "
+                r"to|walk me through(?: how to)?|tell me how to|explain how "
+                r"to|what do i (?:need to )?do to) (?:connect|link|hook up|"
+                r"pair|set up|setup|add) (?:my|your|the|a) " + _PHONE_NOUN
+                + r"(?: (?:to|with|up to|up with) (?:you|jarvis))?"
+                r"|(?:connect|link|hook up|pair) (?:my|the) " + _PHONE_NOUN
+                + r" (?:to|with) (?:you|jarvis)"
+                r"|(?:how (?:do|can) i |help me |show me how to )?(?:set up|"
+                r"setup|configure|connect) (?:the |my )?(?:phone bridge|phone "
+                r"pings?|telegram(?: bot)?|phone notifications)"
+                r")" + _RTAIL), "[ACTION: phone_setup_help]"),
+    (re.compile(_RLEAD + r"(?:(?:turn|switch) off " + _PINGS + r"|(?:turn|"
+                r"switch) " + _PINGS + r" off|(?:disable|stop|pause|mute) "
+                + _PINGS + r"|phone pings? off|stop pinging (?:me|my phone)|"
+                r"(?:don't|do not) ping (?:me|my phone))" + _RTAIL),
+     "[ACTION: phone_pings_off]"),
+    (re.compile(_RLEAD + r"(?:(?:turn|switch) on " + _PINGS + r"|(?:turn|"
+                r"switch) " + _PINGS + r" on|(?:enable|resume|start) "
+                + _PINGS + r"|phone pings? on)" + _RTAIL),
+     "[ACTION: phone_pings_on]"),
+    (re.compile(_RLEAD + r"(?:(?:what is |what are )?(?:the |my )?phone "
+                r"pings? (?:status|settings)|(?:are|is) " + _PINGS
+                + r" (?:on|off|enabled|working)|what will you ping me about|"
+                r"when (?:will|do) you ping (?:me|my phone))" + _RTAIL),
+     "[ACTION: phone_ping_status]"),
+    (re.compile(_RLEAD + r"(?:(?:send|give) (?:me )?(?:a )?test (?:ping|"
+                r"message|notification)(?: to (?:my|the) phone)?|test (?:my "
+                r"|the )?phone pings?|(?:send|do) (?:a )?phone ping test|test "
+                r"(?:the )?phone bridge)" + _RTAIL), "[ACTION: phone_ping_test]"),
+)
+
+
+def _phone_route(text):
+    """Utterance route: the phone-ping token for an exact setup / on / off /
+    status / test request, else None. Never raises."""
+    try:
+        s = str(text or "").lower().replace("-", " ")
+        s = s.replace("what's", "what is").replace("whats", "what is")
+        s = " ".join(re.sub(r"[^a-z0-9' ]+", " ", s).split())
+        if not any(w in s for w in ("phone", "ping", "telegram", "mobile")):
+            return None
+        for rx, token in _PHONE_ROUTES:
+            if rx.match(s):
+                return token
+        return None
+    except Exception:
+        return None
+
+
+def _attach_pings() -> bool:
+    """Hand this bridge to core.phone_ping and start its watcher. With no
+    backend that can send unsolicited, ONE line says pings are a no-op."""
+    if _phone_ping is None:
+        return False
+    p = _phone_ping.attach_bridge(_bridge_send, can_push_unsolicited)
+    if not can_push_unsolicited():
+        p.log_unconfigured_once()
+        return False
+    if not bool(_cfg("PHONE_PING_ENABLED", True)):
+        print("  [phone-ping] off (PHONE_PING_ENABLED) — say 'turn on phone "
+              "pings' to enable")
+        return False
+    if _phone_ping.start_watcher():
+        print("  [phone-ping] on — pings go out through "
+              f"{', '.join(configured_backend_names())}")
+        return True
+    return False
+
+
 # ─── Registration ───────────────────────────────────────────────────────
 
 def register(actions):
@@ -1014,9 +1353,23 @@ def register(actions):
     actions["list_phone_backends"]  = list_phone_backends
     actions["pause_phone_bridge"]   = pause_phone_bridge
     actions["resume_phone_bridge"]  = resume_phone_bridge
+    actions["phone_setup_help"]     = phone_setup_help
+    actions["phone_ping_status"]    = phone_ping_status
+    actions["phone_pings_on"]       = phone_pings_on
+    actions["phone_pings_off"]      = phone_pings_off
+    actions["phone_ping_test"]      = phone_ping_test
+
+    try:
+        su = globals().get("skill_utils") or {}
+        reg = su.get("register_utterance_route") if isinstance(su, dict) else None
+        if callable(reg):
+            reg(_phone_route, "phone pings")
+    except Exception:
+        pass
 
     # Kick off the inbound long-poll only when a Telegram token is set.
     _start_polling_thread()
+    _attach_pings()
 
     configured = []
     if _telegram_configured():

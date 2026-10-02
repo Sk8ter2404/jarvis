@@ -1354,6 +1354,7 @@ class RegisterTests(unittest.TestCase):
                              clear=True), \
              mock.patch.object(self.mod, "_start_polling_thread"), \
              mock.patch.object(self.mod, "_load_state"), \
+             mock.patch.object(self.mod, "_attach_pings"), \
              mock.patch("builtins.print") as pr:
             self.mod.register(fresh)
         printed = " ".join(str(c.args[0]) for c in pr.call_args_list if c.args)

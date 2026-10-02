@@ -984,6 +984,47 @@ CLAP_TRIGGER_COOLDOWN_S = 60.0
 CLAP_TRIGGER_MIN_PEAK = 0.12
 
 
+# ─── Phone pings (core/phone_ping.py, skills/phone_bridge.py) ──────────
+# JARVIS texts your phone ONLY when something needs you, through the phone
+# bridge (Telegram / ntfy / Pushover in .env). With no bridge configured every
+# ping is a no-op and the boot log says so once; "how do I connect my phone"
+# walks you through the @BotFather steps.
+# PHONE_PING_ENABLED — the master switch. On by default, but it does nothing
+#   until a backend can send an unsolicited message (a Telegram token AND your
+#   TELEGRAM_USER_ID, or an ntfy topic, or Pushover). "turn off phone pings" /
+#   "turn on phone pings" flip it live and save it.
+# PHONE_PING_PRINT — a print finished, failed, or paused with an error.
+# PHONE_PING_CONFIRM — a confirmation you left unanswered while away (the
+#   action's NAME only, never its argument).
+# PHONE_PING_SECURITY — a guard-mode alert. Critical: it ignores quiet hours,
+#   focus mode and the hourly cap (it has its own ceiling of 20 an hour).
+# PHONE_PING_ROBOT — a robot event a skill reports with
+#   skill_utils["ping_phone"]("robot", ...).
+# PHONE_PING_SUMMARY — a once-a-day digest at PHONE_PING_SUMMARY_TIME ("07:30"
+#   = a morning summary, "22:00" = a nightly one). Off by default. While it is
+#   on it also carries what quiet hours held back.
+# PHONE_PING_MAX_PER_HOUR — ordinary pings in any rolling hour.
+# PHONE_PING_QUIET_START / _END — "HH:MM", local time; ordinary pings are held
+#   and sent as one message when quiet hours end. Equal values = no quiet hours.
+# PHONE_PING_AWAY_MIN — an ordinary ping waits until you have said nothing to
+#   JARVIS for this many minutes (he already told you out loud); 0 = ping even
+#   while you are talking to him.
+# PHONE_PING_CONFIRM_AFTER_MIN — how old an unanswered confirmation must be
+#   before it may ping (it also needs you away, above).
+PHONE_PING_ENABLED = True
+PHONE_PING_PRINT = True
+PHONE_PING_CONFIRM = True
+PHONE_PING_SECURITY = True
+PHONE_PING_ROBOT = True
+PHONE_PING_SUMMARY = False
+PHONE_PING_SUMMARY_TIME = "07:30"
+PHONE_PING_MAX_PER_HOUR = 6
+PHONE_PING_QUIET_START = "23:00"
+PHONE_PING_QUIET_END = "07:00"
+PHONE_PING_AWAY_MIN = 10.0
+PHONE_PING_CONFIRM_AFTER_MIN = 2.0
+
+
 # ─── Capture auto-gain (quiet-mic normalization before Whisper) ────────
 # CONSERVATIVE input normalization applied to the recorded float32 buffer
 # right BEFORE faster-whisper sees it, on BOTH the normal turn and the
