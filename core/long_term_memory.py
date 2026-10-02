@@ -418,7 +418,11 @@ def _try_import_embedder():
 
 def _try_import_bm25():
     try:
-        from rank_bm25 import BM25Okapi  # noqa: F401
+        from rank_bm25 import BM25Okapi
+        # Availability probe only. pyflakes does not read `# noqa`, so drop the
+        # name instead — the import itself (and any error it raises) is
+        # unchanged (2026-10-02, CI lints core/).
+        del BM25Okapi
         return True
     except Exception:
         return False
@@ -624,18 +628,23 @@ def is_available() -> dict:
     """Per-feature availability flags. Useful for diagnostics and for the
     skill layer to print a single 'pip install …' hint listing only the
     missing pieces."""
+    # Import probes: each name is dropped right after its import so pyflakes
+    # (which ignores `# noqa`) sees no unused import; the probe is unchanged.
     try:
-        import chromadb  # noqa: F401
+        import chromadb
+        del chromadb
         chroma_ok = True
     except Exception:
         chroma_ok = False
     try:
-        import sentence_transformers  # noqa: F401
+        import sentence_transformers
+        del sentence_transformers
         embed_ok = True
     except Exception:
         embed_ok = False
     try:
-        import rank_bm25  # noqa: F401
+        import rank_bm25
+        del rank_bm25
         bm25_ok = True
     except Exception:
         bm25_ok = False

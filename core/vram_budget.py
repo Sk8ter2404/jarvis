@@ -39,11 +39,13 @@ import subprocess
 import time
 from typing import Optional
 
-# Vision tag markers live in core.model_lockstep (stdlib-only, import-light, so
-# the design contract above still holds): this file, skills/model_picker.py and
-# the lockstep rule itself each kept an identical private tuple until
-# 2026-08-20 — ONE copy now, so "what counts as a vision tag" cannot drift.
-from core.model_lockstep import VISION_MARKERS as _VISION_MARKERS
+# Vision tag markers live in core.model_lockstep (VISION_MARKERS): this file,
+# skills/model_picker.py and the lockstep rule itself each kept an identical
+# private tuple until 2026-08-20 — ONE copy now, so "what counts as a vision
+# tag" cannot drift. This file imported that copy but never READ it (no code
+# here has used a marker tuple since v1.32.0 added one), so the unused import
+# went when CI started linting core/ (2026-10-02). Import it again if a marker
+# check is ever added here — never re-grow a private tuple.
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Constants — calibrated anchors (megabytes)
@@ -101,7 +103,8 @@ _DISK_TO_VRAM_FACTOR = 1.15
 
 # Tags that are NOT chat models (vision / embedding) — used by the param-count
 # fallback to pick a sane default when a tag is wholly unrecognised.
-# (_VISION_MARKERS is imported from core.model_lockstep at the top of the file.)
+# (Vision markers: core.model_lockstep.VISION_MARKERS — see the note at the top.
+# 2026-10-02: no code in this file reads _EMBED_MARKERS either.)
 _EMBED_MARKERS = ("embed", "nomic", "bge-", "minilm")
 
 

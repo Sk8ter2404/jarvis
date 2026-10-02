@@ -584,11 +584,11 @@ _TIMER_LIST_RES = tuple(re.compile(p) for p in (
     rf"^(?:do i have|have i got|are there|is there|got) (?:any|a) "
     rf"(?:active |running |pending )?{_TIMERS_N}(?: {_TIMER_STATE_W})?$",
     rf"^any (?:active |running |pending )?{_TIMERS_N}(?: {_TIMER_STATE_W})?$",
-    rf"^how (?:much time|long) (?:is |do i have )?(?:left|remaining) on "
-    rf"(?:my|the) (?:\w+ )?timers?$",
-    rf"^what is left on (?:my|the) (?:\w+ )?timers?$",
-    rf"^(?:when|what time) (?:does|will|is) (?:my|the) (?:\w+ )?timer "
-    rf"(?:go off|going off|done|due)$",
+    r"^how (?:much time|long) (?:is |do i have )?(?:left|remaining) on "
+    r"(?:my|the) (?:\w+ )?timers?$",
+    r"^what is left on (?:my|the) (?:\w+ )?timers?$",
+    r"^(?:when|what time) (?:does|will|is) (?:my|the) (?:\w+ )?timer "
+    r"(?:go off|going off|done|due)$",
 ))
 
 

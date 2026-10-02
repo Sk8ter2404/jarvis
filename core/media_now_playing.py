@@ -60,10 +60,13 @@ def _winrt_available() -> bool:
     global _available
     if _available is None:  # pragma: no cover - platform/env dependent
         try:
-            from winrt.windows.media.control import (  # noqa: F401
+            from winrt.windows.media.control import (
                 GlobalSystemMediaTransportControlsSessionManager as _M,
             )
-            _available = True
+            # Probe only. pyflakes ignores `# noqa` AND a `del` inside an `if`,
+            # so the name is read instead — a class, so this is always True
+            # once the import succeeds (2026-10-02, CI lints core/).
+            _available = _M is not None
         except Exception:
             _available = False
     return _available

@@ -260,7 +260,8 @@ def is_available() -> bool:
     config) stays responsive. PDF / docx / watchdog / reranker are
     *optional* — their absence just disables the feature they back."""
     try:
-        import chromadb  # noqa: F401
+        import chromadb
+        del chromadb  # probe only; pyflakes ignores noqa (2026-10-02)
         return True
     except Exception:
         return False

@@ -64,7 +64,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 from typing import Optional, Tuple
 
 # numpy is present wherever real synthesis runs (the monolith imports it at top

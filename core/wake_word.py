@@ -441,7 +441,8 @@ class WakeWordDetector:
 
     # ── engine init ──────────────────────────────────────────────────
     def _init_openwakeword(self) -> None:
-        import openwakeword  # noqa: F401  — package check
+        import openwakeword  # package check — dropped below: pyflakes ignores noqa
+        del openwakeword
         from openwakeword.model import Model
 
         # Auto-download bundled models the first time we run.

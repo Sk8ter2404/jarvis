@@ -103,12 +103,16 @@ def is_available() -> tuple[bool, str]:
     Cheap — runs two imports. Safe to call at boot to decide which
     pipeline to use.
     """
+    # Import probes: the names are dropped straight away so pyflakes (which
+    # ignores `# noqa`) sees no unused import (2026-10-02).
     try:
-        import RealtimeSTT  # noqa: F401
+        import RealtimeSTT
+        del RealtimeSTT
     except Exception as e:
         return False, f"RealtimeSTT missing ({e})"
     try:
-        import RealtimeTTS  # noqa: F401
+        import RealtimeTTS
+        del RealtimeTTS
     except Exception as e:
         return False, f"RealtimeTTS missing ({e})"
     return True, ""

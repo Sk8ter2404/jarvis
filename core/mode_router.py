@@ -54,10 +54,14 @@ import re
 import threading
 from pathlib import Path
 
-from core.lead_fillers import (
-    LEAD_FILLERS as _LEAD_FILLERS,
-    strip_lead_filler as _strip_lead_filler,
-)
+from core import lead_fillers as _lead_fillers
+from core.lead_fillers import strip_lead_filler as _strip_lead_filler
+
+# Re-exported, never used here: tests/test_mode_router.py pins that
+# mr._LEAD_FILLERS IS the shared table (identity, not a copy). Bound by
+# assignment rather than as an unused import so pyflakes, which CI now runs
+# over core/, stays clean (2026-10-02).
+_LEAD_FILLERS = _lead_fillers.LEAD_FILLERS
 
 
 # ── modes ────────────────────────────────────────────────────────────────
