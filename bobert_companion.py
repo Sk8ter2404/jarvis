@@ -39855,8 +39855,10 @@ def _speak_pending(only_sources=None):
     An orphaned `.consuming` snapshot from a previous crash is merged
     back BEFORE claiming (see _recover_orphaned_queue_snapshot) — a
     reminder batch stranded by a mid-speak kill is spoken on the next
-    pass instead of vanishing; re-speaks are bounded by the
-    _speech_was_recently_spoken dedupe below."""
+    pass instead of vanishing. Lines the batch had already FINISHED are not
+    in it: the snapshot is rewritten after every line (crash-safe progress,
+    2026-10-02), because the _speech_was_recently_spoken dedupe below lives
+    in memory and does not survive the restart that does the recovering."""
     # Release an audio-device sentence the flap governor was holding for its
     # one-per-AUDIO_ANNOUNCE_MIN_GAP_S gap (and announce a finished flap
     # storm). Here, because this drain is the only place it could be spoken
@@ -39970,7 +39972,18 @@ def _speak_pending(only_sources=None):
     deferred: list = []
     held: list = []   # not in only_sources: kept for the full (wake) drain
     back: list = []   # held + deferred, in queue order, requeued below
-    for item in items:
+    # CRASH-SAFE PROGRESS (2026-10-02). The claimed snapshot used to shrink
+    # only at the END of the batch, so a crash or hard kill after line 1 of 3
+    # left all three in it; the next boot's orphan recovery put them back and
+    # line 1 was said twice (the 60 s dedupe meant to stop that is in memory
+    # and dies with the process). Once a line is finished - spoken, dropped
+    # as a duplicate, or failed - the snapshot is rewritten to what is still
+    # owed: held/deferred entries so far + the unprocessed rest, which keeps
+    # queue order. A line cut off mid-word is still in it and is said again
+    # once; a finished one is not. A failed rewrite keeps MORE than is owed:
+    # repeated, never lost. Held/deferred entries need no write - moving one
+    # from the rest to `back` leaves that concatenation unchanged.
+    for _pos, item in enumerate(items):
         if (only_sources is not None
                 and not _pending_source_in(item, only_sources)
                 and not (_hold_urgent
@@ -39998,6 +40011,9 @@ def _speak_pending(only_sources=None):
         _dkey = str(item.get("dedupe_key") or "") or msg
         if _dkey in seen_in_batch or _speech_was_recently_spoken(_dkey):
             print(f"  [pending] suppressed duplicate: {msg[:80]}")
+            # Progress: after a restart the in-memory dedupe is gone, so a
+            # duplicate still in the snapshot would be SPOKEN.
+            _rewrite_queue_snapshot(consume_path, back + items[_pos + 1:])
             continue
         seen_in_batch.add(_dkey)
         print(f"  🔔 [reminder] {msg}")
@@ -40032,6 +40048,8 @@ def _speak_pending(only_sources=None):
             # continue to the next reminder. The snapshot is gone (we
             # already renamed), so this one is lost — but JARVIS stays up.
             print(f"  [pending] speak failed for reminder: {_spe}")
+        # Progress (see CRASH-SAFE PROGRESS above): this line is finished.
+        _rewrite_queue_snapshot(consume_path, back + items[_pos + 1:])
     # Budget tripped: put the un-spoken tail back BEFORE dropping the
     # snapshot, so the deferred announcements are never stranded.
     if deferred:
