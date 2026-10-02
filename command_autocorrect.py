@@ -389,7 +389,7 @@ def _rank_candidates(
     u_norm = _normalise(unknown)
     lexical: list[tuple[str, float]] = []
     for cand in registered:
-        if not cand:
+        if not cand or _polarity_clash(u_norm, cand):
             continue
         c_norm = _normalise(cand)
         if u_norm == c_norm:
@@ -419,6 +419,38 @@ def _rank_candidates(
     merged = blended + lexical[cutoff:]
     merged.sort(key=lambda kv: kv[1], reverse=True)
     return merged
+
+
+# Opposite-meaning words. Many of them are _FILLER_TOKENS (ignored for
+# SIMILARITY so "enable_x" still finds "x"), which made stop_timer and
+# set_timer near-twins: the 2026-10-02 model research saw "never mind, cancel
+# that" -> invented [ACTION: stop_timer] -> routed to set_timer, starting a
+# timer instead of cancelling one. A guess may never flip the owner's intent.
+_OPPOSITES = (
+    (frozenset({"stop", "cancel", "end", "remove", "delete", "clear", "kill",
+                "disable", "off", "close", "pause", "halt", "dismiss", "unset"}),
+     frozenset({"start", "set", "add", "create", "enable", "on", "open",
+                "resume", "play", "begin", "launch", "schedule", "new"})),
+    (frozenset({"mute"}), frozenset({"unmute"})),
+    (frozenset({"lock"}), frozenset({"unlock"})),
+    (frozenset({"hide"}), frozenset({"show"})),
+    (frozenset({"up", "increase", "raise", "louder"}),
+     frozenset({"down", "decrease", "lower", "quieter"})),
+    (frozenset({"connect", "engage", "arm", "pair"}),
+     frozenset({"disconnect", "disengage", "disarm", "unpair"})),
+)
+
+
+def _polarity_clash(unknown: str, candidate: str) -> bool:
+    """True when ``candidate`` means the opposite of ``unknown``: one side has
+    a word from a pair and the other has the opposite word without also
+    carrying the first (so "toggle_on_off" is never an opposite)."""
+    ta = set(_normalise(unknown).split("_"))
+    tb = set(_normalise(candidate).split("_"))
+    for x, y in _OPPOSITES:
+        if (ta & x and tb & y and not tb & x) or (ta & y and tb & x and not tb & y):
+            return True
+    return False
 
 
 def _protected_predicate(protected):

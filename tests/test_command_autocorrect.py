@@ -286,6 +286,63 @@ class ProtectedTargetTests(EmbeddingsOffMixin, unittest.TestCase):
 
 
 # ── Embedding availability toggle (no network involved) ──────────────────────
+class OppositeMeaningTests(EmbeddingsOffMixin, unittest.TestCase):
+    """2026-10-02 model research: for "never mind, cancel that" the local brain
+    invented [ACTION: stop_timer], and the corrector routed it to set_timer -
+    starting a timer instead of cancelling one. stop/start/on/off/enable/...
+    are filler tokens for SIMILARITY, so the two scored as near-twins. A guess
+    must never flip the owner's intent: a candidate whose verb is the
+    opposite of the unknown name's is never routed or offered."""
+
+    TIMERS = ["set_timer", "cancel_timer", "list_timers", "volume_up",
+              "volume_down", "lights_on", "lights_off", "mute_audio",
+              "unmute_audio", "start_eavesdropping", "stop_eavesdropping"]
+
+    def _choice(self, unknown, acts=None):
+        return ac.autocorrect_command_choice(unknown, acts or self.TIMERS,
+                                             use_embeddings=False)
+
+    def _picked(self, choice):
+        if choice["status"] == "none":
+            return set()
+        names = {choice["primary"][0]}
+        if choice.get("secondary"):
+            names.add(choice["secondary"][0])
+        return names
+
+    def test_stop_timer_never_becomes_set_timer(self):
+        self.assertNotIn("set_timer", self._picked(self._choice("stop_timer")))
+
+    def test_stop_timer_with_no_same_meaning_action_is_none(self):
+        choice = self._choice("stop_timer", ["set_timer", "list_timers"])
+        self.assertNotIn("set_timer", self._picked(choice))
+
+    def test_same_meaning_correction_still_works(self):
+        self.assertIn("cancel_timer", self._picked(self._choice("cancel_timers")))
+
+    def test_on_off_up_down_mute_never_flip(self):
+        for unknown, never in (("lights_off_now", "lights_on"),
+                               ("turn_lights_on", "lights_off"),
+                               ("volume_down_please", "volume_up"),
+                               ("unmute_audi", "mute_audio"),
+                               ("start_evesdropping", "stop_eavesdropping")):
+            self.assertNotIn(never, self._picked(self._choice(unknown)),
+                             f"{unknown!r} must never become {never!r}")
+
+    def test_typos_keep_their_own_polarity(self):
+        self.assertEqual(self._choice("start_evesdropping")["primary"][0],
+                         "start_eavesdropping")
+        self.assertEqual(self._choice("volume_dwn")["primary"][0], "volume_down")
+
+    def test_clash_rule_itself(self):
+        self.assertTrue(ac._polarity_clash("stop_timer", "set_timer"))
+        self.assertTrue(ac._polarity_clash("lights_on", "lights_off"))
+        self.assertFalse(ac._polarity_clash("stop_timer", "cancel_timer"))
+        self.assertFalse(ac._polarity_clash("screen_shot", "screenshot"))
+        # a candidate carrying both words is not an opposite
+        self.assertFalse(ac._polarity_clash("lights_off", "toggle_lights_on_off"))
+
+
 class EmbeddingToggleTests(unittest.TestCase):
     def tearDown(self):
         ac.enable_embeddings()  # leave the module in its default state
