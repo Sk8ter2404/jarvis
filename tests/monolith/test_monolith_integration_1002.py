@@ -196,7 +196,10 @@ class BothShadowTests(_BothFeaturesBase):
         out = self._run("volume up")
         self.llm.assert_called_once()
         self.assertEqual(self.calls["volume_up"], [])
-        self.assertEqual(self.spoken, ["Right away, sir."])
+        # live-fixes-1202 F1: an unverified execution claim is never voiced;
+        # the turn goes straight to the follow-up round (stubbed empty here).
+        self.assertEqual(self.spoken, [])
+        self.gfr.assert_called()
         self.oneshot.assert_not_called()
         inst = self._rows()
         self.assertEqual((inst[0]["action"], inst[0]["agree"], inst[0]["brain"]),
