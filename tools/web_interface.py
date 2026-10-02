@@ -4646,10 +4646,18 @@ const QUICK_ACTIONS = [
 // tray channel (which works in standby) and then send, or don't send.
 // A command that DOES start with the wake word goes straight through: the
 // standby handler runs "Jarvis, <command>" as the turn (2026-10-01), so there
-// is nothing to wake first. "Starts with" is core/wake_prefix.py's rule: the
-// wake word at word 1-3 behind lead interjections ("um, Jarvis, pause");
-// tests/test_wake_prefix.py pins this filler list to WAKE_LEAD_FILLERS.
-const WAKE_WORD_RE = /^\s*(?:(?:what|okay|ok|hey|yo|so|umm|um|uhh|uh|oh|alright|all\s+right)[\s,.!?;:-]+){0,2}jarvis\b/i;
+// is nothing to wake first. "Starts with" is core/wake_prefix.py's rule, and
+// this check must never be LOOSER than it: a line the page lets through but
+// the server refuses is dropped in standby (the handler only wakes him), while
+// a line the page holds back just gets the "wake him first?" prompt. So it
+// takes (a) the legacy forms - "Jarvis ...", "hey / ok / okay Jarvis ..." -
+// and (b) the wake word at word 2-3 behind lead interjections ("um, Jarvis,
+// pause"; "all right" counts as two words) only when punctuation sets the name
+// off and no reporting verb follows ("so Jarvis, said what" is a mention).
+// An unpunctuated filler-led line ("um Jarvis pause") gets the prompt.
+// tests/test_wake_prefix.py pins the lists to core/wake_prefix.py and checks
+// that every line this accepts, the server accepts too.
+const WAKE_WORD_RE = /^\s*(?:(?:(?:hey|ok|okay)[,.!?;:-]*\s[\s,.!?;:-]*)?jarvis(?=[,.!?;:\u2026\u2014\u2013"()\[\]\u201c\u201d-]*(?:\s|$))|(?:(?:(?:what|okay|ok|hey|yo|so|umm|um|uhh|uh|oh|alright)[,.!?;:-]*\s[\s,.!?;:-]*){1,2}|all[,.!?;:-]*\s[\s,.!?;:-]*right[,.!?;:-]*\s[\s,.!?;:-]*)jarvis(?:\s*$|\s*[,.!?;:\u2026\u2014\u2013-]+(?=\s|$)(?!\s*(?:said|says|told|tells|thinks|thought|knows|knew|wants|wanted|meant|means|heard|keeps|kept|seems|seemed|sounds|sounded|likes|liked|needs|needed)\b)))/i;
 const WAKE_UP_RE = /^\s*wake(\s+up)?\s*[.!]?\s*$/i;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 

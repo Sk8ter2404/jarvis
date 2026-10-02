@@ -172,6 +172,85 @@ class CanonicalWakeTextTests(unittest.TestCase):
                 self.assertEqual(wp.canonical_wake_text(text), text)
 
 
+# Review fixes (2026-10-02). A filler-led name followed by an auxiliary,
+# copula or modal (no inversion) or by a past-tense verb, with NO vocative
+# punctuation after the name, is talk ABOUT him: "So Jarvis shut down." was
+# canonicalised to "Jarvis shut down." and armed the shutdown prompt. A
+# trailing apostrophe is a possessive in every form, as it was before the
+# rewrite ("Jarvis' voice is weird").
+MENTIONS_REFUSED = (
+    "So Jarvis is broken again",
+    "What Jarvis did was wrong",
+    "Oh Jarvis can't hear us",
+    "So Jarvis won't turn off the lights",
+    "So Jarvis turned off the lights",
+    "So Jarvis shut down.",
+    "So Jarvis is the AI from Iron Man",
+    "Oh Jarvis is great",
+    "what jarvis does is cool",
+    "um Jarvis needed a reboot",
+    "Jarvis' voice is weird",
+    "Jarvis’ voice is weird",
+    "um Jarvis' voice is weird",
+)
+# ...while the address forms those rules sit next to still pass.
+ADDRESSES_ACCEPTED = (
+    "So Jarvis, is it raining?",
+    "Oh Jarvis, is the light on?",
+    "um jarvis is it raining",
+    "Um Jarvis can you hear me",
+    "So Jarvis did you set the timer",
+    "Um, Jarvis, shut down.",
+    "Um Jarvis speed up the music",
+    "um Jarvis need you to check the print",
+    "What Jarvis what model are you?",
+    "So Jarvis what's up",
+    "Jarvis is broken",                        # legacy form: unchanged
+    "hey Jarvis did the print finish",         # legacy form: unchanged
+)
+
+
+class MentionGuardTests(unittest.TestCase):
+    def test_filler_led_mentions_are_refused(self):
+        for text in MENTIONS_REFUSED:
+            with self.subTest(text=text):
+                self.assertFalse(wp.has_wake_prefix(text))
+                self.assertEqual(wp.canonical_wake_text(text), text)
+                self.assertEqual(wp.strip_wake_lead(text), text)
+
+    def test_addresses_still_pass(self):
+        for text in ADDRESSES_ACCEPTED:
+            with self.subTest(text=text):
+                self.assertTrue(wp.has_wake_prefix(text))
+
+    def test_the_shutdown_mention_is_not_rewritten_into_a_command(self):
+        # The live hazard: canonical "Jarvis shut down." is a <=6-word
+        # utterance holding "shut down" - the shutdown prompt's trigger.
+        self.assertEqual(wp.canonical_wake_text("So Jarvis shut down."),
+                         "So Jarvis shut down.")
+
+
+class PunctuationLeadCanonicalTests(unittest.TestCase):
+    """A wake word behind punctuation-only tokens passes the gate; the
+    canonical form must start at the name so every downstream stripper (which
+    expects a leading "Jarvis") sees the command."""
+
+    def test_punctuation_before_the_name_is_dropped(self):
+        for text, want in (("- Jarvis, turn it off.", "Jarvis, turn it off."),
+                           ("... Jarvis, pause", "Jarvis, pause"),
+                           ('"Jarvis, pause"', 'Jarvis, pause"'),
+                           ("— Jarvis", "Jarvis")):
+            with self.subTest(text=text):
+                self.assertTrue(wp.has_wake_prefix(text))
+                self.assertEqual(wp.canonical_wake_text(text), want)
+
+    def test_downstream_handlers_see_the_command(self):
+        from core import date_math, pronoun_switch
+        canon = wp.canonical_wake_text("- Jarvis, turn it off.")
+        self.assertEqual(pronoun_switch.switch_state(canon), "off")
+        self.assertTrue(date_math.normalize(canon).startswith("turn it off"))
+
+
 class NoStaleDuplicateTests(unittest.TestCase):
     """Every copy of the leading-wake rule now calls core.wake_prefix."""
 
@@ -207,39 +286,60 @@ class NoStaleDuplicateTests(unittest.TestCase):
         self.assertIn("strip_wake_lead(", carry)
         self.assertNotIn("_WAKE_LEAD_RE", src)
 
-    def test_the_dashboard_standby_guard_mirrors_the_rule(self):
-        # The page decides in the browser whether a typed command in standby
-        # needs a wake first; its regex must take the same fillers, at most
-        # MAX_WAKE_POSITION - 1 of them.
+    def _page_regex(self):
         src = self._src("tools", "web_interface.py")
         m = re.search(r"const WAKE_WORD_RE = /(.+)/i;", src)
         self.assertIsNotNone(m, "WAKE_WORD_RE literal not found")
-        js = m.group(1)
-        alt = re.search(r"\(\?:\(\?:([^()]+)\)", js)
-        self.assertIsNotNone(alt, js)
-        page = {a.replace(r"\s+", " ") for a in alt.group(1).split("|")}
-        self.assertEqual(page, set(wp.WAKE_LEAD_FILLERS)
-                         | {" ".join(p) for p in wp.WAKE_LEAD_PHRASES})
-        self.assertIn("{0,%d}" % (wp.MAX_WAKE_POSITION - 1), js)
-        rx = re.compile(js, re.IGNORECASE)
-        for text in ACCEPTED:
-            with self.subTest(accepted=text):
-                self.assertIsNotNone(rx.search(text))
-        # The mention guard (and the possessive) are server-side only: the
-        # page then just skips its "wake him first?" prompt and the standby
-        # handler still refuses to run the line as a command.
-        server_only = {"So Jarvis said it would rain",
-                       "What Jarvis told me was wrong",
-                       "oh Jarvis thinks he's funny",
-                       "um Jarvis keeps cutting me off",
-                       "Jarvis's voice is weird",
-                       # the page counts fillers, not words
-                       "um all right Jarvis lights off"}
-        for text in REFUSED:
-            if text in server_only:
-                continue
+        return m.group(1), re.compile(m.group(1), re.IGNORECASE)
+
+    def test_the_dashboard_standby_guard_mirrors_the_rule(self):
+        # The page decides in the browser whether a typed command in standby
+        # needs a wake first. Its lists must be the server's.
+        js, _rx = self._page_regex()
+        alts = re.findall(r"\(\?:\(\?:\(\?:([a-z|]+)\)", js)
+        self.assertEqual(len(alts), 2, js)
+        self.assertEqual(set(alts[0].split("|")), set(wp._LEGACY_LEADS))
+        self.assertEqual(set(alts[1].split("|")), set(wp.WAKE_LEAD_FILLERS))
+        self.assertIn("{1,%d}" % (wp.MAX_WAKE_POSITION - 1), js)
+        self.assertEqual(wp.WAKE_LEAD_PHRASES, frozenset({("all", "right")}))
+        self.assertIn("all[,.!?;:-]*\\s[\\s,.!?;:-]*right", js)
+        verbs = re.search(r"\(\?:(said\|[a-z|]+)\)", js)
+        self.assertIsNotNone(verbs, js)
+        self.assertEqual(set(verbs.group(1).split("|")), set(wp._MENTION_VERBS))
+
+    def test_the_dashboard_never_lets_through_what_the_server_refuses(self):
+        # Review 2026-10-02: the page took "um all right Jarvis ..." (word 4)
+        # and filler-led mentions, so in standby it skipped its "wake him
+        # first?" prompt and the server dropped the line. Every line the
+        # page accepts must be one the server accepts.
+        _js, rx = self._page_regex()
+        extra = ("um-jarvis pause", "um,jarvis pause", "Jarvis-like",
+                 "jarvis.com is down", "um jarvis-like", "So Jarvis, said what",
+                 "um Jarvis,said", "hey-jarvis pause", "so um uh Jarvis, go")
+        for text in (ACCEPTED + REFUSED + MENTIONS_REFUSED
+                     + ADDRESSES_ACCEPTED + extra):
+            with self.subTest(text=text):
+                if rx.search(text):
+                    self.assertTrue(wp.has_wake_prefix(text))
+        for text in REFUSED + MENTIONS_REFUSED:
             with self.subTest(refused=text):
                 self.assertIsNone(rx.search(text))
+
+    def test_the_dashboard_takes_the_typed_forms(self):
+        # What a typed command in standby looks like: the legacy forms, and a
+        # filler-led name set off by punctuation.
+        _js, rx = self._page_regex()
+        for text in ("Jarvis", "Jarvis.", "Jarvis, pause", "jarvis pause",
+                     "JARVIS turn off the lights", "hey jarvis pause",
+                     "Hey, Jarvis, play some jazz", "okay jarvis lights off",
+                     "Um, Jarvis, pause the music", "So, Jarvis, what's next",
+                     "All right, Jarvis, lights off", "um okay Jarvis, go",
+                     "What? Jarvis, what's the weather?", "Alright, Jarvis.",
+                     "hey hey Jarvis", "uh Jarvis",
+                     "Jarvis is broken", "hey Jarvis says hi"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(rx.search(text))
+                self.assertTrue(wp.has_wake_prefix(text))
 
 
 if __name__ == "__main__":
