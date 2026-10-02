@@ -18929,7 +18929,7 @@ def _local_cheatsheet() -> str:
         "  [ACTION: smart_home_control, <plain request>]   [ACTION: make_picture, <prompt>]\n"
         "Choosing YOUR OWN local brain (which Ollama model runs you):\n"
         "  [ACTION: current_model]       \"what model are you using\" / \"what's your brain\"\n"
-        "  [ACTION: list_models]         \"what models do you have\" / \"what can you run on\"\n"
+        "  [ACTION: list_models]         \"what models do you have\" / \"what can you run on\" / \"is there a better model you can run\"\n"
         "  [ACTION: set_model, <name>]   \"switch to the 32B\" / \"use the fast one\" / \"use qwen\"\n"
         "                                 (arg is a tag/size/alias: 32b, 14b, 8b, big, fast, qwen, llama)\n"
         "  [ACTION: set_brain, <local|cloud|auto>]   \"use local\" / \"use cloud / Claude\" / \"go auto\"\n"

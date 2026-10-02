@@ -70,7 +70,11 @@ class ThirdPartyFactTests(unittest.TestCase):
                 "I haven't opened it yet, sir.",
                 "I'm afraid I couldn't open that, sir.",
                 "I've been thinking about that, sir.",
-                "Running the numbers now.",
+                # "Running the numbers now." used to sit here. Since NEW #9
+                # (2026-10-01) it IS a claim when nothing ran: live, "I'm
+                # running the numbers now, sir; I'll have those results for
+                # you in a moment" was never followed up. See
+                # tests/test_completed_work_claims.py.
                 "It is 2:53 PM on Tuesday, sir."):
             with self.subTest(text=text):
                 self.assertIsNone(_flag(text))

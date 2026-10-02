@@ -200,6 +200,23 @@ _FAMILIES: tuple[tuple[str, str, str, str, frozenset[str]], ...] = (
      r"muted|unmuted",
      r"mute|unmute",
      frozenset({"mute", "unmute", "volume", "sound", "audio", "mic"})),
+    # "I've run the calculations, sir." / "Cross-referencing now." / "I've
+    # crunched the numbers" (2026-10-01): stock completed-work lines spoken
+    # live with no action run. Any action that ran this turn grounds them
+    # ("*"); JARVIS's own arithmetic with its result in the reply is not a
+    # claim (_ARITH_RESULT_RE in find_unverified_claim).
+    ("calculate",
+     r"calculating|computing|crunching\s+(?:the\s+|some\s+)?numbers|"
+     r"running\s+(?:the\s+|some\s+)?(?:numbers|calculations?|figures|maths?)|"
+     r"cross[-\s]?referencing|number[-\s]crunching",
+     r"calculated|computed|crunched\s+(?:the\s+|some\s+)?numbers|"
+     r"(?:ran|run)\s+(?:the\s+|some\s+)?(?:numbers|calculations?|figures|"
+     r"maths?)|cross[-\s]?referenced|"
+     r"done\s+the\s+(?:maths?|calculations?|numbers|sums)",
+     r"calculate|compute|crunch\s+(?:the\s+|some\s+)?numbers|"
+     r"run\s+(?:the\s+|some\s+)?(?:numbers|calculations?|figures|maths?)|"
+     r"cross[-\s]?reference",
+     frozenset({"*"})),
 )
 
 _ADVERBS = (r"(?:(?:now|just|currently|already|also|quickly|immediately|"
@@ -326,6 +343,17 @@ _NEW_SUBJECT_RE = re.compile(
     r"you|there|people|scientists|researchers|one|most|many|some)\b")
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
+
+# JARVIS stating the result of its OWN arithmetic: "fifteen percent of eighty
+# is twelve", "I've calculated it, sir: 391". A calculate-family claim in a
+# reply that carries one is the working shown, not an invented action.
+_ARITH_RESULT_RE = re.compile(
+    r"(?:\bis|\bequals|=|\bcomes\s+(?:out\s+)?to|\bgives|\bmakes|:)\s*"
+    r"(?:about\s+|roughly\s+|approximately\s+|exactly\s+|around\s+)?"
+    r"(?:-?\d|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+    r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+    r"hundred|thousand|million|billion|a\s+half)\b)")
 
 
 def _norm(text: str) -> str:
@@ -500,6 +528,7 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
         return None
     ran = _ran_tokens(ran_actions)
     any_ran = bool(ran)
+    shows_working = bool(_ARITH_RESULT_RE.search(_norm(text)))
     acks: list[tuple[str, str]] = []      # (kind, phrase)
     content: list[str] = []               # substantive non-claim cores
     for ack, ack_text, core in _segments(text):
@@ -508,6 +537,8 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
         if not core:
             continue
         claim = _clause_claim(core)
+        if claim and claim[0] == "calculate" and shows_working:
+            claim = None
         if claim:
             fam, phrase = claim
             tokens = _family_tokens(fam)

@@ -144,6 +144,10 @@ def _similar(a: tuple, b: tuple, ratio: float, jaccard: float | None) -> bool:
 RETIRED_EXAMPLES = (
     "You seem rather determined this evening, sir.",
     "You've been at this all afternoon, sir.",
+    # Completed-work claims retired from the phrase pools (2026-10-01).
+    "I've run the calculations, sir.",
+    "Cross-referencing now.",
+    "Cross-referencing now, sir.",
 )
 
 # A capitalised single-quoted sentence in the persona prompt: 'Very good,

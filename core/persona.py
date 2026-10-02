@@ -44,7 +44,9 @@ JARVIS_SIGNATURE_PHRASES: list[str] = [
     "Shall I run the numbers, sir?",
     "Based on current trajectory, sir...",
     "Projecting now, sir...",
-    "Cross-referencing now, sir.",
+    # Was "Cross-referencing now, sir." - a claim of work, spoken live with
+    # no action run (2026-10-01). Same slot, so the count and order hold.
+    "Indeed, sir.",
     "Slight problem, sir...",
     "Rather concerning, sir.",
     "I'll note that for posterity, sir.",

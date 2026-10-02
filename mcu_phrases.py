@@ -29,16 +29,19 @@ MCU_PHRASES: dict[str, list[str]] = {
         "I'm afraid I can't recommend that, sir.",
         "I'd recommend against it, sir, but you rarely listen.",
     ],
+    # Work-in-progress lines only (2026-10-01): the completed-work claims
+    # "I've run the calculations, sir." and "Cross-referencing now." were
+    # spoken live with no action run (core/proactive_guard RETIRED_EXAMPLES
+    # keeps them for the copy check). core/prompts.py allows these only in a
+    # reply whose [ACTION:] token does the work.
     "status": [
         "Running the numbers now.",
         "Shall I run the numbers, sir?",
-        "I've run the calculations, sir.",
         "Projecting now.",
         "Based on current trajectory...",
         "One moment, sir.",
         "Stand by.",
         "Calculating, sir.",
-        "Cross-referencing now.",
     ],
     "initiative": [
         "I've taken the liberty of...",
