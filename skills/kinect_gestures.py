@@ -214,11 +214,13 @@ def _do_raise_hand(bc) -> None:
     could be appending to or cancelling it. Now it only tells the owner the
     action is waiting on his voice. No-op when nothing is queued.
 
-    Silent while JARVIS is dormant, and a lapsed prompt is expired here
-    instead of nudged (B033 guards): the confirmation TTL is lazy, so a
-    prompt that timed out stays queued until the next utterance, and without
-    these two checks anyone raising a hand in view - overnight included -
-    got "needs a spoken yes" every 30 s for an action that no longer exists."""
+    Silent while JARVIS is dormant (B033). A prompt that has LAPSED (older
+    than the monolith's CONFIRMATION_TTL_S - the TTL is lazy, so a timed-out
+    prompt stays queued until the next utterance) is dropped through the
+    monolith's own _expire_pending_confirmation, which says so - never
+    confirmed, and never a "needs a spoken yes" reminder about a request
+    that is already dead (overnight, anyone raising a hand in view got one
+    every 30 s)."""
     try:
         pending = getattr(bc, "_pending_confirmation", None)
         if not pending:
@@ -227,8 +229,14 @@ def _do_raise_hand(bc) -> None:
             print("  [gestures] RAISE_HAND ignored - JARVIS is dormant")
             return
         expire = getattr(bc, "_expire_pending_confirmation", None)
-        if callable(expire) and expire():
-            return
+        if callable(expire):
+            try:
+                if expire(speak=True):
+                    print("  [gestures] RAISE_HAND - the pending prompt had "
+                          "lapsed; dropped, not confirmed")
+                    return
+            except Exception as e:
+                print(f"  [gestures] lapse check failed: {e}")
         print("  [gestures] RAISE_HAND ignored - a pending confirmation needs "
               "a spoken yes")
         now = time.monotonic()
