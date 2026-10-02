@@ -12711,7 +12711,8 @@ def proactive_announce(message: str, source: str = "skill",
                        *, mood: str | None = None,
                        volume_scale: float = 1.0,
                        supersede: str | None = None,
-                       dedupe_key: str | None = None) -> bool:
+                       dedupe_key: str | None = None,
+                       offer: bool = False) -> bool:
     """Public proactive-speech API for skills.
 
     Skills that want JARVIS to speak something unprompted (print milestones,
@@ -12746,6 +12747,12 @@ def proactive_announce(message: str, source: str = "skill",
     The `source` tag is also stored on the entry (2026-10-01) so the drainer
     can pick out owner-requested reminders (timers, promises, schedules) —
     the standby loop speaks only those while JARVIS is asleep.
+
+    `offer` (2026-10-02) marks a line that offers to do something even when
+    it is phrased as a statement ("I can queue the usual if you like." — the
+    wake-word-mode form of "shall I ...?", skills/anticipation_engine). The
+    drainer records it in conversation_history like a question, so his
+    "JARVIS, do it" reaches the LLM with the offer in context.
     """
     # ── FOCUS MODE GATE ──────────────────────────────────────────────────────
     # This is the whole point of focus / do-not-disturb: while the owner is
@@ -12808,6 +12815,8 @@ def proactive_announce(message: str, source: str = "skill",
                        "source": str(source or "")}
         if dedupe_key:
             entry["dedupe_key"] = str(dedupe_key)
+        if offer:
+            entry["offer"] = True
         if supersede:
             _before = len(data)
             data = [e for e in data
@@ -36590,8 +36599,9 @@ def _speak_pending(only_sources=None):
             spoke_any = True
             # A queued line that asks something (a pattern offer, the recap's
             # closing question) goes into the conversation so the owner's
-            # answer has its question (_note_spoken_question).
-            if "?" in msg:
+            # answer has its question (_note_spoken_question) — and so does
+            # an offer phrased as a statement (proactive_announce offer=True).
+            if "?" in msg or item.get("offer") is True:
                 _note_spoken_question(msg)
         except Exception as _spe:
             # Don't let one bad TTS attempt nuke the main loop. Print and

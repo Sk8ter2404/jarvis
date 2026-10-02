@@ -140,19 +140,14 @@ def _is_jarvis_window(name: str) -> bool:
     return (name or "").strip().lower().startswith("jarvis")
 
 
-def _get_active_app() -> str:
-    """Best-effort canonical name of the currently-focused window's owning
-    app. Used to enrich voice-command logs so we can detect 'user typically
-    has Teams focused around this time'. Returns '' on any failure."""
+def app_name_for_title(title: str) -> str:
+    """Canonical app name for a window title — the SAME rule the voice-command
+    log uses for its "app" field, so a pattern's target can be compared with
+    what is focused now (anticipation_engine skips "you typically check X"
+    while X is on screen). '' for a blank title or one of JARVIS's own windows.
+    Never raises."""
     try:
-        import pygetwindow as gw  # type: ignore
-    except Exception:
-        return ""
-    try:
-        w = gw.getActiveWindow()
-        if w is None:
-            return ""
-        title = (getattr(w, "title", "") or "").strip()
+        title = (title or "").strip()
         if not title:
             return ""
         # JARVIS's own windows (HUD, reticle, overlays, the live-log console
@@ -179,6 +174,23 @@ def _get_active_app() -> str:
         # Fallback: truncate the raw title — useful as a weak signal but
         # won't aggregate well across sessions.
         return title[:60]
+    except Exception:
+        return ""
+
+
+def _get_active_app() -> str:
+    """Best-effort canonical name of the currently-focused window's owning
+    app. Used to enrich voice-command logs so we can detect 'user typically
+    has Teams focused around this time'. Returns '' on any failure."""
+    try:
+        import pygetwindow as gw  # type: ignore
+    except Exception:
+        return ""
+    try:
+        w = gw.getActiveWindow()
+        if w is None:
+            return ""
+        return app_name_for_title(getattr(w, "title", "") or "")
     except Exception:
         return ""
 

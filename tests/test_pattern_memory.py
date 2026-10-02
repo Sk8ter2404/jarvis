@@ -216,5 +216,30 @@ class JarvisOwnWindowsAreNotHabitsTests(unittest.TestCase):
         self.assertIn("Teams", targets)
 
 
+
+class AppNameForTitleTests(unittest.TestCase):
+    """NEW #17 (2026-10-02): the anticipation engine compares a pattern's
+    target with the app focused NOW, through the same title -> app rule the
+    voice-command log used when it recorded the pattern."""
+
+    def test_same_rule_as_the_log(self):
+        f = pattern_memory.app_name_for_title
+        self.assertEqual(f("Claude"), "Claude")          # the live 22:19 window
+        self.assertEqual(f("Inbox - you - Outlook"), "Outlook")
+        self.assertEqual(f("Week 6 notes — Google Chrome"), "Chrome")
+        self.assertEqual(f("JARVIS HUD"), "")
+        self.assertEqual(f(""), "")
+        self.assertEqual(f(None), "")
+
+    def test_get_active_app_uses_it(self):
+        import sys
+        import types
+        gw = types.ModuleType("pygetwindow")
+        gw.getActiveWindow = lambda: types.SimpleNamespace(
+            title="Week 6 notes — Google Chrome")
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertEqual(pattern_memory._get_active_app(), "Chrome")
+
+
 if __name__ == "__main__":
     unittest.main()

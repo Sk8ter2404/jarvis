@@ -25,6 +25,16 @@ Gating (all must pass before any trigger is considered):
   • Probability:     even when a trigger matches, fire with probability
                      FIRE_PROBABILITY (0.35) so the engine feels rare,
                      not punctual.
+  • Already there:   a pattern offer naming an app that is focused now, or
+                     was within RECENT_FOCUS_SECONDS, is skipped (2026-10-02,
+                     live 22:19:30: "You typically check Claude around now,
+                     sir — anything you'd like me to peek at?" with the Claude
+                     window in the foreground all evening).
+  • Answerable:      in wake-word mode with no follow-up window open, a line
+                     never ends in a question he cannot answer without the
+                     wake word — "shall I X?" becomes "I can X if you like."
+                     The line is queued as an OFFER, so the drain still puts
+                     it in the conversation for his "JARVIS, do it".
 
 Actions registered:
   anticipation_status — short status report on the engine: last fire,
@@ -43,6 +53,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import tempfile
 import threading
@@ -57,6 +68,9 @@ from core.night_quiet import night_quiet_enabled  # noqa: E402
 
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _STATE_FILE   = os.path.join(_PROJECT_DIR, "anticipation_state.json")
+
+# A pattern offer about an app focused within this window is skipped.
+RECENT_FOCUS_SECONDS = 15 * 60
 
 POLL_INTERVAL_SECONDS = 60.0
 INITIAL_DELAY_SECONDS = 90       # let JARVIS finish booting
@@ -131,11 +145,14 @@ _dwell_state: dict = {
     "started_at":  0.0,     # when we first observed it
     "last_seen":   0.0,
 }
+# Canonical app name (lower-case) -> time.time() it was last seen focused, for
+# the "already there" skip. Updated each poll by _update_dwell.
+_recent_focus: dict = {}
 
 
 # ─── speech queue ────────────────────────────────────────────────────────
 
-def _enqueue_speech(message: str) -> None:
+def _enqueue_speech(message: str, offer: bool = False) -> None:
     """Route a proactive line through bobert_companion.proactive_announce()
     — the canonical, serialized writer for pending_speech.json — and only fall
     back to a direct atomic write when the parent module isn't importable yet
@@ -148,8 +165,14 @@ def _enqueue_speech(message: str) -> None:
     try:
         bc = importlib.import_module("bobert_companion")
         announcer = getattr(bc, "proactive_announce", None)
-        if callable(announcer) and announcer(message, source="anticipation"):
-            return
+        if callable(announcer):
+            # `offer`: the drain records the line in the conversation even
+            # when it is phrased as a statement (wake-word mode, see
+            # _answerable_form), so his "JARVIS, do it" has its context.
+            ok = (announcer(message, source="anticipation", offer=True)
+                  if offer else announcer(message, source="anticipation"))
+            if ok:
+                return
     except Exception:
         pass
 
@@ -362,6 +385,131 @@ def _update_dwell(focused: str) -> None:
             _dwell_state["last_seen"]  = now
         else:
             _dwell_state["last_seen"]  = now
+    _note_focus(focused, now)
+
+
+# ─── "already there" + "answerable" (2026-10-02) ─────────────────────────
+
+def _app_name_for_title(title: str) -> str:
+    """The canonical app name the voice-command log records for a window
+    title (memory.app_name_for_title), so a pattern target compares like with
+    like. Falls back to the raw title. Never raises."""
+    try:
+        pm = importlib.import_module("memory")
+        fn = getattr(pm, "app_name_for_title", None)
+        if callable(fn):
+            return str(fn(title) or "")
+    except Exception:
+        pass
+    return (title or "").strip()[:60]
+
+
+def _note_focus(title: str, now: float | None = None) -> None:
+    """Remember that the app behind `title` was focused now. Never raises."""
+    try:
+        app = _app_name_for_title(title)
+        if not app:
+            return
+        t = time.time() if now is None else float(now)
+        with _dwell_lock:
+            _recent_focus[app.lower()] = t
+            for k in [k for k, at in _recent_focus.items()
+                      if t - at > RECENT_FOCUS_SECONDS]:
+                del _recent_focus[k]
+    except Exception:
+        pass
+
+
+def _recently_focused_apps(now: float | None = None) -> list:
+    t = time.time() if now is None else float(now)
+    with _dwell_lock:
+        return [k for k, at in _recent_focus.items()
+                if t - at <= RECENT_FOCUS_SECONDS]
+
+
+def _offer_names_recent_app(line: str, now: float | None = None) -> str:
+    """The recently-focused app a pattern offer names ('' = none). Live
+    2026-10-01 22:19:30 "You typically check Claude around now" was offered
+    while Claude had been in the foreground all evening."""
+    try:
+        low = " " + re.sub(r"[^a-z0-9+#.]+", " ", (line or "").lower()) + " "
+        for app in _recently_focused_apps(now):
+            needle = " " + re.sub(r"[^a-z0-9+#.]+", " ", app).strip() + " "
+            if needle.strip() and needle in low:
+                return app
+    except Exception:
+        pass
+    return ""
+
+
+def _wake_word_needed() -> bool:
+    """True when he could only answer a question by saying the wake word
+    first: wake-word mode is on and no follow-up window is open (the window,
+    when enabled at all, opens only after HE addresses JARVIS). Never
+    raises (False)."""
+    bc = sys.modules.get("bobert_companion")
+    if bc is None:
+        return False
+    try:
+        if not bool(getattr(bc, "_require_wake_runtime", False)):
+            return False
+        fw = getattr(bc, "_followup_window", None)
+        if fw is not None and float(fw.remaining_s()) > 0.0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+_SIR_TAIL_RE = re.compile(r",\s*sir\s*$", re.IGNORECASE)
+_OFFER_QUESTION_FORMS = (
+    # "... shall I queue the usual?" / "Shall I queue a coffee timer, or are
+    # we pushing through?" (the ", or ..." alternative is dropped)
+    (re.compile(r"^(?P<pre>.*?)\b(?:shall|should|may) I (?P<verb>.+?)"
+                r"(?:, or [^?]+)?\?$", re.IGNORECASE | re.DOTALL),
+     "I can {verb} if you like"),
+    (re.compile(r"^(?P<pre>.*?)\bwould you like me to (?P<verb>.+?)\?$",
+                re.IGNORECASE | re.DOTALL),
+     "I can {verb} if you like"),
+    # "... anything you'd like me to peek at?"
+    (re.compile(r"^(?P<pre>.*?)\b(?:is there )?anything you'?d like me to "
+                r"(?P<verb>.+?)\?$", re.IGNORECASE | re.DOTALL),
+     "I can {verb} it if you like"),
+)
+
+
+def _statement_form(line: str) -> str:
+    """`line` with every question turned into an offer he can take up with
+    the wake word ("shall I X?" -> "I can X if you like."); a question no
+    form fits is dropped. '' when nothing is left. Never raises."""
+    try:
+        out = []
+        for sent in re.split(r"(?<=[.?!])\s+", (line or "").strip()):
+            if "?" not in sent:
+                out.append(sent)
+                continue
+            for rx, form in _OFFER_QUESTION_FORMS:
+                m = rx.match(sent.strip())
+                if not m:
+                    continue
+                verb = m.group("verb").strip()
+                sir = bool(_SIR_TAIL_RE.search(verb))
+                verb = _SIR_TAIL_RE.sub("", verb).strip()
+                pre = m.group("pre")
+                out.append(pre + form.format(verb=verb)
+                           + (", sir." if sir else "."))
+                break
+        return " ".join(x for x in out if x).strip()
+    except Exception:
+        return (line or "").replace("?", ".")
+
+
+def _answerable_form(line: str) -> str:
+    """`line` as he can answer it right now: unchanged unless the wake word
+    is needed (see _wake_word_needed), then in _statement_form."""
+    if "?" not in (line or "") or not _wake_word_needed():
+        return line
+    return _statement_form(line)
 
 
 def _current_dwell_seconds() -> tuple[str, float]:
@@ -517,6 +665,13 @@ def _scheduler_loop() -> None:
 
             offer = _try_pattern_offer()
             if offer:
+                # He is in (or was just in) the very app the habit is about.
+                there = _offer_names_recent_app(offer)
+                if there:
+                    print(f"  [anticipate] skipped pattern offer ({there} is "
+                          f"or was just focused): {offer}")
+                    offer = ""
+            if offer:
                 line = offer
                 trigger = "pattern"
             if not line:
@@ -542,9 +697,15 @@ def _scheduler_loop() -> None:
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            # Fire
+            # Fire — as a question only if he can answer it without the
+            # wake word; an offer either way, for the conversation record.
+            is_offer = "?" in line
+            line = _answerable_form(line)
+            if not line:
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
             print(f"  [anticipate] firing ({trigger}): {line}")
-            _enqueue_speech(line)
+            _enqueue_speech(line, offer=is_offer)
 
             # Persist
             state["last_proactive_at"] = time.time()

@@ -130,6 +130,19 @@ class QueuedQuestionContextTests(_QueueBase):
         self.bc._speak_pending()
         self.assertEqual(hist[-1], {"role": "assistant", "content": self.OFFER})
 
+    def test_a_statement_offer_joins_the_conversation(self):
+        # NEW #17 (2026-10-02): in wake-word mode the anticipation engine
+        # says "I can X if you like." instead of asking; it is queued as an
+        # OFFER so "JARVIS, do it" still reaches the LLM with the offer.
+        hist = self.bc.conversation_history
+        hist[:] = [{"role": "user", "content": "hello"}]
+        line = "You typically check Teams around now, sir — I can peek at it if you like."
+        self.bc.proactive_announce(line, source="anticipation", offer=True)
+        self.assertIs(self._read()[0].get("offer"), True)
+        self.bc._speak_pending()
+        self.assertEqual(self.spoke, [line])
+        self.assertEqual(hist[-1], {"role": "assistant", "content": line})
+
     def test_statements_are_not_added(self):
         hist = self.bc.conversation_history
         hist[:] = [{"role": "user", "content": "hello"},

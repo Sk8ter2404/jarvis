@@ -1213,5 +1213,167 @@ class AnticipationImportGuardTests(unittest.TestCase):
             sys.path[:] = saved
 
 
+
+class _FollowupWindow:
+    def __init__(self, remaining):
+        self._r = remaining
+
+    def remaining_s(self):
+        return self._r
+
+
+class AnticipationAlreadyThereAndAnswerableTests(_EngineTestBase):
+    """NEW #17 (live 2026-10-01 22:19:30): "You typically check Claude around
+    now, sir — anything you'd like me to peek at?" The Claude window had been
+    in the foreground all evening (_scheduler_loop computed `focused` and never
+    compared it with the offer), and the line ended in a question that, in
+    wake-word mode with no follow-up window, he could not answer without
+    saying "JARVIS" first."""
+
+    LIVE = ("You typically check Claude around now, sir — anything you'd "
+            "like me to peek at?")
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self._reset)
+        self._reset()
+        mock.patch.object(self.mod.logging, "exception",
+                          lambda *a, **k: None).start()
+        self.addCleanup(mock.patch.stopall)
+        self.bc = sys.modules["bobert_companion"]
+
+    def _reset(self):
+        with self.mod._dwell_lock:
+            self.mod._dwell_state.update(window="", started_at=0.0,
+                                         last_seen=0.0)
+            getattr(self.mod, "_recent_focus", {}).clear()
+
+    def _pass(self, *, focused, offer, wake=False, window=0.0):
+        """One _scheduler_loop pass with every gate open. Returns the
+        _enqueue_speech mock."""
+        if wake:
+            self.bc._require_wake_runtime = True
+            self.bc._followup_window = _FollowupWindow(window)
+        enqueue = mock.MagicMock()
+        pm = types.ModuleType("memory")
+        pm.maybe_pattern_offer = lambda: offer
+        pm.app_name_for_title = lambda t: (t or "").strip()
+        with mock.patch.object(self.mod.time, "sleep",
+                               side_effect=_sleep_after(1)), \
+             mock.patch.object(self.mod, "_read_config",
+                               return_value={"enabled": True, "cooldown": 20}), \
+             mock.patch.object(self.mod, "_focused_window_title",
+                               return_value=focused), \
+             mock.patch.object(self.mod, "_is_sleep_or_standby", return_value=False), \
+             mock.patch.object(self.mod, "_is_in_call", return_value=False), \
+             mock.patch.object(self.mod, "_user_at_desk", return_value=True), \
+             mock.patch.object(self.mod, "_should_skip_late_night", return_value=False), \
+             mock.patch.object(self.mod, "_load_state", return_value={}), \
+             mock.patch.object(self.mod, "_save_state"), \
+             mock.patch.object(self.mod, "_try_long_dwell", return_value=("", "")), \
+             mock.patch.object(self.mod, "_try_late_hour_active", return_value=""), \
+             mock.patch.object(self.mod, "_enqueue_speech", enqueue), \
+             inject_modules(memory=pm):
+            with self.assertRaises(_StopLoop):
+                self.mod._scheduler_loop()
+        return enqueue
+
+    # ── already there ────────────────────────────────────────────────────
+    def test_live_offer_for_the_focused_app_is_skipped(self):
+        enqueue = self._pass(focused="Claude", offer=self.LIVE)
+        enqueue.assert_not_called()
+
+    def test_an_app_focused_minutes_ago_is_skipped_too(self):
+        if hasattr(self.mod, "_note_focus"):
+            self.mod._note_focus("Claude", time.time() - 5 * 60)
+        enqueue = self._pass(focused="Inbox - Google Chrome", offer=self.LIVE)
+        enqueue.assert_not_called()
+
+    def test_an_app_focused_long_ago_is_offered(self):
+        if hasattr(self.mod, "_note_focus"):
+            self.mod._note_focus("Claude", time.time() - 2 * 3600)
+        enqueue = self._pass(focused="Notepad", offer=self.LIVE)
+        enqueue.assert_called_once()
+
+    def test_an_offer_about_another_app_still_fires(self):
+        enqueue = self._pass(focused="Claude",
+                             offer="You typically check Teams around now, "
+                                   "sir — anything you'd like me to peek at?")
+        enqueue.assert_called_once()
+
+    def test_the_app_name_must_match_a_whole_word(self):
+        self.mod._note_focus("Claude")
+        self.assertEqual(self.mod._offer_names_recent_app(
+            "It's Friday 9 PM, sir — shall I queue the Claudette mix?"), "")
+        self.assertEqual(self.mod._offer_names_recent_app(
+            "You typically check Claude around now, sir."), "claude")
+
+    def test_a_window_title_maps_to_the_logged_app_name(self):
+        # The real memory.app_name_for_title: the same rule the voice-command
+        # log used to record the pattern's target.
+        self.mod._note_focus("General (Team) | Microsoft Teams - Microsoft Teams")
+        self.assertEqual(self.mod._offer_names_recent_app(
+            "You typically check Teams around now, sir."), "teams")
+
+    # ── answerable ───────────────────────────────────────────────────────
+    def test_live_wake_mode_offer_asks_nothing(self):
+        enqueue = self._pass(focused="Notepad", offer=self.LIVE, wake=True)
+        enqueue.assert_called_once()
+        line = enqueue.call_args[0][0]
+        self.assertNotIn("?", line)
+        self.assertEqual(line, "You typically check Claude around now, sir — "
+                               "I can peek at it if you like.")
+        # Queued as an offer, so the drain still records it for his answer.
+        self.assertIs(enqueue.call_args.kwargs.get("offer"), True)
+
+    def test_a_question_stays_when_he_can_answer_it(self):
+        enqueue = self._pass(focused="Notepad", offer=self.LIVE)
+        self.assertEqual(enqueue.call_args[0][0], self.LIVE)
+
+    def test_a_question_stays_while_a_followup_window_is_open(self):
+        enqueue = self._pass(focused="Notepad", offer=self.LIVE, wake=True,
+                             window=20.0)
+        self.assertEqual(enqueue.call_args[0][0], self.LIVE)
+
+    def test_statement_forms_of_every_offer_shape(self):
+        f = self.mod._statement_form
+        cases = {
+            "It's Friday 9 PM, sir — shall I queue the usual?":
+                "It's Friday 9 PM, sir — I can queue the usual if you like.",
+            "It's Friday 9 PM, sir — shall I open Teams for you?":
+                "It's Friday 9 PM, sir — I can open Teams for you if you like.",
+            "It's Friday 9 PM, sir — would you like me to pull up the news?":
+                "It's Friday 9 PM, sir — I can pull up the news if you like.",
+            ("It's Friday 9 PM, sir — you usually set a timer around now. "
+             "Shall I start one?"):
+                ("It's Friday 9 PM, sir — you usually set a timer around now. "
+                 "I can start one if you like."),
+            ("Sir, it's 9:00 PM and you've been in Blender for 2 hours. Shall "
+             "I queue a coffee timer, or are we pushing through?"):
+                ("Sir, it's 9:00 PM and you've been in Blender for 2 hours. "
+                 "I can queue a coffee timer if you like."),
+            ("Shall I queue your usual Jazz mix, sir? You typically start it "
+             "about now."):
+                ("I can queue your usual Jazz mix if you like, sir. You "
+                 "typically start it about now."),
+            "It's late, sir. A stretch would not go amiss.":
+                "It's late, sir. A stretch would not go amiss.",
+        }
+        for q, want in cases.items():
+            with self.subTest(q=q):
+                self.assertEqual(f(q), want)
+        self.assertEqual(f("Time for the Tuesday sweep, sir?"), "")
+
+    def test_wake_word_needed_reads_the_live_flags(self):
+        self.assertFalse(self.mod._wake_word_needed())     # no flag on the fake
+        self.bc._require_wake_runtime = True
+        self.bc._followup_window = _FollowupWindow(0.0)
+        self.assertTrue(self.mod._wake_word_needed())
+        self.bc._followup_window = _FollowupWindow(12.0)
+        self.assertFalse(self.mod._wake_word_needed())
+        self.bc._require_wake_runtime = False
+        self.assertFalse(self.mod._wake_word_needed())
+
+
 if __name__ == "__main__":
     unittest.main()
