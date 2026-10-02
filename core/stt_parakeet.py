@@ -10,13 +10,17 @@ research, with a lower word error rate (2.6 % vs 3.4 % on clean speech, 4.1 %
 vs 4.9 % with fan noise). Two flags in core/config.py, both OFF by default:
 
   STT_ENGINE  'whisper' | 'parakeet'  (env JARVIS_STT_ENGINE wins when it
-              names one of them). Which engine decodes the owner's captures —
-              _transcribe_capture ONLY. Ambient and in-turn captures stay on
-              Whisper, which stays loaded as the hot fallback.
+              names one of them). Which engine decodes the captures that
+              reach _transcribe_capture — the owner's commands and the
+              standby / sleep wake checks — ONLY. Ambient and in-turn
+              captures stay on Whisper, which stays loaded as the hot
+              fallback.
   STT_SHADOW  '' | 'parakeet'. Whisper stays primary; Parakeet re-decodes
-              each owner capture later, once nothing is happening, and both
-              transcripts are judged by the real gates into
-              data/stt_ab.jsonl. The words go there only — never the log.
+              each of those captures later, once nothing is happening, and
+              both transcripts are judged by the live gates' own rules into
+              data/stt_ab.jsonl. The words go there only — never the log —
+              and only for a line the live system acts on (words_kept);
+              nothing is recorded while the mic is muted.
 
 WHAT PARAKEET LOSES, AND THE RESCUE
 -----------------------------------
