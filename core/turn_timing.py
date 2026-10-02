@@ -117,9 +117,14 @@ NOTE_FIELDS = ("tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms",
                "cut", "amb_deferred", "cache")
 
 # Stats fields, printed after the marks in this order.
+# turn_ctx_chars is the per-turn context actually SENT; budget_trimmed=1 when
+# the local prompt budget trimmed the turn (2026-10-02: a trimmed turn's
+# prompt_eval_count must not enter the chars-per-token calibration as if it
+# were whole), '-' when no budget ran (a cloud turn).
 STAT_FIELDS = ("prompt_eval_count", "prompt_eval_ms", "eval_count", "eval_ms",
                "llm_calls", "turn_ctx_chars", "sys_chars", "followup_rounds",
-               "filler", "filler_ms", *NOTE_FIELDS, "lead_dropped")
+               "filler", "filler_ms", *NOTE_FIELDS, "lead_dropped",
+               "budget_trimmed")
 
 # The R1 fields kept in a turn's notes (printed from there): all but
 # load_ms / total_ms, which only the answering response supplies
@@ -644,6 +649,7 @@ def format_line(turn: dict, end, outcome: str = "ok") -> str:
         "load_ms": stats.get("load_ms"),
         "total_ms": stats.get("total_ms"),
         "lead_dropped": turn.get("lead_dropped", 0),
+        "budget_trimmed": stats.get("budget_trimmed"),
     }
     for k in STAT_FIELDS:
         if k == "filler_ms":

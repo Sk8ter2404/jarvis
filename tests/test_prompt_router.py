@@ -1049,9 +1049,21 @@ class FollowupRoundIsRatchetedElsewhereTests(unittest.TestCase):
         self.assertIn("attach=_with_turn_context", fit_body,
                       "_fit_local_messages no longer attaches the turn "
                       "context with _with_turn_context")
+        # Since 2026-10-02 the local round fits through _fit_followup_round
+        # (the owner's request pinned, big results clipped), which must in
+        # turn go through _fit_local_messages.
+        if "_fit_followup_round(" in body:
+            fr_start = src.index("def _fit_followup_round")
+            fr_body = "\n".join(
+                line.split("#", 1)[0] for line in
+                src[fr_start:src.index("\ndef ", fr_start + 1)].split("\n"))
+            self.assertIn("_fit_local_messages(", fr_body,
+                          "_fit_followup_round no longer fits through "
+                          "_fit_local_messages")
         self.assertTrue(
             "_with_turn_context(" in body
-            or "_fit_local_messages(" in body,
+            or "_fit_local_messages(" in body
+            or "_fit_followup_round(" in body,
             "get_followup_response no longer sends a turn context "
             "at all — the follow-up round is back to whatever the "
             "reused system prompt happens to carry")

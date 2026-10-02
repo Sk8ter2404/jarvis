@@ -530,6 +530,13 @@ def _restore_monolith_pristine(bc) -> None:
         bc._input_open_backoff.reset()
     except Exception:
         pass
+    # The local prompt budget's observed window (2026-10-02): a fake Ollama
+    # reply with a small prompt_eval_count reads as a truncation and would
+    # shrink every LATER test's budget. Process-wide, so cleared in place.
+    try:
+        bc._prompt_budget.OBSERVED_WINDOW.clear()
+    except Exception:
+        pass
 
 
 _MISSING = object()

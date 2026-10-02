@@ -14,11 +14,13 @@ Each test builds a synthetic oversized prompt and captures the /api/chat POST
 (or the last hop before the model). The prompt that goes out must:
   * fit the window (estimated with core.prompt_budget, reply room reserved);
   * keep the system prompt byte-identical and the current message intact;
-  * shed the OLDEST history first, then whole per-turn sections;
+  * shed the cheap low-rank tail parts first, then the OLDEST history, then
+    whole per-turn sections (review 2026-10-02);
   * say so in one ``[prompt-budget]`` line;
-and the live conversation_history must be left untouched. A prompt that fits
-must go out exactly as it did before, and JARVIS_LOCAL_PROMPT_BUDGET=0 must
-restore the old behaviour.
+and a turn's history trim is kept in conversation_history, so the next turn
+and the idle re-prime share the trimmed prefix (review 2026-10-02). A prompt
+that fits must go out exactly as it did before, and
+JARVIS_LOCAL_PROMPT_BUDGET=0 must restore the old behaviour.
 
 Before the budget existed the oversized POSTs below carried every byte, so the
 "fits the window" assertions fail on that code.
@@ -48,11 +50,18 @@ class _Resp:
     ok = True
     status_code = 200
     text = "body"
+    # prompt_eval_count to report; None leaves it out. A real count is never
+    # far under the estimate of what was sent, so a fixed small one would
+    # read as a truncation (_note_prompt_window, review 2026-10-02).
+    pe = None
 
     def json(self):
-        return {"model": "gemma-test",
-                "message": {"role": "assistant", "content": "Done, sir."},
-                "done": True, "prompt_eval_count": 1234, "eval_count": 3}
+        out = {"model": "gemma-test",
+               "message": {"role": "assistant", "content": "Done, sir."},
+               "done": True, "eval_count": 3}
+        if self.pe is not None:
+            out["prompt_eval_count"] = self.pe
+        return out
 
 
 # A turn that routes many large PC sections, like the live overflow.
@@ -104,6 +113,8 @@ class _Base(MonolithGlobalsTestCase):
         self._p(bc, "_get_local_llm_model", return_value="gemma-test")
         self._p(bc, "_next_local_llm_fallback", return_value=None)
         self._p(bc, "requests", fake_req)
+        pb.OBSERVED_WINDOW.clear()
+        self.addCleanup(pb.OBSERVED_WINDOW.clear)
         self._big_system_prompt()
 
     def _p(self, *args, **kwargs):
@@ -147,6 +158,13 @@ class _Base(MonolithGlobalsTestCase):
     def _notes(stdout):
         return [ln for ln in stdout.splitlines() if "[prompt-budget]" in ln]
 
+    @classmethod
+    def _fit_notes(cls, stdout):
+        """The fit's own line(s) - not the "kept the history trim" note a
+        trimmed turn adds (review 2026-10-02)."""
+        return [ln for ln in cls._notes(stdout)
+                if "kept the history trim" not in ln]
+
 
 class OversizedTurnTests(_Base):
     def test_overflowing_turn_is_fitted_to_the_window(self):
@@ -157,7 +175,8 @@ class OversizedTurnTests(_Base):
         history = _long_history(7)
         payload, stdout = self._turn(_MANY, history)
         # 1. It fits (before the budget this POST was ~26.3k estimated tokens
-        #    against a 15,884 budget).
+        #    against a 15,884 budget; 16,184 since the reply reserve is a
+        #    voice reply, 2026-10-02).
         self.assertLessEqual(self._est(payload), self._budget())
         # 2. The system prompt is the cache-stable one, byte for byte.
         self.assertEqual(payload["messages"][0]["content"],
@@ -180,14 +199,16 @@ class OversizedTurnTests(_Base):
         self.assertTrue(kept, "every section went; the smallest fit")
         self.assertIn(self.bc._TURN_CTX_OPEN, last["content"])
         # 6. One line says what happened.
-        notes = self._notes(stdout)
+        notes = self._fit_notes(stdout)
         self.assertEqual(len(notes), 1, stdout)
         self.assertIn("[prompt-budget] turn:", notes[0])
         self.assertIn("oldest history msg(s)", notes[0])
         self.assertIn("TASK QUEUE", notes[0])
-        # 7. The live history itself is untouched: the trim is per call.
-        self.assertEqual(self.bc.conversation_history[:len(history)],
-                         history)
+        # 7. The history the turn dropped has left the conversation for good
+        #    (review 2026-10-02), so the next turn shares this prefix; what
+        #    was sent is still there, unchanged.
+        self.assertEqual(self.bc.conversation_history[:len(sent)],
+                         payload["messages"][1:-1])
 
     def test_history_alone_overflowing_keeps_every_section(self):
         # Moderate sections; a long history is what overflows.
@@ -199,9 +220,12 @@ class OversizedTurnTests(_Base):
         last = payload["messages"][-1]["content"]
         self.assertIn(block, last, "a section was dropped while history "
                                    "could still be trimmed")
-        notes = self._notes(stdout)
+        notes = self._fit_notes(stdout)
         self.assertEqual(len(notes), 1, stdout)
-        self.assertNotIn("turn part(s)", notes[0])
+        # Only the cheap tail parts (tone / register hints) may go before
+        # history (review 2026-10-02); no routed section does.
+        for head, _t in pr.split_turn_block(block):
+            self.assertNotIn(head, notes[0])
 
     def test_a_turn_that_fits_is_sent_exactly_as_before(self):
         history = _long_history(3, n=200)
@@ -225,21 +249,26 @@ class OversizedTurnTests(_Base):
                                  block + "\n\nTONE\n\nHINT")
                 self.assertNotIn("empty", [p.label for p in parts])
 
-    def test_a_prompt_that_cannot_fit_is_sent_unchanged(self):
+    def test_a_prompt_that_cannot_fit_sheds_everything_it_can(self):
         # A 30B-class tag gets the 12k window, which the live-size system
-        # prompt alone overflows. Trimming cannot fix that, and Ollama keeps
-        # the TAIL (history + turn context), so nothing is thrown away.
+        # prompt alone overflows. Ollama keeps the first numKeep tokens and
+        # cuts the next (length - num_ctx), so every history / section token
+        # left in costs one from the START of the system prompt: everything
+        # that can go, goes (review 2026-10-02; this used to go out as is).
         bc = self.bc
         self._p(bc, "_RESOLVED_LOCAL_LLM_MODEL", ["big-test:32b"])
         self._p(bc, "_get_local_llm_model", return_value="big-test:32b")
         self.assertEqual(bc._local_num_ctx("big-test:32b"), 12288)
         history = _long_history(3, n=300)
         payload_on, out_on = self._turn("play some music", history)
+        self.assertEqual(len(payload_on["messages"]), 2)
+        self.assertEqual(payload_on["messages"][-1]["content"],
+                         "play some music")
         self.posted.clear()
         self._p(bc, "_LOCAL_PROMPT_BUDGET", False)
         payload_off, _out = self._turn("play some music", history)
-        self.assertEqual(payload_on, payload_off)
-        notes = self._notes(out_on)
+        self.assertGreater(self._est(payload_off), self._est(payload_on))
+        notes = self._fit_notes(out_on)
         self.assertEqual(len(notes), 1, out_on)
         self.assertIn("CANNOT FIT", notes[0])
         self.assertIn("(num_ctx 12288)", notes[0])
@@ -316,7 +345,7 @@ class OtherLocalCallersTests(_Base):
         # The turn path already fitted (and logged); _call_local_llm must
         # neither trim it again nor log a second line.
         payload, stdout = self._turn(_MANY, _long_history(7))
-        self.assertEqual(len(self._notes(stdout)), 1, stdout)
+        self.assertEqual(len(self._fit_notes(stdout)), 1, stdout)
         self.assertLessEqual(self._est(payload), self._budget())
 
     def test_a_small_background_prompt_is_untouched(self):
@@ -327,6 +356,160 @@ class OtherLocalCallersTests(_Base):
             bc._call_local_llm("You summarise.", msgs, max_tokens=50)
         self.assertEqual(self.posted[0]["messages"][1:], msgs)
         self.assertEqual(self._notes(out.getvalue()), [])
+
+
+# ── Review fixes (2026-10-02) ─────────────────────────────────────────────
+
+class ReviewFollowupRoundTests(_Base):
+    """Review 2026-10-02 (medium): on a follow-up round the 'current message'
+    the budget never trims is the machine-made results. (a) The owner's
+    request was dropped before the results were shortened; (b) results too
+    big to fit hit CANNOT FIT and went out unchanged, so Ollama cut the
+    system prompt - PC_CONTROL_SAFETY_RULES included."""
+
+    def _followup(self, results):
+        bc = self.bc
+        seen = {}
+
+        def _fake(sys_prompt, messages, **kw):
+            seen["sys"], seen["msgs"] = sys_prompt, messages
+            return "ok"
+        self._p(bc, "_local_then_cloud_or_honest", _fake)
+        self._p(bc, "_last_stable_sys_prompt", [self.stable])
+        self._p(bc, "_last_turn_pc_block",
+                [pr.turn_pc_block("read my newest email",
+                                  bc.PC_CONTROL_PROMPT)])
+        bc.conversation_history[:] = _long_history(3) + [
+            {"role": "user", "content": "OWNER: read my newest email"},
+            {"role": "assistant", "content": "[ACTION: read_email]"}]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            reply = bc.get_followup_response(results)
+        return reply, seen, out.getvalue()
+
+    def test_big_results_are_clipped_and_the_request_kept(self):
+        body = "SUBJECT: invoice " + "lorem ipsum " * 3000 + " SIGNED: accounts"
+        reply, seen, stdout = self._followup([("read_email", body)])
+        self.assertEqual(reply, "ok")
+        sys_now, msgs = self.bc._local_chat_prompt(seen["sys"], seen["msgs"])
+        self.assertLessEqual(pb.estimate_chat_tokens(sys_now, msgs),
+                             self._budget(400))
+        contents = [m["content"] for m in msgs]
+        self.assertIn("OWNER: read my newest email", contents)
+        self.assertIn("[ACTION: read_email]", contents)
+        last = msgs[-1]["content"]
+        self.assertIn("characters cut", last)
+        self.assertIn("SUBJECT: invoice", last)
+        self.assertIn("SIGNED: accounts", last)
+        self.assertIn("clipped", stdout)
+
+    def test_results_that_cannot_fit_end_the_chain_honestly(self):
+        many = [(f"web_search_{i}", "x" * 4000) for i in range(60)]
+        reply, seen, stdout = self._followup(many)
+        self.assertEqual(reply, self.bc._FOLLOWUP_TOO_LONG_REPLY)
+        self.assertEqual(seen, {}, "a prompt that cannot fit was sent")
+        self.assertNotIn("[ACTION:", reply)
+        self.assertIn("ending the chain", stdout)
+
+
+class ReviewTurnPathTests(_Base):
+    def test_a_turn_history_trim_is_kept_for_the_next_turn(self):
+        # Review 2026-10-02: the trim was per call, so the idle re-prime
+        # warmed the untrimmed history and every later near-limit turn paid a
+        # full re-evaluation. The dropped messages now leave the
+        # conversation, so the next prompt shares this one's prefix.
+        bc = self.bc
+        history = _long_history(7)
+        payload, stdout = self._turn(_MANY, history)
+        sent = payload["messages"][1:-1]
+        self.assertLess(len(sent), len(history))
+        self.assertEqual(bc.conversation_history[:len(sent)], sent)
+        self.assertEqual(bc.conversation_history[len(sent)]["content"], _MANY)
+        self.assertNotIn(history[0], bc.conversation_history)
+        self.assertIn(history[0], bc._session_trimmed)
+        self.assertTrue(any("kept the history trim" in ln
+                            for ln in self._notes(stdout)), stdout)
+        # The idle re-prime now warms exactly what the next turn sends.
+        reprime = bc._build_reprime_payload()
+        self.assertEqual(reprime["messages"][1:1 + len(sent)], sent)
+
+    def test_the_turn_timing_line_logs_what_was_sent(self):
+        bc = self.bc
+        seen = {}
+
+        def _tt(op, *args, **kw):
+            if op == "set_first" and args[0] not in seen:
+                seen[args[0]] = args[1]
+        self._p(bc, "_tt", _tt)
+        block = pr.turn_pc_block(_MANY, bc.PC_CONTROL_PROMPT)
+        payload, _out = self._turn(_MANY, _long_history(7))
+        self.assertEqual(seen.get("budget_trimmed"), 1)
+        self.assertLess(seen["turn_ctx_chars"], len(block))
+        sent_ctx = payload["messages"][-1]["content"]
+        self.assertGreaterEqual(len(sent_ctx), seen["turn_ctx_chars"])
+        seen.clear()
+        self.posted.clear()
+        self._turn("what time is it", _long_history(1, n=50))
+        self.assertEqual(seen.get("budget_trimmed"), 0)
+
+    def test_an_inherited_section_ranks_below_the_turns_memory(self):
+        bc = self.bc
+        block = pr.turn_pc_block("Pause it.", bc.PC_CONTROL_PROMPT, history=[
+            {"role": "user", "content": "how's the print going?"}])
+        parts = bc._turn_budget_parts(block, (),
+                                      inherited={"BAMBU 3D PRINTER"})
+        ranks = {p.label: p.rank for p in parts}
+        self.assertEqual(ranks["BAMBU 3D PRINTER"], pb.RANK_INHERITED)
+        self.assertEqual(ranks["MUSIC CONTROLS"], pb.RANK_SECTION)
+
+    def test_follow_up_routing_only_while_the_last_turn_is_recent(self):
+        import time as _time
+        bc = self.bc
+        hist = [{"role": "user", "content": "how's the print going?"},
+                {"role": "assistant", "content": "Layer 212 of 480, sir."}]
+        bc.conversation_history[:] = list(hist)
+        self._p(bc, "_prev_owner_turn_at", [_time.monotonic() - 20.0])
+        self.assertEqual(bc._routing_history(), hist)
+        self._p(bc, "_prev_owner_turn_at", [_time.monotonic() - 600.0])
+        self.assertIsNone(bc._routing_history())
+        self._p(bc, "_prev_owner_turn_at", [0.0])
+        self.assertIsNone(bc._routing_history())
+        # ...and the live turn: an old print chat lends "Pause it." nothing.
+        self.posted.clear()
+        self._p(bc, "_prev_owner_turn_at", [_time.monotonic() - 600.0])
+        payload, _out = self._turn("Pause it.", hist)
+        self.assertNotIn("pause_print", payload["messages"][-1]["content"])
+        self.posted.clear()
+        self._p(bc, "_prev_owner_turn_at", [_time.monotonic() - 20.0])
+        payload, _out = self._turn("Pause it.", hist)
+        self.assertIn("pause_print", payload["messages"][-1]["content"])
+
+
+class ReviewTruncationDetectionTests(_Base):
+    """Review 2026-10-02 (low): the 10-01 runner cut prompts at 8,195 tokens
+    - half the 16k window the budget assumes - and nothing noticed."""
+
+    def test_a_cut_prompt_is_logged_and_shrinks_the_next_budget(self):
+        self._p(_Resp, "pe", 8195)
+        payload, stdout = self._turn(_MANY, _long_history(3, n=300))
+        notes = [n for n in self._notes(stdout) if "TRUNCATED" in n]
+        self.assertEqual(len(notes), 1, stdout)
+        self.assertIn("8,195", notes[0])
+        self.assertEqual(pb.OBSERVED_WINDOW.limit, 8195)
+        # The next local prompt is budgeted to what Ollama really took: the
+        # system prompt alone is over that, so everything else goes.
+        self.posted.clear()
+        self._p(_Resp, "pe", None)
+        payload, stdout = self._turn(_MANY, _long_history(3, n=300))
+        self.assertEqual(len(payload["messages"]), 2)
+        self.assertTrue(any("observed" in n for n in self._notes(stdout)),
+                        stdout)
+
+    def test_an_honest_count_is_not_a_truncation(self):
+        self._p(_Resp, "pe", 15200)
+        _payload, stdout = self._turn(_MANY, _long_history(3, n=300))
+        self.assertFalse(any("TRUNCATED" in n for n in self._notes(stdout)))
+        self.assertEqual(pb.OBSERVED_WINDOW.limit, 0)
 
 
 if __name__ == "__main__":

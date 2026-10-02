@@ -7,9 +7,10 @@ plus the tail ("truncating input prompt limit=8195 prompt=17958 keep=5" in its
 server log). Two live local turns that day read prompt_eval_count=8195: the
 model answered with most of its system prompt (identity, action grammar,
 safety rules) cut away. These tests pin the estimator against the live
-measurements and the trim order on synthetic oversized prompts: oldest
-history first, then the lowest-priority per-turn parts, never the system
-prompt and never the current message.
+measurements and the trim order on synthetic oversized prompts: the cheap
+low-rank tail parts first, then the oldest history, then the sections, never
+the system prompt and never the current message (nor, on a follow-up round,
+the owner's request).
 """
 from __future__ import annotations
 
@@ -119,12 +120,14 @@ class EstimatorCalibrationTests(unittest.TestCase):
 
 class BudgetForTests(unittest.TestCase):
     def test_reserves_the_reply(self):
-        self.assertEqual(pb.budget_for(16384, 500), 15884)
-        self.assertEqual(pb.budget_for(12288, 400), 11888)
+        # A voice reply's room, not its whole cap (review 2026-10-02).
+        self.assertEqual(pb.budget_for(16384, 500), 16184)
+        self.assertEqual(pb.budget_for(12288, 400), 12088)
+        self.assertEqual(pb.budget_for(16384, 50), 16334)
 
     def test_junk_never_yields_a_tiny_budget(self):
         self.assertEqual(pb.budget_for(None, 500), pb.MIN_BUDGET_TOKENS)
-        self.assertEqual(pb.budget_for(2048, 4000), pb.MIN_BUDGET_TOKENS)
+        self.assertEqual(pb.budget_for(1100, 4000), pb.MIN_BUDGET_TOKENS)
         self.assertEqual(pb.budget_for(16384, "x"), 16384)
 
 
@@ -176,8 +179,10 @@ class FitOversizedTests(unittest.TestCase):
                            budget=self.BUDGET, measure=_measure(self.SYSTEM),
                            attach=_ctx_attach, **kw)
 
-    def test_history_goes_first_oldest_first(self):
-        # The turn context alone fits; the 10-exchange history does not.
+    def test_history_goes_oldest_first_after_the_cheap_tail(self):
+        # The turn context alone fits; the 10-exchange history does not. The
+        # low-rank tone hint goes first (it breaks no cached prefix, review
+        # 2026-10-02), then the oldest history; the section stays.
         msgs = _history(10, n=1200) + [_msg("user", 60, "w")]
         small = [pb.TurnPart("KINECT DEPTH SENSOR", "K" * 1500,
                              pb.RANK_SECTION),
@@ -185,7 +190,7 @@ class FitOversizedTests(unittest.TestCase):
         fit = self._fit(msgs, small)
         self.assertTrue(fit.fits, fit)
         self.assertTrue(fit.trimmed)
-        self.assertEqual(fit.dropped_parts, ())
+        self.assertEqual(fit.dropped_parts, ("tone",))
         kept = [m["content"].split(" ")[0] for m in fit.messages[:-1]]
         # The newest exchanges survive, in order; the oldest went.
         self.assertEqual(kept, [f"{r}{i}" for i in range(10 - len(kept) // 2, 10)
@@ -246,10 +251,12 @@ class FitOversizedTests(unittest.TestCase):
         self.assertTrue(fit2.fits, fit2)
         self.assertEqual(len(fit2.messages), 1)
 
-    def test_cannot_fit_is_sent_unchanged_and_reported(self):
-        # The system prompt + the current message alone are over. Trimming
-        # cannot fix that, and Ollama keeps the TAIL of a truncated prompt
-        # (history + turn context), so nothing is thrown away for nothing.
+    def test_cannot_fit_trims_everything_and_reports(self):
+        # The system prompt + the current message alone are over. Ollama
+        # keeps the first numKeep tokens and cuts the next (length - num_ctx),
+        # so every history / part token left in costs one from the START of
+        # the system prompt: everything that can go, goes (review 2026-10-02;
+        # this used to send the prompt unchanged).
         for system, user in (("S" * 60000, 20), ("S" * 40000, 30000)):
             with self.subTest(system=len(system), user=user):
                 msgs = _history(3, n=500) + [_msg("user", user, "w")]
@@ -258,10 +265,9 @@ class FitOversizedTests(unittest.TestCase):
                                   measure=_measure(system),
                                   attach=_ctx_attach)
                 self.assertFalse(fit.fits)
-                self.assertFalse(fit.trimmed)
-                self.assertEqual(
-                    fit.messages,
-                    _ctx_attach(msgs, "".join(p.text for p in parts)))
+                self.assertTrue(fit.trimmed)
+                self.assertEqual(fit.messages, msgs[-1:])
+                self.assertEqual(fit.after, fit.floor)
                 self.assertGreater(fit.floor, self.BUDGET)
                 note = pb.describe(fit, "turn", num_ctx=16384)
                 self.assertIn("CANNOT FIT", note)
@@ -290,12 +296,194 @@ class FitOversizedTests(unittest.TestCase):
         fit = self._fit(msgs, parts)
         note = pb.describe(fit, "turn", num_ctx=16384)
         self.assertTrue(note.startswith("[prompt-budget] turn: ~"))
-        self.assertIn("budget 15,884 (num_ctx 16384)", note)
+        self.assertIn("budget 16,184 (num_ctx 16384)", note)
         self.assertIn("oldest history msg(s)", note)
         self.assertIn("phrase rotation", note)
         self.assertIn("more]", note)
         self.assertNotIn("\n", note)
         self.assertNotIn("STILL OVER", note)
+
+
+class ReviewTrimOrderTests(unittest.TestCase):
+    """Review 2026-10-02 (medium): the first thing an overflowing turn shed
+    was the OLDEST HISTORY - which moves the cached prefix's divergence point
+    to just after the system prompt and costs a full re-evaluation - while
+    the low-rank parts at the END of the prompt (phrase rotation, tone,
+    long-term memory), which break no cache, were kept."""
+
+    SYSTEM = "S" * 50904
+
+    def _parts(self):
+        return [pb.TurnPart("SMART HOME", "X" * 4410, pb.RANK_SECTION),
+                pb.TurnPart("tone", "T" * 250, pb.RANK_REGISTER),
+                pb.TurnPart("long-term memory", "L" * 700, pb.RANK_MEMORY),
+                pb.TurnPart("phrase rotation", "P" * 300,
+                            pb.RANK_STYLE_HINT)]
+
+    def test_low_rank_parts_go_before_any_history(self):
+        msgs = _history(10, n=60) + [_msg("user", 40, "w")]
+        measure = _measure(self.SYSTEM)
+        full = measure(_ctx_attach(msgs, "".join(p.text for p in self._parts())))
+        # Over by less than the three low-rank parts weigh.
+        fit = pb.fit_chat(msgs, self._parts(), budget=full - 200,
+                          measure=measure, attach=_ctx_attach)
+        self.assertTrue(fit.fits, fit)
+        self.assertEqual(fit.dropped_history, 0)
+        self.assertEqual(fit.messages[:-1], msgs[:-1],
+                         "history must go out byte-for-byte unchanged")
+        self.assertEqual(set(fit.dropped_parts),
+                         {"phrase rotation", "tone", "long-term memory"})
+        self.assertIn("X" * 4410, fit.messages[-1]["content"])
+
+    def test_an_inherited_section_goes_before_the_turns_own_memory(self):
+        # prompt_router.inherited_turn_sections: a section only the history
+        # routed ranks below the turn's own long-term-memory recall.
+        self.assertLess(pb.RANK_INHERITED, pb.RANK_MEMORY)
+        self.assertGreater(pb.RANK_INHERITED, pb.RANK_REGISTER)
+        msgs = [_msg("user", 40, "w")]
+        parts = [pb.TurnPart("OWN", "O" * 2000, pb.RANK_SECTION),
+                 pb.TurnPart("INHERITED", "I" * 2000, pb.RANK_INHERITED),
+                 pb.TurnPart("long-term memory", "L" * 700, pb.RANK_MEMORY)]
+        measure = _measure(self.SYSTEM)
+        full = measure(_ctx_attach(msgs, "".join(p.text for p in parts)))
+        fit = pb.fit_chat(msgs, parts, budget=full - 300, measure=measure,
+                          attach=_ctx_attach)
+        self.assertEqual(fit.dropped_parts, ("INHERITED",))
+
+    def test_the_reply_reserve_is_a_voice_reply_not_max_tokens(self):
+        # Voice replies run ~15-60 tokens; reserving the full 500 trimmed
+        # turns Ollama would never have cut (15.2k-16.4k real tokens).
+        self.assertEqual(pb.budget_for(16384, 500),
+                         16384 - pb.REPLY_RESERVE_TOKENS)
+        self.assertEqual(pb.budget_for(16384, 100), 16284)
+        self.assertLessEqual(pb.REPLY_RESERVE_TOKENS, 256)
+
+
+class ReviewCannotFitTests(unittest.TestCase):
+    """Review 2026-10-02 (medium): when the system prompt + the current
+    message alone were over, the prompt was sent UNCHANGED. Ollama keeps the
+    first numKeep tokens and drops the next (len - num_ctx), so every
+    history or part token left in costs one token from the START of the
+    system prompt - the identity and safety rules. Trim everything that can
+    go, then say it still cannot fit."""
+
+    def test_everything_droppable_goes_and_it_says_so(self):
+        system = "S" * 60000
+        msgs = _history(3, n=500) + [_msg("user", 20, "w")]
+        parts = [pb.TurnPart("A", "A" * 3000, pb.RANK_SECTION),
+                 pb.TurnPart("tone", "T" * 200, pb.RANK_REGISTER)]
+        budget = pb.budget_for(16384, 500)
+        fit = pb.fit_chat(msgs, parts, budget=budget,
+                          measure=_measure(system), attach=_ctx_attach)
+        self.assertFalse(fit.fits)
+        self.assertTrue(fit.trimmed)
+        self.assertEqual(fit.messages, [msgs[-1]])
+        self.assertEqual(set(fit.dropped_parts), {"A", "tone"})
+        self.assertEqual(fit.after, fit.floor)
+        note = pb.describe(fit, "turn", num_ctx=16384)
+        self.assertIn("CANNOT FIT", note)
+        self.assertIn("dropped", note)
+        self.assertNotIn("\n", note)
+
+
+class ReviewFollowupFloorTests(unittest.TestCase):
+    """Review 2026-10-02 (medium): on a follow-up round the 'current message'
+    is the machine-made action-results message, so the owner's actual
+    request was dropped before anything else - the model saw "Continue
+    working toward completing the original task" with no task, next to
+    possibly untrusted results. pin_last_user keeps the owner's last turn
+    (and the chain after it) in the floor."""
+
+    def _followup_msgs(self, results_chars):
+        return (_history(3, n=2500)
+                + [{"role": "user", "content": "OWNER: read my newest email"},
+                   {"role": "assistant", "content": "[ACTION: read_email]"},
+                   {"role": "user", "content": "RESULTS " + "r" * results_chars}])
+
+    def test_the_owners_request_is_never_dropped(self):
+        system = "S" * 51500
+        msgs = self._followup_msgs(5200)
+        parts = [pb.TurnPart("EMAIL", "E" * 2700, pb.RANK_SECTION)]
+        measure = _measure(system)
+        unpinned_floor = measure(_ctx_attach(msgs[-1:], ""))
+        # Just above the results message alone: the old order fitted by
+        # throwing away the owner's request and the action that answered it.
+        budget = unpinned_floor + 5
+        old = pb.fit_chat(msgs, parts, budget=budget, measure=measure,
+                          attach=_ctx_attach)
+        self.assertTrue(old.fits)
+        self.assertEqual(old.messages, msgs[-1:])
+        fit = pb.fit_chat(msgs, parts, budget=budget, measure=measure,
+                          attach=_ctx_attach, pin_last_user=True)
+        # The request and the chain after it are part of the floor now: the
+        # caller learns it cannot fit (and clips the results) instead.
+        self.assertEqual(fit.messages, msgs[-3:])
+        self.assertFalse(fit.fits)
+        self.assertEqual(fit.after, fit.floor)
+        self.assertEqual(fit.dropped_history, 6)
+        self.assertEqual(fit.dropped_parts, ("EMAIL",))
+
+    def test_with_room_only_the_older_history_goes(self):
+        system = "S" * 51500
+        msgs = self._followup_msgs(5200)
+        parts = [pb.TurnPart("EMAIL", "E" * 2700, pb.RANK_SECTION)]
+        measure = _measure(system)
+        pinned_floor = measure(_ctx_attach(msgs[-3:], ""))
+        fit = pb.fit_chat(msgs, parts, budget=pinned_floor + 800,
+                          measure=measure, attach=_ctx_attach,
+                          pin_last_user=True)
+        self.assertTrue(fit.fits, fit)
+        self.assertEqual(fit.messages[:2], msgs[-3:-1])
+        self.assertEqual(fit.dropped_parts, ())
+        self.assertIn("E" * 2700, fit.messages[-1]["content"])
+
+    def test_clip_middle_keeps_head_and_tail(self):
+        text = "HEAD" + "m" * 5000 + "TAIL"
+        out = pb.clip_middle(text, 600)
+        self.assertLessEqual(len(out), 600 + 60)
+        self.assertTrue(out.startswith("HEAD"))
+        self.assertTrue(out.endswith("TAIL"))
+        self.assertIn("characters cut", out)
+        self.assertEqual(pb.clip_middle("short", 600), "short")
+        self.assertEqual(pb.clip_middle(None, 600), "")
+        self.assertTrue(all(a > b for a, b in zip(pb.RESULT_CLIP_STEPS,
+                                                  pb.RESULT_CLIP_STEPS[1:])))
+
+
+class ReviewObservedWindowTests(unittest.TestCase):
+    """Review 2026-10-02 (low): the 10-01 incident read limit=8195 - half the
+    16k num_ctx the budget assumes - so the budget alone would not have
+    saved that prompt, and nothing compared the estimate with what Ollama
+    actually evaluated. A prompt_eval_count far under the estimate is a
+    truncation: say so loudly, and budget the next prompts to it for a
+    while."""
+
+    def test_truncation_is_a_count_far_under_the_estimate(self):
+        self.assertTrue(pb.looks_truncated(15800, 8195))
+        self.assertFalse(pb.looks_truncated(15800, 15100))  # estimate errs high
+        self.assertFalse(pb.looks_truncated(15800, 14200))  # 4.5 chars/token
+        self.assertFalse(pb.looks_truncated(900, 300))      # too small to judge
+        for junk in (None, "x", 0, -5):
+            self.assertFalse(pb.looks_truncated(15800, junk))
+
+    def test_the_observed_limit_budgets_the_next_prompts_for_a_while(self):
+        now = [1000.0]
+        w = pb.ObservedWindow(clock=lambda: now[0])
+        self.assertEqual(w.effective(16384), 16384)
+        self.assertFalse(w.note(13000, 12500))
+        self.assertTrue(w.note(15800, 8195))
+        self.assertEqual(w.limit, 8195)
+        self.assertEqual(w.effective(16384), 8195)
+        # never larger than the configured window
+        self.assertEqual(w.effective(4096), 4096)
+        now[0] += pb.OBSERVED_LIMIT_TTL_S + 1
+        self.assertEqual(w.effective(16384), 16384)
+
+    def test_a_bigger_untruncated_prompt_clears_it(self):
+        w = pb.ObservedWindow(clock=lambda: 0.0)
+        w.note(15800, 8195)
+        self.assertFalse(w.note(13600, 13400))
+        self.assertEqual(w.effective(16384), 16384)
 
 
 if __name__ == "__main__":

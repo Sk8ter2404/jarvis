@@ -230,7 +230,20 @@ class TurnTimingTests(unittest.TestCase):
     def test_lead_dropped_defaults_to_zero(self):
         d = tt.parse_line(self._full_turn())
         self.assertEqual(d["lead_dropped"], "0")
-        self.assertEqual(tt.STAT_FIELDS[-1], "lead_dropped")
+        self.assertIn("lead_dropped", tt.STAT_FIELDS)
+
+    def test_budget_trimmed_is_recorded_when_set(self):
+        # 2026-10-02: a turn the local prompt budget trimmed is marked, so its
+        # prompt_eval_count never enters the chars-per-token calibration as
+        # an untrimmed one; '-' when no budget ran (a cloud turn).
+        self.assertEqual(tt.STAT_FIELDS[-1], "budget_trimmed")
+        self.assertEqual(tt.parse_line(self._full_turn())["budget_trimmed"],
+                         "-")
+        t = self.t
+        t.begin("inject")
+        t.set_first("budget_trimmed", 1)
+        t.set_first("budget_trimmed", 0)       # first value wins
+        self.assertEqual(tt.parse_line(t.emit())["budget_trimmed"], "1")
 
     def test_lead_dropped_marked_by_the_turn_thread_only(self):
         t = self.t
@@ -499,8 +512,10 @@ class R1SchemaTests(unittest.TestCase):
     def test_new_fields_sit_between_filler_ms_and_lead_dropped(self):
         f = list(tt.STAT_FIELDS)
         i = f.index("filler_ms")
-        self.assertEqual(f[i + 1:-1], list(tt.NOTE_FIELDS))
-        self.assertEqual(f[-1], "lead_dropped")
+        j = f.index("lead_dropped")
+        self.assertEqual(f[i + 1:j], list(tt.NOTE_FIELDS))
+        # The prompt budget's budget_trimmed (v2.0.167) follows lead_dropped.
+        self.assertEqual(f[j:], ["lead_dropped", "budget_trimmed"])
         self.assertEqual(tt.NOTE_FIELDS, (
             "tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms", "stt_engine",
             "load_ms", "total_ms", "play_open_ms", "out_lat_ms",

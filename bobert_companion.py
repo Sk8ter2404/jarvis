@@ -2004,10 +2004,16 @@ def _with_turn_context(messages: list, turn_ctx: str) -> list:
 # limit=8195 prompt=17958" in its server log), so an overflowing turn reached
 # the model with most of its system prompt gone. Live: 2 turns on 2026-10-01
 # read prompt_eval_count=8195. _fit_local_messages estimates every local
-# prompt and, only when it is over budget, drops the oldest history, then the
-# lowest-priority per-turn parts, then the rest of the history. It never
-# touches the system prompt or the final message. Calibration, ranks and trim
-# order: core/prompt_budget.py. Set JARVIS_LOCAL_PROMPT_BUDGET=0 to turn it off.
+# prompt and, only when it is over budget, drops the low-rank per-turn parts
+# (the cheap tail), then the oldest history, then the sections, then the rest
+# of the history. It never touches the system prompt or the final message (nor
+# a follow-up round's owner request). Calibration, ranks and trim order:
+# core/prompt_budget.py. Review fixes 2026-10-02: a turn's history trim is kept
+# for good (_persist_budget_history_trim), a prompt that cannot fit still sheds
+# everything it can, a follow-up round clips its results, and a reply whose
+# prompt_eval_count shows Ollama cut the prompt anyway is logged and shrinks
+# the next budgets (_note_prompt_window). JARVIS_LOCAL_PROMPT_BUDGET=0 turns
+# the budget off.
 from core import prompt_budget as _prompt_budget  # noqa: E402
 
 _LOCAL_PROMPT_BUDGET = (os.environ.get("JARVIS_LOCAL_PROMPT_BUDGET", "1")
@@ -2017,8 +2023,18 @@ _LOCAL_PROMPT_BUDGET = (os.environ.get("JARVIS_LOCAL_PROMPT_BUDGET", "1")
 class _BudgetedMessages(list):
     """A message list _fit_local_messages has already fitted for a
     ``num_ctx`` window. _call_local_llm leaves it alone when the model it
-    resolved has that same window, instead of measuring it a second time."""
+    resolved has that same window, instead of measuring it a second time.
+
+    Also carries what the fit did: ``fits``, ``trimmed``, ``ctx_chars`` (the
+    per-turn context actually attached, for the turn-timing line) and
+    ``dropped_head`` (the history messages it dropped, oldest first, for
+    _persist_budget_history_trim)."""
     num_ctx = 0
+    window = 0
+    fits = True
+    trimmed = False
+    ctx_chars = 0
+    dropped_head = ()
 
 
 def _local_budget_tag() -> str:
@@ -2034,21 +2050,25 @@ def _local_budget_tag() -> str:
         return ""
 
 
-def _turn_budget_parts(pc_block: str, addenda=()) -> list:
+def _turn_budget_parts(pc_block: str, addenda=(), inherited=()) -> list:
     """This turn's per-turn context as prompt_budget.TurnPart's: each routed
-    PC section body (rank SECTION), then each non-empty addendum. ``addenda``
-    is ``[(label, text, rank), ...]``. The parts' texts join to exactly
-    ``pc_block + "".join(addendum texts)``, which is the context string the
-    caller attaches. Never raises: on a fault the whole context is ONE part,
-    so it is still sent (and can still only be dropped whole)."""
+    PC section body (rank SECTION; rank INHERITED for a section named in
+    ``inherited`` - one only the history routed, see
+    prompt_router.inherited_turn_sections), then each non-empty addendum.
+    ``addenda`` is ``[(label, text, rank), ...]``. The parts' texts join to
+    exactly ``pc_block + "".join(addendum texts)``, which is the context
+    string the caller attaches. Never raises: on a fault the whole context is
+    ONE part, so it is still sent (and can still only be dropped whole)."""
     try:
         parts = []
         if pc_block:
             from core import prompt_router as _pr
+            inh = set(inherited or ())
             for i, (head, body) in enumerate(_pr.split_turn_block(pc_block)):
                 parts.append(_prompt_budget.TurnPart(
                     head or "turn sections", ("\n" if i else "") + body,
-                    _prompt_budget.RANK_SECTION))
+                    (_prompt_budget.RANK_INHERITED if head in inh
+                     else _prompt_budget.RANK_SECTION)))
         for label, text, rank in addenda:
             if text:
                 parts.append(_prompt_budget.TurnPart(label, text, rank))
@@ -2062,22 +2082,28 @@ def _turn_budget_parts(pc_block: str, addenda=()) -> list:
 
 def _fit_local_messages(system: str, messages: list, parts=(), *,
                         max_tokens: int = 500, where: str = "local",
-                        model_tag: str | None = None) -> list:
+                        model_tag: str | None = None,
+                        pin_last_user: bool = False,
+                        log: bool = True) -> list:
     """``messages`` with the per-turn ``parts`` attached (_with_turn_context),
     trimmed to the local prompt budget when the whole prompt would overflow
     the model's window.
 
     The prompt is measured exactly as _call_local_llm will send it: through
-    _local_chat_prompt (the local-mode directive, the web-search guard). A
-    prompt that fits comes back unchanged. A trimmed or still-over prompt
-    prints one ``[prompt-budget]`` line. Never raises; a fault sends the
-    unbudgeted prompt."""
+    _local_chat_prompt (the local-mode directive, the web-search guard). The
+    window is the model's num_ctx, or the smaller one a recent reply showed
+    Ollama really used (_prompt_budget.OBSERVED_WINDOW). ``pin_last_user``
+    keeps the owner's last turn and the chain after it (a follow-up round).
+    A prompt that fits comes back unchanged. A trimmed or still-over prompt
+    prints one ``[prompt-budget]`` line (``log``). Never raises; a fault
+    sends the unbudgeted prompt."""
     turn_ctx = "".join(p.text for p in parts)
     if not _LOCAL_PROMPT_BUDGET:
         return _with_turn_context(messages, turn_ctx)
     try:
         num_ctx = _local_num_ctx(model_tag or _local_budget_tag())
-        budget = _prompt_budget.budget_for(num_ctx, max_tokens)
+        window = _prompt_budget.OBSERVED_WINDOW.effective(num_ctx)
+        budget = _prompt_budget.budget_for(window, max_tokens)
 
         def _measure(msgs):
             s, m = _local_chat_prompt(system, msgs)
@@ -2085,16 +2111,105 @@ def _fit_local_messages(system: str, messages: list, parts=(), *,
 
         fit = _prompt_budget.fit_chat(list(messages), parts, budget=budget,
                                       measure=_measure,
-                                      attach=_with_turn_context)
-        if fit.trimmed or not fit.fits:
-            print("  " + _prompt_budget.describe(fit, where, num_ctx=num_ctx))
+                                      attach=_with_turn_context,
+                                      pin_last_user=pin_last_user)
+        if log and (fit.trimmed or not fit.fits):
+            note = _prompt_budget.describe(fit, where, num_ctx=window)
+            if window < num_ctx:
+                note += (f" [window {window:,}: observed, not the "
+                         f"{num_ctx:,} configured]")
+            print("  " + note)
         out = _BudgetedMessages(fit.messages)
         out.num_ctx = num_ctx
+        out.window = window
+        out.fits = fit.fits
+        out.trimmed = fit.trimmed
+        dropped = set(fit.dropped_parts)
+        out.ctx_chars = sum(len(p.text) for p in parts
+                            if p.label not in dropped)
+        out.dropped_head = tuple(list(messages)[:fit.dropped_history])
         return out
     except Exception as _e:
         print(f"  [prompt-budget] {where}: check failed "
               f"({type(_e).__name__}: {_e}); sent unbudgeted")
         return _with_turn_context(messages, turn_ctx)
+
+
+def _persist_budget_history_trim(fitted) -> int:
+    """Drop from conversation_history, for good, the oldest messages a turn's
+    budget fit dropped (``fitted.dropped_head``), so the NEXT turn and the
+    idle re-prime share this turn's trimmed prefix (review 2026-10-02: a
+    per-call trim left the re-prime warming the untrimmed history, and every
+    later near-limit turn paid a full re-evaluation). Goes through the same
+    bookkeeping as _trim_conversation_history (the session summary still
+    folds the messages in). Only when those messages are still the front of
+    the live list. Returns how many went. Never raises."""
+    try:
+        gone = list(getattr(fitted, "dropped_head", ()) or ())
+        if not gone:
+            return 0
+        n = len(gone)
+        with _session_summary_lock:
+            if (len(conversation_history) < n
+                    or any(conversation_history[i] is not gone[i]
+                           for i in range(n))):
+                return 0
+            _session_trimmed.extend(conversation_history[:n])
+            del conversation_history[:n]
+        print(f"  [prompt-budget] kept the history trim: {n} oldest "
+              f"message(s) left the conversation")
+        return n
+    except Exception:
+        return 0
+
+
+def _note_prompt_window(sys_prompt: str, messages: list, stats,
+                        model_tag: str = "") -> bool:
+    """After a local reply: compare Ollama's prompt_eval_count with the
+    estimate of what was sent. Far under it (prompt_budget.looks_truncated)
+    means Ollama cut the prompt despite the budget - its runner's window is
+    smaller than num_ctx (the 10-01 incident read limit=8195). Logs one loud
+    ``[prompt-budget] TRUNCATED`` line and the observed window then budgets
+    the next prompts (OBSERVED_WINDOW). Never raises."""
+    try:
+        pe = (stats or {}).get("prompt_eval_count")
+        if pe is None:
+            return False
+        est = _prompt_budget.estimate_chat_tokens(sys_prompt, messages)
+        if not _prompt_budget.OBSERVED_WINDOW.note(est, pe):
+            return False
+        ctx = _local_num_ctx(model_tag) if model_tag else 0
+        print(f"  [prompt-budget] TRUNCATED: Ollama evaluated {int(pe):,} "
+              f"prompt tokens of an estimated ~{est:,} (num_ctx {ctx}) - "
+              f"its runner's window is smaller than configured; the next "
+              f"local prompts are budgeted to {int(pe):,} for "
+              f"{_prompt_budget.OBSERVED_LIMIT_TTL_S / 60:.0f} min")
+        return True
+    except Exception:
+        return False
+
+
+# A short follow-up routes on the previous user turn only while that turn is
+# recent (review 2026-10-02): the same horizon as the "turn it off" referent
+# and "do that again" (core/pronoun_switch.REFERENT_WINDOW_S).
+_FOLLOWUP_ROUTING_MAX_AGE_S = _pronoun_switch.REFERENT_WINDOW_S
+
+
+def _routing_history():
+    """The conversation for the prompt router's follow-up routing, or None
+    when the previous owner turn is older than _FOLLOWUP_ROUTING_MAX_AGE_S
+    (or there was none this process): a turn minutes after the last one is
+    not leaning on it. Never raises."""
+    try:
+        prev = float(_prev_owner_turn_at[0] or 0.0)
+        if prev <= 0.0:
+            return None
+        age = time.monotonic() - prev
+        if age < 0.0 or age > _FOLLOWUP_ROUTING_MAX_AGE_S:
+            return None
+        return list(conversation_history)
+    except Exception:
+        return None
 
 # Phase 4A refactor (2026-05-29): 11 simple _act_* handlers (open_url,
 # web_search, youtube, get_time, screenshot, media_next/prev/playpause,
@@ -19727,6 +19842,8 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             if kind == "ok":
                 print(f"  [local-llm] served via {model} "
                       f"{_served_via_suffix(_gen_stats[0])}")
+                _note_prompt_window(sys_prompt, messages, _gen_stats[0],
+                                    model)
                 return text
             if kind == "empty":
                 # 200-OK-but-EMPTY = the model ran but a broken quant / template
@@ -21967,6 +22084,7 @@ def _call_llm(user_text: str) -> str:
     # route. Empty string = legacy behaviour (everything in the system prompt).
     _turn_ctx = ""
     _stable_split = False
+    _turn_inherited = set()
     if (_chat_route == "local" and _DYNAMIC_LOCAL_PROMPT and _STABLE_LOCAL_PREFIX
             and PC_CONTROL_PROMPT and PC_CONTROL_PROMPT in _system_prompt):
         # CACHE-STABLE SPLIT — see _STABLE_LOCAL_PREFIX. The system prompt keeps
@@ -21982,9 +22100,14 @@ def _call_llm(user_text: str) -> str:
                 raise RuntimeError("stable layout unavailable")
             # history= lets a short elliptical follow-up ('Pause it.',
             # 'never mind, cancel that') also route on the previous user
-            # turn, which is where its subject lives (2026-10-01 brain eval).
+            # turn, which is where its subject lives (2026-10-01 brain eval)
+            # - only while that turn is recent (_routing_history). What only
+            # the history routed ranks low in the prompt budget.
+            _route_hist = _routing_history()
             _turn_ctx = _pr.turn_pc_block(user_text, PC_CONTROL_PROMPT,
-                                          history=list(conversation_history))
+                                          history=_route_hist)
+            _turn_inherited = _pr.inherited_turn_sections(
+                user_text, PC_CONTROL_PROMPT, history=_route_hist)
             _stable_split = True
         except Exception as _pr_err:
             print(f"  [prompt-router] stable split failed ({_pr_err}); "
@@ -21997,7 +22120,7 @@ def _call_llm(user_text: str) -> str:
         try:
             from core import prompt_router as _pr
             _slim_pc = _pr.slim_pc_control(user_text, PC_CONTROL_PROMPT,
-                                           history=list(conversation_history))
+                                           history=_routing_history())
             # slim_pc_control keeps PC_CONTROL's own preamble but NOT the local
             # anti-hallucination guard (the highest-value instruction on this
             # path). _local_cheatsheet has it; this path did not — restore it
@@ -22045,7 +22168,8 @@ def _call_llm(user_text: str) -> str:
         _last_turn_pc_block[0] = _turn_ctx
         # The local prompt budget's per-turn parts: the section bodies, then
         # each addendum. They join to exactly the _turn_ctx sent below.
-        _turn_parts = _turn_budget_parts(_turn_ctx, _addenda_parts)
+        _turn_parts = _turn_budget_parts(_turn_ctx, _addenda_parts,
+                                         inherited=_turn_inherited)
         _turn_ctx = _turn_ctx + _turn_addenda
     else:
         sys_prompt_now = _base_prompt + _turn_addenda
@@ -22064,7 +22188,11 @@ def _call_llm(user_text: str) -> str:
     _last_stable_sys_prompt[0] = sys_prompt_now if _stable_split else ""
 
     _prof("prompt_end", f"sys={len(sys_prompt_now)} ctx={len(_turn_ctx)}")
-    _tt("set_first", "turn_ctx_chars", len(_turn_ctx))
+    # turn_ctx_chars is what was SENT (review 2026-10-02): the local branch
+    # records it after the prompt budget, with budget_trimmed, so a trimmed
+    # turn never enters the chars-per-token calibration as an untrimmed one.
+    if _chat_route != "local":
+        _tt("set_first", "turn_ctx_chars", len(_turn_ctx))
     _tt("set_first", "sys_chars", len(sys_prompt_now))
     if _chat_route == "local":
         # LOCAL-routed turn: local model is primary. On local failure, fall
@@ -22079,11 +22207,17 @@ def _call_llm(user_text: str) -> str:
             # The per-turn context goes on as ranked parts (they join to
             # exactly _turn_ctx) so an overflowing turn can shed the least
             # important ones; a turn that fits is sent byte-for-byte as before.
-            reply = _local_then_cloud_or_honest(
-                sys_prompt_now,
-                _fit_local_messages(sys_prompt_now, conversation_history,
-                                    _turn_parts, max_tokens=500,
-                                    where="turn"))
+            _fitted = _fit_local_messages(sys_prompt_now, conversation_history,
+                                          _turn_parts, max_tokens=500,
+                                          where="turn")
+            _tt("set_first", "turn_ctx_chars",
+                getattr(_fitted, "ctx_chars", len(_turn_ctx))
+                if isinstance(_fitted, _BudgetedMessages) else len(_turn_ctx))
+            _tt("set_first", "budget_trimmed",
+                1 if getattr(_fitted, "trimmed", False) else 0)
+            # The next turn and the idle re-prime share this trimmed prefix.
+            _persist_budget_history_trim(_fitted)
+            reply = _local_then_cloud_or_honest(sys_prompt_now, _fitted)
         finally:
             _owner_chat_call.active = False
     elif AI_BACKEND == "claude":
@@ -33335,11 +33469,17 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     return cleaned, results
 
 
-def get_followup_response(action_results: list[tuple[str, str]]) -> str:
-    """After informational actions ran, ask the LLM to actually answer the
-    user's original question using the action results."""
+# Spoken when a follow-up round's action results cannot fit the local window
+# even clipped (review 2026-10-02): ends the chain honestly instead of sending
+# a prompt Ollama would cut from the start (the identity and safety rules).
+_FOLLOWUP_TOO_LONG_REPLY = ("Those results came back too long for me to read "
+                            "through properly, sir.")
+
+
+def _followup_extra(action_results) -> str:
+    """The follow-up round's results message (see get_followup_response)."""
     summary = "\n".join(f"- [{name}] returned: {result}" for name, result in action_results)
-    extra = (
+    return (
         "(System: the actions in your previous response just ran. Here is what "
         "they returned:\n\n"
         f"{summary}\n\n"
@@ -33372,6 +33512,45 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         "or completed the task. Don't give up mid-chain.\n"
         "- When you do have the answer, reply conversationally. Don't paste raw output.)"
     )
+
+
+def _fit_followup_round(local_sys: str, action_results, local_parts):
+    """The local follow-up round's messages, fitted to the budget with the
+    owner's request pinned (review 2026-10-02: on this round the final
+    message is the machine-made results, and the request it exists to
+    finish used to be the first thing dropped). When the results alone
+    overflow, each is clipped (head and tail kept) through
+    prompt_budget.RESULT_CLIP_STEPS. None when even the smallest clip cannot
+    fit: the caller ends the chain instead of sending a prompt Ollama would
+    cut from the start."""
+    def _fit(results, log=True):
+        return _fit_local_messages(
+            local_sys,
+            list(conversation_history)
+            + [{"role": "user", "content": _followup_extra(results)}],
+            local_parts, max_tokens=400, where="follow-up",
+            pin_last_user=True, log=log)
+
+    fitted = _fit(action_results)
+    if getattr(fitted, "fits", True):
+        return fitted
+    for cap in _prompt_budget.RESULT_CLIP_STEPS:
+        clipped = [(n, _prompt_budget.clip_middle(str(r), cap))
+                   for n, r in action_results]
+        fitted = _fit(clipped, log=False)
+        if getattr(fitted, "fits", True):
+            print(f"  [prompt-budget] follow-up: action results clipped to "
+                  f"~{cap:,} chars each to fit the window")
+            return fitted
+    print("  [prompt-budget] follow-up: the results cannot fit even "
+          "clipped - ending the chain")
+    return None
+
+
+def get_followup_response(action_results: list[tuple[str, str]]) -> str:
+    """After informational actions ran, ask the LLM to actually answer the
+    user's original question using the action results."""
+    extra = _followup_extra(action_results)
 
     # Carry the tone of the original user turn into the follow-up so the
     # register doesn't snap back to default mid-chain (e.g. user barks
@@ -33469,15 +33648,12 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
             _local_parts = _turn_budget_parts(_last_turn_pc_block[0],
                                               _followup_addenda_parts)
         try:
-            return _local_then_cloud_or_honest(
-                _local_sys,
-                _fit_local_messages(
-                    _local_sys,
-                    list(conversation_history)
-                    + [{"role": "user", "content": extra}], _local_parts,
-                    max_tokens=400, where="follow-up"),
-                max_tokens=400,
-            )
+            _fitted = _fit_followup_round(_local_sys, action_results,
+                                          _local_parts)
+            if _fitted is None:
+                return _FOLLOWUP_TOO_LONG_REPLY
+            return _local_then_cloud_or_honest(_local_sys, _fitted,
+                                               max_tokens=400)
         except Exception:
             # Unexpected raise on the local path (it has its own no-propagate
             # wrapper, so this is belt-and-braces): fall through to the backend
