@@ -723,6 +723,15 @@ WHISPER_DEVICE      = "auto"            # "auto" | "cuda" | "cuda:N" | "cpu"
 WHISPER_MODEL_CUDA  = "large-v3-turbo"  # ~3.1 GB VRAM, 8x faster than large-v3
 WHISPER_MODEL_CPU   = "small"           # CPU-friendly default when no GPU
 
+# Speed plan R11 - decode knobs for the owner's turns (faster-whisper path).
+# no_speech_prob is always 0.0 here, so faster-whisper's silence exit never
+# fires and a low-logprob decode walks all six temperatures: the 4-10 s tails.
+# WHISPER_TEMPERATURES None = faster-whisper's own ladder (unchanged); e.g.
+# [0.0, 0.2, 0.4] caps it. WHISPER_BEAM_SIZE 1-10 (5 = unchanged). A bad value
+# falls back to the default. The bounded no-VAD retry keeps beam 1 / temp 0.
+WHISPER_TEMPERATURES = None
+WHISPER_BEAM_SIZE    = 5
+
 # Per-install speech-filter tuning. The Whisper gate thresholds depend on the
 # MICROPHONE, so an install whose mic differs from the desktop's overrides them
 # here (via user_settings.json) instead of editing core/speech_filter.py and

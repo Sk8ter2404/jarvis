@@ -18501,6 +18501,30 @@ _STT_NO_VAD_RETRY_MAX_AUDIO_S = 10.0
 _STT_NO_VAD_RETRY_BEAM = 1
 
 
+def _whisper_decode_kwargs() -> dict:
+    """Speed plan R11: beam_size (+ temperature only when set) for the
+    owner's VAD decodes, from WHISPER_BEAM_SIZE / WHISPER_TEMPERATURES. The
+    defaults reproduce the old call exactly (beam 5, no temperature kwarg); a
+    malformed value falls back to them. Never raises."""
+    beam = globals().get("WHISPER_BEAM_SIZE", 5)
+    if isinstance(beam, bool) or not isinstance(beam, int) or not 1 <= beam <= 10:
+        beam = 5
+    kw = {"beam_size": beam}
+    t = globals().get("WHISPER_TEMPERATURES", None)
+    if isinstance(t, (int, float)) and not isinstance(t, bool):
+        if 0.0 <= float(t) <= 1.0:
+            kw["temperature"] = float(t)
+    elif isinstance(t, (list, tuple)) and t:
+        try:
+            vals = tuple(float(x) for x in t
+                         if not isinstance(x, bool))
+        except (TypeError, ValueError):
+            vals = ()
+        if len(vals) == len(t) and all(0.0 <= v <= 1.0 for v in vals):
+            kw["temperature"] = vals
+    return kw
+
+
 def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
     """Returns (text, confidence) where confidence has no_speech_prob and avg_logprob.
     Abstracts over faster-whisper (preferred, GPU-accelerated on 3090) and
@@ -18535,11 +18559,12 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             _hot_setting = _stt_vocab.live_hotwords(globals().get("STT_HOTWORDS"))
             _hot = _stt_vocab.hotwords_arg(_hot_setting)
             _vad_params = dict(threshold=0.3, min_speech_duration_ms=80)
+            _knobs = _whisper_decode_kwargs()      # R11 (defaults: unchanged)
             segments_gen, info = _stt.transcribe(
                 audio, language="en",
                 vad_filter=True,
                 vad_parameters=_vad_params,
-                beam_size=5, hotwords=_hot,
+                hotwords=_hot, **_knobs,
             )
             segments = list(segments_gen)
             _decoded_with_hot = bool(_hot) and bool(segments)
@@ -18571,7 +18596,7 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
                         audio, language="en",
                         vad_filter=True,
                         vad_parameters=_vad_params,
-                        beam_size=5, hotwords=None,
+                        hotwords=None, **_knobs,
                     )
                     segments = list(segments_gen)
                     text = " ".join((s.text or "").strip() for s in segments).strip()
