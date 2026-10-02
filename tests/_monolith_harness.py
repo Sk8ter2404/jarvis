@@ -255,6 +255,13 @@ _MONOLITH_RESTORE_NAMES = (
     # core.local_traffic is reset in _restore_monolith_pristine.
     "_last_owner_turn_at", "_reprime_primed_at", "_reprime_posts_mark",
     "_learn_pending", "_learn_worker_live",
+    # Cold-first-turn fixes (NEW #8, 2026-10-02): the music-capture streak
+    # (a leaked streak would let a LATER test's re-prime run over an
+    # "utterance"), the worker's last outcome / attempt counter the boot
+    # warm-up reads, and the main-loop start stamp (a leaked one would make a
+    # LATER test's background call schedule a real re-prime thread).
+    "_music_capture_streak", "_music_capture_last_at",
+    "_reprime_last_outcome", "_reprime_outcome_seq", "_main_loop_started_at",
     # Owner-only learning (2026-09-30, core/learn_gate.py): the gate's
     # follow-up window and its classifier thread's flag. A leaked window would
     # let a LATER test's unaddressed turn teach; a leaked flag would park every

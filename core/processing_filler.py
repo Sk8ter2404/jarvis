@@ -179,7 +179,8 @@ class ProcessingFiller:
     def __init__(self, *, play_fn, suppressed_fn, delays_fn,
                  clock=time.monotonic, wait_fn=_default_wait,
                  thread_factory=threading.Thread, retry_s: float = 0.5,
-                 max_retry_s: float = 30.0, first_retry_s: float = 3.0):
+                 max_retry_s: float = 30.0, first_retry_s: float = 3.0,
+                 first_late_s: float | None = None, log_fn=None):
         self._play_fn = play_fn
         self._suppressed_fn = suppressed_fn
         self._delays_fn = delays_fn
@@ -191,6 +192,17 @@ class ProcessingFiller:
         # Stage 1 retries this long on 'retry' (e.g. a background capture
         # holding the mic at t0 + first) instead of being dropped.
         self._first_retry_s = float(first_retry_s)
+        # NEW #8 (2026-10-02): the latest stage 1 may START, in seconds past
+        # t0 + first (None = no cap: first_retry_s alone bounds it). Live
+        # 22:04:11 a 0.5 s line slipped to +3.6 s and, because a started clip
+        # always finishes, the answer waited ~0.9 s behind it. A line that
+        # late is no longer "I heard you"; it is skipped (and logged).
+        try:
+            self._first_late_s = (None if first_late_s is None
+                                  else max(0.0, float(first_late_s)))
+        except (TypeError, ValueError):
+            self._first_late_s = None
+        self._log_fn = log_fn
         self._lock = threading.Lock()
         self._current: FillerTurn | None = None
         self._closed = False
@@ -303,11 +315,25 @@ class ProcessingFiller:
                 if (t.cancel.is_set() or t.spoke or self._captures > 0
                         or not first_ready or t.first > float(max_first_s)):
                     return ""
-                if self._clock() - t.t0 >= t.first + self._first_retry_s:
+                if self._clock() - t.t0 >= t.first + self._first_window():
                     return ""
                 return "pending"
         except Exception:
             return ""
+
+    def _first_window(self) -> float:
+        """How long past t0 + first stage 1 may still start."""
+        if self._first_late_s is None:
+            return self._first_retry_s
+        return min(self._first_retry_s, self._first_late_s)
+
+    def _log(self, msg: str) -> None:
+        self.last_reason = msg
+        if self._log_fn is not None:
+            try:
+                self._log_fn(msg)
+            except Exception:
+                pass
 
     # ── speech marks ────────────────────────────────────────────────────
     @staticmethod
@@ -413,6 +439,11 @@ class ProcessingFiller:
             return
         retried = 0.0
         while not turn.spoke:
+            if self._first_late_s is not None:
+                late = self._clock() - (turn.t0 + turn.first)
+                if late > self._first_late_s:
+                    self._log(f"stage 1 skipped: {late:.1f}s late")
+                    break
             try:
                 r = self._play_fn(turn, 1)
             except Exception:

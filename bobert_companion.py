@@ -20737,6 +20737,19 @@ _utterance_in_progress = [False]
 # reply, not a turn boundary. Drives the re-prime-after-eviction window
 # (LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S). 0.0 = none yet this process.
 _last_owner_turn_at = [0.0]
+# time.monotonic() when main() reached the turn loop (0.0 = it never did: an
+# import, a test): the re-prime-after-background reference before the owner's
+# first turn (NEW #8, 2026-10-02).
+_main_loop_started_at = [0.0]
+# Captures that ended WITHOUT becoming a turn while the PC's playback meter
+# read audio, in a row (NEW #8). Live 21:49:59 music on the PC kept the desk
+# mic tripping, _utterance_in_progress stayed set and the boot prime was
+# skipped as if the owner were mid-sentence. A streak of these means the
+# capture in progress is the music, not him (_capture_is_sustained_music).
+_music_capture_streak = [0]
+_music_capture_last_at = [0.0]
+_MUSIC_CAPTURE_STREAK_MIN = 2
+_MUSIC_CAPTURE_STALE_S = 60.0
 # time.monotonic() of the last accepted owner turn that came from the MIC (not
 # typed / injected / a remote channel). "The owner spoke to JARVIS recently" —
 # the voice half of the proactive-remark presence gate (should_be_proactive).
@@ -20913,6 +20926,7 @@ def _note_owner_turn() -> None:
     _note_conversation_activity()
     _turn_in_progress[0] = True
     _utterance_in_progress[0] = False
+    _music_capture_streak[0] = 0
 
 
 def _note_turn_boundary() -> None:
@@ -20921,7 +20935,43 @@ def _note_turn_boundary() -> None:
     if _turn_in_progress[0]:
         _turn_in_progress[0] = False
         _note_conversation_activity()
+    elif _utterance_in_progress[0]:
+        _note_dropped_capture()
     _utterance_in_progress[0] = False
+
+
+def _note_dropped_capture() -> None:
+    """A capture ended without becoming a turn: count it toward the music
+    streak when the media gate's playback probe for it read PC audio, reset
+    the streak when it read none (unknown changes nothing). Never raises."""
+    try:
+        st = _media_probe[0]
+        if not st or not st["done"].is_set():
+            return
+        peak = st.get("peak")
+        if peak is None:
+            return
+        if _media_gate.audio_playing(peak, False,
+                                     threshold=float(MEDIA_VOICE_GATE_PEAK)):
+            _music_capture_streak[0] += 1
+            _music_capture_last_at[0] = time.monotonic()
+        else:
+            _music_capture_streak[0] = 0
+    except Exception:
+        pass
+
+
+def _capture_is_sustained_music() -> bool:
+    """True when the capture in progress is most likely the PC's music, not
+    the owner: _MUSIC_CAPTURE_STREAK_MIN captures in a row ended without a
+    turn while the playback meter read audio, the last one recently. Only
+    the idle re-prime gate asks this. Never raises."""
+    try:
+        return (_music_capture_streak[0] >= _MUSIC_CAPTURE_STREAK_MIN
+                and time.monotonic() - _music_capture_last_at[0]
+                <= _MUSIC_CAPTURE_STALE_S)
+    except Exception:
+        return False
 
 
 def _prompt_freeze_quiet_s() -> float:
@@ -21137,7 +21187,13 @@ def _reprime_skip_reason() -> str | None:
     except Exception:
         return "route"
     if _utterance_in_progress[0]:
-        return "utterance"
+        # Sustained PC music keeps the desk mic tripping; that capture is not
+        # the owner mid-sentence (NEW #8). Worst case he IS speaking over it:
+        # his turn queues behind the ~2.5 s prime and then finds it warm.
+        if not _capture_is_sustained_music():
+            return "utterance"
+        print(f"  [reprime] capture is music ({_music_capture_streak[0]} "
+              f"captures over PC audio) - not waiting for it")
     # VOICE_MODE='realtime' (experimental, off by default) captures on the
     # streaming STT pipeline's own thread and never goes through
     # record_speech, so _utterance_in_progress cannot see the owner
@@ -21223,13 +21279,23 @@ def _reprime_once() -> str:
     return "primed"
 
 
+# The outcome of the newest _reprime_once (its return value) and a counter of
+# completed attempts, so the boot warm-up can tell whether ITS attempt primed
+# (NEW #8). Written only by _reprime_worker.
+_reprime_last_outcome = [""]
+_reprime_outcome_seq = [0]
+
+
 def _reprime_worker() -> None:
     try:
         while True:
             time.sleep(_REPRIME_DEBOUNCE_S)
             with _reprime_lock:
                 _reprime_again[0] = False
-            _reprime_once()
+            _outcome = _reprime_once()
+            with _reprime_lock:
+                _reprime_last_outcome[0] = str(_outcome or "")
+                _reprime_outcome_seq[0] += 1
             with _reprime_lock:
                 if not _reprime_again[0]:
                     _reprime_running[0] = False
@@ -21259,7 +21325,7 @@ def _start_boot_reprime(delay_s: "float | None" = None) -> bool:
         try:
             time.sleep(delay)
             print("  [reprime] boot warm-up")
-            _schedule_local_reprime()
+            _boot_reprime_until_primed()
         except Exception as _e:
             print(f"  [reprime] boot warm-up failed: {type(_e).__name__}")
 
@@ -21268,6 +21334,56 @@ def _start_boot_reprime(delay_s: "float | None" = None) -> bool:
     except Exception:
         return False
     return True
+
+
+# Boot warm-up retries (NEW #8, 2026-10-02). Live 21:49:59 the one boot prime
+# was skipped ("utterance": music kept the mic tripping) and never tried
+# again, so the first turn at 22:04:11 re-read the whole prompt (3856 ms).
+# A skip for a passing reason is retried every _BOOT_REPRIME_RETRY_S; a
+# permanent reason ends it, as do a prime, the owner's first turn (his turn
+# re-warms the prefix itself) and _BOOT_REPRIME_MAX_TRIES (~10 minutes).
+_BOOT_REPRIME_RETRY_S = 30.0
+_BOOT_REPRIME_MAX_TRIES = 20
+_BOOT_REPRIME_FINAL = frozenset({"primed", "disabled", "local-off", "route",
+                                 "layout"})
+_BOOT_REPRIME_WAIT_S = 120.0
+
+
+def _boot_reprime_until_primed() -> str:
+    """Run the boot warm-up through the single-flight worker until it primes
+    (see _BOOT_REPRIME_* above). Returns the last outcome ('' when no attempt
+    was observed). Runs on the boot-reprime thread; never raises."""
+    outcome = ""
+    try:
+        for attempt in range(_BOOT_REPRIME_MAX_TRIES):
+            if attempt:
+                time.sleep(_BOOT_REPRIME_RETRY_S)
+                if _last_owner_turn_at[0]:
+                    print("  [reprime] boot warm-up: the owner has spoken - "
+                          "no more retries")
+                    return outcome
+            with _reprime_lock:
+                seq0 = _reprime_outcome_seq[0]
+            _schedule_local_reprime()
+            waited = 0.0
+            while _reprime_running[0] and waited < _BOOT_REPRIME_WAIT_S:
+                time.sleep(0.25)
+                waited += 0.25
+            with _reprime_lock:
+                if _reprime_outcome_seq[0] == seq0:
+                    return outcome      # nothing ran (cannot judge): stop
+                outcome = _reprime_last_outcome[0]
+            if outcome in _BOOT_REPRIME_FINAL:
+                return outcome
+            if _last_owner_turn_at[0]:
+                return outcome
+            print(f"  [reprime] boot warm-up skipped ({outcome}) - retry in "
+                  f"{_BOOT_REPRIME_RETRY_S:.0f}s")
+        print(f"  [reprime] boot warm-up gave up after "
+              f"{_BOOT_REPRIME_MAX_TRIES} tries ({outcome})")
+    except Exception as _e:
+        print(f"  [reprime] boot warm-up failed: {type(_e).__name__}")
+    return outcome
 
 
 def _schedule_local_reprime() -> bool:
@@ -21430,6 +21546,9 @@ def wait_for_local_quiet(kind: str = "chat") -> str:
         return "none"
 
 
+_REPRIME_FIRST_TURN_WINDOW_S = 3600.0
+
+
 def _reprime_after_background(tag: str) -> bool:
     """Schedule the idle re-prime after a NON-owner local request replaced the
     one-slot cache, when an owner turn happened within
@@ -21444,7 +21563,17 @@ def _reprime_after_background(tag: str) -> bool:
         if window <= 0 or not (LOCAL_PREFIX_REPRIME and LOCAL_LLM_FALLBACK):
             return False
         last = _last_owner_turn_at[0]
-        if not last or (time.monotonic() - last) > window:
+        if not last:
+            # Before his first turn (NEW #8): measured from the boot (main()
+            # reaching the turn loop), with at least
+            # _REPRIME_FIRST_TURN_WINDOW_S - live, the first turn came 16
+            # minutes after a restart and started cold because nothing
+            # re-warmed the prefix after background work evicted it.
+            last = _main_loop_started_at[0]
+            if not last:
+                return False
+            window = max(window, _REPRIME_FIRST_TURN_WINDOW_S)
+        if (time.monotonic() - last) > window:
             return False
         if not _chat_takes_local_branch():
             return False
@@ -34398,11 +34527,17 @@ def _filler_end_turn(turn) -> None:
 
 _filler_clips = _pf_mod.ClipCache(render_fn=_filler_render, lock=_SPEAK_LOCK,
                                   key_fn=_filler_voice_key)
+# NEW #8 (2026-10-02): a stage-1 line may start at most this long after it was
+# due. Live 22:04:11 the 0.5 s line slipped to +3.6 s (held off by a capture
+# for the old 3 s retry window) and the answer then waited ~0.9 s behind it.
+_FILLER_FIRST_LATE_S = 1.0
 _processing_filler = _pf_mod.ProcessingFiller(
     play_fn=_filler_play,
     suppressed_fn=_filler_arm_suppressed,
     delays_fn=lambda: (globals().get("PROCESSING_FILLER_DELAY", 2.5),
                        globals().get("PROCESSING_FILLER_STILL_DELAY", 12.0)),
+    first_late_s=_FILLER_FIRST_LATE_S,
+    log_fn=lambda _m: print(f"  [filler] {_m}"),
 )
 
 
@@ -39522,6 +39657,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         _publish_main_loop_heartbeat(force=True, now=_main_loop_heartbeat[0])
         # Warm the local model's prompt cache for the first turn (the boot is
         # done: the system prompt has its final, post-skills shape).
+        _main_loop_started_at[0] = time.monotonic()
         _start_boot_reprime()
         # Arm the presence hold on queued proactive speech (starts the
         # physical-input watcher; see _presence_watch_start).
