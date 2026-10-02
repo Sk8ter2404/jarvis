@@ -423,6 +423,16 @@ _TAIL_RE = re.compile(
 _SENT_PUNCT_RE = re.compile(r"[?!.,;:]+(?=\s|$)")
 
 
+# An UNSPACED "/" or "-" between two bare integers is not reliably arithmetic:
+# "9/11", "12/25" (dates), "24/7" (an idiom), "10-4" (a radio code), "2-3" (a
+# range). Spoken arithmetic arrives as words ("divided by", "minus"); the
+# symbol form is mostly typed, where it is ambiguous. answer() leaves such a
+# turn to the LLM — is_arithmetic_request still routes run_python to it — so
+# the fast path never says "9 divided by 11 is about 0.8182" to a history
+# question. Spaced symbols ("144 / 12") stay arithmetic.
+_AMBIGUOUS_SYMBOL_RE = re.compile(r"(?<![\d.,])\d{1,4}[/-]\d{1,4}(?![\d.])")
+
+
 class MathAnswer(NamedTuple):
     expression: str     # canonical spoken form, "12 times 7"
     value: Optional[Fraction]   # None when undefined
@@ -450,6 +460,8 @@ def answer(text) -> Optional[MathAnswer]:
     if not isinstance(text, str) or not text.strip():
         return None
     try:
+        if _AMBIGUOUS_SYMBOL_RE.search(text):
+            return None
         core = _core_expression(text)
         if not core:
             return None

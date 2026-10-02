@@ -51,7 +51,8 @@ class AnswerTests(unittest.TestCase):
                          ("what's 2 to the 10th", 1024),
                          ("what is 2 raised to the 10th power", 1024),
                          ("what's 9 squared", 81), ("what's 3 cubed", 27),
-                         ("what's 2 ^ 5", 32), ("what is 10-4", 6),
+                         ("what's 2 ^ 5", 32), ("what is 10 - 4", 6),
+                         ("what's 144 / 12", 12),
                          ("calculate 1,000 times 2.5", 2500)):
             with self.subTest(q=q):
                 got = sm.answer(q)
@@ -104,6 +105,15 @@ class AnswerTests(unittest.TestCase):
             "sir.")
         # An absurd exponent is not computed at all (falls to the LLM).
         self.assertIsNone(sm.answer("what's 10 to the power of 5000"))
+
+    def test_an_unspaced_slash_or_hyphen_is_left_to_the_llm(self):
+        # Dates, idioms and codes: "9/11", "12/25", "24/7", "10-4". The router
+        # still shows the model run_python for them.
+        for q in ("what is 9/11", "what is 12/25", "what's 24/7",
+                  "what is 10-4", "what's 144/12"):
+            with self.subTest(q=q):
+                self.assertIsNone(sm.answer(q))
+                self.assertTrue(sm.is_arithmetic_request(q))
 
     def test_not_arithmetic_is_not_answered(self):
         for q in ("what times does the store open", "three times a day",
