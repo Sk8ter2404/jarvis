@@ -37,7 +37,7 @@ EXEMPT_SOURCES = frozenset({"timer", "schedule", "promise", "guard"})
 # Lines he asked for that keep their value however late they are: a stale one
 # is spoken whole, never reduced to a recap fragment.
 KEEP_WHOLE_SOURCES = frozenset({
-    "morning", "evening", "daily", "news", "recap", "handoff",
+    "morning", "arrival", "evening", "daily", "news", "recap", "handoff",
     "weekly_digest_briefing", "anticipation_briefing", "focus", "focus_mode",
 })
 
@@ -45,8 +45,8 @@ KEEP_WHOLE_SOURCES = frozenset({
 # banter line): once stale they are simply over, so they are dropped (with a
 # log line) rather than recapped.
 EXPIRE_QUIETLY_SOURCES = frozenset({
-    "wellness", "anticipation", "banter", "greet", "arrival", "posture",
-    "night_owl", "character", "screen_watch",
+    "wellness", "anticipation", "banter", "greet", "posture", "night_owl",
+    "screen_watch",
 })
 
 _RECAP_NAMED = 3          # fragments named in a recap; the rest are counted

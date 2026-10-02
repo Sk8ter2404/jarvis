@@ -125,6 +125,17 @@ class ReturnDrainTests(unittest.TestCase):
         self.assertEqual(out, items)
         self.assertEqual((dropped, folded), ([], []))
 
+    def test_every_briefing_source_is_kept_whole(self):
+        # The morning arrival cold-open (skills/morning_arrival, source
+        # "arrival") is a briefing like the others, never a recap fragment.
+        for src in ("morning", "arrival", "evening", "daily", "news",
+                    "handoff", "recap"):
+            with self.subTest(src=src):
+                self.assertIn(src, op.KEEP_WHOLE_SOURCES)
+                self.assertNotIn(src, op.EXPIRE_QUIETLY_SOURCES)
+        self.assertFalse(op.KEEP_WHOLE_SOURCES & op.EXPIRE_QUIETLY_SOURCES)
+        self.assertFalse(op.EXEMPT_SOURCES & op.EXPIRE_QUIETLY_SOURCES)
+
     def test_named_fragments_are_capped(self):
         items = [self._e(f"Thing {i} happened, sir.", f"src{i}", 4000)
                  for i in range(6)]
