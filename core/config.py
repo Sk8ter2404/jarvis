@@ -741,6 +741,32 @@ ANSWER_FIRST_ENABLED = True
 TURN_TAIL_PROBE = True
 TURN_PLAY_OPEN_PROBE = True
 
+# ─── Smart Turn end of turn (speed plan R7, 2026-10-02) ───────────────────
+# record_speech ends every turn after the same 21 silent chunks (1,344 ms),
+# finished sentence or mid-thought pause alike. Smart Turn v3.2 (an ~9 MB
+# audio model, pipecat-ai/smart-turn-v3) hears the capture's last 8 s and says
+# whether the owner has finished. core/endpointing.EotDecider asks it only in
+# a real pause — at least SMART_TURN_MIN_SILENCE_S of RMS silence, a Silero
+# silence run, and SMART_TURN_MIN_SPEECH_S of Silero speech so far — and a p
+# of SMART_TURN_THRESHOLD or more ends the turn there. The 21 chunks stay the
+# ceiling; Silero or Smart Turn missing, failing or too slow = today's turn.
+#   SMART_TURN_MODE   'off'    no models are loaded;
+#                     'shadow' the models run but nothing changes: the log
+#                              gets an [eot-shadow] line saying when Smart
+#                              Turn WOULD have ended the turn;
+#                     'on'     Smart Turn ends turns.
+#                     Env JARVIS_SMART_TURN, or user_settings.json.
+#   SMART_TURN_MODEL  the ONNX file (smart-turn-v3.2-cpu.onnx), kept OUTSIDE
+#                     the repo: never commit a model. Missing = Smart Turn
+#                     latched off (one log line), i.e. 'rms' turns.
+# Set via user_settings.json; applies on the next start.
+SMART_TURN_MODE = (os.getenv("JARVIS_SMART_TURN", "shadow").strip().lower()
+                   or "shadow")
+SMART_TURN_THRESHOLD = 0.7
+SMART_TURN_MIN_SILENCE_S = 0.256
+SMART_TURN_MIN_SPEECH_S = 1.0
+SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
+
 # ─── Deterministic fast paths (core/fast_paths.py + core/date_math.py) ──
 # When True, relative-date questions ("what's the date tomorrow", "how many
 # days until Christmas", "how long until Friday"), "what did I just ask you"

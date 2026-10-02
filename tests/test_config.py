@@ -62,6 +62,18 @@ class EnvDrivenTests(unittest.TestCase):
         self.assertEqual(mod.BAMBU_ACCESS_CODE, "")
         self.assertEqual(mod.BAMBU_SERIAL, "")
 
+    def test_smart_turn_mode_reads_env_and_ships_shadow(self):
+        # Speed plan R7: JARVIS_SMART_TURN picks off / shadow / on (any case,
+        # stray spaces); unset or blank is the shipped 'shadow'.
+        mod = self._reload_with_env(JARVIS_SMART_TURN=" On ")
+        self.assertEqual(mod.SMART_TURN_MODE, "on")
+        mod = self._reload_with_env(JARVIS_SMART_TURN="")
+        self.assertEqual(mod.SMART_TURN_MODE, "shadow")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JARVIS_SMART_TURN", None)
+            mod = importlib.reload(config)
+        self.assertEqual(mod.SMART_TURN_MODE, "shadow")
+
     def test_env_only_secrets_are_never_applied_from_settings(self):
         # user_settings.json must NOT be able to override the env-only BAMBU
         # secrets — the printer-reconnect flow once wrote BAMBU_PRINTER_IP there,
@@ -228,6 +240,32 @@ class StructuralInvariantTests(unittest.TestCase):
         block = src[src.index("Audio-device flap damping"):
                     src.index("AUDIO_REPICK_STABLE_S    =")]
         self.assertIn("apply on the next start", block)
+
+    def test_smart_turn_knobs_are_typed_and_the_model_lives_outside_the_repo(self):
+        # Speed plan R7: the three numeric knobs are float literals (an int
+        # default would make _apply_user_settings truncate a saved 0.75 to
+        # 0) at the plan's values, and the model path never points into the
+        # repo (a model is never committed).
+        for name, want in (("SMART_TURN_THRESHOLD", 0.7),
+                           ("SMART_TURN_MIN_SILENCE_S", 0.256),
+                           ("SMART_TURN_MIN_SPEECH_S", 1.0)):
+            self.assertIsInstance(getattr(config, name), float, name)
+        with open(config.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        block = src[src.index("Smart Turn end of turn (speed plan R7"):
+                    src.index("SMART_TURN_MODEL = ")]
+        self.assertIn("SMART_TURN_THRESHOLD = 0.7\n", block)
+        self.assertIn("SMART_TURN_MIN_SILENCE_S = 0.256\n", block)
+        self.assertIn("SMART_TURN_MIN_SPEECH_S = 1.0\n", block)
+        self.assertIn("applies on the next start", block)
+        model = config.SMART_TURN_MODEL
+        self.assertTrue(model.endswith("smart-turn-v3.2-cpu.onnx"), model)
+        import ntpath          # a Windows path, also when CI runs on Linux
+        self.assertTrue(ntpath.isabs(model), model)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(
+            config.__file__)))
+        self.assertFalse(os.path.normcase(model).startswith(
+            os.path.normcase(root)), model)
 
 
 if __name__ == "__main__":
