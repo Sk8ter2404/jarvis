@@ -39970,6 +39970,12 @@ def _hard_exit(code: int = 0, *, clean: bool = False) -> None:
     if clean:
         mark_intentional_exit()
         _write_clean_shutdown_flag(force=True)
+    # Persist the month-to-date cloud token tally: atexit never runs past here.
+    try:
+        from core import llm_usage as _llm_usage
+        _llm_usage.flush()
+    except Exception:
+        pass
     _terminate_process_now(code)
 
 

@@ -457,7 +457,8 @@ def _log_cache_usage(usage: Any) -> None:
 # Claude call in the tree funnels through create_message() (complete(), the
 # monolith's _claude_create, the orchestrator, the skills) and the one
 # streaming path is stream_text(), which records its final message, so each
-# reply is counted once. In memory only: nothing persists across restarts.
+# reply is counted once. core/llm_usage.py folds it, debounced, into the
+# persisted month-to-date file (token counts only).
 #   {base model id: {"calls", "input", "output", "cache_read", "cache_write"}}
 session_usage: dict = {}
 _session_usage_lock = threading.Lock()
@@ -490,6 +491,8 @@ def _record_session_usage(model: Any, msg: Any) -> None:
             row["calls"] += 1
             for key, v in counts.items():
                 row[key] += v
+        from core import llm_usage
+        llm_usage.note_usage()
     except Exception:
         pass
 

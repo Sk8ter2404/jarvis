@@ -11,10 +11,11 @@ reading the Anthropic billing page (that is ``check_credits``: the BALANCE):
     (``bobert_companion._session_start_time``) plus the start/end stamps of
     past sessions in memory.py's checkpointed session-summary index.
   * Cloud: this session's real Claude token usage (``core.llm_client``'s
-    ``session_usage`` tally) priced from ``core.model_catalog``. Nothing
-    persists cloud usage across restarts, so there is no month-to-date cloud
-    figure; the reply says so and points at check_credits.
-  * A one-line verdict over THIS session, both costs on the same window.
+    ``session_usage`` tally) and the calendar month's (``core.llm_usage``'s
+    persisted tally), both priced from ``core.model_catalog``. Until a month
+    tally exists the reply says so and points at check_credits.
+  * A one-line verdict over the month when the month tally exists, else over
+    this session; electricity and cloud always on the same window.
 
 Import-light + CI-safe: stdlib only at import; psutil, memory.py and the
 monolith are read lazily and every reader degrades instead of raising. The
@@ -218,6 +219,14 @@ def _session_usage() -> dict:
         return {}
 
 
+def _month_usage(now: Optional[float] = None) -> Optional[dict]:
+    try:
+        from core import llm_usage
+        return llm_usage.month_usage(now)
+    except Exception:
+        return None
+
+
 def cloud_cost(usage: dict) -> Tuple[float, int, int]:
     """(USD, priced calls, unpriced calls) for a {model: token row} tally as
     kept by core.llm_client.session_usage, priced from core.model_catalog.
@@ -276,12 +285,19 @@ def _hours(h: float) -> str:
     return "1 hour" if n == "1" else f"{n} hours"
 
 
+def _calls(n: int) -> str:
+    return f"{n} call{'' if n == 1 else 's'}"
+
+
 def compose(*, gpu_w: Optional[float], cpu_w: float, rate: float,
             session_h: float, today_h: float, month_h: float,
-            cloud_usd: float, cloud_calls: int, unpriced_calls: int = 0) -> str:
+            cloud_usd: float, cloud_calls: int, unpriced_calls: int = 0,
+            month_cloud_usd: Optional[float] = None, month_calls: int = 0,
+            month_unpriced: int = 0) -> str:
     """The three spoken sentences: electricity, cloud, verdict. Plain text,
     rounded numbers, no markdown, and none of the failure-marker words that
-    would stop the verbatim speaker voicing it."""
+    would stop the verbatim speaker voicing it. ``month_cloud_usd`` is None
+    when there is no persisted month tally."""
     kw = ((gpu_w or 0.0) + cpu_w) / 1000.0
     if gpu_w is None:
         draw = (f"with no GPU power reading, the CPU alone is roughly "
@@ -294,26 +310,47 @@ def compose(*, gpu_w: Optional[float], cpu_w: float, rate: float,
              f"{_hours(today_h)} today and {_money(kw * month_h * rate)} for "
              f"{_hours(month_h)} this month.")
     calls = cloud_calls + unpriced_calls
-    if calls == 0:
-        cloud = "The cloud has cost nothing this session, no Claude calls yet"
-    else:
-        cloud = (f"Claude calls this session come to {_money(cloud_usd)} "
-                 f"across {calls} call{'' if calls == 1 else 's'}")
-        if unpriced_calls:
-            cloud += (f", {unpriced_calls} of them on a model I have no "
+    if month_cloud_usd is not None:
+        if calls == 0:
+            cloud = "No Claude calls yet this session"
+        else:
+            cloud = (f"Claude calls this session come to {_money(cloud_usd)} "
+                     f"across {_calls(calls)}")
+        m_calls = month_calls + month_unpriced
+        if m_calls == 0:
+            cloud += ", and none so far this month"
+        else:
+            cloud += (f", and {_money(month_cloud_usd)} across "
+                      f"{_calls(m_calls)} this month at list prices")
+        if month_unpriced:
+            cloud += (f", {month_unpriced} of them on a model I have no "
                       f"price for")
-    cloud += ("; there's no month-to-date cloud tally, so for the bill ask me "
-              "to check your credits.")
-    session_power = kw * session_h * rate
-    total = session_power + cloud_usd
-    if total < 0.005:
-        verdict = "Verdict: next to nothing so far this session, sir."
-    elif cloud_usd <= 0:
-        verdict = (f"Verdict: {_money(total)} for this session so far, all of "
-                   f"it electricity, sir.")
+        cloud += "."
+        window, cloud_usd_w, power_usd = (
+            "this month", month_cloud_usd, kw * month_h * rate)
     else:
-        main = "the cloud" if cloud_usd >= session_power else "electricity"
-        verdict = (f"Verdict: {_money(total)} for this session so far, mostly "
+        if calls == 0:
+            cloud = ("The cloud has cost nothing this session, no Claude "
+                     "calls yet")
+        else:
+            cloud = (f"Claude calls this session come to {_money(cloud_usd)} "
+                     f"across {_calls(calls)}")
+            if unpriced_calls:
+                cloud += (f", {unpriced_calls} of them on a model I have no "
+                          f"price for")
+        cloud += ("; there's no month-to-date cloud tally yet, so for the "
+                  "bill ask me to check your credits.")
+        window, cloud_usd_w, power_usd = (
+            "this session", cloud_usd, kw * session_h * rate)
+    total = power_usd + cloud_usd_w
+    if total < 0.005:
+        verdict = f"Verdict: next to nothing so far {window}, sir."
+    elif cloud_usd_w <= 0:
+        verdict = (f"Verdict: {_money(total)} {window} so far, all of it "
+                   f"electricity, sir.")
+    else:
+        main = "the cloud" if cloud_usd_w >= power_usd else "electricity"
+        verdict = (f"Verdict: {_money(total)} {window} so far, mostly "
                    f"{main}, sir.")
     return f"{power} {cloud} {verdict}"
 
@@ -324,7 +361,12 @@ def report(now: Optional[float] = None) -> str:
     session_h, today_h, month_h = running_hours(
         now, _session_start(), persisted_session_spans())
     usd, priced, unpriced = cloud_cost(_session_usage())
+    month = _month_usage(now)
+    m_usd, m_priced, m_unpriced = (cloud_cost(month) if month is not None
+                                   else (None, 0, 0))
     return compose(gpu_w=gpu_watts(), cpu_w=cpu_watts(_read_cpu_percent()),
                    rate=electricity_rate(), session_h=session_h,
                    today_h=today_h, month_h=month_h, cloud_usd=usd,
-                   cloud_calls=priced, unpriced_calls=unpriced)
+                   cloud_calls=priced, unpriced_calls=unpriced,
+                   month_cloud_usd=m_usd, month_calls=m_priced,
+                   month_unpriced=m_unpriced)
