@@ -460,6 +460,27 @@ XTTS_LANGUAGE     = "en"         # ISO-639-1 hint for XTTS-v2
 # the next start.
 SENTENCE_TTS_ENABLED = True
 
+# ─── Kokoro engine speed (speed plan R4, core/kokoro_tts.py) ───────────
+# KOKORO_PERSISTENT_PHONEMIZER: phonemize every line on ONE espeak backend
+# built with the engine, instead of kokoro_onnx's stock call, which builds a
+# fresh backend per line (~115 ms) and leaves a copy of the espeak-ng dll in
+# %TEMP% each time. Phonemizing and rendering are each one-at-a-time; a
+# render that cannot start within the Kokoro synth timeout falls back to the
+# edge voice. Any error switches back to the stock call for the session.
+# KOKORO_RENDER_CACHE: keep finished renders in memory, keyed by a hash of
+# model, voice, language, speed and text (the text itself is never stored).
+#   'off'    → no cache (today's behaviour)
+#   'shadow' → fill the cache and log would-hit / would-miss, serve nothing
+#   'on'     → a repeated line plays from the cache instead of re-rendering
+# KOKORO_RENDER_CACHE_MB caps the memory (least recently used goes first);
+# KOKORO_RENDER_CACHE_PERSIST also keeps renders as .npy files under
+# data/tts_cache/ (same cap) so they survive a restart. All OFF until proven.
+# Changes apply on the next start.
+KOKORO_PERSISTENT_PHONEMIZER = False
+KOKORO_RENDER_CACHE          = "off"   # 'off' | 'shadow' | 'on'
+KOKORO_RENDER_CACHE_MB       = 64
+KOKORO_RENDER_CACHE_PERSIST  = False
+
 
 # ─── Local voice-cloning backend (Chatterbox) ──────────────────────────
 # A SEPARATE, opt-in path from the XTTS backend above: Resemble AI's
