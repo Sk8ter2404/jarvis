@@ -16,7 +16,6 @@ Stdlib unittest, CI-safe.
 """
 from __future__ import annotations
 
-import re
 import unittest
 
 from core import fast_paths as fp

@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
-import sys
 import time
-import types
 import unittest
 from unittest import mock
 
@@ -613,8 +611,11 @@ class ListTimersIsTheStoreTests(unittest.TestCase):
         self.addCleanup(self.mod._timers.clear)
 
     def _jobs(self, jobs):
-        sched = types.SimpleNamespace(list_jobs=lambda: jobs)
-        return mock.patch.dict(sys.modules, {"core.scheduler": sched})
+        # Patch the attribute on the real module: `from core import
+        # scheduler` reads core.scheduler off the package once it has been
+        # imported, so a sys.modules stand-in is ignored in a full run.
+        from core import scheduler as sched
+        return mock.patch.object(sched, "list_jobs", lambda: jobs)
 
     def test_no_timers_is_said_plainly(self):
         with self._jobs([]):

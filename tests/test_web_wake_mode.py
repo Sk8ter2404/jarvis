@@ -24,7 +24,6 @@ Headless-CI safe: a 127.0.0.1:0 server in a temp dir (tests.test_web_interface).
 from __future__ import annotations
 
 import json
-import os
 import unittest
 
 from tools import web_interface as wi

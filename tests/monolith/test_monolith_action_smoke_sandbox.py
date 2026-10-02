@@ -17,9 +17,12 @@ import sys
 import tempfile
 import unittest
 
+from tests import live_data_guard
 from tests._monolith_harness import requires_monolith
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Named through the guard (tests may not build a data/ path off the root).
+_LIVE_DATA = live_data_guard.LIVE_DATA_DIR
 _TOOL = os.path.join(_ROOT, "tools", "action_smoke.py")
 # Root files a sweep must never create or change in the tree it runs from.
 _WATCHED = ("pending_speech.json", "injected_commands.json",
@@ -38,7 +41,7 @@ def _stamp(path):
 class ActionSmokeSandboxEndToEndTests(unittest.TestCase):
     def _run(self, *args, timeout=420):
         before = {n: _stamp(os.path.join(_ROOT, n)) for n in _WATCHED}
-        before_data = _stamp(os.path.join(_ROOT, "data"))
+        before_data = _stamp(_LIVE_DATA)
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         proc = subprocess.run([sys.executable, "-B", _TOOL, *args],
@@ -48,7 +51,7 @@ class ActionSmokeSandboxEndToEndTests(unittest.TestCase):
         after = {n: _stamp(os.path.join(_ROOT, n)) for n in _WATCHED}
         self.assertEqual(before, after,
                          "the sweep created or changed live root state")
-        self.assertEqual(before_data, _stamp(os.path.join(_ROOT, "data")))
+        self.assertEqual(before_data, _stamp(_LIVE_DATA))
         return proc
 
     def test_preflight_proves_the_queue_is_the_sandbox_queue(self):
@@ -58,7 +61,7 @@ class ActionSmokeSandboxEndToEndTests(unittest.TestCase):
         self.assertIn("preflight OK", out)
         self.assertIn("[smoke] sandbox:", out)
         # The child's live-data guard protects THIS tree, not its own copy.
-        self.assertIn(f"armed on {os.path.join(_ROOT, 'data')}", out)
+        self.assertIn(f"armed on {_LIVE_DATA}", out)
 
     def test_a_small_sweep_runs_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as tmp:

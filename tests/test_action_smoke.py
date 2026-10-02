@@ -197,7 +197,8 @@ class GuardRootOverrideTests(unittest.TestCase):
 
     def test_the_module_still_imports_and_names_its_root(self):
         from tests import live_data_guard as g
-        self.assertEqual(g.LIVE_DATA_DIR, os.path.join(g.PROJECT_ROOT, "data"))
+        self.assertEqual(os.path.dirname(g.LIVE_DATA_DIR), g.PROJECT_ROOT)
+        self.assertEqual(os.path.basename(g.LIVE_DATA_DIR), "data")
 
 
 if __name__ == "__main__":
