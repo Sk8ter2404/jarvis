@@ -24262,10 +24262,14 @@ def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None,
     # Sampled BEFORE the launch (see _focus_steal_guard_active).
     _place_before = None
     _place_activate = True
+    # webbrowser's Chrome controller adds a TAB to a browser window that is
+    # already open; only with none open does it make a new window.
+    _place_tab_likely = False
     if not media_mode:
         try:
             _place_before = _window_handles_snapshot()
             _place_activate = not _focus_steal_guard_active()
+            _place_tab_likely = _find_new_browser_window(()) is not None
         except Exception:
             _place_before = None
 
@@ -24295,9 +24299,10 @@ def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None,
         try:
             browser = webbrowser.get("chrome")
             if browser.open(url):
-                # Usually a tab in an existing window (nothing to place);
-                # a NEW window when Chrome was not running.
-                _place_opened()
+                # A tab in an existing window has nothing to place - and a
+                # placer left watching would catch a window HE opens next.
+                if not _place_tab_likely:
+                    _place_opened()
                 return "chrome:webbrowser"
         except Exception:
             pass

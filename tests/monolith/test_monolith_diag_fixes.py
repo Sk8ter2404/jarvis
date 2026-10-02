@@ -328,6 +328,23 @@ class OrdinaryBrowserWindowPlacementTests(MonolithGlobalsTestCase):
         self.bc._open_url_in_browser("example.com")
         self.assertFalse(self.place.call_args.kwargs.get("activate"))
 
+    def test_a_tab_in_an_open_browser_needs_no_placer(self):
+        # webbrowser's controller adds a TAB when a browser window is open;
+        # with none open it makes a window, which is placed.
+        bc = self.bc
+        ctl = mock.Mock()
+        ctl.open.return_value = True
+        self._p(bc.webbrowser, "get", return_value=ctl)
+        with mock.patch.object(bc, "_find_new_browser_window",
+                               return_value=1):
+            self.assertEqual(bc._open_url_in_browser("example.com"),
+                             "chrome:webbrowser")
+        self.place.assert_not_called()
+        with mock.patch.object(bc, "_find_new_browser_window",
+                               return_value=None):
+            bc._open_url_in_browser("example.com")
+        self.place.assert_called_once()
+
 
 @requires_monolith
 class NewBrowserWindowFinderTests(MonolithGlobalsTestCase):
