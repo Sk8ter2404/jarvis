@@ -1133,6 +1133,16 @@ def _wake_phrase_regex(phrases) -> "re.Pattern":
 
 
 _WAKE_RE = _wake_phrase_regex(WAKE_PHRASES)
+# Standby / sleep wake (audit A29, rechecked 2026-10-02): "jarvis" wakes from
+# anywhere in the sentence, but the soft phrases ("wake up", "come back", "i
+# need you", ...) only as the WHOLE utterance, give or take a courtesy word:
+# "come back here", "I need you to pass the salt" and "wake me at seven" woke
+# him and got a greeting. _WAKE_RE itself is unchanged: the dialogue hold and
+# the R6 rescue share it.
+_NAME_WAKE_RE = _wake_phrase_regex({p for p in WAKE_PHRASES if "jarvis" in p})
+_SOFT_WAKE_PHRASES = frozenset(p for p in WAKE_PHRASES if "jarvis" not in p)
+_SOFT_WAKE_FILLER = frozenset({"please", "sir", "now", "ok", "okay", "hey",
+                               "um", "uh", "so", "oh"})
 # Ambient listening mode (skills/ambient_listen.py) — passive transcription
 # daemon that keeps the mic open and records everything to a rolling buffer
 # without responding. Wake phrases inside the buffer fire proactive_announce.
@@ -29421,6 +29431,14 @@ def _check_and_arm_shutdown_prompt(text: str) -> bool:
         return False
     if not any(p in tl for p in SHUTDOWN_TRIGGER_PHRASES):
         return False
+    # Only when the owner means JARVIS (audit A28, rechecked 2026-10-02): the
+    # bare "shut down" / "power off" also sit inside device commands - "shut
+    # down the computer", "power off the tv", "shut down chrome" - and armed
+    # this prompt instead of running, after which a plain "No." powered
+    # JARVIS off. The dispatcher's own self-termination test decides: a
+    # shutdown verb with no object, or with JARVIS as it.
+    if not _action_risk.asked_for_self_termination("shutdown_jarvis", text):
+        return False
     _shutdown_prompt_pending["armed"] = True
     _shutdown_prompt_pending["expires_at"] = time.time() + SHUTDOWN_PROMPT_TIMEOUT_S
     print(f"  [shutdown] prompt armed for {SHUTDOWN_PROMPT_TIMEOUT_S:.0f}s "
@@ -29460,7 +29478,9 @@ def _handle_shutdown_prompt(text: str) -> bool:
     # Edge case: user repeats a shutdown phrase ('shut down... shut down').
     # Interpret as "yes, full shutdown — I'm insisting" rather than re-arming
     # the prompt and looping.
-    if tl and any(p in tl for p in SHUTDOWN_TRIGGER_PHRASES):
+    if (tl and any(p in tl for p in SHUTDOWN_TRIGGER_PHRASES)
+            and _action_risk.asked_for_self_termination("shutdown_jarvis",
+                                                        text)):
         print(f"  [shutdown] reinforced shutdown via '{tl}' — firing full shutdown")
         try: _act_shutdown_jarvis()
         except Exception as _e:
@@ -32188,6 +32208,17 @@ def _wake_word_heard(text: str) -> bool:
     return bool(_WAKE_RE.search((text or "").strip().lower()))
 
 
+def _standby_wake_heard(text: str) -> bool:
+    """What wakes the standby / sleep loop: the name anywhere, or a soft wake
+    phrase that IS the utterance (courtesy words aside). See _NAME_WAKE_RE."""
+    low = (text or "").strip().lower()
+    if _NAME_WAKE_RE.search(low):
+        return True
+    words = [w for w in re.findall(r"[a-z']+", low)
+             if w not in _SOFT_WAKE_FILLER]
+    return " ".join(words) in _SOFT_WAKE_PHRASES
+
+
 def _room_music_playing() -> bool:
     """The spectral detector's sustained-music state (the standby skill's
     is_music_currently_playing; False when the skill is not loaded) — the
@@ -33928,7 +33959,13 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
     (re.compile(
         r"\b(?:turning\s+off|switching\s+off|disabling|exiting|leaving|"
         r"ending)\s+wake[-\s]*word\s+mode\b"
-        r"|\b(?:normal\s+listening|always\s+listen(?:ing)?)\b",
+        # A switch BACK to normal listening, never a bare "always listening"
+        # (audit A37, rechecked 2026-10-02): "I'm always listening, sir." with
+        # no token injected wake_word_mode_off, and _act_wake_word_mode_set
+        # persists it - the owner's wake-word mode silently stayed off.
+        r"|\b(?:go(?:ing)?\s+back\s+to|switch(?:ing)?\s+(?:back\s+)?to|"
+        r"back\s+to|resum(?:e|ing)|return(?:ing)?\s+to)\s+"
+        r"(?:normal|always[-\s]on)\s+listening\b",
         re.IGNORECASE),
      "wake_word_mode_off", "disable wake-word mode"),
     (re.compile(
@@ -41264,8 +41301,9 @@ def _handle_sleep_standby(injected_text: str | None):
     # a raw substring test that fires on "awakened"/"jar visit"; the ambient
     # listener already used a word-boundary regex, and this standby gate was the
     # stale duplicate that didn't. _wake_word_heard is that regex: the one
-    # copy the dialogue hold and the R6 rescue also use.
-    if _wake_word_heard(text):
+    # copy the dialogue hold and the R6 rescue also use. Soft phrases count
+    # only as the whole utterance here (audit A29): _standby_wake_heard.
+    if _standby_wake_heard(text):
         if _audio_music_should_refuse_wake(text):
             # Length only, never the words (2026-10-01, see the ignored
             # line below).

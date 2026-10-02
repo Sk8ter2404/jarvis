@@ -244,7 +244,7 @@ class MainLoopWiringTests(_Base):
                          "\n        return\n")
         self.assertLess(src.index("_wake_hit = _standby_wake_detected(audio)"),
                         gate)
-        self.assertLess(gate, src.index("if _wake_word_heard(text):"))
+        self.assertLess(gate, src.index("if _standby_wake_heard(text):"))
         self.assertLess(gate, src.index("_ambient_learning_feed(text)"))
 
 

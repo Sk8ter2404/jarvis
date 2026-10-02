@@ -490,7 +490,7 @@ class MainLoopWiringTests(_Base):
         src = inspect.getsource(self.bc._handle_sleep_standby)
         gate = src.index("if _self_echo_ignored(text, injected_text is not None):"
                          "\n        return\n")
-        self.assertLess(gate, src.index("if _wake_word_heard(text):"))
+        self.assertLess(gate, src.index("if _standby_wake_heard(text):"))
         self.assertLess(gate, src.index("_ambient_learning_feed(text)"))
 
     def test_every_voiced_clip_passes_the_registering_wrapper(self):

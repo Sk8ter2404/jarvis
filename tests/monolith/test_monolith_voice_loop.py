@@ -731,7 +731,9 @@ class DroppedLineLogTests(_Base):
 
     def test_a_lyric_near_miss_is_not_logged(self):
         self._p(self.bc, "_audio_music_should_refuse_wake", return_value=True)
-        log = self._heard("wake up little susie wake up")
+        # The name inside a lyric (a soft "wake up" inside one no longer
+        # counts as a wake at all - audit A29, 2026-10-02).
+        log = self._heard("jarvis wake up little susie")
         self.assertIn("wake-word ignored", log)
         self.assertNotIn("susie", log)
 
