@@ -351,13 +351,14 @@ def _fmt_s(seconds: float) -> str:
 # connected. ``off_bus`` is the drop's evidence: True = it left the bus (the
 # Kinect SDK reported the sensor unavailable, or the device vanished from the
 # device list), False = it stayed connected, None = nobody could tell. Power
-# is offered as a thing to CHECK, never asserted.
+# is offered as a thing to CHECK, never asserted: leaving the bus is what was
+# SEEN, and its cause is not - the supply, the cable or port, and (on the
+# owner's box) the 2026-09-08 USB driver-stack update all remain open.
 def dies_on_open_finding(off_bus: "bool | None") -> str:
     """The log line's finding for a device that dies on open. NEVER raises."""
     if off_bus is True:
-        return ("It drops off USB a few seconds after every start: the "
-                "device or its power supply is at fault (check the power "
-                "supply first), not the way it is opened.")
+        return ("It drops off USB a few seconds after every start: check its "
+                "power supply first, then its cable, port and USB driver.")
     if off_bus is False:
         return ("It stays connected while its stream stops, so this is not "
                 "a USB or power drop.")
@@ -375,8 +376,8 @@ def dies_on_open_spoken(label: str, off_bus: "bool | None",
         when = minutes_phrase(retry_s)
         if off_bus is True:
             return (f"{cap} drops off USB a few seconds after every start, "
-                    f"sir. That's a hardware fault - check its power supply "
-                    f"first. I'll only retry it every {when}.")
+                    f"sir. Check its power supply first. I'll only retry it "
+                    f"every {when}.")
         if off_bus is False:
             return (f"{cap}'s stream keeps dying a few seconds after every "
                     f"start, sir, though it stays connected. I'll only retry "

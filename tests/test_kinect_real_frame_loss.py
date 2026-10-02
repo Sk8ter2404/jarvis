@@ -51,8 +51,8 @@ BRIDGE = "kinect-bridge"
 PERF0 = 50_000.0              # the pinned perf_counter (pykinect2's clock)
 
 SAID_OFF_BUS = ("The Kinect drops off USB a few seconds after every start, "
-                "sir. That's a hardware fault - check its power supply "
-                "first. I'll only retry it every thirty minutes.")
+                "sir. Check its power supply first. I'll only retry it "
+                "every thirty minutes.")
 SAID_CONNECTED = ("The Kinect's stream keeps dying a few seconds after every "
                   "start, sir, though it stays connected. I'll only retry it "
                   "every thirty minutes.")
@@ -457,6 +457,15 @@ class GateWordingTests(unittest.TestCase):
     def test_off_bus_evidence(self):
         _g, logs, spoken = self._run(off_bus=True)
         self.assertEqual(spoken, [SAID_OFF_BUS])
+        # Leaving the bus is what was SEEN; its cause is not (power, cable,
+        # port and a USB driver update all remain open), so neither line
+        # may assert one.
+        verdict = [ln for ln in logs if "opens in a row" in ln]
+        self.assertEqual(len(verdict), 1, logs)
+        for said in (spoken[0], verdict[0]):
+            self.assertNotIn("hardware fault", said)
+            self.assertNotIn("is at fault", said)
+        self.assertIn("check its power supply first", verdict[0])
 
     def test_stayed_connected_evidence(self):
         _g, logs, spoken = self._run(off_bus=False)
