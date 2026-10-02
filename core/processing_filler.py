@@ -343,6 +343,18 @@ class ProcessingFiller:
     def armed(self) -> bool:
         return self._current is not None
 
+    def is_owner_thread(self) -> bool:
+        """True when the calling thread armed the current turn (the voice
+        turn's dispatch thread) and the filler is not latched off. Speed plan
+        R3: the answer is pre-rendered only there, so at most one render
+        ever runs outside the speech lock. Never raises."""
+        try:
+            t = self._current
+            return (t is not None and not self._closed
+                    and t.owner == threading.get_ident())
+        except Exception:
+            return False
+
     def ack_state_here(self, first_ready: bool = True,
                        max_first_s: float = 3.0) -> str:
         """Is the filler this voice turn's "I heard you" signal? Asked by the

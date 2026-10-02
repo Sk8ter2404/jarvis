@@ -23856,7 +23856,23 @@ def _resolve_tts_preset(text: str, user_tone: str | None) -> tuple[str, dict[str
     them as arguments. Kept at this 2-arg (text, user_tone) signature so the
     synthesise() call site AND the night_owl_mode monkeypatch (which wraps
     bobert_companion._resolve_tts_preset) keep working unchanged.
+
+    The body is _resolve_tts_preset_from (speed plan R3), which takes the
+    three per-utterance cells as arguments: the filler pre-render resolves
+    the answer's preset from _speak's locals, before _SPEAK_LOCK publishes
+    them into the cells.
     """
+    return _resolve_tts_preset_from(
+        text, user_tone, wry=_last_wry[0],
+        intent_override=_last_intent_override[0], mood=_last_mood[0])
+
+
+def _resolve_tts_preset_from(text: str, user_tone: str | None, *,
+                             wry: bool, intent_override: str | None,
+                             mood: str | None,
+                             ) -> tuple[str, dict[str, object]]:
+    """_resolve_tts_preset with the _last_wry / _last_intent_override /
+    _last_mood cells passed in. Reads the same live state otherwise."""
     if _tts_layer is None:
         # core.tts failed to import — flat neutral prosody keeps JARVIS talking.
         return "neutral", {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
@@ -23873,13 +23889,19 @@ def _resolve_tts_preset(text: str, user_tone: str | None) -> tuple[str, dict[str
     return _tts_layer.resolve_tts_preset(
         text,
         user_tone,
-        wry=_last_wry[0],
-        intent_override=_last_intent_override[0],
-        mood=_last_mood[0],
+        wry=wry,
+        intent_override=intent_override,
+        mood=mood,
         user_text=_last_user_text[0],
         peak_rms=peak_rms,
         emotion_preset=emotion_preset,
     )
+
+
+# The unwrapped resolver. A skill that wraps _resolve_tts_preset (night-owl
+# mode) changes what a line sounds like, so the R3 pre-render only runs while
+# the live resolver is still this one.
+_RESOLVE_TTS_PRESET_ORIG = _resolve_tts_preset
 
 
 def _rate_to_speed(rate: str) -> float:
@@ -36844,7 +36866,7 @@ _SENTENCE_TTS_WAIT_S = 300.0
 
 
 def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
-                     on_first_play=None):
+                     on_first_play=None, first_rendered=None):
     """Voice `chunks` through core.sentence_tts.play_pipelined: sentence 1 is
     rendered and played on THIS thread (the _SPEAK_LOCK holder) while one
     worker renders the rest; every play_with_lipsync call is made here, one
@@ -36874,11 +36896,23 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
       must not voice them again.
     * A render in flight on the worker when the reply is stopped finishes
       after this returns (it cannot be cancelled) and is discarded; see
-      core/sentence_tts.py."""
+      core/sentence_tts.py.
+    * `first_rendered` (audio, sr): sentence 1 as the filler pre-render
+      (speed plan R3) made it, pinned to this same `pinned` preset. It gets
+      the same volume_scale and is not rendered again. None = today."""
     global _barge_in_interrupted
     from core import sentence_tts as _st
     seq0 = _tts_interrupt_seq[0]
     barged = [False]
+
+    def _scaled(audio):
+        if volume_scale != 1.0:
+            try:
+                audio = (audio.astype(np.float32)
+                         * float(volume_scale)).astype(audio.dtype)
+            except Exception:
+                pass
+        return audio
 
     def _render(text, mode):
         _TTS_PRESET_PIN.value = pinned
@@ -36888,13 +36922,12 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
         finally:
             _TTS_PRESET_PIN.value = None
             _TTS_PRESET_PIN.mode = None
-        if volume_scale != 1.0:
-            try:
-                audio = (audio.astype(np.float32)
-                         * float(volume_scale)).astype(audio.dtype)
-            except Exception:
-                pass
-        return audio, sr
+        return _scaled(audio), sr
+
+    _first_kw = {}
+    if first_rendered is not None:
+        _first_kw["first_rendered"] = (_scaled(first_rendered[0]),
+                                       first_rendered[1])
 
     def _pad(audio, sr):
         a = np.asarray(audio)
@@ -36924,7 +36957,8 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
         res = _st.play_pipelined(
             chunks, lambda t: _render(t, "kokoro_only"), _play, _should_stop,
             synth_rest=lambda t: _render(t, "skip_kokoro"), pad=_pad,
-            on_first_play=on_first_play, wait_timeout=_SENTENCE_TTS_WAIT_S)
+            on_first_play=on_first_play, wait_timeout=_SENTENCE_TTS_WAIT_S,
+            **_first_kw)
     finally:
         _tts_reply_active[0] = False
         _audio_ducker.release()
@@ -36939,6 +36973,159 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
         print(f"  [tts] reply stopped after {res.sentences_played}/"
               f"{len(chunks)} sentences")
     return res
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  FILLER HANDOFF PRE-RENDER (speed plan R3, 2026-10-02)
+#  PROCESSING_FILLER_PRERENDER, OFF by default. On 69% of mic turns the
+#  answer waited ~1.5 s for _SPEAK_LOCK behind the filler clip and only then
+#  rendered (~1 s of Kokoro). With the flag on, _speak renders the answer's
+#  first audio (sentence 1, or the whole short reply) on the voice turn's own
+#  thread WHILE the clip plays, then queues for the lock exactly as before.
+#  This is the one exception to "synthesis only under _SPEAK_LOCK", fenced:
+#    * it never takes _SPEAK_LOCK and touches no speaking state
+#      (_tts_current_text, _self_echo, set_state, the _last_* cells) -- all of
+#      that still happens inside the lock, unchanged;
+#    * only on the armed turn's own thread, only while a filler clip is on
+#      the device (_filler_on_device, a plain cell: tests mock
+#      _processing_filler and a Mock is truthy), only Kokoro with no clone and
+#      no mute, never a wry line, never while a skill wraps the preset
+#      resolver (night-owl) -- so at most one render runs outside the lock;
+#    * inside the lock it is used only when it is provably what the normal
+#      path would render now (same text and voice, the preset re-resolved to
+#      the same value, no interrupt, not muted); otherwise it is dropped and
+#      the normal path runs in the same call;
+#    * _filler_play, after its clip, waits for it (bounded, a pure Event
+#      wait) before releasing the lock, so the answer -- not a timer or a tray
+#      line -- is next on the speakers. The pre-render never takes the lock,
+#      so that wait cannot deadlock.
+# ──────────────────────────────────────────────────────────────────────────
+_filler_on_device: list = [False]   # True only while a filler clip plays
+# Set while NO pre-render is in flight (the plan's "_prerender_inflight",
+# inverted so the filler's wait is a plain Event.wait).
+_prerender_idle = threading.Event()
+_prerender_idle.set()
+_PRERENDER_HANDOFF_WAIT_S = 1.5
+
+
+def _prerender_allowed() -> bool:
+    """The pre-render gates, all but the device flag. Never raises."""
+    try:
+        if _processing_filler.is_owner_thread() is not True:
+            return False
+        backend = str(globals().get("TTS_BACKEND", "edge") or "edge").lower()
+        if backend != "kokoro" or globals().get("VOICE_CLONE_ENABLED", False):
+            return False
+        if _tts_muted[0]:
+            return False
+        if _tts_layer is not None and _tts_layer.is_muted():
+            return False
+        return _resolve_tts_preset is _RESOLVE_TTS_PRESET_ORIG
+    except Exception:
+        return False
+
+
+def _speak_prerender(spoken_text: str, intent, wry_flag: bool, chosen_mood):
+    """Render the answer's first audio while the filler clip plays (see the
+    block comment above). Called by _speak BEFORE it takes _SPEAK_LOCK, with
+    _speak's parsed locals. Returns a dict for _prerender_take, or None (no
+    pre-render: the normal path runs). Never takes the lock, never raises."""
+    if not _prerender_allowed():
+        return None
+    # Cleared BEFORE the device flag is read, and _filler_play clears the
+    # flag BEFORE it reads this Event: either this sees the clip gone and
+    # stops, or the filler sees this in flight and waits for it.
+    _prerender_idle.clear()
+    try:
+        if _filler_on_device[0] is not True:
+            return None
+        resolved = _resolve_tts_preset_from(
+            spoken_text, _synth_user_tone(), wry=wry_flag,
+            intent_override=intent, mood=chosen_mood)
+        if resolved[0] == "wry":
+            return None       # the wry beat splices the whole reply
+        # The chunk the normal path renders first (_sentence_tts_plan's
+        # split; backend / clone / mute / wry are gated above).
+        chunk, multi = spoken_text, False
+        if globals().get("SENTENCE_TTS_ENABLED", True):
+            from core import sentence_tts as _st
+            chunks = _st.plan_chunks(spoken_text)
+            if len(chunks) >= 2:
+                chunk, multi = chunks[0], True
+        voice = _filler_voice_key()
+        seq = _tts_interrupt_seq[0]
+        _tt("mark", "synth_start")   # first-wins: the in-lock mark is a no-op
+        # Pinned exactly as a per-sentence chunk is: the preset (and its
+        # gain) applied by synthesise, Kokoro or nothing (SentenceFallback).
+        _TTS_PRESET_PIN.value = resolved
+        _TTS_PRESET_PIN.mode = "kokoro_only"
+        try:
+            audio, sr = synthesise(chunk)
+        finally:
+            _TTS_PRESET_PIN.value = None
+            _TTS_PRESET_PIN.mode = None
+        a = np.asarray(audio)
+        if int(sr) <= 0 or a.size == 0 or not float(np.max(np.abs(a))) >= 1e-3:
+            return None       # empty / the silent-clip shape
+        return {"text": spoken_text, "chunk": chunk, "multi": multi,
+                "resolved": resolved, "voice": voice, "seq": seq,
+                "audio": audio, "sr": sr}
+    except Exception:
+        return None           # SentenceFallback included
+    finally:
+        _prerender_idle.set()
+
+
+def _prerender_take(pre: dict, spoken_text: str, plan):
+    """INSIDE _SPEAK_LOCK, after the reply's cells, state, echo text and
+    self-echo line were published (all unchanged): the pre-rendered
+    (audio, sr) when it is exactly what the path below would render now,
+    else None -- logged with the reason, and the normal path runs. `plan` is
+    this call's _sentence_tts_plan result. Notes pre=1 (used) / pre=0
+    (dropped) on the turn line. Never raises."""
+    try:
+        reason = ""
+        if pre.get("text") != spoken_text:
+            reason = "text changed"
+        elif _tts_interrupt_seq[0] != pre.get("seq"):
+            reason = "interrupted"
+        elif _tts_muted[0] or (_tts_layer is not None
+                               and _tts_layer.is_muted()):
+            reason = "muted"
+        elif _filler_voice_key() != pre.get("voice"):
+            reason = "voice changed"
+        elif plan is not None:
+            # Sentence by sentence: the plan's chunk 1, pinned to the plan's
+            # preset (re-resolved in the lock by _sentence_tts_plan).
+            if not pre.get("multi") or plan[0][0] != pre.get("chunk"):
+                reason = "split changed"
+            elif tuple(plan[1]) != tuple(pre.get("resolved")):
+                reason = "preset changed"
+        elif pre.get("multi"):
+            reason = "split changed"
+        else:
+            user_tone = _synth_user_tone()
+            chosen, preset = _resolve_tts_preset(spoken_text, user_tone)
+            if (chosen, preset) != tuple(pre.get("resolved")):
+                reason = "preset changed"
+            else:
+                # The line synthesise() would have printed for this render.
+                rate = str(preset.get("rate", "+0%"))
+                pitch = str(preset.get("pitch", "+0Hz"))
+                gain = float(preset.get("gain", 1.0))  # type: ignore[arg-type]
+                if chosen != "neutral" or gain != 1.0:
+                    tone_tag = f" tone={user_tone}" if user_tone else ""
+                    mood_tag = f" mood={_last_mood[0]}" if _last_mood[0] else ""
+                    print(f"  [tts] preset={chosen}{tone_tag}{mood_tag} "
+                          f"rate={rate} pitch={pitch} gain={gain:.2f}")
+        if reason:
+            print(f"  [tts] pre-render dropped ({reason}); rendering now")
+            _tt_note_stat("pre", 0)
+            return None
+        _tt_note_stat("pre", 1)
+        return pre["audio"], pre["sr"]
+    except Exception:
+        return None
 
 
 def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
@@ -37079,6 +37266,11 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     # its claim() returns 'gone' (stage 1) / 'not-yet' (stage 2). Only audible
     # utterances reach here (mute / empty / staging returned above).
     _filler_note_speech()
+    # Filler handoff pre-render (speed plan R3; PROCESSING_FILLER_PRERENDER,
+    # off by default): render the answer's first audio NOW, while the filler
+    # clip still holds the lock. Never takes _SPEAK_LOCK; None = today's path.
+    _pre = (_speak_prerender(spoken_text, intent, wry_flag, chosen_mood)
+            if globals().get("PROCESSING_FILLER_PRERENDER", False) else None)
     with _SPEAK_LOCK:
         _speak_ok = False   # set True only once the line was heard (#18 ledger)
         _se_line = 0        # self-echo content token (core/self_echo.py)
@@ -37107,16 +37299,26 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # multi-sentence reply starts playing sentence 1 while the rest
             # renders. None -> today's whole-text synthesise + one play.
             _sentence_plan = _sentence_tts_plan(spoken_text)
+            # R3: the pre-rendered first audio, only if it is exactly what
+            # the path below would render now (else None: today's path).
+            _pre_audio = (_prerender_take(_pre, spoken_text, _sentence_plan)
+                          if _pre is not None else None)
             if _sentence_plan is not None:
+                _first_kw = ({} if _pre_audio is None
+                             else {"first_rendered": _pre_audio})
                 # Raises only when nothing was heard yet (the handler below
                 # then reports the line unspoken, as for one play); a failure
                 # after sentence 1 is logged inside and counts as spoken.
                 _speak_sentences(
                     _sentence_plan[0], _sentence_plan[1], volume_scale,
                     # first audio of the turn's answer = sentence 1's play
-                    on_first_play=lambda: _tt("mark", "first_play"))
+                    on_first_play=lambda: _tt("mark", "first_play"),
+                    **_first_kw)
             else:
-                audio_out, sr = synthesise(spoken_text)
+                if _pre_audio is not None:
+                    audio_out, sr = _pre_audio
+                else:
+                    audio_out, sr = synthesise(spoken_text)
                 if volume_scale != 1.0:
                     try:
                         audio_out = (audio_out.astype(np.float32) * float(volume_scale)).astype(audio_out.dtype)
@@ -37452,20 +37654,42 @@ def _filler_play(turn, stage: int) -> str:
         _se_line = _self_echo.remember(text) if _self_echo_audible() else 0
         try:
             _tts_current_text[0] = text.lower()
+            _filler_on_device[0] = True   # R3: the pre-render may start now
             play_with_lipsync(audio, sr)
         except Exception as _fe:
             print(f"  [filler] playback failed: {type(_fe).__name__}: {_fe}")
         finally:
+            # Cleared FIRST, before the handoff wait reads _prerender_idle.
+            _filler_on_device[0] = False
             # Mirror _speak's finally: nothing owns the speakers any more.
             _tts_playback_active[0] = False
             _tts_current_text[0] = ""
             _tts_interrupt.clear()
             _self_echo.refresh(_se_line)
+        _filler_handoff_wait()
         return "played"
     finally:
         _SPEAK_LOCK.release()
         if claimed:
             _processing_filler.play_done()
+
+
+def _filler_handoff_wait() -> None:
+    """After a clip, still holding _SPEAK_LOCK: while the turn's answer is
+    being pre-rendered (speed plan R3), wait for it -- bounded by
+    _PRERENDER_HANDOFF_WAIT_S, a pure Event wait, no audio -- so the lock
+    goes to the answer next, not to a timer or tray line. The pre-render
+    never takes the lock, so this cannot deadlock. A no-op when none is in
+    flight (always, with PROCESSING_FILLER_PRERENDER off). Never raises."""
+    try:
+        if _prerender_idle.is_set():
+            return
+        if not _prerender_idle.wait(_PRERENDER_HANDOFF_WAIT_S):
+            print(f"  [filler] answer still rendering after "
+                  f"{_PRERENDER_HANDOFF_WAIT_S:.1f}s; releasing the "
+                  f"speech lock")
+    except Exception:
+        pass
 
 
 def _filler_warm_stop() -> bool:

@@ -1192,6 +1192,14 @@ SCHEMA: dict[str, dict] = {
                 "answer, instead of coming back up in between. Applies on the "
                 "next start.",
     },
+    "PROCESSING_FILLER_PRERENDER": {
+        "tab": "voice", "label": "Prepare the answer during the filler",
+        "type": "bool", "default": False,
+        "help": "Kokoro voice only: while the filler line plays, start "
+                "rendering the answer so it follows sooner. Used only when it "
+                "sounds exactly like the normal answer would. Applies on the "
+                "next start.",
+    },
     "ANSWER_FIRST_ENABLED": {
         "tab": "voice", "label": "Answer first (skip 'one moment' lead-ins)",
         "type": "bool", "default": True,
@@ -1879,7 +1887,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                       "PROCESSING_FILLER_STILL_DELAY",
                       "PROCESSING_FILLER_LATE_START_S",
                       "PROCESSING_FILLER_SKIP_PLEASANTRIES",
-                      "FILLER_DUCK_HOLD"]),
+                      "FILLER_DUCK_HOLD", "PROCESSING_FILLER_PRERENDER"]),
         ("Voice clone", ["VOICE_CLONE_ENABLED", "VOICE_CLONE_PROFILE",
                          "VOICE_CLONE_MODEL"]),
         ("Wake word & conversation", [

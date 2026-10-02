@@ -207,6 +207,7 @@ def play_pipelined(
     on_first_play: Optional[Callable[[], None]] = None,
     wait_timeout: float = 90.0,
     poll_s: float = 0.05,
+    first_rendered: Optional[Tuple[object, int]] = None,
 ) -> PipelineResult:
     """Render chunk 1, play it; while it plays, ONE worker renders the rest.
 
@@ -228,6 +229,10 @@ def play_pipelined(
       one sentence was heard -- a later render or play error, or no render
       within `wait_timeout` of waiting -- ends the reply there and is
       returned as `result.error`: those sentences WERE spoken.
+    * `first_rendered` (audio, sr): chunk 1, already rendered by the caller
+      (the speed-plan R3 filler pre-render). It is padded like any chunk and
+      never rendered again; the worker starts on chunk 2 at once. None (the
+      default) renders chunk 1 here, exactly as before.
     """
     res = PipelineResult()
     if not chunks:
@@ -249,7 +254,13 @@ def play_pipelined(
             audio = pad(audio, sr)
         return audio, sr, covered
 
-    first = _render(0)
+    if first_rendered is None:
+        first = _render(0)
+    else:
+        f_audio, f_sr = first_rendered
+        if pad is not None and 1 < n:
+            f_audio = pad(f_audio, f_sr)
+        first = (f_audio, f_sr, 1)
     q: "queue.Queue" = queue.Queue()
     stop = threading.Event()
     next_i = first[2]

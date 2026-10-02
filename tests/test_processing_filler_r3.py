@@ -6,6 +6,10 @@
   * ``is_pleasantry``: a pure phrase-list test ("thank you", "hello", ...)
     the monolith uses, with PROCESSING_FILLER_SKIP_PLEASANTRIES on, to arm no
     filler for a bare pleasantry.
+  * ``is_owner_thread``: True only on the thread that armed the current turn
+    (the R3 pre-render runs only there).
+  * ``core.sentence_tts.play_pipelined(first_rendered=...)``: sentence 1 from
+    the pre-render is padded and played, never rendered again.
 
 The windowed tests are the non-default twins of three tests in
 tests/test_processing_filler.py, which stay unchanged for the default:
@@ -24,7 +28,9 @@ import threading
 import unittest
 
 from core import processing_filler as pf
+from core import sentence_tts as st
 from tests.test_processing_filler import FakeClock, RecFactory
+from tests.test_sentence_tts import _join_workers, _Rec
 
 
 def _make(first=2.5, still=2.0, window=None, first_late_s=None,
@@ -233,6 +239,103 @@ class PleasantryTests(unittest.TestCase):
         # The two gates never disagree about the same phrase.
         for p in pf.PLEASANTRIES:
             self.assertFalse(pf.is_quiet_command(p), p)
+
+
+class OwnerThreadTests(unittest.TestCase):
+    def test_only_the_arming_thread_owns_the_turn(self):
+        f, _c, _p, _a = _make()
+        self.assertFalse(f.is_owner_thread())
+        t = f.arm()
+        self.assertTrue(f.is_owner_thread())
+        seen = []
+        th = threading.Thread(target=lambda: seen.append(f.is_owner_thread()))
+        th.start()
+        th.join()
+        self.assertEqual(seen, [False])
+        f.disarm(t)
+        self.assertFalse(f.is_owner_thread())
+
+    def test_closed_filler_owns_nothing(self):
+        f, _c, _p, _a = _make()
+        f.arm()
+        f.shutdown("restart")
+        self.assertFalse(f.is_owner_thread())
+
+
+class PlayPipelinedFirstRenderedTests(unittest.TestCase):
+    """core.sentence_tts.play_pipelined(first_rendered=...): chunk 1 comes
+    from the R3 pre-render. It is padded like any chunk, never rendered
+    again, and everything else is unchanged."""
+    CHUNKS = ["One.", "Two.", "Three."]
+
+    def tearDown(self):
+        _join_workers()
+
+    def test_chunk_one_is_not_rendered_again(self):
+        rec = _Rec()
+        res = st.play_pipelined(self.CHUNKS, rec.synth, rec.play,
+                                lambda: False,
+                                first_rendered=(["One*"], 24000))
+        rendered = [e[1] for e in rec.log if e[0] == "synth_start"]
+        self.assertEqual(rendered, ["Two.", "Three."])
+        self.assertEqual([a for a, _ in rec.played],
+                         [["One*"], ["Two."], ["Three."]])
+        self.assertEqual((res.plays, res.sentences_played), (3, 3))
+        self.assertEqual(rec.max_active, 1)
+
+    def test_chunk_one_is_padded_like_any_chunk(self):
+        rec = _Rec()
+        st.play_pipelined(self.CHUNKS, rec.synth, rec.play, lambda: False,
+                          pad=lambda audio, sr: list(audio) + ["<gap>"],
+                          first_rendered=(["One*"], 22050))
+        self.assertEqual(rec.played[0], (["One*", "<gap>"], 22050))
+        self.assertEqual(rec.played[-1], (["Three."], 24000))
+
+    def test_on_first_play_still_runs_before_the_first_play(self):
+        rec = _Rec()
+        order = []
+        st.play_pipelined(self.CHUNKS, rec.synth,
+                          lambda a, sr: order.append(("play", tuple(a))),
+                          lambda: False,
+                          on_first_play=lambda: order.append("first"),
+                          first_rendered=(["One*"], 24000))
+        self.assertEqual(order[:2], ["first", ("play", ("One*",))])
+
+    def test_a_stop_after_chunk_one_still_ends_the_reply(self):
+        rec = _Rec()
+        stop = [False]
+
+        def play(audio, sr):
+            rec.play(audio, sr)
+            stop[0] = True
+        res = st.play_pipelined(self.CHUNKS, rec.synth, play,
+                                lambda: stop[0],
+                                first_rendered=(["One*"], 24000))
+        self.assertTrue(res.stopped)
+        self.assertEqual([a for a, _ in rec.played], [["One*"]])
+
+    def test_a_later_fallback_still_voices_the_rest_as_one_block(self):
+        rec = _Rec()
+
+        def synth(text):
+            if text == "Two.":
+                raise st.SentenceFallback("missed")
+            return rec.synth(text)
+        res = st.play_pipelined(self.CHUNKS, synth, rec.play, lambda: False,
+                                synth_rest=lambda t: ([t], 24000),
+                                first_rendered=(["One*"], 24000))
+        self.assertTrue(res.fell_back)
+        self.assertEqual([a for a, _ in rec.played],
+                         [["One*"], ["Two. Three."]])
+
+    def test_default_is_unchanged(self):
+        import inspect
+        sig = inspect.signature(st.play_pipelined)
+        self.assertIsNone(sig.parameters["first_rendered"].default)
+        rec = _Rec()
+        st.play_pipelined(self.CHUNKS, rec.synth, rec.play, lambda: False)
+        rendered = [e[1] for e in rec.log if e[0] == "synth_start"]
+        self.assertEqual(rendered[0], "One.")
 
 
 if __name__ == "__main__":   # pragma: no cover

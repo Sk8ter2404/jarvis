@@ -842,9 +842,14 @@ PROCESSING_FILLER_STILL_DELAY = 12.0   # s of turn silence before stage 2
 # "thank you" / "hello" / "okay" / "good night" ... (owner's choice).
 # FILLER_DUCK_HOLD — keep the music ducked from the filler clip through the
 # answer to the end of the turn (one session scan, no swell in between).
+# PROCESSING_FILLER_PRERENDER — while the filler clip plays, render the
+# answer's first audio on the turn's own thread (Kokoro only, never under the
+# speech lock); it plays only if it is exactly what the normal path would
+# render, else the normal path runs. The turn line then shows pre=1.
 PROCESSING_FILLER_LATE_START_S      = 3.0
 PROCESSING_FILLER_SKIP_PLEASANTRIES = False
 FILLER_DUCK_HOLD                    = False
+PROCESSING_FILLER_PRERENDER         = False
 
 
 # ─── Answer first (skip the model's short lead-in before a spoken answer) ──

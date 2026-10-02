@@ -235,6 +235,10 @@ _MONOLITH_RESTORE_NAMES = (
     # hold it never took (the ducker count itself is reset in
     # _reset_filler_state).
     "_filler_duck_held",
+    # ...and the pre-render's device flag: a leaked True would let a LATER
+    # test's _speak pre-render with no clip playing (the in-flight Event is
+    # set again in _reset_filler_state).
+    "_filler_on_device",
     # Per-turn timing line (2026-09-29): rebind-restored, and its active turn
     # dropped in _restore_monolith_pristine — a turn left open by a test that
     # drove a capture would make a LATER test's dispatch print a stray
@@ -651,6 +655,12 @@ def _reset_filler_state(bc) -> None:
             c._clips.clear()
             c._rejected = set()
         c._warming = False
+    except Exception:
+        pass
+    # Speed plan R3: a pre-render left "in flight" by a failed test would
+    # make every LATER filler clip wait out the handoff bound.
+    try:
+        bc._prerender_idle.set()
     except Exception:
         pass
     # Speed plan R3: a FILLER_DUCK_HOLD hold left on the shared ducker by a

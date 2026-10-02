@@ -78,6 +78,8 @@ NOT_PROACTIVE = {
                                            "filler (its row)",
     "FILLER_DUCK_HOLD": "how long the music stays ducked around the filler "
                         "and the answer",
+    "PROCESSING_FILLER_PRERENDER": "renders the answer during the filler; "
+                                   "says nothing of its own",
     "AMBIENT_EXTRACT_ENABLED": "starts nothing; the extractor follows the "
                                "capture sources",
     "PROACTIVE_REQUIRE_FACE": "a condition on proactive comments",
