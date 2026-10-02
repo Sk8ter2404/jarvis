@@ -29106,9 +29106,24 @@ def _utterance_route_reply(text: str) -> "str | None":
     PC control off (Settings) also turns routes off: parse_and_run_actions
     then runs no action at all, so a claimed token would be SPOKEN as text
     instead of run, and the LLM (which never sees the action grammar in that
-    mode) could not have produced it anyway."""
-    if (not globals().get("SKILL_ROUTES_ENABLED", True)
-            or not globals().get("PC_CONTROL_ENABLED", True) or not text):
+    mode) could not have produced it anyway.
+
+    BUILT-IN route first (NEW #7, 2026-10-02): a whole "play / plays / put on
+    <X> on YouTube" request -> youtube_play (core.dispatcher.
+    youtube_play_route). Live 21:43:17 the model chose the SEARCH action for
+    it: the results page opened and nothing played. Not a skill's route, so
+    SKILL_ROUTES_ENABLED does not switch it off; PC control off does."""
+    if not globals().get("PC_CONTROL_ENABLED", True) or not text:
+        return None
+    try:
+        from core.dispatcher import youtube_play_route as _yt_route
+        _yt_tok = _yt_route(text) if "youtube_play" in ACTIONS else None
+    except Exception:
+        _yt_tok = None
+    if _yt_tok:
+        print("  [route] play on YouTube -> youtube_play")
+        return _yt_tok
+    if not globals().get("SKILL_ROUTES_ENABLED", True):
         return None
     for label, fn in list(_UTTERANCE_ROUTES):
         try:

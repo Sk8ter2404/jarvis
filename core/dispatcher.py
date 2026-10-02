@@ -123,6 +123,56 @@ def _arg_play_streaming(m: re.Match) -> str:
     return f"{_canon_streaming_service(m.group(2) or '')}|{title}"
 
 
+# ── Single-command route: "play X on YouTube" (NEW #7, 2026-10-02) ─────────
+# Live 21:43:17 (2026-10-01): Whisper wrote "Jarvis plays <artist> essentials
+# on YouTube". ONE command never reaches the chain rules below (they need two
+# or more segments), so the model chose: it emitted [ACTION: youtube] - the
+# SEARCH action - the results page opened, nothing played, and JARVIS said
+# "Right away, sir." The monolith's built-in utterance route
+# (_utterance_route_reply) asks THIS function first, so a whole "play / plays
+# / put on <X> on YouTube" request runs youtube_play without the model. A
+# search, a vague object ("play it on YouTube"), another service, or an extra
+# clause ("... on the left monitor") is NOT claimed - the model keeps those.
+_YT_WAKE_LEAD_RE = re.compile(
+    r"^\s*(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*", re.IGNORECASE)
+_YT_PLAY_RE = re.compile(
+    r"^(?:play|plays|put\s+on)\s+(.+?)\s+(?:on|from)\s+(?:the\s+)?"
+    r"(?:you\s?tube|yt)(?:[\s,]+(?:please|for\s+me|now))?$", re.IGNORECASE)
+# Objects that only make sense against earlier context: the model, which
+# sees the conversation, resolves those - a literal YouTube search for "it"
+# would play a random video.
+_YT_VAGUE_OBJECTS = frozenset({
+    "it", "that", "this", "them", "those", "these", "one", "something",
+    "anything", "whatever", "something good", "a video", "the video",
+    "a song", "the song", "music", "some music", "that video", "that song",
+    "this video", "this song",
+})
+_YT_ROUTE_MAX_ARG = 150
+
+
+def youtube_play_route(utterance) -> str | None:
+    """``"[ACTION: youtube_play, <X>]"`` for a whole "play <X> on YouTube"
+    request (Whisper's "plays" and a leading wake word / "can you" / "please"
+    included), else None. Never raises."""
+    try:
+        if not isinstance(utterance, str) or not utterance.strip():
+            return None
+        s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
+        s = _strip_lead_filler(s)
+        s = " ".join(_strip(s).split())
+        m = _YT_PLAY_RE.match(s)
+        if not m:
+            return None
+        query = " ".join(_strip_play_filler(_strip(m.group(1) or "")).split())
+        if (not query or query.lower() in _YT_VAGUE_OBJECTS
+                or len(query) > _YT_ROUTE_MAX_ARG
+                or any(c in query for c in "[]\r\n")):
+            return None
+        return f"[ACTION: youtube_play, {query}]"
+    except Exception:
+        return None
+
+
 # Map common spoken units to seconds (used by both timer and focus rules).
 _UNIT_SECONDS = {
     "second": 1, "seconds": 1, "sec": 1, "secs": 1,
