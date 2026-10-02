@@ -11279,13 +11279,24 @@ def _face_track_note_stopped(reason: str, exc: BaseException | None = None
     """THE line whose absence cost the owner an evening: say that the producer
     stopped, and why. Emitted from the supervisor's `finally`, so it runs for a
     normal shutdown, for an escaped Exception, AND for a BaseException such as
-    SystemExit that today vanishes without a trace. NEVER raises."""
+    SystemExit that today vanishes without a trace. NEVER raises.
+
+    Level (NEW #19, 2026-10-02): a DELIBERATE stop - the stop event is set
+    (shutdown, or the "camera off" action) and nothing escaped - is INFO.
+    Logging it as ERROR on every clean restart polluted error/crash triage.
+    An exception, or a loop that returned WITHOUT the stop event, stays ERROR."""
     try:
         msg = (f"  [face-track] STOPPED - the camera-preview producer is no "
                f"longer running. Reason: {reason}. Every camera tile stays "
                f"dark until JARVIS restarts it.")
         print(msg)
-        if exc is not None:
+        try:
+            deliberate = exc is None and _face_track_stop.is_set()
+        except Exception:
+            deliberate = False
+        if deliberate:
+            logging.info(msg.strip())
+        elif exc is not None:
             logging.error(msg.strip(), exc_info=(type(exc), exc,
                                                  exc.__traceback__))
             try:
