@@ -245,6 +245,9 @@ class PrivateTypedApiTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_WINTYPES, "ctypes.wintypes is Windows-only")
+@unittest.skipUnless(sys.platform == "win32",
+                     "Win32 LL-hook struct layout: wintypes.DWORD is 32-bit only on Windows "
+                     "(c_ulong is 64-bit on Linux, so the flags offset reads garbage there)")
 class HookProcTests(unittest.TestCase):
     """The LowLevel*Proc bodies, fed a hand-built event (flags at the
     documented Win32 offsets) and a fake CallNextHookEx."""
