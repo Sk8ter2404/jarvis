@@ -1407,5 +1407,191 @@ class PulseOwnGpuLoadTests(unittest.TestCase):
                         src.index("_enqueue_speech(message)"))
 
 
+
+# A real `nvidia-smi pmon -c 1 -s u` sample from this rig (2026-10-02), trimmed:
+# the image column is truncated to 15 characters ("llama-server.ex").
+_PMON_SAMPLE = """\
+# gpu         pid   type     sm    mem    enc    dec    jpg    ofa    command
+# Idx           #    C/G      %      %      %      %      %      %    name
+    0       4032   C+G      -      -      -      -      -      -    M365Copilot.exe
+    0      18860   C+G     16      1      -      1      -      -    chrome.exe
+    0      22044   C+G      4      0      -      -      -      -    claude.exe
+    0      47536     C     99     71      -      -      -      -    llama-server.ex
+    1      43176     C     59      8      -      -      -      -    pythonw.exe
+"""
+
+
+class PulseLiveGpuAlertTests(unittest.TestCase):
+    """NEW #10 (live 2026-10-01 19:36:35, owner away): "GPU pinned at 100
+    percent, sir. CPU ..., GPU working hard at 100 percent, ... Anything
+    further?" The load was the shared local model server (llama-server on the
+    3090, busy for another client), the alert came from ONE sample, the line
+    said the GPU twice, and its closing question went into the conversation
+    history (_note_spoken_question) as if he had been asked."""
+
+    LIVE = {"cpu_pct": 12.0, "ram_pct": 41.0, "gpu_util_pct": 100.0,
+            "disk_free_gb": 500.0, "active_apps": 9}
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+        self.mod._last_abnormal_alert.clear()
+        self.slept = []
+
+    def _qualify(self, pulse, *, samples=(100.0,), procs=None, own_pid=4242):
+        seq = list(samples)
+        reasons = self.mod._abnormal_reasons(pulse)
+        with mock.patch("builtins.print") as pr:
+            out_pulse, out = self.mod._qualify_gpu_reason(
+                dict(pulse), reasons,
+                sample=lambda: seq.pop(0) if seq else None,
+                sleep=self.slept.append,
+                busy_procs=lambda: procs, own_pid=own_pid)
+        logged = " ".join(str(c.args[0]) for c in pr.call_args_list if c.args)
+        return dict(out), logged
+
+    def _one_proactive_pass(self, pulse, *, samples=(100.0,), procs=None):
+        """Run ONE _proactive_loop iteration with the GPU boundary faked; the
+        loop's own interval sleep ends it. Returns the enqueued line or None."""
+        enq = []
+        interval = self.mod.PULSE_PROACTIVE_INTERVAL_SECONDS
+
+        def _sleep(secs):
+            if secs == interval:
+                raise _StopLoop
+
+        seq = list(samples)
+        with mock.patch.object(self.mod, "_gather_pulse",
+                               return_value=dict(pulse)), \
+             mock.patch.object(self.mod, "_own_inference_recent",
+                               return_value=False), \
+             mock.patch.object(self.mod, "_read_gpu_util_pct",
+                               side_effect=lambda: seq.pop(0) if seq else None), \
+             mock.patch.object(self.mod, "_gpu_busy_processes",
+                               return_value=procs, create=True), \
+             mock.patch.object(self.mod, "_enqueue_speech",
+                               side_effect=enq.append), \
+             mock.patch.object(self.mod.time, "sleep", side_effect=_sleep), \
+             mock.patch.object(self.mod.time, "time", return_value=50_000.0), \
+             mock.patch("builtins.print"):
+            with self.assertRaises(_StopLoop):
+                self.mod._proactive_loop()
+        return enq[0] if enq else None
+
+    # ── the live line ────────────────────────────────────────────────────
+    def test_live_line_names_the_gpu_once_and_asks_nothing(self):
+        # Genuine, sustained, foreign load: the alert is still spoken - but
+        # once, and as a statement.
+        line = self._one_proactive_pass(
+            self.LIVE, samples=(99.0,),
+            procs=[("fortniteclient-", 9001, 95)])
+        self.assertIsNotNone(line, "a genuine sustained GPU load was not reported")
+        self.assertTrue(line.startswith("GPU pinned at 100 percent, sir."), line)
+        self.assertEqual(line.count("GPU"), 1, line)
+        self.assertNotIn("?", line)
+        self.assertNotIn("Anything further", line)
+        self.assertIn("CPU 12 percent", line)
+
+    def test_live_local_model_server_load_is_not_announced(self):
+        line = self._one_proactive_pass(
+            self.LIVE, samples=(99.0,),
+            procs=[("llama-server.ex", 47536, 99)])     # _PMON_SAMPLE's row
+        self.assertIsNone(line, f"announced the local model server: {line}")
+
+    def test_one_high_sample_is_not_announced(self):
+        line = self._one_proactive_pass(self.LIVE, samples=(23.0,),
+                                        procs=[("fortniteclient-", 9001, 95)])
+        self.assertIsNone(line, f"announced a one-sample spike: {line}")
+
+    # ── _qualify_gpu_reason ──────────────────────────────────────────────
+    def test_a_spike_is_dropped_and_other_reasons_kept(self):
+        pulse = dict(self.LIVE, ram_pct=95.0)
+        out, logged = self._qualify(pulse, samples=(40.0,))
+        self.assertNotIn("gpu", out)
+        self.assertIn("ram", out)
+        self.assertEqual(self.slept, [self.mod.GPU_RESAMPLE_GAP_S])
+        self.assertIn("not sustained", logged)
+
+    def test_the_local_model_server_alone_is_dropped(self):
+        out, logged = self._qualify(self.LIVE,
+                                    procs=[("llama-server.ex", 47536, 99)])
+        self.assertNotIn("gpu", out)
+        self.assertIn("local model server is busy", logged)
+
+    def test_jarvis_own_process_alone_is_dropped(self):
+        out, logged = self._qualify(self.LIVE, procs=[("pythonw.exe", 4242, 59)])
+        self.assertNotIn("gpu", out)
+        self.assertIn("JARVIS's own processing", logged)
+
+    def test_a_foreign_process_keeps_the_alert(self):
+        out, _ = self._qualify(self.LIVE, procs=[("llama-server.ex", 1, 60),
+                                                 ("blender.exe", 2, 80)])
+        self.assertIn("gpu", out)
+
+    def test_unattributable_load_keeps_the_alert(self):
+        for procs in (None, []):
+            with self.subTest(procs=procs):
+                out, _ = self._qualify(self.LIVE, procs=procs)
+                self.assertIn("gpu", out)
+
+    def test_no_gpu_reason_costs_nothing(self):
+        out, _ = self._qualify({"ram_pct": 95.0})
+        self.assertEqual(list(out), ["ram"])
+        self.assertEqual(self.slept, [])
+
+    def test_temperature_fallback_is_left_alone(self):
+        out, _ = self._qualify({"gpu_temp_c": 90.0})
+        self.assertIn("gpu", out)
+        self.assertEqual(self.slept, [])
+
+    # ── nvidia-smi pmon ──────────────────────────────────────────────────
+    def test_parse_pmon_real_sample(self):
+        self.assertEqual(self.mod._parse_pmon(_PMON_SAMPLE),
+                         [("chrome.exe", 18860, 16),
+                          ("llama-server.ex", 47536, 99),
+                          ("pythonw.exe", 43176, 59)])
+        self.assertTrue(self.mod._is_local_model_server("llama-server.ex"))
+        self.assertTrue(self.mod._is_local_model_server("ollama.exe"))
+        self.assertFalse(self.mod._is_local_model_server("chrome.exe"))
+
+    def test_parse_pmon_without_a_header_is_unknown(self):
+        self.assertIsNone(self.mod._parse_pmon(""))
+        self.assertIsNone(self.mod._parse_pmon("No devices were found"))
+
+    # ── _format_report ───────────────────────────────────────────────────
+    def test_no_proactive_line_ends_with_a_question(self):
+        cases = [{"cpu_pct": 99.0}, {"ram_pct": 95.0}, {"disk_free_gb": 5.0},
+                 {"gpu_util_pct": 99.0}, {"gpu_temp_c": 90.0},
+                 {"battery_pct": 9.0, "battery_plugged": False},
+                 {"bambu": {"gcode_state": "FAILED"}}, {"credits_dollars": 1.0},
+                 {"net_down_kbps": 90_000.0}]
+        for pulse in cases:
+            for key, lead in self.mod._abnormal_reasons(pulse):
+                with self.subTest(key=key):
+                    line = self.mod._format_report(pulse, lead=lead,
+                                                   lead_key=key, proactive=True)
+                    self.assertNotIn("?", line)
+
+    def test_the_lead_metric_is_not_repeated(self):
+        pulse = {"cpu_pct": 99.0, "ram_pct": 40.0}
+        key, lead = self.mod._abnormal_reasons(pulse)[0]
+        line = self.mod._format_report(pulse, lead=lead, lead_key=key,
+                                       proactive=True)
+        self.assertEqual(line.count("99 percent"), 1, line)
+        self.assertIn("Memory 40 percent", line)
+
+    def test_the_asked_for_report_keeps_its_offer(self):
+        self.assertTrue(self.mod._format_report(dict(self.LIVE)).endswith(
+            "Anything further?"))
+
+    def test_the_loop_qualifies_before_speaking(self):
+        import inspect
+        src = inspect.getsource(self.mod._proactive_loop)
+        drop = src.index("_drop_self_inflicted_gpu(pulse, reasons)")
+        qual = src.index("_qualify_gpu_reason(pulse, reasons)")
+        self.assertLess(drop, qual)
+        self.assertLess(qual, src.index("_enqueue_speech(message)"))
+        self.assertIn("proactive=True", src)
+
+
 if __name__ == "__main__":
     unittest.main()

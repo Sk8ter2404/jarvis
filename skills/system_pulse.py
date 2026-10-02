@@ -12,7 +12,14 @@ Proactive thread:
   Every PULSE_PROACTIVE_INTERVAL_SECONDS (default 15 min) the same readings
   are gathered silently. If anything looks abnormal — high CPU, high RAM,
   low disk, pinned GPU, low battery, failed Bambu print, low Anthropic credits
-  — JARVIS speaks the pulse unprompted, leading with the abnormal item.
+  — JARVIS speaks the pulse unprompted, leading with the abnormal item. The
+  proactive line never repeats the metric it leads with and never ends with a
+  question (2026-10-02: "GPU pinned at 100 percent ... GPU working hard at 100
+  percent ... Anything further?" went into an empty room at 19:36:35, and the
+  question was written into the conversation as if he had been asked). A
+  pinned GPU is reported only when it stays pinned across
+  GPU_HIGH_SAMPLES_REQUIRED samples and the load is not just the local model
+  server (llama-server / Ollama, which other clients share) or JARVIS itself.
 
 HUD widget:
   Every PULSE_HUD_REFRESH_SECONDS (default 15 s) a compact strip of the
@@ -59,6 +66,18 @@ GPU_TEMP_ABNORMAL_C       = 80.0   # kept for the temperature fallback path only
 BATTERY_LOW_PCT           = 20.0
 CREDITS_LOW_DOLLARS       = 5.0
 NETWORK_HOT_KBPS          = 50_000   # ≥50 MB/s sustained is unusual on a desktop
+
+# A pinned GPU must stay pinned for this many samples GPU_RESAMPLE_GAP_S apart
+# before it is news (one 99 % sample is a model load, a frame, a blip).
+GPU_HIGH_SAMPLES_REQUIRED = 2
+GPU_RESAMPLE_GAP_S        = 5.0
+# A process counts toward the GPU load (nvidia-smi pmon) at or above this SM %.
+GPU_PROC_BUSY_SM_PCT      = 10
+# Image names (nvidia-smi pmon truncates to 15 chars, lower-cased, prefix
+# match) of the LOCAL MODEL SERVER: the shared Ollama runner. Live
+# 2026-10-01 19:36:35 its llama-server.exe pinned the 3090 at 99 % for
+# another client of the shared server, and the pulse called that abnormal.
+LOCAL_MODEL_SERVER_IMAGES = ("llama-server", "llama_server", "ollama")
 
 # ─── cadences ────────────────────────────────────────────────────────────
 PULSE_PROACTIVE_INTERVAL_SECONDS = 15 * 60
@@ -482,10 +501,18 @@ def _fmt_bambu(b: dict) -> str:
     return ""
 
 
-def _format_report(pulse: dict, lead: str = "") -> str:
+def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
+                   proactive: bool = False) -> str:
     """Render the JARVIS-cadence pulse sentence. If `lead` is non-empty, it
     replaces the default 'All systems nominal' opener (used when an
-    abnormality forced the proactive announcement)."""
+    abnormality forced the proactive announcement).
+
+    `lead_key` (an _abnormal_reasons key) names the metric the lead already
+    states; the body then leaves that metric out instead of saying it twice
+    ("GPU pinned at 100 percent ... GPU working hard at 100 percent").
+    `proactive` drops the closing "Anything further?": an unprompted line must
+    not end with a question nobody asked for (in wake-word mode it cannot be
+    answered, and the drain records it in the conversation as one)."""
     cpu = pulse.get("cpu_pct", 0.0)
     ram = pulse.get("ram_pct", 0.0)
     gpu_util = pulse.get("gpu_util_pct")
@@ -499,36 +526,44 @@ def _format_report(pulse: dict, lead: str = "") -> str:
     opener = lead or "All systems nominal, sir."
 
     cpu_temp = pulse.get("cpu_temp_c")
+    said = lead_key if lead else ""   # the metric the lead already states
     parts: list[str] = []
-    if cpu_temp is not None:
-        parts.append(f"CPU {cpu:.0f} percent at {cpu_temp:.0f} degrees, "
-                     f"memory {ram:.0f} percent")
-    else:
-        parts.append(f"CPU {cpu:.0f} percent, memory {ram:.0f} percent")
-    if gpu_util is not None:
+    cpu_part = (f"CPU {cpu:.0f} percent at {cpu_temp:.0f} degrees"
+                if cpu_temp is not None else f"CPU {cpu:.0f} percent")
+    if said != "cpu":
+        parts.append(cpu_part)
+    if said != "ram":
+        parts.append(f"memory {ram:.0f} percent")
+    if said == "gpu":
+        pass
+    elif gpu_util is not None:
         verb = "working hard at" if gpu_util >= GPU_UTIL_ABNORMAL_PCT else "running at"
         parts.append(f"GPU {verb} {gpu_util:.0f} percent")
     elif gpu_temp is not None:
         # No utilization reading available — fall back to temperature.
         verb = "running hot at" if gpu_temp >= GPU_TEMP_ABNORMAL_C else "idling at"
         parts.append(f"GPU {verb} {gpu_temp:.0f} degrees")
-    if bat is not None and pulse.get("battery_plugged") is False:
+    if (said != "battery" and bat is not None
+            and pulse.get("battery_plugged") is False):
         parts.append(f"battery at {bat:.0f} percent on battery power")
-    if disk and disk < DISK_FREE_ABNORMAL_GB * 2:
+    if said != "disk" and disk and disk < DISK_FREE_ABNORMAL_GB * 2:
         # only worth mentioning if it's getting tight
         parts.append(f"C drive has {disk:.0f} gigs free")
     if apps:
         parts.append(f"{apps} windows open")
 
-    middle = ", ".join(parts) + "."
+    middle = (", ".join(parts) + ".") if parts else ""
+    if middle:
+        middle = middle[0].upper() + middle[1:]
     tail_pieces = []
-    if bambu_line:
+    if bambu_line and said != "bambu_fail":
         tail_pieces.append(bambu_line + ".")
-    if credits is not None:
+    if credits is not None and said != "credits":
         tail_pieces.append(f"Anthropic credit balance: ${credits:.2f}.")
     tail = " " + " ".join(tail_pieces) if tail_pieces else ""
+    closer = "" if proactive else " Anything further?"
 
-    return f"{opener} {middle}{tail} Anything further?".strip()
+    return " ".join(f"{opener} {middle}{tail}{closer}".split())
 
 
 def _format_hud_strip(pulse: dict) -> str:
@@ -675,6 +710,124 @@ def _drop_self_inflicted_gpu(pulse: dict, reasons: list, *,
         return pulse, reasons
 
 
+# ─── is a pinned GPU news? (2026-10-02) ─────────────────────────────────
+# Live 2026-10-01 19:36:35: "GPU pinned at 100 percent" from ONE nvidia-smi
+# sample, while the load was the shared local model server (llama-server on
+# the 3090, serving another client) - not JARVIS's own traffic, which is all
+# _drop_self_inflicted_gpu knows about. A gpu reason now survives only when
+# GPU_HIGH_SAMPLES_REQUIRED samples agree AND the busy processes are not just
+# the local model server and JARVIS itself.
+
+def _gpu_busy_processes() -> list | None:
+    """[(image_lower, pid, sm_pct)] for every process using the GPU's SMs at or
+    above GPU_PROC_BUSY_SM_PCT, from one `nvidia-smi pmon -c 1 -s u` sample.
+    None when the per-process reading is unavailable (no nvidia-smi, an error,
+    no header): the caller then cannot attribute the load and keeps the
+    reason. Never raises."""
+    try:
+        exe = shutil.which("nvidia-smi")
+        if not exe:
+            return None
+        out = subprocess.run(
+            [exe, "pmon", "-c", "1", "-s", "u"],
+            capture_output=True, text=True, timeout=6.0,
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+        )
+        return _parse_pmon(out.stdout or "")
+    except Exception:
+        return None
+
+
+def _parse_pmon(text: str) -> list | None:
+    """Parse `nvidia-smi pmon -s u` output (see _gpu_busy_processes). The
+    column layout differs by driver, so it is read from the '# gpu pid ...'
+    header. None when there is no header. Never raises."""
+    try:
+        cols = None
+        busy: list = []
+        for line in (text or "").splitlines():
+            raw = line.strip()
+            if not raw:
+                continue
+            if raw.startswith("#"):
+                names = raw.lstrip("#").split()
+                if cols is None and "pid" in names and "sm" in names:
+                    cols = names
+                continue
+            if cols is None:
+                continue
+            fields = raw.split()
+            if len(fields) < len(cols):
+                continue
+            row = dict(zip(cols, fields))
+            try:
+                pid = int(row.get("pid", "-"))
+            except ValueError:
+                continue
+            sm_raw = row.get("sm", "-")
+            sm = int(sm_raw) if sm_raw.isdigit() else 0
+            if sm < GPU_PROC_BUSY_SM_PCT:
+                continue
+            # The image name is the LAST column and may itself hold spaces.
+            image = " ".join(fields[len(cols) - 1:]).strip().lower()
+            busy.append((image, pid, sm))
+        return busy if cols is not None else None
+    except Exception:
+        return None
+
+
+def _is_local_model_server(image: str) -> bool:
+    name = (image or "").strip().lower()
+    return any(name.startswith(p) for p in LOCAL_MODEL_SERVER_IMAGES)
+
+
+def _qualify_gpu_reason(pulse: dict, reasons: list, *, sample=None,
+                        sleep=None, busy_procs=None, own_pid=None
+                        ) -> tuple[dict, list]:
+    """Return (pulse, reasons) with the 'gpu' reason removed unless the GPU is
+    genuinely and unexpectedly busy:
+      1. GPU_HIGH_SAMPLES_REQUIRED samples (this one + fresh reads
+         GPU_RESAMPLE_GAP_S apart) must all be pinned;
+      2. the processes carrying the load (nvidia-smi pmon) must include
+         something other than the local model server and JARVIS's own
+         process. Unattributable load (pmon unavailable) is kept.
+    Other reasons are untouched. Never raises (on an error: unchanged)."""
+    try:
+        if not any(k == "gpu" for k, _ in reasons):
+            return pulse, reasons
+        first = pulse.get("gpu_util_pct")
+        if first is None:
+            return pulse, reasons        # the temperature fallback path
+        sample = sample or _read_gpu_util_pct
+        sleep = sleep or time.sleep
+        busy_procs = busy_procs or _gpu_busy_processes
+        own = os.getpid() if own_pid is None else own_pid
+        others = [(k, lead) for (k, lead) in reasons if k != "gpu"]
+        for _ in range(max(0, int(GPU_HIGH_SAMPLES_REQUIRED) - 1)):
+            sleep(GPU_RESAMPLE_GAP_S)
+            util = sample()
+            if util is None or util < GPU_UTIL_ABNORMAL_PCT:
+                then = "n/a" if util is None else f"{util:.0f} %"
+                print(f"  [pulse] gpu reading suppressed (not sustained: "
+                      f"{first:.0f} % then {then})")
+                return pulse, others
+        procs = busy_procs()
+        if procs:
+            foreign = [p for p in procs
+                       if not _is_local_model_server(p[0]) and p[1] != own]
+            if not foreign:
+                who = ("the local model server"
+                       if any(_is_local_model_server(p[0]) for p in procs)
+                       else "JARVIS's own processing")
+                names = ", ".join(sorted({p[0] for p in procs}))
+                print(f"  [pulse] gpu reading suppressed ({who} is busy: "
+                      f"{names})")
+                return pulse, others
+        return pulse, reasons
+    except Exception:
+        return pulse, reasons
+
+
 # ─── background threads ──────────────────────────────────────────────────
 
 def _hud_publish_loop() -> None:
@@ -702,6 +855,8 @@ def _proactive_loop() -> None:
             reasons = _abnormal_reasons(pulse)
             # A pinned GPU during JARVIS's own inference is not news.
             pulse, reasons = _drop_self_inflicted_gpu(pulse, reasons)
+            # ...nor one sample, nor the shared local model server's load.
+            pulse, reasons = _qualify_gpu_reason(pulse, reasons)
             now = time.time()
             with _alert_lock:
                 fresh_reasons = [
@@ -712,7 +867,8 @@ def _proactive_loop() -> None:
                 # Lead the report with the first abnormal item, then drop the
                 # full pulse sentence behind it so the user gets context.
                 key, lead = fresh_reasons[0]
-                message = _format_report(pulse, lead=lead)
+                message = _format_report(pulse, lead=lead, lead_key=key,
+                                         proactive=True)
                 _enqueue_speech(message)
                 with _alert_lock:
                     for k, _ in fresh_reasons:
