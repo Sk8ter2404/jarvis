@@ -28001,10 +28001,11 @@ def _is_glance_ambiguous_question(text: str) -> bool:
     return False
 
 
-def _capture_focused_window_png() -> bytes | None:
+def _capture_focused_window_png(max_dim: int = 1568) -> bytes | None:
     """PNG bytes of just the currently-focused window's region, downscaled
-    to vision-friendly dimensions. Returns None if the rect can't be
-    obtained or the capture fails."""
+    to ``max_dim`` on its longest edge (the glance default is vision-friendly
+    1568; see_screen's "read this page" passes a full-resolution cap, NEW #11).
+    Returns None if the rect can't be obtained or the capture fails."""
     # Privacy gate (2026-10-01). This is a second, private copy of
     # take_screenshot's mss/ImageGrab capture and it had left out the
     # SCREENSHOT_PRIVACY_BLOCKLIST check take_screenshot runs first. ask_vision
@@ -28050,7 +28051,10 @@ def _capture_focused_window_png() -> bytes | None:
             print(f"  [glance] capture failed (mss: {e_mss}, pil: {e_pil})")
             return None
     try:
-        max_dim = 1568
+        try:
+            max_dim = max(64, int(max_dim))
+        except (TypeError, ValueError):
+            max_dim = 1568
         if max(img.size) > max_dim:
             ratio = max_dim / max(img.size)
             img = img.resize(

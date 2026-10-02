@@ -2461,6 +2461,74 @@ def _see_screen_question(raw: str, user_text: str = "") -> str:
     return _SEE_SCREEN_DEFAULT_Q
 
 
+# "Read this page" means the window he is looking at (NEW #11, 2026-10-02).
+# Live 20:45-21:00 (2026-10-01) see_screen logged "Capturing all 4 monitors"
+# and sent four 1024-px shots to local vision in one call: the page he meant
+# was shrunk to a corner of a composite, a poor way to read text. When his
+# words name a page / window / tab / article / document, only the focused
+# window is captured, through _capture_focused_window_png (privacy-gated), at
+# the size of a maximised window on a 2560-px monitor (its rect includes the
+# frame) - no downscale. Anything else keeps the all-monitor capture.
+_SEE_SCREEN_FOCUSED_RE = re.compile(
+    r"(?i)\b(?:this|that|the|my|current|open)\s+(?:current\s+|open\s+)?"
+    r"(?:web\s?page|web\s+site|website|page|window|tab|article|site|"
+    r"document|doc|pdf|e-?mail|post|thread)s?\b")
+_SEE_SCREEN_WINDOW_MAX_DIM = 2600
+_SEE_SCREEN_WINDOW_LABEL = "the focused window"
+
+
+def _see_screen_wants_focused_window(user_text: str, question: str) -> bool:
+    """True when the owner's words (else the model's question) name the
+    page / window he is on. Never raises."""
+    try:
+        said = " ".join(str(user_text or "").split())
+        return bool(_SEE_SCREEN_FOCUSED_RE.search(said or str(question or "")))
+    except Exception:
+        return False
+
+
+def _focused_window_is_jarvis(bc) -> bool:
+    """True when the focused window is JARVIS's own (a request typed into
+    the dashboard): its page is not the one he means. Never raises."""
+    try:
+        title = None
+        try:
+            _h, title, _r = bc._read_focused_window()
+        except Exception:
+            title = None
+        if not isinstance(title, str) or not title:
+            title = (bc._focused_window_state or {}).get("title")
+        return isinstance(title, str) and "jarvis" in title.lower()
+    except Exception:
+        return False
+
+
+def _see_screen_focused_window(bc, q: str):
+    """Ask vision about the focused window only. The answer, or None when
+    the capture is unavailable (the caller then captures every monitor)."""
+    if _focused_window_is_jarvis(bc):
+        print("  [vision] focused window is JARVIS's own - capturing all "
+              "monitors instead", flush=True)
+        return None
+    try:
+        png = bc._capture_focused_window_png(
+            max_dim=_SEE_SCREEN_WINDOW_MAX_DIM)
+    except Exception as e:
+        print(f"  [vision] focused-window capture failed: {e}", flush=True)
+        return None
+    if not isinstance(png, (bytes, bytearray)) or not png:
+        print("  [vision] focused-window capture unavailable - capturing all "
+              "monitors instead", flush=True)
+        return None
+    print("  [vision] Capturing the focused window (full resolution)...",
+          flush=True)
+    result = bc.ask_vision(q, png)
+    print(f"  [vision] Got answer ({len(result)} chars)", flush=True)
+    bc._push_screen_context(_SEE_SCREEN_WINDOW_LABEL, q, result,
+                            {_SEE_SCREEN_WINDOW_LABEL: png})
+    return result
+
+
 def _act_see_screen(question: str) -> str:
     bc = _bc()
     # Privacy gate: refuse (spoken) before spending the per-intent budget if a
@@ -2497,6 +2565,14 @@ def _act_see_screen(question: str) -> str:
             "issues a fresh request the budget will reset."
         )
     bc._see_screen_budget_state.used = used + 1
+
+    # "Read this page" / "this window": the focused window only, at full
+    # resolution (NEW #11). Falls through to every monitor when unavailable.
+    if monitor is None and _see_screen_wants_focused_window(
+            _ut if isinstance(_ut, str) else "", question):
+        result = _see_screen_focused_window(bc, q)
+        if result is not None:
+            return result
 
     # Default behaviour: no specific monitor requested -> capture every
     # monitor in MONITORS and send them all to vision in one call.
