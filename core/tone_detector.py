@@ -96,6 +96,27 @@ _EXCITEMENT_PHRASES = (
     "hell yes", "hell yeah", "yeah baby",
 )
 
+# Words that read as excitement ONLY when shouted (2+ '!'). Said plainly
+# ("yes, open it", "it works now") they are no tone at all, so they are kept
+# out of _EXCITEMENT_PHRASES. Shouted, they used to fall to the bare '!!'
+# stress rule: "yes!! finally!!" and "we did it!! it works!!" came out
+# 'stressed' (audit A87). 'finally' is deliberately absent: alone it is relief
+# or exasperation ("finally!! took you long enough!!").
+_EXCLAIMED_POSITIVE_MARKERS = (
+    "yes", "yeah", "it works", "it worked", "it's working", "its working",
+    "we did it", "i did it", "you did it", "hooray",
+)
+
+# Any of these keeps a '!!' stressed even next to a positive marker
+# ("yes it's broken!!", "no!! yes!! whatever!!"). Reading an angry owner as
+# excited is worse than missing excitement, so the list errs wide.
+_EXCLAIMED_NEGATIVE_MARKERS = (
+    "no", "not", "never", "stop", "why", "wrong", "broken", "broke",
+    "fail", "failed", "failing", "crash", "crashed", "crashing", "error",
+    "ugh", "hate", "yeah right", "dont", "doesnt", "didnt", "wont", "cant",
+    "isnt", "wasnt", "arent", "couldnt",
+)
+
 # Local-clock hours when "late-night" applies as a fallback tone. The range
 # wraps midnight: 22:00–04:59 inclusive.
 _LATE_NIGHT_START_HOUR = 22
@@ -307,6 +328,12 @@ def detect_tone(user_text: str, prev_user_text: str | None = None,
     has_playful = _has_any(_PLAYFUL_MARKERS)
     has_excited = _has_any(_EXCITEMENT_PHRASES)
     is_clipped  = (n_words <= 3 and _has_any(_CLIPPED_IMPERATIVES))
+    # A shouted positive ("yes!! finally!!") beats the bare '!!' stress rule
+    # below, unless anything in it reads negative (audit A87).
+    exclaimed_positive = (excl_count >= 2
+                          and _has_any(_EXCLAIMED_POSITIVE_MARKERS)
+                          and "n't" not in clean
+                          and not _has_any(_EXCLAIMED_NEGATIVE_MARKERS))
 
     # Cross-turn repetition: if the previous utterance shares a majority of its
     # content words with this one, the user is restating — a strong frustration
@@ -328,7 +355,7 @@ def detect_tone(user_text: str, prev_user_text: str | None = None,
             or (has_swear and (has_urgency or is_clipped))):
         return "frustrated"
 
-    if has_excited and not has_swear and not is_clipped:
+    if (has_excited or exclaimed_positive) and not has_swear and not is_clipped:
         return "excited"
 
     if has_swear or excl_count >= 2 or (is_clipped and excl_count >= 1):

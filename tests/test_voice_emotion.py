@@ -95,12 +95,86 @@ class RouteTests(unittest.TestCase):
                 "excited")
             self.assertTrue(ve._detect_excited("yes!! finally!!"))
 
+    def test_two_am_yes_finally_gets_the_energy_match_the_docstring_promises(self):
+        # Audit A87: the docstring's own example. detect_tone called it
+        # 'stressed' (the bare '!!' rule), so the router said 'stressed' even
+        # though _detect_excited was True.
+        from core import config as cfg
+        two_am = datetime.datetime(2026, 1, 1, 2, 0).timestamp()
+        with mock.patch.object(cfg, "NIGHT_QUIET_ENABLED", True, create=True):
+            r = ve.route_voice_emotion("yes!! finally!!", now=two_am)
+        self.assertEqual(r["mood"], "excited")
+
     def test_disabled_router_returns_casual(self):
         # When the feature flag is off the router short-circuits to casual
         # regardless of the text. Flag restored after the test.
         with mock.patch.object(ve, "VOICE_EMOTION_ROUTER_ENABLED", False):
             r = ve.route_voice_emotion("what the fuck is going on")
         self.assertEqual(r, {"mood": "casual", "addendum": ""})
+
+
+class ExclaimedUtteranceTableTests(unittest.TestCase):
+    """Audit A87: a '!!' with positive words ("yes!! finally!!", "we did it!!
+    it works!!") read as stressed, which also dims the lights and mutes
+    nudges for 15 min. The fix must not tip an angry '!!' into excited, so
+    the two sides are pinned together. Noon, router and detector enabled."""
+
+    NOON = datetime.datetime(2026, 9, 29, 12, 0).timestamp()
+
+    POSITIVE = (
+        "yes!! finally!!",
+        "Yes!! It works!!",
+        "we did it!! it works!!",
+        "it worked!! finally!!",
+        "finally!! it works!!",
+        "yeah!! we did it!!",
+        "YES!! nailed it!!",
+    )
+    NEGATIVE = (
+        "stop!! now!!",
+        "turn it off!! right now!!",
+        "no!! not that one!!",
+        "finally!!",
+        "finally!! took you long enough!!",
+        "it doesn't work!! fix it!!",
+        "it still doesn't work!! finally!!",
+        "it's not working!! yes I checked!!",
+        "yes it's broken!!",
+        "yeah!! it didn't work!!",
+        "no!! yes!! whatever!!",
+        "yes!! no!! stop!!",
+        "yeah right!! it works!!",
+        "it worked?! why did it crash!!",
+        "fuck yes!!",
+        "yes!! I said yes!!",
+    )
+
+    def _route(self, text):
+        with mock.patch("core.tone_detector._is_late_night_hour",
+                        return_value=False), \
+                mock.patch("core.tone_detector.TONE_DETECTION_ENABLED", True), \
+                mock.patch.object(ve, "VOICE_EMOTION_ROUTER_ENABLED", True):
+            return ve.detect_tone(text), ve.route_voice_emotion(
+                text, now=self.NOON)["mood"]
+
+    def test_positive_exclamations_read_as_excited(self):
+        for text in self.POSITIVE:
+            with self.subTest(text=text):
+                self.assertEqual(self._route(text), ("excited", "excited"))
+
+    def test_angry_exclamations_stay_stressed(self):
+        for text in self.NEGATIVE:
+            with self.subTest(text=text):
+                tone, mood = self._route(text)
+                self.assertIn(tone, ("stressed", "frustrated"))
+                self.assertEqual(mood, "stressed")
+
+    def test_positive_words_without_exclamations_are_not_excited(self):
+        # The new markers count only when shouted: "yes, open it" is a
+        # plain answer, not excitement.
+        for text in ("yes, open it", "it works now, thanks", "yeah go ahead"):
+            with self.subTest(text=text):
+                self.assertNotEqual(self._route(text)[1], "excited")
 
 
 if __name__ == "__main__":
