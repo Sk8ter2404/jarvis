@@ -109,6 +109,72 @@ class CalculateFamilyTests(unittest.TestCase):
                 self.assertIsNone(cv.find_unverified_claim(text))
 
 
+class CalculateFamilyReviewTests(unittest.TestCase):
+    """Review repairs (2026-10-02). The family flagged real answers - a noun
+    use ("Computing power"), an adjective ("Calculated risk"), mental maths
+    with its result in words, the phrasebook's own working lines ahead of an
+    answer - and let the live shape through when "it's one of" read as a
+    figure. Each flag costs a correction round after the reply was spoken."""
+
+    _MONEY_ASK = ("Jarvis, I want to put two thousand dollars aside by next "
+                  "summer, how much is that a week?")
+    _PAGES_ASK = ("Jarvis, if I read 30 pages a day, when do I finish the "
+                  "200 page book?")
+
+    def test_noun_and_adjective_uses_are_not_claims(self):
+        for text in ("Computing power roughly doubles every two years, sir.",
+                     "Calculated risk, sir, but a sound one.",
+                     "Cross-referencing tools exist for that, sir."):
+            with self.subTest(text=text):
+                self.assertIsNone(cv.find_unverified_claim(text))
+                self.assertIsNone(cv.find_unverified_claim(
+                    text, user_text=_LIVE_USER))
+
+    def test_mental_maths_with_its_result_is_not_a_claim(self):
+        cases = (
+            ("I've crunched the numbers, sir - you'd need about forty "
+             "dollars a week.", self._MONEY_ASK),
+            ("I've crunched the numbers, sir - you'd need about forty "
+             "dollars a week.", ""),
+            ("I've run the numbers, sir. At that pace you'll finish by "
+             "Thursday.", self._PAGES_ASK),
+        )
+        for text, user in cases:
+            with self.subTest(text=text, user=user):
+                self.assertIsNone(cv.find_unverified_claim(text, user_text=user))
+
+    def test_a_working_line_ahead_of_an_answer_is_not_a_claim(self):
+        for text in ("Calculating, sir. The 14B would be the better pick for "
+                     "your card.",
+                     "Running the numbers now. The 14B is the better pick, sir."):
+            with self.subTest(text=text):
+                self.assertIsNone(cv.find_unverified_claim(
+                    text, user_text=_LIVE_USER))
+
+    def test_a_working_line_with_nothing_after_it_is_still_a_claim(self):
+        for text in ("Calculating, sir.",
+                     "I'm running the numbers now, sir; I'll have those "
+                     "results for you in a moment."):
+            with self.subTest(text=text):
+                self.assertIsNotNone(cv.find_unverified_claim(
+                    text, user_text=_LIVE_USER))
+
+    def test_one_of_is_not_a_figure(self):
+        for text in ("I've run the calculations, sir - it's one of the "
+                     "trickier trade-offs.",
+                     "I've run the calculations, sir: two of them are worth "
+                     "a look."):
+            with self.subTest(text=text):
+                got = cv.find_unverified_claim(text, user_text=_LIVE_USER)
+                self.assertIsNotNone(got)
+                self.assertIn("run the calculations", got)
+
+    def test_a_model_name_is_not_a_figure(self):
+        self.assertIsNotNone(cv.find_unverified_claim(
+            "I've crunched the numbers, sir - the 32B is your best bet.",
+            user_text=_LIVE_USER))
+
+
 class ListModelsExampleTests(unittest.TestCase):
     def test_the_prompt_maps_a_better_model_to_list_models(self):
         self.assertIn("'is there a better model you can run?'",

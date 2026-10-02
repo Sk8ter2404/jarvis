@@ -348,14 +348,41 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 # JARVIS stating the result of its OWN arithmetic: "fifteen percent of eighty
 # is twelve", "I've calculated it, sir: 391". A calculate-family claim in a
 # reply that carries one is the working shown, not an invented action.
+#
+# Review repair (2026-10-02): "one" is not a figure ("it's one of the trickier
+# trade-offs" read as a result and let the live shape through), and neither is
+# any number word followed by "of" ("two of them").
+_NUMBER_WORDS = (r"(?:zero|two|three|four|five|six|seven|eight|nine|ten|"
+                 r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+                 r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+                 r"eighty|ninety|hundred|thousand|million|billion)")
 _ARITH_RESULT_RE = re.compile(
     r"(?:\bis|'s|\bequals|=|\bcomes\s+(?:out\s+)?(?:to|at)|"
     r"\bworks\s+out\s+(?:to|at)|\bgives|\bmakes|:)\s*"
     r"(?:about\s+|roughly\s+|approximately\s+|exactly\s+|around\s+)?"
-    r"(?:-?\d|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
-    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
-    r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
-    r"hundred|thousand|million|billion|a\s+half)\b)")
+    r"(?:-?\d|(?:" + _NUMBER_WORDS + r"|a\s+half)\b(?!\s+of\b))")
+# ...or an amount with its unit anywhere in the reply ("you'd need about forty
+# dollars a week", "roughly 3.5 hours"). A bare model size ("the 32B") is not.
+_AMOUNT_RE = re.compile(
+    r"(?:\$\s*\d|\b(?:\d[\d,.]*|" + _NUMBER_WORDS + r"|a\s+half)\s*"
+    r"(?:%|percent\b|dollars?\b|bucks\b|cents?\b|pounds?\b|euros?\b|"
+    r"hours?\b|minutes?\b|mins?\b|seconds?\b|days?\b|weeks?\b|months?\b|"
+    r"years?\b|pages?\b|gigabytes?\b|gigs?\b|megabytes?\b|terabytes?\b|"
+    r"gb\b|mb\b|tb\b|kilo\w*|miles?\b|feet\b|foot\b|inches?\b|"
+    r"met(?:er|re)s?\b|degrees?\b|watts?\b|kwh\b|tokens?\b|times\b))")
+# The owner's question had numbers in it, so there was something to work out:
+# "I've run the numbers" over a quantitative ask is mental arithmetic, not an
+# invented action ("if I read 30 pages a day, when do I finish?").
+_QUANT_ASK_RE = re.compile(
+    r"\d|\b(?:" + _NUMBER_WORDS + r"|half|quarter|percent|percentage|twice|"
+    r"double|triple|dozen)\b")
+# A calculate-family gerund / participle that IS the whole clause ("Calculating,
+# sir.", "Running the numbers now.") - the phrasebook's working line. Followed
+# by anything else it is a noun or an adjective ("Computing power", "Calculated
+# risk", "Cross-referencing tools"), never narration.
+_BARE_REST_RE = re.compile(
+    r"^(?:[\s,.!…]|now\b|sir\b|for\s+you\b|as\s+we\s+speak\b|"
+    r"right\s+away\b)*$")
 
 
 def _norm(text: str) -> str:
@@ -419,6 +446,12 @@ def _clause_claim(core: str) -> Optional[tuple[str, str]]:
     later = [p for p in (_strip_leadins(x.strip()) for x in core.split(",")[1:])
              if p and _NARRATION_SIGNAL_RE.search(p)]
     for name, (progressive, perfect, future, narration), _tokens in _COMPILED:
+        if name == "calculate":
+            got = _calculate_claim(core, progressive, perfect, future,
+                                   narration)
+            if got:
+                return got
+            continue
         for rx in (progressive, perfect, future):
             m = rx.search(core)
             if m:
@@ -430,6 +463,27 @@ def _clause_claim(core: str) -> Optional[tuple[str, str]]:
             m = narration.match(part)
             if m and not _gerund_is_noun_use(part, m.end()):
                 return name, m.group(0)
+    return None
+
+
+def _calculate_claim(core, progressive, perfect, future, narration):
+    """The "calculate" family's own reading of one clause (2026-10-02 review
+    repair). ("calculate", phrase) for a COMPLETED-work claim ("I've run the
+    calculations", "I crunched the numbers"); ("calculate_status", phrase) for
+    a working line - "I'm running the numbers", "Let me calculate that", or a
+    clause that is nothing but the gerund ("Calculating, sir."); else None.
+    A clause-initial gerund or participle followed by more words is a noun or
+    an adjective ("Computing power roughly doubles", "Calculated risk")."""
+    m = perfect.search(core)
+    if m:
+        return "calculate", m.group(0)
+    for rx in (progressive, future):
+        m = rx.search(core)
+        if m:
+            return "calculate_status", m.group(0)
+    m = narration.match(core)
+    if m and _BARE_REST_RE.match(core[m.end():]):
+        return "calculate_status", m.group(0)
     return None
 
 
@@ -540,9 +594,15 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
         return None
     ran = _ran_tokens(ran_actions)
     any_ran = bool(ran)
-    shows_working = bool(_ARITH_RESULT_RE.search(_norm(text)))
+    norm = _norm(text)
+    # A completed calculation is JARVIS's own arithmetic, not an invented
+    # action, when the reply carries its result or the owner asked something
+    # with numbers in it (2026-10-02).
+    shows_working = bool(_ARITH_RESULT_RE.search(norm) or _AMOUNT_RE.search(norm)
+                         or _QUANT_ASK_RE.search(_norm(user_text)))
     acks: list[tuple[str, str]] = []      # (kind, phrase)
     content: list[str] = []               # substantive non-claim cores
+    working_line = ""                     # a calculate_status phrase
     for ack, ack_text, core in _segments(text):
         if ack:
             acks.append((ack, ack_text))
@@ -551,6 +611,13 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
         claim = _clause_claim(core)
         if claim and claim[0] == "calculate" and shows_working:
             claim = None
+        if claim and claim[0] == "calculate_status":
+            # The phrasebook's working line ("Calculating, sir.") is persona
+            # flavour ahead of an answer; with nothing after it but promises
+            # it is the claim. Decided once the whole reply has been read.
+            if not any_ran and not working_line:
+                working_line = claim[1].strip()
+            continue
         if claim:
             fam, phrase = claim
             tokens = _family_tokens(fam)
@@ -560,6 +627,8 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
             continue
         if _substantive(core):
             content.append(core)
+    if working_line and not any(not _PROMISE_RE.search(c) for c in content):
+        return working_line
     if not acks:
         return None
     kind, phrase = acks[0]
