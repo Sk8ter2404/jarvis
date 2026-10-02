@@ -100,14 +100,94 @@ def _is_data_dir_page(url: str) -> bool:
         return False
 
 
+def _loaded_bc():
+    """The monolith through _bc() when it is ALREADY loaded, else None -
+    never imports it (a light-tier run has no heavy deps, and a failed import
+    there is a multi-MB code object that coverage pins forever). Going
+    through _bc() keeps a test's patch of it in force."""
+    if "bobert_companion" not in sys.modules:
+        return None
+    try:
+        return _bc()
+    except Exception:
+        return None
+
+
+def _foreground_snapshot():
+    """(hwnd, title, rect) of the foreground window through the running
+    monolith's reader; (None, "", None) without one. Never raises."""
+    bc = _loaded_bc()
+    if bc is None:
+        return None, "", None
+    try:
+        hwnd, title, rect = bc._read_focused_window()
+        return hwnd, (title if isinstance(title, str) else ""), rect
+    except Exception:
+        return None, "", None
+
+
+def _note_browser_tab_open(via: str, url: str, before) -> None:
+    """Record into core.opened_ledger the browser tab a webbrowser.open just
+    brought to the front (S1, 2026-10-02): the foreground window AFTER the
+    open, when it is a browser window and something changed in front of the
+    owner (``before`` is the snapshot taken before the open). Nothing changed
+    in front (the tab landed in a background window, or nothing opened) =
+    nothing recorded: "close that" then honestly says it has no record,
+    instead of closing whatever tab he has in front. Never raises."""
+    try:
+        bc = _loaded_bc()
+        if bc is None:
+            return
+        hwnd, title, rect = _foreground_snapshot()
+        if not isinstance(hwnd, int) or not title:
+            return
+        if (hwnd, title) == (before[0], before[1]):
+            return
+        if _browser_page_title(bc, title) is None:
+            return
+        from core.config import MONITORS
+        from core import monitor_geometry as _mg
+        from core import opened_ledger as _ol
+        mon = _mg.monitor_for_rect(*rect, MONITORS) if rect else None
+        _ol.note_opened(via, url, hwnd=hwnd, kind="tab", monitor=mon,
+                        title=title)
+    except Exception:
+        pass
+
+
+def _streaming_url_fix(url: str, bare_names: bool = True) -> "tuple[str, str]":
+    """(url, note) through core.streaming_search.fix_search_url: a search
+    link the brain GUESSED for a streaming service (live 2026-10-02:
+    hbomax.com/search?q=... is a 404) becomes the verified one, or the
+    service's home page when it has none. ``bare_names=False`` leaves a bare
+    name ("netflix") alone - open_on_monitor launches that as an APP.
+    Never raises."""
+    try:
+        from core import streaming_search as _ss
+        if not bare_names and "." not in url and "/" not in url:
+            return url, ""
+        fix = _ss.fix_search_url(url)
+        if fix.note:
+            print(f"  [streaming-url] {url!r} -> {fix.url!r}", flush=True)
+        return fix.url, fix.note
+    except Exception:
+        return url, ""
+
+
 def _act_open_url(url: str) -> str:
     url = _site_shortcut_url(url) or url
+    url, _fix_note = _streaming_url_fix(url)
     if not (url.startswith(("http://", "https://")) or _is_data_dir_page(url)):
         url = "https://" + url
+    _before = _foreground_snapshot()
     webbrowser.open(url)
     # Small wait so the page has time to start loading before any follow-up
     # see_screen is triggered by the informative-action follow-up loop.
     time.sleep(3.0)
+    _note_browser_tab_open("open_url", url, _before)
+    if _fix_note:
+        return (f"opened {url} ({_fix_note}) — use see_screen to read what "
+                f"loaded")
     return f"opened {url} — use see_screen to read what loaded"
 
 
@@ -132,9 +212,11 @@ def _act_web_search(query: str) -> str:
         # Extraction failed (network, rate-limit, parse miss). Fall through.
 
     url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
+    _before = _foreground_snapshot()
     webbrowser.open(url)
     # Brief wait for page load before follow-up see_screen captures the results.
     time.sleep(3.0)
+    _note_browser_tab_open("web_search", url, _before)
     return f"opened Google search for '{query}' — use see_screen to read the results"
 
 
@@ -1404,13 +1486,13 @@ def _split_close_query(query: str) -> "tuple[str, str | None]":
 
 
 def _on_monitor(w, key: str) -> bool:
-    """True when the centre of window ``w`` lies on monitor ``key``."""
+    """True when the centre of window ``w`` lies on monitor ``key`` (the one
+    rule, core.monitor_geometry.monitor_for_rect)."""
     try:
         from core.config import MONITORS
-        x, y, mw, mh = MONITORS[key]
-        cx = float(w.left) + float(w.width) / 2.0
-        cy = float(w.top) + float(w.height) / 2.0
-        return x <= cx < x + mw and y <= cy < y + mh
+        from core.monitor_geometry import monitor_for_rect
+        return key in MONITORS and monitor_for_rect(
+            w.left, w.top, w.width, w.height, MONITORS) == key
     except Exception:
         return False
 
@@ -1591,6 +1673,83 @@ def _close_browser_tab(bc, w) -> bool:
     except Exception:
         return False
     return True
+
+
+# ─── "close that": the window / tab JARVIS opened last (S1, 2026-10-02) ──
+
+def _same_page_title(bc, a: str, b: str) -> bool:
+    """True when two browser titles name the same page (browser suffix,
+    invisible marks and spacing ignored)."""
+    def _norm(t):
+        t = bc._strip_bidi_and_nbsp(t or "")
+        page = _browser_page_title(bc, t)
+        return " ".join((page if page is not None else t).lower().split())
+    try:
+        return bool(_norm(a)) and _norm(a) == _norm(b)
+    except Exception:
+        return False
+
+
+def _act_close_last_opened(_arg: str = "") -> str:
+    """Close the window or tab JARVIS ITSELF opened last
+    (core.opened_ledger), and nothing else: "close that" right after JARVIS
+    opened something, and the close half of "close that and open X instead".
+
+      * a window JARVIS made (open_on_monitor, the streaming actions) is
+        closed by its handle;
+      * a tab JARVIS added to an existing browser window (open_url,
+        web_search) is closed only while that window still shows the page
+        JARVIS opened - otherwise the tab in front may be the owner's, and it
+        is left alone;
+      * no record (nothing opened in the last CLOSE_MAX_AGE_S) closes nothing
+        and says so, so the follow-up round can ask which window he means.
+    Never closes JARVIS's own host (FORBIDDEN_TARGETS)."""
+    from core import opened_ledger as _ol
+    entry = _ol.last_opened()
+    if entry is None:
+        mins = int(_ol.CLOSE_MAX_AGE_S // 60)
+        return ("couldn't close it: I have no record of opening a window or "
+                f"tab in the last {mins} minutes, so I left every window as "
+                "it is - ask which one he means")
+    bc = _bc()
+    label = _ol.describe(entry)
+    try:
+        import pygetwindow as gw
+        wins = gw.getAllWindows()
+    except Exception:
+        return (f"couldn't close the {label} I opened: window control "
+                "(pygetwindow) isn't available")
+    win = None
+    if entry.hwnd is not None:
+        win = next((w for w in wins
+                    if getattr(w, "_hWnd", None) == entry.hwnd), None)
+    if win is None:
+        _ol.forget(entry)
+        return f"the {label} I opened is already closed"
+    title = getattr(win, "title", "") or ""
+    if any(t in title.lower() for t in bc.FORBIDDEN_TARGETS):
+        _ol.forget(entry)
+        return (f"REFUSED: '{title}' looks like my own host process, so I "
+                "didn't close it")
+    if entry.kind == "tab":
+        if (_browser_page_title(bc, title) is None
+                or not _same_page_title(bc, title, entry.title)):
+            return (f"didn't close it: the tab in front of that browser "
+                    f"window is no longer the {label} I opened, so it may be "
+                    "his own - I left it; ask him to name the tab")
+        if not _close_browser_tab(bc, win):
+            return (f"couldn't bring the {label} I opened to the front, so "
+                    "I left it open")
+        _ol.forget(entry)
+        return f"closed the {label} I opened (just that tab)"
+    try:
+        win.close()
+    except Exception as e:
+        if _close_refused(e) or _window_is_elevated(win):
+            return _elevated_close_line([title], 0)
+        return f"couldn't close the {label} I opened: {e}"
+    _ol.forget(entry)
+    return f"closed the {label} I opened"
 
 
 # ─── UI type (Phase 4D) ────────────────────────────────────────────────
@@ -1965,6 +2124,27 @@ def _act_play_streaming(args: str) -> str:
     return bc._streaming_auto_play("youtube", args.strip())
 
 
+def _act_streaming_search(args: str) -> str:
+    """streaming_search, <service> | <title> - open the title's search page
+    on a video service from the VERIFIED table (core/streaming_search.py),
+    or the service's home page, said so, when it has no verified search link
+    (Disney+). Never a guessed URL (S2, 2026-10-02: hbomax.com/search?q= was
+    a 404). Stops on a sign-in wall."""
+    bc = _bc()
+    from core import streaming_search as _ss
+    if "|" in args:
+        raw_service, query = (s.strip() for s in args.split("|", 1))
+    elif "," in args:
+        raw_service, query = (s.strip() for s in args.split(",", 1))
+    else:
+        return "format: streaming_search, <service> | <title>"
+    key = _ss.canon_service(raw_service)
+    if key is None:
+        return (f"unknown streaming service '{raw_service}'. Known: "
+                + ", ".join(sorted(_ss.SERVICES)))
+    return bc._streaming_open_search(key, query)
+
+
 # ─── UI click + hotkey (Phase 4F) ──────────────────────────────────────
 
 def _act_click(args: str) -> str:
@@ -1994,6 +2174,8 @@ def _act_click(args: str) -> str:
             f"Ask the user to close it manually if they really want to."
         )
 
+    if monitor is None:
+        monitor = _click_monitor_pin(bc)
     coords = bc.find_click_target(args, monitor=monitor)
     if coords is None:
         target = f"'{args}' on {monitor} monitor" if monitor else f"'{args}'"
@@ -2003,6 +2185,62 @@ def _act_click(args: str) -> str:
     except bc.UIFailsafeError as e:
         return str(e)
     return f"clicked '{args}' at {coords}"
+
+
+def _click_monitor_pin(bc) -> "str | None":
+    """The monitor a description click is aimed at when the model named none
+    (S4, 2026-10-02): the one the owner's own words name ("... on the left
+    monitor"), else the one JARVIS opened the page on (core.opened_ledger,
+    PAGE_MAX_AGE_S), else None - the whole desktop, as before. Live: a click
+    meant for the page on the MIDDLE monitor photographed all four monitors
+    shrunk to 1568 px and landed at (-2325, 1165) on the LEFT one. Never
+    raises."""
+    try:
+        from core.config import MONITORS
+        from core import monitor_geometry as _mg
+        try:
+            said = bc._turn_user_text()
+        except Exception:
+            said = ""
+        named = _mg.monitor_named_in(said if isinstance(said, str) else "",
+                                     MONITORS)
+        if named:
+            print(f"  [click] aimed at the {named} monitor (named in the "
+                  "request)", flush=True)
+            return named
+        page = _opened_page_now()
+        if page is not None and page[1] in MONITORS:
+            print(f"  [click] aimed at the {page[1]} monitor (where I opened "
+                  "the page)", flush=True)
+            return page[1]
+    except Exception:
+        return None
+    return None
+
+
+def _opened_page_now():
+    """(entry, monitor) for the page JARVIS opened last (core.opened_ledger,
+    PAGE_MAX_AGE_S) while its window STILL EXISTS - the monitor it is on
+    NOW (he may have moved it), else the one it opened on - or None. A
+    record whose window is gone (or a test's fake handle) aims nothing.
+    Never raises."""
+    try:
+        from core.config import MONITORS
+        from core import monitor_geometry as _mg
+        from core import opened_ledger as _ol
+        entry = _ol.last_opened(_ol.PAGE_MAX_AGE_S)
+        if entry is None or entry.hwnd is None:
+            return None
+        import pygetwindow as gw
+        win = next((w for w in gw.getAllWindows()
+                    if getattr(w, "_hWnd", None) == entry.hwnd), None)
+        if win is None:
+            return None
+        mon = _mg.monitor_for_rect(win.left, win.top, win.width, win.height,
+                                   MONITORS) or entry.monitor
+        return (entry, mon) if mon else None
+    except Exception:
+        return None
 
 
 def _act_hotkey(args: str) -> str:
@@ -2729,17 +2967,112 @@ _SEE_SCREEN_DEFAULT_Q = (
     "anything that looks wrong (errors, warnings, typos, broken layout).")
 
 
-def _see_screen_question(raw: str, user_text: str = "") -> str:
-    """The question to ask vision: `raw` unless it is empty or a file
-    reference; then the owner's own words for this turn, else the default."""
-    q = (raw or "").strip()
-    if q and not _SEE_SCREEN_FILE_REF_RE.search(q):
-        return q
+# S3 (2026-10-02). Live 16:13-16:14: the model passed a bare URL as the
+# question ([ACTION: see_screen, https://...]) and vision answered "which
+# monitor has this URL" - from the URL text in JARVIS's own console window;
+# then "Jarvis, continue" with no question became 'The owner asked: "Jarvis
+# continued."', and vision answered from the CHAT WINDOW on another monitor.
+# A bare URL, a control word or nothing at all is not a question about the
+# page: ask about the page JARVIS opened instead.
+_SEE_SCREEN_URL_RE = re.compile(
+    r"(?i)^\s*(?:https?://\S+|www\.\S+|[\w-]+(?:\.[\w-]+)+(?:[/?#]\S*)?)\s*$")
+# Words that steer the turn but ask nothing ("continue", "go on", "try
+# again"); Parakeet writes "continue" as "continued".
+_CONTROL_WORDS = frozenset({
+    "continue", "continued", "continuing", "go", "on", "ahead", "keep",
+    "going", "carry", "try", "again", "proceed", "next", "resume", "do", "it",
+    "okay", "ok", "yes", "yeah", "yep", "sure", "please", "now", "then",
+    "and", "jarvis", "sir", "alright", "right", "so", "well", "same",
+    "one", "more", "time",
+})
+# Words that alone are only an address, never a steer.
+_CONTROL_ADDRESS = frozenset({"jarvis", "sir", "and"})
+_SEE_SCREEN_PAGE_Q = (
+    "What is on the screen in the browser window showing {page}? Read the "
+    "main content, search results or error messages.")
+_VISION_CHAT_GUARD = (
+    " Ignore chat and assistant windows (the Claude app, the JARVIS console, "
+    "terminals) unless the question is about them.")
+# A question ABOUT a chat / messaging / terminal window keeps the note out
+# (the Teams nudger asks about Teams' chat sidebar).
+_CHAT_TOPIC_RE = re.compile(
+    r"(?i)\b(?:chats?|assistant|claude|jarvis|console|terminals?|powershell|"
+    r"command\s+prompt|transcript|logs?|teams|slack|discord|messenger|"
+    r"e-?mail|inbox|mail)\b")
+
+
+def _is_control_utterance(text) -> bool:
+    """True for words that steer the turn but ask nothing: "Jarvis,
+    continue.", "go on", "try again please". Never raises."""
+    try:
+        words = re.findall(r"[a-z']+", str(text or "").lower())
+        return (bool(words) and all(w in _CONTROL_WORDS for w in words)
+                and any(w not in _CONTROL_ADDRESS for w in words))
+    except Exception:
+        return False
+
+
+def _see_screen_plan(raw: str, user_text: str = "", opened=None):
+    """(question, page) for see_screen. ``page`` is the URL / name of the
+    page the question is about when the question was REWRITTEN to the page
+    question (a bare URL, a control word or nothing, with a page to ask
+    about), else None. ``opened``: the core.opened_ledger entry of the page
+    JARVIS opened last, or None.
+
+      * a real question passes through untouched;
+      * a bare URL -> the page question about that URL;
+      * empty / a file name / a control word -> the owner's own words when
+        they ask something; for a control word ("continue") the page JARVIS
+        opened last; else the generic describe-the-screen default."""
+    q = " ".join((raw or "").split())
+    target = getattr(opened, "target", "") or ""
+    file_ref = bool(q) and bool(_SEE_SCREEN_FILE_REF_RE.search(q))
+    if q and not file_ref and _SEE_SCREEN_URL_RE.match(q):
+        return _SEE_SCREEN_PAGE_Q.format(page=q), q
+    if q and not file_ref and not _is_control_utterance(q):
+        return q, None
     ut = " ".join((user_text or "").split())
-    if ut:
+    if ut and not _is_control_utterance(ut):
         return (f'The owner asked: "{ut}". Answer that from what is on '
-                "the screen.")
-    return _SEE_SCREEN_DEFAULT_Q
+                "the screen."), None
+    if target and (ut or q):
+        return _SEE_SCREEN_PAGE_Q.format(page=target), target
+    return _SEE_SCREEN_DEFAULT_Q, None
+
+
+def _see_screen_question(raw: str, user_text: str = "", opened=None) -> str:
+    """The question to ask vision (see _see_screen_plan)."""
+    return _see_screen_plan(raw, user_text, opened)[0]
+
+
+def _with_chat_guard(q: str) -> str:
+    """``q`` plus the ignore-the-chat-windows note, unless ``q`` is about a
+    chat / assistant / terminal window itself."""
+    if _CHAT_TOPIC_RE.search(q or ""):
+        return q
+    return (q or "").rstrip() + _VISION_CHAT_GUARD
+
+
+def _page_wall_result(answer, opened) -> str:
+    """S5: when the vision answer about the page JARVIS opened on a streaming
+    service says it is a sign-in wall ("Sign In", "Log in") or an error page
+    ("Oops ... isn't working"), the one plain TERMINAL line that ends the
+    turn - no clicking around a page that cannot play; else "". Never
+    raises."""
+    try:
+        from core import streaming_search as _ss
+        from core.failure_markers import TERMINAL_FAILURE_PREFIX
+        key = _ss.service_for_url(getattr(opened, "target", "") or "")
+        if not key:
+            return ""
+        kind = _ss.wall_kind(answer)
+        if not kind:
+            return ""
+        print(f"  [vision] {_ss.service_name(key)} page is a {kind} wall - "
+              "stopping", flush=True)
+        return TERMINAL_FAILURE_PREFIX + _ss.wall_line(key, kind)
+    except Exception:
+        return ""
 
 
 # "Read this page" means the window he is looking at (NEW #11, 2026-10-02).
@@ -2824,7 +3157,11 @@ def _act_see_screen(question: str) -> str:
         _ut = bc._turn_user_text()
     except Exception:
         _ut = ""
-    q = _see_screen_question(question, _ut if isinstance(_ut, str) else "")
+    # The page JARVIS opened last, while its window still exists (S3/S4/S5).
+    _page_now = _opened_page_now()
+    _opened = _page_now[0] if _page_now else None
+    q, _page = _see_screen_plan(question, _ut if isinstance(_ut, str) else "",
+                                _opened)
 
     # Per-intent budget guard. parse_and_run_actions resets the counter at
     # the start of every dispatch; once exhausted, refuse with a hint that
@@ -2855,6 +3192,15 @@ def _act_see_screen(question: str) -> str:
         if result is not None:
             return result
 
+    # The page question about the page JARVIS opened: only the monitor that
+    # page is on (S4) - one image, no chat window beside it to answer from.
+    _about_opened = bool(_page and _opened is not None
+                         and _same_site(_page, _opened.target))
+    if monitor is None and _about_opened and _page_now[1] in MONITORS:
+        monitor = _page_now[1]
+        print(f"  [vision] looking at the {monitor} monitor (where I opened "
+              "the page)", flush=True)
+
     # Default behaviour: no specific monitor requested -> capture every
     # monitor in MONITORS and send them all to vision in one call.
     if monitor is None:
@@ -2876,10 +3222,30 @@ def _act_see_screen(question: str) -> str:
     if png is None:
         return "could not capture screen"
     print("  [vision] Asking Claude (this takes a few seconds)...", flush=True)
-    result = bc.ask_vision(q, png)
+    result = bc.ask_vision(_with_chat_guard(q), png)
     print(f"  [vision] Got answer ({len(result)} chars)", flush=True)
     bc._push_screen_context(monitor, q, result, {monitor: png})
+    if _about_opened:
+        _wall = _page_wall_result(result, _opened)
+        if _wall:
+            return _wall
     return result
+
+
+def _same_site(a, b) -> bool:
+    """True when two URLs (or a URL and a bare host) are on the same site
+    (the same streaming service, or the same host without "www.")."""
+    try:
+        from core import streaming_search as _ss
+        ka, kb = _ss.service_for_url(a), _ss.service_for_url(b)
+        if ka or kb:
+            return ka == kb
+        ha = urllib.parse.urlsplit(a if "://" in a else "https://" + a).hostname
+        hb = urllib.parse.urlsplit(b if "://" in b else "https://" + b).hostname
+        strip = (lambda h: (h or "").lower().removeprefix("www."))
+        return bool(ha) and strip(ha) == strip(hb)
+    except Exception:
+        return False
 
 
 # ─── Replay last non-destructive action (Phase 4H) ─────────────────────
@@ -3971,6 +4337,9 @@ def _act_open_on_monitor(args: str) -> str:
         return "format: open_on_monitor, <monitor_name> | <url-or-app>"
     # "youtube cello" (the model's "youtube, cello") is a search, not an app.
     target = _site_shortcut_url(target) or target
+    # A guessed streaming search link / a bare service name ("HBO Max") ->
+    # the verified link or the service's home page (S2, 2026-10-02).
+    target, _fix_note = _streaming_url_fix(target, bare_names=False)
     m = _YOUTUBE_SEARCH_RE.match(target)
     if m:
         target = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(m.group(1).strip())
@@ -4111,6 +4480,19 @@ def _act_open_on_monitor(args: str) -> str:
             _place_on_monitor(new_window, mx, my)
         except Exception as e:
             return f"opened {target} but failed to move window: {e}"
+        # The window JARVIS made: "close that" closes exactly this one, and a
+        # click / a look at "the page" with no monitor named aims here (S1/S4).
+        try:
+            from core import opened_ledger as _ol
+            _ol.note_opened("open_on_monitor", target,
+                            hwnd=getattr(new_window, "_hWnd", None),
+                            kind="window", monitor=monitor_name,
+                            title=getattr(new_window, "title", "") or "")
+        except Exception:
+            pass
+        if _fix_note:
+            return (f"opened '{target}' on {monitor_name} monitor "
+                    f"(at {mx},{my}) - {_fix_note}")
         return f"opened '{target}' on {monitor_name} monitor (at {mx},{my})"
 
     if reused is not None:
@@ -5005,6 +5387,7 @@ __all__ = [
     "_act_focus_window",
     "_act_minimize_window",
     "_act_close_window",
+    "_act_close_last_opened",
     # Phase 4D — UI type (with shell-cmd refusal)
     "_act_type",
     # Phase 4E — music skip/back
@@ -5026,6 +5409,7 @@ __all__ = [
     "_act_show_last_diagnostic",
     # Phase 4F — streaming dispatcher
     "_act_play_streaming",
+    "_act_streaming_search",
     # Phase 4F — UI click + hotkey
     "_act_click",
     "_act_hotkey",

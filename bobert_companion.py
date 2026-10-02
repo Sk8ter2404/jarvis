@@ -1715,6 +1715,13 @@ from core import topic_hygiene as _topic_hygiene  # noqa: E402
 # recorded -- one live flag every writer below reads (core/guest_mode.py).
 from core import guest_mode as _guest_mode  # noqa: E402
 
+# The verified streaming-service links (S2), the ledger of what JARVIS itself
+# opened (S1 "close that"), and the monitor geometry + vision labels (S4) -
+# 2026-10-02, all stdlib-only (CI-light tier).
+from core import streaming_search as _streaming_search  # noqa: E402
+from core import opened_ledger as _opened_ledger  # noqa: E402
+from core import monitor_geometry as _monitor_geometry  # noqa: E402
+
 
 def _owner_vocab() -> frozenset:
     """Words the owner has used in >= 2 separate logged turns (the
@@ -3526,6 +3533,7 @@ _action_history_lock = threading.Lock()
 # step gets the normal confirmation/pushback path.
 _DESTRUCTIVE_REPLAY_ACTIONS = frozenset({
     "close_window",
+    "close_last_opened",
     "kill_process",
     "restart",
     "upgrade",
@@ -4754,19 +4762,9 @@ def _active_window_center():
 
 def _virtual_screen_bounds():
     """Compute (x, y, w, h) covering every monitor in MONITORS. Returns a
-    safe default if MONITORS is empty/misconfigured."""
-    xs = []
-    ys = []
-    for m in MONITORS.values():
-        try:
-            mx, my, mw, mh = m
-            xs.extend([mx, mx + mw])
-            ys.extend([my, my + mh])
-        except Exception:
-            continue
-    if not xs or not ys:
-        return 0, 0, 2560, 1440
-    return min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
+    safe default if MONITORS is empty/misconfigured. ONE rule:
+    core.monitor_geometry.virtual_bounds (2026-10-02)."""
+    return _monitor_geometry.virtual_bounds(MONITORS, default=(0, 0, 2560, 1440))
 
 
 def _own_process_start_time() -> float:
@@ -25942,6 +25940,42 @@ def take_all_monitor_screenshots(max_dim: int = 1024) -> dict[str, bytes]:
 
 
 def ask_vision_multi(question: str, images: dict[str, bytes]) -> str:
+    """_ask_vision_multi_raw, with every "Image #N" in the answer rewritten
+    to the monitor image N is ("the MIDDLE monitor") - S4, 2026-10-02: live,
+    local vision named "Image #4 (TOP monitor)" for a page and "the MIDDLE
+    monitor" for the same page a round later, so the follow-up rounds now see
+    ONE naming (core.monitor_geometry.canonical_monitor_refs)."""
+    answer = _ask_vision_multi_raw(question, images)
+    try:
+        return _monitor_geometry.canonical_monitor_refs(
+            answer, list((images or {}).keys()))
+    except Exception:
+        return answer
+
+
+# Ignore-the-chat note on every multi-monitor look (S3, 2026-10-02): live, a
+# question about the page was answered from JARVIS's own console / the
+# Claude app, whose text named the same URL. core.actions._with_chat_guard
+# adds it to a single-monitor look; a question ABOUT a chat window keeps it out.
+_VISION_MULTI_CHAT_NOTE = (
+    "Ignore chat and assistant windows (the Claude app, the JARVIS console, "
+    "terminals) unless the question is about them.")
+
+
+def _vision_multi_intro(question: str, names) -> str:
+    """The ONE intro both vision routes put in front of a multi-monitor
+    question: the same "Image N = NAME monitor" labels, answer-by-NAME, and
+    the chat note unless the question is about a chat window."""
+    intro = _monitor_geometry.multi_monitor_intro(names)
+    try:
+        from core.actions import _CHAT_TOPIC_RE
+        about_chat = bool(_CHAT_TOPIC_RE.search(question or ""))
+    except Exception:
+        about_chat = False
+    return intro if about_chat else intro + " " + _VISION_MULTI_CHAT_NOTE
+
+
+def _ask_vision_multi_raw(question: str, images: dict[str, bytes]) -> str:
     """Send several labelled screenshots to Claude in a single message and
     return its answer. Each image is preceded by a text block naming the
     monitor it came from, so the model can refer to them in its answer.
@@ -25963,16 +25997,8 @@ def ask_vision_multi(question: str, images: dict[str, bytes]) -> str:
         # multi-image with positional ordering preserved.
         names = list(images.keys())
         pngs  = [images[n] for n in names]
-        labels = "\n".join(
-            f"Image #{i+1} = {n.upper()} monitor" for i, n in enumerate(names)
-        )
-        prompt = (
-            f"You are looking at {len(images)} monitors at once. They are "
-            f"provided in this order:\n{labels}\n\n"
-            f"When answering, name which monitor(s) the relevant content is on. "
-            f"If the question doesn't apply to a given monitor, you can skip it.\n\n"
-            f"Question: {question}"
-        )
+        prompt = (f"{_vision_multi_intro(question, names)}\n\n"
+                  f"Question: {question}")
         text = _call_local_vision(prompt, pngs, max_tokens=900)
         return f"[local-vision] {text}" if text else None
 
@@ -25999,18 +26025,15 @@ def ask_vision_multi(question: str, images: dict[str, bytes]) -> str:
             "(screen vision requires the anthropic SDK or a local VLM via Ollama)")
 
     try:
-        intro = (
-            f"You are looking at {len(images)} monitors at once. Each image "
-            f"below is labelled with which monitor it is. When answering, "
-            f"mention which monitor(s) the relevant content is on. If "
-            f"something is on only one monitor, name that monitor. If the "
-            f"question doesn't apply to a given monitor, you can skip it."
-        )
+        names = list(images.keys())
+        intro = _vision_multi_intro(question, names)
+        labels = _monitor_geometry.monitor_image_labels(names)
 
         content: list = [{"type": "text", "text": intro}]
-        for name, png in images.items():
+        for label, (name, png) in zip(labels, images.items()):
             b64 = base64.standard_b64encode(png).decode("utf-8")
-            content.append({"type": "text", "text": f"--- {name.upper()} monitor ---"})
+            # The same "Image N = NAME monitor" label the local route lists.
+            content.append({"type": "text", "text": label})
             content.append({
                 "type": "image",
                 "source": {"type": "base64", "media_type": "image/png", "data": b64},
@@ -26195,10 +26218,8 @@ def find_click_target(description: str, monitor: str | None = None) -> tuple[int
         full_w, full_h = full_img.size
 
     # Scale pass-1 coords from low-res image space → full-res image space
-    scale_to_full_x = full_w / w1
-    scale_to_full_y = full_h / h1
-    cx_full = int(rx1 * scale_to_full_x)
-    cy_full = int(ry1 * scale_to_full_y)
+    cx_full, cy_full = _monitor_geometry.scale_point(
+        rx1, ry1, (w1, h1), (full_w, full_h))
 
     refined_x = cx_full
     refined_y = cy_full
@@ -26247,6 +26268,8 @@ def find_click_target(description: str, monitor: str | None = None) -> tuple[int
     #     display scaled >100% — where the native grab is LARGER than its logical
     #     size — is scaled back down before the offset is applied. At 100% the
     #     ratio is exactly 1.0, so a single-monitor / un-scaled rig is unchanged.
+    # The arithmetic is core.monitor_geometry.image_point_to_screen (S4,
+    # 2026-10-02: unit-tested on the 4-monitor, negative-origin layout).
     if monitor and monitor in MONITORS:
         mx, my, lw, lh = MONITORS[monitor]
         sx = (lw / full_w) if full_w else 1.0
@@ -26255,7 +26278,8 @@ def find_click_target(description: str, monitor: str | None = None) -> tuple[int
             print(f"  [vision] DPI scale: monitor={monitor} "
                   f"native={full_w}x{full_h} logical={lw}x{lh} "
                   f"→ click x({sx:.3f},{sy:.3f})", flush=True)
-        return int(mx + refined_x * sx), int(my + refined_y * sy)
+        return _monitor_geometry.image_point_to_screen(
+            refined_x, refined_y, (full_w, full_h), (mx, my, lw, lh))
     # No monitor specified — Pass-2 captured the whole virtual screen (mss
     # monitors[0]). Use the LOGICAL origin (config-derived virtual bounds, which
     # is what pyautogui clicks in) but scale by the LIVE captured native size so
@@ -26275,7 +26299,8 @@ def find_click_target(description: str, monitor: str | None = None) -> tuple[int
     if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
         print(f"  [vision] DPI scale: virtual native={full_w}x{full_h} "
               f"logical={vw}x{vh} → click x({sx:.3f},{sy:.3f})", flush=True)
-    return int(vx + refined_x * sx), int(vy + refined_y * sy)
+    return _monitor_geometry.image_point_to_screen(
+        refined_x, refined_y, (full_w, full_h), (vx, vy, vw, vh))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -26615,7 +26640,8 @@ def _find_browser_window_matching(terms, exclude=None):
     return None
 
 
-def _adopt_media_window(cfg: dict, service_key: str, before: set) -> None:
+def _adopt_media_window(cfg: dict, service_key: str, before: set,
+                        url: str = "", fg_before=None) -> None:
     """Find the browser window a media open just created (a title match that
     was NOT in the `before` snapshot), record its handle as THE window JARVIS
     owns for `service_key`, bring it forward, maximize it on-screen, and pin
@@ -26625,7 +26651,12 @@ def _adopt_media_window(cfg: dict, service_key: str, before: set) -> None:
     playlist flow had copied only the record + maximize half, so its vision
     steps photographed the whole 4-monitor desktop, downscaled until playlist
     tiles were unreadable. No new window → nothing is recorded, adopted or
-    moved: better an extra window left open than the owner's closed."""
+    moved: better an extra window left open than the owner's closed.
+
+    ``fg_before`` (the foreground (hwnd, title) taken just before the open):
+    when the page became a TAB in one of his windows instead, the tab is
+    pinned for vision and noted in core.opened_ledger - see
+    _adopt_media_tab - but never recorded as the media window."""
     terms = cfg.get("tab_match")
     if not terms:
         return
@@ -26633,6 +26664,8 @@ def _adopt_media_window(cfg: dict, service_key: str, before: set) -> None:
     if win is None:
         print(f"  [auto-play] no NEW {service_key} window found - not "
               f"recording a handle", flush=True)
+        if fg_before is not None:
+            _adopt_media_tab(cfg, service_key, url, fg_before)
         return
     # Record the handle of the window JARVIS just opened so the NEXT media
     # request closes exactly this window (see _JARVIS_MEDIA_WINDOW_HWND)
@@ -26665,6 +26698,54 @@ def _adopt_media_window(cfg: dict, service_key: str, before: set) -> None:
     if mon:
         cfg["vision_monitor"] = mon
         print(f"  [auto-play] pinning vision to monitor '{mon}'", flush=True)
+    # The window JARVIS opened: "close that" closes exactly this one, and a
+    # look / click at "the page" aims at its monitor (core.opened_ledger).
+    if hw is not None:
+        _opened_ledger.note_opened(
+            "play_streaming", url or cfg.get("home", ""), hwnd=hw,
+            kind="window", monitor=mon,
+            title=getattr(win, "title", "") or "")
+
+
+def _foreground_now():
+    """(hwnd, title) of the foreground window, or (None, "")."""
+    try:
+        hwnd, title, _rect = _read_focused_window()
+        return hwnd, title or ""
+    except Exception:
+        return None, ""
+
+
+def _adopt_media_tab(cfg: dict, service_key: str, url: str, fg_before) -> None:
+    """The media page became a TAB in one of his browser windows (no new
+    window): when the foreground CHANGED since ``fg_before`` to a browser
+    window whose title is this service's (cfg["tab_match"]), pin vision to
+    its monitor (so the sign-in check and the result click look at the page,
+    not the whole desktop - S4/S5, 2026-10-02) and note the TAB in
+    core.opened_ledger (so "close that" closes just that tab, and only while
+    it is still in front). It is NEVER recorded as the media window
+    (_JARVIS_MEDIA_WINDOW_HWND): the next open would close his whole window.
+    Unchanged foreground = nothing. Never raises."""
+    try:
+        hwnd, title, rect = _read_focused_window()
+        if not hwnd or not title or (hwnd, title) == tuple(fg_before or ())[:2]:
+            return
+        low = _strip_bidi_and_nbsp(title).lower()
+        if not any(low.endswith(s) for s in _BROWSER_CHROME_SUFFIXES):
+            return
+        if not any(t in low for t in (cfg.get("tab_match") or ())):
+            return
+        mon = (_monitor_geometry.monitor_for_rect(*rect, MONITORS)
+               if rect else None)
+        if mon:
+            cfg["vision_monitor"] = mon
+            print(f"  [auto-play] the {service_key} page is a tab on the "
+                  f"'{mon}' monitor - pinning vision there", flush=True)
+        _opened_ledger.note_opened("play_streaming", url or cfg.get("home", ""),
+                                   hwnd=hwnd, kind="tab", monitor=mon,
+                                   title=title)
+    except Exception:
+        pass
 
 
 # ── ordinary browser windows: visible + maximized (2026-10-01) ────────────
@@ -27311,11 +27392,26 @@ APPLE_MUSIC_TAB_POST_WAIT   = 0.6   # gap after the last Tab before Enter
 # "Playlists" link first.
 APPLE_MUSIC_PLAYLIST_PLAY_TEXT = "Shuffle"
 
+# The video services' home and search links come from ONE verified table,
+# core/streaming_search.py (S2, 2026-10-02): every pattern there was checked
+# against the live site, and a service with no verified search (Disney+) has
+# search_url None - _streaming_auto_play then opens the home page and says so
+# instead of guessing. Music services keep their own links below.
+def _ss_home(key: str) -> str:
+    return _streaming_search.SERVICES[key].home
+
+
+def _ss_search(key: str):
+    """The verified search URL template ({q}) for ``key``, or None."""
+    return _streaming_search.SERVICES[key].search
+
+
 _STREAMING_SERVICES = {
     "netflix": {
         "name":             "Netflix",
-        "home":             "https://www.netflix.com",
-        "search_url":       "https://www.netflix.com/search?q={q}",
+        "home":             _ss_home("netflix"),
+        "search_url":       _ss_search("netflix"),
+        "sign_in_check":    True,
         "tab_match":        ["netflix"],
         "load_wait":        5.0,
         "post_click":       3.5,
@@ -27327,8 +27423,9 @@ _STREAMING_SERVICES = {
     "prime_video": {
         "name":             "Prime Video",
         "tab_match":        ["prime video"],
-        "home":             "https://www.primevideo.com",
-        "search_url":       "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}&ie=UTF8",
+        "home":             _ss_home("prime_video"),
+        "search_url":       _ss_search("prime_video"),
+        "sign_in_check":    True,
         "load_wait":        5.0,
         "post_click":       3.5,
         "result_hint":      "the first movie or TV show poster in the Prime Video search results",
@@ -27339,8 +27436,11 @@ _STREAMING_SERVICES = {
     "disney_plus": {
         "name":             "Disney+",
         "tab_match":        ["disney+", "disneyplus"],
-        "home":             "https://www.disneyplus.com",
-        "search_url":       "https://www.disneyplus.com/search?q={q}",
+        "home":             _ss_home("disney_plus"),
+        # None: Disney+ has NO verified search link (core/streaming_search.py)
+        # - its home page opens and JARVIS says so.
+        "search_url":       _ss_search("disney_plus"),
+        "sign_in_check":    True,
         "load_wait":        5.0,
         "post_click":       3.5,
         "result_hint":      "the first show or movie tile in the Disney+ search results",
@@ -27351,8 +27451,9 @@ _STREAMING_SERVICES = {
     "hulu": {
         "name":             "Hulu",
         "tab_match":        ["hulu"],
-        "home":             "https://www.hulu.com",
-        "search_url":       "https://www.hulu.com/search?q={q}",
+        "home":             _ss_home("hulu"),
+        "search_url":       _ss_search("hulu"),
+        "sign_in_check":    True,
         "load_wait":        5.0,
         "post_click":       3.5,
         "result_hint":      "the first show or movie tile in the Hulu search results",
@@ -27361,15 +27462,33 @@ _STREAMING_SERVICES = {
         "fullscreen_wait":  3.5,
     },
     "max": {
-        "name":             "Max",
+        "name":             "HBO Max",
         # "max" alone is a dangerously generic substring; require forms only
         # the real Max tab title produces.
-        "tab_match":        ["hbo max", "max |", "play.max"],
-        "home":             "https://play.max.com",
-        "search_url":       "https://play.max.com/search?q={q}",
+        "tab_match":        ["hbo max", "max |", "play.max", "play.hbomax"],
+        # play.max.com 301-redirects to play.hbomax.com; the guessed
+        # www.hbomax.com/search is a 404 (2026-10-02, core/streaming_search.py).
+        "home":             _ss_home("max"),
+        "search_url":       _ss_search("max"),
+        "sign_in_check":    True,
         "load_wait":        5.0,
         "post_click":       3.5,
         "result_hint":      "the first show or movie tile in the Max search results",
+        "play_hint":        "the Play button on the title's detail page",
+        "fullscreen_key":   "f",
+        "fullscreen_wait":  3.5,
+    },
+    # Apple TV (the service Apple renamed from "Apple TV+" in 2025): its web
+    # search is verified (tv.apple.com/search?term=, core/streaming_search.py).
+    "apple_tv": {
+        "name":             "Apple TV",
+        "tab_match":        ["apple tv"],
+        "home":             _ss_home("apple_tv"),
+        "search_url":       _ss_search("apple_tv"),
+        "sign_in_check":    True,
+        "load_wait":        5.0,
+        "post_click":       3.5,
+        "result_hint":      "the first show or movie tile in the Apple TV search results",
         "play_hint":        "the Play button on the title's detail page",
         "fullscreen_key":   "f",
         "fullscreen_wait":  3.5,
@@ -27499,8 +27618,8 @@ _STREAMING_SERVICES = {
     },
     "youtube": {
         "name":             "YouTube",
-        "home":             "https://www.youtube.com",
-        "search_url":       "https://www.youtube.com/results?search_query={q}",
+        "home":             _ss_home("youtube"),
+        "search_url":       _ss_search("youtube"),
         "tab_match":        ["youtube"],
         "load_wait":        3.5,
         "post_click":       0.0,
@@ -27568,7 +27687,12 @@ _STREAMING_ALIASES = {
 def _normalize_service(s: str) -> str:
     key = re.sub(r"[\s\-]+", "_", s.strip().lower())
     key = key.replace("+", "_plus")
-    return _STREAMING_ALIASES.get(key, key)
+    key = _STREAMING_ALIASES.get(key, key)
+    if key not in _STREAMING_SERVICES:
+        # Spoken forms the alias table lacks ("hbo max", "apple tv+") - the
+        # verified table's names (core/streaming_search.canon_service).
+        key = _streaming_search.canon_service(s) or key
+    return key
 
 
 def _vision_answer_is_yes(answer: str) -> bool:
@@ -28337,6 +28461,88 @@ def _youtube_resolve_video(query: str) -> dict | None:
         return None
 
 
+def _streaming_page_wall(cfg: dict, service_key: str) -> str:
+    """S5 (2026-10-02): the TERMINAL line when the service page JARVIS just
+    opened is a sign-in wall ("Sign In" / "Log in") or an error page ("Oops
+    ... isn't working"), else "". One vision look at the PINNED player
+    monitor (cfg["vision_monitor"], set by _adopt_media_window) with the
+    strict SIGNIN / ERROR / OK question of core.streaming_search; nothing
+    pinned, vision off, a service without "sign_in_check" or an unclear
+    answer = "" (the flow goes on as before). The capture goes through
+    take_screenshot, so the privacy blocklist gate applies. Never raises."""
+    try:
+        if not cfg.get("sign_in_check") or not SCREEN_VISION_ENABLED:
+            return ""
+        mon = cfg.get("vision_monitor")
+        if not mon:
+            return ""
+        png = take_screenshot(monitor=mon)
+        if png is None:
+            return ""
+        verdict = _streaming_search.parse_wall_verdict(
+            ask_vision(_streaming_search.wall_question(service_key), png))
+        if verdict not in ("sign_in", "error"):
+            return ""
+        from core.failure_markers import TERMINAL_FAILURE_PREFIX
+        print(f"  [auto-play] {cfg.get('name', service_key)} page is a "
+              f"{verdict} wall - not clicking", flush=True)
+        return TERMINAL_FAILURE_PREFIX + _streaming_search.wall_line(
+            service_key, verdict)
+    except Exception as e:
+        print(f"  [auto-play] sign-in check skipped: {e}", flush=True)
+        return ""
+
+
+def _streaming_open_search(service_key: str, query: str,
+                           via: str = "streaming_search",
+                           home_is_final: bool = False) -> str:
+    """Open ``query``'s search page on a video service from the VERIFIED
+    table (core/streaming_search.py) in JARVIS's own media window, or the
+    service's HOME page when the service has no verified search link - and
+    say which (S2, 2026-10-02: a guessed hbomax.com/search URL was a 404).
+    Records the window (core.opened_ledger), pins vision to its monitor and
+    stops on a sign-in wall (_streaming_page_wall). Spoken verbatim
+    (SPEAK_RESULT_VERBATIM_ACTIONS). ``home_is_final``: the home-page line is
+    a TERMINAL result (core.failure_markers) - play_streaming, whose results
+    are otherwise not voiced, says it word for word and stops there."""
+    svc = _streaming_search.service(service_key)
+    if svc is None:
+        return (f"unknown streaming service '{service_key}'. Known: "
+                + ", ".join(sorted(_streaming_search.SERVICES)))
+    key = svc.key
+    q = " ".join(str(query or "").split())
+    cfg = dict(_STREAMING_SERVICES.get(key) or {"name": svc.name,
+                                                 "home": svc.home})
+    cfg["service_key"] = key
+    url = _streaming_search.search_url(key, q) or svc.home
+    _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(key)
+    _before = _window_handles_snapshot()
+    _fg_before = _foreground_now()
+    opened_via = _open_url_in_browser(
+        url,
+        close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
+        close_hwnd=_prior_hwnd,
+    )
+    print(f"  [{via}] opened {svc.name} "
+          f"{'search' if url != svc.home else 'home page'} for '{q}' "
+          f"(via {opened_via})", flush=True)
+    time.sleep(float(cfg.get("load_wait", 4.0)))
+    _adopt_media_window(cfg, key, _before, url=url, fg_before=_fg_before)
+    _wall = _streaming_page_wall(cfg, key)
+    if _wall:
+        return _wall
+    if url == svc.home:
+        if not q:
+            return f"{svc.name} is open, sir."
+        line = (f"I don't have a verified search link for {svc.name}, sir, "
+                f"so I've opened its home page - search for {q} there.")
+        if home_is_final:
+            from core.failure_markers import TERMINAL_FAILURE_PREFIX
+            return TERMINAL_FAILURE_PREFIX + line
+        return line
+    return f"{svc.name}'s search for {q} is open, sir."
+
+
 def _streaming_auto_play(service_key: str, query: str) -> str:
     """Open a streaming service's search page for `query`, activate the first
     result, then start playback. Services with `verify_play: True` confirm
@@ -28396,6 +28602,10 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
                 # JARVIS just opened must not land with its title bar off the
                 # top of a negative-origin monitor. Only the recorded handle.
                 _ensure_window_visible_maximized(_hp_hwnd)
+                _opened_ledger.note_opened(
+                    "play_streaming", cfg["home"], hwnd=_hp_hwnd,
+                    kind="window", monitor=_monitor_name_for_window(_hp_win),
+                    title=getattr(_hp_win, "title", "") or "")
         return f"opened {service_label}"
 
     # Step 1: choose the page to open and how to select the result.
@@ -28450,6 +28660,12 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
         url = yt_resolved["url"]
         select_method = "none"      # opening the watch page IS the activation
     else:
+        if not cfg.get("search_url"):
+            # No VERIFIED search link (Disney+, core/streaming_search.py): the
+            # home page opens and JARVIS says so - never a guessed URL whose
+            # "first result" would be clicked on an error page (S2).
+            return _streaming_open_search(service_key, q, via="play_streaming",
+                                          home_is_final=True)
         url = cfg["search_url"].format(q=urllib.parse.quote(q))
         select_method = cfg.get("select_method", "vision")
 
@@ -28472,6 +28688,7 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     # Every window that exists BEFORE the open is not the one JARVIS opens
     # (2026-10-01) - see _find_browser_window_matching's `exclude`.
     _before = _window_handles_snapshot()
+    _fg_before = _foreground_now()
     opened_via = _open_url_in_browser(
         url,
         close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
@@ -28491,7 +28708,16 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     # locate. This makes youtube_play / netflix vision clicks work on a
     # multi-monitor rig, not just the resolved Apple Music path (the latter was
     # confirmed live; youtube_play was failing the same way).
-    _adopt_media_window(cfg, service_key, _before)
+    _adopt_media_window(cfg, service_key, _before, url=url,
+                        fg_before=_fg_before)
+
+    # A sign-in wall / an error page is the end of it (S5, 2026-10-02): live,
+    # HBO Max not signed in showed "Sign In" over an error page, and the turn
+    # went on to click "results" that were not there. One look at the pinned
+    # player monitor first; a wall is one plain sentence and no clicks.
+    _wall = _streaming_page_wall(cfg, service_key)
+    if _wall:
+        return _wall
 
     strict = bool(cfg.get("verify_play"))
 
@@ -30051,22 +30277,10 @@ def _monitor_name_for_window(win) -> str | None:
     play controls (a track-row play triangle becomes a few pixels). Passing the
     window's own monitor crops the capture to that display at full resolution."""
     try:
-        cx = win.left + win.width / 2
-        cy = win.top + win.height / 2
+        return _monitor_geometry.monitor_for_rect(
+            win.left, win.top, win.width, win.height, MONITORS)
     except Exception:
         return None
-    try:
-        items = list(MONITORS.items())
-    except Exception:
-        return None
-    for name, rect in items:
-        try:
-            mx, my, mw, mh = rect
-        except Exception:
-            continue
-        if mx <= cx < mx + mw and my <= cy < my + mh:
-            return name
-    return None
 
 
 def _focus_window_hwnd(hwnd) -> bool:
@@ -31536,6 +31750,9 @@ ACTIONS = {
     "focus_window":    _act_focus_window,
     "minimize_window": _act_minimize_window,
     "close_window":    _act_close_window,
+    # "close that": the window / tab JARVIS itself opened last, never anything
+    # else (core.opened_ledger, S1 2026-10-02).
+    "close_last_opened": _act_close_last_opened,
     # iTunes music playback
     "play_music":      _act_play_music,
     "pause_music":     _act_pause_music,
@@ -31556,6 +31773,9 @@ ACTIONS = {
     "spotify":         _act_spotify,
     "youtube_play":    _act_youtube_play,
     "play_streaming":  _act_play_streaming,
+    # "find <title> on <service>": the VERIFIED search page (or the home page,
+    # said so) - core/streaming_search.py, S2 2026-10-02.
+    "streaming_search": _act_streaming_search,
     # Task queue (for Claude Code handoff)
     "queue_task":            _act_queue_task,
     "show_tasks":            _act_show_tasks,
@@ -31907,6 +32127,21 @@ def _utterance_route_reply(text: str) -> "str | None":
     if _yt_tok:
         print("  [route] play on YouTube -> youtube_play")
         return _yt_tok
+    # BUILT-IN route (S2, 2026-10-02): a whole "find / play <title> on
+    # <service>" request -> play_streaming / streaming_search with the
+    # VERIFIED links (core/streaming_search.py). Live 16:13:15 the budget
+    # had dropped the STREAMING SERVICES section and the brain guessed
+    # hbomax.com/search?q=..., a 404.
+    try:
+        _ss_tok = _streaming_search.streaming_route(
+            text, allow_play="play_streaming" in ACTIONS,
+            allow_find="streaming_search" in ACTIONS)
+    except Exception:
+        _ss_tok = None
+    _ss_m = _ROUTE_TOKEN_RE.match(_ss_tok) if _ss_tok else None
+    if _ss_m and _ss_m.group(1) in ACTIONS:
+        print(f"  [route] streaming title -> {_ss_m.group(1)}")
+        return _ss_tok
     if not globals().get("SKILL_ROUTES_ENABLED", True):
         return None
     for label, fn in list(_UTTERANCE_ROUTES):
@@ -33753,6 +33988,9 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # answer, not an error), so without this only the LLM's inline claim was
     # ever heard — even when no timer existed to cancel. 2026-07-21 audit.
     "cancel_timer",
+    # streaming_search (S2, 2026-10-02): "HBO Max's search for X is open, sir."
+    # or the honest no-verified-link line - one finished sentence either way.
+    "streaming_search",
     "whoami", "face_id_status",
     # Audio output-device switching (skills/audio_autoswitch.py) — each returns
     # a finished confirmation sentence.
@@ -34093,7 +34331,7 @@ LONG_RUNNING_ACTIONS: set[str] = {
     # Auto-play streaming sequence — open service tab, search, click first
     # result, hit play. Each step routinely takes 5-10 s; the chain can run
     # 20+ s end to end.
-    "play_streaming",
+    "play_streaming", "streaming_search",
     "apple_music", "netflix", "prime_video",
     "disney_plus", "hulu", "max",
     "spotify", "youtube_play",
@@ -35291,6 +35529,7 @@ _MISSION_NARRATION_CUES = {
     "focus_window":     "Bringing {arg} forward",
     "minimize_window":  "Minimising {arg}",
     "close_window":     "Closing {arg}",
+    "close_last_opened": "Closing what I opened",
     "launch_app":       "Launching {arg}",
     # Music / streaming
     "play_music":       "Playing {arg}",
@@ -35313,6 +35552,7 @@ _MISSION_NARRATION_CUES = {
     "youtube_direct":   "Opening {arg} on YouTube",
     "yt_direct":        "Opening {arg} on YouTube",
     "play_streaming":   "Starting {arg}",
+    "streaming_search": "Looking up {arg}",
     # Task queue / system
     "queue_task":       "Filing that on the task list",
     "show_tasks":       "Pulling up the task list",
@@ -35920,6 +36160,70 @@ def _note_once_per_turn_ran(name, arg, result, ran_here) -> None:
         pass
 
 
+# ── "Close that and open X instead" (S1, 2026-10-02) ────────────────────────
+# Live 16:12:51: right after JARVIS put a search page on the main monitor the
+# owner said "close that and open <the service> instead"; the brain wrote ONE
+# token, the open, and the close was lost. The chain resolver
+# (core.dispatcher) never claims the turn - it has no close/open rules and
+# needs two matched segments - and the continuation enforcer below
+# (_detect_dropped_steps) reads only the MODEL's prose for promised steps,
+# never the owner's own compound command. So: inside an owner turn (the
+# grounding ledger is open) whose words are "close <that/it/this> ... and
+# open ...", a reply that opens something without closing gets
+# [ACTION: close_last_opened] right in front of the open - the window / tab
+# JARVIS itself opened last, never anything else (core.opened_ledger). A close
+# the brain guessed at (close_window <title>) is replaced by it: the owner
+# said "that", he did not name a window. Once per turn.
+def _enforce_close_then_open(reply: str) -> str:
+    """``reply`` with the close of what JARVIS opened last put before its
+    first open, for a "close that and open X" owner turn; else unchanged.
+    Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if (frame is None or frame.get("close_then_open_done")
+                or "close_last_opened" not in ACTIONS
+                or not _opened_ledger.is_close_then_open(frame["user_text"])):
+            return reply
+        if any(m.group(1).strip().lower() == "close_last_opened"
+               for m in _ACTION_RE.finditer(reply or "")):
+            # The model closed it itself: nothing to add, now or later.
+            frame["close_then_open_done"] = True
+            return reply
+        new, dropped = _opened_ledger.rewrite_close_then_open(reply)
+        if new == reply:
+            return reply
+        frame["close_then_open_done"] = True
+        print("  [continuation_enforcer] the owner said 'close that and open "
+              "...' - closing what I opened last before the open"
+              + (f" (instead of {', '.join(dropped)})" if dropped else ""))
+        return new
+    except Exception as _e:
+        print(f"  [continuation_enforcer] close-then-open check failed: {_e}")
+        return reply
+
+
+def _dropped_open_after_close(results) -> str:
+    """The synthetic _dropped_step text when, in a "close that and open X"
+    owner turn, this reply ran a close but no open action has run this turn;
+    else "". Once per turn. Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if (frame is None or frame.get("close_then_open_nudged")
+                or not _opened_ledger.is_close_then_open(frame["user_text"])):
+            return ""
+        names = {str(n).lower() for (n, _r, _i) in results}
+        closes = _opened_ledger.GUESSED_CLOSE_ACTIONS | {"close_last_opened"}
+        opens = _opened_ledger.OPEN_ACTIONS
+        if not (names & closes) or (names | set(_turn_actions_ran())) & opens:
+            return ""
+        frame["close_then_open_nudged"] = True
+        return ("the owner asked to close it AND then open something "
+                f"(\"{frame['user_text'][:160]}\"), but no open action was "
+                "emitted — the open step was dropped; emit it now")
+    except Exception:
+        return ""
+
+
 def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]:
     """
     Find all [ACTION: ...] tokens, execute whitelisted ones, defer risky ones
@@ -35995,6 +36299,11 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             )
             print(f"  [preemptive_hallucination] refused — {_desc}")
             return "", [("_preemptive_hallucinated_claim", warn, True)]
+
+    # "Close that and open X instead" (S1, 2026-10-02) - see
+    # _enforce_close_then_open: the close of what JARVIS opened last runs
+    # BEFORE the open, even when the brain wrote only the open.
+    reply = _enforce_close_then_open(reply)
 
     # NOTE: the per-intent see_screen budget is intentionally NOT reset here.
     # The follow-up loop in _run_llm_dispatch calls this function once per
@@ -36425,6 +36734,14 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                     "but no such token was emitted — chain step dropped"
                 )
                 results.append(("_dropped_step", warn, True))
+        # The owner's OWN compound (S1, 2026-10-02): "close that and open X"
+        # where the reply closed but opened nothing - the open half is the
+        # dropped step (the close half is _enforce_close_then_open's).
+        _open_step = _dropped_open_after_close(results)
+        if _open_step:
+            print("  [continuation_enforcer] the owner said 'close that and "
+                  "open ...' - the open was dropped")
+            results.append(("_dropped_step", _open_step, True))
 
     # When mission narration fired, the per-step cues replaced the LLM's
     # prose. Drop the cleaned text so the main loop doesn't immediately

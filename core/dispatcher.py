@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
+from core import streaming_search as _streaming_search
 from core.failure_markers import FAILURE_MARKERS
 from core.lead_fillers import strip_lead_filler as _strip_lead_filler
 
@@ -104,17 +105,12 @@ _STREAMING_SERVICE_ALT = (
 
 
 def _canon_streaming_service(svc: str) -> str:
-    """Spoken service name → the _STREAMING_SERVICES key play_streaming takes."""
+    """Spoken service name → the _STREAMING_SERVICES key play_streaming takes.
+    The video services resolve through the ONE verified table
+    (core.streaming_search.canon_service, 2026-10-02); anything else
+    (spotify) passes through as spoken."""
     s = re.sub(r"\s+", " ", (svc or "").strip().lower())
-    if s in ("youtube", "you tube", "yt"):
-        return "youtube"
-    if s.startswith("disney"):
-        return "disney_plus"
-    if s.startswith(("amazon", "prime")):
-        return "prime_video"
-    if s.startswith("hbo") or s == "max":
-        return "max"
-    return s  # netflix, spotify, hulu
+    return _streaming_search.canon_service(s) or s
 
 
 def _arg_play_streaming(m: re.Match) -> str:

@@ -594,6 +594,8 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "STREAMING SERVICES": [
         "netflix", "hulu", "disney", "disney+", "hbo", "prime video",
         "streaming service", "watch on", "auto-play", "put on a movie",
+        # 2026-10-02 (S2): Apple TV joined the verified streaming table.
+        "apple tv",
         # 2026-09-06: the Apple Music APP-LIFECYCLE actions live at the foot of
         # this section, and its own examples for them routed to MUSIC CONTROLS
         # instead — where the only nearby tokens are pause_music/stop. That is
