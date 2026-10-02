@@ -27726,6 +27726,37 @@ def _last_session_end_ts() -> float:
     return 0.0
 
 
+def _previous_process_end_ts() -> float:
+    """Epoch seconds when the PREVIOUS JARVIS process last wrote its session
+    log - in practice when it ended - or 0.0 when unknown (logging off, no
+    earlier log). This process's own log is skipped. Never raises.
+
+    2026-10-02 review repair: the restart quiet was measured from the last
+    session-summary checkpoint, which can be hours older than the process
+    that just stopped. Live 19:44:30 the greeting fired 80 s after a restart
+    because the newest summary was from 17:29:03."""
+    try:
+        logs = globals().get("LOGS_DIR")
+        if not logs or not os.path.isdir(logs):
+            return 0.0
+        own = get_session_log_path()
+        own_key = os.path.normcase(os.path.abspath(own)) if own else ""
+        newest = 0.0
+        for name in os.listdir(logs):
+            if not (name.startswith("session_") and name.endswith(".log")):
+                continue
+            path = os.path.join(logs, name)
+            if own_key and os.path.normcase(os.path.abspath(path)) == own_key:
+                continue
+            try:
+                newest = max(newest, os.path.getmtime(path))
+            except OSError:
+                continue
+        return min(newest, time.time()) if newest > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
 def _last_n_user_commands(n: int = 3) -> list[str]:
     """Tail memory/voice_commands.jsonl for the last N accepted utterances.
     Returns newest-first; empty list if the log doesn't exist yet."""
@@ -27944,6 +27975,16 @@ def _resume_command_phrase(cmd) -> str:
 SESSION_RESUME_QUIET_S = 15 * 60
 
 
+# A session summary written ABOUT the conversation ("The user provides a
+# series of fragmented commands ...", "The assistant explained ...") is a
+# narrator's note, not what he was working on; live 19:44:30 it was read out
+# as "you were working on The user provides ..." (2026-10-02 review repair).
+_RESUME_THIRD_PERSON_RE = re.compile(
+    r"^\s*(?:the\s+|this\s+|in\s+this\s+|during\s+(?:the|this)\s+)?"
+    r"(?:user|owner|assistant|ai|jarvis|bobert|model|conversation|session|"
+    r"exchange|chat|dialogue)\b", re.IGNORECASE)
+
+
 def _resume_clause(work: str, kind: str) -> str:
     """"you'd asked me to X" for a voice command, else "you were working on X"."""
     if kind == "command":
@@ -27968,15 +28009,23 @@ def _build_session_resume(force: bool = False) -> tuple[str, dict]:
     if force and age != float("inf"):
         task_window_s = max(task_window_s, age + WARM_RESTART_WINDOW_SECONDS)
 
+    # The restart quiet counts from whichever ended last: the last summary
+    # checkpoint or the previous process itself (2026-10-02 review repair -
+    # see _previous_process_end_ts).
+    ended = max(last_ts, _previous_process_end_ts())
+    restart_age = (time.time() - ended) if ended > 0 else float("inf")
+
     details = {
         "last_session_ts": last_ts,
         "age_seconds":     age,
+        "restart_age_seconds": restart_age,
         "last_commands":   _last_n_user_commands(3),
         "next_task_line":  _last_queued_task_line(task_window_s),
         "in_window":       0 < age <= WARM_RESTART_WINDOW_SECONDS,
         # A restart minutes after the last session: no auto-greeting (the
         # verbal ask still answers). SESSION_RESUME_QUIET_S, 2026-10-01.
-        "quick_restart":   (not force) and 0 < age < SESSION_RESUME_QUIET_S,
+        "quick_restart":   ((not force)
+                            and 0 <= restart_age < SESSION_RESUME_QUIET_S),
     }
 
     if not force and not details["in_window"]:
@@ -28007,7 +28056,8 @@ def _build_session_resume(force: bool = False) -> tuple[str, dict]:
             last_summary = (recent[0].get("summary") or "").strip()
     except Exception:
         pass
-    if not work and last_summary:
+    if (not work and last_summary
+            and not _RESUME_THIRD_PERSON_RE.match(last_summary)):
         work = _cut_at_word(last_summary.split(".", 1)[0].strip(), 90)
         work_kind = "summary" if work else ""
     details["work"]         = work
@@ -28066,8 +28116,10 @@ def maybe_session_resume_greeting() -> str:
     else:
         try:
             if details.get("quick_restart"):
+                _ra = details.get("restart_age_seconds",
+                                  details.get("age_seconds", 0.0))
                 print(f"  [session_resume] no greeting: restart "
-                      f"{details.get('age_seconds', 0.0) / 60.0:.0f} min after "
+                      f"{_ra / 60.0:.0f} min after "
                       f"the last session (quiet under "
                       f"{SESSION_RESUME_QUIET_S // 60} min)")
         except Exception:

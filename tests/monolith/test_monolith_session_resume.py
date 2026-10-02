@@ -28,6 +28,9 @@ Generic stand-in names only.
 """
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -57,6 +60,16 @@ class _Base(MonolithGlobalsTestCase):
                               side_effect=lambda fb: "Zorblat, Entry, Token, Flemwick"),
         ]
         for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+        # An empty logs folder of our own: the restart quiet also reads the
+        # previous process's session log (2026-10-02), never the real one.
+        self.logs = tempfile.mkdtemp(prefix="jarvis-resume-logs-")
+        self.addCleanup(shutil.rmtree, self.logs, True)
+        for p in (mock.patch.object(bc, "LOGS_DIR", self.logs),
+                  mock.patch.object(bc, "_log_file_path",
+                                    os.path.join(self.logs, "session_now.log"),
+                                    create=True)):
             p.start()
             self.addCleanup(p.stop)
         orig_latch = list(bc._session_resume_done)
@@ -102,6 +115,67 @@ class QuickRestartTests(_Base):
         self.assertEqual(out, "")
         self.assertTrue(any("[session_resume]" in str(c.args[0]) and "restart" in str(c.args[0])
                             for c in pr.call_args_list if c.args))
+
+
+class ProcessEndTests(_Base):
+    """Review repair (2026-10-02). Live 19:44:30 the greeting fired 80 s
+    after the previous process ended (19:43:09): the quiet window was
+    measured from the last session-summary checkpoint (17:29:03, 2.3 h
+    earlier), and with no usable command the greeting read out the summary
+    itself - "you were working on The user provides a series of fragmented
+    commands ..."."""
+
+    _LIVE_SUMMARY = ("The user provides a series of fragmented commands and "
+                     "repetitive prompts to the AI, including requests to "
+                     "change the model. The assistant answers each.")
+
+    def _previous_log(self, ended_ago_s, name="session_prev.log"):
+        path = os.path.join(self.logs, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("=== previous session ===" + chr(10))
+        t = time.time() - ended_ago_s
+        os.utime(path, (t, t))
+        return path
+
+    def test_80_s_after_the_previous_process_there_is_no_greeting(self):
+        self._previous_log(80)
+        text, details = self._resume(age=int(2.3 * 3600),
+                                     summary=self._LIVE_SUMMARY)
+        self.assertEqual(text, "")
+        self.assertTrue(details.get("quick_restart"))
+
+    def test_the_current_processes_own_log_does_not_count(self):
+        own = os.path.join(self.logs, "session_now.log")
+        with open(own, "w", encoding="utf-8") as f:
+            f.write("this process" + chr(10))
+        self._previous_log(3 * 3600)
+        _text, details = self._resume(["Jarvis, do the Zorblat skit"],
+                                      age=int(3 * 3600))
+        self.assertFalse(details.get("quick_restart"))
+
+    def test_a_long_gap_since_the_previous_process_still_greets(self):
+        self._previous_log(40 * 60)
+        text, _details = self._resume(["Jarvis, do the Zorblat skit"],
+                                      age=int(2.3 * 3600))
+        self.assertIn("Welcome back", text)
+
+    def test_a_third_person_summary_is_never_what_he_was_working_on(self):
+        for summary in (self._LIVE_SUMMARY,
+                        "User asked about the weather and a timer.",
+                        "The assistant explained the GPU load.",
+                        "JARVIS reported the print status."):
+            with self.subTest(summary=summary[:30]):
+                text, details = self._resume(age=int(2.3 * 3600),
+                                             summary=summary)
+                self.assertNotIn("working on The", text)
+                self.assertNotIn(summary.split(".")[0][:25], text)
+                self.assertEqual(details.get("work"), "")
+
+    def test_a_first_person_summary_still_works(self):
+        text, _details = self._resume(
+            age=int(2.3 * 3600),
+            summary="Wiring the Zorblat sensor to the rover. Then a break.")
+        self.assertIn("Wiring the Zorblat sensor to the rover", text)
 
 
 class CommandChoiceTests(_Base):
