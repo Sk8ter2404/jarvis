@@ -552,6 +552,8 @@ FOLLOWUP_WINDOW_S = 0.0
 # keeps mishearing -> what was said ({"a cello": "Accelo"}), whole words, every
 # transcript. SITE_SHORTCUTS: {"name": "https://..."} so "open <name>" (also on a
 # monitor) opens that page. All empty by default; set in user_settings.json.
+# STT_HOTWORDS also applies LIVE: an edit to user_settings.json after start reaches
+# the next transcription (core/stt_vocab.live_hotwords); the other two need a restart.
 STT_HOTWORDS = ""
 STT_REPLACEMENTS: dict = {}
 SITE_SHORTCUTS: dict = {}

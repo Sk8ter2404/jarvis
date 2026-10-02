@@ -17815,14 +17815,19 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # The no-VAD retry runs WITHOUT them: its audio is the clip VAD
             # just called non-speech, exactly where Whisper reads the hint
             # back as a "transcript" (live 17:32, "JARVIS, Accelo, Entry, ...").
-            _hot = _stt_vocab.hotwords_arg(globals().get("STT_HOTWORDS"))
+            # Read LIVE (2026-10-01): an edit to data/user_settings.json after
+            # start applies without a restart (core/stt_vocab.live_hotwords).
+            _hot_setting = _stt_vocab.live_hotwords(globals().get("STT_HOTWORDS"))
+            _hot = _stt_vocab.hotwords_arg(_hot_setting)
+            _vad_params = dict(threshold=0.3, min_speech_duration_ms=80)
             segments_gen, info = _stt.transcribe(
                 audio, language="en",
                 vad_filter=True,
-                vad_parameters=dict(threshold=0.3, min_speech_duration_ms=80),
+                vad_parameters=_vad_params,
                 beam_size=5, hotwords=_hot,
             )
             segments = list(segments_gen)
+            _decoded_with_hot = bool(_hot) and bool(segments)
             if not segments:
                 segments_gen, info = _stt.transcribe(
                     audio, language="en",
@@ -17835,9 +17840,33 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # on CPU int8. 2026-07-08.
             _consecutive_whisper_cuda_failures = 0
             text = " ".join((s.text or "").strip() for s in segments).strip()
-            if _hot and _stt_vocab.is_hotword_echo(text, globals().get("STT_HOTWORDS")):
-                print(f"  [stt] dropped a hotword echo ({len(text)} chars) — noise, not speech")
-                return "", {"no_speech_prob": 1.0, "avg_logprob": -10.0}
+            if _hot and _stt_vocab.is_hotword_echo(text, _hot_setting):
+                # A hotword echo is not proof of noise (live 22:06, 2026-10-01:
+                # 1.8 s of the owner's speech, boosted x10, came back as the
+                # hint and the turn was thrown away). Decode the SAME audio
+                # once more with the same VAD and no hint; drop the turn only
+                # when that is empty or an echo too. An echo from the no-VAD
+                # retry above was already a plain decode, so it is dropped.
+                _why = "the plain decode echoed it"
+                if _decoded_with_hot:
+                    segments_gen, info = _stt.transcribe(
+                        audio, language="en",
+                        vad_filter=True,
+                        vad_parameters=_vad_params,
+                        beam_size=5, hotwords=None,
+                    )
+                    segments = list(segments_gen)
+                    text = " ".join((s.text or "").strip() for s in segments).strip()
+                    _why = ("the plain re-decode was empty" if not text else
+                            "the plain re-decode echoed it too")
+                    if text and not _stt_vocab.is_hotword_echo(text, _hot_setting):
+                        print(f"  [stt] hotword echo on the first decode — kept "
+                              f"the plain re-decode ({len(text)} chars)")
+                        _why = ""
+                if _why:
+                    print(f"  [stt] dropped a hotword echo ({len(text)} chars) — "
+                          f"{_why}; noise, not speech")
+                    return "", {"no_speech_prob": 1.0, "avg_logprob": -10.0}
             text = _stt_vocab.apply_replacements(text, globals().get("STT_REPLACEMENTS"))
             if not segments:
                 # info still carries some signal even on empty transcription

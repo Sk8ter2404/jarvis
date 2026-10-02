@@ -14,10 +14,17 @@ Accelo" (or "open Accelo on the left monitor") opens the right page.
 
 All three default to empty in core/config.py, so nothing changes until the owner sets
 them in data/user_settings.json. Pure functions; never raise.
+
+STT_HOTWORDS is also read LIVE (live_hotwords, 2026-10-01): core/config.py applies
+user_settings.json once at import, so emptying the list after the 22:06 echo drops did
+nothing until a restart. Once the file changes after start, its value wins.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import threading
 
 
 # Whisper's ``hotwords`` hint is a decoder prompt, and on noise the model can
@@ -26,7 +33,7 @@ import re
 # with "JARVIS" it passed the wake gate and became a turn. So the wake words are never
 # sent as hotwords, and a transcript that is just the list read back is dropped.
 _NEVER_HOTWORDS = frozenset({"jarvis", "hey jarvis", "wake", "wake up"})
-_ECHO_MIN_HITS = 3          # distinct hotwords in the transcript
+_ECHO_MIN_HITS = 3          # hotword mentions in the transcript, repeats included
 _ECHO_MIN_COVERAGE = 0.6    # share of the transcript's words that are hotwords
 
 
@@ -48,26 +55,111 @@ def hotwords_arg(hotwords) -> "str | None":
 
 def is_hotword_echo(text, hotwords) -> bool:
     """True when `text` is Whisper reading the hotwords hint back instead of speech:
-    at least three distinct hotwords (wake words count here) making up most of it.
+    at least three hotword mentions (wake words count here) making up most of it.
     A real request that names a few of them ("open Accelo and Nextcloud") keeps
-    enough other words to stay well under the bar."""
+    enough other words to stay well under the bar.
+
+    Repeats count (2026-10-01): the read-back often repeats one or two names
+    ("Accelo, Unraid, Unraid, Unraid", and at 22:13 two names got through as a
+    turn), so mentions are counted, not distinct names. At least one mention must
+    be a real hotword: the wake words are never sent as hotwords, so "Jarvis,
+    Jarvis, Jarvis" is the owner calling, not the hint read back."""
     if not text or not isinstance(text, str):
         return False
-    phrases = {" ".join(w.lower().split()) for w in _hotword_list(hotwords)} | _NEVER_HOTWORDS
+    real = {" ".join(w.lower().split()) for w in _hotword_list(hotwords)} - _NEVER_HOTWORDS
+    phrases = real | _NEVER_HOTWORDS
     words = re.findall(r"[\w']+", text.lower())
     if not words:
         return False
     rest = " ".join(words)
-    hits = covered = 0
+    hits = covered = real_hits = 0
     for p in sorted(phrases, key=len, reverse=True):   # "hey jarvis" before "jarvis"
         pw = re.findall(r"[\w']+", p)
         if not pw:
             continue
         rest, n = re.subn(r"(?<!\S)" + " ".join(map(re.escape, pw)) + r"(?!\S)", " ", rest)
         if n:
-            hits += 1
+            hits += n
             covered += n * len(pw)
-    return hits >= _ECHO_MIN_HITS and covered / len(words) >= _ECHO_MIN_COVERAGE
+            if p in real:
+                real_hits += n
+    return (hits >= _ECHO_MIN_HITS and real_hits >= 1
+            and covered / len(words) >= _ECHO_MIN_COVERAGE)
+
+
+# ── STT_HOTWORDS, live (2026-10-01) ─────────────────────────────────────────
+# core/config.py reads data/user_settings.json once, at import (the same path it
+# uses, so the two agree). LiveSettings remembers that file's mtime at start and
+# keeps the import-time value until the file changes; then the file's value wins
+# (a removed key means the shipped default, ""). One os.stat per transcription;
+# the file is re-parsed only when its mtime moves. A half-written file keeps the
+# last good parse. Never raises.
+_SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "user_settings.json")
+
+
+def _mtime_ns(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except Exception:
+        return None
+
+
+class LiveSettings:
+    """The settings file as it is now, for keys that should apply without a
+    restart. ``path`` is fixed at construction; its mtime then is the baseline."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._base = _mtime_ns(path)
+        self._seen = self._base
+        self._data = None          # last good parse after a change
+        self._lock = threading.Lock()
+
+    def _current(self):
+        """The parsed file when it has changed since start, else None."""
+        m = _mtime_ns(self.path)
+        if m == self._base:
+            return None
+        with self._lock:
+            if m != self._seen or self._data is None:
+                try:
+                    with open(self.path, "r", encoding="utf-8-sig") as f:
+                        d = json.load(f)
+                    if isinstance(d, dict):
+                        self._data = d
+                        self._seen = m
+                    elif self._data is None:
+                        self._data = {}
+                except Exception:
+                    if m is None:              # deleted: nothing set any more
+                        self._data, self._seen = {}, m
+                    # else half-written: keep the last good parse, re-read next time
+            return self._data
+
+    def hotwords(self, fallback):
+        """STT_HOTWORDS now: `fallback` (the import-time value) until the file
+        changes, then the file's value ("" once the key is removed). A junk
+        value (not a string or list) keeps `fallback`."""
+        try:
+            d = self._current()
+            if d is None:
+                return fallback
+            if "STT_HOTWORDS" not in d:
+                return ""
+            v = d["STT_HOTWORDS"]
+            return v if isinstance(v, (str, list, tuple)) else fallback
+        except Exception:
+            return fallback
+
+
+_LIVE = LiveSettings(_SETTINGS_FILE)
+
+
+def live_hotwords(fallback):
+    """STT_HOTWORDS as data/user_settings.json says now (see LiveSettings)."""
+    return _LIVE.hotwords(fallback)
 
 
 def apply_replacements(text: str, mapping) -> str:

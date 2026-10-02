@@ -9,6 +9,7 @@ Generic stand-ins only (example.com), never the owner's real sites.
 """
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
 
@@ -128,6 +129,100 @@ class ActionWiringTests(unittest.TestCase):
                 mock.patch.object(A.time, "sleep"):
             A._act_open_url("example.com")
         wb.assert_called_once_with("https://example.com")
+
+
+class RepeatedNameEchoTests(unittest.TestCase):
+    """Live 2026-10-01 (16:30 / 22:13): Whisper's read-back of the hint repeats one or
+    two names ("Zorblat, Zorblat, Zorblat,") instead of listing three distinct ones,
+    so the old distinct-names count let it through as a turn."""
+    HOT = "Zorblat, Flemwick, Quonset"
+
+    def test_repeats_count_toward_the_echo(self):
+        for echo in ("Zorblat, Zorblat, Zorblat,",
+                     "Zorblat, Flemwick, Flemwick.",
+                     "JARVIS, Zorblat, Zorblat"):
+            with self.subTest(echo=echo):
+                self.assertTrue(sv.is_hotword_echo(echo, self.HOT))
+
+    def test_wake_words_alone_are_never_an_echo(self):
+        # The wake words are never sent as hotwords, so a repeated "Jarvis" is not
+        # the hint read back; the owner calling twice must reach the wake gate.
+        self.assertFalse(sv.is_hotword_echo("Jarvis, Jarvis, Jarvis", self.HOT))
+        self.assertFalse(sv.is_hotword_echo("hey Jarvis, Jarvis, Jarvis!", self.HOT))
+
+    def test_real_requests_with_a_repeated_name_survive(self):
+        for said in ("Jarvis, open Zorblat, the Zorblat tickets page please",
+                     "Zorblat and Zorblat", "Jarvis, Zorblat"):
+            with self.subTest(said=said):
+                self.assertFalse(sv.is_hotword_echo(said, self.HOT))
+
+
+class LiveHotwordsTests(unittest.TestCase):
+    """STT_HOTWORDS used to be read once at import, so the owner's 22:08 edit (the
+    list emptied after the echo drops) did nothing until a restart. live_hotwords
+    returns the import-time value until data/user_settings.json changes, then the
+    file's value."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="stt_vocab_live_")
+        self.path = os.path.join(self.dir, "user_settings.json")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, data, bump=1):
+        import json
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+        st = os.stat(self.path)
+        # Force a distinct mtime: two writes inside one clock tick look unchanged.
+        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns + bump * 1_000_000_000))
+
+    def test_unchanged_file_keeps_the_import_time_value(self):
+        self._write({"STT_HOTWORDS": "Zorblat"})
+        live = sv.LiveSettings(self.path)
+        self.assertEqual(live.hotwords("Zorblat, Flemwick"), "Zorblat, Flemwick")
+
+    def test_an_edit_after_start_takes_effect_without_a_restart(self):
+        self._write({"STT_HOTWORDS": "Zorblat, Flemwick"})
+        live = sv.LiveSettings(self.path)
+        self._write({"STT_HOTWORDS": "", "OTHER": 1}, bump=2)
+        self.assertEqual(live.hotwords("Zorblat, Flemwick"), "")
+        self._write({"STT_HOTWORDS": ["Quonset"]}, bump=3)
+        self.assertEqual(live.hotwords("Zorblat, Flemwick"), ["Quonset"])
+
+    def test_key_removed_after_start_means_the_shipped_empty_default(self):
+        self._write({"STT_HOTWORDS": "Zorblat"})
+        live = sv.LiveSettings(self.path)
+        self._write({"OTHER": 1}, bump=2)
+        self.assertEqual(live.hotwords("Zorblat"), "")
+
+    def test_file_created_after_start_counts_as_an_edit(self):
+        live = sv.LiveSettings(self.path)          # no file at start
+        self.assertEqual(live.hotwords("Zorblat"), "Zorblat")
+        self._write({"STT_HOTWORDS": "Flemwick"})
+        self.assertEqual(live.hotwords("Zorblat"), "Flemwick")
+
+    def test_a_half_written_file_keeps_the_last_good_value(self):
+        self._write({"STT_HOTWORDS": "Zorblat"})
+        live = sv.LiveSettings(self.path)
+        self._write({"STT_HOTWORDS": "Flemwick"}, bump=2)
+        self.assertEqual(live.hotwords("Zorblat"), "Flemwick")
+        self._write('{"STT_HOTWORDS": "Quon', bump=3)
+        self.assertEqual(live.hotwords("Zorblat"), "Flemwick")
+
+    def test_junk_value_and_missing_dir_never_raise(self):
+        self._write({"STT_HOTWORDS": "Zorblat"})
+        live = sv.LiveSettings(self.path)
+        self._write({"STT_HOTWORDS": 7}, bump=2)
+        self.assertEqual(live.hotwords("Zorblat"), "Zorblat")   # junk -> fallback
+        gone = sv.LiveSettings(os.path.join(self.dir, "nope", "x.json"))
+        self.assertEqual(gone.hotwords("Zorblat"), "Zorblat")
+        # The module-level reader: the settings file has not changed during this
+        # run, so the import-time value stands.
+        self.assertEqual(sv.live_hotwords("Zorblat"), "Zorblat")
 
 
 if __name__ == "__main__":

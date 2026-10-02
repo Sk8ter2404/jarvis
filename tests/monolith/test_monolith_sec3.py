@@ -822,8 +822,10 @@ class TranscribeTests(MonolithGlobalsTestCase):
             text, conf = self.bc.transcribe(np.zeros(8, dtype=np.float32))
         self.assertEqual(text, "")
         self.assertEqual(conf["no_speech_prob"], 1.0)
-        # and the wake word itself never reached Whisper as a hotword
-        self.assertEqual(fake_stt.transcribe.call_args.kwargs["hotwords"],
+        # and the wake word itself never reached Whisper as a hotword. The FIRST
+        # decode carries the hint; since 2026-10-01 an echo gets one plain
+        # re-decode (hotwords=None) before the drop (test_monolith_hotword_echo).
+        self.assertEqual(fake_stt.transcribe.call_args_list[0].kwargs["hotwords"],
                          "Zorblat, Flemwick, Quonset, Brindle")
 
     def test_a_real_request_naming_hotwords_survives(self):
