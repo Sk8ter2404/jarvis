@@ -36300,11 +36300,25 @@ def _drain_injected_command():
 
 # Who wrote the inject _drain_injected_command just returned (2026-10-01):
 # "test" for the Claude Code driver (.claude/skills/run-jarvis/driver.py) and
-# tools/say_to_jarvis.py, "" for the owner's web page / tray, None when the
-# turn was not an inject. Every inject used to count as the owner typing, so
-# live-verification lines were learned as facts about him (the learn gate
-# admits a typed turn unconditionally and opens its follow-up window).
+# tools/say_to_jarvis.py, "web" for the owner's web page (2026-10-02), "" for
+# an inject that names no source, None when the turn was not an inject. Every
+# inject used to count as the owner typing, so live-verification lines were
+# learned as facts about him (the learn gate admits a typed turn
+# unconditionally and opens its follow-up window).
 _last_inject_source: list = [None]
+
+
+def _inject_log_tag() -> str:
+    """"(web) " when the inject just drained came from the web dashboard,
+    else "". Goes in the "[inject]" log line, where the dashboard's "What
+    JARVIS did" timeline reads a turn's source (tools/web_interface.py
+    build_timeline). Every reader of that line matches on a substring of the
+    command, so the tag changes nothing for them. Never raises."""
+    try:
+        return "(web) " if _last_inject_source[0] == "web" else ""
+    except Exception:
+        return ""
+
 
 # How long ONE _speak_pending() drain may hold the main loop before it hands
 # the tail back to the queue and returns to 'Listening…'.
@@ -37413,7 +37427,7 @@ def _capture_utterance(injected_text, memory):
             print(f"  [inject] (test-mode) text={text!r} "
                   f"conf={conf} peak_rms={_last_recording_peak:.4f}")
         else:
-            print(f"  [inject] {text}")
+            print(f"  [inject] {_inject_log_tag()}{text}")
         set_state("listening")
         return text, conf
 
@@ -37989,7 +38003,7 @@ def _handle_sleep_standby(injected_text: str | None):
         # existing wake-phrase check below so injects can wake the assistant
         # in exactly the same way a spoken 'JARVIS' would.
         _heartbeat()
-        print(f"  [inject] (standby) {injected_text}")
+        print(f"  [inject] (standby) {_inject_log_tag()}{injected_text}")
         text = injected_text
     else:
         _heartbeat()

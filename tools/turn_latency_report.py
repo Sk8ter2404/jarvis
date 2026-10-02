@@ -113,11 +113,17 @@ def session_start(path: str) -> "datetime.datetime | None":
         return None
 
 
-def parse_log(path: str):
+def parse_log(path: str, keep_lines: int = 0):
     """One session log -> (turns, events). A turn is {"ts", "session",
     "kv", "flags"}; an event is (ts, safety label). The wall clock comes from
     the "[HH:MM:SS]" prefix plus the file name's date, rolling over midnight
-    (a jump back of more than 6 h is the next day)."""
+    (a jump back of more than 6 h is the next day).
+
+    keep_lines=N: the LAST N turns also carry "lines", the stamped log lines
+    since the previous [turn-timing] line - their own You: / [action] lines
+    (older turns drop theirs as the file is read, so memory stays bounded).
+    For the dashboard's "What JARVIS did" timeline (tools/web_interface.py);
+    this report never asks for them, so it still prints no log text."""
     start = session_start(path)
     if start is None:
         return [], []
@@ -127,6 +133,7 @@ def parse_log(path: str):
     last = None
     flags: dict = {}
     turns, events = [], []
+    pending: list = []
     base = os.path.basename(path)
     for line in raw.decode("utf-8", errors="replace").splitlines():
         m = _TS.match(line)
@@ -148,7 +155,14 @@ def parse_log(path: str):
             if "kind" in kv:
                 turns.append({"ts": cur, "session": base, "kv": kv,
                               "flags": dict(flags)})
+                if keep_lines > 0:
+                    turns[-1]["lines"] = pending
+                    pending = []
+                    if len(turns) > keep_lines:
+                        turns[-keep_lines - 1].pop("lines", None)
             continue
+        if keep_lines > 0:
+            pending.append(line)
         i = line.find("[turn-flags]")
         if i >= 0:
             flags = parse_kv(line[i + len("[turn-flags]"):])
