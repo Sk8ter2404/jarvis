@@ -37,8 +37,10 @@ def version_string() -> str:
     return __version__
 
 
-def _git_out(root: str, *args: str) -> str:
-    """stdout of ``git -C root <args>``, or '' on any failure. Never raises."""
+def _git_out(root: str, *args: str) -> "str | None":
+    """stdout of ``git -C root <args>`` ('' when git answers with an error),
+    or None when git could not be asked at all (missing, timed out). Never
+    raises."""
     import subprocess
     import sys
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
@@ -46,8 +48,17 @@ def _git_out(root: str, *args: str) -> str:
         r = subprocess.run(["git", "-C", root, *args], capture_output=True,
                            text=True, timeout=3, creationflags=flags)
     except Exception:
-        return ""
+        return None
     return (r.stdout or "").strip() if r.returncode == 0 else ""
+
+
+# ONE ANSWER PER RELEASE ON DISK (2026-10-02 review). "What version are you"
+# runs on the action path, and an uncached answer is 2-3 git subprocesses
+# (~50-300 ms, up to 3 s apiece when git stalls). Keyed by the directory and
+# the VERSION file's mtime and size, so a pull or checkout that changes the
+# release is read afresh. An answer git did not give (timed out, no git) is
+# never kept: the next ask tries git again.
+_release_ts_cache: dict = {}
 
 
 def release_timestamp(project_dir: str | None = None) -> float | None:
@@ -63,7 +74,23 @@ def release_timestamp(project_dir: str | None = None) -> float | None:
     zip, a temp dir inside some other repo) uses the VERSION file's mtime."""
     root = os.path.abspath(project_dir or os.path.dirname(_VERSION_FILE))
     vfile = os.path.join(root, "VERSION")
+    try:
+        st = os.stat(vfile)
+        key = (os.path.normcase(root), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and key in _release_ts_cache:
+        return _release_ts_cache[key]
+    ts, git_answered = _release_timestamp_uncached(root, vfile)
+    if key is not None and git_answered:
+        _release_ts_cache[key] = ts
+    return ts
+
+
+def _release_timestamp_uncached(root: str, vfile: str):
+    """(release_timestamp's answer, whether git was able to give it)."""
     top = _git_out(root, "rev-parse", "--show-toplevel")
+    asked = top is not None
     if top and (os.path.normcase(os.path.realpath(top))
                 == os.path.normcase(os.path.realpath(root))):
         try:
@@ -77,11 +104,14 @@ def release_timestamp(project_dir: str | None = None) -> float | None:
         queries.append(("log", "-1", "--format=%ct", "--", "VERSION"))
         for q in queries:
             out = _git_out(root, *q)
+            if out is None:
+                asked = False
+                continue
             try:
-                return float(out.splitlines()[0])
+                return float(out.splitlines()[0]), asked
             except (IndexError, ValueError):
                 continue
     try:
-        return os.path.getmtime(vfile)
+        return os.path.getmtime(vfile), asked
     except OSError:
-        return None
+        return None, asked

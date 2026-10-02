@@ -132,6 +132,38 @@ class ReleaseTimestampTests(unittest.TestCase):
     def test_nothing_known_is_none(self):
         self.assertIsNone(ver.release_timestamp(self.root))
 
+    def test_asking_again_runs_no_git(self):
+        """"What version are you" runs on the action path, and each uncached
+        answer was 2-3 git subprocesses at up to 3 s apiece (2026-10-02
+        review). The release on disk has not changed, so neither has its date."""
+        _repo(self.root, when=1790600000)
+        self.assertEqual(ver.release_timestamp(self.root), 1790600000)
+        with mock.patch("subprocess.run", wraps=subprocess.run) as run:
+            self.assertEqual(ver.release_timestamp(self.root), 1790600000)
+        run.assert_not_called()
+
+    def test_a_new_release_on_disk_is_read_again(self):
+        _repo(self.root, when=1790600000)
+        self.assertEqual(ver.release_timestamp(self.root), 1790600000)
+        path = os.path.join(self.root, "VERSION")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("1.2.4\n")
+        _git(self.root, "add", "VERSION")
+        _git(self.root, "commit", "-qm", "release 1.2.4", when=1790700000)
+        _git(self.root, "tag", "v1.2.4")
+        os.utime(path, (1795000000, 1795000000))
+        self.assertEqual(ver.release_timestamp(self.root), 1790700000)
+
+    def test_an_answer_git_did_not_give_is_not_kept(self):
+        # git timed out: the VERSION mtime stands in this once, and the next
+        # ask goes back to git rather than keeping the stand-in.
+        _repo(self.root, when=1790600000)
+        os.utime(os.path.join(self.root, "VERSION"), (1700000000, 1700000000))
+        with mock.patch("subprocess.run",
+                        side_effect=subprocess.TimeoutExpired("git", 3)):
+            self.assertEqual(ver.release_timestamp(self.root), 1700000000)
+        self.assertEqual(ver.release_timestamp(self.root), 1790600000)
+
 
 if __name__ == "__main__":
     unittest.main()
