@@ -52,6 +52,14 @@ A reply with no ``[ACTION:]`` token is flagged when it contains:
      X." answering "what did I just ask you" is an answer with a filler
      preface; "On it, sir. The lights are off." answering "turn off the
      lights" is still flagged).
+  4. A PASSIVE completion claim about the owner's target (2026-10-02 live:
+     "Very good, sir. <app> has been closed." with nothing run): "<subject>
+     has / have / 's been <participle>", "is now <participle>", "was
+     successfully <participle>", when the subject is a pronoun or quantifier,
+     a word of the owner's utterance, or a thing JARVIS acts on. Not when the
+     owner's turn asks about state ("did you close it?", "has it been sent"),
+     the clause is dated ("since this morning", "an hour ago", "for decades")
+     or has a passive agent ("closed by the court"). See _passive_claim.
 
 GROUNDING (follow-up rounds)
 ============================
@@ -63,7 +71,9 @@ claim is grounded when an action from the SAME verb family ran (a claim to
 "open" something is not grounded by ``get_time``). An acknowledgement followed
 by a summary, or a bare completion ack ("Done, sir."), is grounded by any
 action that succeeded this turn. A bare pending acknowledgement ("On it,
-sir.") is never grounded — it promises something new.
+sir.") is never grounded — it promises something new. The OWNER's words
+never ground a claim: Parakeet writes "close" as "closed", and "Jarvis closed
+notepad" is a misheard command, not an action that ran.
 
 Pure: no I/O, no monolith import, stdlib ``re`` only, so it is testable on the
 light-deps CI runner (tests/test_claim_validator.py).
@@ -75,6 +85,7 @@ from typing import Iterable, Optional
 
 __all__ = [
     "asks_owner",
+    "find_completed_claim",
     "find_unverified_claim",
     "is_progress_only",
     "looks_like_question",
@@ -466,6 +477,189 @@ def _clause_claim(core: str) -> Optional[tuple[str, str]]:
     return None
 
 
+# ── passive completion claims (2026-10-02 live) ──────────────────────────────
+# Parakeet writes the imperative "close" as "closed", so "Jarvis, close <app>"
+# reached the brain as a past-tense sentence, and the local model answered in
+# the PASSIVE voice - "Very good, sir. <app> has been closed." - with no action
+# token. No first-person rule above sees that shape, so nothing ran and nothing
+# was corrected. Rule: "<subject> has / have / 's been <participle>" ("is now
+# <participle>", "was successfully <participle>") is a claim when its subject
+# is the owner's target: a pronoun or quantifier ("it", "that", "everything",
+# "all the windows", "your email"), a word of the owner's own utterance, or a
+# thing JARVIS acts on (a window, an app, a timer, a message, the lights ...).
+# Never a claim: a question, an owner turn that is itself a question (a status
+# or recall question - "did you close it?" - answered from the conversation),
+# a clause dated in the past ("since this morning", "an hour ago", "for
+# decades"), a passive agent ("closed by the court"), or a report of an action
+# that DID run this turn (grounded by family, exactly as the active forms).
+# The owner's words never ground anything: "Jarvis closed notepad" is what he
+# SAID, not an action that ran.
+_PASSIVE_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("close", r"closed|shut\s+down|killed|terminated|quit|stopped|ended"),
+    ("open", r"opened|launched|started(?:\s+up)?"),
+    ("play", r"played|queued|paused|resumed|skipped"),
+    ("switch", r"switched(?:\s+(?:on|off|over))?"),
+    ("move", r"moved|minimi[sz]ed|maximi[sz]ed|snapped"),
+    ("send", r"sent|emailed|messaged|forwarded|delivered|posted"),
+    ("mute", r"muted|unmuted|silenced"),
+    ("restart", r"restarted|rebooted"),
+    ("turn", r"turned\s+(?:on|off|up|down)"),
+    ("timer", r"set(?:\s+up)?|scheduled|created|added"),
+    # Generic completion: any action that ran this turn grounds it.
+    ("done", r"done|completed|finished|handled|sorted(?:\s+out)?|"
+             r"taken\s+care\s+of|carried\s+out|executed|actioned"),
+)
+_PASSIVE_TOKENS: dict[str, frozenset[str]] = {
+    "timer": frozenset({"timer", "alarm", "reminder", "remind", "schedule",
+                        "set", "volume", "brightness", "add", "create"}),
+    "done": frozenset({"*"}),
+}
+_PASSIVE_ADV = r"(?:(?:now|just|already|all|also|successfully|properly)\s+)*"
+_PASSIVE_RES = tuple(
+    (fam, re.compile(
+        r"(?P<aux>(?:\s+(?:has|have)|'s|'ve)\s+" + _PASSIVE_ADV + r"been\s+"
+        r"|(?:\s+(?:is|are)|'s|'re)\s+now\s+"
+        r"|\s+(?:was|were)\s+(?:successfully|just)\s+)" + _PASSIVE_ADV +
+        r"(?P<part>" + parts + r")\b"))
+    for fam, parts in _PASSIVE_FAMILIES)
+# What follows the participle when the clause is not JARVIS's own work: a
+# passive agent ("closed by the court") or a past date / span ("since 2019",
+# "an hour ago", "for decades", "earlier today").
+_PASSIVE_NOT_NOW_RE = re.compile(
+    r"^\s*by\b|\b(?:since|ago|earlier|yesterday|previously|before\s+you|"
+    r"last\s+(?:night|week|month|year|time)|this\s+(?:morning|afternoon|week)|"
+    r"years?|decades?|centur(?:y|ies)|months|ages|in\s+\d{4})\b")
+# Subjects that ARE the owner's target whatever the turn said.
+_PASSIVE_PRONOUN_RE = re.compile(
+    r"^(?:it|that|this|they|those|these|everything|everyone|all|both|each|"
+    r"every|your|the\s+rest|the\s+others?|the\s+remaining)\b")
+_PASSIVE_TARGET_RE = re.compile(
+    r"\b(?:windows?|apps?|applications?|programs?|tabs?|browsers?|timers?|"
+    r"alarms?|reminders?|e-?mails?|messages?|texts?|lights?|lamps?|music|"
+    r"songs?|tracks?|playlists?|videos?|volume|screenshots?|files?|"
+    r"folders?|requests?|tasks?|commands?|orders?|notes?)\b")
+_PASSIVE_SUBJ_CUT_RE = re.compile(r",|\b(?:and|so|then|but)\b")
+_PASSIVE_STOP = frozenset({
+    "the", "a", "an", "my", "your", "our", "this", "that", "these", "those",
+    "all", "and", "for", "jarvis", "sir", "please", "now", "just", "with",
+    "from", "into", "onto", "has", "have", "been", "was", "were", "are",
+    "except", "else", "then", "too", "also", "can", "you", "it", "its",
+})
+
+
+# The owner asking about state ("has notepad been closed", "is it sent") even
+# without a "?" - looks_like_question needs a pronoun or determiner after the
+# auxiliary. "had been at close" (a misheard command) is not a question.
+_OWNER_STATUS_ASK_RE = re.compile(
+    r"^(?:has|have|had|is|are|was|were)\s+(?!been\b|being\b)\S+")
+
+
+def _owner_asks_status(user_text: str) -> bool:
+    if looks_like_question(user_text):
+        return True
+    t = _Q_FILLER_RE.sub("", _norm(user_text)).strip()
+    return bool(_OWNER_STATUS_ASK_RE.match(t))
+
+
+def _passive_words(text: str) -> set[str]:
+    out = set()
+    for w in _WORD_RE.findall(text or ""):
+        if len(w) >= 3 and w not in _PASSIVE_STOP:
+            out.add(w[:-1] if len(w) > 3 and w.endswith("s") else w)
+    return out
+
+
+def _passive_claim(core: str, owner_words: set[str]
+                   ) -> Optional[tuple[str, str]]:
+    """(family, matched text) for a passive completion claim about the
+    owner's target in one clause (lead-ins already stripped), else None.
+    ``owner_words`` - _passive_words of the owner's utterance."""
+    if core.endswith("?") or _OFFER_RE.search(core):
+        return None
+    for fam, rx in _PASSIVE_RES:
+        m = rx.search(core)
+        if not m:
+            continue
+        if _PASSIVE_NOT_NOW_RE.search(core[m.end():]):
+            return None
+        subj = _PASSIVE_SUBJ_CUT_RE.split(core[:m.start()])[-1].strip()
+        if not subj or len(subj.split()) > 8:
+            continue
+        if (_PASSIVE_PRONOUN_RE.match(subj) or _PASSIVE_TARGET_RE.search(subj)
+                or (_passive_words(subj) & owner_words)):
+            return fam, (subj + m.group(0)).strip()
+    return None
+
+
+_PARTICIPLE_RES = {name: re.compile(r"(?:" + participle + r")")
+                   for name, _g, participle, _b, _t in _FAMILIES}
+
+
+def _clause_completed_claim(core: str) -> Optional[tuple[str, str]]:
+    """(family, matched text) when one clause (lead-ins stripped) claims an
+    action ALREADY happened: a perfect / past form ("I've closed it", "I sent
+    it", "I've taken the liberty of closing ...") or a clause-initial
+    participle ("Sent, sir."). Progressive and future forms ("Opening it
+    now", "I'll send it") are not completions. Else None."""
+    if core.endswith("?") or _OFFER_RE.search(core):
+        return None
+    core = _IDIOM_RE.sub(" ", core).strip(" ,")
+    if not core:
+        return None
+    for name, (_progressive, perfect, _future, narration), _t in _COMPILED:
+        m = perfect.search(core)
+        if m:
+            return name, m.group(0)
+        m = narration.match(core)
+        if (m and _PARTICIPLE_RES[name].fullmatch(m.group(0))
+                and not _gerund_is_noun_use(core, m.end())):
+            return name, m.group(0)
+    return None
+
+
+def _grounded(tokens, ran: set[str], any_ran: bool, phrase: str) -> bool:
+    """A claim of a family with ``tokens`` is grounded by an action of that
+    family, by any action for a "*" family, or by an action named after the
+    claim's own words ("the print job has been sent" after print_document)."""
+    tokens = tokens or frozenset()
+    return bool(tokens & ran or ("*" in tokens and any_ran)
+                or (_passive_words(phrase) & ran))
+
+
+def find_completed_claim(text: str, *, ran_actions: Iterable[str] = (),
+                         user_text: str = "") -> Optional[str]:
+    """The phrase when ``text`` claims an action ALREADY HAPPENED and nothing
+    this turn grounds it: a perfect / past first-person claim, a clause-
+    initial participle, a passive completion (see _passive_claim) or a bare
+    "Done, sir." with nothing run. None otherwise - including progressive
+    and future narration ("Opening it now, sir.", "I'll send it"), which is
+    how a reply honestly leads into an action token it is about to carry.
+
+    The streaming flush (bobert_companion._SentenceFlushBuffer) never voices
+    such a sentence early: it is said before the reply's actions run, and a
+    reply with no token is not spoken at all (2026-10-02)."""
+    if not text or not text.strip():
+        return None
+    ran = _ran_tokens(ran_actions)
+    any_ran = bool(ran)
+    passive_ok = not _owner_asks_status(user_text)
+    owner_words = _passive_words(_norm(user_text)) if passive_ok else set()
+    for ack, ack_text, core in _segments(text):
+        if ack == "done" and not any_ran:
+            return ack_text
+        if not core:
+            continue
+        got = _clause_completed_claim(core)
+        tokens = _family_tokens(got[0]) if got else None
+        if got is None and passive_ok:
+            got = _passive_claim(core, owner_words)
+            if got:
+                tokens = _PASSIVE_TOKENS.get(got[0]) or _family_tokens(got[0])
+        if got and not _grounded(tokens, ran, any_ran, got[1]):
+            return got[1].strip()
+    return None
+
+
 def _calculate_claim(core, progressive, perfect, future, narration):
     """The "calculate" family's own reading of one clause (2026-10-02 review
     repair). ("calculate", phrase) for a COMPLETED-work claim ("I've run the
@@ -603,12 +797,28 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
     acks: list[tuple[str, str]] = []      # (kind, phrase)
     content: list[str] = []               # substantive non-claim cores
     working_line = ""                     # a calculate_status phrase
+    # Passive completion claims ("<app> has been closed") - see
+    # _passive_claim. Not read when the owner's turn asks about state.
+    passive_ok = not _owner_asks_status(user_text)
+    owner_words = _passive_words(_norm(user_text)) if passive_ok else set()
     for ack, ack_text, core in _segments(text):
         if ack:
             acks.append((ack, ack_text))
         if not core:
             continue
         claim = _clause_claim(core)
+        if claim is None and passive_ok:
+            passive = _passive_claim(core, owner_words)
+            if passive:
+                fam, phrase = passive
+                tokens = _PASSIVE_TOKENS.get(fam) or _family_tokens(fam)
+                # Grounded by an action of the same family, by any action for
+                # a generic "done", or by an action named after the subject
+                # ("the print job has been sent" after print_document ran).
+                if not _grounded(tokens, ran, any_ran, phrase):
+                    return phrase
+                content.append(core)
+                continue
         if claim and claim[0] == "calculate" and shows_working:
             claim = None
         if claim and claim[0] == "calculate_status":

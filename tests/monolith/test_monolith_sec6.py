@@ -837,7 +837,9 @@ class ParseAndRunActionsTests(SectionSixBase):
 
     def test_hallucinated_claim_appended_when_no_action(self):
         cleaned, results = self.bc.parse_and_run_actions("Restarting now, sir.")
-        self.assertEqual(cleaned, "Restarting now, sir.")
+        # The claim prose is withheld (2026-10-02): the follow-up round
+        # answers instead, like the preemptive refuse below.
+        self.assertEqual(cleaned, "")
         self.assertEqual(len(results), 1)
         name, msg, informative = results[0]
         self.assertEqual(name, "_unverified_claim")

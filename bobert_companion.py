@@ -22140,6 +22140,18 @@ class _SentenceFlushBuffer:
                     or _world_clock.has_time_claim(piece)):
                 self._stopped = True
                 return True
+            # A claim that something ALREADY happened ("I've closed every
+            # other window", "<app> has been closed", "Done, sir.") is never
+            # voiced early (2026-10-02): it is said before the reply's
+            # actions run, a reply with no token is not spoken at all
+            # (parse_and_run_actions withholds an unverified claim), and
+            # early speech cannot be unsaid. "Opening it now, sir." ahead of
+            # its token still flushes.
+            if _claim_validator.find_completed_claim(
+                    piece, ran_actions=_turn_actions_ran(),
+                    user_text=_turn_user_text()):
+                self._stopped = True
+                return True
             # A refusal of an explicit joke request is replaced by
             # _joke_fallback_line downstream — don't voice it early.
             if (_joke_fallback.looks_like_refusal(piece)
@@ -35786,6 +35798,15 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # fixed. A detector fault must never break the dispatch: fall back to "no
     # claim" (the reply is still spoken; only the self-correction round is
     # skipped).
+    #
+    # NEVER VOICED (2026-10-02 live): the claim prose used to be returned as
+    # `cleaned` and spoken BEFORE the follow-up round ran, so the owner heard
+    # "I've taken the liberty of closing everything else" for windows nothing
+    # closed, and the correction came a round later - or, when the follow-up
+    # never contradicted it, not at all. When the detector fires the prose is
+    # withheld: the turn goes straight to the follow-up round, which emits the
+    # real action or says it can't. The reply stays in conversation_history;
+    # the synthetic result tells the model the owner never heard it.
     if not results:
         try:
             matched = _claim_validator.find_unverified_claim(
@@ -35799,10 +35820,16 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         if matched:
             warn = (
                 f"reply claims '{matched.strip()}' but no [ACTION: ...] token "
-                "was emitted — JARVIS appears to have hallucinated execution"
+                "was emitted — JARVIS appears to have hallucinated execution. "
+                "That reply was NOT spoken: the owner has not heard it, so "
+                "do not apologise for it or refer to it"
             )
             print(f"  [validation] {warn}")
             results.append(("_unverified_claim", warn, True))
+            if cleaned:
+                print("  [validation] not speaking the unverified claim - "
+                      "the follow-up round answers instead")
+            cleaned = ""
 
     # Continuation enforcer: when at least one action *did* run, scan the
     # prose for chained-intent phrases ("and read it to you", "then I'll

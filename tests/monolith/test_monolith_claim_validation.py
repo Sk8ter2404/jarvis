@@ -157,8 +157,10 @@ class AckPrefaceTests(_Base):
                        ["I'm afraid I can't reach the lights, sir."])
         self.gfr.assert_called_once()
         self.assertEqual(self._followup_names(), ["_unverified_claim"])
-        # Not a question, so the preface is spoken untouched.
-        self.assertEqual(self.spoken[0], "On it, sir. The lights are off.")
+        # An unverified claim is never voiced (2026-10-02): only the
+        # follow-up round's answer is spoken.
+        self.assertEqual(self.spoken,
+                         ["I'm afraid I can't reach the lights, sir."])
 
     def test_bare_ack_on_a_question_is_still_a_claim(self):
         # ("Done, sir." is NEW coverage: the old phrase list never had it.)
@@ -169,7 +171,9 @@ class AckPrefaceTests(_Base):
                                ["I can't see it from here, sir."])
                 self.gfr.assert_called_once()
                 self.assertEqual(self._followup_names(), ["_unverified_claim"])
-                self.assertEqual(self.spoken[0], reply)
+                # Never voiced (2026-10-02): the follow-up answers instead.
+                self.assertEqual(self.spoken,
+                                 ["I can't see it from here, sir."])
 
     def test_action_narration_on_a_question_is_still_a_claim(self):
         for reply in ("Opening Spotify now, sir.",
