@@ -407,6 +407,10 @@ def _fmt_countdown(secs: int) -> str:
 
 
 class HUD:
+    # Ctrl+wheel size factor; __init__ replaces it with the persisted value.
+    # A class default so every draw path can read it unconditionally.
+    _scale = 1.0
+
     def __init__(self, x: int, y: int, width: int, parent_pid: int,
                  role: str = "prod"):
         self.parent_pid = parent_pid
@@ -602,6 +606,7 @@ class HUD:
         new_scale = max(self._scale_min, min(self._scale_max, new_scale))
         if abs(new_scale - self._scale) < 0.005:
             return
+        old_scale = self._scale
         self._scale = new_scale
         new_w = int(HUD_W * new_scale)
         new_h = int(HUD_H * new_scale)
@@ -610,14 +615,15 @@ class HUD:
         cur_y = self.root.winfo_y()
         try:
             self.root.geometry(f"{new_w}x{new_h}+{cur_x}+{cur_y}")
-            # Tell Tk's canvas to re-scale its coordinate system so the drawn
-            # rings actually grow/shrink. self.canvas.scale() rescales the
-            # display list; we set its size to match the new window dims.
+            # Every tick redraws at the base layout and _apply_scale() scales
+            # that frame by self._scale, so the persistent resize lives there.
+            # The frame on screen now is already at old_scale: rescale it by
+            # the RATIO (not new_scale, which would compound the two) so the
+            # window and its drawing change size together, with no one-frame
+            # flicker before the next tick.
             self.canvas.config(width=new_w, height=new_h)
-            self.canvas.scale("all", 0, 0, new_scale / 1.0, new_scale / 1.0)
-            # On the next tick the canvas is redrawn from scratch, so the
-            # scale() above mostly affects this frame — but it prevents a
-            # one-frame flicker between the old and new layout.
+            ratio = new_scale / old_scale
+            self.canvas.scale("all", 0, 0, ratio, ratio)
         except Exception:
             pass
         # Persist the new scale so it survives the next restart.
@@ -736,10 +742,25 @@ class HUD:
 
     def _text(self, x: float, y: float, msg: str, color: str = TEXT_COLOR,
               size: int = 9, weight: str = "normal", anchor: str = "center"):
+        # Tk's canvas.scale() moves a text item but never resizes its font, so
+        # the Ctrl+wheel factor is applied to the point size here.
         self.canvas.create_text(
             x, y, text=msg, fill=color, anchor=anchor,
-            font=("Consolas", size, weight),
+            font=("Consolas", max(1, int(round(size * self._scale))), weight),
         )
+
+    def _apply_scale(self):
+        """Scale the frame just drawn to the user's Ctrl+wheel size.
+
+        Every draw call lays the HUD out in base HUD_W x HUD_H coordinates and
+        each tick clears and redraws the whole canvas, so the one-off
+        canvas.scale() in _set_scale was undone on the very next tick and the
+        resize changed only the window, never the rings (GUI_REVIEW B9).
+        Scaling each finished frame about the origin keeps the rings, ticks
+        and text positions matched to the window size."""
+        s = self._scale
+        if abs(s - 1.0) >= 0.005:
+            self.canvas.scale("all", 0, 0, s, s)
 
     # ─── boot-sequence power-up animation ───────────────────────────────
     # When boot_sequence.py is running its 4–5s spoken intro, the HUD
@@ -1165,6 +1186,7 @@ class HUD:
                 and boot_duration > 0
                 and (time.time() - boot_started_at) <= (boot_duration + 0.5)):
             self._draw_boot_animation(boot_started_at, boot_duration)
+            self._apply_scale()
             self.frame += 1
             return TICK_MS
 
@@ -1446,6 +1468,8 @@ class HUD:
         if self.role == "staging":
             ts = state.get("test_state") or {}
             self._draw_staging_overlay(ts if isinstance(ts, dict) else {})
+
+        self._apply_scale()
 
         # Advance the frame counter. Rescheduling is handled by the tick()
         # wrapper's finally-style tail so it runs even if this body raised.
