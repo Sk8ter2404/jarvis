@@ -75,6 +75,10 @@ _IMPORT_LIGHT_CORE = (
     # monitor geometry (2026-10-02 streaming-control fixes): stdlib-only,
     # imported at monolith import time and by core.dispatcher.
     "core.streaming_search", "core.opened_ledger", "core.monitor_geometry",
+    # Which windows a window command may touch (2026-10-03): stdlib-only at
+    # import (ctypes / psutil lazily), imported by core.actions and at
+    # monolith import time.
+    "core.window_scope",
 )
 
 

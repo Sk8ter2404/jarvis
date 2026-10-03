@@ -78,6 +78,20 @@ class _Base(unittest.TestCase):
             q = mock.patch.object(A, name, side_effect=fn)
             q.start()
             self.addCleanup(q.stop)
+        # The process-name lookup enumerates through core.window_scope: its
+        # Win32 reads must not resolve these small fake handles to real
+        # windows either (2026-10-03). Class "progman" marks the desktop.
+        from core import window_scope as ws
+        self.classes: dict = {}
+        for name, fn in (
+                ("probe", lambda w: ws.WindowFacts(
+                    getattr(w, "_hWnd", None), None,
+                    self.classes.get(getattr(w, "_hWnd", None), ""), False)),
+                ("own_pids", lambda: frozenset()),
+                ("own_window_handles", lambda: frozenset())):
+            q = mock.patch.object(ws, name, side_effect=fn)
+            q.start()
+            self.addCleanup(q.stop)
 
     def _all_windows(self, windows):
         """Install a fake pygetwindow whose getAllWindows() is ``windows``."""

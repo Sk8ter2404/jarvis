@@ -70,6 +70,14 @@ class CloseChainReplayTests(_Base):
                 side_effect=lambda w: self.procs.get(w._hWnd))
         self._p(A, "_window_is_elevated",
                 side_effect=lambda w: w._hWnd in self.elevated)
+        # The window lookups go through core.window_scope (2026-10-03): its
+        # Win32 reads must not resolve these small fake handles to real
+        # windows.
+        from core import window_scope as ws
+        self._p(ws, "probe", side_effect=lambda w: ws.WindowFacts(
+            w._hWnd, None, "", False))
+        self._p(ws, "own_pids", return_value=frozenset())
+        self._p(ws, "own_window_handles", return_value=frozenset())
         self._stub("see_screen", "Task Manager is on the LEFT monitor.")
 
     def _task_manager(self):

@@ -43,6 +43,8 @@ import time
 import urllib.parse
 import webbrowser
 
+from core import window_scope as _window_scope
+
 
 def _bc():
     """Late-bound reference to bobert_companion module. Breaks the
@@ -1328,12 +1330,16 @@ def _act_queue_task(args: str) -> str:
 # ─── Window management (Phase 4D) ──────────────────────────────────────
 
 def _act_list_windows(_: str = "") -> str:
-    """Return all open window titles."""
+    """Return the owner's open window titles: never JARVIS's own windows or
+    the shell's (core.window_scope - live 2026-10-03 the listing handed the
+    brain "JARVIS HUD", "JARVIS Reticle", "Program Manager" and "Windows
+    Input Experience", and it minimized all four)."""
     try:
         import pygetwindow as gw
     except ImportError:
         return "pygetwindow not available — pip install pygetwindow"
-    titles = sorted({w.title for w in gw.getAllWindows() if w.title and w.title.strip()})
+    titles = sorted({w.title for w in _window_scope.user_windows(gw.getAllWindows())
+                     if w.title and w.title.strip()})
     if not titles:
         return "no windows visible"
     return "Open windows:\n" + "\n".join(f"  - {t}" for t in titles)
@@ -1494,25 +1500,27 @@ def _close_refused(err) -> bool:
     return "access is denied" in msg or "error code from windows: 5 " in msg
 
 
-# The shell's own desktop window ("Program Manager", explorer.exe). WM_CLOSE
-# on it opens Windows' "Shut Down Windows" dialog, so "close_window,
-# explorer.exe" must reach File Explorer windows only (review 2026-10-02).
-_SHELL_WINDOW_TITLES = frozenset({"program manager"})
+# The shell's own windows ("Program Manager" - the desktop, explorer.exe -
+# "Windows Input Experience", ...). WM_CLOSE on the desktop opens Windows'
+# "Shut Down Windows" dialog, so "close_window, explorer.exe" must reach File
+# Explorer windows only (review 2026-10-02). ONE list: core.window_scope.
+_SHELL_WINDOW_TITLES = _window_scope.SYSTEM_WINDOW_TITLES
 
 
 def _windows_of_process(exe: str) -> list:
     """Titled windows whose process executable is ``exe`` (case-insensitive),
-    never the shell's desktop window."""
+    among the owner's windows (core.window_scope.user_windows): never the
+    shell's desktop window or one of JARVIS's own."""
     try:
         import pygetwindow as gw
-        windows = gw.getAllWindows()
+        windows = _window_scope.user_windows(gw.getAllWindows())
     except Exception:
         return []
     want = exe.strip().lower()
     out = []
     for w in windows:
         title = (getattr(w, "title", "") or "").strip()
-        if not title or title.lower() in _SHELL_WINDOW_TITLES:
+        if not title:
             continue
         name = _window_process_name(w)
         if name and name.strip().lower() == want:

@@ -1721,6 +1721,9 @@ from core import guest_mode as _guest_mode  # noqa: E402
 from core import streaming_search as _streaming_search  # noqa: E402
 from core import opened_ledger as _opened_ledger  # noqa: E402
 from core import monitor_geometry as _monitor_geometry  # noqa: E402
+# Which windows a window command may touch: never JARVIS's own or the shell's
+# (2026-10-03, "close every window but X"), stdlib-only.
+from core import window_scope as _window_scope  # noqa: E402
 
 
 def _owner_vocab() -> frozenset:
@@ -30213,17 +30216,24 @@ def _handle_shutdown_prompt(text: str) -> bool:
 
 
 def _find_windows_by_title(query: str) -> list:
-    """Return all open windows whose title contains query (case-insensitive)."""
+    """Return the open windows whose title contains query (case-insensitive)
+    - the name lookup of close_window, minimize_window, focus_window,
+    move_window_to_monitor and close_window's pushback count - through the
+    ONE window scope (core.window_scope.matching_windows): never a shell
+    window ("Program Manager", "Windows Input Experience", the taskbar,
+    cloaked frames), and one of JARVIS's own windows only when the query and
+    the owner's own words this turn both name it ("close the HUD"). Live
+    2026-10-03 the brain minimized "JARVIS HUD" when the owner had asked it to
+    close every window but the Claude app."""
     try:
         import pygetwindow as gw
     except ImportError:
         return []
-    q = query.lower().strip()
-    out = []
-    for w in gw.getAllWindows():
-        if w.title and q in w.title.lower():
-            out.append(w)
-    return out
+    try:
+        windows = gw.getAllWindows()
+    except Exception:
+        return []
+    return _window_scope.matching_windows(windows, query, _turn_user_text())
 
 
 # Phase 4D refactor: _act_list_windows moved to core/actions.py.
