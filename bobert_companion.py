@@ -43296,11 +43296,24 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
         if not _turn_check_barged(barge_seq0):
             _speak_verbatim_results(results, spoken)
         texts = [retry]
+        # A TERMINAL failure (core.failure_markers) was just voiced word for
+        # word: as in the main follow-up loop it is the last word, never read
+        # back (release-177 interaction audit: a streaming sign-in wall the
+        # retry ran into was said, then re-worded by the read-back).
+        _terminal = list(dict.fromkeys(
+            _terminal_failure_text(r) for (_n, r, _i) in results
+            if _terminal_failure_text(r)))
+        if _terminal:
+            print("  [turn-check] the retry hit a terminal failure - no "
+                  "read-back")
+            conversation_history.append({"role": "assistant",
+                                         "content": " ".join(_terminal)})
         # One read-back, only for real results the owner should hear (never
         # a synthetic "_" result: that would ask for a round we don't run).
-        info = [(n, r) for (n, r, i) in results
-                if not str(n).startswith("_") and not is_self_voiced(n)
-                and (i or _action_result_failed(r))]
+        info = [] if _terminal else [
+            (n, r) for (n, r, i) in results
+            if not str(n).startswith("_") and not is_self_voiced(n)
+            and (i or _action_result_failed(r))]
         if info and not _turn_check_barged(barge_seq0):
             set_state("thinking")
             _heartbeat()

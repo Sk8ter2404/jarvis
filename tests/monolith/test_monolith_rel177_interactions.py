@@ -38,6 +38,8 @@ from unittest import mock
 from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith
 from tests.monolith.test_monolith_claim_validation import _Base
 from tests.monolith.test_monolith_offer_yes import QUIP, _OfferBase
+from tests.monolith.test_monolith_turn_check import (_ASK, _CLAIM,
+                                                     _TurnCheckBase)
 
 SUFFIX = " - Google Chrome"
 SIGN_IN_LINE = ("HBO Max isn't signed in on this browser, sir - sign in once "
@@ -296,6 +298,38 @@ class TerminalLineTurnCheckTests(_Base):
                   "[ACTION: frobnicate_the_widget]")
         self.escalate.assert_called_once()
         self.assertEqual(self.rows[-1]["kind"], "made_up_action")
+
+
+@requires_monolith
+class TerminalLineInTheTurnCheckRetryTests(_TurnCheckBase):
+    """TURN_CHECK_MODE 'on': the local turn failed and the Claude retry ran
+    play_streaming into a sign-in wall. The main follow-up loop ends a chain
+    on a terminal line; the retry's one read-back must too - before the fix
+    it re-worded the line it had just said word for word."""
+
+    READ_BACK = "It seems HBO Max wants you to sign in first, sir."
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "TURN_CHECK_MODE", "on")
+        self.plays: list = []
+        bc.ACTIONS["play_streaming"] = lambda a="": (
+            self.plays.append(a) or _terminal(SIGN_IN_LINE))
+        self.oneshot.return_value = "[ACTION: play_streaming, max|Some Show]"
+        # Round 1 of the local chain (the claim check's self-correction)
+        # gets nothing; a read-back of the retry would get READ_BACK.
+        self.followup.side_effect = ["", self.READ_BACK]
+
+    def test_the_wall_line_is_said_once_and_not_read_back(self):
+        out = self._run(_CLAIM, text=_ASK)
+        self.assertEqual(self.oneshot.call_count, 1, out)   # it did retry
+        self.assertEqual(self.plays, ["max|Some Show"])
+        self.assertEqual(self.spoken.count(SIGN_IN_LINE), 1, self.spoken)
+        self.assertNotIn(self.READ_BACK, self.spoken)
+        self.assertEqual(self.followup.call_count, 1)
+        # ... and, as in the main loop, it is the last thing JARVIS said.
+        self.assertEqual(self.assistant_msgs()[-1], SIGN_IN_LINE)
 
 
 # ════════════════════════════════════════════════════════════════════════════
