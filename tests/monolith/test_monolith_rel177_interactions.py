@@ -18,11 +18,14 @@ no LLM, audio or network is touched. Paraphrased fixtures, no owner words.
   C  the streaming terminal lines (sign-in wall, no verified link) x the
      turn checker in 'on' mode x live-fixes F1 x instant actions 'on': the
      line is spoken once, never withheld as an unverified claim, never
-     followed by a follow-up round and never retried on Claude.
+     followed by a follow-up round and never retried on Claude - and when a
+     Claude retry is the one that hits it, never read back a second time.
   D  guest mode x the learn worker's deferred batch (R5 background slot):
      guest mode is judged when the batch is WRITTEN, not when it was queued.
   E  "diagnostic status" (a fresh sweep) x paused diagnostic daemons: the
      answer is spoken verbatim, once, and still says they are paused.
+  F  the monolith harness forgets core.opened_ledger between tests (a
+     window one test "opened" must not be what a later test closes).
 
     python -m unittest tests.monolith.test_monolith_rel177_interactions
 """
@@ -445,6 +448,25 @@ class FreshDiagnosticStatusPausedTests(_Base):
                         said)
         self.assertEqual(said.count("paused"), 1, said)
         self.gfr.assert_not_called()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  the harness forgets what a test "opened"
+# ════════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class HarnessForgetsTheOpenedLedgerTests(MonolithGlobalsTestCase):
+    """core.opened_ledger (streaming) is process-wide: sec4's media-window
+    placement test records hwnd 909, and every later test's "close that",
+    description click and see_screen read it."""
+
+    def test_restore_empties_the_opened_ledger(self):
+        from core import opened_ledger
+        from tests._monolith_harness import _restore_monolith_pristine
+        self.addCleanup(opened_ledger.reset)
+        opened_ledger.note_opened("play_streaming", "https://www.netflix.com",
+                                  hwnd=909, kind="window", monitor="middle")
+        _restore_monolith_pristine(self.bc)
+        self.assertIsNone(opened_ledger.last_opened())
 
 
 if __name__ == "__main__":

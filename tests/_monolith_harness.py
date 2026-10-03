@@ -585,6 +585,16 @@ def _restore_monolith_pristine(bc) -> None:
         bc._open_offer.clear()
     except Exception:
         pass
+    # The opened-window ledger (core.opened_ledger, 2026-10-02 streaming
+    # S1/S4; release-177 interaction audit): one process-wide list, so a
+    # window one test "opened" (a media-window placement, open_on_monitor)
+    # would be what a LATER test's "close that" closes and where its click
+    # or look at "the page" aims. Emptied in place.
+    try:
+        from core import opened_ledger as _opened_ledger
+        _opened_ledger.reset()
+    except Exception:
+        pass
     # Process-wide state three 2026-10-02 branches added, which the per-test
     # restore did not know about (integration audit, claude/integrate-1002):
     #  * the retired-model guard (core.claude_model_guard.GUARD): a model one
