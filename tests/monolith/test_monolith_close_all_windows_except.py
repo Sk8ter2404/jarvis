@@ -184,6 +184,89 @@ class PushbackTests(_Base):
         self.assertEqual(self.calls[CLOSE], [])
 
 
+class _Win:
+    """A pygetwindow-like window recording close() / minimize()."""
+
+    def __init__(self, title, hwnd):
+        self.title = title
+        self._hWnd = hwnd
+        self.width, self.height = 900, 700
+        self.isMinimized = False
+        self.closed = self.minimized = False
+
+    def close(self):
+        self.closed = True
+
+    def minimize(self):
+        self.minimized = True
+
+
+@requires_monolith
+class LiveDesktopReplayTests(_Base):
+    """The live turn end to end with the REAL action against a fake desktop
+    shaped like the live one (review 2026-10-03): the owner's folder sat
+    under a path that mentions Claude, and JARVIS's live-log console was
+    open. Only the owner's folder and media player may close."""
+
+    def setUp(self):
+        super().setUp()
+        import sys
+        import types
+        from unittest import mock
+
+        import core.actions as A
+        from core import window_scope as ws
+        self._p(self.bc, "_UTTERANCE_ROUTES", [])
+        self.claude = _Win("Claude", 0x70)
+        self.folder = _Win("C:\\Work\\Claude Projects\\samples - File "
+                           "Explorer", 0x71)
+        self.hud = _Win("JARVIS HUD", 0x72)
+        self.log = _Win("JARVIS LIVE LOG (close anytime)", 0x73)
+        self.media = _Win("Media Player", 0x74)
+        self.desk = _Win("Program Manager", 0x75)
+        self.wie = _Win("Windows Input Experience", 0x76)
+        self.term = _Win("* Long build", 0x77)
+        wins = [self.claude, self.folder, self.hud, self.log, self.media,
+                self.desk, self.wie, self.term]
+        procs = {0x70: "claude.exe", 0x71: "explorer.exe",
+                 0x72: "pythonw.exe", 0x73: "powershell.exe",
+                 0x74: "ApplicationFrameHost.exe", 0x75: "explorer.exe",
+                 0x76: "TextInputHost.exe", 0x77: "WindowsTerminal.exe"}
+        pids = {0x72: 9101}
+        classes = {0x73: "consolewindowclass", 0x75: "progman",
+                   0x76: "windows.ui.core.corewindow",
+                   0x77: "cascadia_hosting_window_class"}
+        self._p(ws, "probe", side_effect=lambda w: ws.WindowFacts(
+            w._hWnd, pids.get(w._hWnd), classes.get(w._hWnd, ""),
+            w._hWnd == 0x76))
+        self._p(ws, "own_pids", return_value=frozenset({9100, 9101}))
+        self._p(ws, "own_window_handles", return_value=frozenset())
+        self._p(A, "_window_process_name",
+                side_effect=lambda w: procs.get(w._hWnd))
+        self._p(A, "_window_is_elevated", return_value=False)
+        fake = types.SimpleNamespace(getAllWindows=lambda: list(wins))
+        p = mock.patch.dict(sys.modules, {"pygetwindow": fake})
+        p.start()
+        self.addCleanup(p.stop)
+        self.wins = wins
+        self.llm = self._p(self.bc, "get_response_with_animation",
+                           return_value=IMPROVISED)
+        self._p(self.bc, "get_followup_response", side_effect=[None] * 8)
+
+    def test_the_live_request_closes_only_the_owners_two_windows(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.bc._run_llm_dispatch(LIVE)
+        self.llm.assert_not_called()
+        self.assertTrue(self.folder.closed)
+        self.assertTrue(self.media.closed)
+        for w in (self.claude, self.hud, self.log, self.desk, self.wie,
+                  self.term):
+            self.assertFalse(w.closed or w.minimized, w.title)
+        self.assertEqual(self.spoken, [
+            "Closed 2 windows, sir; kept Claude. I left Windows Terminal "
+            "open; it may be running me."])
+
+
 @requires_monolith
 class ConfirmedTerminalLineTests(_Base):
     def test_a_confirmed_terminal_result_is_spoken_without_its_marker(self):

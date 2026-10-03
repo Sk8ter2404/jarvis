@@ -31,7 +31,8 @@ Never a target:
           owned by this process or one of its python / console child
           processes (the HUD and overlays are child processes), this
           process's console window, and the known JARVIS window titles
-          (the tray's windows and the dashboard live in other processes).
+          (the tray's windows, the dashboard and the live-log console live
+          in other processes).
 
 A JARVIS window is still a target for a SINGLE-window command when it is
 named explicitly ("close the HUD"): matching_windows lets it through when the
@@ -126,10 +127,15 @@ JARVIS_WINDOW_TITLES = frozenset({
 # A title is JARVIS's when its first " — " part is one of the above: "JARVIS
 # — Live" (the dashboard page; inside a browser window the title also carries
 # the browser's suffix), "JARVIS Settings — <file>". Or its last part is
-# "JARVIS": "Today's Summary — JARVIS".
+# "JARVIS": "Today's Summary — JARVIS". Or it is JARVIS's live-log console:
+# "JARVIS LIVE LOG (<log file>)" / "JARVIS LIVE LOG (close anytime)", a
+# PowerShell window _show_log.ps1 and the boot script open - spawned by the
+# tray or the boot script, so neither this process nor a python child of it
+# (review 2026-10-03: a bulk close sent it WM_CLOSE).
 _TITLE_DASH = " — "
 _JARVIS_TITLE_SUFFIX = " — jarvis"
 _DASHBOARD_PREFIX = "jarvis — live"
+_LIVE_LOG_PREFIX = "jarvis live log"
 
 # Child processes of JARVIS that are JARVIS: the interpreter running a HUD /
 # overlay / settings script, and the console host of a python console.
@@ -276,7 +282,8 @@ def is_jarvis_title(title) -> bool:
     if not t:
         return False
     head = t.split(_TITLE_DASH, 1)[0].strip()
-    return head in JARVIS_WINDOW_TITLES or t.endswith(_JARVIS_TITLE_SUFFIX)
+    return (head in JARVIS_WINDOW_TITLES or t.endswith(_JARVIS_TITLE_SUFFIX)
+            or t.startswith(_LIVE_LOG_PREFIX))
 
 
 def is_jarvis_window(w, facts: Optional[WindowFacts] = None,
@@ -313,6 +320,10 @@ def _jarvis_name_words(title) -> frozenset:
     t = _norm_title(title)
     if t.startswith(_DASHBOARD_PREFIX):
         return frozenset({"dashboard"})
+    if t.startswith(_LIVE_LOG_PREFIX):
+        # Only "log": its "(close anytime)" / file-name tail must never let
+        # a "close ..." request name it.
+        return frozenset({"log"})
     words = set(re.findall(r"[a-z]+", t)) - _NAME_STOP
     if words & {"reticle", "cursor"}:
         words.add("overlay")

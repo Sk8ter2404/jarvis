@@ -118,6 +118,18 @@ class CloseThenOpenTests(unittest.TestCase):
                               "[ACTION: open_url, https://b.example]")
         self.assertEqual(dropped, ["[ACTION: close_window, Some Page]"])
 
+    def test_a_guessed_bulk_close_is_replaced(self):
+        # Review 2026-10-03: the guessed-close list named a placeholder
+        # "close_all_windows"; the real bulk close is close_all_windows_except.
+        # "Close that and open X" never asks for every other window to go.
+        reply = ("Right away, sir. [ACTION: close_all_windows_except, Claude] "
+                 "[ACTION: open_url, https://b.example]")
+        new, dropped = L.rewrite_close_then_open(reply)
+        self.assertEqual(new, "Right away, sir. [ACTION: close_last_opened] "
+                              "[ACTION: open_url, https://b.example]")
+        self.assertEqual(dropped,
+                         ["[ACTION: close_all_windows_except, Claude]"])
+
     def test_a_close_only_reply_closes_what_jarvis_opened(self):
         new, dropped = L.rewrite_close_then_open(
             "Done, sir. [ACTION: close_window, chrome]")

@@ -201,6 +201,35 @@ class KeepMatchingTests(_Base):
         self.assertTrue(pad.closed)
         self.assertEqual(out, "Closed 1 window, sir; kept Excel.")
 
+    def test_a_folder_whose_path_mentions_the_app_is_closed(self):
+        # Review 2026-10-03: the live desktop's File Explorer window was a
+        # folder under a path containing "Claude" (paraphrased here). A
+        # title-substring keep kept it, so the live request would have
+        # closed only the media player. The Claude app is open, so "Claude"
+        # names the app: its windows (process, or a title that ends with
+        # the name) are what is kept.
+        claude = self.add("Claude", 0x50, "claude.exe")
+        folder = self.add("C:\\Work\\Claude Projects\\drafts - File Explorer",
+                          0x51, "explorer.exe")
+        media = self.add("Media Player", 0x52, "ApplicationFrameHost.exe")
+        out = A._act_close_all_windows_except("Claude")
+        self.assertFalse(claude.closed)
+        self.assertTrue(folder.closed)
+        self.assertTrue(media.closed)
+        self.assertEqual(out, "Closed 2 windows, sir; kept Claude.")
+
+    def test_a_document_named_in_the_keep_is_kept_when_no_app_is(self):
+        # No open app is called "budget": the name then keeps any window
+        # whose title mentions it, so the owner's document stays open.
+        self.add("Claude", 0x53, "claude.exe")
+        sheet = self.add("Budget 2026.xlsx - Excel", 0x54, "EXCEL.EXE")
+        pad = self.add("notes.txt - Notepad", 0x55, "notepad.exe")
+        out = A._act_close_all_windows_except("Claude and the budget")
+        self.assertFalse(sheet.closed)
+        self.assertTrue(pad.closed)
+        self.assertEqual(out, "Closed 1 window, sir; kept Claude and the "
+                              "budget.")
+
     def test_keep_names_parse(self):
         self.assertEqual(A._keep_names("Claude"), ["Claude"])
         # Names are kept as said (the summary repeats them) and matched by
@@ -274,6 +303,36 @@ class SafetyTests(_Base):
         self.assertTrue(tab.closed)
         self.assertFalse(ide.closed)
         self.assertIn("I left Visual Studio Code open", out)
+
+    def test_terminals_are_left_open_whatever_their_title(self):
+        # Review 2026-10-03: WM_CLOSE on a console or terminal window ends
+        # every program running in it with no chance to save - a kill, not
+        # the X-button close this action promises - and the title-only host
+        # rule missed a terminal titled by what runs in it (a coding
+        # session, a build, an ssh login).
+        self.add("Claude", 0x60, "claude.exe")
+        term = self.add("* Fix the build", 0x61, "WindowsTerminal.exe")
+        self.classes[0x61] = "cascadia_hosting_window_class"
+        con = self.add("ssh build-box", 0x62, "ssh.exe")
+        self.classes[0x62] = "consolewindowclass"
+        pad = self.add("notes.txt - Notepad", 0x63, "notepad.exe")
+        # The "Close N windows?" count never includes them either.
+        self.assertEqual(A._close_all_windows_except_preview("Claude"),
+                         ["notes.txt - Notepad"])
+        out = A._act_close_all_windows_except("Claude")
+        self.assertFalse(term.closed or con.closed)
+        self.assertTrue(pad.closed)
+        self.assertEqual(out, "Closed 1 window, sir; kept Claude. I left "
+                              "Windows Terminal and ssh build-box open; they "
+                              "may be running me.")
+
+    def test_a_terminal_named_in_the_keep_is_simply_kept(self):
+        self.add("Claude", 0x64, "claude.exe")
+        term = self.add("Claude Code", 0x65, "WindowsTerminal.exe")
+        self.classes[0x65] = "cascadia_hosting_window_class"
+        out = A._act_close_all_windows_except("Claude")
+        self.assertFalse(term.closed)
+        self.assertEqual(out, "Nothing else to close, sir; kept Claude.")
 
     def test_elevated_windows_are_reported_once_with_the_terminal_line(self):
         self.add("Claude", 0x43, "claude.exe")

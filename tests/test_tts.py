@@ -141,6 +141,9 @@ class QuipLayerTests(unittest.TestCase):
         self.assertEqual(tts.classify_action_for_quip("focus_window"), "ui")
         self.assertEqual(tts.classify_action_for_quip("see_screen"), "default")
         self.assertEqual(tts.classify_action_for_quip(None), "default")
+        # The real bulk close (2026-10-03), not only the placeholder name.
+        self.assertEqual(tts.classify_action_for_quip(
+            "close_all_windows_except"), "destructive")
 
     def test_long_text_never_quips(self):
         import random

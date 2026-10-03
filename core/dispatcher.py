@@ -202,9 +202,25 @@ _WINDOW_KEEP_RE = re.compile(
 # resolves those. ("this one" / "the current window" are fine: the action
 # keeps the window in front.)
 _WK_VAGUE_RE = re.compile(
-    r"\b(?:it|them|those|these|you|your|yourself|which|whatever|"
-    r"something|anything)\b", re.IGNORECASE)
+    r"\b(?:it|them|those|these|you|your|yours|yourself|which|whatever|"
+    r"something|anything)\b|^(?:the\s+)?one$", re.IGNORECASE)
 _WK_MAX_KEEP = 120
+# A trailing vocative or thanks is not a name to keep (review 2026-10-03:
+# "..., Jarvis" kept every window of the owner's titled with the word, and
+# "thanks" was reported as "I saw no thanks window").
+_WK_TRAIL_RE = re.compile(
+    r"(?:[\s,]+(?:jarvis|sir|thanks|thank\s+you|cheers))+[\s.!?]*$",
+    re.IGNORECASE)
+# A second command riding in the keep ("... except Claude, minimize Spotify",
+# "... and focus Chrome"): the chain splitter knows no window verbs, so the
+# command was swallowed as a name to keep (review 2026-10-03). The model
+# takes such a turn.
+_WK_SECOND_COMMAND_RE = re.compile(
+    r"(?:^|[,;&]|\band\b|\bplus\b)\s*(?:then\s+)?"
+    r"(?:minimi[sz]e|maximi[sz]e|hide|show|focus|move|snap|restore|open|"
+    r"launch|start|play|close|closed|shut|turn|set|put|mute|unmute|pause|"
+    r"resume|stop|kill|quit|exit|switch|bring|search|find|take|send|tell|"
+    r"read|remind|make|dim|skip)\b", re.IGNORECASE)
 
 
 def window_keep_route(utterance) -> str | None:
@@ -221,6 +237,7 @@ def window_keep_route(utterance) -> str | None:
         s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
         s = _strip_lead_filler(s)
         s = " ".join(_strip(s).split())
+        s = _strip(_WK_TRAIL_RE.sub("", s))
         m = _WINDOW_KEEP_RE.match(s)
         if not m:
             return None
@@ -228,9 +245,13 @@ def window_keep_route(utterance) -> str | None:
         # "... but leave Claude open": the "but" took the except slot.
         keep = re.sub(r"^(?:keep|keeping|leave|leaving)\s+", "", keep,
                       flags=re.IGNORECASE)
+        # "... but don't close Claude": the name is what follows.
+        keep = re.sub(r"^(?:do\s*n[o']?t|do\s+not)\s+(?:close|touch|"
+                      r"minimi[sz]e|hide)\s+", "", keep, flags=re.IGNORECASE)
         if (not keep or len(keep) > _WK_MAX_KEEP
                 or any(c in keep for c in "[]\r\n")
                 or _WK_VAGUE_RE.search(keep)
+                or _WK_SECOND_COMMAND_RE.search(keep)
                 or len(_split_chain(keep)) > 1
                 or re.search(r"\bthen\b", keep, re.IGNORECASE)):
             return None

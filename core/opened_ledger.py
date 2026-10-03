@@ -205,9 +205,12 @@ OPEN_ACTIONS = frozenset({
     "open_apple_music",
 })
 # Closes the brain may guess at for "close that": replaced by
-# close_last_opened, because the owner did not name a window.
+# close_last_opened, because the owner did not name a window. The bulk close
+# too (2026-10-03: the real one is close_all_windows_except): "close that"
+# never asks for every other window to go.
 GUESSED_CLOSE_ACTIONS = frozenset({
     "close_window", "close_tab", "close_app", "close_all_windows",
+    "close_all_windows_except",
 })
 _TOKEN_RE = re.compile(r"\[ACTION:\s*([a-z0-9_]+)\s*(?:,\s*(.+?))?\s*\]",
                        re.IGNORECASE)

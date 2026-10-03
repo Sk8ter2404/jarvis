@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import sys
 import types
 import unittest
@@ -181,6 +182,49 @@ class JarvisWindowTests(_ScopeBase):
                 self.assertEqual(ws.user_windows([w]), [w])
 
 
+class LiveLogConsoleTests(_ScopeBase):
+    """JARVIS's live-log console (review 2026-10-03): _show_log.ps1 and the
+    boot script open a PowerShell window titled "JARVIS LIVE LOG (...)". It
+    is spawned by the tray or the boot script, so it is neither this process
+    nor one of its python children - only its title says it is JARVIS's, and
+    the scope did not know that title: list_windows showed it and a bulk
+    close sent it WM_CLOSE."""
+
+    TITLES = ("JARVIS LIVE LOG (session_2026-01-01_00-00-00.log)",
+              "JARVIS LIVE LOG (close anytime)")
+
+    def _console(self, title, hwnd):
+        w = _Win(title, hwnd)
+        self.facts[id(w)] = ws.WindowFacts(hwnd, _OTHER + 9,
+                                           "consolewindowclass", False)
+        return w
+
+    def test_the_live_log_console_is_jarvis_and_never_listed(self):
+        for i, title in enumerate(self.TITLES):
+            with self.subTest(title=title):
+                self.assertTrue(ws.is_jarvis_title(title))
+                w = self._console(title, 0x600 + i)
+                self.assertTrue(ws.is_jarvis_window(w))
+                self.assertEqual(ws.user_windows([w]), [])
+
+    def test_its_own_words_never_name_it(self):
+        # "(close anytime)" must not let any "close ..." request name it.
+        title = self.TITLES[1]
+        self.assertFalse(ws.names_jarvis_window(
+            "close every window except Claude", title))
+        self.assertEqual(ws.matching_windows(
+            [self._console(title, 0x610)], "JARVIS LIVE LOG",
+            owner_text="close every window except Claude"), [])
+
+    def test_the_owner_naming_the_log_reaches_it(self):
+        w = self._console(self.TITLES[0], 0x611)
+        self.assertTrue(ws.names_jarvis_window("close the live log",
+                                               w.title))
+        self.assertEqual(ws.matching_windows([w], "live log",
+                                             owner_text="close the live log"),
+                         [w])
+
+
 class OwnPidsTests(unittest.TestCase):
     def test_python_and_console_children_only(self):
         kids = [types.SimpleNamespace(pid=11, name=lambda: "pythonw.exe"),
@@ -308,7 +352,26 @@ def _window_title_literals():
                 lit = node.value.value
             if lit and "JARVIS" in lit:
                 out.append((os.path.relpath(path, _ROOT), lit))
+    # PowerShell windows JARVIS opens (the live-log console): the static part
+    # of every ``$Host.UI.RawUI.WindowTitle = "..."`` in a root .ps1 script.
+    for fn in sorted(os.listdir(_ROOT)):
+        if not fn.lower().endswith(".ps1"):
+            continue
+        try:
+            with open(os.path.join(_ROOT, fn), encoding="utf-8-sig") as fh:
+                src = fh.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for m in _PS_TITLE_RE.finditer(src):
+            lit = m.group(1)
+            if "JARVIS" in lit:
+                out.append((fn, lit))
     return out
+
+
+# ``$Host.UI.RawUI.WindowTitle = "JARVIS LIVE LOG ($(...))"`` -> the literal
+# up to the first interpolation.
+_PS_TITLE_RE = re.compile(r"WindowTitle\s*=\s*[\"']([^\"'$`]*)")
 
 
 class TitleRatchetTests(unittest.TestCase):
@@ -321,6 +384,9 @@ class TitleRatchetTests(unittest.TestCase):
         # Blindness floor: the scan must still see the HUD and the reticle.
         titles = {lit for _f, lit in found}
         self.assertTrue({"JARVIS HUD", "JARVIS Reticle"} <= titles, titles)
+        # ... and the live-log console a PowerShell script titles.
+        self.assertTrue(any(f.endswith(".ps1") and lit.startswith(
+            "JARVIS LIVE LOG") for f, lit in found), found)
         missed = [(f, lit) for f, lit in found if not ws.is_jarvis_title(lit)]
         self.assertEqual(missed, [], "JARVIS window titles core.window_scope "
                                      "does not recognise - add them to "

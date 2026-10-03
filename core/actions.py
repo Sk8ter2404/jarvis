@@ -1754,6 +1754,9 @@ def _close_browser_tab(bc, w) -> bool:
 # once with close_window's terminal line. Closing more than
 # PUSHBACK_MAX_CLOSE_WINDOWS windows asks first
 # (bobert_companion._jarvis_pushback, via _close_all_windows_except_preview).
+# A bulk close never sends WM_CLOSE to a console / terminal window (that ends
+# what runs in it unsaved - _is_terminal_window) or to a window that may host
+# JARVIS (FORBIDDEN_TARGETS): those are left open and named.
 
 # Several names to keep: "Claude, Spotify", "Claude and Spotify".
 _KEEP_SPLIT_RE = re.compile(
@@ -1807,20 +1810,95 @@ def _keep_names(arg) -> list:
     return names
 
 
-def _keeps_window(w, name, front_hwnd) -> bool:
-    """True when the owner's keep ``name`` covers window ``w``: its title
-    contains the name, or its process is that app (_exe_names_app, the
-    v2.0.176 process-name rule: "except Claude" keeps claude.exe whatever
-    its windows are titled)."""
-    if name == _KEEP_FRONT:
-        return front_hwnd is not None and getattr(w, "_hWnd", None) == front_hwnd
-    key = _keep_key(name)
-    if key.lower() in (getattr(w, "title", "") or "").lower():
-        return True
-    proc = _window_process_name(w)
-    if not proc or proc.strip().lower() in _APP_HOST_PROCESSES:
+def _keep_is_app_window(w, key) -> bool:
+    """True when window ``w`` is the APP keep name ``key`` names: its process
+    is that app's (_exe_names_app, the v2.0.176 process-name rule: "except
+    Claude" keeps claude.exe whatever its windows are titled), its title ends
+    with the app's name (_title_names_app: "Claude", "Claude Code", "Deck1 -
+    PowerPoint"), or - a browser window - its page's does ("Claude - Google
+    Chrome"). Never raises."""
+    try:
+        words = _app_words(key)
+        if not words:
+            return False
+        proc = _window_process_name(w)
+        if (proc and proc.strip().lower() not in _APP_HOST_PROCESSES
+                and _exe_names_app(proc, words)):
+            return True
+        title = (getattr(w, "title", "") or "").strip()
+        if _title_names_app(title, words):
+            return True
+        parts = _TITLE_PART_SPLIT_RE.split(title)
+        return (len(parts) > 1 and _is_browser_process(w)
+                and _title_names_app(parts[-2], words))
+    except Exception:
         return False
-    return _exe_names_app(proc, _app_words(key))
+
+
+def _keep_mentions_window(w, key) -> bool:
+    """True when window ``w``'s title mentions keep name ``key`` anywhere (a
+    document, a folder, a page)."""
+    return str(key or "").lower() in (getattr(w, "title", "") or "").lower()
+
+
+def _kept_windows(scoped, name, front_hwnd) -> list:
+    """The windows among ``scoped`` (the owner's) that keep name ``name``
+    covers. "this one": the window in front. A name that is an open APP
+    keeps that app's windows (_keep_is_app_window); a name no open app
+    answers to keeps every window whose title mentions it. Review
+    2026-10-03: a bare title-substring keep held on to the live turn's File
+    Explorer window because its folder PATH mentioned "Claude", so "close
+    every window but Claude" would have closed the media player alone."""
+    if name == _KEEP_FRONT:
+        return [w for w in scoped if front_hwnd is not None
+                and getattr(w, "_hWnd", None) == front_hwnd]
+    key = _keep_key(name)
+    app = [w for w in scoped if _keep_is_app_window(w, key)]
+    return app or [w for w in scoped if _keep_mentions_window(w, key)]
+
+
+# Console and terminal windows. WM_CLOSE on one ends every program running in
+# it with no chance to save - a kill, not the X-button close this action
+# promises - and its title is whatever runs in it, so close_window's
+# title-only host rule (FORBIDDEN_TARGETS) misses a terminal titled by a
+# build, an ssh login or a coding session (review 2026-10-03). A bulk close
+# leaves them open and names them; minimizing one is harmless.
+_TERMINAL_WINDOW_CLASSES = frozenset({
+    "consolewindowclass", "cascadia_hosting_window_class",
+    "pseudoconsolewindow", "virtualconsoleclass", "mintty", "putty",
+    "org.wezfurlong.wezterm",
+})
+_TERMINAL_PROCESS_STEMS = frozenset({
+    "windowsterminal", "wt", "conhost", "openconsole", "cmd", "powershell",
+    "pwsh", "wezterm", "weztermgui", "alacritty", "mintty", "conemu",
+    "conemu64", "putty", "kitty", "hyper", "tabby", "warp",
+})
+
+
+def _is_terminal_window(w) -> bool:
+    """True for a console / terminal window (its window class or its
+    process). Never raises; False when unknown."""
+    try:
+        if _window_scope.probe(w).class_name in _TERMINAL_WINDOW_CLASSES:
+            return True
+    except Exception:
+        pass
+    try:
+        proc = _window_process_name(w)
+        return bool(proc) and _exe_stem(proc) in _TERMINAL_PROCESS_STEMS
+    except Exception:
+        return False
+
+
+def _host_label(w) -> str:
+    """A spoken name for a window a bulk close left open."""
+    try:
+        proc = _window_process_name(w)
+        if proc and _exe_stem(proc) == "windowsterminal":
+            return "Windows Terminal"
+    except Exception:
+        pass
+    return _app_label(getattr(w, "title", "") or "")
 
 
 def _is_browser_process(w) -> bool:
@@ -1887,20 +1965,25 @@ def _all_except_plan(bc, arg, closing: bool):
         forbidden = [str(t).lower() for t in bc.FORBIDDEN_TARGETS if t]
     except Exception:
         forbidden = []
-    for w in _window_scope.user_windows(every):
+    scoped = _window_scope.user_windows(every)
+    kept_by = {n: {id(w) for w in _kept_windows(scoped, n, front)}
+               for n in names}
+    for w in scoped:
         title = getattr(w, "title", "") or ""
-        hit = [n for n in names if _keeps_window(w, n, front)]
+        hit = [n for n in names if id(w) in kept_by[n]]
         if hit:
             for n in hit:
                 plan.matched.add(n)
                 if n == _KEEP_FRONT:
                     plan.labels[n] = _app_label(title)
             continue
-        if (closing and any(t in title.lower() for t in forbidden)
-                and not _is_browser_process(w)):
-            # close_window's own self-preservation rule: a terminal / python
-            # / editor window may be the one running JARVIS. (A browser tab
-            # that merely mentions "python" is not.)
+        if closing and (_is_terminal_window(w) or (
+                any(t in title.lower() for t in forbidden)
+                and not _is_browser_process(w))):
+            # A console / terminal window: WM_CLOSE would end what runs in
+            # it unsaved. And close_window's own self-preservation rule: a
+            # terminal / python / editor window may be the one running
+            # JARVIS. (A browser tab that merely mentions "python" is not.)
             plan.hosts.append(w)
             continue
         if not closing and getattr(w, "isMinimized", False) is True:
@@ -1984,7 +2067,11 @@ def _all_windows_except(arg: str, closing: bool) -> str:
         line = f"Nothing else to {verb}, sir; kept {kept}."
     extra = []
     if plan.hosts:
-        labels = [_app_label(getattr(w, "title", "")) for w in plan.hosts]
+        labels: list = []
+        for w in plan.hosts:
+            label = _host_label(w)
+            if label not in labels:
+                labels.append(label)
         extra.append(f"I left {_spoken_list(labels)} open; "
                      f"{'it' if len(labels) == 1 else 'they'} may be running "
                      "me.")
@@ -2004,8 +2091,10 @@ def _all_windows_except(arg: str, closing: bool) -> str:
 
 def _act_close_all_windows_except(arg: str) -> str:
     """close_all_windows_except, <names to keep>: close every one of the
-    owner's windows except the named ones (title or process name). JARVIS's
-    own windows and the shell's are always kept. WM_CLOSE only, never a
+    owner's windows except the named ones (an open app's windows by process
+    or title, else any title that mentions the name). JARVIS's own windows
+    and the shell's are always kept; console / terminal windows and windows
+    that may host JARVIS are left open and named. WM_CLOSE only, never a
     kill."""
     return _all_windows_except(arg, closing=True)
 

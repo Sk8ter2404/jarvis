@@ -84,6 +84,57 @@ class WindowKeepRouteTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(self.route(text))
 
+    def test_a_trailing_vocative_or_thanks_is_not_a_name_to_keep(self):
+        # Review 2026-10-03: "..., Jarvis" was kept as a second name, so any
+        # of the owner's windows titled with the word (a JARVIS folder or
+        # workspace) stayed open and the summary said "kept Claude and
+        # Jarvis"; "thanks" became "I saw no thanks window".
+        for text in ("close all windows except Claude, Jarvis.",
+                     "close everything but Claude, thanks",
+                     "close every window except Claude thank you",
+                     "close all windows except Claude, sir"):
+            with self.subTest(text=text):
+                self.assertEqual(self.route(text),
+                                 f"[ACTION: {CLOSE}, Claude]")
+        # "except Jarvis" itself is the model's to resolve.
+        self.assertIsNone(self.route("close all windows except Jarvis"))
+
+    def test_but_dont_close_x_keeps_x(self):
+        self.assertEqual(self.route("close all windows but don't close "
+                                    "Claude"), f"[ACTION: {CLOSE}, Claude]")
+        self.assertEqual(self.route("minimize everything but do not "
+                                    "minimize Claude"),
+                         f"[ACTION: {MINIMIZE}, Claude]")
+
+    def test_a_second_window_command_is_left_to_the_model(self):
+        # Review 2026-10-03: the chain splitter's verb list has no window
+        # verbs, so "..., minimize Spotify" rode inside the keep: Spotify
+        # was KEPT (its name was in the keep) and never minimized, while the
+        # route claimed the turn.
+        for text in ("close all windows except Claude, minimize Spotify",
+                     "close everything but Claude and hide Spotify",
+                     "close all windows except Claude and focus Chrome",
+                     "close everything except Claude and move Chrome to "
+                     "the left monitor",
+                     "minimize everything but Claude and maximize Excel"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.route(text))
+
+    def test_a_keep_that_names_no_window_is_left_to_the_model(self):
+        for text in ("close all but one", "close every window but the one",
+                     "close all windows except yours"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.route(text))
+
+    def test_minimize_everything_and_close_this_window_are_not_claimed(self):
+        # Neither names a window to keep: "minimize everything" must never
+        # become a close, and "close this window" is close_window's.
+        for text in ("minimize everything", "minimise all windows",
+                     "hide everything", "close this window",
+                     "Jarvis, close this window please", "close that window"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.route(text))
+
     def test_the_brain_sees_the_actions_for_these_requests(self):
         # When the route declines (a second command rides along), the model
         # must still have the token: the local prompt is sliced per turn, so

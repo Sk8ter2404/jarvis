@@ -501,6 +501,7 @@ _DESTRUCTIVE_ACTIONS: frozenset[str] = frozenset({
     "kill_process", "force_quit",
     # Window/app slaughter
     "close_window", "close_all_windows", "close_app",
+    "close_all_windows_except",
     # File system
     "delete_file", "empty_recycle_bin", "wipe_screenshots",
 })
