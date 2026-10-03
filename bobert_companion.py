@@ -36201,15 +36201,43 @@ def _note_once_per_turn_ran(name, arg, result, ran_here) -> None:
 # JARVIS itself opened last, never anything else (core.opened_ledger). A close
 # the brain guessed at (close_window <title>) is replaced by it: the owner
 # said "that", he did not name a window. Once per turn.
+# A yes to JARVIS's own offer "Shall I close that and open X?" (offer-yes,
+# _take_open_offer) is the same request (release-177 interaction audit,
+# 2026-10-02): the owner's words are only "Jarvis, yes.", so the turn's
+# accepted offer is read too (_close_then_open_request).
+def _note_turn_accepted_offer(offer) -> None:
+    """Record the offer this owner turn accepted in its grounding ledger
+    (_turn_grounding), for _close_then_open_request. Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is not None and offer:
+            frame["accepted_offer"] = str(offer)
+    except Exception:
+        pass
+
+
+def _close_then_open_request(frame) -> str:
+    """The words that asked for "close that and open X" this turn: the
+    owner's own, or the offer of JARVIS's he just said yes to; "" when
+    neither does. Never raises."""
+    try:
+        for said in (frame.get("user_text"), frame.get("accepted_offer")):
+            if said and _opened_ledger.is_close_then_open(said):
+                return str(said)
+    except Exception:
+        pass
+    return ""
+
+
 def _enforce_close_then_open(reply: str) -> str:
     """``reply`` with the close of what JARVIS opened last put before its
-    first open, for a "close that and open X" owner turn; else unchanged.
-    Never raises."""
+    first open, for a "close that and open X" owner turn (or a yes to that
+    offer); else unchanged. Never raises."""
     try:
         frame = getattr(_turn_grounding, "frame", None)
         if (frame is None or frame.get("close_then_open_done")
                 or "close_last_opened" not in ACTIONS
-                or not _opened_ledger.is_close_then_open(frame["user_text"])):
+                or not _close_then_open_request(frame)):
             return reply
         if any(m.group(1).strip().lower() == "close_last_opened"
                for m in _ACTION_RE.finditer(reply or "")):
@@ -36235,8 +36263,8 @@ def _dropped_open_after_close(results) -> str:
     else "". Once per turn. Never raises."""
     try:
         frame = getattr(_turn_grounding, "frame", None)
-        if (frame is None or frame.get("close_then_open_nudged")
-                or not _opened_ledger.is_close_then_open(frame["user_text"])):
+        asked = _close_then_open_request(frame) if frame is not None else ""
+        if frame is None or frame.get("close_then_open_nudged") or not asked:
             return ""
         names = {str(n).lower() for (n, _r, _i) in results}
         closes = _opened_ledger.GUESSED_CLOSE_ACTIONS | {"close_last_opened"}
@@ -36245,7 +36273,7 @@ def _dropped_open_after_close(results) -> str:
             return ""
         frame["close_then_open_nudged"] = True
         return ("the owner asked to close it AND then open something "
-                f"(\"{frame['user_text'][:160]}\"), but no open action was "
+                f"(\"{asked[:160]}\"), but no open action was "
                 "emitted — the open step was dropped; emit it now")
     except Exception:
         return ""
@@ -43539,6 +43567,10 @@ def _run_llm_dispatch_body(text: str) -> str:
     # prompt yes accepts it and _call_llm hands it to the brain (see
     # _take_open_offer, 2026-10-02).
     _offer_yes = _take_open_offer(text)
+    # ... and it is this turn's request too: "Jarvis, yes." to "Shall I close
+    # that and open <service>?" is "close that and open <service>" (see
+    # _close_then_open_request).
+    _note_turn_accepted_offer(_offer_yes)
     # Glance-response fast path: if the focused window changed in the
     # last few seconds AND the utterance is ambiguous ("what is
     # this?" / "should I worry?" / "wait, what?" / "explain"), grab
