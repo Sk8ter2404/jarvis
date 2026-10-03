@@ -208,10 +208,13 @@ class StartTests(_Base):
                                 str(port)])
         self.assertNotIn("PYTHONPATH", kw["env"])
         if os.name == "nt":
+            # getattr: tools/run_tests_ci_sim.py removes CREATE_NO_WINDOW to
+            # imitate the Linux runner.
             import subprocess
-            self.assertTrue(kw["creationflags"] & subprocess.CREATE_NO_WINDOW)
-            self.assertTrue(kw["creationflags"]
-                            & subprocess.CREATE_NEW_PROCESS_GROUP)
+            self.assertEqual(
+                kw["creationflags"],
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
             self.assertFalse(kw["creationflags"]
                              & getattr(subprocess, "DETACHED_PROCESS", 0))
         else:
