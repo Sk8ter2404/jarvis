@@ -115,13 +115,35 @@ def reset() -> None:
         _entries.clear()
 
 
+_WEB_TARGET_RE = re.compile(r"^[\w-]+(?:\.[\w-]+)*\.([A-Za-z]{2,24})(?:[/?#]|$)")
+# "notepad.exe" names an app, not a site.
+_FILE_EXTENSIONS = frozenset({
+    "exe", "lnk", "bat", "cmd", "msc", "msi", "ps1", "py", "txt", "pdf",
+    "docx", "xlsx", "pptx", "png", "jpg", "jpeg", "mp3", "mp4", "url",
+})
+
+
+def is_web_target(target) -> bool:
+    """True when an entry's target is a web page (a URL or a bare host such
+    as "max.com"), not an app name ("notepad", "notepad.exe"). Never
+    raises."""
+    try:
+        t = str(target or "").strip()
+        if "://" in t:
+            return True
+        m = _WEB_TARGET_RE.match(t)
+        return bool(m) and m.group(1).lower() not in _FILE_EXTENSIONS
+    except Exception:
+        return False
+
+
 def describe(entry) -> str:
     """A short spoken name for an entry: "YouTube page", "Notepad window"."""
     try:
         from urllib.parse import urlsplit
         t = str(entry.target or "")
         host = ""
-        if "://" in t or re.match(r"^[\w-]+(?:\.[\w-]+)+(?:/|$)", t):
+        if is_web_target(t):
             host = (urlsplit(t if "://" in t else "https://" + t).hostname
                     or "")
         if host:

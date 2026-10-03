@@ -65,10 +65,19 @@ class LedgerTests(unittest.TestCase):
                 ("https://www.youtube.com/results?search_query=x", "YouTube page"),
                 ("https://play.hbomax.com/search?q=x", "HBO Max page"),
                 ("https://www.google.com/search?q=x", "Google page"),
-                ("notepad", "notepad window")):
+                ("notepad", "notepad window"),
+                ("notepad.exe", "notepad.exe window")):
             with self.subTest(target=target):
                 e = L.Opened("x", target, None, "window", None, "", 0.0)
                 self.assertEqual(L.describe(e), want)
+
+    def test_is_web_target(self):
+        for target, want in (("https://example.com/x", True), ("max.com", True),
+                             ("www.netflix.com/search?q=x", True),
+                             ("notepad", False), ("notepad.exe", False),
+                             ("Spotify", False), ("", False), (None, False)):
+            with self.subTest(target=target):
+                self.assertIs(L.is_web_target(target), want)
 
 
 class CloseThenOpenTests(unittest.TestCase):

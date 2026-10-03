@@ -29,8 +29,10 @@ A single 200 proves nothing on a site that serves every path, so each check is
 DIFFERENTIAL: the search URL against a nonsense path on the same host.
 
   * HBO Max  play.hbomax.com/search?q=  -> 200 on the player host, while
-    /search (no q), /searchzzz, /search/zzz and even /home redirect away to
-    www.hbomax.com - the server recognises /search exactly when q is given.
+    /searchzzz, /search/zzz and /home redirect away to www.hbomax.com (a
+    review re-check the same day, desktop Chrome UA, saw bare /search answer
+    200 too; a non-browser UA is redirected to www.hbomax.com/?q= - the
+    player is a single-page app, so /search is its route either way).
     The guessed www.hbomax.com/search?q= is a 404 ("Oops"). play.max.com
     301-redirects to play.hbomax.com.
   * Netflix  www.netflix.com/search?q=  -> 302 to /login?nextpage=<the same
@@ -42,7 +44,8 @@ DIFFERENTIAL: the search URL against a nonsense path on the same host.
     nonsense path is a 404.
   * YouTube  www.youtube.com/results?search_query=  -> 200 with videoIds.
   * Apple TV tv.apple.com/search?term=  -> 301 to /us/search?term=, 200; the
-    query word on the page 63 times for a real show, 10 for a nonsense one
+    query word on the page 63 times for a real show, 10 for a nonsense one;
+    /us/<nonsense> is a 404 (a bare /<nonsense> 301s to the home page)
     (Apple renamed "Apple TV+" to "Apple TV" in 2025).
   * Disney+  NO verified pattern: /search, /search?q=, /browse/search and
     /en-us/search?q= are all 404 logged out, exactly like a nonsense path.
@@ -316,6 +319,10 @@ for _k, _svc in SERVICES.items():
         if "_" not in _w:
             _SPOKEN_TO_KEY[_w] = _k
 _SPOKEN_TO_KEY.pop("yt", None)   # too short to trust in free speech
+# Names that mean the video service only after a PLAY verb: "find / look up
+# X on Amazon" is shopping far more often than a show (review 2026-10-02), so
+# a FIND needs "Prime Video" / "Amazon Video"; "play X on Amazon" still plays.
+_PLAY_ONLY_NAMES = frozenset({"amazon", "prime", "amazon prime"})
 _ROUTE_RE = re.compile(
     r"^(?P<verb>" + _alt(_FIND_VERBS + _PLAY_VERBS) + r")\s+(?P<title>.+?)\s+"
     r"(?:on|in|from)\s+(?:the\s+)?(?P<svc>" + _alt(_SPOKEN_TO_KEY) + r")"
@@ -388,7 +395,11 @@ def streaming_route(utterance, *, allow_play: bool = True,
             return None
         verb = " ".join(m.group("verb").lower().split())
         title = " ".join(m.group("title").split()).strip(" ,'\"")
-        key = _SPOKEN_TO_KEY.get(" ".join(m.group("svc").lower().split()))
+        spoken = " ".join(m.group("svc").lower().split())
+        key = _SPOKEN_TO_KEY.get(spoken)
+        # "find out what's new on Netflix" asks a question; it names no title.
+        if verb == "find" and re.match(r"(?i)out\b", title):
+            return None
         tail = re.findall(r"[a-z']+", (m.group("tail") or "").lower())
         if (not key or not title or len(title) > _ROUTE_MAX_TITLE
                 or title.lower() in _VAGUE_TITLES
@@ -398,6 +409,8 @@ def streaming_route(utterance, *, allow_play: bool = True,
             return None
         play = verb in _PLAY_VERBS or bool(_TAIL_PLAY_WORDS & set(tail))
         if key == "youtube" and play:
+            return None
+        if not play and spoken in _PLAY_ONLY_NAMES:
             return None
         if play and allow_play:
             return f"[ACTION: play_streaming, {key}|{title}]"
@@ -423,7 +436,8 @@ _SIGN_IN_RE = re.compile(
     r"\b(?:sign[\s-]?in|log[\s-]?in|signin|login)\b", re.IGNORECASE)
 _NO_SIGN_IN_RE = re.compile(
     r"\b(?:no|without|not\s+(?:asking|showing|requiring)|doesn'?t\s+"
-    r"(?:show|ask|require|need)|isn'?t\s+(?:asking|showing))\s+(?:a\s+|any\s+|"
+    r"(?:show|ask|require|need)|isn'?t\s+(?:asking|showing))\s+"
+    r"(?:(?:you|me|him|the\s+(?:viewer|user|owner))\s+)?(?:a\s+|any\s+|"
     r"for\s+(?:a\s+)?|to\s+)?(?:sign[\s-]?in|log[\s-]?in|signin|login)",
     re.IGNORECASE)
 _ERROR_PAGE_RE = re.compile(
@@ -436,7 +450,11 @@ _ERROR_PAGE_RE = re.compile(
 def wall_kind(text) -> Optional[str]:
     """"sign_in", "error" or None for a description of a page. A sign-in
     prompt wins over an error (the live HBO Max page showed both, and the
-    sign-in is what the owner can fix). Never raises."""
+    sign-in is what the owner can fix). Never raises.
+
+    A HINT only: any mention of "Sign In" counts, so a footer link under real
+    results reads as "sign_in" too. A caller must confirm a hint with the
+    strict ``wall_question`` look before it ends a turn (review 2026-10-02)."""
     try:
         t = " ".join(str(text or "").split())
         if not t:
@@ -478,6 +496,9 @@ def wall_question(key) -> str:
         "LOG IN (a Sign In / Log In button or form, or a sign-up / pricing "
         "page with no profile and no search results), or is it an ERROR page "
         "(for example 'Oops', 'this link isn't working', 'page not found')? "
+        "A Sign In link that is only in the page footer, under search "
+        "results, a title page or a playing video, does not count - that is "
+        "OK. "
         "Reply with exactly one word first - SIGNIN, ERROR or OK - then a "
         "short reason.")
 

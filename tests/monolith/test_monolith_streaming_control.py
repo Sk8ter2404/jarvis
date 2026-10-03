@@ -176,6 +176,13 @@ class StreamingRouteReplayTests(_StreamingBase):
                 cfg = self.bc._STREAMING_SERVICES[key]
                 self.assertEqual(cfg["home"], S.SERVICES[key].home)
                 self.assertEqual(cfg["search_url"], S.SERVICES[key].search)
+        # The sign-in check (the ONE source see_screen's wall check reads
+        # too): every account service, never YouTube, which plays signed out.
+        for key in ("max", "netflix", "hulu", "prime_video", "apple_tv",
+                    "disney_plus"):
+            self.assertIs(self.bc._STREAMING_SERVICES[key].get("sign_in_check"),
+                          True, key)
+        self.assertIsNone(self.bc._STREAMING_SERVICES["youtube"].get("sign_in_check"))
         self.assertEqual(self.bc._normalize_service("Apple TV+"), "apple_tv")
         self.assertEqual(self.bc._normalize_service("hbo max"), "max")
 
@@ -321,6 +328,56 @@ class SignInWallReplayTests(_StreamingBase):
         self.click.assert_not_called()
 
 
+@requires_monolith
+class SeeScreenWallReplayTests(_StreamingBase):
+    """Review 2026-10-02: see_screen's own wall check fired on ANY "sign in"
+    in the free answer - a footer link under real results, and YouTube's
+    signed-out "Sign in" button. Through the real dispatch: the free answer
+    only hints, the strict look decides, and YouTube is never a wall."""
+
+    def setUp(self):
+        super().setUp()
+        # The look must be pinned to the page's monitor; a whole-desktop
+        # capture here would photograph the real screen.
+        self._p(self.bc, "take_all_monitor_screenshots",
+                side_effect=AssertionError("whole-desktop capture"))
+
+    def _look(self, target, answers, title):
+        page = _Win(title + SUFFIX, 0x700, (-8, -8, 2576, 1456))
+        self.windows[:] = [page]
+        self.ledger.note_opened("open_url", target, hwnd=0x700, kind="tab",
+                                monitor="middle", title=page.title)
+        self.vision.side_effect = list(answers)
+        self._dispatch("Jarvis, continue.",
+                       "As you wish, sir. [ACTION: see_screen]",
+                       ["Here is what the page shows, sir."])
+
+    def test_a_footer_sign_in_link_is_not_a_wall(self):
+        footer = ("Search results for the show, seasons 1 to 7. The footer "
+                  "has Help Center, Sign In and Privacy links.")
+        self._look("https://play.hbomax.com/search?q=Some%20Show",
+                   [footer, "OK - search results are shown"], "HBO Max")
+        self.assertNotIn(SIGN_IN_LINE, self.spoken)
+        self.gfr.assert_called()                      # the turn goes on
+        self.shot.assert_called_once_with(monitor="middle")
+
+    def test_youtube_signed_out_is_never_a_wall(self):
+        self._look("https://www.youtube.com/results?search_query=some+show",
+                   ["YouTube results for the show; a Sign in button sits at "
+                    "the top right.", "SIGNIN"], "some show - YouTube")
+        self.assertFalse(any("isn't signed in" in s for s in self.spoken))
+        self.assertEqual(self.vision.call_count, 1)   # no wall look at all
+        self.gfr.assert_called()
+
+    def test_a_confirmed_error_page_is_one_line_and_stops(self):
+        self._look("https://play.hbomax.com/search?q=Some%20Show",
+                   ["The page says 'Oops! Looks like this link isn't "
+                    "working.'", "ERROR - an error page"], "HBO Max")
+        self.assertEqual(len(self.spoken), 1)
+        self.assertIn("HBO Max showed an error page", self.spoken[0])
+        self.gfr.assert_not_called()
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  S4 - click mapping on four monitors, and one label scheme for vision
 # ════════════════════════════════════════════════════════════════════════════
@@ -358,6 +415,27 @@ class ClickMappingTests(_Base):
         got = self._map("left", (64, 36), [(128, 72), (256, 144)],
                         pass2=(132, 70))
         self.assertEqual(got, (-256 + 132, 70))
+
+    def test_a_refined_crop_inside_the_left_monitor_keeps_its_offset(self):
+        # Review 2026-10-02: full-size left monitor at x=-2560, a downscaled
+        # pass-1 shot, and a pass-2 crop that does NOT start at the image's
+        # corner - the crop's own offset and the negative origin both apply.
+        full = {"left": (-2560, 0, 2560, 1440), "middle": (0, 0, 2560, 1440),
+                "right": (2560, 0, 2560, 1440), "top": (0, -1440, 2560, 1440)}
+        shots = iter([_png(1568, 882), _png(2560, 1440)])
+        with mock.patch.object(self.bc, "MONITORS", full), \
+                mock.patch.object(self.bc, "take_screenshot",
+                                  side_effect=lambda **k: next(shots)), \
+                mock.patch.object(self.bc, "_query_vision_for_coords",
+                                  side_effect=[(1200, 600), (260, 240)]), \
+                mock.patch.object(self.bc, "_captured_region", return_value=None):
+            got = self._quiet(self.bc.find_click_target, "the target",
+                              monitor="left")
+        # pass 1 (1200, 600) -> (1959, 979) at full size; the crop starts at
+        # (1709, 729); pass 2 (260, 240) -> (1969, 969); + origin (-2560, 0).
+        self.assertEqual(got, (-591, 969))
+        from core.monitor_geometry import monitor_at
+        self.assertEqual(monitor_at(*got, full), "left")
 
     def test_the_whole_desktop_maps_back_onto_the_right_monitor(self):
         from core.monitor_geometry import monitor_at
@@ -413,6 +491,19 @@ class VisionLabelTests(_StreamingBase):
                 self.assertTrue(seen["content"][i - 1]["text"].startswith("Image "))
         self.assertEqual(kinds.count("image"), 4)
         self.assertEqual(out, "It is on the LEFT monitor.")
+
+    def test_his_wake_word_keeps_the_chat_note_in(self):
+        # Review 2026-10-02: 'The owner asked: "Jarvis, ..."' read as a
+        # question ABOUT JARVIS, so the multi-monitor look lost the note.
+        seen = {}
+        with mock.patch("core.config.model_route", return_value="local"), \
+                mock.patch.object(self.bc, "_call_local_vision",
+                                  side_effect=lambda p, i, max_tokens=600:
+                                  seen.setdefault("p", p) and "ok"):
+            self.bc.ask_vision_multi(
+                'The owner asked: "Jarvis, what does the page say?". Answer '
+                "that from what is on the screen.", self._images())
+        self.assertIn("Ignore chat and assistant windows", seen["p"])
 
     def test_a_question_about_the_chat_keeps_the_note_out(self):
         seen = {}

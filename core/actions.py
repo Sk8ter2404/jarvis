@@ -143,7 +143,8 @@ def _note_browser_tab_open(via: str, url: str, before) -> None:
             return
         if (hwnd, title) == (before[0], before[1]):
             return
-        if _browser_page_title(bc, title) is None:
+        page = _browser_page_title(bc, title)
+        if page is None or not _title_fits_url(page, url):
             return
         from core.config import MONITORS
         from core import monitor_geometry as _mg
@@ -153,6 +154,52 @@ def _note_browser_tab_open(via: str, url: str, before) -> None:
                         title=title)
     except Exception:
         pass
+
+
+# Host labels that say nothing about which site a page is.
+_GENERIC_HOST_LABELS = frozenset({
+    "www", "com", "net", "org", "edu", "gov", "co", "uk", "us", "io", "app",
+    "play", "web", "m", "en", "tv",
+})
+
+
+def _title_fits_url(page: str, url: str) -> bool:
+    """True when browser page title ``page`` plausibly IS the page at ``url``:
+    it names the site (a host label such as "youtube" / "google", or the
+    streaming service's name), or carries the search words. Review
+    2026-10-02: a foreground title that merely CHANGED (his own mail tab
+    ticking from "(2)" to "(3)" while the open landed nowhere visible) was
+    recorded as the tab JARVIS opened, so "close that" would have closed it.
+    An unknown title records nothing - "close that" then says it has no
+    record instead of guessing. Never raises."""
+    try:
+        low = (page or "").lower()
+        squashed = re.sub(r"[^a-z0-9]", "", low)
+        if not squashed:
+            return False
+        parts = urllib.parse.urlsplit(url if "://" in url else "https://" + url)
+        host = (parts.hostname or "").lower()
+        for label in host.split("."):
+            if (len(label) >= 3 and label not in _GENERIC_HOST_LABELS
+                    and label in squashed):
+                return True
+        try:
+            from core import streaming_search as _ss
+            key = _ss.service_for_url(url)
+            if key and re.sub(r"[^a-z0-9]", "",
+                              _ss.service_name(key).lower()) in squashed:
+                return True
+        except Exception:
+            pass
+        query = " ".join(v for vals in urllib.parse.parse_qs(parts.query).values()
+                         for v in vals)
+        words = [w for w in re.findall(r"[a-z0-9']+", query.lower())
+                 if len(w) >= 3]
+        if words and sum(w in low for w in words) * 2 >= len(words):
+            return True
+    except Exception:
+        return False
+    return False
 
 
 def _streaming_url_fix(url: str, bare_names: bool = True) -> "tuple[str, str]":
@@ -1731,6 +1778,15 @@ def _act_close_last_opened(_arg: str = "") -> str:
         _ol.forget(entry)
         return (f"REFUSED: '{title}' looks like my own host process, so I "
                 "didn't close it")
+    # A WEB PAGE JARVIS opened only ever lives in a browser window. A record
+    # whose window is now something else - open_on_monitor took an unrelated
+    # fresh window (a reminder popup in the same 2 s), or Windows reused the
+    # handle - is not the page he means (review 2026-10-02).
+    if _ol.is_web_target(entry.target) and _browser_page_title(bc, title) is None:
+        _ol.forget(entry)
+        return (f"didn't close it: '{title}' isn't the browser window I "
+                f"opened the {label} in, so I left it; ask him to name the "
+                "window")
     if entry.kind == "tab":
         if (_browser_page_title(bc, title) is None
                 or not _same_page_title(bc, title, entry.title)):
@@ -2987,6 +3043,19 @@ _CONTROL_WORDS = frozenset({
 })
 # Words that alone are only an address, never a steer.
 _CONTROL_ADDRESS = frozenset({"jarvis", "sir", "and"})
+# Whole steering phrases the word list can't hold without swallowing real
+# questions (review 2026-10-02): "keep trying", "continue what you were
+# doing", "carry on with it", "pick up where you left off", "finish it".
+_CONTROL_PHRASE_RE = re.compile(
+    r"(?i)^(?:(?:jarvis|sir|please|ok(?:ay)?|alright|yes|yeah|and|so|now|"
+    r"then|just)\W+)*"
+    r"(?:continue|carry\s+on|go\s+on|go\s+ahead|keep\s+(?:going|trying|at\s+it)"
+    r"|proceed|resume|try\s+(?:it\s+|that\s+)?again|"
+    r"finish\s+(?:it|that|up|the\s+job)|"
+    r"pick\s+(?:it\s+)?up\s+where\s+you\s+left\s+off|do\s+it)"
+    r"(?:\W+(?:with\s+(?:it|that|this)|what\s+you\s+were\s+doing|"
+    r"where\s+you\s+left\s+off|from\s+there|please|sir|jarvis|then|now|"
+    r"again))*\W*$")
 _SEE_SCREEN_PAGE_Q = (
     "What is on the screen in the browser window showing {page}? Read the "
     "main content, search results or error messages.")
@@ -2994,20 +3063,27 @@ _VISION_CHAT_GUARD = (
     " Ignore chat and assistant windows (the Claude app, the JARVIS console, "
     "terminals) unless the question is about them.")
 # A question ABOUT a chat / messaging / terminal window keeps the note out
-# (the Teams nudger asks about Teams' chat sidebar).
+# (the Teams nudger asks about Teams' chat sidebar). Not "jarvis" (review
+# 2026-10-02): in wake-word mode nearly every owner question starts "Jarvis,
+# ...", which dropped the note from exactly the looks live vision answered
+# from the chat window ("the JARVIS console" still counts, via "console").
+# Not a bare "log" either: "log in" is a page's button, not a log window.
 _CHAT_TOPIC_RE = re.compile(
-    r"(?i)\b(?:chats?|assistant|claude|jarvis|console|terminals?|powershell|"
-    r"command\s+prompt|transcript|logs?|teams|slack|discord|messenger|"
-    r"e-?mail|inbox|mail)\b")
+    r"(?i)\b(?:chats?|assistant|claude|console|terminals?|powershell|"
+    r"command\s+prompt|transcript|logs|log\s+(?:file|window|output)|teams|"
+    r"slack|discord|messenger|e-?mail|inbox|mail)\b")
 
 
 def _is_control_utterance(text) -> bool:
     """True for words that steer the turn but ask nothing: "Jarvis,
     continue.", "go on", "try again please". Never raises."""
     try:
-        words = re.findall(r"[a-z']+", str(text or "").lower())
-        return (bool(words) and all(w in _CONTROL_WORDS for w in words)
-                and any(w not in _CONTROL_ADDRESS for w in words))
+        s = " ".join(str(text or "").split())
+        words = re.findall(r"[a-z']+", s.lower())
+        if (words and all(w in _CONTROL_WORDS for w in words)
+                and any(w not in _CONTROL_ADDRESS for w in words)):
+            return True
+        return bool(words) and bool(_CONTROL_PHRASE_RE.match(s))
     except Exception:
         return False
 
@@ -3053,20 +3129,33 @@ def _with_chat_guard(q: str) -> str:
     return (q or "").rstrip() + _VISION_CHAT_GUARD
 
 
-def _page_wall_result(answer, opened) -> str:
-    """S5: when the vision answer about the page JARVIS opened on a streaming
-    service says it is a sign-in wall ("Sign In", "Log in") or an error page
-    ("Oops ... isn't working"), the one plain TERMINAL line that ends the
-    turn - no clicking around a page that cannot play; else "". Never
-    raises."""
+def _page_wall_result(answer, opened, bc=None, png=None) -> str:
+    """S5: when the page JARVIS opened on an account streaming service is a
+    sign-in wall ("Sign In", "Log in") or an error page ("Oops ... isn't
+    working"), the one plain TERMINAL line that ends the turn - no clicking
+    around a page that cannot play; else "". Never raises.
+
+    The free ``answer`` is only a HINT (core.streaming_search.wall_kind
+    counts any "Sign In", a footer link under real results included - review
+    2026-10-02). A hint is CONFIRMED with the strict SIGNIN / ERROR / OK look
+    (wall_question) at the same image ``png``, the one _streaming_page_wall
+    asks. Only a service whose _STREAMING_SERVICES entry carries
+    "sign_in_check" is checked: YouTube plays signed out and always shows
+    "Sign in", so a look at a YouTube page is never a wall."""
     try:
         from core import streaming_search as _ss
         from core.failure_markers import TERMINAL_FAILURE_PREFIX
         key = _ss.service_for_url(getattr(opened, "target", "") or "")
-        if not key:
+        if not key or bc is None or png is None:
             return ""
-        kind = _ss.wall_kind(answer)
-        if not kind:
+        table = getattr(bc, "_STREAMING_SERVICES", None)
+        cfg = table.get(key) if isinstance(table, dict) else None
+        if not (isinstance(cfg, dict) and cfg.get("sign_in_check") is True):
+            return ""
+        if not _ss.wall_kind(answer):
+            return ""
+        kind = _ss.parse_wall_verdict(bc.ask_vision(_ss.wall_question(key), png))
+        if kind not in ("sign_in", "error"):
             return ""
         print(f"  [vision] {_ss.service_name(key)} page is a {kind} wall - "
               "stopping", flush=True)
@@ -3226,7 +3315,7 @@ def _act_see_screen(question: str) -> str:
     print(f"  [vision] Got answer ({len(result)} chars)", flush=True)
     bc._push_screen_context(monitor, q, result, {monitor: png})
     if _about_opened:
-        _wall = _page_wall_result(result, _opened)
+        _wall = _page_wall_result(result, _opened, bc=bc, png=png)
         if _wall:
             return _wall
     return result

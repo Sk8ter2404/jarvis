@@ -163,6 +163,24 @@ class StreamingRouteTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(S.streaming_route(text))
 
+    def test_shopping_on_amazon_is_not_a_prime_video_search(self):
+        # Review 2026-10-02: "find / look up X on Amazon" is shopping far more
+        # often than a show, and the route opened a Prime Video search for
+        # "headphones" before the brain could see it. A FIND needs a name that
+        # can only mean the video service; a PLAY on Amazon is still a show.
+        for text in ("look up headphones on Amazon",
+                     "find a phone case on amazon",
+                     "search for a new monitor on Amazon Prime",
+                     "find cheap flights on prime",
+                     # "find out ..." is a question, not a title to search.
+                     "find out what's new on Netflix"):
+            with self.subTest(text=text):
+                self.assertIsNone(S.streaming_route(text))
+        self.assertEqual(S.streaming_route("find Reacher on Prime Video"),
+                         "[ACTION: streaming_search, prime_video|Reacher]")
+        self.assertEqual(S.streaming_route("play The Boys on Amazon"),
+                         "[ACTION: play_streaming, prime_video|The Boys]")
+
     def test_switches(self):
         self.assertIsNone(S.streaming_route("play Dark on Netflix", allow_play=False))
         self.assertIsNone(S.streaming_route("find Dark on Netflix", allow_find=False))
@@ -188,6 +206,7 @@ class SignInWallTests(unittest.TestCase):
                 ("Search results for the show; the viewer is signed in as Guest.", None),
                 ("There is no sign-in prompt; three seasons are listed.", None),
                 ("The page is not asking to sign in. It lists episodes.", None),
+                ("The page doesn't ask you to sign in; it shows results.", None),
                 ("A grid of show posters.", None), ("", None), (None, None)):
             with self.subTest(text=text):
                 self.assertEqual(S.wall_kind(text), want)
@@ -213,6 +232,8 @@ class SignInWallTests(unittest.TestCase):
         self.assertIn("HBO Max", q)
         for word in ("SIGNIN", "ERROR", "OK", "chat"):
             self.assertIn(word, q)
+        # A footer link under a working page is not a wall (review fix).
+        self.assertIn("footer", q)
 
 
 if __name__ == "__main__":

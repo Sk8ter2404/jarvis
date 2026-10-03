@@ -167,14 +167,16 @@ class LedgerFeedTests(_Base):
 
     def test_open_url_records_the_tab_that_came_to_the_front(self):
         before = (0x10, "Inbox - Mail", (0, 0, 800, 600))
-        after = (0x11, "Some Page" + SUFFIX, (-2560, 0, 2560, 1400))
+        # The title names the site it opened (see _title_fits_url).
+        after = (0x11, "Some Page - Example" + SUFFIX, (-2560, 0, 2560, 1400))
         self.bc._read_focused_window.side_effect = [before, after]
         with mock.patch.object(A, "_loaded_bc", return_value=self.bc), \
                 mock.patch.object(A.webbrowser, "open"):
             A._act_open_url("https://example.com/page")
         e = L.last_opened()
         self.assertEqual((e.via, e.hwnd, e.kind, e.monitor, e.title),
-                         ("open_url", 0x11, "tab", "left", "Some Page" + SUFFIX))
+                         ("open_url", 0x11, "tab", "left",
+                          "Some Page - Example" + SUFFIX))
 
     def test_nothing_new_in_front_records_nothing(self):
         same = (0x11, "His Page" + SUFFIX, (0, 0, 2560, 1400))
@@ -183,6 +185,31 @@ class LedgerFeedTests(_Base):
                 mock.patch.object(A.webbrowser, "open"):
             A._act_web_search("anything")
         self.assertIsNone(L.last_opened())
+
+    def test_his_own_tab_changing_title_is_not_recorded_as_mine(self):
+        # Review 2026-10-02: the open landed nowhere visible, and in those 3 s
+        # his own mail tab's title ticked over ("(2)" -> "(3)"). Same window,
+        # new title, a browser: it was recorded as JARVIS's tab, so "close
+        # that and open X" would have closed HIS mail. The title must be the
+        # page JARVIS opened (its site, or its search words).
+        self.bc._read_focused_window.side_effect = [
+            (0x10, "Inbox (2) - Mail" + SUFFIX, (0, 0, 2560, 1400)),
+            (0x10, "Inbox (3) - Mail" + SUFFIX, (0, 0, 2560, 1400))]
+        with mock.patch.object(A, "_loaded_bc", return_value=self.bc), \
+                mock.patch.object(A.webbrowser, "open"):
+            A._act_web_search("some show streaming")
+        self.assertIsNone(L.last_opened())
+
+    def test_the_search_page_jarvis_opened_is_recorded(self):
+        self.bc._read_focused_window.side_effect = [
+            (0x10, "Inbox (2) - Mail" + SUFFIX, (0, 0, 2560, 1400)),
+            (0x10, "some show streaming - Google Search" + SUFFIX,
+             (0, 0, 2560, 1400))]
+        with mock.patch.object(A, "_loaded_bc", return_value=self.bc), \
+                mock.patch.object(A.webbrowser, "open"):
+            A._act_web_search("some show streaming")
+        e = L.last_opened()
+        self.assertEqual((e.hwnd, e.kind), (0x10, "tab"))
 
     def test_a_non_browser_in_front_records_nothing(self):
         self.bc._read_focused_window.side_effect = [
@@ -234,6 +261,19 @@ class CloseLastOpenedTests(_Base):
         out = A._act_close_last_opened("")
         self.assertFalse(his.closed)
         self.assertTrue(out.startswith("couldn't close it"))   # a failure result
+
+    def test_a_page_window_that_is_no_longer_a_browser_is_left_alone(self):
+        # Review 2026-10-02: open_on_monitor takes ANY fresh window as the one
+        # it made (a reminder popup that opened in the same 2 s), and a
+        # handle can be reused. A record for a WEB PAGE only ever closes a
+        # browser window.
+        popup = _Win("Reminder - 1 item", 0x200)
+        self.windows[:] = [popup]
+        L.note_opened("open_on_monitor", "https://www.youtube.com/results?search_query=x",
+                      hwnd=0x200, kind="window", monitor="middle")
+        out = A._act_close_last_opened("")
+        self.assertFalse(popup.closed)
+        self.assertTrue(out.startswith("didn't close it"), out)
 
     def test_an_already_closed_window(self):
         L.note_opened("open_on_monitor", "notepad", hwnd=0x999)
@@ -294,6 +334,13 @@ class SeeScreenPageTests(_Base):
 
     def setUp(self):
         super().setUp()
+        # The monolith's service table: the account services carry the
+        # sign-in check, YouTube (which plays signed out) does not.
+        self.bc._STREAMING_SERVICES = {
+            "max": {"name": "HBO Max", "sign_in_check": True},
+            "netflix": {"name": "Netflix", "sign_in_check": True},
+            "youtube": {"name": "YouTube"},
+        }
         self.bc.take_screenshot.return_value = b"PNG"
         self.bc.take_all_monitor_screenshots.return_value = {"middle": b"PNG"}
         self.bc.ask_vision.return_value = "Search results for the show."
@@ -336,6 +383,38 @@ class SeeScreenPageTests(_Base):
                 self.assertNotIn("contin", q.lower())
                 self.assertNotIn("The owner asked", q)
 
+    def test_longer_control_phrases_are_never_the_question_either(self):
+        # Review 2026-10-02: "keep trying" / "continue what you were doing"
+        # steer the turn too, and were sent to vision as the owner's question.
+        self._opened()
+        for said in ("Jarvis, keep trying.", "continue what you were doing",
+                     "carry on with it", "pick up where you left off",
+                     "Jarvis, finish it."):
+            with self.subTest(said=said):
+                self.bc.ask_vision.reset_mock()
+                self.bc._see_screen_budget_state.used = 0
+                self.bc._turn_user_text.return_value = said
+                A._act_see_screen("")
+                q = self.bc.ask_vision.call_args[0][0]
+                self.assertIn(f"browser window showing {self.PAGE}", q)
+                self.assertNotIn("The owner asked", q)
+
+    def test_his_wake_word_does_not_make_it_a_chat_question(self):
+        # Review 2026-10-02: in wake-word mode nearly every owner question
+        # starts "Jarvis, ...", and "jarvis" counted as a chat-window topic,
+        # so the ignore-the-chat note was dropped from exactly the questions
+        # that live vision answered from the chat window. "log in" is not a
+        # log window either.
+        for q in ('The owner asked: "Jarvis, what does the error on the page '
+                  'say?". Answer that from what is on the screen.',
+                  "Is the page asking me to log in?"):
+            with self.subTest(q=q):
+                self.assertTrue(A._with_chat_guard(q).endswith(A._VISION_CHAT_GUARD))
+        for q in ("What does the Teams chat say?", "Read the JARVIS console",
+                  "what do the logs in the terminal say"):
+            with self.subTest(q=q):
+                self.assertEqual(A._with_chat_guard(q), q)
+
     def test_continue_with_nothing_opened_is_the_generic_look(self):
         self.bc._turn_user_text.return_value = "Jarvis, continue."
         A._act_see_screen("")
@@ -351,14 +430,43 @@ class SeeScreenPageTests(_Base):
 
     def test_a_sign_in_wall_ends_the_turn_with_one_plain_line(self):
         self._opened()
-        self.bc.ask_vision.return_value = (
+        # The free answer only HINTS at a wall; the strict SIGNIN / ERROR / OK
+        # look at the same image decides (review fix, 2026-10-02).
+        self.bc.ask_vision.side_effect = [
             "[local-vision] The page says 'Oops! Looks like this link isn't "
-            "working.' and shows a Sign In button.")
+            "working.' and shows a Sign In button.",
+            "[local-vision] SIGNIN - a Sign In button and no profile"]
         out = A._act_see_screen(self.PAGE)
         self.assertTrue(out.startswith(TERMINAL_FAILURE_PREFIX))
         self.assertEqual(terminal_failure_text(out),
                          "HBO Max isn't signed in on this browser, sir - sign "
                          "in once and I can take it from there.")
+        from core import streaming_search as S
+        self.assertEqual(self.bc.ask_vision.call_args_list[1][0],
+                         (S.wall_question("max"), b"PNG"))
+
+    def test_a_sign_in_link_in_the_footer_of_a_working_page_is_not_a_wall(self):
+        # Review 2026-10-02: the free-text check fired on ANY mention of
+        # "sign in" - a footer link under real search results ended the turn
+        # with "HBO Max isn't signed in". The strict look says OK: no wall.
+        self._opened()
+        answer = ("Search results for the show: seasons 1 to 7. The footer has "
+                  "links for Help Center, Sign In and Privacy.")
+        self.bc.ask_vision.side_effect = [answer, "OK - search results shown"]
+        out = A._act_see_screen(self.PAGE)
+        self.assertEqual(out, answer)
+
+    def test_youtube_signed_out_is_never_a_wall(self):
+        # YouTube plays signed out, and always shows "Sign in" at the top
+        # right: a look at a YouTube page JARVIS opened is never a wall.
+        self._opened("https://www.youtube.com/results?search_query=some+show")
+        answer = ("YouTube search results for the show. A Sign in button is "
+                  "at the top right.")
+        self.bc.ask_vision.side_effect = [answer, "SIGNIN"]
+        self.bc._turn_user_text.return_value = "Jarvis, continue."
+        out = A._act_see_screen("")
+        self.assertEqual(out, answer)
+        self.assertEqual(self.bc.ask_vision.call_count, 1)
 
     def test_an_ordinary_page_answer_passes_through(self):
         self._opened()
