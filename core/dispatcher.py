@@ -169,6 +169,80 @@ def youtube_play_route(utterance) -> str | None:
         return None
 
 
+# ── Single-command route: "close all windows except X" (2026-10-03) ─────────
+# Live 17:22: a request to close every window but the Claude app went to the
+# model, which had no action for it: it ran list_windows and then
+# minimize_window six times - JARVIS's own HUD and Reticle and two shell
+# windows among them - and closed nothing. The monolith's built-in utterance
+# route (_utterance_route_reply) asks THIS function, so a whole "close /
+# minimize all windows except X" request runs close_all_windows_except /
+# minimize_all_windows_except with the owner's own names, never a minimize the
+# model improvised. The token still goes through parse_and_run_actions, so the
+# "Close N windows, sir? Say yes." pushback applies. Deliberately NOT one of
+# the chain rules below: the chain resolver and Controlled mode run their
+# steps directly, which would skip that confirmation.
+_WK_VERB_RE = (r"(?P<verb>close(?:\s+(?:out|down))?|closed|shut(?:\s+down)?|"
+               r"minimi[sz]e|hide)")
+_WK_OBJECT_RE = (
+    r"(?:all(?:\s+of)?(?:\s+(?:the|my))?(?:\s+(?:other|open))*"
+    r"(?:\s+(?:windows?|apps?|applications?|programs?))?"
+    r"|every(?:thing(?:\s+else)?|(?:\s+(?:other|open))*\s+"
+    r"(?:window|app|application|program)))"
+    r"(?:\s+(?:that\s+(?:are|is)\s+)?open)?")
+_WK_EXCEPT_RE = (r"(?:except(?:\s+for)?|but(?:\s+not)?|other\s+than|"
+                 r"apart\s+from|besides|save\s+for|excluding)")
+_WK_KEEP_VERB_RE = r"(?:(?:and|but)\s+)?(?:keep|keeping|leave|leaving)"
+_WINDOW_KEEP_RE = re.compile(
+    r"^" + _WK_VERB_RE + r"\s+" + _WK_OBJECT_RE + r"[\s,]+"
+    r"(?:" + _WK_EXCEPT_RE + r"|" + _WK_KEEP_VERB_RE + r")\s+"
+    r"(?P<keep>.+?)"
+    r"(?:\s+(?:open|alone|running))?"
+    r"(?:[\s,]+(?:please|for\s+me|now))*$", re.IGNORECASE)
+# A keep that only makes sense against context, or names nothing: the model
+# resolves those. ("this one" / "the current window" are fine: the action
+# keeps the window in front.)
+_WK_VAGUE_RE = re.compile(
+    r"\b(?:it|them|those|these|you|your|yourself|which|whatever|"
+    r"something|anything)\b", re.IGNORECASE)
+_WK_MAX_KEEP = 120
+
+
+def window_keep_route(utterance) -> str | None:
+    """``"[ACTION: close_all_windows_except, <keep>]"`` (or
+    ``minimize_all_windows_except`` for "minimize" / "hide") for a whole
+    "close all windows except X" request - "everything but X", "all apps
+    except for X and Y", "all windows and keep X open" - with a leading wake
+    word / "can you" / "please"; else None. A keep that also carries a second
+    command ("... except Claude and play jazz") is left to the model. Never
+    raises."""
+    try:
+        if not isinstance(utterance, str) or not utterance.strip():
+            return None
+        s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
+        s = _strip_lead_filler(s)
+        s = " ".join(_strip(s).split())
+        m = _WINDOW_KEEP_RE.match(s)
+        if not m:
+            return None
+        keep = " ".join(_strip(m.group("keep") or "").split())
+        # "... but leave Claude open": the "but" took the except slot.
+        keep = re.sub(r"^(?:keep|keeping|leave|leaving)\s+", "", keep,
+                      flags=re.IGNORECASE)
+        if (not keep or len(keep) > _WK_MAX_KEEP
+                or any(c in keep for c in "[]\r\n")
+                or _WK_VAGUE_RE.search(keep)
+                or len(_split_chain(keep)) > 1
+                or re.search(r"\bthen\b", keep, re.IGNORECASE)):
+            return None
+        verb = (m.group("verb") or "").lower()
+        action = ("minimize_all_windows_except"
+                  if verb.startswith(("minimi", "hide"))
+                  else "close_all_windows_except")
+        return f"[ACTION: {action}, {keep}]"
+    except Exception:
+        return None
+
+
 # Map common spoken units to seconds (used by both timer and focus rules).
 _UNIT_SECONDS = {
     "second": 1, "seconds": 1, "sec": 1, "secs": 1,

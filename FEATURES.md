@@ -82,6 +82,10 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **List / focus / minimize / close windows** — closing by a site name ("close YouTube") closes just that browser tab; name the browser ("close Chrome") to close its whole window. A word that only matches the browser's own name ("close Google" while YouTube is in front) closes nothing and asks.
   - "minimize Chrome", "close that notepad", "focus the Chrome window", "list every open window"
   - Actions: `list_windows`, `focus_window`, `minimize_window`, `close_window`
+- **Close / minimize everything except an app** — one command, run without the brain: every one of your windows except the ones you name (by title or by app, e.g. "Claude" keeps the Claude app) is closed like its X button (an app may ask to save; nothing is force-killed) or minimized. One spoken summary: "Closed 4 windows, sir; kept Claude." Closing more than five asks first ("Close 7 windows, sir? Say yes."). A name that matches no open window closes nothing.
+  - "close every window except Claude", "close everything but Claude and Spotify", "minimize everything except this one"
+  - Actions: `close_all_windows_except`, `minimize_all_windows_except`
+- **JARVIS's own windows and the shell are never targets** — the window list and every window command skip the HUD, the reticle and the other overlays, the settings window, the dashboard page and JARVIS's console, plus "Program Manager", "Windows Input Experience", the taskbar and invisible (cloaked / zero-size) frames. A JARVIS window is closed, minimized or moved only when you name it yourself ("close the HUD").
 - **Open on a specific monitor / move an existing window** — positions the window directly via win32, moving only the window it just opened. Monitor names are left / right / top / middle, and "main" or "primary" means the primary display. A YouTube search can be the target.
   - "YouTube cello on the left monitor", "put Chrome on the left monitor", "put it on the main monitor"
   - Actions: `open_on_monitor`, `move_window_to_monitor`
@@ -612,7 +616,7 @@ Additional pushback / refusal layers:
 - **Bulk window-close with unsaved work** — pushes back when titles look unsaved (`*` / `●` / `•`, "Untitled", "(modified)") or are live-edit apps (VS Code, Cursor, Google Docs/Sheets).
 - **Outbound messages** — every send goes through the draft-preview gate (read aloud, explicit confirm).
 - **Dashboard actions** — running a side-effect or destructive action by name from the web Actions view needs an explicit confirm.
-- **`replay_last_action`** — refuses destructive actions (close_window, restart, upgrade, start_overnight_upgrade, run_shell); re-issue them so they pass the normal confirmation path.
+- **`replay_last_action`** — refuses destructive actions (close_window, close_all_windows_except, restart, upgrade, start_overnight_upgrade, run_shell); re-issue them so they pass the normal confirmation path.
 - **Skill code is forbidden** from including final purchase / payment confirmation steps (must stop one step BEFORE the money-spending click), and the browser agent's `fill_form` never submits.
 
 ---

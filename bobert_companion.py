@@ -3536,6 +3536,7 @@ _action_history_lock = threading.Lock()
 # step gets the normal confirmation/pushback path.
 _DESTRUCTIVE_REPLAY_ACTIONS = frozenset({
     "close_window",
+    "close_all_windows_except",
     "close_last_opened",
     "kill_process",
     "restart",
@@ -31787,6 +31788,10 @@ ACTIONS = {
     "focus_window":    _act_focus_window,
     "minimize_window": _act_minimize_window,
     "close_window":    _act_close_window,
+    # "close / minimize all windows except Claude" (2026-10-03): the owner's
+    # windows only (core.window_scope), WM_CLOSE never a kill, one summary.
+    "close_all_windows_except":    _act_close_all_windows_except,
+    "minimize_all_windows_except": _act_minimize_all_windows_except,
     # "close that": the window / tab JARVIS itself opened last, never anything
     # else (core.opened_ledger, S1 2026-10-02).
     "close_last_opened": _act_close_last_opened,
@@ -32179,6 +32184,21 @@ def _utterance_route_reply(text: str) -> "str | None":
     if _ss_m and _ss_m.group(1) in ACTIONS:
         print(f"  [route] streaming title -> {_ss_m.group(1)}")
         return _ss_tok
+    # BUILT-IN route (2026-10-03): a whole "close / minimize all windows
+    # except X" request -> close_all_windows_except / minimize_all_windows_
+    # except (core.dispatcher.window_keep_route). Live 17:22:21 the brain had
+    # no such action: it listed the windows and minimized six of them, JARVIS's
+    # own HUD and Reticle among them. The token runs through
+    # parse_and_run_actions, so the "Close N windows?" pushback still asks.
+    try:
+        from core.dispatcher import window_keep_route as _wk_route
+        _wk_tok = _wk_route(text)
+    except Exception:
+        _wk_tok = None
+    _wk_m = _ROUTE_TOKEN_RE.match(_wk_tok) if _wk_tok else None
+    if _wk_m and _wk_m.group(1) in ACTIONS:
+        print(f"  [route] all windows except -> {_wk_m.group(1)}")
+        return _wk_tok
     if not globals().get("SKILL_ROUTES_ENABLED", True):
         return None
     for label, fn in list(_UTTERANCE_ROUTES):
@@ -34028,6 +34048,10 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # streaming_search (S2, 2026-10-02): "HBO Max's search for X is open, sir."
     # or the honest no-verified-link line - one finished sentence either way.
     "streaming_search",
+    # "Closed 4 windows, sir; kept Claude." (2026-10-03): the ONE spoken
+    # summary of a bulk close / minimize. The routed turn has no prose of its
+    # own, so without this it would end in silence.
+    "close_all_windows_except", "minimize_all_windows_except",
     "whoami", "face_id_status",
     # Audio output-device switching (skills/audio_autoswitch.py) — each returns
     # a finished confirmation sentence.
@@ -35485,6 +35509,23 @@ def _jarvis_pushback(name: str, arg: str) -> tuple[str, str] | None:
                           "windows. Are you certain?")
             return (phrase, f"close_window matched {len(matches)} windows")
 
+    # close_all_windows_except (2026-10-03): the same bar - more than
+    # PUSHBACK_MAX_CLOSE_WINDOWS of the owner's windows would close - counted
+    # by the action's own plan, so the number asked about is the number it
+    # closes. Minimizing is undone with one click, so it never asks.
+    if nm == "close_all_windows_except" and low:
+        try:
+            closing = _close_all_windows_except_preview(raw)
+        except Exception:
+            closing = []
+        if len(closing) > PUSHBACK_MAX_CLOSE_WINDOWS:
+            blurb = _unsaved_window_blurb(closing)
+            phrase = (f"Close {len(closing)} windows, sir"
+                      + (f", including {blurb}" if blurb else "")
+                      + "? Say yes.")
+            return (phrase, f"close_all_windows_except would close "
+                            f"{len(closing)} windows")
+
     # queue_task: the LLM occasionally bulk-files a newline-separated list.
     # >N items at once is unusual enough to ask.
     if nm == "queue_task" and raw:
@@ -35566,6 +35607,8 @@ _MISSION_NARRATION_CUES = {
     "focus_window":     "Bringing {arg} forward",
     "minimize_window":  "Minimising {arg}",
     "close_window":     "Closing {arg}",
+    "close_all_windows_except": "Closing everything but {arg}",
+    "minimize_all_windows_except": "Minimising everything but {arg}",
     "close_last_opened": "Closing what I opened",
     "launch_app":       "Launching {arg}",
     # Music / streaming
@@ -37281,7 +37324,12 @@ def handle_confirmation_response(user_text: str) -> bool:
                 # made JARVIS speak "Done." for an action that silently failed.
                 low = (res or "").strip().lower()
                 if low and any(m in low for m in fail_markers):
-                    failures.append(str(res).strip())
+                    # A TERMINAL failure is already the owner's sentence:
+                    # speak it without its marker prefix (2026-10-03: a
+                    # confirmed bulk close that met an elevated window
+                    # would have said "failed (final): ...").
+                    failures.append(_terminal_failure_text(res)
+                                    or str(res).strip())
                 else:
                     executed.append(name)
                     # Route the ANSWER, not a blanket "Done.": INFORMATIVE

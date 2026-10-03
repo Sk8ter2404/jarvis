@@ -104,6 +104,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "WINDOW MANAGEMENT": [
         "window", "move", "resize", "snap", "tile", "maximize", "minimize",
         "restore", "left monitor", "right monitor", "fullscreen", "arrange",
+        # "close everything but Claude" names no window (2026-10-03):
+        # close_all_windows_except lives here.
+        "minimise", "everything except", "everything but", "all except",
+        "all but", "all apps", "all programs", "every app",
     ],
     "SCREEN VISION": [
         "screen", "what's on", "whats on", "looking at", "read the screen",

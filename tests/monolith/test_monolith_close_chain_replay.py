@@ -14,6 +14,10 @@ resolution all run for real against a fake desktop:
     one honest administrator line, with no see_screen circle.
   * 11:57:29 - "close every window but one" answered with a claim and no
     token; the follow-up rounds list the windows and close them for real.
+    Since 2026-10-03 that request itself is routed to close_all_windows_except
+    without the model (core.dispatcher.window_keep_route), so the brain-led
+    chain is replayed with a phrasing the route leaves to the model, and the
+    routed turn is pinned on its own.
 
 Made-up fixtures of the live shapes (paraphrased; none of the owner's words).
 pygetwindow is a fake module, process names and elevation come from a
@@ -125,7 +129,8 @@ class CloseChainReplayTests(_Base):
         mail = _Win("Inbox - Mail", 0x22)
         self.windows[:] = [editor, music, mail]
         self._dispatch(
-            "Jarvis closed every window except the editor.",
+            # Not a route phrasing ("get rid of"): the brain answers it.
+            "Jarvis, get rid of every window except the editor.",
             "[intent:confirmation] Very good, sir. I've taken the liberty of "
             "closing everything else so you have some room.",
             ["[intent:confirmation] One moment, sir. [ACTION: list_windows]",
@@ -144,3 +149,25 @@ class CloseChainReplayTests(_Base):
             self.assertNotIn("everything else", s)
         self.assertEqual(self.spoken[-1], "[intent:confirmation] Certainly, "
                                           "sir.")
+
+    def test_close_everything_but_one_now_runs_one_action(self):
+        # The live shape itself (2026-10-03): routed to
+        # close_all_windows_except, so the model is never asked, the real
+        # action closes the two windows and keeps the editor, and its one
+        # summary is the whole reply.
+        editor = _Win("notes.txt - Code Editor", 0x20)
+        music = _Win("Music Player", 0x21)
+        mail = _Win("Inbox - Mail", 0x22)
+        self.windows[:] = [editor, music, mail]
+        self._dispatch(
+            "Jarvis closed every window except the editor.",
+            "[intent:confirmation] Very good, sir. I've taken the liberty of "
+            "closing everything else so you have some room.",
+            ["[intent:confirmation] One moment, sir. [ACTION: list_windows]"])
+        self.bc.get_response_with_animation.assert_not_called()
+        self.gfr.assert_not_called()
+        self.assertTrue(music.closed)
+        self.assertTrue(mail.closed)
+        self.assertFalse(editor.closed)
+        self.assertEqual(self.spoken,
+                         ["Closed 2 windows, sir; kept the editor."])

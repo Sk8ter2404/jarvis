@@ -1577,6 +1577,22 @@ def _elevated_close_line(denied: list, n_closed: int) -> str:
     return TERMINAL_FAILURE_PREFIX + line
 
 
+def _send_close(w) -> str:
+    """THE close step for one window: pygetwindow's close(), which posts
+    WM_CLOSE - exactly the window's X button, so an app can ask to save
+    first. Never a kill. "closed", "denied" (Windows refused: an elevated
+    window, 2026-10-02 live - Task Manager) or "error"."""
+    try:
+        w.close()
+        return "closed"
+    except Exception as e:
+        # Checked only after a failed close, so a close that works never
+        # queries the process.
+        if _close_refused(e) or _window_is_elevated(w):
+            return "denied"
+        return "error"
+
+
 def _act_close_window(query: str) -> str:
     """Close a window by partial title match. Refuses to close Bobert's host.
     A process name ("taskmgr.exe") and a "<title> | <monitor>" query resolve
@@ -1628,15 +1644,11 @@ def _act_close_window(query: str) -> str:
         if page is not None and not _query_names_browser(query):
             browser_only.append(w.title)
             continue
-        try:
-            w.close()
+        outcome = _send_close(w)
+        if outcome == "closed":
             closed.append(w.title)
-        except Exception as e:
-            # Windows refused (2026-10-02 live: Task Manager runs elevated).
-            # Checked only after a failed close, so a close that works never
-            # queries the process.
-            if _close_refused(e) or _window_is_elevated(w):
-                denied.append(w.title)
+        elif outcome == "denied":
+            denied.append(w.title)
     if denied:
         return _elevated_close_line(denied, len(closed) + len(tabs))
     parts = []
@@ -1728,6 +1740,279 @@ def _close_browser_tab(bc, w) -> bool:
     except Exception:
         return False
     return True
+
+
+# ─── "close / minimize all windows except X" (2026-10-03) ─────────────────
+# Live 17:22 the owner asked to close every window but the Claude app: no
+# action did that, so the brain ran list_windows and minimize_window six times -
+# JARVIS's own HUD and Reticle and two shell windows among them - and closed
+# nothing. ONE action does it now. Every one of the owner's windows
+# (core.window_scope.user_windows: never JARVIS's own, never the shell's)
+# except the ones he named goes through _send_close (WM_CLOSE, the X button:
+# an app may ask to save; never a kill) or is minimized. One spoken summary
+# ("Closed 4 windows, sir; kept Claude."); an elevated window is reported
+# once with close_window's terminal line. Closing more than
+# PUSHBACK_MAX_CLOSE_WINDOWS windows asks first
+# (bobert_companion._jarvis_pushback, via _close_all_windows_except_preview).
+
+# Several names to keep: "Claude, Spotify", "Claude and Spotify".
+_KEEP_SPLIT_RE = re.compile(
+    r"\s*(?:[,;|&+/]|\band\b|\bor\b|\bplus\b|\bas\s+well\s+as\b)\s*",
+    re.IGNORECASE)
+_KEEP_LEAD_RE = re.compile(
+    r"^(?:(?:except|but|for|keep|leave|leaving)\s+)+", re.IGNORECASE)
+_KEEP_TAIL_RE = re.compile(
+    r"(?:\s+(?:open|alone|running|please))+$", re.IGNORECASE)
+# Matching also drops the words that do not name the app ("the Claude app").
+_KEEP_ARTICLE_RE = re.compile(r"^(?:(?:the|my|our)\s+)+", re.IGNORECASE)
+_KEEP_KIND_RE = re.compile(
+    r"(?:\s+(?:app|apps|application|program|window|windows))+$",
+    re.IGNORECASE)
+# "except this one": the window in front.
+_KEEP_FRONT_RE = re.compile(
+    r"^(?:this|that|(?:the\s+)?(?:current|active|focused|front|foreground)|"
+    r"(?:(?:the\s+)?one|what)\s+i(?:'?m|\s+am)\s+(?:on|in|using|looking\s+at|"
+    r"working\s+(?:in|on)))(?:\s+(?:one|window|app))?$", re.IGNORECASE)
+_KEEP_FRONT = "\x00front"
+_KEEP_QUOTES = " .!?\"'‘’“”"
+
+
+def _keep_key(name) -> str:
+    """What a keep name is matched by: "the Claude app" -> "Claude"."""
+    if name == _KEEP_FRONT:
+        return name
+    key = _KEEP_KIND_RE.sub("", _KEEP_ARTICLE_RE.sub("", str(name or "")))
+    return key.strip(_KEEP_QUOTES) or str(name or "")
+
+
+def _keep_names(arg) -> list:
+    """The names to keep from a close/minimize_all_windows_except argument,
+    as said, in order, de-duplicated ("Claude and Spotify" -> ["Claude",
+    "Spotify"]); _KEEP_FRONT for "this one" / "the current window"."""
+    names: list = []
+    keys: set = set()
+    for piece in _KEEP_SPLIT_RE.split(str(arg or "")):
+        p = " ".join(piece.strip(_KEEP_QUOTES).split())
+        if not p:
+            continue
+        if _KEEP_FRONT_RE.match(p):
+            if _KEEP_FRONT not in names:
+                names.append(_KEEP_FRONT)
+            continue
+        p = _KEEP_TAIL_RE.sub("", _KEEP_LEAD_RE.sub("", p)).strip(_KEEP_QUOTES)
+        key = _keep_key(p).lower()
+        if len(key) >= 2 and key not in keys:
+            keys.add(key)
+            names.append(p)
+    return names
+
+
+def _keeps_window(w, name, front_hwnd) -> bool:
+    """True when the owner's keep ``name`` covers window ``w``: its title
+    contains the name, or its process is that app (_exe_names_app, the
+    v2.0.176 process-name rule: "except Claude" keeps claude.exe whatever
+    its windows are titled)."""
+    if name == _KEEP_FRONT:
+        return front_hwnd is not None and getattr(w, "_hWnd", None) == front_hwnd
+    key = _keep_key(name)
+    if key.lower() in (getattr(w, "title", "") or "").lower():
+        return True
+    proc = _window_process_name(w)
+    if not proc or proc.strip().lower() in _APP_HOST_PROCESSES:
+        return False
+    return _exe_names_app(proc, _app_words(key))
+
+
+def _is_browser_process(w) -> bool:
+    """True when ``w``'s process is a web browser (_BROWSER_PROCESS_WORDS);
+    False when unknown."""
+    proc = _window_process_name(w)
+    return bool(proc) and any(b in _exe_stem(proc)
+                              for b in _BROWSER_PROCESS_WORDS)
+
+
+def _spoken_list(items, last="and") -> str:
+    items = [str(i) for i in items if str(i)]
+    if len(items) <= 1:
+        return items[0] if items else ""
+    return ", ".join(items[:-1]) + f" {last} " + items[-1]
+
+
+class _AllExceptPlan:
+    """What close/minimize_all_windows_except would do right now."""
+
+    def __init__(self, names):
+        self.names = names            # keep names, as said
+        self.targets: list = []       # windows to close / minimize
+        self.hosts: list = []         # left alone: may host JARVIS (close)
+        self.matched: set = set()     # keep names that matched a window
+        self.labels: dict = {}        # keep name -> spoken label
+
+    @property
+    def front_missing(self) -> bool:
+        return _KEEP_FRONT in self.names and _KEEP_FRONT not in self.matched
+
+    @property
+    def kept_label(self) -> str:
+        return _spoken_list([self.labels.get(n, n) for n in self.names
+                             if n in self.matched])
+
+    @property
+    def unmatched(self) -> list:
+        return [n for n in self.names
+                if n not in self.matched and n != _KEEP_FRONT]
+
+    @property
+    def unmatched_keys(self) -> list:
+        """The unmatched names as apps ("Spotify", not "the Spotify app")."""
+        return [_keep_key(n) for n in self.unmatched]
+
+
+def _all_except_plan(bc, arg, closing: bool):
+    """The _AllExceptPlan for ``arg``, or None when it names nothing to keep.
+    Raises ImportError when pygetwindow is missing."""
+    names = _keep_names(arg)
+    if not names:
+        return None
+    import pygetwindow as gw
+    every = list(gw.getAllWindows())
+    plan = _AllExceptPlan(names)
+    front = None
+    if _KEEP_FRONT in names:
+        try:
+            front = bc._read_focused_window()[0]
+        except Exception:
+            front = None
+    try:
+        forbidden = [str(t).lower() for t in bc.FORBIDDEN_TARGETS if t]
+    except Exception:
+        forbidden = []
+    for w in _window_scope.user_windows(every):
+        title = getattr(w, "title", "") or ""
+        hit = [n for n in names if _keeps_window(w, n, front)]
+        if hit:
+            for n in hit:
+                plan.matched.add(n)
+                if n == _KEEP_FRONT:
+                    plan.labels[n] = _app_label(title)
+            continue
+        if (closing and any(t in title.lower() for t in forbidden)
+                and not _is_browser_process(w)):
+            # close_window's own self-preservation rule: a terminal / python
+            # / editor window may be the one running JARVIS. (A browser tab
+            # that merely mentions "python" is not.)
+            plan.hosts.append(w)
+            continue
+        if not closing and getattr(w, "isMinimized", False) is True:
+            continue
+        plan.targets.append(w)
+    # "except the HUD": JARVIS's own windows are always kept, so a name that
+    # names one of them is kept, not "not found".
+    jarvis_titles = [getattr(w, "title", "") or "" for w in every
+                     if _window_scope.is_jarvis_title(getattr(w, "title", ""))]
+    for n in plan.unmatched:
+        if any(_window_scope.names_jarvis_window(n, t) for t in jarvis_titles):
+            plan.matched.add(n)
+    return plan
+
+
+def _close_all_windows_except_preview(arg) -> list:
+    """Titles of the windows close_all_windows_except(``arg``) would close
+    right now; [] when it would close nothing or refuse. The pushback count
+    (bobert_companion._jarvis_pushback). Never raises."""
+    try:
+        plan = _all_except_plan(_bc(), arg, True)
+    except Exception:
+        return []
+    if plan is None or not plan.matched or plan.front_missing:
+        return []
+    return [getattr(w, "title", "") or "" for w in plan.targets]
+
+
+def _send_minimize(w) -> str:
+    try:
+        w.minimize()
+        return "minimized"
+    except Exception:
+        return "error"
+
+
+def _all_windows_except(arg: str, closing: bool) -> str:
+    action = ("close_all_windows_except" if closing
+              else "minimize_all_windows_except")
+    verb = "close" if closing else "minimize"
+    usage = f"format: {action}, <window(s) to keep>"
+    if not str(arg or "").strip():
+        return usage
+    bc = _bc()
+    try:
+        plan = _all_except_plan(bc, arg, closing)
+    except ImportError:
+        return "pygetwindow not available — pip install pygetwindow"
+    if plan is None:
+        return usage
+    from core.failure_markers import TERMINAL_FAILURE_PREFIX
+    # Nothing to anchor on: closing "everything except <a window that isn't
+    # there>" would close everything. Say so and close nothing; a terminal
+    # line, so no follow-up round improvises its own closes.
+    if plan.front_missing:
+        return (TERMINAL_FAILURE_PREFIX + "I can't tell which window is in "
+                f"front, sir, so I've {verb}d nothing.")
+    if not plan.matched:
+        return (TERMINAL_FAILURE_PREFIX + "I don't see a "
+                f"{_spoken_list(plan.unmatched_keys, 'or')} window to keep, "
+                f"sir, so I've {verb}d nothing.")
+    done, denied, errors = [], [], []
+    for w in plan.targets:
+        outcome = _send_close(w) if closing else _send_minimize(w)
+        title = getattr(w, "title", "") or ""
+        if outcome in ("closed", "minimized"):
+            done.append(title)
+        elif outcome == "denied":
+            denied.append(title)
+        else:
+            errors.append(title)
+    kept = plan.kept_label
+    n = len(done)
+    if denied:
+        # v2.0.176's terminal line, said once for every refused window.
+        line = _elevated_close_line(denied, n) + f" I kept {kept}."
+    elif n:
+        line = (f"{'Closed' if closing else 'Minimized'} {n} "
+                f"window{'' if n == 1 else 's'}, sir; kept {kept}.")
+    else:
+        line = f"Nothing else to {verb}, sir; kept {kept}."
+    extra = []
+    if plan.hosts:
+        labels = [_app_label(getattr(w, "title", "")) for w in plan.hosts]
+        extra.append(f"I left {_spoken_list(labels)} open; "
+                     f"{'it' if len(labels) == 1 else 'they'} may be running "
+                     "me.")
+    if plan.unmatched:
+        extra.append(
+            f"I saw no {_spoken_list(plan.unmatched_keys, 'or')} window.")
+    if errors:
+        more = len(errors) - 1
+        extra.append(f"{_app_label(errors[0])}"
+                     + (f" and {more} other window{'' if more == 1 else 's'}"
+                        if more else "")
+                     + f" wouldn't {verb}.")
+        if not denied:
+            line = TERMINAL_FAILURE_PREFIX + line
+    return " ".join([line] + extra)
+
+
+def _act_close_all_windows_except(arg: str) -> str:
+    """close_all_windows_except, <names to keep>: close every one of the
+    owner's windows except the named ones (title or process name). JARVIS's
+    own windows and the shell's are always kept. WM_CLOSE only, never a
+    kill."""
+    return _all_windows_except(arg, closing=True)
+
+
+def _act_minimize_all_windows_except(arg: str) -> str:
+    """minimize_all_windows_except, <names to keep>: the same, minimizing."""
+    return _all_windows_except(arg, closing=False)
 
 
 # ─── "close that": the window / tab JARVIS opened last (S1, 2026-10-02) ──
@@ -5485,6 +5770,10 @@ __all__ = [
     "_act_minimize_window",
     "_act_close_window",
     "_act_close_last_opened",
+    # "close / minimize all windows except X" (2026-10-03) + the pushback count
+    "_act_close_all_windows_except",
+    "_act_minimize_all_windows_except",
+    "_close_all_windows_except_preview",
     # Phase 4D — UI type (with shell-cmd refusal)
     "_act_type",
     # Phase 4E — music skip/back

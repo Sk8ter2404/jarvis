@@ -61,7 +61,10 @@ class UnspokenClaimTests(_Base):
                          ["[intent:confirmation] Right away, sir."])
 
     def test_the_liberty_claim_is_not_spoken(self):
-        self._dispatch("Jarvis closed all windows except the editor.",
+        # A phrasing the window-keep route leaves to the model (2026-10-03:
+        # "close all windows except X" itself now runs close_all_windows_
+        # except without it).
+        self._dispatch("Jarvis, clear away every window except the editor.",
                        _LIBERTY,
                        ["[intent:bad_news] I'm afraid I can't pick out the "
                         "windows from here, sir."])
