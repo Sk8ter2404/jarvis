@@ -769,8 +769,38 @@ SCHEMA: dict[str, dict] = {
     },
     "VOICE_CLONE_MODEL": {
         "tab": "voice", "label": "Voice-clone engine", "type": "enum",
-        "choices": ["chatterbox"], "default": "chatterbox",
-        "help": "Local voice-cloning engine. Currently only 'chatterbox'.",
+        "choices": ["chatterbox", "chatterbox_turbo_server"],
+        "default": "chatterbox",
+        "help": "'chatterbox' loads the model inside JARVIS. "
+                "'chatterbox_turbo_server' runs it in its own process (its "
+                "own Python and CUDA) and JARVIS sends it each sentence; "
+                "Kokoro voices any line it misses, and three failures in a "
+                "row switch the clone off until the next start. Applies on "
+                "the next start.",
+    },
+    "VOICE_CLONE_SERVER_URL": {
+        "tab": "voice", "label": "Clone voice server address", "type": "str",
+        "default": "http://127.0.0.1:8767",
+        "help": "Where the clone voice server listens (http on 127.0.0.1 "
+                "only; reply text never leaves this PC). Applies on the next "
+                "start.",
+    },
+    "VOICE_CLONE_SERVER_CMD": {
+        "tab": "voice", "label": "Clone voice server command", "type": "str",
+        "default": "",
+        "help": "The command JARVIS runs at boot to start the clone voice "
+                "server when none is running (hidden window; it keeps "
+                "running after JARVIS exits). {ref} becomes the active "
+                "profile's reference.wav and {port} the address's port. "
+                "Empty = only use a server that is already running. Applies "
+                "on the next start.",
+    },
+    "VOICE_CLONE_TIMEOUT_S": {
+        "tab": "voice", "label": "Clone voice line timeout (s)",
+        "type": "float", "default": 2.5, "min": 0.5, "max": 30,
+        "help": "How long one sentence may take on the clone voice server "
+                "before Kokoro voices it instead (long sentences get 0.03 s "
+                "more per character past 80). Applies on the next start.",
     },
     "AUDIO_PROCESSING_ENABLED": {
         "tab": "hearing", "label": "Audio processing (master)", "type": "bool",
@@ -1912,7 +1942,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                       "PROCESSING_FILLER_SKIP_PLEASANTRIES",
                       "FILLER_DUCK_HOLD", "PROCESSING_FILLER_PRERENDER"]),
         ("Voice clone", ["VOICE_CLONE_ENABLED", "VOICE_CLONE_PROFILE",
-                         "VOICE_CLONE_MODEL"]),
+                         "VOICE_CLONE_MODEL", "VOICE_CLONE_SERVER_URL",
+                         "VOICE_CLONE_SERVER_CMD", "VOICE_CLONE_TIMEOUT_S"]),
         ("Wake word & conversation", [
             "VOICE_MODE", "WAKE_WORD_AUTOSTART", "START_IN_STANDBY",
             "REQUIRE_WAKE_MODE", "FOLLOWUP_WINDOW_S",
@@ -2619,7 +2650,16 @@ def effective_warnings(values: dict, find_spec=None) -> dict[str, str]:
             out["TTS_BACKEND"] = (
                 f"Not in effect: '{backend}' needs the {pkg} package, which "
                 f"isn't installed — JARVIS falls back to another voice.")
-        if truthy(values.get("VOICE_CLONE_ENABLED")) and not have("chatterbox"):
+        clone_model = str(values.get("VOICE_CLONE_MODEL", "")).strip().lower()
+        if clone_model == "chatterbox_turbo_server":
+            # The server runs in its own Python: nothing to install here.
+            if (truthy(values.get("VOICE_CLONE_ENABLED"))
+                    and not str(values.get("VOICE_CLONE_SERVER_CMD", "")
+                                or "").strip()):
+                out["VOICE_CLONE_SERVER_CMD"] = (
+                    "Empty: JARVIS will only use a clone voice server that "
+                    "is already running at the address above.")
+        elif truthy(values.get("VOICE_CLONE_ENABLED")) and not have("chatterbox"):
             out["VOICE_CLONE_ENABLED"] = (
                 "Not in effect: chatterbox-tts isn't installed — the normal "
                 "voice is used.")

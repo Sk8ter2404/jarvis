@@ -594,13 +594,45 @@ KOKORO_RENDER_CACHE_PERSIST  = False
 # action / a user_settings.json flip takes effect immediately. Default OFF.
 VOICE_CLONE_ENABLED = False      # master switch (OFF by default)
 VOICE_CLONE_PROFILE = ""         # active profile name under data/voice_profiles/
-VOICE_CLONE_MODEL   = "chatterbox"   # engine id (currently only "chatterbox")
+# Engine id: "chatterbox" (in-process, below) or "chatterbox_turbo_server"
+# (its own process; see the clone voice server block below).
+VOICE_CLONE_MODEL   = "chatterbox"
 # Torch device for the clone engine. "" = historical default (cuda:0 if present
 # else cpu). Set "cuda:1" to run chatterbox on a SECOND, idle GPU so it stops
 # eating the primary card's VRAM (frees ~3GB on the 3090 for the LLM). Gated by
 # a free-VRAM check in core/voice_clone (degrades to the edge-tts ladder if the
 # chosen device lacks room), so a bad value never OOMs. 2026-07-09.
 VOICE_CLONE_DEVICE  = ""
+
+# ─── Clone voice SERVER (VOICE_CLONE_MODEL = "chatterbox_turbo_server") ──
+# 2026-10-03. The clone model runs in its OWN process and venv (CUDA torch on
+# the RTX 3090) and JARVIS talks to it over the loopback
+# (core/clone_voice_client.py), so nothing heavy loads inside JARVIS. Used
+# when VOICE_CLONE_ENABLED is on, VOICE_CLONE_MODEL is
+# "chatterbox_turbo_server" and VOICE_CLONE_PROFILE names a consented profile:
+#   * boot: JARVIS reuses a server already answering at VOICE_CLONE_SERVER_URL,
+#     else starts VOICE_CLONE_SERVER_CMD detached and waits for it (bounded,
+#     off the boot path). If it never comes up: one log line, Kokoro speaks.
+#   * each sentence is one POST /tts bounded by VOICE_CLONE_TIMEOUT_S (plus
+#     0.03 s per character past 80). A failed or slow line is voiced by
+#     Kokoro at once; 3 failures in a row turn the clone off for the session.
+#   * the server is used only while its voice prompt is the active consented
+#     profile's reference.wav (compared by hash).
+#   * per-sentence speech, the processing filler and the R3 pre-render work
+#     with it as they do with Kokoro (TTS_BACKEND 'kokoro' is the fallback).
+#     Prosody presets: the gain and the wry pause are honoured; rate and pitch
+#     are not (the model has no speed or pitch control).
+# VOICE_CLONE_SERVER_CMD is a command line (or a JSON array of arguments) and
+# is the owner's to set, because it names his own paths. {ref} becomes the
+# active profile's reference.wav and {port} the URL's port, e.g.
+#   <venv>\Scripts\python.exe -u <dir>\clone_tts_server.py --ref {ref} --port {port}
+# Empty = JARVIS never starts a server, but uses one that is already running.
+# The server keeps running when JARVIS exits or restarts (the next boot reuses
+# it) and holds ~2.5 GB of VRAM on the 3090 until it is stopped (POST
+# /shutdown). Changes apply on the next start.
+VOICE_CLONE_SERVER_URL = "http://127.0.0.1:8767"
+VOICE_CLONE_SERVER_CMD = ""
+VOICE_CLONE_TIMEOUT_S  = 2.5
 
 
 # ─── Voice pipeline selector ───────────────────────────────────────────

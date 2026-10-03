@@ -20097,6 +20097,11 @@ def _boot_tts_label() -> str:
             # unusable model shows as the edge fallback the user will hear.
             if not _k.is_available():
                 return f"edge:{TTS_VOICE} (kokoro selected but unavailable)"
+            if _clone_server_selected():
+                # The clone voice server loads in the background (~10 s); the
+                # outcome is its own "[clone-voice]" line.
+                return (f"clone voice server ({_cvc.CLIENT.status()[0]}), "
+                        f"fallback kokoro:{voice} (CPU)")
             return f"kokoro:{voice} (CPU)"
         if backend == "xtts":
             return f"xtts:{os.path.basename(XTTS_VOICE_SAMPLE or '?')}"
@@ -24430,6 +24435,185 @@ _voice_clone_inflight = [False]
 _voice_clone_inflight_lock = threading.Lock()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  CLONE VOICE SERVER (VOICE_CLONE_MODEL = "chatterbox_turbo_server",
+#  2026-10-03). The clone model runs in its own process and venv on the 3090;
+#  JARVIS only POSTs each line to it over the loopback
+#  (core/clone_voice_client.py), so no torch / CUDA / model ever loads here.
+#    * selected   = VOICE_CLONE_ENABLED and that model id (the owner's
+#                   choice; says nothing about the server being up);
+#    * active     = selected AND the server is ready, not latched off, and
+#                   speaking the active consented profile's voice (hash);
+#    * engine kind (_tts_engine_kind) is the ONE gate the Kokoro-only fast
+#      paths read -- per-sentence speech, the processing filler, the R3
+#      pre-render -- so they run for the clone exactly as for Kokoro, and
+#      fall back to plain Kokoro the moment the clone is not active.
+#  A line the clone fails (slow, error) is voiced by Kokoro at once, in the
+#  same synthesise() call; MAX_FAILURES in a row latch the clone off for the
+#  session. Every speak contract lives in _speak / _speak_sentences above the
+#  engine and is unchanged: the speech lock, self-echo remember / refresh,
+#  the barge-in sequence checks, volume_scale, the prosody pin.
+# ──────────────────────────────────────────────────────────────────────────
+from core import clone_voice_client as _cvc  # noqa: E402
+
+_CLONE_SERVER_LOG = os.path.join(LOGS_DIR, "clone_voice", "server.log")
+
+
+def _clone_server_selected() -> bool:
+    """VOICE_CLONE_ENABLED with the clone voice server engine. Never raises."""
+    try:
+        return (bool(globals().get("VOICE_CLONE_ENABLED", False))
+                and _cvc.is_server_model(globals().get("VOICE_CLONE_MODEL", "")))
+    except Exception:
+        return False
+
+
+def _clone_server_may_start() -> bool:
+    """Never start a server from the test harness or a staging instance (the
+    same gate as the brain warm-up): they must not touch the GPU."""
+    return not (os.environ.get("JARVIS_STAGING", "").strip() == "1"
+                or os.environ.get("JARVIS_TEST_MODE", "").strip() == "1"
+                or "--staging" in sys.argv
+                or _is_staging())
+
+
+def _clone_server_on_ready() -> None:
+    """The server just came up: the filler clips are keyed on the engine, so
+    render them again in the clone voice now rather than after the next
+    turn. Never raises."""
+    try:
+        _filler_warm_if_needed()
+    except Exception:
+        pass
+
+
+def _clone_server_kick() -> bool:
+    """Start (or re-check) the server on a daemon, once, while the client is
+    idle: at boot, or the first time the clone is selected at runtime. True
+    if this call started it. Never blocks, never raises."""
+    try:
+        if not _clone_server_selected() or not _clone_server_may_start():
+            return False
+        if _cvc.CLIENT.status()[0] != "idle":
+            return False
+        return _cvc.CLIENT.start_async(
+            url=str(globals().get("VOICE_CLONE_SERVER_URL", "")
+                    or _cvc.DEFAULT_URL),
+            cmd=str(globals().get("VOICE_CLONE_SERVER_CMD", "") or ""),
+            profile=str(globals().get("VOICE_CLONE_PROFILE", "") or ""),
+            log_path=_CLONE_SERVER_LOG,
+            on_ready=_clone_server_on_ready)
+    except Exception as e:
+        print(f"  [clone-voice] could not start ({type(e).__name__}: {e})")
+        return False
+
+
+def _clone_server_active() -> bool:
+    """Selected AND usable right now (see the block comment). An idle client
+    is started here (non-blocking) and counts as not active yet. Never
+    raises."""
+    try:
+        if not _clone_server_selected():
+            return False
+        if _cvc.CLIENT.status()[0] == "idle":
+            _clone_server_kick()
+            return False
+        return _cvc.CLIENT.usable_for(
+            str(globals().get("VOICE_CLONE_PROFILE", "") or ""))
+    except Exception:
+        return False
+
+
+def _tts_engine_kind() -> str:
+    """Which engine voices replies, for the fast-path gates:
+
+      'kokoro' -- TTS_BACKEND 'kokoro' with no clone, or with the clone voice
+                  server selected but not active (starting, down, latched)
+      'clone'  -- TTS_BACKEND 'kokoro' and the clone voice server active
+                  (Kokoro voices any line it misses)
+      'other'  -- anything else: edge-tts / pyttsx3 / xtts, or the in-process
+                  clone (VOICE_CLONE_MODEL 'chatterbox'), which keep today's
+                  whole-text path with no filler and no pre-render.
+    Never raises."""
+    try:
+        backend = str(globals().get("TTS_BACKEND", "edge") or "edge").lower()
+        if backend != "kokoro":
+            return "other"
+        if not globals().get("VOICE_CLONE_ENABLED", False):
+            return "kokoro"
+        if not _clone_server_selected():
+            return "other"
+        return "clone" if _clone_server_active() else "kokoro"
+    except Exception:
+        return "other"
+
+
+def _clone_timeout_s() -> float:
+    """VOICE_CLONE_TIMEOUT_S, sanity-bounded (0.5-30 s; 2.5 on a bad value)."""
+    try:
+        v = float(globals().get("VOICE_CLONE_TIMEOUT_S", 2.5))
+        if not 0.5 <= v <= 30.0:
+            return 2.5
+        return v
+    except Exception:
+        return 2.5
+
+
+def _clone_server_synth(text: str, wry_split, gain: float):
+    """THIS line through the clone voice server: (audio, sr) or None, and
+    None means the caller (synthesise) voices this same line with the ladder
+    below it -- Kokoro -- at once. The preset's gain and the wry pause are
+    applied; its rate / pitch are not (the model has no such control).
+    Notes [turn-timing] clone / clone_ms for the answer's first render.
+    Never raises."""
+    try:
+        if not _clone_server_active():
+            return None
+        timeout_s = _clone_timeout_s()
+        t0 = time.perf_counter()
+        audio = None
+        sr = 0
+        if wry_split is not None:
+            # Both clauses or neither: a half-rendered wry line must never
+            # ship head-only audio (same rule as the Kokoro branch).
+            w_head, w_tail, pause_ms = wry_split
+            first = _cvc.CLIENT.render(w_head, timeout_s)
+            last = (_cvc.CLIENT.render(w_tail, timeout_s) if first.ok
+                    else first)
+            if first.ok and last.ok and first.sr == last.sr:
+                sr = first.sr
+                pause = np.zeros(max(0, int(sr * pause_ms / 1000)),
+                                 dtype=np.float32)
+                audio = np.concatenate([first.audio, pause, last.audio])
+                out = first
+            else:
+                out = last if first.ok else first
+        else:
+            out = _cvc.CLIENT.render(text, timeout_s)
+            if out.ok:
+                audio, sr = out.audio, out.sr
+        ms = int(round((time.perf_counter() - t0) * 1000.0))
+        if out.attempted:
+            _tt_note_stat("clone", 1 if audio is not None else 0)
+            _tt_note_stat("clone_ms", ms)
+        if audio is None:
+            if out.reason == "too-long":
+                print("  [tts] clone voice skipped (line too long for the "
+                      "server); Kokoro voices it")
+            elif out.attempted:
+                print(f"  [tts] clone voice {out.reason or 'failed'} after "
+                      f"{ms} ms; Kokoro voices this line")
+            return None
+        audio = np.asarray(audio, dtype=np.float32)
+        if gain != 1.0:
+            audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+        return audio, int(sr)
+    except Exception as e:
+        print(f"  [tts] clone voice unavailable ({type(e).__name__}: {e}); "
+              f"Kokoro voices this line")
+        return None
+
+
 # Per-sentence speech (core/sentence_tts.py, 2026-09-29): _speak resolves the
 # prosody preset ONCE for the whole reply and pins it here, per THREAD (the
 # caller's thread renders sentence 1, a worker renders the rest), so every
@@ -24512,8 +24696,21 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
         # never silence JARVIS. Read live each utterance so a 'switch to my
         # voice' toggle applies immediately. Gate is defensive: a broken import
         # of the wrapper itself is swallowed and we proceed to the ladder.
+        #
+        # CLONE VOICE SERVER (VOICE_CLONE_MODEL 'chatterbox_turbo_server',
+        # 2026-10-03): one bounded HTTP render per call, no worker thread and
+        # no in-process model (see _clone_server_synth). None -> THIS line
+        # falls through to the ladder below (Kokoro) at once. Skipped in the
+        # "skip_kokoro" rest-of-reply block: both engines already missed a
+        # sentence of this reply.
         try:
-            if globals().get("VOICE_CLONE_ENABLED", False):
+            if (globals().get("VOICE_CLONE_ENABLED", False)
+                    and _clone_server_selected()):
+                if pin_mode != "skip_kokoro":
+                    _srv = _clone_server_synth(text, wry_split, gain)
+                    if _srv is not None:
+                        return _srv
+            elif globals().get("VOICE_CLONE_ENABLED", False):
                 from core import voice_clone as _voice_clone
                 if _voice_clone.is_available():
                     # WALL-CLOCK CAP (2026-07-07 review, MED): run the clone on a
@@ -24603,10 +24800,12 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
                 print(f"  [tts] pyttsx3 render failed ({e}); falling back to edge-tts")
 
         if backend == "kokoro" and pin_mode != "skip_kokoro":
-            # CPU Kokoro (frees the 3090). Reached only when NO on-demand clone is
+            # CPU Kokoro (frees the 3090). Reached when NO on-demand clone is
             # armed (the clone is Axis 1, handled above), so an explicit clone
-            # request still wins. synthesize() is fail-closed (never raises,
-            # returns None) so a missing/corrupt model or a wedged engine falls
+            # request still wins -- and, with the clone voice server, for the
+            # one line it just failed to voice. synthesize() is fail-closed
+            # (never raises, returns None) so a missing/corrupt model or a
+            # wedged engine falls
             # straight through to the edge → pyttsx3 → SAPI5 → silence ladder and
             # never mutes JARVIS. See core/kokoro_tts.py. (2026-07-15, P2.)
             # The preset's rate drives Kokoro's speed (2026-07-21 audit — it
@@ -37971,8 +38170,10 @@ def _sentence_tts_plan(spoken_text: str):
     after the reply's prosody cells are published. Never raises.
 
     Per-sentence only when ALL hold: SENTENCE_TTS_ENABLED; the Kokoro backend
-    with no voice clone armed and Kokoro available (edge-tts keeps its
-    whole-text render cache, the clone its GPU path); not env-muted
+    with no voice clone armed and Kokoro available, or with the clone voice
+    server active (_tts_engine_kind 'clone': each sentence is one server
+    render, Kokoro voices a sentence it misses) -- edge-tts keeps its
+    whole-text render cache, the in-process clone its GPU path; not env-muted
     (MUTE_TTS -- the muted path stays byte-identical); the reply is long
     enough and has more than one sentence (core.sentence_tts.plan_chunks);
     and the reply's preset is not 'wry' (the wry beat is spliced before the
@@ -37980,8 +38181,8 @@ def _sentence_tts_plan(spoken_text: str):
     try:
         if not globals().get("SENTENCE_TTS_ENABLED", True):
             return None
-        backend = str(globals().get("TTS_BACKEND", "edge") or "edge").lower()
-        if backend != "kokoro" or globals().get("VOICE_CLONE_ENABLED", False):
+        kind = _tts_engine_kind()
+        if kind not in ("kokoro", "clone"):
             return None
         if _tts_layer is not None and _tts_layer.is_muted():
             return None
@@ -37990,7 +38191,7 @@ def _sentence_tts_plan(spoken_text: str):
         if len(chunks) < 2:
             return None
         from core import kokoro_tts as _kokoro
-        if not _kokoro.is_available():
+        if kind == "kokoro" and not _kokoro.is_available():
             return None
         user_tone = _synth_user_tone()
         chosen, preset = _resolve_tts_preset(spoken_text, user_tone)
@@ -38142,7 +38343,9 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
 #      that still happens inside the lock, unchanged;
 #    * only on the armed turn's own thread, only while a filler clip is on
 #      the device (_filler_on_device, a plain cell: tests mock
-#      _processing_filler and a Mock is truthy), only Kokoro with no clone and
+#      _processing_filler and a Mock is truthy), only Kokoro -- or the clone
+#      voice server while it is active (2026-10-03: one bounded HTTP render;
+#      the server itself runs one render at a time) -- no in-process clone,
 #      no mute, never a wry line, never while a skill wraps the preset
 #      resolver (night-owl) -- so at most one render runs outside the lock;
 #    * inside the lock it is used only when it is provably what the normal
@@ -38167,8 +38370,7 @@ def _prerender_allowed() -> bool:
     try:
         if _processing_filler.is_owner_thread() is not True:
             return False
-        backend = str(globals().get("TTS_BACKEND", "edge") or "edge").lower()
-        if backend != "kokoro" or globals().get("VOICE_CLONE_ENABLED", False):
+        if _tts_engine_kind() not in ("kokoro", "clone"):
             return False
         if _tts_muted[0]:
             return False
@@ -38702,11 +38904,11 @@ def _filler_suppressed(transient_ok: bool = False) -> str | None:
         # Raw read on purpose: focus_mode_active() self-heals and fires a recap.
         if _focus_mode[0]:
             return "focus"
-        backend = str(globals().get("TTS_BACKEND", "edge") or "edge").lower()
-        if backend != "kokoro" or globals().get("VOICE_CLONE_ENABLED", False):
-            # Clips are rendered on CPU Kokoro only; anything else (network
-            # edge-tts under the lock, the GPU clone) makes the filler
-            # unavailable rather than risky.
+        if _tts_engine_kind() not in ("kokoro", "clone"):
+            # Clips are rendered on CPU Kokoro, or by the clone voice server
+            # while it is active (a bounded HTTP render, cached); anything
+            # else (network edge-tts under the lock, the in-process GPU
+            # clone) makes the filler unavailable rather than risky.
             return "backend"
         if _realtime_session[0] is not None:
             return "realtime"
@@ -38735,24 +38937,34 @@ def _filler_arm_suppressed() -> str | None:
 
 
 def _filler_voice_key() -> tuple:
-    """Cache key: a backend / voice / clone change invalidates every clip."""
+    """Cache key: a backend / voice / clone change invalidates every clip.
+    The engine kind is in it, so the clone voice server coming up (or being
+    latched off) re-renders the clips in the voice that is speaking -- and
+    an R3 pre-render made across such a switch is dropped in the lock."""
     return (str(globals().get("TTS_BACKEND", "edge") or "edge").lower(),
             str(getattr(sys.modules.get("core.kokoro_tts"), "_VOICE", "")),
-            bool(globals().get("VOICE_CLONE_ENABLED", False)))
+            bool(globals().get("VOICE_CLONE_ENABLED", False)),
+            _tts_engine_kind())
 
 
 def _filler_render(text: str):
-    """Render one filler line with CPU Kokoro at neutral speed. Called only by
-    ClipCache.warm while it holds _SPEAK_LOCK. Returns (float32 audio, sr) or
-    None — never falls back to another backend, never raises."""
+    """Render one filler line with CPU Kokoro at neutral speed, or with the
+    clone voice server while it is active (the clips must be in the voice
+    that answers). Called only by ClipCache.warm while it holds _SPEAK_LOCK.
+    Returns (float32 audio, sr) or None — never falls back to another
+    backend, never raises."""
     try:
-        backend = str(globals().get("TTS_BACKEND", "edge") or "edge").lower()
-        if backend != "kokoro" or globals().get("VOICE_CLONE_ENABLED", False):
+        kind = _tts_engine_kind()
+        if kind == "clone":
+            out = _cvc.CLIENT.render(text, _clone_timeout_s())
+            res = (out.audio, out.sr) if out.ok else None
+        elif kind == "kokoro":
+            from core import kokoro_tts as _k
+            if not _k.is_available():
+                return None
+            res = _k.synthesize(text, speed=1.0)
+        else:
             return None
-        from core import kokoro_tts as _k
-        if not _k.is_available():
-            return None
-        res = _k.synthesize(text, speed=1.0)
         if res is None:
             return None
         audio, sr = res
@@ -44345,6 +44557,12 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         _warm_up_local_llm_async()
     except Exception as _e:
         print(f"  [local-llm] warm-up launch failed (non-fatal): {_e}")
+
+    # Clone voice server (VOICE_CLONE_MODEL 'chatterbox_turbo_server'): reuse
+    # or start it now, on its own daemon, so its ~10 s load overlaps the rest
+    # of boot. Kokoro speaks until it is ready; if it never comes up, one
+    # "[clone-voice]" line says why. A no-op when the clone is not selected.
+    _clone_server_kick()
 
     _ensure_whisper()   # load now so first user utterance isn't delayed
     # Speed plan R1 (2026-10-01): the optional model warm-ups registered via

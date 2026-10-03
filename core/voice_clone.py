@@ -53,7 +53,13 @@ place ``import chatterbox`` happens); tests mock it or its import failure.
 Config knobs (core/config.py, all user_settings-overridable):
   VOICE_CLONE_ENABLED   bool  — master switch (default False / OFF)
   VOICE_CLONE_PROFILE   str   — active profile name ("" = none selected)
-  VOICE_CLONE_MODEL     str   — engine id, currently only "chatterbox"
+  VOICE_CLONE_MODEL     str   — engine id: "chatterbox" (this module loads it
+                                in-process) or "chatterbox_turbo_server" (the
+                                model runs in its own process; see
+                                core/clone_voice_client.py). With the server
+                                engine selected this module never loads a
+                                model: is_available() asks the client and
+                                synthesize() returns None.
 
 Latency note: the FIRST call pays a multi-second cold-start (model download on
 the very first run, then load onto CUDA). After that a one-sentence reply is
@@ -391,10 +397,43 @@ def _reset_engine_cache() -> None:
 # PUBLIC API  (called from bobert_companion.synthesise())
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _server_model_selected() -> bool:
+    """VOICE_CLONE_MODEL names the clone voice server (its own process)."""
+    try:
+        from core import clone_voice_client as _cvc
+        return _cvc.is_server_model(_cfg_model())
+    except Exception:
+        return False
+
+
+def engine_hint() -> str:
+    """What the selected engine needs, for an honest 'not ready' sentence."""
+    if _server_model_selected():
+        return "the clone voice server isn't running or isn't ready"
+    return "needs chatterbox-tts and a CUDA GPU"
+
+
+def rearm() -> bool:
+    """An explicit 'use the clone voice' from the owner: with the server
+    engine, let a server that was down (or latched off after failures) be
+    tried again. True if it changed anything. Never raises."""
+    try:
+        if not _server_model_selected():
+            return False
+        from core import clone_voice_client as _cvc
+        return _cvc.CLIENT.rearm()
+    except Exception:
+        return False
+
+
 def is_available() -> bool:
     """Cheap, defensive gate the synth hot-path calls every utterance:
 
         chatterbox importable  AND  a usable profile is selected  AND  CUDA.
+
+    With the clone voice SERVER engine selected it means instead: the server
+    is up, not latched off, and speaking the active consented profile's voice
+    (core.clone_voice_client.CloneVoiceClient.usable_for).
 
     Every clause fails CLOSED (any exception → False → normal ladder). Ordered
     cheapest-first: config flags, then find_spec, then the CUDA probe last.
@@ -404,6 +443,9 @@ def is_available() -> bool:
     try:
         if not _cfg_enabled():
             return False
+        if _server_model_selected():
+            from core import clone_voice_client as _cvc
+            return _cvc.CLIENT.usable_for(_cfg_profile())
         if resolve_active_profile(_cfg_enabled(), _cfg_profile()) is None:
             return False
         if not _chatterbox_importable():
@@ -532,6 +574,10 @@ def synthesize(text: str, profile: Optional[dict] = None) -> Optional[Tuple["np.
         if not text or not str(text).strip():
             return None
         if np is None:            # no numpy → can't produce the waveform contract
+            return None
+        if _server_model_selected():
+            # The server engine renders in its own process; never load the
+            # in-process model (a CUDA context in JARVIS) for it.
             return None
         if profile is None:
             profile = resolve_active_profile(_cfg_enabled(), _cfg_profile())

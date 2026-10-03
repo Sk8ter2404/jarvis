@@ -12,7 +12,7 @@ eval_count=84 eval_ms=790 llm_calls=1 turn_ctx_chars=1342 sys_chars=31012 \
 followup_rounds=0 filler=0 filler_ms=- tail_ms=1410 cap_lag_ms=128 \
 clip_ms=3904 stt_wait_ms=0 stt_engine=- load_ms=13 total_ms=3512 \
 play_open_ms=41 out_lat_ms=46 filler_clip_ms=- eot=- st_p=- st_n=- pre=- \
-cut=- amb_deferred=- cache=- lead_dropped=0
+cut=- amb_deferred=- cache=- clone=- clone_ms=- lead_dropped=0
 
 Offsets are integer milliseconds from the turn's t0: the record_speech VAD
 break for a spoken turn, the inject-queue drain for a typed/injected turn. A
@@ -80,6 +80,12 @@ lead_dropped (NOTE_FIELDS; ``-`` = not measured on this turn):
   cut            reserved (R8): ms of filler played before a soft cut.
   amb_deferred   reserved (R2): ambient decodes deferred during the turn.
   cache          reserved (R4): Kokoro render-cache verdict.
+  clone          the clone voice server (VOICE_CLONE_MODEL
+                 'chatterbox_turbo_server') on the answer's first render: 1 =
+                 it voiced it, 0 = it was tried and that line fell back to
+                 Kokoro. ``-`` = the clone was not in use.
+  clone_ms       that first clone render's time, request to finished audio
+                 (0 = served from the clone's render cache).
 
 They are set through TurnTiming.note_stat (load_ms / total_ms come with the
 answering response through llm_response, cap_lag_ms with the VAD break through
@@ -120,7 +126,7 @@ _AFTER_YOU = frozenset(("synth_start", "first_play"))
 NOTE_FIELDS = ("tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms",
                "stt_engine", "load_ms", "total_ms", "play_open_ms",
                "out_lat_ms", "filler_clip_ms", "eot", "st_p", "st_n", "pre",
-               "cut", "amb_deferred", "cache")
+               "cut", "amb_deferred", "cache", "clone", "clone_ms")
 
 # Stats fields, printed after the marks in this order.
 # turn_ctx_chars is the per-turn context actually SENT; budget_trimmed=1 when
@@ -146,7 +152,8 @@ _NOTE_NAMES = _NOTE_PRINTED - {"cap_lag_ms"}
 #   * like first_play — only after "you", from the turn's thread or a helper
 #     it adopted, so a reminder or tray line played first is not the answer.
 _ANY_THREAD_NAMES = frozenset(("filler_clip_ms", "cut", "amb_deferred"))
-_AFTER_YOU_NAMES = frozenset(("play_open_ms", "out_lat_ms", "cache"))
+_AFTER_YOU_NAMES = frozenset(("play_open_ms", "out_lat_ms", "cache", "clone",
+                              "clone_ms"))
 # Counts that add up over the turn instead of keeping the first value.
 _ADDITIVE_NAMES = frozenset(("amb_deferred",))
 # Any-thread names that may arrive before their turn begins and be adopted
@@ -471,16 +478,16 @@ class TurnTiming:
         first value wins (amb_deferred adds up). Thread rules: the turn's own
         thread only, like mark(owner_only=True) — except filler_clip_ms /
         cut / amb_deferred (any thread) and play_open_ms / out_lat_ms / cache
-        (like first_play: after "you", from the turn's thread or an adopted
-        helper).
+        / clone / clone_ms (like first_play: after "you", from the turn's
+        thread or an adopted helper).
 
         With NO active turn, a value is kept for the turn that is about to
         begin: a standby wake transcribes its capture before begin_voice, and
         record_speech runs before every voice turn. begin_voice(since) adopts
         the caller's own values (amb_deferred: anyone's) stamped at or after
         `since`; everything else ages out of a small bounded stash.
-        play_open_ms / out_lat_ms / cache / filler_clip_ms / cut need a live
-        turn.
+        play_open_ms / out_lat_ms / cache / clone / clone_ms / filler_clip_ms
+        / cut need a live turn.
 
         `value` may be a zero-argument callable (a result still being worked
         out on a daemon, e.g. tail_ms): it is called once when the line is

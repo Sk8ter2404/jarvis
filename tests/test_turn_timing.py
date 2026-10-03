@@ -520,7 +520,7 @@ class R1SchemaTests(unittest.TestCase):
             "tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms", "stt_engine",
             "load_ms", "total_ms", "play_open_ms", "out_lat_ms",
             "filler_clip_ms", "eot", "st_p", "st_n", "pre", "cut",
-            "amb_deferred", "cache"))
+            "amb_deferred", "cache", "clone", "clone_ms"))
         self.assertEqual(len(set(tt.STAT_FIELDS)), len(tt.STAT_FIELDS))
 
     def test_the_old_fields_keep_their_order(self):
@@ -551,6 +551,8 @@ class NoteStatTests(unittest.TestCase):
         t.note_stat("play_open_ms", 41)
         t.note_stat("out_lat_ms", 46)
         t.note_stat("cache", "would-hit")
+        t.note_stat("clone", 1)
+        t.note_stat("clone_ms", 812)
         _in_thread(lambda: t.note_stat("filler_clip_ms", 2120))
         _in_thread(lambda: t.note_stat("cut", 980))
         _in_thread(lambda: t.note_stat("amb_deferred", 2))
@@ -563,7 +565,8 @@ class NoteStatTests(unittest.TestCase):
              "total_ms": "3512", "play_open_ms": "41", "out_lat_ms": "46",
              "filler_clip_ms": "2120", "eot": "rms",
              "st_p": "0.873", "st_n": "2", "pre": "1", "cut": "980",
-             "amb_deferred": "2", "cache": "would-hit"})
+             "amb_deferred": "2", "cache": "would-hit", "clone": "1",
+             "clone_ms": "812"})
         self.assertEqual(d["lead_dropped"], "0")
 
     def test_an_absent_field_prints_dash(self):
@@ -611,8 +614,11 @@ class NoteStatTests(unittest.TestCase):
         _in_thread(lambda: t.note_stat("play_open_ms", 7))
         _in_thread(lambda: t.note_stat("out_lat_ms", 7))
         _in_thread(lambda: t.note_stat("cache", "hit"))
+        _in_thread(lambda: t.note_stat("clone", 1))
+        _in_thread(lambda: t.note_stat("clone_ms", 700))
         d = self._emit()
-        for k in _R1_OWNER + ("play_open_ms", "out_lat_ms", "cache"):
+        for k in _R1_OWNER + ("play_open_ms", "out_lat_ms", "cache", "clone",
+                              "clone_ms"):
             self.assertEqual(d[k], "-", k)
 
     def test_any_thread_fields_are_accepted_from_any_thread(self):
@@ -830,12 +836,15 @@ class PreTurnStashTests(unittest.TestCase):
         self.clock.advance(0.1)
         t.note_stat("play_open_ms", 40)
         t.note_stat("cache", "hit")
+        t.note_stat("clone", 1)
+        t.note_stat("clone_ms", 650)
         _in_thread(lambda: t.note_stat("filler_clip_ms", 2100))
         _in_thread(lambda: t.note_stat("cut", 500))
         t.begin_voice(since)
         t.mark("you")
         d = self._emit()
-        for k in ("play_open_ms", "cache", "filler_clip_ms", "cut"):
+        for k in ("play_open_ms", "cache", "clone", "clone_ms",
+                  "filler_clip_ms", "cut"):
             self.assertEqual(d[k], "-", k)
 
     def test_no_since_and_other_kinds_adopt_nothing(self):

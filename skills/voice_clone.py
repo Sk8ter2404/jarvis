@@ -121,6 +121,31 @@ def _persist(enabled: Optional[bool] = None, profile: Optional[str] = None) -> N
         pass
 
 
+# ─── engine wording ─────────────────────────────────────────────────────────
+
+_DEFAULT_HINT = "needs chatterbox-tts and a CUDA GPU"
+
+
+def _engine_hint(vc) -> str:
+    """What the selected engine needs (core.voice_clone.engine_hint), for an
+    honest 'not ready' sentence. Falls back to the in-process wording."""
+    try:
+        hint = vc.engine_hint() if vc is not None else None
+    except Exception:
+        hint = None
+    return hint if isinstance(hint, str) and hint else _DEFAULT_HINT
+
+
+def _rearm(vc) -> None:
+    """core.voice_clone.rearm(), best effort (never raises)."""
+    try:
+        fn = getattr(vc, "rearm", None)
+        if callable(fn):
+            fn()
+    except Exception:
+        pass
+
+
 # ─── action bodies ──────────────────────────────────────────────────────────
 
 def _list_voice_profiles(_: str = "") -> str:
@@ -168,6 +193,9 @@ def _set_voice_profile(name: str = "") -> str:
                 f"consented, so it's off-limits.")
     _apply_runtime(enabled=True, profile=n)
     _persist(enabled=True, profile=n)
+    # An explicit selection re-arms the clone voice server if it was down or
+    # latched off earlier this session (a no-op for the in-process engine).
+    _rearm(vc)
     engine_ready = False
     try:
         engine_ready = vc.is_available()
@@ -176,10 +204,10 @@ def _set_voice_profile(name: str = "") -> str:
     if engine_ready:
         return f"Switched to the '{n}' voice, sir."
     # Selected + enabled, but the engine can't render yet (no chatterbox / no
-    # GPU) — be honest that I'll fall back until it's installed.
+    # GPU, or the clone voice server is not up yet) — be honest that I'll
+    # fall back until it is.
     return (f"Selected the '{n}' voice, sir, but the clone engine isn't ready "
-            f"(needs chatterbox-tts and a CUDA GPU), so I'll use my normal "
-            f"voice until it is.")
+            f"({_engine_hint(vc)}), so I'll use my normal voice until it is.")
 
 
 def _voice_clone_status(_: str = "") -> str:
@@ -199,7 +227,7 @@ def _voice_clone_status(_: str = "") -> str:
     if ready:
         return f"Voice cloning is on, sir, speaking as the '{profile}' profile."
     return (f"Voice cloning is on with the '{profile}' profile, sir, but the "
-            f"engine isn't available (needs chatterbox-tts and CUDA), so I'm "
+            f"engine isn't available ({_engine_hint(vc)}), so I'm "
             f"falling back to my normal voice.")
 
 
