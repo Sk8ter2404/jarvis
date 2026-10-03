@@ -48,6 +48,26 @@ class KeepAliveSettingTests(MonolithGlobalsTestCase):
                                       create=True):
                 self.assertEqual(self.bc._local_keep_alive(), want)
 
+    def test_a_value_ollama_would_reject_falls_back_to_20m(self):
+        # Review 2026-10-02: the settings loader stores str(saved value), so
+        # a hand edit arrives here as "1.5", "3600.0", "None" (a JSON null),
+        # "True", " 24h " or "1d". Each was sent as-is - HTTP 400 on EVERY
+        # local request, the 15:05 outage again - and "--1" raised
+        # ValueError out of the chat payload builder. A number of seconds
+        # goes as a number, a duration Ollama parses goes as itself, anything
+        # else falls back to "20m".
+        for value, want in (("1.5", 1.5), ("3600.0", 3600), (" 24h ", "24h"),
+                            ("1h30m", "1h30m"), ("500ms", "500ms"), ("0", 0),
+                            (2.5, 2.5), ("None", "20m"), ("True", "20m"),
+                            ("1d", "20m"), ("24H", "20m"), ("--1", "20m"),
+                            ("1h 30m", "20m"), ("inf", "20m"),
+                            (float("inf"), "20m"), (float("nan"), "20m")):
+            with self.subTest(value=value), \
+                    mock.patch.object(self.bc, "LOCAL_KEEP_ALIVE", value,
+                                      create=True):
+                self.assertEqual(self.bc._local_keep_alive(), want)
+                self.assertEqual(self._payload()["keep_alive"], want)
+
     def test_no_local_request_hard_codes_its_own_keep_alive(self):
         src = inspect.getsource(self.bc)
         self.assertNotIn('"keep_alive": "20m"', src)

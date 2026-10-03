@@ -20853,20 +20853,47 @@ def _local_chat_prompt(system: str, messages: list) -> tuple:
     return sys_prompt, messages
 
 
+# What Ollama accepts as keep_alive (its api.Duration): a JSON number of
+# seconds, or a Go duration string - a number and a unit (ns, us, ms, s, m,
+# h; Go's micro-sign spellings too), chainable ("1h30m"). Anything else is
+# HTTP 400 on every request.
+_KEEP_ALIVE_SECONDS_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", re.ASCII)
+_KEEP_ALIVE_DURATION_RE = re.compile(
+    r"[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|µs|μs|ms|s|m|h))+",
+    re.ASCII)
+# Rejected values already reported, so the log says it once, not per request.
+_keep_alive_rejected: set = set()
+
+
 def _local_keep_alive():
     """LOCAL_KEEP_ALIVE (core/config.py): the keep_alive every local-brain
     request sends, so the chat, warm-up and re-prime paths never disagree.
     A blank or broken value falls back to today's "20m"."""
     v = globals().get("LOCAL_KEEP_ALIVE", "20m")
-    if isinstance(v, bool) or v is None or (isinstance(v, str) and not v.strip()):
+    if isinstance(v, bool) or v is None:
         return "20m"
-    # A bare number saved in the settings arrives as a STRING (the settings
-    # loader keeps the default's type), and Ollama rejects "-1" with HTTP 400
-    # "missing unit in duration" on EVERY local request - live 2026-10-02
-    # 15:05-16:07. A numeric string is sent as the number it spells.
-    if isinstance(v, str) and v.strip().lstrip("+-").isdigit():
-        return int(v.strip())
-    return v
+    if isinstance(v, (int, float)):
+        return v if math.isfinite(v) else "20m"
+    s = str(v).strip()
+    if not s:
+        return "20m"
+    # A value saved in the settings arrives as a STRING (the settings loader
+    # keeps the default's type: -1 -> "-1", 1.5 -> "1.5", null -> "None"),
+    # and Ollama answers anything but a number or a duration with HTTP 400 on
+    # EVERY local request - live 2026-10-02 15:05-16:07 ("-1"). A numeric
+    # string is sent as the number of seconds it spells, a duration as
+    # itself; anything else falls back to "20m" and is said once in the log.
+    if _KEEP_ALIVE_SECONDS_RE.fullmatch(s):
+        n = float(s)
+        return int(n) if n.is_integer() else n
+    if _KEEP_ALIVE_DURATION_RE.fullmatch(s):
+        return s
+    if s not in _keep_alive_rejected:
+        _keep_alive_rejected.add(s)
+        print(f"  [local-llm] LOCAL_KEEP_ALIVE={v!r} is not a keep_alive "
+              f"Ollama accepts (a number of seconds, or a duration such as "
+              f"\"30m\" or \"24h\") - using \"20m\"")
+    return "20m"
 
 
 def _local_chat_payload(model_tag: str, sys_prompt: str, messages: list,
