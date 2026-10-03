@@ -67,6 +67,8 @@ class _Base(MonolithGlobalsTestCase):
         self._p(bc, "_is_staging", lambda: False)
         self._p(bc, "TTS_BACKEND", "kokoro", create=True)
         self._p(bc, "VOICE_CLONE_ENABLED", False, create=True)
+        # The in-process clone engine whatever this box's settings select.
+        self._p(bc, "VOICE_CLONE_MODEL", "chatterbox", create=True)
         self._p(bc, "SENTENCE_TTS_ENABLED", True, create=True)
         self._p(bc, "BARGE_IN_ENABLED", False)
         self._p(kokoro_tts, "is_available", return_value=True)

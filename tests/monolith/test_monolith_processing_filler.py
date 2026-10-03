@@ -120,6 +120,9 @@ class _Base(MonolithGlobalsTestCase):
         self._p(bc, "PROCESSING_FILLER_ENABLED", True)
         self._p(bc, "TTS_BACKEND", "kokoro")
         self._p(bc, "VOICE_CLONE_ENABLED", False)
+        # The in-process clone engine (a box whose settings select the clone
+        # voice SERVER must still see "the clone disables the filler" here).
+        self._p(bc, "VOICE_CLONE_MODEL", "chatterbox", create=True)
         self._p(bc, "_tts_layer", None)
         self._p(bc, "_is_staging", lambda: False)
         self._p(bc, "_GESTURE_BARGE_IN_ENABLED", False)

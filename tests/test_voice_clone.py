@@ -162,6 +162,14 @@ class ResolveActiveProfileTests(unittest.TestCase):
 class IsAvailableTests(unittest.TestCase):
     """is_available() must fail CLOSED for every missing precondition."""
 
+    def setUp(self):
+        # The in-process engine: pinned, so a box whose user_settings.json
+        # selects the clone voice SERVER (core.config reads it at import)
+        # still tests this path (2026-10-03).
+        p = mock.patch.object(vc, "_cfg_model", return_value="chatterbox")
+        p.start()
+        self.addCleanup(p.stop)
+
     def _usable_profile(self):
         return {"name": "me", "source": "owner", "consent": True,
                 "reference_wav": __file__}   # any existing file passes the wav check
@@ -229,6 +237,14 @@ class CudaAvailableTests(unittest.TestCase):
 class SynthesizeFallbackTests(unittest.TestCase):
     """synthesize() must return None (→ caller falls back) on every failure
     path, and only return a waveform when the engine renders one."""
+
+    def setUp(self):
+        # The in-process engine: pinned, so a box whose user_settings.json
+        # selects the clone voice SERVER (core.config reads it at import)
+        # still tests this path (2026-10-03).
+        p = mock.patch.object(vc, "_cfg_model", return_value="chatterbox")
+        p.start()
+        self.addCleanup(p.stop)
 
     def _usable_profile(self):
         return {"name": "me", "source": "owner", "consent": True,

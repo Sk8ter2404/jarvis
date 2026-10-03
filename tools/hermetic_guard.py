@@ -63,7 +63,7 @@ runner; a refused lookup raises ``socket.gaierror``):
 * a connect (TCP or UDP) to any address that is not this machine;
 * a connect to a LIVE local service on loopback - ``LIVE_SERVICE_PORTS``
   (Ollama 11434, the JARVIS web UI 8766, ComfyUI 8188, OBS websocket 4455, the
-  MCP SSE bridge 8788);
+  MCP SSE bridge 8788, the clone voice server 8767);
 * a bind to one of those ports (on Windows ``SO_REUSEADDR`` lets a second
   socket share - i.e. hijack - the live web UI's port);
 * a name lookup that would leave the box (anything but ``localhost``, a
@@ -163,6 +163,10 @@ LIVE_SERVICE_PORTS = {
     8188: "ComfyUI",
     4455: "the OBS websocket",
     8788: "the MCP SSE bridge",
+    # The clone voice server's default port (core/clone_voice_client.py): a
+    # request there renders on the owner's GPU. Tests use a fake server on an
+    # ephemeral port.
+    8767: "the clone voice server",
 }
 
 # Programs whose launch IS a live-hardware / live-service / network probe (or

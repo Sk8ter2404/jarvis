@@ -35,6 +35,10 @@ class SynthesiseVoiceCloneTests(MonolithGlobalsTestCase):
 
     def setUp(self):
         bc = self.bc
+        # These pin the IN-PROCESS engine; the clone voice server has its own
+        # file (test_monolith_clone_server). Pinned so a box whose settings
+        # select the server still tests this path.
+        self._p(bc, "VOICE_CLONE_MODEL", "chatterbox", create=True)
         # synthesise() reads these single-element state cells for prosody.
         self._p(bc, "_last_voice_route", [{"addendum": "", "mood": "casual"}])
         self._p(bc, "_last_user_tone", [None])

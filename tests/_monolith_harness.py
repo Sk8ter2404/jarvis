@@ -796,6 +796,12 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         _saved_owner_only = getattr(bc, "LEARN_ONLY_FROM_OWNER", None)
         if _saved_owner_only is not None:
             bc.LEARN_ONLY_FROM_OWNER = False
+        # Same for the voice clone (2026-10-03): the owner's box may select
+        # it, and every speech test expects the shipped default (off) unless
+        # it patches the clone on itself.
+        _saved_clone = getattr(bc, "VOICE_CLONE_ENABLED", None)
+        if _saved_clone is not None:
+            bc.VOICE_CLONE_ENABLED = False
         # Start clean too, not only end clean: anything that ran before the
         # first monolith test (an import-time Kinect pump, a light-tier test)
         # may have left history in the process-wide camera gate.
@@ -811,3 +817,5 @@ class MonolithGlobalsTestCase(unittest.TestCase):
             _cfg.AMBIENT_LISTEN_ENABLED = _saved_ambient
             if _saved_owner_only is not None:
                 bc.LEARN_ONLY_FROM_OWNER = _saved_owner_only
+            if _saved_clone is not None:
+                bc.VOICE_CLONE_ENABLED = _saved_clone
