@@ -177,18 +177,24 @@ def total_vram_mb(force: bool = False) -> int:
     return total
 
 
-def whisper_on_budget_card(whisper_device) -> bool:
+def whisper_on_budget_card(whisper_device, listen_gpu="cuda:1") -> bool:
     """Does Whisper (WHISPER_DEVICE) load onto the card this budget describes?
 
     "auto" / "cuda" / "cuda:0" / unset → yes: bobert_companion's
     _resolve_whisper_device turns "auto" into "cuda" = CUDA device 0, which
-    under CUDA's default FASTEST_FIRST order is the brain's card. "cuda:N" with
-    N ≥ 1 is ANOTHER card (on this desk cuda:1 is the 1650 SUPER, kept for
-    Whisper precisely so the 3090 stays free) and "cpu" is no card at all.
-    An unparseable "cuda:x" counts as this card (the conservative answer)."""
+    is the brain's card (bobert_companion numbers cards by PCI bus). "cuda:N"
+    with N ≥ 1 is ANOTHER card (on this desk cuda:1 is the 1650 SUPER, kept
+    for Whisper precisely so the 3090 stays free) and "cpu" is no card at all.
+    An unparseable "cuda:x" counts as this card (the conservative answer).
+    "listen" (2026-10-04) is the card ``listen_gpu`` (LISTEN_GPU) names:
+    this card only when that is "cuda"/"cuda:0"; a UUID or a name piece is
+    taken to mean the listen card, not the brain's."""
     dev = str(whisper_device or "auto").strip().lower()
     if dev == "cpu":
         return False
+    if dev == "listen":
+        lg = str(listen_gpu or "").strip().lower()
+        return lg in ("cuda", "cuda:0")
     if dev.startswith("cuda:"):
         try:
             return int(dev.split(":", 1)[1]) == 0
@@ -431,7 +437,8 @@ def predict_budget(settings: dict, total_mb: Optional[int] = None) -> dict:
     #    THIS card nothing; it is still listed so the breakdown says where it
     #    went ("elsewhere" rows carry no MB in the text renderings).
     whisper_dev = str(settings.get("WHISPER_DEVICE") or "auto").strip()
-    if whisper_on_budget_card(whisper_dev):
+    if whisper_on_budget_card(whisper_dev,
+                              settings.get("LISTEN_GPU", "cuda:1")):
         components.append({
             "label": "Whisper",
             "mb": WHISPER_VRAM_MB,

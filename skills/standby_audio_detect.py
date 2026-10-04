@@ -248,21 +248,28 @@ def _try_import_librosa():
 
 
 def _cuda_free_vram_mb() -> "float | None":
-    """Best-effort free-VRAM probe for the opt-in GPU whisper path. Returns free
-    MiB, or None when it can't be determined — the caller treats None as 'no
-    headroom' and stays on CPU (fail-safe). torch here is CPU-only, so we go
-    straight to NVML rather than torch.cuda.mem_get_info. (2026-07-08)"""
+    """Best-effort free-VRAM probe for the opt-in GPU whisper path (cuda:0,
+    the card it loads on). Returns free MiB, or None when it can't be
+    determined — the caller treats None as 'no headroom' and stays on CPU
+    (fail-safe). NVML through core/gpu_probe (no CUDA context; 2026-10-04 —
+    the pynvml package this used is not installed, so it always answered
+    None and the opt-in was dead)."""
     try:
-        import pynvml
-        pynvml.nvmlInit()
-        try:
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            info = pynvml.nvmlDeviceGetMemoryInfo(h)
-            return info.free / (1024 * 1024)
-        finally:
-            pynvml.nvmlShutdown()
+        from core import gpu_probe as _gp
+        mem = _gp.cuda_memory_mb(0)
+        return None if mem is None else float(mem[0])
     except Exception:
         return None
+
+
+def _headset_output(bc) -> bool:
+    """The PC's output is a headset (bobert_companion.is_using_headset): the
+    one case in which this loop may act. False when it cannot tell (as the
+    engage check below always treated it). Never raises."""
+    try:
+        return bool(bc.is_using_headset())
+    except Exception:
+        return False
 
 
 def _ensure_whisper_tiny():
@@ -477,6 +484,16 @@ def _background_loop() -> None:
         if bc is None:
             continue
         if _suppress_due_to_state(bc):
+            _loop_consecutive[0] = 0
+            continue
+        # HEADSET FIRST (2026-10-04). The loop's only action - auto-standby -
+        # requires the headset as the output (see the engage check below),
+        # so on the speakers every mic read + whisper-tiny decode + librosa
+        # pass was pure cost: measured 9.5 CPU-s a minute while music played
+        # on the Realtek speakers. Off the headset the count starts over, so
+        # switching to the headset mid-song needs `match_windows` fresh
+        # lyric windows (~15 s) before standby engages.
+        if not _headset_output(bc):
             _loop_consecutive[0] = 0
             continue
         try:

@@ -1045,12 +1045,15 @@ class VlmCoLoadTrueFreeVramTests(MonolithGlobalsTestCase):
         req.post.assert_called_once()
 
     def test_cuda0_free_vram_mb_never_raises(self):
-        # Best-effort probe: torch absent AND nvidia-smi absent → returns None,
-        # never raises. nvidia-smi is made absent for real: this used to leave
-        # it installed, so on an NVIDIA box it ran the real binary and the
-        # assertion had to accept "None or any int" (2026-09-30).
+        # Best-effort probe: NVML unreadable AND nvidia-smi absent → returns
+        # None, never raises. nvidia-smi is made absent for real: this used to
+        # leave it installed, so on an NVIDIA box it ran the real binary and
+        # the assertion had to accept "None or any int" (2026-09-30). NVML is
+        # made unreadable the same way (2026-10-04).
         bc = self.bc
         with mock.patch.dict("sys.modules", {"torch": None}), \
+                mock.patch.object(bc._gpu_probe, "cuda_memory_mb",
+                                  return_value=None), \
                 mock.patch("subprocess.run",
                            side_effect=FileNotFoundError("nvidia-smi")) as run:
             val = bc._cuda0_free_vram_mb()
@@ -1062,8 +1065,27 @@ class VlmCoLoadTrueFreeVramTests(MonolithGlobalsTestCase):
         bc = self.bc
         done = mock.Mock(returncode=0, stdout="12345\n")
         with mock.patch.dict("sys.modules", {"torch": None}), \
+                mock.patch.object(bc._gpu_probe, "cuda_memory_mb",
+                                  return_value=None), \
                 mock.patch("subprocess.run", return_value=done):
             self.assertEqual(bc._cuda0_free_vram_mb(), 12345)
+
+    def test_cuda0_free_vram_mb_reads_nvml_and_never_torch(self):
+        # 2026-10-04: torch.cuda.mem_get_info(0) CREATED a CUDA context on
+        # the 3090 the first time it ran (+59 MB, kept until exit). NVML
+        # (core/gpu_probe) answers first; torch and nvidia-smi are never
+        # asked when it can.
+        bc = self.bc
+        fake_torch = mock.Mock()
+        fake_torch.cuda.mem_get_info.side_effect = AssertionError("context")
+        with mock.patch.dict("sys.modules", {"torch": fake_torch}), \
+                mock.patch.object(bc._gpu_probe, "cuda_memory_mb",
+                                  return_value=(1650, 24576)) as probe, \
+                mock.patch("subprocess.run") as run:
+            self.assertEqual(bc._cuda0_free_vram_mb(), 1650)
+        probe.assert_called_once_with(0)
+        run.assert_not_called()
+        fake_torch.cuda.mem_get_info.assert_not_called()
 
 
 @requires_monolith

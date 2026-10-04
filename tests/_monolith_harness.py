@@ -96,6 +96,11 @@ def load_monolith():
     _sf.reset_overrides()
     bc.WHISPER_TRUST_RMS = _sf.WHISPER_TRUST_RMS
     bc._followup_window = FollowupWindow(0)
+    # The music gate's one real-world read (the PC's playback meter and media
+    # session, 2026-10-04) must never answer a test: one run while the owner
+    # plays music would see "music" and count / print for real. No music;
+    # a test that needs music patches _music_meter (or _music_read_state).
+    bc._music_meter = lambda: (0.0, False)
     _bc = bc
     return bc
 
@@ -441,6 +446,15 @@ _MONOLITH_RESTORE_NAMES = (
     "last_speech_time", "last_face_seen", "_apple_music_last_seen",
     # ── STT / whisper model handles ────────────────────────────────────────
     "_stt", "_stt_device", "_stt_model_name", "_stt_engine",
+    # ── listening lane (2026-10-04) ────────────────────────────────────────
+    # The music gate's cached reading (a leaked "music" would gate a LATER
+    # test's rescue / ambient batch / capture), its voice-ID tick mark and
+    # "lost" log throttle, the per-capture voice memo (a leaked entry would
+    # answer a later test's voice check from this one's fake), and the
+    # listening-model placements + their once-per-model fallback latch. The
+    # minute counter itself is replaced in _restore_monolith_pristine.
+    "_music_state", "_music_vid_seen", "_music_lost_logged",
+    "_capture_voice_memo", "_listen_placements", "_listen_fallback_logged",
     # ── local-LLM / ollama latches + caches ────────────────────────────────
     "_RESOLVED_LOCAL_LLM_MODEL", "_OLLAMA_INSTALL_TRIGGERED",
     "_OLLAMA_PULL_TRIGGERED", "_LOCAL_VISION_PULL_TRIGGERED",
@@ -528,6 +542,13 @@ def _restore_monolith_pristine(bc) -> None:
     _reset_camera_gate(bc)
     try:
         bc._turn_timing.reset()
+    except Exception:
+        pass
+    # The music gate's minute counter (2026-10-04): counts or a "had music"
+    # mark left by one test would print a minute line into a LATER test's
+    # output. A fresh one per test.
+    try:
+        bc._music_counter = bc._music_gate.MinuteCounter()
     except Exception:
         pass
     # R1 tail probe (2026-10-01): a probe thread left by one test would make

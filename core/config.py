@@ -851,8 +851,11 @@ NOISE_FILTER_ENABLED = True
 # forces GPU 0; 'cuda:N' pins STT to a specific GPU (e.g. 'cuda:1' to run
 # Whisper on a second card and keep the primary free for the LLM/voice);
 # 'cpu' forces the legacy path. large-v3-turbo on the 3090 runs ~15× real-time
-# at near-identical accuracy to large-v3.
-WHISPER_DEVICE      = "auto"            # "auto" | "cuda" | "cuda:N" | "cpu"
+# at near-identical accuracy to large-v3. 'listen' = the listen card
+# (LISTEN_GPU below). bobert_companion numbers GPUs by PCI bus
+# (CUDA_DEVICE_ORDER=PCI_BUS_ID), so 'cuda:1' keeps meaning the same card when
+# another one is added in a slot after it.
+WHISPER_DEVICE      = "auto"            # "auto" | "cuda" | "cuda:N" | "cpu" | "listen"
 WHISPER_MODEL_CUDA  = "large-v3-turbo"  # ~3.1 GB VRAM, 8x faster than large-v3
 WHISPER_MODEL_CPU   = "small"           # CPU-friendly default when no GPU
 
@@ -901,6 +904,45 @@ PARAKEET_MODEL_DIR         = r"C:\JARVIS-models\parakeet-tdt-0.6b-v2-onnx"
 PARAKEET_THREADS           = 8
 PARAKEET_CONF_ANCHORS: list = []
 STT_REPLACEMENTS_PARAKEET: dict = {}
+
+# ─── Where the listening models run (core/listen_devices.py, 2026-10-04) ──
+# PARAKEET_DEVICE / SMART_TURN_DEVICE / VOICE_ID_DEVICE: 'cpu' | 'listen' |
+#   'cuda:N' (Whisper's is WHISPER_DEVICE above). 'listen' = the card
+#   LISTEN_GPU names. A card that is missing, lacks the model's GPU runtime
+#   (onnxruntime-gpu for Parakeet / Smart Turn; it is not installed) or has
+#   less than the model's need + LISTEN_GPU_RESERVE_MB free puts the model on
+#   the CPU with one "[listen]" log line. The defaults are what measured best
+#   here: Parakeet 106-194 ms a command and Smart Turn 25 ms on the CPU;
+#   voice-ID 10-75 ms on the CPU (on the 3090 it had taken a CUDA context and
+#   up to 441 MB beside the brain).
+# LISTEN_GPU: which card 'listen' means — 'cuda:N', a GPU UUID ('GPU-...',
+#   printed on the boot "[listen] devices:" line; a unique prefix will do) or
+#   a piece of its name ('1650'); '' = no listen card. When a second RTX 3090
+#   arrives, set this to its UUID to move every 'listen' model there.
+# All apply on the next start.
+LISTEN_GPU                 = "cuda:1"
+LISTEN_GPU_RESERVE_MB      = 512
+PARAKEET_DEVICE            = "cpu"
+SMART_TURN_DEVICE          = "cpu"
+VOICE_ID_DEVICE            = "cpu"
+
+# ─── Music gate (core/music_gate.py, 2026-10-04) ───────────────────────
+# With music playing in wake-word mode every capture runs to 30 s and was
+# transcribed twice (Parakeet, then a Whisper "rescue"), and the ambient
+# listener ran Whisper on every 2.5 s of lyrics: ~35 % of the 1650 and ~39
+# CPU-s a minute. MUSIC_GATE_MODE:
+#   'off'    today's behaviour, nothing measured;
+#   'shadow' (default) today's behaviour, plus one "[music-gate]" counter
+#            line per minute with music: what 'on' would have skipped and
+#            whether any of it would have been an owner turn ("lost");
+#   'on'     over music: the ambient listener transcribes nothing,
+#            Parakeet's rescue runs only with a "Jarvis"-like word or the
+#            owner's voice behind it, and an owner capture stops at
+#            MUSIC_MAX_CAPTURE_S seconds.
+# Wake-word and owner-voice detection (Parakeet on every capture, the media
+# gate's voice check) keep running in every mode.
+MUSIC_GATE_MODE            = "shadow"
+MUSIC_MAX_CAPTURE_S        = 10.0
 
 # Per-install speech-filter tuning. The Whisper gate thresholds depend on the
 # MICROPHONE, so an install whose mic differs from the desktop's overrides them

@@ -218,11 +218,16 @@ def session_options(threads=DEFAULT_THREADS, rt=None):
     return so
 
 
-def load(model_dir, threads=DEFAULT_THREADS):
+CPU_PROVIDERS = ("CPUExecutionProvider",)
+
+
+def load(model_dir, threads=DEFAULT_THREADS, providers=None):
     """The Parakeet engine: onnx-asr's nemo-conformer-tdt model from
-    `model_dir`, int8, CPU ONLY (CPUExecutionProvider; nothing is placed on
-    a GPU), the tuned session options, with timestamps (so each result
-    carries per-token log-probabilities). Raises on any failure — the
+    `model_dir`, int8, the tuned session options, with timestamps (so each
+    result carries per-token log-probabilities). `providers`: onnxruntime's
+    list — CPU only (CPUExecutionProvider) unless the caller passes the one
+    PARAKEET_DEVICE resolved to (core/listen_devices.ort_providers: CUDA on
+    the listen card with the CPU behind it). Raises on any failure — the
     package or the model directory missing, or the load itself; the caller
     latches the engine off."""
     if not package_available():
@@ -234,7 +239,7 @@ def load(model_dir, threads=DEFAULT_THREADS):
     model = onnx_asr.load_model(MODEL_TYPE, str(model_dir),
                                 quantization=QUANTIZATION,
                                 sess_options=session_options(threads),
-                                providers=["CPUExecutionProvider"])
+                                providers=list(providers or CPU_PROVIDERS))
     return model.with_timestamps()
 
 
@@ -338,16 +343,24 @@ class Primary:
                                        gates and the Silero head check
       note(value)                      [turn-timing] stt_engine
       hotwords() -> bool               STT_HOTWORDS is set (then logged once)
+      gate(text, audio, why) -> str    the music gate (core/music_gate.py,
+                                       2026-10-04) on a rescue: '' = rescue,
+                                       'skip' = keep Parakeet's text (no
+                                       Whisper decode), 'shadow' = rescue,
+                                       then shadow(why, result) is told
+                                       what Whisper made of it. None (the
+                                       default) = every rescue runs.
 
     run() returns what the turn uses. Never raises past whisper(): a
     Parakeet failure latches off (one log line) and Whisper decodes. A
     decode that raises NotReady (the model is still loading) is Whisper's
     too, without latching ('whisper-loading'). The rescue line is logged
-    once, then at most once per RESCUE_LOG_EVERY_S (`clock`)."""
+    once, then at most once per RESCUE_LOG_EVERY_S (`clock`). A gate error
+    rescues (a slower turn, never a lost one)."""
 
     def __init__(self, decode, whisper, *, latch, post_text=None,
                  rescue=None, note=None, hotwords=None, log=print,
-                 clock=time.monotonic):
+                 clock=time.monotonic, gate=None, shadow=None):
         self._decode = decode
         self._whisper = whisper
         self.latch = latch
@@ -356,6 +369,8 @@ class Primary:
                                   else "empty")
         self._note = note or (lambda v: None)
         self._hotwords = hotwords or (lambda: False)
+        self._gate = gate
+        self._shadow = shadow
         self._log = log
         self._clock = clock
         self._mu = threading.Lock()
@@ -364,6 +379,7 @@ class Primary:
         self._rescue_quiet = 0
         self.decodes = 0
         self.rescues = 0
+        self.gated = 0          # rescues the music gate skipped
 
     def _say(self, line: str) -> None:
         try:
@@ -406,6 +422,17 @@ class Primary:
             self.decodes += 1
         why = self._rescue(text, audio)
         if why:
+            verdict = ""
+            if self._gate is not None:
+                try:
+                    verdict = str(self._gate(text, audio, why) or "")
+                except Exception:
+                    verdict = ""
+            if verdict == "skip":
+                with self._mu:
+                    self.gated += 1
+                self._note_engine("parakeet-gated")
+                return text, conf
             line = None
             with self._mu:
                 self.rescues += 1
@@ -428,7 +455,13 @@ class Primary:
             if line:
                 self._say(line)
             self._note_engine("parakeet-rescued")
-            return self._whisper(audio)
+            res = self._whisper(audio)
+            if verdict == "shadow" and self._shadow is not None:
+                try:
+                    self._shadow(why, res)
+                except Exception:
+                    pass
+            return res
         self._note_engine("parakeet")
         return text, conf
 

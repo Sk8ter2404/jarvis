@@ -268,8 +268,8 @@ _MIN_FREE_VRAM_BYTES = 6 * 1024 * 1024 * 1024
 
 
 def _device_index(device: str) -> int:
-    """Parse a torch CUDA device string ("cuda" | "cuda:1") to the integer index
-    ``torch.cuda.mem_get_info`` wants. Bare "cuda" → 0. Never raises."""
+    """Parse a torch CUDA device string ("cuda" | "cuda:1") to its integer
+    CUDA index. Bare "cuda" → 0. Never raises."""
     try:
         if ":" in device:
             return int(device.split(":", 1)[1])
@@ -279,19 +279,21 @@ def _device_index(device: str) -> int:
 
 
 def _free_vram_ok(device: str) -> bool:
-    """True if ``device`` reports at least ``_MIN_FREE_VRAM_BYTES`` free VRAM via
-    ``torch.cuda.mem_get_info``. Fails OPEN (returns True) on any probe failure —
-    a torch build without mem_get_info must not wrongly suppress the feature; a
-    real OOM at load is still caught downstream and falls back cleanly."""
+    """True if ``device`` reports at least ``_MIN_FREE_VRAM_BYTES`` free VRAM.
+    Read from NVML (core/gpu_probe.py), NOT torch.cuda.mem_get_info: that
+    call creates a CUDA context on the card it asks about (2026-10-04: +59 MB
+    that stays for the life of the process), so ASKING about the brain's 3090
+    took room there. Fails OPEN (returns True) when the free VRAM cannot be
+    read — the probe must not wrongly suppress the feature; a real OOM at load
+    is still caught downstream and falls back cleanly."""
     try:
-        import torch  # type: ignore
+        from core import gpu_probe as _gp
+        mem = _gp.cuda_memory_mb(_device_index(device))
     except Exception:
         return True
-    try:
-        free, _total = torch.cuda.mem_get_info(_device_index(device))
-        return int(free) >= _MIN_FREE_VRAM_BYTES
-    except Exception:
+    if mem is None:
         return True
+    return int(mem[0]) * 1024 * 1024 >= _MIN_FREE_VRAM_BYTES
 
 
 def _resolve_device() -> Optional[str]:

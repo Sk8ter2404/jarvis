@@ -702,43 +702,58 @@ class EnsureWhisperTests(MonolithGlobalsTestCase):
         self.assertEqual(kwargs.get("compute_type"), "int8")
         self.assertEqual(self.bc._stt_device, "cpu")
 
+    # The plan reads free VRAM from NVML (core/gpu_probe), never
+    # torch.cuda.mem_get_info — that call creates a CUDA context on the card
+    # it asks (2026-10-04). Each test installs a torch whose mem_get_info
+    # would fail the test if it were ever called.
+    def _plan(self, dev_index, mem):
+        fake_torch = mock.Mock()
+        fake_torch.cuda.mem_get_info.side_effect = AssertionError(
+            "torch.cuda.mem_get_info creates a CUDA context")
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}), \
+                mock.patch.object(self.bc._gpu_probe, "cuda_memory_mb",
+                                  return_value=mem) as probe:
+            out = self.bc._whisper_cuda_plan(dev_index)
+        probe.assert_called_once_with(dev_index)
+        fake_torch.cuda.mem_get_info.assert_not_called()
+        return out
+
     def test_whisper_cuda_plan_small_card_int8(self):
         # 4 GB total, plenty free → int8, no fallback.
-        fake_torch = mock.Mock()
-        fake_torch.cuda.mem_get_info.return_value = (3500 * 1024 * 1024,
-                                                     4096 * 1024 * 1024)
-        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
-            compute, fb, _reason = self.bc._whisper_cuda_plan(1)
+        compute, fb, _reason = self._plan(1, (3500, 4096))
         self.assertEqual(compute, "int8")
         self.assertFalse(fb)
 
     def test_whisper_cuda_plan_big_card_float16(self):
         # 24 GB total, plenty free → float16, no fallback.
-        fake_torch = mock.Mock()
-        fake_torch.cuda.mem_get_info.return_value = (20000 * 1024 * 1024,
-                                                     24576 * 1024 * 1024)
-        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
-            compute, fb, _reason = self.bc._whisper_cuda_plan(0)
+        compute, fb, _reason = self._plan(0, (20000, 24576))
         self.assertEqual(compute, "float16")
         self.assertFalse(fb)
 
     def test_whisper_cuda_plan_low_free_falls_back(self):
         # 4 GB total but only ~1 GB free (another consumer resident) → fallback.
-        fake_torch = mock.Mock()
-        fake_torch.cuda.mem_get_info.return_value = (1000 * 1024 * 1024,
-                                                     4096 * 1024 * 1024)
-        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
-            compute, fb, _reason = self.bc._whisper_cuda_plan(1)
+        _compute, fb, _reason = self._plan(1, (1000, 4096))
         self.assertTrue(fb)
 
     def test_whisper_cuda_plan_probe_unavailable_defaults_int8(self):
-        # torch/mem_get_info unavailable → conservative int8, no fallback gate.
-        fake_torch = mock.Mock()
-        fake_torch.cuda.mem_get_info.side_effect = RuntimeError("no CUDA")
-        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
-            compute, fb, _reason = self.bc._whisper_cuda_plan(0)
+        # NVML cannot read the card → conservative int8, no fallback gate.
+        compute, fb, _reason = self._plan(0, None)
         self.assertEqual(compute, "int8")
         self.assertFalse(fb)
+
+    def test_whisper_cuda_plan_int8_needs_1600_plus_the_reserve(self):
+        # 2026-10-04: int8 measured 1,161 MB resident / 1,385 MB decoding on
+        # the 1650. The old 3,000 MB rule put Whisper on the CPU whenever
+        # anything else held ~1.2 GB of the card; now 1,600 + the
+        # LISTEN_GPU_RESERVE_MB (512 shipped) = 2,112 MB.
+        with mock.patch.object(self.bc, "LISTEN_GPU_RESERVE_MB", 512):
+            self.assertFalse(self._plan(1, (2112, 4096))[1])
+            self.assertTrue(self._plan(1, (2111, 4096))[1])
+            # (2,500 MB free: the old rule refused it)
+            self.assertFalse(self._plan(1, (2500, 4096))[1])
+        with mock.patch.object(self.bc, "LISTEN_GPU_RESERVE_MB", 0):
+            self.assertFalse(self._plan(1, (1600, 4096))[1])
+            self.assertTrue(self._plan(1, (1599, 4096))[1])
 
 
 # ===========================================================================

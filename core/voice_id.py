@@ -9,8 +9,9 @@ permissions (e.g. "only the owner can run sudo commands").
 
 Backend
 -------
-Resemblyzer's `VoiceEncoder` produces 256-dim speaker embeddings on the
-GPU/CPU in well under a second per utterance. We compare a new utterance's
+Resemblyzer's `VoiceEncoder` produces 256-dim speaker embeddings in well
+under a second per utterance, on the device VOICE_ID_DEVICE names (the CPU by
+default: 10-75 ms a clip on this desk; see _encoder_placement). We compare a new utterance's
 embedding against every enrolled speaker's averaged embedding using cosine
 similarity. The best match above CONFIDENCE_THRESHOLD wins; everything
 else collapses to UNKNOWN_SPEAKER (returned as None) so callers can decide
@@ -108,6 +109,15 @@ _OWNER_PERMISSIONS = {
 _state_lock = threading.RLock()
 _encoder = None                       # lazy-loaded VoiceEncoder
 _encoder_error: Optional[str] = None
+# Where the encoder runs ('cpu' | 'cuda:N'), set when it loads. 2026-10-04:
+# VoiceEncoder() with no device picks torch.device("cuda") = cuda:0 - the RTX
+# 3090 that holds the local brain - so voice-ID opened a CUDA context there
+# and kept a torch cache sized by its longest clip (441 MB after a 30 s one).
+# It is now placed by VOICE_ID_DEVICE (core/listen_devices.py; default 'cpu').
+_encoder_device: str = ""
+# identify_speaker calls that computed an embedding (the music gate's
+# per-minute counter reads it; never reset).
+identify_calls = 0
 _voiceprints: dict[str, np.ndarray] = {}      # name → averaged embedding
 _voicemeta:   dict[str, dict] = {}            # name → sidecar metadata
 _active_speaker: Optional[str] = None         # last identified speaker
@@ -199,9 +209,46 @@ def _to_resemblyzer_audio(audio: np.ndarray, sample_rate: int) -> np.ndarray:
 
 # ── encoder ─────────────────────────────────────────────────────────────────
 
+def _torch_cuda_runtime(_index):
+    """listen_devices runtime check for a torch model: torch with CUDA.
+    torch.cuda.is_available() initialises the driver but creates no context
+    (measured 2026-10-04: 0 MB on the card)."""
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available():
+            return True, ""
+        return False, "torch has no CUDA"
+    except Exception as e:
+        return False, f"torch unavailable ({type(e).__name__})"
+
+
+def _encoder_placement():
+    """Where the encoder runs: VOICE_ID_DEVICE through core/listen_devices
+    ('cpu' unless the owner chose a card that is present with room). Returns
+    (device, log line or ''). Never raises: any failure is the CPU."""
+    try:
+        from core import config as _cfg
+        from core import listen_devices as _ld
+        spec = getattr(_cfg, "VOICE_ID_DEVICE", "cpu")
+        if _ld.normalize(spec) == "cpu":
+            return "cpu", ""
+        p = _ld.resolve("voice_id", spec,
+                        listen_gpu=getattr(_cfg, "LISTEN_GPU",
+                                           _ld.DEFAULT_LISTEN_GPU),
+                        reserve_mb=getattr(_cfg, "LISTEN_GPU_RESERVE_MB",
+                                           _ld.DEFAULT_RESERVE_MB),
+                        runtime=_torch_cuda_runtime)
+        return p.device, _ld.fallback_line("voice-id", p)
+    except Exception as e:
+        return "cpu", (f"  [listen] voice-id: device check failed "
+                       f"({type(e).__name__}); running on the CPU")
+
+
 def _load_encoder():
-    """Lazy-init Resemblyzer's VoiceEncoder. Returns the encoder or None."""
-    global _encoder, _encoder_error
+    """Lazy-init Resemblyzer's VoiceEncoder ON AN EXPLICIT DEVICE
+    (_encoder_placement; never Resemblyzer's own "cuda if available"
+    default). Returns the encoder or None."""
+    global _encoder, _encoder_error, _encoder_device
     if _encoder is not None:
         return _encoder
     try:
@@ -212,19 +259,38 @@ def _load_encoder():
             "Install with `pip install resemblyzer`."
         )
         return None
+    device, line = _encoder_placement()
+    if line:
+        print(line)
     try:
-        _encoder = VoiceEncoder(verbose=False)
+        _encoder = VoiceEncoder(device=device, verbose=False)
     except TypeError:
         # Older resemblyzer signatures don't accept `verbose`.
         try:
-            _encoder = VoiceEncoder()
+            _encoder = VoiceEncoder(device=device)
         except Exception as e:
             _encoder_error = f"VoiceEncoder init failed: {e}"
             return None
     except Exception as e:
         _encoder_error = f"VoiceEncoder init failed: {e}"
         return None
+    _encoder_device = device
     return _encoder
+
+
+def _release_gpu_cache() -> None:
+    """On a GPU, hand the torch cache back after each embedding: Resemblyzer
+    batches a clip's partials in one forward pass, so the cache grows with
+    the longest clip and was never released (441 MB after a 30 s clip,
+    99 MB after empty_cache). A no-op on the CPU. Never raises."""
+    if not str(_encoder_device).startswith("cuda"):
+        return
+    try:
+        import torch  # type: ignore
+        with torch.cuda.device(torch.device(_encoder_device)):
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _embed(audio: np.ndarray, sample_rate: int) -> Optional[np.ndarray]:
@@ -243,6 +309,8 @@ def _embed(audio: np.ndarray, sample_rate: int) -> Optional[np.ndarray]:
     except Exception as e:
         print(f"  [voice_id] embed failed: {e}")
         return None
+    finally:
+        _release_gpu_cache()
     emb = np.asarray(emb, dtype=np.float32).reshape(-1)
     n = float(np.linalg.norm(emb))
     if n > 0:
@@ -344,6 +412,7 @@ def encoder_status() -> dict:
     return {
         "encoder_loaded": enc is not None,
         "encoder_error": _encoder_error,
+        "encoder_device": _encoder_device or None,
         "enrolled": sorted(_voiceprints.keys()),
         "active_speaker": _active_speaker,
         "threshold": CONFIDENCE_THRESHOLD,
@@ -506,7 +575,7 @@ def identify_speaker(
     could be computed) so callers can log close-calls / debug threshold
     tuning.
     """
-    global _active_speaker
+    global _active_speaker, identify_calls
     _load_all()
     with _state_lock:
         if not _voiceprints:
@@ -514,6 +583,7 @@ def identify_speaker(
     if not is_available():
         return None, 0.0
 
+    identify_calls += 1
     emb = _embed(audio, sample_rate)
     if emb is None:
         return None, 0.0

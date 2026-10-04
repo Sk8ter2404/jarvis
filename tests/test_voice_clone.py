@@ -386,9 +386,29 @@ class DeviceSelectionTests(unittest.TestCase):
         self.assertEqual(vc._device_index("cuda:bogus"), 0)  # fails safe to 0
 
     def test_free_vram_ok_fails_open_without_torch(self):
-        # No torch on the CI box → probe unavailable → attempt the load (True).
-        with mock.patch.dict(sys.modules, {"torch": None}):
+        # No torch / no NVML on the CI box → probe unavailable → attempt the
+        # load (True). NVML is made unreadable for real (hermetic on a GPU box).
+        from core import gpu_probe
+        with mock.patch.dict(sys.modules, {"torch": None}), \
+                mock.patch.object(gpu_probe, "cuda_memory_mb",
+                                  return_value=None):
             self.assertTrue(vc._free_vram_ok("cuda:0"))
+
+    def test_free_vram_ok_reads_nvml_never_torch(self):
+        # 2026-10-04: torch.cuda.mem_get_info creates a CUDA context on the
+        # card it asks; the gate now reads NVML (core/gpu_probe) instead.
+        from core import gpu_probe
+        fake_torch = mock.Mock()
+        fake_torch.cuda.mem_get_info.side_effect = AssertionError("context")
+        six_gb = vc._MIN_FREE_VRAM_BYTES // (1024 * 1024)
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}), \
+                mock.patch.object(gpu_probe, "cuda_memory_mb",
+                                  return_value=(six_gb, 24576)) as probe:
+            self.assertTrue(vc._free_vram_ok("cuda:1"))
+            probe.return_value = (six_gb - 1, 24576)
+            self.assertFalse(vc._free_vram_ok("cuda:1"))
+        self.assertEqual(probe.call_args.args, (1,))
+        fake_torch.cuda.mem_get_info.assert_not_called()
 
     def test_load_engine_threads_chosen_device_into_from_pretrained(self):
         fake_model = mock.MagicMock()

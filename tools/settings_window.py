@@ -869,12 +869,74 @@ SCHEMA: dict[str, dict] = {
     # plumbing only and does not touch the runtime whisper code.
     "WHISPER_DEVICE": {
         "tab": "hearing", "label": "Whisper STT device", "type": "enum",
-        "choices": ["auto", "cuda", "cuda:0", "cuda:1", "cpu"],
+        "choices": ["auto", "cuda", "cuda:0", "cuda:1", "cpu", "listen"],
         "default": "auto",
         "help": "Where speech-to-text runs. auto / cuda / cuda:0 = the main "
                 "GPU; cuda:1 = the second card (keeps the main one free — the "
                 "VRAM budget then leaves Whisper off the main card); cpu = no "
-                "GPU. Applies on the next start.",
+                "GPU; listen = the listen card below. Applies on the next "
+                "start.",
+    },
+    # Where the other listening models run (core/listen_devices.py,
+    # 2026-10-04). Read by the monolith's loaders and core/voice_id.py.
+    "LISTEN_GPU": {
+        "tab": "hearing", "label": "Listen card", "type": "str",
+        "default": "cuda:1",
+        "help": "The card 'listen' means for the hearing models: cuda:N, a "
+                "GPU UUID (GPU-..., shown on the '[listen] devices:' line at "
+                "start; the first few characters will do) or part of its "
+                "name (1650). Empty = no listen card. Applies on the next "
+                "start.",
+    },
+    "LISTEN_GPU_RESERVE_MB": {
+        "tab": "hearing", "label": "Free VRAM a hearing model must leave (MB)",
+        "type": "int", "default": 512, "min": 0, "max": 8192,
+        "help": "A hearing model loads on its card only if this much VRAM "
+                "stays free after it; otherwise it runs on the CPU (one log "
+                "line says so). Applies on the next start.",
+    },
+    "PARAKEET_DEVICE": {
+        "tab": "hearing", "label": "Parakeet (your commands) device",
+        "type": "enum", "choices": ["cpu", "listen", "cuda:0", "cuda:1"],
+        "default": "cpu",
+        "help": "cpu: ~0.1-0.2 s a command here. A card needs the GPU build "
+                "of onnxruntime (not installed); without it the model stays "
+                "on the CPU. Applies on the next start.",
+    },
+    "SMART_TURN_DEVICE": {
+        "tab": "hearing", "label": "Smart Turn (end of turn) device",
+        "type": "enum", "choices": ["cpu", "listen", "cuda:0", "cuda:1"],
+        "default": "cpu",
+        "help": "cpu: 25 ms a check here. A card needs the GPU build of "
+                "onnxruntime (not installed). Applies on the next start.",
+    },
+    "VOICE_ID_DEVICE": {
+        "tab": "hearing", "label": "Voice recognition (whose voice) device",
+        "type": "enum", "choices": ["cpu", "listen", "cuda:0", "cuda:1"],
+        "default": "cpu",
+        "help": "cpu: 10-75 ms a clip here. listen = the listen card (saves "
+                "the CPU time, uses ~100-400 MB there). Never the main card "
+                "unless chosen: it used to sit beside the brain by accident. "
+                "Applies on the next start.",
+    },
+    # The music gate (core/music_gate.py, 2026-10-04).
+    "MUSIC_GATE_MODE": {
+        "tab": "hearing", "label": "Stop transcribing music", "type": "enum",
+        "choices": ["off", "shadow", "on"], "default": "shadow",
+        "help": "While music plays and he needs 'JARVIS' to answer: on = "
+                "song lyrics are not transcribed (every recording is still "
+                "checked for your wake word and your voice) and each "
+                "recording stops at the length below; shadow = no change, "
+                "but a once-a-minute log line shows what 'on' would skip and "
+                "whether it would have missed you; off = no change, no line. "
+                "Applies on the next start.",
+    },
+    "MUSIC_MAX_CAPTURE_S": {
+        "tab": "hearing", "label": "Longest recording over music (seconds)",
+        "type": "float", "default": 10.0, "min": 3, "max": 30,
+        "help": "With the setting above on: over music a recording never "
+                "goes quiet, so it used to run the full 30 s. Applies on the "
+                "next start.",
     },
     "WHISPER_MODEL_CUDA": {
         "tab": "hearing", "label": "Whisper GPU model", "type": "str",
@@ -1969,7 +2031,11 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Device changes", ["AUDIO_FLAP_WINDOW_S", "AUDIO_FLAP_THRESHOLD",
                             "AUDIO_ANNOUNCE_MIN_GAP_S",
                             "AUDIO_REPICK_STABLE_S"]),
-        ("Speech recognition", ["WHISPER_DEVICE", "WHISPER_MODEL_CUDA"]),
+        ("Speech recognition", ["WHISPER_DEVICE", "WHISPER_MODEL_CUDA",
+                                "PARAKEET_DEVICE", "SMART_TURN_DEVICE",
+                                "VOICE_ID_DEVICE", "LISTEN_GPU",
+                                "LISTEN_GPU_RESERVE_MB"]),
+        ("Music", ["MUSIC_GATE_MODE", "MUSIC_MAX_CAPTURE_S"]),
         ("What he ignores", ["SELF_ECHO_FILTER_ENABLED", "SELF_ECHO_WINDOW_S",
                              "SELF_ECHO_TAIL_S", "NOISE_FILTER_ENABLED",
                              "DEVICE_SPEECH_FILTER_ENABLED",
@@ -2882,6 +2948,8 @@ VRAM_WATCH_KEYS = (
     # 2026-09-30: Whisper on cuda:1 lives on the SECOND card; the panel used to
     # charge its 1.5 GB to the 3090 regardless.
     "WHISPER_DEVICE",
+    # 2026-10-04: WHISPER_DEVICE 'listen' is whichever card this names.
+    "LISTEN_GPU",
 )
 
 

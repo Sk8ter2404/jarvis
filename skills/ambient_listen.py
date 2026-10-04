@@ -199,6 +199,33 @@ def _identify_speaker_safe(audio: np.ndarray, sample_rate: int) -> tuple[Optiona
         return None, 0.0
 
 
+def _music_gate_check(b, audio: np.ndarray, sample_rate: int):
+    """The host's music gate verdict for one mic batch
+    (bobert_companion._music_gate_ambient, 2026-10-04): None = transcribe as
+    always (no gate on the host, gate off, no music, any error); a dict with
+    ``verdict`` 'skip' | 'shadow' otherwise. Never raises."""
+    try:
+        fn = getattr(b, "_music_gate_ambient", None)
+        return fn(audio, int(sample_rate)) if callable(fn) else None
+    except Exception:
+        return None
+
+
+def _music_gate_report(b, gate, out: dict) -> None:
+    """Tell the host what became of a batch the gate saw in 'shadow' (kept?
+    the wake word in it? its voice-ID answer) for the per-minute count.
+    Never raises."""
+    if not isinstance(gate, dict):
+        return
+    try:
+        fn = getattr(b, "_music_gate_ambient_done", None)
+        if callable(fn):
+            fn(gate, kept=bool(out.get("kept")), wake=bool(out.get("wake")),
+               speaker=out.get("speaker"))
+    except Exception:
+        pass
+
+
 # The MIC worker's own AudioProcessor (2026-10-01, audit P1-8 part 2). The
 # shared get_processor() singleton belongs to the main mic path: record_speech
 # runs every chunk through it, and its AGC running-RMS, spectral-flatness and
@@ -1125,10 +1152,11 @@ def _worker_loop() -> None:
     stt_yield = (_SttYield(b, "ambient-listen")
                  if getattr(b, "AMBIENT_STT_YIELD", False) is True else None)
 
-    def _keep_batch(audio, rms, cap_ts=None, ctx=None):
+    def _decode_batch(audio, rms, cap_ts, ctx, out):
         """Transcribe one batch and keep it. cap_ts / ctx are set only for a
         batch the STT yield parked: it keeps its capture time and window, and
-        never nudges a wake (the moment has passed)."""
+        never nudges a wake (the moment has passed). ``out`` is filled with
+        what became of it, for the music gate's shadow count."""
         global _last_error
         try:
             text, conf = transcribe(audio)
@@ -1166,6 +1194,10 @@ def _worker_loop() -> None:
         # one is enrolled, or the embedding doesn't clear the
         # confidence threshold — single-user mode stays untouched.
         speaker_id, speaker_score = _identify_speaker_safe(audio, sample_rate)
+        out["kept"] = True
+        out["speaker"] = (speaker_id, speaker_score)
+        out["wake"] = bool(_wake_pattern is not None
+                           and _wake_pattern.search(text))
 
         entry = {
             "ts": time.time() if cap_ts is None else cap_ts,
@@ -1190,6 +1222,20 @@ def _worker_loop() -> None:
         _rotate_jsonl_if_needed(_AUDIO_JSONL)
         if cap_ts is None:
             _maybe_nudge_wake(text)
+
+    def _keep_batch(audio, rms, cap_ts=None, ctx=None):
+        """One batch through the music gate (2026-10-04,
+        bobert_companion._music_gate_ambient): over music with the gate 'on'
+        a batch is never transcribed — no Whisper decode, nothing kept.
+        Otherwise _decode_batch, as always."""
+        gate = _music_gate_check(b, audio, sample_rate)
+        if isinstance(gate, dict) and gate.get("verdict") == "skip":
+            return
+        out = {"kept": False, "wake": False, "speaker": None}
+        try:
+            _decode_batch(audio, rms, cap_ts, ctx, out)
+        finally:
+            _music_gate_report(b, gate, out)
 
     try:
         while not _stop_evt.is_set():

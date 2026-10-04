@@ -36,6 +36,16 @@ Quick setup
 # OpenCV finish initialising. stdlib-only on purpose.
 import codecs, os, sys, subprocess, threading, time
 
+# Number GPUs by PCI bus, BEFORE anything initialises CUDA (2026-10-04). CUDA's
+# default order (FASTEST_FIRST) would renumber the cards when a second RTX 3090
+# goes in: the 1650 that WHISPER_DEVICE="cuda:1" means today could become
+# cuda:2, and "cuda:1" would silently land on the new card. PCI order is also
+# NVML's, so core/gpu_probe's free-VRAM reads (no CUDA context) index the same
+# cards ctranslate2 and torch do. Identical to today's mapping on this desk
+# (3090 = bus 1 = cuda:0, 1650 = bus 8 = cuda:1). setdefault: an explicit
+# environment choice wins.
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
 # Make stdout/stderr UTF-8 so JARVIS's non-ASCII output (─, ≥, →, em-dashes,
 # etc.) never raises UnicodeEncodeError on a legacy cp1252 Windows console — a
 # tester may run `python bobert_companion.py` in a raw console rather than the
@@ -2807,9 +2817,20 @@ def _learn_gate() -> "_learn_gate_mod.LearnGate":
     return _learn_gate_state[0]
 
 
+# The music gate's voice check of the capture it is deciding about
+# (_music_gate_rescue, 2026-10-04): (audio object, sample rate, name, score)
+# from voice_id.identify_speaker, so the media gate / room-talk check of the
+# SAME capture (the same raw buffer object, _last_capture_audio) reuse it
+# instead of embedding up to 30 s of audio again. Keyed by identity: a new
+# capture is a new object, and the cell holds a reference, so an id is never
+# reused while it is set. Only _learn_voice_verdict(remember=True) writes it.
+_capture_voice_memo = [None]
+
+
 def _learn_voice_verdict(audio, sample_rate: int,
                          reject_below: "float | None" = None,
-                         any_enrolled: bool = False) -> "tuple[str, float]":
+                         any_enrolled: bool = False,
+                         remember: bool = False) -> "tuple[str, float]":
     """(verdict, score) of the turn's raw audio against the enrolled
     voiceprints (core/learn_gate.voice_verdict). UNAVAILABLE when nobody is
     enrolled, resemblyzer is missing, or there is no audio. Never raises.
@@ -2817,7 +2838,9 @@ def _learn_voice_verdict(audio, sample_rate: int,
     (the media gate passes its own, MEDIA_VOICE_GATE_REJECT_BELOW).
     ``any_enrolled``: any enrolled person who matches counts as OWNER, not
     only one allowed to teach (the media gate asks "is this a person in the
-    room or the video?", not "may this voice teach?" - 2026-10-02)."""
+    room or the video?", not "may this voice teach?" - 2026-10-02).
+    ``remember``: keep this capture's (name, score) in _capture_voice_memo;
+    a later call on the same buffer object reads it from there."""
     try:
         if reject_below is None:
             reject_below = LEARN_VOICE_REJECT_BELOW
@@ -2826,7 +2849,15 @@ def _learn_voice_verdict(audio, sample_rate: int,
         import core.voice_id as _vid
         if not _vid.list_enrolled() or not _vid.is_available():
             return _learn_gate_mod.UNAVAILABLE, 0.0
-        name, score = _vid.identify_speaker(audio, int(sample_rate))
+        memo = _capture_voice_memo[0]
+        if (memo is not None and memo[0] is audio
+                and memo[1] == int(sample_rate)):
+            name, score = memo[2], memo[3]
+        else:
+            name, score = _vid.identify_speaker(audio, int(sample_rate))
+            if remember:
+                _capture_voice_memo[0] = (audio, int(sample_rate), name,
+                                          score)
         may_write = bool(name) and (bool(any_enrolled)
                                     or _vid.can(name, "memory_write"))
         return _learn_gate_mod.voice_verdict(
@@ -16484,7 +16515,21 @@ if TURN_TAIL_PROBE:
 # Mode 'off' registers no warmer and builds no decider (onnxruntime is never
 # imported for it).
 _eot_stream = _endpointing.SileroStream()    # its OWN session, not _tail_vad's
-_eot_turn = _endpointing.SmartTurn(SMART_TURN_MODEL)
+
+
+def _smart_turn_session(path: str):
+    """Smart Turn's onnxruntime session on the device SMART_TURN_DEVICE
+    resolves to (core/listen_devices.py, 2026-10-04): the CPU by default —
+    25 ms a check on 4 threads here; a card needs onnxruntime-gpu, which is
+    not installed (then the CPU, with one "[listen]" line)."""
+    provs = _listen_ort_providers(
+        "smart_turn", globals().get("SMART_TURN_DEVICE", "cpu"))
+    return _endpointing.smart_turn_session(
+        path, providers=None if provs == ["CPUExecutionProvider"] else provs)
+
+
+_eot_turn = _endpointing.SmartTurn(
+    SMART_TURN_MODEL, session_factory=lambda path: _smart_turn_session(path))
 # ready: the boot warmer warmed both models. off: why Smart Turn is off for
 # the session ('' = usable). logged: that one line is out.
 _eot_state = {"ready": False, "off": "", "logged": False}
@@ -16785,6 +16830,86 @@ def _log_turn_flags() -> None:
         pass
 
 
+def _listen_devices_line() -> str:
+    """The boot "[listen] devices:" line (2026-10-04): where every listening
+    model runs this session, the listen card (name, PCI bus, UUID prefix —
+    what LISTEN_GPU can name — and its free VRAM) and the music gate's mode.
+    Placements are resolved exactly as the loaders resolve them (Whisper is
+    already loaded; Parakeet / Smart Turn / voice-ID load later and log a
+    "[listen]" line of their own if the card turns them away). Never
+    raises."""
+    parts = []
+    try:
+        dev = str(globals().get("_stt_device") or "not loaded")
+        if dev.startswith("cuda"):
+            try:
+                idx = int(dev.split(":", 1)[1]) if ":" in dev else 0
+            except ValueError:
+                idx = 0
+            name = (_gpu_probe.cuda_gpu(idx) or {}).get("name")
+            if name:
+                dev = f"{dev} ({name})"
+        model = globals().get("_stt_model_name") or "?"
+        parts.append(f"whisper={dev} [{model}]")
+    except Exception:
+        parts.append("whisper=?")
+    try:
+        if _stt_r6_route() is None:
+            parts.append("parakeet=off")
+        else:
+            p = _listen_placement(
+                "parakeet", globals().get("PARAKEET_DEVICE", "cpu"),
+                runtime=_listen_devices.ort_cuda_runtime())
+            parts.append(f"parakeet={_listen_devices.label(p)}"
+                         f" [{globals().get('PARAKEET_THREADS', 8)} threads]")
+    except Exception:
+        parts.append("parakeet=?")
+    try:
+        if _eot_mode() == "off":
+            parts.append("smart-turn=off")
+        else:
+            p = _listen_placement(
+                "smart_turn", globals().get("SMART_TURN_DEVICE", "cpu"),
+                runtime=_listen_devices.ort_cuda_runtime())
+            parts.append(f"smart-turn={_listen_devices.label(p)}")
+    except Exception:
+        parts.append("smart-turn=?")
+    parts.append("silero=cpu")
+    try:
+        import core.voice_id as _vid
+        vdev = getattr(_vid, "_encoder_device", "") or ""
+        if not vdev:
+            vdev, _line = _vid._encoder_placement()
+        parts.append(f"voice-id={vdev}")
+    except Exception:
+        parts.append("voice-id=?")
+    parts.append("lyric-loop=" + ("cuda:0 when >=1.5 GB free"
+                                  if globals().get(
+                                      "STANDBY_WHISPER_PREFER_GPU", False)
+                                  else "cpu"))
+    try:
+        card = _listen_devices.resolve_target(
+            "listen", listen_gpu=globals().get(
+                "LISTEN_GPU", _listen_devices.DEFAULT_LISTEN_GPU))
+        if card.index is None:
+            parts.append(f"| listen card: none ({card.reason})")
+        else:
+            parts.append("| listen card: "
+                         + _gpu_probe.describe(card.gpu, card.index))
+    except Exception:
+        parts.append("| listen card: ?")
+    parts.append(f"| music gate: {_music_gate_mode()}")
+    return "[listen] devices: " + " ".join(parts)
+
+
+def _log_listen_devices() -> None:
+    """Print the boot "[listen] devices:" line. Never raises."""
+    try:
+        print("  " + _listen_devices_line())
+    except Exception:
+        pass
+
+
 _last_recording_peak = 0.0   # set by record_speech, read by callers
 
 # ── SPECULATIVE TRANSCRIPTION (2026-09-06 latency work) ───────────────────
@@ -17070,13 +17195,61 @@ def _stt_r6_route() -> "str | None":
     return None
 
 
+# ── where the listening models run (core/listen_devices.py, 2026-10-04) ──
+# PARAKEET_DEVICE / SMART_TURN_DEVICE (VOICE_ID_DEVICE lives in core/voice_id,
+# WHISPER_DEVICE in _resolve_whisper_device): 'cpu' (default) | 'listen' |
+# 'cuda:N'. Resolved when the model loads; a card that is missing, has no GPU
+# onnxruntime, or lacks room puts the model on the CPU with ONE "[listen]"
+# line. The last placement per model feeds the boot "[listen] devices:" line.
+from core import listen_devices as _listen_devices  # noqa: E402
+_listen_placements: dict = {}
+_listen_fallback_logged: set = set()
+
+
+def _listen_placement(model: str, spec, runtime=None):
+    """core/listen_devices.resolve for ``model`` with LISTEN_GPU and
+    LISTEN_GPU_RESERVE_MB, remembered for the boot line; the fallback line is
+    printed once per model. 'cpu' never touches NVML. Never raises."""
+    try:
+        p = _listen_devices.resolve(
+            model, spec,
+            listen_gpu=globals().get("LISTEN_GPU",
+                                     _listen_devices.DEFAULT_LISTEN_GPU),
+            reserve_mb=_listen_reserve_mb(), runtime=runtime)
+        _listen_placements[model] = p
+        line = _listen_devices.fallback_line(model, p)
+        if line and model not in _listen_fallback_logged:
+            _listen_fallback_logged.add(model)
+            print(line)
+        return p
+    except Exception:
+        return _listen_devices.resolve_target("cpu")
+
+
+def _listen_ort_providers(model: str, spec) -> list:
+    """onnxruntime providers for an ONNX listening model (Parakeet, Smart
+    Turn): CPU only unless ``spec`` names a card that is present, has room
+    and an onnxruntime with CUDA (not installed here: then the CPU, logged
+    once)."""
+    p = _listen_placement(model, spec,
+                          runtime=_listen_devices.ort_cuda_runtime())
+    return _listen_devices.ort_providers(p)
+
+
 def _parakeet_engine():
-    """The loaded Parakeet engine (_stt_alt), loading it on first use.
-    Caller holds _parakeet_lock. Raises on failure (the caller latches)."""
+    """The loaded Parakeet engine (_stt_alt), loading it on first use on the
+    device PARAKEET_DEVICE resolves to (the CPU by default). Caller holds
+    _parakeet_lock. Raises on failure (the caller latches)."""
     global _stt_alt
     if _stt_alt is None:
+        provs = _listen_ort_providers(
+            "parakeet", globals().get("PARAKEET_DEVICE", "cpu"))
+        # The CPU (the default) is load()'s own default: the call is
+        # exactly the one R6 shipped.
+        kw = {} if provs == ["CPUExecutionProvider"] else {"providers": provs}
         _stt_alt = _stt_parakeet.load(globals().get("PARAKEET_MODEL_DIR"),
-                                      globals().get("PARAKEET_THREADS", 8))
+                                      globals().get("PARAKEET_THREADS", 8),
+                                      **kw)
     return _stt_alt
 
 
@@ -17097,6 +17270,7 @@ def _parakeet_decode(audio, wait_for_load: bool = True):
     try:
         wait_ms = int(round((time.perf_counter() - t0) * 1000.0))
         eng = _parakeet_engine()
+        _music_note("parakeet")
         text, conf = _stt_parakeet.transcribe(
             eng, audio, anchors=globals().get("PARAKEET_CONF_ANCHORS"))
         if isinstance(conf, dict):
@@ -17182,6 +17356,10 @@ _parakeet_primary = _stt_parakeet.Primary(
     note=lambda v: _tt_note_stat("stt_engine", v),
     hotwords=lambda: bool(_stt_vocab.hotwords_arg(
         globals().get("STT_HOTWORDS"))),
+    # The music gate (core/music_gate.py, 2026-10-04): over music a rescue
+    # needs a wake hint ('on' skips it otherwise; 'shadow' only counts).
+    gate=lambda t, a, w: _music_gate_rescue(t, a, w),
+    shadow=lambda w, res: _music_gate_rescue_seen(w, res),
 )
 
 
@@ -18467,6 +18645,9 @@ def record_speech(timeout: float | None = None, *,
     _eot = None
     _eot_why = "rms"
     record_start_ts = 0.0   # set when recording actually begins (VAD trip)
+    # Music gate (2026-10-04): the shorter cap over music, asked ONCE per
+    # capture when it passes it (None = not this capture / gate off).
+    _music_cap = _music_capture_cap_s()
     _se_vad_ts = _se_open_ts  # the same instant on the self-echo clock
     _se_clip_ts = _se_open_ts
     # Mute Mic mid-capture (2026-09-30): the tray's mute used to be checked
@@ -18561,6 +18742,17 @@ def record_speech(timeout: float | None = None, *,
                       f"{MAX_RECORDING_SECS:.0f}s reached — finalizing")
                 _eot_why = "max"
                 break
+            # Music gate (core/music_gate.py): over music no capture ever goes
+            # quiet, so each one ran the full 30 s. Measured in AUDIO time
+            # (samples since the trip, pre-roll excluded); asked once.
+            if recording and _music_cap is not None:
+                _rec_s = ((len(chunks) * CHUNK - pre_samples)
+                          / float(SAMPLE_RATE))
+                if _rec_s > _music_cap:
+                    _cap_s, _music_cap = _music_cap, None
+                    if _music_gate_capture(_rec_s, _cap_s):
+                        _eot_why = "max"
+                        break
 
             rms = float(np.sqrt(np.mean(data ** 2)))
             if rms > peak_rms:
@@ -19110,10 +19302,20 @@ def _resolve_whisper_device() -> str:
     'cuda' is honoured verbatim even if the runtime check fails; the
     actual load attempt in _ensure_whisper() will then fall back to CPU
     with a clearer error message. 'auto' silently falls back to CPU when
-    no GPU backend reports a device."""
+    no GPU backend reports a device. 'listen' (2026-10-04) = the card
+    LISTEN_GPU names (core/listen_devices.py); a missing one is the CPU with
+    one "[listen]" line. Its free VRAM is _whisper_cuda_plan's to judge."""
     pref = (WHISPER_DEVICE or "auto").lower()
     if pref == "cpu":
         return "cpu"
+    if pref == "listen":
+        from core import listen_devices as _ld
+        p = _ld.resolve_target("listen", listen_gpu=globals().get(
+            "LISTEN_GPU", _ld.DEFAULT_LISTEN_GPU))
+        line = _ld.fallback_line("whisper", p)
+        if line:
+            print(line)
+        return p.device
     if pref == "cuda" or pref.startswith("cuda:"):
         # "cuda" (default GPU) or "cuda:N" (pin STT to a specific GPU — e.g.
         # "cuda:1" to run Whisper on a second card and keep the primary free).
@@ -19239,6 +19441,21 @@ _force_whisper_cpu_int8 = False
 _consecutive_whisper_cuda_failures = 0
 _WHISPER_CUDA_FAILURE_LIMIT = 2
 
+# Free VRAM (no CUDA context) — see core/gpu_probe.py and _whisper_cuda_plan.
+from core import gpu_probe as _gpu_probe  # noqa: E402
+# What Whisper large-v3-turbo needs on its card (weights + decode workspace),
+# before LISTEN_GPU_RESERVE_MB. int8 measured 2026-10-04 on the 1650: 1,161
+# MB resident, 1,385 MB while decoding.
+_WHISPER_NEED_MB = {"int8": 1600, "float16": 4800}
+
+
+def _listen_reserve_mb() -> int:
+    """LISTEN_GPU_RESERVE_MB as a non-negative int (512 when unreadable)."""
+    try:
+        return max(0, int(globals().get("LISTEN_GPU_RESERVE_MB", 512)))
+    except Exception:
+        return 512
+
 
 def _whisper_cuda_plan(dev_index: int):
     """Decide HOW (and WHETHER) to load Whisper on cuda:{dev_index} without
@@ -19254,20 +19471,28 @@ def _whisper_cuda_plan(dev_index: int):
       * preflight FREE VRAM — if there isn't comfortable headroom for the chosen
         precision + workspace, fall back to CPU int8 (slower but crash-proof)
         rather than attempting a load that will OOM.
-    Uses torch.cuda.mem_get_info when available; if it isn't, returns a
-    conservative int8 plan and skips the free-VRAM gate (best effort). int8 is
-    only marginally less accurate than float16 for large-v3-turbo. 2026-07-08."""
+    Free VRAM comes from NVML (core/gpu_probe.py), never
+    torch.cuda.mem_get_info: that call creates a CUDA context on the card it
+    asks (2026-10-04: it made the 1650's context at every boot). When the
+    probe cannot read the card, returns a conservative int8 plan and skips
+    the free-VRAM gate (best effort). int8 is only marginally less accurate
+    than float16 for large-v3-turbo. 2026-07-08.
+
+    The int8 need is 1,600 MB (measured 2026-10-04: 1,161 MB resident, 1,385
+    MB while decoding — the old 3,000 MB put Whisper on the CPU whenever
+    anything else held ~1.2 GB of the 1650), and every need also keeps
+    LISTEN_GPU_RESERVE_MB free for the card's other users."""
     try:
-        import torch
-        free, total = torch.cuda.mem_get_info(dev_index)
-        free_mb = int(free // (1024 * 1024))
-        total_mb = int(total // (1024 * 1024))
-    except Exception as e:
-        return "int8", False, (f"VRAM probe unavailable ({type(e).__name__}); "
-                               f"defaulting to int8")
+        mem = _gpu_probe.cuda_memory_mb(dev_index)
+    except Exception:
+        mem = None
+    if mem is None:
+        return "int8", False, ("VRAM probe unavailable (NVML could not read "
+                               f"cuda:{dev_index}); defaulting to int8")
+    free_mb, total_mb = int(mem[0]), int(mem[1])
     # Small cards can't afford float16 + workspace — force int8.
     compute_type = "int8" if total_mb < 8192 else "float16"
-    need_mb = 4800 if compute_type == "float16" else 3000
+    need_mb = _WHISPER_NEED_MB[compute_type] + _listen_reserve_mb()
     if free_mb < need_mb:
         return compute_type, True, (
             f"cuda:{dev_index} has {free_mb} MB free < {need_mb} MB needed for "
@@ -19536,6 +19761,8 @@ def transcribe(audio: np.ndarray) -> tuple[str, dict]:
         _stt_wait_tls.ms = int(round((time.perf_counter() - _stt_p0)
                                      * 1000.0))
         _tt_note_elapsed("stt_wait_ms", _stt_w0)
+        # The music gate's per-minute counter (numbers only; never raises).
+        _music_note(_whisper_source_kind())
         return _transcribe_impl(audio)
 
 
@@ -19631,6 +19858,7 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # Bounded retry: see _STT_NO_VAD_RETRY_MAX_AUDIO_S.
             if (not segments and len(audio) <= float(SAMPLE_RATE)
                     * _STT_NO_VAD_RETRY_MAX_AUDIO_S):
+                _music_note("retry")
                 segments_gen, info = _stt.transcribe(
                     audio, language="en",
                     vad_filter=False,
@@ -20523,13 +20751,18 @@ def _cuda0_free_vram_mb() -> int | None:
     Unlike _ollama_big_model_resident (which only sees what the OLLAMA server
     reports), this reads the DRIVER's own free-memory counter, so whisper +
     chatterbox (~6 GB the Ollama API is blind to) are correctly counted against
-    the budget before a VLM co-load. Prefers torch.cuda.mem_get_info(0); falls
+    the budget before a VLM co-load. Reads NVML (core/gpu_probe.py); falls
     back to `nvidia-smi`. Returns None when neither is available — the caller
-    then relies on the Ollama residency check alone. 2026-07-08."""
+    then relies on the Ollama residency check alone. 2026-07-08.
+
+    2026-10-04: this used torch.cuda.mem_get_info(0), which CREATES a CUDA
+    context on the 3090 the first time it runs (+59 MB measured, kept until
+    exit) — asking whether the brain's card had room took room on it. NVML
+    reads the driver's counter without one."""
     try:
-        import torch
-        free, _total = torch.cuda.mem_get_info(0)
-        return int(free // (1024 * 1024))
+        mem = _gpu_probe.cuda_memory_mb(0)
+        if mem is not None:
+            return int(mem[0])
     except Exception:
         pass
     try:
@@ -33810,6 +34043,35 @@ def _media_guest_mode() -> bool:
         return False
 
 
+def _owner_voice_over_media(audio, sr: int,
+                            remember: bool = False) -> "tuple[str, float, str]":
+    """(verdict, score, how) of a capture against the enrolled voiceprints,
+    as the media gate judges a voice over PC audio: any enrolled person
+    counts, the floor is MEDIA_VOICE_GATE_REJECT_BELOW, and a NOT_OWNER
+    capture is scored again on its leading speech ("Jarvis, ..." leads it;
+    on a long one the media behind him dominates the rest — live 22:59:47,
+    20.7 s, 0.50). ``how`` is ', leading speech' when that rescued it. The
+    one copy: the media gate and the music gate's rescue check share it.
+    ``remember``: keep the whole-capture score for the next voice check of
+    this same capture (_capture_voice_memo). Never raises (UNAVAILABLE)."""
+    try:
+        floor = float(MEDIA_VOICE_GATE_REJECT_BELOW)
+        voice, score = _learn_voice_verdict(audio, sr, reject_below=floor,
+                                            any_enrolled=True,
+                                            remember=remember)
+        how = ""
+        if voice == _learn_gate_mod.NOT_OWNER:
+            lead = _media_gate.leading_speech_window(audio, sr)
+            if lead is not None:
+                v2, s2 = _learn_voice_verdict(lead, sr, reject_below=floor,
+                                              any_enrolled=True)
+                if v2 in (_learn_gate_mod.OWNER, _learn_gate_mod.UNSURE):
+                    voice, score, how = v2, s2, ", leading speech"
+        return voice, score, how
+    except Exception:
+        return _learn_gate_mod.UNAVAILABLE, 0.0, ""
+
+
 def _media_voice_gate(text: str, injected: bool = False) -> bool:
     """True when the caller must DROP this mic turn: the PC was playing audio
     for the capture and the voice is confidently not the owner's (under
@@ -33847,20 +34109,7 @@ def _media_voice_gate(text: str, injected: bool = False) -> bool:
             print(f"  [media-gate] PC audio playing; a media control — "
                   f"allowed ({meter})")
             return False
-        floor = float(MEDIA_VOICE_GATE_REJECT_BELOW)
-        voice, score = _learn_voice_verdict(audio, sr, reject_below=floor,
-                                            any_enrolled=True)
-        how = ""
-        if voice == _learn_gate_mod.NOT_OWNER:
-            # "Jarvis, ..." leads the capture; on a long one the media behind
-            # him dominates the rest (live 22:59:47, 20.7 s, 0.50). Score the
-            # leading speech before calling it someone else's.
-            lead = _media_gate.leading_speech_window(audio, sr)
-            if lead is not None:
-                v2, s2 = _learn_voice_verdict(lead, sr, reject_below=floor,
-                                              any_enrolled=True)
-                if v2 in (_learn_gate_mod.OWNER, _learn_gate_mod.UNSURE):
-                    voice, score, how = v2, s2, ", leading speech"
+        voice, score, how = _owner_voice_over_media(audio, sr)
         drop, line = _media_gate.decide(True, voice)
         if line:
             print(f"  {line} ({meter}, voice {float(score or 0.0):.2f}{how}, "
@@ -33894,6 +34143,282 @@ def _media_gate_drop_cue(text: str) -> None:
         _speak(_media_gate.DROP_CUE)
     except Exception:
         pass
+
+
+# ── music gate (core/music_gate.py, 2026-10-04) ───────────────────────────
+# Over music in wake-word mode JARVIS transcribed lyrics nonstop: every capture
+# ran to 30 s, Parakeet decoded it, Whisper decoded it again as a "no-wake"
+# rescue (1,381 rescues 10-02..10-04 made 3 owner turns), and the ambient
+# listener ran Whisper on every 2.5 s of the same frames — ~35 % of the 1650
+# and ~39 CPU-s a minute. MUSIC_GATE_MODE 'on' stops transcribing music while
+# every capture is still checked for the owner's wake word (Parakeet) and
+# voice (the media gate); 'shadow' (shipped) only counts, one "[music-gate]"
+# line per minute with music. Everything here is numbers only — never a word
+# that was heard.
+from core import music_gate as _music_gate  # noqa: E402
+_music_counter = _music_gate.MinuteCounter()
+# The last music-mode reading (monotonic time, verdict, meter peak, room
+# music). Refreshed at most every _MUSIC_STATE_TTL_S by whichever thread asks
+# first; a thread that finds a refresh in flight uses the cached verdict.
+_music_state = {"at": None, "music": False, "peak": None, "room": False}
+_music_state_lock = threading.Lock()
+_MUSIC_STATE_TTL_S = 2.0
+_music_vid_seen = [None]     # core.voice_id.identify_calls at the last tick
+_music_lost_logged = [0.0]   # monotonic time of the last shadow "lost" line
+
+
+def _music_gate_mode() -> str:
+    """MUSIC_GATE_MODE normalised ('off' | 'shadow' | 'on'). Never raises."""
+    try:
+        return _music_gate.mode_setting(globals().get("MUSIC_GATE_MODE", "off"))
+    except Exception:
+        return "off"
+
+
+def _music_meter() -> "tuple[float | None, bool]":
+    """(playback peak, media session playing) — the music gate's only
+    real-world read: the PC's playback meter (JARVIS's own process excluded;
+    it stops at the first sample over MEDIA_VOICE_GATE_PEAK — ~11 ms a read
+    here) and, only when the meter cannot be read, the media session."""
+    threshold = float(MEDIA_VOICE_GATE_PEAK)
+    peak = _media_gate.pc_audio_peak((os.getpid(),), samples=2,
+                                     stop_at=max(threshold, 1e-6))
+    return peak, (_smtc_media_playing() if peak is None else False)
+
+
+def _music_read_state() -> dict:
+    """One fresh reading of the music-mode inputs: the meter
+    (_music_meter), the spectral detector's sustained room music, and
+    whether only a wake-word line can get through now (_wake_gate_state,
+    peeked: nothing is consumed)."""
+    threshold = float(MEDIA_VOICE_GATE_PEAK)
+    peak, smtc = _music_meter()
+    st = _wake_gate_state()
+    room = bool(st.get("room_music"))
+    playing = (_media_gate.audio_playing(peak, smtc, threshold=threshold)
+               or room)
+    music = _music_gate.music_mode(
+        playing=playing, standby=bool(st.get("standby")),
+        wake_mode=bool(st.get("wake_mode")),
+        music_refuse=bool(st.get("music_refuse")))
+    return {"music": bool(music), "peak": peak, "room": room}
+
+
+def _music_now(refresh: bool = True) -> bool:
+    """Music mode now (core/music_gate.music_mode), cached for
+    _MUSIC_STATE_TTL_S. Mode 'off' reads nothing and answers False; a
+    reading that fails is "no music" (today's behaviour). Never raises."""
+    try:
+        if _music_gate_mode() == "off":
+            return False
+        at = _music_state["at"]
+        if refresh and (at is None
+                        or time.monotonic() - at >= _MUSIC_STATE_TTL_S):
+            if _music_state_lock.acquire(blocking=False):
+                try:
+                    try:
+                        _music_state.update(_music_read_state())
+                    except Exception:
+                        _music_state.update(music=False, peak=None,
+                                            room=False)
+                    _music_state["at"] = time.monotonic()
+                finally:
+                    _music_state_lock.release()
+        music = bool(_music_state["music"])
+        if music:
+            _music_counter.mark_music()
+        return music
+    except Exception:
+        return False
+
+
+def _music_tick() -> None:
+    """Fold the voice-ID calls made since the last tick into the counter and
+    print the minute line when a minute that had music is over. Never
+    raises."""
+    try:
+        mode = _music_gate_mode()
+        if mode == "off":
+            return
+        vid = sys.modules.get("core.voice_id")
+        if vid is not None:
+            n = int(getattr(vid, "identify_calls", 0) or 0)
+            last = _music_vid_seen[0]
+            _music_vid_seen[0] = n
+            if last is not None and n > last:
+                _music_counter.note("voice_id", n - last)
+        line = _music_counter.tick(mode)
+        if line:
+            print(f"  {line}")
+    except Exception:
+        pass
+
+
+def _music_note(kind: str, n: int = 1) -> None:
+    """Count one listening-lane event for the minute line (core/music_gate
+    MinuteCounter kinds); mode 'off' counts nothing. Never raises."""
+    try:
+        if _music_gate_mode() == "off":
+            return
+        _music_counter.note(kind, n)
+        _music_tick()
+    except Exception:
+        pass
+
+
+def _whisper_source_kind() -> str:
+    """Which counter a Whisper decode on this thread feeds: the main loop
+    and its speculative worker ('whisper_turn': owner captures, rescues,
+    standby checks), the ambient listener ('whisper_ambient'), anything else
+    ('whisper_other')."""
+    try:
+        t = threading.current_thread()
+        name = t.name or ""
+        if t is threading.main_thread() or name == "spec-stt":
+            return "whisper_turn"
+        if name.startswith("ambient"):
+            return "whisper_ambient"
+    except Exception:
+        pass
+    return "whisper_other"
+
+
+def _capture_voice_verdict(audio) -> str:
+    """The owner-voice check behind a rescue over music: the capture's RAW
+    buffer (_last_capture_audio — what the media gate scores; the auto-gained
+    copy the rescue holds has the same length) through
+    _owner_voice_over_media, remembered so the media gate / room-talk check
+    of this capture reuse it. Never raises (UNAVAILABLE = rescue)."""
+    try:
+        raw, sr = _last_capture_audio, int(_last_capture_sr or 0)
+        if raw is None or sr <= 0 or len(raw) != len(audio):
+            raw, sr = audio, SAMPLE_RATE
+        voice, _score, _how = _owner_voice_over_media(raw, sr, remember=True)
+        return voice
+    except Exception:
+        return _learn_gate_mod.UNAVAILABLE
+
+
+def _music_gate_rescue(text, audio, why) -> str:
+    """core/stt_parakeet.Primary's gate on a rescue (core/music_gate
+    rescue_decision): '' rescue as always; 'skip' (mode 'on', music, no
+    "Jarvis"-like word in Parakeet's first three, not the owner's voice) keeps
+    Parakeet's text; 'shadow' would skip, rescues anyway. The voice is asked
+    only when the text gives no hint. Never raises ('' = rescue)."""
+    try:
+        mode = _music_gate_mode()
+        if mode == "off":
+            return ""
+        v = _music_gate.rescue_decision(mode, _music_now(), why, text,
+                                        lambda: _capture_voice_verdict(audio))
+        if v == "skip":
+            _music_note("skip_rescue")
+        else:
+            _music_note("rescue")
+            if v == "shadow":
+                _music_note("would_rescue")
+        return v
+    except Exception:
+        return ""
+
+
+def _music_gate_rescue_seen(why, res) -> None:
+    """Shadow: what Whisper made of a rescue 'on' would have skipped. A line
+    the wake gates would let through is one 'on' would have LOST — counted,
+    and logged at most once a minute (its length, never its words). Never
+    raises."""
+    try:
+        text = res[0] if isinstance(res, tuple) and res else ""
+        if not str(text or "").strip() or _parakeet_wake_lost(text):
+            return
+        _music_note("lost_rescue")
+        now = time.monotonic()
+        last = float(_music_lost_logged[0] or 0.0)
+        if not last or now - last >= 60.0:
+            _music_lost_logged[0] = now
+            print(f"  [music-gate] shadow: a rescue 'on' would have skipped "
+                  f"({why}) made a line the wake gates pass "
+                  f"({len(str(text))} chars) — 'on' would have lost it")
+    except Exception:
+        pass
+
+
+def _music_gate_ambient(audio, sample_rate) -> "dict | None":
+    """skills/ambient_listen asks before transcribing a mic batch. None =
+    transcribe as always (gate off, or no music). Else a dict, ``verdict``:
+    'skip' (mode 'on' over music: no Whisper decode, no voice-ID — see
+    core/music_gate.ambient_decision for why voice-ID cannot keep the
+    owner's lines here); 'shadow' (transcribe as always, then
+    _music_gate_ambient_done). Any error = None (as always). ``audio`` /
+    ``sample_rate`` are the batch's, for a future cheap wake check."""
+    try:
+        mode = _music_gate_mode()
+        if mode == "off":
+            return None
+        music = _music_now()
+        _music_tick()
+        v = _music_gate.ambient_decision(mode, music)
+        if v == "skip":
+            _music_note("skip_ambient")
+            return {"verdict": "skip"}
+        if v == "shadow":
+            return {"verdict": "shadow"}
+        return None
+    except Exception:
+        return None
+
+
+def _music_gate_ambient_done(gate, kept: bool = False, wake: bool = False,
+                             speaker=None) -> None:
+    """Shadow accounting for one ambient batch transcribed over music: 'on'
+    would not have transcribed it. A KEPT line counts as lost; those with
+    the wake word in them, and those voice-ID named as an enrolled speaker
+    (score >= its 0.72 match threshold), are counted apart. Never raises."""
+    try:
+        if not isinstance(gate, dict) or gate.get("verdict") != "shadow":
+            return
+        _music_note("would_ambient")
+        if kept:
+            _music_note("lost_ambient")
+            if wake:
+                _music_note("lost_ambient_wake")
+            if speaker and speaker[0]:
+                _music_note("lost_ambient_named")
+    except Exception:
+        pass
+
+
+def _music_capture_cap_s() -> "float | None":
+    """MUSIC_MAX_CAPTURE_S when the gate may cut a capture (mode not 'off'
+    and the cap under MAX_RECORDING_SECS), else None. Never raises."""
+    try:
+        if _music_gate_mode() == "off":
+            return None
+        cap = float(globals().get("MUSIC_MAX_CAPTURE_S", 10.0))
+        if not cap > 0.0 or cap >= float(MAX_RECORDING_SECS):
+            return None
+        return cap
+    except Exception:
+        return None
+
+
+def _music_gate_capture(recorded_s: float, cap_s: float) -> bool:
+    """record_speech asks ONCE per capture, when it has recorded past
+    ``cap_s`` seconds of audio: True = stop the capture here (mode 'on' and
+    music now). Shadow counts a would-cut. Never raises (False)."""
+    try:
+        v = _music_gate.capture_decision(_music_gate_mode(), _music_now(),
+                                         recorded_s, cap_s)
+        if v == "cut":
+            _music_note("skip_capture")
+            print(f"  [music-gate] music playing — capture stopped at "
+                  f"{float(cap_s):.0f}s (MUSIC_MAX_CAPTURE_S)")
+            return True
+        if v == "shadow":
+            _music_note("would_capture")
+        return False
+    except Exception:
+        return False
 
 
 def _device_speech_ignored(text: str, injected: bool = False) -> bool:
@@ -44906,6 +45431,8 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # session runs with are logged once for tools/turn_latency_report.py.
     _run_boot_warmers()
     _log_turn_flags()
+    # Where every listening model runs this session (2026-10-04).
+    _log_listen_devices()
 
     # Walk requirements.txt and warn loudly about any missing packages so
     # silent feature-disabling (psutil → no system monitor / no HUD CPU-RAM,

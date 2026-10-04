@@ -106,11 +106,13 @@ def bundled_model_path() -> "str | None":
     return None
 
 
-def default_session(path: str, intra: int = 1):
+def default_session(path: str, intra: int = 1, providers=None):
     """An onnxruntime CPU session for the Silero model: one intra-op and one
     inter-op thread, spin-wait off, no arena — a ~2 MB side session that
     never competes with Kokoro or the ambient decoder for cores. `intra`
-    raises the intra-op threads (smart_turn_session)."""
+    raises the intra-op threads (smart_turn_session). `providers`: CPU only
+    unless the caller passes another list (SMART_TURN_DEVICE, through
+    core/listen_devices.ort_providers)."""
     import onnxruntime as ort   # lazy: CI never installs it
     so = ort.SessionOptions()
     so.intra_op_num_threads = int(intra)
@@ -124,14 +126,15 @@ def default_session(path: str, intra: int = 1):
         except Exception:
             pass
     return ort.InferenceSession(path, sess_options=so,
-                                providers=["CPUExecutionProvider"])
+                                providers=list(providers
+                                               or ["CPUExecutionProvider"]))
 
 
-def smart_turn_session(path: str):
+def smart_turn_session(path: str, providers=None):
     """default_session for Smart Turn: four intra-op threads (a ~9 MB
     Whisper-tiny encoder over 8 s must answer inside ST_BUDGET_S), still one
-    inter-op thread and no spin-wait."""
-    return default_session(path, intra=ST_INTRA_THREADS)
+    inter-op thread and no spin-wait. `providers` as default_session's."""
+    return default_session(path, intra=ST_INTRA_THREADS, providers=providers)
 
 
 class SileroVad:

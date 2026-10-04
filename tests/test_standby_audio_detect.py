@@ -74,9 +74,21 @@ class WhisperDeviceSafetyTests(unittest.TestCase):
         self.assertEqual(kw["compute_type"], "int8")
         self.assertNotEqual(kw["compute_type"], "float16")
 
-    def test_vram_probe_is_failsafe_when_pynvml_missing(self):
-        with mock.patch.dict(sys.modules, {"pynvml": None}):
+    def test_vram_probe_is_failsafe_when_nvml_unreadable(self):
+        # 2026-10-04: NVML through core/gpu_probe (the pynvml package this
+        # used is not installed, so the opt-in always read None). Unreadable
+        # = None = stay on the CPU.
+        from core import gpu_probe
+        with mock.patch.object(gpu_probe, "cuda_memory_mb",
+                               return_value=None):
             self.assertIsNone(s._cuda_free_vram_mb())
+
+    def test_vram_probe_reads_cuda0_from_nvml(self):
+        from core import gpu_probe
+        with mock.patch.object(gpu_probe, "cuda_memory_mb",
+                               return_value=(1700, 24576)) as probe:
+            self.assertEqual(s._cuda_free_vram_mb(), 1700.0)
+        probe.assert_called_once_with(0)
 
 
 if __name__ == "__main__":

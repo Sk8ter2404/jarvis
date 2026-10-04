@@ -61,6 +61,8 @@ lead_dropped (NOTE_FIELDS; ``-`` = not measured on this turn):
   stt_engine     R6 (STT_ENGINE='parakeet' only): which engine's transcript
                  the turn used — parakeet, parakeet-rescued (Parakeet's text
                  was empty or lost the wake word; Whisper decoded again),
+                 parakeet-gated (that rescue was skipped over music:
+                 MUSIC_GATE_MODE 'on', core/music_gate.py),
                  whisper-fallback (Parakeet failed and latched off on this
                  capture), whisper-loading (the model was still loading; no
                  latch) or whisper (latched off earlier). ``-`` on the

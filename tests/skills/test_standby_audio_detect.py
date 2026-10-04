@@ -994,6 +994,9 @@ class DialogueGateTests(unittest.TestCase):
         bc._jarvis_played_music_at = [0.0]
         bc._dialogue_gate_active = lambda: gate
         bc.get_mic_buffer = mock.MagicMock(return_value=None)
+        # The loop reads the mic only with the headset as the output (its
+        # one action needs it - 2026-10-04, HeadsetFirstTests below).
+        bc.is_using_headset = lambda: True
         return bc
 
     def test_suppressed_while_dialogue_gate_active(self):
