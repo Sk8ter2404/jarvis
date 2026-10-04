@@ -53,6 +53,7 @@ import importlib.util
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
@@ -250,6 +251,19 @@ def _claude_call(
     return llm_client.response_text(msg).strip()
 
 
+def _shared_keep_alive():
+    """The keep_alive every local-brain request of the running JARVIS sends
+    (bobert_companion._local_keep_alive), or None when no monolith is loaded
+    in this process (a standalone run keeps Ollama's default, as before).
+    Never imports the monolith; never raises."""
+    try:
+        bc = sys.modules.get("bobert_companion")
+        fn = getattr(bc, "_local_keep_alive", None) if bc is not None else None
+        return fn() if callable(fn) else None
+    except Exception:
+        return None
+
+
 def _ollama_call(
     model: str,
     system: str,
@@ -268,7 +282,7 @@ def _ollama_call(
     """
     import urllib.request
     from core.ollama_opts import chat_options
-    payload = json.dumps({
+    body = {
         "model": model,
         "stream": False,
         "messages": [
@@ -276,7 +290,15 @@ def _ollama_call(
             {"role": "user",   "content": user},
         ],
         "options": chat_options(model),
-    }).encode("utf-8")
+    }
+    # The voice brain's keep_alive (2026-10-04): a request without one sets
+    # the runner's residency to Ollama's 5-minute default, so the brain this
+    # worker shares unloaded 5 minutes later and the next voice turn paid a
+    # reload. The running monolith's own resolver, never a second copy.
+    keep_alive = _shared_keep_alive()
+    if keep_alive is not None:
+        body["keep_alive"] = keep_alive
+    payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url=f"{base_url.rstrip('/')}/api/chat",
         data=payload,

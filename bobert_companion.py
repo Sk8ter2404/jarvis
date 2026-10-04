@@ -2214,13 +2214,17 @@ def _fit_local_messages(system: str, messages: list, parts=(), *,
     if not _LOCAL_PROMPT_BUDGET:
         return _with_turn_context(messages, turn_ctx)
     try:
-        num_ctx = _local_num_ctx(model_tag or _local_budget_tag())
+        _tag = model_tag or _local_budget_tag()
+        num_ctx = _local_num_ctx(_tag)
         window = _prompt_budget.OBSERVED_WINDOW.effective(num_ctx)
         budget = _prompt_budget.budget_for(window, max_tokens)
 
         def _measure(msgs):
+            # Token-aware (2026-10-04): the prefix Ollama already reported
+            # (the re-prime's system + history, its stage-A head) counts
+            # exactly; only what follows is estimated.
             s, m = _local_chat_prompt(system, msgs)
-            return _prompt_budget.estimate_chat_tokens(s, m)
+            return _prompt_budget.measure_chat_tokens(s, m, model=_tag)
 
         fit = _prompt_budget.fit_chat(list(messages), parts, budget=budget,
                                       measure=_measure,
@@ -2287,8 +2291,17 @@ def _note_prompt_window(sys_prompt: str, messages: list, stats,
         pe = (stats or {}).get("prompt_eval_count")
         if pe is None:
             return False
-        est = _prompt_budget.estimate_chat_tokens(sys_prompt, messages)
-        if not _prompt_budget.OBSERVED_WINDOW.note(est, pe):
+        est = _prompt_budget.measure_chat_tokens(sys_prompt, messages,
+                                                 model=model_tag)
+        # A prompt estimated over the configured window was cut because it
+        # was too big (the budget already said CANNOT FIT); it says nothing
+        # about the runner's window (2026-10-04), so it is not learned.
+        cfg_ctx = _local_num_ctx(model_tag) if model_tag else None
+        if not _prompt_budget.OBSERVED_WINDOW.note(est, pe, num_ctx=cfg_ctx):
+            # An honest count is the prompt's exact size: later prompts that
+            # share this prefix are measured, not estimated.
+            if not _prompt_budget.looks_truncated(est, pe):
+                _prompt_budget.EXACT.note(model_tag, sys_prompt, messages, pe)
             return False
         ctx = _local_num_ctx(model_tag) if model_tag else 0
         print(f"  [prompt-budget] TRUNCATED: Ollama evaluated {int(pe):,} "
@@ -2393,6 +2406,13 @@ def _load_chappie_standing_rules() -> str:
 # and disables the split.
 _system_prompt_stable_len = [0]
 
+# The most recent build_system_prompt() output's STABLE HEAD: everything
+# before its first learned (memory-derived) section, a prefix of that output
+# ('' = no build yet). The local brain's prompt-cache boundary - see
+# _local_prompt_head and the stage-A re-prime. Single-element list, same
+# idiom as above.
+_system_prompt_head = [""]
+
 
 def build_system_prompt(memory: dict) -> str:
     # STABLE CORE first, everything memory-derived second. The prompt is one
@@ -2440,20 +2460,30 @@ def build_system_prompt(memory: dict) -> str:
     # layout, in the uncached addenda tail everywhere else.
     prompt += "\n\n" + _mcu_phrases.render_phrasebook_block()
 
-    days_known = 0
-    try:
-        from datetime import date
-        y, m, d = map(int, memory["first_meeting"].split("-"))
-        days_known = (date.today() - date(y, m, d)).days
-    except Exception:
-        pass
-
+    # Which instance this is never changes within a run, so it stays in the
+    # stable head (the day / conversation count moved to the very end).
     prompt += (
-        f"\n\nContext: you've known your owner for {days_known} day(s) across "
-        f"{memory['conversation_count']} conversations. "
-        f"You are currently the {LOCATION} instance — there may be other "
-        f"versions of you running in other rooms, sharing the same memory."
+        f"\n\nContext: you are currently the {LOCATION} instance — there may "
+        f"be other versions of you running in other rooms, sharing the same "
+        f"memory."
     )
+
+    # ── stable head / learned tail boundary (2026-10-04) ───────────────────
+    # Everything above is byte-identical between rebuilds (it changes only
+    # with a release, a rules edit or a skill load); everything below is
+    # learned, in a FIXED order from least to most volatile, so the local
+    # brain re-reads as little as possible after a change. gemma4 uses
+    # sliding-window attention: llama.cpp resumes a changed prompt only from
+    # a saved checkpoint at or before its first changed token. Ollama's
+    # server.log (10-01..10-04) showed 46 full re-reads of 13.5-16k-token
+    # prompts (3.1-4.1 s each), 15 of them because the day / conversation
+    # count - bumped at every boot, rolled at midnight - sat at token ~10.8k,
+    # ahead of ~2.8k tokens of memory. The idle re-prime's stage-A posts this
+    # head alone (_local_prompt_head) so the server keeps a checkpoint at it.
+    # The head ends on a non-newline character and the tail always opens
+    # with a blank line: the brain's tokenizer never merges a newline with
+    # anything else, so the head tokenizes alone exactly as inside the prompt.
+    _system_prompt_head[0] = prompt
 
     if memory["facts"]:
         prompt += "\n\nWhat you know about your owner:\n"
@@ -2473,6 +2503,17 @@ def build_system_prompt(memory: dict) -> str:
 
     # Secret-shaped topic labels and session summaries written before their
     # write guards existed (2026-10-01) are skipped, not sent every turn.
+    # The summaries change about once a session, the topics with nearly every
+    # learned turn: summaries first.
+    recent = [x for x in memory["sessions"][-5:]
+              if not _is_secret_fact(str(x.get("summary", "")))]
+    if recent:
+        prompt += "\n\nRecent conversation summaries:\n"
+        prompt += "\n".join(
+            f"- {s['date']} ({s.get('location', '?')}): {s['summary']}"
+            for s in recent
+        )
+
     recent_topics = [t for t in memory["topics"][-15:]
                      if not _is_secret_fact(str(t.get("topic", "")))]
     if recent_topics:
@@ -2486,14 +2527,19 @@ def build_system_prompt(memory: dict) -> str:
             for t in recent_topics
         )
 
-    recent = [x for x in memory["sessions"][-5:]
-              if not _is_secret_fact(str(x.get("summary", "")))]
-    if recent:
-        prompt += "\n\nRecent conversation summaries:\n"
-        prompt += "\n".join(
-            f"- {s['date']} ({s.get('location', '?')}): {s['summary']}"
-            for s in recent
-        )
+    # Last: the conversation count goes up at every boot, the day count at
+    # midnight.
+    days_known = 0
+    try:
+        from datetime import date
+        y, m, d = map(int, memory["first_meeting"].split("-"))
+        days_known = (date.today() - date(y, m, d)).days
+    except Exception:
+        pass
+    prompt += (
+        f"\n\nContext: you've known your owner for {days_known} day(s) across "
+        f"{memory['conversation_count']} conversations."
+    )
 
     return prompt
 
@@ -15794,7 +15840,16 @@ def generate_proactive_comment(now: float | None = None) -> str:
     # (the system part stays byte-identical, so its cached prefix holds).
     now = time.time() if now is None else float(now)
     lt = time.localtime(now)
-    system = _system_prompt + (
+    # On the local model the full prompt cannot fit (2026-10-04): its
+    # PC_CONTROL_PROMPT becomes the local cheatsheet, ~18.4k estimated tokens
+    # in all, and Ollama cut it to its last 8,195 tokens (live 10-02 14:59
+    # and 10-04 13:07). The compact cache-stable layout the owner's turns use
+    # fits and shares their warm prefix up to the end of the system prompt.
+    # A cloud one-shot keeps the full prompt (its cached prefix).
+    base = _system_prompt
+    if _llm_quick_goes_local():
+        base = _local_stable_system_prompt(base) or base
+    system = base + (
         "\n\nYou are now generating a PROACTIVE comment. Your owner has been "
         "quiet for a while but you can see them at their desk. "
         "Pick ONE of: a short interesting fact related to their interests, "
@@ -20946,6 +21001,24 @@ def _local_chat_payload(model_tag: str, sys_prompt: str, messages: list,
     return payload
 
 
+# Empty replies from the local brain in a row (any caller); reset by any other
+# outcome. See the failover in _call_local_llm.
+_local_empty_streak = [0]
+_LOCAL_EMPTY_FAILOVER_AFTER = 2
+
+
+def _local_failover_allowed() -> bool:
+    """May _call_local_llm fail over to a DIFFERENT model after an empty
+    reply? Only on the main loop (the owner's turn), and only once the brain
+    returned empty _LOCAL_EMPTY_FAILOVER_AFTER times in a row. Never
+    raises (False)."""
+    try:
+        return (threading.current_thread() is threading.main_thread()
+                and _local_empty_streak[0] >= _LOCAL_EMPTY_FAILOVER_AFTER)
+    except Exception:
+        return False
+
+
 def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str | None:
     """POST to Ollama /api/chat. Returns the assistant text or None on any
     failure (no Ollama running, no model pulled, HTTP error, timeout)."""
@@ -20967,9 +21040,28 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     # here, history only.
     if not (isinstance(messages, _BudgetedMessages)
             and messages.num_ctx == _local_num_ctx(model)):
-        messages = _fit_local_messages(system, messages, (),
+        _raw = messages
+        messages = _fit_local_messages(system, _raw, (),
                                        max_tokens=max_tokens, where="call",
                                        model_tag=model)
+        # The system prompt is never trimmed - so when it cannot fit at all
+        # (a caller that passed the full prompt: its PC_CONTROL_PROMPT
+        # becomes the ~4k-token-bigger local cheatsheet, ~18.4k estimated in
+        # all; live 10-02 14:59 and 10-04 13:07, a proactive remark) the
+        # compact cache-stable layout the turn path uses goes instead, rather
+        # than letting Ollama cut the START of the prompt (2026-10-04).
+        if not getattr(messages, "fits", True):
+            _compact = _local_stable_system_prompt(system)
+            if _compact and _compact != system:
+                _refit = _fit_local_messages(_compact, _raw, (),
+                                             max_tokens=max_tokens,
+                                             where="call", model_tag=model,
+                                             log=False)
+                print("  [prompt-budget] call: the system prompt alone is "
+                      "over the window - sent in the compact local layout "
+                      + ("(fits)" if getattr(_refit, "fits", True)
+                         else "(still over)"))
+                system, messages = _compact, _refit
     sys_prompt, messages = _local_chat_prompt(system, messages)
     # The last _generate's Ollama counters (prompt_eval / eval), for the
     # served-via line below. All-None until a response arrives.
@@ -21054,9 +21146,12 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     try:
         with _lt.slot():
             text, kind = _generate(model)
+            if kind != "empty":
+                _local_empty_streak[0] = 0
             if kind == "ok":
                 print(f"  [local-llm] served via {model} "
                       f"{_served_via_suffix(_gen_stats[0])}")
+                _note_brain_response(_gen_stats[0], model)
                 _note_prompt_window(sys_prompt, messages, _gen_stats[0],
                                     model)
                 _note_turn_brain("local", model)
@@ -21069,6 +21164,19 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
                 # brain. Only the empty case retries; a timeout ('fail') already spent
                 # the read budget, so retrying a wedged runner would just double the
                 # wait for nothing.
+                # 2026-10-04: loading another model UNLOADS the brain
+                # (OLLAMA_MAX_LOADED_MODELS=1) and pins the other one for the
+                # session, so one stray empty reply must not do it: only
+                # _LOCAL_EMPTY_FAILOVER_AFTER empties in a row (a broken
+                # quant is empty every time), and only on the main loop -
+                # never from a background job.
+                _local_empty_streak[0] += 1
+                if not _local_failover_allowed():
+                    print(f"  [local-llm] `{model}` returned EMPTY "
+                          f"({_local_empty_streak[0]} in a row) - not "
+                          f"failing over yet: loading another model would "
+                          f"unload it")
+                    return None
                 alt = _next_local_llm_fallback(exclude=model)
                 print(f"  [local-llm] `{model}` returned EMPTY (likely a broken quant)"
                       + (f" — failing over to `{alt}`" if alt
@@ -21079,6 +21187,7 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
                         # Sticky: pin the working model for the rest of the session so
                         # every later turn skips the broken one (no repeated empty+retry).
                         _RESOLVED_LOCAL_LLM_MODEL[0] = alt
+                        _local_empty_streak[0] = 0
                         print(f"  [local-llm] served via {alt} (failed over from {model}) "
                               f"{_served_via_suffix(_gen_stats[0])}")
                         _note_turn_brain("local", alt)
@@ -21486,15 +21595,25 @@ def _ensure_ollama_single_model_env() -> None:
     # 1) Current process. setdefault: never clobber an explicit operator override
     #    (e.g. someone who deliberately set it to 2 for a multi-GPU box).
     os.environ.setdefault(_OLLAMA_MAX_LOADED_ENV, "1")
-    # 2) Persist for the next server launch.
-    status = _persist_user_env(_OLLAMA_MAX_LOADED_ENV, "1")
+    # 2) Persist for the next server launch - the value THIS process runs
+    #    with (2026-10-04). It used to persist a literal "1", so an override
+    #    the line above had just respected was written back to 1 at every
+    #    boot and the server lost it at its next restart. The brain-eviction
+    #    guard (core.ollama_opts.max_loaded_models) reads the same value.
+    from core.ollama_opts import max_loaded_models as _max_loaded
+    want = str(_max_loaded())
+    status = _persist_user_env(_OLLAMA_MAX_LOADED_ENV, want)
     if status == "already":
-        print(f"  [ollama-env] {_OLLAMA_MAX_LOADED_ENV}=1 already persisted "
-              f"(User env) — Ollama will evict, not co-load. Good.")
+        print(f"  [ollama-env] {_OLLAMA_MAX_LOADED_ENV}={want} already "
+              f"persisted (User env)"
+              + (" — Ollama will evict, not co-load. Good." if want == "1"
+                 else " — Ollama may co-load models (an explicit override)."))
     elif status == "set":
-        print(f"  [ollama-env] persisted {_OLLAMA_MAX_LOADED_ENV}=1 to User env "
-              f"so Ollama evicts instead of co-loading a 2nd model (VRAM-brick "
-              f"guard).")
+        print(f"  [ollama-env] persisted {_OLLAMA_MAX_LOADED_ENV}={want} to "
+              f"User env"
+              + (" so Ollama evicts instead of co-loading a 2nd model "
+                 "(VRAM-brick guard)." if want == "1"
+                 else " (the explicit override this process runs with)."))
         # Only nag about a restart if a server is actually up AND already holding
         # more than one model — otherwise nothing is at risk right now.
         try:
@@ -22570,6 +22689,33 @@ def _local_stable_system_prompt(base: str | None = None) -> str | None:
     return base.replace(PC_CONTROL_PROMPT, _stable_pc, 1)
 
 
+def _local_prompt_head(system: str | None = None) -> str | None:
+    """The STABLE HEAD of the local system prompt (2026-10-04):
+    build_system_prompt's head (_system_prompt_head) in its local form, i.e.
+    everything before the first learned section. ``system`` is the local
+    system text it must be a strict prefix of (default: the live
+    _local_stable_system_prompt()). None when the cache-stable layout does
+    not apply, no build recorded a head, the head is no longer a prefix of
+    the live prompt, or the cut would not fall between a non-newline
+    character and a newline (see build_system_prompt). Never raises."""
+    try:
+        head = _system_prompt_head[0]
+        base = _system_prompt
+        if not head or len(head) >= len(base) or not base.startswith(head):
+            return None
+        local_head = _local_stable_system_prompt(head)
+        full = _local_stable_system_prompt(base) if system is None else system
+        if not local_head or not full or len(full) <= len(local_head):
+            return None
+        if not full.startswith(local_head):
+            return None
+        if local_head[-1] in "\r\n" or full[len(local_head)] != "\n":
+            return None
+        return local_head
+    except Exception:
+        return None
+
+
 # In-process copy of memory['last_used_phrase_by_intent'] (None = not loaded
 # yet). Updated where _call_llm records a reply's phrases, so the per-turn
 # hint needs no disk read after the first turn.
@@ -23141,6 +23287,16 @@ _reprime_prefix_hash = [""]     # hash of the last primed prefix ('' = none)
 _reprime_primed_at = [0.0]
 _reprime_posts_mark = [0]
 _REPRIME_DEBOUNCE_S = 1.0
+# Stage-A (2026-10-04): the _local_prefix_hash of the last head-only prime
+# that succeeded ('' = none, or invalidated: the brain was reloaded, or a
+# full prime after it re-read everything). See _reprime_once.
+# JARVIS_REPRIME_STAGE_A=0 turns stage-A off (the full prime is unchanged).
+_REPRIME_STAGE_A = (os.environ.get("JARVIS_REPRIME_STAGE_A", "1")
+                    .strip().lower() not in ("0", "false", "no", "off"))
+_stage_a_primed = [""]
+# A local response whose Ollama load_duration is at least this was a
+# (re)load: the server's prompt cache, checkpoints included, started empty.
+_BRAIN_RELOAD_MS = 1000
 
 
 def _game_mode_active() -> bool:
@@ -23185,6 +23341,92 @@ def _build_reprime_payload() -> dict | None:
         return None
     sys_prompt, msgs = _local_chat_prompt(system, hist)
     return _local_chat_payload(model, sys_prompt, list(msgs)[:-1], max_tokens=1)
+
+
+def _build_stage_a_payload(full_payload: dict | None) -> dict | None:
+    """The re-prime's STAGE A (2026-10-04): ``full_payload`` (a
+    _build_reprime_payload body) cut down to the system prompt's stable head
+    alone - same model, options, keep_alive and think, no messages,
+    num_predict 1 - so it ENDS EXACTLY AT THE STABLE BOUNDARY.
+
+    Why: gemma4's sliding-window attention lets llama.cpp resume a changed
+    prompt only from a saved checkpoint at or before the first changed
+    token, and it saves checkpoints only near a prompt's END (the start of
+    its last 1,024-token batch, and 4 tokens before the end - Ollama's
+    server.log). A prompt that ends at the head leaves a checkpoint the
+    server keeps, so when a learned section changes, the next prime or turn
+    re-reads ~1k tokens of the head plus the learned tail and the history
+    instead of all ~13.6k (measured 3.1-3.6 s). None when there is no head
+    (see _local_prompt_head) or it is not a prefix of ``full_payload``'s
+    system text. Never raises."""
+    try:
+        if not full_payload or not _REPRIME_STAGE_A:
+            return None
+        msgs = full_payload.get("messages") or []
+        if not msgs or msgs[0].get("role") != "system":
+            return None
+        full_sys = msgs[0].get("content") or ""
+        head = _local_prompt_head()
+        if not head or not full_sys.startswith(head) or full_sys == head:
+            return None
+        if full_sys[len(head)] != "\n":
+            return None
+        return _local_chat_payload(full_payload.get("model"), head, [],
+                                   max_tokens=1)
+    except Exception:
+        return None
+
+
+def _note_brain_response(stats, model_tag: str = "") -> None:
+    """After a local-brain response: a (re)load (load_ms >=
+    _BRAIN_RELOAD_MS) emptied the server's prompt cache, so the next re-prime
+    must post stage-A again. Never raises."""
+    try:
+        load = (stats or {}).get("load_ms")
+        if load is not None and int(load) >= _BRAIN_RELOAD_MS:
+            if _stage_a_primed[0]:
+                print(f"  [reprime] the brain was (re)loaded ({int(load)} ms) "
+                      f"- stage-A will run again")
+            _stage_a_primed[0] = ""
+    except Exception:
+        pass
+
+
+def _post_prime(payload: dict) -> tuple:
+    """POST one prime body (stage-A or the full prime). Returns
+    (ok, ms, prompt_eval_count or -1, stats or None, error-tag). Tracked as
+    JARVIS's own GPU work but NOT counted as an eviction (it warms the
+    prefix the next turn wants). Both bodies come from _local_chat_payload,
+    so num_ctx is pinned (chat_options / _local_num_ctx) exactly as on a
+    turn and a prime can never reload the runner. Never raises."""
+    t0 = time.perf_counter()
+    try:
+        with _lt.TRACKER.track(count=False):
+            r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
+                              timeout=_LOCAL_GENERATE_TIMEOUT)
+        ms = int((time.perf_counter() - t0) * 1000)
+        if not r.ok:
+            return (False, ms, -1, None, f"status={r.status_code}")
+        stats = _tt_stats(r)
+        try:
+            pe = int((r.json() or {}).get("prompt_eval_count"))
+        except Exception:
+            pe = -1
+        return (True, ms, pe, stats, "")
+    except Exception as _e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        return (False, ms, -1, None, type(_e).__name__)
+
+
+def _prefill_note(stats) -> str:
+    """' new≈N <state>' for a prime's log line ('' when unknown)."""
+    try:
+        new, state = _tt_mod.prefill_estimate(
+            (stats or {}).get("prompt_eval_count"),
+            (stats or {}).get("prompt_eval_ms"))
+        return f" new≈{new} {state}" if state else ""
+    except Exception:
+        return ""
 
 
 def _reprime_skip_reason() -> str | None:
@@ -23248,6 +23490,33 @@ def _reprime_once() -> str:
                               exact=True):
         print("  [reprime] skip not-resident")
         return "not-resident"
+    # STAGE A (2026-10-04): when the server may not hold a checkpoint at the
+    # system prompt's stable head (first prime of this process, a new head,
+    # or the brain was reloaded since), prime the head alone first - see
+    # _build_stage_a_payload. Then the full prime below, and any later
+    # change to the learned tail, re-reads from the head instead of from 0.
+    stage_a = _build_stage_a_payload(payload)
+    stage_a_key = (_local_prefix_hash(stage_a, drop_last=False)
+                   if stage_a else "")
+    stage_a_ran = False
+    if stage_a and stage_a_key != _stage_a_primed[0]:
+        ok_a, ms_a, pe_a, st_a, err_a = _post_prime(stage_a)
+        if not ok_a:
+            print(f"  [reprime] stage-A failed {ms_a} {err_a}")
+        else:
+            stage_a_ran = True
+            _stage_a_primed[0] = stage_a_key
+            try:
+                _prompt_budget.EXACT.note_head(
+                    stage_a["model"], stage_a["messages"][0]["content"], pe_a)
+            except Exception:
+                pass
+            print(f"  [reprime] stage-A {ms_a} pe={pe_a}{_prefill_note(st_a)}")
+        # The owner may have started talking during it: same gates again.
+        reason = _reprime_skip_reason()
+        if reason:
+            print(f"  [reprime] skip {reason}")
+            return reason
     # Stamp the primed prefix BEFORE the POST: an owner turn that starts
     # while it is in flight queues behind it on Ollama's single slot and must
     # be compared against THIS prefix (a stamp after the POST returned was
@@ -23265,30 +23534,34 @@ def _reprime_once() -> str:
             if _reprime_prefix_hash[0] == primed:
                 _reprime_prefix_hash[0] = ""
 
-    t0 = time.perf_counter()
-    try:
-        # Same endpoint + timeout as a real turn; num_ctx is pinned by the
-        # shared builder (_local_chat_payload -> chat_options / _local_num_ctx),
-        # so this can never reload the runner under a different context.
-        # Tracked as JARVIS's own GPU work (the pulse must not report it) but
-        # NOT counted as an eviction: it is the prefix the next turn wants.
-        with _lt.TRACKER.track(count=False):
-            r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
-                              timeout=_LOCAL_GENERATE_TIMEOUT)
-        ms = int((time.perf_counter() - t0) * 1000)
-        if not r.ok:
-            _unstamp()
-            print(f"  [reprime] failed {ms} status={r.status_code}")
-            return "failed"
-        try:
-            pe = int((r.json() or {}).get("prompt_eval_count"))
-        except Exception:
-            pe = -1
-    except Exception as _e:
+    # Same endpoint + timeout as a real turn; num_ctx is pinned by the shared
+    # builder (_local_chat_payload -> chat_options / _local_num_ctx), so this
+    # can never reload the runner under a different context. Tracked as
+    # JARVIS's own GPU work (the pulse must not report it) but NOT counted as
+    # an eviction: it is the prefix the next turn wants (_post_prime).
+    ok, ms, pe, stats, err = _post_prime(payload)
+    if not ok:
         _unstamp()
-        print(f"  [reprime] failed {type(_e).__name__}")
+        if err.startswith("status="):
+            print(f"  [reprime] failed {ms} {err}")
+        else:
+            print(f"  [reprime] failed {err}")
         return "failed"
-    print(f"  [reprime] {ms} pe={pe}")
+    _note_brain_response(stats)
+    try:
+        _prompt_budget.EXACT.note(payload["model"],
+                                  payload["messages"][0]["content"],
+                                  payload["messages"][1:], pe)
+    except Exception:
+        pass
+    note = _prefill_note(stats)
+    print(f"  [reprime] {ms} pe={pe}{note}")
+    # A full re-read right after a stage-A this process believed the server
+    # still held means the head checkpoint is gone (the brain was reloaded
+    # by someone else, or the cache dropped it): post stage-A again next time.
+    if (not stage_a_ran and _stage_a_primed[0]
+            and note.endswith(" full")):
+        _stage_a_primed[0] = ""
     return "primed"
 
 
@@ -23466,13 +23739,19 @@ def _reprime_check_stale(payload: dict) -> bool | None:
         stale = _local_prefix_hash(payload, drop_last=True) != primed
         age = int(max(0.0, time.monotonic() - at)) if at else -1
         if stale:
+            verdict = "stale"
             print(f"  [reprime] stale age={age}s")
         else:
             others = _lt.TRACKER.posts - mark
             if others > 0:
+                verdict = "evicted"
                 print(f"  [reprime] evicted age={age}s by={others}")
             else:
+                verdict = "hit"
                 print(f"  [reprime] hit age={age}s")
+        # ...and on the turn's [turn-timing] line (reprime=), next to the
+        # prompt's pe_new / pe_state.
+        _tt("set_first", "reprime", verdict)
         return stale
     except Exception:
         return None

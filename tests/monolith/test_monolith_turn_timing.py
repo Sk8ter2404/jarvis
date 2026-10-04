@@ -201,6 +201,8 @@ class ServedViaLineTests(_Base):
         bc = self.bc
         fake_req = self._local_llm(_FULL, model="broken:model")
         self._p(bc, "_next_local_llm_fallback", return_value="good:model")
+        # The failover needs a second empty reply in a row (2026-10-04).
+        self._p(bc, "_local_empty_streak", [1])
         saved = list(bc._RESOLVED_LOCAL_LLM_MODEL)
         self.addCleanup(lambda: bc._RESOLVED_LOCAL_LLM_MODEL.__setitem__(
             slice(None), saved))
@@ -431,6 +433,8 @@ class TurnLineTests(_Base):
         bc = self.bc
         self._p(bc, "_get_local_llm_model", return_value="broken:model")
         self._p(bc, "_next_local_llm_fallback", return_value="good:model")
+        # The failover needs a second empty reply in a row (2026-10-04).
+        self._p(bc, "_local_empty_streak", [1])
         saved = list(bc._RESOLVED_LOCAL_LLM_MODEL)
         self.addCleanup(lambda: bc._RESOLVED_LOCAL_LLM_MODEL.__setitem__(
             slice(None), saved))

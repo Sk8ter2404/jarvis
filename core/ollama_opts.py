@@ -137,23 +137,10 @@ def model_resident(model: str, base_url: str = "http://127.0.0.1:11434",
     tag = (model or "").strip()
     if not tag:
         return False
-    import json as _json
-    import urllib.request as _url
-    try:
-        req = _url.Request(f"{base_url.rstrip('/')}/api/ps", method="GET")
-        with _url.urlopen(req, timeout=timeout_s) as resp:
-            payload = _json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
-        return False
-    for m in (payload.get("models") or []):
-        name = (m or {}).get("name") or (m or {}).get("model") or ""
-        if not name:
-            continue
+    names = resident_models(base_url, timeout_s)
+    for name in names or ():
         if exact:
-            # Mirrors skills/game_mode.py _keep_warm._same.
-            if (name == tag
-                    or (":" not in tag and name == f"{tag}:latest")
-                    or (":" not in name and tag == f"{name}:latest")):
+            if same_tag(name, tag):
                 return True
             continue
         # Ollama reports fully-qualified tags ("nomic-embed-text:latest");
@@ -161,6 +148,90 @@ def model_resident(model: str, base_url: str = "http://127.0.0.1:11434",
         if name == tag or name.split(":", 1)[0] == tag.split(":", 1)[0]:
             return True
     return False
+
+
+def same_tag(resident_name: str, tag: str) -> bool:
+    """Is ``resident_name`` (as /api/ps reports it) exactly ``tag``? A bare
+    name matches only its ":latest" form, in either direction. Mirrors
+    skills/game_mode.py _keep_warm._same."""
+    a = (resident_name or "").strip()
+    b = (tag or "").strip()
+    if not a or not b:
+        return False
+    return (a == b
+            or (":" not in b and a == f"{b}:latest")
+            or (":" not in a and b == f"{a}:latest"))
+
+
+def resident_models(base_url: str = "http://127.0.0.1:11434",
+                    timeout_s: float = 1.5) -> "list[str] | None":
+    """The model tags Ollama has loaded right now (GET /api/ps), in its
+    order; None when the list cannot be read (server down, timeout, junk).
+    Loads nothing. Never raises."""
+    import json as _json
+    import urllib.request as _url
+    try:
+        req = _url.Request(f"{str(base_url).rstrip('/')}/api/ps", method="GET")
+        with _url.urlopen(req, timeout=timeout_s) as resp:
+            payload = _json.loads(resp.read().decode("utf-8", errors="replace"))
+        out = []
+        for m in (payload.get("models") or []):
+            name = (m or {}).get("name") or (m or {}).get("model") or ""
+            if name:
+                out.append(str(name))
+        return out
+    except Exception:
+        return None
+
+
+# ── Brain-eviction guard (2026-10-04) ──────────────────────────────────────
+# With OLLAMA_MAX_LOADED_MODELS=1 (the value JARVIS persists, see the
+# monolith's _ensure_ollama_single_model_env) ANY request naming a model that
+# is not loaded unloads whatever is: on 10-02 15:05:40 and 10-03 17:35:41 the
+# RAG boot scan's nomic-embed-text requests unloaded the voice brain, and the
+# next brain loads took 54 s and 9 s (Ollama server.log). A caller whose work
+# can wait asks eviction_risk() first and waits when it says no.
+MAX_LOADED_ENV = "OLLAMA_MAX_LOADED_MODELS"
+
+
+def max_loaded_models(environ=None) -> int:
+    """How many models the Ollama server holds at once, as JARVIS runs it:
+    OLLAMA_MAX_LOADED_MODELS from this process's environment (the value
+    JARVIS persists to the User environment, which the server reads at its
+    own start), else 1. A blank, zero, negative or non-integer value reads
+    as 1 - the evicting behaviour JARVIS enforces. Never raises."""
+    import os as _os
+    env = _os.environ if environ is None else environ
+    try:
+        n = int(str(env.get(MAX_LOADED_ENV, "1")).strip())
+    except Exception:
+        return 1
+    return n if n >= 1 else 1
+
+
+def eviction_risk(model: str, base_url: str = "http://127.0.0.1:11434",
+                  timeout_s: "float | None" = None, *,
+                  max_loaded: "int | None" = None) -> str:
+    """'' when a request naming ``model`` cannot unload another model: it is
+    already loaded (exact tag, see same_tag), or fewer than ``max_loaded``
+    (default max_loaded_models()) models are loaded. Otherwise a short reason
+    naming what it would unload. When /api/ps cannot be read the answer is a
+    reason too: a caller that can wait must not gamble a ~15 GB brain reload
+    on an unknown. Loads nothing. Never raises."""
+    tag = (model or "").strip()
+    if not tag:
+        return "no model named"
+    cap = max_loaded_models() if max_loaded is None else max(1, int(max_loaded))
+    t = probe_timeout(base_url) if timeout_s is None else timeout_s
+    names = resident_models(base_url, t)
+    if names is None:
+        return f"could not read {str(base_url).rstrip('/')}/api/ps"
+    if any(same_tag(n, tag) for n in names):
+        return ""
+    if len(names) < cap:
+        return ""
+    return (f"loading {tag} would unload {', '.join(names)} "
+            f"(Ollama holds {cap} model{'s' if cap != 1 else ''})")
 
 
 def chat_options(model: str, *, num_predict: int | None = None,

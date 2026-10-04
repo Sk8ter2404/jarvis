@@ -133,10 +133,29 @@ NOTE_FIELDS = ("tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms",
 # the local prompt budget trimmed the turn (2026-10-02: a trimmed turn's
 # prompt_eval_count must not enter the chars-per-token calibration as if it
 # were whole), '-' when no budget ran (a cloud turn).
+# Brain-prefix fields (2026-10-04), printed LAST, after budget_trimmed - what
+# makes the local brain's prompt cache measurable on every turn:
+#   pe_new    estimated prompt tokens the answering local call really
+#             evaluated (the rest of prompt_eval_count came from Ollama's
+#             cache): see prefill_estimate;
+#   pe_state  warm (under PE_WARM_FRACTION of the prompt was evaluated),
+#             full (at least PE_FULL_FRACTION: a whole re-read), or partial;
+#   reprime   the idle re-prime's verdict for this turn's prefix (hit /
+#             evicted / stale), '-' when no prime was stamped.
+BRAIN_FIELDS = ("pe_new", "pe_state", "reprime")
 STAT_FIELDS = ("prompt_eval_count", "prompt_eval_ms", "eval_count", "eval_ms",
                "llm_calls", "turn_ctx_chars", "sys_chars", "followup_rounds",
                "filler", "filler_ms", *NOTE_FIELDS, "lead_dropped",
-               "budget_trimmed")
+               "budget_trimmed", *BRAIN_FIELDS)
+
+# Prefill cost of the brain (gemma4:26b-a4b on the 3090), fitted to Ollama's
+# server.log 2026-10-01..10-04 (1,216 brain prompts of 8k+ tokens, median
+# ms by evaluated tokens: 15 -> 160, 176 -> 222, 998 -> 426, 1,831 -> 623,
+# 13,604 -> 3,449): ms ~ PREFILL_FIXED_MS + PREFILL_MS_PER_TOKEN * tokens.
+PREFILL_FIXED_MS = 150.0
+PREFILL_MS_PER_TOKEN = 0.24
+PE_WARM_FRACTION = 0.25
+PE_FULL_FRACTION = 0.80
 
 # The R1 fields kept in a turn's notes (printed from there): all but
 # load_ms / total_ms, which only the answering response supplies
@@ -271,6 +290,37 @@ def caller_tag(frame=None, wrappers=LLM_WRAPPERS) -> str:
         return f"{tag}@{thread}"
     except Exception:
         return "?"
+
+
+def prefill_estimate(prompt_eval_count, prompt_eval_ms) -> tuple:
+    """(pe_new, pe_state) for one local response: the prompt tokens it most
+    likely evaluated (Ollama's prompt_eval_count is the WHOLE prompt even
+    when the prefix came from the cache; the time says how much was really
+    read), clamped to [0, count], and warm / partial / full (see
+    BRAIN_FIELDS). (None, None) when either number is missing. An estimate:
+    a fast prompt that was mostly re-read reads warm, never the reverse by
+    more than the fit's scatter. Never raises."""
+    try:
+        if (prompt_eval_count is None or prompt_eval_ms is None
+                or isinstance(prompt_eval_count, bool)
+                or isinstance(prompt_eval_ms, bool)):
+            return (None, None)
+        count = int(prompt_eval_count)
+        ms = float(prompt_eval_ms)
+        if count <= 0 or ms < 0:
+            return (None, None)
+        new = int(round((ms - PREFILL_FIXED_MS) / PREFILL_MS_PER_TOKEN))
+        new = max(0, min(count, new))
+        frac = new / count
+        if frac < PE_WARM_FRACTION:
+            state = "warm"
+        elif frac >= PE_FULL_FRACTION:
+            state = "full"
+        else:
+            state = "partial"
+        return (new, state)
+    except Exception:
+        return (None, None)
 
 
 def _new_turn(kind: str, t0: float, owner: int) -> dict:
@@ -663,7 +713,10 @@ def format_line(turn: dict, end, outcome: str = "ok") -> str:
         "total_ms": stats.get("total_ms"),
         "lead_dropped": turn.get("lead_dropped", 0),
         "budget_trimmed": stats.get("budget_trimmed"),
+        "reprime": stats.get("reprime"),
     }
+    vals["pe_new"], vals["pe_state"] = prefill_estimate(
+        stats.get("prompt_eval_count"), stats.get("prompt_eval_ms"))
     for k in STAT_FIELDS:
         if k == "filler_ms":
             parts.append(f"filler_ms={_off(t0, turn['filler_at'])}")

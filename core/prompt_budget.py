@@ -82,6 +82,24 @@ prompt alone is ~13.4k tokens, and of 397 logged turns (2026-09-29 to 10-01;
 median 13,847 tokens, max 16,338 untruncated) 157 were over 14,000. A flat
 14k cap would have trimmed history on about 40 % of ordinary turns.
 
+TOKEN-AWARE: EXACT COUNTS FOR WHAT WAS ALREADY SENT (2026-10-04)
+================================================================
+The character estimate is ~3.6 % high on the system prompt (~490 tokens of a
+13.6k prompt) and LOW on dense text (the topics list runs 2.5 characters per
+token), so it neither guarantees the fit nor uses the window well. Ollama
+reports the exact size of every prompt it evaluated (``prompt_eval_count`` is
+the whole prompt even when most of it came from the cache), and JARVIS
+re-sends the same prefix over and over: the idle re-prime posts exactly the
+next turn minus its user message, and its stage-A posts the system prompt's
+stable head alone. ``ExactCounts`` (``EXACT``) remembers those sizes, keyed
+by model, system prompt and message list, and ``measure_chat_tokens`` counts
+the longest known prefix exactly and estimates only what follows it. A count
+far from the estimate of the same prompt (``EXACT_SANITY``: a truncated
+prompt, or a server that reports only the uncached part) is never stored.
+``budget_for`` keeps ``SAFETY_MARGIN_TOKENS`` free on top of the reply's
+room, so system prompt + turn context + reply stay inside the real window
+with a margin. The system prompt is still never trimmed.
+
 WHEN THE WINDOW IS SMALLER THAN num_ctx (review 2026-10-02)
 ==========================================================
 The 10-01 incident read ``limit=8195`` - half the 16k num_ctx the budget
@@ -121,6 +139,16 @@ KEEP_RECENT_MESSAGES = 2
 # The reply's room in the window (see CALIBRATION): at most this, or the
 # call's max_tokens when that is smaller.
 REPLY_RESERVE_TOKENS = 200
+
+# Kept free on top of the reply's room (2026-10-04): the estimated part of a
+# prompt (what follows its exactly-known prefix: the new user message, the
+# per-turn context) may run a little denser than CHARS_PER_TOKEN.
+SAFETY_MARGIN_TOKENS = 128
+
+# An exact count is stored only when it is within this band of the
+# character estimate of the same prompt (see TOKEN-AWARE above). Measured
+# real/estimate on whole local prompts: 0.93-0.98.
+EXACT_SANITY = (0.80, 1.20)
 
 # Per-turn part ranks. LOWER is dropped FIRST. Every rank below RANK_SECTION
 # goes before any history does.
@@ -206,10 +234,12 @@ def estimate_chat_tokens(system, messages) -> int:
 
 
 def budget_for(num_ctx, max_tokens) -> int:
-    """Estimated prompt tokens allowed in a ``num_ctx`` window when the reply
-    may run to ``max_tokens``. Room for the reply is reserved - a prompt that
-    fills the window leaves the model nothing to answer in - but only
-    REPLY_RESERVE_TOKENS of it: a voice reply is far shorter than its cap."""
+    """Prompt tokens allowed in a ``num_ctx`` window when the reply may run
+    to ``max_tokens``. Room for the reply is reserved - a prompt that fills
+    the window leaves the model nothing to answer in - but only
+    REPLY_RESERVE_TOKENS of it: a voice reply is far shorter than its cap.
+    SAFETY_MARGIN_TOKENS more stay free for the estimated part of the
+    prompt (2026-10-04)."""
     try:
         ctx = int(num_ctx)
     except Exception:
@@ -218,7 +248,173 @@ def budget_for(num_ctx, max_tokens) -> int:
         reply = min(max(0, int(max_tokens)), REPLY_RESERVE_TOKENS)
     except Exception:
         reply = 0
-    return max(MIN_BUDGET_TOKENS, ctx - reply)
+    return max(MIN_BUDGET_TOKENS, ctx - reply - SAFETY_MARGIN_TOKENS)
+
+
+def _sha(text) -> str:
+    import hashlib
+    return hashlib.sha1(str(text).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _message_key(m) -> str:
+    """One message as a hash of its role and text (images are not counted:
+    a prompt with images is never stored, see ExactCounts.note)."""
+    if not isinstance(m, dict):
+        return _sha(repr(m))
+    return _sha(f"{m.get('role', '')}\x00{_content_text(m.get('content'))}")
+
+
+def _has_images(messages) -> bool:
+    for m in messages or ():
+        if isinstance(m, dict) and m.get("images"):
+            return True
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, (list, tuple)) and any(
+                isinstance(b, dict) and b.get("type") not in (None, "text")
+                for b in c):
+            return True
+    return False
+
+
+class ExactCounts:
+    """Exact prompt sizes Ollama reported for prompts JARVIS sent.
+
+    ``note(model, system, messages, count)`` after a reply: the whole prompt
+    of (system, messages) was ``count`` tokens. ``note_head(model, head,
+    count)`` after a system-only prompt whose system text is ``head`` (the
+    re-prime's stage-A): any later system prompt that STARTS with ``head``
+    has that many tokens up to the end of it. ``lookup`` / ``head_for`` find
+    the longest known prefix. Bounded (MAX_ENTRIES / MAX_HEADS, newest
+    kept); thread-safe; never raises."""
+
+    MAX_ENTRIES = 8
+    MAX_HEADS = 4
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = []   # [(model, sys_hash, (msg_hash, ...), count)]
+        self._heads = []     # [(model, head_len, head_hash, count)]
+
+    @staticmethod
+    def _sane(estimated, count) -> bool:
+        try:
+            est = float(estimated)
+            got = float(count)
+        except Exception:
+            return False
+        lo, hi = EXACT_SANITY
+        return est > 0 and got > 0 and lo * est <= got <= hi * est
+
+    def note(self, model, system, messages, count) -> bool:
+        try:
+            messages = list(messages or ())
+            if _has_images(messages):
+                return False
+            if not self._sane(estimate_chat_tokens(system, messages), count):
+                return False
+            key = (str(model or ""), _sha(system),
+                   tuple(_message_key(m) for m in messages))
+            with self._lock:
+                self._entries = [e for e in self._entries if e[:3] != key]
+                self._entries.append(key + (int(count),))
+                del self._entries[:-self.MAX_ENTRIES]
+            return True
+        except Exception:
+            return False
+
+    def note_head(self, model, head, count) -> bool:
+        try:
+            if not isinstance(head, str) or not head:
+                return False
+            if not self._sane(estimate_chat_tokens(head, []), count):
+                return False
+            entry = (str(model or ""), len(head), _sha(head), int(count))
+            with self._lock:
+                self._heads = [h for h in self._heads if h[:3] != entry[:3]]
+                self._heads.append(entry)
+                del self._heads[:-self.MAX_HEADS]
+            return True
+        except Exception:
+            return False
+
+    def lookup(self, model, system, messages):
+        """(count, k): the longest stored prompt with this model and system
+        whose messages are the first k of ``messages``; None when none is."""
+        try:
+            sh = _sha(system)
+            keys = tuple(_message_key(m) for m in (messages or ()))
+            best = None
+            with self._lock:
+                entries = list(self._entries)
+            for m, s, msgs, count in entries:
+                if (m != str(model or "") or s != sh or len(msgs) > len(keys)
+                        or keys[:len(msgs)] != msgs):
+                    continue
+                if best is None or len(msgs) > best[1]:
+                    best = (count, len(msgs))
+            return best
+        except Exception:
+            return None
+
+    def head_for(self, model, system):
+        """(head_len, count) of the longest stored head ``system`` starts
+        with (this model); None when none."""
+        try:
+            if not isinstance(system, str):
+                return None
+            with self._lock:
+                heads = list(self._heads)
+            best = None
+            for m, n, h, count in heads:
+                if m != str(model or "") or n > len(system):
+                    continue
+                if (best is None or n > best[0]) and _sha(system[:n]) == h:
+                    best = (n, count)
+            return best
+        except Exception:
+            return None
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries = []
+            self._heads = []
+
+
+# The process-wide record the monolith's local calls feed and read.
+EXACT = ExactCounts()
+
+
+def measure_chat_tokens(system, messages, model="", exact=None) -> int:
+    """Tokens of a whole chat prompt, exact where Ollama already reported a
+    prefix of it (``EXACT``), estimated (estimate_chat_tokens' rules) for the
+    rest. A known prefix's count already includes the chat template's
+    opening and closing tokens, so each further message adds its own
+    MESSAGE_OVERHEAD_TOKENS and text; a known head (a prefix of the system
+    text) adds the estimate of the system text after it. Never raises."""
+    ex = EXACT if exact is None else exact
+    msgs = list(messages or ())
+    try:
+        hit = ex.lookup(model, system, msgs)
+        if hit is not None:
+            count, k = hit
+            total = int(count)
+            for m in msgs[k:]:
+                total += MESSAGE_OVERHEAD_TOKENS
+                if isinstance(m, dict):
+                    total += estimate_tokens(_content_text(m.get("content")))
+            return total
+        head = ex.head_for(model, system)
+        if head is not None:
+            n, count = head
+            total = int(count) + estimate_tokens(system[n:])
+            for m in msgs:
+                total += MESSAGE_OVERHEAD_TOKENS
+                if isinstance(m, dict):
+                    total += estimate_tokens(_content_text(m.get("content")))
+            return total
+    except Exception:
+        pass
+    return estimate_chat_tokens(system, msgs)
 
 
 def _default_attach(messages: list, turn_ctx: str) -> list:
@@ -397,8 +593,19 @@ class ObservedWindow:
         self.limit = 0
         self._at = 0.0
 
-    def note(self, estimated, prompt_eval_count) -> bool:
+    def note(self, estimated, prompt_eval_count, num_ctx=None) -> bool:
+        """``num_ctx``: the window the prompt was sent for. A prompt whose
+        estimate was already over it was cut because it was too big, not
+        because the runner's window is small (2026-10-04: the proactive
+        remark's ~18.4k prompt taught "the window is 8,195" and every local
+        prompt for 15 minutes was budgeted to that), so it teaches nothing."""
         try:
+            if num_ctx is not None:
+                try:
+                    if int(estimated) > int(num_ctx):
+                        return False
+                except Exception:
+                    pass
             if looks_truncated(estimated, prompt_eval_count):
                 with self._lock:
                     self.limit = int(prompt_eval_count)

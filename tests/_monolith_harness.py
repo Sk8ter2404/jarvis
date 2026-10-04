@@ -265,6 +265,10 @@ _MONOLITH_RESTORE_NAMES = (
     "_utterance_in_progress", "_prompt_rebuild_pending",
     "_prompt_rebuild_waiter", "_reprime_running", "_reprime_again",
     "_reprime_prefix_hash",
+    # Brain prefix (2026-10-04): the recorded stable head, the stage-A stamp
+    # and the empty-reply streak. A leaked head would give a LATER test's
+    # re-prime a stage-A; a leaked streak would fail its first empty over.
+    "_system_prompt_head", "_stage_a_primed", "_local_empty_streak",
     # Local background traffic control (2026-09-29, r6): the owner-turn stamp
     # that opens the re-prime-after-eviction window, the prime's age / POST
     # mark (the hit / evicted diagnostic) and learn_from_turn's queue + worker
@@ -538,6 +542,12 @@ def _restore_monolith_pristine(bc) -> None:
     # not make every later tagged call wait out the deferral cap.
     try:
         bc._lt.GATE.reset()
+    except Exception:
+        pass
+    # Exact prompt sizes (core/prompt_budget.EXACT, 2026-10-04): one test's
+    # reply or re-prime count must not size a LATER test's prompt.
+    try:
+        bc._prompt_budget.EXACT.clear()
     except Exception:
         pass
     # Guest mode (core/guest_mode.py, 2026-10-02): one process-wide flag. A

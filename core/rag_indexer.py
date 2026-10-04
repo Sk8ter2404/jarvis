@@ -338,6 +338,49 @@ def _device() -> str:
     return "cpu"
 
 
+# ── brain-eviction guard (2026-10-04) ──────────────────────────────────
+# With OLLAMA_MAX_LOADED_MODELS=1 every embedding request while the voice
+# brain is loaded UNLOADS it: the boot scans of 10-02 15:05:40 (657 chunks)
+# and 10-03 17:35:41 (3,699 chunks) did, and the next brain loads took 54 s
+# and 9 s (Ollama server.log; the brain was gone 9 minutes the second time).
+# Indexing can wait, so it does: the boot scan, the watcher and a manual
+# reindex embed only while core.ollama_opts.eviction_risk says a request for
+# the embed model unloads nothing (it is loaded already, nothing else is, or
+# the server may hold more than one model), and try again RAG_DEFER_RETRY_S
+# later otherwise. A search is the owner's own request and still runs (one
+# line in the log says what it unloads).
+RAG_DEFER_RETRY_S: float = 600.0
+
+
+class EmbedDeferred(RuntimeError):
+    """An embedding was not sent: it would have unloaded another Ollama
+    model (the voice brain). The message says what and why."""
+
+
+def _embed_eviction_reason(model: str, endpoint: str) -> str:
+    """Why a BACKGROUND embedding request for ``model`` must wait right now
+    ('' = it may go): core.ollama_opts.eviction_risk against the server
+    ``endpoint`` points at. Fails closed. Never raises."""
+    try:
+        from core.ollama_opts import eviction_risk
+        base = str(endpoint or "").split("/api/", 1)[0].rstrip("/")
+        return eviction_risk(model, base)
+    except Exception as e:  # pragma: no cover - in-tree import
+        return f"eviction guard unavailable ({type(e).__name__})"
+
+
+# The deferral reason last logged ('' = none since the last embedding that
+# went through), so a deferred scan logs once, not per file.
+_deferral_logged = [""]
+
+
+def _log_deferral(where: str, reason: str) -> None:
+    if _deferral_logged[0] != reason:
+        _deferral_logged[0] = reason
+        print(f"  [rag] {where} deferred: {reason}; retrying in "
+              f"{RAG_DEFER_RETRY_S / 60:.0f} min")
+
+
 class _OllamaEmbedder:
     """Thin wrapper that mimics SentenceTransformer's .encode() interface
     but POSTs to Ollama's /api/embeddings. One request per chunk, but
@@ -346,6 +389,10 @@ class _OllamaEmbedder:
 
     Returns numpy float32 arrays so the rest of the indexer (which
     calls .tolist() before handing embeddings to Chroma) is unchanged.
+
+    Every request first asks _embed_eviction_reason (per request, so a brain
+    loaded mid-file stops the rest of the file) unless ``allow_evict`` - the
+    owner's search - and raises EmbedDeferred instead of sending.
     """
 
     def __init__(self, model: str, endpoint: str,
@@ -355,7 +402,11 @@ class _OllamaEmbedder:
         self.batch_size = max(1, int(batch_size))
         self.timeout = float(timeout)
 
-    def _embed_one(self, text: str) -> list[float]:
+    def _embed_one(self, text: str, allow_evict: bool = False) -> list[float]:
+        if not allow_evict:
+            reason = _embed_eviction_reason(self.model, self.endpoint)
+            if reason:
+                raise EmbedDeferred(reason)
         # One-shot GPU snapshot on first embedding call so VRAM
         # allocation for nomic-embed-text is captured in the log.
         # Safe to call on every request — dedup is inside log_gpu_state.
@@ -394,6 +445,7 @@ class _OllamaEmbedder:
                convert_to_numpy: bool = True,
                show_progress_bar: bool = False,
                normalize_embeddings: bool = False,
+               allow_evict: bool = False,
                **_ignored):
         import numpy as np
         if isinstance(texts, str):
@@ -404,12 +456,13 @@ class _OllamaEmbedder:
 
         n_workers = batch_size if batch_size else self.batch_size
         n_workers = max(1, min(n_workers, len(texts)))
+        one = functools.partial(self._embed_one, allow_evict=allow_evict)
 
         if n_workers == 1 or len(texts) == 1:
-            vecs = [self._embed_one(t) for t in texts]
+            vecs = [one(t) for t in texts]
         else:
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                vecs = list(pool.map(self._embed_one, texts))
+                vecs = list(pool.map(one, texts))
 
         if normalize_embeddings:
             vecs = [self._normalise(v) for v in vecs]
@@ -672,6 +725,10 @@ def _index_file(path: str) -> int:
             chunks, batch_size=RAG_EMBED_BATCH, convert_to_numpy=True,
             show_progress_bar=False, normalize_embeddings=True,
         )
+    except EmbedDeferred:
+        # Not an error: the caller re-tries the file later (nothing written,
+        # the old chunks stay searchable).
+        raise
     except (urllib.error.URLError, urllib.error.HTTPError,
             ConnectionError, TimeoutError) as e:
         with _lock:
@@ -714,6 +771,7 @@ def _index_file(path: str) -> int:
     with _lock:
         _stats["chunks_written"] += len(chunks)
         _stats["files_indexed"] += 1
+    _deferral_logged[0] = ""
     return len(chunks)
 
 
@@ -758,6 +816,7 @@ def index_once(progress: Optional[Callable[[str, int], None]] = None,
 
     seen_files: set[str] = set()
     files_seen_count = 0
+    deferred = ""
     for root in RAG_INDEX_PATHS:
         if not os.path.isdir(root):
             continue
@@ -767,6 +826,13 @@ def index_once(progress: Optional[Callable[[str, int], None]] = None,
             seen_files.add(_file_id(path))
             try:
                 _index_file(path)
+            except EmbedDeferred as e:
+                # Embedding now would unload the voice brain: stop the walk
+                # (the next file would wait for the same reason) and leave
+                # the rest for the retry. Unchanged files never reach the
+                # embedder, so the walk only stops at real work.
+                deferred = str(e)
+                break
             except Exception as e:
                 with _lock:
                     _stats["errors"] += 1
@@ -778,8 +844,26 @@ def index_once(progress: Optional[Callable[[str, int], None]] = None,
                     progress(path, files_seen_count)
                 except Exception:
                     pass
-        if _stop_flag.is_set():
+        if _stop_flag.is_set() or deferred:
             break
+
+    if deferred:
+        # An unfinished walk must not garbage-collect: every file it never
+        # reached would look deleted. The daemon's drain loop runs the scan
+        # again later (a manual reindex included).
+        _scan_retry_at[0] = time.time() + RAG_DEFER_RETRY_S
+        _log_deferral("index scan", deferred)
+        with _lock:
+            return {
+                "ok": True,
+                "deferred": deferred,
+                "files_seen": files_seen_count,
+                "files_indexed_total": _stats["files_indexed"],
+                "chunks_written_total": _stats["chunks_written"],
+                "errors": _stats["errors"],
+                "excluded_dropped": 0,
+                "ts": _last_full_scan_ts,
+            }
 
     # Garbage-collect: drop chunks whose file no longer exists on disk, AND
     # chunks of a file that now matches RAG_EXCLUDE_GLOBS. The second half is
@@ -813,6 +897,7 @@ def index_once(progress: Optional[Callable[[str, int], None]] = None,
     except Exception:
         excluded_dropped = 0
 
+    _scan_retry_at[0] = 0.0
     with _lock:
         _last_full_scan_ts = time.time()
         return {
@@ -827,15 +912,31 @@ def index_once(progress: Optional[Callable[[str, int], None]] = None,
 
 
 # ── watchdog daemon ──────────────────────────────────────────────────
+# time.time() when a deferred full scan is due again (0.0 = none pending).
+_scan_retry_at = [0.0]
+
+
+def _run_scan(label: str) -> dict:
+    """One index_once() for the daemon. A deferred scan (see EmbedDeferred)
+    has already scheduled its retry (_scan_retry_at, run by the drain loop)
+    and logged why; a finished one prints its summary."""
+    summary = index_once()
+    if not (isinstance(summary, dict) and summary.get("deferred")):
+        print(f"  [rag] {label}: {summary}")
+    return summary
+
+
 def _drain_event_queue() -> None:
     """Single-threaded reindex worker — drains _event_q. Coalesces
     multiple events for the same path within a short window into one
-    re-index call (debounce ~2 s)."""
+    re-index call (debounce ~2 s). A path whose embedding was deferred
+    (EmbedDeferred) waits RAG_DEFER_RETRY_S and is tried again; a deferred
+    full scan is re-run here when it is due."""
     pending: dict[str, float] = {}
     while not _stop_flag.is_set():
         try:
             path = _event_q.get(timeout=0.1)
-            pending[path] = time.time() + 2.0
+            pending[path] = max(pending.get(path, 0.0), time.time() + 2.0)
         except queue.Empty:
             pass
 
@@ -851,11 +952,20 @@ def _drain_event_queue() -> None:
                 continue
             try:
                 _index_file(p)
+            except EmbedDeferred as e:
+                pending[p] = now + RAG_DEFER_RETRY_S
+                _log_deferral("re-index", str(e))
             except Exception as e:
                 global _last_error
                 with _lock:
                     _stats["errors"] += 1
                     _last_error = f"reindex({p}): {e}"
+        if _scan_retry_at[0] and now >= _scan_retry_at[0] and not ready:
+            try:
+                _run_scan("rescan after deferral")
+            except Exception as e:
+                _scan_retry_at[0] = now + RAG_DEFER_RETRY_S
+                print(f"  [rag] rescan failed: {e}")
 
 
 def _start_watchdog() -> bool:
@@ -933,8 +1043,7 @@ def start(initial_scan: bool = True) -> bool:
     def _bg():
         if initial_scan:
             try:
-                summary = index_once()
-                print(f"  [rag] initial scan: {summary}")
+                _run_scan("initial scan")
             except Exception as e:
                 global _last_error
                 _last_error = f"initial scan: {e}"
@@ -982,10 +1091,13 @@ def search(query: str, k: int = 5, candidates: int = 25,
     except Exception as e:
         print(f"  [rag] search init failed: {e}")
         return []
+    # The owner asked for this search: it runs even when the embedding
+    # unloads the voice brain (the background indexer waits instead); the
+    # next brain call reloads it (its load_ms shows on [turn-timing]).
     try:
         qvec = embedder.encode(
             [query], convert_to_numpy=True, normalize_embeddings=True,
-            show_progress_bar=False,
+            show_progress_bar=False, allow_evict=True,
         )[0]
     except Exception as e:
         print(f"  [rag] embed-query failed ({e}); Ollama unreachable?")

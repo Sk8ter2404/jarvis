@@ -121,14 +121,16 @@ class EstimatorCalibrationTests(unittest.TestCase):
 class BudgetForTests(unittest.TestCase):
     def test_reserves_the_reply(self):
         # A voice reply's room, not its whole cap (review 2026-10-02).
-        self.assertEqual(pb.budget_for(16384, 500), 16184)
-        self.assertEqual(pb.budget_for(12288, 400), 12088)
-        self.assertEqual(pb.budget_for(16384, 50), 16334)
+        # ...and SAFETY_MARGIN_TOKENS (128) kept free (2026-10-04).
+        self.assertEqual(pb.budget_for(16384, 500), 16056)
+        self.assertEqual(pb.budget_for(12288, 400), 11960)
+        self.assertEqual(pb.budget_for(16384, 50), 16206)
 
     def test_junk_never_yields_a_tiny_budget(self):
         self.assertEqual(pb.budget_for(None, 500), pb.MIN_BUDGET_TOKENS)
         self.assertEqual(pb.budget_for(1100, 4000), pb.MIN_BUDGET_TOKENS)
-        self.assertEqual(pb.budget_for(16384, "x"), 16384)
+        self.assertEqual(pb.budget_for(16384, "x"),
+                         16384 - pb.SAFETY_MARGIN_TOKENS)
 
 
 class FitWithinBudgetTests(unittest.TestCase):
@@ -296,7 +298,7 @@ class FitOversizedTests(unittest.TestCase):
         fit = self._fit(msgs, parts)
         note = pb.describe(fit, "turn", num_ctx=16384)
         self.assertTrue(note.startswith("[prompt-budget] turn: ~"))
-        self.assertIn("budget 16,184 (num_ctx 16384)", note)
+        self.assertIn("budget 16,056 (num_ctx 16384)", note)
         self.assertIn("oldest history msg(s)", note)
         self.assertIn("phrase rotation", note)
         self.assertIn("more]", note)
@@ -354,8 +356,9 @@ class ReviewTrimOrderTests(unittest.TestCase):
         # Voice replies run ~15-60 tokens; reserving the full 500 trimmed
         # turns Ollama would never have cut (15.2k-16.4k real tokens).
         self.assertEqual(pb.budget_for(16384, 500),
-                         16384 - pb.REPLY_RESERVE_TOKENS)
-        self.assertEqual(pb.budget_for(16384, 100), 16284)
+                         16384 - pb.REPLY_RESERVE_TOKENS
+                         - pb.SAFETY_MARGIN_TOKENS)
+        self.assertEqual(pb.budget_for(16384, 100), 16156)
         self.assertLessEqual(pb.REPLY_RESERVE_TOKENS, 256)
 
 

@@ -1331,9 +1331,14 @@ class LocalLlmEmptyFailoverTests(MonolithGlobalsTestCase):
     def setUp(self):
         self._saved_cache = list(self.bc._RESOLVED_LOCAL_LLM_MODEL)
         self.bc._RESOLVED_LOCAL_LLM_MODEL[0] = None
+        # One empty reply already happened: the failover needs two in a row
+        # (2026-10-04, see EmptyFailoverNeedsTwoInARowTests).
+        self._saved_streak = list(self.bc._local_empty_streak)
+        self.bc._local_empty_streak[0] = 1
 
     def tearDown(self):
         self.bc._RESOLVED_LOCAL_LLM_MODEL[:] = self._saved_cache
+        self.bc._local_empty_streak[:] = self._saved_streak
 
     def _post_side_effect(self, empty_models, good_text="Hello sir."):
         """requests.post stub: models in `empty_models` reply 200-empty,

@@ -236,7 +236,9 @@ class TurnTimingTests(unittest.TestCase):
         # 2026-10-02: a turn the local prompt budget trimmed is marked, so its
         # prompt_eval_count never enters the chars-per-token calibration as
         # an untrimmed one; '-' when no budget ran (a cloud turn).
-        self.assertEqual(tt.STAT_FIELDS[-1], "budget_trimmed")
+        # The brain-prefix fields (2026-10-04) follow it.
+        self.assertEqual(tt.STAT_FIELDS[-1 - len(tt.BRAIN_FIELDS)],
+                         "budget_trimmed")
         self.assertEqual(tt.parse_line(self._full_turn())["budget_trimmed"],
                          "-")
         t = self.t
@@ -515,7 +517,9 @@ class R1SchemaTests(unittest.TestCase):
         j = f.index("lead_dropped")
         self.assertEqual(f[i + 1:j], list(tt.NOTE_FIELDS))
         # The prompt budget's budget_trimmed (v2.0.167) follows lead_dropped.
-        self.assertEqual(f[j:], ["lead_dropped", "budget_trimmed"])
+        # ...and the brain-prefix fields (2026-10-04) after that.
+        self.assertEqual(f[j:], ["lead_dropped", "budget_trimmed",
+                                 "pe_new", "pe_state", "reprime"])
         self.assertEqual(tt.NOTE_FIELDS, (
             "tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms", "stt_engine",
             "load_ms", "total_ms", "play_open_ms", "out_lat_ms",
