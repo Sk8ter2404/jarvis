@@ -169,10 +169,15 @@ class ObservedWindowOverBudgetTests(unittest.TestCase):
         self.assertEqual(w.limit, 0)
         self.assertEqual(w.effective(16384), 16384)
 
-    def test_a_prompt_that_should_have_fit_still_teaches_the_window(self):
+    def test_a_prompt_that_should_have_fit_teaches_only_a_real_cut(self):
+        # Review 2026-10-04: 8,195 is Ollama halving a prompt that was over
+        # the 16,384 window (the estimate was low), never a smaller window;
+        # a cut at another count is still learned.
         w = pb.ObservedWindow(clock=lambda: 0.0)
-        self.assertTrue(w.note(15800, 8195, num_ctx=16384))
-        self.assertEqual(w.effective(16384), 8195)
+        self.assertFalse(w.note(15800, 8195, num_ctx=16384))
+        self.assertEqual(w.effective(16384), 16384)
+        self.assertTrue(w.note(15800, 4098, num_ctx=16384))
+        self.assertEqual(w.effective(16384), 4098)
 
     def test_callers_that_pass_no_window_keep_the_old_behaviour(self):
         w = pb.ObservedWindow(clock=lambda: 0.0)

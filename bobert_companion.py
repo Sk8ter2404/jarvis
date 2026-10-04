@@ -2141,13 +2141,16 @@ class _BudgetedMessages(list):
     Also carries what the fit did: ``fits``, ``trimmed``, ``ctx_chars`` (the
     per-turn context actually attached, for the turn-timing line) and
     ``dropped_head`` (the history messages it dropped, oldest first, for
-    _persist_budget_history_trim)."""
+    _persist_budget_history_trim) and ``note`` (the ``[prompt-budget]`` line
+    for a trimmed or still-over fit, '' otherwise - printed unless the
+    caller passed log=False)."""
     num_ctx = 0
     window = 0
     fits = True
     trimmed = False
     ctx_chars = 0
     dropped_head = ()
+    note = ""
 
 
 def _local_budget_tag() -> str:
@@ -2230,13 +2233,16 @@ def _fit_local_messages(system: str, messages: list, parts=(), *,
                                       measure=_measure,
                                       attach=_with_turn_context,
                                       pin_last_user=pin_last_user)
-        if log and (fit.trimmed or not fit.fits):
+        note = ""
+        if fit.trimmed or not fit.fits:
             note = _prompt_budget.describe(fit, where, num_ctx=window)
             if window < num_ctx:
                 note += (f" [window {window:,}: observed, not the "
                          f"{num_ctx:,} configured]")
-            print("  " + note)
+            if log:
+                print("  " + note)
         out = _BudgetedMessages(fit.messages)
+        out.note = note
         out.num_ctx = num_ctx
         out.window = window
         out.fits = fit.fits
@@ -2283,27 +2289,41 @@ def _note_prompt_window(sys_prompt: str, messages: list, stats,
                         model_tag: str = "") -> bool:
     """After a local reply: compare Ollama's prompt_eval_count with the
     estimate of what was sent. Far under it (prompt_budget.looks_truncated)
-    means Ollama cut the prompt despite the budget - its runner's window is
-    smaller than num_ctx (the 10-01 incident read limit=8195). Logs one loud
-    ``[prompt-budget] TRUNCATED`` line and the observed window then budgets
-    the next prompts (OBSERVED_WINDOW). Never raises."""
+    means Ollama cut the prompt despite the budget, and logs one loud
+    ``[prompt-budget] TRUNCATED`` line. A cut to about half of num_ctx
+    (the 10-01 incident's 8,195) or of a prompt estimated over num_ctx was a
+    prompt too big for the configured window - nothing is learned; any other
+    cut means the runner's window is smaller than num_ctx, and the observed
+    window then budgets the next prompts (OBSERVED_WINDOW). An honest count
+    is recorded as the prompt's exact size (EXACT). Returns True only when a
+    window was learned. Never raises."""
     try:
         pe = (stats or {}).get("prompt_eval_count")
         if pe is None:
             return False
         est = _prompt_budget.measure_chat_tokens(sys_prompt, messages,
                                                  model=model_tag)
-        # A prompt estimated over the configured window was cut because it
-        # was too big (the budget already said CANNOT FIT); it says nothing
-        # about the runner's window (2026-10-04), so it is not learned.
-        cfg_ctx = _local_num_ctx(model_tag) if model_tag else None
-        if not _prompt_budget.OBSERVED_WINDOW.note(est, pe, num_ctx=cfg_ctx):
+        if not _prompt_budget.looks_truncated(est, pe):
             # An honest count is the prompt's exact size: later prompts that
-            # share this prefix are measured, not estimated.
-            if not _prompt_budget.looks_truncated(est, pe):
-                _prompt_budget.EXACT.note(model_tag, sys_prompt, messages, pe)
+            # share this prefix are measured, not estimated. (note() also
+            # clears a stale observed limit a whole bigger prompt disproves.)
+            _prompt_budget.OBSERVED_WINDOW.note(est, pe)
+            _prompt_budget.EXACT.note(model_tag, sys_prompt, messages, pe)
             return False
         ctx = _local_num_ctx(model_tag) if model_tag else 0
+        # A prompt estimated over the configured window, or cut to about
+        # half of it (prompt_budget.halved_window: Ollama's own cut), was
+        # too big for a runner that HAD the configured window; it teaches
+        # the observed window nothing (2026-10-04) - but it is still a cut
+        # prompt that lost the start of its system prompt, so say so.
+        if not _prompt_budget.OBSERVED_WINDOW.note(est, pe,
+                                                   num_ctx=ctx or None):
+            print(f"  [prompt-budget] TRUNCATED: Ollama evaluated "
+                  f"{int(pe):,} prompt tokens of an estimated ~{est:,} "
+                  f"(num_ctx {ctx}) - the prompt was over the window, so "
+                  f"Ollama kept its first few tokens and its newest half "
+                  f"only; no smaller window learned")
+            return False
         print(f"  [prompt-budget] TRUNCATED: Ollama evaluated {int(pe):,} "
               f"prompt tokens of an estimated ~{est:,} (num_ctx {ctx}) - "
               f"its runner's window is smaller than configured; the next "
@@ -21043,25 +21063,31 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
         _raw = messages
         messages = _fit_local_messages(system, _raw, (),
                                        max_tokens=max_tokens, where="call",
-                                       model_tag=model)
+                                       model_tag=model, log=False)
         # The system prompt is never trimmed - so when it cannot fit at all
         # (a caller that passed the full prompt: its PC_CONTROL_PROMPT
         # becomes the ~4k-token-bigger local cheatsheet, ~18.4k estimated in
         # all; live 10-02 14:59 and 10-04 13:07, a proactive remark) the
         # compact cache-stable layout the turn path uses goes instead, rather
-        # than letting Ollama cut the START of the prompt (2026-10-04).
+        # than letting Ollama cut the START of the prompt (2026-10-04). Only
+        # the fit actually sent is described (its CANNOT FIT line used to
+        # print first, saying "sent as is" about a prompt that was not).
+        _compact = None
         if not getattr(messages, "fits", True):
             _compact = _local_stable_system_prompt(system)
-            if _compact and _compact != system:
-                _refit = _fit_local_messages(_compact, _raw, (),
-                                             max_tokens=max_tokens,
-                                             where="call", model_tag=model,
-                                             log=False)
-                print("  [prompt-budget] call: the system prompt alone is "
-                      "over the window - sent in the compact local layout "
-                      + ("(fits)" if getattr(_refit, "fits", True)
-                         else "(still over)"))
-                system, messages = _compact, _refit
+            if not _compact or _compact == system:
+                _compact = None
+        if _compact is not None:
+            _refit = _fit_local_messages(_compact, _raw, (),
+                                         max_tokens=max_tokens,
+                                         where="call", model_tag=model)
+            print("  [prompt-budget] call: the system prompt alone is "
+                  "over the window - sent in the compact local layout "
+                  + ("(fits)" if getattr(_refit, "fits", True)
+                     else "(still over)"))
+            system, messages = _compact, _refit
+        elif getattr(messages, "note", ""):
+            print("  " + messages.note)
     sys_prompt, messages = _local_chat_prompt(system, messages)
     # The last _generate's Ollama counters (prompt_eval / eval), for the
     # served-via line below. All-None until a response arrives.
@@ -21151,7 +21177,7 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             if kind == "ok":
                 print(f"  [local-llm] served via {model} "
                       f"{_served_via_suffix(_gen_stats[0])}")
-                _note_brain_response(_gen_stats[0], model)
+                _note_brain_response(_gen_stats[0], model, sys_prompt)
                 _note_prompt_window(sys_prompt, messages, _gen_stats[0],
                                     model)
                 _note_turn_brain("local", model)
@@ -23377,10 +23403,18 @@ def _build_stage_a_payload(full_payload: dict | None) -> dict | None:
         return None
 
 
-def _note_brain_response(stats, model_tag: str = "") -> None:
+def _note_brain_response(stats, model_tag: str = "",
+                         sys_prompt: str | None = None) -> None:
     """After a local-brain response: a (re)load (load_ms >=
     _BRAIN_RELOAD_MS) emptied the server's prompt cache, so the next re-prime
-    must post stage-A again. Never raises."""
+    must post stage-A again. With ``sys_prompt`` (a reply through
+    _call_local_llm, review 2026-10-04): a prompt that carries the live
+    stable head (_local_prompt_head) yet was re-read WHOLE had no checkpoint
+    at the head to resume from - the brain was reloaded by a path that never
+    reports here (vision, game mode's keep-warm, the orchestrator, another
+    client) - so stage-A runs again too. The re-prime itself passes no
+    ``sys_prompt``: its own full read right after a stage-A must not loop
+    stage-A. Never raises."""
     try:
         load = (stats or {}).get("load_ms")
         if load is not None and int(load) >= _BRAIN_RELOAD_MS:
@@ -23388,6 +23422,18 @@ def _note_brain_response(stats, model_tag: str = "") -> None:
                 print(f"  [reprime] the brain was (re)loaded ({int(load)} ms) "
                       f"- stage-A will run again")
             _stage_a_primed[0] = ""
+            return
+        if sys_prompt is None or not _stage_a_primed[0]:
+            return
+        _new, state = _tt_mod.prefill_estimate(
+            (stats or {}).get("prompt_eval_count"),
+            (stats or {}).get("prompt_eval_ms"))
+        if state != "full" or not _local_prompt_head(sys_prompt):
+            return
+        print(f"  [reprime] this call re-read its whole prompt "
+              f"(new≈{_new}) - no checkpoint at the stable head; stage-A "
+              f"will run again")
+        _stage_a_primed[0] = ""
     except Exception:
         pass
 
@@ -23429,9 +23475,11 @@ def _prefill_note(stats) -> str:
         return ""
 
 
-def _reprime_skip_reason() -> str | None:
+def _reprime_skip_reason(quiet: bool = False) -> str | None:
     """Why an idle re-prime must not run right now (None = go). Deliberately
-    NOT gated on _record_speech_active — see _utterance_in_progress."""
+    NOT gated on _record_speech_active — see _utterance_in_progress.
+    ``quiet``: the re-check after stage-A, which must not print the "capture
+    is music" note a second time."""
     if not LOCAL_PREFIX_REPRIME:
         return "disabled"
     if not LOCAL_LLM_FALLBACK:
@@ -23447,8 +23495,9 @@ def _reprime_skip_reason() -> str | None:
         # his turn queues behind the ~2.5 s prime and then finds it warm.
         if not _capture_is_sustained_music():
             return "utterance"
-        print(f"  [reprime] capture is music ({_music_capture_streak[0]} "
-              f"captures over PC audio) - not waiting for it")
+        if not quiet:
+            print(f"  [reprime] capture is music ({_music_capture_streak[0]} "
+                  f"captures over PC audio) - not waiting for it")
     # VOICE_MODE='realtime' (experimental, off by default) captures on the
     # streaming STT pipeline's own thread and never goes through
     # record_speech, so _utterance_in_progress cannot see the owner
@@ -23513,7 +23562,7 @@ def _reprime_once() -> str:
                 pass
             print(f"  [reprime] stage-A {ms_a} pe={pe_a}{_prefill_note(st_a)}")
         # The owner may have started talking during it: same gates again.
-        reason = _reprime_skip_reason()
+        reason = _reprime_skip_reason(quiet=True)
         if reason:
             print(f"  [reprime] skip {reason}")
             return reason

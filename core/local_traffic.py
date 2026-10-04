@@ -359,6 +359,13 @@ class BackgroundGate:
             self._holder = None
             self._depth = 0
 
+    def defer_reason(self):
+        """Why a background job would wait right now: the configured
+        predicate's reason ('conversation', 'turn', 'utterance'), or None.
+        For background work that does not go through acquire() (the RAG
+        indexer's embeddings, 2026-10-04). Never raises (None)."""
+        return self._reason()
+
     def busy(self) -> bool:
         with self._cond:
             self._drop_dead_holder()

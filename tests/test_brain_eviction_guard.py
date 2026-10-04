@@ -10,9 +10,10 @@ for 9 minutes the second time (Ollama server.log). What these pin:
 
   * core.ollama_opts.eviction_risk says when a request would unload a
     loaded model (and treats "could not tell" as a reason to wait);
-  * the RAG embedder sends NO request while it would, and the boot scan, a
-    manual reindex and the folder watcher wait and retry instead (the
-    owner's own search still runs);
+  * the RAG embedder sends NO request while it would, and the boot scan and
+    the folder watcher wait and retry instead (the owner's own search still
+    runs, and - review 2026-10-04, tests/test_brain_prefix_review.py - so
+    does his "reindex my files");
   * core/orchestrator's Ollama call keeps the brain's keep_alive instead of
     resetting its residency to Ollama's 5-minute default.
 
@@ -109,12 +110,24 @@ class EvictionRiskTests(unittest.TestCase):
         self.assertIn("could not read", self._risk("nomic-embed-text", None))
         self.assertEqual(oo.eviction_risk("", "http://x"), "no model named")
 
-    def test_the_cap_defaults_to_the_process_env(self):
+    def test_the_cap_defaults_to_the_process_env_and_the_server(self):
+        # Review 2026-10-04: the server's own cap counts too (its log's
+        # "server config" line) - 2 here and 2 there co-loads; 2 here with
+        # the server's unknown fails closed (see test_brain_prefix_review).
         with mock.patch.dict(os.environ, {oo.MAX_LOADED_ENV: "2"}), \
+                mock.patch.object(oo, "server_max_loaded_models",
+                                  return_value=2), \
                 mock.patch.object(urllib.request, "urlopen",
                                   _ollama(["gemma4:26b-a4b-it-qat"])):
             self.assertEqual(oo.eviction_risk("nomic-embed-text",
                                               "http://h", timeout_s=1), "")
+        with mock.patch.dict(os.environ, {oo.MAX_LOADED_ENV: "2"}), \
+                mock.patch.object(oo, "server_max_loaded_models",
+                                  return_value=None), \
+                mock.patch.object(urllib.request, "urlopen",
+                                  _ollama(["gemma4:26b-a4b-it-qat"])):
+            self.assertIn("would unload", oo.eviction_risk(
+                "nomic-embed-text", "http://h", timeout_s=1))
 
 
 class EmbedderWaitsTests(_RagBase):

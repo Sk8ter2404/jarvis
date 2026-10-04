@@ -178,20 +178,33 @@ def search_my_files(query: str, k: int = RAG_DEFAULT_K) -> str:
 
 
 def rag_reindex(_: str = "") -> str:
-    """Trigger a one-shot full scan on a worker thread."""
+    """Trigger a one-shot full scan on a worker thread - an OWNER scan
+    (core.rag_indexer.index_once(owner=True)): it embeds even while the
+    voice brain is loaded, unloading it if a file changed, instead of
+    waiting for the brain to unload - with the brain kept loaded, a waiting
+    reindex never ran while this reply said it was running (review
+    2026-10-04). The reply says when the brain will have to reload."""
     rag = _rag()
     if rag is None or not rag.is_available():
         return "Personal RAG is offline, sir."
+    try:
+        unloads = bool(rag.embed_would_unload())
+    except Exception:
+        unloads = False
 
     def _bg():
         try:
-            summary = rag.index_once()
+            summary = rag.index_once(owner=True)
             print(f"  [personal-rag] reindex summary: {summary}")
         except Exception as e:
             print(f"  [personal-rag] reindex failed: {e}")
 
     threading.Thread(target=_bg, name="rag-manual-reindex",
                      daemon=True).start()
+    if unloads:
+        return ("Reindexing your files in the background, sir. If any have "
+                "changed, my local model steps aside while they're read, so "
+                "my next answer may take a few seconds longer.")
     return "Reindexing your files in the background, sir."
 
 
@@ -209,9 +222,19 @@ def rag_status(_: str = "") -> str:
                 if last else "never")
     state = "running" if s.get("running") else "idle"
     wd = "on" if s.get("watchdog_active") else "off"
-    return (f"Personal RAG {state} — {chunks} chunks indexed, "
+    line = (f"Personal RAG {state} — {chunks} chunks indexed, "
             f"watchdog {wd}, last full scan {last_str}, "
             f"{s.get('errors', 0)} errors.")
+    # Indexing that is waiting so it won't unload the voice brain is not
+    # "idle" (review 2026-10-04): say so, and how to run it now.
+    if s.get("deferred"):
+        retry = s.get("retry_at") or 0
+        when = (f" (next try {time.strftime('%H:%M', time.localtime(retry))})"
+                if retry else "")
+        line += (f" New or changed files are waiting{when}, so indexing "
+                 f"them won't unload my local model. Say \"reindex my "
+                 f"files\" to do it now.")
+    return line
 
 
 def rag_configure(arg: str = "") -> str:

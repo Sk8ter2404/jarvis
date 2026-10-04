@@ -191,15 +191,28 @@ def resident_models(base_url: str = "http://127.0.0.1:11434",
 # RAG boot scan's nomic-embed-text requests unloaded the voice brain, and the
 # next brain loads took 54 s and 9 s (Ollama server.log). A caller whose work
 # can wait asks eviction_risk() first and waits when it says no.
+#
+# Review 2026-10-04: the cap the guard trusts is the RUNNING SERVER's, not
+# this process's environment. The server reads OLLAMA_MAX_LOADED_MODELS once,
+# at its own start, and logs it ('msg="server config" env="map[...
+# OLLAMA_MAX_LOADED_MODELS:1 ...]"'); a value changed in the User
+# environment reaches JARVIS at its next launch but the server only at ITS
+# next restart. Trusting this process alone failed OPEN: set it to 2, restart
+# only JARVIS, and the boot scan unloaded the brain exactly as before. So the
+# cap is min(this process's value, the server's logged value), and 1 when the
+# server's cannot be read (fail closed: indexing waits, the brain stays). One
+# more case the log cannot show: a server that may hold 2 models still
+# unloads one when the new one does not fit in VRAM - the first co-load that
+# does unload something (note_coload) pins the cap to 1 for the process.
 MAX_LOADED_ENV = "OLLAMA_MAX_LOADED_MODELS"
 
 
 def max_loaded_models(environ=None) -> int:
-    """How many models the Ollama server holds at once, as JARVIS runs it:
-    OLLAMA_MAX_LOADED_MODELS from this process's environment (the value
-    JARVIS persists to the User environment, which the server reads at its
-    own start), else 1. A blank, zero, negative or non-integer value reads
-    as 1 - the evicting behaviour JARVIS enforces. Never raises."""
+    """OLLAMA_MAX_LOADED_MODELS from this process's environment (the value
+    JARVIS persists to the User environment), else 1. A blank, zero,
+    negative or non-integer value reads as 1 - the evicting behaviour JARVIS
+    enforces. What the guard trusts is effective_max_loaded(). Never
+    raises."""
     import os as _os
     env = _os.environ if environ is None else environ
     try:
@@ -209,21 +222,135 @@ def max_loaded_models(environ=None) -> int:
     return n if n >= 1 else 1
 
 
+_SERVER_CONFIG_MARK = b'msg="server config"'
+_SERVER_CAP_RE = re.compile(rb"OLLAMA_MAX_LOADED_MODELS:(\d+)")
+# Incremental read of the server log: {path: (bytes scanned, last value)}.
+_server_log_scan: dict = {}
+# True once a co-load unloaded a model anyway (note_coload).
+_coload_evicted = [False]
+
+
+def ollama_server_log(environ=None) -> "str | None":
+    """Where the local Ollama server writes its log: %LOCALAPPDATA%/Ollama/
+    server.log on Windows, ~/.ollama/logs/server.log elsewhere; None when
+    neither exists. Never raises."""
+    import os as _os
+    env = _os.environ if environ is None else environ
+    try:
+        cands = []
+        if env.get("LOCALAPPDATA"):
+            cands.append(_os.path.join(env["LOCALAPPDATA"], "Ollama",
+                                       "server.log"))
+        cands.append(_os.path.join(_os.path.expanduser("~"), ".ollama",
+                                   "logs", "server.log"))
+        for c in cands:
+            if _os.path.isfile(c):
+                return c
+    except Exception:
+        pass
+    return None
+
+
+def server_max_loaded_models(base_url: str = "http://127.0.0.1:11434",
+                             log_path: "str | None" = None) -> "int | None":
+    """OLLAMA_MAX_LOADED_MODELS as the RUNNING local server read it: the last
+    "server config" line of its log (``log_path``, default
+    ollama_server_log()). Read incrementally - only bytes appended since the
+    last call (from 0 again when the log shrank: a new log). None for a
+    remote ``base_url``, a missing log, no such line, or a blank / zero value
+    (the server's own default). Never raises."""
+    import os as _os
+    try:
+        if endpoint_is_remote(base_url):
+            return None
+        path = log_path or ollama_server_log()
+        if not path:
+            return None
+        size = _os.path.getsize(path)
+        done, value = _server_log_scan.get(path, (0, None))
+        if size < done:
+            done, value = 0, None
+        if size > done:
+            with open(path, "rb") as fh:
+                fh.seek(done)
+                chunk = fh.read(size - done)
+            cut = chunk.rfind(b"\n")
+            if cut >= 0:
+                for line in chunk[:cut].split(b"\n"):
+                    if _SERVER_CONFIG_MARK in line:
+                        m = _SERVER_CAP_RE.search(line)
+                        value = int(m.group(1)) if m else None
+                done += cut + 1
+            _server_log_scan[path] = (done, value)
+        return value if value and value >= 1 else None
+    except Exception:
+        return None
+
+
+def effective_max_loaded(base_url: str = "http://127.0.0.1:11434",
+                         environ=None, log_path: "str | None" = None) -> int:
+    """How many models the guard may assume the server holds at once: 1 when
+    this process's value is 1 (no log read) or a co-load already unloaded
+    something (note_coload), else min(this process's value, the running
+    server's logged one), and 1 when the server's is unknown. Never
+    raises."""
+    try:
+        own = max_loaded_models(environ)
+        if own <= 1 or _coload_evicted[0]:
+            return 1
+        srv = server_max_loaded_models(base_url, log_path)
+        return min(own, srv) if srv else 1
+    except Exception:
+        return 1
+
+
+def note_coload(before, after, model: str = "") -> bool:
+    """After a request that co-loaded ``model`` next to the models ``before``
+    (a /api/ps list): True, and the guard's cap is 1 from now on, when any
+    of them is missing from ``after`` - the server unloaded it anyway (its
+    VRAM, or a cap the log did not show). ``after`` None (unreadable) proves
+    nothing. Never raises."""
+    try:
+        if after is None:
+            return False
+        gone = [n for n in (before or ())
+                if not any(same_tag(a, n) for a in after)]
+        if not gone:
+            return False
+        if not _coload_evicted[0]:
+            print(f"  [ollama-guard] loading {model or 'a model'} unloaded "
+                  f"{', '.join(gone)} although the server may hold more "
+                  f"than one model - treating it as one from now on")
+        _coload_evicted[0] = True
+        return True
+    except Exception:
+        return False
+
+
 def eviction_risk(model: str, base_url: str = "http://127.0.0.1:11434",
                   timeout_s: "float | None" = None, *,
-                  max_loaded: "int | None" = None) -> str:
+                  max_loaded: "int | None" = None,
+                  resident: "list | None" = None) -> str:
     """'' when a request naming ``model`` cannot unload another model: it is
     already loaded (exact tag, see same_tag), or fewer than ``max_loaded``
-    (default max_loaded_models()) models are loaded. Otherwise a short reason
-    naming what it would unload. When /api/ps cannot be read the answer is a
-    reason too: a caller that can wait must not gamble a ~15 GB brain reload
-    on an unknown. Loads nothing. Never raises."""
+    (default effective_max_loaded()) models are loaded. Otherwise a short
+    reason naming what it would unload. When /api/ps cannot be read the
+    answer is a reason too: a caller that can wait must not gamble a ~15 GB
+    brain reload on an unknown. ``resident``: the /api/ps list the caller
+    already read (no second GET). Loads nothing. Never raises."""
     tag = (model or "").strip()
     if not tag:
         return "no model named"
-    cap = max_loaded_models() if max_loaded is None else max(1, int(max_loaded))
-    t = probe_timeout(base_url) if timeout_s is None else timeout_s
-    names = resident_models(base_url, t)
+    try:
+        cap = (effective_max_loaded(base_url) if max_loaded is None
+               else max(1, int(max_loaded)))
+    except Exception:
+        cap = 1
+    if resident is None:
+        t = probe_timeout(base_url) if timeout_s is None else timeout_s
+        names = resident_models(base_url, t)
+    else:
+        names = list(resident)
     if names is None:
         return f"could not read {str(base_url).rstrip('/')}/api/ps"
     if any(same_tag(n, tag) for n in names):

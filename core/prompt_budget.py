@@ -100,6 +100,25 @@ prompt, or a server that reports only the uncached part) is never stored.
 room, so system prompt + turn context + reply stay inside the real window
 with a margin. The system prompt is still never trimmed.
 
+DENSE TEXT (review 2026-10-04)
+==============================
+The character estimate alone under-counts dense text badly, and exact counts
+cover only what was already sent - an action result in a follow-up round is
+always estimated. The brain's tokenizer spends one token on EVERY digit
+(and one on a space before a number), one on most punctuation marks and
+non-ASCII characters, and two on a line break with the next line's indent:
+measured offline with its own vocabulary, a sensor table runs 1.5
+characters per token, JSON 1.4, a URL list 1.8, file paths 1.8 - so 3.7
+counted them at 0.29-0.68 of their real size, and a 6,000-character JSON
+result reached Ollama at ~18.6k tokens of a 16,384 window with the budget
+saying it fit. ``estimate_tokens`` is now the larger of the character
+estimate and ``dense_estimate`` (DENSE_TOKENS_PER_SYMBOL / _LINE_BREAK /
+_WORD). Measured on 118 materials (the live system prompt, all 88 PC
+sections, docs, code, 13 dense shapes) and 21 held-out repo files: every
+material of 200+ tokens is estimated at 0.99-1.58 of its real size (the
+dense shapes 1.00-1.58, were 0.29-0.68); the system prompt 1.049 (was
+1.041), prose unchanged.
+
 WHEN THE WINDOW IS SMALLER THAN num_ctx (review 2026-10-02)
 ==========================================================
 The 10-01 incident read ``limit=8195`` - half the 16k num_ctx the budget
@@ -110,11 +129,28 @@ a count far under the estimate is a truncation. It logs a loud
 ``[prompt-budget] TRUNCATED`` line and ``ObservedWindow`` budgets the next
 prompts to the observed limit for OBSERVED_LIMIT_TTL_S.
 
+Correction (review 2026-10-04): 8,195 was NOT a smaller window. Ollama cuts
+a prompt longer than its runner's window to about HALF of that window - its
+server.log reads ``limit=8195 ... keep=5`` or ``limit=8194 ... keep=4`` on
+every one of its 30 cuts (10-01 19:03 to 10-04 13:07), all at num_ctx
+16,384, for prompts of 17,505 to 18,629 tokens. So a count within
+HALVED_WINDOW_SLACK of num_ctx / 2 (``halved_window``) means the runner HAD
+the configured window and the prompt was simply over it: the estimate was
+low (DENSE TEXT above), and learning 8,195 as "the window" would budget
+every local prompt for 15 minutes to half its real room.
+``ObservedWindow.note(..., num_ctx=...)``
+learns nothing from such a cut (nor from a prompt estimated over num_ctx);
+the monolith still logs it. A cut at any other count is still learned - as
+the count itself, which is at most half the runner's real window, so the
+budget errs small.
+
 Pure and stdlib-only, so the CI-light tier covers it (tests/test_prompt_budget.py).
 """
 from __future__ import annotations
 
+import functools
 import math
+import re
 import threading
 import time
 from typing import Callable, List, NamedTuple, Optional, Sequence
@@ -123,6 +159,16 @@ from typing import Callable, List, NamedTuple, Optional, Sequence
 # material. See CALIBRATION above: the bottom of the measured range, so the
 # estimate errs high.
 CHARS_PER_TOKEN = 3.7
+
+# Dense text (DENSE TEXT above): what one digit, punctuation mark, non-ASCII
+# character or space before a digit costs, what a run of line breaks costs
+# (the break and the next line's indent / bullet), and what a run of ASCII
+# letters (a word) costs. Fitted on the brain's own tokenizer.
+DENSE_TOKENS_PER_SYMBOL = 1.0
+DENSE_TOKENS_PER_LINE_BREAK = 2.0
+DENSE_TOKENS_PER_WORD = 1.05
+# Texts at least this long are estimated through a small cache.
+_LONG_TEXT_CHARS = 4096
 
 # Chat-template cost of one message (role marker + turn delimiters) and of the
 # prompt as a whole (BOS + the generation prompt). Small, and generous.
@@ -169,6 +215,9 @@ RESULT_CLIP_STEPS = (4000, 1500, 600, 250)
 TRUNCATION_RATIO = 0.75         # evaluated < 75 % of the estimate = cut
 TRUNCATION_MIN_ESTIMATE = 2048  # smaller prompts are never judged
 OBSERVED_LIMIT_TTL_S = 900.0    # how long an observed limit budgets prompts
+# A cut count this close to num_ctx / 2 is Ollama halving a prompt that was
+# over the configured window (see the 2026-10-04 correction above).
+HALVED_WINDOW_SLACK = 64
 
 
 class TurnPart(NamedTuple):
@@ -201,13 +250,58 @@ class Fit(NamedTuple):
         return self.after <= self.budget
 
 
+_DIGITS = "0123456789"
+_WORD_RE = re.compile(r"[A-Za-z]+")
+_NEWLINE_RUN_RE = re.compile(r"\n+")
+
+
+def dense_estimate(text: str) -> int:
+    """Token count of ``text`` by what the brain's tokenizer does with dense
+    material (see DENSE TEXT above): DENSE_TOKENS_PER_SYMBOL per ASCII digit
+    and per space or tab right before one, per non-ASCII character and per
+    punctuation mark; DENSE_TOKENS_PER_LINE_BREAK per run of line breaks;
+    DENSE_TOKENS_PER_WORD per run of ASCII letters. ``text`` must be a str."""
+    n = len(text)
+    digits = sum(map(text.count, _DIGITS))
+    before_digit = sum(text.count(" " + d) + text.count("\t" + d)
+                       for d in _DIGITS)
+    non_ascii = n - len(text.encode("ascii", "ignore"))
+    breaks = text.count("\n")
+    blanks = text.count(" ") + text.count("\t")
+    words = _WORD_RE.findall(text)
+    letters = sum(map(len, words))
+    punct = max(0, n - digits - non_ascii - breaks - blanks - letters)
+    runs = len(_NEWLINE_RUN_RE.findall(text)) if breaks else 0
+    return int(math.ceil(
+        DENSE_TOKENS_PER_SYMBOL * (digits + before_digit + non_ascii + punct)
+        + DENSE_TOKENS_PER_LINE_BREAK * runs
+        + DENSE_TOKENS_PER_WORD * len(words)))
+
+
+@functools.lru_cache(maxsize=64)
+def _estimate_long(text: str) -> int:
+    return max(int(math.ceil(len(text) / CHARS_PER_TOKEN)),
+               dense_estimate(text))
+
+
 def estimate_tokens(text) -> int:
-    """Estimated tokens in ``text`` (0 for empty or non-text). Never raises."""
+    """Estimated tokens in ``text`` (0 for empty or non-text): the larger of
+    the character estimate (CHARS_PER_TOKEN) and dense_estimate, so prose
+    and the system prompt keep their calibration and numbers, JSON, tables,
+    paths and URLs are not under-counted (2026-10-04). Never raises."""
     try:
         n = len(text) if isinstance(text, str) else 0
+        if not n:
+            return 0
+        if n >= _LONG_TEXT_CHARS:
+            # The system prompt is measured over and over within one fit.
+            return _estimate_long(text)
+        return max(int(math.ceil(n / CHARS_PER_TOKEN)), dense_estimate(text))
     except Exception:
-        return 0
-    return int(math.ceil(n / CHARS_PER_TOKEN)) if n else 0
+        try:
+            return int(math.ceil(len(text) / CHARS_PER_TOKEN))
+        except Exception:
+            return 0
 
 
 def _content_text(content) -> str:
@@ -561,6 +655,19 @@ def clip_middle(text, max_chars: int) -> str:
             + text[-tail:].lstrip())
 
 
+def halved_window(prompt_eval_count, num_ctx) -> bool:
+    """Is ``prompt_eval_count`` what Ollama leaves of a prompt that was over
+    a ``num_ctx`` window? It keeps the first few tokens and the newest ~half
+    of the window (limit = num_ctx / 2 + keep - 2 in its server.log), so the
+    count lands within HALVED_WINDOW_SLACK of num_ctx / 2. Never raises."""
+    try:
+        got = int(prompt_eval_count)
+        half = int(num_ctx) // 2
+    except Exception:
+        return False
+    return half > 0 and abs(got - half) <= HALVED_WINDOW_SLACK
+
+
 def looks_truncated(estimated, prompt_eval_count) -> bool:
     """True when Ollama evaluated far fewer prompt tokens than the estimate of
     what was sent: under TRUNCATION_RATIO of it, on a prompt of at least
@@ -594,15 +701,17 @@ class ObservedWindow:
         self._at = 0.0
 
     def note(self, estimated, prompt_eval_count, num_ctx=None) -> bool:
-        """``num_ctx``: the window the prompt was sent for. A prompt whose
-        estimate was already over it was cut because it was too big, not
-        because the runner's window is small (2026-10-04: the proactive
-        remark's ~18.4k prompt taught "the window is 8,195" and every local
-        prompt for 15 minutes was budgeted to that), so it teaches nothing."""
+        """``num_ctx``: the window the prompt was sent for. A prompt cut
+        because it was too big for THAT window teaches nothing about the
+        runner (2026-10-04: the proactive remark's ~18.4k prompt taught "the
+        window is 8,195" and every local prompt for 15 minutes was budgeted
+        to that): one whose estimate was already over it, and one whose
+        count is Ollama halving it (halved_window) - the estimate was low."""
         try:
             if num_ctx is not None:
                 try:
-                    if int(estimated) > int(num_ctx):
+                    if (int(estimated) > int(num_ctx)
+                            or halved_window(prompt_eval_count, num_ctx)):
                         return False
                 except Exception:
                     pass

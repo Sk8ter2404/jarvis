@@ -343,13 +343,28 @@ def _device() -> str:
 # brain is loaded UNLOADS it: the boot scans of 10-02 15:05:40 (657 chunks)
 # and 10-03 17:35:41 (3,699 chunks) did, and the next brain loads took 54 s
 # and 9 s (Ollama server.log; the brain was gone 9 minutes the second time).
-# Indexing can wait, so it does: the boot scan, the watcher and a manual
-# reindex embed only while core.ollama_opts.eviction_risk says a request for
-# the embed model unloads nothing (it is loaded already, nothing else is, or
-# the server may hold more than one model), and try again RAG_DEFER_RETRY_S
-# later otherwise. A search is the owner's own request and still runs (one
-# line in the log says what it unloads).
+# Indexing can wait, so it does: the boot scan, the watcher and the rescan
+# of a deferred scan embed only while core.ollama_opts.eviction_risk says a
+# request for the embed model unloads nothing (it is loaded already, nothing
+# else is, or the server may hold more than one model), and try again
+# RAG_DEFER_RETRY_S later otherwise. A search is the owner's own request and
+# still runs (one line in the log says what it unloads); so does his
+# reindex (below).
+#
+# Review 2026-10-04:
+#  * "reindex my files" is the owner's request too. With the brain kept
+#    loaded for 24 h, a reindex that waited for it never ran while JARVIS
+#    said it was reindexing. An owner reindex (index_once(owner=True))
+#    therefore embeds like his search does, unloading the brain if it must
+#    (his reply says so) - but it pauses while he is mid-sentence or
+#    mid-turn (OWNER_SCAN_MAX_WAIT_S at most), so none of its requests is in
+#    flight when his turn's brain request lands. status() reports any wait.
+#  * While the server holds one model, a background embedding also waits
+#    while the owner is talking to JARVIS (core.local_traffic's background
+#    gate): one sent just before his turn's brain request would reload the
+#    embed model right after the brain answered, unloading it again.
 RAG_DEFER_RETRY_S: float = 600.0
+OWNER_SCAN_MAX_WAIT_S: float = 120.0
 
 
 class EmbedDeferred(RuntimeError):
@@ -357,16 +372,72 @@ class EmbedDeferred(RuntimeError):
     model (the voice brain). The message says what and why."""
 
 
-def _embed_eviction_reason(model: str, endpoint: str) -> str:
+def _ollama_base(endpoint: str) -> str:
+    return str(endpoint or "").split("/api/", 1)[0].rstrip("/")
+
+
+def _owner_talking_reason(hard_only: bool = False) -> str:
+    """'' unless the owner is talking to JARVIS right now: core.local_traffic's
+    background-gate reason ('utterance', 'turn', or 'conversation' - the
+    quiet window after a turn; ``hard_only`` ignores that one). Unconfigured
+    gate = ''. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        why = _lt.GATE.defer_reason()
+        if not why or (hard_only and why not in _lt.HARD_REASONS):
+            return ""
+        return f"the owner is talking to JARVIS ({why})"
+    except Exception:
+        return ""
+
+
+def _embed_eviction_reason(model: str, endpoint: str,
+                           resident: "list | None" = None) -> str:
     """Why a BACKGROUND embedding request for ``model`` must wait right now
     ('' = it may go): core.ollama_opts.eviction_risk against the server
-    ``endpoint`` points at. Fails closed. Never raises."""
+    ``endpoint`` points at (``resident``: its /api/ps list, already read),
+    and - while that server holds one model - the owner talking to JARVIS.
+    Fails closed. Never raises."""
     try:
-        from core.ollama_opts import eviction_risk
-        base = str(endpoint or "").split("/api/", 1)[0].rstrip("/")
-        return eviction_risk(model, base)
+        from core import ollama_opts as _oo
+        base = _ollama_base(endpoint)
+        why = _oo.eviction_risk(model, base, resident=resident)
+        if why:
+            return why
+        if _oo.effective_max_loaded(base) < 2:
+            return _owner_talking_reason()
+        return ""
     except Exception as e:  # pragma: no cover - in-tree import
         return f"eviction guard unavailable ({type(e).__name__})"
+
+
+def _wait_owner_quiet(max_s: "float | None" = None) -> None:
+    """An owner scan's request waits here while he is mid-sentence or
+    mid-turn (at most ``max_s``, default OWNER_SCAN_MAX_WAIT_S; the scan he
+    asked for starts inside his own turn). Never raises."""
+    try:
+        cap = OWNER_SCAN_MAX_WAIT_S if max_s is None else float(max_s)
+        end = time.monotonic() + max(0.0, cap)
+        while (_owner_talking_reason(hard_only=True)
+               and not _stop_flag.is_set() and time.monotonic() < end):
+            time.sleep(0.25)
+    except Exception:
+        pass
+
+
+def embed_would_unload() -> str:
+    """'' when embedding now unloads no other Ollama model, else why it would
+    (the owner's "reindex my files" reply says so). Never raises."""
+    try:
+        from core.ollama_opts import eviction_risk
+        return eviction_risk(RAG_EMBED_MODEL, _ollama_base(RAG_OLLAMA_ENDPOINT))
+    except Exception:
+        return ""
+
+
+# index_once(owner=True) marks its own thread; _OllamaEmbedder.encode reads
+# the mark there (its pool workers are other threads) and hands it on.
+_owner_scan = threading.local()
 
 
 # The deferral reason last logged ('' = none since the last embedding that
@@ -392,7 +463,10 @@ class _OllamaEmbedder:
 
     Every request first asks _embed_eviction_reason (per request, so a brain
     loaded mid-file stops the rest of the file) unless ``allow_evict`` - the
-    owner's search - and raises EmbedDeferred instead of sending.
+    owner's search - and raises EmbedDeferred instead of sending. A request
+    of an owner scan (``owner``) is sent like a search, after
+    _wait_owner_quiet. A request that loads the embed model NEXT TO other
+    models re-reads /api/ps afterwards (core.ollama_opts.note_coload).
     """
 
     def __init__(self, model: str, endpoint: str,
@@ -402,11 +476,23 @@ class _OllamaEmbedder:
         self.batch_size = max(1, int(batch_size))
         self.timeout = float(timeout)
 
-    def _embed_one(self, text: str, allow_evict: bool = False) -> list[float]:
+    def _embed_one(self, text: str, allow_evict: bool = False,
+                   owner: bool = False) -> list[float]:
+        coload = None
+        if owner:
+            _wait_owner_quiet()
+            allow_evict = True
         if not allow_evict:
-            reason = _embed_eviction_reason(self.model, self.endpoint)
+            from core import ollama_opts as _oo
+            base = _ollama_base(self.endpoint)
+            before = _oo.resident_models(base, _oo.probe_timeout(base))
+            reason = _embed_eviction_reason(self.model, self.endpoint,
+                                            resident=before)
             if reason:
                 raise EmbedDeferred(reason)
+            if before and not any(_oo.same_tag(n, self.model)
+                                  for n in before):
+                coload = before     # loads next to them: check afterwards
         # One-shot GPU snapshot on first embedding call so VRAM
         # allocation for nomic-embed-text is captured in the log.
         # Safe to call on every request — dedup is inside log_gpu_state.
@@ -424,6 +510,16 @@ class _OllamaEmbedder:
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
+        if coload is not None:
+            try:
+                from core import ollama_opts as _oo
+                base = _ollama_base(self.endpoint)
+                _oo.note_coload(coload,
+                                _oo.resident_models(base,
+                                                    _oo.probe_timeout(base)),
+                                self.model)
+            except Exception:
+                pass
         emb = payload.get("embedding") or []
         if not emb:
             raise RuntimeError(f"Ollama returned empty embedding (model={self.model})")
@@ -456,7 +552,9 @@ class _OllamaEmbedder:
 
         n_workers = batch_size if batch_size else self.batch_size
         n_workers = max(1, min(n_workers, len(texts)))
-        one = functools.partial(self._embed_one, allow_evict=allow_evict)
+        one = functools.partial(
+            self._embed_one, allow_evict=allow_evict,
+            owner=bool(getattr(_owner_scan, "active", False)))
 
         if n_workers == 1 or len(texts) == 1:
             vecs = [one(t) for t in texts]
@@ -776,7 +874,23 @@ def _index_file(path: str) -> int:
 
 
 def index_once(progress: Optional[Callable[[str, int], None]] = None,
-               force: bool = False) -> dict:
+               force: bool = False, owner: bool = False) -> dict:
+    """Walk every RAG_INDEX_PATHS root once and index unchanged-skipping
+    everything. Blocking; returns a small summary dict (see _index_once).
+    ``owner``: the owner asked for this scan ("reindex my files") - its
+    embeddings go out like his search's, after waiting out his own
+    utterance / turn, instead of waiting for the voice brain to unload
+    (review 2026-10-04, see EmbedDeferred)."""
+    prev = getattr(_owner_scan, "active", False)
+    _owner_scan.active = bool(owner)
+    try:
+        return _index_once(progress, force)
+    finally:
+        _owner_scan.active = prev
+
+
+def _index_once(progress: Optional[Callable[[str, int], None]] = None,
+                force: bool = False) -> dict:
     """Walk every RAG_INDEX_PATHS root once and index unchanged-skipping
     everything. Blocking; returns a small summary dict.
 
@@ -850,7 +964,7 @@ def index_once(progress: Optional[Callable[[str, int], None]] = None,
     if deferred:
         # An unfinished walk must not garbage-collect: every file it never
         # reached would look deleted. The daemon's drain loop runs the scan
-        # again later (a manual reindex included).
+        # again later (an owner scan's rest included, as a background one).
         _scan_retry_at[0] = time.time() + RAG_DEFER_RETRY_S
         _log_deferral("index scan", deferred)
         with _lock:
@@ -898,6 +1012,7 @@ def index_once(progress: Optional[Callable[[str, int], None]] = None,
         excluded_dropped = 0
 
     _scan_retry_at[0] = 0.0
+    _deferral_logged[0] = ""
     with _lock:
         _last_full_scan_ts = time.time()
         return {
@@ -1225,6 +1340,11 @@ def status() -> dict:
         "watchdog_active": _observer is not None,
         "last_full_scan_ts": last_full_scan_ts,
         "last_error": last_error,
+        # Review 2026-10-04: indexing that is WAITING (EmbedDeferred) is not
+        # "idle" - why it waits ('' = it is not) and when a deferred full
+        # scan runs again (0.0 = none pending).
+        "deferred": _deferral_logged[0],
+        "retry_at": _scan_retry_at[0],
         **stats_snapshot,
         "config": current_config(),
     }

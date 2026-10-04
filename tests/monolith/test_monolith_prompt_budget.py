@@ -491,15 +491,20 @@ class ReviewTurnPathTests(_Base):
 
 class ReviewTruncationDetectionTests(_Base):
     """Review 2026-10-02 (low): the 10-01 runner cut prompts at 8,195 tokens
-    - half the 16k window the budget assumes - and nothing noticed."""
+    and nothing noticed. Review 2026-10-04: 8,195 is Ollama HALVING a prompt
+    that was over the 16k window (its server.log: limit=8195 keep=5), not a
+    smaller window - so that cut is logged and learned as nothing, and only
+    a cut at another count (a runner really loaded smaller) shrinks the next
+    budgets."""
 
     def test_a_cut_prompt_is_logged_and_shrinks_the_next_budget(self):
-        self._p(_Resp, "pe", 8195)
+        self._p(_Resp, "pe", 4098)          # a runner holding an 8k window
         payload, stdout = self._turn(_MANY, _long_history(3, n=300))
         notes = [n for n in self._notes(stdout) if "TRUNCATED" in n]
         self.assertEqual(len(notes), 1, stdout)
-        self.assertIn("8,195", notes[0])
-        self.assertEqual(pb.OBSERVED_WINDOW.limit, 8195)
+        self.assertIn("4,098", notes[0])
+        self.assertIn("smaller than configured", notes[0])
+        self.assertEqual(pb.OBSERVED_WINDOW.limit, 4098)
         # The next local prompt is budgeted to what Ollama really took: the
         # system prompt alone is over that, so everything else goes.
         self.posted.clear()
@@ -508,6 +513,16 @@ class ReviewTruncationDetectionTests(_Base):
         self.assertEqual(len(payload["messages"]), 2)
         self.assertTrue(any("observed" in n for n in self._notes(stdout)),
                         stdout)
+
+    def test_a_halved_prompt_is_logged_but_teaches_no_window(self):
+        self._p(_Resp, "pe", 8195)
+        _payload, stdout = self._turn(_MANY, _long_history(3, n=300))
+        notes = [n for n in self._notes(stdout) if "TRUNCATED" in n]
+        self.assertEqual(len(notes), 1, stdout)
+        self.assertIn("8,195", notes[0])
+        self.assertIn("over the window", notes[0])
+        self.assertEqual(pb.OBSERVED_WINDOW.limit, 0)
+        self.assertEqual(pb.OBSERVED_WINDOW.effective(16384), 16384)
 
     def test_an_honest_count_is_not_a_truncation(self):
         self._p(_Resp, "pe", 15200)

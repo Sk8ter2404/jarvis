@@ -516,14 +516,25 @@ class TokenAwareBudgetTests(_Base):
                 {"prompt_eval_count": 8195}, "gemma-test")
         self.assertFalse(learned)
         self.assertEqual(pb.OBSERVED_WINDOW.limit, 0)
-        self.assertNotIn("TRUNCATED", out.getvalue())
-        # A prompt that should have fit and came back cut still teaches it.
+        # Review 2026-10-04: still a cut prompt (its system prompt's start
+        # is gone) - logged, just not learned.
+        self.assertIn("TRUNCATED", out.getvalue())
+        self.assertIn("over the window", out.getvalue())
+        # A prompt that should have fit and was HALVED (8,195 of 16,384:
+        # the estimate was low) teaches nothing either...
         with contextlib.redirect_stdout(out):
             learned = bc._note_prompt_window(
                 "S" * 55000, [{"role": "user", "content": "x"}],
                 {"prompt_eval_count": 8195}, "gemma-test")
+        self.assertFalse(learned)
+        self.assertEqual(pb.OBSERVED_WINDOW.limit, 0)
+        # ...a cut at any other count is a runner with a smaller window.
+        with contextlib.redirect_stdout(out):
+            learned = bc._note_prompt_window(
+                "S" * 55000, [{"role": "user", "content": "x"}],
+                {"prompt_eval_count": 4098}, "gemma-test")
         self.assertTrue(learned)
-        self.assertEqual(pb.OBSERVED_WINDOW.limit, 8195)
+        self.assertEqual(pb.OBSERVED_WINDOW.limit, 4098)
 
     def test_an_honest_reply_records_the_prompts_exact_size(self):
         bc = self.bc
