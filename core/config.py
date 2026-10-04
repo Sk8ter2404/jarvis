@@ -1492,7 +1492,8 @@ KINECT_POINT_CONTROL_ENABLED = False
 #   A background poller (~30 Hz) maps the driving hand's position within a
 #   calibrated reach-box onto the WHOLE VIRTUAL DESKTOP — every monitor, incl.
 #   any left of / above the primary, so target pixels may be negative
-#   (_reach_box_for_virtual_desktop) — heavily EMA-smoothed to fight
+#   (_reach_box_for_virtual_desktop) — smoothed by the shared hand
+#   stabiliser's One Euro filter (KINECT_HAND_FILTER_* below) to fight
 #   jitter, and drives the cursor via win32api (pyautogui fallback). A glowing
 #   JARVIS reticle (hud/jarvis_air_cursor.py) follows the cursor — cyan while
 #   tracking an open hand, gold-locked on grab/drag. Off by default; never runs
@@ -1584,7 +1585,10 @@ AIR_MOUSE_ENGAGE_REACH_M = 0.20
 #   shifts when he sits back. A reach extends the elbow; a resting arm is folded.
 #   0 disables the elbow half.
 AIR_MOUSE_ENGAGE_STRAIGHT = 0.85
-# AIR_MOUSE_GRIP_CLOSE_FRAMES — consecutive frames a CLOSED hand must be seen
+# AIR_MOUSE_GRIP_CLOSE_FRAMES — LEGACY, used only when the bridge has no shared
+#   hand stabiliser; the live press rule is KINECT_GRIP_CLOSE_SEC +
+#   KINECT_GRIP_CLOSE_MIN_VOTES below (High-confidence REAL frames, not polls).
+#   Consecutive polls a CLOSED hand must be seen
 #   before it presses a button. Deliberately STRICTER than the open/release
 #   debounce: a spurious release only drops a drag, a spurious press is a click the
 #   owner never made (one closed his browser tabs). ~4 frames ≈ 133 ms at 30 Hz —
@@ -1655,6 +1659,121 @@ KINECT_HAND_MIRROR = True
 #   off). See skills/kinect_two_hand.py (+ skills/kinect_air_mouse.set_two_hand_active
 #   / two_hand_active for the hand-off, hud/jarvis_air_cursor.py for the reticles).
 KINECT_TWO_HAND_ENABLED = True
+# ─── KINECT HAND STABILISER (2026-10-04, "hand tracking is unstable") ─────────
+# One shared stabiliser (audio/kinect_stabilizer.py) runs ONCE per real Kinect
+# body frame inside the bridge pump; the air-mouse, two-hand, gestures and
+# pointing all read its snapshot (audio.kinect_bridge.get_tracked_frame), so
+# they agree on the owner body, the active hand, raised / grip state and
+# two-hand mode. Every value below is also the module's own default
+# (kinect_stabilizer.DEFAULTS - a test pins the two equal). Override any of them
+# in data/user_settings.json; they are read live every frame.
+# Measured basis (2026-10-04 desk recording, scratchpad kinect_tracking/): hand
+# joint Tracked only 29-35% of frames vs the WRIST 50-94%; still-hand jitter
+# 3.6-4.8 mm RMS (p90 24-36 mm); single-frame steps up to 186 mm; the grip
+# classifier LOW-confidence on 80% of left-hand frames at rest.
+# KINECT_HAND_FILTER_MIN_CUTOFF_HZ — One Euro filter cutoff for a hand at REST.
+#   Lower = steadier cursor at rest, more lag on very slow moves. 0.7 Hz.
+KINECT_HAND_FILTER_MIN_CUTOFF_HZ = 0.7
+# KINECT_HAND_FILTER_BETA — how fast the cutoff opens with hand SPEED (Hz per
+#   m/s). Higher = less lag when moving, more jitter on slow moves. 12.0 keeps
+#   the added lag under 40 ms from ~0.25 m/s up.
+KINECT_HAND_FILTER_BETA = 12.0
+# KINECT_HAND_FILTER_D_CUTOFF_HZ — cutoff of the speed estimate the filter
+#   adapts on. 1.0 Hz (the One Euro paper's default).
+KINECT_HAND_FILTER_D_CUTOFF_HZ = 1.0
+# KINECT_HAND_JUMP_REJECT_M — a hand that jumps further than this in ONE frame
+#   (scaled by frames elapsed; ~7.5 m/s, faster than a real hand) is a glitch:
+#   the frame is dropped. 0.25 m.
+KINECT_HAND_JUMP_REJECT_M = 0.25
+# KINECT_HAND_JUMP_REJECT_FRAMES — at most this many consecutive jump frames are
+#   dropped; if the hand is still "there" after that it is real and the filter
+#   re-seeds at the new place. 2.
+KINECT_HAND_JUMP_REJECT_FRAMES = 2
+# KINECT_HAND_LOSS_GRACE_SEC — when the hand (and wrist) stop being measured,
+#   HOLD the last good position / lift / grip this long before reporting the
+#   hand as gone (which releases the cursor). One Inferred frame used to drop
+#   the lift to None and release instantly. 0.30 s.
+KINECT_HAND_LOSS_GRACE_SEC = 0.30
+# KINECT_WRIST_OFFSET_MAX_AGE_SEC — the hand is placed at the Tracked wrist +
+#   the learned hand-wrist offset; an offset not refreshed (hand and wrist both
+#   Tracked) for this long is not trusted, and the Tracked hand, else the raw
+#   wrist, is used instead. 2.0 s.
+KINECT_WRIST_OFFSET_MAX_AGE_SEC = 2.0
+# KINECT_HAND_OFFSET_CUTOFF_HZ — the hand-wrist offset is low-pass filtered at
+#   this cutoff, and a Tracked WRIST + that offset is the PREFERRED hand position
+#   (the wrist is steadier, and closing the hand moves the hand joint but not
+#   the wrist). Measured on the desk recording: still-hand jitter p90 22 mm
+#   (old cursor path) -> 10 mm. Higher = follows wrist-only flexion faster,
+#   with more hand-joint noise. 1.0 Hz.
+KINECT_HAND_OFFSET_CUTOFF_HZ = 1.0
+# KINECT_GRIP_REQUIRE_HIGH_CONFIDENCE — a grip (open/closed) frame counts only
+#   when the Kinect's own classifier is HIGH confidence and the hand joint is
+#   Tracked; LOW confidence is "no vote". Set False only if clicks stop
+#   registering at all (the SDK then never reports High for your hands).
+KINECT_GRIP_REQUIRE_HIGH_CONFIDENCE = True
+# KINECT_GRIP_CLOSE_SEC — a closed hand must be seen (High confidence, real
+#   frames, no open vote in between) across at least this span... 0.09 s.
+KINECT_GRIP_CLOSE_SEC = 0.09
+# KINECT_GRIP_CLOSE_MIN_VOTES — ...on at least this many REAL frames before it
+#   PRESSES a button. 4 frames = a closed hand seen for 133 ms; a flicker of 3
+#   frames (100 ms) or less can never click, whatever its timestamps say. 4.
+KINECT_GRIP_CLOSE_MIN_VOTES = 4
+# KINECT_GRIP_OPEN_SEC — the same for opening (RELEASE): span... 0.03 s.
+KINECT_GRIP_OPEN_SEC = 0.03
+# KINECT_GRIP_OPEN_MIN_VOTES — ...and frames. Looser than the press: a spurious
+#   release only drops a drag, a spurious press is a click you never made. 2.
+KINECT_GRIP_OPEN_MIN_VOTES = 2
+# KINECT_GRIP_VOTE_GAP_SEC — a run of grip votes is broken when no vote arrives
+#   for longer than this (the run must start again). 0.10 s.
+KINECT_GRIP_VOTE_GAP_SEC = 0.10
+# KINECT_GRIP_LASSO_AS — what a LASSO (two-finger point) reading counts as:
+#   "none" (no vote - the default: a pointing hand is not a click), "closed"
+#   (the pre-2026-10-04 behaviour) or "open".
+KINECT_GRIP_LASSO_AS = "none"
+# KINECT_LIFT_UP_MARGIN — a hand counts as RAISED once its height above the
+#   shoulder line passes this (metres). Same key the 'calibrate air mouse'
+#   action persists, so a calibration moves the shared gate and the air-mouse
+#   together. 0.07 m.
+KINECT_LIFT_UP_MARGIN = 0.07
+# KINECT_LIFT_DOWN_MARGIN — ...and stays raised until it drops below this
+#   (hysteresis: DOWN < UP, so a hand at the line can't flap). -0.10 m.
+KINECT_LIFT_DOWN_MARGIN = -0.10
+# KINECT_RAISE_ENTER_SEC — the hand must stay above UP this long to count as
+#   raised (a one-frame height spike doesn't). 0.10 s.
+KINECT_RAISE_ENTER_SEC = 0.10
+# KINECT_RAISE_EXIT_SEC — ...and below DOWN this long to count as lowered. 0.10 s.
+KINECT_RAISE_EXIT_SEC = 0.10
+# KINECT_ACTIVE_HAND_SWITCH_LEAD_M — with both hands raised, the cursor moves to
+#   the other hand only when that hand is this much HIGHER... 0.15 m.
+KINECT_ACTIVE_HAND_SWITCH_LEAD_M = 0.15
+# KINECT_ACTIVE_HAND_SWITCH_SEC — ...for this long (or at once if you lower the
+#   driving hand). 0.40 s.
+KINECT_ACTIVE_HAND_SWITCH_SEC = 0.40
+# KINECT_TWO_HAND_ENTER_SEC — both hands must stay raised this long before
+#   two-hand (pinch-to-resize) mode engages and the single-hand cursor stands
+#   down. 0.25 s.
+KINECT_TWO_HAND_ENTER_SEC = 0.25
+# KINECT_TWO_HAND_EXIT_SEC — two-hand mode ends only after "not both raised"
+#   has lasted this long. 0.20 s.
+KINECT_TWO_HAND_EXIT_SEC = 0.20
+# KINECT_TWO_HAND_REARM_SEC — after two-hand mode ends it can't re-engage for
+#   this long, so engage edges are >= EXIT + REARM + ENTER (1.05 s) apart and it
+#   cannot flap within a second. 0.60 s.
+KINECT_TWO_HAND_REARM_SEC = 0.60
+# KINECT_OWNER_LOSS_GRACE_SEC — if the tracked owner body vanishes for a frame,
+#   hold it this long before treating it as gone; also the age past which a
+#   snapshot with no newer frame reads as stale (not tracked). 0.30 s.
+KINECT_OWNER_LOSS_GRACE_SEC = 0.30
+# KINECT_OWNER_SWITCH_NEARER_M — another body takes over as the owner only when
+#   it is at least this much nearer the sensor... 0.25 m.
+KINECT_OWNER_SWITCH_NEARER_M = 0.25
+# KINECT_OWNER_SWITCH_SEC — ...for this long. 1.0 s.
+KINECT_OWNER_SWITCH_SEC = 1.0
+# KINECT_GESTURE_RELEASE_MUTE_SEC — gestures (wave / swipe / raise) stay muted
+#   this long after the air-mouse or two-hand mode lets go, so the arm coming
+#   down can't fire a SWIPE (which cancels speech and a pending confirmation).
+#   0.5 s.
+KINECT_GESTURE_RELEASE_MUTE_SEC = 0.5
 # KINECT_GREET_ON_ENTRY — when True (and presence is enabled), JARVIS speaks a
 #   brief varied greeting when you enter a room that had been empty for a while.
 #   Hard rate-limited (≤ once/min) and skipped mid-conversation. Off by default.

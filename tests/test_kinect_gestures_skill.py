@@ -413,8 +413,13 @@ class AirMouseSuppressionTests(_Base):
         rec = _StubRec([kg.WAVE])
         self.assertIsNone(mod._poll_once(rec, bc))
         self.assertEqual(rec.updates, 0)
-        # Relax → the same queued gesture now fires (detection resumed).
+        # Relax → muted for KINECT_GESTURE_RELEASE_MUTE_SEC (the arm coming
+        # down must not read as a SWIPE; 2026-10-04), then the same queued
+        # gesture fires (detection resumed).
         self._set_air_mouse(False)
+        self.assertIsNone(mod._poll_once(rec, bc))
+        self.assertEqual(rec.updates, 0)
+        mod._muted_until[0] = 0.0               # the mute window has elapsed
         self.assertEqual(mod._poll_once(rec, bc), kg.WAVE)
         self.assertTrue(rec.resets >= 1 and rec.updates == 1)
 
@@ -467,8 +472,11 @@ class TwoHandSuppressionTests(_Base):
         rec = _StubRec([kg.WAVE])
         self.assertIsNone(mod._poll_once(rec, bc))
         self.assertEqual(rec.updates, 0)
-        # Two-hand releases → the same queued gesture fires.
+        # Two-hand releases → muted for the release window, then the same
+        # queued gesture fires.
         self._set_air_mouse(two_hand=False)
+        self.assertIsNone(mod._poll_once(rec, bc))
+        mod._muted_until[0] = 0.0               # the mute window has elapsed
         self.assertEqual(mod._poll_once(rec, bc), kg.WAVE)
         self.assertTrue(rec.resets >= 1 and rec.updates == 1)
 

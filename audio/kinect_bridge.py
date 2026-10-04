@@ -1316,7 +1316,9 @@ def _read_and_cache_bodies(consume: bool = True) -> list[dict]:
     except Exception:   # pragma: no cover - defensive: mid-stream readiness/getter glitch
         return []
     bodies = _parse_body_frame(frame)
-    _store_bodies_cache(bodies)
+    # Cache it AND advance the shared hand stabiliser exactly once for this
+    # real frame (get_tracked_frame) - see publish_body_frame.
+    publish_body_frame(bodies)
     return bodies
 
 
@@ -1903,6 +1905,133 @@ def get_bodies() -> list[dict]:
     # pump (H3): with a live pump this serves the cache and leaves the pending frame
     # for the pump; only a genuinely pump-less caller reads the sensor directly.
     return _read_and_cache_bodies(consume=False)
+
+
+# ─── SHARED HAND STABILISER (2026-10-04, "hand tracking is unstable") ──────
+# Every consumer used to re-derive body / hand / raised / grip per POLL from one
+# raw frame, so they disagreed and a single noisy frame flipped state (two-hand
+# mode engaged 51 times in 28 min, 48 of them gone within the second). Now the
+# body frame that publish_body_frame() caches is ALSO fed, exactly once, to one
+# audio.kinect_stabilizer.HandStabilizer, and every consumer reads the snapshot
+# it returns through get_tracked_frame(). One owner body, one sticky active hand,
+# one two-hand verdict, one confident grip per hand - computed on REAL frames
+# with real frame times, so a consumer that polls twice per frame cannot count a
+# frame twice. The stabiliser borrows the bridge's arm_extension and
+# _joint_reliable so the geometry and the Tracked-joint rule keep one home.
+_tracker: list[Any] = [None]          # the HandStabilizer (lazy)
+_tracked_frame: list[Any] = [None]    # the last published snapshot dict
+_tracked_lock = threading.Lock()
+_body_seq = [0]                       # increments once per published body frame
+# (up, down) lift margins pushed by the air-mouse (its live _reach_thresholds:
+# the owner's calibration, else core.config KINECT_LIFT_*), so the shared raised
+# gate and the air-mouse engage gate always use the same lines. None = use
+# core.config directly.
+_lift_margin_override: list[Any] = [None]
+
+
+def _stabilizer_module():
+    try:
+        from audio import kinect_stabilizer as _ks
+    except ImportError:   # pragma: no cover - bridge loaded outside the package
+        import kinect_stabilizer as _ks
+    return _ks
+
+
+def set_lift_margins(up_margin, down_margin) -> None:
+    """Pin the shared stabiliser's raise margins (metres of lift; DOWN < UP).
+    Called every air-mouse poll with its live thresholds. A bad pair is
+    ignored. NEVER raises."""
+    try:
+        u, d = float(up_margin), float(down_margin)
+        if u == u and d == d and d < u:
+            _lift_margin_override[0] = (u, d)
+    except (TypeError, ValueError):
+        pass
+
+
+def _live_stabilizer_params() -> dict:
+    """core.config's stabiliser tunables, with the pushed lift margins on top."""
+    p = _stabilizer_module().load_params()
+    ov = _lift_margin_override[0]
+    if ov is not None:
+        p["KINECT_LIFT_UP_MARGIN"], p["KINECT_LIFT_DOWN_MARGIN"] = ov
+    return p
+
+
+def new_stabilizer(params_fn=None):
+    """A HandStabilizer wired to this bridge's canonical geometry. Used by the
+    pump (via publish_body_frame) and by the offline replay harness, so a replay
+    runs exactly the live wiring. NEVER raises (returns None if the module can't
+    load, in which case get_tracked_frame stays None and consumers fall back)."""
+    try:
+        return _stabilizer_module().HandStabilizer(
+            arm_extension_fn=arm_extension,
+            joint_reliable_fn=_joint_reliable,
+            params_fn=params_fn or _live_stabilizer_params)
+    except Exception:   # pragma: no cover - defensive
+        return None
+
+
+def publish_body_frame(bodies: list, now: Optional[float] = None) -> None:
+    """Publish ONE freshly-parsed body frame: store it in the shared body cache
+    (get_bodies) and advance the shared hand stabiliser once (get_tracked_frame).
+    The pump is the only caller in production; the replay harness drives it the
+    same way. NEVER raises - a stabiliser failure must not break the body pipe."""
+    ts = time.monotonic() if now is None else float(now)
+    _store_bodies_cache(bodies, ts)
+    try:
+        with _tracked_lock:
+            if _tracker[0] is None:
+                _tracker[0] = new_stabilizer()
+            tr = _tracker[0]
+            if tr is None:
+                return
+            _body_seq[0] += 1
+            _tracked_frame[0] = tr.process(bodies, ts, seq=_body_seq[0])
+    except Exception:   # pragma: no cover - process() already never raises
+        pass
+
+
+def get_tracked_frame(now: Optional[float] = None) -> Optional[dict]:
+    """The latest shared stabiliser snapshot (see audio/kinect_stabilizer), or
+    None before the first frame / after the pump stopped. A shallow copy with
+    two extra keys: ``age`` (seconds since that frame) and ``stale`` (True once
+    the age passes KINECT_OWNER_LOSS_GRACE_SEC - no new frame for that long, e.g.
+    the pump starved, so consumers must treat the owner as not tracked). Shape:
+
+        {"seq", "t", "age", "stale", "owner_id", "owner" (the raw body dict),
+         "fresh", "tracked", "active" ("left"|"right"|None, SDK side),
+         "two_hand" (bool), "hands": {"left"|"right": {"pos", "source",
+         "measured", "lost_s", "lift", "lift_measured", "raised", "grip",
+         "grip_vote", "state", "conf", "joint_tracked", "ext"}}}
+
+    Sides are the SDK's labels; a consumer that mirrors (the air-mouse) swaps
+    them itself. NEVER raises."""
+    snap = _tracked_frame[0]
+    if snap is None:
+        return None
+    try:
+        n = time.monotonic() if now is None else float(now)
+        out = dict(snap)
+        age = max(0.0, n - float(snap.get("t", 0.0)))
+        out["age"] = age
+        grace = 0.30
+        tr = _tracker[0]
+        if tr is not None:
+            grace = float(tr.params.get("KINECT_OWNER_LOSS_GRACE_SEC", grace))
+        out["stale"] = age > grace
+        return out
+    except Exception:   # pragma: no cover - defensive
+        return None
+
+
+def reset_tracking() -> None:
+    """Forget the stabiliser state and the last snapshot (pump stop / tests /
+    replay). NEVER raises."""
+    with _tracked_lock:
+        _tracker[0] = None
+        _tracked_frame[0] = None
+        _lift_margin_override[0] = None
 
 
 def get_color_space_mapper():
@@ -2898,6 +3027,9 @@ def stop_body_pump() -> None:
     with _body_cache_lock:
         _body_cache[0] = None
         _body_cache_at[0] = 0.0
+    # Same for the shared hand stabiliser: no pump, no fresh frames, no snapshot
+    # (a reopened sensor starts clean instead of resuming a stale hand state).
+    reset_tracking()
 
 
 # ─── lifecycle ────────────────────────────────────────────────────────────

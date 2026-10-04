@@ -625,6 +625,31 @@ def _both_hands_engaged(am, left_ext, right_ext, thresholds) -> bool:
         return False
 
 
+def _shared_two_hand(am) -> "Optional[bool]":
+    """The SHARED stabiliser's two-hand verdict that am._hand_sample stashed this
+    tick, or None when the bridge has no shared layer (legacy per-frame check).
+    NEVER raises."""
+    try:
+        holder = getattr(am, "_last_two_hand", None)
+        if isinstance(holder, list) and holder and holder[0] is not None:
+            return bool(holder[0])
+    except Exception:
+        pass
+    return None
+
+
+def _both_lifts_up(left_ext, right_ext, thresholds) -> bool:
+    """Both hands' (stabilised) lift still at/above the ENGAGE line. Used only
+    while a window is grabbed, to freeze the resize as a hand starts to drop.
+    NEVER raises."""
+    try:
+        up = float((thresholds or {}).get("up_margin", 0.07))
+        return all(e is not None and e.lift_m is not None and e.lift_m >= up
+                   for e in (left_ext, right_ext))
+    except Exception:
+        return False
+
+
 def _joint_tracked(am, joint) -> bool:
     """Whether `joint` is sensor-TRACKED, via the air-mouse's pure joint_well_tracked
     helper (single source of truth — TrackingState >= 2, finite, non-zero). Falls
@@ -929,6 +954,9 @@ def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
 #  LIVE POLL — read both hands → decide → move the foreground window
 # ══════════════════════════════════════════════════════════════════════════
 _grab_hwnd = [0]    # module-list: the hwnd captured on the current grab (or 0)
+# True after a grab was let go by LOWERING a hand while the shared two-hand gate
+# is still in its exit dwell; blocks a re-grab until the gate turns off.
+_regrab_blocked = [False]
 
 
 def _poll_once(ctrl: "TwoHandController",
@@ -947,8 +975,16 @@ def _poll_once(ctrl: "TwoHandController",
     bridge = _bridge()
     if bridge is None:
         return None
+    # This poll's OWN sample extras (body id, the shared two-hand verdict) when
+    # the air-mouse offers them - never the module stashes the air-mouse thread
+    # rewrites concurrently. An older air-mouse falls back to the stashes.
+    sample_ex = None
     try:
-        left_ext, right_ext, _lg, _rg, tracked = am._hand_sample(bridge)
+        ex_fn = getattr(am, "_hand_sample_ex", None)
+        if callable(ex_fn):
+            (left_ext, right_ext, _lg, _rg, tracked), sample_ex = ex_fn(bridge)
+        else:
+            left_ext, right_ext, _lg, _rg, tracked = am._hand_sample(bridge)
     except Exception:
         left_ext = right_ext = None
         _lg = _rg = "unknown"
@@ -960,10 +996,35 @@ def _poll_once(ctrl: "TwoHandController",
     except Exception:
         thresholds = None
 
-    both = bool(tracked) and _both_hands_engaged(am, left_ext, right_ext, thresholds)
+    # TWO-HAND VERDICT. With the bridge's SHARED stabiliser (the live bridge)
+    # the mode follows its TwoHandGate - both hands raised for an enter dwell,
+    # "not both" for an exit dwell, then a re-arm window - which am._hand_sample
+    # stashed this tick; the air-mouse stands down on exactly the same verdict.
+    # The per-frame _both_hands_engaged (strict bar, both joints Tracked on
+    # THIS frame) flapped the mode 51 times in 28 min on 2026-10-04 and only
+    # remains for a bridge without the shared layer.
+    shared_two = (sample_ex.get("two_hand") if sample_ex is not None
+                  else _shared_two_hand(am))
+    lifts_up = _both_lifts_up(left_ext, right_ext, thresholds)
+    if shared_two is None:
+        both = bool(tracked) and _both_hands_engaged(am, left_ext, right_ext,
+                                                     thresholds)
+    else:
+        if not shared_two:
+            _regrab_blocked[0] = False
+        both = bool(tracked) and shared_two and not _regrab_blocked[0]
+        # While a window is GRABBED, a hand dipping under the engage line is the
+        # start of a release: report it as not-confirmed so the controller's
+        # dead-man HOLDS the rect (no resize from the falling hand) and lets go
+        # if it stays down - exactly the old grabbed-state behaviour, now on the
+        # filtered, gap-held lifts.
+        if both and ctrl.is_grabbed and not lifts_up:
+            both = False
+    was_grabbed = ctrl.is_grabbed
     # The controlling body's id (stashed by am._hand_sample above) for the FILTER 6
     # pin — so a closer 2nd person can't steal the grab mid-resize. None if absent.
-    body_id = _controlling_body_id(am)
+    body_id = (sample_ex.get("body_id") if sample_ex is not None
+               else _controlling_body_id(am))
 
     # Project both hands to screen + compute the distance/midpoint. We do this both
     # when CONFIRMED (`both`) AND, while already GRABBED, whenever both hand joints
@@ -1032,6 +1093,12 @@ def _poll_once(ctrl: "TwoHandController",
     decision = ctrl.update(both_engaged=both, hand_dist=hand_dist, midpoint=mid,
                            focused_rect=focused_rect, bounds=bounds, hands=hands,
                            body_id=body_id, left_grip=_lg, right_grip=_rg)
+    # A grab that ended because a hand came DOWN (the dead-man ran out) is the
+    # owner letting go: don't re-enter "holding" while the shared gate is still
+    # in its exit dwell, or the mode would blink off and straight back on as the
+    # hands drop (one release = one off edge). Cleared when the gate turns off.
+    if (shared_two and was_grabbed and not ctrl.is_grabbed and not lifts_up):
+        _regrab_blocked[0] = True
 
     # STAND DOWN the single-hand air-mouse whenever two-hand mode is active (incl.
     # the pre-grab hold) so the two never fight the cursor.

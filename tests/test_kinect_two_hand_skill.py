@@ -612,6 +612,21 @@ class TwoHandControllerTests(_Base):
 #  WIN32 WIRING — a grabbed window is SetWindowPos'd with the SCALED rect
 # ══════════════════════════════════════════════════════════════════════════
 class PollWin32Tests(_Base):
+    def _load(self):
+        # HERMETIC (2026-10-04): the GRAB edge consults the air-mouse's real-input
+        # yield and its per-app stand-down, which read the REAL desktop (the last
+        # real keyboard/mouse input and the foreground window title). With a
+        # browser showing "YouTube - ..." in front, both resize tests failed on
+        # origin/main d5931da as well. Pin them to "not blocked"; the blocking
+        # behaviour itself is covered by the grab-edge tests that patch them.
+        mod = super()._load()
+        for name, fake in (("real_input_recent", lambda *a, **k: False),
+                           ("_per_app_disabled", lambda: False)):
+            p = mock.patch.object(self._am, name, fake)
+            p.start()
+            self.addCleanup(p.stop)
+        return mod
+
     def _spy_win32(self):
         """A mock Win32: foreground_target returns a fixed (hwnd, rect); set_window_pos
         records every (hwnd, rect) it's asked to apply."""

@@ -240,6 +240,14 @@ class GestureRecognizer:
         if sample is None:
             return None
         sample["t"] = now
+        # SIDE LOCK (2026-10-04). The sampled hand is re-chosen every tick (the
+        # higher one), so with BOTH hands up it alternates left/right - and the
+        # history then holds a left-hand x next to a right-hand x ~0.4 m apart:
+        # a phantom 0.4 m "swipe" or a run of fake wave "reversals" (a false
+        # SWIPE cancels speech and a pending confirmation). A change of side
+        # therefore CLEARS the history: every detector only ever sees one hand.
+        if self._hist and self._hist[-1].get("side") != sample.get("side"):
+            self._hist.clear()
         self._hist.append(sample)
 
         # Global debounce: nothing fires during the cooldown window.

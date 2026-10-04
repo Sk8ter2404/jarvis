@@ -1472,6 +1472,17 @@ class AirMouseController:
         # 1-frame open flicker on a held fist doesn't drop it).
         self._fist_release_latched = False
         self._latch_open_streak = 0
+        # WHY the cursor was last let go while engaged ("" until it happens) —
+        # logged on the telemetry line, because the 2026-10-04 13:28:36 release
+        # (lift +0.42, no yield) could not be explained from the log.
+        self._release_reason = ""
+
+    @property
+    def last_release_reason(self) -> str:
+        """Why the most recent ENGAGED→released transition happened ("yield",
+        "per-app", "tracking-lost", "body-changed", "two-hand", "lowered",
+        "fist-release", "gate"), or "" if it never has. NEVER raises."""
+        return self._release_reason
 
     def reset(self) -> None:
         """Drop all smoothing + grip + engage state. Used by the dead-man and on
@@ -1542,12 +1553,16 @@ class AirMouseController:
         opens. Exposed for the debug telemetry so a jitter repro is diagnosable."""
         return self._fist_release_latched
 
-    def release_decision(self) -> AirMouseDecision:
+    def release_decision(self, reason: str = "") -> AirMouseDecision:
         """The DEAD-MAN / disengaged decision: if a button was held, command it
         UP (per hand); hide the overlay; clear smoothing + grips + engage so the
         next acquisition snaps. cursor=None so the live loop issues NO
         SetCursorPos and the physical mouse is free. Idempotent — once released,
-        repeated calls just keep the overlay hidden with no button edge."""
+        repeated calls just keep the overlay hidden with no button edge.
+        `reason` is remembered (last_release_reason) only when this call ends
+        an ENGAGEMENT, so the telemetry can say why the cursor was let go."""
+        if self._engaged and reason:
+            self._release_reason = str(reason)
         left = "up" if self._left_down else None
         right = "up" if self._right_down else None
         self._left_down = False
@@ -1663,18 +1678,32 @@ class AirMouseController:
             return True
 
     def _select_controlling_arm(self, left_ext, right_ext,
-                                thresholds: "Optional[dict]"):
+                                thresholds: "Optional[dict]",
+                                preferred_side: "Optional[str]" = None):
         """Pick the cursor-driving arm with HAND-HYSTERESIS (ISSUE 3). Keeps the
         current controlling hand unless the OTHER arm out-reaches it by the margin
         for `switch_frames` consecutive frames; a brief or marginal lead never
         flips control. Updates the challenger streak as a side effect and returns
-        the chosen ArmExtension (or None when neither arm is extended)."""
+        the chosen ArmExtension (or None when neither arm is extended).
+
+        `preferred_side` is the SHARED stabiliser's active hand (2026-10-04): when
+        it names an arm that is a candidate, that arm drives - the stabiliser's
+        sticky rule (raised + clear lead held for a dwell, holder kept through a
+        tracking gap) is the ONE active-hand rule every consumer agrees on. The
+        per-poll streak below is only the fallback for a bridge without the
+        shared layer, or the instant before the shared gate has named a hand."""
         candidates = extended_arms(left_ext, right_ext, engaged=self._engaged,
                                    thresholds=thresholds)
         if not candidates:
             self._challenge_side = None
             self._challenge_count = 0
             return None
+        if preferred_side is not None:
+            pref = next((a for a in candidates if a.side == preferred_side), None)
+            if pref is not None:
+                self._challenge_side = None
+                self._challenge_count = 0
+                return pref
         best = max(candidates, key=lambda a: a.reach_score())
         # Is the hand currently driving still a live candidate?
         holder = next((a for a in candidates if a.side == self._hand), None)
@@ -1735,7 +1764,9 @@ class AirMouseController:
                tracked: bool, thresholds: "Optional[dict]" = None,
                real_input_recent: bool = False, body_id=None,
                facing_deg=None, armed: "Optional[bool]" = None,
-               per_app_disabled: bool = False
+               per_app_disabled: bool = False,
+               two_hand: "Optional[bool]" = None,
+               active_side: "Optional[str]" = None
                ) -> AirMouseDecision:
         """Advance one frame.
 
@@ -1761,6 +1792,12 @@ class AirMouseController:
             gate). None → read the module _air_mouse_armed flag live.
         per_app_disabled: True when the FOREGROUND app matches a disabled-app hint —
             the air-mouse STANDS DOWN (force-disengage + no engage) this frame.
+        two_hand: the SHARED stabiliser's two-hand verdict (dwell + hysteresis +
+            re-arm, audio/kinect_stabilizer.TwoHandGate). None (no shared layer)
+            falls back to the legacy per-frame both-hands-raised pre-empt.
+        active_side: the SHARED stabiliser's sticky active hand (in this
+            controller's labels, i.e. already mirrored); preferred whenever it is
+            a candidate. None → the per-poll hand hysteresis below.
 
         DISENGAGES (returns cursor=None — no SetCursorPos — and releases any held
         button) when real input is recent (AUTO-YIELD), when the foreground app is
@@ -1794,7 +1831,7 @@ class AirMouseController:
         #    immediately, and the air-mouse cannot re-engage until the window
         #    elapses. This is checked FIRST so it overrides a raised hand. ────────
         if real_input_recent:
-            return self.release_decision()
+            return self.release_decision("yield")
         # ── PER-APP DISABLE: the foreground app is on the disabled-app list (a
         #    fullscreen game/video, say). STAND DOWN — release + no engage, exactly
         #    like a yield — so a stray cursor grab can't disrupt it. Defensive: the
@@ -1802,7 +1839,7 @@ class AirMouseController:
         #    fires on a positive match. Checked before the pose gate so it overrides
         #    a valid pose. ─────────────────────────────────────────────────────────
         if per_app_disabled:
-            return self.release_decision()
+            return self.release_decision("per-app")
         # ── tracking-loss path, with a short grace so a 1-frame dropout doesn't
         #    disengage + re-snap (a held drag must survive a flicker). ──────────
         if not tracked:
@@ -1825,7 +1862,7 @@ class AirMouseController:
                 return AirMouseDecision(cursor=None, left=None, right=None,
                                         overlay=overlay, hand=self._hand,
                                         grip=self._controlling_grip())
-            return self.release_decision()
+            return self.release_decision("tracking-lost")
 
         # ── BODY-ID PIN (FILTER 6): while engaged we drive ONLY the body that took
         #    control. If the nearest-body id changed under us (a closer 2nd person
@@ -1835,7 +1872,7 @@ class AirMouseController:
         #    cleanly. body_id None (caller didn't supply one) disables the pin. ───
         if (self._engaged and self._locked_body_id is not None
                 and body_id is not None and body_id != self._locked_body_id):
-            return self.release_decision()
+            return self.release_decision("body-changed")
 
         # FILTER 7: a fully-Tracked frame — advance the re-acquisition streak and,
         # once solidly back (≥ retrack_frames in a row), zero the untracked budget
@@ -1849,14 +1886,24 @@ class AirMouseController:
         #    waiting for the cross-process two-hand heartbeat (which lags a frame).
         #    This closes the 1-frame entry twitch where the single-hand cursor would
         #    grab one hand on the very frame the owner raised the second. Computed
-        #    with the strict ENGAGE bar so it matches the two-hand poller's gate. ─
-        if self._both_hands_raised(left_ext, right_ext, thresholds):
-            return self.release_decision()
+        #    with the strict ENGAGE bar so it matches the two-hand poller's gate.
+        #    2026-10-04: when the SHARED stabiliser supplies its two-hand verdict
+        #    (dwell + hysteresis + re-arm) THAT is the rule - the per-frame check
+        #    is what flapped two-hand mode 51 times in 28 min and stood the
+        #    cursor down on every flap. The per-frame check only remains for a
+        #    caller with no shared layer. ───────────────────────────────────────
+        if two_hand is None:
+            pre_empt = self._both_hands_raised(left_ext, right_ext, thresholds)
+        else:
+            pre_empt = bool(two_hand)
+        if pre_empt:
+            return self.release_decision("two-hand")
 
         # ── HEIGHT gate: pick the controlling hand (highest above the shoulder,
         #    engage hysteresis + sticky hand-hysteresis). No hand raised above the
         #    line → disengage (fail SAFE, the real mouse is left alone). ─────────
-        arm = self._select_controlling_arm(left_ext, right_ext, thresholds)
+        arm = self._select_controlling_arm(left_ext, right_ext, thresholds,
+                                           preferred_side=active_side)
         if arm is None:
             # Hand LOWERED (below the engage line). Clear the fist-release latch so
             # it can never get stuck: the latch's job is only to stop a re-grab
@@ -1864,7 +1911,7 @@ class AirMouseController:
             # "done" that resets it (the next raise starts fresh).
             self._fist_release_latched = False
             self._latch_open_streak = 0
-            return self.release_decision()
+            return self.release_decision("lowered")
 
         # ── ADVANCE the grip debouncers ONCE per tracked frame (FILTER 4: an
         #    untracked/inferred hand is fed "unknown" so it can never latch a click).
@@ -2036,7 +2083,7 @@ class AirMouseController:
             self._prime = 0.0
             if self._engaged:
                 # Was engaged but the (armed) gate dropped lift → full release.
-                return self.release_decision()
+                return self.release_decision("gate")
             return self._hold_off_decision(prime=0.0)
 
         # ── ENGAGED. On the rising edge (was disengaged) snap the smoothing to
@@ -2091,7 +2138,7 @@ class AirMouseController:
                     # only when the hand OPENS again (see the gate above).
                     self._fist_release_latched = True
                     self._latch_open_streak = 0
-                    return self.release_decision()
+                    return self.release_decision("fist-release")
             else:
                 self._fist_closed_at = None
 
@@ -2376,10 +2423,13 @@ def _reach_thresholds() -> dict:
     str_e = _saved_float(s, SETTING_STRAIGHT_ENGAGE)
     str_d = _saved_float(s, SETTING_STRAIGHT_DISENGAGE)
     return {
-        # The PRIMARY height-gate margins (persisted override or module default).
-        "up_margin": up_m if up_m is not None else AIR_MOUSE_ENGAGE_UP_MARGIN_M,
+        # The PRIMARY height-gate margins (persisted override, else the live
+        # core.config KINECT_LIFT_* value - the SAME keys the shared stabiliser's
+        # raised gate reads, so the two can't disagree - else the module default).
+        "up_margin": up_m if up_m is not None
+        else _cfg_float(SETTING_UP_MARGIN, AIR_MOUSE_ENGAGE_UP_MARGIN_M),
         "down_margin": down_m if down_m is not None
-        else AIR_MOUSE_ENGAGE_DOWN_MARGIN_M,
+        else _cfg_float(SETTING_DOWN_MARGIN, AIR_MOUSE_ENGAGE_DOWN_MARGIN_M),
         # DEMOTED forward / straightness cues — permissive (≈0) by default so they
         # never gate; only the persisted KINECT_REACH_* / KINECT_STRAIGHT_* keys (if
         # the owner sets them) re-enable a secondary bar.
@@ -2890,6 +2940,18 @@ _last_body_id: list = [None]
 # a None facing as "facing OK" so it never becomes an un-passable gate.
 _last_facing_deg: list = [None]
 
+# SHARED STABILISER stashes (2026-10-04), filled by _hand_sample() alongside
+# _last_body_id so the 5-tuple return keeps its arity for every caller:
+#   _last_tracked_frame[0] — the bridge snapshot this tick read (or None);
+#   _last_two_hand[0]      — its two-hand verdict (None = no shared layer, the
+#                            callers then use their legacy per-frame check);
+#   _last_active_side[0]   — its sticky active hand, MIRRORED like the arms.
+# The two-hand poller reads the same stashes (it samples through _hand_sample),
+# so both pollers act on the one shared verdict.
+_last_tracked_frame: list = [None]
+_last_two_hand: list = [None]
+_last_active_side: list = [None]
+
 
 def _body_facing_deg(body: dict) -> "Optional[float]":
     """|facing yaw| in degrees from square for a bridge body dict, or None when
@@ -2923,21 +2985,55 @@ def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtensi
     body's id in _last_body_id[0] (FILTER 6) — None when no body. NEVER raises —
     any failure degrades to (None, None, "unknown", "unknown", False) which the
     controller treats as a dead-man release (no arm extended / not tracked →
-    disengaged)."""
+    disengaged).
+
+    The stashes are written once, at the END (never reset-then-filled), so a
+    reader on another thread never sees a half-written sample. The two pollers
+    themselves use _hand_sample_ex() and act on their OWN extras instead of the
+    shared stashes (2026-10-04: the air-mouse could read the two-hand thread's
+    None body id / facing from these module slots)."""
+    result, ex = _hand_sample_ex(bridge)
+    _publish_sample_stashes(ex)
+    return result
+
+
+def _publish_sample_stashes(ex: dict) -> None:
+    """Write one sample's extras to the module stashes, each slot whole."""
+    _last_body_id[0] = ex.get("body_id")
+    _last_facing_deg[0] = ex.get("facing_deg")
+    _last_tracked_frame[0] = ex.get("frame")
+    _last_two_hand[0] = ex.get("two_hand")
+    _last_active_side[0] = ex.get("active")
+
+
+def _hand_sample_ex(bridge) -> tuple:
+    """_hand_sample()'s 5-tuple plus this call's own extras:
+    {"body_id", "facing_deg", "frame" (shared snapshot or None), "two_hand"
+    (shared verdict, None without the shared layer), "active" (shared active
+    hand, mirrored like the arms)}. NEVER raises."""
     none_result = (None, None, "unknown", "unknown", False)
-    _last_body_id[0] = None
-    _last_facing_deg[0] = None
+    ex = {"body_id": None, "facing_deg": None, "frame": None,
+          "two_hand": None, "active": None}
     try:
         if not bridge.get_enabled():
-            return none_result
+            return none_result, ex
         ok, _reason = bridge.available()
         if not ok:
-            return none_result
+            return none_result, ex
+        shared = getattr(bridge, "get_tracked_frame", None)
+        if callable(shared):
+            # THE SHARED STABILISER (audio/kinect_stabilizer via the bridge): one
+            # owner body, filtered hand positions, held-through-gap lifts,
+            # High-confidence grips, the sticky active hand and the two-hand
+            # verdict - the same snapshot the two-hand poller, gestures and
+            # pointing read. The raw get_bodies() path below is only for a
+            # bridge (or test fake) without it.
+            return _hand_sample_shared(shared())
         bodies = bridge.get_bodies()
     except Exception:
-        return none_result
+        return none_result, ex
     if not bodies:
-        return none_result
+        return none_result, ex
 
     # Nearest body (same ranking the rest of the stack uses).
     def _key(b):
@@ -2946,19 +3042,19 @@ def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtensi
     try:
         body = min((b for b in bodies if isinstance(b, dict)), key=_key)
     except (TypeError, ValueError):
-        return none_result
+        return none_result, ex
 
-    # Stash the controlling body's id for the FILTER 6 pin (best-effort).
+    # The controlling body's id for the FILTER 6 pin (best-effort).
     try:
-        _last_body_id[0] = body.get("id")
+        ex["body_id"] = body.get("id")
     except Exception:
-        _last_body_id[0] = None
-    # Stash the body's FACING yaw for the PASSIVE smart-engage facing gate (None
-    # when unavailable → treated as facing OK downstream).
+        ex["body_id"] = None
+    # The body's FACING yaw for the PASSIVE smart-engage facing gate (None when
+    # unavailable → treated as facing OK downstream).
     try:
-        _last_facing_deg[0] = _body_facing_deg(body)
+        ex["facing_deg"] = _body_facing_deg(body)
     except Exception:
-        _last_facing_deg[0] = None
+        ex["facing_deg"] = None
 
     joints = body.get("joints") or {}
     left_grip = (body.get("hand_left") or "unknown").lower()
@@ -2975,7 +3071,109 @@ def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtensi
         left_ext, right_ext = (_relabel_arm_side(right_ext, "left"),
                                _relabel_arm_side(left_ext, "right"))
         left_grip, right_grip = right_grip, left_grip
-    return left_ext, right_ext, left_grip, right_grip, True
+    return (left_ext, right_ext, left_grip, right_grip, True), ex
+
+
+_MIRROR_SIDE = {"left": "right", "right": "left"}
+
+
+def _arm_from_shared(hv: "Optional[dict]", side: str) -> "ArmExtension":
+    """One arm's ArmExtension built from a SHARED snapshot hand view: the hand
+    joint is the stabiliser's FILTERED position (TrackingState slot 2 - it is
+    only published while measured or inside the loss grace), lift_m the
+    stabiliser's held-through-gap lift (None once the hand is truly gone), and
+    the reach / straightness cues the bridge's arm_extension computed on that
+    frame's raw joints. A missing hand gives hand=None (never extended). PURE;
+    NEVER raises."""
+    try:
+        if not hv or hv.get("pos") is None:
+            return ArmExtension(side, None, None, None)
+        ext = hv.get("ext") or {}
+        p = hv["pos"]
+        return ArmExtension(side, ext.get("forward_reach_m"),
+                            ext.get("straightness"),
+                            (float(p[0]), float(p[1]), float(p[2]), 2),
+                            reach_ratio=ext.get("reach_ratio"),
+                            lift_m=hv.get("lift"),
+                            shoulder_ref_y=ext.get("shoulder_ref_y"))
+    except Exception:
+        return ArmExtension(side, None, None, None)
+
+
+def _hand_sample_shared(snap: "Optional[dict]") -> tuple:
+    """_hand_sample_ex() over the bridge's SHARED snapshot (get_tracked_frame):
+    the same 5-tuple plus the extras, including the shared two-hand verdict and
+    active hand. The grips returned are the stabiliser's STABLE grips (High
+    confidence, time-debounced), so the controller built by _new_controller()
+    passes them straight through. A stale snapshot (no new body frame for the
+    owner-loss grace - the pump starved or the sensor stopped) reads as NOT
+    tracked. NEVER raises."""
+    none_result = (None, None, "unknown", "unknown", False)
+    ex = {"body_id": None, "facing_deg": None, "frame": snap,
+          "two_hand": False, "active": None}
+    try:
+        if not snap or snap.get("stale") or not snap.get("tracked"):
+            return none_result, ex
+        owner = snap.get("owner") or {}
+        ex["body_id"] = snap.get("owner_id")
+        try:
+            ex["facing_deg"] = _body_facing_deg(owner)
+        except Exception:
+            ex["facing_deg"] = None
+        ex["two_hand"] = bool(snap.get("two_hand"))
+        hands = snap.get("hands") or {}
+        lv, rv = hands.get("left") or {}, hands.get("right") or {}
+        left_ext = _arm_from_shared(lv, "left")
+        right_ext = _arm_from_shared(rv, "right")
+        left_grip = str(lv.get("grip") or "unknown").lower()
+        right_grip = str(rv.get("grip") or "unknown").lower()
+        active = snap.get("active")
+        if _hand_mirror_enabled():
+            left_ext, right_ext = (_relabel_arm_side(right_ext, "left"),
+                                   _relabel_arm_side(left_ext, "right"))
+            left_grip, right_grip = right_grip, left_grip
+            active = _MIRROR_SIDE.get(active)
+        ex["active"] = active if active in ("left", "right") else None
+        return (left_ext, right_ext, left_grip, right_grip, True), ex
+    except Exception:
+        return none_result, ex
+
+
+def _publish_lift_margins(bridge, thresholds: "Optional[dict]") -> None:
+    """Push this gate's live up/down lift margins (the owner's calibration, or
+    the KINECT_LIFT_* defaults) into the bridge's shared stabiliser so its
+    raised / two-hand / active-hand gates use exactly the same lines. NEVER
+    raises; a bridge without set_lift_margins is left alone."""
+    try:
+        fn = getattr(bridge, "set_lift_margins", None)
+        if callable(fn) and thresholds:
+            fn(thresholds.get("up_margin"), thresholds.get("down_margin"))
+    except Exception:
+        pass
+
+
+def _bridge_has_shared_layer(bridge) -> bool:
+    """True when `bridge` publishes the shared stabiliser snapshot."""
+    return callable(getattr(bridge, "get_tracked_frame", None))
+
+
+def _new_controller(bridge, reach: "Optional[ReachBox]" = None
+                    ) -> "AirMouseController":
+    """The controller the LIVE poller runs. Over the SHARED stabiliser the
+    per-poll smoothing, grip debounce and tracking grace move OUT of the
+    controller - the stabiliser already did them once per real frame, on frame
+    time, and doing them again per poll would (a) add a second EMA's lag to the
+    One Euro filter, (b) count a frame read twice as two grip frames (the
+    2026-10-04 duplicate-read click), and (c) stack a second 0.3 s grace on top
+    of the shared one. So: EMA alpha 1.0 (pass-through), grip debounce 1/1
+    (pass-through), grace 0 (the shared loss grace is the one grace). Without
+    the shared layer the shipped per-poll defaults stay. The replay harness
+    builds its controller here too, so it runs exactly the live configuration."""
+    rb = reach if reach is not None else _reach_box_for_virtual_desktop(refresh=True)
+    if _bridge_has_shared_layer(bridge):
+        return AirMouseController(rb, alpha=1.0, debounce_frames=1,
+                                  close_debounce_frames=1, grace_sec=0.0)
+    return AirMouseController(rb)
 
 
 def _relabel_arm_side(ext: "Optional[ArmExtension]",
@@ -3044,6 +3242,8 @@ def _persist_reach_thresholds(th: dict) -> bool:
     ok = True
     ok = _persist_setting(SETTING_UP_MARGIN, float(th["up_margin"])) and ok
     ok = _persist_setting(SETTING_DOWN_MARGIN, float(th["down_margin"])) and ok
+    # (The shared stabiliser picks the new margins up on the very next poll:
+    # _poll_once pushes _reach_thresholds() into it via _publish_lift_margins.)
     ok = _persist_setting(SETTING_STRAIGHT_ENGAGE,
                           float(th["straight_engage"])) and ok
     ok = _persist_setting(SETTING_STRAIGHT_DISENGAGE,
@@ -3200,6 +3400,37 @@ def _debounced_grip_for(arm, ctrl) -> str:
         return "?"
 
 
+def _logged_arm(left_ext, right_ext):
+    """The arm the telemetry line describes: the SHARED stabiliser's active hand
+    when it names one (stable - the 2026-10-04 log's 65 left/right flips were the
+    old highest-arm pick re-chosen every line), else the highest-raised arm.
+    NEVER raises."""
+    try:
+        arms = [a for a in (left_ext, right_ext) if a is not None]
+        if not arms:
+            return None
+        side = _last_active_side[0]
+        for a in arms:
+            if side is not None and a.side == side:
+                return a
+        return max(arms, key=lambda a: a.reach_score())
+    except Exception:
+        return None
+
+
+def _shared_view_for(side: "Optional[str]") -> dict:
+    """The shared snapshot's hand view for a controller-label `side` (undoing
+    the mirror swap), or {} when unavailable. NEVER raises."""
+    try:
+        snap = _last_tracked_frame[0]
+        if not snap or side not in ("left", "right"):
+            return {}
+        sdk = _MIRROR_SIDE[side] if _hand_mirror_enabled() else side
+        return (snap.get("hands") or {}).get(sdk) or {}
+    except Exception:
+        return {}
+
+
 def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
                         yielding: "Optional[bool]" = None) -> str:
     """The telemetry line. Leads with the HEIGHT delta (lift = hand_y minus the
@@ -3207,10 +3438,14 @@ def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
     side, engaged, and the auto-YIELD state; then the demoted reach/straight cues
     for context. `yielding` is resolved by _maybe_debug_log (so the printed line
     agrees with the transition signature). PURE-ish (reads ctrl state); NEVER
-    raises."""
+    raises.
+
+    2026-10-04: with the shared stabiliser it also says where the hand position
+    came from (src=hand|wrist|inferred|hold), the raw grip confidence, the shared
+    two-hand verdict and WHY the cursor was last released (why=) - the four
+    things the 13:09 log could not answer."""
     try:
-        arms = [a for a in (left_ext, right_ext) if a is not None]
-        arm = max(arms, key=lambda a: a.reach_score()) if arms else None
+        arm = _logged_arm(left_ext, right_ext)
         if arm is None:
             lift_s = "n/a"
             reach_s, straight_s, hand_s = "n/a", "n/a", "none"
@@ -3222,10 +3457,19 @@ def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
             hand_s = arm.side or "?"
         grip_s = _debounced_grip_for(arm, ctrl)
         latch_s = bool(getattr(ctrl, "fist_release_latched", False))
-        return ("  [air-mouse] lift=%s hand=%s grip=%s engaged=%s latch=%s "
+        line = ("  [air-mouse] lift=%s hand=%s grip=%s engaged=%s latch=%s "
                 "yield=%s reach=%s straight=%s tracked=%s"
                 % (lift_s, hand_s, grip_s, bool(ctrl.engaged), latch_s,
                    bool(yielding), reach_s, straight_s, bool(tracked)))
+        if _last_tracked_frame[0] is not None:
+            hv = _shared_view_for(arm.side if arm is not None else None)
+            line += (" src=%s conf=%s two=%s"
+                     % (hv.get("source") or "none", hv.get("conf") or "?",
+                        bool(_last_two_hand[0])))
+        why = getattr(ctrl, "last_release_reason", "")
+        if why and not bool(getattr(ctrl, "engaged", False)):
+            line += " why=%s" % why
+        return line
     except Exception:
         return "  [air-mouse] lift=? hand=? engaged=? yield=? reach=? straight=?"
 
@@ -3255,8 +3499,7 @@ def _maybe_debug_log(left_ext, right_ext, tracked: bool, ctrl,
         # a transition only WHILE engaged/latched (a controlling-hand switch is
         # a real event); on a DISENGAGED body the highest-raised-arm designation
         # flaps left↔right constantly, so collapse it to mere presence.
-        arms = [a for a in (left_ext, right_ext) if a is not None]
-        arm = max(arms, key=lambda a: a.reach_score()) if arms else None
+        arm = _logged_arm(left_ext, right_ext)
         engaged = bool(getattr(ctrl, "engaged", False))
         latch = bool(getattr(ctrl, "fist_release_latched", False))
         if engaged or latch:
@@ -3301,11 +3544,18 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     instantly and releases any held button via the dead-man path."""
     if bridge is None:
         return None
-    left_ext, right_ext, left_grip, right_grip, tracked = _hand_sample(bridge)
+    (left_ext, right_ext, left_grip, right_grip, tracked), sample_ex = \
+        _hand_sample_ex(bridge)
+    # Publish the stashes for the telemetry line / other readers (each slot
+    # written whole); THIS poll acts only on its own sample_ex below.
+    _publish_sample_stashes(sample_ex)
     # Live engage bars (owner's persisted height margins / calibration or the
     # defaults), read fresh each tick so a tweak takes effect with no restart. The
     # controller applies them in its height engage hysteresis.
     thresholds = _reach_thresholds()
+    # Keep the SHARED stabiliser's raised gate on the same margins as this gate
+    # (a calibration lands in both at once). No-op for a bridge without it.
+    _publish_lift_margins(bridge, thresholds)
     # AUTO-YIELD: has the owner touched their REAL mouse/keyboard recently? If so
     # the controller force-disengages + stays suppressed this frame so the real
     # input always wins. Lazily ensure the watcher is installed (the LL hook, or
@@ -3318,27 +3568,43 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     # held button, and stays suppressed this frame. (Fresh-heartbeat-gated, so a
     # dead two-hand poller can't strand the cursor.)
     two_hand = two_hand_active()
-    yielding = real_input_recent() or two_hand
+    real_input = real_input_recent()
+    yielding = real_input or two_hand
     # The nearest body's id this tick (stashed by _hand_sample) so the controller
     # PINS the controlling body and releases — rather than silently retargets — if
     # a closer 2nd person steals the "nearest" slot mid-drag (FILTER 6).
-    body_id = _last_body_id[0]
+    body_id = sample_ex["body_id"]
     # The body's FACING yaw (|deg from square|, or None) for the PASSIVE smart-pose
     # facing gate; the module ARMED flag (relaxed gate when the owner asked for the
     # cursor); and the PER-APP disable (stand down over a fullscreen game/video).
-    facing_deg = _last_facing_deg[0]
+    facing_deg = sample_ex["facing_deg"]
     armed = air_mouse_is_armed()
     per_app_disabled = _per_app_disabled()
+    # The SHARED stabiliser's verdicts (None without the shared layer → the
+    # controller's legacy per-frame rules): two-hand mode and the sticky active
+    # hand, the same ones the two-hand poller and gestures act on.
+    shared_two_hand = sample_ex["two_hand"]
+    shared_active = sample_ex["active"]
+    if shared_two_hand is not None:
+        # Shared layer: two-hand mode (its verdict, or the two-hand poller's
+        # heartbeat) is its own stand-down reason, and only REAL input yields -
+        # so the release is logged as what it was ("two-hand" vs "yield").
+        shared_two_hand = bool(shared_two_hand or two_hand)
+        ctrl_yield = real_input
+    else:
+        ctrl_yield = yielding
     try:
         decision = ctrl.update(left_ext, right_ext, left_grip, right_grip,
                                tracked, thresholds=thresholds,
-                               real_input_recent=yielding, body_id=body_id,
+                               real_input_recent=ctrl_yield, body_id=body_id,
                                facing_deg=facing_deg, armed=armed,
-                               per_app_disabled=per_app_disabled)
+                               per_app_disabled=per_app_disabled,
+                               two_hand=shared_two_hand,
+                               active_side=shared_active)
     except Exception:
         # A controller error must not strand a held button — force a release.
         try:
-            decision = ctrl.release_decision()
+            decision = ctrl.release_decision("error")
         except Exception:
             return None
 
@@ -3408,7 +3674,9 @@ def _poll_loop() -> None:  # pragma: no cover - non-terminating daemon; each tic
         print("  [air-mouse] kinect_bridge unavailable — poller exiting")
         return
     # Map across the WHOLE virtual desktop (all monitors), not just primary.
-    ctrl = AirMouseController(_reach_box_for_virtual_desktop(refresh=True))
+    # _new_controller picks the shared-stabiliser configuration when the bridge
+    # publishes get_tracked_frame (the live bridge does).
+    ctrl = _new_controller(bridge)
     was_enabled = False
     last_bounds_refresh = time.time()
     while True:

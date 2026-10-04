@@ -408,6 +408,47 @@ def get_last_gesture() -> dict:
 
 # ─── poll loop ─────────────────────────────────────────────────────────────
 
+# Monotonic time until which gestures stay muted after the air-mouse / two-hand
+# mode let go (see KINECT_GESTURE_RELEASE_MUTE_SEC). Module-list per house style.
+_muted_until = [0.0]
+_RELEASE_MUTE_SEC_DEFAULT = 0.5
+
+
+def _release_mute_sec() -> float:
+    try:
+        from core import config as _c
+        return max(0.0, float(getattr(_c, "KINECT_GESTURE_RELEASE_MUTE_SEC",
+                                      _RELEASE_MUTE_SEC_DEFAULT)))
+    except Exception:
+        return _RELEASE_MUTE_SEC_DEFAULT
+
+
+def _owner_bodies(kb) -> list:
+    """The bodies the recognizer reads. With the bridge's SHARED stabiliser that
+    is ONLY the owner body it tracks (sticky by id - the same body the air-mouse
+    and two-hand mode act on), so a second person or a reflection can't feed the
+    recognizer and the gesture body can't hop between people frame to frame.
+    Falls back to every tracked body (the recognizer then picks) without the
+    shared layer or before it has an owner. NEVER raises."""
+    try:
+        fn = getattr(kb, "get_tracked_frame", None)
+        if callable(fn):
+            snap = fn()
+            if snap and not snap.get("stale"):
+                owner = snap.get("owner")
+                if snap.get("fresh") and isinstance(owner, dict):
+                    return [owner]
+                if snap.get("tracked"):
+                    # Owner held through a dropout: no NEW sample this tick.
+                    return []
+    except Exception:
+        pass
+    try:
+        return kb.get_bodies()
+    except Exception:
+        return []
+
+
 def _poll_once(rec, bc) -> str | None:
     """One recognizer tick: read the skeleton stream, update the recognizer,
     dispatch any gesture. Returns the gesture name (for tests) or None. NEVER
@@ -431,7 +472,20 @@ def _poll_once(rec, bc) -> str | None:
     # Suppress gestures while the air-mouse owns the cursor (arm extended) OR while
     # two-hand resize mode is driving. Reset the recognizer so no stale reach/resize
     # motion lingers to fire on disengage.
+    now = time.monotonic()
     if _air_mouse_engaged() or _two_hand_active():
+        _muted_until[0] = now + _release_mute_sec()
+        try:
+            rec.reset()
+        except Exception:
+            pass
+        return None
+    # RELEASE MUTE (2026-10-04): ...and for a moment AFTER they let go, because
+    # the arm coming DOWN from the cursor / a two-hand resize is a fast lateral
+    # sweep the recognizer would happily read as a SWIPE ("never mind": speech
+    # cut, pending confirmation cleared). Reset again so the descent can't sit in
+    # the history either.
+    if now < _muted_until[0]:
         try:
             rec.reset()
         except Exception:
@@ -443,7 +497,7 @@ def _poll_once(rec, bc) -> str | None:
         ok, _reason = kb.available()
         if not ok:
             return None
-        bodies = kb.get_bodies()
+        bodies = _owner_bodies(kb)
     except Exception:
         return None
     try:

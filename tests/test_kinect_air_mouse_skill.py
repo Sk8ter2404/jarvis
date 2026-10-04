@@ -218,7 +218,12 @@ class _Base(unittest.TestCase):
         # real_input_recent themselves (a nested patch wins).
         p7 = mock.patch.object(mod, "_install_yield_watcher", lambda *a, **k: False)
         p8 = mock.patch.object(mod, "real_input_recent", lambda *a, **k: False)
-        for p in (p1, p2, p3, p4, p5, p6, p7, p8):
+        # ...and never read the REAL foreground window for the per-app stand-down
+        # (2026-10-04: with a browser titled "YouTube - ..." in front, 15 of these
+        # poll tests failed on origin/main d5931da too). Tests that exercise the
+        # stand-down patch _per_app_disabled themselves (a nested patch wins).
+        p9 = mock.patch.object(mod, "_per_app_disabled", lambda: False)
+        for p in (p1, p2, p3, p4, p5, p6, p7, p8, p9):
             p.start()
             self.addCleanup(p.stop)
         return moves, buttons

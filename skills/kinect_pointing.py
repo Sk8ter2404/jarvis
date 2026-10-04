@@ -176,11 +176,13 @@ def _current_direction():
     kp = _pointing_module()
     if kb is None or kp is None:
         return None
-    try:
-        bodies = kb.get_bodies()
-    except Exception:
-        return None
-    body = _nearest_body(bodies)
+    body = _shared_owner_body(kb)
+    if body is None:
+        try:
+            bodies = kb.get_bodies()
+        except Exception:
+            return None
+        body = _nearest_body(bodies)
     if body is None:
         return None
     try:
@@ -190,6 +192,25 @@ def _current_direction():
     if ray is None:
         return None
     return ray[1]   # (origin, dir) → dir
+
+
+def _shared_owner_body(kb):
+    """The owner body the bridge's SHARED stabiliser tracks (sticky by id - the
+    same person the air-mouse, two-hand mode and gestures follow), when it was
+    seen on the latest frame; None otherwise (no shared layer, no owner, a stale
+    snapshot or an owner only held through a dropout), and the caller falls back
+    to the nearest raw body. NEVER raises."""
+    try:
+        fn = getattr(kb, "get_tracked_frame", None)
+        if not callable(fn):
+            return None
+        snap = fn()
+        if not snap or snap.get("stale") or not snap.get("fresh"):
+            return None
+        owner = snap.get("owner")
+        return owner if isinstance(owner, dict) else None
+    except Exception:
+        return None
 
 
 def _nearest_body(bodies):
