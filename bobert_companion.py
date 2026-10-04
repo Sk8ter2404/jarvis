@@ -38967,6 +38967,13 @@ def _filler_render(text: str):
             return None
         if res is None:
             return None
+        # ClipCache.warm stores the clip under the key it reads AFTER this
+        # render, and the key carries the engine kind: a clip rendered while
+        # the clone server came up (or was latched off) would otherwise be
+        # filed under the other voice and play in the wrong one. Drop it;
+        # the next warm renders that line again in the voice now speaking.
+        if _tts_engine_kind() != kind:
+            return None
         audio, sr = res
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
         if int(sr) <= 0 or audio.size == 0:

@@ -32,8 +32,9 @@ WHAT THIS MODULE DOES
     CONNECT_TIMEOUT_S, so a server that is gone costs half a second, not the
     ~2 s a refused loopback connect takes on Windows. Never raises.
   * MAX_FAILURES failed renders IN A ROW latch the clone off for the session
-    (one log line); the caller then voices everything with Kokoro. A success
-    resets the count.
+    (one log line); the caller then voices everything with Kokoro. A render
+    the server returns resets the count; a cache hit does not (no request
+    was made, so it says nothing about the server).
   * Every render is trimmed (the model leaves ~0.3 s of near-silence at the
     end) and loudness-matched to Kokoro's level, so a reply that mixes the
     two engines (one fallback line) does not jump in volume.
@@ -581,9 +582,21 @@ class CloneVoiceClient:
                 if spawned:
                     rc = self._proc.poll() if self._proc is not None else None
                     if rc is not None:
-                        where = f" (log: {log_path})" if log_path else ""
-                        return self._down(f"the server exited with code {rc} "
-                                          f"while loading{where}")
+                        # The server binds its port BEFORE it loads, so a
+                        # second instance exits at once (measured: code 4
+                        # after 121 ms, no GPU work) when another one holds
+                        # the port -- e.g. a restart racing the instance the
+                        # previous boot just spawned. Wait for that one
+                        # instead of writing the clone off for the session.
+                        code, h = self._health()
+                        if code not in (200, 503):
+                            where = f" (log: {log_path})" if log_path else ""
+                            return self._down(f"the server exited with code "
+                                              f"{rc} while loading{where}")
+                        spawned = False
+                        if code == 200 and h.get("ok"):
+                            return self._ready_from(h, want, "loaded", t0,
+                                                    on_ready, spawned=False)
                 self._sleep(BOOT_POLL_S)
                 code, h = self._health()
                 if code == 200 and h.get("ok"):
@@ -700,7 +713,11 @@ class CloneVoiceClient:
         key = hashlib.sha256((sha + "\0" + spoken).encode("utf-8")).hexdigest()
         hit = self._cache_get(key)
         if hit is not None:
-            self._succeeded()
+            # No request was made, so this says nothing about the server: it
+            # must NOT reset the failure streak. Otherwise a hung server never
+            # latches while cached acks come between the answers, and every
+            # new line waits out its whole deadline for the rest of the
+            # session.
             return Outcome(audio=hit[0].copy(), sr=hit[1], ms=0, cached=True)
         budget = render_budget_s(len(spoken), timeout_s)
         t0 = self._clock()

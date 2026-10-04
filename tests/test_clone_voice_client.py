@@ -245,6 +245,38 @@ class StartTests(_Base):
         self.assertEqual(len(self.logs), 1, self.logs)
         self.assertIn("exited with code 3", self.logs[0])
 
+    def test_a_second_instance_that_exits_adopts_the_one_holding_the_port(self):
+        # Two starters can race (a JARVIS restart while the server it just
+        # spawned is not yet listening): the late spawn cannot bind, exits at
+        # once (the real server: code 4, measured 121 ms, before any GPU
+        # work) -- and the instance that holds the port is waited for, not
+        # written off as "down" for the session.
+        port = free_port()              # nothing listening at first...
+        url = f"http://127.0.0.1:{port}"
+        later = []
+
+        def popen(argv, **kw):
+            # ...then the OTHER instance binds the port and loads; ours
+            # exits with "cannot bind".
+            s = FakeCloneServer(ref_sha=self.prof.sha, health_code=503,
+                                ok=False).start(port=port)
+            later.append(s)
+
+            def _ready():
+                time.sleep(0.15)
+                s.health_code, s.ok = 200, True
+            threading.Thread(target=_ready, daemon=True).start()
+            return _FakeProc(4)
+
+        self.addCleanup(lambda: [s.stop() for s in later])
+        c = self.client(popen=popen)
+        self.assertEqual(c.start(url=url, cmd="srv {ref} {port}",
+                                 profile="butler"), "ready", self.logs)
+        self.assertEqual(len(self.logs), 1, self.logs)
+        self.assertNotIn("exited", self.logs[0])
+        # Not ours: never asked to stop.
+        self.assertEqual(later[0].count("POST", "/shutdown"), 0)
+
     def test_server_that_never_comes_up_is_bounded(self):
         c = self.client(popen=lambda argv, **kw: _FakeProc(None),
                         boot_wait_s=0.3)
@@ -452,6 +484,30 @@ class LatchTests(_Base):
         for _ in range(cvc.MAX_FAILURES - 1):
             c.render("Fail again.", 2.5)
         self.assertEqual(c.status()[0], "ready")
+
+    def test_cache_hits_do_not_reset_the_failure_streak(self):
+        # A cached stock line says nothing about the server's health. If a
+        # cache hit reset the count, a hung server would never latch while
+        # acks ("Very good, sir.") came between the answers, and EVERY new
+        # line would wait out its whole deadline for the rest of the session.
+        srv = self.server()
+        c, _ = self.ready_client(srv)
+        self.assertTrue(c.render("Very good, sir.", 2.5).ok)
+        srv.tts_status = 500
+        for i in range(cvc.MAX_FAILURES):
+            self.assertEqual(c.status()[0], "ready")
+            self.assertFalse(c.render(f"New line {i}.", 2.5).ok)
+            if c.status()[0] == "ready":
+                hit = c.render("Very good, sir.", 2.5)
+                self.assertTrue(hit.ok and hit.cached)
+        self.assertEqual(c.status()[0], "latched", c.failures())
+        # A hit still reports success to its caller while the streak runs.
+        c2, srv2 = self.ready_client(self.server())
+        self.assertTrue(c2.render("Right away, sir.", 2.5).ok)
+        srv2.tts_status = 500
+        c2.render("Fails once.", 2.5)
+        self.assertTrue(c2.render("Right away, sir.", 2.5).cached)
+        self.assertEqual(c2.failures(), 1)
 
     def test_rearm_from_latched_or_down(self):
         c, srv = self.ready_client(self.server(tts_status=500))

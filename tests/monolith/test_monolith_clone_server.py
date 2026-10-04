@@ -223,6 +223,29 @@ class HealthyTests(_Base):
         self.assertGreaterEqual(longest, int(sr * 0.2))
         self.assertEqual(self.kokoro_texts, [])
 
+    def test_a_wry_line_whose_tail_fails_is_all_kokoro(self):
+        # Both clauses or neither: a clone head must never ship alone (or
+        # twice), and Kokoro then voices the WHOLE line with its own pause.
+        bc = self.bc
+        layer = types.SimpleNamespace(
+            split_for_wry_pause=lambda t: ("Splendid.", "Another meeting, sir."),
+            WRY_PAUSE_MS=200, is_muted=lambda: False)
+        self._p(bc, "_tts_layer", layer)
+        self._p(bc, "_resolve_tts_preset",
+                return_value=("wry", {"rate": "+0%", "pitch": "+0Hz",
+                                      "gain": 1.0}))
+        self.srv.fail_texts = {"Another meeting, sir."}
+        audio, sr = self.quiet(bc.synthesise, "Splendid. Another meeting, sir.")
+        self.assertEqual(self.srv.tts_texts(),
+                         ["Splendid.", "Another meeting, sir."])
+        self.assertEqual(self.kokoro_texts,
+                         ["Splendid.", "Another meeting, sir."])
+        # Only Kokoro's constant and the spliced pause: no clone samples.
+        a = self.np.asarray(audio)
+        self.assertTrue(bool(self.np.all((a == 0.0) | self.np.isclose(a, KOKORO))))
+        self.assertEqual(int(self.np.sum(self.np.isclose(a, KOKORO))), 2 * 2400)
+        self.assertIn("Kokoro voices this line", self.out)
+
     def test_the_fast_paths_run_with_the_clone(self):
         bc = self.bc
         plan = self.quiet(bc._sentence_tts_plan, REPLY)
@@ -487,6 +510,37 @@ class FillerAndPrerenderTests(_CloneMixin, _FillerBase):
         self.client._status = "latched"
         audio, _ = bc._filler_render("One moment.")
         self.assertTrue(self.is_kokoro(audio))
+
+    def test_a_clip_rendered_across_an_engine_switch_is_not_filed(self):
+        # ClipCache.warm files a clip under the key it reads AFTER the
+        # render. The server coming up mid-render must not file a Kokoro
+        # clip under the clone key (it would play in the wrong voice).
+        bc = self.bc
+        from core import processing_filler as pf
+        clips = pf.ClipCache(render_fn=bc._filler_render, lock=bc._SPEAK_LOCK,
+                             key_fn=bc._filler_voice_key)
+        self._p(bc, "_filler_clips", clips)
+        self.client._status = "starting"           # Kokoro voices clips now
+        real_k = bc._filler_voice_key()
+
+        def _kokoro_then_ready(text, speed=1.0):
+            self.kokoro_texts.append(text)
+            self.client._status = "ready"          # the server came up
+            return self.np.full(2400, KOKORO, dtype=self.np.float32), 24000
+        from core import kokoro_tts
+        self._p(kokoro_tts, "synthesize", side_effect=_kokoro_then_ready)
+        line = "Processing, sir."
+        stored = bc._filler_clips.warm([line], stop_fn=lambda: False,
+                                       wait_fn=lambda ev, s: None)
+        self.assertEqual(stored, 0)
+        self.assertEqual(self.kokoro_texts, [line])
+        self.assertNotEqual(bc._filler_voice_key(), real_k)
+        self.assertIsNone(bc._filler_clips.get(line))
+        # The next warm renders it in the voice now speaking.
+        self.assertEqual(bc._filler_clips.warm([line], stop_fn=lambda: False,
+                                               wait_fn=lambda ev, s: None), 1)
+        audio, _sr = bc._filler_clips.get(line)
+        self.assertTrue(self.is_clone(audio))
 
     def test_prerender_goes_through_the_clone_and_is_taken_in_the_lock(self):
         bc = self.bc
