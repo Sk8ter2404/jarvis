@@ -774,9 +774,9 @@ SCHEMA: dict[str, dict] = {
         "help": "'chatterbox' loads the model inside JARVIS. "
                 "'chatterbox_turbo_server' runs it in its own process (its "
                 "own Python and CUDA) and JARVIS sends it each sentence; "
-                "Kokoro voices any line it misses, and three failures in a "
-                "row switch the clone off until the next start. Applies on "
-                "the next start.",
+                "Kokoro voices any line it misses, and three missed lines in "
+                "a row rest the clone for 5 minutes (doubling, up to 30) "
+                "before it is tried again. Applies on the next start.",
     },
     "VOICE_CLONE_SERVER_URL": {
         "tab": "voice", "label": "Clone voice server address", "type": "str",
@@ -798,9 +798,11 @@ SCHEMA: dict[str, dict] = {
     "VOICE_CLONE_TIMEOUT_S": {
         "tab": "voice", "label": "Clone voice line timeout (s)",
         "type": "float", "default": 2.5, "min": 0.5, "max": 30,
-        "help": "How long one sentence may take on the clone voice server "
-                "before Kokoro voices it instead (long sentences get 0.03 s "
-                "more per character past 80). Applies on the next start.",
+        "help": "How long the first sentence of a reply may take on the "
+                "clone voice server before Kokoro voices it instead (long "
+                "sentences get 0.03 s more per character past 80). A "
+                "sentence rendered while earlier ones still play may take "
+                "until it is needed. Applies on the next start.",
     },
     "AUDIO_PROCESSING_ENABLED": {
         "tab": "hearing", "label": "Audio processing (master)", "type": "bool",

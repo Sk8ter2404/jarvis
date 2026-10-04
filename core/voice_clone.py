@@ -411,14 +411,24 @@ def _server_model_selected() -> bool:
 def engine_hint() -> str:
     """What the selected engine needs, for an honest 'not ready' sentence."""
     if _server_model_selected():
+        try:
+            from core import clone_voice_client as _cvc
+            left = _cvc.CLIENT.cooldown_left_s()
+        except Exception:
+            left = 0.0
+        if left > 0.0:
+            mins = max(1, int(round(left / 60.0)))
+            return (f"the clone voice server was too slow a few times in a "
+                    f"row, so it is resting for about {mins} more "
+                    f"minute{'s' if mins != 1 else ''}")
         return "the clone voice server isn't running or isn't ready"
     return "needs chatterbox-tts and a CUDA GPU"
 
 
 def rearm() -> bool:
     """An explicit 'use the clone voice' from the owner: with the server
-    engine, let a server that was down (or latched off after failures) be
-    tried again. True if it changed anything. Never raises."""
+    engine, let a server that was down (or cooling down after missed lines)
+    be tried again at once. True if it changed anything. Never raises."""
     try:
         if not _server_model_selected():
             return False
@@ -434,7 +444,7 @@ def is_available() -> bool:
         chatterbox importable  AND  a usable profile is selected  AND  CUDA.
 
     With the clone voice SERVER engine selected it means instead: the server
-    is up, not latched off, and speaking the active consented profile's voice
+    is up, not cooling down, and speaking the active consented profile's voice
     (core.clone_voice_client.CloneVoiceClient.usable_for).
 
     Every clause fails CLOSED (any exception → False → normal ladder). Ordered

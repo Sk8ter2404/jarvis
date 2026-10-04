@@ -13,8 +13,14 @@ Pins:
   * render: healthy -> trimmed, loudness-matched float32 audio; text is
     number-normalised before it is sent; slow -> times out inside its
     deadline; a dead server costs the capped connect, not ~2 s;
-  * the latch: MAX_FAILURES in a row turn the clone off for the session with
-    one log line, a success resets the count, rearm() undoes it;
+  * the cool-down (2026-10-04, was a latch for the whole session):
+    MAX_FAILURES latency-critical misses in a row rest the clone for 5 min
+    (doubling, capped at 30) with one log line per state change, then it is
+    tried again; a success resets the count, rearm() ends it at once;
+  * the needed-by deadline: a line rendered ahead may wait until it is
+    needed (never less than its budget), and a look-ahead line given up on
+    before it was needed does not count;
+  * the 10:36 replay: the live briefing pattern keeps the clone voice;
   * the consent gate: the server is used only while it speaks the active
     consented profile's reference (by hash);
   * the cache answers a repeated line without a request.
@@ -31,7 +37,10 @@ import numpy as np
 
 from core import clone_voice_client as cvc
 from core import voice_clone as vc
-from tests._clone_voice_fake import (FakeCloneServer, ProfileDir, free_port,
+from core import sentence_tts as st
+from tests._clone_voice_fake import (LIVE_1036_AUDIO_S, LIVE_1036_LINES,
+                                     LIVE_1036_RENDER_S, FakeCloneServer,
+                                     ProfileDir, free_port, live_1036_server,
                                      make_wav)
 
 
@@ -451,16 +460,17 @@ class RenderTests(_Base):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Latch-off and rearm
+#  The cool-down (was: latch-off for the session) and rearm
 # ════════════════════════════════════════════════════════════════════════════
 class LatchTests(_Base):
-    def test_max_failures_in_a_row_latch_off_with_one_line(self):
+    def test_max_failures_in_a_row_start_a_cooldown_with_one_line(self):
         c, srv = self.ready_client(self.server(tts_status=500))
         for _ in range(cvc.MAX_FAILURES):
             self.assertFalse(c.render("Hello.", 2.5).ok)
-        self.assertEqual(c.status()[0], "latched")
-        latch_lines = [m for m in self.logs if "off for this session" in m]
-        self.assertEqual(len(latch_lines), 1, self.logs)
+        self.assertEqual(c.status()[0], "cooldown")
+        rest_lines = [m for m in self.logs if "rests for 5 min" in m]
+        self.assertEqual(len(rest_lines), 1, self.logs)
+        self.assertNotIn("for this session", " ".join(self.logs))
         n = srv.count("POST", "/tts")
         out = c.render("Hello.", 2.5)
         self.assertEqual(out.reason, "not-ready")     # no request any more
@@ -468,8 +478,7 @@ class LatchTests(_Base):
         self.assertFalse(c.usable_for("butler"))
         for _ in range(3):
             c.render("Hello.", 2.5)
-        self.assertEqual(len([m for m in self.logs
-                              if "off for this session" in m]), 1)
+        self.assertEqual(len([m for m in self.logs if "rests for" in m]), 1)
 
     def test_a_success_resets_the_count(self):
         srv = self.server()
@@ -500,7 +509,7 @@ class LatchTests(_Base):
             if c.status()[0] == "ready":
                 hit = c.render("Very good, sir.", 2.5)
                 self.assertTrue(hit.ok and hit.cached)
-        self.assertEqual(c.status()[0], "latched", c.failures())
+        self.assertEqual(c.status()[0], "cooldown", c.failures())
         # A hit still reports success to its caller while the streak runs.
         c2, srv2 = self.ready_client(self.server())
         self.assertTrue(c2.render("Right away, sir.", 2.5).ok)
@@ -509,10 +518,11 @@ class LatchTests(_Base):
         self.assertTrue(c2.render("Right away, sir.", 2.5).cached)
         self.assertEqual(c2.failures(), 1)
 
-    def test_rearm_from_latched_or_down(self):
+    def test_rearm_from_cooldown_or_down(self):
         c, srv = self.ready_client(self.server(tts_status=500))
         for _ in range(cvc.MAX_FAILURES):
             c.render("Hello.", 2.5)
+        self.assertEqual(c.status()[0], "cooldown")
         self.assertTrue(c.rearm())
         self.assertEqual(c.status(), ("idle", ""))
         self.assertEqual(c.failures(), 0)
@@ -520,6 +530,242 @@ class LatchTests(_Base):
         c2 = self.client()
         c2.start(url="http://10.0.0.1:1", cmd="", profile="butler")
         self.assertTrue(c2.rearm())
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  The cool-down's clock: 5 min, doubling, capped at 30, then tried again
+# ════════════════════════════════════════════════════════════════════════════
+class CooldownTests(_Base):
+    """A fake clock: the cool-down is minutes long. The fake server answers
+    HTTP 500 at once (a hard error), so no render waits on the clock."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = [5000.0]
+        self.srv = self.server(tts_status=500)
+        self.c, _ = self.ready_client(self.srv, clock=lambda: self.now[0])
+
+    def miss(self, n=cvc.MAX_FAILURES):
+        for i in range(n):
+            self.assertFalse(self.c.render(f"Miss {self.now[0]} {i}.", 2.5).ok)
+
+    def test_the_first_cooldown_is_five_minutes_then_the_clone_is_tried(self):
+        self.miss()
+        self.assertEqual(self.c.status()[0], "cooldown")
+        self.assertAlmostEqual(self.c.cooldown_left_s(), cvc.COOLDOWN_BASE_S)
+        self.assertEqual(cvc.COOLDOWN_BASE_S, 300.0)
+        self.now[0] += cvc.COOLDOWN_BASE_S - 1
+        self.assertFalse(self.c.usable_for("butler"))
+        self.assertEqual(self.c.render("Still resting.", 2.5).reason,
+                         "not-ready")
+        self.now[0] += 1
+        self.assertTrue(self.c.usable_for("butler"))    # tried again
+        self.assertEqual(self.c.status(), ("ready", ""))
+        self.assertEqual(self.c.failures(), 0)
+        over = [m for m in self.logs if "cool-down over" in m]
+        self.assertEqual(len(over), 1, self.logs)
+        self.srv.tts_status = 200
+        self.assertTrue(self.c.render("Back again.", 2.5).ok)
+
+    def test_each_further_cooldown_doubles_up_to_thirty_minutes(self):
+        seen = []
+        for _ in range(6):
+            self.miss()
+            self.assertEqual(self.c.status()[0], "cooldown")
+            left = self.c.cooldown_left_s()
+            seen.append(left)
+            self.now[0] += left
+            self.assertEqual(self.c.status()[0], "ready")
+        self.assertEqual(seen, [300.0, 600.0, 1200.0, 1800.0, 1800.0, 1800.0])
+        self.assertEqual(cvc.COOLDOWN_MAX_S, 1800.0)
+
+    def test_the_doubling_starts_over_after_a_healthy_half_hour(self):
+        self.miss()
+        self.now[0] += self.c.cooldown_left_s()
+        self.miss()
+        self.assertAlmostEqual(self.c.cooldown_left_s(), 600.0)
+        self.now[0] += self.c.cooldown_left_s()
+        self.assertEqual(self.c.status()[0], "ready")
+        self.now[0] += cvc.COOLDOWN_MAX_S            # a healthy half hour
+        self.miss()
+        self.assertAlmostEqual(self.c.cooldown_left_s(), 300.0)
+
+    def test_one_log_line_per_state_change(self):
+        self.miss()
+        self.miss()                    # no requests while resting
+        self.assertEqual(self.c.status()[0], "cooldown")
+        for _ in range(5):
+            self.c.status()
+            self.c.usable_for("butler")
+        self.now[0] += 300
+        for _ in range(5):
+            self.c.status()
+            self.c.usable_for("butler")
+        self.assertEqual(len(self.logs), 2, self.logs)
+        self.assertIn("rests for 5 min", self.logs[0])
+        self.assertIn("Kokoro speaks until then", self.logs[0])
+        self.assertIn("cool-down over", self.logs[1])
+
+    def test_rearm_ends_a_cooldown_and_resets_the_doubling(self):
+        self.miss()
+        self.now[0] += self.c.cooldown_left_s()
+        self.miss()
+        self.assertAlmostEqual(self.c.cooldown_left_s(), 600.0)
+        self.assertTrue(self.c.rearm())
+        self.assertEqual(self.c.status()[0], "idle")
+        self.assertEqual(self.c.start(url=self.srv.url, cmd="",
+                                      profile="butler"), "ready")
+        self.miss()
+        self.assertAlmostEqual(self.c.cooldown_left_s(), 300.0)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  The needed-by deadline (2026-10-04)
+# ════════════════════════════════════════════════════════════════════════════
+class LineDeadlineTests(unittest.TestCase):
+    def test_a_first_line_gets_its_latency_budget(self):
+        self.assertEqual(cvc.line_deadline_s(2.5, None, 100.0), (2.5, False))
+
+    def test_a_line_rendered_ahead_may_take_until_it_is_needed(self):
+        wait, by_need = cvc.line_deadline_s(2.5, 108.0, 100.0)
+        self.assertAlmostEqual(wait, 8.0 - cvc.NEEDED_BY_MARGIN_S)
+        self.assertTrue(by_need)
+
+    def test_never_less_than_the_budget(self):
+        self.assertEqual(cvc.line_deadline_s(2.5, 101.0, 100.0), (2.5, False))
+        self.assertEqual(cvc.line_deadline_s(2.5, 90.0, 100.0), (2.5, False))
+
+    def test_never_more_than_the_cap(self):
+        wait, by_need = cvc.line_deadline_s(2.5, 1000.0, 100.0)
+        self.assertEqual(wait, cvc.LOOKAHEAD_MAX_S)
+        self.assertTrue(by_need)
+
+    def test_a_bad_needed_by_is_the_budget(self):
+        self.assertEqual(cvc.line_deadline_s(2.5, "soon", 100.0), (2.5, False))
+
+
+class LookAheadRenderTests(_Base):
+    def test_a_line_rendered_ahead_waits_past_its_budget_until_needed(self):
+        # The 10:36 case in one line: slower than the budget, but seconds of
+        # earlier audio still queued ahead of it.
+        c, srv = self.ready_client(self.server(tts_delay=0.6))
+        first = c.render("A first line, sir.", 0.3)
+        self.assertFalse(first.ok)
+        self.assertIn("timed out", first.reason)
+        self.assertTrue(first.counted)
+        self.assertFalse(first.lookahead)
+        self.assertAlmostEqual(first.deadline_s, 0.3)
+        out = c.render("A line rendered ahead.", 0.3,
+                       needed_by=time.monotonic() + 2.0)
+        self.assertTrue(out.ok, out.reason)
+        self.assertTrue(out.lookahead and out.by_need)
+        self.assertGreater(out.deadline_s, 1.0)
+        self.assertGreater(out.ms, 300)
+        self.assertEqual(c.failures(), 0)          # a success resets it
+
+    def test_a_lookahead_miss_past_its_needed_by_counts(self):
+        c, srv = self.ready_client(self.server(tts_delay=2.0))
+        t0 = time.monotonic()
+        out = c.render("Needed almost at once.", 0.3,
+                       needed_by=t0 + cvc.NEEDED_BY_MARGIN_S + 0.1)
+        self.assertLess(time.monotonic() - t0, 1.2)
+        self.assertFalse(out.ok)
+        self.assertTrue(out.lookahead)
+        self.assertFalse(out.by_need)              # the budget was longer
+        self.assertTrue(out.counted)
+        self.assertEqual(c.failures(), 1)
+
+    def test_a_lookahead_given_up_before_it_was_needed_does_not_count(self):
+        c, srv = self.ready_client(self.server(tts_delay=3.0))
+        with mock.patch.object(cvc, "LOOKAHEAD_MAX_S", 0.3):
+            for i in range(cvc.MAX_FAILURES + 1):
+                out = c.render(f"Far ahead {i}.", 0.1,
+                               needed_by=time.monotonic() + 20.0)
+                self.assertFalse(out.ok)
+                self.assertTrue(out.by_need)
+                self.assertFalse(out.counted)
+        self.assertEqual(c.failures(), 0)
+        self.assertEqual(c.status()[0], "ready")
+        self.assertEqual(self.logs, [])
+
+    def test_bad_hints_never_raise(self):
+        c, srv = self.ready_client(self.server(tts_delay=0.5))
+        out = c.render("A bad hint.", 0.1, needed_by="soon",
+                       budget_chars="many")
+        self.assertFalse(out.ok)
+        self.assertFalse(out.lookahead)            # treated as a first line
+        self.assertTrue(out.counted)
+        self.assertAlmostEqual(out.deadline_s, 0.1)
+
+    def test_hard_errors_count_for_lines_rendered_ahead_too(self):
+        c, srv = self.ready_client(self.server(tts_status=500))
+        for i in range(cvc.MAX_FAILURES):
+            out = c.render(f"Ahead {i}.", 2.5,
+                           needed_by=time.monotonic() + 10.0)
+            self.assertTrue(out.counted)
+        self.assertEqual(c.status()[0], "cooldown")
+
+    def test_the_rest_of_a_split_line_keeps_the_whole_lines_budget(self):
+        c, srv = self.ready_client(self.server(tts_delay=0.45))
+        rest = "the rest of a sentence."               # < BASE_CHARS
+        short = c.render(rest, 0.2)
+        self.assertFalse(short.ok)
+        with mock.patch.object(cvc, "PER_CHAR_S", 0.02):
+            whole = c.render("and " + rest, 0.2,
+                             budget_chars=cvc.BASE_CHARS + 30)
+        self.assertTrue(whole.ok, whole.reason)
+        self.assertAlmostEqual(whole.deadline_s, 0.2 + 0.02 * 30)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  The live pattern of 2026-10-04 10:36, replayed (client + player)
+# ════════════════════════════════════════════════════════════════════════════
+class LiveReplayTests(_Base):
+    """The 7-sentence briefing that changed voice mid-reply and latched the
+    clone off: its measured render times (1.0-3.8 s) and audio lengths,
+    scaled by SCALE, through the REAL client against a serial fake server and
+    the REAL core.sentence_tts.play_pipelined. Kokoro is a marker; play
+    blocks for the audio's length, as the speaker does."""
+
+    SCALE = 0.15
+
+    def test_the_1036_briefing_keeps_the_clone_and_never_cools_down(self):
+        s = self.SCALE
+        srv = live_1036_server(self.prof.sha, s).start()
+        self.addCleanup(srv.stop)
+        c, _ = self.ready_client(srv)
+        voices = []
+        kokoro = 0.25                   # Kokoro's marker: a constant level
+
+        def synth(text):
+            out = c.render(text, 2.5 * s, needed_by=st.needed_by())
+            if out.ok:
+                return out.audio, out.sr
+            return np.full(int(24000 * 0.1), kokoro, np.float32), 24000
+
+        def play(audio, sr):
+            voices.append("kokoro" if np.allclose(audio, kokoro) else "clone")
+            time.sleep(len(audio) / float(sr))
+
+        with mock.patch.object(cvc, "PER_CHAR_S", cvc.PER_CHAR_S * s), \
+             mock.patch.object(cvc, "NEEDED_BY_MARGIN_S",
+                               cvc.NEEDED_BY_MARGIN_S * s):
+            res = st.play_pipelined(list(LIVE_1036_LINES), synth, play,
+                                    lambda: False)
+        self.assertEqual(res.sentences_played, 7)
+        self.assertEqual(voices, ["clone"] * 7)        # no Kokoro switch
+        self.assertEqual(c.failures(), 0)
+        self.assertEqual(c.status(), ("ready", ""))   # no latch, no rest
+        self.assertEqual(self.logs, [])
+        self.assertEqual(srv.tts_texts(), list(LIVE_1036_LINES))
+        # The pattern really is the live one: lines 5-7 rendered slower than
+        # the fixed per-line budget -- the ones that switched voice live.
+        budgets = [cvc.render_budget_s(len(t), 2.5) for t in LIVE_1036_LINES]
+        over = [i for i, (r, b) in enumerate(zip(LIVE_1036_RENDER_S, budgets))
+                if r > b]
+        self.assertEqual(over, [4, 5, 6])
+        self.assertTrue(all(a > r for a, r in zip(LIVE_1036_AUDIO_S,
+                                                  LIVE_1036_RENDER_S)))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -581,6 +827,21 @@ class VoiceCloneServerModelTests(_Base):
             self.assertIsNone(vc.synthesize(
                 "hello", {"consent": True, "source": "owner",
                           "reference_wav": __file__}))
+
+    def test_engine_hint_says_when_the_clone_is_resting(self):
+        now = [100.0]
+        c, srv = self.ready_client(self.server(tts_status=500),
+                                   clock=lambda: now[0])
+        with mock.patch.object(vc, "_cfg_model", return_value=cvc.MODEL_ID), \
+             mock.patch.object(cvc, "CLIENT", c):
+            for i in range(cvc.MAX_FAILURES):
+                c.render(f"Miss {i}.", 2.5)
+            self.assertIn("resting for about 5 more minutes",
+                          vc.engine_hint())
+            now[0] += 250
+            self.assertIn("about 1 more minute,", vc.engine_hint() + ",")
+            now[0] += 50
+            self.assertIn("isn't running or isn't ready", vc.engine_hint())
 
     def test_engine_hint_and_rearm(self):
         with mock.patch.object(vc, "_cfg_model", return_value=cvc.MODEL_ID):

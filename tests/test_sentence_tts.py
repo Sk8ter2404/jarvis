@@ -522,5 +522,234 @@ class PlayPipelinedTests(unittest.TestCase):
         self.assertEqual((rec.log, res.plays), ([], 0))
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  The clone voice server's first-line clause split (2026-10-04)
+# ════════════════════════════════════════════════════════════════════════════
+class ClauseSplitTests(unittest.TestCase):
+    SPLITS = [
+        # (line, expected head) -- None: no split
+        ("While you were away, sir: I tried to check your account credits "
+         "but the console is asking for a login.",
+         "While you were away, sir:"),
+        ("The printer finished the job; the plate is cooling and the part "
+         "should be ready to remove soon.",
+         "The printer finished the job;"),
+        ("Good evening, sir, the forecast calls for light rain this "
+         "afternoon and temperatures near sixty.",
+         "Good evening, sir,"),
+        ("The forecast is mixed — light rain this afternoon and then "
+         "clearing skies by the evening hours, sir.",
+         "The forecast is mixed —"),
+        ("The forecast is mixed - light rain this afternoon and then "
+         "clearing skies by the evening hours, sir.",
+         "The forecast is mixed -"),
+        # Never inside a number or a time.
+        ("The total came to 1,500 dollars and 20 cents after the refund was "
+         "applied to the account this morning.", None),
+        ("Pick any of 3, 4 or 5 for the shelf height and the bracket will "
+         "still fit the frame without trouble.", None),
+        ("The meeting moved to 2:30 this afternoon because the conference "
+         "room was booked by the facilities team.", None),
+        # Never right after an abbreviation.
+        ("Your alarm is set for 7 a.m., and the coffee maker will start ten "
+         "minutes before it rings, sir.", None),
+        # Never inside quotes or brackets.
+        ('He said "stop, wait, and listen to the whole thing before you '
+         'decide" and then he left the room.', None),
+        ("The plan (the long one, with the extra stops) still gets us home "
+         "well before the late show starts.", None),
+        # Never a hyphen inside a word.
+        ("A well-known and long-standing tradition continues tonight in the "
+         "square near the old town hall.", None),
+        # A head that would be too short ("Sir,") is no split.
+        ("Sir, the forecast calls for light rain this afternoon and much "
+         "cooler temperatures overnight.", None),
+        # Short lines are never split.
+        ("Short line, sir: all good.", None),
+        ("Right away, sir, the lamp is on.", None),
+    ]
+
+    def test_table(self):
+        for line, head in self.SPLITS:
+            with self.subTest(line=line):
+                got = st.split_first_clause(line)
+                self.assertEqual(None if got is None else got[0], head)
+
+    def test_pieces_rejoin_to_the_line(self):
+        for line, head in self.SPLITS:
+            got = st.split_first_clause(line)
+            if got is not None:
+                self.assertEqual(" ".join(got), line)
+
+    def test_never_ends_a_head_on_an_abbreviation(self):
+        line = ("Bring the usual gear, e.g., a jacket, gloves and an umbrella "
+                "for the long walk home tonight, sir.")
+        head, rest = st.split_first_clause(line)
+        self.assertFalse(head.endswith("e.g.,"), head)
+        self.assertEqual(head, "Bring the usual gear, e.g., a jacket,")
+
+    def test_the_head_is_short_and_the_rest_is_not(self):
+        for line, head in self.SPLITS:
+            got = st.split_first_clause(line)
+            if got is None:
+                continue
+            h, r = got
+            self.assertGreaterEqual(len(h), st.HEAD_MIN_CHARS)
+            self.assertLessEqual(len(h), st.HEAD_MAX_FRAC * len(line))
+            self.assertGreaterEqual(len(r), st.REST_MIN_CHARS)
+
+    def test_threshold(self):
+        self.assertEqual(st.CLAUSE_SPLIT_MIN_CHARS, 70)
+        base = "The garage door is closed, and the porch light is on"
+        line = base + " " + "x" * (70 - len(base) - 2) + "."
+        self.assertEqual(len(line), 70)
+        self.assertIsNone(st.split_first_clause(line))          # 70: whole
+        self.assertEqual(st.split_first_clause(line[:-1] + "x.")[0],
+                         "The garage door is closed,")         # 71: split
+
+
+class PlanCloneChunksTests(unittest.TestCase):
+    LONG_FIRST = ("Good evening, sir, the forecast calls for light rain this "
+                  "afternoon and temperatures near sixty.")
+
+    def test_a_long_first_sentence_becomes_a_head_and_a_tail(self):
+        text = self.LONG_FIRST + " Bring an umbrella. The roads are clear."
+        chunks = st.plan_clone_chunks(text)
+        self.assertEqual(chunks, [
+            "Good evening, sir,",
+            "the forecast calls for light rain this afternoon and "
+            "temperatures near sixty.",
+            "Bring an umbrella.", "The roads are clear."])
+        head, tail = chunks[0], chunks[1]
+        self.assertIsInstance(head, st.Chunk)
+        self.assertEqual((head.clause, head.gap_s, head.budget_chars),
+                         ("head", st.CLAUSE_GAP_S, None))
+        self.assertEqual((tail.clause, tail.gap_s, tail.budget_chars),
+                         ("tail", None, len(self.LONG_FIRST)))
+        self.assertLess(st.CLAUSE_GAP_S, st.SENTENCE_GAP_S)
+        # Only the first line is ever split; the rest are plain sentences.
+        self.assertNotIsInstance(chunks[2], st.Chunk)
+
+    def test_a_long_single_sentence_reply_is_split(self):
+        chunks = st.plan_clone_chunks(self.LONG_FIRST)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(" ".join(chunks), self.LONG_FIRST)
+        # Kokoro's plan is unchanged: one chunk.
+        self.assertEqual(st.plan_chunks(self.LONG_FIRST), [self.LONG_FIRST])
+
+    def test_a_short_reply_of_several_sentences_goes_sentence_by_sentence(self):
+        text = ("Good morning, sir. It is currently half past eight, and the "
+                "sky is overcast.")
+        self.assertGreater(len(text), st.CLAUSE_SPLIT_MIN_CHARS)
+        self.assertLess(len(text), st.MIN_CHARS)
+        self.assertEqual(st.plan_chunks(text), [text])        # Kokoro
+        self.assertEqual(st.plan_clone_chunks(text), [
+            "Good morning, sir.",
+            "It is currently half past eight, and the sky is overcast."])
+
+    def test_short_or_unsplittable_lines_are_unchanged(self):
+        for text in ("Right away, sir.",
+                     "Right away, sir, the lamp is on and the door is shut.",
+                     "A well-known and long-standing tradition continues "
+                     "tonight in the square near the old town hall."):
+            self.assertEqual(st.plan_clone_chunks(text), st.plan_chunks(text))
+        self.assertEqual(st.plan_clone_chunks("  "), [])
+
+    def test_a_chunk_is_a_plain_string_to_everything_else(self):
+        c = st.Chunk("Good evening, sir,", gap_s=0.05, clause="head")
+        self.assertEqual(c, "Good evening, sir,")
+        self.assertEqual(hash(c), hash("Good evening, sir,"))
+        self.assertIs(type(" ".join([c, "x"])), str)
+        self.assertIs(type(c.strip()), str)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  needed_by(): when a chunk rendered ahead will be played (2026-10-04)
+# ════════════════════════════════════════════════════════════════════════════
+class NeededByTests(unittest.TestCase):
+    """Audio is a list of N samples at SR samples/s, so its length is
+    N / SR seconds, and play blocks for that long as the speaker does."""
+
+    SR = 100
+
+    def tearDown(self):
+        _join_workers()
+
+    def _run(self, chunks, samples, render_s=0.0, pad=None, **kw):
+        seen = {}
+        plays = []
+
+        def synth(text):
+            seen[str(text)] = (st.needed_by(), time.monotonic())
+            if render_s:
+                time.sleep(render_s)
+            return ["x"] * samples[str(text)], self.SR
+
+        def play(audio, sr):
+            plays.append((time.monotonic(), len(audio) / sr))
+            time.sleep(len(audio) / sr)
+
+        st.play_pipelined(chunks, synth, play, lambda: False, pad=pad, **kw)
+        return seen, plays
+
+    def test_outside_play_pipelined_it_is_none(self):
+        self.assertIsNone(st.needed_by())
+
+    def test_the_first_chunk_has_none_and_the_rest_count_the_queue(self):
+        seen, plays = self._run(["A.", "B.", "C."],
+                                {"A.": 40, "B.": 30, "C.": 10})
+        self.assertIsNone(seen["A."][0])
+        t_play1 = plays[0][0]
+        # B is needed when A (0.4 s) has played; C when A and B have.
+        self.assertAlmostEqual(seen["B."][0], t_play1 + 0.4, delta=0.08)
+        self.assertAlmostEqual(seen["C."][0], t_play1 + 0.7, delta=0.08)
+        # ... and they really were played about then.
+        self.assertAlmostEqual(plays[1][0], seen["B."][0], delta=0.1)
+        self.assertAlmostEqual(plays[2][0], seen["C."][0], delta=0.1)
+        self.assertIsNone(st.needed_by())      # cleared after every render
+
+    def test_padding_counts(self):
+        seen, plays = self._run(["A.", "B."], {"A.": 20, "B.": 10},
+                                pad=lambda a, sr: list(a) + ["-"] * 30)
+        self.assertAlmostEqual(seen["B."][0], plays[0][0] + 0.5, delta=0.08)
+
+    def test_a_late_render_is_needed_now(self):
+        # Rendering slower than playback: the queue runs dry, so the next
+        # chunk is needed at once (no slack to wait for).
+        seen, plays = self._run(["A.", "B.", "C."],
+                                {"A.": 5, "B.": 5, "C.": 5}, render_s=0.2)
+        self.assertLess(seen["C."][0] - seen["C."][1], 0.06)
+
+    def test_a_prerendered_first_chunk_counts(self):
+        seen = {}
+
+        def synth(text):
+            seen[text] = st.needed_by()
+            return ["x"] * 10, self.SR
+        t0 = time.monotonic()
+        st.play_pipelined(["A.", "B."], synth, lambda a, sr: time.sleep(0.6),
+                          lambda: False, first_rendered=(["x"] * 60, self.SR))
+        self.assertNotIn("A.", seen)
+        self.assertAlmostEqual(seen["B."], t0 + 0.6, delta=0.08)
+
+    def test_a_clause_head_is_padded_with_its_own_gap(self):
+        calls = []
+
+        def pad(audio, sr, gap_s=None):
+            calls.append(gap_s)
+            return list(audio) + ["-"]
+        head = st.Chunk("Good evening, sir,", gap_s=0.05, clause="head")
+        tail = st.Chunk("the rest.", clause="tail")
+        rec = _Rec()
+        st.play_pipelined([head, tail, "Next."], rec.synth, rec.play,
+                          lambda: False, pad=pad)
+        self.assertEqual(calls, [0.05, None])
+        # A pre-rendered head gets its gap too.
+        calls.clear()
+        st.play_pipelined([head, tail], rec.synth, rec.play, lambda: False,
+                          pad=pad, first_rendered=(["H"], 24000))
+        self.assertEqual(calls, [0.05])
+
+
 if __name__ == "__main__":
     unittest.main()

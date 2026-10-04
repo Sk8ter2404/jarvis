@@ -31,6 +31,16 @@ cannot be cancelled (a native ONNX run), so it finishes -- at most that one
 sentence -- after `play_pipelined` has returned, and its audio is discarded.
 The worker starts no further render once stopped. Joining it instead would add
 up to a sentence's render time to every barge-in before the mic reopens.
+
+The clone voice server (2026-10-04) adds two things, both inert for Kokoro:
+
+  * `needed_by()` -- while `play_pipelined` renders a chunk AHEAD of playback,
+    the time that chunk will actually be needed (when the audio queued ahead
+    of it runs out). A slow engine can wait that long instead of giving the
+    line to a fallback voice mid-reply. None for a reply's first chunk.
+  * `plan_clone_chunks` -- a long first line is split at a clause boundary
+    into a short head (first audio sooner) and the rest (rendered while the
+    head plays), joined by a short pause (`Chunk.gap_s`).
 """
 from __future__ import annotations
 
@@ -41,7 +51,9 @@ import time
 from typing import Callable, List, Optional, Tuple
 
 __all__ = ["MIN_CHARS", "SENTENCE_GAP_S", "split_sentences", "plan_chunks",
-           "play_pipelined", "PipelineResult", "SentenceFallback"]
+           "play_pipelined", "PipelineResult", "SentenceFallback",
+           "CLAUSE_SPLIT_MIN_CHARS", "CLAUSE_GAP_S", "Chunk",
+           "split_first_clause", "plan_clone_chunks", "needed_by"]
 
 # Below this many characters a reply is voiced whole, exactly as before: the
 # render of a short reply is already quick, and one play call is one stream.
@@ -156,6 +168,200 @@ def plan_chunks(text: str, min_chars: int = MIN_CHARS) -> List[str]:
     return parts if len(parts) > 1 else [t]
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  First-line clause split (the clone voice server only, 2026-10-04)
+# ═══════════════════════════════════════════════════════════════════════════
+# The clone renders one line in roughly 0.3 s + ~25 ms per character on a
+# busy GPU (measured live 2026-10-04: 18 chars 1.0 s, 116 chars 3.2 s), so a
+# long first line kept the listener waiting ~3 s for the first word. Its
+# audio runs ~55 ms per character, so a head of ~2/5 of the line plays long
+# enough to cover the render of the rest.
+#
+# A first line longer than this is split at a clause boundary.
+CLAUSE_SPLIT_MIN_CHARS = 70
+# The head is at least this long (no "Sir," on its own) ...
+HEAD_MIN_CHARS = 12
+# ... and leaves at least this much for the rest.
+REST_MIN_CHARS = 20
+# Among the usable boundaries, the one whose head is nearest this share of
+# the line wins; a head longer than HEAD_MAX_FRAC of it saves too little.
+HEAD_TARGET_FRAC = 0.4
+HEAD_MAX_FRAC = 0.65
+# Silence after the head. The clone keeps ~0.10 s after a render and ~0.04 s
+# before one, and each play pays ~0.1 s of stream setup, so the heard pause is
+# ~0.3 s: a comma, not a full stop (SENTENCE_GAP_S).
+CLAUSE_GAP_S = 0.05
+
+_CLAUSE_PUNCT = ",;:"
+_DASHES = "-–—"
+
+
+class Chunk(str):
+    """A chunk with hints for the player and the clone engine; a plain str to
+    everything else (joins and slices of it are plain str again).
+
+    gap_s        -- silence after this chunk (None: the player's own pad)
+    budget_chars -- the clone's render budget is computed for this many
+                    characters (None: its own length). The rest of a split
+                    first line keeps the WHOLE line's budget, so splitting
+                    never gives it less time than the unsplit line had.
+    clause       -- 'head' / 'tail' for the two halves of a split line."""
+
+    gap_s: Optional[float] = None
+    budget_chars: Optional[int] = None
+    clause: str = ""
+
+    def __new__(cls, text: str, *, gap_s: Optional[float] = None,
+                budget_chars: Optional[int] = None, clause: str = ""):
+        obj = super().__new__(cls, text)
+        obj.gap_s = gap_s
+        obj.budget_chars = budget_chars
+        obj.clause = clause
+        return obj
+
+
+def _token_before(text: str, end: int) -> str:
+    """The whitespace-delimited token ending at `end` (exclusive)."""
+    start = end
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    return text[start:end]
+
+
+def _is_abbreviation(token: str) -> bool:
+    """'e.g.' / 'etc.' / 'a.m.' / 'Dr.' -- a token that ends in an
+    abbreviation's dot."""
+    tok = token.lstrip(_LEADING_OPENERS)
+    if not tok.endswith("."):
+        return False
+    low = tok.rstrip(".").lower()
+    return (low in _ABBREVIATIONS or bool(_DOTTED_ABBREV_RE.fullmatch(tok))
+            or bool(_DOTTED_ABBREV_RE.fullmatch(tok.rstrip(".")))
+            or (len(low) == 1 and low.isalpha()))
+
+
+def _inside_quotes(head: str) -> bool:
+    """An opened quote or bracket is still open at the end of `head`."""
+    return (head.count('"') % 2 == 1
+            or head.count("“") > head.count("”")
+            or head.count("(") > head.count(")")
+            or head.count("[") > head.count("]"))
+
+
+def _clause_candidates(text: str) -> List[Tuple[str, str]]:
+    """Every (head, rest) split at a clause boundary that is safe to pause
+    at: ', ' / '; ' / ': ', a spaced dash (' - ', ' – ', ' — ') or
+    an em dash between words. Never inside a number ('1,500', '2:30',
+    '3, 4'), after an abbreviation ('e.g.,', 'a.m.,'), or inside quotes or
+    brackets. The punctuation stays with the head."""
+    out: List[Tuple[str, str]] = []
+    n = len(text)
+    for i, ch in enumerate(text):
+        nxt = text[i + 1] if i + 1 < n else ""
+        prev = text[i - 1] if i > 0 else ""
+        if ch in _CLAUSE_PUNCT:
+            if not nxt.isspace():
+                continue                      # '1,500', '2:30', 'a,b'
+            after = text[i + 1:].lstrip()
+            if prev.isdigit() and after[:1].isdigit():
+                continue                      # '3, 4', '10: 30'
+            if _is_abbreviation(_token_before(text, i)):
+                continue                      # 'e.g.,' / 'a.m.,'
+        elif ch in _DASHES:
+            spaced = prev.isspace() and nxt.isspace()
+            joined = (ch == "—" and prev.isalpha() and nxt.isalpha())
+            if not (spaced or joined):
+                continue                      # 'well-known', '5-3'
+        else:
+            continue
+        head = text[:i + 1].strip()
+        rest = text[i + 1:].strip()
+        if not head or not rest or _inside_quotes(head):
+            continue
+        out.append((head, rest))
+    return out
+
+
+def split_first_clause(text: str) -> Optional[Tuple[str, str]]:
+    """(head, rest) for a line longer than CLAUSE_SPLIT_MIN_CHARS, split at the
+    safe clause boundary whose head is nearest HEAD_TARGET_FRAC of the line
+    (head HEAD_MIN_CHARS..HEAD_MAX_FRAC of it, rest >= REST_MIN_CHARS); None
+    when the line is short or no boundary qualifies -- a missed split only
+    costs latency, a wrong one breaks the phrase."""
+    t = (text or "").strip()
+    n = len(t)
+    if n <= CLAUSE_SPLIT_MIN_CHARS:
+        return None
+    best = None
+    for head, rest in _clause_candidates(t):
+        h = len(head)
+        if h < HEAD_MIN_CHARS or h > HEAD_MAX_FRAC * n:
+            continue
+        if len(rest) < REST_MIN_CHARS:
+            continue
+        score = abs(h - HEAD_TARGET_FRAC * n)
+        if best is None or score < best[0]:
+            best = (score, head, rest)
+    return None if best is None else (best[1], best[2])
+
+
+def plan_clone_chunks(text: str, min_chars: int = MIN_CHARS) -> List[str]:
+    """`plan_chunks` for the clone voice server: the same chunks, except that
+    a first line longer than CLAUSE_SPLIT_MIN_CHARS is voiced in pieces so
+    the first audio comes sooner --
+
+      * a short reply of several sentences (one chunk for Kokoro) is voiced
+        sentence by sentence;
+      * a first sentence still that long is split at a clause
+        (split_first_clause) into a head Chunk (gap_s CLAUSE_GAP_S) and a
+        tail Chunk that keeps the whole sentence's render budget.
+
+    Never used for Kokoro (its replies are planned by plan_chunks)."""
+    chunks = plan_chunks(text, min_chars)
+    if not chunks or len(chunks[0]) <= CLAUSE_SPLIT_MIN_CHARS:
+        return chunks
+    if len(chunks) == 1:
+        parts = split_sentences(chunks[0])
+        if len(parts) > 1:
+            chunks = parts
+            if len(chunks[0]) <= CLAUSE_SPLIT_MIN_CHARS:
+                return chunks
+    first = chunks[0]
+    cut = split_first_clause(first)
+    if cut is None:
+        return chunks
+    head, rest = cut
+    return ([Chunk(head, gap_s=CLAUSE_GAP_S, clause="head"),
+             Chunk(rest, budget_chars=len(first), clause="tail")]
+            + list(chunks[1:]))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  When a chunk rendered ahead is needed (2026-10-04)
+# ═══════════════════════════════════════════════════════════════════════════
+_render_ctx = threading.local()
+
+
+def needed_by() -> Optional[float]:
+    """For a render running inside `play_pipelined` on THIS thread: the
+    time.monotonic() at which its chunk will be needed -- when the sentence
+    playing now and every rendered sentence waiting behind it have played
+    (an estimate from their durations; the real moment is a little later,
+    each play pays its stream setup). None for a reply's first chunk (nothing
+    plays ahead of it: the listener is waiting now) and for any render
+    outside play_pipelined (a whole-text reply, the R3 pre-render, the
+    filler)."""
+    return getattr(_render_ctx, "needed_by", None)
+
+
+def _duration_s(audio, sr) -> float:
+    """Seconds of `audio` at `sr`; 0.0 when it cannot be told. Never raises."""
+    try:
+        return max(0.0, float(len(audio)) / float(sr))
+    except Exception:
+        return 0.0
+
+
 
 
 class SentenceFallback(Exception):
@@ -223,7 +429,8 @@ def play_pipelined(
       rendered as one block by `synth_rest` (re-raised when it is None).
     * `pad(audio, sr)` is applied to every piece except the reply's last, so
       each sentence boundary gets the same pause (the engine trims each
-      render's trailing silence).
+      render's trailing silence). A `Chunk` with a `gap_s` (the head of a
+      clause split) is padded with `pad(audio, sr, gap_s)` instead.
     * Errors: one before anything was heard (chunk 1's render or play) is
       raised, so the caller's whole-text error path runs. One after at least
       one sentence was heard -- a later render or play error, or no render
@@ -233,37 +440,59 @@ def play_pipelined(
       (the speed-plan R3 filler pre-render). It is padded like any chunk and
       never rendered again; the worker starts on chunk 2 at once. None (the
       default) renders chunk 1 here, exactly as before.
+    * While the worker renders chunk i, `needed_by()` on its thread is when
+      chunk i will be played: the end of the chunk playing now plus the
+      length of every rendered chunk waiting to play (padding included).
+      Chunk 1 is rendered with needed_by() None.
     """
     res = PipelineResult()
     if not chunks:
         return res
     n = len(chunks)
+    # The playback schedule the worker reads for needed_by(): when the chunk
+    # handed to play() last will end, and the length of the rendered chunks
+    # still waiting in the queue. The caller writes busy_until right before
+    # each play; the worker adds each render it queues.
+    sched_mu = threading.Lock()
+    sched = {"busy_until": 0.0, "queued_s": 0.0}
 
-    def _render(i: int):
+    def _padded(audio, sr, last_i: int):
+        """`audio` padded for the boundary after chunk `last_i` (not the
+        reply's last)."""
+        if pad is None or last_i + 1 >= n:
+            return audio
+        gap = getattr(chunks[last_i], "gap_s", None)
+        return pad(audio, sr) if gap is None else pad(audio, sr, gap)
+
+    def _render(i: int, need: Optional[float] = None):
         """(audio, sr, chunks covered) for chunk i, padded unless last."""
+        _render_ctx.needed_by = need
         try:
-            audio, sr = synth(chunks[i])
-            covered = 1
-        except SentenceFallback:
-            if synth_rest is None:
-                raise
-            res.fell_back = True
-            audio, sr = synth_rest(" ".join(chunks[i:]))
-            covered = n - i
-        if pad is not None and i + covered < n:
-            audio = pad(audio, sr)
-        return audio, sr, covered
+            try:
+                audio, sr = synth(chunks[i])
+                covered = 1
+            except SentenceFallback:
+                if synth_rest is None:
+                    raise
+                res.fell_back = True
+                audio, sr = synth_rest(" ".join(chunks[i:]))
+                covered = n - i
+        finally:
+            _render_ctx.needed_by = None
+        return _padded(audio, sr, i + covered - 1), sr, covered
 
     if first_rendered is None:
         first = _render(0)
     else:
         f_audio, f_sr = first_rendered
-        if pad is not None and 1 < n:
-            f_audio = pad(f_audio, f_sr)
-        first = (f_audio, f_sr, 1)
+        first = (_padded(f_audio, f_sr, 0), f_sr, 1)
     q: "queue.Queue" = queue.Queue()
     stop = threading.Event()
     next_i = first[2]
+    # Chunk 1 starts playing right after the worker starts: set its end now,
+    # so the worker's first needed_by() already counts it.
+    with sched_mu:
+        sched["busy_until"] = time.monotonic() + _duration_s(first[0], first[1])
 
     def _worker() -> None:
         i = next_i
@@ -271,11 +500,16 @@ def play_pipelined(
             while i < n:
                 if stop.is_set():
                     return
+                with sched_mu:
+                    need = (max(time.monotonic(), sched["busy_until"])
+                            + sched["queued_s"])
                 try:
-                    item = _render(i)
+                    item = _render(i, need)
                 except BaseException as e:  # noqa: BLE001 - handed to caller
                     q.put(("err", e))
                     return
+                with sched_mu:
+                    sched["queued_s"] += _duration_s(item[0], item[1])
                 q.put(("ok", item))
                 i += item[2]
         finally:
@@ -319,6 +553,10 @@ def play_pipelined(
                 res.stopped = True
                 return res
             audio, sr, covered = val
+            dur = _duration_s(audio, sr)
+            with sched_mu:
+                sched["queued_s"] = max(0.0, sched["queued_s"] - dur)
+                sched["busy_until"] = time.monotonic() + dur
             play(audio, sr)
             res.plays += 1
             res.sentences_played += covered

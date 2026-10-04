@@ -614,8 +614,13 @@ VOICE_CLONE_DEVICE  = ""
 #     else starts VOICE_CLONE_SERVER_CMD detached and waits for it (bounded,
 #     off the boot path). If it never comes up: one log line, Kokoro speaks.
 #   * each sentence is one POST /tts bounded by VOICE_CLONE_TIMEOUT_S (plus
-#     0.03 s per character past 80). A failed or slow line is voiced by
-#     Kokoro at once; 3 failures in a row turn the clone off for the session.
+#     0.03 s per character past 80) -- the budget of a line the listener is
+#     waiting for. A sentence rendered ahead while earlier ones still play
+#     may take until it is needed (2026-10-04). A failed or slow line is
+#     voiced by Kokoro at once; 3 latency-critical misses in a row rest the
+#     clone for 5 minutes (doubling each time, up to 30), then it is tried
+#     again. A long first sentence is split at a clause so the first word
+#     comes sooner.
 #   * the server is used only while its voice prompt is the active consented
 #     profile's reference.wav (compared by hash).
 #   * per-sentence speech, the processing filler and the R3 pre-render work

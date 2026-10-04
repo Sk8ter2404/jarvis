@@ -7,8 +7,17 @@ the server contract the client relies on:
   POST /tts       -> tts_status + a 16-bit mono WAV (after tts_delay seconds)
   POST /shutdown  -> 200
 
+Per-request control (2026-10-04, the live-budget replay):
+  latency_for  dict text -> seconds, or a callable(text) -> seconds: how long
+               THIS line "renders" (falls back to tts_delay)
+  wav_for      dict text -> WAV bytes: what THIS line returns (its audio
+               length), falling back to `wav`
+  serial       True: one render at a time, like the real server (a request
+               waits for the one before it, even one the client gave up on)
+  timings      (text, start, end) in time.monotonic() per finished render
+
 It records every request. Nothing leaves the loopback, nothing is played,
-and stop() releases a handler still sleeping in tts_delay at once.
+and stop() releases a handler still sleeping in a delay at once.
 """
 from __future__ import annotations
 
@@ -20,6 +29,7 @@ import os
 import struct
 import tempfile
 import threading
+import time
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -50,13 +60,20 @@ def make_wav(sr: int = 24000, lead_s: float = 0.05, speech_s: float = 0.5,
 class FakeCloneServer:
     def __init__(self, *, ref_sha: str = "", health_code: int = 200,
                  ok: bool = True, tts_delay: float = 0.0,
-                 tts_status: int = 200, wav: bytes | None = None):
+                 tts_status: int = 200, wav: bytes | None = None,
+                 latency_for=None, wav_for: dict | None = None,
+                 serial: bool = False):
         self.ref_sha = ref_sha
         self.health_code = health_code
         self.ok = ok
         self.tts_delay = tts_delay
         self.tts_status = tts_status
         self.wav = wav if wav is not None else make_wav()
+        self.latency_for = latency_for
+        self.wav_for = dict(wav_for or {})
+        self.serial = serial
+        self._render_mu = threading.Lock()
+        self.timings: list = []
         # Texts answered with HTTP 500 (one line of a reply fails).
         self.fail_texts: set = set()
         self.requests: list = []
@@ -108,14 +125,18 @@ class FakeCloneServer:
                     return self._send(200, b'{"ok": true}', "application/json")
                 if self.path != "/tts":
                     return self._send(404, b"{}", "application/json")
-                if fake.tts_delay > 0:
-                    fake._release.wait(fake.tts_delay)
                 text = obj.get("text") if isinstance(obj, dict) else None
+                if fake.serial:
+                    with fake._render_mu:
+                        fake._render(text)
+                else:
+                    fake._render(text)
                 if fake.tts_status != 200 or text in fake.fail_texts:
                     code = fake.tts_status if fake.tts_status != 200 else 500
                     return self._send(code, b'{"error": "x"}',
                                       "application/json")
-                return self._send(200, fake.wav, "audio/wav")
+                return self._send(200, fake.wav_for.get(text, fake.wav),
+                                  "audio/wav")
 
         class Server(ThreadingHTTPServer):
             daemon_threads = True
@@ -144,6 +165,23 @@ class FakeCloneServer:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+    def latency(self, text) -> float:
+        """How long `text` renders: latency_for, else tts_delay."""
+        lf = self.latency_for
+        if callable(lf):
+            return float(lf(text))
+        if isinstance(lf, dict) and text in lf:
+            return float(lf[text])
+        return float(self.tts_delay)
+
+    def _render(self, text) -> None:
+        t0 = time.monotonic()
+        delay = self.latency(text)
+        if delay > 0:
+            self._release.wait(delay)
+        with self._lock:
+            self.timings.append((text, t0, time.monotonic()))
 
     # ── records ─────────────────────────────────────────────────────────
     def _record(self, method, path, body, ctype=None):
@@ -193,3 +231,36 @@ class ProfileDir:
 
     def cleanup(self) -> None:
         self._tmp.cleanup()
+
+
+# ── The live pattern of 2026-10-04 10:36 (a 7-sentence briefing) ──────────
+# Line lengths, render times and audio lengths as the clone server logged
+# them that morning (rounded; the text is made up, the shape is not). Lines
+# 5-7 took longer than the fixed per-line budget (2.5 s + 0.03 s per char past
+# 80) although seconds of earlier audio were still queued: Kokoro voiced them
+# mid-reply and three misses in a row latched the clone off for the session.
+LIVE_1036_LINES = (
+    "Good evening, sir.",
+    "A quiet day on the voice channel.",
+    "Tomorrow looks mild, with a light breeze and grey skies.",
+    "Today's headlines, sir.",
+    "The city council has approved a new plan for the riverside park, and "
+    "work should begin early next spring, sir.",
+    "Local schools will open an hour late on Monday while crews finish the "
+    "repairs to the heating.",
+    "And finally, a team of university students is heading south to compete "
+    "in a national robotics challenge, sir.",
+)
+LIVE_1036_RENDER_S = (1.0, 1.4, 1.6, 1.1, 3.8, 3.5, 3.8)
+LIVE_1036_AUDIO_S = (1.24, 2.24, 4.64, 1.6, 6.16, 4.64, 6.44)
+
+
+def live_1036_server(ref_sha: str, scale: float) -> "FakeCloneServer":
+    """A serial fake server that renders the 10:36 lines with their measured
+    render times and audio lengths, both multiplied by `scale` (a test runs
+    the pattern faster; every ratio is kept). Not started."""
+    lat = {t: r * scale for t, r in zip(LIVE_1036_LINES, LIVE_1036_RENDER_S)}
+    wavs = {t: make_wav(lead_s=0.0, speech_s=a * scale, tail_s=0.0, amp=0.3)
+            for t, a in zip(LIVE_1036_LINES, LIVE_1036_AUDIO_S)}
+    return FakeCloneServer(ref_sha=ref_sha, latency_for=lat, wav_for=wavs,
+                           serial=True)

@@ -27,14 +27,30 @@ WHAT THIS MODULE DOES
     voice prompt (its ref_sha256) is the reference.wav of the ACTIVE consented
     profile (core.voice_clone.resolve_active_profile). A server that was
     started with any other voice is never used.
-  * render(text) is one POST /tts bounded by a deadline: timeout_s, plus a
-    per-character allowance for long lines. The connect alone is capped at
-    CONNECT_TIMEOUT_S, so a server that is gone costs half a second, not the
-    ~2 s a refused loopback connect takes on Windows. Never raises.
-  * MAX_FAILURES failed renders IN A ROW latch the clone off for the session
-    (one log line); the caller then voices everything with Kokoro. A render
-    the server returns resets the count; a cache hit does not (no request
-    was made, so it says nothing about the server).
+  * render(text) is one POST /tts bounded by a deadline. A line the listener
+    is waiting for (a reply's first line) gets its LATENCY BUDGET: timeout_s,
+    plus a per-character allowance for long lines. A line rendered AHEAD
+    while earlier audio of the same reply still plays (needed_by, from
+    core.sentence_tts.needed_by) gets max(that budget, the time until it is
+    needed - NEEDED_BY_MARGIN_S): once a reply speaks in the clone voice,
+    waiting for its next line beats switching that line to Kokoro. The
+    connect alone is capped at CONNECT_TIMEOUT_S, so a server that is gone
+    costs half a second, not the ~2 s a refused loopback connect takes on
+    Windows. Never raises.
+  * MAX_FAILURES LATENCY-CRITICAL misses IN A ROW (a first line that timed
+    out, a line that missed the time it was needed, or a hard error: refused,
+    HTTP error, silent render) put the clone into a COOL-DOWN: Kokoro speaks
+    for COOLDOWN_BASE_S (5 min), then the clone is tried again; each further
+    cool-down doubles, capped at COOLDOWN_MAX_S (30 min), and the doubling
+    starts over once the clone has run a whole COOLDOWN_MAX_S without one.
+    One log line per state change, nothing spoken. A look-ahead line that
+    was given up on BEFORE it was needed (its wait capped at LOOKAHEAD_MAX_S)
+    does not count. A render the server returns resets the count; a cache
+    hit does not (no request was made, so it says nothing about the server).
+    (Until 2026-10-04 three timeouts of ANY kind latched the clone off for
+    the whole session: one slow minute on a busy GPU -- three long lines of
+    one briefing rendered ahead with seconds of audio still queued -- cost
+    the owner his voice until the next restart.)
   * Every render is trimmed (the model leaves ~0.3 s of near-silence at the
     end) and loudness-matched to Kokoro's level, so a reply that mixes the
     two engines (one fallback line) does not jump in volume.
@@ -68,15 +84,27 @@ except Exception:  # pragma: no cover - numpy is present wherever audio is
     np = None  # type: ignore
 
 __all__ = ["MODEL_ID", "DEFAULT_URL", "MAX_FAILURES", "is_server_model",
-           "parse_url", "render_budget_s", "build_command", "decode_wav",
-           "finish_audio", "Outcome", "CloneVoiceClient", "CLIENT"]
+           "parse_url", "render_budget_s", "line_deadline_s", "build_command",
+           "decode_wav", "finish_audio", "Outcome", "CloneVoiceClient",
+           "CLIENT"]
 
 # The VOICE_CLONE_MODEL value that selects this engine.
 MODEL_ID = "chatterbox_turbo_server"
 DEFAULT_URL = "http://127.0.0.1:8767"
 
-# Failed renders in a row before the clone is latched off for the session.
+# Latency-critical misses in a row before the clone rests (the cool-down).
 MAX_FAILURES = 3
+# The cool-down: Kokoro speaks this long, then the clone is tried again. Each
+# further cool-down doubles, capped at COOLDOWN_MAX_S; the doubling starts
+# over once the clone has run COOLDOWN_MAX_S without one.
+COOLDOWN_BASE_S = 300.0
+COOLDOWN_MAX_S = 1800.0
+# A line rendered ahead must be back this long before it is needed: the
+# hand-off to the player, and a Kokoro render if the clone still misses.
+NEEDED_BY_MARGIN_S = 0.5
+# The longest a line rendered ahead waits, however much audio is queued
+# before it (bounds a wedged server; such a give-up is not counted).
+LOOKAHEAD_MAX_S = 30.0
 # Boot: how long start() waits for /health to say ready (a cold load from
 # disk measured 18 s; 10-11 s once the weights are in the file cache).
 BOOT_WAIT_S = 90.0
@@ -164,6 +192,26 @@ def render_budget_s(text_len: int, timeout_s: float) -> float:
     except Exception:
         base = 2.5
     return base + PER_CHAR_S * max(0, int(text_len) - BASE_CHARS)
+
+
+def line_deadline_s(budget_s: float, needed_by, now: float) -> tuple:
+    """(seconds to wait, waited for need) for one line.
+
+    No ``needed_by`` (a reply's first line: the listener waits now): the
+    latency budget. Otherwise the line plays only once the audio queued ahead
+    of it runs out, so it may take until then, less NEEDED_BY_MARGIN_S --
+    never less than the budget, never more than LOOKAHEAD_MAX_S. The flag is
+    True when the time it is needed (not the budget) set the wait."""
+    budget = float(budget_s)
+    if needed_by is None:
+        return budget, False
+    try:
+        slack = float(needed_by) - NEEDED_BY_MARGIN_S - float(now)
+    except Exception:
+        return budget, False
+    if slack > budget:
+        return min(slack, LOOKAHEAD_MAX_S), True
+    return budget, False
 
 
 def build_command(cmd, ref: str, port: int):
@@ -271,19 +319,31 @@ def _normalize_text(text: str) -> str:
 class Outcome:
     """One render attempt. ``audio`` is None when it did not produce audio;
     ``reason`` then says why: 'empty' / 'not-ready' / 'too-long' (nothing was
-    sent, not a failure), or 'timeout' / 'error (...)' / 'http NNN' (a
-    failure that counts toward the latch)."""
+    sent, not a failure), or 'timed out' / 'error (...)' / 'http NNN' (a
+    failure; ``counted`` says whether it counted toward the cool-down).
 
-    __slots__ = ("audio", "sr", "ms", "reason", "cached", "server_ms")
+    ``lookahead``  -- rendered ahead with a needed-by time (not a first line)
+    ``deadline_s`` -- the wait this render was given
+    ``by_need``    -- that wait was set by the needed-by time, not the
+                      latency budget"""
+
+    __slots__ = ("audio", "sr", "ms", "reason", "cached", "server_ms",
+                 "lookahead", "deadline_s", "by_need", "counted")
 
     def __init__(self, audio=None, sr: int = 0, ms: int = 0, reason: str = "",
-                 cached: bool = False, server_ms=None):
+                 cached: bool = False, server_ms=None, lookahead: bool = False,
+                 deadline_s: float = 0.0, by_need: bool = False,
+                 counted: bool = False):
         self.audio = audio
         self.sr = sr
         self.ms = ms
         self.reason = reason
         self.cached = cached
         self.server_ms = server_ms
+        self.lookahead = lookahead
+        self.deadline_s = deadline_s
+        self.by_need = by_need
+        self.counted = counted
 
     @property
     def ok(self) -> bool:
@@ -296,7 +356,9 @@ class Outcome:
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (f"Outcome(ok={self.ok}, sr={self.sr}, ms={self.ms}, "
-                f"reason={self.reason!r}, cached={self.cached})")
+                f"reason={self.reason!r}, cached={self.cached}, "
+                f"lookahead={self.lookahead}, deadline_s={self.deadline_s}, "
+                f"counted={self.counted})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -309,9 +371,11 @@ class CloneVoiceClient:
       idle      nothing tried yet (the caller may start it)
       starting  start() is running on its daemon
       ready     the server answers and speaks the active profile's voice
-      down      it never came up, or is not usable (terminal for the session)
-      latched   MAX_FAILURES renders failed in a row (terminal for the
-                session; rearm() resets it)
+      down      it never came up, or is not usable (terminal for the session;
+                rearm() resets it)
+      cooldown  MAX_FAILURES latency-critical misses in a row: Kokoro speaks
+                until the cool-down ends, then the clone is 'ready' again
+                (checked on every status read); rearm() ends it at once
 
     Thread-safe: renders run on the voice thread, the per-sentence worker,
     the pre-render and the filler warm, so every state change is under one
@@ -334,6 +398,11 @@ class CloneVoiceClient:
         self._server_sha = ""
         self._server_pid = None
         self._fails = 0
+        # The cool-down: when it ends, how many have run back to back (the
+        # doubling), and when the last one ended (the doubling's reset).
+        self._cool_until = 0.0
+        self._cool_level = 0
+        self._cool_ended_at = float("-inf")
         self._proc = None
         self._profile_memo: dict = {}   # name -> (expires_at, sha or "")
         self._sha_memo: dict = {}       # path -> ((size, mtime_ns), sha)
@@ -357,6 +426,7 @@ class CloneVoiceClient:
 
     def status(self) -> tuple:
         """(status, reason)."""
+        self._cooldown_tick()
         with self._mu:
             return self._status, self._reason
 
@@ -367,6 +437,31 @@ class CloneVoiceClient:
     def failures(self) -> int:
         with self._mu:
             return self._fails
+
+    def cooldown_left_s(self) -> float:
+        """Seconds of cool-down left (0.0 when not cooling down)."""
+        self._cooldown_tick()
+        with self._mu:
+            if self._status != "cooldown":
+                return 0.0
+            return max(0.0, self._cool_until - self._clock())
+
+    def _cooldown_tick(self) -> None:
+        """A cool-down whose time is up ends here: back to 'ready' with a
+        fresh count, and ONE log line. Called from every status read."""
+        msg = None
+        with self._mu:
+            if self._status == "cooldown":
+                now = self._clock()
+                if now >= self._cool_until:
+                    self._status = "ready"
+                    self._reason = ""
+                    self._fails = 0
+                    self._cool_ended_at = now
+                    msg = ("  [clone-voice] cool-down over; trying the clone "
+                           "voice again")
+        if msg:
+            self._log(msg)
 
     # ── the consent gate ─────────────────────────────────────────────────
     def _file_sha(self, path: str) -> str:
@@ -419,6 +514,7 @@ class CloneVoiceClient:
         return sha
 
     def is_ready(self) -> bool:
+        self._cooldown_tick()
         with self._mu:
             return self._status == "ready"
 
@@ -426,6 +522,7 @@ class CloneVoiceClient:
         """Ready AND speaking the voice of ``profile_name`` (consented). Never
         raises; a mismatch is logged once per (profile, voice)."""
         try:
+            self._cooldown_tick()
             with self._mu:
                 if self._status != "ready":
                     return False
@@ -684,46 +781,71 @@ class CloneVoiceClient:
         return "down"
 
     def rearm(self) -> bool:
-        """Back to 'idle' from 'down' / 'latched' (an explicit 'use the clone
-        voice' from the owner), so the next use starts or re-checks the
-        server. True if it changed anything."""
+        """Back to 'idle' from 'down' / 'cooldown' (an explicit 'use the
+        clone voice' from the owner), so the next use starts or re-checks the
+        server, and the cool-down doubling starts over. True if it changed
+        anything."""
         with self._mu:
-            if self._status not in ("down", "latched"):
+            if self._status not in ("down", "cooldown"):
                 return False
             self._status = "idle"
             self._reason = ""
             self._fails = 0
+            self._cool_until = 0.0
+            self._cool_level = 0
+            self._cool_ended_at = float("-inf")
             self._logged.clear()
             return True
 
     # ── render ───────────────────────────────────────────────────────────
-    def render(self, text: str, timeout_s: float) -> Outcome:
+    def render(self, text: str, timeout_s: float, *, needed_by=None,
+               budget_chars=None) -> Outcome:
         """One line through the server, trimmed and loudness-matched. Never
-        raises; see Outcome for the reasons."""
+        raises; see Outcome for the reasons.
+
+        ``timeout_s`` is the latency budget (VOICE_CLONE_TIMEOUT_S), grown
+        per character past BASE_CHARS -- of ``budget_chars`` when that is
+        longer than the line (the rest of a split first line keeps the whole
+        line's budget). ``needed_by`` (time.monotonic()) marks a line rendered
+        AHEAD of playback: it may wait until then (line_deadline_s), and a
+        miss counts toward the cool-down only if it ran past that time."""
         t = str(text or "").strip()
+        try:
+            needed_by = None if needed_by is None else float(needed_by)
+        except Exception:
+            needed_by = None          # unusable: treated as a first line
+        lookahead = needed_by is not None
         if not t:
-            return Outcome(reason="empty")
+            return Outcome(reason="empty", lookahead=lookahead)
+        self._cooldown_tick()
         with self._mu:
             if self._status != "ready":
-                return Outcome(reason="not-ready")
+                return Outcome(reason="not-ready", lookahead=lookahead)
             sha = self._server_sha
         spoken = _normalize_text(t)
         if len(spoken) > MAX_CHARS:
-            return Outcome(reason="too-long")
+            return Outcome(reason="too-long", lookahead=lookahead)
         key = hashlib.sha256((sha + "\0" + spoken).encode("utf-8")).hexdigest()
         hit = self._cache_get(key)
         if hit is not None:
             # No request was made, so this says nothing about the server: it
             # must NOT reset the failure streak. Otherwise a hung server never
-            # latches while cached acks come between the answers, and every
-            # new line waits out its whole deadline for the rest of the
-            # session.
-            return Outcome(audio=hit[0].copy(), sr=hit[1], ms=0, cached=True)
-        budget = render_budget_s(len(spoken), timeout_s)
+            # cools down while cached acks come between the answers, and
+            # every new line waits out its whole deadline.
+            return Outcome(audio=hit[0].copy(), sr=hit[1], ms=0, cached=True,
+                           lookahead=lookahead)
+        try:
+            n_budget = max(len(spoken), int(budget_chars or 0))
+        except Exception:
+            n_budget = len(spoken)
+        budget = render_budget_s(n_budget, timeout_s)
         t0 = self._clock()
+        wait_s, by_need = line_deadline_s(budget, needed_by, t0)
+        info = {"lookahead": lookahead, "deadline_s": wait_s,
+                "by_need": by_need}
         try:
             body = json.dumps({"text": spoken}).encode("utf-8")
-            code, headers, data = self._request("POST", "/tts", body, budget)
+            code, headers, data = self._request("POST", "/tts", body, wait_s)
             if code != 200:
                 raise _HttpStatus(code)
             audio, sr = decode_wav(data)
@@ -731,35 +853,56 @@ class CloneVoiceClient:
             if audio is None:
                 raise ValueError("silent render")
         except TimeoutError:
-            return self._failed(f"timed out ({budget:.1f} s)", t0)
+            # Latency-critical unless this was a look-ahead line given up on
+            # BEFORE it was needed (its wait capped at LOOKAHEAD_MAX_S): a
+            # first line keeps the listener waiting, and a look-ahead line
+            # that ran out its wait ran past the time it was needed.
+            critical = (needed_by is None
+                        or t0 + wait_s >= needed_by
+                        - NEEDED_BY_MARGIN_S - 1e-6)
+            return self._failed("timed out", t0, critical, info)
         except _HttpStatus as e:
-            return self._failed(f"http {e.code}", t0)
+            return self._failed(f"http {e.code}", t0, True, info)
         except Exception as e:
-            return self._failed(f"error ({type(e).__name__}: {e})", t0)
+            return self._failed(f"error ({type(e).__name__}: {e})", t0, True,
+                                info)
         ms = int(round((self._clock() - t0) * 1000.0))
         self._succeeded()
         self._cache_put(key, audio, sr)
         server_ms = headers.get("x-render-ms")
-        return Outcome(audio=audio, sr=sr, ms=ms, server_ms=server_ms)
+        return Outcome(audio=audio, sr=sr, ms=ms, server_ms=server_ms, **info)
 
     def _succeeded(self) -> None:
         with self._mu:
             self._fails = 0
 
-    def _failed(self, reason: str, t0: float) -> Outcome:
-        ms = int(round((self._clock() - t0) * 1000.0))
-        latched = False
+    def _failed(self, reason: str, t0: float, critical: bool = True,
+                info: Optional[dict] = None) -> Outcome:
+        """A failed render. Only a latency-critical one counts toward the
+        cool-down; MAX_FAILURES of them in a row start it (one log line)."""
+        now = self._clock()
+        ms = int(round((now - t0) * 1000.0))
+        rest_s = 0.0
         with self._mu:
-            self._fails += 1
-            if self._fails >= MAX_FAILURES and self._status == "ready":
-                self._status = "latched"
-                self._reason = reason
-                latched = True
-        if latched:
-            self._log(f"  [clone-voice] {MAX_FAILURES} renders failed in a "
-                      f"row (last: {reason}); the clone voice is off for this "
-                      f"session and Kokoro speaks")
-        return Outcome(reason=reason, ms=ms)
+            if critical:
+                self._fails += 1
+                if self._fails >= MAX_FAILURES and self._status == "ready":
+                    # The doubling starts over once the clone has run a
+                    # whole COOLDOWN_MAX_S since the last cool-down ended.
+                    if now - self._cool_ended_at >= COOLDOWN_MAX_S:
+                        self._cool_level = 0
+                    rest_s = min(COOLDOWN_BASE_S * (2 ** self._cool_level),
+                                 COOLDOWN_MAX_S)
+                    self._cool_level = min(self._cool_level + 1, 16)
+                    self._cool_until = now + rest_s
+                    self._status = "cooldown"
+                    self._reason = reason
+        if rest_s:
+            self._log(f"  [clone-voice] {MAX_FAILURES} lines missed in a row "
+                      f"(last: {reason}); the clone voice rests for "
+                      f"{rest_s / 60.0:.0f} min and Kokoro speaks until then")
+        return Outcome(reason=reason, ms=ms, counted=bool(critical),
+                       **(info or {}))
 
     # ── cache ────────────────────────────────────────────────────────────
     def _cache_get(self, key: str):

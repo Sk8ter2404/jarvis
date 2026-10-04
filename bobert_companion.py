@@ -24990,21 +24990,39 @@ _voice_clone_inflight_lock = threading.Lock()
 #  (core/clone_voice_client.py), so no torch / CUDA / model ever loads here.
 #    * selected   = VOICE_CLONE_ENABLED and that model id (the owner's
 #                   choice; says nothing about the server being up);
-#    * active     = selected AND the server is ready, not latched off, and
+#    * active     = selected AND the server is ready, not cooling down, and
 #                   speaking the active consented profile's voice (hash);
 #    * engine kind (_tts_engine_kind) is the ONE gate the Kokoro-only fast
 #      paths read -- per-sentence speech, the processing filler, the R3
 #      pre-render -- so they run for the clone exactly as for Kokoro, and
 #      fall back to plain Kokoro the moment the clone is not active.
 #  A line the clone fails (slow, error) is voiced by Kokoro at once, in the
-#  same synthesise() call; MAX_FAILURES in a row latch the clone off for the
-#  session. Every speak contract lives in _speak / _speak_sentences above the
-#  engine and is unchanged: the speech lock, self-echo remember / refresh,
+#  same synthesise() call; MAX_FAILURES latency-critical misses in a row put
+#  the clone into a cool-down (5 min, doubling, capped at 30), then it is
+#  tried again. Every speak contract lives in _speak / _speak_sentences above
+#  the engine and is unchanged: the speech lock, self-echo remember / refresh,
 #  the barge-in sequence checks, volume_scale, the prosody pin.
+#  Live budgeting (2026-10-04; a 7-sentence briefing changed voice mid-reply
+#  and three slow lines latched the clone off for the session):
+#    * a sentence rendered AHEAD while earlier ones play may take until it
+#      is needed (core.sentence_tts.needed_by -> the client's deadline), not
+#      the fixed VOICE_CLONE_TIMEOUT_S budget a first line gets;
+#    * a long first line is split at a clause (_speech_chunks) so the first
+#      word comes sooner, and the rest of that sentence never switches to
+#      the clone after Kokoro voiced its head (_speak_sentences);
+#    * every clone line logs one "[tts] clone voice ..." line: its render
+#      ms, first line or look-ahead, the deadline it had, and whether Kokoro
+#      voiced it instead.
 # ──────────────────────────────────────────────────────────────────────────
 from core import clone_voice_client as _cvc  # noqa: E402
+from core import sentence_tts as _sentence_tts  # noqa: E402
 
 _CLONE_SERVER_LOG = os.path.join(LOGS_DIR, "clone_voice", "server.log")
+# Per THREAD: did the clone voice server voice the last synthesise() on this
+# thread? Reset at the top of every synthesise(), set by _clone_server_synth.
+# _speak_sentences reads it after a clause head (the rest of that sentence
+# stays in the head's voice) and the R3 pre-render records it.
+_CLONE_LINE = threading.local()
 
 
 def _clone_server_selected() -> bool:
@@ -25076,7 +25094,7 @@ def _tts_engine_kind() -> str:
     """Which engine voices replies, for the fast-path gates:
 
       'kokoro' -- TTS_BACKEND 'kokoro' with no clone, or with the clone voice
-                  server selected but not active (starting, down, latched)
+                  server selected but not active (starting, down, cooldown)
       'clone'  -- TTS_BACKEND 'kokoro' and the clone voice server active
                   (Kokoro voices any line it misses)
       'other'  -- anything else: edge-tts / pyttsx3 / xtts, or the in-process
@@ -25107,17 +25125,41 @@ def _clone_timeout_s() -> float:
         return 2.5
 
 
+def _clone_line_tag(out) -> str:
+    """'first line, deadline 2.5 s' / 'look-ahead, deadline 5.9 s' for the
+    per-line log. Never raises."""
+    try:
+        kind = "look-ahead" if out.lookahead else "first line"
+        if out.cached:
+            return f"{kind}, cached"
+        tag = f"{kind}, deadline {float(out.deadline_s):.1f} s"
+        if not out.ok and not out.counted:
+            tag += ", not counted"
+        return tag
+    except Exception:
+        return "?"
+
+
 def _clone_server_synth(text: str, wry_split, gain: float):
     """THIS line through the clone voice server: (audio, sr) or None, and
     None means the caller (synthesise) voices this same line with the ladder
     below it -- Kokoro -- at once. The preset's gain and the wry pause are
     applied; its rate / pitch are not (the model has no such control).
-    Notes [turn-timing] clone / clone_ms for the answer's first render.
-    Never raises."""
+
+    A line rendered ahead inside core.sentence_tts.play_pipelined carries
+    its needed-by time (_sentence_tts.needed_by()) to the client, which then
+    waits until then instead of the fixed budget; the rest of a split first
+    line carries the whole line's budget (Chunk.budget_chars).
+
+    Logs ONE line per attempted line ("[tts] clone voice ..."), notes
+    [turn-timing] clone / clone_ms for the answer's first render, and sets
+    _CLONE_LINE.voiced on success. Never raises."""
     try:
         if not _clone_server_active():
             return None
         timeout_s = _clone_timeout_s()
+        need = _sentence_tts.needed_by()
+        budget_chars = getattr(text, "budget_chars", None)
         t0 = time.perf_counter()
         audio = None
         sr = 0
@@ -25125,9 +25167,9 @@ def _clone_server_synth(text: str, wry_split, gain: float):
             # Both clauses or neither: a half-rendered wry line must never
             # ship head-only audio (same rule as the Kokoro branch).
             w_head, w_tail, pause_ms = wry_split
-            first = _cvc.CLIENT.render(w_head, timeout_s)
-            last = (_cvc.CLIENT.render(w_tail, timeout_s) if first.ok
-                    else first)
+            first = _cvc.CLIENT.render(w_head, timeout_s, needed_by=need)
+            last = (_cvc.CLIENT.render(w_tail, timeout_s, needed_by=need)
+                    if first.ok else first)
             if first.ok and last.ok and first.sr == last.sr:
                 sr = first.sr
                 pause = np.zeros(max(0, int(sr * pause_ms / 1000)),
@@ -25137,7 +25179,8 @@ def _clone_server_synth(text: str, wry_split, gain: float):
             else:
                 out = last if first.ok else first
         else:
-            out = _cvc.CLIENT.render(text, timeout_s)
+            out = _cvc.CLIENT.render(text, timeout_s, needed_by=need,
+                                     budget_chars=budget_chars)
             if out.ok:
                 audio, sr = out.audio, out.sr
         ms = int(round((time.perf_counter() - t0) * 1000.0))
@@ -25150,11 +25193,14 @@ def _clone_server_synth(text: str, wry_split, gain: float):
                       "server); Kokoro voices it")
             elif out.attempted:
                 print(f"  [tts] clone voice {out.reason or 'failed'} after "
-                      f"{ms} ms; Kokoro voices this line")
+                      f"{ms} ms ({_clone_line_tag(out)}); Kokoro voices "
+                      f"this line")
             return None
+        print(f"  [tts] clone voice {ms} ms ({_clone_line_tag(out)})")
         audio = np.asarray(audio, dtype=np.float32)
         if gain != 1.0:
             audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+        _CLONE_LINE.voiced = True
         return audio, int(sr)
     except Exception as e:
         print(f"  [tts] clone voice unavailable ({type(e).__name__}: {e}); "
@@ -25196,6 +25242,7 @@ def _synth_user_tone() -> str | None:
 
 
 def synthesise(text: str) -> tuple[np.ndarray, int]:
+    _CLONE_LINE.voiced = False    # set again only if the clone voices THIS line
     try:
         pinned = getattr(_TTS_PRESET_PIN, "value", None)
         pin_mode = None
@@ -25250,11 +25297,15 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
         # no in-process model (see _clone_server_synth). None -> THIS line
         # falls through to the ladder below (Kokoro) at once. Skipped in the
         # "skip_kokoro" rest-of-reply block: both engines already missed a
-        # sentence of this reply.
+        # sentence of this reply. Skipped too for the rest of a sentence
+        # whose clause head Kokoro voiced (_TTS_PRESET_PIN.no_clone, set by
+        # _speak_sentences): one sentence, one voice.
         try:
             if (globals().get("VOICE_CLONE_ENABLED", False)
                     and _clone_server_selected()):
-                if pin_mode != "skip_kokoro":
+                if pin_mode != "skip_kokoro" and not (
+                        pinned is not None
+                        and getattr(_TTS_PRESET_PIN, "no_clone", False)):
                     _srv = _clone_server_synth(text, wry_split, gain)
                     if _srv is not None:
                         return _srv
@@ -38995,7 +39046,9 @@ def _sentence_tts_plan(spoken_text: str):
     (MUTE_TTS -- the muted path stays byte-identical); the reply is long
     enough and has more than one sentence (core.sentence_tts.plan_chunks);
     and the reply's preset is not 'wry' (the wry beat is spliced before the
-    FINAL clause of the whole reply, so a wry line renders whole)."""
+    FINAL clause of the whole reply, so a wry line renders whole). With the
+    clone active a long first line is also split at a clause
+    (_speech_chunks), so one long sentence can be two chunks."""
     try:
         if not globals().get("SENTENCE_TTS_ENABLED", True):
             return None
@@ -39004,8 +39057,7 @@ def _sentence_tts_plan(spoken_text: str):
             return None
         if _tts_layer is not None and _tts_layer.is_muted():
             return None
-        from core import sentence_tts as _st
-        chunks = _st.plan_chunks(spoken_text)
+        chunks = _speech_chunks(spoken_text, kind)
         if len(chunks) < 2:
             return None
         from core import kokoro_tts as _kokoro
@@ -39018,12 +39070,29 @@ def _sentence_tts_plan(spoken_text: str):
         gain = float(preset.get("gain", 1.0))  # type: ignore[arg-type]
         tone_tag = f" tone={user_tone}" if user_tone else ""
         mood_tag = f" mood={_last_mood[0]}" if _last_mood[0] else ""
+        split_tag = (" split=clause"
+                     if getattr(chunks[0], "clause", "") == "head" else "")
         print(f"  [tts] {len(chunks)} sentences preset={chosen}{tone_tag}"
-              f"{mood_tag} rate={preset.get('rate', '+0%')} gain={gain:.2f}")
+              f"{mood_tag} rate={preset.get('rate', '+0%')} gain={gain:.2f}"
+              f"{split_tag}")
         return chunks, (chosen, preset)
     except Exception as e:
         print(f"  [tts] sentence split skipped ({type(e).__name__}: {e})")
         return None
+
+
+def _speech_chunks(spoken_text: str, kind: str) -> list:
+    """The chunks a reply is voiced in -- THE one planner, shared by
+    _sentence_tts_plan and the R3 pre-render (_speak_prerender), so a
+    pre-rendered first chunk is always the plan's chunk 1. Kokoro (and
+    anything but the clone): core.sentence_tts.plan_chunks, unchanged. The
+    clone voice server active (kind 'clone'): plan_clone_chunks -- a first
+    line longer than CLAUSE_SPLIT_MIN_CHARS is voiced in pieces (sentence by
+    sentence, then a clause head and the rest) so its first audio comes
+    sooner."""
+    if kind == "clone":
+        return _sentence_tts.plan_clone_chunks(spoken_text)
+    return _sentence_tts.plan_chunks(spoken_text)
 
 
 # Bound on each wait for the next sentence's render (the house rule: nothing
@@ -39039,7 +39108,8 @@ _SENTENCE_TTS_WAIT_S = 300.0
 
 
 def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
-                     on_first_play=None, first_rendered=None):
+                     on_first_play=None, first_rendered=None,
+                     first_clone=None):
     """Voice `chunks` through core.sentence_tts.play_pipelined: sentence 1 is
     rendered and played on THIS thread (the _SPEAK_LOCK holder) while one
     worker renders the rest; every play_with_lipsync call is made here, one
@@ -39072,11 +39142,22 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
       core/sentence_tts.py.
     * `first_rendered` (audio, sr): sentence 1 as the filler pre-render
       (speed plan R3) made it, pinned to this same `pinned` preset. It gets
-      the same volume_scale and is not rendered again. None = today."""
+      the same volume_scale and is not rendered again. None = today.
+      `first_clone`: whether the clone voice server voiced it (None: not
+      known).
+    * A first line split at a clause (the clone engine, _speech_chunks):
+      the head is followed by CLAUSE_GAP_S instead of SENTENCE_GAP_S, and
+      when Kokoro voiced the head the rest of that sentence skips the clone
+      (_TTS_PRESET_PIN.no_clone) -- one sentence never changes voice
+      halfway. Each chunk rendered ahead carries its needed-by time to the
+      clone (core.sentence_tts.needed_by)."""
     global _barge_in_interrupted
     from core import sentence_tts as _st
     seq0 = _tts_interrupt_seq[0]
     barged = [False]
+    # Whether the clone voiced the clause head of a split first line (None:
+    # no split, or not known).
+    head_clone = [first_clone]
 
     def _scaled(audio):
         if volume_scale != 1.0:
@@ -39088,13 +39169,22 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
         return audio
 
     def _render(text, mode):
+        clause = getattr(text, "clause", "")
+        no_clone = clause == "tail" and head_clone[0] is False
         _TTS_PRESET_PIN.value = pinned
         _TTS_PRESET_PIN.mode = mode
+        _TTS_PRESET_PIN.no_clone = no_clone
         try:
+            if no_clone:
+                print("  [tts] clone voice skipped: Kokoro voiced the start "
+                      "of this sentence, so it voices the rest")
             audio, sr = synthesise(text)
+            if clause == "head":
+                head_clone[0] = bool(getattr(_CLONE_LINE, "voiced", False))
         finally:
             _TTS_PRESET_PIN.value = None
             _TTS_PRESET_PIN.mode = None
+            _TTS_PRESET_PIN.no_clone = False
         return _scaled(audio), sr
 
     _first_kw = {}
@@ -39102,9 +39192,10 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
         _first_kw["first_rendered"] = (_scaled(first_rendered[0]),
                                        first_rendered[1])
 
-    def _pad(audio, sr):
+    def _pad(audio, sr, gap_s=None):
         a = np.asarray(audio)
-        gap = np.zeros(int(sr * _st.SENTENCE_GAP_S), dtype=a.dtype)
+        g = _st.SENTENCE_GAP_S if gap_s is None else float(gap_s)
+        gap = np.zeros(max(0, int(sr * g)), dtype=a.dtype)
         return np.concatenate([a, gap], axis=0)
 
     def _play(audio, sr):
@@ -39219,11 +39310,12 @@ def _speak_prerender(spoken_text: str, intent, wry_flag: bool, chosen_mood):
         if resolved[0] == "wry":
             return None       # the wry beat splices the whole reply
         # The chunk the normal path renders first (_sentence_tts_plan's
-        # split; backend / clone / mute / wry are gated above).
+        # split, through the same _speech_chunks planner -- the clone's
+        # clause head included; backend / clone / mute / wry are gated
+        # above).
         chunk, multi = spoken_text, False
         if globals().get("SENTENCE_TTS_ENABLED", True):
-            from core import sentence_tts as _st
-            chunks = _st.plan_chunks(spoken_text)
+            chunks = _speech_chunks(spoken_text, _tts_engine_kind())
             if len(chunks) >= 2:
                 chunk, multi = chunks[0], True
         voice = _filler_voice_key()
@@ -39235,6 +39327,7 @@ def _speak_prerender(spoken_text: str, intent, wry_flag: bool, chosen_mood):
         _TTS_PRESET_PIN.mode = "kokoro_only"
         try:
             audio, sr = synthesise(chunk)
+            clone = bool(getattr(_CLONE_LINE, "voiced", False))
         finally:
             _TTS_PRESET_PIN.value = None
             _TTS_PRESET_PIN.mode = None
@@ -39243,7 +39336,7 @@ def _speak_prerender(spoken_text: str, intent, wry_flag: bool, chosen_mood):
             return None       # empty / the silent-clip shape
         return {"text": spoken_text, "chunk": chunk, "multi": multi,
                 "resolved": resolved, "voice": voice, "seq": seq,
-                "audio": audio, "sr": sr}
+                "audio": audio, "sr": sr, "clone": clone}
     except Exception:
         return None           # SentenceFallback included
     finally:
@@ -39479,7 +39572,8 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
                           if _pre is not None else None)
             if _sentence_plan is not None:
                 _first_kw = ({} if _pre_audio is None
-                             else {"first_rendered": _pre_audio})
+                             else {"first_rendered": _pre_audio,
+                                   "first_clone": _pre.get("clone")})
                 # Raises only when nothing was heard yet (the handler below
                 # then reports the line unspoken, as for one play); a failure
                 # after sentence 1 is logged inside and counts as spoken.
@@ -39756,9 +39850,10 @@ def _filler_arm_suppressed() -> str | None:
 
 def _filler_voice_key() -> tuple:
     """Cache key: a backend / voice / clone change invalidates every clip.
-    The engine kind is in it, so the clone voice server coming up (or being
-    latched off) re-renders the clips in the voice that is speaking -- and
-    an R3 pre-render made across such a switch is dropped in the lock."""
+    The engine kind is in it, so the clone voice server coming up (or
+    starting a cool-down) re-renders the clips in the voice that is speaking
+    -- and an R3 pre-render made across such a switch is dropped in the
+    lock."""
     return (str(globals().get("TTS_BACKEND", "edge") or "edge").lower(),
             str(getattr(sys.modules.get("core.kokoro_tts"), "_VOICE", "")),
             bool(globals().get("VOICE_CLONE_ENABLED", False)),
@@ -39787,7 +39882,7 @@ def _filler_render(text: str):
             return None
         # ClipCache.warm stores the clip under the key it reads AFTER this
         # render, and the key carries the engine kind: a clip rendered while
-        # the clone server came up (or was latched off) would otherwise be
+        # the clone server came up (or began a cool-down) would otherwise be
         # filed under the other voice and play in the wrong one. Drop it;
         # the next warm renders that line again in the voice now speaking.
         if _tts_engine_kind() != kind:

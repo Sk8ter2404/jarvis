@@ -14,9 +14,15 @@ filler code; only Kokoro (a constant 0.25 sentinel), the speaker
     (per-sentence speech, the filler, the R3 pre-render) run with it;
   * slow: the line times out inside its deadline and THAT line is Kokoro;
   * down at boot: one log line, Kokoro speaks, nothing waits on the server;
-  * latch-off: MAX_FAILURES in a row, then no more requests;
+  * cool-down (2026-10-04, was latch-off for the session): MAX_FAILURES
+    latency-critical misses in a row, then no requests until it ends, then
+    the clone voices again;
   * speak contracts: self-echo remember before the play / refresh after it,
-    a barge-in between sentences stops the reply, volume_scale, mute.
+    a barge-in between sentences stops the reply, volume_scale, mute;
+  * live budgeting (2026-10-04): the 10:36 briefing replayed through the
+    real _speak keeps the clone voice and never cools down; a long first
+    sentence is split at a clause (clone only), the rest keeps the head's
+    voice and the whole line's budget; one "[tts] clone voice" line per line.
 
     python -m unittest tests.monolith.test_monolith_clone_server
 """
@@ -30,7 +36,8 @@ import types
 import unittest
 from unittest import mock
 
-from tests._clone_voice_fake import FakeCloneServer, ProfileDir, free_port
+from tests._clone_voice_fake import (LIVE_1036_LINES, FakeCloneServer,
+                                     ProfileDir, free_port, live_1036_server)
 from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith
 from tests.monolith.test_monolith_processing_filler import _Base as _FillerBase
 
@@ -47,7 +54,7 @@ class _CloneMixin:
     """A box with the clone voice server selected and a fake server up.
     Mixed into a MonolithGlobalsTestCase subclass that provides _p()."""
 
-    def clone_setup(self, *, ready=True, **server_kw):
+    def clone_setup(self, *, ready=True, server_factory=None, **server_kw):
         bc = self.bc
         import numpy as np
         self.np = np
@@ -58,7 +65,8 @@ class _CloneMixin:
         self.prof = ProfileDir("butler")
         self.addCleanup(self.prof.cleanup)
         self._p(vc, "PROFILES_DIR", self.prof.root)
-        self.srv = FakeCloneServer(ref_sha=self.prof.sha, **server_kw).start()
+        self.srv = (server_factory(self.prof.sha) if server_factory else
+                    FakeCloneServer(ref_sha=self.prof.sha, **server_kw)).start()
         self.addCleanup(self.srv.stop)
         self.logs = []
         self.client = cvc.CloneVoiceClient(
@@ -91,8 +99,22 @@ class _CloneMixin:
             self.logs.clear()
 
     # helpers
+    def rest_clone(self):
+        """Put the client in a cool-down that lasts the whole test."""
+        self.client._status = "cooldown"
+        self.client._cool_until = self.client._clock() + 3600.0
+
     def is_kokoro(self, audio) -> bool:
         return bool(self.np.allclose(audio, KOKORO))
+
+    def voice_of(self, audio) -> str:
+        """'kokoro' / 'clone' / '?' for a played clip, its sentence pause
+        (exact zeros) ignored."""
+        a = self.np.asarray(audio)
+        voiced = a[a != 0.0]
+        if voiced.size and bool(self.np.allclose(voiced, KOKORO)):
+            return "kokoro"
+        return "clone" if self.is_clone(a) else "?"
 
     def is_clone(self, audio) -> bool:
         a = self.np.asarray(audio)
@@ -252,7 +274,7 @@ class HealthyTests(_Base):
         self.assertIsNotNone(plan)
         self.assertEqual(plan[0], [S1, S2, S3])
         key_clone = bc._filler_voice_key()
-        self.client._status = "latched"
+        self.rest_clone()
         self.assertEqual(bc._tts_engine_kind(), "kokoro")
         self.assertNotEqual(bc._filler_voice_key(), key_clone)
 
@@ -269,12 +291,24 @@ class HealthyTests(_Base):
         self.assertTrue(self.np.allclose(audio, 0.75))
         self.assertEqual(self.srv.tts_texts(), [])
 
+    def test_the_voiced_flag_describes_the_last_line_only(self):
+        # _CLONE_LINE.voiced: did the clone voice the LAST synthesise() on
+        # this thread. A stale True would let the rest of a sentence whose
+        # head Kokoro voiced switch to the clone halfway.
+        bc = self.bc
+        self.quiet(bc.synthesise, SHORT)
+        self.assertTrue(bc._CLONE_LINE.voiced)
+        self.srv.fail_texts = {"A line that fails."}
+        audio, _ = self.quiet(bc.synthesise, "A line that fails.")
+        self.assertTrue(self.is_kokoro(audio))
+        self.assertFalse(bc._CLONE_LINE.voiced)
+
     def test_boot_label_names_the_clone(self):
         self.assertIn("clone voice server (ready)", self.bc._boot_tts_label())
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Slow, failing, latched
+#  Slow, failing, cooling down
 # ════════════════════════════════════════════════════════════════════════════
 class SlowAndFailingTests(_Base):
     def test_slow_line_falls_back_to_kokoro_inside_the_timeout(self):
@@ -288,25 +322,40 @@ class SlowAndFailingTests(_Base):
         self.assertEqual(self.kokoro_texts, [SHORT])
         self.assertIn("clone voice timed out", self.out)
         self.assertIn("Kokoro voices this line", self.out)
+        # One compact line: render ms, first line, the deadline it had.
+        self.assertIn("(first line, deadline 0.5 s)", self.out)
         self.assertEqual(dict(self.stats).get("clone"), 0)
         self.assertEqual(bc._tts_engine_kind(), "clone")   # one miss: still on
 
-    def test_latch_off_after_max_failures(self):
+    def test_cooldown_after_max_failures_then_the_clone_returns(self):
         self.clone_setup(tts_status=500)
         bc = self.bc
+        now = [1000.0]
+        self.client._clock = lambda: now[0]
         n = self.cvc.MAX_FAILURES
         for i in range(n):
             audio, _ = self.quiet(bc.synthesise, f"Line {i}.")
             self.assertTrue(self.is_kokoro(audio))
-        self.assertEqual(self.client.status()[0], "latched")
-        self.assertEqual(len([m for m in self.logs
-                              if "off for this session" in m]), 1, self.logs)
+        self.assertEqual(self.client.status()[0], "cooldown")
+        rests = [m for m in self.logs if "rests for 5 min" in m]
+        self.assertEqual(len(rests), 1, self.logs)
+        self.assertNotIn("for this session", " ".join(self.logs))
         sent = len(self.srv.tts_texts())
-        audio, _ = self.quiet(bc.synthesise, "After the latch.")
+        audio, _ = self.quiet(bc.synthesise, "During the rest.")
         self.assertTrue(self.is_kokoro(audio))
         self.assertEqual(len(self.srv.tts_texts()), sent)   # no more requests
         self.assertNotIn("clone voice", self.out)           # and no noise
         self.assertEqual(bc._tts_engine_kind(), "kokoro")
+        # Five minutes later the clone is tried again -- not off for the
+        # session any more.
+        now[0] += self.cvc.COOLDOWN_BASE_S
+        self.srv.tts_status = 200
+        self.assertEqual(bc._tts_engine_kind(), "clone")
+        audio, _ = self.quiet(bc.synthesise, "After the rest.")
+        self.assertTrue(self.is_clone(audio))
+        self.assertEqual(self.srv.tts_texts()[-1], "After the rest.")
+        self.assertEqual(len([m for m in self.logs if "cool-down over" in m]),
+                         1, self.logs)
 
     def test_too_long_line_goes_to_kokoro_without_a_failure(self):
         self.clone_setup()
@@ -386,10 +435,19 @@ class DownAtBootTests(_Base):
 # ════════════════════════════════════════════════════════════════════════════
 #  Speak contracts through the real _speak
 # ════════════════════════════════════════════════════════════════════════════
-class SpeakContractTests(_Base):
+class _SpeakBase(_Base):
+    """The real _speak / _speak_sentences / synthesise with the speaker
+    (play_with_lipsync), HUD, ducker and self-echo faked. PLAY_SLEEPS: the
+    fake speaker blocks for the audio's length, as the real one does."""
+
+    PLAY_SLEEPS = False
+
+    def clone_kw(self) -> dict:
+        return {}
+
     def setUp(self):
         super().setUp()
-        self.clone_setup()
+        self.clone_setup(**self.clone_kw())
         bc = self.bc
         self._p(bc, "set_state")
         self._p(bc, "_write_hud_state")
@@ -416,6 +474,8 @@ class SpeakContractTests(_Base):
             self.played.append(self.np.array(audio, copy=True))
             if self.on_play is not None:
                 self.on_play(len(self.played))
+            if self.PLAY_SLEEPS:
+                time.sleep(len(audio) / float(sr))
         self._p(bc, "play_with_lipsync", side_effect=play)
         self._p(bc._self_echo, "remember",
                 side_effect=lambda t: (self.events.append(("remember", t)), 7)[1])
@@ -424,6 +484,18 @@ class SpeakContractTests(_Base):
 
     def speak(self, text=REPLY, **kw):
         return self.quiet(self.bc._speak, text, **kw)
+
+    def join_workers(self):
+        """Let a render left in flight by a stopped reply finish (by design)
+        before the fake server goes away, its log line kept out of the
+        test output."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            for th in threading.enumerate():
+                if th.name == "sentence-tts-synth":
+                    th.join(timeout=5.0)
+
+
+class SpeakContractTests(_SpeakBase):
 
     def test_each_sentence_is_one_clone_render_in_order(self):
         self.assertTrue(self.speak())
@@ -463,9 +535,7 @@ class SpeakContractTests(_Base):
         self.assertIn("reply stopped after 1/3", self.out)
         # The render already in flight on the worker finishes on its own
         # (by design) -- let it, before the fake server goes away.
-        for th in threading.enumerate():
-            if th.name == "sentence-tts-synth":
-                th.join(timeout=5.0)
+        self.join_workers()
         self.assertEqual(len(self.played), 1)
 
     def test_volume_scale_applies_to_the_clone(self):
@@ -481,6 +551,147 @@ class SpeakContractTests(_Base):
         self.speak()
         self.assertEqual(self.srv.tts_texts(), [])
         self.assertEqual(self.played, [])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Live budgeting (2026-10-04): the 10:36 briefing, replayed through _speak
+# ════════════════════════════════════════════════════════════════════════════
+class LiveBudgetReplayTests(_SpeakBase):
+    """The 7-sentence briefing of 2026-10-04 10:36: renders of 1.0-3.8 s
+    (lines 5-7 slower than the fixed per-line budget) while seconds of
+    earlier audio were still queued. Live, Kokoro voiced lines mid-reply and
+    three such misses latched the clone off for the session. Replayed here
+    with every time scaled by SCALE (budget, per-char allowance, margin,
+    sentence gap, render and audio lengths), through the REAL _speak ->
+    _speak_sentences -> play_pipelined -> synthesise -> client, a serial fake
+    server and a fake speaker that blocks for each clip's length."""
+
+    SCALE = 0.2
+    PLAY_SLEEPS = True
+
+    def clone_kw(self) -> dict:
+        return {"server_factory":
+                lambda sha: live_1036_server(sha, self.SCALE)}
+
+    def setUp(self):
+        super().setUp()
+        s = self.SCALE
+        from core import sentence_tts
+        self._p(self.bc, "_clone_timeout_s", return_value=2.5 * s)
+        self._p(self.cvc, "PER_CHAR_S", self.cvc.PER_CHAR_S * s)
+        # create=True: the same replay runs against a client without the
+        # needed-by deadline (origin/main before 2026-10-04) and fails there
+        # on behaviour, not on a missing name.
+        self._p(self.cvc, "NEEDED_BY_MARGIN_S",
+                getattr(self.cvc, "NEEDED_BY_MARGIN_S", 0.5) * s, create=True)
+        self._p(sentence_tts, "SENTENCE_GAP_S",
+                sentence_tts.SENTENCE_GAP_S * s)
+
+    def test_the_1036_briefing_keeps_the_clone_voice_and_never_cools_down(self):
+        self.assertTrue(self.speak(" ".join(LIVE_1036_LINES)))
+        self.join_workers()
+        self.assertEqual(self.srv.tts_texts(), list(LIVE_1036_LINES))
+        self.assertEqual(len(self.played), 7)
+        voices = [self.voice_of(a) for a in self.played]
+        self.assertEqual(voices, ["clone"] * 7)       # never changed voice
+        self.assertEqual(self.kokoro_texts, [])
+        self.assertEqual(self.client.failures(), 0)
+        self.assertEqual(self.client.status(), ("ready", ""))   # no latch
+        self.assertEqual(self.logs, [])               # no cool-down either
+        self.assertNotIn("Kokoro voices this line", self.out)
+        # One compact line per clone line: ms, first / look-ahead, deadline.
+        lines = [ln for ln in self.out.splitlines()
+                 if "[tts] clone voice" in ln]
+        self.assertEqual(len(lines), 7, self.out)
+        self.assertRegex(lines[0], r"clone voice \d+ ms \(first line, "
+                                   r"deadline 0\.5 s\)$")
+        for ln in lines[1:]:
+            self.assertRegex(ln, r"clone voice \d+ ms \(look-ahead, "
+                                 r"deadline \d+\.\d s\)$")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  The first-line clause split (clone only)
+# ════════════════════════════════════════════════════════════════════════════
+LONG = ("Good evening, sir, the forecast calls for light rain this afternoon "
+        "and temperatures near sixty.")
+HEAD = "Good evening, sir,"
+TAIL = ("the forecast calls for light rain this afternoon and temperatures "
+        "near sixty.")
+
+
+class ClauseSplitSpeakTests(_SpeakBase):
+    def test_a_long_first_sentence_is_two_renders_head_first(self):
+        from core import sentence_tts
+        self.speak(f"{LONG} {S3}")
+        self.assertEqual(self.srv.tts_texts(), [HEAD, TAIL, S3])
+        self.assertEqual(len(self.played), 3)
+        for a in self.played:
+            self.assertTrue(self.is_clone(a))
+        self.assertEqual(self.kokoro_texts, [])
+        # Every render is the same take, so the lengths differ only by the
+        # pause after it: a short clause pause after the head, the full
+        # sentence pause after the end of the sentence, none at the end.
+        clip = len(self.played[2])
+        self.assertEqual(len(self.played[0]) - clip,
+                         int(24000 * sentence_tts.CLAUSE_GAP_S))
+        self.assertEqual(len(self.played[1]) - clip,
+                         int(24000 * sentence_tts.SENTENCE_GAP_S))
+        self.assertIn("split=clause", self.out)
+        self.assertIn("(first line, deadline", self.out)
+        self.assertIn("(look-ahead, deadline", self.out)
+
+    def test_kokoro_is_unchanged_when_the_clone_is_off(self):
+        self._p(self.bc, "VOICE_CLONE_ENABLED", False)
+        self.speak(LONG)
+        self.assertEqual(self.kokoro_texts, [LONG])
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(self.srv.tts_texts(), [])
+        self.assertNotIn("split=clause", self.out)
+
+    def test_no_split_while_the_clone_rests(self):
+        self.rest_clone()
+        self.speak(LONG)
+        self.assertEqual(self.kokoro_texts, [LONG])
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(self.srv.tts_texts(), [])
+
+    def test_the_rest_of_a_sentence_keeps_the_heads_voice(self):
+        self.srv.fail_texts = {HEAD}
+        self.speak(LONG)
+        self.assertEqual(self.srv.tts_texts(), [HEAD])   # the rest: no clone
+        self.assertEqual(self.kokoro_texts, [HEAD, TAIL])
+        self.assertTrue(self.is_kokoro(self.played[0][:2400]))
+        self.assertTrue(self.is_kokoro(self.played[1]))
+        self.assertIn("Kokoro voiced the start of this sentence", self.out)
+
+    def test_the_rest_keeps_the_whole_lines_budget(self):
+        # The rest alone (77 chars) gets the 0.5 s budget; the whole line
+        # (96 chars) 0.5 + 0.03 x 16 = 0.98 s. Rendering it in 0.75 s keeps
+        # the clone: splitting never gives the rest less time than the
+        # unsplit line had.
+        self._p(self.bc, "VOICE_CLONE_TIMEOUT_S", 0.5)
+        self.srv.latency_for = {TAIL: 0.75}
+        self.speak(LONG)
+        self.join_workers()
+        self.assertEqual(self.srv.tts_texts(), [HEAD, TAIL])
+        self.assertEqual(self.kokoro_texts, [])
+        for a in self.played:
+            self.assertTrue(self.is_clone(a))
+
+    def test_a_prerendered_head_tells_the_rest_which_voice_to_keep(self):
+        bc = self.bc
+        plan = self.quiet(bc._sentence_tts_plan, LONG)
+        self.assertEqual(plan[0], [HEAD, TAIL])
+        kokoro_head = (self.np.full(2400, KOKORO, dtype=self.np.float32),
+                       24000)
+        self.quiet(bc._speak_sentences, plan[0], plan[1],
+                   first_rendered=kokoro_head, first_clone=False)
+        self.assertEqual(self.srv.tts_texts(), [])
+        self.assertEqual(self.kokoro_texts, [TAIL])
+        self.quiet(bc._speak_sentences, plan[0], plan[1],
+                   first_rendered=kokoro_head, first_clone=True)
+        self.assertEqual(self.srv.tts_texts(), [TAIL])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -507,7 +718,7 @@ class FillerAndPrerenderTests(_CloneMixin, _FillerBase):
         self.assertTrue(self.is_clone(audio))
         self.assertEqual(self.srv.tts_texts(), ["Just a moment, sir."])
         self.assertEqual(self.kokoro_texts, [])
-        self.client._status = "latched"
+        self.rest_clone()
         audio, _ = bc._filler_render("One moment.")
         self.assertTrue(self.is_kokoro(audio))
 
@@ -565,10 +776,30 @@ class FillerAndPrerenderTests(_CloneMixin, _FillerBase):
         self.addCleanup(bc._filler_on_device.__setitem__, 0, False)
         pre = self.quiet(bc._speak_prerender, SHORT, None, False, None)
         self.assertIsNotNone(pre)
-        self.client._status = "latched"
+        self.rest_clone()
         got = self.quiet(bc._prerender_take, pre, SHORT, None)
         self.assertIsNone(got)
         self.assertIn("pre-render dropped (voice changed)", self.out)
+
+    def test_prerender_renders_the_clause_head_the_plan_starts_with(self):
+        # One planner (_speech_chunks) for the pre-render and the plan: the
+        # pre-rendered chunk is the plan's clause head, so the take keeps it.
+        bc = self.bc
+        self._p(bc, "_processing_filler",
+                mock.Mock(is_owner_thread=lambda: True))
+        self._p(bc, "SENTENCE_TTS_ENABLED", True, create=True)
+        bc._filler_on_device[0] = True
+        self.addCleanup(bc._filler_on_device.__setitem__, 0, False)
+        pre = self.quiet(bc._speak_prerender, LONG, None, False, None)
+        self.assertIsNotNone(pre)
+        self.assertEqual((pre["chunk"], pre["multi"], pre["clone"]),
+                         (HEAD, True, True))
+        self.assertEqual(self.srv.tts_texts(), [HEAD])
+        plan = self.quiet(bc._sentence_tts_plan, LONG)
+        self.assertEqual(plan[0], [HEAD, TAIL])
+        got = self.quiet(bc._prerender_take, pre, LONG, plan)
+        self.assertIsNotNone(got, self.out)
+        self.assertIs(got[0], pre["audio"])
 
     def test_no_prerender_with_the_in_process_clone(self):
         bc = self.bc
