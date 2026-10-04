@@ -423,6 +423,21 @@ def _release_mute_sec() -> float:
         return _RELEASE_MUTE_SEC_DEFAULT
 
 
+def _shared_two_hand_on(kb) -> bool:
+    """True while the bridge's SHARED stabiliser says two-hand mode is on (a
+    fresh snapshot). The same verdict the air-mouse stands down on, so the
+    gesture mute can never disagree with it - even for a frame where the
+    two-hand poller's heartbeat lags or the poller is off. NEVER raises."""
+    try:
+        fn = getattr(kb, "get_tracked_frame", None)
+        if callable(fn):
+            snap = fn()
+            return bool(snap and not snap.get("stale") and snap.get("two_hand"))
+    except Exception:
+        pass
+    return False
+
+
 def _owner_bodies(kb) -> list:
     """The bodies the recognizer reads. With the bridge's SHARED stabiliser that
     is ONLY the owner body it tracks (sticky by id - the same body the air-mouse
@@ -473,7 +488,7 @@ def _poll_once(rec, bc) -> str | None:
     # two-hand resize mode is driving. Reset the recognizer so no stale reach/resize
     # motion lingers to fire on disengage.
     now = time.monotonic()
-    if _air_mouse_engaged() or _two_hand_active():
+    if _air_mouse_engaged() or _two_hand_active() or _shared_two_hand_on(kb):
         _muted_until[0] = now + _release_mute_sec()
         try:
             rec.reset()

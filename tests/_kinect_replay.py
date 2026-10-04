@@ -25,8 +25,10 @@ complete before-picture run this harness on an origin/main tree, where the
 bridge has no publish_body_frame and every consumer is the shipped code.
 
 A replay leaves no state behind: run() resets what the skills publish to
-each other (engaged flag, two-hand heartbeat) and unload_modules() puts back
-the sys.modules entries load_modules() replaced.
+each other (engaged flag, two-hand heartbeat), clears the bridge's body cache
+(its frames carry SIMULATED stamps that a short-uptime machine would serve as
+fresh) and unload_modules() puts back the sys.modules entries load_modules()
+replaced. The two-hand heartbeat runs on the replay's simulated clock too.
 
 Nothing here touches a sensor, the mouse, a window, the network or the
 settings file. Stdlib + unittest.mock only.
@@ -160,12 +162,22 @@ def _fake_body(joints: dict, fr: Frame, body_id: int, z_shift: float = 0.0):
 
 def parse(fr: Frame) -> list:
     """The REAL bridge parser over the fake frame (ghost gate, confidence,
-    distance, facing - all live code)."""
+    distance, facing - all live code). fr.body_id None = the owner is not in
+    this frame. Each fr.extra entry is another body: (id, dz) copies the
+    owner's pose `dz` metres deeper; (id, dz, left, right) gives it its own
+    hand positions (open hands, everything Tracked)."""
     from audio import kinect_bridge as kb
+    bodies = []
     joints = frame_joints(fr)
-    bodies = [_fake_body(joints, fr, fr.body_id)]
-    for bid, dz in fr.extra:
-        bodies.append(_fake_body(joints, fr, bid, dz))
+    if fr.body_id is not None:
+        bodies.append(_fake_body(joints, fr, fr.body_id))
+    for ex in fr.extra:
+        if len(ex) == 2:
+            bodies.append(_fake_body(joints, fr, ex[0], ex[1]))
+        else:
+            bid, dz, left, right = ex
+            other = Frame(left, right)
+            bodies.append(_fake_body(frame_joints(other), other, bid, dz))
     return kb._parse_body_frame(types.SimpleNamespace(bodies=bodies))
 
 
@@ -283,6 +295,10 @@ def _patched(am, th, gs, facade, clock):
         mock.patch.object(gs, "time", types.SimpleNamespace(
             monotonic=clock, time=clock, sleep=lambda s: None)),
     ]
+    if hasattr(am, "_heartbeat_clock"):
+        # The two-hand -> air-mouse heartbeat TTL on the SIMULATED clock, so a
+        # replay neither mixes clocks nor flakes on a descheduled process.
+        patches.append(mock.patch.object(am, "_heartbeat_clock", [clock]))
     for p in patches:
         p.start()
     try:
@@ -330,7 +346,6 @@ def _reset_published_state(am, th, gs) -> None:
     for fn in (lambda: am._set_air_mouse_state(False, "open", None),
                lambda: am.set_two_hand_active(False),
                lambda: th._grab_hwnd.__setitem__(0, 0),
-               lambda: th._regrab_blocked.__setitem__(0, False),
                lambda: gs._muted_until.__setitem__(0, 0.0)):
         try:
             fn()
@@ -367,9 +382,23 @@ def run(frames: list, *, shared: bool = True, poll_hz: float = 27.0,
         _reset_published_state(am, th, gs)
         if shared:
             kb.reset_tracking()
+        clear_body_cache()
         if own:
             unload_modules()
     return res
+
+
+def clear_body_cache() -> None:
+    """Empty the bridge's shared body cache. A replay's frames carry simulated
+    stamps (t ~ 1000 s); on a machine up for less than that, get_bodies() would
+    serve them as fresh to whatever runs next. NEVER raises."""
+    try:
+        from audio import kinect_bridge as kb
+        with kb._body_cache_lock:
+            kb._body_cache[0] = None
+            kb._body_cache_at[0] = 0.0
+    except Exception:
+        pass
 
 
 def _replay(frames, res, am, th, gs, kb, kgr, facade, state, clock, t0,
@@ -437,15 +466,33 @@ def _replay(frames, res, am, th, gs, kb, kgr, facade, state, clock, t0,
 def rest_noise(rows: list, src: str = "left") -> list:
     """Per-frame hand + wrist jitter (metres) from the recording's AT-REST
     frames (still_<src> = 1: that hand and wrist moved < 15 mm over 1 s), in
-    recorded order. The left hand is the default source: its joints were
-    Tracked most of the time (hand 78%, wrist 98% of this segment), so its
-    residuals are sensor noise, not Inferred-joint guesses."""
+    recorded order, WITH each joint's recorded TrackingState of that frame
+    ("hand_state" / "wrist_state"). The hand residuals include the frames the
+    SDK only Inferred the hand (wider excursions); a replay that injects them
+    must label those frames Inferred too (scenario_raise_and_hold's
+    noise_states), or it hands a Tracked-labelled guess to the pipeline - which
+    flatters the wrist-first stabiliser (2026-10-04 review)."""
     J = "Left" if src == "left" else "Right"
     out = []
     for r in rows:
         if r.get("still_" + src):
             out.append({"hand": tuple(r[f"Hand{J}_{a}"] / 10000.0 for a in "xyz"),
-                        "wrist": tuple(r[f"Wrist{J}_{a}"] / 10000.0 for a in "xyz")})
+                        "wrist": tuple(r[f"Wrist{J}_{a}"] / 10000.0 for a in "xyz"),
+                        "hand_state": r["ts_Hand" + J],
+                        "wrist_state": r["ts_Wrist" + J]})
+    return out
+
+
+def iid_noise(n: int, sd_m: float = 0.003, seed: int = 11) -> list:
+    """`n` frames of independent Gaussian jitter (sd_m metres per axis), the
+    SAME distribution on the hand and on the wrist - so a jitter comparison
+    measures the filter, not which joint the pipeline reads."""
+    import random
+    rnd = random.Random(seed)
+    out = []
+    for _ in range(n):
+        out.append({"hand": tuple(rnd.gauss(0.0, sd_m) for _ in range(3)),
+                    "wrist": tuple(rnd.gauss(0.0, sd_m) for _ in range(3))})
     return out
 
 
@@ -469,22 +516,29 @@ def scenario_desk(rows: list) -> list:
 
 def scenario_raise_and_hold(rows: Optional[list] = None, *, seconds=8.0,
                             side="right", lift=0.25, grip=2, conf=1,
-                            tracking_from: Optional[str] = None) -> list:
+                            tracking_from: Optional[str] = None,
+                            noise: Optional[list] = None,
+                            noise_states: bool = False) -> list:
     """One hand raised (open palm, reaching) and held still; the other at the
     desk. With `rows`, the raised hand + wrist carry the recorded AT-REST
-    jitter (rest_noise). tracking_from="left"/"right" additionally gives them
-    the recorded hand/wrist TrackingState stream of that recorded hand (the
+    jitter (rest_noise) - or pass `noise` (e.g. iid_noise) explicitly.
+    noise_states=True labels each injected frame with the recorded hand/wrist
+    TrackingState of that same rest frame. tracking_from="left"/"right" instead
+    gives them the recorded TrackingState stream of that recorded hand (the
     right one toggled Tracked/Inferred 86 times in 30 s)."""
     out = []
     n = int(seconds * 30)
     other = "left" if side == "right" else "right"
-    noise_seq = rest_noise(rows) if rows else []
+    noise_seq = noise if noise is not None else (rest_noise(rows) if rows else [])
     for i in range(n):
         hand = raised_hand(side, lift)
-        noise, states = {}, {}
+        nzd, states = {}, {}
         if noise_seq:
             nz = noise_seq[i % len(noise_seq)]
-            noise = {f"hand_{side}": nz["hand"], f"wrist_{side}": nz["wrist"]}
+            nzd = {f"hand_{side}": nz["hand"], f"wrist_{side}": nz["wrist"]}
+            if noise_states and "hand_state" in nz:
+                states = {f"hand_{side}": nz["hand_state"],
+                          f"wrist_{side}": nz["wrist_state"]}
         if rows and tracking_from:
             r = rows[i % len(rows)]
             J = "Left" if tracking_from == "left" else "Right"
@@ -493,7 +547,7 @@ def scenario_raise_and_hold(rows: Optional[list] = None, *, seconds=8.0,
         kw = {"hr": grip, "hrc": conf} if side == "right" else {"hl": grip, "hlc": conf}
         left = hand if side == "left" else desk_hand(other)
         right = hand if side == "right" else desk_hand(other)
-        out.append(Frame(left, right, states=states, noise=noise, **kw))
+        out.append(Frame(left, right, states=states, noise=nzd, **kw))
     return out
 
 
@@ -656,3 +710,184 @@ def scenario_reach(*, hold=2.0, distance=0.30, move_s=0.6, side="right",
         out.append(Frame(other if side == "right" else hand,
                          hand if side == "right" else other, noise=noise))
     return out
+
+
+# ─── 2026-10-04 review scenarios (each one reproduced a finding) ────────────
+def _timeline(seconds: float, fn) -> list:
+    """Frames at 30 Hz: fn(t) -> Frame for each frame time t."""
+    return [fn(i * FRAME_S) for i in range(int(seconds * 30))]
+
+
+def scenario_offhand_fist_at_desk(*, seconds=4.0, at=2.0, dur=0.5, conf=1):
+    """The RIGHT hand drives (raised, open); the LEFT hand rests on the desk,
+    Tracked, and closes (High confidence) from `at` for `dur` - holding a cup,
+    a phone, the real mouse."""
+    def fn(t):
+        return Frame(desk_hand("left"), raised_hand("right", 0.25),
+                     hl=3 if at <= t < at + dur else 2, hlc=conf)
+    return _timeline(seconds, fn)
+
+
+def scenario_drag_then_open(*, seconds=6.0, after=2, after_conf=0,
+                            move_m=0.10):
+    """RIGHT hand engaged; a deliberate High-confidence fist 2.0-2.5 s, then
+    the SDK reads `after` (2 = Open, 0 = Unknown) at confidence `after_conf`
+    for 2 s while the hand moves `move_m` sideways (the owner thinks he let
+    go), then Open/High."""
+    def fn(t):
+        if 2.0 <= t < 2.5:
+            hr, hrc = 3, 1
+        elif 2.5 <= t < 4.5:
+            hr, hrc = after, after_conf
+        else:
+            hr, hrc = 2, 1
+        x = 0.15 - move_m * min(1.0, max(0.0, (t - 2.6) / 1.0))
+        return Frame(desk_hand("left"), raised_hand("right", 0.25, x=x),
+                     hr=hr, hrc=hrc)
+    return _timeline(seconds, fn)
+
+
+def scenario_reach_with_hand_state(*, seconds=4.0, state=4, conf=1,
+                                   lift=0.15):
+    """The RIGHT hand rises to `lift` at 0.5 s and is held, reaching, with the
+    SDK reading `state` (4 = Lasso / pointing, 3 = Closed, ...) at `conf`."""
+    def fn(t):
+        up = t >= 0.5
+        return Frame(desk_hand("left"),
+                     raised_hand("right", lift) if up else desk_hand("right"),
+                     hr=state if up else 2, hrc=conf)
+    return _timeline(seconds, fn)
+
+
+def scenario_second_hand_crosses_then_rests(*, seconds=8.0, rest_lift=0.0,
+                                            fists_at=None):
+    """The RIGHT hand drives (+0.25). The LEFT crosses the line (+0.12) for
+    0.5 s at 2.0 s (touching glasses), then rests at `rest_lift` (chin /
+    chest height). Optionally both hands close from `fists_at`."""
+    def fn(t):
+        if t < 2.0:
+            left = desk_hand("left")
+        else:
+            ll = 0.12 if t < 2.5 else rest_lift
+            left = raised_hand("left", ll, forward=0.10)
+        g = 3 if (fists_at is not None and t >= fists_at) else 2
+        return Frame(left, raised_hand("right", 0.25), hl=g, hr=g)
+    return _timeline(seconds, fn)
+
+
+def scenario_hand_joint_inferred(*, seconds=7.0, lift=0.10, start=2.0,
+                                 stop=5.0, grip_from=None):
+    """A STILL raised RIGHT hand whose hand joint is only Inferred from
+    `start` to `stop` (the wrist stays Tracked) - the desk recording had such
+    stretches up to 11 s. Optionally a fist from `grip_from` (a held drag)."""
+    def fn(t):
+        st = {"hand_right": 1} if start <= t < stop else {}
+        g = 3 if (grip_from is not None and t >= grip_from) else 2
+        return Frame(desk_hand("left"), raised_hand("right", lift), states=st,
+                     hr=g)
+    return _timeline(seconds, fn)
+
+
+def scenario_switch_mid_drag(*, seconds=8.0):
+    """The RIGHT hand drags (fist from 1.5 s); at 3.0 s the LEFT rises while
+    the RIGHT lowers to the desk over 0.5 s, where the SDK reads it the way
+    the desk recording does (NotTracked / Unknown, Low) - no grip evidence.
+    From 4.0 s the LEFT hand sweeps 0.3 m across, driving the cursor."""
+    def fn(t):
+        f = min(1.0, max(0.0, (t - 3.0) / 0.5))
+        dl, ul = desk_hand("left"), raised_hand("left", 0.10, x=-0.20)
+        ur, dr = raised_hand("right", 0.10, x=0.20), desk_hand("right")
+        left = tuple(dl[k] + f * (ul[k] - dl[k]) for k in range(3))
+        right = tuple(ur[k] + f * (dr[k] - ur[k]) for k in range(3))
+        if t < 1.5:
+            hr, hrc = 2, 1
+        elif f < 1.0:
+            hr, hrc = 3, 1
+        else:
+            hr, hrc = (1, 0) if int(t * 30) % 5 else (0, 0)
+        if t >= 4.0:
+            left = raised_hand("left", 0.10,
+                               x=-0.20 + 0.3 * min(1.0, (t - 4.0) / 2.0))
+        return Frame(left, right, hr=hr, hrc=hrc, hl=2, hlc=1)
+    return _timeline(seconds, fn)
+
+
+def scenario_two_hand_dip(*, seconds=8.0):
+    """Both fists raised (+0.25) grab a window; at 3.0 s the LEFT dips to
+    +0.03 (under the +0.07 engage line) for 0.6 s and comes back; fists held
+    throughout - the owner wants to keep resizing."""
+    def fn(t):
+        up = t >= 0.5
+        ll = 0.03 if 3.0 <= t < 3.6 else 0.25
+        left = raised_hand("left", ll) if up else desk_hand("left")
+        right = raised_hand("right", 0.25) if up else desk_hand("right")
+        g = 3 if t >= 1.0 else 2
+        return Frame(left, right, hl=g, hr=g)
+    return _timeline(seconds, fn)
+
+
+def scenario_two_hand_cycles(*, cycles=3):
+    """`cycles` full two-hand resizes in a row (raise, fists, hold, open,
+    lower), each a fresh grab."""
+    out = []
+    for _ in range(cycles):
+        out += scenario_two_hand_raise(before=1.0, hold=2.5, after=1.5)
+    return out
+
+
+def scenario_owner_dropout(*, seconds=10.0, other_dz=0.20, new_id=False,
+                           out_at=3.0, out_for=0.5):
+    """The owner drives (RIGHT raised) with a passive person (hands at the
+    desk) `other_dz` metres farther all along. The owner drops out of the
+    frames for `out_for` s at `out_at` and returns (same id, or a NEW id as
+    the SDK often assigns), hand still raised."""
+    def fn(t):
+        bid = 1
+        if out_at <= t < out_at + out_for:
+            bid = None
+        elif t >= out_at + out_for and new_id:
+            bid = 7
+        fr = Frame(desk_hand("left"), raised_hand("right", 0.25), body_id=bid)
+        fr.extra = [(2, other_dz, desk_hand("left"), desk_hand("right"))]
+        return fr
+    return _timeline(seconds, fn)
+
+
+def scenario_passive_first(*, seconds=8.0, other_dz=0.20, owner_at=1.0):
+    """A passive person (hands at the desk) is in view FIRST; the owner
+    arrives at `owner_at`, `other_dz` metres nearer, with a hand raised."""
+    def fn(t):
+        fr = Frame(desk_hand("left"), raised_hand("right", 0.25),
+                   body_id=(1 if t >= owner_at else None))
+        fr.extra = [(2, other_dz, desk_hand("left"), desk_hand("right"))]
+        return fr
+    return _timeline(seconds, fn)
+
+
+def scenario_drag_with_stall(*, seconds=8.0, stall_at=4.0, stall=0.45):
+    """A held drag (RIGHT fist 2.0-6.0 s) while the body pump delivers NO
+    frame for `stall` seconds at `stall_at` (the CPU was pinned on
+    2026-10-04: 267 ms gaps, one over 4 s)."""
+    out, t = [], 0.0
+    while t < seconds:
+        dt = stall if (stall > 0 and abs(t - stall_at) < FRAME_S / 2) else FRAME_S
+        hr = 3 if 2.0 <= t < 6.0 else 2
+        out.append(Frame(desk_hand("left"), raised_hand("right", 0.25), dt=dt,
+                         hr=hr))
+        t += dt
+    return out
+
+
+def scenario_two_hand_band_fists(*, seconds=6.0, band_lift=0.05):
+    """Both hands rise OPEN to +0.25 (two-hand mode engages, nothing grabbed);
+    at 2.0 s the LEFT settles at `band_lift` (under the +0.07 line, inside the
+    mode's 4 cm band); both hands close at 2.5 s; at 4.0 s the left rises back
+    to +0.25 with the fists held."""
+    def fn(t):
+        up = t >= 0.5
+        ll = band_lift if 2.0 <= t < 4.0 else 0.25
+        left = raised_hand("left", ll) if up else desk_hand("left")
+        right = raised_hand("right", 0.25) if up else desk_hand("right")
+        g = 3 if t >= 2.5 else 2
+        return Frame(left, right, hl=g, hr=g)
+    return _timeline(seconds, fn)

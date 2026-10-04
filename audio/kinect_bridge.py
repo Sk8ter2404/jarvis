@@ -1927,6 +1927,13 @@ _body_seq = [0]                       # increments once per published body frame
 # gate and the air-mouse engage gate always use the same lines. None = use
 # core.config directly.
 _lift_margin_override: list[Any] = [None]
+# A stabiliser that could not be BUILT (import / constructor error): when the
+# last attempt failed (monotonic) and why. The pump retries at most once per
+# _TRACKER_RETRY_SEC instead of on every frame, and says so ONCE per failure
+# streak - the air-mouse and two-hand mode stay OFF meanwhile (fail closed).
+_tracker_failed_at: list[Any] = [None]
+_tracker_error: list[Any] = [None]
+_TRACKER_RETRY_SEC = 30.0
 
 
 def _stabilizer_module():
@@ -1961,15 +1968,25 @@ def _live_stabilizer_params() -> dict:
 def new_stabilizer(params_fn=None):
     """A HandStabilizer wired to this bridge's canonical geometry. Used by the
     pump (via publish_body_frame) and by the offline replay harness, so a replay
-    runs exactly the live wiring. NEVER raises (returns None if the module can't
-    load, in which case get_tracked_frame stays None and consumers fall back)."""
+    runs exactly the live wiring. NEVER raises: returns None if the module can't
+    load or construct (the error is kept in _tracker_error). get_tracked_frame
+    then stays None, and the consumers that need it FAIL CLOSED - the air-mouse
+    and two-hand mode read "not tracked" (no cursor, no clicks); gestures and
+    point-to-control fall back to the raw bodies."""
     try:
         return _stabilizer_module().HandStabilizer(
             arm_extension_fn=arm_extension,
             joint_reliable_fn=_joint_reliable,
             params_fn=params_fn or _live_stabilizer_params)
-    except Exception:   # pragma: no cover - defensive
+    except Exception as e:
+        _tracker_error[0] = f"{type(e).__name__}: {e}"
         return None
+
+
+def tracking_error() -> Optional[str]:
+    """Why the shared hand stabiliser could not be built (None = it is fine or
+    has not been needed yet). NEVER raises."""
+    return _tracker_error[0]
 
 
 def publish_body_frame(bodies: list, now: Optional[float] = None) -> None:
@@ -1982,10 +1999,23 @@ def publish_body_frame(bodies: list, now: Optional[float] = None) -> None:
     try:
         with _tracked_lock:
             if _tracker[0] is None:
+                failed = _tracker_failed_at[0]
+                if failed is not None and 0.0 <= ts - failed < _TRACKER_RETRY_SEC:
+                    return          # failed recently: don't rebuild every frame
                 _tracker[0] = new_stabilizer()
+                if _tracker[0] is None:
+                    if failed is None:
+                        print("  [kinect] hand stabiliser UNAVAILABLE ("
+                              f"{_tracker_error[0]}) - the air-mouse and two-hand "
+                              f"mode stay OFF; retrying every {_TRACKER_RETRY_SEC:.0f} s",
+                              flush=True)
+                    _tracker_failed_at[0] = ts
+                    return
+                if failed is not None:
+                    print("  [kinect] hand stabiliser recovered", flush=True)
+                _tracker_failed_at[0] = None
+                _tracker_error[0] = None
             tr = _tracker[0]
-            if tr is None:
-                return
             _body_seq[0] += 1
             _tracked_frame[0] = tr.process(bodies, ts, seq=_body_seq[0])
     except Exception:   # pragma: no cover - process() already never raises
@@ -1994,16 +2024,18 @@ def publish_body_frame(bodies: list, now: Optional[float] = None) -> None:
 
 def get_tracked_frame(now: Optional[float] = None) -> Optional[dict]:
     """The latest shared stabiliser snapshot (see audio/kinect_stabilizer), or
-    None before the first frame / after the pump stopped. A shallow copy with
-    two extra keys: ``age`` (seconds since that frame) and ``stale`` (True once
-    the age passes KINECT_OWNER_LOSS_GRACE_SEC - no new frame for that long, e.g.
-    the pump starved, so consumers must treat the owner as not tracked). Shape:
+    None before the first frame / after the pump stopped / while the stabiliser
+    can't be built (tracking_error). A shallow copy with two extra keys: ``age``
+    (seconds since that frame) and ``stale`` (True once the age passes
+    KINECT_SNAPSHOT_STALE_SEC - no new frame for that long, e.g. the pump
+    starved, so consumers must treat the owner as not tracked; a SHORTER stall
+    holds, so a drag survives it). Shape:
 
-        {"seq", "t", "age", "stale", "owner_id", "owner" (the raw body dict),
-         "fresh", "tracked", "active" ("left"|"right"|None, SDK side),
+        {"seq", "t", "age", "stale", "fps", "owner_id", "owner" (the raw body
+         dict), "fresh", "tracked", "active" ("left"|"right"|None, SDK side),
          "two_hand" (bool), "hands": {"left"|"right": {"pos", "source",
          "measured", "lost_s", "lift", "lift_measured", "raised", "grip",
-         "grip_vote", "state", "conf", "joint_tracked", "ext"}}}
+         "grip_vote", "palm", "state", "conf", "joint_tracked", "ext"}}}
 
     Sides are the SDK's labels; a consumer that mirrors (the air-mouse) swaps
     them itself. NEVER raises."""
@@ -2015,11 +2047,12 @@ def get_tracked_frame(now: Optional[float] = None) -> Optional[dict]:
         out = dict(snap)
         age = max(0.0, n - float(snap.get("t", 0.0)))
         out["age"] = age
-        grace = 0.30
+        stale_after = 0.60
         tr = _tracker[0]
         if tr is not None:
-            grace = float(tr.params.get("KINECT_OWNER_LOSS_GRACE_SEC", grace))
-        out["stale"] = age > grace
+            stale_after = float(tr.params.get("KINECT_SNAPSHOT_STALE_SEC",
+                                              stale_after))
+        out["stale"] = age > stale_after
         return out
     except Exception:   # pragma: no cover - defensive
         return None
@@ -2032,6 +2065,8 @@ def reset_tracking() -> None:
         _tracker[0] = None
         _tracked_frame[0] = None
         _lift_margin_override[0] = None
+        _tracker_failed_at[0] = None
+        _tracker_error[0] = None
 
 
 def get_color_space_mapper():

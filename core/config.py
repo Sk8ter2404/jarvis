@@ -1595,6 +1595,14 @@ AIR_MOUSE_ENGAGE_STRAIGHT = 0.85
 #   past the correlated 2-3-frame misreads the Kinect hand classifier produces at
 #   range, which a 2-frame bar did not cover. NB "lasso" also votes CLOSED.
 AIR_MOUSE_GRIP_CLOSE_FRAMES = 4
+# AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M — clicks are per hand (left hand = left
+#   button, right hand = right button) whichever hand drives the cursor, but the
+#   hand that is NOT driving may only press while it is held up at least this
+#   high relative to the shoulder line (metres; -0.10 = upper-chest height).
+#   A fist resting on the desk (~-0.30) never clicks, and a held button is let
+#   go the moment that hand drops below it. -1.0 = click from anywhere (the
+#   pre-2026-10-04 behaviour); 1.0 = only the driving hand clicks. -0.10 m.
+AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M = -0.10
 # AIR_MOUSE_FIST_RELEASES — a SUSTAINED closed fist while engaged force-disengages
 #   (an extra, optional snappy release to "let go" without lowering the hand).
 #   DEFAULT OFF (2026-07-07 owner report): it FOUGHT the click/drag gesture — a
@@ -1694,21 +1702,18 @@ KINECT_HAND_JUMP_REJECT_FRAMES = 2
 #   hand as gone (which releases the cursor). One Inferred frame used to drop
 #   the lift to None and release instantly. 0.30 s.
 KINECT_HAND_LOSS_GRACE_SEC = 0.30
-# KINECT_WRIST_OFFSET_MAX_AGE_SEC — the hand is placed at the Tracked wrist +
-#   the learned hand-wrist offset; an offset not refreshed (hand and wrist both
-#   Tracked) for this long is not trusted, and the Tracked hand, else the raw
-#   wrist, is used instead. 2.0 s.
-KINECT_WRIST_OFFSET_MAX_AGE_SEC = 2.0
 # KINECT_HAND_OFFSET_CUTOFF_HZ — the hand-wrist offset is low-pass filtered at
 #   this cutoff, and a Tracked WRIST + that offset is the PREFERRED hand position
 #   (the wrist is steadier, and closing the hand moves the hand joint but not
-#   the wrist). Measured on the desk recording: still-hand jitter p90 22 mm
-#   (old cursor path) -> 10 mm. Higher = follows wrist-only flexion faster,
-#   with more hand-joint noise. 1.0 Hz.
+#   the wrist). The last offset is kept however long the hand joint stays
+#   un-Tracked, and re-learned smoothly - never a step. Measured on the desk
+#   recording: still-hand jitter p90 22 mm (old cursor path) -> 10 mm. Higher =
+#   follows wrist-only flexion faster, with more hand-joint noise. 1.0 Hz.
 KINECT_HAND_OFFSET_CUTOFF_HZ = 1.0
-# KINECT_GRIP_REQUIRE_HIGH_CONFIDENCE — a grip (open/closed) frame counts only
-#   when the Kinect's own classifier is HIGH confidence and the hand joint is
-#   Tracked; LOW confidence is "no vote". Set False only if clicks stop
+# KINECT_GRIP_REQUIRE_HIGH_CONFIDENCE — a closed hand PRESSES a button only on
+#   frames where the Kinect's own classifier is HIGH confidence and the hand
+#   joint is Tracked; a LOW-confidence fist is "no vote" for a press. (Opening
+#   the hand RELEASES at any confidence.) Set False only if clicks stop
 #   registering at all (the SDK then never reports High for your hands).
 KINECT_GRIP_REQUIRE_HIGH_CONFIDENCE = True
 # KINECT_GRIP_CLOSE_SEC — a closed hand must be seen (High confidence, real
@@ -1726,10 +1731,16 @@ KINECT_GRIP_OPEN_MIN_VOTES = 2
 # KINECT_GRIP_VOTE_GAP_SEC — a run of grip votes is broken when no vote arrives
 #   for longer than this (the run must start again). 0.10 s.
 KINECT_GRIP_VOTE_GAP_SEC = 0.10
-# KINECT_GRIP_LASSO_AS — what a LASSO (two-finger point) reading counts as:
-#   "none" (no vote - the default: a pointing hand is not a click), "closed"
-#   (the pre-2026-10-04 behaviour) or "open".
+# KINECT_GRIP_LASSO_AS — what a LASSO (two-finger point) reading counts as for
+#   a click: "none" (no vote - the default: a pointing hand is not a click),
+#   "closed" (the pre-2026-10-04 behaviour) or "open". Whatever the setting, a
+#   pointing hand is never an OPEN PALM for AIR_MOUSE_REQUIRE_OPEN_PALM.
 KINECT_GRIP_LASSO_AS = "none"
+# KINECT_GRIP_CLOSED_HOLD_MAX_SEC — a held fist (button down) with NO closed
+#   reading at all for this long (the SDK says Unknown / the hand joint is only
+#   Inferred) lets the button go, so a drag can't outlive the evidence for it.
+#   0 = hold until the hand is seen open or lost. 1.0 s.
+KINECT_GRIP_CLOSED_HOLD_MAX_SEC = 1.0
 # KINECT_LIFT_UP_MARGIN — a hand counts as RAISED once its height above the
 #   shoulder line passes this (metres). Same key the 'calibrate air mouse'
 #   action persists, so a calibration moves the shared gate and the air-mouse
@@ -1760,15 +1771,33 @@ KINECT_TWO_HAND_EXIT_SEC = 0.20
 #   this long, so engage edges are >= EXIT + REARM + ENTER (1.05 s) apart and it
 #   cannot flap within a second. 0.60 s.
 KINECT_TWO_HAND_REARM_SEC = 0.60
+# KINECT_TWO_HAND_ENTER_ABOVE_M — to ENTER two-hand mode both hands must be at
+#   least this far ABOVE the raise line (KINECT_LIFT_UP_MARGIN). Raise it (e.g.
+#   0.05) if two-hand mode takes over while your second hand only hovers near
+#   your chin and you wanted the cursor. 0.0 m.
+KINECT_TWO_HAND_ENTER_ABOVE_M = 0.0
+# KINECT_TWO_HAND_EXIT_BELOW_M — two-hand mode ENDS once either hand drops this
+#   far below the raise line (for KINECT_TWO_HAND_EXIT_SEC). Its own narrow band,
+#   not the single-hand stay line: a second hand resting at chin / chest height
+#   gives the cursor back. 0.04 m.
+KINECT_TWO_HAND_EXIT_BELOW_M = 0.04
 # KINECT_OWNER_LOSS_GRACE_SEC — if the tracked owner body vanishes for a frame,
-#   hold it this long before treating it as gone; also the age past which a
-#   snapshot with no newer frame reads as stale (not tracked). 0.30 s.
+#   hold it this long before treating it as gone. 0.30 s.
 KINECT_OWNER_LOSS_GRACE_SEC = 0.30
 # KINECT_OWNER_SWITCH_NEARER_M — another body takes over as the owner only when
 #   it is at least this much nearer the sensor... 0.25 m.
 KINECT_OWNER_SWITCH_NEARER_M = 0.25
 # KINECT_OWNER_SWITCH_SEC — ...for this long. 1.0 s.
 KINECT_OWNER_SWITCH_SEC = 1.0
+# KINECT_OWNER_CLAIM_SEC — a body at least as near the sensor as the current
+#   owner that holds a hand RAISED this long, while the owner has no hand
+#   raised, becomes the owner: you can always take the cursor back by raising a
+#   hand, even if someone farther away was picked first. 0.30 s.
+KINECT_OWNER_CLAIM_SEC = 0.30
+# KINECT_SNAPSHOT_STALE_SEC — with NO new body frame for this long (the pump
+#   starved, the sensor stopped) the hand state reads as not tracked and the
+#   cursor / any held button is let go. A shorter stall just holds. 0.60 s.
+KINECT_SNAPSHOT_STALE_SEC = 0.60
 # KINECT_GESTURE_RELEASE_MUTE_SEC — gestures (wave / swipe / raise) stay muted
 #   this long after the air-mouse or two-hand mode lets go, so the arm coming
 #   down can't fire a SWIPE (which cancels speech and a pending confirmation).

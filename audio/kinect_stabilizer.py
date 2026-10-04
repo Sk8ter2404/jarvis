@@ -28,7 +28,9 @@ frame cannot double-count, and a skipped frame cannot shorten a dwell.
 
   * OWNER BODY   - sticky by tracking id; held through a short loss; a
                    different body takes over only if the owner is gone past
-                   the grace or another body is clearly nearer for a while.
+                   the grace, another body is clearly nearer for a while, or
+                   a body at least as near RAISES a hand while the owner has
+                   none raised (so the real owner can always claim it back).
   * HAND POSITION - Tracked wrist + the SMOOTHED hand-wrist offset (the wrist
                    is Tracked ~94% of frames when the hand joint is ~35%, it is
                    steadier, and closing the hand moves the hand joint but not
@@ -43,17 +45,21 @@ frame cannot double-count, and a skipped frame cannot shorten a dwell.
                    None on one bad frame.
   * RAISED       - per hand, with an enter dwell above the engage margin and
                    an exit dwell below the (lower) stay margin.
-  * GRIP         - changes ONLY on High-confidence votes from a Tracked hand
-                   joint, with separate time dwells to close (press) and to
-                   open (release); Low confidence / Unknown / an untracked
-                   joint is "no vote". A flicker shorter than the close dwell
-                   can never press a button.
+  * GRIP         - a PRESS needs High-confidence closed votes from a Tracked
+                   hand joint over a time dwell; a RELEASE counts open
+                   readings at ANY confidence; a held grip with no closed
+                   reading for a second lets go. A flicker shorter than the
+                   close dwell can never press, and a drag can't outlive the
+                   evidence for it. A separate PALM signal (any confidence,
+                   Lasso = not open) feeds the air-mouse's open-palm gate.
   * ACTIVE HAND  - sticky: the holder keeps it while raised; the other hand
                    takes over only when it is raised AND leads by a clear
                    margin for a dwell (or the holder is lowered).
-  * TWO-HAND     - enter only after both hands stay raised for a dwell, exit
-                   only after "not both" persists, and no re-entry for a
-                   re-arm window after an exit: it cannot flap within a second.
+  * TWO-HAND     - enter only after both hands stay raised over the UP line
+                   for a dwell, exit once either drops 4 cm under it for a
+                   dwell, no re-entry for a re-arm window after an exit: it
+                   cannot flap within a second, and a second hand resting at
+                   chin / chest height gives the cursor back.
 
 PURE: stdlib only, no sensor, no clock (the caller passes frame times), no
 config import at module level (params are read through an injectable
@@ -83,12 +89,11 @@ DEFAULTS: dict = {
     "KINECT_HAND_JUMP_REJECT_FRAMES": 2,
     # Hold the last good hand value this long before "hand = none".
     "KINECT_HAND_LOSS_GRACE_SEC": 0.30,
-    # A hand-wrist offset older than this is not trusted for the wrist stand-in.
-    "KINECT_WRIST_OFFSET_MAX_AGE_SEC": 2.0,
-    # Cutoff of the smoothing on that hand-wrist offset.
+    # Cutoff of the smoothing on the hand-wrist offset (the wrist stand-in).
     "KINECT_HAND_OFFSET_CUTOFF_HZ": 1.0,
-    # Grip: High-confidence votes only; dwell to CLOSE (press) and to OPEN
-    # (release); a vote run is broken by a contrary vote or a gap this long.
+    # Grip: a PRESS needs High-confidence closed votes; a RELEASE counts open
+    # readings at any confidence; dwell to CLOSE (press) and to OPEN (release);
+    # a vote run is broken by a contrary vote or a gap this long.
     "KINECT_GRIP_REQUIRE_HIGH_CONFIDENCE": True,
     "KINECT_GRIP_CLOSE_SEC": 0.09,
     "KINECT_GRIP_CLOSE_MIN_VOTES": 4,
@@ -96,6 +101,9 @@ DEFAULTS: dict = {
     "KINECT_GRIP_OPEN_MIN_VOTES": 2,
     "KINECT_GRIP_VOTE_GAP_SEC": 0.10,
     "KINECT_GRIP_LASSO_AS": "none",
+    # A held (closed) grip with NO closed reading for this long lets go: a
+    # button can't stay down on no evidence (0 = never).
+    "KINECT_GRIP_CLOSED_HOLD_MAX_SEC": 1.0,
     # Raised: engage above UP, stay down to DOWN (metres of lift).
     "KINECT_LIFT_UP_MARGIN": 0.07,
     "KINECT_LIFT_DOWN_MARGIN": -0.10,
@@ -104,15 +112,27 @@ DEFAULTS: dict = {
     # Active hand: the challenger must lead by this much lift for this long.
     "KINECT_ACTIVE_HAND_SWITCH_LEAD_M": 0.15,
     "KINECT_ACTIVE_HAND_SWITCH_SEC": 0.40,
-    # Two-hand mode: enter dwell, exit dwell, re-arm after an exit.
+    # Two-hand mode: enter dwell, exit dwell, re-arm after an exit. Both hands
+    # must be raised AND at least ENTER_ABOVE over the UP line to enter; the
+    # mode holds while both stay above (UP - EXIT_BELOW) - its OWN narrow band,
+    # not the single-hand stay line, so a second hand resting at chin / chest
+    # height gives the cursor back.
     "KINECT_TWO_HAND_ENTER_SEC": 0.25,
     "KINECT_TWO_HAND_EXIT_SEC": 0.20,
     "KINECT_TWO_HAND_REARM_SEC": 0.60,
+    "KINECT_TWO_HAND_ENTER_ABOVE_M": 0.0,
+    "KINECT_TWO_HAND_EXIT_BELOW_M": 0.04,
     # Owner body: hold through a loss; switch to a nearer body only when it is
-    # this much nearer for this long.
+    # this much nearer for this long; a body at least as near as the owner that
+    # RAISES a hand (while the owner has none raised) claims it after CLAIM.
     "KINECT_OWNER_LOSS_GRACE_SEC": 0.30,
     "KINECT_OWNER_SWITCH_NEARER_M": 0.25,
     "KINECT_OWNER_SWITCH_SEC": 1.0,
+    "KINECT_OWNER_CLAIM_SEC": 0.30,
+    # A snapshot with no newer body frame for this long reads as stale (not
+    # tracked). Longer than the loss grace, so a short pump stall (the CPU was
+    # pinned on 2026-10-04) holds a drag instead of dropping it.
+    "KINECT_SNAPSHOT_STALE_SEC": 0.60,
 }
 
 _SIDES = ("left", "right")
@@ -209,27 +229,47 @@ class OneEuro3:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  GRIP (open / closed) - High confidence only, time-debounced, asymmetric
+#  GRIP (open / closed) - confident presses, evidence-bound holds
 # ══════════════════════════════════════════════════════════════════════════
+def _lasso_as(params: dict) -> str:
+    m = str(params.get("KINECT_GRIP_LASSO_AS", "none")).lower()
+    return m if m in ("open", "closed") else "none"
+
+
 class GripFilter:
     """Per-hand stable grip ("open" | "closed"), changed only by a RUN of
     agreeing votes that spans the dwell for that direction.
 
-    A vote is cast only when the hand joint is fully Tracked AND the SDK's
-    classification is Open/Closed (Lasso per KINECT_GRIP_LASSO_AS) AND - when
-    KINECT_GRIP_REQUIRE_HIGH_CONFIDENCE - its confidence is not "low". Anything
-    else is NO vote: it neither flips nor counts toward a flip. A run is broken
-    by a contrary vote, or by a gap with no vote longer than the vote gap, and
-    then must start again. To PRESS the run needs CLOSE_MIN_VOTES real frames
-    (4: a closed reading seen for 4 frames = 133 ms) whose first-to-last span
-    reaches CLOSE_SEC; to RELEASE, OPEN_MIN_VOTES frames spanning OPEN_SEC. So a
-    closed flicker of 3 frames or fewer (100 ms or less) can never press a
-    button, however late a frame's timestamp lands, and two reads of the same
-    frame cannot count twice (the caller feeds one vote per real frame). Starts
-    "open" so the first real close is a clean press edge."""
+    The two directions are deliberately NOT symmetric, because their costs are
+    not (a spurious PRESS is a click the owner never made; a spurious HOLD is a
+    button stuck down that drags whatever is under the cursor):
+
+      * PRESS (open -> closed): only a Closed reading from a Tracked hand joint
+        votes, and - when KINECT_GRIP_REQUIRE_HIGH_CONFIDENCE - only at High
+        confidence (Lasso per KINECT_GRIP_LASSO_AS). The run needs
+        CLOSE_MIN_VOTES real frames (4 = a closed reading seen for 133 ms)
+        whose first-to-last span reaches CLOSE_SEC, so a closed flicker of 3
+        frames or fewer can never press, however late a frame's timestamp
+        lands. An Open reading at ANY confidence breaks a run toward a press.
+      * RELEASE (closed -> open): an Open reading from a Tracked joint votes at
+        ANY confidence (OPEN_MIN_VOTES frames spanning OPEN_SEC) - the SDK
+        marks most frames Low, and a drag must never outlive the hand opening
+        (2026-10-04 review: a Low-confidence open held a drag for 2.4 s).
+        A Closed (or Lasso) reading at any confidence is evidence the hand is
+        still shut: it breaks a run toward release and refreshes the hold.
+      * HOLD BOUND: a closed grip with NO closed reading for
+        KINECT_GRIP_CLOSED_HOLD_MAX_SEC (the SDK said Unknown / NotTracked /
+        Open-on-a-guessed-joint the whole time) lets go - a button can't stay
+        down on no evidence. A Closed reading on an Inferred joint is no vote,
+        but it does count as evidence for the hold.
+
+    Anything else is NO vote. A run is broken by a contrary vote, or by a gap
+    with no vote longer than the vote gap, and then must start again; two reads
+    of the same frame cannot count twice (the caller feeds one reading per real
+    frame). Starts "open" so the first real close is a clean press edge."""
 
     __slots__ = ("stable", "_cand", "_first_t", "_last_t", "_votes",
-                 "last_vote", "since")
+                 "last_vote", "since", "_evidence_t")
 
     def __init__(self):
         self.reset()
@@ -242,17 +282,18 @@ class GripFilter:
         self._votes = 0
         self.last_vote: Optional[str] = None
         self.since: Optional[float] = None
+        self._evidence_t: Optional[float] = None
 
     @staticmethod
     def vote_for(state: str, conf: str, joint_tracked: bool,
                  params: dict) -> Optional[str]:
-        """The vote ("open"/"closed") one frame casts, or None. PURE."""
+        """The vote ("open"/"closed") one frame casts toward a PRESS, or None.
+        Confidence-gated in both directions. PURE."""
         if not joint_tracked:
             return None
         s = (state or "unknown").lower()
         if s == "lasso":
-            mapped = str(params.get("KINECT_GRIP_LASSO_AS", "none")).lower()
-            s = mapped if mapped in ("open", "closed") else "none"
+            s = _lasso_as(params)
         if s not in ("open", "closed"):
             return None
         if (params.get("KINECT_GRIP_REQUIRE_HIGH_CONFIDENCE", True)
@@ -260,7 +301,58 @@ class GripFilter:
             return None
         return s
 
+    @staticmethod
+    def reading_for(state: str, joint_tracked: bool,
+                    params: dict) -> Optional[str]:
+        """What a Tracked hand's reading SAYS at any confidence: "open",
+        "closed" (Closed, or Lasso unless KINECT_GRIP_LASSO_AS maps it to
+        "open": a pointing hand is not an open palm), or None. PURE."""
+        if not joint_tracked:
+            return None
+        s = (state or "unknown").lower()
+        if s == "lasso":
+            return "open" if _lasso_as(params) == "open" else "closed"
+        return s if s in ("open", "closed") else None
+
+    def feed(self, state: str, conf: str, joint_tracked: bool, t: float,
+             params: dict) -> str:
+        """One REAL frame's SDK grip reading -> the stable grip. The entry
+        point HandTrack uses (see the class doc for the rules)."""
+        reading = self.reading_for(state, joint_tracked, params)
+        if self.stable == "closed":
+            if reading in ("open", "closed"):
+                # Any confidence: an open reading votes to release, a closed
+                # one is evidence the hand is still shut (and breaks a run).
+                return self.update(reading, t, params)
+            if self.reading_for(state, True, params) == "closed":
+                # The SDK still classifies the hand as closed while it only
+                # INFERS the joint: no vote either way (a guessed joint never
+                # presses or releases), but evidence enough to keep holding.
+                self._evidence_t = t
+                self.last_vote = None
+                return self.stable
+            cap = float(params.get("KINECT_GRIP_CLOSED_HOLD_MAX_SEC", 0.0) or 0.0)
+            if (cap > 0.0 and self._evidence_t is not None
+                    and (t - self._evidence_t) > cap):
+                self._flip("open", t)
+            self.last_vote = None
+            return self.stable
+        vote = self.vote_for(state, conf, joint_tracked, params)
+        if vote is None and reading == "open":
+            vote = "open"           # a Low-confidence open still breaks a press run
+        return self.update(vote, t, params)
+
+    def _flip(self, to: str, t: float) -> None:
+        self.stable = to
+        self.since = t
+        self._cand = None
+        self._votes = 0
+        if to == "closed":
+            self._evidence_t = t
+
     def update(self, vote: Optional[str], t: float, params: dict) -> str:
+        """Advance the run with one already-decided vote. Used by feed() and
+        by the palm filter."""
         self.last_vote = vote
         gap = float(params["KINECT_GRIP_VOTE_GAP_SEC"])
         if vote is None:
@@ -268,6 +360,8 @@ class GripFilter:
             return self.stable
         if vote == self.stable:
             self._cand = None
+            if vote == "closed":
+                self._evidence_t = t
             return self.stable
         if vote == self._cand and t <= self._last_t:
             # The same frame fed twice (no time advanced): one frame, one vote.
@@ -286,10 +380,25 @@ class GripFilter:
             votes = int(params["KINECT_GRIP_OPEN_MIN_VOTES"])
         if (self._votes >= max(1, votes)
                 and (self._last_t - self._first_t) >= need - 1e-9):
-            self.stable = vote
-            self.since = t
-            self._cand = None
+            self._flip(vote, t)
         return self.stable
+
+
+def palm_vote(state: str, joint_tracked: bool) -> Optional[str]:
+    """The OPEN-PALM signal's vote for one frame, at ANY confidence: "open"
+    for Open, "closed" for Closed OR Lasso (a fist read Low and a pointing
+    hand are both NOT an open palm), None otherwise (Unknown / NotTracked /
+    an untracked joint carry no evidence). The air-mouse's passive engage
+    gate reads this signal, never the click grip (which defaults to "open"
+    on no confident evidence - 2026-10-04 review). PURE."""
+    if not joint_tracked:
+        return None
+    s = (state or "unknown").lower()
+    if s == "open":
+        return "open"
+    if s in ("closed", "lasso"):
+        return "closed"
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -327,11 +436,15 @@ class HandTrack:
                                params["KINECT_HAND_FILTER_BETA"],
                                params["KINECT_HAND_FILTER_D_CUTOFF_HZ"])
         self.grip = GripFilter()
+        # The OPEN-PALM signal (palm_vote: any confidence, Lasso = not open),
+        # debounced like the grip; the air-mouse's passive engage gate reads it.
+        self.palm = GripFilter()
         self.reset()
 
     def reset(self) -> None:
         self._pos_f.reset()
         self.grip.reset()
+        self.palm.reset()
         self.pos: Optional[tuple] = None
         self.source: Optional[str] = None     # hand | wrist | inferred | hold
         self.measured = False                 # a real position this frame
@@ -348,7 +461,6 @@ class HandTrack:
         self._last_raw: Optional[tuple] = None
         self._jumps = 0
         self._offset: Optional[tuple] = None
-        self._offset_t: Optional[float] = None
         self._raise_cand_since: Optional[float] = None
         self._raw_above = False
         self._shoulder_y: Optional[float] = None
@@ -386,21 +498,20 @@ class HandTrack:
         # Learn the hand-wrist offset whenever BOTH are Tracked - SMOOTHED, so one
         # bad "Tracked" hand frame between Inferred ones can't throw the hand
         # position by centimetres (measured: a single such frame moved the old
-        # wrist stand-in 44 mm RMS while the wrist itself sat still).
+        # wrist stand-in 44 mm RMS while the wrist itself sat still). Only the
+        # FIRST offset of an acquisition is taken raw; every later one - however
+        # long the hand joint was un-Tracked in between - is low-passed from the
+        # last, so re-learning can never step the hand.
         if hand_ok and wrist_ok:
             h, w = _xyz(hand), _xyz(wrist)
             if h is not None and w is not None:
                 raw_off = (h[0] - w[0], h[1] - w[1], h[2] - w[2])
-                fresh = (self._offset is None or self._offset_t is None
-                         or (t - self._offset_t)
-                         > float(params["KINECT_WRIST_OFFSET_MAX_AGE_SEC"]))
-                if fresh:
+                if self._offset is None:
                     self._offset = raw_off
                 else:
                     a = _alpha(float(params["KINECT_HAND_OFFSET_CUTOFF_HZ"]), dt)
                     self._offset = tuple(a * raw_off[k] + (1.0 - a) * self._offset[k]
                                          for k in range(3))
-                self._offset_t = t
 
         # ── measurement. The WRIST is the steadier joint (larger, constrained by
         # the forearm; Tracked 94% of frames when the hand joint was 35%), and a
@@ -410,9 +521,13 @@ class HandTrack:
         # hand (a guess - it never measures lift).
         meas, src = None, None
         w = _xyz(wrist) if wrist_ok else None
-        off_ok = (self._offset is not None and self._offset_t is not None
-                  and (t - self._offset_t)
-                  <= float(params["KINECT_WRIST_OFFSET_MAX_AGE_SEC"]))
+        # The LAST learned offset is kept for as long as this acquisition lasts:
+        # the hand joint can stay un-Tracked for 10 s+ while the wrist is Tracked
+        # (desk recording), and dropping to the RAW wrist when an offset "aged
+        # out" stepped a perfectly still cursor by the whole hand-wrist offset
+        # (2026-10-04 review: 540 px). A stale offset is at worst a constant
+        # few-cm bias the owner steers through; a step is a jump under a drag.
+        off_ok = self._offset is not None
         if w is not None and off_ok:
             meas = (w[0] + self._offset[0], w[1] + self._offset[1],
                     w[2] + self._offset[2])
@@ -521,14 +636,16 @@ class HandTrack:
             else:
                 self._raise_cand_since = None
 
-        # ── grip: one vote per real frame, High confidence only.
+        # ── grip + palm: one reading per real frame (GripFilter.feed: confident
+        # presses, any-confidence releases, an evidence-bound hold).
         if self.pos is None:
             # Hand gone past the grace: a stale grip must not survive into the
             # next acquisition (it would press on re-engage).
             self.grip.reset()
+            self.palm.reset()
         else:
-            self.grip.update(GripFilter.vote_for(self.state, self.conf,
-                                                 hand_ok, params), t, params)
+            self.grip.feed(self.state, self.conf, hand_ok, t, params)
+            self.palm.update(palm_vote(self.state, hand_ok), t, params)
 
     def view(self, t: float) -> dict:
         """The public, read-only per-hand dict published in the snapshot."""
@@ -543,6 +660,7 @@ class HandTrack:
             "raised": self.raised,
             "grip": self.grip.stable,
             "grip_vote": self.grip.last_vote,
+            "palm": self.palm.stable,
             "state": self.state,
             "conf": self.conf,
             "joint_tracked": self.joint_tracked,
@@ -653,6 +771,34 @@ def _nearest(bodies: list) -> Optional[dict]:
     return min(cands, key=_distance)
 
 
+def _body_raises_hand(body: dict, up: float, reliable: Callable[[Any], bool]
+                      ) -> bool:
+    """Does this (non-owner) body hold a hand at least `up` above its shoulder
+    line on THIS frame, measured from a Tracked hand (or wrist) and a Tracked
+    shoulder reference? Raw, single-frame - the caller adds the dwell. NEVER
+    raises."""
+    try:
+        j = body.get("joints") or {}
+        ref = j.get("spine_shoulder")
+        if not reliable(ref):
+            ref = next((j.get(f"shoulder_{s}") for s in _SIDES
+                        if reliable(j.get(f"shoulder_{s}"))), None)
+        if ref is None:
+            return False
+        ry = float(ref[1])
+        for side in _SIDES:
+            h = j.get(f"hand_{side}")
+            if not reliable(h):
+                h = j.get(f"wrist_{side}")
+                if not reliable(h):
+                    continue
+            if float(h[1]) - ry >= up:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  THE STABILISER (one per bridge; process() once per new body frame)
 # ══════════════════════════════════════════════════════════════════════════
@@ -680,6 +826,9 @@ class HandStabilizer:
         self._owner_seen_t: Optional[float] = None
         self._chall_id = None
         self._chall_since: Optional[float] = None
+        self._claim_id = None
+        self._claim_since: Optional[float] = None
+        self._frame_ts: list = []         # recent frame times, for the fps
         self.snapshot: Optional[dict] = None
 
     def _reset_owner_state(self) -> None:
@@ -689,6 +838,28 @@ class HandStabilizer:
         self.two_hand.reset()
         self._chall_id = None
         self._chall_since = None
+        self._claim_id = None
+        self._claim_since = None
+
+    def _claimant(self, bodies: list, owner: dict) -> Optional[dict]:
+        """The body that may CLAIM ownership this frame: not the owner, at
+        least as near the sensor as the owner, holding a hand raised over the
+        engage line - while the owner holds none raised. Without this a
+        sticky owner could lock the real owner out for good: whoever was seen
+        first, or whoever the owner's 0.3 s dropout fell to, kept the cursor
+        unless the real owner sat 0.25 m nearer (2026-10-04 review: 0 %
+        engaged with a passive person 0.1-0.2 m farther). A FARTHER body can
+        never claim, and nobody can claim from an owner who is using a hand,
+        so a passer-by can't take an active cursor by raising a hand."""
+        if any(self.hands[s].raised for s in _SIDES):
+            return None
+        up = float(self.params["KINECT_LIFT_UP_MARGIN"])
+        d_owner = _distance(owner)
+        cands = [b for b in bodies
+                 if isinstance(b, dict) and b.get("id") != self._owner_id
+                 and _distance(b) <= d_owner
+                 and _body_raises_hand(b, up, self._reliable)]
+        return min(cands, key=_distance) if cands else None
 
     def _pick_owner(self, bodies: list, t: float) -> "tuple[Optional[dict], bool]":
         """(owner body, fresh-this-frame). Sticky by tracking id."""
@@ -717,6 +888,19 @@ class HandStabilizer:
             else:
                 self._chall_id = None
                 self._chall_since = None
+            claimant = self._claimant(bodies, ob)
+            if claimant is None:
+                self._claim_id = None
+                self._claim_since = None
+            elif self._claim_id != claimant.get("id"):
+                self._claim_id = claimant.get("id")
+                self._claim_since = t
+            elif (t - (self._claim_since or t)) >= float(
+                    p["KINECT_OWNER_CLAIM_SEC"]) - 1e-9:
+                self._owner_id = claimant.get("id")
+                self._owner_body = claimant
+                self._reset_owner_state()
+                return claimant, True
             return ob, True
         # The owner is not in this frame: hold it through the loss grace.
         if (self._owner_id is not None and self._owner_seen_t is not None
@@ -745,7 +929,7 @@ class HandStabilizer:
         except Exception:
             snap = {"seq": int(seq or 0), "t": float(t or 0.0), "owner_id": None,
                     "owner": None, "fresh": False, "tracked": False,
-                    "active": None, "two_hand": False,
+                    "active": None, "two_hand": False, "fps": None,
                     "hands": {s: HandTrack(s, DEFAULTS).view(0.0) for s in _SIDES}}
             self.snapshot = snap
             return snap
@@ -775,8 +959,14 @@ class HandStabilizer:
             self.two_hand.reset()
         else:
             active = self.active.update(self.hands, t, p)
-            two = self.two_hand.update(
-                self.hands["left"].raised and self.hands["right"].raised, t, p)
+            two = self.two_hand.update(self._both_up_for_two_hand(p), t, p)
+        # Frames per second over the last ~30 real frames (telemetry: the grip
+        # dwells count REAL frames, so their latency depends on this rate).
+        self._frame_ts.append(t)
+        if len(self._frame_ts) > 31:
+            del self._frame_ts[0]
+        span = self._frame_ts[-1] - self._frame_ts[0]
+        fps = ((len(self._frame_ts) - 1) / span) if span > 1e-6 else None
         snap = {
             "seq": seq,
             "t": t,
@@ -786,10 +976,27 @@ class HandStabilizer:
             "tracked": owner is not None,
             "active": active,
             "two_hand": bool(two),
+            "fps": fps,
             "hands": {s: self.hands[s].view(t) for s in _SIDES},
         }
         self.snapshot = snap
         return snap
+
+    def _both_up_for_two_hand(self, p: dict) -> bool:
+        """The two-hand gate's input: BOTH hands raised, with their (filtered)
+        lift at least ENTER_ABOVE over the UP line to enter, and held while it
+        stays above UP - EXIT_BELOW. Its OWN narrow band - not the single-hand
+        stay line (-0.10 m) - so a second hand that crossed the line once and
+        now rests at chin or chest height ends the mode and gives the cursor
+        back, and a window grab can't latch with a hand 15 cm under the line
+        (2026-10-04 review: 0 % cursor for 4.5 s, a grab at lift 0.0)."""
+        up = float(p["KINECT_LIFT_UP_MARGIN"])
+        if self.two_hand.active:
+            bar = up - float(p["KINECT_TWO_HAND_EXIT_BELOW_M"])
+        else:
+            bar = up + float(p["KINECT_TWO_HAND_ENTER_ABOVE_M"])
+        return all(self.hands[s].raised and self.hands[s].lift is not None
+                   and self.hands[s].lift >= bar - 1e-9 for s in _SIDES)
 
 
 def _default_reliable(j) -> bool:

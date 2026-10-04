@@ -488,6 +488,9 @@ class BridgeWiringTests(unittest.TestCase):
     def setUp(self):
         kb.reset_tracking()
         self.addCleanup(kb.reset_tracking)
+        # publish_body_frame fills the bridge's body cache with SIMULATED
+        # stamps; never leave it for a later test (2026-10-04 review).
+        self.addCleanup(_clear_body_cache)
 
     def test_publish_advances_once_per_frame_and_snapshot_ages(self):
         b = [_body(_joints(None, _up("right", 0.2)))]
@@ -497,7 +500,13 @@ class BridgeWiringTests(unittest.TestCase):
         s2 = kb.get_tracked_frame(now=50.0 + T)
         self.assertEqual(s2["seq"], s1["seq"] + 1)
         self.assertFalse(s2["stale"])
-        self.assertTrue(kb.get_tracked_frame(now=50.0 + T + 0.31)["stale"])
+        # A pump stall SHORTER than KINECT_SNAPSHOT_STALE_SEC holds (a drag
+        # survives it); a longer one reads as stale (not tracked).
+        stale_after = ks.DEFAULTS["KINECT_SNAPSHOT_STALE_SEC"]
+        self.assertGreater(stale_after, ks.DEFAULTS["KINECT_OWNER_LOSS_GRACE_SEC"])
+        self.assertFalse(kb.get_tracked_frame(now=50.0 + T + 0.45)["stale"])
+        self.assertTrue(kb.get_tracked_frame(
+            now=50.0 + T + stale_after + 0.01)["stale"])
         # get_bodies' cache got the same frame.
         self.assertEqual(kb._body_cache[0], b)
 
@@ -520,6 +529,369 @@ class BridgeWiringTests(unittest.TestCase):
         kb.publish_body_frame([{"id": 1, "joints": {"hand_left": ("x",)}}], now=80.0)
         snap = kb.get_tracked_frame(now=80.0)
         self.assertIsNotNone(snap)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  2026-10-04 REVIEW FIXES. A docstring that names a review finding marks a
+#  test that FAILED on abf81ef (the first stabiliser commit); one that names a
+#  "Mutant" pins a rule a guard mutation showed was unprotected; the rest are
+#  the guard rails of a fix (what it must NOT start doing).
+# ══════════════════════════════════════════════════════════════════════════
+def _grip_trace(st, states, *, side="right", confs="high", jstates=2,
+                lift=0.25, t0=100.0):
+    """Feed one frame per (state, conf, joint-state) with `side` raised;
+    returns the snapshots. states/confs/jstates: a list or one value."""
+    snaps = []
+    for i, s in enumerate(states):
+        c = confs[i] if isinstance(confs, (list, tuple)) else confs
+        js = jstates[i] if isinstance(jstates, (list, tuple)) else jstates
+        if side == "right":
+            j = _joints(None, _up("right", lift), rstate=js)
+        else:
+            j = _joints(_up("left", lift), None, lstate=js)
+        b = _body(j, **({"hr": s, "hrc": c} if side == "right"
+                        else {"hl": s, "hlc": c}))
+        snaps.append(st.process([b], t0 + i * T))
+    return snaps
+
+
+class GripEvidenceTests(unittest.TestCase):
+    """The click grip: confident presses, any-confidence releases, and a hold
+    that can't outlive the evidence for it."""
+
+    def grips(self, states, **kw):
+        return [s["hands"]["right"]["grip"]
+                for s in _grip_trace(_stab(), states, **kw)]
+
+    def test_a_low_confidence_open_releases_a_drag(self):
+        """HIGH (both reviewers): a Low-confidence Open counted as no vote, so
+        a drag stayed down until a High open came (2.4 s, 1,477 px dragged)."""
+        g = self.grips(["closed"] * 10 + ["open"] * 4,
+                       confs=["high"] * 10 + ["low"] * 4)
+        self.assertEqual(g[9], "closed")
+        self.assertEqual(g[-1], "open")
+        self.assertLessEqual(g.index("open", 10) - 10, 1)   # 2 frames = 33 ms
+
+    def test_low_confidence_still_never_presses(self):
+        self.assertNotIn("closed", self.grips(["open"] * 5 + ["closed"] * 60,
+                                              confs="low"))
+
+    def test_a_low_confidence_open_breaks_a_run_toward_a_press(self):
+        # closed High x3, ONE Low open, closed High x3: never 4 in a row.
+        g = self.grips(["open"] * 5 + ["closed"] * 3 + ["open"] + ["closed"] * 3,
+                       confs=["high"] * 8 + ["low"] + ["high"] * 3)
+        self.assertNotIn("closed", g)
+
+    def test_alternating_closed_open_flicker_never_presses(self):
+        """Mutant 'an agreeing vote does not clear the candidate' survived the
+        old tests (they only used contiguous flicker runs)."""
+        g = self.grips(["open"] * 5 + ["closed", "open"] * 20)
+        self.assertNotIn("closed", g)
+
+    def test_a_hold_with_no_evidence_lets_go(self):
+        """A pressed hand the SDK then calls Unknown for good: the button is
+        let go after KINECT_GRIP_CLOSED_HOLD_MAX_SEC instead of never."""
+        cap = P["KINECT_GRIP_CLOSED_HOLD_MAX_SEC"]
+        n = int(cap / T) + 6
+        g = self.grips(["closed"] * 6 + ["unknown"] * n)
+        self.assertEqual(g[5], "closed")
+        first_open = g.index("open", 6)
+        self.assertAlmostEqual((first_open - 5) * T, cap, delta=2 * T)
+
+    def test_a_closed_reading_on_an_inferred_joint_keeps_the_hold(self):
+        # The SDK still says Closed while it only Infers the hand joint: no
+        # vote (it can't press or release), but evidence to keep the drag.
+        n = int(2.0 / T)
+        g = self.grips(["closed"] * (6 + n), jstates=[2] * 6 + [1] * n)
+        self.assertEqual(set(g[5:]), {"closed"})
+
+    def test_an_open_reading_on_an_inferred_joint_never_releases_early(self):
+        n = int(0.5 / T)
+        g = self.grips(["closed"] * 6 + ["open"] * n, jstates=[2] * 6 + [1] * n)
+        self.assertEqual(set(g[5:]), {"closed"})
+
+    def test_the_grip_resets_when_the_hand_is_lost(self):
+        """Mutant 'grip reset when hand lost' survived: a fist lost past the
+        grace must not come back 'closed' (a phantom press on re-engage)."""
+        st = _stab()
+        _grip_trace(st, ["closed"] * 8)
+        gone = [_body(_joints(None, _up("right", 0.25), rstate=0, rwrist=0),
+                      hr="unknown")]
+        for i in range(15):
+            st.process(gone, 100.0 + (8 + i) * T)
+        s = st.process([_body(_joints(None, _up("right", 0.25)), hr="unknown")],
+                       100.0 + 23 * T)
+        self.assertEqual(s["hands"]["right"]["grip"], "open")
+
+
+class PalmSignalTests(unittest.TestCase):
+    """HIGH (review 1): AIR_MOUSE_REQUIRE_OPEN_PALM read the CLICK grip, which
+    defaults to 'open' on no confident evidence - so a pointing hand (Lasso) or
+    a fist read at Low confidence passed the open-palm gate."""
+
+    def palms(self, states, confs="high"):
+        return [s["hands"]["right"]["palm"]
+                for s in _grip_trace(_stab(), states, confs=confs)]
+
+    def test_lasso_and_a_low_confidence_fist_are_not_an_open_palm(self):
+        self.assertEqual(self.palms(["lasso"] * 10)[-1], "closed")
+        self.assertEqual(self.palms(["closed"] * 10, confs="low")[-1], "closed")
+
+    def test_an_open_hand_at_any_confidence_is_an_open_palm(self):
+        p = self.palms(["lasso"] * 10 + ["open"] * 4, confs="low")
+        self.assertEqual(p[-1], "open")
+
+    def test_unknown_carries_no_evidence(self):
+        # Legacy-equal: a hand the classifier never reads stays "open".
+        self.assertEqual(set(self.palms(["unknown"] * 20)), {"open"})
+
+    def test_a_single_lasso_frame_does_not_flip_it(self):
+        p = self.palms(["open"] * 5 + ["lasso"] + ["open"] * 5)
+        self.assertEqual(set(p), {"open"})
+
+
+class WristOffsetTests(unittest.TestCase):
+    """MEDIUM (review 1): after KINECT_WRIST_OFFSET_MAX_AGE_SEC the stand-in
+    fell back to the RAW wrist - a still hand's cursor stepped 540 px, and
+    stepped back when the hand joint was Tracked again."""
+
+    def test_a_still_hand_does_not_move_through_a_long_inferred_stretch(self):
+        st = _stab()
+        up = _up("right", 0.10)
+        frames = [(None, up, {})] * 30 + [(None, up, {"rstate": 1})] * 120 \
+            + [(None, up, {})] * 30
+        ys = [st.process([_body(_joints(l, r, **kw))], 100.0 + i * T)
+              ["hands"]["right"]["pos"][1] for i, (l, r, kw) in enumerate(frames)]
+        self.assertLess(max(ys[29:]) - min(ys[29:]), 0.002)
+
+    def test_a_relearned_offset_never_steps_the_hand(self):
+        # The hand joint comes back Tracked 3 cm off the stale offset: the hand
+        # glides there (low-pass), no single-frame jump.
+        st = _stab()
+        up = _up("right", 0.10)
+        shifted = (up[0] + 0.03, up[1], up[2])
+        frames = [(None, up, {})] * 30 + [(None, up, {"rstate": 1})] * 90 \
+            + [(None, shifted, {})] * 60
+        xs = [st.process([_body(_joints(l, r, **kw))], 100.0 + i * T)
+              ["hands"]["right"]["pos"][0] for i, (l, r, kw) in enumerate(frames)]
+        steps = [abs(b - a) for a, b in zip(xs[119:], xs[120:])]
+        self.assertLess(max(steps), 0.012)
+        self.assertAlmostEqual(xs[-1], shifted[0], delta=0.004)
+
+
+class HandTrackEdgeTests(unittest.TestCase):
+    def _feed(self, st, frames, t0=100.0, dts=None):
+        out, t = [], t0
+        for i, (l, r, kw) in enumerate(frames):
+            if dts and i in dts:
+                t += dts[i]
+            else:
+                t += T
+            out.append(st.process([_body(_joints(l, r, **kw))], t))
+        return out
+
+    def test_a_short_dip_under_the_stay_line_does_not_lower(self):
+        """Mutant 'raise EXIT dwell' survived: a 2-frame dip below DOWN
+        (a depth glitch) must not lower a raised hand."""
+        st = _stab()
+        # Raised, resting in the band at lift 0.0; a 2-frame dip to -0.22 (a
+        # 0.22 m step - under the jump-reject bar, so it IS measured).
+        frames = ([(None, _up("right", 0.20), {})] * 15
+                  + [(None, _up("right", 0.0), {})] * 30
+                  + [(None, _up("right", -0.22), {})] * 2
+                  + [(None, _up("right", 0.0), {})] * 10)
+        snaps = self._feed(st, frames)
+        dip = [s["hands"]["right"]["lift"] for s in snaps[45:47]]
+        self.assertLess(min(dip), P["KINECT_LIFT_DOWN_MARGIN"])   # it did cross
+        self.assertTrue(all(s["hands"]["right"]["raised"] for s in snaps[10:]))
+
+    def test_a_real_move_after_a_frame_gap_is_not_rejected_as_a_jump(self):
+        """Mutant 'jump threshold not scaled by elapsed frames' survived: after
+        a 0.3 s pump gap the hand legitimately moved 0.4 m - accept it at
+        once instead of dropping frames as glitches."""
+        st = _stab()
+        a = _up("right", 0.20)
+        b = (a[0] - 0.40, a[1], a[2])
+        frames = [(None, a, {})] * 10 + [(None, b, {})] * 3
+        snaps = self._feed(st, frames, dts={10: 0.30})
+        self.assertTrue(snaps[10]["hands"]["right"]["measured"])
+        self.assertAlmostEqual(snaps[10]["hands"]["right"]["pos"][0], b[0],
+                               delta=0.05)
+
+
+class ActiveHandChallengeTests(unittest.TestCase):
+    def test_an_interrupted_challenge_does_not_accumulate(self):
+        """Mutant 'challenge accumulates across interruptions' survived: a
+        lead that keeps breaking off must restart the dwell every time."""
+        st = _stab()
+        seq = [(None, _up("right", 0.20))] * 15
+        for _ in range(6):     # 0.30 s leading, 0.10 s not - never 0.40 s
+            seq += [(_up("left", 0.45), _up("right", 0.20))] * 9
+            seq += [(_up("left", 0.25), _up("right", 0.20))] * 3
+        snaps = [st.process([_body(_joints(l, r))], 100.0 + i * T)
+                 for i, (l, r) in enumerate(seq)]
+        self.assertEqual({s["active"] for s in snaps[15:]}, {"right"})
+
+
+class TwoHandBandTests(unittest.TestCase):
+    """MEDIUM (review 1): two-hand mode ended only when a hand fell below the
+    single-hand STAY line (-0.10 m), so a second hand resting at chin / chest
+    height after crossing the line once kept the cursor locked out."""
+
+    def _run(self, left_lifts):
+        st = _stab()
+        snaps = []
+        for i, ll in enumerate(left_lifts):
+            snaps.append(st.process(
+                [_body(_joints(_up("left", ll), _up("right", 0.25)))],
+                100.0 + i * T))
+        return snaps
+
+    def test_a_second_hand_resting_under_the_line_ends_two_hand_mode(self):
+        for rest in (0.0, -0.05):
+            snaps = self._run([0.25] * 20 + [rest] * 30)
+            self.assertTrue(snaps[19]["two_hand"])
+            self.assertFalse(snaps[-1]["two_hand"], rest)
+
+    def test_two_hand_mode_holds_inside_its_own_band(self):
+        up, below = P["KINECT_LIFT_UP_MARGIN"], P["KINECT_TWO_HAND_EXIT_BELOW_M"]
+        snaps = self._run([0.25] * 20 + [up - below / 2] * 30)
+        self.assertTrue(all(s["two_hand"] for s in snaps[19:]))
+
+    def test_entry_needs_both_hands_over_the_line(self):
+        up = P["KINECT_LIFT_UP_MARGIN"]
+        # Raised once (so 'raised' holds), then parked just under the line.
+        snaps = self._run([0.25] * 4 + [up - 0.02] * 40)
+        self.assertFalse(any(s["two_hand"] for s in snaps))
+
+
+class OwnerClaimTests(unittest.TestCase):
+    """HIGH (review 2): the sticky owner could lock the real owner out for
+    good - whoever was seen first, or whoever a 0.3 s dropout fell to, kept the
+    cursor unless the real owner sat 0.25 m nearer for 1 s."""
+
+    @staticmethod
+    def _frames(st, n, bodies_fn, t0):
+        return [st.process(bodies_fn(i), t0 + i * T) for i in range(n)]
+
+    def test_the_real_owner_claims_it_back_by_raising_a_hand(self):
+        st = _stab()
+
+        def passive():
+            return _body(_joints(), bid=2, dist=1.4)
+
+        def owner():
+            return _body(_joints(None, _up("right", 0.25)), bid=1)
+        # A passive person (hands down) is seen FIRST and becomes the owner.
+        self._frames(st, 10, lambda i: [passive()], 100.0)
+        # The real owner arrives 0.2 m NEARER with a hand raised.
+        snaps = self._frames(st, 30, lambda i: [passive(), owner()], 100.0 + 10 * T)
+        claim = next(i for i, s in enumerate(snaps) if s["owner_id"] == 1)
+        self.assertLessEqual(claim * T, P["KINECT_OWNER_CLAIM_SEC"] + 2 * T)
+        self.assertEqual(snaps[-1]["owner_id"], 1)
+
+    def test_a_farther_body_can_never_claim(self):
+        st = _stab()
+        self._frames(st, 10, lambda i: [_body(_joints(), bid=1, dist=1.2)], 100.0)
+        snaps = self._frames(st, 60, lambda i: [
+            _body(_joints(), bid=1, dist=1.2),
+            _body(_joints(None, _up("right", 0.30)), bid=2, dist=1.3)],
+            100.0 + 10 * T)
+        self.assertEqual({s["owner_id"] for s in snaps}, {1})
+
+    def test_nobody_claims_from_an_owner_using_a_hand(self):
+        st = _stab()
+
+        def own():
+            return _body(_joints(None, _up("right", 0.25)), bid=1, dist=1.2)
+        self._frames(st, 15, lambda i: [own()], 100.0)
+        snaps = self._frames(st, 60, lambda i: [
+            own(), _body(_joints(_up("left", 0.30), None), bid=2, dist=1.0)],
+            100.0 + 15 * T)
+        self.assertEqual({s["owner_id"] for s in snaps}, {1})
+
+    def test_a_brief_raise_does_not_claim(self):
+        st = _stab()
+        self._frames(st, 10, lambda i: [_body(_joints(), bid=2, dist=1.4)], 100.0)
+        n = int(P["KINECT_OWNER_CLAIM_SEC"] / T) - 2
+        snaps = self._frames(st, 30, lambda i: [
+            _body(_joints(), bid=2, dist=1.4),
+            _body(_joints(None, _up("right", 0.25) if i < n else None), bid=1)],
+            100.0 + 10 * T)
+        self.assertEqual({s["owner_id"] for s in snaps}, {2})
+
+
+class OwnerTakeoverGuardTests(unittest.TestCase):
+    def test_a_slightly_nearer_body_never_takes_over(self):
+        """Mutant 'owner nearer margin -> 0' survived: a body only 0.1 m nearer
+        (hands down, no claim) must never take the owner, however long."""
+        st = _stab()
+        for i in range(10):
+            st.process([_body(_joints(), bid=1, dist=1.2)], 100.0 + i * T)
+        snaps = [st.process([_body(_joints(), bid=1, dist=1.2),
+                             _body(_joints(), bid=2, dist=1.1)],
+                            100.0 + (10 + i) * T) for i in range(90)]
+        self.assertEqual({s["owner_id"] for s in snaps}, {1})
+
+    def test_an_intermittently_nearer_body_does_not_accumulate(self):
+        """Mutant 'owner challenger reset when not nearer' survived: nearer for
+        0.8 s, then not, then nearer again - the 1 s dwell restarts."""
+        st = _stab()
+        for i in range(10):
+            st.process([_body(_joints(), bid=1, dist=1.2)], 100.0 + i * T)
+        snaps, t = [], 100.0 + 10 * T
+        for _ in range(3):
+            for near in (True,) * 24 + (False,) * 6:
+                snaps.append(st.process(
+                    [_body(_joints(), bid=1, dist=1.2),
+                     _body(_joints(), bid=2, dist=0.8 if near else 1.5)], t))
+                t += T
+        self.assertEqual({s["owner_id"] for s in snaps}, {1})
+
+
+class BridgeFailClosedTests(unittest.TestCase):
+    """LOW (review 1): a stabiliser that can't be built was retried on EVERY
+    frame, silently, and the docstring promised a fallback the air-mouse never
+    made. Now: fail closed, say so once, retry at most every 30 s."""
+
+    def setUp(self):
+        kb.reset_tracking()
+        self.addCleanup(kb.reset_tracking)
+        self.addCleanup(_clear_body_cache)
+
+    def test_an_unbuildable_stabiliser_fails_closed_loudly_and_backs_off(self):
+        import contextlib
+        import io
+        from unittest import mock
+        calls = {"n": 0}
+
+        def boom():
+            calls["n"] += 1
+            raise ImportError("simulated")
+        out = io.StringIO()
+        b = [_body(_joints(None, _up("right", 0.25)))]
+        with mock.patch.object(kb, "_stabilizer_module", boom), \
+                contextlib.redirect_stdout(out):
+            for i in range(60):
+                kb.publish_body_frame(b, now=200.0 + i * T)
+        self.assertEqual(calls["n"], 1)
+        self.assertIsNone(kb.get_tracked_frame(now=202.0))
+        self.assertIn("simulated", kb.tracking_error() or "")
+        self.assertEqual(out.getvalue().count("hand stabiliser UNAVAILABLE"), 1)
+        # The body pipe itself kept working.
+        self.assertEqual(kb._body_cache[0], b)
+        # After the back-off it retries, and recovers once the module loads.
+        with contextlib.redirect_stdout(io.StringIO()):
+            kb.publish_body_frame(b, now=200.0 + kb._TRACKER_RETRY_SEC + 1.0)
+        self.assertIsNotNone(kb.get_tracked_frame(
+            now=200.0 + kb._TRACKER_RETRY_SEC + 1.0))
+        self.assertIsNone(kb.tracking_error())
+
+
+def _clear_body_cache():
+    with kb._body_cache_lock:
+        kb._body_cache[0] = None
+        kb._body_cache_at[0] = 0.0
 
 
 if __name__ == "__main__":

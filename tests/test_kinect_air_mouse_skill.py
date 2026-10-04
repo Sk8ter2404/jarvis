@@ -873,15 +873,98 @@ class ControllerStateMachineTests(_Base):
     def test_either_hand_clicks_regardless_of_which_drives(self):
         mod = self._load()
         c = self._ctrl(mod)
-        # RIGHT arm drives the cursor, but the LEFT hand closes → LEFT button
-        # still fires (clicks are hand-specific, independent of the cursor hand).
-        c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
-                 "open", "open", True)
-        d = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+        # RIGHT arm drives the cursor, but the LEFT hand - held up at chest
+        # height (lift -0.05: off the desk, under the raise line) - closes →
+        # LEFT button still fires (clicks are hand-specific, independent of the
+        # cursor hand).
+        held_up = self._ext(mod, "left", hand_y=SHOULDER_Y - 0.05)
+        c.update(held_up, self._ext(mod, "right"), "open", "open", True)
+        d = c.update(held_up, self._ext(mod, "right"),
                      "closed", "open", True)   # LEFT hand closes
         self.assertEqual(d.hand, "right")       # cursor still on the right arm
         self.assertEqual(d.left, "down")        # but the LEFT button fired
         self.assertIsNone(d.right)
+
+    def test_a_fist_resting_on_the_desk_never_clicks(self):
+        """2026-10-04 review: the NON-driving hand resting on the desk (lift
+        -0.40) closing - holding a cup, a phone, the real mouse - fired its
+        button while the other hand drove the cursor. The off-hand now clicks
+        only while held up (AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M, -0.10)."""
+        mod = self._load()
+        c = self._ctrl(mod)
+        c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                 "open", "open", True)
+        for _ in range(5):
+            d = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                         "closed", "open", True)
+            self.assertIsNone(d.left)
+        self.assertFalse(c.left_is_down)
+        # Lifting the STILL-CLOSED fist off the desk is not a click either: it
+        # must open and close again up there.
+        held_up = self._ext(mod, "left", hand_y=SHOULDER_Y - 0.05)
+        d = c.update(held_up, self._ext(mod, "right"), "closed", "open", True)
+        self.assertIsNone(d.left)
+        c.update(held_up, self._ext(mod, "right"), "open", "open", True)
+        d = c.update(held_up, self._ext(mod, "right"), "closed", "open", True)
+        self.assertEqual(d.left, "down")
+        # ...and dropping that hand back to the desk lets the button go at once.
+        d = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                     "closed", "open", True)
+        self.assertEqual(d.left, "up")
+        self.assertFalse(c.left_is_down)
+
+    def test_a_hand_switch_lets_go_of_the_old_hands_drag_first(self):
+        """2026-10-04 review: the hand that held a drag stays up (chest height,
+        still a fist) while the OTHER hand takes the cursor. Its button goes up
+        on the switch frame, the cursor is held where it was for that frame
+        (the release lands where the drag ended, not where the new hand is),
+        and the still-closed fist can't re-press until it opens."""
+        mod = self._load()
+        c = self._ctrl(mod)
+        drive = self._ext(mod, "right")                       # lift +0.15
+        low = self._ext(mod, "left", hand_x=-0.2)
+        c.update(self._relaxed(mod, "left"), drive, "open", "open", True)
+        d = c.update(self._relaxed(mod, "left"), drive, "open", "closed", True)
+        self.assertEqual(d.right, "down")
+        cur = d.cursor
+        # The right fist drops to chest height (still eligible to click) and
+        # the left rises; the shared layer names LEFT the active hand.
+        chest = self._ext(mod, "right", hand_x=0.3, hand_y=SHOULDER_Y - 0.02)
+        d = c.update(low, chest, "open", "closed", True, active_side="left")
+        self.assertEqual(c.hand, "left")
+        self.assertEqual(d.right, "up")
+        self.assertEqual(d.cursor, cur)                       # held this frame
+        d = c.update(low, chest, "open", "closed", True, active_side="left")
+        self.assertIsNone(d.right)                            # no re-press
+        self.assertNotEqual(d.cursor, cur)                    # now follows LEFT
+        c.update(low, chest, "open", "open", True, active_side="left")
+        d = c.update(low, chest, "open", "closed", True, active_side="left")
+        self.assertEqual(d.right, "down")                     # opened, re-closed
+
+    def test_offhand_lift_bar_is_the_setting(self):
+        mod = self._load()
+        self.assertEqual(mod.AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M, -0.10)
+        # ONE value: the skill's fallback constant is core/config.py's literal
+        # (read from the source, so a local settings override can't mask it).
+        import ast
+        cfg_path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "core", "config.py")
+        with open(cfg_path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        lit = next(ast.literal_eval(n.value) for n in tree.body
+                   if isinstance(n, ast.Assign) and len(n.targets) == 1
+                   and getattr(n.targets[0], "id", "")
+                   == "AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M")
+        self.assertEqual(lit, mod.AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M)
+        # -1.0 restores "click from anywhere".
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, engage_debounce_frames=1,
+                                   offhand_min_lift=-1.0)
+        c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                 "open", "open", True)
+        d = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                     "closed", "open", True)
+        self.assertEqual(d.left, "down")
 
     def test_closed_hand_still_moves_drag(self):
         mod = self._load()
@@ -2931,19 +3014,26 @@ class ClickTrackingStateTests(_Base):
         # right button (clicks are evaluated for both hands, but an untracked joint
         # is fed 'unknown').
         left = self._ext(mod, "left", hand_state=2, lift=0.30)
-        right_inf = self._ext(mod, "right", hand_state=1, lift=-0.40)
+        right_inf = self._ext(mod, "right", hand_state=1, lift=-0.05)
         c.update(left, right_inf, "open", "open", True)
         d = c.update(left, right_inf, "open", "closed", True)
         self.assertEqual(c.hand, "left")          # left drives
         self.assertIsNone(d.right)                # inferred right CANNOT press
         self.assertFalse(c.right_is_down)
-        # The SAME low right hand, but TRACKED, does fire the click (proving it's the
-        # tracking STATE — not the height — that suppressed it above).
+        # The SAME right hand (held up at chest height), but TRACKED, does fire
+        # the click (proving it's the tracking STATE that suppressed it above).
         c2 = self._ctrl(mod)
-        right_ok = self._ext(mod, "right", hand_state=2, lift=-0.40)
+        right_ok = self._ext(mod, "right", hand_state=2, lift=-0.05)
         c2.update(left, right_ok, "open", "open", True)
         d2 = c2.update(left, right_ok, "open", "closed", True)
         self.assertEqual(d2.right, "down")
+        # A TRACKED right hand resting at the DESK (lift -0.40) does not: the
+        # off-hand only clicks while held up (AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M).
+        c3 = self._ctrl(mod)
+        right_desk = self._ext(mod, "right", hand_state=2, lift=-0.40)
+        c3.update(left, right_desk, "open", "open", True)
+        d3 = c3.update(left, right_desk, "open", "closed", True)
+        self.assertIsNone(d3.right)
 
 
 class BodyIdPinTests(_Base):

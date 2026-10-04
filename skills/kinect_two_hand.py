@@ -317,6 +317,23 @@ class TwoHandController:
     def is_grabbed(self) -> bool:
         return self._phase == "grabbed"
 
+    def _released(self, now: float, hand_dist: "Optional[float]", hands,
+                  stay_active: bool) -> "TwoHandDecision":
+        """End the current grab / hold. While the SHARED two-hand verdict is
+        still on (stay_active) and hand data exists, the mode stays visibly on
+        as a fresh "holding" (no grab: a new fists-held hold is needed), so the
+        mode never blinks off and back on as the hands come down; otherwise
+        idle."""
+        self.reset()
+        if stay_active and hand_dist is not None:
+            self._phase = "holding"
+            self._engaged_since = now
+            self._smoothed_dist = float(hand_dist)
+            return TwoHandDecision(active=True, rect=None, resizing=False,
+                                   phase="holding", hands=hands)
+        return TwoHandDecision(active=False, rect=None, resizing=False,
+                               phase="idle", hands=hands)
+
     def _ema(self, prev: Optional[float], x: float, alpha: float) -> float:
         if prev is None:
             return float(x)
@@ -338,7 +355,9 @@ class TwoHandController:
                bounds: "tuple[int, int, int, int]",
                hands: "Optional[tuple]" = None, body_id=None,
                left_grip: str = "unknown",
-               right_grip: str = "unknown") -> "TwoHandDecision":
+               right_grip: str = "unknown",
+               grab_allowed: bool = True,
+               stay_active: bool = False) -> "TwoHandDecision":
         """Advance one frame.
 
         both_engaged: True when BOTH hands clear the raise-to-engage lift gate AND
@@ -360,6 +379,16 @@ class TwoHandController:
                       grab, so you grab with fists and let go by opening your palms.
                       Default "unknown" preserves the pre-grip behaviour for callers
                       (and tests) that don't pass grips.
+        grab_allowed: False keeps a "holding" pose from LATCHING a grab this
+                      frame (the hold timer restarts) - the poller passes False
+                      while either hand is under the engage line, so a window is
+                      only ever grabbed with BOTH hands up.
+        stay_active:  True while the SHARED two-hand verdict says the mode is
+                      on: a frame that would drop to idle (a hand dipped and the
+                      dead-man ran out) re-enters "holding" instead, so the mode
+                      stays visibly active and agrees with the air-mouse's
+                      stand-down and the gesture mute (2026-10-04 review: the
+                      controller sat idle while the cursor stayed stood down).
 
         Returns a TwoHandDecision: `rect` is the window rect to apply this tick (None
         when not actively resizing/moving), `resizing` True once grabbed."""
@@ -378,9 +407,7 @@ class TwoHandController:
             if self._both_open_since is None:
                 self._both_open_since = now
             elif (now - self._both_open_since) >= self._open_release_sec:
-                self.reset()
-                return TwoHandDecision(active=False, rect=None, resizing=False,
-                                       phase="idle", hands=hands)
+                return self._released(now, hand_dist, hands, stay_active)
         else:
             self._both_open_since = None
 
@@ -409,9 +436,7 @@ class TwoHandController:
                     and (now - self._last_confirmed_grab_at) <= self._deadman_sec):
                 return TwoHandDecision(active=True, rect=self._smoothed_rect,
                                        resizing=True, phase="grabbed", hands=hands)
-            self.reset()
-            return TwoHandDecision(active=False, rect=None, resizing=False,
-                                   phase="idle", hands=hands)
+            return self._released(now, hand_dist, hands, stay_active)
 
         # CONFIRMED both-hands frame (both fully Tracked + raised): stamp it for the
         # FILTER 3 dead-man so a later brief dropout is graced from HERE.
@@ -447,7 +472,7 @@ class TwoHandController:
             # latch the foreground window on one stray grip frame.
             both_closed = (str(left_grip).lower() == "closed"
                            and str(right_grip).lower() == "closed")
-            if not both_closed:
+            if not both_closed or not grab_allowed:
                 self._engaged_since = now
                 return TwoHandDecision(active=True, rect=None, resizing=False,
                                        phase="holding", hands=hands)
@@ -954,9 +979,6 @@ def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
 #  LIVE POLL — read both hands → decide → move the foreground window
 # ══════════════════════════════════════════════════════════════════════════
 _grab_hwnd = [0]    # module-list: the hwnd captured on the current grab (or 0)
-# True after a grab was let go by LOWERING a hand while the shared two-hand gate
-# is still in its exit dwell; blocks a re-grab until the gate turns off.
-_regrab_blocked = [False]
 
 
 def _poll_once(ctrl: "TwoHandController",
@@ -1006,21 +1028,25 @@ def _poll_once(ctrl: "TwoHandController",
     shared_two = (sample_ex.get("two_hand") if sample_ex is not None
                   else _shared_two_hand(am))
     lifts_up = _both_lifts_up(left_ext, right_ext, thresholds)
+    mode_on = False
+    grab_allowed = True
     if shared_two is None:
         both = bool(tracked) and _both_hands_engaged(am, left_ext, right_ext,
                                                      thresholds)
     else:
-        if not shared_two:
-            _regrab_blocked[0] = False
-        both = bool(tracked) and shared_two and not _regrab_blocked[0]
-        # While a window is GRABBED, a hand dipping under the engage line is the
-        # start of a release: report it as not-confirmed so the controller's
-        # dead-man HOLDS the rect (no resize from the falling hand) and lets go
-        # if it stays down - exactly the old grabbed-state behaviour, now on the
-        # filtered, gap-held lifts.
+        mode_on = bool(tracked) and bool(shared_two)
+        both = mode_on
+        # A window is grabbed - and stays grabbed - only with BOTH hands at or
+        # over the engage line (the shared verdict holds the MODE down to 4 cm
+        # under it). While GRABBED, a hand dipping under the line is the start
+        # of a release: report it as not-confirmed so the controller's dead-man
+        # HOLDS the rect (no resize from the falling hand) and lets go if it
+        # stays down - the old grabbed-state behaviour, on the filtered,
+        # gap-held lifts. Either way the mode itself stays on ("holding",
+        # stay_active) while the shared verdict does: one source of truth.
+        grab_allowed = lifts_up
         if both and ctrl.is_grabbed and not lifts_up:
             both = False
-    was_grabbed = ctrl.is_grabbed
     # The controlling body's id (stashed by am._hand_sample above) for the FILTER 6
     # pin — so a closer 2nd person can't steal the grab mid-resize. None if absent.
     body_id = (sample_ex.get("body_id") if sample_ex is not None
@@ -1042,7 +1068,8 @@ def _poll_once(ctrl: "TwoHandController",
     p_left = p_right = None
     hand_dist = None
     mid = None
-    if (both or (ctrl.is_grabbed and hands_present)) and reach is not None:
+    if (hands_present and (both or mode_on or ctrl.is_grabbed)
+            and reach is not None):
         p_left = _project_hand(reach, left_ext.hand)
         p_right = _project_hand(reach, right_ext.hand)
         hand_dist = _hand_distance(am, left_ext, right_ext)
@@ -1077,7 +1104,7 @@ def _poll_once(ctrl: "TwoHandController",
     # (single source of truth). Blocked → no window is offered, so the controller
     # stays "holding" (the air-mouse still stands down) and grabs nothing.
     focused_rect = None
-    if both and not ctrl.is_grabbed:
+    if both and grab_allowed and not ctrl.is_grabbed:
         try:
             blocked = bool(am.real_input_recent() or am._per_app_disabled())
         except Exception:
@@ -1092,13 +1119,8 @@ def _poll_once(ctrl: "TwoHandController",
 
     decision = ctrl.update(both_engaged=both, hand_dist=hand_dist, midpoint=mid,
                            focused_rect=focused_rect, bounds=bounds, hands=hands,
-                           body_id=body_id, left_grip=_lg, right_grip=_rg)
-    # A grab that ended because a hand came DOWN (the dead-man ran out) is the
-    # owner letting go: don't re-enter "holding" while the shared gate is still
-    # in its exit dwell, or the mode would blink off and straight back on as the
-    # hands drop (one release = one off edge). Cleared when the gate turns off.
-    if (shared_two and was_grabbed and not ctrl.is_grabbed and not lifts_up):
-        _regrab_blocked[0] = True
+                           body_id=body_id, left_grip=_lg, right_grip=_rg,
+                           grab_allowed=grab_allowed, stay_active=mode_on)
 
     # STAND DOWN the single-hand air-mouse whenever two-hand mode is active (incl.
     # the pre-grab hold) so the two never fight the cursor.

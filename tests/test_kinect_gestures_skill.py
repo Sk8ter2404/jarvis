@@ -461,6 +461,29 @@ class TwoHandSuppressionTests(_Base):
         self.assertGreaterEqual(rec.resets, 1)  # recognizer reset while resizing
         self.assertTrue(bc._standby_mode[0])    # NOT woken / no side effect
 
+    def test_gesture_suppressed_while_the_shared_verdict_says_two_hand(self):
+        """2026-10-04 review: the gesture mute must follow the SAME two-hand
+        verdict the air-mouse stands down on - even on a tick where the two-hand
+        poller's heartbeat is absent (lagging, or the poller is off)."""
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        self._set_air_mouse(engaged=False, two_hand=False)   # no heartbeat
+        bc = _fake_bc(standby=True, sleep=True)
+        kb = _fake_bridge(bodies=[{"x": 1}])
+        kb.get_tracked_frame = lambda: {"stale": False, "two_hand": True,
+                                        "tracked": True, "fresh": True,
+                                        "owner": {"x": 1}}
+        self._inject("audio.kinect_bridge", kb)
+        rec = _StubRec([kg.SWIPE_LEFT])
+        self.assertIsNone(mod._poll_once(rec, bc))
+        self.assertEqual(rec.updates, 0)
+        self.assertTrue(bc._standby_mode[0])
+        # A STALE snapshot's verdict mutes nothing.
+        kb.get_tracked_frame = lambda: {"stale": True, "two_hand": True}
+        mod._muted_until[0] = 0.0
+        self.assertEqual(mod._poll_once(rec, bc), kg.SWIPE_LEFT)
+
     def test_gesture_fires_once_two_hand_releases(self):
         mod = self._load()
         self._not_staging(mod)

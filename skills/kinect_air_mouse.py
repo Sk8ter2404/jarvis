@@ -497,6 +497,13 @@ AIR_MOUSE_FIST_RELEASES = False          # OFF by default (fought click/drag —
 #                                          normal close stopped tracking); close =
 #                                          click/drag, lower the hand to let go
 AIR_MOUSE_FIST_RELEASE_SEC = 0.60        # …held closed this long counts as release
+# OFF-HAND CLICKS (2026-10-04 review): the hand NOT driving the cursor may press
+# its button only while it is held up at least this high relative to the
+# shoulder line (metres; -0.10 = upper chest). A fist resting on the desk
+# (lift ~-0.30) no longer right-clicks while the other hand drives, and a button
+# that hand holds is let go once it drops below. core/config.py holds the same
+# literal (a test pins the pair). -1.0 = anywhere (old), 1.0 = never.
+AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M = -0.10
 AIR_MOUSE_PER_APP_DISABLE = True         # stand down over disabled-app windows
 AIR_MOUSE_DISABLED_APP_HINTS = [         # lower-case title/class substrings
     "full screen", "fullscreen",
@@ -1307,7 +1314,12 @@ class AirMouseController:
       • RIGHT hand OPEN→CLOSED → emit RIGHT "down"; CLOSED→OPEN → RIGHT "up".
       A held-closed hand keeps its button down while the cursor moves (a drag);
       a quick close→open with no move is a click. The overlay shows "grab" while
-      EITHER button is held."""
+      EITHER button is held.
+      2026-10-04: the hand NOT driving the cursor clicks only while it is held
+      up (AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M; a fist resting on the desk never
+      clicks, and its held button is let go when it drops), and on a hand
+      SWITCH the old hand's held button goes up before the cursor moves to the
+      new hand (a drag is never carried across by the other hand)."""
 
     def __init__(self, reach: ReachBox,
                  alpha: float = AIR_MOUSE_EMA_ALPHA,
@@ -1330,7 +1342,8 @@ class AirMouseController:
                  engage_reach_m: "Optional[float]" = None,
                  engage_reach_ratio: "Optional[float]" = None,
                  engage_straight: "Optional[float]" = None,
-                 close_debounce_frames: "Optional[int]" = None):
+                 close_debounce_frames: "Optional[int]" = None,
+                 offhand_min_lift: "Optional[float]" = None):
         self.reach = reach
         self._ema_x = EMA(alpha)
         self._ema_y = EMA(alpha)
@@ -1472,6 +1485,19 @@ class AirMouseController:
         # 1-frame open flicker on a held fist doesn't drop it).
         self._fist_release_latched = False
         self._latch_open_streak = 0
+        # OFF-HAND CLICK GATE (see AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M): the lift
+        # the non-driving hand must be at to press, and per hand a latch that
+        # blocks a press from a fist that was already shut while the hand was
+        # not allowed to click (lifting a closed fist off the desk is not a
+        # click; it must open and close again).
+        self._offhand_min_lift = (
+            float(offhand_min_lift) if offhand_min_lift is not None
+            else _cfg_float("AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M",
+                            AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M))
+        self._needs_open = {"left": False, "right": False}
+        # The cursor pixel last emitted while engaged (a hand switch re-emits it
+        # for one frame so the old hand's button goes UP where it was).
+        self._last_cursor: Optional[tuple] = None
         # WHY the cursor was last let go while engaged ("" until it happens) —
         # logged on the telemetry line, because the 2026-10-04 13:28:36 release
         # (lift +0.42, no yield) could not be explained from the log.
@@ -1496,6 +1522,8 @@ class AirMouseController:
         # responsible for releasing held buttons. We only clear our own view.
         self._left_down = False
         self._right_down = False
+        self._needs_open = {"left": False, "right": False}
+        self._last_cursor = None
         self._engaged = False
         self._hand = None
         self._last_engaged_at = 0.0
@@ -1567,6 +1595,8 @@ class AirMouseController:
         right = "up" if self._right_down else None
         self._left_down = False
         self._right_down = False
+        self._needs_open = {"left": False, "right": False}
+        self._last_cursor = None
         self._engaged = False
         self._hand = None
         self._engage_streak = 0
@@ -1766,7 +1796,9 @@ class AirMouseController:
                facing_deg=None, armed: "Optional[bool]" = None,
                per_app_disabled: bool = False,
                two_hand: "Optional[bool]" = None,
-               active_side: "Optional[str]" = None
+               active_side: "Optional[str]" = None,
+               left_palm: "Optional[str]" = None,
+               right_palm: "Optional[str]" = None
                ) -> AirMouseDecision:
         """Advance one frame.
 
@@ -1798,6 +1830,12 @@ class AirMouseController:
         active_side: the SHARED stabiliser's sticky active hand (in this
             controller's labels, i.e. already mirrored); preferred whenever it is
             a candidate. None → the per-poll hand hysteresis below.
+        left_palm / right_palm: the SHARED stabiliser's OPEN-PALM signal per hand
+            ("open"/"closed"; any confidence, a Lasso point counts as NOT open).
+            When given, AIR_MOUSE_REQUIRE_OPEN_PALM tests THIS for the controlling
+            hand instead of the click grip - the click grip defaults to "open" on
+            no confident evidence, so a pointing hand or a Low-confidence fist
+            passed the gate (2026-10-04 review). None → the click grip (legacy).
 
         DISENGAGES (returns cursor=None — no SetCursorPos — and releases any held
         button) when real input is recent (AUTO-YIELD), when the foreground app is
@@ -1924,6 +1962,10 @@ class AirMouseController:
         right_stable = self._grip_right.update(
             self._grip_if_tracked(right_ext, right_grip))
         ctrl_stable = left_stable if arm.side == "left" else right_stable
+        # The grip the PASSIVE open-palm test reads: the shared stabiliser's palm
+        # signal for the controlling hand when supplied, else the click grip.
+        ctrl_palm = left_palm if arm.side == "left" else right_palm
+        palm_grip = ctrl_palm if ctrl_palm is not None else ctrl_stable
 
         # ── FIST-RELEASE LATCH GATE: after a sustained fist LET GO of the cursor,
         #    refuse to re-engage until the raised hand OPENS again. Checked on the
@@ -2012,7 +2054,7 @@ class AirMouseController:
             # smart-engage rewrite set out to kill. Gate the increment on real
             # pose validity; reset the streak on an invalid frame so a fresh,
             # genuinely-held open-palm pose must fill the dwell.
-            if _pose_ok_passive(lift_ok=True, grip=ctrl_stable,
+            if _pose_ok_passive(lift_ok=True, grip=palm_grip,
                                 facing_deg=facing_deg, hand_still=hand_still,
                                 require_open_palm=self._require_open_palm,
                                 facing_max_deg=self._facing_max_deg,
@@ -2047,7 +2089,7 @@ class AirMouseController:
 
         verdict = engage_decision(
             lift_ok=True, currently_engaged=self._engaged, armed=bool(armed),
-            grip=ctrl_stable, facing_deg=facing_deg, reach_ok=reach_ok,
+            grip=palm_grip, facing_deg=facing_deg, reach_ok=reach_ok,
             hand_still=hand_still,
             dwell_elapsed=dwell_elapsed, arm_debounce_elapsed=arm_elapsed,
             require_open_palm=self._require_open_palm,
@@ -2106,8 +2148,24 @@ class AirMouseController:
             # unintended grab/drag the owner never gestured. Seeding held=want_down
             # suppresses that edge; a real click still fires on the next
             # open→close. 2026-07-08.
-            self._left_down = (left_stable == "closed")
-            self._right_down = (right_stable == "closed")
+            # 2026-10-04: an OFF-hand that may not click (resting on the desk) is
+            # not seeded "down" - it gets the must-open-first latch instead, so
+            # it neither presses nor sends an unmatched button-up later.
+            for side, stable, ext in (("left", left_stable, left_ext),
+                                      ("right", right_stable, right_ext)):
+                closed = (stable == "closed")
+                may = (side == arm.side) or self._offhand_may_click(ext)
+                setattr(self, "_left_down" if side == "left" else "_right_down",
+                        closed and may)
+                self._needs_open[side] = closed and not may
+        # HAND SWITCH while engaged: the hand that drove until now becomes the
+        # off-hand. Its held button (a drag it started) is let go on THIS frame,
+        # and the cursor is held where it was for this one frame, so the button
+        # goes up BEFORE the cursor moves to the new hand (_apply_decision moves
+        # first, then clicks) - otherwise the drag is carried across the desktop
+        # by the other hand (2026-10-04 review: a 5,900 px carried drag).
+        switched_from = (self._hand if (self._engaged and self._hand is not None
+                                        and self._hand != arm.side) else None)
         self._engaged = True
         self._engage_streak = 0       # met the bar; clear so a later re-engage re-debounces
         self._prime = 0.0             # engaged → nothing to prime
@@ -2153,14 +2211,73 @@ class AirMouseController:
         # can click regardless of which drives the cursor. LEFT hand → LEFT
         # button, RIGHT hand → RIGHT button. The debouncers were ALREADY advanced
         # this frame (above), so emit edges from their stable grips WITHOUT
-        # re-advancing (no double-advance).
-        left_edge = self._button_edge_from_stable(left_stable, "_left_down")
-        right_edge = self._button_edge_from_stable(right_stable, "_right_down")
+        # re-advancing (no double-advance). The NON-driving hand clicks only
+        # while it is held up (AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M).
+        if switched_from is not None:
+            self._release_switched_hand(switched_from,
+                                        left_stable if switched_from == "left"
+                                        else right_stable)
+        left_edge = self._hand_edge("left", left_stable, left_ext, arm.side)
+        right_edge = self._hand_edge("right", right_stable, right_ext, arm.side)
+        if switched_from is not None:
+            old_up = (left_edge if switched_from == "left" else right_edge) == "up"
+            if old_up and self._last_cursor is not None:
+                cursor = self._last_cursor
+        self._last_cursor = cursor
 
         overlay = "grab" if self.button_is_down else "track"
         return AirMouseDecision(cursor=cursor, left=left_edge, right=right_edge,
                                 overlay=overlay, hand=arm.side,
                                 grip=self._controlling_grip(), prime=0.0)
+
+    def _offhand_may_click(self, ext) -> bool:
+        """May the NON-driving hand press its button this frame? Only while its
+        hand joint is sensor-Tracked and held up at least
+        AIR_MOUSE_OFFHAND_CLICK_MIN_LIFT_M relative to the shoulder line - a fist
+        resting on the desk (or a hand the sensor can't see) never clicks.
+        PURE; NEVER raises."""
+        try:
+            if ext is None or ext.hand is None or ext.lift_m is None:
+                return False
+            if not joint_well_tracked(ext.hand):
+                return False
+            return float(ext.lift_m) >= self._offhand_min_lift
+        except (TypeError, ValueError):
+            return False
+
+    def _release_switched_hand(self, side: str, stable: str) -> None:
+        """A hand switch: the hand that drove until now must re-open before it
+        can press again (its held button is released by _hand_edge, below)."""
+        attr = "_left_down" if side == "left" else "_right_down"
+        if getattr(self, attr) or stable == "closed":
+            self._needs_open[side] = True
+
+    def _hand_edge(self, side: str, stable: str, ext,
+                   driving_side: str) -> Optional[str]:
+        """One hand's button edge this ENGAGED frame. The driving hand clicks
+        from its stable grip; the off-hand only while _offhand_may_click (a
+        button it holds is let go the moment it may not), and any hand whose
+        _needs_open latch is set must be seen open before it can press.
+        Returns "down"/"up"/None."""
+        attr = "_left_down" if side == "left" else "_right_down"
+        held = getattr(self, attr)
+        if side != driving_side:
+            may = self._offhand_may_click(ext)
+            if not may:
+                # Down at the desk / not seen: no press, and let go of a held
+                # button now; a fist must re-open before it can click again.
+                self._needs_open[side] = (stable == "closed")
+            if not may or (held and self._needs_open[side]):
+                # (held + latch = the hand that drove until a switch this frame)
+                if held:
+                    setattr(self, attr, False)
+                    return "up"
+                return None
+        if self._needs_open[side]:
+            if stable == "closed":
+                return None
+            self._needs_open[side] = False
+        return self._button_edge_from_stable(stable, attr)
 
     def _controlling_grip(self) -> str:
         """The stable grip of whichever hand is driving the cursor (for the
@@ -2275,6 +2392,9 @@ def get_air_mouse_prime() -> float:
 _TWO_HAND_ACTIVE_TTL_SEC = 0.5     # heartbeat older than this → treat as inactive
 _two_hand_state_lock = threading.Lock()
 _two_hand_state: dict = {"active": False, "ts": 0.0}
+# The heartbeat's clock (module-list so the offline replay can drive it from
+# its simulated clock instead of mixing simulated and wall time).
+_heartbeat_clock: list = [time.time]
 
 
 def set_two_hand_active(active: bool) -> None:
@@ -2284,7 +2404,7 @@ def set_two_hand_active(active: bool) -> None:
     try:
         with _two_hand_state_lock:
             _two_hand_state["active"] = bool(active)
-            _two_hand_state["ts"] = time.time()
+            _two_hand_state["ts"] = _heartbeat_clock[0]()
     except Exception:
         pass
 
@@ -2298,7 +2418,7 @@ def two_hand_active() -> bool:
         with _two_hand_state_lock:
             if not _two_hand_state["active"]:
                 return False
-            age = time.time() - float(_two_hand_state["ts"] or 0.0)
+            age = _heartbeat_clock[0]() - float(_two_hand_state["ts"] or 0.0)
         return 0.0 <= age <= _TWO_HAND_ACTIVE_TTL_SEC
     except Exception:
         return False
@@ -3013,7 +3133,7 @@ def _hand_sample_ex(bridge) -> tuple:
     hand, mirrored like the arms)}. NEVER raises."""
     none_result = (None, None, "unknown", "unknown", False)
     ex = {"body_id": None, "facing_deg": None, "frame": None,
-          "two_hand": None, "active": None}
+          "two_hand": None, "active": None, "palms": (None, None)}
     try:
         if not bridge.get_enabled():
             return none_result, ex
@@ -3102,15 +3222,18 @@ def _arm_from_shared(hv: "Optional[dict]", side: str) -> "ArmExtension":
 
 def _hand_sample_shared(snap: "Optional[dict]") -> tuple:
     """_hand_sample_ex() over the bridge's SHARED snapshot (get_tracked_frame):
-    the same 5-tuple plus the extras, including the shared two-hand verdict and
-    active hand. The grips returned are the stabiliser's STABLE grips (High
-    confidence, time-debounced), so the controller built by _new_controller()
-    passes them straight through. A stale snapshot (no new body frame for the
-    owner-loss grace - the pump starved or the sensor stopped) reads as NOT
-    tracked. NEVER raises."""
+    the same 5-tuple plus the extras, including the shared two-hand verdict,
+    active hand and per-hand OPEN-PALM signal ("palms", for the passive
+    open-palm gate). The grips returned are the stabiliser's STABLE click grips
+    (confident presses, any-confidence releases, time-debounced), so the
+    controller built by _new_controller() passes them straight through. A stale
+    snapshot (no new body frame for KINECT_SNAPSHOT_STALE_SEC - the pump starved
+    or the sensor stopped) and a missing one (no frame yet, or the stabiliser
+    could not be built: kinect_bridge.tracking_error) read as NOT tracked - the
+    air-mouse fails CLOSED. NEVER raises."""
     none_result = (None, None, "unknown", "unknown", False)
     ex = {"body_id": None, "facing_deg": None, "frame": snap,
-          "two_hand": False, "active": None}
+          "two_hand": False, "active": None, "palms": (None, None)}
     try:
         if not snap or snap.get("stale") or not snap.get("tracked"):
             return none_result, ex
@@ -3127,13 +3250,16 @@ def _hand_sample_shared(snap: "Optional[dict]") -> tuple:
         right_ext = _arm_from_shared(rv, "right")
         left_grip = str(lv.get("grip") or "unknown").lower()
         right_grip = str(rv.get("grip") or "unknown").lower()
+        left_palm, right_palm = lv.get("palm"), rv.get("palm")
         active = snap.get("active")
         if _hand_mirror_enabled():
             left_ext, right_ext = (_relabel_arm_side(right_ext, "left"),
                                    _relabel_arm_side(left_ext, "right"))
             left_grip, right_grip = right_grip, left_grip
+            left_palm, right_palm = right_palm, left_palm
             active = _MIRROR_SIDE.get(active)
         ex["active"] = active if active in ("left", "right") else None
+        ex["palms"] = (left_palm, right_palm)
         return (left_ext, right_ext, left_grip, right_grip, True), ex
     except Exception:
         return none_result, ex
@@ -3461,11 +3587,14 @@ def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
                 "yield=%s reach=%s straight=%s tracked=%s"
                 % (lift_s, hand_s, grip_s, bool(ctrl.engaged), latch_s,
                    bool(yielding), reach_s, straight_s, bool(tracked)))
-        if _last_tracked_frame[0] is not None:
+        snap = _last_tracked_frame[0]
+        if snap is not None:
             hv = _shared_view_for(arm.side if arm is not None else None)
-            line += (" src=%s conf=%s two=%s"
+            fps = snap.get("fps")
+            line += (" src=%s conf=%s two=%s fps=%s"
                      % (hv.get("source") or "none", hv.get("conf") or "?",
-                        bool(_last_two_hand[0])))
+                        bool(_last_two_hand[0]),
+                        ("%.0f" % fps) if isinstance(fps, (int, float)) else "?"))
         why = getattr(ctrl, "last_release_reason", "")
         if why and not bool(getattr(ctrl, "engaged", False)):
             line += " why=%s" % why
@@ -3585,6 +3714,7 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     # hand, the same ones the two-hand poller and gestures act on.
     shared_two_hand = sample_ex["two_hand"]
     shared_active = sample_ex["active"]
+    left_palm, right_palm = sample_ex.get("palms") or (None, None)
     if shared_two_hand is not None:
         # Shared layer: two-hand mode (its verdict, or the two-hand poller's
         # heartbeat) is its own stand-down reason, and only REAL input yields -
@@ -3600,7 +3730,8 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
                                facing_deg=facing_deg, armed=armed,
                                per_app_disabled=per_app_disabled,
                                two_hand=shared_two_hand,
-                               active_side=shared_active)
+                               active_side=shared_active,
+                               left_palm=left_palm, right_palm=right_palm)
     except Exception:
         # A controller error must not strand a held button — force a release.
         try:
