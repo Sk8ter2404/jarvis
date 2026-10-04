@@ -50,8 +50,9 @@ Configuration (read at start time; override via configure()):
     RAG_MAX_FILE_BYTES    — skip files larger than this (default 25 MB)
     RAG_CHUNK_CHARS       — chunk size in characters (default 1200)
     RAG_CHUNK_OVERLAP     — chunk overlap in characters (default 200)
-    RAG_DEVICE            — "auto" | "cuda" | "cpu" for the reranker only
-                            (embeddings run via Ollama regardless)
+    RAG_DEVICE            — "auto" | "cpu" | "cuda" | "cuda:N" for the
+                            reranker only (embeddings run via Ollama
+                            regardless). "auto" = the CPU: see _device()
 """
 
 from __future__ import annotations
@@ -327,14 +328,14 @@ def is_available() -> bool:
 
 
 def _device() -> str:
-    if RAG_DEVICE in ("cpu", "cuda"):
-        return RAG_DEVICE
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
+    """The reranker's torch device. "auto" is the CPU (2026-10-04): it used
+    to be "cuda" whenever torch had CUDA, i.e. cuda:0 — the RTX 3090 that
+    holds the local brain with ~1.1 GB free — where bge-reranker-base (~1.1
+    GB fp32) plus a CUDA context would have landed on the first file search.
+    A card only when RAG_DEVICE names one ("cuda" / "cuda:N")."""
+    dev = str(RAG_DEVICE or "auto").strip().lower()
+    if dev == "cpu" or dev == "cuda" or dev.startswith("cuda:"):
+        return dev
     return "cpu"
 
 
@@ -648,7 +649,7 @@ def _get_reranker():
             # GPU-first, but fall back to CPU on a cuda OOM rather than
             # losing rerank entirely (the 3090 can hit 24 GB when image-gen
             # loads alongside a large Ollama model).
-            if str(dev) == "cuda":
+            if str(dev).startswith("cuda"):
                 print(f"  [rag] cuda reranker load failed ({e}); retrying on CPU")
                 try:
                     _reranker = CrossEncoder(RAG_RERANKER_MODEL, device="cpu")

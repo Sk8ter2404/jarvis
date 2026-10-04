@@ -15,6 +15,9 @@ Pinned here (stdlib only, a fake NVML library — no driver, no GPU):
   * find() for 'cuda', 'cuda:N', a UUID prefix and a piece of the name;
   * NVML missing / nvmlInit failing = unknown (None), loaded and initialised
     once, never raising;
+  * a GPU NVML cannot read KEEPS ITS PLACE (review 2026-10-04: skipping it
+    moved every later card down one CUDA index, so the 1650's free VRAM read
+    as the 3090's and 'listen' = '1650' resolved to cuda:0, the brain's card);
   * the module imports nothing that could open a CUDA context.
 
     python -m unittest tests.test_gpu_probe
@@ -58,6 +61,9 @@ class FakeNvml:
         return 0
 
     def nvmlDeviceGetHandleByIndex_v2(self, i, ref):
+        rc = self.cards[int(i.value)].get("handle_rc", 0)
+        if rc:
+            return rc                              # e.g. GPU lost (15)
         ref._obj.value = int(i.value) + 1          # handle = index + 1
         return 0
 
@@ -66,6 +72,8 @@ class FakeNvml:
 
     def nvmlDeviceGetMemoryInfo(self, h, ref):
         c = self._card(h)
+        if c.get("mem_rc"):
+            return c["mem_rc"]
         ref._obj.total = c["total"] * _MB
         ref._obj.free = c["free"] * _MB
         ref._obj.used = (c["total"] - c["free"]) * _MB
@@ -214,6 +222,61 @@ class FindTests(_Base):
         self.assertIn("bus 8", s)
         self.assertIn("2769/4096 MB free", s)
         self.assertEqual(gp.describe(None), "no GPU")
+
+
+# The brain's card unreadable (a TDR / GPU-lost state), the 1650 fine. A
+# whole-length synthetic UUID for the 1650 (never a real one).
+UUID_1650 = "GPU-bbbb2222-0000-0000-0000-000000000000"
+
+
+class UnreadableCardTests(_Base):
+    PCI = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+
+    def setUp(self):
+        super().setUp()
+        self.lib.cards = [dict(CARDS[0], mem_rc=15),
+                          dict(CARDS[1], uuid=UUID_1650.encode())]
+
+    def test_the_cards_after_it_keep_their_index(self):
+        lst = gp.cuda_gpus(self.PCI)
+        self.assertEqual(len(lst), 2)
+        self.assertTrue(lst[0].get("unreadable"))
+        self.assertEqual(lst[1]["pci_bus"], 8)
+        # cuda:0 is unknown — never the 1650's numbers read as the 3090's.
+        self.assertIsNone(gp.cuda_memory_mb(0, self.PCI))
+        self.assertEqual(gp.cuda_memory_mb(1, self.PCI), (2769, 4096))
+        self.assertIsNone(gp.cuda_memory_mb(2, self.PCI))
+
+    def test_a_failed_handle_keeps_its_place_too(self):
+        self.lib.cards = [dict(CARDS[0], handle_rc=15), CARDS[1]]
+        self.assertEqual(gp.cuda_memory_mb(1, self.PCI), (2769, 4096))
+        self.assertIsNone(gp.cuda_memory_mb(0, self.PCI))
+
+    def test_display_lists_only_readable_cards(self):
+        self.assertEqual([g["pci_bus"] for g in gp.gpus()], [8])
+
+    def test_find_names_the_right_index(self):
+        self.assertEqual(gp.find("1650", self.PCI)[0], 1)
+        self.assertEqual(gp.find(UUID_1650, self.PCI)[0], 1)
+        self.assertEqual(gp.find(UUID_1650.lower(), self.PCI)[0], 1)
+        # A short prefix might be the unreadable card's own: unknown.
+        self.assertIsNone(gp.find("GPU-bbbb", self.PCI))
+        self.assertIsNone(gp.find("3090", self.PCI))     # cannot be named
+        idx, g = gp.find("cuda:0", self.PCI)
+        self.assertEqual(idx, 0)
+        self.assertTrue(g.get("unreadable"))
+        self.assertEqual(gp.describe(g, 0), "cuda:0 GPU unreadable")
+
+    def test_listen_never_lands_on_the_brains_card(self):
+        from core import listen_devices as ld
+        for spec in ("1650", UUID_1650, "cuda:1"):
+            p = ld.resolve("voice_id", "listen", listen_gpu=spec,
+                           reserve_mb=512, env=self.PCI)
+            self.assertEqual(p.device, "cuda:1", spec)
+        # Asked for the unreadable card itself: no room can be proved.
+        p = ld.resolve("voice_id", "cuda:0", reserve_mb=512, env=self.PCI)
+        self.assertEqual(p.device, "cpu")
+        self.assertIn("unreadable", p.reason)
 
 
 class NoContextTests(unittest.TestCase):

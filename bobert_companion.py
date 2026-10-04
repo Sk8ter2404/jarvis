@@ -36,14 +36,15 @@ Quick setup
 # OpenCV finish initialising. stdlib-only on purpose.
 import codecs, os, sys, subprocess, threading, time
 
-# Number GPUs by PCI bus, BEFORE anything initialises CUDA (2026-10-04). CUDA's
-# default order (FASTEST_FIRST) would renumber the cards when a second RTX 3090
-# goes in: the 1650 that WHISPER_DEVICE="cuda:1" means today could become
-# cuda:2, and "cuda:1" would silently land on the new card. PCI order is also
-# NVML's, so core/gpu_probe's free-VRAM reads (no CUDA context) index the same
-# cards ctranslate2 and torch do. Identical to today's mapping on this desk
-# (3090 = bus 1 = cuda:0, 1650 = bus 8 = cuda:1). setdefault: an explicit
-# environment choice wins.
+# Number GPUs by PCI bus, BEFORE anything initialises CUDA (2026-10-04): PCI
+# order is NVML's, so core/gpu_probe's free-VRAM reads (no CUDA context) index
+# the same cards ctranslate2 and torch do. Identical to today's mapping on this
+# desk (3090 = bus 1 = cuda:0, 1650 = bus 8 = cuda:1). It does NOT pin a card
+# to an index: a card added on a lower bus than the 1650 (any CPU-attached
+# slot) becomes cuda:1 and the 1650 cuda:2 - as it would under CUDA's default
+# FASTEST_FIRST too - so "cuda:1" settings would follow the new card. Name the
+# card instead (LISTEN_GPU = its UUID or "1650", WHISPER_DEVICE = "listen").
+# setdefault: an explicit environment choice wins.
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 # Make stdout/stderr UTF-8 so JARVIS's non-ASCII output (─, ≥, →, em-dashes,
@@ -17359,7 +17360,7 @@ _parakeet_primary = _stt_parakeet.Primary(
     # The music gate (core/music_gate.py, 2026-10-04): over music a rescue
     # needs a wake hint ('on' skips it otherwise; 'shadow' only counts).
     gate=lambda t, a, w: _music_gate_rescue(t, a, w),
-    shadow=lambda w, res: _music_gate_rescue_seen(w, res),
+    shadow=lambda w, res, a: _music_gate_rescue_seen(w, res, a),
 )
 
 
@@ -18645,9 +18646,6 @@ def record_speech(timeout: float | None = None, *,
     _eot = None
     _eot_why = "rms"
     record_start_ts = 0.0   # set when recording actually begins (VAD trip)
-    # Music gate (2026-10-04): the shorter cap over music, asked ONCE per
-    # capture when it passes it (None = not this capture / gate off).
-    _music_cap = _music_capture_cap_s()
     _se_vad_ts = _se_open_ts  # the same instant on the self-echo clock
     _se_clip_ts = _se_open_ts
     # Mute Mic mid-capture (2026-09-30): the tray's mute used to be checked
@@ -18742,17 +18740,6 @@ def record_speech(timeout: float | None = None, *,
                       f"{MAX_RECORDING_SECS:.0f}s reached — finalizing")
                 _eot_why = "max"
                 break
-            # Music gate (core/music_gate.py): over music no capture ever goes
-            # quiet, so each one ran the full 30 s. Measured in AUDIO time
-            # (samples since the trip, pre-roll excluded); asked once.
-            if recording and _music_cap is not None:
-                _rec_s = ((len(chunks) * CHUNK - pre_samples)
-                          / float(SAMPLE_RATE))
-                if _rec_s > _music_cap:
-                    _cap_s, _music_cap = _music_cap, None
-                    if _music_gate_capture(_rec_s, _cap_s):
-                        _eot_why = "max"
-                        break
 
             rms = float(np.sqrt(np.mean(data ** 2)))
             if rms > peak_rms:
@@ -34303,8 +34290,12 @@ def _music_gate_rescue(text, audio, why) -> str:
     """core/stt_parakeet.Primary's gate on a rescue (core/music_gate
     rescue_decision): '' rescue as always; 'skip' (mode 'on', music, no
     "Jarvis"-like word in Parakeet's first three, not the owner's voice) keeps
-    Parakeet's text; 'shadow' would skip, rescues anyway. The voice is asked
-    only when the text gives no hint. Never raises ('' = rescue)."""
+    Parakeet's text; 'shadow' (no wake hint) rescues anyway. The voice is
+    asked only in 'on' and only when the text gives no hint: in 'shadow' it
+    would be main-loop time spent on a capture whose rescue runs regardless
+    (18-64 ms a capture on 24 CPU threads, up to ~100 ms — review
+    2026-10-04), so shadow asks it after the rescue and only for a line the
+    wake gates pass (_music_gate_rescue_seen). Never raises ('' = rescue)."""
     try:
         mode = _music_gate_mode()
         if mode == "off":
@@ -34322,14 +34313,21 @@ def _music_gate_rescue(text, audio, why) -> str:
         return ""
 
 
-def _music_gate_rescue_seen(why, res) -> None:
-    """Shadow: what Whisper made of a rescue 'on' would have skipped. A line
-    the wake gates would let through is one 'on' would have LOST — counted,
-    and logged at most once a minute (its length, never its words). Never
-    raises."""
+def _music_gate_rescue_seen(why, res, audio=None) -> None:
+    """Shadow: what Whisper made of a rescue without a wake hint. A line the
+    wake gates let through, in a voice that is not the owner's, is one 'on'
+    would have LOST ('on' still rescues the owner's voice: the voice is
+    asked here, only for such a line — the media gate of that turn reuses
+    the same check from the memo) — counted, and logged at most once a
+    minute (its length, never its words). ``audio`` is the capture the
+    rescue decoded. Never raises."""
     try:
         text = res[0] if isinstance(res, tuple) and res else ""
-        if not str(text or "").strip() or _parakeet_wake_lost(text):
+        if not str(text or "").strip():
+            return
+        if not _music_gate.shadow_lost(
+                not _parakeet_wake_lost(text),
+                lambda: _capture_voice_verdict(audio)):
             return
         _music_note("lost_rescue")
         now = time.monotonic()
@@ -34386,39 +34384,6 @@ def _music_gate_ambient_done(gate, kept: bool = False, wake: bool = False,
                 _music_note("lost_ambient_named")
     except Exception:
         pass
-
-
-def _music_capture_cap_s() -> "float | None":
-    """MUSIC_MAX_CAPTURE_S when the gate may cut a capture (mode not 'off'
-    and the cap under MAX_RECORDING_SECS), else None. Never raises."""
-    try:
-        if _music_gate_mode() == "off":
-            return None
-        cap = float(globals().get("MUSIC_MAX_CAPTURE_S", 10.0))
-        if not cap > 0.0 or cap >= float(MAX_RECORDING_SECS):
-            return None
-        return cap
-    except Exception:
-        return None
-
-
-def _music_gate_capture(recorded_s: float, cap_s: float) -> bool:
-    """record_speech asks ONCE per capture, when it has recorded past
-    ``cap_s`` seconds of audio: True = stop the capture here (mode 'on' and
-    music now). Shadow counts a would-cut. Never raises (False)."""
-    try:
-        v = _music_gate.capture_decision(_music_gate_mode(), _music_now(),
-                                         recorded_s, cap_s)
-        if v == "cut":
-            _music_note("skip_capture")
-            print(f"  [music-gate] music playing — capture stopped at "
-                  f"{float(cap_s):.0f}s (MUSIC_MAX_CAPTURE_S)")
-            return True
-        if v == "shadow":
-            _music_note("would_capture")
-        return False
-    except Exception:
-        return False
 
 
 def _device_speech_ignored(text: str, injected: bool = False) -> bool:

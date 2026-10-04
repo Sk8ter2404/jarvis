@@ -23,12 +23,18 @@ CUDA INDEX vs NVML INDEX
 ------------------------
 NVML numbers GPUs by PCI bus. CUDA numbers them by CUDA_DEVICE_ORDER
 (FASTEST_FIRST by default) after CUDA_VISIBLE_DEVICES filters them. The two
-agree only under ``CUDA_DEVICE_ORDER=PCI_BUS_ID`` (bobert_companion sets that
-before anything touches CUDA, so a second RTX 3090 can never silently
-renumber the 1650 that WHISPER_DEVICE="cuda:1" means). ``cuda_gpus()`` maps
-CUDA's numbering onto NVML's and returns None — "unknown", never a guess —
-when it cannot (FASTEST_FIRST with more than one GPU, an unreadable
-CUDA_VISIBLE_DEVICES entry).
+agree only under ``CUDA_DEVICE_ORDER=PCI_BUS_ID`` — bobert_companion sets that
+before anything touches CUDA, so these reads index the same cards ctranslate2
+and torch use. It does NOT make an index an identity: a card added on a lower
+PCI bus than the 1650 (bus 8 here; a CPU-attached slot is lower) takes
+"cuda:1" and the 1650 becomes "cuda:2" — under either order. Settings that
+must stay on one card name it (its UUID, or "1650"; see find()).
+``cuda_gpus()`` maps CUDA's numbering onto NVML's and returns None — "unknown",
+never a guess — when it cannot (FASTEST_FIRST with more than one GPU, an
+unreadable CUDA_VISIBLE_DEVICES entry). A GPU NVML cannot read keeps its
+place as an UNREADABLE entry (name '', free_mb None), so one bad card never
+shifts the cards after it onto its index (review 2026-10-04: a skipped 3090
+made the 1650's numbers read as cuda:0's).
 
 Public API (stdlib only, never raises, never creates a CUDA context):
     available()                 -> bool        NVML loaded and initialised
@@ -39,7 +45,9 @@ Public API (stdlib only, never raises, never creates a CUDA context):
     find(spec, env=None)        -> (cuda_index, dict) | None
     describe(gpu)               -> str
 Each GPU dict: index (NVML), name, uuid, pci_bus, total_mb, free_mb,
-used_mb, util_pct (None when unreadable).
+used_mb, util_pct (None when unreadable). cuda_gpus() also holds an
+UNREADABLE entry (``unreadable: True``, every reading None) for a GPU NVML
+counts but cannot read; gpus() leaves those out.
 """
 from __future__ import annotations
 
@@ -185,9 +193,19 @@ def _read_one(lib, i: int) -> "dict | None":
             "util_pct": util}
 
 
-def gpus() -> "list[dict]":
-    """Every GPU the driver reports, in NVML (PCI bus) order; [] when NVML is
-    unavailable or reads nothing. Never raises."""
+def _unreadable(i: int) -> dict:
+    """The place-holder for NVML index ``i`` when that GPU cannot be read:
+    it keeps the GPUs after it on their own indices, and matches no name or
+    UUID."""
+    return {"index": int(i), "name": "", "uuid": "", "pci_bus": None,
+            "total_mb": None, "free_mb": None, "used_mb": None,
+            "util_pct": None, "unreadable": True}
+
+
+def _slots() -> "list[dict]":
+    """One entry per GPU NVML counts, in NVML (PCI bus) order — the GPU's
+    record, or _unreadable(i) when it cannot be read; [] when NVML is
+    unavailable or counts nothing. Never raises."""
     try:
         lib = _lib()
         if lib is None:
@@ -201,11 +219,17 @@ def gpus() -> "list[dict]":
                 g = _read_one(lib, i)
             except Exception:
                 g = None
-            if g is not None:
-                out.append(g)
+            out.append(g if g is not None else _unreadable(i))
         return out
     except Exception:
         return []
+
+
+def gpus() -> "list[dict]":
+    """Every GPU the driver reports that NVML can read, in NVML (PCI bus)
+    order; [] when NVML is unavailable or reads nothing. For display: the
+    list POSITION is not a CUDA index (cuda_gpus() is). Never raises."""
+    return [g for g in _slots() if not g.get("unreadable")]
 
 
 def cuda_gpus(env=None) -> "list[dict] | None":
@@ -219,7 +243,7 @@ def cuda_gpus(env=None) -> "list[dict] | None":
         env = os.environ if env is None else env
         if not available():
             return None
-        all_gpus = gpus()
+        all_gpus = _slots()    # unreadable GPUs keep their place
         order = str(env.get("CUDA_DEVICE_ORDER", "") or "").strip().upper()
         pci_order = order == "PCI_BUS_ID" or len(all_gpus) <= 1
         vis = env.get("CUDA_VISIBLE_DEVICES")
@@ -267,10 +291,11 @@ def cuda_gpu(index, env=None) -> "dict | None":
 
 
 def cuda_memory_mb(index, env=None) -> "tuple[int, int] | None":
-    """(free_mb, total_mb) of ``cuda:index``, or None when unknown. Never
-    raises, never creates a CUDA context."""
+    """(free_mb, total_mb) of ``cuda:index``, or None when unknown (no such
+    GPU, or NVML cannot read it). Never raises, never creates a CUDA
+    context."""
     g = cuda_gpu(index, env)
-    if g is None:
+    if g is None or g.get("unreadable"):
         return None
     try:
         return int(g["free_mb"]), int(g["total_mb"])
@@ -303,7 +328,14 @@ def find(spec, env=None) -> "tuple[int, dict] | None":
         if low.startswith("gpu-") or low.startswith("mig-"):
             hits = [(i, g) for i, g in enumerate(lst)
                     if str(g.get("uuid", "")).lower().startswith(low)]
-            return hits[0] if len(hits) == 1 else None
+            if len(hits) != 1:
+                return None
+            # A SHORT prefix might also be an unreadable GPU's: unknown. A
+            # whole UUID ("GPU-" + 36) that matched a readable GPU is that
+            # GPU, whatever else cannot be read.
+            if len(low) < 40 and any(g.get("unreadable") for g in lst):
+                return None
+            return hits[0]
         for i, g in enumerate(lst):
             if low in str(g.get("name", "")).lower():
                 return i, g
@@ -326,6 +358,8 @@ def describe(gpu, cuda_index=None) -> str:
         if uuid:
             extra.append(uuid[:12])
         tail = f" ({', '.join(extra)})" if extra else ""
+        if gpu.get("unreadable") or gpu.get("free_mb") is None:
+            return f"{where}{gpu.get('name') or 'GPU'}{tail} unreadable"
         return (f"{where}{gpu.get('name') or 'GPU'}{tail} "
                 f"{int(gpu.get('free_mb', 0))}/{int(gpu.get('total_mb', 0))}"
                 f" MB free")

@@ -247,16 +247,35 @@ def _try_import_librosa():
         return None
 
 
-def _cuda_free_vram_mb() -> "float | None":
-    """Best-effort free-VRAM probe for the opt-in GPU whisper path (cuda:0,
-    the card it loads on). Returns free MiB, or None when it can't be
-    determined — the caller treats None as 'no headroom' and stays on CPU
-    (fail-safe). NVML through core/gpu_probe (no CUDA context; 2026-10-04 —
-    the pynvml package this used is not installed, so it always answered
-    None and the opt-in was dead)."""
+def _gpu_index() -> "int | None":
+    """The CUDA index of the card the opt-in GPU path may load on: the listen
+    card (LISTEN_GPU through core/listen_devices — the 1650 here), never
+    cuda:0 by default. cuda:0 is the RTX 3090 that holds the local brain;
+    this path used to load there, dead only because its pynvml probe was
+    not installed (review 2026-10-04: a working probe revived it). None =
+    no listen card (the caller stays on the CPU). Never raises."""
+    try:
+        from core import listen_devices as _ld
+        try:
+            from core import config as _cfg
+            lg = getattr(_cfg, "LISTEN_GPU", _ld.DEFAULT_LISTEN_GPU)
+        except Exception:
+            lg = _ld.DEFAULT_LISTEN_GPU
+        return _ld.resolve_target("listen", listen_gpu=lg).index
+    except Exception:
+        return None
+
+
+def _cuda_free_vram_mb(index: int) -> "float | None":
+    """Best-effort free-VRAM probe of ``cuda:index`` for the opt-in GPU
+    whisper path. Returns free MiB, or None when it can't be determined —
+    the caller treats None as 'no headroom' and stays on CPU (fail-safe).
+    NVML through core/gpu_probe (no CUDA context; 2026-10-04 — the pynvml
+    package this used is not installed, so it always answered None and the
+    opt-in was dead)."""
     try:
         from core import gpu_probe as _gp
-        mem = _gp.cuda_memory_mb(0)
+        mem = _gp.cuda_memory_mb(int(index))
         return None if mem is None else float(mem[0])
     except Exception:
         return None
@@ -291,6 +310,7 @@ def _ensure_whisper_tiny():
     True in core/config — then we try CUDA first and fall back to CPU/int8 if
     the GPU path fails. (The 2026-05-30 GPU audit had flipped this to CUDA-first
     unconditionally; gated back behind the flag after the VRAM-pressure crash.)
+    The card is the listen card (_gpu_index; 2026-10-04), not cuda:0.
     """
     if _whisper_model[0] is not None:
         return _whisper_model[0]
@@ -308,22 +328,27 @@ def _ensure_whisper_tiny():
             # JARVIS (sibling of the main-STT crash). Gate the opt-in GPU path
             # behind a free-VRAM preflight and pin device_index + int8 (tiny
             # model, not latency-critical) so the memory bite stays minimal.
-            free_mb = _cuda_free_vram_mb()
+            idx = _gpu_index()
+            free_mb = None if idx is None else _cuda_free_vram_mb(idx)
             if free_mb is not None and free_mb >= _GPU_MIN_FREE_VRAM_MB:
                 try:
                     _whisper_model[0] = _FWM(model_name, device="cuda",
-                                             device_index=0, compute_type="int8")
+                                             device_index=idx,
+                                             compute_type="int8")
                     print(f"  [standby-loop] faster-whisper '{model_name}' ready "
-                          f"on cuda:0 int8 ({int(free_mb)} MiB free)")
+                          f"on cuda:{idx} int8 ({int(free_mb)} MiB free)")
                     return _whisper_model[0]
                 except Exception as e_gpu:
                     print(f"  [standby-loop] faster-whisper cuda load failed "
                           f"({type(e_gpu).__name__}); falling back to cpu/int8")
+            elif idx is None:
+                print("  [standby-loop] skipping GPU whisper — no listen card "
+                      "(LISTEN_GPU); using cpu/int8")
             else:
                 got = "unknown" if free_mb is None else f"{int(free_mb)} MiB"
                 print(f"  [standby-loop] skipping GPU whisper — insufficient free "
-                      f"VRAM ({got} < {int(_GPU_MIN_FREE_VRAM_MB)} MiB); "
-                      "using cpu/int8")
+                      f"VRAM on cuda:{idx} ({got} < "
+                      f"{int(_GPU_MIN_FREE_VRAM_MB)} MiB); using cpu/int8")
         # CPU path — int8 keeps it light on the desk CPU. This is the DEFAULT
         # (STANDBY_WHISPER_PREFER_GPU is False) so VRAM stays free for the LLM.
         try:

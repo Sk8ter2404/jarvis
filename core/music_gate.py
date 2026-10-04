@@ -36,20 +36,35 @@ from the spectral detector) AND a line needs the wake word right now (standby
      rescues. The voice hint is generous on purpose: lyrics passed its 0.45
      floor on about half the batches of 10-04, so it costs savings, never a
      turn; the text hint does most of the filtering.
-  3. An owner capture is cut at MUSIC_MAX_CAPTURE_S (10 s) instead of 30.
-     Owner turns 10-01..10-04: 101 of 102 clips were under 8.1 s.
+
+A capture is NEVER cut short over music (review 2026-10-04). The microphone
+stream is opened per capture, so nothing is recorded between the end of one
+capture and the next "Recording…": over music that deaf gap measured a median
+5-6 s after a 30 s capture whose rescue ran (n=46 / 26, the 13:49 and 13:09
+sessions of 10-04) and ~2 s when no rescue ran (n=10 / 6): ~14 % of the
+time deaf today (5 s per 35), 6-10 % with 'on' skipping the rescue on lyrics
+(it still rescues the ~half its voice hint passes). A 10 s cap would put a
+gap after every 10 s instead of every 30 s — 17-26 % of the time deaf — and
+split a command at three times as many boundaries ("Jarvis, pause the
+music", 10-04 13:21, was spoken ~12-15 s into its capture: past a 10 s cut).
+Skipping the rescue is what shortens the gap; a shorter capture needs a
+gap-free capture first.
 
 Wake-word detection (Parakeet on every capture, the rescue with a hint) and
 owner-voice detection (the media gate and the room-talk check on the main
 loop's captures) keep running; only transcription of music stops.
 
-'shadow' changes nothing: each decision is computed and counted ("would
-skip"), and a decision that would have LOST something is logged — a skipped
-rescue whose Whisper text would have passed the wake gates — or counted —
-the ambient lines 'on' would not have transcribed, those with the wake word
-and those voice-ID named as an enrolled speaker apart. Turn it 'on' once a
-week of shadow minutes shows "lost: rescues 0". Every minute that had music
-logs one counter line.
+'shadow' changes nothing — not even the main loop's time: the rescue runs as
+always and the voice is NOT asked before it; only a rescue that made a line
+the wake gates pass is voice-checked afterwards (the same check the media
+gate of that turn then reuses from the memo). A rescue without a wake hint
+counts as "would skip" — an upper bound, since 'on' still rescues the ones
+in the owner's voice — and one whose line passed the wake gates in a voice
+that is not the owner's would have been LOST, and is logged. Ambient lines
+'on' would not have transcribed are counted, those with the wake word and
+those voice-ID named as an enrolled speaker apart. Turn it 'on' once a week
+of shadow minutes shows "lost: rescues 0". Every minute that had music logs
+one counter line.
 
 Pure policy and counters, stdlib only. The monolith owns the live inputs
 (meters, voice-ID, gates) and calls these with plain values.
@@ -63,7 +78,6 @@ import time
 
 MODES = ("off", "shadow", "on")
 DEFAULT_MODE = "shadow"
-DEFAULT_MAX_CAPTURE_S = 10.0
 WAKE_WORD = "jarvis"
 HINT_WORDS = 3            # the wake word may sit at word 1-3 (core/wake_prefix)
 HINT_MIN_RATIO = 0.6      # difflib ratio to "jarvis" that counts as a hint
@@ -119,20 +133,40 @@ def _gated(mode: str) -> str:
 
 def rescue_decision(mode, music, why, text, voice_fn) -> str:
     """Parakeet's rescue for one capture: '' = rescue as today, 'skip' (mode
-    'on'), 'shadow' (would skip; rescue anyway). ``voice_fn()`` -> a voice
-    verdict, asked only when the text gives no hint. Any error rescues."""
+    'on'), 'shadow' (no wake hint; rescue anyway). ``voice_fn()`` -> a voice
+    verdict, asked only in 'on' and only when the text gives no hint.
+    'shadow' never asks it here: the rescue runs either way, so the caller
+    asks the voice AFTER the rescue, and only for a line that matters
+    (shadow_lost). Any error rescues."""
     try:
         mode = mode_setting(mode)
         if mode == "off" or not music or why not in ("empty", "no-wake"):
             return ""
         if wake_hint(text):
             return ""
+        if mode == "shadow":
+            return "shadow"
         voice = voice_fn() if callable(voice_fn) else UNAVAILABLE
         if voice in (OWNER, UNSURE, UNAVAILABLE):
             return ""
-        return _gated(mode)
+        return "skip"
     except Exception:
         return ""
+
+
+def shadow_lost(line_passes, voice_fn) -> bool:
+    """Shadow, after a rescue 'on' might have skipped: would 'on' have LOST
+    its line? Only when the line passes the wake gates (``line_passes``)
+    AND the voice is not the owner's ('on' rescues on OWNER, UNSURE and
+    UNAVAILABLE). ``voice_fn`` is asked only for such a line. Any error =
+    not lost (this only counts; nothing is dropped)."""
+    try:
+        if not line_passes:
+            return False
+        voice = voice_fn() if callable(voice_fn) else UNAVAILABLE
+        return voice not in (OWNER, UNSURE, UNAVAILABLE)
+    except Exception:
+        return False
 
 
 def ambient_decision(mode, music) -> str:
@@ -153,20 +187,6 @@ def ambient_decision(mode, music) -> str:
         return ""
 
 
-def capture_decision(mode, music, recorded_s, cap_s) -> str:
-    """An owner capture that has run ``recorded_s`` of audio: '' = keep
-    recording, 'cut' (mode 'on'), 'shadow' (would cut). Never raises."""
-    try:
-        mode = mode_setting(mode)
-        if mode == "off" or not music:
-            return ""
-        if float(recorded_s) <= float(cap_s):
-            return ""
-        return "cut" if mode == "on" else "shadow"
-    except Exception:
-        return ""
-
-
 class MinuteCounter:
     """What the listening lane did in each minute that had music, as ONE log
     line per such minute (numbers only, never words). Thread-safe; any
@@ -174,8 +194,8 @@ class MinuteCounter:
 
     KINDS = ("whisper_turn", "whisper_ambient", "whisper_other", "rescue",
              "retry", "parakeet", "voice_id",
-             "skip_ambient", "skip_rescue", "skip_capture",
-             "would_ambient", "would_rescue", "would_capture",
+             "skip_ambient", "skip_rescue",
+             "would_ambient", "would_rescue",
              "lost_rescue", "lost_ambient", "lost_ambient_wake",
              "lost_ambient_named")
 
@@ -244,11 +264,13 @@ class MinuteCounter:
                 f"{c['parakeet']}, voice-ID {c['voice_id']}")
         if mode == "on":
             line += (f"; skipped: ambient {c['skip_ambient']}, rescues "
-                     f"{c['skip_rescue']}, captures cut {c['skip_capture']}")
+                     f"{c['skip_rescue']}")
         elif mode == "shadow":
+            # rescues "<=": the voice is asked only after a rescue that made
+            # a wake line (rescue_decision / shadow_lost), so this counts
+            # every rescue without a wake hint.
             line += (f"; would skip: ambient {c['would_ambient']}, rescues "
-                     f"{c['would_rescue']}, captures cut "
-                     f"{c['would_capture']}; lost: rescues "
+                     f"<={c['would_rescue']}; lost: rescues "
                      f"{c['lost_rescue']}, ambient lines "
                      f"{c['lost_ambient']} (wake word in "
                      f"{c['lost_ambient_wake']}, voice-ID named "

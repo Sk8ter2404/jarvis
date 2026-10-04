@@ -482,6 +482,52 @@ class PrimaryTests(unittest.TestCase):
         self.assertEqual(log2, [])
 
 
+class PrimaryMusicGateTests(unittest.TestCase):
+    """Primary's music-gate hooks (core/music_gate.py, 2026-10-04): 'skip'
+    keeps Parakeet's text, 'shadow' rescues and then tells shadow() what
+    Whisper made of THIS capture, and a gate that raises RESCUES — a slower
+    turn, never a lost one (review 2026-10-04: no test pinned that)."""
+    AUDIO = np.zeros(16000, np.float32)
+
+    def _p(self, gate, shadow=None):
+        notes, log = [], []
+        w = _Whisper()
+        p = sp.Primary(lambda a: ("la la la", {}), w, latch=sp.Latch(),
+                       rescue=lambda t, a: "no-wake", note=notes.append,
+                       log=log.append, gate=gate, shadow=shadow)
+        return p, w, notes
+
+    def test_a_raising_gate_rescues(self):
+        def boom(text, audio, why):
+            raise RuntimeError("meter")
+        p, w, notes = self._p(boom)
+        self.assertEqual(p.run(self.AUDIO), w.res)
+        self.assertEqual((len(w.calls), p.gated), (1, 0))
+        self.assertEqual(notes, ["parakeet-rescued"])
+
+    def test_skip_keeps_parakeets_text(self):
+        p, w, notes = self._p(lambda t, a, why: "skip")
+        self.assertEqual(p.run(self.AUDIO)[0], "la la la")
+        self.assertEqual((len(w.calls), p.gated, p.rescues), (0, 1, 0))
+        self.assertEqual(notes, ["parakeet-gated"])
+
+    def test_shadow_rescues_and_hands_over_the_capture(self):
+        seen = []
+        p, w, _notes = self._p(lambda t, a, why: "shadow",
+                               shadow=lambda why, res, audio:
+                               seen.append((why, res, audio)))
+        self.assertEqual(p.run(self.AUDIO), w.res)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][:2], ("no-wake", w.res))
+        self.assertIs(seen[0][2], self.AUDIO)
+
+    def test_a_raising_shadow_still_returns_the_rescue(self):
+        def boom(why, res, audio):
+            raise RuntimeError("count")
+        p, w, _notes = self._p(lambda t, a, why: "shadow", shadow=boom)
+        self.assertEqual(p.run(self.AUDIO), w.res)
+
+
 # ── the shadow worker ─────────────────────────────────────────────────────
 def _judge(text, conf, peak, ctx):
     return {"gates_passed": bool(text), "wake_prefix": _prefix(text)}

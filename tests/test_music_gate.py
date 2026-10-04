@@ -11,8 +11,13 @@ CPU-s a minute on lyrics.
 Pinned here:
   * music mode = audio playing AND only a wake-word line gets through;
   * the wake hint ("Jarvis"-like word in the first three) and that the
-    voice is asked only when the text gives no hint;
-  * the rescue / ambient / capture decisions for off, shadow and on;
+    voice is asked only in 'on' and only when the text gives no hint —
+    'shadow' asks it only AFTER a rescue that made a wake line
+    (shadow_lost; review 2026-10-04: asking before the rescue cost the main
+    loop 18-64 ms a music capture for a rescue that runs anyway);
+  * the rescue / ambient decisions for off, shadow and on — and that the
+    gate has NO capture cut (review 2026-10-04: nothing is recorded between
+    captures, so a 10 s cut tripled the deaf gaps over music);
   * one counter line per minute WITH music, numbers only.
 
     python -m unittest tests.test_music_gate
@@ -91,10 +96,15 @@ class RescueTests(unittest.TestCase):
             self._voice(mg.NOT_OWNER)), "")
         self.assertEqual(self.asked, 0)
 
-    def test_shadow_only_says_it_would(self):
+    def test_shadow_only_says_it_would_and_never_asks_the_voice(self):
+        for who in (mg.NOT_OWNER, mg.OWNER):
+            self.assertEqual(mg.rescue_decision(
+                "shadow", True, "no-wake", "la", self._voice(who)),
+                "shadow")
+        self.assertEqual(self.asked, 0)
         self.assertEqual(mg.rescue_decision(
-            "shadow", True, "no-wake", "la", self._voice(mg.NOT_OWNER)),
-            "shadow")
+            "shadow", True, "no-wake", "Travis, hi",
+            self._voice(mg.NOT_OWNER)), "")
 
     def test_errors_rescue(self):
         def boom():
@@ -103,7 +113,41 @@ class RescueTests(unittest.TestCase):
                                             boom), "")
 
 
-class AmbientAndCaptureTests(unittest.TestCase):
+class ShadowLostTests(unittest.TestCase):
+    """After a shadow rescue: lost = its line passes the wake gates AND
+    the voice is not the owner's ('on' rescues OWNER / UNSURE /
+    UNAVAILABLE). The voice is asked only for a passing line."""
+
+    def setUp(self):
+        self.asked = 0
+
+    def _voice(self, verdict):
+        def fn():
+            self.asked += 1
+            if isinstance(verdict, Exception):
+                raise verdict
+            return verdict
+        return fn
+
+    def test_a_line_that_fails_the_wake_gates_is_never_lost(self):
+        self.assertFalse(mg.shadow_lost(False, self._voice(mg.NOT_OWNER)))
+        self.assertEqual(self.asked, 0)
+
+    def test_a_wake_line_in_another_voice_is_lost(self):
+        self.assertTrue(mg.shadow_lost(True, self._voice(mg.NOT_OWNER)))
+        self.assertEqual(self.asked, 1)
+
+    def test_on_would_have_rescued_the_owner(self):
+        for who in (mg.OWNER, mg.UNSURE, mg.UNAVAILABLE):
+            self.assertFalse(mg.shadow_lost(True, self._voice(who)), who)
+        self.assertFalse(mg.shadow_lost(True, None))        # unavailable
+
+    def test_errors_count_nothing(self):
+        self.assertFalse(mg.shadow_lost(True,
+                                        self._voice(RuntimeError("x"))))
+
+
+class AmbientTests(unittest.TestCase):
     def test_ambient(self):
         # Over music no ambient batch is transcribed in 'on' — voice-ID
         # cannot pick the owner out of music (10-04: half the lyric batches
@@ -114,14 +158,12 @@ class AmbientAndCaptureTests(unittest.TestCase):
         self.assertEqual(mg.ambient_decision("off", True), "")
         self.assertEqual(mg.ambient_decision("nonsense", True), "")
 
-    def test_capture(self):
-        self.assertEqual(mg.capture_decision("on", True, 10.1, 10.0), "cut")
-        self.assertEqual(mg.capture_decision("on", True, 10.0, 10.0), "")
-        self.assertEqual(mg.capture_decision("shadow", True, 12, 10),
-                         "shadow")
-        self.assertEqual(mg.capture_decision("on", False, 29, 10), "")
-        self.assertEqual(mg.capture_decision("off", True, 29, 10), "")
-        self.assertEqual(mg.capture_decision("on", True, "x", 10), "")
+    def test_there_is_no_capture_cut(self):
+        # Review 2026-10-04: no mode shortens a capture (see the module
+        # docstring); the counter has no "captures cut" either.
+        self.assertFalse(hasattr(mg, "capture_decision"))
+        for kind in mg.MinuteCounter.KINDS:
+            self.assertNotIn("capture", kind)
 
 
 class CounterTests(unittest.TestCase):
@@ -149,8 +191,11 @@ class CounterTests(unittest.TestCase):
         line = self.c.tick("shadow")
         self.assertTrue(line.startswith("[music-gate] shadow: 60 s with music"
                                         " — whisper 21 (ambient 15, turns 6"))
-        self.assertIn("would skip: ambient 15, rescues 5", line)
-        self.assertIn("lost: rescues 1", line)
+        # "<=": shadow asks no voice before a rescue, so every rescue
+        # without a wake hint counts (an upper bound of what 'on' skips).
+        self.assertIn("would skip: ambient 15, rescues <=5; lost: rescues 1",
+                      line)
+        self.assertNotIn("captures cut", line)
         self.assertIsNone(self.c.tick("shadow"))      # a fresh window
 
     def test_on_says_skipped(self):
@@ -158,8 +203,9 @@ class CounterTests(unittest.TestCase):
         self.c.mark_music()
         self.now[0] += 61
         line = self.c.tick("on")
-        self.assertIn("skipped: ambient 14", line)
+        self.assertIn("skipped: ambient 14, rescues 0", line)
         self.assertNotIn("would skip", line)
+        self.assertNotIn("captures cut", line)
 
     def test_unknown_kinds_are_ignored(self):
         self.c.note("nonsense", 4)

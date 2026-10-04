@@ -347,9 +347,9 @@ class Primary:
                                        2026-10-04) on a rescue: '' = rescue,
                                        'skip' = keep Parakeet's text (no
                                        Whisper decode), 'shadow' = rescue,
-                                       then shadow(why, result) is told
-                                       what Whisper made of it. None (the
-                                       default) = every rescue runs.
+                                       then shadow(why, result, audio) is
+                                       told what Whisper made of it. None
+                                       (the default) = every rescue runs.
 
     run() returns what the turn uses. Never raises past whisper(): a
     Parakeet failure latches off (one log line) and Whisper decodes. A
@@ -458,7 +458,7 @@ class Primary:
             res = self._whisper(audio)
             if verdict == "shadow" and self._shadow is not None:
                 try:
-                    self._shadow(why, res)
+                    self._shadow(why, res, audio)
                 except Exception:
                     pass
             return res

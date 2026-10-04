@@ -11,6 +11,11 @@ side effect:
   * ``VoiceEncoder()`` with no device — Resemblyzer picks "cuda" = cuda:0
     (the live 3090 context: born inside the ambient listener's first
     voice-ID, 13:50:56.037).
+  * ``SentenceTransformer(...)`` / ``CrossEncoder(...)`` with no device pick
+    "cuda" = cuda:0 whenever torch has CUDA, and core/rag_indexer's own
+    "auto" did the same for bge-reranker-base (~1.1 GB fp32 + a context, on
+    the first file search — review 2026-10-04). Every such constructor must
+    name its device, and RAG_DEVICE "auto" is the CPU.
 
 Free VRAM is read through core/gpu_probe.py (NVML, no context) and every
 VoiceEncoder is built on an explicit device. This walks the AST of every
@@ -87,6 +92,35 @@ class NoContextProbeTests(unittest.TestCase):
                             for w in found), found)
         self.assertEqual(bare, [], "VoiceEncoder() with no device lands on "
                          "cuda:0 (the brain's 3090) whenever torch has CUDA")
+
+    def test_every_sentence_transformers_model_names_its_device(self):
+        found, bare = [], []
+        for path in _production_files():
+            for call in _calls(path):
+                if _name(call.func) not in ("SentenceTransformer",
+                                            "CrossEncoder"):
+                    continue
+                where = f"{os.path.relpath(path, _PROJECT)}:{call.lineno}"
+                found.append(where)
+                if not any(k.arg == "device" for k in call.keywords):
+                    bare.append(where)
+        # Blindness floor: the walk must SEE both known constructors.
+        norm = [w.replace("\\", "/") for w in found]
+        for rel in ("core/rag_indexer.py", "core/long_term_memory.py"):
+            self.assertTrue(any(w.startswith(rel) for w in norm), (rel, norm))
+        self.assertEqual(bare, [], "a sentence-transformers model with no "
+                         "device lands on cuda:0 (the brain's 3090) "
+                         "whenever torch has CUDA")
+
+    def test_the_rag_reranker_never_picks_a_card_by_itself(self):
+        import sys
+        import types
+        from unittest import mock
+        from core import rag_indexer as rag
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(is_available=lambda: True)
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}),                 mock.patch.object(rag, "RAG_DEVICE", "auto"):
+            self.assertEqual(rag._device(), "cpu")
 
     def test_the_probes_go_through_gpu_probe(self):
         # The four former mem_get_info / pynvml sites each name gpu_probe.

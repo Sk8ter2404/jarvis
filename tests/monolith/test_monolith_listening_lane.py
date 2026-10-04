@@ -23,9 +23,13 @@ music"; each test that needs music says so):
     R6 shipped, byte for byte), a card only when it is there with room and a
     GPU runtime, else the CPU with ONE "[listen]" line;
   * the music gate: 'off' reads nothing; 'shadow' changes nothing but counts
-    (and logs a rescue it would have lost); 'on' skips the rescue without a
-    wake hint or the owner's voice, skips ambient batches that are not the
-    owner's voice, cuts an owner capture at MUSIC_MAX_CAPTURE_S;
+    (and logs a rescue it would have lost) — it asks no voice before a
+    rescue, only after one that made a wake line; 'on' skips the rescue
+    without a wake hint or the owner's voice and skips ambient batches; a
+    gate error rescues; NO mode cuts a capture short (review 2026-10-04:
+    nothing is recorded between captures, so a 10 s cut over music tripled
+    the deaf gaps; "Jarvis, pause the music" at 10-04 13:21 was spoken
+    ~12-15 s into its capture);
   * one "[music-gate]" line per minute with music; one "[listen] devices:"
     line at boot.
 
@@ -392,8 +396,16 @@ class RescueGateTests(_Base):
         bc = self.bc
         self._p(bc, "_parakeet_decode", return_value=(
             parakeet_text, {"no_speech_prob": 0.0, "avg_logprob": -0.4}))
+        self.order = []
+        self.whisper.side_effect = (
+            lambda *a, **k: self.order.append("whisper")
+            or self.whisper.return_value)
+
+        def _voice(*_a, **_k):
+            self.order.append("voice")
+            return voice
         self.voice = self._p(bc, "_capture_voice_verdict",
-                             return_value=voice, create=True)
+                             side_effect=_voice, create=True)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             res = bc._transcribe_capture(self.audio)
@@ -447,6 +459,10 @@ class RescueGateTests(_Base):
         res, out = self._run("la la la")
         self.whisper.assert_called_once()
         self.assertEqual(res[0], self.W_TEXT)
+        # The voice is asked AFTER the rescue, for the wake line it made.
+        self.assertEqual(self.order, ["whisper", "voice"])
+        self.assertEqual(self.voice.call_count, 1)
+        self.assertEqual(len(self.voice.call_args.args[0]), len(self.audio))
         c = self._counts()
         self.assertEqual((c["rescue"], c["would_rescue"], c["lost_rescue"]),
                          (1, 1, 1))
@@ -455,17 +471,55 @@ class RescueGateTests(_Base):
                       f"({len(self.W_TEXT)} chars)", out)
         self.assertNotIn("what's new", out)               # never the words
 
-    def test_shadow_lyrics_lose_nothing(self):
+    def test_shadow_lyrics_lose_nothing_and_ask_no_voice(self):
+        # Review 2026-10-04: shadow used to voice-ID every lyric capture on
+        # the main loop BEFORE its rescue (18-64 ms on 24 CPU threads, up to
+        # ~100 ms) — time added to the deaf gap between captures for a
+        # rescue that runs anyway. Lyrics never reach the voice now.
         self._mode("shadow")
         self._music()
         self.whisper.return_value = ("baby baby oh", {"no_speech_prob": 0.0,
                                                       "avg_logprob": -0.3})
         _res, out = self._run("la la la")
+        self.whisper.assert_called_once()
+        self.voice.assert_not_called()
         self.assertEqual(self._counts()["lost_rescue"], 0)
+        self.assertEqual(self._counts()["would_rescue"], 1)  # upper bound
         self.assertNotIn("would have lost", out)
+
+    def test_shadow_a_wake_line_in_the_owners_voice_is_not_lost(self):
+        # 'on' would have rescued it on the voice hint.
+        self._mode("shadow")
+        self._music()
+        for voice in ("owner", "unsure", "unavailable"):
+            _res, out = self._run("la la la", voice=voice)
+            self.assertEqual(self.order, ["whisper", "voice"], voice)
+            self.assertNotIn("would have lost", out)
+        self.assertEqual(self._counts()["lost_rescue"], 0)
+
+    def test_a_gate_error_rescues(self):
+        # Review 2026-10-04 (M5): the fail-open contract had no test.
+        self._mode("on")
+        self._music()
+        self._p(self.bc._music_gate, "rescue_decision",
+                side_effect=RuntimeError("policy"))
+        res, _out = self._run("la la la")
+        self.whisper.assert_called_once()
+        self.assertEqual(res[0], self.W_TEXT)
+        self.assertEqual(self.bc._music_gate_rescue("la", self.audio,
+                                                    "no-wake"), "")
 
 
 class CaptureVoiceMemoTests(_Base):
+    def test_a_failing_voice_check_is_unavailable(self):
+        # Review 2026-10-04 (M8): UNAVAILABLE rescues ('on' fails open);
+        # NOT_OWNER here would skip the owner's rescue on an error.
+        self._p(self.bc, "_owner_voice_over_media",
+                side_effect=RuntimeError("resemblyzer"))
+        self.assertEqual(
+            self.bc._capture_voice_verdict(np.zeros(16000, np.float32)),
+            self.bc._learn_gate_mod.UNAVAILABLE)
+
     def test_the_rescue_check_is_reused_by_the_media_gate(self):
         bc = self.bc
         import core.voice_id as vid
@@ -531,9 +585,15 @@ class AmbientGateTests(_Base):
         self.ident.assert_not_called()
 
 
-class CaptureCutTests(_Base):
+class NoCaptureCutTests(_Base):
     """The REAL record_speech over a fake mic (the harness of
-    tests/test_speculative_stt): 15 s of loud audio, then silence."""
+    tests/test_speculative_stt): 15 s of loud audio, then silence. No music
+    gate mode shortens a capture (review 2026-10-04): the stream is opened
+    per capture, so nothing is recorded between captures — a deaf gap of a
+    median 5-6 s after a lyric capture whose rescue ran, ~2 s without one —
+    and a 10 s cap over music put one after every 10 s instead of every 30
+    s. "Jarvis, pause the music" (10-04 13:21) was spoken ~12-15 s into its
+    capture: past a 10 s cut."""
 
     def _capture(self, seconds=15.0):
         from tests import test_speculative_stt as _spec
@@ -544,39 +604,31 @@ class CaptureCutTests(_Base):
                 self, [0.05] * n, tail_silence=30)
         return audio, out.getvalue()
 
-    def test_on_over_music_stops_at_the_cap(self):
+    def test_on_over_music_records_the_whole_capture(self):
         self._mode("on")
-        self._music()
-        self._p(self.bc, "MUSIC_MAX_CAPTURE_S", 10.0, create=True)
-        audio, out = self._capture()
-        secs = len(audio) / 16000.0
-        self.assertGreater(secs, 10.0)
-        self.assertLess(secs, 11.5)                  # cap + the pre-roll
-        self.assertIn("[music-gate] music playing — capture stopped at 10s",
-                      out)
-        self.assertEqual(self._counts()["skip_capture"], 1)
-
-    def test_shadow_records_it_all_and_counts(self):
-        self._mode("shadow")
         self._music()
         audio, out = self._capture()
         self.assertGreater(len(audio) / 16000.0, 15.0)
         self.assertNotIn("capture stopped", out)
-        self.assertEqual(self._counts()["would_capture"], 1)
 
-    def test_on_without_music_records_it_all(self):
-        self._mode("on")
-        self._music(on=False)
-        audio, _out = self._capture()
-        self.assertGreater(len(audio) / 16000.0, 15.0)
+    def test_record_speech_never_asks_the_music_gate(self):
+        # Code, not comments: no name record_speech uses is the gate's.
+        tree = ast.parse(inspect.getsource(self.bc.record_speech))
+        names = sorted({n.id for n in ast.walk(tree)
+                        if isinstance(n, ast.Name)
+                        and n.id.startswith("_music")})
+        self.assertEqual(names, [])
 
-    def test_off_never_asks(self):
-        self._mode("off")
-        read = self._p(self.bc, "_music_read_state",
-                       side_effect=AssertionError("read the meter"))
-        audio, _out = self._capture()
-        self.assertGreater(len(audio) / 16000.0, 15.0)
-        read.assert_not_called()
+
+class WhisperPlanUnknownTests(_Base):
+    def test_an_unreadable_card_keeps_whisper_on_it(self):
+        # Review 2026-10-04 (M11): NVML unable to read the card is "unknown",
+        # not "full" — int8 on the card, the existing load fallback behind
+        # it; never a silent move to the CPU.
+        self._p(self.bc._gpu_probe, "cuda_memory_mb", return_value=None)
+        compute, fallback, why = self.bc._whisper_cuda_plan(1)
+        self.assertEqual((compute, fallback), ("int8", False))
+        self.assertIn("VRAM probe unavailable", why)
 
 
 class MinuteLineTests(_Base):

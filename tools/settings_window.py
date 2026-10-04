@@ -885,8 +885,9 @@ SCHEMA: dict[str, dict] = {
         "help": "The card 'listen' means for the hearing models: cuda:N, a "
                 "GPU UUID (GPU-..., shown on the '[listen] devices:' line at "
                 "start; the first few characters will do) or part of its "
-                "name (1650). Empty = no listen card. Applies on the next "
-                "start.",
+                "name (1650). cuda:N is a position, not a card: a card added "
+                "on a lower PCI bus takes it, so name the card to pin it. "
+                "Empty = no listen card. Applies on the next start.",
     },
     "LISTEN_GPU_RESERVE_MB": {
         "tab": "hearing", "label": "Free VRAM a hearing model must leave (MB)",
@@ -925,18 +926,10 @@ SCHEMA: dict[str, dict] = {
         "choices": ["off", "shadow", "on"], "default": "shadow",
         "help": "While music plays and he needs 'JARVIS' to answer: on = "
                 "song lyrics are not transcribed (every recording is still "
-                "checked for your wake word and your voice) and each "
-                "recording stops at the length below; shadow = no change, "
-                "but a once-a-minute log line shows what 'on' would skip and "
-                "whether it would have missed you; off = no change, no line. "
-                "Applies on the next start.",
-    },
-    "MUSIC_MAX_CAPTURE_S": {
-        "tab": "hearing", "label": "Longest recording over music (seconds)",
-        "type": "float", "default": 10.0, "min": 3, "max": 30,
-        "help": "With the setting above on: over music a recording never "
-                "goes quiet, so it used to run the full 30 s. Applies on the "
-                "next start.",
+                "checked for your wake word and your voice); shadow = no "
+                "change, but a once-a-minute log line shows what 'on' would "
+                "skip and whether it would have missed you; off = no change, "
+                "no line. Applies on the next start.",
     },
     "WHISPER_MODEL_CUDA": {
         "tab": "hearing", "label": "Whisper GPU model", "type": "str",
@@ -2035,7 +2028,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                                 "PARAKEET_DEVICE", "SMART_TURN_DEVICE",
                                 "VOICE_ID_DEVICE", "LISTEN_GPU",
                                 "LISTEN_GPU_RESERVE_MB"]),
-        ("Music", ["MUSIC_GATE_MODE", "MUSIC_MAX_CAPTURE_S"]),
+        ("Music", ["MUSIC_GATE_MODE"]),
         ("What he ignores", ["SELF_ECHO_FILTER_ENABLED", "SELF_ECHO_WINDOW_S",
                              "SELF_ECHO_TAIL_S", "NOISE_FILTER_ENABLED",
                              "DEVICE_SPEECH_FILTER_ENABLED",

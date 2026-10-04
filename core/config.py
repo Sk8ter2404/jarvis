@@ -853,8 +853,10 @@ NOISE_FILTER_ENABLED = True
 # 'cpu' forces the legacy path. large-v3-turbo on the 3090 runs ~15× real-time
 # at near-identical accuracy to large-v3. 'listen' = the listen card
 # (LISTEN_GPU below). bobert_companion numbers GPUs by PCI bus
-# (CUDA_DEVICE_ORDER=PCI_BUS_ID), so 'cuda:1' keeps meaning the same card when
-# another one is added in a slot after it.
+# (CUDA_DEVICE_ORDER=PCI_BUS_ID, NVML's order). An index is NOT an identity: a
+# card added on a LOWER bus number than the 1650 (bus 8 here — any CPU-attached
+# slot) takes 'cuda:1' and the 1650 becomes 'cuda:2'. To keep a model on the
+# 1650 whatever is added, use 'listen' with LISTEN_GPU = its UUID or '1650'.
 WHISPER_DEVICE      = "auto"            # "auto" | "cuda" | "cuda:N" | "cpu" | "listen"
 WHISPER_MODEL_CUDA  = "large-v3-turbo"  # ~3.1 GB VRAM, 8x faster than large-v3
 WHISPER_MODEL_CPU   = "small"           # CPU-friendly default when no GPU
@@ -917,8 +919,10 @@ STT_REPLACEMENTS_PARAKEET: dict = {}
 #   up to 441 MB beside the brain).
 # LISTEN_GPU: which card 'listen' means — 'cuda:N', a GPU UUID ('GPU-...',
 #   printed on the boot "[listen] devices:" line; a unique prefix will do) or
-#   a piece of its name ('1650'); '' = no listen card. When a second RTX 3090
-#   arrives, set this to its UUID to move every 'listen' model there.
+#   a piece of its name ('1650'); '' = no listen card. 'cuda:1' is an index,
+#   not a card: a card added on a lower PCI bus takes it. Name the card (its
+#   UUID) to pin it. When a second RTX 3090 arrives, set this to its UUID to
+#   move every 'listen' model there.
 # All apply on the next start.
 LISTEN_GPU                 = "cuda:1"
 LISTEN_GPU_RESERVE_MB      = 512
@@ -935,14 +939,15 @@ VOICE_ID_DEVICE            = "cpu"
 #   'shadow' (default) today's behaviour, plus one "[music-gate]" counter
 #            line per minute with music: what 'on' would have skipped and
 #            whether any of it would have been an owner turn ("lost");
-#   'on'     over music: the ambient listener transcribes nothing,
+#   'on'     over music: the ambient listener transcribes nothing, and
 #            Parakeet's rescue runs only with a "Jarvis"-like word or the
-#            owner's voice behind it, and an owner capture stops at
-#            MUSIC_MAX_CAPTURE_S seconds.
+#            owner's voice behind it (which also shortens the deaf gap
+#            between captures: ~2 s instead of 5-6 s after a lyric capture).
 # Wake-word and owner-voice detection (Parakeet on every capture, the media
-# gate's voice check) keep running in every mode.
+# gate's voice check) keep running in every mode. No mode shortens a capture:
+# nothing is recorded between captures, so more, shorter captures over music
+# would mean more deaf gaps (core/music_gate.py).
 MUSIC_GATE_MODE            = "shadow"
-MUSIC_MAX_CAPTURE_S        = 10.0
 
 # Per-install speech-filter tuning. The Whisper gate thresholds depend on the
 # MICROPHONE, so an install whose mic differs from the desktop's overrides them
@@ -2399,7 +2404,8 @@ STANDBY_LOOP_WHISPER_MODEL        = "tiny"  # whisper model name (kept small for
 # few hundred MB and has contributed to an OOM crash. Left False, the loop loads
 # on CPU (int8 — whisper-tiny is cheap there). Set True only when there's VRAM
 # headroom to opt back into the faster CUDA-first path (float16, frees a CPU
-# core), which falls back to CPU/int8 if the GPU load fails.
+# core), which falls back to CPU/int8 if the GPU load fails. The card is the
+# listen card (LISTEN_GPU), never cuda:0 = the brain's 3090 (2026-10-04).
 STANDBY_WHISPER_PREFER_GPU        = False
 
 

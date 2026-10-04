@@ -596,10 +596,21 @@ class AvailabilityTests(_RagBase):
         rag.RAG_DEVICE = "cuda"
         self.assertEqual(rag._device(), "cuda")
 
-    def test_device_auto_prefers_cuda_when_available(self):
+    def test_device_auto_is_the_cpu_even_with_cuda(self):
+        # 2026-10-04: "auto" used to be "cuda" whenever torch had CUDA =
+        # cuda:0, the RTX 3090 that holds the local brain with ~1.1 GB free;
+        # bge-reranker-base is ~1.1 GB fp32 plus a CUDA context. A card only
+        # when RAG_DEVICE names one.
         rag.RAG_DEVICE = "auto"
         with mock.patch.dict(sys.modules, {"torch": _make_fake_torch(cuda_available=True)}):
-            self.assertEqual(rag._device(), "cuda")
+            self.assertEqual(rag._device(), "cpu")
+
+    def test_device_explicit_card(self):
+        for dev in ("cuda:1", "CUDA:1 "):
+            rag.RAG_DEVICE = dev
+            self.assertEqual(rag._device(), "cuda:1")
+        rag.RAG_DEVICE = "nonsense"
+        self.assertEqual(rag._device(), "cpu")
 
     def test_device_auto_falls_back_to_cpu(self):
         rag.RAG_DEVICE = "auto"
@@ -869,6 +880,24 @@ class GetRerankerTests(_RagBase):
         with mock.patch.dict(sys.modules, {"sentence_transformers": st}):
             self.assertIs(rag._get_reranker(), cpu_marker)
         self.assertEqual(attempts["n"], 2)
+
+    def test_a_named_card_that_fails_falls_back_to_cpu(self):
+        rag.RAG_RERANKER_MODEL = "some/model"
+        rag.RAG_DEVICE = "cuda:1"
+        cpu_marker = _FakeReranker()
+        devices = []
+
+        def _ctor(model, device=None):
+            devices.append(device)
+            if device != "cpu":
+                raise RuntimeError("CUDA OOM")
+            return cpu_marker
+
+        st = types.ModuleType("sentence_transformers")
+        st.CrossEncoder = _ctor
+        with mock.patch.dict(sys.modules, {"sentence_transformers": st}):
+            self.assertIs(rag._get_reranker(), cpu_marker)
+        self.assertEqual(devices, ["cuda:1", "cpu"])
 
     def test_cuda_then_cpu_both_fail_returns_none(self):
         rag.RAG_RERANKER_MODEL = "some/model"
