@@ -550,6 +550,9 @@ class ClauseSplitTests(unittest.TestCase):
          "still fit the frame without trouble.", None),
         ("The meeting moved to 2:30 this afternoon because the conference "
          "room was booked by the facilities team.", None),
+        # Never inside a web address (a colon with no space after it).
+        ("Open the page at https://example.org/status and check that the "
+         "green light is on before you leave.", None),
         # Never right after an abbreviation.
         ("Your alarm is set for 7 a.m., and the coffee maker will start ten "
          "minutes before it rings, sir.", None),
