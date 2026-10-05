@@ -357,6 +357,15 @@ _MONOLITH_RESTORE_NAMES = (
     # test boosted a LATER test's faked buffer into a different array
     # (StandbyWakeWiringTests, 2026-09-30).
     "_last_recording_peak",
+    # ...and the last capture itself plus the media gate's playback probe for
+    # it (2026-10-05). A test that runs the real record_speech (the self-echo
+    # live sequences) left both behind; a LATER _note_room_talk then took
+    # the "a capture exists" branch and asked the REAL media session whether
+    # the PC was playing, so test_monolith_presence_hold's room-talk tests
+    # failed whenever they ran after the self-echo tests and media happened
+    # to be playing (found when test_monolith_keeper_on_slices re-ran the
+    # self-echo classes earlier in the alphabet).
+    "_last_capture_audio", "_last_capture_sr", "_media_probe",
     # Per-camera "a face is here" stamps. Since 2026-09-30 written only by
     # _face_presence_note on a SUSTAINED face; a stamp left by a test that
     # drove the face-track loop would make a later presence / gaze test see
