@@ -264,6 +264,131 @@ def window_keep_route(utterance) -> str | None:
         return None
 
 
+# ── A NAMED close: "close File Explorer" (2026-10-05) ───────────────────────
+# Live 00:24:21-00:25:43 the owner said "go ahead and close out File Explorer
+# 2" ("too"), "close file explorer" twice and "close Google Chrome"; every one
+# was answered [ACTION: close_last_opened] - which closes only what JARVIS
+# itself opened, so each failed "I have no record of opening a window". The
+# owner had NAMED the window each time. named_close_target reads the name out
+# of a whole "close <name>" request; the monolith routes it to close_window
+# when that name is an open window (or a running app's), and rewrites a
+# close_last_opened the brain still writes for it. "close that / it / this
+# one / the window" names nothing: that stays close_last_opened's, and a bulk
+# "close everything ..." stays window_keep_route's.
+_NC_VERB_RE = re.compile(
+    r"^(?:close|closed|quit)(?:\s+(?:out(?:\s+of)?|down|up))?\s+"
+    r"(?P<name>.+)$",
+    re.IGNORECASE)
+# Trailing words that are not part of the name: "too" (Parakeet wrote it as
+# "2" live), "as well", "for me", "please", "now", "real quick".
+_NC_TAIL_RE = re.compile(
+    r"(?:[\s,]+(?:too|2|two|also|as\s+well|for\s+me|please|now|real\s+quick|"
+    r"right\s+now|thanks|thank\s+you|jarvis|sir))+[\s.!?]*$", re.IGNORECASE)
+_NC_LEAD_RE = re.compile(r"^(?:(?:the|my|that|this|our)\s+)+", re.IGNORECASE)
+_NC_KIND_RE = re.compile(
+    r"(?:\s+(?:app|application|program|window|windows|tab))+$", re.IGNORECASE)
+# Names that point back or name nothing ("close that", "close it out",
+# "close the window", "close them all"), and the bulk ones.
+_NC_DEICTIC_RE = re.compile(
+    r"^(?:(?:the|that|this|those|these)\s+)?(?:it|that|this|those|these|them|"
+    r"one|ones|window|windows|tab|tabs|page|pages|app|apps|program|programs|"
+    r"thing|things|last\s+one|other\s+one|current\s+(?:one|window|tab)|"
+    r"(?:the\s+)?(?:video|show|search|results?))(?:\s+(?:one|out|down|up))?$",
+    re.IGNORECASE)
+_NC_BULK_RE = re.compile(
+    r"\b(?:all|every|everything|everybody|except|but|other\s+than|besides|"
+    r"apart\s+from)\b", re.IGNORECASE)
+# "close Chrome on the left monitor" carries a monitor; "close Spotify and
+# open Netflix" a second step; "close my eyes" / "close the door" are not
+# windows at all (the monolith only routes a name that IS one).
+_NC_MONITOR_RE = re.compile(
+    r"\bon\s+(?:the|my)\s+\w+(?:\s+(?:monitor|screen|display))?$|"
+    r"\b(?:monitor|screen|display)$", re.IGNORECASE)
+_NC_MAX_NAME = 60
+
+
+def named_close_target(utterance) -> str | None:
+    """The window / app NAME of a whole "close <name>" request ("Jarvis, go
+    ahead and close out File Explorer 2." -> "File Explorer"), else None: a
+    pointing-back close ("close that"), a bulk one ("close everything but
+    X"), a second command riding along, a monitor qualifier. Never
+    raises."""
+    try:
+        if not isinstance(utterance, str) or not utterance.strip():
+            return None
+        s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
+        s = _strip_lead_filler(s)
+        s = " ".join(_strip(s).split())
+        m = _NC_VERB_RE.match(s)
+        if not m:
+            return None
+        name = _strip(_NC_TAIL_RE.sub("", m.group("name") or ""))
+        name = " ".join(name.split())
+        if (not name or len(name) > _NC_MAX_NAME
+                or any(c in name for c in "[]\r\n,;")
+                or _NC_DEICTIC_RE.match(name)
+                or _NC_BULK_RE.search(name)
+                or _NC_MONITOR_RE.search(name)
+                or _WK_SECOND_COMMAND_RE.search(name)
+                or len(_split_chain(name)) > 1
+                or re.search(r"\b(?:then|and)\b", name, re.IGNORECASE)):
+            return None
+        name = _NC_KIND_RE.sub("", _NC_LEAD_RE.sub("", name)).strip()
+        if not name or _NC_DEICTIC_RE.match(name) or len(name) < 2:
+            return None
+        return name
+    except Exception:
+        return None
+
+
+# ── "You forgot X" right after a bulk close (2026-10-05) ────────────────────
+# Live 00:25:27, straight after "Closed 5 windows, sir; kept Claude." the
+# owner said "you forgot Google Chrome", and the brain added Chrome to the
+# names to KEEP. forgot_close_target reads the window out of "you forgot X" /
+# "you missed X" / "you left X open" / "X is still open"; the monolith turns
+# it into close_window X only while the bulk close is fresh
+# (core.actions._last_bulk_close).
+_FC_FORGOT_RE = re.compile(
+    r"^(?:(?:but|and|oh|hey|wait)[\s,]+)*(?:you\s+)?(?:forgot|missed|"
+    r"skipped|didn'?t\s+close|did\s+not\s+close|left(?:\s+out)?)\s+(?:about\s+)?"
+    r"(?P<name>.+?)(?:\s+(?:open|up|running|alone|behind|there))?$",
+    re.IGNORECASE)
+_FC_STILL_RE = re.compile(
+    r"^(?:(?:but|and|oh|hey|wait)[\s,]+)*(?P<name>.+?)\s+(?:is|'s|are)\s+"
+    r"still\s+(?:open|up|there|running|on\s+(?:the\s+)?screen)$",
+    re.IGNORECASE)
+
+
+def forgot_close_target(utterance) -> str | None:
+    """The window named in "you forgot X" / "you missed X" / "you left X
+    open" / "X is still open" (a whole utterance), else None. Never
+    raises."""
+    try:
+        if not isinstance(utterance, str) or not utterance.strip():
+            return None
+        s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
+        s = _strip_lead_filler(s)
+        s = " ".join(_strip(_WK_TRAIL_RE.sub("", _strip(s))).split())
+        s = re.sub(r"(\w)'s\s+still\b", r"\1 is still", s)
+        m = _FC_FORGOT_RE.match(s) or _FC_STILL_RE.match(s)
+        if not m:
+            return None
+        name = " ".join(_strip(m.group("name") or "").split())
+        if (not name or len(name) > _NC_MAX_NAME
+                or any(c in name for c in "[]\r\n,;")
+                or _NC_BULK_RE.search(name)
+                or _WK_VAGUE_RE.search(name)
+                or _WK_SECOND_COMMAND_RE.search(name)
+                or re.search(r"\b(?:then|and|to)\b", name, re.IGNORECASE)):
+            return None
+        name = _NC_KIND_RE.sub("", _NC_LEAD_RE.sub("", name)).strip()
+        if not name or _NC_DEICTIC_RE.match(name):
+            return None
+        return name
+    except Exception:
+        return None
+
+
 # Map common spoken units to seconds (used by both timer and focus rules).
 _UNIT_SECONDS = {
     "second": 1, "seconds": 1, "sec": 1, "secs": 1,

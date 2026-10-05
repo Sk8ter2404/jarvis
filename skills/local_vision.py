@@ -329,6 +329,16 @@ def local_click_target_by_description(description: str) -> str:
             f"Ask the user to close it manually if they really want to."
         )
 
+    # The cloud click's sign-in rule too (core.auth_guard, 2026-10-05): never
+    # an account / sign-in / consent click the owner did not ask for.
+    try:
+        from core.actions import _click_auth_refusal
+        refusal = _click_auth_refusal(b, description)
+    except Exception:
+        refusal = ""
+    if refusal:
+        return refusal
+
     target = f" on {monitor} monitor" if monitor else ""
     print(f"  [local-vision] 📸 Looking for '{description}'{target}…", flush=True)
     coords = _find_click_target_local(description, monitor=monitor)

@@ -33050,6 +33050,91 @@ def register_utterance_route(fn, name: str = "") -> bool:
         return False
 
 
+# ── A named close goes to close_window (2026-10-05) ─────────────────────────
+# Live 00:24:21-00:25:43 "close out File Explorer", "close file explorer" (x2)
+# and "close Google Chrome" were each answered [ACTION: close_last_opened],
+# which closes only what JARVIS itself opened - so each one failed, "I have no
+# record of opening a window ...". The cause was the prompt: those turns name
+# no "window", so the router shipped only the always-on MULTI-MONITOR APP
+# LAUNCHING section, whose ONLY close token was close_last_opened ("close
+# that"); close_window lived in WINDOW MANAGEMENT, which never loaded. The
+# always-on section now documents close_window for a named close too, and:
+#   * a whole "close <name>" request whose name IS an open window (a running
+#     app's process, or a title that names it as itself:
+#     core.actions._names_open_window) is routed to close_window without the
+#     brain - only while the REAL close_window is registered (a skill's
+#     override resolves its own names);
+#   * "you forgot X" / "X is still open" within BULK_CLOSE_FOLLOWUP_S of a
+#     bulk close (live 00:25:27: the brain added X to the names to KEEP) is
+#     close_window X when X is open;
+#   * a close_last_opened the brain still writes for a named close is
+#     rewritten to close_window <name> (_enforce_named_close).
+def _named_close_route_reply(text: str) -> "str | None":
+    """"Very good, sir. [ACTION: close_window, <name>]" for a whole
+    named-close request or a "you forgot X" right after a bulk close, when
+    <name> is open; else None. Never raises."""
+    try:
+        if ACTIONS.get("close_window") is not _act_close_window:
+            return None
+        from core.dispatcher import (forgot_close_target as _fc_target,
+                                     named_close_target as _nc_target)
+        name = _nc_target(text)
+        label = "named close"
+        if not name:
+            name = _fc_target(text)
+            label = "you forgot X after a bulk close"
+            bulk = _last_bulk_close() if name else None
+            if bulk is None:
+                return None
+            if any(_compact_name(name) == _compact_name(k)
+                   for k in bulk.keep):
+                return None
+        if not name or any(c in name for c in "[]"):
+            return None
+        if not _names_open_window(name):
+            return None
+        print(f"  [route] {label} -> close_window")
+        # The brain's own acknowledgement for a close (live 00:24:12); the
+        # ack-hold drops it if the close fails, and a pushback replaces it.
+        return ("[intent:confirmation] Very good, sir. "
+                f"[ACTION: close_window, {name}]")
+    except Exception as _e:
+        print(f"  [route] named close check failed: {type(_e).__name__}")
+        return None
+
+
+def _compact_name(s) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def _enforce_named_close(reply: str) -> str:
+    """``reply`` with every [ACTION: close_last_opened] replaced by
+    [ACTION: close_window, <name>] when the owner's words this turn are a
+    whole NAMED close ("close Google Chrome"): close_last_opened is only for
+    "close that / close what you opened". Unchanged otherwise. Never
+    raises."""
+    try:
+        if "close_window" not in ACTIONS:
+            return reply
+        if not any(m.group(1).strip().lower() == "close_last_opened"
+                   for m in _ACTION_RE.finditer(reply or "")):
+            return reply
+        from core.dispatcher import named_close_target as _nc_target
+        name = _nc_target(_turn_user_text())
+        if not name or any(c in name for c in "[]"):
+            return reply
+        new = re.sub(r"\[ACTION:\s*close_last_opened\s*(?:,[^\]]*)?\]",
+                     f"[ACTION: close_window, {name}]", reply,
+                     flags=re.IGNORECASE)
+        if new != reply:
+            print("  [named-close] the owner named the window - "
+                  "close_window, not close_last_opened")
+        return new
+    except Exception as _e:
+        print(f"  [named-close] check failed: {_e}")
+        return reply
+
+
 def _utterance_route_reply(text: str) -> "str | None":
     """The action token a registered route claims ``text`` with, or None.
     Never raises; a failing or malformed route is logged and skipped.
@@ -33103,6 +33188,11 @@ def _utterance_route_reply(text: str) -> "str | None":
     if _wk_m and _wk_m.group(1) in ACTIONS:
         print(f"  [route] all windows except -> {_wk_m.group(1)}")
         return _wk_tok
+    # BUILT-IN routes (2026-10-05): a NAMED close and "you forgot X" after a
+    # bulk close -> close_window (_named_close_route_reply).
+    _nc_tok = _named_close_route_reply(text)
+    if _nc_tok:
+        return _nc_tok
     if not globals().get("SKILL_ROUTES_ENABLED", True):
         return None
     for label, fn in list(_UTTERANCE_ROUTES):
@@ -35761,12 +35851,36 @@ def _note_turn_action_ran(name: str, result) -> None:
         frame = getattr(_turn_grounding, "frame", None)
         if frame is None:
             return
+        # What this turn's looks at the screen said (2026-10-05): the
+        # sign-in click guard (core.auth_guard) reads it to know a sign-in
+        # page is in front. Kept whatever the answer was.
+        if str(name).strip().lower() in _SCREEN_LOOK_ACTIONS:
+            seen = frame.setdefault("screen", [])
+            seen.append(str(result or "")[:4000])
+            del seen[:-4]
         low = str(result).lower()
         if any(m.lower() in low for m in FAILURE_MARKERS):
             return
         frame["ran"].add(str(name).strip().lower())
     except Exception:
         pass
+
+
+# Actions whose result describes what is on the screen.
+_SCREEN_LOOK_ACTIONS = frozenset({
+    "see_screen", "local_describe_screen", "find_on_screen",
+    "previous_screen", "screen_history",
+})
+
+
+def _turn_screen_texts() -> list:
+    """What this owner turn's looks at the screen said, oldest first ([]
+    outside a turn)."""
+    frame = getattr(_turn_grounding, "frame", None)
+    try:
+        return list(frame.get("screen") or []) if frame else []
+    except Exception:
+        return []
 
 
 def _turn_actions_ran() -> frozenset:
@@ -36624,12 +36738,14 @@ def _scan_python_for_danger(code: str) -> str | None:
     return None
 
 
-def _jarvis_pushback(name: str, arg: str) -> tuple[str, str] | None:
+def _jarvis_pushback(name: str, arg: str) -> tuple | None:
     """Return (objection_line, reason) if this action deserves an in-character
     objection before running. None means proceed without confirmation. The
     objection is meant to be SPOKEN to the user; the caller queues the
     action on _pending_confirmation and ordinary 'yes' / 'no' handling
-    decides whether it actually fires."""
+    decides whether it actually fires. A "did you mean" question
+    (_close_name_question) adds a THIRD element: the corrected argument
+    the caller queues instead of ``arg``."""
     nm  = (name or "").lower()
 
     # run_python / eval_python / compute: arbitrary-code execution. This is a
@@ -36660,6 +36776,26 @@ def _jarvis_pushback(name: str, arg: str) -> tuple[str, str] | None:
             phrase = "That seems inadvisable, sir. Shall I proceed regardless?"
             return (phrase, f"destructive shell pattern: {sh_low[:60]}")
 
+    # "Did you mean Claude?" (2026-10-05, core.actions._close_name_question):
+    # a close that names a window which is not open, while one that sounds
+    # like it IS, asks - and its THIRD element is the corrected argument the
+    # caller queues, so the yes runs "close everything except Claude", not
+    # the misheard "Claw". Not a gray-zone objection (the alternative is
+    # closing nothing), so it asks with PUSHBACK_ENABLED off too.
+    # The bulk close's preview is read ONCE for both questions (this one
+    # and the "Close N windows?" count below).
+    _ca_closing = None
+    if nm == "close_all_windows_except" and (arg or "").strip():
+        try:
+            _ca_closing = _close_all_windows_except_preview(
+                (arg or "").strip())
+        except Exception:
+            _ca_closing = []
+    if nm in ("close_window", "close_all_windows_except"):
+        _dym = _close_name_question(nm, arg, _ca_closing)
+        if _dym is not None:
+            return _dym
+
     if not PUSHBACK_ENABLED:
         return None
     raw = (arg or "").strip()
@@ -36688,10 +36824,13 @@ def _jarvis_pushback(name: str, arg: str) -> tuple[str, str] | None:
     # by the action's own plan, so the number asked about is the number it
     # closes. Minimizing is undone with one click, so it never asks.
     if nm == "close_all_windows_except" and low:
-        try:
-            closing = _close_all_windows_except_preview(raw)
-        except Exception:
-            closing = []
+        if _ca_closing is not None:
+            closing = _ca_closing
+        else:
+            try:
+                closing = _close_all_windows_except_preview(raw)
+            except Exception:
+                closing = []
         if len(closing) > PUSHBACK_MAX_CLOSE_WINDOWS:
             blurb = _unsaved_window_blurb(closing)
             phrase = (f"Close {len(closing)} windows, sir"
@@ -37586,6 +37725,9 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # _enforce_close_then_open: the close of what JARVIS opened last runs
     # BEFORE the open, even when the brain wrote only the open.
     reply = _enforce_close_then_open(reply)
+    # ... and the other direction (2026-10-05): a close the owner NAMED is
+    # close_window, never close_last_opened (_enforce_named_close).
+    reply = _enforce_named_close(reply)
 
     # NOTE: the per-intent see_screen budget is intentionally NOT reset here.
     # The follow-up loop in _run_llm_dispatch calls this function once per
@@ -37776,8 +37918,12 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         # to do it.
         _pb = _jarvis_pushback(name, arg)
         if _pb:
-            objection, reason = _pb
-            _queue_pending_confirmation(name, arg)
+            objection, reason = _pb[0], _pb[1]
+            # A "did you mean" question queues the CORRECTED argument
+            # (2026-10-05): the yes runs what the owner meant.
+            _pb_arg = (_pb[2] if len(_pb) > 2 and isinstance(_pb[2], str)
+                       and _pb[2].strip() else arg)
+            _queue_pending_confirmation(name, _pb_arg)
             _pushback_objections.append(objection)
             print(f"  [pushback] {reason} → '{objection}'")
             results.append((name, f"⚠  PUSHBACK: {objection}", False))
