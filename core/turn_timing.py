@@ -12,7 +12,7 @@ eval_count=84 eval_ms=790 llm_calls=1 turn_ctx_chars=1342 sys_chars=31012 \
 followup_rounds=0 filler=0 filler_ms=- tail_ms=1410 cap_lag_ms=128 \
 clip_ms=3904 stt_wait_ms=0 stt_engine=- load_ms=13 total_ms=3512 \
 play_open_ms=41 out_lat_ms=46 filler_clip_ms=- eot=- st_p=- st_n=- pre=- \
-cut=- amb_deferred=- cache=- clone=- clone_ms=- lead_dropped=0
+cut=- amb_deferred=- cache=- clone=- clone_ms=- keeper=- lead_dropped=0
 
 Offsets are integer milliseconds from the turn's t0: the record_speech VAD
 break for a spoken turn, the inject-queue drain for a typed/injected turn. A
@@ -88,6 +88,10 @@ lead_dropped (NOTE_FIELDS; ``-`` = not measured on this turn):
                  Kokoro. ``-`` = the clone was not in use.
   clone_ms       that first clone render's time, request to finished audio
                  (0 = served from the clone's render cache).
+  keeper         PLAYBACK_KEEPER (2026-10-05): 1 = the playback keeper's
+                 silent stream was holding the speaker when the answer's
+                 first playback opened, 0 = it was not (yet). ``-`` = the
+                 keeper is off.
 
 They are set through TurnTiming.note_stat (load_ms / total_ms come with the
 answering response through llm_response, cap_lag_ms with the VAD break through
@@ -128,7 +132,8 @@ _AFTER_YOU = frozenset(("synth_start", "first_play"))
 NOTE_FIELDS = ("tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms",
                "stt_engine", "load_ms", "total_ms", "play_open_ms",
                "out_lat_ms", "filler_clip_ms", "eot", "st_p", "st_n", "pre",
-               "cut", "amb_deferred", "cache", "clone", "clone_ms")
+               "cut", "amb_deferred", "cache", "clone", "clone_ms",
+               "keeper")
 
 # Stats fields, printed after the marks in this order.
 # turn_ctx_chars is the per-turn context actually SENT; budget_trimmed=1 when
@@ -174,7 +179,7 @@ _NOTE_NAMES = _NOTE_PRINTED - {"cap_lag_ms"}
 #     it adopted, so a reminder or tray line played first is not the answer.
 _ANY_THREAD_NAMES = frozenset(("filler_clip_ms", "cut", "amb_deferred"))
 _AFTER_YOU_NAMES = frozenset(("play_open_ms", "out_lat_ms", "cache", "clone",
-                              "clone_ms"))
+                              "clone_ms", "keeper"))
 # Counts that add up over the turn instead of keeping the first value.
 _ADDITIVE_NAMES = frozenset(("amb_deferred",))
 # Any-thread names that may arrive before their turn begins and be adopted

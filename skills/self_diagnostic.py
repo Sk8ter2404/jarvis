@@ -2350,7 +2350,10 @@ def _probe_microphone() -> dict:
             # PortAudio is still executing the close, so opening another
             # capture stream here is the same class of hazard the flags above
             # cover. COUNT cell — truthy when > 0.
-            or _owner_flag("_pa_close_pending"))
+            or _owner_flag("_pa_close_pending")
+            # The playback keeper's silent speaker stream (PLAYBACK_KEEPER,
+            # 2026-10-05) — an owner in _pa_streams_live like the rest.
+            or _owner_flag("_tts_keeper_active"))
 
     awake = bool(bc is not None and not getattr(bc, "_sleep_mode", [True])[0])
     mic_off = bool(getattr(bc, "_mic_input_disabled", lambda: False)())

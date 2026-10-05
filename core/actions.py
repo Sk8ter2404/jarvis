@@ -5356,6 +5356,16 @@ def _release_audio_streams(bc, budget_s: float = 3.0) -> None:
                     done[name] = True
         except Exception:
             pass
+        # (d) the playback keeper's silent speaker stream (PLAYBACK_KEEPER,
+        #     2026-10-05): latch it off; its own thread closes the stream and
+        #     drops _tts_keeper_active, which the wait below watches.
+        try:
+            fn = getattr(bc, "_playback_keeper_shutdown", None)
+            if callable(fn):
+                fn()
+                done["playback_keeper"] = True
+        except Exception:
+            pass
 
     try:
         import threading as _threading

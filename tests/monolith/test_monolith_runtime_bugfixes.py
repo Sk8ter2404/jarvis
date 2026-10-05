@@ -2096,11 +2096,17 @@ class PaCloseGateStaleDuplicateTests(MonolithGlobalsTestCase):
         cells.discard("_pa_reinit_active")
         self.assertIn("_pa_close_pending", cells,
                       "the canonical owner list must name the H-6 cell")
-        sd_path = os.path.join(os.path.dirname(os.path.dirname(bc.__file__)),
-                               "JARVIS", "skills", "self_diagnostic.py")
+        # The skill NEXT TO the monolith under test first: the old order
+        # tried <parent>/JARVIS/skills first, which from a worktree such as
+        # C:/jarvis_wt_x is the LIVE C:/JARVIS copy - so a branch that adds
+        # an owner cell on both sides failed against the live tree's mirror
+        # (2026-10-05, PLAYBACK_KEEPER).
+        sd_path = os.path.join(os.path.dirname(bc.__file__),
+                               "skills", "self_diagnostic.py")
         if not os.path.isfile(sd_path):
-            sd_path = os.path.join(os.path.dirname(bc.__file__),
-                                   "skills", "self_diagnostic.py")
+            sd_path = os.path.join(
+                os.path.dirname(os.path.dirname(bc.__file__)),
+                "JARVIS", "skills", "self_diagnostic.py")
         with io.open(sd_path, encoding="utf-8") as fh:
             probe_src = fh.read()
         start = probe_src.index("def _mic_owned()")

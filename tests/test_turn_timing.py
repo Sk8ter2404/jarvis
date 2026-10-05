@@ -524,7 +524,7 @@ class R1SchemaTests(unittest.TestCase):
             "tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms", "stt_engine",
             "load_ms", "total_ms", "play_open_ms", "out_lat_ms",
             "filler_clip_ms", "eot", "st_p", "st_n", "pre", "cut",
-            "amb_deferred", "cache", "clone", "clone_ms"))
+            "amb_deferred", "cache", "clone", "clone_ms", "keeper"))
         self.assertEqual(len(set(tt.STAT_FIELDS)), len(tt.STAT_FIELDS))
 
     def test_the_old_fields_keep_their_order(self):
@@ -557,6 +557,7 @@ class NoteStatTests(unittest.TestCase):
         t.note_stat("cache", "would-hit")
         t.note_stat("clone", 1)
         t.note_stat("clone_ms", 812)
+        t.note_stat("keeper", 1)
         _in_thread(lambda: t.note_stat("filler_clip_ms", 2120))
         _in_thread(lambda: t.note_stat("cut", 980))
         _in_thread(lambda: t.note_stat("amb_deferred", 2))
@@ -570,7 +571,7 @@ class NoteStatTests(unittest.TestCase):
              "filler_clip_ms": "2120", "eot": "rms",
              "st_p": "0.873", "st_n": "2", "pre": "1", "cut": "980",
              "amb_deferred": "2", "cache": "would-hit", "clone": "1",
-             "clone_ms": "812"})
+             "clone_ms": "812", "keeper": "1"})
         self.assertEqual(d["lead_dropped"], "0")
 
     def test_an_absent_field_prints_dash(self):
@@ -620,9 +621,10 @@ class NoteStatTests(unittest.TestCase):
         _in_thread(lambda: t.note_stat("cache", "hit"))
         _in_thread(lambda: t.note_stat("clone", 1))
         _in_thread(lambda: t.note_stat("clone_ms", 700))
+        _in_thread(lambda: t.note_stat("keeper", 1))
         d = self._emit()
         for k in _R1_OWNER + ("play_open_ms", "out_lat_ms", "cache", "clone",
-                              "clone_ms"):
+                              "clone_ms", "keeper"):
             self.assertEqual(d[k], "-", k)
 
     def test_any_thread_fields_are_accepted_from_any_thread(self):
@@ -842,12 +844,13 @@ class PreTurnStashTests(unittest.TestCase):
         t.note_stat("cache", "hit")
         t.note_stat("clone", 1)
         t.note_stat("clone_ms", 650)
+        t.note_stat("keeper", 1)
         _in_thread(lambda: t.note_stat("filler_clip_ms", 2100))
         _in_thread(lambda: t.note_stat("cut", 500))
         t.begin_voice(since)
         t.mark("you")
         d = self._emit()
-        for k in ("play_open_ms", "cache", "clone", "clone_ms",
+        for k in ("play_open_ms", "cache", "clone", "clone_ms", "keeper",
                   "filler_clip_ms", "cut"):
             self.assertEqual(d[k], "-", k)
 
