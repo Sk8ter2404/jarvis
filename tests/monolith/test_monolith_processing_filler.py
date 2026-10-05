@@ -1112,3 +1112,37 @@ class RealThreadOrderingTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_monolith
+class FillerVarietyTests(MonolithGlobalsTestCase):
+    """2026-10-05: the owner asked for more variety than "Processing, sir."
+    The banks are wider and a stage never repeats its last line back to back."""
+
+    def setUp(self):
+        super().setUp()
+        self.bc._FILLER_LAST.clear()
+
+    def test_the_banks_are_wide_enough_for_variety(self):
+        from core import processing_filler as pf
+        self.assertGreaterEqual(len(pf.FIRST_LINES), 10)
+        self.assertGreaterEqual(len(pf.STILL_LINES), 6)
+        self.assertIn("Processing, sir.", pf.FIRST_LINES)
+
+    def test_a_stage_never_repeats_its_last_line_back_to_back(self):
+        from core import processing_filler as pf
+        avail = list(pf.FIRST_LINES)
+        prev = None
+        for _ in range(300):
+            line = self.bc._filler_pick(1, avail)
+            self.assertIn(line, avail)
+            self.assertNotEqual(line, prev)
+            prev = line
+
+    def test_stages_are_tracked_separately_and_a_single_line_still_plays(self):
+        self.assertEqual(self.bc._filler_pick(2, ["Nearly there, sir."]),
+                         "Nearly there, sir.")
+        self.assertEqual(self.bc._filler_pick(2, ["Nearly there, sir."]),
+                         "Nearly there, sir.")   # the only one available
+        first = self.bc._filler_pick(1, ["A", "B"])
+        self.assertNotEqual(self.bc._filler_pick(1, ["A", "B"]), first)

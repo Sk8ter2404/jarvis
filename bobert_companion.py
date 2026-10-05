@@ -40528,6 +40528,23 @@ def _filler_render(text: str):
         return None
 
 
+# The line each stage played last, so the next turn never repeats it back to
+# back (2026-10-05: the owner asked for variety, and with random.choice over a
+# small bank the same line came up twice in a row often).
+_FILLER_LAST: dict = {}
+
+
+def _filler_pick(stage: int, avail) -> str:
+    """One available line for `stage`, never the one this stage played last
+    (unless it is the only one available). Never raises."""
+    pool = list(avail)
+    last = _FILLER_LAST.get(stage)
+    fresh = [t for t in pool if t != last]
+    text = random.choice(fresh or pool)
+    _FILLER_LAST[stage] = text
+    return text
+
+
 def _filler_play(turn, stage: int) -> str:
     """Play one cached filler clip for `stage`. Returns 'played' | 'retry' |
     'skipped'. Never renders, never calls set_state / _write_hud_state
@@ -40555,7 +40572,7 @@ def _filler_play(turn, stage: int) -> str:
         claimed = True
         if globals().get("FILLER_DUCK_HOLD", False):
             _filler_duck_hold()   # given back at the end of the turn
-        text = random.choice(avail)
+        text = _filler_pick(stage, avail)
         clip = _filler_clips.get(text)
         if clip is None:
             return "played"   # the stage is consumed either way

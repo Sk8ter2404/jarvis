@@ -61,16 +61,37 @@ __all__ = [
 #     fits ClipCache's max_secs (a longer render is refused, so the line
 #     would simply never play).
 # Stage 1 is the "I heard you" line. The owner's own wording (2026-09-29): he
-# wants to hear "processing" or "thinking about that" right after he speaks.
+# wants to hear "processing" or "thinking about that" right after he speaks;
+# 2026-10-05: "give him more lines other than processing sir, that was just an
+# example ... something like that" -- so a wider bank in the same dry style.
+# None of these is a reply opener the brain itself uses ("Right away, sir.",
+# "On it, sir.", "Certainly, sir."), so the owner never hears the filler and
+# then the same words again as the answer.
 FIRST_LINES: tuple[str, ...] = (
     "Processing, sir.",
     "Thinking about that, sir.",
     "Let me think about that, sir.",
+    "Give me a moment, sir.",
+    "Running the numbers, sir.",
+    "Consulting my records, sir.",
+    "Looking into it, sir.",
+    "Checking now, sir.",
+    "Allow me a moment, sir.",
+    "Let me see, sir.",
+    "Considering that, sir.",
+    "Analysing, sir.",
+    "Pulling that together, sir.",
+    "Working through it, sir.",
 )
 STILL_LINES: tuple[str, ...] = (
     "Still working on it, sir.",
     "Nearly there, sir.",
     "A little longer, sir.",
+    "Still on it, sir.",
+    "Just finishing up, sir.",
+    "This is taking a moment, sir.",
+    "Thank you for your patience, sir.",
+    "Won't be much longer, sir.",
 )
 
 DEFAULT_FIRST = 2.5
