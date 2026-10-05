@@ -168,17 +168,17 @@ class KeepMatchingTests(_Base):
 
     def test_claude_is_kept_by_title_in_another_process(self):
         # No Claude app runs, so the windows whose titles name it are kept -
-        # and, since 2026-10-05, the owner hears that they are OTHER apps'
-        # windows kept by their titles alone.
+        # and, since 2026-10-05, the owner hears which BROWSER stayed open
+        # for a Claude page. (The terminal titled "Claude Code" names the
+        # app as itself: nothing to explain.)
         term = self.add("Claude Code", 0x22, "WindowsTerminal.exe")
         web = self.add("Claude - Google Chrome", 0x23, "chrome.exe")
         pad = self.add("notes.txt - Notepad", 0x24, "notepad.exe")
         out = A._act_close_all_windows_except("the Claude app")
         self.assertFalse(term.closed or web.closed)
         self.assertTrue(pad.closed)
-        self.assertEqual(out, "Closed 1 window, sir; kept the Claude app. I "
-                              "kept Windows Terminal and Google Chrome only "
-                              "because their titles mention Claude.")
+        self.assertEqual(out, "Closed 1 window, sir; kept the Claude app. "
+                              "Google Chrome stays open for its Claude page.")
 
     def test_several_names(self):
         claude = self.add("Claude", 0x25, "claude.exe")

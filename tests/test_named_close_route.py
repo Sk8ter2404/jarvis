@@ -21,12 +21,13 @@ import unittest
 from core.dispatcher import (forgot_close_target, named_close_target,
                              window_keep_route)
 
-# The live utterances, as transcribed (no personal data in them).
+# The live utterances, paraphrased: the load-bearing words kept ("close
+# out", Parakeet's "2" for "too", the missing comma after the wake word).
 LIVE_NAMED = (
-    ("Jarvis, go ahead and close out File Explorer 2.", "File Explorer"),
-    ("Jarvis, close file explorer.", "file explorer"),
-    ("Jarvis Close File Explorer.", "File Explorer"),
-    ("Jarvis close Google Chrome.", "Google Chrome"),
+    ("Jarvis, please close out File Explorer 2.", "File Explorer"),
+    ("Jarvis, close the file explorer.", "file explorer"),
+    ("Jarvis Close File Explorer now.", "File Explorer"),
+    ("Jarvis close Google Chrome for me.", "Google Chrome"),
 )
 
 
@@ -41,8 +42,11 @@ class NamedCloseTargetTests(unittest.TestCase):
                 ("close Spotify", "Spotify"),
                 ("Jarvis closed notepad.", "notepad"),
                 ("close my notes", "notes"),
-                ("close the YouTube tab", "YouTube"),
                 ("close the Claude app", "Claude"),
+                ("close the Downloads folder", "Downloads"),
+                # An app whose name ends in a common word is still a name.
+                ("close Apple Music", "Apple Music"),
+                ("close Epic Games", "Epic Games"),
                 ("Jarvis, quit Spotify please", "Spotify"),
                 ("close out of chrome", "chrome"),
                 ("close down Spotify for me", "Spotify"),
@@ -55,12 +59,24 @@ class NamedCloseTargetTests(unittest.TestCase):
         for said in ("close that", "close it", "Jarvis, close it out",
                      "close this one", "close the window", "close the tab",
                      "close the last one", "close them", "close those",
-                     "close them all"):
+                     "close them all",
+                     # Review 2026-10-05: these point back at what JARVIS
+                     # opened / played, and were rewritten away from
+                     # close_last_opened when read as names.
+                     "close what you opened", "close what you just opened",
+                     "close the window you just opened",
+                     "close the thing you opened", "close the tab you opened",
+                     "close the page you just opened",
+                     "close the video you put on",
+                     "close that YouTube video", "close the YouTube tab",
+                     "close the Netflix show", "close the song",
+                     "close the music", "close the browser",
+                     "close the search results"):
             with self.subTest(said=said):
                 self.assertIsNone(named_close_target(said))
 
     def test_bulk_compound_and_monitor_shapes_are_left_alone(self):
-        for said in ("Jarvis close everything except for Claude.",
+        for said in ("Jarvis close every window except for Claude.",
                      "close all windows but Spotify",
                      "close that and open Netflix",
                      "close Spotify and open Netflix",
@@ -76,7 +92,7 @@ class NamedCloseTargetTests(unittest.TestCase):
                 self.assertIsNone(named_close_target(said))
         # The bulk close keeps its own route.
         self.assertEqual(
-            window_keep_route("Jarvis close everything except for Claude."),
+            window_keep_route("Jarvis close every window except for Claude."),
             "[ACTION: close_all_windows_except, Claude]")
 
     def test_not_a_close(self):
@@ -88,8 +104,8 @@ class NamedCloseTargetTests(unittest.TestCase):
 
 class ForgotCloseTargetTests(unittest.TestCase):
     def test_the_live_follow_up(self):
-        self.assertEqual(forgot_close_target("Jarvis, you forgot Google "
-                                             "Chrome."), "Google Chrome")
+        self.assertEqual(forgot_close_target("Jarvis, you forgot about "
+                                             "Google Chrome."), "Google Chrome")
 
     def test_other_shapes(self):
         for said, name in (("Chrome is still open", "Chrome"),

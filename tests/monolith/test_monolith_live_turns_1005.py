@@ -100,6 +100,12 @@ class _Desk(_Base):
         p.start()
         self.addCleanup(p.stop)
         self._p(self.bc, "_UTTERANCE_ROUTES", [])
+        # Never a real key, click or foreground read: a browser-tab close
+        # checks the window in front before its Ctrl+W.
+        for ui in ("ui_hotkey", "ui_press", "ui_type", "ui_click"):
+            self._p(self.bc, ui)
+        self._p(self.bc, "_read_focused_window",
+                return_value=(None, "", None))
         # (getattr: on a tree without the 2026-10-05 fix these replays fail
         # on what JARVIS DOES, not on a missing name in their set-up.)
         bulk = getattr(A, "_LAST_BULK_CLOSE", None)
@@ -132,7 +138,7 @@ class _Desk(_Base):
 @requires_monolith
 class NamedCloseReplayTests(_Desk):
     def test_close_out_file_explorer_2_is_routed_to_close_window(self):
-        printed = self._turn("Jarvis, go ahead and close out File Explorer "
+        printed = self._turn("Jarvis, please close out File Explorer "
                              "2.", LIVE_CLOSE_THAT)
         self.llm.assert_not_called()
         self.assertIn("[route] named close -> close_window", printed)
@@ -145,7 +151,7 @@ class NamedCloseReplayTests(_Desk):
         self.assertEqual(self.spoken, ["[intent:confirmation] Very good, sir."])
 
     def test_close_google_chrome_closes_the_chrome_window(self):
-        self._turn("Jarvis close Google Chrome.", LIVE_CLOSE_THAT)
+        self._turn("Jarvis close Google Chrome for me.", LIVE_CLOSE_THAT)
         self.llm.assert_not_called()
         self.assertTrue(self.web.closed)
         self.assertFalse(self.claude.closed)
@@ -166,10 +172,10 @@ class NamedCloseReplayTests(_Desk):
         self.A._window_process_name.side_effect = (
             lambda w: procs.get(w._hWnd))
         routed = []
-        for said in ("Jarvis, go ahead and close out File Explorer 2.",
-                     "Jarvis, close file explorer.",
-                     "Jarvis Close File Explorer.",
-                     "Jarvis close Google Chrome."):
+        for said in ("Jarvis, please close out File Explorer 2.",
+                     "Jarvis, close the file explorer.",
+                     "Jarvis Close File Explorer now.",
+                     "Jarvis close Google Chrome for me."):
             printed = self._turn(said, LIVE_CLOSE_THAT,
                                  ["[intent:bad_news] No File Explorer window "
                                   "is open, sir."])
@@ -190,7 +196,7 @@ class NamedCloseReplayTests(_Desk):
         # Nothing to route (no window of that name is open now): the brain
         # answers, and its close_last_opened becomes close_window <name>.
         self.files.closed = True
-        printed = self._turn("Jarvis, close file explorer.", LIVE_CLOSE_THAT,
+        printed = self._turn("Jarvis, close the file explorer.", LIVE_CLOSE_THAT,
                              ["[intent:bad_news] There's no File Explorer "
                               "window open, sir."])
         self.llm.assert_called_once()
@@ -202,7 +208,7 @@ class NamedCloseReplayTests(_Desk):
     def test_the_rewrite_runs_whatever_close_window_is_registered(self):
         stub = self._stub("close_window", "closed: Claude - Google Chrome")
         self.assertIsNotNone(stub)
-        self._turn("Jarvis close Google Chrome.", LIVE_CLOSE_THAT)
+        self._turn("Jarvis close Google Chrome for me.", LIVE_CLOSE_THAT)
         # A replaced handler is not pre-resolved by the route ...
         self.llm.assert_called_once()
         # ... and the brain's nameless close still becomes the named one.
@@ -249,7 +255,7 @@ class CloseAllReplayTests(_Desk):
 
     def test_claw_asks_did_you_mean_claude_and_the_yes_closes(self):
         # 00:25:02, the live words.
-        self._turn("Jarvis close everything except for Claw.",
+        self._turn("Jarvis close every window except for Claw.",
                    "[intent:confirmation] Very good, sir.")
         self.llm.assert_not_called()
         self.assertFalse(any(w.closed for w in self.wins), "closed on a "
@@ -268,7 +274,7 @@ class CloseAllReplayTests(_Desk):
         self.assertEqual(self.spoken, ["Closed 5 windows, sir; kept Claude."])
 
     def test_a_no_to_the_question_closes_nothing(self):
-        self._turn("Jarvis close everything except for Claw.", "")
+        self._turn("Jarvis close every window except for Claw.", "")
         with contextlib.redirect_stdout(io.StringIO()):
             self.bc.handle_confirmation_response("No.")
         self.assertFalse(any(w.closed for w in self.wins))
@@ -281,7 +287,7 @@ class CloseAllReplayTests(_Desk):
 
     def test_except_claude_closes_the_chrome_window_with_a_claude_tab(self):
         # 00:25:12: the Claude APP runs, so it is what "Claude" keeps.
-        self._turn("Jarvis close everything except for Claude.", "")
+        self._turn("Jarvis close every window except for Claude.", "")
         self.llm.assert_not_called()
         self.assertTrue(self.web.closed)
         self.assertEqual(len(self._owner_windows_closed()), 5)
@@ -294,14 +300,14 @@ class CloseAllReplayTests(_Desk):
         # live follow-up closes it; the brain's live reply (keep Chrome too)
         # never runs.
         self.wins.remove(self.claude)
-        self._turn("Jarvis close everything except for Claude.", "")
+        self._turn("Jarvis close every window except for Claude.", "")
         self.assertFalse(self.web.closed)
         self.assertEqual(self.spoken, [
-            "Closed 4 windows, sir; kept Claude. I kept Google Chrome only "
-            "because its title mentions Claude."])
+            "Closed 4 windows, sir; kept Claude. Google Chrome stays open "
+            "for its Claude page."])
         self.spoken.clear()
         printed = self._turn(
-            "Jarvis, you forgot Google Chrome.",
+            "Jarvis, you forgot about Google Chrome.",
             "[intent:confirmation] Certainly, sir. "
             "[ACTION: close_all_windows_except, Claude, Chrome]")
         self.llm.assert_not_called()
@@ -311,7 +317,7 @@ class CloseAllReplayTests(_Desk):
         self.assertEqual(self.spoken, ["[intent:confirmation] Very good, sir."])
 
     def test_you_forgot_without_a_bulk_close_is_the_brains(self):
-        self._turn("Jarvis, you forgot Google Chrome.",
+        self._turn("Jarvis, you forgot about Google Chrome.",
                    "[intent:confirmation] Forgot what about it, sir?")
         self.llm.assert_called_once()
         self.assertFalse(self.web.closed)
@@ -320,7 +326,7 @@ class CloseAllReplayTests(_Desk):
 # ════════════════════════════════════════════════════════════════════════
 #  S - "pull up that page so I can sign in": never an unasked sign-in click
 # ════════════════════════════════════════════════════════════════════════
-OWNER_ASK = "Jarvis, pull up that page so I can sign in for you."
+OWNER_ASK = "Jarvis, bring that page up so I can sign in for you."
 PAGE = "https://console.example.com/"
 CHOOSER_LOOK = ("[local-vision] The browser window is not showing the console "
                 "page; it shows a Google 'Choose an account' screen listing "

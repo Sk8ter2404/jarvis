@@ -33066,9 +33066,15 @@ def register_utterance_route(fn, name: str = "") -> bool:
 #     override resolves its own names);
 #   * "you forgot X" / "X is still open" within BULK_CLOSE_FOLLOWUP_S of a
 #     bulk close (live 00:25:27: the brain added X to the names to KEEP) is
-#     close_window X when X is open;
+#     close_window X when X is open - never a window that close kept by
+#     name or left open on purpose (core.actions._resolve_after_bulk);
 #   * a close_last_opened the brain still writes for a named close is
-#     rewritten to close_window <name> (_enforce_named_close).
+#     rewritten to close_window <name> (_enforce_named_close) - only when
+#     the name IS an open window, or no window at all: "close what you
+#     opened", "close the song" stay close_last_opened (review 2026-10-05).
+# close_window itself closes, for a NAME, the windows that are that name
+# (core.actions._resolve_named_close): "close Claude" is the Claude app,
+# never the Claude Code terminal or a "Claude Code" folder.
 def _named_close_route_reply(text: str) -> "str | None":
     """"Very good, sir. [ACTION: close_window, <name>]" for a whole
     named-close request or a "you forgot X" right after a bulk close, when
@@ -33080,6 +33086,7 @@ def _named_close_route_reply(text: str) -> "str | None":
                                      named_close_target as _nc_target)
         name = _nc_target(text)
         label = "named close"
+        bulk = None
         if not name:
             name = _fc_target(text)
             label = "you forgot X after a bulk close"
@@ -33089,9 +33096,11 @@ def _named_close_route_reply(text: str) -> "str | None":
             if any(_compact_name(name) == _compact_name(k)
                    for k in bulk.keep):
                 return None
+            # Never a window that close kept or spared on purpose (review
+            # 2026-10-05): close_window resolves with the same exclusion.
         if not name or any(c in name for c in "[]"):
             return None
-        if not _names_open_window(name):
+        if not _names_open_window(name, bulk):
             return None
         print(f"  [route] {label} -> close_window")
         # The brain's own acknowledgement for a close (live 00:24:12); the
@@ -33122,6 +33131,17 @@ def _enforce_named_close(reply: str) -> str:
         from core.dispatcher import named_close_target as _nc_target
         name = _nc_target(_turn_user_text())
         if not name or any(c in name for c in "[]"):
+            return reply
+        # Review 2026-10-05: rewriting on ANY extracted text broke "close
+        # what you opened" and closed "Song lyrics draft.txt" for "close the
+        # song". Only a name a close by name resolves ("named"), or one no
+        # window carries at all ("none": close_window then says so honestly
+        # instead of "no record of opening"), is rewritten; a word that is
+        # only inside some title leaves the brain's close_last_opened.
+        state = _named_close_state(name)
+        if state == "loose":
+            print(f"  [named-close] {name!r} only appears inside a window "
+                  "title - leaving close_last_opened")
             return reply
         new = re.sub(r"\[ACTION:\s*close_last_opened\s*(?:,[^\]]*)?\]",
                      f"[ACTION: close_window, {name}]", reply,
@@ -35843,7 +35863,7 @@ def _end_turn_grounding(prev) -> None:
     _turn_grounding.frame = prev
 
 
-def _note_turn_action_ran(name: str, result) -> None:
+def _note_turn_action_ran(name: str, result, arg: str = "") -> None:
     """Record an action that ran this turn. Failures are NOT recorded: a
     failed get_time grounds nothing, so a time stated afterwards still gets
     the real action injected. Never raises."""
@@ -35851,13 +35871,19 @@ def _note_turn_action_ran(name: str, result) -> None:
         frame = getattr(_turn_grounding, "frame", None)
         if frame is None:
             return
-        # What this turn's looks at the screen said (2026-10-05): the
-        # sign-in click guard (core.auth_guard) reads it to know a sign-in
-        # page is in front. Kept whatever the answer was.
-        if str(name).strip().lower() in _SCREEN_LOOK_ACTIONS:
+        # What this turn's looks at the screen said, and what it looked for
+        # (2026-10-05): the sign-in guard (core.auth_guard) reads them to
+        # know a sign-in page is in front, and that a coordinate click is on
+        # the account entry find_on_screen just located. Kept whatever the
+        # answer was.
+        if _is_screen_look_action(name):
             seen = frame.setdefault("screen", [])
             seen.append(str(result or "")[:4000])
             del seen[:-4]
+        if _is_find_action(name) and str(arg or "").strip():
+            looked = frame.setdefault("looked_for", [])
+            looked.append(str(arg)[:300])
+            del looked[:-6]
         low = str(result).lower()
         if any(m.lower() in low for m in FAILURE_MARKERS):
             return
@@ -35866,11 +35892,34 @@ def _note_turn_action_ran(name: str, result) -> None:
         pass
 
 
-# Actions whose result describes what is on the screen.
+# Actions whose result describes what is on the screen: these names and
+# every alias registered to the same handler (recall_screen / last_screen /
+# previous_screen / screen_history are one handler - review 2026-10-05
+# found a hand list that named two of the four).
 _SCREEN_LOOK_ACTIONS = frozenset({
-    "see_screen", "local_describe_screen", "find_on_screen",
-    "previous_screen", "screen_history",
+    "see_screen", "local_describe_screen", "find_on_screen", "recall_screen",
 })
+
+
+def _same_handler_as(name, bases) -> bool:
+    """True when action ``name`` is one of ``bases`` or is registered to the
+    same handler as one of them (an alias). Never raises."""
+    try:
+        nm = str(name or "").strip().lower()
+        if nm in bases:
+            return True
+        fn = ACTIONS.get(nm)
+        return fn is not None and any(ACTIONS.get(b) is fn for b in bases)
+    except Exception:
+        return False
+
+
+def _is_screen_look_action(name) -> bool:
+    return _same_handler_as(name, _SCREEN_LOOK_ACTIONS)
+
+
+def _is_find_action(name) -> bool:
+    return _same_handler_as(name, ("find_on_screen",))
 
 
 def _turn_screen_texts() -> list:
@@ -35881,6 +35930,35 @@ def _turn_screen_texts() -> list:
         return list(frame.get("screen") or []) if frame else []
     except Exception:
         return []
+
+
+def _turn_click_targets() -> list:
+    """What this owner turn's find_on_screen looked for, oldest first ([]
+    outside a turn)."""
+    frame = getattr(_turn_grounding, "frame", None)
+    try:
+        return list(frame.get("looked_for") or []) if frame else []
+    except Exception:
+        return []
+
+
+def _turn_note_auth_refused() -> None:
+    """Mark this owner turn: an input was refused by the sign-in guard, so
+    the rest of its clicks and keys are refused too (core.auth_guard)."""
+    frame = getattr(_turn_grounding, "frame", None)
+    try:
+        if frame is not None:
+            frame["auth_refused"] = True
+    except Exception:
+        pass
+
+
+def _turn_auth_refused() -> bool:
+    frame = getattr(_turn_grounding, "frame", None)
+    try:
+        return bool(frame and frame.get("auth_refused"))
+    except Exception:
+        return False
 
 
 def _turn_actions_ran() -> frozenset:
@@ -36780,19 +36858,11 @@ def _jarvis_pushback(name: str, arg: str) -> tuple | None:
     # a close that names a window which is not open, while one that sounds
     # like it IS, asks - and its THIRD element is the corrected argument the
     # caller queues, so the yes runs "close everything except Claude", not
-    # the misheard "Claw". Not a gray-zone objection (the alternative is
-    # closing nothing), so it asks with PUSHBACK_ENABLED off too.
-    # The bulk close's preview is read ONCE for both questions (this one
-    # and the "Close N windows?" count below).
-    _ca_closing = None
-    if nm == "close_all_windows_except" and (arg or "").strip():
-        try:
-            _ca_closing = _close_all_windows_except_preview(
-                (arg or "").strip())
-        except Exception:
-            _ca_closing = []
+    # the misheard "Claw". Not a gray-zone objection (the alternative closes
+    # nothing - or, with another keep name matched, the very app he meant
+    # to keep), so it asks with PUSHBACK_ENABLED off too.
     if nm in ("close_window", "close_all_windows_except"):
-        _dym = _close_name_question(nm, arg, _ca_closing)
+        _dym = _close_name_question(nm, arg)
         if _dym is not None:
             return _dym
 
@@ -36803,13 +36873,13 @@ def _jarvis_pushback(name: str, arg: str) -> tuple | None:
 
     # close_window: matched too many windows. Embellish the phrase with an
     # unsaved-work hint if any of the matches look like a modified editor.
+    # Counted by close_window's own resolution (core.actions.
+    # _close_window_preview, review 2026-10-05): a name closes the app's
+    # windows by process too, and those count.
     if nm == "close_window" and low:
-        try:
-            matches = _find_windows_by_title(low)
-        except Exception:
-            matches = []
+        titles = _close_window_preview(raw)
+        matches = titles
         if len(matches) > PUSHBACK_MAX_CLOSE_WINDOWS:
-            titles = [(m.title or "") for m in matches]
             blurb = _unsaved_window_blurb(titles)
             if blurb:
                 phrase = (f"If I may, sir — that will close {len(matches)} "
@@ -36824,13 +36894,10 @@ def _jarvis_pushback(name: str, arg: str) -> tuple | None:
     # by the action's own plan, so the number asked about is the number it
     # closes. Minimizing is undone with one click, so it never asks.
     if nm == "close_all_windows_except" and low:
-        if _ca_closing is not None:
-            closing = _ca_closing
-        else:
-            try:
-                closing = _close_all_windows_except_preview(raw)
-            except Exception:
-                closing = []
+        try:
+            closing = _close_all_windows_except_preview(raw)
+        except Exception:
+            closing = []
         if len(closing) > PUSHBACK_MAX_CLOSE_WINDOWS:
             blurb = _unsaved_window_blurb(closing)
             phrase = (f"Close {len(closing)} windows, sir"
@@ -37989,7 +38056,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             # Turn grounding ledger: lets a later follow-up round that reads
             # this result back pass the claim validators (no-op outside a
             # dispatch; failures are not recorded).
-            _note_turn_action_ran(name, res)
+            _note_turn_action_ran(name, res, arg)
             _note_once_per_turn_ran(name, arg, res, _once_ran_here)
             _note_web_search_ran(name, res)
             record_session_action(name, arg)

@@ -416,9 +416,9 @@ PC_CONTROL_SAFETY_RULES = (
     "The user must say 'yes' before they execute. Never try to bypass this.\n\n"
     "If unsure whether to take an action, ASK FIRST.\n\n"
     "A sign-in, account-chooser, consent or password page is sir's to "
-    "complete: never click on it (no account, no 'Continue', no 'Allow') "
-    "unless he asks for that exact click this turn - tell him the page is "
-    "ready for him to sign in.\n\n"
+    "complete: never click, type or press Enter on it (no account, no "
+    "'Continue', no 'Allow') unless he asks for that exact click this turn "
+    "- tell him the page is ready for him to sign in.\n\n"
     + RESULT_HOLD_RULE +
     "An action's name must MATCH what sir asked about. If none does, emit no "
     "action at all.\n"

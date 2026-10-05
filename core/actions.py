@@ -914,6 +914,11 @@ def _act_show_llm_stats(_: str = "") -> str:
 
 def _act_press(key: str) -> str:
     bc = _bc()
+    # Never Enter / Tab / Space on a sign-in page the owner did not ask for
+    # (core.auth_guard, review 2026-10-05).
+    refusal = _input_auth_refusal(bc, "press", key)
+    if refusal:
+        return refusal
     try:
         bc.ui_press(key.strip().lower())
     except bc.UIFailsafeError as e:
@@ -1604,13 +1609,11 @@ def _app_process_windows(windows, query) -> list:
 
 def _find_app_windows(query) -> list:
     """The owner's windows whose process is the app ``query`` names - for a
-    single close / focus by name when no window TITLE carries the name. A
-    console / terminal window is never one: its title is whatever runs in
-    it, and closing it ends that unsaved (the bulk close's rule). Never
-    raises."""
+    single close / focus by name when no window TITLE carries the name.
+    Terminals included: whether a close by name may close one is
+    _resolve_named_close's call (review 2026-10-05). Never raises."""
     try:
-        return [w for w in _app_process_windows(_owner_windows(), query)
-                if not _is_terminal_window(w)]
+        return _app_process_windows(_owner_windows(), query)
     except Exception:
         return []
 
@@ -1637,22 +1640,44 @@ def _title_names_as_app(w, words) -> bool:
     return False
 
 
-def _names_open_window(name) -> bool:
-    """True when ``name`` is what one of the owner's open windows is: a
-    running app's process (_find_app_windows) or a window title that names
-    it as itself (_title_names_as_app). The bar for routing "close <name>"
-    to close_window without the brain - stricter than close_window's own
-    title-substring lookup, so "close the door" is never a "Doorbell" tab.
-    Never raises."""
+def _names_open_window(name, bulk=None) -> bool:
+    """True when a close BY NAME of ``name`` (_resolve_named_close) would
+    close at least one window and every one of them is the owner's (never
+    one of JARVIS's own): the bar for routing "close <name>" to close_window
+    without the brain. The route and the action resolve the same windows, so
+    "close Claude" routed is the Claude app alone - never the Claude Code
+    terminal or a "Claude Code" folder (review 2026-10-05) - and "close the
+    door" is never a "Doorbell" tab. ``bulk``: the bulk close a "you forgot
+    X" follows (_resolve_after_bulk). Never raises."""
     try:
-        words = _app_words(_keep_key(name))
-        if not words:
+        res = _resolve_after_bulk(_bc(), name, bulk)
+        if not res or not res[0]:
             return False
-        if _find_app_windows(name):
-            return True
-        return any(_title_names_as_app(w, words) for w in _owner_windows())
+        return len(_window_scope.user_windows(res[0])) == len(res[0])
     except Exception:
         return False
+
+
+def _named_close_state(name) -> str:
+    """How an open window answers to ``name``: "named" (a close by name
+    resolves it - _resolve_named_close - even if only to a terminal it
+    leaves open), "loose" (only close_window's title-substring lookup or the
+    app's process finds something: a word inside a title) or "none".
+    bobert_companion._enforce_named_close rewrites the brain's
+    close_last_opened only on "named" / "none" (review 2026-10-05: "close the
+    song" closed "Song lyrics draft.txt - Notepad" when the rewrite ignored
+    this). Never raises: "loose" on a fault, so nothing is rewritten."""
+    try:
+        bc = _bc()
+        res = _resolve_named_close(bc, name)
+        if res and (res[0] or res[1]):
+            return "named"
+        if (bc._find_windows_by_title(name)
+                or _seam_list(bc, "_find_app_windows", name)):
+            return "loose"
+        return "none"
+    except Exception:
+        return "loose"
 
 
 # Invisible marks in titles: core.window_scope's ONE list.
@@ -1707,6 +1732,246 @@ def _window_name_suggestion(query) -> str:
     """"Claude" for a heard "Claw" while Claude is open: _suggest_window_name
     against the owner's open windows. "" when none. Never raises."""
     return _suggest_window_name(query, _owner_windows())
+
+
+# ── Which windows a close BY NAME closes (review 2026-10-05) ───────────────
+# "close Claude" was routed to close_window, whose title-SUBSTRING lookup
+# also took the Claude Code terminal (WM_CLOSE ends what runs in it, unsaved)
+# and a "Claude Code" folder - with no question, since that was under the
+# "too many windows" bar. The brain, now taught close_window <name>, and the
+# yes to a "did you mean" reached the same broad close. A query that is a
+# NAME (a few words: not a "<document> - <app>" title, a path, a file or an
+# exe) now closes the windows that ARE that name, in this order:
+#   1. the app whose executable carries EVERY word of the name (claude.exe
+#      for "Claude", Code.exe for "Code", chrome.exe for "Google Chrome") -
+#      not the windows that merely mention it;
+#   2. else the windows whose title names it as ITSELF (_title_names_as_app:
+#      "Downloads - File Explorer", "Deck1 - PowerPoint", a browser page's
+#      "Lo-fi - YouTube - Google Chrome");
+#   3. else, when no title carries the name at all, the app by its process
+#      the looser way (_exe_names_app: "File Explorer" -> explorer.exe; an
+#      explorer.exe window that is not a folder window - a Properties sheet,
+#      a copy dialog - is not File Explorer).
+# A console / terminal window in that set is closed only when the owner named
+# the terminal itself - its program ("PowerShell") or its whole title ("npm
+# run dev"); one that a title word swept in is left open and named. JARVIS's
+# own windows only when none of the owner's answers ("close settings" is
+# Windows Settings, not JARVIS Settings). No window qualifies: close_window's
+# title-substring match, exactly as before.
+_FOLDER_WINDOW_CLASS = "cabinetwclass"
+_FILE_NAME_RE = re.compile(r"\.[a-z0-9]{1,5}$", re.IGNORECASE)
+_NAME_QUERY_MAX_WORDS = 4
+
+
+def _name_query_words(query) -> list:
+    """The app words of ``query`` when it is a NAME ("File Explorer", "the
+    Claude app"), [] when it is a window title, a path, a file, an exe or
+    longer than a name. Never raises."""
+    try:
+        q = " ".join(_NAME_INVISIBLE_RE.sub("", str(query or "")).split())
+        q = _keep_key(q)
+        if (not q or len(q.split()) > _NAME_QUERY_MAX_WORDS
+                or _EXE_QUERY_RE.match(q) or _TITLE_PART_SPLIT_RE.search(q)
+                or _PATHLIKE_RE.search(q) or _FILE_NAME_RE.search(q)):
+            return []
+        return _app_words(q)
+    except Exception:
+        return []
+
+
+def _proc_is_named_app(w, words) -> bool:
+    """True when window ``w``'s executable carries EVERY word of the name
+    (claude.exe for "Claude"; not claude.exe for "Claude Code", whose words
+    it does not all carry). A packaged-app host names no app. Never
+    raises."""
+    try:
+        proc = _window_process_name(w)
+        if not proc or proc.strip().lower() in _APP_HOST_PROCESSES:
+            return False
+        stem = _exe_stem(proc)
+        own = [c for c in (_compact(t) for t in words or ()) if c]
+        return bool(stem and own) and all(t in stem for t in own)
+    except Exception:
+        return False
+
+
+def _folder_window_ok(w) -> bool:
+    """False for an explorer.exe window whose class is known and is not a
+    folder window ("CabinetWClass"): a Properties sheet or a copy dialog is
+    not "File Explorer". True for every other window. Never raises."""
+    try:
+        proc = _window_process_name(w)
+        if not proc or _exe_stem(proc) != "explorer":
+            return True
+        cls = _window_scope.probe(w).class_name
+        return not cls or cls == _FOLDER_WINDOW_CLASS
+    except Exception:
+        return True
+
+
+def _terminal_named(w, words, name) -> bool:
+    """True when terminal window ``w`` is what the owner named: the terminal
+    program itself (every word of the name in a terminal executable -
+    "PowerShell", "Windows Terminal") or its whole title / title part ("npm
+    run dev", "Command Prompt"). Never raises."""
+    try:
+        proc = _window_process_name(w)
+        if (proc and _exe_stem(proc) in _TERMINAL_PROCESS_STEMS
+                and _proc_is_named_app(w, words)):
+            return True
+        want = _compact(_keep_key(name))
+        title = _NAME_INVISIBLE_RE.sub("", str(getattr(w, "title", "") or ""))
+        title = re.sub(r"^\s*administrator\s*:\s*", "", title,
+                       flags=re.IGNORECASE).strip()
+        parts = _TITLE_PART_SPLIT_RE.split(title)
+        return bool(want) and want in {_compact(title), _compact(parts[0]),
+                                       _compact(parts[-1])}
+    except Exception:
+        return False
+
+
+def _resolve_named_close(bc, title_q, exclude=frozenset()) -> "tuple | None":
+    """(windows to close, terminals left open) for a close BY NAME of
+    ``title_q`` - see the block comment above - or None when the query is
+    not a name or no window answers to it as one (close_window then matches
+    by title, as before). ``exclude``: window keys (_window_key) never to
+    touch. Raises what bc._find_windows_by_title raises."""
+    words = _name_query_words(title_q)
+    if not words:
+        return None
+    by_title = [w for w in (bc._find_windows_by_title(title_q) or [])
+                if _window_key(w) not in exclude]
+    # The app by its process only when no title carries the name (the
+    # 2026-10-05 fallback): a test that fakes the title lookup never reaches
+    # a real desktop through this.
+    by_proc = [] if by_title else [
+        w for w in _seam_list(bc, "_find_app_windows", title_q)
+        if _window_key(w) not in exclude]
+    seen: set = set()
+    cands = []
+    for w in by_title + by_proc:
+        if _window_key(w) not in seen:
+            seen.add(_window_key(w))
+            cands.append(w)
+    pool = [w for w in cands if _proc_is_named_app(w, words)]
+    if not pool:
+        pool = [w for w in by_title if _title_names_as_app(w, words)]
+    if not pool:
+        pool = [w for w in by_proc if _folder_window_ok(w)]
+    if not pool:
+        return None
+    mine = _window_scope.user_windows(pool)
+    if mine:
+        pool = mine
+    targets, left = [], []
+    for w in pool:
+        if _is_terminal_window(w) and not _terminal_named(w, words, title_q):
+            left.append(w)
+        else:
+            targets.append(w)
+    return targets, left
+
+
+def _spoken_title(w) -> str:
+    """A window's title as it can be said: no leading marks ("✳ Claude
+    Code" -> "Claude Code"), no "Administrator:"."""
+    t = _NAME_INVISIBLE_RE.sub("", str(getattr(w, "title", "") or ""))
+    t = re.sub(r"^\s*administrator\s*:\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^[^\w]+", "", t).strip()
+    return t[:60].strip() or "That window"
+
+
+def _terminal_left_line(left) -> str:
+    """The TERMINAL line for terminals a close by name left open."""
+    from core.failure_markers import TERMINAL_FAILURE_PREFIX
+    labels: list = []
+    for w in left:
+        label = _spoken_title(w)
+        if label not in labels:
+            labels.append(label)
+    one = len(labels) == 1
+    return (TERMINAL_FAILURE_PREFIX
+            + f"{_spoken_list(labels)} {'is a terminal' if one else 'are terminals'}"
+            f", sir; closing {'it' if one else 'them'} would end whatever "
+            f"runs in {'it' if one else 'them'}, so I've left "
+            f"{'it' if one else 'them'} open.")
+
+
+def _bulk_exclusions(bulk) -> list:
+    """The window-key sets a close right after bulk close ``bulk`` must
+    spare, strictest first: every window it kept or spared; then - when that
+    leaves nothing - only the windows it kept by name and the ones it spared,
+    so a browser window it kept ONLY for a page ("Google Chrome stays open
+    for its Claude page") is what "you forgot Google Chrome" closes."""
+    if bulk is None:
+        return [frozenset()]
+    out = [bulk.keys]
+    if bulk.page_kept_keys:
+        out.append(bulk.loose_keys)
+    return out
+
+
+def _resolve_after_bulk(bc, title_q, bulk=None) -> "tuple | None":
+    """_resolve_named_close, sparing what bulk close ``bulk`` kept or spared
+    (_bulk_exclusions, strictest first). Review 2026-10-05: "you forgot
+    Chrome" closed the Chrome window kept for "YouTube", and a terminal the
+    bulk close had said it left open. Raises what bc._find_windows_by_title
+    raises."""
+    res = None
+    for exclude in _bulk_exclusions(bulk):
+        res = _resolve_named_close(bc, title_q, exclude)
+        if res and res[0]:
+            return res
+    return res
+
+
+def _close_window_matches(bc, query) -> tuple:
+    """(windows close_window(``query``) would close, terminals it would
+    leave open, the "you forgot X" bulk-close record or None) - the ONE
+    resolution behind close_window and its pushback count. Raises what
+    bc._find_windows_by_title raises."""
+    title_q, monitor = _split_close_query(query)
+    bulk = _forgot_bulk_close()
+    named = _resolve_after_bulk(bc, title_q, bulk)
+    if named is not None:
+        matches, left = named
+    else:
+        left = []
+        matches = []
+        for exclude in _bulk_exclusions(bulk):
+            matches = [w for w in (bc._find_windows_by_title(title_q) or [])
+                       if _window_key(w) not in exclude]
+            if not matches and _EXE_QUERY_RE.match(title_q):
+                matches = [w for w in _windows_of_process(title_q)
+                           if _window_key(w) not in exclude]
+            if matches:
+                break
+    if monitor and len(matches) > 1:
+        on_it = [w for w in matches if _on_monitor(w, monitor)]
+        matches = on_it or matches
+    return matches, left, bulk
+
+
+def _close_window_preview(arg) -> list:
+    """Titles of the windows close_window(``arg``) would close now - the
+    pushback's "that will close N windows" count
+    (bobert_companion._jarvis_pushback), so the number asked about is the
+    number closed, process matches included. [] on any fault."""
+    try:
+        bc = _bc()
+        try:
+            forbidden = [str(t).lower() for t in bc.FORBIDDEN_TARGETS if t]
+        except Exception:
+            forbidden = []
+        matches, _left, _bulk = _close_window_matches(bc, str(arg or ""))
+        out = []
+        for w in matches:
+            title = getattr(w, "title", "") or ""
+            if not any(t in title.lower() for t in forbidden):
+                out.append(title)
+        return out
+    except Exception:
+        return []
 
 
 def _split_close_query(query: str) -> "tuple[str, str | None]":
@@ -1788,17 +2053,18 @@ def _act_close_window(query: str) -> str:
             f"REFUSED: '{query}' looks like your own host process. "
             f"Closing it would kill the session. Ask the user to close it manually."
         )
-    title_q, monitor = _split_close_query(query)
-    matches = bc._find_windows_by_title(title_q)
-    if not matches and _EXE_QUERY_RE.match(title_q):
-        matches = _windows_of_process(title_q)
-    elif not matches:
-        # "close Claude" while the app's window is titled by its chat
-        # (2026-10-05): the app the owner NAMED, by its process.
-        matches = _seam_list(bc, "_find_app_windows", title_q)
-    if monitor and len(matches) > 1:
-        on_it = [w for w in matches if _on_monitor(w, monitor)]
-        matches = on_it or matches
+    title_q, _monitor = _split_close_query(query)
+    # A NAME closes the windows that ARE that name, never every title that
+    # mentions it, and no terminal it merely swept in; a "you forgot X"
+    # right after a bulk close never touches what that close kept or spared
+    # (review 2026-10-05: _close_window_matches).
+    matches, left, bulk = _close_window_matches(bc, query)
+    if not matches and left:
+        return _terminal_left_line(left)
+    if not matches and bulk is not None:
+        why = _forgot_spared_line(bc, title_q, bulk)
+        if why:
+            return why
     if not matches:
         sugg = _seam_str(bc, "_window_name_suggestion", title_q)
         if sugg:
@@ -1858,6 +2124,10 @@ def _act_close_window(query: str) -> str:
                      "name, and closing that window would close every tab in "
                      "it. Say 'close Chrome' (or the browser's name) for the "
                      "whole window, or name the tab")
+    if parts and left:
+        parts.append("left " + ", ".join(repr(_spoken_title(w)) for w in left)
+                     + " open: a terminal - closing it would end whatever "
+                     "runs in it")
     return "; ".join(parts) if parts else "could not close"
 
 
@@ -2073,15 +2343,19 @@ def _kept_windows_how(scoped, name, front_hwnd) -> tuple:
 
 
 def _kept_by_title_only(w, key) -> bool:
-    """True when window ``w`` was kept for ``key`` only because its title
-    names it: its process is KNOWN, is not a packaged-app host, and is
-    another app ("Claude - Google Chrome" is chrome.exe). Unknown process:
-    False (nothing to say)."""
+    """True when window ``w`` is a BROWSER window that keep name ``key``
+    kept only through its page ("Claude - Google Chrome" for "Claude" while
+    no Claude app runs): the owner then hears which browser stayed open. A
+    window whose own title names the app (POWERPNT.EXE's "Deck1 -
+    PowerPoint", olk.exe's "Inbox - Outlook") IS that app - review
+    2026-10-05: those got "I kept PowerPoint only because its title mentions
+    PowerPoint" - and an unknown process says nothing. Never raises."""
     try:
-        proc = _window_process_name(w)
-        if not proc or proc.strip().lower() in _APP_HOST_PROCESSES:
+        if not _is_browser_process(w):
             return False
-        return not _exe_names_app(proc, _app_words(key))
+        words = _app_words(key)
+        return bool(words) and not _title_names_app(
+            getattr(w, "title", "") or "", words)
     except Exception:
         return False
 
@@ -2154,7 +2428,7 @@ class _AllExceptPlan:
         self.hosts: list = []         # left alone: may host JARVIS (close)
         self.matched: set = set()     # keep names that matched a window
         self.labels: dict = {}        # keep name -> spoken label
-        # keep name -> windows of ANOTHER app kept only by their title
+        # keep name -> browser windows kept only by their page
         self.by_title: dict = {}
         self.kept: list = []          # every window kept by a name
         self.scoped: list = []        # the owner's windows the plan saw
@@ -2180,9 +2454,9 @@ class _AllExceptPlan:
 
     @property
     def title_only_note(self) -> str:
-        """"I kept Google Chrome only because its title mentions Claude." -
-        one sentence per keep name for which another app's window was kept
-        by its title alone; "" when none was."""
+        """"Google Chrome stays open for its Claude page." - one sentence per
+        keep name that kept a browser window by its page alone
+        (_kept_by_title_only); "" when none did."""
         notes = []
         for n in self.names:
             wins = self.by_title.get(n) or []
@@ -2194,9 +2468,10 @@ class _AllExceptPlan:
                 if label not in labels:
                     labels.append(label)
             one = len(labels) == 1
-            notes.append(f"I kept {_spoken_list(labels)} only because "
-                         f"{'its title mentions' if one else 'their titles mention'}"
-                         f" {_keep_key(n)}.")
+            notes.append(f"{_spoken_list(labels)} "
+                         f"{'stays' if one else 'stay'} open for "
+                         f"{'its' if one else 'their'} {_keep_key(n)} "
+                         f"{'page' if one else 'pages'}.")
         return " ".join(notes)
 
 
@@ -2236,10 +2511,10 @@ def _all_except_plan(bc, arg, closing: bool):
                 plan.matched.add(n)
                 if n == _KEEP_FRONT:
                     plan.labels[n] = _app_label(title)
-            # ANOTHER app's window kept only because its title names the
-            # app ("Claude - Google Chrome" while no Claude app runs) is
-            # reported (2026-10-05): the owner then hears why it is still
-            # open. A document / folder named in the keep is not.
+            # A browser window kept only by its page ("Claude - Google
+            # Chrome" while no Claude app runs) is reported (2026-10-05):
+            # the owner then hears which browser stayed open. A document /
+            # folder named in the keep, or an app's own title, is not.
             if all(how_by[n] == "title"
                    and _kept_by_title_only(w, _keep_key(n)) for n in hit):
                 plan.by_title.setdefault(hit[0], []).append(w)
@@ -2374,32 +2649,43 @@ def _all_windows_except(arg: str, closing: bool) -> str:
 
 
 def _all_except_correction(plan) -> "tuple | None":
-    """(corrected names, heard, suggested) for a plan in which NO keep name
-    matched, when every unmatched name is one open name misheard
-    (core.name_suggest against the windows the plan saw); else None.
-    "Claw" -> (["Claude"], "Claw", "Claude"). Never raises."""
+    """(corrected names, heard, suggested) when at least one keep name that
+    matched no window is one open name misheard (core.name_suggest against
+    the windows the plan saw); else None. "Claw" -> (["Claude"], "Claw",
+    "Claude"); "Excel, Claw" -> (["Excel", "Claude"], "Claw", "Claude"): the
+    names that matched stay, and a name with no suggestion stays as said (it
+    is reported as not found when the corrected close runs). Review
+    2026-10-05: with one name matched and one misheard, the bulk close went
+    ahead and closed the app the owner meant to keep. Never raises."""
     try:
-        if plan is None or plan.matched or plan.front_missing:
+        if plan is None or plan.front_missing:
             return None
-        names = [n for n in plan.names if n != _KEEP_FRONT]
-        if not names:
-            return None
-        fixed = []
-        for n in names:
+        fixed, heard, said = [], [], []
+        for n in plan.names:
+            if n == _KEEP_FRONT:
+                fixed.append("this one")
+                continue
+            if n in plan.matched:
+                fixed.append(n)
+                continue
             s = _suggest_window_name(n, plan.scoped)
-            if not s:
-                return None
-            fixed.append(s)
-        return (fixed, _spoken_list([_keep_key(n) for n in names], "and"),
-                _spoken_list(fixed, "and"))
+            if s:
+                fixed.append(s)
+                heard.append(_keep_key(n))
+                said.append(s)
+            else:
+                fixed.append(n)
+        if not said:
+            return None
+        return fixed, _spoken_list(heard, "or"), _spoken_list(said, "and")
     except Exception:
         return None
 
 
 def _close_all_windows_except_suggestion(arg) -> "tuple | None":
-    """For a close_all_windows_except(``arg``) whose keep names match no
-    window but are open names misheard: (corrected arg, titles it would then
-    close, heard, suggested); else None. The pushback asks "Did you mean
+    """For a close_all_windows_except(``arg``) with a keep name that matches
+    no window but is an open name misheard: (corrected arg, titles it would
+    then close, heard, suggested); else None. The pushback asks "Did you mean
     Claude?" with it and holds the corrected command for a yes. Never
     raises."""
     try:
@@ -2419,7 +2705,7 @@ def _close_all_windows_except_suggestion(arg) -> "tuple | None":
         return None
 
 
-def _close_name_question(name, arg, closing=None) -> "tuple | None":
+def _close_name_question(name, arg) -> "tuple | None":
     """(question, reason, corrected arg) when a close names a window that is
     not open but one that IS open sounds like it - "close everything except
     Claw" while Claude is open (live 2026-10-05) - else None. A close on a
@@ -2428,10 +2714,10 @@ def _close_name_question(name, arg, closing=None) -> "tuple | None":
 
       * close_window: no window title carries the name, no running app is
         it (_find_app_windows), and _window_name_suggestion has one;
-      * close_all_windows_except: its plan keeps nothing
-        (_close_all_windows_except_preview is empty) and every keep name is
-        a misheard open name (_close_all_windows_except_suggestion). The
-        question carries the count, so the yes needs no second one.
+      * close_all_windows_except: a keep name that matches no window is a
+        misheard open name (_close_all_windows_except_suggestion) - whether
+        or not the other keep names matched. The question carries the
+        count of the corrected close, so the yes needs no second one.
     A lookup that fails asks nothing. Never raises."""
     try:
         bc = _bc()
@@ -2458,15 +2744,9 @@ def _close_name_question(name, arg, closing=None) -> "tuple | None":
                     f"close_window: no {heard!r} window; did you mean "
                     f"{sugg!r}", sugg)
         if nm == "close_all_windows_except":
-            # ``closing``: the caller's _close_all_windows_except_preview
-            # list, when it already read it (the pushback does).
-            try:
-                if closing is None:
-                    closing = bc._close_all_windows_except_preview(raw)
-                if closing:
-                    return None
-            except Exception:
-                return None
+            # Asked BEFORE anything closes, also when other keep names
+            # matched (review 2026-10-05): "except Excel and Claw" would
+            # otherwise close Claude.
             fix = bc._close_all_windows_except_suggestion(raw)
             if not isinstance(fix, tuple) or len(fix) != 4:
                 return None
@@ -2498,24 +2778,58 @@ BULK_CLOSE_FOLLOWUP_S = 120.0
 
 
 class _BulkClose:
-    __slots__ = ("at", "keep", "closed")
+    """One bulk close that ran: when, the keep names, the titles it closed,
+    and the windows it KEPT and SPARED (left open on purpose - a terminal, a
+    window that may host JARVIS), by _window_key. Review 2026-10-05: "you
+    forgot Chrome" closed the Chrome window kept for "YouTube", and "you
+    forgot <the dev-server terminal>" closed the terminal the bulk close had
+    just said it left open."""
+    __slots__ = ("at", "keep", "closed", "kept_keys", "spared_keys",
+                 "page_kept_keys", "labels")
 
-    def __init__(self, at, keep, closed):
+    def __init__(self, at, keep, closed, kept_keys=(), spared_keys=(),
+                 labels=None, page_kept_keys=()):
         self.at = at
         self.keep = tuple(keep)
         self.closed = tuple(closed)
+        self.kept_keys = frozenset(kept_keys)
+        self.spared_keys = frozenset(spared_keys)
+        # Browser windows kept ONLY for a page (the owner heard "Google
+        # Chrome stays open for its Claude page").
+        self.page_kept_keys = frozenset(page_kept_keys) & self.kept_keys
+        self.labels = dict(labels or {})
+
+    @property
+    def keys(self) -> frozenset:
+        """Every window the bulk close kept or spared."""
+        return self.kept_keys | self.spared_keys
+
+    @property
+    def loose_keys(self) -> frozenset:
+        """The same, less the browser windows kept only for a page."""
+        return (self.kept_keys - self.page_kept_keys) | self.spared_keys
 
 
 _LAST_BULK_CLOSE: list = [None]
 
 
 def _note_bulk_close(plan, closed) -> None:
-    """Remember a bulk close that ran (its keep names and what it closed)."""
+    """Remember a bulk close that ran: its keep names, what it closed, and
+    which of the owner's windows it kept or spared."""
     try:
+        kept = {_window_key(w) for w in plan.kept}
+        targets = {_window_key(w) for w in plan.targets}
+        spared = {_window_key(w) for w in plan.scoped
+                  if _window_key(w) not in kept
+                  and _window_key(w) not in targets}
+        labels = {_window_key(w): _spoken_title(w)
+                  for w in plan.scoped if _window_key(w) in kept | spared}
+        page_kept = {_window_key(w) for wins in plan.by_title.values()
+                     for w in wins}
         _LAST_BULK_CLOSE[0] = _BulkClose(
             time.monotonic(),
             [_keep_key(n) for n in plan.names if n != _KEEP_FRONT],
-            list(closed or ()))
+            list(closed or ()), kept, spared, labels, page_kept)
     except Exception:
         pass
 
@@ -2531,6 +2845,48 @@ def _last_bulk_close(max_age_s: float = BULK_CLOSE_FOLLOWUP_S):
         return rec if 0 <= age <= max_age_s else None
     except Exception:
         return None
+
+
+def _forgot_bulk_close():
+    """The fresh bulk close (_last_bulk_close) when the owner's words this
+    turn are "you forgot X" / "X is still open"
+    (core.dispatcher.forgot_close_target), else None: a close in that turn
+    must not touch what the bulk close kept or spared. Never raises."""
+    try:
+        bulk = _last_bulk_close()
+        if bulk is None:
+            return None
+        said = _seam_str(_bc(), "_turn_user_text")
+        if not said:
+            return None
+        from core.dispatcher import forgot_close_target
+        return bulk if forgot_close_target(said) else None
+    except Exception:
+        return None
+
+
+def _forgot_spared_line(bc, title_q, bulk) -> str:
+    """The TERMINAL line when the only windows ``title_q`` names are ones the
+    last bulk close kept or spared on purpose; "" otherwise. Never
+    raises."""
+    try:
+        from core.failure_markers import TERMINAL_FAILURE_PREFIX
+        hits = list(bc._find_windows_by_title(title_q) or [])
+        if not hits:
+            hits = _seam_list(bc, "_find_app_windows", title_q)
+        hits = [w for w in hits if _window_key(w) in bulk.keys]
+        if not hits:
+            return ""
+        key = _window_key(hits[0])
+        label = bulk.labels.get(key) or _spoken_title(hits[0])
+        if key in bulk.kept_keys:
+            return (TERMINAL_FAILURE_PREFIX + f"You asked me to keep {label} "
+                    "open, sir, so I've left it.")
+        return (TERMINAL_FAILURE_PREFIX + f"I left {label} open on purpose, "
+                "sir: closing it could end whatever runs in it - me "
+                "included.")
+    except Exception:
+        return ""
 
 
 def _act_close_all_windows_except(arg: str) -> str:
@@ -2642,6 +2998,11 @@ def _act_type(text: str) -> str:
     # which could be a chat, a code editor, a browser address bar, anything.
     # Refuse and tell the LLM to use run_shell instead.
     bc = _bc()
+    # Never typing on a sign-in page the owner did not ask for - an address,
+    # a code (core.auth_guard, review 2026-10-05).
+    refusal = _input_auth_refusal(bc, "type", text)
+    if refusal:
+        return refusal
     if bc._looks_like_shell_command(text) and not bc._active_window_is_terminal():
         preview = text.strip().splitlines()[0][:80]
         return (
@@ -3074,68 +3435,137 @@ def _act_click(args: str) -> str:
     return f"clicked '{args}' at {coords}"
 
 
-def _opened_page_context() -> "tuple[str, str] | None":
-    """(the URL / app JARVIS opened last, the CURRENT title of its window)
-    for core.opened_ledger's newest entry no older than PAGE_MAX_AGE_S; the
-    title is "" when its window can't be found. None when nothing was
-    opened. Never raises."""
+def _opened_page_context(fg_hwnd=None) -> "tuple[str, str] | None":
+    """(the URL / app JARVIS opened last - "" once its page has moved on -,
+    the CURRENT title of its window) for core.opened_ledger's newest entry
+    no older than PAGE_MAX_AGE_S, when that window still exists and is the
+    window in front (``fg_hwnd``; unknown counts as in front). None
+    otherwise. Review 2026-10-05: a /login address JARVIS opened kept
+    refusing every click for ten minutes, whatever was in front and after
+    he had signed in. The address counts only while the window still shows
+    the title it was opened with. Never raises."""
     try:
         from core import opened_ledger as _ol
         entry = _ol.last_opened(_ol.PAGE_MAX_AGE_S)
-        if entry is None:
+        if entry is None or entry.hwnd is None:
             return None
-        title = ""
-        if entry.hwnd is not None:
-            try:
-                import pygetwindow as gw
-                win = next((w for w in gw.getAllWindows()
-                            if getattr(w, "_hWnd", None) == entry.hwnd), None)
-                title = str(getattr(win, "title", "") or "") if win else ""
-            except Exception:
-                title = ""
-        return str(entry.target or ""), title
+        if isinstance(fg_hwnd, int) and fg_hwnd != entry.hwnd:
+            return None
+        import pygetwindow as gw
+        win = next((w for w in gw.getAllWindows()
+                    if getattr(w, "_hWnd", None) == entry.hwnd), None)
+        title = str(getattr(win, "title", "") or "") if win else ""
+        if not title:
+            return None
+        url = (str(entry.target or "")
+               if entry.title and title == entry.title else "")
+        return url, title
     except Exception:
         return None
 
 
+def _seam_true(bc, name: str, *args) -> bool:
+    """``bc.<name>(*args) is True`` (a Mock monolith is never True)."""
+    try:
+        return getattr(bc, name)(*args) is True
+    except Exception:
+        return False
+
+
+def _auth_context(bc) -> dict:
+    """What core.auth_guard judges an input by: the owner's words this
+    turn, the page in front (the focused window's title; the page JARVIS
+    opened, while it is in front), what this turn's looks at the screen
+    said, what its find_on_screen looked for, and whether an input was
+    already refused this turn. Never raises."""
+    ctx = {"owner_text": _seam_str(bc, "_turn_user_text"), "urls": [],
+           "titles": [], "screen_texts": [], "looked_for": [],
+           "refused_before": False}
+    try:
+        fg_hwnd = None
+        try:
+            fg = bc._read_focused_window()
+            if isinstance(fg, tuple) and len(fg) >= 2:
+                if isinstance(fg[0], int):
+                    fg_hwnd = fg[0]
+                if isinstance(fg[1], str):
+                    ctx["titles"].append(fg[1])
+        except Exception:
+            pass
+        page = _opened_page_context(fg_hwnd)
+        if page is not None:
+            if page[0]:
+                ctx["urls"].append(page[0])
+            if page[1] not in ctx["titles"]:
+                ctx["titles"].append(page[1])
+        ctx["screen_texts"] = [s for s in _seam_list(bc, "_turn_screen_texts")
+                               if isinstance(s, str)]
+        ctx["looked_for"] = [s for s in _seam_list(bc, "_turn_click_targets")
+                             if isinstance(s, str)]
+        ctx["refused_before"] = _seam_true(bc, "_turn_auth_refused")
+    except Exception:
+        pass
+    return ctx
+
+
+def _note_auth_refusal(bc, what: str, why: str) -> None:
+    """Log a refused input (never its target: an account entry carries the
+    owner's name and e-mail address) and mark the turn, so the rest of the
+    reply's clicks and keys are refused too."""
+    print(f"  [auth-guard] not {what} ({why or 'an earlier refusal'}): the "
+          "owner did not ask for it this turn", flush=True)
+    try:
+        bc._turn_note_auth_refused()
+    except Exception:
+        pass
+
+
 def _click_auth_refusal(bc, description: str) -> str:
     """The TERMINAL refusal (core.auth_guard.click_refusal) when this click
-    would pick an account, sign in or grant consent - or land anywhere on a
-    sign-in page - and the owner's own words this turn did not ask for that
-    exact click; "" when the click may go ahead.
+    would pick an account, sign in or grant access - or land on a sign-in
+    page - and the owner's own words this turn did not ask for that exact
+    click; "" when the click may go ahead.
 
     Live 2026-10-05 00:14:18: the owner asked for the console page "so I can
     sign in"; JARVIS looked at the screen and clicked his Google account
-    entry by itself. The page is read from the window in front, the page
-    JARVIS opened (its address and its window's title now) and what this
-    turn's looks at the screen said. Never raises."""
+    entry by itself. Never raises."""
     try:
         from core import auth_guard as _ag
-        said = _seam_str(bc, "_turn_user_text")
-        urls: list = []
-        titles: list = []
-        try:
-            fg = bc._read_focused_window()
-            if (isinstance(fg, tuple) and len(fg) >= 2
-                    and isinstance(fg[1], str)):
-                titles.append(fg[1])
-        except Exception:
-            pass
-        page = _opened_page_context()
-        if page is not None:
-            urls.append(page[0])
-            if page[1]:
-                titles.append(page[1])
-        screens = [s for s in _seam_list(bc, "_turn_screen_texts")
-                   if isinstance(s, str)]
-        line = _ag.click_refusal(description, said, urls, titles, screens)
+        ctx = _auth_context(bc)
+        line = _ag.click_refusal(description, **ctx)
         if line:
-            # The target itself is not logged: an account entry carries the
-            # owner's name and e-mail address.
             why = (_ag.auth_control(description)
-                   or _ag.auth_page(urls, titles, screens))
-            print(f"  [auth-guard] not clicking ({why}): the owner did not "
-                  "ask for that click this turn", flush=True)
+                   or _ag.auth_page(ctx["urls"], ctx["titles"],
+                                    ctx["screen_texts"])
+                   or _ag.auth_overlay(ctx["screen_texts"])
+                   or ("it looked for a sign-in control"
+                       if ctx["looked_for"] else ""))
+            _note_auth_refusal(bc, "clicking", why)
+        return line
+    except Exception:
+        return ""
+
+
+def _input_auth_refusal(bc, kind: str, value: str) -> str:
+    """The TERMINAL refusal (core.auth_guard.input_refusal) for typing or a
+    submit key on a sign-in page / under a sign-in pop-up, or after an input
+    was refused this turn, that the owner did not ask for this turn; "" when
+    it may go ahead. Review 2026-10-05: the click guard alone left
+    "[ACTION: type, <address>] [ACTION: press, enter]" free to sign him in.
+    Never raises."""
+    try:
+        from core import auth_guard as _ag
+        if kind != "type" and not _ag.is_submit_key(value):
+            return ""
+        ctx = _auth_context(bc)
+        ctx.pop("looked_for", None)
+        line = _ag.input_refusal(kind, value, **ctx)
+        if line:
+            why = (_ag.auth_page(ctx["urls"], ctx["titles"],
+                                 ctx["screen_texts"])
+                   or _ag.auth_overlay(ctx["screen_texts"]))
+            _note_auth_refusal(bc, "typing" if kind == "type"
+                               else "pressing that key", why)
         return line
     except Exception:
         return ""
@@ -3200,6 +3630,10 @@ def _opened_page_now():
 def _act_hotkey(args: str) -> str:
     bc = _bc()
     keys = [bc._normalize_key(k) for k in args.split("+")]
+    refusal = _input_auth_refusal(
+        bc, "hotkey", "+".join(k for k in keys if isinstance(k, str)))
+    if refusal:
+        return refusal
     # Refuse alt+f4 if the currently focused window is our host process
     if set(keys) == {"alt", "f4"}:
         try:
@@ -6382,6 +6816,8 @@ __all__ = [
     # Named closes, misheard names and "you forgot X" (2026-10-05)
     "_find_app_windows",
     "_names_open_window",
+    "_named_close_state",
+    "_close_window_preview",
     "_window_name_suggestion",
     "_close_all_windows_except_suggestion",
     "_close_name_question",

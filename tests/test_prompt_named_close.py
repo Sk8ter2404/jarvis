@@ -24,10 +24,10 @@ from core import prompt_router as pr
 from core.prompts import PC_CONTROL_PROMPT, PC_CONTROL_SAFETY_RULES
 
 LIVE = (
-    "Jarvis, go ahead and close out File Explorer 2.",
-    "Jarvis, close file explorer.",
-    "Jarvis Close File Explorer.",
-    "Jarvis close Google Chrome.",
+    "Jarvis, please close out File Explorer 2.",
+    "Jarvis, close the file explorer.",
+    "Jarvis Close File Explorer now.",
+    "Jarvis close Google Chrome for me.",
 )
 
 

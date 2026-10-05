@@ -96,9 +96,8 @@ class KeepTheRunningAppTests(_Desk):
         out = A._act_close_all_windows_except("Claude")
         self.assertFalse(self.web.closed)
         self.assertTrue(self.files.closed and self.pad.closed)
-        self.assertEqual(out, "Closed 4 windows, sir; kept Claude. I kept "
-                              "Google Chrome only because its title mentions "
-                              "Claude.")
+        self.assertEqual(out, "Closed 4 windows, sir; kept Claude. Google "
+                              "Chrome stays open for its Claude page.")
 
     def test_the_minimize_variant_follows_the_same_keep(self):
         self.live_desktop()
@@ -186,11 +185,23 @@ class NamedCloseWindowTests(_Desk):
         self.assertTrue(self.web.closed)
         self.assertFalse(self.claude.closed)
 
-    def test_a_terminal_is_never_found_by_its_process(self):
+    def test_a_terminal_closes_by_name_only_when_it_is_the_name(self):
+        # Review 2026-10-05: a terminal is closed by name only when the
+        # owner named the terminal itself - never one a title word swept in.
         term = self.add("build log", 0x92, "WindowsTerminal.exe")
         self.classes[0x92] = "cascadia_hosting_window_class"
-        self.assertEqual(A._find_app_windows("Windows Terminal"), [])
+        self.assertEqual(A._find_app_windows("Windows Terminal"), [term])
+        # A word of its title is not its name: left open, and said.
+        out = A._act_close_window("build")
         self.assertFalse(term.closed)
+        self.assertEqual(fm.terminal_failure_text(out),
+                         "build log is a terminal, sir; closing it would end "
+                         "whatever runs in it, so I've left it open.")
+        self.assertFalse(A._names_open_window("build"))
+        # Its whole title is.
+        self.assertEqual(A._act_close_window("build log"),
+                         "closed: build log")
+        self.assertTrue(term.closed)
 
     def test_the_route_bar_is_a_window_named_as_itself(self):
         # _names_open_window decides whether "close <name>" is routed to

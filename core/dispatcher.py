@@ -286,7 +286,29 @@ _NC_TAIL_RE = re.compile(
     r"right\s+now|thanks|thank\s+you|jarvis|sir))+[\s.!?]*$", re.IGNORECASE)
 _NC_LEAD_RE = re.compile(r"^(?:(?:the|my|that|this|our)\s+)+", re.IGNORECASE)
 _NC_KIND_RE = re.compile(
-    r"(?:\s+(?:app|application|program|window|windows|tab))+$", re.IGNORECASE)
+    r"(?:\s+(?:app|application|program|window|windows|folder))+$",
+    re.IGNORECASE)
+# Names that point back at what JARVIS opened, played or found (review
+# 2026-10-05: "close what you just opened", "close the tab you opened" and
+# "close that YouTube video" were read as NAMES and rewritten away from
+# close_last_opened, the one action they are for): a relative clause about
+# JARVIS, a lone kind of thing ("the song", "the page", "the browser"), or a
+# name that ends in one ("that YouTube video", "the YouTube tab") - but not
+# an app that ends in a common word ("Apple Music", "Epic Games").
+_NC_RELATIVE_RE = re.compile(
+    r"^what\b|\bwhat(?:ever)?\s+you\b|\b(?:you|jarvis)\s+(?:just\s+|already\s+"
+    r"|have\s+|had\s+|'ve\s+)?(?:opened|open|played|play|put\s+(?:on|up)|"
+    r"pulled\s+up|brought\s+up|started|launched|loaded|showed|found|"
+    r"searched|made|did)\b", re.IGNORECASE)
+_NC_GENERIC_ONE_RE = re.compile(
+    r"^(?:videos?|songs?|tracks?|music|pages?|sites?|websites?|webpages?|"
+    r"browsers?|things?|stuff|shows?|movies?|clips?|playlists?|search|"
+    r"results?|links?|articles?|tabs?|documents?|files?|folders?|games?|"
+    r"streams?|others?|ones?|everything|all)$", re.IGNORECASE)
+_NC_GENERIC_TAIL_RE = re.compile(
+    r"\s(?:videos?|songs?|tracks?|clips?|shows?|movies?|tabs?|pages?|sites?|"
+    r"websites?|webpages?|search|results?|playlists?|links?|articles?|"
+    r"things?)$", re.IGNORECASE)
 # Names that point back or name nothing ("close that", "close it out",
 # "close the window", "close them all"), and the bulk ones.
 _NC_DEICTIC_RE = re.compile(
@@ -326,15 +348,17 @@ def named_close_target(utterance) -> str | None:
         name = " ".join(name.split())
         if (not name or len(name) > _NC_MAX_NAME
                 or any(c in name for c in "[]\r\n,;")
-                or _NC_DEICTIC_RE.match(name)
                 or _NC_BULK_RE.search(name)
                 or _NC_MONITOR_RE.search(name)
+                or _NC_RELATIVE_RE.search(name)
                 or _WK_SECOND_COMMAND_RE.search(name)
                 or len(_split_chain(name)) > 1
                 or re.search(r"\b(?:then|and)\b", name, re.IGNORECASE)):
             return None
         name = _NC_KIND_RE.sub("", _NC_LEAD_RE.sub("", name)).strip()
-        if not name or _NC_DEICTIC_RE.match(name) or len(name) < 2:
+        if (not name or _NC_DEICTIC_RE.match(name) or len(name) < 2
+                or _NC_GENERIC_ONE_RE.match(name)
+                or _NC_GENERIC_TAIL_RE.search(name)):
             return None
         return name
     except Exception:
