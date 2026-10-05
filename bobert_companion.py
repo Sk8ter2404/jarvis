@@ -1716,6 +1716,11 @@ from core.memory_guards import (  # noqa: E402,F401
 from core.failure_markers import FAILURE_MARKERS  # noqa: E402
 from core.failure_markers import (  # noqa: E402
     terminal_failure_text as _terminal_failure_text)
+from core.failure_markers import (  # noqa: E402
+    ACTION_CRASH_MARK as _ACTION_CRASH_MARK,
+    TERMINAL_FAILURE_PREFIX as _TERMINAL_FAILURE_PREFIX)
+# What JARVIS says for a self-voiced action that said nothing (2026-10-05).
+from core import self_voiced as _self_voiced_lines  # noqa: E402
 
 # Write-time quality gates for auto-learned TOPICS / PROJECTS (2026-09-29: a
 # mis-heard TV line became a standing "project" the model then volunteered).
@@ -3830,9 +3835,16 @@ def _run_draft_gated(name: str, arg: str, fn):
     Every path that runs an action it was handed must use this, not fn(arg):
     parse_and_run_actions, the 'yes' that runs a deferred confirmation and the
     autocorrect 'did you mean' pick each used to call the sender directly
-    (B093, 2026-10-01)."""
+    (B093, 2026-10-01).
+
+    A SELF-VOICED action runs through _run_self_voiced (2026-10-05): it waits
+    (bounded) for another device dialogue to end, and a run that said nothing
+    comes back as a terminal failure carrying one honest line - so every one
+    of those paths voices it the same way."""
     if _draft_preview_gate is not None and _is_draft_send(name, fn):
         return _draft_preview_gate.run_with_gate(name, arg, fn)
+    if is_self_voiced(name):
+        return _run_self_voiced(name, arg, fn)
     return fn(arg)
 
 
@@ -32987,6 +32999,19 @@ def _collect_skill_prompt_examples(mod, name: str) -> None:
 # Declared by a skill as a module-level SELF_VOICED_ACTIONS iterable (collected
 # below) or at run time with skill_utils["register_self_voiced"](name). The
 # set is DISJOINT from the two speak sets above: an overlap is refused.
+#
+# ... but only when it DID its own talking (2026-10-05). Live 00:49-00:53 on
+# v2.0.180, five owner turns asked for a device chat; the brain replied
+# "Right away, sir. [ACTION: <chat>, ...]", the skill refused before a word
+# ("... not started: <reason>.") and JARVIS said NOTHING - the prose was
+# dropped as self-voiced and the refusal was neither news nor a failure. Now
+# every self-voiced action runs through _run_self_voiced (the one runner,
+# _run_draft_gated): it speaks on the turn's own thread before it returns, or
+# its result becomes a TERMINAL failure carrying one honest line
+# (core/self_voiced.py) that the main turn, a routed turn and a confirmed
+# "yes" all voice word for word. _self_voiced_did_talk is the ONE test every
+# result-reading path uses; is_self_voiced alone only says what the action
+# is, not what it did.
 SELF_VOICED_ACTIONS: set[str] = set()
 
 
@@ -33013,6 +33038,147 @@ def is_self_voiced(name) -> bool:
     """True when action ``name`` does all of its own talking."""
     try:
         return str(name or "").strip().lower() in SELF_VOICED_ACTIONS
+    except Exception:
+        return False
+
+
+# Lines spoken on each thread (_speak and _speak_line both count one; only
+# before/after DIFFERENCES are read). Per thread, so a proactive line or a
+# tray announcement from another thread is never taken for the action's own.
+_spoken_marks = threading.local()
+
+
+def _note_spoken_here() -> None:
+    """Count one line about to be voiced on this thread. Never raises."""
+    try:
+        _spoken_marks.n = int(getattr(_spoken_marks, "n", 0)) + 1
+    except Exception:
+        pass
+
+
+def _spoken_here() -> int:
+    """Lines counted on this thread so far (see _note_spoken_here)."""
+    try:
+        return int(getattr(_spoken_marks, "n", 0))
+    except Exception:
+        return 0
+
+
+# How long a self-voiced action waits for ANOTHER device dialogue (one on a
+# different thread: an after-reply encore, a web-panel chat, the device still
+# finishing its last line after the owner's wake word cut it) to end before
+# it starts. Bounded: the voice thread never waits longer, and the watchdog
+# is fed while it waits.
+_SELF_VOICED_READY_WAIT_S = 8.0
+_SELF_VOICED_READY_WAIT_MAX_S = 15.0
+_SELF_VOICED_READY_POLL_S = 0.1
+
+
+def _other_dialogue_running() -> bool:
+    """True while a device dialogue runs on ANOTHER thread. Never one on this
+    thread: it cannot end while this thread waits for it. Never raises."""
+    try:
+        h = _dialogue_current[0]
+        if h is not None:
+            return getattr(h, "_thread", None) is not threading.current_thread()
+        return bool(_dialogue_active[0])
+    except Exception:
+        return False
+
+
+def _self_voiced_wait_ready(name: str) -> str:
+    """"" when self-voiced action ``name`` may start now - at once, or once
+    the other device dialogue ended inside the bounded wait - else "active"
+    (still running when the wait ran out). Cancels the turn's processing
+    filler before waiting: a filler line would talk over the other chat.
+    Never raises."""
+    try:
+        if not _other_dialogue_running():
+            return ""
+        try:
+            wait = float(globals().get("_SELF_VOICED_READY_WAIT_S", 8.0))
+        except Exception:
+            wait = 8.0
+        if wait != wait:                 # NaN
+            wait = 8.0
+        wait = min(_SELF_VOICED_READY_WAIT_MAX_S, max(0.0, wait))
+        print(f"  [self-voiced] {name}: another device chat is still running "
+              f"- waiting up to {wait:.0f}s for it to end")
+        try:
+            _processing_filler.cancel("self-voiced-wait")
+        except Exception:
+            pass
+        t0 = time.monotonic()
+        deadline = t0 + wait
+        while _other_dialogue_running():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                print(f"  [self-voiced] {name}: the other chat is still "
+                      f"running after {wait:.0f}s - not started")
+                return "active"
+            try:
+                _heartbeat()
+            except Exception:
+                pass
+            time.sleep(min(_SELF_VOICED_READY_POLL_S, left))
+        print(f"  [self-voiced] {name}: the other chat ended after "
+              f"{time.monotonic() - t0:.1f}s - starting")
+        return ""
+    except Exception:
+        return ""
+
+
+def _run_self_voiced(name: str, arg: str, fn):
+    """Run self-voiced action ``name`` (from _run_draft_gated - every path
+    that runs an action it was handed). First the bounded readiness wait;
+    still busy -> not run, and the result is a terminal failure saying so.
+    Then fn(arg); a run that voiced no line on this thread comes back as a
+    terminal failure carrying the honest line (core/self_voiced.py) - except
+    a deferral (pushback / confirmation / ambiguity: its question is spoken
+    by the normal path), a terminal failure of its own (spoken as is) and an
+    owner stop before the first line (he ended it: nothing is added). An
+    exception propagates unchanged (the caller reports it)."""
+    if _self_voiced_wait_ready(name):
+        return _TERMINAL_FAILURE_PREFIX + _self_voiced_lines.BUSY_LINE
+    n0 = _spoken_here()
+    res = fn(arg)
+    if _spoken_here() != n0:
+        return res
+    try:
+        if isinstance(res, str) and (
+                res.startswith(_ANSWER_FIRST_DEFERRED_PREFIXES)
+                or _terminal_failure_text(res)):
+            return res
+        if _self_voiced_lines.stopped_by_owner(res):
+            print(f"  [self-voiced] {name} said nothing: stopped by the "
+                  f"owner first")
+            return res
+        line = _self_voiced_lines.silent_line(res)
+        print(f"  [self-voiced] {name} said nothing ({str(res)[:80]!r}) - "
+              f"saying why")
+        return _TERMINAL_FAILURE_PREFIX + line
+    except Exception:
+        return res
+
+
+def _self_voiced_did_talk(name, result) -> bool:
+    """THE test of every result-reading path: True when action ``name`` is
+    self-voiced AND ``result`` shows it did its own talking - it is not a
+    deferral (nothing said yet), not a TERMINAL failure (the line JARVIS must
+    say for it; _run_self_voiced turns a run that said nothing into one) and
+    not the dispatcher's crash result (core.failure_markers.ACTION_CRASH_MARK:
+    the failure follow-up reports it). Never raises."""
+    try:
+        if not is_self_voiced(name):
+            return False
+        if isinstance(result, str):
+            if result.startswith(_ANSWER_FIRST_DEFERRED_PREFIXES):
+                return False
+            if _terminal_failure_text(result):
+                return False
+            if _ACTION_CRASH_MARK in result:
+                return False
+        return True
     except Exception:
         return False
 
@@ -33661,7 +33827,25 @@ def _all_self_voiced(action_results) -> bool:
     _ANSWER_FIRST_DEFERRED_PREFIXES results) has said nothing yet: the reply
     then carries the "say 'yes' to proceed" question, which must be spoken,
     or JARVIS waits silently for a confirmation it never asked for and the
-    owner's next sentence cancels it."""
+    owner's next sentence cancels it. And (2026-10-05) at least one of them
+    must have done its own talking (_self_voiced_did_talk): when none did -
+    it refused before a word, or crashed - what happened must be said. A
+    sibling that said nothing after one that talked (the same chat emitted
+    twice, the second refused) adds nothing: the turn was voiced."""
+    try:
+        return _self_voiced_reply(action_results) and any(
+            _self_voiced_did_talk(r[0], r[1]) for r in action_results)
+    except Exception:
+        return False
+
+
+def _self_voiced_reply(action_results) -> bool:
+    """True when ``action_results`` is non-empty and every action in it is
+    self-voiced and was not deferred: the reply's only job was to run them,
+    so its prose (written for a chat the action was to voice itself) is
+    never spoken - whether they then did their own talking
+    (_all_self_voiced) or not (then the honest line is said instead: the
+    routed path, which has no prose, and the brain path say the same)."""
     try:
         return bool(action_results) and all(
             is_self_voiced(r[0])
@@ -37252,7 +37436,7 @@ def _result_hold_name(new_results) -> str:
     try:
         for name, result, info in new_results or ():
             n = str(name or "").strip().lower()
-            if not n or n.startswith("_") or is_self_voiced(n):
+            if not n or n.startswith("_") or _self_voiced_did_talk(n, result):
                 continue
             if not isinstance(result, str) or result.startswith(
                     _ANSWER_FIRST_DEFERRED_PREFIXES):
@@ -38630,6 +38814,12 @@ def handle_autocorrect_disambig_response(user_text: str) -> bool:
         record_session_action(name, arg)
         if name != "replay_last_action":
             record_action_history(name, arg, res)
+        # A terminal failure is the owner's sentence (a self-voiced action
+        # that said nothing included, 2026-10-05): say it, not "Running"
+        # followed by silence.
+        _t_line = _terminal_failure_text(res)
+        if _t_line:
+            _speak(_t_line)
     except Exception as e:
         print(f"  [action] {name} failed: {e}")
     return True
@@ -38700,10 +38890,10 @@ def handle_confirmation_response(user_text: str) -> bool:
                 print(f"  [action] {name}: {res}")
                 # A deferral string (a pushback / confirmation / ambiguity
                 # prompt) has said nothing yet, so it takes the normal path
-                # below — the same carve-out _all_self_voiced makes.
-                if is_self_voiced(name) and not (
-                        isinstance(res, str)
-                        and res.startswith(_ANSWER_FIRST_DEFERRED_PREFIXES)):
+                # below — the same carve-out _all_self_voiced makes. So does
+                # a run that said nothing (2026-10-05): _run_self_voiced made
+                # it a terminal failure, and its honest line is spoken below.
+                if _self_voiced_did_talk(name, res):
                     self_voiced_ran.append(name)
                     continue
                 # A soft failure is signalled by a RETURNED marker substring, not
@@ -39022,7 +39212,7 @@ def _failed_or_refused_actions(action_results) -> list:
     try:
         for name, result, _info in action_results or ():
             n = str(name or "").strip().lower()
-            if not n or n.startswith("_") or is_self_voiced(n):
+            if not n or n.startswith("_") or _self_voiced_did_talk(n, result):
                 continue
             if not isinstance(result, str) or result.startswith(
                     _ANSWER_FIRST_DEFERRED_PREFIXES):
@@ -39852,6 +40042,10 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
         _last_wry[0] = False
         _last_mood[0] = None
         return
+    # A line is about to be voiced on this thread (or recorded, on staging):
+    # a self-voiced action that got here did its own talking
+    # (_run_self_voiced, 2026-10-05).
+    _note_spoken_here()
     # Publish the stripped text so the holographic overlay's center text
     # panel can render "what JARVIS just said" alongside last_transcript.
     if spoken_text:
@@ -40799,6 +40993,11 @@ def _speak_line(text: str, mood: str | None = None) -> str:
                              daemon=True).start()
         except Exception:
             pass
+    # The dialogue's own line, counted here as well as in _speak: a
+    # self-voiced action that reached this point did its own talking
+    # (_run_self_voiced). A line refused above (muted, staging, the mic still
+    # held) is not counted - nothing was heard.
+    _note_spoken_here()
     try:
         ok = _speak(text, mood=mood)
     except Exception:
@@ -41174,7 +41373,7 @@ def _do_proactive_turn(memory: dict):
     spoken, _proactive_results = parse_and_run_actions(text)
     # A self-voiced action has already spoken; never voice its result again.
     _proactive_results = [r for r in _proactive_results
-                          if not is_self_voiced(r[0])]
+                          if not _self_voiced_did_talk(r[0], r[1])]
     spoken = _apply_quip_layer(spoken, _proactive_results)
     _speak(spoken)
     if isinstance(spoken, str) and spoken.strip():
@@ -44857,7 +45056,7 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
         # a synthetic "_" result: that would ask for a round we don't run).
         info = [] if _terminal else [
             (n, r) for (n, r, i) in results
-            if not str(n).startswith("_") and not is_self_voiced(n)
+            if not str(n).startswith("_") and not _self_voiced_did_talk(n, r)
             and (i or _action_result_failed(r))]
         if info and not _turn_check_barged(barge_seq0):
             set_state("thinking")
@@ -45215,8 +45414,19 @@ def _run_llm_dispatch_body(text: str) -> str:
     # Self-voiced actions (a device dialogue) already said everything: no
     # prose, answer-first, quip, verbatim result or follow-up for this reply.
     _self_voiced_only = _all_self_voiced(action_results)
+    # A reply whose every action is self-voiced never voices its prose (it was
+    # written for a chat the action voices itself). When one of them said
+    # nothing (2026-10-05, live 00:49-00:53: "Right away, sir." was dropped and
+    # then NOTHING followed), its honest line is said instead - the terminal
+    # failure _run_self_voiced made, spoken below as a verbatim result - the
+    # same line a routed turn (no prose at all) says.
+    _sv_reply = _self_voiced_reply(action_results)
     if _self_voiced_only:
         print("  [self-voiced] the action did its own talking")
+        spoken_text = ""
+    elif _sv_reply:
+        print("  [self-voiced] the action said nothing - its reply's prose is "
+              "not voiced; saying what happened instead")
         spoken_text = ""
     # "On it, sir. You asked about X." answering a question: the preface is
     # filler, not a promise — speak only the answer (2026-09-29). The quip
@@ -45273,7 +45483,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         print(f"  [answer-first] dropped lead-in ({_af_words} words)")
         _tt("note_lead_dropped")
         spoken_text = ""
-    elif not _self_voiced_only:
+    elif not _sv_reply:
         spoken_text = _apply_quip_layer(spoken_text, action_results)
     # Honest close-out bookkeeping (NEW #6) - see _chain_close_out_line.
     _spoke_substance = False
@@ -45365,7 +45575,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         # explain: the action already said what it had to.
         informative = [
             (n, r) for (n, r, is_info) in current_results
-            if not is_self_voiced(n) and (is_info or _is_failure(r))
+            if not _self_voiced_did_talk(n, r) and (is_info or _is_failure(r))
         ]
         if not informative:
             break
@@ -45490,7 +45700,7 @@ def _run_llm_dispatch_body(text: str) -> str:
             _spoke_substance = _spoke_substance or bool(_round_verbatim)
     else:
         # Depth cap: the last round's results were never read back.
-        if any(not is_self_voiced(n) and (i or _is_failure(r))
+        if any(not _self_voiced_did_talk(n, r) and (i or _is_failure(r))
                for (n, r, i) in current_results):
             _chain_cut = "depth cap"
     # A chain can also stop on its own words (2026-10-02 review repair): the
@@ -45523,7 +45733,7 @@ def _run_llm_dispatch_body(text: str) -> str:
     # (_note_open_offer, 2026-10-02) - unless the turn ended on something
     # else. Before the ledger records this chain's offers as closed.
     _note_open_offer(_chain_texts,
-                     skip=bool(_barged or _close or _self_voiced_only))
+                     skip=bool(_barged or _close or _sv_reply))
     # The chain is over: its offers are closed (NEW #13) - a later turn's
     # "Also, …" aside that repeats one is not spoken.
     _record_turn_offers(_chain_texts)
@@ -45536,7 +45746,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         _turn_check_after_chain(
             text, _chain_texts, _chain_results,
             skip=(_route_reply is not None or _glance_reply is not None
-                  or _barged or _self_voiced_only),
+                  or _barged or _sv_reply),
             close_line=_close, barge_seq0=_barge_seq0)
     except Exception as _tc_err:
         print(f"  [turn-check] skipped - {type(_tc_err).__name__}: "

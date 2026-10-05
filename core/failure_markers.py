@@ -66,6 +66,15 @@ FAILURE_MARKERS: tuple[str, ...] = (
 TERMINAL_FAILURE_PREFIX = "failed (final): "
 
 
+# The dispatcher's result for an action that RAISED (parse_and_run_actions:
+# "<JARVIS-voice line> (action failed; class=<class>; <technical>)", see
+# jarvis_failure_lines.failure_message). It carries "failed", so it is a
+# failure for every consumer above; a SELF-VOICED action's crash is reported
+# by the failure follow-up instead of being taken for its own talking
+# (bobert_companion._self_voiced_did_talk, 2026-10-05).
+ACTION_CRASH_MARK = "(action failed; class="
+
+
 def terminal_failure_text(result) -> str:
     """The owner-facing line of a terminal failure result, else ""."""
     if not isinstance(result, str) or not result.startswith(

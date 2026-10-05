@@ -22,7 +22,9 @@ Covers:
     a non-wake transcript is dropped and a wake-prefixed / typed one passes;
     the learners return early during a dialogue;
   * SELF_VOICED actions: nothing else is spoken for an all-self-voiced reply
-    (prose, quip, verbatim, follow-up; a failure-marker result is ignored),
+    (prose, quip, verbatim, follow-up; a failure-marker result is ignored)
+    once the action has spoken (a run that said nothing:
+    test_monolith_self_voiced_silent),
     mixed replies keep their speech, the proactive path never voices one,
     the chain dispatcher gets the predicate, the speak sets stay disjoint;
   * _local_complete: no local-mode directive, the sampling options and
@@ -1249,9 +1251,15 @@ class ConfirmedSelfVoicedTests(_Base):
                                 return_value="Following up.")
         self.ran = []
         acts = dict(bc.ACTIONS)
-        acts["desk_chat"] = lambda a="": (
+
+        def _chat(a=""):
+            # A real self-voiced action speaks its own lines (on this thread)
+            # before it returns; one that says nothing gets JARVIS's honest
+            # line instead (_run_self_voiced, 2026-10-05).
             self.ran.append("desk_chat")
-            or "Dialogue finished: 4 lines, done.")
+            bc._speak_line("After you, desk device.")
+            return "Dialogue finished: 4 lines, done."
+        acts["desk_chat"] = _chat
         acts["desk_lamp"] = lambda a="": self.ran.append("desk_lamp") or "ok"
         self._p(bc, "ACTIONS", acts)
         self._p(bc, "_pending_confirmation", [])
@@ -1266,22 +1274,36 @@ class ConfirmedSelfVoicedTests(_Base):
     def test_confirmed_self_voiced_action_gets_no_done(self):
         self.assertTrue(self._confirm("desk_chat"))
         self.assertEqual(self.ran, ["desk_chat"])
-        self.assertEqual(self.spoken, [],
+        self.assertEqual(self.spoken, ["After you, desk device."],
                          "JARVIS added feedback on top of a self-voiced "
                          "action that already did its own talking")
         self.followup.assert_not_called()
         self.assertEqual(self.bc._pending_confirmation, [])
 
     def test_a_failure_marker_result_is_not_reported_either(self):
-        self.bc.ACTIONS["desk_chat"] = lambda a="": (
-            "It failed and could not start.")
+        # ... once the action has spoken: it said what it had to.
+        def _chat(a=""):
+            self.bc._speak_line("We seem to have lost it, sir.")
+            return "It failed and could not start."
+        self.bc.ACTIONS["desk_chat"] = _chat
         self._confirm("desk_chat")
-        self.assertEqual(self.spoken, [])
+        self.assertEqual(self.spoken, ["We seem to have lost it, sir."])
+
+    def test_a_confirmed_run_that_said_nothing_is_said_aloud(self):
+        # 2026-10-05: a confirmed self-voiced action that refused before a
+        # word used to end in silence (no "Done.", no reason).
+        self.bc.ACTIONS["desk_chat"] = lambda a="": (
+            "Chat not started: mic_muted.")
+        self._confirm("desk_chat")
+        self.assertEqual(self.spoken, [
+            "I'm afraid the chat didn't start, sir; the microphone is "
+            "muted."])
+        self.followup.assert_not_called()
 
     def test_mixed_confirmation_says_done_for_the_plain_action_only(self):
         self._confirm("desk_chat", "desk_lamp")
         self.assertEqual(self.ran, ["desk_chat", "desk_lamp"])
-        self.assertEqual(self.spoken, ["Done."])
+        self.assertEqual(self.spoken, ["After you, desk device.", "Done."])
 
     def test_a_raising_self_voiced_action_is_still_reported(self):
         def boom(_a=""):
@@ -1300,7 +1322,7 @@ class ConfirmedSelfVoicedTests(_Base):
     def test_unregistered_action_still_says_done(self):
         self.bc.SELF_VOICED_ACTIONS.clear()
         self._confirm("desk_chat")
-        self.assertEqual(self.spoken, ["Done."])
+        self.assertEqual(self.spoken, ["After you, desk device.", "Done."])
 
     def test_declining_still_says_cancelled(self):
         self._confirm("desk_chat", answer="no")

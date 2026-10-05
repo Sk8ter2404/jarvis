@@ -114,12 +114,23 @@ class UtteranceRouteDispatchTests(_Base):
         self.assertFalse(self.bc.register_utterance_route("nope", "x"))
 
     def test_a_self_voiced_route_speaks_nothing_more(self):
-        self._p(self.bc, "SELF_VOICED_ACTIONS", {"desk_chat"})
+        bc = self.bc
+        self._p(bc, "SELF_VOICED_ACTIONS", {"desk_chat"})
+        self._p(bc, "_is_staging", return_value=False)
+        self._p(bc, "_tts_muted", [False])
+        stub = self.chat
+
+        def _chat(arg=""):
+            # A real self-voiced action voices its own lines before it
+            # returns (_run_self_voiced, 2026-10-05).
+            bc._speak_line("Pizza, desk device?")
+            return stub(arg)
+        self._actions["desk_chat"] = _chat
         self._route(lambda t: "[ACTION: desk_chat, pizza]")
         out = self._run("talk to the desk device about pizza")
         self.assertEqual(self.calls["desk_chat"], ["pizza"])
         self.assertIn("[self-voiced]", out)
-        self.assertEqual(self.spoken, [])
+        self.assertEqual(self.spoken, ["Pizza, desk device?"])
 
     def test_skill_utils_exposes_the_hook(self):
         self.assertIn("register_utterance_route", self.bc.skill_utils)
