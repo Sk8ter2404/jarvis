@@ -364,7 +364,44 @@ def split_first_clause(text: str) -> Optional[Tuple[str, str]]:
     return None if best is None else (best[1], best[2])
 
 
-def plan_clone_chunks(text: str, min_chars: int = MIN_CHARS) -> List[str]:
+def _cached(is_cached, text: str) -> bool:
+    """is_cached(text), False when it raises."""
+    try:
+        return bool(is_cached(text))
+    except Exception:
+        return False
+
+
+def _cache_aware_plan(text: str, min_chars: int,
+                      is_cached) -> Optional[List[str]]:
+    """The chunks when the clone's render cache already holds the reply's
+    opening, else None (plan as usual):
+
+      * the first chunk `plan_chunks` makes (the whole short reply, or the
+        first sentence of a long one) is cached -> keep it WHOLE, however
+        long: it plays at once, so splitting it at a clause would only
+        replace an instant take with a render;
+      * else the first SENTENCE of that chunk is cached -> start with it,
+        then the rest of that chunk as one piece (rendered while the cached
+        sentence plays, with the whole chunk's render budget), then the
+        reply's other chunks."""
+    chunks = plan_chunks(text, min_chars)
+    if not chunks:
+        return None
+    first = chunks[0]
+    if _cached(is_cached, first):
+        return chunks
+    parts = split_sentences(first)
+    if len(parts) > 1 and _cached(is_cached, parts[0]):
+        rest = " ".join(parts[1:])
+        return ([parts[0], Chunk(rest, budget_chars=len(first))]
+                + list(chunks[1:]))
+    return None
+
+
+def plan_clone_chunks(text: str, min_chars: int = MIN_CHARS,
+                      is_cached: Optional[Callable[[str], bool]] = None
+                      ) -> List[str]:
     """`plan_chunks` for the clone voice server: the same chunks, except that
     a first line longer than CLAUSE_SPLIT_MIN_CHARS is voiced in pieces so
     the first audio comes sooner --
@@ -379,7 +416,18 @@ def plan_clone_chunks(text: str, min_chars: int = MIN_CHARS) -> List[str]:
 
     No piece ever gets less render budget than the unsplit text it came from
     had as one render. Never used for Kokoro (its replies are planned by
-    plan_chunks)."""
+    plan_chunks).
+
+    `is_cached(text)` (the clone client's render cache, VOICE_CLONE_CACHE
+    'on'; 2026-10-05): when the reply's opening is already cached the plan
+    starts with it instead (_cache_aware_plan) -- a cached first sentence
+    plays whole even when it is long, and a short reply whose first
+    sentence is cached is split there. None, or nothing cached: exactly the
+    plan above."""
+    if is_cached is not None:
+        cached_plan = _cache_aware_plan(text, min_chars, is_cached)
+        if cached_plan is not None:
+            return cached_plan
     chunks = plan_chunks(text, min_chars)
     if not chunks or len(chunks[0]) <= CLAUSE_SPLIT_MIN_CHARS:
         return chunks

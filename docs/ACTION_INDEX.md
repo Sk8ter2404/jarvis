@@ -27,12 +27,12 @@
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 711 |
+| Total registered actions (incl. aliases) | 712 |
 | — monolith `ACTIONS` dict | 150 |
-| — skill / core registered | 561 |
-| tested | 649 |
+| — skill / core registered | 562 |
+| tested | 650 |
 | **untested** (no test names it) | 62 |
-| spoken note: VERBATIM | 361 |
+| spoken note: VERBATIM | 362 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
 | **no spoken note** (neither) | 271 |
@@ -245,6 +245,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `forget_last_hour` | `core/actions.py:3100` | neither | yes | yes |
 | `forget_point_target` | `skills/kinect_pointing.py:423` | **VERBATIM** | — | yes |
 | `forget_voice` | `skills/enroll_voice.py:373` | **VERBATIM** | — | yes |
+| `forget_voice_line` | `skills/voice_clone.py:273` | **VERBATIM** | yes | yes |
 | `full_power` | `skills/game_mode.py:2015` | **VERBATIM** | — | yes |
 | `game_mode_learn_this` | `skills/game_mode.py:2060` | **VERBATIM** | — | yes |
 | `game_mode_off` | `skills/game_mode.py:2015` | **VERBATIM** | — | yes |

@@ -681,6 +681,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # gerund the body itself prints as the trigger had no entry. Bare
         # "cloning" is safe — the word appears nowhere else in this grammar.
         "cloning", "normal voice", "what voices",
+        # 2026-10-05: forget_voice_line (a bad take in the render cache).
+        # "forget that line" also loads MEMORY MAINTENANCE (on "forget
+        # that"), whose body now says which action a LINE is.
+        "forget that line", "that line sounded", "redo that line",
+        "bad take",
     ],
     "SMART HOME — PER-BRAND LIST": [
         "smart device",

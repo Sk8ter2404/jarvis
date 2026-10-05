@@ -640,6 +640,30 @@ VOICE_CLONE_DEVICE  = ""
 VOICE_CLONE_SERVER_URL = "http://127.0.0.1:8767"
 VOICE_CLONE_SERVER_CMD = ""
 VOICE_CLONE_TIMEOUT_S  = 2.5
+# The clone voice's render cache (core/clone_render_cache.py, 2026-10-05):
+# finished takes keyed by the server's voice hash, model, T3 precision,
+# sample rate and the exact text, kept in memory (16 MB) and -- with 'shadow'
+# or 'on' -- as int16 .npy files under data/clone_cache/ (gitignored) so they
+# survive a restart.
+#   'off'    → memory only, for this run (the cache as it was before)
+#   'shadow' → memory serves; every take is also written to disk and each
+#              line logs whether the disk WOULD have served it
+#   'on'     → memory, then disk, then the server. A reply whose first
+#              sentence is cached starts with that sentence whole. Lines
+#              that recur in JARVIS's history are rendered into the cache
+#              one at a time while you've been quiet for a minute, within
+#              VOICE_CLONE_SEED_GPU_S of server time per voice per day
+#              (0 = no seeding).
+# A cached take plays only while the clone voice server is up and speaking
+# the selected consented profile's voice; takes of a voice whose consent is
+# withdrawn or whose reference.wav is replaced are deleted in every mode.
+# "Forget that line" drops the takes of the reply you just heard.
+# VOICE_CLONE_CACHE_MB caps the folder (least recently used goes first).
+# Rollback: 'off' (the files stay on disk, unused; delete data/clone_cache/
+# by hand if wanted). Changes apply on the next start.
+VOICE_CLONE_CACHE      = "on"    # 'off' | 'shadow' | 'on'
+VOICE_CLONE_CACHE_MB   = 64
+VOICE_CLONE_SEED_GPU_S = 90.0
 
 
 # ─── Voice pipeline selector ───────────────────────────────────────────

@@ -178,6 +178,53 @@ class VoiceCloneSkillTests(unittest.TestCase):
             reply = self.actions["voice_clone_status"]("")
         self.assertIn("no profile", reply.lower())
 
+    # ── the clone voice server's fast decoder (C3, 2026-10-05) ───────────────
+    def test_status_says_when_the_fast_decoder_is_off(self):
+        cfg.VOICE_CLONE_ENABLED = True
+        cfg.VOICE_CLONE_PROFILE = "jarvis"
+        client = mock.Mock()
+        client.decode_note.return_value = "the decoder note"
+        fake = self._fake_vc(is_available=True)
+        with mock.patch.object(self.mod, "_voice_clone", return_value=fake), \
+                mock.patch.object(self.mod, "_clone_client",
+                                  return_value=client):
+            reply = self.actions["voice_clone_status"]("")
+        self.assertIn("jarvis", reply)
+        self.assertIn("the decoder note", reply)
+        client.refresh_health.assert_called_once_with()
+        client.decode_note.return_value = ""
+        with mock.patch.object(self.mod, "_voice_clone", return_value=fake), \
+                mock.patch.object(self.mod, "_clone_client",
+                                  return_value=client):
+            reply = self.actions["voice_clone_status"]("")
+        self.assertEqual(reply, "Voice cloning is on, sir, speaking as the "
+                                "'jarvis' profile.")
+
+    # ── "forget that line" (2026-10-05) ──────────────────────────────────────
+    def test_forget_voice_line_is_registered(self):
+        self.assertIn("forget_voice_line", self.actions)
+
+    def test_forget_voice_line_replies(self):
+        client = mock.Mock()
+        for texts, want in (([], "no recent line"),
+                            (["Certainly, sir."], "afresh next time"),
+                            (["One.", "Two."], "all 2 lines")):
+            client.forget_last_reply.return_value = texts
+            with mock.patch.object(self.mod, "_clone_client",
+                                   return_value=client):
+                reply = self.actions["forget_voice_line"]("")
+            self.assertIn(want, reply)
+            # The line's own words are never read back.
+            for t in texts:
+                self.assertNotIn(t, reply)
+        with mock.patch.object(self.mod, "_clone_client", return_value=None):
+            self.assertIn("nothing to forget",
+                          self.actions["forget_voice_line"](""))
+        client.forget_last_reply.side_effect = RuntimeError("x")
+        with mock.patch.object(self.mod, "_clone_client", return_value=client):
+            self.assertIn("no recent line",
+                          self.actions["forget_voice_line"](""))
+
 
 class PersistenceTests(unittest.TestCase):
     """_persist routes through the shared Settings writer

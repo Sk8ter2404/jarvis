@@ -807,6 +807,34 @@ SCHEMA: dict[str, dict] = {
                 "also has until then. Shorter means fewer pauses but more "
                 "Kokoro sentences. Applies on the next start.",
     },
+    "VOICE_CLONE_CACHE": {
+        "tab": "voice", "label": "Clone voice line cache", "type": "enum",
+        "choices": ["off", "shadow", "on"], "default": "on",
+        "help": "Keep finished clone-voice lines so a repeated line plays "
+                "at once. 'on': kept on disk (data/clone_cache) across "
+                "restarts, and lines JARVIS says often are prepared while "
+                "you're quiet. 'shadow': kept, but only measured (the log "
+                "says what the disk would have served). 'off': kept in "
+                "memory for this run only. Cached lines play only while "
+                "the clone server is up in your consented voice. Applies "
+                "on the next start.",
+    },
+    "VOICE_CLONE_CACHE_MB": {
+        "tab": "voice", "label": "Clone voice cache size (MB)",
+        "type": "int", "default": 64, "min": 0, "max": 2048,
+        "help": "Disk space for cached clone-voice lines (one second of "
+                "speech is ~48 KB). The least recently used go first. "
+                "Applies on the next start.",
+    },
+    "VOICE_CLONE_SEED_GPU_S": {
+        "tab": "voice", "label": "Clone cache preparation (s/day)",
+        "type": "float", "default": 90.0, "min": 0, "max": 600,
+        "help": "Seconds of clone-server time per voice per day used to "
+                "prepare lines JARVIS often says, one at a time and only "
+                "after you've been quiet for a minute. 0 = never prepare "
+                "ahead (lines are still cached once said). Applies on the "
+                "next start.",
+    },
     "AUDIO_PROCESSING_ENABLED": {
         "tab": "hearing", "label": "Audio processing (master)", "type": "bool",
         "default": True,
@@ -2003,7 +2031,9 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                       "FILLER_DUCK_HOLD", "PROCESSING_FILLER_PRERENDER"]),
         ("Voice clone", ["VOICE_CLONE_ENABLED", "VOICE_CLONE_PROFILE",
                          "VOICE_CLONE_MODEL", "VOICE_CLONE_SERVER_URL",
-                         "VOICE_CLONE_SERVER_CMD", "VOICE_CLONE_TIMEOUT_S"]),
+                         "VOICE_CLONE_SERVER_CMD", "VOICE_CLONE_TIMEOUT_S",
+                         "VOICE_CLONE_CACHE", "VOICE_CLONE_CACHE_MB",
+                         "VOICE_CLONE_SEED_GPU_S"]),
         ("Wake word & conversation", [
             "VOICE_MODE", "WAKE_WORD_AUTOSTART", "START_IN_STANDBY",
             "REQUIRE_WAKE_MODE", "FOLLOWUP_WINDOW_S",

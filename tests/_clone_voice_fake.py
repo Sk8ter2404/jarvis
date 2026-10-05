@@ -16,6 +16,12 @@ Per-request control (2026-10-04, the live-budget replay):
                waits for the one before it, even one the client gave up on)
   timings      (text, start, end) in time.monotonic() per finished render
 
+The model facts the client keys its render cache on (2026-10-05): /health
+also reports model / t3_dtype / sample_rate / t3_decode (``t3_decode``), and
+every /tts reply carries X-Audio-Ms, X-Sample-Rate, X-Speech-Tokens (the
+clip's 40 ms tokens), X-T3-Ms (``t3_ms_per_token`` each) and X-T3-Engine
+(``engine``) like the real server.
+
 It records every request. Nothing leaves the loopback, nothing is played,
 and stop() releases a handler still sleeping in a delay at once.
 """
@@ -62,7 +68,10 @@ class FakeCloneServer:
                  ok: bool = True, tts_delay: float = 0.0,
                  tts_status: int = 200, wav: bytes | None = None,
                  latency_for=None, wav_for: dict | None = None,
-                 serial: bool = False):
+                 serial: bool = False, t3_decode: str = "cuda-graph",
+                 engine: str = "graph", model: str = "chatterbox-turbo",
+                 t3_dtype: str = "fp16", sample_rate: int = 24000,
+                 t3_ms_per_token: float = 4.25):
         self.ref_sha = ref_sha
         self.health_code = health_code
         self.ok = ok
@@ -72,6 +81,13 @@ class FakeCloneServer:
         self.latency_for = latency_for
         self.wav_for = dict(wav_for or {})
         self.serial = serial
+        self.t3_decode = t3_decode
+        self.engine = engine
+        self.model = model
+        self.t3_dtype = t3_dtype
+        self.sample_rate = sample_rate
+        self.t3_ms_per_token = t3_ms_per_token
+        self.device = "cuda:0 (physical, PCI order)"
         self._render_mu = threading.Lock()
         self.timings: list = []
         # Texts answered with HTTP 500 (one line of a reply fails).
@@ -92,12 +108,14 @@ class FakeCloneServer:
             def log_message(self, *a):
                 return
 
-            def _send(self, code, body, ctype):
+            def _send(self, code, body, ctype, extra=None):
                 try:
                     self.send_response(code)
                     self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(len(body)))
                     self.send_header("X-Render-Ms", "12.5")
+                    for k, v in (extra or {}).items():
+                        self.send_header(k, str(v))
                     self.end_headers()
                     self.wfile.write(body)
                 except OSError:
@@ -107,7 +125,11 @@ class FakeCloneServer:
                 fake._record("GET", self.path, None)
                 if self.path == "/health":
                     body = json.dumps({"ok": fake.ok, "ref_sha256": fake.ref_sha,
-                                       "pid": 4242}).encode()
+                                       "pid": 4242, "model": fake.model,
+                                       "t3_dtype": fake.t3_dtype,
+                                       "sample_rate": fake.sample_rate,
+                                       "t3_decode": fake.t3_decode,
+                                       "s3gen_device": fake.device}).encode()
                     return self._send(fake.health_code, body,
                                       "application/json")
                 return self._send(404, b"{}", "application/json")
@@ -135,8 +157,8 @@ class FakeCloneServer:
                     code = fake.tts_status if fake.tts_status != 200 else 500
                     return self._send(code, b'{"error": "x"}',
                                       "application/json")
-                return self._send(200, fake.wav_for.get(text, fake.wav),
-                                  "audio/wav")
+                wav = fake.wav_for.get(text, fake.wav)
+                return self._send(200, wav, "audio/wav", fake.headers_for(wav))
 
         class Server(ThreadingHTTPServer):
             daemon_threads = True
@@ -165,6 +187,20 @@ class FakeCloneServer:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+    def headers_for(self, wav: bytes) -> dict:
+        """The real server's X- headers for a reply carrying `wav`."""
+        try:
+            with wave.open(io.BytesIO(wav), "rb") as w:
+                n, sr = w.getnframes(), w.getframerate()
+        except Exception:
+            n, sr = 0, self.sample_rate
+        audio_ms = 1000.0 * n / max(1, sr)
+        tokens = max(1, int(audio_ms // 40))
+        return {"X-Audio-Ms": f"{audio_ms:.1f}", "X-Sample-Rate": sr,
+                "X-Speech-Tokens": tokens,
+                "X-T3-Ms": f"{tokens * self.t3_ms_per_token:.1f}",
+                "X-T3-Engine": self.engine}
 
     def latency(self, text) -> float:
         """How long `text` renders: latency_for, else tts_delay."""
