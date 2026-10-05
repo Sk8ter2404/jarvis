@@ -194,7 +194,9 @@ class RowTruthTests(unittest.TestCase):
     def test_switchable_rows_are_bool_schema_rows(self):
         settable = [f["key"] for f in wi.PROACTIVE_FEATURES
                     if wi._proactive_settable(f, sw.SCHEMA)]
-        self.assertEqual(len(settable), 17)
+        # 18: + AMBIENT_SCREEN_VLM_ENABLED (2026-10-05, the old vision-model
+        # screen loop split off AMBIENT_SCREEN_ENABLED / screen memory)
+        self.assertEqual(len(settable), 18)
         for key in settable:
             self.assertEqual(sw.SCHEMA[key]["type"], "bool", key)
             self.assertIn(key, sw.persisted_keys())

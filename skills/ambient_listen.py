@@ -767,29 +767,13 @@ def _focused_proc_name() -> str:
 
 # ── default blocklist + matcher ──────────────────────────────────────────
 
-_DEFAULT_SCREEN_BLOCKLIST = (
-    r"(?i)\b1password\b",
-    r"(?i)\bbitwarden\b",
-    r"(?i)\bkeepass\b",
-    r"(?i)\blastpass\b",
-    r"(?i)\bdashlane\b",
-    r"(?i)\bbanking\b",
-    r"(?i)\bchase\.com\b",
-    r"(?i)\bcapitalone\b",
-    r"(?i)\bbankofamerica\b",
-    r"(?i)\bwellsfargo\b",
-    r"(?i)\b(visa|mastercard)\.com\b",
-    r"(?i)\bpaypal\.com\b",
-    r"(?i)\bvenmo\.com\b",
-    r"(?i)\bcoinbase\b",
-    r"(?i)\bcredit\s*card\b",
-    # Generic auth screens
-    r"(?i)\b(sign\s*in|log\s*in|login).*(password|2fa|otp)\b",
-    r"(?i)\bauthenticator\b",
-    r"(?i)\bone\s*time\s*passcode\b",
-    r"(?i)\bsocial\s*security\b",
-    r"(?i)\bssn\b",
-)
+# The sensitive-window defaults are core.screen_privacy's (2026-10-05: one
+# rule for every screen reader - the screenshot gate, the click executor,
+# screen memory, the vision trace and this loop - instead of three copies).
+try:
+    from core.screen_privacy import DEFAULT_PATTERNS as _DEFAULT_SCREEN_BLOCKLIST
+except Exception:  # pragma: no cover - core always importable in JARVIS
+    _DEFAULT_SCREEN_BLOCKLIST = ()
 
 
 def _compile_blocklist() -> list[re.Pattern]:
@@ -1984,7 +1968,26 @@ def ambient_audio_stop(_: str = "") -> str:
 
 
 def ambient_screen_start(_: str = "") -> str:
-    """Begin the periodic screen-snapshot loop."""
+    """Start SCREEN MEMORY (2026-10-05): core.screen_memory - text only, no
+    AI calls. The old vision-model snapshot loop runs only with
+    AMBIENT_SCREEN_VLM_ENABLED (_ambient_screen_vlm_start)."""
+    if _get_config("AMBIENT_SCREEN_VLM_ENABLED", False):
+        return _ambient_screen_vlm_start(_)
+    try:
+        from core import screen_memory as _sw
+        if _sw.is_running():
+            return "Screen memory is already on, sir."
+        if not _sw.start():
+            return "Screen memory can't start here, sir (a test process)."
+        return ("Screen memory on, sir \u2014 text only, no AI calls. Say "
+                "'stop watching' any time.")
+    except Exception as e:
+        return f"Screen memory failed to start: {type(e).__name__}"
+
+
+def _ambient_screen_vlm_start(_: str = "") -> str:
+    """Begin the periodic screen-snapshot loop (the OLD vision-model loop,
+    AMBIENT_SCREEN_VLM_ENABLED only)."""
     global _screen_thread, _screen_stop_evt, _screen_started_at
     global _screen_heartbeat, _screen_last_error, _screen_last_phash
     with _lock:
@@ -2005,7 +2008,28 @@ def ambient_screen_start(_: str = "") -> str:
 
 
 def ambient_screen_stop(_: str = "") -> str:
-    """Stop the screen-snapshot loop."""
+    """Stop screen memory (core.screen_memory) and, if it runs, the old
+    vision-model loop."""
+    msg = ""
+    try:
+        from core import screen_memory as _sw
+        if _sw.is_running():
+            _sw.stop()
+            msg = "Screen memory off, sir."
+    except Exception:
+        pass
+    with _lock:
+        vlm_thread = _screen_thread is not None
+    if not vlm_thread:
+        return msg or "Screen memory is not running, sir."
+    out = _ambient_screen_vlm_stop(_)
+    if msg and "not running" in out:
+        return msg
+    return f"{msg} {out}".strip()
+
+
+def _ambient_screen_vlm_stop(_: str = "") -> str:
+    """Stop the old vision-model screen-snapshot loop."""
     global _screen_thread, _screen_started_at
     with _lock:
         if _screen_thread is None or not _screen_thread.is_alive():
@@ -2129,14 +2153,16 @@ def register(actions: dict) -> None:
                 ambient_listen_start("")
             if _get_config("AMBIENT_AUDIO_ENABLED", False):
                 ambient_audio_start("")
-            if _get_config("AMBIENT_SCREEN_ENABLED", False):
+            if (_get_config("AMBIENT_SCREEN_ENABLED", False)
+                    or _get_config("AMBIENT_SCREEN_VLM_ENABLED", False)):
                 ambient_screen_start("")
         except Exception as e:
             print(f"  [ambient-listen] autostart failed: {e}")
 
     if (_get_config("AMBIENT_LISTEN_ENABLED", False)
             or _get_config("AMBIENT_AUDIO_ENABLED", False)
-            or _get_config("AMBIENT_SCREEN_ENABLED", False)):
+            or _get_config("AMBIENT_SCREEN_ENABLED", False)
+            or _get_config("AMBIENT_SCREEN_VLM_ENABLED", False)):
         threading.Thread(target=_bg_autostart,
                          name="ambient-listen-autostart",
                          daemon=True).start()

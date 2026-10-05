@@ -1622,32 +1622,44 @@ class ClickTests(_BaseActTest):
         self.assertIn("REFUSED", out)
         self.bc.find_click_target.assert_not_called()
 
+    # 2026-10-05: a DESCRIPTION click is the grounded executor's
+    # (core.grounded_click, tests/test_grounded_click.py) - never a
+    # whole-desktop find_click_target.
+    def _grounded(self, text="Done, sir.", outcome="verified"):
+        from core import grounded_click as G
+        p = mock.patch.object(G, "run_bounded",
+                              return_value=G.Result(text, outcome))
+        self.addCleanup(p.stop)
+        return p.start()
+
     def test_description_found_and_clicked(self):
         self.bc._is_self_close_attempt.return_value = False
-        self.bc.find_click_target.return_value = (300, 400)
+        run = self._grounded("Done, sir \u2014 clicked 'Play' on the middle "
+                             "monitor.")
         out = A._act_click("the play button")
-        self.bc.find_click_target.assert_called_once_with("the play button", monitor=None)
-        self.bc.ui_click.assert_called_once_with(300, 400)
-        self.assertEqual(out, "clicked 'the play button' at (300, 400)")
+        self.assertEqual(run.call_args.args[0], "the play button")
+        self.assertEqual(run.call_args.kwargs.get("mode"), "click")
+        self.bc.find_click_target.assert_not_called()
+        self.assertIn("clicked 'Play'", out)
 
     def test_description_not_found(self):
         self.bc._is_self_close_attempt.return_value = False
-        self.bc.find_click_target.return_value = None
+        self._grounded("I don't see 'nonexistent thing' on your screens, sir.",
+                       "not_found")
         out = A._act_click("nonexistent thing")
-        self.assertIn("could not locate", out)
+        self.assertIn("don't see", out)
 
     def test_description_not_found_with_monitor(self):
         self.bc._parse_monitor_prefix.side_effect = lambda a: ("left", "the play button")
         self.bc._is_self_close_attempt.return_value = False
-        self.bc.find_click_target.return_value = None
-        out = A._act_click("monitor:left|the play button")
-        self.bc.find_click_target.assert_called_once_with("the play button", monitor="left")
-        self.assertIn("on left monitor", out)
+        run = self._grounded("I don't see it, sir.", "not_found")
+        A._act_click("monitor:left|the play button")
+        self.assertEqual(run.call_args.args[0], "monitor:left|the play button")
+        self.bc.find_click_target.assert_not_called()
 
     def test_description_click_failsafe(self):
         self.bc._is_self_close_attempt.return_value = False
-        self.bc.find_click_target.return_value = (5, 6)
-        self.bc.ui_click.side_effect = _UIFailsafe("nope")
+        self._grounded("nope", "failed")
         self.assertEqual(A._act_click("thing"), "nope")
 
 

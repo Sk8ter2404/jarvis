@@ -113,3 +113,19 @@ try:  # never let a guard break test COLLECTION — an unguarded run beats no ru
 except Exception as _exc:  # noqa: BLE001 - collection must survive anything
     print(f"[cuda-guard] WARNING: JARVIS_NO_CUDA_DRIVER not set "
           f"({type(_exc).__name__}: {_exc})", flush=True)
+
+# ── 6. NO SCREEN READS (2026-10-05) ────────────────────────────────────────
+# core.screen_scope (EnumWindows titles), core.uia_host (UI Automation),
+# core.screen_ocr (the OCR worker) and the click / screen-memory captures read
+# the owner's REAL windows. A test must never see them - not even a window
+# title in its output: every one of those readers asks
+# core.screen_privacy.reads_blocked(), which is true while this is "1", and a
+# test injects fakes instead (tests/_screen_fakes.py). Escape hatch:
+# JARVIS_NO_SCREEN_READ=0 set before the run.
+try:  # never let a guard break test COLLECTION — an unguarded run beats no run
+    import os as _os_screen
+
+    _os_screen.environ.setdefault("JARVIS_NO_SCREEN_READ", "1")
+except Exception as _exc:  # noqa: BLE001 - collection must survive anything
+    print(f"[screen-read-guard] WARNING: JARVIS_NO_SCREEN_READ not set "
+          f"({type(_exc).__name__}: {_exc})", flush=True)

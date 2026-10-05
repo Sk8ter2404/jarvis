@@ -449,9 +449,12 @@ def register(actions: dict) -> None:
     # (AMBIENT_LISTEN_ENABLED) unless the system-audio or screen source was
     # explicitly enabled - those have their own toggles, which "ambient mode
     # off" does not touch.
+    # AMBIENT_SCREEN_ENABLED (screen memory, 2026-10-05) is text in a local
+    # timeline that is NEVER fact-extracted: only the old vision-model screen
+    # loop (AMBIENT_SCREEN_VLM_ENABLED) feeds this extractor.
     _autostart = (_get_config("AMBIENT_LISTEN_ENABLED", False)
                   or _get_config("AMBIENT_AUDIO_ENABLED", False)
-                  or _get_config("AMBIENT_SCREEN_ENABLED", False))
+                  or _get_config("AMBIENT_SCREEN_VLM_ENABLED", False))
     if _autostart:
         def _bg():
             try:

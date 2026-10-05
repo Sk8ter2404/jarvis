@@ -1440,6 +1440,15 @@ def _on_ambient_mode(icon, item):
     """Toggle ambient mode (continuous-listen background mode)."""
     _send_command("ambient_mode_toggle")
 
+def _on_screen_memory(icon, item):
+    """Screen memory on / off for this run (core.screen_memory: a text-only
+    record of what is on screen - no AI calls, no pictures kept)."""
+    _send_command("screen_memory_toggle")
+
+def _on_screen_memory_pause(icon, item):
+    """Pause screen memory for 15 minutes."""
+    _send_command("screen_memory_pause", arg="15")
+
 def _on_force_upgrade(icon, item):
     """Spec verb 'force upgrade now' — kick the overnight engine. The item is
     greyed out while overnight upgrades are switched off; the monolith refuses
@@ -2486,6 +2495,12 @@ def _is_ambient_mode() -> bool:
     return bool(data.get("ambient_mode_active"))
 
 
+def _is_screen_memory() -> bool:
+    """Screen Memory checkmark: hud_state.screen_memory, published by the
+    monolith when the tray toggles it."""
+    return bool(_read_hud_state().get("screen_memory"))
+
+
 def _is_debug_mode() -> bool:
     return bool(_read_hud_state().get("debug_mode"))
 
@@ -2831,6 +2846,9 @@ def _build_menu():
                          checked=lambda i: _is_tts_muted()),
         pystray.MenuItem("Ambient Mode",    _on_ambient_mode,
                          checked=lambda i: _is_ambient_mode()),
+        pystray.MenuItem("Screen Memory",   _on_screen_memory,
+                         checked=lambda i: _is_screen_memory()),
+        pystray.MenuItem("Pause Screen Memory 15 min", _on_screen_memory_pause),
         pystray.Menu.SEPARATOR,
         # ── grouped submenus ──
         pystray.MenuItem("Audio",       audio_menu),

@@ -194,10 +194,20 @@ def _local_query_coords(description: str, png_bytes: bytes,
     answer = _call_local_vision(prompt, [png_bytes], max_tokens=64) or ""
     if "NOT_FOUND" in answer.upper():
         return None
-    m = re.search(r"(\d+)\s*,\s*(\d+)", answer)
-    if not m:
-        return None
-    x, y = int(m.group(1)), int(m.group(2))
+    # The shared tolerant parser (core.vision_grounding, 2026-10-05): a clean
+    # "X,Y" or one at the end of a SHORT answer - never a pair mined out of
+    # prose ("I see 2 buttons, 3 tabs").
+    try:
+        from core import vision_grounding as _vgr
+        parsed = _vgr.parse_reply(answer, "pixel")
+        if parsed.get("kind") != "point":
+            return None
+        x, y = parsed["xy"]
+    except Exception:
+        m = re.search(r"(\d+)\s*,\s*(\d+)", answer)
+        if not m:
+            return None
+        x, y = int(m.group(1)), int(m.group(2))
     if 0 <= x <= w and 0 <= y <= h:
         return x, y
     return None
@@ -328,6 +338,25 @@ def local_click_target_by_description(description: str) -> str:
             f"or Python process running me. Closing it would kill my session. "
             f"Ask the user to close it manually if they really want to."
         )
+
+    # Every description click goes through the grounded executor (2026-10-05,
+    # core.grounded_click): read the windows by name, resolve, guard (sign-in
+    # pages, private windows, a hit test), click, VERIFY - its vision tiers
+    # are the LOCAL model already. The two-pass pixel search below is the
+    # fallback when the executor is unavailable.
+    try:
+        from core import grounded_click as _gc
+        said = ""
+        try:
+            said = b._turn_user_text()
+            said = said if isinstance(said, str) else ""
+        except Exception:
+            said = ""
+        arg = f"monitor:{monitor}|{description}" if monitor else description
+        return _gc.run_bounded(arg, said=said, mode="click").text
+    except Exception as e:
+        print(f"  [local-vision] grounded click unavailable ({e}); falling "
+              "back to the pixel search", flush=True)
 
     target = f" on {monitor} monitor" if monitor else ""
     print(f"  [local-vision] 📸 Looking for '{description}'{target}…", flush=True)

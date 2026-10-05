@@ -317,6 +317,37 @@ _SCREEN_TARGETS = (
     ("PIL.ImageGrab", None, "grab"),
 )
 _SCREEN_MODULES = frozenset(t[0] for t in _SCREEN_TARGETS)
+
+# Screen READERS that are not captures (2026-10-05): a UI Automation client
+# reads every window's link names and titles, so creating one is refused
+# under the screen guard - only for the UIA classes, judged per call
+# (comtypes.client.CreateObject builds every other COM object too).
+# core.uia_host also refuses on its own in a test process; this records the
+# offender when that check is bypassed. (module, class or None, attribute,
+# verdict function name)
+_SCREEN_VERDICT_TARGETS = (
+    ("comtypes.client", None, "CreateObject", "uia_verdict"),
+)
+_UIA_CLSIDS = ("ff48dba4-60ef-4201-aa87-54103eef594e",      # CUIAutomation
+               "e22ad333-b25f-460c-83d0-0581107395c9")      # CUIAutomation8
+# The screen OCR worker (core/screen_ocr.py) reads pixels it is sent.
+_OCR_WORKER_NAMES = frozenset({"ocr_worker.ps1"})
+
+
+def uia_verdict(args, kwargs=None) -> str | None:
+    """Why creating this COM object is a screen read (a UI Automation
+    client), or None. ``args[0]`` is a class, a progid or a CLSID."""
+    try:
+        target = args[0] if args else (kwargs or {}).get("progid")
+        text = " ".join(str(x) for x in (
+            getattr(target, "__name__", ""), getattr(target, "_reg_clsid_", ""),
+            target)).lower()
+        if "cuiautomation" in text or any(c in text for c in _UIA_CLSIDS):
+            return ("a UI Automation client reads the owner's windows (their "
+                    "link names and titles)")
+    except Exception:  # noqa: BLE001 - a guard bug must not break the call
+        return None
+    return None
 _EFFECT_REASONS = {
     "input": ("a real effect on the owner's speakers / media session (a COM "
               "/ WinRT call no audit event covers)"),
@@ -562,6 +593,11 @@ def _shell_command_words(tokens: list[str]) -> list[str]:
 def probe_verdict(executable, args) -> str | None:
     """Why launching this command must be refused, or None."""
     tokens = _command_tokens(args)
+    for tok in tokens:
+        base = os.path.basename(str(tok).strip('"').strip("'")).lower()
+        if base in _OCR_WORKER_NAMES:
+            return ("the screen OCR worker (tools/ocr_worker.ps1) reads "
+                    "screen pixels")
     first = _program(tokens[0]) if tokens else ""
     exe = _program(executable) if executable else ""
     for name in (exe, first):
@@ -999,11 +1035,23 @@ def _wrapped_targets() -> tuple:
     """(guard, module, class or None, attribute) for every entry point wrapped
     on import. Read at call time, so a patched target table is honoured."""
     return (tuple(("input",) + tuple(t) for t in _EFFECT_TARGETS)
-            + tuple(("screen",) + tuple(t) for t in _SCREEN_TARGETS))
+            + tuple(("screen",) + tuple(t) for t in _SCREEN_TARGETS)
+            + tuple(("screen",) + tuple(t[:3])
+                    for t in _SCREEN_VERDICT_TARGETS))
+
+
+def _verdict_for(modname: str, cls_name, name: str):
+    """The per-call verdict function of a _SCREEN_VERDICT_TARGETS entry, or
+    None for an always-refused target."""
+    for t in _SCREEN_VERDICT_TARGETS:
+        if (t[0], t[1], t[2]) == (modname, cls_name, name):
+            return globals().get(t[3])
+    return None
 
 
 def _wrapped_modules() -> frozenset:
-    return frozenset(_EFFECT_MODULES) | frozenset(_SCREEN_MODULES)
+    return (frozenset(_EFFECT_MODULES) | frozenset(_SCREEN_MODULES)
+            | frozenset(t[0] for t in _SCREEN_VERDICT_TARGETS))
 
 
 def _wrap_effect(module, modname: str, cls_name, name: str,
@@ -1017,10 +1065,19 @@ def _wrap_effect(module, modname: str, cls_name, name: str,
         return
     label = f"{modname}.{cls_name + '.' if cls_name else ''}{name}"
     why = _EFFECT_REASONS[guard]
+    verdict = _verdict_for(modname, cls_name, name)
 
     def stub(*args, **kwargs):
         if _active(guard):
-            _refuse(guard, label, label, why)
+            if verdict is None:
+                _refuse(guard, label, label, why)
+            else:
+                try:
+                    reason = verdict(args, kwargs)
+                except Exception:  # noqa: BLE001
+                    reason = None
+                if reason:
+                    _refuse(guard, label, label, reason)
         return real(*args, **kwargs)
 
     stub.__name__ = getattr(real, "__name__", name)

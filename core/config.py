@@ -390,10 +390,19 @@ CREDITS_CHECK_BACKEND = "auto"
 # AMBIENT_LISTEN_ENABLED — autostart the mic-only ambient transcription
 #   daemon. False by default because it competes with record_speech for
 #   the input device (Windows WASAPI rejects two opens on the same mic).
-# AMBIENT_SCREEN_ENABLED — autostart periodic screen-snapshot analysis via
-#   the local VLM for ambient context. False by default (privacy).
+# AMBIENT_SCREEN_ENABLED — SCREEN MEMORY (2026-10-05): a text-only,
+#   continuous record of what is on the screen (core/screen_memory.py: window
+#   titles, page addresses, page text read through UI Automation / OCR on
+#   change). NO AI / vision calls, no stored images, no GPU, <= 1% of one CPU
+#   core (self-governed); pauses for games, a locked screen, a busy CPU and
+#   "stop watching". Kept 7 days / 200 MB in data/screen_timeline.db.
+#   False by default (privacy); the owner turns it on.
+# AMBIENT_SCREEN_VLM_ENABLED — the OLD screen loop (skills/ambient_listen):
+#   a vision-model call on every changed minute, on the GPU the brain uses.
+#   False; it no longer rides on AMBIENT_SCREEN_ENABLED.
 AMBIENT_LISTEN_ENABLED = False
 AMBIENT_SCREEN_ENABLED = False
+AMBIENT_SCREEN_VLM_ENABLED = False
 # AMBIENT_STT_YIELD — the ambient mic and system-audio daemons hold a batch
 #   back (instead of transcribing it) while you are speaking to JARVIS, so
 #   they never make your own transcription wait behind them; held batches are
@@ -417,6 +426,52 @@ CHAPPIE_ENABLED = False
 # default = no change (opt-in); add e.g. "1password", "bitwarden",
 # "banking" via the Settings GUI / user_settings.json to enforce.
 SCREENSHOT_PRIVACY_BLOCKLIST: list = []
+
+# ─── Screen vision: grounded clicks, the vision trace, screen memory ───
+# (2026-10-05; core/grounded_click.py, core/vision_trace.py,
+# core/screen_memory.py, core/screen_timeline.py)
+# VISION_TRACE — the owner-approved record of what JARVIS's eyes were given
+#   and answered (images as sent + prompt + answer + outcome), for Claude to
+#   debug with. "on" | "text" (no images) | "off". LOCAL ONLY, in the
+#   gitignored data/vision_trace/; private / sign-in windows are text-only
+#   "skipped: private" entries. A STRING (the LOCAL_KEEP_ALIVE lesson).
+VISION_TRACE = "on"
+# Retention, rotated out oldest-first by the trace writer itself.
+VISION_TRACE_DAYS = 7
+VISION_TRACE_MAX_ENTRIES = 300
+VISION_TRACE_MAX_MB = 300
+# Read windows through Windows UI Automation (link names, titles, rects)
+# for clicks, "what's on my screen" and screen memory. The kill switch.
+SCREEN_UIA_ENABLED = True
+# UI Automation on NON-browser windows: "off" | "on_demand" (only the
+# window a click / look is about) | "always". Electron apps may switch to
+# screen-reader mode when read.
+SCREEN_UIA_NONBROWSER = "on_demand"
+# Image-token cap for every image sent to the local vision model (one
+# 1024-token ubatch on this build; ceil(w/48) * ceil(h/48)).
+VLM_MAX_IMAGE_TOKENS = 960
+# The click executor's vision tiers: "box2d" (set-of-mark + gemma box_2d),
+# "pixel" (the legacy two-pass X,Y pinned to one monitor) or "off".
+VISION_GROUNDING_FORMAT = "box2d"
+# How long a click waits for its effect (URL / title / new tab / state).
+CLICK_VERIFY_TIMEOUT_S = 2.5
+# The built-in "click that X" route (no brain round for a whole request).
+CLICK_ROUTE_ENABLED = True
+# OCR backend: "auto" (in-process WinRT when its wheels are installed, else
+# the PowerShell worker) | "powershell" | "winrt" | "off".
+SCREEN_OCR_BACKEND = "auto"
+# Screen memory (AMBIENT_SCREEN_ENABLED): tick interval, the CPU % above
+# which it pauses, and its own budget in % of ONE core (over it the interval
+# doubles; over 3x it pauses five minutes).
+SCREEN_MEMORY_INTERVAL_S = 5.0
+SCREEN_MEMORY_CPU_PAUSE_PCT = 60.0
+SCREEN_MEMORY_MAX_CORE_PCT = 1.0
+# The screen timeline's retention.
+SCREEN_TIMELINE_DAYS = 7.0
+SCREEN_TIMELINE_MAX_MB = 200.0
+# A second file the developer notes are appended to (e.g. a synced folder);
+# empty = data/notes_for_claude.jsonl only.
+NOTES_FOR_CLAUDE_MIRROR = ""
 
 # ─── Spend ceilings (Settings GUI exposes both) ────────────────────────
 # DAILY_BUDGET_USD — hard cap on Claude spend per UTC day for the Chappie

@@ -5451,6 +5451,30 @@ def _force_wake(speak: bool = True, source: str = "tray") -> None:
     print(f"  [{source}] force_wake — cleared sleep/standby")
 
 
+def _screen_memory_tray(cmd: str, entry: dict) -> str:
+    """The tray's screen-memory controls. Never raises."""
+    try:
+        from core import screen_memory as _sw
+        if cmd == "screen_memory_pause":
+            try:
+                mins = float(entry.get("arg") or 15)
+            except (TypeError, ValueError):
+                mins = 15.0
+            if not _sw.is_running():
+                return "Screen memory is off, sir."
+            return _sw.pause(mins)
+        if _sw.is_running():
+            _sw.stop()
+            on = False
+        else:
+            on = _sw.start()
+        _write_hud_state(screen_memory=bool(on))
+        return ("Screen memory on, sir - text only." if on
+                else "Screen memory off, sir.")
+    except Exception as _e:
+        return f"Screen memory control failed: {type(_e).__name__}"
+
+
 def _dispatch_tray_command(cmd: str, entry: dict) -> None:
     """Route a single tray command to the matching JARVIS action handler."""
     if cmd == "enter_standby":
@@ -5623,6 +5647,12 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         # the voice command (live flag, config, settings file, hud_state).
         result = _act_guest_mode_set(cmd == "guest_mode_on")
         _publish_tray_result(str(entry.get("rid") or ""), cmd, result)
+    elif cmd == "screen_memory_toggle" or cmd == "screen_memory_pause":
+        # Screen memory (core.screen_memory, 2026-10-05): on/off for this run
+        # and "pause 15 min" - text only, no AI calls.
+        result = _screen_memory_tray(cmd, entry)
+        _publish_tray_result(str(entry.get("rid") or ""), cmd, result)
+        print(f"  [tray] {cmd} -> {result}")
     elif cmd == "mic_mute_toggle":
         # Mute Mic: drop captured mic input before dispatch (see
         # _capture_utterance) so JARVIS hears nothing and stays idle — distinct
@@ -21979,8 +22009,48 @@ def _vision_shares_chat_model() -> bool:
         return False
 
 
+def _fit_images_for_vlm(png_images) -> list:
+    """Each PNG resized so its image-token estimate is <= VLM_MAX_IMAGE_TOKENS
+    (core.vision_grounding); an image that already fits, or cannot be
+    decoded, is passed unchanged. Never raises."""
+    out = []
+    for p in png_images or ():
+        try:
+            from PIL import Image
+            from core import vision_grounding as _vgr
+            img = Image.open(io.BytesIO(p))
+            fit, scale = _vgr.fit_for_vlm(img)
+            if scale < 1.0:
+                buf = io.BytesIO()
+                fit.save(buf, format="PNG")
+                out.append(buf.getvalue())
+                continue
+        except Exception:
+            pass
+        out.append(p)
+    return out
+
+
 def _call_local_vision(question: str, png_images: list[bytes],
                        max_tokens: int = 600) -> str | None:
+    """_call_local_vision_raw, recorded into the current vision-trace step
+    (core.vision_trace, owner-approved 2026-10-05) when an owner-turn step
+    is open: the prompt, the images as sent, the raw answer, the time. A
+    background caller (no step) is not traced."""
+    t0 = time.monotonic()
+    imgs = _fit_images_for_vlm(png_images)
+    ans = _call_local_vision_raw(question, imgs, max_tokens)
+    try:
+        from core import vision_trace as _vtr
+        _vtr.note_model_call(question, imgs, ans or "",
+                             ms=(time.monotonic() - t0) * 1000)
+    except Exception:
+        pass
+    return ans
+
+
+def _call_local_vision_raw(question: str, png_images: list[bytes],
+                           max_tokens: int = 600) -> str | None:
     """POST a vision request to Ollama's /api/chat with one or more PNGs.
 
     Returns the assistant text on success, or None if local vision is
@@ -22003,7 +22073,11 @@ def _call_local_vision(question: str, png_images: list[bytes],
     # timeout) describe the moment of the POST, not the moment it queued.
     # A no-op for the owner's own request and on the main thread. An
     # UNTAGGED call from another thread mid-turn is named in the log (R5c).
-    _note_untagged_local_call("vision", sys._getframe(1))
+    _caller_frame = sys._getframe(1)
+    if _caller_frame.f_code.co_name == "_call_local_vision":
+        # the trace / resize wrapper (2026-10-05): name ITS caller
+        _caller_frame = _caller_frame.f_back or _caller_frame
+    _note_untagged_local_call("vision", _caller_frame)
     _lt.wait_for_quiet()
     # VRAM brick guard (REVIEW_FINDINGS_2 P0-2/P0-3): if the big 30B-class brain
     # is already pinned in VRAM, loading the VLM on top co-loads a 2nd model and
@@ -22066,6 +22140,10 @@ def _call_local_vision(question: str, png_images: list[bytes],
     # schedules the idle re-prime (this POST replaced the one-slot cache
     # when chat and vision share the model).
     _vis_posted = [False]
+    # Every image to the local model is <= VLM_MAX_IMAGE_TOKENS (960; one
+    # 1024-token ubatch on this build - llama.cpp #21550 / #21461), resized
+    # here, the one chokepoint (2026-10-05). The vision trace records the
+    # images EXACTLY as sent.
     try:
         with _lt.slot():
             try:
@@ -26641,17 +26719,43 @@ def screenshot_privacy_block_reason() -> str | None:
     hiccup never silently blinds vision — the blocklist is an opt-in privacy
     guard, not a hard gate."""
     try:
-        from core import config as _cfg
-        blocklist = getattr(_cfg, "SCREENSHOT_PRIVACY_BLOCKLIST", ()) or ()
+        hwnd, title, _ = _read_focused_window()
     except Exception:
         return None
-    if not blocklist:
-        return None
+    # ONE rule (core.screen_privacy, 2026-10-05): the owner's blocklist plus
+    # the sensitive-window defaults (password managers, bank sites) over the
+    # focused window's title, process and - for a browser - its address. A
+    # sign-in page is NOT refused here: the streaming sign-in-wall check
+    # (S5) has to look at one.
     try:
-        _, title, _ = _read_focused_window()
+        from core import screen_privacy as _sp
+        proc = _focused_process_name(hwnd)
+        url = ""
+        if proc.lower() in ("chrome.exe", "msedge.exe", "brave.exe"):
+            try:
+                from core import screen_text as _st
+                url = _st.read_url(hwnd, timeout_s=0.2) or ""
+            except Exception:
+                url = ""
+        return _sp.title_reason(title or "", proc, url)
     except Exception:
-        return None
-    return _privacy_blocklist_match(title, blocklist)
+        return _privacy_blocklist_match(title)
+
+
+def _focused_process_name(hwnd) -> str:
+    """The process name owning ``hwnd`` ("chrome.exe"), or ""."""
+    try:
+        if not hwnd:
+            return ""
+        import ctypes
+        from ctypes import wintypes
+        pid = wintypes.DWORD()
+        ctypes.WinDLL("user32").GetWindowThreadProcessId(
+            int(hwnd), ctypes.byref(pid))
+        import psutil
+        return psutil.Process(int(pid.value)).name()
+    except Exception:
+        return ""
 
 
 def _privacy_blocklist_match(title, blocklist=None) -> str | None:
@@ -26661,11 +26765,16 @@ def _privacy_blocklist_match(title, blocklist=None) -> str | None:
     also test the focus tracker's CACHED title — the rect it grabs can come
     from that cache rather than the live window."""
     if blocklist is None:
+        # The one rule (core.screen_privacy): owner list + defaults.
         try:
-            from core import config as _cfg
-            blocklist = getattr(_cfg, "SCREENSHOT_PRIVACY_BLOCKLIST", ()) or ()
+            from core import screen_privacy as _sp
+            return _sp.title_reason(title or "")
         except Exception:
-            return None
+            try:
+                from core import config as _cfg
+                blocklist = getattr(_cfg, "SCREENSHOT_PRIVACY_BLOCKLIST", ()) or ()
+            except Exception:
+                return None
     if not blocklist or not title:
         return None
     low = str(title).lower()
@@ -27029,19 +27138,20 @@ def _query_vision_for_coords(description: str, png_bytes: bytes, w: int, h: int)
     answer = ask_vision(prompt, png_bytes).strip()
     if "NOT_FOUND" in answer.upper():
         return None
-    ans = answer.strip()
     # The model is told to reply with ONLY the coordinates, so do NOT mine an
     # arbitrary "\d+,\d+" out of prose — a reply like "I see 2 buttons, 3 tabs"
     # was yielding a confident click at (2,3) (esp. on the chattier local VLM).
     # Accept a clean coordinate reply, or a coordinate at the very END of a
     # SHORT answer; otherwise refuse — safer not to click than to click
-    # garbage on the user's live screen. 2026-05-30 deep audit.
-    m = re.fullmatch(r"\(?\s*(\d+)\s*,\s*(\d+)\s*\)?\.?", ans)
-    if not m and len(ans) <= 32:
-        m = re.search(r"(\d+)\s*,\s*(\d+)\s*\)?\.?\s*$", ans)
-    if not m:
+    # garbage on the user's live screen. 2026-05-30 deep audit. The rule is
+    # core.vision_grounding.parse_reply (pixel mode), which first strips the
+    # "[local-vision] " tag every local answer carries (2026-10-05: with it
+    # the <= 32-character rule saw 15 characters of tag).
+    from core import vision_grounding as _vgr
+    parsed = _vgr.parse_reply(answer, "pixel")
+    if parsed.get("kind") != "point":
         return None
-    x, y = int(m.group(1)), int(m.group(2))
+    x, y = parsed["xy"]
     if 0 <= x <= w and 0 <= y <= h:
         return x, y
     return None
@@ -31707,6 +31817,48 @@ def _focus_tracker_loop() -> None:
             break
 
 
+def _screen_vision_context() -> dict:
+    """session log + byte offset for the vision trace / developer notes."""
+    out = {}
+    try:
+        p = get_session_log_path()
+        if p:
+            out["session_log"] = os.path.basename(p)
+            out["log_offset"] = os.path.getsize(p)
+    except Exception:
+        pass
+    return out
+
+
+def _dev_notes_context() -> dict:
+    out = _screen_vision_context()
+    try:
+        with _action_history_lock:
+            out["last_results"] = [f"{h.get('action')}: {h.get('result', '')}"
+                                   for h in list(_action_history)[-5:]]
+    except Exception:
+        out["last_results"] = []
+    try:
+        from core import vision_trace as _vtr
+        out["trace_ids"] = [e.get("id") for e in _vtr.read_index(5)]
+    except Exception:
+        out["trace_ids"] = []
+    return out
+
+
+def _screen_vision_boot() -> None:
+    """Wire the screen-vision modules at boot. Never raises."""
+    try:
+        from core import dev_notes as _dn
+        from core import screen_timeline as _tl
+        from core import vision_trace as _vtr
+        _vtr.set_context_provider(_screen_vision_context)
+        _dn.set_context_provider(_dev_notes_context)
+        _tl.start_pruner()
+    except Exception as _e:
+        print(f"  [screen-vision] boot wiring failed: {_e}")
+
+
 def _start_focus_tracker() -> None:
     """Launch the background focus tracker. Safe to call once at startup."""
     t = threading.Thread(target=_focus_tracker_loop, daemon=True,
@@ -32680,6 +32832,14 @@ ACTIONS = {
     "previous_screen": _act_recall_screen,
     "screen_history":  _act_recall_screen,
     "find_on_screen":  _act_find_on_screen,
+    # Grounded screen clicks (2026-10-05, core.grounded_click): find by NAME,
+    # guard, click, verify; "go back" / "not that one"; developer notes; the
+    # text-only screen memory's controls.
+    "click_on_screen": _act_click_on_screen,
+    "undo_click":      _act_undo_click,
+    "note_for_claude": _act_note_for_claude,
+    "screen_memory":    _act_screen_memory,
+    "forget_screen":   _act_forget_screen,
     # Webcam awareness
     "where_is_user":   _act_where_is_user,
     "see_user":        _act_see_user,
@@ -33050,6 +33210,66 @@ def register_utterance_route(fn, name: str = "") -> bool:
         return False
 
 
+def _screen_route_state() -> dict:
+    """What the screen routes need to know about the moment: an open "which
+    one?" (and whether a plain yes may answer it), a recent JARVIS UI action,
+    whether the watcher is on, other watch-type skills armed. Never raises."""
+    st = {"pending": None, "allow_yes": False, "recent_ui": False,
+          "watching": False, "other_watch": False,
+          "claude_note": "note_for_claude" in ACTIONS,
+          "click": "click_on_screen" in ACTIONS,
+          "click_route": bool(globals().get("CLICK_ROUTE_ENABLED", True))}
+    try:
+        from core import grounded_click as _gc
+        p = _gc.pending_choice()
+        if p is not None:
+            st["pending"] = p
+            st["allow_yes"] = bool(
+                p.get("allow_yes") or len(p.get("options") or []) == 1) and not (
+                _pending_confirmation or _open_offer_pending())
+        st["recent_ui"] = _gc.last_ui_action() is not None
+        if not st["recent_ui"]:
+            from core import opened_ledger as _ol
+            st["recent_ui"] = _ol.last_opened(_gc.UI_ACTION_TTL_S) is not None
+    except Exception:
+        pass
+    try:
+        from core import screen_memory as _sw
+        st["watching"] = _sw.is_running()
+    except Exception:
+        pass
+    try:
+        _g = sys.modules.get("skill_guard_mode")
+        st["other_watch"] = bool(_g is not None
+                                 and (getattr(_g, "_armed", None) or [False])[0])
+    except Exception:
+        pass
+    return st
+
+
+def _open_offer_pending() -> bool:
+    try:
+        return bool(_open_offer.peek())
+    except Exception:
+        return False
+
+
+def _screen_route_reply(text: str) -> "str | None":
+    """The action token core.dispatcher.screen_route claims ``text`` with,
+    when its action is registered; else None. Never raises."""
+    try:
+        from core.dispatcher import screen_route as _sr
+        tok = _sr(text, _screen_route_state())
+    except Exception as _e:
+        print(f"  [route] screen route failed: {type(_e).__name__}")
+        return None
+    m = _ROUTE_TOKEN_RE.match(tok) if tok else None
+    if not m or m.group(1) not in ACTIONS:
+        return None
+    print(f"  [route] screen -> {m.group(1)}")
+    return tok
+
+
 def _utterance_route_reply(text: str) -> "str | None":
     """The action token a registered route claims ``text`` with, or None.
     Never raises; a failing or malformed route is logged and skipped.
@@ -33065,6 +33285,15 @@ def _utterance_route_reply(text: str) -> "str | None":
     SKILL_ROUTES_ENABLED does not switch it off; PC control off does."""
     if not globals().get("PC_CONTROL_ENABLED", True) or not text:
         return None
+    # BUILT-IN screen routes (2026-10-05, core.dispatcher.screen_route): a
+    # whole "click that X", the answer to JARVIS's own "which one?", "not
+    # that one" / "go back" right after a JARVIS UI action, "the one that
+    # was on screen", screen-memory controls, "forget the last hour of what
+    # you saw" and "tell Claude ...". FIRST, before youtube_play_route: live
+    # 00:28:23 "click that Mr. Beast video" became a YouTube SEARCH.
+    _scr_tok = _screen_route_reply(text)
+    if _scr_tok:
+        return _scr_tok
     try:
         from core.dispatcher import youtube_play_route as _yt_route
         _yt_tok = _yt_route(text) if "youtube_play" in ACTIONS else None
@@ -35226,6 +35455,14 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # summary of a bulk close / minimize. The routed turn has no prose of its
     # own, so without this it would end in silence.
     "close_all_windows_except", "minimize_all_windows_except",
+    # Grounded screen clicks + their recovery, developer notes and the screen
+    # memory's controls (2026-10-05): each returns ONE finished sentence - a
+    # verified fact ("Playing 'X' on the middle monitor, sir."), a question
+    # naming the real options, or an honest "I don't see it". A question
+    # must END the turn (the owner answers), so no follow-up round restates
+    # or acts on it.
+    "click_on_screen", "undo_click", "note_for_claude", "screen_memory",
+    "forget_screen",
     "whoami", "face_id_status",
     # Audio output-device switching (skills/audio_autoswitch.py) — each returns
     # a finished confirmation sentence.
@@ -35746,6 +35983,17 @@ def _begin_turn_grounding(user_text: str):
     nested dispatch on the same thread restores it (_end_turn_grounding)."""
     prev = getattr(_turn_grounding, "frame", None)
     _turn_grounding.frame = {"user_text": str(user_text or ""), "ran": set()}
+    # "click that X" / "the one on screen": read the windows NOW (text only,
+    # off this thread) so the click and the rewrite guard see the screen as
+    # it was when he spoke (core.grounded_click.freeze_scene, 2026-10-05).
+    try:
+        if user_text and globals().get("SCREEN_UIA_ENABLED", True):
+            from core import onscreen_refs as _or
+            if _or.is_onscreen_reference(user_text):
+                from core import grounded_click as _gc
+                _gc.freeze_scene_async(str(user_text))
+    except Exception:
+        pass
     return prev
 
 
@@ -36819,6 +37067,11 @@ _MISSION_NARRATION_CUES = {
     "check_credits":    "Checking your credits",
     # UI automation
     "click":            "Clicking",
+    "click_on_screen":  "Clicking {arg}",
+    "undo_click":       "Taking that back",
+    "note_for_claude":  "Noting that for Claude",
+    "screen_memory":     "Adjusting screen memory",
+    "forget_screen":    "Forgetting that",
     "type":             "Typing",
     "press":            "Pressing {arg}",
     "hotkey":           "Sending the hotkey",
@@ -37506,6 +37759,83 @@ def _dropped_open_after_close(results) -> str:
         return ""
 
 
+_CLICK_COORD_RE = re.compile(
+    r"^\s*(?:monitor:[\w-]+\s*\|\s*)?-?\d+\s*,\s*-?\d+\s*"
+    r"(?:,\s*(?:left|right|middle))?\s*$", re.IGNORECASE)
+
+
+def _click_alias(name: str, arg: str) -> str:
+    """``click_on_screen`` for a DESCRIPTION click, ``name`` otherwise. Only
+    while "click" is still the built-in _act_click (which hands a
+    description to the same grounded click anyway): a skill - or a test -
+    that registered its own "click" is respected."""
+    try:
+        if (name == "click" and "click_on_screen" in ACTIONS and arg
+                and ACTIONS.get("click") is _act_click
+                and not _CLICK_COORD_RE.match(arg)):
+            return "click_on_screen"
+    except Exception:
+        pass
+    return name
+
+
+# The actions a brain picks for "that video" when it does not know the
+# thing is already on screen (live 00:28:23: youtube_play).
+_ONSCREEN_REWRITE_ACTIONS = frozenset({"youtube_play", "youtube", "open_url",
+                                       "web_search", "search"})
+
+
+def _enforce_onscreen_reference(reply: str) -> str:
+    """``reply`` with ONE youtube_play / youtube / open_url / web_search
+    replaced by [ACTION: click_on_screen, <referent>] when the owner's words
+    this turn point at something on screen ("click that MrBeast video and
+    then go back into wake word mode") and the frozen scene (or a fresh
+    read) has a strong match (core.screen_resolve.REWRITE_MIN, 0.75). Every
+    other action in the reply still runs. No strong match = unchanged (a
+    "play X" with nothing on screen still searches). Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is None or frame.get("onscreen_rewrite_done"):
+            return reply
+        said = frame.get("user_text") or ""
+        if "click_on_screen" not in ACTIONS:
+            return reply
+        from core import onscreen_refs as _or
+        if not _or.is_onscreen_reference(said):
+            return reply
+        hits = [m for m in _ACTION_RE.finditer(reply or "")
+                if m.group(1).strip().lower() in _ONSCREEN_REWRITE_ACTIONS]
+        if not hits:
+            return reply
+        m = hits[0]
+        referent = _or.referent_phrase(said) or (m.group(2) or "").strip()
+        if not referent:
+            return reply
+        from core import grounded_click as _gc
+        from core import screen_resolve as _sres
+        res = _gc.scene_match(referent, said)
+        if res.get("status") == "none":
+            # No frozen scene yet: one bounded fresh freeze (UIA only).
+            _gc.freeze_scene(said, referent=referent)
+            res = _gc.scene_match(referent, said)
+        status = res.get("status")
+        score = float(res.get("score") or 0.0)
+        strong = (status == "ok" and score >= _sres.REWRITE_MIN) or (
+            status == "ambiguous" and score >= _sres.REWRITE_MIN)
+        if not strong:
+            print(f"  [onscreen-rewrite] kept {m.group(1).strip()} - no strong "
+                  f"on-screen match for {referent!r} ({status}, {score:.2f})")
+            return reply
+        frame["onscreen_rewrite_done"] = True
+        new_tok = f"[ACTION: click_on_screen, {referent}]"
+        print(f"  [onscreen-rewrite] {m.group(1).strip()} -> click_on_screen "
+              f"(score {score:.2f}, {res.get('monitor') or '?'})")
+        return reply[:m.start()] + new_tok + reply[m.end():]
+    except Exception as _e:
+        print(f"  [onscreen-rewrite] check failed: {type(_e).__name__}")
+        return reply
+
+
 def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]:
     """
     Find all [ACTION: ...] tokens, execute whitelisted ones, defer risky ones
@@ -37586,6 +37916,10 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # _enforce_close_then_open: the close of what JARVIS opened last runs
     # BEFORE the open, even when the brain wrote only the open.
     reply = _enforce_close_then_open(reply)
+    # "click that MrBeast video" answered with youtube_play / open_url /
+    # web_search while the thing IS on screen (2026-10-05, live 00:28:23):
+    # that action becomes click_on_screen (_enforce_onscreen_reference).
+    reply = _enforce_onscreen_reference(reply)
 
     # NOTE: the per-intent see_screen budget is intentionally NOT reset here.
     # The follow-up loop in _run_llm_dispatch calls this function once per
@@ -37631,6 +37965,10 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     def _runner(match):
         name = match.group(1).strip().lower()
         arg  = (match.group(2) or "").strip()
+        # [ACTION: click, <description>] IS a grounded on-screen click
+        # (2026-10-05): find by name, guard, click, verify - spoken word for
+        # word. A coordinate click stays the silent "click".
+        name = _click_alias(name, arg)
         fn   = ACTIONS.get(name)
         if fn is None and _cmd_autocorrect is not None:
             # Fuzzy-correction layer. ACTIONS may have grown via
@@ -38065,6 +38403,37 @@ _FOLLOWUP_TOO_LONG_REPLY = ("Those results came back too long for me to read "
                             "through properly, sir.")
 
 
+# The screen-target family (2026-10-05): one "click / find" attempt under
+# four names. Live 00:29:54-00:30:24 find_on_screen, click, click each failed
+# once under its own name, so the repeat-failure cut never saw a repeat.
+_SCREEN_TARGET_FAMILY = frozenset({"click", "click_on_screen", "find_on_screen",
+                                   "local_click_target_by_description"})
+
+
+def _action_family(name) -> str:
+    n = str(name or "").strip().lower()
+    return "screen-target" if n in _SCREEN_TARGET_FAMILY else n
+
+
+def _screen_target_stuck(action_results) -> bool:
+    """True when this round's results include a screen-target action that
+    came back not found or with candidates to choose from."""
+    try:
+        for item in action_results or ():
+            name, result = item[0], item[1]
+            if _action_family(name) != "screen-target":
+                continue
+            low = str(result or "").lower()
+            if any(k in low for k in ("not found", "could not locate",
+                                      "could not find", "don't see",
+                                      "several matches", "matches",
+                                      "which one")):
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _followup_extra(action_results) -> str:
     """The follow-up round's results message (see get_followup_response)."""
     summary = "\n".join(f"- [{name}] returned: {result}" for name, result in action_results)
@@ -38085,9 +38454,11 @@ def _followup_extra(action_results) -> str:
         "[ACTION: ...] token for that step. Emit the missing token now to "
         "finish the chain — don't stop mid-task and don't re-narrate the "
         "promise without backing it with a real action token.\n"
-        "- If you just opened a URL or ran a web search, use [ACTION: see_screen, ...] "
-        "to read what loaded before responding — don't stop after just opening the page.\n"
-        "- If the result shows an error or dead end, try an alternative approach.\n"
+        + ("- If click or find says not found or lists candidates, ask sir "
+           "which one, naming them; never search, open or play something "
+           "else instead.\n" if _screen_target_stuck(action_results) else
+           "- If the result shows an error or dead end, try an alternative "
+           "approach.\n") +
         "- If a result begins with a JARVIS-voice failure line (e.g. "
         "\"Windows is being precious about that one, sir.\" / \"It seems "
         "the internet has opinions today, sir.\") followed by "
@@ -38097,8 +38468,9 @@ def _followup_extra(action_results) -> str:
         "parse / app_not_found / timeout / com / ui_automation / io / "
         "unknown) — use it to decide whether to retry, try an alternative, "
         "or just relay the failure to the user.\n"
-        "- Only stop and reply to the user when you have actually found the answer "
-        "or completed the task. Don't give up mid-chain.\n"
+        + ("" if _screen_target_stuck(action_results) else
+           "- Only stop and reply to the user when you have actually found the "
+           "answer or completed the task. Don't give up mid-chain.\n") +
         "- When you do have the answer, reply conversationally. Don't paste raw output.)"
     )
 
@@ -45170,14 +45542,23 @@ def _run_llm_dispatch_body(text: str) -> str:
         # which the same action fails stops the chain; the honest close-out
         # below then says so once (_chain_close_out_line: the attempt that
         # failed again was never reported). Still bounded by _max_followup.
-        _failing_now = {n for (n, r) in informative if _is_failure(r)}
+        # The screen-target family (click / click_on_screen / find_on_screen
+        # / local_click_target_by_description) counts as ONE action here
+        # (2026-10-05): the second failure in the family stops the chain.
+        _failing_now = {_action_family(n) for (n, r) in informative
+                        if _is_failure(r)}
         _failing_repeat = _failing_now & _failed_seen
         # An IDENTICAL failure (same action, same result) is a repeat even
         # after a success of that action cleared it (the reset below).
-        _failing_repeat |= {n for (n, r) in informative
+        _failing_repeat |= {_action_family(n) for (n, r) in informative
                             if _is_failure(r) and (n, r) in _info_seen}
         if _failing_repeat:
-            print(f"  [follow-up] {', '.join(sorted(_failing_repeat))} failed "
+            # name the ACTIONS that failed (the family key is "screen-target")
+            _rep_names = sorted({str(n).strip().lower()
+                                 for (n, r) in informative if _is_failure(r)
+                                 and _action_family(n) in _failing_repeat})
+            print(f"  [follow-up] "
+                  f"{', '.join(_rep_names or sorted(_failing_repeat))} failed "
                   f"again this chain — stopping")
             _chain_cut = _CUT_REPEATED_FAILURE
             break
@@ -45187,7 +45568,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         # click 'Play' fails - a different step of a chain that is moving,
         # not the same failure twice. A round where the action only
         # succeeded clears it; a round where it also failed does not.
-        _failed_seen -= ({n for (n, r, _i) in current_results
+        _failed_seen -= ({_action_family(n) for (n, r, _i) in current_results
                           if not _is_failure(r)} - _failing_now)
         # SUCCESS-repeat break (mirror of the failure-repeat break above): if a
         # whole round adds NO new informative (name, result) pair — every result
@@ -45826,6 +46207,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # when the user just switched windows and an ambiguous question
         # ("what is this?") should attach a fresh screenshot.
         _start_focus_tracker()
+
+        # Screen vision (2026-10-05): the vision trace and the developer
+        # notes know the session log; the screen timeline and the trace are
+        # pruned now and hourly.
+        _screen_vision_boot()
 
     # Launch the on-screen HUD overlay (separate process so its tkinter loop
     # doesn't fight the main thread).

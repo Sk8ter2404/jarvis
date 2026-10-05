@@ -485,8 +485,11 @@ class TakeScreenshotTests(MonolithGlobalsTestCase):
         mssmod.mss.assert_not_called()       # never reached the capture backend
 
     def test_privacy_blocklist_empty_is_noop(self):
-        # Empty blocklist (the default) must NOT change behaviour: a private-
-        # looking title still captures normally.
+        # Empty OWNER blocklist (the default) adds nothing: an ordinary title
+        # captures normally. 2026-10-05: the sensitive-window defaults
+        # (core.screen_privacy.DEFAULT_PATTERNS - password managers, banks)
+        # apply on top of the owner's list, so "1Password" is refused even
+        # with an empty list (it used to be captured).
         from core import config as cfg
         pil, _img = self._fake_pil()
         mssmod = mock.MagicMock()
@@ -501,9 +504,15 @@ class TakeScreenshotTests(MonolithGlobalsTestCase):
         del mssmod.MSS
         with mock.patch.object(cfg, "SCREENSHOT_PRIVACY_BLOCKLIST", []), \
                 mock.patch.object(self.bc, "_read_focused_window",
-                                  return_value=(1, "1Password", None)), \
+                                  return_value=(1, "Untitled - Notepad",
+                                                None)), \
                 mock.patch.dict(sys.modules, {"mss": mssmod, "PIL": pil}):
             self.assertEqual(self.bc.take_screenshot(), b"PNGBYTES")
+        with mock.patch.object(cfg, "SCREENSHOT_PRIVACY_BLOCKLIST", []), \
+                mock.patch.object(self.bc, "_read_focused_window",
+                                  return_value=(1, "1Password", None)), \
+                mock.patch.dict(sys.modules, {"mss": mssmod, "PIL": pil}):
+            self.assertIsNone(self.bc.take_screenshot())
 
 
 @requires_monolith

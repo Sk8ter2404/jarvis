@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Tuple
 
+from core import onscreen_refs as _onscreen_refs
 from core.action_risk import SELF_TERMINATING_ACTIONS
 from core.spoken_math import is_arithmetic_request
 from core.units import is_unit_conversion_request
@@ -368,6 +369,25 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "UI AUTOMATION": [
         "click on", "type into", "automate", "fill in", "press the button",
         "move the mouse", "click the",
+        # 2026-10-05: grounded clicks and their recovery ("click that video",
+        # "go back", "not that one") - the predicate route below catches the
+        # demonstrative shapes ("play that MrBeast video").
+        "click", "go back", "not that one", "wrong one", "undo that",
+        "the other one", "not the right", "wrong video",
+    ],
+    # 2026-10-05: the text-only screen memory's controls (core.screen_memory).
+    "SCREEN MEMORY": [
+        "stop watching", "watch my screen", "watching my screen",
+        "watch again", "are you watching", "screen memory", "don't watch",
+        "dont watch", "forget what you saw", "what you saw",
+        "what was i looking at", "what was i watching",
+    ],
+    # 2026-10-05: "tell Claude ..." - a note for the developer, never a web
+    # search (live 00:30:42) and never a claimed relay (00:32:50).
+    "DEVELOPER NOTES": [
+        "tell claude", "let claude know", "note for claude",
+        "message for claude", "remind claude", "have claude", "ask claude to",
+        "leave claude",
     ],
     # NOTE this key routes TWO physically separate sections — the prompt has a
     # full "CHANGELOG / VERSION (self-awareness…)" block and a short
@@ -834,6 +854,7 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "stark ring", "status ring", "is the hud", "hud up", "hud showing",
         # background watchers
         "listening", "watching my screen", "are you watching", "ambient",
+        "staring",
         "extractor", "learned anything", "keeping an eye", "anticipation",
         "predicting", "briefing me", "weekly digest", "banter",
         "making jokes", "robot build", "smart home router", "not respond",
@@ -995,9 +1016,36 @@ def is_self_knowledge_request(user_text: str) -> bool:
 # operator word cannot be a keyword on its own ("what times does the store
 # open"). core.spoken_math.is_arithmetic_request wants a number on BOTH sides.
 # SELF-KNOWLEDGE: is_self_knowledge_request above.
+def _screen_memory_request(user_text: str) -> bool:
+    """A screen-memory control, a forget of what was seen, or a recall of
+    what was on screen (core.onscreen_refs). Never raises."""
+    try:
+        return bool(_onscreen_refs.screen_memory_command(user_text)
+                    or _onscreen_refs.forget_span(user_text)
+                    or _onscreen_refs.is_screen_recall_request(user_text))
+    except Exception:
+        return False
+
+
+def _developer_note_request(user_text: str) -> bool:
+    try:
+        return bool(_onscreen_refs.claude_note(user_text))
+    except Exception:
+        return False
+
+
 _PREDICATE_ROUTES = {
     "PYTHON SANDBOX": is_arithmetic_request,
     "SELF-KNOWLEDGE": is_self_knowledge_request,
+    # 2026-10-05 (live 00:28:23): "click that Mr. Beast video and then go
+    # back into wake word mode" named no UI AUTOMATION keyword, so the brain
+    # had no click token and searched YouTube instead.
+    "UI AUTOMATION": _onscreen_refs.is_onscreen_reference,
+    # "what was that video on the middle monitor", "the one that was on
+    # screen" - recall from the screen record.
+    "SCREEN VISION": _onscreen_refs.is_screen_recall_request,
+    "SCREEN MEMORY": _screen_memory_request,
+    "DEVELOPER NOTES": _developer_note_request,
 }
 
 # Short keywords ("tv", "ram", "hot", "mic", "bed", "obs", "lan") may only take

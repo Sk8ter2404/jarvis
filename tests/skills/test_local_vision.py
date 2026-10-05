@@ -152,6 +152,15 @@ class LocalVisionHelperTests(unittest.TestCase):
             self.assertIsNone(self.mod._local_query_coords("btn", b"png", 100, 100))
 
 
+@contextlib.contextmanager
+def _no_grounded():
+    """The grounded executor (core.grounded_click) unavailable: the click
+    falls back to the legacy two-pass pixel search these tests pin."""
+    from core import grounded_click as G
+    with mock.patch.object(G, "run_bounded", side_effect=RuntimeError("off")):
+        yield
+
+
 class LocalVisionActionTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("local_vision")
@@ -206,9 +215,24 @@ class LocalVisionActionTests(unittest.TestCase):
         self.assertTrue(out.startswith("REFUSED:"))
         self.assertIn("kill my session", out)
 
+    def test_click_goes_through_the_grounded_executor(self):
+        from core import grounded_click as G
+        bc = _fake_bc()
+        bc._turn_user_text.return_value = "click the play button"
+        with _quiet(), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(G, "run_bounded", return_value=G.Result(
+                 "Done, sir.", "verified")) as run, \
+             mock.patch.object(self.mod, "_find_click_target_local") as legacy:
+            out = self.actions["local_click_target_by_description"](
+                "monitor:left|the play button")
+        self.assertEqual(out, "Done, sir.")
+        self.assertEqual(run.call_args.args[0], "monitor:left|the play button")
+        legacy.assert_not_called()
+
     def test_click_happy_path(self):
         bc = _fake_bc()
-        with _quiet(), \
+        with _quiet(), _no_grounded(), \
              mock.patch.object(self.mod, "_bobert", return_value=bc), \
              mock.patch.object(self.mod, "_find_click_target_local", return_value=(120, 240)):
             out = self.actions["local_click_target_by_description"]("the play button")
@@ -217,7 +241,7 @@ class LocalVisionActionTests(unittest.TestCase):
 
     def test_click_target_not_found(self):
         bc = _fake_bc()  # healthy VLM → "could not find" rather than degradation msg
-        with _quiet(), \
+        with _quiet(), _no_grounded(), \
              mock.patch.object(self.mod, "_bobert", return_value=bc), \
              mock.patch.object(self.mod, "_find_click_target_local", return_value=None):
             out = self.actions["local_click_target_by_description"]("a unicorn icon")
@@ -226,7 +250,7 @@ class LocalVisionActionTests(unittest.TestCase):
     def test_click_surfaces_click_failure(self):
         bc = _fake_bc()
         bc.ui_click.side_effect = RuntimeError("failsafe: cursor in corner")
-        with _quiet(), \
+        with _quiet(), _no_grounded(), \
              mock.patch.object(self.mod, "_bobert", return_value=bc), \
              mock.patch.object(self.mod, "_find_click_target_local", return_value=(10, 20)):
             out = self.actions["local_click_target_by_description"]("ok button")
@@ -237,7 +261,7 @@ class LocalVisionActionTests(unittest.TestCase):
         # _find_click_target_local returns None AND the VLM is actually down →
         # surface the degradation message (covers line 285's `return msg`).
         bc = _fake_bc(ollama_alive=False)
-        with _quiet(), \
+        with _quiet(), _no_grounded(), \
              mock.patch.object(self.mod, "_bobert", return_value=bc), \
              mock.patch.object(self.mod, "_find_click_target_local", return_value=None):
             out = self.actions["local_click_target_by_description"]("the play button")
@@ -607,7 +631,7 @@ class FindClickTargetLocalTests(unittest.TestCase):
         bc = _fake_bc()
         bc.take_screenshot.side_effect = [b"low", None]
         bc.MONITORS = {}
-        with _quiet(), self._pil([(800, 600)]), \
+        with _quiet(), _no_grounded(), self._pil([(800, 600)]), \
              mock.patch.object(self.mod, "_bobert", return_value=bc), \
              mock.patch.object(self.mod, "_local_query_coords", return_value=(11, 22)):
             out = self.actions["local_click_target_by_description"]("the OK button")

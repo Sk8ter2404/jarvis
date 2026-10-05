@@ -1529,9 +1529,120 @@ SCHEMA: dict[str, dict] = {
                 "turns are refused. Applies on the next start.",
     },
     "AMBIENT_SCREEN_ENABLED": {
-        "tab": "privacy", "label": "Ambient screen capture", "type": "bool",
+        "tab": "privacy", "label": "Screen memory (text only)", "type": "bool",
         "default": False,
-        "help": "Periodically read the screen for ambient context.",
+        "help": "Screen memory — text only, no AI calls. JARVIS keeps a "
+                "timestamped record of window titles, page addresses and page "
+                "text (read when the screen changes) so he can answer 'what "
+                "was I looking at'. No pictures are stored, nothing leaves "
+                "this PC, private / sign-in windows are skipped, and it "
+                "pauses for games. Say 'stop watching' or 'don't watch this' "
+                "any time. Applies on the next start.",
+    },
+    "AMBIENT_SCREEN_VLM_ENABLED": {
+        "tab": "privacy", "label": "Old screen watcher (vision model)",
+        "type": "bool", "default": False,
+        "help": "The old ambient screen loop: sends a screenshot to the "
+                "vision model on every changed minute, on the GPU the brain "
+                "uses. Off unless you specifically want it.",
+    },
+    "VISION_TRACE": {
+        "tab": "privacy", "label": "Vision trace (for Claude)",
+        "type": "enum", "choices": ["on", "text", "off"], "default": "on",
+        "help": "Keeps what JARVIS's eyes were given and answered (on: the "
+                "images as sent + text; text: no images) in data/"
+                "vision_trace on this PC, so Claude can debug screen vision. "
+                "Private and sign-in windows are never saved.",
+    },
+    "VISION_TRACE_DAYS": {
+        "tab": "privacy", "label": "Vision trace: keep days", "type": "int",
+        "default": 7, "min": 1, "max": 90,
+        "help": "Older vision-trace entries are deleted automatically.",
+    },
+    "VISION_TRACE_MAX_ENTRIES": {
+        "tab": "privacy", "label": "Vision trace: max entries", "type": "int",
+        "default": 300, "min": 10, "max": 5000,
+        "help": "The oldest entries are deleted beyond this many.",
+    },
+    "VISION_TRACE_MAX_MB": {
+        "tab": "privacy", "label": "Vision trace: max MB", "type": "int",
+        "default": 300, "min": 10, "max": 5000,
+        "help": "The oldest entries are deleted beyond this much disk.",
+    },
+    "SCREEN_UIA_ENABLED": {
+        "tab": "privacy", "label": "Read windows by name (UI Automation)",
+        "type": "bool", "default": True,
+        "help": "Clicks, 'what's on my screen' and screen memory read link "
+                "names and titles through Windows UI Automation. Turning it "
+                "off falls back to pictures (slower, less exact).",
+    },
+    "SCREEN_UIA_NONBROWSER": {
+        "tab": "privacy", "label": "UI Automation outside the browser",
+        "type": "enum", "choices": ["off", "on_demand", "always"],
+        "default": "on_demand",
+        "help": "on_demand: only the app a click or look is about. Some apps "
+                "(VS Code, Discord) may switch to screen-reader mode when read.",
+    },
+    "VLM_MAX_IMAGE_TOKENS": {
+        "tab": "privacy", "label": "Vision image token cap", "type": "int",
+        "default": 960, "min": 64, "max": 4096,
+        "help": "Every image sent to the local vision model is shrunk to at "
+                "most this many image tokens (one batch on this build).",
+    },
+    "VISION_GROUNDING_FORMAT": {
+        "tab": "privacy", "label": "Click: vision fallback",
+        "type": "enum", "choices": ["box2d", "pixel", "off"],
+        "default": "box2d",
+        "help": "When a click target has no readable name: box2d (numbered "
+                "marks, then the model's box), pixel (the old two-pass "
+                "coordinates) or off.",
+    },
+    "CLICK_VERIFY_TIMEOUT_S": {
+        "tab": "privacy", "label": "Click: verify wait (s)", "type": "float",
+        "default": 2.5, "min": 0.5, "max": 10,
+        "help": "How long a click waits to see that it worked.",
+    },
+    "CLICK_ROUTE_ENABLED": {
+        "tab": "privacy", "label": "Click: instant 'click that X'",
+        "type": "bool", "default": True,
+        "help": "A whole 'click that X' request runs without asking the brain.",
+    },
+    "SCREEN_OCR_BACKEND": {
+        "tab": "privacy", "label": "Screen OCR", "type": "enum",
+        "choices": ["auto", "powershell", "winrt", "off"], "default": "auto",
+        "help": "Windows' built-in OCR, for pages UI Automation can't read.",
+    },
+    "SCREEN_MEMORY_INTERVAL_S": {
+        "tab": "privacy", "label": "Screen memory: tick (s)", "type": "float",
+        "default": 5.0, "min": 1, "max": 60,
+        "help": "How often screen memory checks for changes.",
+    },
+    "SCREEN_MEMORY_CPU_PAUSE_PCT": {
+        "tab": "privacy", "label": "Screen memory: pause above CPU %",
+        "type": "float", "default": 60.0, "min": 10, "max": 100,
+        "help": "Screen memory pauses while the whole PC is this busy.",
+    },
+    "SCREEN_MEMORY_MAX_CORE_PCT": {
+        "tab": "privacy", "label": "Screen memory: own CPU budget %",
+        "type": "float", "default": 1.0, "min": 0.1, "max": 10,
+        "help": "Its own budget, in % of one core: over it, it slows down; "
+                "over three times it, it pauses five minutes.",
+    },
+    "SCREEN_TIMELINE_DAYS": {
+        "tab": "privacy", "label": "Screen memory: keep days", "type": "float",
+        "default": 7.0, "min": 1, "max": 90,
+        "help": "Older screen-memory notes are deleted automatically.",
+    },
+    "SCREEN_TIMELINE_MAX_MB": {
+        "tab": "privacy", "label": "Screen memory: max MB", "type": "float",
+        "default": 200.0, "min": 10, "max": 5000,
+        "help": "The oldest notes are deleted beyond this much disk.",
+    },
+    "NOTES_FOR_CLAUDE_MIRROR": {
+        "tab": "privacy", "label": "Notes for Claude: copy to",
+        "type": "str", "default": "",
+        "help": "Optional second file the 'tell Claude ...' notes are "
+                "appended to. Empty = data/notes_for_claude.jsonl only.",
     },
     "STANDBY_LOOP_ENABLED": {
         "tab": "voice", "label": "Standby music auto-detect", "type": "bool",
@@ -2082,7 +2193,20 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
     "privacy": [
         ("Listening & watching", ["AMBIENT_LISTEN_ENABLED",
                                   "AMBIENT_SCREEN_ENABLED",
-                                  "SCREENSHOT_PRIVACY_BLOCKLIST"]),
+                                  "SCREENSHOT_PRIVACY_BLOCKLIST",
+                                  "AMBIENT_SCREEN_VLM_ENABLED"]),
+        ("Screen vision", ["SCREEN_UIA_ENABLED", "SCREEN_UIA_NONBROWSER",
+                           "CLICK_ROUTE_ENABLED", "CLICK_VERIFY_TIMEOUT_S",
+                           "VISION_GROUNDING_FORMAT", "VLM_MAX_IMAGE_TOKENS",
+                           "SCREEN_OCR_BACKEND"]),
+        ("Screen memory", ["SCREEN_MEMORY_INTERVAL_S",
+                           "SCREEN_MEMORY_CPU_PAUSE_PCT",
+                           "SCREEN_MEMORY_MAX_CORE_PCT", "SCREEN_TIMELINE_DAYS",
+                           "SCREEN_TIMELINE_MAX_MB"]),
+        ("Vision trace (for Claude)", ["VISION_TRACE", "VISION_TRACE_DAYS",
+                                       "VISION_TRACE_MAX_ENTRIES",
+                                       "VISION_TRACE_MAX_MB",
+                                       "NOTES_FOR_CLAUDE_MIRROR"]),
         ("Who can teach him", ["LEARN_ONLY_FROM_OWNER", "LEARN_FOLLOWUP_S",
                                "LEARN_VOICE_REJECT_BELOW"]),
         ("Faces", ["FACE_ID_ENABLED", "GREET_NEW_PEOPLE_ENABLED"]),
