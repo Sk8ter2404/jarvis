@@ -279,6 +279,42 @@ class UnreadableCardTests(_Base):
         self.assertIn("unreadable", p.reason)
 
 
+class SerialisedReadTests(unittest.TestCase):
+    """v2.0.180 defence in depth (after the 2026-10-04 native abort, which
+    was not NVML's doing): NVML is initialised once and its device reads run
+    one at a time, so no two driver reads from this process ever overlap."""
+
+    def test_device_reads_never_overlap(self):
+        import threading
+        lib = FakeNvml()
+        lock = threading.Lock()
+        active = [0]
+        peak = [0]
+        overlapped = threading.Event()
+        real = lib.nvmlDeviceGetMemoryInfo
+
+        def _slow(h, ref):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+                if active[0] > 1:
+                    overlapped.set()
+            overlapped.wait(0.1)      # every chance for a second reader to enter
+            with lock:
+                active[0] -= 1
+            return real(h, ref)
+        lib.nvmlDeviceGetMemoryInfo = _slow
+        gp.set_loader(lambda: lib)
+        self.addCleanup(gp.set_loader, None)
+        ts = [threading.Thread(target=gp.gpus, daemon=True) for _ in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10.0)
+        self.assertEqual(peak[0], 1)
+        self.assertEqual(lib.inits, 1)
+
+
 class NoContextTests(unittest.TestCase):
     """The probe must not be able to open a CUDA context: it imports nothing
     beyond the stdlib (no torch, ctranslate2, onnxruntime, pynvml)."""

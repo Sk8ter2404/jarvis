@@ -36,6 +36,14 @@ place as an UNREADABLE entry (name '', free_mb None), so one bad card never
 shifts the cards after it onto its index (review 2026-10-04: a skipped 3090
 made the 1650's numbers read as cuda:0's).
 
+ONE READER AT A TIME (v2.0.180): NVML is initialised once per process (never
+shut down, so no reader can race a shutdown), and every device read now runs
+under ``_io_lock``. NVML documents itself as thread-safe; serialising costs
+nothing here (a read is well under a millisecond and callers are boot, the
+listen-devices line and the occasional VRAM check) and keeps a driver call
+from ever running concurrently with another from this process - cheap
+defence after the 2026-10-04 native abort, which was NOT NVML's doing.
+
 Public API (stdlib only, never raises, never creates a CUDA context):
     available()                 -> bool        NVML loaded and initialised
     gpus()                      -> list[dict]  every GPU, NVML (PCI) order
@@ -104,6 +112,7 @@ def _default_loader():
 _loader = _default_loader     # tests: set_loader()
 _state = {"lib": None, "tried": False}
 _lock = threading.Lock()
+_io_lock = threading.Lock()   # one NVML device read at a time (see docstring)
 
 
 def set_loader(fn) -> None:
@@ -210,17 +219,18 @@ def _slots() -> "list[dict]":
         lib = _lib()
         if lib is None:
             return []
-        n = ctypes.c_uint(0)
-        if int(lib.nvmlDeviceGetCount_v2(ctypes.byref(n))) != NVML_SUCCESS:
-            return []
-        out = []
-        for i in range(int(n.value)):
-            try:
-                g = _read_one(lib, i)
-            except Exception:
-                g = None
-            out.append(g if g is not None else _unreadable(i))
-        return out
+        with _io_lock:
+            n = ctypes.c_uint(0)
+            if int(lib.nvmlDeviceGetCount_v2(ctypes.byref(n))) != NVML_SUCCESS:
+                return []
+            out = []
+            for i in range(int(n.value)):
+                try:
+                    g = _read_one(lib, i)
+                except Exception:
+                    g = None
+                out.append(g if g is not None else _unreadable(i))
+            return out
     except Exception:
         return []
 

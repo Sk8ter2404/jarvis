@@ -93,6 +93,11 @@ _loop_thread: "threading.Thread | None" = None
 _loop_cfg: dict = dict(_LOOP_DEFAULTS)
 _loop_consecutive = [0]                 # consecutive matched windows
 _whisper_model = [None]                 # lazy-loaded whisper-tiny handle
+# The model in _whisper_model when it was loaded on CUDA (the opt-in GPU
+# path): its decodes run on the ct2-host thread (core/ct2_host.py, v2.0.180)
+# - this loop's thread ends on standby-off, and a thread that exits after a
+# CTranslate2 CUDA decode can abort the whole process (v2.0.179).
+_whisper_cuda_model = [None]
 _librosa_mod = [None]                   # cached librosa module (None=unavailable)
 _loop_last_score: dict = {"ts": 0.0, "onset": 0.0, "rhyme": 0.0, "text": ""}
 
@@ -317,6 +322,10 @@ def _ensure_whisper_tiny():
     model_name = _loop_cfg.get("whisper_model", "tiny")
     prefer_gpu = bool(_loop_cfg.get("prefer_gpu", False))
     try:
+        # The CUDA driver starts before ctranslate2 can load (v2.0.180,
+        # core/cuda_preinit.py - a no-op once the boot did it).
+        from core import cuda_preinit as _cuda_preinit
+        _cuda_preinit.before_ctranslate2()
         from faster_whisper import WhisperModel as _FWM
         # GPU only when explicitly opted in — otherwise skip straight to CPU so
         # we never grab VRAM the local LLM needs (same ctranslate2 CUDA path the
@@ -332,9 +341,14 @@ def _ensure_whisper_tiny():
             free_mb = None if idx is None else _cuda_free_vram_mb(idx)
             if free_mb is not None and free_mb >= _GPU_MIN_FREE_VRAM_MB:
                 try:
-                    _whisper_model[0] = _FWM(model_name, device="cuda",
-                                             device_index=idx,
-                                             compute_type="int8")
+                    # Built on the ct2-host thread: its per-thread CUDA
+                    # state must never live on a thread that exits.
+                    from core import ct2_host as _ct2_host
+                    _m = _ct2_host.run(_FWM, model_name, device="cuda",
+                                       device_index=idx, compute_type="int8")
+                    _whisper_model[0] = _m
+                    _whisper_cuda_model[0] = _m
+                    _m = None
                     print(f"  [standby-loop] faster-whisper '{model_name}' ready "
                           f"on cuda:{idx} int8 ({int(free_mb)} MiB free)")
                     return _whisper_model[0]
@@ -398,7 +412,13 @@ def _transcribe_buffer(audio: np.ndarray, sample_rate: int) -> str:
             # (WhisperModel.transcribe) and openai-whisper (load_model().
             # transcribe) accept the same language= kwarg, so this single
             # call covers both engine paths.
-            out = model.transcribe(a, language="en")
+            if model is _whisper_cuda_model[0]:
+                # A CUDA model decodes (and drains its generator) on the
+                # ct2-host thread - see _whisper_cuda_model.
+                from core import ct2_host as _ct2_host
+                out = _ct2_host.decode(model, a, "cuda", language="en")
+            else:
+                out = model.transcribe(a, language="en")
             if isinstance(out, tuple):
                 segs, _info = out
                 text = " ".join(getattr(s, "text", "") for s in segs)

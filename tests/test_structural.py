@@ -33,6 +33,10 @@ _IMPORT_LIGHT_CORE = (
     # The camera open gate (2026-09-29): stdlib-only, imported at monolith
     # import time before the Kinect bridge is enabled.
     "core.camera_gate",
+    # The CUDA driver pre-init and the CTranslate2 host thread (v2.0.180, the
+    # v2.0.179 thread-exit abort): stdlib-only, imported at monolith import
+    # time - they must never pull in ctranslate2 or a CUDA library.
+    "core.cuda_preinit", "core.ct2_host",
     # The capture-open backoff (R10, 2026-09-29): stdlib-only, imported at
     # monolith import time.
     "core.input_backoff",

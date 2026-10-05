@@ -19307,10 +19307,13 @@ def _resolve_whisper_device() -> str:
         # "cuda" (default GPU) or "cuda:N" (pin STT to a specific GPU — e.g.
         # "cuda:1" to run Whisper on a second card and keep the primary free).
         return pref
-    # auto — try ctranslate2 first (covers faster-whisper), then torch
+    # auto — try ctranslate2 first (covers faster-whisper), then torch.
+    # The CUDA driver starts before ctranslate2 loads, and the device count
+    # (a CUDA runtime call) runs on the ct2-host thread (v2.0.180).
+    _cuda_driver_first()
     try:
         import ctranslate2 as _ct2
-        if _ct2.get_cuda_device_count() > 0:
+        if _ct2_host.run(_ct2.get_cuda_device_count) > 0:
             return "cuda"
     except Exception as e:
         print(f"  [whisper] ctranslate2 CUDA check failed: {type(e).__name__}: {e}")
@@ -19321,6 +19324,48 @@ def _resolve_whisper_device() -> str:
     except Exception:
         pass
     return "cpu"
+
+
+# ── CTranslate2 + CUDA: driver first, one host thread (v2.0.180) ──────────
+# v2.0.179 aborted 2.5 min after boot: the self-diagnostic's throwaway
+# probe-stt thread decoded on cuda:1 and, as it EXITED, CTranslate2's
+# per-thread CUDA destructors threw (no CUDA context) -> std::terminate ->
+# "Fatal Python error: Aborted" (crash dumps, 2026-10-04 20:40). Two fixes:
+#   1. core/cuda_preinit: cuInit(0) - no context - before ctranslate2 loads,
+#      the DLL order v2.0.178 had (via torch) and survived 94 such exits with.
+#   2. core/ct2_host: every CTranslate2 call on a CUDA model (load, decode +
+#      generator drain, release) runs on ONE thread that never exits.
+from core import cuda_preinit as _cuda_preinit  # noqa: E402
+from core import ct2_host as _ct2_host  # noqa: E402
+
+_cuda_init_said = [False]
+_cuda_order_said = [False]
+
+
+def _cuda_driver_first() -> None:
+    """Start the CUDA driver (cuInit(0), no context) BEFORE anything imports
+    ctranslate2 / faster_whisper - see core/cuda_preinit.py. Idempotent; one
+    "[cuda-init]" line the first time. Never raises."""
+    try:
+        st = _cuda_preinit.before_ctranslate2()
+        if st.get("done") and not _cuda_init_said[0]:
+            _cuda_init_said[0] = True
+            print(_cuda_preinit.status_line(st))
+    except Exception as e:
+        print(f"  [cuda-init] failed: {type(e).__name__}: {e}")
+
+
+def _log_cuda_load_order() -> None:
+    """After the first CUDA Whisper load: one line saying whether the CUDA
+    driver really loaded before ctranslate2.dll (the order 178 had and 179
+    lost). Never raises."""
+    if _cuda_order_said[0]:
+        return
+    _cuda_order_said[0] = True
+    try:
+        print(_cuda_preinit.load_order_line())
+    except Exception:
+        pass
 
 
 def _register_cuda_dll_dirs() -> None:
@@ -19512,6 +19557,7 @@ def _ensure_whisper_locked():
     faster-whisper isn't installed.
     Picks `WHISPER_MODEL_CUDA` on GPU, `WHISPER_MODEL_CPU` on CPU."""
     global _stt, _stt_device, _stt_model_name, _stt_engine
+    _cuda_driver_first()        # before ANY ctranslate2 import (v2.0.180)
     _register_cuda_dll_dirs()
     device = _resolve_whisper_device()          # 'cuda' | 'cuda:N' | 'cpu'
     # Split into (base, index) for faster-whisper's device_index. 'cuda:1' pins
@@ -19550,12 +19596,18 @@ def _ensure_whisper_locked():
         print(f"Loading faster-whisper '{model}' on {dev_label} "
               f"(compute_type={compute_type})…")
         try:
-            _stt = _FWM(model, device=base_dev, device_index=dev_index,
-                        compute_type=compute_type)
+            # A CUDA model is BUILT on the ct2-host thread (its per-thread
+            # CUDA state must never live on a thread that exits); a CPU
+            # model inline, as before.
+            _stt = _ct2_host.run_for(base_dev, _FWM, model, device=base_dev,
+                                     device_index=dev_index,
+                                     compute_type=compute_type)
             _stt_engine = "faster_whisper"
             _stt_device = dev_label
             _stt_model_name = model
             print(f"faster-whisper '{model}' ready on {dev_label}.\n")
+            if base_dev == "cuda":
+                _log_cuda_load_order()
             return
         except Exception as e:
             if base_dev == "cuda":
@@ -19834,25 +19886,27 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             _hot = _stt_vocab.hotwords_arg(_hot_setting)
             _vad_params = dict(threshold=0.3, min_speech_duration_ms=80)
             _knobs = _whisper_decode_kwargs()      # R11 (defaults: unchanged)
-            segments_gen, info = _stt.transcribe(
-                audio, language="en",
+            # Every decode runs through _ct2_host.decode: .transcribe() AND
+            # the drain of its lazy generator, on the ct2-host thread for a
+            # CUDA model (v2.0.180 - a thread that exits must never own
+            # CTranslate2 CUDA state), inline for a CPU one.
+            segments, info = _ct2_host.decode(
+                _stt, audio, _stt_device, language="en",
                 vad_filter=True,
                 vad_parameters=_vad_params,
                 hotwords=_hot, **_knobs,
             )
-            segments = list(segments_gen)
             _decoded_with_hot = bool(_hot) and bool(segments)
             # Bounded retry: see _STT_NO_VAD_RETRY_MAX_AUDIO_S.
             if (not segments and len(audio) <= float(SAMPLE_RATE)
                     * _STT_NO_VAD_RETRY_MAX_AUDIO_S):
                 _music_note("retry")
-                segments_gen, info = _stt.transcribe(
-                    audio, language="en",
+                segments, info = _ct2_host.decode(
+                    _stt, audio, _stt_device, language="en",
                     vad_filter=False,
                     beam_size=_STT_NO_VAD_RETRY_BEAM, temperature=0.0,
                     hotwords=None,
                 )
-                segments = list(segments_gen)
             # Native decode completed without a CUDA fault — clear the
             # consecutive-failure counter so one transient OOM never sticks us
             # on CPU int8. 2026-07-08.
@@ -19867,13 +19921,12 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
                 # retry above was already a plain decode, so it is dropped.
                 _why = "the plain decode echoed it"
                 if _decoded_with_hot:
-                    segments_gen, info = _stt.transcribe(
-                        audio, language="en",
+                    segments, info = _ct2_host.decode(
+                        _stt, audio, _stt_device, language="en",
                         vad_filter=True,
                         vad_parameters=_vad_params,
                         hotwords=None, **_knobs,
                     )
-                    segments = list(segments_gen)
                     text = " ".join((s.text or "").strip() for s in segments).strip()
                     _why = ("the plain re-decode was empty" if not text else
                             "the plain re-decode echoed it too")
@@ -19930,7 +19983,13 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
                     torch.cuda.empty_cache()
             except Exception:
                 pass
-            _stt = None
+            # The dropped CUDA model is released on the ct2-host thread, so
+            # CTranslate2's teardown never runs on (and leaves CUDA state on)
+            # this caller's thread (v2.0.180).
+            _dead, _stt = _stt, None
+            if _ct2_host.is_cuda(_stt_device):
+                _ct2_host.retire(_dead)
+            _dead = None
             # Track consecutive CUDA faults. Dropping + reloading the SAME
             # over-budget GPU config just re-OOMs (load→OOM→drop→reload
             # livelock), so after _WHISPER_CUDA_FAILURE_LIMIT flip the sticky
@@ -41422,10 +41481,12 @@ def _ctranslate2_sees_cuda() -> bool:
     """True iff ctranslate2 thinks at least one CUDA device is present.
     Used to decide whether cublas64_12.dll's absence is a real problem
     (we'd have tried CUDA) vs. a non-event (no GPU at all, will fall
-    back to CPU regardless)."""
+    back to CPU regardless). The CUDA driver starts first and the count runs
+    on the ct2-host thread (v2.0.180, see _cuda_driver_first)."""
+    _cuda_driver_first()
     try:
         import ctranslate2 as _ct2
-        return _ct2.get_cuda_device_count() > 0
+        return _ct2_host.run(_ct2.get_cuda_device_count) > 0
     except Exception:
         return False
 
@@ -45540,6 +45601,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # check this block used to perform — see _startup_preflight for the
     # incident history. Camera + cublas results gate downstream behaviour
     # (CAMERAS may shrink; _force_whisper_cpu_int8 may flip).
+    # The CUDA driver starts FIRST - before the preflight, Whisper or any
+    # skill can import ctranslate2 / faster_whisper (v2.0.180; see
+    # _cuda_driver_first). cuInit only: no CUDA context on any GPU.
+    _cuda_driver_first()
     _startup_preflight()
 
     # VRAM-brick guard (REVIEW_FINDINGS_2 P0-2): cap Ollama at one resident

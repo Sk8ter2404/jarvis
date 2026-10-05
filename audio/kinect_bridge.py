@@ -111,7 +111,127 @@ def import_pykinect2():
         (r"time\.clock\(", r"time.perf_counter("),
         (r"numpy\.object\b", r"object"),   # newer numpy removed np.object
     ])
+    _install_frame_thread_guard(sys.modules["pykinect2.PyKinectRuntime"])
     return sys.modules["pykinect2.PyKinectV2"], sys.modules["pykinect2.PyKinectRuntime"]
+
+
+# ─── a runtime's frame thread stops BEFORE its close releases anything ─────
+# (v2.0.180). PyKinectRuntime.close() sets its close event and, in the same
+# breath, closes that event's handle, drops the frame readers and closes the
+# sensor - while its own frame thread (started with _thread, never joined) may
+# be in the middle of handle_color_arrived(). Live 2026-10-04 on v2.0.178:
+# "AttributeError: 'NoneType' object has no attribute
+# 'GetFrameArrivedEventData'" tracebacks from kinect_frame_thread each time the
+# stale-stream reset closed a runtime. Python-level here, but the same race
+# also lets that thread wait on a CLOSED (and recyclable) handle and run COM
+# calls on a sensor that is being closed under it. The guard - installed on the
+# class once, by import_pykinect2 - gives every runtime a "frame thread done"
+# Event, and makes close() signal the thread first and wait (bounded) for it to
+# leave its loop before the original close() tears anything down.
+_FRAME_DONE_ATTR = "_bridge_frame_done"
+_FRAME_IDENT_ATTR = "_bridge_frame_ident"
+_FRAME_THREAD_STOP_S = 1.0
+
+
+def _signal_close_event(rt) -> bool:
+    """Set the runtime's Win32 close event (wakes its frame thread, which
+    breaks out of its loop on it). False when it cannot. NEVER raises."""
+    try:
+        h = getattr(rt, "_close_event", None)
+        if not h:
+            return False
+        import ctypes
+        return bool(ctypes.windll.kernel32.SetEvent(h))
+    except Exception:
+        return False
+
+
+def _stop_frame_thread(rt, timeout: Optional[float] = None) -> Optional[bool]:
+    """Ask a guarded runtime's frame thread to leave its loop and wait for it
+    (bounded). True = stopped (or already stopped), False = still running
+    after `timeout` (the close then proceeds as before), None = nothing to
+    wait for (unguarded runtime, already closed, or called from the frame
+    thread itself). NEVER raises."""
+    try:
+        done = getattr(rt, _FRAME_DONE_ATTR, None)
+        if not isinstance(done, threading.Event):
+            return None
+        if done.is_set():
+            return True
+        if getattr(rt, _FRAME_IDENT_ATTR, None) == threading.get_ident():
+            return None
+        if getattr(rt, "_sensor", None) is None:
+            return None             # already closed: nothing left to protect
+        if not _signal_close_event(rt):
+            return False
+        if timeout is None:
+            timeout = _FRAME_THREAD_STOP_S
+        return bool(done.wait(max(0.0, float(timeout))))
+    except Exception:   # pragma: no cover - defensive
+        return None
+
+
+def _note_frame_thread_error(e: BaseException) -> None:
+    """One line when a runtime's frame thread ends on an exception (it used
+    to die with a bare traceback). NEVER raises."""
+    try:
+        print(f"  [kinect] a runtime's frame thread stopped on "
+              f"{type(e).__name__}: {e}{_ms()}")
+    except Exception:   # pragma: no cover - print on a closed stream
+        pass
+
+
+def _install_frame_thread_guard(rt_mod) -> bool:
+    """Wrap rt_mod.PyKinectRuntime's __init__, kinect_frame_thread and close
+    as described above. Idempotent (a second call is a no-op); returns True
+    iff it installed the guard now. NEVER raises."""
+    try:
+        cls = getattr(rt_mod, "PyKinectRuntime", None)
+        if cls is None or not isinstance(cls, type):
+            return False
+        orig_thread = getattr(cls, "kinect_frame_thread", None)
+        orig_close = getattr(cls, "close", None)
+        orig_init = getattr(cls, "__init__", None)
+        if not (callable(orig_thread) and callable(orig_close)
+                and callable(orig_init)):
+            return False
+        if getattr(orig_thread, "_bridge_guarded", False):
+            return False
+
+        def __init__(self, *a, **k):
+            # Before the original __init__ starts the frame thread.
+            setattr(self, _FRAME_DONE_ATTR, threading.Event())
+            orig_init(self, *a, **k)
+
+        def kinect_frame_thread(self):
+            done = getattr(self, _FRAME_DONE_ATTR, None)
+            try:
+                setattr(self, _FRAME_IDENT_ATTR, threading.get_ident())
+            except Exception:   # pragma: no cover - defensive
+                pass
+            try:
+                orig_thread(self)
+            except Exception as e:
+                _note_frame_thread_error(e)
+            finally:
+                if isinstance(done, threading.Event):
+                    done.set()
+
+        def close(self):
+            _stop_frame_thread(self)
+            return orig_close(self)
+
+        for fn, orig in ((__init__, orig_init),
+                         (kinect_frame_thread, orig_thread),
+                         (close, orig_close)):
+            fn.__wrapped__ = orig
+            fn._bridge_guarded = True
+        cls.__init__ = __init__
+        cls.kinect_frame_thread = kinect_frame_thread
+        cls.close = close
+        return True
+    except Exception:   # pragma: no cover - defensive
+        return False
 
 
 # ─── configuration hook ───────────────────────────────────────────────────
@@ -599,7 +719,129 @@ def _runtime_streams(rt, timeout_sec: float = 2.5,
     return saw_body and not require_color
 
 
+# ─── NEVER CLOSE A RUNTIME UNDER A READER (v2.0.180) ─────────────────────
+# Every bridge read of a runtime (get_color_bgr, get_depth, get_infrared_gray,
+# the body read, the coordinate-mapper calls) runs inside _reading(rt), and
+# _safe_close_runtime - the ONE way the bridge releases a runtime (close(),
+# the stale-stream reset, a lost open race, a failed verify) - first waits
+# (bounded) until no reader is inside it. A reader also refuses a runtime
+# that is no longer the published one: once a reset or close has dropped it
+# from _runtime[0], nothing starts a new read on it. With the installed
+# pykinect2 the getters already copy under the runtime's own frame lock, so
+# today this guards COM calls (the mapper) and the close/read interleaving;
+# _owned_frame makes the copy a bridge guarantee rather than a property of
+# one pykinect2 build.
+_inflight_cv = threading.Condition(threading.Lock())
+_inflight: dict = {}               # id(runtime) -> readers inside it now
+_CLOSE_DRAIN_S = 1.0
+_FRAME_LOCK_WAIT_S = 0.5
+
+
+class _reading:
+    """``with _reading(rt) as live:`` - `live` is False (and the body must
+    not touch rt) when rt is no longer the published runtime."""
+    __slots__ = ("rt", "ok")
+
+    def __init__(self, rt):
+        self.rt = rt
+        self.ok = False
+
+    def __enter__(self) -> bool:
+        with _inflight_cv:
+            if self.rt is None or _runtime[0] is not self.rt:
+                return False
+            k = id(self.rt)
+            _inflight[k] = _inflight.get(k, 0) + 1
+            self.ok = True
+        return True
+
+    def __exit__(self, *_exc) -> bool:
+        if self.ok:
+            self.ok = False
+            with _inflight_cv:
+                k = id(self.rt)
+                n = _inflight.get(k, 0) - 1
+                if n <= 0:
+                    _inflight.pop(k, None)
+                    _inflight_cv.notify_all()
+                else:
+                    _inflight[k] = n
+        return False
+
+
+def _drain_readers(rt, timeout: Optional[float] = None) -> bool:
+    """Wait (bounded, _CLOSE_DRAIN_S by default) until no reader is inside
+    `rt`. True = none left, False = timed out (logged; the close then
+    proceeds as it always did). NEVER raises."""
+    try:
+        if timeout is None:
+            timeout = _CLOSE_DRAIN_S
+        k = id(rt)
+        end = time.monotonic() + max(0.0, float(timeout))
+        with _inflight_cv:
+            while _inflight.get(k, 0) > 0:
+                left = end - time.monotonic()
+                if left <= 0:
+                    print(f"  [kinect] closing a runtime with "
+                          f"{_inflight.get(k, 0)} reader(s) still inside it "
+                          f"after {timeout:.1f}s{_ms()}")
+                    return False
+                _inflight_cv.wait(left)
+        return True
+    except Exception:   # pragma: no cover - defensive
+        return False
+
+
+def _owns_memory(arr) -> bool:
+    """True when numpy array `arr` (or the array it views) owns its buffer -
+    numpy memory, not a runtime's ctypes buffer. NEVER raises."""
+    try:
+        import numpy as np
+        b = arr
+        for _ in range(64):
+            base = getattr(b, "base", None)
+            if base is None:
+                return bool(b.flags.owndata)
+            if not isinstance(base, np.ndarray):
+                return False
+            b = base
+        return False
+    except Exception:
+        return False
+
+
+def _owned_frame(rt, flat, lock_attr: str):
+    """`flat` as memory the runtime can neither free nor overwrite: as-is
+    when it already owns its buffer (pykinect2 0.1.0's getters numpy.copy
+    under the runtime's frame lock), else copied HERE under that same frame
+    lock (bounded wait). None when it cannot be copied. NEVER raises."""
+    if flat is None:
+        return None
+    try:
+        import numpy as np
+        if isinstance(flat, np.ndarray) and _owns_memory(flat):
+            return flat
+        lock = getattr(rt, lock_attr, None)
+        acquire = getattr(lock, "acquire", None)
+        if callable(acquire):
+            if not acquire(True, _FRAME_LOCK_WAIT_S):
+                return None
+            try:
+                return np.array(flat, copy=True)
+            finally:
+                lock.release()
+        return np.array(flat, copy=True)
+    except Exception:
+        return None
+
+
 def _safe_close_runtime(rt) -> None:
+    """THE way the bridge releases a runtime: wait for readers inside it to
+    leave, then close it (the guarded close stops its frame thread first -
+    see _install_frame_thread_guard). NEVER raises."""
+    if rt is None:
+        return
+    _drain_readers(rt)
     try:
         close = getattr(rt, "close", None)
         if callable(close):
@@ -966,11 +1208,20 @@ def get_color_bgr(require_new: bool = True):
         # _frame_time_advanced): the installed build's has_new_color_frame() is
         # permanently True after the first frame ever, which silently defeated
         # this whole gate (2026-07-21 audit).
-        had_new, ct = _frame_time_advanced(
-            rt, "_last_color_frame_time", "has_new_color_frame", _color_time_seen)
-        if require_new and not had_new:
-            return None
-        flat = rt.get_last_color_frame()
+        # Inside _reading (v2.0.180): no close/reset releases rt while we
+        # read it, and a runtime a reset already dropped is not read at all.
+        # _owned_frame: the frame leaves here as OUR memory, never a view of
+        # the runtime's buffer.
+        with _reading(rt) as live:
+            if not live:
+                return None
+            had_new, ct = _frame_time_advanced(
+                rt, "_last_color_frame_time", "has_new_color_frame",
+                _color_time_seen)
+            if require_new and not had_new:
+                return None
+            flat = _owned_frame(rt, rt.get_last_color_frame(),
+                                "_color_frame_lock")
         if flat is None:
             return None
         arr = np.asarray(flat, dtype=np.uint8)
@@ -1034,9 +1285,12 @@ def get_infrared_gray():
         has_new = getattr(rt, "has_new_infrared_frame", None)
         if not callable(getter) or not callable(has_new):
             return None
-        if not has_new():
-            return None
-        flat = getter()
+        with _reading(rt) as live:      # see get_color_bgr (v2.0.180)
+            if not live:
+                return None
+            if not has_new():
+                return None
+            flat = _owned_frame(rt, getter(), "_infrared_frame_lock")
         if flat is None:
             return None
         arr = np.asarray(flat, dtype=np.uint16)
@@ -1081,11 +1335,16 @@ def get_depth(require_new: bool = False):
         return None
     try:
         import numpy as np
-        had_new, dt = _frame_time_advanced(
-            rt, "_last_depth_frame_time", "has_new_depth_frame", _depth_time_seen)
-        if require_new and not had_new:
-            return None
-        flat = rt.get_last_depth_frame()
+        with _reading(rt) as live:      # see get_color_bgr (v2.0.180)
+            if not live:
+                return None
+            had_new, dt = _frame_time_advanced(
+                rt, "_last_depth_frame_time", "has_new_depth_frame",
+                _depth_time_seen)
+            if require_new and not had_new:
+                return None
+            flat = _owned_frame(rt, rt.get_last_depth_frame(),
+                                "_depth_frame_lock")
         if flat is None:
             return None
         arr = np.asarray(flat, dtype=np.uint16)
@@ -1312,7 +1571,12 @@ def _read_and_cache_bodies(consume: bool = True) -> list[dict]:
         if bt is not None:
             _body_time_seen[0] = bt
         note_body_frame_seen()
-        frame = rt.get_last_body_frame()
+        with _reading(rt) as live:      # see get_color_bgr (v2.0.180)
+            frame = rt.get_last_body_frame() if live else None
+        if not live:
+            # A reset/close dropped this runtime: no frame, and nothing fed
+            # to the shared stabiliser (a fake "no body" would release a drag).
+            return []
     except Exception:   # pragma: no cover - defensive: mid-stream readiness/getter glitch
         return []
     bodies = _parse_body_frame(frame)
@@ -2115,7 +2379,13 @@ def get_color_space_mapper():
             pt.x = float(x)
             pt.y = float(y)
             pt.z = float(z)
-            cs = map_fn(pt)
+            # A mapper kept past a reset/close never calls into the dropped
+            # runtime's COM mapper, and a close waits for a call in flight
+            # (v2.0.180, see _reading).
+            with _reading(rt) as live:
+                if not live:
+                    return None
+                cs = map_fn(pt)
             return (float(cs.x), float(cs.y))
         except Exception:   # pragma: no cover - per-joint COM/marshalling glitch
             return None
@@ -2161,7 +2431,10 @@ def get_depth_space_mapper():
             pt.x = float(x)
             pt.y = float(y)
             pt.z = float(z)
-            ds = map_fn(pt)
+            with _reading(rt) as live:  # see get_color_space_mapper
+                if not live:
+                    return None
+                ds = map_fn(pt)
             px, py = float(ds.x), float(ds.y)
             # Reject the SDK's out-of-frustum sentinels (-inf) and any NaN.
             if px != px or py != py:
@@ -2897,15 +3170,9 @@ def reset_if_body_stale(now: Optional[float] = None) -> bool:
         _gate_note_drop(quiet_s, cause, off_bus)
         # Release the old handle BEFORE the open lock: its close() closes the
         # one shared sensor, so nothing may have opened a new runtime on it
-        # yet. Same best-effort close idiom close() uses; older builds without
-        # .close() rely on __del__.
-        if rt is not None:
-            closer = getattr(rt, "close", None)
-            if callable(closer):
-                try:
-                    closer()
-                except Exception:   # pragma: no cover - defensive: close on a half-dead runtime
-                    pass
+        # yet. _safe_close_runtime (v2.0.180) waits for readers still inside
+        # it and - guarded build - for its frame thread to stop first.
+        _safe_close_runtime(rt)
     finally:
         _reset_in_progress[0] = False
         _open_attempt_lock.release()
@@ -3095,13 +3362,9 @@ def close(final: bool = False) -> None:
         if rt is None:
             return
         # PyKinectRuntime exposes .close() in recent builds; older ones rely on
-        # __del__. Try the explicit close, swallow anything.
-        closer = getattr(rt, "close", None)
-        if callable(closer):
-            try:
-                closer()
-            except Exception:   # pragma: no cover - defensive: close on a half-dead runtime
-                pass
+        # __del__. _safe_close_runtime (v2.0.180): readers out first, then the
+        # (guarded) close, swallowing anything.
+        _safe_close_runtime(rt)
 
 
 # ─── drop-in cv2.VideoCapture shim ────────────────────────────────────────

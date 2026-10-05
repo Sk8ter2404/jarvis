@@ -95,3 +95,18 @@ except Exception as _exc:  # noqa: BLE001 - collection must survive anything
     print(f"[hermetic-guard] WARNING: not armed from tests/__init__.py "
           f"({type(_exc).__name__}: {_exc}) — this run CAN reach the network, "
           f"real input and live hardware", flush=True)
+
+# ── 5. NO CUDA DRIVER (v2.0.180) ────────────────────────────────────────────
+# core/cuda_preinit starts the NVIDIA driver (cuInit, no context) before
+# ctranslate2 loads - lazily, from the Whisper / standby-detector / Smart Turn
+# paths that unit tests drive with fakes. A test must never load the real
+# driver, whatever CUDA_VISIBLE_DEVICES says; core/cuda_preinit skips (loads
+# nothing) while this is "1". tests/test_cuda_preinit.py pins it. Escape hatch:
+# JARVIS_NO_CUDA_DRIVER=0 set before the run.
+try:  # never let a guard break test COLLECTION — an unguarded run beats no run
+    import os as _os_cuda
+
+    _os_cuda.environ.setdefault("JARVIS_NO_CUDA_DRIVER", "1")
+except Exception as _exc:  # noqa: BLE001 - collection must survive anything
+    print(f"[cuda-guard] WARNING: JARVIS_NO_CUDA_DRIVER not set "
+          f"({type(_exc).__name__}: {_exc})", flush=True)

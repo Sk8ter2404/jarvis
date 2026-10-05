@@ -414,7 +414,11 @@ def whisper_features():
     """faster-whisper's numpy log-mel extractor sized for Smart Turn (80
     mels, hop 160, n_fft 400, 8 s): a callable ST_SAMPLES floats -> [80, 800].
     padding=0: the input is already exactly 8 s (the default pads 160 more
-    samples, one frame too many). Imports faster_whisper — call it lazily."""
+    samples, one frame too many). Imports faster_whisper — call it lazily.
+    The faster_whisper package imports ctranslate2, so the CUDA driver starts
+    first (core/cuda_preinit.py, v2.0.180 - a no-op once the boot did it)."""
+    from core import cuda_preinit as _cuda_preinit
+    _cuda_preinit.before_ctranslate2()
     from faster_whisper.feature_extractor import FeatureExtractor
     fe = FeatureExtractor(feature_size=ST_MELS, sampling_rate=SAMPLE_RATE,
                           hop_length=160, chunk_length=ST_SECONDS, n_fft=400)

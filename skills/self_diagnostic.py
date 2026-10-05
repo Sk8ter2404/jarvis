@@ -2836,15 +2836,20 @@ def _probe_stt() -> dict:
     # (WhisperModel from faster_whisper) returns (segments_gen, info);
     # openai-whisper returns a dict. Detect by class name to avoid the
     # import dance.
-    def _do_transcribe(m):
+    def _do_transcribe(m, device="cpu"):
         import numpy as np  # type: ignore
         sr = 16000
         t = np.linspace(0, 1.0, sr, dtype=np.float32)
         audio = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
         if type(m).__name__ == "WhisperModel":
-            # faster-whisper path
-            segs_gen, _info = m.transcribe(audio, language="en")
-            segs = list(segs_gen)
+            # faster-whisper path. The decode AND the drain of its lazy
+            # segment generator run on the ct2-host thread when the model is
+            # on CUDA (core/ct2_host.py, v2.0.180): THIS probe thread exits
+            # when the probe ends, and in v2.0.179 a probe-stt thread that
+            # exited after a CUDA decode aborted the whole process -
+            # CTranslate2's per-thread CUDA destructors threw on the way out.
+            from core import ct2_host as _ct2_host
+            segs, _info = _ct2_host.decode(m, audio, device, language="en")
             return " ".join((s.text or "").strip() for s in segs).strip()
         else:
             # openai-whisper path. Modern openai-whisper (v20250115+) removed
@@ -2883,11 +2888,11 @@ def _probe_stt() -> dict:
     try:
         if lock is not None:
             try:
-                text = _do_transcribe(model)
+                text = _do_transcribe(model, cached_dev)
             finally:
                 lock.release()
         else:
-            text = _do_transcribe(model)
+            text = _do_transcribe(model, cached_dev if using_cached else "cpu")
         details["transcribed_text"] = text[:60]
     except Exception as e:
         # CUDA DLL load failures are environmental: the GPU runtime
@@ -2909,6 +2914,10 @@ def _probe_stt() -> dict:
             cpu_ok = False
             cpu_note = ""
             try:
+                # The CUDA driver starts before ctranslate2 can load (v2.0.180,
+                # core/cuda_preinit.py - a no-op once the boot did it).
+                from core import cuda_preinit as _cuda_preinit
+                _cuda_preinit.before_ctranslate2()
                 from faster_whisper import WhisperModel as _FWM  # type: ignore
                 cpu_model = _FWM("tiny", device="cpu", compute_type="int8")
                 _do_transcribe(cpu_model)
