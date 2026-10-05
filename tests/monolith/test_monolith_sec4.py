@@ -3995,8 +3995,15 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
         # degrades_clearly was the one test that forgot, and fetched
         # itunes.apple.com on every run (the hermetic guard's catch). The
         # window lookup by title is a real-desktop boundary too.
+        # So is the screen (2026-10-02): the play_button strategy runs
+        # find_click_target even with vision OFF, and it photographs the
+        # whole virtual desktop BEFORE vision declines, so
+        # test_space_fires_when_enter_did_not_start took two real captures of
+        # the owner's screen per run (mss, then the PIL.ImageGrab fallback
+        # under a tripwire). None is what both answer with vision off.
         for name in ("_apple_music_resolve_track",
-                     "_find_browser_window_matching"):
+                     "_find_browser_window_matching",
+                     "find_click_target", "take_screenshot"):
             patcher = mock.patch.object(self.bc, name, return_value=None)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -4044,8 +4051,10 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
                 return "Africa — Toto"
 
         # resolve->None forces the search-page fallback so the play_strategies
-        # loop runs; play_button (attempt 1) is a vision no-op with vision OFF,
-        # so it advances to SPACE (attempt 2). See class note (v1.35.0).
+        # loop runs; play_button (attempt 1) is a vision no-op with vision OFF
+        # (find_click_target pinned to None in setUp - the real one captures
+        # the screen first), so it advances to SPACE (attempt 2). See class
+        # note (v1.35.0).
         with mock.patch.object(bc, "_apple_music_resolve_track",
                                return_value=None), \
              mock.patch.object(bc, "_open_url_in_browser",
@@ -4064,6 +4073,7 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
             out = bc._streaming_auto_play("apple_music", "Africa by Toto")
         self.assertEqual(out, "playing 'Africa by Toto' on Apple Music")
         up.assert_any_call("space")      # SPACE was the trigger
+        bc.take_screenshot.assert_not_called()   # no vision screenshot
 
     def test_no_ui_automation_degrades_clearly(self):
         # The honest message replaces the old silent vision-timeout.

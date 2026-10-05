@@ -1,5 +1,6 @@
 """tools/hermetic_guard - the refusal of a TEST RUN reaching the network, the
-owner's keyboard / mouse / windows, and live-hardware probes.
+owner's keyboard / mouse / windows, live-hardware probes, and the owner's
+screen.
 
 THE FINDINGS (2026-09-30)
 =========================
@@ -8,7 +9,8 @@ reached the real world through production code: the live Ollama (/api/ps,
 /api/tags) from the dashboard and preflight suites, itunes.apple.com from two
 Apple Music tests, the real nvidia-smi / `ollama ps`, a real
 SetForegroundWindow, and a HUD overlay window put on the desktop by a skill's
-register(). All green - for the wrong reason.
+register(). All green - for the wrong reason. A tripwire run on 2026-10-02
+added the screen: a monolith test photographed the whole desktop twice.
 
 These tests pin the guard WITHOUT reaching anything:
 
@@ -16,9 +18,10 @@ These tests pin the guard WITHOUT reaching anything:
 * the hook is exercised with SYNTHETIC audit events (``sys.audit`` runs the
   hooks and nothing else - no socket, no process, no user32 call);
 * the few tests that make a REAL call (a connect, a lookup, a spawn, a
-  SetCursorPos) run only while the guard is proven armed, so the refusal
-  happens before anything leaves the process - they can never reach the thing
-  they are about;
+  SetCursorPos, a screen BitBlt, an ImageGrab / mss grab) run only while the
+  guard is proven armed, so the refusal happens before anything leaves the
+  process - they can never reach the thing they are about (the capture ones
+  also spy on every pixel source beneath the entry point);
 * the regression class re-runs every test the audit caught, in-process, and
   requires that it now reaches nothing (the fixes in the tests themselves);
 * the monolith class re-runs every test that injects ``bobert_companion=None``
@@ -259,6 +262,41 @@ class InputVerdictTests(unittest.TestCase):
 
     def test_read_only_calls_pass(self):
         self.assertIsNone(hg.input_verdict("GetCursorPos", ()))
+
+
+_SRCCOPY = 0x00CC0020
+_WHITENESS = 0x00FF0062
+
+
+class ScreenVerdictTests(unittest.TestCase):
+
+    def test_a_blit_from_a_screen_dc_is_refused(self):
+        for fn in ("BitBlt", "StretchBlt"):
+            with self.subTest(fn=fn):
+                args = (10, 0, 0, 1, 1, 77, 0, 0, _SRCCOPY)
+                self.assertIsNotNone(hg.screen_verdict(
+                    fn, args, screen_dc=lambda dc: dc == 77))
+                # the default answer for an unknown DC is "the screen"
+                self.assertIsNotNone(hg.screen_verdict(fn, args))
+
+    def test_ordinary_drawing_passes(self):
+        # a memory-DC source, and a source-less raster op (a fill)
+        self.assertIsNone(hg.screen_verdict(
+            "BitBlt", (10, 0, 0, 1, 1, 11, 0, 0, _SRCCOPY),
+            screen_dc=lambda dc: False))
+        self.assertIsNone(hg.screen_verdict(
+            "BitBlt", (10, 0, 0, 1, 1, None, 0, 0, _WHITENESS),
+            screen_dc=hg._screen_dc))
+        self.assertFalse(hg._screen_dc(0))
+
+    def test_printwindow_is_refused_only_on_another_process_window(self):
+        self.assertIsNotNone(hg.screen_verdict(
+            "PrintWindow", (5, 10, 2), foreign=lambda h: True))
+        self.assertIsNone(hg.screen_verdict(
+            "PrintWindow", (5, 10, 2), foreign=lambda h: False))
+
+    def test_other_functions_pass(self):
+        self.assertIsNone(hg.screen_verdict("GetPixel", (10, 0, 0)))
 
 
 # ─── the hook, through synthetic audit events (no I/O) ─────────────────────
@@ -561,6 +599,201 @@ class EffectTargetsTests(_Armed):
         self.assertIn("REFUSED", out.stdout)
 
 
+# ─── the screen, 2026-10-02 ────────────────────────────────────────────────
+# A tripwire run of the monolith tier caught test_space_fires_when_enter_did_
+# not_start photographing the owner's whole desktop twice per run (mss, then
+# the PIL.ImageGrab fallback). Each test below that calls a REAL capture entry
+# point first spies on every pixel source beneath it, so a broken guard fails
+# the test instead of photographing anything.
+
+def _need(module: str) -> None:
+    import importlib.util
+    if importlib.util.find_spec(module.split(".")[0]) is None:
+        raise unittest.SkipTest(f"{module} is not installed here")
+
+
+@contextlib.contextmanager
+def _imagegrab_pixel_spies():
+    """Every way PIL.ImageGrab.grab reads pixels, replaced by a spy: the C
+    grabs (Windows / X11) and the subprocess it shells out to (macOS
+    screencapture, the Linux gnome-screenshot fallback). Yields the spies."""
+    from PIL import Image, ImageGrab
+    with contextlib.ExitStack() as stack:
+        spies = [stack.enter_context(mock.patch.object(
+                     Image.core, name,
+                     side_effect=AssertionError("reached the pixels")))
+                 for name in ("grabscreen_win32", "grabscreen_x11")
+                 if hasattr(Image.core, name)]
+        spies.append(stack.enter_context(
+            mock.patch.object(ImageGrab, "subprocess")))
+        yield spies
+
+
+class ScreenGuardTests(_Armed):
+
+    def test_the_capture_entry_points_are_targets(self):
+        self.assertIn("screen", hg.GUARDS)
+        self.assertIn(("mss.base", "MSS", "grab"), hg._SCREEN_TARGETS)
+        self.assertIn(("PIL.ImageGrab", None, "grab"), hg._SCREEN_TARGETS)
+
+    def test_a_real_imagegrab_grab_is_refused_before_any_pixel_is_read(self):
+        _need("PIL")
+        self.require_armed("screen")
+        from PIL import ImageGrab
+        self.assertTrue(hg._marked(ImageGrab.grab))
+        with _ledger_restored(), _imagegrab_pixel_spies() as spies:
+            with self.assertRaises(hg.ScreenGuardError):
+                ImageGrab.grab(all_screens=True)
+            last = hg.refusals("screen")[-1]
+            self.assertEqual(last.api, "PIL.ImageGrab.grab")
+            self.assertIn("test_a_real_imagegrab_grab_is_refused", last.test_id)
+        for spy in spies:
+            self.assertEqual(spy.mock_calls, [])
+
+    def test_a_real_mss_grab_is_refused_before_any_pixel_is_read(self):
+        # The REAL MSS.grab, on a fake instance whose backend is a spy: no
+        # MSS() is ever made, so nothing below grab() exists to reach.
+        _need("mss")
+        self.require_armed("screen")
+        import mss.base
+        self.assertTrue(hg._marked(mss.base.MSS.grab))
+        fake = mock.MagicMock()
+        fake._impl.grab.side_effect = AssertionError("reached the pixels")
+        fake._grab_impl.side_effect = AssertionError("reached the pixels")
+        with _ledger_restored():
+            with self.assertRaises(hg.ScreenGuardError):
+                mss.base.MSS.grab(fake, {"left": 0, "top": 0,
+                                         "width": 1, "height": 1})
+            self.assertEqual(hg.refusals("screen")[-1].api,
+                             "mss.base.MSS.grab")
+        fake._impl.grab.assert_not_called()
+        fake._grab_impl.assert_not_called()
+
+    def test_a_patched_capture_entry_point_reports_unarmed_and_is_restored(self):
+        _need("PIL")
+        from PIL import ImageGrab
+        with mock.patch.object(ImageGrab, "grab"):
+            self.assertIn("PIL.ImageGrab.grab", hg.unwrapped_effects("screen"))
+            self.assertIn("screen", hg.unarmed_guards())
+            self.assertNotIn("PIL.ImageGrab.grab",
+                             hg.unwrapped_effects("input"))
+        self.assertEqual(hg.unwrapped_effects("screen"), [],
+                         "mock.patch must restore the guard's stub")
+        self.assertNotIn("screen", hg.unarmed_guards())
+
+    def test_an_opt_in_lets_a_capture_through(self):
+        _need("PIL")
+        from PIL import ImageGrab
+        with _ledger_restored(), _imagegrab_pixel_spies(), \
+                hg.allow("screen", reason="the spy stands in for the screen"):
+            with self.assertRaises(AssertionError):   # it reached the spy
+                ImageGrab.grab()
+            self.assertEqual(hg.refusals("screen"), ())
+
+    def test_a_synthetic_screen_blit_is_refused_and_a_fill_passes(self):
+        blit = [p for p, fn in hg._screen_fn_ptrs.items() if fn[1] == "BitBlt"]
+        if not blit:
+            self.skipTest("no gdi32 on this host")
+        self.require_armed("screen")
+        with _ledger_restored():
+            with self.assertRaises(hg.ScreenGuardError):
+                sys.audit("ctypes.call_function", blit[0],
+                          (0, 0, 0, 1, 1, 1, 0, 0, _SRCCOPY))
+            self.assertEqual(hg.refusals("screen")[-1].api, "gdi32.BitBlt")
+            sys.audit("ctypes.call_function", blit[0],
+                      (0, 0, 0, 1, 1, None, 0, 0, _WHITENESS))
+
+    def test_a_real_screen_blit_is_refused_and_ordinary_drawing_passes(self):
+        if sys.platform != "win32" or not hg._screen_fn_ptrs:
+            self.skipTest("no gdi32 on this host")
+        self.require_armed("screen")
+        import ctypes
+        from ctypes import wintypes
+        user32, gdi32 = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")
+        user32.GetDC.argtypes = [wintypes.HWND]
+        user32.GetDC.restype = wintypes.HDC
+        user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        user32.GetDesktopWindow.restype = wintypes.HWND
+        user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC,
+                                       wintypes.UINT]
+        gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int,
+                                                 ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+        gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+        gdi32.SelectObject.restype = wintypes.HGDIOBJ
+        gdi32.BitBlt.argtypes = [wintypes.HDC] + [ctypes.c_int] * 4 + [
+            wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+        gdi32.GetPixel.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+        gdi32.GetPixel.restype = wintypes.DWORD
+        gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        screen = user32.GetDC(None)          # a handle; reads no pixels
+        dcs, bitmaps = [], []
+        try:
+            for _ in range(2):
+                dc = gdi32.CreateCompatibleDC(screen)
+                bmp = gdi32.CreateCompatibleBitmap(screen, 1, 1)
+                gdi32.SelectObject(dc, bmp)
+                dcs.append(dc)
+                bitmaps.append(bmp)
+            mem, other = dcs
+            # Ordinary drawing passes: a source-less fill, then a
+            # memory-to-memory copy of it.
+            self.assertTrue(gdi32.BitBlt(mem, 0, 0, 1, 1, None, 0, 0,
+                                         _WHITENESS))
+            self.assertTrue(gdi32.BitBlt(other, 0, 0, 1, 1, mem, 0, 0,
+                                         _SRCCOPY))
+            self.assertEqual(gdi32.GetPixel(other, 0, 0), 0xFFFFFF)
+            with _ledger_restored():
+                with self.assertRaises(hg.ScreenGuardError):
+                    gdi32.BitBlt(mem, 0, 0, 1, 1, screen, 0, 0, _SRCCOPY)
+                with self.assertRaises(hg.ScreenGuardError):
+                    user32.PrintWindow(user32.GetDesktopWindow(), mem, 0)
+                self.assertEqual([r.api for r in hg.refusals("screen")[-2:]],
+                                 ["gdi32.BitBlt", "user32.PrintWindow"])
+        finally:
+            for dc in dcs:
+                gdi32.DeleteDC(dc)
+            for bmp in bitmaps:
+                gdi32.DeleteObject(bmp)
+            user32.ReleaseDC(None, screen)
+
+    def test_the_tests_package_arms_it_in_a_fresh_process(self):
+        # End to end through the chokepoint: a child that only imports the
+        # tests package must refuse a real capture, and say so at exit. Every
+        # pixel source is a spy in the child too.
+        _need("PIL")
+        code = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "import contextlib\n"
+            "import tests\n"
+            "from tools import hermetic_guard as hg\n"
+            "from tests.test_hermetic_guard import _imagegrab_pixel_spies\n"
+            "assert 'screen' not in hg.unarmed_guards(), hg.unarmed_guards()\n"
+            "from PIL import ImageGrab\n"
+            "assert hg._marked(ImageGrab.grab), 'ImageGrab.grab not wrapped'\n"
+            "with _imagegrab_pixel_spies() as spies:\n"
+            "    try:\n"
+            "        ImageGrab.grab()\n"
+            "    except hg.ScreenGuardError:\n"
+            "        print('REFUSED')\n"
+            "assert all(not s.mock_calls for s in spies), 'reached the pixels'\n"
+            "print('SUMMARY ' + hg.summary().splitlines()[0])\n"
+            "hg.reset()\n"
+        ) % _PROJECT_ROOT
+        env = {k: v for k, v in os.environ.items()
+               if k not in hg.ENV_ESCAPES.values()}
+        out = subprocess.run([sys.executable, "-B", "-c", code], env=env,
+                             cwd=_PROJECT_ROOT, capture_output=True,
+                             text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr[-800:])
+        self.assertIn("REFUSED", out.stdout)
+        self.assertIn("SUMMARY [screen-guard] refused 1 real screen reach",
+                      out.stdout)
+
+
 # ─── real calls, refused before anything leaves the process ────────────────
 
 class RealCallTests(_Armed):
@@ -685,6 +918,10 @@ _FIXED_OFFENDERS = (
      "itunes.apple.com + a real browser"),
     ("tests.monolith.test_monolith_sec4.AppleMusicAutoPlayNoVisionTests."
      "test_no_ui_automation_degrades_clearly", "itunes.apple.com"),
+    # (2026-10-02, the tripwire run of the monolith tier)
+    ("tests.monolith.test_monolith_sec4.AppleMusicAutoPlayNoVisionTests."
+     "test_space_fires_when_enter_did_not_start",
+     "the real screen - two whole-desktop captures (mss, PIL.ImageGrab)"),
     ("tests.monolith.test_monolith_sec4.AppleMusicPlaylistSidebarTests."
      "test_sidebar_playlists_click_failsafe", "a real browser"),
     ("tests.monolith.test_monolith_sec4.StreamingApplyPlayStrategyTests."
