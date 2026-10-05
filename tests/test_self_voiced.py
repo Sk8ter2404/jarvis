@@ -73,6 +73,22 @@ class SilentLineTests(unittest.TestCase):
                 self.assertTrue(r in sv.REASON_CLAUSES
                                 or r in sv.OWNER_STOP_REASONS or r == "done")
 
+    def test_stopped_while_waiting_reads_as_an_owner_stop(self):
+        # Nothing is added for it, like any owner stop before a word.
+        self.assertTrue(sv.stopped_by_owner(sv.STOPPED_WHILE_WAITING))
+
+    def test_spoke_then_raised_is_neither_a_crash_nor_a_failure_line(self):
+        # So no failure round re-runs a chat that already talked, and no
+        # terminal line is added after it.
+        from core import failure_markers as fm
+        for exc in (RuntimeError("x"), ValueError(), KeyboardInterrupt()):
+            with self.subTest(exc=type(exc).__name__):
+                res = sv.spoke_then_raised(exc)
+                self.assertIn(type(exc).__name__, res)
+                self.assertNotIn(fm.ACTION_CRASH_MARK, res)
+                self.assertEqual(fm.terminal_failure_text(res), "")
+                self.assertFalse(sv.stopped_by_owner(res))
+
     def test_lines_are_spoken_sentences(self):
         lines = [sv.BUSY_LINE] + [
             sv.silent_line(f"Chat not started: {r}.") for r in sv.REASON_CLAUSES]

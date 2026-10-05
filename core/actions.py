@@ -4694,6 +4694,11 @@ def _act_replay_last_action(arg: str = "") -> str:
     is refused too: this path calls the handler directly, past the read-back
     gate parse_and_run_actions applies (the monolith also stops recording
     them; this is the second lock on the same door).
+
+    The handler runs through the monolith's one runner, _run_draft_gated
+    (2026-10-05). Returns "" when a self-voiced action did its own talking
+    (nothing more to say) and a terminal failure whole (the owner's
+    sentence, voiced word for word by every caller).
     """
     bc = _bc()
     with bc._action_history_lock:
@@ -4730,9 +4735,22 @@ def _act_replay_last_action(arg: str = "") -> str:
 
     new_arg = bc._substitute_monitor_in_arg(name, orig_arg, arg) if arg else orig_arg
     try:
-        res = fn(new_arg)
+        # The monolith's one runner (2026-10-05), as every path that runs an
+        # action it was handed: a self-voiced action (a device chat) gets
+        # its bounded wait for another chat and its honest line when it
+        # says nothing. A bare fn() here bypassed both.
+        res = bc._run_draft_gated(name, new_arg, fn)
     except Exception as e:
         return f"replay of '{name}' failed: {e}"
+    # A terminal failure is already the owner's sentence: handed back whole,
+    # so every caller voices it word for word - never "replayed x: failed
+    # (final): ...". And a self-voiced action that did its own talking has
+    # nothing more to say: its result is bookkeeping, never read aloud.
+    from core.failure_markers import terminal_failure_text
+    if terminal_failure_text(res):
+        return res
+    if bc._self_voiced_did_talk(name, res):
+        return ""
     suffix = f" on monitor {arg.strip().lower()}" if arg else ""
     summary = res if isinstance(res, str) else str(res)
     head = summary.split("\n", 1)[0]

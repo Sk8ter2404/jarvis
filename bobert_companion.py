@@ -32253,7 +32253,9 @@ def maybe_replay_last_action(utterance: str) -> str | None:
 
     Returns the spoken confirmation if the utterance matched and the replay
     fired (or refused), else None so the caller falls through to its normal
-    dispatch path.
+    dispatch path. "" when the replayed action did its own talking (a
+    self-voiced device chat, 2026-10-05); a terminal failure comes back
+    whole, for the caller to voice without its marker.
     """
     if not utterance or not utterance.strip():
         return None
@@ -32261,6 +32263,10 @@ def maybe_replay_last_action(utterance: str) -> str | None:
     if not m:
         return None
     monitor = (m.group(1) or "").strip()
+    # The owner's words, recorded as a routed turn records them (_call_llm
+    # never runs here): a skill that checks the transcript before acting (a
+    # device chat) must judge THIS sentence, not the previous turn's.
+    _last_user_text[0] = utterance
     return _act_replay_last_action(monitor)
 
 
@@ -33072,6 +33078,10 @@ def _spoken_here() -> int:
 _SELF_VOICED_READY_WAIT_S = 8.0
 _SELF_VOICED_READY_WAIT_MAX_S = 15.0
 _SELF_VOICED_READY_POLL_S = 0.1
+# How long the "another chat is still going" line waits for the other chat's
+# live stop-listen capture to close (the device is mid-line) before it is
+# said - the rule _speak_line applies to a dialogue's own lines (1 s there).
+_SELF_VOICED_MIC_WAIT_S = 3.0
 
 
 def _other_dialogue_running() -> bool:
@@ -33089,12 +33099,27 @@ def _other_dialogue_running() -> bool:
 def _self_voiced_wait_ready(name: str) -> str:
     """"" when self-voiced action ``name`` may start now - at once, or once
     the other device dialogue ended inside the bounded wait - else "active"
-    (still running when the wait ran out). Cancels the turn's processing
-    filler before waiting: a filler line would talk over the other chat.
-    Never raises."""
+    (still running when the wait ran out) or "interrupted" (an accepted
+    interrupt landed while it waited: the owner's stop or wake word over the
+    other chat, a tray / web STOP, the other chat's own stop. It bumps
+    _tts_interrupt_seq, so this turn is barged - and a chat started after it
+    would take a FRESH interrupt snapshot, out of the stop's reach; review
+    2026-10-05). Cancels the turn's processing filler before waiting: a
+    filler line would talk over the other chat. The watchdog is fed only
+    from the main loop's own thread (_dispatch_heartbeat). Never raises."""
     try:
         if not _other_dialogue_running():
             return ""
+        try:
+            seq0 = _tts_interrupt_seq[0]
+        except Exception:
+            seq0 = None
+
+        def _interrupted() -> bool:
+            try:
+                return seq0 is not None and _tts_interrupt_seq[0] != seq0
+            except Exception:
+                return False
         try:
             wait = float(globals().get("_SELF_VOICED_READY_WAIT_S", 8.0))
         except Exception:
@@ -33111,16 +33136,24 @@ def _self_voiced_wait_ready(name: str) -> str:
         t0 = time.monotonic()
         deadline = t0 + wait
         while _other_dialogue_running():
+            if _interrupted():
+                break
             left = deadline - time.monotonic()
             if left <= 0:
                 print(f"  [self-voiced] {name}: the other chat is still "
                       f"running after {wait:.0f}s - not started")
                 return "active"
             try:
-                _heartbeat()
+                _dispatch_heartbeat()
             except Exception:
                 pass
             time.sleep(min(_SELF_VOICED_READY_POLL_S, left))
+        # Checked once more after the loop: a stop() bumps the seq and THEN
+        # the other chat ends, so the loop may see the end first.
+        if _interrupted():
+            print(f"  [self-voiced] {name}: a stop landed while it waited - "
+                  f"not started")
+            return "interrupted"
         print(f"  [self-voiced] {name}: the other chat ended after "
               f"{time.monotonic() - t0:.1f}s - starting")
         return ""
@@ -33128,26 +33161,76 @@ def _self_voiced_wait_ready(name: str) -> str:
         return ""
 
 
+def _self_voiced_wait_mic_free(name: str) -> None:
+    """Bounded wait (_SELF_VOICED_MIC_WAIT_S) while another dialogue's
+    stop-listen capture holds the mic - its device is mid-line - before a
+    line about it is said: played now, that line would talk over the device
+    and close the capture that hears the owner's stop (_stop_listen_must_
+    yield). The rule _speak_line applies to a dialogue's own lines. Never
+    raises."""
+    try:
+        if not _pathb_mic_active[0]:
+            return
+        try:
+            wait = float(globals().get("_SELF_VOICED_MIC_WAIT_S", 3.0))
+        except Exception:
+            wait = 3.0
+        if wait != wait:                 # NaN
+            wait = 3.0
+        deadline = time.monotonic() + min(_SELF_VOICED_READY_WAIT_MAX_S,
+                                          max(0.0, wait))
+        while _pathb_mic_active[0] and time.monotonic() < deadline:
+            try:
+                _dispatch_heartbeat()
+            except Exception:
+                pass
+            time.sleep(0.02)
+        if _pathb_mic_active[0]:
+            print(f"  [self-voiced] {name}: the other chat's capture is "
+                  f"still live after {wait:.0f}s - saying it anyway")
+    except Exception:
+        pass
+
+
 def _run_self_voiced(name: str, arg: str, fn):
     """Run self-voiced action ``name`` (from _run_draft_gated - every path
-    that runs an action it was handed). First the bounded readiness wait;
-    still busy -> not run, and the result is a terminal failure saying so.
-    Then fn(arg); a run that voiced no line on this thread comes back as a
-    terminal failure carrying the honest line (core/self_voiced.py) - except
-    a deferral (pushback / confirmation / ambiguity: its question is spoken
-    by the normal path), a terminal failure of its own (spoken as is) and an
-    owner stop before the first line (he ended it: nothing is added). An
-    exception propagates unchanged (the caller reports it)."""
-    if _self_voiced_wait_ready(name):
+    that runs an action it was handed, "do that again" included). First the
+    bounded readiness wait: a stop during it -> not run, nothing added
+    (core.self_voiced.STOPPED_WHILE_WAITING); still busy -> not run, and the
+    result is a terminal failure saying so, voiced once the other chat's
+    live capture has closed. Then fn(arg); a run that voiced no line on this
+    thread comes back as a terminal failure carrying the honest line
+    (core/self_voiced.py) - except a terminal failure of its own (spoken as
+    is) and an owner stop before the first line (he ended it: nothing is
+    added). A deferral-shaped result gets the honest line too: only the
+    dispatcher defers, BEFORE an action runs (review 2026-10-05). An
+    exception before the first line propagates unchanged (the caller reports
+    it); one AFTER it had spoken is logged and recorded, and the action's
+    talking stands (core.self_voiced.spoke_then_raised: no failure round
+    that could run the whole chat again)."""
+    why = _self_voiced_wait_ready(name)
+    if why == "interrupted":
+        return _self_voiced_lines.STOPPED_WHILE_WAITING
+    if why:
+        _self_voiced_wait_mic_free(name)
         return _TERMINAL_FAILURE_PREFIX + _self_voiced_lines.BUSY_LINE
     n0 = _spoken_here()
-    res = fn(arg)
+    try:
+        res = fn(arg)
+    except Exception as e:
+        if _spoken_here() == n0:
+            raise
+        print(f"  [self-voiced] {name} raised after it had spoken "
+              f"({type(e).__name__}: {e}) - its talking stands, no retry")
+        try:
+            record_action_error(name, e, traceback.format_exc())
+        except Exception:
+            pass
+        return _self_voiced_lines.spoke_then_raised(e)
     if _spoken_here() != n0:
         return res
     try:
-        if isinstance(res, str) and (
-                res.startswith(_ANSWER_FIRST_DEFERRED_PREFIXES)
-                or _terminal_failure_text(res)):
+        if _terminal_failure_text(res):
             return res
         if _self_voiced_lines.stopped_by_owner(res):
             print(f"  [self-voiced] {name} said nothing: stopped by the "
@@ -43270,9 +43353,14 @@ def _run_voice_shortcuts(text: str) -> bool:
         print(f"  [replay] handler failed: {_e}")
         _replay_reply = None
     if _replay_reply is not None:
-        print(f"  [replay] {_replay_reply}")
-        _append_turn(text, _replay_reply)
-        _speak(_replay_reply)
+        print(f"  [replay] {_replay_reply or 'it did its own talking'}")
+        # A terminal failure is the owner's sentence (a self-voiced run that
+        # said nothing included); "" = the replayed action voiced itself
+        # (a device chat), so nothing is added (2026-10-05).
+        _replay_say = _terminal_failure_text(_replay_reply) or _replay_reply
+        _append_turn(text, _replay_say or "[ACTION: replay_last_action]")
+        if _replay_say:
+            _speak(_replay_say)
         set_state("idle")
         return True
 

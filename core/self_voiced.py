@@ -23,6 +23,12 @@ a confirmed "yes"). The routed path and the brain path therefore say the
 same thing. One exception: an owner stop (his wake word, a stop, a tray
 interrupt) before the first line - he ended it, so nothing is added.
 
+Review repairs the same day: a stop while the action waits for another chat
+cancels it (STOPPED_WHILE_WAITING); an action that raised after it had spoken
+did its talking (spoke_then_raised: no failure round that could run it
+twice); a deferral-shaped result handed back BY the action is a silent run
+like any other (only the dispatcher defers, before an action runs).
+
 The line names a reason only when the result carries one of JARVIS's OWN
 dialogue words (bobert_companion._dialogue_ready() and core.dialogue.REASONS).
 A skill's private reason ("binding", "unreachable", ...) means nothing to the
@@ -61,6 +67,27 @@ OWNER_STOP_REASONS: tuple = ("owner_stop", "wake", "interrupted")
 # (bobert_companion._self_voiced_wait_ready) and the action was not started.
 BUSY_LINE = ("I'm afraid another chat is still going, sir; ask me again "
              "once it's finished.")
+
+# The result when the action was NOT started because an accepted interrupt
+# (the owner's stop or wake word, a tray / web STOP, the other chat's own
+# stop) landed while it waited for another dialogue (review 2026-10-05: the
+# waiting chat used to start the moment the stopped one ended, out of the
+# stop's reach). That turn is barged; this reads as an owner stop
+# (stopped_by_owner), so nothing is added.
+STOPPED_WHILE_WAITING = "Not started: interrupted."
+
+
+def spoke_then_raised(exc) -> str:
+    """The result of a self-voiced action that raised AFTER it had spoken
+    (bobert_companion._run_self_voiced): its talking is done. It carries no
+    crash marker (core.failure_markers.ACTION_CRASH_MARK) and no terminal
+    prefix, so no failure round runs the action again and nothing more is
+    said. Never raises."""
+    try:
+        return (f"Ended after it had spoken; then it raised "
+                f"{type(exc).__name__}.")
+    except Exception:
+        return "Ended after it had spoken; then it raised."
 
 _WORD_RE = re.compile(r"[a-z_]+")
 # "Chat not started: x." / "Banter finished: 0 lines, x." -> "chat" / "banter".

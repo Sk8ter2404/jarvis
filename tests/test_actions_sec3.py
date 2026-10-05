@@ -1593,6 +1593,10 @@ class ReplayLastActionTests(unittest.TestCase):
         bc._action_history = history
         bc._DESTRUCTIVE_REPLAY_ACTIONS = set(destructive or
                                              ["close_window", "kill_process"])
+        # The monolith's one runner and one rule (2026-10-05): a plain run,
+        # and no action here is a self-voiced one that did its own talking.
+        bc._run_draft_gated = lambda name, arg, fn: fn(arg)
+        bc._self_voiced_did_talk = lambda name, result: False
         return bc
 
     def test_no_history(self):
@@ -1683,6 +1687,43 @@ class ReplayLastActionTests(unittest.TestCase):
             out = A._act_replay_last_action()
         fn.assert_called_once_with("5 minutes")
         self.assertEqual(out, "replayed set_timer: timer set")
+
+    # 2026-10-05: the replay runs the action through the monolith's one
+    # runner (_run_draft_gated - a self-voiced action's readiness wait and
+    # honest line), like every other path that runs an action it was handed.
+    def test_replay_runs_through_the_one_runner(self):
+        bc = self._bc([{"action": "desk_chat", "arg": "phones"}])
+        fn = mock.Mock(return_value="ran")
+        bc.ACTIONS = {"desk_chat": fn}
+        seen = []
+        bc._run_draft_gated = lambda n, a, f: seen.append((n, a, f)) or f(a)
+        with _patch_bc(bc):
+            out = A._act_replay_last_action()
+        self.assertEqual(seen, [("desk_chat", "phones", fn)])
+        fn.assert_called_once_with("phones")
+        self.assertEqual(out, "replayed desk_chat: ran")
+
+    def test_a_self_voiced_replay_that_talked_adds_nothing(self):
+        # It voiced itself; its result is bookkeeping, never read aloud.
+        bc = self._bc([{"action": "desk_chat", "arg": ""}])
+        bc.ACTIONS = {"desk_chat": mock.Mock(
+            return_value="Chat finished: 3 lines, done.")}
+        bc._self_voiced_did_talk = lambda n, r: n == "desk_chat"
+        with _patch_bc(bc):
+            out = A._act_replay_last_action()
+        self.assertEqual(out, "")
+
+    def test_a_terminal_failure_is_handed_back_whole(self):
+        # Already the owner's sentence (a self-voiced run that said nothing
+        # included): every caller voices it word for word - never
+        # "replayed x: failed (final): ...".
+        from core.failure_markers import TERMINAL_FAILURE_PREFIX as T
+        line = "I'm afraid the chat didn't start, sir."
+        bc = self._bc([{"action": "desk_chat", "arg": ""}])
+        bc.ACTIONS = {"desk_chat": mock.Mock(return_value=T + line)}
+        with _patch_bc(bc):
+            out = A._act_replay_last_action("left")
+        self.assertEqual(out, T + line)
 
     def test_draft_send_is_never_replayed(self):
         for name in ("send_draft", "send_vip_reply", "confirm_pending_draft"):

@@ -27,7 +27,18 @@ _self_voiced_reply / _self_voiced_wait_ready, core/self_voiced.py):
   * a crash is reported (failure follow-up), an owner stop adds nothing,
     another thread's speech never counts as the action's own, _speak and
     _speak_line both count, the crash marker matches the dispatcher's result,
-    every one of _dialogue_ready()'s reasons has a clause.
+    every one of _dialogue_ready()'s reasons has a clause;
+  * review repairs (2026-10-05): a stop during the wait cancels the waiting
+    chat (routed and brain path, owner stop and tray STOP); the "another
+    chat is still going" line waits (bounded) for the other chat's live
+    capture; "do that again" runs through the same runner with THIS turn's
+    words and never reads the chat's result aloud; a crash AFTER the chat
+    spoke is neither retried nor re-read; an unspoken offer is never left
+    open and the prose after a silent chat is held; the autocorrect pick
+    says a terminal failure; the wait beats the watchdog only on the main
+    thread; a deferral-shaped result from the action gets the honest line
+    while the dispatcher's own deferral still asks; an AST guard keeps every
+    result-reading site on the one rule (_self_voiced_did_talk).
 
 GENERIC fixtures only ("desk device"); the owner's words are paraphrased.
 No real audio, no LLM, no network, no device.
@@ -179,6 +190,46 @@ class _Base(_DispatchBase):
             self.bc._run_llm_dispatch(text)
         self.llm.assert_not_called()
         return buf.getvalue()
+
+    def _later(self, delay, fn):
+        """Run ``fn`` on a timer thread after ``delay`` seconds."""
+        timer = threading.Timer(delay, fn)
+        timer.daemon = True
+        timer.start()
+        self.addCleanup(timer.cancel)
+        return timer
+
+    def _other_chat_loop(self):
+        """A device chat on ANOTHER thread that runs until its session is
+        stopped - what a Runner does: it reads ds.stopped() before every
+        line (a stop(), an accepted interrupt, mute, sleep, max_s). Returns
+        (its handle, an Event set once it has ended)."""
+        bc = self.bc
+        entered = threading.Event()
+        ended = threading.Event()
+        box: list = []
+
+        def run():
+            with bc._dialogue_session("desk device", max_s=60) as ds:
+                box.append(ds)
+                entered.set()
+                t_end = time.monotonic() + 10.0
+                while not ds.stopped() and time.monotonic() < t_end:
+                    time.sleep(0.02)
+            ended.set()
+
+        t = threading.Thread(target=run, name="other-chat", daemon=True)
+        t.start()
+        self.assertTrue(entered.wait(5.0))
+
+        def _cleanup():
+            try:
+                box[0].stop("cleanup")
+            except Exception:
+                pass
+            t.join(5.0)
+        self.addCleanup(_cleanup)
+        return box[0], ended
 
 
 # ── the live sequence, replayed ──────────────────────────────────────────
@@ -352,18 +403,30 @@ class ReadinessWaitTests(_Base):
         self.assertEqual(self.runs, [])
 
     def test_the_wait_is_clamped(self):
+        # No time.sleep patch: bc.time IS the stdlib module, so patching its
+        # sleep would make every other thread in the process spin (review
+        # 2026-10-05). The other chat "ends" on the third look instead.
         bc = self.bc
+        for bad in (float("nan"), -5.0):
+            with self.subTest(wait=bad):
+                self._p(bc, "_SELF_VOICED_READY_WAIT_S", bad)
+                seq = iter([True, False])
+                self._p(bc, "_other_dialogue_running",
+                        side_effect=lambda: next(seq, False))
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    self.assertEqual(bc._self_voiced_wait_ready("x"), "")
+                self.assertRegex(buf.getvalue(), r"up to (8|0)s")
         self._p(bc, "_SELF_VOICED_READY_WAIT_S", 1e9)
-        calls = []
         seq = iter([True, True, False])
         self._p(bc, "_other_dialogue_running",
-                side_effect=lambda: calls.append(1) or next(seq))
-        sleeps = []
-        self._p(bc.time, "sleep", side_effect=lambda s: sleeps.append(s))
+                side_effect=lambda: next(seq, False))
+        t0 = time.monotonic()
         with contextlib.redirect_stdout(io.StringIO()) as buf:
             self.assertEqual(bc._self_voiced_wait_ready("desk_chat"), "")
         self.assertIn("up to 15s", buf.getvalue())
-        self.assertTrue(all(s <= bc._SELF_VOICED_READY_POLL_S for s in sleeps))
+        # Two polls of at most _SELF_VOICED_READY_POLL_S each.
+        self.assertLess(time.monotonic() - t0,
+                        2 * bc._SELF_VOICED_READY_POLL_S + 1.0)
 
     def test_no_wait_for_a_chat_on_this_very_thread(self):
         bc = self.bc
@@ -505,6 +568,406 @@ class ContractTests(_Base):
         reasons.discard("staging")          # a staging instance never speaks
         self.assertEqual(sorted(reasons - set(sv.REASON_CLAUSES)), [])
 
+    def test_a_deferral_shaped_result_from_the_action_says_why(self):
+        # Deferrals ("say 'yes' to proceed") are made by the dispatcher BEFORE
+        # an action runs; one coming back FROM the action registered no
+        # confirmation and said nothing, so it gets the honest line like any
+        # other silent run (review 2026-10-05: the old carve-out was dead).
+        bc = self.bc
+        prefix = bc._ANSWER_FIRST_DEFERRED_PREFIXES[0]
+        res = bc._run_self_voiced("desk_chat", "",
+                                  lambda arg="": prefix + " not now")
+        self.assertEqual(res, bc._TERMINAL_FAILURE_PREFIX
+                         + "I'm afraid that didn't start, sir.")
+
+    def test_the_dispatchers_own_deferral_still_asks(self):
+        # The live carve-out: a self-voiced action the dispatcher defers for
+        # confirmation has said nothing yet - its question is spoken and the
+        # action does not run.
+        bc = self.bc
+        self._p(bc, "_needs_confirmation",
+                lambda n, a: str(n).lower() == "desk_chat")
+        self._p(bc, "_pending_confirmation", [])
+        self._brain_turn("Jarvis, talk to the desk device.",
+                         "Right away, sir. [ACTION: desk_chat]")
+        self.assertEqual(self.runs, [])
+        self.assertEqual([n for n, _a in bc._pending_confirmation],
+                         ["desk_chat"])
+        self.assertTrue(any("say 'yes' to proceed" in s for s in self.spoken),
+                        self.spoken)
+
+
+# ── review repairs (2026-10-05) ──────────────────────────────────────────
+class WaitInterruptTests(_Base):
+    """A stop while the action waits for another chat is a stop of THIS
+    turn too: the waiting chat must not start (its new session would take a
+    fresh interrupt snapshot, so the stop could never reach it)."""
+
+    def _assert_cancelled(self, out):
+        self.assertEqual(self.runs, [], "the waiting chat started after the "
+                         "stop")
+        self.assertEqual(self.client.said, [])
+        self.assertEqual(self.spoken, [])
+        self.assertIn("not started", out)
+
+    def test_an_owner_stop_of_the_other_chat_cancels_the_waiting_one(self):
+        self._route_desk()
+        ds, ended = self._other_chat_loop()
+        self._later(0.3, lambda: ds.stop("owner_stop"))
+        t0 = time.monotonic()
+        out = self._routed_turn("Jarvis, talk to the desk device.")
+        self.assertTrue(ended.wait(5.0))
+        self.assertLess(time.monotonic() - t0, 5.0)
+        self._assert_cancelled(out)
+
+    def test_a_tray_stop_during_the_wait_cancels_it_too(self):
+        bc = self.bc
+        self._route_desk()
+        _ds, ended = self._other_chat_loop()
+        self._later(0.3, lambda: bc.request_tts_interrupt(source="tray",
+                                                          acoustic=False))
+        out = self._routed_turn("Jarvis, talk to the desk device.")
+        self.assertTrue(ended.wait(5.0))
+        self._assert_cancelled(out)
+
+    def test_the_brain_path_is_cancelled_the_same_way(self):
+        ds, ended = self._other_chat_loop()
+        self._later(0.3, lambda: ds.stop("owner_stop"))
+        out = self._brain_turn("Jarvis, talk to the desk device about rain.",
+                               "Right away, sir. [ACTION: desk_chat, rain]")
+        self.assertTrue(ended.wait(5.0))
+        self._assert_cancelled(out)
+
+
+class BusyLineTests(_Base):
+    """"Another chat is still going" is said while that chat runs: never over
+    its live stop-listen capture (the device is mid-line, and playback would
+    close the capture that hears the owner's stop)."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "_SELF_VOICED_READY_WAIT_S", 0.3, create=True)
+        self.seen: list = []
+
+        def rec(t, *a, **k):
+            self.seen.append((t, bc._pathb_mic_active[0]))
+            self.spoken.append(t)
+            return True
+        self._p(bc, "_speak", side_effect=rec)
+
+    def test_the_busy_line_waits_for_the_live_capture_to_close(self):
+        bc = self.bc
+        from core import self_voiced as sv
+        self._route_desk()
+        _ds, ended = self._other_chat_loop()
+        bc._pathb_mic_active[0] = True       # the device is mid-line
+        self._later(0.8, lambda: bc._pathb_mic_active.__setitem__(0, False))
+        t0 = time.monotonic()
+        self._routed_turn("Jarvis, talk to the desk device.")
+        self.assertEqual(self.spoken, [sv.BUSY_LINE])
+        self.assertIs(self.seen[0][1], False, "the busy line played over the "
+                      "other chat's live capture")
+        self.assertGreaterEqual(time.monotonic() - t0, 0.7)
+        self.assertFalse(ended.is_set())
+        self.assertEqual(self.runs, [])
+
+    def test_the_capture_wait_is_bounded(self):
+        bc = self.bc
+        from core import self_voiced as sv
+        self._p(bc, "_SELF_VOICED_MIC_WAIT_S", 0.3, create=True)
+        self._route_desk()
+        self._other_chat_loop()
+        bc._pathb_mic_active[0] = True       # never released
+        t0 = time.monotonic()
+        self._routed_turn("Jarvis, talk to the desk device.")
+        self.assertEqual(self.spoken, [sv.BUSY_LINE])
+        self.assertLess(time.monotonic() - t0, 3.0)
+
+
+class ReplayTests(_Base):
+    """"Do that again" (the replay shortcut) runs the chat through the same
+    runner as every other path, and never reads its private result aloud."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        saved = list(bc._action_history)
+
+        def _restore():
+            bc._action_history.clear()
+            bc._action_history.extend(saved)
+        self.addCleanup(_restore)
+        self.turns: list = []
+        self._p(bc, "_append_turn",
+                side_effect=lambda u, a: self.turns.append((u, a)))
+
+    def _replay(self, arg):
+        bc = self.bc
+        bc._action_history.clear()
+        bc._action_history.append({"action": "desk_chat", "arg": arg,
+                                   "at": time.time()})
+        # The previous turn's sentence: the shortcut must record THIS one
+        # (the chat checks the transcript before it starts).
+        bc._last_user_text[0] = "Jarvis, what time is it?"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertTrue(bc._run_voice_shortcuts("do that again"))
+        return buf.getvalue()
+
+    def test_do_that_again_runs_the_chat_through_the_one_runner(self):
+        bc = self.bc
+        spy = self._p(bc, "_run_self_voiced", wraps=bc._run_self_voiced)
+        self._replay("")
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(self.client.said, [_DEVICE_LINE])
+        self.assertEqual(self.spoken, [_OPENER, _CLOSER],
+                         "the chat's own result was read aloud after it")
+        self.assertEqual(len(self.turns), 1)
+        self.assertTrue(self.turns[0][1])     # never an empty history entry
+
+    def test_a_replay_that_said_nothing_says_why(self):
+        # The original request carried a topic; "do that again" names no
+        # device, so the chat's binding refuses (as live 00:53:06).
+        self._replay("phones")
+        self.assertEqual(self.runs, ["phones"])
+        self.assertEqual(self.spoken, [_HONEST])
+        self.assertEqual(self.turns[0][1], _HONEST)
+
+    def test_a_replay_waits_for_another_chat_and_says_so(self):
+        from core import self_voiced as sv
+        self._p(self.bc, "_SELF_VOICED_READY_WAIT_S", 0.3, create=True)
+        self._other_chat_loop()
+        self._replay("")
+        self.assertEqual(self.runs, [])
+        self.assertEqual(self.spoken, [sv.BUSY_LINE])
+
+
+class CrashAfterTalkingTests(_Base):
+    """A self-voiced action that raised AFTER it had spoken did its talking:
+    no failure round (which could run the whole chat again), nothing more
+    said; the error still reaches the self-diagnostic queue."""
+
+    def _crash_after(self):
+        orig = self._desk_chat
+
+        def chat(arg=""):
+            orig(arg)
+            raise RuntimeError("state save failed")
+        self._actions["desk_chat"] = chat
+        self.gfr.side_effect = (["One more go, sir. [ACTION: desk_chat]"]
+                                + [None] * 8)
+        return self._p(self.bc, "record_action_error")
+
+    def test_the_routed_path(self):
+        errs = self._crash_after()
+        self._route_desk()
+        out = self._routed_turn("Jarvis, talk to the desk device.")
+        self.gfr.assert_not_called()
+        self.assertEqual(len(self.runs), 1, "the chat ran twice")
+        self.assertEqual(self.spoken, [_OPENER, _CLOSER])
+        self.assertEqual([c.args[0] for c in errs.call_args_list],
+                         ["desk_chat"])
+        self.assertIn("after it had spoken", out)
+
+    def test_the_brain_path(self):
+        self._crash_after()
+        self._brain_turn("Jarvis, talk to the desk device about rain.",
+                         "Right away, sir. [ACTION: desk_chat, rain]")
+        self.gfr.assert_not_called()
+        self.assertEqual(self.runs, ["rain"])
+        self.assertEqual(self.spoken, [_OPENER, _CLOSER])
+
+
+class ReplyBookkeepingTests(_Base):
+    """The prose of a reply whose self-voiced action said nothing is never
+    voiced - so it can neither leave an offer open nor be spoken through
+    the result hold."""
+
+    def setUp(self):
+        super().setUp()
+        self.bc._open_offer.clear()
+        self.addCleanup(self.bc._open_offer.clear)
+
+    def test_an_unspoken_offer_is_never_left_open(self):
+        self._brain_turn("Jarvis, talk to the desk divice.",
+                         "Right away, sir. Shall I also dim the hall lights? "
+                         "[ACTION: desk_chat]")
+        self.assertEqual(self.spoken, [_HONEST])
+        self.assertEqual(self.bc._open_offer.peek(), "",
+                         "an offer JARVIS never said was left open for a "
+                         "'yes'")
+
+    def test_the_prose_after_a_silent_chat_is_held(self):
+        self._stub("desk_lamp", "ok")
+        self._brain_turn("Jarvis, lamp on and talk to the desk divice.",
+                         "On it, sir. [ACTION: desk_lamp] [ACTION: desk_chat] "
+                         "Shall I also dim the hall lights?")
+        self.assertEqual(self.calls["desk_lamp"], [""])
+        self.assertEqual(self.spoken, [_HONEST])
+
+
+class AutocorrectPickTests(_Base):
+    """The 'did you mean' pick runs the action through the one runner and
+    says a terminal failure - not "Running ..." followed by silence."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "_pending_autocorrect_choice", [])
+
+    def _pick(self, name, arg=""):
+        bc = self.bc
+        bc._pending_autocorrect_choice.append(
+            {"primary": (name, arg), "secondary": ("desk_lamp", ""),
+             "original": "desk chap"})
+        bc._last_user_text[0] = "first one"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(
+                bc.handle_autocorrect_disambig_response("first one"))
+
+    def test_a_guessed_chat_that_said_nothing_says_why(self):
+        self._pick("desk_chat", "phones")
+        self.assertEqual(self.runs, ["phones"])
+        self.assertEqual(self.spoken, ["Running `desk_chat`, sir.", _HONEST])
+
+    def test_any_actions_terminal_failure_is_said(self):
+        bc = self.bc
+        line = "That lamp is on a schedule I can't override, sir."
+        self._stub("lamp_dim", bc._TERMINAL_FAILURE_PREFIX + line)
+        self._pick("lamp_dim")
+        self.assertEqual(self.calls["lamp_dim"], [""])
+        self.assertEqual(self.spoken, ["Running `lamp_dim`, sir.", line])
+
+    def test_a_plain_result_is_still_not_read_out(self):
+        self._stub("lamp_dim", "ok")
+        self._pick("lamp_dim")
+        self.assertEqual(self.spoken, ["Running `lamp_dim`, sir."])
+
+
+class HeartbeatRuleTests(_Base):
+    """The wait feeds the main loop's watchdog only from the main loop's own
+    thread (_dispatch_heartbeat, the 2026-10-01 audit rule): a wait on a
+    web / panel thread must never hide a wedged main loop."""
+
+    def _wait_once(self):
+        bc = self.bc
+        seq = iter([True, True, True, False])
+        self._p(bc, "_other_dialogue_running",
+                side_effect=lambda: next(seq, False))
+        return bc._self_voiced_wait_ready("desk_chat")
+
+    def test_off_the_main_thread_it_never_beats(self):
+        bc = self.bc
+        beats = self._p(bc, "_heartbeat")
+        self._p(bc, "_SELF_VOICED_READY_POLL_S", 0.01)
+        box: list = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            t = threading.Thread(target=lambda: box.append(self._wait_once()),
+                                 name="web-panel")
+            t.start()
+            t.join(5.0)
+        self.assertEqual(box, [""])
+        self.assertEqual(beats.call_count, 0)
+
+    def test_on_the_main_thread_it_does(self):
+        bc = self.bc
+        self.assertIs(threading.current_thread(), threading.main_thread())
+        beats = self._p(bc, "_heartbeat")
+        self._p(bc, "_SELF_VOICED_READY_POLL_S", 0.01)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self._wait_once(), "")
+        self.assertGreaterEqual(beats.call_count, 1)
+
+
+class OneRuleGuardTests(unittest.TestCase):
+    """The STALE DUPLICATE guard: what a self-voiced action DID is decided in
+    one place (_self_voiced_did_talk). A bare is_self_voiced() only says what
+    an action IS, so a new result-reading site calling it would silently
+    re-open the silent-turn bug. Exact sets: a new caller must be added here
+    deliberately, with its reason."""
+
+    # function -> why it may ask what an action IS (never what it did)
+    _ALLOWED = {
+        "_run_draft_gated": "routes a self-voiced action to its runner",
+        "_self_voiced_did_talk": "THE rule itself",
+        "_self_voiced_reply": "is EVERY action of a reply self-voiced "
+                              "(its prose is never voiced)",
+        "_run_voice_shortcuts": "hides self-voiced actions from the chain "
+                                "resolver (never run as a chain step)",
+        "<module>": "the skill_utils['is_self_voiced'] hook",
+    }
+
+    @staticmethod
+    def _tree(path):
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        with open(os.path.join(root, path), encoding="utf-8") as f:
+            return ast.parse(f.read())
+
+    @classmethod
+    def _mentions(cls, path, ident) -> int:
+        """Names, attributes and string constants spelling ``ident`` (a
+        getattr(bc, "...") counts too). Comments are not in the AST."""
+        n = 0
+        for node in ast.walk(cls._tree(path)):
+            if ((isinstance(node, ast.Name) and node.id == ident)
+                    or (isinstance(node, ast.Attribute)
+                        and node.attr == ident)
+                    or (isinstance(node, ast.Constant)
+                        and node.value == ident)):
+                n += 1
+        return n
+
+    @classmethod
+    def _callers(cls, path, callee):
+        tree = cls._tree(path)
+        found: set = set()
+
+        def visit(node, owner):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    visit(child, child.name if owner == "<module>"
+                          else owner)
+                    continue
+                if isinstance(child, ast.Call):
+                    f = child.func
+                    name = (f.id if isinstance(f, ast.Name) else
+                            f.attr if isinstance(f, ast.Attribute) else "")
+                    if name == callee:
+                        found.add(owner)
+                visit(child, owner)
+        visit(tree, "<module>")
+        return found
+
+    def test_the_monolith_asks_what_an_action_is_only_where_allowed(self):
+        callers = self._callers("bobert_companion.py", "is_self_voiced")
+        self.assertGreaterEqual(len(callers), 4, callers)   # blindness floor
+        self.assertEqual(sorted(callers), sorted(self._ALLOWED))
+
+    def test_every_result_reader_uses_the_one_rule(self):
+        # The sites that read a self-voiced action's RESULT (blindness floor:
+        # each must still call the rule).
+        callers = self._callers("bobert_companion.py",
+                                "_self_voiced_did_talk")
+        for site in ("_all_self_voiced", "_result_hold_name",
+                     "handle_confirmation_response",
+                     "_failed_or_refused_actions", "_do_proactive_turn",
+                     "_turn_check_escalate", "_run_llm_dispatch_body"):
+            with self.subTest(site=site):
+                self.assertIn(site, callers)
+
+    def test_replay_uses_the_runner_and_the_rule(self):
+        # "Do that again" runs an action it was handed outside the monolith:
+        # the one runner, the one rule, never a bare is_self_voiced. (A clap
+        # routine cannot be self-voiced: skills/clap_trigger.py only runs its
+        # allow-list - the workspace setup and the morning briefing.)
+        path = "core/actions.py"
+        self.assertEqual(self._mentions(path, "is_self_voiced"), 0)
+        self.assertGreaterEqual(self._mentions(path, "_run_draft_gated"), 1)
+        self.assertGreaterEqual(
+            self._mentions(path, "_self_voiced_did_talk"), 1)
 
 
 if __name__ == "__main__":

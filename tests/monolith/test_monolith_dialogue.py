@@ -1314,10 +1314,15 @@ class ConfirmedSelfVoicedTests(_Base):
         self.assertIn("ran into an error", self.spoken[0])
 
     def test_a_deferral_result_is_not_swallowed(self):
+        # Deferral strings are the dispatcher's, made BEFORE an action runs;
+        # one handed back BY the action registered no confirmation and said
+        # nothing - so it is neither "Done." nor silence, but the honest line
+        # (review 2026-10-05: the assertion used to be just "something").
         prefix = self.bc._ANSWER_FIRST_DEFERRED_PREFIXES[0]
         self.bc.ACTIONS["desk_chat"] = lambda a="": prefix + " not now"
         self._confirm("desk_chat")
-        self.assertTrue(self.spoken)
+        self.assertEqual(self.spoken, ["I'm afraid that didn't start, sir."])
+        self.followup.assert_not_called()
 
     def test_unregistered_action_still_says_done(self):
         self.bc.SELF_VOICED_ACTIONS.clear()
