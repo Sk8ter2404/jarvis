@@ -14,9 +14,11 @@ off in test mode) unless a test points it at a temporary folder.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -24,6 +26,11 @@ from tests.monolith.test_monolith_clone_server import _Base, _SpeakBase
 
 OPENER = "Very good, sir."
 SHORT_REPLY = "Very good, sir. The lamp is off now."
+# A first line the clone plan splits anyway (over CLAUSE_SPLIT_MIN_CHARS).
+SPLIT_REPLY = ("Very good, sir. The lamp in the study is off now and the "
+               "heating is down to sixty eight.")
+SPLIT_REST = ("The lamp in the study is off now and the heating is down to "
+              "sixty eight.")
 LONG_S = ("The forecast for tomorrow looks mild, with a gentle breeze from "
           "the west and grey skies all afternoon.")
 
@@ -37,14 +44,25 @@ class CacheAwarePlanTests(_Base):
 
     def test_a_cached_opener_starts_the_plan(self):
         bc = self.bc
-        self.assertEqual(bc._speech_chunks(SHORT_REPLY, "clone"),
-                         [SHORT_REPLY])
+        plain = bc._speech_chunks(SPLIT_REPLY, "clone")
+        self.assertGreater(len(plain), 1)               # split anyway
         self.quiet(bc.synthesise, OPENER)             # now cached (memory)
+        self.assertEqual(bc._speech_chunks(SPLIT_REPLY, "clone"),
+                         [OPENER, SPLIT_REST])
+        # A short reply voiced in one piece is never split for the cache
+        # (a new stream per piece: ~0.4-0.7 s of silence until C5).
         self.assertEqual(bc._speech_chunks(SHORT_REPLY, "clone"),
-                         [OPENER, "The lamp is off now."])
-        # Kokoro's plan never looks at the clone cache.
-        self.assertEqual(bc._speech_chunks(SHORT_REPLY, "kokoro"),
                          [SHORT_REPLY])
+        # Kokoro's plan never looks at the clone cache.
+        self.assertEqual(bc._speech_chunks(SPLIT_REPLY, "kokoro"),
+                         [SPLIT_REPLY])
+
+    def test_a_struggling_clone_plans_as_if_nothing_were_cached(self):
+        bc = self.bc
+        self.quiet(bc.synthesise, OPENER)
+        self.client._fails = 1                 # a miss since its last line
+        self.assertEqual(bc._speech_chunks(SPLIT_REPLY, "clone"),
+                         bc._sentence_tts.plan_clone_chunks(SPLIT_REPLY))
 
     def test_a_cached_long_first_sentence_is_not_split(self):
         bc = self.bc
@@ -57,10 +75,11 @@ class CacheAwarePlanTests(_Base):
         bc = self.bc
         from core import config
         self.quiet(bc.synthesise, OPENER)
+        plain = bc._sentence_tts.plan_clone_chunks(SPLIT_REPLY)
         for m in ("shadow", "off"):
             with mock.patch.object(config, "VOICE_CLONE_CACHE", m):
-                self.assertEqual(bc._speech_chunks(SHORT_REPLY, "clone"),
-                                 [SHORT_REPLY], m)
+                self.assertEqual(bc._speech_chunks(SPLIT_REPLY, "clone"),
+                                 plain, m)
 
     def test_turn_timing_notes_where_the_line_came_from(self):
         bc = self.bc
@@ -69,12 +88,43 @@ class CacheAwarePlanTests(_Base):
         self.assertEqual(names.get("clone_cache"), "miss")
         self.assertAlmostEqual(names.get("t3_ms_tok"), 4.25, places=1)
         self.stats.clear()
+        n = len(self.srv.tts_texts())
         self.quiet(bc.synthesise, OPENER)
         names = dict(self.stats)
         self.assertEqual(names.get("clone_cache"), "mem")
-        self.assertNotIn("t3_ms_tok", names)
-        self.assertLessEqual(names.get("clone_ms"), 5)
+        # Noted as None ('-'): a cached line has no T3 speed of its own.
+        self.assertIn("t3_ms_tok", names)
+        self.assertIsNone(names["t3_ms_tok"])
+        # Where it came from is the structure, not a wall-clock bound (a
+        # cached line's time is the server check, 0-2 ms, more on a busy
+        # box at Idle priority).
+        self.assertIsInstance(names.get("clone_ms"), int)
+        self.assertEqual(len(self.srv.tts_texts()), n)     # no render
         self.assertIn("(first line, cached)", self.out)
+
+    def test_t3_speed_is_the_first_lines_or_nothing(self):
+        # A cached first line, then a later line of the same reply rendered
+        # on the same thread: first value wins, so the later line's speed
+        # must never stand in for the first one's.
+        bc = self.bc
+        self.quiet(bc.synthesise, OPENER)
+        self.stats.clear()
+        self.quiet(bc.synthesise, OPENER)                     # cached
+        self.quiet(bc.synthesise, "The lamp is off now.")     # rendered
+        first = {}
+        for name, value in self.stats:
+            first.setdefault(name, value)
+        self.assertEqual(first["clone_cache"], "mem")
+        self.assertIsNone(first["t3_ms_tok"])
+
+    def test_a_refused_cached_take_is_tagged_refused(self):
+        bc = self.bc
+        out = self.cvc.Outcome(reason="error (x)", counted=True,
+                               cache="refused")
+        self.assertEqual(bc._clone_cache_tag(out), "refused")
+        self.assertIn("cached take refused", bc._clone_line_tag(out))
+        self.assertEqual(bc._clone_cache_tag(self.cvc.Outcome(reason="x")),
+                         "miss")
 
 
 class SpeakWithCacheTests(_SpeakBase):
@@ -87,12 +137,20 @@ class SpeakWithCacheTests(_SpeakBase):
         self.assertTrue(self.speak(OPENER))
         self.assertEqual(self.srv.tts_texts(), [OPENER])
         self.played.clear()
-        self.assertTrue(self.speak(SHORT_REPLY))
+        self.assertTrue(self.speak(SPLIT_REPLY))
         self.join_workers()
-        self.assertEqual(self.srv.tts_texts(), [OPENER, "The lamp is off now."])
+        self.assertEqual(self.srv.tts_texts(), [OPENER, SPLIT_REST])
         self.assertEqual(len(self.played), 2)
         self.assertTrue(all(self.voice_of(a) == "clone" for a in self.played))
         self.assertEqual(self.kokoro_texts, [])
+
+    def test_a_short_reply_stays_one_render(self):
+        self.assertTrue(self.speak(OPENER))
+        self.played.clear()
+        self.assertTrue(self.speak(SHORT_REPLY))
+        self.join_workers()
+        self.assertEqual(self.srv.tts_texts(), [OPENER, SHORT_REPLY])
+        self.assertEqual(len(self.played), 1)
 
 
 class SetupAndGateTests(_Base):
@@ -182,6 +240,37 @@ class SetupAndGateTests(_Base):
         bc._main_loop_started_at[0] = time.monotonic() - 900.0
         self.rest_clone()
         self.assertEqual(bc._clone_seed_gate(), "clone not speaking")
+
+    def test_every_input_of_the_seed_gate_closes_it(self):
+        # Each input alone (the others quiet) closes the gate: a seed render
+        # must never queue on the GPU ahead of a line he is about to hear.
+        self.clone_setup()
+        bc = self.bc
+        now = time.monotonic
+        cases = (
+            ("_filler_on_device", [True], "speaking"),
+            ("_last_owner_voice_at", [now() - 10.0], "owner active"),
+            ("_last_convo_activity", [now() - 10.0], "owner active"),
+            ("_last_owner_turn_at", [now() - 10.0], "owner active"),
+        )
+        for name, value, why in cases:
+            self._quiet_room()
+            self.assertIsNone(bc._clone_seed_gate(), name)
+            with mock.patch.object(bc, name, value):
+                self.assertEqual(bc._clone_seed_gate(), why, name)
+        self._quiet_room()
+        bc._tts_playback_active[0] = True
+        try:
+            self.assertEqual(bc._clone_seed_gate(), "speaking")
+            self.assertTrue(bc._clone_seed_abort())
+        finally:
+            bc._tts_playback_active[0] = False
+        self.assertIsNone(bc._clone_seed_gate())
+        game = types.SimpleNamespace(_st=types.SimpleNamespace(active=True))
+        with mock.patch.dict(sys.modules, {"skill_game_mode": game}):
+            self.assertEqual(bc._clone_seed_gate(), "game")
+            game._st.active = False
+            self.assertIsNone(bc._clone_seed_gate())
 
     def test_history_lines_are_cleaned_like_speech(self):
         bc = self.bc

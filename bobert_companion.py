@@ -25332,6 +25332,8 @@ def _clone_line_tag(out) -> str:
             return (f"{kind}, cached, disk"
                     if getattr(out, "cache", "") == "disk"
                     else f"{kind}, cached")
+        if getattr(out, "cache", "") == "refused":
+            return f"{kind}, cached take refused"
         tag = f"{kind}, deadline {float(out.deadline_s):.1f} s"
         if out.ok and float(getattr(out, "late_s", 0.0) or 0.0) >= 0.1:
             tag += f", {float(out.late_s):.1f} s late"
@@ -25344,12 +25346,15 @@ def _clone_line_tag(out) -> str:
 
 def _clone_cache_tag(out) -> str:
     """The [turn-timing] clone_cache value for one clone attempt: 'mem' /
-    'disk' (served from the render cache), 'shadow-hit' (VOICE_CLONE_CACHE
-    'shadow': rendered, but the disk would have served it) or 'miss'.
-    Never raises."""
+    'disk' (served from the render cache), 'refused' (cached, but the server
+    was not answering ready, so the line went to Kokoro), 'shadow-hit'
+    (VOICE_CLONE_CACHE 'shadow': rendered, but the disk would have served
+    it) or 'miss'. Never raises."""
     try:
         if out.cached:
             return str(getattr(out, "cache", "") or "mem")
+        if getattr(out, "cache", "") == "refused":
+            return "refused"
         if getattr(out, "shadow", None) == "would-hit":
             return "shadow-hit"
         return "miss"
@@ -25430,10 +25435,14 @@ def _clone_server_synth(text: str, wry_split, gain: float):
             _tt_note_stat("clone", 1 if audio is not None else 0)
             _tt_note_stat("clone_ms", ms)
             # C8 (2026-10-05): where the answer's first clone line came
-            # from, and its T3 decode speed (a server render only).
+            # from, and its T3 decode speed -- THAT line's, so it is noted
+            # (None, printed '-') for a cached or missed first line too: the
+            # first value wins, and a later line's speed must never stand
+            # in for the first one's.
             _tt_note_stat("clone_cache", _clone_cache_tag(out))
-            if out.ok and not out.cached and out.t3_ms_per_token is not None:
-                _tt_note_stat("t3_ms_tok", out.t3_ms_per_token)
+            _tt_note_stat("t3_ms_tok",
+                          out.t3_ms_per_token
+                          if out.ok and not out.cached else None)
         if audio is None:
             if out.reason == "too-long":
                 print("  [tts] clone voice skipped (line too long for the "

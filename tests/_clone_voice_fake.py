@@ -17,7 +17,8 @@ Per-request control (2026-10-04, the live-budget replay):
   timings      (text, start, end) in time.monotonic() per finished render
 
 The model facts the client keys its render cache on (2026-10-05): /health
-also reports model / t3_dtype / sample_rate / t3_decode (``t3_decode``), and
+also reports pid (``pid``, 4242) / model / t3_dtype / sample_rate /
+t3_decode (``t3_decode``), and
 every /tts reply carries X-Audio-Ms, X-Sample-Rate, X-Speech-Tokens (the
 clip's 40 ms tokens), X-T3-Ms (``t3_ms_per_token`` each) and X-T3-Engine
 (``engine``) like the real server.
@@ -88,6 +89,9 @@ class FakeCloneServer:
         self.sample_rate = sample_rate
         self.t3_ms_per_token = t3_ms_per_token
         self.device = "cuda:0 (physical, PCI order)"
+        # The process id /health reports: a test "restarts" the server by
+        # changing it (with ref_sha / ok / health_code for what came back).
+        self.pid = 4242
         self._render_mu = threading.Lock()
         self.timings: list = []
         # Texts answered with HTTP 500 (one line of a reply fails).
@@ -125,7 +129,7 @@ class FakeCloneServer:
                 fake._record("GET", self.path, None)
                 if self.path == "/health":
                     body = json.dumps({"ok": fake.ok, "ref_sha256": fake.ref_sha,
-                                       "pid": 4242, "model": fake.model,
+                                       "pid": fake.pid, "model": fake.model,
                                        "t3_dtype": fake.t3_dtype,
                                        "sample_rate": fake.sample_rate,
                                        "t3_decode": fake.t3_decode,

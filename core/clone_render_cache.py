@@ -36,9 +36,14 @@ voice's ref_sha256: a revoked or replaced voice is purged by prefix
 (purge_except). Each file is the server's own int16 samples, unprocessed:
 the client trims and loudness-matches on every read (finish_audio), so a
 change to those settings never leaves stale audio behind. A file that is not
-a 1-D int16 array of sane length is ignored, never served. Writes go
-through ONE writer thread (atomic replace, then the folder is trimmed to the
-cap, least recently used first).
+a 1-D int16 array of sane length is never served and is deleted. Writes go
+through ONE writer thread: the caller's ``keep()`` check first (the client
+re-checks there that the take came from the server and voice it knows), then
+a temporary file flushed to the disk (fsync) and renamed over the take, then
+the folder is trimmed to the cap, least recently used first. A write still
+queued when its take is forgotten or its voice purged never lands, and the
+temporary file of a write cut off by a crash is swept at the next attach (and
+by a purge of its voice).
 
 THE TAKE GATE
 -------------
@@ -46,10 +51,14 @@ Sampling is random, so a cached take freezes one performance. Only takes
 whose length fits the text are kept on disk: the ratio of the audio length
 to the length expected for that many characters must lie within the p1-p99
 range of this voice's own recent renders (a fixed band until 50 have been
-seen). The audio per SPEECH token is constant (40 ms a token by
-construction), so it cannot flag anything; per character of text is what a
-runaway or truncated take changes. Rejected takes still play (and stay in
-the memory tier for this run, as before); they are just never persisted.
+seen), and the voice's own range can only be TIGHTER than the fixed band,
+never wider: every measured take joins the history (keeping only admitted
+ones would ratchet the band shut), so without that clamp a few runaway takes
+would stretch p99 until runaways were admitted. The audio per SPEECH token is
+constant (40 ms a token by construction), so it cannot flag anything; per
+character of text is what a runaway or truncated take changes. Rejected
+takes still play (and stay in the memory tier for this run, as before); they
+are just never persisted.
 
 Nothing here raises: a cache fault costs the cache, never a line of speech.
 Stdlib + numpy; no monolith import. Tests: tests/test_clone_render_cache.py.
@@ -88,6 +97,11 @@ PREFIX_HEX = 16
 GATE_FILE = "gate.json"
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _FILE_RE = re.compile(r"^([0-9a-f]{16})_([0-9a-f]{64})\.npy$")
+# A write's temporary file (_write): the take's name plus the writer's pid and
+# thread. One left by a crash is swept at attach and by a purge of its voice.
+_TMP_RE = re.compile(r"^([0-9a-f]{16})_([0-9a-f]{64})\.npy\.\d+\.\d+\.tmp$")
+# How many forgotten keys are remembered (a queued write of one never lands).
+_FORGOT_MAX = 256
 # A cached take longer than this is refused (a 4 MB float32 entry is ~43 s at
 # 24 kHz; nothing JARVIS caches comes close).
 MAX_TAKE_S = 45.0
@@ -198,13 +212,16 @@ class TakeGate:
 
     def band(self, prefix: str) -> tuple:
         """(lo, hi, samples) for `prefix`: p1-p99 of its history once it has
-        GATE_MIN_SAMPLES, else GATE_DEFAULT_BAND."""
+        GATE_MIN_SAMPLES, clamped INSIDE GATE_DEFAULT_BAND (a voice's own
+        range may only tighten the fixed band: a run of runaway takes in the
+        history must never widen it), else GATE_DEFAULT_BAND."""
         with self._mu:
             h = list(self._hist.get(prefix) or ())
         if len(h) < GATE_MIN_SAMPLES:
             return GATE_DEFAULT_BAND[0], GATE_DEFAULT_BAND[1], len(h)
         h.sort()
-        return _quantile(h, GATE_LO_Q), _quantile(h, GATE_HI_Q), len(h)
+        return (max(GATE_DEFAULT_BAND[0], _quantile(h, GATE_LO_Q)),
+                min(GATE_DEFAULT_BAND[1], _quantile(h, GATE_HI_Q)), len(h))
 
     def admit(self, prefix: str, audio_ms, chars) -> tuple:
         """(admitted, ratio, (lo, hi)). The band is the one BEFORE this take
@@ -279,12 +296,20 @@ class CloneRenderCache:
         self._pending = 0
         self._idle = threading.Event()
         self._idle.set()
+        # Bumped by every forget / purge; a queued write carries the value
+        # it was queued at, so one queued BEFORE its take was forgotten (or
+        # its voice purged) never lands (_stale).
+        self._gen = 0
+        self._forgot: "OrderedDict[str, int]" = OrderedDict()
+        self._purge: Optional[tuple] = None     # (gen, frozenset of kept)
         self.gate = TakeGate()
         self.counters = {"mem_hits": 0, "disk_hits": 0, "misses": 0,
                          "shadow_would_hit": 0, "shadow_would_miss": 0,
                          "writes": 0, "write_errors": 0, "rejected": 0,
                          "corrupt": 0, "purged": 0, "forgotten": 0,
-                         "dropped_writes": 0}
+                         "dropped_writes": 0, "not_kept": 0,
+                         "stale_writes": 0, "leftovers": 0,
+                         "refused": 0, "rejected_on_read": 0}
 
     # ── setup ────────────────────────────────────────────────────────────
     def attach(self, disk_dir: str) -> bool:
@@ -296,10 +321,20 @@ class CloneRenderCache:
                 return False
             os.makedirs(d, exist_ok=True)
             index = {}
+            swept = 0
             for name in os.listdir(d):
                 if _FILE_RE.match(name):
                     try:
                         index[name] = os.path.getsize(os.path.join(d, name))
+                    except OSError:
+                        pass
+                elif _TMP_RE.match(name):
+                    # A write cut off by a crash (nothing writes before the
+                    # folder is attached): cloned-voice audio outside the
+                    # index, the cap and the purge -- removed.
+                    try:
+                        os.remove(os.path.join(d, name))
+                        swept += 1
                     except OSError:
                         pass
             gate_obj = None
@@ -312,6 +347,7 @@ class CloneRenderCache:
             with self._mu:
                 self._dir = d
                 self._index = index
+                self.counters["leftovers"] += swept
             if gate_obj is not None:
                 self.gate.load_json(gate_obj)
             return True
@@ -393,9 +429,9 @@ class CloneRenderCache:
 
     def disk_get(self, key, prefix, sr: int):
         """The raw int16 take for this key, or None (absent, no disk tier,
-        corrupt, wrong shape or type, absurd length). A bad file is dropped
-        from the index (so it is never tried again; the next render of the
-        line replaces it)."""
+        corrupt, wrong shape or type, absurd length). A bad file is deleted
+        (so it is never tried again, and never sits outside the cap; the
+        next render of the line replaces it)."""
         name = None
         try:
             name = self._name(str(key or ""), str(prefix or ""))
@@ -414,9 +450,7 @@ class CloneRenderCache:
             max_n = int(MAX_TAKE_S * max(1, int(sr or 0)))
             if (not isinstance(a, np.ndarray) or a.dtype != np.int16
                     or a.ndim != 1 or not 0 < a.size <= max_n):
-                with self._mu:
-                    self._index.pop(name, None)
-                    self.counters["corrupt"] += 1
+                self._drop_bad(d, name)
                 return None
             try:
                 os.utime(path)              # recently used: trimmed last
@@ -426,35 +460,57 @@ class CloneRenderCache:
         except Exception:
             try:
                 with self._mu:
-                    if name:
-                        self._index.pop(name, None)
-                    self.counters["corrupt"] += 1
+                    d = self._dir
+                if name:
+                    self._drop_bad(d, name)
             except Exception:
                 pass
             return None
 
-    def disk_put(self, key, prefix, pcm16) -> bool:
-        """Persist a raw int16 take (queued to the writer thread unless
-        sync_writes). False when there is no disk tier or nothing to write."""
+    def _drop_bad(self, d: Optional[str], name: str) -> None:
+        """A take file that cannot be served: out of the index and off the
+        disk, counted 'corrupt'. Never raises."""
         try:
-            name = self._name(str(key or ""), str(prefix or ""))
+            with self._mu:
+                self._index.pop(name, None)
+                self.counters["corrupt"] += 1
+            if d is not None:
+                os.remove(os.path.join(d, name))
+        except Exception:
+            pass
+
+    def disk_put(self, key, prefix, pcm16, *, sr: Optional[int] = None,
+                 keep: Optional[Callable[[], bool]] = None) -> bool:
+        """Persist a raw int16 take (queued to the writer thread unless
+        sync_writes). ``sr`` given: a take longer than MAX_TAKE_S (which
+        disk_get would never serve) is refused. ``keep()`` runs on the
+        writer just before the write: False (or raising) and the take is not
+        kept. False when there is no disk tier or nothing to write."""
+        try:
+            k = str(key or "")
+            p = str(prefix or "")
+            name = self._name(k, p)
             with self._mu:
                 d = self._dir
+                gen = self._gen
             if d is None or not name or pcm16 is None:
                 return False
             a = np.ascontiguousarray(np.asarray(pcm16, dtype=np.int16)
                                      .reshape(-1))
             if not a.size:
                 return False
+            if sr is not None and a.size > int(MAX_TAKE_S * max(1, int(sr))):
+                return False
+            item = (d, name, a, keep, gen, k, p)
             if self._sync:
-                self._write(d, name, a)
+                self._write_item(item)
                 return True
             self._ensure_writer()
             with self._mu:
                 self._pending += 1
                 self._idle.clear()
             try:
-                self._q.put_nowait((d, name, a))
+                self._q.put_nowait(item)
             except queue.Full:
                 self._done_one()
                 self._count("dropped_writes")
@@ -462,6 +518,37 @@ class CloneRenderCache:
             return True
         except Exception:
             return False
+
+    def _stale(self, gen: int, key: str, prefix: str) -> bool:
+        """Caller holds the lock: a write queued at `gen` whose take has been
+        forgotten, or whose voice purged, since."""
+        fg = self._forgot.get(key)
+        if fg is not None and fg > gen:
+            return True
+        pg = self._purge
+        return pg is not None and pg[0] > gen and prefix not in pg[1]
+
+    def _write_item(self, item) -> None:
+        """One queued write: skipped when stale, or when its keep() says no;
+        else written. Never raises."""
+        d, name, a, keep, gen, key, prefix = item
+        try:
+            with self._mu:
+                stale = self._stale(gen, key, prefix)
+            if stale:
+                self._count("stale_writes")
+                return
+            if keep is not None:
+                try:
+                    ok = bool(keep())
+                except Exception:
+                    ok = False
+                if not ok:
+                    self._count("not_kept")
+                    return
+            self._write(d, name, a, gen, key, prefix)
+        except Exception:
+            pass
 
     def _ensure_writer(self) -> None:
         with self._mu:
@@ -482,12 +569,12 @@ class CloneRenderCache:
     def _writer_loop(self) -> None:
         while True:
             try:
-                d, name, a = self._q.get()
+                item = self._q.get()
             except Exception:
                 time.sleep(0.1)
                 continue
             try:
-                self._write(d, name, a)
+                self._write_item(item)
             except Exception:
                 pass
             finally:
@@ -497,14 +584,21 @@ class CloneRenderCache:
         """Wait (bounded) until every queued write has landed. Tests."""
         return self._idle.wait(timeout)
 
-    def _write(self, d: str, name: str, a) -> None:
-        """Atomic write of one take, then trim the folder to the cap."""
+    def _write(self, d: str, name: str, a, gen: int = -1, key: str = "",
+               prefix: str = "") -> None:
+        """Write one take: a temporary file flushed to the disk (fsync, so a
+        crash cannot leave a renamed take whose samples never reached it)
+        and renamed over the take; then trim the folder to the cap. A take
+        forgotten (or its voice purged) while it was being written is
+        removed again, so a forget / purge always wins the race."""
         path = os.path.join(d, name)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
             os.makedirs(d, exist_ok=True)
             with open(tmp, "wb") as f:
                 np.save(f, a, allow_pickle=False)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
             size = os.path.getsize(path)
         except Exception:
@@ -517,8 +611,18 @@ class CloneRenderCache:
         with self._mu:
             if self._dir != d:          # re-attached elsewhere meanwhile
                 return
-            self._index[name] = size
-            self.counters["writes"] += 1
+            stale = self._stale(gen, key, prefix)
+            if not stale:
+                self._index[name] = size
+                self.counters["writes"] += 1
+            else:
+                self.counters["stale_writes"] += 1
+        if stale:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return
         self._trim(d, disk_cap_bytes())
 
     def _trim(self, d: str, cap: int) -> None:
@@ -560,15 +664,22 @@ class CloneRenderCache:
             return sum(self._index.values())
 
     # ── removal ──────────────────────────────────────────────────────────
-    def forget(self, keys: Iterable[str]) -> int:
-        """Drop these takes from both tiers (any voice). Returns how many
-        entries went."""
+    def forget(self, keys: Iterable[str], count: bool = True) -> int:
+        """Drop these takes from both tiers (any voice); a write of one still
+        queued never lands. Returns how many entries went. ``count`` False:
+        an internal drop (not the owner's "forget that line")."""
         n = 0
         try:
             want = {str(k) for k in keys if k}
             if not want:
                 return 0
             with self._mu:
+                self._gen += 1
+                for k in want:
+                    self._forgot[k] = self._gen
+                    self._forgot.move_to_end(k)
+                while len(self._forgot) > _FORGOT_MAX:
+                    self._forgot.popitem(last=False)
                 for k in [k for k in self._mem if k in want]:
                     gone = self._mem.pop(k)
                     self._mem_bytes -= int(gone[0].nbytes)
@@ -579,7 +690,8 @@ class CloneRenderCache:
             for nm in names:
                 if self._remove_file(d, nm):
                     n += 1
-            self._count("forgotten", n)
+            if count:
+                self._count("forgotten", n)
         except Exception:
             pass
         return n
@@ -600,11 +712,15 @@ class CloneRenderCache:
     def purge_except(self, keep_prefixes: Iterable[str]) -> int:
         """Drop every take (memory and disk) whose voice prefix is not in
         `keep_prefixes`: a revoked or replaced voice. Returns how many went.
-        Files on disk that are not in the index are found by a listing."""
+        Files on disk that are not in the index are found by a listing
+        (a crash's temporary files of those voices too), and a write of
+        theirs still queued never lands."""
         n = 0
         try:
             keep = {str(p) for p in keep_prefixes if p}
             with self._mu:
+                self._gen += 1
+                self._purge = (self._gen, frozenset(keep))
                 for k in [k for k, v in self._mem.items() if v[2] not in keep]:
                     gone = self._mem.pop(k)
                     self._mem_bytes -= int(gone[0].nbytes)
@@ -617,7 +733,7 @@ class CloneRenderCache:
                 except OSError:
                     names = []
                 for name in names:
-                    m = _FILE_RE.match(name)
+                    m = _FILE_RE.match(name) or _TMP_RE.match(name)
                     if m and m.group(1) not in keep:
                         if self._remove_file(d, name):
                             n += 1

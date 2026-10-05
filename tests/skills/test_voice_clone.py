@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -224,6 +225,27 @@ class VoiceCloneSkillTests(unittest.TestCase):
         with mock.patch.object(self.mod, "_clone_client", return_value=client):
             self.assertIn("no recent line",
                           self.actions["forget_voice_line"](""))
+
+    def test_forget_voice_line_leaves_out_lines_after_the_request(self):
+        # The acknowledgement of "forget that line" can be voiced before the
+        # action runs: only lines voiced before the owner's turn was
+        # accepted (the monolith's _last_owner_turn_at) are "that line".
+        client = mock.Mock()
+        client.forget_last_reply.return_value = ["Some line."]
+        bc = types.SimpleNamespace(_last_owner_turn_at=[1234.5])
+        with mock.patch.object(self.mod, "_clone_client",
+                               return_value=client), \
+                mock.patch.object(self.mod, "_bobert", return_value=bc):
+            self.actions["forget_voice_line"]("")
+        client.forget_last_reply.assert_called_once_with(before=1234.5)
+        client.reset_mock()
+        for cell in ([0.0], None, ["x"]):
+            bc = types.SimpleNamespace(_last_owner_turn_at=cell)
+            with mock.patch.object(self.mod, "_clone_client",
+                                   return_value=client), \
+                    mock.patch.object(self.mod, "_bobert", return_value=bc):
+                self.actions["forget_voice_line"]("")
+            client.forget_last_reply.assert_called_with(before=None)
 
 
 class PersistenceTests(unittest.TestCase):

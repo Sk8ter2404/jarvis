@@ -79,8 +79,18 @@ WHAT THIS MODULE DOES
     cached take is served only while the client is 'ready' (never while the
     server is down, starting or cooling down: no voice change mid-reply) and,
     from disk, only while the server's voice is the active consented
-    profile's. Takes of a voice that is no longer a consented profile's are
-    purged (purge_unconsented).
+    profile's. A cached take that would OPEN a reply is served only while
+    the clone looks healthy (no miss pending, the fast decoder on) and the
+    server answers /health ready in the same process, voice and model
+    (_cache_live: a recent check stands for LIVE_MEMO_S) -- else the line
+    is rendered or missed like any other, so a reply never opens in the
+    clone only to fall to Kokoro. A take is kept on disk only once a
+    /health read AFTER it arrived shows the same server process, voice and
+    model that the key names (_verify_take, on the writer thread): /tts
+    does not say which voice spoke, and a server restarted with another
+    reference would otherwise have its takes filed under the consented
+    voice's key. Takes of a voice that is no longer a consented profile's
+    are purged (purge_unconsented).
   * The fast decoder (C3, 2026-10-05): when /health says t3_decode is not
     'cuda-graph', or a line comes back with X-T3-Engine 'eager', ONE log line
     says the server is on its slow decoder (and one when it is back);
@@ -201,11 +211,20 @@ RECENT_MAX = 32
 # The same line voiced again within this long (an R3 pre-render dropped in
 # the lock and rendered again) is one saying, not two, for the ledger.
 LEDGER_DEDUPE_S = 15.0
-# Before a cached take is played for a listener, a bare TCP connect checks
-# the server is still there (well under a millisecond while it is up). A
-# server that died since the last request must not have its voice played
-# from the cache while the rest of the reply falls to Kokoro.
+# Before a cached take OPENS a reply, GET /health must answer ready in the
+# same server process, voice and model, within this long (_cache_live). A
+# bare connect is not enough: the server binds its port before it loads
+# (~13 s of 503s) and a hung one still accepts, so a reply could open in the
+# clone and go on in Kokoro -- the owner's "no cached lines while the server
+# is down" (B6). Measured on this box: ~1 ms p99 with _fast_connect.
 LIVENESS_TIMEOUT_S = 0.25
+# A /health that confirmed the server (same pid, voice and model) this
+# recently stands for it: no new probe (a reply's later cached lines, and
+# the writer's checks of its rendered ones, keep it fresh).
+LIVE_MEMO_S = 2.0
+# The writer's /health read before a take is kept on disk (off the voice
+# path; a server that does not answer in time keeps nothing).
+VERIFY_TIMEOUT_S = 1.0
 
 _LOOPBACK = ("127.0.0.1", "::1", "localhost")
 # Interpreter variables of JARVIS's own Python that must not leak into the
@@ -557,6 +576,11 @@ class CloneVoiceClient:
         self._server_info: dict = {}
         self._decode = ""
         self._health_at = float("-inf")
+        # The last /health that confirmed the server: (clock when it was
+        # SENT, _identity). It vouches for takes that arrived before it was
+        # sent (_verify_take) and, for LIVE_MEMO_S, for the server being up
+        # (_cache_live).
+        self._verified: Optional[tuple] = None
         self._consented_memo = (float("-inf"), None)
         # The render cache: memory tier always; disk tier once attached.
         self.store = _crc.CloneRenderCache(
@@ -718,14 +742,12 @@ class CloneVoiceClient:
         conn = http.client.HTTPConnection(
             host, port, timeout=min(CONNECT_TIMEOUT_S, self._left(deadline)))
         try:
-            try:
-                conn.connect()
-            except OSError as e:
-                # Refused, or no answer within CONNECT_TIMEOUT_S: the server
-                # is not there. Not a render timeout.
-                raise ConnectionError(f"cannot connect to {host}:{port} "
-                                      f"({type(e).__name__})") from None
-            sock = conn.sock
+            # Refused, or no answer within CONNECT_TIMEOUT_S: the server is
+            # not there (ConnectionError). Not a render timeout. Connected
+            # here, not by http.client: see _fast_connect.
+            sock = _fast_connect(host, port,
+                                 min(CONNECT_TIMEOUT_S, self._left(deadline)))
+            conn.sock = sock
             sock.settimeout(self._left(deadline))
             headers = {"Connection": "close"}
             if body is not None:
@@ -754,11 +776,12 @@ class CloneVoiceClient:
             except Exception:
                 pass
 
-    def _health(self):
-        """(status code, JSON dict) or (None, {}) when nothing answers."""
+    def _health(self, budget_s: float = HEALTH_TIMEOUT_S):
+        """(status code, JSON dict) or (None, {}) when nothing answers
+        within ``budget_s``."""
         try:
             code, _h, data = self._request("GET", "/health", None,
-                                           HEALTH_TIMEOUT_S)
+                                           float(budget_s))
         except Exception:
             return None, {}
         try:
@@ -930,6 +953,9 @@ class CloneVoiceClient:
             self._server_pid = h.get("pid")
             self._server_info = _server_facts(h)
             self._health_at = self._clock()
+            # Nothing renders before 'ready', so this /health vouches for
+            # the server from now.
+            self._verified = (self._health_at, _health_identity(h))
             self._fails = 0
             self._probation = False
             self._recheck = False
@@ -981,6 +1007,7 @@ class CloneVoiceClient:
         an unreachable / not-ready server (counted like a failed render; the
         re-check stays pending). Bounded by ``budget_s`` (and the connect cap);
         never raises."""
+        sent = self._clock()
         try:
             code, _h, data = self._request("GET", "/health", None,
                                            min(HEALTH_TIMEOUT_S, budget_s))
@@ -1005,6 +1032,7 @@ class CloneVoiceClient:
                 self._server_info = _server_facts(obj)
                 self._health_at = self._clock()
         if same:
+            self._mark_verified(sent, obj)
             self._note_decode(obj.get("t3_decode"), "its /health")
             return None
         self._down("after a cool-down the server answering at its address "
@@ -1052,6 +1080,7 @@ class CloneVoiceClient:
                 # mid-reply.
                 return Outcome(reason="not-ready", lookahead=lookahead)
             sha = self._server_sha
+            pid = self._server_pid
             facts = dict(self._server_info)
         spoken = _crc.normalise_text(_normalize_text(t))
         if len(spoken) > MAX_CHARS:
@@ -1059,37 +1088,51 @@ class CloneVoiceClient:
         key = self._key(sha, facts, spoken)
         prefix = _crc.voice_prefix(sha)
         mode = _crc.mode()
-        hit = self.store.mem_get(key) if key else None
-        if hit is not None:
+        # A take that would OPEN a reply for a listener: served only while
+        # the clone looks healthy and the server is confirmed up in the same
+        # process, voice and model (_cache_live) -- else this line renders
+        # or misses like any other, so the reply never opens in the clone
+        # only to go on in Kokoro (B6, one voice per reply). A LOOK-AHEAD
+        # line belongs to a reply already speaking in the clone: its cached
+        # take can only keep more of that reply in the one voice, so it is
+        # served while 'ready' without a probe (as the in-memory cache
+        # always was). Background renders (count=False) likewise.
+        opener = bool(count) and not lookahead
+        source = ""
+        take = self.store.mem_get(key) if key else None
+        if take is not None:
+            source = "mem"
+        elif key and mode == "on" and self._serve_ok(sha):
+            take = self._disk_take(key, prefix, facts, len(spoken))
+            if take is not None:
+                source = "disk"
+        if take is not None and opener:
+            if not self._healthy_for_cache():
+                take = None             # rendered (or missed) instead
+            else:
+                live = self._cache_live()
+                if live == "down":
+                    return Outcome(reason="not-ready", lookahead=lookahead)
+                if live in ("recheck", "render"):
+                    take = None         # the render path (re-checks first)
+                elif live != "ok":
+                    self.store._count("refused")
+                    return self._failed(
+                        "error (the server is not answering ready; its "
+                        "cached take is not used)", self._clock(), True,
+                        {"lookahead": lookahead, "cache": "refused"})
+        if take is not None:
             # No request was made, so this says nothing about the server: it
             # must NOT reset the failure streak. Otherwise a hung server never
             # cools down while cached acks come between the answers, and
             # every new line waits out its whole deadline.
-            if count and not self._server_alive():
-                return self._failed("error (the server stopped answering; "
-                                    "its cached take is not used)",
-                                    self._clock(), True,
-                                    {"lookahead": lookahead})
-            self.store._count("mem_hits")
+            self.store._count("mem_hits" if source == "mem" else "disk_hits")
             if count:
                 self._remember_line(key, prefix, t)
-            return Outcome(audio=hit[0], sr=hit[1], ms=0, cached=True,
-                           cache="mem", lookahead=lookahead)
+            return Outcome(audio=take[0], sr=take[1], ms=0, cached=True,
+                           cache=source, lookahead=lookahead)
         shadow = None
-        if key and mode == "on" and self._serve_ok(sha):
-            disk = self._disk_take(key, prefix, facts)
-            if disk is not None and count and not self._server_alive():
-                return self._failed("error (the server stopped answering; "
-                                    "its cached take is not used)",
-                                    self._clock(), True,
-                                    {"lookahead": lookahead})
-            if disk is not None:
-                self.store._count("disk_hits")
-                if count:
-                    self._remember_line(key, prefix, t)
-                return Outcome(audio=disk[0], sr=disk[1], ms=0, cached=True,
-                               cache="disk", lookahead=lookahead)
-        elif key and mode == "shadow" and self.store.disk_dir is not None:
+        if key and mode == "shadow" and self.store.disk_dir is not None:
             would = self.store.disk_has(key, prefix)
             shadow = "would-hit" if would else "would-miss"
             self.store._count("shadow_would_hit" if would
@@ -1169,7 +1212,8 @@ class CloneVoiceClient:
             self.store.mem_put(key, audio, sr, prefix)
             if mode in ("shadow", "on"):
                 self._persist_take(key, prefix, pcm16, sr, audio_ms,
-                                   len(spoken), facts)
+                                   len(spoken), facts,
+                                   _identity(pid, sha, facts), now)
         if count:
             self._remember_line(key, prefix, t)
         return Outcome(audio=audio, sr=sr, ms=ms, server_ms=server_ms,
@@ -1242,15 +1286,24 @@ class CloneVoiceClient:
         except Exception:
             return False
 
-    def _disk_take(self, key: str, prefix: str, facts: dict):
+    def _disk_take(self, key: str, prefix: str, facts: dict, n_chars: int):
         """(finished float32 take, sr) from the disk tier, kept in memory
-        too, or None. Never raises."""
+        too, or None. The take's length is checked against its text again
+        (the fixed band of the take gate): a file that does not fit -- kept
+        under an older rule, or damaged -- is deleted, never served. Never
+        raises."""
         try:
             sr = int(facts.get("sample_rate") or 0)
             if sr <= 0:
                 return None
             raw = self.store.disk_get(key, prefix, sr)
             if raw is None:
+                return None
+            r = _crc.take_ratio(1000.0 * raw.size / float(sr), n_chars)
+            lo, hi = _crc.GATE_DEFAULT_BAND
+            if r is None or not lo <= r <= hi:
+                self.store.forget([key], count=False)
+                self.store._count("rejected_on_read")
                 return None
             audio = finish_audio(raw.astype(np.float32) / 32768.0, sr)
             if audio is None:
@@ -1261,27 +1314,166 @@ class CloneVoiceClient:
             return None
 
     def _persist_take(self, key: str, prefix: str, pcm16, sr: int,
-                      audio_ms: float, n_chars: int, facts: dict) -> None:
-        """Write a fresh take to disk if it passes the take gate. Only a
-        take at the sample rate the server reports (the key carries it) is
-        kept. Never raises."""
+                      audio_ms: float, n_chars: int, facts: dict,
+                      ident: tuple, got_at: float) -> None:
+        """Queue a fresh take for the disk. Only a take at the sample rate
+        the server reports (the key carries it) is queued; on the writer it
+        is kept only if the server it came from is still the one the key
+        names (_verify_take) and it passes the take gate. Never raises."""
         try:
             if self.store.disk_dir is None:
                 return
             if int(facts.get("sample_rate") or 0) != int(sr):
                 return
-            ok, ratio, band = self.store.gate.admit(prefix, audio_ms, n_chars)
-            if ok:
-                self.store.disk_put(key, prefix, pcm16)
-                return
-            self.store._count("rejected")
-            r = "?" if ratio is None else f"{ratio:.2f}"
-            self._log(f"  [clone-cache] take not kept on disk: its length is "
-                      f"{r}x the usual for {n_chars} characters (kept range "
-                      f"{band[0]:.2f}-{band[1]:.2f}); it plays this time "
-                      f"and is rendered again next time")
+
+            def keep() -> bool:
+                if not self._verify_take(key, ident, got_at):
+                    return False
+                ok, ratio, band = self.store.gate.admit(prefix, audio_ms,
+                                                        n_chars)
+                if not ok:
+                    self.store._count("rejected")
+                    r = "?" if ratio is None else f"{ratio:.2f}"
+                    self._log(f"  [clone-cache] take not kept on disk: its "
+                              f"length is {r}x the usual for {n_chars} "
+                              f"characters (kept range {band[0]:.2f}-"
+                              f"{band[1]:.2f}); it plays this time and is "
+                              f"rendered again next time")
+                return ok
+
+            self.store.disk_put(key, prefix, pcm16, sr=sr, keep=keep)
         except Exception:
             pass
+
+    def _mark_verified(self, sent_at: float, h: dict) -> None:
+        """A /health sent at `sent_at` confirmed the server `h` describes
+        (the newest confirmation is kept)."""
+        with self._mu:
+            v = self._verified
+            if v is None or sent_at >= v[0]:
+                self._verified = (sent_at, _health_identity(h))
+
+    def _verify_take(self, key: str, ident: tuple, got_at: float) -> bool:
+        """On the writer, before a take is kept on disk: the take came from
+        the server and voice its key names. The /tts reply does not say which
+        process or voice prompt made it, so a /health sent AFTER the take
+        arrived must show the same process (pid), voice prompt hash and
+        model facts -- a pid is never reused within seconds, and a
+        restarted server needs ~13 s to load, so a server that answers
+        /health as that process now made the take. One confirmation covers
+        every take that arrived before it was sent. Also: the voice is still
+        the active consented profile's.
+
+        A different server answering (a restart, another reference, another
+        model): the take is dropped from memory too, and the client follows
+        the server or stops using it (_adopt). No answer: not kept (it is
+        rendered again next time), nothing else changes. Never raises."""
+        try:
+            if not self._serve_ok(ident[1]):
+                return False
+            with self._mu:
+                v = self._verified
+            if v is not None and v[0] >= got_at and v[1] == ident:
+                return True
+            sent = self._clock()
+            code, h = self._health(VERIFY_TIMEOUT_S)
+            if code != 200 or not h.get("ok"):
+                return False
+            if _health_identity(h) == ident:
+                self._mark_verified(sent, h)
+                return True
+            self.store.forget([key], count=False)
+            with self._mu:
+                ready = self._status == "ready"
+                cur = _identity(self._server_pid, self._server_sha,
+                                self._server_info)
+            if ready and cur == ident:
+                self._adopt(h, sent)
+            return False
+        except Exception:
+            return False
+
+    def _healthy_for_cache(self) -> bool:
+        """The clone looks able to voice the REST of a reply: no counted miss
+        since its last success, not on probation, the fast decoder not known
+        to be off. A cached take opens a reply only then (else a reply could
+        open in the clone and miss to Kokoro on its next line)."""
+        with self._mu:
+            return (not self._fails and not self._probation
+                    and self._decode != "eager")
+
+    def _cache_live(self) -> str:
+        """May a cached take open a reply now? 'ok' -- the server answered
+        /health ready in the same process, voice and model (or did within
+        LIVE_MEMO_S); 'recheck' -- the voice re-check after a cool-down is
+        pending (the render path does it); 'down' -- it now speaks another
+        voice (the client stopped using it); 'render' -- it restarted, or now
+        speaks the active profile's new reference (the client follows it;
+        this line is rendered, not served from the old process's cache);
+        'no' -- not answering ready within LIVENESS_TIMEOUT_S (dead,
+        loading, stuck). Never raises."""
+        try:
+            with self._mu:
+                if self._recheck:
+                    return "recheck"
+                ident = _identity(self._server_pid, self._server_sha,
+                                  self._server_info)
+                v = self._verified
+            now = self._clock()
+            if v is not None and v[1] == ident and now - v[0] <= LIVE_MEMO_S:
+                return "ok"
+            code, h = self._health(LIVENESS_TIMEOUT_S)
+            if code != 200 or not h.get("ok"):
+                return "no"
+            if _health_identity(h) == ident:
+                self._mark_verified(now, h)
+                self._note_decode(h.get("t3_decode"), "its /health")
+                # The probe may have just found the slow decoder: then the
+                # rest of the reply would crawl -- render this line too.
+                return "ok" if self._healthy_for_cache() else "render"
+            return "render" if self._adopt(h, now) else "down"
+        except Exception:
+            return "no"
+
+    def _adopt(self, h: dict, sent_at: float) -> bool:
+        """A ready /health from the server at the client's address that may
+        describe a different server than the one recorded: the same voice
+        prompt (a restart, new model facts) -- followed; the active consented
+        profile's NEW reference -- followed, the cache keys follow the hash;
+        anything else -- the client is down (the consent gate never passes a
+        voice it has not checked). True while the client still uses the
+        server. Never raises."""
+        try:
+            sha = str(h.get("ref_sha256") or "")
+            with self._mu:
+                same = bool(sha) and sha == self._server_sha
+                profile = self._profile
+                old_pid = self._server_pid
+            if not same:
+                if sha and sha == self.profile_sha(profile):
+                    with self._mu:
+                        self._server_sha = sha
+                    self._log("  [clone-voice] the voice server now speaks "
+                              "the active profile's new reference; the "
+                              "render cache follows it")
+                else:
+                    self._down("the server answering at its address now "
+                               "speaks a different voice prompt (or does "
+                               "not say which), so it is no longer used")
+                    return False
+            elif h.get("pid") != old_pid:
+                self._log(f"  [clone-voice] the voice server restarted "
+                          f"(pid {old_pid} -> {h.get('pid')}) with the same "
+                          f"voice; following it")
+            with self._mu:
+                self._server_pid = h.get("pid")
+                self._server_info = _server_facts(h)
+                self._health_at = self._clock()
+            self._mark_verified(sent_at, h)
+            self._note_decode(h.get("t3_decode"), "its /health")
+            return True
+        except Exception:
+            return False
 
     def _remember_line(self, key, prefix: str, text: str) -> None:
         """A line voiced for a listener: for "forget that line" and for the
@@ -1297,24 +1489,6 @@ class CloneVoiceClient:
                 self.ledger.record(text)
         except Exception:
             pass
-
-    def _server_alive(self) -> bool:
-        """A bare loopback connect to the server succeeds (LIVENESS_TIMEOUT_S
-        at most). Sends nothing. Never raises."""
-        try:
-            with self._mu:
-                host, port = self._host, self._port
-            if not host or not port:
-                return False
-            sock = socket.create_connection((host, int(port)),
-                                            timeout=LIVENESS_TIMEOUT_S)
-        except Exception:
-            return False
-        try:
-            sock.close()
-        except Exception:
-            pass
-        return True
 
     def server_gpu_index(self):
         """The physical (PCI-order, = NVML) index of the GPU the server
@@ -1377,10 +1551,12 @@ class CloneVoiceClient:
             return False
 
     def is_cached(self, text) -> bool:
-        """VOICE_CLONE_CACHE 'on', the clone ready, and `text` would be
-        served from the cache right now (memory, or disk while the voice is
-        the consented one). For the chunk planner: no file I/O. Never
-        raises."""
+        """VOICE_CLONE_CACHE 'on', the clone ready and healthy enough for a
+        cached take to open a reply (_healthy_for_cache, no voice re-check
+        pending), and `text` would be served from the cache right now
+        (memory, or disk while the voice is the consented one). For the
+        chunk planner: no I/O at all (render() still checks the server is
+        up before a cached take opens the reply). Never raises."""
         try:
             if _crc.mode() != "on":
                 return False
@@ -1388,8 +1564,10 @@ class CloneVoiceClient:
             if not t:
                 return False
             self._cooldown_tick()
+            if not self._healthy_for_cache():
+                return False
             with self._mu:
-                if self._status != "ready":
+                if self._status != "ready" or self._recheck:
                     return False
                 sha = self._server_sha
                 facts = dict(self._server_info)
@@ -1407,9 +1585,12 @@ class CloneVoiceClient:
             return False
 
     def consented_prefixes(self):
-        """The cache prefixes of every consented profile's reference.wav, or
-        None when that cannot be told (no profiles folder): nothing is purged
-        on a None. Memoised for PROFILE_TTL_S. Never raises."""
+        """The cache prefixes of every consented profile's reference.wav --
+        an EMPTY set when the profiles folder is gone (deleting it is the
+        most complete way to withdraw consent: everything is purged) -- or
+        None when that cannot be told (the folder is there but cannot be
+        read): nothing is purged on a None. Memoised for PROFILE_TTL_S.
+        Never raises."""
         try:
             now = self._clock()
             with self._mu:
@@ -1417,9 +1598,11 @@ class CloneVoiceClient:
             if now < until:
                 return memo
             from core import voice_clone as _vc
-            out = None
+            out = set()
             if os.path.isdir(_vc.PROFILES_DIR):
-                out = set()
+                # list_profiles() reads an unlistable folder as empty; that
+                # must not purge everything: the listing error -> None.
+                os.listdir(_vc.PROFILES_DIR)
                 for meta in _vc.list_profiles():
                     if not _vc.profile_is_usable(meta):
                         continue
@@ -1447,6 +1630,10 @@ class CloneVoiceClient:
             if keep is None or held <= keep:
                 return 0
             n = self.store.purge_except(keep)
+            # Consent changed: re-read the active profile at the next
+            # _serve_ok (a write still queued is checked against it).
+            with self._mu:
+                self._profile_memo.clear()
             if n:
                 self._log(f"  [clone-cache] removed {n} cached take"
                           f"{'s' if n != 1 else ''} of a voice that is no "
@@ -1456,17 +1643,28 @@ class CloneVoiceClient:
         except Exception:
             return 0
 
-    def forget_last_reply(self) -> list:
+    def forget_last_reply(self, before=None) -> list:
         """'Forget that line': drop the takes of the last burst of lines
         voiced for a listener (lines no more than FORGET_GAP_S apart, the
         burst ended within FORGET_WINDOW_S) from memory and disk, and never
-        seed them again. Returns their texts, in the order they were said
-        ([] when there was nothing recent). The next time one is said it is
-        rendered afresh. Never raises."""
+        seed them again. ``before`` (this client's clock: when the owner's
+        request was accepted) leaves out every line voiced at or after it --
+        the acknowledgement of the request itself ("Certainly, sir.") can be
+        voiced before the action runs, and is not "that line". Returns the
+        texts, in the order they were said ([] when there was nothing
+        recent). The next time one is said it is rendered afresh. A write
+        of one still queued never lands. Never raises."""
         try:
             now = self._clock()
+            try:
+                cut = None if before is None else float(before)
+                if cut is not None and not cut > 0.0:
+                    cut = None
+            except Exception:
+                cut = None
             with self._mu:
-                items = list(self._recent)
+                items = [it for it in self._recent
+                         if cut is None or it[0] < cut]
             if not items or now - items[-1][0] > FORGET_WINDOW_S:
                 return []
             group = [items[-1]]
@@ -1476,7 +1674,6 @@ class CloneVoiceClient:
                 else:
                     break
             group.reverse()
-            self.store.flush(1.0)      # a queued write of one must land first
             self.store.forget({it[1] for it in group if it[1]})
             texts = []
             for it in group:
@@ -1557,32 +1754,13 @@ class CloneVoiceClient:
                     return False
                 if self._clock() - self._health_at < float(max_age_s):
                     return True
+            sent = self._clock()
             code, h = self._health()
             with self._mu:
                 self._health_at = self._clock()
             if code != 200 or not h.get("ok"):
                 return False
-            sha = str(h.get("ref_sha256") or "")
-            with self._mu:
-                same = bool(sha) and sha == self._server_sha
-                profile = self._profile
-            if not same:
-                if sha and sha == self.profile_sha(profile):
-                    with self._mu:
-                        self._server_sha = sha
-                    self._log("  [clone-voice] the voice server now speaks "
-                              "the active profile's new reference; the "
-                              "render cache follows it")
-                else:
-                    self._down("the server answering at its address now "
-                               "speaks a different voice prompt (or does "
-                               "not say which), so it is no longer used")
-                    return False
-            with self._mu:
-                self._server_pid = h.get("pid")
-                self._server_info = _server_facts(h)
-            self._note_decode(h.get("t3_decode"), "its /health")
-            return True
+            return self._adopt(h, sent)
         except Exception:
             return False
 
@@ -1626,6 +1804,65 @@ def _server_facts(h: dict) -> dict:
             "sample_rate": sr,
             "t3_decode": str(h.get("t3_decode") or ""),
             "device": str(h.get("s3gen_device") or h.get("device") or "")}
+
+
+def _identity(pid, sha, facts: dict) -> tuple:
+    """Which server made / would make a take: its process, voice prompt hash
+    and the model facts the cache key carries."""
+    try:
+        sr = int(facts.get("sample_rate") or 0)
+    except Exception:
+        sr = 0
+    return (pid, str(sha or ""), str(facts.get("model") or ""),
+            str(facts.get("t3_dtype") or ""), sr)
+
+
+def _health_identity(h: dict) -> tuple:
+    """_identity of the server a /health body describes."""
+    return _identity(h.get("pid"), h.get("ref_sha256"), _server_facts(h))
+
+
+def _fast_connect(host: str, port: int, timeout_s: float):
+    """A connected TCP socket to ``host:port``, or ConnectionError. Each
+    address is tried for at most ``timeout_s`` (as socket.create_connection
+    does) with a NON-BLOCKING connect and select(): CPython's own timed
+    connect costs ~20 ms on about a quarter of loopback connects on Windows
+    (measured 2026-10-05, 300 connects 10 ms apart: p90 20.3 ms, p99 25 ms;
+    this way p90 0.5 ms, p99 0.7-1.0 ms). The socket is returned blocking;
+    the caller sets its timeout."""
+    last = None
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as e:
+        raise ConnectionError(f"cannot resolve {host} ({e})") from None
+    for fam, typ, proto, _cn, addr in infos:
+        sock = None
+        try:
+            sock = socket.socket(fam, typ, proto)
+            sock.setblocking(False)
+            try:
+                sock.connect(addr)
+            except (BlockingIOError, InterruptedError):
+                pass
+            _r, w, x = select.select([], [sock], [sock],
+                                     max(0.0, float(timeout_s)))
+            if not w and not x:
+                raise TimeoutError("connect timed out")
+            # Windows reports a failed connect in the exception set.
+            err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if err or x:
+                raise OSError(err, os.strerror(err) if err else "refused")
+            sock.setblocking(True)
+            return sock
+        except OSError as e:
+            last = e
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    raise ConnectionError(f"cannot connect to {host}:{port} "
+                          f"({type(last).__name__ if last else 'no address'})")
 
 
 class _HttpStatus(Exception):

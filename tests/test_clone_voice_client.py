@@ -544,6 +544,10 @@ class LatchTests(_Base):
         # cache hit reset the count, a hung server would never latch while
         # acks ("Very good, sir.") came between the answers, and EVERY new
         # line would wait out its whole deadline for the rest of the session.
+        # Since 2026-10-05 a cached take does not OPEN a reply while a miss
+        # is pending (it renders, and counts, like any line: a reply must
+        # not open in the clone and miss to Kokoro); a LOOK-AHEAD hit -- a
+        # reply already in the clone -- is still served. Neither resets it.
         srv = self.server()
         c, _ = self.ready_client(srv)
         self.assertTrue(c.render("Very good, sir.", 2.5).ok)
@@ -552,7 +556,8 @@ class LatchTests(_Base):
             self.assertEqual(c.status()[0], "ready")
             self.assertFalse(c.render(f"New line {i}.", 2.5).ok)
             if c.status()[0] == "ready":
-                hit = c.render("Very good, sir.", 2.5)
+                hit = c.render("Very good, sir.", 2.5,
+                               needed_by=time.monotonic() + 5.0)
                 self.assertTrue(hit.ok and hit.cached)
         self.assertEqual(c.status()[0], "cooldown", c.failures())
         # A hit still reports success to its caller while the streak runs.
@@ -560,8 +565,13 @@ class LatchTests(_Base):
         self.assertTrue(c2.render("Right away, sir.", 2.5).ok)
         srv2.tts_status = 500
         c2.render("Fails once.", 2.5)
-        self.assertTrue(c2.render("Right away, sir.", 2.5).cached)
+        self.assertTrue(c2.render("Right away, sir.", 2.5,
+                                  needed_by=time.monotonic() + 5.0).cached)
         self.assertEqual(c2.failures(), 1)
+        # ...but it does not open a reply now: rendered, and missed.
+        out = c2.render("Right away, sir.", 2.5)
+        self.assertFalse(out.ok or out.cached)
+        self.assertEqual(c2.failures(), 2)
 
     def test_rearm_from_cooldown_or_down(self):
         c, srv = self.ready_client(self.server(tts_status=500))
@@ -1010,14 +1020,23 @@ class RecheckAfterCooldownTests(_Base):
 
     def test_a_cache_hit_needs_no_check(self):
         # The cache holds renders of the voice start() checked; serving one
-        # sends nothing, so there is nothing to check yet.
+        # sends nothing, so there is nothing to check yet -- for a LOOK-AHEAD
+        # line (its reply already speaks in the clone). A cached take never
+        # OPENS a reply before the re-check (2026-10-05): the server could
+        # speak another voice now, and the rest of the reply would be
+        # Kokoro. That line renders, after the check.
         self.srv.tts_status = 200
         c, srv = self.ready_client(self.server())
         self.assertTrue(c.render("Very good, sir.", 2.5).ok)
         c._recheck = True
         n = srv.count("GET", "/health")
-        self.assertTrue(c.render("Very good, sir.", 2.5).cached)
+        self.assertTrue(c.render("Very good, sir.", 2.5,
+                                 needed_by=time.monotonic() + 5.0).cached)
         self.assertEqual(srv.count("GET", "/health"), n)
+        out = c.render("Very good, sir.", 2.5)
+        self.assertTrue(out.ok and not out.cached)
+        self.assertEqual(srv.count("GET", "/health"), n + 1)   # the re-check
+        self.assertFalse(c._recheck)
 
     def test_a_server_still_loading_is_a_counted_miss_and_checked_again(self):
         self.srv.health_code = 503
@@ -1320,6 +1339,45 @@ class VoiceCloneServerModelTests(_Base):
         with mock.patch.object(vc, "_cfg_model", return_value="chatterbox"):
             self.assertIn("chatterbox-tts", vc.engine_hint())
             self.assertFalse(vc.rearm())
+
+
+class FastConnectTests(_Base):
+    """Every request connects through _fast_connect (a non-blocking connect
+    and select): CPython's own timed connect costs ~20 ms on about a
+    quarter of loopback connects on Windows (measured 2026-10-05), which a
+    cached opener's /health check -- and every render -- would pay."""
+
+    def test_it_connects_and_the_client_uses_it(self):
+        srv = self.server()
+        sock = cvc._fast_connect("127.0.0.1", srv.port, 1.0)
+        try:
+            self.assertIsNotNone(sock.getpeername())
+            self.assertTrue(sock.getblocking())
+        finally:
+            sock.close()
+        calls = []
+        real = cvc._fast_connect
+
+        def spy(*a):
+            calls.append(a)
+            return real(*a)
+        c, _ = self.ready_client(srv)
+        with mock.patch.object(cvc, "_fast_connect", side_effect=spy):
+            self.assertTrue(c.render("Hello there.", 2.5).ok)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ("127.0.0.1", srv.port))
+
+    def test_nothing_listening_is_a_connection_error_within_its_time(self):
+        port = free_port()
+        t0 = time.monotonic()
+        with self.assertRaises(ConnectionError):
+            cvc._fast_connect("127.0.0.1", port, 0.3)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        c = self.client()
+        c._host, c._port = "127.0.0.1", port
+        with self.assertRaises(ConnectionError):
+            c._request("GET", "/health", None, 0.3)
+        self.assertEqual(c._health(0.3), (None, {}))
 
 
 if __name__ == "__main__":

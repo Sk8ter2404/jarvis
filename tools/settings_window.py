@@ -827,13 +827,13 @@ SCHEMA: dict[str, dict] = {
                 "Applies on the next start.",
     },
     "VOICE_CLONE_SEED_GPU_S": {
-        "tab": "voice", "label": "Clone cache preparation (s/day)",
-        "type": "float", "default": 90.0, "min": 0, "max": 600,
-        "help": "Seconds of clone-server time per voice per day used to "
-                "prepare lines JARVIS often says, one at a time and only "
-                "after you've been quiet for a minute. 0 = never prepare "
-                "ahead (lines are still cached once said). Applies on the "
-                "next start.",
+        "tab": "voice", "label": "Clone cache preparation (s per voice)",
+        "type": "float", "default": 60.0, "min": 0, "max": 600,
+        "help": "Seconds of clone-server time per voice, in total, used to "
+                "prepare lines JARVIS often says, each at most once, one at "
+                "a time and only after you've been quiet for a minute. 0 = "
+                "never prepare ahead (lines are still cached once said). "
+                "Applies on the next start.",
     },
     "AUDIO_PROCESSING_ENABLED": {
         "tab": "hearing", "label": "Audio processing (master)", "type": "bool",

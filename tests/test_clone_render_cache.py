@@ -10,31 +10,48 @@ Pins:
   * the key: the voice hash, model, T3 precision, sample rate and exact text
     all change it; no usable hash or text -> no key;
   * the disk tier: int16 round trip; a corrupt / wrong-type / wrong-shape /
-    absurd-length file is ignored (and never tried again); the folder is
-    trimmed to VOICE_CLONE_CACHE_MB, least recently used first; one writer
-    thread however many writes;
+    absurd-length file is never served and is deleted; a crash's temporary
+    file is swept at attach (and by a purge of its voice); writes are
+    fsynced before the rename; an over-long take is never written; a write
+    queued before its take is forgotten (or its voice purged) never lands;
+    the folder is trimmed to VOICE_CLONE_CACHE_MB, least recently used
+    first; one writer thread however many writes;
   * the take gate: a fixed band until GATE_MIN_SAMPLES takes, then the
-    voice's own p1-p99; a take outside it plays but is never persisted;
+    voice's own p1-p99 clamped INSIDE the fixed band (runaway takes in the
+    history can never widen it); a take outside it plays but is never
+    persisted; a disk take that does not fit its text is never served;
   * the serve rules: 'on' serves a take written by an earlier run from disk
     with no request; never while the client is not ready (down, cooling
     down: no voice change mid-reply); never from disk unless the server's
     voice is the active consented profile's; a new reference / another
-    model is a miss; 'shadow' serves from memory only and logs would-hit;
-    'off' writes nothing;
-  * purges: a withdrawn consent or a replaced reference deletes that
-    voice's takes (memory and disk), in every mode;
+    model is a miss; a take OPENING a reply only while the clone is healthy
+    and /health answers ready from the same server (a loading or dead server
+    refuses it; a recent check stands for LIVE_MEMO_S), while a look-ahead
+    line of a reply already in the clone is served; 'shadow' serves from
+    memory only and logs would-hit; 'off' writes nothing;
+  * identity: a take is kept on disk only once /health confirms the server
+    process, voice and model that made it -- a server restarted with
+    another reference never gets its takes filed under the consented key,
+    and the client stops using it (or follows a restart in the same voice);
+  * purges: a withdrawn consent, a replaced reference or a deleted profiles
+    folder deletes that voice's takes (memory and disk), in every mode; a
+    folder that cannot be listed purges nothing;
   * C3: one log line when the server is on its slow decoder (/health or a
     line's X-T3-Engine), one when it is back; a long line on the slow loop
     by design raises nothing; decode_note for voice_clone_status;
   * C8 inputs: a rendered line carries its T3 ms per token;
   * "forget that line": the last burst of lines goes from memory and disk
-    and is never seeded; an older reply is kept;
+    and is never seeded; an older reply is kept; a line voiced after the
+    request was accepted (its own acknowledgement) is not "that line"; a
+    write of one still queued never lands;
   * the cache-aware planner (core.sentence_tts): a cached first sentence is
-    played whole even when long, and a short reply whose first sentence is
-    cached is split there; nothing cached -> the plan is unchanged.
+    played whole even when long; a first line the plan splits anyway is
+    split at its cached first sentence; a short one-piece reply is never
+    split for the cache; nothing cached -> the plan is unchanged.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 import threading
@@ -146,6 +163,38 @@ class TakeGateTests(unittest.TestCase):
         self.assertFalse(g.admit(p, exp * 1.3, 40)[0])
         self.assertTrue(g.admit(p, exp * 0.97, 40)[0])
 
+    def test_runaway_takes_in_the_history_never_widen_the_band(self):
+        # Every measured take joins the history (rejected ones too), so a
+        # few runaways would stretch p99; the voice's own band may only
+        # tighten the fixed one.
+        p = "a" * 16
+        exp = crc.GATE_FIXED_MS + crc.GATE_MS_PER_CHAR * 40
+        g = crc.TakeGate()
+        for i in range(47):
+            self.assertTrue(g.admit(p, exp * (0.98 + 0.001 * i), 40)[0])
+        for _ in range(3):
+            self.assertFalse(g.admit(p, exp * 2.5, 40)[0])
+        lo, hi, n = g.band(p)
+        self.assertEqual(n, 50)
+        self.assertLessEqual(hi, crc.GATE_DEFAULT_BAND[1])
+        self.assertGreaterEqual(lo, crc.GATE_DEFAULT_BAND[0])
+        self.assertFalse(g.admit(p, exp * 2.5, 40)[0])
+        # Steady state: 2 % runaways in a full history.
+        g = crc.TakeGate()
+        for i in range(392):
+            g.admit(p, exp * (0.9 + 0.0005 * i), 40)
+        for _ in range(8):
+            g.admit(p, exp * 2.2, 40)
+        self.assertFalse(g.admit(p, exp * 2.2, 40)[0])
+        self.assertTrue(g.admit(p, exp, 40)[0])
+        # A voice whose own range is narrower keeps it.
+        g = crc.TakeGate()
+        for i in range(60):
+            g.admit(p, exp * (0.99 + 0.0002 * i), 40)
+        lo, hi, _n = g.band(p)
+        self.assertGreater(lo, crc.GATE_DEFAULT_BAND[0])
+        self.assertLess(hi, 1.1)
+
     def test_unusable_inputs_are_refused(self):
         g = crc.TakeGate()
         self.assertFalse(g.admit("a" * 16, 0, 40)[0])
@@ -221,6 +270,8 @@ class StoreTests(unittest.TestCase):
             self.assertTrue(s.disk_has(key, self.pfx), kind)
             self.assertIsNone(s.disk_get(key, self.pfx, 100), kind)
             self.assertFalse(s.disk_has(key, self.pfx), kind)  # never again
+            # ...and gone from the disk: nothing sits outside the cap.
+            self.assertFalse(os.path.exists(path), kind)
         # Names that are not ours are never indexed at all.
         with open(os.path.join(self.dir, "notes.txt"), "w") as f:
             f.write("x")
@@ -313,6 +364,112 @@ class StoreTests(unittest.TestCase):
         s2 = crc.CloneRenderCache()
         s2.attach(self.dir)
         self.assertEqual(s2.gate.band(self.pfx)[2], 1)
+
+    def test_crash_leftovers_are_swept_at_attach(self):
+        tmp = os.path.join(self.dir, f"{self.pfx}_{self.key}.npy.999.123.tmp")
+        with open(tmp, "wb") as f:
+            f.write(b"half a take")
+        other = os.path.join(self.dir, "notes.txt")
+        with open(other, "w") as f:
+            f.write("x")
+        s = crc.CloneRenderCache(sync_writes=True)
+        self.assertTrue(s.attach(self.dir))
+        self.assertFalse(os.path.exists(tmp))
+        self.assertTrue(os.path.exists(other))       # not ours: left alone
+        self.assertEqual(s.stats()["leftovers"], 1)
+
+    def test_a_purge_takes_a_purged_voices_leftovers_too(self):
+        pb = crc.voice_prefix(_SHA_B)
+        kb = crc.make_key(_SHA_B, "m", "fp16", 24000, "Hello there.")
+        tmp_b = os.path.join(self.dir, f"{pb}_{kb}.npy.1.2.tmp")
+        tmp_a = os.path.join(self.dir, f"{self.pfx}_{self.key}.npy.1.2.tmp")
+        for t in (tmp_a, tmp_b):
+            with open(t, "wb") as f:
+                f.write(b"x")
+        self.s.purge_except({self.pfx})
+        self.assertFalse(os.path.exists(tmp_b))
+        self.assertTrue(os.path.exists(tmp_a))
+
+    def test_an_over_long_take_is_never_written(self):
+        big = np.zeros(int(crc.MAX_TAKE_S * 24000) + 1, dtype=np.int16)
+        self.assertFalse(self.s.disk_put(self.key, self.pfx, big, sr=24000))
+        self.assertEqual(os.listdir(self.dir), [])
+        self.assertTrue(self.s.disk_put(self.key, self.pfx, self.pcm(),
+                                        sr=24000))
+
+    def test_a_write_reaches_the_disk_before_its_rename(self):
+        calls = []
+        real_replace = os.replace
+
+        def replace(a, b_):
+            calls.append("replace")
+            return real_replace(a, b_)
+        with mock.patch.object(crc.os, "fsync",
+                               side_effect=lambda fd: calls.append("fsync")), \
+                mock.patch.object(crc.os, "replace", side_effect=replace):
+            self.assertTrue(self.s.disk_put(self.key, self.pfx, self.pcm()))
+        self.assertEqual(calls, ["fsync", "replace"])
+
+    def test_keep_runs_on_the_writer_and_can_refuse(self):
+        self.assertTrue(self.s.disk_put(self.key, self.pfx, self.pcm(),
+                                        keep=lambda: False))
+        self.assertEqual(os.listdir(self.dir), [])
+        self.assertEqual(self.s.stats()["not_kept"], 1)
+
+        def boom():
+            raise RuntimeError("x")
+        self.s.disk_put(self.key, self.pfx, self.pcm(), keep=boom)
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_a_write_queued_before_a_forget_or_a_purge_never_lands(self):
+        s = crc.CloneRenderCache()
+        s.attach(self.dir)
+        held = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hold():
+            held.set()
+            return release.wait(5.0)
+        k1 = crc.make_key(_SHA_A, "m", "fp16", 24000, "one")
+        k2 = crc.make_key(_SHA_A, "m", "fp16", 24000, "two")
+        kb = crc.make_key(_SHA_B, "m", "fp16", 24000, "one")
+        pb = crc.voice_prefix(_SHA_B)
+        asked = []
+        self.assertTrue(s.disk_put(k1, self.pfx, self.pcm(), keep=hold))
+        self.assertTrue(held.wait(5.0))              # the writer is busy
+        self.assertTrue(s.disk_put(k2, self.pfx, self.pcm(),
+                                   keep=lambda: asked.append("k2") or True))
+        self.assertTrue(s.disk_put(kb, pb, self.pcm(),
+                                   keep=lambda: asked.append("kb") or True))
+        s.forget([k2])
+        s.purge_except({self.pfx})
+        release.set()
+        self.assertTrue(s.flush(5.0))
+        self.assertEqual(os.listdir(self.dir), [f"{self.pfx}_{k1}.npy"])
+        self.assertEqual(s.stats()["stale_writes"], 2)
+        # Dropped before their keep() (a /health read for the client) and
+        # before any file was written.
+        self.assertEqual(asked, [])
+        self.assertEqual(s.stats()["writes"], 1)
+        # A take said afresh AFTER the forget is written as usual.
+        self.assertTrue(s.disk_put(k2, self.pfx, self.pcm()))
+        self.assertTrue(s.flush(5.0))
+        self.assertTrue(s.disk_has(k2, self.pfx))
+
+    def test_a_forget_during_the_write_itself_wins(self):
+        # The forget lands between the writer's check and its rename.
+        s = crc.CloneRenderCache(sync_writes=True)
+        s.attach(self.dir)
+        real_replace = os.replace
+
+        def replace(a, b_):
+            s.forget([self.key])
+            return real_replace(a, b_)
+        with mock.patch.object(crc.os, "replace", side_effect=replace):
+            s.disk_put(self.key, self.pfx, self.pcm())
+        self.assertEqual(os.listdir(self.dir), [])
+        self.assertFalse(s.disk_has(self.key, self.pfx))
 
     def test_nothing_raises_without_a_disk_tier(self):
         s = crc.CloneRenderCache()
@@ -486,13 +643,39 @@ class OnModeTests(_ClientBase):
         self.assertEqual(self.files(), [])
         self.assertEqual(c.cache_len(), 0)
 
-    def test_an_unreadable_profiles_folder_purges_nothing(self):
+    def test_a_deleted_profiles_folder_purges_every_take(self):
+        # Deleting data/voice_profiles is the most complete way to withdraw
+        # consent: every take goes, now and at the next boot.
         srv = self.server(wav_for={self.TEXT: fit_wav(self.TEXT)})
         c = self.client(srv)
         c.render(self.TEXT, 2.5)
         self.assertTrue(c.store.flush(5.0))
-        with mock.patch.object(vc, "PROFILES_DIR",
-                               os.path.join(self._tmp.name, "missing")):
+        self.assertEqual(len(self.files()), 1)
+        gone = os.path.join(self._tmp.name, "missing")
+        with mock.patch.object(vc, "PROFILES_DIR", gone):
+            self.assertEqual(c.purge_unconsented(), 2)     # memory + disk
+        self.assertEqual(self.files(), [])
+        self.assertEqual(c.cache_len(), 0)
+        # At the next boot, attaching the folder alone purges.
+        self.rendered(srv, self.TEXT)
+        self.assertEqual(len(self.files()), 1)
+        with mock.patch.object(vc, "PROFILES_DIR", gone):
+            self.client(srv, start=False)
+        self.assertEqual(self.files(), [])
+
+    def test_a_profiles_folder_that_cannot_be_listed_purges_nothing(self):
+        srv = self.server(wav_for={self.TEXT: fit_wav(self.TEXT)})
+        c = self.client(srv)
+        c.render(self.TEXT, 2.5)
+        self.assertTrue(c.store.flush(5.0))
+        real_listdir = os.listdir
+
+        def listdir(path="."):
+            if os.path.normcase(str(path)) == os.path.normcase(self.prof.root):
+                raise PermissionError("denied")
+            return real_listdir(path)
+        with mock.patch.object(os, "listdir", side_effect=listdir):
+            self.assertIsNone(c.consented_prefixes())
             self.assertEqual(c.purge_unconsented(), 0)
         self.assertEqual(len(self.files()), 1)
 
@@ -554,22 +737,37 @@ class OnModeTests(_ClientBase):
         self.assertEqual(c.ledger.count("One moment, sir."), 0)
         self.assertEqual(c.ledger.seeds(), [self.TEXT])
 
-    def test_no_cached_take_once_the_server_is_gone(self):
+    def test_no_cached_take_opens_a_reply_once_the_server_is_gone(self):
         # Died since the last request (still 'ready'): its voice must not
-        # play from the cache while the rest of the reply falls to Kokoro.
+        # OPEN a reply from the cache while the rest falls to Kokoro.
+        clock = _Clock()
         srv = self.server(wav_for={self.TEXT: fit_wav(self.TEXT)})
         earlier = self.rendered(srv, self.TEXT)
-        c = self.client(srv)
+        c = self.client(srv, clock=clock)
         self.assertTrue(c.render("Right away, sir.", 2.5).ok)
+        self.assertTrue(c.store.flush(5.0))
         srv.stop()
+        clock.t += cvc.LIVE_MEMO_S + 1.0
         for text in ("Right away, sir.", self.TEXT):    # memory, disk
+            c._fails = 0      # each its own reply opening on a healthy clone
             out = c.render(text, 2.5)
             self.assertFalse(out.ok, text)
-            self.assertIn("stopped answering", out.reason)
+            self.assertIn("not answering ready", out.reason)
+            self.assertEqual(out.cache, "refused")
             self.assertTrue(out.counted)
+        self.assertEqual(c.failures(), 1)
+        # With that miss pending, a cached opener is not even tried: the
+        # line renders, and misses like any other.
+        out = c.render("Right away, sir.", 2.5)
+        self.assertFalse(out.ok)
+        self.assertNotEqual(out.cache, "refused")
         self.assertEqual(c.failures(), 2)
         # A background render (the filler warm) is not a listener's line.
         self.assertTrue(c.render("Right away, sir.", 2.5, count=False).ok)
+        # A look-ahead line belongs to a reply already in the clone: its
+        # cached take keeps more of that reply in the one voice.
+        out = c.render("Right away, sir.", 2.5, needed_by=clock.t + 5.0)
+        self.assertTrue(out.ok and out.cached)
         self.assertIsNotNone(earlier)
 
     def test_the_server_gpu_index(self):
@@ -580,6 +778,204 @@ class OnModeTests(_ClientBase):
         self.assertEqual(c.server_gpu_index(), 1)
         c._server_info["device"] = "cpu"
         self.assertIsNone(c.server_gpu_index())
+
+
+class ServerIdentityTests(_ClientBase):
+    """/tts does not say which process or voice made a take: it is kept on
+    disk only once /health confirms the server the key names."""
+    TEXT = "The lights are off, sir."
+    NEXT = "Right away, sir."
+
+    def test_a_server_restarted_in_another_voice_never_files_its_takes(self):
+        srv = self.server(wav_for={t: fit_wav(t) for t in (self.TEXT,
+                                                            self.NEXT)})
+        c = self.client(srv)
+        # It restarts with another (unconsented) reference while JARVIS is
+        # up; the client cannot tell from the /tts reply.
+        srv.ref_sha = "c" * 64
+        srv.pid = 5151
+        out = c.render(self.TEXT, 2.5)
+        self.assertTrue(out.ok)
+        self.assertTrue(c.store.flush(5.0))
+        self.assertEqual(self.files(), [])           # never on disk ...
+        self.assertEqual(c.cache_len(), 0)           # ... nor in memory
+        self.assertEqual(c.status()[0], "down")      # and no longer used
+        self.assertEqual(c.render(self.NEXT, 2.5).reason, "not-ready")
+        # The next run, the server back on the consented voice: the line is
+        # rendered afresh, never served from a wrong-voice file.
+        srv.ref_sha = self.prof.sha
+        srv.pid = 4242
+        c2 = self.client(srv)
+        n = len(srv.tts_texts())
+        again = c2.render(self.TEXT, 2.5)
+        self.assertTrue(again.ok and not again.cached)
+        self.assertEqual(len(srv.tts_texts()), n + 1)
+
+    def test_a_restart_in_the_same_voice_is_followed(self):
+        srv = self.server(wav_for={t: fit_wav(t) for t in (self.TEXT,
+                                                            self.NEXT)})
+        c = self.client(srv)
+        srv.pid = 5151                   # restarted: same reference, model
+        self.assertTrue(c.render(self.TEXT, 2.5).ok)
+        self.assertTrue(c.store.flush(5.0))
+        self.assertEqual(self.files(), [])   # the take across the restart
+        self.assertEqual(c.status()[0], "ready")
+        self.assertEqual(c.server_pid(), 5151)
+        self.assertTrue(any("restarted" in m for m in self.logs), self.logs)
+        self.assertTrue(c.render(self.NEXT, 2.5).ok)
+        self.assertTrue(c.store.flush(5.0))
+        self.assertEqual(len(self.files()), 1)          # the next one is kept
+
+    def test_a_take_the_server_cannot_vouch_for_is_not_kept(self):
+        srv = self.server(wav_for={self.TEXT: fit_wav(self.TEXT)})
+        c = self.client(srv, clock=_Clock())
+        srv.health_code = 503                # /health stops answering ready
+        srv.ok = False
+        c._clock.t += 1.0
+        self.assertTrue(c.render(self.TEXT, 2.5).ok)
+        self.assertTrue(c.store.flush(5.0))
+        self.assertEqual(self.files(), [])
+        self.assertEqual(c.status()[0], "ready")    # nothing else changes
+        self.assertEqual(c.cache_stats()["not_kept"], 1)
+
+    def test_a_take_of_a_voice_no_longer_consented_is_not_kept(self):
+        # Consent withdrawn (or the profile switched) while a take was on
+        # its way to the disk: the writer re-checks the active profile.
+        srv = self.server(wav_for={self.TEXT: fit_wav(self.TEXT)})
+        c = self.client(srv)
+        with mock.patch.object(c, "profile_sha", return_value=_SHA_B):
+            self.assertTrue(c.render(self.TEXT, 2.5).ok)
+            self.assertTrue(c.store.flush(5.0))
+        self.assertEqual(self.files(), [])
+        self.assertEqual(c.cache_stats()["not_kept"], 1)
+
+    def test_one_health_read_vouches_for_earlier_takes(self):
+        srv = self.server(wav_for={t: fit_wav(t) for t in (self.TEXT,
+                                                            self.NEXT)})
+        clock = _Clock()
+        c = self.client(srv, clock=clock)
+        gets = srv.count("GET", "/health")
+        clock.t += 1.0
+        self.assertTrue(c.render(self.TEXT, 2.5).ok)
+        self.assertTrue(c.render(self.NEXT, 2.5).ok)    # same instant
+        self.assertTrue(c.store.flush(5.0))
+        self.assertEqual(srv.count("GET", "/health"), gets + 1)
+        self.assertEqual(len(self.files()), 2)
+        # A take that arrives after that read needs a read of its own.
+        clock.t += 1.0
+        self.assertTrue(c.render("A third line, sir.", 2.5).ok)
+        self.assertTrue(c.store.flush(5.0))
+        self.assertEqual(srv.count("GET", "/health"), gets + 2)
+
+
+class CachedOpenerTests(_ClientBase):
+    """A cached take that OPENS a reply: only while the clone is healthy and
+    the server answers ready in the same process, voice and model."""
+    TEXT = "Certainly, sir."
+
+    def cached_client(self, **srv_kw):
+        srv_kw.setdefault("wav_for", {self.TEXT: fit_wav(self.TEXT)})
+        srv = self.server(**srv_kw)
+        clock = _Clock()
+        c = self.client(srv, clock=clock)
+        self.assertTrue(c.render(self.TEXT, 2.5).ok)    # now in memory
+        self.assertTrue(c.store.flush(5.0))
+        return srv, c, clock
+
+    def test_a_loading_server_never_opens_a_reply_from_the_cache(self):
+        srv, c, clock = self.cached_client()
+        # It died; a new one bound the port and loads (~13 s of 503s).
+        srv.ok = False
+        srv.health_code = 503
+        srv.tts_status = 503
+        srv.pid = 5151
+        clock.t += cvc.LIVE_MEMO_S + 1.0
+        out = c.render(self.TEXT, 2.5)
+        self.assertFalse(out.ok)
+        self.assertTrue(out.counted)
+        self.assertEqual(out.cache, "refused")
+        self.assertIn("not answering ready", out.reason)
+        self.assertEqual(c.cache_stats()["refused"], 1)
+
+    def test_a_recent_check_stands_for_the_server_then_it_is_probed(self):
+        srv, c, clock = self.cached_client()
+        gets = srv.count("GET", "/health")
+        self.assertEqual(c.render(self.TEXT, 2.5).cache, "mem")
+        self.assertEqual(srv.count("GET", "/health"), gets)      # memo
+        clock.t += cvc.LIVE_MEMO_S + 1.0
+        self.assertEqual(c.render(self.TEXT, 2.5).cache, "mem")
+        self.assertEqual(srv.count("GET", "/health"), gets + 1)  # probed
+        self.assertEqual(c.render(self.TEXT, 2.5).cache, "mem")
+        self.assertEqual(srv.count("GET", "/health"), gets + 1)  # fresh
+
+    def test_a_pending_voice_recheck_renders_instead(self):
+        srv, c, clock = self.cached_client()
+        c._recheck = True                 # a cool-down just ended
+        self.assertFalse(c.is_cached(self.TEXT))
+        n = len(srv.tts_texts())
+        out = c.render(self.TEXT, 2.5)
+        self.assertTrue(out.ok and not out.cached)
+        self.assertEqual(len(srv.tts_texts()), n + 1)
+        self.assertFalse(c._recheck)
+
+    def test_a_struggling_clone_renders_the_opener_instead(self):
+        srv, c, clock = self.cached_client()
+        for state in ({"_fails": 1}, {"_probation": True},
+                      {"_decode": "eager"}):
+            for k, v in state.items():
+                setattr(c, k, v)
+            self.assertFalse(c.is_cached(self.TEXT), state)
+            n = len(srv.tts_texts())
+            out = c.render(self.TEXT, 2.5)
+            self.assertTrue(out.ok and not out.cached, state)
+            self.assertEqual(len(srv.tts_texts()), n + 1, state)
+            # A look-ahead line of a reply already in the clone still is.
+            la = c.render(self.TEXT, 2.5, needed_by=clock.t + 5.0)
+            self.assertTrue(la.ok and la.cached, state)
+            c._fails, c._probation, c._decode = 0, False, "cuda-graph"
+        self.assertTrue(c.is_cached(self.TEXT))
+
+    def test_a_probe_that_finds_the_slow_decoder_renders_the_opener(self):
+        srv, c, clock = self.cached_client()
+        srv.t3_decode = "eager"              # it fell back since the last line
+        srv.engine = "eager"
+        clock.t += cvc.LIVE_MEMO_S + 1.0
+        n = len(srv.tts_texts())
+        out = c.render(self.TEXT, 2.5)
+        self.assertTrue(out.ok and not out.cached)
+        self.assertEqual(len(srv.tts_texts()), n + 1)
+        self.assertEqual(c.decode_state(), "eager")
+
+    def test_a_server_now_in_the_profiles_new_voice_renders_the_opener(self):
+        srv, c, clock = self.cached_client()
+        with open(self.prof.ref, "wb") as f:
+            f.write(b"RIFF the owner's new reference")
+        with open(self.prof.ref, "rb") as f:
+            new_sha = hashlib.sha256(f.read()).hexdigest()
+        srv.ref_sha = new_sha
+        srv.pid = 5151
+        clock.t += cvc.LIVE_MEMO_S + 1.0
+        out = c.render(self.TEXT, 2.5)
+        self.assertTrue(out.ok and not out.cached)   # the old voice's take
+        self.assertEqual(c.status()[0], "ready")     # is not played
+        self.assertEqual(c.voice_prefix(), new_sha[:16])
+
+    def test_a_disk_take_that_does_not_fit_its_text_is_never_served(self):
+        srv = self.server(wav_for={self.TEXT: fit_wav(self.TEXT)})
+        c1 = self.client(srv, start=True)
+        key = c1._key(self.prof.sha, c1._server_info,
+                      crc.normalise_text(cvc._normalize_text(self.TEXT)))
+        # A 12 s take for a 15-character line, filed by an older rule.
+        c1.store.disk_put(key, self.prof.sha[:16],
+                          np.full(12 * 24000, 900, dtype=np.int16))
+        self.assertTrue(c1.store.flush(5.0))
+        self.assertEqual(len(self.files()), 1)
+        c2 = self.client(srv)
+        n = len(srv.tts_texts())
+        out = c2.render(self.TEXT, 2.5)
+        self.assertFalse(out.cached)
+        self.assertEqual(len(srv.tts_texts()), n + 1)
+        self.assertEqual(c2.cache_stats()["rejected_on_read"], 1)
 
 
 class ShadowAndOffTests(_ClientBase):
@@ -719,6 +1115,48 @@ class ForgetTests(_ClientBase):
         self.assertTrue(c.render(self.OLD, 2.5).cached)
         self.assertEqual(len(srv.tts_texts()), n + 1)
 
+    def test_a_line_voiced_after_the_request_is_not_that_line(self):
+        # "Forget that line" -> the reply streams "Certainly, sir." before
+        # the action runs; that acknowledgement is not the line he meant.
+        clock = _Clock()
+        bad = "The parcel arrived at the side door."
+        srv = self.server(wav_for={t: fit_wav(t) for t in (bad, self.A)})
+        c = self.client(srv, clock=clock)
+        c.render(bad, 2.5)
+        clock.t += 20.0
+        asked = clock.t                     # his request accepted ("You:")
+        clock.t += 6.0
+        c.render(self.A, 2.5)               # the streamed acknowledgement
+        clock.t += 1.0
+        self.assertTrue(c.store.flush(5.0))
+        self.assertEqual(c.forget_last_reply(before=asked), [bad])
+        self.assertTrue(c.ledger.is_forgotten(bad))
+        self.assertFalse(c.ledger.is_forgotten(self.A))
+        self.assertTrue(c.render(self.A, 2.5).cached)
+        self.assertFalse(c.render(bad, 2.5).cached)
+
+    def test_a_take_still_queued_when_forgotten_never_lands(self):
+        clock = _Clock()
+        srv = self.server(wav_for={self.A: fit_wav(self.A)})
+        c = self.client(srv, clock=clock)
+        held = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        real_verify = c._verify_take
+
+        def slow_verify(*a):
+            held.set()
+            release.wait(5.0)
+            return real_verify(*a)
+        with mock.patch.object(c, "_verify_take", side_effect=slow_verify):
+            self.assertTrue(c.render(self.A, 2.5).ok)
+            self.assertTrue(held.wait(5.0))      # its write is in flight
+            clock.t += 1.0
+            self.assertEqual(c.forget_last_reply(), [self.A])
+            release.set()
+            self.assertTrue(c.store.flush(5.0))
+        self.assertEqual(self.files(), [])
+
     def test_nothing_recent_forgets_nothing(self):
         clock = _Clock()
         srv = self.server(wav_for={self.A: fit_wav(self.A)})
@@ -754,15 +1192,31 @@ class CacheAwarePlanTests(unittest.TestCase):
                                       is_cached=lambda t: t == self.LONG_S1)
         self.assertEqual(cached, [self.LONG_S1])
 
-    def test_a_short_reply_splits_at_its_cached_first_sentence(self):
+    def test_a_short_one_piece_reply_is_never_split_for_the_cache(self):
+        # Each piece plays on a new stream: a boundary is ~0.4-0.7 s of
+        # silence until C5, a pause one render never had.
+        self.assertLessEqual(len(self.SHORT), st.CLAUSE_SPLIT_MIN_CHARS)
         self.assertEqual(st.plan_clone_chunks(self.SHORT), [self.SHORT])
-        plan = st.plan_clone_chunks(
-            self.SHORT, is_cached=lambda t: t == "Very good, sir.")
-        self.assertEqual(plan, ["Very good, sir.", "The lamp is off now."])
-        self.assertEqual(plan[1].budget_chars, len(self.SHORT))
+        self.assertEqual(st.plan_clone_chunks(
+            self.SHORT, is_cached=lambda t: t == "Very good, sir."),
+            [self.SHORT])
         # The whole short reply cached: one chunk, as before.
         self.assertEqual(st.plan_clone_chunks(
             self.SHORT, is_cached=lambda t: True), [self.SHORT])
+
+    def test_a_first_line_split_anyway_splits_at_its_cached_opener(self):
+        text = ("Very good, sir. The lamp in the study is off now and the "
+                "heating is down to sixty eight.")
+        self.assertGreater(len(text), st.CLAUSE_SPLIT_MIN_CHARS)
+        self.assertLess(len(text), st.MIN_CHARS)
+        plain = st.plan_clone_chunks(text)
+        self.assertGreater(len(plain), 1)              # split anyway
+        plan = st.plan_clone_chunks(
+            text, is_cached=lambda t: t == "Very good, sir.")
+        self.assertEqual(plan[0], "Very good, sir.")
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(plan[1].budget_chars, len(text))
+        self.assertLessEqual(len(plan), len(plain))   # never more pieces
 
     def test_a_cached_opener_of_a_long_reply(self):
         text = "Certainly, sir. " + self.LONG_S1 + " And that is all."

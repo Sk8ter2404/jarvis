@@ -381,16 +381,24 @@ def _cache_aware_plan(text: str, min_chars: int,
         first sentence of a long one) is cached -> keep it WHOLE, however
         long: it plays at once, so splitting it at a clause would only
         replace an instant take with a render;
-      * else the first SENTENCE of that chunk is cached -> start with it,
-        then the rest of that chunk as one piece (rendered while the cached
-        sentence plays, with the whole chunk's render budget), then the
-        reply's other chunks."""
+      * else, when that chunk is one the clone plan splits anyway (longer
+        than CLAUSE_SPLIT_MIN_CHARS), and its first SENTENCE is cached ->
+        start with it, then the rest of that chunk as one piece (rendered
+        while the cached sentence plays, with the whole chunk's render
+        budget), then the reply's other chunks.
+
+    A short reply the plan voices in ONE piece is never split for the cache:
+    each piece plays on a new stream, and the boundary costs ~0.4-0.7 s of
+    silence until the playback keeper (C5) lands -- a pause inside "Very
+    good, sir. The lamp is off now." that one render never had."""
     chunks = plan_chunks(text, min_chars)
     if not chunks:
         return None
     first = chunks[0]
     if _cached(is_cached, first):
         return chunks
+    if len(first) <= CLAUSE_SPLIT_MIN_CHARS:
+        return None
     parts = split_sentences(first)
     if len(parts) > 1 and _cached(is_cached, parts[0]):
         rest = " ".join(parts[1:])
@@ -421,9 +429,9 @@ def plan_clone_chunks(text: str, min_chars: int = MIN_CHARS,
     `is_cached(text)` (the clone client's render cache, VOICE_CLONE_CACHE
     'on'; 2026-10-05): when the reply's opening is already cached the plan
     starts with it instead (_cache_aware_plan) -- a cached first sentence
-    plays whole even when it is long, and a short reply whose first
-    sentence is cached is split there. None, or nothing cached: exactly the
-    plan above."""
+    plays whole even when it is long, and a first line this plan would split
+    anyway is split at its cached first sentence. None, or nothing cached:
+    exactly the plan above."""
     if is_cached is not None:
         cached_plan = _cache_aware_plan(text, min_chars, is_cached)
         if cached_plan is not None:

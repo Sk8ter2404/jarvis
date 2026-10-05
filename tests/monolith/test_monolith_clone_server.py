@@ -372,7 +372,10 @@ class SlowAndFailingTests(_Base):
         self.quiet(self.bc.synthesise, SHORT)
         audio, _ = self.quiet(self.bc.synthesise, SHORT)
         self.assertTrue(self.is_clone(audio))
-        self.assertIn("[tts] clone voice 0 ms (first line, cached)", self.out)
+        # The wall time of a cached line is the server check (0-2 ms; more
+        # at Idle priority on a busy box): the tag says "cached", not "0".
+        self.assertRegex(self.out,
+                         r"\[tts\] clone voice \d+ ms \(first line, cached\)")
         self.assertEqual(self.srv.tts_texts(), [SHORT])
 
     def test_too_long_line_goes_to_kokoro_without_a_failure(self):

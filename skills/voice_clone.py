@@ -270,15 +270,29 @@ def _decode_note() -> str:
         return ""
 
 
+def _request_accepted_at():
+    """time.monotonic() when the owner's current turn was accepted (the
+    monolith's _last_owner_turn_at), or None when not known. Lines the clone
+    voiced at or after it -- this request's own acknowledgement, streamed
+    before the action runs -- are not "that line". Never raises."""
+    try:
+        cell = getattr(_bobert(), "_last_owner_turn_at", None)
+        t = float(cell[0])
+        return t if t > 0.0 else None
+    except Exception:
+        return None
+
+
 def _forget_voice_line(_: str = "") -> str:
     """'Forget that line': the clone voice's cached takes of the reply just
     heard are dropped (memory and disk) and never prepared ahead again; the
-    next time a line is said it is rendered afresh."""
+    next time a line is said it is rendered afresh. "Just heard" = before
+    this request was accepted."""
     client = _clone_client()
     if client is None:
         return "The clone voice isn't loaded, sir, so there's nothing to forget."
     try:
-        texts = client.forget_last_reply()
+        texts = client.forget_last_reply(before=_request_accepted_at())
     except Exception:
         texts = []
     if not texts:

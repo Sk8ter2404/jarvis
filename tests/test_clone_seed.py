@@ -1,5 +1,5 @@
 """core/clone_seed.py -- the line ledger, the one-time history bootstrap, the
-daily seed budget and the cache keeper's quiet-time seeding (voice
+once-per-voice seed budget and the cache keeper's quiet-time seeding (voice
 architecture C6, 2026-10-05).
 
 Light tier. The keeper drives a REAL CloneVoiceClient against a FAKE
@@ -14,13 +14,19 @@ Pins:
     the episode store is one reply), counts each unit once per reply, adds
     the first sentence (what the cache-aware planner looks for) and cleans
     each reply first;
-  * the budget is per voice per day and resets at midnight;
+  * the budget is per voice IN TOTAL (the owner approved seeding once,
+    <= 60 s of GPU): it survives restarts and days, a new voice starts at
+    zero, and a line is tried at most once per voice;
   * the keeper: nothing while the gate is closed or the cache is off (the
     purge still runs); a one-time bootstrap; one seed render per tick into
     the disk tier, never counted toward the clone's cool-down and never
-    entered in the ledger; no seeding on the slow decoder, past the daily
-    budget, or for a forgotten line; a render abandoned the moment the
-    owner starts talking leaves nothing behind.
+    entered in the ledger; no seeding on the slow decoder, past the budget,
+    in an unconsented voice, while the clone is on probation, or for a
+    forgotten or already cached line; a seed the take gate rejects is never
+    rendered again, nor one the cache later trims; a render abandoned the
+    moment the owner starts talking leaves nothing behind and is tried
+    again later; the ledger is saved while the owner is quiet (or at most
+    every PERSIST_MAX_S), never on every tick mid-conversation.
 """
 from __future__ import annotations
 
@@ -174,26 +180,47 @@ class HistoryTests(unittest.TestCase):
 
 
 class BudgetTests(unittest.TestCase):
-    def test_per_voice_per_day(self):
+    def test_per_voice_in_total_across_restarts_and_days(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = os.path.join(tmp.name, "seed_state.json")
-        wall = _Wall(_DAY1)
-        b = cs.SeedBudget(path, wall=wall)
+        b = cs.SeedBudget(path)
         b.add("a" * 16, 1500)
         b.mark_tried("a" * 16, "Certainly, sir.")
         self.assertAlmostEqual(b.used_s("a" * 16), 1.5)
-        self.assertEqual(b.used_s("b" * 16), 0.0)
+        self.assertEqual(b.used_s("b" * 16), 0.0)        # a new voice
         self.assertTrue(b.tried("a" * 16, "Certainly, sir."))
+        self.assertFalse(b.tried("b" * 16, "Certainly, sir."))
         b.save_if_dirty()
-        again = cs.SeedBudget(path, wall=_Wall(_DAY1))
-        self.assertAlmostEqual(again.used_s("a" * 16), 1.5)
-        self.assertTrue(again.tried("a" * 16, "Certainly, sir."))
-        wall.t = _DAY2
-        self.assertEqual(b.used_s("a" * 16), 0.0)
-        self.assertFalse(b.tried("a" * 16, "Certainly, sir."))
-        self.assertEqual(cs.SeedBudget(path, wall=_Wall(_DAY2))
-                         .used_s("a" * 16), 0.0)
+        # A restart -- on any later day -- finds the same totals.
+        with mock.patch.object(time, "time", return_value=_DAY2 + 86400.0):
+            again = cs.SeedBudget(path)
+            self.assertAlmostEqual(again.used_s("a" * 16), 1.5)
+            self.assertTrue(again.tried("a" * 16, "Certainly, sir."))
+        again.unmark_tried("a" * 16, "Certainly, sir.")
+        self.assertFalse(again.tried("a" * 16, "Certainly, sir."))
+
+    def test_an_older_per_day_file_starts_over(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "seed_state.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"date": "2026-10-05",
+                       "voices": {"a" * 16: {"gpu_ms": 5000.0,
+                                             "tried": []}}}, f)
+        self.assertEqual(cs.SeedBudget(path).used_s("a" * 16), 0.0)
+
+    def test_shipped_budget_is_the_owners_sixty_seconds(self):
+        self.assertEqual(cs.DEFAULT_SEED_GPU_S, 60.0)
+        self.assertEqual(cfg.VOICE_CLONE_SEED_GPU_S, cs.DEFAULT_SEED_GPU_S)
+        from tools import settings_window as sw
+        self.assertEqual(sw.SCHEMA["VOICE_CLONE_SEED_GPU_S"]["default"],
+                         cs.DEFAULT_SEED_GPU_S)
+        ex = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "tools", "user_settings.example.json")
+        with open(ex, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["VOICE_CLONE_SEED_GPU_S"],
+                             cs.DEFAULT_SEED_GPU_S)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -235,11 +262,13 @@ class KeeperTests(unittest.TestCase):
         self.addCleanup(lambda: self.c.store.flush(5.0))
         self.assertEqual(self.c.start(url=self.srv.url, cmd="",
                                       profile="butler"), "ready")
+        self.clock = _Wall(1000.0)
         self.k = cs.CacheKeeper(
             self.c, gate_fn=lambda: self.gate[0],
             abort_fn=lambda: self.abort[0],
             history_fn=(lambda: history) if history is not None else None,
-            plan=st.plan_clone_chunks, log=self.logs.append)
+            plan=st.plan_clone_chunks, log=self.logs.append,
+            clock=self.clock)
         return self.k
 
     def ledger_with(self, *texts, n=2):
@@ -322,7 +351,7 @@ class KeeperTests(unittest.TestCase):
         self.util[0] = None                           # unreadable: no veto
         self.assertEqual(k.tick(), "seeded")
 
-    def test_the_daily_budget(self):
+    def test_the_budget(self):
         k = self.setup()
         self.ledger_with(*SEEDS)
         self.c.ledger.bootstrapped = True
@@ -365,6 +394,109 @@ class KeeperTests(unittest.TestCase):
                 k.tick()
         self.assertEqual(self.c.failures(), 0)
         self.assertEqual(self.c.status()[0], "ready")
+
+    def test_a_seed_the_take_gate_rejects_is_rendered_once(self):
+        runaway = "Certainly, sir."
+        wavs = {t: fit_wav(t) for t in SEEDS}
+        wavs[runaway] = make_wav(lead_s=0.0, speech_s=12.0, tail_s=0.0,
+                                 amp=0.3)
+        k = self.setup(wav_for=wavs)
+        self.ledger_with(*SEEDS)
+        self.c.ledger.bootstrapped = True
+        for _ in range(8):
+            k.tick()
+            self.assertTrue(self.c.store.flush(5.0))
+        self.assertEqual(self.srv.tts_texts().count(runaway), 1)
+        self.assertEqual(sorted(self.srv.tts_texts()), sorted(SEEDS))
+
+    def test_each_line_is_seeded_once_per_voice_ever(self):
+        k = self.setup()
+        self.ledger_with(*SEEDS)
+        self.c.ledger.bootstrapped = True
+        while k.tick() == "seeded":
+            pass
+        self.assertTrue(self.c.store.flush(5.0))
+        n = len(self.srv.tts_texts())
+        self.assertEqual(n, len(SEEDS))
+        # The cache trims one later; nothing renders it again -- not on a
+        # later day, not after a restart (a new budget over the same file).
+        key = self.c._key(self.c._server_sha, self.c._server_info,
+                          "Certainly, sir.")
+        self.c.store.forget([key], count=False)
+        self.assertFalse(self.c.is_cached("Certainly, sir."))
+        self.c.budget.save_if_dirty()
+        self.c.budget = cs.SeedBudget(os.path.join(self.dir, cs.STATE_FILE))
+        with mock.patch.object(time, "time", return_value=_DAY2 + 86400.0):
+            for _ in range(3):
+                self.assertEqual(k.tick(), "done")
+        self.assertEqual(len(self.srv.tts_texts()), n)
+
+    def test_a_line_already_cached_is_not_seeded(self):
+        k = self.setup()
+        # Said for a listener (cached) before the keeper got to it.
+        self.assertTrue(self.c.render("Certainly, sir.", 2.5).ok)
+        self.ledger_with(*SEEDS)
+        self.c.ledger.bootstrapped = True
+        while k.tick() == "seeded":
+            pass
+        self.assertEqual(self.srv.tts_texts().count("Certainly, sir."), 1)
+        self.assertEqual(len(self.srv.tts_texts()), len(SEEDS))
+
+    def test_a_seed_abandoned_for_the_owner_is_tried_again_later(self):
+        k = self.setup(tts_delay=1.0)
+        self.ledger_with("Certainly, sir.")
+        self.c.ledger.bootstrapped = True
+        threading.Timer(0.2, lambda: self.abort.__setitem__(0, True)).start()
+        self.assertEqual(k.tick(), "aborted")
+        self.assertFalse(self.c.budget.tried(self.c.voice_prefix(),
+                                             "Certainly, sir."))
+        self.abort[0] = False
+        self.srv.tts_delay = 0.0
+        self.assertEqual(k.tick(), "seeded")
+        self.assertTrue(self.c.store.flush(5.0))
+        self.assertTrue(self.c.is_cached("Certainly, sir."))
+
+    def test_no_seeding_in_a_voice_that_is_not_the_consented_one(self):
+        k = self.setup()
+        self.ledger_with(*SEEDS)
+        self.c.ledger.bootstrapped = True
+        with mock.patch.object(self.c, "profile_sha", return_value="b" * 64):
+            self.assertEqual(k.tick(), "voice not the consented profile's")
+        self.assertEqual(self.srv.tts_texts(), [])
+
+    def test_no_seeding_while_the_clone_is_missing_lines(self):
+        k = self.setup()
+        self.ledger_with(*SEEDS)
+        self.c.ledger.bootstrapped = True
+        for state in ({"_probation": True}, {"_fails": 1},
+                      {"_recheck": True}):
+            for name, v in state.items():
+                setattr(self.c, name, v)
+            self.assertEqual(k.tick(), "clone missing lines", state)
+            self.c._probation, self.c._fails, self.c._recheck = \
+                False, 0, False
+        self.assertEqual(self.srv.tts_texts(), [])
+
+    def test_the_ledger_is_saved_while_quiet_not_on_every_busy_tick(self):
+        k = self.setup()
+        path = os.path.join(self.dir, cs.LEDGER_FILE)
+        self.c.ledger.bootstrapped = True
+        self.c.ledger.record("A line before the quiet tick.")
+        self.gate[0] = None
+        k.tick()                                  # quiet: saved
+        self.assertTrue(os.path.exists(path))
+        self.c.ledger.record("Mid-conversation line.")
+        mtime = os.path.getmtime(path)
+        size = os.path.getsize(path)
+        self.gate[0] = "owner active"
+        for _ in range(5):
+            k.tick()
+            self.clock.t += 30.0
+        self.assertEqual((os.path.getmtime(path), os.path.getsize(path)),
+                         (mtime, size))
+        self.clock.t += cs.PERSIST_MAX_S
+        k.tick()                                  # at most every 5 min
+        self.assertNotEqual(os.path.getsize(path), size)
 
     def test_the_daemon_starts_once(self):
         k = self.setup()

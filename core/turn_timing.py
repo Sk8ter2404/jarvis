@@ -87,17 +87,20 @@ lead_dropped (NOTE_FIELDS; ``-`` = not measured on this turn):
                  'chatterbox_turbo_server') on the answer's first render: 1 =
                  it voiced it, 0 = it was tried and that line fell back to
                  Kokoro. ``-`` = the clone was not in use.
-  clone_ms       that first clone render's time, request to finished audio
-                 (0 = served from the clone's render cache).
+  clone_ms       that first clone line's wall time, request to finished
+                 audio; for a cached line, the time to confirm the server
+                 is up and fetch the take (0-2 ms; clone_cache says it was
+                 cached).
   t3_ms_tok      C8 (2026-10-05): that first clone line's T3 decode ms per
                  speech token, from the server's X-T3-Ms / X-Speech-Tokens
                  (~4.3 on the fast cuda-graph decoder, ~24 on the slow
-                 loop). ``-`` when it came from the cache or the server
-                 sent no headers.
+                 loop). ``-`` when it came from the cache, missed, or the
+                 server sent no headers -- never a later line's speed.
   clone_cache    where that first clone line came from: mem / disk (the
-                 render cache), miss (the server rendered it), shadow-hit
-                 (VOICE_CLONE_CACHE 'shadow': rendered, but the disk would
-                 have served it).
+                 render cache), miss (the server rendered it, or failed),
+                 refused (cached, but the server was not answering ready,
+                 so Kokoro voiced it), shadow-hit (VOICE_CLONE_CACHE
+                 'shadow': rendered, but the disk would have served it).
   audible_ms     computed when the line is printed, never noted: the
                  answer's first audible sample, ms from t0 = first_play +
                  play_open_ms + out_lat_ms (``-`` unless all three are

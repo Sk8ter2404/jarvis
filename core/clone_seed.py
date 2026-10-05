@@ -29,19 +29,25 @@ SEEDING (only with VOICE_CLONE_CACHE 'on')
 CacheKeeper runs on one daemon ('clone-cache-keeper') and, each tick:
   * purges takes of any voice that is no longer a consented profile's
     reference (consent revoked, reference replaced) -- in EVERY mode;
-  * saves the ledger, the take gate and the seed budget when they changed;
+  * saves the ledger, the take gate and the seed budget when they changed
+    -- while the owner is quiet, or at most every PERSIST_MAX_S otherwise
+    (never a ~10 ms JSON write on every tick mid-conversation);
   * reads /health now and then (fast-decode alert, C3);
   * renders ONE recurring line that is not cached yet, only when ALL hold:
     the monolith's gate says the owner has been quiet >= QUIET_S and nothing
     is speaking, recording or mid-turn; the client is ready, speaking the
     consented voice, with the fast (cuda-graph) decoder on; the server's GPU
     is under GPU_BUSY_PCT utilisation (no game, no brain work); this voice
-    has used less than VOICE_CLONE_SEED_GPU_S of server render time today. The
-    wait is abandoned the moment the owner starts talking (``abort_fn``); a
-    render already on the GPU finishes there (<= ~1.3 s), long before his
-    turn reaches its first render (the end-of-turn silence alone is ~1.2 s).
-    Most frequent first, shortest first; a line tried today is not retried
-    until tomorrow; a line the owner asked to forget is never seeded.
+    has used less than VOICE_CLONE_SEED_GPU_S of server render time IN
+    TOTAL (the owner approved seeding ONCE, <= 60 s of GPU, 2026-10-04: B6).
+    The wait is abandoned the moment the owner starts talking
+    (``abort_fn``); a render already on the GPU finishes there (<= ~1.3 s),
+    long before his turn reaches its first render (the end-of-turn silence
+    alone is ~1.2 s). Most frequent first, shortest first; a line is seeded
+    at most once per voice (tried once, rendered or not -- a take the gate
+    rejects, or one the cache later trims, is never rendered again by the
+    seeding; one abandoned for the owner is tried again later); a line the
+    owner asked to forget is never seeded.
 A seed render is a background render (count=False): it never touches the
 clone's miss count or cool-down. Seeds go through the same take gate as any
 render. Two log lines per seeding burst at most.
@@ -69,11 +75,17 @@ LEDGER_MAX = 4000
 # Longer lines are never seeded (they recur verbatim too rarely to pay).
 TEXT_MAX_CHARS = 300
 SEED_MIN_COUNT = 2
-DEFAULT_SEED_GPU_S = 90.0
+DEFAULT_SEED_GPU_S = 60.0
 QUIET_S = 60.0
 # Between two seed renders (the 3090 is shared with the brain and DWM).
 SEED_GAP_S = 2.0
 IDLE_TICK_S = 30.0
+# The ledger / budget / take-gate files are saved while the owner is quiet,
+# or at most this often while he is not.
+PERSIST_MAX_S = 300.0
+# Over LEDGER_MAX the ledger is cut to this share of it (so the sort that
+# picks what goes runs once per ~LEDGER_MAX/10 new lines, not every line).
+LEDGER_PRUNE_TO = 0.9
 # /health is read before seeding when older than this, and otherwise at most
 # this often while the owner is quiet (the fast-decode alert, C3).
 HEALTH_SEED_MAX_AGE_S = 60.0
@@ -101,8 +113,8 @@ def _cfg(name: str, default):
 
 
 def seed_gpu_s() -> float:
-    """VOICE_CLONE_SEED_GPU_S: server render seconds per voice per day the
-    seeding may use (0 = no seeding), clamped to 0..600."""
+    """VOICE_CLONE_SEED_GPU_S: server render seconds per voice, in total,
+    the seeding may use (0 = no seeding), clamped to 0..600."""
     try:
         v = float(_cfg("VOICE_CLONE_SEED_GPU_S", DEFAULT_SEED_GPU_S))
         if not v == v:
@@ -225,9 +237,11 @@ class LineLedger:
         return ok
 
     def _prune(self) -> None:
-        """Caller holds the lock. Over LEDGER_MAX: one-off lines go first,
-        oldest first; then the least said."""
-        over = len(self._lines) - LEDGER_MAX
+        """Caller holds the lock. Over LEDGER_MAX: down to LEDGER_PRUNE_TO of
+        it, one-off lines first, oldest first; then the least said."""
+        if len(self._lines) <= LEDGER_MAX:
+            return
+        over = len(self._lines) - int(LEDGER_MAX * LEDGER_PRUNE_TO)
         if over <= 0:
             return
         order = sorted(self._lines.items(),
@@ -441,22 +455,24 @@ def bootstrap_counts(sources: Iterable[Iterable[str]], clean=None,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  The daily budget
+#  The budget (once per voice)
 # ═══════════════════════════════════════════════════════════════════════════
-class SeedBudget:
-    """Seed render time used per voice today, and the lines tried today.
-    Resets when the date changes. Thread-safe; never raises."""
+BUDGET_VERSION = 2
 
-    def __init__(self, path: Optional[str] = None, *,
-                 wall: Callable[[], float] = time.time) -> None:
+
+class SeedBudget:
+    """Seed render time used per voice IN TOTAL, and the lines the seeding
+    has tried for that voice (each at most once). Kept across restarts; a
+    new voice (new reference) starts at zero. Thread-safe; never raises."""
+
+    def __init__(self, path: Optional[str] = None) -> None:
         self._mu = threading.Lock()
         self.path = path
-        self._wall = wall
-        self._date = _today(wall)
         self._voices: dict = {}
         self.dirty = False
         obj = _read_json(path) if path else None
-        if isinstance(obj, dict) and obj.get("date") == self._date and \
+        # Only this layout is read (an older, per-day one is started over).
+        if isinstance(obj, dict) and obj.get("v") == BUDGET_VERSION and \
                 isinstance(obj.get("voices"), dict):
             for p, v in obj["voices"].items():
                 if not isinstance(v, dict):
@@ -470,14 +486,6 @@ class SeedBudget:
                 self._voices[str(p)] = {"gpu_ms": max(0.0, ms),
                                         "tried": set(tried)}
 
-    def _roll(self) -> None:
-        """Caller holds the lock: a new day starts a new budget."""
-        day = _today(self._wall)
-        if day != self._date:
-            self._date = day
-            self._voices = {}
-            self.dirty = True
-
     def _v(self, prefix: str) -> dict:
         v = self._voices.get(prefix)
         if v is None:
@@ -486,13 +494,11 @@ class SeedBudget:
 
     def used_s(self, prefix: str) -> float:
         with self._mu:
-            self._roll()
             return self._v(prefix)["gpu_ms"] / 1000.0
 
     def add(self, prefix: str, ms) -> None:
         try:
             with self._mu:
-                self._roll()
                 self._v(prefix)["gpu_ms"] += max(0.0, float(ms or 0.0))
                 self.dirty = True
         except Exception:
@@ -500,13 +506,18 @@ class SeedBudget:
 
     def tried(self, prefix: str, text) -> bool:
         with self._mu:
-            self._roll()
             return text_hash(text) in self._v(prefix)["tried"]
 
     def mark_tried(self, prefix: str, text) -> None:
         with self._mu:
-            self._roll()
             self._v(prefix)["tried"].add(text_hash(text))
+            self.dirty = True
+
+    def unmark_tried(self, prefix: str, text) -> None:
+        """A seed abandoned for the owner (never heard, never judged): it may
+        be tried again in a later quiet spell."""
+        with self._mu:
+            self._v(prefix)["tried"].discard(text_hash(text))
             self.dirty = True
 
     def save_if_dirty(self) -> bool:
@@ -515,7 +526,7 @@ class SeedBudget:
         with self._mu:
             if not self.dirty:
                 return False
-            obj = {"date": self._date,
+            obj = {"v": BUDGET_VERSION,
                    "voices": {p: {"gpu_ms": round(v["gpu_ms"], 1),
                                   "tried": sorted(v["tried"])}
                               for p, v in self._voices.items()}}
@@ -584,6 +595,7 @@ class CacheKeeper:
         self._burst = 0                 # lines seeded in the current burst
         self._burst_announced = False
         self._last_health = float("-inf")
+        self._last_persist = float("-inf")
 
     def _log(self, msg: str) -> None:
         try:
@@ -626,12 +638,18 @@ class CacheKeeper:
                 used = 0.0
             self._log(f"  [clone-cache] seeded {self._burst} line"
                       f"{'s' if self._burst != 1 else ''} ({why}; "
-                      f"{used:.0f} s of {seed_gpu_s():.0f} s seed render "
-                      f"time used today)")
+                      f"{used:.0f} s of this voice's {seed_gpu_s():.0f} s "
+                      f"seed render time used)")
         self._burst = 0
         self._burst_announced = False
 
-    def _persist(self) -> None:
+    def _persist(self, quiet: bool) -> None:
+        """Save what changed: while the owner is quiet, else at most every
+        PERSIST_MAX_S."""
+        now = self._clock()
+        if not quiet and now - self._last_persist < PERSIST_MAX_S:
+            return
+        self._last_persist = now
         for obj in (getattr(self.client, "ledger", None),
                     getattr(self.client, "budget", None)):
             try:
@@ -652,12 +670,13 @@ class CacheKeeper:
             self.client.purge_unconsented()
         except Exception:
             pass
-        self._persist()
         m = _crc.mode()
         if m == "off":
+            self._persist(False)
             self._end_burst("cache off")
             return "off"
         why = self._gate()
+        self._persist(not why)
         if why:
             self._end_burst("you were busy" if self._burst else why)
             return str(why)
@@ -711,7 +730,7 @@ class CacheKeeper:
         prefix = self.client.voice_prefix()
         budget = self.client.budget
         if budget.used_s(prefix) >= cap:
-            self._end_burst("today's seed budget is spent")
+            self._end_burst("this voice's seed budget is spent")
             return "budget"
         pick = None
         left = 0
@@ -731,6 +750,8 @@ class CacheKeeper:
                       f"at a time while you're quiet")
         if self._abort.is_set():
             return "aborted"
+        # Marked BEFORE the render (a crash mid-render must not loop on it);
+        # un-marked only when the owner cut it short.
         budget.mark_tried(prefix, pick)
         t0 = self._clock()
         out = self.client.render(pick, SEED_TIMEOUT_S, count=False,
@@ -746,6 +767,7 @@ class CacheKeeper:
             self._burst += 1
             return "seeded"
         if getattr(out, "cancelled", False):
+            budget.unmark_tried(prefix, pick)
             self._end_burst("you started talking")
             return "aborted"
         return "seed-failed"
