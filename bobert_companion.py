@@ -39213,6 +39213,12 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
     # the next (True: the clone; False: anything else; None: not known).
     # The worker renders in order, so it is always the previous chunk's.
     prev_clone = [first_clone]
+    # One voice per reply (the owner's choice, 2026-10-04): once a line of
+    # THIS reply came out in Kokoro while the clone voice server was active
+    # (a miss, a skip, a too-long line), every later line stays in Kokoro
+    # too, so the voice never switches back mid-reply. Unknown (None) is not
+    # a miss.
+    reply_kokoro = [first_clone is False and _tts_engine_kind() == "clone"]
 
     def _scaled(audio):
         if volume_scale != 1.0:
@@ -39225,21 +39231,31 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
 
     def _render(text, mode):
         clause = getattr(text, "clause", "")
-        # The rest of a sentence keeps the voice of its start ...
-        no_clone = clause == "tail" and prev_clone[0] is False
+        # The rest of a sentence keeps the voice of its start, and once a
+        # line of this reply missed the clone the rest of the reply stays in
+        # Kokoro ...
+        kokoro_head = clause == "tail" and prev_clone[0] is False
+        no_clone = kokoro_head or reply_kokoro[0]
         # ... and once the reply speaks in the clone, the next line waits
         # for the clone (bounded) rather than switch voice.
         hold = prev_clone[0] is True
+        clone_tried = (not no_clone) and _tts_engine_kind() == "clone"
         _TTS_PRESET_PIN.value = pinned
         _TTS_PRESET_PIN.mode = mode
         _TTS_PRESET_PIN.no_clone = no_clone
         _TTS_PRESET_PIN.hold_clone = hold
         try:
-            if no_clone:
+            if kokoro_head:
                 print("  [tts] clone voice skipped: Kokoro voiced the start "
                       "of this sentence, so it voices the rest")
+            elif no_clone:
+                print("  [tts] clone voice skipped: Kokoro voiced an earlier "
+                      "line of this reply, so it voices the rest (one voice "
+                      "per reply)")
             audio, sr = synthesise(text)
             prev_clone[0] = bool(getattr(_CLONE_LINE, "voiced", False))
+            if clone_tried and not prev_clone[0]:
+                reply_kokoro[0] = True
         finally:
             _TTS_PRESET_PIN.value = None
             _TTS_PRESET_PIN.mode = None

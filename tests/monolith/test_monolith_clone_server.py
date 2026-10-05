@@ -523,16 +523,29 @@ class SpeakContractTests(_SpeakBase):
             self.assertTrue(self.is_clone(a))
         self.assertEqual(self.kokoro_texts, [])
 
-    def test_a_failed_sentence_is_kokoro_and_the_next_is_clone_again(self):
+    def test_a_failed_sentence_keeps_the_rest_of_the_reply_in_kokoro(self):
+        # One voice per reply (owner, 2026-10-04): once a line missed the
+        # clone, the reply never switches back to the clone voice.
         self.srv.fail_texts = {S2}
         self.assertTrue(self.speak())
         self.assertEqual(len(self.played), 3)
         self.assertTrue(self.is_clone(self.played[0]))
         self.assertTrue(self.is_kokoro(
             self.played[1][: -int(24000 * 0.15)]))   # before the sentence gap
-        self.assertTrue(self.is_clone(self.played[2]))
-        self.assertEqual(self.kokoro_texts, [S2])
-        self.assertEqual(self.client.failures(), 0)
+        self.assertTrue(self.is_kokoro(self.played[2]))
+        self.assertEqual(self.kokoro_texts, [S2, S3])
+        self.assertEqual(self.srv.tts_texts(), [S1, S2])  # S3 never asked
+        self.assertIn("one voice per reply", self.out)
+
+    def test_a_kokoro_first_line_keeps_the_whole_reply_in_kokoro(self):
+        self.srv.fail_texts = {S1}
+        self.assertTrue(self.speak())
+        self.assertEqual(len(self.played), 3)
+        self.assertTrue(self.is_kokoro(
+            self.played[0][: -int(24000 * 0.15)]))   # before the sentence gap
+        self.assertTrue(self.is_kokoro(self.played[2]))
+        self.assertEqual(self.kokoro_texts, [S1, S2, S3])
+        self.assertEqual(self.srv.tts_texts(), [S1])
 
     def test_self_echo_is_remembered_before_the_first_play(self):
         self.speak(SHORT)
@@ -821,17 +834,17 @@ class HoldTests(_SpeakBase):
 
     def test_the_hold_is_bounded_and_a_miss_past_it_counts(self):
         # A wedged line: held for its budget past the time it was due, then
-        # Kokoro voices it (counted), and the line after it -- no longer in
-        # a clone-voiced reply -- is not held.
+        # Kokoro voices it (counted), and -- one voice per reply (owner,
+        # 2026-10-04) -- the rest of the reply stays in Kokoro, not held.
         self._p(self.bc, "VOICE_CLONE_TIMEOUT_S", 0.5)
         self.srv.latency_for = {S2: 5.0}
         t0 = time.monotonic()
         self.assertTrue(self.speak())
         self.assertLess(time.monotonic() - t0, 3.0)
         self.assertEqual([self.voice_of(a) for a in self.played],
-                         ["clone", "kokoro", "clone"], self.out)
-        self.assertEqual(self.kokoro_texts, [S2])
-        self.assertEqual(self.client.failures(), 0)   # S3 reset the streak
+                         ["clone", "kokoro", "kokoro"], self.out)
+        self.assertEqual(self.kokoro_texts, [S2, S3])
+        self.assertEqual(self.client.failures(), 1)   # S2's miss counted
         self.assertRegex(self.out, r"clone voice timed out after \d+ ms "
                                    r"\(look-ahead, deadline \d+\.\d s\); "
                                    r"Kokoro voices this line")
@@ -846,7 +859,7 @@ class HoldTests(_SpeakBase):
                                          tail_s=0.0, amp=0.3)}
         self.srv.latency_for = {S2: 3.0}
         self.speak()
-        self.assertEqual(self.kokoro_texts, [S2])
+        self.assertEqual(self.kokoro_texts, [S2, S3])   # one voice per reply
         self.assertEqual(self.client.failures(), 0)
         self.assertRegex(self.out, r"clone voice timed out after \d+ ms "
                                    r"\(look-ahead, deadline 0\.8 s, not "
