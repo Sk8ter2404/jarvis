@@ -9,6 +9,7 @@ plays audio, a mic turn in a voice that is confidently not the owner's is droppe
 from __future__ import annotations
 
 import unittest
+import weakref
 
 from core import learn_gate as lg
 from core import media_gate as mg
@@ -82,6 +83,26 @@ class PeakTests(unittest.TestCase):
         self.assertAlmostEqual(mg.pc_audio_peak((), sessions_fn=fn,
                                                 sleep=lambda s: None), 0.2)
         self.assertEqual(fn.cleaned, [True])
+
+    def test_meters_are_released_before_com_is_uninitialised(self):
+        # v2.0.180 review: the real cleanup runs CoUninitialize, so no meter
+        # may still be referenced by pc_audio_peak when it runs - a COM
+        # Release() after the thread's last CoUninitialize is a native
+        # crash risk (the music gate reads this every 2 s since v2.0.179).
+        refs, alive_at_cleanup = [], []
+
+        def fn():
+            out = [(7, _Meter(0.0, 0.3)), (8, _Meter(0.1))]
+            refs.extend(weakref.ref(pair[1]) for pair in out)
+
+            def _cleanup():
+                out.clear()                 # what the real cleanup does first
+                alive_at_cleanup.extend(r() is not None for r in refs)
+            return out, _cleanup
+        peak = mg.pc_audio_peak((), samples=2, sessions_fn=fn,
+                                sleep=lambda s: None)
+        self.assertAlmostEqual(peak, 0.3)
+        self.assertEqual(alive_at_cleanup, [False, False])
 
 
 class PlayingTests(unittest.TestCase):

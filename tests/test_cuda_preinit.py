@@ -158,8 +158,8 @@ class StdlibOnlyTests(unittest.TestCase):
 
     def test_ct2_host_is_stdlib_only(self):
         self.assertLessEqual(self._imports("core/ct2_host.py"),
-                             {"__future__", "queue", "threading", "time",
-                              "traceback"})
+                             {"__future__", "queue", "sys", "threading",
+                              "time", "traceback"})
 
 
 class LoadOrderTests(unittest.TestCase):

@@ -149,6 +149,37 @@ class RunTests(unittest.TestCase):
             t.join(10.0)
         self.assertEqual(peak[0], 1)
 
+    def test_the_host_survives_an_escape_from_its_own_loop(self):
+        # The host's own exit is the v2.0.179 abort: nothing that escapes a
+        # loop pass (here a SystemExit out of the queue read) may end it, and
+        # a job queued next is still served by the SAME thread.
+        ct2_host.run(lambda: None)
+        host = ct2_host.host_thread()
+        real_q = ct2_host._q
+
+        class _FlakyQ:
+            boom = 1
+
+            def get(self, timeout=None):
+                if _FlakyQ.boom:
+                    _FlakyQ.boom = 0
+                    raise SystemExit("escaped the host loop")
+                return real_q.get(timeout=timeout)
+
+            def put(self, item):
+                real_q.put(item)
+
+            def empty(self):
+                return real_q.empty()
+        with mock.patch.object(ct2_host, "_q", _FlakyQ()):
+            ran = []
+            ct2_host.run(lambda: ran.append(threading.current_thread()))
+            ct2_host.run(lambda: ran.append(threading.current_thread()))
+        self.assertEqual(_FlakyQ.boom, 0)       # the escape really happened
+        self.assertEqual(ran, [host, host])
+        self.assertTrue(host.is_alive())
+        self.assertIs(ct2_host.host_thread(), host)
+
     def test_run_for_cpu_is_inline(self):
         seen = []
         ct2_host.run_for("cpu", lambda: seen.append(threading.current_thread()))
@@ -180,6 +211,35 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(len(segs), 1)
         self.assertEqual(model.state_threads,
                          [threading.current_thread()] * 2)
+
+    def test_a_cuda_model_is_hosted_even_when_the_label_says_cpu(self):
+        # Review 2026-10-04: the probe reads _stt and _stt_device apart,
+        # outside the STT lock - a stale "cpu" label must not send a CUDA
+        # model's decode to the probe's own (exiting) thread.
+        model = FakeCT2Whisper()
+        model.model = types.SimpleNamespace(device="cuda")
+        box = _in_short_lived_thread(
+            lambda: ct2_host.decode(model, [0.0] * 16, "cpu", language="en"))
+        self.assertEqual(len(box["result"][0]), 1)
+        self.assertEqual({t.name for t in model.state_threads}, {"ct2-host"})
+
+    def test_a_cpu_model_with_a_cpu_label_stays_inline(self):
+        model = FakeCT2Whisper()
+        model.model = types.SimpleNamespace(device="cpu")
+        ct2_host.decode(model, [0.0] * 16, "cpu", language="en")
+        self.assertEqual(model.state_threads, [threading.current_thread()] * 2)
+
+    def test_model_device_never_raises(self):
+        class _Boom:
+            @property
+            def model(self):
+                raise RuntimeError("boom")
+        self.assertEqual(ct2_host.model_device(_Boom()), "")
+        self.assertEqual(ct2_host.model_device(mock.Mock()), "")
+        self.assertEqual(ct2_host.model_device(None), "")
+        self.assertEqual(ct2_host.model_device(
+            types.SimpleNamespace(model=types.SimpleNamespace(device="CUDA"))),
+            "cuda")
 
     def test_generator_is_closed_when_the_drain_raises(self):
         closed = []
@@ -220,6 +280,69 @@ class RetireTests(unittest.TestCase):
                 done.wait(0.05)
         self.assertEqual(len(freed_on), 1)
         self.assertEqual(freed_on[0].name, "ct2-host")
+
+    def _nudge_until(self, cond, rounds=80):
+        for _ in range(rounds):
+            if cond():
+                return True
+            ct2_host.run(lambda: None)          # nudge the host loop
+            threading.Event().wait(0.05)
+        return cond()
+
+    def test_another_holder_never_frees_it_on_its_own_thread(self):
+        # Review 2026-10-04: a probe that read _stt just before the drop
+        # still holds the model. The host must keep its reference until the
+        # probe lets go, so the LAST reference - and CTranslate2's teardown,
+        # which frees CUDA memory through a per-thread stream - goes on the
+        # host, never on the probe's exiting thread.
+        freed_on = []
+
+        class _Model:
+            pass
+        m = _Model()
+        weakref.finalize(m, lambda: freed_on.append(threading.current_thread()))
+        holder = [m]
+        released0 = ct2_host.stats()["released"]
+        with mock.patch.object(ct2_host, "_RETIRE_GRACE_S", 0.1):
+            ct2_host.retire(m)
+            del m
+            # Well past the grace: still held by the host, nothing freed.
+            self.assertFalse(self._nudge_until(lambda: bool(freed_on), rounds=10))
+            self.assertEqual(ct2_host.stats()["released"], released0)
+            _in_short_lived_thread(holder.clear, name="probe-stt")
+            self.assertEqual(freed_on, [])      # not on the probe's thread
+            self.assertTrue(self._nudge_until(lambda: bool(freed_on)))
+        self.assertEqual(freed_on[0].name, "ct2-host")
+
+    def test_a_dropped_model_is_released_before_the_next_job_runs(self):
+        # The job after a CUDA fault is typically the replacement's build:
+        # the dead model's VRAM (on a 4 GB 1650) must be free before it runs,
+        # not 2 s later (the original fixed grace).
+        freed = []
+
+        class _Model:
+            pass
+        m = _Model()
+        weakref.finalize(m, lambda: freed.append(threading.current_thread()))
+        ct2_host.retire(m)
+        del m
+        seen_by_next_job = ct2_host.run(lambda: list(freed))
+        self.assertEqual(len(seen_by_next_job), 1)
+        self.assertEqual(seen_by_next_job[0].name, "ct2-host")
+
+    def test_a_holder_that_never_lets_go_is_given_up_after_the_max_hold(self):
+        class _Model:
+            pass
+        m = _Model()
+        holder = [m]
+        released0 = ct2_host.stats()["released"]
+        with mock.patch.object(ct2_host, "_RETIRE_GRACE_S", 0.05), \
+                mock.patch.object(ct2_host, "_RETIRE_MAX_HOLD_S", 0.3):
+            ct2_host.retire(m)
+            del m
+            self.assertTrue(self._nudge_until(
+                lambda: ct2_host.stats()["released"] > released0))
+        self.assertEqual(len(holder), 1)        # still alive: freed as before
 
     def test_retire_none_is_a_no_op(self):
         before = ct2_host.stats()["retired"]

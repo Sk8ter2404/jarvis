@@ -40,23 +40,42 @@ CONTRACT
   plus the full drain of its segment generator in ONE host job; returns
   ``(segments_list, info)``.
 * ``retire(obj)``: drop the last reference to a CUDA model ON the host. The
-  caller hands it over and drops its own references at once; the host keeps
-  it for a short grace period (_RETIRE_GRACE_S - long enough for the caller's
-  except-block and locals to be gone) and then releases it, so CTranslate2's
-  teardown runs on the host. If something else still holds the model then,
-  it is freed wherever that last reference goes - exactly as before.
+  caller hands it over and drops its own references at once; the host lets
+  go of it as soon as it holds the ONLY reference (the caller's except-block,
+  its traceback frames and locals are gone), so CTranslate2's teardown runs
+  on the host. That is checked every _RETIRE_POLL_S and right before every
+  job - so a dropped model's VRAM is free before the job that builds its
+  replacement runs. If something else still holds the model (a
+  self-diagnostic probe that read ``_stt`` just before the drop), the host
+  keeps waiting - the other holder's drop then never frees it on the other
+  holder's (possibly exiting) thread - for at most _RETIRE_MAX_HOLD_S; past
+  that it lets go and the model is freed wherever its last reference goes,
+  exactly as before (review 2026-10-04: CTranslate2 frees CUDA memory
+  through a per-thread CUDA stream, so the thread that frees a model's last
+  tensor can own the same thread-exit state the decode did). The original
+  fixed 2 s grace is gone: it kept a dead model's VRAM on the 1650 while an
+  ambient decode 2.5 s later could already be building the replacement.
+* A decode is hosted when EITHER the caller's device label OR the model
+  itself says CUDA (``model_device``): a label read apart from the model
+  (the probe reads ``_stt`` and ``_stt_device`` separately, outside the STT
+  lock) can no longer send a CUDA model's decode to a thread that exits.
+* The host loop itself never ends: anything that escapes a pass is
+  swallowed and the loop goes on (its own exit is exactly the thread-exit
+  teardown this module exists to avoid).
 
 Stdlib only; never imports ctranslate2 itself.
 """
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 import traceback
 
 _THREAD_NAME = "ct2-host"
-_RETIRE_GRACE_S = 2.0         # a retired object is released this long after retire()
+_RETIRE_GRACE_S = 0.0         # minimum hold after retire() (0: sole-reference rule only)
+_RETIRE_MAX_HOLD_S = 60.0     # while others still hold it, keep it at most this long
 _RETIRE_POLL_S = 0.25
 _HOST_CHECK_S = 1.0           # how often a waiting caller checks the host is alive
 
@@ -104,9 +123,30 @@ def stats() -> dict:
     return dict(_stats)
 
 
+def _sole_ref_count() -> int:
+    """sys.getrefcount() of an object whose ONLY holder is a graveyard entry,
+    read through the same access path _drain_graveyard uses (measured, so an
+    interpreter that counts stack references differently stays correct)."""
+    entry = [object(), 0.0]
+    return sys.getrefcount(entry[0])
+
+
+_SOLE_REFS = _sole_ref_count()
+
+
+def _others_hold(entry) -> bool:
+    """True when something besides the graveyard still references the
+    retired object. Never raises (unknown = False: release as before)."""
+    try:
+        return sys.getrefcount(entry[0]) > _SOLE_REFS
+    except Exception:
+        return False
+
+
 def _drain_graveyard(now=None) -> None:
-    """Release retired objects whose grace period is over. Runs on the host
-    thread only."""
+    """Release retired objects that nothing else holds any more (or that have
+    waited _RETIRE_MAX_HOLD_S), once _RETIRE_GRACE_S has passed. Runs on the
+    host thread only."""
     while True:
         try:
             _graveyard.append(_graveyard_in.get_nowait())
@@ -117,7 +157,9 @@ def _drain_graveyard(now=None) -> None:
     now = time.monotonic() if now is None else now
     keep = []
     for entry in _graveyard:
-        if now - entry[1] >= _RETIRE_GRACE_S:
+        age = now - entry[1]
+        if age >= _RETIRE_GRACE_S and (age >= _RETIRE_MAX_HOLD_S
+                                       or not _others_hold(entry)):
             entry[0] = None            # the host's reference goes here
             _stats["released"] += 1
         else:
@@ -125,37 +167,53 @@ def _drain_graveyard(now=None) -> None:
     _graveyard[:] = keep
 
 
-def _loop() -> None:  # pragma: no cover - the daemon body; run() is tested through it
-    while True:
+def _loop_once() -> None:
+    """One pass of the host loop: wait for a job (or a graveyard tick), run
+    it, release what the graveyard may release."""
+    try:
+        job = _q.get(timeout=_RETIRE_POLL_S if (_graveyard or not
+                                                _graveyard_in.empty())
+                     else None)
+    except queue.Empty:
+        job = None
+    try:
+        _drain_graveyard()
+    except BaseException:           # a dequeued job must still run
+        pass
+    if job is None:
+        return
+    try:
+        job.result = job.fn(*job.args, **job.kwargs)
+    except BaseException as e:      # handed to the caller, never raised here
         try:
-            job = _q.get(timeout=_RETIRE_POLL_S if (_graveyard or not
-                                                    _graveyard_in.empty())
-                         else None)
-        except queue.Empty:
-            job = None
-        try:
-            _drain_graveyard()
-        except Exception:
+            traceback.clear_frames(e.__traceback__)
+        except BaseException:
             pass
-        if job is None:
-            continue
+        job.exc = e
+    finally:
         try:
-            job.result = job.fn(*job.args, **job.kwargs)
-        except BaseException as e:      # handed to the caller, never raised here
-            try:
-                traceback.clear_frames(e.__traceback__)
-            except Exception:
-                pass
-            job.exc = e
-        finally:
             _stats["jobs"] += 1
             job.fn = job.args = job.kwargs = None
-            job.done.set()
+        finally:
+            job.done.set()          # the caller is ALWAYS released
             job = None
+    try:
+        _drain_graveyard()
+    except BaseException:
+        pass
+
+
+def _loop() -> None:  # pragma: no cover - the daemon body; run() is tested through it
+    # NEVER returns and never raises: this thread's exit would run
+    # CTranslate2's thread-exit CUDA destructors - the v2.0.179 abort.
+    while True:
         try:
-            _drain_graveyard()
-        except Exception:
-            pass
+            _loop_once()
+        except BaseException:
+            try:
+                time.sleep(_RETIRE_POLL_S)
+            except BaseException:
+                pass
 
 
 def _ensure_started():
@@ -218,11 +276,29 @@ def _decode_job(model, audio, kwargs):
         gen = None
 
 
+def model_device(model) -> str:
+    """The device a faster-whisper model's CTranslate2 model really lives on
+    ("cuda" / "cpu", lower-case), or "" when it cannot be read (a fake, an
+    openai-whisper model). Reads a plain attribute - no CUDA call. Never
+    raises."""
+    try:
+        inner = getattr(model, "model", None)
+        if inner is None:
+            return ""
+        dev = getattr(inner, "device", None)
+        return dev.strip().lower() if isinstance(dev, str) else ""
+    except Exception:
+        return ""
+
+
 def decode(model, audio, device, /, **kwargs):
     """faster-whisper ``model.transcribe(audio, **kwargs)`` AND the drain of
-    its segment generator, in one call on the right thread (the host for a
-    CUDA ``device``). Returns ``(segments_list, info)``."""
-    return run_for(device, _decode_job, model, audio, kwargs)
+    its segment generator, in one call on the right thread: the host when the
+    caller's ``device`` label OR the model itself (model_device) says CUDA,
+    inline otherwise. Returns ``(segments_list, info)``."""
+    if is_cuda(device) or is_cuda(model_device(model)):
+        return run(_decode_job, model, audio, kwargs)
+    return _decode_job(model, audio, kwargs)
 
 
 def retire(obj) -> None:

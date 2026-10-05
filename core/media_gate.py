@@ -179,8 +179,14 @@ def pc_audio_peak(exclude_pids=(), *, samples: int = 4, interval_s: float = 0.02
     None when it cannot be read. A peak meter reports one device period, so it
     is sampled `samples` times `interval_s` apart (speech has gaps), stopping
     early once `stop_at` is reached. No active session = 0.0 without sampling.
-    pid 0 (system sounds) is never counted. Never raises."""
+    pid 0 (system sounds) is never counted. Never raises.
+
+    COM ORDER (v2.0.180 review): every meter reference held HERE is dropped
+    BEFORE the cleanup runs CoUninitialize - a Release() after this thread's
+    last CoUninitialize calls into an apartment that is gone. v2.0.179's music
+    gate made this a read every 2 s from the ambient worker as well."""
     cleanup = None
+    sessions = meters = m = None
     try:
         sessions, cleanup = (sessions_fn or _pycaw_sessions)()
         skip = {0}
@@ -209,6 +215,9 @@ def pc_audio_peak(exclude_pids=(), *, samples: int = 4, interval_s: float = 0.02
     except Exception:
         return None
     finally:
+        # Our references go first; the cleanup clears the session list and
+        # only then uninitialises COM (see COM ORDER above).
+        sessions = meters = m = None
         if cleanup is not None:
             try:
                 cleanup()
