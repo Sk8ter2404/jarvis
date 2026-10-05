@@ -17,12 +17,22 @@ Pins:
     MAX_FAILURES latency-critical misses in a row rest the clone for 5 min
     (doubling, capped at 30) with one log line per state change, then it is
     tried again; a success resets the count, rearm() ends it at once;
+  * probation: right after a cool-down ONE counted miss rests the clone
+    again (a dead or still-slow server costs one line per cool-down, not
+    three); a success, or a healthy half hour, ends it;
   * the needed-by deadline: a line rendered ahead may wait until it is
-    needed (never less than its budget), and a look-ahead line given up on
-    before it was needed does not count;
-  * the 10:36 replay: the live briefing pattern keeps the clone voice;
+    needed (never less than its budget), and -- once the reply speaks in
+    the clone (hold) -- up to its budget past that; a look-ahead line given
+    up on before it was needed does not count;
+  * a stopped reply (cancel) ends a render's wait at once, uncounted;
+  * hard errors (refused, HTTP, silent) always count; a background render
+    (count=False, the filler clips) never counts and never resets;
+  * the 10:36-10:37 replay (the briefing and the two one-line replies that
+    latched it, as the server logged them) and a short opener before a long
+    line: the live pattern keeps the clone voice;
   * the consent gate: the server is used only while it speaks the active
-    consented profile's reference (by hash);
+    consented profile's reference (by hash) -- re-checked after a
+    cool-down;
   * the cache answers a repeated line without a request.
 """
 from __future__ import annotations
@@ -39,8 +49,14 @@ from core import clone_voice_client as cvc
 from core import voice_clone as vc
 from core import sentence_tts as st
 from tests._clone_voice_fake import (LIVE_1036_AUDIO_S, LIVE_1036_LINES,
-                                     LIVE_1036_RENDER_S, FakeCloneServer,
-                                     ProfileDir, free_port, live_1036_server,
+                                     LIVE_1036_RENDER_S, LIVE_1037_AWAY,
+                                     LIVE_1037_AWAY_PIECES,
+                                     LIVE_1037_AWAY_RENDER_S,
+                                     LIVE_1037_MORNING,
+                                     LIVE_1037_MORNING_PIECES,
+                                     LIVE_1037_MORNING_RENDER_S,
+                                     FakeCloneServer, ProfileDir, free_port,
+                                     live_1036_server, live_1037_timings,
                                      make_wav)
 
 
@@ -410,6 +426,8 @@ class RenderTests(_Base):
         self.assertLess(time.monotonic() - t0, cvc.CONNECT_TIMEOUT_S + 0.5)
         self.assertFalse(out.ok)
         self.assertIn("ConnectionError", out.reason)
+        self.assertTrue(out.counted)               # a hard error counts
+        self.assertEqual(c.failures(), 1)
 
     def test_http_error_is_a_failure(self):
         c, srv = self.ready_client(self.server(tts_status=500))
@@ -423,6 +441,33 @@ class RenderTests(_Base):
         out = c.render("Hello.", 2.5)
         self.assertFalse(out.ok)
         self.assertIn("silent", out.reason)
+        self.assertTrue(out.counted)
+        self.assertEqual(c.failures(), 1)
+
+    def test_hard_errors_count_for_a_line_rendered_ahead_too(self):
+        # Refused, silent: the server is broken, however much audio was
+        # still queued ahead of the line.
+        silent = make_wav(lead_s=0.1, speech_s=0.0, tail_s=0.2)
+        c, srv = self.ready_client(self.server(wav=silent))
+        out = c.render("Ahead.", 2.5, needed_by=time.monotonic() + 20.0)
+        self.assertIn("silent", out.reason)
+        self.assertTrue(out.lookahead and out.counted)
+        srv.stop()
+        out = c.render("Ahead again.", 2.5,
+                       needed_by=time.monotonic() + 20.0)
+        self.assertIn("ConnectionError", out.reason)
+        self.assertTrue(out.lookahead and out.counted)
+        self.assertEqual(c.failures(), 2)
+
+    def test_a_server_that_is_gone_rests_the_clone_after_three_lines(self):
+        c, srv = self.ready_client()
+        srv.stop()
+        for i in range(cvc.MAX_FAILURES):
+            self.assertEqual(c.status()[0], "ready")
+            out = c.render(f"Anyone there {i}?", 2.5)
+            self.assertIn("ConnectionError", out.reason)
+        self.assertEqual(c.status()[0], "cooldown")
+        self.assertEqual(len([m for m in self.logs if "rests for" in m]), 1)
 
     def test_too_long_is_not_sent_and_not_a_failure(self):
         c, srv = self.ready_client()
@@ -615,8 +660,101 @@ class CooldownTests(_Base):
         self.assertEqual(self.c.status()[0], "idle")
         self.assertEqual(self.c.start(url=self.srv.url, cmd="",
                                       profile="butler"), "ready")
-        self.miss()
+        self.miss(1)                                   # no probation
+        self.assertEqual(self.c.status()[0], "ready")
+        self.miss(cvc.MAX_FAILURES - 1)
         self.assertAlmostEqual(self.c.cooldown_left_s(), 300.0)
+
+    # -- probation (2026-10-04 review) ---------------------------------------
+    def test_one_miss_right_after_a_cooldown_rests_the_clone_again(self):
+        # A server still slow or broken when the rest ends costs ONE more
+        # degraded line, not MAX_FAILURES of them, before the next rest.
+        self.miss()
+        self.now[0] += self.c.cooldown_left_s()
+        self.assertEqual(self.c.status()[0], "ready")
+        self.assertEqual(self.c.failures(), 0)
+        out = self.c.render("Still broken.", 2.5)
+        self.assertTrue(out.counted)
+        self.assertEqual(self.c.status()[0], "cooldown")
+        self.assertAlmostEqual(self.c.cooldown_left_s(), 600.0)   # doubled
+        rests = [m for m in self.logs if "rests for" in m]
+        self.assertEqual(len(rests), 2, self.logs)
+        self.assertIn("the first line after a cool-down missed too",
+                      rests[1])
+        self.assertIn("rests for 10 min", rests[1])
+
+    def test_a_success_ends_the_probation(self):
+        self.miss()
+        self.now[0] += self.c.cooldown_left_s()
+        self.srv.tts_status = 200
+        self.assertTrue(self.c.render("Back again.", 2.5).ok)
+        self.srv.tts_status = 500
+        self.miss(cvc.MAX_FAILURES - 1)
+        self.assertEqual(self.c.status()[0], "ready")
+        self.miss(1)
+        self.assertEqual(self.c.status()[0], "cooldown")
+        # Still within half an hour of the last rest: the doubling holds.
+        self.assertAlmostEqual(self.c.cooldown_left_s(), 600.0)
+
+    def test_the_probation_lapses_after_a_healthy_half_hour(self):
+        self.miss()
+        self.now[0] += self.c.cooldown_left_s()
+        self.assertEqual(self.c.status()[0], "ready")
+        self.now[0] += cvc.COOLDOWN_MAX_S
+        self.miss(1)
+        self.assertEqual(self.c.status()[0], "ready")
+        self.miss(cvc.MAX_FAILURES - 1)
+        self.assertAlmostEqual(self.c.cooldown_left_s(), 300.0)
+
+    def test_a_server_gone_when_the_rest_ends_costs_one_capped_connect(self):
+        self.miss()
+        self.srv.stop()                     # the server died meanwhile
+        self.now[0] += self.c.cooldown_left_s()
+        self.assertEqual(self.c.status()[0], "ready")
+        t0 = time.monotonic()
+        out = self.c.render("Anyone there?", 2.5)
+        self.assertLess(time.monotonic() - t0, cvc.CONNECT_TIMEOUT_S + 0.5)
+        self.assertIn("ConnectionError", out.reason)
+        self.assertEqual(self.c.status()[0], "cooldown")
+        self.assertAlmostEqual(self.c.cooldown_left_s(), 600.0)
+
+
+class CooldownEdgeTests(_Base):
+    def test_a_failure_from_a_render_in_flight_changes_nothing(self):
+        # A render that was already waiting when the cool-down began fails
+        # afterwards: no second log line, the rest is not doubled.
+        srv = self.server(tts_status=500,
+                          latency_for=lambda t: 1.0 if t == "In flight." else 0)
+        c, _ = self.ready_client(srv)
+        box = {}
+        th = threading.Thread(
+            target=lambda: box.setdefault("out", c.render("In flight.", 2.5)))
+        th.start()
+        time.sleep(0.1)
+        for i in range(cvc.MAX_FAILURES):
+            c.render(f"Quick miss {i}.", 2.5)
+        self.assertEqual(c.status()[0], "cooldown")
+        th.join(5.0)
+        self.assertEqual(box["out"].reason, "http 500")
+        self.assertEqual(c.status()[0], "cooldown")
+        self.assertEqual(len([m for m in self.logs if "rests for" in m]), 1,
+                         self.logs)
+        self.assertLessEqual(c.cooldown_left_s(), cvc.COOLDOWN_BASE_S)
+
+    def test_consent_revoked_during_a_cooldown_is_still_refused_after_it(self):
+        now = [2000.0]
+        c, srv = self.ready_client(self.server(tts_status=500),
+                                   clock=lambda: now[0])
+        for i in range(cvc.MAX_FAILURES):
+            c.render(f"Miss {i}.", 2.5)
+        self.assertEqual(c.status()[0], "cooldown")
+        import json
+        meta = os.path.join(self.prof.root, "butler", "meta.json")
+        with open(meta, "w", encoding="utf-8") as f:
+            json.dump({"name": "butler", "source": "character"}, f)
+        now[0] += cvc.COOLDOWN_BASE_S + cvc.PROFILE_TTL_S + 1
+        self.assertEqual(c.status()[0], "ready")      # the rest is over ...
+        self.assertFalse(c.usable_for("butler"))       # ... consent is not
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -639,9 +777,35 @@ class LineDeadlineTests(unittest.TestCase):
         wait, by_need = cvc.line_deadline_s(2.5, 1000.0, 100.0)
         self.assertEqual(wait, cvc.LOOKAHEAD_MAX_S)
         self.assertTrue(by_need)
+        self.assertEqual(cvc.line_deadline_s(2.5, 1000.0, 100.0, hold=True),
+                         (cvc.LOOKAHEAD_MAX_S, True))
+
+    def test_the_cap_never_shortens_the_budget(self):
+        # A long line at a long VOICE_CLONE_TIMEOUT_S (30 s allowed) has a
+        # budget above the cap; the cap must not cut it.
+        budget = cvc.render_budget_s(200, 30.0)
+        self.assertGreater(budget, cvc.LOOKAHEAD_MAX_S)
+        for hold in (False, True):
+            self.assertEqual(
+                cvc.line_deadline_s(budget, 140.0, 100.0, hold=hold),
+                (budget, False))
 
     def test_a_bad_needed_by_is_the_budget(self):
         self.assertEqual(cvc.line_deadline_s(2.5, "soon", 100.0), (2.5, False))
+        self.assertEqual(cvc.line_deadline_s(2.5, float("nan"), 100.0,
+                                             hold=True), (2.5, False))
+
+    def test_held_a_line_may_run_its_budget_past_the_time_it_is_needed(self):
+        # The reply already speaks in the clone: a pause no longer than the
+        # line's own budget beats a change of voice.
+        wait, by_need = cvc.line_deadline_s(2.5, 101.0, 100.0, hold=True)
+        self.assertAlmostEqual(wait, 1.0 + 2.5)
+        self.assertTrue(by_need)
+        # Not held: it must be back NEEDED_BY_MARGIN_S before it is needed.
+        self.assertEqual(cvc.line_deadline_s(2.5, 101.0, 100.0), (2.5, False))
+        # Needed already (the queue ran dry): the budget from now.
+        self.assertEqual(cvc.line_deadline_s(2.5, 99.0, 100.0, hold=True),
+                         (2.5, False))
 
 
 class LookAheadRenderTests(_Base):
@@ -675,6 +839,22 @@ class LookAheadRenderTests(_Base):
         self.assertTrue(out.counted)
         self.assertEqual(c.failures(), 1)
 
+    def test_a_lookahead_that_waited_until_needed_and_missed_counts(self):
+        # The wait was set by the needed-by time (not the budget, not the
+        # cap, not held) and the line still did not come back: it was due
+        # and Kokoro voices it mid-reply -- a counted miss.
+        c, srv = self.ready_client(self.server(tts_delay=2.0))
+        t0 = time.monotonic()
+        out = c.render("Due and missed.", 0.2,
+                       needed_by=t0 + cvc.NEEDED_BY_MARGIN_S + 0.4)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertFalse(out.ok)
+        self.assertTrue(out.lookahead and out.by_need)
+        self.assertFalse(out.held)
+        self.assertAlmostEqual(out.deadline_s, 0.4, delta=0.05)
+        self.assertTrue(out.counted)
+        self.assertEqual(c.failures(), 1)
+
     def test_a_lookahead_given_up_before_it_was_needed_does_not_count(self):
         c, srv = self.ready_client(self.server(tts_delay=3.0))
         with mock.patch.object(cvc, "LOOKAHEAD_MAX_S", 0.3):
@@ -705,6 +885,40 @@ class LookAheadRenderTests(_Base):
             self.assertTrue(out.counted)
         self.assertEqual(c.status()[0], "cooldown")
 
+    def test_a_held_line_waits_past_the_time_it_is_needed(self):
+        # The short-opener case: little audio queued, the line slower than
+        # its budget. Not held it goes to Kokoro; held (the reply already
+        # speaks in the clone) it is voiced late -- a pause, one voice.
+        c, srv = self.ready_client(self.server(tts_delay=0.45))
+        first = c.render("Not held.", 0.3, needed_by=time.monotonic() + 0.3)
+        self.assertFalse(first.ok)
+        self.assertFalse(first.held)
+        self.assertAlmostEqual(first.deadline_s, 0.3)
+        need = time.monotonic() + 0.3
+        out = c.render("Held.", 0.3, needed_by=need, hold=True)
+        self.assertTrue(out.ok, out.reason)
+        self.assertTrue(out.held and out.by_need)
+        self.assertGreater(out.deadline_s, 0.5)
+        self.assertGreater(out.late_s, 0.05)        # about 0.15 s of pause
+        self.assertEqual(c.failures(), 0)
+
+    def test_a_held_line_that_still_misses_counts(self):
+        c, srv = self.ready_client(self.server(tts_delay=3.0))
+        t0 = time.monotonic()
+        out = c.render("Held but hopeless.", 0.2, needed_by=t0 + 0.2,
+                       hold=True)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertFalse(out.ok)
+        self.assertTrue(out.held and out.counted)
+        self.assertEqual(c.failures(), 1)
+
+    def test_hold_means_nothing_for_a_first_line(self):
+        c, srv = self.ready_client(self.server(tts_delay=0.6))
+        out = c.render("First line.", 0.3, hold=True)
+        self.assertFalse(out.ok)
+        self.assertFalse(out.held)
+        self.assertAlmostEqual(out.deadline_s, 0.3)
+
     def test_the_rest_of_a_split_line_keeps_the_whole_lines_budget(self):
         c, srv = self.ready_client(self.server(tts_delay=0.45))
         rest = "the rest of a sentence."               # < BASE_CHARS
@@ -717,55 +931,292 @@ class LookAheadRenderTests(_Base):
         self.assertAlmostEqual(whole.deadline_s, 0.2 + 0.02 * 30)
 
 
+class BackgroundRenderTests(_Base):
+    """count=False (the filler clips, rendered after a turn while nobody
+    waits): an outcome that never touches the miss count, the probation or
+    the cool-down."""
+
+    def test_background_misses_never_rest_the_clone(self):
+        c, srv = self.ready_client(self.server(tts_delay=0.5))
+        for i in range(cvc.MAX_FAILURES + 1):
+            out = c.render(f"Filler {i}.", 0.1, count=False)
+            self.assertIn("timed out", out.reason)
+            self.assertFalse(out.counted)
+        srv.tts_delay = 0.0
+        srv.tts_status = 500
+        self.assertFalse(c.render("Filler error.", 2.5, count=False).counted)
+        srv.stop()
+        self.assertFalse(c.render("Filler gone.", 2.5, count=False).counted)
+        self.assertEqual(c.failures(), 0)
+        self.assertEqual(c.status(), ("ready", ""))
+        self.assertEqual(self.logs, [])
+
+    def test_a_background_success_does_not_reset_the_count(self):
+        srv = self.server()
+        c, _ = self.ready_client(srv)
+        srv.fail_texts = {"Answer 0.", "Answer 1."}
+        for i in range(2):
+            self.assertTrue(c.render(f"Answer {i}.", 2.5).counted)
+        self.assertTrue(c.render("Very good, sir.", 2.5, count=False).ok)
+        self.assertEqual(c.failures(), 2)     # says nothing about the answers
+
+
+class RecheckAfterCooldownTests(_Base):
+    """The consent gate across a cool-down: the server is checked again
+    before the first render after one, because whatever answers at the
+    address may have changed while the clone rested."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = [5000.0]
+        self.srv = self.server(tts_status=500)
+        self.c, _ = self.ready_client(self.srv, clock=lambda: self.now[0])
+        for i in range(cvc.MAX_FAILURES):
+            self.c.render(f"Miss {i}.", 2.5)
+        self.assertEqual(self.c.status()[0], "cooldown")
+        self.srv.tts_status = 200
+
+    def end_rest(self):
+        self.now[0] += self.c.cooldown_left_s()
+        self.assertEqual(self.c.status()[0], "ready")
+        self.logs.clear()
+
+    def test_a_server_with_another_voice_is_refused_after_the_rest(self):
+        self.srv.ref_sha = "f" * 64       # someone else's server, same port
+        self.end_rest()
+        out = self.c.render("Hello again.", 2.5)
+        self.assertFalse(out.ok)
+        self.assertEqual(out.reason, "not-ready")
+        self.assertEqual(self.srv.tts_texts()[-1:], ["Miss 2."])  # nothing new
+        self.assertEqual(self.c.status()[0], "down")
+        self.assertFalse(self.c.usable_for("butler"))
+        self.assertEqual(len([m for m in self.logs
+                              if "different voice prompt" in m]), 1, self.logs)
+
+    def test_a_server_that_hides_its_voice_is_refused_after_the_rest(self):
+        self.srv.ref_sha = ""
+        self.end_rest()
+        self.assertEqual(self.c.render("Hello again.", 2.5).reason,
+                         "not-ready")
+        self.assertEqual(self.c.status()[0], "down")
+
+    def test_the_same_voice_is_checked_once_then_used(self):
+        self.end_rest()
+        n = self.srv.count("GET", "/health")
+        self.assertTrue(self.c.render("Back again.", 2.5).ok)
+        self.assertTrue(self.c.render("And again.", 2.5).ok)
+        self.assertEqual(self.srv.count("GET", "/health"), n + 1)
+        self.assertEqual(self.c.status(), ("ready", ""))
+
+    def test_a_cache_hit_needs_no_check(self):
+        # The cache holds renders of the voice start() checked; serving one
+        # sends nothing, so there is nothing to check yet.
+        self.srv.tts_status = 200
+        c, srv = self.ready_client(self.server())
+        self.assertTrue(c.render("Very good, sir.", 2.5).ok)
+        c._recheck = True
+        n = srv.count("GET", "/health")
+        self.assertTrue(c.render("Very good, sir.", 2.5).cached)
+        self.assertEqual(srv.count("GET", "/health"), n)
+
+    def test_a_server_still_loading_is_a_counted_miss_and_checked_again(self):
+        self.srv.health_code = 503
+        self.end_rest()
+        out = self.c.render("Hello again.", 2.5)
+        self.assertIn("503", out.reason)
+        self.assertTrue(out.counted)
+        self.assertEqual(self.c.status()[0], "cooldown")   # probation
+        self.srv.health_code = 200
+        self.end_rest()
+        self.assertTrue(self.c.render("Hello at last.", 2.5).ok)
+
+
+class CancelTests(_Base):
+    """A reply stopped (a barge-in) while a line renders ahead: nothing will
+    play that line, so the wait ends at once and nothing is counted."""
+
+    def test_a_stopped_reply_ends_the_wait_at_once(self):
+        srv = self.server(latency_for=lambda t: 5.0 if t == "Slow." else 0.0)
+        srv.fail_texts = {"Miss 0.", "Miss 1."}
+        c, _ = self.ready_client(srv)
+        for i in range(2):
+            self.assertTrue(c.render(f"Miss {i}.", 2.5).counted)
+        stop = threading.Event()
+        timer = threading.Timer(0.2, stop.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        t0 = time.monotonic()
+        out = c.render("Slow.", 2.5, needed_by=t0 + 10.0, cancel=stop)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertEqual(out.reason, "cancelled")
+        self.assertTrue(out.cancelled)
+        self.assertFalse(out.ok or out.counted)
+        # Neither a miss nor a success: the streak is exactly where it was.
+        self.assertEqual(c.failures(), 2)
+        self.assertEqual(c.status()[0], "ready")
+
+    def test_an_already_stopped_reply_sends_nothing(self):
+        c, srv = self.ready_client()
+        stop = threading.Event()
+        stop.set()
+        out = c.render("Never sent.", 2.5, needed_by=time.monotonic() + 5,
+                       cancel=stop)
+        self.assertTrue(out.cancelled)
+        time.sleep(0.3)               # a request, had one gone out, lands
+        self.assertEqual(srv.tts_texts(), [])
+        self.assertEqual(srv.count("POST", "/tts"), 0)
+
+    def test_a_render_that_is_not_stopped_is_unchanged(self):
+        c, srv = self.ready_client(self.server(tts_delay=0.2))
+        out = c.render("Fine.", 2.5, needed_by=time.monotonic() + 1.0,
+                       cancel=threading.Event())
+        self.assertTrue(out.ok, out.reason)
+        slow = c.render("Too slow.", 0.1, cancel=threading.Event())
+        self.assertIn("timed out", slow.reason)
+        self.assertTrue(slow.counted)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  The live pattern of 2026-10-04 10:36, replayed (client + player)
 # ════════════════════════════════════════════════════════════════════════════
 class LiveReplayTests(_Base):
-    """The 7-sentence briefing that changed voice mid-reply and latched the
-    clone off: its measured render times (1.0-3.8 s) and audio lengths,
-    scaled by SCALE, through the REAL client against a serial fake server and
-    the REAL core.sentence_tts.play_pipelined. Kokoro is a marker; play
-    blocks for the audio's length, as the speaker does."""
+    """The replies that changed voice mid-reply and latched the clone off on
+    2026-10-04 (tests/_clone_voice_fake: the 10:36 briefing, then the two
+    one-line replies of 10:36:58 and 10:37:09): their render times and audio
+    lengths as the server logged them, scaled by SCALE, through the REAL
+    client against a serial fake server and the REAL
+    core.sentence_tts.play_pipelined (and plan_clone_chunks for the later
+    two). Kokoro is a marker; play blocks for the audio's length, as the
+    speaker does. The synth passes what the monolith's _speak_sentences
+    passes: the needed-by time, the chunk's budget, the reply's stop Event,
+    and hold once the line before was the clone's (the real wiring is
+    replayed in tests/monolith/test_monolith_clone_server).
 
-    SCALE = 0.15
+    What is replayed is the lines rendered AHEAD. The reply's first line
+    gets a generous budget (FIRST_TIMEOUT_S): a first line's own budget is
+    pinned elsewhere, and on a starved runner (measured: up to ~0.3 s of
+    extra round trip at 2x CPU oversubscription) its scaled 0.3 s margin
+    would make this test about scheduling instead. Every later line has the
+    shipped 2.5 s."""
 
-    def test_the_1036_briefing_keeps_the_clone_and_never_cools_down(self):
-        s = self.SCALE
-        srv = live_1036_server(self.prof.sha, s).start()
-        self.addCleanup(srv.stop)
-        c, _ = self.ready_client(srv)
+    SCALE = 0.2
+    FIRST_TIMEOUT_S = 10.0
+    KOKORO = 0.25                       # Kokoro's marker: a constant level
+
+    def replay(self, srv, lines, timeout_s=2.5, scale=None, client=None):
+        s = self.SCALE if scale is None else scale
+        c = client if client is not None else self.ready_client(srv)[0]
         voices = []
-        kokoro = 0.25                   # Kokoro's marker: a constant level
+        prev_clone = [None]
 
         def synth(text):
-            out = c.render(text, 2.5 * s, needed_by=st.needed_by())
+            need = st.needed_by()
+            budget = timeout_s if need is not None else self.FIRST_TIMEOUT_S
+            out = c.render(text, budget * s, needed_by=need,
+                           budget_chars=getattr(text, "budget_chars", None),
+                           hold=prev_clone[0] is True,
+                           cancel=st.reply_stopped())
+            prev_clone[0] = out.ok
             if out.ok:
                 return out.audio, out.sr
-            return np.full(int(24000 * 0.1), kokoro, np.float32), 24000
+            return np.full(int(24000 * 0.1), self.KOKORO, np.float32), 24000
 
         def play(audio, sr):
-            voices.append("kokoro" if np.allclose(audio, kokoro) else "clone")
+            voices.append("kokoro" if np.allclose(audio, self.KOKORO)
+                          else "clone")
             time.sleep(len(audio) / float(sr))
 
         with mock.patch.object(cvc, "PER_CHAR_S", cvc.PER_CHAR_S * s), \
              mock.patch.object(cvc, "NEEDED_BY_MARGIN_S",
                                cvc.NEEDED_BY_MARGIN_S * s):
-            res = st.play_pipelined(list(LIVE_1036_LINES), synth, play,
-                                    lambda: False)
+            res = st.play_pipelined(list(lines), synth, play, lambda: False)
+        return c, res, voices
+
+    def test_a_short_opener_then_a_long_line_keeps_one_voice(self):
+        # 10:36 lines 4 and 7 as one reply: a 23-char opener (1.6 s of
+        # audio), then the 114-char line that was slower than its budget at
+        # the shipped 2.5 s (3.76 s against 3.52 s). Only the opener's audio
+        # is queued ahead of it, so waiting until it is needed is not enough
+        # (995fad8: Kokoro mid-reply); the reply already speaks in the
+        # clone, so the line is held -- about 2 s of pause, then the clone.
+        # Scaled by 0.5 so the hold's margin (1.4 s live) survives a starved
+        # CI runner; the long line's own clip is cut short (nothing follows
+        # it, so its length changes nothing).
+        s = 0.5
+        lines = (LIVE_1036_LINES[3], LIVE_1036_LINES[6])
+        lat = {lines[0]: LIVE_1036_RENDER_S[3] * s,
+               lines[1]: LIVE_1036_RENDER_S[6] * s}
+        wavs = {lines[0]: make_wav(lead_s=0.0, speech_s=LIVE_1036_AUDIO_S[3] * s,
+                                   tail_s=0.0, amp=0.3),
+                lines[1]: make_wav(lead_s=0.0, speech_s=0.2, tail_s=0.0,
+                                   amp=0.3)}
+        srv = self.server(latency_for=lat, wav_for=wavs, serial=True)
+        c, res, voices = self.replay(srv, lines, scale=s)
+        self.assertEqual(res.sentences_played, 2)
+        self.assertEqual(voices, ["clone", "clone"])
+        self.assertEqual(c.failures(), 0)
+        # The premise: the long line really is slower than its budget, and
+        # than the time it was needed.
+        self.assertGreater(LIVE_1036_RENDER_S[6],
+                           cvc.render_budget_s(len(lines[1]), 2.5))
+        self.assertGreater(LIVE_1036_RENDER_S[6], LIVE_1036_AUDIO_S[3])
+
+    def test_the_1036_briefing_keeps_the_clone_and_never_cools_down(self):
+        s = self.SCALE
+        srv = live_1036_server(self.prof.sha, s).start()
+        self.addCleanup(srv.stop)
+        c, res, voices = self.replay(srv, LIVE_1036_LINES)
         self.assertEqual(res.sentences_played, 7)
         self.assertEqual(voices, ["clone"] * 7)        # no Kokoro switch
         self.assertEqual(c.failures(), 0)
         self.assertEqual(c.status(), ("ready", ""))   # no latch, no rest
         self.assertEqual(self.logs, [])
         self.assertEqual(srv.tts_texts(), list(LIVE_1036_LINES))
-        # The pattern really is the live one: lines 5-7 rendered slower than
-        # the fixed per-line budget -- the ones that switched voice live.
+        # The pattern really is the live one: only line 7 rendered slower
+        # than the fixed per-line budget -- the one Kokoro voiced live.
+        self.assertEqual([len(t) for t in LIVE_1036_LINES],
+                         [18, 33, 58, 23, 113, 93, 114])
         budgets = [cvc.render_budget_s(len(t), 2.5) for t in LIVE_1036_LINES]
         over = [i for i, (r, b) in enumerate(zip(LIVE_1036_RENDER_S, budgets))
                 if r > b]
-        self.assertEqual(over, [4, 5, 6])
+        self.assertEqual(over, [6])
         self.assertTrue(all(a > r for a, r in zip(LIVE_1036_AUDIO_S,
                                                   LIVE_1036_RENDER_S)))
+
+    def test_the_two_replies_that_latched_it_keep_one_voice(self):
+        # 10:36:58 (one 95-char sentence) and 10:37:09 (two short sentences,
+        # 100 chars): each missed its first-line budget live -- misses 2 and
+        # 3, the latch. Planned for the clone now (a clause head and the
+        # rest; sentence by sentence), the piece rendered ahead keeps the
+        # whole line's budget and is held for the clone, so each reply stays
+        # in one voice with no miss. (The pieces' render times are
+        # estimates, see tests/_clone_voice_fake.)
+        s = self.SCALE
+        srv = live_1036_server(self.prof.sha, s, later=True).start()
+        self.addCleanup(srv.stop)
+        c, _ = self.ready_client(srv)
+        for whole, pieces in ((LIVE_1037_AWAY, LIVE_1037_AWAY_PIECES),
+                              (LIVE_1037_MORNING, LIVE_1037_MORNING_PIECES)):
+            chunks = st.plan_clone_chunks(whole)
+            self.assertEqual(chunks, list(pieces))
+            self.assertEqual(chunks[1].budget_chars, len(whole))
+            _c, res, voices = self.replay(srv, chunks, client=c)
+            self.assertEqual(voices, ["clone", "clone"], whole)
+        self.assertEqual(c.failures(), 0)
+        self.assertEqual(c.status(), ("ready", ""))
+        self.assertEqual(self.logs, [])
+        # The premise: unsplit, each was slower than its first-line budget.
+        self.assertEqual((len(LIVE_1037_AWAY), len(LIVE_1037_MORNING)),
+                         (95, 100))
+        self.assertGreater(LIVE_1037_AWAY_RENDER_S,
+                           cvc.render_budget_s(len(LIVE_1037_AWAY), 2.5))
+        self.assertGreater(LIVE_1037_MORNING_RENDER_S,
+                           cvc.render_budget_s(len(LIVE_1037_MORNING), 2.5))
+        # ... while the second piece alone (no whole-line budget, not held)
+        # would miss too: the budget and the hold are both load-bearing.
+        rest_r, _a = live_1037_timings()[LIVE_1037_MORNING_PIECES[1]]
+        self.assertGreater(rest_r, cvc.render_budget_s(
+            len(LIVE_1037_MORNING_PIECES[1]), 2.5))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -838,10 +1289,30 @@ class VoiceCloneServerModelTests(_Base):
                 c.render(f"Miss {i}.", 2.5)
             self.assertIn("resting for about 5 more minutes",
                           vc.engine_hint())
+            self.assertIn("kept failing", vc.engine_hint())     # HTTP 500s
             now[0] += 250
             self.assertIn("about 1 more minute,", vc.engine_hint() + ",")
             now[0] += 50
             self.assertIn("isn't running or isn't ready", vc.engine_hint())
+
+    def test_engine_hint_says_why_the_clone_is_resting(self):
+        # Spoken by voice_clone_status: slow lines and a server that stopped
+        # answering are different stories.
+        for reason, words in (("timed out", "was too slow"),
+                              ("error (ConnectionError: cannot connect to "
+                               "127.0.0.1:1 (ConnectionRefusedError))",
+                               "stopped answering"),
+                              ("http 500", "kept failing")):
+            c = self.client()
+            with c._mu:
+                c._status, c._reason = "cooldown", reason
+                c._cool_until = c._clock() + 120.0
+            with mock.patch.object(vc, "_cfg_model",
+                                   return_value=cvc.MODEL_ID), \
+                 mock.patch.object(cvc, "CLIENT", c):
+                hint = vc.engine_hint()
+            self.assertIn(words, hint, reason)
+            self.assertIn("resting for about 2 more minutes", hint)
 
     def test_engine_hint_and_rearm(self):
         with mock.patch.object(vc, "_cfg_model", return_value=cvc.MODEL_ID):

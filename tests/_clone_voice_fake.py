@@ -233,34 +233,95 @@ class ProfileDir:
         self._tmp.cleanup()
 
 
-# ── The live pattern of 2026-10-04 10:36 (a 7-sentence briefing) ──────────
-# Line lengths, render times and audio lengths as the clone server logged
-# them that morning (rounded; the text is made up, the shape is not). Lines
-# 5-7 took longer than the fixed per-line budget (2.5 s + 0.03 s per char past
-# 80) although seconds of earlier audio were still queued: Kokoro voiced them
-# mid-reply and three misses in a row latched the clone off for the session.
+# ── The live pattern of 2026-10-04 10:36-10:37 ────────────────────────────
+# Taken from the clone server's own log of that morning (one render at a
+# time; "render" = its time on the server, "audio" = the clip's length) and
+# the JARVIS session log. The text is made up; every length is the live one
+# (normalised characters -- these lines contain nothing the normaliser
+# rewrites). The per-line budget then was 2.5 s + 0.03 s per char past 80.
+#
+#  * 10:36:25, a 7-sentence briefing. Lines 1-6 came back inside their
+#    budget; line 7 (114 chars) took 3.76 s against 3.52 s: Kokoro voiced it
+#    mid-reply -- miss 1.
+#  * 10:36:58, one sentence of 95 chars: 3.33 s against 2.95 s -- miss 2.
+#  * 10:37:09, two short sentences, 100 chars (under MIN_CHARS: ONE render):
+#    3.32 s against 3.10 s -- miss 3, and the clone latched off for the
+#    session ("hes still speaking with old voice").
 LIVE_1036_LINES = (
     "Good evening, sir.",
     "A quiet day on the voice channel.",
-    "Tomorrow looks mild, with a light breeze and grey skies.",
+    "Tomorrow looks mild, with a gentler breeze and grey skies.",
     "Today's headlines, sir.",
     "The city council has approved a new plan for the riverside park, and "
-    "work should begin early next spring, sir.",
+    "the work should begin late next spring, sir.",
     "Local schools will open an hour late on Monday while crews finish the "
     "repairs to the heating.",
-    "And finally, a team of university students is heading south to compete "
-    "in a national robotics challenge, sir.",
+    "And finally, a team of local university students is heading west to "
+    "compete in a national robotics challenge, sir.",
 )
-LIVE_1036_RENDER_S = (1.0, 1.4, 1.6, 1.1, 3.8, 3.5, 3.8)
-LIVE_1036_AUDIO_S = (1.24, 2.24, 4.64, 1.6, 6.16, 4.64, 6.44)
+LIVE_1036_RENDER_S = (1.016, 1.368, 2.218, 1.147, 2.962, 2.274, 3.761)
+LIVE_1036_AUDIO_S = (1.24, 2.24, 4.64, 1.60, 6.16, 4.64, 6.44)
+
+# The two one-line replies that followed (the misses that latched it).
+LIVE_1037_AWAY = ("While you were away, sir: the parcel you ordered was "
+                  "delivered and was left by the garage door.")
+LIVE_1037_AWAY_RENDER_S = 3.334
+LIVE_1037_AWAY_AUDIO_S = 5.40
+LIVE_1037_MORNING = ("Good morning, sir. It is just after eight, the air "
+                     "outside is cool and the sky is grey and overcast.")
+LIVE_1037_MORNING_RENDER_S = 3.318
+LIVE_1037_MORNING_AUDIO_S = 5.96
+
+# Since 2026-10-04 the clone voices those two in pieces: a clause head and
+# the rest, and sentence by sentence. Those pieces were never rendered live,
+# so their times are ESTIMATES: each line's measured render split as a fixed
+# cost per render (RENDER_FIXED_S, the intercept of a straight-line fit over
+# that morning's nine renders: 0.59 s + 0.025 s per char, +-0.5 s) plus the
+# rest of it shared by characters; its audio shared by characters.
+LIVE_1037_AWAY_PIECES = ("While you were away, sir:",
+                         "the parcel you ordered was delivered and was left "
+                         "by the garage door.")
+LIVE_1037_MORNING_PIECES = ("Good morning, sir.",
+                            "It is just after eight, the air outside is cool "
+                            "and the sky is grey and overcast.")
+RENDER_FIXED_S = 0.59
 
 
-def live_1036_server(ref_sha: str, scale: float) -> "FakeCloneServer":
+def piece_estimate(whole: str, render_s: float, audio_s: float,
+                   piece: str) -> tuple:
+    """(render s, audio s) estimated for `piece` of the live line `whole`."""
+    share = len(piece) / float(len(whole))
+    return (RENDER_FIXED_S + (render_s - RENDER_FIXED_S) * share,
+            audio_s * share)
+
+
+def live_1037_timings() -> dict:
+    """text -> (render s, audio s) for both later replies: the whole lines
+    as measured (what origin/main sent) and their pieces as estimated."""
+    out = {}
+    for whole, r, a, pieces in (
+            (LIVE_1037_AWAY, LIVE_1037_AWAY_RENDER_S, LIVE_1037_AWAY_AUDIO_S,
+             LIVE_1037_AWAY_PIECES),
+            (LIVE_1037_MORNING, LIVE_1037_MORNING_RENDER_S,
+             LIVE_1037_MORNING_AUDIO_S, LIVE_1037_MORNING_PIECES)):
+        out[whole] = (r, a)
+        for p in pieces:
+            out[p] = piece_estimate(whole, r, a, p)
+    return out
+
+
+def live_1036_server(ref_sha: str, scale: float,
+                     later: bool = False) -> "FakeCloneServer":
     """A serial fake server that renders the 10:36 lines with their measured
     render times and audio lengths, both multiplied by `scale` (a test runs
-    the pattern faster; every ratio is kept). Not started."""
-    lat = {t: r * scale for t, r in zip(LIVE_1036_LINES, LIVE_1036_RENDER_S)}
+    the pattern faster; every ratio is kept). `later` adds the two replies
+    of 10:36:58 and 10:37:09 (whole and in pieces). Not started."""
+    timings = {t: (r, a) for t, r, a in zip(
+        LIVE_1036_LINES, LIVE_1036_RENDER_S, LIVE_1036_AUDIO_S)}
+    if later:
+        timings.update(live_1037_timings())
+    lat = {t: r * scale for t, (r, _a) in timings.items()}
     wavs = {t: make_wav(lead_s=0.0, speech_s=a * scale, tail_s=0.0, amp=0.3)
-            for t, a in zip(LIVE_1036_LINES, LIVE_1036_AUDIO_S)}
+            for t, (_r, a) in timings.items()}
     return FakeCloneServer(ref_sha=ref_sha, latency_for=lat, wav_for=wavs,
                            serial=True)

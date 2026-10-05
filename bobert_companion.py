@@ -25002,17 +25002,25 @@ _voice_clone_inflight_lock = threading.Lock()
 #  tried again. Every speak contract lives in _speak / _speak_sentences above
 #  the engine and is unchanged: the speech lock, self-echo remember / refresh,
 #  the barge-in sequence checks, volume_scale, the prosody pin.
-#  Live budgeting (2026-10-04; a 7-sentence briefing changed voice mid-reply
-#  and three slow lines latched the clone off for the session):
+#  Live budgeting (2026-10-04; a briefing's last line went to Kokoro
+#  mid-reply, then two one-line replies each missed their first-line budget
+#  by a few tenths of a second, and those three misses latched the clone off
+#  for the session):
 #    * a sentence rendered AHEAD while earlier ones play may take until it
 #      is needed (core.sentence_tts.needed_by -> the client's deadline), not
-#      the fixed VOICE_CLONE_TIMEOUT_S budget a first line gets;
+#      only the fixed VOICE_CLONE_TIMEOUT_S budget a first line gets; and
+#      once the reply speaks in the clone (the sentence before it was
+#      clone), up to its budget PAST that moment -- a pause no longer than
+#      a first line may make the listener wait, instead of a voice change;
 #    * a long first line is split at a clause (_speech_chunks) so the first
-#      word comes sooner, and the rest of that sentence never switches to
-#      the clone after Kokoro voiced its head (_speak_sentences);
+#      word comes sooner; the rest of that sentence never switches to the
+#      clone after Kokoro voiced its head, and after a clone head it waits
+#      for the clone as above (_speak_sentences);
+#    * a reply stopped mid-render (a barge-in) drops the line the clone is
+#      still rendering ahead: no wait, no miss counted, no Kokoro render;
 #    * every clone line logs one "[tts] clone voice ..." line: its render
-#      ms, first line or look-ahead, the deadline it had, and whether Kokoro
-#      voiced it instead.
+#      ms, first line or look-ahead, the deadline it had, how late it came
+#      back, and whether Kokoro voiced it instead.
 # ──────────────────────────────────────────────────────────────────────────
 from core import clone_voice_client as _cvc  # noqa: E402
 from core import sentence_tts as _sentence_tts  # noqa: E402
@@ -25127,17 +25135,28 @@ def _clone_timeout_s() -> float:
 
 def _clone_line_tag(out) -> str:
     """'first line, deadline 2.5 s' / 'look-ahead, deadline 5.9 s' for the
-    per-line log. Never raises."""
+    per-line log, plus ', 0.8 s late' for a look-ahead line that came back
+    after the time it was needed (about that much pause was heard -- an
+    estimate) and ', not counted' for a miss that does not count toward the
+    cool-down. Never raises."""
     try:
         kind = "look-ahead" if out.lookahead else "first line"
         if out.cached:
             return f"{kind}, cached"
         tag = f"{kind}, deadline {float(out.deadline_s):.1f} s"
+        if out.ok and float(getattr(out, "late_s", 0.0) or 0.0) >= 0.1:
+            tag += f", {float(out.late_s):.1f} s late"
         if not out.ok and not out.counted:
             tag += ", not counted"
         return tag
     except Exception:
         return "?"
+
+
+# _clone_server_synth's answer for a line whose reply was stopped while the
+# clone rendered it: nothing will play it, so synthesise() voices it with
+# nobody (a short silence), not with Kokoro.
+_CLONE_DROPPED = object()
 
 
 def _clone_server_synth(text: str, wry_split, gain: float):
@@ -25148,8 +25167,14 @@ def _clone_server_synth(text: str, wry_split, gain: float):
 
     A line rendered ahead inside core.sentence_tts.play_pipelined carries
     its needed-by time (_sentence_tts.needed_by()) to the client, which then
-    waits until then instead of the fixed budget; the rest of a split first
-    line carries the whole line's budget (Chunk.budget_chars).
+    waits until then instead of the fixed budget -- or, when the line before
+    it was voiced by the clone (_TTS_PRESET_PIN.hold_clone, set by
+    _speak_sentences), up to its budget PAST then: a pause rather than a
+    change of voice mid-reply. It also carries the reply's stop Event
+    (_sentence_tts.reply_stopped()): a stopped reply ends the wait at once
+    and the line is dropped (_CLONE_DROPPED), not voiced by Kokoro. The rest
+    of a split first line carries the whole line's budget
+    (Chunk.budget_chars).
 
     Logs ONE line per attempted line ("[tts] clone voice ..."), notes
     [turn-timing] clone / clone_ms for the answer's first render, and sets
@@ -25159,16 +25184,21 @@ def _clone_server_synth(text: str, wry_split, gain: float):
             return None
         timeout_s = _clone_timeout_s()
         need = _sentence_tts.needed_by()
+        stopped = _sentence_tts.reply_stopped()
+        hold = (getattr(_TTS_PRESET_PIN, "value", None) is not None
+                and bool(getattr(_TTS_PRESET_PIN, "hold_clone", False)))
         budget_chars = getattr(text, "budget_chars", None)
         t0 = time.perf_counter()
         audio = None
         sr = 0
         if wry_split is not None:
             # Both clauses or neither: a half-rendered wry line must never
-            # ship head-only audio (same rule as the Kokoro branch).
+            # ship head-only audio (same rule as the Kokoro branch). A wry
+            # line is always voiced whole (_sentence_tts_plan never splits
+            # one), never rendered ahead, so it gets the plain budget.
             w_head, w_tail, pause_ms = wry_split
-            first = _cvc.CLIENT.render(w_head, timeout_s, needed_by=need)
-            last = (_cvc.CLIENT.render(w_tail, timeout_s, needed_by=need)
+            first = _cvc.CLIENT.render(w_head, timeout_s)
+            last = (_cvc.CLIENT.render(w_tail, timeout_s)
                     if first.ok else first)
             if first.ok and last.ok and first.sr == last.sr:
                 sr = first.sr
@@ -25180,10 +25210,18 @@ def _clone_server_synth(text: str, wry_split, gain: float):
                 out = last if first.ok else first
         else:
             out = _cvc.CLIENT.render(text, timeout_s, needed_by=need,
-                                     budget_chars=budget_chars)
+                                     budget_chars=budget_chars, hold=hold,
+                                     cancel=stopped)
             if out.ok:
                 audio, sr = out.audio, out.sr
         ms = int(round((time.perf_counter() - t0) * 1000.0))
+        if out.cancelled:
+            # The reply was stopped (a barge-in) while this line rendered
+            # ahead: nobody will hear it. Neither a miss nor a Kokoro render
+            # (which would only hold Kokoro's lock against the next reply).
+            print(f"  [tts] clone voice line dropped after {ms} ms: the "
+                  f"reply was stopped")
+            return _CLONE_DROPPED
         if out.attempted:
             _tt_note_stat("clone", 1 if audio is not None else 0)
             _tt_note_stat("clone_ms", ms)
@@ -25226,6 +25264,11 @@ def _clone_server_synth(text: str, wry_split, gain: float):
 #   "skip_kokoro" -- that rest-of-reply block: straight to the edge-tts ->
 #                    pyttsx3 -> SAPI5 ladder, in one voice, without paying the
 #                    stuck engine's timeout a second time.
+# Two clone voice server hints, also read only while .value is set (both set
+# and cleared by _speak_sentences):
+#   .no_clone   -- skip the clone: Kokoro voiced the start of this sentence
+#   .hold_clone -- the chunk before this one was voiced by the clone, so
+#                  this one may wait past its needed-by time for it
 _TTS_PRESET_PIN = threading.local()
 from core.sentence_tts import SentenceFallback as _SentenceFallback  # noqa: E402
 
@@ -25299,7 +25342,9 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
         # "skip_kokoro" rest-of-reply block: both engines already missed a
         # sentence of this reply. Skipped too for the rest of a sentence
         # whose clause head Kokoro voiced (_TTS_PRESET_PIN.no_clone, set by
-        # _speak_sentences): one sentence, one voice.
+        # _speak_sentences): one sentence, one voice. A line whose reply was
+        # stopped while the clone rendered it (_CLONE_DROPPED) is not handed
+        # to Kokoro either: nothing will play it.
         try:
             if (globals().get("VOICE_CLONE_ENABLED", False)
                     and _clone_server_selected()):
@@ -25307,6 +25352,8 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
                         pinned is not None
                         and getattr(_TTS_PRESET_PIN, "no_clone", False)):
                     _srv = _clone_server_synth(text, wry_split, gain)
+                    if _srv is _CLONE_DROPPED:
+                        return _silent_clip()   # nothing will play it
                     if _srv is not None:
                         return _srv
             elif globals().get("VOICE_CLONE_ENABLED", False):
@@ -39137,27 +39184,35 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
       render/play failure, the wait cap) is logged here and the reply counts
       as spoken -- those sentences WERE heard, so the streaming flush ledger
       must not voice them again.
-    * A render in flight on the worker when the reply is stopped finishes
-      after this returns (it cannot be cancelled) and is discarded; see
-      core/sentence_tts.py.
+    * A Kokoro render in flight on the worker when the reply is stopped
+      finishes after this returns (it cannot be cancelled) and is
+      discarded; a clone render stops waiting at once and is dropped
+      without a Kokoro render (see core/sentence_tts.py, reply_stopped).
     * `first_rendered` (audio, sr): sentence 1 as the filler pre-render
       (speed plan R3) made it, pinned to this same `pinned` preset. It gets
       the same volume_scale and is not rendered again. None = today.
       `first_clone`: whether the clone voice server voiced it (None: not
       known).
+    * Keeping one voice with the clone voice server: each chunk rendered
+      ahead carries its needed-by time to the clone
+      (core.sentence_tts.needed_by), and when the chunk before it was
+      voiced by the clone it may run up to its budget past that time
+      (_TTS_PRESET_PIN.hold_clone): a pause rather than a voice change.
     * A first line split at a clause (the clone engine, _speech_chunks):
-      the head is followed by CLAUSE_GAP_S instead of SENTENCE_GAP_S, and
-      when Kokoro voiced the head the rest of that sentence skips the clone
-      (_TTS_PRESET_PIN.no_clone) -- one sentence never changes voice
-      halfway. Each chunk rendered ahead carries its needed-by time to the
-      clone (core.sentence_tts.needed_by)."""
+      the head is followed by CLAUSE_GAP_S instead of SENTENCE_GAP_S; when
+      Kokoro voiced the head the rest of that sentence skips the clone
+      (_TTS_PRESET_PIN.no_clone), and when the clone voiced it the rest
+      waits for the clone as above. The plan is made while the clone is
+      active, so when Kokoro voices the head the sentence is still two
+      Kokoro renders joined by the clause pause."""
     global _barge_in_interrupted
     from core import sentence_tts as _st
     seq0 = _tts_interrupt_seq[0]
     barged = [False]
-    # Whether the clone voiced the clause head of a split first line (None:
-    # no split, or not known).
-    head_clone = [first_clone]
+    # Who voiced the chunk rendered last -- the one that plays right before
+    # the next (True: the clone; False: anything else; None: not known).
+    # The worker renders in order, so it is always the previous chunk's.
+    prev_clone = [first_clone]
 
     def _scaled(audio):
         if volume_scale != 1.0:
@@ -39170,21 +39225,26 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
 
     def _render(text, mode):
         clause = getattr(text, "clause", "")
-        no_clone = clause == "tail" and head_clone[0] is False
+        # The rest of a sentence keeps the voice of its start ...
+        no_clone = clause == "tail" and prev_clone[0] is False
+        # ... and once the reply speaks in the clone, the next line waits
+        # for the clone (bounded) rather than switch voice.
+        hold = prev_clone[0] is True
         _TTS_PRESET_PIN.value = pinned
         _TTS_PRESET_PIN.mode = mode
         _TTS_PRESET_PIN.no_clone = no_clone
+        _TTS_PRESET_PIN.hold_clone = hold
         try:
             if no_clone:
                 print("  [tts] clone voice skipped: Kokoro voiced the start "
                       "of this sentence, so it voices the rest")
             audio, sr = synthesise(text)
-            if clause == "head":
-                head_clone[0] = bool(getattr(_CLONE_LINE, "voiced", False))
+            prev_clone[0] = bool(getattr(_CLONE_LINE, "voiced", False))
         finally:
             _TTS_PRESET_PIN.value = None
             _TTS_PRESET_PIN.mode = None
             _TTS_PRESET_PIN.no_clone = False
+            _TTS_PRESET_PIN.hold_clone = False
         return _scaled(audio), sr
 
     _first_kw = {}
@@ -39226,16 +39286,19 @@ def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
     finally:
         _tts_reply_active[0] = False
         _audio_ducker.release()
+    # A clause split makes the first sentence two chunks: count "parts".
+    unit = ("parts" if getattr(chunks[0] if chunks else "", "clause", "")
+            == "head" else "sentences")
     if res.fell_back:
         print("  [tts] Kokoro missed a sentence; voiced the rest of the reply "
               "in one block on the fallback engine")
     if res.error is not None:
         print(f"  [speak] playback failed after {res.sentences_played}/"
-              f"{len(chunks)} sentences: {type(res.error).__name__}: "
+              f"{len(chunks)} {unit}: {type(res.error).__name__}: "
               f"{res.error}")
     elif res.stopped:
         print(f"  [tts] reply stopped after {res.sentences_played}/"
-              f"{len(chunks)} sentences")
+              f"{len(chunks)} {unit}")
     return res
 
 
@@ -39865,11 +39928,13 @@ def _filler_render(text: str):
     clone voice server while it is active (the clips must be in the voice
     that answers). Called only by ClipCache.warm while it holds _SPEAK_LOCK.
     Returns (float32 audio, sr) or None — never falls back to another
-    backend, never raises."""
+    backend, never raises. A clone render here is a background one
+    (count=False): nobody is waiting for it, so a miss never counts toward
+    the clone's cool-down (and a success never resets the count)."""
     try:
         kind = _tts_engine_kind()
         if kind == "clone":
-            out = _cvc.CLIENT.render(text, _clone_timeout_s())
+            out = _cvc.CLIENT.render(text, _clone_timeout_s(), count=False)
             res = (out.audio, out.sr) if out.ok else None
         elif kind == "kokoro":
             from core import kokoro_tts as _k

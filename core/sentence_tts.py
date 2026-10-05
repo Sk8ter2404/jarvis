@@ -26,18 +26,23 @@ The monolith injects `synth`, `play` and `should_stop` (the interrupt / mute
 check), so this module never touches sounddevice.
 
 One deliberate exception to "renders happen only while the speaker lock is
-held": when a reply is STOPPED, the render already in flight on the worker
-cannot be cancelled (a native ONNX run), so it finishes -- at most that one
-sentence -- after `play_pipelined` has returned, and its audio is discarded.
-The worker starts no further render once stopped. Joining it instead would add
-up to a sentence's render time to every barge-in before the mic reopens.
+held": when a reply is STOPPED, a Kokoro render already in flight on the
+worker cannot be cancelled (a native ONNX run), so it finishes -- at most that
+one sentence -- after `play_pipelined` has returned, and its audio is
+discarded. The worker starts no further render once stopped. Joining it
+instead would add up to a sentence's render time to every barge-in before the
+mic reopens. (A clone voice server render is an HTTP wait, which CAN be
+abandoned: `reply_stopped()` below.)
 
-The clone voice server (2026-10-04) adds two things, both inert for Kokoro:
+The clone voice server (2026-10-04) adds three things, all inert for Kokoro:
 
   * `needed_by()` -- while `play_pipelined` renders a chunk AHEAD of playback,
     the time that chunk will actually be needed (when the audio queued ahead
     of it runs out). A slow engine can wait that long instead of giving the
     line to a fallback voice mid-reply. None for a reply's first chunk.
+  * `reply_stopped()` -- for the same renders, an Event set once the reply
+    has ended (stopped, failed or finished): after that nothing will play
+    the chunk, so an engine that is still waiting can give up at once.
   * `plan_clone_chunks` -- a long first line is split at a clause boundary
     into a short head (first audio sooner) and the rest (rendered while the
     head plays), joined by a short pause (`Chunk.gap_s`).
@@ -53,7 +58,8 @@ from typing import Callable, List, Optional, Tuple
 __all__ = ["MIN_CHARS", "SENTENCE_GAP_S", "split_sentences", "plan_chunks",
            "play_pipelined", "PipelineResult", "SentenceFallback",
            "CLAUSE_SPLIT_MIN_CHARS", "CLAUSE_GAP_S", "Chunk",
-           "split_first_clause", "plan_clone_chunks", "needed_by"]
+           "split_first_clause", "plan_clone_chunks", "needed_by",
+           "reply_stopped"]
 
 # Below this many characters a reply is voiced whole, exactly as before: the
 # render of a short reply is already quick, and one play call is one stream.
@@ -181,7 +187,9 @@ def plan_chunks(text: str, min_chars: int = MIN_CHARS) -> List[str]:
 CLAUSE_SPLIT_MIN_CHARS = 70
 # The head is at least this long (no "Sir," on its own) ...
 HEAD_MIN_CHARS = 12
-# ... and leaves at least this much for the rest.
+# ... and leaves at least this much for the rest. (With the thresholds below
+# HEAD_MAX_FRAC already leaves a line over CLAUSE_SPLIT_MIN_CHARS a rest of
+# 24+ chars, so this only bites if those thresholds are ever lowered.)
 REST_MIN_CHARS = 20
 # Among the usable boundaries, the one whose head is nearest this share of
 # the line wins; a head longer than HEAD_MAX_FRAC of it saves too little.
@@ -194,6 +202,18 @@ CLAUSE_GAP_S = 0.05
 
 _CLAUSE_PUNCT = ",;:"
 _DASHES = "-–—"
+# A spaced dash between two of these is a range, not a clause break:
+# 'Monday - Friday', 'noon - 2 pm' (a number on both sides is one too).
+_RANGE_WORDS = frozenset({
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday", "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri",
+    "sat", "sun", "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december", "jan",
+    "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov",
+    "dec", "noon", "midnight",
+})
+_WORD_RE = re.compile(r"[^\s\-–—]+")
+_WORD_EDGE = ".,;:!?\"'()[]“”‘’"
 
 
 class Chunk(str):
@@ -241,19 +261,56 @@ def _is_abbreviation(token: str) -> bool:
 
 
 def _inside_quotes(head: str) -> bool:
-    """An opened quote or bracket is still open at the end of `head`."""
+    """An opened quote or bracket is still open at the end of `head`.
+
+    Single quotes double as apostrophes, so one between two letters
+    ("don't", "it’s") is not a quote mark. Any other straight ' counts both
+    ways (an odd number is open -- a possessive "students'" then reads as
+    open, which only costs a missed split); a curly ‘ opens and a ’ that is
+    not an apostrophe closes."""
+    straight = curly_close = 0
+    for k, c in enumerate(head):
+        if c not in "'’":
+            continue
+        prev = head[k - 1] if k > 0 else ""
+        nxt = head[k + 1] if k + 1 < len(head) else ""
+        if prev.isalpha() and nxt.isalpha():
+            continue                              # an apostrophe
+        if c == "'":
+            straight += 1
+        else:
+            curly_close += 1
     return (head.count('"') % 2 == 1
             or head.count("“") > head.count("”")
+            or straight % 2 == 1
+            or head.count("‘") > curly_close
             or head.count("(") > head.count(")")
             or head.count("[") > head.count("]"))
+
+
+def _range_end(word: str) -> bool:
+    """A word that can end a range: has a digit, or is a weekday, a month,
+    noon or midnight."""
+    w = word.strip(_WORD_EDGE).lower()
+    return any(c.isdigit() for c in w) or w in _RANGE_WORDS
+
+
+def _is_range_dash(text: str, i: int) -> bool:
+    """The dash at text[i] joins the two ends of a range or a score: a range
+    end within two words on BOTH sides -- '31 - 17', '2 pm - 4 pm',
+    '5 km - 8 km', 'Monday - Friday', 'noon - 2 pm'."""
+    before = _WORD_RE.findall(text[:i])[-2:]
+    after = _WORD_RE.findall(text[i + 1:])[:2]
+    return any(map(_range_end, before)) and any(map(_range_end, after))
 
 
 def _clause_candidates(text: str) -> List[Tuple[str, str]]:
     """Every (head, rest) split at a clause boundary that is safe to pause
     at: ', ' / '; ' / ': ', a spaced dash (' - ', ' – ', ' — ') or
     an em dash between words. Never inside a number ('1,500', '2:30',
-    '3, 4'), after an abbreviation ('e.g.,', 'a.m.,'), or inside quotes or
-    brackets. The punctuation stays with the head."""
+    '3, 4'), a range or a score ('3 - 5', '102 – 98', '2 pm - 4 pm',
+    'Monday - Friday'), after an abbreviation ('e.g.,', 'a.m.,'), or inside
+    quotes or brackets. The punctuation stays with the head."""
     out: List[Tuple[str, str]] = []
     n = len(text)
     for i, ch in enumerate(text):
@@ -272,6 +329,8 @@ def _clause_candidates(text: str) -> List[Tuple[str, str]]:
             joined = (ch == "—" and prev.isalpha() and nxt.isalpha())
             if not (spaced or joined):
                 continue                      # 'well-known', '5-3'
+            if _is_range_dash(text, i):
+                continue                      # '3 - 5', 'Monday - Friday'
         else:
             continue
         head = text[:i + 1].strip()
@@ -311,19 +370,25 @@ def plan_clone_chunks(text: str, min_chars: int = MIN_CHARS) -> List[str]:
     the first audio comes sooner --
 
       * a short reply of several sentences (one chunk for Kokoro) is voiced
-        sentence by sentence;
+        sentence by sentence, every sentence after the first a Chunk that
+        keeps the whole reply's render budget;
       * a first sentence still that long is split at a clause
         (split_first_clause) into a head Chunk (gap_s CLAUSE_GAP_S) and a
-        tail Chunk that keeps the whole sentence's render budget.
+        tail Chunk that keeps the whole sentence's render budget (the whole
+        reply's, when the sentence came from such a short reply).
 
-    Never used for Kokoro (its replies are planned by plan_chunks)."""
+    No piece ever gets less render budget than the unsplit text it came from
+    had as one render. Never used for Kokoro (its replies are planned by
+    plan_chunks)."""
     chunks = plan_chunks(text, min_chars)
     if not chunks or len(chunks[0]) <= CLAUSE_SPLIT_MIN_CHARS:
         return chunks
+    budget = len(chunks[0])
     if len(chunks) == 1:
         parts = split_sentences(chunks[0])
         if len(parts) > 1:
-            chunks = parts
+            chunks = [parts[0]] + [Chunk(p, budget_chars=budget)
+                                   for p in parts[1:]]
             if len(chunks[0]) <= CLAUSE_SPLIT_MIN_CHARS:
                 return chunks
     first = chunks[0]
@@ -332,7 +397,7 @@ def plan_clone_chunks(text: str, min_chars: int = MIN_CHARS) -> List[str]:
         return chunks
     head, rest = cut
     return ([Chunk(head, gap_s=CLAUSE_GAP_S, clause="head"),
-             Chunk(rest, budget_chars=len(first), clause="tail")]
+             Chunk(rest, budget_chars=max(budget, len(first)), clause="tail")]
             + list(chunks[1:]))
 
 
@@ -354,14 +419,24 @@ def needed_by() -> Optional[float]:
     return getattr(_render_ctx, "needed_by", None)
 
 
+def reply_stopped() -> Optional[threading.Event]:
+    """For a render running inside `play_pipelined`'s worker on THIS thread:
+    an Event set once the reply has ended -- stopped by the listener, failed,
+    or finished -- after which nothing will play the chunk being rendered.
+    An engine that waits on something it can abandon (the clone voice
+    server's HTTP reply) checks it and gives up at once; a native render
+    simply finishes and is discarded. None for a reply's first chunk (it is
+    rendered before playback starts, on the caller's thread) and for any
+    render outside play_pipelined."""
+    return getattr(_render_ctx, "stop", None)
+
+
 def _duration_s(audio, sr) -> float:
     """Seconds of `audio` at `sr`; 0.0 when it cannot be told. Never raises."""
     try:
         return max(0.0, float(len(audio)) / float(sr))
     except Exception:
         return 0.0
-
-
 
 
 class SentenceFallback(Exception):
@@ -423,8 +498,9 @@ def play_pipelined(
     * `should_stop()` is checked while waiting for the next render (every
       `poll_s`) and again right before each play; a True ends the reply there
       and tells the worker to START no further render. A render already in
-      flight finishes on the worker and is discarded (it cannot be cancelled;
-      the caller does not wait for it).
+      flight finishes on the worker and is discarded (the caller does not
+      wait for it); `reply_stopped()` lets an engine that can abandon its
+      wait do so at once.
     * `synth` may raise `SentenceFallback`: that chunk and all after it are
       rendered as one block by `synth_rest` (re-raised when it is None).
     * `pad(audio, sr)` is applied to every piece except the reply's last, so
@@ -442,8 +518,9 @@ def play_pipelined(
       default) renders chunk 1 here, exactly as before.
     * While the worker renders chunk i, `needed_by()` on its thread is when
       chunk i will be played: the end of the chunk playing now plus the
-      length of every rendered chunk waiting to play (padding included).
-      Chunk 1 is rendered with needed_by() None.
+      length of every rendered chunk waiting to play (padding included), and
+      `reply_stopped()` is the Event set when this call returns. Chunk 1 is
+      rendered with both None.
     """
     res = PipelineResult()
     if not chunks:
@@ -464,9 +541,11 @@ def play_pipelined(
         gap = getattr(chunks[last_i], "gap_s", None)
         return pad(audio, sr) if gap is None else pad(audio, sr, gap)
 
-    def _render(i: int, need: Optional[float] = None):
+    def _render(i: int, need: Optional[float] = None,
+                stopped: Optional[threading.Event] = None):
         """(audio, sr, chunks covered) for chunk i, padded unless last."""
         _render_ctx.needed_by = need
+        _render_ctx.stop = stopped
         try:
             try:
                 audio, sr = synth(chunks[i])
@@ -479,6 +558,7 @@ def play_pipelined(
                 covered = n - i
         finally:
             _render_ctx.needed_by = None
+            _render_ctx.stop = None
         return _padded(audio, sr, i + covered - 1), sr, covered
 
     if first_rendered is None:
@@ -487,6 +567,8 @@ def play_pipelined(
         f_audio, f_sr = first_rendered
         first = (_padded(f_audio, f_sr, 0), f_sr, 1)
     q: "queue.Queue" = queue.Queue()
+    # Set when this call returns (the finally below): the worker starts no
+    # further render, and a render in flight may abandon its wait.
     stop = threading.Event()
     next_i = first[2]
     # Chunk 1 starts playing right after the worker starts: set its end now,
@@ -504,7 +586,7 @@ def play_pipelined(
                     need = (max(time.monotonic(), sched["busy_until"])
                             + sched["queued_s"])
                 try:
-                    item = _render(i, need)
+                    item = _render(i, need, stop)
                 except BaseException as e:  # noqa: BLE001 - handed to caller
                     q.put(("err", e))
                     return

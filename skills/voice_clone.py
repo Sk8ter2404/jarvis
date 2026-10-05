@@ -194,7 +194,7 @@ def _set_voice_profile(name: str = "") -> str:
     _apply_runtime(enabled=True, profile=n)
     _persist(enabled=True, profile=n)
     # An explicit selection re-arms the clone voice server if it was down or
-    # latched off earlier this session (a no-op for the in-process engine).
+    # is cooling down after missed lines (a no-op for the in-process engine).
     _rearm(vc)
     engine_ready = False
     try:

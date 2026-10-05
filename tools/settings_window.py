@@ -798,11 +798,14 @@ SCHEMA: dict[str, dict] = {
     "VOICE_CLONE_TIMEOUT_S": {
         "tab": "voice", "label": "Clone voice line timeout (s)",
         "type": "float", "default": 2.5, "min": 0.5, "max": 30,
-        "help": "How long the first sentence of a reply may take on the "
-                "clone voice server before Kokoro voices it instead (long "
-                "sentences get 0.03 s more per character past 80). A "
-                "sentence rendered while earlier ones still play may take "
-                "until it is needed. Applies on the next start.",
+        "help": "The longest the listener waits in silence for the clone "
+                "voice before Kokoro voices a sentence instead (long "
+                "sentences get 0.03 s more per character past 80): before "
+                "the first sentence of a reply, and - once a reply speaks "
+                "in the clone voice - past the moment a later sentence is "
+                "due. A sentence prepared while earlier ones still play "
+                "also has until then. Shorter means fewer pauses but more "
+                "Kokoro sentences. Applies on the next start.",
     },
     "AUDIO_PROCESSING_ENABLED": {
         "tab": "hearing", "label": "Audio processing (master)", "type": "bool",

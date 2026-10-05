@@ -414,13 +414,21 @@ def engine_hint() -> str:
         try:
             from core import clone_voice_client as _cvc
             left = _cvc.CLIENT.cooldown_left_s()
+            why = str(_cvc.CLIENT.status()[1] or "")
         except Exception:
-            left = 0.0
+            left, why = 0.0, ""
         if left > 0.0:
             mins = max(1, int(round(left / 60.0)))
-            return (f"the clone voice server was too slow a few times in a "
-                    f"row, so it is resting for about {mins} more "
-                    f"minute{'s' if mins != 1 else ''}")
+            # Say what went wrong: the last miss's reason (a cool-down starts
+            # from refused connections as well as from slow lines).
+            if "timed out" in why:
+                what = "was too slow for several lines"
+            elif "Connection" in why or "connect" in why:
+                what = "stopped answering"
+            else:
+                what = "kept failing"
+            return (f"the clone voice server {what}, so it is resting for "
+                    f"about {mins} more minute{'s' if mins != 1 else ''}")
         return "the clone voice server isn't running or isn't ready"
     return "needs chatterbox-tts and a CUDA GPU"
 

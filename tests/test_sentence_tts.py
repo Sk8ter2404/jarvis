@@ -556,14 +556,60 @@ class ClauseSplitTests(unittest.TestCase):
         # Never right after an abbreviation.
         ("Your alarm is set for 7 a.m., and the coffee maker will start ten "
          "minutes before it rings, sir.", None),
+        ("Bring the chairs and the cooler and the blankets etc., and we will "
+         "set up near the lake by noon.", None),
         # Never inside quotes or brackets.
         ('He said "stop, wait, and listen to the whole thing before you '
          'decide" and then he left the room.', None),
         ("The plan (the long one, with the extra stops) still gets us home "
          "well before the late show starts.", None),
+        # ... single quotes too, straight or curly -- but an apostrophe
+        # between two letters is not a quote.
+        ("She said 'yes, absolutely, go ahead' and then left the room "
+         "without another word, sir.", None),
+        ("She said ‘yes, absolutely, go ahead’ and then left the room "
+         "without another word, sir.", None),
+        ("The shop's closing early, and the bakery next to it shuts in about "
+         "ten minutes from now.", "The shop's closing early,"),
+        ("The shop’s closing early, and the bakery next to it shuts in about "
+         "ten minutes from now.", "The shop’s closing early,"),
         # Never a hyphen inside a word.
         ("A well-known and long-standing tradition continues tonight in the "
          "square near the old town hall.", None),
+        # Never a spaced dash inside a range or a score (2026-10-04 review:
+        # "102 -" | "98 last night" read as two renders).
+        ("The home side won 102 - 98 last night in overtime, and the series "
+         "is now tied at two games apiece.",
+         "The home side won 102 - 98 last night in overtime,"),
+        ("Delivery should take 3 - 5 business days according to the "
+         "tracking page, so expect it around Thursday, sir.", None),
+        ("The score was 3 – 1 at halftime, and it finished 4 – 2 after a "
+         "late penalty in the ninetieth minute of play.",
+         "The score was 3 – 1 at halftime,"),
+        ("The match ended 2 — 2 after extra time and the replay is "
+         "scheduled for the second weekend of next month.", None),
+        # ... nor between two ends of a range a word away from the dash
+        # (2026-10-04 second review: "2 pm -" | "4 pm in the main room").
+        ("Your meeting runs from 2 pm - 4 pm in the main conference room on "
+         "the third floor, sir.", None),
+        ("The trail is roughly 5 km - 8 km long depending on the route you "
+         "take back to the car park.", None),
+        ("The office is open Monday - Friday from early morning until late "
+         "in the evening for walk-ins.", None),
+        ("The office is open Monday—Friday from early morning until late in "
+         "the evening for all visitors.", None),
+        ("It runs from noon - 2 pm on most days, and the queue usually "
+         "builds up quickly after that.",
+         "It runs from noon - 2 pm on most days,"),
+        # A number on ONE side only is no range: the dash is a clause break.
+        ("It cost 300 - a bargain for a coat that should last at least "
+         "another ten winters, sir.", "It cost 300 -"),
+        # Never right after an initial ("A. J.,").
+        ("The letter was signed by Dr. Adams and A. J., who both asked for "
+         "an answer before the end of the week.", None),
+        # A head over HEAD_MAX_FRAC of the line saves too little.
+        ("The new shelf brackets arrived this morning and they fit the "
+         "frame very well indeed, so the rest can wait.", None),
         # A head that would be too short ("Sir,") is no split.
         ("Sir, the forecast calls for light rain this afternoon and much "
          "cooler temperatures overnight.", None),
@@ -590,6 +636,18 @@ class ClauseSplitTests(unittest.TestCase):
         head, rest = st.split_first_clause(line)
         self.assertFalse(head.endswith("e.g.,"), head)
         self.assertEqual(head, "Bring the usual gear, e.g., a jacket,")
+
+    def test_an_em_dash_between_words_is_a_boundary(self):
+        # "mixed—light": no spaces, but an em dash between words is a
+        # clause break (a hyphen or en dash there is not).
+        line = ("The forecast is mixed—light rain this afternoon and then "
+                "clearing skies by the evening hours, sir.")
+        self.assertEqual(st.split_first_clause(line),
+                         ("The forecast is mixed—",
+                          "light rain this afternoon and then clearing skies "
+                          "by the evening hours, sir."))
+        for dash in ("-", "–"):
+            self.assertIsNone(st.split_first_clause(line.replace("—", dash)))
 
     def test_the_head_is_short_and_the_rest_is_not(self):
         for line, head in self.SPLITS:
@@ -646,16 +704,43 @@ class PlanCloneChunksTests(unittest.TestCase):
         self.assertGreater(len(text), st.CLAUSE_SPLIT_MIN_CHARS)
         self.assertLess(len(text), st.MIN_CHARS)
         self.assertEqual(st.plan_chunks(text), [text])        # Kokoro
-        self.assertEqual(st.plan_clone_chunks(text), [
+        chunks = st.plan_clone_chunks(text)
+        self.assertEqual(chunks, [
             "Good morning, sir.",
             "It is currently half past eight, and the sky is overcast."])
+        # The sentence after the first keeps the whole reply's budget: as
+        # one render the reply had that long (2026-10-04 second review --
+        # alone, 10:37's second sentence got 2.53 s where the reply had
+        # 3.10 s).
+        self.assertIsNone(getattr(chunks[0], "budget_chars", None))
+        self.assertEqual(chunks[1].budget_chars, len(text))
+
+    def test_no_piece_gets_less_budget_than_the_text_it_came_from(self):
+        # A short reply whose first sentence is itself long: the clause tail
+        # and the sentence after it both keep the WHOLE reply's budget.
+        text = self.LONG_FIRST + " Stay dry, sir."
+        self.assertLess(len(text), st.MIN_CHARS)
+        chunks = st.plan_clone_chunks(text)
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual([c.clause for c in chunks], ["head", "tail", ""])
+        self.assertEqual([c.budget_chars for c in chunks[1:]],
+                         [len(text), len(text)])
+        # A long reply (Kokoro's sentence plan already): the tail keeps its
+        # sentence's budget, the later sentences their own.
+        long_text = self.LONG_FIRST + " Bring an umbrella. The roads are clear."
+        chunks = st.plan_clone_chunks(long_text)
+        self.assertEqual(chunks[1].budget_chars, len(self.LONG_FIRST))
+        self.assertIsNone(getattr(chunks[2], "budget_chars", None))
 
     def test_short_or_unsplittable_lines_are_unchanged(self):
         for text in ("Right away, sir.",
+                     # Several sentences, but 70 chars or less: one render.
+                     "Very good, sir. The lights are off.",
                      "Right away, sir, the lamp is on and the door is shut.",
                      "A well-known and long-standing tradition continues "
                      "tonight in the square near the old town hall."):
             self.assertEqual(st.plan_clone_chunks(text), st.plan_chunks(text))
+            self.assertEqual(len(st.plan_clone_chunks(text)), 1, text)
         self.assertEqual(st.plan_clone_chunks("  "), [])
 
     def test_a_chunk_is_a_plain_string_to_everything_else(self):
@@ -667,73 +752,211 @@ class PlanCloneChunksTests(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  needed_by(): when a chunk rendered ahead will be played (2026-10-04)
+#  needed_by() / reply_stopped(): the schedule a chunk rendered ahead sees
 # ════════════════════════════════════════════════════════════════════════════
-class NeededByTests(unittest.TestCase):
-    """Audio is a list of N samples at SR samples/s, so its length is
-    N / SR seconds, and play blocks for that long as the speaker does."""
+class _Stage:
+    """play_pipelined on its own thread, driven one step at a time: the
+    synth of a chunk returns only once go(text) is called, and its play
+    lasts until release(text). Clip lengths are VIRTUAL (play never sleeps
+    for them), so clips of tens of seconds cost nothing and the schedule is
+    checked exactly -- no wall-clock tolerance to flake on a starved runner.
+    The 'audio' is a list of the chunk's text, SR items per second."""
 
     SR = 100
+    WAIT_S = 10.0
+
+    def __init__(self, test, durs, **kw):
+        self.durs = dict(durs)
+        self.go_ev = {t: threading.Event() for t in self.durs}
+        self.release_ev = {t: threading.Event() for t in self.durs}
+        self.rendering = {t: threading.Event() for t in self.durs}
+        self.playing = {t: threading.Event() for t in self.durs}
+        self.need = {}
+        self.stop_ev = {}
+        self.play_at = {}
+        self.res = None
+        self.kw = kw
+        self.th = None
+        test.addCleanup(self.finish)
+
+    def synth(self, text):
+        t = str(text)
+        self.need[t] = st.needed_by()
+        self.stop_ev[t] = st.reply_stopped()
+        self.rendering[t].set()
+        self.go_ev[t].wait(self.WAIT_S)
+        return [t] * int(round(self.durs[t] * self.SR)), self.SR
+
+    def play(self, audio, sr):
+        t = audio[0]
+        self.play_at[t] = time.monotonic()
+        self.playing[t].set()
+        self.release_ev[t].wait(self.WAIT_S)
+
+    def start(self, chunks):
+        def _run():
+            self.res = st.play_pipelined(chunks, self.synth, self.play,
+                                         lambda: False, **self.kw)
+        self.th = threading.Thread(target=_run, name="stage", daemon=True)
+        self.th.start()
+
+    def go(self, t):
+        self.go_ev[t].set()
+
+    def release(self, t):
+        self.release_ev[t].set()
+
+    def wait(self, ev, what):
+        if not ev.wait(self.WAIT_S):
+            raise AssertionError(f"timed out waiting for {what}")
+
+    def finish(self):
+        for ev in list(self.go_ev.values()) + list(self.release_ev.values()):
+            ev.set()
+        if self.th is not None:
+            self.th.join(self.WAIT_S)
+        _join_workers()
+
+
+class NeededByTests(unittest.TestCase):
+    """needed_by() while the worker renders chunk i = when chunk i will be
+    played: the end of the clip playing now plus every rendered clip still
+    waiting in the queue (padding included)."""
+
+    SR = 100
+    # How much earlier than the play call busy_until may be stamped (it is
+    # set just before play() runs): generous, the clips are 5-40 s long.
+    SLACK = 1.0
 
     def tearDown(self):
         _join_workers()
 
-    def _run(self, chunks, samples, render_s=0.0, pad=None, **kw):
-        seen = {}
-        plays = []
-
-        def synth(text):
-            seen[str(text)] = (st.needed_by(), time.monotonic())
-            if render_s:
-                time.sleep(render_s)
-            return ["x"] * samples[str(text)], self.SR
-
-        def play(audio, sr):
-            plays.append((time.monotonic(), len(audio) / sr))
-            time.sleep(len(audio) / sr)
-
-        st.play_pipelined(chunks, synth, play, lambda: False, pad=pad, **kw)
-        return seen, plays
+    def assertAbout(self, got, want, what):
+        # needed_by is stamped right BEFORE the play call it describes, so it
+        # may sit a little earlier than play_at-based arithmetic, never later.
+        self.assertLessEqual(got, want + 0.01, what)
+        self.assertGreater(got, want - self.SLACK, what)
 
     def test_outside_play_pipelined_it_is_none(self):
         self.assertIsNone(st.needed_by())
+        self.assertIsNone(st.reply_stopped())
 
-    def test_the_first_chunk_has_none_and_the_rest_count_the_queue(self):
-        seen, plays = self._run(["A.", "B.", "C."],
-                                {"A.": 40, "B.": 30, "C.": 10})
-        self.assertIsNone(seen["A."][0])
-        t_play1 = plays[0][0]
-        # B is needed when A (0.4 s) has played; C when A and B have.
-        self.assertAlmostEqual(seen["B."][0], t_play1 + 0.4, delta=0.08)
-        self.assertAlmostEqual(seen["C."][0], t_play1 + 0.7, delta=0.08)
-        # ... and they really were played about then.
-        self.assertAlmostEqual(plays[1][0], seen["B."][0], delta=0.1)
-        self.assertAlmostEqual(plays[2][0], seen["C."][0], delta=0.1)
-        self.assertIsNone(st.needed_by())      # cleared after every render
+    def test_the_queue_is_added_on_render_and_taken_off_on_play(self):
+        s = _Stage(self, {"A.": 10.0, "B.": 20.0, "C.": 30.0, "D.": 40.0})
+        s.go("A.")
+        s.start(["A.", "B.", "C.", "D."])
+        s.wait(s.playing["A."], "A to play")
+        s.wait(s.rendering["B."], "B's render")
+        # B: needed when A (10 s) has played; nothing queued yet.
+        self.assertAbout(s.need["B."], s.play_at["A."] + 10.0, "B")
+        s.go("B.")
+        s.wait(s.rendering["C."], "C's render")
+        # C: behind A and the rendered B (20 s) -- exactly B's length later
+        # than B's own needed-by (both read the same busy_until).
+        self.assertAlmostEqual(s.need["C."] - s.need["B."], 20.0, places=6)
+        # A ends: B is taken off the queue and plays; C is still rendering.
+        s.release("A.")
+        s.wait(s.playing["B."], "B to play")
+        s.go("C.")
+        s.wait(s.rendering["D."], "D's render")
+        # D: behind B (playing, 20 s) and the rendered C (30 s). B left the
+        # queue when it started, so it is counted once, not twice.
+        self.assertAbout(s.need["D."], s.play_at["B."] + 50.0, "D")
+        # The first chunk is rendered before playback starts: no needed-by,
+        # no stop Event.
+        self.assertIsNone(s.need["A."])
+        self.assertIsNone(s.stop_ev["A."])
+        for t in ("B.", "C.", "D."):
+            self.assertFalse(s.stop_ev[t].is_set(), t)
+        s.go("D.")
+        for t in ("B.", "C.", "D."):
+            s.release(t)
+        s.th.join(s.WAIT_S)
+        self.assertEqual(s.res.sentences_played, 4)
+        # The reply is over: a render still holding the Event sees it set.
+        self.assertTrue(s.stop_ev["D."].is_set())
+        self.assertIs(s.stop_ev["B."], s.stop_ev["D."])
 
     def test_padding_counts(self):
-        seen, plays = self._run(["A.", "B."], {"A.": 20, "B.": 10},
-                                pad=lambda a, sr: list(a) + ["-"] * 30)
-        self.assertAlmostEqual(seen["B."][0], plays[0][0] + 0.5, delta=0.08)
+        s = _Stage(self, {"A.": 10.0, "B.": 5.0},
+                   pad=lambda a, sr: list(a) + ["-"] * (3 * sr))
+        s.go("A.")
+        s.go("B.")
+        s.start(["A.", "B."])
+        s.wait(s.rendering["B."], "B's render")
+        s.wait(s.playing["A."], "A to play")
+        self.assertAbout(s.need["B."], s.play_at["A."] + 13.0, "B")
+        s.release("A.")
+        s.release("B.")
+
+    def test_a_prerendered_first_chunk_counts(self):
+        s = _Stage(self, {"P.": 6.0, "B.": 5.0},
+                   first_rendered=(["P."] * 600, 100))
+        s.go("B.")
+        s.start(["P.", "B."])
+        s.wait(s.playing["P."], "P to play")
+        s.wait(s.rendering["B."], "B's render")
+        self.assertNotIn("P.", s.need)          # never rendered again
+        self.assertAbout(s.need["B."], s.play_at["P."] + 6.0, "B")
+        s.release("P.")
+        s.release("B.")
+
+    def test_a_clip_that_already_ended_counts_from_now(self):
+        # A's clip (10 ms of virtual audio) "ended" long ago, but its real
+        # play is still running (stream setup, a slow device): the next
+        # chunk is needed from NOW plus what is queued, never from a moment
+        # already in the past (that would cut its wait short).
+        s = _Stage(self, {"A.": 0.01, "B.": 5.0, "C.": 3.0})
+        s.go("A.")
+        s.start(["A.", "B.", "C."])
+        s.wait(s.playing["A."], "A to play")
+        s.wait(s.rendering["B."], "B's render")
+        time.sleep(0.6)
+        go_at = time.monotonic()
+        s.go("B.")
+        s.wait(s.rendering["C."], "C's render")
+        # A is still 'playing' (not released), so B is still queued.
+        self.assertGreaterEqual(s.need["C."], go_at + 5.0)
+        s.go("C.")
+        for t in ("A.", "B.", "C."):
+            s.release(t)
 
     def test_a_late_render_is_needed_now(self):
         # Rendering slower than playback: the queue runs dry, so the next
         # chunk is needed at once (no slack to wait for).
-        seen, plays = self._run(["A.", "B.", "C."],
-                                {"A.": 5, "B.": 5, "C.": 5}, render_s=0.2)
-        self.assertLess(seen["C."][0] - seen["C."][1], 0.06)
-
-    def test_a_prerendered_first_chunk_counts(self):
         seen = {}
 
         def synth(text):
+            seen[text] = (st.needed_by(), time.monotonic())
+            time.sleep(0.2)
+            return ["x"] * 5, self.SR
+        st.play_pipelined(["A.", "B.", "C."], synth,
+                          lambda a, sr: time.sleep(len(a) / sr),
+                          lambda: False)
+        self.assertLess(seen["C."][0] - seen["C."][1], 0.06)
+
+    def test_never_later_than_the_real_play_when_renders_fall_behind(self):
+        # Real time end to end: 7 clips of 0.4 s, the last four rendered
+        # slower (0.7 s) than they play, so later renders start after
+        # earlier clips have left the queue. needed_by must never be LATER
+        # than the real play (then a line would wait after the speaker had
+        # gone quiet); earlier is the safe side (each real play also pays
+        # stream setup), so a busy runner cannot make this flake.
+        seen = {}
+        plays = {}
+        texts = [f"S{i}." for i in range(7)]
+
+        def synth(text):
             seen[text] = st.needed_by()
-            return ["x"] * 10, self.SR
-        t0 = time.monotonic()
-        st.play_pipelined(["A.", "B."], synth, lambda a, sr: time.sleep(0.6),
-                          lambda: False, first_rendered=(["x"] * 60, self.SR))
-        self.assertNotIn("A.", seen)
-        self.assertAlmostEqual(seen["B."], t0 + 0.6, delta=0.08)
+            time.sleep(0.7 if texts.index(text) >= 3 else 0.0)
+            return [text] * 40, self.SR
+
+        def play(audio, sr):
+            plays[audio[0]] = time.monotonic()
+            time.sleep(len(audio) / sr)
+        st.play_pipelined(texts, synth, play, lambda: False)
+        for t in texts[1:]:
+            self.assertLessEqual(seen[t], plays[t] + 0.05, t)
 
     def test_a_clause_head_is_padded_with_its_own_gap(self):
         calls = []
@@ -752,6 +975,40 @@ class NeededByTests(unittest.TestCase):
         st.play_pipelined([head, tail], rec.synth, rec.play, lambda: False,
                           pad=pad, first_rendered=(["H"], 24000))
         self.assertEqual(calls, [0.05])
+
+
+class ReplyStoppedTests(unittest.TestCase):
+    """reply_stopped(): the Event a render running ahead can watch -- set
+    the moment the reply is stopped, so an engine waiting on something it
+    can abandon (the clone server's HTTP reply) gives up at once."""
+
+    def tearDown(self):
+        _join_workers()
+
+    def test_a_stop_sets_it_while_the_render_is_still_in_flight(self):
+        stop_now = threading.Event()
+        in_flight = threading.Event()
+        box = {}
+
+        def synth(text):
+            if text == "Two.":
+                box["ev"] = st.reply_stopped()
+                in_flight.set()
+                # The engine's wait: ends as soon as the reply is stopped.
+                box["saw_stop"] = box["ev"].wait(5.0)
+            return ["x"], 100
+
+        def play(audio, sr):
+            in_flight.wait(5.0)
+            stop_now.set()                    # the listener barges in
+        t0 = time.monotonic()
+        res = st.play_pipelined(["One.", "Two.", "Three."], synth, play,
+                                stop_now.is_set)
+        _join_workers()
+        self.assertTrue(res.stopped)
+        self.assertTrue(box["saw_stop"])
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertIsNone(st.reply_stopped())   # cleared on every thread
 
 
 if __name__ == "__main__":
