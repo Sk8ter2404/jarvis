@@ -1585,9 +1585,15 @@ class R1WiringTests(_Base):
                         src.index("_audio_ducker.duck()"))
         self.assertEqual(src.count("_tt_open0 = "), 1)
         self.assertEqual(src.count("_tt_note_out_latency(_stream)"), 2)
-        self.assertEqual(src.count("_play_audio_safe()\n"
-                                   "            _tt_note_elapsed("
-                                   "\"play_open_ms\", _tt_open0)"), 2)
+        # Both branches note the open through the ONE helper (play_open_ms
+        # plus the reply's opens / opens_ms), and only when a stream was
+        # opened (PLAYBACK_KEEPER review 2026-10-05: a line cut before its
+        # open opens nothing).
+        self.assertEqual(src.count("_opened = _play_audio_safe()\n"
+                                   "            if _opened:\n"
+                                   "                _tt_note_play_open("
+                                   "_tt_open0)"), 2)
+        self.assertEqual(src.count("_tt_note_play_open("), 2)
         self.assertEqual(src.count("args=(_stream, _done_evt, audio_secs)"),
                          2)
 

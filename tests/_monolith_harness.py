@@ -841,7 +841,9 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         # an OutputStream asynchronously - it could outlive a test's patch of
         # bc.sd. Every test runs with it OFF (and _keeper_open_stream itself
         # refuses under a test run behind that); a keeper test turns it on
-        # with its own fakes. Restored, and the keeper switched off, below.
+        # with its own fakes, and test_monolith_keeper_on_slices re-runs the
+        # audio-path classes with it ON. Restored, and the keeper switched
+        # off, below.
         _saved_keeper = getattr(bc, "PLAYBACK_KEEPER", None)
         if _saved_keeper is not None:
             bc.PLAYBACK_KEEPER = "off"

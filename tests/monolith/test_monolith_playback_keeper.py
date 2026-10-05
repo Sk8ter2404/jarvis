@@ -17,7 +17,17 @@ around it:
   * the keeper never opens a real device under a test run, and its stream
     is a plain zero-filled OutputStream;
   * the primed stream plays every frame, ends with CallbackStop (never during
-    priming) and goes to the same reaper; its -9999 fallback is sd.play's.
+    priming) and goes to the same reaper; its -9999 fallback is sd.play's;
+  * review fixes (2026-10-05), with the REAL keeper in the REAL play body:
+    a playback's own open never overlaps a keeper open or close (a speaker
+    change, a cold open, a reopen that falls due mid-open), the wait is the
+    bounded READY_WAIT_S one, a line cut during that wait opens nothing, a
+    hold taken mid-refresh never gets the pre-reinit index, the exit hook
+    waits for the keeper's close before sounddevice terminates PortAudio,
+    and every open of a reply is counted (opens / opens_ms).
+
+The existing audio-path classes are re-run with the keeper ON in
+tests/monolith/test_monolith_keeper_on_slices.py.
 
 No real audio device is touched: sd is a fake everywhere, and
 _keeper_open_stream refuses under a test run.
@@ -42,13 +52,15 @@ except ImportError:      # light runner: every class below is skipped
 
 
 class _FakeKeeper:
-    """Stands in for bc._playback_keeper: records calls, never threads."""
+    """Stands in for bc._playback_keeper: records calls, never threads.
+    ``on_wait`` runs inside the playback's wait (a barge-in arriving then)."""
 
-    def __init__(self, live=True):
+    def __init__(self, live=True, on_wait=None):
         self.enabled = True
         self.live = live
         self.calls = []
         self._tok = 0
+        self.on_wait = on_wait
 
     def set_enabled(self, on):
         self.calls.append(("set_enabled", bool(on)))
@@ -64,7 +76,18 @@ class _FakeKeeper:
 
     def wait_settled(self, timeout):
         self.calls.append(("wait_settled", timeout))
+        if self.on_wait is not None:
+            self.on_wait()
         return True
+
+    def enter_play_open(self, timeout):
+        self.calls.append(("enter_play_open", timeout))
+        if self.on_wait is not None:
+            self.on_wait()
+        return 41, True
+
+    def exit_play_open(self, tok):
+        self.calls.append(("exit_play_open", tok))
 
     def is_live(self):
         return self.live
@@ -405,11 +428,27 @@ class PlaybackBodyTests(_PlayBase):
         stats = []
         self._p(bc, "_tt_note_stat",
                 side_effect=lambda n, v: stats.append((n, v)))
+        enter_names = []
+        fake_enter = fake.enter_play_open
+
+        def _enter(timeout):
+            enter_names.append(list(order))
+            return fake_enter(timeout)
+        fake.enter_play_open = _enter
         bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
         names = fake.names()
         self.assertEqual(fake_sd.play_calls, [(240, 24000, 6)])
         self.assertIn(("begin", 6, 1), fake.calls)
-        self.assertLess(names.index("begin"), names.index("wait_settled"))
+        self.assertLess(names.index("begin"), names.index("enter_play_open"))
+        # The wait is the bounded READY_WAIT_S one (not 0, not unbounded) ...
+        from core import playback_keeper as pk
+        self.assertIn(("enter_play_open", pk.READY_WAIT_S), fake.calls)
+        # ... it runs BEFORE sd.play, and the mark is lifted after it.
+        self.assertEqual(enter_names, [[]])
+        self.assertEqual(order, ["sd.play"])
+        self.assertIn(("exit_play_open", 41), fake.calls)
+        self.assertLess(names.index("enter_play_open"),
+                        names.index("exit_play_open"))
         self.assertIn(("end", 1), fake.calls)
         self.assertIn(("keeper", 1), stats)
         self.assertIn("note_play", names)
@@ -440,6 +479,7 @@ class PlaybackBodyTests(_PlayBase):
         self.assertEqual(fake_sd.play_calls, [(240, 24000, 6)])
         self.assertNotIn("begin", fake.names())
         self.assertNotIn("wait_settled", fake.names())
+        self.assertNotIn("enter_play_open", fake.names())
         self.assertFalse([s for s in stats if s[0] == "keeper"])
 
     def test_a_muted_play_holds_nothing(self):
@@ -707,6 +747,351 @@ class PrimedPlaybackTests(_PlayBase):
         self.assertEqual(opened, [6, None])
         self.assertEqual(fake_sd.play_calls, [])
         self.assertEqual([c[0] for c in own.calls], ["stop", "close"])
+
+
+class _KeeperRig:
+    """A REAL PlaybackKeeper wired the monolith's way (claim / release through
+    bc's owner cell), with a fake stream factory that records the interval of
+    every native call, so a test can prove no keeper call overlaps a
+    playback's own open."""
+
+    def __init__(self, bc, open_delay=0.0, close_delay=0.0, **kw):
+        from core import playback_keeper as pk
+        self.spans = []
+        self.lock = threading.Lock()
+        self.open_delay = open_delay
+        self.close_delay = close_delay
+        rig = self
+
+        class _St:
+            def __init__(self, dev):
+                self.dev = dev
+
+            def abort(self, ignore_errors=True):
+                t0 = time.monotonic()
+                rig.span("abort", self.dev, t0)
+
+            def close(self, ignore_errors=True):
+                t0 = time.monotonic()
+                if rig.close_delay:
+                    time.sleep(rig.close_delay)
+                rig.span("close", self.dev, t0)
+
+        def _open(dev):
+            t0 = time.monotonic()
+            if rig.open_delay:
+                time.sleep(rig.open_delay)
+            rig.span("open", dev, t0)
+            return _St(dev)
+
+        self.keeper = pk.PlaybackKeeper(
+            open_stream=_open, claim=lambda: bc._keeper_claim(),
+            release=lambda: bc._keeper_release(), log=lambda line: None,
+            **kw)
+
+    def span(self, name, dev, t0):
+        with self.lock:
+            self.spans.append((name, dev, t0, time.monotonic()))
+
+    def overlapping(self, t0, t1):
+        with self.lock:
+            return [x for x in self.spans if x[2] < t1 and x[3] > t0]
+
+
+class _TimedSd(_FakeSd):
+    """_FakeSd whose play() takes ``open_s`` and records its interval."""
+
+    def __init__(self, open_s=0.0, stream=None):
+        super().__init__(stream)
+        self.open_s = open_s
+        self.play_spans = []
+
+    def play(self, audio, sr, device=None):
+        t0 = time.monotonic()
+        if self.open_s:
+            time.sleep(self.open_s)
+        super().play(audio, sr, device)
+        self.play_spans.append((device, t0, time.monotonic()))
+
+
+class RealKeeperPlaybackTests(_PlayBase):
+    """The REAL keeper in the REAL playback body (fakes only at the native
+    edge). Review fix 2026-10-05: before it, the playback waited only for a
+    keeper open that had already started, so a speaker change (the keeper's
+    close + reopen) or a cold open ran straight into sd.play()."""
+
+    def _wire(self, rig, sd_open_s=0.0):
+        bc = self.bc
+        self._p(bc, "_playback_keeper", rig.keeper)
+        self._p(bc, "PLAYBACK_KEEPER", "on")
+        self.addCleanup(rig.keeper.shutdown, 2.0)
+        fake_sd = _TimedSd(open_s=sd_open_s)
+        self._p(bc, "sd", fake_sd)
+        stats = []
+        self._p(bc, "_tt_note_stat",
+                side_effect=lambda n, v: stats.append((n, v)))
+        return fake_sd, stats
+
+    def test_the_first_play_waits_for_a_slow_keeper_open(self):
+        bc = self.bc
+        rig = _KeeperRig(bc, open_delay=0.2)
+        fake_sd, stats = self._wire(rig, sd_open_s=0.05)
+        bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        self.assertEqual(len(fake_sd.play_spans), 1)
+        dev, p0, p1 = fake_sd.play_spans[0]
+        self.assertEqual(dev, 6)
+        self.assertEqual(rig.overlapping(p0, p1), [],
+                         "a keeper call ran during the play's own open")
+        opens = [x for x in rig.spans if x[0] == "open"]
+        self.assertEqual(len(opens), 1)
+        self.assertLessEqual(opens[0][3], p0)      # keeper open came first
+        self.assertIn(("keeper", 1), stats)
+        self.assertTrue(rig.keeper.shutdown(2.0))
+        self.assertFalse(bc._tts_keeper_active[0])
+
+    def test_a_speaker_change_never_overlaps_the_keepers_close_and_reopen(self):
+        bc = self.bc
+        rig = _KeeperRig(bc, open_delay=0.1, close_delay=0.03)
+        fake_sd, stats = self._wire(rig, sd_open_s=0.05)
+        rig.keeper.set_enabled(True)
+        tok = rig.keeper.begin(6)                  # held on the old speaker
+        end = time.monotonic() + 2.0
+        while not rig.keeper.is_live() and time.monotonic() < end:
+            time.sleep(0.005)
+        self.assertTrue(rig.keeper.is_live())
+        self._p(bc, "get_output_device", return_value=7)   # switched
+        bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        dev, p0, p1 = fake_sd.play_spans[0]
+        self.assertEqual(dev, 7)
+        self.assertEqual(rig.overlapping(p0, p1), [],
+                         "the keeper's close/reopen ran into sd.play()")
+        self.assertEqual([(x[0], x[1]) for x in rig.spans],
+                         [("open", 6), ("abort", 6), ("close", 6),
+                          ("open", 7)])
+        self.assertIn(("keeper", 1), stats)
+        rig.keeper.end(tok)
+
+    def test_a_keeper_reopen_that_falls_due_mid_open_waits_for_the_play(self):
+        bc = self.bc
+        rig = _KeeperRig(bc, yield_s=0.25)
+        fake_sd, _ = self._wire(rig, sd_open_s=0.6)
+        rig.keeper.set_enabled(True)
+        tok = rig.keeper.begin(6)
+        end = time.monotonic() + 2.0
+        while not rig.keeper.is_live() and time.monotonic() < end:
+            time.sleep(0.005)
+        rig.keeper.request_yield()                 # closed; back in 0.25 s
+        end = time.monotonic() + 2.0
+        while bc._tts_keeper_active[0] and time.monotonic() < end:
+            time.sleep(0.005)
+        bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        dev, p0, p1 = fake_sd.play_spans[0]
+        self.assertEqual(rig.overlapping(p0, p1), [],
+                         "the keeper reopened inside the play's own open")
+        rig.keeper.end(tok)
+
+
+class CutBeforeOpenTests(_PlayBase):
+    """A barge-in that lands during the keeper wait (up to READY_WAIT_S)
+    must not open the line it already cut (review fix 2026-10-05) - with the
+    primed stream the line's own samples would be queued and playing before
+    the reaper's first poll - and must not hand the reaper a stream that is
+    not this line's."""
+
+    def _interrupt(self):
+        self.bc._tts_interrupt.set()
+
+    def test_sd_play_path_opens_nothing(self):
+        bc = self.bc
+        fake = self._p(bc, "_playback_keeper",
+                       _FakeKeeper(on_wait=self._interrupt))
+        self._p(bc, "PLAYBACK_KEEPER", "on")
+        fake_sd = _FakeSd()
+        fake_sd.get_stream = mock.Mock(
+            side_effect=AssertionError("sd.get_stream must not be read"))
+        self._p(bc, "sd", fake_sd)
+        reaper = self._p(bc, "_reap_playback")
+        with mock.patch("builtins.print"):
+            bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        self.assertEqual(fake_sd.play_calls, [])
+        self.assertEqual(fake_sd.get_stream.call_count, 0)
+        reaper.assert_not_called()
+        self.assertIn(("exit_play_open", 41), fake.calls)
+        self.assertFalse(bc._tts_playback_active[0])
+        self.assertFalse(bc._tts_interrupt.is_set())   # the finally's clear
+
+    def test_primed_path_opens_nothing(self):
+        bc = self.bc
+        self._p(bc, "_playback_keeper", _FakeKeeper(on_wait=self._interrupt))
+        self._p(bc, "PLAYBACK_KEEPER", "on")
+        self._p(bc, "PLAYBACK_PRIMED_STREAM", True)
+        opened = self._p(bc, "_open_primed_stream")
+        fake_sd = _FakeSd()
+        fake_sd.get_stream = mock.Mock(
+            side_effect=AssertionError("sd.get_stream must not be read"))
+        self._p(bc, "sd", fake_sd)
+        with mock.patch("builtins.print"):
+            bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        opened.assert_not_called()
+        self.assertEqual(fake_sd.get_stream.call_count, 0)
+        self.assertFalse(bc._tts_playback_active[0])
+
+    def test_keeper_off_and_primed_off_is_the_old_path(self):
+        # Rollback promise: with both flags off an interrupt before the open
+        # still opens (the reaper cuts it at its first poll), exactly as
+        # before the keeper existed.
+        bc = self.bc
+        self._p(bc, "_playback_keeper", _FakeKeeper())
+        self._p(bc, "PLAYBACK_KEEPER", "off")
+        self._p(bc, "_audio_ducker", mock.Mock(
+            duck=mock.Mock(side_effect=self._interrupt)))
+        fake_sd = _FakeSd()
+        self._p(bc, "sd", fake_sd)
+        bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        self.assertEqual(fake_sd.play_calls, [(240, 24000, 6)])
+
+
+class TelemetryTests(_PlayBase):
+    def test_every_open_is_counted_and_the_first_is_play_open_ms(self):
+        bc = self.bc
+        self._p(bc, "PLAYBACK_KEEPER", "off")
+        self._p(bc, "sd", _FakeSd())
+        calls = []
+
+        def _tt(op, *a, **k):
+            if op == "now":
+                return time.perf_counter()
+            calls.append((op,) + a)
+        self._p(bc, "_tt", side_effect=_tt)
+        self._p(bc, "TURN_PLAY_OPEN_PROBE", True)
+        for _ in range(2):
+            bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        notes = [c[1:] for c in calls if c[0] == "note_stat"]
+        names = [n[0] for n in notes]
+        self.assertEqual(names.count("play_open_ms"), 2)  # first wins there
+        self.assertEqual([n for n in notes if n[0] == "opens"],
+                         [("opens", 1), ("opens", 1)])
+        ms = [n[1] for n in notes if n[0] == "opens_ms"]
+        self.assertEqual(ms, [n[1] for n in notes if n[0] == "play_open_ms"])
+
+    def test_a_cut_before_the_open_is_not_counted(self):
+        bc = self.bc
+        self._p(bc, "_playback_keeper",
+                _FakeKeeper(on_wait=lambda: bc._tts_interrupt.set()))
+        self._p(bc, "PLAYBACK_KEEPER", "on")
+        self._p(bc, "sd", _FakeSd())
+        calls = []
+
+        def _tt(op, *a, **k):
+            if op == "now":
+                return time.perf_counter()
+            calls.append((op,) + a)
+        self._p(bc, "_tt", side_effect=_tt)
+        self._p(bc, "TURN_PLAY_OPEN_PROBE", True)
+        with mock.patch("builtins.print"):
+            bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        names = [c[1] for c in calls if c[0] == "note_stat"]
+        self.assertNotIn("opens", names)
+        self.assertNotIn("play_open_ms", names)
+
+
+class PrimedRobotBranchTests(_PlayBase):
+    def test_the_robot_branch_hands_the_primed_stream_to_the_reaper(self):
+        bc = self.bc
+        self._p(bc, "PLAYBACK_PRIMED_STREAM", True)
+        self._p(bc, "ROBOT_ENABLED", True)
+        self._p(bc, "send")
+        own = _PlayStream(natural_s=0.0)
+        self._p(bc, "_open_primed_stream",
+                side_effect=lambda a, sr, dev: own)
+        fake_sd = _FakeSd()
+        fake_sd.get_stream = mock.Mock(
+            side_effect=AssertionError("sd.get_stream must not be read"))
+        self._p(bc, "sd", fake_sd)
+        bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        self.assertEqual(fake_sd.play_calls, [])
+        self.assertEqual(fake_sd.get_stream.call_count, 0)
+        self.assertEqual([c[0] for c in own.calls], ["stop", "close"])
+
+
+class StaleIndexTests(_Base):
+    """Review fix 2026-10-05: a refresh pass that re-enumerates PortAudio
+    stores its freshly picked speaker index only at its END, so a hold taken
+    in between must not hand the keeper _device_cache['out'] (an index from
+    before the reinit - MME renumbers)."""
+
+    def test_a_hold_taken_mid_refresh_never_gets_the_old_index(self):
+        bc = self.bc
+        from core import playback_keeper as pk
+        fake = self._p(bc, "_playback_keeper", _FakeKeeper())
+        self._p(bc, "PLAYBACK_KEEPER", "on")
+        self._p(bc, "_keeper_audible", lambda: True)
+        bc._device_cache["out"] = 6                # pre-reinit index
+        handed = []
+
+        def _pick(prefs, want_input):
+            if not want_input:
+                # After the reinit, before the pass stores the new index.
+                bc._keeper_begin()
+                handed.append(fake.calls[-1][1])
+                return (9, "FakeSpeaker")
+            return (0, "FakeMic")
+
+        with mock.patch.object(bc.sd, "_terminate"), \
+                mock.patch.object(bc.sd, "_initialize"), \
+                mock.patch.object(bc.sd, "query_devices",
+                                  return_value={"name": "FakeDev"}), \
+                mock.patch.object(bc, "MICROPHONE_INDEX", None), \
+                mock.patch.object(bc, "SPEAKER_INDEX", None), \
+                mock.patch.object(bc, "_pick_device", side_effect=_pick), \
+                mock.patch("builtins.print"):
+            bc._device_cache["checked_at"] = 0.0
+            bc._refresh_devices(force=True)
+        self.assertEqual(len(handed), 1)
+        self.assertIs(handed[0], pk.UNSET,
+                      "the keeper was handed the pre-reinit index")
+        self.assertIn(("reinit_done",), fake.calls)
+        # After the pass, the fresh index is what a hold hands over.
+        bc._keeper_begin()
+        self.assertEqual(fake.calls[-1][1], 9)
+
+
+class InterpreterExitTests(_Base):
+    def test_keeper_atexit_waits_for_the_close(self):
+        bc = self.bc
+        rig = _KeeperRig(bc, close_delay=0.1)
+        self._p(bc, "_playback_keeper", rig.keeper)
+        self.addCleanup(rig.keeper.shutdown, 2.0)
+        rig.keeper.set_enabled(True)
+        rig.keeper.begin(6)
+        end = time.monotonic() + 2.0
+        while not rig.keeper.is_live() and time.monotonic() < end:
+            time.sleep(0.005)
+        self.assertTrue(bc._tts_keeper_active[0])
+        bc._keeper_atexit(budget_s=2.0)
+        # Returned only once the close returned and the cell dropped.
+        self.assertFalse(bc._tts_keeper_active[0])
+        self.assertEqual([x[0] for x in rig.spans], ["open", "abort", "close"])
+
+    def test_main_registers_it_so_it_runs_before_sounddevices_handler(self):
+        # atexit is last-in, first-out and sounddevice registers its own
+        # handler (Pa_Terminate) at import - so main() registering ours is
+        # what makes it run FIRST.
+        import ast
+        bc = self.bc
+        tree = ast.parse(inspect.getsource(bc.main))
+        regs = [n for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "register"
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == "atexit"
+                and n.args and isinstance(n.args[0], ast.Name)
+                and n.args[0].id == "_keeper_atexit"]
+        self.assertEqual(len(regs), 1)
+        src = inspect.getsource(bc)
+        self.assertLess(src.index("import sounddevice"),
+                        src.index("def main("))
 
 
 if __name__ == "__main__":

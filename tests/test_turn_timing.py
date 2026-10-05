@@ -524,7 +524,8 @@ class R1SchemaTests(unittest.TestCase):
             "tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms", "stt_engine",
             "load_ms", "total_ms", "play_open_ms", "out_lat_ms",
             "filler_clip_ms", "eot", "st_p", "st_n", "pre", "cut",
-            "amb_deferred", "cache", "clone", "clone_ms", "keeper"))
+            "amb_deferred", "cache", "clone", "clone_ms", "keeper",
+            "opens", "opens_ms"))
         self.assertEqual(len(set(tt.STAT_FIELDS)), len(tt.STAT_FIELDS))
 
     def test_the_old_fields_keep_their_order(self):
@@ -558,6 +559,8 @@ class NoteStatTests(unittest.TestCase):
         t.note_stat("clone", 1)
         t.note_stat("clone_ms", 812)
         t.note_stat("keeper", 1)
+        t.note_stat("opens", 1)
+        t.note_stat("opens_ms", 41)
         _in_thread(lambda: t.note_stat("filler_clip_ms", 2120))
         _in_thread(lambda: t.note_stat("cut", 980))
         _in_thread(lambda: t.note_stat("amb_deferred", 2))
@@ -571,7 +574,8 @@ class NoteStatTests(unittest.TestCase):
              "filler_clip_ms": "2120", "eot": "rms",
              "st_p": "0.873", "st_n": "2", "pre": "1", "cut": "980",
              "amb_deferred": "2", "cache": "would-hit", "clone": "1",
-             "clone_ms": "812", "keeper": "1"})
+             "clone_ms": "812", "keeper": "1", "opens": "1",
+             "opens_ms": "41"})
         self.assertEqual(d["lead_dropped"], "0")
 
     def test_an_absent_field_prints_dash(self):
@@ -622,10 +626,30 @@ class NoteStatTests(unittest.TestCase):
         _in_thread(lambda: t.note_stat("clone", 1))
         _in_thread(lambda: t.note_stat("clone_ms", 700))
         _in_thread(lambda: t.note_stat("keeper", 1))
+        _in_thread(lambda: t.note_stat("opens", 1))
+        _in_thread(lambda: t.note_stat("opens_ms", 300))
         d = self._emit()
         for k in _R1_OWNER + ("play_open_ms", "out_lat_ms", "cache", "clone",
-                              "clone_ms", "keeper"):
+                              "clone_ms", "keeper", "opens", "opens_ms"):
             self.assertEqual(d[k], "-", k)
+
+    def test_opens_add_up_over_the_reply_while_play_open_keeps_the_first(self):
+        # PLAYBACK_KEEPER review (2026-10-05): the later sentences' opens are
+        # where the keeper saves the most, and play_open_ms keeps only the
+        # first, so opens / opens_ms add up over every playback of the reply.
+        t = self.t
+        t.begin("voice")
+        t.mark("you")
+        for ms in (372, 6, 9):           # first line slow, two fast ones
+            t.note_stat("play_open_ms", ms)
+            t.note_stat("opens", 1)
+            t.note_stat("opens_ms", ms)
+        d = self._emit()
+        self.assertEqual((d["play_open_ms"], d["opens"], d["opens_ms"]),
+                         ("372", "3", "387"))
+        # The documented reading: mean later open = (387 - 372) / (3 - 1).
+        self.assertEqual((int(d["opens_ms"]) - int(d["play_open_ms"]))
+                         / (int(d["opens"]) - 1), 7.5)
 
     def test_any_thread_fields_are_accepted_from_any_thread(self):
         t = self.t
@@ -845,12 +869,15 @@ class PreTurnStashTests(unittest.TestCase):
         t.note_stat("clone", 1)
         t.note_stat("clone_ms", 650)
         t.note_stat("keeper", 1)
+        t.note_stat("opens", 1)
+        t.note_stat("opens_ms", 40)
         _in_thread(lambda: t.note_stat("filler_clip_ms", 2100))
         _in_thread(lambda: t.note_stat("cut", 500))
         t.begin_voice(since)
         t.mark("you")
         d = self._emit()
         for k in ("play_open_ms", "cache", "clone", "clone_ms", "keeper",
+                  "opens", "opens_ms",
                   "filler_clip_ms", "cut"):
             self.assertEqual(d[k], "-", k)
 
