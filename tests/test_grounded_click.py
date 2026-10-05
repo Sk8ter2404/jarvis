@@ -176,7 +176,14 @@ class GuardTests(_Base):
         stub.click_refusal = click_refusal
         chooser = F.FakeWindow(101, "chooser_light", "middle")
         b = self.desk(chooser)
-        with mock.patch.dict(sys.modules, {"core.auth_guard": stub}):
+        import core
+        from core import screen_privacy as SP
+        # The page itself stays readable here (with core.auth_guard on main
+        # a sign-in TITLE alone makes it private, and the guard below is
+        # never reached - test_a_sign_in_page_is_never_read_or_clicked).
+        with mock.patch.dict(sys.modules, {"core.auth_guard": stub}), \
+                mock.patch.object(core, "auth_guard", stub, create=True), \
+                mock.patch.object(SP, "auth_reason", return_value=None):
             r = G.run("the test user account",
                       said="pull up the console so I can sign in", backend=b)
         self.assertEqual(r.outcome, G.REFUSED_AUTH, r.text)
