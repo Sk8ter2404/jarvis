@@ -400,6 +400,14 @@ AMBIENT_SCREEN_ENABLED = False
 #   transcribed and kept, in order, once your sentence is done. False by
 #   default. Set via user_settings.json; applies on the next daemon start.
 AMBIENT_STT_YIELD = False
+# AMBIENT_LEARN_FROM_EVERYONE — overheard speech from a voice that is NOT the
+#   enrolled owner (a lecture, a meeting whose people agreed to it) still
+#   teaches facts, through the same media / short-fragment / speech-validity /
+#   content-judge gates used when voice-ID is unavailable. It never makes
+#   JARVIS answer: replies still need the wake word. False by default (only
+#   the owner's voice teaches); ignored while LEARN_ONLY_FROM_OWNER is on.
+#   Set via user_settings.json; applies on the next start.
+AMBIENT_LEARN_FROM_EVERYONE = False
 
 # CHAPPIE_ENABLED — autostart the continuous self-learning daemon
 #   (skills/chappie_consciousness.py). False by default because the daemon

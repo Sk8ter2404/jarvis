@@ -3578,9 +3578,15 @@ def _ambient_learn_from_gated(text: str, memory: dict,
                       f"— owner voice (score={vscore:.2f})")
                 return
             # vstatus == "unknown": enrolled owner exists but this isn't them.
-            print(f"  [ambient-learn] skipped: unknown speaker "
-                  f"(not enrolled owner, score={vscore:.2f}) ({n} chars)")
-            return
+            # AMBIENT_LEARN_FROM_EVERYONE (a class or meeting that agreed to it)
+            # sends it through the voice-ID-unavailable path below instead.
+            if not AMBIENT_LEARN_FROM_EVERYONE or LEARN_ONLY_FROM_OWNER:
+                print(f"  [ambient-learn] skipped: unknown speaker "
+                      f"(not enrolled owner, score={vscore:.2f}) ({n} chars)")
+                return
+            why = f"another speaker, score={vscore:.2f}"
+        else:
+            why = "voice-ID unavailable"
 
         # (3) Voice-ID unavailable. Owner-only learning (core/learn_gate.py)
         # never learns overheard speech it cannot attribute to the owner, so
@@ -3593,7 +3599,7 @@ def _ambient_learn_from_gated(text: str, memory: dict,
         # to drop stray low-information TV fragments.
         if n < _AMBIENT_LEARN_MIN_CHARS or len(snippet.split()) < _AMBIENT_LEARN_MIN_WORDS:
             print("  [ambient-learn] skipped: low-information fragment "
-                  f"(voice-ID unavailable) ({n} chars)")
+                  f"({why}) ({n} chars)")
             return
 
         # Final gate: speech-validity (confidence/RMS/hallucination) + the
@@ -3605,7 +3611,7 @@ def _ambient_learn_from_gated(text: str, memory: dict,
         learn_from_turn(snippet, "", memory, owner_directed=False, conf=conf,
                         epoch=_ep)
         print(f"  [ambient-learn] ingested gated text ({n} chars) "
-              "— no media, voice-ID unavailable (content heuristic passed)")
+              f"— no media, {why} (content heuristic passed)")
     except Exception as _e:
         print(f"  [ambient-learn] gated-feed skipped: {type(_e).__name__}: {_e}")
 

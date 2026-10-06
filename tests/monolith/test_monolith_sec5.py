@@ -1854,6 +1854,56 @@ class AmbientLearnFromGatedTests(SectionFiveBase):
                                          {}, audio, 16000)
         lft.assert_not_called()
 
+    def test_learn_from_everyone_ingests_unknown_voice(self):
+        bc = self.bc
+        import core.voice_id as vid
+        # AMBIENT_LEARN_FROM_EVERYONE (a class that agreed to it): another
+        # speaker's content-rich line teaches like the voice-ID-unavailable path,
+        # and still never speaks.
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "AMBIENT_LEARN_FROM_EVERYONE", True), \
+             mock.patch.object(bc, "LEARN_ONLY_FROM_OWNER", False), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=True), \
+             mock.patch.object(vid, "list_enrolled", return_value=["tony"]), \
+             mock.patch.object(vid, "identify_speaker", return_value=(None, 0.20)), \
+             mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
+             mock.patch.object(bc, "learn_from_turn") as lft, \
+             mock.patch.object(bc, "_speak") as speak:
+            bc._ambient_learn_from_gated("the midterm covers chapters three to five",
+                                         {}, object(), 16000)
+        lft.assert_called_once()
+        speak.assert_not_called()
+
+    def test_learn_from_everyone_still_drops_short_fragments(self):
+        bc = self.bc
+        import core.voice_id as vid
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "AMBIENT_LEARN_FROM_EVERYONE", True), \
+             mock.patch.object(bc, "LEARN_ONLY_FROM_OWNER", False), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=True), \
+             mock.patch.object(vid, "list_enrolled", return_value=["tony"]), \
+             mock.patch.object(vid, "identify_speaker", return_value=(None, 0.20)), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("oh no", {}, object(), 16000)
+        lft.assert_not_called()
+
+    def test_learn_from_everyone_yields_to_owner_only_learning(self):
+        bc = self.bc
+        import core.voice_id as vid
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "AMBIENT_LEARN_FROM_EVERYONE", True), \
+             mock.patch.object(bc, "LEARN_ONLY_FROM_OWNER", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=True), \
+             mock.patch.object(vid, "list_enrolled", return_value=["tony"]), \
+             mock.patch.object(vid, "identify_speaker", return_value=(None, 0.20)), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("the midterm covers chapters three to five",
+                                         {}, object(), 16000)
+        lft.assert_not_called()
+
     def test_skip_short_fragment_when_voice_id_unavailable(self):
         bc = self.bc
         import core.voice_id as vid
