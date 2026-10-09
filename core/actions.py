@@ -5325,6 +5325,21 @@ def _release_audio_streams(bc, budget_s: float = 3.0) -> None:
     done = {}
 
     def _signal():
+        # (0) the playback keeper's silent speaker stream (PLAYBACK_KEEPER,
+        #     2026-10-05): latch it off; its own thread closes the stream and
+        #     drops _tts_keeper_active, which the wait below watches. FIRST
+        #     (review 2026-10-09): shutdown() only sets a latch and never
+        #     blocks, so its ~10 ms close then runs while (a)-(c) stop -- the
+        #     ambient stops below join up to 3 s each, and as the last step
+        #     the keeper's close could still be inside the driver when
+        #     TerminateProcess lands.
+        try:
+            fn = getattr(bc, "_playback_keeper_shutdown", None)
+            if callable(fn):
+                fn()
+                done["playback_keeper"] = True
+        except Exception:
+            pass
         # (a) record_speech / the main loop. The watchdog reset signal is the
         #     documented way to make it wake from audio_q.get, close its
         #     InputStream and return (see _main_loop_watchdog_thread).
@@ -5354,16 +5369,6 @@ def _release_audio_streams(bc, budget_s: float = 3.0) -> None:
                 if callable(fn):
                     fn("")
                     done[name] = True
-        except Exception:
-            pass
-        # (d) the playback keeper's silent speaker stream (PLAYBACK_KEEPER,
-        #     2026-10-05): latch it off; its own thread closes the stream and
-        #     drops _tts_keeper_active, which the wait below watches.
-        try:
-            fn = getattr(bc, "_playback_keeper_shutdown", None)
-            if callable(fn):
-                fn()
-                done["playback_keeper"] = True
         except Exception:
             pass
 

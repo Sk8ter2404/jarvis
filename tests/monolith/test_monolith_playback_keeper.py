@@ -7,8 +7,9 @@ around it:
 
   * the keeper's owner cell is an owner like any other: _pa_streams_live
     counts it, _refresh_devices defers its destructive reinit for it (and
-    asks it to step aside when it is the only owner in the way), and the
-    self-diagnostic's mirror of the owner list names it;
+    asks it to step aside when it is the only owner in the way, then waits
+    for that close to RETURN before the pass returns - review 2026-10-09),
+    and the self-diagnostic's mirror of the owner list names it;
   * 'off' is the old path: no holder, the reaper polls at 50 ms;
   * 'on': a reply, a line and a playback each hold the speaker, the play
     waits (bounded) for a keeper open in flight, the turn line notes
@@ -38,8 +39,10 @@ from __future__ import annotations
 
 import inspect
 import re
+import sys
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -211,7 +214,11 @@ class OwnerCellTests(_Base):
                                      "stream is the 0xc0000374")
         self.assertFalse(bc._pa_reinit_active[0])
         self.assertIn("playback keeper holds the speaker", "\n".join(printed))
-        self.assertEqual(fake.names(), ["request_yield"])
+        # ...and waits (bounded, YIELD_WAIT_S) for the keeper's close to
+        # return before the pass returns (review 2026-10-09).
+        from core import playback_keeper as pk
+        self.assertEqual(fake.calls, [("request_yield",),
+                                      ("wait_settled", pk.YIELD_WAIT_S)])
 
     def test_another_owner_keeps_its_own_reason_and_no_yield(self):
         bc = self.bc
@@ -637,6 +644,32 @@ class HolderSiteTests(_Base):
             A._release_audio_streams(bc, budget_s=0.5)
         bc._playback_keeper_shutdown.assert_called_once_with()
 
+    def test_teardown_switches_the_keeper_off_first(self):
+        # Review 2026-10-09: shutdown() only sets a latch, so run it FIRST -
+        # its ~10 ms close then runs while the other owners stop (the two
+        # ambient stops join up to 3 s each). As the last step its close
+        # could still be in the driver when TerminateProcess lands.
+        from core import actions as A
+        order = []
+        bc = mock.Mock()
+        bc._mic_lock = threading.Lock()
+        bc._pa_streams_live.return_value = False
+        bc._playback_keeper_shutdown.side_effect = (
+            lambda: order.append("keeper"))
+        bc._watchdog_reset_signal.set.side_effect = (
+            lambda: order.append("record_speech"))
+        wl = types.SimpleNamespace(_detector=types.SimpleNamespace(
+            stop=lambda: order.append("wake_word")))
+        al = types.SimpleNamespace(
+            ambient_listen_stop=lambda arg: order.append("ambient_listen"),
+            ambient_audio_stop=lambda arg: order.append("ambient_audio"))
+        with mock.patch.dict(sys.modules, {"skill_wake_listener": wl,
+                                           "skill_ambient_listen": al}), \
+                mock.patch("builtins.print"):
+            A._release_audio_streams(bc, budget_s=0.5)
+        self.assertEqual(order, ["keeper", "record_speech", "wake_word",
+                                 "ambient_listen", "ambient_audio"])
+
     def test_turn_flags_name_both_settings(self):
         self.assertIn("PLAYBACK_KEEPER", self.bc._TURN_FLAG_KEYS)
         self.assertIn("PLAYBACK_PRIMED_STREAM", self.bc._TURN_FLAG_KEYS)
@@ -1054,6 +1087,83 @@ class StaleIndexTests(_Base):
         # After the pass, the fresh index is what a hold hands over.
         bc._keeper_begin()
         self.assertEqual(fake.calls[-1][1], 9)
+
+
+class KeeperYieldWaitTests(_Base):
+    """Review 2026-10-09 (audio safety, medium): when _refresh_devices asks
+    the keeper to step aside, the keeper's close must have RETURNED before
+    the pass returns. Its usual caller is record_speech (get_input_device),
+    which claims and opens its mic InputStream straight after, and
+    PortAudio's open-stream list is not thread-safe: Pa_OpenStream links a
+    stream in at its end, Pa_CloseStream unlinks one at its start, with no
+    lock. Before the fix request_yield() returned at once and the keeper's
+    abort + close ran on its own thread while the caller opened. The REAL
+    keeper through the REAL _refresh_devices; fakes only at the native
+    edge."""
+
+    def _refresh(self):
+        bc = self.bc
+        with mock.patch.object(bc.sd, "_terminate"), \
+                mock.patch.object(bc.sd, "_initialize"), \
+                mock.patch.object(bc.sd, "query_devices",
+                                  return_value={"name": "FakeDev"}), \
+                mock.patch.object(bc, "MICROPHONE_INDEX", None), \
+                mock.patch.object(bc, "SPEAKER_INDEX", None), \
+                mock.patch.object(bc, "_pick_device",
+                                  return_value=(0, "FakeDev")), \
+                mock.patch("builtins.print"):
+            bc._device_cache["checked_at"] = 0.0
+            bc._refresh_devices(force=True)
+
+    def _wait(self, pred, timeout=2.0):
+        end = time.monotonic() + timeout
+        while not pred() and time.monotonic() < end:
+            time.sleep(0.005)
+        return pred()
+
+    def test_the_keepers_close_returns_before_the_pass_does(self):
+        bc = self.bc
+        rig = _KeeperRig(bc, close_delay=0.08)        # linger 2 s
+        self._p(bc, "_playback_keeper", rig.keeper)
+        self.addCleanup(rig.keeper.shutdown, 2.0)
+        rig.keeper.set_enabled(True)
+        rig.keeper.end(rig.keeper.begin(6))   # lingering after a reply
+        self.assertTrue(self._wait(rig.keeper.is_live))
+        self._refresh()
+        # record_speech's claim + InputStream open would start right here.
+        t_open = time.monotonic()
+        closes = [x for x in rig.spans if x[0] == "close"]
+        self.assertEqual(len(closes), 1,
+                         "the pass returned with the keeper's close still "
+                         "in flight: %r" % (rig.spans,))
+        self.assertLessEqual(closes[0][3], t_open)
+        self.assertFalse(bc._tts_keeper_active[0])
+        self.assertEqual(rig.keeper.yields, 1)
+
+    def test_a_yield_during_the_keepers_open_waits_for_open_and_close(self):
+        bc = self.bc
+        rig = _KeeperRig(bc, open_delay=0.2, close_delay=0.03)
+        self._p(bc, "_playback_keeper", rig.keeper)
+        self.addCleanup(rig.keeper.shutdown, 2.0)
+        rig.keeper.set_enabled(True)
+        rig.keeper.end(rig.keeper.begin(6))
+        # The keeper has claimed its cell and is inside its (slow) open.
+        self.assertTrue(self._wait(lambda: bc._tts_keeper_active[0]))
+        self._refresh()
+        t_open = time.monotonic()
+        self.assertEqual([x[0] for x in rig.spans],
+                         ["open", "abort", "close"])
+        self.assertTrue(all(x[3] <= t_open for x in rig.spans), rig.spans)
+        self.assertFalse(bc._tts_keeper_active[0])
+
+    def test_no_wait_when_another_owner_is_in_the_way(self):
+        bc = self.bc
+        fake = self._p(bc, "_playback_keeper", _FakeKeeper())
+        with bc._mic_lock:
+            bc._tts_keeper_active[0] = True
+            bc._tts_playback_active[0] = True
+        self._refresh()
+        self.assertNotIn("wait_settled", fake.names())
 
 
 class InterpreterExitTests(_Base):

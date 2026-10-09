@@ -1085,8 +1085,9 @@ PLAYBACK_KEEPER = "on"
 # PLAYBACK_PRIMED_STREAM — each line plays on JARVIS's own stream instead of
 # sd.play()'s: the line itself fills the speaker's ~0.2 s start-up buffer
 # (sd.play() fills it with silence, so every line starts ~0.2 s late), and
-# the stream ends by playing out what is queued (sd.play() discards it: the
-# last ~0.15 s of each line, or the pause after a sentence, is never heard).
+# the stream ends by playing out what is queued (sd.play() discards the last
+# ~0.15 s of each line: mostly its own trailing quiet or the pause after a
+# sentence, plus ~50-70 ms of the final syllable's decay).
 # Same reaper, barge-in and device rules (bobert_companion._open_primed_
 # stream). It changes what you hear, so it is OFF until judged by ear.
 # out_lat_ms on the turn line stays the stream's reported latency; with this

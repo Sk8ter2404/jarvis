@@ -38,24 +38,45 @@ CONTRACT (every rule below is load-bearing)
 * YIELDS TO THE RE-ENUMERATION. When _refresh_devices wants that
   re-enumeration and the keeper is the only owner in the way, it calls
   ``request_yield()``: the keeper closes at once and stays closed until
-  ``reinit_done()`` or ``yield_s``, whichever comes first.
+  ``reinit_done()`` or ``yield_s``, whichever comes first. The refresh then
+  WAITS (bounded, ``wait_settled(YIELD_WAIT_S)``) for that close to return
+  before it returns itself (review fix, 2026-10-09): its caller --
+  record_speech, right before its InputStream open -- must not open a
+  stream while the keeper is still inside Pa_CloseStream.
 * SINGLE TOUCHER. Every native call on the keeper's stream (open, start,
   abort, close) happens on ONE daemon thread ("tts-keeper"). Callers only
   change state under a plain lock and notify; nothing a caller does can block
   on PortAudio. The stream is never published into sounddevice's
   ``_last_callback`` slot (it is built with ``sd.OutputStream``), so no
   ``sd.play()``/``sd.stop()`` elsewhere can reach it.
-* ONE OPEN AT A TIME ON THE SPEAKER (review fix, 2026-10-05). PortAudio's
-  open/close bookkeeping is not thread-safe, so a playback's own open never
-  runs at the same moment as a keeper open or close, in EITHER order:
+* ONE OPEN AT A TIME ON THE SPEAKER (review fixes, 2026-10-05 and -09).
+  PortAudio's open-stream list is not thread-safe (Pa_OpenStream links the
+  new stream in at its END, Pa_CloseStream unlinks it at its START, with no
+  lock), so a playback's own open never runs at the same moment as a keeper
+  open or close, in EITHER order:
     - a playback calls ``enter_play_open()`` right before it opens its
-      stream: it waits (bounded, ``READY_WAIT_S``) while the keeper has an
-      open or close in flight OR DUE -- a device change, a cold start or a
-      block that just ran out, not only an open that already started -- and
-      then marks its own open as in flight;
+      stream. A keeper open or close already IN FLIGHT is waited for until
+      it returns (that costs no more than the cold open the playback would
+      otherwise make itself); one that is only DUE -- a device change, a
+      cold start, a block that just ran out -- is waited for at most
+      ``READY_WAIT_S``. Then the playback marks its own open as in flight;
     - the keeper thread starts no open or close while a playback's open is
       marked, until ``exit_play_open()`` (or ``OPEN_WEDGED_S``, so a wedged
-      native open on either side can never stall the other for good).
+      native open on the playback's side can never stall the keeper for
+      good).
+  So giving up on a DUE call is safe (the mark holds it off). The one case
+  that is not kept apart is a keeper call that has been in flight for
+  ``OPEN_WEDGED_S`` (wedged in the driver): a playback cannot wait on it
+  for ever, so it opens anyway -- and a keeper native call that ever takes
+  that long QUARANTINES the keeper for the rest of the process (it closes
+  what it holds and never opens again; logged once), so that can happen
+  once per run at most.
+  Scope: the fence keeps the keeper apart from the playbacks and from the
+  re-enumeration's caller. The other streams (record_speech, the barge-in
+  listener, the wake word, the tts-reaper's closes) are not fenced against
+  the keeper, exactly as they are not fenced against each other; the
+  keeper's own two calls per turn are timed away from them (the open at
+  dispatch, the close ``LINGER_S`` after the reply).
 * NO STALE INDEX. ``reinit_done()`` forgets the device; a keeper open that
   was decided before a re-enumeration and claimed after it re-checks the
   device under the lock and opens nothing (the claim waits out the reinit's
@@ -68,6 +89,9 @@ CONTRACT (every rule below is load-bearing)
 * THE CALLBACK WRITES ZEROS AND NOTHING ELSE (no locks, no I/O, no logging).
 * NEVER HOT-LOOPS. A refused claim or a failed open backs off (5 s, doubling
   to 60 s) and is logged once per streak.
+* QUARANTINE. A keeper native open or close that took ``OPEN_WEDGED_S`` or
+  longer switches the keeper off for the life of the process (see ONE OPEN
+  AT A TIME). Playback itself is unaffected; only its fast open goes.
 * OFF IS ABSENT. While disabled no thread is started and every call is a
   cheap no-op.
 
@@ -80,7 +104,8 @@ import threading
 import time
 
 __all__ = ["PlaybackKeeper", "LINGER_S", "MAX_HOLD_S", "YIELD_S",
-           "READY_WAIT_S", "OPEN_WEDGED_S", "REAP_POLL_S", "UNSET"]
+           "YIELD_WAIT_S", "READY_WAIT_S", "OPEN_WEDGED_S", "REAP_POLL_S",
+           "UNSET"]
 
 # Seconds the stream stays after the last holder ended. Covers the gap
 # between a reply and its follow-up round, or a filler and the answer.
@@ -91,14 +116,21 @@ MAX_HOLD_S = 60.0
 # After request_yield(): stay closed this long unless reinit_done() comes
 # first, so a refresh pass (every DEVICE_CHECK_INTERVAL) can run.
 YIELD_S = 10.0
-# How long a playback waits (bounded condition wait) for a keeper open or
-# close in flight or due before it opens its own stream (the measured keeper
-# open was 322 ms, its close 10 ms; play_open_ms p90 391).
+# After request_yield(): how long _refresh_devices waits for the keeper's
+# close to return before it returns to its caller (which opens the mic next).
+# The close itself took 10 ms; the budget also covers a keeper OPEN that was
+# in flight when the yield came (live play_open_ms max 699 ms, 10-01..06).
+YIELD_WAIT_S = 1.0
+# How long a playback waits for a keeper open or close that is DUE but not
+# started yet (one already in flight is waited for until it returns, bounded
+# by OPEN_WEDGED_S). The measured keeper open was 322 ms, its close 10 ms;
+# play_open_ms p90 391.
 READY_WAIT_S = 0.45
 # A native open or close in flight longer than this is treated as wedged:
 # playbacks stop waiting for a wedged keeper call at all (they would otherwise
-# pay READY_WAIT_S each, for as long as it hangs), and the keeper stops
-# waiting for a wedged playback open.
+# wait on it for as long as it hangs), the keeper stops waiting for a wedged
+# playback open, and a keeper native call that took this long quarantines
+# the keeper for the rest of the process.
 OPEN_WEDGED_S = 2.0
 # The playback reaper's poll interval while the keeper is on (it is 0.05 s
 # when it is off): the gap from a clip's natural end to its close, and the
@@ -142,6 +174,9 @@ class PlaybackKeeper:
         self._block_is_yield = False
         self._backoff_s = _BACKOFF_FIRST_S
         self._fail_logged = False
+        # A native call took OPEN_WEDGED_S or longer: off for good (see
+        # QUARANTINE in the module docstring).
+        self._quarantined = False
         # Stream state: written by the keeper thread only (under the lock).
         self._stream = None
         self._stream_dev = None
@@ -183,16 +218,23 @@ class PlaybackKeeper:
     def enabled(self) -> bool:
         return self._enabled
 
+    @property
+    def quarantined(self) -> bool:
+        return self._quarantined
+
     # ── holders ──────────────────────────────────────────────────────────
     def begin(self, device=UNSET) -> int:
         """A reply (or one playback) is on its way: keep the endpoint awake
         until the matching end(). Returns a token for end(); 0 = disabled
-        (end(0) is a no-op). ``device``, when given, is the output device
-        the speaking path will use. Never blocks on PortAudio."""
+        or quarantined (end(0) is a no-op). ``device``, when given, is the
+        output device the speaking path will use; a different one than the
+        keeper holds closes it and reopens it there. Never blocks on
+        PortAudio."""
         tok, lines = 0, []
         try:
             with self._cv:
-                if not self._enabled or self._shutdown:
+                if (not self._enabled or self._shutdown
+                        or self._quarantined):
                     return 0
                 if device is not UNSET:
                     self._device = device
@@ -219,18 +261,6 @@ class PlaybackKeeper:
                     self._linger_until = max(self._linger_until,
                                              self._clock() + self._linger_s)
                 self._cv.notify_all()
-        except Exception:
-            pass
-
-    def note_device(self, device) -> None:
-        """The output device a playback is about to open. A keeper on
-        another device is closed and reopened on this one."""
-        try:
-            with self._cv:
-                if self._device != device or not self._device_known:
-                    self._device = device
-                    self._device_known = True
-                    self._cv.notify_all()
         except Exception:
             pass
 
@@ -287,8 +317,12 @@ class PlaybackKeeper:
 
     def wait_settled(self, timeout: float = READY_WAIT_S) -> bool:
         """Wait (bounded) while the keeper has an open or close in flight or
-        due. True = none (any more); False = still busy after ``timeout``, or
-        its native call is wedged (no wait at all). Never raises."""
+        due: one in flight until it returns (at most OPEN_WEDGED_S), one only
+        due for at most ``timeout``. True = none (any more); False = one is
+        still due after ``timeout``, or the one in flight is wedged (no wait
+        at all). _refresh_devices calls it after request_yield() so the
+        keeper's close has returned before its caller opens a stream. Never
+        raises."""
         try:
             with self._cv:
                 return self._wait_quiet_locked(timeout)
@@ -302,7 +336,10 @@ class PlaybackKeeper:
         keeper thread starts none until exit_play_open(token). Returns
         (token, settled); token 0 = the keeper never ran (nothing to keep
         apart from). The wait and the mark happen under one lock, so the
-        keeper cannot slip a native call in between. Never raises."""
+        keeper cannot slip a native call in between: settled=False after a
+        call that was only DUE leaves it held off by the mark; only a keeper
+        call wedged in flight (OPEN_WEDGED_S, which quarantines the keeper)
+        can still be running. Never raises."""
         try:
             with self._cv:
                 if self._thread is None:
@@ -372,17 +409,36 @@ class PlaybackKeeper:
 
     def _wait_quiet_locked(self, timeout: float) -> bool:
         """Bounded wait (caller holds the lock) until no keeper native call
-        is in flight or due. The budget is REAL time (the injected clock may
-        stand still in tests); the wedge rule uses the keeper's clock."""
-        end = time.monotonic() + max(0.0, float(timeout))
+        is in flight or due.
+
+        * A call IN FLIGHT is waited for until it returns: a caller that
+          went ahead would run its own open alongside it (review 2026-10-09:
+          the old flat ``timeout`` let a 0.6 s keeper open overlap a play's
+          open). Bounded by the wedge rule -- once the call has run
+          OPEN_WEDGED_S on the keeper's clock it is not waited for at all --
+          and by OPEN_WEDGED_S of real time from the start of this wait.
+        * A call only DUE (not started) is waited for at most ``timeout``.
+
+        Budgets are REAL time (the injected clock may stand still in tests);
+        the wedge rule uses the keeper's clock."""
+        start = time.monotonic()
+        timeout = max(0.0, float(timeout))
+        end = start + timeout
+        hard_end = start + max(timeout, OPEN_WEDGED_S)
         while True:
             now = self._clock()
             if not self._native_due_locked(now):
                 return True
-            if (self._native is not None
-                    and now - self._native_t0 >= OPEN_WEDGED_S):
-                return False             # wedged: do not wait for it at all
-            left = end - time.monotonic()
+            rt = time.monotonic()
+            if self._native is not None:
+                # In flight: until it returns, but never past the moment it
+                # counts as wedged (then ``left`` <= 0 below: a wedged call
+                # is not waited for at all), nor past hard_end.
+                age = now - self._native_t0
+                deadline = min(hard_end, rt + (OPEN_WEDGED_S - age))
+            else:
+                deadline = end
+            left = deadline - rt
             if left <= 0:
                 return False
             self._cv.wait(left)
@@ -423,6 +479,8 @@ class PlaybackKeeper:
     def _want_locked(self, now: float):
         """(want_open, seconds until the decision may change by itself, or
         None: nothing changes until a caller notifies)."""
+        # (Quarantined: no holder or linger is left - _quarantine_locked
+        # clears them and begin() adds none - so nothing is wanted.)
         if self._shutdown or not self._enabled:
             return False, None
         for tok, t0 in list(self._holders.items()):
@@ -454,7 +512,7 @@ class PlaybackKeeper:
                             action = "close"
                     elif want:
                         action = "open"
-                    elif self._shutdown:
+                    elif self._shutdown or self._quarantined:
                         self._thread = None
                         return
                     if action is not None:
@@ -505,7 +563,15 @@ class PlaybackKeeper:
                 self._safe_release()
                 claimed = False
                 return
-            st = self._open_stream(dev)
+            n0 = self._clock()
+            try:
+                st = self._open_stream(dev)
+            finally:
+                took = self._clock() - n0
+                if took >= OPEN_WEDGED_S:
+                    with self._cv:
+                        self._quarantine_locked(
+                            f"its open on device {dev} took {took:.1f}s")
             with self._cv:
                 self._stream = st
                 self._stream_dev = dev
@@ -534,6 +600,7 @@ class PlaybackKeeper:
 
     def _do_close(self) -> None:
         st = self._stream
+        n0 = self._clock()
         try:
             try:
                 st.abort(ignore_errors=True)
@@ -544,6 +611,7 @@ class PlaybackKeeper:
             except Exception:
                 pass
         finally:
+            took = self._clock() - n0
             # Release only AFTER the native close returned (close-then-
             # release); a close that never returns keeps the cell up.
             self._safe_release()
@@ -554,16 +622,40 @@ class PlaybackKeeper:
                 self._stream_dev = None
                 self._native = None
                 self.closes += 1
+                if took >= OPEN_WEDGED_S:
+                    self._quarantine_locked(
+                        f"its close on device {dev} took {took:.1f}s")
                 self._cv.notify_all()
+                lines = self._take_pending_locked()
             self._say(f"  [playback-keeper] held the speaker (device {dev}) "
                       f"{held:.1f}s: open {open_ms} ms, {plays} "
                       f"play{'s' if plays != 1 else ''} while held")
+            for line in lines:
+                self._say(line)
 
     def _safe_release(self) -> None:
         try:
             self._release()
         except Exception:
             pass
+
+    def _quarantine_locked(self, why: str) -> None:
+        """A keeper native call took OPEN_WEDGED_S or longer (caller holds
+        the lock): off for the rest of the process. A stream it holds is
+        still closed by the thread (that releases the speaker and the owner
+        cell); nothing is opened again. Logged once."""
+        if self._quarantined:
+            return
+        self._quarantined = True
+        self._holders.clear()
+        self._linger_until = 0.0
+        self._pending.append(
+            f"  [playback-keeper] {why} (wedged: {OPEN_WEDGED_S:.0f}s or "
+            f"more) -- the keeper is OFF for the rest of this run, so no "
+            f"line opens the speaker alongside a hung keeper call again "
+            f"(playback is unaffected, only slower to open; a restart "
+            f"re-arms it)")
+        self._cv.notify_all()
 
     def _note_failure_locked(self, why: str) -> None:
         # Caller holds the lock.

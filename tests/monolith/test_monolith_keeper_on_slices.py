@@ -22,6 +22,13 @@ class unchanged, with:
 The keeper is shut down - and its close waited for - before the harness
 restores the globals, so nothing carries into the next test.
 
+Three re-run tests have a different outcome with the keeper on BY DESIGN,
+and override just that test with the keeper-on expectation (review
+2026-10-09: every monolith class was re-run with the keeper on; these were
+the only differences): the two sec3 headset barge-in tests (a line cut
+before its open is never opened) and R1PlaybackOpenTests' slow-claim timing
+(the keeper's own claim must not tick the test's shared fake clock).
+
     python -m unittest tests.monolith.test_monolith_keeper_on_slices
 """
 from __future__ import annotations
@@ -30,6 +37,11 @@ import threading
 import time
 import unittest
 from unittest import mock
+
+try:
+    import numpy as np
+except ImportError:      # light runner: every class below is skipped
+    np = None
 
 # Modules, not classes: a TestCase class imported into this namespace would
 # be collected (and run) a second time with the keeper OFF.
@@ -185,6 +197,111 @@ class AfterReplyBargeKeeperOnTests(_KeeperOn, _after_reply.BargeTests):
 class SelfEchoLiveSequenceKeeperOnTests(_KeeperOn,
                                         _self_echo.LiveSequenceTests):
     pass
+
+
+class _CutBeforeOpenMixin:
+    """The two sec3 headset barge-in tests run the barge watch synchronously
+    (_ImmediateThread), so the interrupt is already set BEFORE the line's
+    open. With the keeper on, a line cut before its open is never opened
+    (CutBeforeOpenTests in test_monolith_playback_keeper) - so the expected
+    outcome differs BY DESIGN: no sd.play(), no stream for the reaper to
+    abort or close, sd.stop() still never called, the listener still opened
+    and closed, the playback cell still dropped. (Review 2026-10-09: these
+    were the keeper-on differences found by re-running every monolith class
+    with the keeper on; recorded here instead of left unrun.)"""
+
+    def _headset_cut(self, fake_sd, barge_stream, extra):
+        bc = self.bc
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        bc._barge_in_interrupted = True
+        patches = [
+            mock.patch.object(bc, "sd", fake_sd),
+            mock.patch.object(bc, "_tts_layer", fake_layer),
+            mock.patch.object(bc, "_audio_ducker", mock.Mock()),
+            mock.patch.object(bc, "get_output_device", return_value=1),
+            mock.patch.object(bc, "_write_hud_state"),
+            mock.patch.object(bc, "_feed_playback_reference"),
+            mock.patch.object(bc.threading, "Thread", _sec3._ImmediateThread),
+            mock.patch.object(bc.time, "sleep"),
+            mock.patch.object(bc, "BARGE_IN_ENABLED", True),
+            mock.patch.object(bc, "ROBOT_ENABLED", False),
+            mock.patch.object(bc, "is_using_headset", return_value=True),
+            mock.patch.object(bc, "_start_barge_in_listener",
+                              return_value=barge_stream),
+        ] + extra
+        started = [p.start() for p in patches]
+        try:
+            with mock.patch("builtins.print"):
+                bc.play_with_lipsync(np.zeros(48, dtype=np.float32), 24000)
+        finally:
+            for p in patches:
+                p.stop()
+        return started
+
+
+class PlayWithLipsyncExtraPathsKeeperOnTests(
+        _KeeperOn, _CutBeforeOpenMixin,
+        _sec3.PlayWithLipsyncExtraPathsTests):
+
+    def test_barge_in_headset_path_opens_and_closes_listener(self):
+        fake_sd = mock.Mock()
+        stream = _sec3._wire_fake_stream(fake_sd, active=True)
+        barge_stream = mock.Mock()
+        scs_patch = mock.patch.object(self.bc, "_safe_close_stream")
+        started = self._headset_cut(fake_sd, barge_stream, [scs_patch])
+        fake_sd.play.assert_not_called()          # cut before the open
+        fake_sd.get_stream.assert_not_called()
+        stream.abort.assert_not_called()
+        stream.close.assert_not_called()
+        fake_sd.stop.assert_not_called()
+        started[-1].assert_called_once_with(barge_stream)
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+
+class PlayWithLipsyncDefensiveHandlerKeeperOnTests(
+        _KeeperOn, _CutBeforeOpenMixin,
+        _sec3.PlayWithLipsyncDefensiveHandlerTests):
+
+    def test_barge_watch_routed_abort_exception_swallowed(self):
+        fake_sd = mock.Mock()
+        stream = _sec3._wire_fake_stream(fake_sd, active=True)
+        stream.abort.side_effect = RuntimeError("abort boom")
+        self._headset_cut(fake_sd, mock.Mock(), [
+            mock.patch.object(self.bc, "_safe_close_stream")])
+        fake_sd.play.assert_not_called()          # nothing left to abort
+        stream.abort.assert_not_called()
+        stream.close.assert_not_called()
+        fake_sd.stop.assert_not_called()
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+
+class R1PlaybackOpenKeeperOnTests(_KeeperOn, _turn_timing.R1PlaybackOpenTests):
+
+    def test_the_setup_before_the_duck_is_timed_too(self):
+        # The parent's slow claim advances the shared fake clock on EVERY
+        # _pa_claim_owner - with the keeper on that includes the keeper's
+        # own claim on its thread (during the play's wait for its open), one
+        # extra 50 ms tick (610 vs 560). Advance it for the play's cell only:
+        # everything the PLAY does before its open is still timed the same.
+        bc = self.bc
+        claim = bc._pa_claim_owner
+
+        def slow_claim(cell, *a, **k):
+            if cell is bc._tts_playback_active:
+                self.clock.advance(0.050)
+            return claim(cell, *a, **k)
+
+        def slow_device():
+            self.clock.advance(0.300)        # a device refresh / reinit
+            return 1
+
+        self._p(bc, "_pa_claim_owner", side_effect=slow_claim)
+        self._p(bc, "get_output_device", side_effect=slow_device)
+        self._turn()
+        self._play()
+        self.assertEqual(self._emit()["play_open_ms"], "560")
+        self.assertEqual(len(self._keeper_opened), 1)   # it really held
 
 
 class KeeperEngagedTests(_KeeperOn, MonolithGlobalsTestCase):

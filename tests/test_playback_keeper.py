@@ -16,6 +16,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest import mock
 
 from core import playback_keeper as pk
 
@@ -42,6 +43,8 @@ class _FakeStream:
     def close(self, ignore_errors=True):
         t0 = time.monotonic()
         self.rig.event("close", self.device)
+        if self.rig.close_hook is not None:
+            self.rig.close_hook()
         if self.rig.close_delay:
             time.sleep(self.rig.close_delay)
         block = self.rig.close_block
@@ -64,6 +67,7 @@ class _Rig:
         self.open_delay = open_delay
         self.close_delay = close_delay
         self.close_block = None
+        self.close_hook = None
         self.claim_block = None
         self.cell = [False]
         self.lines = []
@@ -133,7 +137,6 @@ class KeeperOffTests(unittest.TestCase):
                               thread_factory=factory)
         self.assertEqual(k.begin(6), 0)
         k.end(0)
-        k.note_device(7)
         k.request_yield()
         self.assertTrue(k.wait_settled(0.01))
         self.assertFalse(k.is_live())
@@ -199,13 +202,14 @@ class KeeperLifecycleTests(unittest.TestCase):
     def test_device_change_closes_and_reopens_on_the_new_device(self):
         tok = self.k.begin(6)
         self.assertTrue(_wait_for(self.k.is_live))
-        self.k.note_device(7)
+        tok7 = self.k.begin(7)            # the play path's begin(out_dev)
         self.assertFalse(self.k.is_live(), "not live on the device in use")
         self.assertTrue(_wait_for(
             lambda: [e[1] for e in self.rig.events if e[0] == "open"]
             == [6, 7]))
         self.assertTrue(_wait_for(self.k.is_live))
         self.k.end(tok)
+        self.k.end(tok7)
         self.assertTrue(_wait_for(lambda: not self.rig.cell[0]))
         self.assertEqual(self.rig.names(),
                          ["claim", "open", "abort", "close", "release",
@@ -227,6 +231,18 @@ class KeeperLifecycleTests(unittest.TestCase):
         self.k.set_enabled(False)
         self.assertTrue(_wait_for(lambda: not self.rig.cell[0]))
         self.assertFalse(self.k.is_live())
+
+    def test_turning_off_forgets_the_holders(self):
+        # Off then on again (the owner flips the setting mid-reply): a
+        # holder from before must not reopen the speaker by itself.
+        self.k.begin(6)                       # never ended
+        self.assertTrue(_wait_for(self.k.is_live))
+        self.k.set_enabled(False)
+        self.assertTrue(_wait_for(lambda: not self.rig.cell[0]))
+        self.k.set_enabled(True)
+        time.sleep(0.15)                      # > linger_s
+        self.assertEqual(self.rig.names().count("open"), 1)
+        self.assertFalse(self.rig.cell[0])
 
 
 class KeeperBoundsTests(unittest.TestCase):
@@ -261,10 +277,11 @@ class KeeperBoundsTests(unittest.TestCase):
         time.sleep(0.1)
         self.assertEqual(rig.names().count("open"), 1)
         # ... and then it holds the speaker again, on that device.
-        self.k.note_device(9)
+        tok9 = self.k.begin(9)
         self.assertTrue(_wait_for(self.k.is_live))
         self.assertEqual([e[1] for e in rig.events if e[0] == "open"], [6, 9])
         self.k.end(tok)
+        self.k.end(tok9)
 
     def test_yield_block_expires_by_itself(self):
         rig = _Rig()
@@ -309,8 +326,7 @@ class KeeperBoundsTests(unittest.TestCase):
         # once the device opens, says so.
         rig.open_error = None
         clock[0] += 5.1
-        self.k.note_device(6)            # any notify re-evaluates
-        self.k.begin(6)
+        self.k.begin(6)                  # any notify re-evaluates
         self.assertTrue(_wait_for(self.k.is_live))
         self.assertTrue(any("holding the speaker again" in ln
                             for ln in rig.lines), rig.lines)
@@ -324,7 +340,6 @@ class KeeperBoundsTests(unittest.TestCase):
         self.k.begin(6)
         self.assertTrue(_wait_for(lambda: rig.names().count("open") == 1))
         clock[0] = 5.5
-        self.k.note_device(6)
         self.k.begin(6)
         self.assertTrue(_wait_for(lambda: rig.names().count("open") == 2))
         clock[0] = 5.5 + 9.0              # inside the 10 s second back-off
@@ -334,23 +349,84 @@ class KeeperBoundsTests(unittest.TestCase):
         clock[0] = 5.5 + 10.5
         self.k.begin(6)
         self.assertTrue(_wait_for(lambda: rig.names().count("open") == 3))
+        # Three failures in one streak: ONE line (review 2026-10-09: no test
+        # pinned the count over repeated failures).
+        self.assertTrue(_wait_for(lambda: rig.names().count("release") == 3))
+        self.assertEqual(sum("not holding the speaker" in ln
+                             for ln in rig.lines), 1, rig.lines)
+
+    def test_each_failure_streak_logs_once(self):
+        rig = _Rig(open_error=OSError("-9999"))
+        clock = [0.0]
+        self.k = rig.keeper(clock=lambda: clock[0])
+        self.k.set_enabled(True)
+        tok = self.k.begin(6)
+        self.assertTrue(_wait_for(lambda: rig.names().count("release") == 1))
+        clock[0] = 5.5                         # past the 5 s back-off
+        self.k.begin(6)
+        self.assertTrue(_wait_for(lambda: rig.names().count("release") == 2))
+        rig.open_error = None                  # it works again ...
+        clock[0] = 5.5 + 10.5
+        self.k.begin(6)
+        self.assertTrue(_wait_for(self.k.is_live))
+        self.k.set_enabled(False)              # ... closes ...
+        self.assertTrue(_wait_for(lambda: not rig.cell[0]))
+        rig.open_error = OSError("-9999")      # ... and a NEW streak starts
+        self.k.set_enabled(True)
+        self.k.begin(6)
+        self.assertTrue(_wait_for(lambda: rig.names().count("open") == 4))
+        self.assertTrue(_wait_for(lambda: rig.names().count("release") == 4))
+        self.assertEqual(sum("not holding the speaker" in ln
+                             for ln in rig.lines), 2, rig.lines)
+        self.assertEqual(sum("holding the speaker again" in ln
+                             for ln in rig.lines), 1, rig.lines)
+        self.k.end(tok)
 
 
 class KeeperCallerSafetyTests(unittest.TestCase):
     def tearDown(self):
         self.k.shutdown()
 
-    def test_wait_settled_is_bounded_while_an_open_is_in_flight(self):
+    def test_an_open_in_flight_is_waited_for_until_it_returns(self):
+        # Review 2026-10-09: the budget is for a call only DUE. One already
+        # in flight is waited for until it RETURNS - a caller that went
+        # ahead after its budget would open alongside it.
         rig = _Rig(open_delay=0.3)
         self.k = rig.keeper()
         self.k.set_enabled(True)
         self.k.begin(6)
         self.assertTrue(_wait_for(lambda: "open" in rig.names()))
         t0 = time.monotonic()
-        self.assertFalse(self.k.wait_settled(0.05))
-        self.assertLess(time.monotonic() - t0, 0.2)
-        self.assertTrue(self.k.wait_settled(1.0))
+        self.assertTrue(self.k.wait_settled(0.05))
+        t1 = time.monotonic()
+        self.assertGreater(t1 - t0, 0.15, "gave up on the open in flight")
         self.assertTrue(self.k.is_live())
+        self.assertTrue(all(sp[3] <= t1 for sp in rig.spans), rig.spans)
+
+    def test_the_wait_for_a_call_in_flight_is_bounded_in_real_time(self):
+        # The keeper's clock stands still (a fake), so only the real-time
+        # backstop (OPEN_WEDGED_S from the start of the wait) can end it.
+        rig = _Rig()
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def _open(device):
+            rig.event("open", device)
+            gate.wait(5.0)
+            return _FakeStream(rig, device)
+
+        with mock.patch.object(pk, "OPEN_WEDGED_S", 0.3):
+            self.k = pk.PlaybackKeeper(open_stream=_open, claim=rig.claim,
+                                       release=rig.release, log=rig.log,
+                                       clock=lambda: 50.0, linger_s=0.05)
+            self.k.set_enabled(True)
+            self.k.begin(6)
+            self.assertTrue(_wait_for(lambda: "open" in rig.names()))
+            t0 = time.monotonic()
+            self.assertFalse(self.k.wait_settled(0.05))
+            dt = time.monotonic() - t0
+        self.assertGreaterEqual(dt, 0.25)
+        self.assertLess(dt, 1.0)
 
     def test_a_wedged_open_stops_costing_playbacks_a_wait(self):
         rig = _Rig()
@@ -368,17 +444,21 @@ class KeeperCallerSafetyTests(unittest.TestCase):
         self.k.set_enabled(True)
         self.k.begin(6)
         self.assertTrue(_wait_for(lambda: "open" in rig.names()))
-        # In flight for less than OPEN_WEDGED_S: a bounded wait.
+        # In flight for less than OPEN_WEDGED_S: waited for (it returns).
+        threading.Timer(0.1, gate.set).start()
         t0 = time.monotonic()
-        self.assertFalse(self.k.wait_settled(0.05))
-        self.assertGreaterEqual(time.monotonic() - t0, 0.04)
-        # Past it: no wait at all.
+        self.assertTrue(self.k.wait_settled(0.05))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.08)
+        self.assertTrue(self.k.is_live())
+        # A second open, in flight past OPEN_WEDGED_S: no wait at all.
+        gate.clear()
+        self.k.end(self.k.begin(7))
+        self.assertTrue(_wait_for(lambda: rig.names().count("open") == 2))
         clock[0] += pk.OPEN_WEDGED_S + 0.1
         t0 = time.monotonic()
         self.assertFalse(self.k.wait_settled(0.45))
         self.assertLess(time.monotonic() - t0, 0.02)
         gate.set()
-        self.assertTrue(_wait_for(self.k.is_live))
 
     def test_a_wedged_close_keeps_the_cell_and_never_blocks_callers(self):
         rig = _Rig()
@@ -394,14 +474,24 @@ class KeeperCallerSafetyTests(unittest.TestCase):
         # sd._terminate() away from the live native call) ...
         self.assertTrue(rig.cell[0])
         self.assertNotIn("release", rig.names())
-        # ... and no caller blocks on it.
+        # ... and no caller that does not wait blocks on it.
         t0 = time.monotonic()
         t2 = self.k.begin(6)
         self.k.end(t2)
-        self.k.note_device(7)
+        self.k.end(self.k.begin(7))
         self.k.request_yield()
-        self.k.wait_settled(0.01)
+        self.k.is_live()
         self.assertLess(time.monotonic() - t0, 0.1)
+        # The waiting ones (wait_settled / enter_play_open) wait for a close
+        # in flight only until it counts as wedged: OPEN_WEDGED_S from its
+        # start (0.3 s here), then not at all.
+        with mock.patch.object(pk, "OPEN_WEDGED_S", 0.3):
+            t0 = time.monotonic()
+            self.assertFalse(self.k.wait_settled(0.01))
+            self.assertLess(time.monotonic() - t0, 0.35)
+            t0 = time.monotonic()
+            self.assertFalse(self.k.wait_settled(0.01))
+            self.assertLess(time.monotonic() - t0, 0.02)
         rig.close_block.set()
         self.assertTrue(_wait_for(lambda: not rig.cell[0]))
 
@@ -410,7 +500,7 @@ class KeeperCallerSafetyTests(unittest.TestCase):
         # line were printed while the keeper's lock is held.
         rig = _Rig(open_error=RuntimeError("boom"))
         holder = {}
-        finished = []
+        in_time = []
 
         def reentrant_log(line):
             rig.lines.append(line)
@@ -418,14 +508,18 @@ class KeeperCallerSafetyTests(unittest.TestCase):
 
             def _calls():
                 k.is_live()
-                k.note_device(6)
+                k.note_play()
                 k.end(k.begin(6))
-                finished.append(True)
-            # On a helper thread with a bounded join: a deadlock fails the
-            # test instead of hanging the suite.
+            # On a helper thread with a SHORT bounded join, judged WHILE the
+            # hook still runs: a line printed under the keeper's lock leaves
+            # the helper blocked until the hook returns. (Review 2026-10-09:
+            # the old version joined for 1 s and then waited for the helper
+            # to finish at all - after the hook returned the lock dropped and
+            # the helper finished late, so logging under the lock passed.)
             t = threading.Thread(target=_calls, daemon=True)
             t.start()
-            t.join(1.0)
+            t.join(0.5)
+            in_time.append(not t.is_alive())
 
         self.k = pk.PlaybackKeeper(open_stream=rig.open_stream,
                                    claim=rig.claim, release=rig.release,
@@ -433,8 +527,8 @@ class KeeperCallerSafetyTests(unittest.TestCase):
         holder["k"] = self.k
         self.k.set_enabled(True)
         self.k.begin(6)
-        self.assertTrue(_wait_for(lambda: len(rig.lines) >= 1))
-        self.assertTrue(_wait_for(lambda: finished == [True]),
+        self.assertTrue(_wait_for(lambda: len(in_time) >= 1))
+        self.assertTrue(all(in_time),
                         "a keeper call from the log hook blocked: a line "
                         "was printed under the keeper's lock")
 
@@ -525,7 +619,7 @@ class KeeperOneOpenAtATimeTests(unittest.TestCase):
         t_mark = time.monotonic()
         # A device change (or a block that runs out) lands while the
         # playback's open is in flight: the keeper must not touch PortAudio.
-        self.k.note_device(7)
+        tok7 = self.k.begin(7)
         time.sleep(0.15)
         t_exit = time.monotonic()
         self.assertEqual(_overlaps(rig.spans, t_mark, t_exit), [])
@@ -535,6 +629,7 @@ class KeeperOneOpenAtATimeTests(unittest.TestCase):
         self.assertEqual([e[1] for e in rig.events if e[0] == "open"], [6, 7])
         self.assertTrue(all(x[2] >= t_exit for x in rig.spans[1:]), rig.spans)
         self.k.end(tok)
+        self.k.end(tok7)
 
     def test_a_wedged_play_open_stops_holding_the_keeper_back(self):
         self.rig = rig = _Rig()
@@ -544,7 +639,7 @@ class KeeperOneOpenAtATimeTests(unittest.TestCase):
         tok = self.k.begin(6)
         self.assertTrue(_wait_for(self.k.is_live))
         tok_p, _ = self.k.enter_play_open(0.0)     # never exited (wedged)
-        self.k.note_device(7)
+        tok7 = self.k.begin(7)
         time.sleep(0.1)
         self.assertEqual(rig.names().count("abort"), 0)
         clock[0] += pk.OPEN_WEDGED_S + 0.1
@@ -553,6 +648,30 @@ class KeeperOneOpenAtATimeTests(unittest.TestCase):
         self.assertEqual([e[1] for e in rig.events if e[0] == "open"], [6, 7])
         self.k.exit_play_open(tok_p)
         self.k.end(tok)
+        self.k.end(tok7)
+
+    def test_a_keeper_close_in_flight_is_waited_for_by_a_play(self):
+        self.rig = rig = _Rig()
+        rig.close_block = threading.Event()
+        clock = [10.0]
+        self.k = rig.keeper(clock=lambda: clock[0])
+        self.k.set_enabled(True)
+        tok = self.k.begin(6)
+        self.assertTrue(_wait_for(self.k.is_live))
+        self.k.end(tok)
+        clock[0] += 1.0                            # past the 0.05 s linger
+        self.k.set_enabled(True)
+        self.assertTrue(_wait_for(lambda: "close" in rig.names()))
+        # In flight for less than OPEN_WEDGED_S: waited for past the play's
+        # own 0.05 s budget, until it returns.
+        threading.Timer(0.1, rig.close_block.set).start()
+        t0 = time.monotonic()
+        tok_p, settled = self.k.enter_play_open(0.05)
+        t1 = time.monotonic()
+        self.assertTrue(settled)
+        self.assertGreaterEqual(t1 - t0, 0.08)
+        self.assertTrue(all(sp[3] <= t1 for sp in rig.spans), rig.spans)
+        self.k.exit_play_open(tok_p)
 
     def test_a_wedged_keeper_close_costs_plays_no_wait(self):
         self.rig = rig = _Rig()
@@ -566,13 +685,7 @@ class KeeperOneOpenAtATimeTests(unittest.TestCase):
         clock[0] += 1.0                            # past the 0.05 s linger
         self.k.set_enabled(True)
         self.assertTrue(_wait_for(lambda: "close" in rig.names()))
-        # In flight for less than OPEN_WEDGED_S: a bounded wait.
-        t0 = time.monotonic()
-        tok_p, settled = self.k.enter_play_open(0.05)
-        self.assertFalse(settled)
-        self.assertGreaterEqual(time.monotonic() - t0, 0.04)
-        self.k.exit_play_open(tok_p)
-        # Past it: no wait at all.
+        # In flight past OPEN_WEDGED_S: no wait at all.
         clock[0] += pk.OPEN_WEDGED_S + 0.1
         t0 = time.monotonic()
         tok_p, settled = self.k.enter_play_open(pk.READY_WAIT_S)
@@ -582,17 +695,56 @@ class KeeperOneOpenAtATimeTests(unittest.TestCase):
         rig.close_block.set()
         self.assertTrue(_wait_for(lambda: not rig.cell[0]))
 
-    def test_the_play_wait_is_bounded_by_its_timeout(self):
+    def test_a_play_never_opens_alongside_a_slow_keeper_open(self):
+        # Review 2026-10-09 (both reviewers): the old flat READY_WAIT_S
+        # budget gave up on a keeper open still in flight (live: 1 in 168
+        # first-line opens took ~0.7 s) and let the play open alongside it.
         self.rig = rig = _Rig(open_delay=0.6)
         self.k = rig.keeper()
         self.k.set_enabled(True)
         tok = self.k.begin(6)
+        self.assertTrue(_wait_for(lambda: "open" in rig.names()))
         t0 = time.monotonic()
-        tok_p, settled = self.k.enter_play_open(0.1)
-        self.assertFalse(settled)
-        self.assertLess(time.monotonic() - t0, 0.4)
+        tok_p, settled = self.k.enter_play_open(pk.READY_WAIT_S)
+        t_play = time.monotonic()
+        self.assertTrue(settled)
+        self.assertGreater(t_play - t0, pk.READY_WAIT_S - 0.1)
+        self.assertTrue(self.k.is_live())
+        time.sleep(0.05)                           # the play's own open
+        t_play_end = time.monotonic()
         self.k.exit_play_open(tok_p)
+        # Judged once every keeper call has returned (spans are recorded at
+        # the END of a call, so a call still running would not show yet).
+        self.assertTrue(_wait_for(lambda: any(sp[0] == "open"
+                                              for sp in rig.spans)))
+        self.assertEqual(_overlaps(rig.spans, t_play, t_play_end), [])
         self.k.end(tok)
+
+    def test_a_call_only_due_is_waited_for_its_budget_then_held_off(self):
+        # Giving up on a DUE call (not started) is safe: the play's mark
+        # holds it off until exit_play_open.
+        self.rig = rig = _Rig()
+        self.k = rig.keeper()
+        self.k.set_enabled(True)
+        tok = self.k.begin(6)
+        self.assertTrue(_wait_for(self.k.is_live))
+        tok_a, _ = self.k.enter_play_open(pk.READY_WAIT_S)   # play A opening
+        tok7 = self.k.begin(7)          # speaker change: close + open DUE
+        t0 = time.monotonic()
+        tok_b, settled = self.k.enter_play_open(0.1)         # play B
+        dt = time.monotonic() - t0
+        self.assertFalse(settled)
+        self.assertGreaterEqual(dt, 0.09)
+        self.assertLess(dt, 0.5)
+        self.k.exit_play_open(tok_a)
+        time.sleep(0.1)
+        self.assertEqual(rig.names().count("abort"), 0,
+                         "the keeper moved while play B's open was marked")
+        self.k.exit_play_open(tok_b)
+        self.assertTrue(_wait_for(self.k.is_live))
+        self.assertEqual([e[1] for e in rig.events if e[0] == "open"], [6, 7])
+        self.k.end(tok)
+        self.k.end(tok7)
 
     def test_no_keeper_thread_means_nothing_to_wait_for_or_mark(self):
         self.rig = rig = _Rig()
@@ -627,10 +779,11 @@ class KeeperStaleIndexTests(unittest.TestCase):
         self.assertFalse(rig.cell[0])
         self.assertEqual(self.k.dropped_opens, 1)
         self.assertEqual(self.k.failures, 0, "a dropped open is no failure")
-        self.k.note_device(9)                      # a fresh index
+        tok9 = self.k.begin(9)                     # a fresh index
         self.assertTrue(_wait_for(self.k.is_live))
         self.assertEqual([e[1] for e in rig.events if e[0] == "open"], [9])
         self.k.end(tok)
+        self.k.end(tok9)
 
 
 class KeeperLingerTests(unittest.TestCase):
@@ -696,6 +849,140 @@ class KeeperShutdownWaitTests(unittest.TestCase):
         self.assertTrue(self.k.shutdown(wait_s=1.0))
 
 
+class KeeperYieldWaitTests(unittest.TestCase):
+    """Review 2026-10-09 (audio safety, medium): _refresh_devices asks the
+    keeper to step aside and then waits - wait_settled(YIELD_WAIT_S) - for
+    its close to RETURN, because its caller (record_speech) opens the mic
+    straight after. The wait the monolith makes is pinned in
+    tests/monolith/test_monolith_playback_keeper.py (KeeperYieldWaitTests);
+    this pins that wait_settled really covers the close."""
+
+    def tearDown(self):
+        self.k.shutdown()
+
+    def test_the_wait_returns_only_after_the_close_returned(self):
+        rig = _Rig(close_delay=0.08)
+        self.k = rig.keeper(linger_s=2.0)
+        self.k.set_enabled(True)
+        self.k.end(self.k.begin(6))           # lingering: only the keeper
+        self.assertTrue(_wait_for(self.k.is_live))
+        self.k.request_yield()
+        self.assertTrue(self.k.wait_settled(pk.YIELD_WAIT_S))
+        t_after = time.monotonic()
+        closes = [sp for sp in rig.spans if sp[0] == "close"]
+        self.assertEqual(len(closes), 1, rig.spans)
+        self.assertLessEqual(closes[0][3], t_after)
+        self.assertFalse(rig.cell[0])
+        self.assertEqual(rig.names()[-1], "release")
+
+    def test_a_yield_during_the_keepers_open_waits_for_open_and_close(self):
+        rig = _Rig(open_delay=0.25, close_delay=0.02)
+        self.k = rig.keeper(linger_s=2.0)
+        self.k.set_enabled(True)
+        self.k.end(self.k.begin(6))
+        self.assertTrue(_wait_for(lambda: "open" in rig.names()))
+        self.k.request_yield()                # the claim is up: deferred
+        self.assertTrue(self.k.wait_settled(pk.YIELD_WAIT_S))
+        t_after = time.monotonic()
+        self.assertEqual([sp[0] for sp in rig.spans],
+                         ["open", "abort", "close"])
+        self.assertTrue(all(sp[3] <= t_after for sp in rig.spans), rig.spans)
+        self.assertFalse(rig.cell[0])
+
+
+class KeeperQuarantineTests(unittest.TestCase):
+    """Review 2026-10-09: a keeper native call that ran OPEN_WEDGED_S or
+    longer is one a playback could not wait for (it opened alongside it), so
+    the keeper switches itself off for the rest of the process: it closes
+    what it holds and never opens again. Logged once."""
+
+    def tearDown(self):
+        self.k.shutdown()
+
+    def _keeper(self, rig, clock, open_s=0.0):
+        def _open(device):
+            rig.event("open", device)
+            clock[0] += open_s                   # the native open's length
+            if rig.open_error is not None:
+                raise rig.open_error
+            return _FakeStream(rig, device)
+
+        return pk.PlaybackKeeper(open_stream=_open, claim=rig.claim,
+                                 release=rig.release, log=rig.log,
+                                 clock=lambda: clock[0], linger_s=0.05)
+
+    def test_a_wedged_open_switches_the_keeper_off_for_good(self):
+        rig = _Rig()
+        clock = [10.0]
+        # The close of what the slow open gave it is slow too: still ONE
+        # quarantine line.
+        rig.close_hook = lambda: clock.__setitem__(
+            0, clock[0] + pk.OPEN_WEDGED_S + 0.1)
+        self.k = self._keeper(rig, clock, open_s=pk.OPEN_WEDGED_S + 0.1)
+        self.k.set_enabled(True)
+        self.k.begin(6)
+        # It closes what the slow open gave it, and drops the owner cell.
+        self.assertTrue(_wait_for(lambda: "release" in rig.names()))
+        self.assertEqual(rig.names(),
+                         ["claim", "open", "abort", "close", "release"])
+        self.assertTrue(self.k.quarantined)
+        self.assertFalse(rig.cell[0])
+        # Nothing opens again, whatever asks.
+        self.k.set_enabled(True)
+        self.assertEqual(self.k.begin(6), 0)
+        self.assertEqual(self.k.begin(7), 0)
+        time.sleep(0.1)
+        self.assertEqual(rig.names().count("open"), 1)
+        self.assertEqual(self.k.enter_play_open(0.1), (0, True))
+        self.assertEqual(sum("OFF for the rest of this run" in ln
+                             for ln in rig.lines), 1, rig.lines)
+
+    def test_a_wedged_failed_open_quarantines_too(self):
+        rig = _Rig(open_error=OSError("-9999"))
+        clock = [10.0]
+        self.k = self._keeper(rig, clock, open_s=pk.OPEN_WEDGED_S + 0.5)
+        self.k.set_enabled(True)
+        self.k.begin(6)
+        self.assertTrue(_wait_for(lambda: "release" in rig.names()))
+        self.assertTrue(_wait_for(lambda: self.k.quarantined))
+        clock[0] += 120.0                        # far past any back-off
+        self.assertEqual(self.k.begin(6), 0)
+        time.sleep(0.1)
+        self.assertEqual(rig.names().count("open"), 1)
+
+    def test_a_wedged_close_switches_the_keeper_off_for_good(self):
+        rig = _Rig()
+        clock = [10.0]
+        rig.close_hook = lambda: clock.__setitem__(
+            0, clock[0] + pk.OPEN_WEDGED_S + 0.1)
+        self.k = self._keeper(rig, clock)
+        self.k.set_enabled(True)
+        tok = self.k.begin(6)
+        self.assertTrue(_wait_for(self.k.is_live))
+        self.k.end(tok)
+        clock[0] += 1.0                          # past the linger
+        self.k.set_enabled(True)                 # notify: re-evaluate
+        self.assertTrue(_wait_for(lambda: "release" in rig.names()))
+        self.assertTrue(_wait_for(lambda: self.k.quarantined))
+        rig.close_hook = None
+        self.assertEqual(self.k.begin(6), 0)
+        time.sleep(0.1)
+        self.assertEqual(rig.names().count("open"), 1)
+        self.assertEqual(sum("its close on device 6" in ln
+                             for ln in rig.lines), 1, rig.lines)
+
+    def test_a_slow_open_under_the_wedge_bound_is_kept(self):
+        rig = _Rig()
+        clock = [10.0]
+        self.k = self._keeper(rig, clock, open_s=pk.OPEN_WEDGED_S - 0.2)
+        self.k.set_enabled(True)
+        tok = self.k.begin(6)
+        self.assertTrue(_wait_for(self.k.is_live))
+        self.assertFalse(self.k.quarantined)
+        self.assertNotIn("close", rig.names())
+        self.k.end(tok)
+
+
 class KeeperConstantsTests(unittest.TestCase):
     def test_per_turn_bounds(self):
         # Never permanent: a holder is bounded, the linger is short, and the
@@ -712,6 +999,11 @@ class KeeperConstantsTests(unittest.TestCase):
         self.assertGreaterEqual(pk.READY_WAIT_S, 0.35)
         self.assertLessEqual(pk.READY_WAIT_S, 0.5)
         self.assertGreater(pk.OPEN_WEDGED_S, pk.READY_WAIT_S)
+        # The re-enumeration's wait for the keeper's close (10 ms) also
+        # covers a keeper open in flight when the yield came (live max
+        # 699 ms) - and stays a short, bounded wait on the voice thread.
+        self.assertGreaterEqual(pk.YIELD_WAIT_S, 0.8)
+        self.assertLessEqual(pk.YIELD_WAIT_S, pk.OPEN_WEDGED_S)
 
 
 if __name__ == "__main__":

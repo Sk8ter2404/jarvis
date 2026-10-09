@@ -6025,6 +6025,7 @@ class PlaybackReaperTests(MonolithGlobalsTestCase):
         fake_sd = _ReaperFakeSd(stream)
         audio = np.zeros(24, dtype=np.float32)
         patches = self._patches(fake_sd)
+        before = {t for t in threading.enumerate() if t.name == "tts-reaper"}
         for p in patches:
             p.start()
         try:
@@ -6033,6 +6034,13 @@ class PlaybackReaperTests(MonolithGlobalsTestCase):
             elapsed = time.monotonic() - t0
         finally:
             release.set()                        # free the stranded daemon
+            # ...and let it FINISH while this test's patches still stand:
+            # once freed it calls the module-global _prof / _pa_close_done,
+            # which a test starting right after may have patched (review
+            # 2026-10-09: R1ReaperMarkTests caught a stray 'reap_closed').
+            for t in threading.enumerate():
+                if t.name == "tts-reaper" and t not in before:
+                    t.join(2.0)
             for p in patches:
                 p.stop()
         self.assertGreaterEqual(elapsed, 5.5, "bounded wait was skipped")

@@ -14765,6 +14765,12 @@ def _refresh_devices(force: bool = False):
             _log_reinit_deferral(_defer_reason, _defer_message)
             if _defer_reason == "keeper":
                 _keeper_request_yield()
+                # ...and let its close RETURN before this pass does: the
+                # usual caller here is record_speech, which opens its mic
+                # InputStream straight after, and PortAudio's open-stream
+                # list must never see the keeper's Pa_CloseStream and that
+                # Pa_OpenStream at once (review 2026-10-09). ~10 ms; bounded.
+                _keeper_wait_yielded()
             _reinit_ok = False
             if do_reinit:
                 try:
@@ -18383,7 +18389,11 @@ def _keeper_cached_out():
     that re-enumerates PortAudio stores its freshly picked index only at its
     end, so in between the cache holds an index from BEFORE the reinit (MME
     renumbers its devices) — the keeper must never be handed that. A
-    non-blocking try of the pass's own lock: never waits, never raises."""
+    non-blocking try of the pass's own lock: never waits, never raises.
+    Residual window (review 2026-10-09, accepted): a whole pass that starts
+    AFTER this read and re-enumerates before the caller's begin() takes the
+    keeper's lock (a few bytecodes) would leave the keeper holding zeros on
+    a stale index - silent, and the next play's begin(out_dev) moves it."""
     try:
         if not _device_refresh_lock.acquire(blocking=False):
             return _pk_mod.UNSET
@@ -18427,6 +18437,21 @@ def _keeper_request_yield() -> None:
         pass
 
 
+def _keeper_wait_yielded() -> None:
+    """After _keeper_request_yield(): wait (bounded, YIELD_WAIT_S; a keeper
+    call in flight until it returns, at most OPEN_WEDGED_S) until the
+    keeper's close has returned, so _refresh_devices' caller never opens a
+    stream while the keeper is inside Pa_CloseStream. Called OUTSIDE _pa_gate
+    (the keeper's release takes _mic_lock after its close). Logs when the
+    close did not return in time. Never raises."""
+    try:
+        if not _playback_keeper.wait_settled(_pk_mod.YIELD_WAIT_S):
+            print("  [playback-keeper] stepping aside: its close had not "
+                  f"returned after {_pk_mod.YIELD_WAIT_S:.1f}s")
+    except Exception:
+        pass
+
+
 def _keeper_reinit_done() -> None:
     try:
         _playback_keeper.reinit_done()
@@ -18435,14 +18460,16 @@ def _keeper_reinit_done() -> None:
 
 
 def _keeper_before_open() -> int:
-    """Right before a playback opens its stream: wait (bounded,
-    READY_WAIT_S) while the keeper has an open or close in flight OR DUE (a
-    device change, a cold start), then mark this playback's open in flight
-    so the keeper starts no native call until _keeper_after_open — PortAudio
-    must never see the two at once, in either order. Then note on the turn
-    line whether the speaker was held (keeper=1/0). Returns the token for
-    _keeper_after_open (0 = nothing marked). Only while the keeper is on.
-    Never raises."""
+    """Right before a playback opens its stream: wait while the keeper has
+    an open or close in flight (until it returns, at most OPEN_WEDGED_S) or
+    DUE (a device change, a cold start: at most READY_WAIT_S), then mark this
+    playback's open in flight so the keeper starts no native call until
+    _keeper_after_open — PortAudio must never see the two at once, in either
+    order. ``settled`` is not needed here: a call still only due is held off
+    by the mark, and one wedged in flight quarantines the keeper. Then note
+    on the turn line whether the speaker was held (keeper=1/0). Returns the
+    token for _keeper_after_open (0 = nothing marked). Only while the keeper
+    is on. Never raises."""
     try:
         if not _playback_keeper.enabled:
             return 0
@@ -18505,8 +18532,11 @@ def _reap_poll_s() -> float:
 #     drained for 201 ms after its last callback. sd.play() ends with
 #     CallbackAbort (sounddevice's _CallbackContext.callback_exit) one
 #     callback after its data runs out, so PortAudio DISCARDS the ~180 ms
-#     still queued: the last ~0.15-0.17 s of every line — or the 0.15 s
-#     SENTENCE_GAP_S pad — is never heard;
+#     still queued. Rendered lines already end in ~80-250 ms of near-
+#     silence (below -40 dB: Kokoro 79-86 ms, the clone mostly ~100 ms;
+#     review 2026-10-09), so what is lost is mostly that trailing quiet or
+#     the 0.15 s SENTENCE_GAP_S pad, plus ~50-70 ms of the last syllable's
+#     decay;
 #   * an MME stream starts with ~208 ms of queued buffers, filled with
 #     silence (sd.play() hard-codes prime_output_buffers_using_stream_
 #     callback=False), so the first sample is heard ~0.18-0.21 s after the

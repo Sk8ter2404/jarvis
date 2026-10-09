@@ -1318,9 +1318,10 @@ SCHEMA: dict[str, dict] = {
         "tab": "voice", "label": "Start each line without the lead-in gap",
         "type": "bool", "default": False,
         "help": "Each line starts about 0.2 seconds sooner and plays to its "
-                "very end (the old way lost its last ~0.15 seconds, or the "
-                "pause after a sentence). Changes how replies sound, so try "
-                "it by ear. Applies on the next start.",
+                "very end (the old way cut its last ~0.15 seconds: mostly "
+                "quiet or the pause after a sentence, plus the very end of "
+                "the last word's fade). Changes how replies sound, so try it "
+                "by ear. Applies on the next start.",
     },
     "PROCESSING_FILLER_PRERENDER": {
         "tab": "voice", "label": "Prepare the answer during the filler",

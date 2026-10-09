@@ -1304,7 +1304,20 @@ class R1ReaperMarkTests(_Base):
     def _run(self, stream):
         bc = self.bc
         tags = []
-        self._p(bc, "_prof", side_effect=lambda tag, extra="": tags.append(tag))
+        me = threading.get_ident()
+
+        def _mark(tag, extra=""):
+            # Only THIS call's marks: _reap_playback runs synchronously on
+            # this thread. A reaper stranded by an earlier test (sec3's
+            # test_wedged_native_close_cannot_stall_caller frees its daemon
+            # in its finally) calls the module-global _prof whenever its
+            # close returns - into this test's patch, if the tests run back
+            # to back (review 2026-10-09: an extra leading 'reap_closed' in
+            # a full gate, order-dependent).
+            if threading.get_ident() == me:
+                tags.append(tag)
+
+        self._p(bc, "_prof", side_effect=_mark)
         done = threading.Event()
         with mock.patch.object(bc, "_pa_close_done"):
             bc._reap_playback(stream, done, 0.1)
@@ -1334,6 +1347,25 @@ class R1ReaperMarkTests(_Base):
         type(stream).active = mock.PropertyMock(
             side_effect=RuntimeError("gone"))
         self.assertEqual(self._run(stream), ["reap_closed"])
+
+    def test_a_stray_reapers_mark_is_not_counted(self):
+        # Another thread's reaper calling _prof mid-run (the stranded daemon
+        # above) must not land in this run's marks.
+        bc = self.bc
+
+        class _Stream:
+            active = False
+
+            def stop(self, ignore_errors=True):
+                t = threading.Thread(target=lambda: bc._prof("reap_closed"))
+                t.start()
+                t.join(2.0)
+
+            def close(self, ignore_errors=True):
+                pass
+
+        self.assertEqual(self._run(_Stream()),
+                         ["reap_inactive", "reap_closed"])
 
 
 @requires_monolith
