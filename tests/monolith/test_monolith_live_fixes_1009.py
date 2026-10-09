@@ -98,6 +98,38 @@ class SingularCloseTests(unittest.TestCase):
             self.assertEqual(len(matches), expect, said)
 
 
+class ReviewFixTests(unittest.TestCase):
+    def test_u2_band_requests_untouched(self):
+        from core.stt_vocab import fix_command_mishearings as f
+        for t in ("start U2 radio", "open the u2 concert playlist",
+                  "open u2 on spotify", "go to u2 website"):
+            self.assertEqual(f(t), t)
+        self.assertEqual(f("open u2"), "open YouTube")
+        self.assertEqual(f("open you two"), "open YouTube")
+
+    def test_compound_close_not_singular(self):
+        from core.actions import _singular_close_said as g
+        self.assertTrue(g("close that chrome window"))
+        for t in ("close that chrome window and the youtube window",
+                  "close that window or this window",
+                  "close that window then close all windows",
+                  "close that chrome window, and then after that also close every other window"):
+            self.assertFalse(g(t), t)
+
+    def test_hand_tracking_ambiguous_words_left_to_brain(self):
+        from core.dispatcher import hand_tracking_route as h
+        for t in ("turn up hand tracking", "pause hand tracking",
+                  "hand tracking enabled", "hand tracking disabled"):
+            self.assertIsNone(h(t), t)
+        self.assertEqual(h("turn on hand tracking"), "[ACTION: air_mouse_on]")
+        self.assertEqual(h("hand tracking off"), "[ACTION: air_mouse_off]")
+
+    def test_gmail_dot_com_and_twitch_app(self):
+        from core.actions import _website_name_url as w
+        self.assertEqual(w("gmail.com"), "https://mail.google.com")
+        self.assertIsNone(w("twitch"))
+
+
 @requires_monolith
 class WarmupBudgetTests(unittest.TestCase):
     def test_cold_start_gets_longer_budget(self):

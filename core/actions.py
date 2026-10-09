@@ -92,7 +92,6 @@ _WEBSITE_NAME_URLS = {
     "hulu": "https://www.hulu.com", "disney plus": "https://www.disneyplus.com",
     "disney+": "https://www.disneyplus.com",
     "prime video": "https://www.primevideo.com",
-    "twitch": "https://www.twitch.tv",
     "gmail": "https://mail.google.com", "google mail": "https://mail.google.com",
     "google": "https://www.google.com",
     "google drive": "https://drive.google.com",
@@ -104,7 +103,7 @@ _WEBSITE_NAME_URLS = {
 }
 _WEBSITE_NAME_NOISE_RE = re.compile(
     r"^(?:(?:the|a|an|up|open|my)\s+)+|(?:\s+(?:website|web\s*site|site|"
-    r"page|com|dot\s+com|\.com))+$", re.IGNORECASE)
+    r"page|com|dot\s+com)|\.com)+$", re.IGNORECASE)
 
 
 def _website_name_url(name: str) -> "str | None":
@@ -2122,8 +2121,16 @@ def _singular_close_said(said: str) -> bool:
     """True when the owner's words this turn close ONE window by a singular
     demonstrative ("close that Chrome window"). Never raises."""
     try:
-        m = _SINGULAR_CLOSE_RE.search(said or "")
-        return bool(m) and not _BULK_WORD_RE.search(said[m.start():m.end() + 40])
+        said = said or ""
+        m = _SINGULAR_CLOSE_RE.search(said)
+        if not m or _BULK_WORD_RE.search(said[m.start():]):
+            return False
+        # one close clause only: "close that chrome window and the youtube
+        # window" / a second "close" is a compound request, not one window.
+        if len(re.findall(r"\bclos(?:e|es|ed|ing)\b", said, re.IGNORECASE)) > 1:
+            return False
+        return not re.search(r"\b(?:and|or|then|also|plus)\b[^.]*\bwindow", said[m.end():],
+                             re.IGNORECASE)
     except Exception:
         return False
 

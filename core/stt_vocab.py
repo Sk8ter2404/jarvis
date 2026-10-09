@@ -184,7 +184,10 @@ def apply_replacements(text: str, mapping) -> str:
 # "U2" is a band: it only reads as YouTube after an open / close verb, never
 # after play / watch / put on.
 _YT_HEARD = r"(?:you\s*-?\s*two|you\s*-?\s*tube|u\s*-?\s*tube)"
-_YT_HEARD_OPEN = r"(?:" + _YT_HEARD + r"|u\s*-?\s*2|u\s*-?\s*two)"
+# bare "U2" (the band) only counts as YouTube when it ends the clause
+# ("open u2", "close u2 please"), never "start U2 radio" / "open u2 on spotify".
+_YT_HEARD_OPEN = (r"(?:" + _YT_HEARD + r"|(?:u\s*-?\s*2|u\s*-?\s*two)"
+                  r"(?=\s*(?:$|[.,!?]|(?:back\s+up|again|please|for\s+me|now)\b)))")
 _YT_CMD_VERB_RE = (r"(?:open(?:s|ed|ing)?|clos(?:e|es|ed|ing)|launch(?:es|ed|ing)?|"
                    r"start(?:s|ed|ing)?|pull(?:ing)?\s+up|bring(?:ing)?\s+up|"
                    r"go(?:ing)?\s+to|switch(?:ing)?\s+to)")

@@ -533,16 +533,16 @@ def forgot_close_target(utterance) -> str | None:
 # other words riding along stay with the model.
 _HT_NAME = r"(?:the\s+)?(?:my\s+)?hand[\s-]*track(?:ing|er)(?:\s+(?:mode|feature))?"
 _HT_ON_RE = re.compile(
-    r"^(?:(?:turn|switch|flip|put)\s+(?:on|up)\s+" + _HT_NAME
+    r"^(?:(?:turn|switch|flip|put)\s+on\s+" + _HT_NAME
     + r"|(?:turn|switch)\s+" + _HT_NAME + r"\s+on"
     + r"|(?:enable|activate|start|begin|engage|resume)\s+" + _HT_NAME
-    + r"|" + _HT_NAME + r"\s+(?:on|enabled|please\s+on)"
+    + r"|" + _HT_NAME + r"\s+(?:on|please\s+on)"
     + r"|(?:let'?s\s+)?(?:use|get)\s+" + _HT_NAME + r")$", re.IGNORECASE)
 _HT_OFF_RE = re.compile(
     r"^(?:(?:turn|switch|shut|flip)\s+off\s+" + _HT_NAME
     + r"|(?:turn|switch|shut)\s+" + _HT_NAME + r"\s+off"
-    + r"|(?:disable|deactivate|stop|end|kill|pause)\s+" + _HT_NAME
-    + r"|" + _HT_NAME + r"\s+(?:off|disabled))$", re.IGNORECASE)
+    + r"|(?:disable|deactivate|stop|end|kill)\s+" + _HT_NAME
+    + r"|" + _HT_NAME + r"\s+off)$", re.IGNORECASE)
 _HT_POLITE_RE = re.compile(
     r"^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?|"
     r"(?:[\s,]+(?:please|for\s+me|now|thanks|thank\s+you|jarvis|sir))+[\s.!?]*$",
