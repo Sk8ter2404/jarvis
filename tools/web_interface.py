@@ -1393,7 +1393,10 @@ TRAY_WEB_COMMANDS = ("force_wake", "enter_standby", "mute_tts_toggle",
                      "wake_word_mode_on", "wake_word_mode_off",
                      # Guest mode (2026-10-02): the same _act_guest_mode_set
                      # the voice command runs.
-                     "guest_mode_on", "guest_mode_off")
+                     "guest_mode_on", "guest_mode_off",
+                     # Screen memory (2026-10-05): on/off for this run, and
+                     # "pause 15 minutes" (core.screen_memory).
+                     "screen_memory_toggle", "screen_memory_pause")
 _TRAY_CONFIRM = frozenset({"restart"})
 DEFAULT_TRAY_COMMANDS_PATH = os.path.join(PROJECT_DIR, "tray_commands.json")
 
@@ -2211,12 +2214,19 @@ PROACTIVE_FEATURES = (
      "applies": "restart",
      "how": "the listener is started at boot; 'ambient mode on' / 'off' "
             "switches it now"},
-    {"key": "AMBIENT_SCREEN_ENABLED", "name": "Ambient screen watching",
-     "what": "Reads the screen every so often with the vision model for "
-             "context",
+    {"key": "AMBIENT_SCREEN_ENABLED", "name": "Screen memory",
+     "what": "Screen memory — text only, no AI calls: a timestamped record "
+             "of window titles, page addresses and page text, read when the "
+             "screen changes",
      "applies": "restart",
-     "how": "started at boot; the ambient_screen_start / ambient_screen_stop "
-            "actions switch it now"},
+     "how": "started at boot; 'stop watching' / 'you can watch again', the "
+            "tray, or ambient_screen_start / ambient_screen_stop switch it "
+            "now"},
+    {"key": "AMBIENT_SCREEN_VLM_ENABLED", "name": "Screen descriptions (AI)",
+     "what": "The older screen watcher: on every changed minute it asks the "
+             "local vision model (the brain's GPU) to describe the screen",
+     "applies": "restart",
+     "how": "started at boot when on; ambient_screen_stop stops it now"},
     {"key": "TEAMS_NUDGE_ENABLED", "name": "Teams nudger",
      "what": "Every 10 minutes, reads the screen and says when Teams shows "
              "unread messages",

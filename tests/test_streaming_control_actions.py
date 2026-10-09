@@ -103,7 +103,7 @@ class OpenUrlGuardTests(_Base):
             out = A._act_open_url("https://www.hbomax.com/search?q=Some+Show")
         wb.assert_called_once_with("https://play.hbomax.com/search?q=Some%20Show")
         self.assertIn("not a real HBO Max link", out)
-        self.assertIn("see_screen", out)
+        self.assertNotIn("see_screen", out)
 
     def test_no_verified_pattern_opens_the_home_page_and_says_so(self):
         with mock.patch.object(A.webbrowser, "open") as wb:
@@ -120,8 +120,8 @@ class OpenUrlGuardTests(_Base):
         with mock.patch.object(A.webbrowser, "open") as wb:
             out = A._act_open_url("https://example.com/search?q=x")
         wb.assert_called_once_with("https://example.com/search?q=x")
-        self.assertEqual(out, "opened https://example.com/search?q=x — use "
-                              "see_screen to read what loaded")
+        self.assertEqual(out, "opened https://example.com/search?q=x "
+                              "(still loading)")
 
     def test_open_on_monitor_fixes_a_guessed_url_but_launches_a_bare_name(self):
         new = _Win("Some Show - HBO Max" + SUFFIX, 0x300)
@@ -282,48 +282,36 @@ class CloseLastOpenedTests(_Base):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  S4 - a description click is aimed at the page's monitor
+#  S4 -> 2026-10-05: a description click goes through the grounded executor
+#  (core.grounded_click): it searches the visible windows BY NAME with the
+#  owner's monitor as a hard filter and the page JARVIS opened as a prior -
+#  never the whole desktop (tests/test_grounded_click.py pins the scope).
 # ════════════════════════════════════════════════════════════════════════════
 class ClickPinTests(_Base):
     def setUp(self):
         super().setUp()
-        self.bc.find_click_target.return_value = (10, 20)
+        from core import grounded_click as G
+        self.run = self._enter(mock.patch.object(
+            G, "run_bounded", return_value=G.Result("Done, sir.", "verified")))
 
-    def _page_on(self, box):
-        self.windows[:] = [_Win("Search - HBO Max" + SUFFIX, 0x200, box)]
-        L.note_opened("open_on_monitor", "https://play.hbomax.com/search?q=x",
-                      hwnd=0x200, monitor="middle")
+    def test_description_click_goes_to_the_grounded_executor(self):
+        self.bc._turn_user_text.return_value = "click the first result"
+        out = A._act_click("the first result")
+        self.assertEqual(out, "Done, sir.")
+        self.run.assert_called_once_with("the first result",
+                                         said="click the first result",
+                                         mode="click")
+        self.bc.find_click_target.assert_not_called()
 
-    def test_aimed_at_the_monitor_the_page_is_on(self):
-        self._page_on((-8, -8, 2576, 1456))
-        A._act_click('"Some Show" result')
-        self.bc.find_click_target.assert_called_once_with(
-            '"Some Show" result', monitor="middle")
-
-    def test_the_monitor_it_is_on_now_wins(self):
-        self._page_on((2560, 0, 2560, 1400))     # he moved it to the right
-        A._act_click("the first result")
-        self.bc.find_click_target.assert_called_once_with(
-            "the first result", monitor="right")
-
-    def test_a_monitor_in_his_words_wins(self):
-        self._page_on((-8, -8, 2576, 1456))
-        self.bc._turn_user_text.return_value = "click the first one on the left monitor"
-        A._act_click("the first result")
-        self.bc.find_click_target.assert_called_once_with(
-            "the first result", monitor="left")
-
-    def test_an_explicit_prefix_wins(self):
-        self._page_on((-8, -8, 2576, 1456))
+    def test_an_explicit_prefix_is_passed_on_as_a_prior(self):
         self.bc._parse_monitor_prefix.side_effect = None
         self.bc._parse_monitor_prefix.return_value = ("top", "the button")
         A._act_click("monitor:top|the button")
-        self.bc.find_click_target.assert_called_once_with("the button", monitor="top")
+        self.assertEqual(self.run.call_args.args[0], "monitor:top|the button")
 
-    def test_no_live_page_is_the_whole_desktop_as_before(self):
-        L.note_opened("open_on_monitor", "x", hwnd=0x777, monitor="middle")
+    def test_never_the_whole_desktop(self):
         A._act_click("the button")
-        self.bc.find_click_target.assert_called_once_with("the button", monitor=None)
+        self.bc.find_click_target.assert_not_called()
 
 
 # ════════════════════════════════════════════════════════════════════════════

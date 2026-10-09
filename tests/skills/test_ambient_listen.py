@@ -1917,19 +1917,37 @@ class ActionOrchestrationTests(_TmpDirMixin, unittest.TestCase):
         self.assertIn("did not stop cleanly", out)
 
     # ── screen start/stop ───────────────────────────────────────────────
+    # 2026-10-05: ambient_screen_start is SCREEN MEMORY (core.screen_memory,
+    # text only, no AI calls); the old vision-model loop runs only with
+    # AMBIENT_SCREEN_VLM_ENABLED.
     def test_screen_start_already_active(self):
+        bc = _FakeBobert()
+        bc.AMBIENT_SCREEN_VLM_ENABLED = True
         self.mod._screen_thread = self._live_thread()
-        out = self.actions["ambient_screen_start"]("")
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            out = self.actions["ambient_screen_start"]("")
         self.assertIn("already active", out)
 
     def test_screen_start_success(self):
         bc = _FakeBobert()
+        bc.AMBIENT_SCREEN_VLM_ENABLED = True
         bc.AMBIENT_SCREEN_INTERVAL_S = 45.0
         bc.AMBIENT_VISION_BUDGET_USD = 1.0
         with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
             out = self.actions["ambient_screen_start"]("")
         self.assertIn("Screen watcher engaged", out)
         self.assertIn("45s", out)
+
+    def test_screen_start_is_screen_memory_by_default(self):
+        from core import screen_memory as SW
+        bc = _FakeBobert()
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+                mock.patch.object(SW, "is_running", return_value=False), \
+                mock.patch.object(SW, "start", return_value=True) as st:
+            out = self.actions["ambient_screen_start"]("")
+        st.assert_called_once_with()
+        self.assertIn("text only, no AI calls", out)
+        self.assertIsNone(self.mod._screen_thread)
 
     def test_screen_stop_reports(self):
         t = self._alive_then_dead_thread()
@@ -1938,7 +1956,9 @@ class ActionOrchestrationTests(_TmpDirMixin, unittest.TestCase):
         self.mod._screen_entries_total = 2
         self.mod._screen_skipped_total = 4
         self.mod._screen_blocked_total = 1
-        with mock.patch.object(self.mod, "_get_bobert", return_value=None):
+        from core import screen_memory as SW
+        with mock.patch.object(self.mod, "_get_bobert", return_value=None), \
+                mock.patch.object(SW, "is_running", return_value=False):
             out = self.actions["ambient_screen_stop"]("")
         self.assertIn("2 snapshots", out)
         self.assertIn("4 skipped", out)

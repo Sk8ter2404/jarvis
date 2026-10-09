@@ -160,6 +160,11 @@ def youtube_play_route(utterance) -> str | None:
         if not m:
             return None
         query = " ".join(_strip_play_filler(_strip(m.group(1) or "")).split())
+        # "play THAT MrBeast video on YouTube" points at something already
+        # on screen (2026-10-05, live 00:28:23): never a new search - the
+        # screen route / the brain's click takes it.
+        if re.match(r"^(?:that|this|the\s+one)\b", query, re.IGNORECASE):
+            return None
         if (not query or query.lower() in _YT_VAGUE_OBJECTS
                 or len(query) > _YT_ROUTE_MAX_ARG
                 or any(c in query for c in "[]\r\n")):
@@ -167,6 +172,112 @@ def youtube_play_route(utterance) -> str | None:
         return f"[ACTION: youtube_play, {query}]"
     except Exception:
         return None
+
+
+# ── Screen routes (2026-10-05) ────────────────────────────────────────────
+# The monolith's _utterance_route_reply asks THIS first (before the YouTube
+# route): pure text over core.onscreen_refs, with the moment's state passed
+# in by the caller (an open "which one?", a recent JARVIS UI action, whether
+# the screen watcher runs). Each claim is a token the parse loop runs like
+# any other, so the guards still apply.
+#   * the answer to JARVIS's own "which one?" (<= 90 s): "the second one",
+#     "the burger one", a plain "yes" only when one option was offered and no
+#     other confirmation / offer is open        -> click_on_screen, pick:<n>
+#   * within 120 s of a JARVIS UI action: "not that one" / "that's not the
+#     right video"                              -> undo_click, other
+#     "go back" / "undo that"                   -> undo_click
+#   * "the one that was on screen at the time" (a scene to read it from)
+#                                               -> click_on_screen, scene:previous
+#   * "tell Claude to ..." (a developer note)   -> note_for_claude, <note>
+#   * "stop watching (for N minutes)" / "don't watch this" / "you can watch
+#     again" / "are you watching?"              -> screen_memory, ...
+#   * "forget the last hour of what you saw"    -> forget_screen, <span>
+#   * a WHOLE "click that X" / "play that X video" (no second command)
+#                                               -> click_on_screen, <X>
+def _token_arg(text) -> str:
+    """An action argument with no brackets / newlines (they would end or
+    break the token)."""
+    return " ".join(str(text or "").replace("[", "(").replace("]", ")")
+                    .split())[:300]
+
+
+def screen_route(utterance, state=None) -> str | None:
+    """The token a screen route claims ``utterance`` with, else None (see
+    the block comment). ``state`` keys: pending (core.grounded_click's open
+    question or None), allow_yes, recent_ui (core.grounded_click.undoable),
+    watching, other_watch, scenes, claude_note, click, click_route, and
+    app_known (name -> True when an open window is that app). Never
+    raises."""
+    try:
+        from core import onscreen_refs as _or
+        st = dict(state or {})
+        if not isinstance(utterance, str) or not _or.clean(utterance):
+            return None
+        click_ok = st.get("click", True)
+        p = st.get("pending")
+        if p and click_ok:
+            idx = _or.pending_choice_answer(utterance, p.get("options") or (),
+                                            allow_yes=bool(st.get("allow_yes")))
+            if idx is not None:
+                return f"[ACTION: click_on_screen, pick:{idx + 1}]"
+        if st.get("recent_ui") or p:
+            c = _or.is_ui_correction(utterance)
+            if c == "other":
+                return "[ACTION: undo_click, other]"
+            if c == "undo" and st.get("recent_ui"):
+                return "[ACTION: undo_click]"
+        if click_ok and _or.is_scene_back_reference(utterance) and (
+                st.get("recent_ui") or p or st.get("scenes")):
+            return "[ACTION: click_on_screen, scene:previous]"
+        if st.get("claude_note", True):
+            note = _or.claude_note(utterance)
+            if note:
+                return f"[ACTION: note_for_claude, {_token_arg(note)}]"
+        cmd = _or.screen_memory_command(utterance)
+        if cmd:
+            op = cmd["op"]
+            bare = not re.search(r"\b(?:screens?|monitors?)\b",
+                                 _or.clean(utterance), re.IGNORECASE)
+            if op == "pause":
+                if bare and (not st.get("watching") or st.get("other_watch")):
+                    return None
+                mins = cmd.get("minutes")
+                return ("[ACTION: screen_memory, pause"
+                        + (f" {mins:g}" if mins else "") + "]")
+            if op == "resume":
+                return "[ACTION: screen_memory, unpause]"
+            if op == "status":
+                return "[ACTION: screen_memory, status]"
+            if op == "exclude_this":
+                return "[ACTION: screen_memory, exclude_this]"
+            if op == "exclude_app":
+                # "stop watching the room" (guard mode), "stop watching the
+                # video" are not about screen memory (review 2026-10-05):
+                # an app exclusion is claimed only while screen memory runs
+                # AND the words name an app that is open on the screen
+                # (``app_known``); anything else is the brain's.
+                known = st.get("app_known")
+                if not (st.get("watching") and callable(known)
+                        and known(cmd["app"])):
+                    return None
+                return (f"[ACTION: screen_memory, exclude "
+                        f"{_token_arg(cmd['app'])}]")
+        span = _or.forget_span(utterance)
+        if span:
+            if span.get("all"):
+                arg = "all"
+            elif span.get("today"):
+                arg = "today"
+            else:
+                arg = f"{float(span['seconds']) / 60.0:g}m"
+            return f"[ACTION: forget_screen, {arg}]"
+        if click_ok and st.get("click_route", True):
+            target = _or.onscreen_click_target(utterance)
+            if target:
+                return f"[ACTION: click_on_screen, {_token_arg(target)}]"
+    except Exception:
+        return None
+    return None
 
 
 # ── Single-command route: "close all windows except X" (2026-10-03) ─────────

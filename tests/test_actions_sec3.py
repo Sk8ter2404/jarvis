@@ -2383,72 +2383,76 @@ class SessionMemoryRecallTests(unittest.TestCase):
 # _act_recall_screen
 # ===========================================================================
 class RecallScreenTests(unittest.TestCase):
-    def _bc(self, recent):
+    """2026-10-05: recall_screen answers from the screen timeline (TEXT,
+    with times) and never re-asks the vision model who / what something
+    was (live 00:29:49 that invented "the Kai Cenat video"). Only a VISUAL
+    follow-up re-examines the last cached look, labelled as such."""
+
+    def setUp(self):
+        import tempfile, shutil
+        self.td = tempfile.mkdtemp(prefix="recall_tl_")
+        self.addCleanup(shutil.rmtree, self.td, True)
+        env = mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": self.td})
+        env.start()
+        self.addCleanup(env.stop)
+        from core import screen_timeline as T
+        self.tl = T.Timeline(os.path.join(self.td, "screen_timeline.db"))
+        p = mock.patch.object(T, "get", return_value=self.tl)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _bc(self, recent=()):
         bc = _base_bc()
-        bc._recent_screen_contexts.return_value = recent
+        bc._recent_screen_contexts.return_value = list(recent)
         bc._format_screen_age.side_effect = lambda age: f"{int(age)}s ago"
+        bc._turn_user_text.return_value = ""
         return bc
 
-    def test_nothing_cached(self):
-        bc = self._bc([])
-        with _patch_bc(bc):
-            out = A._act_recall_screen("anything?")
-        self.assertIn("haven't seen the screen in the last 5 minutes", out)
-
-    def test_summary_mode(self):
-        entry = {"ts": 9_900.0, "monitor": None,
-                 "answer": "a terminal and a browser",
-                 "images": {"middle": b"PNG"}}
-        bc = self._bc([entry])
-        with _patch_bc(bc), \
-                mock.patch.object(A.time, "time", return_value=10_000.0):
-            out = A._act_recall_screen("")
-        self.assertIn("I last looked at all monitors", out)
-        self.assertIn("a terminal and a browser", out)
+    def test_nothing_recorded_says_so(self):
+        bc = self._bc()
+        with _patch_bc(bc), mock.patch("builtins.print"):
+            out = A._act_recall_screen("what was that video?")
+        self.assertIn("no record", out)
         bc.ask_vision.assert_not_called()
         bc.ask_vision_multi.assert_not_called()
 
-    def test_summary_mode_truncates_long_snippet(self):
-        entry = {"ts": 9_900.0, "monitor": "left",
-                 "answer": "z" * 400, "images": {}}
-        bc = self._bc([entry])
-        with _patch_bc(bc), \
-                mock.patch.object(A.time, "time", return_value=10_000.0):
-            out = A._act_recall_screen("")
-        self.assertIn("...", out)
+    def test_recorded_rows_come_back_with_times(self):
+        now = 1_000_000.0
+        self.tl.add_now(ts=now - 120, monitor="middle", hwnd=5,
+                        process="chrome.exe", title="Home - YouTube",
+                        url="https://www.youtube.com/", source="scene",
+                        text="I Survived 7 Days In An Abandoned City")
+        bc = self._bc()
+        with _patch_bc(bc), mock.patch("builtins.print"), \
+                mock.patch.object(A.time, "time", return_value=now):
+            out = A._act_recall_screen("what was that video on the middle "
+                                       "monitor")
+        self.assertIn("Recorded", out)
+        self.assertIn("I Survived 7 Days In An Abandoned City", out)
+        self.assertIn("middle", out)
+        bc.ask_vision.assert_not_called()
 
-    def test_followup_single_image(self):
-        entry = {"ts": 9_950.0, "monitor": "left",
-                 "answer": "old answer", "images": {"left": b"PNG"}}
+    def test_a_name_question_never_asks_the_model(self):
+        # The live failure: "the one that was on screen" -> the model was
+        # re-asked and named a video that never existed.
+        entry = {"ts": 9_950.0, "monitor": None, "answer": "old",
+                 "images": {"left": b"P1", "right": b"P2"}}
         bc = self._bc([entry])
-        bc.ask_vision.return_value = "fresh single-image answer"
-        with _patch_bc(bc), \
-                mock.patch.object(A.time, "time", return_value=10_000.0):
-            out = A._act_recall_screen("is the build green?")
-        self.assertEqual(out, "fresh single-image answer")
-        contextual_q = bc.ask_vision.call_args[0][0]
-        self.assertIn("cached screenshot", contextual_q)
-        self.assertIn("is the build green?", contextual_q)
+        with _patch_bc(bc), mock.patch("builtins.print"):
+            A._act_recall_screen("which video was on screen?")
+        bc.ask_vision.assert_not_called()
+        bc.ask_vision_multi.assert_not_called()
 
-    def test_followup_multi_image(self):
-        entry = {"ts": 9_950.0, "monitor": None,
-                 "answer": "old", "images": {"left": b"P1", "right": b"P2"}}
+    def test_a_visual_followup_uses_the_cached_look_and_says_so(self):
+        entry = {"ts": 9_950.0, "monitor": "left", "answer": "old",
+                 "images": {"left": b"PNG"}}
         bc = self._bc([entry])
-        bc.ask_vision_multi.return_value = "multi answer"
-        with _patch_bc(bc), \
+        bc.ask_vision.return_value = "red"
+        with _patch_bc(bc), mock.patch("builtins.print"), \
                 mock.patch.object(A.time, "time", return_value=10_000.0):
-            out = A._act_recall_screen("compare them")
-        self.assertEqual(out, "multi answer")
-        self.assertIn("cached from", bc.ask_vision_multi.call_args[0][0])
-
-    def test_followup_no_images_cached(self):
-        entry = {"ts": 9_950.0, "monitor": "left",
-                 "answer": "had text only", "images": {}}
-        bc = self._bc([entry])
-        with _patch_bc(bc), \
-                mock.patch.object(A.time, "time", return_value=10_000.0):
-            out = A._act_recall_screen("what about it")
-        self.assertIn("no image to re-examine", out)
+            out = A._act_recall_screen("what colour was the button?")
+        self.assertIn("reduced snapshot", out)
+        self.assertIn("red", out)
 
 
 # ===========================================================================
@@ -3752,31 +3756,38 @@ class SwitchLlmTests(unittest.TestCase):
 # _act_find_on_screen — vision target locator
 # ===========================================================================
 class FindOnScreenTests(unittest.TestCase):
-    def _bc(self, coords, monitor=None):
+    """2026-10-05: find_on_screen FINDS BY NAME through the grounded
+    executor (mode "find", never a click) and returns facts - the label,
+    the monitor, the window - instead of bare pixel coordinates."""
+
+    def _bc(self, monitor=None):
         bc = mock.Mock()
         bc._parse_monitor_prefix.return_value = (monitor, "the play button")
-        bc.find_click_target.return_value = coords
+        bc._turn_user_text.return_value = "find the play button"
         return bc
 
-    def test_found_returns_coords(self):
-        bc = self._bc((120, 240))
-        with _patch_bc(bc), mock.patch("builtins.print"):
+    def _run(self, bc, text, outcome="found"):
+        from core import grounded_click as G
+        with _patch_bc(bc), mock.patch("builtins.print"), \
+                mock.patch.object(G, "run_bounded",
+                                  return_value=G.Result(text, outcome)) as run:
             out = A._act_find_on_screen("the play button")
-        self.assertEqual(out, "found at 120,240")
+        return out, run
+
+    def test_found_returns_facts(self):
+        out, run = self._run(self._bc(), "found 'Play' on the middle monitor "
+                                         "in 'Player - Chrome' [uia]")
+        self.assertIn("found 'Play' on the middle monitor", out)
+        self.assertEqual(run.call_args.kwargs.get("mode"), "find")
 
     def test_not_found_returns_message(self):
-        bc = self._bc(None)
-        with _patch_bc(bc), mock.patch("builtins.print"):
-            out = A._act_find_on_screen("the play button")
-        self.assertIn("could not find", out)
+        out, _run = self._run(self._bc(), "not found: no 'the play button' on "
+                                          "your screens", "not_found")
+        self.assertIn("not found", out)
 
     def test_monitor_prefix_threaded_through(self):
-        bc = self._bc((1, 2), monitor="left")
-        with _patch_bc(bc), mock.patch("builtins.print"):
-            A._act_find_on_screen("left|the play button")
-        # find_click_target is invoked with the parsed monitor.
-        _, kwargs = bc.find_click_target.call_args
-        self.assertEqual(kwargs.get("monitor"), "left")
+        _out, run = self._run(self._bc(monitor="left"), "found", "found")
+        self.assertEqual(run.call_args.args[0], "monitor:left|the play button")
 
 
 # ===========================================================================

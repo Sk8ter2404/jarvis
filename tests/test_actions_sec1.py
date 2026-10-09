@@ -58,7 +58,9 @@ class OpenUrlTests(unittest.TestCase):
             out = A._act_open_url("example.com")
         mopen.assert_called_once_with("https://example.com")
         self.assertIn("opened https://example.com", out)
-        self.assertIn("see_screen", out)
+        # 2026-10-05: the result says where the page opened (or that it is
+        # still loading); it no longer sends the brain to see_screen.
+        self.assertNotIn("see_screen", out)
 
     def test_http_url_passed_through_unchanged(self):
         with mock.patch.object(A.webbrowser, "open") as mopen, _no_sleep():
@@ -72,10 +74,18 @@ class OpenUrlTests(unittest.TestCase):
         mopen.assert_called_once_with("https://secure.example.com")
 
     def test_waits_for_page_load(self):
+        # 2026-10-05: a bounded poll (A._OPEN_POLL_S) instead of a blind 3 s
+        # sleep - and with nothing new coming to the front it gives up after
+        # A._OPEN_NOTHING_NEW_S, well inside A._OPEN_WAIT_S.
         with mock.patch.object(A.webbrowser, "open"), \
                 mock.patch.object(A.time, "sleep") as msleep:
-            A._act_open_url("example.com")
-        msleep.assert_called_once_with(3.0)
+            out = A._act_open_url("example.com")
+        self.assertTrue(msleep.call_args_list)
+        for c in msleep.call_args_list:
+            self.assertEqual(c.args, (A._OPEN_POLL_S,))
+        self.assertLessEqual(
+            msleep.call_count, int(A._OPEN_NOTHING_NEW_S / A._OPEN_POLL_S) + 1)
+        self.assertIn("still loading", out)
 
     def _data_dir(self):
         data = tempfile.mkdtemp(prefix="open_url_data_")
@@ -136,7 +146,7 @@ class WebSearchTests(unittest.TestCase):
         # query is URL-quoted (space -> %20)
         self.assertIn("weather%20today", url)
         self.assertIn("Google search", out)
-        self.assertIn("see_screen", out)
+        self.assertNotIn("see_screen", out)
         # no video intent -> extraction never attempted
         fake._extract_youtube_url_from_search.assert_not_called()
 

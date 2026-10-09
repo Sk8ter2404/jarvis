@@ -639,8 +639,14 @@ class AmbientExtractRegisterTests(unittest.TestCase):
         # An explicitly enabled audio / screen source still feeds it.
         self.assertTrue(_run(AMBIENT_EXTRACT_ENABLED=True,
                              AMBIENT_AUDIO_ENABLED=True))
+        # 2026-10-05: the screen source that feeds it is the old vision-model
+        # loop (AMBIENT_SCREEN_VLM_ENABLED). AMBIENT_SCREEN_ENABLED is now
+        # screen memory - local text that is never fact-extracted - so it
+        # alone must not start background model passes.
         self.assertTrue(_run(AMBIENT_EXTRACT_ENABLED=True,
-                             AMBIENT_SCREEN_ENABLED=True))
+                             AMBIENT_SCREEN_VLM_ENABLED=True))
+        self.assertFalse(_run(AMBIENT_EXTRACT_ENABLED=True,
+                              AMBIENT_SCREEN_ENABLED=True))
         self.assertTrue(_run(AMBIENT_EXTRACT_ENABLED=True,
                              AMBIENT_LISTEN_ENABLED=True))
 

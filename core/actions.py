@@ -128,25 +128,30 @@ def _foreground_snapshot():
         return None, "", None
 
 
-def _note_browser_tab_open(via: str, url: str, before) -> None:
+def _note_browser_tab_open(via: str, url: str, before, page=None) -> None:
     """Record into core.opened_ledger the browser tab a webbrowser.open just
     brought to the front (S1, 2026-10-02): the foreground window AFTER the
     open, when it is a browser window and something changed in front of the
     owner (``before`` is the snapshot taken before the open). Nothing changed
     in front (the tab landed in a background window, or nothing opened) =
     nothing recorded: "close that" then honestly says it has no record,
-    instead of closing whatever tab he has in front. Never raises."""
+    instead of closing whatever tab he has in front. ``page`` is what
+    _await_opened_page already confirmed (hwnd, title, rect): recorded
+    without a second read (2026-10-05). Never raises."""
     try:
         bc = _loaded_bc()
         if bc is None:
             return
-        hwnd, title, rect = _foreground_snapshot()
+        if page is not None:
+            hwnd, title, rect = page[0], page[1], page[2]
+        else:
+            hwnd, title, rect = _foreground_snapshot()
         if not isinstance(hwnd, int) or not title:
             return
         if (hwnd, title) == (before[0], before[1]):
             return
-        page = _browser_page_title(bc, title)
-        if page is None or not _title_fits_url(page, url):
+        page_title = _browser_page_title(bc, title)
+        if page_title is None or not _title_fits_url(page_title, url):
             return
         from core.config import MONITORS
         from core import monitor_geometry as _mg
@@ -156,6 +161,108 @@ def _note_browser_tab_open(via: str, url: str, before) -> None:
                         title=title)
     except Exception:
         pass
+
+
+# How long open_url / web_search wait for the page they opened (2026-10-05:
+# was a fixed 3 s sleep). The wait ends as soon as the browser window in
+# front shows a title that names the page (its site or its search words) and
+# is not just the address Chrome shows while loading; it gives up early when
+# nothing new comes to the front at all (the tab went to a background
+# window). Bounded by poll COUNT, so a test's no-op sleep never spins.
+_OPEN_WAIT_S = 6.0
+_OPEN_POLL_S = 0.15
+_OPEN_NOTHING_NEW_S = 2.0
+_LOADING_TITLE_RE = re.compile(
+    r"^(?:untitled|new tab|loading\.*|about:blank|"
+    r"(?:https?://)?[\w.-]+\.[a-z]{2,}(?:[/?#]\S*)?)$", re.IGNORECASE)
+
+
+def _await_opened_page(url: str, before):
+    """(hwnd, title, rect, monitor, page_url) of the browser window that
+    came to the front showing ``url``'s page, or None (still loading / it
+    landed in a background window). Never raises."""
+    try:
+        bc = _loaded_bc()
+        polls = int(_OPEN_WAIT_S / _OPEN_POLL_S)
+        idle_polls = int(_OPEN_NOTHING_NEW_S / _OPEN_POLL_S)
+        changed = False
+        for i in range(polls):
+            time.sleep(_OPEN_POLL_S)
+            hwnd, title, rect = _foreground_snapshot()
+            if not isinstance(hwnd, int) or not title or \
+                    (hwnd, title) == (before[0], before[1]):
+                if not changed and i >= idle_polls:
+                    return None
+                continue
+            changed = True
+            if bc is None:
+                continue
+            page = _browser_page_title(bc, title)
+            if page is None or _LOADING_TITLE_RE.match(page.strip()):
+                continue
+            if not _title_fits_url(page, url):
+                continue
+            page_url = ""
+            try:
+                from core import screen_text as _st
+                page_url = _st.read_url(hwnd, timeout_s=0.3) or ""
+            except Exception:
+                page_url = ""
+            mon = None
+            try:
+                from core.config import MONITORS
+                from core import monitor_geometry as _mg
+                mon = _mg.monitor_for_rect(*rect, MONITORS) if rect else None
+            except Exception:
+                mon = None
+            return (hwnd, title, rect, mon, page_url)
+    except Exception:
+        return None
+    return None
+
+
+def _opened_line(url: str, found, note: str = "") -> str:
+    """"opened <url> on the middle monitor - page title '<title>'" or
+    "opened <url> (still loading)"."""
+    extra = f" ({note})" if note else ""
+    if found is None:
+        return f"opened {url}{extra} (still loading)"
+    bc = _loaded_bc()
+    title = _browser_page_title(bc, found[1]) if bc is not None else None
+    where = f" on the {found[3]} monitor" if found[3] else ""
+    return (f"opened {url}{extra}{where} \u2014 page title "
+            f"'{title or found[1]}'")
+
+
+def _search_results_line(found) -> str:
+    """The first result headings (<= 5, <= 600 chars) of the search page in
+    window ``found`` - privacy-gated, through UI Automation. "" when they
+    can't be read. Never raises."""
+    try:
+        if found is None:
+            return ""
+        from core import screen_privacy as _sp
+        from core import screen_text as _st
+        hwnd, title = found[0], found[1]
+        if _sp.window_private({"hwnd": hwnd, "title": title,
+                               "url": found[4] or ""}):
+            return ""
+        snap = _st.snapshot(hwnd, title=title, process="chrome.exe",
+                            budget_ms=500, want_hrefs=False)
+        if snap is None or snap.has_password:
+            return ""
+        heads = []
+        for e in sorted(snap.elements, key=lambda e: (e.rect[1], e.rect[0])):
+            if (e.in_document and e.ctype == "Hyperlink"
+                    and 12 <= len(e.name) <= 160 and e.rect[3] <= 60
+                    and e.name not in heads):
+                heads.append(e.name)
+            if len(heads) >= 5:
+                break
+        out = ", ".join(f'"{h}"' for h in heads)
+        return out[:600]
+    except Exception:
+        return ""
 
 
 # Host labels that say nothing about which site a page is.
@@ -230,14 +337,13 @@ def _act_open_url(url: str) -> str:
         url = "https://" + url
     _before = _foreground_snapshot()
     webbrowser.open(url)
-    # Small wait so the page has time to start loading before any follow-up
-    # see_screen is triggered by the informative-action follow-up loop.
-    time.sleep(3.0)
-    _note_browser_tab_open("open_url", url, _before)
-    if _fix_note:
-        return (f"opened {url} ({_fix_note}) — use see_screen to read what "
-                f"loaded")
-    return f"opened {url} — use see_screen to read what loaded"
+    # Wait (bounded, up to _OPEN_WAIT_S) until the page is in front and
+    # named, instead of a blind 3 s sleep; the result says where it opened
+    # and what it is, so the next round needs no screenshot (2026-10-05).
+    _found = _await_opened_page(url, _before)
+    _note_browser_tab_open("open_url", url, _before,
+                           page=_found[:3] if _found else None)
+    return _opened_line(url, _found, _fix_note)
 
 
 def _act_web_search(query: str) -> str:
@@ -252,8 +358,9 @@ def _act_web_search(query: str) -> str:
     if video_intent:
         yt_url = bc._extract_youtube_url_from_search(query)
         if yt_url:
+            _before = _foreground_snapshot()
             webbrowser.open(yt_url)
-            time.sleep(3.0)
+            _await_opened_page(yt_url, _before)
             return (
                 f"opened {yt_url} (extracted from Google results for '{query}') — "
                 f"video is now playing, no further action needed"
@@ -263,10 +370,16 @@ def _act_web_search(query: str) -> str:
     url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
     _before = _foreground_snapshot()
     webbrowser.open(url)
-    # Brief wait for page load before follow-up see_screen captures the results.
-    time.sleep(3.0)
-    _note_browser_tab_open("web_search", url, _before)
-    return f"opened Google search for '{query}' — use see_screen to read the results"
+    _found = _await_opened_page(url, _before)
+    _note_browser_tab_open("web_search", url, _before,
+                           page=_found[:3] if _found else None)
+    where = f" on the {_found[3]} monitor" if _found and _found[3] else ""
+    results = _search_results_line(_found)
+    if results:
+        return (f"opened Google search for '{query}'{where} \u2014 top "
+                f"results: {results}")
+    return (f"opened Google search for '{query}'{where}"
+            + ("" if _found else " (still loading)"))
 
 
 def _act_youtube(query: str) -> str:
@@ -3393,8 +3506,14 @@ def _act_streaming_search(args: str) -> str:
 def _act_click(args: str) -> str:
     """args: 'x,y' or 'x,y,right' for right-click, or a description to find+click.
     Coords can be negative (for monitors to the left of the primary, e.g. -2215,249).
-    Prefix with 'monitor:NAME|' to restrict vision search to that monitor:
-        click, monitor:left|the play button"""
+    Prefix with 'monitor:NAME|' to prefer that monitor:
+        click, monitor:left|the play button
+
+    A DESCRIPTION click goes through the grounded executor (core.
+    grounded_click, 2026-10-05) - the same chokepoint as click_on_screen:
+    read the windows by name, resolve, guard, click, verify. Live 00:28-00:30
+    the old path photographed a whole monitor (or all four) and clicked
+    nothing in five tries."""
     bc = _bc()
     # Optional monitor prefix
     monitor, args = bc._parse_monitor_prefix(args)
@@ -3421,18 +3540,8 @@ def _act_click(args: str) -> str:
             f"Python process running me. Closing it would kill my session. "
             f"Ask the user to close it manually if they really want to."
         )
-
-    if monitor is None:
-        monitor = _click_monitor_pin(bc)
-    coords = bc.find_click_target(args, monitor=monitor)
-    if coords is None:
-        target = f"'{args}' on {monitor} monitor" if monitor else f"'{args}'"
-        return f"could not locate {target} on screen"
-    try:
-        bc.ui_click(coords[0], coords[1])
-    except bc.UIFailsafeError as e:
-        return str(e)
-    return f"clicked '{args}' at {coords}"
+    target = f"monitor:{monitor}|{args}" if monitor else args
+    return _click_on_screen(target, _turn_said(bc))
 
 
 def _opened_page_context(fg_hwnd=None) -> "tuple[str, str] | None":
@@ -3571,35 +3680,160 @@ def _input_auth_refusal(bc, kind: str, value: str) -> str:
         return ""
 
 
-def _click_monitor_pin(bc) -> "str | None":
-    """The monitor a description click is aimed at when the model named none
-    (S4, 2026-10-02): the one the owner's own words name ("... on the left
-    monitor"), else the one JARVIS opened the page on (core.opened_ledger,
-    PAGE_MAX_AGE_S), else None - the whole desktop, as before. Live: a click
-    meant for the page on the MIDDLE monitor photographed all four monitors
-    shrunk to 1568 px and landed at (-2325, 1165) on the LEFT one. Never
-    raises."""
+def _turn_said(bc=None) -> str:
+    """The owner's words this turn (the grounding ledger), '' outside one."""
     try:
-        from core.config import MONITORS
-        from core import monitor_geometry as _mg
-        try:
-            said = bc._turn_user_text()
-        except Exception:
-            said = ""
-        named = _mg.monitor_named_in(said if isinstance(said, str) else "",
-                                     MONITORS)
-        if named:
-            print(f"  [click] aimed at the {named} monitor (named in the "
-                  "request)", flush=True)
-            return named
-        page = _opened_page_now()
-        if page is not None and page[1] in MONITORS:
-            print(f"  [click] aimed at the {page[1]} monitor (where I opened "
-                  "the page)", flush=True)
-            return page[1]
+        bc = bc if bc is not None else _loaded_bc()
+        said = bc._turn_user_text() if bc is not None else ""
+        return said if isinstance(said, str) else ""
     except Exception:
-        return None
-    return None
+        return ""
+
+
+def _act_click_on_screen(args: str) -> str:
+    """click_on_screen, <what> | pick:<n> | scene:previous - find the thing
+    on screen BY NAME and click it, verified (core.grounded_click). Spoken
+    word for word: a verified fact, a question naming the real options, or
+    an honest "I don't see it"."""
+    return _click_on_screen(args, _turn_said())
+
+
+def _click_on_screen(args: str, said: str) -> str:
+    from core import grounded_click as _gc
+    r = _gc.run_bounded(args, said=said, mode="click")
+    _note_screen_look("click_on_screen", r.text)
+    return _youtube_when_not_on_screen(r, args, said) or r.text
+
+
+def _youtube_when_not_on_screen(r, args: str, said: str) -> str:
+    """"play that MrBeast video on YouTube" when NO such video is on the
+    screen: he named YouTube, so its search-and-play runs (main did that;
+    review 2026-10-05: the screen route answered "I don't see it" and
+    nothing played). Only on a plain "not on screen": never after a time-out
+    (the page may hold it), a failure, an open question or a pick / scene
+    answer; and only for that exact shape (core.onscreen_refs.
+    youtube_play_query). "" otherwise. Never raises."""
+    try:
+        from core import grounded_click as _gc
+        from core import onscreen_refs as _or
+        if (r.outcome != _gc.NOT_FOUND or r.failed
+                or r.tier == _gc.TIMED_OUT):
+            return ""
+        if str(args or "").strip().lower().startswith(("pick:", "scene:")):
+            return ""
+        if _gc.pending_choice() is not None:
+            return ""
+        q = _or.youtube_play_query(said)
+        if not q:
+            return ""
+        fn = getattr(_bc(), "ACTIONS", {}).get("youtube_play")
+        if not callable(fn):
+            return ""
+        print(f"  [click] {q!r} is not on screen and he named YouTube - "
+              "playing it from a search", flush=True)
+        res = str(fn(q) or "")
+        from core.failure_markers import FAILURE_MARKERS
+        low = res.lower()
+        if not res or any(m in low for m in FAILURE_MARKERS):
+            return ("I don't see that on screen, sir, and the YouTube "
+                    f"search didn't play it: {res or 'no answer'}")
+        return (f"I don't see that on screen, sir, so I've put '{q}' on "
+                "from YouTube.")
+    except Exception:
+        return ""
+
+
+def _act_undo_click(args: str = "") -> str:
+    """undo_click[, other] - take back JARVIS's own last UI action (the
+    window / tab it opened, or Back in the page it navigated), within two
+    minutes; "other" then asks which one he meant, naming the options that
+    were on screen BEFORE that action."""
+    from core import grounded_click as _gc
+    other = "other" in str(args or "").lower()
+    r = _gc.undo(other=other, said=_turn_said())
+    return r.text
+
+
+def _act_note_for_claude(args: str = "") -> str:
+    """note_for_claude, <note> - the owner's words for the developer,
+    appended to data/notes_for_claude.jsonl (core.dev_notes). JARVIS never
+    claims to have relayed it: there is no channel to Claude."""
+    from core import dev_notes as _dn
+    from core import onscreen_refs as _or
+    said = _turn_said()
+    note = " ".join(str(args or "").split()) or (_or.claude_note(said) or said)
+    if not note:
+        return "What should I note for Claude, sir?"
+    rec = _dn.add_note(note, utterance=said or note)
+    if rec is None:
+        return ("I couldn't save that note for Claude, sir \u2014 the notes "
+                "file isn't writable.")
+    return _dn.SPOKEN_LINE
+
+
+def _act_screen_memory(args: str = "") -> str:
+    """screen_memory, pause [N] | unpause | status | exclude_this |
+    exclude <app> - the continuous screen memory's controls (core.
+    screen_memory)."""
+    from core import screen_memory as _sw
+    a = " ".join(str(args or "").split())
+    low = a.lower()
+    m = re.match(r"^(?:pause|stop)(?:\s+(\d+(?:\.\d+)?))?", low)
+    if m:
+        return _sw.pause(float(m.group(1)) if m.group(1) else None)
+    if low.startswith(("unpause", "resume", "start", "again", "on")):
+        return _sw.unpause()
+    if low.startswith(("status", "are you")):
+        return _sw.status_line()
+    if low.startswith(("exclude_this", "exclude this", "this")):
+        return _sw.exclude_foreground()
+    m = re.match(r"^exclude\s+(.+)$", a, re.IGNORECASE)
+    if m:
+        return _sw.exclude_app(m.group(1))
+    return ("format: screen_memory, pause [minutes] | unpause | status | "
+            "exclude_this | exclude <app>")
+
+
+def _act_forget_screen(args: str = "") -> str:
+    """forget_screen, <span> - "forget the last hour / 10 minutes / today /
+    everything you saw": timeline rows, vision-trace entries, the scene ring
+    and the cached looks in that span."""
+    # ltm-exempt: screen memory is never written to long-term memory - the
+    # screen timeline / vision trace are their own stores (core.screen_memory
+    # never fact-extracts), so there is no LTM copy to purge.
+    from core import onscreen_refs as _or
+    from core import screen_memory as _sw
+    a = " ".join(str(args or "").split()).lower()
+    span = None
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(m|min|mins|minutes?|h|hours?)?$", a)
+    if m:
+        n = float(m.group(1))
+        span = {"seconds": n * (3600.0 if (m.group(2) or "m").startswith("h")
+                                else 60.0)}
+    elif a in ("all", "everything"):
+        span = {"all": True}
+    elif a == "today":
+        span = {"today": True}
+    elif a in ("hour", "last hour", "1 hour"):
+        span = {"seconds": 3600.0}
+    if span is None:
+        span = _or.forget_span(_turn_said()) or {"seconds": 3600.0}
+    return _sw.forget(span)
+
+
+def _note_screen_look(name: str, text: str) -> None:
+    """Feed what a screen action found into this turn's screen texts (the
+    sign-in guard reads them; core.auth_guard's _turn_screen_texts seam,
+    when the monolith has it). Never raises."""
+    try:
+        bc = _loaded_bc()
+        frame = getattr(getattr(bc, "_turn_grounding", None), "frame", None)
+        if frame is not None and text:
+            seen = frame.setdefault("screen", [])
+            seen.append(str(text)[:4000])
+            del seen[:-4]
+    except Exception:
+        pass
 
 
 def _opened_page_now():
@@ -4564,6 +4798,69 @@ def _see_screen_focused_window(bc, q: str):
     return result
 
 
+# ── see_screen reads TEXT first (2026-10-05) ────────────────────────────
+# Live 00:28:01 see_screen sent four monitor shots to the local model and
+# got "the YouTube page displays several video thumbnails and categories" -
+# not one title, while every title sat in the page's accessibility tree. A
+# READING question (anything not about colours / pictures / layout) is now
+# answered from the windows' own text (core.screen_digest: UI Automation,
+# OCR when thin): no vision call, not counted against the see_screen budget.
+# A VISUAL question still gets ONE look, with that text beside it.
+_screen_digest_backend: list = [None]       # tests inject a fake backend
+
+
+def _see_screen_text(bc, monitor, said, question, page_now):
+    """(text, scope, hwnds) - the digest answer for a reading question, or
+    None when nothing could be read (the caller falls back to vision)."""
+    try:
+        from core import screen_digest as _sd
+        from core import monitor_geometry as _mg
+        from core.config import MONITORS
+        mon = monitor or _mg.monitor_named_in(said or question or "", MONITORS)
+        backend = _screen_digest_backend[0]
+        if mon:
+            d = _sd.digest("monitor", said=said, monitor=mon, backend=backend)
+            scope = f"the {mon} monitor"
+        elif _see_screen_wants_focused_window(said, question) and \
+                not _focused_window_is_jarvis(bc):
+            hwnd = None
+            try:
+                hwnd = bc._read_focused_window()[0]
+            except Exception:
+                hwnd = None
+            d = _sd.digest("window", said=said, hwnd=hwnd, backend=backend)
+            scope = "the focused window"
+        elif page_now is not None and getattr(page_now[0], "hwnd", None):
+            d = _sd.digest("window", said=said, hwnd=page_now[0].hwnd,
+                           backend=backend)
+            scope = "the page I opened"
+        else:
+            d = _sd.digest("overview", said=said, backend=backend)
+            scope = "every monitor"
+        if not d.get("windows"):
+            return None
+        return d["text"], scope, d["windows"]
+    except Exception:
+        return None
+
+
+def _record_look(bc, said, scope, text, source="look") -> None:
+    """A look's text into the screen timeline, the vision trace and the
+    turn's screen texts. Never raises."""
+    try:
+        from core import screen_timeline as _tl
+        _tl.add(source="look", title=f"see_screen: {scope}", text=text)
+    except Exception:
+        pass
+    try:
+        from core import vision_trace as _vt
+        _vt.record("see_screen", utterance=said, outcome="read",
+                   source=source, scope={"monitor": scope}, raw_answer=text)
+    except Exception:
+        pass
+    _note_screen_look("see_screen", text)
+
+
 def _act_see_screen(question: str) -> str:
     bc = _bc()
     # Privacy gate: refuse (spoken) before spending the per-intent budget if a
@@ -4583,6 +4880,42 @@ def _act_see_screen(question: str) -> str:
     _opened = _page_now[0] if _page_now else None
     q, _page = _see_screen_plan(question, _ut if isinstance(_ut, str) else "",
                                 _opened)
+    _said = _ut if isinstance(_ut, str) else ""
+
+    # Text first (2026-10-05): a READING question is answered from the
+    # windows' own text, with no picture. A sign-in-checked streaming page
+    # JARVIS opened keeps its look (S5's wall check reads the image).
+    from core.screen_digest import VISUAL_Q_RE
+    _visual = bool(VISUAL_Q_RE.search(q or "") or VISUAL_Q_RE.search(_said))
+    _wall_page = False
+    try:
+        from core import streaming_search as _ss
+        _key = _ss.service_for_url(getattr(_opened, "target", "") or "")
+        _cfgs = getattr(bc, "_STREAMING_SERVICES", None)
+        _wall_page = bool(_key and isinstance(_cfgs, dict)
+                          and (_cfgs.get(_key) or {}).get("sign_in_check"))
+    except Exception:
+        _wall_page = False
+    _digest = None
+    try:
+        from core import config as _cfg_mod
+        _uia_on = bool(getattr(_cfg_mod, "SCREEN_UIA_ENABLED", True))
+    except Exception:
+        _uia_on = True
+    if _uia_on and not _wall_page:
+        _digest = _see_screen_text(bc, monitor, _said, question, _page_now)
+    if _digest is not None and not _visual:
+        text, scope, _hw = _digest
+        print(f"  [vision] read {scope} as text ({len(text)} chars, no "
+              "picture)", flush=True)
+        bc._push_screen_context(scope, q, text, {})
+        _record_look(bc, _said, scope, text, source="uia")
+        return ("Read from the screen's own text (exact titles; quote them, "
+                "invent nothing):\n" + text)
+    if _digest is not None:
+        # A visual question: ONE look, with the page's text beside it.
+        q = (q + "\n\nThe windows' own text (quote titles exactly from "
+             "this):\n" + _digest[0][:1500])
 
     # Per-intent budget guard. parse_and_run_actions resets the counter at
     # the start of every dispatch; once exhausted, refuse with a hint that
@@ -5216,69 +5549,125 @@ def _act_session_memory_recall(args: str = "") -> str:
 
 # ─── Cached-screen recall (Phase 4I) ───────────────────────────────────
 
+_RECALL_STOP = frozenset("""
+what was that the a an on in at of to my your screen screens monitor
+monitors video videos page window tab thing one i me you were was is are
+looking look watching watch reading read doing did see saw seen earlier
+before ago minutes minute mins min hours hour seconds second just there
+which who about from with it this time when then while recently few couple
+left right top middle main bottom open opened jarvis sir please
+""".split())
+
+
+def _recall_window(question: str, now: float):
+    """(since, until, label) for the time words in a recall question.
+    Default: the last 15 minutes."""
+    q = (question or "").lower()
+    m = re.search(r"\b(\d+|a|an|one|two|three|five|ten|fifteen|twenty|"
+                  r"thirty|few|couple(?:\s+of)?)\s+(minutes?|mins?|hours?)\s+"
+                  r"ago\b", q)
+    words = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "five": 5,
+             "ten": 10, "fifteen": 15, "twenty": 20, "thirty": 30, "few": 3,
+             "couple": 2, "couple of": 2}
+    if m:
+        n = float(words.get(m.group(1), m.group(1)) if not
+                  m.group(1).isdigit() else m.group(1))
+        secs = n * (3600.0 if m.group(2).startswith("h") else 60.0)
+        pad = max(120.0, secs * 0.3)
+        return now - secs - pad, now - secs + pad, f"about {m.group(0)}"
+    if "this morning" in q:
+        lt = time.localtime(now)
+        start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 5, 0, 0, 0,
+                             0, -1))
+        return start, start + 7 * 3600, "this morning"
+    if re.search(r"\btoday\b", q):
+        lt = time.localtime(now)
+        start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0,
+                             0, -1))
+        return start, now, "today"
+    if re.search(r"\b(?:earlier|before|a while ago|last hour)\b", q):
+        return now - 3600.0, now, "in the last hour"
+    return now - 900.0, now, "in the last 15 minutes"
+
+
 def _act_recall_screen(question: str) -> str:
-    """Reference the cached screen context from a recent see_screen.
-
-    Empty question -> returns a JARVIS-style summary of the most recent
-    capture ('I last saw your screen 47 seconds ago: ...'). With a question ->
-    re-asks vision against the SAME cached images (no recapture, ~instant)
-    so the user can ask follow-ups against the visual state JARVIS already
-    has in memory. Falls back to a polite refusal when nothing is cached
-    or the newest entry is older than SCREEN_CACHE_TTL_SECONDS."""
+    """What WAS on the screen, from JARVIS's text record (core.
+    screen_timeline - looks, clicks, scene freezes and, when screen memory
+    is on, the watcher), with times. Never re-asks the vision model who or
+    what something was: live 00:29:49 that invented "the Kai Cenat video".
+    Only a VISUAL follow-up ("what colour was it") re-examines the last
+    cached look, and says it is a reduced snapshot."""
     bc = _bc()
-    recent = bc._recent_screen_contexts()
-    if not recent:
-        return (
-            "I'm afraid I haven't seen the screen in the last 5 minutes, sir — "
-            "use see_screen first if you'd like me to take a fresh look."
-        )
-
-    entry = recent[0]
-    age = time.time() - entry["ts"]
-    mon_label = entry["monitor"] or "all monitors"
-    age_str = bc._format_screen_age(age)
-
-    q = question.strip()
-    if not q:
-        # Summary mode: read back what was last seen without burning a vision call.
-        history_lines = []
-        for e in recent[:3]:
-            e_age = bc._format_screen_age(time.time() - e["ts"])
-            e_mon = e["monitor"] or "all monitors"
-            snippet = e["answer"].strip().replace("\n", " ")
-            if len(snippet) > 220:
-                snippet = snippet[:217] + "..."
-            history_lines.append(f"- {e_age}, {e_mon}: {snippet}")
-        head = (
-            f"I last looked at {mon_label} {age_str}, sir. "
-            f"What I saw then:"
-        )
-        return head + "\n" + "\n".join(history_lines)
-
-    # Follow-up mode: re-vision against the cached images so we get a fresh
-    # answer to a NEW question without re-capturing.
-    images = entry["images"]
-    if not images:
-        return f"I have the answer from {age_str} cached but no image to re-examine, sir."
-
-    print(
-        f"  [vision] Recalling cached screen ({mon_label}, "
-        f"{age_str}) — re-asking without recapture...",
-        flush=True,
-    )
-    if len(images) == 1:
-        only_png = next(iter(images.values()))
-        contextual_q = (
-            f"This is a cached screenshot from {age_str}. {q}"
-        )
-        result = bc.ask_vision(contextual_q, only_png)
-    else:
-        contextual_q = (
-            f"These screenshots are cached from {age_str}. {q}"
-        )
-        result = bc.ask_vision_multi(contextual_q, images)
-    print(f"  [vision] Got cached-recall answer ({len(result)} chars)", flush=True)
-    return result
+    q = " ".join(str(question or "").split())
+    said = _turn_said(bc)
+    from core.screen_digest import VISUAL_Q_RE
+    if q and VISUAL_Q_RE.search(q):
+        recent = bc._recent_screen_contexts()
+        entry = next((e for e in recent if e.get("images")), None)
+        if entry is not None:
+            age = time.time() - entry["ts"]
+            age_str = bc._format_screen_age(age)
+            images = entry["images"]
+            print(f"  [vision] visual follow-up on a cached look "
+                  f"({age_str})", flush=True)
+            if len(images) == 1:
+                ans = bc.ask_vision(f"This is a cached screenshot from "
+                                    f"{age_str}. {q}", next(iter(images.values())))
+            else:
+                ans = bc.ask_vision_multi(f"These screenshots are cached from "
+                                          f"{age_str}. {q}", images)
+            return (f"From a reduced snapshot {int(age)} s ago (only how it "
+                    f"looked, not what it was called): {ans}")
+    from core import screen_timeline as _tl
+    from core import monitor_geometry as _mg
+    from core.config import MONITORS
+    now = time.time()
+    since, until, when = _recall_window(q or said, now)
+    mon = _mg.monitor_named_in(q or said, MONITORS)
+    words = [w for w in re.findall(r"[a-z0-9$']+", (q or "").lower())
+             if w not in _RECALL_STOP and len(w) >= 3]
+    video = bool(re.search(r"\b(?:video|watch|watching|youtube|clip)\b",
+                           (q + " " + said).lower()))
+    tl = _tl.get()
+    tl.flush(1.0)
+    rows = []
+    if words:
+        rows = tl.query(text=" ".join(words), since=since, until=until,
+                        monitor=mon, limit=12)
+        if not rows:
+            rows = tl.query(text=" ".join(words), since=now - 7 * 86400,
+                            monitor=mon, limit=8)
+    if not rows:
+        rows = tl.query(since=since, until=until, monitor=mon, limit=40)
+        if video:
+            vids = [r for r in rows
+                    if "watch?v=" in (r.get("url") or "")
+                    or "youtube" in (r.get("title") or "").lower()
+                    or r.get("source") in ("scene", "click")]
+            rows = vids or rows
+        rows = rows[:12]
+    if not rows:
+        print(f"  [recall] no record {when}", flush=True)
+        return (f"I have no record of that, sir \u2014 nothing on screen "
+                f"{when} matches.")
+    lines = []
+    for r in sorted(rows, key=lambda r: r["ts"]):
+        stamp = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
+        host = ""
+        try:
+            host = (urllib.parse.urlsplit(r["url"]).hostname or "").removeprefix(
+                "www.") if r.get("url") else ""
+        except Exception:
+            host = ""
+        head = ", ".join(b for b in (stamp, r.get("monitor") or "",
+                                     (r.get("process") or "").replace(
+                                         ".exe", ""), host) if b)
+        body = " ".join(str(r.get("text") or "").split())[:300]
+        title = str(r.get("title") or "")[:120]
+        lines.append(f"[{head}] '{title}'" + (f" - {body}" if body else ""))
+    print(f"  [recall] {len(lines)} recorded row(s) {when}", flush=True)
+    return ("Recorded - quote exactly; if the answer is not here, say you "
+            "have no record:\n" + "\n".join(lines[-12:]))
 
 
 # ─── Changelog read + summarise (Phase 4I) ─────────────────────────────
@@ -6739,16 +7128,20 @@ def _act_switch_llm(arg: str = "") -> str:
 # ─── Vision: find on screen (Phase 4C) ─────────────────────────────────
 
 def _act_find_on_screen(description: str) -> str:
+    """find_on_screen, <what> - FIND (never click) the thing by name in the
+    visible windows (core.grounded_click, mode "find"): facts the follow-up
+    round quotes - "found '<label>' on the middle monitor in '<window>'
+    [uia]", several matches by name, or not found plus what IS there."""
+    from core import grounded_click as _gc
     bc = _bc()
     monitor, description = bc._parse_monitor_prefix(description)
     target = f" on {monitor} monitor" if monitor else ""
     print(f"  [vision] Looking for '{description}'{target}...", flush=True)
-    coords = bc.find_click_target(description, monitor=monitor)
-    if coords is None:
-        print("  [vision] Not found", flush=True)
-        return f"could not find '{description}' on screen"
-    print(f"  [vision] Found at {coords}", flush=True)
-    return f"found at {coords[0]},{coords[1]}"
+    arg = f"monitor:{monitor}|{description}" if monitor else description
+    r = _gc.run_bounded(arg, said=_turn_said(bc), mode="find")
+    print(f"  [vision] {r.text[:160]}", flush=True)
+    _note_screen_look("find_on_screen", r.text)
+    return r.text
 
 
 # ─── Cache / mode toggles (Phase 4B) ───────────────────────────────────
@@ -6825,6 +7218,12 @@ __all__ = [
     "_act_list_skills",
     "_act_apple_music",
     "_act_find_on_screen",
+    # 2026-10-05 - grounded screen clicks, undo, developer notes, screen memory
+    "_act_click_on_screen",
+    "_act_undo_click",
+    "_act_note_for_claude",
+    "_act_screen_memory",
+    "_act_forget_screen",
     # Phase 4D — app launching
     "_act_launch_app",
     # Phase 4D — Apple Music transport (media keys; classic iTunes COM is dead)

@@ -86,6 +86,14 @@ _IMPORT_LIGHT_CORE = (
     # import (ctypes / psutil lazily), imported by core.actions and at
     # monolith import time.
     "core.window_scope",
+    # Screen vision (2026-10-05): grounded clicks, the vision trace, screen
+    # memory. Stdlib-only at import (comtypes / PIL / numpy / mss lazily);
+    # core.actions and the monolith import them per call.
+    "core.screen_resolve", "core.onscreen_refs", "core.vision_grounding",
+    "core.screen_privacy", "core.vision_trace", "core.screen_timeline",
+    "core.dev_notes", "core.screen_scope", "core.uia_host",
+    "core.screen_text", "core.screen_ocr", "core.grounded_click",
+    "core.screen_digest", "core.screen_memory",
 )
 
 
