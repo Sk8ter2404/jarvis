@@ -32,7 +32,11 @@ DESIGN
     tray's mic-pause CLOSES the stream, it does not just drop frames), a
     device refresh needs PortAudio (``suspend`` / ``resume``), the capture
     asks for another device, frames stop arriving (the stream died), or the
-    bus is turned off.
+    bus is turned off. An open that fell back to the system default is
+    retried on the asked device every FALLBACK_RETRY_S; an open the driver
+    never returns is reported (BusOpenStalled - the capture books and logs
+    it) while the owner cell stays claimed (a native open is in flight, so
+    no PortAudio reinit may run under it).
   * The callback only copies, indexes and enqueues (bounded; the oldest
     frame is dropped and counted). A DSP worker thread (never exits) runs
     ``process`` (the echo canceller, when on), writes the rings and fans
@@ -62,12 +66,28 @@ DEAD_AFTER_S = 2.0               # no frame this long = the stream died
 ENSURE_WAIT_S = 2.5
 SUSPEND_WAIT_S = 2.5
 POLL_S = 0.1
+# The selected mic would not open and the stream fell back to the system
+# default: the selected one is tried again (a reopen) after this long - a
+# per-capture stream retried it on the very next capture (review 2026-10-09).
+FALLBACK_RETRY_S = 30.0
 
 
 class BusUnavailable(RuntimeError):
     """The bus cannot open right now for a reason that is not a device
     failure (muted / off, suspended for a device refresh, the PortAudio
     claim refused): the capture skips this cycle and books nothing."""
+
+
+class BusOpenStalled(RuntimeError):
+    """The owner thread is still inside the stream open after the capture's
+    wait: the driver has not returned (review 2026-10-09). NOT a
+    BusUnavailable - the capture books it (the R10 back-off paces the next
+    attempt and logs it) instead of skipping silently. ``stalled_s`` is how
+    long the open has been in flight."""
+
+    def __init__(self, msg: str = "", stalled_s: float = 0.0):
+        super().__init__(msg)
+        self.stalled_s = float(stalled_s)
 
 
 class Frame(NamedTuple):
@@ -191,7 +211,11 @@ class MicBus:
         self._ring_n = n
         # Stream state (owner thread writes; readers read under _cv).
         self.stream = None
-        self.device_open = None
+        self.device_open = None       # the device a capture ASKED for
+        self.device_actual = None     # the device the stream is really on
+        self._fallback_at = None      # opened on a fallback (clock) or None
+        self._retry_asked = False     # reopen to try the asked device again
+        self._opening_since = None    # an open in flight since (clock)
         self._want = None             # (device,) a capture asked for
         self._want_seq = 0
         self._done_seq = 0
@@ -320,10 +344,18 @@ class MicBus:
 
     def add_listener(self, fn) -> None:
         """``fn(frame)`` on the DSP thread for every frame - it must only
-        enqueue (the pre-gate's feed)."""
+        enqueue or set a flag (the pre-gate's feed, the barge-in rule)."""
         with self._subs_lock:
             if fn not in self._listeners:
                 self._listeners.append(fn)
+
+    def remove_listener(self, fn) -> None:
+        """Stop calling ``fn`` (a no-op when it is not listening)."""
+        with self._subs_lock:
+            try:
+                self._listeners.remove(fn)
+            except ValueError:
+                pass
 
     def last_frame_time(self) -> "float | None":
         """Arrival time of the newest frame in the rings (its last sample
@@ -367,17 +399,55 @@ class MicBus:
         with self._cv:
             return self.stream is not None
 
+    def open_stalled_s(self) -> float:
+        """How long the stream open in flight has been running (0.0 when no
+        open is in flight)."""
+        with self._cv:
+            since = self._opening_since
+        if since is None:
+            return 0.0
+        try:
+            return max(0.0, float(self._clock()) - float(since))
+        except Exception:
+            return 0.0
+
+    def _stalled_locked(self, after_s: float):
+        """A BusOpenStalled when an open has been in flight at least
+        ``after_s`` (called with _cv held), else None."""
+        since = self._opening_since
+        if since is None:
+            return None
+        try:
+            stalled = max(0.0, float(self._clock()) - float(since))
+        except Exception:
+            return None
+        if stalled < after_s:
+            return None
+        return BusOpenStalled(f"the microphone open has not returned for "
+                              f"{stalled:.1f} s", stalled)
+
     def ensure(self, device, timeout: float = ENSURE_WAIT_S):
         """A capture wants the bus open on ``device``. Returns (ok, error):
         ok when the stream is open on it (opening it now if needed - on the
         owner thread, waited for, bounded), error = the exception of a
-        failed open (the caller books it with the R10 back-off)."""
+        failed open (the caller books it with the R10 back-off). An open
+        that is STILL in flight when the wait ends is a BusOpenStalled
+        (booked, logged - never a silent skip); while it stays in flight a
+        later call returns that at once instead of waiting again."""
         if not self._start_threads():
             return False, self._last_error
         with self._cv:
             if (self.stream is not None and self.device_open == device
                     and not self._suspended):
-                return True, None
+                fb = self._fallback_at
+                if fb is None or self._clock() - fb < FALLBACK_RETRY_S:
+                    return True, None
+                # On the system default instead of the asked device for
+                # FALLBACK_RETRY_S: reopen to try the asked one again.
+                self._retry_asked = True
+            stalled = self._stalled_locked(float(timeout))
+            if stalled is not None:
+                return False, stalled
             self._want = (device,)
             self._want_seq += 1
             seq = self._want_seq
@@ -386,6 +456,9 @@ class MicBus:
             while self._done_seq < seq:
                 rem = deadline - time.monotonic()
                 if rem <= 0:
+                    stalled = self._stalled_locked(0.0)
+                    if stalled is not None:
+                        return False, stalled
                     return False, BusUnavailable("the mic bus did not open "
                                                  "in time")
                 self._cv.wait(rem)
@@ -426,7 +499,10 @@ class MicBus:
         with self._subs_lock:
             nsub = len(self._subs)
             sub_dropped = sum(s.dropped for s in self._subs)
-        return {"open": open_, "device": dev, "suspended": bool(sus),
+        return {"open": open_, "device": dev,
+                "device_actual": self.device_actual,
+                "opening_s": round(self.open_stalled_s(), 1),
+                "suspended": bool(sus),
                 "opens": self.opens, "closes": self.closes,
                 "n": self.n_written, "callback_dropped": self.cb_dropped,
                 "subscribers": nsub, "subscriber_dropped": sub_dropped,
@@ -462,6 +538,9 @@ class MicBus:
             with self._cv:
                 self.stream = None
                 self.device_open = None
+                self.device_actual = None
+                self._fallback_at = None
+                self._retry_asked = False
                 self.closes += 1
                 if self._want is not None and why != "off":
                     self._closed_since = self._clock()
@@ -475,11 +554,21 @@ class MicBus:
                                  "holds it)")
         else:
             st = None
+            actual = device
+            with self._cv:
+                self._opening_since = self._clock()
             try:
                 st = self._open_stream(device, self._callback)
+                # open_stream may say where the stream really opened: a
+                # (stream, device) pair - its system-default retry.
+                if isinstance(st, tuple):
+                    st, actual = st
             except BaseException as e:      # noqa: BLE001 - booked, not raised
                 err = e
                 st = None
+            finally:
+                with self._cv:
+                    self._opening_since = None
             if st is None:
                 try:
                     self._release()
@@ -491,6 +580,9 @@ class MicBus:
                 with self._cv:
                     self.stream = st
                     self.device_open = device
+                    self.device_actual = actual
+                    self._fallback_at = (None if actual == device
+                                         else self._clock())
                     self.opens += 1
                     if self._closed_since is not None:
                         self.closed_s += self._clock() - self._closed_since
@@ -530,6 +622,7 @@ class MicBus:
             want_seq, done_seq = self._want_seq, self._done_seq
             st, dev = self.stream, self.device_open
             suspended = bool(self._suspended)
+            retry = bool(self._retry_asked)
         try:
             run = bool(self._should_run())
         except Exception:
@@ -539,8 +632,8 @@ class MicBus:
                 last = self._t_last_cb
             dead = last is not None and self._clock() - last > DEAD_AFTER_S
             if not run or suspended or dead or (
-                    want is not None and want[0] != dev
-                    and want_seq != done_seq):
+                    want is not None and want_seq != done_seq
+                    and (want[0] != dev or retry)):
                 why = ("off" if not run else "suspend" if suspended
                        else "dead" if dead else "device")
                 if dead:

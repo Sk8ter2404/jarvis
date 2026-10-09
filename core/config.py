@@ -968,12 +968,17 @@ MUSIC_GATE_MODE            = "shadow"
 # WAKE_PREGATE_MODE   openWakeWord scores the mic: 'shadow' logs its scores
 #   (one line per accepted wake turn, one per media minute); 'on' (needs
 #   MIC_BUS_MODE) lets the name START a capture, confirmed by Parakeet.
+#   Ships 'off' (2026-10-09 review): 'shadow' loads openWakeWord into the
+#   live process (+~100 MB, sklearn and a second OpenMP runtime) - a native
+#   change that needs its own live canary before it runs at boot.
 #   WAKE_PREGATE_THRESHOLD is its trigger score (0.10-0.50).
 # MIC_BUS_MODE        'on' = one always-open mic stream with a 30 s ring
 #   instead of a stream per capture (no deaf gap between captures).
 # MEDIA_AEC_MODE      echo cancellation of what the PC plays (a loopback of
 #   the default speakers, held in RAM only, never saved): 'shadow' measures,
-#   'on' captures read the cancelled mic.
+#   'on' captures read the cancelled mic - only with MIC_BUS_MODE 'on' (a
+#   stream per capture re-anchors the canceller at every open, and its first
+#   frames still carry the video; without the bus 'on' measures only).
 # WAKE_LOOPBACK_VETO  a wake the video itself said ("Jarvis" in the PC's own
 #   audio within 1 s) is dropped ('on') or counted (needs MEDIA_AEC_MODE).
 # WAKE_DUCK_MODE      'on' = after a confirmed wake, other apps duck to
@@ -981,7 +986,7 @@ MUSIC_GATE_MODE            = "shadow"
 # WAKE_BARGEIN_MODE   'on' = saying "Jarvis" / "stop" over his own speech
 #   stops it (needs MIC_BUS_MODE and the pre-gate).
 WAKE_REANCHOR_MODE         = "shadow"
-WAKE_PREGATE_MODE          = "shadow"
+WAKE_PREGATE_MODE          = "off"
 WAKE_PREGATE_THRESHOLD     = 0.15
 MIC_BUS_MODE               = "off"
 MEDIA_AEC_MODE             = "off"

@@ -13,7 +13,10 @@ loopback can tell when the video itself said "Jarvis" (D2).
 The stock ``hey_jarvis_v0.1`` model is trained on "hey Jarvis"; the owner
 mostly says "Jarvis, ...". Its recall for the plain name depends heavily on
 the voice (synthetic set: 71 % at 0.5 for one voice, 12 % for three others),
-so it ships in SHADOW (A3, WAKE_PREGATE_MODE 'shadow'): it scores the mic
+so it is a SHADOW first (A3, WAKE_PREGATE_MODE 'shadow' - the setting ships
+'off' since the 2026-10-09 review: loading it adds ~100 MB and a second
+OpenMP runtime to the live process, so 'shadow' waits for its own canary): it
+scores the mic
 the main capture already hears (the record tap - no new stream) and logs
 NUMBERS ONLY - for each accepted wake-word turn its highest score around the
 capture start, and per media minute how many events each threshold would

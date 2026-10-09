@@ -382,12 +382,13 @@ class _FakeAEC:
 
 class CancelledSignalTests(_Base):
 
-    def _aec(self, fake, mode="on"):
+    def _aec(self, fake, mode="on", effective=True):
         bc = self.bc
         self._p(bc, "MEDIA_AEC_MODE", mode, create=True)
         self._p(bc, "_media_aec_get", lambda: fake)
         self._p(bc, "_media_aec_bypass", lambda: "")
-        self._p(bc, "_media_aec_effective", lambda: mode == "on")
+        if effective:
+            self._p(bc, "_media_aec_effective", lambda: mode == "on")
 
     def test_the_cancelled_signal_decides_and_the_linear_is_kept(self):
         streams = self._bus_on()
@@ -419,28 +420,52 @@ class CancelledSignalTests(_Base):
         self.assertIsNotNone(clip)
         self.assertGreater(float(np.abs(clip).max()), 0.02)
 
-    def test_the_per_capture_stream_uses_the_canceller_too(self):
+    def test_the_per_capture_stream_only_measures(self):
+        """MEDIA_AEC_MODE 'on' with MIC_BUS_MODE 'off': each per-capture
+        stream is a new canceller session (it measures), but the capture
+        decides on the RAW mic - a session re-anchored at every open still
+        carries the video in its first frames (21 of 23 synthetic reopens
+        crossed the threshold; 58-69 % accepted against 92-97 % for one
+        continuous session - 2026-10-09 review). The REAL
+        _media_aec_effective decides, not a stand-in."""
         bc = self.bc
         self._edges()
         self._p(bc, "MIC_BUS_MODE", "off", create=True)
         fake = _FakeAEC(lin_gain=0.0, sup_gain=0.0)
-        self._aec(fake)
+        self._aec(fake, effective=False)
+
+        class Loop:
+            running = True
+            endpoint = "Speakers (ACME USB Audio)"
+            n_written = 16000
+
+            def rms_recent(self, seconds=1.0):
+                return 0.02
+
+            def age_s(self):
+                return 0.01
 
         class Legacy:
             def __init__(s, *a, callback=None, **k):
                 s.cb = callback
 
             def start(s):
-                # Trailing quiet: a broken canceller ends the capture (red)
-                # instead of hanging it.
-                for f in [_loud(0)] * 30 + [_quiet(0)] * 40:
+                for f in [_loud(0)] * 4 + [_quiet(0)] * 40:
                     s.cb(f.reshape(-1, 1), len(f), None, None)
 
         self._p(bc.sd, "InputStream", Legacy)
         self._p(bc, "_safe_close_stream", lambda *a, **k: None)
         self._p(bc, "_media_aec_obj", [fake])
-        self.assertIsNone(self._record(timeout=0.5))
+        self._p(bc, "_loopback_obj", [Loop()])
+        self.assertFalse(bc._media_aec_effective())
+        clip = self._record(timeout=1.0)
+        self.assertIsNotNone(clip, "the raw mic decides: the loud frames "
+                                   "start a capture")
+        self.assertGreater(float(np.abs(clip).max()), 0.02)
         self.assertEqual(fake.sessions, 1)     # a new stream, a new session
+        # The same canceller with the bus on IS effective.
+        self._p(bc, "_bus_mode_on", lambda: True)
+        self.assertTrue(bc._media_aec_effective())
 
 
 # ── D1 / D2 / D3: the pre-gate's trigger, veto and duck ──────────────────
@@ -792,7 +817,11 @@ class MediaTestAndLogTests(_Base):
             def rms_recent(self, seconds=1.0):
                 return 0.0 if quiet[0] else 0.02
 
+            def age_s(self):
+                return 0.01                      # packets keep arriving
+
         self._p(bc, "MEDIA_AEC_MODE", "on", create=True)
+        self._p(bc, "_bus_mode_on", lambda: True)
         self._p(bc, "_loopback_obj", [Loop()])
         self._p(bc, "_media_aec_obj", [_FakeAEC(1.0, 1.0)])
         self._p(bc, "_pc_media_playing", lambda refresh=True: True)

@@ -65,13 +65,18 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(g.gain(np.full(1280, 0.4, np.float32), 0.1), 1.0)
 
     def test_a_load_failure_latches_off(self):
+        calls = []
+
         def boom():
+            calls.append(1)
             raise RuntimeError("no model")
 
         d = wpg.Detector(model_factory=boom)
-        self.assertEqual(d.feed(np.zeros(2560, np.float32), 1.0), [])
+        for i in range(20):                  # 20 frames: ONE load attempt
+            self.assertEqual(d.feed(np.zeros(2560, np.float32), 1.0 + i), [])
         self.assertIn("no model", d.failed)
         self.assertFalse(d.ready())
+        self.assertEqual(len(calls), 1, "latched: never re-loaded per frame")
 
 
 class WorkerTests(unittest.TestCase):
@@ -134,6 +139,19 @@ class WorkerTests(unittest.TestCase):
                  or importlib.util.find_spec("onnxruntime") is None,
                  "openwakeword / onnxruntime not installed")
 class RealModelTests(unittest.TestCase):
+    """Installed is not importable: under tools/run_tests_ci_sim.py (the
+    Linux runner faked on Windows) onnxruntime's import fails with "DLL
+    initialization routine failed" (2026-10-09 review: an ERROR in the
+    pre-push gate). The import is tried once, here, and a failure skips."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            importlib.import_module("onnxruntime")
+            importlib.import_module("openwakeword.model")
+        except (Exception, SystemExit) as e:   # ImportError, OSError ...
+            raise unittest.SkipTest(f"openwakeword / onnxruntime do not "
+                                    f"import here ({type(e).__name__})")
 
     def test_the_real_graph_loads_on_the_cpu_single_threaded(self):
         m = wpg.load_model()

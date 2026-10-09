@@ -325,7 +325,9 @@ class SettingsCopiesTests(unittest.TestCase):
                     self.assertNotIn(key, sw.SCHEMA)   # a constant
         # The shipped defaults the spec names.
         self.assertEqual(lm.DEFAULTS["WAKE_REANCHOR_MODE"], "shadow")
-        self.assertEqual(lm.DEFAULTS["WAKE_PREGATE_MODE"], "shadow")
+        # Off: 'shadow' loads openWakeWord into the live process (2026-10-09
+        # review) - its own canary first.
+        self.assertEqual(lm.DEFAULTS["WAKE_PREGATE_MODE"], "off")
         self.assertEqual(lm.DEFAULTS["MIC_BUS_MODE"], "off")
         self.assertEqual(lm.DEFAULTS["MEDIA_AEC_MODE"], "off")
 

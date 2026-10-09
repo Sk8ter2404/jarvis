@@ -184,22 +184,42 @@ class ReaderThreadTests(unittest.TestCase):
         self.assertTrue(self._wait(lambda: ref.opens >= 2))
         self.assertGreater(ref.gap_seq, seq)
 
-    def test_failure_falls_back_then_backs_off_logging_once(self):
-        calls = {"n": 0}
+    def _failing(self, retry_s):
+        calls = {"primary": 0, "fallback": 0}
 
-        def broken():
-            calls["n"] += 1
+        def primary():
+            calls["primary"] += 1
             raise OSError("no loopback endpoint")
 
-        old = (lr.BACKOFF_MIN_S, lr.BACKOFF_MAX_S)
+        def fallback():
+            calls["fallback"] += 1
+            raise OSError("no loopback endpoint either")
+
+        old = (lr.BACKOFF_MIN_S, lr.BACKOFF_MAX_S, lr.FALLBACK_RETRY_S)
         lr.BACKOFF_MIN_S, lr.BACKOFF_MAX_S = 0.01, 0.02
+        lr.FALLBACK_RETRY_S = retry_s
         self.addCleanup(lambda: (setattr(lr, "BACKOFF_MIN_S", old[0]),
-                                 setattr(lr, "BACKOFF_MAX_S", old[1])))
-        ref, logs = self._ref([broken, broken])
+                                 setattr(lr, "BACKOFF_MAX_S", old[1]),
+                                 setattr(lr, "FALLBACK_RETRY_S", old[2])))
+        ref, logs = self._ref([primary, fallback])
         ref.start()
-        self.assertTrue(self._wait(lambda: ref.failures >= 3))
-        self.assertGreaterEqual(calls["n"], 6)        # both tried each time
+        self.assertTrue(self._wait(lambda: ref.failures >= 6))
+        ref.shutdown()
+        return calls, logs
+
+    def test_failure_backs_off_logging_once(self):
+        calls, logs = self._failing(retry_s=60.0)
+        self.assertGreaterEqual(calls["primary"], 6)  # soundcard every time
         self.assertEqual(sum("cannot record" in line for line in logs), 1)
+
+    def test_the_fallback_is_tried_at_most_once_a_retry_window(self):
+        """pyaudiowpatch bundles a second PortAudio: a failing episode
+        initialises / terminates it at most every FALLBACK_RETRY_S, not on
+        every back-off step (2026-10-09 review)."""
+        calls, _logs = self._failing(retry_s=60.0)
+        self.assertEqual(calls["fallback"], 1)
+        calls, _logs = self._failing(retry_s=0.0)      # the window elapsed
+        self.assertGreaterEqual(calls["fallback"], 6)
 
     def test_the_second_source_is_the_fallback(self):
         def broken():

@@ -18837,9 +18837,10 @@ def record_speech(timeout: float | None = None, *,
             # Hard utterance ceiling: if continuous above-threshold audio
             # kept us recording past the cap, finalize now and let whisper
             # sort it out, rather than recording until the watchdog fires.
-            # A capture the wake word started (D1) is capped at
-            # PREGATE_CAP_S.
-            _cap_s = (_lm.PREGATE_CAP_S if _cap_ctx.get("pregate")
+            # A capture the wake word started (D1) over media the canceller
+            # is not cancelling is capped at PREGATE_CAP_S (anywhere else
+            # it ends on his silence like any capture).
+            _cap_s = (_lm.PREGATE_CAP_S if _cap_ctx.get("pregate_cap")
                       else MAX_RECORDING_SECS)
             if recording and (time.time() - record_start_ts) > _cap_s:
                 print(f"  [record_speech] max utterance "
@@ -19089,6 +19090,8 @@ def record_speech(timeout: float | None = None, *,
     # Listening over media: how this capture started and ended, for the main
     # loop (the wake duck's release, the minute line).
     _pg = _cap_ctx.get("pregate")
+    if _bus_cap is not None and _cap_ctx.get("last_start") is not None:
+        _mic_bus_clip_end[0] = int(_cap_ctx["last_start"])
     _last_capture_meta[0] = {
         "pregate": bool(_pg),
         "pregate_seq": int(_pg.get("seq", 0)) if isinstance(_pg, dict) else 0,
@@ -23566,6 +23569,11 @@ def _note_turn_boundary() -> None:
     if _turn_in_progress[0]:
         _turn_in_progress[0] = False
         _note_conversation_activity()
+        # The always-open mic (2026-10-09 review): the last capture became
+        # a turn, so a late wake confirm for a name in it is stale, and a
+        # media segment's overlap is not carried into the next capture (it
+        # would replay the command just acted on).
+        _listen_turn_taken()
     elif _utterance_in_progress[0]:
         _note_dropped_capture()
     _utterance_in_progress[0] = False
@@ -26086,6 +26094,31 @@ def request_tts_interrupt(source: str = "wake-word",
     return True
 
 
+class _BusBargeIn:
+    """The headset barge-in listener on the always-open mic (MIC_BUS_MODE):
+    the stream callback's own rule, fed the bus's raw frames on its DSP
+    thread (it only sets a flag) - no second stream on the device. close()
+    stops it; nothing native to free."""
+
+    def __init__(self, bus, cb):
+        self._bus = bus
+
+        def _fn(fr, _cb=cb):
+            raw = np.asarray(fr.raw, np.float32)
+            _cb(raw.reshape(-1, 1), len(raw), None, None)
+        self._fn = _fn
+        bus.add_listener(_fn)
+
+    def stop(self) -> None:
+        pass
+
+    def close(self) -> None:
+        try:
+            self._bus.remove_listener(self._fn)
+        except Exception:
+            pass
+
+
 def _start_barge_in_listener():
     """Open a mic InputStream that flags sustained speech during playback.
     The callback ONLY sets `_barge_in_interrupted = True`; calling sd.stop()
@@ -26117,9 +26150,11 @@ def _start_barge_in_listener():
         return None
     if _mic_bus_open():
         # The mic bus holds the device (MIC_BUS_MODE): a second stream on it
-        # is the WASAPI double open. Voice barge-in runs on the bus
-        # (WAKE_BARGEIN_MODE).
-        return None
+        # is the WASAPI double open, so the SAME rule runs on the bus's
+        # frames instead (2026-10-09 review: returning None here switched
+        # his headset barge-in off whenever the bus was on).
+        bus = _mic_bus_obj[0]
+        return _BusBargeIn(bus, cb) if bus is not None else None
     try:
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
@@ -26791,7 +26826,9 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
         _tts_interrupt.clear()
         # Ensure HUD doesn't show stale amplitude after playback
         _write_hud_state(tts_amplitude=0.0)
-        if barge_stream is not None:
+        if isinstance(barge_stream, _BusBargeIn):
+            barge_stream.close()            # a bus listener: no native close
+        elif barge_stream is not None:
             _safe_close_stream(barge_stream)
         # Release the TTS-playback claim only NOW — after the barge-in
         # stream's native close — so the flag covers its whole native lifetime
@@ -35015,7 +35052,11 @@ def _media_aec_get():
                     _loopback_obj[0] = lb
                     _media_aec_obj[0] = aec
                     print(f"  [media-aec] {_aec_mode()}: echo cancellation of "
-                          f"the PC's playback (loopback in RAM only)")
+                          f"the PC's playback (loopback in RAM only)"
+                          + ("" if _aec_mode() != "on" or _bus_mode_on()
+                             else " - with MIC_BUS_MODE 'off' it only "
+                                  "measures; captures decide on the raw "
+                                  "mic"))
         lb = _loopback_obj[0]
         if lb is not None and not lb.running:
             lb.start()
@@ -35041,14 +35082,40 @@ def _media_aec_bypass() -> str:
         return "no loopback"
 
 
+def _loopback_stale() -> bool:
+    """The loopback reader has delivered nothing for LOOPBACK_STALE_S (or
+    never): soundcard pads a silent endpoint with zeros by the clock, so a
+    live reader never goes this quiet - a stalled or dead one does, and its
+    last LOUD second would otherwise read as a present reference for ever
+    (2026-10-09 review). Never raises (True)."""
+    try:
+        lb = _loopback_obj[0]
+        if lb is None:
+            return True
+        age = lb.age_s()
+        return age is None or float(age) > _lm.LOOPBACK_STALE_S
+    except Exception:
+        return True
+
+
 def _media_aec_effective() -> bool:
     """MEDIA_AEC_MODE 'on' AND the canceller is actually cancelling (not
-    bypassed, its reference present). The B2 segments and the D3 duck stand
-    in when it is not. Never raises."""
+    bypassed, its reference present and fresh) AND the mic bus is on. The
+    B2 segments and the D3 duck stand in when it is not.
+
+    The bus is required (2026-10-09 review): a stream per capture is a new
+    canceller session at every open, and the first frames after each re-
+    anchor still carry the video - 21 of 23 synthetic reopens crossed the
+    capture threshold, and the closed-mic gaps between captures lost 7-11
+    of 36 commands (58-69 % accepted against 92-97 % for one continuous
+    session). With MIC_BUS_MODE 'off' the canceller only measures.
+    Never raises."""
     try:
         if _aec_mode() != "on" or _media_aec_obj[0] is None:
             return False
-        if _media_aec_bypass() or _aec_ref_missing[0]:
+        if not _bus_mode_on():
+            return False
+        if _media_aec_bypass() or _aec_ref_missing[0] or _loopback_stale():
             return False
         st = _media_aec_obj[0].status()
         return bool(st.get("converging", True))
@@ -35080,7 +35147,10 @@ def _media_aec_check_reference() -> None:
         # The one media reading (a meter read at most every
         # _MUSIC_STATE_TTL_S, only while the canceller is on).
         playing = _pc_media_playing(refresh=True)
-        quiet = lb.rms_recent(1.0) < 1e-5
+        # Quiet = the last second written is silent, OR the reader has
+        # written nothing for LOOPBACK_STALE_S (a stalled / dead reader
+        # keeps its last loud second for ever - 2026-10-09 review).
+        quiet = _loopback_stale() or lb.rms_recent(1.0) < 1e-5
         now = time.monotonic()
         if playing and quiet:
             if _aec_ref_quiet_since[0] is None:
@@ -35105,8 +35175,9 @@ def _media_aec_chunk(chunk, t=None):
     """Run one capture chunk through the canceller (bus off: record_speech
     calls this per chunk). (lin, sup, use): ``use`` True = MEDIA_AEC_MODE
     'on' and the canceller is effective, so the capture keeps ``lin`` and
-    decides on ``sup``; False = the caller keeps the raw chunk (shadow
-    measures only). Never raises."""
+    decides on ``sup``; False = the caller keeps the raw chunk (it only
+    measures). Effective needs the bus (_media_aec_effective), so on this
+    per-capture path it always measures only. Never raises."""
     try:
         aec = _media_aec_get()
         if aec is None or _media_aec_bypass():
@@ -35153,8 +35224,10 @@ class _BusUnavailable(RuntimeError):
 def _mic_bus_open_stream(device, callback):
     """The bus's stream: the same InputStream record_speech opens (MME, the
     selected index, 1024-sample blocks), with its one system-default retry.
-    Runs on the bus's owner thread. Raises on failure (booked by the
-    capture that asked)."""
+    Runs on the bus's owner thread. Returns (stream, the device it really
+    opened on - None after the system-default retry, so the bus tries the
+    selected mic again later: core/mic_bus FALLBACK_RETRY_S). Raises on
+    failure (booked by the capture that asked)."""
     try:
         st = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                             dtype="float32", blocksize=1024, device=device,
@@ -35175,7 +35248,7 @@ def _mic_bus_open_stream(device, callback):
         _safe_close_stream(st)
         raise
     _note_live_capture(st, opened)
-    return st
+    return st, opened
 
 
 def _mic_bus_claim() -> bool:
@@ -35193,12 +35266,30 @@ def _mic_bus_should_run() -> bool:
                 and not _mic_input_disabled())
 
 
+def _jarvis_audible_now() -> bool:
+    """JARVIS's own playback is live, or ended under PLAYBACK_TAIL_S ago
+    (any thread's: core/self_echo's registry, plus the main loop's own
+    playback flag). Never raises (False)."""
+    try:
+        if _tts_playback_active[0]:
+            return True
+        end = _self_echo.last_playback_end()
+        return (end is not None
+                and _self_echo.now() - float(end) < _lm.PLAYBACK_TAIL_S)
+    except Exception:
+        return False
+
+
 def _mic_bus_tap_allowed() -> bool:
     """The legacy record taps (the ambient listener, get_mic_buffer) get
     the bus's frames except while a private in-turn capture runs off the
-    main thread (the printer wizard's access code: 2026-10-01 review) or
-    the mic is muted."""
-    return not (_offthread_capture_holds_mic() or _mic_muted[0])
+    main thread (the printer wizard's access code: 2026-10-01 review), the
+    mic is muted, or JARVIS himself is audible (2026-10-09 review: with a
+    stream per capture no tap frame ever arrived during his main-loop
+    speech; the always-open bus would hand his own voice to the ambient
+    listener, which transcribes and keeps it for the learners)."""
+    return not (_offthread_capture_holds_mic() or _mic_muted[0]
+                or _jarvis_audible_now())
 
 
 def _mic_bus_tap_fanout(fr) -> None:
@@ -35213,11 +35304,20 @@ def _mic_bus_tap_fanout(fr) -> None:
 def _mic_bus_process(mono, t):
     """The bus's DSP hook: the canceller on every frame while
     MEDIA_AEC_MODE is not 'off' (shadow measures; 'on' is used by
-    record_speech), None otherwise (lin = sup = raw)."""
+    record_speech), None otherwise (lin = sup = raw). For the first
+    MEDIA_AEC_SETTLE_S after the canceller (re)anchors - a reopened stream,
+    dropped frames, a reference gap - the suppressed copy is silence: its
+    output still carries the video then, and it decides when a capture
+    starts (2026-10-09 review)."""
     aec = _media_aec_get()
     if aec is None or _media_aec_bypass():
         return None
     lin, sup = aec.process(mono, t)
+    try:
+        if aec.settling(len(mono)):
+            sup = np.zeros_like(sup)
+    except Exception:
+        pass
     _media_aec_count(mono, sup)
     return lin, sup
 
@@ -35547,7 +35647,8 @@ def _pregate_confirm_one(t_hit: float, score: float, speaking: bool) -> str:
             return "dropped"
         _listen_note("pregate_confirms")
         _pregate_seq[0] += 1
-        _pregate_hit[0] = {"n0": int(n0), "t": float(t_hit), "ok": True,
+        _pregate_hit[0] = {"n0": int(n0), "n_hit": int(n_hit),
+                           "t": float(t_hit), "ok": True,
                            "seq": _pregate_seq[0], "score": float(score)}
         _wake_duck_start()
         if _wake_duck_timer[0] is not None:
@@ -35729,6 +35830,13 @@ def _wake_reanchor(text: str, conf) -> "str | None":
             why = "no word timing"
         elif audio is None or sr <= 0:
             why = "no audio"
+        elif ((_last_capture_meta[0] or {}).get("why") == "segment"
+              and cap_s - (float(cut_s) + _lm.REANCHOR_PAD_S)
+              < _lm.SEGMENT_OVERLAP_S):
+            # A media segment cut this capture and the name sits in the
+            # overlap the next capture starts with: taken there, whole (here
+            # it may be cut mid-command, and taking both would run it twice).
+            why = "in the next segment"
         if not why:
             cut = audio[int(cut_s * sr):]
             if len(cut) < int(0.4 * sr):
@@ -35766,6 +35874,19 @@ def _wake_reanchor(text: str, conf) -> "str | None":
         return None
 
 
+def _listen_turn_taken() -> None:
+    """Turn boundary, the previous capture became a turn: its bus audio is
+    spent (see _mic_bus_turn_end) and no segment carry outlives it. Never
+    raises."""
+    try:
+        _mic_bus_turn_end[0] = _mic_bus_clip_end[0]
+        if _mic_bus_carry[0] is not None:
+            _mic_bus_carry[0] = None
+            _listen_note("carry_dropped")
+    except Exception:
+        pass
+
+
 # ── record_speech's listening-over-media hooks (2026-10-05) ─────────────
 _last_capture_meta: list = [None]
 # When the last per-capture stream closed (monotonic), or None: the gap to
@@ -35801,6 +35922,9 @@ def _bus_capture_open(device):
         ok, err = bus.ensure(device)
         if not ok:
             from core import mic_bus as _mb
+            if isinstance(err, _mb.BusOpenStalled):
+                _bus_open_stalled(bus, err, device)
+                return False
             if err is None or isinstance(err, _mb.BusUnavailable):
                 time.sleep(0.1)          # never a hot loop
                 return False
@@ -35817,6 +35941,37 @@ def _bus_capture_open(device):
                 "first": True}
     except Exception:
         return None
+
+
+def _bus_open_stalled(bus, err, device) -> None:
+    """The bus's stream open has not returned (the driver holds its owner
+    thread): nothing is heard until it does. Booked with the R10 back-off
+    (the next attempts are paced; a summary each minute), logged on its
+    first and summary attempts, and - once it has lasted
+    MIC_SILENT_WARN_SECONDS - SPOKEN through the silent-mic warning (its own
+    throttle), because it takes away the owner's way of asking. The bus's
+    owner cell stays claimed meanwhile: a native open is in flight, so no
+    PortAudio reinit may run under it (2026-10-09 review: it used to be a
+    silent 0.1 s skip, every capture, for ever). Never raises."""
+    try:
+        now = _input_backoff_now()
+        st = _input_open_backoff.note_failure(now, f"{type(err).__name__}: "
+                                                   f"{err}")
+        try:
+            stalled = float(bus.open_stalled_s() or 0.0)
+        except Exception:
+            stalled = float(getattr(err, "stalled_s", 0.0) or 0.0)
+        if st.get("log") in ("first", "summary"):
+            print(f"  [mic-bus] the microphone open on device {device!r} has "
+                  f"not returned for {stalled:.0f} s - nothing is heard until "
+                  f"it does (the driver holds the bus's own thread; the main "
+                  f"loop keeps running). {st.get('attempts')} attempt(s); "
+                  f"next in {float(st.get('delay') or 0.0):.1f} s, a summary "
+                  f"each minute")
+        if stalled >= float(MIC_SILENT_WARN_SECONDS):
+            _report_silent_mic(stalled, time.time())
+    except Exception:
+        pass
 
 
 def _bus_chunks(bus, kind: str, start: int, stop: int):
@@ -35870,7 +36025,17 @@ def _capture_frame(item, ctx):
         seed = None
         if cap.get("first"):
             cap["first"] = False
+            # Ring audio from before this capture never reaches back into
+            # JARVIS's own voice (2026-10-09 review: his last words sat in
+            # the next pre-roll, older than the self-echo filter looks).
+            floor = _bus_playback_floor(bus)
             carry = cap.get("carry")
+            if (carry is not None and floor is not None
+                    and floor > int(carry[0])):
+                # He spoke since the segment cut: its overlap holds his
+                # reply, not a command - the capture starts fresh.
+                _listen_note("carry_dropped")
+                carry = None
             if carry is not None:
                 ch = _bus_chunks(bus, kind, carry[0], start)
                 if ch:
@@ -35880,16 +36045,19 @@ def _capture_frame(item, ctx):
                                                  + secs), "trip": True}
                     ctx["seeded"] = True
             if seed is None:
-                ch = _bus_chunks(bus, kind, start - 12 * 1024, start)
+                lo = start - 12 * 1024
+                if floor is not None:
+                    lo = max(lo, int(floor))
+                ch = _bus_chunks(bus, kind, lo, start)
                 if ch:
                     seed = {"chunks": ch, "secs": 0.0, "t0": None,
                             "trip": False}
         hit = _pregate_take_hit(0) if _pregate_mode() == "on" else None
         if hit is not None and not ctx.get("pregate"):
-            age = time.monotonic() - float(hit["t"])
-            n0 = max(int(hit["n0"]), int(fr.n_end) - 25 * SAMPLE_RATE)
+            seat = _pregate_seat(bus, hit, int(fr.n_end))
+            n0 = seat if isinstance(seat, int) else None
             ch = (_bus_chunks(bus, kind, n0, start)
-                  if age < _lm.PREGATE_CAP_S else None)
+                  if n0 is not None else None)
             if ch:
                 secs = sum(len(c) for c in ch) / float(SAMPLE_RATE)
                 seed = {"chunks": ch, "secs": secs,
@@ -35897,12 +36065,72 @@ def _capture_frame(item, ctx):
                                              + secs), "trip": True}
                 ctx["pregate"] = hit
                 ctx["seeded"] = True
+                # The 10 s cap is for a capture the video would otherwise
+                # run to 30 s: only over media the canceller is not
+                # cancelling (a quiet room ends it on his silence).
+                ctx["pregate_cap"] = bool(_pc_media_playing()
+                                          and not _media_aec_effective())
                 print(f"  [wake-pregate] the wake word starts this capture "
                       f"({secs:.1f} s back)")
         return raw, keep, det, seed
     except Exception:
         r = getattr(item, "raw", item)
         return r, r, r, None
+
+
+# The bus sample index the last bus capture's clip was processed up to (its
+# last frame's start), and that index for the last capture that became a
+# TURN (set at the turn boundary). A confirmed wake whose name is at or
+# before the latter was already acted on (2026-10-09 review: a confirm that
+# landed after "Jarvis, pause the music" ended re-seated the NEXT capture on
+# that same command - it ran twice, which plays the music again).
+_mic_bus_clip_end: list = [None]
+_mic_bus_turn_end: list = [None]
+
+
+def _bus_playback_floor(bus) -> "int | None":
+    """The oldest bus sample a capture may start from without JARVIS's own
+    voice: the index heard PLAYBACK_TAIL_S after his latest playback ended
+    (after the newest frame while one is still playing: no ring audio at
+    all). None when no playback is remembered. Never raises (None)."""
+    try:
+        end = _self_echo.last_playback_end()
+        if end is None:
+            return None
+        return _bus_index_at(bus, float(end) + _lm.PLAYBACK_TAIL_S)
+    except Exception:
+        return None
+
+
+def _pregate_seat(bus, hit: dict, n_end: int) -> "int | str":
+    """Where a confirmed D1 hit seats the capture (a bus sample index), or
+    why it does not (a string; counted and logged, numbers only): too old,
+    its name was already in a capture that became a turn, or it was heard
+    while JARVIS himself was audible. Never raises ('error')."""
+    try:
+        pre = int(_lm.PREGATE_PREROLL_S * SAMPLE_RATE)
+        n0 = int(hit["n0"])
+        n_hit = int(hit.get("n_hit", n0 + pre))
+        why = ""
+        if time.monotonic() - float(hit["t"]) >= _lm.PREGATE_CAP_S:
+            why = "too old"
+        elif (_mic_bus_turn_end[0] is not None
+              and n_hit <= int(_mic_bus_turn_end[0])):
+            why = "already a turn"
+        else:
+            floor = _bus_playback_floor(bus)
+            if floor is not None:
+                if n_hit <= int(floor):
+                    why = "during his own speech"
+                else:
+                    n0 = max(n0, int(floor))
+        if why:
+            _listen_note("pregate_stale")
+            print(f"  [wake-pregate] a confirmed wake not used ({why})")
+            return why
+        return max(n0, int(n_end) - 25 * SAMPLE_RATE)
+    except Exception:
+        return "error"
 
 
 def _segment_active_now() -> bool:

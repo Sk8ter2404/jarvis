@@ -261,6 +261,37 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(lin.shape, x.shape)
         self.assertIn("last_error", aec.stats)
 
+    def test_poor_erle_passes_the_mic_through_once_per_episode(self):
+        """ERLE under 10 dB for MEDIA_AEC_POOR_S: the mic passes through
+        unchanged (lin is the mic) and take_not_converging() says so once."""
+        rng = np.random.default_rng(12)
+        n = 6 * SR
+        ref = _bandpass(0.05 * rng.standard_normal(n))
+        mic = _bandpass(0.02 * rng.standard_normal(n))   # no echo of it
+        old = ap.MEDIA_AEC_POOR_S
+        ap.MEDIA_AEC_POOR_S = 1.0
+        self.addCleanup(setattr, ap, "MEDIA_AEC_POOR_S", old)
+        aec = ap.MediaEchoCanceller(FakeRef(ref))
+        run(aec, mic[:4 * SR])
+        self.assertFalse(aec.status()["converging"])
+        self.assertTrue(aec.take_not_converging())
+        self.assertFalse(aec.take_not_converging())
+        x = mic[4 * SR:4 * SR + 1024]
+        lin, _sup = aec.process(x, t=(4 * SR + 1024) / SR)
+        np.testing.assert_allclose(lin, x.astype(np.float32), atol=1e-7)
+
+    def test_a_reference_gap_re_anchors(self):
+        ref, mic, echo, near = make_scene(seconds=3.0, ppm=0.0)
+        r = FakeRef(ref)
+        aec = ap.MediaEchoCanceller(r)
+        run(aec, mic[:SR])
+        before = aec.stats["sessions"]
+        self.assertFalse(aec.settling(1024))
+        r.gap_seq += 1                    # the loopback reopened
+        aec.process(mic[SR:SR + 1024], t=(SR + 1024) / SR)
+        self.assertEqual(aec.stats["sessions"], before + 1)
+        self.assertTrue(aec.settling(1024))
+
     def test_odd_chunk_sizes_keep_the_length(self):
         ref, mic, echo, near = make_scene(seconds=2.0, ppm=0.0)
         aec = ap.MediaEchoCanceller(FakeRef(ref))
@@ -270,6 +301,60 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(len(lin), n)
             self.assertEqual(len(sup), n)
             pos += n
+
+
+class ClockRef(FakeRef):
+    """index_at follows the SPEAKER's clock, as the loopback's time base
+    does (its ring index at a monotonic time counts the speaker's own
+    samples): the mic at +ppm hears reference position t * SR * (1+ppm)."""
+
+    def __init__(self, x, ppm):
+        super().__init__(x)
+        self.k = 1.0 + ppm * 1e-6
+
+    def index_at(self, t):
+        return t * SR * self.k
+
+
+class ReopenTests(unittest.TestCase):
+    """2026-10-09 review (F1): a new session (a reopened stream, dropped
+    frames, a reference gap) re-anchors by the wall clock. Its first frames
+    still carry the video (settling() covers them), and - the defect - the
+    anchor ignored the drift corrected so far, so at 20 ppm the converged
+    filter met a reference a few samples off and the output stayed as loud
+    as the raw mic for over a second."""
+
+    def _reopen(self, ppm, seed):
+        ref, mic, echo, near = make_scene(seconds=12.0, ppm=ppm, seed=seed)
+        aec = ap.MediaEchoCanceller(ClockRef(ref, ppm))
+        C = 1024
+        for i in range(0, 8 * SR, C):
+            aec.process(mic[i:i + C], t=(i + C) / SR)
+        aec.new_session()                       # 2 s closed, then reopened
+        out = []
+        for i in range(10 * SR, 11 * SR, C):
+            _lin, sup = aec.process(mic[i:i + C], t=(i + C) / SR)
+            out.append((aec.settling(C),
+                        float(np.sqrt(np.mean(np.asarray(sup, np.float64)
+                                              ** 2)))))
+        return out
+
+    def test_settling_covers_the_first_half_second(self):
+        out = self._reopen(ppm=0.0, seed=8)
+        flags = [s for s, _r in out]
+        n = int(ap.MEDIA_AEC_SETTLE_S * SR / 1024) + 1
+        self.assertEqual(flags[:n - 1], [True] * (n - 1))
+        self.assertFalse(any(flags[n:]))
+        self.assertGreater(max(r for s, r in out if s), 0.008,
+                           "the transient is real: it would start a capture")
+
+    def test_after_settling_a_reopen_cancels_again_with_drift(self):
+        for ppm in (20.0, 40.0):
+            with self.subTest(ppm=ppm):
+                out = self._reopen(ppm=ppm, seed=9)
+                after = [r for s, r in out if not s]
+                self.assertLess(max(after), 0.008,
+                                "below the capture threshold once settled")
 
 
 if __name__ == "__main__":

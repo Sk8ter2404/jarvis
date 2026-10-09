@@ -25,19 +25,33 @@ THE STAGES (each behind its own setting; see core/config.py)
   A2  WAKE_REANCHOR_MODE: a refused line is re-anchored at a later sentence
       (core/wake_prefix.reanchor); 'on' cuts the audio at the name
       (reanchor_cut_s), checks the voice and re-decodes it first.
-  A3  WAKE_PREGATE_MODE 'shadow': openWakeWord scores the mic (scores only).
+  A3  WAKE_PREGATE_MODE 'shadow': openWakeWord scores the mic (scores only;
+      ships 'off' - loading it is a native change with its own canary).
   B1  MIC_BUS_MODE: one always-open mic stream with a 30 s ring
       (core/mic_bus).
   B2  MEDIA_SEGMENT_S: over media, a capture is cut every 12 s and the next
       one starts 2 s earlier from the ring (segment_active).
   C1  MEDIA_AEC_MODE: echo cancellation against what the PC plays
-      (core/audio_processor.MediaEchoCanceller, core/loopback_ref).
+      (core/audio_processor.MediaEchoCanceller, core/loopback_ref); 'on'
+      decides only on the always-open bus (B1) - a stream per capture
+      re-anchors it at every open (2026-10-09 review).
   D1  WAKE_PREGATE_MODE 'on': the wake word starts the capture (PregateTrigger).
   D2  WAKE_LOOPBACK_VETO: a wake the video itself said is vetoed (vetoed_by).
   D3  WAKE_DUCK_MODE: media ducked after a confirmed wake.
   D4  owner-voice score of every confirmed cut (shadow, scores only).
 
 Everything logged here is numbers only - never a word that was heard.
+
+THE 2026-10-09 REVIEW (two reviewers, 17 findings) added: a confirmed wake
+whose name was already in a capture that became a turn, or heard while
+JARVIS spoke, never re-seats a capture; the bus never seeds a capture with
+ring audio from his own playback (PLAYBACK_TAIL_S) and never hands it to the
+record taps; a segment's overlap is dropped once a turn is taken or he
+spoke; the D1 cap applies only over media the canceller is not cancelling;
+a wedged bus open is booked, logged and spoken; the headset barge-in runs on
+the bus; a stale loopback (LOOPBACK_STALE_S) is no reference; the canceller
+settles 0.5 s after each re-anchor and its anchor keeps the drift it
+corrected; WAKE_PREGATE_MODE ships 'off'.
 """
 from __future__ import annotations
 
@@ -63,6 +77,12 @@ VETO_WINDOW_S = 1.0           # D2: a mic hit within this of ...
 VETO_SCORE = 0.3              # ... a loopback score at least this is vetoed
 DUCK_CAP_S = 8.0              # D3: a wake duck never lasts longer than this
 DUCK_TAIL_S = 0.3             # D3: held this long past the end of speech
+PLAYBACK_TAIL_S = 0.3         # B1: ring audio this soon after JARVIS's own
+                              # playback ended (speaker -> mic + room decay)
+                              # never seeds a capture (2026-10-09 review)
+LOOPBACK_STALE_S = 1.0        # C1: no loopback packet this long = no
+                              # reference (soundcard pads silence, so a
+                              # live reader never goes this quiet)
 TURN_PEAK_BEFORE_S = 1.0      # A3: a turn's peak score is the max over
 TURN_PEAK_AFTER_S = 3.0       #     [capture start - 1 s, + 3 s]
 SHADOW_THRESHOLDS = (0.10, 0.15, 0.20, 0.30, 0.50)
@@ -83,7 +103,7 @@ AMBIENT_MATCH_S = 10.0        # an ambient wake hit with no main turn this
 # only, not in the GUI): MEDIA_SEGMENT_S, MEDIA_AEC_BACKEND.
 DEFAULTS = {
     "WAKE_REANCHOR_MODE": "shadow",     # A2: OD-3 turns it 'on'
-    "WAKE_PREGATE_MODE": "shadow",      # A3 / D1
+    "WAKE_PREGATE_MODE": "off",         # A3 / D1: 'shadow' after a canary
     "WAKE_PREGATE_THRESHOLD": 0.15,     # D1; later from A3's week of data
     "MIC_BUS_MODE": "off",              # B1: 'on' after the canary
     "MEDIA_AEC_MODE": "off",            # C1: 'shadow' after OD-2

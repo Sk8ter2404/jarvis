@@ -951,11 +951,12 @@ SCHEMA: dict[str, dict] = {
     "WAKE_PREGATE_MODE": {
         "tab": "hearing", "label": "Wake-word detector",
         "type": "enum", "choices": ["off", "shadow", "on"],
-        "default": "shadow",
+        "default": "off",
         "help": "A small 'Jarvis' detector on the microphone. shadow = it "
                 "only scores (log lines, numbers only) so its threshold can "
                 "be set from your real voice; on = your name starts the "
-                "recording (needs the always-open microphone below). "
+                "recording (needs the always-open microphone below). It "
+                "loads about 100 MB of extra libraries; off = not loaded. "
                 "Applies on the next start.",
     },
     "WAKE_PREGATE_THRESHOLD": {
@@ -980,8 +981,9 @@ SCHEMA: dict[str, dict] = {
                 "from the microphone. It listens to what the PC plays (kept "
                 "in memory for 30 s at most, never saved or sent). shadow = "
                 "measures only (a log line a minute); on = recordings start "
-                "and end on your voice, not the video. Applies on the next "
-                "start.",
+                "and end on your voice, not the video - with the always-open "
+                "microphone on (without it, it only measures). Applies on "
+                "the next start.",
     },
     "WAKE_LOOPBACK_VETO": {
         "tab": "hearing", "label": "Ignore 'Jarvis' said by a video",

@@ -868,6 +868,12 @@ MEDIA_AEC_POOR_ERLE_DB = 10.0
 MEDIA_AEC_TRACK_ERLE_DB = 6.0       # the filter's peak is the echo path
 MEDIA_AEC_POOR_S = 60.0
 MEDIA_AEC_RECOVER_ERLE_DB = 12.0
+# After a session is (re)anchored the filter's reference history (its last
+# 20 partitions) still holds the old stream, so for a few frames its output
+# carries the video: 0.022 / 0.010 / 0.004 RMS in the first 64 ms frames
+# against ~0.0005 converged (2026-10-09 review, a per-capture reopen). The
+# bus's capture decision ignores the suppressed copy this long (settling()).
+MEDIA_AEC_SETTLE_S = 0.5
 _SINC_TAPS = 16
 
 
@@ -1427,6 +1433,13 @@ class MediaEchoCanceller:
         # A moves so the reference position at the current sample does not
         # jump: A + k(1+eps_old) == A' + k(1+eps_new).
         self._A += self._k * slope
+        # The same correction in the wall-clock delay a NEW session anchors
+        # with (A = index_at(t) - delay_wall + margin): without it every
+        # re-anchor (a reopened stream, dropped frames, a reference gap)
+        # missed by the drift corrected so far - a few samples, enough to
+        # turn a converged filter into a 1-2 s burst of uncancelled video
+        # at 20-40 ppm (2026-10-09 review, synthetic reopen probe).
+        self.delay_wall -= self._k * slope
         self.eps = float(np.clip(self.eps - slope, -300e-6, 300e-6))
         self._last_drift_step = abs(slope)
         self.stats["drift_updates"] += 1
@@ -1551,6 +1564,15 @@ class MediaEchoCanceller:
             if (self._passthrough
                     and self._erle_db >= MEDIA_AEC_RECOVER_ERLE_DB):
                 self._passthrough = False
+
+    def settling(self, n: int = 0) -> bool:
+        """True when a chunk of ``n`` samples just processed began inside
+        the first MEDIA_AEC_SETTLE_S of an anchored session (see the
+        constant). False outside a session (pass-through: nothing is
+        cancelled, nothing to wait for)."""
+        with self._mu:
+            return bool(self._session) and (
+                self._k - max(0, int(n)) < int(MEDIA_AEC_SETTLE_S * self.sr))
 
     def take_not_converging(self) -> bool:
         """True once per episode of the poor-ERLE pass-through (the caller

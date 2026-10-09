@@ -469,6 +469,8 @@ _MONOLITH_RESTORE_NAMES = (
     "_aec_ref_quiet_since", "_aec_tts_device_checked", "_aec_backend_said",
     "_wake_duck_seq", "_wake_duck_timer", "_listen_aec_frames",
     "_reanchor_taken", "_mic_stream_closed_at",
+    # 2026-10-09 review: the bus audio already spent (a clip, a turn).
+    "_mic_bus_clip_end", "_mic_bus_turn_end",
     # ── local-LLM / ollama latches + caches ────────────────────────────────
     "_RESOLVED_LOCAL_LLM_MODEL", "_OLLAMA_INSTALL_TRIGGERED",
     "_OLLAMA_PULL_TRIGGERED", "_LOCAL_VISION_PULL_TRIGGERED",

@@ -271,5 +271,86 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(h.bus.take_closed_s(), 0.0)
 
 
+class ReviewTests(unittest.TestCase):
+    """The 2026-10-09 review of the bus."""
+
+    def test_an_open_that_never_returns_is_a_stall_not_a_skip(self):
+        """A driver that never returns from the open: the capture gets a
+        BusOpenStalled (it books and logs it), never a BusUnavailable (a
+        silent skip); a later capture gets it at once instead of waiting
+        again; nothing opens beside the wedged open."""
+        h = Harness()
+        self.addCleanup(h.close)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        calls = []
+
+        def wedged(device, cb):
+            calls.append(device)
+            release.wait(10)
+            raise OSError("released")
+
+        h.bus._open_stream = wedged
+        ok, err = h.bus.ensure(1, timeout=0.3)
+        self.assertFalse(ok)
+        self.assertIsInstance(err, mb.BusOpenStalled)
+        self.assertNotIsInstance(err, mb.BusUnavailable)
+        self.assertGreater(err.stalled_s, 0.0)
+        time.sleep(0.35)
+        t0 = time.monotonic()
+        ok, err = h.bus.ensure(1, timeout=0.3)
+        self.assertIsInstance(err, mb.BusOpenStalled)
+        self.assertLess(time.monotonic() - t0, 0.25, "no second full wait")
+        self.assertGreater(h.bus.open_stalled_s(), 0.0)
+        self.assertGreater(h.bus.status()["opening_s"], 0.0)
+        self.assertEqual(calls, [1])
+        self.assertTrue(h.owner[0], "the owner cell covers the native open")
+        release.set()
+        self.assertTrue(h.wait(lambda: not h.owner[0]))
+        self.assertEqual(h.bus.open_stalled_s(), 0.0)
+
+    def test_a_fallback_open_is_retried_on_the_asked_device(self):
+        h = Harness()
+        self.addCleanup(h.close)
+        fail_asked = [True]
+
+        def open_stream(device, cb):
+            actual = None if fail_asked[0] else device   # its default retry
+            st = FakeStream(actual, cb)
+            h.opened.append(st)
+            return st, actual
+
+        h.bus._open_stream = open_stream
+        ok, _ = h.bus.ensure(2)
+        self.assertTrue(ok)
+        self.assertIsNone(h.bus.status()["device_actual"])
+        fail_asked[0] = False
+        ok, _ = h.bus.ensure(2)                       # within the window
+        self.assertTrue(ok)
+        self.assertEqual(len(h.opened), 1)
+        old = mb.FALLBACK_RETRY_S
+        mb.FALLBACK_RETRY_S = 0.0
+        self.addCleanup(setattr, mb, "FALLBACK_RETRY_S", old)
+        ok, _ = h.bus.ensure(2)
+        self.assertTrue(ok)
+        self.assertEqual(len(h.opened), 2)
+        self.assertEqual(h.bus.status()["device_actual"], 2)
+        self.assertTrue(h.opened[0].closed)
+        ok, _ = h.bus.ensure(2)                       # on it now: kept
+        self.assertEqual(len(h.opened), 2)
+
+    def test_a_removed_listener_hears_nothing_more(self):
+        h = Harness()
+        self.addCleanup(h.close)
+        heard = []
+        fn = heard.append
+        h.bus.add_listener(fn)
+        h.bus._dsp_one(1024, 1.0, chunk(0.1))
+        h.bus.remove_listener(fn)
+        h.bus.remove_listener(fn)                     # a no-op
+        h.bus._dsp_one(2048, 1.1, chunk(0.1))
+        self.assertEqual(len(heard), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,7 +26,11 @@ cannot open the endpoint at all.
   * a stream error, or the default speaker changing (re-checked every
     RESOLVE_EVERY_S), reopens it; each reopen bumps ``gap_seq`` so the
     canceller re-measures the delay; failures back off 0.5 -> 5 s and are
-    logged once per episode (no hot loop);
+    logged once per episode (no hot loop); the pyaudiowpatch fallback is
+    tried at most every FALLBACK_RETRY_S;
+  * ``age_s()`` is the reader's liveness: soundcard pads silence with zeros
+    by the clock, so a reader that stops delivering (a stalled read) shows
+    as a growing age, never as a stale "loud" last second;
   * ``index_at(t)`` maps a monotonic time to a ring index through the
     earliest-arrival time base over the last few seconds (the packet
     arrival jitter never moves it forward);
@@ -50,6 +54,10 @@ PACKET = 160                    # 10 ms at 16 kHz
 RESOLVE_EVERY_S = 5.0
 TIMEBASE_WINDOW_S = 10.0
 BACKOFF_MIN_S, BACKOFF_MAX_S = 0.5, 5.0
+# The pyaudiowpatch fallback bundles a SECOND PortAudio: while soundcard keeps
+# failing it is tried at most once a minute, not on every back-off step (each
+# try initialises and terminates that PortAudio - 2026-10-09 review).
+FALLBACK_RETRY_S = 60.0
 
 
 def _com_init_mta(import_soundcard: bool = True) -> None:
@@ -199,6 +207,7 @@ class LoopbackReference:
         self._thread_lock = threading.Lock()
         self.failures = 0
         self.opens = 0
+        self._fallback_at = None          # last pyaudiowpatch try (monotonic)
         self._episode_logged = False
         self.last_error = ""
         self._stop = False
@@ -341,8 +350,16 @@ class LoopbackReference:
             pass
 
     def _open(self):
+        """The first source that opens. A fallback (every source after the
+        first) is tried at most every FALLBACK_RETRY_S."""
         last = None
-        for factory in (self._sources or _default_sources()):
+        for i, factory in enumerate(self._sources or _default_sources()):
+            if i > 0:
+                now = time.monotonic()
+                if (self._fallback_at is not None
+                        and now - self._fallback_at < FALLBACK_RETRY_S):
+                    continue
+                self._fallback_at = now
             try:
                 return factory()
             except Exception as e:
