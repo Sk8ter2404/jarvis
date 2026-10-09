@@ -25,8 +25,16 @@ WHAT THIS MODULE DOES
     runs on a daemon (start_async), never on the boot path.
   * The consent gate still holds. The clone is used only while the server's
     voice prompt (its ref_sha256) is the reference.wav of the ACTIVE consented
-    profile (core.voice_clone.resolve_active_profile). A server that was
-    started with any other voice is never used.
+    profile (core.voice_clone.resolve_active_profile). A server that speaks
+    any other voice is never used. The profile's reference.wav is re-read at
+    most every PROFILE_TTL_S, and hashed again only when a cheap stat says it
+    changed (size, mtime or file id). When the two differ -- the owner
+    replaced reference.wav, the server was restarted with another one, the
+    profile was switched -- the consent check (usable_for) reads /health
+    again (rate-limited, _voice_probe) and uses the server again the moment
+    it speaks the active profile's voice: a reference swap takes effect
+    without a restart. Until then it stays refused, and nothing is rendered
+    or served in the old voice through the gate.
   * render(text) is one POST /tts bounded by a deadline (line_deadline_s).
     A line the listener is waiting for (a reply's first line) gets its
     LATENCY BUDGET: timeout_s, plus a per-character allowance for long
@@ -182,6 +190,17 @@ PER_CHAR_S = 0.03
 # The consent gate (profile meta + reference hash) is re-read at most this
 # often, so a profile switch or a revoked consent is seen within seconds.
 PROFILE_TTL_S = 5.0
+# When the consent check finds the server's voice is not the active profile's
+# (its reference.wav was replaced, the server restarted with another one, the
+# profile was switched), /health is read again -- at once when the profile's
+# hash is new to the check, else at most every VOICE_PROBE_S (a server that
+# answered) or VOICE_PROBE_IDLE_S (one that did not: each such probe can cost
+# its whole LIVENESS_TIMEOUT_S) -- and a server that now speaks the profile's
+# voice is used again without a restart (2026-10-09: the owner swapped
+# reference.wav and the server was restarted with it, yet JARVIS spoke Kokoro
+# until a full restart, because the client never looked at /health again).
+VOICE_PROBE_S = 5.0
+VOICE_PROBE_IDLE_S = 60.0
 
 # Loudness match: Kokoro's speech sits at an active RMS of ~0.10 (measured on
 # its renders); the clone's short lines came out ~10 dB quieter.
@@ -527,7 +546,10 @@ class CloneVoiceClient:
       starting  start() is running on its daemon
       ready     the server answers and speaks the active profile's voice
       down      it never came up, or is not usable (terminal for the session;
-                rearm() resets it)
+                rearm() resets it) -- except a server that speaks another
+                voice than the active consented profile's: the consent check
+                (usable_for) keeps looking (_voice_probe) and the client is
+                'ready' again once the two match
       cooldown  MAX_FAILURES latency-critical misses in a row: Kokoro speaks
                 until the cool-down ends, then the clone is 'ready' again,
                 on probation (checked on every status read); rearm() ends
@@ -566,7 +588,15 @@ class CloneVoiceClient:
         self._recheck = False
         self._proc = None
         self._profile_memo: dict = {}   # name -> (expires_at, sha or "")
-        self._sha_memo: dict = {}       # path -> ((size, mtime_ns), sha)
+        # path -> ((size, mtime_ns, file id), sha)
+        self._sha_memo: dict = {}
+        # 'down' because the server speaks another voice than the consented
+        # profile's (not because it never came up): usable_for keeps probing.
+        self._voice_down = False
+        # The consent check's /health probe: the profile hash it last looked
+        # for, and when it may look again for that same hash.
+        self._probe_want: Optional[str] = None
+        self._probe_next = float("-inf")
         self._logged: set = set()
         # The profile start() was asked for (the disk cache serves only
         # while the server speaks ITS consented voice).
@@ -653,10 +683,16 @@ class CloneVoiceClient:
 
     # ── the consent gate ─────────────────────────────────────────────────
     def _file_sha(self, path: str) -> str:
-        """SHA-256 of a file, memoised by (size, mtime). '' if unreadable."""
+        """SHA-256 of a file, memoised by a cheap stat: (size, mtime, file
+        id). A replaced reference.wav changes at least one of them -- a copy
+        of the same length keeps the size, and one whose times were kept
+        (Copy-Item / os.replace of a file with an old mtime) still gets a new
+        file id -- and is hashed again. '' if unreadable."""
         try:
             st = os.stat(path)
-            sig = (st.st_size, getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            sig = (st.st_size,
+                   getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
+                   getattr(st, "st_ino", 0))
             with self._mu:
                 memo = self._sha_memo.get(path)
             if memo is not None and memo[0] == sig:
@@ -686,15 +722,19 @@ class CloneVoiceClient:
         except Exception:
             return None
 
-    def profile_sha(self, profile_name: str) -> str:
+    def profile_sha(self, profile_name: str, fresh: bool = False) -> str:
         """The active profile's reference hash ('' = no usable profile),
-        re-checked at most every PROFILE_TTL_S."""
+        re-checked at most every PROFILE_TTL_S -- or now with ``fresh``
+        (a decision about a server that answered with another voice must not
+        rest on a memo from before the file was replaced). Re-checking is a
+        stat; the file is hashed again only when the stat changed."""
         name = str(profile_name or "")
         now = self._clock()
-        with self._mu:
-            memo = self._profile_memo.get(name)
-        if memo is not None and now < memo[0]:
-            return memo[1]
+        if not fresh:
+            with self._mu:
+                memo = self._profile_memo.get(name)
+            if memo is not None and now < memo[0]:
+                return memo[1]
         ref = self._profile_ref(name)
         sha = ref[1] if ref else ""
         with self._mu:
@@ -703,22 +743,132 @@ class CloneVoiceClient:
 
     def usable_for(self, profile_name: str) -> bool:
         """Ready AND speaking the voice of ``profile_name`` (consented). Never
-        raises; a mismatch is logged once per (profile, voice)."""
+        raises; a mismatch is logged once per (profile, voice).
+
+        The consent check: when the server's voice (as last read) is not the
+        profile's -- its reference.wav was replaced, the profile switched --
+        /health is read again (_voice_probe, rate-limited, bounded) and a
+        server that now speaks the profile's voice is used from this call
+        on, without a restart; also one that was 'down' for speaking another
+        voice. Anything else stays refused."""
         try:
             self._cooldown_tick()
             with self._mu:
-                if self._status != "ready":
-                    return False
+                st = self._status
+                voice_down = self._voice_down
                 server_sha = self._server_sha
-            want = self.profile_sha(profile_name)
-            if want and want == server_sha:
+            if st != "ready" and not (st == "down" and voice_down):
+                return False
+            name = str(profile_name or "")
+            want = self.profile_sha(name)
+            if st == "ready" and want and want == server_sha:
                 return True
-            self._log_once(
-                ("mismatch", str(profile_name or ""), want, server_sha),
-                f"  [clone-voice] the server's voice is not the "
-                f"'{profile_name}' profile's (or that profile is not "
-                f"consented); Kokoro speaks until they match")
+            if want and self._voice_probe(want, name):
+                return True
+            if st == "ready":
+                self._log_once(
+                    ("mismatch", name, want, server_sha),
+                    f"  [clone-voice] the server's voice is not the "
+                    f"'{profile_name}' profile's (or that profile is not "
+                    f"consented); Kokoro speaks until they match")
             return False
+        except Exception:
+            return False
+
+    def voice_mismatch(self, profile_name: str) -> bool:
+        """The server is up (or was stopped being used for its voice) but
+        does not speak ``profile_name``'s consented reference -- e.g. that
+        reference.wav was just replaced and the server not yet restarted
+        with it. For an honest status line; no request (the consent memo
+        only). Never raises."""
+        try:
+            self._cooldown_tick()
+            with self._mu:
+                st = self._status
+                voice_down = self._voice_down
+                server_sha = self._server_sha
+            if st == "down":
+                return voice_down
+            if st != "ready":
+                return False
+            want = self.profile_sha(profile_name)
+            return bool(want) and want != server_sha
+        except Exception:
+            return False
+
+    def _voice_probe(self, want: str, profile: str) -> bool:
+        """The consent check found the server's voice is not ``want`` (the
+        active consented profile's reference hash): read /health -- at once
+        when ``want`` is new to the probe (a replaced reference.wav), else at
+        most every VOICE_PROBE_S, or VOICE_PROBE_IDLE_S after a probe nothing
+        answered -- and use the server again (_use_server) when it now
+        answers ready in that voice. True when it did. A server that speaks
+        anything else changes nothing: it stays refused. Bounded by
+        LIVENESS_TIMEOUT_S; never raises."""
+        try:
+            now = self._clock()
+            with self._mu:
+                if want == self._probe_want and now < self._probe_next:
+                    return False
+                self._probe_want = want
+                self._probe_next = now + VOICE_PROBE_IDLE_S
+            code, h = self._health(LIVENESS_TIMEOUT_S)
+            if code is not None:
+                with self._mu:
+                    self._probe_next = now + VOICE_PROBE_S
+            if code != 200 or not h.get("ok"):
+                return False
+            if str(h.get("ref_sha256") or "") != want:
+                return False
+            return self._use_server(h, now, profile)
+        except Exception:
+            return False
+
+    def _use_server(self, h: dict, sent_at: float, profile: str = "") -> bool:
+        """Use the server a ready /health ``h`` (sent at ``sent_at``)
+        describes, whose voice prompt is the active consented profile's
+        (the caller checked): its hash, process and model facts from now on
+        (the render cache keys follow the hash), a fresh miss count, and the
+        takes of a voice no longer consented purged. From 'ready', or from
+        'down' for speaking another voice; any other state (a cool-down, a
+        rearm, a stop meanwhile) is left alone. ``profile`` (when given)
+        becomes the profile the disk tier and the writer check consent
+        against. True when it switched. ONE log line. Never raises."""
+        try:
+            sha = str(h.get("ref_sha256") or "")
+            with self._mu:
+                st = self._status
+                if not sha or not (st == "ready"
+                                   or (st == "down" and self._voice_down)):
+                    return False
+                same = sha == self._server_sha and st == "ready"
+                self._status = "ready"
+                self._reason = ""
+                self._voice_down = False
+                self._server_sha = sha
+                self._server_pid = h.get("pid")
+                self._server_info = _server_facts(h)
+                self._health_at = self._clock()
+                if profile:
+                    self._profile = str(profile)
+                self._fails = 0
+                self._probation = False
+                self._recheck = False
+                self._probe_want = None
+                self._probe_next = float("-inf")
+                # A reference changed: list the consented voices afresh for
+                # the purge below.
+                self._consented_memo = (float("-inf"), None)
+                who = self._profile
+            self._mark_verified(sent_at, h)
+            if not same:
+                self._log(f"  [clone-voice] the voice server now speaks the "
+                          f"'{who}' profile's reference (server pid "
+                          f"{h.get('pid')}); replies use the clone voice "
+                          f"again and the render cache follows it")
+            self._note_decode(h.get("t3_decode"), "its /health")
+            self.purge_unconsented()
+            return True
         except Exception:
             return False
 
@@ -939,13 +1089,17 @@ class CloneVoiceClient:
             # Never speak in a voice the consent gate has not passed. A server
             # this process started is useless then: ask it to stop. One that
             # was already running belongs to someone else: leave it alone.
+            # One left running is watched by the consent check: when it (or
+            # the profile's reference.wav) changes so the two match, it is
+            # used (usable_for -> _voice_probe).
             stopped = "; asked it to stop" if spawned and self.stop_server() else ""
             if not sha:
                 return self._down("the server does not report its voice "
                                   "prompt (ref_sha256), so it cannot be "
-                                  f"checked{stopped}")
+                                  f"checked{stopped}", voice=not stopped)
             return self._down("the server was started with a different voice "
-                              f"prompt than the active profile's{stopped}")
+                              f"prompt than the active profile's{stopped}",
+                              voice=not stopped)
         with self._mu:
             self._status = "ready"
             self._reason = ""
@@ -971,12 +1125,22 @@ class CloneVoiceClient:
                 pass
         return "ready"
 
-    def _down(self, reason: str) -> str:
+    def _down(self, reason: str, voice: bool = False) -> str:
+        """Stop using the server. ``voice``: because it speaks another voice
+        than the active consented profile's -- the consent check keeps
+        looking and uses it again once the two match (a replaced
+        reference.wav, a server restarted with the right one); otherwise
+        for the session (rearm() resets it)."""
         with self._mu:
             self._status = "down"
             self._reason = reason
-        self._log(f"  [clone-voice] not used this session: {reason}. Kokoro "
-                  f"keeps speaking.")
+            self._voice_down = bool(voice)
+        if voice:
+            self._log(f"  [clone-voice] not used: {reason}. Kokoro speaks "
+                      f"until the server speaks the active profile's voice.")
+        else:
+            self._log(f"  [clone-voice] not used this session: {reason}. "
+                      f"Kokoro keeps speaking.")
         return "down"
 
     def rearm(self) -> bool:
@@ -995,18 +1159,24 @@ class CloneVoiceClient:
             self._cool_ended_at = float("-inf")
             self._probation = False
             self._recheck = False      # start() checks the voice anyway
+            self._voice_down = False
+            self._probe_want = None
+            self._probe_next = float("-inf")
             self._logged.clear()
             return True
 
     def _recheck_voice(self, budget_s: float):
         """After a cool-down, before the next render: does the server at the
-        address still speak the voice start() checked? None when it does (and
-        the re-check is done), "voice" when it now speaks another voice or
-        hides it (the client is then down for the session: the consent gate
-        never passes a voice it has not checked), else the failure reason of
-        an unreachable / not-ready server (counted like a failed render; the
-        re-check stays pending). Bounded by ``budget_s`` (and the connect cap);
-        never raises."""
+        address still speak a voice the consent gate passed? None when it
+        does (and the re-check is done): the voice start() checked (a
+        restart in it is followed), or the active consented profile's NEW
+        reference (followed -- the owner replaced reference.wav and the
+        server was restarted with it during the rest). "voice" when it
+        speaks anything else or hides it: never used then (down, watched by
+        the consent check -- _adopt). Else the failure reason of an
+        unreachable / not-ready server (counted like a failed render; the
+        re-check stays pending). Bounded by ``budget_s`` (and the connect
+        cap); never raises."""
         sent = self._clock()
         try:
             code, _h, data = self._request("GET", "/health", None,
@@ -1023,22 +1193,11 @@ class CloneVoiceClient:
             obj = {}
         if code != 200 or not obj.get("ok"):
             return f"http {code} on the voice re-check"
-        sha = str(obj.get("ref_sha256") or "")
+        if not self._adopt(obj, sent):
+            return "voice"
         with self._mu:
-            same = bool(sha) and sha == self._server_sha
-            if same:
-                self._recheck = False
-                self._server_pid = obj.get("pid")
-                self._server_info = _server_facts(obj)
-                self._health_at = self._clock()
-        if same:
-            self._mark_verified(sent, obj)
-            self._note_decode(obj.get("t3_decode"), "its /health")
-            return None
-        self._down("after a cool-down the server answering at its address "
-                   "speaks a different voice prompt (or does not say which), "
-                   "so it is no longer used")
-        return "voice"
+            self._recheck = False
+        return None
 
     # ── render ───────────────────────────────────────────────────────────
     def render(self, text: str, timeout_s: float, *, needed_by=None,
@@ -1439,10 +1598,13 @@ class CloneVoiceClient:
         """A ready /health from the server at the client's address that may
         describe a different server than the one recorded: the same voice
         prompt (a restart, new model facts) -- followed; the active consented
-        profile's NEW reference -- followed, the cache keys follow the hash;
-        anything else -- the client is down (the consent gate never passes a
-        voice it has not checked). True while the client still uses the
-        server. Never raises."""
+        profile's NEW reference (read afresh: a stat, and a hash only if the
+        file changed) -- followed, the cache keys follow the hash
+        (_use_server); anything else -- the client stops using it (the
+        consent gate never passes a voice it has not checked), 'down' for
+        speaking another voice: the consent check uses it again once it
+        speaks the active profile's (usable_for). True while the client
+        still uses the server. Never raises."""
         try:
             sha = str(h.get("ref_sha256") or "")
             with self._mu:
@@ -1450,18 +1612,14 @@ class CloneVoiceClient:
                 profile = self._profile
                 old_pid = self._server_pid
             if not same:
-                if sha and sha == self.profile_sha(profile):
-                    with self._mu:
-                        self._server_sha = sha
-                    self._log("  [clone-voice] the voice server now speaks "
-                              "the active profile's new reference; the "
-                              "render cache follows it")
-                else:
-                    self._down("the server answering at its address now "
-                               "speaks a different voice prompt (or does "
-                               "not say which), so it is no longer used")
-                    return False
-            elif h.get("pid") != old_pid:
+                if sha and sha == self.profile_sha(profile, fresh=True):
+                    return self._use_server(h, sent_at)
+                self._down("the server answering at its address now "
+                           "speaks a different voice prompt (or does not "
+                           "say which) than the active profile's",
+                           voice=True)
+                return False
+            if h.get("pid") != old_pid:
                 self._log(f"  [clone-voice] the voice server restarted "
                           f"(pid {old_pid} -> {h.get('pid')}) with the same "
                           f"voice; following it")
