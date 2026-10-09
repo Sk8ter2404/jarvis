@@ -14760,6 +14760,20 @@ def _refresh_devices(force: bool = False):
                         "Pa_CloseStream; sd._terminate() there is "
                         "0xc0000374). Logged once; the next line about it "
                         "will be when the deferral ends.")
+                elif _tts_keeper_active[0]:
+                    # The playback keeper's silent stream (2026-10-05) is the
+                    # ONLY owner in the way: defer this pass like any other
+                    # owner (sd._terminate() under its live stream is the same
+                    # 0xc0000374), and ask it to step aside below, so the next
+                    # pass can run the reinit. It stays closed until the
+                    # reinit ran or YIELD_S passed.
+                    _defer_reason = "keeper"
+                    _defer_message = (
+                        "  [audio] device drift detected while the playback "
+                        "keeper holds the speaker — it is closing so the "
+                        "PortAudio reinit can run on the next pass. Logged "
+                        "once; the next line about it will be when the "
+                        "deferral ends.")
                 else:
                     _pa_reinit_active[0] = True
                     do_reinit = True
@@ -14767,6 +14781,14 @@ def _refresh_devices(force: bool = False):
             # _mic_lock would put I/O inside the teardown-gate's critical
             # section (the lock discipline above forbids slow work there).
             _log_reinit_deferral(_defer_reason, _defer_message)
+            if _defer_reason == "keeper":
+                _keeper_request_yield()
+                # ...and let its close RETURN before this pass does: the
+                # usual caller here is record_speech, which opens its mic
+                # InputStream straight after, and PortAudio's open-stream
+                # list must never see the keeper's Pa_CloseStream and that
+                # Pa_OpenStream at once (review 2026-10-09). ~10 ms; bounded.
+                _keeper_wait_yielded()
             _reinit_ok = False
             if do_reinit:
                 try:
@@ -14799,6 +14821,9 @@ def _refresh_devices(force: bool = False):
                     # followed yet, so the baseline stays where JARVIS is.
                     if _have_eps:
                         _device_cache["last_default_endpoints"] = _follow_eps
+                    # A keeper that stepped aside for this reinit may hold the
+                    # speaker again (on the freshly enumerated index).
+                    _keeper_reinit_done()
                 except Exception as e:
                     print(f"  [audio] PortAudio re-init failed: {e}")
                 finally:
@@ -16288,6 +16313,27 @@ def _tt_note_elapsed(name: str, t0) -> None:
         pass
 
 
+def _tt_note_play_open(t0) -> None:
+    """One playback opened (play_with_lipsync, both branches; the ONE place
+    an open is noted). play_open_ms keeps the answer's FIRST open (the first
+    value wins); every open of the reply adds to opens / opens_ms, so the
+    later sentences' opens - where PLAYBACK_KEEPER saves the most - are on
+    the turn line too: mean later open = (opens_ms - play_open_ms) /
+    (opens - 1). t0 None (probe off) records nothing. Never raises."""
+    try:
+        if t0 is None:
+            return
+        t1 = _tt("now")
+        if t1 is None:
+            return
+        ms = int(round((t1 - t0) * 1000.0))
+        _tt("note_stat", "play_open_ms", ms)
+        _tt("note_stat", "opens", 1)
+        _tt("note_stat", "opens_ms", ms)
+    except Exception:
+        pass
+
+
 def _tt_note_clip_ms(name: str, audio, sr) -> None:
     """note_stat(name, length of `audio` at `sr` in ms). Never raises."""
     try:
@@ -16810,7 +16856,7 @@ _TURN_FLAG_KEYS = (
     "PROCESSING_FILLER_SOFT_CUT", "LOCAL_PROMPT_PROFILE",
     "LOCAL_TURN_CTX_IN_HISTORY", "SENTENCE_TTS_MIN_CHARS",
     "SENTENCE_TTS_LOOKAHEAD_MERGE", "LOCAL_STREAMING_TTS",
-    "TTS_OUTPUT_LATENCY",
+    "TTS_OUTPUT_LATENCY", "PLAYBACK_KEEPER", "PLAYBACK_PRIMED_STREAM",
 )
 
 
@@ -17937,6 +17983,12 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
 # idle does get_mic_buffer fall back to opening its own stream.
 _record_speech_active = [False]          # True while record_speech holds the mic
 _tts_playback_active  = [False]          # True while play_with_lipsync owns the speakers + barge-in stream
+# True while the playback keeper (core/playback_keeper.py, PLAYBACK_KEEPER)
+# holds its silent stream on the speaker: claimed before its open, released
+# after its close, so the PortAudio teardown gate sees it like any other
+# stream owner. Deliberately NOT _tts_playback_active: the keeper plays only
+# zeros, and the skills that read that flag ask "is JARVIS speaking?".
+_tts_keeper_active    = [False]
 # Self-echo gate (core/self_echo.py, 2026-09-29): the timing of the LAST
 # utterance record_speech returned, on the self-echo clock —
 # (stream_open, vad_trip, capture_end, clip_start) — or None (no mic
@@ -18114,6 +18166,8 @@ def _pa_streams_live() -> bool:
     native Pa_CloseStream is still in flight (_pa_close_pending, H-6). Caller
     MUST hold _mic_lock. skills/self_diagnostic._mic_owned mirrors this list
     (minus the probe's own _diag_capture_active cell) — update BOTH together.
+    The playback keeper's silent stream (_tts_keeper_active, 2026-10-05) is
+    an owner like any other: the reinit must never tear it down live.
 
     VERIFIED 2026-08-20: its ONE caller is _refresh_devices' ADVISORY
     pre-check (`_owners_busy`), which decides whether it is worth pausing the
@@ -18125,7 +18179,7 @@ def _pa_streams_live() -> bool:
     understand that adding a cell here alone changes nothing binding: it must
     also go into _refresh_devices' deny chain below."""
     return (_pa_mic_capture_live() or bool(_tts_playback_active[0])
-            or bool(_pa_close_pending[0]))
+            or bool(_pa_close_pending[0]) or bool(_tts_keeper_active[0]))
 
 
 def _pa_claim_owner(cell, *, refcount: bool = False, timeout: float = 1.0,
@@ -18258,6 +18312,324 @@ def _pa_detach_play_stream(stream) -> bool:
         logging.exception("[audio] could not detach the play stream from "
                           "sounddevice's _last_callback")
         return False
+
+
+# ── Playback keeper (PLAYBACK_KEEPER, 2026-10-05) ─────────────────────────
+# A silent stream on the speaker for the length of one reply, so the speaker
+# is already running when each line opens (core/playback_keeper.py has the
+# measurements and the contract). This block is the monolith glue: the owner
+# cell (_tts_keeper_active, claimed/released through the same _pa_gate as
+# every stream owner), the stream factory and the holder calls. Every helper
+# here never raises and never blocks on PortAudio.
+from core import playback_keeper as _pk_mod  # noqa: E402
+
+
+def _keeper_zeros(outdata, frames, time_info, status) -> None:
+    """The keeper's PortAudio callback: silence, nothing else (no locks, no
+    I/O, no logging — it runs on PortAudio's thread)."""
+    outdata.fill(0)
+
+
+def _keeper_test_run() -> bool:
+    """True under a test run (the monolith harness's JARVIS_TEST_MODE, or the
+    live-data guard tests/__init__.py installs for every run — the same
+    sentinel pair as _camera_gate_doo_state_path). Never raises."""
+    try:
+        return (os.environ.get("JARVIS_TEST_MODE", "").strip() == "1"
+                or "tests.live_data_guard" in sys.modules)
+    except Exception:
+        return True
+
+
+def _keeper_open_stream(device):
+    """Open and start the keeper's zero stream (called ONLY on the keeper's
+    own thread). A plain sd.OutputStream, never published into sounddevice's
+    _last_callback, so no sd.play()/sd.stop() can reach it. Same rate and
+    shape as the speech clips.
+
+    Refuses under a test run: the keeper's thread opens asynchronously, so
+    it could outlive a test's patch of ``sd`` and reach the owner's real
+    speaker (a unit test must never touch a real device)."""
+    if _keeper_test_run():
+        raise RuntimeError("test run: the playback keeper never opens a "
+                           "real output device")
+    st = sd.OutputStream(samplerate=24000, channels=1, dtype="float32",
+                         device=device, callback=_keeper_zeros)
+    try:
+        st.start()
+    except BaseException:
+        try:
+            st.close(ignore_errors=True)
+        except Exception:
+            pass
+        raise
+    return st
+
+
+def _keeper_claim() -> bool:
+    return _pa_claim_owner(_tts_keeper_active)
+
+
+def _keeper_release() -> None:
+    _pa_release_owner(_tts_keeper_active)
+
+
+# The three hooks are looked up at CALL time (lambdas), so a test harness that
+# replaces _keeper_open_stream reaches the keeper's thread too.
+_playback_keeper = _pk_mod.PlaybackKeeper(
+    open_stream=lambda device: _keeper_open_stream(device),
+    claim=lambda: _keeper_claim(),
+    release=lambda: _keeper_release(), log=print)
+
+
+def _keeper_mode_on() -> bool:
+    try:
+        return str(globals().get("PLAYBACK_KEEPER", "off")
+                   or "off").strip().lower() == "on"
+    except Exception:
+        return False
+
+
+def _keeper_audible() -> bool:
+    """Whether a line spoken now would reach the speaker: not staging, not
+    the tray mute, not MUTE_TTS. The keeper holds nothing otherwise."""
+    try:
+        if _is_staging() or _tts_muted[0]:
+            return False
+        return _self_echo_audible()
+    except Exception:
+        return False
+
+
+def _keeper_cached_out():
+    """The speaker index the last COMPLETED _refresh_devices pass picked
+    (_device_cache["out"]), or _pk_mod.UNSET while a pass is running. A pass
+    that re-enumerates PortAudio stores its freshly picked index only at its
+    end, so in between the cache holds an index from BEFORE the reinit (MME
+    renumbers its devices) — the keeper must never be handed that. A
+    non-blocking try of the pass's own lock: never waits, never raises.
+    Residual window (review 2026-10-09, accepted): a whole pass that starts
+    AFTER this read and re-enumerates before the caller's begin() takes the
+    keeper's lock (a few bytecodes) would leave the keeper holding zeros on
+    a stale index - silent, and the next play's begin(out_dev) moves it."""
+    try:
+        if not _device_refresh_lock.acquire(blocking=False):
+            return _pk_mod.UNSET
+        try:
+            return _device_cache.get("out")
+        finally:
+            _device_refresh_lock.release()
+    except Exception:
+        return _pk_mod.UNSET
+
+
+def _keeper_begin(device=_pk_mod.UNSET) -> int:
+    """Hold the speaker for a reply / line / playback; returns a token for
+    _keeper_end (0 = nothing held). ``device`` defaults to the speaker the
+    last completed refresh picked (_keeper_cached_out) — a cache read, never
+    a device refresh; UNSET (keep the device the keeper has) while a refresh
+    pass runs. Never raises, never blocks on PortAudio."""
+    try:
+        on = _keeper_mode_on()
+        _playback_keeper.set_enabled(on)
+        if not on or not _keeper_audible():
+            return 0
+        if device is _pk_mod.UNSET:
+            device = _keeper_cached_out()
+        return _playback_keeper.begin(device)
+    except Exception:
+        return 0
+
+
+def _keeper_end(token: int) -> None:
+    try:
+        _playback_keeper.end(token)
+    except Exception:
+        pass
+
+
+def _keeper_request_yield() -> None:
+    try:
+        _playback_keeper.request_yield()
+    except Exception:
+        pass
+
+
+def _keeper_wait_yielded() -> None:
+    """After _keeper_request_yield(): wait (bounded, YIELD_WAIT_S; a keeper
+    call in flight until it returns, at most OPEN_WEDGED_S) until the
+    keeper's close has returned, so _refresh_devices' caller never opens a
+    stream while the keeper is inside Pa_CloseStream. Called OUTSIDE _pa_gate
+    (the keeper's release takes _mic_lock after its close). Logs when the
+    close did not return in time. Never raises."""
+    try:
+        if not _playback_keeper.wait_settled(_pk_mod.YIELD_WAIT_S):
+            print("  [playback-keeper] stepping aside: its close had not "
+                  f"returned after {_pk_mod.YIELD_WAIT_S:.1f}s")
+    except Exception:
+        pass
+
+
+def _keeper_reinit_done() -> None:
+    try:
+        _playback_keeper.reinit_done()
+    except Exception:
+        pass
+
+
+def _keeper_before_open() -> int:
+    """Right before a playback opens its stream: wait while the keeper has
+    an open or close in flight (until it returns, at most OPEN_WEDGED_S) or
+    DUE (a device change, a cold start: at most READY_WAIT_S), then mark this
+    playback's open in flight so the keeper starts no native call until
+    _keeper_after_open — PortAudio must never see the two at once, in either
+    order. ``settled`` is not needed here: a call still only due is held off
+    by the mark, and one wedged in flight quarantines the keeper. Then note
+    on the turn line whether the speaker was held (keeper=1/0). Returns the
+    token for _keeper_after_open (0 = nothing marked). Only while the keeper
+    is on. Never raises."""
+    try:
+        if not _playback_keeper.enabled:
+            return 0
+        tok, _settled = _playback_keeper.enter_play_open(_pk_mod.READY_WAIT_S)
+        live = _playback_keeper.is_live()
+        if live:
+            _playback_keeper.note_play()
+        _tt_note_stat("keeper", 1 if live else 0)
+        return tok
+    except Exception:
+        return 0
+
+
+def _keeper_after_open(token: int) -> None:
+    """The playback's open returned or raised (see _keeper_before_open).
+    Never raises."""
+    try:
+        _playback_keeper.exit_play_open(token)
+    except Exception:
+        pass
+
+
+def _keeper_atexit(budget_s: float = 1.0) -> None:
+    """Interpreter exit (atexit, registered in main()). sounddevice's own
+    exit handler — registered when it was imported, so it runs AFTER this
+    one (atexit is last-in, first-out) — calls Pa_Terminate, which closes
+    every stream still open. The keeper's thread must not be inside its own
+    abort/close of the same stream then (a double close on the way out, the
+    0xc0000374 family), so latch the keeper off and wait, bounded, for its
+    close to return. The Ctrl-C / restart teardown does the same through
+    core/actions._release_audio_streams. Never raises."""
+    try:
+        if not _playback_keeper.shutdown(wait_s=budget_s):
+            print("  [playback-keeper] exit: the keeper's close did not "
+                  f"return within {budget_s:.1f}s")
+    except Exception:
+        pass
+
+
+def _playback_keeper_shutdown() -> None:
+    """Teardown (core/actions._release_audio_streams): latch the keeper off
+    and let its thread close the stream; the teardown's bounded wait on the
+    owner cells sees the close return. Never raises."""
+    try:
+        _playback_keeper.shutdown()
+    except Exception:
+        pass
+
+
+def _reap_poll_s() -> float:
+    """The tts-reaper's poll interval: 10 ms with the keeper on (the gap
+    after each sentence and the barge-in cut), else the old 50 ms."""
+    return _pk_mod.REAP_POLL_S if _keeper_mode_on() else 0.05
+
+
+# ── Primed play stream (PLAYBACK_PRIMED_STREAM, 2026-10-05, OFF by default) ─
+# Measured silently on the owner's speaker (MME, 24 kHz, 2026-10-05 00:38):
+#   * sd.play() of 1.0 s went inactive 1,056-1,062 ms after start, while a
+#     stream that ends with CallbackStop (paComplete) took 1,231-1,233 ms and
+#     drained for 201 ms after its last callback. sd.play() ends with
+#     CallbackAbort (sounddevice's _CallbackContext.callback_exit) one
+#     callback after its data runs out, so PortAudio DISCARDS the ~180 ms
+#     still queued. Rendered lines already end in ~80-250 ms of near-
+#     silence (below -40 dB: Kokoro 79-86 ms, the clone mostly ~100 ms;
+#     review 2026-10-09), so what is lost is mostly that trailing quiet or
+#     the 0.15 s SENTENCE_GAP_S pad, plus ~50-70 ms of the last syllable's
+#     decay;
+#   * an MME stream starts with ~208 ms of queued buffers, filled with
+#     silence (sd.play() hard-codes prime_output_buffers_using_stream_
+#     callback=False), so the first sample is heard ~0.18-0.21 s after the
+#     open (out_lat_ms=182). With priming the callback filled all 8 buffers
+#     (4,992 frames) inside start(), and a 1.0 s clip with CallbackStop ran
+#     1,032 ms start to inactive.
+# With the flag on, each line is JARVIS's own OutputStream: primed with the
+# line (no leading silence) and ended with CallbackStop (played out, not
+# discarded). Everything around it is unchanged: the open/start stay on the
+# caller's thread like sd.play()'s, the stream goes to the same single-
+# toucher tts-reaper (abort on barge-in, stop + close), and it is never in
+# sounddevice's _last_callback slot, so no sd.play()/sd.stop() can reach it.
+# It changes what the owner HEARS (each line ~0.2 s sooner; the full tail
+# and the sentence pause audible), so it ships off until he has heard it.
+
+
+def _primed_stream_on() -> bool:
+    try:
+        return bool(globals().get("PLAYBACK_PRIMED_STREAM", False))
+    except Exception:
+        return False
+
+
+def _primed_play_callback(data):
+    """The PortAudio callback for one line: copies ``data`` (frames x
+    channels) out in order, zero-fills past its end, and ends the stream with
+    CallbackStop (play out what is queued) once the data has run out — never
+    while PortAudio is priming (paPrimingOutput inside start()), only on a
+    real callback after it. No locks, no I/O, no logging."""
+    n = int(len(data))
+    pos = [0]
+
+    def _cb(outdata, frames, time_info, status):
+        i = pos[0]
+        k = n - i
+        if k > frames:
+            k = frames
+        if k > 0:
+            outdata[:k] = data[i:i + k]
+            pos[0] = i + k
+        else:
+            k = 0
+        if k < frames:
+            outdata[k:] = 0
+        if pos[0] >= n and not getattr(status, "priming_output", False):
+            raise sd.CallbackStop
+
+    return _cb
+
+
+def _open_primed_stream(audio, sr, device):
+    """Open and start one line's own stream (PLAYBACK_PRIMED_STREAM) on the
+    caller's thread, exactly where sd.play() would; return it for the
+    tts-reaper. Same dtype rules as sd.play (float64 is played as float32).
+    On a failed start the stream is closed here and the error re-raised (the
+    caller's -9999 fallback handles PortAudioError)."""
+    a = np.asarray(audio)
+    if a.dtype not in (np.float32, np.int16, np.int32):
+        a = a.astype(np.float32)
+    if a.ndim == 1:
+        a = a.reshape(-1, 1)
+    a = np.ascontiguousarray(a)
+    st = sd.OutputStream(samplerate=sr, channels=int(a.shape[1]),
+                         dtype=a.dtype.name, device=device,
+                         callback=_primed_play_callback(a),
+                         prime_output_buffers_using_stream_callback=True)
+    try:
+        st.start()
+    except BaseException:
+        try:
+            st.close(ignore_errors=True)
+        except Exception:
+            pass
+        raise
+    return st
 
 
 _record_speech_taps: "list[queue.Queue]" = []
@@ -26386,7 +26758,8 @@ def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None
     main voice loop → the 100-181 s heartbeat stalls the watchdog kept
     reaping. Do not reintroduce sd.wait()/sd.stop() here.
 
-    Polls every 50 ms:
+    Polls every 50 ms (10 ms with PLAYBACK_KEEPER on, _reap_poll_s — the
+    gap between a sentence's natural end and its close, and the cut):
       * _tts_interrupt set → stream.abort() (Pa_AbortStream — no buffer
         drain, snappier than stop()); abort latency ≤ one slice, well
         inside the 300 ms barge-in budget.
@@ -26410,6 +26783,7 @@ def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None
     try:
         deadline = time.monotonic() + max(audio_secs + 2.0, 5.0)
         cut = False
+        poll_s = _reap_poll_s()
         while True:
             try:
                 if not stream.active:   # False once closed/aborted/finished
@@ -26435,7 +26809,7 @@ def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None
                 except Exception:
                     pass
                 break
-            time.sleep(0.05)
+            time.sleep(poll_s)
         try:
             stream.stop(ignore_errors=True)
         except Exception:
@@ -26529,6 +26903,9 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
     _prof("play_enter")
     _tts_interrupt.clear()
     out_dev = get_output_device()
+    # PLAYBACK_PRIMED_STREAM: the stream _play_audio_safe opened itself, or
+    # None for an sd.play() stream (read back with sd.get_stream()).
+    _own_stream: list = [None]
 
     def _play_audio_safe():
         """sd.play(audio, sr, device=out_dev) with a one-shot fallback to the
@@ -26540,19 +26917,53 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
         cached index and re-open on device=None (the now-current default) so a
         mid-playback endpoint change finishes the speech on the new endpoint
         instead of swallowing it. If the fallback also fails, re-raise so the
-        outer handler logs it loudly rather than failing silent."""
-        _prof("sdplay_call")
+        outer handler logs it loudly rather than failing silent.
+
+        PLAYBACK_KEEPER: waits (bounded) while a keeper open or close is in
+        flight or due, marks this open in flight for the keeper (so it makes
+        no native call until the open below returned) and notes keeper=1/0 on
+        the turn line first; play_open_ms includes that wait, because it is
+        part of the way to the open.
+
+        PLAYBACK_PRIMED_STREAM: the stream is JARVIS's own (_open_primed_
+        stream) instead of sd.play's, recorded in _own_stream for the reaper
+        hand-off below; same device, same fallback.
+
+        Returns True when a stream was opened, False when an interrupt that
+        arrived before the open (with the keeper or the primed stream on: a
+        barge-in during the keeper wait) means the line was already cut - no
+        stream is opened then, and the caller must not look for one."""
+        _kp_open = _keeper_before_open()
         try:
-            sd.play(audio, sr, device=out_dev)
-            _prof("sdplay_return")
-        except sd.PortAudioError as e:
-            # -9999 / endpoint vanished mid-open: drop to the live system default.
-            print(f"  [speak] playback open failed on device {out_dev} ({e}); "
-                  f"retrying on system default")
-            _usb_storm_note_audio_drop("output")
-            _device_cache["out"] = None
-            _device_cache["checked_at"] = 0.0
-            sd.play(audio, sr, device=None)
+            if ((_keeper_mode_on() or _primed_stream_on())
+                    and _tts_interrupt.is_set()):
+                # A primed stream would have the line's first ~0.2 s queued
+                # and playing before the reaper's first poll could abort it.
+                print("  [barge-in] cut before the line opened - not "
+                      "opening it")
+                return False
+            _prof("sdplay_call")
+            try:
+                if _primed_stream_on():
+                    _own_stream[0] = _open_primed_stream(audio, sr, out_dev)
+                else:
+                    sd.play(audio, sr, device=out_dev)
+                _prof("sdplay_return")
+            except sd.PortAudioError as e:
+                # -9999 / endpoint vanished mid-open: drop to the live
+                # system default.
+                print(f"  [speak] playback open failed on device {out_dev} "
+                      f"({e}); retrying on system default")
+                _usb_storm_note_audio_drop("output")
+                _device_cache["out"] = None
+                _device_cache["checked_at"] = 0.0
+                if _primed_stream_on():
+                    _own_stream[0] = _open_primed_stream(audio, sr, None)
+                else:
+                    sd.play(audio, sr, device=None)
+            return True
+        finally:
+            _keeper_after_open(_kp_open)
 
     # Start barge-in listener if conditions met
     barge_stream = None
@@ -26628,6 +27039,12 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
     except Exception:
         _muted = False
     audio_secs = (len(audio) / float(sr)) if sr else 0.0
+    # PLAYBACK_KEEPER: hold the speaker on THIS playback's device for the
+    # length of the play (plus the keeper's linger), and follow a device
+    # change. Opened on the keeper's own thread; nothing here waits for it.
+    # A muted play touches no device, so it holds nothing. Released in the
+    # finally below.
+    _kp_tok = 0 if _muted else _keeper_begin(out_dev)
 
     try:
         if _muted:
@@ -26648,10 +27065,16 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
             # crash vector, and unbounded native calls on this thread are
             # what stalled the main loop 100-181 s until the watchdog reaped
             # the process).
-            _play_audio_safe()
-            _tt_note_elapsed("play_open_ms", _tt_open0)
+            _opened = _play_audio_safe()
+            if _opened:
+                _tt_note_play_open(_tt_open0)
             try:
-                _stream = sd.get_stream()
+                # Not opened (cut before the open): no stream of ours - and
+                # sd.get_stream() could hand the reaper a stream another
+                # reaper already owns.
+                _stream = (None if not _opened
+                           else _own_stream[0] if _own_stream[0] is not None
+                           else sd.get_stream())
             except Exception:
                 logging.exception(
                     "[audio] sd.get_stream() failed — skipping playback reaper")
@@ -26715,15 +27138,18 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
 
             t = threading.Thread(target=_sync, daemon=True)
             t.start()
-            _play_audio_safe()
-            _tt_note_elapsed("play_open_ms", _tt_open0)
+            _opened = _play_audio_safe()
+            if _opened:
+                _tt_note_play_open(_tt_open0)
             # Same single-toucher tts-reaper as the no-robot branch — barge-in
             # works with the robot connected too. Shared _reap_playback body,
             # deliberately NOT a divergent copy (the old _safe_wait_robot twin
             # was exactly the stale-duplicate shape this codebase keeps paying
             # for).
             try:
-                _stream = sd.get_stream()
+                _stream = (None if not _opened
+                           else _own_stream[0] if _own_stream[0] is not None
+                           else sd.get_stream())
             except Exception:
                 logging.exception(
                     "[audio] sd.get_stream() failed — skipping playback reaper (robot)")
@@ -26749,6 +27175,7 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
                           "abandoning (daemon dies with process)")
             t.join(timeout=0.5)
     finally:
+        _keeper_end(_kp_tok)
         amp_stop.set()
         try:
             amp_thread.join(timeout=0.2)
@@ -40417,6 +40844,10 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     # Filler handoff pre-render (speed plan R3; PROCESSING_FILLER_PRERENDER,
     # off by default): render the answer's first audio NOW, while the filler
     # clip still holds the lock. Never takes _SPEAK_LOCK; None = today's path.
+    # PLAYBACK_KEEPER: start holding the speaker NOW, so its silent stream
+    # opens (on the keeper's thread) while this line renders; released in
+    # the finally below, after the last sentence. Never blocks, never raises.
+    _kp_tok = _keeper_begin()
     _pre = (_speak_prerender(spoken_text, intent, wry_flag, chosen_mood)
             if globals().get("PROCESSING_FILLER_PRERENDER", False) else None)
     with _SPEAK_LOCK:
@@ -40526,6 +40957,8 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # land between release and mark and say 'still working' right
             # after a long answer. Never raises.
             _filler_note_speech()
+            # The keeper lingers LINGER_S from here (never raises).
+            _keeper_end(_kp_tok)
     # Report whether the line was actually voiced. Most callers ignore this;
     # the streaming flush ledger uses it so a TTS-failed sentence is NOT
     # recorded as spoken (which would strip it from the tail). 2026-07-14 (#18).
@@ -45636,6 +46069,11 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
     # every action that runs successfully during this turn (first reply AND
     # follow-up rounds). Closed in the finally so it never outlives the turn.
     _tg_prev = _begin_turn_grounding(text)
+    # PLAYBACK_KEEPER: the answer is on its way — hold the speaker from now
+    # (the brain call and the render give the keeper's open its head start)
+    # until LINGER_S after the turn; taken right before the try, so nothing
+    # in between can leak it. Never blocks, never raises.
+    _kp_tok = _keeper_begin()
     try:
         _reply = _run_llm_dispatch_body(text)
         _tt_outcome = "ok"
@@ -45644,6 +46082,7 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
         _end_turn_grounding(_tg_prev)
         if voice:
             _filler_end_turn(_pf_turn)
+        _keeper_end(_kp_tok)
         # [turn-timing]: the turn's one line, partial when the body raised.
         # A no-op when no turn is active or on another thread's dispatch.
         _tt("emit", _tt_outcome)
@@ -46376,6 +46815,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # happens in the Ctrl-C shutdown path and via atexit as a safety net.
     _activate_high_performance_plan()
     atexit.register(_restore_prior_power_plan)
+    # PLAYBACK_KEEPER: switch the keeper off and let its close return BEFORE
+    # sounddevice's own exit handler terminates PortAudio (registered at its
+    # import, so it runs after this one - atexit is last-in, first-out).
+    atexit.register(_keeper_atexit)
 
     # Three startup self-heal checks (API key + ping, cublas64_12.dll,
     # per-camera open smoke test). Replaces the bare ANTHROPIC_API_KEY

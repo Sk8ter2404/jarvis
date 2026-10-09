@@ -1106,6 +1106,33 @@ ANSWER_FIRST_ENABLED = True
 TURN_TAIL_PROBE = True
 TURN_PLAY_OPEN_PROBE = True
 
+# ─── Playback keeper (2026-10-05) ─────────────────────────────────────────
+# Opening the speaker for a clip took ~350 ms on most of the owner's turns
+# (play_open_ms p50 ~377) and under 50 ms whenever other audio was playing on
+# the same speaker. Silent check on his speaker, 2026-10-05: 10/10 sd.play()
+# opens 320-346 ms with nothing else open, 10/10 at 3.6-9.7 ms with a
+# zero-filled stream held open on it. PLAYBACK_KEEPER 'on' plays SILENCE on
+# the speaker JARVIS uses for the length of one reply: a zero-filled stream
+# opened when a turn is answered or a line is about to be spoken, closed
+# LINGER_S (2 s) after the last line; so the first line and every sentence
+# after it open fast. Never permanent (it yields to the hotplug
+# re-enumeration, and one holder counts for 60 s at most); see
+# core/playback_keeper.py. 'on' also polls the playback reaper every 10 ms
+# instead of 50 (the gap after each sentence and the barge-in cut). 'off' =
+# exactly the old path. Applies on the next start.
+PLAYBACK_KEEPER = "on"
+# PLAYBACK_PRIMED_STREAM — each line plays on JARVIS's own stream instead of
+# sd.play()'s: the line itself fills the speaker's ~0.2 s start-up buffer
+# (sd.play() fills it with silence, so every line starts ~0.2 s late), and
+# the stream ends by playing out what is queued (sd.play() discards the last
+# ~0.15 s of each line: mostly its own trailing quiet or the pause after a
+# sentence, plus ~50-70 ms of the final syllable's decay).
+# Same reaper, barge-in and device rules (bobert_companion._open_primed_
+# stream). It changes what you hear, so it is OFF until judged by ear.
+# out_lat_ms on the turn line stays the stream's reported latency; with this
+# on the first sample is not behind it. Applies on the next start.
+PLAYBACK_PRIMED_STREAM = False
+
 # ─── Smart Turn end of turn (speed plan R7, 2026-10-02) ───────────────────
 # record_speech ends every turn after the same 21 silent chunks (1,344 ms),
 # finished sentence or mid-thought pause alike. Smart Turn v3.2 (an ~9 MB

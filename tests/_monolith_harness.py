@@ -341,6 +341,10 @@ _MONOLITH_RESTORE_NAMES = (
     # value would make every later _refresh_devices test silently defer its
     # reinit — the exact "green for the wrong reason" shape.
     "_pa_close_pending",
+    # The playback keeper's owner cell (PLAYBACK_KEEPER, 2026-10-05): a
+    # leaked True would make every later _refresh_devices test defer its
+    # reinit for the keeper — green for the wrong reason, like the count.
+    "_tts_keeper_active",
     # ...and the deferral LOG latch (_log_reinit_deferral is edge-triggered:
     # it prints only when the reason CHANGES). A test that ends deferred
     # leaves the latch on that reason, so the NEXT test's identical deferral
@@ -353,6 +357,15 @@ _MONOLITH_RESTORE_NAMES = (
     # test boosted a LATER test's faked buffer into a different array
     # (StandbyWakeWiringTests, 2026-09-30).
     "_last_recording_peak",
+    # ...and the last capture itself plus the media gate's playback probe for
+    # it (2026-10-05). A test that runs the real record_speech (the self-echo
+    # live sequences) left both behind; a LATER _note_room_talk then took
+    # the "a capture exists" branch and asked the REAL media session whether
+    # the PC was playing, so test_monolith_presence_hold's room-talk tests
+    # failed whenever they ran after the self-echo tests and media happened
+    # to be playing (found when test_monolith_keeper_on_slices re-ran the
+    # self-echo classes earlier in the alphabet).
+    "_last_capture_audio", "_last_capture_sr", "_media_probe",
     # Per-camera "a face is here" stamps. Since 2026-09-30 written only by
     # _face_presence_note on a SUSTAINED face; a stamp left by a test that
     # drove the face-track loop would make a later presence / gaze test see
@@ -833,6 +846,19 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         _saved_clone = getattr(bc, "VOICE_CLONE_ENABLED", None)
         if _saved_clone is not None:
             bc.VOICE_CLONE_ENABLED = False
+        # The playback keeper (2026-10-05) ships ON, and its own thread opens
+        # an OutputStream asynchronously - it could outlive a test's patch of
+        # bc.sd. Every test runs with it OFF (and _keeper_open_stream itself
+        # refuses under a test run behind that); a keeper test turns it on
+        # with its own fakes, and test_monolith_keeper_on_slices re-runs the
+        # audio-path classes with it ON. Restored, and the keeper switched
+        # off, below.
+        _saved_keeper = getattr(bc, "PLAYBACK_KEEPER", None)
+        if _saved_keeper is not None:
+            bc.PLAYBACK_KEEPER = "off"
+        _saved_primed = getattr(bc, "PLAYBACK_PRIMED_STREAM", None)
+        if _saved_primed is not None:
+            bc.PLAYBACK_PRIMED_STREAM = False
         # Start clean too, not only end clean: anything that ran before the
         # first monolith test (an import-time Kinect pump, a light-tier test)
         # may have left history in the process-wide camera gate.
@@ -850,3 +876,11 @@ class MonolithGlobalsTestCase(unittest.TestCase):
                 bc.LEARN_ONLY_FROM_OWNER = _saved_owner_only
             if _saved_clone is not None:
                 bc.VOICE_CLONE_ENABLED = _saved_clone
+            if _saved_keeper is not None:
+                bc.PLAYBACK_KEEPER = _saved_keeper
+            if _saved_primed is not None:
+                bc.PLAYBACK_PRIMED_STREAM = _saved_primed
+            try:
+                bc._playback_keeper.set_enabled(False)
+            except Exception:
+                pass

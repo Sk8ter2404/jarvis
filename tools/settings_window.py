@@ -1332,6 +1332,25 @@ SCHEMA: dict[str, dict] = {
                 "answer, instead of coming back up in between. Applies on the "
                 "next start.",
     },
+    "PLAYBACK_KEEPER": {
+        "tab": "voice", "label": "Keep the speaker awake while replying",
+        "type": "enum", "choices": ["on", "off"],
+        "default": "on",
+        "help": "on = while JARVIS prepares and speaks a reply, he plays "
+                "silence on the speaker he uses, so each line starts sooner "
+                "(opening an idle speaker took about a third of a second). "
+                "It stops 2 seconds after the reply. off = the old way. "
+                "Applies on the next start.",
+    },
+    "PLAYBACK_PRIMED_STREAM": {
+        "tab": "voice", "label": "Start each line without the lead-in gap",
+        "type": "bool", "default": False,
+        "help": "Each line starts about 0.2 seconds sooner and plays to its "
+                "very end (the old way cut its last ~0.15 seconds: mostly "
+                "quiet or the pause after a sentence, plus the very end of "
+                "the last word's fade). Changes how replies sound, so try it "
+                "by ear. Applies on the next start.",
+    },
     "PROCESSING_FILLER_PRERENDER": {
         "tab": "voice", "label": "Prepare the answer during the filler",
         "type": "bool", "default": False,
@@ -2028,7 +2047,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                       "PROCESSING_FILLER_STILL_DELAY",
                       "PROCESSING_FILLER_LATE_START_S",
                       "PROCESSING_FILLER_SKIP_PLEASANTRIES",
-                      "FILLER_DUCK_HOLD", "PROCESSING_FILLER_PRERENDER"]),
+                      "FILLER_DUCK_HOLD", "PROCESSING_FILLER_PRERENDER",
+                      "PLAYBACK_KEEPER", "PLAYBACK_PRIMED_STREAM"]),
         ("Voice clone", ["VOICE_CLONE_ENABLED", "VOICE_CLONE_PROFILE",
                          "VOICE_CLONE_MODEL", "VOICE_CLONE_SERVER_URL",
                          "VOICE_CLONE_SERVER_CMD", "VOICE_CLONE_TIMEOUT_S",

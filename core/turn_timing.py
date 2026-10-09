@@ -13,7 +13,7 @@ followup_rounds=0 filler=0 filler_ms=- tail_ms=1410 cap_lag_ms=128 \
 clip_ms=3904 stt_wait_ms=0 stt_engine=- load_ms=13 total_ms=3512 \
 play_open_ms=41 out_lat_ms=46 filler_clip_ms=- eot=- st_p=- st_n=- pre=- \
 cut=- amb_deferred=- cache=- clone=- clone_ms=- t3_ms_tok=- clone_cache=- \
-audible_ms=5207 lead_dropped=0
+audible_ms=5207 keeper=- opens=1 opens_ms=41 lead_dropped=0
 
 Offsets are integer milliseconds from the turn's t0: the record_speech VAD
 break for a spoken turn, the inject-queue drain for a typed/injected turn. A
@@ -106,6 +106,16 @@ lead_dropped (NOTE_FIELDS; ``-`` = not measured on this turn):
                  play_open_ms + out_lat_ms (``-`` unless all three are
                  known). From the owner's last word: tail_ms + cap_lag_ms +
                  audible_ms.
+  keeper         PLAYBACK_KEEPER (2026-10-05): 1 = the playback keeper's
+                 silent stream was holding the speaker when the answer's
+                 first playback opened, 0 = it was not (yet). ``-`` = the
+                 keeper is off.
+  opens          how many playbacks the answer opened (one per sentence /
+                 clip), counted like play_open_ms (after "you", the turn's
+                 thread or a helper it adopted).
+  opens_ms       their play_open_ms values added up: the mean open of the
+                 LATER sentences is (opens_ms - play_open_ms) / (opens - 1),
+                 the part of each sentence gap the keeper is meant to cut.
 
 They are set through TurnTiming.note_stat (load_ms / total_ms come with the
 answering response through llm_response, cap_lag_ms with the VAD break through
@@ -147,7 +157,8 @@ NOTE_FIELDS = ("tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms",
                "stt_engine", "load_ms", "total_ms", "play_open_ms",
                "out_lat_ms", "filler_clip_ms", "eot", "st_p", "st_n", "pre",
                "cut", "amb_deferred", "cache", "clone", "clone_ms",
-               "t3_ms_tok", "clone_cache", "audible_ms")
+               "t3_ms_tok", "clone_cache", "audible_ms",
+               "keeper", "opens", "opens_ms")
 # Computed by format_line from the marks and notes, never noted.
 _COMPUTED_NAMES = frozenset(("audible_ms",))
 
@@ -195,9 +206,10 @@ _NOTE_NAMES = _NOTE_PRINTED - {"cap_lag_ms"} - _COMPUTED_NAMES
 #     it adopted, so a reminder or tray line played first is not the answer.
 _ANY_THREAD_NAMES = frozenset(("filler_clip_ms", "cut", "amb_deferred"))
 _AFTER_YOU_NAMES = frozenset(("play_open_ms", "out_lat_ms", "cache", "clone",
-                              "clone_ms", "t3_ms_tok", "clone_cache"))
+                              "clone_ms", "t3_ms_tok", "clone_cache",
+                              "keeper", "opens", "opens_ms"))
 # Counts that add up over the turn instead of keeping the first value.
-_ADDITIVE_NAMES = frozenset(("amb_deferred",))
+_ADDITIVE_NAMES = frozenset(("amb_deferred", "opens", "opens_ms"))
 # Any-thread names that may arrive before their turn begins and be adopted
 # by it: an ambient decode deferred while the owner was still talking. A
 # filler clip or a soft cut only ever happens inside a turn; with no turn
@@ -547,12 +559,14 @@ class TurnTiming:
     def note_stat(self, name: str, value) -> None:
         """Record one speed-plan field (NOTE_FIELDS) for the active turn.
 
-        Refuses any other name (and cap_lag_ms: note_vad_break's). The
-        first value wins (amb_deferred adds up). Thread rules: the turn's own
-        thread only, like mark(owner_only=True) — except filler_clip_ms /
-        cut / amb_deferred (any thread) and play_open_ms / out_lat_ms / cache
-        / clone / clone_ms (like first_play: after "you", from the turn's
-        thread or an adopted helper).
+        Refuses any other name (and cap_lag_ms: note_vad_break's; and
+        audible_ms, which format_line computes). The first value wins
+        (amb_deferred, opens and opens_ms add up). Thread rules: the turn's
+        own thread only, like mark(owner_only=True) — except
+        filler_clip_ms / cut / amb_deferred (any thread) and play_open_ms /
+        out_lat_ms / cache / clone / clone_ms / t3_ms_tok / clone_cache /
+        keeper / opens / opens_ms (like first_play: after "you", from the
+        turn's thread or an adopted helper).
 
         With NO active turn, a value is kept for the turn that is about to
         begin: a standby wake transcribes its capture before begin_voice, and
