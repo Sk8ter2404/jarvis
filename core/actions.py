@@ -81,6 +81,46 @@ def _site_shortcut_url(name: str) -> "str | None":
         return None
 
 
+# A spoken WEBSITE name is a page in the browser, never a program to launch
+# (live 2026-10-05 00:35:57: open_on_monitor "main | youtube" failed with
+# "could not launch youtube: [WinError 2]"). Only names that are websites
+# first and foremost; an app people also install (Spotify, Discord) is not here.
+_WEBSITE_NAME_URLS = {
+    "youtube": "https://www.youtube.com", "you tube": "https://www.youtube.com",
+    "netflix": "https://www.netflix.com",
+    "hbo max": "https://www.max.com", "hbomax": "https://www.max.com",
+    "hulu": "https://www.hulu.com", "disney plus": "https://www.disneyplus.com",
+    "disney+": "https://www.disneyplus.com",
+    "prime video": "https://www.primevideo.com",
+    "gmail": "https://mail.google.com", "google mail": "https://mail.google.com",
+    "google": "https://www.google.com",
+    "google drive": "https://drive.google.com",
+    "google calendar": "https://calendar.google.com",
+    "google maps": "https://maps.google.com",
+    "reddit": "https://www.reddit.com", "facebook": "https://www.facebook.com",
+    "twitter": "https://x.com", "amazon": "https://www.amazon.com",
+    "wikipedia": "https://www.wikipedia.org",
+}
+_WEBSITE_NAME_NOISE_RE = re.compile(
+    r"^(?:(?:the|a|an|up|open|my)\s+)+|(?:\s+(?:website|web\s*site|site|"
+    r"page|com|dot\s+com)|\.com)+$", re.IGNORECASE)
+
+
+def _website_name_url(name: str) -> "str | None":
+    """The home page for a bare spoken website name ("youtube", "HBO Max",
+    "gmail.com"), else None. Never raises."""
+    try:
+        s = " ".join(str(name or "").lower().split())
+        for _ in range(3):
+            s2 = _WEBSITE_NAME_NOISE_RE.sub("", s).strip()
+            if s2 == s:
+                break
+            s = s2
+        return _WEBSITE_NAME_URLS.get(s)
+    except Exception:
+        return None
+
+
 def _is_data_dir_page(url: str) -> bool:
     """True for a ``file:`` URI naming an existing .html/.htm page inside
     JARVIS's own data dir (a page a skill wrote, e.g. skills/site_builder.py).
@@ -2062,7 +2102,51 @@ def _close_window_matches(bc, query) -> tuple:
     if monitor and len(matches) > 1:
         on_it = [w for w in matches if _on_monitor(w, monitor)]
         matches = on_it or matches
+    if len(matches) > 1 and _singular_close_said(_seam_str(bc, "_turn_user_text")):
+        matches = _one_window(bc, matches)
     return matches, left, bulk
+
+
+# "close THAT chrome window" is ONE window (live 2026-10-05 00:32:06 it closed
+# two). A singular demonstrative before a singular "window"; a plural
+# ("windows") or an "all / every / both" keeps closing every match.
+_SINGULAR_CLOSE_RE = re.compile(
+    r"\bclose[ds]?(?:\s+out)?\s+(?:that|this|the\s+(?:current|front|top|last|"
+    r"active|focused))\s+(?:[\w'-]+\s+){0,3}?window\b(?!s)", re.IGNORECASE)
+_BULK_WORD_RE = re.compile(r"\b(?:all|every|everything|both|each)\b|windows\b",
+                           re.IGNORECASE)
+
+
+def _singular_close_said(said: str) -> bool:
+    """True when the owner's words this turn close ONE window by a singular
+    demonstrative ("close that Chrome window"). Never raises."""
+    try:
+        said = said or ""
+        m = _SINGULAR_CLOSE_RE.search(said)
+        if not m or _BULK_WORD_RE.search(said[m.start():]):
+            return False
+        # one close clause only: "close that chrome window and the youtube
+        # window" / a second "close" is a compound request, not one window.
+        if len(re.findall(r"\bclos(?:e|es|ed|ing)\b", said, re.IGNORECASE)) > 1:
+            return False
+        return not re.search(r"\b(?:and|or|then|also|plus)\b[^.]*\bwindow", said[m.end():],
+                             re.IGNORECASE)
+    except Exception:
+        return False
+
+
+def _one_window(bc, matches: list) -> list:
+    """The single window of ``matches`` a singular "that ... window" means: the
+    one in focus when it is among them, else the frontmost (the first the OS
+    lists - top of the z-order). Never raises."""
+    try:
+        fg = bc._read_focused_window()[0]
+        for w in matches:
+            if fg is not None and _window_key(w) == fg:
+                return [w]
+    except Exception:
+        pass
+    return list(matches[:1])
 
 
 def _close_window_preview(arg) -> list:
@@ -6251,6 +6335,8 @@ def _act_open_on_monitor(args: str) -> str:
         return "format: open_on_monitor, <monitor_name> | <url-or-app>"
     # "youtube cello" (the model's "youtube, cello") is a search, not an app.
     target = _site_shortcut_url(target) or target
+    # A bare website name ("youtube", "netflix") is a page, not a program.
+    target = _website_name_url(target) or target
     # A guessed streaming search link / a bare service name ("HBO Max") ->
     # the verified link or the service's home page (S2, 2026-10-02).
     target, _fix_note = _streaming_url_fix(target, bare_names=False)

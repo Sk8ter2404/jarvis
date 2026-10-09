@@ -524,6 +524,51 @@ def forgot_close_target(utterance) -> str | None:
         return None
 
 
+# ── "turn on hand tracking" (2026-10-09) ────────────────────────────────────
+# Live 18:02:58 "turn on hand tracking" was answered "I can't do hand
+# tracking"; "turn on air mouse" at 18:03:39 worked. Hand tracking IS the air
+# mouse (skills/kinect_air_mouse.py), so a WHOLE on/off request for it routes
+# there without the brain: turn / switch / enable / disable / start / stop,
+# or "hand tracking on / off". A question ("is hand tracking on?") or any
+# other words riding along stay with the model.
+_HT_NAME = r"(?:the\s+)?(?:my\s+)?hand[\s-]*track(?:ing|er)(?:\s+(?:mode|feature))?"
+_HT_ON_RE = re.compile(
+    r"^(?:(?:turn|switch|flip|put)\s+on\s+" + _HT_NAME
+    + r"|(?:turn|switch)\s+" + _HT_NAME + r"\s+on"
+    + r"|(?:enable|activate|start|begin|engage|resume)\s+" + _HT_NAME
+    + r"|" + _HT_NAME + r"\s+(?:on|please\s+on)"
+    + r"|(?:let'?s\s+)?(?:use|get)\s+" + _HT_NAME + r")$", re.IGNORECASE)
+_HT_OFF_RE = re.compile(
+    r"^(?:(?:turn|switch|shut|flip)\s+off\s+" + _HT_NAME
+    + r"|(?:turn|switch|shut)\s+" + _HT_NAME + r"\s+off"
+    + r"|(?:disable|deactivate|stop|end|kill)\s+" + _HT_NAME
+    + r"|" + _HT_NAME + r"\s+off)$", re.IGNORECASE)
+_HT_POLITE_RE = re.compile(
+    r"^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?|"
+    r"(?:[\s,]+(?:please|for\s+me|now|thanks|thank\s+you|jarvis|sir))+[\s.!?]*$",
+    re.IGNORECASE)
+
+
+def hand_tracking_route(utterance) -> str | None:
+    """``"[ACTION: air_mouse_on]"`` / ``"[ACTION: air_mouse_off]"`` for a
+    whole "turn on / off hand tracking" request, else None. Never raises."""
+    try:
+        if not isinstance(utterance, str) or not utterance.strip():
+            return None
+        s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
+        s = _strip_lead_filler(s)
+        s = " ".join(_strip(s).split())
+        s = " ".join(_strip(_HT_POLITE_RE.sub("", s)).split())
+        s = " ".join(_HT_POLITE_RE.sub("", s).split())
+        if _HT_ON_RE.match(s):
+            return "[ACTION: air_mouse_on]"
+        if _HT_OFF_RE.match(s):
+            return "[ACTION: air_mouse_off]"
+        return None
+    except Exception:
+        return None
+
+
 # Map common spoken units to seconds (used by both timer and focus rules).
 _UNIT_SECONDS = {
     "second": 1, "seconds": 1, "sec": 1, "secs": 1,

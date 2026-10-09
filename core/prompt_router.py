@@ -162,7 +162,8 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     # DIFFERENT operation (feature power vs. the pose gate). Cover every
     # trigger phrase the body prints, not just the "air mouse" spellings.
     "AIR-MOUSE": [
-        "air mouse", "air-mouse", "drive the cursor", "hand mouse",
+        "air mouse", "air-mouse", "hand tracking", "hand-tracking",
+        "drive the cursor", "hand mouse",
         "cursor with my", "take the cursor", "give me the cursor",
         "release the cursor", "grab the cursor", "mouse control",
         "calibrate reach",

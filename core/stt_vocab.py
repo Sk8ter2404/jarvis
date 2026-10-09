@@ -175,6 +175,48 @@ def apply_replacements(text: str, mapping) -> str:
     return text
 
 
+# "you two" / "u2" / "you tube" is how the STT writes "YouTube" (live
+# 2026-10-05 00:32:14: "open YouTube back up" became "opening you two back
+# up", and JARVIS opened Chrome AND moved another window). Rewritten ONLY
+# inside an open / close / play style command: a verb, up to two filler words,
+# then the misheard name - or "play / put on / watch ... on you two". "I'll
+# see you two tomorrow" and "you two should talk" are never touched.
+# "U2" is a band: it only reads as YouTube after an open / close verb, never
+# after play / watch / put on.
+_YT_HEARD = r"(?:you\s*-?\s*two|you\s*-?\s*tube|u\s*-?\s*tube)"
+# bare "U2" (the band) only counts as YouTube when it ends the clause
+# ("open u2", "close u2 please"), never "start U2 radio" / "open u2 on spotify".
+_YT_HEARD_OPEN = (r"(?:" + _YT_HEARD + r"|(?:u\s*-?\s*2|u\s*-?\s*two)"
+                  r"(?=\s*(?:$|[.,!?]|(?:back\s+up|again|please|for\s+me|now)\b)))")
+_YT_CMD_VERB_RE = (r"(?:open(?:s|ed|ing)?|clos(?:e|es|ed|ing)|launch(?:es|ed|ing)?|"
+                   r"start(?:s|ed|ing)?|pull(?:ing)?\s+up|bring(?:ing)?\s+up|"
+                   r"go(?:ing)?\s+to|switch(?:ing)?\s+to)")
+_YT_PLAY_VERB_RE = r"(?:play(?:s|ed|ing)?|watch(?:es|ed|ing)?|put(?:ting)?\s+on)"
+_YT_MISHEARD_RES = (
+    re.compile(r"(?<![\w'])(" + _YT_CMD_VERB_RE + r"(?:\s+(?:up|the|a|an|my|our|"
+               r"me|some|us))*\s+)" + _YT_HEARD_OPEN + r"(?![\w'])", re.IGNORECASE),
+    re.compile(r"(?<![\w'])(" + _YT_PLAY_VERB_RE + r"(?:\s+(?:the|a|an|my|our|"
+               r"me|some|us))*\s+)" + _YT_HEARD + r"(?![\w'])", re.IGNORECASE),
+    re.compile(r"(?<![\w'])((?:play|plays|playing|put\s+on|watch|watching)\b"
+               r"[^.?!]{0,60}?\s(?:on|in|from)\s+)" + _YT_HEARD + r"(?![\w'])",
+               re.IGNORECASE),
+)
+
+
+def fix_command_mishearings(text: str) -> str:
+    """``text`` with a misheard "YouTube" ("you two", "u2", "you tube")
+    restored inside an open / close / play command; everything else, and any
+    "you two" outside such a command, unchanged. Never raises."""
+    try:
+        if not isinstance(text, str) or not text:
+            return text
+        for rx in _YT_MISHEARD_RES:
+            text = rx.sub(lambda m: m.group(1) + "YouTube", text)
+        return text
+    except Exception:
+        return text
+
+
 _SHORTCUT_NOISE_RE = re.compile(r"^(?:the|my|our)\s+|\s+(?:site|website|page|tickets?|app)$")
 
 
