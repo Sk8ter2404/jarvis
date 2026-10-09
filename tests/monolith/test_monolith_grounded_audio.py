@@ -136,8 +136,10 @@ class InventedReadingTests(_Base):
 
     def test_a_real_reading_is_kept(self):
         self._stub("audio_check", AUDIO_READ)
-        reply = ("[ACTION: audio_check, why can't I hear] The volume is at "
-                 "20 percent, sir.")
+        # Prose BEFORE the token: prose after a verbatim read-out's token is
+        # held by design (_result_hold_name) - the reading itself is voiced.
+        reply = ("The volume is at 20 percent, sir. "
+                 "[ACTION: audio_check, why can't I hear]")
         cleaned, results = self._in_turn(
             LIVE_USER, self.bc.parse_and_run_actions, reply)
         self.assertIn("20 percent", cleaned)
@@ -161,6 +163,25 @@ class InventedReadingTests(_Base):
         self.assertIn("20 percent", cleaned)
         self.assertEqual(results, [])
         self.assertFalse(stopped)
+
+
+class BrainRequestedAudioCheckIsSpokenTests(_Base):
+    """Review 2026-10-09: audio_check was in no speak set, so a reading the
+    brain asked for ("check the audio", or the _ungrounded_reading retry)
+    was logged and never voiced."""
+
+    def test_audio_check_is_spoken_verbatim(self):
+        self.assertIn("audio_check", self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+
+    def test_brain_audio_check_result_reaches_the_speaker(self):
+        self._stub("audio_check", AUDIO_READ)
+        cleaned, results = self._in_turn(
+            "Jarvis, check the audio", self.bc.parse_and_run_actions,
+            "Checking, sir. [ACTION: audio_check]")
+        self.assertIn(("audio_check", AUDIO_READ),
+                      [(n, r) for n, r, _i in results])
+        self._quiet(self.bc._speak_verbatim_results, results, cleaned)
+        self.assertIn(AUDIO_READ, self.spoken)
 
 
 if __name__ == "__main__":

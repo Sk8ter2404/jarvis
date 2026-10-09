@@ -97,5 +97,61 @@ class DescribeTests(unittest.TestCase):
         self.assertIn("lower other apps while I'm speaking", out)
 
 
+class RecogniserReviewTests(unittest.TestCase):
+    """Review 2026-10-09: requests and other topics were taken over."""
+
+    def test_a_request_anywhere_goes_to_the_brain(self):
+        for text in ("I can't hear anything, turn the volume up",
+                     "Jarvis can you turn it up I can't hear it",
+                     "the video has no sound, can you play a different one",
+                     "Why can't I hear my video? Unmute it please",
+                     "I can't hear myself think, turn it down"):
+            with self.subTest(text=text):
+                self.assertFalse(ac.is_audio_trouble_question(text))
+
+    def test_not_hearing_a_person_or_the_room_is_not_the_pc(self):
+        for text in ("I can't hear you, Jarvis",
+                     "Sorry, I couldn't hear what you said",
+                     "I couldn't hear the doorbell",
+                     "I can't listen to music while studying"):
+            with self.subTest(text=text):
+                self.assertFalse(ac.is_audio_trouble_question(text))
+
+    def test_microphone_questions_are_not_the_output(self):
+        for text in ("They can't hear me on Discord",
+                     "my friends can't hear me",
+                     "no audio on the zoom call, can people hear me",
+                     "is my mic muted"):
+            with self.subTest(text=text):
+                self.assertFalse(ac.is_audio_trouble_question(text))
+
+    def test_pc_sound_questions_still_match(self):
+        for text in ("why can't I hear Spotify", "I can't hear it",
+                     "why can't I hear the music on my laptop",
+                     "I still can't hear anything from Chrome",
+                     "why can't I hear?", "is the video muted"):
+            with self.subTest(text=text):
+                self.assertTrue(ac.is_audio_trouble_question(text))
+
+
+class AppMatchTests(unittest.TestCase):
+    def test_search_host_is_not_a_browser(self):
+        # "arc" (the Arc browser) is a substring of searchhost / searchapp.
+        st = _state(master_pct=60, muted=False, sessions=[
+            ac.AppSession("chrome.exe", 100, False, True),
+            ac.AppSession("searchhost.exe", 100, True, False),
+            ac.AppSession("searchapp.exe", 100, True, False)])
+        out = ac.describe(st, LIVE_USER)
+        self.assertNotIn("Searchhost", out)
+        self.assertNotIn("Searchapp", out)
+        self.assertNotIn("muted in the volume mixer", out)
+        self.assertIn("Chrome is sending sound", out)
+
+    def test_real_browser_processes_match(self):
+        for name in ("chrome.exe", "msedge.exe", "arc.exe", "firefox.exe"):
+            with self.subTest(name=name):
+                self.assertTrue(ac._matches(name, ac._BROWSERS))
+
+
 if __name__ == "__main__":
     unittest.main()

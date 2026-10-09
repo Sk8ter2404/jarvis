@@ -81,8 +81,18 @@ class ReadingShapesTests(unittest.TestCase):
                 self.assertIsNone(cv.find_ungrounded_reading(reply))
 
     def test_the_owners_own_number_grounds_it(self):
+        # A number the owner STATED grounds it; one he asked to have SET
+        # needs the set's own result (review 2026-10-09: a failed or never-
+        # run set_volume must not ground "the volume is now at 30").
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "The volume is at 30 percent, sir, as you said.",
+            user_text="my volume is at 30 and I still can't hear"))
+        self.assertIsNotNone(cv.find_ungrounded_reading(
+            "The volume is now at 30 percent, sir.",
+            user_text="set the volume to 30"))
         self.assertIsNone(cv.find_ungrounded_reading(
             "The volume is now at 30 percent, sir.",
+            grounding=["volume set to 30 percent, sir"],
             user_text="set the volume to 30"))
 
     def test_a_conversion_is_arithmetic_not_a_reading(self):
@@ -107,6 +117,80 @@ class ReadingShapesTests(unittest.TestCase):
         for bad in (None, "", 12, "volume is at"):
             self.assertIsNone(cv.find_ungrounded_reading(bad))
         self.assertEqual(cv.drop_ungrounded_readings(""), ("", []))
+
+
+# skills/system_pulse.py's real wording (format_status: "CPU N percent at N
+# degrees", "memory N percent", "battery at N percent on battery power").
+REAL_PULSE = ("All systems nominal, sir. CPU 20 percent at 55 degrees, "
+              "memory 58 percent, GPU running at 31 percent, battery at 45 "
+              "percent on battery power.")
+
+
+class AttachedGroundingTests(unittest.TestCase):
+    """Review 2026-10-09: a number grounded a reading merely by sitting in a
+    text that also held the keyword. It must be ATTACHED to that reading."""
+
+    def test_web_search_count_does_not_ground_the_live_line(self):
+        self.assertIsNotNone(cv.find_ungrounded_reading(
+            "I'm afraid the volume is currently set to 20%, sir.",
+            grounding=["Searched the web for 'why no sound youtube': 20 "
+                       "fixes for audio problems"],
+            user_text=LIVE_USER))
+
+    def test_memory_number_beside_sound_settings_does_not_ground(self):
+        self.assertIsNotNone(cv.find_ungrounded_reading(
+            "The volume is at 64 percent, sir.",
+            grounding=["All systems nominal, sir. CPU 12 percent, memory "
+                       "64 percent. Spotify, Discord and Sound Settings "
+                       "open."]))
+
+    def test_real_pulse_cpu_number_is_not_a_temperature(self):
+        self.assertIsNotNone(cv.find_ungrounded_reading(
+            "The temperature is 20 degrees, sir.", grounding=[REAL_PULSE]))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "The CPU temperature is 55 degrees, sir.",
+            grounding=[REAL_PULSE]))
+
+    def test_real_pulse_memory_number_is_not_the_battery(self):
+        self.assertIsNotNone(cv.find_ungrounded_reading(
+            "Your battery is at 58 percent, sir.", grounding=[REAL_PULSE]))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "Your battery is at 45 percent, sir.", grounding=[REAL_PULSE]))
+
+    def test_owner_number_for_something_else_does_not_ground(self):
+        self.assertIsNotNone(cv.find_ungrounded_reading(
+            "The volume is at 20 percent, sir.",
+            user_text="set a timer for 20 minutes and why can't I hear"))
+
+    def test_owner_set_request_does_not_ground_a_failed_set(self):
+        self.assertIsNotNone(cv.find_ungrounded_reading(
+            "The volume is at 30 percent, sir.",
+            grounding=["couldn't parse a volume percent from '30ish'"],
+            user_text="set the volume to 30ish"))
+
+    def test_owner_stated_or_asked_number_still_grounds(self):
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "Yes, the temperature is 70 degrees, sir.",
+            user_text="is the temperature 70 degrees outside?"))
+
+    def test_real_readings_in_other_wordings_ground(self):
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "The print bed temperature is 60 degrees, sir.",
+            grounding=["Bed 60C nozzle 220C, layer 40 of 200"]))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "The robot's battery is at 80 percent.",
+            grounding=["robot status: batt 80%"]))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "The volume is at 30 percent, sir.",
+            grounding=["volume set to 30 percent, sir"]))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "The volume is at 20 percent, sir.", grounding=[AUDIO_READ]))
+
+    def test_trading_volume_and_battery_health_are_not_readings(self):
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "Trading volume is up 20 percent today, sir."))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "The battery is at 80 percent health, sir."))
 
 
 if __name__ == "__main__":

@@ -1050,11 +1050,12 @@ def strip_ack_preface(text: str, user_text: str, *,
 # volume, brightness, battery or a temperature as a present fact ("the volume
 # is currently set to 20%", "battery at 45 percent", "20% volume", "the GPU
 # temperature is 65 degrees") when nothing this turn supplied that number:
-# no action result / sensor line / context text that names the same kind of
-# reading (the word "volume", "battery", ...) carries it, and the owner did
-# not say it himself. A real reading quoted back ("the system volume is at
+# no action result carries it ATTACHED to the same kind of reading ("volume
+# set to 20 percent", "battery at 45 percent", "55 degrees" - see
+# _rd_attached_values), and the owner did not state it himself (a number he
+# asked to have SET does not count). A real reading quoted back ("the system volume is at
 # 35 percent" after audio_check said 35) is grounded and passes. Not a
-# reading: a question, a condition or advice ("if the volume is at 0%",
+# reading: "trading volume", "battery health", a question, a condition or advice ("if the volume is at 0%",
 # "ideally the battery stays above 20%"), an instruction ("set the volume to
 # 20%" - the action-claim checks' job), or a temperature when the owner asked
 # for a unit conversion. A number within 1 of a grounded value counts (a
@@ -1085,14 +1086,6 @@ _RD_NOUN = {
     "brightness": r"(?:brightness)",
     "battery": r"(?:battery(?:\s+(?:level|life|charge))?|charge\s+level)",
     "temperature": r"(?:temperature|temp)",
-}
-# The words a grounding text must carry to ground a reading of that kind.
-_RD_KEYWORDS = {
-    "volume": ("volume", "sound", "audio", "mute", "speaker"),
-    "brightness": ("bright",),
-    "battery": ("battery", "charge", "charging", "plugged"),
-    "temperature": ("temp", "°", "degree", "weather", "forecast",
-                    "thermostat", "celsius", "fahrenheit"),
 }
 _RD_COP = (r"(?:'s|\s+is|\s+was|\s+are|\s+reads|\s+sits|\s+stands|\s+shows|"
            r"\s+remains|\s+stays|\s+has(?:\s+got)?|"
@@ -1156,27 +1149,92 @@ def _rd_value(tok: str) -> Optional[float]:
     return None
 
 
-def _rd_numbers(text: str) -> list:
+# A number grounds a reading only when it is ATTACHED to that kind of
+# reading in the grounding text - not merely somewhere in a text that also
+# contains the keyword. The review of 2026-10-09 grounded "the volume is at
+# 20%" from "20 fixes for audio problems", "the temperature is 20 degrees"
+# from "CPU 20 percent at 55 degrees", "battery at 58 percent" from
+# "battery at 45 percent, memory 58 percent". Attached means, inside one
+# clause (split at , ; . | and line breaks):
+#   * the keyword, then only connector words, then the number ("volume set
+#     to 30 percent", "battery at 45 percent", "Volume: 20%", "batt 80%");
+#   * the number with its % unit, then the keyword ("80% charging");
+#   * for a temperature, the number carrying a temperature unit ("55
+#     degrees", "52°C", "Bed 60C", "70F") - the unit IS the keyword.
+_RD_CLAUSE_SPLIT_RE = re.compile(r"[;!?\n|]|,\s|\.(?=\s|$)|\s[-—–]\s")
+_RD_KW_RES = {
+    "volume": r"(?:volume|sound|audio|mute\w*|speakers?)",
+    "brightness": r"(?:bright\w*)",
+    "battery": r"(?:batt\w*|charg\w*|plugged)",
+    "temperature": r"(?:temp\w*|weather|forecast|thermostat|outside|"
+                   r"indoors?|room)",
+}
+_RD_CONNECT = (r"(?:is|was|are|at|to|set|now|currently|level|levels|master|"
+               r"system|output|scalar|of|sitting|reading|reads|holding|"
+               r"stays|remains|still|only|about|around|approximately|"
+               r"roughly|just|life|charge|'s|its|own|mixer|in|the)")
+_RD_ATTACH_RES = {
+    fam: (
+        re.compile(r"\b" + kw + r"\b(?:\W+" + _RD_CONNECT + r"\b){0,4}"
+                   r"\W*(?P<n>" + _RD_NUM + r")"),
+        re.compile(r"(?P<n>" + _RD_NUM + r")\s*(?:%|percent\b)\s+(?:of\s+)?"
+                   r"(?:the\s+|your\s+|my\s+)?" + kw + r"\b"),
+    )
+    for fam, kw in _RD_KW_RES.items()
+}
+_RD_TEMP_UNIT_RE = re.compile(
+    r"(?P<n>\d{1,3}(?:\.\d+)?|" + _RD_WORD_NUM + r")\s*(?:°\s*[cf]?|"
+    r"degrees?\b|[cf]\b)")
+# The owner's own number grounds a reading he STATED or ASKED about ("is it
+# 70 degrees out?", "the volume's at 20 and I can't hear"), never one he
+# asked to have SET ("set the volume to 30") - that is the very claim the
+# action-result checks must see a result for.
+_RD_OWNER_COMMAND_RE = re.compile(
+    r"\b(?:set|turn|make|put|change|raise|lower|bump|increase|decrease|"
+    r"crank|drop|dim|brighten)\b")
+
+
+def _rd_attached_values(fam: str, text: str) -> list:
     out = []
-    for m in _RD_NUM_TOKEN_RE.finditer(text or ""):
-        v = _rd_value(m.group(0))
-        if v is not None:
-            out.append(v)
+    for clause in _RD_CLAUSE_SPLIT_RE.split(str(text or "").lower()):
+        if not clause.strip():
+            continue
+        rxs = list(_RD_ATTACH_RES[fam])
+        if fam == "temperature":
+            rxs.append(_RD_TEMP_UNIT_RE)
+        for rx in rxs:
+            for m in rx.finditer(clause):
+                v = _rd_value(m.group("n"))
+                if v is not None:
+                    out.append(v)
     return out
 
 
 def _rd_grounded(fam: str, value: float, grounding, user_text: str) -> bool:
-    # The owner's own number ("set it to 20", "is it 70 degrees out?").
-    if any(abs(v - value) < 0.5 for v in _rd_numbers(_norm(user_text))):
+    owner = " . ".join(
+        c for c in _RD_CLAUSE_SPLIT_RE.split(_norm(user_text).lower())
+        if c.strip() and not _RD_OWNER_COMMAND_RE.search(c))
+    if any(abs(v - value) < 0.5 for v in _rd_attached_values(fam, owner)):
         return True
-    keys = _RD_KEYWORDS[fam]
     for g in grounding:
-        low = str(g or "").lower()
-        if not low or not any(k in low for k in keys):
-            continue
-        if any(abs(v - value) <= 1.0 for v in _rd_numbers(low)):
+        if any(abs(v - value) <= 1.0
+               for v in _rd_attached_values(fam, g)):
             return True
     return False
+
+
+# Not a sensor reading at all: "trading volume", "battery health".
+_RD_NOT_SENSOR_BEFORE = {
+    "volume": re.compile(
+        r"\b(?:trading|sales|search|traffic|call|order|transaction|data|"
+        r"shipping|production|stock|share|market|trade|ticket|email|"
+        r"message|loan|deal|book|series)\s+volume\b"),
+}
+_RD_NOT_SENSOR_AFTER = {
+    "battery": re.compile(
+        r"^\s*(?:of\s+(?:its|the|their|your)\s+(?:original\s+|design\s+|"
+        r"full\s+)?)?(?:health|capacity|wear|design\s+capacity)\b"),
+}
 
 
 def find_ungrounded_reading(text: str, *, grounding: Iterable[str] = (),
@@ -1205,6 +1263,13 @@ def find_ungrounded_reading(text: str, *, grounding: Iterable[str] = (),
                         # first form reads the whole sentence.
                         scope = s if rx is rxs[2] else s[:m.end()]
                         if _RD_NOT_STATE_RE.search(scope):
+                            continue
+                        bef = _RD_NOT_SENSOR_BEFORE.get(fam)
+                        if bef and bef.search(s[max(0, m.start() - 24):
+                                                m.end()]):
+                            continue
+                        aft = _RD_NOT_SENSOR_AFTER.get(fam)
+                        if aft and aft.search(s[m.end():]):
                             continue
                         value = _rd_value(m.group("n"))
                         if value is None:

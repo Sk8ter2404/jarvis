@@ -32,10 +32,10 @@
 | — skill / core registered | 562 |
 | tested | 660 |
 | **untested** (no test names it) | 58 |
-| spoken note: VERBATIM | 368 |
+| spoken note: VERBATIM | 369 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
-| **no spoken note** (neither) | 271 |
+| **no spoken note** (neither) | 270 |
 | no `prompts.py` example | 512 |
 
 A result with no spoken note is correct for side-effect actions but is the recurring
@@ -104,7 +104,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `audio_autoswitch_off` | `skills/audio_autoswitch.py:217` | **VERBATIM** | yes | no |
 | `audio_autoswitch_on` | `skills/audio_autoswitch.py:211` | **VERBATIM** | yes | no |
 | `audio_autoswitch_status` | `skills/audio_autoswitch.py:197` | **VERBATIM** | yes | yes |
-| `audio_check` | `bobert_companion.py:33795` | neither | — | yes |
+| `audio_check` | `bobert_companion.py:33795` | **VERBATIM** | — | yes |
 | `audio_devices` | `skills/audio_devices.py:314` | **VERBATIM** | yes | yes |
 | `audio_music_status` | `skills/standby_audio_detect.py:692` | **VERBATIM** | — | yes |
 | `bambu_camera` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
@@ -191,7 +191,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `device_online` | `skills/network_deco.py:729` | **VERBATIM** | — | yes |
 | `diagnostic_daemon_status` | `core/diagnostic_daemons.py:1629` | **VERBATIM** | — | yes |
 | `diagnostic_history` | `skills/self_diagnostic.py:4679` | **VERBATIM** | — | yes |
-| `diagnostic_status` | `bobert_companion.py:46677` | **VERBATIM** | yes | yes |
+| `diagnostic_status` | `bobert_companion.py:46675` | **VERBATIM** | yes | yes |
 | `disable_guest_network` | `skills/network_deco.py:819` | neither | — | yes |
 | `disable_night_owl` | `skills/night_owl_mode.py:502` | neither | — | yes |
 | `disable_voice_clone` | `skills/voice_clone.py:244` | **VERBATIM** | yes | yes |

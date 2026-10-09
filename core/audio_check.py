@@ -63,7 +63,7 @@ _APPS = (
     (r"apple\s+music|itunes", "Apple Music", ("applemusic", "itunes")),
     (r"discord", "Discord", ("discord",)),
     (r"vlc", "VLC", ("vlc",)),
-    (r"teams", "Teams", ("teams",)),
+    (r"teams", "Teams", ("ms-teams", "teams")),
     (r"zoom", "Zoom", ("zoom",)),
     (r"fortnite|game", "the game", ("fortnite",)),
 )
@@ -79,11 +79,25 @@ def target_apps(text: str):
     return None
 
 
-_HEAR = r"(?:hear|listen\s+to)"
+# What "can't hear ..." must be about for the READING to answer it: the PC's
+# own sound (nothing named, "anything", "it", a video / song / game / an app).
+# Not "can't hear you" (say it again), "can't hear me" (a microphone), "the
+# doorbell" (the room) - the review of 2026-10-09 caught all three routed here.
+_MEDIA = (r"video|music|song|songs|movie|film|show|episode|game|stream|audio|"
+          r"sound|track|podcast|clip|speakers?|pc|computer|laptop|tab|"
+          r"browser|youtube|spotify|netflix|twitch|discord|vlc|apple\s+music|"
+          r"headphones|headset|anything\s+(?:on|from)\s+\w+")
+_HEAR_OBJ = (r"(?:\s*$|\s*[.?!,;]|\s+(?:anything|a\s+thing|it|this|that|"
+             r"any\s+(?:sound|audio)|(?:" + _MEDIA + r")\b|"
+             r"(?:the|my|this|that|any)\s+(?:\w+\s+){0,2}?(?:" + _MEDIA
+             + r")\b))")
 _TROUBLE_RES = tuple(re.compile(p, re.I) for p in (
-    # "why can't I hear my YouTube video" / "I can't hear anything"
-    r"\b(?:can'?t|cannot|can\s+not|couldn'?t|not\s+able\s+to|unable\s+to)\s+"
-    r"(?:i\s+|we\s+|anyone\s+)?(?:still\s+)?" + _HEAR + r"\b",
+    # "why can't I hear my YouTube video" / "I can't hear anything" - the
+    # owner (I / we) hearing the PC, never someone else hearing him.
+    r"(?:\b(?:i|we)\s+(?:still\s+)?(?:can'?t|cannot|can\s+not|couldn'?t|"
+    r"am\s+not\s+able\s+to|'m\s+not\s+able\s+to|am\s+unable\s+to)|"
+    r"\b(?:can'?t|cannot|couldn'?t)\s+(?:i|we))\s+(?:still\s+)?hear"
+    + _HEAR_OBJ,
     # "why is there no sound" / "there's no audio from Chrome"
     r"\bno\s+(?:sound|audio|volume)\b",
     # "is my sound muted" / "is the PC muted" / "why is it muted"
@@ -97,19 +111,42 @@ _TROUBLE_RES = tuple(re.compile(p, re.I) for p in (
     r"\bwhat'?s?\s+(?:is\s+)?(?:the\s+|my\s+)?(?:system\s+|master\s+)?"
     r"volume\s+(?:at|set\s+to|level|now)\b",
 ))
+# A request to CHANGE something, anywhere in the utterance ("I can't hear
+# anything, turn the volume up", "the video has no sound, can you play a
+# different one"): the owner asked for an action, not a report - the brain
+# runs it. Matched anywhere, not only at the start.
 _COMMAND_RE = re.compile(
-    r"^\s*(?:(?:hey\s+)?jarvis[,\s]+)?(?:please\s+)?(?:turn|set|mute|unmute|"
-    r"raise|lower|increase|decrease|put|make)\b", re.I)
+    r"\b(?:turn|unmute|raise|lower|increase|decrease|crank|bump|play|skip|"
+    r"switch|change|pause|resume|restart|repeat|louder|quieter|fix|"
+    r"mute\s+(?:it|the|my|this|that|everything|all|\w+\s+(?:tab|app|video))|"
+    r"set\s+(?:it|the|my|volume|sound)|put\s+(?:it|the|on)|"
+    r"(?:volume|sound)\s+(?:up|down)|say\s+(?:that|it)\s+again)\b", re.I)
+# The owner's MICROPHONE ("can people hear me", "is my mic muted", "am I
+# muted on Teams") - audio_check reads the output side only.
+_MIC_RE = re.compile(
+    r"\b(?:mic|mics|microphone|hear\s+(?:me|us)|am\s+i\s+muted|"
+    r"i'?m\s+muted|are\s+we\s+muted)\b", re.I)
 
 
 def is_audio_trouble_question(text) -> bool:
-    """True when the owner asks why he can't hear something / whether the
-    sound is muted / what the volume is - a question the audio READING
-    answers. A command ("mute it", "turn the volume up") is not one."""
+    """True when the owner asks why he can't hear something on the PC /
+    whether the sound is muted / what the volume is - a question the audio
+    READING answers. A request to change anything ("mute it", "I can't hear,
+    turn it up"), a microphone question, or not hearing a person ("I can't
+    hear you") is not one."""
     t = str(text or "").strip()
-    if not t or len(t) > 160 or _COMMAND_RE.search(t):
+    if (not t or len(t) > 160 or _COMMAND_RE.search(t)
+            or _MIC_RE.search(t)):
         return False
     return any(rx.search(t) for rx in _TROUBLE_RES)
+
+
+def _matches(name: str, frags) -> bool:
+    """True when process ``name`` IS one of ``frags`` (its base name equals
+    or starts with the fragment) - "arc" is Arc's arc.exe, never
+    searchhost.exe, which merely contains the letters."""
+    base = re.sub(r"\.exe$", "", str(name or "").lower())
+    return any(base == f or base.startswith(f) for f in frags)
 
 
 # ── the reading ─────────────────────────────────────────────────────────────
@@ -227,8 +264,7 @@ def _describe(st: AudioState, user_text: str) -> str:
     target = target_apps(user_text)
     found = []
     if target and st.sessions:
-        found = [s for s in st.sessions
-                 if any(f in s.name for f in target[1])]
+        found = [s for s in st.sessions if _matches(s.name, target[1])]
     causes: list[str] = []
     if st.muted:
         causes.append("Windows sound output is muted")

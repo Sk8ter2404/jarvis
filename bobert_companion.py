@@ -38303,6 +38303,12 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # Single-sentence health/status aggregator (skills/system_pulse.py) and its
     # natural-phrasing aliases. Each returns one finished status sentence.
     "system_pulse", "check_system", "status_report",
+    # The audio READING (core/audio_check.py, 2026-10-09): one finished
+    # answer built only from what was read. Spoken as written - an LLM
+    # restatement could put back the very invented number it replaces - and
+    # spoken when the brain asks for it ("check the audio", or the
+    # _ungrounded_reading retry), not only on the shortcut.
+    "audio_check",
     # Status / info READ-OUTS — each returns a finished, user-facing sentence the
     # user explicitly asked for. Without this they were logged but NEVER VOICED
     # (only the generic "Of course, sir" preamble was spoken) — owner caught this
@@ -39003,31 +39009,18 @@ def _turn_user_text() -> str:
     return frame["user_text"] if frame else ""
 
 
-def _note_turn_context(text) -> None:
-    """Record a sensor line / context text this turn's prompt carried, so a
-    reading the reply quotes from it is grounded (find_ungrounded_reading).
-    No-op outside a turn. Never raises."""
-    try:
-        frame = getattr(_turn_grounding, "frame", None)
-        if frame is not None and text:
-            ctx = frame.setdefault("context", [])
-            ctx.append(str(text)[:2000])
-            del ctx[:-12]
-    except Exception:
-        pass
-
-
 def _turn_grounding_texts() -> list:
     """Everything this owner turn READ: every action result (failed ones
-    too) and any context noted by _note_turn_context, oldest first ([]
-    outside a turn). What a volume / battery / temperature number in a reply
-    must come from (2026-10-09). Never raises."""
+    too), oldest first ([] outside a turn). What a volume / battery /
+    temperature number in a reply must come from (2026-10-09). Prompt
+    context lines are deliberately NOT included: nothing proved a sensor
+    line in the prompt is fresh, and a reading the owner wants comes from an
+    action (audio_check / system_pulse). Never raises."""
     frame = getattr(_turn_grounding, "frame", None)
     try:
         if not frame:
             return []
-        return (list(frame.get("readings") or [])
-                + list(frame.get("context") or []))
+        return list(frame.get("readings") or [])
     except Exception:
         return []
 
