@@ -70,7 +70,14 @@ STRONG_LEADS = (("go", "ahead"), ("do", "it"), ("of", "course"))
 # "I am." answer the pushback "Are you certain?" (2026-10-01).
 SOFT_LEADS = (("go", "for", "it"), ("please", "do"), ("i", "am", "sure"),
               ("i", "am", "certain"), ("im", "sure"), ("im", "certain"),
-              ("i", "am"), ("sounds", "good"))
+              ("i", "am"), ("sounds", "good")) + tuple(
+    # "Jarvis, yes, that is what I want." (live 2026-10-06) answered "Say
+    # yes if that is what you want" - and was "other", so the held shutdown
+    # was cancelled. The owner restating that he wants it is a yes; "that is
+    # what SHE said" is not (no "i").
+    (*that, "what", "i", verb)
+    for that in (("that", "is"), ("thats",))
+    for verb in ("want", "wanted", "said", "meant", "asked"))
 YES_LEADS = STRONG_LEADS + SOFT_LEADS
 # The most "other" words a strong yes / strong lead may carry and still be a
 # yes: "Yes, delete it" passes ("Yes I am" / "Yes, send it" are a yes plus a

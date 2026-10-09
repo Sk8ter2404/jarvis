@@ -139,6 +139,19 @@ _FAMILIES: tuple[tuple[str, str, str, str, frozenset[str]], ...] = (
      r"close(?!\s+(?:by|with)\b)|shut\s+(?:\w+\s+)?down|kill(?!\s+time\b)",
      frozenset({"close", "kill", "shutdown", "shut", "quit", "exit", "window",
                 "stop", "end"})),
+    # JARVIS taking HIMSELF down (live 2026-10-06): "I've cancelled the
+    # overnight protocol and am powering down now." was spoken with nothing
+    # run - "shutting down" was caught, "powering down" / "going offline"
+    # were not. A device powered off by smart_home_control grounds it too
+    # (_GROUND_ALSO).
+    ("power",
+     r"powering\s+(?:\w+\s+)?(?:down|off)\b|going\s+offline|"
+     r"turning\s+myself\s+off|taking\s+myself\s+offline",
+     r"powered\s+(?:\w+\s+)?(?:down|off)\b|(?:gone|went)\s+offline",
+     r"power\s+(?:\w+\s+)?(?:down|off)\b|go\s+offline|turn\s+myself\s+off|"
+     r"take\s+myself\s+offline",
+     frozenset({"shutdown", "shut", "power", "off", "offline", "exit", "quit",
+                "overnight", "upgrade", "restart", "sleep"})),
     ("switch",
      r"switching(?!\s+(?:gears|topics?|subjects?|tack|sides)\b)",
      r"switched(?!\s+(?:gears|topics?|subjects?|tack|sides)\b)",
@@ -238,8 +251,10 @@ _ADVERBS = (r"(?:(?:now|just|currently|already|also|quickly|immediately|"
 
 
 def _compile_family(gerund: str, participle: str, base: str):
+    # "... and am powering down now" (live 2026-10-06): "am" carries the
+    # reply's own "I" past an "and"; no other subject takes "am".
     progressive = re.compile(
-        r"\b(?:i'?m|i\s+am)\s+" + _ADVERBS + r"(?:" + gerund + r")\b")
+        r"\b(?:i'?m|i\s+am|and\s+am)\s+" + _ADVERBS + r"(?:" + gerund + r")\b")
     # "I've taken the liberty of searching ..." is the persona's initiative
     # opener wrapped round a gerund: as much a claim as "I've searched".
     perfect = re.compile(
@@ -752,6 +767,7 @@ def _ran_tokens(ran_actions: Iterable[str]) -> set[str]:
 # Grounding only - the lenient direction.
 _GROUND_ALSO: dict[str, frozenset[str]] = {
     "switch": next(t for n, _g, _p, _b, t in _FAMILIES if n == "turn"),
+    "power": next(t for n, _g, _p, _b, t in _FAMILIES if n == "turn"),
     "send": frozenset({"print", "printer"}),
 }
 

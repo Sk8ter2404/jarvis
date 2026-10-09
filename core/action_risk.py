@@ -188,9 +188,90 @@ def self_termination_class(name) -> str:
     return _SELF_TERMINATION_CLASS.get(n, "shutdown")
 
 
+# Words QUOTED in the utterance are not the owner asking (review 2026-10-06):
+# 'He said "shut down."' / 'the line was "go offline now"' armed the
+# shutdown prompt. Double quotes only - an apostrophe is a contraction.
+_QUOTED_RE = re.compile(r"[\"“”][^\"“”]*[\"“”]")
+# A negator in the three words before the verb takes that mention out (review
+# 2026-10-06): "don't shut down" / "never go offline" / "no, don't turn
+# yourself off" / "don't go to bed" all asked for it here, so an armed
+# overnight prompt answered "No, don't shut down." powered JARVIS off.
+_NEGATORS = frozenset({
+    "dont", "not", "never", "wont", "cant", "cannot", "shouldnt", "mustnt",
+    "didnt", "doesnt", "wouldnt", "couldnt", "isnt", "wasnt",
+})
+# Someone else as the verb's subject: "should I shut down?", "it shut down",
+# "they shut down at nine" - the owner or a device, not JARVIS.
+_OTHER_SUBJECTS = frozenset({"i", "we", "they", "he", "she", "it"})
+# "No overnight protocol" said WITH the shutdown (live 2026-10-06): "shut
+# down no overnight protocol", "shut down with no overnight protocol", "shut
+# down without the protocol" answer the overnight question JARVIS asks first,
+# so the verb is still aimed at JARVIS. Only the overnight protocol (or its
+# upgrade) is a thing to decline here: "shut down with no warning" / "shut
+# down? No." are not.
+_OVERNIGHT_THING = (
+    r"(?:(?:the|any|an|that|your)\s+)?"
+    r"(?:overnight(?:\s+(?:protocol|mode|upgrades?|thing|run))?|"
+    r"night\s+protocol|protocol|upgrades?|updates?|upgrading|updating)")
+_DECLINE = r"(?:with\s+no|with\s+out|without|no|not)\s+" + _OVERNIGHT_THING
+_DECLINE_AFTER_VERB_RE = re.compile(r"^" + _DECLINE + r"\b")
+# The WHOLE utterance is a shutdown that declines the overnight protocol, or
+# (in reply to the overnight question) the decline alone. Strict on purpose:
+# anything more ("shut down the printer with no overnight protocol", "don't
+# shut down, no overnight protocol") is not this shape and goes the usual way.
+_WAKE = r"(?:(?:hey|ok|okay)\s+)?jarvis\s+"
+_LEAD = r"(?:(?:okay|ok|just|please|then|so|go\s+ahead\s+and|and|no|nope)\s+)*"
+_SHUTDOWN_CMD = (
+    r"(?:shut\s*down|power\s+(?:off|down)|go\s+offline|"
+    r"turn\s+(?:yourself\s+off|off\s+jarvis)|switch\s+yourself\s+off)"
+    r"(?:\s+(?:yourself|jarvis))?")
+_SOFT = (r"(?:\s+(?:now|please|sir|jarvis|then|completely|fully|tonight|"
+         r"thanks|thank\s+you|right\s+now|for\s+the\s+night|this\s+time))*")
+_DECLINE_FULL = _DECLINE + _SOFT
+_CMD_FULL = _SHUTDOWN_CMD + _SOFT
+_SHUTDOWN_DECLINING_RE = re.compile(
+    r"^(?:" + _WAKE + r")?" + _LEAD + r"(?:"
+    + _CMD_FULL + r"\s+(?:and\s+)?" + _DECLINE_FULL
+    + r"|" + _DECLINE_FULL + r"\s+(?:(?:and|so|just|then)\s+)*" + _CMD_FULL
+    + r")$")
+_DECLINE_ONLY_RE = re.compile(
+    r"^(?:" + _WAKE + r")?" + _LEAD + _DECLINE_FULL + r"$")
+
+
 def _clean_words(text) -> str:
-    t = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower().replace("'", ""))
+    t = _QUOTED_RE.sub(" ", str(text or "").lower())
+    t = re.sub(r"[^a-z0-9]+", " ", t.replace("'", "").replace("’", ""))
     return " " + " ".join(t.split()) + " "
+
+
+def _aimed_elsewhere(low: str, i: int) -> bool:
+    """True when the verb starting at index ``i`` of ``low`` (a
+    _clean_words string) is negated ("don't shut down") or has someone
+    other than JARVIS as its subject ("should I shut down")."""
+    before = low[:i].split()
+    if any(w in _NEGATORS for w in before[-3:]):
+        return True
+    return bool(before) and before[-1] in _OTHER_SUBJECTS
+
+
+def shutdown_declining_overnight(text, *, alone_ok: bool = False) -> bool:
+    """True when ``text`` is, as a whole, a shutdown of JARVIS that already
+    says no to the overnight protocol (live 2026-10-06): "Jarvis shut down no
+    overnight protocol.", "Jarvis shut down with no overnight protocol.",
+    "shut down without the protocol", "no overnight protocol, just shut
+    down". ``alone_ok`` (the overnight question is open): the decline alone
+    counts too - "without the overnight protocol", "with no overnight
+    protocol". A negated, quoted or longer sentence never matches. Never
+    raises; a fault is False."""
+    try:
+        low = _clean_words(text).strip()
+        if not low:
+            return False
+        if _SHUTDOWN_DECLINING_RE.match(low):
+            return True
+        return bool(alone_ok and _DECLINE_ONLY_RE.match(low))
+    except Exception:
+        return False
 
 
 def asked_for_self_termination(name, user_text) -> bool:
@@ -212,6 +293,12 @@ def asked_for_self_termination(name, user_text) -> bool:
                 changes", "install the update";
       overnight "overnight", "goodnight", "bed", "sleep", "calling it a
                 night", ...
+    A shutdown may also decline the overnight protocol in the same breath:
+    "shut down no overnight protocol", "shut down with no overnight
+    protocol", "shut down without the protocol" (live 2026-10-06).
+    Never counted (review 2026-10-06): a negated verb ("don't shut down",
+    "never go offline"), another subject ("should I shut down?", "it shut
+    down"), or words inside double quotes ('He said "shut down."').
     Any other action name is True (not this gate's business). Never raises;
     a fault is False, so JARVIS asks."""
     try:
@@ -220,8 +307,10 @@ def asked_for_self_termination(name, user_text) -> bool:
             return True
         low = _clean_words(user_text)
         phrases = _SELF_PHRASES.get(cls)
-        if phrases is not None and phrases.search(low):
-            return True
+        if phrases is not None:
+            for m in phrases.finditer(low):
+                if not _aimed_elsewhere(low, m.start()):
+                    return True
         for verb in _VERBS.get(cls, ()):
             start = 0
             needle = " " + verb + " "
@@ -230,8 +319,13 @@ def asked_for_self_termination(name, user_text) -> bool:
                 if i < 0:
                     break
                 start = i + 1
-                nxt = low[i + len(needle):].split(" ", 1)[0]
+                if _aimed_elsewhere(low, i + 1):
+                    continue
+                rest = low[i + len(needle):]
+                nxt = rest.split(" ", 1)[0]
                 if nxt in _SELF_AIM:
+                    return True
+                if cls == "shutdown" and _DECLINE_AFTER_VERB_RE.match(rest):
                     return True
         return False
     except Exception:

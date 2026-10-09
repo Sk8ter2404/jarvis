@@ -31023,9 +31023,28 @@ def _check_and_arm_shutdown_prompt(text: str) -> bool:
     "JARVIS, shut down" / "shut down please" / "go offline now" all hit. Only
     fires when the utterance is short (≤ 6 words) to avoid catching casual
     mentions inside longer prose ("if I say shut down it should…").
+
+    A shutdown that already says no to the overnight protocol ("Jarvis shut
+    down with no overnight protocol.") asks nothing: it runs the full
+    shutdown the prompt's "No." would have (2026-10-06).
     """
     if not text:
         return False
+    # The overnight question already answered (live 2026-10-06): "Jarvis
+    # shut down with no overnight protocol." was 7 words, so it never got
+    # here, went to the model, and the shutdown it emitted was held for a
+    # yes. A whole utterance that is a shutdown of JARVIS saying no to the
+    # overnight protocol is exactly the prompt's "shut down" + "No." - so it
+    # does what that pair does. Strict shape (core/action_risk): negated,
+    # quoted or device sentences never match.
+    if _action_risk.shutdown_declining_overnight(text):
+        _shutdown_prompt_pending["armed"] = False
+        print("  [shutdown] shutdown with the overnight protocol declined "
+              "in the same breath — full shutdown")
+        try: _act_shutdown_jarvis()
+        except Exception as _e:
+            print(f"  [shutdown] _act_shutdown_jarvis failed: {_e}")
+        return True
     tl = text.strip().lower()
     if not tl or len(tl.split()) > 6:
         return False
@@ -31075,6 +31094,17 @@ def _handle_shutdown_prompt(text: str) -> bool:
     # Clear the flag eagerly so a second-arming or a re-entrant call can't
     # re-trigger this branch. Each dispatch path below is terminal.
     _shutdown_prompt_pending["armed"] = False
+    # "<command> no <thing>" / "without <thing>" is a NO (live 2026-10-06):
+    # "Jarvis shut down no overnight protocol." was read as unrelated (the
+    # "no" sat mid-sentence), the prompt was cancelled and the model then
+    # SAID it was powering down with nothing run. The whole reply must be
+    # that shape - see core/action_risk.shutdown_declining_overnight.
+    if _action_risk.shutdown_declining_overnight(tl, alone_ok=True):
+        print(f"  [shutdown] user declined overnight ('{tl}') — full shutdown")
+        try: _act_shutdown_jarvis()
+        except Exception as _e:
+            print(f"  [shutdown] _act_shutdown_jarvis failed: {_e}")
+        return True
     # Edge case: user repeats a shutdown phrase ('shut down... shut down').
     # Interpret as "yes, full shutdown — I'm insisting" rather than re-arming
     # the prompt and looping.
