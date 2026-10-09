@@ -2344,6 +2344,8 @@ def _probe_microphone() -> dict:
             or _owner_flag("_pathb_mic_active")
             or _owner_flag("_ambient_stream_active")   # refcount — truthy when > 0
             or _owner_flag("_enroll_capture_active")
+            # The mic bus's always-open stream (MIC_BUS_MODE, 2026-10-05).
+            or _owner_flag("_mic_bus_active")
             or _owner_flag("_tts_playback_active")
             # H-6 (2026-08-20): a native Pa_CloseStream handed to a daemon
             # whose caller already gave up waiting. The owner flag is down but

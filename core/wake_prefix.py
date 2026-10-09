@@ -43,12 +43,31 @@ the same as "what jarvis ..."), but it is read for one thing: whether the
 name is set off as a vocative. A possessive ("Jarvis's", "Jarvis'") is not
 the wake word in any form.
 
+"Hay" (2026-10-05). Parakeet writes "Hey Jarvis" as "Hay Jarvis": 18 of
+its 22 refusals on clean synthetic commands. "hay" is read exactly as
+"hey" (a legacy lead: no mention guard), and canonical_wake_text hands
+the line on as "Hey Jarvis ..." so every downstream "hey jarvis" stripper
+sees the form it knows. Fuzzy spellings of the NAME ("Jervis", "Jarva")
+stay out: they would widen the rule for every caller.
+
+Sentence re-anchor (2026-10-05, WAKE_REANCHOR_MODE). Over a video the
+owner speaks into a capture that is already running, so his "Jarvis, pause
+the music" lands behind the video's words and the whole line fails the
+rule above. reanchor() tries each later SENTENCE (split at . ! ?) and
+returns the first one that is addressed, with the rest of the line as the
+command. It never changes has_wake_prefix: the caller decides what to do
+with a re-anchored line (shadow counts, or a voice check and a fresh decode
+of the audio from the name before it is accepted - the monolith's
+_wake_reanchor).
+
 Public API (pure stdlib, never raises, safe on the light-deps CI runner):
     has_wake_prefix(text)  -> bool  the gate question
     strip_wake_lead(text)  -> str   the command with filler + wake removed
     canonical_wake_text(text) -> str  a filler-led wake rewritten to the
                                       plain "Jarvis ..." form every
                                       downstream handler already strips
+    reanchor(text) -> Reanchor | None  the first later sentence that is
+                                      addressed, for a line that is not
 """
 from __future__ import annotations
 
@@ -66,8 +85,8 @@ MAX_WAKE_POSITION = 3
 # mirrors this list in its standby guard; tests/test_wake_prefix.py pins the
 # two together.
 WAKE_LEAD_FILLERS = frozenset({
-    "what", "okay", "ok", "hey", "yo", "so", "um", "umm", "uh", "uhh",
-    "oh", "alright",
+    "what", "okay", "ok", "hey", "hay", "yo", "so", "um", "umm", "uh",
+    "uhh", "oh", "alright",
 })
 # Two-word interjections, each word counting toward MAX_WAKE_POSITION:
 # Whisper writes "alright" as "All right," about as often as not.
@@ -75,8 +94,14 @@ WAKE_LEAD_PHRASES = frozenset({("all", "right")})
 
 # The single-word leads that always passed ("hey Jarvis", "ok Jarvis",
 # "okay Jarvis"). Utterances in these legacy forms are never rewritten and
-# never mention-guarded, so their behaviour is exactly what it was.
-_LEGACY_LEADS = frozenset({"hey", "ok", "okay"})
+# never mention-guarded, so their behaviour is exactly what it was. "hay" is
+# Parakeet's spelling of "hey" (2026-10-05) and is read as "hey".
+_LEGACY_LEADS = frozenset({"hey", "hay", "ok", "okay"})
+
+# A legacy lead that is only a MISHEARING of another, and the word it is:
+# canonical_wake_text rewrites it so the handlers downstream (which strip
+# "hey jarvis", never "hay jarvis") see the form they know.
+_MISHEARD_LEADS = {"hay": "Hey"}
 
 # After a FILLER-led name these make it a third-person mention, not an
 # address. Only unambiguous reporting forms: an auxiliary ("is", "did",
@@ -270,7 +295,9 @@ def canonical_wake_text(text) -> str:
     Unchanged: text not addressed to JARVIS, the legacy forms ("Jarvis ...",
     "hey / ok / okay Jarvis ..."), and a name that ENDS the utterance
     ("Alright, Jarvis." — the lead IS the message there, a yes to a
-    question). Never raises."""
+    question). A misheard legacy lead is the one rewrite of a legacy form:
+    "Hay Jarvis, pause" -> "Hey Jarvis, pause" (_MISHEARD_LEADS). Never
+    raises."""
     try:
         hit = _addressed(text)
         if hit is None:
@@ -278,8 +305,78 @@ def canonical_wake_text(text) -> str:
         if not hit.leads:
             # No filler: only punctuation can sit before the name.
             return text[hit.start:] if text[:hit.start].strip() else text
+        if len(hit.leads) == 1 and hit.leads[0] in _MISHEARD_LEADS:
+            # "Hay Jarvis, ..." -> "Hey Jarvis, ..." (the lead was misheard).
+            return f"{_MISHEARD_LEADS[hit.leads[0]]} {text[hit.start:]}"
         if _is_legacy(hit.leads) or not hit.nxt:
             return text
         return text[hit.start:]
     except Exception:
         return text
+
+
+# ── sentence re-anchor (2026-10-05) ───────────────────────────────────────
+# A sentence ends at . ! ? or an ellipsis followed by whitespace. A decimal
+# ("3.5") or an abbreviation without a following space never splits.
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?…])[\"”’')\]]*\s+")
+
+
+class Reanchor(NamedTuple):
+    """A line re-anchored at a later sentence (see reanchor)."""
+    command: str      # the line from that sentence to its end
+    sentence: int     # which sentence (1 = the second; 0 never: the whole
+                      # line would have passed has_wake_prefix)
+    start_word: int   # index of the sentence's first word in text.split()
+    name_word: int    # index of the wake word in text.split()
+    words: int        # len(text.split()) - for the caller's timestamp check
+
+
+def _word_index(text: str, offset: int) -> int:
+    """How many whitespace-separated words of ``text`` start before
+    ``offset`` - the index, in text.split(), of the word at ``offset``."""
+    return sum(1 for _ in _TOKEN_RE.finditer(text[:max(0, offset)]))
+
+
+def reanchor(text) -> "Reanchor | None":
+    """For a line that is NOT addressed to JARVIS at its start
+    (has_wake_prefix False): the first later sentence - split at . ! ? - that
+    IS addressed, by the same rule, with the rest of the line as its command.
+    None when the line already passes (nothing to re-anchor), when no
+    sentence passes, or for anything that is not a string. A video's
+    "...that was close. Jarvis, pause the music." -> command "Jarvis, pause
+    the music.", sentence 1. The mention guards apply to each sentence as
+    they do to a whole line ("...and then. So Jarvis said no." stays
+    refused). Never raises."""
+    try:
+        if not isinstance(text, str) or has_wake_prefix(text):
+            return None
+        sentence = 0
+        for m in _SENTENCE_END_RE.finditer(text):
+            sentence += 1
+            start = m.end()
+            rest = text[start:]
+            if not rest.strip():
+                break
+            hit = _addressed(rest)
+            if hit is None:
+                continue
+            return Reanchor(rest, sentence, _word_index(text, start),
+                            _word_index(text, start + hit.start),
+                            len(text.split()))
+        return None
+    except Exception:
+        return None
+
+
+def name_word_index(text) -> "int | None":
+    """The index, in text.split(), of the wake word of a line addressed to
+    JARVIS at its start (has_wake_prefix), else None. The loopback veto
+    (D2) asks when the name was heard from the transcript's word times.
+    Never raises."""
+    try:
+        hit = _addressed(text)
+        if hit is None:
+            return None
+        return _word_index(text, hit.start)
+    except Exception:
+        return None
