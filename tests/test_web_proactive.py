@@ -100,6 +100,8 @@ NOT_PROACTIVE = {
     "KINECT_PRESENCE_ENABLED": "room-presence sensing; its behaviours are "
                                "the PRESENCE_STANDBY / _WAKE rows",
     "WAKE_WORD_AUTOSTART": "starts the wake-word detector (input)",
+    "WAKE_LISTENER_AUTOSTART": "starts the wake-listener skill's own "
+                               "detector stream (input, barge-in)",
     "ITUNES_AUTO_LAUNCH": "opens iTunes only when a music command needs it",
     "HOLOGRAPHIC_OVERLAY_AUTO_LAUNCH": _RETIRED,
     "HOLO_WORKSHOP_AUTO_ON_THINK": _RETIRED,

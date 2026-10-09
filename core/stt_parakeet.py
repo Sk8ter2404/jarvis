@@ -267,7 +267,52 @@ def transcribe(engine, audio, anchors=None, clock=time.perf_counter):
     text = " ".join(str(getattr(res, "text", "") or "").split())
     conf = map_conf(getattr(res, "logprobs", None) if text else (), anchors)
     conf.update(engine="parakeet", speech_s=speech_s, stt_ms=stt_ms)
+    wt = word_times(getattr(res, "tokens", None),
+                    getattr(res, "timestamps", None), text) if text else None
+    if wt is not None:
+        conf["word_t"] = wt
+        conf["n_words"] = len(text.split())
     return text, conf
+
+
+def word_times(tokens, timestamps, text) -> "list | None":
+    """When each word of ``text`` starts, from onnx-asr's per-token
+    timestamps: ``[[word_index, seconds], ...]`` for every whitespace word of
+    ``text`` (numbers only - no words), or None when the tokens do not line
+    up with those words.
+
+    onnx-asr joins the tokens (each word-initial piece begins with a space)
+    and drops a space that is not followed by a word character, so a
+    punctuation piece joins the word before it. A word therefore starts at
+    the first non-space character and at every word character that follows
+    a space. The wake re-anchor (core/wake_prefix.reanchor; the monolith's
+    _wake_reanchor) uses these to cut the audio at the name. Never raises."""
+    try:
+        if not tokens or timestamps is None:
+            return None
+        toks = [str(t) for t in tokens]
+        ts = [float(x) for x in timestamps]
+        if len(toks) != len(ts):
+            return None
+        owner = []                       # raw char -> token index
+        for k, t in enumerate(toks):
+            owner.extend([k] * len(t))
+        raw = "".join(toks)
+        starts = []
+        first = True
+        for p, ch in enumerate(raw):
+            if ch.isspace():
+                continue
+            if first:
+                starts.append(p)
+                first = False
+            elif raw[p - 1].isspace() and (ch.isalnum() or ch == "_"):
+                starts.append(p)
+        if len(starts) != len(str(text or "").split()):
+            return None
+        return [[i, round(ts[owner[p]], 3)] for i, p in enumerate(starts)]
+    except Exception:
+        return None
 
 
 # ── the rescue ────────────────────────────────────────────────────────────

@@ -302,7 +302,25 @@ _BLOCKED_MESSAGES.update({m: "WM_MOUSE" for m in range(0x0200, 0x020F)})
 _EFFECT_TARGETS = (
     ("core.media_now_playing", None, "_default_transport"),
     ("pycaw.utils", "AudioUtilities", "GetSpeakers"),
+    # A REAL microphone or loopback capture (2026-10-05, listening over
+    # media): a unit test must never open the owner's mic or record what his
+    # PC plays. sounddevice's InputStream (record_speech, the mic bus, every
+    # Path-B capture; sd.rec() opens one too), soundcard's recorder (the echo
+    # canceller's loopback, core/loopback_ref.py) and pyaudiowpatch's open
+    # (its fallback). A test that fakes the stream (mock.patch / a fake
+    # module) never reaches these.
+    ("sounddevice", None, "InputStream"),
+    ("soundcard.mediafoundation", "_Microphone", "recorder"),
+    ("soundcard.mediafoundation", "_Microphone", "record"),
+    ("pyaudiowpatch", "PyAudio", "open"),
 )
+# What each refused input-guard effect is, per module, for the refusal
+# line (falls back to _EFFECT_REASONS[guard]).
+_EFFECT_MODULE_REASONS = {
+    "sounddevice": "a real microphone capture (InputStream)",
+    "soundcard.mediafoundation": "a real microphone / loopback recording",
+    "pyaudiowpatch": "a real loopback / microphone stream",
+}
 _EFFECT_MODULES = frozenset(t[0] for t in _EFFECT_TARGETS)
 
 # The screen-capture entry points, wrapped the same way under the screen
@@ -1064,7 +1082,7 @@ def _wrap_effect(module, modname: str, cls_name, name: str,
     if _marked(real):
         return
     label = f"{modname}.{cls_name + '.' if cls_name else ''}{name}"
-    why = _EFFECT_REASONS[guard]
+    why = _EFFECT_MODULE_REASONS.get(modname) or _EFFECT_REASONS[guard]
     verdict = _verdict_for(modname, cls_name, name)
 
     def stub(*args, **kwargs):

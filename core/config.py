@@ -1051,6 +1051,58 @@ VOICE_ID_DEVICE            = "cpu"
 # would mean more deaf gaps (core/music_gate.py).
 MUSIC_GATE_MODE            = "shadow"
 
+# ─── Listening over videos (core/listen_media.py, 2026-10-05) ───────────
+# Over a video in wake-word mode his "Jarvis, ..." landed inside a capture
+# full of the video's words and was refused, the mic was closed between
+# captures and nothing cancelled what the PC played. Each stage has its own
+# switch ('off' | 'shadow' | 'on'; shadow = no change, numbers-only log
+# lines saying what 'on' would do):
+# WAKE_REANCHOR_MODE  a refused line is re-anchored at a later sentence led
+#   by the name; 'on' first cuts the audio at the name (its STT timing),
+#   checks it is not someone else's voice and re-decodes it.
+# WAKE_PREGATE_MODE   openWakeWord scores the mic: 'shadow' logs its scores
+#   (one line per accepted wake turn, one per media minute); 'on' (needs
+#   MIC_BUS_MODE) lets the name START a capture, confirmed by Parakeet.
+#   Ships 'off' (2026-10-09 review): 'shadow' loads openWakeWord into the
+#   live process (+~100 MB, sklearn and a second OpenMP runtime) - a native
+#   change that needs its own live canary before it runs at boot.
+#   WAKE_PREGATE_THRESHOLD is its trigger score (0.10-0.50).
+# MIC_BUS_MODE        'on' = one always-open mic stream with a 30 s ring
+#   instead of a stream per capture (no deaf gap between captures).
+# MEDIA_AEC_MODE      echo cancellation of what the PC plays (a loopback of
+#   the default speakers, held in RAM only, never saved): 'shadow' measures,
+#   'on' captures read the cancelled mic - only with MIC_BUS_MODE 'on' (a
+#   stream per capture re-anchors the canceller at every open, and its first
+#   frames still carry the video; without the bus 'on' measures only).
+# WAKE_LOOPBACK_VETO  a wake the video itself said ("Jarvis" in the PC's own
+#   audio within 1 s) is dropped ('on') or counted (needs MEDIA_AEC_MODE).
+#   Never dropped while the PC plays into a headset (no acoustic path, and a
+#   sidetone / monitor there can carry the owner's own voice).
+# WAKE_DUCK_MODE      'on' = after a confirmed wake, other apps duck to
+#   AUDIO_DUCKING_LEVEL for at most 8 s while he speaks.
+# WAKE_BARGEIN_MODE   'on' = saying "Jarvis" / "stop" over his own speech
+#   stops it (needs MIC_BUS_MODE and the pre-gate).
+WAKE_REANCHOR_MODE         = "shadow"
+WAKE_PREGATE_MODE          = "off"
+WAKE_PREGATE_THRESHOLD     = 0.15
+MIC_BUS_MODE               = "off"
+MEDIA_AEC_MODE             = "off"
+WAKE_LOOPBACK_VETO         = "shadow"
+WAKE_DUCK_MODE             = "off"
+WAKE_BARGEIN_MODE          = "off"
+# Constants, not in the Settings GUI. MEDIA_SEGMENT_S: with the bus on and
+# the echo not cancelled, a capture over media is cut every this many
+# seconds and the next starts 2 s earlier from the ring (0 = never).
+# MEDIA_AEC_BACKEND: 'nlms' (the built canceller); env
+# JARVIS_MEDIA_AEC_BACKEND overrides ('windows_comms' is an experiment this
+# build does not carry).
+MEDIA_SEGMENT_S            = 12.0
+MEDIA_AEC_BACKEND          = "nlms"
+# skills/wake_listener.py's own detector autostart (its own InputStream; off:
+# it collides with record_speech on the same WASAPI device). Its ONE default
+# (2026-10-05) - distinct from WAKE_WORD_AUTOSTART, the standby wake latch.
+WAKE_LISTENER_AUTOSTART    = False
+
 # Per-install speech-filter tuning. The Whisper gate thresholds depend on the
 # MICROPHONE, so an install whose mic differs from the desktop's overrides them
 # here (via user_settings.json) instead of editing core/speech_filter.py and

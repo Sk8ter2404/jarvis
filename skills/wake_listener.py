@@ -73,7 +73,22 @@ WAKE_WORD_USE_SILERO_VAD: bool = False
 # WASAPI cannot share an input device between two streams (raises
 # PortAudioError). User must opt in explicitly via wake_listener_start
 # (e.g. "jarvis, start listening for the wake word").
-WAKE_WORD_AUTOSTART: bool = False
+# The default lives in ONE place, core.config.WAKE_LISTENER_AUTOSTART
+# (2026-10-05, the stale-duplicate rule: two "autostart" knobs used to carry
+# their own defaults). It is NOT core.config.WAKE_WORD_AUTOSTART, the
+# standby wake latch. Voice barge-in through the always-open mic is
+# core.config.WAKE_BARGEIN_MODE (the host's pre-gate, no stream of its own).
+
+
+def _config_autostart() -> bool:
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "WAKE_LISTENER_AUTOSTART", False))
+    except Exception:
+        return False
+
+
+WAKE_WORD_AUTOSTART: bool = _config_autostart()
 
 # Voice biometric gating — verify the post-wake utterance matches the user's
 # enrolled voiceprint before triggering the proactive announce. Default
@@ -455,8 +470,23 @@ def _get_detector():
     return _detector
 
 
+def _host_mic_bus_open() -> bool:
+    """The host's always-open mic (MIC_BUS_MODE) holds the device: this
+    detector's own stream would be the WASAPI double open."""
+    bc = sys.modules.get("bobert_companion") or sys.modules.get("__main__")
+    fn = getattr(bc, "_mic_bus_open", None) if bc is not None else None
+    try:
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
 def wake_listener_start(_: str = "") -> str:
     """Start the wake-word detector. Idempotent."""
+    if _host_mic_bus_open():
+        return ("The always-open microphone holds the mic, sir - its own "
+                "wake-word detector does this job (WAKE_PREGATE_MODE, and "
+                "WAKE_BARGEIN_MODE for interrupting me).")
     with _lock:
         det = _get_detector()
         if det is None:

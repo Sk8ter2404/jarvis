@@ -456,6 +456,20 @@ class AmbientListenStateTests(unittest.TestCase):
             self.mod._maybe_nudge_wake("jarvis open my bookmarks")
         bc.proactive_announce.assert_not_called()
 
+    def test_an_awake_wake_match_reaches_the_host_books(self):
+        """Awake: no nudge, but the host's listening-over-media books hear
+        of it ("ambient heard the name, main dropped" - 2026-10-09 review:
+        nothing exercised this hook)."""
+        import re
+        bc = self._make_bc()
+        self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
+        self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = 0.0
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            self.mod._maybe_nudge_wake("jarvis pause the music")
+        bc._listen_ambient_wake_hit.assert_called_once_with()
+        bc.proactive_announce.assert_not_called()
+
     def test_maybe_nudge_silent_during_own_tts(self):
         # JARVIS's own voice echoing into the mic must not trip the nudge.
         import re

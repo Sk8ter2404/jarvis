@@ -14712,6 +14712,12 @@ def _refresh_devices(force: bool = False):
                     paused_det = det
             except Exception as e:
                 print(f"  [audio] wake-word pause failed: {e}")
+        # The mic bus (MIC_BUS_MODE, 2026-10-05) holds its stream open across
+        # captures, so a destructive reinit would be deferred for ever: when
+        # it is the ONLY owner, close it (bounded, through the owner gate) for
+        # the re-enumeration and reopen it after.
+        _bus_suspended = bool(not _sig_unchanged
+                              and _mic_bus_suspend_for_reinit())
 
         try:
             # Force PortAudio to re-enumerate so USB plug/unplug events
@@ -15063,6 +15069,8 @@ def _refresh_devices(force: bool = False):
         finally:
             if paused_det is not None:
                 _wake_word_resume_or_report(paused_det)
+            if _bus_suspended:
+                _mic_bus_resume_after_reinit()
 
 
 # A capture open that fails on a resolved index most often means PortAudio's
@@ -17900,7 +17908,8 @@ def _recover_from_main_loop_error(exc: BaseException) -> None:
 
 def _process_capture_chunk(chunk: np.ndarray,
                            sample_rate: int = SAMPLE_RATE,
-                           skip_ns: bool = False) -> np.ndarray:
+                           skip_ns: bool = False,
+                           media_aec: bool = False) -> np.ndarray:
     """Run a single mic chunk through the noise-cancel-1 pipeline (AEC →
     noise suppression → AGC). Falls through to the raw chunk when the
     processor module isn't available or any stage errors — VAD is run on
@@ -17911,14 +17920,19 @@ def _process_capture_chunk(chunk: np.ndarray,
     (noisereduce spectral gating) costs 1-2s of CPU per ~2.6s chunk — the
     caller passes True for clearly-silent idle chunks so the main loop
     isn't pinned processing guaranteed-discard audio (AEC/AGC still run so
-    their adaptive state stays warm across the silence)."""
+    their adaptive state stays warm across the silence).
+
+    media_aec: the chunk already went through the media echo canceller
+    (MEDIA_AEC_MODE 'on', 2026-10-05), which cancels JARVIS's own voice too
+    (it is in the loopback) - the 0.7x duck after his playback retires for
+    it; the self-echo filter (R9) stays the backstop."""
     if not _audio_master_enabled[0] or _audio_processor is None:
         return chunk
     try:
         proc = _audio_processor.get_processor(sample_rate)
         return proc.process(
             chunk,
-            enable_aec=bool(_audio_aec_enabled[0]),
+            enable_aec=bool(_audio_aec_enabled[0]) and not media_aec,
             enable_ns=bool(_audio_ns_enabled[0]) and not skip_ns,
             enable_agc=bool(_audio_agc_enabled[0]),
         )
@@ -18089,6 +18103,13 @@ _diag_capture_active = [0]
 # InputStream twin) is live. Enrolment runs on the main voice thread only, so
 # a plain boolean cell suffices. 2026-08-14.
 _enroll_capture_active = [False]
+# True while the mic bus (core/mic_bus.py, MIC_BUS_MODE 'on', 2026-10-05)
+# holds its ONE always-open InputStream - claimed by the bus's owner thread
+# through _pa_claim_owner BEFORE the open and released only AFTER the close,
+# exactly like record_speech's own cell. _refresh_devices suspends the bus
+# (closes the stream through _safe_close_stream) before a PortAudio
+# re-enumeration and resumes it after; it never re-enumerates under it.
+_mic_bus_active = [False]
 # COUNT of native Pa_CloseStream calls that have been handed to an ABANDONABLE
 # daemon thread (H-6, 2026-08-20). _safe_close_stream and play_with_lipsync
 # both hand the native close to a daemon and then park on a BOUNDED wait; when
@@ -18196,7 +18217,7 @@ def _pa_mic_capture_live() -> bool:
     _pa_streams_live so the owner list exists in exactly ONE place."""
     return bool(_record_speech_active[0] or _pathb_mic_active[0]
                 or _ambient_stream_active[0] or _diag_capture_active[0]
-                or _enroll_capture_active[0])
+                or _enroll_capture_active[0] or _mic_bus_active[0])
 
 
 def _pa_streams_live() -> bool:
@@ -18706,7 +18727,9 @@ def add_record_tap(q: "queue.Queue") -> bool:
     with _record_speech_taps_lock:
         if q not in _record_speech_taps:
             _record_speech_taps.append(q)
-    return bool(_record_speech_active[0])
+    # The mic bus (MIC_BUS_MODE) fans its frames out to the same taps,
+    # between captures too.
+    return bool(_record_speech_active[0]) or _mic_bus_open()
 
 
 def remove_record_tap(q: "queue.Queue") -> None:
@@ -18935,6 +18958,12 @@ def record_speech(timeout: float | None = None, *,
     _next_work_check = time.monotonic() + _WORK_CHECK_S
     peak_rms    = 0.0
     silent_peak = 0.0   # peak RMS while NOT recording (= ambient floor)
+    # Listening over media (2026-10-05): per-capture state for
+    # _capture_frame (the bus, the canceller, B2's seed, D1's re-seat) and a
+    # capture that must start on the next frame (a seed from the ring).
+    _cap_ctx: dict = {}
+    _force_trip = False
+    _seed_secs = 0.0
 
     audio_q: queue.Queue = queue.Queue()
     # An off-thread in-turn capture (a dashboard-run action asking the owner
@@ -18980,6 +19009,11 @@ def record_speech(timeout: float | None = None, *,
     # reinit gate then saw no owner (0xc0000374 window).
     _deny = ((lambda: bool(_record_speech_active[0])) if _offthread_claimed
              else _offthread_capture_holds_mic)
+    # A per-capture stream never opens beside the mic bus's (MIC_BUS_MODE
+    # just turned off: the bus closes within ~0.1 s; this cycle is skipped).
+    if not _bus_mode_on():
+        _deny_base = _deny
+        _deny = lambda: bool(_deny_base() or _mic_bus_active[0])  # noqa: E731
     if not _pa_claim_owner(_record_speech_active, deny_if=_deny):
         if _deny():
             print("  [record_speech] another capture holds the microphone — "
@@ -19007,11 +19041,28 @@ def record_speech(timeout: float | None = None, *,
     # the open (conservative: an earlier open can only widen what counts as
     # "heard while JARVIS was speaking").
     _se_open_ts = _self_echo.now()
+    # Listening over media (2026-10-05): with MIC_BUS_MODE 'on' this capture
+    # READS the always-open bus (core/mic_bus.py) instead of opening a stream
+    # of its own - audio_q becomes the bus subscription (same get / qsize),
+    # the pre-roll comes from the bus's ring, and a media segment (B2) or a
+    # confirmed wake (D1) can start the capture in the past. Off: exactly the
+    # per-capture stream below. See _bus_capture_open.
+    _bus_cap = _bus_capture_open(_in_dev) if _bus_mode_on() else None
+    if _bus_cap is False:
+        # The bus would not open: the claim above is dropped (no stream was
+        # ever ours) and the failure, if it was one, is booked (R10).
+        _record_speech_active[0] = False
+        return None
+    if _bus_cap is not None:
+        audio_q = _bus_cap["sub"]
+        _cap_ctx["bus"] = _bus_cap
     # Defense-in-depth against a stale cached mic index: even after
     # get_input_device() validates, the device can disappear between
     # that query and InputStream open. Catch PortAudioError and retry
     # once with device=None so we don't crash main().
     try:  # pragma: no cover - opens+starts a live PortAudio input stream (needs real mic)
+        if _bus_cap is not None:
+            raise _BusCaptureNoOpen()
         try:
             _record_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32",
@@ -19048,6 +19099,8 @@ def record_speech(timeout: float | None = None, *,
         # silently swap the cached mic for the system default) — the source of
         # truth for "what microphone are you using".
         _note_live_capture(_record_stream, _opened_dev)
+    except _BusCaptureNoOpen:
+        pass                    # the bus is open: nothing to open here
     except Exception as _open_exc:
         # Open (incl. the system-default retry) or start() failed: we never
         # got a RUNNING stream, so drop the ownership flag we claimed above
@@ -19069,6 +19122,17 @@ def record_speech(timeout: float | None = None, *,
         return None
     # The stream is open and running: a backoff episode (if any) is over.
     _input_open_succeeded()
+    # Echo cancellation on the per-capture stream (MEDIA_AEC_MODE, bus off):
+    # a new stream is a new canceller session. The bus does its own. And the
+    # time the mic was closed since the last capture's stream (the minute
+    # line's "mic closed", target 0 with the bus).
+    if _bus_cap is None:
+        _media_aec_new_session()
+        _closed_at = _mic_stream_closed_at[0]
+        if _closed_at is not None:
+            _listen_note("mic_closed_s",
+                         max(0.0, time.monotonic() - float(_closed_at)))
+            _mic_stream_closed_at[0] = None
     # Smart Turn (R7): this capture's hooks, built first thing inside the
     # try below (whose finally closes the stream and frees the mic, whatever
     # happens). How the capture ended, for its eot stat.
@@ -19139,6 +19203,14 @@ def record_speech(timeout: float | None = None, *,
             try:
                 data = audio_q.get(timeout=0.1)
             except queue.Empty:
+                # The bus closed under this capture (mute, device lost): end
+                # it as a closed stream would (2026-10-05).
+                if _bus_cap is not None and not _mic_bus_open():
+                    if recording:
+                        _eot_why = "bus"
+                        break
+                    _utterance_in_progress[0] = False
+                    return None
                 # No audio arrived in the last 100ms — check watchdog + timeout
                 if _watchdog_reset_signal.is_set():
                     print("  [record_speech] watchdog reset signalled — "
@@ -19161,16 +19233,69 @@ def record_speech(timeout: float | None = None, *,
             # and the 60s watchdog reset the loop mid-stream (the 2026-05-30
             # ~70s stall).
             _heartbeat()
+            # Listening over media (2026-10-05): what this frame is - the raw
+            # mic (health, the HUD), what joins the clip and what decides
+            # start / end (the echo-cancelled and residual-suppressed copies
+            # while MEDIA_AEC_MODE is 'on' and effective; the raw frame
+            # otherwise). A bus capture may also be seeded from the ring here
+            # (a media segment's overlap, B2) or re-seated at a confirmed
+            # wake (D1). See _capture_frame.
+            data, _keep, _det, _seed = _capture_frame(data, _cap_ctx)
+            if _seed is not None and not _seed["trip"]:
+                # A bus capture's pre-roll: the ring's audio just before it.
+                if not recording and not pre_ring:
+                    pre_ring = [_process_capture_chunk(c, SAMPLE_RATE,
+                                                       skip_ns=True)
+                                for c in _seed["chunks"]][-PRE_BUFFER:]
+                _seed = None
+            if _seed is not None:
+                _eot = None              # Smart Turn never saw the seed
+                _spec_stt_reset()
+                _seed_chunks = [_process_capture_chunk(c, SAMPLE_RATE)
+                                for c in _seed["chunks"]]
+                if recording:
+                    chunks = list(_seed_chunks)
+                    silence_n = 0
+                    record_start_ts = time.time() - _seed["secs"]
+                    _se_clip_ts = _seed["t0"]
+                    pre_samples = 0
+                else:
+                    pre_ring = list(_seed_chunks)
+                    _force_trip = True
+                    _seed_secs = float(_seed["secs"])
             # Hard utterance ceiling: if continuous above-threshold audio
             # kept us recording past the cap, finalize now and let whisper
             # sort it out, rather than recording until the watchdog fires.
-            if recording and (time.time() - record_start_ts) > MAX_RECORDING_SECS:
+            # A capture the wake word started (D1) over media the canceller
+            # is not cancelling is capped at PREGATE_CAP_S (anywhere else
+            # it ends on his silence like any capture).
+            _cap_s = (_lm.PREGATE_CAP_S if _cap_ctx.get("pregate_cap")
+                      else MAX_RECORDING_SECS)
+            if recording and (time.time() - record_start_ts) > _cap_s:
                 print(f"  [record_speech] max utterance "
-                      f"{MAX_RECORDING_SECS:.0f}s reached — finalizing")
+                      f"{_cap_s:.0f}s reached — finalizing")
                 _eot_why = "max"
                 break
+            # B2: over media, with the bus on and the echo not cancelled, a
+            # capture is cut every MEDIA_SEGMENT_S; the next one starts
+            # SEGMENT_OVERLAP_S before the cut, from the ring (no gap, no
+            # split command).
+            if (recording and _bus_cap is not None
+                    and not _cap_ctx.get("pregate")
+                    and len(chunks) * CHUNK / float(SAMPLE_RATE)
+                    > _segment_s() > 0
+                    and _segment_active_now()):
+                _segment_cut(_cap_ctx)
+                _eot_why = "segment"
+                break
 
-            rms = float(np.sqrt(np.mean(data ** 2)))
+            # Health / HUD / silent-mic read the RAW mic; the start / end
+            # decision reads _det (raw unless the canceller is effective).
+            raw_rms = float(np.sqrt(np.mean(data ** 2)))
+            rms = (raw_rms if _det is data
+                   else float(np.sqrt(np.mean(_det ** 2))))
+            if _force_trip:
+                rms = max(rms, VAD_THRESHOLD * 1.0001)
             if rms > peak_rms:
                 peak_rms = rms
 
@@ -19179,7 +19304,7 @@ def record_speech(timeout: float | None = None, *,
             now_ts = time.time()
             if HUD_ENABLED and (now_ts - _last_mic_hud_write[0]) > 0.1:
                 _last_mic_hud_write[0] = now_ts
-                level = min(1.0, rms / max(VAD_THRESHOLD * 4.0, 1e-4))
+                level = min(1.0, raw_rms / max(VAD_THRESHOLD * 4.0, 1e-4))
                 _write_hud_state(mic_level=level)
 
             # Surface VAD activity to skills/self_diagnostic. note_vad_poll
@@ -19194,7 +19319,7 @@ def record_speech(timeout: float | None = None, *,
             try:
                 from core import audio_processor as _ap_for_vad
                 _ap_for_vad.note_vad_poll(now_ts)
-                _ap_for_vad.note_raw_rms(rms, now_ts)
+                _ap_for_vad.note_raw_rms(raw_rms, now_ts)
                 if rms > VAD_THRESHOLD:
                     _ap_for_vad.note_vad_active(now_ts)
                 # Silent-mic health check: if raw RMS has been ≈0 for
@@ -19210,14 +19335,14 @@ def record_speech(timeout: float | None = None, *,
                     # _report_silent_mic owns the latch, the re-warn throttle
                     # and the spoken escalation.
                     _report_silent_mic(silent_age, now_ts)
-                elif rms > 1e-5 and _silent_mic_warned[0]:
+                elif raw_rms > 1e-5 and _silent_mic_warned[0]:
                     # Mic recovered — allow the warning to re-fire next
                     # time we drop silent for that long.
                     _silent_mic_warned[0] = False
                     _silent_mic_warned_at[0] = 0.0
                     _silent_mic_warned_device[0] = ""
                     print(f"  [vad] mic is audible again "
-                          f"(RMS {rms:.5f}) — silent-mic warning re-armed")
+                          f"(RMS {raw_rms:.5f}) — silent-mic warning re-armed")
             except Exception:
                 pass
 
@@ -19232,27 +19357,37 @@ def record_speech(timeout: float | None = None, *,
             # MainThread in spectral_gating_stationary, injected commands
             # starved 5+ min). AEC/AGC still run to keep their state warm;
             # full NS resumes the moment recording starts or rms rises.
+            # media_aec only when the canceller's frame is kept (so a
+            # stand-in with the old signature keeps working).
+            _pcc_kw = {"media_aec": True} if _keep is not data else {}
             processed = _process_capture_chunk(
-                data, SAMPLE_RATE,
-                skip_ns=(not recording and rms < VAD_THRESHOLD * 0.75))
+                _keep, SAMPLE_RATE,
+                skip_ns=(not recording and rms < VAD_THRESHOLD * 0.75),
+                **_pcc_kw)
             if rms > VAD_THRESHOLD:
                 if not recording:
                     recording = True
+                    _force_trip = False
                     # A real utterance is now in progress (cleared when its
                     # transcript is accepted or dropped) — the idle re-prime
                     # gate. _record_speech_active cannot serve: it is True
                     # for the whole idle listen.
                     _utterance_in_progress[0] = True
-                    record_start_ts = time.time()
+                    # A capture seeded from the bus's ring started that much
+                    # earlier (its cap counts from its first sample).
+                    record_start_ts = time.time() - _seed_secs
                     _se_vad_ts = _self_echo.now()
                     # The returned clip starts with the pre-roll ring plus
-                    # this tripping chunk — that far before the trip.
-                    _se_clip_ts = max(
-                        _se_open_ts,
-                        _se_vad_ts - (len(pre_ring) + 1) * CHUNK
-                        / float(SAMPLE_RATE or 16000))
-                    pre_samples = int(sum(np.asarray(c).size
-                                          for c in pre_ring))
+                    # this tripping chunk — that far before the trip. A bus
+                    # capture's pre-roll (or seed) can be older than its own
+                    # start: only a stream's own clip is clamped to its open.
+                    _se_clip_ts = (_se_vad_ts - (len(pre_ring) + 1) * CHUNK
+                                   / float(SAMPLE_RATE or 16000))
+                    if _bus_cap is None:
+                        _se_clip_ts = max(_se_open_ts, _se_clip_ts)
+                    pre_samples = (0 if _cap_ctx.get("seeded") else
+                                   int(sum(np.asarray(c).size
+                                           for c in pre_ring)))
                     chunks.extend(pre_ring)
                     # Smart Turn hears the clip from its first sample: the
                     # pre-roll joins it here, so it is fed here.
@@ -19279,7 +19414,7 @@ def record_speech(timeout: float | None = None, *,
                 if not recording and rms > silent_peak:
                     silent_peak = rms
                 pre_ring.append(processed.copy())
-                if len(pre_ring) > PRE_BUFFER:
+                if len(pre_ring) > PRE_BUFFER and not _force_trip:
                     pre_ring.pop(0)
                 if recording:
                     chunks.append(processed.copy())
@@ -19314,6 +19449,13 @@ def record_speech(timeout: float | None = None, *,
                               f"(threshold {VAD_THRESHOLD})")
                     return None
     finally:
+        # A bus capture closes only its subscription: the bus's stream stays
+        # open (MIC_BUS_MODE).
+        if _bus_cap is not None:
+            try:
+                _bus_cap["sub"].close()
+            except Exception:
+                pass
         # Close the stream BEFORE releasing mic ownership (2026-08-14): the
         # flag must cover the stream's whole native lifetime, or a reinit that
         # latches in the release→close gap runs Pa_Terminate while
@@ -19347,6 +19489,8 @@ def record_speech(timeout: float | None = None, *,
         # copy did not (stale-duplicate rule).
         try:
             _safe_close_stream(_record_stream)
+            if _bus_cap is None and _record_stream is not None:
+                _mic_stream_closed_at[0] = time.monotonic()
         finally:
             # Processing filler (2026-09-29): an in-turn capture (bambu setup
             # wizard, draft confirm) ending is turn activity — restart the
@@ -19372,6 +19516,16 @@ def record_speech(timeout: float | None = None, *,
     # Self-echo gate: publish this utterance's timing for _self_echo_ignored.
     _last_capture_window[0] = (_se_open_ts, _se_vad_ts, _self_echo.now(),
                                _se_clip_ts)
+    # Listening over media: how this capture started and ended, for the main
+    # loop (the wake duck's release, the minute line).
+    _pg = _cap_ctx.get("pregate")
+    if _bus_cap is not None and _cap_ctx.get("last_start") is not None:
+        _mic_bus_clip_end[0] = int(_cap_ctx["last_start"])
+    _last_capture_meta[0] = {
+        "pregate": bool(_pg),
+        "pregate_seq": int(_pg.get("seq", 0)) if isinstance(_pg, dict) else 0,
+        "why": _eot_why, "bus": _bus_cap is not None}
+    _listen_note("captures")
     _clip_out = np.concatenate(chunks).flatten()
     # R6 rescue: where the owner's speech starts in this clip.
     _last_capture_preroll[0] = (int(_clip_out.size), pre_samples)
@@ -19513,7 +19667,8 @@ def _get_mic_buffer_impl(seconds: float,
     # record_speech is live we either return its tapped audio or None
     # (skip this cycle); we deliberately do NOT fall through to Path B,
     # because Path B would re-introduce the competing open.
-    if _record_speech_active[0] and int(_record_speech_sr[0]) == target_sr:
+    if ((_record_speech_active[0] or _mic_bus_open())
+            and int(_record_speech_sr[0]) == target_sr):
         tap_q2: queue.Queue = queue.Queue()
         add_record_tap(tap_q2)
         tapped: list[np.ndarray] = []
@@ -19521,7 +19676,7 @@ def _get_mic_buffer_impl(seconds: float,
         deadline = time.time() + seconds + 1.0
         try:
             while got < need and time.time() < deadline:
-                if not _record_speech_active[0]:
+                if not (_record_speech_active[0] or _mic_bus_open()):
                     break   # record_speech closed the stream mid-tap
                 if _mic_muted[0]:
                     break   # Mute Mic landed mid-tap (2026-10-01)
@@ -19591,7 +19746,8 @@ def _get_mic_buffer_impl(seconds: float,
     # while the other stream was still live.
     if not _pa_claim_owner(_pathb_mic_active,
                            deny_if=lambda: bool(_record_speech_active[0]
-                                                or _pathb_mic_active[0])):
+                                                or _pathb_mic_active[0]
+                                                or _mic_bus_active[0])):
         return None
     try:
         # 2026-05-29 silent-crash fix: avoid `with sd.InputStream(...)`. Open the
@@ -20377,7 +20533,17 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
                             for s in segments) / n
             logprob   = sum(float(getattr(s, "avg_logprob", 0.0) or 0.0)
                             for s in segments) / n
-            return text, {"no_speech_prob": no_speech, "avg_logprob": logprob}
+            _conf = {"no_speech_prob": no_speech, "avg_logprob": logprob}
+            # The wake re-anchor's timing (A2, 2026-10-05): when each
+            # segment's first word was heard - numbers only, dropped when a
+            # replacement changed the word count.
+            _wt = _lm.segment_word_times(
+                [((getattr(s, "text", "") or "").strip(),
+                  getattr(s, "start", None)) for s in segments], text)
+            if _wt is not None:
+                _conf["word_t"] = _wt
+                _conf["n_words"] = len(text.split())
+            return text, _conf
 
         # openai-whisper path (legacy). Modern openai-whisper (v20250115+)
         # removed the fp16= kwarg — precision is now derived from the dtype
@@ -23901,9 +24067,18 @@ def _note_first_owner_turn_of_day(test_inject: bool = False) -> bool:
 def _note_turn_boundary() -> None:
     """Main loop, top of every iteration: the previous turn (if any) is over,
     and any capture that did not become a turn was dropped."""
+    # Listening over media (2026-10-05): the minute line, and the wake duck
+    # (D3) of the capture whose turn just ended goes back up.
+    _listen_tick()
+    _wake_duck_turn_over()
     if _turn_in_progress[0]:
         _turn_in_progress[0] = False
         _note_conversation_activity()
+        # The always-open mic (2026-10-09 review): the last capture became
+        # a turn, so a late wake confirm for a name in it is stale, and a
+        # media segment's overlap is not carried into the next capture (it
+        # would replay the command just acted on).
+        _listen_turn_taken()
     elif _utterance_in_progress[0]:
         _note_dropped_capture()
     _utterance_in_progress[0] = False
@@ -26588,6 +26763,31 @@ def request_tts_interrupt(source: str = "wake-word",
     return True
 
 
+class _BusBargeIn:
+    """The headset barge-in listener on the always-open mic (MIC_BUS_MODE):
+    the stream callback's own rule, fed the bus's raw frames on its DSP
+    thread (it only sets a flag) - no second stream on the device. close()
+    stops it; nothing native to free."""
+
+    def __init__(self, bus, cb):
+        self._bus = bus
+
+        def _fn(fr, _cb=cb):
+            raw = np.asarray(fr.raw, np.float32)
+            _cb(raw.reshape(-1, 1), len(raw), None, None)
+        self._fn = _fn
+        bus.add_listener(_fn)
+
+    def stop(self) -> None:
+        pass
+
+    def close(self) -> None:
+        try:
+            self._bus.remove_listener(self._fn)
+        except Exception:
+            pass
+
+
 def _start_barge_in_listener():
     """Open a mic InputStream that flags sustained speech during playback.
     The callback ONLY sets `_barge_in_interrupted = True`; calling sd.stop()
@@ -26617,6 +26817,13 @@ def _start_barge_in_listener():
 
     if _mic_input_disabled():
         return None
+    if _mic_bus_open():
+        # The mic bus holds the device (MIC_BUS_MODE): a second stream on it
+        # is the WASAPI double open, so the SAME rule runs on the bus's
+        # frames instead (2026-10-09 review: returning None here switched
+        # his headset barge-in off whenever the bus was on).
+        bus = _mic_bus_obj[0]
+        return _BusBargeIn(bus, cb) if bus is not None else None
     try:
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
@@ -26654,6 +26861,11 @@ class _AudioDucker:
         # does not swell back up (and restore's synchronous fade-up does not
         # stall) between two sentences of one reply. release() restores.
         self._holds = 0
+        # Holds taken under an OWNER name (2026-10-05, D3's wake duck): a
+        # per-owner count, so one owner's release can never drop another's
+        # hold (the shared-guard lesson). _holds counts every hold, named or
+        # not.
+        self._owner_holds: dict = {}
         # FILLER_DUCK_HOLD (speed plan R3, off by default): True once a duck()
         # has scanned the sessions while a hold is up. Every later duck()
         # under the same hold is then a no-op even when that scan matched
@@ -26661,17 +26873,38 @@ class _AudioDucker:
         # session scan. Cleared when the last hold is released.
         self._held_ducked = False
 
-    def hold(self) -> None:
+    def hold(self, owner: "str | None" = None,
+             exclusive: bool = False) -> bool:
+        """Take a hold (restore() is a no-op while any is up). ``owner``
+        names it (released only by release(owner)); ``exclusive``: at most
+        one hold per owner - False when that owner already holds one."""
         with self._lock:
+            if owner is not None:
+                if exclusive and self._owner_holds.get(owner, 0) > 0:
+                    return False
+                self._owner_holds[owner] = self._owner_holds.get(owner, 0) + 1
             self._holds += 1
+            return True
 
-    def release(self) -> None:
+    def release(self, owner: "str | None" = None) -> None:
+        """Give back one hold - ``owner``'s own (nothing when it holds
+        none), or an anonymous one. The last hold restores the volume,
+        unless JARVIS is speaking right now: his own playback's restore()
+        brings it back when he finishes (no swell under his voice)."""
         with self._lock:
+            if owner is not None:
+                n = self._owner_holds.get(owner, 0)
+                if n <= 0:
+                    return
+                if n == 1:
+                    self._owner_holds.pop(owner, None)
+                else:
+                    self._owner_holds[owner] = n - 1
             self._holds = max(0, self._holds - 1)
             last = self._holds == 0
             if last:
                 self._held_ducked = False
-        if last:
+        if last and not (owner is not None and _tts_playback_active[0]):
             self.restore()
 
     @classmethod
@@ -27317,7 +27550,9 @@ def _play_with_lipsync_body(audio: np.ndarray, sr: int):
         _tts_interrupt.clear()
         # Ensure HUD doesn't show stale amplitude after playback
         _write_hud_state(tts_amplitude=0.0)
-        if barge_stream is not None:
+        if isinstance(barge_stream, _BusBargeIn):
+            barge_stream.close()            # a bus listener: no native close
+        elif barge_stream is not None:
             _safe_close_stream(barge_stream)
         # Release the TTS-playback claim only NOW — after the barge-in
         # stream's native close — so the flag covers its whole native lifetime
@@ -35258,6 +35493,12 @@ def _wake_lead_canonical(text: str) -> str:
     words. Never raises."""
     try:
         out = _wake_prefix.canonical_wake_text(text)
+        if (isinstance(out, str) and out and out != text
+                and _wake_prefix.name_word_index(text) == 1
+                and str(text).strip().lower().startswith("hay")):
+            # Parakeet's "Hay Jarvis" read as "Hey Jarvis" (2026-10-05):
+            # counted for the minute line, never the words.
+            _listen_note("hay_leads")
         if isinstance(out, str) and out and out != text:
             print(f"  [wake] lead before the wake word dropped "
                   f"({len(text or '')} -> {len(out)} chars)")
@@ -35680,7 +35921,8 @@ _music_counter = _music_gate.MinuteCounter()
 # The last music-mode reading (monotonic time, verdict, meter peak, room
 # music). Refreshed at most every _MUSIC_STATE_TTL_S by whichever thread asks
 # first; a thread that finds a refresh in flight uses the cached verdict.
-_music_state = {"at": None, "music": False, "peak": None, "room": False}
+_music_state = {"at": None, "music": False, "peak": None, "room": False,
+                "playing": False}
 _music_state_lock = threading.Lock()
 _MUSIC_STATE_TTL_S = 2.0
 _music_vid_seen = [None]     # core.voice_id.identify_calls at the last tick
@@ -35721,7 +35963,31 @@ def _music_read_state() -> dict:
         playing=playing, standby=bool(st.get("standby")),
         wake_mode=bool(st.get("wake_mode")),
         music_refuse=bool(st.get("music_refuse")))
-    return {"music": bool(music), "peak": peak, "room": room}
+    return {"music": bool(music), "peak": peak, "room": room,
+            "playing": bool(playing)}
+
+
+def _music_state_refresh() -> None:
+    """Refresh _music_state when it is older than _MUSIC_STATE_TTL_S (one
+    thread at a time; a thread that finds a refresh in flight keeps the
+    cached reading). The one reading behind _music_now and
+    _pc_media_playing (listening over media, 2026-10-05). Never raises."""
+    try:
+        at = _music_state["at"]
+        if at is not None and time.monotonic() - at < _MUSIC_STATE_TTL_S:
+            return
+        if _music_state_lock.acquire(blocking=False):
+            try:
+                try:
+                    _music_state.update(_music_read_state())
+                except Exception:
+                    _music_state.update(music=False, peak=None,
+                                        room=False, playing=False)
+                _music_state["at"] = time.monotonic()
+            finally:
+                _music_state_lock.release()
+    except Exception:
+        pass
 
 
 def _music_now(refresh: bool = True) -> bool:
@@ -35731,19 +35997,8 @@ def _music_now(refresh: bool = True) -> bool:
     try:
         if _music_gate_mode() == "off":
             return False
-        at = _music_state["at"]
-        if refresh and (at is None
-                        or time.monotonic() - at >= _MUSIC_STATE_TTL_S):
-            if _music_state_lock.acquire(blocking=False):
-                try:
-                    try:
-                        _music_state.update(_music_read_state())
-                    except Exception:
-                        _music_state.update(music=False, peak=None,
-                                            room=False)
-                    _music_state["at"] = time.monotonic()
-                finally:
-                    _music_state_lock.release()
+        if refresh:
+            _music_state_refresh()
         music = bool(_music_state["music"])
         if music:
             _music_counter.mark_music()
@@ -35915,6 +36170,1444 @@ def _music_gate_ambient_done(gate, kept: bool = False, wake: bool = False,
                 _music_note("lost_ambient_wake")
             if speaker and speaker[0]:
                 _music_note("lost_ambient_named")
+    except Exception:
+        pass
+
+
+# ── listening over media (core/listen_media.py, 2026-10-05) ───────────────
+# Owner, 10-05 ~02:00: "he's constantly listening, especially when videos are
+# playing, and he can't hear me - even in wake word mode." Captures filled
+# with video and ran to 30 s, the positional wake rule refused his name behind
+# the video's words, the mic was closed between captures and nothing cancelled
+# what the PC played. The stages (each behind its own setting, all numbers-only
+# in the log) are described in core/listen_media.py; this section is their
+# wiring:
+#   A2 _wake_reanchor           WAKE_REANCHOR_MODE (the refusal site)
+#   A3 _pregate_*               WAKE_PREGATE_MODE 'shadow' (the record tap)
+#   B1 _mic_bus_*               MIC_BUS_MODE (record_speech reads the bus)
+#   B2 _segment_*               MEDIA_SEGMENT_S (record_speech)
+#   C1 _media_aec_*             MEDIA_AEC_MODE (+ core/loopback_ref.py)
+#   D1 _pregate_confirm_*       WAKE_PREGATE_MODE 'on' (needs the bus)
+#   D2 _wake_veto*              WAKE_LOOPBACK_VETO (needs the loopback)
+#   D3 _wake_duck_*             WAKE_DUCK_MODE
+#   D5 _bargein_*               WAKE_BARGEIN_MODE (needs the bus)
+from core import listen_media as _lm  # noqa: E402
+from core import wake_pregate as _wake_pregate_mod  # noqa: E402
+
+_listen_counter = _lm.MinuteCounter()
+_ambient_match = _lm.AmbientMatch()
+_listen_aec_frames = {"raw": 0, "sup": 0, "n": 0}   # frames over VAD, shadow
+_listen_lock = threading.Lock()
+_aec_backend_said = [False]
+_aec_ref_missing = [False]          # media plays, the loopback hears nothing
+_aec_ref_quiet_since = [None]
+_aec_tts_device_checked = [False]
+
+
+def _reanchor_mode() -> str:
+    return _lm.mode3(globals().get("WAKE_REANCHOR_MODE",
+                                    _lm.DEFAULTS["WAKE_REANCHOR_MODE"]))
+
+
+def _pregate_mode() -> str:
+    return _lm.mode3(globals().get("WAKE_PREGATE_MODE",
+                                    _lm.DEFAULTS["WAKE_PREGATE_MODE"]))
+
+
+def _aec_mode() -> str:
+    """MEDIA_AEC_MODE ('off' | 'shadow' | 'on'); the env var
+    JARVIS_MEDIA_AEC_MODE wins when it names one."""
+    env = os.environ.get("JARVIS_MEDIA_AEC_MODE", "").strip().lower()
+    if env in _lm.MODES3:
+        return env
+    return _lm.mode3(globals().get("MEDIA_AEC_MODE",
+                                    _lm.DEFAULTS["MEDIA_AEC_MODE"]))
+
+
+def _aec_backend() -> str:
+    """MEDIA_AEC_BACKEND ('nlms' | 'windows_comms'), env
+    JARVIS_MEDIA_AEC_BACKEND first (the CAMERA_BACKEND pattern). Only 'nlms'
+    is built: 'windows_comms' (C3, Windows' communications-mode capture) is
+    an experiment that needs the owner's consented A/B (OD-4) and reads as
+    'nlms' with one log line."""
+    v = (os.environ.get("JARVIS_MEDIA_AEC_BACKEND", "")
+         or str(globals().get("MEDIA_AEC_BACKEND",
+                                _lm.DEFAULTS["MEDIA_AEC_BACKEND"]))).strip().lower()
+    if v == "windows_comms" and not _aec_backend_said[0]:
+        _aec_backend_said[0] = True
+        print("  [media-aec] MEDIA_AEC_BACKEND 'windows_comms' is an "
+              "experiment this build does not carry (OD-4) - using 'nlms'")
+    return "nlms"
+
+
+def _veto_mode() -> str:
+    return _lm.mode3(globals().get("WAKE_LOOPBACK_VETO",
+                                    _lm.DEFAULTS["WAKE_LOOPBACK_VETO"]))
+
+
+def _duck_mode() -> str:
+    return _lm.mode2(globals().get("WAKE_DUCK_MODE",
+                                    _lm.DEFAULTS["WAKE_DUCK_MODE"]))
+
+
+def _bus_mode_on() -> bool:
+    return _lm.mode2(globals().get("MIC_BUS_MODE",
+                                    _lm.DEFAULTS["MIC_BUS_MODE"])) == "on"
+
+
+def _bargein_bus_on() -> bool:
+    return _lm.mode2(globals().get("WAKE_BARGEIN_MODE",
+                                    _lm.DEFAULTS["WAKE_BARGEIN_MODE"])) == "on"
+
+
+def _segment_s() -> float:
+    try:
+        return max(0.0, float(globals().get("MEDIA_SEGMENT_S",
+                                           _lm.DEFAULTS["MEDIA_SEGMENT_S"])
+                             or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _pregate_threshold() -> float:
+    return _lm.threshold_setting(globals().get("WAKE_PREGATE_THRESHOLD",
+                                               _lm.DEFAULTS[
+                                                   "WAKE_PREGATE_THRESHOLD"]))
+
+
+# ── the per-minute listening line ─────────────────────────────────────────
+def _listen_note(kind: str, n: float = 1) -> None:
+    """Count one listening-over-media event (core/listen_media
+    MinuteCounter). Never raises."""
+    try:
+        _listen_counter.note(kind, n)
+    except Exception:
+        pass
+
+
+def _listen_tick() -> None:
+    """Print the minute line(s) when a minute that had media is over: the
+    listening counters, and with MEDIA_AEC_MODE on/shadow the canceller's
+    numbers. Also settles the "ambient heard the name, main dropped" books
+    and the mic-closed time, and (MEDIA_AEC_MODE not 'off') checks the
+    canceller's reference (_media_aec_check_reference). Called from the main
+    loop's turn boundary (_note_turn_boundary). Never raises."""
+    try:
+        now = time.monotonic()
+        if _aec_mode() != "off":
+            _media_aec_check_reference()
+        # Media: the shared reading when something refreshed it, or the
+        # playback meter the media probe read for the last capture (never a
+        # new meter read on this thread).
+        _probe = _media_probe[0]
+        _probed = bool(
+            _probe and _probe["done"].is_set()
+            and _probe.get("peak") is not None
+            and _media_gate.audio_playing(
+                _probe.get("peak"), False,
+                threshold=float(MEDIA_VOICE_GATE_PEAK)))
+        if _pc_media_playing(refresh=False) or _probed:
+            _listen_counter.mark_media()
+        lost = _ambient_match.settle(now)
+        if lost:
+            _listen_note("ambient_main_dropped", lost)
+        bus = _mic_bus_obj[0]
+        if bus is not None:
+            closed = bus.take_closed_s()
+            if closed > 0:
+                _listen_note("mic_closed_s", float(closed))
+        aec = _media_aec_obj[0]
+        if aec is not None:
+            erle = aec.erle_db()
+            if erle is not None:
+                _listen_counter.gauge("erle_db", erle)
+        pg = _pregate_obj[0]
+        if pg is not None:
+            _pregate_attach()          # follows a MIC_BUS_MODE flip
+        line = _listen_counter.tick()
+        if not line:
+            return
+        print(f"  {line}")
+        if pg is not None and pg.trigger is not None:
+            ev = pg.trigger.take_events()
+            floods = int(pg.trigger.flooded)
+            new_floods = floods - int(getattr(pg, "_floods_said", 0))
+            pg._floods_said = floods
+            print("  [wake-pregate] " + _pregate_mode() + ": events a minute "
+                  "at thresholds " + ", ".join(
+                      f"{thr:.2f}: {ev.get(thr, 0)}"
+                      for thr in _lm.SHADOW_THRESHOLDS)
+                  + f" (cpu {pg.status().get('cpu_s_per_audio_s')} s/s"
+                  + (f"; {new_floods} flood(s) - over "
+                     f"{_lm.PREGATE_RATE_PER_MIN} triggers a minute, the "
+                     f"threshold rose {_lm.PREGATE_BUMP:.2f} for "
+                     f"{_lm.PREGATE_BUMP_S:.0f} s" if new_floods else "")
+                  + ")")
+        if aec is not None and _aec_mode() != "off":
+            st = aec.status()
+            with _listen_lock:
+                fr = dict(_listen_aec_frames)
+                _listen_aec_frames.update(raw=0, sup=0, n=0)
+            n = max(1, fr["n"])
+            print(f"  [media-aec] {_aec_mode()}: erle "
+                  f"{st.get('erle_db')} dB, delay {st.get('delay_ms')} ms, "
+                  f"drift {st.get('drift_ppm')} ppm, "
+                  f"{'converging' if st.get('converging') else 'NOT converging'}"
+                  f", frames over VAD raw {100.0 * fr['raw'] / n:.1f} % / "
+                  f"cancelled {100.0 * fr['sup'] / n:.1f} %"
+                  + ("" if not _aec_ref_missing[0]
+                     else " - reference MISSING (protected playback?)"))
+    except Exception:
+        pass
+
+
+def _listen_ambient_wake_hit() -> None:
+    """skills/ambient_listen: its batch had the wake word while JARVIS was
+    awake (it logs it and leaves the turn to the main loop). Counted against
+    the main loop's accepted wake turns (AmbientMatch). Never raises."""
+    try:
+        _ambient_match.ambient_hit(time.monotonic())
+    except Exception:
+        pass
+
+
+# ── the shared media test (the music gate's reading) ──────────────────────
+_MUSIC_STATE_STALE_S = 10.0
+
+
+def _pc_media_playing(refresh: bool = True) -> bool:
+    """The PC (or the room) is playing audio: the music gate's own reading -
+    the playback meter at or over MEDIA_VOICE_GATE_PEAK (JARVIS's process
+    excluded), the media session when the meter is unreadable, or sustained
+    room music - cached for _MUSIC_STATE_TTL_S, read whatever
+    MUSIC_GATE_MODE says. The ONE media test of the music gate, B2's
+    segments, the echo canceller's missing-reference check and D3.
+    ``refresh`` False reads only what another thread refreshed; a reading
+    older than _MUSIC_STATE_STALE_S (nothing has refreshed it - the music
+    gate off, no ambient listener) is "not playing", never a stale "yes".
+    Never raises."""
+    try:
+        if refresh:
+            _music_state_refresh()
+        at = _music_state.get("at")
+        if at is None or time.monotonic() - float(at) > _MUSIC_STATE_STALE_S:
+            return False
+        return bool(_music_state.get("playing"))
+    except Exception:
+        return False
+
+
+# ── C1: echo cancellation of what the PC plays ───────────────────────────
+_media_aec_obj: list = [None]
+_loopback_obj: list = [None]
+_media_aec_build_lock = threading.Lock()
+
+
+def _media_aec_get():
+    """The canceller (core/audio_processor.MediaEchoCanceller) with its
+    loopback reference (core/loopback_ref.LoopbackReference), built and the
+    loopback started on first use while MEDIA_AEC_MODE is not 'off' (OD-2:
+    nothing records the PC's playback otherwise); paused again when the mode
+    goes 'off'. None when off or unavailable. Never raises."""
+    try:
+        if _aec_mode() == "off":
+            lb = _loopback_obj[0]
+            if lb is not None and lb.running:
+                lb.pause()
+            return None
+        aec = _media_aec_obj[0]
+        if aec is None:
+            with _media_aec_build_lock:
+                aec = _media_aec_obj[0]
+                if aec is None:
+                    _aec_backend()
+                    from core import loopback_ref as _lbr
+                    from core import audio_processor as _ap_mod
+                    lb = _lbr.LoopbackReference()
+                    aec = _ap_mod.MediaEchoCanceller(lb, SAMPLE_RATE)
+                    _loopback_obj[0] = lb
+                    _media_aec_obj[0] = aec
+                    print(f"  [media-aec] {_aec_mode()}: echo cancellation of "
+                          f"the PC's playback (loopback in RAM only)"
+                          + ("" if _aec_mode() != "on" or _bus_mode_on()
+                             else " - with MIC_BUS_MODE 'off' it only "
+                                  "measures; captures decide on the raw "
+                                  "mic"))
+        lb = _loopback_obj[0]
+        if lb is not None and not lb.running:
+            lb.start()
+        return aec
+    except Exception:
+        return None
+
+
+def _media_aec_bypass() -> str:
+    """Why the canceller must not run now ('' = it may): 'headset' - the
+    PC plays into a headset, there is no acoustic path (the auto-switch's
+    headset name, or a headset-like endpoint name); 'no loopback' - the
+    reference has not started. Never raises."""
+    try:
+        lb = _loopback_obj[0]
+        if lb is None or lb.n_written <= 0:
+            return "no loopback"
+        if _lm.output_is_headset(lb.endpoint,
+                                 globals().get("AUDIO_AUTOSWITCH_HEADSET", "")):
+            return "headset"
+        return ""
+    except Exception:
+        return "no loopback"
+
+
+def _loopback_stale() -> bool:
+    """The loopback reader has delivered nothing for LOOPBACK_STALE_S (or
+    never): soundcard pads a silent endpoint with zeros by the clock, so a
+    live reader never goes this quiet - a stalled or dead one does, and its
+    last LOUD second would otherwise read as a present reference for ever
+    (2026-10-09 review). Never raises (True)."""
+    try:
+        lb = _loopback_obj[0]
+        if lb is None:
+            return True
+        age = lb.age_s()
+        return age is None or float(age) > _lm.LOOPBACK_STALE_S
+    except Exception:
+        return True
+
+
+def _media_aec_effective() -> bool:
+    """MEDIA_AEC_MODE 'on' AND the canceller is actually cancelling (not
+    bypassed, its reference present and fresh) AND the mic bus is on. The
+    B2 segments and the D3 duck stand in when it is not.
+
+    The bus is required (2026-10-09 review): a stream per capture is a new
+    canceller session at every open, and the first frames after each re-
+    anchor still carry the video - 21 of 23 synthetic reopens crossed the
+    capture threshold, and the closed-mic gaps between captures lost 7-11
+    of 36 commands (58-69 % accepted against 92-97 % for one continuous
+    session). With MIC_BUS_MODE 'off' the canceller only measures.
+    Never raises."""
+    try:
+        if _aec_mode() != "on" or _media_aec_obj[0] is None:
+            return False
+        if not _bus_mode_on():
+            return False
+        if _media_aec_bypass() or _aec_ref_missing[0] or _loopback_stale():
+            return False
+        st = _media_aec_obj[0].status()
+        return bool(st.get("converging", True))
+    except Exception:
+        return False
+
+
+def _media_aec_check_reference() -> None:
+    """Failure mode 7 / 9: media plays (the meter) but the loopback hears
+    nothing for 5 s - protected (DRM) playback, an exclusive-mode app, the
+    wrong endpoint - is logged once per episode and the canceller counts as
+    not effective; the first time the loopback opens, a TTS device that is
+    not the looped endpoint is logged once (the self-echo filter, R9, keeps
+    covering JARVIS's own voice either way). Never raises."""
+    try:
+        lb = _loopback_obj[0]
+        if lb is None or not lb.running:
+            return
+        if not _aec_tts_device_checked[0] and lb.endpoint:
+            _aec_tts_device_checked[0] = True
+            # The output JARVIS last picked, by name (no PortAudio call).
+            name = str(_device_cache.get("last_out_name") or "")
+            if name and lb.endpoint and not (
+                    name.lower()[:20] in lb.endpoint.lower()
+                    or lb.endpoint.lower()[:20] in name.lower()):
+                print("  [media-aec] JARVIS speaks on a device that is not "
+                      "the one the canceller listens to - his own voice "
+                      "stays covered by the self-echo filter only")
+        # The one media reading (a meter read at most every
+        # _MUSIC_STATE_TTL_S, only while the canceller is on).
+        playing = _pc_media_playing(refresh=True)
+        # Quiet = the last second written is silent, OR the reader has
+        # written nothing for LOOPBACK_STALE_S (a stalled / dead reader
+        # keeps its last loud second for ever - 2026-10-09 review).
+        quiet = _loopback_stale() or lb.rms_recent(1.0) < 1e-5
+        now = time.monotonic()
+        if playing and quiet:
+            if _aec_ref_quiet_since[0] is None:
+                _aec_ref_quiet_since[0] = now
+            elif (not _aec_ref_missing[0]
+                  and now - _aec_ref_quiet_since[0] >= 5.0):
+                _aec_ref_missing[0] = True
+                print("  [media-aec] the PC is playing audio the loopback "
+                      "cannot hear (protected playback?) - no echo "
+                      "cancellation for it; segments and the wake duck "
+                      "stand in")
+        else:
+            _aec_ref_quiet_since[0] = None
+            if _aec_ref_missing[0] and not quiet:
+                _aec_ref_missing[0] = False
+                print("  [media-aec] the loopback hears the PC's audio again")
+    except Exception:
+        pass
+
+
+def _media_aec_chunk(chunk, t=None):
+    """Run one capture chunk through the canceller (bus off: record_speech
+    calls this per chunk). (lin, sup, use): ``use`` True = MEDIA_AEC_MODE
+    'on' and the canceller is effective, so the capture keeps ``lin`` and
+    decides on ``sup``; False = the caller keeps the raw chunk (it only
+    measures). Effective needs the bus (_media_aec_effective), so on this
+    per-capture path it always measures only. Never raises."""
+    try:
+        aec = _media_aec_get()
+        if aec is None or _media_aec_bypass():
+            return chunk, chunk, False
+        lin, sup = aec.process(chunk, t)
+        _media_aec_count(chunk, sup)
+        if aec.take_not_converging():
+            print("  [media-aec] AEC not converging (ERLE under 10 dB for "
+                  "60 s) - the mic passes through until it recovers")
+        return lin, sup, _media_aec_effective()
+    except Exception:
+        return chunk, chunk, False
+
+
+def _media_aec_count(raw, sup) -> None:
+    """Shadow statistics: 64 ms frames over VAD_THRESHOLD, raw vs
+    cancelled, while media plays. Never raises."""
+    try:
+        if not _pc_media_playing(refresh=False):
+            return
+        thr = float(VAD_THRESHOLD)
+        r = float(np.sqrt(np.mean(np.square(raw, dtype=np.float64))))
+        c = float(np.sqrt(np.mean(np.square(sup, dtype=np.float64))))
+        with _listen_lock:
+            _listen_aec_frames["n"] += 1
+            _listen_aec_frames["raw"] += int(r > thr)
+            _listen_aec_frames["sup"] += int(c > thr)
+    except Exception:
+        pass
+
+
+# ── B1: the mic bus ───────────────────────────────────────────────────────
+_mic_bus_obj: list = [None]
+_mic_bus_build_lock = threading.Lock()
+# B2: the next capture starts here (a bus sample index), 2 s before the cut
+# of a media segment; (index, monotonic time of the cut) or None.
+_mic_bus_carry: list = [None]
+
+
+class _BusUnavailable(RuntimeError):
+    """The bus is suspended / off: skip this capture cycle, book nothing."""
+
+
+def _mic_bus_open_stream(device, callback):
+    """The bus's stream: the same InputStream record_speech opens (MME, the
+    selected index, 1024-sample blocks), with its one system-default retry.
+    Runs on the bus's owner thread. Returns (stream, the device it really
+    opened on - None after the system-default retry, so the bus tries the
+    selected mic again later: core/mic_bus FALLBACK_RETRY_S). Raises on
+    failure (booked by the capture that asked)."""
+    try:
+        st = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                            dtype="float32", blocksize=1024, device=device,
+                            callback=callback)
+        opened = device
+    except sd.PortAudioError as e:
+        if device is None:
+            raise
+        _note_input_open_failure("mic bus", device, e,
+                                 then="retrying with the system default")
+        st = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                            dtype="float32", blocksize=1024, device=None,
+                            callback=callback)
+        opened = None
+    try:
+        st.start()
+    except BaseException:
+        _safe_close_stream(st)
+        raise
+    _note_live_capture(st, opened)
+    return st, opened
+
+
+def _mic_bus_claim() -> bool:
+    """The bus's PortAudio owner claim: refused while a Path-B / dialogue /
+    enrolment / probe capture holds the device (two streams on one WASAPI
+    mic is the ~70 s stall) or a reinit is in flight."""
+    return _pa_claim_owner(
+        _mic_bus_active,
+        deny_if=lambda: bool(_pathb_mic_active[0] or _enroll_capture_active[0]
+                             or _diag_capture_active[0]))
+
+
+def _mic_bus_should_run() -> bool:
+    return bool(_bus_mode_on() and not _mic_muted[0]
+                and not _mic_input_disabled())
+
+
+def _jarvis_audible_now() -> bool:
+    """JARVIS's own playback is live, or ended under PLAYBACK_TAIL_S ago
+    (any thread's: core/self_echo's registry, plus the main loop's own
+    playback flag). Never raises (False)."""
+    try:
+        if _tts_playback_active[0]:
+            return True
+        end = _self_echo.last_playback_end()
+        return (end is not None
+                and _self_echo.now() - float(end) < _lm.PLAYBACK_TAIL_S)
+    except Exception:
+        return False
+
+
+def _mic_bus_tap_allowed() -> bool:
+    """The legacy record taps (the ambient listener, get_mic_buffer) get
+    the bus's frames except while a private in-turn capture runs off the
+    main thread (the printer wizard's access code: 2026-10-01 review), the
+    mic is muted, or JARVIS himself is audible (2026-10-09 review: with a
+    stream per capture no tap frame ever arrived during his main-loop
+    speech; the always-open bus would hand his own voice to the ambient
+    listener, which transcribes and keeps it for the learners)."""
+    return not (_offthread_capture_holds_mic() or _mic_muted[0]
+                or _jarvis_audible_now())
+
+
+def _mic_bus_tap_fanout(fr) -> None:
+    """The bus's frame to the legacy record taps (the ambient listener,
+    get_mic_buffer, the bus-off pre-gate tap): the echo-cancelled copy only
+    while MEDIA_AEC_MODE is 'on' and effective - 'shadow' changes nothing a
+    consumer hears."""
+    _fanout_record_frame(fr.lin if (fr.aec and _media_aec_effective())
+                         else fr.raw)
+
+
+def _mic_bus_process(mono, t):
+    """The bus's DSP hook: the canceller on every frame while
+    MEDIA_AEC_MODE is not 'off' (shadow measures; 'on' is used by
+    record_speech), None otherwise (lin = sup = raw). For the first
+    MEDIA_AEC_SETTLE_S after the canceller (re)anchors - a reopened stream,
+    dropped frames, a reference gap - the suppressed copy is silence: its
+    output still carries the video then, and it decides when a capture
+    starts (2026-10-09 review)."""
+    aec = _media_aec_get()
+    if aec is None or _media_aec_bypass():
+        return None
+    lin, sup = aec.process(mono, t)
+    try:
+        if aec.settling(len(mono)):
+            sup = np.zeros_like(sup)
+    except Exception:
+        pass
+    _media_aec_count(mono, sup)
+    return lin, sup
+
+
+def _mic_bus_on_reopen() -> None:
+    aec = _media_aec_obj[0]
+    if aec is not None:
+        aec.new_session()
+
+
+def _mic_bus_get():
+    """The mic bus (core/mic_bus.MicBus), built on first use while
+    MIC_BUS_MODE is 'on'; None otherwise. Never raises."""
+    try:
+        if not _bus_mode_on():
+            bus = _mic_bus_obj[0]
+            if bus is not None:
+                bus.wake()          # it closes itself (should_run False)
+            return None
+        bus = _mic_bus_obj[0]
+        if bus is None:
+            with _mic_bus_build_lock:
+                bus = _mic_bus_obj[0]
+                if bus is None:
+                    from core import mic_bus as _mb
+                    bus = _mb.MicBus(
+                        open_stream=_mic_bus_open_stream,
+                        close_stream=_safe_close_stream,
+                        claim=_mic_bus_claim,
+                        release=lambda: _pa_release_owner(_mic_bus_active),
+                        should_run=_mic_bus_should_run,
+                        process=_mic_bus_process,
+                        tap_fanout=_mic_bus_tap_fanout,
+                        tap_allowed=_mic_bus_tap_allowed,
+                        on_reopen=_mic_bus_on_reopen,
+                        sample_rate=SAMPLE_RATE, chunk=1024)
+                    _mic_bus_obj[0] = bus
+                    _pregate_attach()
+                    print("  [mic-bus] on: one always-open microphone stream "
+                          "with a 30 s ring")
+        return bus
+    except Exception:
+        return None
+
+
+def _mic_bus_open() -> bool:
+    """True while the bus holds an open stream (its frames reach the record
+    taps, so get_mic_buffer taps it and never opens a second stream)."""
+    bus = _mic_bus_obj[0]
+    try:
+        return bus is not None and bus.is_open()
+    except Exception:
+        return False
+
+
+def _mic_bus_suspend_for_reinit() -> bool:
+    """_refresh_devices wants PortAudio torn down and the bus is the only
+    mic owner: close it (bounded) so the reinit can run. True = suspended
+    (the caller MUST _mic_bus_resume_after_reinit). Never raises."""
+    try:
+        bus = _mic_bus_obj[0]
+        if bus is None or not _mic_bus_active[0]:
+            return False
+        if (_record_speech_active[0] or _pathb_mic_active[0]
+                or _ambient_stream_active[0] or _diag_capture_active[0]
+                or _enroll_capture_active[0] or _tts_playback_active[0]):
+            return False            # deferred anyway: leave the bus alone
+        bus.suspend()
+        return True
+    except Exception:
+        return False
+
+
+def _mic_bus_resume_after_reinit() -> None:
+    try:
+        bus = _mic_bus_obj[0]
+        if bus is not None:
+            bus.resume()
+    except Exception:
+        pass
+
+
+# ── A3 / D1 / D2 / D5: the wake pre-gate ─────────────────────────────────
+_pregate_obj: list = [None]       # the mic worker (PregateWorker)
+_loopveto_obj: list = [None]      # the loopback worker
+_pregate_build_lock = threading.Lock()
+# D1's state, written by the confirm worker, read by record_speech:
+# {"n0": bus index the cut starts at, "t": hit time, "ok": confirmed,
+#  "seq": n}; None = nothing pending.
+_pregate_hit: list = [None]
+_pregate_seq = [0]
+_pregate_confirm_q: "queue.Queue" = queue.Queue(maxsize=4)
+_pregate_confirm_thread: list = [None]
+
+
+def _pregate_get():
+    """The mic pre-gate worker while WAKE_PREGATE_MODE is not 'off' (built
+    and attached on first use); None otherwise. Never raises."""
+    try:
+        if _pregate_mode() == "off" and not _bargein_bus_on():
+            return None
+        pg = _pregate_obj[0]
+        if pg is None:
+            with _pregate_build_lock:
+                pg = _pregate_obj[0]
+                if pg is None:
+                    pg = _wake_pregate_mod.PregateWorker(
+                        "mic", track=_lm.ScoreTrack(),
+                        trigger=_lm.PregateTrigger(_pregate_threshold()),
+                        on_trigger=_pregate_on_trigger,
+                        active=lambda: (_pregate_mode() != "off"
+                                        or _bargein_bus_on()))
+                    _pregate_obj[0] = pg
+                    pg.start()
+                    _pregate_attach()
+                    print(f"  [wake-pregate] {_pregate_mode()}: openWakeWord "
+                          f"scores the mic (numbers only)")
+        return pg
+    except Exception:
+        return None
+
+
+def _pregate_attach() -> None:
+    """Feed the pre-gate from where the mic is: the bus (its suppressed
+    signal, C2) while the bus is on, else the record tap (record_speech's
+    raw frames - no new stream). Idempotent. Never raises."""
+    try:
+        pg = _pregate_obj[0]
+        if pg is None:
+            return
+        bus = _mic_bus_obj[0]
+        if bus is not None and _bus_mode_on():
+            # Never both: the bus also feeds the record taps.
+            remove_record_tap(pg.tap)
+            if not getattr(pg, "_bus_listening", False):
+                # The suppressed copy only while the canceller is 'on' and
+                # effective (C2); 'shadow' changes nothing it hears.
+                bus.add_listener(lambda fr: pg.feed(
+                    fr.sup if (fr.aec and _media_aec_effective()) else fr.raw,
+                    fr.t))
+                pg._bus_listening = True
+        else:
+            # The bus is off (or never built): the record tap, idempotent.
+            add_record_tap(pg.tap)
+    except Exception:
+        pass
+
+
+def _loopveto_get():
+    """D2's loopback worker: the same detector on what the PC plays, fed
+    from the loopback ring while it is not silent. Needs the loopback
+    (MEDIA_AEC_MODE not 'off', OD-2). None otherwise. Never raises."""
+    try:
+        if _veto_mode() == "off" or _media_aec_get() is None:
+            return None
+        lv = _loopveto_obj[0]
+        if lv is None:
+            with _pregate_build_lock:
+                lv = _loopveto_obj[0]
+                if lv is None:
+                    lv = _wake_pregate_mod.PregateWorker(
+                        "loopback", track=_lm.ScoreTrack(),
+                        active=lambda: _veto_mode() != "off")
+                    _loopveto_obj[0] = lv
+                    lv.start()
+                    t = threading.Thread(target=_loopveto_pump,
+                                         name="wake-veto-pump", daemon=True)
+                    t.start()
+        return lv
+    except Exception:
+        return None
+
+
+def _loopveto_pump() -> None:
+    """Never exits: every 80 ms hands the loopback's new samples to the
+    veto detector - only while it is not silent (the CPU is spent only
+    while the PC plays)."""
+    last = None
+    while True:
+        try:
+            time.sleep(0.08)
+            lb, lv = _loopback_obj[0], _loopveto_obj[0]
+            if lb is None or lv is None or not lb.running:
+                last = None
+                continue
+            end = lb.n_written
+            if last is None or end - last > lb.sr * 2 or end < last:
+                last = end
+                continue
+            n = end - last
+            if n <= 0:
+                continue
+            x = lb.read(last, n)
+            last = end
+            if x is None:
+                continue
+            if float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) < 1e-4:
+                continue
+            t = lb.age_s()
+            lv.feed(x, time.monotonic() - (t or 0.0))
+        except Exception:
+            time.sleep(0.5)
+
+
+def _wake_vetoed(t_name: "float | None", site: str) -> bool:
+    """D2: True (drop it) when WAKE_LOOPBACK_VETO is 'on' and the PC's own
+    audio scored the wake word within VETO_WINDOW_S of ``t_name`` (a
+    monotonic time). 'shadow' counts what 'on' would veto and returns
+    False. Never raises (no veto)."""
+    try:
+        mode = _veto_mode()
+        if mode == "off" or t_name is None:
+            return False
+        lv = _loopveto_get()
+        if lv is None:
+            return False
+        if not _lm.vetoed_by(lv.track, float(t_name)):
+            return False
+        if _media_aec_bypass() == "headset":
+            # The PC plays into a headset: no acoustic path, so the name in
+            # its audio cannot be what the mic heard - and a headset is
+            # where a sidetone / "Listen to this device" / OBS monitor puts
+            # HIS OWN voice into that audio (2026-10-09 review, finding 12:
+            # the veto would drop his "Jarvis"). Counted, never dropped.
+            _listen_note("veto_headset")
+            return False
+        if mode == "shadow":
+            _listen_note("would_veto")
+            print(f"  [wake-veto] shadow: the PC's audio said the name "
+                  f"within {_lm.VETO_WINDOW_S:.0f} s ({site}) - 'on' would "
+                  f"drop it")
+            return False
+        _listen_note("vetoes")
+        print(f"  [wake-veto] the PC's audio said the name ({site}) - "
+              f"not the owner, dropped")
+        return True
+    except Exception:
+        return False
+
+
+def _pregate_on_trigger(t_hit: float, score: float) -> None:
+    """The mic detector crossed its threshold (the worker's thread). In
+    'on' with the bus open: queue the confirm (D1). During JARVIS's own
+    speech with WAKE_BARGEIN_MODE on: the barge-in confirm (D5). Shadow
+    only counts. Never raises."""
+    try:
+        _listen_note("pregate_hits")
+        bus = _mic_bus_obj[0]
+        speaking = bool(_tts_playback_active[0] or _tts_reply_active[0])
+        if speaking and not (_bargein_bus_on() and score >= 0.5):
+            return
+        if not speaking and _pregate_mode() != "on":
+            return
+        if bus is None or not bus.is_open():
+            return
+        try:
+            _pregate_confirm_q.put_nowait((float(t_hit), float(score),
+                                           speaking))
+        except queue.Full:
+            return
+        t = _pregate_confirm_thread[0]
+        if t is None or not t.is_alive():
+            t = threading.Thread(target=_pregate_confirm_loop,
+                                 name="wake-confirm", daemon=True)
+            _pregate_confirm_thread[0] = t
+            t.start()
+    except Exception:
+        pass
+
+
+def _bus_index_at(bus, t: float) -> "int | None":
+    """The bus sample index heard at monotonic ``t`` (from its newest
+    frame); None before any frame."""
+    try:
+        n_end = bus.n_written
+        st = bus.last_frame_time()
+        if st is None:
+            return None
+        return int(n_end - (st - float(t)) * SAMPLE_RATE)
+    except Exception:
+        return None
+
+
+def _pregate_confirm_loop() -> None:
+    """Never exits: confirms each pre-gate hit with Parakeet on the first
+    CONFIRM_S of its cut (from PREGATE_PREROLL_S before the hit), which must
+    pass the wake rule (D1) - or, during JARVIS's speech, the wake rule or a
+    stop word (D5). A confirmed D1 hit is handed to record_speech
+    (_pregate_hit), ducks media (D3) and logs the owner-voice score (D4);
+    a failed one is dropped silently and counted."""
+    while True:
+        try:
+            t_hit, score, speaking = _pregate_confirm_q.get()
+            _pregate_confirm_one(t_hit, score, speaking)
+        except Exception:
+            time.sleep(0.1)
+
+
+def _pregate_confirm_one(t_hit: float, score: float, speaking: bool) -> str:
+    """One pre-gate hit (the confirm worker's body). Returns what happened:
+    'vetoed', 'confirmed', 'dropped', 'barge-in', 'no-barge-in' or 'skip'.
+    Never raises ('skip')."""
+    try:
+        bus = _mic_bus_obj[0]
+        if bus is None:
+            return "skip"
+        if _wake_vetoed(t_hit, "pre-gate"):
+            return "vetoed"
+        n_hit = _bus_index_at(bus, t_hit)
+        if n_hit is None:
+            return "skip"
+        pre = int(_lm.PREGATE_PREROLL_S * SAMPLE_RATE)
+        n0 = n_hit - pre
+        n1 = n0 + int(_lm.CONFIRM_S * SAMPLE_RATE)
+        deadline = time.monotonic() + _lm.CONFIRM_S + 1.0
+        while bus.n_written < n1 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        kind = "lin" if _media_aec_effective() else "raw"
+        cut = bus.read(kind, n0, min(n1, bus.n_written))
+        if cut is None or cut.size < int(0.5 * SAMPLE_RATE):
+            _listen_note("pregate_drops")
+            return "dropped"
+        peak = float(np.sqrt(np.mean(np.square(cut, dtype=np.float64))))
+        audio, _g = apply_capture_auto_gain(cut, peak)
+        text, _conf = _wake_confirm_decode(audio)
+        ok = _text_has_wake_prefix(text)
+        if speaking:
+            if (ok or _wake_confirm_stop_word(text)) and request_tts_interrupt(
+                    "bus-wake", acoustic=True):
+                _listen_note("bargeins")
+                return "barge-in"
+            return "no-barge-in"
+        if not ok:
+            _listen_note("pregate_drops")
+            return "dropped"
+        _listen_note("pregate_confirms")
+        _pregate_seq[0] += 1
+        _pregate_hit[0] = {"n0": int(n0), "n_hit": int(n_hit),
+                           "t": float(t_hit), "ok": True,
+                           "seq": _pregate_seq[0], "score": float(score)}
+        _wake_duck_start()
+        if _wake_duck_timer[0] is not None:
+            _wake_duck_seq[0] = _pregate_seq[0]
+        try:
+            voice, vscore, _how = _owner_voice_over_media(cut, SAMPLE_RATE)
+            print(f"  [wake-pregate] confirmed a wake at score {score:.2f}; "
+                  f"owner voice {float(vscore or 0.0):.2f} ({voice}, D4 "
+                  f"shadow)")
+        except Exception:
+            pass
+        return "confirmed"
+    except Exception:
+        return "skip"
+
+
+def _wake_confirm_decode(audio):
+    """Parakeet on a short cut (the confirm / re-anchor decode); Whisper
+    when Parakeet is not loaded or latched off. (text, conf); never
+    raises (('', {}))."""
+    try:
+        if _stt_alt is not None and not _parakeet_latch.failed:
+            text, conf = _parakeet_decode(audio, wait_for_load=False)
+            return _parakeet_post_text(text), conf
+    except Exception:
+        pass
+    try:
+        return transcribe(audio)
+    except Exception:
+        return "", {}
+
+
+def _wake_confirm_stop_word(text: str) -> bool:
+    try:
+        from core import device_speech_filter as _dsf
+        return bool(_dsf.has_stop_word(text))
+    except Exception:
+        return False
+
+
+def _pregate_take_hit(after_seq: int) -> "dict | None":
+    """The newest confirmed D1 hit newer than ``after_seq`` (consumed), or
+    None."""
+    h = _pregate_hit[0]
+    if h is None or int(h.get("seq", 0)) <= int(after_seq):
+        return None
+    _pregate_hit[0] = None
+    return h
+
+
+def _pregate_turn_peak(clip_t0: "float | None", text: str) -> None:
+    """A3 shadow: an accepted wake-word turn - log the pre-gate's highest
+    score in [capture start - 1 s, + 3 s] and the form ("hey" / "plain"),
+    numbers only. Never raises."""
+    try:
+        pg = _pregate_obj[0]
+        if pg is None or clip_t0 is None:
+            return
+        peak = pg.track.max_between(clip_t0 - _lm.TURN_PEAK_BEFORE_S,
+                                    clip_t0 + _lm.TURN_PEAK_AFTER_S)
+        if peak is None:
+            return
+        low = (text or "").strip().lower()
+        form = "hey" if re.match(r"^\W*h[ae]y\b", low) else "plain"
+        print(f"  [wake-pregate] {_pregate_mode()}: accepted wake turn - peak "
+              f"score {peak:.2f} (form {form})")
+    except Exception:
+        pass
+
+
+# ── D3: duck the media after a confirmed wake ────────────────────────────
+_wake_duck_timer: list = [None]
+_WAKE_DUCK_OWNER = "wake"
+
+
+def _wake_duck_start() -> None:
+    """WAKE_DUCK_MODE 'on': hold the media duck (AUDIO_DUCKING_LEVEL) under
+    its own owner from the confirmed wake; released at the next turn
+    boundary (the reply has played: the TTS duck took over without a swell
+    in between) or by an independent DUCK_CAP_S timer, whichever is first.
+    Never with the output on a headset. Never raises."""
+    try:
+        if _duck_mode() != "on":
+            return
+        lb = _loopback_obj[0]
+        if lb is not None and _lm.output_is_headset(
+                lb.endpoint, globals().get("AUDIO_AUTOSWITCH_HEADSET", "")):
+            return
+        if not _audio_ducker.hold(owner=_WAKE_DUCK_OWNER, exclusive=True):
+            return
+        _audio_ducker.duck()
+        _listen_note("ducks")
+        t = threading.Timer(_lm.DUCK_CAP_S, _wake_duck_end)
+        t.daemon = True
+        _wake_duck_timer[0] = t
+        t.start()
+    except Exception:
+        pass
+
+
+def _wake_duck_end() -> None:
+    """Release the wake duck (idempotent: only its own owner's hold)."""
+    try:
+        t, _wake_duck_timer[0] = _wake_duck_timer[0], None
+        if t is not None:
+            t.cancel()
+        _audio_ducker.release(owner=_WAKE_DUCK_OWNER)
+    except Exception:
+        pass
+
+
+# ── A2: the sentence re-anchor ───────────────────────────────────────────
+def _capture_clip_t0() -> "float | None":
+    """Monotonic time of the first sample of the last capture
+    (_last_capture_window's clip start; the self-echo clock is
+    monotonic)."""
+    try:
+        w = _last_capture_window[0]
+        return None if w is None else float(w[3])
+    except Exception:
+        return None
+
+
+def _name_time(conf, word_index: int) -> "float | None":
+    """Monotonic time the word at ``word_index`` of this capture's
+    transcript was heard (its STT timing), or None."""
+    try:
+        t0 = _capture_clip_t0()
+        if t0 is None or not isinstance(conf, dict):
+            return None
+        for i, ts in conf.get("word_t") or ():
+            if int(i) == int(word_index):
+                return t0 + float(ts)
+        return None
+    except Exception:
+        return None
+
+
+def _wake_reanchor(text: str, conf) -> "str | None":
+    """A2 at the wake-word-mode refusal: the first later sentence of
+    ``text`` that is addressed to JARVIS (core/wake_prefix.reanchor).
+
+      'shadow': nothing changes - one numbers-only line per would-accept
+                (sentence, word position of the name, capture length, the
+                owner-voice score, whether media played) and a counter.
+      'on'    : the audio from the name minus REANCHOR_PAD_S (its STT
+                timing; none = no re-anchor) must not be confidently someone
+                else (the media gate's check and floor), the loopback must
+                not have said the name (D2, when on), and Parakeet's fresh
+                decode of it must pass the wake rule at its start. Then that
+                decode is the turn's text and the cut its audio.
+
+    Returns the new text, or None (stay refused). Never raises."""
+    try:
+        mode = _reanchor_mode()
+        if mode == "off":
+            return None
+        r = _wake_prefix.reanchor(text)
+        if r is None:
+            return None
+        audio, sr = _last_capture_audio, int(_last_capture_sr or 0)
+        cap_s = (len(audio) / float(sr)) if (audio is not None and sr) else 0.0
+        media = _pc_media_playing(refresh=False)
+        if mode == "shadow":
+            _listen_note("reanchor_would")
+            score = 0.0
+            if audio is not None and sr > 0:
+                _v, score, _how = _owner_voice_over_media(audio, sr,
+                                                          remember=True)
+            print(f"  [wake-reanchor] shadow: sentence {r.sentence} would "
+                  f"start the command (name at word {r.name_word + 1} of "
+                  f"{r.words}, capture {cap_s:.1f} s, owner voice "
+                  f"{float(score or 0.0):.2f}, media "
+                  f"{'yes' if media else 'no'})")
+            return None
+        cut_s = _lm.reanchor_cut_s(r, conf)
+        why = ""
+        if cut_s is None:
+            why = "no word timing"
+        elif audio is None or sr <= 0:
+            why = "no audio"
+        elif ((_last_capture_meta[0] or {}).get("why") == "segment"
+              and cap_s - (float(cut_s) + _lm.REANCHOR_PAD_S)
+              < _lm.SEGMENT_OVERLAP_S):
+            # A media segment cut this capture and the name sits in the
+            # overlap the next capture starts with: taken there, whole (here
+            # it may be cut mid-command, and taking both would run it twice).
+            why = "in the next segment"
+        if not why:
+            cut = audio[int(cut_s * sr):]
+            if len(cut) < int(0.4 * sr):
+                why = "too short"
+        if not why:
+            voice, score, _how = _owner_voice_over_media(cut, sr)
+            if voice == _learn_gate_mod.NOT_OWNER:
+                why = f"voice {float(score or 0.0):.2f}"
+        if not why and _wake_vetoed(_name_time(conf, r.name_word),
+                                    "re-anchor"):
+            why = "vetoed"
+        if not why:
+            peak = float(np.sqrt(np.mean(np.square(cut, dtype=np.float64))))
+            dec, _g = apply_capture_auto_gain(cut, peak)
+            new_text, _c = _wake_confirm_decode(dec)
+            if not _text_has_wake_prefix(new_text):
+                why = "re-decode"
+        if why:
+            _listen_note("reanchor_failed")
+            print(f"  [wake-reanchor] sentence {r.sentence} not taken "
+                  f"({why}; capture {cap_s:.1f} s)")
+            return None
+        _listen_note("reanchor_on")
+        # The veto already ran on its name; the A3 turn peak is read around
+        # where the re-anchored command starts, not the whole capture's.
+        _t0 = _capture_clip_t0()
+        _reanchor_taken[0] = {"t0": (_t0 + float(cut_s)
+                                     if _t0 is not None else None)}
+        globals()["_last_capture_audio"] = cut
+        print(f"  [wake-reanchor] took sentence {r.sentence}: the command "
+              f"starts {cut_s:.1f} s into a {cap_s:.1f} s capture "
+              f"({len(new_text)} chars)")
+        return new_text
+    except Exception:
+        return None
+
+
+def _listen_turn_taken() -> None:
+    """Turn boundary, the previous capture became a turn: its bus audio is
+    spent (see _mic_bus_turn_end) and no segment carry outlives it. Never
+    raises."""
+    try:
+        _mic_bus_turn_end[0] = _mic_bus_clip_end[0]
+        if _mic_bus_carry[0] is not None:
+            _mic_bus_carry[0] = None
+            _listen_note("carry_dropped")
+    except Exception:
+        pass
+
+
+# ── record_speech's listening-over-media hooks (2026-10-05) ─────────────
+_last_capture_meta: list = [None]
+# When the last per-capture stream closed (monotonic), or None: the gap to
+# the next open is time the mic heard nothing.
+_mic_stream_closed_at: list = [None]
+
+
+class _BusCaptureNoOpen(Exception):
+    """record_speech internal: a bus capture skips the stream open."""
+
+
+def _media_aec_new_session() -> None:
+    """A new per-capture stream: the canceller re-anchors. Never raises."""
+    try:
+        aec = _media_aec_obj[0]
+        if aec is not None:
+            aec.new_session()
+    except Exception:
+        pass
+
+
+def _bus_capture_open(device):
+    """record_speech with MIC_BUS_MODE 'on': the bus open on ``device`` and
+    a subscription to read. Returns a dict (the capture reads it), False
+    (no capture this cycle: the bus is muted / suspended / its claim was
+    refused - nothing booked - or the open FAILED - booked with the R10
+    back-off exactly like a failed stream), or None (the bus could not even
+    be built: the per-capture stream opens instead). Never raises."""
+    try:
+        bus = _mic_bus_get()
+        if bus is None:
+            return None
+        ok, err = bus.ensure(device)
+        if not ok:
+            from core import mic_bus as _mb
+            if isinstance(err, _mb.BusOpenStalled):
+                _bus_open_stalled(bus, err, device)
+                return False
+            if err is None or isinstance(err, _mb.BusUnavailable):
+                time.sleep(0.1)          # never a hot loop
+                return False
+            if _is_input_open_error(err):
+                _usb_storm_note_audio_drop("input")
+            _input_open_failed(err, device)
+            return False
+        _input_open_succeeded()
+        carry = _mic_bus_carry[0]
+        _mic_bus_carry[0] = None
+        if carry is not None and time.monotonic() - float(carry[1]) > 10.0:
+            carry = None
+        return {"bus": bus, "sub": bus.subscribe(), "carry": carry,
+                "first": True}
+    except Exception:
+        return None
+
+
+def _bus_open_stalled(bus, err, device) -> None:
+    """The bus's stream open has not returned (the driver holds its owner
+    thread): nothing is heard until it does. Booked with the R10 back-off
+    (the next attempts are paced; a summary each minute), logged on its
+    first and summary attempts, and - once it has lasted
+    MIC_SILENT_WARN_SECONDS - SPOKEN through the silent-mic warning (its own
+    throttle), because it takes away the owner's way of asking. The bus's
+    owner cell stays claimed meanwhile: a native open is in flight, so no
+    PortAudio reinit may run under it (2026-10-09 review: it used to be a
+    silent 0.1 s skip, every capture, for ever). Never raises."""
+    try:
+        now = _input_backoff_now()
+        st = _input_open_backoff.note_failure(now, f"{type(err).__name__}: "
+                                                   f"{err}")
+        try:
+            stalled = float(bus.open_stalled_s() or 0.0)
+        except Exception:
+            stalled = float(getattr(err, "stalled_s", 0.0) or 0.0)
+        if st.get("log") in ("first", "summary"):
+            print(f"  [mic-bus] the microphone open on device {device!r} has "
+                  f"not returned for {stalled:.0f} s - nothing is heard until "
+                  f"it does (the driver holds the bus's own thread; the main "
+                  f"loop keeps running). {st.get('attempts')} attempt(s); "
+                  f"next in {float(st.get('delay') or 0.0):.1f} s, a summary "
+                  f"each minute")
+        if stalled >= float(MIC_SILENT_WARN_SECONDS):
+            _report_silent_mic(stalled, time.time())
+    except Exception:
+        pass
+
+
+def _bus_chunks(bus, kind: str, start: int, stop: int):
+    """Ring samples [start, stop) as capture-sized (1024) chunks - from
+    the oldest still in the ring when ``start`` is older - or None when
+    there are none."""
+    start = max(int(start), int(bus.oldest()))
+    if int(stop) <= start:
+        return None
+    x = bus.read(kind, start, int(stop))
+    if x is None or x.size == 0:
+        return None
+    return [x[k:k + 1024] for k in range(0, len(x), 1024)]
+
+
+def _capture_frame(item, ctx):
+    """One item off record_speech's queue -> (raw, keep, det, seed):
+
+      raw   the mic as recorded (health, the HUD, the silent-mic check);
+      keep  what joins the clip: the echo-cancelled (linear) frame while
+            MEDIA_AEC_MODE is 'on' and the canceller is effective, else raw
+            (STT and voice-ID get the linear output, never the suppressed);
+      det   what decides start / end and the capture's peak: the
+            residual-suppressed frame then, else raw;
+      seed  None, or audio from the bus's ring the capture starts with:
+            {"chunks", "secs", "t0", "trip"} - the pre-roll of a bus capture
+            (trip False), the overlap of a media segment (B2) or the audio
+            from a confirmed wake (D1, trip True: the capture starts there).
+
+    A per-capture stream (bus off) hands raw ndarrays; the canceller runs
+    here in mode shadow / on. A bus capture hands core/mic_bus Frames.
+    Never raises (raw, raw, raw, None)."""
+    try:
+        cap = ctx.get("bus")
+        if cap is None:
+            raw = item
+            if _aec_mode() == "off":
+                return raw, raw, raw, None
+            lin, sup, use = _media_aec_chunk(raw, time.monotonic())
+            return (raw, lin, sup, None) if use else (raw, raw, raw, None)
+        fr = item
+        raw = fr.raw
+        use = bool(fr.aec) and _media_aec_effective()
+        keep = fr.lin if use else raw
+        det = fr.sup if use else raw
+        kind = "lin" if use else "raw"
+        bus = cap["bus"]
+        start = int(fr.n_end) - len(raw)
+        ctx["last_n"] = int(fr.n_end)
+        ctx["last_start"] = start
+        seed = None
+        if cap.get("first"):
+            cap["first"] = False
+            # Ring audio from before this capture never reaches back into
+            # JARVIS's own voice (2026-10-09 review: his last words sat in
+            # the next pre-roll, older than the self-echo filter looks).
+            floor = _bus_playback_floor(bus)
+            carry = cap.get("carry")
+            if (carry is not None and floor is not None
+                    and floor > int(carry[0])):
+                # He spoke since the segment cut: its overlap holds his
+                # reply, not a command - the capture starts fresh.
+                _listen_note("carry_dropped")
+                carry = None
+            if carry is not None:
+                ch = _bus_chunks(bus, kind, carry[0], start)
+                if ch:
+                    secs = sum(len(c) for c in ch) / float(SAMPLE_RATE)
+                    seed = {"chunks": ch, "secs": secs,
+                            "t0": float(fr.t) - (len(raw) / float(SAMPLE_RATE)
+                                                 + secs), "trip": True}
+                    ctx["seeded"] = True
+            if seed is None:
+                lo = start - 12 * 1024
+                if floor is not None:
+                    lo = max(lo, int(floor))
+                ch = _bus_chunks(bus, kind, lo, start)
+                if ch:
+                    seed = {"chunks": ch, "secs": 0.0, "t0": None,
+                            "trip": False}
+        hit = _pregate_take_hit(0) if _pregate_mode() == "on" else None
+        if hit is not None and not ctx.get("pregate"):
+            seat = _pregate_seat(bus, hit, int(fr.n_end))
+            n0 = seat if isinstance(seat, int) else None
+            ch = (_bus_chunks(bus, kind, n0, start)
+                  if n0 is not None else None)
+            if ch:
+                secs = sum(len(c) for c in ch) / float(SAMPLE_RATE)
+                seed = {"chunks": ch, "secs": secs,
+                        "t0": float(fr.t) - (len(raw) / float(SAMPLE_RATE)
+                                             + secs), "trip": True}
+                ctx["pregate"] = hit
+                ctx["seeded"] = True
+                # The 10 s cap is for a capture the video would otherwise
+                # run to 30 s: only over media the canceller is not
+                # cancelling (a quiet room ends it on his silence).
+                ctx["pregate_cap"] = bool(_pc_media_playing()
+                                          and not _media_aec_effective())
+                print(f"  [wake-pregate] the wake word starts this capture "
+                      f"({secs:.1f} s back)")
+        return raw, keep, det, seed
+    except Exception:
+        r = getattr(item, "raw", item)
+        return r, r, r, None
+
+
+# The bus sample index the last bus capture's clip was processed up to (its
+# last frame's start), and that index for the last capture that became a
+# TURN (set at the turn boundary). A confirmed wake whose name is at or
+# before the latter was already acted on (2026-10-09 review: a confirm that
+# landed after "Jarvis, pause the music" ended re-seated the NEXT capture on
+# that same command - it ran twice, which plays the music again).
+_mic_bus_clip_end: list = [None]
+_mic_bus_turn_end: list = [None]
+
+
+def _bus_playback_floor(bus) -> "int | None":
+    """The oldest bus sample a capture may start from without JARVIS's own
+    voice: the index heard PLAYBACK_TAIL_S after his latest playback ended
+    (after the newest frame while one is still playing: no ring audio at
+    all). None when no playback is remembered. Never raises (None)."""
+    try:
+        end = _self_echo.last_playback_end()
+        if end is None:
+            return None
+        return _bus_index_at(bus, float(end) + _lm.PLAYBACK_TAIL_S)
+    except Exception:
+        return None
+
+
+def _pregate_seat(bus, hit: dict, n_end: int) -> "int | str":
+    """Where a confirmed D1 hit seats the capture (a bus sample index), or
+    why it does not (a string; counted and logged, numbers only): too old,
+    its name was already in a capture that became a turn, or it was heard
+    while JARVIS himself was audible. Never raises ('error')."""
+    try:
+        pre = int(_lm.PREGATE_PREROLL_S * SAMPLE_RATE)
+        n0 = int(hit["n0"])
+        n_hit = int(hit.get("n_hit", n0 + pre))
+        why = ""
+        if time.monotonic() - float(hit["t"]) >= _lm.PREGATE_CAP_S:
+            why = "too old"
+        elif (_mic_bus_turn_end[0] is not None
+              and n_hit <= int(_mic_bus_turn_end[0])):
+            why = "already a turn"
+        else:
+            floor = _bus_playback_floor(bus)
+            if floor is not None:
+                if n_hit <= int(floor):
+                    why = "during his own speech"
+                else:
+                    n0 = max(n0, int(floor))
+        if why:
+            _listen_note("pregate_stale")
+            print(f"  [wake-pregate] a confirmed wake not used ({why})")
+            return why
+        return max(n0, int(n_end) - 25 * SAMPLE_RATE)
+    except Exception:
+        return "error"
+
+
+def _segment_active_now() -> bool:
+    """B2 applies now (core/listen_media.segment_active): the bus is on,
+    wake-word mode is on, the PC is playing audio and the echo is not being
+    cancelled. Never raises."""
+    try:
+        return _lm.segment_active(
+            bus_on=_bus_mode_on(), wake_mode=bool(_require_wake_runtime),
+            media=_pc_media_playing(),
+            aec_mode="on" if _media_aec_effective() else "off",
+            segment_s=_segment_s())
+    except Exception:
+        return False
+
+
+def _segment_cut(ctx) -> None:
+    """B2: this capture ends here - before the frame in hand, which the
+    next capture gets - and the next one starts SEGMENT_OVERLAP_S earlier,
+    from the bus's ring. Never raises."""
+    try:
+        n = int(ctx.get("last_start") or 0)
+        _mic_bus_carry[0] = (n - int(_lm.SEGMENT_OVERLAP_S * SAMPLE_RATE),
+                             time.monotonic())
+        _listen_note("segments")
+        print(f"  [record_speech] media segment cut at {_segment_s():.0f} s "
+              f"- the next capture starts {_lm.SEGMENT_OVERLAP_S:.0f} s "
+              f"earlier")
+    except Exception:
+        pass
+
+
+# A2 'on' took the last capture's later sentence: {"t0": monotonic time
+# the re-anchored command starts}, consumed by _wake_turn_checks.
+_reanchor_taken: list = [None]
+
+
+def _wake_turn_checks(text: str, conf) -> bool:
+    """A mic turn that passed the gates: when it is led by the wake word,
+    the loopback veto (D2, True = drop it), the pre-gate's shadow score for
+    the turn (A3) and the ambient books. A re-anchored turn (A2 'on') had
+    its name checked by the veto already, at its own time. Never raises
+    (False)."""
+    try:
+        reanchored, _reanchor_taken[0] = _reanchor_taken[0], None
+        idx = _wake_prefix.name_word_index(text)
+        if idx is None:
+            return False
+        _ambient_match.main_turn(time.monotonic())
+        if not reanchored and _wake_vetoed(_name_time(conf, idx), "capture"):
+            return True
+        t0 = (reanchored.get("t0") if isinstance(reanchored, dict) else None)
+        _pregate_turn_peak(t0 if t0 is not None else _capture_clip_t0(), text)
+        return False
+    except Exception:
+        return False
+
+
+_wake_duck_seq = [0]
+
+
+def _wake_duck_turn_over() -> None:
+    """Turn boundary: the wake duck (D3) goes back up once the capture its
+    wake started has become a turn (or was dropped) - the reply has played
+    by now, under the duck. The DUCK_CAP_S timer covers every other case.
+    Never raises."""
+    try:
+        if not _wake_duck_seq[0] or _wake_duck_timer[0] is None:
+            return
+        meta = _last_capture_meta[0] or {}
+        if int(meta.get("pregate_seq", 0)) >= int(_wake_duck_seq[0]):
+            _wake_duck_seq[0] = 0
+            _wake_duck_end()
+    except Exception:
+        pass
+
+
+def _listen_media_boot() -> None:
+    """Main loop start: build what the listening-over-media modes need now
+    (the pre-gate worker on the record tap; the canceller and its loopback,
+    which records nothing unless MEDIA_AEC_MODE is not 'off'). Never
+    raises."""
+    try:
+        _pregate_get()
+        _media_aec_get()
+        if _veto_mode() != "off":
+            _loopveto_get()
+        modes = (f"re-anchor {_reanchor_mode()}, pre-gate {_pregate_mode()}"
+                 f" @ {_pregate_threshold():.2f}, bus "
+                 f"{'on' if _bus_mode_on() else 'off'}, aec {_aec_mode()}, "
+                 f"veto {_veto_mode()}, wake duck {_duck_mode()}, "
+                 f"barge-in {'on' if _bargein_bus_on() else 'off'}")
+        print(f"  [listen-media] {modes}")
     except Exception:
         pass
 
@@ -42316,7 +44009,7 @@ def _stop_listen_capture_denied() -> bool:
     never while another mic stream, playback or a reply is live."""
     return bool(_pathb_mic_active[0] or _record_speech_active[0]
                 or _tts_playback_active[0] or _tts_reply_active[0]
-                or _ambient_stream_active[0] > 0)
+                or _ambient_stream_active[0] > 0 or _mic_bus_active[0])
 
 
 def _stop_listen_must_yield() -> bool:
@@ -42469,6 +44162,20 @@ def _listen_for_stop(until, *, beat_s: float | None = None,
                 frames, beat_idx = _collect_frames(_get, until, beat_s, max_s)
             finally:
                 det.remove_tap(tap_q)
+        elif _mic_bus_open():
+            # The mic bus holds the device (MIC_BUS_MODE, 2026-10-05): read
+            # its frames - a second stream on the same mic is the ~70 s
+            # WASAPI stall.
+            _bsub = _mic_bus_obj[0].subscribe()
+            try:
+                def _get(t):
+                    try:
+                        return _bsub.get(timeout=t).raw
+                    except queue.Empty:
+                        return None
+                frames, beat_idx = _collect_frames(_get, until, beat_s, max_s)
+            finally:
+                _bsub.close()
         else:
             q_local: queue.Queue = queue.Queue()
 
@@ -47962,6 +49669,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # Arm the presence hold on queued proactive speech (starts the
         # physical-input watcher; see _presence_watch_start).
         _presence_watch_start()
+        # Listening over media (2026-10-05): the wake pre-gate (A3) and the
+        # echo canceller's loopback (C1) start now when their modes are on.
+        _listen_media_boot()
         while True:
             try:
                 if _blue_green_loop_tick():
@@ -48051,7 +49761,20 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # else while music plays is treated as overheard audio and dropped.
                 _bg_gate, _bg_why = _bg_gate_for_turn(
                     text, _injected_text is not None)
+                # ── SENTENCE RE-ANCHOR (A2, WAKE_REANCHOR_MODE, 2026-10-05) ──
+                # Over a video he speaks into a capture already running, so
+                # "...the video's words. Jarvis, pause the music." fails the
+                # positional rule. A later sentence that is addressed is
+                # counted ('shadow') or, verified, becomes the turn ('on').
+                # Numbers-only log. See _wake_reanchor.
+                if (_bg_gate and _bg_why == "wake-word mode"
+                        and _injected_text is None):
+                    _ra_text = _wake_reanchor(text, conf)
+                    if _ra_text is not None:
+                        text = _ra_text
+                        _bg_gate, _bg_why = _bg_gate_for_turn(text, False)
                 if _bg_gate:
+                    _listen_note("refused")
                     # The reason and the length only, never the words
                     # (2026-10-01): this is the gate that drops OTHER people's
                     # speech, and it printed 40 characters of every line
@@ -48086,6 +49809,16 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                         kwargs={"conf": conf, "peak_rms": _last_recording_peak},
                         daemon=True,
                     ).start()
+                    set_state("idle")
+                    continue
+
+                # ── A MIC TURN LED BY THE WAKE WORD (2026-10-05) ────────────────
+                # The loopback veto (D2): the PC's own audio said the name ->
+                # dropped ('on') / counted ('shadow'). The pre-gate's shadow
+                # score for the turn (A3) and the ambient listener's books.
+                # Numbers only. See _wake_turn_checks.
+                if (_injected_text is None
+                        and _wake_turn_checks(text, conf)):
                     set_state("idle")
                     continue
 

@@ -623,8 +623,17 @@ def _maybe_nudge_wake(text: str) -> None:
     standby_list = getattr(b, "_standby_mode", None)
     in_standby = bool(standby_list and standby_list[0])
     if not (in_sleep or in_standby):
-        # Awake — the main loop already owns this utterance.
+        # Awake — the main loop already owns this utterance. Told to the
+        # host's listening-over-media books (2026-10-05): a hit the main loop
+        # never turns into a wake-word turn is one it LOST ("ambient heard
+        # the name, main dropped", target 0).
         print(f"  [ambient-listen] wake match (awake, no nudge): {text!r}")
+        _hit = getattr(b, "_listen_ambient_wake_hit", None)
+        if callable(_hit):
+            try:
+                _hit()
+            except Exception:
+                pass
         return
     _last_wake_at = now
 

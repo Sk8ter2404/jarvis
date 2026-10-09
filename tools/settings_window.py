@@ -964,6 +964,80 @@ SCHEMA: dict[str, dict] = {
                 "skip and whether it would have missed you; off = no change, "
                 "no line. Applies on the next start.",
     },
+    # Listening over videos (core/listen_media.py, 2026-10-05).
+    "WAKE_REANCHOR_MODE": {
+        "tab": "hearing", "label": "Find 'Jarvis' later in a recording",
+        "type": "enum", "choices": ["off", "shadow", "on"],
+        "default": "shadow",
+        "help": "Over a video he often says 'Jarvis, ...' after the video's "
+                "own words in the same recording, and wake-word mode refused "
+                "it. on = a later sentence that starts with his name is "
+                "taken, after checking the voice and re-hearing that part; "
+                "shadow = no change, a log line (numbers only) when 'on' "
+                "would take one; off = neither. Applies on the next start.",
+    },
+    "WAKE_PREGATE_MODE": {
+        "tab": "hearing", "label": "Wake-word detector",
+        "type": "enum", "choices": ["off", "shadow", "on"],
+        "default": "off",
+        "help": "A small 'Jarvis' detector on the microphone. shadow = it "
+                "only scores (log lines, numbers only) so its threshold can "
+                "be set from your real voice; on = your name starts the "
+                "recording (needs the always-open microphone below). It "
+                "loads about 100 MB of extra libraries; off = not loaded. "
+                "Applies on the next start.",
+    },
+    "WAKE_PREGATE_THRESHOLD": {
+        "tab": "hearing", "label": "Wake-word detector threshold",
+        "type": "float", "default": 0.15, "min": 0.1, "max": 0.5,
+        "help": "Detector score that counts as 'Jarvis' (0.10-0.50). Lower "
+                "hears a quiet 'Jarvis' more often; every hit is still "
+                "confirmed by speech recognition. Applies on the next start.",
+    },
+    "MIC_BUS_MODE": {
+        "tab": "hearing", "label": "Always-open microphone",
+        "type": "enum", "choices": ["off", "on"], "default": "off",
+        "help": "on = one microphone stream stays open with the last 30 s "
+                "kept in memory, so nothing is missed between recordings "
+                "(today the mic closes after each one). Mute still closes "
+                "it. Applies on the next start.",
+    },
+    "MEDIA_AEC_MODE": {
+        "tab": "hearing", "label": "Cancel what the PC is playing",
+        "type": "enum", "choices": ["off", "shadow", "on"], "default": "off",
+        "help": "Echo cancellation of the PC's own sound (videos, music) "
+                "from the microphone. It listens to what the PC plays (kept "
+                "in memory for 30 s at most, never saved or sent). shadow = "
+                "measures only (a log line a minute); on = recordings start "
+                "and end on your voice, not the video - with the always-open "
+                "microphone on (without it, it only measures). Applies on "
+                "the next start.",
+    },
+    "WAKE_LOOPBACK_VETO": {
+        "tab": "hearing", "label": "Ignore 'Jarvis' said by a video",
+        "type": "enum", "choices": ["off", "shadow", "on"],
+        "default": "shadow",
+        "help": "When the PC's own audio said 'Jarvis' at that moment, the "
+                "wake is the video's, not yours. on = dropped; shadow = "
+                "counted only. Never drops while the PC plays into a "
+                "headset (no sound reaches the mic, and a headset's "
+                "monitoring can carry your own voice). Needs 'Cancel what "
+                "the PC is playing'. Applies on the next start.",
+    },
+    "WAKE_DUCK_MODE": {
+        "tab": "hearing", "label": "Lower other sound after 'Jarvis'",
+        "type": "enum", "choices": ["off", "on"], "default": "off",
+        "help": "on = once the detector has confirmed your 'Jarvis', other "
+                "apps drop to the ducking level for at most 8 s while you "
+                "finish the command. Applies on the next start.",
+    },
+    "WAKE_BARGEIN_MODE": {
+        "tab": "hearing", "label": "Interrupt him by voice",
+        "type": "enum", "choices": ["off", "on"], "default": "off",
+        "help": "on = saying 'Jarvis' or 'stop' while he speaks stops him "
+                "(needs the always-open microphone and the wake-word "
+                "detector). Applies on the next start.",
+    },
     "WHISPER_MODEL_CUDA": {
         "tab": "hearing", "label": "Whisper GPU model", "type": "str",
         "default": "large-v3-turbo", "nonblank": True,
@@ -2200,6 +2274,10 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                                 "VOICE_ID_DEVICE", "LISTEN_GPU",
                                 "LISTEN_GPU_RESERVE_MB"]),
         ("Music", ["MUSIC_GATE_MODE"]),
+        ("Listening over videos", ["WAKE_REANCHOR_MODE", "WAKE_PREGATE_MODE",
+                                   "WAKE_PREGATE_THRESHOLD", "MIC_BUS_MODE",
+                                   "MEDIA_AEC_MODE", "WAKE_LOOPBACK_VETO",
+                                   "WAKE_DUCK_MODE", "WAKE_BARGEIN_MODE"]),
         ("What he ignores", ["SELF_ECHO_FILTER_ENABLED", "SELF_ECHO_WINDOW_S",
                              "SELF_ECHO_TAIL_S", "NOISE_FILTER_ENABLED",
                              "DEVICE_SPEECH_FILTER_ENABLED",

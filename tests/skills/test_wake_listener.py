@@ -286,6 +286,27 @@ class StartTests(unittest.TestCase):
         svt.assert_called_once_with(det)
         self.assertIn("Listening", out)
 
+    def test_start_refuses_beside_the_host_mic_bus(self):
+        """The host's always-open mic (MIC_BUS_MODE) holds the device: this
+        detector's own stream would be the WASAPI double open (2026-10-09
+        review: nothing pinned this refusal)."""
+        det = FakeDetector(running=False, start_ok=True)
+        host = types.ModuleType("bobert_companion")
+        host._mic_bus_open = lambda: True
+        with (inject_modules(bobert_companion=host),
+              mock.patch.object(self.mod, "_get_detector",
+                                return_value=det)):
+            out = self.actions["wake_listener_start"]("")
+        self.assertFalse(det.started)
+        self.assertIn("always-open microphone", out)
+        host._mic_bus_open = lambda: False
+        with (inject_modules(bobert_companion=host),
+              mock.patch.object(self.mod, "_get_detector",
+                                return_value=det),
+              mock.patch.object(self.mod, "_start_voice_tap")):
+            self.actions["wake_listener_start"]("")
+        self.assertTrue(det.started)
+
     def test_start_engine_failure_message(self):
         det = FakeDetector(running=False, start_ok=False)
         with mock.patch.object(self.mod, "_get_detector", return_value=det), \

@@ -34,6 +34,21 @@ class _Clocked(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
 
+class LastPlaybackEndTests(_Clocked):
+    """last_playback_end(): the always-open mic's floor (2026-10-09 review -
+    ring audio older than his latest playback never seeds a capture)."""
+
+    def test_none_then_the_latest_end_then_now_while_playing(self):
+        self.assertIsNone(se.last_playback_end())
+        a = se.playback_begin(_LINE, at=990.0)
+        se.playback_end(a, at=992.0)
+        b = se.playback_begin(_LINE, at=994.0)
+        se.playback_end(b, at=995.5)
+        self.assertEqual(se.last_playback_end(), 995.5)
+        se.playback_begin(_LINE, at=999.0)          # still playing
+        self.assertEqual(se.last_playback_end(), 1000.0)
+
+
 class TimingLayerTests(_Clocked):
     """capture_overlap(open, vad, end): the live incident and its neighbours."""
 

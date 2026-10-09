@@ -182,6 +182,27 @@ def playback_live() -> bool:
         return False
 
 
+def last_playback_end() -> Optional[float]:
+    """When JARVIS's latest audible playback ended (the shared clock):
+    now() while one is still playing, None when none is remembered. The
+    always-open mic (bobert_companion, MIC_BUS_MODE) never starts a capture
+    from ring audio older than this (2026-10-09 review: his own last words
+    sat in the next capture's pre-roll). Never raises (None)."""
+    try:
+        with _lock:
+            if not _playbacks:
+                return None
+            if any(p[1] is None for p in _playbacks.values()):
+                live = True
+                end = None
+            else:
+                live = False
+                end = max(float(p[1]) for p in _playbacks.values())
+        return now() if live else end
+    except Exception:
+        return None
+
+
 def _prune_playbacks_locked(t: float) -> None:
     for tok in [k for k, p in _playbacks.items()
                 if p[1] is not None and t - p[1] > _PLAYBACK_KEEP_S]:

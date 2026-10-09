@@ -468,6 +468,22 @@ _MONOLITH_RESTORE_NAMES = (
     # minute counter itself is replaced in _restore_monolith_pristine.
     "_music_state", "_music_vid_seen", "_music_lost_logged",
     "_capture_voice_memo", "_listen_placements", "_listen_fallback_logged",
+    # ── listening over media (2026-10-05) ──────────────────────────────────
+    # The mic bus's owner cell (a leaked True would defer every LATER
+    # test's reinit), the lazily built bus / canceller / loopback / pre-gate
+    # workers (a test's fake must never serve the next test), B2's carry,
+    # D1's pending hit and its sequence, the last capture's meta, the
+    # missing-reference state and the wake duck's seq / timer. The minute
+    # counter and the ambient books are replaced in
+    # _restore_monolith_pristine.
+    "_mic_bus_active", "_mic_bus_obj", "_mic_bus_carry", "_media_aec_obj",
+    "_loopback_obj", "_pregate_obj", "_loopveto_obj", "_pregate_hit",
+    "_pregate_seq", "_last_capture_meta", "_aec_ref_missing",
+    "_aec_ref_quiet_since", "_aec_tts_device_checked", "_aec_backend_said",
+    "_wake_duck_seq", "_wake_duck_timer", "_listen_aec_frames",
+    "_reanchor_taken", "_mic_stream_closed_at",
+    # 2026-10-09 review: the bus audio already spent (a clip, a turn).
+    "_mic_bus_clip_end", "_mic_bus_turn_end",
     # ── local-LLM / ollama latches + caches ────────────────────────────────
     "_RESOLVED_LOCAL_LLM_MODEL", "_OLLAMA_INSTALL_TRIGGERED",
     "_OLLAMA_PULL_TRIGGERED", "_LOCAL_VISION_PULL_TRIGGERED",
@@ -562,6 +578,13 @@ def _restore_monolith_pristine(bc) -> None:
     # output. A fresh one per test.
     try:
         bc._music_counter = bc._music_gate.MinuteCounter()
+    except Exception:
+        pass
+    # Listening over media (2026-10-05): the same for its minute line and the
+    # "ambient heard the name, main dropped" books.
+    try:
+        bc._listen_counter = bc._lm.MinuteCounter()
+        bc._ambient_match = bc._lm.AmbientMatch()
     except Exception:
         pass
     # R1 tail probe (2026-10-01): a probe thread left by one test would make

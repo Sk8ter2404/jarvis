@@ -806,6 +806,806 @@ def seconds_since_audible_chunk() -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Media echo cancellation (MEDIA_AEC_MODE, 2026-10-05)
+# ──────────────────────────────────────────────────────────────────────
+# The 0.7x duck in _aec() above only covers JARVIS's OWN voice for 150 ms.
+# Over a video the desk mic hears the desk speakers at 0.013-0.063 RMS
+# against a 0.008 capture threshold, so every capture filled with video and
+# ran to 30 s. MediaEchoCanceller subtracts what the PC itself plays (the
+# loopback of the default render endpoint, core/loopback_ref.py) from the
+# mic, the way a phone cancels its own loudspeaker:
+#
+#   * partitioned-block frequency-domain NLMS (16 ms blocks x 20 partitions
+#     = a 320 ms filter, step 0.5), as a background / foreground pair: the
+#     background adapts every block, the output (foreground) filter is only
+#     replaced by a background that is doing better - so the owner talking
+#     over the video cannot drag the output filter off - and a background
+#     that diverged is reset from the foreground;
+#   * GCC-PHAT bulk delay on loud reference stretches, re-measured every
+#     MEDIA_AEC_DELAY_EVERY_S and soon after any gap, and clock DRIFT from
+#     the slope of those delays over MEDIA_AEC_DRIFT_WINDOW_S: a USB desk
+#     mic and USB speakers run on separate crystals, and without
+#     drift compensation the benchmark's ERLE fell to 11.5 dB at 20 ppm
+#     (6.5 dB at 40). The reference is read at fractional positions
+#     (windowed sinc) at the estimated rate;
+#   * a residual-echo suppressor (STFT Wiener gain from the echo estimate,
+#     the leak tracked by a running minimum). Its output ("sup") is for
+#     DETECTION only - capture start / end, loudness, the pre-gate. Speech
+#     recognition and voice-ID get the linear output ("lin"): the suppressor
+#     cost Parakeet 0.938 -> 0.901 at -5 dB in the research benchmark.
+#
+# Guards: output louder than input by 3 dB for 1 s resets the filters
+# (pass-through while it reconverges); ERLE under 10 dB for 60 s passes the
+# mic through and says "AEC not converging" once; a silent reference passes
+# the mic through and keeps the weights. Pure numpy; never raises out of
+# process() (any failure passes the chunk through). The reference audio
+# lives only in RAM (core/loopback_ref.py), never on disk or in a log.
+MEDIA_AEC_BLOCK = 256               # 16 ms at 16 kHz
+MEDIA_AEC_PARTITIONS = 20           # x 16 ms = a 320 ms filter
+MEDIA_AEC_MU = 0.5
+MEDIA_AEC_MARGIN_S = 0.030          # the reference leads the echo by this
+MEDIA_AEC_DELAY_EVERY_S = 10.0
+MEDIA_AEC_FIRST_DELAY_S = 1.0       # the first measurement after a gap
+# Until the drift is known, measure twice a second: 20 ppm moves the echo
+# 0.32 samples a second, and an NLMS chasing that caps ERLE near 7 dB on
+# broadband audio, so the first estimate (>= 4 points over >= 3 s) cannot
+# wait for the slow schedule. Later estimates refine over a longer span.
+# Converged, the measurement is the filter's own direct-path tap (cheap and
+# far steadier than a GCC peak, which a strong reflection can win).
+MEDIA_AEC_FAST_EVERY_S = 0.5
+MEDIA_AEC_FAST_FOR_S = 20.0
+MEDIA_AEC_FIRST_DRIFT_SPAN_S = 1.0
+MEDIA_AEC_DRIFT_SPAN_S = 30.0
+MEDIA_AEC_SMALL_STEP = 2.0e-6       # a drift correction under 2 ppm
+MEDIA_AEC_DELAY_WINDOW_S = 4.0      # each measurement looks this far back
+MEDIA_AEC_DRIFT_WINDOW_S = 120.0
+MEDIA_AEC_MAX_LAG_S = 0.400         # GCC searches the echo up to this late
+MEDIA_AEC_MAX_LEAD_S = 0.200        # ... and this early
+MEDIA_AEC_REF_ACTIVE_RMS = 1e-4     # quieter reference = silence
+MEDIA_AEC_DIVERGE_DB = 3.0
+MEDIA_AEC_DIVERGE_S = 1.0
+MEDIA_AEC_POOR_ERLE_DB = 10.0
+MEDIA_AEC_TRACK_ERLE_DB = 6.0       # the filter's peak is the echo path
+MEDIA_AEC_POOR_S = 60.0
+MEDIA_AEC_RECOVER_ERLE_DB = 12.0
+# After a session is (re)anchored the filter's reference history (its last
+# 20 partitions) still holds the old stream, so for a few frames its output
+# carries the video: 0.022 / 0.010 / 0.004 RMS in the first 64 ms frames
+# against ~0.0005 converged (2026-10-09 review, a per-capture reopen). The
+# bus's capture decision ignores the suppressed copy this long (settling()).
+MEDIA_AEC_SETTLE_S = 0.5
+_SINC_TAPS = 16
+
+
+def _sinc_kernel(frac: np.ndarray) -> np.ndarray:
+    """Kaiser-windowed sinc weights (len(frac), _SINC_TAPS) for reading a
+    signal at integer index + frac (taps at -7..+8)."""
+    k = np.arange(-_SINC_TAPS // 2 + 1, _SINC_TAPS // 2 + 1, dtype=np.float64)
+    win = np.kaiser(_SINC_TAPS + 2, 8.0)[1:-1]
+    x = k[None, :] - frac[:, None]
+    return np.sinc(x * 0.95) * 0.95 * win[None, :]
+
+
+def gcc_phat_lag(x: np.ndarray, d: np.ndarray, max_lag: int,
+                 max_lead: int = 0) -> "tuple[float, float]":
+    """(lag, peak): how many samples ``d`` trails ``x`` (sub-sample,
+    parabolic peak; negative = leads, down to -max_lead) and the PHAT
+    correlation peak (under ~0.05 = no reliable echo). Pure numpy.
+
+    Hann-windowed, PHAT-beta 0.8: with a rectangular window and full
+    whitening a strong TONE (music) leaks into many bins that all carry the
+    same phase difference, and they add up to a false peak at lag 0 - the
+    synthetic gated 220 Hz tone did exactly that, 1 measurement in 3."""
+    x = np.asarray(x, np.float64)
+    d = np.asarray(d, np.float64)
+    if len(x) == len(d) and len(x) > 8:
+        w = np.hanning(len(x))
+        x = x * w
+        d = d * w
+    n = len(x) + len(d)
+    L = 1 << int(np.ceil(np.log2(max(2, n))))
+    G = np.fft.rfft(d, L) * np.conj(np.fft.rfft(x, L))
+    G /= (np.abs(G) + 1e-12) ** 0.8
+    cc = np.fft.irfft(G, L)
+    lags = np.concatenate([cc[L - max_lead:] if max_lead > 0 else cc[:0],
+                           cc[:max_lag + 1]])
+    k = int(np.argmax(lags))
+    peak = float(lags[k])
+    frac = 0.0
+    if 0 < k < len(lags) - 1:
+        a, b, c = lags[k - 1], lags[k], lags[k + 1]
+        den = a - 2 * b + c
+        if den != 0:
+            frac = float(0.5 * (a - c) / den)
+    return float(k - max_lead) + frac, peak
+
+
+class _PBFDAF:
+    """Partitioned-block frequency-domain NLMS (overlap-save, constrained
+    gradient) with a background / foreground pair. block(x, d) -> (e, y):
+    the error (mic minus the echo estimate) and the echo estimate, both from
+    the FOREGROUND filter."""
+
+    def __init__(self, B=MEDIA_AEC_BLOCK, P=MEDIA_AEC_PARTITIONS,
+                 mu=MEDIA_AEC_MU, ref_active=MEDIA_AEC_REF_ACTIVE_RMS):
+        self.B, self.P, self.mu = int(B), int(P), float(mu)
+        self.K = self.B + 1
+        self.ref_active = float(ref_active)
+        self.reset()
+
+    def reset(self) -> None:
+        P, K, B = self.P, self.K, self.B
+        self.Wb = np.zeros((P, K), np.complex128)
+        self.Wf = np.zeros((P, K), np.complex128)
+        self.Xbuf = np.zeros((P, K), np.complex128)
+        self.head = 0
+        self.xprev = np.zeros(B)
+        self.Pxx = np.full(K, 1e-6)
+        self.Eb = 0.0
+        self.Ef = 0.0
+        self.zB = np.zeros(B)
+        self.n_copy = 0
+        self.n_reset = 0
+
+    def shift(self, s: int) -> None:
+        """Move both filters' taps ``s`` samples EARLIER (s > 0) or later
+        (s < 0): the echo path is re-aligned by the same amount, so a
+        converged filter stays converged (zeros enter at the far end)."""
+        s = int(s)
+        if s == 0:
+            return
+        B, P = self.B, self.P
+        for W in (self.Wb, self.Wf):
+            h = np.fft.irfft(W, axis=1)[:, :B].reshape(-1)     # P*B taps
+            out = np.zeros_like(h)
+            if s > 0:
+                out[:len(h) - s] = h[s:] if s < len(h) else 0.0
+            else:
+                out[-s:] = h[:len(h) + s] if -s < len(h) else 0.0
+            g = np.zeros((P, 2 * B))
+            g[:, :B] = out.reshape(P, B)
+            W[:] = np.fft.rfft(g, axis=1)
+
+    def taps(self) -> np.ndarray:
+        """The foreground filter as time-domain taps (P*B)."""
+        return np.fft.irfft(self.Wf, axis=1)[:, :self.B].reshape(-1)
+
+    def peak(self) -> "float | None":
+        """The foreground filter's strongest tap (the direct path), to a
+        sub-sample (sinc-interpolated around the peak); None when the
+        filter is still empty."""
+        h = np.fft.irfft(self.Wf, axis=1)[:, :self.B].reshape(-1)
+        a = np.abs(h)
+        k = int(np.argmax(a))
+        if a[k] <= 1e-9:
+            return None
+        lo, hi = max(0, k - 8), min(len(h), k + 9)
+        taps = h[lo:hi]
+        grid = np.arange(-1.0, 1.0 + 1e-9, 1.0 / 32.0) + k
+        n = np.arange(lo, hi)
+        vals = np.abs(np.sinc(grid[:, None] - n[None, :]) @ taps)
+        return float(grid[int(np.argmax(vals))])
+
+    def _conv(self, W, idx):
+        Y = np.einsum("pk,pk->k", W, self.Xbuf[idx])
+        return np.fft.irfft(Y)[self.B:]
+
+    def block(self, x: np.ndarray, d: np.ndarray):
+        B = self.B
+        X = np.fft.rfft(np.concatenate([self.xprev, x]))
+        self.xprev = x
+        self.head = (self.head + 1) % self.P
+        self.Xbuf[self.head] = X
+        idx = (self.head - np.arange(self.P)) % self.P
+        Ps = np.sum(self.Xbuf.real ** 2 + self.Xbuf.imag ** 2, axis=0)
+        self.Pxx = 0.5 * self.Pxx + 0.5 * Ps
+        yb = self._conv(self.Wb, idx)
+        eb = d - yb
+        active = float(np.mean(x * x)) > self.ref_active ** 2
+        if active:
+            Eb = np.fft.rfft(np.concatenate([self.zB, eb]))
+            norm = self.mu / (self.Pxx + 1e-6 * 2 * B + 1e-10)
+            G = np.conj(self.Xbuf[idx]) * (Eb * norm)[None, :]
+            g = np.fft.irfft(G, axis=1)
+            g[:, B:] = 0.0                       # gradient constraint
+            self.Wb += np.fft.rfft(g, axis=1)
+        yf = self._conv(self.Wf, idx)
+        ef = d - yf
+        a = 0.85
+        self.Eb = a * self.Eb + (1 - a) * float(np.dot(eb, eb))
+        self.Ef = a * self.Ef + (1 - a) * float(np.dot(ef, ef))
+        if active:
+            if self.Eb < 0.7 * self.Ef:
+                self.Wf[:] = self.Wb
+                self.n_copy += 1
+                self.Ef = self.Eb
+                ef, yf = eb, yb
+            elif self.Eb > 2.0 * self.Ef and self.Ef > 0:
+                self.Wb[:] = self.Wf
+                self.n_reset += 1
+                self.Eb = self.Ef
+        return ef, yf, active
+
+
+def _onset(h: np.ndarray, frac: float = 0.5) -> "int | None":
+    """The first tap at least ``frac`` of the strongest one: the direct path
+    of a learnt echo path (a reflection can be the strongest tap, rarely
+    the first strong one). None for an empty filter."""
+    a = np.abs(h)
+    m = float(a.max()) if a.size else 0.0
+    if m <= 1e-9:
+        return None
+    return int(np.argmax(a >= frac * m))
+
+
+def _path_shift(a: np.ndarray, b: np.ndarray,
+                max_shift: int = 8) -> "float | None":
+    """How far the learnt echo path moved between two snapshots of the
+    filter's taps (sub-sample; + = later). Cross-correlates the WHOLE
+    response, so a reflection overtaking the direct path does not read as a
+    move. None when either snapshot is empty."""
+    na, nb = float(np.dot(a, a)), float(np.dot(b, b))
+    if na <= 1e-18 or nb <= 1e-18:
+        return None
+    L = 1 << int(np.ceil(np.log2(len(a) + len(b))))
+    c = np.fft.irfft(np.fft.rfft(b, L) * np.conj(np.fft.rfft(a, L)), L)
+    lags = np.concatenate([c[L - max_shift:], c[:max_shift + 1]])
+    k = int(np.argmax(lags))
+    if lags[k] <= 0:
+        return None
+    frac = 0.0
+    if 0 < k < len(lags) - 1:
+        y0, y1, y2 = lags[k - 1], lags[k], lags[k + 1]
+        den = y0 - 2 * y1 + y2
+        if den != 0:
+            frac = float(0.5 * (y0 - y2) / den)
+    return float(k - max_shift) + frac
+
+
+class _ResidualSuppressor:
+    """Streaming residual-echo suppressor: 512-point sqrt-Hann STFT, hop
+    256 (one block), a Wiener-style gain per bin from the echo estimate; the
+    echo leak per bin is the running MINIMUM over ~1.5 s of S_ee / S_yy (the
+    single-talk moments between the owner's words set it, so his speech does
+    not inflate the estimate). Output lags input by one hop (16 ms)."""
+
+    NFFT, HOP = 512, 256
+
+    def __init__(self, beta=2.0, gmin=0.1, alpha=0.6, win_s=1.5,
+                 sr=16000):
+        self.beta, self.gmin, self.alpha = float(beta), float(gmin), float(alpha)
+        self.win = np.sqrt(np.hanning(self.NFFT + 1)[:-1])
+        self.W = max(3, int(win_s * sr / self.HOP))
+        self.reset()
+
+    def reset(self) -> None:
+        K = self.NFFT // 2 + 1
+        self.e_prev = np.zeros(self.HOP)
+        self.y_prev = np.zeros(self.HOP)
+        self.See = np.zeros(K)
+        self.Syy = np.zeros(K)
+        self.ratios = np.ones((self.W, K))
+        self.ri = 0
+        self.ola = np.zeros(self.HOP)
+
+    def block(self, e: np.ndarray, y: np.ndarray) -> np.ndarray:
+        fe = np.concatenate([self.e_prev, e]) * self.win
+        fy = np.concatenate([self.y_prev, y]) * self.win
+        self.e_prev, self.y_prev = e, y
+        E = np.fft.rfft(fe)
+        Y = np.fft.rfft(fy)
+        a = self.alpha
+        self.See = a * self.See + (1 - a) * (E.real ** 2 + E.imag ** 2)
+        self.Syy = a * self.Syy + (1 - a) * (Y.real ** 2 + Y.imag ** 2)
+        self.ratios[self.ri] = np.minimum(self.See / (self.Syy + 1e-12), 1.0)
+        self.ri = (self.ri + 1) % self.W
+        eta = self.ratios.min(axis=0)
+        R = 1.5 * eta * self.Syy
+        G = np.clip(1.0 - self.beta * R / (self.See + 1e-12), self.gmin, 1.0)
+        fr = np.fft.irfft(E * G, self.NFFT) * self.win
+        out = self.ola + fr[:self.HOP]
+        self.ola = fr[self.HOP:].copy()
+        return out
+
+
+class MediaEchoCanceller:
+    """Echo cancellation of what the PC plays, for the owner's mic.
+
+    ``ref`` is the reference source (core/loopback_ref.LoopbackReference or
+    a test double): ``read(start, n)`` -> the samples [start, start+n) or
+    None when they are not in its ring, ``index_at(t)`` -> the (fractional)
+    reference index the PC played at monotonic time t (None when unknown),
+    ``n_written``, ``gap_seq`` (bumped on every discontinuity) and,
+    optionally, ``wait_for(index, timeout)`` (block until the index is
+    written; the reference may trail the mic by a packet).
+
+    process(mic, t=None) -> (lin, sup): the mic chunk with the echo removed
+    (lin: for STT and voice-ID) and the residual-suppressed copy (sup: for
+    detection), both the chunk's length (sup trails lin by 16 ms). ``t`` =
+    monotonic time the chunk arrived (its last sample). Consecutive chunks are
+    one SESSION - the caller says when a new stream starts (new_session():
+    a new capture stream, a reopened bus, dropped frames); a gap in the
+    reference starts one too. A session is placed on the reference by the
+    wall clock (the first chunk's ``t``) and then re-measured (GCC-PHAT)
+    soon after. The filters and the delay / drift estimates carry over.
+    Thread-safe; never raises (a failure passes the chunk through)."""
+
+    def __init__(self, ref=None, sample_rate: int = 16000,
+                 clock=time.monotonic, delay_prior_s: float = 0.040):
+        self.sr = int(sample_rate)
+        self.ref = ref
+        self._clock = clock
+        self._mu = threading.Lock()
+        self.margin = int(round(MEDIA_AEC_MARGIN_S * self.sr))
+        self.max_lag = int(round(MEDIA_AEC_MAX_LAG_S * self.sr))
+        self.max_lead = int(round(MEDIA_AEC_MAX_LEAD_S * self.sr))
+        self.f = _PBFDAF()
+        self.res = _ResidualSuppressor(sr=self.sr)
+        # Samples the echo trails the wall-clock reference by (speaker +
+        # room + capture latency, less the loopback's): a prior until the
+        # first GCC measurement replaces it.
+        self.delay_wall = float(delay_prior_s) * self.sr
+        self.eps = 0.0              # reference rate - 1 (clock drift)
+        self._last_drift_step = 0.0
+        self.stats = {"resets": 0, "realigns": 0, "delay_measures": 0,
+                      "drift_updates": 0, "chunks": 0, "passthrough": 0,
+                      "ref_late": 0, "sessions": 0, "not_converging": 0}
+        self._hist_n = int(self.sr * MEDIA_AEC_DELAY_WINDOW_S)
+        self._mic_hist = np.zeros(self._hist_n)
+        self._x_hist = np.zeros(self._hist_n)
+        self._erle_db = None
+        self._erle_num = 0.0
+        self._erle_den = 0.0
+        self._div_blocks = 0
+        self._poor_since = None
+        self._passthrough = False
+        self._said_poor = False
+        self._blocks = 0            # blocks processed, all sessions
+        self._session = False
+        self._last_t = None
+        self._pending = (np.zeros(0), np.zeros(0))
+        self._fifo = np.zeros(0)
+        self._new_session_state()
+
+    # ── session / alignment ──────────────────────────────────────────────
+    def _new_session_state(self) -> None:
+        self._k = 0                    # session samples processed
+        self._A = 0.0                  # reference index of session sample 0
+        self._gap_seq = None
+        self._next_measure = None
+        self._hist_w = 0               # circular write index
+        self._hist_fill = 0
+        self._drift_pts = []           # (session sample, continuous lag)
+        self._sess_shift = 0.0
+        self._gcc_last = None
+        self._h_prev = None            # the filter's taps at the last measure
+        self._gcc_series = []          # per-path GCC lag series
+        self._track_pos = 0.0          # how far the learnt path has moved
+
+    def new_session(self) -> None:
+        """The mic stream restarted (a new capture stream): re-anchor on the
+        next chunk."""
+        with self._mu:
+            self._session = False
+
+    def reset(self) -> None:
+        """Forget everything learnt (filters, delay, drift)."""
+        with self._mu:
+            self.f.reset()
+            self.res.reset()
+            self._session = False
+            self._erle_db = None
+            self._passthrough = False
+            self.eps = 0.0
+
+    def _anchor(self, t_first: float) -> bool:
+        """Place session sample 0 (heard at monotonic ``t_first``) on the
+        reference. False when the reference cannot place it yet."""
+        ref = self.ref
+        if ref is None:
+            return False
+        try:
+            at = ref.index_at(t_first)
+        except Exception:
+            at = None
+        if at is None:
+            return False
+        self._new_session_state()
+        self._A = float(at) - self.delay_wall + self.margin
+        self._gap_seq = getattr(ref, "gap_seq", None)
+        self._session = True
+        self._next_measure = int(MEDIA_AEC_FIRST_DELAY_S * self.sr)
+        self.f.xprev = np.zeros(self.f.B)
+        self.stats["sessions"] += 1
+        return True
+
+    def _ref_block(self, k0: int, n: int):
+        """The aligned reference for session samples [k0, k0+n): an array,
+        "late" (not written yet, even after a short wait) or None (gone from
+        the ring)."""
+        ref = self.ref
+        pos = self._A + (k0 + np.arange(n, dtype=np.float64)) * (1.0 + self.eps)
+        half = _SINC_TAPS // 2
+        i0 = int(np.floor(pos[0])) - half + 1
+        i1 = int(np.floor(pos[-1])) + half + 1
+        try:
+            written = int(getattr(ref, "n_written", 0))
+        except Exception:
+            written = 0
+        if i1 + 1 > written:
+            wait = getattr(ref, "wait_for", None)
+            if callable(wait):
+                try:
+                    wait(i1 + 1, 0.06)
+                except Exception:
+                    pass
+            if i1 + 1 > int(getattr(ref, "n_written", 0)):
+                return "late"
+        seg = ref.read(i0, i1 - i0 + 1)
+        if seg is None:
+            return None
+        seg = np.asarray(seg, np.float64)
+        ip = np.floor(pos).astype(np.int64)
+        frac = pos - ip
+        if self.eps == 0.0 and float(np.max(np.abs(frac))) < 1e-9:
+            return seg[ip - i0]
+        w = _sinc_kernel(frac)
+        kk = np.arange(-half + 1, half + 1)
+        idx = np.clip((ip - i0)[:, None] + kk[None, :], 0, len(seg) - 1)
+        return np.sum(seg[idx] * w, axis=1)
+
+    def _push_hist(self, d: np.ndarray, x: np.ndarray) -> None:
+        n, w = len(d), self._hist_w
+        end = w + n
+        if end <= self._hist_n:
+            self._mic_hist[w:end] = d
+            self._x_hist[w:end] = x
+        else:
+            cut = self._hist_n - w
+            self._mic_hist[w:] = d[:cut]
+            self._x_hist[w:] = x[:cut]
+            self._mic_hist[:n - cut] = d[cut:]
+            self._x_hist[:n - cut] = x[cut:]
+        self._hist_w = end % self._hist_n
+        self._hist_fill = min(self._hist_n, self._hist_fill + n)
+
+    def _hist(self, n: int):
+        order = np.roll(np.arange(self._hist_n), -self._hist_w)[-n:]
+        return self._x_hist[order], self._mic_hist[order]
+
+    def _realign(self, err: float) -> None:
+        """Move the reference by ``err`` samples (+ = the echo is later than
+        planned) so it leads the echo by the margin again. The filter learnt
+        the path at the old alignment: its taps move with it (instead of
+        starting over) and its reference history is re-read."""
+        step = int(round(err))
+        if step == 0:
+            return
+        self._A -= step
+        self._sess_shift += step
+        self.delay_wall += step
+        self.f.shift(step)
+        self._rebuild_ref_history()
+        self._h_prev = None                # the drift series restart
+        self._gcc_series = []
+        self._drift_pts = []
+        self.stats["realigns"] += 1
+        self._hist_fill = 0            # the GCC history straddles the shift
+
+    def _measure_delay(self) -> None:
+        """Where is the echo, and is it moving?
+
+        Until the drift is known (and while its corrections are still
+        large): GCC-PHAT between the aligned reference and the mic over the
+        last second, twice a second. Its lag series (sub-sample) gives the
+        drift within a couple of seconds; a jump of more than 2 samples
+        means a reflection won the peak, and the series restarts. The
+        reference is re-aligned only when the filter needs it, and - unless
+        the echo is out of the filter's reach - only when two measurements
+        in a row agree.
+
+        Once the drift is known and the filter has converged (ERLE >=
+        MEDIA_AEC_TRACK_ERLE_DB): how far the WHOLE learnt path moved since
+        the last look (_path_shift), every 10 s - steadier than any single
+        peak - refines the drift, and the first strong tap re-aligns the
+        reference if it wanders out of place."""
+        converged = (self._erle_db is not None
+                     and self._erle_db >= MEDIA_AEC_TRACK_ERLE_DB)
+        quick = (self.stats["drift_updates"] == 0
+                 or self._last_drift_step > MEDIA_AEC_SMALL_STEP)
+        if converged and not quick:
+            h = self.f.taps()
+            self.stats["delay_measures"] += 1
+            onset = (_onset(h) if self._erle_db >= MEDIA_AEC_POOR_ERLE_DB
+                     else None)
+            if onset is not None and (onset < self.margin / 3.0
+                                      or onset > self.margin + 0.010 * self.sr):
+                self._realign(onset - self.margin)
+                return
+            prev, self._h_prev = self._h_prev, h
+            if prev is None:
+                self._track_pos = 0.0
+                self._drift_pts = [(float(self._k), 0.0)]
+                return
+            delta = _path_shift(prev, h)
+            if delta is None or abs(delta) > 4.0:
+                # The learnt path changed shape, not place: a new series.
+                self._track_pos = 0.0
+                self._drift_pts = [(float(self._k), 0.0)]
+                return
+            self._track_pos += delta
+            self._drift_pts.append((float(self._k), self._track_pos))
+            horizon = MEDIA_AEC_DRIFT_WINDOW_S * self.sr
+            self._drift_pts = [q for q in self._drift_pts
+                               if self._k - q[0] <= horizon]
+            self._update_drift()
+            return
+        self._h_prev = None
+        n = min(self._hist_fill,
+                int((1.0 if quick else MEDIA_AEC_DELAY_WINDOW_S) * self.sr))
+        if n < int(1.0 * self.sr):
+            return
+        x, d = self._hist(n)
+        if float(np.sqrt(np.mean(x * x))) < 10 * MEDIA_AEC_REF_ACTIVE_RMS:
+            return
+        lag, pk = gcc_phat_lag(x, d, self.max_lag, self.max_lead)
+        self.stats["delay_measures"] += 1
+        if pk < 0.05:
+            self._gcc_last = None
+            return
+        err = lag - self.margin            # + = the echo is later than planned
+        # Re-align only when the filter needs it: an echo earlier than a
+        # third of the margin risks an acausal path, one far later than the
+        # margin starves the filter's tail.
+        if lag < self.margin / 3.0 or lag > self.margin + 0.050 * self.sr:
+            last, self._gcc_last = self._gcc_last, lag
+            reachable = 0 <= lag <= self.f.P * self.f.B - self.f.B
+            if reachable and (last is None
+                              or abs(last - lag) > 0.002 * self.sr):
+                return                     # confirm it on the next measure
+            self._gcc_last = None
+            self._realign(err)
+            return
+        self._gcc_last = None
+        # The drift series: the lag on the session's clock (re-alignments
+        # added back). In a room with strong reflections the PHAT peak hops
+        # between paths (a few samples to a few ms apart), so each path
+        # keeps its own series: a lag joins the series whose last value is
+        # within 2 samples, else it starts one. The drift comes from the
+        # longest series.
+        q = lag + self._sess_shift
+        k_mid = float(self._k) - n / 2.0
+        for ser in self._gcc_series:
+            if abs(q - ser[-1][1]) <= 2.0:
+                ser.append((k_mid, q))
+                break
+        else:
+            self._gcc_series.append([(k_mid, q)])
+            del self._gcc_series[:-6]
+        self._drift_pts = max(self._gcc_series, key=len)
+        self._update_drift()
+
+    def _rebuild_ref_history(self) -> None:
+        """Refill the filter's reference spectra (its last P blocks) from
+        the reference at the CURRENT alignment, so the taps moved by
+        _PBFDAF.shift meet the reference they now expect."""
+        f = self.f
+        B, P = f.B, f.P
+        k_end = self._k
+        blocks = []
+        for j in range(P + 1):
+            k0 = k_end - (P + 1 - j) * B
+            if k0 < 0:
+                blocks.append(np.zeros(B))
+                continue
+            xr = self._ref_block(k0, B)
+            blocks.append(np.zeros(B) if (xr is None or isinstance(xr, str))
+                          else np.asarray(xr, np.float64))
+        for j in range(1, P + 1):
+            f.head = (f.head + 1) % P
+            f.Xbuf[f.head] = np.fft.rfft(np.concatenate([blocks[j - 1],
+                                                         blocks[j]]))
+        f.xprev = blocks[-1]
+
+    def _update_drift(self) -> None:
+        pts = self._drift_pts
+        # Quick estimates (a few seconds) until a step is small: an NLMS
+        # that is still chasing the drift under-reads it, so the first
+        # estimate falls short and the next few close the gap.
+        quick = (self.stats["drift_updates"] == 0
+                 or self._last_drift_step > MEDIA_AEC_SMALL_STEP)
+        span = (MEDIA_AEC_FIRST_DRIFT_SPAN_S if quick
+                else MEDIA_AEC_DRIFT_SPAN_S)
+        if len(pts) < 4 or pts[-1][0] - pts[0][0] < span * self.sr:
+            return
+        ks = np.array([p[0] for p in pts], np.float64)
+        ls = np.array([p[1] for p in pts], np.float64)
+        M = np.vstack([ks, np.ones_like(ks)]).T
+        coef, *_ = np.linalg.lstsq(M, ls, rcond=None)
+        res = ls - M @ coef
+        keep = np.abs(res) < max(1.0, 3 * float(np.std(res)))
+        if keep.sum() >= 4:
+            coef, *_ = np.linalg.lstsq(M[keep], ls[keep], rcond=None)
+        slope = float(coef[0])
+        if abs(slope) < 1.0e-6:            # under 1 ppm: noise
+            return
+        # The lag grows by (eps - eps_true) a sample: eps_true = eps - slope.
+        # A moves so the reference position at the current sample does not
+        # jump: A + k(1+eps_old) == A' + k(1+eps_new).
+        self._A += self._k * slope
+        # The same correction in the wall-clock delay a NEW session anchors
+        # with (A = index_at(t) - delay_wall + margin): without it every
+        # re-anchor (a reopened stream, dropped frames, a reference gap)
+        # missed by the drift corrected so far - a few samples, enough to
+        # turn a converged filter into a 1-2 s burst of uncancelled video
+        # at 20-40 ppm (2026-10-09 review, synthetic reopen probe).
+        self.delay_wall -= self._k * slope
+        self.eps = float(np.clip(self.eps - slope, -300e-6, 300e-6))
+        self._last_drift_step = abs(slope)
+        self.stats["drift_updates"] += 1
+        self._drift_pts = []
+        self._gcc_series = []
+        self._h_prev = None
+
+    # ── processing ──────────────────────────────────────────────────────
+    def process(self, mic, t: "float | None" = None):
+        x = np.asarray(mic, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return x, x
+        try:
+            with self._mu:
+                return self._process(x, t)
+        except BaseException as e:   # never break the capture loop
+            self.stats["last_error"] = _safe_exc("media_aec", e)
+            self._session = False
+            return x, x
+
+    def _process(self, chunk: np.ndarray, t):
+        n = len(chunk)
+        self.stats["chunks"] += 1
+        if t is None:
+            t = float(self._clock())
+        self._last_t = t
+        ref = self.ref
+        gap_seq = getattr(ref, "gap_seq", None) if ref is not None else None
+        if (not self._session
+                or (gap_seq is not None and gap_seq != self._gap_seq)):
+            self._fifo = np.zeros(0)
+            self._pending = (np.zeros(0), np.zeros(0))
+            if not self._anchor(t - n / self.sr):
+                self._session = False
+                self.stats["passthrough"] += 1
+                return chunk, chunk
+        d_all = np.concatenate([self._fifo, chunk.astype(np.float64)])
+        B = self.f.B
+        nb = len(d_all) // B
+        lin = d_all[:nb * B].copy()
+        sup = d_all[:nb * B].copy()
+        for b in range(nb):
+            s0 = b * B
+            d = d_all[s0:s0 + B]
+            xr = self._ref_block(self._k, B)
+            if xr is None:
+                # Gone from the ring: pass the rest through and re-anchor.
+                self._session = False
+                self.stats["passthrough"] += 1
+                break
+            if isinstance(xr, str):
+                # The reference has not arrived yet: this block passes
+                # through; the session (and its sample count) goes on.
+                self.stats["ref_late"] += 1
+                xr = np.zeros(B)
+            e, y, active = self.f.block(xr, d)
+            self._guard(d, e, active)
+            out = d if self._passthrough else e
+            lin[s0:s0 + B] = out
+            sup[s0:s0 + B] = self.res.block(
+                out, np.zeros(B) if self._passthrough else y)
+            self._push_hist(d, xr)
+            self._k += B
+            self._blocks += 1
+            if self._next_measure is not None and self._k >= self._next_measure:
+                fast = (self.stats["drift_updates"] == 0
+                        or self._last_drift_step > MEDIA_AEC_SMALL_STEP
+                        or self._k < MEDIA_AEC_FAST_FOR_S * self.sr)
+                self._next_measure = self._k + int(
+                    (MEDIA_AEC_FAST_EVERY_S if fast
+                     else MEDIA_AEC_DELAY_EVERY_S) * self.sr)
+                self._measure_delay()
+        self._fifo = d_all[nb * B:]
+        # Out has the chunk's length: a chunk that is not a whole number of
+        # blocks delays the output by the leftover (never with the 1024-
+        # sample capture chunks).
+        out_lin = np.concatenate([self._pending[0], lin])
+        out_sup = np.concatenate([self._pending[1], sup])
+        if len(out_lin) < n:
+            pad = np.asarray(chunk[:n - len(out_lin)], np.float64)
+            out_lin = np.concatenate([pad, out_lin])
+            out_sup = np.concatenate([pad, out_sup])
+        self._pending = (out_lin[n:], out_sup[n:])
+        return (out_lin[:n].astype(np.float32),
+                out_sup[:n].astype(np.float32))
+
+    def _guard(self, d: np.ndarray, e: np.ndarray, active: bool) -> None:
+        """The ERLE estimate, the divergence reset and the poor-convergence
+        pass-through."""
+        pd = float(np.dot(d, d))
+        pe = float(np.dot(e, e))
+        per_s = self.sr / len(d)
+        if active and pd > 1e-10:
+            self._erle_num = 0.95 * self._erle_num + 0.05 * pd
+            self._erle_den = 0.95 * self._erle_den + 0.05 * pe
+            self._erle_db = 10.0 * float(np.log10(
+                max(self._erle_num, 1e-20) / max(self._erle_den, 1e-20)))
+        # Output louder than input by 3 dB for 1 s: the filter diverged.
+        if pd > 1e-10 and pe > pd * 10 ** (MEDIA_AEC_DIVERGE_DB / 10.0):
+            self._div_blocks += 1
+            if self._div_blocks >= MEDIA_AEC_DIVERGE_S * per_s:
+                self.f.reset()
+                self.res.reset()
+                self._div_blocks = 0
+                self._erle_num = self._erle_den = 0.0
+                self._erle_db = None
+                self.stats["resets"] += 1
+        else:
+            self._div_blocks = 0
+        if not active or self._erle_db is None:
+            return
+        now_s = self._blocks / per_s
+        if self._erle_db < MEDIA_AEC_POOR_ERLE_DB:
+            if self._poor_since is None:
+                self._poor_since = now_s
+            elif (not self._passthrough
+                  and now_s - self._poor_since >= MEDIA_AEC_POOR_S):
+                self._passthrough = True
+                self.stats["not_converging"] += 1
+        else:
+            self._poor_since = None
+            if (self._passthrough
+                    and self._erle_db >= MEDIA_AEC_RECOVER_ERLE_DB):
+                self._passthrough = False
+
+    def settling(self, n: int = 0) -> bool:
+        """True when a chunk of ``n`` samples just processed began inside
+        the first MEDIA_AEC_SETTLE_S of an anchored session (see the
+        constant). False outside a session (pass-through: nothing is
+        cancelled, nothing to wait for)."""
+        with self._mu:
+            return bool(self._session) and (
+                self._k - max(0, int(n)) < int(MEDIA_AEC_SETTLE_S * self.sr))
+
+    def take_not_converging(self) -> bool:
+        """True once per episode of the poor-ERLE pass-through (the caller
+        logs "AEC not converging" once)."""
+        with self._mu:
+            if self._passthrough and not self._said_poor:
+                self._said_poor = True
+                return True
+            if not self._passthrough:
+                self._said_poor = False
+            return False
+
+    def erle_db(self) -> "float | None":
+        with self._mu:
+            return None if self._erle_db is None else float(self._erle_db)
+
+    def status(self) -> dict:
+        """Numbers only: ERLE, delay, drift, convergence and counters."""
+        with self._mu:
+            st = dict(self.stats)
+            st.update({
+                "erle_db": (None if self._erle_db is None
+                            else round(float(self._erle_db), 1)),
+                "delay_ms": round(self.delay_wall * 1000.0 / self.sr, 1),
+                "drift_ppm": round(self.eps * 1e6, 2),
+                "converging": not self._passthrough,
+                "session": self._session,
+                "fg_copies": self.f.n_copy, "bg_resets": self.f.n_reset,
+            })
+            return st
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Self-test
 # ──────────────────────────────────────────────────────────────────────
 
