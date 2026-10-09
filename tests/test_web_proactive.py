@@ -82,6 +82,11 @@ NOT_PROACTIVE = {
                                    "says nothing of its own",
     "AMBIENT_EXTRACT_ENABLED": "starts nothing; the extractor follows the "
                                "capture sources",
+    "AMBIENT_LEARN_FROM_EVERYONE": "whose overheard speech ambient learning "
+                                   "may learn from (a consenting room, not "
+                                   "only the owner); it starts nothing and "
+                                   "never speaks - replies still need the "
+                                   "wake word",
     "PROACTIVE_REQUIRE_FACE": "a condition on proactive comments",
     "PROACTIVE_REQUIRE_OWNER_VOICE": "a condition on proactive comments",
     "PRESENCE_HOLD_ENABLED": "a condition on queued proactive lines: they "
