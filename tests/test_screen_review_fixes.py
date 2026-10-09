@@ -428,7 +428,12 @@ class SignInGuardTests(_Base):
 
         mod = types.ModuleType("core.auth_guard")
         mod.click_refusal = new_sig
-        with mock.patch.dict("sys.modules", {"core.auth_guard": mod}):
+        # With main's real core.auth_guard imported, "from core import
+        # auth_guard" reads the package attribute first: pin the stub there
+        # too (as test_grounded_click's sign-in guard test does).
+        import core
+        with mock.patch.dict("sys.modules", {"core.auth_guard": mod}), \
+                mock.patch.object(core, "auth_guard", mod, create=True):
             G._auth_refusal("x", "click x", looked_for=["Sign in"],
                             refused_before=True)
             self.assertEqual(seen, {"looked_for": ["Sign in"],
