@@ -1055,10 +1055,14 @@ def _auth_refusal(label, said, urls=(), titles=(), screen_texts=(),
         pass
     except Exception:
         return ""
-    # Fallback until core.auth_guard is on main: a sign-in control (an
-    # e-mail address, "sign in", "continue with ...") or a sign-in page -
-    # or an input already refused this turn - unless the owner's own words
-    # click that very thing. Superseded by core.auth_guard once merged.
+    # Fallback ONLY when core.auth_guard cannot be imported (it is on main
+    # since v2.0.181, so normally never reached; core.actions'
+    # _click_auth_refusal fails open in that case, this keeps a guard): a
+    # sign-in control (an e-mail address, "sign in", "continue with ...") or
+    # a sign-in page - or an input already refused this turn - unless the
+    # owner's own words click that very thing. Kept because it refuses more
+    # than core.auth_guard does (any "password" / "continue with X" label),
+    # so the reviewed guard does not provably cover it.
     try:
         from core.failure_markers import TERMINAL_FAILURE_PREFIX
         lab = str(label or "")
