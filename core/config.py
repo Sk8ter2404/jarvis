@@ -981,6 +981,8 @@ MUSIC_GATE_MODE            = "shadow"
 #   frames still carry the video; without the bus 'on' measures only).
 # WAKE_LOOPBACK_VETO  a wake the video itself said ("Jarvis" in the PC's own
 #   audio within 1 s) is dropped ('on') or counted (needs MEDIA_AEC_MODE).
+#   Never dropped while the PC plays into a headset (no acoustic path, and a
+#   sidetone / monitor there can carry the owner's own voice).
 # WAKE_DUCK_MODE      'on' = after a confirmed wake, other apps duck to
 #   AUDIO_DUCKING_LEVEL for at most 8 s while he speaks.
 # WAKE_BARGEIN_MODE   'on' = saying "Jarvis" / "stop" over his own speech

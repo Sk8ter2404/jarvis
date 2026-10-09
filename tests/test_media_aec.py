@@ -280,6 +280,24 @@ class GuardTests(unittest.TestCase):
         lin, _sup = aec.process(x, t=(4 * SR + 1024) / SR)
         np.testing.assert_allclose(lin, x.astype(np.float32), atol=1e-7)
 
+    def test_pass_through_outputs_the_mic_even_with_a_trained_filter(self):
+        """M54: once the guard has decided "not converging", the output is
+        the mic itself - not the residual of a filter that learnt an echo
+        path that no longer holds (the test above trains nothing, so its
+        residual already equals the mic and cannot tell the two apart)."""
+        ref, mic, echo, near = make_scene(seconds=4.0, ppm=0.0)
+        aec = ap.MediaEchoCanceller(FakeRef(ref))
+        run(aec, mic[:3 * SR])
+        self.assertTrue(np.any(aec.f.Wf), "the filter has trained")
+
+        def decided(d, e, active):
+            aec._passthrough = True
+
+        aec._guard = decided
+        x = mic[3 * SR:3 * SR + 1024]
+        lin, _sup = aec.process(x, t=(3 * SR + 1024) / SR)
+        np.testing.assert_allclose(lin, x.astype(np.float32), atol=1e-7)
+
     def test_a_reference_gap_re_anchors(self):
         ref, mic, echo, near = make_scene(seconds=3.0, ppm=0.0)
         r = FakeRef(ref)

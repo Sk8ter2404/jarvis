@@ -126,6 +126,40 @@ class StaleWakeConfirmTests(_ReviewBase):
         self._feed_when_read(bus, st, [_quiet(2)] * 60)
         self.assertIsNone(self._record(timeout=2.0))
 
+    def test_a_name_from_before_his_last_playback_never_seats_a_capture(self):
+        """The same rule when the ring already reaches past his playback
+        (it ended 2 s ago): the test above cannot tell a dropped hit from
+        one clamped to the floor - the clamp lands after the newest frame,
+        so nothing is seeded either way. Here the floor is inside the ring:
+        clamping the hit there (instead of dropping it) would force-start a
+        capture on whatever the room played after his speech (loud here),
+        while the owner says nothing."""
+        bc = self.bc
+        streams = self._bus_on()
+        self._p(bc, "WAKE_PREGATE_MODE", "on", create=True)
+        bus, st = self._open_bus(streams)
+        now = bc._self_echo.now()
+        ptok = bc._self_echo.playback_begin("Turning it up, sir.",
+                                            at=now - 4.0)
+        bc._self_echo.playback_end(ptok, at=now - 2.0)
+        self._feed_now(bus, st, [_jarvis(i) for i in range(12)]
+                       + [_loud(i) for i in range(40)])
+        n_end = bus.n_written
+        floor = bc._bus_playback_floor(bus)
+        self.assertIsNotNone(floor)
+        self.assertLess(floor, n_end - 10 * _CHUNK,
+                        "the floor sits inside the ring")
+        n_hit = floor - 4 * _CHUNK                 # before the floor
+        bc._pregate_hit[0] = {"n0": n_hit - 8 * _CHUNK, "n_hit": n_hit,
+                              "t": time.monotonic(), "ok": True, "seq": 3,
+                              "score": 0.4}
+        self._feed_when_read(bus, st, [_quiet(2)] * 60)
+        self.assertIsNone(self._record(timeout=2.0),
+                          "a hit from his own speech must not start one")
+        self.assertIsNone(bc._pregate_hit[0])
+        self.assertEqual(bc._listen_counter.snapshot().get("pregate_stale"),
+                         1)
+
 
 # ── #3 the bus's pre-roll never reaches back into JARVIS's own voice ──────
 class PrerollAfterPlaybackTests(_ReviewBase):
@@ -842,6 +876,65 @@ class BusOwnershipTests(_ReviewBase):
         self.assertEqual(q.qsize(), 1)
 
 
+class StreamOwnershipEdgesTests(_ReviewBase):
+    """M11, M15, M32 (review 2 counted them equivalent or masked; pinned
+    here anyway)."""
+
+    def test_no_per_capture_stream_while_the_bus_still_holds_the_mic(self):
+        """MIC_BUS_MODE just turned off: the bus closes within ~0.1 s; the
+        capture skips this cycle instead of opening beside it."""
+        bc = self.bc
+        self._edges()
+        self._p(bc, "MIC_BUS_MODE", "off", create=True)
+        self._p(bc, "_mic_bus_active", [True])
+        opened = mock.Mock()
+        self._p(bc.sd, "InputStream", opened)
+        self.assertIsNone(self._record(timeout=0.3))
+        opened.assert_not_called()
+        self.assertFalse(bc._record_speech_active[0])
+
+    def test_the_stop_listener_never_opens_beside_the_bus(self):
+        bc = self.bc
+        self.assertFalse(bc._stop_listen_capture_denied())
+        self._p(bc, "_mic_bus_active", [True])
+        self.assertTrue(bc._stop_listen_capture_denied())
+
+    def test_the_stop_listener_reads_the_open_bus(self):
+        """M16: a dialogue's stop-listen with the bus open hears the bus's
+        frames (its own stream would be refused - M15 - so without this it
+        would hear nothing at all)."""
+        bc = self.bc
+        streams = self._bus_on()
+        bus, st = self._open_bus(streams)
+        self._p(bc, "_dialogue_current", [mock.Mock()])
+        self._p(bc, "_dialogue_active", [True])
+        self._p(bc, "DIALOGUE_STOP_LISTEN", True, create=True)
+        self._p(bc, "_is_staging", lambda: False)
+        self._p(bc, "_stop_listen_worker", lambda *a, **k: None)
+        got = []
+
+        def collect(get, until, beat_s, max_s, **kw):
+            st.cb(_loud(3).reshape(-1, 1), _CHUNK, None, None)
+            fr = get(2.0)
+            got.append(fr)
+            return ([fr] if fr is not None else []), 0
+
+        self._p(bc, "_collect_frames", collect)
+        cap = bc._listen_for_stop(lambda: True)
+        self.assertTrue(cap.available)
+        self.assertEqual(len(got), 1)
+        self.assertAlmostEqual(float(abs(got[0][0])), 0.0303, places=4)
+        self.assertEqual(len(streams), 1, "no second stream")
+
+    def test_the_loopback_pauses_when_the_canceller_goes_off(self):
+        bc = self.bc
+        lb = mock.Mock(running=True)
+        self._p(bc, "_loopback_obj", [lb])
+        self._p(bc, "MEDIA_AEC_MODE", "off", create=True)
+        self.assertIsNone(bc._media_aec_get())
+        lb.pause.assert_called_once_with()
+
+
 class ShadowIsInertTests(_ReviewBase):
     """M20, M22: MEDIA_AEC_MODE 'shadow' changes nothing a consumer hears -
     the taps and the pre-gate get the raw mic."""
@@ -910,7 +1003,7 @@ class ShadowIsInertTests(_ReviewBase):
 
 
 class SmallerGuardsTests(_ReviewBase):
-    """M30, M36."""
+    """M30, M36, review 1 finding 12."""
 
     def test_no_cancellation_into_a_headset(self):
         bc = self.bc
@@ -923,6 +1016,30 @@ class SmallerGuardsTests(_ReviewBase):
         self.assertEqual(bc._media_aec_bypass(), "headset")
         Lb.endpoint = "Speakers (ACME USB Audio)"
         self.assertEqual(bc._media_aec_bypass(), "")
+
+    def test_no_veto_while_the_pc_plays_into_a_headset(self):
+        """Review 1, finding 12: a headset is where a sidetone / "Listen to
+        this device" / OBS monitor puts HIS voice into the PC's audio, and
+        there is no acoustic path from it to the mic - the veto must not
+        drop his "Jarvis" then. Speakers: the video's name is still
+        vetoed."""
+        bc = self.bc
+
+        class Lb:
+            n_written = 16000
+            endpoint = "Headset Earphone (ACME HS-1 Wireless)"
+
+        self._p(bc, "_loopback_obj", [Lb()])
+        loop = bc._lm.ScoreTrack()
+        loop.add(100.2, 0.7)                 # the PC's audio said the name
+        self._p(bc, "_loopveto_get", lambda: mock.Mock(track=loop))
+        self._p(bc, "WAKE_LOOPBACK_VETO", "on", create=True)
+        with mock.patch("builtins.print"):
+            self.assertFalse(bc._wake_vetoed(100.0, "capture"))
+            self.assertEqual(
+                bc._listen_counter.snapshot().get("veto_headset"), 1)
+            Lb.endpoint = "Speakers (ACME USB Audio)"
+            self.assertTrue(bc._wake_vetoed(100.0, "capture"))
 
     def test_a_release_by_an_owner_holding_none_drops_nothing(self):
         bc = self.bc

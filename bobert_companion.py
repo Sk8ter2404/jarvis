@@ -35536,6 +35536,14 @@ def _wake_vetoed(t_name: "float | None", site: str) -> bool:
             return False
         if not _lm.vetoed_by(lv.track, float(t_name)):
             return False
+        if _media_aec_bypass() == "headset":
+            # The PC plays into a headset: no acoustic path, so the name in
+            # its audio cannot be what the mic heard - and a headset is
+            # where a sidetone / "Listen to this device" / OBS monitor puts
+            # HIS OWN voice into that audio (2026-10-09 review, finding 12:
+            # the veto would drop his "Jarvis"). Counted, never dropped.
+            _listen_note("veto_headset")
+            return False
         if mode == "shadow":
             _listen_note("would_veto")
             print(f"  [wake-veto] shadow: the PC's audio said the name "

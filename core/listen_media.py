@@ -51,7 +51,9 @@ spoke; the D1 cap applies only over media the canceller is not cancelling;
 a wedged bus open is booked, logged and spoken; the headset barge-in runs on
 the bus; a stale loopback (LOOPBACK_STALE_S) is no reference; the canceller
 settles 0.5 s after each re-anchor and its anchor keeps the drift it
-corrected; WAKE_PREGATE_MODE ships 'off'.
+corrected; WAKE_PREGATE_MODE ships 'off'; the D2 veto never drops a name
+while the PC plays into a headset (no acoustic path - and a sidetone or
+monitor there carries the owner's own voice).
 """
 from __future__ import annotations
 

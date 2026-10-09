@@ -991,8 +991,10 @@ SCHEMA: dict[str, dict] = {
         "default": "shadow",
         "help": "When the PC's own audio said 'Jarvis' at that moment, the "
                 "wake is the video's, not yours. on = dropped; shadow = "
-                "counted only. Needs 'Cancel what the PC is playing'. "
-                "Applies on the next start.",
+                "counted only. Never drops while the PC plays into a "
+                "headset (no sound reaches the mic, and a headset's "
+                "monitoring can carry your own voice). Needs 'Cancel what "
+                "the PC is playing'. Applies on the next start.",
     },
     "WAKE_DUCK_MODE": {
         "tab": "hearing", "label": "Lower other sound after 'Jarvis'",

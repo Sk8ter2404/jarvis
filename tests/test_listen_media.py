@@ -97,6 +97,10 @@ class ReanchorTests(unittest.TestCase):
 
     def test_nothing_to_re_anchor(self):
         for text in ("Jarvis, pause",              # already addressed
+                     # already addressed, and a later sentence is too: the
+                     # line is a turn as it stands (M58 - the guard is the
+                     # contract, not only the caller's precondition)
+                     "Jarvis, stop. Jarvis, play jazz.",
                      "the video continues. So Jarvis said no.",  # mention
                      "price is 3.5 dollars Jarvis pause",  # no sentence end
                      "the video continues. I asked Jarvis.",
