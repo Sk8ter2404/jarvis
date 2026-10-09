@@ -31,7 +31,8 @@ import time
 from tests._monolith_harness import requires_monolith
 from tests.monolith.test_monolith_claim_validation import _Base
 from tests.monolith.test_monolith_live_turns_1005 import (
-    ACCOUNT_ENTRY, CHOOSER_LOOK, LIVE_CLOSE_THAT, PAGE, _Desk, _Win)
+    ACCOUNT_ENTRY, CHOOSER_LOOK, LIVE_CLOSE_THAT, PAGE, _Desk, _Win,
+    grounded_stand_in)
 
 _PROCS = {0x70: "claude.exe", 0x71: "chrome.exe", 0x72: "explorer.exe",
           0x73: "ApplicationFrameHost.exe", 0x74: "notepad.exe",
@@ -291,6 +292,8 @@ class _SignIn(_Base):
                                "loaded")
         self.find = self._p(bc, "find_click_target", return_value=(40, 50))
         self.click = self._p(bc, "ui_click")
+        from core import grounded_click as G
+        self._p(G, "run_bounded", side_effect=grounded_stand_in(bc))
         self.typed = self._p(bc, "ui_type")
         self.pressed = self._p(bc, "ui_press")
         self._p(bc, "_looks_like_shell_command", return_value=False)
@@ -362,6 +365,10 @@ class FindThenClickTests(_SignIn):
         self.click.assert_not_called()
 
     def test_find_on_screen_of_an_ordinary_target_then_click(self):
+        # The screen-vision merge routes a whole "click the X" utterance to
+        # click_on_screen before the brain; this test is about the brain's
+        # find_on_screen + coordinate click, so that route is off here.
+        self._p(self.bc, "CLICK_ROUTE_ENABLED", False)
         self._stub("find_on_screen", "found at 500,300")
         self._dispatch("Jarvis, click the play button.",
                        "[ACTION: find_on_screen, the play button]",

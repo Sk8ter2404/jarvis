@@ -288,6 +288,23 @@ class InputRefusalTests(unittest.TestCase):
         self.assertTrue(ag.input_refusal("type", "x", "", screen_texts=[pop]))
 
 
+def _grounded_stand_in(bc):
+    """core.grounded_click.run_bounded for a desk with no real windows: find
+    the target through ``bc.find_click_target`` and click it through
+    ``bc.ui_click`` - the executor's line is the old click line."""
+    from core import grounded_click as G
+
+    def run_bounded(arg, said="", mode="click", backend=None, budget_s=None):
+        pt = bc.find_click_target(arg)
+        if pt is None:
+            return G.Result(f"could not locate '{arg}' on screen",
+                            G.NOT_FOUND)
+        bc.ui_click(pt[0], pt[1])
+        return G.Result(f"clicked '{arg}' at {tuple(pt)}", G.VERIFIED,
+                        label=arg)
+    return run_bounded
+
+
 class _ClickBase(unittest.TestCase):
     def setUp(self):
         self.bc = mock.Mock()
@@ -301,6 +318,16 @@ class _ClickBase(unittest.TestCase):
             "the mouse moved: a refused click must never reach ui_click")
         p = mock.patch.object(A, "_bc", return_value=self.bc)
         p.start()
+        self.addCleanup(p.stop)
+        # A description click is executed by core.grounded_click (screen
+        # vision, merged after v2.0.181) instead of find_click_target +
+        # ui_click. This stand-in executor locates through the same
+        # find_click_target stub and clicks through ui_click, so what the
+        # sign-in guard lets through - or stops before the executor - stays
+        # observable exactly as before.
+        p = mock.patch("core.grounded_click.run_bounded",
+                       side_effect=_grounded_stand_in(self.bc))
+        self.grounded = p.start()
         self.addCleanup(p.stop)
         ol.reset()
         self.addCleanup(ol.reset)
@@ -345,6 +372,44 @@ class ClickActionTests(_ClickBase):
         self.bc.ui_click.side_effect = None
         out = A._act_click("Saved Songs")
         self.assertEqual(out, "clicked 'Saved Songs' at (100, 200)")
+
+
+class ClickOnScreenTests(_ClickBase):
+    """click_on_screen (screen vision) gets the same pre-check as click: the
+    monolith hands every description click to it (_click_alias), and the
+    screen route sends "click that X" to it."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(A, "_loaded_bc", return_value=self.bc)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_live_click_never_reaches_the_executor(self):
+        out = A._act_click_on_screen(ACCOUNT_ENTRY)
+        self.assertEqual(fm.terminal_failure_text(out), READY)
+        self.grounded.assert_not_called()
+        self.bc._turn_note_auth_refused.assert_called_once_with()
+
+    def test_a_monitor_prefix_is_judged_by_its_target(self):
+        out = A._act_click_on_screen(f"monitor:middle|{ACCOUNT_ENTRY}")
+        self.assertEqual(fm.terminal_failure_text(out), READY)
+        self.grounded.assert_not_called()
+
+    def test_an_asked_for_click_reaches_the_executor(self):
+        self.bc._turn_user_text.return_value = ("Jarvis, click Continue with "
+                                                "Google")
+        self.bc.ui_click.side_effect = None
+        out = A._act_click_on_screen("Continue with Google")
+        self.assertEqual(out, "clicked 'Continue with Google' at (100, 200)")
+        self.grounded.assert_called_once()
+
+    def test_a_pick_answer_is_left_to_the_executor_s_own_guard(self):
+        # "pick:2" names no target: grounded_click judges the option it
+        # resolves to, with core.auth_guard, by that window's page.
+        self.bc.ui_click.side_effect = None
+        A._act_click_on_screen("pick:2")
+        self.grounded.assert_called_once()
 
 
 class ReviewClickActionTests(_ClickBase):

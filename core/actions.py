@@ -3694,7 +3694,23 @@ def _act_click_on_screen(args: str) -> str:
     """click_on_screen, <what> | pick:<n> | scene:previous - find the thing
     on screen BY NAME and click it, verified (core.grounded_click). Spoken
     word for word: a verified fact, a question naming the real options, or
-    an honest "I don't see it"."""
+    an honest "I don't see it".
+
+    The same sign-in pre-check as _act_click (core.auth_guard via
+    _click_auth_refusal) runs first for a described target: the monolith
+    hands every DESCRIPTION "click" here (bobert_companion._click_alias),
+    and the screen route sends "click that X" here, so without it the
+    v2.0.181 guard on the request itself (the page in front, this turn's
+    looks, an input already refused) would apply to a direct _act_click
+    only. grounded_click then judges the RESOLVED label again, by the
+    target window's own page. A "pick:<n>" / "scene:previous" answer has
+    no description of its own: grounded_click judges the option it
+    resolves to."""
+    desc = re.sub(r"^\s*monitor:[\w-]+\s*\|", "", str(args or "")).strip()
+    if desc and not desc.lower().startswith(("pick:", "scene:")):
+        refusal = _click_auth_refusal(_loaded_bc(), desc)
+        if refusal:
+            return refusal
     return _click_on_screen(args, _turn_said())
 
 

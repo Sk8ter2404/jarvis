@@ -334,6 +334,26 @@ CHOOSER_LOOK = ("[local-vision] The browser window is not showing the console "
 ACCOUNT_ENTRY = "Pat Example (pat.example@example.com)"
 
 
+def grounded_stand_in(bc):
+    """core.grounded_click.run_bounded for a test desk with no real windows.
+    A description click (and the monolith's click -> click_on_screen alias)
+    is executed by core.grounded_click since the screen-vision merge, not by
+    find_click_target + ui_click; this stand-in locates through the test's
+    ``bc.find_click_target`` stub and clicks through ``bc.ui_click``, so what
+    the sign-in guard lets through - or stops before the executor - stays
+    observable exactly as before."""
+    from core import grounded_click as G
+
+    def run_bounded(arg, said="", mode="click", backend=None, budget_s=None):
+        pt = bc.find_click_target(arg)
+        if pt is None:
+            return G.Result(f"I don't see {arg} on screen, sir.",
+                            G.NOT_FOUND)
+        bc.ui_click(pt[0], pt[1])
+        return G.Result(f"I clicked {arg}, sir.", G.VERIFIED, label=arg)
+    return run_bounded
+
+
 @requires_monolith
 class SignInReplayTests(_Base):
     def setUp(self):
@@ -346,6 +366,8 @@ class SignInReplayTests(_Base):
             "looked for the account entry"))
         self.click = self._p(bc, "ui_click", side_effect=AssertionError(
             "the mouse moved"))
+        from core import grounded_click as G
+        self._p(G, "run_bounded", side_effect=grounded_stand_in(bc))
         self._p(bc, "_read_focused_window", return_value=(None, "Claude",
                                                           None))
         from core import opened_ledger as ol
