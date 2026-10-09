@@ -129,11 +129,14 @@ class CanonicalCommandTextTests(_Base):
         out, log = self._quiet(self.bc._wake_lead_canonical, LIVE_LINE)
         self.assertEqual(out, "Jarvis what model are you?")
         # The rewritten text takes the legacy first-word path downstream.
-        self.assertEqual(self.bc._yes_no.normalize("Um, Jarvis, yes."), "um jarvis yes")
+        self.assertEqual(self.bc._yes_no.normalize("So, Jarvis, yes."), "so jarvis yes")
         self.assertEqual(
             self.bc._yes_no.normalize(
-                self._quiet(self.bc._wake_lead_canonical, "Um, Jarvis, yes.")[0]),
+                self._quiet(self.bc._wake_lead_canonical, "So, Jarvis, yes.")[0]),
             "yes")
+        # A bare hesitation is the one lead normalize drops itself (review
+        # 2026-10-09: "Um, no." to a yes/no question was "other").
+        self.assertEqual(self.bc._yes_no.normalize("Um, Jarvis, yes."), "yes")
         self.assertIn("[wake]", log)
         self.assertNotIn("model", log)      # never the words
 

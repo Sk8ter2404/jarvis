@@ -1264,7 +1264,7 @@ SHUTDOWN_PROMPT_YES_PHRASES = (
     "yes please", "yes go ahead",
 )
 SHUTDOWN_PROMPT_NO_PHRASES = (
-    "no", "nope", "nah",
+    "no", "nope", "nah", "negative",
     "no overnight",
     "just shut down", "just shutdown",
     "shut down completely", "shutdown completely",
@@ -31023,9 +31023,36 @@ def _check_and_arm_shutdown_prompt(text: str) -> bool:
     "JARVIS, shut down" / "shut down please" / "go offline now" all hit. Only
     fires when the utterance is short (≤ 6 words) to avoid catching casual
     mentions inside longer prose ("if I say shut down it should…").
+
+    A shutdown that already says no to the overnight protocol ("Jarvis shut
+    down with no overnight protocol.") asks nothing: it runs the full
+    shutdown the prompt's "No." would have (2026-10-06).
     """
     if not text:
         return False
+    # A yes that restates the shutdown, said while the model's shutdown is
+    # held for a yes ("Yes, shut down." / "Yes, shut down with no overnight
+    # protocol."), answers THAT question (review 2026-10-09): this router
+    # runs first, so it asked the overnight question again - or, for the
+    # 7-word form, the confirmation then heard "no" and cancelled.
+    if (_held_shutdown_pending()
+            and _action_risk.confirms_held_shutdown(text)):
+        return False
+    # The overnight question already answered (live 2026-10-06): "Jarvis
+    # shut down with no overnight protocol." was 7 words, so it never got
+    # here, went to the model, and the shutdown it emitted was held for a
+    # yes. A whole utterance that is a shutdown of JARVIS saying no to the
+    # overnight protocol is exactly the prompt's "shut down" + "No." - so it
+    # does what that pair does. Strict shape (core/action_risk): negated,
+    # quoted or device sentences never match.
+    if _action_risk.shutdown_declining_overnight(text):
+        _shutdown_prompt_pending["armed"] = False
+        print("  [shutdown] shutdown with the overnight protocol declined "
+              "in the same breath — full shutdown")
+        try: _act_shutdown_jarvis()
+        except Exception as _e:
+            print(f"  [shutdown] _act_shutdown_jarvis failed: {_e}")
+        return True
     tl = text.strip().lower()
     if not tl or len(tl.split()) > 6:
         return False
@@ -31053,9 +31080,16 @@ def _handle_shutdown_prompt(text: str) -> bool:
     Returns True when the message was consumed.
 
     Branches:
-      - YES phrase → fire start_overnight_upgrade (overnight mode)
-      - NO phrase  → fire _act_shutdown_jarvis (full shutdown)
+      - A shutdown that declines the overnight protocol, or the decline
+        alone ("shut down no overnight protocol", "skip the overnight
+        protocol") → full shutdown
+      - The overnight protocol by name ("Yes, run the overnight protocol,
+        then shut down.") → start_overnight_upgrade
       - Another SHUTDOWN_TRIGGER_PHRASE → user is insisting — full shutdown
+      - A PLAIN no phrase ("No.", "No thanks.", "No, just shut down.")
+        → fire _act_shutdown_jarvis (full shutdown); a no that says anything
+        else ("No, stay on.") → cancelled, like unrelated speech
+      - YES phrase → fire start_overnight_upgrade (overnight mode)
       - Unrelated speech → speak "Shutdown cancelled." and clear the flag
       - Expired flag → silently clear and return False (normal LLM routing)
     """
@@ -31075,6 +31109,29 @@ def _handle_shutdown_prompt(text: str) -> bool:
     # Clear the flag eagerly so a second-arming or a re-entrant call can't
     # re-trigger this branch. Each dispatch path below is terminal.
     _shutdown_prompt_pending["armed"] = False
+    # "<command> no <thing>" / "without <thing>" is a NO (live 2026-10-06):
+    # "Jarvis shut down no overnight protocol." was read as unrelated (the
+    # "no" sat mid-sentence), the prompt was cancelled and the model then
+    # SAID it was powering down with nothing run. The whole reply must be
+    # ONE request of that shape - see core/action_risk
+    # .shutdown_declining_overnight. The RAW text (review 2026-10-09): its
+    # question mark, quotes and sentence breaks are what keep "Shut down with
+    # no overnight protocol? No, wait." and a quoted line out.
+    if _action_risk.shutdown_declining_overnight(text, alone_ok=True):
+        print(f"  [shutdown] user declined overnight ('{tl}') — full shutdown")
+        try: _act_shutdown_jarvis()
+        except Exception as _e:
+            print(f"  [shutdown] _act_shutdown_jarvis failed: {_e}")
+        return True
+    # A yes that names the overnight protocol (review 2026-10-09): "Yes, run
+    # the overnight protocol, then shut down." carries a shutdown phrase, so
+    # the insisting branch below ran a FULL shutdown instead.
+    if _action_risk.accepts_overnight(text):
+        print(f"  [shutdown] user chose overnight ('{tl}') — start_overnight_upgrade")
+        try: _act_start_overnight_upgrade()
+        except Exception as _e:
+            print(f"  [shutdown] _act_start_overnight_upgrade failed: {_e}")
+        return True
     # Edge case: user repeats a shutdown phrase ('shut down... shut down').
     # Interpret as "yes, full shutdown — I'm insisting" rather than re-arming
     # the prompt and looping.
@@ -31090,15 +31147,16 @@ def _handle_shutdown_prompt(text: str) -> bool:
     _no_phrase = next((p for p in SHUTDOWN_PROMPT_NO_PHRASES
                        if tl == p or tl.startswith(p + " ")), None)
     if _no_phrase is not None:
-        # A hedged no is a cancel, not a power-off (2026-10-01 review): with
-        # the punctuation now dropped, "No, wait." / "No, cancel that." /
-        # "Nope, hold on." / "No, never mind." / "No, don't." read as
-        # "no wait" etc. and matched the "no " prefix — and NO here means a
-        # full JARVIS shutdown, so an explicit cancel killed the process.
-        # A repeated plain no ("No, no.") is still a no; "no thanks" too.
-        _after = tl[len(_no_phrase):].split()
-        if [w for w in _yes_no.hedge_words(_after)
-                if w not in ("no", "nope", "nah")]:
+        # Only a PLAIN no is a power-off. A hedged no is a cancel (2026-10-01
+        # review: "No, wait." / "No, cancel that." / "No, don't." killed the
+        # process) - and so is a no that goes on to say anything else
+        # (review 2026-10-09: "No, stay on." / "No, keep running." / "No, I
+        # need you." / "No, my laptop." / "No, no shutdown." / "Just shut
+        # down the printer." all shut JARVIS down, because the hedge list
+        # did not know those words). A repeated no ("No, no."), "no thanks",
+        # "no overnight protocol" and "no, just shut down" are still a no -
+        # core/action_risk.plain_no_to_overnight.
+        if not _action_risk.plain_no_to_overnight(tl):
             print("  [shutdown] hedged no — cancelling prompt, falling "
                   "through to normal routing")
             try: _speak("Shutdown cancelled.")
@@ -38914,6 +38972,21 @@ def handle_autocorrect_disambig_response(user_text: str) -> bool:
     return True
 
 
+def _held_shutdown_pending() -> bool:
+    """True when what waits on the owner's yes is the model's shutdown of
+    JARVIS, held because his words did not ask for it (the dispatcher's
+    self-termination hold): every queued action is a shutdown alias. Never
+    raises."""
+    try:
+        pending = list(_pending_confirmation)
+        return bool(pending) and all(
+            _action_risk.self_termination_class(
+                _self_terminating_target(n)) == "shutdown"
+            for n, _a in pending)
+    except Exception:
+        return False
+
+
 def handle_confirmation_response(user_text: str) -> bool:
     """
     If we're waiting on a confirmation, interpret this user message as either
@@ -38940,6 +39013,14 @@ def handle_confirmation_response(user_text: str) -> bool:
     # counts (2026-10-01 review): a sentence that merely starts with "Yeah,"
     # / "Absolutely," is "other" — cancelled and routed on, never run.
     verdict = _yes_no.classify_reply(user_text)
+    # A held SHUTDOWN asked "Say yes if that is what you want." (live
+    # 2026-10-06 / review 2026-10-09): a yes that restates it - "Yes, shut
+    # down with no overnight protocol." (the "no" read as a hedge), "Yes, I
+    # want you to shut down.", "Yes, shut it down." - or the restatement
+    # alone ("That is what I want.") answers it. Only for that question.
+    if (verdict != "yes" and _held_shutdown_pending()
+            and _action_risk.confirms_held_shutdown(user_text)):
+        verdict = "yes"
     affirmative = verdict == "yes"
     if affirmative:
         count = len(_pending_confirmation)
