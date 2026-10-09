@@ -440,12 +440,13 @@ VISION_TRACE = "on"
 VISION_TRACE_DAYS = 7
 VISION_TRACE_MAX_ENTRIES = 300
 VISION_TRACE_MAX_MB = 300
-# Read windows through Windows UI Automation (link names, titles, rects)
-# for clicks, "what's on my screen" and screen memory. The kill switch.
+# Read windows through Windows UI Automation (link names, titles, rects,
+# page addresses) for clicks, "what's on my screen" and screen memory. The
+# kill switch: False stops EVERY UI Automation read (core.uia_host).
 SCREEN_UIA_ENABLED = True
-# UI Automation on NON-browser windows: "off" | "on_demand" (only the
-# window a click / look is about) | "always". Electron apps may switch to
-# screen-reader mode when read.
+# UI Automation on NON-browser windows: "off" | "on_demand" (the window in
+# front, or the app the owner's words name) | "always". Electron apps may
+# switch to screen-reader mode when read.
 SCREEN_UIA_NONBROWSER = "on_demand"
 # Image-token cap for every image sent to the local vision model (one
 # 1024-token ubatch on this build; ceil(w/48) * ceil(h/48)).

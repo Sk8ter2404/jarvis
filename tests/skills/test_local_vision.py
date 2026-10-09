@@ -236,7 +236,9 @@ class LocalVisionActionTests(unittest.TestCase):
              mock.patch.object(self.mod, "_bobert", return_value=bc), \
              mock.patch.object(self.mod, "_find_click_target_local", return_value=(120, 240)):
             out = self.actions["local_click_target_by_description"]("the play button")
-        self.assertIn("clicked 'the play button' at (120, 240)", out)
+        # Spoken word for word (SPEAK_RESULT_VERBATIM_ACTIONS): a sentence,
+        # no coordinates; the click itself went to (120, 240).
+        self.assertEqual(out, "Clicked 'the play button', sir.")
         bc.ui_click.assert_called_once_with(120, 240)
 
     def test_click_target_not_found(self):
@@ -245,7 +247,10 @@ class LocalVisionActionTests(unittest.TestCase):
              mock.patch.object(self.mod, "_bobert", return_value=bc), \
              mock.patch.object(self.mod, "_find_click_target_local", return_value=None):
             out = self.actions["local_click_target_by_description"]("a unicorn icon")
-        self.assertIn("could not find 'a unicorn icon'", out)
+        self.assertIn("couldn't find 'a unicorn icon'", out)
+        # still a failure the follow-up loop reads as one
+        from core.failure_markers import FAILURE_MARKERS
+        self.assertTrue(any(m in out.lower() for m in FAILURE_MARKERS), out)
 
     def test_click_surfaces_click_failure(self):
         bc = _fake_bc()
@@ -635,7 +640,7 @@ class FindClickTargetLocalTests(unittest.TestCase):
              mock.patch.object(self.mod, "_bobert", return_value=bc), \
              mock.patch.object(self.mod, "_local_query_coords", return_value=(11, 22)):
             out = self.actions["local_click_target_by_description"]("the OK button")
-        self.assertIn("clicked 'the OK button' at (11, 22)", out)
+        self.assertEqual(out, "Clicked 'the OK button', sir.")
         bc.ui_click.assert_called_once_with(11, 22)
 
 

@@ -250,6 +250,7 @@ def _snapshot_once(hwnd, win_rect, title, process, pid, monitor, budget_ms,
         url = ""
         has_pw = False
         items = []
+        over = False
         for i in range(n):
             try:
                 e = arr.GetElement(i)
@@ -282,13 +283,23 @@ def _snapshot_once(hwnd, win_rect, title, process, pid, monitor, budget_ms,
                     continue
             items.append((e, ct, name, r, pw, inv))
         els = []
+        # Link addresses are the only per-element cross-process reads (the
+        # rest came back cached in one call): ONE call each (the Value
+        # property, not GetCurrentPattern + CurrentValue), and only within
+        # half the read's budget - the read honours its budget (review
+        # 2026-10-05: hundreds of links x two calls ran heavy pages past
+        # the host's wedge line). A click reads its own target's address
+        # on demand (href_of) when this skipped it.
+        href_until = t0 + max(0.05, budget_ms / 1000.0) * 0.5
         for idx, (e, ct, name, r, pw, inv) in enumerate(items):
             in_doc = bool(doc_rect and r[1] >= doc_rect[1] - 1
                           and r[0] >= doc_rect[0] - 1)
             href = ""
-            if (want_hrefs and ct == 50005 and in_doc
-                    and len(name) >= 12):
-                href = _value_of(uia, e)
+            if want_hrefs and ct == 50005 and in_doc and len(name) >= 12:
+                if time.perf_counter() < href_until:
+                    href = _value_of(uia, e, single_call=True)
+                else:
+                    over = True
             keep.append(e)
             els.append(El(name=" ".join(name.split()),
                           ctype=CT_NAMES.get(ct, str(ct)), rect=r,
@@ -298,11 +309,11 @@ def _snapshot_once(hwnd, win_rect, title, process, pid, monitor, budget_ms,
         while len(_snaps) > _KEEP_SNAPSHOTS:
             _snaps.popitem(last=False)
         ms = (time.perf_counter() - t0) * 1000
-        return els, doc_rect, url, has_pw, n, ms, wr
+        return els, doc_rect, url, has_pw, n, ms, wr, over
     ok, val = uia_host.call(job, timeout_s=max(0.2, budget_ms / 1000.0))
     if not ok:
         return None
-    els, doc_rect, url, has_pw, n, ms, wr = val
+    els, doc_rect, url, has_pw, n, ms, wr, over = val
     # Occlusion (outside the host: plain Win32, no COM).
     marked = []
     for el in els:
@@ -315,7 +326,7 @@ def _snapshot_once(hwnd, win_rect, title, process, pid, monitor, budget_ms,
                     rect=tuple(wr) if wr else (),
                     elements=tuple(marked), partial=doc_rect is None,
                     ms=round(ms, 1), doc_rect=doc_rect, has_password=has_pw,
-                    heavy=(ms > _HEAVY_MS or n > _HEAVY_ELEMENTS),
+                    heavy=(ms > _HEAVY_MS or n > _HEAVY_ELEMENTS or over),
                     at=time.time())
 
 
@@ -357,7 +368,17 @@ def _pressed(ok, val):
     return None if val == "timeout" else False
 
 
-def _value_of(uia, e) -> str:
+def _value_of(uia, e, single_call: bool = False) -> str:
+    """The element's Value (a link's address, the address bar's text).
+    ``single_call``: the Value PROPERTY in one cross-process call first
+    (the pattern route costs two)."""
+    if single_call:
+        try:
+            v = e.GetCurrentPropertyValue(P_VALUE)
+            if isinstance(v, str):
+                return v
+        except Exception:
+            pass
     try:
         from comtypes.gen import UIAutomationClient as UIA
         pat = e.GetCurrentPattern(PAT_VALUE)
@@ -501,7 +522,7 @@ def toggle_state(el, timeout_s: float = 0.3):
 def href_of(el, timeout_s: float = 0.3) -> str:
     def job(uia):
         e = _resolve(el.ref)
-        return "" if _nil(e) else _value_of(uia, e)
+        return "" if _nil(e) else _value_of(uia, e, single_call=True)
     try:
         ok, val = uia_host.call(job, timeout_s=timeout_s)
         return val if ok and isinstance(val, str) else ""

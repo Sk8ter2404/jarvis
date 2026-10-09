@@ -35,8 +35,10 @@ from tests._monolith_harness import requires_monolith
 from tests.monolith.test_monolith_claim_validation import _Base
 
 
-@requires_monolith
-class ScreenVisionReplayTests(_Base):
+class _DeskBase(_Base):
+    """The fake desktop (YouTube home on the middle monitor) and the stubbed
+    actions both test classes below share."""
+
     def setUp(self):
         super().setUp()
         import core.actions as A
@@ -77,6 +79,25 @@ class ScreenVisionReplayTests(_Base):
 
     def _all_spoken(self):
         return " | ".join(self.spoken)
+
+    def _after_a_youtube_play_open(self):
+        self.G.freeze_scene("click that Mr. Beast video and then wake word "
+                            "mode", backend=self.desk)
+        time.sleep(0.01)
+        opened = F.FakeWindow(102, None, "top",
+                              title="Eat Everything - YouTube - Google Chrome")
+        self.desk.wins.insert(0, opened)
+        self.desk.ledger_entry = (102, "top",
+                                  "https://www.youtube.com/watch?v=zz",
+                                  "play_streaming")
+        self.L.note_opened("play_streaming",
+                           "https://www.youtube.com/watch?v=zz", hwnd=102,
+                           kind="window", monitor="top", title=opened.title)
+        return opened
+
+
+@requires_monolith
+class ScreenVisionReplayTests(_DeskBase):
 
     # 1 ──────────────────────────────────────────────────────────────────
     def test_compound_click_and_wake_word_mode(self):
@@ -120,21 +141,6 @@ class ScreenVisionReplayTests(_Base):
         self.assertEqual(self.desk.clicks, [])
 
     # 2 + 3 ──────────────────────────────────────────────────────────────
-    def _after_a_youtube_play_open(self):
-        self.G.freeze_scene("click that Mr. Beast video and then wake word "
-                            "mode", backend=self.desk)
-        time.sleep(0.01)
-        opened = F.FakeWindow(102, None, "top",
-                              title="Eat Everything - YouTube - Google Chrome")
-        self.desk.wins.insert(0, opened)
-        self.desk.ledger_entry = (102, "top",
-                                  "https://www.youtube.com/watch?v=zz",
-                                  "play_streaming")
-        self.L.note_opened("play_streaming",
-                           "https://www.youtube.com/watch?v=zz", hwnd=102,
-                           kind="window", monitor="top", title=opened.title)
-        return opened
-
     def test_thats_not_the_right_video_closes_it_and_asks(self):
         opened = self._after_a_youtube_play_open()
         resp = self._p(self.bc, "get_response_with_animation")
@@ -229,3 +235,128 @@ class ScreenVisionReplayTests(_Base):
                        ["[ACTION: local_click_target_by_description, dragon]",
                         "[ACTION: find_on_screen, dragon again]"])
         self.assertEqual(self.gfr.call_count, 1)
+
+
+@requires_monolith
+class ScreenVisionReviewTests(_DeskBase):
+    """The 2026-10-05 review's findings that live in the monolith's wiring:
+    the follow-up loop, the rewrite guard, the YouTube fallback, the trace
+    hook, the tray checkmark, the speak set and the route state. Each
+    failed on the reviewed head (7d52f87)."""
+
+    def test_real_find_failures_stop_at_the_second_round(self):
+        # find_on_screen's own not-found line (no stub): 5 rounds ran on
+        # the reviewed head - its text carried no failure marker.
+        self._dispatch("find the dragon thing",
+                       "[ACTION: find_on_screen, the dragon thing]",
+                       ["[ACTION: find_on_screen, the dragon picture]",
+                        "[ACTION: find_on_screen, a dragon icon]",
+                        "[ACTION: find_on_screen, dragon logo]",
+                        "[ACTION: find_on_screen, the red dragon]",
+                        "Sorry sir."])
+        self.assertEqual(self.gfr.call_count, 1)
+
+    def test_a_search_request_is_not_turned_into_a_click(self):
+        from core.screen_text import El
+        x, y = self.home.rect[0] + 200, self.home.rect[1] + 300
+        self.home.elements_override = [El(
+            name="Python", ctype="Hyperlink", rect=(x, y, 120, 24),
+            href="https://www.python.org/", invokable=True,
+            in_document=True, ref=("x", 1))]
+        self._dispatch("search google for how to click a link in python",
+                       "[intent:confirmation] [ACTION: web_search, how to "
+                       "click a link in python]")
+        self.assertEqual(len(self.calls["web_search"]), 1)
+        self.assertEqual(self.desk.clicks, [])
+        self.assertEqual(self.desk.invokes, [])
+
+    def test_play_that_video_on_youtube_searches_when_it_is_not_on_screen(
+            self):
+        self.desk.wins[:] = [F.FakeWindow(300, None, "middle",
+                                          title="Untitled - Notepad",
+                                          process="notepad.exe")]
+        resp = self._p(self.bc, "get_response_with_animation")
+        self._quiet(self.bc._run_llm_dispatch,
+                    "play that MrBeast video on YouTube")
+        resp.assert_not_called()
+        self.assertEqual(self.calls["youtube_play"], ["MrBeast"])
+        self.assertIn("from YouTube", self._all_spoken())
+
+    def test_play_that_video_on_youtube_clicks_it_when_it_is_on_screen(self):
+        resp = self._p(self.bc, "get_response_with_animation")
+        self._quiet(self.bc._run_llm_dispatch,
+                    "play that MrBeast video on YouTube")
+        resp.assert_not_called()
+        self.assertEqual(self.calls["youtube_play"], [])
+        self.assertEqual(len(self.desk.clicks), 1)
+
+    def test_a_look_with_no_step_is_traced_text_only_when_private(self):
+        import io
+        from PIL import Image
+        from core import config as cfg
+        from core import vision_trace as VT
+        self._p(cfg, "VISION_TRACE", "on", create=True)
+        VT._reset_for_tests()
+        self.addCleanup(VT._reset_for_tests)
+        self._p(self.bc, "_turn_user_text", return_value="what's on screen?")
+        self._p(self.bc, "_call_local_vision_raw",
+                return_value="a page of videos")
+        self._p(self.bc, "_fit_images_for_vlm", side_effect=lambda i: i)
+        buf = io.BytesIO()
+        Image.new("RGB", (320, 200), (90, 20, 20)).save(buf, format="PNG")
+        png = buf.getvalue()
+        with mock.patch("core.screen_privacy.visible_private",
+                        return_value=None):
+            self.bc._call_local_vision("what is on screen?", [png], 200)
+        with mock.patch("core.screen_privacy.visible_private",
+                        return_value="sensitive window"):
+            self.bc._call_local_vision("what is on screen?", [png], 200)
+        VT.flush(5)
+        idx = VT.read_index()
+        self.assertEqual(len(idx), 2, idx)
+        self.assertEqual(idx[0]["step"], "vision")
+        self.assertEqual(len(idx[0]["model_calls"]), 1)
+        self.assertEqual(len(idx[0]["images"]), 1)
+        self.assertEqual(idx[1]["privacy"], VT.PRIVATE_SKIP)
+        self.assertNotIn("images", idx[1])
+
+    def test_the_tray_checkmark_follows_every_start_and_stop(self):
+        import types
+        from core import dev_notes as DN
+        from core import screen_memory as SW
+        from core import vision_trace as VT
+        from tests.test_screen_memory import FakeEnv
+        hud = self._p(self.bc, "_write_hud_state")
+        w = SW.Watcher(env=FakeEnv([]), clock=time.time)
+        w.thread = types.SimpleNamespace(is_alive=lambda: True)
+        self.addCleanup(SW.set_state_publisher, None)
+        self.addCleanup(VT.set_context_provider, None)
+        self.addCleanup(DN.set_context_provider, None)
+        with mock.patch.dict(SW._singleton, {"w": w}), \
+                mock.patch("core.screen_timeline.start_pruner"):
+            self._quiet(self.bc._screen_vision_boot)
+            self._quiet(SW.start)              # boot autostart / voice
+            self._quiet(SW.stop)
+        seen = [c.kwargs["screen_memory"] for c in hud.call_args_list
+                if "screen_memory" in c.kwargs]
+        self.assertEqual(seen, [False, True, False])
+
+    def test_the_local_description_click_is_spoken(self):
+        self.assertIn("local_click_target_by_description",
+                      self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        self._stub("local_click_target_by_description",
+                   "Which one, sir: 'Cats' or 'Dogs'?")
+        # (not "click the animal video": the screen route takes that one
+        # before the brain)
+        self._dispatch("the animal video, please",
+                       "[ACTION: local_click_target_by_description, the "
+                       "animal video]")
+        self.assertEqual(self.calls["local_click_target_by_description"],
+                         ["the animal video"])
+        self.assertIn("Which one, sir", self._all_spoken())
+
+    def test_go_back_after_he_moved_on_is_not_an_undo(self):
+        opened = self._after_a_youtube_play_open()
+        self.assertTrue(self.bc._screen_route_state()["recent_ui"])
+        opened.title = "Another Video - YouTube - Google Chrome"
+        self.assertFalse(self.bc._screen_route_state()["recent_ui"])

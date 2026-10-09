@@ -89,8 +89,10 @@ class FakeEnv:
                 return self.thumbs.get(mon, _thumb())
         return _thumb()
 
-    def capture(self, rect, windows):
+    def capture(self, rect, windows, urls=None):
         self.captures += 1
+        self.capture_windows = list(windows)
+        self.capture_urls = dict(urls or {})
         from PIL import Image
         return Image.new("RGB", (int(rect[2]), int(rect[3])))
 

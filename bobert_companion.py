@@ -5463,12 +5463,15 @@ def _screen_memory_tray(cmd: str, entry: dict) -> str:
             if not _sw.is_running():
                 return "Screen memory is off, sir."
             return _sw.pause(mins)
+        # The tray checkmark (hud_state.screen_memory) is published by
+        # core.screen_memory itself on every start / stop (_screen_vision_
+        # boot registers the publisher) - not here, so a boot autostart or a
+        # voice toggle shows too.
         if _sw.is_running():
             _sw.stop()
             on = False
         else:
             on = _sw.start()
-        _write_hud_state(screen_memory=bool(on))
         return ("Screen memory on, sir - text only." if on
                 else "Screen memory off, sir.")
     except Exception as _e:
@@ -22040,13 +22043,41 @@ def _call_local_vision(question: str, png_images: list[bytes],
     t0 = time.monotonic()
     imgs = _fit_images_for_vlm(png_images)
     ans = _call_local_vision_raw(question, imgs, max_tokens)
+    _trace_vision_call(question, imgs, ans or "",
+                       (time.monotonic() - t0) * 1000)
+    return ans
+
+
+def _trace_vision_call(question, images, answer, ms, cloud=False) -> None:
+    """Record one vision-model call in the owner-approved trace (core.
+    vision_trace): into the step a screen action opened; with no step open
+    but inside an OWNER TURN on this thread, as its own entry - a
+    see_screen look, the focused-window look, a recall_screen visual
+    follow-up, the legacy pixel click search (review 2026-10-05: those ran
+    with no step and were never recorded). The images are the ones the
+    model was given (after the take_screenshot privacy gate) - and, for a
+    look with no step of its own (whole monitors), only while no visible
+    window is private: that gate judges the FOCUSED window alone, so a bank
+    tab on another monitor would be kept (core.screen_privacy.
+    visible_private; the entry is then "skipped: private", no image). A
+    background caller (no turn: the Teams nudger, ambient) is never traced.
+    Never raises."""
     try:
         from core import vision_trace as _vtr
-        _vtr.note_model_call(question, imgs, ans or "",
-                             ms=(time.monotonic() - t0) * 1000)
+        if _vtr.current() is not None:
+            _vtr.note_model_call(question, images, answer, ms=ms, cloud=cloud)
+            return
+        said = _turn_user_text()
+        if not said or _vtr.mode() == "off":
+            return
+        from core import screen_privacy as _sp
+        why = _sp.visible_private()
+        with _vtr.step("vision", utterance=said, privacy=why,
+                       source="cloud" if cloud else "local") as _st:
+            _st.model_call(question, images, answer, ms=ms, cloud=cloud)
+            _st.finish("answered" if answer else "no answer")
     except Exception:
         pass
-    return ans
 
 
 def _call_local_vision_raw(question: str, png_images: list[bytes],
@@ -26919,6 +26950,7 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
 
     try:
         b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
+        _t0_cloud = time.monotonic()
         msg = _claude_create(
             "vision",
             model=SCREEN_VISION_MODEL, max_tokens=500,
@@ -26932,7 +26964,10 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
                 ],
             }],
         )
-        return _claude_reply_text(msg).strip()
+        _ans_cloud = _claude_reply_text(msg).strip()
+        _trace_vision_call(question, [png_bytes], _ans_cloud,
+                           (time.monotonic() - _t0_cloud) * 1000, cloud=True)
+        return _ans_cloud
     except anthropic.APIStatusError as e:
         # 4xx/5xx from Claude (rate limit, credit exhausted, server error,
         # auth) — exactly the case the local VLM fallback was built for.
@@ -27084,12 +27119,16 @@ def _ask_vision_multi_raw(question: str, images: dict[str, bytes]) -> str:
             })
         content.append({"type": "text", "text": question})
 
+        _t0_cloud = time.monotonic()
         msg = _claude_create(
             "vision",
             model=SCREEN_VISION_MODEL, max_tokens=800,
             messages=[{"role": "user", "content": content}],
         )
-        return _claude_reply_text(msg).strip()
+        _ans_cloud = _claude_reply_text(msg).strip()
+        _trace_vision_call(question, list(images.values()), _ans_cloud,
+                           (time.monotonic() - _t0_cloud) * 1000, cloud=True)
+        return _ans_cloud
     except anthropic.APIStatusError as e:
         # 4xx/5xx from Claude (rate limit, credit exhausted, server error,
         # auth) — exactly the case the local VLM fallback was built for.
@@ -31846,15 +31885,27 @@ def _dev_notes_context() -> dict:
     return out
 
 
+def _publish_screen_memory_state(on) -> None:
+    """hud_state.screen_memory for the tray checkmark. Never raises."""
+    try:
+        _write_hud_state(screen_memory=bool(on))
+    except Exception:
+        pass
+
+
 def _screen_vision_boot() -> None:
     """Wire the screen-vision modules at boot. Never raises."""
     try:
         from core import dev_notes as _dn
+        from core import screen_memory as _sw
         from core import screen_timeline as _tl
         from core import vision_trace as _vtr
         _vtr.set_context_provider(_screen_vision_context)
         _dn.set_context_provider(_dev_notes_context)
         _tl.start_pruner()
+        # The tray's "Screen Memory" checkmark follows EVERY start / stop
+        # (review 2026-10-05: only the tray's own toggle wrote it).
+        _sw.set_state_publisher(_publish_screen_memory_state)
     except Exception as _e:
         print(f"  [screen-vision] boot wiring failed: {_e}")
 
@@ -33227,15 +33278,21 @@ def _screen_route_state() -> dict:
             st["allow_yes"] = bool(
                 p.get("allow_yes") or len(p.get("options") or []) == 1) and not (
                 _pending_confirmation or _open_offer_pending())
-        st["recent_ui"] = _gc.last_ui_action() is not None
-        if not st["recent_ui"]:
-            from core import opened_ledger as _ol
-            st["recent_ui"] = _ol.last_opened(_gc.UI_ACTION_TTL_S) is not None
+        # The ONE rule _undo applies (core.grounded_click.undoable): a click
+        # of JARVIS's, or a page he opened that nothing happened in since -
+        # never a page the owner has since navigated himself (review
+        # 2026-10-05: "go back" closed it).
+        st["recent_ui"] = _gc.undoable()
     except Exception:
         pass
     try:
         from core import screen_memory as _sw
         st["watching"] = _sw.is_running()
+    except Exception:
+        pass
+    try:
+        from core import screen_privacy as _sp
+        st["app_known"] = _sp.app_open
     except Exception:
         pass
     try:
@@ -35463,6 +35520,10 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # or acts on it.
     "click_on_screen", "undo_click", "note_for_claude", "screen_memory",
     "forget_screen",
+    # skills/local_vision's description click IS the grounded click: its
+    # finished sentence / question ("which one, sir?") must be spoken, or
+    # the question it armed is never heard (review 2026-10-05).
+    "local_click_target_by_description",
     "whoami", "face_id_status",
     # Audio output-device switching (skills/audio_autoswitch.py) — each returns
     # a finished confirmation sentence.
@@ -37801,14 +37862,19 @@ def _enforce_onscreen_reference(reply: str) -> str:
         if "click_on_screen" not in ACTIONS:
             return reply
         from core import onscreen_refs as _or
-        if not _or.is_onscreen_reference(said):
+        # The owner POINTED at a thing ("click that MrBeast video", "play
+        # that phone review video") and did not ask to search (review
+        # 2026-10-05: "search google for how to click a link in python"
+        # matched an on-screen "Python" link and became a click).
+        said_ref = _or.rewrite_referent(said)
+        if not said_ref:
             return reply
         hits = [m for m in _ACTION_RE.finditer(reply or "")
                 if m.group(1).strip().lower() in _ONSCREEN_REWRITE_ACTIONS]
         if not hits:
             return reply
         m = hits[0]
-        referent = _or.referent_phrase(said) or (m.group(2) or "").strip()
+        referent = said_ref
         if not referent:
             return reply
         from core import grounded_click as _gc

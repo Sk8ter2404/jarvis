@@ -204,8 +204,10 @@ def _token_arg(text) -> str:
 def screen_route(utterance, state=None) -> str | None:
     """The token a screen route claims ``utterance`` with, else None (see
     the block comment). ``state`` keys: pending (core.grounded_click's open
-    question or None), allow_yes, recent_ui, watching, other_watch, scenes,
-    claude_note, click, click_route. Never raises."""
+    question or None), allow_yes, recent_ui (core.grounded_click.undoable),
+    watching, other_watch, scenes, claude_note, click, click_route, and
+    app_known (name -> True when an open window is that app). Never
+    raises."""
     try:
         from core import onscreen_refs as _or
         st = dict(state or {})
@@ -249,6 +251,15 @@ def screen_route(utterance, state=None) -> str | None:
             if op == "exclude_this":
                 return "[ACTION: screen_memory, exclude_this]"
             if op == "exclude_app":
+                # "stop watching the room" (guard mode), "stop watching the
+                # video" are not about screen memory (review 2026-10-05):
+                # an app exclusion is claimed only while screen memory runs
+                # AND the words name an app that is open on the screen
+                # (``app_known``); anything else is the brain's.
+                known = st.get("app_known")
+                if not (st.get("watching") and callable(known)
+                        and known(cmd["app"])):
+                    return None
                 return (f"[ACTION: screen_memory, exclude "
                         f"{_token_arg(cmd['app'])}]")
         span = _or.forget_span(utterance)

@@ -2756,7 +2756,45 @@ def _click_on_screen(args: str, said: str) -> str:
     from core import grounded_click as _gc
     r = _gc.run_bounded(args, said=said, mode="click")
     _note_screen_look("click_on_screen", r.text)
-    return r.text
+    return _youtube_when_not_on_screen(r, args, said) or r.text
+
+
+def _youtube_when_not_on_screen(r, args: str, said: str) -> str:
+    """"play that MrBeast video on YouTube" when NO such video is on the
+    screen: he named YouTube, so its search-and-play runs (main did that;
+    review 2026-10-05: the screen route answered "I don't see it" and
+    nothing played). Only on a plain "not on screen": never after a time-out
+    (the page may hold it), a failure, an open question or a pick / scene
+    answer; and only for that exact shape (core.onscreen_refs.
+    youtube_play_query). "" otherwise. Never raises."""
+    try:
+        from core import grounded_click as _gc
+        from core import onscreen_refs as _or
+        if (r.outcome != _gc.NOT_FOUND or r.failed
+                or r.tier == _gc.TIMED_OUT):
+            return ""
+        if str(args or "").strip().lower().startswith(("pick:", "scene:")):
+            return ""
+        if _gc.pending_choice() is not None:
+            return ""
+        q = _or.youtube_play_query(said)
+        if not q:
+            return ""
+        fn = getattr(_bc(), "ACTIONS", {}).get("youtube_play")
+        if not callable(fn):
+            return ""
+        print(f"  [click] {q!r} is not on screen and he named YouTube - "
+              "playing it from a search", flush=True)
+        res = str(fn(q) or "")
+        from core.failure_markers import FAILURE_MARKERS
+        low = res.lower()
+        if not res or any(m in low for m in FAILURE_MARKERS):
+            return ("I don't see that on screen, sir, and the YouTube "
+                    f"search didn't play it: {res or 'no answer'}")
+        return (f"I don't see that on screen, sir, so I've put '{q}' on "
+                "from YouTube.")
+    except Exception:
+        return ""
 
 
 def _act_undo_click(args: str = "") -> str:

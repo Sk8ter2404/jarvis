@@ -37,9 +37,11 @@ import threading
 import time
 
 __all__ = ["call", "submit", "available", "set_backend", "status",
-           "reset_for_tests", "DISABLED", "WEDGE_GRACE_S"]
+           "reset_for_tests", "DISABLED", "SWITCHED_OFF", "WEDGE_GRACE_S",
+           "switched_off"]
 
 DISABLED = "disabled"
+SWITCHED_OFF = "switched off"
 WEDGE_GRACE_S = 3.0
 _CONNECTION_TIMEOUT_MS = 1500
 _TRANSACTION_TIMEOUT_MS = 1000
@@ -196,7 +198,22 @@ def reset_for_tests() -> None:
         _state.update(host=None, wedges=0, disabled=False, told=False)
 
 
+def switched_off() -> bool:
+    """SCREEN_UIA_ENABLED is False: no UI Automation at all - the ONE
+    chokepoint every reader passes (core.screen_text: page reads, address
+    reads, presses, the privacy gate's address check, the page wait after
+    open_url, the search-results line). Review 2026-10-05: the switch only
+    stopped the click path's page reads. Never raises."""
+    try:
+        from core import config as _c
+        return getattr(_c, "SCREEN_UIA_ENABLED", True) is False
+    except Exception:
+        return False
+
+
 def _host() -> "_Host | None":
+    if switched_off():
+        return None
     with _lock:
         if _state["disabled"]:
             return None
@@ -248,6 +265,8 @@ def call(fn, timeout_s: float = 1.0):
     Waits at most ``timeout_s`` (plus the host's start-up the first time,
     bounded too). Never raises."""
     try:
+        if switched_off():
+            return False, SWITCHED_OFF
         h = _host()
         if h is None:
             return False, DISABLED if _state["disabled"] else "unavailable"

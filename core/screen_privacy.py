@@ -47,8 +47,28 @@ __all__ = [
     "reads_blocked", "DEFAULT_PATTERNS", "owner_blocklist", "compiled_patterns",
     "title_reason", "auth_reason", "window_private", "region_gate",
     "Gate", "exclude_window", "exclude_app", "excluded", "clear_exclusions",
-    "set_exclusions_provider",
+    "set_exclusions_provider", "BROWSER_PROCESSES", "is_browser_process",
+    "url_private", "live_private", "address_bar_private", "UNKNOWN_ADDRESS",
+    "visible_private",
+    "app_open",
 ]
+
+# Browsers: their window title does not say which SITE is showing, so a page
+# is private by its ADDRESS too (review 2026-10-05: a bank page titled
+# "Accounts Overview - Google Chrome" at secure.chase.com was stored, spoken
+# and traced because only the title was checked).
+BROWSER_PROCESSES = frozenset({"chrome.exe", "msedge.exe", "firefox.exe",
+                               "brave.exe", "opera.exe", "vivaldi.exe"})
+# The reason for a browser window whose address could not be read, where a
+# caller must fail closed (screen memory, a window above a capture target).
+UNKNOWN_ADDRESS = "its address could not be read"
+
+
+def is_browser_process(process) -> bool:
+    try:
+        return str(process or "").strip().lower() in BROWSER_PROCESSES
+    except Exception:
+        return False
 
 def reads_blocked() -> bool:
     """True in a test process (tests/__init__.py sets JARVIS_NO_SCREEN_READ=1)
@@ -292,14 +312,72 @@ def excluded(win) -> Optional[str]:
                 return "excluded by the owner"
         proc = str(_get(win, "process") or "").lower()
         title = str(_get(win, "title") or "").lower()
-        stem = proc[:-4] if proc.endswith(".exe") else proc
+        host = _host(_with_scheme(_get(win, "url")))
         for app in _app_names():
-            if app and (app == stem or app == proc or app in title.split(" - ")[-1]
-                        or (len(app) >= 4 and app in stem)):
+            if app and _app_matches(app, proc, title, host):
                 return "excluded by the owner"
     except Exception:
         return None
     return None
+
+
+def app_open(name, windows=None) -> bool:
+    """Is an app the owner names ("Discord", "Gmail", "my bank") open on the
+    screen right now - a visible window's process or title part? The
+    screen routes ask before claiming "don't watch <name>" (core.dispatcher:
+    "stop watching the room" is guard mode's). ``windows`` for tests; the
+    real ones otherwise (core.screen_scope). Never raises."""
+    try:
+        app = " ".join(str(name or "").split()).lower()
+        if not app:
+            return False
+        if windows is None:
+            from core import screen_scope as _sc
+            windows = _sc.visible_windows()
+        for w in windows or ():
+            if _app_matches(app, str(_get(w, "process") or "").lower(),
+                            str(_get(w, "title") or "").lower(),
+                            _host(_with_scheme(_get(w, "url")))):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+_TITLE_PART_SPLIT_RE = re.compile(r"\s+[-–—|·]\s+")
+
+
+def _app_matches(app: str, proc: str, title: str, host: str) -> bool:
+    """Does the owner's "don't watch <app>" name this window? Its process
+    ("discord" = Discord.exe), any part of its title ("Gmail" in "Inbox -
+    me@x - Gmail - Google Chrome", "YouTube" in "Video - YouTube - Google
+    Chrome" - review 2026-10-05: only the LAST part was checked, which for a
+    browser is always "Google Chrome"), or its site's address ("bank" in
+    mybank.example.com). Whole words in a title, so "bank" does not match
+    "Banking basics". Never raises."""
+    try:
+        a = " ".join(app.split()).lower()
+        if not a:
+            return False
+        stem = proc[:-4] if proc.endswith(".exe") else proc
+        if a in (stem, proc) or (len(a) >= 4 and a in stem):
+            return True
+        word = re.compile(r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])")
+        browser = is_browser_process(proc)
+        parts = [p.strip() for p in _TITLE_PART_SPLIT_RE.split(title)
+                 if p.strip()]
+        if browser and parts and re.match(
+                r"^(?:google chrome|microsoft\s*edge|brave|opera|vivaldi|"
+                r"mozilla firefox)$", parts[-1]):
+            parts = parts[:-1]              # the browser's own name
+        if any(word.search(p) for p in parts):
+            return True
+        squashed = re.sub(r"[^a-z0-9]", "", a)
+        if host and len(squashed) >= 4 and squashed in host.replace("-", ""):
+            return True
+    except Exception:
+        return False
+    return False
 
 
 def _get(win, key, default=None):
@@ -314,7 +392,9 @@ def _get(win, key, default=None):
 def window_private(win, has_password: bool = False) -> Optional[str]:
     """Why ``win`` (hwnd, title, process, url) must not be read, captured,
     stored or traced: an owner exclusion, a blocklist / sensitive match, a
-    sign-in page, or a password box on it; else None. Never raises."""
+    sign-in page, or a password box on it; else None. Judges only the
+    fields it is given - for a browser window use live_private, which adds
+    the CURRENT address. Never raises."""
     try:
         why = excluded(win)
         if why:
@@ -325,11 +405,131 @@ def window_private(win, has_password: bool = False) -> Optional[str]:
         why = title_reason(title, proc, url)
         if why:
             return why
-        why = auth_reason(title, url)
+        why = auth_reason(title, _with_scheme(url))
         if why:
             return why
         if has_password or _get(win, "has_password"):
             return "a password box is on it"
+    except Exception:
+        return "privacy check failed"
+    return None
+
+
+def _with_scheme(url) -> str:
+    """An address as the address bar shows it ("secure.example.com/x") with a
+    scheme, so address rules written for "https://..." apply. Never
+    raises."""
+    try:
+        u = str(url or "").strip()
+        if not u:
+            return ""
+        if "://" in u or u.lower().startswith(("about:", "chrome:", "edge:",
+                                               "file:", "data:")):
+            return u
+        if re.match(r"^[A-Za-z]:[\\/]", u):
+            return u
+        return "https://" + u
+    except Exception:
+        return ""
+
+
+def url_private(url) -> Optional[str]:
+    """Why an ADDRESS alone makes a page private (the owner's blocklist and
+    the sensitive defaults over the address - a bank's host - or a sign-in
+    address), else None. Takes the address with or without its scheme.
+    Never raises."""
+    try:
+        u = _with_scheme(url)
+        if not u:
+            return None
+        return title_reason("", "", u) or auth_reason("", u)
+    except Exception:
+        return "privacy check failed"
+
+
+def live_private(win, url=None, url_of=None, has_password: bool = False,
+                 fail_closed: bool = False) -> Optional[str]:
+    """window_private, with a browser window's CURRENT address: ``url`` when
+    the caller has it, else ``url_of(hwnd)`` (a UI Automation read of the
+    address bar). A browser whose address cannot be read is judged on its
+    title alone - or, with ``fail_closed``, is private (UNKNOWN_ADDRESS):
+    screen memory and windows covering a capture use that. Never raises."""
+    try:
+        why = window_private(win, has_password=has_password)
+        if why:
+            return why
+        if not is_browser_process(_get(win, "process")):
+            return None
+        u = url if url else (_get(win, "url") or "")
+        if not u and callable(url_of):
+            try:
+                u = url_of(_get(win, "hwnd")) or ""
+            except Exception:
+                u = ""
+        if not u:
+            return UNKNOWN_ADDRESS if fail_closed else None
+        return window_private({"hwnd": _get(win, "hwnd"),
+                               "title": _get(win, "title") or "",
+                               "process": _get(win, "process") or "",
+                               "url": u}, has_password=has_password)
+    except Exception:
+        return "privacy check failed"
+
+
+def visible_private(windows=None, url_of=None) -> Optional[str]:
+    """Why a picture of WHOLE monitors must not be KEPT (the vision trace of
+    a see_screen look): a visible window is private - an owner exclusion,
+    the blocklist / sensitive defaults by title or process, a sign-in page,
+    or a browser page by its current address. take_screenshot's gate only
+    judges the FOCUSED window, so a bank tab on another monitor reached
+    the model; the trace keeps only "skipped: private" for it (review
+    2026-10-05). ``windows`` / ``url_of(hwnd)`` for tests; the real windows
+    and UI Automation address reads otherwise. None when none is private
+    (or nothing could be listed); "privacy check failed" on an error.
+    Never raises."""
+    try:
+        if windows is None:
+            from core import screen_scope as _sc
+            windows = _sc.visible_windows()
+        if url_of is None:
+            def url_of(h):
+                from core import screen_text as _st
+                return _st.read_url(h, timeout_s=0.2) or ""
+        for w in windows or ():
+            why = live_private(w, url_of=url_of)
+            if why:
+                return why
+    except Exception:
+        return "privacy check failed"
+    return None
+
+
+# The address-bar row of a browser window: below the tab strip, above the
+# page (Chrome at 100%: tabs 0-40 px, address bar ~46-80 px).
+_TAB_STRIP_PX = 36
+_ADDRESS_TOKEN_RE = re.compile(r"[\w.-]+\.[a-z]{2,}(?:[/:?#][^\s]*)?",
+                               re.IGNORECASE)
+
+
+def address_bar_private(ocr_lines, page_top: float) -> Optional[str]:
+    """Why the address bar, as OCR read it from a browser-window crop, makes
+    the page private. ``ocr_lines`` are dicts with "t" and "rect" [x, y, w,
+    h] relative to the crop's top-left; ``page_top`` is where the page
+    starts in the crop (the toolbar's bottom). The second line of defence
+    when the address could not be read through UI Automation. Never
+    raises (a failure is private)."""
+    try:
+        for ln in ocr_lines or ():
+            r = ln.get("rect") if isinstance(ln, dict) else None
+            if not r or len(r) < 4:
+                continue
+            cy = float(r[1]) + float(r[3]) / 2.0
+            if not (_TAB_STRIP_PX <= cy <= float(page_top)):
+                continue
+            for tok in _ADDRESS_TOKEN_RE.findall(str(ln.get("t") or "")):
+                why = url_private(tok)
+                if why:
+                    return why
     except Exception:
         return "privacy check failed"
     return None

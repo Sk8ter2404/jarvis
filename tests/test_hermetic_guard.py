@@ -624,6 +624,16 @@ def _imagegrab_pixel_spies():
                      side_effect=AssertionError("reached the pixels")))
                  for name in ("grabscreen_win32", "grabscreen_x11")
                  if hasattr(Image.core, name)]
+        if not hasattr(Image.core, "grabscreen_x11"):
+            # A Pillow built without XCB (the Windows wheel under
+            # tools/run_tests_ci_sim.py's sys.platform="linux") takes the X11
+            # branch too: give it the spy that branch would reach, so the
+            # grab ends at a spy, not at "Pillow was built without XCB".
+            stack.enter_context(mock.patch.object(Image.core, "HAVE_XCB",
+                                                  True, create=True))
+            spies.append(stack.enter_context(mock.patch.object(
+                Image.core, "grabscreen_x11", create=True,
+                side_effect=AssertionError("reached the pixels"))))
         spies.append(stack.enter_context(
             mock.patch.object(ImageGrab, "subprocess")))
         yield spies

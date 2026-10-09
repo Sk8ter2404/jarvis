@@ -37,6 +37,7 @@ Pure stdlib; never raises at the public API.
 from __future__ import annotations
 
 import difflib
+import functools
 import math
 import re
 
@@ -44,6 +45,7 @@ __all__ = [
     "FLOOR", "MARGIN", "REWRITE_MIN",
     "toks", "content_tokens", "tok_sim", "split_label", "prepare",
     "group_cards", "video_cards", "card_target", "reading_order",
+    "is_ad_card", "ad_members",
     "resolve", "describe_position", "legend", "label_of",
 ]
 
@@ -113,14 +115,23 @@ def _stem(t: str) -> str:
     return t
 
 
+@functools.lru_cache(maxsize=65536)
 def tok_sim(q: str, c: str) -> float:
-    """How well spoken token ``q`` matches on-screen token ``c`` (0..1)."""
+    """How well spoken token ``q`` matches on-screen token ``c`` (0..1).
+    Cached (a page repeats its words, and the IDF pass and the scoring pass
+    ask the same pairs), and the edit-distance ratio is only computed when
+    the lengths allow 0.8 (review 2026-10-05: 850 ms for 2,400
+    candidates, all in difflib)."""
     if q == c:
         return 1.0
     if len(q) >= 4 and len(c) >= 4:
         if _stem(q) == _stem(c):
             return 0.9
-        r = difflib.SequenceMatcher(None, q, c).ratio()
+        lq, lc = len(q), len(c)
+        if 2.0 * min(lq, lc) / (lq + lc) < 0.8:
+            r = 0.0                       # ratio() could not reach 0.8
+        else:
+            r = difflib.SequenceMatcher(None, q, c).ratio()
         # ASR slips: "senat"~"cenat", "veritasiam" - a letter or so, not a
         # missing prefix ("mrbeast" is not "beast", ratio 0.83).
         if r >= 0.8 and (abs(len(q) - len(c)) <= 1 or r >= 0.9):
@@ -195,24 +206,46 @@ def label_of(cand) -> str:
         return ""
 
 
+_CARD_GAP = 18
+_CARD_COL = 60
+
+
 def group_cards(cands) -> list:
     """Stack elements that share a column (x overlap) and touch vertically
-    (thumbnail / title / channel / meta of one video card)."""
+    (thumbnail / title / channel / meta of one video card). Near-linear:
+    candidates arrive top to bottom, so only cards still OPEN (their last
+    element ends at most 18 px above) in a nearby column are tried (review
+    2026-10-05: every card was tried for every element - 364 ms at 2,400).
+    The first matching card in creation order wins, as before."""
     cs = sorted([c for c in cands if c.get("rect")],
                 key=lambda c: (c["rect"][1], c["rect"][0]))
     cards: list = []
+    cols: dict = {}               # column bucket -> [card index, ...]
     for c in cs:
         x, y, w, h = c["rect"]
         home = None
-        for card in cards:
+        b0 = int(x // _CARD_COL)
+        near = []
+        for bk in (b0 - 1, b0, b0 + 1):
+            idxs = cols.get(bk)
+            if not idxs:
+                continue
+            # drop cards that can never take another element
+            idxs[:] = [i for i in idxs
+                       if y - (cards[i][-1]["rect"][1]
+                               + cards[i][-1]["rect"][3]) <= _CARD_GAP]
+            near.extend(idxs)
+        for i in sorted(near):
+            card = cards[i]
             lx, ly, lw, lh = card[-1]["rect"]
             ov = min(x + w, lx + lw) - max(x, lx)
-            if (ov > 0.5 * min(w, lw) and -4 <= y - (ly + lh) <= 18
-                    and abs(x - card[0]["rect"][0]) < 60):
+            if (ov > 0.5 * min(w, lw) and -4 <= y - (ly + lh) <= _CARD_GAP
+                    and abs(x - card[0]["rect"][0]) < _CARD_COL):
                 home = card
                 break
         if home is None:
             cards.append([c])
+            cols.setdefault(b0, []).append(len(cards) - 1)
         else:
             home.append(c)
     return cards
@@ -226,15 +259,83 @@ def _is_thumb(c) -> bool:
     return c["rect"][3] > 120
 
 
+# An advert is not a video (review 2026-10-05: "the first video" picked a
+# "Sponsored" Shop-Now card): a card with a sponsor marker or a sales
+# call-to-action as one of its own lines.
+_AD_MARK_RE = re.compile(
+    r"^\s*(?:sponsored|ad|ads|promoted|advertisement)\b(?:\s*[·•|:-].*)?$",
+    re.IGNORECASE)
+_AD_CTA_RE = re.compile(
+    r"^\s*(?:shop\s+now|buy\s+now|order\s+now|learn\s+more|sign\s+up|"
+    r"get\s+offer|visit\s+(?:site|advertiser)|install(?:\s+now)?|"
+    r"download(?:\s+now)?|get\s+the\s+app|book\s+now|apply\s+now)\s*$",
+    re.IGNORECASE)
+_AD_SUFFIX_RE = re.compile(r"\s[-–—|·]\s*(?:shop|buy|order)\s+now\s*$",
+                           re.IGNORECASE)
+
+
+def _line_text(c) -> str:
+    return str(c.get("raw") or c.get("text") or "")
+
+
+def is_ad_card(card) -> bool:
+    """A grouped card that is an advert: a sponsor marker ("Sponsored",
+    "Ad · shop.example") or a "<title> - Shop Now" line among its own
+    lines, or a sales call-to-action ("Shop now", "Install") on a card WITH
+    a thumbnail - a plain "Download" / "Learn more" / "Sign up" button under
+    a heading is not an advert. Never raises."""
+    try:
+        if any(_AD_MARK_RE.match(_line_text(c))
+               or _AD_SUFFIX_RE.search(_line_text(c)) for c in card):
+            return True
+        return (any(_AD_CTA_RE.match(_line_text(c)) for c in card)
+                and any(_is_thumb(c) for c in card if c.get("rect")))
+    except Exception:
+        return False
+
+
+def ad_members(cands) -> set:
+    """ids of the candidates that belong to an advert: every element of an
+    ad card (a sponsor marker or a sales call-to-action among its stacked
+    lines), and - for a LONE "Sponsored" label - the block right under it
+    (the same column, within 120 px). Never raises."""
+    out = set()
+    try:
+        lone = []
+        for card in group_cards(cands):
+            if not is_ad_card(card):
+                continue
+            if len(card) >= 2:
+                out.update(id(c) for c in card)
+            elif _AD_MARK_RE.match(str(card[0].get("raw")
+                                       or card[0].get("text") or "")):
+                lone.append(card[0])
+                out.add(id(card[0]))
+            else:
+                out.add(id(card[0]))
+        for m in lone:
+            mx, my, mw, mh = m["rect"]
+            for c in cands:
+                if not c.get("rect") or id(c) in out:
+                    continue
+                x, y, w, h = c["rect"]
+                if (0 < y - my <= 120 and abs(x - mx) < _CARD_COL):
+                    out.add(id(c))
+    except Exception:
+        return out
+    return out
+
+
 def video_cards(cands) -> list:
     """The video cards among ``cands``: 2-6 stacked elements with a title
-    line, and a thumbnail or at least three lines. A stacked navigation
-    list (the sidebar) is not one."""
+    line, and a thumbnail or at least three lines; never an advert. A
+    stacked navigation list (the sidebar) is not one."""
     cards = group_cards(cands)
     grid = [cd for cd in cards
             if 2 <= len(cd) <= _CARD_MAX_ELEMENTS
             and any(_is_titleish(c) for c in cd)
-            and (any(_is_thumb(c) for c in cd) or len(cd) >= 3)]
+            and (any(_is_thumb(c) for c in cd) or len(cd) >= 3)
+            and not is_ad_card(cd)]
     # Thumbnails known (UIA / OCR saw them): the cards ARE the thumb cards.
     if any(any(_is_thumb(c) for c in cd) for cd in grid):
         grid = [cd for cd in grid if any(_is_thumb(c) for c in cd)]
@@ -311,6 +412,14 @@ def _resolve(query, cands, playing_title, margin) -> dict:
         if not content and not ords:
             return {"status": "none", "why": "playing-unknown"}
     want_video = bool(re.search(r"\b(video|videos|one|clip|watch|play)\b", ql))
+    # A video request never lands on an advert (review 2026-10-05: "the
+    # first video" picked a "Sponsored" Shop-Now card) - unless he asks for
+    # the ad. Any other request ("click Download") sees every element.
+    if want_video and not re.search(
+            r"\b(?:ad|ads|advert|sponsored|promoted)\b", ql):
+        ads = ad_members(cands)
+        if ads:
+            cands = [c for c in cands if id(c) not in ads]
     grid = video_cards(cands) if want_video else []
     if ords and grid and not content:
         unit = _pick_ordinal(grid, ords[0])

@@ -365,14 +365,16 @@ def local_click_target_by_description(description: str) -> str:
         msg = _missing_local_vision_msg()
         if not msg.startswith("local vision call to"):
             return msg
-        return f"could not find '{description}' on screen via local vision"
+        return f"I couldn't find '{description}' on screen, sir."
 
+    # This action is spoken word for word (SPEAK_RESULT_VERBATIM_ACTIONS,
+    # 2026-10-05), so its lines are sentences, not coordinates.
     try:
         b.ui_click(coords[0], coords[1])
     except Exception as e:
         # Surface UIFailsafeError's friendly message rather than the traceback.
-        return f"found '{description}' at {coords} but click failed: {e}"
-    return f"[local-vision] clicked '{description}' at {coords}"
+        return f"I found '{description}', sir, but the click failed: {e}"
+    return f"Clicked '{description}', sir."
 
 
 def register(actions: dict):

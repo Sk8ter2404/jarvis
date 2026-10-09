@@ -36,6 +36,7 @@ __all__ = [
     "referent_phrase", "is_ui_correction", "is_scene_back_reference",
     "pending_choice_answer", "is_screen_recall_request",
     "screen_memory_command", "forget_span", "claude_note", "is_video_like",
+    "rewrite_referent", "youtube_play_query",
 ]
 
 _WAKE_RE = re.compile(r"^\s*(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*",
@@ -57,17 +58,23 @@ def clean(text) -> str:
 
 
 # ── is_onscreen_reference ────────────────────────────────────────────────
-_CLICK_RE = re.compile(r"\bclick(?:s|ed|ing)?\b", re.IGNORECASE)
+# "click" as a verb - not the noun "clicks" ("how many clicks did my post
+# get" is not about the screen; review 2026-10-05).
+_CLICK_RE = re.compile(r"\bclick(?:ed|ing)?\b", re.IGNORECASE)
 _VERBS = r"(?:press|tap|select|pick|choose|hit|open|play|watch|start)"
 _NOUNS = (r"(?:video|videos|clip|clips|link|links|thumbnail|thumbnails|result|"
           r"results|button|buttons|tab|tabs|icon|icons|one|ones|thing|option|"
           r"entry|item|page)")
-# verb ... within 6 words ... that / this / the one ... (<= 4 words) ... noun
+# verb ... within 6 words ... that / this / the one ... (<= 4 words) ... noun;
+# "that one"; and "the one" only when a place / description follows ("the
+# one on the left", "the one with the dog", "the one you just opened") -
+# never "start the one hour timer" or "play the one by Drake".
 _DEMONSTRATIVE_RE = re.compile(
     r"\b" + _VERBS + r"\b(?:\s+\S+){0,6}?\s+(?:that|this|the\s+one)"
     r"(?:\s+\S+){0,4}?\s+" + _NOUNS + r"\b"
     r"|\b" + _VERBS + r"\b(?:\s+\S+){0,6}?\s+(?:that|this)\s+one\b"
-    r"|\b" + _VERBS + r"\b(?:\s+\S+){0,6}?\s+the\s+one\b",
+    r"|\b" + _VERBS + r"\b(?:\s+\S+){0,6}?\s+the\s+one\s+(?:on|at|in|with|"
+    r"from|that|that's|thats|which|you|i|playing|showing|there|here|up)\b",
     re.IGNORECASE)
 _SCREEN_PLACE_RE = re.compile(
     r"\bon\s+(?:the\s+|my\s+)?(?:screen|page|"
@@ -154,7 +161,25 @@ _LOCATION_TAIL_RE = re.compile(
     r"center|centre|primary|bottom|upper|lower)\s+(?:monitor|screen|display)|"
     r"screen|page|you\s?tube|chrome|the\s+browser)\s*$", re.IGNORECASE)
 _CLICK_ROUTE_RE = re.compile(
-    r"^(?:click|tap|press|select)(?:\s+on)?\s+(?P<t>(?:that|this|the)\s+.+)$",
+    r"^(?P<v>click|tap|press|select)(?:\s+on)?\s+(?P<t>(?:that|this|the)\s+.+)$",
+    re.IGNORECASE)
+# What a WHOLE "press / select the X" names that is not a thing on the
+# screen (review 2026-10-05: "press the enter key", "press the mute
+# button", "select the USB desk mic" all became screen clicks before
+# the brain saw them): a keyboard key, an audio / camera device, a mute or
+# volume control. "click / tap" is screen-only, so only a word that says
+# KEY stops those ("click the return policy link", "click the next arrow"
+# are on the page); "press / select" also stops on a bare key name.
+_KEY_WORD_RE = re.compile(r"\b(?:keys?|keyboard|space\s*bar|spacebar|"
+                          r"hotkey|shortcut)\b", re.IGNORECASE)
+_KEY_NAME_RE = re.compile(
+    r"\b(?:enter|escape|esc|return|backspace|delete|tab|shift|ctrl|control|"
+    r"alt|f\d{1,2}|page\s+(?:up|down)|home|end|(?:up|down|left|right)\s+"
+    r"arrow)\b", re.IGNORECASE)
+_DEVICE_TARGET_RE = re.compile(
+    r"\b(?:mics?|microphones?|headsets?|headphones|earbuds|speakers?|"
+    r"webcams?|cameras?|audio\s+devices?|sound\s+devices?|mute|unmute|"
+    r"volume)\b|\bas\s+(?:the\s+|my\s+)?(?:output|input|default)\b",
     re.IGNORECASE)
 _PLAY_ROUTE_RE = re.compile(
     r"^(?:play|open|watch)\s+(?P<t>(?:that|this)\s+.+?\s+"
@@ -187,6 +212,12 @@ def onscreen_click_target(text) -> "str | None":
             return None
         if not _content_words(target):
             return None
+        verb = (m.groupdict().get("v") or "").lower()
+        if _KEY_WORD_RE.search(target):
+            return None
+        if verb in ("press", "select") and (_KEY_NAME_RE.search(target)
+                                           or _DEVICE_TARGET_RE.search(target)):
+            return None
         if _MUSIC_NOUN_RE.search(target) and not _SCREENISH_RE.search(s):
             return None
         if len(target) > 120:
@@ -199,6 +230,54 @@ def onscreen_click_target(text) -> "str | None":
 _VIDEO_LIKE_RE = re.compile(r"\b(?:video|videos|clip|clips|watch|episode|"
                             r"trailer|stream|vlog|short|shorts)\b",
                             re.IGNORECASE)
+
+# ── the rewrite guard's referent ────────────────────────────────────────
+# A request to SEARCH / look something up is never "the thing on screen"
+# (review 2026-10-05: "search google for how to click a link in python"
+# found an on-screen "Python" link and its search became a click).
+_SEARCH_REQUEST_RE = re.compile(
+    r"^(?:search|google|bing|look\s+up|look\s+for|find\s+me|find\s+out|"
+    r"research)\b|\bsearch\s+(?:google|youtube|bing|the\s+web|online|for)\b"
+    r"|\blook\s+(?:it|that|this)\s+up\b", re.IGNORECASE)
+_DEMONSTRATIVE_WORD_RE = re.compile(r"\b(?:that|this|these|those|the\s+one)\b",
+                                    re.IGNORECASE)
+
+
+def rewrite_referent(text) -> "str | None":
+    """The on-screen referent that may turn the brain's youtube_play /
+    open_url / web_search into a click: the owner pointed with "that /
+    this / the one" at a thing ("click that MrBeast video and then ...",
+    "play that phone review video"), and did not ask to search. None
+    otherwise. Never raises."""
+    try:
+        s = clean(text)
+        if not s or _SEARCH_REQUEST_RE.search(s):
+            return None
+        ref = referent_phrase(s)
+        if not ref or not _DEMONSTRATIVE_WORD_RE.search(ref):
+            return None
+        return ref
+    except Exception:
+        return None
+
+
+_YT_PLAY_THAT_RE = re.compile(
+    r"^(?:play|watch|put\s+on|pull\s+up)\s+(?:that|this)\s+(?P<q>.+?)\s+"
+    r"(?:video|clip)\s+(?:on|from)\s+you\s?tube$", re.IGNORECASE)
+
+
+def youtube_play_query(text) -> "str | None":
+    """"play that MrBeast video on YouTube" -> "MrBeast": the search to run
+    when the thing is NOT on screen (the owner named YouTube, so main's
+    search-and-play stands). None for anything else. Never raises."""
+    try:
+        m = _YT_PLAY_THAT_RE.match(clean(text))
+        if not m:
+            return None
+        q = " ".join(m.group("q").split()).strip(" ,.")
+        return q if _content_words(q) else None
+    except Exception:
+        return None
 
 
 def is_video_like(text) -> bool:
@@ -523,12 +602,26 @@ _ASK_QUESTION_RE = re.compile(
     r"do|can|could|would|should|if|whether)\b", re.IGNORECASE)
 
 
+# What a note for the DEVELOPER is about: JARVIS himself or his workings
+# (review 2026-10-05: "ask Claude to make me a workout plan" and "have Claude
+# review my essay" are requests for the cloud brain, not developer notes).
+_DEV_TOPIC_RE = re.compile(
+    r"\b(?:you|your|yourself|he|him|his|jarvis|bugs?|code|coding|features?|"
+    r"screen\s+vision|vision|clicks?|clicking|voice|wake\s+word|dispatcher|"
+    r"router|routing|prompts?|release|version|builds?|tests?|crash(?:es|ed)?|"
+    r"logs?|settings?|patch|skills?|memory|transcri\w*|microphone|mic|"
+    r"camera|kinect|hud|tray|latency|lag|slow|glitch\w*|broken|"
+    r"not\s+working|working\s+properly)\b", re.IGNORECASE)
+
+
 def claude_note(text) -> "str | None":
     """The note for the developer (Claude) in "tell Claude to research the
     screen vision", "let Claude know your clicking is off", "leave Claude a
-    note: ...", else None. Not for Claude's credits / cost, "use / switch to
-    / open Claude", or "ask Claude <question>?" (a question for the cloud
-    brain). Never raises."""
+    note: ...", else None. The note must be about JARVIS or his workings
+    (a "tell / let ... know" with a task or about him; "ask / have / get
+    Claude to ..." only about him). Not for Claude's credits / cost, "use /
+    switch to / open Claude", or "ask Claude <question>?" (a question for
+    the cloud brain). Never raises."""
     try:
         s = clean(text)
         if not s or _CLAUDE_EXCLUDE_RE.search(s) or _ASK_QUESTION_RE.match(s):
@@ -546,6 +639,11 @@ def claude_note(text) -> "str | None":
                       rest, flags=re.IGNORECASE)
         if not rest:
             return None
+        verb = (m.group(0).split() or [""])[0].lower()
+        if verb in ("ask", "have", "get"):
+            # Claude asked to DO something: a developer note only when it
+            # is about JARVIS or his workings.
+            return rest if _DEV_TOPIC_RE.search(rest) else None
         if _TASK_VERB_RE.search(rest) or _ABOUT_JARVIS_RE.search(rest):
             return rest
     except Exception:

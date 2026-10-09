@@ -1573,15 +1573,20 @@ SCHEMA: dict[str, dict] = {
         "tab": "privacy", "label": "Read windows by name (UI Automation)",
         "type": "bool", "default": True,
         "help": "Clicks, 'what's on my screen' and screen memory read link "
-                "names and titles through Windows UI Automation. Turning it "
-                "off falls back to pictures (slower, less exact).",
+                "names, titles and page addresses through Windows UI "
+                "Automation. Off stops every such read: clicks fall back to "
+                "OCR (slower, less exact), and screen memory skips browser "
+                "windows (their address - a bank, a sign-in page - can't be "
+                "checked).",
     },
     "SCREEN_UIA_NONBROWSER": {
         "tab": "privacy", "label": "UI Automation outside the browser",
         "type": "enum", "choices": ["off", "on_demand", "always"],
         "default": "on_demand",
-        "help": "on_demand: only the app a click or look is about. Some apps "
-                "(VS Code, Discord) may switch to screen-reader mode when read.",
+        "help": "on_demand: only the app in front, or the one you name "
+                "('... in Notepad'), when a click or look needs it; screen "
+                "memory reads other apps by OCR. Some apps (VS Code, "
+                "Discord) may switch to screen-reader mode when read.",
     },
     "VLM_MAX_IMAGE_TOKENS": {
         "tab": "privacy", "label": "Vision image token cap", "type": "int",

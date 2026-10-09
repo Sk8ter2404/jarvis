@@ -32,6 +32,9 @@ __all__ = ["digest", "window_digest", "inventory", "PER_WINDOW", "TOTAL",
 
 PER_WINDOW = 1200
 TOTAL = 3000
+# A browser's tab strip + toolbar when UIA did not say where the page starts
+# (core.grounded_click._BROWSER_TOOLBAR_PX).
+_TOOLBAR_PX = 88
 # A question about how things LOOK needs the vision model; anything else is
 # a reading question.
 VISUAL_Q_RE = re.compile(
@@ -161,8 +164,11 @@ def window_digest(win, snap=None, ocr_lines=None, url="",
         return ""
 
 
-def inventory(windows) -> str:
-    """Every visible window per monitor: title, app, URL host."""
+def inventory(windows, url_of=None) -> str:
+    """Every visible window per monitor: title, app, URL host. A browser
+    window is judged with its address too (``url_of(hwnd)``: a bank tab
+    titled "Accounts Overview" is "(a private window)" - review
+    2026-10-05)."""
     by_mon: dict = {}
     for w in windows or ():
         by_mon.setdefault(_g(w, "monitor") or "?", []).append(w)
@@ -170,7 +176,7 @@ def inventory(windows) -> str:
     for mon in sorted(by_mon):
         items = []
         for w in by_mon[mon][:6]:
-            if _priv.window_private(w):
+            if _priv.live_private(w, url_of=url_of):
                 items.append("(a private window)")
             else:
                 items.append(f"'{_clip(_page_title(_g(w, 'title', '')), 70)}'"
@@ -207,27 +213,38 @@ def digest(scope="overview", *, said="", monitor=None, hwnd=None,
             targets.sort(key=lambda w: (_g(w, "hwnd") != fg, _g(w, "z", 0)))
             targets = targets[:1]
         parts = []
+        url_of = getattr(backend, "read_url", None)
         if scope == "overview":
-            inv = inventory(wins)
+            inv = inventory(wins, url_of=url_of)
             if inv:
                 parts.append("Windows on screen:\n" + inv)
         total = sum(len(p) for p in parts)
+        hidden = "(a private window - not read)"
         for w in targets:
             if total >= TOTAL:
                 break
-            if _priv.window_private(w):
+            # The address FIRST (review 2026-10-05): a page private by its
+            # address alone - a bank tab titled "Accounts Overview" - is
+            # never read, OCR'd or quoted.
+            browser = _priv.is_browser_process(_g(w, "process"))
+            url0 = ""
+            if browser and callable(url_of):
+                try:
+                    url0 = url_of(_g(w, "hwnd")) or ""
+                except Exception:
+                    url0 = ""
+            if _priv.live_private(w, url=url0 or None):
                 out["private"] += 1
-                parts.append(f"[{_g(w, 'monitor')}] (a private window - not "
-                             "read)")
+                parts.append(f"[{_g(w, 'monitor')}] {hidden}")
                 continue
             snap = backend.snapshot(w)
-            url = snap.url if snap is not None else ""
-            if snap is not None and (snap.has_password or _priv.window_private(
+            url = (snap.url if snap is not None else "") or url0
+            if snap is not None and (snap.has_password or _priv.live_private(
                     {"hwnd": _g(w, "hwnd"), "title": _g(w, "title"),
-                     "process": _g(w, "process"), "url": url})):
+                     "process": _g(w, "process"), "url": url},
+                    url=url or None)):
                 out["private"] += 1
-                parts.append(f"[{_g(w, 'monitor')}] (a private window - not "
-                             "read)")
+                parts.append(f"[{_g(w, 'monitor')}] {hidden}")
                 continue
             if snap is not None:
                 out["uia"] = True
@@ -238,6 +255,16 @@ def digest(scope="overview", *, said="", monitor=None, hwnd=None,
                 img = backend.capture(_g(w, "rect"), target_hwnd=_g(w, "hwnd"))
                 if img is not None:
                     ocr_lines = backend.ocr(img)
+                # A browser whose address is still unknown: its address bar,
+                # as OCR read it, decides (the click path's rule).
+                if ocr_lines and browser and not url:
+                    top = (snap.doc_rect[1] - _g(w, "rect")[1]
+                           if snap is not None and snap.doc_rect
+                           else _TOOLBAR_PX)
+                    if _priv.address_bar_private(ocr_lines, top):
+                        out["private"] += 1
+                        parts.append(f"[{_g(w, 'monitor')}] {hidden}")
+                        continue
             line = window_digest(w, snap, ocr_lines, url,
                                  limit=min(PER_WINDOW, TOTAL - total))
             if line:

@@ -121,7 +121,9 @@ class FakeBackend:
         self.hotkeys = []
         self.focused = []
         self.backs = []
-        self._turn_vision = 0
+        self._tl = threading.local()
+        self.auth_refusals = 0
+        self.href_reads = 0
         self._next_hwnd = 9000
         self.closed_last_opened = 0
         self.lock = threading.Lock()
@@ -207,12 +209,16 @@ class FakeBackend:
         if mode == "new_tab":
             w.tabs.append(el.name)
             return
+        name = el.name
         if mode == "wrong":
+            # a different page: its own address AND its own title (the
+            # clicked label's title would read as the right page)
             href = "https://videosite.example/@ch-elsewhere"
+            name = "Channel Elsewhere"
         if href:
             w.history.append((w.url, w.title, w.page))
             w.url = href
-            w.title = f"{el.name} - VideoSite - Google Chrome"
+            w.title = f"{name} - VideoSite - Google Chrome"
             w.page = None if "watch" in href or "@" in href else w.page
 
     def click(self, x, y):
@@ -325,12 +331,46 @@ class FakeBackend:
         d = str(desc).lower()
         return "close" in d and ("powershell" in d or "terminal" in d)
 
+    # The owner turn's frame is PER THREAD, like the monolith's
+    # _turn_grounding (review 2026-10-05: this fake used to keep one shared
+    # counter, so the 4-calls-per-turn cap "worked" here while production's
+    # click worker thread saw no turn at all). A test that wants a turn sets
+    # one: b.adopt_frame({"user_text": ...}).
+    def turn_frame(self):
+        return getattr(self._tl, "frame", None)
+
+    def adopt_frame(self, frame):
+        prev = getattr(self._tl, "frame", None)
+        self._tl.frame = frame
+        return prev
+
     def turn_vision(self, add=0):
-        self._turn_vision += add
-        return self._turn_vision
+        frame = self.turn_frame()
+        if frame is None:
+            return 0
+        frame["vision_calls"] = int(frame.get("vision_calls", 0)) + add
+        return frame["vision_calls"]
 
     def screen_texts(self):
-        return []
+        frame = self.turn_frame() or {}
+        return list(frame.get("screen") or [])
+
+    def auth_context(self):
+        frame = self.turn_frame() or {}
+        return {"owner_text": str(frame.get("user_text") or ""),
+                "screen_texts": list(frame.get("screen") or []),
+                "looked_for": list(frame.get("looked_for") or []),
+                "refused_before": bool(frame.get("auth_refused"))}
+
+    def note_auth_refused(self):
+        self.auth_refusals += 1
+        frame = self.turn_frame()
+        if frame is not None:
+            frame["auth_refused"] = True
+
+    def href_of(self, el):
+        self.href_reads += 1
+        return getattr(el, "href", "") or ""
 
     def sleep(self, s):
         time.sleep(min(float(s), 0.01))

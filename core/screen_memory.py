@@ -55,7 +55,8 @@ import time
 
 __all__ = ["Watcher", "ChangeDetector", "get", "start", "stop", "pause",
            "unpause", "status_line", "exclude_foreground", "exclude_app",
-           "forget", "is_running", "state_path", "load_state"]
+           "forget", "is_running", "state_path", "load_state",
+           "owner_paused", "set_state_publisher"]
 
 THUMB_W, THUMB_H = 160, 90
 GRID_W, GRID_H = 16, 9
@@ -308,14 +309,20 @@ class Env:
         except Exception:
             return None
 
-    def capture(self, rect, windows):
-        """Privacy-gated native pixels of ``rect`` (for OCR), or None."""
+    def capture(self, rect, windows, urls=None):
+        """Privacy-gated native pixels of ``rect`` (for OCR), or None. A
+        browser window is judged with its address (``urls``: hwnd -> the
+        address read this tick); one whose address is unknown is masked
+        (fail closed)."""
         try:
             from core import screen_privacy as _priv
             if _priv.reads_blocked():
                 return None
+            urls = urls or {}
             infos = [{"hwnd": w.hwnd, "rect": w.rect, "title": w.title,
-                      "process": w.process, "private": _priv.window_private(w)}
+                      "process": w.process,
+                      "private": _priv.live_private(
+                          w, url=urls.get(w.hwnd) or None, fail_closed=True)}
                      for w in windows]
             gate = _priv.region_gate(rect, infos, None)
             if not gate.allowed:
@@ -441,12 +448,22 @@ class Watcher:
                 self.thread.start()
             self.wake.set()
         print("  [screen-memory] on - text only, no AI calls", flush=True)
+        _publish()
         return True
 
     def stop(self) -> None:
         with self.lock:
             self.running = False
         print("  [screen-memory] off", flush=True)
+        _publish()
+
+    def owner_paused(self) -> bool:
+        """True while the owner's "stop watching" pause runs."""
+        try:
+            until = self.owner_pause_until
+            return until is not None and self.clock() < until
+        except Exception:
+            return False
 
     def _loop(self) -> None:               # never exits
         try:
@@ -516,9 +533,15 @@ class Watcher:
                 report["paused"] = why
                 return report
             from core import screen_privacy as _priv
-            visible = [w for w in wins if not _priv.window_private(w)]
+            urls = self._addresses(wins)
+            # A browser page is private by its ADDRESS too (a bank whose tab
+            # title says only "Accounts Overview"); a browser whose address
+            # could not be read is skipped this tick - fail closed (review
+            # 2026-10-05).
+            visible = [w for w in wins if not _priv.live_private(
+                w, url=urls.get(_g(w, "hwnd")) or None, fail_closed=True)]
             rows0 = self.rows_today
-            urls = self._inventory(visible, fg)
+            self._inventory(visible, fg, urls)
             # Fullscreen browser / video: titles and now-playing only.
             st = self.env.notification_state()
             if st == QUNS_BUSY and fg_browser:
@@ -527,7 +550,7 @@ class Watcher:
             changed = self._detect(visible, report)
             for mon, region in changed.items():
                 t0 = time.monotonic()
-                self._extract(mon, region, visible, urls, report)
+                self._extract(mon, region, visible, urls, report, wins)
                 uia_wall += time.monotonic() - t0
             self._full_read(fgw, visible, urls, report)
             report["rows"] = self.rows_today - rows0
@@ -538,22 +561,45 @@ class Watcher:
             self._govern(cost, uia_wall)
             self._health()
 
-    def _inventory(self, wins, fg) -> dict:
+    def _addresses(self, wins) -> dict:
+        """{hwnd: address} of every browser window: read again when its
+        title changed (or it is new), else the address read then. "" when
+        it could not be read. Never raises."""
+        out = {}
+        cache = getattr(self, "url_cache", None)
+        if cache is None:
+            cache = self.url_cache = {}
+        live = set()
+        for w in wins:
+            h = _g(w, "hwnd")
+            if str(_g(w, "process", "")).lower() not in _BROWSERS:
+                continue
+            live.add(h)
+            title = _g(w, "title", "")
+            old = cache.get(h)
+            if old is not None and old[0] == title and old[1]:
+                out[h] = old[1]
+                continue
+            try:
+                url = self.env.read_url(h) or ""
+            except Exception:
+                url = ""
+            cache[h] = (title, url)
+            out[h] = url
+        for h in [h for h in cache if h not in live]:
+            cache.pop(h, None)
+        return out
+
+    def _inventory(self, wins, fg, urls) -> None:
         now = self.clock()
         cur = {}
-        urls = {}
         for w in wins:
             cur[_g(w, "hwnd")] = (_g(w, "title", ""), _g(w, "monitor"),
                                   _g(w, "process", ""))
         for h, (title, mon, proc) in cur.items():
             old = self.last_inventory.get(h)
             if old is None or old[0] != title:
-                url = ""
-                if str(proc).lower() in _BROWSERS:
-                    url = self.env.read_url(h) or ""
-                    urls[h] = url
-                    if url and self._excluded_host(url):
-                        continue
+                url = urls.get(h, "") if str(proc).lower() in _BROWSERS else ""
                 self._add(ts=now, monitor=mon, hwnd=h, process=proc,
                           title=title, url=url,
                           source="title", text=("opened" if old is None
@@ -570,14 +616,18 @@ class Watcher:
             self.last_fg = fg
             self.fg_since = now
         self.last_inventory = cur
-        return urls
 
-    def _excluded_host(self, url) -> bool:
+    @staticmethod
+    def _private_now(w, url) -> bool:
+        """The window, judged again with the address its page read just
+        returned (fresher than the tick's): private, or a browser page
+        whose address is still unknown. Never raises (True on failure)."""
         try:
             from core import screen_privacy as _priv
-            return bool(_priv.excluded({"url": url}))
+            return bool(_priv.live_private(w, url=url or None,
+                                           fail_closed=True))
         except Exception:
-            return False
+            return True
 
     def _detect(self, wins, report) -> dict:
         """{monitor: changed native region} (input / window gated)."""
@@ -640,7 +690,13 @@ class Watcher:
         bx, by, bw, bh = b
         return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
 
-    def _extract(self, mon, region, wins, urls, report) -> None:
+    def _extract(self, mon, region, wins, urls, report,
+                 all_wins=None) -> None:
+        """Read the windows of ``wins`` (the non-private ones) that the
+        changed ``region`` touches. The OCR capture's privacy gate sees
+        ``all_wins`` - EVERY window, so a private one above the region is
+        masked (it was handed the filtered list, which could not mask
+        what it had never been shown)."""
         now = self.clock()
         mode = str(_cfg("SCREEN_UIA_NONBROWSER", "on_demand")).lower()
         for w in wins:
@@ -656,8 +712,8 @@ class Watcher:
                     snap = self.env.snapshot(w)
                     report["uia"] += 1
                     if snap is not None and not snap.has_password:
-                        url = urls.get(hwnd) or snap.url
-                        if url and self._excluded_host(url):
+                        url = snap.url or urls.get(hwnd) or ""
+                        if self._private_now(w, url):
                             continue
                         lines = self._lines_from_snapshot(snap)
                         text_chars = sum(len(x) for x in lines)
@@ -681,8 +737,12 @@ class Watcher:
             y1 = min(region[1] + region[3], _g(w, "rect")[1] + _g(w, "rect")[3])
             if x1 - x0 < 32 or y1 - y0 < 16:
                 continue
+            if self._private_now(w, urls.get(hwnd, "")):
+                continue
             self.last_ocr = now
-            img = self.env.capture((x0, y0, x1 - x0, y1 - y0), wins)
+            img = self.env.capture((x0, y0, x1 - x0, y1 - y0),
+                                   all_wins if all_wins is not None else wins,
+                                   urls)
             if img is None:
                 continue
             lines = self.env.ocr(img)
@@ -712,6 +772,8 @@ class Watcher:
         snap = self.env.snapshot(fgw)
         report["uia"] += 1
         if snap is None or snap.has_password:
+            return
+        if self._private_now(fgw, snap.url or urls.get(hwnd, "")):
             return
         lines = self._lines_from_snapshot(snap)
         if lines:
@@ -867,6 +929,43 @@ def get() -> Watcher:
 def is_running() -> bool:
     w = _singleton["w"]
     return bool(w and w.running)
+
+
+def owner_paused() -> bool:
+    """True while the owner's "stop watching (for N minutes)" runs - with
+    screen memory on OR off. Every screen RECORD honours it, not only the
+    watcher (review 2026-10-05): core.screen_timeline.add drops rows and
+    core.vision_trace keeps a bare "skipped: paused" entry. A click or look
+    he asks for still reads the screen; it just is not kept. Never
+    raises."""
+    try:
+        w = _singleton["w"]
+        return bool(w is not None and w.owner_paused())
+    except Exception:
+        return False
+
+
+# The tray's "Screen Memory" checkmark (hud_state.screen_memory): published
+# on EVERY start / stop - boot autostart, voice, settings, tray - by the
+# watcher itself (review 2026-10-05: only the tray's own toggle wrote it, so
+# a boot autostart showed unchecked while recording).
+_publisher = [None]
+
+
+def set_state_publisher(fn) -> None:
+    """``fn(on: bool)`` - called now and on every start / stop. Never
+    raises."""
+    _publisher[0] = fn if callable(fn) else None
+    _publish()
+
+
+def _publish() -> None:
+    try:
+        fn = _publisher[0]
+        if fn is not None:
+            fn(is_running())
+    except Exception:
+        pass
 
 
 def start() -> bool:

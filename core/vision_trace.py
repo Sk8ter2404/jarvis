@@ -54,9 +54,26 @@ __all__ = [
     "Step", "step", "current", "note_model_call", "note_image", "record",
     "mode", "trace_dir", "index_path", "flush", "purge", "prune",
     "read_index", "stats", "set_context_provider", "PRIVATE_SKIP",
+    "PAUSED_SKIP",
 ]
 
 PRIVATE_SKIP = "skipped: private"
+# While the owner's "stop watching" pause runs (core.screen_memory.
+# owner_paused) a step keeps nothing but this marker - no title, URL,
+# prompt, answer or image (review 2026-10-05: the pause stopped only the
+# background watcher, and every click kept tracing).
+PAUSED_SKIP = "skipped: paused"
+_PAUSED = "paused by the owner"
+
+
+def _paused_reason() -> str:
+    try:
+        from core import screen_memory as _sm
+        return _PAUSED if _sm.owner_paused() else ""
+    except Exception:
+        return ""
+
+
 _QUEUE_MAX = 64
 _PENDING_IMAGE_BYTES_MAX = 48 * 1024 * 1024
 _COMPACT_EVERY = 25
@@ -168,7 +185,7 @@ class Step:
             "latency_ms": {}, "cloud": False, "privacy": "",
             "model_calls": [],
         }
-        self.private = str(privacy or "")
+        self.private = str(privacy or "") or _paused_reason()
         self._images: list = []         # (payload, meta) - encoded by writer
         self._done = False
         self.entry.update(_context())
@@ -271,7 +288,9 @@ class Step:
             return {"id": self.id, "ts": self.entry["ts"],
                     "step": self.entry["step"],
                     "outcome": self.entry.get("outcome"),
-                    "privacy": (PRIVATE_SKIP if "excluded" not in self.private
+                    "privacy": (PAUSED_SKIP if self.private == _PAUSED
+                                else PRIVATE_SKIP
+                                if "excluded" not in self.private
                                 else "skipped: excluded")}
         e = dict(self.entry)
         e["privacy"] = ""
