@@ -199,7 +199,12 @@ def _set_pending(options, said, referent, kind="which", allow_yes=False,
     with _lock:
         if dl is not None and dl.cancelled:
             return False
-        _state["pending"] = dict(extra, ts=time.time(), options=list(options),
+        # ``mono``: when it was asked on the monolith's owner-turn clock
+        # (time.monotonic), so the screen route can tell an answer from the
+        # very next owner turn from a "yes" two turns later (review
+        # 2026-10-09).
+        _state["pending"] = dict(extra, ts=time.time(), mono=time.monotonic(),
+                                 options=list(options),
                                  said=str(said or ""),
                                  referent=str(referent or ""), kind=kind,
                                  allow_yes=bool(allow_yes), owner=dl)

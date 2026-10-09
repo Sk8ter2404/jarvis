@@ -304,6 +304,9 @@ class CloneRenderCache:
         self._gen = 0
         self._forgot: "OrderedDict[str, int]" = OrderedDict()
         self._purge: Optional[tuple] = None     # (gen, frozenset of kept)
+        # The gen of the last memory wipe (wipe): every write queued before
+        # it is stale.
+        self._wiped = 0
         self.gate = TakeGate()
         self.counters = {"mem_hits": 0, "disk_hits": 0, "misses": 0,
                          "shadow_would_hit": 0, "shadow_would_miss": 0,
@@ -524,6 +527,8 @@ class CloneRenderCache:
     def _stale(self, gen: int, key: str, prefix: str) -> bool:
         """Caller holds the lock: a write queued at `gen` whose take has been
         forgotten, or whose voice purged, since."""
+        if gen < self._wiped:
+            return True
         fg = self._forgot.get(key)
         if fg is not None and fg > gen:
             return True
@@ -766,6 +771,53 @@ class CloneRenderCache:
         except Exception:
             pass
         return n
+
+    def wipe(self, since: Optional[float] = None,
+             until: Optional[float] = None) -> int:
+        """A memory wipe (core.actions reset_memory / forget_last_hour,
+        review 2026-10-09). ``since`` None: every take, both tiers. Else
+        every take on disk written or played in [``since``, ``until``]
+        (time.time(); ``until`` None = no end) is removed, and the memory
+        tier is emptied too - it keeps no times, so it cannot tell that
+        hour's takes from older ones (an older one is read from the disk
+        again); those are not counted. A write queued before the wipe never
+        lands (a temporary file mid-write is removed by its writer). The
+        take gate (lengths only, no words) is kept. Returns how many takes
+        went (one per line, whichever tiers held it). Never raises."""
+        gone: set = set()
+        try:
+            lo = None if since is None else float(since)
+            hi = float("inf") if until is None else float(until)
+            with self._mu:
+                self._gen += 1
+                self._wiped = self._gen
+                if lo is None:
+                    gone.update(self._mem)
+                self._mem.clear()
+                self._mem_bytes = 0
+                d = self._dir
+            if d is not None:
+                try:
+                    names = os.listdir(d)
+                except OSError:
+                    names = []
+                for name in names:
+                    m = _FILE_RE.match(name)
+                    if not m:
+                        continue
+                    if lo is not None:
+                        try:
+                            mt = os.stat(os.path.join(d, name)).st_mtime
+                        except OSError:
+                            continue
+                        if not lo <= mt <= hi:
+                            continue
+                    if self._remove_file(d, name):
+                        gone.add(m.group(2))
+            self._count("wiped", len(gone))
+        except Exception:
+            pass
+        return len(gone)
 
     def prefixes(self) -> set:
         """Every voice prefix held, in either tier."""

@@ -3654,6 +3654,12 @@ _DESTRUCTIVE_REPLAY_ACTIONS = frozenset({
     "run_shell",
     "reset_memory",
     "forget_last_hour",
+    # The screen memory's and the clone voice's own forgets (review
+    # 2026-10-09): a replayed span is relative to NOW, so "do that again"
+    # after "forget the last hour of what you saw" deleted the rows kept
+    # since; "forget that line" again drops whatever was said last.
+    "forget_screen",
+    "forget_voice_line",
     "clear_tasks",
     # run_python family: arbitrary-code execution. Never silently re-fire via
     # "do that again" or a fuzzy-typo disambiguation — force the user to
@@ -25695,6 +25701,11 @@ def _clone_seed_gate() -> str | None:
             return "game"
         if _tts_engine_kind() != "clone":
             return "clone not speaking"
+        if _guest_mode.is_on():
+            # Guest mode keeps no take on disk (core.clone_voice_client.
+            # _persist_take), so a seed rendered now would be lost and its
+            # line counted as tried for good (review 2026-10-09).
+            return "guest mode"
         return None
     except Exception as e:
         return f"error ({type(e).__name__})"
@@ -34277,6 +34288,11 @@ def _screen_route_state() -> dict:
     try:
         from core import grounded_click as _gc
         p = _gc.pending_choice()
+        if p is not None and _screen_question_stale(p):
+            _gc.clear_pending()
+            print("  [click] the open screen question is closed: another "
+                  "owner turn came after it")
+            p = None
         if p is not None:
             st["pending"] = p
             st["allow_yes"] = bool(
@@ -34315,15 +34331,62 @@ def _open_offer_pending() -> bool:
         return False
 
 
+# JARVIS's own open screen question ("which one, sir?" / "shall I press
+# it?", core.grounded_click) is answered by the owner's NEXT turn or not at
+# all - the open offer's rule (_take_open_offer). Review 2026-10-09: a
+# declined "shall I press 'Delete account'?" stayed armed for its whole
+# 90 s; "no", "never mind", "play some jazz" and "stop" all left it, and a
+# later "yes" to a question the brain asked in plain prose pressed it.
+# The tokens that answer it (or correct JARVIS's last UI action) keep it.
+_SCREEN_ANSWER_TOKEN_RE = re.compile(
+    r"^\[ACTION:\s*(?:click_on_screen\s*,\s*(?:pick|scene)\s*:|undo_click\b)",
+    re.IGNORECASE)
+
+
+def _screen_question_stale(p) -> bool:
+    """True when another owner turn started after the one that followed
+    JARVIS's question ``p`` (core.grounded_click's pending, stamped
+    ``mono`` on time.monotonic, the clock of _prev_owner_turn_at). A
+    question with no stamp is judged by its own TTL only. Never raises."""
+    try:
+        asked = p.get("mono")
+        prev = float(_prev_owner_turn_at[0] or 0.0)
+        return asked is not None and prev > 0.0 and float(asked) <= prev
+    except Exception:
+        return False
+
+
+def _close_unanswered_screen_question(st, tok) -> None:
+    """This owner turn takes JARVIS's open screen question: a turn that does
+    not answer it (``tok`` is not a pick / scene / undo token) closes it.
+    Never raises."""
+    try:
+        if not (st or {}).get("pending"):
+            return
+        if tok and _SCREEN_ANSWER_TOKEN_RE.match(str(tok)):
+            return
+        from core import grounded_click as _gc
+        if _gc.pending_choice() is st["pending"]:
+            _gc.clear_pending()
+            print("  [click] the open screen question is closed: this turn "
+                  "did not answer it")
+    except Exception:
+        pass
+
+
 def _screen_route_reply(text: str) -> "str | None":
     """The action token core.dispatcher.screen_route claims ``text`` with,
-    when its action is registered; else None. Never raises."""
+    when its action is registered; else None. Every owner turn that reaches
+    it takes JARVIS's open screen question (_close_unanswered_screen_
+    question). Never raises."""
     try:
         from core.dispatcher import screen_route as _sr
-        tok = _sr(text, _screen_route_state())
+        _st = _screen_route_state()
+        tok = _sr(text, _st)
     except Exception as _e:
         print(f"  [route] screen route failed: {type(_e).__name__}")
         return None
+    _close_unanswered_screen_question(_st, tok)
     m = _ROUTE_TOKEN_RE.match(tok) if tok else None
     if not m or m.group(1) not in ACTIONS:
         return None
@@ -37100,12 +37163,19 @@ def _note_turn_action_ran(name: str, result, arg: str = "") -> None:
         frame = getattr(_turn_grounding, "frame", None)
         if frame is None:
             return
+        # The action that just ran may have fed its look itself (core.
+        # actions._note_screen_look marks the frame): then it is recorded
+        # once, not twice (review 2026-10-09: two entries per look halved
+        # the sign-in guard's window). Taken by every action that runs, so
+        # the mark never outlives the action that set it.
+        fed = frame.pop("screen_fed", None)
         # What this turn's looks at the screen said, and what it looked for
         # (2026-10-05): the sign-in guard (core.auth_guard) reads them to
         # know a sign-in page is in front, and that a coordinate click is on
         # the account entry find_on_screen just located. Kept whatever the
         # answer was.
-        if _is_screen_look_action(name):
+        if _is_screen_look_action(name) and not (
+                fed and _same_handler_as(name, (fed,))):
             seen = frame.setdefault("screen", [])
             seen.append(str(result or "")[:4000])
             del seen[:-4]

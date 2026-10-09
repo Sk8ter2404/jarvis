@@ -492,6 +492,14 @@ class Watcher:
             if now < self.owner_pause_until:
                 return "you asked me to stop watching"
             self.owner_pause_until = None
+        # Guest mode: nothing is kept while visitors are in the room
+        # (core.guest_mode; review 2026-10-09).
+        try:
+            from core import guest_mode as _gm
+            if _gm.is_on():
+                return "guest mode is on"
+        except Exception:
+            pass
         if now < self.gov_pause_until:
             return "my own CPU use was over budget"
         if self.env.game_mode():
@@ -998,60 +1006,71 @@ def exclude_app(name) -> str:
     return get().exclude_app(name)
 
 
-def forget(span: dict, now=None) -> str:
+def forget_counts(span: dict, now=None) -> dict:
     """Purge timeline rows, trace entries, the scene ring and the screen
     cache for a span ({"seconds": N} / {"today": True} / {"all": True}).
-    Returns the spoken line with the counts. Never raises."""
+    Returns {"what", "rows", "traces", "scenes", "cached"}; raises on a
+    failure the caller must disclose (the memory wipes in core.actions
+    report it; forget() below turns it into its spoken line)."""
+    t = float(now or time.time())
+    if span.get("all"):
+        since, what = None, "everything I'd seen"
+    elif span.get("today"):
+        lt = time.localtime(t)
+        since = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0,
+                             0, 0, -1))
+        what = "everything from today"
+    else:
+        secs = float(span.get("seconds") or 3600)
+        since = t - secs
+        mins = int(round(secs / 60))
+        what = ("the last hour" if mins == 60 else
+                f"the last {mins // 60} hours" if mins % 60 == 0 and mins > 60
+                else f"the last {mins} minute{'s' if mins != 1 else ''}")
+    from core import screen_timeline as _tl
+    rows = _tl.get().forget(since=since, until=t)
+    traces = 0
     try:
-        t = float(now or time.time())
-        if span.get("all"):
-            since, what = None, "everything I'd seen"
-        elif span.get("today"):
-            lt = time.localtime(t)
-            since = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0,
-                                 0, 0, -1))
-            what = "everything from today"
-        else:
-            secs = float(span.get("seconds") or 3600)
-            since = t - secs
-            mins = int(round(secs / 60))
-            what = ("the last hour" if mins == 60 else
-                    f"the last {mins // 60} hours" if mins % 60 == 0 and mins > 60
-                    else f"the last {mins} minute{'s' if mins != 1 else ''}")
-        from core import screen_timeline as _tl
-        rows = _tl.get().forget(since=since, until=t)
+        from core import vision_trace as _vt
+        traces = _vt.purge(since, t)
+    except Exception:
         traces = 0
-        try:
-            from core import vision_trace as _vt
-            traces = _vt.purge(since, t)
-        except Exception:
-            traces = 0
+    scenes = 0
+    try:
+        from core import grounded_click as _gc
+        scenes = _gc.forget_scenes(since, t)
+    except Exception:
         scenes = 0
-        try:
-            from core import grounded_click as _gc
-            scenes = _gc.forget_scenes(since, t)
-        except Exception:
-            scenes = 0
+    cached = 0
+    try:
+        import sys
+        bc = sys.modules.get("bobert_companion")
+        lock = getattr(bc, "_screen_cache_lock", None)
+        cache = getattr(bc, "_screen_cache", None)
+        if lock is not None and isinstance(cache, list):
+            with lock:
+                keep = [e for e in cache
+                        if since is not None and not (
+                            since <= e.get("ts", 0) <= t)]
+                cached = len(cache) - len(keep)
+                cache[:] = keep
+    except Exception:
         cached = 0
-        try:
-            import sys
-            bc = sys.modules.get("bobert_companion")
-            lock = getattr(bc, "_screen_cache_lock", None)
-            cache = getattr(bc, "_screen_cache", None)
-            if lock is not None and isinstance(cache, list):
-                with lock:
-                    keep = [e for e in cache
-                            if since is not None and e.get("ts", 0) < since]
-                    cached = len(cache) - len(keep)
-                    cache[:] = keep
-        except Exception:
-            cached = 0
-        w = _singleton["w"]
-        if w is not None:
-            w.seen_lines.clear()
-        print(f"  [screen-memory] forgot {what}: {rows} rows, {traces} trace "
-              f"entries, {scenes} scenes, {cached} cached looks", flush=True)
-        return (f"Done, sir — I've forgotten {what} on your screen: "
+    w = _singleton["w"]
+    if w is not None:
+        w.seen_lines.clear()
+    print(f"  [screen-memory] forgot {what}: {rows} rows, {traces} trace "
+          f"entries, {scenes} scenes, {cached} cached looks", flush=True)
+    return {"what": what, "rows": int(rows or 0), "traces": int(traces or 0),
+            "scenes": int(scenes or 0), "cached": int(cached or 0)}
+
+
+def forget(span: dict, now=None) -> str:
+    """forget_counts as the spoken line with the counts. Never raises."""
+    try:
+        c = forget_counts(span, now=now)
+        rows, traces, cached = c["rows"], c["traces"], c["cached"]
+        return (f"Done, sir — I've forgotten {c['what']} on your screen: "
                 f"{rows} note{'s' if rows != 1 else ''}"
                 + (f", {traces} vision record{'s' if traces != 1 else ''}"
                    if traces else "")

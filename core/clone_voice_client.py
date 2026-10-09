@@ -390,6 +390,16 @@ def decode_wav(data: bytes):
                                  dtype=np.float32), sr)
 
 
+def _guest_mode_on() -> bool:
+    """core.guest_mode's live flag (visitors in the room: nothing said is
+    kept on disk). Never raises."""
+    try:
+        from core import guest_mode as _gm
+        return _gm.is_on()
+    except Exception:
+        return False
+
+
 def _header_float(headers: dict, name: str):
     """A numeric X- header as a float, None when absent or not a number."""
     try:
@@ -1484,6 +1494,12 @@ class CloneVoiceClient:
                 return
             if int(facts.get("sample_rate") or 0) != int(sr):
                 return
+            if _guest_mode_on():
+                # Guest mode: nothing said is kept (core.guest_mode); the
+                # take stays in the memory tier for this run only (review
+                # 2026-10-09: a guest's words reached data/clone_cache).
+                self.store._count("guest_not_kept")
+                return
 
             def keep() -> bool:
                 if not self._verify_take(key, ident, got_at):
@@ -1643,7 +1659,9 @@ class CloneVoiceClient:
                             for ts, k, _p, _t in self._recent)
                 if not again:
                     self._recent.append((now, key, prefix, text))
-            if not again:
+            if not again and not _guest_mode_on():
+                # Not in guest mode: the ledger writes a line said twice
+                # down in plain text (review 2026-10-09).
                 self.ledger.record(text)
         except Exception:
             pass
@@ -1800,6 +1818,46 @@ class CloneVoiceClient:
             return n
         except Exception:
             return 0
+
+    def wipe(self, since_wall=None, until_wall=None) -> dict:
+        """The clone voice's share of a memory wipe (core.actions
+        reset_memory / forget_last_hour, review 2026-10-09): the takes
+        voiced in [``since_wall``, ``until_wall``] (time.time(); None =
+        all, resp. now) leave both tiers, the ledger forgets those lines
+        (count and text), the "forget that line" record is emptied, and the
+        ledger is saved at once - its plain text leaves the disk now, not
+        at the next quiet save. Returns {"takes": n, "lines": m}. Never
+        raises."""
+        out = {"takes": 0, "lines": 0}
+        until = None
+        if since_wall is not None:
+            try:
+                until = float(time.time() if until_wall is None
+                              else until_wall)
+            except Exception:
+                until = None
+        try:
+            out["takes"] = int(self.store.wipe(since_wall, until))
+        except Exception:
+            pass
+        try:
+            led = self.ledger
+            out["lines"] = int(led.clear() if since_wall is None
+                               else led.forget_since(since_wall, until))
+            led.save_if_dirty()
+        except Exception:
+            pass
+        try:
+            with self._mu:
+                self._recent.clear()
+        except Exception:
+            pass
+        if out["takes"] or out["lines"]:
+            self._log(f"  [clone-cache] memory wipe: {out['takes']} cached "
+                      f"take{'s' if out['takes'] != 1 else ''} and "
+                      f"{out['lines']} ledger line"
+                      f"{'s' if out['lines'] != 1 else ''} forgotten")
+        return out
 
     def forget_last_reply(self, before=None) -> list:
         """'Forget that line': drop the takes of the last burst of lines

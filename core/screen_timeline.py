@@ -459,10 +459,18 @@ def get() -> Timeline:
 def add(**row) -> bool:
     """Queue one row on the process-wide timeline - not while the owner's
     "stop watching" pause runs (core.screen_memory.owner_paused: a click
-    or look he asks for then is not kept either). Never raises."""
+    or look he asks for then is not kept either), and not in guest mode
+    (core.guest_mode: nothing is kept while visitors are in the room;
+    review 2026-10-09). Never raises."""
     try:
         if not _singleton["enabled"]:
             return False
+        try:
+            from core import guest_mode as _gm
+            if _gm.is_on():
+                return False
+        except Exception:
+            pass
         try:
             from core import screen_memory as _sm
             if _sm.owner_paused():

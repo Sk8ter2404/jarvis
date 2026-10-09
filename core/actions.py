@@ -3780,6 +3780,12 @@ def _act_note_for_claude(args: str = "") -> str:
     note = " ".join(str(args or "").split()) or (_or.claude_note(said) or said)
     if not note:
         return "What should I note for Claude, sir?"
+    try:
+        from core import guest_mode as _gm
+        if _gm.is_on():
+            return _dn.GUEST_LINE
+    except Exception:
+        pass
     rec = _dn.add_note(note, utterance=said or note)
     if rec is None:
         return ("I couldn't save that note for Claude, sir \u2014 the notes "
@@ -3840,7 +3846,16 @@ def _act_forget_screen(args: str = "") -> str:
 def _note_screen_look(name: str, text: str) -> None:
     """Feed what a screen action found into this turn's screen texts (the
     sign-in guard reads them; core.auth_guard's _turn_screen_texts seam,
-    when the monolith has it). Never raises."""
+    when the monolith has it). Never raises.
+
+    ONE entry per look (review 2026-10-09): the monolith's
+    _note_turn_action_ran also records a look action's result after it
+    runs. ``frame["screen_fed"]`` names the action that fed the frame here,
+    so that run is not recorded a second time - two entries per look had
+    halved the guard's window (the last 4 looks became the last 2) and a
+    sign-in page seen early in a chain was forgotten three actions later.
+    This entry is the one kept: see_screen's raw page text, not an answer
+    built from it."""
     try:
         bc = _loaded_bc()
         frame = getattr(getattr(bc, "_turn_grounding", None), "frame", None)
@@ -3848,6 +3863,7 @@ def _note_screen_look(name: str, text: str) -> None:
             seen = frame.setdefault("screen", [])
             seen.append(str(text)[:4000])
             del seen[:-4]
+            frame["screen_fed"] = str(name or "").strip().lower()
     except Exception:
         pass
 
@@ -3992,6 +4008,40 @@ def _forget_learning_in_flight(bc, cutoff) -> None:
         print(f"  [memory] learn queue not invalidated: {e}")
 
 
+def _forget_screen_and_voice(span: dict, since) -> "tuple[list, list]":
+    """The screen memory's and the clone voice's share of a memory wipe
+    (review 2026-10-09: both wipes left them, so after a confirmed "forget
+    the last hour" the screen timeline still answered "what was on my
+    screen", the vision trace still held his words, and the clone cache's
+    ledger kept a line said twice in plain text). ``span``: core.
+    screen_memory's ({"seconds": 3600} / {"all": True}); ``since``: the
+    same cutoff on time.time() (None = everything). Returns (bits,
+    failures) for the reply - a store that could not be purged is
+    DISCLOSED, never silent. Never raises."""
+    bits: list = []
+    failures: list = []
+    try:
+        from core import screen_memory as _sm
+        c = _sm.forget_counts(span)
+        n = int(c.get("rows", 0)) + int(c.get("traces", 0)) + int(
+            c.get("cached", 0))
+        if n:
+            bits.append(f"{n} screen record(s)")
+    except Exception as e:
+        failures.append(f"what I saw on the screen was NOT forgotten ({e})")
+    try:
+        from core import clone_voice_client as _cvc
+        client = getattr(_cvc, "CLIENT", None)
+        if client is not None:
+            v = client.wipe(since)
+            n = max(int(v.get("takes", 0)), int(v.get("lines", 0)))
+            if n:
+                bits.append(f"{n} cached voice line(s)")
+    except Exception as e:
+        failures.append(f"the cloned voice's cache was NOT cleared ({e})")
+    return bits, failures
+
+
 def _act_reset_memory(_: str = "") -> str:
     """Snapshot bobert_memory.json to backups/, then re-initialise it
     to the empty schema. Destructive — but the backup is unconditional,
@@ -4007,7 +4057,11 @@ def _act_reset_memory(_: str = "") -> str:
     2026-10-01: also wiped -- each one survived and was read back after a
     confirmed reset: turns still queued for learning, the session-summary
     index and the verbatim voice-command log (backed up first), this
-    process's conversation history, and the LIVE system prompt."""
+    process's conversation history, and the LIVE system prompt.
+
+    2026-10-09: and the screen memory (timeline, vision trace, scenes,
+    cached looks) and the cloned voice's cache (its takes and the line
+    ledger's plain text) - _forget_screen_and_voice."""
     bc = _bc()
     try:
         with bc._memory_lock:
@@ -4065,6 +4119,13 @@ def _act_reset_memory(_: str = "") -> str:
         except Exception as pe:
             ltm_note += (f" — WARNING: the session summaries and the "
                          f"voice-command log were NOT cleared ({pe})")
+        # What the screen memory saw and the cloned voice's cache of what
+        # was said (review 2026-10-09).
+        _sv_bits, _sv_fail = _forget_screen_and_voice({"all": True}, None)
+        if _sv_bits:
+            ltm_note += " + " + " + ".join(_sv_bits) + " cleared"
+        for _f in _sv_fail:
+            ltm_note += f" — WARNING: {_f}"
         _pw = _refresh_live_prompt_after_wipe(bc)
         if _pw:
             ltm_note += f" — WARNING: {_pw}"
@@ -4315,7 +4376,10 @@ def _act_forget_last_hour(_: str = "") -> str:
     2026-10-01: also forgotten -- each one survived and was read back after
     a confirmed forget: turns still queued for learning, the session-summary
     index, this process's conversation history (and the running session
-    summary), and the LIVE system prompt is rebuilt at once."""
+    summary), and the LIVE system prompt is rebuilt at once.
+
+    2026-10-09: and the hour of the screen memory and of the cloned voice's
+    cache (_forget_screen_and_voice)."""
     bc = _bc()
     try:
         # Numeric epoch cutoff. Entries carry a float ts=time.time() written
@@ -4435,6 +4499,11 @@ def _act_forget_last_hour(_: str = "") -> str:
                 ss_removed = _n
         except Exception as se:
             failures.append(f"the session summaries were NOT purged ({se})")
+        # The screen memory and the cloned voice's cache (review
+        # 2026-10-09): the same hour.
+        _sv_bits, _sv_fail = _forget_screen_and_voice({"seconds": 3600.0},
+                                                      cutoff)
+        failures.extend(_sv_fail)
         _pw = _refresh_live_prompt_after_wipe(bc)
         if _pw:
             failures.append(_pw)
@@ -4449,6 +4518,7 @@ def _act_forget_last_hour(_: str = "") -> str:
             bits.append(f"{fcs} fact(s)")
         if vc_removed:
             bits.append(f"{vc_removed} voice command(s)")
+        bits.extend(_sv_bits)
         if opening_removed and not bits:
             # Normally the same utterances are already counted as logged
             # turns; say so only when nothing else was.
@@ -6855,6 +6925,60 @@ def _release_native_resources(bc) -> None:
     _release_audio_streams(bc)
     try:
         bc._face_track_stop.set()         # camera caps (thread releases them)
+    except Exception:
+        pass
+    _flush_persistent_stores()
+
+
+def _flush_persistent_stores(timeout: float = 1.5) -> None:
+    """Land the session's queued disk writes before TerminateProcess
+    (review 2026-10-09): the clone cache's line ledger, seed budget and
+    take gate (otherwise saved only after 60 s of quiet, or every 5 min)
+    and its queued takes, the screen timeline's queued rows and the vision
+    trace's queued entries - a session that ended mid-conversation lost
+    them all. Last in the teardown, after every driver is released, and
+    bounded by ``timeout`` in total (the caller's failsafe timer still
+    guarantees death). The writer daemons hold no driver handle, so they
+    are not stopped. Only modules already loaded are touched. Never
+    raises."""
+    deadline = time.time() + max(0.0, float(timeout))
+
+    def left() -> float:
+        return max(0.0, deadline - time.time())
+
+    try:
+        cvc = sys.modules.get("core.clone_voice_client")
+        client = getattr(cvc, "CLIENT", None) if cvc is not None else None
+        if client is not None:
+            for obj in (getattr(client, "ledger", None),
+                        getattr(client, "budget", None)):
+                try:
+                    if obj is not None:
+                        obj.save_if_dirty()
+                except Exception:
+                    pass
+            try:
+                client.store.save_gate()
+            except Exception:
+                pass
+            try:
+                client.store.flush(left())
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        tlm = sys.modules.get("core.screen_timeline")
+        holder = getattr(tlm, "_singleton", None) if tlm is not None else None
+        tl = holder.get("tl") if isinstance(holder, dict) else None
+        if tl is not None:
+            tl.flush(left())
+    except Exception:
+        pass
+    try:
+        vt = sys.modules.get("core.vision_trace")
+        if vt is not None:
+            vt.flush(left())
     except Exception:
         pass
 

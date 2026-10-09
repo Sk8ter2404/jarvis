@@ -54,7 +54,7 @@ __all__ = [
     "Step", "step", "current", "note_model_call", "note_image", "record",
     "mode", "trace_dir", "index_path", "flush", "purge", "prune",
     "read_index", "stats", "set_context_provider", "PRIVATE_SKIP",
-    "PAUSED_SKIP",
+    "PAUSED_SKIP", "GUEST_SKIP",
 ]
 
 PRIVATE_SKIP = "skipped: private"
@@ -64,9 +64,21 @@ PRIVATE_SKIP = "skipped: private"
 # background watcher, and every click kept tracing).
 PAUSED_SKIP = "skipped: paused"
 _PAUSED = "paused by the owner"
+# Guest mode (core.guest_mode: visitors are in the room, nothing said is
+# kept) keeps the same bare marker - no utterance, title, URL, prompt,
+# answer or image (review 2026-10-09: every look and click traced the
+# owner's - or a guest's - words for 7 days with guest mode on).
+GUEST_SKIP = "skipped: guest mode"
+_GUEST = "guest mode"
 
 
 def _paused_reason() -> str:
+    try:
+        from core import guest_mode as _gm
+        if _gm.is_on():
+            return _GUEST
+    except Exception:
+        pass
     try:
         from core import screen_memory as _sm
         return _PAUSED if _sm.owner_paused() else ""
@@ -289,6 +301,7 @@ class Step:
                     "step": self.entry["step"],
                     "outcome": self.entry.get("outcome"),
                     "privacy": (PAUSED_SKIP if self.private == _PAUSED
+                                else GUEST_SKIP if self.private == _GUEST
                                 else PRIVATE_SKIP
                                 if "excluded" not in self.private
                                 else "skipped: excluded")}

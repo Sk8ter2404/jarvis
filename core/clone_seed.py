@@ -216,6 +216,10 @@ class LineLedger:
                 ent["t"] = t
             if e.get("f"):
                 ent["f"] = 1
+            w = e.get("w")
+            if (isinstance(w, (int, float)) and not isinstance(w, bool)
+                    and w > 0):
+                ent["w"] = int(w)
             clean[h] = ent
         with self._mu:
             self._lines = clean
@@ -264,12 +268,62 @@ class LineLedger:
                     e = self._lines[h] = {"n": 0, "d": day}
                 e["n"] = int(e.get("n", 0)) + 1
                 e["d"] = day
+                # When it was last voiced (wall clock): a memory wipe of the
+                # last hour forgets the lines said in it (forget_since).
+                e["w"] = int(self._wall())
                 if e["n"] >= SEED_MIN_COUNT and len(t) <= TEXT_MAX_CHARS:
                     e["t"] = t
                 self.dirty = True
                 self._prune()
         except Exception:
             pass
+
+    def _wipe_where(self, pick) -> int:
+        """forget_since / clear: every line ``pick`` selects goes - its
+        count, text and time. A line the owner asked never to seed keeps
+        only that mark, by hash (with a count, or a reload drops it).
+        Returns how many lines went."""
+        n = 0
+        with self._mu:
+            for h, e in list(self._lines.items()):
+                if not pick(e):
+                    continue
+                if e.get("f"):
+                    if "t" not in e and "w" not in e:
+                        continue                  # already only the mark
+                    self._lines[h] = {
+                        "n": max(1, int(e.get("n", 0) or 0)),
+                        "d": str(e.get("d") or ""), "f": 1}
+                else:
+                    del self._lines[h]
+                n += 1
+            if n:
+                self.dirty = True
+        return n
+
+    def forget_since(self, wall_ts, until=None) -> int:
+        """A memory wipe of the last hour (core.actions forget_last_hour):
+        forget every line last voiced in [``wall_ts``, ``until``] (wall
+        clock; ``until`` None = no end), its count and its text. A line with
+        no time (counted before 2026-10-09, or from the history bootstrap)
+        is older and kept. Returns how many lines went. Never raises."""
+        try:
+            lo = float(wall_ts)
+            hi = float("inf") if until is None else float(until)
+            return self._wipe_where(
+                lambda e: isinstance(e.get("w"), int) and lo <= e["w"] <= hi)
+        except Exception:
+            return 0
+
+    def clear(self) -> int:
+        """A full memory wipe (core.actions reset_memory): every line goes.
+        The history bootstrap is not run again. Returns how many lines
+        went. Never raises."""
+        try:
+            return self._wipe_where(
+                lambda e: int(e.get("n", 0) or 0) > 0 or "t" in e)
+        except Exception:
+            return 0
 
     def merge_counts(self, counts: dict) -> int:
         """Fold history counts in (max, not sum: the history and the live

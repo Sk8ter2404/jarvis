@@ -26,8 +26,8 @@ import os
 import threading
 import time
 
-__all__ = ["SPOKEN_LINE", "notes_path", "add_note", "read_notes",
-           "set_context_provider"]
+__all__ = ["SPOKEN_LINE", "GUEST_LINE", "notes_path", "add_note",
+           "read_notes", "set_context_provider"]
 
 # "can’t" with a typographic apostrophe: the ASCII "can't" is a failure
 # marker (core.failure_markers), which would keep this finished sentence from
@@ -60,10 +60,25 @@ def _mirror_path() -> str:
         return ""
 
 
+# Guest mode (core.guest_mode): nothing said is kept while visitors are in
+# the room - a note is the owner's (or a visitor's) words verbatim, so it
+# waits until they have gone (review 2026-10-09).
+GUEST_LINE = ("Guest mode is on, sir, so I'm not keeping notes. Tell me "
+              "again once the guests have gone and I'll note it for Claude.")
+
+
 def add_note(note, utterance="", *, now=None) -> "dict | None":
-    """Append one note. Returns the record, or None on failure. Never
-    raises. No network."""
+    """Append one note. Returns the record, or None on failure or in guest
+    mode (the action says GUEST_LINE then). Never raises. No network."""
     try:
+        try:
+            from core import guest_mode as _gm
+            if _gm.is_on():
+                print("  [dev-notes] guest mode is on - note not kept",
+                      flush=True)
+                return None
+        except Exception:
+            pass
         rec = {"ts": round(float(time.time() if now is None else now), 3),
                "when": time.strftime("%Y-%m-%d %H:%M:%S",
                                      time.localtime(now or time.time())),
