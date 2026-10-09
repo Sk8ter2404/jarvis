@@ -70,15 +70,28 @@ STRONG_LEADS = (("go", "ahead"), ("do", "it"), ("of", "course"))
 # "I am." answer the pushback "Are you certain?" (2026-10-01).
 SOFT_LEADS = (("go", "for", "it"), ("please", "do"), ("i", "am", "sure"),
               ("i", "am", "certain"), ("im", "sure"), ("im", "certain"),
-              ("i", "am"), ("sounds", "good")) + tuple(
-    # "Jarvis, yes, that is what I want." (live 2026-10-06) answered "Say
-    # yes if that is what you want" - and was "other", so the held shutdown
-    # was cancelled. The owner restating that he wants it is a yes; "that is
-    # what SHE said" is not (no "i").
-    (*that, "what", "i", verb)
-    for that in (("that", "is"), ("thats",))
-    for verb in ("want", "wanted", "said", "meant", "asked"))
+              ("i", "am"), ("sounds", "good"), ("i", "said", "yes"))
 YES_LEADS = STRONG_LEADS + SOFT_LEADS
+# The owner RESTATING his yes after it (live 2026-10-06): "Jarvis, yes, that
+# is what I want." answered "Say yes if that is what you want." and was
+# "other" - four words after the yes - so the held shutdown was cancelled.
+# After a yes word or lead these words add nothing ("Yes, that's exactly what
+# I want", "Yes, I meant that", "Yes, you heard me"). They are NOT a yes on
+# their own (review 2026-10-09): a bare "That's what I said." is as often a
+# correction, and it confirmed a queued delete and started the overnight
+# protocol. "that is what SHE said" / "...what I want to know" never match.
+AFFIRM_TAIL = (
+    r"(?:(?:that\s+is|thats|it\s+is|its)\s+"
+    r"(?:(?:exactly|just|precisely|really)\s+)?"
+    r"(?:what\s+(?:i|im|id|we)\s+(?:am\s+|really\s+|do\s+)?"
+    r"(?:want(?:ed)?(?:\s+to\s+happen)?|said|meant|mean|asked(?:\s+for)?|"
+    r"asking(?:\s+for)?|saying|would\s+like|like)"
+    r"|the\s+plan|right|correct)"
+    r"|i\s+(?:(?:do|really|definitely|did)\s+)*(?:want|meant|mean)\s+"
+    r"(?:that|it|this)"
+    r"|i\s+said\s+(?:yes|so)"
+    r"|you\s+heard\s+me)")
+_AFFIRM_TAIL_RE = re.compile(r"(?:" + AFFIRM_TAIL + r")(?=\s|$)")
 # The most "other" words a strong yes / strong lead may carry and still be a
 # yes: "Yes, delete it" passes ("Yes I am" / "Yes, send it" are a yes plus a
 # yes lead); "Yeah, I saw it" and "Yeah, I saw that movie last week" do not
@@ -115,24 +128,37 @@ FILLER = frozenset({
 # Leading wake word: "jarvis", "hey jarvis", "ok jarvis", "okay jarvis".
 _WAKE_LEAD = (("hey", "jarvis"), ("ok", "jarvis"), ("okay", "jarvis"),
               ("jarvis",))
+# A hesitation before the answer (review 2026-10-09): "Um, no." / "Uh,
+# yeah." were "other" - the shutdown prompt and a held action were cancelled.
+_DISFLUENCY = frozenset({"um", "umm", "uh", "uhh", "er", "erm", "hmm", "mm"})
 # Trailing address / politeness that never changes the answer.
 _TRAILING = frozenset({"sir", "jarvis", "please"})
 
 
 def normalize(text) -> str:
-    """Lower-case words only, the wake word and trailing address dropped:
-    'Jarvis, yes.' -> 'yes', 'No, thanks.' -> 'no thanks', "Don't." ->
+    """Lower-case words only, the wake word(s), a leading hesitation and the
+    trailing address dropped: 'Jarvis, yes.' -> 'yes', 'Jarvis, Jarvis, no.'
+    -> 'no', 'Um, no.' -> 'no', 'No, thanks.' -> 'no thanks', "Don't." ->
     'dont', 'Shut-down' -> 'shut down'. A reply that is ONLY the wake word
     keeps it ('Jarvis.' -> 'jarvis'). Never raises."""
     try:
         s = str(text or "").lower().replace("’", "'")
         s = s.replace("'", "")                      # don't -> dont
         words = re.sub(r"[^\w\s]", " ", s).split()
-        for lead in _WAKE_LEAD:
-            n = len(lead)
-            if tuple(words[:n]) == lead and len(words) > n:
-                words = words[n:]
-                break
+        # A repeated wake word (review 2026-10-09: "Jarvis, Jarvis, yes."
+        # stayed "jarvis yes") and a hesitation either side of it.
+        changed = True
+        while changed:
+            changed = False
+            while len(words) > 1 and words[0] in _DISFLUENCY:
+                words = words[1:]
+                changed = True
+            for lead in _WAKE_LEAD:
+                n = len(lead)
+                if tuple(words[:n]) == lead and len(words) > n:
+                    words = words[n:]
+                    changed = True
+                    break
         while len(words) > 1 and words[-1] in _TRAILING:
             words = words[:-1]
         return " ".join(words)
@@ -158,8 +184,10 @@ def _drop_idioms(words: list) -> list:
 def hedge_words(words) -> list:
     """The hedge words (HEDGES) in ``words`` — a list of normalized words —
     with the affirmative idioms ("why not", "no problem") dropped first. The
-    shutdown prompt uses it on the words after its "no" (2026-10-01): "No,
-    wait." is a cancel there, not a power-off. Never raises."""
+    shutdown prompt used it on the words after its "no" (2026-10-01); since
+    2026-10-09 it takes only a PLAIN no there
+    (core.action_risk.plain_no_to_overnight), which no hedge can pass.
+    Never raises."""
     try:
         return [w for w in _drop_idioms(list(words or ())) if w in HEDGES]
     except Exception:
@@ -177,13 +205,26 @@ def _match_lead(words: list, leads) -> int:
     return best
 
 
+def _tail_len(words: list) -> int:
+    """How many of ``words`` an AFFIRM_TAIL at their start covers, or 0."""
+    m = _AFFIRM_TAIL_RE.match(" ".join(words))
+    return len(m.group(0).split()) if m else 0
+
+
 def _other_words(rest: list, leads) -> int:
-    """How many words of ``rest`` are not filler, a yes word or part of a
-    yes lead ("Okay, go ahead" -> 0, "Yes, delete it" -> 1)."""
+    """How many words of ``rest`` are not filler, a yes word, part of a yes
+    lead or an affirming restatement ("Okay, go ahead" -> 0, "Yes, delete
+    it" -> 1, "Yes, that is what I want" -> 0)."""
     n_other = 0
     i = 0
     while i < len(rest):
         n = _match_lead(rest[i:], leads)
+        if not n:
+            # A restatement only ENDS a yes: "Yeah, I want that movie" is a
+            # sentence that starts with a yes word, not a yes.
+            t = _tail_len(rest[i:])
+            if t and not _other_words(rest[i + t:], leads):
+                n = t
         if n:
             i += n
             continue
@@ -218,6 +259,14 @@ def classify_reply(text, extra_yes=(), extra_no=()) -> str:
         extra_yes = tuple(tuple(x) for x in (extra_yes or ()))
         soft_leads = SOFT_LEADS + extra_yes
         all_leads = STRONG_LEADS + soft_leads
+        # "Just do it." (review 2026-10-09): an emphatic "just" ahead of a
+        # yes word or lead adds nothing - it was "other", so the held
+        # action was cancelled. "Just a second" / "Just wait" stay as they
+        # were (no yes after the "just").
+        if (len(words) > 1 and words[0] == "just"
+                and (words[1] in YES_WORDS or _match_lead(words[1:],
+                                                          all_leads))):
+            words = words[1:]
         lead = _match_lead(words, all_leads)
         if lead:
             soft = _match_lead(words, soft_leads) == lead

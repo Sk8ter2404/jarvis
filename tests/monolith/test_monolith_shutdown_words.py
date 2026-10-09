@@ -20,6 +20,13 @@ shut down", "should I shut down my PC?", "shut down the printer", a quoted
 line, a broadcast sentence, "No, don't", a yes to a DIFFERENT question -
 still never shuts JARVIS down.
 
+ReviewRoutingTests (review 2026-10-09) adds what the first cut got wrong: a
+device statement or a question that shut JARVIS down or armed the prompt, a
+change of mind ("No, stay on.") read as a no, a bare "That's what I said."
+answering a different question - and the owner's phrasings it still missed
+("Yes, shut down with no overnight protocol.", "Skip the overnight
+protocol.", "Yes, run the overnight protocol, then shut down.").
+
     python -m unittest tests.monolith.test_monolith_shutdown_words
 """
 from __future__ import annotations
@@ -279,6 +286,173 @@ class NotTheOwnerAskingTests(_Base):
         self.shutdown.assert_not_called()
         # Nothing pending: the yes goes to the model, nothing runs.
         self.assertIsNone(self._route(SAID_4))
+        self.shutdown.assert_not_called()
+
+
+@requires_monolith
+class ReviewRoutingTests(_Base):
+    """Review 2026-10-09, through the real routers. Contexts: "A" the
+    overnight question is open, "B" nothing is pending, "C" the model's
+    shutdown_jarvis is held for a yes, "D" a different action (a wipe) is
+    held."""
+
+    def _end_state(self, ctx, *seq):
+        bc = self.bc
+        self.shutdown.reset_mock()
+        self.overnight.reset_mock()
+        self.wiped.reset_mock()
+        self.spoken.clear()
+        bc._shutdown_prompt_pending["armed"] = False
+        bc._pending_confirmation.clear()
+        bc._pending_confirmation_at[0] = 0.0
+        if ctx == "A":
+            self._arm()
+        elif ctx == "C":
+            bc._queue_pending_confirmation("shutdown_jarvis", "")
+        elif ctx == "D":
+            bc._queue_pending_confirmation("wipe_thing_x", "all")
+        consumed = None
+        for said in seq:
+            consumed = self._route(said)
+        if self.shutdown.called:
+            return "SHUTDOWN"
+        if self.overnight.called:
+            return "OVERNIGHT"
+        if self.wiped.called:
+            return "WIPE"
+        if bc._shutdown_prompt_pending["armed"]:
+            return "ASKS"
+        if any("ancelled" in s for s in self.spoken):
+            return "CANCEL"
+        return "LLM" if consumed is None else "CONSUMED"
+
+    def _expect(self, ctx, outcome, cases):
+        for seq in cases:
+            seq = (seq,) if isinstance(seq, str) else tuple(seq)
+            with self.subTest(ctx=ctx, seq=seq):
+                self.assertEqual(self._end_state(ctx, *seq), outcome)
+
+    def test_the_owners_four_tries_still_work(self):
+        self.assertEqual(self._end_state("B", SAID_1), "ASKS")
+        self.assertEqual(self._end_state("B", SAID_1, SAID_2), "SHUTDOWN")
+        self.assertEqual(self._end_state("B", SAID_3), "SHUTDOWN")
+        self.assertEqual(self._end_state("C", SAID_4), "SHUTDOWN")
+
+    def test_a_change_of_mind_cancels_the_prompt(self):
+        self._expect("A", "CANCEL", (
+            "No, stay on.", "No, keep running.", "No, I changed my mind.",
+            "Nope, stay awake.", "No no, keep going.", "No, I need you.",
+            "Nope, scratch that.", "No, forget it.",
+            "No, I don't want you to shut down.", "Cancel the shutdown.",
+            "No, no shutdown.", "Jarvis, no updates on the printer?",
+            "Just shut down the printer.", "No, the overnight protocol."))
+
+    def test_a_device_statement_then_a_correction_never_shuts_down(self):
+        for seq in (("Jarvis, laptop shut down without updating.", "No."),
+                    ("Server shut down without the update.", "No."),
+                    ("My laptop shut down without updating.",
+                     "No, my laptop."),
+                    ("The printer shut down without updating.",
+                     "No, the printer did."),
+                    ("It'll shut down without updating.", "No, the PC."),
+                    ("I'll shut down without the update.",
+                     "No, I meant my PC."),
+                    ('Jarvis, shut down "Plex".', "No, Plex."),
+                    ("Cancel the shutdown.", "No."),
+                    ("Jarvis, no shutdown.", "No."),
+                    ("My laptop shut down.", "No."),
+                    ("The factory had to shut down.", "No."),
+                    ("Windows will shut down.", "No."),
+                    ("The TV will power off.", "No.")):
+            with self.subTest(seq=seq):
+                self.assertNotIn(self._end_state("B", *seq),
+                                 ("SHUTDOWN", "OVERNIGHT"))
+
+    def test_questions_echoes_and_quotes_with_the_prompt_open_cancel(self):
+        self._expect("A", "CANCEL", (
+            "What happens if you shut down without the overnight protocol?",
+            "Is it okay to shut down without the update?",
+            "Shut down with no overnight protocol? No, wait.",
+            "Shut down. No, overnight protocol.",
+            '"Shut down without the protocol."',
+            "That's what I said.", "Jarvis, that's what I asked."))
+
+    def test_update_words_and_questions_never_shut_down_at_once(self):
+        self._expect("B", "LLM", (
+            "Shut down? No updates?", "Shut down. Not updating.",
+            "Jarvis, power off, no updates.",
+            "Jarvis, shut down without updating?",
+            "Jarvis, shut down without updating.",
+            "Jarvis, shut down. No, overnight protocol."))
+
+    def test_the_overnight_protocol_by_name_starts_it(self):
+        self._expect("A", "OVERNIGHT", (
+            "Yes, run the overnight protocol, then shut down.",
+            "Overnight protocol, then shut down.",
+            "Do the overnight protocol and then shut down.",
+            "Start the overnight protocol and shut down.",
+            "Yes, overnight protocol.", "Yeah, do the overnight protocol.",
+            "Run the overnight protocol.", "Jarvis yes do the overnight",
+            "Jarvis, shut down with the overnight protocol.",
+            "Jarvis, Jarvis, yes.", "Um, yes."))
+
+    def test_more_ways_to_say_no_overnight_with_the_prompt_open(self):
+        self._expect("A", "SHUTDOWN", (
+            "Jarvis shut down but no overnight protocol.",
+            "Jarvis shut down, skip the overnight protocol.",
+            "Skip the overnight protocol.",
+            "Jarvis shut down, don't do the overnight protocol.",
+            "I don't want the overnight protocol.",
+            "No, don't bother with the overnight protocol.",
+            "Jarvis, shut it down, no overnight protocol.",
+            "Jarvis shut down, no over night protocol.",
+            "Jarvis, no, don't do overnight, shut down.",
+            "Jarvis turn off, no overnight protocol.",
+            "Negative.", "Um, no.", "Jarvis, Jarvis, no.", "No, I'm good.",
+            "No. Shut down without the overnight protocol."))
+
+    def test_more_ways_shut_down_at_once_with_nothing_open(self):
+        self._expect("B", "SHUTDOWN", (
+            "Jarvis, Jarvis, shut down with no overnight protocol.",
+            "Jarvis, shut down without running the overnight protocol.",
+            "Jarvis shut down, don't run the overnight protocol.",
+            "Jarvis, power off, don't do the overnight protocol.",
+            "Jarvis, shut down, skip the overnight protocol.",
+            "Jarvis, shut it down, no overnight protocol.",
+            "Jarvis shut down, no over night protocol."))
+
+    def test_the_held_shutdown_takes_a_restated_yes(self):
+        self._expect("C", "SHUTDOWN", (
+            "Yes, shut down with no overnight protocol.",
+            "Jarvis, yes, shut down with no overnight protocol.",
+            "Yes, that's exactly what I want.", "Yes, I meant that.",
+            "I said yes.", "Yes, you heard me.", "Just do it.",
+            "Please, just do it.", "Jarvis, Jarvis, yes.", "Um, yes.",
+            "Yes, shut it down.", "Yes, I want you to shut down.",
+            "Yes, power down.", "Yes, shut down.", "Yes, shut down now.",
+            "Yeah, I'm sure, shut down.",
+            "Yes, shut down, no overnight protocol.",
+            "That is what I want."))
+
+    def test_the_held_shutdown_still_refuses(self):
+        for said in ("Jarvis, no, don't.", "No.", "Jarvis, don't shut down.",
+                     "Yes, shut down later.", "Yes, shut down the printer.",
+                     "That's what she said.", "Please.", 'Yes, "shut down".',
+                     "Yes, shut down?"):
+            with self.subTest(said=said):
+                self.assertNotIn(self._end_state("C", said),
+                                 ("SHUTDOWN", "OVERNIGHT"))
+
+    def test_a_restatement_never_answers_a_different_question(self):
+        for said in ("That's what I said.", "Jarvis, that's what I meant.",
+                     "That's what I asked", "That is what I want."):
+            with self.subTest(said=said):
+                self.assertEqual(self._end_state("D", said), "CANCEL")
+                self.wiped.assert_not_called()
+                self.shutdown.assert_not_called()
+        # ...while a yes to it still runs it, not a shutdown.
+        self.assertEqual(self._end_state("D", "Yes, that's what I said."),
+                         "WIPE")
         self.shutdown.assert_not_called()
 
 

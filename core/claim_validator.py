@@ -143,15 +143,25 @@ _FAMILIES: tuple[tuple[str, str, str, str, frozenset[str]], ...] = (
     # overnight protocol and am powering down now." was spoken with nothing
     # run - "shutting down" was caught, "powering down" / "going offline"
     # were not. A device powered off by smart_home_control grounds it too
-    # (_GROUND_ALSO).
+    # (_GROUND_ALSO), and so does any stop / disarm / pause / hide that ran
+    # (review 2026-10-09: "Powering down the pipeline, sir." after
+    # stop_pipeline, "Going offline now, sir. Phone bridge paused." after
+    # pause_phone_bridge were withheld). A past event is an answer, not a
+    # claim: "I went offline at 2 a.m. for the overnight protocol" / "I
+    # powered down at two last night" (to "why were you offline?").
     ("power",
      r"powering\s+(?:\w+\s+)?(?:down|off)\b|going\s+offline|"
      r"turning\s+myself\s+off|taking\s+myself\s+offline",
-     r"powered\s+(?:\w+\s+)?(?:down|off)\b|(?:gone|went)\s+offline",
+     r"powered\s+(?:\w+\s+)?(?:down|off)\b(?!.*\b(?:last\s+night|ago|"
+     r"yesterday|earlier|this\s+morning|at\s+(?:\d|one|two|three|four|five|"
+     r"six|seven|eight|nine|ten|eleven|twelve|midnight|noon)))"
+     r"|gone\s+offline",
      r"power\s+(?:\w+\s+)?(?:down|off)\b|go\s+offline|turn\s+myself\s+off|"
      r"take\s+myself\s+offline",
      frozenset({"shutdown", "shut", "power", "off", "offline", "exit", "quit",
-                "overnight", "upgrade", "restart", "sleep"})),
+                "overnight", "upgrade", "restart", "sleep", "stop", "disarm",
+                "pause", "hide", "disable", "deactivate", "end", "close",
+                "kill", "standby"})),
     ("switch",
      r"switching(?!\s+(?:gears|topics?|subjects?|tack|sides)\b)",
      r"switched(?!\s+(?:gears|topics?|subjects?|tack|sides)\b)",
