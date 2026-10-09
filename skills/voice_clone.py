@@ -9,8 +9,14 @@ Actions registered:
                             Refuses an unknown profile or one without consent
                             (never silently arms an un-consented voice).
   voice_clone_status      — say whether cloning is on, which profile, and
-                            whether the engine (chatterbox + CUDA) is available.
+                            whether the engine (chatterbox + CUDA) is available
+                            (and, with the clone voice server, whether its
+                            fast decoder is off).
   disable_voice_clone     — turn cloning back off (revert to the normal ladder).
+  forget_voice_line       — "forget that line": drop the clone voice's cached
+                            take(s) of the reply just heard, so the next time
+                            the line is said it is rendered afresh (a bad take
+                            would otherwise replay from the render cache).
 
 Each returns ONE finished, user-facing sentence and does NOT self-speak, so
 these names go in bobert_companion.SPEAK_RESULT_VERBATIM_ACTIONS (near the
@@ -225,6 +231,10 @@ def _voice_clone_status(_: str = "") -> str:
         except Exception:
             ready = False
     if ready:
+        note = _decode_note()
+        if note:
+            return (f"Voice cloning is on, sir, speaking as the '{profile}' "
+                    f"profile, though {note}.")
         return f"Voice cloning is on, sir, speaking as the '{profile}' profile."
     return (f"Voice cloning is on with the '{profile}' profile, sir, but the "
             f"engine isn't available ({_engine_hint(vc)}), so I'm "
@@ -237,6 +247,62 @@ def _disable_voice_clone(_: str = "") -> str:
     return "Voice cloning off, sir — back to my normal voice."
 
 
+def _clone_client():
+    """core.clone_voice_client.CLIENT, or None (never raises)."""
+    try:
+        from core import clone_voice_client as _cvc  # type: ignore
+        return _cvc.CLIENT
+    except Exception:
+        return None
+
+
+def _decode_note() -> str:
+    """The clone voice server's fast-decode note ('' when it is on or not
+    known). Reads /health once more first (bounded, loopback). Never
+    raises."""
+    client = _clone_client()
+    if client is None:
+        return ""
+    try:
+        client.refresh_health()
+        return str(client.decode_note() or "")
+    except Exception:
+        return ""
+
+
+def _request_accepted_at():
+    """time.monotonic() when the owner's current turn was accepted (the
+    monolith's _last_owner_turn_at), or None when not known. Lines the clone
+    voiced at or after it -- this request's own acknowledgement, streamed
+    before the action runs -- are not "that line". Never raises."""
+    try:
+        cell = getattr(_bobert(), "_last_owner_turn_at", None)
+        t = float(cell[0])
+        return t if t > 0.0 else None
+    except Exception:
+        return None
+
+
+def _forget_voice_line(_: str = "") -> str:
+    """'Forget that line': the clone voice's cached takes of the reply just
+    heard are dropped (memory and disk) and never prepared ahead again; the
+    next time a line is said it is rendered afresh. "Just heard" = before
+    this request was accepted."""
+    client = _clone_client()
+    if client is None:
+        return "The clone voice isn't loaded, sir, so there's nothing to forget."
+    try:
+        texts = client.forget_last_reply(before=_request_accepted_at())
+    except Exception:
+        texts = []
+    if not texts:
+        return ("I've no recent line in the cloned voice to forget, sir.")
+    if len(texts) == 1:
+        return ("Forgotten, sir. I'll say that line afresh next time.")
+    return (f"Forgotten, sir — all {len(texts)} lines of that reply. I'll say "
+            f"them afresh next time.")
+
+
 # ─── registration ────────────────────────────────────────────────────────────
 
 def register(actions: dict) -> None:
@@ -244,6 +310,7 @@ def register(actions: dict) -> None:
     actions["set_voice_profile"] = _set_voice_profile
     actions["voice_clone_status"] = _voice_clone_status
     actions["disable_voice_clone"] = _disable_voice_clone
+    actions["forget_voice_line"] = _forget_voice_line
     # Natural-language aliases the LLM tends to emit — same handlers.
     actions["use_voice_profile"] = _set_voice_profile
     actions["switch_voice_profile"] = _set_voice_profile

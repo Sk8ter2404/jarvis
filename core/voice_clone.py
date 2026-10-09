@@ -429,6 +429,17 @@ def engine_hint() -> str:
                 what = "kept failing"
             return (f"the clone voice server {what}, so it is resting for "
                     f"about {mins} more minute{'s' if mins != 1 else ''}")
+        try:
+            other = _cvc.CLIENT.voice_mismatch(_cfg_profile())
+        except Exception:
+            other = False
+        if other:
+            # Its reference.wav was replaced (or the server restarted with
+            # another one): the server is used again by itself once the two
+            # match (2026-10-09).
+            return ("the clone voice server is speaking a different "
+                    "reference than the selected profile's, so I'll switch "
+                    "over once it is running with that one")
         return "the clone voice server isn't running or isn't ready"
     return "needs chatterbox-tts and a CUDA GPU"
 

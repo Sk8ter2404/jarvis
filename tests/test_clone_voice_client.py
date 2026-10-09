@@ -37,6 +37,7 @@ Pins:
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 import time
@@ -544,6 +545,10 @@ class LatchTests(_Base):
         # cache hit reset the count, a hung server would never latch while
         # acks ("Very good, sir.") came between the answers, and EVERY new
         # line would wait out its whole deadline for the rest of the session.
+        # Since 2026-10-05 a cached take does not OPEN a reply while a miss
+        # is pending (it renders, and counts, like any line: a reply must
+        # not open in the clone and miss to Kokoro); a LOOK-AHEAD hit -- a
+        # reply already in the clone -- is still served. Neither resets it.
         srv = self.server()
         c, _ = self.ready_client(srv)
         self.assertTrue(c.render("Very good, sir.", 2.5).ok)
@@ -552,7 +557,8 @@ class LatchTests(_Base):
             self.assertEqual(c.status()[0], "ready")
             self.assertFalse(c.render(f"New line {i}.", 2.5).ok)
             if c.status()[0] == "ready":
-                hit = c.render("Very good, sir.", 2.5)
+                hit = c.render("Very good, sir.", 2.5,
+                               needed_by=time.monotonic() + 5.0)
                 self.assertTrue(hit.ok and hit.cached)
         self.assertEqual(c.status()[0], "cooldown", c.failures())
         # A hit still reports success to its caller while the streak runs.
@@ -560,8 +566,13 @@ class LatchTests(_Base):
         self.assertTrue(c2.render("Right away, sir.", 2.5).ok)
         srv2.tts_status = 500
         c2.render("Fails once.", 2.5)
-        self.assertTrue(c2.render("Right away, sir.", 2.5).cached)
+        self.assertTrue(c2.render("Right away, sir.", 2.5,
+                                  needed_by=time.monotonic() + 5.0).cached)
         self.assertEqual(c2.failures(), 1)
+        # ...but it does not open a reply now: rendered, and missed.
+        out = c2.render("Right away, sir.", 2.5)
+        self.assertFalse(out.ok or out.cached)
+        self.assertEqual(c2.failures(), 2)
 
     def test_rearm_from_cooldown_or_down(self):
         c, srv = self.ready_client(self.server(tts_status=500))
@@ -1010,14 +1021,23 @@ class RecheckAfterCooldownTests(_Base):
 
     def test_a_cache_hit_needs_no_check(self):
         # The cache holds renders of the voice start() checked; serving one
-        # sends nothing, so there is nothing to check yet.
+        # sends nothing, so there is nothing to check yet -- for a LOOK-AHEAD
+        # line (its reply already speaks in the clone). A cached take never
+        # OPENS a reply before the re-check (2026-10-05): the server could
+        # speak another voice now, and the rest of the reply would be
+        # Kokoro. That line renders, after the check.
         self.srv.tts_status = 200
         c, srv = self.ready_client(self.server())
         self.assertTrue(c.render("Very good, sir.", 2.5).ok)
         c._recheck = True
         n = srv.count("GET", "/health")
-        self.assertTrue(c.render("Very good, sir.", 2.5).cached)
+        self.assertTrue(c.render("Very good, sir.", 2.5,
+                                 needed_by=time.monotonic() + 5.0).cached)
         self.assertEqual(srv.count("GET", "/health"), n)
+        out = c.render("Very good, sir.", 2.5)
+        self.assertTrue(out.ok and not out.cached)
+        self.assertEqual(srv.count("GET", "/health"), n + 1)   # the re-check
+        self.assertFalse(c._recheck)
 
     def test_a_server_still_loading_is_a_counted_miss_and_checked_again(self):
         self.srv.health_code = 503
@@ -1254,6 +1274,220 @@ class ConsentGateTests(_Base):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  A replaced reference.wav (2026-10-09)
+# ════════════════════════════════════════════════════════════════════════════
+class ReferenceSwapTests(_Base):
+    """The owner swapped data/voice_profiles/<p>/reference.wav to a new take
+    and the server was restarted with it, yet JARVIS spoke Kokoro until a
+    full restart: the client still held the OLD hash and refused the server
+    whose /health said the new one. The consent check notices the changed
+    file (a stat, then a hash) and reads /health again, so the swap takes
+    effect without a restart -- and a server in any other voice stays
+    refused."""
+    TEXT = "Very good, sir."
+
+    def setUp(self):
+        super().setUp()
+        self.now = [3000.0]
+
+    def ready(self, srv=None):
+        return self.ready_client(srv, clock=lambda: self.now[0])
+
+    def swap_reference(self, wav: bytes = b"RIFF the owner's new take") -> str:
+        with open(self.prof.ref, "wb") as f:
+            f.write(wav)
+        return hashlib.sha256(wav).hexdigest()
+
+    def later(self, s: float) -> None:
+        self.now[0] += s
+
+    def test_a_replaced_reference_is_used_without_a_restart(self):
+        c, srv = self.ready()
+        self.assertTrue(c.render(self.TEXT, 2.5).ok)      # cached, old voice
+        self.assertEqual(c.cache_len(), 1)
+        new = self.swap_reference()
+        srv.ref_sha, srv.pid = new, 5151                   # restarted with it
+        self.later(cvc.PROFILE_TTL_S + 0.1)
+        self.assertTrue(c.usable_for("butler"))            # the next check
+        self.assertEqual(c.status(), ("ready", ""))
+        self.assertEqual(c.voice_prefix(), new[:16])
+        self.assertEqual(c.server_pid(), 5151)
+        self.assertEqual(len([m for m in self.logs
+                              if "now speaks the 'butler' profile's" in m]),
+                         1, self.logs)
+        # The old voice's take is gone and never served: the line renders
+        # in the new voice.
+        self.assertEqual(c.store.prefixes(), set())
+        n = len(srv.tts_texts())
+        out = c.render(self.TEXT, 2.5)
+        self.assertTrue(out.ok and not out.cached)
+        self.assertEqual(len(srv.tts_texts()), n + 1)
+        self.assertEqual(c.store.prefixes(), {new[:16]})
+        self.assertTrue(c.usable_for("butler"))
+
+    def test_a_server_still_in_the_old_voice_stays_refused(self):
+        c, srv = self.ready()
+        gets = srv.count("GET", "/health")
+        new = self.swap_reference()                        # not restarted yet
+        self.later(cvc.PROFILE_TTL_S + 0.1)
+        self.assertFalse(c.usable_for("butler"))
+        self.assertEqual(srv.count("GET", "/health"), gets + 1)   # looked
+        for _ in range(5):                                 # rate-limited
+            self.assertFalse(c.usable_for("butler"))
+        self.assertEqual(srv.count("GET", "/health"), gets + 1)
+        self.later(cvc.VOICE_PROBE_S + 0.1)
+        self.assertFalse(c.usable_for("butler"))
+        self.assertEqual(srv.count("GET", "/health"), gets + 2)
+        self.assertEqual(c.status()[0], "ready")           # just refused
+        self.assertEqual(c.voice_prefix(), self.prof.sha[:16])
+        self.assertEqual(srv.tts_texts(), [])
+        # Now it restarts with the new take: used at the next check after.
+        srv.ref_sha, srv.pid = new, 5151
+        self.later(cvc.VOICE_PROBE_S + 0.1)
+        self.assertTrue(c.usable_for("butler"))
+        self.assertEqual(c.voice_prefix(), new[:16])
+
+    def test_a_server_restarted_with_the_new_take_first_is_used_once_the_file_matches(self):
+        c, srv = self.ready()
+        new = hashlib.sha256(b"RIFF the owner's new take").hexdigest()
+        srv.ref_sha, srv.pid = new, 5151        # the file is still the old one
+        self.assertFalse(c.refresh_health())
+        self.assertEqual(c.status()[0], "down")
+        self.assertFalse(c.usable_for("butler"))
+        self.assertEqual(c.render(self.TEXT, 2.5).reason, "not-ready")
+        self.assertEqual(srv.tts_texts(), [])
+        self.swap_reference()                    # ...and now the file
+        self.later(cvc.PROFILE_TTL_S + 0.1)
+        self.assertTrue(c.usable_for("butler"))
+        self.assertEqual(c.status(), ("ready", ""))
+        self.assertTrue(c.render(self.TEXT, 2.5).ok)
+
+    def test_a_server_in_any_other_voice_is_never_used(self):
+        c, srv = self.ready()
+        srv.ref_sha, srv.pid = "c" * 64, 5151      # nobody's reference
+        self.assertFalse(c.refresh_health())
+        self.assertEqual(c.status()[0], "down")
+        for step in range(4):
+            self.later(cvc.VOICE_PROBE_IDLE_S + 0.1)
+            if step == 2:
+                self.swap_reference()              # another new take
+            self.assertFalse(c.usable_for("butler"), step)
+        self.assertEqual(c.status()[0], "down")
+        self.assertEqual(srv.tts_texts(), [])
+        self.assertEqual(len([m for m in self.logs
+                              if "different voice prompt" in m]), 1, self.logs)
+
+    def test_a_reference_replaced_during_a_cool_down_is_followed_after_it(self):
+        c, srv = self.ready(self.server(tts_status=500))
+        for i in range(cvc.MAX_FAILURES):
+            c.render(f"Miss {i}.", 2.5)
+        self.assertEqual(c.status()[0], "cooldown")
+        new = self.swap_reference()
+        srv.ref_sha, srv.pid, srv.tts_status = new, 5151, 200
+        self.later(c.cooldown_left_s() + 0.1)
+        self.assertTrue(c.usable_for("butler"))
+        out = c.render(self.TEXT, 2.5)
+        self.assertTrue(out.ok, out)
+        self.assertEqual(c.status(), ("ready", ""))
+        self.assertEqual(c.voice_prefix(), new[:16])
+
+    def test_the_voice_recheck_after_a_cool_down_follows_the_new_reference(self):
+        # The first render after a rest re-checks the voice before it sends
+        # anything (_recheck_voice); a reference replaced during the rest,
+        # with the server restarted on it, is the consented voice: it passes.
+        c, srv = self.ready(self.server(tts_status=500))
+        for i in range(cvc.MAX_FAILURES):
+            c.render(f"Miss {i}.", 2.5)
+        new = self.swap_reference()
+        srv.ref_sha, srv.pid, srv.tts_status = new, 5151, 200
+        self.later(c.cooldown_left_s() + 0.1)
+        self.assertEqual(c.status()[0], "ready")
+        out = c.render(self.TEXT, 2.5)          # no consent check before it
+        self.assertTrue(out.ok, out)
+        self.assertEqual(c.status(), ("ready", ""))
+        self.assertEqual(c.voice_prefix(), new[:16])
+        self.assertEqual(srv.tts_texts()[-1], self.TEXT)
+        # (One restarted in nobody's voice is refused at that check:
+        # RecheckAfterCooldownTests.)
+
+    def test_a_server_left_running_in_another_voice_at_boot_is_watched(self):
+        new = hashlib.sha256(b"RIFF the owner's new take").hexdigest()
+        srv = self.server(ref_sha=new)            # JARVIS restarted mid-swap
+        c = self.client(clock=lambda: self.now[0])
+        self.assertEqual(c.start(url=srv.url, cmd="", profile="butler"),
+                         "down")
+        self.assertFalse(c.usable_for("butler"))
+        self.swap_reference()
+        self.later(cvc.PROFILE_TTL_S + 0.1)
+        self.assertTrue(c.usable_for("butler"))
+        self.assertEqual(c.voice_prefix(), new[:16])
+
+    def test_a_server_down_for_another_reason_is_not_probed(self):
+        c = self.client(clock=lambda: self.now[0])
+        self.assertEqual(c.start(url=f"http://127.0.0.1:{free_port()}",
+                                 cmd="", profile="butler"), "down")
+        with mock.patch.object(c, "_health",
+                               side_effect=AssertionError("probed")):
+            self.later(cvc.VOICE_PROBE_IDLE_S + 1.0)
+            self.assertFalse(c.usable_for("butler"))
+
+    def test_a_same_size_swap_that_kept_the_old_mtime_is_noticed(self):
+        # A cheap stat decides whether to hash again: a new take of the same
+        # length, copied with its times kept, still has a new file id.
+        c, _srv = self.ready()
+        old_sha = c._file_sha(self.prof.ref)
+        self.assertEqual(old_sha, self.prof.sha)
+        st0 = os.stat(self.prof.ref)
+        tmp = self.prof.ref + ".new"
+        with open(self.prof.ref, "rb") as f:
+            wav = bytes(b ^ 0x55 for b in f.read())
+        with open(tmp, "wb") as f:
+            f.write(wav)
+        os.utime(tmp, ns=(st0.st_atime_ns, st0.st_mtime_ns))
+        os.replace(tmp, self.prof.ref)
+        st1 = os.stat(self.prof.ref)
+        self.assertEqual((st1.st_size, st1.st_mtime_ns),
+                         (st0.st_size, st0.st_mtime_ns))
+        self.assertEqual(c._file_sha(self.prof.ref),
+                         hashlib.sha256(wav).hexdigest())
+        self.later(cvc.PROFILE_TTL_S + 0.1)
+        self.assertEqual(c.profile_sha("butler"),
+                         hashlib.sha256(wav).hexdigest())
+
+    def test_the_status_line_says_the_server_speaks_another_reference(self):
+        # "What voice are you using?" right after the swap, before the
+        # server was restarted with the new take: an honest reason.
+        c, srv = self.ready()
+        new = self.swap_reference()
+        self.later(cvc.PROFILE_TTL_S + 0.1)
+        with mock.patch.object(vc, "_cfg_model", return_value=cvc.MODEL_ID), \
+             mock.patch.object(vc, "_cfg_enabled", return_value=True), \
+             mock.patch.object(vc, "_cfg_profile", return_value="butler"), \
+             mock.patch.object(cvc, "CLIENT", c):
+            self.assertFalse(vc.is_available())
+            self.assertIn("different reference", vc.engine_hint())
+            srv.ref_sha, srv.pid = new, 5151
+            self.later(cvc.VOICE_PROBE_S + 0.1)
+            self.assertTrue(vc.is_available())
+            self.assertNotIn("different reference", vc.engine_hint())
+            srv.ref_sha = "c" * 64                  # someone else's voice
+            self.assertFalse(c.refresh_health())
+            self.assertIn("different reference", vc.engine_hint())
+
+    def test_a_stale_memo_never_drops_a_server_in_the_new_voice(self):
+        # Something reads /health (the writer, the keeper) within the
+        # consent memo's lifetime after the swap: the decision about the
+        # server is taken on the file as it is now, not on the memo.
+        c, srv = self.ready()
+        self.assertTrue(c.usable_for("butler"))     # memo: the old hash
+        new = self.swap_reference()
+        srv.ref_sha, srv.pid = new, 5151
+        self.assertTrue(c.refresh_health())          # no TTL has passed
+        self.assertEqual(c.status(), ("ready", ""))
+        self.assertEqual(c.voice_prefix(), new[:16])
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  core.voice_clone with the server engine selected
 # ════════════════════════════════════════════════════════════════════════════
 class VoiceCloneServerModelTests(_Base):
@@ -1320,6 +1554,45 @@ class VoiceCloneServerModelTests(_Base):
         with mock.patch.object(vc, "_cfg_model", return_value="chatterbox"):
             self.assertIn("chatterbox-tts", vc.engine_hint())
             self.assertFalse(vc.rearm())
+
+
+class FastConnectTests(_Base):
+    """Every request connects through _fast_connect (a non-blocking connect
+    and select): CPython's own timed connect costs ~20 ms on about a
+    quarter of loopback connects on Windows (measured 2026-10-05), which a
+    cached opener's /health check -- and every render -- would pay."""
+
+    def test_it_connects_and_the_client_uses_it(self):
+        srv = self.server()
+        sock = cvc._fast_connect("127.0.0.1", srv.port, 1.0)
+        try:
+            self.assertIsNotNone(sock.getpeername())
+            self.assertTrue(sock.getblocking())
+        finally:
+            sock.close()
+        calls = []
+        real = cvc._fast_connect
+
+        def spy(*a):
+            calls.append(a)
+            return real(*a)
+        c, _ = self.ready_client(srv)
+        with mock.patch.object(cvc, "_fast_connect", side_effect=spy):
+            self.assertTrue(c.render("Hello there.", 2.5).ok)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ("127.0.0.1", srv.port))
+
+    def test_nothing_listening_is_a_connection_error_within_its_time(self):
+        port = free_port()
+        t0 = time.monotonic()
+        with self.assertRaises(ConnectionError):
+            cvc._fast_connect("127.0.0.1", port, 0.3)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        c = self.client()
+        c._host, c._port = "127.0.0.1", port
+        with self.assertRaises(ConnectionError):
+            c._request("GET", "/health", None, 0.3)
+        self.assertEqual(c._health(0.3), (None, {}))
 
 
 if __name__ == "__main__":

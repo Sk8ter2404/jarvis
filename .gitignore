@@ -61,6 +61,9 @@ data/voiceprints/
 # TTS clone (core/voice_clone.py). Contains the owner's OWN consented voice
 # audio; biometric + personal, NEVER commit. tools/enroll_voice.py writes here.
 data/voice_profiles/
+# The clone voice's render cache (core/clone_render_cache.py): rendered takes
+# of the cloned voice plus the text of lines JARVIS repeats. NEVER commit.
+data/clone_cache/
 # Long-term memory + fact stores — PII (names, email, employer, financial
 # references) that must never be committed. The live prompt already gets
 # these; a git commit would publish them.

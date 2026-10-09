@@ -12,7 +12,8 @@ eval_count=84 eval_ms=790 llm_calls=1 turn_ctx_chars=1342 sys_chars=31012 \
 followup_rounds=0 filler=0 filler_ms=- tail_ms=1410 cap_lag_ms=128 \
 clip_ms=3904 stt_wait_ms=0 stt_engine=- load_ms=13 total_ms=3512 \
 play_open_ms=41 out_lat_ms=46 filler_clip_ms=- eot=- st_p=- st_n=- pre=- \
-cut=- amb_deferred=- cache=- clone=- clone_ms=- lead_dropped=0
+cut=- amb_deferred=- cache=- clone=- clone_ms=- t3_ms_tok=- clone_cache=- \
+audible_ms=5207 lead_dropped=0
 
 Offsets are integer milliseconds from the turn's t0: the record_speech VAD
 break for a spoken turn, the inject-queue drain for a typed/injected turn. A
@@ -86,8 +87,25 @@ lead_dropped (NOTE_FIELDS; ``-`` = not measured on this turn):
                  'chatterbox_turbo_server') on the answer's first render: 1 =
                  it voiced it, 0 = it was tried and that line fell back to
                  Kokoro. ``-`` = the clone was not in use.
-  clone_ms       that first clone render's time, request to finished audio
-                 (0 = served from the clone's render cache).
+  clone_ms       that first clone line's wall time, request to finished
+                 audio; for a cached line, the time to confirm the server
+                 is up and fetch the take (0-2 ms; clone_cache says it was
+                 cached).
+  t3_ms_tok      C8 (2026-10-05): that first clone line's T3 decode ms per
+                 speech token, from the server's X-T3-Ms / X-Speech-Tokens
+                 (~4.3 on the fast cuda-graph decoder, ~24 on the slow
+                 loop). ``-`` when it came from the cache, missed, or the
+                 server sent no headers -- never a later line's speed.
+  clone_cache    where that first clone line came from: mem / disk (the
+                 render cache), miss (the server rendered it, or failed),
+                 refused (cached, but the server was not answering ready,
+                 so Kokoro voiced it), shadow-hit (VOICE_CLONE_CACHE
+                 'shadow': rendered, but the disk would have served it).
+  audible_ms     computed when the line is printed, never noted: the
+                 answer's first audible sample, ms from t0 = first_play +
+                 play_open_ms + out_lat_ms (``-`` unless all three are
+                 known). From the owner's last word: tail_ms + cap_lag_ms +
+                 audible_ms.
 
 They are set through TurnTiming.note_stat (load_ms / total_ms come with the
 answering response through llm_response, cap_lag_ms with the VAD break through
@@ -128,7 +146,10 @@ _AFTER_YOU = frozenset(("synth_start", "first_play"))
 NOTE_FIELDS = ("tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms",
                "stt_engine", "load_ms", "total_ms", "play_open_ms",
                "out_lat_ms", "filler_clip_ms", "eot", "st_p", "st_n", "pre",
-               "cut", "amb_deferred", "cache", "clone", "clone_ms")
+               "cut", "amb_deferred", "cache", "clone", "clone_ms",
+               "t3_ms_tok", "clone_cache", "audible_ms")
+# Computed by format_line from the marks and notes, never noted.
+_COMPUTED_NAMES = frozenset(("audible_ms",))
 
 # Stats fields, printed after the marks in this order.
 # turn_ctx_chars is the per-turn context actually SENT; budget_trimmed=1 when
@@ -164,8 +185,8 @@ PE_FULL_FRACTION = 0.80
 # (llm_response).
 _NOTE_PRINTED = frozenset(NOTE_FIELDS) - {"load_ms", "total_ms"}
 # The names note_stat accepts: those, but cap_lag_ms, which only the VAD
-# break supplies (note_vad_break) — one writer each.
-_NOTE_NAMES = _NOTE_PRINTED - {"cap_lag_ms"}
+# break supplies (note_vad_break) — one writer each — and the computed ones.
+_NOTE_NAMES = _NOTE_PRINTED - {"cap_lag_ms"} - _COMPUTED_NAMES
 
 # Thread rules for note_stat (everything else follows mark(owner_only=True)):
 #   * any thread — the filler clip, a soft cut on the playback reaper, the
@@ -174,7 +195,7 @@ _NOTE_NAMES = _NOTE_PRINTED - {"cap_lag_ms"}
 #     it adopted, so a reminder or tray line played first is not the answer.
 _ANY_THREAD_NAMES = frozenset(("filler_clip_ms", "cut", "amb_deferred"))
 _AFTER_YOU_NAMES = frozenset(("play_open_ms", "out_lat_ms", "cache", "clone",
-                              "clone_ms"))
+                              "clone_ms", "t3_ms_tok", "clone_cache"))
 # Counts that add up over the turn instead of keeping the first value.
 _ADDITIVE_NAMES = frozenset(("amb_deferred",))
 # Any-thread names that may arrive before their turn begins and be adopted
@@ -691,6 +712,24 @@ def _note_value(v) -> str:
         return "-"
 
 
+def _audible_ms(t0, marks: dict, notes: dict) -> str:
+    """first_play + play_open_ms + out_lat_ms as ms from t0 (the answer's
+    first audible sample), or '-' unless all three are known whole numbers.
+    Never raises."""
+    try:
+        fp = marks.get("first_play")
+        po = notes.get("play_open_ms")
+        ol = notes.get("out_lat_ms")
+        if fp is None or callable(po) or callable(ol):
+            return "-"
+        if any(v is None or isinstance(v, bool) for v in (po, ol)):
+            return "-"
+        total = (fp - t0) * 1000.0 + float(po) + float(ol)
+        return str(int(round(total)))
+    except Exception:
+        return "-"
+
+
 def format_line(turn: dict, end, outcome: str = "ok") -> str:
     """Render one finished turn (see the module docstring for the shape)."""
     t0 = turn["t0"]
@@ -722,6 +761,8 @@ def format_line(turn: dict, end, outcome: str = "ok") -> str:
     for k in STAT_FIELDS:
         if k == "filler_ms":
             parts.append(f"filler_ms={_off(t0, turn['filler_at'])}")
+        elif k == "audible_ms":
+            parts.append(f"audible_ms={_audible_ms(t0, marks, notes)}")
         elif k in _NOTE_PRINTED:
             parts.append(f"{k}={_note_value(notes.get(k))}")
         else:

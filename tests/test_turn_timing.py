@@ -524,7 +524,8 @@ class R1SchemaTests(unittest.TestCase):
             "tail_ms", "cap_lag_ms", "clip_ms", "stt_wait_ms", "stt_engine",
             "load_ms", "total_ms", "play_open_ms", "out_lat_ms",
             "filler_clip_ms", "eot", "st_p", "st_n", "pre", "cut",
-            "amb_deferred", "cache", "clone", "clone_ms"))
+            "amb_deferred", "cache", "clone", "clone_ms", "t3_ms_tok",
+            "clone_cache", "audible_ms"))
         self.assertEqual(len(set(tt.STAT_FIELDS)), len(tt.STAT_FIELDS))
 
     def test_the_old_fields_keep_their_order(self):
@@ -557,6 +558,8 @@ class NoteStatTests(unittest.TestCase):
         t.note_stat("cache", "would-hit")
         t.note_stat("clone", 1)
         t.note_stat("clone_ms", 812)
+        t.note_stat("t3_ms_tok", 4.31)
+        t.note_stat("clone_cache", "disk")
         _in_thread(lambda: t.note_stat("filler_clip_ms", 2120))
         _in_thread(lambda: t.note_stat("cut", 980))
         _in_thread(lambda: t.note_stat("amb_deferred", 2))
@@ -570,7 +573,8 @@ class NoteStatTests(unittest.TestCase):
              "filler_clip_ms": "2120", "eot": "rms",
              "st_p": "0.873", "st_n": "2", "pre": "1", "cut": "980",
              "amb_deferred": "2", "cache": "would-hit", "clone": "1",
-             "clone_ms": "812"})
+             "clone_ms": "812", "t3_ms_tok": "4.31", "clone_cache": "disk",
+             "audible_ms": "-"})
         self.assertEqual(d["lead_dropped"], "0")
 
     def test_an_absent_field_prints_dash(self):
@@ -901,6 +905,69 @@ class PreTurnStashTests(unittest.TestCase):
         t.discard()
         t.begin_voice(since)
         self.assertEqual(self._emit()["eot"], "rms")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  C8 (2026-10-05): audible_ms, the first clone line's T3 speed, cache source
+# ════════════════════════════════════════════════════════════════════════════
+class C8FieldTests(unittest.TestCase):
+    def setUp(self):
+        self.lines = []
+        self.clock = _ManualClock()
+        self.t = tt.TurnTiming(print_fn=self.lines.append, clock=self.clock)
+
+    def _emit(self):
+        return tt.parse_line(self.t.emit())
+
+    def test_audible_is_first_play_plus_open_plus_output_latency(self):
+        t = self.t
+        t.begin("voice")
+        self.clock.advance(1.5)
+        t.mark("you")
+        self.clock.advance(2.0)
+        t.mark("first_play")
+        t.note_stat("play_open_ms", 377)
+        t.note_stat("out_lat_ms", 182)
+        d = self._emit()
+        self.assertEqual(d["first_play"], "3500")
+        self.assertEqual(d["audible_ms"], str(3500 + 377 + 182))
+
+    def test_audible_is_dash_unless_all_three_are_known(self):
+        for marks, notes in (((), {"play_open_ms": 40, "out_lat_ms": 46}),
+                             (("first_play",), {"out_lat_ms": 46}),
+                             (("first_play",), {"play_open_ms": 40}),
+                             (("first_play",), {"play_open_ms": None,
+                                                "out_lat_ms": 46})):
+            t = tt.TurnTiming(print_fn=self.lines.append, clock=self.clock)
+            t.begin("voice")
+            t.mark("you")
+            for m in marks:
+                t.mark(m)
+            for k, v in notes.items():
+                t.note_stat(k, v)
+            d = tt.parse_line(t.emit())
+            self.assertEqual(d["audible_ms"], "-", (marks, notes))
+
+    def test_audible_cannot_be_noted(self):
+        t = self.t
+        t.begin("voice")
+        t.mark("you")
+        t.note_stat("audible_ms", 1)
+        self.assertEqual(self._emit()["audible_ms"], "-")
+
+    def test_clone_fields_follow_the_first_play_rule(self):
+        t = self.t
+        t.begin("voice")
+        t.note_stat("t3_ms_tok", 4.3)         # before "you": not the answer
+        t.mark("you")
+        _in_thread(lambda: t.note_stat("t3_ms_tok", 9.9))   # not adopted
+        _in_thread(lambda: t.note_stat("clone_cache", "mem"))
+        t.note_stat("clone_cache", "miss")
+        t.note_stat("t3_ms_tok", 4.47)
+        t.note_stat("clone_cache", "disk")    # first value wins
+        d = self._emit()
+        self.assertEqual((d["t3_ms_tok"], d["clone_cache"]),
+                         ("4.47", "miss"))
 
 
 if __name__ == "__main__":

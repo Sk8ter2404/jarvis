@@ -25,8 +25,16 @@ WHAT THIS MODULE DOES
     runs on a daemon (start_async), never on the boot path.
   * The consent gate still holds. The clone is used only while the server's
     voice prompt (its ref_sha256) is the reference.wav of the ACTIVE consented
-    profile (core.voice_clone.resolve_active_profile). A server that was
-    started with any other voice is never used.
+    profile (core.voice_clone.resolve_active_profile). A server that speaks
+    any other voice is never used. The profile's reference.wav is re-read at
+    most every PROFILE_TTL_S, and hashed again only when a cheap stat says it
+    changed (size, mtime or file id). When the two differ -- the owner
+    replaced reference.wav, the server was restarted with another one, the
+    profile was switched -- the consent check (usable_for) reads /health
+    again (rate-limited, _voice_probe) and uses the server again the moment
+    it speaks the active profile's voice: a reference swap takes effect
+    without a restart. Until then it stays refused, and nothing is rendered
+    or served in the old voice through the gate.
   * render(text) is one POST /tts bounded by a deadline (line_deadline_s).
     A line the listener is waiting for (a reply's first line) gets its
     LATENCY BUDGET: timeout_s, plus a per-character allowance for long
@@ -69,12 +77,40 @@ WHAT THIS MODULE DOES
     end) and loudness-matched to Kokoro's level, so a reply that mixes the
     two engines (one fallback line) does not jump in volume.
   * Finished renders are kept in a small in-memory LRU (CACHE_MAX_BYTES),
-    keyed by a hash of the voice and the text (the text itself is never
-    stored), so a stock line ("Right away, sir.") is instant the second time.
+    keyed by a hash of the voice, the model facts /health reports and the
+    text (the text itself is never stored), so a stock line ("Right away,
+    sir.") is instant the second time. With VOICE_CLONE_CACHE 'shadow' / 'on'
+    and a disk folder attached (attach_cache: the monolith does it at boot)
+    the takes are also kept on disk across restarts -- see
+    core/clone_render_cache.py for the key, the take gate and the files, and
+    core/clone_seed.py for the line ledger and the quiet-time seeding. A
+    cached take is served only while the client is 'ready' (never while the
+    server is down, starting or cooling down: no voice change mid-reply) and,
+    from disk, only while the server's voice is the active consented
+    profile's. A cached take that would OPEN a reply is served only while
+    the clone looks healthy (no miss pending, the fast decoder on) and the
+    server answers /health ready in the same process, voice and model
+    (_cache_live: a recent check stands for LIVE_MEMO_S) -- else the line
+    is rendered or missed like any other, so a reply never opens in the
+    clone only to fall to Kokoro. A take is kept on disk only once a
+    /health read AFTER it arrived shows the same server process, voice and
+    model that the key names (_verify_take, on the writer thread): /tts
+    does not say which voice spoke, and a server restarted with another
+    reference would otherwise have its takes filed under the consented
+    voice's key. Takes of a voice that is no longer a consented profile's
+    are purged (purge_unconsented).
+  * The fast decoder (C3, 2026-10-05): when /health says t3_decode is not
+    'cuda-graph', or a line comes back with X-T3-Engine 'eager', ONE log line
+    says the server is on its slow decoder (and one when it is back);
+    decode_note() feeds voice_clone_status. Nothing is spoken and nothing is
+    restarted (the server re-captures its graphs itself).
+  * forget_last_reply() drops the takes of the reply the owner just heard
+    (the "forget that line" action): the next time, it is rendered afresh.
 
 Nothing here is sound: it never plays audio. Stdlib + numpy (imported
 defensively); no monolith import. Tests: tests/test_clone_voice_client.py
-(light tier, against a fake loopback server).
+(light tier, against a fake loopback server) and
+tests/test_clone_render_cache.py.
 """
 from __future__ import annotations
 
@@ -84,14 +120,19 @@ import http.client
 import io
 import json
 import os
+import re
 import select
 import shlex
+import socket
 import subprocess
 import threading
 import time
 import wave
 from typing import Callable, Optional
 from urllib.parse import urlsplit
+
+from core import clone_render_cache as _crc
+from core import clone_seed as _cseed
 
 try:
     import numpy as np  # type: ignore
@@ -100,8 +141,8 @@ except Exception:  # pragma: no cover - numpy is present wherever audio is
 
 __all__ = ["MODEL_ID", "DEFAULT_URL", "MAX_FAILURES", "is_server_model",
            "parse_url", "render_budget_s", "line_deadline_s", "build_command",
-           "decode_wav", "finish_audio", "Outcome", "CloneVoiceClient",
-           "CLIENT"]
+           "decode_wav", "decode_wav_pcm16", "finish_audio", "Outcome",
+           "CloneVoiceClient", "CLIENT"]
 
 # The VOICE_CLONE_MODEL value that selects this engine.
 MODEL_ID = "chatterbox_turbo_server"
@@ -149,6 +190,17 @@ PER_CHAR_S = 0.03
 # The consent gate (profile meta + reference hash) is re-read at most this
 # often, so a profile switch or a revoked consent is seen within seconds.
 PROFILE_TTL_S = 5.0
+# When the consent check finds the server's voice is not the active profile's
+# (its reference.wav was replaced, the server restarted with another one, the
+# profile was switched), /health is read again -- at once when the profile's
+# hash is new to the check, else at most every VOICE_PROBE_S (a server that
+# answered) or VOICE_PROBE_IDLE_S (one that did not: each such probe can cost
+# its whole LIVENESS_TIMEOUT_S) -- and a server that now speaks the profile's
+# voice is used again without a restart (2026-10-09: the owner swapped
+# reference.wav and the server was restarted with it, yet JARVIS spoke Kokoro
+# until a full restart, because the client never looked at /health again).
+VOICE_PROBE_S = 5.0
+VOICE_PROBE_IDLE_S = 60.0
 
 # Loudness match: Kokoro's speech sits at an active RMS of ~0.10 (measured on
 # its renders); the clone's short lines came out ~10 dB quieter.
@@ -165,6 +217,33 @@ TAIL_KEEP_S = 0.10
 
 # In-memory render cache (float32 audio; 16 MB is ~170 s of speech).
 CACHE_MAX_BYTES = 16 * 1024 * 1024
+# The server decodes a line on its CUDA graphs up to ~600 characters (its
+# static KV cache); a longer line uses the slow loop BY DESIGN, so only a
+# line up to this long on 'eager' raises the fast-decode alert (C3).
+GRAPH_MAX_CHARS = 500
+# "Forget that line": the lines voiced for a listener in the last burst --
+# consecutive lines no more than FORGET_GAP_S apart -- and only if that
+# burst ended within FORGET_WINDOW_S.
+FORGET_GAP_S = 10.0
+FORGET_WINDOW_S = 600.0
+RECENT_MAX = 32
+# The same line voiced again within this long (an R3 pre-render dropped in
+# the lock and rendered again) is one saying, not two, for the ledger.
+LEDGER_DEDUPE_S = 15.0
+# Before a cached take OPENS a reply, GET /health must answer ready in the
+# same server process, voice and model, within this long (_cache_live). A
+# bare connect is not enough: the server binds its port before it loads
+# (~13 s of 503s) and a hung one still accepts, so a reply could open in the
+# clone and go on in Kokoro -- the owner's "no cached lines while the server
+# is down" (B6). Measured on this box: ~1 ms p99 with _fast_connect.
+LIVENESS_TIMEOUT_S = 0.25
+# A /health that confirmed the server (same pid, voice and model) this
+# recently stands for it: no new probe (a reply's later cached lines, and
+# the writer's checks of its rendered ones, keep it fresh).
+LIVE_MEMO_S = 2.0
+# The writer's /health read before a take is kept on disk (off the voice
+# path; a server that does not answer in time keeps nothing).
+VERIFY_TIMEOUT_S = 1.0
 
 _LOOPBACK = ("127.0.0.1", "::1", "localhost")
 # Interpreter variables of JARVIS's own Python that must not leak into the
@@ -281,9 +360,10 @@ def build_command(cmd, ref: str, port: int):
         return None
 
 
-def decode_wav(data: bytes):
-    """(float32 mono array, sample rate) from 16-bit PCM WAV bytes. Raises on
-    anything else."""
+def decode_wav_pcm16(data: bytes):
+    """(int16 mono array, sample rate) from 16-bit PCM WAV bytes: the
+    server's own samples (several channels are averaged and rounded). Raises
+    on anything else."""
     if np is None:
         raise RuntimeError("numpy unavailable")
     with wave.open(io.BytesIO(data), "rb") as w:
@@ -295,10 +375,28 @@ def decode_wav(data: bytes):
         raise ValueError(f"expected 16-bit PCM, got {8 * width}-bit")
     if sr <= 0 or ch <= 0:
         raise ValueError("bad WAV header")
-    a = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    a = np.frombuffer(raw, dtype="<i2")
     if ch > 1:
-        a = a[: (a.size // ch) * ch].reshape(-1, ch).mean(axis=1)
-    return np.ascontiguousarray(a, dtype=np.float32), int(sr)
+        a = np.round(a[: (a.size // ch) * ch].reshape(-1, ch)
+                     .astype(np.float32).mean(axis=1))
+    return np.ascontiguousarray(a, dtype=np.int16), int(sr)
+
+
+def decode_wav(data: bytes):
+    """(float32 mono array, sample rate) from 16-bit PCM WAV bytes. Raises on
+    anything else."""
+    pcm, sr = decode_wav_pcm16(data)
+    return (np.ascontiguousarray(pcm.astype(np.float32) / 32768.0,
+                                 dtype=np.float32), sr)
+
+
+def _header_float(headers: dict, name: str):
+    """A numeric X- header as a float, None when absent or not a number."""
+    try:
+        v = float(str(headers.get(name)).strip())
+        return v if v == v else None
+    except Exception:
+        return None
 
 
 def _active_rms(a, sr: int) -> float:
@@ -366,17 +464,26 @@ class Outcome:
                       so this line could run past the time it was needed
     ``late_s``     -- a look-ahead line that came back AFTER the time it was
                       needed: by how much (an estimate; the listener heard
-                      about that much pause before it)"""
+                      about that much pause before it)
+    ``cache``      -- where a cached take came from: 'mem' / 'disk' ('' when
+                      the server rendered it)
+    ``shadow``     -- VOICE_CLONE_CACHE 'shadow' only: 'would-hit' /
+                      'would-miss' (would the disk have served this line)
+    ``t3_ms`` ``tokens`` ``engine`` ``audio_ms`` -- the server's X-T3-Ms,
+                      X-Speech-Tokens, X-T3-Engine and X-Audio-Ms for a
+                      rendered line (None / '' when absent or cached)"""
 
     __slots__ = ("audio", "sr", "ms", "reason", "cached", "server_ms",
                  "lookahead", "deadline_s", "by_need", "counted", "held",
-                 "late_s")
+                 "late_s", "cache", "shadow", "t3_ms", "tokens", "engine",
+                 "audio_ms")
 
     def __init__(self, audio=None, sr: int = 0, ms: int = 0, reason: str = "",
                  cached: bool = False, server_ms=None, lookahead: bool = False,
                  deadline_s: float = 0.0, by_need: bool = False,
                  counted: bool = False, held: bool = False,
-                 late_s: float = 0.0):
+                 late_s: float = 0.0, cache: str = "", shadow=None,
+                 t3_ms=None, tokens=None, engine: str = "", audio_ms=None):
         self.audio = audio
         self.sr = sr
         self.ms = ms
@@ -389,6 +496,22 @@ class Outcome:
         self.counted = counted
         self.held = held
         self.late_s = late_s
+        self.cache = cache
+        self.shadow = shadow
+        self.t3_ms = t3_ms
+        self.tokens = tokens
+        self.engine = engine
+        self.audio_ms = audio_ms
+
+    @property
+    def t3_ms_per_token(self):
+        """T3 decode ms per speech token for a rendered line, else None."""
+        try:
+            if self.t3_ms is None or not self.tokens:
+                return None
+            return round(float(self.t3_ms) / float(self.tokens), 2)
+        except Exception:
+            return None
 
     @property
     def ok(self) -> bool:
@@ -423,7 +546,10 @@ class CloneVoiceClient:
       starting  start() is running on its daemon
       ready     the server answers and speaks the active profile's voice
       down      it never came up, or is not usable (terminal for the session;
-                rearm() resets it)
+                rearm() resets it) -- except a server that speaks another
+                voice than the active consented profile's: the consent check
+                (usable_for) keeps looking (_voice_probe) and the client is
+                'ready' again once the two match
       cooldown  MAX_FAILURES latency-critical misses in a row: Kokoro speaks
                 until the cool-down ends, then the clone is 'ready' again,
                 on probation (checked on every status read); rearm() ends
@@ -462,10 +588,40 @@ class CloneVoiceClient:
         self._recheck = False
         self._proc = None
         self._profile_memo: dict = {}   # name -> (expires_at, sha or "")
-        self._sha_memo: dict = {}       # path -> ((size, mtime_ns), sha)
-        self._cache: "collections.OrderedDict" = collections.OrderedDict()
-        self._cache_bytes = 0
+        # path -> ((size, mtime_ns, file id), sha)
+        self._sha_memo: dict = {}
+        # 'down' because the server speaks another voice than the consented
+        # profile's (not because it never came up): usable_for keeps probing.
+        self._voice_down = False
+        # The consent check's /health probe: the profile hash it last looked
+        # for, and when it may look again for that same hash.
+        self._probe_want: Optional[str] = None
+        self._probe_next = float("-inf")
         self._logged: set = set()
+        # The profile start() was asked for (the disk cache serves only
+        # while the server speaks ITS consented voice).
+        self._profile = ""
+        # What /health reported about the model (the cache key's facts) and
+        # the decoder in use: 'cuda-graph' / 'eager' / '' (not known yet).
+        self._server_info: dict = {}
+        self._decode = ""
+        self._health_at = float("-inf")
+        # The last /health that confirmed the server: (clock when it was
+        # SENT, _identity). It vouches for takes that arrived before it was
+        # sent (_verify_take) and, for LIVE_MEMO_S, for the server being up
+        # (_cache_live).
+        self._verified: Optional[tuple] = None
+        self._consented_memo = (float("-inf"), None)
+        # The render cache: memory tier always; disk tier once attached.
+        self.store = _crc.CloneRenderCache(
+            mem_cap_fn=lambda: CACHE_MAX_BYTES)
+        # Lines voiced for a listener: (clock, key, prefix, text), newest
+        # last (forget_last_reply), and how often each was said (seeding).
+        self._recent: "collections.deque" = collections.deque(
+            maxlen=RECENT_MAX)
+        self.ledger = _cseed.LineLedger(None)
+        self.budget = _cseed.SeedBudget(None)
+        self.keeper = None
 
     # ── small helpers ────────────────────────────────────────────────────
     def _log(self, msg: str) -> None:
@@ -527,10 +683,16 @@ class CloneVoiceClient:
 
     # ── the consent gate ─────────────────────────────────────────────────
     def _file_sha(self, path: str) -> str:
-        """SHA-256 of a file, memoised by (size, mtime). '' if unreadable."""
+        """SHA-256 of a file, memoised by a cheap stat: (size, mtime, file
+        id). A replaced reference.wav changes at least one of them -- a copy
+        of the same length keeps the size, and one whose times were kept
+        (Copy-Item / os.replace of a file with an old mtime) still gets a new
+        file id -- and is hashed again. '' if unreadable."""
         try:
             st = os.stat(path)
-            sig = (st.st_size, getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            sig = (st.st_size,
+                   getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
+                   getattr(st, "st_ino", 0))
             with self._mu:
                 memo = self._sha_memo.get(path)
             if memo is not None and memo[0] == sig:
@@ -560,15 +722,19 @@ class CloneVoiceClient:
         except Exception:
             return None
 
-    def profile_sha(self, profile_name: str) -> str:
+    def profile_sha(self, profile_name: str, fresh: bool = False) -> str:
         """The active profile's reference hash ('' = no usable profile),
-        re-checked at most every PROFILE_TTL_S."""
+        re-checked at most every PROFILE_TTL_S -- or now with ``fresh``
+        (a decision about a server that answered with another voice must not
+        rest on a memo from before the file was replaced). Re-checking is a
+        stat; the file is hashed again only when the stat changed."""
         name = str(profile_name or "")
         now = self._clock()
-        with self._mu:
-            memo = self._profile_memo.get(name)
-        if memo is not None and now < memo[0]:
-            return memo[1]
+        if not fresh:
+            with self._mu:
+                memo = self._profile_memo.get(name)
+            if memo is not None and now < memo[0]:
+                return memo[1]
         ref = self._profile_ref(name)
         sha = ref[1] if ref else ""
         with self._mu:
@@ -577,22 +743,132 @@ class CloneVoiceClient:
 
     def usable_for(self, profile_name: str) -> bool:
         """Ready AND speaking the voice of ``profile_name`` (consented). Never
-        raises; a mismatch is logged once per (profile, voice)."""
+        raises; a mismatch is logged once per (profile, voice).
+
+        The consent check: when the server's voice (as last read) is not the
+        profile's -- its reference.wav was replaced, the profile switched --
+        /health is read again (_voice_probe, rate-limited, bounded) and a
+        server that now speaks the profile's voice is used from this call
+        on, without a restart; also one that was 'down' for speaking another
+        voice. Anything else stays refused."""
         try:
             self._cooldown_tick()
             with self._mu:
-                if self._status != "ready":
-                    return False
+                st = self._status
+                voice_down = self._voice_down
                 server_sha = self._server_sha
-            want = self.profile_sha(profile_name)
-            if want and want == server_sha:
+            if st != "ready" and not (st == "down" and voice_down):
+                return False
+            name = str(profile_name or "")
+            want = self.profile_sha(name)
+            if st == "ready" and want and want == server_sha:
                 return True
-            self._log_once(
-                ("mismatch", str(profile_name or ""), want, server_sha),
-                f"  [clone-voice] the server's voice is not the "
-                f"'{profile_name}' profile's (or that profile is not "
-                f"consented); Kokoro speaks until they match")
+            if want and self._voice_probe(want, name):
+                return True
+            if st == "ready":
+                self._log_once(
+                    ("mismatch", name, want, server_sha),
+                    f"  [clone-voice] the server's voice is not the "
+                    f"'{profile_name}' profile's (or that profile is not "
+                    f"consented); Kokoro speaks until they match")
             return False
+        except Exception:
+            return False
+
+    def voice_mismatch(self, profile_name: str) -> bool:
+        """The server is up (or was stopped being used for its voice) but
+        does not speak ``profile_name``'s consented reference -- e.g. that
+        reference.wav was just replaced and the server not yet restarted
+        with it. For an honest status line; no request (the consent memo
+        only). Never raises."""
+        try:
+            self._cooldown_tick()
+            with self._mu:
+                st = self._status
+                voice_down = self._voice_down
+                server_sha = self._server_sha
+            if st == "down":
+                return voice_down
+            if st != "ready":
+                return False
+            want = self.profile_sha(profile_name)
+            return bool(want) and want != server_sha
+        except Exception:
+            return False
+
+    def _voice_probe(self, want: str, profile: str) -> bool:
+        """The consent check found the server's voice is not ``want`` (the
+        active consented profile's reference hash): read /health -- at once
+        when ``want`` is new to the probe (a replaced reference.wav), else at
+        most every VOICE_PROBE_S, or VOICE_PROBE_IDLE_S after a probe nothing
+        answered -- and use the server again (_use_server) when it now
+        answers ready in that voice. True when it did. A server that speaks
+        anything else changes nothing: it stays refused. Bounded by
+        LIVENESS_TIMEOUT_S; never raises."""
+        try:
+            now = self._clock()
+            with self._mu:
+                if want == self._probe_want and now < self._probe_next:
+                    return False
+                self._probe_want = want
+                self._probe_next = now + VOICE_PROBE_IDLE_S
+            code, h = self._health(LIVENESS_TIMEOUT_S)
+            if code is not None:
+                with self._mu:
+                    self._probe_next = now + VOICE_PROBE_S
+            if code != 200 or not h.get("ok"):
+                return False
+            if str(h.get("ref_sha256") or "") != want:
+                return False
+            return self._use_server(h, now, profile)
+        except Exception:
+            return False
+
+    def _use_server(self, h: dict, sent_at: float, profile: str = "") -> bool:
+        """Use the server a ready /health ``h`` (sent at ``sent_at``)
+        describes, whose voice prompt is the active consented profile's
+        (the caller checked): its hash, process and model facts from now on
+        (the render cache keys follow the hash), a fresh miss count, and the
+        takes of a voice no longer consented purged. From 'ready', or from
+        'down' for speaking another voice; any other state (a cool-down, a
+        rearm, a stop meanwhile) is left alone. ``profile`` (when given)
+        becomes the profile the disk tier and the writer check consent
+        against. True when it switched. ONE log line. Never raises."""
+        try:
+            sha = str(h.get("ref_sha256") or "")
+            with self._mu:
+                st = self._status
+                if not sha or not (st == "ready"
+                                   or (st == "down" and self._voice_down)):
+                    return False
+                same = sha == self._server_sha and st == "ready"
+                self._status = "ready"
+                self._reason = ""
+                self._voice_down = False
+                self._server_sha = sha
+                self._server_pid = h.get("pid")
+                self._server_info = _server_facts(h)
+                self._health_at = self._clock()
+                if profile:
+                    self._profile = str(profile)
+                self._fails = 0
+                self._probation = False
+                self._recheck = False
+                self._probe_want = None
+                self._probe_next = float("-inf")
+                # A reference changed: list the consented voices afresh for
+                # the purge below.
+                self._consented_memo = (float("-inf"), None)
+                who = self._profile
+            self._mark_verified(sent_at, h)
+            if not same:
+                self._log(f"  [clone-voice] the voice server now speaks the "
+                          f"'{who}' profile's reference (server pid "
+                          f"{h.get('pid')}); replies use the clone voice "
+                          f"again and the render cache follows it")
+            self._note_decode(h.get("t3_decode"), "its /health")
+            self.purge_unconsented()
+            return True
         except Exception:
             return False
 
@@ -616,14 +892,12 @@ class CloneVoiceClient:
         conn = http.client.HTTPConnection(
             host, port, timeout=min(CONNECT_TIMEOUT_S, self._left(deadline)))
         try:
-            try:
-                conn.connect()
-            except OSError as e:
-                # Refused, or no answer within CONNECT_TIMEOUT_S: the server
-                # is not there. Not a render timeout.
-                raise ConnectionError(f"cannot connect to {host}:{port} "
-                                      f"({type(e).__name__})") from None
-            sock = conn.sock
+            # Refused, or no answer within CONNECT_TIMEOUT_S: the server is
+            # not there (ConnectionError). Not a render timeout. Connected
+            # here, not by http.client: see _fast_connect.
+            sock = _fast_connect(host, port,
+                                 min(CONNECT_TIMEOUT_S, self._left(deadline)))
+            conn.sock = sock
             sock.settimeout(self._left(deadline))
             headers = {"Connection": "close"}
             if body is not None:
@@ -652,11 +926,12 @@ class CloneVoiceClient:
             except Exception:
                 pass
 
-    def _health(self):
-        """(status code, JSON dict) or (None, {}) when nothing answers."""
+    def _health(self, budget_s: float = HEALTH_TIMEOUT_S):
+        """(status code, JSON dict) or (None, {}) when nothing answers
+        within ``budget_s``."""
         try:
             code, _h, data = self._request("GET", "/health", None,
-                                           HEALTH_TIMEOUT_S)
+                                           float(budget_s))
         except Exception:
             return None, {}
         try:
@@ -710,6 +985,7 @@ class CloneVoiceClient:
         t0 = self._clock()
         with self._mu:
             self._status = "starting"
+            self._profile = str(profile or "")
         spawned = False
         try:
             hp = parse_url(url)
@@ -813,24 +1089,35 @@ class CloneVoiceClient:
             # Never speak in a voice the consent gate has not passed. A server
             # this process started is useless then: ask it to stop. One that
             # was already running belongs to someone else: leave it alone.
+            # One left running is watched by the consent check: when it (or
+            # the profile's reference.wav) changes so the two match, it is
+            # used (usable_for -> _voice_probe).
             stopped = "; asked it to stop" if spawned and self.stop_server() else ""
             if not sha:
                 return self._down("the server does not report its voice "
                                   "prompt (ref_sha256), so it cannot be "
-                                  f"checked{stopped}")
+                                  f"checked{stopped}", voice=not stopped)
             return self._down("the server was started with a different voice "
-                              f"prompt than the active profile's{stopped}")
+                              f"prompt than the active profile's{stopped}",
+                              voice=not stopped)
         with self._mu:
             self._status = "ready"
             self._reason = ""
             self._server_sha = sha
             self._server_pid = h.get("pid")
+            self._server_info = _server_facts(h)
+            self._health_at = self._clock()
+            # Nothing renders before 'ready', so this /health vouches for
+            # the server from now.
+            self._verified = (self._health_at, _health_identity(h))
             self._fails = 0
             self._probation = False
             self._recheck = False
         self._log(f"  [clone-voice] ready ({how}, {self._clock() - t0:.1f} s, "
                   f"server pid {h.get('pid')}): replies use the clone voice; "
                   f"Kokoro covers any line it misses")
+        self._note_decode(h.get("t3_decode"), "its /health")
+        self.purge_unconsented()
         if on_ready is not None:
             try:
                 on_ready()
@@ -838,12 +1125,22 @@ class CloneVoiceClient:
                 pass
         return "ready"
 
-    def _down(self, reason: str) -> str:
+    def _down(self, reason: str, voice: bool = False) -> str:
+        """Stop using the server. ``voice``: because it speaks another voice
+        than the active consented profile's -- the consent check keeps
+        looking and uses it again once the two match (a replaced
+        reference.wav, a server restarted with the right one); otherwise
+        for the session (rearm() resets it)."""
         with self._mu:
             self._status = "down"
             self._reason = reason
-        self._log(f"  [clone-voice] not used this session: {reason}. Kokoro "
-                  f"keeps speaking.")
+            self._voice_down = bool(voice)
+        if voice:
+            self._log(f"  [clone-voice] not used: {reason}. Kokoro speaks "
+                      f"until the server speaks the active profile's voice.")
+        else:
+            self._log(f"  [clone-voice] not used this session: {reason}. "
+                      f"Kokoro keeps speaking.")
         return "down"
 
     def rearm(self) -> bool:
@@ -862,18 +1159,25 @@ class CloneVoiceClient:
             self._cool_ended_at = float("-inf")
             self._probation = False
             self._recheck = False      # start() checks the voice anyway
+            self._voice_down = False
+            self._probe_want = None
+            self._probe_next = float("-inf")
             self._logged.clear()
             return True
 
     def _recheck_voice(self, budget_s: float):
         """After a cool-down, before the next render: does the server at the
-        address still speak the voice start() checked? None when it does (and
-        the re-check is done), "voice" when it now speaks another voice or
-        hides it (the client is then down for the session: the consent gate
-        never passes a voice it has not checked), else the failure reason of
-        an unreachable / not-ready server (counted like a failed render; the
-        re-check stays pending). Bounded by ``budget_s`` (and the connect cap);
-        never raises."""
+        address still speak a voice the consent gate passed? None when it
+        does (and the re-check is done): the voice start() checked (a
+        restart in it is followed), or the active consented profile's NEW
+        reference (followed -- the owner replaced reference.wav and the
+        server was restarted with it during the rest). "voice" when it
+        speaks anything else or hides it: never used then (down, watched by
+        the consent check -- _adopt). Else the failure reason of an
+        unreachable / not-ready server (counted like a failed render; the
+        re-check stays pending). Bounded by ``budget_s`` (and the connect
+        cap); never raises."""
+        sent = self._clock()
         try:
             code, _h, data = self._request("GET", "/health", None,
                                            min(HEALTH_TIMEOUT_S, budget_s))
@@ -889,18 +1193,11 @@ class CloneVoiceClient:
             obj = {}
         if code != 200 or not obj.get("ok"):
             return f"http {code} on the voice re-check"
-        sha = str(obj.get("ref_sha256") or "")
+        if not self._adopt(obj, sent):
+            return "voice"
         with self._mu:
-            same = bool(sha) and sha == self._server_sha
-            if same:
-                self._recheck = False
-                self._server_pid = obj.get("pid")
-        if same:
-            return None
-        self._down("after a cool-down the server answering at its address "
-                   "speaks a different voice prompt (or does not say which), "
-                   "so it is no longer used")
-        return "voice"
+            self._recheck = False
+        return None
 
     # ── render ───────────────────────────────────────────────────────────
     def render(self, text: str, timeout_s: float, *, needed_by=None,
@@ -921,7 +1218,7 @@ class CloneVoiceClient:
         ``count=False`` marks a background render nobody is waiting for (the
         filler clips): its outcome never touches the miss count, the
         probation or the cool-down."""
-        t = str(text or "").strip()
+        t = _crc.normalise_text(text)
         try:
             needed_by = None if needed_by is None else float(needed_by)
             if needed_by is not None and not needed_by == needed_by:
@@ -937,20 +1234,75 @@ class CloneVoiceClient:
         self._cooldown_tick()
         with self._mu:
             if self._status != "ready":
+                # Never a cached take either: the clone is not speaking now,
+                # and a cached line amid Kokoro ones would change the voice
+                # mid-reply.
                 return Outcome(reason="not-ready", lookahead=lookahead)
             sha = self._server_sha
-        spoken = _normalize_text(t)
+            pid = self._server_pid
+            facts = dict(self._server_info)
+        spoken = _crc.normalise_text(_normalize_text(t))
         if len(spoken) > MAX_CHARS:
             return Outcome(reason="too-long", lookahead=lookahead)
-        key = hashlib.sha256((sha + "\0" + spoken).encode("utf-8")).hexdigest()
-        hit = self._cache_get(key)
-        if hit is not None:
+        key = self._key(sha, facts, spoken)
+        prefix = _crc.voice_prefix(sha)
+        mode = _crc.mode()
+        # A take that would OPEN a reply for a listener: served only while
+        # the clone looks healthy and the server is confirmed up in the same
+        # process, voice and model (_cache_live) -- else this line renders
+        # or misses like any other, so the reply never opens in the clone
+        # only to go on in Kokoro (B6, one voice per reply). A LOOK-AHEAD
+        # line belongs to a reply already speaking in the clone: its cached
+        # take can only keep more of that reply in the one voice, so it is
+        # served while 'ready' without a probe (as the in-memory cache
+        # always was). Background renders (count=False) likewise.
+        opener = bool(count) and not lookahead
+        source = ""
+        take = self.store.mem_get(key) if key else None
+        if take is not None:
+            source = "mem"
+        elif key and mode == "on" and self._serve_ok(sha):
+            take = self._disk_take(key, prefix, facts, len(spoken))
+            if take is not None:
+                source = "disk"
+        if take is not None and opener:
+            if not self._healthy_for_cache():
+                take = None             # rendered (or missed) instead
+            else:
+                live = self._cache_live()
+                if live == "down":
+                    return Outcome(reason="not-ready", lookahead=lookahead)
+                if live in ("recheck", "render"):
+                    take = None         # the render path (re-checks first)
+                elif live != "ok":
+                    self.store._count("refused")
+                    return self._failed(
+                        "error (the server is not answering ready; its "
+                        "cached take is not used)", self._clock(), True,
+                        {"lookahead": lookahead, "cache": "refused"})
+        if take is not None:
             # No request was made, so this says nothing about the server: it
             # must NOT reset the failure streak. Otherwise a hung server never
             # cools down while cached acks come between the answers, and
             # every new line waits out its whole deadline.
-            return Outcome(audio=hit[0].copy(), sr=hit[1], ms=0, cached=True,
-                           lookahead=lookahead)
+            self.store._count("mem_hits" if source == "mem" else "disk_hits")
+            if count:
+                self._remember_line(key, prefix, t)
+            return Outcome(audio=take[0], sr=take[1], ms=0, cached=True,
+                           cache=source, lookahead=lookahead)
+        shadow = None
+        if key and mode == "shadow" and self.store.disk_dir is not None:
+            would = self.store.disk_has(key, prefix)
+            shadow = "would-hit" if would else "would-miss"
+            self.store._count("shadow_would_hit" if would
+                              else "shadow_would_miss")
+            if count:
+                st = self.store.stats()
+                h = st["shadow_would_hit"]
+                n = h + st["shadow_would_miss"]
+                self._log(f"  [clone-cache] shadow {shadow} ({h}/{n} lines "
+                          f"the disk would have served)")
+        self.store._count("misses")
         try:
             n_budget = max(len(spoken), int(budget_chars or 0))
         except Exception:
@@ -979,8 +1331,8 @@ class CloneVoiceClient:
                                                 cancel=cancel)
             if code != 200:
                 raise _HttpStatus(code)
-            audio, sr = decode_wav(data)
-            audio = finish_audio(audio, sr)
+            pcm16, sr = decode_wav_pcm16(data)
+            audio = finish_audio(pcm16.astype(np.float32) / 32768.0, sr)
             if audio is None:
                 raise ValueError("silent render")
         except _Cancelled:
@@ -1009,10 +1361,24 @@ class CloneVoiceClient:
                   else 0.0)
         if count:
             self._succeeded()
-        self._cache_put(key, audio, sr)
         server_ms = headers.get("x-render-ms")
+        t3_ms = _header_float(headers, "x-t3-ms")
+        tokens = _header_float(headers, "x-speech-tokens")
+        engine = str(headers.get("x-t3-engine") or "").strip().lower()
+        audio_ms = 1000.0 * pcm16.size / float(sr)
+        self._note_engine(engine, len(spoken))
+        if key:
+            self.store.mem_put(key, audio, sr, prefix)
+            if mode in ("shadow", "on"):
+                self._persist_take(key, prefix, pcm16, sr, audio_ms,
+                                   len(spoken), facts,
+                                   _identity(pid, sha, facts), now)
+        if count:
+            self._remember_line(key, prefix, t)
         return Outcome(audio=audio, sr=sr, ms=ms, server_ms=server_ms,
-                       late_s=late_s, **info)
+                       late_s=late_s, shadow=shadow, t3_ms=t3_ms,
+                       tokens=(int(tokens) if tokens is not None else None),
+                       engine=engine, audio_ms=round(audio_ms, 1), **info)
 
     def _succeeded(self) -> None:
         with self._mu:
@@ -1060,34 +1426,601 @@ class CloneVoiceClient:
                        **(info or {}))
 
     # ── cache ────────────────────────────────────────────────────────────
-    def _cache_get(self, key: str):
-        with self._mu:
-            v = self._cache.get(key)
-            if v is None:
-                return None
-            self._cache.move_to_end(key)
-            return v
+    @staticmethod
+    def _key(sha: str, facts: dict, spoken: str):
+        """The render cache key for `spoken` in this server's voice and
+        model (core.clone_render_cache.make_key), or None."""
+        return _crc.make_key(sha, facts.get("model"), facts.get("t3_dtype"),
+                             facts.get("sample_rate"), spoken)
 
-    def _cache_put(self, key: str, audio, sr: int) -> None:
+    def _serve_ok(self, sha: str) -> bool:
+        """A take from DISK may be served: the server's voice is still the
+        consented active profile's (re-read at most every PROFILE_TTL_S).
+        Never raises."""
         try:
-            nbytes = int(audio.nbytes)
-            if nbytes > CACHE_MAX_BYTES // 4:
-                return
             with self._mu:
-                old = self._cache.pop(key, None)
-                if old is not None:
-                    self._cache_bytes -= int(old[0].nbytes)
-                self._cache[key] = (audio.copy(), int(sr))
-                self._cache_bytes += nbytes
-                while self._cache_bytes > CACHE_MAX_BYTES and self._cache:
-                    _k, (a, _s) = self._cache.popitem(last=False)
-                    self._cache_bytes -= int(a.nbytes)
+                profile = self._profile
+            want = self.profile_sha(profile)
+            return bool(want) and want == sha
+        except Exception:
+            return False
+
+    def _disk_take(self, key: str, prefix: str, facts: dict, n_chars: int):
+        """(finished float32 take, sr) from the disk tier, kept in memory
+        too, or None. The take's length is checked against its text again
+        (the fixed band of the take gate): a file that does not fit -- kept
+        under an older rule, or damaged -- is deleted, never served. Never
+        raises."""
+        try:
+            sr = int(facts.get("sample_rate") or 0)
+            if sr <= 0:
+                return None
+            raw = self.store.disk_get(key, prefix, sr)
+            if raw is None:
+                return None
+            r = _crc.take_ratio(1000.0 * raw.size / float(sr), n_chars)
+            lo, hi = _crc.GATE_DEFAULT_BAND
+            if r is None or not lo <= r <= hi:
+                self.store.forget([key], count=False)
+                self.store._count("rejected_on_read")
+                return None
+            audio = finish_audio(raw.astype(np.float32) / 32768.0, sr)
+            if audio is None:
+                return None
+            self.store.mem_put(key, audio, sr, prefix)
+            return audio, sr
+        except Exception:
+            return None
+
+    def _persist_take(self, key: str, prefix: str, pcm16, sr: int,
+                      audio_ms: float, n_chars: int, facts: dict,
+                      ident: tuple, got_at: float) -> None:
+        """Queue a fresh take for the disk. Only a take at the sample rate
+        the server reports (the key carries it) is queued; on the writer it
+        is kept only if the server it came from is still the one the key
+        names (_verify_take) and it passes the take gate. Never raises."""
+        try:
+            if self.store.disk_dir is None:
+                return
+            if int(facts.get("sample_rate") or 0) != int(sr):
+                return
+
+            def keep() -> bool:
+                if not self._verify_take(key, ident, got_at):
+                    return False
+                ok, ratio, band = self.store.gate.admit(prefix, audio_ms,
+                                                        n_chars)
+                if not ok:
+                    self.store._count("rejected")
+                    r = "?" if ratio is None else f"{ratio:.2f}"
+                    self._log(f"  [clone-cache] take not kept on disk: its "
+                              f"length is {r}x the usual for {n_chars} "
+                              f"characters (kept range {band[0]:.2f}-"
+                              f"{band[1]:.2f}); it plays this time and is "
+                              f"rendered again next time")
+                return ok
+
+            self.store.disk_put(key, prefix, pcm16, sr=sr, keep=keep)
         except Exception:
             pass
 
-    def cache_len(self) -> int:
+    def _mark_verified(self, sent_at: float, h: dict) -> None:
+        """A /health sent at `sent_at` confirmed the server `h` describes
+        (the newest confirmation is kept)."""
         with self._mu:
-            return len(self._cache)
+            v = self._verified
+            if v is None or sent_at >= v[0]:
+                self._verified = (sent_at, _health_identity(h))
+
+    def _verify_take(self, key: str, ident: tuple, got_at: float) -> bool:
+        """On the writer, before a take is kept on disk: the take came from
+        the server and voice its key names. The /tts reply does not say which
+        process or voice prompt made it, so a /health sent AFTER the take
+        arrived must show the same process (pid), voice prompt hash and
+        model facts -- a pid is never reused within seconds, and a
+        restarted server needs ~13 s to load, so a server that answers
+        /health as that process now made the take. One confirmation covers
+        every take that arrived before it was sent. Also: the voice is still
+        the active consented profile's.
+
+        A different server answering (a restart, another reference, another
+        model): the take is dropped from memory too, and the client follows
+        the server or stops using it (_adopt). No answer: not kept (it is
+        rendered again next time), nothing else changes. Never raises."""
+        try:
+            if not self._serve_ok(ident[1]):
+                return False
+            with self._mu:
+                v = self._verified
+            if v is not None and v[0] >= got_at and v[1] == ident:
+                return True
+            sent = self._clock()
+            code, h = self._health(VERIFY_TIMEOUT_S)
+            if code != 200 or not h.get("ok"):
+                return False
+            if _health_identity(h) == ident:
+                self._mark_verified(sent, h)
+                return True
+            self.store.forget([key], count=False)
+            with self._mu:
+                ready = self._status == "ready"
+                cur = _identity(self._server_pid, self._server_sha,
+                                self._server_info)
+            if ready and cur == ident:
+                self._adopt(h, sent)
+            return False
+        except Exception:
+            return False
+
+    def _healthy_for_cache(self) -> bool:
+        """The clone looks able to voice the REST of a reply: no counted miss
+        since its last success, not on probation, the fast decoder not known
+        to be off. A cached take opens a reply only then (else a reply could
+        open in the clone and miss to Kokoro on its next line)."""
+        with self._mu:
+            return (not self._fails and not self._probation
+                    and self._decode != "eager")
+
+    def _cache_live(self) -> str:
+        """May a cached take open a reply now? 'ok' -- the server answered
+        /health ready in the same process, voice and model (or did within
+        LIVE_MEMO_S); 'recheck' -- the voice re-check after a cool-down is
+        pending (the render path does it); 'down' -- it now speaks another
+        voice (the client stopped using it); 'render' -- it restarted, or now
+        speaks the active profile's new reference (the client follows it;
+        this line is rendered, not served from the old process's cache);
+        'no' -- not answering ready within LIVENESS_TIMEOUT_S (dead,
+        loading, stuck). Never raises."""
+        try:
+            with self._mu:
+                if self._recheck:
+                    return "recheck"
+                ident = _identity(self._server_pid, self._server_sha,
+                                  self._server_info)
+                v = self._verified
+            now = self._clock()
+            if v is not None and v[1] == ident and now - v[0] <= LIVE_MEMO_S:
+                return "ok"
+            code, h = self._health(LIVENESS_TIMEOUT_S)
+            if code != 200 or not h.get("ok"):
+                return "no"
+            if _health_identity(h) == ident:
+                self._mark_verified(now, h)
+                self._note_decode(h.get("t3_decode"), "its /health")
+                # The probe may have just found the slow decoder: then the
+                # rest of the reply would crawl -- render this line too.
+                return "ok" if self._healthy_for_cache() else "render"
+            return "render" if self._adopt(h, now) else "down"
+        except Exception:
+            return "no"
+
+    def _adopt(self, h: dict, sent_at: float) -> bool:
+        """A ready /health from the server at the client's address that may
+        describe a different server than the one recorded: the same voice
+        prompt (a restart, new model facts) -- followed; the active consented
+        profile's NEW reference (read afresh: a stat, and a hash only if the
+        file changed) -- followed, the cache keys follow the hash
+        (_use_server); anything else -- the client stops using it (the
+        consent gate never passes a voice it has not checked), 'down' for
+        speaking another voice: the consent check uses it again once it
+        speaks the active profile's (usable_for). True while the client
+        still uses the server. Never raises."""
+        try:
+            sha = str(h.get("ref_sha256") or "")
+            with self._mu:
+                same = bool(sha) and sha == self._server_sha
+                profile = self._profile
+                old_pid = self._server_pid
+            if not same:
+                if sha and sha == self.profile_sha(profile, fresh=True):
+                    return self._use_server(h, sent_at)
+                self._down("the server answering at its address now "
+                           "speaks a different voice prompt (or does not "
+                           "say which) than the active profile's",
+                           voice=True)
+                return False
+            if h.get("pid") != old_pid:
+                self._log(f"  [clone-voice] the voice server restarted "
+                          f"(pid {old_pid} -> {h.get('pid')}) with the same "
+                          f"voice; following it")
+            with self._mu:
+                self._server_pid = h.get("pid")
+                self._server_info = _server_facts(h)
+                self._health_at = self._clock()
+            self._mark_verified(sent_at, h)
+            self._note_decode(h.get("t3_decode"), "its /health")
+            return True
+        except Exception:
+            return False
+
+    def _remember_line(self, key, prefix: str, text: str) -> None:
+        """A line voiced for a listener: for "forget that line" and for the
+        seeding ledger. Never raises."""
+        try:
+            now = self._clock()
+            with self._mu:
+                again = any(k == key and now - ts < LEDGER_DEDUPE_S
+                            for ts, k, _p, _t in self._recent)
+                if not again:
+                    self._recent.append((now, key, prefix, text))
+            if not again:
+                self.ledger.record(text)
+        except Exception:
+            pass
+
+    def server_gpu_index(self):
+        """The physical (PCI-order, = NVML) index of the GPU the server
+        renders S3Gen on, from /health's 'cuda:N (physical, PCI order)';
+        None when not known."""
+        try:
+            with self._mu:
+                dev = str(self._server_info.get("device") or "")
+            m = re.match(r"^cuda:(\d+)", dev.strip())
+            return int(m.group(1)) if m else None
+        except Exception:
+            return None
+
+    def cache_len(self) -> int:
+        """Takes in the memory tier."""
+        return self.store.mem_len()
+
+    def cache_stats(self) -> dict:
+        try:
+            out = self.store.stats()
+            out["mode"] = _crc.mode()
+            out["ledger_lines"] = len(self.ledger)
+            return out
+        except Exception:
+            return {}
+
+    def voice_prefix(self) -> str:
+        """The cache prefix of the voice the server speaks ('' = none)."""
+        with self._mu:
+            return _crc.voice_prefix(self._server_sha)
+
+    def attach_cache(self, disk_dir: str) -> bool:
+        """Give the render cache its disk tier (and the ledger and seed
+        budget their files) under `disk_dir`. Takes of voices that are not a
+        consented profile's are purged at once. True when usable. Never
+        raises."""
+        try:
+            if not self.store.attach(disk_dir):
+                return False
+            self.ledger = _cseed.LineLedger(
+                os.path.join(disk_dir, _cseed.LEDGER_FILE))
+            self.budget = _cseed.SeedBudget(
+                os.path.join(disk_dir, _cseed.STATE_FILE))
+            self.purge_unconsented()
+            return True
+        except Exception:
+            return False
+
+    def start_keeper(self, **kw) -> bool:
+        """Start the cache keeper daemon once (core.clone_seed.CacheKeeper,
+        keyword arguments as its own). True when this call started it."""
+        try:
+            with self._mu:
+                if self.keeper is not None:
+                    return False
+                self.keeper = _cseed.CacheKeeper(self, **kw)
+                keeper = self.keeper
+            return keeper.start()
+        except Exception:
+            return False
+
+    def is_cached(self, text) -> bool:
+        """VOICE_CLONE_CACHE 'on', the clone ready and healthy enough for a
+        cached take to open a reply (_healthy_for_cache, no voice re-check
+        pending), and `text` would be served from the cache right now
+        (memory, or disk while the voice is the consented one). For the
+        chunk planner: no I/O at all (render() still checks the server is
+        up before a cached take opens the reply). Never raises."""
+        try:
+            if _crc.mode() != "on":
+                return False
+            t = _crc.normalise_text(text)
+            if not t:
+                return False
+            self._cooldown_tick()
+            if not self._healthy_for_cache():
+                return False
+            with self._mu:
+                if self._status != "ready" or self._recheck:
+                    return False
+                sha = self._server_sha
+                facts = dict(self._server_info)
+            spoken = _crc.normalise_text(_normalize_text(t))
+            key = self._key(sha, facts, spoken)
+            if not key:
+                return False
+            if self.store.mem_has(key):
+                return True
+            if int(facts.get("sample_rate") or 0) <= 0:
+                return False
+            return (self.store.disk_has(key, _crc.voice_prefix(sha))
+                    and self._serve_ok(sha))
+        except Exception:
+            return False
+
+    def consented_prefixes(self):
+        """The cache prefixes of every consented profile's reference.wav --
+        an EMPTY set when the profiles folder is gone (deleting it is the
+        most complete way to withdraw consent: everything is purged) -- or
+        None when that cannot be told (the folder is there but cannot be
+        read): nothing is purged on a None. Memoised for PROFILE_TTL_S.
+        Never raises."""
+        try:
+            now = self._clock()
+            with self._mu:
+                until, memo = self._consented_memo
+            if now < until:
+                return memo
+            from core import voice_clone as _vc
+            out = set()
+            if os.path.isdir(_vc.PROFILES_DIR):
+                # list_profiles() reads an unlistable folder as empty; that
+                # must not purge everything: the listing error -> None.
+                os.listdir(_vc.PROFILES_DIR)
+                for meta in _vc.list_profiles():
+                    if not _vc.profile_is_usable(meta):
+                        continue
+                    p = _crc.voice_prefix(
+                        self._file_sha(str(meta.get("reference_wav") or "")))
+                    if p:
+                        out.add(p)
+            with self._mu:
+                self._consented_memo = (now + PROFILE_TTL_S, out)
+            return out
+        except Exception:
+            return None
+
+    def purge_unconsented(self) -> int:
+        """Drop every cached take whose voice is not a consented profile's
+        reference any more (consent revoked, reference replaced, profile
+        removed), in memory and on disk. One log line when anything went.
+        Runs whatever VOICE_CLONE_CACHE says: those files are the cloned
+        voice. Never raises."""
+        try:
+            held = self.store.prefixes()
+            if not held:
+                return 0
+            keep = self.consented_prefixes()
+            if keep is None or held <= keep:
+                return 0
+            n = self.store.purge_except(keep)
+            # Consent changed: re-read the active profile at the next
+            # _serve_ok (a write still queued is checked against it).
+            with self._mu:
+                self._profile_memo.clear()
+            if n:
+                self._log(f"  [clone-cache] removed {n} cached take"
+                          f"{'s' if n != 1 else ''} of a voice that is no "
+                          f"longer a consented profile's (consent withdrawn "
+                          f"or its reference replaced)")
+            return n
+        except Exception:
+            return 0
+
+    def forget_last_reply(self, before=None) -> list:
+        """'Forget that line': drop the takes of the last burst of lines
+        voiced for a listener (lines no more than FORGET_GAP_S apart, the
+        burst ended within FORGET_WINDOW_S) from memory and disk, and never
+        seed them again. ``before`` (this client's clock: when the owner's
+        request was accepted) leaves out every line voiced at or after it --
+        the acknowledgement of the request itself ("Certainly, sir.") can be
+        voiced before the action runs, and is not "that line". Returns the
+        texts, in the order they were said ([] when there was nothing
+        recent). The next time one is said it is rendered afresh. A write
+        of one still queued never lands. Never raises."""
+        try:
+            now = self._clock()
+            try:
+                cut = None if before is None else float(before)
+                if cut is not None and not cut > 0.0:
+                    cut = None
+            except Exception:
+                cut = None
+            with self._mu:
+                items = [it for it in self._recent
+                         if cut is None or it[0] < cut]
+            if not items or now - items[-1][0] > FORGET_WINDOW_S:
+                return []
+            group = [items[-1]]
+            for it in reversed(items[:-1]):
+                if group[-1][0] - it[0] <= FORGET_GAP_S:
+                    group.append(it)
+                else:
+                    break
+            group.reverse()
+            self.store.forget({it[1] for it in group if it[1]})
+            texts = []
+            for it in group:
+                self.ledger.forget(it[3])
+                if it[3] not in texts:
+                    texts.append(it[3])
+            drop = {id(it) for it in group}
+            with self._mu:
+                kept = [it for it in self._recent if id(it) not in drop]
+                self._recent.clear()
+                self._recent.extend(kept)
+            self._log(f"  [clone-cache] forgot {len(texts)} line"
+                      f"{'s' if len(texts) != 1 else ''} of the last reply; "
+                      f"they are rendered afresh next time")
+            return texts
+        except Exception:
+            return []
+
+    # ── health: the fast decoder (C3) and a server that changed ───────────
+    def _note_decode(self, value, source: str) -> None:
+        """Track the server's decoder ('cuda-graph' / 'eager'); ONE log line
+        when it falls back to the slow loop, one when it is back. Never
+        raises."""
+        try:
+            v = {"cuda-graph": "cuda-graph", "graph": "cuda-graph",
+                 "eager": "eager"}.get(str(value or "").strip().lower())
+            if not v:
+                return
+            with self._mu:
+                prev = self._decode
+                self._decode = v
+            if prev == v:
+                return
+            if v == "eager":
+                self._log(f"  [clone-voice] fast decode is OFF on the voice "
+                          f"server ({source} says the slow decoder): new "
+                          f"lines render several times slower until it "
+                          f"re-captures its CUDA graphs by itself; nothing "
+                          f"is restarted")
+            elif prev == "eager":
+                self._log("  [clone-voice] fast decode is back on the voice "
+                          "server (cuda-graph)")
+        except Exception:
+            pass
+
+    def _note_engine(self, engine: str, n_chars: int) -> None:
+        """A rendered line's X-T3-Engine. 'eager' on a line short enough for
+        the graphs means the fast decoder is off (C3)."""
+        if engine == "graph":
+            self._note_decode("cuda-graph", "a rendered line")
+        elif engine == "eager" and int(n_chars) <= GRAPH_MAX_CHARS:
+            self._note_decode("eager", "a rendered line")
+
+    def decode_state(self) -> str:
+        """'cuda-graph' / 'eager' / '' (not known yet)."""
+        with self._mu:
+            return self._decode
+
+    def decode_note(self) -> str:
+        """A clause for voice_clone_status while the fast decoder is off,
+        else ''."""
+        if self.decode_state() == "eager":
+            return ("the voice server's fast decoder is off just now, so new "
+                    "lines come a little slower than usual")
+        return ""
+
+    def refresh_health(self, max_age_s: float = 0.0) -> bool:
+        """Read /health again (if the last read is older than `max_age_s`)
+        while the client is ready: the decoder (C3) and the server's voice.
+        A server that now speaks the active consented profile's (new)
+        reference is followed -- the cache keys follow the hash; one that
+        speaks anything else is no longer used (down). True when the server
+        answered ready. Bounded (HEALTH_TIMEOUT_S); never raises."""
+        try:
+            self._cooldown_tick()
+            with self._mu:
+                if self._status != "ready":
+                    return False
+                if self._clock() - self._health_at < float(max_age_s):
+                    return True
+            sent = self._clock()
+            code, h = self._health()
+            with self._mu:
+                self._health_at = self._clock()
+            if code != 200 or not h.get("ok"):
+                return False
+            return self._adopt(h, sent)
+        except Exception:
+            return False
+
+    def seed_ready(self, max_health_age_s: float = 60.0):
+        """None when a seed render may be sent now, else why not: the
+        clone ready and not missing lines, its voice the consented one, the
+        fast decoder on (a seed on the slow loop costs ~5x the GPU), a disk
+        tier to keep it in. Never raises."""
+        try:
+            st = self.status()[0]
+            if st != "ready":
+                return f"clone {st}"
+            with self._mu:
+                if self._fails or self._probation or self._recheck:
+                    return "clone missing lines"
+            if self.store.disk_dir is None:
+                return "no disk cache"
+            if not self.refresh_health(max_health_age_s):
+                return "server not answering ready"
+            with self._mu:
+                decode = self._decode
+                sha = self._server_sha
+            if decode != "cuda-graph":
+                return "fast decode off"
+            if not self._serve_ok(sha):
+                return "voice not the consented profile's"
+            return None
+        except Exception as e:
+            return f"error ({type(e).__name__})"
+
+
+def _server_facts(h: dict) -> dict:
+    """The model facts from a /health body that the cache key carries, plus
+    its decoder. Missing ones are ''/0."""
+    try:
+        sr = int(h.get("sample_rate") or 0)
+    except Exception:
+        sr = 0
+    return {"model": str(h.get("model") or ""),
+            "t3_dtype": str(h.get("t3_dtype") or ""),
+            "sample_rate": sr,
+            "t3_decode": str(h.get("t3_decode") or ""),
+            "device": str(h.get("s3gen_device") or h.get("device") or "")}
+
+
+def _identity(pid, sha, facts: dict) -> tuple:
+    """Which server made / would make a take: its process, voice prompt hash
+    and the model facts the cache key carries."""
+    try:
+        sr = int(facts.get("sample_rate") or 0)
+    except Exception:
+        sr = 0
+    return (pid, str(sha or ""), str(facts.get("model") or ""),
+            str(facts.get("t3_dtype") or ""), sr)
+
+
+def _health_identity(h: dict) -> tuple:
+    """_identity of the server a /health body describes."""
+    return _identity(h.get("pid"), h.get("ref_sha256"), _server_facts(h))
+
+
+def _fast_connect(host: str, port: int, timeout_s: float):
+    """A connected TCP socket to ``host:port``, or ConnectionError. Each
+    address is tried for at most ``timeout_s`` (as socket.create_connection
+    does) with a NON-BLOCKING connect and select(): CPython's own timed
+    connect costs ~20 ms on about a quarter of loopback connects on Windows
+    (measured 2026-10-05, 300 connects 10 ms apart: p90 20.3 ms, p99 25 ms;
+    this way p90 0.5 ms, p99 0.7-1.0 ms). The socket is returned blocking;
+    the caller sets its timeout."""
+    last = None
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as e:
+        raise ConnectionError(f"cannot resolve {host} ({e})") from None
+    for fam, typ, proto, _cn, addr in infos:
+        sock = None
+        try:
+            sock = socket.socket(fam, typ, proto)
+            sock.setblocking(False)
+            try:
+                sock.connect(addr)
+            except (BlockingIOError, InterruptedError):
+                pass
+            _r, w, x = select.select([], [sock], [sock],
+                                     max(0.0, float(timeout_s)))
+            if not w and not x:
+                raise TimeoutError("connect timed out")
+            # Windows reports a failed connect in the exception set.
+            err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if err or x:
+                raise OSError(err, os.strerror(err) if err else "refused")
+            sock.setblocking(True)
+            return sock
+        except OSError as e:
+            last = e
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    raise ConnectionError(f"cannot connect to {host}:{port} "
+                          f"({type(last).__name__ if last else 'no address'})")
 
 
 class _HttpStatus(Exception):

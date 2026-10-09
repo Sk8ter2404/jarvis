@@ -372,7 +372,10 @@ class SlowAndFailingTests(_Base):
         self.quiet(self.bc.synthesise, SHORT)
         audio, _ = self.quiet(self.bc.synthesise, SHORT)
         self.assertTrue(self.is_clone(audio))
-        self.assertIn("[tts] clone voice 0 ms (first line, cached)", self.out)
+        # The wall time of a cached line is the server check (0-2 ms; more
+        # at Idle priority on a busy box): the tag says "cached", not "0".
+        self.assertRegex(self.out,
+                         r"\[tts\] clone voice \d+ ms \(first line, cached\)")
         self.assertEqual(self.srv.tts_texts(), [SHORT])
 
     def test_too_long_line_goes_to_kokoro_without_a_failure(self):
@@ -448,6 +451,61 @@ class DownAtBootTests(_Base):
         self.assertFalse(bc._clone_server_active())
         self.assertFalse(bc._clone_server_kick())
         start.assert_not_called()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  A replaced reference.wav while JARVIS runs (2026-10-09)
+# ════════════════════════════════════════════════════════════════════════════
+class ReferenceSwapTests(_Base):
+    """10-04, owner-visible: reference.wav swapped to a new take and the
+    server restarted with it -> JARVIS kept speaking Kokoro until a full
+    restart. Now the next consent check follows it; in between, and for a
+    server in any other voice, Kokoro speaks and nothing goes to the
+    server."""
+
+    def setUp(self):
+        super().setUp()
+        self.clone_setup()
+        # The consent memo and the probe's rate limit, as if their time had
+        # passed between the turns below.
+        self._p(self.cvc, "PROFILE_TTL_S", 0.0)
+        self._p(self.cvc, "VOICE_PROBE_S", 0.0, create=True)
+
+    def swap_reference(self) -> str:
+        import hashlib
+        wav = b"RIFF the owner's chosen take"
+        with open(self.prof.ref, "wb") as f:
+            f.write(wav)
+        return hashlib.sha256(wav).hexdigest()
+
+    def test_the_next_reply_after_the_swap_uses_the_new_voice(self):
+        bc = self.bc
+        audio, _ = self.quiet(bc.synthesise, SHORT)
+        self.assertTrue(self.is_clone(audio))
+        new = self.swap_reference()            # the file first ...
+        audio, _ = self.quiet(bc.synthesise, SHORT)
+        self.assertTrue(self.is_kokoro(audio))  # old voice: refused
+        self.assertEqual(self.srv.tts_texts(), [SHORT])
+        self.srv.ref_sha, self.srv.pid = new, 5151   # ... then the server
+        audio, _ = self.quiet(bc.synthesise, SHORT)
+        self.assertTrue(self.is_clone(audio))
+        # Rendered in the new voice, not the old voice's cached take.
+        self.assertEqual(self.srv.tts_texts(), [SHORT, SHORT])
+        self.assertEqual(self.client.voice_prefix(), new[:16])
+        self.assertEqual(bc._tts_engine_kind(), "clone")
+
+    def test_a_server_in_another_voice_stays_refused(self):
+        bc = self.bc
+        self.srv.ref_sha, self.srv.pid = "c" * 64, 5151
+        self.assertFalse(self.client.refresh_health())
+        for _ in range(3):
+            audio, _ = self.quiet(bc.synthesise, SHORT)
+            self.assertTrue(self.is_kokoro(audio))
+        self.swap_reference()                  # a take, but not that voice
+        audio, _ = self.quiet(bc.synthesise, SHORT)
+        self.assertTrue(self.is_kokoro(audio))
+        self.assertEqual(self.srv.tts_texts(), [])
+        self.assertEqual(bc._tts_engine_kind(), "kokoro")
 
 
 # ════════════════════════════════════════════════════════════════════════════

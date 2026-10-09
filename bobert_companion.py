@@ -25138,6 +25138,134 @@ def _clone_server_on_ready() -> None:
         pass
 
 
+# ── The clone voice's persistent render cache and its keeper (2026-10-05) ──
+# core/clone_render_cache.py (VOICE_CLONE_CACHE: the takes, on disk under
+# data/clone_cache/) and core/clone_seed.py (the line ledger, the purge on a
+# withdrawn consent, the fast-decode check and the quiet-time seeding). Set
+# up once, by main() at boot (so never in the test harness, which imports the
+# monolith and drives the kick directly), and never in a staging instance
+# (the server's own gate). The clone selected later at runtime keeps the
+# in-memory cache until the next start.
+_clone_cache_setup_done = [False]
+
+
+def _clone_cache_setup() -> None:
+    """Attach the disk tier and start the keeper daemon, once: when the
+    clone voice server is selected, or when a cache folder from an earlier
+    run exists (its takes must still be purged if consent is withdrawn).
+    One log line. Never raises."""
+    if _clone_cache_setup_done[0]:
+        return
+    _clone_cache_setup_done[0] = True
+    try:
+        if not _clone_server_may_start():
+            return
+        from core import clone_render_cache as _crc
+        from core.paths import data_dir as _data_dir
+        folder = os.path.join(_data_dir(), _crc.SUBDIR)
+        if not _clone_server_selected() and not os.path.isdir(folder):
+            return
+        ok = _cvc.CLIENT.attach_cache(folder)
+        st = _cvc.CLIENT.cache_stats()
+        if ok:
+            mib = 1024.0 * 1024.0
+            print(f"  [clone-cache] mode {_crc.mode()}: "
+                  f"{st.get('disk_entries', 0)} takes on disk "
+                  f"({st.get('disk_bytes', 0) / mib:.1f} of "
+                  f"{_crc.disk_cap_bytes() / mib:.0f} MB), "
+                  f"{st.get('ledger_lines', 0)} lines in the ledger")
+        else:
+            print("  [clone-cache] the disk folder is not usable; clone "
+                  "lines are cached in memory for this run only")
+        _cvc.CLIENT.start_keeper(
+            gate_fn=_clone_seed_gate, abort_fn=_clone_seed_abort,
+            history_fn=_clone_seed_history, clean=_clone_seed_clean,
+            plan=_sentence_tts.plan_clone_chunks, log=print)
+    except Exception as e:
+        print(f"  [clone-cache] not set up ({type(e).__name__}: {e}); clone "
+              f"lines are cached in memory for this run only")
+
+
+def _clone_seed_gate() -> str | None:
+    """None when a seed render may go to the voice server now -- the owner
+    has been quiet (no turn, reply, capture) for core.clone_seed.QUIET_S,
+    nothing is speaking or about to, the clone is the speaking voice, no
+    game -- else a short reason. Read by the cache keeper's daemon. Never
+    raises (an error is a reason)."""
+    try:
+        if _turn_in_progress[0] or _utterance_in_progress[0]:
+            return "mid-turn"
+        if _SPEAK_LOCK.locked() or _tts_playback_active[0] \
+                or _filler_on_device[0]:
+            return "speaking"
+        if _main_loop_started_at[0] <= 0.0:
+            return "booting"
+        from core import clone_seed as _cseed
+        now = time.monotonic()
+        last = max(_last_convo_activity[0], _last_owner_turn_at[0],
+                   _last_owner_voice_at[0], _main_loop_started_at[0])
+        if now - last < _cseed.QUIET_S:
+            return "owner active"
+        if time.time() - float(globals().get("last_speech_time", 0.0)) \
+                < _cseed.QUIET_S / 6.0:
+            return "just spoke"
+        if getattr(getattr(sys.modules.get("skill_game_mode"), "_st", None),
+                   "active", False):
+            return "game"
+        if _tts_engine_kind() != "clone":
+            return "clone not speaking"
+        return None
+    except Exception as e:
+        return f"error ({type(e).__name__})"
+
+
+def _clone_seed_abort() -> bool:
+    """True the moment a seed render must stop waiting: the owner started
+    talking (a capture tripped), a turn began, or a line wants the
+    speakers. Polled every 50 ms by the client while it waits. Never
+    raises (an error aborts)."""
+    try:
+        return bool(_utterance_in_progress[0] or _turn_in_progress[0]
+                    or _SPEAK_LOCK.locked() or _tts_playback_active[0])
+    except Exception:
+        return True
+
+
+def _clone_seed_history() -> list:
+    """What JARVIS has said before, for the ledger's one-time bootstrap:
+    the "JARVIS:" lines of the session logs and the assistant replies in
+    the episode store (one list per source). Never raises."""
+    out = []
+    try:
+        import glob as _glob
+        from core import clone_seed as _cseed
+        out.append(_cseed.log_replies(sorted(_glob.glob(
+            os.path.join(LOGS_DIR, "session_*.log")))))
+        from core.paths import data_dir as _data_dir
+        out.append(_cseed.episode_replies(os.path.join(
+            _data_dir(), "long_term_memory", "episodes.jsonl")))
+    except Exception:
+        pass
+    return out
+
+
+def _clone_seed_clean(text: str) -> str:
+    """A logged reply as _speak would voice it: action tags, the leading
+    [intent:] / [mood:] / [wry] tags and markdown removed. Never raises."""
+    try:
+        t = _ACTION_RE.sub(" ", str(text or ""))
+        _i, t = _parse_intent_tag(t)
+        _m, t = _parse_mood_tag(t)
+        if _tts_layer is not None:
+            wry, t = _tts_layer.parse_wry_tag(t)
+            if wry:
+                _i, t = _parse_intent_tag(t)
+                _m, t = _parse_mood_tag(t)
+        return _strip_markdown_for_speech(t)
+    except Exception:
+        return ""
+
+
 def _clone_server_kick() -> bool:
     """Start (or re-check) the server on a daemon, once, while the client is
     idle: at boot, or the first time the clone is selected at runtime. True
@@ -25219,13 +25347,35 @@ def _clone_line_tag(out) -> str:
     try:
         kind = "look-ahead" if out.lookahead else "first line"
         if out.cached:
-            return f"{kind}, cached"
+            return (f"{kind}, cached, disk"
+                    if getattr(out, "cache", "") == "disk"
+                    else f"{kind}, cached")
+        if getattr(out, "cache", "") == "refused":
+            return f"{kind}, cached take refused"
         tag = f"{kind}, deadline {float(out.deadline_s):.1f} s"
         if out.ok and float(getattr(out, "late_s", 0.0) or 0.0) >= 0.1:
             tag += f", {float(out.late_s):.1f} s late"
         if not out.ok and not out.counted:
             tag += ", not counted"
         return tag
+    except Exception:
+        return "?"
+
+
+def _clone_cache_tag(out) -> str:
+    """The [turn-timing] clone_cache value for one clone attempt: 'mem' /
+    'disk' (served from the render cache), 'refused' (cached, but the server
+    was not answering ready, so the line went to Kokoro), 'shadow-hit'
+    (VOICE_CLONE_CACHE 'shadow': rendered, but the disk would have served
+    it) or 'miss'. Never raises."""
+    try:
+        if out.cached:
+            return str(getattr(out, "cache", "") or "mem")
+        if getattr(out, "cache", "") == "refused":
+            return "refused"
+        if getattr(out, "shadow", None) == "would-hit":
+            return "shadow-hit"
+        return "miss"
     except Exception:
         return "?"
 
@@ -25302,6 +25452,15 @@ def _clone_server_synth(text: str, wry_split, gain: float):
         if out.attempted:
             _tt_note_stat("clone", 1 if audio is not None else 0)
             _tt_note_stat("clone_ms", ms)
+            # C8 (2026-10-05): where the answer's first clone line came
+            # from, and its T3 decode speed -- THAT line's, so it is noted
+            # (None, printed '-') for a cached or missed first line too: the
+            # first value wins, and a later line's speed must never stand
+            # in for the first one's.
+            _tt_note_stat("clone_cache", _clone_cache_tag(out))
+            _tt_note_stat("t3_ms_tok",
+                          out.t3_ms_per_token
+                          if out.ok and not out.cached else None)
         if audio is None:
             if out.reason == "too-long":
                 print("  [tts] clone voice skipped (line too long for the "
@@ -35820,6 +35979,9 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "list_voice_profiles", "set_voice_profile", "voice_clone_status",
     "disable_voice_clone", "use_voice_profile", "switch_voice_profile",
     "stop_voice_clone", "voice_clone_off",
+    # "Forget that line" (2026-10-05): drops the clone render cache's takes
+    # of the reply just heard; one finished sentence either way.
+    "forget_voice_line",
     # AIR CONTROL — movie-style Kinect hand-mouse (skills/air_control.py,
     # 2026-07). Each returns ONE finished sentence ("Air control on, sir —
     # reach a hand out…" / "…already off, sir." / the status line) and never
@@ -39768,9 +39930,13 @@ def _speech_chunks(spoken_text: str, kind: str) -> list:
     clone voice server active (kind 'clone'): plan_clone_chunks -- a first
     line longer than CLAUSE_SPLIT_MIN_CHARS is voiced in pieces (sentence by
     sentence, then a clause head and the rest) so its first audio comes
-    sooner."""
+    sooner -- unless the clone's render cache already holds the reply's
+    opening (VOICE_CLONE_CACHE 'on', _cvc.CLIENT.is_cached: an in-memory
+    check, no file I/O): then the plan starts with that cached sentence,
+    whole (core.sentence_tts._cache_aware_plan)."""
     if kind == "clone":
-        return _sentence_tts.plan_clone_chunks(spoken_text)
+        return _sentence_tts.plan_clone_chunks(
+            spoken_text, is_cached=_cvc.CLIENT.is_cached)
     return _sentence_tts.plan_chunks(spoken_text)
 
 
@@ -46244,6 +46410,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # of boot. Kokoro speaks until it is ready; if it never comes up, one
     # "[clone-voice]" line says why. A no-op when the clone is not selected.
     _clone_server_kick()
+    # Its render cache on disk and the keeper daemon (purge on a withdrawn
+    # consent, the fast-decode check, quiet-time seeding): one log line.
+    _clone_cache_setup()
 
     _ensure_whisper()   # load now so first user utterance isn't delayed
     # Speed plan R1 (2026-10-01): the optional model warm-ups registered via
