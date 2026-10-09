@@ -21619,6 +21619,7 @@ def _local_cheatsheet() -> str:
         "  [ACTION: media_playpause]  [ACTION: media_next]  [ACTION: media_prev]   raw media-key TOGGLES: only when sir asks for the key itself — never a retry after the four above\n"
         "  [ACTION: volume_up]  [ACTION: volume_down]  [ACTION: volume_mute]  [ACTION: volume_unmute]\n"
         "  [ACTION: set_volume, 30]   <- absolute: 'set the volume to 30 percent'\n"
+        "  [ACTION: audio_check, <his words>]   READS volume/mute/output device/app mixer: 'why can't I hear X', 'is it muted'. Never state a volume you didn't read.\n"
         "  [ACTION: netflix, <title>]  [ACTION: spotify, <query>]\n"
         "  [ACTION: youtube_play, <video>]  <- 'play X on youtube': opens, FINDS\n"
         "      the first real video and CLICKS it (auto-fullscreen). Prefer this\n"
@@ -23546,6 +23547,16 @@ class _SentenceFlushBuffer:
             # its token still flushes.
             if _claim_validator.find_completed_claim(
                     piece, ran_actions=_turn_actions_ran(),
+                    user_text=_turn_user_text()):
+                self._stopped = True
+                return True
+            # A volume / battery / temperature number nothing has read yet
+            # (live 2026-10-09: "I'm afraid the volume is currently set to
+            # 20%, sir." flushed ahead of [ACTION: system_pulse], which
+            # never reads the volume). parse_and_run_actions drops it from
+            # the reply unless a result this turn carried it.
+            if _claim_validator.find_ungrounded_reading(
+                    piece, grounding=_turn_grounding_texts(),
                     user_text=_turn_user_text()):
                 self._stopped = True
                 return True
@@ -33811,6 +33822,25 @@ def _act_where_learned(_: str = "") -> str:
     return f"\"{text}\": {how}, sir.{tail}"
 
 
+def _act_audio_check(arg: str = "") -> str:
+    """READ the sound state - master volume, mute, output device and each
+    app's own mixer level - and say only what was read (core/audio_check.py,
+    2026-10-09: "why can't I hear my YouTube video?" was answered with an
+    invented "the volume is currently set to 20%"). Changes nothing. ``arg``
+    is the owner's words, so the app he named is reported first. Never
+    raises."""
+    from core import audio_check as _ac
+    try:
+        state = _ac.read_state()
+        try:
+            state.ducked = bool(getattr(_audio_ducker, "_saved", None))
+        except Exception:
+            pass
+        return _ac.describe(state, str(arg or ""))
+    except Exception:
+        return "I couldn't read the audio settings just now, sir."
+
+
 # Whitelist of actions Bobert is allowed to perform
 ACTIONS = {
     "open_url":        _act_open_url,
@@ -33956,6 +33986,9 @@ ACTIONS = {
     # Absolute volume ("set the volume to 30 percent") — up/down alone made
     # the local model nudge volume_down for set-to-value requests. 2026-07-10.
     "set_volume":      _act_set_volume,
+    # READ the sound state (volume, mute, output device, per-app mixer) -
+    # "why can't I hear X" / "is it muted". Read-only. 2026-10-09.
+    "audio_check":     _act_audio_check,
     # Replay the most recent non-destructive action ('do that again', etc.)
     "replay_last_action": _act_replay_last_action,
     # Changelog + version info ('what's new', 'show changelog', 'what version are you on')
@@ -38311,6 +38344,12 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # Single-sentence health/status aggregator (skills/system_pulse.py) and its
     # natural-phrasing aliases. Each returns one finished status sentence.
     "system_pulse", "check_system", "status_report",
+    # The audio READING (core/audio_check.py, 2026-10-09): one finished
+    # answer built only from what was read. Spoken as written - an LLM
+    # restatement could put back the very invented number it replaces - and
+    # spoken when the brain asks for it ("check the audio", or the
+    # _ungrounded_reading retry), not only on the shortcut.
+    "audio_check",
     # Status / info READ-OUTS — each returns a finished, user-facing sentence the
     # user explicitly asked for. Without this they were logged but NEVER VOICED
     # (only the generic "Of course, sir" preamble was spoken) — owner caught this
@@ -38917,6 +38956,13 @@ def _note_turn_action_ran(name: str, result, arg: str = "") -> None:
             looked = frame.setdefault("looked_for", [])
             looked.append(str(arg)[:300])
             del looked[:-6]
+        # What every action said, failed or not (2026-10-09): a volume /
+        # battery / temperature number in the reply is grounded only by a
+        # result that carried it (core.claim_validator.
+        # find_ungrounded_reading; _turn_grounding_texts).
+        said = frame.setdefault("readings", [])
+        said.append(str(result or "")[:2000])
+        del said[:-12]
         low = str(result).lower()
         if any(m.lower() in low for m in FAILURE_MARKERS):
             return
@@ -39002,6 +39048,22 @@ def _turn_actions_ran() -> frozenset:
 def _turn_user_text() -> str:
     frame = getattr(_turn_grounding, "frame", None)
     return frame["user_text"] if frame else ""
+
+
+def _turn_grounding_texts() -> list:
+    """Everything this owner turn READ: every action result (failed ones
+    too), oldest first ([] outside a turn). What a volume / battery /
+    temperature number in a reply must come from (2026-10-09). Prompt
+    context lines are deliberately NOT included: nothing proved a sensor
+    line in the prompt is fresh, and a reading the owner wants comes from an
+    action (audio_check / system_pulse). Never raises."""
+    frame = getattr(_turn_grounding, "frame", None)
+    try:
+        if not frame:
+            return []
+        return list(frame.get("readings") or [])
+    except Exception:
+        return []
 
 
 def _strip_ack_preface(spoken: str, user_text: str) -> str:
@@ -41366,6 +41428,42 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                   "open ...' - the open was dropped")
             results.append(("_dropped_step", _open_step, True))
 
+    # Invented readings (live 2026-10-09 17:53): "why can't I hear my
+    # YouTube video?" -> "I'm afraid the volume is currently set to 20%,
+    # sir. [ACTION: system_pulse]". system_pulse never reads the volume; the
+    # number was made up and spoken. A sentence stating a volume /
+    # brightness / battery / temperature number is dropped unless an action
+    # result or context this turn (or the owner's own words) carried it -
+    # core.claim_validator.find_ungrounded_reading has the rules - and a
+    # synthetic result tells the follow-up round to read it for real
+    # (audio_check for the sound) or say it can't tell. A real reading
+    # quoted back is grounded and kept. Runs last, after the claim checks
+    # above, so its synthetic result never changes what they decide. Only
+    # inside an owner turn (_run_llm_dispatch's ledger is open): a proactive
+    # remark has no follow-up round, and its prompt may carry a sensor line
+    # this ledger never saw.
+    _kept, _invented = cleaned, []
+    if getattr(_turn_grounding, "frame", None) is not None:
+        try:
+            _grounding = _turn_grounding_texts() + [
+                str(_r) for (_n, _r, _i) in results
+                if not str(_n).startswith("_")]
+            _kept, _invented = _claim_validator.drop_ungrounded_readings(
+                cleaned, grounding=_grounding, user_text=_turn_user_text())
+        except Exception as _rd_err:
+            print(f"  [validation] reading check failed: {_rd_err}")
+            _kept, _invented = cleaned, []
+    if _invented:
+        warn = (
+            f"reply stated '{_invented[0]}' but nothing this turn read that "
+            "value - it was NOT spoken. Only state a volume, brightness, "
+            "battery or temperature number an action result gave you: run "
+            "the action that reads it (audio_check for the sound and "
+            "volume) or say you can't tell from here")
+        print(f"  [validation] {warn}")
+        results.append(("_ungrounded_reading", warn, True))
+        cleaned = _kept
+
     # When mission narration fired, the per-step cues replaced the LLM's
     # prose. Drop the cleaned text so the main loop doesn't immediately
     # re-speak whatever narration the LLM also tried to inline.
@@ -41457,6 +41555,11 @@ def _followup_extra(action_results) -> str:
         "[ACTION: ...] token for that step. Emit the missing token now to "
         "finish the chain — don't stop mid-task and don't re-narrate the "
         "promise without backing it with a real action token.\n"
+        "- If a result is from [_ungrounded_reading], your previous reply "
+        "stated a volume, brightness, battery or temperature number that "
+        "nothing had read; the owner did not hear it. Emit the action that "
+        "reads it ([ACTION: audio_check] for sound or volume) or say plainly "
+        "you can't tell from here - never repeat or guess the number.\n"
         + ("- If click or find says not found or lists candidates, ask sir "
            "which one, naming them; never search, open or play something "
            "else instead.\n" if _screen_target_stuck(action_results) else
@@ -46432,6 +46535,8 @@ def _run_voice_shortcuts(text: str) -> bool:
         return True
     if _run_timer_list_shortcut(text):
         return True
+    if _run_audio_check_shortcut(text):
+        return True
 
     # "Jarvis, turn it off" with nothing for "it" to mean (2026-10-01): ask,
     # never let the model guess. See _run_pronoun_switch_shortcut.
@@ -46531,7 +46636,8 @@ def _run_pronoun_switch_shortcut(text: str) -> bool:
 
 
 def _run_action_shortcut(text: str, kind: str, recognise, action_names,
-                         ack: str = "", empty_reply: str = "") -> bool:
+                         ack: str = "", empty_reply: str = "",
+                         arg: str = "") -> bool:
     """Answer ``text`` with a registered READ-OUT action and no LLM, when
     ``recognise(text)`` says it is that question (2026-10-01; the shared body
     of _run_self_check_shortcut and _run_timer_list_shortcut).
@@ -46542,7 +46648,8 @@ def _run_action_shortcut(text: str, kind: str, recognise, action_names,
     ``action_names`` that is registered runs; with none registered it
     returns False, so the LLM answers rather than this inventing one. ``ack``
     (optional) is spoken first, for an action that takes seconds. A raising
-    or empty action speaks ``empty_reply``. Never raises."""
+    or empty action speaks ``empty_reply``. ``arg`` is the action's argument
+    ("" unless the action reads the owner's words). Never raises."""
     if not globals().get("FAST_PATHS_ENABLED", True):
         return False
     try:
@@ -46564,7 +46671,7 @@ def _run_action_shortcut(text: str, kind: str, recognise, action_names,
         except Exception:
             pass
     try:
-        result = fn("")
+        result = fn(arg)
         reply = result.strip() if isinstance(result, str) else ""
     except Exception as _e:
         print(f"  [fast-path] {kind} raised: {_e}")
@@ -46641,6 +46748,21 @@ def _run_timer_list_shortcut(text: str) -> bool:
     return _run_action_shortcut(
         text, "timers", _fast_paths.is_timer_list_request, ("list_timers",),
         empty_reply="I could not read the timer list just now, sir.")
+
+
+def _run_audio_check_shortcut(text: str) -> bool:
+    """"why can't I hear my YouTube video" / "is the sound muted" / "there's
+    no audio" -> audio_check's READING (volume, mute, output device, the
+    named app's mixer level), with no LLM (2026-10-09). Live 17:53 that
+    question got "I'm afraid the volume is currently set to 20%, sir." with
+    system_pulse - a number nothing read. Recognition is
+    core.audio_check.is_audio_trouble_question; the owner's words are the
+    argument so the app he named is checked first. Never raises."""
+    from core import audio_check as _ac
+    return _run_action_shortcut(
+        text, "audio-check", _ac.is_audio_trouble_question, ("audio_check",),
+        empty_reply="I couldn't read the audio settings just now, sir.",
+        arg=str(text or ""))
 
 
 # ── Instant actions (2026-10-02) ─────────────────────────────────────────
@@ -48694,7 +48816,8 @@ def _run_llm_dispatch_body(text: str) -> str:
         # and web_search.
         _loop_actions = {"open_url", "web_search", "check_credits",
                          "_unverified_claim", "_dropped_step",
-                         "_preemptive_hallucinated_claim"}
+                         "_preemptive_hallucinated_claim",
+                         "_ungrounded_reading"}
         # check_credits is also terminal — once it returns a balance,
         # there's nothing left to do but report it. Stop after the
         # first follow-up that reports the balance.
