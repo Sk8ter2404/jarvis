@@ -44,6 +44,8 @@ SOURCES = ("focus", "title", "uia", "ocr", "look", "click", "scene", "action")
 _KEEP_QUERY = ("v", "list", "t", "q", "search_query")
 _MAX_TEXT = 4000
 _QUEUE_MAX = 512
+# Queued by Timeline.close(): the writer thread returns when it reaches it.
+_STOP_WRITER = object()
 
 
 def _cfg(name, default):
@@ -211,7 +213,7 @@ class Timeline:
                                             daemon=True)
             self._thread.start()
 
-    def _writer_loop(self) -> None:          # never exits
+    def _writer_loop(self) -> None:          # exits only on close()
         while True:
             try:
                 row = self._q.get()
@@ -219,6 +221,8 @@ class Timeline:
                 time.sleep(0.5)
                 continue
             try:
+                if row is _STOP_WRITER:
+                    return
                 self.add_now(**row)
             except Exception:
                 pass
@@ -227,6 +231,28 @@ class Timeline:
                     self._q.task_done()
                 except Exception:
                     pass
+
+    def close(self, timeout: float = 2.0) -> None:
+        """Stop the writer thread after the rows queued before this call; a
+        later add() starts a new one. For a timeline that is done with:
+        get() closes the one it replaces when the data dir changes (never
+        in a running JARVIS; every test that redirects JARVIS_DATA_DIR -
+        32 writer threads were left waiting in the 2026-10-09 rel-182
+        run). ``timeout`` 0 = signal, do not wait. Never raises."""
+        try:
+            with self._lock:
+                th = self._thread
+                if th is None or not th.is_alive():
+                    return
+                self._thread = None
+            t = max(0.0, float(timeout))
+            if t:
+                self._q.put(_STOP_WRITER, timeout=t)
+                th.join(t)
+            else:
+                self._q.put_nowait(_STOP_WRITER)
+        except Exception:
+            pass
 
     def flush(self, timeout: float = 5.0) -> bool:
         deadline = time.time() + max(0.0, float(timeout))
@@ -418,12 +444,16 @@ def get() -> Timeline:
     JARVIS_DATA_DIR gets a new one)."""
     from core.paths import data_file
     path = data_file("screen_timeline.db")
+    old = None
     with _s_lock:
         tl = _singleton["tl"]
         if tl is None or tl.path != path:
+            old = tl
             tl = Timeline(path)
             _singleton["tl"] = tl
-        return tl
+    if old is not None:
+        old.close(0)          # its queued rows still land, then it stops
+    return tl
 
 
 def add(**row) -> bool:

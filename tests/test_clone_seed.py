@@ -260,6 +260,7 @@ class KeeperTests(unittest.TestCase):
                                       sleep=lambda s: time.sleep(min(s, 0.02)))
         self.assertTrue(self.c.attach_cache(self.dir))
         self.addCleanup(lambda: self.c.store.flush(5.0))
+        self.addCleanup(self.c.store.close)  # its writer thread (runs first)
         self.assertEqual(self.c.start(url=self.srv.url, cmd="",
                                       profile="butler"), "ready")
         self.clock = _Wall(1000.0)

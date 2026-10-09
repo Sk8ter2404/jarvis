@@ -276,8 +276,29 @@ class StoreTests(unittest.TestCase):
         with open(os.path.join(self.dir, "notes.txt"), "w") as f:
             f.write("x")
         s = crc.CloneRenderCache()
+        self.addCleanup(s.close)
         s.attach(self.dir)
         self.assertNotIn("notes.txt", s._index)
+
+    def test_close_stops_the_writer_after_its_queued_writes(self):
+        # rel-182 (2026-10-09): a writer per test client, never stopped,
+        # left 50 threads alive in one suite.
+        s = crc.CloneRenderCache()
+        self.addCleanup(s.close)
+        s.attach(self.dir)
+        self.assertTrue(s.disk_put(self.key, self.pfx, self.pcm()))
+        th = s._writer
+        self.assertTrue(th is not None and th.is_alive())
+        s.close()
+        self.assertFalse(th.is_alive())
+        self.assertTrue(s.disk_has(self.key, self.pfx))   # it landed first
+        # A later write starts a new writer, and it lands too.
+        k2 = crc.make_key(_SHA_A, "m", "fp16", 24000, "And again.")
+        self.assertTrue(s.disk_put(k2, self.pfx, self.pcm()))
+        self.assertTrue(s.flush(5.0))
+        self.assertTrue(s.disk_has(k2, self.pfx))
+        s.close()
+        s.close()                                        # idempotent
 
     def test_folder_is_trimmed_least_recently_used_first(self):
         keys = [crc.make_key(_SHA_A, "m", "fp16", 24000, f"l{i}")
@@ -332,6 +353,7 @@ class StoreTests(unittest.TestCase):
 
     def test_memory_tier_is_bounded_and_copies(self):
         s = crc.CloneRenderCache(mem_cap_fn=lambda: 4000)
+        self.addCleanup(s.close)
         a = np.ones(200, np.float32)          # 800 bytes
         for i in range(10):
             s.mem_put(f"k{i}", a, 24000)
@@ -343,6 +365,7 @@ class StoreTests(unittest.TestCase):
 
     def test_one_writer_thread_however_many_writes(self):
         s = crc.CloneRenderCache()
+        self.addCleanup(s.close)
         s.attach(self.dir)
 
         def writers():
@@ -362,6 +385,7 @@ class StoreTests(unittest.TestCase):
         self.s.gate.admit(self.pfx, 1500.0, 20)
         self.assertTrue(self.s.save_gate())
         s2 = crc.CloneRenderCache()
+        self.addCleanup(s2.close)
         s2.attach(self.dir)
         self.assertEqual(s2.gate.band(self.pfx)[2], 1)
 
@@ -423,6 +447,7 @@ class StoreTests(unittest.TestCase):
 
     def test_a_write_queued_before_a_forget_or_a_purge_never_lands(self):
         s = crc.CloneRenderCache()
+        self.addCleanup(s.close)
         s.attach(self.dir)
         held = threading.Event()
         release = threading.Event()
@@ -473,6 +498,7 @@ class StoreTests(unittest.TestCase):
 
     def test_nothing_raises_without_a_disk_tier(self):
         s = crc.CloneRenderCache()
+        self.addCleanup(s.close)
         self.assertFalse(s.disk_put(self.key, self.pfx, self.pcm()))
         self.assertIsNone(s.disk_get(self.key, self.pfx, 24000))
         self.assertFalse(s.disk_has(self.key, self.pfx))
@@ -517,6 +543,7 @@ class _ClientBase(unittest.TestCase):
             self.assertEqual(c.start(url=srv.url, cmd="", profile="butler"),
                              "ready", self.logs)
         self.addCleanup(lambda: c.store.flush(5.0))
+        self.addCleanup(c.store.close)      # its writer thread (runs first)
         return c
 
     def rendered(self, srv, text):

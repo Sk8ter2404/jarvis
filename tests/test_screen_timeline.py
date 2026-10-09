@@ -20,6 +20,7 @@ class _Base(unittest.TestCase):
         self.td = tempfile.mkdtemp(prefix="tl_")
         self.addCleanup(shutil.rmtree, self.td, True)
         self.tl = T.Timeline(os.path.join(self.td, "screen_timeline.db"))
+        self.addCleanup(self.tl.close)
 
 
 class CleanUrlTests(unittest.TestCase):
@@ -83,6 +84,40 @@ class StoreTests(_Base):
                                         source="uia"))
         self.assertTrue(self.tl.flush(5))
         self.assertEqual(self.tl.count(), 20)
+
+    def test_close_stops_the_writer_after_its_queued_rows(self):
+        # rel-182 (2026-10-09): every test on a fresh data dir left one
+        # writer thread waiting forever (32 at once in one suite).
+        for i in range(5):
+            self.tl.add(title=f"t{i}", text=f"line {i}", source="uia")
+        th = self.tl._thread
+        self.assertTrue(th is not None and th.is_alive())
+        self.tl.close()
+        self.assertFalse(th.is_alive())
+        self.assertEqual(self.tl.count(), 5)          # they landed first
+        self.assertTrue(self.tl.add(title="again", text="later", source="uia"))
+        self.assertTrue(self.tl.flush(5))
+        self.assertEqual(self.tl.count(), 6)          # a new writer took it
+        self.tl.close()
+        self.tl.close()                               # idempotent
+
+    def test_a_new_data_dir_closes_the_replaced_timeline(self):
+        from unittest import mock
+        other = tempfile.mkdtemp(prefix="tl2_")
+        self.addCleanup(shutil.rmtree, other, True)
+        self.addCleanup(T._singleton.__setitem__, "tl", T._singleton["tl"])
+        with mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": self.td}):
+            first = T.get()
+            self.addCleanup(first.close)
+            first.add(title="a", text="one", source="uia")
+            th = first._thread
+        with mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": other}):
+            second = T.get()
+            self.addCleanup(second.close)
+        self.assertIsNot(first, second)
+        th.join(5)
+        self.assertFalse(th.is_alive())
+        self.assertEqual(first.count(), 1)            # its row still landed
 
 
 class ForgetAndRetentionTests(_Base):

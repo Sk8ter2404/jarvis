@@ -106,6 +106,8 @@ _FORGOT_MAX = 256
 # 24 kHz; nothing JARVIS caches comes close).
 MAX_TAKE_S = 45.0
 _WRITE_QUEUE_MAX = 64
+# Queued by close(): the writer thread returns when it reaches it.
+_STOP_WRITER = object()
 
 # The take gate. Expected audio for a line of N characters (a straight-line
 # fit over 1,141 live renders of 2026-10-03..05, all voices): 281 ms + 57.6
@@ -555,7 +557,7 @@ class CloneRenderCache:
             if self._writer is not None:
                 return
             self._q = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
-            th = threading.Thread(target=self._writer_loop,
+            th = threading.Thread(target=self._writer_loop, args=(self._q,),
                                   name="clone-cache-writer", daemon=True)
             self._writer = th
         th.start()
@@ -566,13 +568,16 @@ class CloneRenderCache:
             if self._pending == 0:
                 self._idle.set()
 
-    def _writer_loop(self) -> None:
+    def _writer_loop(self, q=None) -> None:
+        q = q if q is not None else self._q
         while True:
             try:
-                item = self._q.get()
+                item = q.get()
             except Exception:
                 time.sleep(0.1)
                 continue
+            if item is _STOP_WRITER:
+                return
             try:
                 self._write_item(item)
             except Exception:
@@ -583,6 +588,26 @@ class CloneRenderCache:
     def flush(self, timeout: float = 5.0) -> bool:
         """Wait (bounded) until every queued write has landed. Tests."""
         return self._idle.wait(timeout)
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop the writer thread once the writes queued before this call
+        have landed; a later write starts a new one. The process keeps ONE
+        cache for its life, so this is for a cache that is done with (a
+        test's client): each writer is a daemon that otherwise waits on
+        its queue forever, and a suite that built hundreds of clients kept
+        one thread per client alive (50 at once in the 2026-10-09 rel-182
+        run, which pushed a real faulthandler dump past its 100-thread
+        limit). Never raises."""
+        try:
+            with self._mu:
+                th, q = self._writer, self._q
+                if th is None or q is None:
+                    return
+                self._writer = None
+            q.put(_STOP_WRITER, timeout=max(0.0, float(timeout)))
+            th.join(max(0.0, float(timeout)))
+        except Exception:
+            pass
 
     def _write(self, d: str, name: str, a, gen: int = -1, key: str = "",
                prefix: str = "") -> None:
