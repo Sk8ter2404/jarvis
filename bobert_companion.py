@@ -17395,8 +17395,8 @@ def _parakeet_decode(audio, wait_for_load: bool = True):
 def _parakeet_post_text(text: str) -> str:
     """STT_REPLACEMENTS (as for Whisper), then STT_REPLACEMENTS_PARAKEET."""
     text = _stt_vocab.apply_replacements(text, globals().get("STT_REPLACEMENTS"))
-    return _stt_vocab.apply_replacements(
-        text, globals().get("STT_REPLACEMENTS_PARAKEET"))
+    return _stt_vocab.fix_command_mishearings(_stt_vocab.apply_replacements(
+        text, globals().get("STT_REPLACEMENTS_PARAKEET")))
 
 
 def _parakeet_wake_lost(text: str) -> bool:
@@ -20523,7 +20523,8 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
                     print(f"  [stt] dropped a hotword echo ({len(text)} chars) — "
                           f"{_why}; noise, not speech")
                     return "", {"no_speech_prob": 1.0, "avg_logprob": -10.0}
-            text = _stt_vocab.apply_replacements(text, globals().get("STT_REPLACEMENTS"))
+            text = _stt_vocab.fix_command_mishearings(_stt_vocab.apply_replacements(
+                text, globals().get("STT_REPLACEMENTS")))
             if not segments:
                 # info still carries some signal even on empty transcription
                 nsp = float(getattr(info, "no_speech_prob", 1.0) or 1.0)
@@ -20552,8 +20553,8 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
         # Clean decode — reset the consecutive CUDA-failure counter (see the
         # faster-whisper branch above). 2026-07-08.
         _consecutive_whisper_cuda_failures = 0
-        text = _stt_vocab.apply_replacements(result["text"].strip(),
-                                             globals().get("STT_REPLACEMENTS"))
+        text = _stt_vocab.fix_command_mishearings(_stt_vocab.apply_replacements(
+            result["text"].strip(), globals().get("STT_REPLACEMENTS")))
         segments = result.get("segments", [])
         if not segments:
             return text, {"no_speech_prob": 1.0, "avg_logprob": -10.0}
@@ -20917,6 +20918,11 @@ def _reap_wedged_ollama() -> None:
         pass
 
 
+# True once THIS process started the Ollama server itself (it was down). The
+# boot warm-up then pays the model's cold load too and gets a longer budget.
+_OLLAMA_STARTED_COLD = [False]
+
+
 def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
     """Self-heal: if the local Ollama server (the local-model brain) isn't
     answering, START it and wait for it to come up. Ollama being DOWN — after a
@@ -20998,6 +21004,7 @@ def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
         subprocess.Popen([exe, "serve"], creationflags=flags,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          close_fds=True)
+        _OLLAMA_STARTED_COLD[0] = True
     except Exception as e:
         print(f"  [ollama] failed to start server: {type(e).__name__}: {e}")
         return False
@@ -22329,6 +22336,13 @@ def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
 _LOCAL_WARMUP_TRIGGERED = [False]
 
 
+def _warmup_timeout(cold: bool) -> tuple:
+    """(connect, read) seconds for the boot warm-up generate: the normal
+    budget, or 3x the read budget when JARVIS itself just started the server."""
+    c, r = _LOCAL_GENERATE_TIMEOUT
+    return (c, r * 3) if cold else (c, r)
+
+
 def _warm_up_local_llm_async() -> None:
     """Non-blocking boot warm-up: confirm the local model actually GENERATES
     (not merely that /api/tags answers 200 — the SAC-blocked-runner case passes
@@ -22376,10 +22390,23 @@ def _warm_up_local_llm_async() -> None:
                 "options": {"num_predict": 1, "num_ctx": _local_num_ctx(model)},
                 "keep_alive": _local_keep_alive(),
             }
-            with _lt.TRACKER.track():   # JARVIS's own GPU load (system-pulse)
-                r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat",
-                                  json=payload,
-                                  timeout=_LOCAL_GENERATE_TIMEOUT)
+            # A server JARVIS had to start cold also loads the model for the
+            # first time (live 2026-10-09 17:50:44: the 50 s budget ran out
+            # while the model was still loading; it was fine moments later):
+            # give it a longer budget and one retry.
+            _cold = bool(_OLLAMA_STARTED_COLD[0])
+            _to = _warmup_timeout(_cold)
+            for _attempt in range(2 if _cold else 1):
+                try:
+                    with _lt.TRACKER.track():   # JARVIS's own GPU load (system-pulse)
+                        r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat",
+                                          json=payload, timeout=_to)
+                    break
+                except requests.Timeout:
+                    if _attempt + 1 >= (2 if _cold else 1):
+                        raise
+                    print("  [local-llm] warm-up: the model is still loading "
+                          "after a cold server start - trying once more")
             dt = time.monotonic() - t0
             if r.ok:
                 print(f"  [local-llm] warm-up OK — `{model}` generated in "
@@ -22394,11 +22421,14 @@ def _warm_up_local_llm_async() -> None:
             if _sac_blocked_local_recently():
                 print("  [local-llm] warm-up FAILED — runner up but did not "
                       "generate; Smart App Control appears to have blocked it "
-                      "this boot. Foreground turns will fall back to the cloud.")
+                      "this boot. Turns try the local model first and use "
+                      "the cloud only if it fails.")
             else:
-                print("  [local-llm] warm-up FAILED — runner up on /api/tags "
-                      "but did not generate within the budget (blocked/wedged "
-                      "runner?). Foreground turns will fall back to the cloud.")
+                print("  [local-llm] warm-up timed out — runner up on /api/tags "
+                      "but the model had not answered within the budget "
+                      "(still loading, or a blocked/wedged runner). This is "
+                      "only a boot probe: turns try the local model first and "
+                      "use the cloud only if it fails.")
         except Exception as _e:
             print(f"  [local-llm] warm-up error (non-fatal): "
                   f"{type(_e).__name__}: {_e}")
@@ -34691,6 +34721,17 @@ def _utterance_route_reply(text: str) -> "str | None":
     if _wk_m and _wk_m.group(1) in ACTIONS:
         print(f"  [route] all windows except -> {_wk_m.group(1)}")
         return _wk_tok
+    # BUILT-IN route (2026-10-09): "turn on / off hand tracking" is the air
+    # mouse (live 18:02:58 the brain said it could not do hand tracking).
+    try:
+        from core.dispatcher import hand_tracking_route as _ht_route
+        _ht_tok = _ht_route(text)
+    except Exception:
+        _ht_tok = None
+    _ht_m = _ROUTE_TOKEN_RE.match(_ht_tok) if _ht_tok else None
+    if _ht_m and _ht_m.group(1) in ACTIONS:
+        print(f"  [route] hand tracking -> {_ht_m.group(1)}")
+        return _ht_tok
     # BUILT-IN routes (2026-10-05): a NAMED close and "you forgot X" after a
     # bulk close -> close_window (_named_close_route_reply).
     _nc_tok = _named_close_route_reply(text)
