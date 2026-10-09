@@ -1074,6 +1074,9 @@ PC_CONTROL_PROMPT = (
     "    'mute' / 'mute the audio' → [ACTION: volume_mute]\n"
     "    'unmute' / 'turn the sound back on' → [ACTION: volume_unmute]\n"
     "    'set the volume to 30 percent' → [ACTION: set_volume, 30]\n"
+    "    audio_check, <his words> READS volume, mute, output device and each\n"
+    "    app's mixer level: 'why can't I hear my video' / 'is it muted'.\n"
+    "    Never state a volume or other level nothing read this turn.\n"
     # A REAL section header (column 0, all-caps, trailing colon) on purpose.
     # 2026-09-04: this block first shipped as an indented sub-heading, which
     # made split_pc_control fold it into MUSIC CONTROLS — so asking about a

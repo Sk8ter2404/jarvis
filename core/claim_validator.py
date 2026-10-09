@@ -77,6 +77,15 @@ sir.") is never grounded — it promises something new. The OWNER's words
 never ground a claim: Parakeet writes "close" as "closed", and "Jarvis closed
 notepad" is a misheard command, not an action that ran.
 
+INVENTED READINGS (2026-10-09)
+==============================
+find_ungrounded_reading / drop_ungrounded_readings hold back a different
+fabrication: a volume / brightness / battery / temperature NUMBER stated as a
+present reading that no action result, sensor line or context this turn
+supplied ("I'm afraid the volume is currently set to 20%, sir." while only
+system_pulse ran). They read every reply, with or without action tokens -
+see the section at the end of this module.
+
 Pure: no I/O, no monolith import, stdlib ``re`` only, so it is testable on the
 light-deps CI runner (tests/test_claim_validator.py).
 """
@@ -87,7 +96,9 @@ from typing import Iterable, Optional
 
 __all__ = [
     "asks_owner",
+    "drop_ungrounded_readings",
     "find_completed_claim",
+    "find_ungrounded_reading",
     "find_unverified_claim",
     "is_progress_only",
     "looks_like_question",
@@ -1024,3 +1035,208 @@ def strip_ack_preface(text: str, user_text: str, *,
         return text
     rest = rest[0].upper() + rest[1:]
     return f"{tags.strip()} {rest}".strip() if tags.strip() else rest
+
+
+# ── invented device readings (2026-10-09) ───────────────────────────────────
+# Live 2026-10-09 17:53: "Jarvis, why can't I hear my YouTube video?" was
+# answered "I'm afraid the volume is currently set to 20%, sir. [ACTION:
+# system_pulse]". system_pulse reports CPU / GPU / memory / windows; nothing
+# read the volume, and the number was invented and voiced. The checks above
+# only read claims of DOING something, and only in replies with no action
+# token, so a made-up STATE ("the volume is at 20%") sailed through - it was
+# even flushed early, before any action ran.
+#
+# find_ungrounded_reading: a sentence that states a specific number for the
+# volume, brightness, battery or a temperature as a present fact ("the volume
+# is currently set to 20%", "battery at 45 percent", "20% volume", "the GPU
+# temperature is 65 degrees") when nothing this turn supplied that number:
+# no action result / sensor line / context text that names the same kind of
+# reading (the word "volume", "battery", ...) carries it, and the owner did
+# not say it himself. A real reading quoted back ("the system volume is at
+# 35 percent" after audio_check said 35) is grounded and passes. Not a
+# reading: a question, a condition or advice ("if the volume is at 0%",
+# "ideally the battery stays above 20%"), an instruction ("set the volume to
+# 20%" - the action-claim checks' job), or a temperature when the owner asked
+# for a unit conversion. A number within 1 of a grounded value counts (a
+# result's "39.6" read back as "40").
+_RD_NUM_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_RD_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+            "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+_RD_WORD_NUM = (r"(?:(?:a|one)\s+hundred"
+                r"|(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+                r"(?:[\s-](?:one|two|three|four|five|six|seven|eight|nine))?"
+                r"|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+                r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+                r"eighteen|nineteen)\b")
+_RD_NUM = r"(?:\d{1,3}(?:\.\d+)?|" + _RD_WORD_NUM + r")"
+_RD_UNIT = (r"(?:\s*%|\s*percent\b|\s+per\s*cent\b|\s*°\s*[cf]?\b|\s*°"
+            r"|\s+degrees?\b(?:\s+(?:celsius|fahrenheit|c|f)\b)?)")
+# After a unit-less number: the end of the statement, never another word
+# ("the volume is 2 notches up", "the battery is 3 years old").
+_RD_END = (r"(?=\s*(?:[,.;:!?)\-—–]|$)|\s+(?:sir|now|right\s+now|currently|"
+           r"at\s+the\s+moment|at\s+present)\b)")
+_RD_NOUN = {
+    "volume": r"(?:volume|sound\s+level|audio\s+level)",
+    "brightness": r"(?:brightness)",
+    "battery": r"(?:battery(?:\s+(?:level|life|charge))?|charge\s+level)",
+    "temperature": r"(?:temperature|temp)",
+}
+# The words a grounding text must carry to ground a reading of that kind.
+_RD_KEYWORDS = {
+    "volume": ("volume", "sound", "audio", "mute", "speaker"),
+    "brightness": ("bright",),
+    "battery": ("battery", "charge", "charging", "plugged"),
+    "temperature": ("temp", "°", "degree", "weather", "forecast",
+                    "thermostat", "celsius", "fahrenheit"),
+}
+_RD_COP = (r"(?:'s|\s+is|\s+was|\s+are|\s+reads|\s+sits|\s+stands|\s+shows|"
+           r"\s+remains|\s+stays|\s+has(?:\s+got)?|"
+           r"\s+(?:looks|appears|seems)\s+to\s+be)")
+_RD_ADV = (r"(?:(?:currently|now|still|just|only|already|presently|"
+           r"right\s+now|at\s+the\s+moment)\s+)*")
+_RD_SET = (r"(?:(?:set|sitting|turned\s+(?:down|up)|down|up|running|holding|"
+           r"reading|showing|sat)\s+)?")
+_RD_QUAL = r"(?:(?:about|around|roughly|approximately|a\s+mere|nearly)\s+)?"
+
+
+def _rd_compile(fam: str):
+    noun = (r"\b" + _RD_NOUN[fam] + r"\b(?:\s+(?:outside|inside|outdoors|"
+            r"indoors|here|in\s+here|out\s+there|today|tonight))?")
+    num_tail = (r"(?P<n>" + _RD_NUM + r")(?:" + _RD_UNIT + r"|" + _RD_END
+                + r")")
+    return (
+        # "the volume is currently set to 20%" / "battery's at 45 percent"
+        re.compile(noun + _RD_COP + r"\s+" + _RD_ADV + _RD_SET
+                   + r"(?:(?:at|to)\s+)?" + _RD_QUAL + num_tail),
+        # "battery at 45%" / "volume sitting at 20"
+        re.compile(noun + r"\s+(?:at|sitting\s+at|down\s+to|up\s+to)\s+"
+                   + _RD_QUAL + num_tail),
+        # "20% volume" / "45 percent battery"
+        re.compile(r"(?P<n>" + _RD_NUM + r")" + _RD_UNIT + r"\s+(?:of\s+)?"
+                   r"(?:your\s+|the\s+)?" + noun),
+    )
+
+
+_RD_COMPILED = tuple((fam, _rd_compile(fam)) for fam in _RD_NOUN)
+# A sentence that is advice, a condition or a hypothetical, not a reading.
+_RD_NOT_STATE_RE = re.compile(
+    r"\b(?:if|when|whenever|unless|once|until|should|would|could|might|"
+    r"ideal|ideally|typically|usually|normally|generally|recommend\w*|"
+    r"suggest\w*|try|keep|above|below|under|over|between|less\s+than|"
+    r"more\s+than|aim|target|safe|max(?:imum)?|min(?:imum)?)\b")
+_RD_CONVERSION_RE = re.compile(
+    r"\b(?:convert\w*|celsius|fahrenheit|centigrade|in\s+[cf])\b")
+_RD_NUM_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?|" + _RD_WORD_NUM)
+_RD_CUE_RE = re.compile(r"\d|%|°|percent|degree|" + _RD_WORD_NUM)
+
+
+def _rd_value(tok: str) -> Optional[float]:
+    t = re.sub(r"[\s-]+", " ", (tok or "").strip().lower())
+    if not t:
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        pass
+    if t in ("a hundred", "one hundred"):
+        return 100.0
+    if t in _RD_NUM_WORDS:
+        return float(_RD_NUM_WORDS[t])
+    parts = t.split(" ")
+    if parts[0] in _RD_TENS:
+        if len(parts) == 1:
+            return float(_RD_TENS[parts[0]])
+        if len(parts) == 2 and parts[1] in _RD_NUM_WORDS:
+            return float(_RD_TENS[parts[0]] + _RD_NUM_WORDS[parts[1]])
+    return None
+
+
+def _rd_numbers(text: str) -> list:
+    out = []
+    for m in _RD_NUM_TOKEN_RE.finditer(text or ""):
+        v = _rd_value(m.group(0))
+        if v is not None:
+            out.append(v)
+    return out
+
+
+def _rd_grounded(fam: str, value: float, grounding, user_text: str) -> bool:
+    # The owner's own number ("set it to 20", "is it 70 degrees out?").
+    if any(abs(v - value) < 0.5 for v in _rd_numbers(_norm(user_text))):
+        return True
+    keys = _RD_KEYWORDS[fam]
+    for g in grounding:
+        low = str(g or "").lower()
+        if not low or not any(k in low for k in keys):
+            continue
+        if any(abs(v - value) <= 1.0 for v in _rd_numbers(low)):
+            return True
+    return False
+
+
+def find_ungrounded_reading(text: str, *, grounding: Iterable[str] = (),
+                            user_text: str = "") -> Optional[str]:
+    """The phrase when ``text`` states a volume / brightness / battery /
+    temperature number as a present reading that nothing in ``grounding``
+    (this turn's action results, sensor lines and context, as text) and not
+    the owner's ``user_text`` supplied; None otherwise. Pure; never
+    raises."""
+    try:
+        norm = _norm(text)
+        if not norm or not _RD_CUE_RE.search(norm):
+            return None
+        grounding = [str(g) for g in (grounding or ()) if g]
+        conversion = bool(_RD_CONVERSION_RE.search(_norm(user_text)))
+        for sentence in _SENTENCE_SPLIT_RE.split(norm):
+            s = sentence.strip()
+            if not s or s.endswith("?"):
+                continue
+            for fam, rxs in _RD_COMPILED:
+                if fam == "temperature" and conversion:
+                    continue
+                for rx in rxs:
+                    for m in rx.finditer(s):
+                        # "20% volume should do it" is advice: the number-
+                        # first form reads the whole sentence.
+                        scope = s if rx is rxs[2] else s[:m.end()]
+                        if _RD_NOT_STATE_RE.search(scope):
+                            continue
+                        value = _rd_value(m.group("n"))
+                        if value is None:
+                            continue
+                        if not _rd_grounded(fam, value, grounding, user_text):
+                            return m.group(0).strip()
+        return None
+    except Exception:
+        return None
+
+
+def drop_ungrounded_readings(text: str, *, grounding: Iterable[str] = (),
+                             user_text: str = "") -> tuple:
+    """(``text`` without the sentences find_ungrounded_reading flags, the
+    flagged phrases). Sentences split as in the monolith's
+    _drop_timer_claims, so the rest of the reply is kept as written. Never
+    raises: on a fault ``text`` comes back unchanged with no phrases."""
+    try:
+        if not text:
+            return text, []
+        grounding = [str(g) for g in (grounding or ()) if g]
+        if find_ungrounded_reading(text, grounding=grounding,
+                                   user_text=user_text) is None:
+            return text, []
+        kept, flagged = [], []
+        for part in re.split(r"(?<=[.!?])\s+", text):
+            hit = find_ungrounded_reading(part, grounding=grounding,
+                                          user_text=user_text)
+            if hit:
+                flagged.append(hit)
+            else:
+                kept.append(part)
+        return " ".join(kept).strip(), flagged
+    except Exception:
+        return text, []
