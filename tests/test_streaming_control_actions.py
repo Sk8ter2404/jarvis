@@ -141,8 +141,10 @@ class OpenUrlGuardTests(_Base):
         with mock.patch.object(A, "_act_launch_app", return_value="ok") as la, \
                 mock.patch.object(A.time, "time", _clock()):
             state["n"] = 0
-            A._act_open_on_monitor("main | netflix")
-        la.assert_called_once_with("netflix")
+            # A bare APP name still launches; a bare website name ("netflix",
+            # "youtube") opens the site instead (v2.0.183, live 10-05 00:35:57).
+            A._act_open_on_monitor("main | notepad")
+        la.assert_called_once_with("notepad")
 
 
 # ════════════════════════════════════════════════════════════════════════════
