@@ -2363,6 +2363,12 @@ AUDIO_AUTOSWITCH_MIC_FALLBACK = os.getenv("JARVIS_AUDIO_MIC_FALLBACK", "")  # e.
 # before 2026-09-05, i.e. fire-once-and-never-re-check).
 AUDIO_AUTOSWITCH_MIC_SILENT_S = _env_float("JARVIS_AUDIO_MIC_SILENT_S", 60.0)
 
+# While any media session is Playing, the OUTPUT switch (headset on/off) waits:
+# a video pauses when its output device changes (10-09 census: ~16 switches in
+# 10 days, each paused HBO). The switch happens once playback has been quiet
+# for a few seconds, or after a bounded wait. Mic switching is never deferred.
+AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA = True
+
 
 # ─── Audio-device flap damping (bobert_companion + core/audio_flap.py) ─
 # 2026-09-29: a desk mic's Windows endpoint went Active <-> NotPresent every

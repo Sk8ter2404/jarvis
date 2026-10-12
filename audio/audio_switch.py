@@ -1042,6 +1042,18 @@ def mic_liveness_rank(name: str) -> int:
     return 0
 
 
+def _media_is_playing() -> bool:
+    """True when the system media session (SMTC) reports Playing. Unknown or
+    unreadable counts as NOT playing, so the switch is never blocked by a
+    failed probe."""
+    try:
+        from core import media_now_playing
+        info = media_now_playing.get_now_playing()
+        return bool(info and info.get("playing"))
+    except Exception:
+        return False
+
+
 class AudioAutoSwitch:
     """Background watcher: on the headset's power transitions, move the Windows
     default render device. Idempotent + terminable. Mirrors JARVIS's other
@@ -1111,8 +1123,21 @@ class AudioAutoSwitch:
 
     def __init__(self, headset: str, fallback: str = "", poll_s: float = 3.0,
                  announce=None, mic_fallback: str = "", follow_mic: bool = False,
-                 mic_silent_s: float = 60.0, announce_kind=None):
+                 mic_silent_s: float = 60.0, announce_kind=None,
+                 defer_during_media: bool = False, media_playing=None,
+                 defer_quiet_s: float = 5.0, defer_max_s: float = 900.0):
         self.headset = headset
+        # OUTPUT switches wait while media plays (a video pauses when its
+        # output device changes). Off by default HERE so direct constructions
+        # keep the old behaviour; the skill passes the setting (default True).
+        self.defer_during_media = bool(defer_during_media)
+        self._media_playing = media_playing or _media_is_playing
+        self.defer_quiet_s = float(defer_quiet_s)
+        self.defer_max_s = float(defer_max_s)
+        self._pending_out: str | None = None     # "to_headset" | "away"
+        self._defer_since: float | None = None   # clock() when first deferred
+        self._quiet_since: float | None = None   # clock() when playback stopped
+        self._defer_logged = False
         self.fallback = fallback           # name fragment, or "" = remember prior
         self.poll_s = max(1.0, float(poll_s))
         self.announce = announce or (lambda msg: _log(msg))
@@ -1273,12 +1298,31 @@ class AudioAutoSwitch:
         self._believed_on = now
         label = None
         try:
+            want = None
             if now and not was_on:
                 # Covers False->True and the startup None->True sync. Idempotent:
                 # _switch_to_headset() no-ops when the headset is already default.
-                label = self._switch_to_headset()
+                want = "to_headset"
             elif was_on is True and not now:
-                label = self._switch_away()
+                want = "away"
+            elif self._pending_out:
+                # A deferred switch is still owed. If the headset flipped back
+                # the move is moot (nothing was moved yet), else keep waiting.
+                if (self._pending_out == "to_headset") == bool(now):
+                    want = self._pending_out
+                else:
+                    self._clear_pending()
+            if want == "away" and self._pending_out == "to_headset":
+                # Powered on and off again while the grab was still deferred:
+                # nothing was ever moved, so there is nothing to move back.
+                self._clear_pending()
+                want = None
+            if want and self._defer_output(want):
+                label = None
+            elif want:
+                self._clear_pending()
+                label = (self._switch_to_headset() if want == "to_headset"
+                         else self._switch_away())
             # Deliberately no branch for None->False on the OUTPUT side: at
             # startup with the headset already off, the owner's chosen speakers
             # are left exactly alone. The INPUT side does NOT get that pass —
@@ -1319,6 +1363,53 @@ class AudioAutoSwitch:
                       "by another process)")
         _log(f"can't tell whether '{self.headset}' is powered{detail}; HOLDING at "
              f"{held} — unknown is never treated as off")
+
+    def _clear_pending(self) -> None:
+        self._pending_out = None
+        self._defer_since = None
+        self._quiet_since = None
+        self._defer_logged = False
+
+    def _defer_output(self, want: str) -> bool:
+        """True = hold the OUTPUT switch for now (media is playing).
+
+        A video pauses when its output device changes, so with
+        defer_during_media the move waits until nothing has been Playing for
+        defer_quiet_s, and is bounded by defer_max_s so a stream that never
+        stops cannot block the switch forever. One log line on first deferral,
+        one when it finally proceeds. Never raises; a failed probe = go."""
+        if not self.defer_during_media:
+            return False
+        t = self._now()
+        try:
+            playing = bool(self._media_playing())
+        except Exception:
+            playing = False
+        if self._pending_out != want:
+            self._pending_out = want
+            self._defer_since = t
+            self._quiet_since = None
+            self._defer_logged = False
+        if playing:
+            self._quiet_since = None
+        elif self._quiet_since is None:
+            self._quiet_since = t
+        waited = t - (self._defer_since if self._defer_since is not None else t)
+        stamp = time.strftime("%H:%M:%S")
+        if playing or (t - self._quiet_since) < self.defer_quiet_s:
+            if waited >= self.defer_max_s:
+                _log(f"{stamp} output switch ({want}) waited {waited:.0f}s for "
+                     f"media to pause; switching anyway")
+                return False
+            if not self._defer_logged:
+                self._defer_logged = True
+                _log(f"{stamp} media is playing - deferring the output switch "
+                     f"({want}) until it has been paused {self.defer_quiet_s:.0f}s")
+            return True
+        if self._defer_logged:
+            _log(f"{stamp} playback stopped - doing the deferred output switch "
+                 f"({want}) after {waited:.0f}s")
+        return False
 
     def _switch_to_headset(self) -> str | None:
         hs = find_active(self.headset)

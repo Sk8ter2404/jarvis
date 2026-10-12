@@ -1098,6 +1098,14 @@ SCHEMA: dict[str, dict] = {
         "help": "Off by default: a wrong move of the default recording device "
                 "is how JARVIS goes deaf. Applies on the next start.",
     },
+    "AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA": {
+        "tab": "hearing", "label": "Wait for pause before moving the speakers",
+        "type": "bool", "default": True,
+        "help": "When the headset turns on or off while a video or song is "
+                "playing, wait until it is paused before moving the sound, "
+                "because a video pauses when its output device changes. The "
+                "mic is never delayed. Applies on the next start.",
+    },
     "AUDIO_AUTOSWITCH_MIC_FALLBACK": {
         "tab": "hearing", "label": "Mic when the headset turns off",
         "type": "str", "default": "",
@@ -2275,7 +2283,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                                  "AUDIO_AUTOSWITCH_HEADSET",
                                  "AUDIO_AUTOSWITCH_FALLBACK",
                                  "AUDIO_AUTOSWITCH_MIC",
-                                 "AUDIO_AUTOSWITCH_MIC_FALLBACK"]),
+                                 "AUDIO_AUTOSWITCH_MIC_FALLBACK",
+                                 "AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA"]),
         ("Device changes", ["AUDIO_FLAP_WINDOW_S", "AUDIO_FLAP_THRESHOLD",
                             "AUDIO_ANNOUNCE_MIN_GAP_S",
                             "AUDIO_REPICK_STABLE_S"]),

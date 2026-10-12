@@ -184,6 +184,7 @@ def _make_daemon():
         # Device sentences go through the monolith's flap governor with their
         # kind; the battery warning keeps the plain announce path.
         announce_kind=_announce_kind,
+        defer_during_media=bool(_cfg("AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA", True)),
     )
 
 
