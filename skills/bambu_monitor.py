@@ -143,6 +143,10 @@ _CHAMBER_SWING_AMBER_C = 6.0
 _speech_lock = threading.Lock()
 _last_finish_announced_at = [0.0]
 _announced_error_codes: set = set()
+# File name of the print THIS session watched in RUNNING/PAUSE. A FINISH is
+# spoken only when it matches the current file (a real RUNNING -> FINISH).
+_finish_witnessed: list = [None]
+_finish_boot_logged: list = [False]
 
 # External listeners invoked after every state-change pass. Companion skills
 # (e.g. proactive_print_companion) call register_state_change_hook() to be
@@ -454,7 +458,26 @@ _print_start_ts: list           = [0.0]
 _print_initial_estimate_min: list = [None]
 
 
-def _enqueue_speech(message: str, urgent: bool = False) -> None:
+def speech_still_valid(tag: str) -> bool:
+    """Drain-time check for a queued line: False = drop it unspoken.
+    ``bambu_finish:<file>`` holds only while the printer still reports FINISH
+    for that file (a new job started since means the line is stale)."""
+    try:
+        if not str(tag).startswith("bambu_finish:"):
+            return True
+        want = str(tag).split(":", 1)[1]
+        with _state_lock:
+            gs = (_state.get("gcode_state") or "").upper()
+            cur = _strip_filename(_state.get("filename") or "")
+        if gs != "FINISH":
+            return False
+        return (not want) or (cur == want)
+    except Exception:
+        return True
+
+
+def _enqueue_speech(message: str, urgent: bool = False,
+                    still_valid: str | None = None) -> None:
     """Route a proactive announcement through bobert_companion's public
     proactive_announce() API when available, falling back to a direct atomic
     write against pending_speech.json if the parent module hasn't loaded yet
@@ -475,6 +498,12 @@ def _enqueue_speech(message: str, urgent: bool = False) -> None:
                     return
                 except TypeError:
                     pass        # an older announcer: say it without the flag
+            if still_valid:
+                try:
+                    announcer(message, source="bambu", still_valid=still_valid)
+                    return
+                except TypeError:
+                    pass
             announcer(message, source="bambu")
             return
     except Exception:
@@ -493,6 +522,8 @@ def _enqueue_speech(message: str, urgent: bool = False) -> None:
         entry = {"ts": time.time(), "message": message}
         if urgent:
             entry["urgent"] = True
+        if still_valid:
+            entry["still_valid"] = still_valid
         data.append(entry)
         try:
             _atomic_write_json(_SPEECH_QUEUE, data)
@@ -696,6 +727,11 @@ def _on_message(client, userdata, msg) -> None:
             if report.get(fkey):
                 _state["filename"] = report[fkey]
                 break
+        # Printer-side job id (differs per job even for a re-print of the same file).
+        for ikey in ("task_id", "subtask_id", "job_id"):
+            if report.get(ikey) not in (None, "", "0", 0):
+                _state["task_id"] = str(report[ikey])
+                break
         # Track chamber temperature samples for swing detection. Only
         # record genuine readings (>1 °C) so a missing-sensor zero doesn't
         # widen the apparent swing.
@@ -761,7 +797,12 @@ def _handle_state_change() -> None:
     _last_gcode_state[0] = gcode_state
 
     new_print = False
+    name_changed_idle = False
     if fname and fname != _current_print_filename[0]:
+        # A new file name arriving while the printer still reports FINISH/IDLE
+        # (or on the first push after boot) is the NEXT job loading, or the old
+        # finished one being discovered - never a completion.
+        name_changed_idle = gcode_state not in ("RUNNING", "PAUSE", "PREPARE")
         _current_print_filename[0] = fname
         new_print = True
     elif gcode_state == "RUNNING" and prev_gcode in ("FINISH", "FAILED", "IDLE", "PREPARE"):
@@ -777,6 +818,7 @@ def _handle_state_change() -> None:
         _bed_cool_announced[0] = False
         _print_start_ts[0] = 0.0
         _print_initial_estimate_min[0] = None
+        _finish_witnessed[0] = None
         # Clear THIS filename's durable FINISH/bed-cool dedup keys. Those keys exist
         # so a process bounce mid-print can't replay a completion (pruned only after
         # 7 days) — but a genuine REPRINT of the same file is a NEW print, not a
@@ -790,8 +832,12 @@ def _handle_state_change() -> None:
             _rk = fname or "_anon_"
             _rstate_np = _load_reminder_persistence()
             _np_dirty = False
-            for _dedup_key in (f"finish:{_rk}", f"bedcool:{_rk}"):
-                if _dedup_key in _rstate_np:
+            for _dedup_key in list(_rstate_np):
+                # Only a witnessed start (RUNNING, not a name arriving during
+                # FINISH/IDLE) clears the replay guards: finish:<file>[#<job>].
+                if gcode_state != "RUNNING" or name_changed_idle:
+                    break
+                if _dedup_key.split("#", 1)[0] in (f"finish:{_rk}", f"bedcool:{_rk}"):
                     del _rstate_np[_dedup_key]
                     _np_dirty = True
             if _np_dirty:
@@ -907,6 +953,10 @@ def _handle_state_change() -> None:
         except (TypeError, ValueError):
             pass
 
+    # This session watched the current file print: a later FINISH is a real one.
+    if gcode_state in ("RUNNING", "PAUSE") and fname:
+        _finish_witnessed[0] = fname
+
     # Completion (100 %)
     if gcode_state == "FINISH":
         now = time.time()
@@ -914,20 +964,39 @@ def _handle_state_change() -> None:
         # been announced? Keyed by filename so a NEW print after a bounce
         # still announces, but the same print doesn't replay.
         rstate = _load_reminder_persistence()
-        finish_key = f"finish:{fname or '_anon_'}"
+        with _state_lock:
+            _tid = _state.get("task_id")
+        finish_key = f"finish:{fname or '_anon_'}" + (f"#{_tid}" if _tid else "")
         already_announced = bool(rstate.get(finish_key))
         time_gate_ok = (now - _last_finish_announced_at[0]) > COMPLETION_COOLDOWN
-        if time_gate_ok and not already_announced:
+        witnessed = _finish_witnessed[0] is not None and _finish_witnessed[0] == fname
+        if already_announced:
+            # Quietly arm the bed-watch without re-announcing - so the bed-
+            # cool follow-up still fires if it hasn't yet for this print.
+            bed_key = f"bedcool:{fname or '_anon_'}"
+            if not rstate.get(bed_key):
+                _post_finish_bed_watch[0] = True
+                _bed_cool_announced[0] = False
+        elif not witnessed:
+            # Discovered at boot, or a new name arrived while the printer still
+            # said FINISH: not a completion this session watched. Log once.
+            if not _finish_boot_logged[0]:
+                _finish_boot_logged[0] = True
+                print(f"  [bambu] '{fname}' already FINISH when seen - not announcing")
+        elif time_gate_ok and not already_announced:
+            _finish_witnessed[0] = None
             _last_finish_announced_at[0] = now
             if fname:
                 _enqueue_speech(
                     f"Print complete, sir — '{fname}' is finished. "
-                    "Shall I notify you when the bed has cooled?"
+                    "Shall I notify you when the bed has cooled?",
+                    still_valid=f"bambu_finish:{fname}",
                 )
             else:
                 _enqueue_speech(
                     "Print complete, sir. "
-                    "Shall I notify you when the bed has cooled?"
+                    "Shall I notify you when the bed has cooled?",
+                    still_valid="bambu_finish:",
                 )
             _post_finish_bed_watch[0] = True
             _bed_cool_announced[0] = False
@@ -938,13 +1007,6 @@ def _handle_state_change() -> None:
             rstate = {k: v for k, v in rstate.items()
                       if not (isinstance(v, dict) and v.get("ts", 0) < cutoff)}
             _save_reminder_persistence(rstate)
-        elif already_announced:
-            # Quietly arm the bed-watch without re-announcing — so the bed-
-            # cool follow-up still fires if it hasn't yet for this print.
-            bed_key = f"bedcool:{fname or '_anon_'}"
-            if not rstate.get(bed_key):
-                _post_finish_bed_watch[0] = True
-                _bed_cool_announced[0] = False
 
     # Bed cool-down follow-up. Only armed after we just announced a FINISH,
     # so a print JARVIS discovered already-finished on cold start (and which

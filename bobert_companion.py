@@ -13499,7 +13499,8 @@ def proactive_announce(message: str, source: str = "skill",
                        supersede: str | None = None,
                        dedupe_key: str | None = None,
                        offer: bool = False,
-                       urgent: bool = False) -> bool:
+                       urgent: bool = False,
+                       still_valid: str | None = None) -> bool:
     """Public proactive-speech API for skills.
 
     Skills that want JARVIS to speak something unprompted (print milestones,
@@ -13611,6 +13612,10 @@ def proactive_announce(message: str, source: str = "skill",
             entry["offer"] = True
         if urgent:
             entry["urgent"] = True
+        if still_valid:
+            # Re-checked by the drain just before speaking
+            # (skills.bambu_monitor.speech_still_valid); False drops the line.
+            entry["still_valid"] = str(still_valid)
         if supersede:
             _before = len(data)
             data = [e for e in data
@@ -45994,6 +45999,17 @@ def _speak_pending(only_sources=None):
         msg = item.get("message", "")
         if not msg:
             continue
+        _sv = item.get("still_valid")
+        if _sv:
+            try:
+                import skills.bambu_monitor as _bm_sv
+                _sv_ok = bool(_bm_sv.speech_still_valid(str(_sv)))
+            except Exception:
+                _sv_ok = True
+            if not _sv_ok:
+                print(f"  [pending] dropped stale announcement: {msg[:80]}")
+                _rewrite_queue_snapshot(consume_path, back + items[_pos + 1:])
+                continue
         _dkey = str(item.get("dedupe_key") or "") or msg
         if _dkey in seen_in_batch or _speech_was_recently_spoken(_dkey):
             print(f"  [pending] suppressed duplicate: {msg[:80]}")
