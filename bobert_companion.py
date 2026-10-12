@@ -22221,16 +22221,31 @@ def _chat_cloud_allowed() -> bool:
         return False
 
 
+def _cloud_boost_on() -> bool:
+    """CLOUD_BOOST_UNTIL (core/cloud_boost.py): True from the date it is set
+    through the end of that day, when a key exists. Empty setting = False."""
+    try:
+        until = globals().get("CLOUD_BOOST_UNTIL") or ""
+        if not str(until).strip():
+            return False
+        from core import cloud_boost as _cb
+        return bool(_cb.boost_active(until)
+                    and (os.environ.get("ANTHROPIC_API_KEY") or "").strip())
+    except Exception:
+        return False
+
+
 def _claude_oneshot(system: "str | list", messages: list,
                     max_tokens: int = 500,
-                    model: str | None = None) -> str | None:
+                    model: str | None = None,
+                    boost: bool = False) -> str | None:
     """Single Claude completion used as the cloud fallback when the LOCAL model
     fails on a 'local'-routed turn. Returns the text, or None if the cloud is
     unreachable / errors (caller then emits the honest both-down message).
     Mirrors the timeout + client-reuse the main _call_llm Claude path uses.
     ``model`` defaults to CLAUDE_MODEL; the turn checker's retry passes
     TURN_CHECK_ESCALATE_MODEL (see _turn_check_escalate)."""
-    if not _claude_reachable():
+    if not (_claude_reachable() or (boost and _cloud_boost_on())):
         return None
     model = model or CLAUDE_MODEL
     try:
@@ -22296,7 +22311,8 @@ def _self_knowledge_for_cloud(messages: list) -> list:
 
 
 def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
-                                max_tokens: int = 500) -> str:
+                                max_tokens: int = 500,
+                                hard: bool = False) -> str:
     """LOCAL-routed turn with honest resilience. Try the local model; if it
     can't answer this turn, fall back to Claude when reachable; if neither
     works, return an honest sentence (never a fabricated answer).
@@ -22310,6 +22326,15 @@ def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
     rather than propagating — giving the LOCAL route the same no-propagate
     guarantee the Claude and Ollama branches of _call_llm already have."""
     try:
+        _boost = _cloud_boost_on()
+        if _boost and hard:
+            # CLOUD_BOOST_UNTIL: a hard turn goes to Claude first; if the
+            # cloud cannot answer, the local model below still does.
+            _hc = _claude_oneshot(sys_prompt, _self_knowledge_for_cloud(messages),
+                                  max_tokens=max_tokens, boost=True)
+            if _hc:
+                print("  [cloud-boost] hard turn answered by Claude")
+                return _hc
         text = _call_local_llm(sys_prompt, messages, max_tokens=max_tokens)
         if text:
             t = text.lstrip()
@@ -22319,7 +22344,7 @@ def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
         # Local didn't answer. Prefer the cloud if we can reach it - told
         # it is the cloud answering (_self_knowledge_for_cloud).
         cloud = _claude_oneshot(sys_prompt, _self_knowledge_for_cloud(messages),
-                                max_tokens=max_tokens)
+                                max_tokens=max_tokens, boost=_boost)
         if cloud:
             if _sac_blocked_local_recently():
                 print("  [local-llm] SAC blocked the local runner this boot — "
@@ -24934,6 +24959,8 @@ def _vision_goes_local() -> bool:
         if not _local_vision_usable():
             return False
         from core.config import model_route
+        if _cloud_boost_on():
+            return False
         return model_route("vision") == "local" or AI_BACKEND != "claude"
     except Exception:
         return False
@@ -25287,7 +25314,15 @@ def _call_llm(user_text: str) -> str:
                 1 if getattr(_fitted, "trimmed", False) else 0)
             # The next turn and the idle re-prime share this trimmed prefix.
             _persist_budget_history_trim(_fitted)
-            reply = _local_then_cloud_or_honest(sys_prompt_now, _fitted)
+            try:
+                from core import cloud_boost as _cb_hard
+                _hard_turn = _cb_hard.is_hard_turn(user_text)
+            except Exception:
+                _hard_turn = False
+            reply = (_local_then_cloud_or_honest(sys_prompt_now, _fitted,
+                                                 hard=True)
+                     if _hard_turn else
+                     _local_then_cloud_or_honest(sys_prompt_now, _fitted))
         finally:
             _owner_chat_call.active = False
     elif AI_BACKEND == "claude":
@@ -27817,12 +27852,13 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
 
     # Per-function routing: force the local VLM when vision is routed "local".
     from core.config import model_route
-    if model_route("vision") == "local":
+    _vboost = _cloud_boost_on()     # CLOUD_BOOST_UNTIL: screen reading -> Claude
+    if model_route("vision") == "local" and not _vboost:
         local = _call_local_vision(question, [png_bytes])
         return f"[local-vision] {local}" if local else "(local vision unavailable — Ollama not reachable)"
 
     # Cloud-disabled path: jump straight to the local VLM.
-    if AI_BACKEND != "claude":
+    if AI_BACKEND != "claude" and not _vboost:
         local = _call_local_vision(question, [png_bytes])
         if local:
             return f"[local-vision] {local}"
@@ -27978,11 +28014,12 @@ def _ask_vision_multi_raw(question: str, images: dict[str, bytes]) -> str:
         return f"[local-vision] {text}" if text else None
 
     from core.config import model_route
-    if model_route("vision") == "local":
+    _vboost = _cloud_boost_on()     # CLOUD_BOOST_UNTIL: screen reading -> Claude
+    if model_route("vision") == "local" and not _vboost:
         local = _local_multi_fallback()
         return local if local else "(local vision unavailable — Ollama not reachable)"
 
-    if AI_BACKEND != "claude":
+    if AI_BACKEND != "claude" and not _vboost:
         local = _local_multi_fallback()
         if local:
             return local

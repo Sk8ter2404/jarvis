@@ -1293,6 +1293,16 @@ SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
 TURN_CHECK_MODE = "shadow"
 TURN_CHECK_ESCALATE_MODEL = "claude-sonnet-5-5"
 
+# ─── Time-boxed Claude boost (core/cloud_boost.py, 2026-10-12) ───────────
+# CLOUD_BOOST_UNTIL — an ISO date ("2026-11-05"). Through the end of that day
+#   HARD questions (an explicit "think hard"/"look it up"/"step by step" ask,
+#   or a long multi-part question) and screen-reading / vision questions are
+#   answered by CLAUDE_MODEL instead of the local model, and a local answer
+#   that fails falls to Claude even when AI_BACKEND is "ollama". It needs an
+#   ANTHROPIC_API_KEY; the next day it switches itself off with one log line.
+#   "" (default) = off = nothing changes. Applies on the next start.
+CLOUD_BOOST_UNTIL = ""
+
 # ─── Deterministic fast paths (core/fast_paths.py + core/date_math.py) ──
 # When True, relative-date questions ("what's the date tomorrow", "how many
 # days until Christmas", "how long until Friday"), "what did I just ask you"
