@@ -447,6 +447,7 @@ class BambuStateChangeTests(unittest.TestCase):
         self.mod._last_gcode_state[0] = "RUNNING"
         self.mod._current_print_filename[0] = "cube"
         self.mod._announced_start[0] = True
+        self.mod._finish_witnessed[0] = "cube"
         self._set(gcode_state="FINISH", filename="cube.3mf")
         msgs = self._run()
         self.assertTrue(any("Print complete" in m for m in msgs))
@@ -1095,6 +1096,7 @@ class BambuHandleStateChangeBranchTests(BambuStateChangeTests):
         self.mod._last_gcode_state[0] = "RUNNING"
         self.mod._current_print_filename[0] = None
         self.mod._announced_start[0] = True
+        self.mod._finish_witnessed[0] = ""
         self._set(gcode_state="FINISH")  # no filename
         msgs = self._run()
         hit = [m for m in msgs if "Print complete" in m]
