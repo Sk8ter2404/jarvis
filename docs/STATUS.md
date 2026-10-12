@@ -4,9 +4,9 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.184
+- Version: v2.0.185
 - Live since: 2026-10-12
-- Latest change: v2.0.184 (live 10-12 16:02, check passed 16:33): no false 'print complete' announcements; new HUMOR_MODE setting (dry or sarcastic). v2.0.183 (live 15:24, passed 15:55).
+- Latest change: v2.0.185 (10-12): public status docs on GitHub, no code change. Last code release v2.0.184 (live 16:02, check passed 16:33): no false 'print complete' announcements; HUMOR_MODE sarcastic.
 
 ## In progress
 
@@ -23,7 +23,7 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 Open, planned and idea items. Wording is generic on purpose.
 
-### In progress (7)
+### In progress (9)
 
 - No more bugs on JARVIS or the robot. In progress.
 - Make FEATURES.md match reality. In progress.
@@ -32,8 +32,10 @@ Open, planned and idea items. Wording is generic on purpose.
 - Stop the robot repeating the same jokes. In progress.
 - Turn checker: retry a bad local answer on Claude. In progress.
 - Test-order leak between two test files. In progress.
+- Air mouse is slow to take the cursor. In progress.
+- JARVIS cleanup overhaul. In progress.
 
-### Planned next (9)
+### Planned next (7)
 
 - Make sure queued speech is never lost. Planned next.
 - Small engineering follow-ups. Planned next.
@@ -42,8 +44,6 @@ Open, planned and idea items. Wording is generic on purpose.
 - Better memory search models. Planned next.
 - Searchable screen memory. Planned next.
 - Show clearly on the VRAM bar when settings go over the limit. Planned next.
-- Air mouse is slow to take the cursor. Planned next.
-- JARVIS cleanup overhaul. Planned next.
 
 ### Ideas (23)
 
@@ -73,6 +73,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.185 (2026-10-12): Public status docs on GitHub: docs/STATUS.md and docs/RELEASE_HISTORY.md, generated from the master sheet with all personal data stripped. No code change; the running JARVIS code is the same as v2.0.184.
 - v2.0.184 (2026-10-12): JARVIS only announces a finished print he actually watched run (no "print complete" for a print finished while he was off, none when a new print's name arrives before the printer leaves FINISH, no replay after a restart, a stale queued finish line is ...
 - v2.0.183 (2026-10-09): "turn on/off hand tracking" works, "close that window" closes one, "u2"/"you two" means YouTube only inside open/close/play commands, a bare website name opens the site (no exe launch), the cold-start warm-up message tells the truth; "why can't I hear X" runs ...
 - v2.0.182 (2026-10-09): JARVIS shuts down when asked in plain words ("shut down, no overnight protocol", "yes, that is what I want") and still never on someone else's words; screen vision rebuilt (reads real buttons and links through UI Automation, OCR as backup, checks every click ...
@@ -82,6 +83,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.178 (2026-10-03): the cloned JARVIS voice runs from its own GPU server with Kokoro covering any line it misses (off until switched on), and "close all windows except X" really closes the rest - never JARVIS's own HUD/Reticle or the Windows shell, asks first above five, never ...
 - v2.0.177 (2026-10-02): a yes to JARVIS's own offer carries it out, slow apps are moved when their window appears, streaming search uses verified links and stops at a sign-in wall, 'close that' closes only what he opened, fresh 'diagnostic status', facts remember who said them + ...
 - v2.0.176 (2026-10-02): the big 10-02 batch - JARVIS never voices a claim he didn't carry out, honest about admin windows and repeated failures, instant time; turn checker + instant actions (shadow), answer pre-render (R3), July audit fixes, local-first features with a retired-model ...
-- v2.0.175 (2026-10-02): 'power off the tv' never arms JARVIS's own shutdown, a reply saying 'always listening' never leaves wake-word mode, and standby wakes only on the name or a bare wake phrase (July audit A28, A37, A29)
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
