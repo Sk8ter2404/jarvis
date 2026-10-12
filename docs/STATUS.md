@@ -6,7 +6,7 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 - Version: v2.0.184
 - Live since: 2026-10-12
-- Latest change: v2.0.184: no false 'print complete' announcements; new HUMOR_MODE setting (dry or sarcastic).
+- Latest change: v2.0.184 (live 10-12 16:02, check passed 16:33): no false 'print complete' announcements; new HUMOR_MODE setting (dry or sarcastic). v2.0.183 (live 15:24, passed 15:55).
 
 ## In progress
 
@@ -16,37 +16,36 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 - Per-camera flap counter
 - Boot proof and long live diagnostics
 - Speed plan: enabling each speed feature one at a time with before and after measurements
+- Next release: media-aware audio switching, an optional boost that sends hard turns to a cloud model, privacy fixes, and a slimmer brain prompt
+- Planned: a two-way chat bot for alerts, a shopping list for reminders, easier air-mouse engage, useful Kinect gestures, batched background learning, and repo cleanup of unused code
 
 ## Roadmap
 
 Open, planned and idea items. Wording is generic on purpose.
 
-### In progress (8)
+### In progress (7)
 
 - No more bugs on JARVIS or the robot. In progress.
 - Make FEATURES.md match reality. In progress.
 - Fix the leftover findings from the July 4 audit. In progress.
 - Prepare the answer while 'processing' plays. In progress.
-- Searchable screen memory. In progress.
 - Stop the robot repeating the same jokes. In progress.
 - Turn checker: retry a bad local answer on Claude. In progress.
 - Test-order leak between two test files. In progress.
 
-### Planned next (6)
+### Planned next (9)
 
 - Make sure queued speech is never lost. Planned next.
 - Small engineering follow-ups. Planned next.
 - Kinect sees ghost skeletons. Planned next.
 - Refresh the big mission prompt. Planned next.
 - Better memory search models. Planned next.
+- Searchable screen memory. Planned next.
 - Show clearly on the VRAM bar when settings go over the limit. Planned next.
+- Air mouse is slow to take the cursor. Planned next.
+- JARVIS cleanup overhaul. Planned next.
 
-### Open, needs a decision (2)
-
-- Keep the new Ollama setup or go back. Open: waiting on a design decision.
-- JARVIS reacts when the robot is picked up or shaken. Open: waiting on a design decision.
-
-### Ideas (18)
+### Ideas (23)
 
 - Leaner local brain prompt. Idea, not started.
 - Speak the first sentence sooner. Idea, not started.
@@ -59,6 +58,11 @@ Open, planned and idea items. Wording is generic on purpose.
 - Tell apart several people talking in the room. Idea, not started.
 - Long-running missions with check-ins. Idea, not started.
 - Fine-tune the brain on its own logs. Idea, not started.
+- Turn on by itself when USB is plugged in. Idea, not started.
+- Drive safety tests on the stand. Idea, not started.
+- Let the robot explore the desk on command. Idea, not started.
+- Banter mode that keeps them chatting. Idea, not started.
+- JARVIS reacts when the robot is picked up or shaken. Idea, not started.
 - Robot mood and 'age', with eyes on the web page. Idea, not started.
 - Games where the robot is a sore loser. Idea, not started.
 - Distance, gesture and screen-eye modules. Idea, not started.
