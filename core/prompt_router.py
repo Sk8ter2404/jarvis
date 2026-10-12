@@ -1738,16 +1738,32 @@ def documented_actions(text: str, known=None) -> List[str]:
         return []
 
 
-def split_skill_examples(block: str) -> List[Tuple[str, str]]:
+def _skill_part_name(txt: str) -> str:
+    first = txt.split("\n", 1)[0]
+    return re.split(r"[(:]", first, 1)[0].strip() or first.strip()
+
+
+def split_skill_examples(block: str,
+                         skill_texts=None) -> List[Tuple[str, str]]:
     """Split a skill-examples block (the monolith's
     _skill_prompt_examples_block: blank lines, an intro line, then each
     skill's PROMPT_EXAMPLES text joined by newlines) into
-    ``[(name, text), ...]``. A part starts at a column-0 line that opens with
-    an upper-case letter; its name is that line up to the first '(' or ':'.
-    Never raises; on a fault the whole block is one part."""
+    ``[(name, text), ...]``.
+
+    ``skill_texts`` (optional): the per-skill texts the block was joined
+    from, in order. When the block ends with exactly their join, each skill
+    is one part - the real boundary, whatever its lines look like (review
+    2026-10-12: a column-0 "NOTE: ..." line inside one skill split it in two
+    and an indented first line merged the next skill into it). Otherwise a
+    part starts at a column-0 line that opens with an upper-case letter.
+    A part's name is its first line up to the first '(' or ':'. Never
+    raises; on a fault the whole block is one part."""
     if not block or not block.strip():
         return []
     try:
+        texts_in = [str(t) for t in (skill_texts or ()) if str(t).strip()]
+        if texts_in and block.endswith("\n" + "\n".join(texts_in)):
+            return [(_skill_part_name(t), t) for t in texts_in]
         lines = block.split("\n")
         i = 0
         while i < len(lines) and not lines[i].strip():
@@ -1763,18 +1779,14 @@ def split_skill_examples(block: str) -> List[Tuple[str, str]]:
             cur.append(ln)
         if cur:
             texts.append("\n".join(cur))
-        named: List[Tuple[str, str]] = []
-        for txt in texts:
-            first = txt.split("\n", 1)[0]
-            name = re.split(r"[(:]", first, 1)[0].strip() or first.strip()
-            named.append((name, txt))
-        return named
+        return [(_skill_part_name(txt), txt) for txt in texts]
     except Exception:
         return [("SKILL ACTIONS", block)]
 
 
 def slim_stable_pc_block(pc_control: str, skill_block: str = "",
-                         known=None, exclude=None, group=None) -> str:
+                         known=None, exclude=None, group=None,
+                         skill_texts=None) -> str:
     """The SLIM byte-stable PC block: the core preamble + the always-on
     sections (as stable_pc_block) + an ACTION INDEX naming every action the
     full PC_CONTROL text and ``skill_block`` document, under the capability
@@ -1783,8 +1795,9 @@ def slim_stable_pc_block(pc_control: str, skill_block: str = "",
     SELF_TERMINATING_ACTIONS) are never listed. ``group`` (optional dict:
     action name -> its handler's identity) lists one name per handler: an
     alias of a name already listed or in the head runs the very same code,
-    so it is left out. Every section header is listed, with or without
-    actions, so no capability vanishes. Pure function of its inputs. Never raises: a fault falls back to
+    so it is left out. ``skill_texts``: see split_skill_examples. Every
+    section header is listed, with or without actions, so no capability
+    vanishes. Pure function of its inputs. Never raises: a fault falls back to
     stable_pc_block."""
     try:
         excl = set(SELF_TERMINATING_ACTIONS if exclude is None else exclude)
@@ -1800,7 +1813,7 @@ def slim_stable_pc_block(pc_control: str, skill_block: str = "",
         rows: List[str] = []
         groups = [(h.strip(), b) for h, b in sections
                   if h.strip().upper() not in pinned]
-        groups += split_skill_examples(skill_block)
+        groups += split_skill_examples(skill_block, skill_texts)
         for name, body in groups:
             acts = []
             for a in documented_actions(body, known):
@@ -1913,7 +1926,7 @@ def router_miss(actions, routed_text: str, stable_text: str) -> List[str]:
 
 
 def section_for_action(pc_control: str, name: str, skill_block: str = "",
-                       known=None) -> str:
+                       known=None, skill_texts=None) -> str:
     """The full text of the first PC_CONTROL section (or skill-examples part)
     that documents action ``name``, '' when none does. A [router-miss]
     appends it to the turn's routed text so a follow-up round of the same
@@ -1923,7 +1936,8 @@ def section_for_action(pc_control: str, name: str, skill_block: str = "",
             return ""
         known = set(known or ()) | {name}
         _core, sections = split_pc_control(pc_control)
-        for _h, body in list(sections) + split_skill_examples(skill_block):
+        for _h, body in (list(sections)
+                         + split_skill_examples(skill_block, skill_texts)):
             if name in documented_actions(body, known):
                 return body
         return ""
@@ -1932,11 +1946,15 @@ def section_for_action(pc_control: str, name: str, skill_block: str = "",
 
 
 _OWNER_MEMORY_RE = re.compile(
-    r"\b(?:what (?:else )?do you (?:know|remember) about me"
-    r"|what have you (?:learned|learnt|picked up) about me"
-    r"|what do you know about (?:your owner|myself)"
-    r"|tell me (?:about myself|what you know about me)"
-    r"|how well do you know me)\b")
+    r"\b(?:what (?:else )?(?:do|did) you (?:know|remember|recall)"
+    r" (?:about|of) (?:me|myself|your owner)"
+    r"|what (?:else )?have you (?:learned|learnt|picked up|figured out"
+    r"|got|gathered|noticed) (?:about|on|of) me"
+    r"|what(?:'s| is) on file (?:about|for|on) me"
+    r"|tell me (?:about myself|(?:everything |all |what )(?:else )?you "
+    r"(?:know|remember) about me)"
+    r"|how (?:well|much) do you know (?:me|about me)"
+    r"|do you (?:know|remember) anything about me)\b")
 
 
 def is_owner_memory_request(user_text: str) -> bool:

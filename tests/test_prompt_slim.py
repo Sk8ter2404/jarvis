@@ -146,6 +146,33 @@ class SkillExampleRoutingTests(unittest.TestCase):
         self.assertIn("launch_gadget", got[0])
 
 
+    def test_split_on_the_per_skill_boundary_when_given(self):
+        # A column-0 continuation line in one skill's text ("NOTE: ...") and
+        # an indented first line in the next must not move the boundary: the
+        # per-skill texts decide it (review finding 4, 2026-10-12).
+        plex = ("PLEX CONTROL:\n  plex_play - fire on 'play the movie'.\n"
+                "NOTE: plex_pause needs a title. Fire on 'pause plex'.")
+        lamp = "  lamp_on - fire on 'lamp on'."
+        block = ("\n\nADDITIONAL SKILL ACTIONS (same contract as above):\n"
+                 + plex + "\n" + lamp)
+        heur = pr.split_skill_examples(block)
+        self.assertEqual([n for n, _t in heur], ["PLEX CONTROL", "NOTE"])
+        parts = pr.split_skill_examples(block, [plex, lamp])
+        self.assertEqual([t for _n, t in parts], [plex, lamp])
+        self.assertEqual(parts[0][0], "PLEX CONTROL")
+        self.assertEqual(pr.select_skill_examples("play the movie", parts),
+                         [plex])
+        # Texts that are not this block's fall back to the heuristic.
+        self.assertEqual(pr.split_skill_examples(block, ["other"]), heur)
+        self.assertIn("plex_pause",
+                      pr.slim_stable_pc_block(PC_CONTROL_PROMPT, block,
+                                              known={"plex_pause"},
+                                              skill_texts=[plex, lamp]))
+        self.assertEqual(pr.section_for_action(PC_CONTROL_PROMPT, "plex_pause",
+                                               block, skill_texts=[plex, lamp]),
+                         plex)
+
+
 class LearnedLinesTests(unittest.TestCase):
     def test_relevant_lines(self):
         lines = ["- 2026-10-12 (desk): the rover build",
@@ -161,9 +188,17 @@ class LearnedLinesTests(unittest.TestCase):
     def test_owner_memory_request(self):
         for t in ("Jarvis, what do you know about me?",
                   "what have you learned about me so far",
-                  "How well do you know me"):
+                  "How well do you know me",
+                  "tell me everything you know about me",
+                  "what do you know of me",
+                  "what have you got on me",
+                  "what do you remember of me",
+                  "what else have you learned about me"):
             self.assertTrue(pr.is_owner_memory_request(t), t)
-        for t in ("what do you know about printers", "play music", ""):
+        for t in ("what do you know about printers", "play music", "",
+                  "what have you got on the calendar",
+                  "tell me everything you know about rovers",
+                  "forget everything you know about me"):
             self.assertFalse(pr.is_owner_memory_request(t), t)
 
 

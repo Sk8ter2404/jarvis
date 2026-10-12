@@ -293,6 +293,68 @@ class PerTurnTests(_Base):
                          self._user(self._turn("tell me a joke")))
 
 
+class ReviewFindingTests(_Base):
+    """Review of e9e3e93 (2026-10-12): each test failed before its fix."""
+
+    def test_a_mode_addendum_keeps_the_learned_hints(self):
+        # skills/dnd_focus_mode (and night-owl / workshop) append an addendum
+        # to the live _system_prompt; the blocks' build is still its prefix.
+        bc = self.bc
+        bc._system_prompt = bc._system_prompt + "\n\n[Focus mode]\nBe brief."
+        self.assertIn("Sheldon",
+                      self._user(self._turn("what is my tortoise called")))
+        u = self._user(self._turn("what do you know about me"))
+        self.assertIn("Owner fact 119:", u)
+        # A different build (not a prefix) still sends no stale hints.
+        bc._system_prompt = "something else entirely"
+        self.assertEqual(bc._slim_turn_hints("my tortoise", ""), "")
+
+    def test_a_huge_fact_list_is_capped_not_dropped(self):
+        bc = self.bc
+        self._live(_memory(bc, n_facts=300))
+        out = io.StringIO()
+        self.posted.clear()
+        bc.conversation_history[:] = []
+        with contextlib.redirect_stdout(out):
+            bc._call_llm("what do you know about me")
+        self.assertNotIn("learned hints", out.getvalue())
+        u = self._user(self.posted[0])
+        # Newest facts ride, oldest are cut, and the model is told so.
+        self.assertIn("Sheldon", u)
+        self.assertIn("Owner fact 299:", u)
+        self.assertNotIn("Owner fact 0:", u)
+        self.assertIn("older facts not shown", u)
+        self.assertLessEqual(
+            self._tok(bc._slim_turn_hints("what do you know about me", "")),
+            bc._SLIM_FACTS_MAX_TOKENS + 40)
+        # 120 facts still all ride.
+        self._live(_memory(bc))
+        u = self._user(self._turn("what do you know about me"))
+        self.assertIn("Owner fact 0:", u)
+        self.assertNotIn("older facts not shown", u)
+
+    def test_follow_up_round_keeps_the_learned_hints(self):
+        bc = self.bc
+        self._turn("what is my tortoise called")
+        self.posted.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.get_followup_response([("get_time", "It is noon.")])
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("Sheldon", self._user(self.posted[0]))
+        self.assertNotIn("Sheldon", self._sys(self.posted[0]))
+
+    def test_skill_with_a_column0_note_routes_whole(self):
+        bc = self.bc
+        plex = ("PLEX CONTROL:\n  plex_play - fire on 'play the movie'.\n"
+                "NOTE: plex_pause needs a title. Fire on 'pause plex'.")
+        self._p(bc, "_SKILL_PROMPT_EXAMPLES",
+                {"aa_plex": plex, "bb_lamp": "  lamp_on - fire on 'lamp on'."})
+        self._live(_memory(bc))
+        u = self._user(self._turn("play the movie"))
+        self.assertIn("NOTE: plex_pause needs a title", u)
+        self.assertNotIn("lamp_on - fire", u)
+
+
 class OffModeTests(_Base):
     def test_off_sends_the_previous_layout(self):
         bc = self.bc
