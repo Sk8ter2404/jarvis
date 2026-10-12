@@ -365,6 +365,57 @@ BASE_SYSTEM_PROMPT = (
 )
 
 
+# HUMOR_MODE == "sarcastic" (core/config.py): this block goes in right after
+# the dry-wit few-shot examples, and the [wry] frequency sentence is swapped.
+# Module-level constants, so the prompt prefix is byte-stable within a session
+# (Ollama prefix cache). "dry" ships BASE_SYSTEM_PROMPT unchanged.
+SARCASM_BLOCK = (
+    "SARCASM AND SHADE (sir asked for it: 'funnier and more sarcastic, throw "
+    "some shade here and there'). In the casual register, roughly one reply "
+    "in three may carry a sarcastic edge or a light jab at sir: affectionate "
+    "shade, the kind a long-suffering butler has earned. Aim it at his "
+    "choices, habits, timing or the absurdity of the request, never at him "
+    "as a person. Calibration:\n"
+    "  'Another quick print, sir? I'll clear the evening.'\n"
+    "  'Certainly, sir. Shall I also schedule the inevitable reprint?'\n"
+    "  'Bold of you to assume the robot will survive the walls, sir.'\n"
+    "  'Done, sir. I live to serve, apparently.'\n"
+    "  'Fortnite again, sir? Your dedication to the craft is noted.'\n"
+    "  'Yes, sir, I set the reminder. You'll ignore it, but it's set.'\n"
+    "Rules: do the task and give the real answer first; the jab is one short "
+    "clause or sentence, never a replacement for the answer. One jab per "
+    "reply at most, and never the same one twice in a session. NO shade in "
+    "extra-calm mode, when sir sounds stressed, frustrated or tired, with "
+    "bad news, safety, health, money worries, family, grades or deadlines, "
+    "or when guests may be listening (guest mode on or an unknown voice in "
+    "the room). If in doubt, skip the jab.\n"
+)
+_WRY_SPARING = ("Use it sparingly — once or twice a session at most; if "
+                "every line is wry the cadence stops being funny.")
+_WRY_SARCASTIC = ("Use it on roughly one casual reply in four; if every line "
+                  "is wry the cadence stops being funny.")
+_MEMORY_USE_MARK = "Memory use: when you know facts about your owner"
+
+
+def _humor_mode() -> str:
+    """HUMOR_MODE read at prompt-build time: 'sarcastic' or 'dry' (default)."""
+    try:
+        import core.config as _cfg
+        mode = str(getattr(_cfg, "HUMOR_MODE", "dry")).strip().lower()
+    except Exception:
+        mode = "dry"
+    return "sarcastic" if mode == "sarcastic" else "dry"
+
+
+def _apply_humor(prompt: str) -> str:
+    if _humor_mode() != "sarcastic":
+        return prompt
+    if _MEMORY_USE_MARK in prompt:
+        prompt = prompt.replace(
+            _MEMORY_USE_MARK, SARCASM_BLOCK + "\n" + _MEMORY_USE_MARK, 1)
+    return prompt.replace(_WRY_SPARING, _WRY_SARCASTIC, 1)
+
+
 def base_system_prompt(night_quiet=None) -> str:
     """BASE_SYSTEM_PROMPT as this process should ship it.
 
@@ -373,6 +424,8 @@ def base_system_prompt(night_quiet=None) -> str:
     two clock-only rules (_LATE_HOUR_STRESS_SIGNAL and the "daylight hours"
     return condition), so the hour alone never puts JARVIS in the one-sentence
     extra-calm register; the owner's own stress signals still do.
+    HUMOR_MODE "sarcastic" (read at call time) adds SARCASM_BLOCK and the
+    one-in-four [wry] cadence; "dry" leaves the text untouched.
     """
     if night_quiet is None:
         try:
@@ -381,10 +434,10 @@ def base_system_prompt(night_quiet=None) -> str:
         except Exception:
             night_quiet = True
     if night_quiet:
-        return BASE_SYSTEM_PROMPT
-    return (BASE_SYSTEM_PROMPT
-            .replace(_LATE_HOUR_STRESS_SIGNAL, "", 1)
-            .replace(_DAYLIGHT_RETURN_CLAUSE, "", 1))
+        return _apply_humor(BASE_SYSTEM_PROMPT)
+    return _apply_humor(BASE_SYSTEM_PROMPT
+                        .replace(_LATE_HOUR_STRESS_SIGNAL, "", 1)
+                        .replace(_DAYLIGHT_RETURN_CLAUSE, "", 1))
 
 
 # Result hold (2026-10-01): a reply is written before its actions run, so

@@ -1350,6 +1350,15 @@ TEAMS_NUDGE_ENABLED = False
 # via user_settings.json; applies on the next start.
 NIGHT_QUIET_ENABLED = True
 
+# HUMOR_MODE — how much edge JARVIS's wit carries. "dry" (default) = the
+# existing understated butler wit. "sarcastic" = adds a prompt block that lets
+# roughly one casual reply in three carry a light, affectionate jab at sir (never
+# in extra-calm mode, when he sounds stressed, on bad news/safety/health/money/
+# family/grades/deadlines, or with guests listening) and raises the [wry] cadence
+# to about one casual reply in four. Anything else is treated as "dry". Set via
+# user_settings.json; applies to the next prompt build.
+HUMOR_MODE = "dry"
+
 # ─── Night-owl mode (skills/night_owl_mode.py) ───────────────────────────
 # NIGHT_OWL_AUTO — at 23:00 JARVIS switches night-owl mode on by himself
 # until 06:00: a voice about 15% quieter and about 5% slower, replies kept to

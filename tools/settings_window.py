@@ -666,6 +666,15 @@ SCHEMA: dict[str, dict] = {
                 "commands always get through. 0 = no hold. Applies on the "
                 "next start.",
     },
+    "HUMOR_MODE": {
+        "tab": "voice", "label": "Humour style", "type": "enum",
+        "choices": ["dry", "sarcastic"], "default": "dry",
+        "help": "dry = the understated butler wit. sarcastic = funnier, with "
+                "the occasional affectionate jab at you (about one casual "
+                "reply in three); never when you sound stressed or tired, on "
+                "bad news, safety, health, money, family, grades or "
+                "deadlines, or with guests listening.",
+    },
     "NIGHT_QUIET_ENABLED": {
         "tab": "voice", "label": "Quieter voice at night (by the clock)",
         "type": "bool", "default": True,
@@ -2252,6 +2261,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Device dialogues", ["SKILL_ROUTES_ENABLED", "DIALOGUE_ENABLED",
                               "DIALOGUE_MAX_S", "DIALOGUE_STOP_LISTEN",
                               "DIALOGUE_BEAT_S", "DIALOGUE_LOST_HOLD_S"]),
+        ("Personality", ["HUMOR_MODE"]),
         ("At night", ["NIGHT_QUIET_ENABLED", "NIGHT_OWL_AUTO"]),
     ],
     "hearing": [
