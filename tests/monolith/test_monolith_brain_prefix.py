@@ -328,7 +328,9 @@ class StageAReprimeTests(_Base):
                     conversation_count=771))
         self._once()
         self.assertEqual(len(self.posted), 1)
-        self.assertIn("A freshly learned fact",
+        # The learned tail's last line: in the cached prompt under either
+        # PROMPT_SLIM_MODE (slim moves the facts themselves to the turn).
+        self.assertIn("across 771 conversations",
                       self.posted[0]["messages"][0]["content"])
 
     def test_a_new_head_is_primed_again(self):

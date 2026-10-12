@@ -85,6 +85,7 @@
   "RAG_ENABLED": true,
   "LTM_ENABLED": true,
   "PROMPT_FREEZE_QUIET_S": 30.0,
+  "PROMPT_SLIM_MODE": "on",
   "LOCAL_PREFIX_REPRIME": true,
   "FAST_PATHS_ENABLED": true,
   "INSTANT_ACTIONS_MODE": "shadow",
