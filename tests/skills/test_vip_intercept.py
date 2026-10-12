@@ -1,9 +1,9 @@
-"""Logic tests for skills/vip_intercept.py — the Wayne draft-and-send flow.
+"""Logic tests for skills/vip_intercept.py — the Riley draft-and-send flow.
 
 The regression these exist for (2026-08-20 bug-hunt, H-2):
 
   ``send_vip_reply`` typed the queued reply into Teams with pyautogui,
-  pressed Ctrl+Enter, then returned **"Sent the reply to Wayne, sir."** and
+  pressed Ctrl+Enter, then returned **"Sent the reply to Riley, sir."** and
   destroyed the draft with ``_write_pending(None)`` — on nothing but "the
   keystroke calls did not raise". Its own helper docstring conceded the
   keystrokes "DOES NOT verify Teams accepted them" and then promised "a
@@ -23,7 +23,7 @@ The regression these exist for (2026-08-20 bug-hunt, H-2):
     • every not-confirmed line must carry a live FAILURE_MARKER so it routes
       to the failure follow-up instead of reading like a success.
 
-Nothing here touches the live ``data/wayne_pending_reply.json`` — every test
+Nothing here touches the live ``data/riley_pending_reply.json`` — every test
 repoints ``_PENDING_FILE`` at a temp dir.
 
 The background monitor thread never starts (harness neuters threads).
@@ -88,16 +88,16 @@ class _VipInterceptBase(unittest.TestCase):
         self.mod, self.actions = load_skill_isolated("vip_intercept")
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.pending_file = os.path.join(self._tmp.name, "wayne_pending_reply.json")
+        self.pending_file = os.path.join(self._tmp.name, "riley_pending_reply.json")
         patcher = mock.patch.object(self.mod, "_PENDING_FILE", self.pending_file)
         patcher.start()
         self.addCleanup(patcher.stop)
 
     # ── helpers ──────────────────────────────────────────────────────────
-    def queue(self, body="Sorry Wayne — in a 1:1, call you at 3.", **extra):
+    def queue(self, body="Sorry Riley — in a 1:1, call you at 3.", **extra):
         rec = {
             "ts": self.mod.time.time(),
-            "to": "Wayne",
+            "to": "Riley",
             "subject": "Teams reply",
             "body": body,
             "kind": "dm",
@@ -131,7 +131,7 @@ class UnverifiedSendTests(_VipInterceptBase):
 
     def test_unverified_dispatch_does_not_claim_a_send(self):
         # Keystrokes went out; nothing corroborated them. The old code said
-        # "Sent the reply to Wayne, sir." here.
+        # "Sent the reply to Riley, sir." here.
         self.queue()
         out, _, _ = self._send(self.mod.SEND_DISPATCHED, self.mod.SEND_UNVERIFIED)
         self.assertNotIn("Sent the reply", out)
@@ -174,7 +174,7 @@ class UnverifiedSendTests(_VipInterceptBase):
     def test_confirmed_send_clears_the_draft_and_claims_it(self):
         self.queue()
         out, _, _ = self._send(self.mod.SEND_DISPATCHED, self.mod.SEND_CONFIRMED)
-        self.assertEqual(out, "Sent the reply to Wayne, sir.")
+        self.assertEqual(out, "Sent the reply to Riley, sir.")
         self.assertIsNone(self.on_disk(),
                           "a CONFIRMED send is the only thing that may clear it")
         self.assertFalse(_is_failure_line(out),
@@ -196,7 +196,7 @@ class UnverifiedSendTests(_VipInterceptBase):
 
     def test_no_draft_is_reported_plainly(self):
         self.assertEqual(self.actions["send_vip_reply"](""),
-                         "No Wayne reply queued, sir.")
+                         "No Riley reply queued, sir.")
 
     def test_every_not_confirmed_outcome_carries_a_marker(self):
         combos = [
@@ -287,17 +287,17 @@ class SendTargetTests(_VipInterceptBase):
     def test_ring_toast_is_never_a_send_target(self):
         # A ringing-call window has no compose box: typing there dispatches
         # keystrokes that go nowhere while every call still "succeeds". The
-        # designed flow drafts a reply WHILE Wayne is ringing, so this is the
+        # designed flow drafts a reply WHILE Riley is ringing, so this is the
         # common case, not an exotic one.
-        ring = _FakeWindow("Wayne A. Example is calling you | Microsoft Teams")
-        chat = _FakeWindow("Chat | Wayne A. Example | Microsoft Teams", hwnd=2)
+        ring = _FakeWindow("Riley A. Example is calling you | Microsoft Teams")
+        chat = _FakeWindow("Chat | Riley A. Example | Microsoft Teams", hwnd=2)
         got = self._candidates([ring, chat], proc="ms-teams.exe")
         self.assertEqual(got, [chat])
 
     def test_every_ring_hint_is_excluded(self):
         for hint in self.mod.TEAMS_RING_TITLE_HINTS:
             with self.subTest(hint=hint):
-                w = _FakeWindow(f"Wayne {hint} | Microsoft Teams")
+                w = _FakeWindow(f"Riley {hint} | Microsoft Teams")
                 self.assertEqual(self._candidates([w], proc="ms-teams.exe"), [])
 
     def test_bare_teams_title_is_not_enough(self):
@@ -307,13 +307,13 @@ class SendTargetTests(_VipInterceptBase):
         self.assertEqual(self._candidates([w], proc=""), [])
 
     def test_browser_window_titled_teams_is_vetoed_by_process(self):
-        w = _FakeWindow("Chat | Wayne | Microsoft Teams - Google Chrome")
+        w = _FakeWindow("Chat | Riley | Microsoft Teams - Google Chrome")
         self.assertEqual(self._candidates([w], proc="chrome.exe"), [])
 
     def test_unattributable_window_falls_back_to_the_title_rule(self):
         # '' from _window_proc_name means "could not resolve", not "not
         # Teams" — it must not silently disqualify a real Teams window.
-        w = _FakeWindow("Chat | Wayne | Microsoft Teams")
+        w = _FakeWindow("Chat | Riley | Microsoft Teams")
         self.assertEqual(self._candidates([w], proc=""), [w])
 
     def test_refused_foreground_change_is_not_treated_as_focused(self):
@@ -321,7 +321,7 @@ class SendTargetTests(_VipInterceptBase):
         # refuses the foreground change (and teams_screener's fallback path
         # returns True from a bare minimize/restore). Typing after that lands
         # the owner's reply in whatever is actually in front.
-        w = _FakeWindow("Chat | Wayne | Microsoft Teams")
+        w = _FakeWindow("Chat | Riley | Microsoft Teams")
         fake_gw = mock.MagicMock(name="pygetwindow")
         fake_gw.getAllWindows.return_value = [w]
         with mock.patch.dict(sys.modules, {"pygetwindow": fake_gw}), \
@@ -330,7 +330,7 @@ class SendTargetTests(_VipInterceptBase):
             self.assertFalse(self.mod._focus_teams_for_send())
 
     def test_confirmed_foreground_change_is_accepted(self):
-        w = _FakeWindow("Chat | Wayne | Microsoft Teams", minimized=True)
+        w = _FakeWindow("Chat | Riley | Microsoft Teams", minimized=True)
         fake_gw = mock.MagicMock(name="pygetwindow")
         fake_gw.getAllWindows.return_value = [w]
         with mock.patch.dict(sys.modules, {"pygetwindow": fake_gw}), \
@@ -344,7 +344,7 @@ class SendTargetTests(_VipInterceptBase):
         # None = "this build can't tell". We still type, but the send is then
         # gated by the vision check, so an unknown focus can only ever produce
         # an honest "couldn't confirm" — never a false "Sent".
-        w = _FakeWindow("Chat | Wayne | Microsoft Teams")
+        w = _FakeWindow("Chat | Riley | Microsoft Teams")
         fake_gw = mock.MagicMock(name="pygetwindow")
         fake_gw.getAllWindows.return_value = [w]
         with mock.patch.dict(sys.modules, {"pygetwindow": fake_gw}), \
@@ -394,7 +394,7 @@ class SendTargetTests(_VipInterceptBase):
         self.assertEqual(self.mod._window_proc_name(object()), "")
 
     def test_wait_for_foreground_tri_state(self):
-        w = _FakeWindow("Chat | Wayne | Microsoft Teams", hwnd=4242)
+        w = _FakeWindow("Chat | Riley | Microsoft Teams", hwnd=4242)
         with mock.patch.object(self.mod, "_foreground_hwnd", return_value=4242):
             self.assertIs(self.mod._wait_for_foreground(w, timeout_s=0.0), True)
         with mock.patch.object(self.mod, "_foreground_hwnd", return_value=99):
@@ -418,7 +418,7 @@ class VerificationTests(_VipInterceptBase):
         else:
             del bc.ask_vision
         with mock.patch.object(self.mod, "_import_companion", return_value=bc):
-            return self.mod._verify_send_landed("hello Wayne")
+            return self.mod._verify_send_landed("hello Riley")
 
     def test_yes_confirms(self):
         self.assertEqual(self._verify("YES"), self.mod.SEND_CONFIRMED)
@@ -480,31 +480,31 @@ class DraftStoreHonestyTests(_VipInterceptBase):
              mock.patch.object(self.mod, "_queue_draft", return_value=False), \
              mock.patch.object(self.mod, "_speak_now",
                                side_effect=lambda t, **k: spoken.append(t)):
-            self.assertFalse(self.mod.handle_call({"name": "Wayne"}))
+            self.assertFalse(self.mod.handle_call({"name": "Riley"}))
         self.assertTrue(spoken)
-        self.assertNotIn("I've drafted a reply for Wayne", " ".join(spoken))
+        self.assertNotIn("I've drafted a reply for Riley", " ".join(spoken))
 
     def test_handle_dm_does_not_announce_a_draft_it_could_not_queue(self):
         spoken = []
         with mock.patch.object(self.mod, "_maybe_engage", return_value=True), \
-             mock.patch.object(self.mod, "_extract_wayne_message",
+             mock.patch.object(self.mod, "_extract_riley_message",
                                return_value="got 5 min?"), \
              mock.patch.object(self.mod, "_draft_reply", return_value="a reply"), \
              mock.patch.object(self.mod, "_queue_draft", return_value=False), \
              mock.patch.object(self.mod, "_speak_now",
                                side_effect=lambda t, **k: spoken.append(t)):
-            self.assertFalse(self.mod.handle_dm({"name": "Wayne"}))
+            self.assertFalse(self.mod.handle_dm({"name": "Riley"}))
         self.assertNotIn("I've drafted a reply, sir", " ".join(spoken))
 
     def test_handle_dm_announces_a_draft_it_did_queue(self):
         spoken = []
         with mock.patch.object(self.mod, "_maybe_engage", return_value=True), \
-             mock.patch.object(self.mod, "_extract_wayne_message",
+             mock.patch.object(self.mod, "_extract_riley_message",
                                return_value="got 5 min?"), \
              mock.patch.object(self.mod, "_draft_reply", return_value="a reply"), \
              mock.patch.object(self.mod, "_speak_now",
                                side_effect=lambda t, **k: spoken.append(t)):
-            self.assertTrue(self.mod.handle_dm({"name": "Wayne"}))
+            self.assertTrue(self.mod.handle_dm({"name": "Riley"}))
         self.assertIn("I've drafted a reply, sir", " ".join(spoken))
         self.assertEqual(self.on_disk()["body"], "a reply")
 
@@ -519,12 +519,12 @@ class DraftStoreHonestyTests(_VipInterceptBase):
     def test_scrap_clears_and_says_so(self):
         self.queue()
         self.assertEqual(self.actions["scrap_vip_reply"](""),
-                         "Scrapped the Wayne reply, sir.")
+                         "Scrapped the Riley reply, sir.")
         self.assertIsNone(self.on_disk())
 
     def test_ttl_never_reaps_an_unverified_send(self):
         # This record is the ONLY trace that a message may or may not have
-        # reached Wayne. Letting the 5-minute TTL eat it silently would put
+        # reached Riley. Letting the 5-minute TTL eat it silently would put
         # us right back to losing the draft.
         old = self.mod.time.time() - (self.mod.DRAFT_TTL_SECONDS + 60)
         self.queue(ts=old, state=self.mod.DRAFT_STATE_UNVERIFIED)
@@ -550,7 +550,7 @@ class DraftStoreHonestyTests(_VipInterceptBase):
     def test_status_reads_an_ordinary_draft_normally(self):
         self.queue()
         out = self.actions["vip_intercept_status"]("")
-        self.assertIn("Wayne reply queued", out)
+        self.assertIn("Riley reply queued", out)
         self.assertNotIn("NOT confirmed", out)
 
     def test_queue_draft_stamps_the_queued_state(self):
@@ -562,10 +562,10 @@ class DraftStoreHonestyTests(_VipInterceptBase):
     def test_gate_adapter_still_sees_the_shape_it_expects(self):
         # core/draft_preview_gate reads to/subject/body — the new lifecycle
         # fields must not disturb it.
-        self.queue(body="hello Wayne")
+        self.queue(body="hello Riley")
         self.assertEqual(self.mod.get_pending_draft(),
-                         {"to": "Wayne", "subject": "Teams reply",
-                          "body": "hello Wayne"})
+                         {"to": "Riley", "subject": "Teams reply",
+                          "body": "hello Riley"})
 
 
 if __name__ == "__main__":

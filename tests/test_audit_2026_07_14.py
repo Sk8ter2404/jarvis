@@ -1574,7 +1574,7 @@ class TeamsNoDeclineAfterOutOfBandAnswerTests(unittest.TestCase):
     def test_grace_thread_does_not_decline_an_ended_call(self):
         import time as _t
         mod = self.mod
-        vip = {"name": "Wayne", "priority": True}
+        vip = {"name": "Riley", "priority": True}
         sent = mock.Mock(return_value=True)
         with mock.patch.object(mod, "_send_teams_hotkey", sent), \
              mock.patch.object(mod, "_pause_music_via_main", return_value=True), \
@@ -1590,13 +1590,13 @@ class TeamsNoDeclineAfterOutOfBandAnswerTests(unittest.TestCase):
     def test_grace_thread_still_declines_a_genuinely_unanswered_call(self):
         import time as _t
         mod = self.mod
-        vip = {"name": "Wayne", "priority": True}
+        vip = {"name": "Riley", "priority": True}
         sent = mock.Mock(return_value=True)
         with mock.patch.object(mod, "_send_teams_hotkey", sent), \
              mock.patch.object(mod, "_pause_music_via_main", return_value=True), \
              mock.patch.object(mod, "_enqueue_speech"), \
              mock.patch.object(mod, "_detect",
-                               return_value=("call", vip, "Wayne | Microsoft Teams")):
+                               return_value=("call", vip, "Riley | Microsoft Teams")):
             mod._arm_call(vip)
             mod._vip_priority_handler(vip)
             _t.sleep(0.5)
