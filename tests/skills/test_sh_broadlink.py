@@ -22,11 +22,25 @@ class FakeHub:
         self._learn_data = learn_data
         self._auth_raises = auth_raises
         self.sweeps = 0
+        # python-broadlink 0.19 shape: check_frequency() -> (found, MHz),
+        # find_rf_packet(frequency=None).
+        self.freq_reads = list(rf) if isinstance(rf, (list, tuple)) else [(True, 433.92)]
+        self.rf_packet_freq = "unset"
+        self.cancelled = False
         if rf:
             self.sweep_frequency = self._sweep
-            self.check_frequency = lambda: True
-            self.find_rf_packet = lambda: None
-            self.cancel_sweep_frequency = lambda: None
+            self.check_frequency = self._check_frequency
+            self.find_rf_packet = self._find_rf_packet
+            self.cancel_sweep_frequency = self._cancel
+
+    def _check_frequency(self):
+        return self.freq_reads.pop(0) if len(self.freq_reads) > 1 else self.freq_reads[0]
+
+    def _find_rf_packet(self, frequency=None):
+        self.rf_packet_freq = frequency
+
+    def _cancel(self):
+        self.cancelled = True
 
     def _sweep(self):
         self.sweeps += 1
@@ -211,6 +225,24 @@ class LearnTests(BroadlinkBase):
         self.assertIn("RF code", out)
         self.assertEqual(hub.sweeps, 1)
         self.assertEqual(self.mod._load_codes()["garage"]["type"], "rf")
+
+    def test_learn_rf_waits_for_a_real_lock_and_passes_the_frequency(self):
+        # (False, 0.0) is a truthy tuple: it must NOT count as a lock.
+        hub = FakeHub(learn_data=b"RF",
+                      rf=[(False, 0.0), (False, 0.0), (True, 315.0)])
+        self.use([hub])
+        out = self.mod.learn("gate", kind="rf", _sleep=lambda s: None)
+        self.assertIn("RF code", out)
+        self.assertEqual(hub.rf_packet_freq, 315.0)
+
+    def test_learn_rf_with_no_lock_learns_nothing(self):
+        hub = FakeHub(learn_data=b"RF", rf=[(False, 0.0)])
+        self.use([hub])
+        out = self.mod.learn("gate", kind="rf", timeout=0.05,
+                             _sleep=lambda s: None)
+        self.assertIn("No RF signal", out)
+        self.assertTrue(hub.cancelled)
+        self.assertNotIn("gate", self.mod._load_codes())
 
     def test_learn_rf_unsupported_hub(self):
         self.use([FakeHub()])

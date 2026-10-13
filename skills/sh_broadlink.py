@@ -229,8 +229,20 @@ def learn(name: str, kind: str = "ir", timeout: float = LEARN_TIMEOUT_S,
                 say("Hold the button on the remote until I say it's locked, "
                     f"for the {key} code.")
             dev.sweep_frequency()
-            locked = _poll(lambda: b"1" if dev.check_frequency() else None,
-                           time.time() + timeout, _sleep)
+            # python-broadlink 0.19: check_frequency() -> (found, MHz). A
+            # tuple is always truthy, so read the flag, not the return value
+            # (2026-10-13 review); older builds returned a bare bool.
+            freq_box: list = []
+
+            def _locked():
+                got = dev.check_frequency()
+                found, mhz = (got if isinstance(got, tuple) else (got, None))
+                if found:
+                    freq_box.append(mhz)
+                    return b"1"
+                return None
+
+            locked = _poll(_locked, time.time() + timeout, _sleep)
             if locked is None:
                 try:
                     dev.cancel_sweep_frequency()
@@ -239,7 +251,11 @@ def learn(name: str, kind: str = "ir", timeout: float = LEARN_TIMEOUT_S,
                 return f"No RF signal heard in {int(timeout)} seconds; nothing learned, sir."
             if say:
                 say("Frequency locked. Now tap the button once.")
-            dev.find_rf_packet()
+            mhz = freq_box[0] if freq_box else None
+            try:
+                dev.find_rf_packet(frequency=mhz) if mhz else dev.find_rf_packet()
+            except TypeError:           # an older build without the kwarg
+                dev.find_rf_packet()
             raw = _poll(dev.check_data, time.time() + timeout, _sleep)
         else:
             if say:
