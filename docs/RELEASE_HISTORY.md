@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.186 (2026-10-12)
+
+Alexa sign-in rebuilt on the phone-app style OAuth device registration (sign in once, saved token, the real smart-home device list, no session secrets in logs); audio auto-switch waits while media plays; CLOUD_BOOST_UNTIL sends hard turns and screen reading to Claude until a date; PROMPT_SLIM_MODE keeps the cached brain prompt smaller.
+
 ## v2.0.185 (2026-10-12)
 
 Public status docs on GitHub: docs/STATUS.md and docs/RELEASE_HISTORY.md, generated from the master sheet with all personal data stripped. No code change; the running JARVIS code is the same as v2.0.184.
