@@ -691,7 +691,10 @@ class PointMonitorTests(_SkillBase):
         self.assertEqual(self.cursor, [(1280, -1440 + 720)])
 
     def test_focus_action_activates_the_top_window_on_that_monitor(self):
-        import pygetwindow  # noqa: F401  (patched below; skip if absent)
+        try:
+            import pygetwindow  # noqa: F401  (patched below)
+        except ImportError:
+            self.skipTest("pygetwindow is Windows-only (not on the Linux CI)")
         self._cfg(KINECT_POINT_MONITOR_ACTION="focus")
         from core import actions as act
         left_win = _Win(title="Left Win", left=-2000, top=200, width=800, height=600)
