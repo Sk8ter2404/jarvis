@@ -286,6 +286,15 @@ WEDGE_HOLD_OTHERS_MAX_S = 3600.0
 # sweep would turn a 3 s boot step into 36 s.
 UNSTAGGERED_PREFIXES = ("dshow:",)
 
+# FLAP COUNTER (2026-10-13, master list 315). A camera that leaves the device
+# list and is back within FLAP_WINDOW_S is a short drop ("flap"). When one
+# camera flaps FLAP_SUMMARY_COUNT times inside FLAP_SUMMARY_WINDOW_S, ONE
+# summary line is logged; at most one more per camera per FLAP_SUMMARY_WINDOW_S.
+# Diagnostic only: it never changes an open decision.
+FLAP_WINDOW_S = 60.0
+FLAP_SUMMARY_WINDOW_S = 600.0
+FLAP_SUMMARY_COUNT = 3
+
 KIND_CAMERA = "camera"
 KIND_AUDIO = "audio"
 
@@ -545,7 +554,11 @@ class CameraGate:
                  # ...and what the last counted death showed (2026-10-02):
                  # True = the device left the bus, False = it stayed
                  # connected, None = nobody could tell. Words the verdict.
-                 "doo_off_bus": None}
+                 "doo_off_bus": None,
+                 # flap counter: times of short drops, the absent episode
+                 # already counted, and when the last summary was logged
+                 "flaps": [], "flap_counted_since": -1.0,
+                 "flap_said_at": None}
             self._dev[key] = r
         return r
 
@@ -1014,6 +1027,7 @@ class CameraGate:
                         f"  [camera-gate] {key}: back on the device list after "
                         f"{_fmt_s(now - r['absent_since'])} - reopening it after "
                         f"a {ABSENT_SETTLE_S:.0f}s settle, not at once.")
+                    self._note_flap_locked(key, r, now, lines)
                 left = ABSENT_SETTLE_S - (now - r["arrived_at"])
                 if left > 0.0:
                     return Decision(False, "settling", left,
@@ -1106,6 +1120,29 @@ class CameraGate:
             f"  [camera-gate] {key}: gone from the device list - it is NOT "
             f"reopened on a timer; JARVIS waits for it to come back, then "
             f"settles {ABSENT_SETTLE_S:.0f}s before opening it.")
+
+    def _note_flap_locked(self, key: str, r: dict, now: float,
+                          lines: list) -> None:
+        """A camera is back on the device list: count it as a flap if it was
+        gone for at most FLAP_WINDOW_S, once per absent episode, and log ONE
+        summary line at FLAP_SUMMARY_COUNT flaps in FLAP_SUMMARY_WINDOW_S."""
+        since = r["absent_since"]
+        if r["flap_counted_since"] == since:
+            return
+        r["flap_counted_since"] = since
+        if (now - since) > FLAP_WINDOW_S:
+            return
+        r["flaps"] = [t for t in r["flaps"]
+                      if (now - t) < FLAP_SUMMARY_WINDOW_S] + [now]
+        n = len(r["flaps"])
+        said = r["flap_said_at"]
+        if n >= FLAP_SUMMARY_COUNT and (
+                said is None or (now - said) >= FLAP_SUMMARY_WINDOW_S):
+            r["flap_said_at"] = now
+            lines.append(
+                f"  [camera-gate] {key}: FLAPPING - {n} short drops "
+                f"(gone and back within {FLAP_WINDOW_S:.0f}s) in the last "
+                f"{FLAP_SUMMARY_WINDOW_S / 60.0:.0f} min; check its cable/port.")
 
     def _poll_lockers_if_needed(self, key: str):
         with self._lock:
@@ -1630,6 +1667,9 @@ class CameraGate:
                             t for t in r["strikes"]
                             if (now - t) < CULPRIT_MEMORY_S]),
                         "dies_on_open": r["doo_count"],
+                        "flaps_10min": len([
+                            t for t in r["flaps"]
+                            if (now - t) < FLAP_SUMMARY_WINDOW_S]),
                         "slow_retry_s": r["doo_retry_s"],
                         # what the last counted death showed (True: it left
                         # the bus, False: it stayed connected, None: unknown)
