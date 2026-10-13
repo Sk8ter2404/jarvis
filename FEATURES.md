@@ -2,7 +2,7 @@
 
 ## Overview
 
-JARVIS (internal codename "Bobert") is a Python voice-controlled desktop AI assistant for Windows that styles itself after the Iron Man JARVIS: dry, British, composed. The main process is one long-running script, `bobert_companion.py` (~43,000 lines), backed by `core/` (104 modules: prompts, action handlers, config, memory, the voice pipeline, routing and safety layers), a skills system (`skills/`, 99 loadable skills) and `hud/` (overlay scripts, each run as its own subprocess). It listens on the microphone, transcribes with faster-whisper (`large-v3-turbo` on CUDA, `small` on CPU), decides what to do, and speaks back.
+JARVIS (internal codename "Bobert") is a Python voice-controlled desktop AI assistant for Windows that styles itself after the Iron Man JARVIS: dry, British, composed. The main process is one long-running script, `bobert_companion.py` (~51,000 lines), backed by `core/` (145 modules: prompts, action handlers, config, memory, the voice pipeline, routing and safety layers), a skills system (`skills/`, 91 loadable skills) and `hud/` (overlay scripts, each run as its own subprocess). It listens on the microphone, transcribes with faster-whisper (`large-v3-turbo` on CUDA, `small` on CPU), decides what to do, and speaks back.
 
 The brain is **local-first**. A local Ollama model is the always-on baseline (shipped default `gemma4:26b-a4b-it-qat`, a multimodal MoE that serves both chat and local vision), so JARVIS works with no API key and no credits at all. Which brain answers a conversation turn is decided per turn by `MODEL_ROUTING["chat"]` (`_call_llm` in `bobert_companion.py`):
 
@@ -18,7 +18,7 @@ Requests reach an action through several layers, in order:
 2. **Conversation-mode router** (`core/mode_router.py`): "controlled mode" / "smart mode" / "agent mode".
 3. **Command-chain resolver** (`core/dispatcher.py`): several commands in one sentence are split and run directly.
 4. **Skill utterance routes** (`register_utterance_route`): a skill can claim an exact request before the model sees it. In the public tree: the camera retry ("use the Kinect again"), the clap-trigger switches and the phone-bridge setup help.
-5. **The language model**, which emits `[ACTION: name, arg]` tokens that map to registered handlers. On the local route `core/prompt_router.py` sends the model only the capability sections the turn's words implicate (101 sections in all; keywords match at a word start) plus a one-line index of the rest, inside a cache-stable prefix; `core/prompt_budget.py` keeps the whole prompt inside the local model's context window instead of letting Ollama silently truncate it. The cloud route sends the full prompt.
+5. **The language model**, which emits `[ACTION: name, arg]` tokens that map to registered handlers. On the local route `core/prompt_router.py` sends the model only the capability sections the turn's words implicate (102 sections in all; keywords match at a word start) plus a one-line index of the rest, inside a cache-stable prefix; `core/prompt_budget.py` keeps the whole prompt inside the local model's context window instead of letting Ollama silently truncate it. The cloud route sends the full prompt.
 
 Around that sit the proactive background daemons (print monitor and announcers, briefings, weather watcher, credits and disk watchdogs, wellness and screen-watch nudges, banter, anticipation and weekly-digest offers, phone pings, the self-diagnostic sweep and four diagnostic daemons), a system-tray applet, a local web dashboard, and a Settings window.
 
@@ -26,17 +26,17 @@ Around that sit the proactive background daemons (print monitor and announcers, 
 
 | What | Count | How it was counted |
 |---|---|---|
-| Registered action names (incl. aliases) | 705 | `tools/gen_action_index.py` `build_index()` over git-tracked sources (the same AST scan that writes `docs/ACTION_INDEX.md`) |
-| — monolith `ACTIONS` dict | 142 | same scan, `bobert_companion.py` only (most handlers live in `core/actions.py`) |
-| — registered by skills and `core/` | 563 | same scan, `skills/*.py`, `skills/*/__init__.py`, `core/*.py` |
-| Distinct handlers | 443 | handler groups in that index (aliases sharing one handler collapse to one row) |
-| Loadable skills | 99 | the loader's rule as `tests/test_docs_truth.py` measures it: every non-underscore `skills/*.py` plus package skills |
-| `core/` modules | 104 | `core/*.py` minus `__init__.py` |
-| PC-control prompt sections | 101 | `core.prompt_router.split_pc_control(core.prompts.PC_CONTROL_PROMPT)` |
-| Settings in the Settings window | 151 (+11 status rows) | entries of `tools/settings_window.py` `SCHEMA`, minus the `_status_*` / `_view_*` rows |
-| Monolith lines | 43,288 | `wc -l bobert_companion.py` at this build (v2.0.174) |
+| Registered action names (incl. aliases) | 722 | `tools/gen_action_index.py` `build_index()` over git-tracked sources (the same AST scan that writes `docs/ACTION_INDEX.md`) |
+| — monolith `ACTIONS` dict | 156 | same scan, `bobert_companion.py` only (most handlers live in `core/actions.py`) |
+| — registered by skills and `core/` | 566 | same scan, `skills/*.py`, `skills/*/__init__.py`, `core/*.py` |
+| Distinct handlers | 460 | handler groups in that index (aliases sharing one handler collapse to one row) |
+| Loadable skills | 91 | the loader's rule as `tests/test_docs_truth.py` measures it: every non-underscore `skills/*.py` plus package skills |
+| `core/` modules | 145 | `core/*.py` minus `__init__.py` |
+| PC-control prompt sections | 102 | `core.prompt_router.split_pc_control(core.prompts.PC_CONTROL_PROMPT)` |
+| Settings in the Settings window | 217 (+10 status rows) | entries of `tools/settings_window.py` `SCHEMA`, minus the `_status_*` / `_view_*` rows |
+| Monolith lines | 51,199 | `wc -l bobert_companion.py` at this build (v2.0.188) |
 
-Two of the 705 names (`morning_tabs`, `vscode_command`) belong to `skills/_example_skill.py`, which the loader skips, so a running install has 703. MCP servers add `mcp_<server>_<tool>` actions at runtime, and locally installed private skills (gitignored) add their own; neither is counted or documented here. Regenerate the full per-action table with `python tools/gen_action_index.py`.
+Two of the 722 names (`morning_tabs`, `vscode_command`) belong to `skills/_example_skill.py`, which the loader skips, so a running install has 720. MCP servers add `mcp_<server>_<tool>` actions at runtime, and locally installed private skills (gitignored) add their own; neither is counted or documented here. Regenerate the full per-action table with `python tools/gen_action_index.py`.
 
 Features marked **(off by default - setting `NAME`)** ship switched off; turn them on in the Settings window or in `data/user_settings.json` (gitignored), or by the voice command listed with them.
 
@@ -111,6 +111,8 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - "which monitor am I looking at", "which camera can see me", "can you see me", "gaze status"
   - Actions: `where_is_user`, `see_user`, `which_monitor`, `gaze_status`, `gaze_stats`, `face_track_status`, `calibrate_gaze`, `gaze_calibration_status`, `forget_gaze_calibration`, `gaze_tracking_on` / `gaze_tracking_off`
   - Skill: `skills/face_tracker.py`
+- **Screen comments** (on by default - setting `SCREEN_REMARKS_ENABLED`; needs screen memory on) — `core/screen_remarks.py`: at most one short dry remark about a video you have just started watching, built only from the title and text screen memory actually read. Never in a call, a full-screen game, on a private / sign-in / incognito page, in guest or focus mode, while either of you is speaking, or at night; spacing `SCREEN_REMARKS_MIN_GAP_S` (15 min), item dwell `SCREEN_REMARKS_DWELL_S`, ordinary web pages only with `SCREEN_REMARKS_PAGES` (off). The tray menu and the dashboard switch it too.
+  - "stop commenting", "start commenting"
 - **All cameras at once** — every camera's health, a fused "where am I" read, a whole-room look, and retrying a camera JARVIS benched for knocking the USB hub offline (claimed by the utterance route before the model).
   - "camera status", "where am I", "look around", "use the Kinect again", "use the left webcam again"
   - Actions: `camera_status`, `situational_awareness` / `where_am_i`, `look_around`, `camera_unquarantine`
@@ -338,12 +340,17 @@ Every briefing below is one skill, `skills/daily_briefing/` (merged 2026-10-12 f
 - **Set / list / cancel timers** — a spoken "Reminder, sir — <message>" when it fires. "List timers" answers only from the timer store; "cancel timer" with no number cancels the soonest, "cancel all timers" clears them.
   - "set a timer for 5 minutes to check the oven", "remind me in an hour to stretch", "cancel timer 3"
   - Actions: `set_timer`, `list_timers`, `cancel_timer`
+- **Shopping list and reminders list** (`skills/shopping_list.py`, grammar in `core/untimed_reminders.py`) — a reminder that names no time goes on a list instead of becoming a guessed timer: buying something lands on the shopping list, anything else on a separate reminders list (never the developer task queue). Every reply says where the item went; a failed save says so. A reminder with a time stays a timer or schedule.
+  - "remind me to buy milk", "add eggs and bread to my shopping list", "what's on my shopping list", "clear the reminders list"
+  - Actions: `add_reminder`, `add_shopping_item`, `show_shopping_list`, `remove_shopping_item`, `clear_shopping_list`, `show_reminders_list`, `remove_reminder_item`, `clear_reminders_list`
 - **Schedules and conditional triggers** — APScheduler-backed recurring jobs, one-shot jobs at a wall-clock time, and "when X happens, do Y" triggers; chain actions with `&&`.
   - "every morning at 8 give me the briefing", "tomorrow at 9am open Bambu Studio", "when the print finishes, tell me"
   - Actions: `schedule_recurring` / `schedule_cron`, `schedule_once`, `schedule_when` / `when_condition`, `list_schedules`, `cancel_schedule` / `remove_schedule`, `run_schedule` / `fire_schedule`, `schedule_status`
 
 ### Category 13: Self-management & learning
 
+- **Time-boxed Claude boost** (off by default - setting `CLOUD_BOOST_UNTIL`, an ISO date; `core/cloud_boost.py`) — through the end of that day, hard questions ("think hard", "look it up", long multi-part asks) and screen-reading questions go to Claude instead of the local model, and a failed local answer falls to Claude even with `AI_BACKEND = "ollama"`. Needs an API key; the next day it switches itself off with one log line.
+- **Humor mode** (setting `HUMOR_MODE`: `dry` default, `sarcastic`) — `sarcastic` lets about one casual reply in three carry a light, affectionate jab; never when you sound stressed, on bad news, safety, health, money, grades or deadlines, or with guests listening.
 - **AI brain selection** — which local model serves turns (switched live, persisted) and which route chat takes (see Overview).
   - "what model are you using", "use the fast one", "use local only", "use the cloud model"
   - Actions: `current_model`, `list_models`, `set_model`, `set_brain` (`local` / `cloud` / `auto`), `switch_llm`
@@ -469,7 +476,7 @@ Every briefing below is one skill, `skills/daily_briefing/` (merged 2026-10-12 f
 - **Smart-home router** — natural-language control routed to whichever brand skill owns the device (Hue, Govee, LIFX, Kasa/Tapo, Tuya/Smart Life, Ecobee, Nest, Ring).
   - "turn off the office light", "dim the bedroom lamps to 30%", "set the living room thermostat to 72"
   - Actions: `smart_home_control` / `control_smart_home` / `control_device` / `control_light` / `control_plug`, `smart_home_router_status` ("why did that light not respond"), `refresh_smart_home_router`
-- **Discovery and catalog** — Alexa + LAN discovery builds `data/smart_home_devices.json`; "list my smart-home devices" reads that catalog back (plainly when it is empty).
+- **Discovery and catalog** — Alexa + LAN discovery builds `data/smart_home_devices.json`; the one-time Alexa sign-in is the phone-app style OAuth device registration (`python -m skills.smart_home_discover`, or `... reauth`): you sign in on Amazon's own page, JARVIS keeps only a saved refresh token (`data/alexa_oauth.json`) and scrubs secrets from every log line; "list my smart-home devices" reads that catalog back (plainly when it is empty).
   - "discover my smart-home devices", "list my smart-home devices", "forget my Alexa login"
   - Actions: `discover_smart_home`, `list_smart_home_devices`, `forget_alexa_login`
 - **Per-brand lists and setup** — "list my Hue lights", "list my Tuya plugs", "authorize Ecobee", "set the Hue bridge IP"
@@ -480,6 +487,7 @@ Every briefing below is one skill, `skills/daily_briefing/` (merged 2026-10-12 f
 
 ### Category 19: Browser agent
 
+- **Never signs in for you** (`core/auth_guard.py`) — a click, typing or Enter/Tab/Space on a sign-in page, or on an account-chooser / "Continue with Google" / "Authorize" control, is refused unless your own words that turn asked for exactly that input; JARVIS opens the page and you sign in.
 - **Sandboxed browser automation** (Playwright + browser-use, separate profile from your everyday browser; needs `ANTHROPIC_API_KEY`).
   - "use the browser to find the cheapest flight to Tokyo next Friday" → `browser_task`
   - "go read up on PETG nozzle temps and summarise it" → `browse_for`
@@ -499,7 +507,8 @@ Every briefing below is one skill, `skills/daily_briefing/` (merged 2026-10-12 f
 - **Windows notification triage** — captures toasts, applies your rules, reads back recent ones.
   - "what notifications have come in", "list notification rules", "pause notification triage"
   - Actions: `recent_notifications_summary`, `list_notification_rules`, `add_notification_rule`, `remove_notification_rule`, `pause_notification_triage`, `resume_notification_triage`, `triage_status`
-- **Phone push** — Telegram, ntfy or Pushover; prefix `!urgent` / `!high` for priority.
+- **Two-way chat bot** (`core/discord_bridge.py`, `DISCORD_ENABLED` / `DISCORD_INBOUND`; inert until a bot token and the owner's id are set in the environment, see `docs/DISCORD_SETUP.md`) — alerts arrive as direct messages from a Discord bot, and you can DM the bot to talk to JARVIS: each DM runs like a typed command and the reply comes back in the same DM. Only the owner's own account is obeyed; server channels and other people are ignored. ntfy is the fallback when a send fails (`DISCORD_NTFY_FALLBACK_ONLY`).
+- **Phone push** — Discord, Telegram, ntfy or Pushover; prefix `!urgent` / `!high` for priority.
   - "send the print status to my phone", "text my phone <message>", "phone status"
   - Actions: `notify_phone` / `push_to_phone` / `text_my_phone`, `phone_status`, `list_phone_backends`, `pause_phone_bridge`, `resume_phone_bridge`
 - **Phone pings** (`core/phone_ping.py`, `PHONE_PING_ENABLED` on, but a no-op with one boot line until a phone bridge is configured) — JARVIS texts your phone unprompted only when something needs you: a print finished, failed (not one you cancelled) or paused with an error (once per pause); a guard-mode alert (its own switch — "turn off phone pings" never silences the guard); a talking-device skill that needs you (`skill_utils["ping_phone"]`); and, off by default, a confirmation you asked for and left to lapse while away (the action's name only, `PHONE_PING_CONFIRM`) and a daily summary (`PHONE_PING_SUMMARY`). Nothing pings while you are talking to him or, while he is awake, working at the PC (he says it out loud), in focus mode, or 23:00–07:00 / in overnight mode (held, then sent as one message), except guard alerts; at most 6 an hour; secrets are scrubbed from every text.
@@ -567,10 +576,10 @@ The "speed plan" work: each new engine ships off or in a log-only shadow mode an
 - **Whisper decode knobs** — `WHISPER_TEMPERATURES` (`None` = faster-whisper's own ladder) and `WHISPER_BEAM_SIZE` (5) cap the slow fallback decodes on the owner's turns; the defaults leave behaviour unchanged.
 - **Smart Turn end of turn** (`core/endpointing.py`, `SMART_TURN_MODE`, `off` by default) — an ~9 MB audio model hears the last 8 s of a capture in a real pause and says whether you have finished, instead of always waiting out the fixed 1.3 s of silence. In `shadow` nothing changes: each accepted owner turn gets one `[eot-shadow]` log line saying when Smart Turn would have ended it; `on` lets it end turns; `off` loads nothing. A missing model file means today's behaviour.
 - **Kokoro speed** (`core/kokoro_tts.py`, `core/tts_render_cache.py`; off by default - settings `KOKORO_PERSISTENT_PHONEMIZER`, `KOKORO_RENDER_CACHE`) — one persistent espeak phonemizer instead of a fresh one per line, and a render cache for repeated lines (`shadow` logs would-hits; `on` serves them; the text itself is never stored, `KOKORO_RENDER_CACHE_PERSIST` keeps renders across restarts).
-- **Local prompt cache** — the local route keeps its system prompt byte-identical between turns (only the turn's sections ride the user message), holds post-turn prompt rebuilds back while you are talking (`PROMPT_FREEZE_QUIET_S`), defers non-urgent background model work mid-conversation (`LOCAL_BACKGROUND_MAX_DEFER_S`) and re-primes the model afterwards and at boot, so a turn rarely pays a full prompt re-read. `PROMPT_SLIM_MODE` (on by default) keeps that cached prompt smaller and steadier: it lists every action by name, learned facts, topics and projects ride only the turns they are relevant to ("what do you know about me" gets them all, newest first up to a size cap, and the follow-up round after an action keeps them), and skill examples only the turns that mention them; a turn that uses an action whose instructions were not sent logs `[router-miss]`.
+- **Local prompt cache** — the local route keeps its system prompt byte-identical between turns (only the turn's sections ride the user message), holds post-turn prompt rebuilds back while you are talking (`PROMPT_FREEZE_QUIET_S`), defers non-urgent background model work mid-conversation (`LOCAL_BACKGROUND_MAX_DEFER_S`) and re-primes the model afterwards and at boot, so a turn rarely pays a full prompt re-read. `PROMPT_SLIM_MODE` (on by default) keeps that cached prompt smaller and steadier: it lists every action by name, learned facts, topics and projects ride only the turns they are relevant to ("what do you know about me" gets them all, newest first up to a size cap, and the follow-up round after an action keeps them), and skill examples only the turns that mention them; a turn that uses an action whose instructions were not sent logs `[router-miss]`. `LOCAL_KEEP_ALIVE` (default `20m`; `-1` keeps the local model loaded until game mode or a restart) sets how long Ollama keeps it resident.
 - **Batched ambient learning** (`core/learn_batch.py`, `LEARN_BATCH_ENABLED`, on; `LEARN_BATCH_INTERVAL_S`, `LEARN_BATCH_QUIET_S`, `LEARN_BATCH_MAX_JOBS`) — memory extraction, the TV-or-person check on overheard speech and the ambient extractor are queued and sent to the local brain as ONE request every few minutes, only while you have been quiet (no turn or reply for a while) and re-checked right before the send, so they stop evicting your prompt cache; log lines `[learn-batch] sent N job(s) ...`. Off restores one request per job.
 - **Answer first** (`ANSWER_FIRST_ENABLED`, on) — a short pure-acknowledgement lead-in ("One moment, sir.") is skipped when the action itself speaks the real answer.
-- **Turn checker** (`core/turn_checker.py`, decision only, not wired into turns yet) — decides when a local turn failed in a way a single Claude retry would fix (an invented action name, a claimed action nothing ran, a clear command with no action). `python tools/turn_checker_report.py <logs>` counts its verdicts over real session logs so the threshold can be judged before it is wired.
+- **Turn checker** (off by default - setting `TURN_CHECK_MODE`: `off`, `shadow` logs each failed turn to `data/turn_check.jsonl`, `on` retries it once on Claude when the cloud is allowed; `core/turn_checker.py`) — decides when a local turn failed in a way a single Claude retry would fix (an invented action name, a claimed action nothing ran, a clear command with no action). `python tools/turn_checker_report.py <logs>` counts its verdicts over real session logs so the threshold can be judged before it is switched on.
 
 ---
 
@@ -626,9 +635,10 @@ Additional pushback / refusal layers:
 - `core/prompts.py` — `BASE_SYSTEM_PROMPT` and the sectioned `PC_CONTROL_PROMPT` (every routing example)
 - `core/prompt_router.py` — per-turn section selection for the local brain; `core/prompt_budget.py` — keeps the local prompt inside the context window
 - `core/config.py` — shipped defaults; `data/user_settings.json` (gitignored) overrides them
-- `skills/` — 99 loadable skill modules (plus `_example_skill.py`, which the loader skips)
+- `skills/` — 91 loadable skill modules (plus `_example_skill.py`, which the loader skips)
 - `hud/` — the overlay subprocesses, driven by `hud_state.json` and per-overlay control files (the old corner ring `hud/jarvis_hud.py` is no longer launched; `hud/globe_geometry.py` is the globe's geometry helper)
 - `tray.py` — system-tray applet; `tools/settings_window.py` — Settings window; `tools/web_interface.py` — web dashboard
+- `docs/STATUS.md`, `docs/RELEASE_HISTORY.md` — public status and release history (generated; personal data stripped)
 - `docs/ACTION_INDEX.md` — machine-generated per-action table (`python tools/gen_action_index.py`)
 - `tools/turn_latency_report.py`, `tools/turn_checker_report.py` — read-only reports over session logs
 - `upgrade_jarvis.py` — voice-triggered Claude Code pipeline
