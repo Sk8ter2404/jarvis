@@ -231,6 +231,7 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "TIMERS / REMINDERS": [
         "timer", "remind", "reminder", "alarm", "wake me", "in a minute",
         "minutes", "seconds", "hour", "countdown", "set a", "alert me",
+        "shopping list", "grocery list", "groceries", "timesheet",
     ],
     # Header renamed TEAMS CALL SCREENING -> MICROSOFT TEAMS (2026-08-20): the
     # three screener actions it used to document ship only in the gitignored

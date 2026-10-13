@@ -27,16 +27,16 @@
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 718 |
+| Total registered actions (incl. aliases) | 725 |
 | — monolith `ACTIONS` dict | 156 |
-| — skill / core registered | 562 |
-| tested | 660 |
+| — skill / core registered | 569 |
+| tested | 667 |
 | **untested** (no test names it) | 58 |
-| spoken note: VERBATIM | 369 |
+| spoken note: VERBATIM | 375 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
-| **no spoken note** (neither) | 270 |
-| no `prompts.py` example | 512 |
+| **no spoken note** (neither) | 271 |
+| no `prompts.py` example | 515 |
 
 A result with no spoken note is correct for side-effect actions but is the recurring
 "logged but never voiced" bug for read-outs — see the audit that seeded the 2026-07
@@ -50,6 +50,8 @@ One row per action, sorted by name; aliases share their handler's location.
 | action | handler | spoken note | ex? | tested |
 |---|---|---|:--:|:--:|
 | `add_notification_rule` | `skills/notification_triage.py:1564` | **VERBATIM** | — | yes |
+| `add_reminder` | `skills/shopping_list.py:100` | **VERBATIM** | yes | yes |
+| `add_shopping_item` | `skills/shopping_list.py:42` | **VERBATIM** | yes | yes |
 | `air_control_off` | `skills/air_control.py:405` | **VERBATIM** | yes | yes |
 | `air_control_on` | `skills/air_control.py:385` | **VERBATIM** | yes | yes |
 | `air_control_status` | `skills/air_control.py:414` | **VERBATIM** | yes | yes |
@@ -164,6 +166,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `clap_trigger_routine` | `skills/clap_trigger.py:849` | **VERBATIM** | yes | yes |
 | `clap_trigger_status` | `skills/clap_trigger.py:807` | **VERBATIM** | yes | yes |
 | `clear_llm_cache` | `core/actions.py:7289` | neither | — | yes |
+| `clear_shopping_list` | `skills/shopping_list.py:90` | **VERBATIM** | — | yes |
 | `clear_tasks` | `core/actions.py:803` | neither | yes | yes |
 | `click` | `core/actions.py:3506` | neither | yes | yes |
 | `click_on_screen` | `core/actions.py:3693` | **VERBATIM** | — | yes |
@@ -313,6 +316,8 @@ One row per action, sorted by name; aliases share their handler's location.
 | `holographic_on` | `skills/holographic_overlay/__init__.py:334` | neither | — | yes |
 | `holographic_status` | `skills/holographic_overlay/__init__.py:350` | **VERBATIM** | yes | yes |
 | `hotkey` | `core/actions.py:3896` | neither | — | yes |
+| `hours_reminder_fire` | `skills/hours_reminder.py:235` | neither | — | yes |
+| `hours_status` | `skills/hours_reminder.py:232` | **VERBATIM** | — | yes |
 | `how_is_the_print` | `skills/bambu_monitor.py:1349` | *INFORMATIVE* | yes | yes |
 | `how_much_battery_headset` | `skills/headset_status.py:370` | **VERBATIM** | — | yes |
 | `hud_off` | `skills/holographic_overlay/__init__.py:339` | neither | — | yes |
@@ -520,6 +525,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `remember_this_person` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
 | `remove_notification_rule` | `skills/notification_triage.py:1586` | **VERBATIM** | — | yes |
 | `remove_schedule` | `skills/schedule_manager.py:527` | **VERBATIM** | — | yes |
+| `remove_shopping_item` | `skills/shopping_list.py:72` | **VERBATIM** | yes | yes |
 | `replay_last_action` | `core/actions.py:5099` | neither | — | yes |
 | `report_a_bug` | `core/actions.py:4237` | **VERBATIM** | — | yes |
 | `report_bug` | `core/actions.py:4237` | **VERBATIM** | yes | yes |
@@ -590,6 +596,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `show_printer_camera` | `skills/holographic_overlay/__init__.py:1005` | neither | — | yes |
 | `show_recent_facts` | `core/actions.py:3374` | **VERBATIM** | — | yes |
 | `show_schedules` | `skills/schedule_manager.py:512` | **VERBATIM** | — | no |
+| `show_shopping_list` | `skills/shopping_list.py:65` | **VERBATIM** | — | yes |
 | `show_status_hud` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
 | `show_status_ring_v2` | `skills/holographic_overlay/__init__.py:1810` | neither | — | yes |
 | `show_tasks` | `core/actions.py:3167` | *INFORMATIVE* | yes | yes |

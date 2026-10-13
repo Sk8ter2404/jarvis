@@ -493,6 +493,27 @@ def _duration_span(raw: str, m: re.Match) -> tuple[int, int]:
         return start, end
 
 
+# Words that may sit around a bare number in a timer request ("for 5",
+# "five minutes please", "a timer of ten") without making it a sentence.
+_BARE_DURATION_FILLER = frozenset({
+    "a", "an", "the", "for", "of", "about", "around", "like", "just", "set",
+    "timer", "please", "minute", "minutes", "min", "mins", "me", "to", "in",
+    "sir", "jarvis",
+})
+
+
+def _is_bare_duration_text(raw: str) -> bool:
+    """True when ``raw`` is a number (digits or a number word) and nothing but
+    timer filler - the only text a unit-less duration may be read from."""
+    for w in re.findall(r"[a-z]+|\d+(?:\.\d+)?", (raw or "").lower()):
+        if w in _BARE_DURATION_FILLER or w in _WORD_NUMBERS:
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)?", w):
+            continue
+        return False
+    return True
+
+
 def _split_timer_args(args: str) -> tuple[int | None, str]:
     """Pull a (duration_seconds, label) pair out of whatever the LLM emitted.
 
@@ -536,14 +557,45 @@ def _split_timer_args(args: str) -> tuple[int | None, str]:
         label = re.sub(r"\b(?:timer|reminder)\b", "", label, flags=re.IGNORECASE).strip(" ,.-")
         return secs, label
 
-    # 4. Bare number / spelled-out number with no unit word ("5", "five").
+    # 4. Bare number / spelled-out number with no unit word ("5", "five") -
+    # but ONLY when that is all there is. "buy two eggs" is not a 2-minute
+    # timer: a number word inside other text used to be read as minutes, a
+    # silent invented duration (2026-10-12).
+    if not _is_bare_duration_text(raw):
+        return None, ""
     return _parse_duration(raw), ""
+
+
+def _untimed_task(args: str) -> str:
+    """The task when a set_timer argument names NO usable duration but does
+    carry a task ("later | buy milk", "buy milk", "remind me to call mom"), else
+    "". Such a request is a reminder with no time - a list item, never a timer
+    (and never an invented duration)."""
+    raw = (args or "").strip()
+    if "|" in raw:
+        return raw.split("|", 1)[1].strip(" ,.")
+    low = raw.lower()
+    for lead in ("remind me to ", "remind me ", "to "):
+        if low.startswith(lead):
+            return raw[len(lead):].strip(" ,.")
+    try:
+        from core import untimed_reminders as _ur
+        if _ur.shopping_items(raw):
+            return raw.strip(" ,.")
+    except Exception:
+        pass
+    return ""
 
 
 def register(actions):
     def set_timer(args: str) -> str:
         secs, msg = _split_timer_args(args)
         if secs is None or secs <= 0:
+            task = _untimed_task(args)
+            add = actions.get("add_reminder")
+            if task and callable(add):
+                return ("No time given, so no timer, sir. "
+                        + add(task))
             return ("I couldn't tell how long, sir — try 'set a timer for "
                     "5 minutes' (or '5 minutes for tea').")
         # A label is optional; default to a generic reminder so a bare
