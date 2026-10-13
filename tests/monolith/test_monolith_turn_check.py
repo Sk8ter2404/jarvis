@@ -154,8 +154,8 @@ class OffModeTests(_TurnCheckBase):
     def test_mode_normalisation(self):
         bc = self.bc
         for raw, want in (("off", "off"), (" ON ", "on"), ("Shadow", "shadow"),
-                          ("bogus", "shadow"), ("", "shadow"),
-                          (None, "shadow"), (1, "shadow")):
+                          ("bogus", "off"), ("", "off"),
+                          (None, "off"), (1, "off")):
             with mock.patch.object(bc, "TURN_CHECK_MODE", raw):
                 self.assertEqual(bc._turn_check_mode(), want, repr(raw))
 
@@ -220,11 +220,12 @@ class ShadowModeTests(_TurnCheckBase):
         self.assertEqual(row["emitted"], ["lamp_off"])
         self.assertEqual(row["ran"], ["lamp_off"])
 
-    def test_unknown_mode_reads_as_shadow(self):
+    def test_unknown_mode_reads_as_off(self):
+        # A typo reads as the shipped default, 'off': no check, no row.
         self._p(self.bc, "TURN_CHECK_MODE", "sometimes")
         out = self._run(_CLAIM, text=_ASK)
-        self.assertEqual(len(self.turn_lines(out)), 1)
-        self.assertEqual(self.rows()[0]["mode"], "shadow")
+        self.assertEqual(self.turn_lines(out), [])
+        self.assertEqual(self.rows(), [])
         self.oneshot.assert_not_called()
 
     def test_the_check_runs_on_the_worker_not_the_voice_thread(self):
@@ -585,7 +586,7 @@ class WiringTests(_TurnCheckBase):
     def test_config_defaults_and_settings_rows(self):
         from core import config
         from tools import settings_window as sw
-        self.assertEqual(config.TURN_CHECK_MODE, "shadow")
+        self.assertEqual(config.TURN_CHECK_MODE, "off")
         self.assertEqual(config.TURN_CHECK_ESCALATE_MODEL, "claude-sonnet-5-5")
         row = sw.SCHEMA["TURN_CHECK_MODE"]
         self.assertEqual(row["type"], "enum")

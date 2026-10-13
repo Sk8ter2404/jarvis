@@ -662,7 +662,7 @@ _TTS_EMOTION_PRESETS: dict[str, dict[str, object]] = {
     "proud":          {"rate": "+1%",  "pitch": "+2Hz", "gain": 1.05},  # warmer + slightly bright — quiet pride, mild praise
     "concerned":      {"rate": "-15%", "pitch": "-4Hz", "gain": 0.92},  # softer + slower — per spec line 120, lingering worry, sits between calm and bad_news
     "wry":            {"rate": "+3%",  "pitch": "+1Hz", "gain": 1.0},   # dry-humour deliveries [wry] — slight beat inserted before the punchline by synthesise()
-    # voice_mood layer (core/voice_mood_selector) — context-aware overrides
+    # voice_mood layer (explicit only; the old selector module was removed) — overrides
     # passed in explicitly via _speak(mood=...) or the [mood:xxx] tag. Picks
     # land between the [intent:xxx] override and the emotion-tracker /
     # user-tone fallbacks so a skill saying "this is urgent" beats the

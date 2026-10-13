@@ -5,7 +5,7 @@ listener waited for the full synthesis of a multi-sentence answer before
 hearing its first word. This module lets `_speak` start playing sentence 1 as
 soon as it is rendered while a worker thread renders the rest.
 
-Unlike streaming the LLM (core/stream_speech.py), the complete reply and all of
+Unlike streaming the LLM (an idea that was never wired), the complete reply and all of
 its actions are already settled when `_speak` runs, so voicing it sentence by
 sentence has none of the early-speech risks: the words and their order are
 exactly the words `_speak` was handed.

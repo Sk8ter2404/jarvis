@@ -18,7 +18,7 @@ next one starts at once. Measured on 2026-10-04 (13:49-15:40 session):
   * altogether the 1650 sat ~35 % busy and the listening threads burned ~39
     CPU-s a minute transcribing lyrics nobody acts on.
 
-THE GATE (MUSIC_GATE_MODE 'off' | 'shadow' | 'on'; shipped 'shadow')
+THE GATE (MUSIC_GATE_MODE 'off' | 'shadow' | 'on'; shipped 'off')
 -------------------------------------------------------------------
 Music mode = the PC is playing audio (its playback meter at or over
 MEDIA_VOICE_GATE_PEAK — the media gate's own test — or sustained room music

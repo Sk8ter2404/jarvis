@@ -329,7 +329,7 @@ _state: dict[str, Any] = {
 
 # voice_mood layer hook — set by _announce_failures() when a HIGH-severity
 # probe failure is announced. Read by get_recent_problem_flag() so other
-# components (the holographic HUD, the voice_mood_selector) can tell that
+# components (the holographic HUD, a future voice-mood selector) can tell that
 # JARVIS *should* be sounding concerned right now. A simple float + lock so
 # the announce path stays fast and the read path stays thread-safe.
 _RECENT_PROBLEM_WINDOW_SEC = 600.0   # 10 min — long enough that a follow-up
@@ -349,9 +349,8 @@ def _mark_recent_problem(now: Optional[float] = None) -> None:
 
 def get_recent_problem_flag(now: Optional[float] = None) -> bool:
     """Return True iff a HIGH-severity probe failure was announced within
-    the last _RECENT_PROBLEM_WINDOW_SEC. Wired into the voice_mood layer
-    (core/voice_mood_selector) so the next utterance lands in
-    `concerned_soft` while a real system problem is fresh.
+    the last _RECENT_PROBLEM_WINDOW_SEC. A hook for a voice-mood selector
+    (none ships; the old core/voice_mood_selector was removed unwired).
 
     Thread-safe: reads the cached timestamp under _recent_problem_lock so
     a concurrent _announce_failures call can't tear the read.

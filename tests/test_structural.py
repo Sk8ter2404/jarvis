@@ -26,7 +26,7 @@ _IMPORT_LIGHT_CORE = (
     # core-only) so a wrong name surfaces here, not at JARVIS boot.
     "core.tts", "core.llm_client", "core.tone_detector",
     "core.speech_filter", "core.voice_emotion", "core.memory_guards",
-    "core.legacy_memory", "core.stream_speech",
+    "core.legacy_memory",
     "core.followup_window", "core.ollama_opts", "core.processing_filler",
     "core.owner_turn",
     "core.audio_flap",

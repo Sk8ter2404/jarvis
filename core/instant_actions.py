@@ -9,14 +9,14 @@ monolith's _run_action_shortcut). Volume, media transport, the lights and
 emit one obvious action token.
 
 INSTANT_ACTIONS_MODE (core/config.py) closes that gap in two steps:
-  "shadow" (default)  the brain still answers. The monolith logs the action
+  "shadow"            the brain still answers. The monolith logs the action
                       this module WOULD have run and, once the brain's own
                       actions have run, whether the brain ran the same one:
                       the precision measurement, scored by
                       tools/instant_actions_report.py.
   "on"                the action runs at once with a short spoken line and
                       the LLM is never called.
-  "off"               nothing is matched or logged.
+  "off" (default)     nothing is matched or logged.
 The monolith side is bobert_companion._instant_action_for /
 _instant_action_after_run, wired into _run_llm_dispatch_body.
 
@@ -90,7 +90,7 @@ __all__ = [
 ]
 
 MODES = ("shadow", "on", "off")
-DEFAULT_MODE = "shadow"
+DEFAULT_MODE = "off"
 
 LOG_NAME = "instant_actions.jsonl"
 LOG_MAX_BYTES = 1_000_000
@@ -126,7 +126,7 @@ class InstantAction:
 
 
 def normalize_mode(value) -> str:
-    """'shadow' / 'on' / 'off'; anything else is the default, 'shadow'
+    """'shadow' / 'on' / 'off'; anything else is the default, 'off'
     (which changes nothing the owner hears)."""
     mode = str(value or "").strip().lower()
     return mode if mode in MODES else DEFAULT_MODE

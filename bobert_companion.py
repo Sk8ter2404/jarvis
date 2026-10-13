@@ -16592,7 +16592,7 @@ if TURN_TAIL_PROBE:
 # record_speech(smart_endpoint=True) — stream what Whisper will hear into a
 # Silero detector and, in a real pause, ask Smart Turn v3.2 whether he has
 # finished (core/endpointing.EotDecider; the knobs are SMART_TURN_* in
-# core/config.py). This release ships SMART_TURN_MODE='shadow': nothing ends a
+# core/config.py). This release ships SMART_TURN_MODE='off' (opt in to 'shadow' to log): nothing ends a
 # turn early; each ACCEPTED owner turn logs one "[eot-shadow] fire_ms= p=
 # resumed= actual_ms=" line (right after its "You:" line) and its
 # [turn-timing] line gets eot / st_p / st_n, and the owner promotes to 'on'
@@ -25508,7 +25508,8 @@ _last_intent_override: list[str | None] = [None]
 # core.tts.parse_wry_tag(), cleared in the same finally block.
 _last_wry: list[bool] = [False]
 
-# Slot for the voice_mood layer (core/voice_mood_selector). Carries a mood
+# Slot for the explicit voice-mood override (the former core/voice_mood_selector
+# router was never wired and was removed 2026-10-12). Carries a mood
 # name (calm_efficient / urgent_clipped / dry_amused / concerned_soft) when
 # the caller passed mood= to _speak(), or when [mood:xxx] was parsed off the
 # leading tag. Read by _resolve_tts_preset() between the [intent:xxx]
@@ -43056,8 +43057,8 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     `volume_scale` < 1.0 attenuates the rendered audio in-place before
     playback (used by context_aware_greeting for the 'looking away' case).
 
-    `mood` (optional) opts the caller into the voice_mood layer
-    (core/voice_mood_selector). One of: calm_efficient / urgent_clipped /
+    `mood` (optional) opts the caller into the explicit voice-mood override
+    (no automatic selector exists; the caller or a [mood:xxx] tag chooses). One of: calm_efficient / urgent_clipped /
     dry_amused / concerned_soft. When set, _resolve_tts_preset uses the
     matching preset between the [intent:xxx] override and the
     emotion-tracker / user-tone fallbacks. None preserves legacy behaviour
@@ -48018,12 +48019,12 @@ _turn_check_worker_lock = threading.Lock()
 
 def _turn_check_mode() -> str:
     """TURN_CHECK_MODE normalised to 'off' | 'shadow' | 'on'. Anything else -
-    a typo, a blank, a non-string - reads as 'shadow'. Never raises."""
+    a typo, a blank, a non-string - reads as 'off' (the default). Never raises."""
     try:
-        mode = str(globals().get("TURN_CHECK_MODE", "shadow")).strip().lower()
+        mode = str(globals().get("TURN_CHECK_MODE", "off")).strip().lower()
     except Exception:
-        return "shadow"
-    return mode if mode in _TURN_CHECK_MODES else "shadow"
+        return "off"
+    return mode if mode in _TURN_CHECK_MODES else "off"
 
 
 def _turn_check_emitted(texts) -> list:

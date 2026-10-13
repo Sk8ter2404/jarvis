@@ -97,9 +97,7 @@ def _coverage_for(coverage_mod, *, full: bool = False, **coverage_kwargs):
              # what we hold to coverage; these are dev conveniences):
              "tools/audit_local.py", "tools/pii_local.py",
              "tools/bounce_jarvis.py", "tools/face_detect_bench.py",
-             "tools/generate_jarvis_icon.py", "tools/identify_vendors.py",
-             "tools/render_unified_hud.py", "tools/say_to_jarvis.py",
-             "tools/scan_full_network.py", "tools/scan_lan_devices.py",
+             "tools/generate_jarvis_icon.py", "tools/say_to_jarvis.py",
              "tools/test_local_prompt.py",
              # Developer-facing TEMPLATE skill (copy-me example), not a real
              # shipped/registered skill — documentation by example, not logic.

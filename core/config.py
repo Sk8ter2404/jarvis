@@ -1037,8 +1037,9 @@ VOICE_ID_DEVICE            = "cpu"
 # transcribed twice (Parakeet, then a Whisper "rescue"), and the ambient
 # listener ran Whisper on every 2.5 s of lyrics: ~35 % of the 1650 and ~39
 # CPU-s a minute. MUSIC_GATE_MODE:
-#   'off'    today's behaviour, nothing measured;
-#   'shadow' (default) today's behaviour, plus one "[music-gate]" counter
+#   'off'    (default) today's behaviour, nothing measured; nobody read the
+#            shadow counter lines, so the diagnostic is opt-in (2026-10-12);
+#   'shadow' today's behaviour, plus one "[music-gate]" counter
 #            line per minute with music: what 'on' would have skipped and
 #            whether any of it would have been an owner turn ("lost");
 #   'on'     over music: the ambient listener transcribes nothing, and
@@ -1049,7 +1050,7 @@ VOICE_ID_DEVICE            = "cpu"
 # gate's voice check) keep running in every mode. No mode shortens a capture:
 # nothing is recorded between captures, so more, shorter captures over music
 # would mean more deaf gaps (core/music_gate.py).
-MUSIC_GATE_MODE            = "shadow"
+MUSIC_GATE_MODE            = "off"
 
 # ─── Listening over videos (core/listen_media.py, 2026-10-05) ───────────
 # Over a video in wake-word mode his "Jarvis, ..." landed inside a capture
@@ -1250,7 +1251,7 @@ PLAYBACK_PRIMED_STREAM = False
 # silence run, and SMART_TURN_MIN_SPEECH_S of Silero speech so far — and a p
 # of SMART_TURN_THRESHOLD or more ends the turn there. The 21 chunks stay the
 # ceiling; Silero or Smart Turn missing, failing or too slow = today's turn.
-#   SMART_TURN_MODE   'off'    no models are loaded;
+#   SMART_TURN_MODE   'off'    (default) no models are loaded;
 #                     'shadow' the models run but nothing changes: each
 #                              owner turn JARVIS accepts gets an
 #                              [eot-shadow] line saying when Smart Turn
@@ -1262,8 +1263,8 @@ PLAYBACK_PRIMED_STREAM = False
 #                     the repo: never commit a model. Missing = Smart Turn
 #                     latched off (one log line), i.e. 'rms' turns.
 # Set via user_settings.json; applies on the next start.
-SMART_TURN_MODE = (os.getenv("JARVIS_SMART_TURN", "shadow").strip().lower()
-                   or "shadow")
+SMART_TURN_MODE = (os.getenv("JARVIS_SMART_TURN", "off").strip().lower()
+                   or "off")
 SMART_TURN_THRESHOLD = 0.7
 SMART_TURN_MIN_SILENCE_S = 0.256
 SMART_TURN_MIN_SPEECH_S = 1.0
@@ -1275,7 +1276,7 @@ SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
 # ran ("Done, sir." and nothing happened), ran nothing for a clear command, or
 # named an action that does not exist. Route, glance, barged and self-voiced
 # turns are never checked.
-#   TURN_CHECK_MODE   'off'    no check at all;
+#   TURN_CHECK_MODE   'off'    (default) no check at all;
 #                     'shadow' check only: a "[turn-check]" log line for a
 #                              failed turn and one row per checked turn in
 #                              data/turn_check.jsonl (kind, confidence and
@@ -1287,10 +1288,10 @@ SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
 #                              and the model is not one Anthropic already
 #                              answered not_found for this session (then its
 #                              CLAUDE_MODEL_SUCCESSORS entry, or no retry).
-#                     Any other value reads as 'shadow'.
+#                     Any other value reads as 'off'.
 #   TURN_CHECK_ESCALATE_MODEL  the Claude model that retry runs on.
 # Set via user_settings.json; applies on the next start.
-TURN_CHECK_MODE = "shadow"
+TURN_CHECK_MODE = "off"
 TURN_CHECK_ESCALATE_MODEL = "claude-sonnet-5-5"
 
 # ─── Deterministic fast paths (core/fast_paths.py + core/date_math.py) ──
@@ -1309,16 +1310,16 @@ FAST_PATHS_ENABLED = True
 # precision-first rules. Never a question, a "can you ...?" ask, two commands
 # in one sentence, a pronoun ("turn it up") or anything that needs a yes.
 # INSTANT_ACTIONS_MODE:
-#   "shadow" (default) the brain still answers every turn. The action that
+#   "shadow" the brain still answers every turn. The action that
 #            WOULD have run and whether the brain ran the same one go to
 #            data/instant_actions.jsonl (time + action names only, never the
 #            owner's words). Score it: python tools/instant_actions_report.py
 #   "on"     the action runs at once with a short spoken line; no LLM call.
-#   "off"    nothing is matched or logged.
+#   "off"    (default) nothing is matched or logged.
 # INSTANT_ACTIONS_ALLOW: the registered action names it may run. It can only
 # narrow core/instant_actions.RULE_ACTIONS (a name no rule produces is
 # ignored). Set via user_settings.json; applies on the next start.
-INSTANT_ACTIONS_MODE = "shadow"
+INSTANT_ACTIONS_MODE = "off"
 INSTANT_ACTIONS_ALLOW = [
     "volume_up", "volume_down", "volume_mute", "volume_unmute",
     "pause_music", "resume_music", "next_song", "previous_song",

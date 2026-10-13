@@ -965,7 +965,7 @@ SCHEMA: dict[str, dict] = {
     # The music gate (core/music_gate.py, 2026-10-04).
     "MUSIC_GATE_MODE": {
         "tab": "hearing", "label": "Stop transcribing music", "type": "enum",
-        "choices": ["off", "shadow", "on"], "default": "shadow",
+        "choices": ["off", "shadow", "on"], "default": "off",
         "help": "While music plays and he needs 'JARVIS' to answer: on = "
                 "song lyrics are not transcribed (every recording is still "
                 "checked for your wake word and your voice); shadow = no "
@@ -1285,7 +1285,7 @@ SCHEMA: dict[str, dict] = {
     "INSTANT_ACTIONS_MODE": {
         "tab": "ai", "label": "Instant actions (volume, music, lights, print pause)",
         "type": "enum", "choices": ["shadow", "on", "off"],
-        "default": "shadow",
+        "default": "off",
         "help": "shadow = the AI model still answers, and JARVIS only logs "
                 "the action it would have run instantly and whether the "
                 "model agreed (data/instant_actions.jsonl: times and action "
@@ -1340,7 +1340,7 @@ SCHEMA: dict[str, dict] = {
     "TURN_CHECK_MODE": {
         "tab": "ai", "label": "Check each turn for a failed reply",
         "type": "enum", "choices": ["off", "shadow", "on"],
-        "default": "shadow",
+        "default": "off",
         "help": "After each turn, check whether the reply claimed an "
                 "action that never ran, ran nothing for a clear command, or "
                 "named an action that does not exist. shadow = only log it "
