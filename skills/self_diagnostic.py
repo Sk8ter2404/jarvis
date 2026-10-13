@@ -3299,6 +3299,18 @@ def _probe_bambu() -> dict:
                            details={"skipped": "monitor still connecting "
                                                "(first attempt pending)",
                                     "ip": ip})
+        # The printer allows ONE local MQTT client. While the live monitor
+        # holds that session, a second connect from this probe is refused and
+        # was reported as a false FAILED (item 336, 2026-10-12): judge from
+        # the monitor's own connection state instead of connecting again.
+        _live = bool(isinstance(_st, dict) and _st.get("monitor_running")
+                     and _st.get("ever_connected"))
+        if _live and _st.get("state") == "connected":
+            return _result(True, 0.0,
+                           details={"ip": ip, "via": "live monitor",
+                                    "state": "connected",
+                                    "age_s": round(float(_st.get("age_s") or 0.0), 1),
+                                    "connected_at": _st.get("connected_at")})
         # If the monitor has already decided the printer is offline/asleep
         # (after a session this boot), skip the 5s MQTT connect entirely.
         # Otherwise this probe fires on every boot sweep and spams "Bambu
@@ -3312,6 +3324,20 @@ def _probe_bambu() -> dict:
         except Exception:
             # If we can't query, just fall through to the real probe.
             pass
+        if _live:
+            # Connected earlier this boot but not right now: report what the
+            # monitor says. Never open a second connection, never invent PASS.
+            _fails = int(_st.get("failures") or 0)
+            _why = str(_st.get("reason") or "no reason recorded").rstrip(".")
+            _hint = str(_st.get("hint") or "").strip()
+            return _result(
+                False, (_now() - start) * 1000.0,
+                error=(f"Bambu printer: monitor is {_st.get('state')} after an "
+                       f"earlier session ({_why}; {_fails} failed attempt"
+                       f"{'' if _fails == 1 else 's'}). {_hint}").strip(),
+                details={"ip": ip, "via": "live monitor",
+                         "state": _st.get("state"), "kind": _st.get("kind"),
+                         "failures": _fails})
 
     try:
         import paho.mqtt.client as mqtt  # type: ignore
