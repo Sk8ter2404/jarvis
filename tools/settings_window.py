@@ -666,6 +666,16 @@ SCHEMA: dict[str, dict] = {
                 "commands always get through. 0 = no hold. Applies on the "
                 "next start.",
     },
+    "CLOUD_BOOST_UNTIL": {
+        "tab": "voice", "label": "Use Claude for hard questions until (date)",
+        "type": "str", "default": "",
+        "help": "A date like 2026-11-05. Through that day, hard questions and "
+                "screen reading are answered by Claude instead of the local "
+                "model, to use up credits before they expire; a local answer "
+                "that fails also falls to Claude. The next day it switches "
+                "itself off. Blank = off. Needs the Claude API key. Applies "
+                "on the next start.",
+    },
     "HUMOR_MODE": {
         "tab": "voice", "label": "Humour style", "type": "enum",
         "choices": ["dry", "sarcastic"], "default": "dry",
@@ -1097,6 +1107,14 @@ SCHEMA: dict[str, dict] = {
         "type": "bool", "default": False,
         "help": "Off by default: a wrong move of the default recording device "
                 "is how JARVIS goes deaf. Applies on the next start.",
+    },
+    "AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA": {
+        "tab": "hearing", "label": "Wait for pause before moving the speakers",
+        "type": "bool", "default": True,
+        "help": "When the headset turns on or off while a video or song is "
+                "playing, wait until it is paused before moving the sound, "
+                "because a video pauses when its output device changes. The "
+                "mic is never delayed. Applies on the next start.",
     },
     "AUDIO_AUTOSWITCH_MIC_FALLBACK": {
         "tab": "hearing", "label": "Mic when the headset turns off",
@@ -2261,7 +2279,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Device dialogues", ["SKILL_ROUTES_ENABLED", "DIALOGUE_ENABLED",
                               "DIALOGUE_MAX_S", "DIALOGUE_STOP_LISTEN",
                               "DIALOGUE_BEAT_S", "DIALOGUE_LOST_HOLD_S"]),
-        ("Personality", ["HUMOR_MODE"]),
+        ("Personality", ["HUMOR_MODE", "CLOUD_BOOST_UNTIL"]),
         ("At night", ["NIGHT_QUIET_ENABLED", "NIGHT_OWL_AUTO"]),
     ],
     "hearing": [
@@ -2275,7 +2293,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                                  "AUDIO_AUTOSWITCH_HEADSET",
                                  "AUDIO_AUTOSWITCH_FALLBACK",
                                  "AUDIO_AUTOSWITCH_MIC",
-                                 "AUDIO_AUTOSWITCH_MIC_FALLBACK"]),
+                                 "AUDIO_AUTOSWITCH_MIC_FALLBACK",
+                                 "AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA"]),
         ("Device changes", ["AUDIO_FLAP_WINDOW_S", "AUDIO_FLAP_THRESHOLD",
                             "AUDIO_ANNOUNCE_MIN_GAP_S",
                             "AUDIO_REPICK_STABLE_S"]),

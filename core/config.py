@@ -1293,6 +1293,16 @@ SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
 TURN_CHECK_MODE = "shadow"
 TURN_CHECK_ESCALATE_MODEL = "claude-sonnet-5-5"
 
+# ─── Time-boxed Claude boost (core/cloud_boost.py, 2026-10-12) ───────────
+# CLOUD_BOOST_UNTIL — an ISO date ("2026-11-05"). Through the end of that day
+#   HARD questions (an explicit "think hard"/"look it up"/"step by step" ask,
+#   or a long multi-part question) and screen-reading / vision questions are
+#   answered by CLAUDE_MODEL instead of the local model, and a local answer
+#   that fails falls to Claude even when AI_BACKEND is "ollama". It needs an
+#   ANTHROPIC_API_KEY; the next day it switches itself off with one log line.
+#   "" (default) = off = nothing changes. Applies on the next start.
+CLOUD_BOOST_UNTIL = ""
+
 # ─── Deterministic fast paths (core/fast_paths.py + core/date_math.py) ──
 # When True, relative-date questions ("what's the date tomorrow", "how many
 # days until Christmas", "how long until Friday"), "what did I just ask you"
@@ -2362,6 +2372,12 @@ AUDIO_AUTOSWITCH_MIC_FALLBACK = os.getenv("JARVIS_AUDIO_MIC_FALLBACK", "")  # e.
 # <= 0 switches the watchdog off entirely (the ON side then behaves as it did
 # before 2026-09-05, i.e. fire-once-and-never-re-check).
 AUDIO_AUTOSWITCH_MIC_SILENT_S = _env_float("JARVIS_AUDIO_MIC_SILENT_S", 60.0)
+
+# While any media session is Playing, the OUTPUT switch (headset on/off) waits:
+# a video pauses when its output device changes (10-09 census: ~16 switches in
+# 10 days, each paused HBO). The switch happens once playback has been quiet
+# for a few seconds, or after a bounded wait. Mic switching is never deferred.
+AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA = True
 
 
 # ─── Audio-device flap damping (bobert_companion + core/audio_flap.py) ─
