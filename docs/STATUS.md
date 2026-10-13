@@ -4,9 +4,9 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.188
-- Live since: 2026-10-12
-- Latest change: v2.0.188 (10-12): test lint fix after v2.0.187 (two-way chat bot, shopping and reminders lists, optional screen comments, gesture fixes, batched learning, privacy guards, cleanup).
+- Version: v2.0.189
+- Live since: 2026-10-13
+- Latest change: v2.0.189 (10-13): queued speech never lost, printer self-check false alarm fixed, camera flap counter, last July-audit findings fixed, dashboard accessibility, FEATURES.md current.
 
 ## In progress
 
@@ -21,29 +21,20 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 Open, planned and idea items. Wording is generic on purpose.
 
-### In progress (9)
+### In progress (4)
 
 - No more bugs on JARVIS or the robot. In progress.
-- Make FEATURES.md match reality. In progress.
-- Fix the leftover findings from the July 4 audit. In progress.
 - Prepare the answer while 'processing' plays. In progress.
 - Stop the robot repeating the same jokes. In progress.
 - Turn checker: retry a bad local answer on Claude. In progress.
-- Test-order leak between two test files. In progress.
-- Air mouse is slow to take the cursor. In progress.
-- JARVIS cleanup overhaul. In progress.
 
-### Planned next (7)
+### Planned next (3)
 
-- Make sure queued speech is never lost. Planned next.
 - Small engineering follow-ups. Planned next.
 - Kinect sees ghost skeletons. Planned next.
-- Refresh the big mission prompt. Planned next.
 - Better memory search models. Planned next.
-- Searchable screen memory. Planned next.
-- Show clearly on the VRAM bar when settings go over the limit. Planned next.
 
-### Ideas (24)
+### Ideas (23)
 
 - Leaner local brain prompt. Idea, not started.
 - Speak the first sentence sooner. Idea, not started.
@@ -68,10 +59,10 @@ Open, planned and idea items. Wording is generic on purpose.
 - JARVIS's voice through the robot's speaker. Idea, not started.
 - A character voice for the robot. Idea, not started.
 - JARVIS mishears its name (Jerry, Gary, Jersey). Idea, not started.
-- Audit the JARVIS dashboard against web design guidelines. Idea, not started.
 
 ## Recent releases
 
+- v2.0.189 (2026-10-13): Queued speech can no longer be lost: a line whose speech fails is retried (up to 3 tries) and a queue file cut off mid-write keeps every intact line. The printer self-check reads the live monitor instead of opening a second connection (no more false FAILED). Cameras that drop off USB and come back are counted per camera with one 'check its cable' line. The last four open July-audit findings are fixed (overnight yes is answered, empty speech no longer clears another line's voice style, the local action list follows new actions, wake-word pause drops leftover audio). Dashboard accessibility fixes, an up-to-date FEATURES.md, and a test-order leak fixed.
 - v2.0.188 (2026-10-12): Test-only lint fix: clears the unused imports and one unused variable that made the GitHub CI lint step fail on v2.0.187. No change to the running code.
 - v2.0.187 (2026-10-12): Two-way chat bot for alerts and commands; a shopping list and a separate reminders list (reminders with no time never land in the developer queue); optional comments about what is on screen; easier air-mouse engage and useful Kinect gestures; batched background learning; game mode, TV and clap tweaks plus an order tracker; privacy guards on test data; repo cleanup (one daily briefing skill).
 - v2.0.186 (2026-10-12): Alexa sign-in rebuilt on the phone-app style OAuth device registration (sign in once, saved token, the real smart-home device list, no session secrets in logs); audio auto-switch waits while media plays; CLOUD_BOOST_UNTIL sends hard turns and screen reading to Claude until a date; PROMPT_SLIM_MODE keeps the cached brain prompt smaller.
@@ -81,6 +72,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.182 (2026-10-09): JARVIS shuts down when asked in plain words ("shut down, no overnight protocol", "yes, that is what I want") and still never on someone else's words; screen vision rebuilt (reads real buttons and links through UI Automation, OCR as backup, checks every click ...
 - v2.0.181 (2026-10-05): a named close closes that app (not "what I opened"), close-all keeps the running app and says when a title alone kept a window, "you forgot X" closes X, a misheard keep/close name gets "did you mean ...?", JARVIS never clicks or types on a sign-in page unless ...
 - v2.0.180 (2026-10-04): fixes the v2.0.179 native abort - the CUDA driver starts before ctranslate2 again, and every CTranslate2 CUDA build, decode and free runs on one never-exiting host thread (a short-lived self-check thread exiting with CTranslate2 CUDA state aborted the ...
-- v2.0.179 (2026-10-04): one voice per reply (the clone never switches mid-reply, a sentence prepared ahead waits until it is needed, a long first line is split at a clause, misses cool down instead of switching the clone off for the session), steady Kinect hand tracking (one shared ...
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
