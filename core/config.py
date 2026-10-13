@@ -289,6 +289,13 @@ LOCAL_LLM_BASE_URL = "http://127.0.0.1:11434"
 #   Float; 0.0 turns it off.
 # Changes apply on the next start.
 PROMPT_FREEZE_QUIET_S = 30.0
+# PROMPT_SLIM_MODE — "on" | "off" (2026-10-12). LOCAL chat route only. "on"
+#   makes the brain's cached system prompt smaller and steadier: its index
+#   names every ACTION (not just each capability), skill routing examples ride
+#   only the turns that mention them, and auto-learned topics / projects ride
+#   only the turns that share a word with them instead of sitting in the
+#   cached prompt. "off" = the previous layout. Changes apply on the next start.
+PROMPT_SLIM_MODE = "on"
 LOCAL_PREFIX_REPRIME = True
 LOCAL_REPRIME_AT_BOOT_S = 20.0
 

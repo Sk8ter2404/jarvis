@@ -1664,3 +1664,304 @@ def split_turn_block(block: str) -> List[Tuple[str, str]]:
         return out
     except Exception:
         return [("", block)]
+
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  SLIM MODE: ACTION INDEX + ROUTED SKILL EXAMPLES  (2026-10-12)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# WHY (census 2026-10-12). The cache-stable split above keeps the system
+# prompt byte-identical, but its CAPABILITY INDEX names SECTIONS only. When
+# the router misses a section the model has no action name for it at all: it
+# refuses, or invents a name ("mute_volume") that dispatches to nothing. At
+# the same time the head carries every skill's full routing examples (~0.7k
+# tokens tracked, ~1.5k with private skills) on every turn, and the learned
+# tail sends auto-learned topics + projects the prompt itself says never to
+# volunteer.
+#
+# PROMPT_SLIM_MODE "on" (core/config.py) changes the LOCAL stable layout:
+#   * the static head's index lists every action NAME the full prompt
+#     documents, grouped by capability (slim_stable_pc_block), so a router
+#     miss never hides a name the model could have used;
+#   * skill routing examples leave the head and ride the turn context only
+#     when the turn's words implicate them (select_skill_examples);
+#   * auto-learned topics / projects leave the cached tail and ride the turn
+#     only when the turn shares a word with them (relevant_lines).
+# Self-terminating actions (core.action_risk) are deliberately NOT indexed:
+# their names reach the model only when the turn's own words route their
+# section, exactly as before (the 10-01 shutdown incident).
+
+_ACTION_REF_RE = re.compile(r"\[ACTION:\s*([a-z][a-z0-9_]*)")
+_SNAKE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])([a-z][a-z0-9]*(?:_[a-z0-9]+)+)(?![A-Za-z0-9_])")
+
+# Safety sections the SLIM head carries in full on every turn (on top of the
+# core preamble's SAFETY / sign-in-page rules and the _ALWAYS sections), so
+# no turn depends on the router for them. SHUTDOWN ALIASES is deliberately
+# not here: it NAMES the self-terminating actions (see above).
+_SLIM_HEAD_SECTIONS = frozenset({"SELF-PRESERVATION"})
+
+_ACTION_INDEX_HEADER = (
+    "\n\nACTION INDEX — every action you can emit, by capability. Full "
+    "instructions for the capabilities this turn needs come with the user's "
+    "message below. Use only these exact names. For an action listed here "
+    "whose instructions were not supplied, emit it only when it takes no "
+    "arguments or its arguments are obvious; otherwise say you can do it and "
+    "ask for the details:\n")
+
+
+def documented_actions(text: str, known=None) -> List[str]:
+    """The action names ``text`` documents, in first-seen order: every
+    ``[ACTION: name`` token, plus (when ``known`` - the registered action
+    names - is given) every registered snake_case name the text mentions.
+    Never raises; [] on a fault."""
+    try:
+        text = text or ""
+        known = set(known or ())
+        found: List[Tuple[int, str]] = []
+        for m in _ACTION_REF_RE.finditer(text):
+            found.append((m.start(), m.group(1)))
+        if known:
+            for m in _SNAKE_RE.finditer(text):
+                if m.group(1) in known:
+                    found.append((m.start(), m.group(1)))
+        found.sort()
+        out: List[str] = []
+        seen = set()
+        for _pos, name in found:
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
+    except Exception:
+        return []
+
+
+def _skill_part_name(txt: str) -> str:
+    first = txt.split("\n", 1)[0]
+    return re.split(r"[(:]", first, 1)[0].strip() or first.strip()
+
+
+def split_skill_examples(block: str,
+                         skill_texts=None) -> List[Tuple[str, str]]:
+    """Split a skill-examples block (the monolith's
+    _skill_prompt_examples_block: blank lines, an intro line, then each
+    skill's PROMPT_EXAMPLES text joined by newlines) into
+    ``[(name, text), ...]``.
+
+    ``skill_texts`` (optional): the per-skill texts the block was joined
+    from, in order. When the block ends with exactly their join, each skill
+    is one part - the real boundary, whatever its lines look like (review
+    2026-10-12: a column-0 "NOTE: ..." line inside one skill split it in two
+    and an indented first line merged the next skill into it). Otherwise a
+    part starts at a column-0 line that opens with an upper-case letter.
+    A part's name is its first line up to the first '(' or ':'. Never
+    raises; on a fault the whole block is one part."""
+    if not block or not block.strip():
+        return []
+    try:
+        texts_in = [str(t) for t in (skill_texts or ()) if str(t).strip()]
+        if texts_in and block.endswith("\n" + "\n".join(texts_in)):
+            return [(_skill_part_name(t), t) for t in texts_in]
+        lines = block.split("\n")
+        i = 0
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        if i < len(lines) and lines[i].startswith("ADDITIONAL SKILL ACTIONS"):
+            i += 1
+        texts: List[str] = []
+        cur: List[str] = []
+        for ln in lines[i:]:
+            if ln[:1].isupper() and cur:
+                texts.append("\n".join(cur))
+                cur = []
+            cur.append(ln)
+        if cur:
+            texts.append("\n".join(cur))
+        return [(_skill_part_name(txt), txt) for txt in texts]
+    except Exception:
+        return [("SKILL ACTIONS", block)]
+
+
+def slim_stable_pc_block(pc_control: str, skill_block: str = "",
+                         known=None, exclude=None, group=None,
+                         skill_texts=None) -> str:
+    """The SLIM byte-stable PC block: the core preamble + the always-on
+    sections (as stable_pc_block) + an ACTION INDEX naming every action the
+    full PC_CONTROL text and ``skill_block`` document, under the capability
+    that documents it. Names already in the core / always-on text are not
+    repeated; names in ``exclude`` (default: core.action_risk
+    SELF_TERMINATING_ACTIONS) are never listed. ``group`` (optional dict:
+    action name -> its handler's identity) lists one name per handler: an
+    alias of a name already listed or in the head runs the very same code,
+    so it is left out. ``skill_texts``: see split_skill_examples. Every
+    section header is listed, with or without actions, so no capability
+    vanishes. Pure function of its inputs. Never raises: a fault falls back to
+    stable_pc_block."""
+    try:
+        excl = set(SELF_TERMINATING_ACTIONS if exclude is None else exclude)
+        core, sections = split_pc_control(pc_control)
+        if not sections:
+            return stable_pc_block(pc_control)
+        pinned = _ALWAYS | _SLIM_HEAD_SECTIONS
+        always = [b for h, b in sections if h.strip().upper() in pinned]
+        head_text = "\n".join([core] + always)
+        group = group or {}
+        listed = set(documented_actions(head_text, known)) | excl
+        handlers = {group[n] for n in listed if n in group}
+        rows: List[str] = []
+        groups = [(h.strip(), b) for h, b in sections
+                  if h.strip().upper() not in pinned]
+        groups += split_skill_examples(skill_block, skill_texts)
+        for name, body in groups:
+            acts = []
+            for a in documented_actions(body, known):
+                if a in listed or (a in group and group[a] in handlers):
+                    continue
+                acts.append(a)
+                listed.add(a)
+                if a in group:
+                    handlers.add(group[a])
+            rows.append(name + (": " + ", ".join(acts) if acts else ""))
+        return (head_text + _ACTION_INDEX_HEADER + "\n".join(rows))
+    except Exception:
+        return stable_pc_block(pc_control)
+
+
+_HINT_STOPWORDS = frozenset("""
+a an and are about any be but by can could did do does for from get got had
+has have how i if in into is it its just let like me my no not of on or our
+please so some tell than that the their them then there these they this to
+up us was we were what when where which who why will with would you your
+jarvis sir hey okay ok yes yeah now again also more want need make give show
+know think thing things going one two set turn open put take""".split())
+
+
+def _content_words(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) >= 3 and w not in _HINT_STOPWORDS}
+
+
+def _word_match(a: set, b: set) -> bool:
+    """Any shared word, or a 5+-letter word of one that starts the other's
+    (plural / -ing tolerance: "printer" ~ "printers")."""
+    if a & b:
+        return True
+    for x in a:
+        if len(x) < 5:
+            continue
+        for y in b:
+            if len(y) >= 5 and (x.startswith(y) or y.startswith(x)):
+                return True
+    return False
+
+
+def select_skill_examples(user_text: str, parts: List[Tuple[str, str]],
+                          history=None, also=None) -> List[str]:
+    """The skill-example texts (from split_skill_examples) this turn
+    implicates: a part routes when the turn shares a content word with the
+    part's name / header line or one of its quoted trigger phrases. Words
+    only a short follow-up's history (routing_text) or ``also`` contribute
+    never route a part that documents a self-terminating action. Never
+    raises; [] on a fault."""
+    try:
+        own = _content_words(user_text)
+        extra = _routing_parts(user_text, history)[1:] + _also_parts(also)
+        hist = _content_words(" ".join(extra))
+        out: List[str] = []
+        for name, text in parts:
+            first = text.split("\n", 1)[0]
+            quoted = " ".join(re.findall(r"'([^']{2,80})'", text))
+            words = _content_words(first + " " + quoted + " " + name)
+            if _word_match(own, words):
+                out.append(text)
+            elif (hist and not documents_self_terminating_action(text)
+                    and _word_match(hist, words)):
+                out.append(text)
+        return out
+    except Exception:
+        return []
+
+
+_HINT_STAMP_RE = re.compile(r"^-\s*\d{4}-\d{2}-\d{2}\s*\([^)]*\):\s*")
+
+
+def relevant_lines(user_text: str, lines, max_n: int = 5) -> List[str]:
+    """The ``lines`` (auto-learned topics / projects) that share a content
+    word with ``user_text``: at most ``max_n``, the newest (last) ones, in
+    their original order. The prompt says to use these hints only when the
+    owner raises them, so a line no word of this turn touches is never
+    needed. Never raises; [] on a fault."""
+    try:
+        own = _content_words(user_text)
+        if not own or max_n <= 0:
+            return []
+        # Match on the hint itself, not its "- date (location): " stamp
+        # ("desk" would otherwise pull in every topic learned at the desk).
+        hits = [ln for ln in (lines or ())
+                if _word_match(own, _content_words(
+                    _HINT_STAMP_RE.sub("", str(ln), count=1)))]
+        return hits[-max_n:]
+    except Exception:
+        return []
+
+
+def router_miss(actions, routed_text: str, stable_text: str) -> List[str]:
+    """The emitted ``actions`` whose names appear in neither this turn's
+    routed text (section bodies + skill examples it shipped) nor the static
+    head's grammar above the ACTION INDEX: the model named it from the
+    index alone, or invented it. Diagnostic only - the caller logs
+    ``[router-miss]``. Never raises; [] on a fault."""
+    try:
+        routed_text = routed_text or ""
+        stable_text = stable_text or ""
+        idx = stable_text.find(_ACTION_INDEX_HEADER)
+        head = stable_text if idx < 0 else stable_text[:idx]
+        seen = set(documented_actions(routed_text + "\n" + head))
+        seen |= set(_SNAKE_RE.findall(routed_text + "\n" + head))
+        return [a for a in (actions or ()) if a and a not in seen]
+    except Exception:
+        return []
+
+
+def section_for_action(pc_control: str, name: str, skill_block: str = "",
+                       known=None, skill_texts=None) -> str:
+    """The full text of the first PC_CONTROL section (or skill-examples part)
+    that documents action ``name``, '' when none does. A [router-miss]
+    appends it to the turn's routed text so a follow-up round of the same
+    turn gets the action's real grammar. Never raises."""
+    try:
+        if not name:
+            return ""
+        known = set(known or ()) | {name}
+        _core, sections = split_pc_control(pc_control)
+        for _h, body in (list(sections)
+                         + split_skill_examples(skill_block, skill_texts)):
+            if name in documented_actions(body, known):
+                return body
+        return ""
+    except Exception:
+        return ""
+
+
+_OWNER_MEMORY_RE = re.compile(
+    r"\b(?:what (?:else )?(?:do|did) you (?:know|remember|recall)"
+    r" (?:about|of) (?:me|myself|your owner)"
+    r"|what (?:else )?have you (?:learned|learnt|picked up|figured out"
+    r"|got|gathered|noticed) (?:about|on|of) me"
+    r"|what(?:'s| is) on file (?:about|for|on) me"
+    r"|tell me (?:about myself|(?:everything |all |what )(?:else )?you "
+    r"(?:know|remember) about me)"
+    r"|how (?:well|much) do you know (?:me|about me)"
+    r"|do you (?:know|remember) anything about me)\b")
+
+
+def is_owner_memory_request(user_text: str) -> bool:
+    """"What do you know about me?" and kin: the one kind of turn that needs
+    EVERY learned fact, not the few recall picks. PROMPT_SLIM_MODE ships the
+    whole fact list with such a turn. Never raises."""
+    try:
+        return bool(_OWNER_MEMORY_RE.search((user_text or "").lower()))
+    except Exception:
+        return False

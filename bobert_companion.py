@@ -2449,6 +2449,15 @@ _system_prompt_stable_len = [0]
 # idiom as above.
 _system_prompt_head = [""]
 
+# The blocks of the newest build_system_prompt() that PROMPT_SLIM_MODE
+# (core/config.py) takes out of the LOCAL cached prompt: "skills" (the skill
+# routing-examples block) with "skill_texts" (the per-skill texts it was
+# joined from - the real part boundaries, prompt_router.split_skill_examples),
+# "projects" / "topics" (the auto-learned hint blocks, exact text) with their
+# "project_lines" / "topic_lines", and "prompt" (the full prompt they belong
+# to). Same single-slot idiom.
+_system_prompt_blocks: list = [{}]
+
 
 def build_system_prompt(memory: dict) -> str:
     # STABLE CORE first, everything memory-derived second. The prompt is one
@@ -2471,13 +2480,18 @@ def build_system_prompt(memory: dict) -> str:
     if rules_block:
         prompt += "\n\n" + rules_block
 
+    _blocks = {"skills": "", "facts": "", "projects": "", "topics": "",
+               "fact_lines": [], "project_lines": [], "topic_lines": [],
+               "skill_texts": []}
     if PC_CONTROL_ENABLED:
         prompt += PC_CONTROL_PROMPT
         # Routing examples contributed by loaded skills (gitignored personal
         # skills whose trigger phrases can't live in the tracked prompts.py).
         # Empty until load_skills() has run — main() rebuilds the prompt once
         # after skill loading so these are always present in the live prompt.
-        prompt += _skill_prompt_examples_block()
+        _blocks["skills"] = _skill_prompt_examples_block()
+        _blocks["skill_texts"] = _skill_prompt_example_texts()
+        prompt += _blocks["skills"]
 
     # ── stable/memory boundary ──────────────────────────────────────────────
     # Everything above changes only on restart / rules edit / skill load;
@@ -2522,8 +2536,10 @@ def build_system_prompt(memory: dict) -> str:
     _system_prompt_head[0] = prompt
 
     if memory["facts"]:
-        prompt += "\n\nWhat you know about your owner:\n"
-        prompt += "\n".join(f"- {f}" for f in memory["facts"])
+        _blocks["fact_lines"] = [f"- {f}" for f in memory["facts"]]
+        _blocks["facts"] = ("\n\nWhat you know about your owner:\n"
+                            + "\n".join(_blocks["fact_lines"]))
+        prompt += _blocks["facts"]
 
     # Projects and topics are AUTO-LEARNED from speech recognition, so they
     # are framed as low-confidence hints the model must not volunteer
@@ -2531,11 +2547,13 @@ def build_system_prompt(memory: dict) -> str:
     # projects). "What am I working on" has a grounded source instead:
     # project_status (skills/project_status.py).
     if memory["projects"]:
-        prompt += ("\n\nProjects picked up from past conversations "
-                   "(auto-learned and unverified: never volunteer one, and "
-                   "answer 'what am I working on' with project_status, not "
-                   "this list):\n")
-        prompt += "\n".join(f"- {p}" for p in memory["projects"])
+        _blocks["project_lines"] = [f"- {p}" for p in memory["projects"]]
+        _blocks["projects"] = (
+            "\n\nProjects picked up from past conversations "
+            "(auto-learned and unverified: never volunteer one, and "
+            "answer 'what am I working on' with project_status, not "
+            "this list):\n" + "\n".join(_blocks["project_lines"]))
+        prompt += _blocks["projects"]
 
     # Secret-shaped topic labels and session summaries written before their
     # write guards existed (2026-10-01) are skipped, not sent every turn.
@@ -2553,15 +2571,16 @@ def build_system_prompt(memory: dict) -> str:
     recent_topics = [t for t in memory["topics"][-15:]
                      if not _is_secret_fact(str(t.get("topic", "")))]
     if recent_topics:
-        prompt += ("\n\nTopics picked up from recent conversations "
-                   "(auto-learned from speech recognition and possibly "
-                   "mis-heard: low-confidence hints only, never volunteer "
-                   "them or state them as fact; use one only if sir raises "
-                   "it first):\n")
-        prompt += "\n".join(
+        _blocks["topic_lines"] = [
             f"- {t['date']} ({t.get('location', '?')}): {t['topic']}"
-            for t in recent_topics
-        )
+            for t in recent_topics]
+        _blocks["topics"] = (
+            "\n\nTopics picked up from recent conversations "
+            "(auto-learned from speech recognition and possibly "
+            "mis-heard: low-confidence hints only, never volunteer "
+            "them or state them as fact; use one only if sir raises "
+            "it first):\n" + "\n".join(_blocks["topic_lines"]))
+        prompt += _blocks["topics"]
 
     # Last: the conversation count goes up at every boot, the day count at
     # midnight.
@@ -2577,6 +2596,11 @@ def build_system_prompt(memory: dict) -> str:
         f"{memory['conversation_count']} conversations."
     )
 
+    # The exact texts of the blocks PROMPT_SLIM_MODE moves out of the local
+    # cached prompt (_local_stable_system_prompt), recorded per build so they
+    # always match the _system_prompt this build becomes.
+    _blocks["prompt"] = prompt
+    _system_prompt_blocks[0] = _blocks
     return prompt
 
 
@@ -23730,10 +23754,211 @@ def _local_stable_system_prompt(base: str | None = None) -> str | None:
     if not (_DYNAMIC_LOCAL_PROMPT and _STABLE_LOCAL_PREFIX
             and PC_CONTROL_PROMPT and PC_CONTROL_PROMPT in base):
         return None
+    if _prompt_slim_on():
+        slim = _slim_local_system_prompt(base)
+        if slim is not None:
+            return slim
     from core import prompt_router as _pr
     _stable_pc = (_LOCAL_NEVER_GUESS_GUARD + "\n"
                   + _pr.stable_pc_block(PC_CONTROL_PROMPT))
     return base.replace(PC_CONTROL_PROMPT, _stable_pc, 1)
+
+
+def _prompt_slim_on() -> bool:
+    """PROMPT_SLIM_MODE (core/config.py) is "on". Never raises."""
+    try:
+        return str(globals().get("PROMPT_SLIM_MODE", "off")).strip().lower() \
+            in ("on", "1", "true", "yes")
+    except Exception:
+        return False
+
+
+# (id(PC_CONTROL_PROMPT), skill block, len(ACTIONS)) -> the slim stable PC
+# block. Computed once per distinct key, so every turn and the re-prime send
+# the very same bytes.
+_SLIM_PC_CACHE: dict = {}
+
+
+def _slim_stable_pc(skill_block: str, skill_texts=None) -> str:
+    """The never-guess guard + prompt_router.slim_stable_pc_block() for the
+    live PC_CONTROL_PROMPT, ``skill_block`` (split on ``skill_texts``, its
+    per-skill texts, when given) and registered ACTIONS."""
+    try:
+        n_actions = len(ACTIONS)
+        known = frozenset(ACTIONS)
+        # One name per handler in the index: an alias runs the same code.
+        group = {}
+        for _n, _f in list(ACTIONS.items()):
+            _f = getattr(_f, "__func__", _f)
+            group[_n] = ("fn", id(_f))
+    except Exception:
+        n_actions, known, group = 0, frozenset(), {}
+    skill_texts = tuple(str(t) for t in (skill_texts or ()))
+    key = (id(PC_CONTROL_PROMPT), skill_block or "", n_actions, skill_texts)
+    hit = _SLIM_PC_CACHE.get(key)
+    if hit is None:
+        from core import prompt_router as _pr
+        hit = (_LOCAL_NEVER_GUESS_GUARD + "\n"
+               + _pr.slim_stable_pc_block(PC_CONTROL_PROMPT, skill_block or "",
+                                          known=known, group=group,
+                                          skill_texts=skill_texts))
+        if len(_SLIM_PC_CACHE) > 8:
+            _SLIM_PC_CACHE.clear()
+        _SLIM_PC_CACHE[key] = hit
+    return hit
+
+
+def _slim_local_system_prompt(base: str) -> str | None:
+    """PROMPT_SLIM_MODE's local system prompt for ``base`` (the live prompt
+    or its head): PC_CONTROL_PROMPT + the skill routing-examples block
+    replaced by _slim_stable_pc (core + always-on + every action by name),
+    and the auto-learned projects / topics blocks taken out (they ride the
+    turn context instead, only when relevant - _slim_turn_hints). None when
+    ``base`` does not hold the newest build's skill block. Never raises."""
+    try:
+        blocks = _system_prompt_blocks[0] or {}
+        skills = str(blocks.get("skills") or "")
+        target = PC_CONTROL_PROMPT + skills
+        if target not in base:
+            return None
+        out = base.replace(
+            target, _slim_stable_pc(skills, blocks.get("skill_texts")), 1)
+        for key in ("facts", "projects", "topics"):
+            text = str(blocks.get(key) or "")
+            if text and text in out:
+                out = out.replace(text, "", 1)
+        return out
+    except Exception:
+        return None
+
+
+def _slim_skill_parts() -> list:
+    """The newest build's skill routing examples split per skill
+    (prompt_router.split_skill_examples). Never raises."""
+    try:
+        from core import prompt_router as _pr
+        blocks = _system_prompt_blocks[0] or {}
+        return _pr.split_skill_examples(str(blocks.get("skills") or ""),
+                                        blocks.get("skill_texts"))
+    except Exception:
+        return []
+
+
+def _log_router_miss(name: str, registered: bool) -> None:
+    """``[router-miss]`` telemetry (2026-10-12 census: the router had no miss
+    counter at all). On the cache-stable local layout, an emitted action whose
+    name is in neither this turn's routed text (_last_turn_pc_block) nor the
+    head's grammar above the index was named from the ACTION INDEX alone
+    ("indexed": its instructions were not supplied, so its arguments are a
+    guess) or invented ("unknown"). Log only. Never raises."""
+    try:
+        sys_now = _last_stable_sys_prompt[0]
+        if not name or not sys_now:
+            return
+        from core import prompt_router as _pr
+        if _pr.router_miss([name], _last_turn_pc_block[0], sys_now):
+            print(f"  [router-miss] {name} "
+                  f"{'indexed' if registered else 'unknown'}")
+            # Hand a follow-up round of this turn the section the router
+            # missed (it rides the volatile turn context, never the prefix).
+            if registered and _prompt_slim_on():
+                _blocks = _system_prompt_blocks[0] or {}
+                body = _pr.section_for_action(
+                    PC_CONTROL_PROMPT, name, str(_blocks.get("skills") or ""),
+                    skill_texts=_blocks.get("skill_texts"))
+                if body and body not in _last_turn_pc_block[0]:
+                    _last_turn_pc_block[0] = (
+                        (_last_turn_pc_block[0] + "\n" + body)
+                        if _last_turn_pc_block[0] else body)
+    except Exception:
+        pass
+
+
+_SLIM_FACTS_PER_TURN = 6
+# A "what do you know about me" turn ships the fact list, newest first, up
+# to this many estimated tokens (review 2026-10-12: 300 facts made one
+# ~7k-token block the prompt budget could only drop WHOLE, so the model
+# answered as if it knew nothing). ~120 typical facts are well under it.
+_SLIM_FACTS_MAX_TOKENS = 3500
+
+# The learned hints _call_llm computed for the current turn's owner words,
+# WITHOUT the long-term-memory de-duplication (a follow-up round does not
+# carry that recall). get_followup_response re-sends them on the local
+# cache-stable layout: those facts are no longer in the system prompt it
+# reuses (review 2026-10-12). Same single-slot idiom as _last_turn_pc_block.
+_last_turn_hints = [""]
+
+
+def _capped_fact_block(intro: str, lines: list) -> str:
+    """``intro`` + the newest ``lines`` (original order) that fit
+    _SLIM_FACTS_MAX_TOKENS, with a note naming how many older ones were
+    left out. Never raises."""
+    try:
+        kept, used = [], _prompt_budget.estimate_tokens(intro) + 30
+        for ln in reversed(lines):
+            cost = _prompt_budget.estimate_tokens(ln + "\n")
+            if kept and used + cost > _SLIM_FACTS_MAX_TOKENS:
+                break
+            kept.append(ln)
+            used += cost
+        kept.reverse()
+        out = intro + "\n".join(kept)
+        if len(kept) < len(lines):
+            out += (f"\n- (...and {len(lines) - len(kept)} older facts not "
+                    f"shown here.)")
+        return out
+    except Exception:
+        return intro + "\n".join(lines[-_SLIM_FACTS_PER_TURN:])
+
+
+def _slim_turn_hints(user_text: str, sent_system: str,
+                     ltm_text: str = "") -> str:
+    """PROMPT_SLIM_MODE: the learned blocks that left the cached prompt
+    (_slim_local_system_prompt), brought back for THIS turn only, framed
+    exactly as the system prompt framed them, or ''.
+
+      * facts: ALL of them on a "what do you know about me" turn
+        (prompt_router.is_owner_memory_request); otherwise the few that share
+        a word with the turn (at most _SLIM_FACTS_PER_TURN) and are not
+        already in ``ltm_text`` (this turn's long-term-memory recall, which
+        is the main per-turn fact source);
+      * auto-learned projects / topics: the ones that share a word with the
+        turn (the prompt says to use them only when sir raises them).
+
+    Only for a block ``sent_system`` (this turn's system prompt) does not
+    hold, and only while the live _system_prompt is the build those blocks
+    came from - itself, or with a mode addendum appended (focus / night-owl /
+    workshop modes extend _system_prompt that way). Never raises."""
+    try:
+        blocks = _system_prompt_blocks[0] or {}
+        built = blocks.get("prompt")
+        if not built or not (_system_prompt or "").startswith(built):
+            return ""
+        from core import prompt_router as _pr
+        out = ""
+        facts = str(blocks.get("facts") or "")
+        if facts and facts not in (sent_system or ""):
+            if _pr.is_owner_memory_request(user_text):
+                out += _capped_fact_block(facts.split(":\n", 1)[0] + ":\n",
+                                          list(blocks.get("fact_lines") or []))
+            else:
+                hits = [ln for ln in _pr.relevant_lines(
+                            user_text, blocks.get("fact_lines") or [],
+                            max_n=_SLIM_FACTS_PER_TURN)
+                        if ln[2:].strip() not in (ltm_text or "")]
+                if hits:
+                    out += (facts.split(":\n", 1)[0] + ":\n"
+                            + "\n".join(hits))
+        for key, lines_key in (("projects", "project_lines"),
+                               ("topics", "topic_lines")):
+            text = str(blocks.get(key) or "")
+            hits = _pr.relevant_lines(user_text, blocks.get(lines_key) or [])
+            if text and hits and text not in (sent_system or ""):
+                intro = text.split(":\n", 1)[0] + ":\n"
+                out += intro + "\n".join(hits)
+        return out
+    except Exception:
+        return ""
 
 
 def _local_prompt_head(system: str | None = None) -> str | None:
@@ -24230,10 +24455,31 @@ def _apply_prompt_rebuild() -> bool:
         print("  [memory] prompt rebuild skipped: the memory store is "
               "unreadable; keeping the current prompt")
         return False
+    # PROMPT_SLIM_MODE: learned facts / topics / projects are not in the
+    # LOCAL cached prompt, so a rebuild that only learned those leaves the
+    # local prompt byte-identical and needs no re-prime (_rebuild_local_changed).
+    try:
+        old_local = (_local_stable_system_prompt(_system_prompt)
+                     if _prompt_slim_on() else None)
+    except Exception:
+        old_local = None
     new = build_system_prompt(mem)
     changed = new != _system_prompt
     _system_prompt = new
+    local_changed = changed
+    if changed and old_local is not None:
+        try:
+            if _local_stable_system_prompt(new) == old_local:
+                local_changed = False
+        except Exception:
+            pass
+    _rebuild_local_changed[0] = local_changed
     return changed
+
+
+# Whether the newest _apply_prompt_rebuild changed the LOCAL cached prompt
+# (False when PROMPT_SLIM_MODE kept it byte-identical): the re-prime trigger.
+_rebuild_local_changed = [True]
 
 
 def _rebuild_prompt_now() -> bool:
@@ -24248,7 +24494,7 @@ def _rebuild_prompt_now() -> bool:
     with _prompt_rebuild_lock:
         _prompt_rebuild_pending[0] = False
     changed = _apply_prompt_rebuild()
-    if changed:
+    if changed and _rebuild_local_changed[0]:
         try:
             if _chat_takes_local_branch():
                 _schedule_local_reprime()   # keeps its own gates
@@ -24294,9 +24540,11 @@ def _poll_deferred_prompt_rebuild(now: float | None = None) -> bool:
             return False
         _prompt_rebuild_pending[0] = False
     changed = _apply_prompt_rebuild()
+    local_same = changed and not _rebuild_local_changed[0]
     print(f"  [prompt-freeze] deferred rebuild applied "
-          f"({'changed' if changed else 'unchanged'})")
-    if changed:
+          f"({'changed' if changed else 'unchanged'}"
+          f"{', local prompt unchanged' if local_same else ''})")
+    if changed and not local_same:
         _schedule_local_reprime()
     return True
 
@@ -25199,6 +25447,19 @@ def _call_llm(user_text: str) -> str:
                                           also=_offer_route)
             _turn_inherited = _pr.inherited_turn_sections(
                 user_text, PC_CONTROL_PROMPT, history=_route_hist)
+            # PROMPT_SLIM_MODE: the skill routing examples left the cached
+            # head (their action names stay in its ACTION INDEX); the ones
+            # this turn's words implicate ride with the section bodies.
+            _skills_blk = str((_system_prompt_blocks[0] or {}).get(
+                "skills") or "")
+            if (_prompt_slim_on() and _skills_blk
+                    and _skills_blk not in _base_prompt):
+                _skill_txt = "\n".join(_pr.select_skill_examples(
+                    user_text, _slim_skill_parts(), history=_route_hist,
+                    also=_offer_route))
+                if _skill_txt:
+                    _turn_ctx = (_turn_ctx + "\n" + _skill_txt
+                                 if _turn_ctx else _skill_txt)
             _stable_split = True
         except Exception as _pr_err:
             print(f"  [prompt-router] stable split failed ({_pr_err}); "
@@ -25224,6 +25485,16 @@ def _call_llm(user_text: str) -> str:
             print(f"  [prompt-router] slim failed ({_pr_err}); full prompt")
             _base_prompt = _system_prompt
 
+    _ltm_txt = _ltm_context(user_text)
+    # PROMPT_SLIM_MODE: the learned facts / projects / topics this turn shares
+    # a word with (they left the cached prompt; see _slim_local_system_prompt)
+    # - '' otherwise. The follow-up rounds get the copy without the LTM
+    # de-duplication (_last_turn_hints).
+    _hints_txt, _last_turn_hints[0] = "", ""
+    if _stable_split and _prompt_slim_on():
+        _hints_txt = _slim_turn_hints(user_text, _base_prompt, _ltm_txt)
+        _last_turn_hints[0] = (_slim_turn_hints(user_text, _base_prompt)
+                               if _ltm_txt else _hints_txt)
     # Kept as labelled, ranked pieces so the local prompt budget can drop the
     # least important ones from an overflowing turn (_fit_local_messages);
     # _turn_addenda is their plain concatenation, in this order.
@@ -25237,8 +25508,8 @@ def _call_llm(user_text: str) -> str:
         # Per-turn semantic recall from tiered long-term memory. Lives in the
         # VOLATILE tail so it never invalidates the cached stable prefix
         # (see _cached_system_param); '' when disabled / cold / slow.
-        ("long-term memory", _ltm_context(user_text),
-         _prompt_budget.RANK_MEMORY),
+        ("long-term memory", _ltm_txt, _prompt_budget.RANK_MEMORY),
+        ("learned hints", _hints_txt, _prompt_budget.RANK_MEMORY),
         # Phrasebook "last used" rotation hint (2026-09-29): per-turn by
         # nature, so it lives here with the other volatile material and never
         # in the system prompt, where each rotation changed the cached prefix.
@@ -35369,12 +35640,18 @@ def _collect_skill_web_panels(mod, name: str) -> None:
         print(f"  [skill] {name}: WEB_PANELS could not be applied: {_wpe}")
 
 
+def _skill_prompt_example_texts() -> list:
+    """Each skill's routing-examples text, in _skill_prompt_examples_block's
+    order (the per-skill boundaries PROMPT_SLIM_MODE routes on)."""
+    return [_SKILL_PROMPT_EXAMPLES[k] for k in sorted(_SKILL_PROMPT_EXAMPLES)]
+
+
 def _skill_prompt_examples_block() -> str:
     """The system-prompt block for skill-contributed routing examples, or ''
     when no skill registered any."""
     if not _SKILL_PROMPT_EXAMPLES:
         return ""
-    parts = [_SKILL_PROMPT_EXAMPLES[k] for k in sorted(_SKILL_PROMPT_EXAMPLES)]
+    parts = _skill_prompt_example_texts()
     return ("\n\nADDITIONAL SKILL ACTIONS (locally-installed skills — same "
             "[ACTION: ...] contract as above):\n" + "\n".join(parts))
 
@@ -41073,6 +41350,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         # word. A coordinate click stays the silent "click".
         name = _click_alias(name, arg)
         fn   = ACTIONS.get(name)
+        _log_router_miss(name, fn is not None)
         if fn is None and _cmd_autocorrect is not None:
             # Fuzzy-correction layer. ACTIONS may have grown via
             # load_skills() since boot, so we always pass the live keys.
@@ -41754,8 +42032,13 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
             # As ranked parts joining to exactly
             # _last_turn_pc_block[0] + _followup_addenda, so the prompt budget
             # can shed the least important ones from an overflowing round.
-            _local_parts = _turn_budget_parts(_last_turn_pc_block[0],
-                                              _followup_addenda_parts)
+            # PROMPT_SLIM_MODE: the turn's learned hints too - that system
+            # prompt no longer holds the facts / topics / projects.
+            _local_parts = _turn_budget_parts(
+                _last_turn_pc_block[0],
+                _followup_addenda_parts + [
+                    ("learned hints", _last_turn_hints[0],
+                     _prompt_budget.RANK_MEMORY)])
         try:
             _fitted = _fit_followup_round(_local_sys, action_results,
                                           _local_parts)
@@ -48583,6 +48866,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         _stream_spoken_prefix[0] = ""
         _last_stable_sys_prompt[0] = ""
         _last_turn_pc_block[0] = ""
+        _last_turn_hints[0] = ""
         # _call_llm is also what records the owner's words for skills that
         # check the transcript before acting (a device dialogue refuses to
         # start off any sentence but the one that asked for it), so a routed
@@ -48613,6 +48897,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         # user text and must not be replayed as this chain's reference.
         _last_stable_sys_prompt[0] = ""
         _last_turn_pc_block[0] = ""
+        _last_turn_hints[0] = ""
     else:
         _accepted_offer[0] = _offer_yes
         try:

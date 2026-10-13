@@ -1284,6 +1284,14 @@ SCHEMA: dict[str, dict] = {
                 "reply starts warm (0 = update between turns). Applies on the "
                 "next start.",
     },
+    "PROMPT_SLIM_MODE": {
+        "tab": "ai", "label": "Slim local brain prompt",
+        "type": "enum", "choices": ["on", "off"], "default": "on",
+        "help": "Local brain only. on = a smaller, steadier cached prompt: it "
+                "lists every action by name, and skill examples and "
+                "auto-learned topics ride only the turns that mention them. "
+                "off = the previous layout. Applies on the next start.",
+    },
     "LOCAL_PREFIX_REPRIME": {
         "tab": "ai", "label": "Re-warm the local brain after prompt updates",
         "type": "bool", "default": True,
@@ -2323,7 +2331,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                    "AMBIENT_LEARNING_FORCE_LOCAL", "GAME_MODE_ENABLED"]),
         ("Memory", ["LTM_ENABLED", "RAG_ENABLED"]),
         ("Speed", ["FAST_PATHS_ENABLED", "INSTANT_ACTIONS_MODE",
-                   "PROMPT_FREEZE_QUIET_S",
+                   "PROMPT_FREEZE_QUIET_S", "PROMPT_SLIM_MODE",
                    "LOCAL_PREFIX_REPRIME", "LOCAL_BACKGROUND_MAX_DEFER_S",
                    "LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S",
                    "BACKGROUND_TAG_STRICT", "LOCAL_REPRIME_AT_BOOT_S"]),
