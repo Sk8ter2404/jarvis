@@ -76,6 +76,9 @@ _BRAND_TO_SKILL = {
     "tapo":         "sh_kasa",
     "lifx":         "sh_lifx",
     "govee":        "sh_govee",
+    "magic home":   "sh_magichome",
+    "magichome":    "sh_magichome",
+    "flux":         "sh_magichome",
     "ecobee":       "sh_ecobee",
     "nest":         "sh_nest",
     "google nest":  "sh_nest",
@@ -1135,7 +1138,7 @@ def _summarize_verdict(action: dict, results: list[dict]) -> str:
 _SKILL_LABELS = {
     "sh_hue": "Hue", "sh_kasa": "Kasa", "sh_lifx": "LIFX", "sh_govee": "Govee",
     "sh_ecobee": "Ecobee", "sh_nest": "Nest", "sh_ring": "Ring",
-    "sh_tuya": "Tuya",
+    "sh_tuya": "Tuya", "sh_magichome": "Magic Home",
 }
 # Names read out before "and N more".
 _CATALOG_SPOKEN_NAMES = 10

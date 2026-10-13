@@ -39,6 +39,12 @@ ROBOT_IP      = "192.168.1.XXX"   # printed on Serial at boot
 ROBOT_PORT    = 80
 
 
+# ─── Smart home ────────────────────────────────────────────────────────
+# Direct LAN control of Magic Home / Flux LED strips (flux_led). It only acts
+# on owner commands, so it defaults ON; the router falls back to Alexa.
+MAGICHOME_ENABLED = True
+
+
 # ─── PC control ────────────────────────────────────────────────────────
 # Master switch — let the LLM launch apps, open URLs, etc.
 PC_CONTROL_ENABLED = True
