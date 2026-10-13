@@ -101,6 +101,7 @@ def _fake_bc():
     bc.proactive_announce = mock.MagicMock(return_value=True)
     for k, v in {
         "GAME_MODE_ENABLED": False,
+        "GAME_MODE_DETECT_FULLSCREEN": False,
         "GAME_MODE_PROCESS_HINTS": [GAME],
         "GAME_MODE_BRAIN": SMALL,
         "GAME_MODE_VERIFY_DELAY_SECONDS": 0.0,

@@ -509,64 +509,9 @@ class TeamsPhraseTests(unittest.TestCase):
                 self.mod._section_teams_phrase(),
                 "three new Teams chats from Alice, Sam, and Pat")
 
-    # ── _section_teams_phrase nudge fallback (vision found nothing) ───────
-    def test_fallback_no_nudge_skill(self):
+    def test_no_senders_is_empty(self):
         with mock.patch.object(self.mod, "_teams_top_senders_via_vision",
-                               return_value=[]), \
-             mock.patch.object(self.mod, "_import_skill", return_value=None):
-            self.assertEqual(self.mod._section_teams_phrase(), "")
-
-    def test_fallback_single_unread_with_sender(self):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.return_value = (True, 1, "Sam")
-        with mock.patch.object(self.mod, "_teams_top_senders_via_vision",
-                               return_value=[]), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            self.assertEqual(self.mod._section_teams_phrase(),
-                             "one unread Teams message from Sam")
-
-    def test_fallback_single_unread_no_sender(self):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.return_value = (True, 1, "")
-        with mock.patch.object(self.mod, "_teams_top_senders_via_vision",
-                               return_value=[]), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            self.assertEqual(self.mod._section_teams_phrase(),
-                             "one unread Teams message")
-
-    def test_fallback_multi_unread_with_sender(self):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.return_value = (True, 4, "Sam")
-        with mock.patch.object(self.mod, "_teams_top_senders_via_vision",
-                               return_value=[]), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            self.assertEqual(
-                self.mod._section_teams_phrase(),
-                "4 unread Teams messages including one from Sam")
-
-    def test_fallback_multi_unread_no_sender(self):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.return_value = (True, 3, "")
-        with mock.patch.object(self.mod, "_teams_top_senders_via_vision",
-                               return_value=[]), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            self.assertEqual(self.mod._section_teams_phrase(),
-                             "3 unread Teams messages")
-
-    def test_fallback_nothing_unread(self):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.return_value = (False, 0, "")
-        with mock.patch.object(self.mod, "_teams_top_senders_via_vision",
-                               return_value=[]), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            self.assertEqual(self.mod._section_teams_phrase(), "")
-
-    def test_fallback_vision_lookup_raises(self):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.side_effect = RuntimeError("vision down")
-        with mock.patch.object(self.mod, "_teams_top_senders_via_vision",
-                               return_value=[]), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
+                               return_value=[]):
             self.assertEqual(self.mod._section_teams_phrase(), "")
 
 

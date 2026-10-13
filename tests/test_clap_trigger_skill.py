@@ -916,9 +916,123 @@ class RegisterTests(unittest.TestCase):
         start.assert_called_once()
 
 
+# ─── music / TV audio must never fire it (2026-10-12) ────────────────────────
+class TvAndMusicTests(_Base):
+    """The claps are on by default, so the question that matters is what they
+    must NOT do: a TV (speech, a score, applause, a gunshot) and music in the
+    room. Two layers, both pinned here: the detector's isolation rule on a
+    realistic TV soundtrack pushed through the REAL tap -> worker path, and the
+    camera's TV veto in the gates."""
+
+    def _tv_soundtrack(self, seed):
+        from tests.test_clap_detector import (
+            _Scene, speech_like, clap, kick, snare, hat)
+        rng = np.random.default_rng(seed)
+        sc = _Scene(14.0, rng)
+        t = np.arange(len(sc.x)) / SR
+        # an underscore bed, dialogue over the top, a drum cue, and applause
+        # (a dense, irregular train of claps) with one isolated-looking pair
+        # inside the talking.
+        sc.x += 0.03 * (np.sin(2 * np.pi * 110.0 * t)
+                        + 0.5 * np.sin(2 * np.pi * 220.0 * t))
+        sc.add(0.3, speech_like(rng, dur=13.0, amp=0.35))
+        for k in range(8):
+            at = 1.0 + k * 0.5
+            sc.add(at, kick(rng))
+            sc.add(at + 0.25, snare(rng))
+            sc.add(at + 0.25, hat(rng))
+        for at in np.cumsum(rng.uniform(0.05, 0.3, 25)) + 7.0:
+            sc.add(float(at), clap(rng, float(rng.uniform(0.3, 0.7))))
+        sc.add(5.0, clap(rng, 0.5))
+        sc.add(5.3, clap(rng, 0.5))
+        return sc.samples()
+
+    def _run_through_the_tap(self, samples):
+        p = mock.patch.object(self.mod, "_GAP_S", 1.0)
+        p.start()
+        self.addCleanup(p.stop)
+        bc = self.bc()
+        self.inject("bobert_companion", bc)
+        self.assertTrue(self.mod._start_worker())
+        self.addCleanup(self.mod._stop_worker)
+        deadline = time.monotonic() + 3.0
+        while not bc._taps and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(bc._taps), 1)
+        q = bc._taps[0]
+        for i in range(0, len(samples), 1024):
+            while q.qsize() > 8:
+                time.sleep(0.001)
+            q.put(samples[i:i + 1024])
+        deadline = time.monotonic() + 8.0
+        while q.qsize() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.3)
+        return bc
+
+    def test_a_tv_soundtrack_never_runs_the_routine(self):
+        for seed in (3, 4, 5):
+            with self.subTest(seed=seed):
+                self.setup_calls.clear()
+                self.mod._reset_state_for_tests()
+                bc = self._run_through_the_tap(self._tv_soundtrack(seed))
+                self.assertEqual(self.setup_calls, [])
+                self.assertEqual(bc._announced, [])
+                self.assertEqual(self.mod.status_snapshot()["fired"], 0)
+                self.mod._stop_worker()
+
+    def test_a_real_double_clap_in_a_quiet_room_still_fires(self):
+        # The same pipeline, same settings: the veto layers do not eat the
+        # feature.
+        bc = self._run_through_the_tap(_scene([1.5, 1.8]))
+        self.assertEqual(len(self.setup_calls), 1)
+        self.assertEqual(self.mod.status_snapshot()["fired"], 1)
+
+    def test_the_camera_seeing_the_tv_on_ignores_the_claps(self):
+        tv = types.ModuleType("skill_tv_detect")
+        tv.is_tv_on = lambda: True
+        self.inject("skill_tv_detect", tv)
+        out = self.mod.handle_double_clap(self.bc(), _event(), now=10.0)
+        self.assertEqual(out, "ignored: the TV is on")
+        self.assertEqual(self.setup_calls, [])
+        self.assertIn("the TV is on",
+                      self.mod.status_snapshot()["last_ignored"])
+
+    def test_no_tv_means_the_claps_run(self):
+        tv = types.ModuleType("skill_tv_detect")
+        tv.is_tv_on = lambda: False
+        self.inject("skill_tv_detect", tv)
+        self.assertEqual(
+            self.mod.handle_double_clap(self.bc(), _event(), now=10.0),
+            "fired")
+
+    def test_a_broken_tv_detector_does_not_block_the_claps(self):
+        tv = types.ModuleType("skill_tv_detect")
+
+        def boom():
+            raise RuntimeError("camera exploded")
+        tv.is_tv_on = boom
+        self.inject("skill_tv_detect", tv)
+        self.assertEqual(
+            self.mod.handle_double_clap(self.bc(), _event(), now=10.0),
+            "fired")
+
+    def test_the_tv_veto_is_logged_with_its_reason(self):
+        tv = types.ModuleType("skill_tv_detect")
+        tv.is_tv_on = lambda: True
+        self.inject("skill_tv_detect", tv)
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.mod.handle_double_clap(self.bc(), _event(), now=10.0)
+        self.assertIn("double clap ignored", buf.getvalue())
+        self.assertIn("the TV is on", buf.getvalue())
+
+
 # ─── settings surface ───────────────────────────────────────────────────────
 class SettingsSurfaceTests(unittest.TestCase):
-    KEYS = {"CLAP_TRIGGER_ENABLED": False,
+    KEYS = {"CLAP_TRIGGER_ENABLED": True,
             "CLAP_TRIGGER_ACTION": "acknowledge",
             "CLAP_TRIGGER_WAKE": False,
             "CLAP_TRIGGER_COOLDOWN_S": 60.0,
@@ -940,7 +1054,7 @@ class SettingsSurfaceTests(unittest.TestCase):
                     pass
         return out
 
-    def test_shipped_defaults_are_off_safe(self):
+    def test_shipped_defaults_are_on_with_the_safe_routine(self):
         lits = self._config_literals()
         for key, want in self.KEYS.items():
             with self.subTest(key=key):

@@ -236,6 +236,12 @@ class AmazonTestBase(unittest.TestCase):
         self.mod, self.actions = load_skill_isolated("amazon_order_tracker")
         self._tmp = tempfile.TemporaryDirectory()
         self.mod._STATE_FILE = os.path.join(self._tmp.name, "amazon_state.json")
+        # Never the real read-only Gmail token, never a live refresh thread.
+        self.mod.GMAIL_READONLY_TOKEN_FILE = os.path.join(
+            self._tmp.name, "gmail_readonly_token.json")
+        self.mod._refresh_now = lambda timeout=0.0: None
+        self.mod._ro_cache[0] = None
+        self.mod._ro_problem[0] = ""
         self.addCleanup(self._tmp.cleanup)
         # A handful of code paths (register / start_monitor) print status banners
         # straight to stdout. The harness only captures during import, not the
@@ -458,6 +464,13 @@ class FmtDateTests(AmazonTestBase):
 
 
 class ActionTests(AmazonTestBase):
+    def setUp(self):
+        super().setUp()
+        # These pin the roll-call wording, so the mailbox counts as signed in.
+        p = mock.patch.object(self.mod, "_backend_problem", return_value="")
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_check_orders_no_state(self):
         with mock.patch.object(self.mod, "_load_state",
                                return_value={"orders": {}}):
@@ -505,7 +518,7 @@ class ActionTests(AmazonTestBase):
             out = self.actions["amazon_tracking_status"]("")
         self.assertIn("enabled: True", out)
         self.assertIn("Outlook: configured", out)
-        self.assertIn("Gmail: not configured", out)
+        self.assertIn("Gmail: not signed in", out)
         self.assertIn("orders tracked: 1", out)
         self.assertTrue(out.rstrip().endswith("sir."))
 
@@ -516,16 +529,30 @@ class ConfigShimTests(AmazonTestBase):
         with inject_modules(bobert_companion=_fake_bc(AMAZON_TRACKING_ENABLED=True)):
             self.assertTrue(self.mod._read_feature_flag())
 
-    def test_read_feature_flag_default_false_when_attr_missing(self):
+    def test_read_feature_flag_reads_core_config_when_attr_missing(self):
+        # The flag lives in core/config.py (2026-10-12); a monolith without
+        # the attribute defers to it.
+        from core import config as cfg
         with inject_modules(bobert_companion=_fake_bc()):
-            self.assertFalse(self.mod._read_feature_flag())
+            with mock.patch.object(cfg, "AMAZON_TRACKING_ENABLED", False,
+                                   create=True):
+                self.assertFalse(self.mod._read_feature_flag())
+            with mock.patch.object(cfg, "AMAZON_TRACKING_ENABLED", True,
+                                   create=True):
+                self.assertTrue(self.mod._read_feature_flag())
 
-    def test_read_feature_flag_import_failure_is_false(self):
-        # No bobert_companion importable → swallowed → False.
+    def test_read_feature_flag_import_failure_reads_core_config(self):
+        from core import config as cfg
         with inject_modules(bobert_companion=None):
             with mock.patch.object(self.mod.importlib, "import_module",
                                    side_effect=ImportError("no bc")):
-                self.assertFalse(self.mod._read_feature_flag())
+                with mock.patch.object(cfg, "AMAZON_TRACKING_ENABLED", False,
+                                       create=True):
+                    self.assertFalse(self.mod._read_feature_flag())
+
+    def test_the_shipped_default_is_on_and_lives_in_core_config(self):
+        from core import config as cfg
+        self.assertTrue(cfg.AMAZON_TRACKING_ENABLED)
 
     def test_email_triage_resolves_first_name(self):
         et = _fake_email_triage()
@@ -824,11 +851,13 @@ class FetchGmailTests(AmazonTestBase):
         with self._patch_triage(et):
             self.assertEqual(self.mod._fetch_gmail(), [])
 
-    def test_missing_shape_returns_empty(self):
-        svc = _FakeGmailService(list_result={"messages": [{"id": "g1"}]})
+    def test_missing_shape_falls_back_to_the_trackers_own(self):
+        svc = _FakeGmailService(list_result={"messages": [{"id": "g1"}]},
+                                full_by_id={"g1": self._gmail_full("g1")})
         et = _fake_email_triage(gmail_service=svc, drop_gmail_shape=True)
         with self._patch_triage(et):
-            self.assertEqual(self.mod._fetch_gmail(), [])
+            out = self.mod._fetch_gmail()
+        self.assertEqual([m["id"] for m in out], ["g1"])
 
     def test_list_raises_returns_empty(self):
         svc = _FakeGmailService(list_raises=True)
@@ -1011,11 +1040,28 @@ class ActionEdgeTests(AmazonTestBase):
 # ─── Poll lifecycle: _poll_once / _poll_loop ────────────────────────────────
 class PollOnceTests(AmazonTestBase):
     def test_poll_once_no_messages_updates_ts(self):
+        # A fetcher that REACHED its mailbox and found nothing new.
+        def reached():
+            self.mod._fetch_status["ok"] = True
+            return []
         with mock.patch.object(self.mod, "_fetch_outlook", return_value=[]), \
-             mock.patch.object(self.mod, "_fetch_gmail", return_value=[]):
+             mock.patch.object(self.mod, "_fetch_gmail", side_effect=reached):
             n = self.mod._poll_once()
         self.assertEqual(n, 0)
-        self.assertGreater(self.mod._load_state()["last_poll_ts"], 0.0)
+        st = self.mod._load_state()
+        self.assertGreater(st["last_poll_ts"], 0.0)
+        self.assertTrue(st["seeded"])
+
+    def test_poll_once_that_reached_nothing_is_not_a_clean_poll(self):
+        # Could not look (no sign-in / a failed call) is not "no mail": the
+        # timestamp stays put and the reason is recorded.
+        with mock.patch.object(self.mod, "_fetch_outlook", return_value=[]), \
+             mock.patch.object(self.mod, "_fetch_gmail", return_value=[]):
+            self.mod._poll_once()
+        st = self.mod._load_state()
+        self.assertEqual(st["last_poll_ts"], 0.0)
+        self.assertFalse(st.get("seeded"))
+        self.assertTrue(st["last_error"])
 
     def test_poll_once_processes_fetched_messages(self):
         oid = "113-1234567-7654321"
@@ -1044,6 +1090,12 @@ class PollOnceTests(AmazonTestBase):
 
 
 class PollLoopTests(AmazonTestBase):
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(self.mod, "_any_backend", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_loop_exits_immediately_on_initial_wait(self):
         # stop_evt.wait(INITIAL_DELAY) returning True → loop returns at once.
         evt = mock.MagicMock()
@@ -1098,11 +1150,19 @@ class MonitorLifecycleTests(AmazonTestBase):
         with mock.patch.object(self.mod, "_read_feature_flag", return_value=True):
             self.assertTrue(self.mod.start_monitor())
 
-    def test_start_monitor_false_when_no_backend(self):
+    def test_start_monitor_idles_when_no_backend(self):
+        # 2026-10-12: the poller starts anyway and waits for a sign-in, so one
+        # made while JARVIS runs is picked up; nothing is spoken.
+        started = []
         with mock.patch.object(self.mod, "_read_feature_flag", return_value=True), \
              mock.patch.object(self.mod, "_outlook_configured", return_value=False), \
-             mock.patch.object(self.mod, "_gmail_configured", return_value=False):
-            self.assertFalse(self.mod.start_monitor())
+             mock.patch.object(self.mod, "_gmail_configured", return_value=False), \
+             mock.patch.object(self.mod, "_proactive_announce") as ann, \
+             mock.patch.object(self.mod.threading.Thread, "start",
+                               lambda self_t: started.append(self_t)):
+            self.assertTrue(self.mod.start_monitor())
+        self.assertEqual(len(started), 1)
+        ann.assert_not_called()
 
     def test_start_monitor_spawns_thread_when_configured(self):
         # Thread.start is neutered (patched to a no-op) so nothing really runs;
@@ -1152,15 +1212,16 @@ class RegisterTests(AmazonTestBase):
             self.mod.register({})
         start.assert_not_called()
 
-    def test_register_no_backend_announces_and_skips_start(self):
+    def test_register_no_backend_is_quiet_and_still_starts_the_idle_poller(self):
+        # 2026-10-12: no spoken nag at every boot while he has not signed in.
         with mock.patch.object(self.mod, "_read_feature_flag", return_value=True), \
              mock.patch.object(self.mod, "_outlook_configured", return_value=False), \
              mock.patch.object(self.mod, "_gmail_configured", return_value=False), \
              mock.patch.object(self.mod, "_proactive_announce") as ann, \
              mock.patch.object(self.mod, "start_monitor") as start:
             self.mod.register({})
-        ann.assert_called_once()
-        start.assert_not_called()
+        ann.assert_not_called()
+        start.assert_called_once()
 
     def test_register_starts_monitor_when_enabled_and_configured(self):
         with mock.patch.object(self.mod, "_read_feature_flag", return_value=True), \

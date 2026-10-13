@@ -39,8 +39,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The proactive / background flags found in the code (2026-10-02 audit). Each
 # must be a row of the page.
 KNOWN_CONFIG_KEYS = (
-    "AMBIENT_LISTEN_ENABLED", "AMBIENT_SCREEN_ENABLED", "TEAMS_NUDGE_ENABLED",
-    "PROCESSING_FILLER_ENABLED", "LOCAL_PREFIX_REPRIME",
+    "AMBIENT_LISTEN_ENABLED", "AMBIENT_SCREEN_ENABLED",
+    "AMAZON_TRACKING_ENABLED", "PROCESSING_FILLER_ENABLED", "LOCAL_PREFIX_REPRIME",
     "MISSION_NARRATION_ENABLED", "NIGHT_QUIET_ENABLED", "NIGHT_OWL_AUTO",
     "STANDBY_LOOP_ENABLED", "KINECT_PRESENCE_STANDBY", "KINECT_PRESENCE_WAKE",
     "KINECT_GREET_ON_ENTRY", "KINECT_POSTURE_NUDGE",
@@ -54,7 +54,7 @@ KNOWN_MONOLITH_KEYS = (
     "ANTICIPATION_BRIEFING_ENABLED", "WEEKLY_DIGEST_ENABLED",
     "DAILY_BRIEFING_ENABLED", "EVENING_BRIEFING_ENABLED",
     "DAILY_RECAP_ENABLED", "WEATHER_BRIEFING_PROACTIVE",
-    "AMAZON_TRACKING_ENABLED", "LEARN_EVERY_TURN", "AMBIENT_AUDIO_ENABLED",
+    "LEARN_EVERY_TURN", "AMBIENT_AUDIO_ENABLED",
 )
 
 # Names that look proactive / background. A module-level `NAME = True|False`
@@ -207,9 +207,10 @@ class RowTruthTests(unittest.TestCase):
     def test_switchable_rows_are_bool_schema_rows(self):
         settable = [f["key"] for f in wi.PROACTIVE_FEATURES
                     if wi._proactive_settable(f, sw.SCHEMA)]
-        # 18: + AMBIENT_SCREEN_VLM_ENABLED (2026-10-05, the old vision-model
-        # screen loop split off AMBIENT_SCREEN_ENABLED / screen memory)
-        # 19: + SCREEN_REMARKS_ENABLED (2026-10-12, screen comments)
+        # 18 before 2026-10-12; + SCREEN_REMARKS_ENABLED (screen comments),
+        # - TEAMS_NUDGE_ENABLED (nudger removed), + AMAZON_TRACKING_ENABLED
+        # (moved into core/config.py and the Settings window), all 2026-10-12.
+        # Includes AMBIENT_SCREEN_VLM_ENABLED (2026-10-05).
         self.assertEqual(len(settable), 19)
         for key in settable:
             self.assertEqual(sw.SCHEMA[key]["type"], "bool", key)
@@ -232,7 +233,7 @@ class _FakeRuntime(wi.NoRuntime):
 class ProactiveRouteTests(_ServerBase):
     def server_extra(self):
         return {"runtime": _FakeRuntime({"PROACTIVE_ENABLED": True,
-                                         "TEAMS_NUDGE_ENABLED": False})}
+                                         "AMBIENT_SCREEN_VLM_ENABLED": False})}
 
     def test_the_page_lists_every_row(self):
         code, d = _get(self.base + "/api/proactive")
@@ -242,9 +243,9 @@ class ProactiveRouteTests(_ServerBase):
         self.assertEqual(rows["PROACTIVE_ENABLED"]["value"], True)
         self.assertEqual(rows["PROACTIVE_ENABLED"]["applies"], "code")
         self.assertFalse(rows["PROACTIVE_ENABLED"]["settable"])
-        self.assertEqual(rows["TEAMS_NUDGE_ENABLED"]["value"], False)
-        self.assertTrue(rows["TEAMS_NUDGE_ENABLED"]["settable"])
-        self.assertEqual(rows["TEAMS_NUDGE_ENABLED"]["applies"], "restart")
+        self.assertEqual(rows["AMBIENT_SCREEN_VLM_ENABLED"]["value"], False)
+        self.assertTrue(rows["AMBIENT_SCREEN_VLM_ENABLED"]["settable"])
+        self.assertEqual(rows["AMBIENT_SCREEN_VLM_ENABLED"]["applies"], "restart")
         self.assertEqual(rows["BANTER_ENABLED"]["value"], True)
         # A bare web process cannot know a monolith constant: unknown.
         self.assertIsNone(rows["ANTICIPATION_ENABLED"]["value"])
@@ -258,11 +259,11 @@ class ProactiveRouteTests(_ServerBase):
 
         with mock.patch.object(wi, "_write_settings", side_effect=fake_write):
             code, d = _post(self.base + "/api/proactive",
-                            {"key": "TEAMS_NUDGE_ENABLED", "on": True})
+                            {"key": "AMBIENT_SCREEN_VLM_ENABLED", "on": True})
         self.assertEqual(code, 200, d)
-        self.assertEqual(calls, [({"TEAMS_NUDGE_ENABLED": True},
+        self.assertEqual(calls, [({"AMBIENT_SCREEN_VLM_ENABLED": True},
                                   self.user_settings_path)])
-        self.assertEqual(d["applied"], {"TEAMS_NUDGE_ENABLED": True})
+        self.assertEqual(d["applied"], {"AMBIENT_SCREEN_VLM_ENABLED": True})
         self.assertEqual(d["applies"], "restart")
         self.assertFalse(os.path.exists(self.user_settings_path))
 
@@ -270,8 +271,8 @@ class ProactiveRouteTests(_ServerBase):
         cases = (
             ({"key": "NOT_A_FEATURE", "on": True}, 404),
             ({"key": "WEB_INTERFACE_TOKEN", "on": True}, 404),
-            ({"key": "TEAMS_NUDGE_ENABLED", "on": "yes"}, 400),
-            ({"key": "TEAMS_NUDGE_ENABLED"}, 400),
+            ({"key": "AMBIENT_SCREEN_VLM_ENABLED", "on": "yes"}, 400),
+            ({"key": "AMBIENT_SCREEN_VLM_ENABLED"}, 400),
             ({"key": "PROACTIVE_ENABLED", "on": False}, 400),   # code row
             ({"key": "CHAPPIE_ENABLED", "on": True}, 400),      # not in schema
             ({"key": "BANTER_ENABLED", "on": False}, 400),      # no switch
@@ -289,7 +290,7 @@ class ProactiveRouteTests(_ServerBase):
         import urllib.request
         req = urllib.request.Request(
             self.base + "/api/proactive", method="POST",
-            data=b"key=TEAMS_NUDGE_ENABLED&on=true",
+            data=b"key=AMBIENT_SCREEN_VLM_ENABLED&on=true",
             headers={"Content-Type": "application/x-www-form-urlencoded"})
         with self.assertRaises(urllib.error.HTTPError) as cm:
             urllib.request.urlopen(req, timeout=5)
@@ -297,13 +298,13 @@ class ProactiveRouteTests(_ServerBase):
 
     def test_a_real_save_lands_in_the_settings_file(self):
         code, d = _post(self.base + "/api/proactive",
-                        {"key": "TEAMS_NUDGE_ENABLED", "on": True})
+                        {"key": "AMBIENT_SCREEN_VLM_ENABLED", "on": True})
         self.assertEqual(code, 200, d)
         with open(self.user_settings_path, encoding="utf-8") as f:
-            self.assertEqual(json.load(f), {"TEAMS_NUDGE_ENABLED": True})
+            self.assertEqual(json.load(f), {"AMBIENT_SCREEN_VLM_ENABLED": True})
         code, d = _get(self.base + "/api/proactive")
         row = next(r for r in d["features"]
-                   if r["key"] == "TEAMS_NUDGE_ENABLED")
+                   if r["key"] == "AMBIENT_SCREEN_VLM_ENABLED")
         self.assertEqual((row["value"], row["saved"], row["pending_restart"]),
                          (False, True, True))
 
@@ -315,7 +316,7 @@ class ProactiveTokenTests(_ServerBase):
         code, _ = _get_raw(self.base + "/api/proactive")
         self.assertEqual(code, 401)
         code, _ = _post(self.base + "/api/proactive",
-                        {"key": "TEAMS_NUDGE_ENABLED", "on": True})
+                        {"key": "AMBIENT_SCREEN_VLM_ENABLED", "on": True})
         self.assertEqual(code, 401)
         self.assertFalse(os.path.exists(self.user_settings_path))
         code, _ = _get_raw(self.base + "/api/proactive",

@@ -104,7 +104,6 @@ one-time auth step you run from a terminal (not by voice):
 - **Smart home** (Hue, Kasa, LIFX, Govee, Nest, Ecobee, Ring…): install the
   relevant optional library and run that skill's first-run auth, e.g.
   `python -m skills.sh_ring`. Govee just needs `GOVEE_API_KEY`.
-- **OBS:** enable the WebSocket server in OBS and set `OBS_PASSWORD`.
 - **Phone bridge:** set a Telegram bot token + your user id (or ntfy/Pushover).
 - **Voice ID:** say "JARVIS, learn my voice" to enroll a voiceprint (stored
   locally under `data/voiceprints/`, gitignored).

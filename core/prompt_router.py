@@ -233,15 +233,6 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "minutes", "seconds", "hour", "countdown", "set a", "alert me",
         "shopping list", "grocery list", "groceries", "timesheet",
     ],
-    # Header renamed TEAMS CALL SCREENING -> MICROSOFT TEAMS (2026-08-20): the
-    # three screener actions it used to document ship only in the gitignored
-    # skills/teams_screener.py, so the tracked prompt now covers the unread
-    # sweep alone. Keyword list is unchanged so "screen my calls" still loads
-    # the section on the local route. The key MUST match the section head or
-    # test_every_section_has_routing_or_is_always strands the section.
-    "MICROSOFT TEAMS": [
-        "teams", "call screening", "screen my calls", "screen calls", "meeting",
-    ],
     "CLAUDE CREDITS": [
         "claude", "credit", "credits", "api", "quota", "budget", "cost",
         "spending", "usage", "token",
@@ -428,10 +419,6 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "network", "wifi", "wi-fi", "router", "deco", "who's home", "whos home",
         "devices online", "lan", "is home", "internet",
     ],
-    "OBS STUDIO": [
-        "obs", "record", "recording", "stream", "streaming", "scene",
-        "start recording",
-    ],
     "PYTHON SANDBOX": [
         "python", "calculate", "run code", "run a script", "compute", "evaluate",
         "what's the square", "math",
@@ -566,7 +553,6 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "CODE EXECUTOR": ["run python", "execute python", "code executor"],
     "CUSTOM TTS / XTTS": ["custom voice", "xtts", "clone a voice", "custom tts"],
     "MCP": ["mcp"],
-    "OBS": ["obs"],
     "BAMBU PRINTER LAN CHECK ALIAS": [
         "print", "printer", "bambu", "3d", "is it printing", "printer online",
     ],
@@ -1070,7 +1056,7 @@ _PREDICATE_ROUTES = {
     "DEVELOPER NOTES": _developer_note_request,
 }
 
-# Short keywords ("tv", "ram", "hot", "mic", "bed", "obs", "lan") may only take
+# Short keywords ("tv", "ram", "hot", "mic", "bed", "lan") may only take
 # a plural after them; longer ones may run on freely (see _keyword_hit).
 _SHORT_KEYWORD_LEN = 3
 _SHORT_KEYWORD_TAILS = ("", "s", "es")

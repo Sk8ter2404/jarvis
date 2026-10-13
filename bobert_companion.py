@@ -944,15 +944,9 @@ MS_GRAPH_CLIENT_ID = ""           # Azure AD app (public client) id
 MS_GRAPH_TENANT_ID = "common"     # 'common' supports personal + work accounts
 MS_GRAPH_SCOPES    = ["Calendars.Read", "Mail.Read"]
 
-# Amazon order tracker — skills/amazon_order_tracker.py polls whichever email
-# backend (Microsoft Graph / Gmail via skills/email_triage.py) is already
-# configured every 15 minutes, parses Amazon shipment notifications, and
-# proactively announces order status transitions (shipped → out for delivery
-# → delivered, plus delay warnings). Reuses the existing email backend
-# credentials — no separate Amazon login needed. Leave False to keep the
-# voice actions (check_orders / recent_delivery / amazon_tracking_status)
-# available without starting the background poller.
-AMAZON_TRACKING_ENABLED = False
+# Amazon order tracker - AMAZON_TRACKING_ENABLED lives in core/config.py
+# (arrives via `from core.config import *`); do NOT re-declare it here or the
+# value saved in Settings would be shadowed.
 
 # Evening briefing — skills/daily_briefing/evening.py fires once per day at this
 # local clock time (default 22:00) with an end-of-day summary: voice
@@ -3508,7 +3502,7 @@ def _ambient_media_is_playing() -> bool:
             return True
     except Exception:
         pass
-    # Camera-based TV detector (opt-in, TV_DETECT_ENABLED): a bright + flickering
+    # Camera-based TV detector (TV_DETECT_ENABLED): a bright + flickering
     # screen in view is independent VISUAL evidence the room audio is the TV.
     # is_tv_on() is fail-safe (False unless enabled AND it positively sees a TV).
     try:
@@ -13613,7 +13607,7 @@ _pending_speech_lock = threading.Lock()
 #
 # WHY THIS LIVES HERE (in the monolith, not the skill): proactive_announce is
 # the single chokepoint for ALL unsolicited speech (print milestones, weather,
-# Teams nudges, timer reminders, self-diag…). The one clean place to HOLD that
+# timer reminders, self-diag…). The one clean place to HOLD that
 # speech while the owner is heads-down is the top of proactive_announce — so the
 # focus flag + the "missed" buffer must be readable from here without importing
 # the skill (which may not have loaded, and which we must never hard-depend on).
@@ -13787,7 +13781,7 @@ def proactive_announce(message: str, source: str = "skill",
     """Public proactive-speech API for skills.
 
     Skills that want JARVIS to speak something unprompted (print milestones,
-    Teams nudges, timer reminders, etc.) should call this — it appends the
+    timer reminders, etc.) should call this — it appends the
     message to pending_speech.json and the main listen loop will drain the
     queue at the next turn boundary. Returns True on successful enqueue.
 
@@ -13918,7 +13912,7 @@ def proactive_announce(message: str, source: str = "skill",
         data.append(entry)
         # Cap the pending-speech queue. Every enqueue rewrites the whole file
         # (O(n²)); a lagging drainer or a chatty skill (timer reminders,
-        # device-flap alerts, Teams nudges) must not grow it unbounded. Keep
+        # device-flap alerts) must not grow it unbounded. Keep
         # the most recent 50 announcements. 2026-05-30 audit.
         if len(data) > 50:
             data = data[-50:]
@@ -16148,6 +16142,9 @@ def should_be_proactive() -> bool:
         return False
     # A running device dialogue, or the quiet hold after one.
     if _dialogue_active[0] or _speech_hold_active():
+        return False
+    # Game mode is quiet: no spontaneous remarks while he plays (2026-10-12).
+    if _game_quiet_active():
         return False
 
     # FOCUS / DO-NOT-DISTURB gate. Spontaneous proactive comments take the
@@ -22968,7 +22965,7 @@ def _trace_vision_call(question, images, answer, ms, cloud=False) -> None:
     window is private: that gate judges the FOCUSED window alone, so a bank
     tab on another monitor would be kept (core.screen_privacy.
     visible_private; the entry is then "skipped: private", no image). A
-    background caller (no turn: the Teams nudger, ambient) is never traced.
+    background caller (no turn: ambient) is never traced.
     Never raises."""
     try:
         from core import vision_trace as _vtr
@@ -23073,7 +23070,7 @@ def _call_local_vision_raw(question: str, png_images: list[bytes],
             return None
     _log_gpu_state(LOCAL_VISION_MODEL)
     # Background traffic control (2026-09-29): a TAGGED background caller
-    # (the Teams nudger, the ambient screen observer) waits here, bounded,
+    # (the ambient screen observer) waits here, bounded,
     # while the owner is in a conversation; the owner's own vision request
     # is untagged and never waits. A request made outside a turn then
     # schedules the idle re-prime (this POST replaced the one-slot cache
@@ -24345,6 +24342,10 @@ _presence_hold_logged = [""]
 # drain's recap says "While you were away" only then (2026-10-02 - after room
 # talk or standby he never left). Consumed by the drain that speaks them.
 _presence_away_seen = [False]
+# True once a drain held the queue because game mode is engaged (quiet); the
+# first drain after the game folds what waited into one "Earlier, sir" recap
+# (2026-10-12), even when the presence gate itself is not armed.
+_game_hold_seen = [False]
 
 
 # The voice check behind a room-talk stamp while the PC plays audio runs off
@@ -24537,8 +24538,15 @@ def _room_talk_recent() -> bool:
 def _presence_hold_reason() -> str:
     """Why the speech-queue drain must hold non-exempt lines right now ('' =
     speak). Open (never holds) until the boot path armed it, or with
-    PRESENCE_HOLD_ENABLED off. Never raises (fails open)."""
+    PRESENCE_HOLD_ENABLED off. Never raises (fails open).
+
+    While game mode is engaged (and GAME_MODE_QUIET is on) the answer is
+    "gaming", independent of the presence gate: the owner is at the desk but
+    does not want to be spoken at (2026-10-12)."""
     try:
+        if _game_quiet_active():
+            _game_hold_seen[0] = True
+            return "gaming"
         if not PRESENCE_HOLD_ENABLED or not _presence_gate_armed[0]:
             return ""
         if _room_talk_recent():
@@ -24868,6 +24876,22 @@ def _game_mode_active() -> bool:
     try:
         return bool(getattr(getattr(sys.modules.get("skill_game_mode"), "_st",
                                     None), "active", False))
+    except Exception:
+        return False
+
+
+def _game_quiet_active() -> bool:
+    """True while game mode is engaged AND GAME_MODE_QUIET is on (2026-10-12):
+    JARVIS makes no unsolicited remarks and the speech-queue drain holds
+    everything but his own reminders, the guard alert and urgent lines (see
+    _presence_hold_reason / should_be_proactive). Read live, so leaving game
+    mode (or the setting) releases the hold on the next pass with nothing to
+    undo. Never raises (False)."""
+    try:
+        if not _game_mode_active():
+            return False
+        import core.config as _cfg
+        return bool(getattr(_cfg, "GAME_MODE_QUIET", True))
     except Exception:
         return False
 
@@ -39278,7 +39302,6 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "point_targets",                              # = list_point_targets
     "categorise_inbox",                           # = categorize_inbox (UK spelling)
     # On-demand verdicts / confirmations that return one finished sentence:
-    "check_teams",
     "categorize_inbox", "triage_inbox",
     "email_briefing", "inbox_briefing",
     "chappie_recall_entity",
@@ -39336,9 +39359,6 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     #   image_gen.py — "image saved to … , sir." (the empty-prompt path returns a
     #   "format:" line and the off/error paths carry markers, so they skip here).
     "generate_image", "make_picture",
-    #   obs_control.py — mute / scene / recording confirmations.
-    "obs_toggle_mute", "obs_switch_scene", "obs_start_recording",
-    "obs_stop_recording", "obs_pause_recording",
     #   schedule_manager.py — schedule set / cancel / fire confirmations.
     "schedule_once", "schedule_recurring", "schedule_cron", "schedule_when",
     "when_condition", "cancel_schedule", "remove_schedule", "fire_schedule",
@@ -46571,8 +46591,10 @@ def _speak_pending(only_sources=None):
             _hold_urgent = True
         else:
             _presence_hold_logged[0] = ""
-            _return_drain = bool(PRESENCE_HOLD_ENABLED
-                                 and _presence_gate_armed[0])
+            _return_drain = (bool(PRESENCE_HOLD_ENABLED
+                                  and _presence_gate_armed[0])
+                             or bool(_game_hold_seen[0]))
+            _game_hold_seen[0] = False
             _return_away = bool(_presence_away_seen[0])
             _presence_away_seen[0] = False
     # Standby runs this every pass (as often as every 0.3 s while muted):

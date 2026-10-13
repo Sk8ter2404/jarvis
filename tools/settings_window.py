@@ -29,11 +29,11 @@ Design notes
   mid-save can't corrupt the file.
 * SECURITY: integration secrets are NEVER read from or written to the repo.
   The Integrations tab shows only presence for each env var and never a
-  secret's value; the web-interface token field is masked. The three
-  plain-text rows there (OBS_HOST_HINT / OBS_PORT_HINT / HUE_BRIDGE_IP_HINT)
-  are OWNER NOTES: they persist to the user (gitignored) settings file and are
-  read by NOTHING at runtime. Their labels and help say so. See the block
-  comment above them for why they are neither wired nor deleted.
+  secret's value; the web-interface token field is masked. The one
+  plain-text row there (HUE_BRIDGE_IP_HINT) is an OWNER NOTE: it persists to
+  the user (gitignored) settings file and is read by NOTHING at runtime. Its
+  label and help say so. See the block comment above it for why it is neither
+  wired nor deleted.
 * ``tools/web_interface.py`` serves this module's ``SCHEMA`` as its settings
   panel, so a row added here appears there too.
 
@@ -1156,11 +1156,12 @@ SCHEMA: dict[str, dict] = {
     # worker / gate / routine; "clap trigger on/off" by voice saves the flag.
     "CLAP_TRIGGER_ENABLED": {
         "tab": "hearing", "label": "Double clap runs a routine",
-        "type": "bool", "default": False,
+        "type": "bool", "default": True,
         "help": "Two sharp claps, nothing else loud around them, run the clap "
                 "routine below. Uses the microphone JARVIS already listens on; "
                 "never while he is speaking, during the phone pings' quiet "
-                "hours, in focus or game mode, or while music, a video or "
+                "hours, in focus or game mode, while the camera sees the TV "
+                "on, or while music, a video or "
                 "anything else plays on the speakers. 'Clap trigger on/off' "
                 "by voice does the same and saves it here.",
     },
@@ -1321,19 +1322,11 @@ SCHEMA: dict[str, dict] = {
                 "Questions and 'can you ...?' always go to the model. "
                 "Applies on the next start.",
     },
-    "TEAMS_NUDGE_ENABLED": {
-        "tab": "ai", "label": "Teams unread-message nudger (background)",
-        "type": "bool", "default": False,
-        "help": "Every 10 minutes, read the screen with the vision model and "
-                "say when Teams shows unread messages. Off by default; "
-                "'check Teams' on request still works. Applies on the next "
-                "start.",
-    },
     "LOCAL_BACKGROUND_MAX_DEFER_S": {
         "tab": "ai", "label": "Hold background brain work while talking (max seconds)",
         "type": "float", "default": 120.0, "max": 3600,
         "help": "Local brain only: memory extraction, the ambient extractor "
-                "and the Teams check wait until you go quiet, so they don't "
+                "and the screen observer wait until you go quiet, so they don't "
                 "make your next reply re-read the whole prompt — but never "
                 "longer than this. Your own requests never wait (0 = don't "
                 "hold them). Applies on the next start.",
@@ -1520,7 +1513,7 @@ SCHEMA: dict[str, dict] = {
         "tab": "voice", "label": "Focus mode / do-not-disturb available",
         "type": "bool", "default": True,
         "help": "Let you say 'focus mode' / 'do not disturb' to hold "
-                "unsolicited announcements (print, weather, Teams, timers) "
+                "unsolicited announcements (print, weather, timers) "
                 "until you resume, then hear a recap of what you missed. "
                 "Wake-word and command replies always work. This only makes "
                 "the feature available — focus mode always starts OFF.",
@@ -1672,13 +1665,29 @@ SCHEMA: dict[str, dict] = {
                 "costs $0. Foreground conversation is unaffected.",
     },
     "GAME_MODE_ENABLED": {
-        "tab": "ai", "label": "Game mode watcher (smaller brain while gaming)",
-        "type": "bool", "default": False,
-        "help": "Start the game watcher at boot: when a listed game holds the "
-                "foreground, JARVIS swaps to the smaller game brain and pauses "
-                "the camera/gesture extras until the game exits. Off = only by "
-                "voice ('game mode on', 'low power mode'). Applies on the next "
-                "start.",
+        "tab": "ai", "label": "Game mode watcher (smaller brain, quiet while gaming)",
+        "type": "bool", "default": True,
+        "help": "Start the game watcher at boot: when a game holds the "
+                "foreground, JARVIS swaps to the smaller game brain, pauses "
+                "the camera/gesture extras and stays quiet until the game "
+                "exits. Off = only by voice ('game mode on', 'low power "
+                "mode'). Applies on the next start.",
+    },
+    "GAME_MODE_DETECT_FULLSCREEN": {
+        "tab": "ai", "label": "Game mode: recognise any fullscreen game",
+        "type": "bool", "default": True,
+        "help": "Besides the listed game, treat a fullscreen app as a game "
+                "when it runs from a game-library folder (Steam, Epic, Riot, "
+                "...). Browsers, video players and meeting apps never count. "
+                "'Treat this as a game' adds one by hand.",
+    },
+    "GAME_MODE_QUIET": {
+        "tab": "ai", "label": "Game mode: stay quiet",
+        "type": "bool", "default": True,
+        "help": "While game mode is on, no unsolicited remarks and queued "
+                "status lines wait until the game ends (then one short "
+                "recap). Your timers, the guard alert and urgent print "
+                "failures still speak; anything you say to him is answered.",
     },
 
     # ── Privacy / Ambient ──────────────────────────────────────────────
@@ -1941,23 +1950,6 @@ SCHEMA: dict[str, dict] = {
         "config_file": "sh_hue_config.json",
         "help": "Configured via data/sh_hue_config.json (bridge IP + button).",
     },
-    "_status_obs": {
-        "tab": "integrations", "label": "OBS Studio", "type": "status",
-        # Every one of these is OPTIONAL (skills/obs_control._config defaults
-        # the host/port, and an OBS without auth needs no password), so the old
-        # all-required "not set" read as broken on a working setup. What CAN be
-        # missing is the client package.
-        "secret_env": [],
-        "optional_env": ["OBS_HOST", "OBS_PORT", "OBS_PASSWORD"],
-        "requires_module": "obswebsocket", "module_pip": "obs-websocket-py",
-        "defaults_note": "127.0.0.1:4455, no password",
-        # Names the real source in the same tab, exactly as _status_hue does.
-        # Its absence is why the note fields below could be mistaken for the
-        # thing that configures OBS.
-        "help": "Configured via OBS_HOST / OBS_PORT / OBS_PASSWORD in your "
-                ".env or OS environment — all optional (defaults "
-                "127.0.0.1:4455, no password).",
-    },
     "_status_deco": {
         "tab": "integrations", "label": "TP-Link Deco router", "type": "status",
         "secret_env": ["DECO_HOST", "DECO_PASSWORD"],
@@ -1967,6 +1959,16 @@ SCHEMA: dict[str, dict] = {
         "secret_env": ["TELEGRAM_BOT_TOKEN", "NTFY_TOPIC", "PUSHOVER_TOKEN"],
         "help": "PRESENT if any one channel (Telegram / ntfy / Pushover) is set.",
         "match": "any",
+    },
+    "AMAZON_TRACKING_ENABLED": {
+        "tab": "integrations", "label": "Amazon order announcements",
+        "type": "bool", "default": True,
+        "help": "Watch your mailbox for Amazon shipping mail and say when an "
+                "order ships, is out for delivery, arrives or is delayed. "
+                "Needs a one-time read-only Google sign-in (run 'python -m "
+                "skills.amazon_order_tracker --auth-gmail' in a terminal); "
+                "until then it does nothing and 'check my orders' says so. "
+                "Applies on the next start.",
     },
     # Phone pings (core/phone_ping.py): read live on every ping, so a change
     # here applies at once. "turn off / on phone pings" by voice saves
@@ -2082,49 +2084,25 @@ SCHEMA: dict[str, dict] = {
                 "Prime / Hulu / Max). Off = playback starts windowed.",
     },
     # ── OWNER NOTES — persisted, but READ BY NOTHING ────────────────────
-    # These three rows are a notepad, not configuration. Verified 2026-08-20:
-    # a whole-tree grep for the names finds this schema, the example settings
-    # file, two explanatory comments in tools/web_interface.py, the tests, and
-    # the persisted (empty) values — and ZERO runtime readers.
-    # core/config.py:1252 guarantees it stays that way: _apply_user_settings
-    # skips any key with no module-level constant, and
+    # This row is a notepad, not configuration.
+    # core/config.py guarantees it stays that way: _apply_user_settings skips
+    # any key with no module-level constant, and
     # tests/test_settings_schema_wiring.py asserts none of these ever gains one.
     #
-    # They are NOT wired, deliberately:
-    #   * HUE_BRIDGE_IP_HINT — skills/sh_hue.py already owns `bridge_ip` as a
-    #     SINGLE authority with a self-heal that REWRITES the stored address
-    #     when a configured one fails. A second source for the same field is
-    #     this repo's #1 bug class: the GUI note and the self-healed config file
-    #     would silently disagree the moment discovery corrected a stale IP.
-    #   * OBS_*_HINT — skills/obs_control._config() reads OBS_HOST / OBS_PORT
-    #     from the ENVIRONMENT on every call so they can change without a
-    #     restart. Routing them through a restart-scoped settings file instead
-    #     would be a downgrade, and its failure line already NAMES the endpoint
-    #     it dialled ("I couldn't reach OBS at 127.0.0.1:4455, sir"), so a
-    #     mismatch is audible rather than silent.
-    # They are NOT deleted either: the round-trip path for schema keys with no
+    # It is NOT wired, deliberately: skills/sh_hue.py already owns `bridge_ip`
+    # as a SINGLE authority with a self-heal that REWRITES the stored address
+    # when a configured one fails. A second source for the same field is this
+    # repo's #1 bug class: the GUI note and the self-healed config file would
+    # silently disagree the moment discovery corrected a stale IP.
+    #
+    # It is not deleted either: the round-trip path for schema keys with no
     # core.config constant is real machinery (tools/web_interface's _NO_CONSTANT
     # sourcing, pinned by tests/test_web_interface.GuiOnlyKeyRoundTripTests) and
-    # these are its only live instances.
+    # this is its only live instance.
     #
-    # What WAS wrong is that they read as live knobs. The old help split the
-    # password (env) from the host (this box) — the exact inverse of the truth,
-    # since OBS_HOST env is the only thing obs_control reads. Labels and help
-    # now say so outright. Keep it that way: anything here that sounds like
+    # What matters is that it must not read as a live knob. Label and help say
+    # so outright. Keep it that way: anything here that sounds like
     # configuration is a lie the owner will troubleshoot against.
-    "OBS_HOST_HINT": {
-        "tab": "integrations", "label": "OBS host (note only — not read)",
-        "type": "str", "default": "",
-        "help": "Reminder field. JARVIS reads OBS_HOST from your .env / OS "
-                "environment (default 127.0.0.1) — typing here records the "
-                "value, it does NOT change what JARVIS dials.",
-    },
-    "OBS_PORT_HINT": {
-        "tab": "integrations", "label": "OBS port (note only — not read)",
-        "type": "str", "default": "",
-        "help": "Reminder field. JARVIS reads OBS_PORT from your .env / OS "
-                "environment (default 4455); this value is not read.",
-    },
     "HUE_BRIDGE_IP_HINT": {
         "tab": "integrations", "label": "Hue bridge IP (note only — not read)",
         "type": "str", "default": "",
@@ -2285,12 +2263,13 @@ SCHEMA: dict[str, dict] = {
     },
     "TV_DETECT_ENABLED": {
         "tab": "cameras", "label": "Notice a lit TV (stops learning from TV chatter)",
-        "type": "bool", "default": False,
+        "type": "bool", "default": True,
         "help": "Look for a bright, flickering screen in the camera frame the "
                 "face tracker already has, and treat it as media playing so "
                 "JARVIS doesn't learn from what the TV says. It can only stop "
-                "learning, never trigger anything. Calibrate with 'calibrate "
-                "the tv region'; also 'turn on/off tv detection'.",
+                "learning (and double-clap runs), never trigger anything. "
+                "Calibrate with 'calibrate the tv region'; also 'turn on/off "
+                "tv detection'. Every change is logged as [tv-detect].",
     },
     # ── Live web interface (tools/web_interface.py) ─────────────────────
     # A local-LAN dashboard to watch JARVIS and type commands to him. The
@@ -2414,7 +2393,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Brain", ["AI_BACKEND", "CLAUDE_MODEL", "LOCAL_LLM_MODEL",
                    "LOCAL_VISION_MODEL", "MODEL_ROUTING", "CLAUDE_OPTIONAL",
                    "LOCAL_LLM_FALLBACK", "LOCAL_VISION_FALLBACK",
-                   "AMBIENT_LEARNING_FORCE_LOCAL", "GAME_MODE_ENABLED"]),
+                   "AMBIENT_LEARNING_FORCE_LOCAL", "GAME_MODE_ENABLED",
+                   "GAME_MODE_DETECT_FULLSCREEN", "GAME_MODE_QUIET"]),
         ("Memory", ["LTM_ENABLED", "RAG_ENABLED"]),
         ("Speed", ["FAST_PATHS_ENABLED", "INSTANT_ACTIONS_MODE",
                    "PROMPT_FREEZE_QUIET_S", "PROMPT_SLIM_MODE",
@@ -2424,7 +2404,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                    "LEARN_BATCH_ENABLED", "LEARN_BATCH_INTERVAL_S",
                    "LEARN_BATCH_QUIET_S", "LEARN_BATCH_MAX_JOBS"]),
         ("Turn checker", ["TURN_CHECK_MODE", "TURN_CHECK_ESCALATE_MODEL"]),
-        ("Background work", ["ENABLE_ORCHESTRATOR", "TEAMS_NUDGE_ENABLED"]),
+        ("Background work", ["ENABLE_ORCHESTRATOR"]),
         ("Spending caps", ["DAILY_BUDGET_USD", "DEEP_AUDIT_BUDGET_USD"]),
     ],
     "cameras": [
@@ -2476,7 +2456,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Connections", ["_status_anthropic", "_status_porcupine",
                          "_status_azure_tts", "_status_elevenlabs",
                          "_status_bambu", "_status_govee", "_status_hue",
-                         "_status_obs", "_status_deco", "_status_phone"]),
+                         "_status_deco", "_status_phone"]),
         ("Phone pings", ["PHONE_PING_ENABLED", "PHONE_PING_PRINT",
                          "PHONE_PING_CONFIRM", "PHONE_PING_SECURITY",
                          "PHONE_PING_ROBOT", "PHONE_PING_SUMMARY",
@@ -2486,9 +2466,9 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                          "PHONE_PING_CONFIRM_AFTER_MIN"]),
         ("Reminders", ["HOURS_REMINDER_ENABLED", "HOURS_REMINDER_ANCHOR",
                        "HOURS_REMINDER_TIME"]),
+        ("Orders", ["AMAZON_TRACKING_ENABLED"]),
         ("Media", ["STREAMING_AUTO_FULLSCREEN"]),
-        ("Notes (not read by JARVIS)", ["OBS_HOST_HINT", "OBS_PORT_HINT",
-                                        "HUE_BRIDGE_IP_HINT"]),
+        ("Notes (not read by JARVIS)", ["HUE_BRIDGE_IP_HINT"]),
     ],
     "advanced": [
         ("On screen", ["HUD_ENABLED", "HUD_MONITOR", "BRAIN_GLOW_ENABLED",

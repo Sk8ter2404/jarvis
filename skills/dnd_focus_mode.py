@@ -11,7 +11,7 @@ active:
   • Microsoft Teams presence is set to DoNotDisturb via the Graph API
     /me/presence/setUserPreferredPresence call. Requires the Graph token
     to have Presence.ReadWrite scope — degrades silently otherwise.
-  • Non-critical proactive nudges (banter, wellness, teams_nudge) are
+  • Non-critical proactive nudges (banter, wellness) are
     paused by monkey-patching each skill's _enqueue_speech with a sink
     that drops queued messages while focus mode is active. Critical
     skills (bambu_monitor failure / timer reminders) stay unaffected so
@@ -35,9 +35,9 @@ Module-level helper for other skills:
 
 Announces on entry (what this skill ACTUALLY does — 2026-10-01; it used to
 promise "holding all non-critical interruptions ... VIPs or emergencies
-only", but it only silences Windows toasts, Teams and three nudge skills):
+only", but it only silences Windows toasts, Teams and two nudge skills):
   "Do not disturb for N minutes, sir — Windows notifications are paused,
-   Teams is set to Do Not Disturb, and the banter, wellness and Teams nudges
+   Teams is set to Do Not Disturb, and the banter and wellness nudges
    are muted. Timers and print alerts still come through."
 When skills/focus_mode.py drives this skill it engages / ends it QUIETLY
 (the `.quiet` hooks on the action handlers): focus_mode speaks its own line,
@@ -70,7 +70,7 @@ TEAMS_GRAPH_TIMEOUT      = 6.0
 # Critical announcements (bambu print failure, timer reminders, audio
 # device drops) stay loud — the engage line says so ("Timers and print
 # alerts still come through").
-SUPPRESSED_SKILLS = ("banter", "wellness", "teams_nudge")
+SUPPRESSED_SKILLS = ("banter", "wellness")
 
 FOCUS_PROMPT_ADDENDUM = (
     "\n\n[Focus mode]\n"
@@ -417,7 +417,7 @@ def _engage_summary(duration_seconds: int) -> str:
         done.append("Windows notifications are paused")
     if _teams_was_set[0]:
         done.append("Teams is set to Do Not Disturb")
-    done.append("the banter, wellness and Teams nudges are muted")
+    done.append("the banter and wellness nudges are muted")
     listed = done[0] if len(done) == 1 else (", ".join(done[:-1]) + ", and " + done[-1])
     return (f"Do not disturb for {_format_minutes(duration_seconds)}, sir — "
             f"{listed}. Timers and print alerts still come through.")

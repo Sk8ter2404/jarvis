@@ -30,7 +30,7 @@ across conversations.
 - **~90 skills** (auto-loaded from `skills/`), including: morning/evening
   briefings, weather & news, timers & reminders, a notification triage engine,
   smart-home control (Hue, Kasa, LIFX, Govee, Nest, Ecobee, …), Bambu Lab
-  3D-printer monitoring, Microsoft Teams/email helpers, OBS control, pattern
+  3D-printer monitoring, email helpers, pattern
   learning, and a self-diagnostic + self-healing loop.
 - **Memory** — remembers facts and context across sessions (stored locally).
 - **Local-first & private** — your conversations and memory stay on your machine;

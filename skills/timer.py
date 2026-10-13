@@ -251,7 +251,7 @@ def _enqueue_speech(message: str, key: str | None = None):
 
     Routes through bobert_companion.proactive_announce() so this skill shares
     one write path with every other pending_speech.json co-writer
-    (bambu_monitor, status_panel, night_owl_mode, screen_watch, teams_nudge,
+    (bambu_monitor, status_panel, night_owl_mode, screen_watch,
     …) and they don't race each other. Falls back to a local atomic write
     only when the parent module isn't loaded yet (import-time registration /
     unit tests) or the announcer call fails — so a broken parent import

@@ -2,7 +2,7 @@
 
 Covers config clamping + knob reads, the weekday bucket, the forward-only
 minute delta, the spoken-line composer across every action branch (music /
-Teams / morning / evening / generic offer, with and without lead), prediction
+morning / evening / generic offer, with and without lead), prediction
 selection (precise-with-lead before broad-now, confidence floor, tolerance-band
 "happening now", bucket/window mismatches — all driven off a frozen clock), the
 throttle-aware _next_eligible pick + _mark_fired, persistent state
@@ -184,34 +184,6 @@ class AnticipationBriefingTests(_BriefingTestBase):
         for act in ("youtube_play", "spotify", "apple_music"):
             line = self.mod._compose_briefing_line({"action": act, "common_arg": "queen"})
             self.assertIn("Queen", line)
-
-    def test_compose_teams_with_name_and_lead(self):
-        line = self.mod._compose_briefing_line(
-            {"action": "check_teams", "common_arg": "sam", "__lead_minutes": 12})
-        self.assertIn("Sam sync in 12 minutes", line)
-        self.assertIn("last conversation", line.lower())
-
-    def test_compose_teams_with_name_singular_minute(self):
-        line = self.mod._compose_briefing_line(
-            {"action": "check_teams", "common_arg": "sam", "__lead_minutes": 1})
-        self.assertIn("Sam sync in 1 minute,", line)   # no trailing 's'
-
-    def test_compose_teams_name_no_lead(self):
-        # arg present but lead 0 → the "is upon us" phrasing (line 382-387).
-        line = self.mod._compose_briefing_line(
-            {"action": "check_teams", "common_arg": "alex", "__lead_minutes": 0})
-        self.assertIn("Your Alex sync is upon us", line)
-
-    def test_compose_teams_lead_no_name(self):
-        # no arg but lead > 0 → generic Teams lead phrasing (line 388-392).
-        line = self.mod._compose_briefing_line(
-            {"action": "check_teams", "__lead_minutes": 8})
-        self.assertIn("Teams sync in 8 minutes", line)
-        self.assertIn("most recent thread", line.lower())
-
-    def test_compose_teams_no_arg_no_lead(self):
-        line = self.mod._compose_briefing_line({"action": "check_teams"})
-        self.assertIn("check Teams about now", line)
 
     def test_compose_morning_briefing_with_lead(self):
         line = self.mod._compose_briefing_line(
@@ -597,7 +569,7 @@ class BriefingSelectTests(_BriefingTestBase):
     def test_select_precise_within_lead(self):
         with self._at(9, 0):       # 09:00 = minute 540
             snap = {"precise": [
-                {"key": "p1", "action": "check_teams", "ratio": 0.9,
+                {"key": "p1", "action": "check_print", "ratio": 0.9,
                  "center_minute": 550, "tolerance_min": 5, "common_arg": "sam"}],
                 "broad": []}
             preds = self.mod._select_predictions(snap, self._cfg(lead_min=15))
@@ -609,7 +581,7 @@ class BriefingSelectTests(_BriefingTestBase):
         # center already passed (sentinel delta) but within tolerance → "now".
         with self._at(9, 2):       # minute 542
             snap = {"precise": [
-                {"key": "now", "action": "check_teams", "ratio": 0.9,
+                {"key": "now", "action": "check_print", "ratio": 0.9,
                  "center_minute": 540, "tolerance_min": 5}],  # |542-540|<=5
                 "broad": []}
             preds = self.mod._select_predictions(snap, self._cfg())
@@ -619,7 +591,7 @@ class BriefingSelectTests(_BriefingTestBase):
     def test_select_precise_skipped_outside_lead_and_band(self):
         with self._at(9, 0):
             snap = {"precise": [
-                {"key": "later", "action": "check_teams", "ratio": 0.9,
+                {"key": "later", "action": "check_print", "ratio": 0.9,
                  "center_minute": 700, "tolerance_min": 2}],   # 160 min away
                 "broad": []}
             self.assertEqual(self.mod._select_predictions(snap, self._cfg()), [])
@@ -627,7 +599,7 @@ class BriefingSelectTests(_BriefingTestBase):
     def test_select_precise_center_not_int_skipped(self):
         with self._at(9, 0):
             snap = {"precise": [
-                {"key": "bad", "action": "check_teams", "ratio": 0.9,
+                {"key": "bad", "action": "check_print", "ratio": 0.9,
                  "center_minute": "not-int", "tolerance_min": 2}],
                 "broad": []}
             self.assertEqual(self.mod._select_predictions(snap, self._cfg()), [])
@@ -635,7 +607,7 @@ class BriefingSelectTests(_BriefingTestBase):
     def test_select_filters_below_confidence(self):
         with self._at(9, 0):
             snap = {"precise": [
-                {"key": "low", "action": "check_teams", "ratio": 0.2,
+                {"key": "low", "action": "check_print", "ratio": 0.2,
                  "center_minute": 545, "tolerance_min": 5}],
                 "broad": []}
             self.assertEqual(
@@ -688,7 +660,7 @@ class BriefingSelectTests(_BriefingTestBase):
     def test_select_precise_before_broad_and_broad_ratio_order(self):
         with self._at(10, 0, wday=0):
             snap = {
-                "precise": [{"key": "pr", "action": "check_teams", "ratio": 0.9,
+                "precise": [{"key": "pr", "action": "check_print", "ratio": 0.9,
                              "center_minute": 605, "tolerance_min": 2}],  # 5 min
                 "broad": [
                     {"key": "b_lo", "action": "play_music", "ratio": 0.60,
@@ -710,7 +682,7 @@ class BriefingSelectTests(_BriefingTestBase):
 class BriefingNextEligibleTests(_BriefingTestBase):
     def test_next_eligible_skips_throttled_key(self):
         today = time.strftime("%Y-%m-%d", time.localtime())
-        pred = {"key": "k1", "action": "check_teams", "common_arg": "sam",
+        pred = {"key": "k1", "action": "check_print", "common_arg": "sam",
                 "__lead_minutes": 10}
         with mock.patch.object(self.mod, "_read_config", return_value=self._cfg()), \
              mock.patch.object(self.mod, "_load_snapshot",
@@ -722,21 +694,21 @@ class BriefingNextEligibleTests(_BriefingTestBase):
         self.assertEqual(p, {})
 
     def test_next_eligible_bypass_returns_line(self):
-        pred = {"key": "k1", "action": "check_teams", "common_arg": "sam",
+        pred = {"key": "k1", "action": "play_music", "common_arg": "sam",
                 "__lead_minutes": 10}
         with mock.patch.object(self.mod, "_read_config", return_value=self._cfg()), \
              mock.patch.object(self.mod, "_load_snapshot",
                                return_value={"precise": [], "broad": []}), \
              mock.patch.object(self.mod, "_select_predictions", return_value=[pred]):
             line, p = self.mod._next_eligible(bypass_throttle=True)
-        self.assertIn("Sam sync", line)
+        self.assertIn("Sam", line)
         self.assertEqual(p["key"], "k1")
 
     def test_next_eligible_skips_keyless_and_empty_line(self):
         # First candidate has no key (skipped), second composes an empty line
         # (skipped), third is a valid music pred → returned.
         preds = [
-            {"key": "", "action": "check_teams", "common_arg": "x"},
+            {"key": "", "action": "check_print", "common_arg": "x"},
             {"key": "k2", "action": "unknown_no_offer"},        # composes ""
             {"key": "k3", "action": "play_music", "common_arg": "queen"},
         ]
@@ -767,7 +739,7 @@ class BriefingNextEligibleTests(_BriefingTestBase):
         # The engine (pattern_learning.maybe_pattern_offer_v2) offered this
         # prediction earlier today; the briefing must not offer it again.
         today = time.strftime("%Y-%m-%d", time.localtime())
-        pred = {"key": "broad|check_teams|weekday|9-11", "action": "check_teams"}
+        pred = {"key": "broad|check_print|weekday|9-11", "action": "check_print"}
         pl = self._fake_pattern_learning({pred["key"]: today})
         with inject_modules(skill_pattern_learning=pl), \
              mock.patch.object(self.mod, "_read_config", return_value=self._cfg()), \
@@ -783,8 +755,8 @@ class BriefingNextEligibleTests(_BriefingTestBase):
         with inject_modules(skill_pattern_learning=pl), \
              mock.patch.object(self.mod, "_load_state", return_value={}), \
              mock.patch.object(self.mod, "_save_state"):
-            self.mod._mark_fired({"key": "broad|check_teams|weekday|9-11"})
-        self.assertEqual(pl._store.get("broad|check_teams|weekday|9-11"), today)
+            self.mod._mark_fired({"key": "broad|check_print|weekday|9-11"})
+        self.assertEqual(pl._store.get("broad|check_print|weekday|9-11"), today)
 
     def test_legacy_invented_offer_is_not_spoken(self):
         # Snapshots aggregated before 2026-10-01 store "Shall I get time,

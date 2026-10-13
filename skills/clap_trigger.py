@@ -1,5 +1,6 @@
 """
-clap_trigger skill — DOUBLE-CLAP to run a routine (off by default).
+clap_trigger skill — DOUBLE-CLAP to run a routine (on by default since
+2026-10-12; the default routine is only an acknowledgement).
 
 Two sharp claps ~0.15-0.7 s apart, with nothing else loud around them, run the
 "clap routine". Out of the box that is only a spoken "You rang, sir?": the
@@ -40,9 +41,11 @@ WHEN A DOUBLE CLAP IS IGNORED (handle_double_clap's gates, in order)
     slicer window turns on) — a clap must not move the cursor mid-work;
   * game mode is engaged, or sustained music is playing in the room
     (skills/standby_audio_detect): gunshots and drum hits are clap-shaped;
+  * the camera sees the TV on (skills/tv_detect.is_tv_on, when TV detection is
+    on): a TV is full of claps, applause and gunshots;
   * media is playing: the Windows media session (a video with claps in it,
     Apple Music, YouTube), music JARVIS started in the last
-    _JARVIS_MUSIC_WINDOW_S, the camera's TV detector (the monolith's
+    _JARVIS_MUSIC_WINDOW_S, the room-music detector (the monolith's
     _ambient_media_is_playing);
   * the speakers are playing anything at all (the playback device's peak
     meter): a game, a call, a clip — the claps may have come out of them.
@@ -272,6 +275,18 @@ def _game_mode_active() -> bool:
         return False
 
 
+def _tv_on() -> bool:
+    """The camera's TV detector says a lit, moving screen is on
+    (skills/tv_detect.is_tv_on: False unless TV detection is enabled AND it
+    positively sees one). Never raises."""
+    try:
+        sk = sys.modules.get("skill_tv_detect")
+        fn = getattr(sk, "is_tv_on", None) if sk is not None else None
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
 def _music_playing() -> bool:
     try:
         sk = sys.modules.get("skill_standby_audio_detect")
@@ -436,6 +451,8 @@ def handle_double_clap(bc, event: dict, now: "float | None" = None) -> str:
             return _note_ignored("game mode is on", now)
         if _music_playing():
             return _note_ignored("music is playing", now)
+        if _tv_on():
+            return _note_ignored("the TV is on", now)
         if _media_playing(bc):
             return _note_ignored("media is playing", now)
         if _speaker_output_active():

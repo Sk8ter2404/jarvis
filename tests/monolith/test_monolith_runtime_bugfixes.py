@@ -424,9 +424,6 @@ class SpeakContractBugHunt20260707Tests(MonolithGlobalsTestCase):
         "point_control_on", "point_control_off", "forget_point_target",
         # image_gen.py
         "generate_image", "make_picture",
-        # obs_control.py
-        "obs_toggle_mute", "obs_switch_scene", "obs_start_recording",
-        "obs_stop_recording", "obs_pause_recording",
         # schedule_manager.py
         "schedule_once", "schedule_recurring", "schedule_cron", "schedule_when",
         "when_condition", "cancel_schedule", "remove_schedule", "fire_schedule",

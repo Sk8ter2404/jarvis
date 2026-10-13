@@ -1565,36 +1565,6 @@ class SingleInstanceTests(_TmpDir):
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  P1-14  OBS: every env var is optional
-# ════════════════════════════════════════════════════════════════════════
-class ObsStatusTests(unittest.TestCase):
-    def test_obs_with_no_env_is_ready_on_defaults(self):
-        spec = sw.SCHEMA["_status_obs"]
-        env = {k: "" for k in ("OBS_HOST", "OBS_PORT", "OBS_PASSWORD")}
-        with mock.patch.dict(os.environ, env):
-            present, detail = sw.integration_status(
-                spec, find_spec=lambda m: object())
-        self.assertTrue(present, "OBS reads 'not set' with the defaults, "
-                                 "which work")
-        self.assertIn("127.0.0.1:4455", detail)
-
-    def test_obs_names_a_missing_client_package(self):
-        present, detail = sw.integration_status(sw.SCHEMA["_status_obs"],
-                                                find_spec=lambda m: None)
-        self.assertFalse(present)
-        self.assertIn("obs-websocket-py", detail)
-
-    def test_obs_reports_which_overrides_are_set_never_values(self):
-        with mock.patch.dict(os.environ, {"OBS_PASSWORD": "fake-secret",
-                                          "OBS_HOST": "", "OBS_PORT": ""}):
-            present, detail = sw.integration_status(
-                sw.SCHEMA["_status_obs"], find_spec=lambda m: object())
-        self.assertTrue(present)
-        self.assertIn("OBS_PASSWORD set", detail)
-        self.assertNotIn("fake-secret", detail)
-
-
-# ════════════════════════════════════════════════════════════════════════
 #  P2  keyboard, unsaved changes, async model list
 # ════════════════════════════════════════════════════════════════════════
 class ConvenienceTests(_TmpDir):

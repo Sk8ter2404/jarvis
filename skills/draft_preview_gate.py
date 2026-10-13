@@ -9,7 +9,7 @@ lifting lives in two core modules:
                            any future send_<channel> verb). Bound in
                            bobert_companion.parse_and_run_actions.
   core.draft_confirm       imperative confirm() helper for background /
-                           non-dispatcher sends (Teams nudges, phone
+                           non-dispatcher sends (phone
                            pushes, future SMS / Slack / Discord bridges).
 
 What this skill adds on top:
@@ -37,8 +37,8 @@ What this skill adds on top:
 Why a skill and not just core? The dispatcher already auto-routes
 send_* through ``core.draft_preview_gate``; new channels that follow
 that naming convention get gated for free. This skill exists for the
-channels that DON'T fit that pattern (phone_bridge.push_to_phone,
-teams_nudge.queue_teams_nudge) and for unified diagnostics, plus it
+channels that DON'T fit that pattern (phone_bridge.push_to_phone)
+and for unified diagnostics, plus it
 gives us a single place to hang future extensions (SMS, Slack, Discord)
 without scattering the standing read-aloud-before-sending rule across
 every outbound module.
@@ -179,7 +179,7 @@ def gate_outbound_message(channel: str, draft: dict | str) -> bool:
                  optionally 'recipient' / 'to' for the named recipient.
 
     Use this from skills whose outbound path bypasses the send_* action
-    contract — e.g. teams_nudge, phone_bridge, future Slack / Discord
+    contract — e.g. phone_bridge, future Slack / Discord
     bridges. Skills that DO use send_* don't need to call this directly;
     the dispatcher already wraps them via core.draft_preview_gate.
 
@@ -260,7 +260,7 @@ def register(actions: dict) -> None:
     The skill only registers diagnostics: the user-facing gating already
     happens through the dispatcher's core/draft_preview_gate middleware
     (send_* actions) and through core/draft_confirm called imperatively
-    by phone_bridge / teams_nudge. ``gate_outbound_message`` is a
+    by phone_bridge. ``gate_outbound_message`` is a
     module-level helper, not an action, so skills import it directly:
 
         from skill_draft_preview_gate import gate_outbound_message

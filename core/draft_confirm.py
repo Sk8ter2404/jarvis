@@ -1,15 +1,14 @@
 """Pre-send confirmation gate for outbound message actions.
 
-A single shared helper that every outbound channel (teams_nudge,
-phone_bridge, future send_sms, etc.) routes through before firing. The
-gate speaks the draft body aloud, prompts for confirmation, and waits up
+A single shared helper that every outbound channel (phone_bridge, future send_sms, etc.) routes through before
+firing. The gate speaks the draft body aloud, prompts for confirmation, and waits up
 to ``CONFIRM_TIMEOUT_S`` seconds for a yes / no token.
 
 This is a sibling of ``core.draft_preview_gate``: that module is a
 middleware shim used by the dispatcher to wrap ``send_*`` actions
 registered with the action registry. ``draft_confirm`` is the imperative
 counterpart for skills that fire outbound messages from background
-threads (Teams nudges, phone pushes) and never go through the
+threads (phone pushes) and never go through the
 dispatcher's send_* path. Both share the same confirm/cancel keyword
 sets and the same fail-closed semantics so the user only learns one set
 of voice tokens.
@@ -125,8 +124,8 @@ def _report_unvoiced_hold(body: str, recipient: str) -> None:
     the console and the HUD, where a muted owner can actually see it.
 
     There is deliberately NO owner-override here, unlike
-    core.draft_preview_gate.run_with_gate. This module's callers (teams_nudge,
-    phone_bridge) fire from BACKGROUND threads with no user turn attached, so
+    core.draft_preview_gate.run_with_gate. This module's callers (phone_bridge)
+    fire from BACKGROUND threads with no user turn attached, so
     the last thing he said is not an answer to THIS prompt and must never be
     read as consent for it. Holding a JARVIS-initiated push is the correct
     answer; what changed is that the hold is no longer silent.

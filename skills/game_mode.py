@@ -24,7 +24,7 @@ returns `_RESOLVED_LOCAL_LLM_MODEL[0]` whenever the cache is warm
 `LOCAL_VISION_MODEL` fresh on every call (bobert_companion.py:11627, :11711).
 
 So repointing those three cells makes EVERY consumer — the owner's own
-utterance, teams_nudge's 10-minute vision tick, banter, ambient extract, the
+utterance, the 10-minute vision ticks, banter, ambient extract, the
 autocorrect embedder — load the SMALL model instead of the big one. Not five
 gated call sites: the resolver itself. That single move is why this needs
 
@@ -44,7 +44,7 @@ Three designs were considered. The two rejected ones failed here:
   #1 documented defect wearing a fix's clothing.
 
   "Unload the brain and reload on demand."  Measured: the orchestrator ran
-  `ollama stop` at ~20:35; by 20:36:16 teams_nudge's vision call had cold-loaded
+  `ollama stop` at ~20:35; by 20:36:16 a background vision call had cold-loaded
   the whole 15.2 GB back. A one-shot unload does not survive ten minutes here.
   And the reload IS the crash — `cudaMalloc failed: out of memory` is already in
   this session's log twice (19:41:35, 19:43:27).
@@ -136,7 +136,24 @@ Fortnite, so skills/ambient_listen.py:_focused_proc_name() is blind to any
 protected process. We never OpenProcess with VM_READ, never read game memory,
 never inject.
 
-Not enabled by default (GAME_MODE_ENABLED=False). The orchestrator enables it.
+================================================================================
+2026-10-12 - ON BY DEFAULT, ANY FULLSCREEN GAME, AND QUIET
+================================================================================
+* GAME_MODE_ENABLED defaults to True: the watcher starts at boot.
+* Detection is no longer limited to the one allowlisted title. A foreground
+  window that covers its whole monitor and whose executable lives in a
+  game-library folder (GAME_MODE_PATH_MARKERS) counts as a game
+  (GAME_MODE_DETECT_FULLSCREEN). Browsers, media players, meeting / remote
+  desktop / office apps never do. A recognised game is remembered by pid and
+  then behaves like an allowlisted one: entry needs the foreground for the
+  dwell, exit follows process lifetime, alt-tab never exits.
+* QUIET (GAME_MODE_QUIET): while the mode is engaged JARVIS makes no unsolicited
+  remarks and holds queued status lines. The mechanism lives in the monolith
+  (_game_quiet_active): should_be_proactive() answers False and the speech-queue
+  drain (_speak_pending) holds everything except his own timers / schedules /
+  promises, the guard alert and urgent lines. Held lines stay on disk in order and
+  are spoken after the game as one short "Earlier, sir" recap. This skill only
+  owns the "engaged" flag they read, so nothing needs undoing on exit.
 """
 from __future__ import annotations
 
@@ -172,7 +189,8 @@ SPEAK_VERBATIM_ACTIONS = (
 # tonight; move this block into core/prompts.py once that edit lands.
 PROMPT_EXAMPLES = (
     "GAME LOW-POWER MODE (skills/game_mode.py — frees VRAM/RAM for a running\n"
-    "  game by downshifting the local brain; never mutes JARVIS):\n"
+    "  game by downshifting the local brain and holds unsolicited speech until\n"
+    "  the game ends; he can still talk to you):\n"
     "  game_mode_status     — report whether game mode is engaged, which game,\n"
     "                         which brain is loaded, and the MEASURED memory\n"
     "                         freed. Fire on 'are you in game mode', 'what\n"
@@ -246,11 +264,15 @@ def _cfg_int(name, default: int) -> int:
 def _announce(message: str) -> None:
     """Route through the canonical pending_speech writer. Funnelling every skill
     through proactive_announce eliminates the cross-skill read-modify-write race
-    an independent writer would reintroduce."""
+    an independent writer would reintroduce.
+
+    urgent=True: the only lines this skill announces are the ones he asked for
+    (the verdict after "divert power", or GAME_MODE_ANNOUNCE on), and the quiet
+    hold that game mode itself puts on the speech queue must not swallow them."""
     try:
         bc = _bc()
         ann = getattr(bc, "proactive_announce", None) if bc else None
-        if callable(ann) and ann(message, source="game_mode"):
+        if callable(ann) and ann(message, source="game_mode", urgent=True):
             return
     except Exception as e:
         print(f"{_LOG} speech-queue write failed ({e}); msg: {message}")
@@ -569,7 +591,9 @@ def _game_hints() -> "tuple[str, ...]":
 
 
 def _find_game_pid() -> "tuple[int | None, str | None]":
-    """(pid, exe_basename) of the first running allowlisted game, else (None, None).
+    """(pid, exe_basename) of the first running game, else (None, None): an
+    allowlisted one, else a fullscreen game the detector recognised (see
+    _find_fullscreen_game).
 
     EXACT basename match, case-insensitive — NOT substring. Measured live
     2026-09-04 20:5x, four Fortnite processes were running at once:
@@ -586,23 +610,28 @@ def _find_game_pid() -> "tuple[int | None, str | None]":
     reusing that helper would never fire while reporting itself healthy.
     psutil.process_iter(['name']) sees it — verified live."""
     hints = _game_hints()
-    if not hints:
-        return None, None
-    try:
-        import psutil
-    except Exception:
-        return None, None
-    try:
-        for p in psutil.process_iter(["pid", "name"]):
+    if hints:
+        try:
+            import psutil
+        except Exception:
+            psutil = None
+        if psutil is not None:
             try:
-                name = (p.info.get("name") or "").strip().lower()
+                for p in psutil.process_iter(["pid", "name"]):
+                    try:
+                        name = (p.info.get("name") or "").strip().lower()
+                    except Exception:
+                        continue
+                    if name and name in hints:
+                        return int(p.info["pid"]), name
             except Exception:
-                continue
-            if name and name in hints:
-                return int(p.info["pid"]), name
-    except Exception:
-        return None, None
-    return None, None
+                pass
+    # Not on the allowlist: a game the fullscreen detector already recognised
+    # and that is still alive, else the fullscreen foreground game right now.
+    pid, exe = _seen_game_alive()
+    if pid:
+        return pid, exe
+    return _find_fullscreen_game()
 
 
 def _pid_alive(pid: "int | None") -> bool:
@@ -639,27 +668,22 @@ def _foreground_pid() -> "int | None":
         return None
 
 
-def _foreground_exe_basename() -> "str | None":
-    """Basename of the foreground process's image, via kernel32
-    QueryFullProcessImageNameW.
+def _pid_image_path(pid: "int | None") -> "str | None":
+    """Full image path of a process via kernel32 QueryFullProcessImageNameW.
 
     Measured against Fortnite (pid 47036):
         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) -> handle, err=0   OK
         GetModuleBaseNameW (psapi)  -> rc=0, err=5 ACCESS_DENIED, value='' FAIL
         QueryFullProcessImageNameW  -> rc=1, full path                    OK
-    Used only by game_mode_learn_this, so enrolment works WHILE the game is
-    focused. PROCESS_QUERY_LIMITED_INFORMATION only — never VM_READ."""
-    if sys.platform != "win32":
-        return None
-    pid = _foreground_pid()
-    if not pid:
+    PROCESS_QUERY_LIMITED_INFORMATION only — never VM_READ. None on any error."""
+    if sys.platform != "win32" or not pid:
         return None
     try:
         import ctypes
         from ctypes import wintypes
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         k32 = ctypes.windll.kernel32
-        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not h:
             return None
         try:
@@ -667,11 +691,182 @@ def _foreground_exe_basename() -> "str | None":
             buf = ctypes.create_unicode_buffer(size.value)
             if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
                 return None
-            return os.path.basename(buf.value).strip().lower() or None
+            return buf.value or None
         finally:
             k32.CloseHandle(h)
     except Exception:
         return None
+
+
+def _foreground_exe_basename() -> "str | None":
+    """Basename of the foreground process's image (see _pid_image_path).
+    Used by game_mode_learn_this, so enrolment works WHILE the game is
+    focused."""
+    path = _pid_image_path(_foreground_pid())
+    if not path:
+        return None
+    return os.path.basename(path).strip().lower() or None
+
+
+# ── Generic fullscreen-game detection (2026-10-12) ────────────────────────
+# The allowlist only ever knew one title, so the mode never engaged for any
+# other game. A foreground window that covers its whole monitor AND whose
+# executable lives in a game-store library folder (GAME_MODE_PATH_MARKERS) is
+# now treated as a game too. Fail closed: a fullscreen app that matches no
+# marker (a video, a slide show, a remote desktop) is only logged once.
+_NON_GAME_EXES = frozenset({
+    # browsers (fullscreen video, kiosk pages)
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "vivaldi.exe", "iexplore.exe", "arc.exe",
+    # media / streaming / music players
+    "vlc.exe", "mpv.exe", "mpc-hc64.exe", "mpc-hc.exe", "wmplayer.exe",
+    "plex.exe", "plexamp.exe", "spotify.exe", "applemusic.exe", "itunes.exe",
+    "netflix.exe", "disneyplus.exe", "primevideo.exe", "movies & tv.exe",
+    "video.ui.exe", "potplayermini64.exe", "potplayermini.exe",
+    # meetings / chat / remote desktop / virtual machines
+    "teams.exe", "ms-teams.exe", "zoom.exe", "slack.exe", "discord.exe",
+    "skype.exe", "webex.exe", "mstsc.exe", "msrdc.exe", "vmware.exe",
+    "vmware-vmx.exe", "vmplayer.exe", "virtualboxvm.exe", "anydesk.exe",
+    "teamviewer.exe", "parsecd.exe", "moonlight.exe",
+    # office / documents / design / dev
+    "powerpnt.exe", "winword.exe", "excel.exe", "acrord32.exe",
+    "acrobat.exe", "code.exe", "devenv.exe", "obs64.exe", "obs32.exe",
+    # game stores / launchers live in game-library folders but are not games
+    "steam.exe", "steamwebhelper.exe", "epicgameslauncher.exe",
+    "battle.net.exe", "galaxyclient.exe", "riotclientservices.exe",
+    "riotclientux.exe", "eadesktop.exe", "origin.exe", "ubisoftconnect.exe",
+    "upc.exe", "xboxpcapp.exe", "gamingservices.exe",
+    # the shell, terminals, JARVIS itself
+    "explorer.exe", "searchhost.exe", "startmenuexperiencehost.exe",
+    "applicationframehost.exe", "windowsterminal.exe", "cmd.exe",
+    "powershell.exe", "pwsh.exe", "python.exe", "pythonw.exe", "claude.exe",
+})
+
+_SHELL_WINDOW_CLASSES = frozenset({
+    "progman", "workerw", "shell_traywnd", "shell_secondarytraywnd",
+})
+
+# pid -> exe basename of games the fullscreen detector recognised this session.
+# In memory only (L1). They behave like allowlisted games while alive, so the
+# exit rules (process lifetime, never focus) are the same for both kinds.
+_seen_games: "dict[int, str]" = {}
+_unrecognised_logged: "set[str]" = set()
+
+
+def _path_markers() -> "tuple[str, ...]":
+    raw = _cfg("GAME_MODE_PATH_MARKERS", ()) or ()
+    if isinstance(raw, str):
+        raw = [raw]
+    out = []
+    for m in raw:
+        if isinstance(m, str) and m.strip():
+            out.append(m.strip().lower().replace("/", "\\"))
+    return tuple(out)
+
+
+def _looks_like_game(exe: "str | None", path: "str | None") -> bool:
+    """Is this executable a game? Allowlisted/learned names always are; a
+    known non-game never is; otherwise it must live under a game-library
+    folder. Pure (no OS access) so it is unit-testable."""
+    exe = (exe or "").strip().lower()
+    if not exe:
+        return False
+    if exe in _game_hints():
+        return True
+    if exe in _NON_GAME_EXES:
+        return False
+    norm = (path or "").strip().lower().replace("/", "\\")
+    if not norm:
+        return False
+    return any(m in norm for m in _path_markers())
+
+
+def _fullscreen_foreground() -> "tuple[int | None, str | None, str | None]":
+    """(pid, exe_basename, full_path) of the foreground window when it covers
+    its whole monitor (exclusive or borderless fullscreen) and is not the
+    desktop shell; else (None, None, None). GetWindowRect / GetMonitorInfo
+    only — no process memory is read."""
+    if sys.platform != "win32":
+        return None, None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        hwnd = u32.GetForegroundWindow()
+        if not hwnd or u32.IsIconic(hwnd):
+            return None, None, None
+        cls = ctypes.create_unicode_buffer(256)
+        u32.GetClassNameW(hwnd, cls, 256)
+        if cls.value.strip().lower() in _SHELL_WINDOW_CLASSES:
+            return None, None, None
+        rc = wintypes.RECT()
+        if not u32.GetWindowRect(hwnd, ctypes.byref(rc)):
+            return None, None, None
+
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        mon = u32.MonitorFromWindow(hwnd, 2)        # MONITOR_DEFAULTTONEAREST
+        if not mon or not u32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+            return None, None, None
+        m = mi.rcMonitor
+        if not (rc.left <= m.left and rc.top <= m.top
+                and rc.right >= m.right and rc.bottom >= m.bottom):
+            return None, None, None
+        pid = wintypes.DWORD(0)
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        pid_i = int(pid.value) or None
+        if not pid_i:
+            return None, None, None
+        path = _pid_image_path(pid_i)
+        exe = os.path.basename(path).strip().lower() if path else None
+        return pid_i, (exe or None), path
+    except Exception:
+        return None, None, None
+
+
+def _find_fullscreen_game() -> "tuple[int | None, str | None]":
+    """The fullscreen foreground game, if any, remembered in _seen_games so it
+    stays 'running' while alt-tabbed. Off with GAME_MODE_DETECT_FULLSCREEN."""
+    if not bool(_cfg("GAME_MODE_DETECT_FULLSCREEN", True)):
+        return None, None
+    pid, exe, path = _fullscreen_foreground()
+    if not pid or not exe:
+        return None, None
+    if _looks_like_game(exe, path):
+        if _seen_games.get(pid) != exe:
+            print(f"{_LOG} fullscreen game recognised: {exe} (pid {pid})")
+        _seen_games[pid] = exe
+        return pid, exe
+    if exe not in _NON_GAME_EXES and exe not in _unrecognised_logged:
+        _unrecognised_logged.add(exe)
+        print(f"{_LOG} fullscreen app {exe} is not in a game library folder - "
+              f"not treated as a game (say 'treat this as a game' to add it)")
+    return None, None
+
+
+def _seen_game_alive() -> "tuple[int | None, str | None]":
+    """First previously recognised fullscreen game that is still running.
+    Dead pids (and a pid that now belongs to a different program) are pruned."""
+    if not _seen_games:
+        return None, None
+    try:
+        import psutil
+    except Exception:
+        return None, None
+    for pid, exe in list(_seen_games.items()):
+        try:
+            alive = psutil.pid_exists(int(pid))
+            if alive:
+                alive = (psutil.Process(int(pid)).name() or "").strip().lower() == exe
+        except Exception:
+            alive = False
+        if alive:
+            return int(pid), exe
+        _seen_games.pop(pid, None)
+    return None, None
 
 
 # ── Watch state + the PURE decision core ─────────────────────────────────
@@ -1061,7 +1256,7 @@ def _hold_face_detection(bc, notes: list, applied: dict) -> None:
 
 def _suspend_luxuries(notes: list, applied: dict) -> None:
     """Stop the expensive/harmful background work. All resolved dynamically —
-    the seven daemons a rival design promised to silence (teams_nudge,
+    the daemons a rival design promised to silence (the vision nudgers,
     screen_watch, banter, chappie_consciousness, personal_rag) have NO stop API
     at all in this tree, and their threads are already running old bytes in the
     live process, so no flag added tonight could reach them. We do not pretend
@@ -2096,17 +2291,20 @@ def register(actions):
     actions["normal_power"] = game_mode_off
     actions["full_power"] = game_mode_off
 
-    enabled = bool(_cfg("GAME_MODE_ENABLED", False))
+    enabled = bool(_cfg("GAME_MODE_ENABLED", True))
     hints = _game_hints()
+    detect = bool(_cfg("GAME_MODE_DETECT_FULLSCREEN", True))
     # Never autostart under staging/test — it polls processes and mutates the
     # live brain pointer. Same gate as skills/audio_autoswitch.
-    if enabled and hints and not os.getenv("JARVIS_STAGING"):
+    if enabled and (hints or detect) and not os.getenv("JARVIS_STAGING"):
         try:
             if start_watcher():
-                print(f"{_LOG} watching for {len(hints)} game(s) every "
+                print(f"{_LOG} watching for {len(hints)} listed game(s)"
+                      f"{' and any fullscreen game' if detect else ''} every "
                       f"{_cfg_float('GAME_MODE_POLL_SECONDS', 5.0):.0f}s "
                       f"— brain downshifts to "
-                      f"{_cfg('GAME_MODE_BRAIN', '?')} while one is running")
+                      f"{_cfg('GAME_MODE_BRAIN', '?')} while one is running"
+                      f"{'; quiet' if bool(_cfg('GAME_MODE_QUIET', True)) else ''}")
         except Exception as e:
             print(f"{_LOG} watcher start failed: {e}")
     else:

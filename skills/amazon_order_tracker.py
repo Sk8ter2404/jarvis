@@ -1,21 +1,38 @@
 """
 Amazon order tracking skill for JARVIS.
 
-Polls whichever email backend (Microsoft Graph or Gmail) the user has
-already wired up via skills/email_triage.py every POLL_INTERVAL_SECONDS,
-filters for Amazon shipment notifications, and proactively announces
-status transitions (shipped → out for delivery → delivered, plus delay
-warnings).
+Polls the owner's mailbox every POLL_INTERVAL_SECONDS, filters for Amazon
+shipment notifications, and proactively announces status transitions
+(shipped → out for delivery → delivered, plus delay warnings).
+
+MAILBOX ACCESS (2026-10-12)
+  1. Gmail, READ-ONLY: its own token, data/gmail_readonly_token.json, with the
+     single scope https://www.googleapis.com/auth/gmail.readonly, made once by
+         python -m skills.amazon_order_tracker --auth-gmail
+     (it needs the OAuth client file gmail_credentials.json at the project
+     root, the same one skills/email_triage uses). It can list and read mail;
+     it cannot change, send or delete anything. Used first when it exists.
+  2. Otherwise whatever skills/email_triage already has: its Gmail service, or
+     Microsoft Graph (Outlook). Only fetches are made; nothing is marked read.
+  With none of those the tracker does NOT guess: the voice actions answer
+  "I need a Google sign-in first, sir" (or say what is wrong with the one that
+  exists), the poller idles and re-checks every minute, and signing in later
+  needs no restart. Nothing is spoken at boot about it.
+
+FIRST RUN IS SILENT: the first poll only records what is already in the mailbox
+(the last week of orders) so JARVIS does not read out three transitions per
+old order; announcements start from the next change. A message older than
+ANNOUNCE_MAX_AGE_S is recorded but not announced either.
 
 State lives in data/amazon_order_state.json. Writes go through
 core.atomic_io._atomic_write_json so concurrent skill reloads can't
 corrupt it (same approach as skills/bambu_monitor.py).
 
-Auth: gated by ``AMAZON_TRACKING_ENABLED`` in bobert_companion.py. No
-new credentials — reuses Microsoft Graph and/or Gmail via skills.email_triage.
+Gated by ``AMAZON_TRACKING_ENABLED`` (core/config.py, default True: with no
+sign-in it does nothing).
 
 Actions registered:
-  check_orders            — manual roll-call of in-flight orders.
+  check_orders            — roll-call of in-flight orders (refreshes first).
   recent_delivery         — packages delivered in the last 5 days.
   amazon_tracking_status  — diagnostic: backend health + poller state.
 
@@ -53,12 +70,32 @@ _log = logging.getLogger(__name__)
 # well clear of Graph/Gmail rate limits while staying responsive enough
 # that out-for-delivery → delivered transitions feel near-real-time.
 POLL_INTERVAL_SECONDS  = 15 * 60
+# With no usable sign-in the poller checks again this often (a file-exists
+# test; no network), so signing in later takes effect without a restart.
+NO_BACKEND_RECHECK_SECONDS = 60
 INITIAL_DELAY_SECONDS  = 45
 LOOKBACK_DAYS          = 7
 STATE_MAX_ORDERS       = 200   # drop oldest delivered orders past this cap
 PER_BACKEND_FETCH_LIMIT = 25
+# A status email older than this is recorded but never spoken (the tracker was
+# off, or the mailbox was only just connected).
+ANNOUNCE_MAX_AGE_S     = 48 * 3600
+# check_orders refreshes from the mailbox first, but never holds the voice
+# loop longer than this.
+REFRESH_WAIT_S         = 6.0
 
 _STATE_FILE = os.path.join(_PROJECT_DIR, "data", "amazon_order_state.json")
+
+# The tracker's own READ-ONLY Gmail credential (see the module docstring).
+GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_READONLY_TOKEN_FILE = os.path.join(_PROJECT_DIR, "data",
+                                         "gmail_readonly_token.json")
+GMAIL_CLIENT_FILE = os.path.join(_PROJECT_DIR, "gmail_credentials.json")
+SIGN_IN_COMMAND = "python -m skills.amazon_order_tracker --auth-gmail"
+
+# Set by a fetcher that reached its mailbox and got an answer (even an empty
+# one). _poll_once reads it to tell "nothing new" from "could not look".
+_fetch_status = {"ok": False}
 
 _state_lock  = threading.RLock()
 _stop_evt    = threading.Event()
@@ -78,17 +115,19 @@ _STATUS_ORDER = {
 
 # Subject + snippet keyword → status. Order matters: more-specific phrases
 # first so 'out for delivery' doesn't get clobbered by the broader
-# 'delivery' check below it.
+# 'delivery' check below it. The SUBJECT is classified first and the snippet
+# only when the subject says nothing (a "Shipped" mail whose preview reads "will
+# be delivered by Friday" is shipped, not delivered).
 _STATUS_RULES = [
-    (re.compile(r"\bdelivered\b",                          re.I), "delivered"),
+    (re.compile(r"(?<!will be )(?<!to be )\bdelivered\b",   re.I), "delivered"),
     (re.compile(r"\bout for delivery\b",                    re.I), "out_for_delivery"),
-    (re.compile(r"\barriving (today|tomorrow|soon)\b",     re.I), "out_for_delivery"),
+    (re.compile(r"\barriving today\b",                      re.I), "out_for_delivery"),
     (re.compile(r"\b(shipped|on the way|on its way|"
-                r"your package has shipped|shipment notification)\b",
-                                                            re.I), "shipped"),
+                r"your package has shipped|shipment notification|"
+                r"arriving (tomorrow|soon))\b",             re.I), "shipped"),
     (re.compile(r"\b(order (placed|confirmation)|"
                 r"thank you for your order|"
-                r"your amazon\.com order)\b",               re.I), "ordered"),
+                r"your amazon\.com order)\b|^\s*ordered\b", re.I), "ordered"),
 ]
 # Delay markers are independent — they can co-occur with shipped / out for
 # delivery without overriding them.
@@ -122,9 +161,21 @@ _MONTH_INDEX = {m: i + 1 for i, m in enumerate(
 # ─── Config / shared helpers ────────────────────────────────────────────
 
 def _read_feature_flag() -> bool:
+    """AMAZON_TRACKING_ENABLED, read fresh. The monolith re-exports
+    core.config, so its attribute is the same value; it is consulted first so
+    a test (or an older build that still declares the flag in the monolith)
+    keeps working, then core.config directly."""
+    sentinel = object()
     try:
         bc = importlib.import_module("bobert_companion")
-        return bool(getattr(bc, "AMAZON_TRACKING_ENABLED", False))
+        val = getattr(bc, "AMAZON_TRACKING_ENABLED", sentinel)
+        if val is not sentinel:
+            return bool(val)
+    except Exception:
+        pass
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "AMAZON_TRACKING_ENABLED", False))
     except Exception:
         return False
 
@@ -165,6 +216,11 @@ def _outlook_configured() -> bool:
 
 
 def _gmail_configured() -> bool:
+    """A Gmail credential exists: the tracker's own read-only token, or a
+    Gmail service skills/email_triage already has. Existence only - it does
+    not prove the token still works (see _readonly_problem)."""
+    if _readonly_token_present():
+        return True
     et = _email_triage()
     if not et:
         return False
@@ -172,6 +228,156 @@ def _gmail_configured() -> bool:
         return bool(et.is_gmail_available())
     except Exception:
         return False
+
+
+# ─── Gmail, READ-ONLY (the tracker's own credential) ─────────────────────
+
+_ro_cache: list = [None]          # (service, creds) once built
+_ro_problem: list = [""]          # why the read-only credential is unusable
+
+
+def _readonly_token_present() -> bool:
+    try:
+        return os.path.exists(GMAIL_READONLY_TOKEN_FILE)
+    except Exception:
+        return False
+
+
+def _google_libs():
+    """(build, Credentials, Request, InstalledAppFlow) or None when the Google
+    client libraries are not installed. Imported lazily: the skill must load
+    and answer honestly without them."""
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        try:
+            from google_auth_oauthlib.flow import InstalledAppFlow
+        except Exception:
+            InstalledAppFlow = None
+        return build, Credentials, Request, InstalledAppFlow
+    except Exception:
+        return None
+
+
+def _readonly_credentials():
+    """The read-only credentials, refreshed when expired, or None with
+    _ro_problem saying why. Never raises, never opens a browser."""
+    _ro_problem[0] = ""
+    if not _readonly_token_present():
+        _ro_problem[0] = "no read-only token yet"
+        return None
+    libs = _google_libs()
+    if libs is None:
+        _ro_problem[0] = ("the Google client libraries are not installed "
+                          "(google-api-python-client, google-auth-oauthlib)")
+        return None
+    _build, Credentials, Request, _flow = libs
+    try:
+        creds = Credentials.from_authorized_user_file(
+            GMAIL_READONLY_TOKEN_FILE, [GMAIL_READONLY_SCOPE])
+    except Exception as e:
+        _ro_problem[0] = f"the saved token is unreadable ({type(e).__name__})"
+        return None
+    try:
+        if creds.valid:
+            return creds
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            try:
+                _atomic_write_json(GMAIL_READONLY_TOKEN_FILE,
+                                   json.loads(creds.to_json()))
+            except Exception as e:
+                _log.debug("[amazon] token save failed: %s", e)
+            return creds
+    except Exception as e:
+        # A revoked / expired-for-good refresh token lands here.
+        _ro_problem[0] = f"Google refused the saved sign-in ({type(e).__name__})"
+        return None
+    _ro_problem[0] = "the saved sign-in has expired"
+    return None
+
+
+def _readonly_service():
+    """A Gmail client on the read-only credential, or None. Cached while the
+    credentials stay valid."""
+    cached = _ro_cache[0]
+    if cached is not None:
+        service, creds = cached
+        try:
+            if creds.valid:
+                return service
+        except Exception:
+            pass
+        _ro_cache[0] = None
+    creds = _readonly_credentials()
+    if creds is None:
+        return None
+    libs = _google_libs()
+    if libs is None:
+        return None
+    try:
+        service = libs[0]("gmail", "v1", credentials=creds,
+                          cache_discovery=False)
+    except Exception as e:
+        _ro_problem[0] = f"could not build the Gmail client ({type(e).__name__})"
+        return None
+    _ro_cache[0] = (service, creds)
+    return service
+
+
+def authenticate_gmail_readonly() -> bool:
+    """One-time sign-in: opens the browser, asks for READ-ONLY Gmail access
+    and stores the token at GMAIL_READONLY_TOKEN_FILE. Run from a terminal,
+    never by voice."""
+    libs = _google_libs()
+    if libs is None or libs[3] is None:
+        print("[amazon] Install the Google libraries first: "
+              "pip install google-api-python-client google-auth-oauthlib")
+        return False
+    if not os.path.exists(GMAIL_CLIENT_FILE):
+        print("[amazon] The OAuth client file gmail_credentials.json was not "
+              f"found at {GMAIL_CLIENT_FILE}. Create a Desktop-app OAuth "
+              "client in Google Cloud Console (Gmail API enabled), download "
+              "its JSON and save it there, then run this again.")
+        return False
+    flow = libs[3].from_client_secrets_file(GMAIL_CLIENT_FILE,
+                                            [GMAIL_READONLY_SCOPE])
+    creds = flow.run_local_server(port=0)
+    os.makedirs(os.path.dirname(GMAIL_READONLY_TOKEN_FILE), exist_ok=True)
+    _atomic_write_json(GMAIL_READONLY_TOKEN_FILE, json.loads(creds.to_json()))
+    _ro_cache[0] = None
+    print(f"[amazon] Read-only Gmail token saved to {GMAIL_READONLY_TOKEN_FILE}")
+    return True
+
+
+def _backend_problem() -> str:
+    """'' when a mailbox backend looks usable, else the SPOKEN reason it is not
+    (the honest answer instead of an empty "no orders"). A sign-in that exists
+    but is broken is reported as that, not as 'never signed in'. Runs on the
+    voice thread, so it never refreshes a token or touches the network: what
+    the poller last found (_ro_problem) is the evidence."""
+    if _outlook_configured():
+        return ""
+    if _readonly_token_present():
+        et = _email_triage()
+        try:
+            if et is not None and et.is_gmail_available():
+                return ""
+        except Exception:
+            pass
+        if _google_libs() is None:
+            return ("I can't read your Amazon mail, sir - the Google client "
+                    "libraries are not installed.")
+        if _ro_problem[0]:
+            return ("Your Google sign-in for Amazon tracking needs doing again, "
+                    f"sir - {_ro_problem[0]}. Run {SIGN_IN_COMMAND} once.")
+        return ""
+    if _gmail_configured():
+        return ""
+    return ("I need a Google sign-in first, sir. Run "
+            f"{SIGN_IN_COMMAND} once (it asks for read-only Gmail access) and "
+            "I'll watch for your Amazon orders.")
 
 
 # ─── State persistence ──────────────────────────────────────────────────
@@ -234,10 +440,10 @@ def _parse_iso(s: str) -> float:
 
 
 def _classify(subject: str, snippet: str) -> str:
-    text = f"{subject}\n{snippet}"
-    for rx, status in _STATUS_RULES:
-        if rx.search(text):
-            return status
+    for text in (subject or "", snippet or ""):
+        for rx, status in _STATUS_RULES:
+            if rx.search(text):
+                return status
     return "unknown"
 
 
@@ -251,6 +457,45 @@ def _extract_order_id(subject: str, snippet: str) -> str | None:
         if m:
             return m.group(1)
     return None
+
+
+# Amazon puts the item in the subject, in quotes: Shipped: "Anker 65W Charger".
+# Its mails rarely carry the order number in the subject or the preview, so the
+# item is what ties "Shipped" to "Out for delivery" to "Delivered".
+_ITEM_RE = re.compile(r'[“"]([^”"]{3,160})[”"]')
+
+
+def _extract_item(subject: str) -> str:
+    m = _ITEM_RE.search(subject or "")
+    if not m:
+        return ""
+    item = " ".join(m.group(1).split())
+    if len(item) > 60:
+        item = item[:60].rsplit(" ", 1)[0].rstrip(" ,-:") + "..."
+    return item
+
+
+def _order_key(subject: str, snippet: str, msg_id: str) -> str:
+    """The key an order is tracked under: its number when a mail carries one,
+    else the item named in the subject, else the single message."""
+    oid = _extract_order_id(subject, snippet)
+    if oid:
+        return oid
+    item = _extract_item(subject)
+    if item:
+        return "item:" + item.lower()[:80]
+    return f"msg:{msg_id[:24]}"
+
+
+def _order_label(order_id: str, entry: dict) -> str:
+    """How an order is named aloud: its number, else the item in quotes, else a
+    generic phrase (never the synthetic key)."""
+    if order_id.startswith("item:"):
+        item = (entry or {}).get("item") or order_id[5:]
+        return "“" + item + "”"
+    if order_id.startswith("msg:"):
+        return "an Amazon order"
+    return order_id
 
 
 def _extract_estimated_delivery(text: str, ref_ts: float = 0.0) -> float | None:
@@ -322,6 +567,7 @@ def _fetch_outlook() -> list[dict]:
         return []
     if not body:
         return []
+    _fetch_status["ok"] = True
     cutoff = time.time() - (LOOKBACK_DAYS * 86400)
     out: list[dict] = []
     for raw in body.get("value") or []:
@@ -337,21 +583,69 @@ def _fetch_outlook() -> list[dict]:
     return out
 
 
-def _fetch_gmail() -> list[dict]:
+def _shape_gmail_message(full: dict) -> dict:
+    """Normalise a Gmail messages.get(format=metadata) reply into the shape the
+    tracker reads (the same keys skills/email_triage produces), so the
+    read-only path needs nothing from email_triage."""
+    headers = {}
+    for h in ((full.get("payload") or {}).get("headers")) or []:
+        try:
+            headers[str(h.get("name", "")).lower()] = str(h.get("value", ""))
+        except Exception:
+            continue
+    from email.utils import parseaddr
+    name, addr = parseaddr(headers.get("from", ""))
+    received = ""
+    try:
+        ms = int(full.get("internalDate") or 0)
+        if ms > 0:
+            import datetime as _dt
+            received = _dt.datetime.fromtimestamp(
+                ms / 1000.0, _dt.timezone.utc).isoformat()
+    except Exception:
+        received = ""
+    return {
+        "id":        full.get("id") or "",
+        "backend":   "gmail",
+        "from_addr": (addr or "").strip(),
+        "from_name": (name or "").strip(),
+        "subject":   headers.get("subject", "").strip(),
+        "snippet":   (full.get("snippet") or "").strip(),
+        "received":  received or headers.get("date", ""),
+    }
+
+
+def _gmail_for_fetch():
+    """(service, shape, source) for the Gmail fetch, or (None, None, ''):
+    the tracker's own READ-ONLY credential first, else the Gmail service
+    skills/email_triage already holds."""
+    if _readonly_token_present():
+        try:
+            svc = _readonly_service()
+        except Exception as e:
+            _log.debug("[amazon] read-only gmail unavailable: %s", e)
+            svc = None
+        if svc is not None:
+            return svc, _shape_gmail_message, "read-only"
     et = _email_triage()
     if not et:
-        return []
+        return None, None, ""
     try:
         if not et.is_gmail_available():
-            return []
+            return None, None, ""
         service = et._gmail_service()
     except Exception as e:
         _log.debug("[amazon] gmail service unavailable: %s", e)
-        return []
+        return None, None, ""
     if service is None:
-        return []
+        return None, None, ""
     shape = getattr(et, "_shape_gmail_message", None)
-    if not callable(shape):
+    return service, (shape if callable(shape) else _shape_gmail_message), "email_triage"
+
+
+def _fetch_gmail() -> list[dict]:
+    service, shape, source = _gmail_for_fetch()
+    if service is None:
         return []
     q = (f"from:(amazon.com OR shipment-tracking@amazon.com "
          f"OR auto-confirm@amazon.com) "
@@ -363,7 +657,13 @@ def _fetch_gmail() -> list[dict]:
                 .execute())
     except Exception as e:
         _log.debug("[amazon] gmail list failed: %s", e)
+        if source == "read-only":
+            _ro_problem[0] = f"Gmail refused the request ({type(e).__name__})"
+            _ro_cache[0] = None
         return []
+    _fetch_status["ok"] = True
+    if source == "read-only":
+        _ro_problem[0] = ""
     out: list[dict] = []
     for item in resp.get("messages") or []:
         try:
@@ -429,7 +729,13 @@ def _announce_message(status: str, order_label: str) -> str:
     return f"Sir, Amazon order {order_label} is now {_humanise_status(status)}."
 
 
-def _process_messages(messages: list[dict], state: dict) -> dict:
+def _process_messages(messages: list[dict], state: dict, announce: bool = True,
+                      max_age_s: float | None = None) -> dict:
+    """Fold fetched mail into the order table, speaking forward progress.
+
+    ``announce`` False records everything and says nothing (the first poll of a
+    fresh mailbox connection). ``max_age_s`` makes a mail older than that
+    silent too - it is still recorded."""
     orders = state["orders"]
     # Oldest-first so a same-poll progression (e.g. shipped + delivered for
     # the same order) climbs each rank in order rather than skipping.
@@ -441,9 +747,14 @@ def _process_messages(messages: list[dict], state: dict) -> dict:
             continue
         subject = msg.get("subject") or ""
         snippet = msg.get("snippet") or ""
-        order_id = _extract_order_id(subject, snippet) or f"msg:{msg_id[:24]}"
+        order_id = _order_key(subject, snippet, msg_id)
         status = _classify(subject, snippet)
         delayed = _is_delayed(subject, snippet)
+        recv_ts = _parse_iso(msg.get("received", ""))
+        speak = bool(announce)
+        if (speak and max_age_s is not None and recv_ts
+                and time.time() - recv_ts > max_age_s):
+            speak = False
 
         prev = orders.get(order_id) or {
             "first_seen_ts":    time.time(),
@@ -459,8 +770,10 @@ def _process_messages(messages: list[dict], state: dict) -> dict:
             prev["last_message_ids"] = prev["last_message_ids"][-5:]
         prev["last_seen_ts"] = time.time()
         prev["subject"] = subject
+        item = _extract_item(subject)
+        if item:
+            prev["item"] = item
 
-        recv_ts = _parse_iso(msg.get("received", ""))
         est = _extract_estimated_delivery(f"{subject}\n{snippet}", ref_ts=recv_ts)
         if est:
             prev["est_delivery_ts"] = est
@@ -469,21 +782,21 @@ def _process_messages(messages: list[dict], state: dict) -> dict:
         new_rank = _STATUS_ORDER.get(status, 0)
         advanced = (status != "unknown" and new_rank > prev_rank
                     and not already_processed)
+        label = _order_label(order_id, prev)
 
         # Delay side-channel — one announcement per (order, delay flag).
         if delayed and not prev.get("delayed_announced") and not already_processed:
             prev["delayed_announced"] = True
-            label = order_id if not order_id.startswith("msg:") else "an Amazon order"
-            _proactive_announce(_announce_message("delayed", label))
+            if speak:
+                _proactive_announce(_announce_message("delayed", label))
 
         if advanced:
             prev["status"] = status
             history = prev.setdefault("history", [])
             history.append({"status": status, "ts": time.time()})
             prev["history"] = history[-10:]
-            label = order_id if not order_id.startswith("msg:") else "an Amazon order"
             spoken = _announce_message(status, label)
-            if spoken:
+            if spoken and speak:
                 _proactive_announce(spoken)
             # Reminder promise: only on 'shipped' with a future ETA, and
             # only once per order so a re-shipped notice doesn't double up.
@@ -509,6 +822,8 @@ def _process_messages(messages: list[dict], state: dict) -> dict:
 # ─── Poll loop / lifecycle ──────────────────────────────────────────────
 
 def _poll_once() -> int:
+    """One pass over the mailbox. Returns how many Amazon mails it saw."""
+    _fetch_status["ok"] = False
     messages: list[dict] = []
     try:
         messages.extend(_fetch_outlook())
@@ -518,21 +833,56 @@ def _poll_once() -> int:
         messages.extend(_fetch_gmail())
     except Exception:
         _log.exception("[amazon] gmail fetch crashed")
+    reached = bool(_fetch_status["ok"] or messages)
 
     with _state_lock:
         state = _load_state()
+        # The first poll of a mailbox only RECORDS what is already there; a
+        # state written before this flag existed (last_poll_ts set) was
+        # already live, so it is not silenced.
+        seeded = bool(state.get("seeded")) or float(state.get("last_poll_ts") or 0) > 0
         if messages:
-            state = _process_messages(messages, state)
-        else:
+            state = _process_messages(messages, state, announce=seeded,
+                                      max_age_s=ANNOUNCE_MAX_AGE_S)
+            if not seeded:
+                print(f"  [amazon] first look at the mailbox: recorded "
+                      f"{len(state.get('orders') or {})} order(s) silently")
+        elif reached:
             state["last_poll_ts"] = time.time()
+        if reached:
+            state["seeded"] = True
+            state["last_error"] = ""
+        else:
+            state["last_error"] = (_backend_problem() or
+                                   "the mailbox could not be reached")
         _save_state(state)
     return len(messages)
+
+
+def _any_backend() -> bool:
+    return _outlook_configured() or _gmail_configured()
 
 
 def _poll_loop(stop_evt: threading.Event) -> None:
     if stop_evt.wait(INITIAL_DELAY_SECONDS):
         return
+    logged_missing = False
     while not stop_evt.is_set():
+        if not _any_backend():
+            # Not signed in (yet): idle cheaply and re-check, so a sign-in made
+            # while JARVIS runs is picked up. One quiet log line, nothing
+            # spoken.
+            if not logged_missing:
+                logged_missing = True
+                print("  [amazon] waiting for a Google sign-in "
+                      f"({SIGN_IN_COMMAND}) - checking again every "
+                      f"{NO_BACKEND_RECHECK_SECONDS}s")
+            if stop_evt.wait(NO_BACKEND_RECHECK_SECONDS):
+                return
+            continue
+        if logged_missing:
+            logged_missing = False
+            print("  [amazon] a mailbox sign-in is available - tracking now")
         try:
             _poll_once()
         except Exception:
@@ -563,23 +913,43 @@ def stop_monitor() -> None:
 
 
 def start_monitor() -> bool:
+    """Start the poller (idempotent). It starts even with no mailbox sign-in:
+    it then idles and notices a sign-in made later. False only when the
+    feature flag is off."""
     if not _read_feature_flag():
         return False
     if _poll_thread[0] is not None and _poll_thread[0].is_alive():
         return True
-    if not (_outlook_configured() or _gmail_configured()):
-        print("  [amazon] no email backend configured — poller off. "
-              "Run `python -m skills.ms_graph --auth` or "
-              "`python -m skills.email_triage --auth-gmail` first.")
-        return False
     _stop_evt.clear()
     t = threading.Thread(target=_poll_loop, args=(_stop_evt,),
                          daemon=True, name="amazon-order-tracker")
     t.start()
     _poll_thread[0] = t
-    print(f"  [amazon] order tracker active — polling every "
-          f"{POLL_INTERVAL_SECONDS // 60} minutes")
+    if _any_backend():
+        print(f"  [amazon] order tracker active - polling every "
+              f"{POLL_INTERVAL_SECONDS // 60} minutes")
+    else:
+        print(f"  [amazon] order tracker idle: {_backend_problem()}")
     return True
+
+
+def _refresh_now(timeout: float = REFRESH_WAIT_S) -> None:
+    """Look at the mailbox now so an answer is fresh, but never hold the voice
+    loop longer than `timeout`: the poll runs on a worker thread and the caller
+    answers from the state file if it is not done."""
+    if not _any_backend():
+        return
+    t = threading.Thread(target=_poll_once_safely, daemon=True,
+                         name="amazon-refresh")
+    t.start()
+    t.join(timeout=max(0.0, timeout))
+
+
+def _poll_once_safely() -> None:
+    try:
+        _poll_once()
+    except Exception:
+        _log.exception("[amazon] refresh crashed")
 
 
 # ─── Voice actions ──────────────────────────────────────────────────────
@@ -599,7 +969,21 @@ def _fmt_date(ts: float | None) -> str:
         return ""
 
 
+def _entry_name(oid: str, entry: dict, fallback: str) -> str:
+    """How an order is named in a spoken roll-call."""
+    if oid.startswith("msg:"):
+        return fallback
+    return _order_label(oid, entry)
+
+
 def action_check_orders(_: str = "") -> str:
+    problem = _backend_problem()
+    if problem and not _load_state().get("orders"):
+        # Not signed in (or the sign-in is broken): say so. An empty list here
+        # would read as "nothing is coming", which nobody has checked.
+        return problem
+    if not problem:
+        _refresh_now()
     state = _load_state()
     orders = state.get("orders") or {}
     if not orders:
@@ -610,11 +994,12 @@ def action_check_orders(_: str = "") -> str:
         if entry.get("status") in ("ordered", "shipped", "out_for_delivery")
     ]
     if not in_flight:
-        return "Nothing currently in transit, sir."
+        out = "Nothing currently in transit, sir."
+        return (out + " " + problem) if problem else out
     in_flight.sort(key=lambda kv: kv[1].get("last_seen_ts", 0), reverse=True)
     parts = []
     for oid, entry in in_flight[:5]:
-        label = oid if not oid.startswith("msg:") else "an order"
+        label = _entry_name(oid, entry, "an order")
         status_words = _humanise_status(entry.get("status") or "unknown")
         eta = _fmt_date(entry.get("est_delivery_ts"))
         if entry.get("delayed_announced"):
@@ -623,10 +1008,17 @@ def action_check_orders(_: str = "") -> str:
             parts.append(f"{label} — {status_words}, arriving {eta}")
         else:
             parts.append(f"{label} — {status_words}")
-    return "Amazon, sir: " + "; ".join(parts) + "."
+    out = "Amazon, sir: " + "; ".join(parts) + "."
+    return (out + " (That is from the last time I could look: " + problem + ")"
+            ) if problem else out
 
 
 def action_recent_delivery(_: str = "") -> str:
+    problem = _backend_problem()
+    if problem and not _load_state().get("orders"):
+        return problem
+    if not problem:
+        _refresh_now()
     state = _load_state()
     orders = state.get("orders") or {}
     cutoff = time.time() - (5 * 86400)
@@ -640,7 +1032,7 @@ def action_recent_delivery(_: str = "") -> str:
     delivered.sort(key=lambda kv: kv[1].get("last_seen_ts", 0), reverse=True)
     parts = []
     for oid, entry in delivered[:5]:
-        label = oid if not oid.startswith("msg:") else "an order"
+        label = _entry_name(oid, entry, "an order")
         when = _fmt_date(entry.get("last_seen_ts"))
         parts.append(f"{label} ({when})" if when else label)
     return "Recently delivered, sir: " + "; ".join(parts) + "."
@@ -651,7 +1043,15 @@ def action_amazon_tracking_status(_: str = "") -> str:
     enabled = _read_feature_flag()
     bits = [f"enabled: {enabled}"]
     bits.append(f"Outlook: {'configured' if _outlook_configured() else 'not configured'}")
-    bits.append(f"Gmail: {'configured' if _gmail_configured() else 'not configured'}")
+    if _readonly_token_present():
+        gmail = "read-only token saved"
+        if _ro_problem[0]:
+            gmail += f" but {_ro_problem[0]}"
+    elif _gmail_configured():
+        gmail = "configured through email triage"
+    else:
+        gmail = "not signed in"
+    bits.append(f"Gmail: {gmail}")
     last = state.get("last_poll_ts") or 0.0
     if last:
         age_s = max(0, int(time.time() - last))
@@ -663,7 +1063,9 @@ def action_amazon_tracking_status(_: str = "") -> str:
     bits.append(f"orders tracked: {len(state.get('orders') or {})}")
     running = bool(_poll_thread[0] and _poll_thread[0].is_alive())
     bits.append(f"poller: {'running' if running else 'stopped'}")
-    return "Amazon tracker — " + "; ".join(bits) + ", sir."
+    out = "Amazon tracker — " + "; ".join(bits) + ", sir."
+    problem = _backend_problem()
+    return (out + " " + problem) if problem else out
 
 
 def register(actions):
@@ -677,14 +1079,19 @@ def register(actions):
     if not _read_feature_flag():
         print("  [amazon] AMAZON_TRACKING_ENABLED=False — actions registered, poller off")
         return
-    if not (_outlook_configured() or _gmail_configured()):
-        # Surface this once so a misconfigured first-time setup doesn't go
-        # silent. Skill stays loaded so check_orders / status still report.
-        _proactive_announce(
-            "Sir, Amazon order tracking is enabled but no email backend "
-            "is configured. Authenticate Microsoft Graph or Gmail and "
-            "I'll start watching for shipments."
-        )
-        print("  [amazon] no email backend configured — poller off")
-        return
+    # Enabled: start the poller whether or not a mailbox sign-in exists yet.
+    # With none it idles quietly (a log line, never a spoken nag at boot) and
+    # the voice actions say "I need a Google sign-in first, sir".
     start_monitor()
+
+
+if __name__ == "__main__":   # pragma: no cover - interactive one-time sign-in
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Amazon order tracker: one-time READ-ONLY Gmail sign-in")
+    ap.add_argument("--auth-gmail", action="store_true",
+                    help="open the browser and save a read-only Gmail token")
+    args = ap.parse_args()
+    if args.auth_gmail:
+        sys.exit(0 if authenticate_gmail_readonly() else 1)
+    ap.print_help()
