@@ -941,14 +941,18 @@ class NewsAndUmbrellaTests(unittest.TestCase):
     def test_fetch_news_returns_text(self):
         nb = types.ModuleType("news_briefing")
         nb.get_news_text = lambda: "Today's headlines, sir. Markets up."
-        with inject_modules(**{"skills.news_briefing": nb, "news_briefing": nb}):
+        # The news briefing is the package's own news.py part now
+        # (skills/daily_briefing/, loaded as skill_daily_briefing).
+        with inject_modules(**{"skill_daily_briefing.news": nb, "news_briefing": nb}):
             out = self.mod._fetch_news()
         self.assertIn("headlines", out)
 
     def test_fetch_news_module_unavailable(self):
-        # Both `from . import news_briefing` and the bare-import fallback fail →
+        # Both `from . import news` and the bare-import fallback fail →
         # graceful "" (real module is blocked so no feed/LLM network is hit).
-        with block_import("news_briefing"):
+        with inject_modules(**{"skill_daily_briefing.news": None,
+                               "news_briefing": None}), \
+             block_import("news_briefing"):
             self.assertEqual(self.mod._fetch_news(), "")
 
     def test_fetch_news_getter_raises(self):
@@ -956,7 +960,9 @@ class NewsAndUmbrellaTests(unittest.TestCase):
         def _boom():
             raise RuntimeError("all feeds down")
         nb.get_news_text = _boom
-        with inject_modules(**{"skills.news_briefing": nb, "news_briefing": nb}):
+        # The news briefing is the package's own news.py part now
+        # (skills/daily_briefing/, loaded as skill_daily_briefing).
+        with inject_modules(**{"skill_daily_briefing.news": nb, "news_briefing": nb}):
             self.assertEqual(self.mod._fetch_news(), "")
 
     def test_fetch_umbrella_returns_alert(self):

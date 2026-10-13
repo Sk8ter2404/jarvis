@@ -491,6 +491,9 @@ class AmbientExtractActionEdgeTests(unittest.TestCase):
 
 
 class AmbientExtractLoopTests(unittest.TestCase):
+    # These pin the direct (non-batched) loop path: with the monolith loaded
+    # and LEARN_BATCH_ENABLED on, _run_once_batched queues the pass instead
+    # (covered by the learn-batch tests), so they turn batching off here.
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("ambient_multimodal_extract")
 
@@ -498,6 +501,8 @@ class AmbientExtractLoopTests(unittest.TestCase):
         # wait() returns True on the first check → loop breaks after one pass.
         self.mod._stop_evt = self.mod.threading.Event()
         with mock.patch.object(self.mod, "_get_config", return_value=300.0), \
+             mock.patch.object(self.mod, "_run_once_batched",
+                               return_value=False), \
              mock.patch.object(self.mod, "_run_once") as run, \
              mock.patch.object(self.mod._stop_evt, "wait", return_value=True):
             self.mod._loop()
@@ -506,6 +511,8 @@ class AmbientExtractLoopTests(unittest.TestCase):
     def test_loop_swallows_run_once_exception_then_exits(self):
         self.mod._stop_evt = self.mod.threading.Event()
         with mock.patch.object(self.mod, "_get_config", return_value=300.0), \
+             mock.patch.object(self.mod, "_run_once_batched",
+                               return_value=False), \
              mock.patch.object(self.mod, "_run_once",
                                side_effect=RuntimeError("extract boom")), \
              mock.patch.object(self.mod._stop_evt, "wait", return_value=True):
@@ -527,6 +534,8 @@ class AmbientExtractLoopTests(unittest.TestCase):
             self.mod._stop_evt.set()
             seen.append(job.cancel() if job else None)
         with mock.patch.object(self.mod, "_get_config", return_value=300.0), \
+             mock.patch.object(self.mod, "_run_once_batched",
+                               return_value=False), \
              mock.patch.object(self.mod, "_run_once", side_effect=_pass), \
              mock.patch.object(self.mod._stop_evt, "wait", return_value=True):
             self.mod._loop()
