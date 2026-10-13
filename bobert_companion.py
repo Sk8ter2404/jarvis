@@ -21867,7 +21867,10 @@ _LOCAL_MODE_DIRECTIVE = (
 )
 
 
-_LOCAL_CHEATSHEET_CACHE: list[str | None] = [None]
+# (number of registered actions, cheatsheet text) or None. Keyed on the action
+# count so an action or skill registered after the first build is listed too
+# (July audit A82, 2026-10-13); tests reset it to None.
+_LOCAL_CHEATSHEET_CACHE: list = [None]
 
 
 # The single most important instruction on the LOCAL path. A small model with no
@@ -21918,9 +21921,13 @@ def _local_cheatsheet() -> str:
     from the live ACTIONS registry so nothing is unreachable and the list never
     drifts out of sync. ~2k tokens instead of ~18k. Cached after first build.
     """
+    try:
+        _n_actions = len(ACTIONS)
+    except Exception:               # a broken registry must not break the prompt
+        _n_actions = -1
     cached = _LOCAL_CHEATSHEET_CACHE[0]
-    if cached is not None:
-        return cached
+    if isinstance(cached, tuple) and cached[0] == _n_actions:
+        return cached[1]
     common = (
         "\n\n=== CONTROLLING THE PC ===\n"
         "To DO something, output a token EXACTLY like:  [ACTION: name, argument]\n"
@@ -22014,7 +22021,7 @@ def _local_cheatsheet() -> str:
         "=== END PC CONTROL ===\n"
     )
     out = common + allnames + tail
-    _LOCAL_CHEATSHEET_CACHE[0] = out
+    _LOCAL_CHEATSHEET_CACHE[0] = (_n_actions, out)
     return out
 
 
@@ -32782,9 +32789,16 @@ def _handle_shutdown_prompt(text: str) -> bool:
     # the insisting branch below ran a FULL shutdown instead.
     if _action_risk.accepts_overnight(text):
         print(f"  [shutdown] user chose overnight ('{tl}') — start_overnight_upgrade")
-        try: _act_start_overnight_upgrade()
+        # Speak what the action returns (July audit A40, 2026-10-13): with
+        # the engine switched off it explains why nothing will run and that
+        # JARVIS stays awake; ignoring it left the owner's yes unanswered.
+        try: _overnight_out = _act_start_overnight_upgrade()
         except Exception as _e:
             print(f"  [shutdown] _act_start_overnight_upgrade failed: {_e}")
+            _overnight_out = "The overnight engine failed to start, sir. I'm staying awake."
+        if isinstance(_overnight_out, str) and _overnight_out.strip():
+            try: _speak(_overnight_out)
+            except Exception: pass
         return True
     # Edge case: user repeats a shutdown phrase ('shut down... shut down').
     # Interpret as "yes, full shutdown — I'm insisting" rather than re-arming
@@ -32834,9 +32848,16 @@ def _handle_shutdown_prompt(text: str) -> bool:
             or any(tl.startswith(p + " ") for p in SHUTDOWN_PROMPT_YES_PHRASES
                    if "overnight" in p))):
         print(f"  [shutdown] user confirmed overnight ('{tl}') — start_overnight_upgrade")
-        try: _act_start_overnight_upgrade()
+        # Speak what the action returns (July audit A40, 2026-10-13): with
+        # the engine switched off it explains why nothing will run and that
+        # JARVIS stays awake; ignoring it left the owner's yes unanswered.
+        try: _overnight_out = _act_start_overnight_upgrade()
         except Exception as _e:
             print(f"  [shutdown] _act_start_overnight_upgrade failed: {_e}")
+            _overnight_out = "The overnight engine failed to start, sir. I'm staying awake."
+        if isinstance(_overnight_out, str) and _overnight_out.strip():
+            try: _speak(_overnight_out)
+            except Exception: pass
         return True
     # Unrelated speech — cancel the prompt and let the original utterance
     # fall through to normal LLM routing so the user isn't stuck waiting.
@@ -43883,12 +43904,12 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     # (AssertionError) → SAPI5 ("empty text for SAPI5 render") → silence,
     # spamming the logs and spinning up the duck/barge-in machinery for
     # nothing (seen in the 2026-05-30 log audit). Mirror the mute-path
-    # bookkeeping and return.
+    # bookkeeping and return. Like the mute path, do NOT touch the shared
+    # _last_* cells: they are only published under _SPEAK_LOCK, and clearing
+    # them here (outside the lock) stomped on a concurrent speaker's prosody
+    # (July audit A83, 2026-10-13).
     if not (spoken_text or "").strip():
         last_speech_time = time.time()
-        _last_intent_override[0] = None
-        _last_wry[0] = False
-        _last_mood[0] = None
         return
     # A line is about to be voiced on this thread (or recorded, on staging):
     # a self-voiced action that got here did its own talking

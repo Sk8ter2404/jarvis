@@ -1428,5 +1428,26 @@ class EndToEndOwwTests(unittest.TestCase):
         self.assertEqual(events[0]["phrase"], "jarvis")
 
 
+class PauseDropsPartialFramesTests(unittest.TestCase):
+    """July audit A47 (2026-10-13): pause() dropped the float frame buffer
+    but kept Porcupine's partial-frame carry, so the first frame after
+    resume() spliced pre- and post-refresh audio together."""
+
+    def test_pause_clears_the_porcupine_carry_too(self):
+        d = ww.WakeWordDetector(engine="off")
+        d._running = True
+        d._paused = False
+        d._stream = object()
+        d._buf = np.ones(100, dtype=np.float32)
+        d._porcupine_leftover = np.ones(37, dtype=np.int16)
+        with mock.patch.object(ww, "_safe_close_stream") as close:
+            d.pause()
+        close.assert_called_once()
+        self.assertTrue(d._paused)
+        self.assertEqual(d._buf.size, 0)
+        self.assertEqual(d._porcupine_leftover.size, 0)
+        self.assertEqual(d._porcupine_leftover.dtype, np.int16)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -418,8 +418,11 @@ class WakeWordDetector:
             self._paused = True
             _safe_close_stream(s)
             # Drop any partial frame data so the resumed stream doesn't splice
-            # pre- and post-refresh audio into a single garbage frame.
+            # pre- and post-refresh audio into a single garbage frame. That
+            # includes Porcupine's partial-frame carry (July audit A47): the
+            # stream is already closed above, so no callback races this.
             self._buf = np.zeros(0, dtype=np.float32)
+            self._porcupine_leftover = np.zeros(0, dtype=np.int16)
             print("  [wake-word] paused for device refresh")
 
     def resume(self) -> bool:
