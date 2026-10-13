@@ -82,6 +82,12 @@ _BRAND_TO_SKILL = {
     "nest":         "sh_nest",
     "google nest":  "sh_nest",
     "ring":         "sh_ring",
+    # Smart Life / Tuya: local LAN control once the local keys are in
+    # data/tuya_devices.json (2026-10-13); a device without a key, or one
+    # that doesn't confirm, errors and the router falls back to Alexa.
+    "smartlife":    "sh_tuya",
+    "smart life":   "sh_tuya",
+    "tuya":         "sh_tuya",
 }
 
 # Coarse rgb tuples used when the user names a color. Keyed by the lowercase
