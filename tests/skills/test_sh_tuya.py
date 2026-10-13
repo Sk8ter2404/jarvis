@@ -115,90 +115,105 @@ class TuyaFindRecordTests(unittest.TestCase):
             self.assertIsNone(self.mod._find_record({"name": "nope"}))
 
 
+class _FakeTuya:
+    """A Tuya device that keeps its data points: set_value really changes
+    them (unless `stuck`), status() reads them back, `dead` = unreachable."""
+
+    def __init__(self, dps, stuck=False, dead=False, raise_on_set=False):
+        self.dps = dict(dps)
+        self.stuck, self.dead, self.raise_on_set = stuck, dead, raise_on_set
+        self.sets = []
+
+    def status(self):
+        if self.dead:
+            return {"Error": "Network Error: Device Unreachable", "Err": "905"}
+        return {"dps": dict(self.dps)}
+
+    def set_value(self, index, value):
+        if self.raise_on_set:
+            raise OSError("offline")
+        self.sets.append((str(index), value))
+        if not self.stuck:
+            self.dps[str(index)] = value
+        return {"dps": {str(index): value}}
+
+
+BULB = {"20": False, "21": "white", "22": 1000, "23": 400}
+PLUG = {"1": False, "9": 0}
+
+
 class TuyaSetStateApplyTests(unittest.TestCase):
-    """set_state drives a tinytuya OutletDevice. We stub _device so a fake
-    handle records turn_on/turn_off, avoiding any real LAN socket."""
+    """set_state drives the device's REAL data points (read first) and
+    confirms by reading back (2026-10-13: the old OutletDevice.turn_on drove
+    dp 1, which Tuya bulbs don't have, and still said OK)."""
 
     def setUp(self):
         self.mod, _ = load_skill_isolated("sh_tuya")
 
-    def test_turn_on(self):
-        handle = mock.Mock()
-        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]), \
-             mock.patch.object(self.mod, "_device", return_value=handle):
-            res = self.mod.set_state({"name": "Entry Plug"}, on=True)
-        self.assertEqual(res["applied"]["on"], True)
-        handle.turn_on.assert_called_once()
+    def _run(self, dev, **kw):
+        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]),              mock.patch.object(self.mod, "_device", return_value=dev):
+            return self.mod.set_state({"name": "Entry Plug"}, **kw)
 
-    def test_turn_off(self):
-        handle = mock.Mock()
-        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]), \
-             mock.patch.object(self.mod, "_device", return_value=handle):
-            res = self.mod.set_state({"name": "Entry Plug"}, on=False)
-        self.assertEqual(res["applied"]["on"], False)
-        handle.turn_off.assert_called_once()
-
-    def test_get_state_reads_dps_switch(self):
-        handle = mock.Mock()
-        handle.status.return_value = {"dps": {"1": True}}
-        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]), \
-             mock.patch.object(self.mod, "_device", return_value=handle):
-            st = self.mod.get_state({"name": "Entry Plug"})
-        self.assertTrue(st["on"])
-        self.assertEqual(st["raw"], {"1": True})
-
-    def test_get_state_read_failure_is_caught(self):
-        handle = mock.Mock()
-        handle.status.side_effect = OSError("LAN timeout")
-        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]), \
-             mock.patch.object(self.mod, "_device", return_value=handle):
-            st = self.mod.get_state({"name": "Entry Plug"})
-        self.assertIn("tuya state read failed", st["error"])
-
-    def test_get_state_dps20_fallback_switch(self):
-        # Some Tuya switches expose dp '20' instead of '1'.
-        handle = mock.Mock()
-        handle.status.return_value = {"dps": {"20": True}}
-        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]), \
-             mock.patch.object(self.mod, "_device", return_value=handle):
-            st = self.mod.get_state({"name": "Entry Plug"})
-        self.assertTrue(st["on"])
-
-    def test_set_state_brightness_applied(self):
-        handle = mock.Mock()
-        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]), \
-             mock.patch.object(self.mod, "_device", return_value=handle):
-            res = self.mod.set_state({"name": "Entry Plug"}, brightness=60)
-        self.assertEqual(res["applied"]["brightness"], 60)
-        # Tuya brightness dp 22 expects 0..1000; 60% → 600.
-        handle.set_value.assert_called_once_with(22, 600)
-
-    def test_set_state_brightness_clamped(self):
-        handle = mock.Mock()
-        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]), \
-             mock.patch.object(self.mod, "_device", return_value=handle):
-            res = self.mod.set_state({"name": "Entry Plug"}, brightness=250)
-        self.assertEqual(res["applied"]["brightness"], 100)  # clamped to 100
-
-    def test_set_state_brightness_failure_swallowed(self):
-        # set_value raising must not abort; brightness simply isn't recorded.
-        handle = mock.Mock()
-        handle.set_value.side_effect = RuntimeError("unsupported dp")
-        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]), \
-             mock.patch.object(self.mod, "_device", return_value=handle):
-            res = self.mod.set_state({"name": "Entry Plug"}, brightness=50)
+    def test_bulb_turns_on_with_dp_20(self):
+        dev = _FakeTuya(BULB)
+        res = self._run(dev, on=True)
         self.assertTrue(res["ok"])
-        self.assertNotIn("brightness", res["applied"])
+        self.assertEqual(dev.sets, [("20", True)])
+        self.assertIs(dev.dps["20"], True)
 
-    def test_set_state_outer_failure_returns_partial(self):
-        # turn_on raising → outer except path with the partial dict.
-        handle = mock.Mock()
-        handle.turn_on.side_effect = OSError("offline")
-        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]), \
-             mock.patch.object(self.mod, "_device", return_value=handle):
-            res = self.mod.set_state({"name": "Entry Plug"}, on=True)
+    def test_plug_turns_off_with_dp_1(self):
+        dev = _FakeTuya(dict(PLUG, **{"1": True}))
+        res = self._run(dev, on=False)
+        self.assertTrue(res["ok"])
+        self.assertEqual(dev.sets, [("1", False)])
+
+    def test_brightness_turns_the_bulb_on_and_sets_dp_22(self):
+        dev = _FakeTuya(BULB)
+        res = self._run(dev, brightness=60)
+        self.assertEqual(res["applied"], {"on": True, "brightness": 60})
+        self.assertEqual(dev.sets, [("20", True), ("22", 600)])
+
+    def test_brightness_is_clamped_and_never_below_the_floor(self):
+        dev = _FakeTuya(BULB)
+        self.assertEqual(self._run(dev, brightness=250)["applied"]["brightness"], 100)
+        self.assertEqual(dev.sets[-1], ("22", 1000))
+        dev2 = _FakeTuya(BULB)
+        self._run(dev2, brightness=0.4)
+        self.assertEqual(dev2.sets, [("20", False)])     # 0 % means off
+
+    def test_a_device_that_does_not_change_is_not_reported_ok(self):
+        res = self._run(_FakeTuya(BULB, stuck=True), on=True)
+        self.assertIn("did not confirm", res["error"])
+
+    def test_unreachable_device_errors_so_the_router_falls_back(self):
+        res = self._run(_FakeTuya(BULB, dead=True), on=True)
+        self.assertIn("didn't answer", res["error"])
+
+    def test_set_failure_returns_partial(self):
+        res = self._run(_FakeTuya(BULB, raise_on_set=True), on=True)
         self.assertIn("tuya set_state failed", res["error"])
         self.assertIn("partial", res)
+
+    def test_colour_only_is_left_to_alexa(self):
+        res = self._run(_FakeTuya(BULB), color_name="red")
+        self.assertIn("isn't supported locally", res["error"])
+
+    def test_no_brightness_point_is_an_error_not_a_fake_ok(self):
+        res = self._run(_FakeTuya(PLUG), brightness=50)
+        self.assertIn("no brightness control", res["error"])
+
+    def test_get_state_bulb(self):
+        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]),              mock.patch.object(self.mod, "_device",
+                               return_value=_FakeTuya({"20": True, "22": 500})):
+            st = self.mod.get_state({"name": "Entry Plug"})
+        self.assertTrue(st["on"])
+        self.assertEqual(st["brightness"], 50)
+
+    def test_get_state_plug_and_read_failure(self):
+        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]),              mock.patch.object(self.mod, "_device", return_value=_FakeTuya({"1": True})):
+            self.assertTrue(self.mod.get_state({"name": "x"})["on"])
+        with mock.patch.object(self.mod, "_find_record", return_value=_CATALOG[0]),              mock.patch.object(self.mod, "_device", return_value=_FakeTuya(BULB, dead=True)):
+            self.assertIn("didn't answer", self.mod.get_state({"name": "x"})["error"])
 
 
 class TuyaTtImportTests(unittest.TestCase):

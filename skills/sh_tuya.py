@@ -111,45 +111,113 @@ def _find_record(device: dict) -> dict | None:
     return None
 
 
+def _switch_dp(dps: dict) -> str | None:
+    """The on/off data point: '20' on Tuya lights/bulbs (category dj; their
+    dp '1' does not exist), '1' on plugs and switches. None when neither is
+    reported. (2026-10-13: the old code always drove dp 1 through
+    OutletDevice.turn_on, so a bulb 'turned on' did nothing yet said OK.)"""
+    for dp in ("20", "1"):
+        if dp in dps:
+            return dp
+    return None
+
+
+def _brightness_dp(dps: dict):
+    """(dp, lowest, highest) for brightness: v2 lights use dp '22' (10..1000),
+    older ones dp '3' (25..255). None when the device has no brightness."""
+    if "22" in dps:
+        return "22", 10, 1000
+    if "3" in dps and "20" not in dps:
+        return "3", 25, 255
+    return None
+
+
+def _read_dps(dev) -> tuple[dict, str]:
+    """(dps, error). tinytuya reports a failed read as {'Error': ...}."""
+    try:
+        st = dev.status() or {}
+    except Exception as e:
+        return {}, f"tuya state read failed: {e}"
+    if st.get("Error"):
+        return {}, f"tuya device didn't answer: {st.get('Error')}"
+    return (st.get("dps") or {}), ""
+
+
 def get_state(device: dict) -> dict:
     rec = _find_record(device)
     dev = _device(rec) if rec else None
     if dev is None:
         return {"error": f"tuya device '{device.get('name')}' not ready"}
-    try:
-        st = dev.status() or {}
-        dps = st.get("dps") or {}
-        # dps '1' is the switch on most Tuya plugs/switches.
-        on = bool(dps.get("1", dps.get("20", False)))
-        return {"on": on, "raw": dps}
-    except Exception as e:
-        return {"error": f"tuya state read failed: {e}"}
+    dps, err = _read_dps(dev)
+    if err:
+        return {"error": err}
+    sw = _switch_dp(dps)
+    out = {"on": bool(dps.get(sw)) if sw else False, "raw": dps}
+    b = _brightness_dp(dps)
+    if b and isinstance(dps.get(b[0]), (int, float)):
+        out["brightness"] = max(0, min(100, round(dps[b[0]] * 100 / b[2])))
+    return out
 
 
 def set_state(device: dict, **kwargs) -> dict:
+    """On/off and brightness over the LAN, on the device's REAL data points
+    (read first), confirmed by a read-back. Anything this skill can't do
+    locally (colour, colour temperature), an unreachable device, or a device
+    that doesn't confirm returns {"error"} so the router falls back to Alexa
+    - never an "ok" for a change that didn't happen."""
     rec = _find_record(device)
     dev = _device(rec) if rec else None
     if dev is None:
         return {"error": f"tuya device '{device.get('name')}' not ready"}
-    applied = {}
+    want_on = kwargs.get("on")
+    pct = kwargs.get("brightness")
+    extras = [k for k in ("color", "color_name", "color_temperature")
+              if kwargs.get(k) is not None]
+    if extras and want_on is None and pct is None:
+        return {"error": f"tuya: {', '.join(extras)} isn't supported locally"}
+    dps, err = _read_dps(dev)
+    if err:
+        return {"error": err}
+    sw = _switch_dp(dps)
+    bdp = _brightness_dp(dps)
+    if pct is not None:
+        pct = max(0, min(100, int(pct)))
+        if pct == 0:
+            want_on, pct = False, None
+        elif want_on is None:
+            want_on = True                  # "set it to 40%" means on
+    applied: dict = {}
+    target: dict = {}
     try:
-        if "on" in kwargs and kwargs["on"] is not None:
-            if kwargs["on"]:
-                dev.turn_on()
-            else:
-                dev.turn_off()
-            applied["on"] = bool(kwargs["on"])
-        if kwargs.get("brightness") is not None:
-            # Tuya brightness dp is usually '2'/'22' (0..1000). Best-effort.
-            pct = max(0, min(100, int(kwargs["brightness"])))
-            try:
-                dev.set_value(22, int(pct * 10))
-                applied["brightness"] = pct
-            except Exception:
-                pass
-        return {"ok": True, "applied": applied}
+        if want_on is not None:
+            if sw is None:
+                return {"error": "tuya device reports no on/off switch"}
+            dev.set_value(int(sw), bool(want_on))
+            applied["on"] = target[sw] = bool(want_on)
+        if pct is not None and want_on is not False:
+            if bdp is None:
+                return {"error": "tuya device has no brightness control",
+                        "partial": applied}
+            dp, lo, hi = bdp
+            value = max(lo, min(hi, round(hi * pct / 100)))
+            dev.set_value(int(dp), value)
+            applied["brightness"] = pct
+            target[dp] = value
     except Exception as e:
         return {"error": f"tuya set_state failed: {e}", "partial": applied}
+    after, err = _read_dps(dev)
+    if err:
+        return {"error": f"tuya change not confirmed ({err})", "partial": applied}
+    for dp, want in target.items():
+        got = after.get(dp)
+        if isinstance(want, bool):
+            ok = got is want
+        else:
+            ok = isinstance(got, (int, float)) and abs(got - want) <= max(5, hi * 0.02)
+        if not ok:
+            return {"error": f"tuya device did not confirm dp {dp} (wanted "
+                             f"{want}, reads {got})", "partial": applied}
+    return {"ok": True, "applied": applied}
 
 
 # ── voice helpers ──────────────────────────────────────────────────────

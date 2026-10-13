@@ -144,6 +144,10 @@ _BRAND_TO_SKILL = {
     "nest":         "sh_nest",
     "google nest":  "sh_nest",
     "ring":         "sh_ring",
+    # Keep in step with core/smart_home_router._BRAND_TO_SKILL (2026-10-13).
+    "smartlife":    "sh_tuya",
+    "smart life":   "sh_tuya",
+    "tuya":         "sh_tuya",
 }
 
 # OUI prefixes (upper, no separators) for the LAN cross-reference.

@@ -318,6 +318,17 @@ class BrandDiscoveryTests(_RouterTestBase):
         self.assertEqual(router._controller_for("tapo"), "sh_kasa")
         self.assertEqual(router._controller_for("Govee Strip"), "sh_govee")
         self.assertEqual(router._controller_for("google nest"), "sh_nest")
+        # 2026-10-13: Smart Life / Tuya go direct (local keys), Alexa fallback.
+        self.assertEqual(router._controller_for("SmartLife"), "sh_tuya")
+        self.assertEqual(router._controller_for("Smart Life"), "sh_tuya")
+        self.assertEqual(router._controller_for("Tuya"), "sh_tuya")
+
+    def test_router_and_discover_brand_tables_agree(self):
+        # Two copies of the table drifted before (stale-duplicate class);
+        # every brand the router knows must label the catalog the same way.
+        from skills import smart_home_discover as disc
+        for brand, skill in router._BRAND_TO_SKILL.items():
+            self.assertEqual(disc._BRAND_TO_SKILL.get(brand), skill, brand)
 
     def test_controller_for_empty_and_unknown(self):
         self.assertIsNone(router._controller_for(""))
