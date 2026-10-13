@@ -1445,6 +1445,11 @@ def _on_screen_memory(icon, item):
     record of what is on screen - no AI calls, no pictures kept)."""
     _send_command("screen_memory_toggle")
 
+def _on_screen_remarks(icon, item):
+    """Screen comments on / off (core.screen_remarks): the occasional dry
+    remark about the video he just started. Saved, applies at once."""
+    _send_command("screen_remarks_toggle")
+
 def _on_screen_memory_pause(icon, item):
     """Pause screen memory for 15 minutes."""
     _send_command("screen_memory_pause", arg="15")
@@ -2501,6 +2506,12 @@ def _is_screen_memory() -> bool:
     return bool(_read_hud_state().get("screen_memory"))
 
 
+def _is_screen_remarks() -> bool:
+    """Screen Comments checkmark: hud_state.screen_remarks, published by the
+    monolith at boot and on every flip."""
+    return bool(_read_hud_state().get("screen_remarks"))
+
+
 def _is_debug_mode() -> bool:
     return bool(_read_hud_state().get("debug_mode"))
 
@@ -2848,6 +2859,8 @@ def _build_menu():
                          checked=lambda i: _is_ambient_mode()),
         pystray.MenuItem("Screen Memory",   _on_screen_memory,
                          checked=lambda i: _is_screen_memory()),
+        pystray.MenuItem("Screen Comments", _on_screen_remarks,
+                         checked=lambda i: _is_screen_remarks()),
         pystray.MenuItem("Pause Screen Memory 15 min", _on_screen_memory_pause),
         pystray.Menu.SEPARATOR,
         # ── grouped submenus ──

@@ -61,7 +61,7 @@ def is_urgent(entry) -> bool:
 # log line) rather than recapped.
 EXPIRE_QUIETLY_SOURCES = frozenset({
     "wellness", "anticipation", "banter", "greet", "posture", "night_owl",
-    "screen_watch",
+    "screen_watch", "screen_remark",
 })
 
 _RECAP_NAMED = 3          # fragments named in a recap; the rest are counted

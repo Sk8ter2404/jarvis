@@ -98,7 +98,8 @@ class NoteForClaudeTests(_Base):
 class ScreenMemoryActionTests(_Base):
     def test_controls_route_to_the_watcher(self):
         from core import screen_memory as SW
-        with mock.patch.object(SW, "pause", return_value="paused") as pa, \
+        with mock.patch.object(SW, "is_running", return_value=True), \
+                mock.patch.object(SW, "pause", return_value="paused") as pa, \
                 mock.patch.object(SW, "unpause", return_value="resumed") as re_, \
                 mock.patch.object(SW, "status_line", return_value="st") as st, \
                 mock.patch.object(SW, "exclude_foreground",
