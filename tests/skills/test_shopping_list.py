@@ -111,39 +111,87 @@ class RemoveAndClearTests(_Base):
 
 
 class AddReminderTests(_Base):
+    """No-time reminders go to their OWN reminders list - never to the
+    developer queue (queue_task / jarvis_todo.md), which the overnight
+    upgrade pipeline reads as coding tasks."""
+
+    def _reminders(self):
+        from core import untimed_reminders as ur
+        return [i["text"] for i in ur.load_items(ur.REMINDERS_LIST)]
+
     def test_purchase_goes_to_the_shopping_list(self):
         out = self.actions["add_reminder"]("buy milk")
         self.assertEqual(out, "Added milk to your shopping list, sir.")
         self.assertEqual(self.queued, [])
+        self.assertEqual(self._reminders(), [])
 
-    def test_other_reminder_goes_to_the_todo_list(self):
+    def test_other_reminder_goes_to_the_reminders_list(self):
         out = self.actions["add_reminder"]("call the dentist")
-        self.assertEqual(self.queued, ["[reminder] call the dentist"])
-        self.assertIn("to-do list", out)
+        self.assertEqual(self._reminders(), ["call the dentist"])
+        self.assertEqual(self.queued, [], "must never reach the dev queue")
+        self.assertIn("reminders list", out)
         self.assertIn("call the dentist", out)
         self.assertIn("no time", out)
 
-    def test_no_todo_list_is_an_honest_failure(self):
-        del self.actions["queue_task"]
+    def test_duplicate_reminder_says_so(self):
+        self.actions["add_reminder"]("call the dentist")
         out = self.actions["add_reminder"]("call the dentist")
-        self.assertIn("nothing was saved", out)
+        self.assertIn("already on your reminders list", out)
+        self.assertEqual(self._reminders(), ["call the dentist"])
 
-    def test_todo_failure_is_an_honest_failure(self):
-        def boom(_):
-            raise RuntimeError("no file")
-        self.actions["queue_task"] = boom
-        out = self.actions["add_reminder"]("call the dentist")
+    def test_save_failure_is_an_honest_failure(self):
+        with mock.patch.object(self.mod._ur, "add_items",
+                               side_effect=OSError("disk")):
+            out = self.actions["add_reminder"]("call the dentist")
         self.assertIn("nothing was saved", out)
 
     def test_blank_asks(self):
         self.assertIn("What should I remind you",
                       self.actions["add_reminder"](""))
 
-    def test_never_schedules_a_timer(self):
+    def test_never_schedules_a_timer_or_queues_a_task(self):
         self.assertNotIn("set_timer", self.actions)
         self.actions["add_reminder"]("buy milk")
         self.actions["add_reminder"]("call mom")
-        self.assertEqual(self.queued, ["[reminder] call mom"])
+        self.assertEqual(self.queued, [])
+        self.assertEqual(self._reminders(), ["call mom"])
+
+
+class RemindersListTests(_Base):
+    def test_registered_and_spoken_verbatim(self):
+        for name in ("show_reminders_list", "remove_reminder_item",
+                     "clear_reminders_list"):
+            self.assertIn(name, self.actions)
+            self.assertIn(name, self.mod.SPEAK_VERBATIM_ACTIONS)
+
+    def test_show_empty_then_full(self):
+        self.assertEqual(self.actions["show_reminders_list"](),
+                         "Your reminders list is empty, sir.")
+        self.actions["add_reminder"]("call the dentist")
+        self.actions["add_reminder"]("renew the registration")
+        out = self.actions["show_reminders_list"]()
+        self.assertIn("2 items", out)
+        self.assertIn("call the dentist and renew the registration", out)
+
+    def test_remove_one(self):
+        self.actions["add_reminder"]("call the dentist")
+        out = self.actions["remove_reminder_item"]("dentist")
+        self.assertIn("off your reminders list", out)
+        self.assertEqual(self.actions["show_reminders_list"](),
+                         "Your reminders list is empty, sir.")
+
+    def test_remove_missing_says_so(self):
+        out = self.actions["remove_reminder_item"]("the dentist")
+        self.assertIn("I don't see", out)
+
+    def test_clear_keeps_a_backup_and_leaves_shopping_alone(self):
+        self.actions["add_reminder"]("call the dentist")
+        self.actions["add_shopping_item"]("eggs")
+        out = self.actions["clear_reminders_list"]()
+        self.assertIn("1 item removed", out)
+        self.assertIn("eggs", self.actions["show_shopping_list"]())
+        self.assertTrue(os.path.exists(
+            os.path.join(self._dir, "reminders_list.json.bak")))
 
 
 if __name__ == "__main__":

@@ -232,6 +232,7 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "timer", "remind", "reminder", "alarm", "wake me", "in a minute",
         "minutes", "seconds", "hour", "countdown", "set a", "alert me",
         "shopping list", "grocery list", "groceries", "timesheet",
+        "reminders list", "reminder list", "my reminders",
     ],
     "CLAUDE CREDITS": [
         "claude", "credit", "credits", "api", "quota", "budget", "cost",

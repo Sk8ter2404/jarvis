@@ -3,17 +3,22 @@ Shopping list + untimed reminders.
 
 Actions added:
   add_reminder, <what>            a reminder that names NO time: goes on the
-                                  to-do list (queue_task). Says where it went.
-                                  If the text is about buying something it goes
-                                  on the shopping list instead.
+                                  reminders list. Says where it went. If the
+                                  text is about buying something it goes on
+                                  the shopping list instead.
+  show_reminders_list             read the reminders list back
+  remove_reminder_item, <item>    take one reminder off
+  clear_reminders_list            empty the reminders list (a .bak is kept)
   add_shopping_item, <a, b, c>    add items to the shopping list
   show_shopping_list              read the list back
   remove_shopping_item, <item>    take one item off
   clear_shopping_list             empty the list (a .bak copy is kept)
 
 "Remind me to buy milk" (no time) lands on the shopping list; any other
-reminder with no time lands on the to-do list; a reminder WITH a time stays a
-timer / schedule. The grammar lives in core/untimed_reminders.py; the monolith
+reminder with no time lands on the reminders list; a reminder WITH a time stays
+a timer / schedule. The reminders list is its own file (data/reminders_list.json),
+NEVER jarvis_todo.md: that is the developer task queue the overnight upgrade
+pipeline reads as coding tasks, and "the to-do list" already names it by voice. The grammar lives in core/untimed_reminders.py; the monolith
 routes whole-utterance requests here without the model, and the prompt teaches
 the model the same actions for the phrasings the grammar misses.
 
@@ -25,13 +30,12 @@ from __future__ import annotations
 
 from core import untimed_reminders as _ur
 
-_TODO_TAG = "[reminder] "
-
 # The replies are finished sentences that say where the item went: spoken
 # verbatim (bobert_companion._collect_skill_speak_sets), never re-worded.
 SPEAK_VERBATIM_ACTIONS = ("add_reminder", "add_shopping_item",
                           "show_shopping_list", "remove_shopping_item",
-                          "clear_shopping_list")
+                          "clear_shopping_list", "show_reminders_list",
+                          "remove_reminder_item", "clear_reminders_list")
 
 
 def _count_words(n: int) -> str:
@@ -99,7 +103,8 @@ def register(actions: dict) -> None:
 
     def add_reminder(args: str = "") -> str:
         """A reminder with no time. Shopping goes to the shopping list, the
-        rest to the to-do list - never to a timer."""
+        rest to the reminders list - never to a timer, never to the
+        developer queue."""
         task = (args or "").strip(" ,.")
         if not task:
             return ("What should I remind you about, sir? Say 'remind me to "
@@ -108,22 +113,59 @@ def register(actions: dict) -> None:
         items = _ur.shopping_items(task)
         if items:
             return add_shopping_item(", ".join(items))
-        queue = actions.get("queue_task")
-        if not callable(queue):
-            return ("I can't reach the to-do list just now, sir - nothing was "
-                    "saved.")
         try:
-            result = queue(_TODO_TAG + task)
+            added, dup = _ur.add_items([task], name=_ur.REMINDERS_LIST)
         except Exception as e:
-            return (f"I couldn't add that to your to-do list, sir "
+            return (f"I couldn't save that to your reminders list, sir "
                     f"({type(e).__name__}) - nothing was saved.")
-        if isinstance(result, str) and result.lower().startswith("format:"):
-            return "I couldn't add that to your to-do list, sir."
-        return (f"Added to your to-do list, sir: {task}. You gave me no "
-                f"time, so I won't alert you.")
+        if not added and dup:
+            return f"That's already on your reminders list, sir: {dup[0]}."
+        if not added:
+            return "I didn't catch what to remind you about, sir."
+        return (f"Added to your reminders list, sir: {added[0]}. You gave me "
+                f"no time, so I won't alert you.")
+
+    def show_reminders_list(_: str = "") -> str:
+        items = [i["text"] for i in _ur.load_items(_ur.REMINDERS_LIST)]
+        if not items:
+            return "Your reminders list is empty, sir."
+        return (f"Your reminders list has {_count_words(len(items))}, sir: "
+                f"{_ur.spoken_join(items)}.")
+
+    def remove_reminder_item(args: str = "") -> str:
+        what = (args or "").strip()
+        if not what:
+            return "Which reminder should I take off your list, sir?"
+        if what.lower() in _ur._ALL_WORDS:
+            return clear_reminders_list("")
+        try:
+            removed, candidates = _ur.remove_matching(
+                what, name=_ur.REMINDERS_LIST)
+        except Exception as e:
+            return (f"I couldn't update your reminders list, sir "
+                    f"({type(e).__name__}) - nothing was removed.")
+        if removed:
+            return f"Took '{removed}' off your reminders list, sir."
+        if candidates:
+            return (f"More than one reminder matches '{what}', sir: "
+                    f"{_ur.spoken_join(candidates)}. Which one?")
+        return f"I don't see '{what}' on your reminders list, sir."
+
+    def clear_reminders_list(_: str = "") -> str:
+        try:
+            n = _ur.clear_all(name=_ur.REMINDERS_LIST)
+        except Exception as e:
+            return (f"I couldn't clear your reminders list, sir "
+                    f"({type(e).__name__}) - it's unchanged.")
+        if not n:
+            return "Your reminders list was already empty, sir."
+        return f"Cleared your reminders list, sir - {_count_words(n)} removed."
 
     actions["add_shopping_item"] = add_shopping_item
     actions["show_shopping_list"] = show_shopping_list
     actions["remove_shopping_item"] = remove_shopping_item
     actions["clear_shopping_list"] = clear_shopping_list
     actions["add_reminder"] = add_reminder
+    actions["show_reminders_list"] = show_reminders_list
+    actions["remove_reminder_item"] = remove_reminder_item
+    actions["clear_reminders_list"] = clear_reminders_list

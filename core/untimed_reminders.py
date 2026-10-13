@@ -264,23 +264,28 @@ def match(text) -> Optional[Intent]:
     return None
 
 
-# ── the shopping list (data/shopping_list.json) ─────────────────────────────
-_FILE_NAME = "shopping_list.json"
+# ── the lists (data/shopping_list.json, data/reminders_list.json) ───────────
+# Personal no-time reminders live in their OWN file, never in jarvis_todo.md:
+# that file is the developer task queue the overnight upgrade pipeline reads
+# as coding tasks.
+SHOPPING_LIST = "shopping_list.json"
+REMINDERS_LIST = "reminders_list.json"
+_FILE_NAME = SHOPPING_LIST
 _lock = threading.RLock()
 
 
-def _path() -> str:
+def _path(name: str = SHOPPING_LIST) -> str:
     from core import paths
-    return paths.data_file(_FILE_NAME)
+    return paths.data_file(name)
 
 
-def load_items() -> list:
+def load_items(name: str = SHOPPING_LIST) -> list:
     """The list as [{"text": str, "added": iso}], oldest first. A missing or
     unreadable file is an empty list, never an error."""
     import json
     with _lock:
         try:
-            with open(_path(), "r", encoding="utf-8") as f:
+            with open(_path(name), "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
             return []
@@ -293,9 +298,9 @@ def load_items() -> list:
     return out
 
 
-def _save(items: list) -> None:
+def _save(items: list, name: str = SHOPPING_LIST) -> None:
     from core.atomic_io import _atomic_write_json
-    _atomic_write_json(_path(), {"items": items})
+    _atomic_write_json(_path(name), {"items": items})
 
 
 def _key(s: str) -> str:
@@ -314,11 +319,11 @@ def _key(s: str) -> str:
     return " ".join(out)
 
 
-def add_items(texts: list) -> tuple:
+def add_items(texts: list, name: str = SHOPPING_LIST) -> tuple:
     """Add items. Returns (added, already_there) as lists of the spoken text.
     Raises OSError if the list cannot be saved (the caller says so)."""
     with _lock:
-        items = load_items()
+        items = load_items(name)
         have = {_key(i["text"]) for i in items}
         added, dup = [], []
         for raw in texts:
@@ -334,17 +339,17 @@ def add_items(texts: list) -> tuple:
             items.append({"text": text,
                           "added": datetime.now().isoformat(timespec="seconds")})
         if added:
-            _save(items)
+            _save(items, name)
         return added, dup
 
 
-def remove_matching(what: str) -> tuple:
+def remove_matching(what: str, name: str = SHOPPING_LIST) -> tuple:
     """Remove the item ``what`` names. Returns (removed_text | None,
     candidates): ``removed_text`` when exactly one item matched (an exact
     match wins over partial ones), else None with the ambiguous
     ``candidates`` (empty = nothing matched)."""
     with _lock:
-        items = load_items()
+        items = load_items(name)
         k = _key(what)
         if not k:
             return None, []
@@ -360,25 +365,25 @@ def remove_matching(what: str) -> tuple:
                               or _words(_key(i["text"])) <= kw)]
         if len(hit) == 1:
             items.remove(hit[0])
-            _save(items)
+            _save(items, name)
             return hit[0]["text"], []
         return None, [i["text"] for i in hit]
 
 
-def clear_all() -> int:
+def clear_all(name: str = SHOPPING_LIST) -> int:
     """Empty the list, keeping the previous contents in a .bak file beside it
     (so a mis-heard "clear" can be undone by hand). Returns how many items were
     removed."""
     import shutil
     with _lock:
-        items = load_items()
+        items = load_items(name)
         if not items:
             return 0
         try:
-            shutil.copyfile(_path(), _path() + ".bak")
+            shutil.copyfile(_path(name), _path(name) + ".bak")
         except Exception:
             pass
-        _save([])
+        _save([], name)
         return len(items)
 
 
