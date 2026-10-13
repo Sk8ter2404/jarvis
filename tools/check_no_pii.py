@@ -9,8 +9,17 @@ before the baseline commit, in CI, and inside ``tools/build_release.py``.
     python tools/check_no_pii.py            # scan git-tracked / staged files
     python tools/check_no_pii.py <dir>      # scan every text file under <dir>
     python tools/check_no_pii.py --strict   # promote WARN findings to failures
+    python tools/check_no_pii.py --metadata [RANGE]
+                                            # scan commit author/committer
+                                            # identities + messages (default
+                                            # range: upstream..HEAD)
+    python tools/check_no_pii.py --commit-msg FILE
+                                            # scan a commit message + the
+                                            # identity git would commit as
+                                            # (the commit-msg hook)
 
-Exit code 0 = clean (no HARD findings), 1 = leak(s) found.
+Exit code 0 = clean (no HARD findings), 1 = leak(s) found, 2 = could not scan
+safely.
 
 Zero external deps (stdlib only) so it runs in the App-Control-locked
 environment and on a bare CI runner. Add new patterns as the owner's personal
@@ -44,6 +53,31 @@ _SKIP_EXT = {
     ".woff", ".woff2", ".ttf", ".mp4", ".mov",
 }
 
+# Binary files cannot be read as text but can still carry personal data (a
+# desktop screenshot shows the taskbar, open apps, hostnames, the wallpaper).
+# They are no longer silently skipped: every tracked file with one of these
+# extensions must be on the reviewed allow-list below or the gate fails with a
+# "binary-review" finding, so a new image / document / archive is a deliberate,
+# looked-at addition. To add one: open it, confirm it shows nothing personal,
+# then append its repo-relative path (forward slashes) to _REVIEWED_BINARIES.
+_REVIEW_EXT = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp", ".pdf",
+    ".xlsx", ".docx", ".zip", ".gz", ".7z", ".wav", ".mp3", ".flac", ".ogg",
+    ".mp4", ".mov", ".npy", ".npz", ".pt", ".onnx", ".bin", ".stl", ".3mf",
+    ".obj",
+}
+_REVIEWED_BINARIES = frozenset({
+    "assets/jarvis_icon.png",
+    "assets/jarvis_icon.ico",
+    # HUD crops: weather/clock widgets on a blank background, no names.
+    "tools/corner.png",
+    "tools/hud_check.png",
+    "tools/hud_live.png",
+    "tools/hud_now.png",
+    "tools/hud_wide.png",
+    "tools/unified_hud_preview.png",
+})
+
 # This scanner itself names the patterns it hunts for, so exclude it (and the
 # plan/notes) from being self-flagged.
 _SELF = {
@@ -57,6 +91,132 @@ _SELF = {
 # (unless --strict). Keep HARD reserved for genuinely identifying data.
 def _rx(p: str) -> "re.Pattern[str]":
     return re.compile(p)
+
+
+class _FilteredRx:
+    """A regex plus an allow-list predicate, quacking like ``re.Pattern`` for the
+    calls the gate and core/bug_reporter make (``search`` / ``sub`` /
+    ``finditer`` / ``match``). A match the predicate allows (an obvious
+    placeholder such as an example.com address or an all-zero MAC) is treated as
+    no match at all, so the allow-list lives in readable Python instead of a
+    lookahead maze, and the runtime bug-report scrubber honours it too."""
+
+    def __init__(self, pattern: str, allow, flags: int = 0) -> None:
+        self.rx = re.compile(pattern, flags)
+        self.pattern = pattern
+        self.flags = self.rx.flags
+        self._allow = allow
+
+    def finditer(self, text, *a):
+        for m in self.rx.finditer(text, *a):
+            if not self._allow(m):
+                yield m
+
+    def search(self, text, *a):
+        return next(self.finditer(text, *a), None)
+
+    def match(self, text, *a):
+        m = self.rx.match(text, *a)
+        return None if m is None or self._allow(m) else m
+
+    def sub(self, repl, text, count: int = 0):
+        def _one(m):
+            if self._allow(m):
+                return m.group(0)
+            return repl(m) if callable(repl) else m.expand(repl)
+        return self.rx.sub(_one, text, count)
+
+
+# --- allow-lists for the privacy categories ---------------------------------
+# Obvious placeholders only. Anything that merely LOOKS like a placeholder but
+# could be a real address (a plausible corporate domain, a believable MAC) is
+# NOT allowed: rewrite the fixture to a reserved example value instead.
+_EMAIL_OK_DOMAINS = frozenset({
+    "example.com", "example.org", "example.net", "example.edu",
+    "users.noreply.github.com", "noreply.github.com", "github.com",
+    "anthropic.com", "localhost",
+})
+_EMAIL_OK_SUFFIXES = (".example", ".test", ".invalid", ".localhost", ".local",
+                      ".example.com", ".example.org", ".example.net")
+# One-letter / generic placeholder domains used by tests (a@x.com ...).
+_EMAIL_OK_LABELS = frozenset({"x", "y", "z", "a", "b", "c", "e", "t", "foo",
+                              "bar", "baz", "domain", "yourdomain", "your-domain",
+                              "company", "mydomain", "synth"})
+
+
+# Role / placeholder local parts. A no-reply or "shipment-tracking" sender at a
+# retailer, or "user@..." in an example, names no person.
+_EMAIL_OK_LOCALS = frozenset({
+    "noreply", "no-reply", "donotreply", "do-not-reply", "shipment-tracking",
+    "auto-confirm", "ship", "deals", "order-update", "orders", "info",
+    "support", "admin", "sales", "contact", "hello", "billing", "newsletter",
+    "notifications", "alerts", "user", "you", "name", "someone", "me", "email",
+    "username", "test", "foo", "bar", "alice", "bob", "carol", "yourname",
+    "your.name", "first.last", "firstname.lastname",
+})
+
+
+def _email_allowed(m) -> bool:
+    local, _, domain = m.group(0).lower().rpartition("@")
+    if local in _EMAIL_OK_LOCALS:
+        return True
+    if domain in _EMAIL_OK_DOMAINS or domain.endswith(_EMAIL_OK_SUFFIXES):
+        return True
+    labels = domain.split(".")
+    if "example" in labels:
+        return True
+    return len(labels) == 2 and labels[0] in _EMAIL_OK_LABELS
+
+
+_MAC_PLACEHOLDERS = frozenset({
+    "aa:bb:cc:dd:ee:ff", "00:11:22:33:44:55", "11:22:33:44:55:66",
+    "12:34:56:78:9a:bc", "de:ad:be:ef:00:01", "de:ad:be:ef:de:ad",
+    "00:1a:2b:3c:4d:5e",
+})
+# Last three octets that are obviously typed by hand for a fixture.
+_MAC_PLACEHOLDER_TAILS = frozenset({
+    ("aa", "bb", "cc"), ("dd", "ee", "ff"), ("11", "22", "33"),
+    ("00", "11", "22"), ("44", "55", "66"), ("3c", "4d", "5e"),
+})
+
+
+def _mac_allowed(m) -> bool:
+    octets = re.split(r"[:\-]", m.group(0).lower())
+    if len(set(octets)) == 1:                    # 00:00:.. / ff:ff:.. / aa:aa:..
+        return True
+    if octets[3:5] == ["00", "00"]:              # <OUI>:00:00:xx test convention
+        return True
+    if ":".join(octets) in _MAC_PLACEHOLDERS:
+        return True
+    if tuple(octets[3:]) in _MAC_PLACEHOLDER_TAILS:
+        return True
+    return octets[:2] in (["aa", "bb"], ["00", "11"], ["01", "23"])
+
+
+_USER_PATH_OK = frozenset({
+    "public", "default", "default user", "all users", "user", "users",
+    "username", "you", "your", "yourname", "me", "name", "someone", "example",
+    "alice", "bob", "carol", "test", "testuser", "tester", "runner",
+    "runneradmin", "ubuntu", "root", "pi", "jarvis", "foo", "bar", "x", "u",
+    "owner", "admin", "person", "someuser", "some_user", "dev", "developer", "home", "..", ".",
+    "your-name", "your_name", "user_name", "yourusername",
+})
+
+
+def _user_path_allowed(m) -> bool:
+    name = m.group(1).strip().lower()
+    # A one-letter name or a run of dots ("C:\Users\...") is a placeholder.
+    return name in _USER_PATH_OK or len(name) <= 1 or not name.strip(".")
+
+
+def _phone_allowed(m) -> bool:
+    digits = re.sub(r"\D", "", m.group(0))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    # 555 exchange = reserved fictional block; 000/123/555 area codes and the
+    # 123-456-7890 run are the usual placeholders.
+    return (digits[3:6] == "555" or digits[:3] in ("000", "123", "555")
+            or digits in ("1234567890", "0123456789"))
 
 
 HARD = [
@@ -96,6 +256,31 @@ HARD = [
                                r"T[A-Z0-9]{6,}/B[A-Z0-9]{6,}/[A-Za-z0-9]{20,}")),
     ("jwt",                _rx(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
                                r"\.[A-Za-z0-9_\-]{10,}\b")),
+    # --- Personal-data categories (2026-10-12 privacy audit). The shipped gate
+    # used to know generic KEY shapes only; an e-mail address, phone number,
+    # MAC, overlay-network address or profile path was caught solely by the
+    # gitignored pii_local.py, i.e. never in GitHub CI or on a contributor's
+    # clone. These are format rules with obvious-placeholder allow-lists
+    # (example.com, all-zero MACs, 555 numbers, a "<user>" path ...).
+    ("email-address",      _FilteredRx(
+        r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}\b",
+        _email_allowed)),
+    ("phone-number",       _FilteredRx(
+        r"(?<![\w.\-/])(?:\+?1[ .\-]?)?(?:\(\d{3}\)[ .\-]?|\d{3}[ .\-])"
+        r"\d{3}[ .\-]\d{4}(?![\w\-])", _phone_allowed)),
+    ("mac-address",        _FilteredRx(
+        r"(?<![0-9A-Fa-f:\-])[0-9A-Fa-f]{2}([:\-])(?:[0-9A-Fa-f]{2}\1){4}"
+        r"[0-9A-Fa-f]{2}(?![0-9A-Fa-f:\-])", _mac_allowed)),
+    # Tailscale / CGNAT range 100.64.0.0/10 and MagicDNS names.
+    ("tailscale-address",  _rx(r"(?<![\d.])100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])"
+                              r"\.\d{1,3}\.\d{1,3}(?![\d.]*\d)")),
+    ("tailscale-host",     _rx(r"(?i)\b[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.ts\.net\b")),
+    # A real person's profile folder: C:\Users\<name>, /Users/<name>,
+    # /home/<name>. Reserved/placeholder names pass (Public, runner, ...).
+    ("user-profile-path",  _FilteredRx(
+        r"(?i)(?:\b[A-Za-z]:[\\/]+Users|(?<![\w.~])/(?:Users|home))[\\/]+"
+        r"([A-Za-z0-9_.\-]{1,40})(?![A-Za-z0-9_.\-])",
+        _user_path_allowed)),
 ]
 
 WARN = [
@@ -174,7 +359,7 @@ def _load_local_patterns() -> None:
             # than "no file present": the owner-PII patterns did NOT load, so the
             # scanner has silently degraded to generic key formats exactly when
             # it is meant to catch owner literals — and this repo syncs through
-            # Nextcloud, so a leaked commit is effectively irreversible. The gate
+            # a synced folder, so a leaked commit is effectively irreversible. The gate
             # must still refuse. But this module is ALSO imported by
             # core/bug_reporter (to scrub by the same rules), and a bare
             # sys.exit(2) at module scope would terminate the interpreter of
@@ -227,10 +412,120 @@ def _walk_text_files(root: str) -> list[str]:
                        if d not in {".git", "__pycache__", "backups", "_backups",
                                     "node_modules", "data_staging", "logs_staging"}]
         for fn in filenames:
-            if os.path.splitext(fn)[1].lower() in _SKIP_EXT:
+            ext = os.path.splitext(fn)[1].lower()
+            # Binaries are not read as text, but they ARE listed so the
+            # binary-review rule (_binary_review_hits) can see them.
+            if ext in _SKIP_EXT and ext not in _REVIEW_EXT:
                 continue
             found.append(os.path.join(dirpath, fn))
     return found
+
+
+def _binary_review_hits(files: list[str], root: str) -> list[tuple]:
+    """(rel, 0, "binary-review", "") for every file whose extension is a
+    review-worthy binary and whose path relative to ``root`` is not on the
+    reviewed allow-list."""
+    hits: list[tuple] = []
+    for path in files:
+        if os.path.splitext(path)[1].lower() not in _REVIEW_EXT:
+            continue
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        if rel not in _REVIEWED_BINARIES:
+            hits.append((rel, 0, "binary-review", ""))
+    return hits
+
+
+# --- commit metadata (author / committer identity + message) -----------------
+_ZERO_SHA = "0" * 40
+
+
+def _git_out(args: list[str]) -> str | None:
+    try:
+        out = subprocess.run(["git"] + args, cwd=_PROJECT_ROOT,
+                             capture_output=True, text=True, timeout=60,
+                             encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _scan_blob(text: str, rules: list) -> list[tuple]:
+    """[(label, line_no)] for every rule hit in free text (no snippets)."""
+    hits: list[tuple] = []
+    for i, line in enumerate(text.splitlines(), 1):
+        for label, rx in rules:
+            if rx.search(line):
+                hits.append((label, i))
+    return hits
+
+
+def _default_rev_args() -> list[str]:
+    """Commits not yet on the upstream / origin/main; else just HEAD."""
+    for base in ("@{upstream}", "origin/main"):
+        if _git_out(["rev-parse", "--verify", "-q", base]) is not None:
+            return [f"{base}..HEAD"]
+    return ["-n", "1", "HEAD"]
+
+
+def _commit_metadata_hits(rev_args: list[str]) -> list[tuple] | None:
+    """Scan author / committer identity lines and the message body of the
+    commits named by ``rev_args`` with every HARD rule. Returns
+    [(short_sha, field, label, line_no)], or None if git could not be asked."""
+    fmt = "--format=%H%x1f%an <%ae>%x1f%cn <%ce>%x1f%B%x1e"
+    out = _git_out(["log", fmt] + rev_args)
+    if out is None:
+        return None
+    sep_f, sep_r = chr(0x1f), chr(0x1e)     # what git printed for %x1f / %x1e
+    hits: list[tuple] = []
+    for rec in out.split(sep_r):
+        rec = rec.strip("\n")
+        if not rec:
+            continue
+        parts = rec.split(sep_f, 3)
+        if len(parts) < 4:
+            continue
+        sha, author, committer, body = parts
+        for field, text in (("author", author), ("committer", committer),
+                            ("message", body)):
+            for label, ln in _scan_blob(text, HARD):
+                hits.append((sha[:7], field, label, ln))
+    return hits
+
+
+def _pre_push_rev_args(stdin_text: str) -> list[list[str]]:
+    """One rev-arg list per pushed ref from a pre-push hook's stdin lines
+    (``<local ref> <local sha> <remote ref> <remote sha>``). A new remote ref
+    scans only the commits no remote-tracking ref already has."""
+    revs: list[list[str]] = []
+    for line in stdin_text.splitlines():
+        f = line.split()
+        if len(f) < 4 or f[1] == _ZERO_SHA:     # delete push: nothing to scan
+            continue
+        local, remote = f[1], f[3]
+        if remote == _ZERO_SHA:
+            revs.append([local, "--not", "--remotes"])
+        else:
+            revs.append([f"{remote}..{local}"])
+    return revs
+
+
+def _commit_msg_hits(msg_path: str) -> list[tuple] | None:
+    """Scan the message in ``msg_path`` (comment lines dropped) and the
+    author / committer identity git is about to record."""
+    try:
+        with open(msg_path, encoding="utf-8", errors="replace") as fh:
+            msg = chr(10).join(l for l in fh.read().splitlines()
+                               if not l.startswith("#"))
+    except OSError:
+        return None
+    hits = [("message", label, ln) for label, ln in _scan_blob(msg, HARD)]
+    for field, var in (("author", "GIT_AUTHOR_IDENT"),
+                       ("committer", "GIT_COMMITTER_IDENT")):
+        ident = _git_out(["var", var])
+        if ident is None:
+            continue
+        hits += [(field, label, ln) for label, ln in _scan_blob(ident, HARD)]
+    return hits
 
 
 def _redact(s: str) -> str:
@@ -284,6 +579,54 @@ def main(argv: list[str]) -> int:
         sys.stderr.write(f"[check_no_pii] refusing to scan: {_LOAD_ERROR}\n")
         return 2
 
+    if "--commit-msg" in argv:
+        i = argv.index("--commit-msg")
+        if i + 1 >= len(argv):
+            sys.stderr.write("[check_no_pii] --commit-msg needs a file path\n")
+            return 2
+        mh = _commit_msg_hits(argv[i + 1])
+        if mh is None:
+            sys.stderr.write("[check_no_pii] could not read the commit message\n")
+            return 2
+        for field, label, ln in mh:
+            print(f"    ! commit {field}:{ln}  [{label}]")
+        if mh:
+            print(f"\n[check_no_pii] FAIL - {len(mh)} hard finding(s) in the commit "
+                  "identity/message. Use a noreply identity "
+                  "(git config user.email <id>+<user>@users.noreply.github.com).")
+            return 1
+        print("[check_no_pii] OK - commit identity and message are clean.")
+        return 0
+
+    if "--pre-push" in argv or "--metadata" in argv:
+        if "--pre-push" in argv:
+            ranges = _pre_push_rev_args(sys.stdin.read())
+            if not ranges:
+                print("[check_no_pii] nothing to push-scan.")
+                return 0
+        else:
+            i = argv.index("--metadata")
+            tail = [a for a in argv[i + 1:] if a != "--strict"]
+            ranges = [tail or _default_rev_args()]
+        total = 0
+        for rev_args in ranges:
+            mh = _commit_metadata_hits(rev_args)
+            if mh is None:
+                sys.stderr.write("[check_no_pii] could not read git history for "
+                                 f"{' '.join(rev_args)}\n")
+                return 2
+            for sha, field, label, ln in mh:
+                print(f"    ! commit {sha} {field}:{ln}  [{label}]")
+            total += len(mh)
+        if total:
+            print(f"\n[check_no_pii] FAIL - {total} hard finding(s) in commit "
+                  "metadata. This tool never rewrites history: fix the "
+                  "identity (noreply address) and re-create the commit(s) "
+                  "before pushing.")
+            return 1
+        print("[check_no_pii] OK - commit authors, committers and messages are clean.")
+        return 0
+
     strict = "--strict" in argv
     positional = [a for a in argv if not a.startswith("-")]
 
@@ -303,6 +646,11 @@ def main(argv: list[str]) -> int:
 
     hard_hits: list[tuple] = []
     warn_hits: list[tuple] = []
+    # Unreviewed binaries: a gate failure for the files git would commit, an
+    # advisory in a directory (release-output) scan whose layout may differ.
+    bin_root = os.path.abspath(positional[0]) if positional else _PROJECT_ROOT
+    for rel, ln, label, snip in _binary_review_hits(files, bin_root):
+        (warn_hits if positional else hard_hits).append((rel, ln, label, snip))
     for path in files:
         rel = os.path.relpath(path, _PROJECT_ROOT)
         for label, ln, snip in _scan_file(path, HARD):

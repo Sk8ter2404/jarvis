@@ -20,7 +20,7 @@ and everything downstream failed while naming the wrong culprit:
       goes dark, every OTHER camera keeps publishing.
     STEP 5: guarded release of a healthy handle -> released=False
 
-Read those together: the healthy eMeet C960 was benched for a wedge it never
+Read those together: the healthy Example Webcam C960 was benched for a wedge it never
 had — its opener body executed ZERO times, so it never reached DirectShow at
 all — and the log line announcing it claimed "every OTHER camera keeps
 publishing" while no camera was publishing. One sick camera still took every

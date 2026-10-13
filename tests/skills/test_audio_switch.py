@@ -5,7 +5,7 @@ device function is mocked, so this runs on the CI light tier too.
 
 THE BUG THESE TESTS EXIST FOR (measured 2026-09-04 on this machine)
 ==================================================================
-With the CORSAIR VOID ELITE Wireless headset POWERED OFF, Windows reported
+With the ExampleBrand Wireless headset POWERED OFF, Windows reported
 BOTH of its endpoints as Status=OK / Active, because the endpoint belongs to
 the DONGLE and the dongle stays plugged in. find_active() therefore answered
 "headset on" forever and the auto-switch could never fire. The rows in
@@ -18,10 +18,10 @@ while the headset pairs (20:19:41 -> 20:21:26). At the default 3 s poll that is
 ~35 unknown samples in a row, every time the owner powers the headset on, so
 `test_hundred_unknowns_hold_state_and_never_switch` replays it.
 
-Third: the saved fallback really was "Blue Snowball" — a MICROPHONE — which
+Third: the saved fallback really was "Example Desk Mic" — a MICROPHONE — which
 `find_active(render_only=True)` can never match, so the switch-away was a
-silent no-op. Verified live 2026-09-04: find_active("Blue Snowball") -> None,
-find_active("Blue Snowball", render_only=False) -> "Microphone (Blue Snowball )".
+silent no-op. Verified live 2026-09-04: find_active("Example Desk Mic") -> None,
+find_active("Example Desk Mic", render_only=False) -> "Microphone (Example Desk Mic )".
 """
 import sys
 import types
@@ -526,7 +526,7 @@ class SkillWiringTests(unittest.TestCase):
 # The owner powered the headset off. The OUTPUT switched correctly:
 #     [audio] speakers -> [8] Speakers (Realtek USB2.0 Audio)
 # The INPUT did not move at all:
-#     [audio] mic      -> [1] Headset Microphone (CORSAIR VOID ELITE ...)
+#     [audio] mic      -> [1] Headset Microphone (ExampleBrand ELITE ...)
 #     [vad] timeout - silent peak RMS=0.0000 (threshold 0.008)   x2, 30 s apart
 # EXACTLY zero twice. Nothing in the repo had ever written the default CAPTURE
 # endpoint, so Windows went on pointing the microphone at a headset that was
@@ -831,7 +831,7 @@ class MicFollowTransitionTests(unittest.TestCase):
              mock.patch.object(A, "default_render_id", return_value=CORSAIR_EAR), \
              mock.patch.object(A, "default_capture", return_value=_cur(SNOWBALL)), \
              mock.patch.object(A, "set_default_capture") as setc:
-            sw.tick(was_on=True)          # on -> on, mic manually on the Snowball
+            sw.tick(was_on=True)          # on -> on, mic manually on the desk mic
         setc.assert_not_called()
 
     def test_follow_mic_off_never_touches_the_input_at_all(self):
@@ -984,7 +984,7 @@ class MicDeafSafetyTests(unittest.TestCase):
 
         AUDIO_AUTOSWITCH_MIC_FALLBACK is a fragment the owner types by hand,
         directly under a setting whose value is the headset's own name, so
-        "CORSAIR VOID ELITE" landing in it is the obvious slip. With the
+        "ExampleBrand ELITE" landing in it is the obvious slip. With the
         headset POWERED OFF its microphone endpoint is still ACTIVE (the
         measured 2026-09-04 fact this whole module is built around), so the
         fragment RESOLVES - to the very device we are running away from.
@@ -1087,7 +1087,7 @@ class MicDeafSafetyTests(unittest.TestCase):
         refused every fallback would also 'never make him deaf' and would be
         useless - this is the test that stops the fix from being that."""
         spoken = []
-        sw = _mic_sw(announce=spoken.append)          # fallback = "Blue Snowball"
+        sw = _mic_sw(announce=spoken.append)          # fallback = "Example Desk Mic"
         with mock.patch.object(A, "headset_powered", return_value=False),              mock.patch.object(A, "list_render", return_value=ROWS_LIVE),              mock.patch.object(A, "default_capture", return_value=_cur(CORSAIR_MIC)),              mock.patch.object(A, "set_default_render", return_value=True),              mock.patch.object(A, "set_default_capture", return_value=True) as setc,              mock.patch.object(A, "_log") as log:
             sw.tick(was_on=True)
         setc.assert_called_once_with(SNOWBALL)
@@ -1500,9 +1500,9 @@ class MicSpokenClaimTests(unittest.TestCase):
     with PREFERRED_INPUT_DEVICES set, bobert_companion's capture loop takes the
     first connected preferred device and NEVER evaluates the branch that
     resolves the live default endpoint. set_default_capture() moved the Windows
-    default, JARVIS kept recording through the Blue Snowball, and
+    default, JARVIS kept recording through the Example Desk Mic, and
     _mic_to_headset announced "headset on - listening on Headset Microphone
-    (CORSAIR VOID ELITE ...)". He puts the headset on, is told the boom mic is
+    (ExampleBrand ELITE ...)". He puts the headset on, is told the boom mic is
     live, and is heard through a desk mic across the room.
 
     Note what is NOT asserted anywhere below: that any microphone produces
@@ -1671,7 +1671,7 @@ class CaptureReadBackTests(unittest.TestCase):
     without moving the endpoint, the headset powers off, the desk mic is
     resolved and verified Active, the write "succeeds", `_prior_capture` is
     cleared and JARVIS SAYS "headset off - listening on Microphone (Blue
-    Snowball )" — while the default recording endpoint is still the dead
+    desk mic )" — while the default recording endpoint is still the dead
     CORSAIR mic and the VAD reads 0.0000. Every rule survives that intact.
 
     `default_capture_id()` already existed and cost a measured 7.8 / 8.2 /
@@ -1802,7 +1802,7 @@ class UnprovenCaptureIsNeverAnnouncedTests(unittest.TestCase):
         Headset off, the default IS its microphone, a remembered desk mic
         resolves and re-verifies Active - and the write is accepted without
         moving anything. Before the read-back this announced "headset off -
-        listening on Microphone (2- HD Webcam eMeet C960)" and cleared the
+        listening on Microphone (2- HD Webcam Example Webcam C960)" and cleared the
         memory, while the peak RMS stayed at 0.0000."""
         said = []
         sw = self._mic_only_sw(said)
@@ -2014,14 +2014,14 @@ class MicRescueCostTests(unittest.TestCase):
         """THE ONE THAT MATTERS. The hold is a TIMER, not a latch.
 
         He is deaf on the powered-off headset with nothing to move to, so the
-        rescue holds. Then he plugs the Blue Snowball back in. Nothing CHEAP
+        rescue holds. Then he plugs the Example Desk Mic back in. Nothing CHEAP
         changed - same default capture id, same fallback fragment, same
         remembered mic - so the only thing that can notice is the hold
         expiring. If it ever became permanent this is the test that fails, and
         he would stay deaf until he restarted JARVIS."""
         sw = _mic_sw(mic_fallback="Blue Snowball")
         t = self._pinned(sw)
-        rows = {"now": self.ROWS_NO_OTHER_MIC}   # the Snowball is unplugged
+        rows = {"now": self.ROWS_NO_OTHER_MIC}   # the desk mic is unplugged
         with mock.patch.object(A, "headset_powered", return_value=False), \
              mock.patch.object(A, "default_capture", return_value=_cur(CORSAIR_MIC)), \
              mock.patch.object(A, "list_render", side_effect=lambda: rows["now"]), \
@@ -2032,7 +2032,7 @@ class MicRescueCostTests(unittest.TestCase):
                 sw.tick()
                 t[0] += 3.0
             setc.assert_not_called()
-            rows["now"] = ROWS_LIVE            # the Snowball is plugged back in
+            rows["now"] = ROWS_LIVE            # the desk mic is plugged back in
             fired_after = None
             for i in range(1, 41):             # give it 2 minutes to notice
                 sw.tick()
@@ -2197,8 +2197,8 @@ class MicVoiceActionClaimTests(unittest.TestCase):
     actions were not - and they answer a DIRECT ORDER, which is the worst place
     to say something unverified. With the owner's live PREFERRED_INPUT_DEVICES
     he says "use my headset mic", hears "Listening on Headset Microphone
-    (CORSAIR VOID ELITE ...) now, sir", talks into the boom mic, and is
-    recorded through the Snowball on the desk. Every assertion below fails on
+    (ExampleBrand ELITE ...) now, sir", talks into the boom mic, and is
+    recorded through the desk mic on the desk. Every assertion below fails on
     the pre-fix sentence.
 
     Nothing here asserts that any microphone PRODUCES AUDIO. These pin WHICH
@@ -2342,21 +2342,21 @@ class LastResortMicTests(unittest.TestCase):
     """DEAF-SAFETY RULE 8: never park him on a microphone measured DEAD.
 
     THE DEFECT THESE WERE WRITTEN FOR, reproduced with mocks 2026-09-05 before
-    the fix. follow_mic on, AUDIO_AUTOSWITCH_MIC_FALLBACK "Blue Snowball". The
+    the fix. follow_mic on, AUDIO_AUTOSWITCH_MIC_FALLBACK "Example Desk Mic". The
     headset was ON, so the watcher had moved the default capture to its
-    microphone and remembered the Snowball. The Snowball was then unplugged
+    microphone and remembered the desk mic. The desk mic was then unplugged
     (his USB tree is documented as marginal) and the headset powered off:
 
         the microphone I remembered (...snowball) is no longer an active
-          recording device - falling back to 'Blue Snowball'
-        MIC FALLBACK UNUSABLE: 'Blue Snowball' matches NO audio device ...
+          recording device - falling back to 'Example Desk Mic'
+        MIC FALLBACK UNUSABLE: 'Example Desk Mic' matches NO audio device ...
         DEAF RISK: ... there is nothing VERIFIED to move to and I am leaving it.
         set_default_capture calls: []
 
     Nothing moved. The default recording device stayed the CORSAIR headset
     microphone with the headset powered off - the device that read peak RMS
     exactly 0.0000 twice, thirty seconds apart, at 00:50:40 - while the SAME
-    enumeration held "Microphone (2- HD Webcam eMeet C960)" (his own #2
+    enumeration held "Microphone (2- HD Webcam Example Webcam C960)" (his own #2
     PREFERRED_INPUT_DEVICES entry) and "Headset Microphone (DualSense Wireless
     Controller)", both Active. The code called that outcome the safe direction
     and logged that it was "leaving him on what is working". It had already
@@ -2377,7 +2377,7 @@ class LastResortMicTests(unittest.TestCase):
     def test_the_reported_outage_now_moves_off_the_dead_headset(self):
         """The exact scenario above: remembered mic gone, fallback unresolvable."""
         spoken = []
-        sw = _mic_sw(announce=spoken.append)          # fallback = "Blue Snowball"
+        sw = _mic_sw(announce=spoken.append)          # fallback = "Example Desk Mic"
         sw._prior_capture = SNOWBALL                  # remembered while ON
         rows = self._rows_without(SNOWBALL)           # ... then unplugged
         with mock.patch.object(A, "headset_powered", return_value=False), \
@@ -2449,7 +2449,7 @@ class LastResortMicTests(unittest.TestCase):
 
     # ── the ordering, and what it is worth ──────────────────────────────────
     def test_a_mains_powered_mic_outranks_a_battery_one_and_a_virtual_one(self):
-        """MEASURED ordering on this machine's own rows. The eMeet is a USB
+        """MEASURED ordering on this machine's own rows. The ExampleCam is a USB
         webcam mic - it cannot be flat - so it goes first; the DualSense
         carries a battery and can be asleep in exactly the way the CORSAIR
         was; Voicemod is a route rather than a microphone and produces nothing
@@ -2508,7 +2508,7 @@ class LastResortMicTests(unittest.TestCase):
         """And so does the name he typed. A guess must never quietly replace a
         choice - that would be a different bug wearing this fix's clothes."""
         spoken = []
-        sw = _mic_sw(announce=spoken.append)          # fallback = "Blue Snowball"
+        sw = _mic_sw(announce=spoken.append)          # fallback = "Example Desk Mic"
         with mock.patch.object(A, "headset_powered", return_value=False), \
              mock.patch.object(A, "list_render", return_value=ROWS_LIVE), \
              mock.patch.object(A, "default_capture", return_value=_cur(CORSAIR_MIC)), \
@@ -2794,8 +2794,8 @@ class MicDeafRiskIsSPOKENTests(unittest.TestCase):
 
     def test_it_does_NOT_claim_deafness_when_something_overrides_the_default(self):
         """The whole point of capture_override(). Measured in the owner's LIVE
-        settings 2026-09-05, PREFERRED_INPUT_DEVICES = ['Blue Snowball',
-        'eMeet C960', 'CORSAIR VOID'] and _refresh_devices consults that list
+        settings 2026-09-05, PREFERRED_INPUT_DEVICES = ['Example Desk Mic',
+        'Example Webcam C960', 'ExampleBrand VOID'] and _refresh_devices consults that list
         BEFORE the Windows default - so "the default is the dead headset" does
         NOT imply JARVIS is deaf, and saying it did would be a fourth
         unverified claim rather than a fix for the first three."""

@@ -1020,7 +1020,7 @@ class MeetingPhraseTests(unittest.TestCase):
         # Organizer first token contains '@' → rejected as who_label; with an
         # empty subject the result is the generic "a meeting".
         ms = self._ms({"start": datetime.datetime(2026, 6, 1, 9, 0),
-                       "subject": "", "organizer": "sam@example.io"})
+                       "subject": "", "organizer": "sam@example.com"})
         with mock.patch.object(self.mod, "_import_skill", return_value=ms):
             self.assertEqual(self.mod._section_first_meeting_phrase(),
                              "a meeting at 9")

@@ -23,6 +23,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the commit-metadata gate below needs the pushed range
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -54,6 +56,25 @@ jobs:
 
       - name: PII / secret leak gate
         run: python tools/check_no_pii.py
+
+      # Commit AUTHOR / COMMITTER identity and message bodies are scanned with
+      # the same HARD rules (a personal e-mail in an author field reached the
+      # public history once). Only the commits this push / PR adds are scanned;
+      # history is never rewritten by this tool.
+      - name: Commit identity / message gate
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            python tools/check_no_pii.py --metadata "origin/${BASE_REF}..HEAD^2"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            python tools/check_no_pii.py --metadata "${BEFORE}..${AFTER}"
+          else
+            echo "new branch or manual run: nothing to range-scan"
+          fi
 
       - name: Unit suite
         run: python tools/run_tests.py

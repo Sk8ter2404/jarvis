@@ -1277,7 +1277,7 @@ PC_CONTROL_PROMPT = (
     "    'turn off audio auto switching'              → [ACTION: audio_autoswitch_off]\n"
     "    'turn on audio auto switching'               → [ACTION: audio_autoswitch_on]\n"
     "\n"
-    "  HEADSET POWER + BATTERY — is the CORSAIR VOID ELITE actually switched\n"
+    "  HEADSET POWER + BATTERY — is the USB wireless headset actually switched\n"
     "  on, and how much charge is left. Read from the dongle's Corsair HID\n"
     "  link, which is the only sensor that can tell:\n"
     "    headset_status / is_headset_on / headset_on / is_my_headset_on\n"

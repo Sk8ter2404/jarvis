@@ -106,8 +106,8 @@ def _stub_cv2(cascade_empty=False):
 
 
 # The owner's real configuration, which is what produced the failure:
-#   CAMERAS index 2 = eMeet C960  (left),  index 0 = USB 2.0 Camera (right)
-#   Media Foundation order        0=Kinect  1=USB 2.0 Camera  2=eMeet C960
+#   CAMERAS index 2 = Example Webcam C960  (left),  index 0 = USB 2.0 Camera (right)
+#   Media Foundation order        0=Kinect  1=USB 2.0 Camera  2=Example Webcam C960
 _CAMERAS = [
     {"index": 2, "label": "Left webcam (left monitor)",
      "name": "emeet c960", "primary": True},
@@ -328,7 +328,7 @@ class ProducerOwnershipTests(unittest.TestCase):
     def test_the_reported_index_is_in_the_backend_space_it_names(self):
         """``index`` and ``backend`` have to agree, or a record read months
         later names the wrong physical camera. The owner's right webcam is
-        CAMERAS/DirectShow 0 and Media Foundation 1 — pick the eMeet and the
+        CAMERAS/DirectShow 0 and Media Foundation 1 — pick the ExampleCam and the
         two numbers coincide, which is precisely why this asserts on the one
         camera where they do NOT."""
         right = [dict(_CAMERAS[1])]
@@ -344,7 +344,7 @@ class ProducerOwnershipTests(unittest.TestCase):
     def test_a_camera_the_producer_does_not_own_is_still_opened(self):
         """The fix is a fence around the producer's devices, not a blanket
         refusal. With only the right webcam configured, MSMF index 2 (the
-        eMeet) belongs to nobody and must still be probed for real."""
+        ExampleCam) belongs to nobody and must still be probed for real."""
         one = [dict(_CAMERAS[1])]
         self._install(_FakeBC(held=(0,), frame_ages={0: 300.0}, cameras=one))
         res, opened = self._run_probe()

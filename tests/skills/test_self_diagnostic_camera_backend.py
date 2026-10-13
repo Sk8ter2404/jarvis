@@ -10,8 +10,8 @@ _probe_webcam_locked() found a camera with a BACKEND-LESS ``cv2.VideoCapture(idx
 then handed the winning integer to _attempt_camera_wake(), which opened it with
 ``cv2.CAP_DSHOW``. The two backends do not enumerate the same device list:
 
-    Media Foundation  0=Kinect V2 Video Sensor  1=USB 2.0 Camera  2=eMeet C960
-    DirectShow        0=USB 2.0 Camera  1=Kinect V2 Video Sensor  2=eMeet C960
+    Media Foundation  0=Kinect V2 Video Sensor  1=USB 2.0 Camera  2=Example Webcam C960
+    DirectShow        0=USB 2.0 Camera  1=Kinect V2 Video Sensor  2=Example Webcam C960
                       3=OBS Virtual Camera
 
 So "index 0" meant the Kinect to the scan and the USB webcam to the wake. The

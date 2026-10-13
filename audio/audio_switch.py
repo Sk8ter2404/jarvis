@@ -51,11 +51,11 @@ HOW THE POWER STATE IS DETECTED  (corrected 2026-09-04)
 ======================================================
 This module used to assume that Windows flips the headset's audio ENDPOINT
 between ``Active`` (on) and ``NotPresent``/``Unplugged`` (off). MEASURED
-2026-09-04 on this machine, that assumption is FALSE for the CORSAIR VOID
+2026-09-04 on this machine, that assumption is FALSE for the ExampleBrand VOID
 ELITE Wireless: with the headset POWERED OFF, Windows still reported
 
-    OK / Active   Headset Earphone   (CORSAIR VOID ELITE Wireless Gaming Headset)
-    OK / Active   Headset Microphone (CORSAIR VOID ELITE Wireless Gaming Headset)
+    OK / Active   Headset Earphone   (ExampleBrand Wireless Gaming Headset)
+    OK / Active   Headset Microphone (ExampleBrand Wireless Gaming Headset)
 
 because what Windows sees is the DONGLE, and the dongle is plugged in whether
 or not the headset is powered. The endpoint state therefore carries NO
@@ -89,12 +89,12 @@ Standalone:
     python -m audio.audio_switch --list-mics  # RECORDING devices + states
     python -m audio.audio_switch --state      # what the detector actually says
     python -m audio.audio_switch --test       # switch to headset + restore (proves it)
-    python -m audio.audio_switch --test-mic "Blue Snowball"
+    python -m audio.audio_switch --test-mic "Example Desk Mic"
                                               # switch the default MIC + restore.
                                               # The only thing here that proves a
                                               # capture default really MOVES; run
                                               # it deliberately, on a desk mic.
-    python -m audio.audio_switch --daemon [--follow-mic --mic-fallback "Blue Snowball"]
+    python -m audio.audio_switch --daemon [--follow-mic --mic-fallback "Example Desk Mic"]
 """
 from __future__ import annotations
 
@@ -173,7 +173,7 @@ def _log(msg: str) -> None:
 
 # MMDevice id prefixes. These are the ONLY structural difference between a
 # playback and a recording endpoint id, and every direction decision in this
-# module is made on them rather than on a device NAME — the CORSAIR's earphone
+# module is made on them rather than on a device NAME — the headset's earphone
 # and its microphone share one friendly name, so a name can never tell them
 # apart. Measured on this machine 2026-09-05: render default
 # "{0.0.0.00000000}.{b068b686-...}", capture default "{0.0.1.00000000}.{da8ac56b-...}".
@@ -191,7 +191,7 @@ def set_default_endpoint(device_id: str) -> bool:
 
     WHAT WAS ACTUALLY MEASURED, and what was not — 2026-09-05 00:5x, live:
       PROVEN: called with the CAPTURE id that was ALREADY the default for all
-        three capture roles ({0.0.1.00000000}.{da8ac56b-...} — the CORSAIR
+        three capture roles ({0.0.1.00000000}.{da8ac56b-...} — the headset
         headset microphone), it returned S_OK and afterwards all three capture
         roles and the render default read exactly as before. Writing a value
         that equals the value already there cannot move a device, so this is a
@@ -200,7 +200,7 @@ def set_default_endpoint(device_id: str) -> bool:
       NOT PROVEN: that a capture default actually MOVES to a DIFFERENT device.
         That needs a real switch on a live box, and the owner was mid-session
         with JARVIS listening, so it was deliberately not done. Prove it with
-        `python -m audio.audio_switch --test-mic "Blue Snowball"` (switches,
+        `python -m audio.audio_switch --test-mic "Example Desk Mic"` (switches,
         reads back, restores, and prints every step) before trusting the
         microphone follow. Until then treat the input half as UNVERIFIED —
         `AudioAutoSwitch` is written so that an unproven or failing capture
@@ -435,10 +435,10 @@ def find_active(fragment: str, render_only: bool = True,
         Active means the ENDPOINT is present and enabled. For a USB-dongle
         wireless headset the endpoint belongs to the DONGLE, so it stays
         Active while the headset itself is powered off. Measured 2026-09-04 on
-        this machine with the CORSAIR VOID ELITE Wireless POWERED OFF, Windows
+        this machine with the ExampleBrand Wireless POWERED OFF, Windows
         reported both of its endpoints as Status=OK / Active:
-            OK  Headset Earphone   (CORSAIR VOID ELITE Wireless Gaming Headset)
-            OK  Headset Microphone (CORSAIR VOID ELITE Wireless Gaming Headset)
+            OK  Headset Earphone   (ExampleBrand Wireless Gaming Headset)
+            OK  Headset Microphone (ExampleBrand Wireless Gaming Headset)
 
     So this function answers "is there a usable endpoint with this name?" and
     NOT "is the headset switched on?". For the power question call
@@ -477,8 +477,8 @@ def find_active_capture(fragment: str,
     whichever endpoint comes first in the enumeration, and for a headset that
     is the earphone. MEASURED live 2026-09-05 on this machine:
 
-        find_active("CORSAIR VOID ELITE", render_only=False)
-          -> ("{0.0.0.…30c225e7}", "Headset Earphone (CORSAIR VOID ELITE …)")
+        find_active("ExampleBrand ELITE", render_only=False)
+          -> ("{0.0.0.…30c225e7}", "Headset Earphone (ExampleBrand ELITE …)")
 
     i.e. a PLAYBACK id handed back from what a reader would assume is the
     microphone lookup. Shipping that as "the mic resolver" would be the exact
@@ -528,7 +528,7 @@ def looks_like_corsair_void(fragment: str) -> bool:
     """True when this configured NAME FRAGMENT names a Corsair VOID headset.
 
     Matched on the fragment the owner configured, not against a hardcoded
-    device string, so "CORSAIR VOID ELITE", "void elite", "Corsair VOID RGB"
+    device string, so "Corsair VOID ELITE", "void elite", "Corsair VOID RGB"
     and a bare "VOID" all route to the HID detector. Word-boundary, so
     "avoid" and "Devoid" do not.
 
@@ -650,12 +650,12 @@ def fallback_problem(fragment: str,
     """Why `fragment` cannot serve as the fallback PLAYBACK device, or None.
 
     Written because the saved setting really was
-    ``"AUDIO_AUTOSWITCH_FALLBACK": "Blue Snowball"`` — a MICROPHONE. Resolved
+    ``"AUDIO_AUTOSWITCH_FALLBACK": "Example Desk Mic"`` — a MICROPHONE. Resolved
     through `find_active(..., render_only=True)` a mic can never match, so the
     switch-away silently did nothing, forever, with no message anywhere.
-    Verified live 2026-09-04: find_active("Blue Snowball") -> None while
-    find_active("Blue Snowball", render_only=False) -> the capture endpoint
-    "Microphone (Blue Snowball )"."""
+    Verified live 2026-09-04: find_active("Example Desk Mic") -> None while
+    find_active("Example Desk Mic", render_only=False) -> the capture endpoint
+    "Microphone (Example Desk Mic )"."""
     if not fragment:
         return None                        # nothing configured is not a fault
     rows = list_render() if rows is None else rows
@@ -773,15 +773,15 @@ def resolve_mic_fallback(fragment: str,
 # ── does JARVIS'S OWN capture actually follow the Windows default? ───────────
 # THE BUG THIS EXISTS TO KILL (measured 2026-09-05, live config):
 #   data/user_settings.json carries PREFERRED_INPUT_DEVICES =
-#   ['Blue Snowball', 'eMeet C960', 'CORSAIR VOID']. bobert_companion's capture
+#   ['Example Desk Mic', 'Example Webcam C960', 'ExampleBrand VOID']. bobert_companion's capture
 #   loop asks _pick_device(PREFERRED_INPUT_DEVICES, want_input=True) FIRST and
 #   only falls through to the Windows default when that returns None. The
-#   Snowball is connected and openable, so it wins on every single pass and
+#   desk mic is connected and openable, so it wins on every single pass and
 #   `in_idx` is never None - which means the one branch that resolves the live
 #   default endpoint (_endpoint_device_identity(..., want_input=True)) NEVER
 #   RUNS. set_default_capture() below therefore moves the WINDOWS default while
-#   JARVIS goes on recording through the Snowball, and _mic_to_headset used to
-#   say "listening on Headset Microphone (CORSAIR VOID ...)" anyway. The owner
+#   JARVIS goes on recording through the desk mic, and _mic_to_headset used to
+#   say "listening on Headset Microphone (ExampleBrand VOID ...)" anyway. The owner
 #   puts the headset on, is told the boom mic is live, talks into it, and is
 #   heard through a desk mic across the room.
 #
@@ -1021,7 +1021,7 @@ _SOFTWARE_MIC_RE = re.compile(
 _SELF_POWERED_MIC_RE = re.compile(
     # Anything carrying its own battery can be off in exactly the way tonight's
     # headset was off — a sleeping DualSense enumerates Active and hears
-    # nothing, which is the same lie the CORSAIR told. Ranked below USB/mains
+    # nothing, which is the same lie the headset told. Ranked below USB/mains
     # devices, never excluded, because "probably asleep" still beats "measured
     # dead".
     r"wireless|bluetooth|headset|dualsense|airpods",
@@ -1658,10 +1658,10 @@ class AudioAutoSwitch:
         sources, the remembered id and one configured name fragment, and when
         neither resolved it logged DEAF RISK and left the default on the
         headset microphone it had just MEASURED powered off. Reproduced with
-        mocks 2026-09-05 before this method existed - Snowball unplugged,
-        fallback "Blue Snowball" therefore unresolvable - set_default_capture
+        mocks 2026-09-05 before this method existed - desk mic unplugged,
+        fallback "Example Desk Mic" therefore unresolvable - set_default_capture
         was never called, while the SAME enumeration held "Microphone (2- HD
-        Webcam eMeet C960)" and "Headset Microphone (DualSense Wireless
+        Webcam Example Webcam C960)" and "Headset Microphone (DualSense Wireless
         Controller)", both Active.
 
         WHAT THESE CANDIDATES ARE AND ARE NOT. Each is verified to be an ACTIVE
@@ -1849,7 +1849,7 @@ class AudioAutoSwitch:
         JARVIS records from, so "I may not be able to hear you" is a fair
         reading of the two measured facts. With an override in force it is NOT:
         measured in the owner's LIVE settings 2026-09-05,
-        PREFERRED_INPUT_DEVICES = ['Blue Snowball', 'eMeet C960', 'CORSAIR
+        PREFERRED_INPUT_DEVICES = ['Example Desk Mic', 'Example Webcam C960', 'ExampleBrand
         VOID'] and _refresh_devices consults that list BEFORE the Windows
         default — so a stuck default says nothing about what he is heard on,
         and asserting deafness from it would be the FOURTH unverified claim of
@@ -2293,15 +2293,15 @@ class AudioAutoSwitch:
             #
             # It resolves. That is the problem. MEASURED 2026-09-05: with the
             # VOID ELITE powered OFF, Windows still lists
-            # "Headset Microphone (CORSAIR VOID ELITE Wireless Gaming Headset)"
+            # "Headset Microphone (ExampleBrand Wireless Gaming Headset)"
             # as Active (see the module docstring — endpoint state carries no
             # power information for this dongle), so a fallback fragment of
-            # "CORSAIR", "VOID ELITE" or "Headset Microphone" resolves to the
+            # "ExampleBrand", "VOID ELITE" or "Headset Microphone" resolves to the
             # headset's own microphone. It is a {0.0.1. id, so
             # set_default_capture accepts it; SetDefaultEndpoint on the device
             # that is ALREADY the default returns S_OK; so the write
             # "succeeds", `self._prior_capture` is cleared, and he is TOLD
-            # "headset off - listening on Headset Microphone (CORSAIR ...)".
+            # "headset off - listening on Headset Microphone (ExampleBrand ...)".
             # The default never moved. He is deaf and has just been informed he
             # was rescued.
             #
@@ -2313,7 +2313,7 @@ class AudioAutoSwitch:
             #
             # A misconfigured fallback is not a hypothetical here. This module's
             # entire history is a wrong device sitting in a fallback slot: the
-            # playback fallback really was set to "Blue Snowball", a MICROPHONE
+            # playback fallback really was set to "Example Desk Mic", a MICROPHONE
             # (fixed 2026-09-04), and the mic fallback slot sits directly under
             # a setting whose value is the headset's own name.
             #
@@ -2497,6 +2497,21 @@ class AudioAutoSwitch:
 
 
 # ── standalone CLI ───────────────────────────────────────────────────────────
+def _configured_device_default(setting: str, env: str) -> str:
+    """Blank-by-default CLI default for a device-name fragment: the owner's
+    setting if core.config exposes it, else the env var, else "". Never raises
+    (a CLI default must not stop the module importing)."""
+    try:
+        from core import config as _cfg  # type: ignore
+        val = getattr(_cfg, setting, "")
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    import os as _os
+    return _os.environ.get(env, "") or ""
+
+
 def _main(argv) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="Auto-switch default audio on headset power.")
@@ -2515,17 +2530,22 @@ def _main(argv) -> int:
                     help="what the power detector actually says (three-valued)")
     ap.add_argument("--test", action="store_true", help="switch to headset then restore")
     ap.add_argument("--daemon", action="store_true")
-    ap.add_argument("--headset", default="CORSAIR VOID ELITE")
-    # NOTE: this default is the owner's real speakers. data/user_settings.json
-    # has carried "Blue Snowball" — a MICROPHONE — in AUDIO_AUTOSWITCH_FALLBACK,
-    # which can never match a render endpoint. `--state` prints that verdict.
-    ap.add_argument("--fallback", default="Realtek USB2.0 Audio")
+    # No device names ship as defaults: --headset / --fallback fall back to the
+    # owner's AUDIO_AUTOSWITCH_HEADSET / AUDIO_AUTOSWITCH_FALLBACK settings (or
+    # the JARVIS_AUDIO_* env vars) and are blank when neither is set.
+    # NOTE: a microphone name in AUDIO_AUTOSWITCH_FALLBACK can never match a
+    # render endpoint; `--state` prints that verdict.
+    ap.add_argument("--headset", default=_configured_device_default(
+        "AUDIO_AUTOSWITCH_HEADSET", "JARVIS_AUDIO_HEADSET"))
+    ap.add_argument("--fallback", default=_configured_device_default(
+        "AUDIO_AUTOSWITCH_FALLBACK", "JARVIS_AUDIO_FALLBACK"))
     # No default here on purpose. The PLAYBACK fallback above cannot serve the
     # input direction: measured 2026-09-05, "Realtek USB2.0 Audio" has ZERO
     # Active recording endpoints on this machine (Line In and Microphone both
     # Unplugged, Internal AUX Jack Disabled), so borrowing it would resolve to
     # nothing and no-op in silence.
-    ap.add_argument("--mic-fallback", default="",
+    ap.add_argument("--mic-fallback", default=_configured_device_default(
+        "AUDIO_AUTOSWITCH_MIC_FALLBACK", "JARVIS_AUDIO_MIC_FALLBACK"),
                     help="desk-microphone name fragment for the input half")
     ap.add_argument("--follow-mic", action="store_true",
                     help="with --daemon, also move the default RECORDING device")
@@ -2535,6 +2555,12 @@ def _main(argv) -> int:
                          "(0 disables the check and restores the pre-2026-09-05 "
                          "fire-once-on-transition behaviour)")
     args = ap.parse_args(argv)
+
+    if (args.state or args.test or args.daemon) and not args.headset:
+        print("  no headset name configured — pass --headset NAME or set "
+              "AUDIO_AUTOSWITCH_HEADSET (JARVIS_AUDIO_HEADSET). Use --list to "
+              "see the device names Windows reports.")
+        return 2
 
     if _HAS_COM:
         try:

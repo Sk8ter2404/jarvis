@@ -204,7 +204,7 @@ class SecretNameTableTests(_ExcludeBase):
     def test_folders_above_the_root_are_never_tested(self):
         # A user folder or a root that happens to contain "pass" / "token"
         # must not hide every file under it.
-        root = r"C:\Users\Compass\Token Projects\Documents"
+        root = r"C:\Users\someuser\Token Projects\Documents"
         rag.RAG_INDEX_PATHS = [root]
         for path in _spellings(root, "Clients/notes.md"):
             with self.subTest(path=path):

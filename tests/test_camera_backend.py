@@ -7,8 +7,8 @@ leaks too, and no gate can help there because the face-track loop has to open
 the camera. Measured on the owner's rig 2026-09-05, 25 open/read/release cycles
 per figure, each in a fresh process, 1280x720 requested, 30 reads per cycle:
 
-    eMeet C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
-    eMeet C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
+    Example Webcam C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
+    Example Webcam C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
     USB 2.0 Cam  CAP_DSHOW  +4.55 OS threads  +479 handles  per cycle
     USB 2.0 Cam  CAP_MSMF   -0.18 OS threads    +1.06       per cycle
 
@@ -16,8 +16,8 @@ So the code moved to Media Foundation. The DANGEROUS half of that move is not
 the backend constant, it is the INDEX: the two backends enumerate different
 device lists, of different lengths.
 
-    DirectShow  0=USB 2.0 Camera  1=Kinect  2=eMeet C960  3=OBS Virtual Camera
-    MediaFdn.   0=Kinect          1=USB 2.0 Camera  2=eMeet C960
+    DirectShow  0=USB 2.0 Camera  1=Kinect  2=Example Webcam C960  3=OBS Virtual Camera
+    MediaFdn.   0=Kinect          1=USB 2.0 Camera  2=Example Webcam C960
 
 A naive `CAP_DSHOW -> CAP_MSMF` edit repoints index 0 from the USB webcam to
 the Kinect AND SUCCEEDS — the worst possible failure, because nothing errors.
@@ -300,7 +300,7 @@ class OpenCameraTests(unittest.TestCase):
         self.assertEqual(len(fake.calls), 1)
 
     def test_opened_but_frameless_is_rejected_and_released(self):
-        # THE BUSY-DEVICE SHAPE. Measured with one process holding the eMeet:
+        # THE BUSY-DEVICE SHAPE. Measured with one process holding the ExampleCam:
         # a DirectShow contender got isOpened() == False, but an MSMF contender
         # got isOpened() True, set() True, get() reading back 1280x720 — and
         # 0 frames out of 20. Trusting isOpened() there hands the face-track

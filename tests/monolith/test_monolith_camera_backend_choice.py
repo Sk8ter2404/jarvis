@@ -9,8 +9,8 @@ gate can help there because the face-track loop has to open the camera.
 Measured on the owner's rig 2026-09-05, 25 open/read/release cycles per figure,
 each in a fresh process, 1280x720 requested, 30 reads per cycle:
 
-    eMeet C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
-    eMeet C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
+    Example Webcam C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
+    Example Webcam C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
     USB 2.0 Cam  CAP_DSHOW  +4.55 OS threads  +479 handles  per cycle
     USB 2.0 Cam  CAP_MSMF   -0.18 OS threads    +1.06       per cycle
 
@@ -23,8 +23,8 @@ THE PART THAT IS ACTUALLY DANGEROUS
 The backends enumerate DIFFERENT lists, of different lengths (verified on this
 rig with both enumerators and confirmed by device-unique resolutions):
 
-    DirectShow  0=USB 2.0 Camera  1=Kinect  2=eMeet C960  3=OBS Virtual Camera
-    MediaFdn.   0=Kinect          1=USB 2.0 Camera  2=eMeet C960
+    DirectShow  0=USB 2.0 Camera  1=Kinect  2=Example Webcam C960  3=OBS Virtual Camera
+    MediaFdn.   0=Kinect          1=USB 2.0 Camera  2=Example Webcam C960
 
 CAMERAS on disk holds DIRECTSHOW indices. A `CAP_DSHOW -> CAP_MSMF` edit with
 the index left alone repoints index 0 from the USB webcam to the Kinect AND

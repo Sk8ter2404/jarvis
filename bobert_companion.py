@@ -6405,7 +6405,7 @@ def _kinect_preview_webcam_names() -> dict[str, str]:
     DERIVED FROM `CAMERAS` — the single source of truth — not hardcoded.
 
     This used to be a literal dict pinned to `"left": "logi c270"`. When the
-    owner retired the C270 for an eMeet C960 (v2.0.56 updated core.config), the
+    owner retired the C270 for an Example Webcam C960 (v2.0.56 updated core.config), the
     composite kept looking for a device that no longer exists, silently failed
     to resolve the slot, and drew the LEFT tile as a dim "off" placeholder
     forever — while the camera was open and streaming. The HUD reported a
@@ -7896,15 +7896,15 @@ def _camera_open(idx, *, name: "str | None" = None,
     ``idx`` is a DIRECTSHOW index, because that is what CAMERAS on disk holds
     and what _dshow_name_to_index() produces. The two backends do NOT index the
     same list (verified on this rig 2026-09-05: DirectShow 0=USB 2.0 Camera
-    1=Kinect 2=eMeet 3=OBS Virtual Camera; Media Foundation 0=Kinect
-    1=USB 2.0 Camera 2=eMeet, with no OBS entry at all), so handing a raw
+    1=Kinect 2=ExampleCam 3=OBS Virtual Camera; Media Foundation 0=Kinect
+    1=USB 2.0 Camera 2=ExampleCam, with no OBS entry at all), so handing a raw
     CAMERAS index to CAP_MSMF would repoint index 0 from the USB webcam to the
     Kinect and succeed. Everything here exists to stop that.
 
     WHY MSMF AT ALL — measured, 25 open/read/release cycles per figure, fresh
     process each, 1280x720 requested, 30 reads per cycle:
-        eMeet C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
-        eMeet C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
+        Example Webcam C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
+        Example Webcam C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
         USB 2.0 Cam  CAP_DSHOW  +4.55 OS threads  +479 handles  per cycle
         USB 2.0 Cam  CAP_MSMF   -0.18 OS threads    +1.06       per cycle
     The DirectShow threads all start inside mfksproxy.dll and are never
@@ -8755,7 +8755,7 @@ def _open_tile_capture(idx: int, name: "str | None" = None) -> "cv2.VideoCapture
 # ~1.00 s in the bad ones), so it is removed here.
 #
 # HONEST LIMIT: whether the duplicate graph also CAUSED the slow reads is unproven
-# — the other webcam (an eMeet C960) was double-opened too and read in ~0 ms.
+# — the other webcam (an Example Webcam C960) was double-opened too and read in ~0 ms.
 # Removing the duplicate provably removes one read per composite; the read-timing
 # warning added in _face_tracking_thread now names whichever camera is left
 # gating the loop, which is the diagnostic that was missing all along.
@@ -8779,7 +8779,7 @@ _KINECT_PREVIEW_TILE_REUSE_MAX_AGE = 2.0   # s; an older cache counts as absent
 #
 #                       producer reads BEFORE   DURING     AFTER (tile released)
 #   USB 2.0 Camera      208 ok /   0 fail       1 ok / 210 fail    0 ok / 239 fail
-#   eMeet C960          211 ok /   0 fail       1 ok / 211 fail    0 ok / 239 fail
+#   Example Webcam C960          211 ok /   0 fail       1 ok / 211 fail    0 ok / 239 fail
 #
 # Three findings, none of them optional:
 #   1. The second MSMF open is GRANTED - it even satisfies require_frame, so
@@ -8789,7 +8789,7 @@ _KINECT_PREVIEW_TILE_REUSE_MAX_AGE = 2.0   # s; an older cache counts as absent
 #      0 ok / 239 fail for a further 12 s in every cycle; only a full
 #      release+reopen recovers it - which is exactly the
 #      "read failure #25 ... woke via release+reopen" pair in the session logs.
-#   3. It is NOT a sick-camera effect. The healthy eMeet C960 died identically.
+#   3. It is NOT a sick-camera effect. The healthy Example Webcam C960 died identically.
 #      camera_backend's docstring measured contention CROSS-PROCESS ("both
 #      backends leave the HOLDER undisturbed"); IN-PROCESS is the opposite.
 #
@@ -8799,7 +8799,7 @@ _KINECT_PREVIEW_TILE_REUSE_MAX_AGE = 2.0   # s; an older cache counts as absent
 # takes the fast path. The NON-primary camera is read AFTER the composite in
 # the same iteration, so at composite time its cache is one whole loop period
 # old, and on the first iteration it does not exist at all. On this rig the
-# primary is the LEFT eMeet and the non-primary is the RIGHT USB 2.0 Camera,
+# primary is the LEFT ExampleCam and the non-primary is the RIGHT USB 2.0 Camera,
 # which is why 8 boots out of 8 - EVERY boot in the 2026-09-05 22:00 ->
 # 2026-09-06 07:50 log window in which the producer actually held the right
 # camera AND the tile had a right slot (22:38:43, 22:41:10, 23:20:21, 02:13:45,
@@ -10006,7 +10006,7 @@ class _CameraIOLock:
         runs, so its webcam check would read UNVERIFIED for the rest of the
         session ("the face tracker holds _camera_io_lock") no matter how
         healthy the cameras were;
-      * an open of the HEALTHY primary (index 2, the eMeet C960) returned None
+      * an open of the HEALTHY primary (index 2, the Example Webcam C960) returned None
         after its full timeout with the opener body executed ZERO times — it
         never touched DirectShow at all, it only queued on the dead lock;
       * three of those in 120 s printed
@@ -12970,7 +12970,7 @@ def _face_tracking_thread_body():
             #   * `now_loop < entry["next_reopen_at"]` (reopen backoff),
             #   * a failed reopen,
             #   * the wake path's own bench.
-            # On the live rig the PRIMARY is index 2 (the eMeet C960), so the
+            # On the live rig the PRIMARY is index 2 (the Example Webcam C960), so the
             # very camera most likely to be stolen by Teams/Zoom is the one
             # whose bench blanked the HUD - the owner's original symptom, and
             # the reason the quarantine log line promising "every OTHER camera
@@ -13223,20 +13223,55 @@ def _devices_signature():
         return None
 
 
-# Speakable aliases for the endpoints the owner actually switches between from
-# his Stream Deck. The generic parse below is technically correct but produces
-# unspeakable strings for exactly these ('CORSAIR VOID ELITE Wireless Gaming
-# Dongle'), and the follow-the-default announcement reads the result OUT LOUD
-# ("Switched to <this>, sir."). Matched case-insensitively as a substring of the
-# RAW description, so an MME-truncated variant still hits. Deliberately narrow:
-# anything not listed here keeps the generic parse untouched (a broad 'speakers'
-# entry would swallow 'Speakers (Realtek)' → 'Realtek', which callers like the
-# boot sequence and suit_up rely on).
-_FRIENDLY_DEVICE_ALIASES = (
-    ("corsair",    "your headset"),
-    ("void elite", "your headset"),
-    ("snowball",   "the Blue Snowball"),
-)
+# Speakable aliases for the endpoints the owner actually switches between
+# (e.g. from a Stream Deck). The generic parse below is technically correct but
+# produces unspeakable strings for a USB wireless headset dongle ("<Brand>
+# <Model> Wireless Gaming Dongle"), and the follow-the-default announcement
+# reads the result OUT LOUD ("Switched to <this>, sir."). The aliases are built
+# at CALL time from the owner's own settings (AUDIO_AUTOSWITCH_HEADSET ->
+# "your headset", AUDIO_AUTOSWITCH_MIC_FALLBACK -> "the <name>") so the shipped
+# code carries no device names; with both blank the table is empty and every
+# name takes the generic parse. Matched case-insensitively as a substring of
+# the RAW description, so an MME-truncated variant still hits. Deliberately
+# narrow: anything not listed keeps the generic parse untouched (a broad
+# 'speakers' entry would swallow 'Speakers (Realtek)' -> 'Realtek', which
+# callers like the boot sequence and suit_up rely on).
+_ALIAS_GENERIC_WORDS = frozenset({
+    "headset", "headphones", "microphone", "wireless", "speakers", "gaming",
+    "audio", "device", "webcam", "camera",
+})
+
+
+def _alias_needles(fragment: str, *, take_first: bool) -> list:
+    """Lower-case substrings that identify a configured device fragment: the
+    whole fragment plus its one distinctive word (first word for a headset
+    brand, last word for a microphone model) so an MME-truncated description
+    still matches. Generic or short words never become a needle."""
+    frag = (fragment or "").strip().lower()
+    if not frag:
+        return []
+    out = [frag]
+    words = [w for w in re.split(r"[^a-z0-9]+", frag) if w]
+    ordered = words if take_first else list(reversed(words))
+    for w in ordered:
+        if len(w) >= 6 and w not in _ALIAS_GENERIC_WORDS:
+            if w not in out:
+                out.append(w)
+            break
+    return out
+
+
+def _friendly_device_aliases() -> tuple:
+    """(needle, spoken alias) pairs built from the owner's settings."""
+    pairs = []
+    head = str(globals().get("AUDIO_AUTOSWITCH_HEADSET", "") or "")
+    for n in _alias_needles(head, take_first=True):
+        pairs.append((n, "your headset"))
+    mic = str(globals().get("AUDIO_AUTOSWITCH_MIC_FALLBACK", "") or "").strip()
+    for n in _alias_needles(mic, take_first=False):
+        pairs.append((n, "the " + mic))
+    return tuple(pairs)
+
 
 # Endpoint descriptions that carry NO brand at all once parsed. Spoken bare they
 # read like a proper noun ("Switched to Speakers, sir"), so they get possessed.
@@ -13265,14 +13300,14 @@ def _friendly_device_name(raw: str) -> str:
     'Microphone (USB Mic), MME' → 'USB Mic';
     'Headset Microphone (Gaming Headset), Windows DirectSound' → 'Gaming Headset';
     'Speakers (Realtek)' → 'Realtek';
-    'Headset Microphone (CORSAIR VOID ELITE …)' → 'your headset' (alias table);
+    'Headset Microphone (ExampleBrand ELITE …)' → 'your headset' (alias table);
     'Speakers (2- USB Audio Device)' → 'USB Audio Device' (MME index prefix);
     'Speakers (DualSense Wireless Co' → 'DualSense Wireless Co' (MME cuts the
     description at 31 chars, closing paren included)."""
     if not raw:
         return ""
     low = raw.lower()
-    for needle, alias in _FRIENDLY_DEVICE_ALIASES:
+    for needle, alias in _friendly_device_aliases():
         if needle in low:
             return alias
     first = raw.split(",")[0].strip()
@@ -13932,7 +13967,7 @@ def _pick_device(preferred_names: list[str], want_input: bool) -> tuple[int | No
 # Device() returns hostApis[Pa_GetDefaultHostApi()]->info.defaultOutputDevice —
 # a STRUCT FIELD each host API fills in ONCE, inside Pa_Initialize. sd.default
 # .device re-reads that field on every access (measured here: 0.00006 ms/call,
-# and it resolves to concrete indices — [1, 7] = 'Microphone (Blue Snowball )'
+# and it resolves to concrete indices — [1, 7] = 'Microphone (Example Desk Mic )'
 # / 'Speakers (Realtek USB2.0 Audio)', not the Sound Mapper), but the value
 # behind it is FROZEN until sd._terminate()/sd._initialize() runs. It is the
 # same freeze DEVICE_REENUM_INTERVAL exists for on the hotplug side — which is
@@ -14179,8 +14214,8 @@ def _audio_endpoint_gone(endpoint_id, active) -> bool:
 #     Stream Deck does NOT plug anything in — it moves the Windows default
 #     BETWEEN endpoints that are already enumerated. Measured 2026-08-21 while
 #     the live JARVIS was running: every ACTIVE MMDevice endpoint on this box
-#     (Blue Snowball, CORSAIR VOID ELITE, Realtek USB2.0, both NVIDIA HDMI
-#     sinks, the Xbox NUI array, the eMeet webcam) already had a row in the
+#     (Example Desk Mic, ExampleBrand ELITE, Realtek USB2.0, both NVIDIA HDMI
+#     sinks, the Xbox NUI array, the ExampleCam webcam) already had a row in the
 #     FROZEN sd.query_devices() list. So the new device's INDEX is obtainable
 #     without ever calling sd._terminate().
 #   • What the re-enumeration uniquely provides is the refreshed value behind
@@ -14189,8 +14224,8 @@ def _audio_endpoint_gone(endpoint_id, active) -> bool:
 #     HOST API's own idea of the default. Measured: sd.default.hostapi is MME
 #     (0) here, and MME's default_input_device/default_output_device were 1 and
 #     6 — byte-identical to the endpoints MMDevice reports as the live
-#     eConsole defaults ('Microphone (Blue Snowball )' / 'Headset Earphone
-#     (CORSAIR VOID …)'). So resolving the LIVE endpoint's friendly name inside
+#     eConsole defaults ('Microphone (Example Desk Mic )' / 'Headset Earphone
+#     (ExampleBrand VOID …)'). So resolving the LIVE endpoint's friendly name inside
 #     the DEFAULT HOST API reproduces exactly the index a reinit would hand
 #     `device=None` — which is why an explicit index here is a faithful
 #     substitute for the teardown, not an approximation of it.
@@ -20490,10 +20525,10 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # Silero hears no speech in is dropped without one: the price of
             # keeping the main loop under the watchdog (audit P1-1).
             # STT_HOTWORDS (core/stt_vocab.py, 2026-10-01): the owner's names
-            # ("Accelo" came out as "a cello"). None when unset = unchanged.
+            # ("Zorblat" came out as "a cello"). None when unset = unchanged.
             # The no-VAD retry runs WITHOUT them: its audio is the clip VAD
             # just called non-speech, exactly where Whisper reads the hint
-            # back as a "transcript" (live 17:32, "JARVIS, Accelo, Entry, ...").
+            # back as a "transcript" (live 17:32, "JARVIS, Zorblat, Entry, ...").
             # Read LIVE (2026-10-01): an edit to data/user_settings.json after
             # start applies without a restart (core/stt_vocab.live_hotwords).
             _hot_setting = _stt_vocab.live_hotwords(globals().get("STT_HOTWORDS"))

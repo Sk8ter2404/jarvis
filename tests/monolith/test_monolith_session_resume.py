@@ -4,7 +4,7 @@ THE LIVE FAILURES (2026-10-01), each the first thing JARVIS said after a restart
   * 17:33:37  "...working on Fix open_url/browser window placement — new windows
               sometimes spawn off-screen to the r…" (a to-do cut mid-word, a code
               identifier read aloud);
-  * 19:44:30  "...working on jarvis, accelo, entry, token, bambu, hbo max, ..." (the
+  * 19:44:30  "...working on jarvis, zorblat, entry, token, bambu, hbo max, ..." (the
               last "command" was Whisper reading the hotwords hint back);
   * 21:49:25  "...working on jarvis plays skrillex essentials on youtube" (a raw media
               command, wake word and all, 6 minutes after a deliberate restart with

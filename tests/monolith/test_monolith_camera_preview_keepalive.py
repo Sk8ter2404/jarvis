@@ -13,7 +13,7 @@ reopen, the soft-wake path's own bench. Losing the PRIMARY therefore did not
 just darken the primary's tile, it stopped ALL shared-preview production, and
 the only line the owner got promised the opposite ("its tile goes dark, every
 OTHER camera keeps publishing"). On the live rig the primary is index 2, the
-eMeet C960 - the camera Teams/Zoom is most likely to steal - so the HUD camera
+Example Webcam C960 - the camera Teams/Zoom is most likely to steal - so the HUD camera
 tile went dark for 60-600 s at a time and pointed him at his webcam hardware.
 
 WHY THESE TESTS DRIVE THE REAL LOOP. The sibling quarantine suite pins some
