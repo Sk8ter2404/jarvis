@@ -319,6 +319,28 @@ LOCAL_BACKGROUND_MAX_DEFER_S = 120.0
 LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S = 600.0
 BACKGROUND_TAG_STRICT = False
 
+# ─── Batched ambient learning (2026-10-12) ─────────────────────────────
+# Background learning used to send ~60 separate little requests to the local
+# brain a session (a memory extraction per turn of yours, a "is this the TV?"
+# check per overheard line, the ambient extractor), and each one made your
+# next reply re-read the whole prompt. With this on they are queued and sent
+# as ONE request every few minutes, and only while you have been quiet for a
+# while (nothing being said, no turn running); if you start talking the batch
+# waits for the next quiet moment. Facts you teach it by talking are learned a
+# few minutes later instead of at once.
+# LEARN_BATCH_ENABLED — False = the old behaviour (each job runs by itself).
+# LEARN_BATCH_INTERVAL_S — a queued job waits at least this long before it is
+#   sent, so more of them ride together. Float seconds (0 = send at the next
+#   quiet moment).
+# LEARN_BATCH_QUIET_S — how long you must have been silent (no turn, no
+#   reply) before a batch may go out. Float seconds.
+# LEARN_BATCH_MAX_JOBS — most jobs in one request (the rest wait for the next).
+# Changes apply on the next start.
+LEARN_BATCH_ENABLED = True
+LEARN_BATCH_INTERVAL_S = 300.0
+LEARN_BATCH_QUIET_S = 90.0
+LEARN_BATCH_MAX_JOBS = 20
+
 # When True, every ambient/background one-shot LLM call (memory extraction,
 # proactive comments, the ambient extractor — everything routed through
 # `_llm_quick`) runs on the LOCAL model ONLY and never touches Claude, so

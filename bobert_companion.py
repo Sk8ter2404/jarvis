@@ -3077,12 +3077,26 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
 
 
 def _learn_enqueue(turn: tuple) -> None:
-    """Queue one turn for extraction and make sure a worker drains it."""
-    with _learn_lock:
-        _learn_pending.append(turn)
-        if _learn_worker_live[0]:
-            return          # the live worker picks this turn up
-        _learn_worker_live[0] = True
+    """Queue one turn for extraction and make sure a worker drains it.
+
+    Batched learning on (LEARN_BATCH_ENABLED, core/learn_batch.py): the turn
+    waits in _learn_pending for the next batch instead and no worker starts;
+    a batch the batcher refuses falls through to the worker below."""
+    if _learn_batch_on():
+        with _learn_lock:
+            _learn_pending.append(turn)
+        if _learn_batch_ensure_jobs():
+            return
+        with _learn_lock:
+            if _learn_worker_live[0]:
+                return
+            _learn_worker_live[0] = True
+    else:
+        with _learn_lock:
+            _learn_pending.append(turn)
+            if _learn_worker_live[0]:
+                return      # the live worker picks this turn up
+            _learn_worker_live[0] = True
     try:
         threading.Thread(target=_learn_worker, name="learn-from-turn",
                          daemon=True).start()
@@ -3299,6 +3313,147 @@ def _learn_worker() -> None:
                 _learn_worker_live[0] = False
 
 
+# ── Batched ambient learning (2026-10-12, core/learn_batch.py) ───────────
+# Memory extraction (one call per owner turn), the ambient content judge (one
+# per overheard line) and the multimodal extractor (one per interval) used to
+# be ~60 separate local-model requests a session, each evicting the owner's
+# cached prompt prefix. With LEARN_BATCH_ENABLED they are queued and sent as
+# ONE request every LEARN_BATCH_INTERVAL_S, only while the owner has been
+# quiet for LEARN_BATCH_QUIET_S (nothing being said, no turn running); the
+# quiet check runs again right before the send, so a batch never starts in
+# front of an owner turn. Off, every caller runs exactly as before.
+from core import learn_batch as _learn_batch_mod  # noqa: E402
+_learn_batcher_state = [None]
+_learn_batch_queued = {True: False, False: False}   # kind -> a job is waiting
+_LEARN_BATCH_TURNS_MAX = 12         # turns of one kind per extraction
+
+
+def _learn_batch_on() -> bool:
+    """LEARN_BATCH_ENABLED, read at call time. Never raises."""
+    try:
+        return bool(LEARN_BATCH_ENABLED)
+    except Exception:
+        return False
+
+
+def _learn_batch_quiet() -> bool:
+    """May a learning batch go out now? No utterance or turn in progress and
+    no owner turn / reply for LEARN_BATCH_QUIET_S. Never raises (False on
+    doubt: the owner may be talking)."""
+    try:
+        if _utterance_in_progress[0] or _turn_in_progress[0]:
+            return False
+        try:
+            quiet_s = max(0.0, float(LEARN_BATCH_QUIET_S))
+        except Exception:
+            quiet_s = 90.0
+        last = max(_last_convo_activity[0], _last_owner_turn_at[0])
+        if last and (time.monotonic() - last) < quiet_s:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _learn_batch_llm(system: str, user: str, max_tokens: int = 200) -> str:
+    """The one request a batch makes: tagged background work, so it also
+    passes the background gate (core/local_traffic.py) before the POST."""
+    with _lt.background_work("learn-batch"):
+        return _llm_quick(system, user, max_tokens=max_tokens)
+
+
+def _learn_batcher() -> "_learn_batch_mod.LearnBatcher":
+    if _learn_batcher_state[0] is None:
+        _learn_batcher_state[0] = _learn_batch_mod.LearnBatcher(
+            _learn_batch_llm, _learn_batch_quiet,
+            enabled=_learn_batch_on,
+            interval_s=lambda: LEARN_BATCH_INTERVAL_S,
+            max_jobs=lambda: LEARN_BATCH_MAX_JOBS)
+    return _learn_batcher_state[0]
+
+
+def learn_batch_submit_text(tag: str, system: str, user: str,
+                            max_tokens: int, apply) -> bool:
+    """Queue one small prompt for the next learning batch; ``apply(text)``
+    gets its answer ("" on a failure). False = batching is off (or refused):
+    the caller runs the prompt itself, the old way. Never raises."""
+    try:
+        if not _learn_batch_on():
+            return False
+        return _learn_batcher().submit(_learn_batch_mod.Job.simple(
+            tag, system, user, max_tokens, apply))
+    except Exception:
+        return False
+
+
+def _learn_batch_ensure_jobs() -> bool:
+    """Make sure a batch job waits for each kind (owner-directed / overheard)
+    of turn in _learn_pending. False when the batcher refused one (the caller
+    then starts the plain worker)."""
+    ok = True
+    for kind in (True, False):
+        with _learn_lock:
+            if _learn_batch_queued[kind]:
+                continue
+            if not any(_learn_turn_fields(t)[2] == kind
+                       for t in _learn_pending):
+                continue
+            _learn_batch_queued[kind] = True
+        try:
+            submitted = _learn_batcher().submit(_learn_batch_mod.Job(
+                "learn", *_learn_batch_job_fns(kind)))
+        except Exception:
+            submitted = False
+        if not submitted:
+            with _learn_lock:
+                _learn_batch_queued[kind] = False
+            ok = False
+    return ok
+
+
+def _learn_batch_job_fns(kind: bool):
+    """(build, apply, unbuild) of the memory-extraction job for one kind of
+    turn. The turns are taken at SEND time, so everything that arrived while
+    the job waited rides the same request (a batch never mixes owner-directed
+    with overheard turns: _learn_provenance)."""
+    def build():
+        with _learn_lock:
+            _learn_batch_queued[kind] = False
+            taken = [t for t in _learn_pending
+                     if _learn_turn_fields(t)[2] == kind
+                     ][:_LEARN_BATCH_TURNS_MAX]
+            if not taken:
+                return None
+            gone = {id(t) for t in taken}
+            _learn_pending[:] = [t for t in _learn_pending
+                                 if id(t) not in gone]
+            epoch = _learn_epoch[0]
+        try:
+            system, user, max_tokens = _learn_prompt(taken)
+        except Exception:
+            unbuild((taken, epoch))
+            raise
+        return system, user, max_tokens, (taken, epoch)
+
+    def unbuild(ctx):
+        taken, epoch = ctx
+        with _learn_lock:
+            if epoch == _learn_epoch[0]:    # a wipe since then drops them
+                _learn_pending[0:0] = taken
+                _learn_batch_queued[kind] = True
+
+    def apply(text, ctx):
+        taken, epoch = ctx
+        try:
+            _learn_apply(text or "", taken, epoch=epoch)
+        except Exception as e:
+            print(f"  [learn] failed: {type(e).__name__}: {e}")
+        finally:
+            _learn_batch_ensure_jobs()      # leftovers beyond the cap
+
+    return build, apply, unbuild
+
+
 # Content heuristic for the voice-ID-unavailable fallback: a transcript shorter
 # than this many characters OR fewer than this many words is treated as a stray
 # TV/room fragment and NOT ingested. Mirrors _ambient_learning_feed's drop rule
@@ -3391,6 +3546,30 @@ def _ambient_owner_voice(audio, sample_rate: int) -> "tuple[bool, str, float]":
         return (False, "unavailable", 0.0)
 
 
+_AMBIENT_JUDGE_SYSTEM = (
+    "You are a strict binary classifier. Decide whether a short "
+    "overheard transcript is a line FROM media (a TV show or movie "
+    "line of dialogue, song lyrics, or an advertisement / commercial) "
+    "rather than a real person talking in the room. Answer with ONLY "
+    "one word: MEDIA or PERSON. No punctuation, no explanation."
+)
+
+
+def _ambient_judge_user(text: str) -> str:
+    return f"Transcript: {text!r}\nAnswer (MEDIA or PERSON):"
+
+
+def _ambient_judge_says_media(out) -> bool:
+    """True only for an explicit MEDIA verdict. Match the token anywhere in
+    the reply so a chatty local model that wraps the word ("MEDIA.",
+    "Answer: MEDIA") is still understood; an empty/ambiguous reply or a
+    PERSON verdict is False (fail-open)."""
+    if not out:
+        return False
+    verdict = str(out).strip().upper()
+    return ("MEDIA" in verdict) and ("PERSON" not in verdict)
+
+
 def _ambient_content_is_media(snippet: str) -> bool:
     """CONTENT JUDGE for ambient learning: ask the cheap LOCAL model whether
     ``snippet`` is a line FROM media (a TV show / movie line, song lyric, or an
@@ -3414,14 +3593,8 @@ def _ambient_content_is_media(snippet: str) -> bool:
         text = (snippet or "").strip()
         if not text:
             return False
-        system = (
-            "You are a strict binary classifier. Decide whether a short "
-            "overheard transcript is a line FROM media (a TV show or movie "
-            "line of dialogue, song lyrics, or an advertisement / commercial) "
-            "rather than a real person talking in the room. Answer with ONLY "
-            "one word: MEDIA or PERSON. No punctuation, no explanation."
-        )
-        user = f"Transcript: {text!r}\nAnswer (MEDIA or PERSON):"
+        system = _AMBIENT_JUDGE_SYSTEM
+        user = _ambient_judge_user(text)
         # Non-urgent background work: waits (bounded) while the owner is in a
         # conversation (never on the main thread) -- see core/local_traffic.py.
         with _lt.background_work("ambient-learn"):
@@ -3431,16 +3604,69 @@ def _ambient_content_is_media(snippet: str) -> bool:
             # Local judge unavailable/empty — fail open (treat as not-media so
             # real conversation still learns). Logged by the caller's decision.
             return False
-        verdict = out.strip().upper()
-        # Match the token anywhere in the reply so a chatty local model that
-        # wraps the word ("MEDIA.", "Answer: MEDIA") is still understood; only
-        # an explicit MEDIA verdict (and not a PERSON one) suppresses.
-        is_media = ("MEDIA" in verdict) and ("PERSON" not in verdict)
-        return bool(is_media)
+        # Only an explicit MEDIA verdict (and not a PERSON one) suppresses.
+        return bool(_ambient_judge_says_media(out))
     except Exception as _e:
         print(f"  [ambient-learn] content judge errored "
               f"({type(_e).__name__}: {_e}) — failing open (not media)")
         return False
+
+
+def _ambient_validity_ok(text: str, conf=None, peak_rms: float = 0.0) -> bool:
+    """Gate (1) of _ambient_should_learn_text: the speech-validity filter.
+    False (after logging why) when the line must not be learned; True when it
+    passes, when there is no Whisper metadata, or when the check errors
+    (fail open). Never raises."""
+    if conf is None:
+        return True
+    try:
+        valid, reason = is_valid_speech(text, conf, peak_rms=peak_rms)
+        if not valid and not reason.startswith("missing wake word"):
+            print("  [ambient-learn] skipped: failed speech validity "
+                  f"({reason})")
+            return False
+    except Exception as _ve:
+        # A validity-check error must not block learning.
+        print(f"  [ambient-learn] speech-validity check errored "
+              f"({type(_ve).__name__}: {_ve}) — failing open")
+    return True
+
+
+def _ambient_gate_then(snippet: str, conf, peak_rms: float, ingest) -> None:
+    """Run the final pre-ingest gate on ``snippet``, then ``ingest()`` when it
+    passes. Batched learning off: exactly _ambient_should_learn_text. On: the
+    cheap validity check runs now and the content judge joins the next
+    learning batch (core/learn_batch.py); ``ingest`` then runs from the batch
+    thread with the judge's verdict, failing open like the single judge. A
+    batcher that refuses the job runs the plain gate."""
+    if _learn_batch_on():
+        try:
+            text = (snippet or "").strip()
+            if not _ambient_validity_ok(text, conf, peak_rms):
+                return
+            if text:
+                def _verdict(out) -> None:
+                    try:
+                        if _ambient_judge_says_media(out):
+                            print("  [ambient-learn] skipped: content judge "
+                                  "says MEDIA (TV/movie/lyrics/ad, not a "
+                                  "real conversation)")
+                            return
+                        ingest()
+                    except Exception as _e:
+                        print(f"  [ambient-learn] batched ingest failed: "
+                              f"{type(_e).__name__}: {_e}")
+                if learn_batch_submit_text(
+                        "judge", _AMBIENT_JUDGE_SYSTEM,
+                        _ambient_judge_user(text), 4, _verdict):
+                    return
+        except Exception as _e:
+            print(f"  [ambient-learn] pre-ingest gate errored "
+                  f"({type(_e).__name__}: {_e}) — failing open")
+            ingest()
+            return
+    if _ambient_should_learn_text(snippet, conf, peak_rms):
+        ingest()
 
 
 def _ambient_should_learn_text(snippet: str, conf=None,
@@ -3468,17 +3694,8 @@ def _ambient_should_learn_text(snippet: str, conf=None,
     try:
         text = (snippet or "").strip()
         # (1) speech-validity gate (skipped when we have no Whisper metadata).
-        if conf is not None:
-            try:
-                valid, reason = is_valid_speech(text, conf, peak_rms=peak_rms)
-                if not valid and not reason.startswith("missing wake word"):
-                    print("  [ambient-learn] skipped: failed speech validity "
-                          f"({reason})")
-                    return False
-            except Exception as _ve:
-                # A validity-check error must not block learning.
-                print(f"  [ambient-learn] speech-validity check errored "
-                      f"({type(_ve).__name__}: {_ve}) — failing open")
+        if not _ambient_validity_ok(text, conf, peak_rms):
+            return False
         # (2) content judge (local-LLM): drop media lines (TV/movie/lyrics/ad).
         if _ambient_content_is_media(text):
             print("  [ambient-learn] skipped: content judge says MEDIA "
@@ -3566,16 +3783,17 @@ def _ambient_learn_from_gated(text: str, memory: dict,
                 # content judge before ingesting, so a low-confidence Whisper
                 # hallucination or a media line (even one a voiceprint spuriously
                 # matched) is never learned.
-                if not _ambient_should_learn_text(snippet, conf, peak_rms):
-                    return
-                # Overheard (not addressed to JARVIS): facts only — never a
-                # topic or project (core/topic_hygiene.py rule 1). The voice
-                # verdict lets owner-only learning keep it (core/learn_gate).
-                learn_from_turn(snippet, "", memory, owner_directed=False,
-                                conf=conf, voice=_learn_gate_mod.OWNER,
-                                epoch=_ep)
-                print(f"  [ambient-learn] ingested gated text ({n} chars) "
-                      f"— owner voice (score={vscore:.2f})")
+                def _ingest_owner():
+                    # Overheard (not addressed to JARVIS): facts only — never
+                    # a topic or project (core/topic_hygiene.py rule 1). The
+                    # voice verdict lets owner-only learning keep it
+                    # (core/learn_gate).
+                    learn_from_turn(snippet, "", memory, owner_directed=False,
+                                    conf=conf, voice=_learn_gate_mod.OWNER,
+                                    epoch=_ep)
+                    print(f"  [ambient-learn] ingested gated text ({n} chars)"
+                          f" — owner voice (score={vscore:.2f})")
+                _ambient_gate_then(snippet, conf, peak_rms, _ingest_owner)
                 return
             # vstatus == "unknown": enrolled owner exists but this isn't them.
             # AMBIENT_LEARN_FROM_EVERYONE (a class or meeting that agreed to it)
@@ -3605,13 +3823,12 @@ def _ambient_learn_from_gated(text: str, memory: dict,
         # Final gate: speech-validity (confidence/RMS/hallucination) + the
         # local-LLM content judge. This is the path that catches a TV with no
         # now-playing signal (the My Name Is Earl case) purely by content.
-        if not _ambient_should_learn_text(snippet, conf, peak_rms):
-            return
-
-        learn_from_turn(snippet, "", memory, owner_directed=False, conf=conf,
-                        epoch=_ep)
-        print(f"  [ambient-learn] ingested gated text ({n} chars) "
-              f"— no media, {why} (content heuristic passed)")
+        def _ingest_heuristic():
+            learn_from_turn(snippet, "", memory, owner_directed=False,
+                            conf=conf, epoch=_ep)
+            print(f"  [ambient-learn] ingested gated text ({n} chars) "
+                  f"— no media, {why} (content heuristic passed)")
+        _ambient_gate_then(snippet, conf, peak_rms, _ingest_heuristic)
     except Exception as _e:
         print(f"  [ambient-learn] gated-feed skipped: {type(_e).__name__}: {_e}")
 

@@ -1329,6 +1329,37 @@ SCHEMA: dict[str, dict] = {
                 "they run at once and the log notes when they would have "
                 "waited. Applies on the next start.",
     },
+    "LEARN_BATCH_ENABLED": {
+        "tab": "ai", "label": "Batch background learning",
+        "type": "bool", "default": True,
+        "help": "Memory extraction, the TV-or-person check on overheard "
+                "speech and the ambient extractor are queued and sent to the "
+                "brain as ONE request every few minutes, only while you are "
+                "quiet, so they stop making your next reply re-read the "
+                "prompt. Things you tell it are learned a few minutes later. "
+                "Off: each runs by itself, as before. Applies on the next "
+                "start.",
+    },
+    "LEARN_BATCH_INTERVAL_S": {
+        "tab": "ai", "label": "Batched learning: wait between sends (seconds)",
+        "type": "float", "default": 300.0, "max": 7200,
+        "help": "A queued learning job waits at least this long so more of "
+                "them go in one request (0 = at the next quiet moment). "
+                "Applies on the next start.",
+    },
+    "LEARN_BATCH_QUIET_S": {
+        "tab": "ai", "label": "Batched learning: quiet time needed (seconds)",
+        "type": "float", "default": 90.0, "max": 3600,
+        "help": "How long you must have been silent (no turn, no reply) "
+                "before a learning batch may be sent. Applies on the next "
+                "start.",
+    },
+    "LEARN_BATCH_MAX_JOBS": {
+        "tab": "ai", "label": "Batched learning: most jobs per request",
+        "type": "int", "default": 20, "min": 1, "max": 100,
+        "help": "Most learning jobs sent in one request; the rest wait for "
+                "the next one. Applies on the next start.",
+    },
     "LOCAL_REPRIME_AT_BOOT_S": {
         "tab": "ai", "label": "Warm the local brain after start (seconds)",
         "type": "float", "default": 20.0, "max": 3600,
@@ -2307,7 +2338,9 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                    "PROMPT_FREEZE_QUIET_S",
                    "LOCAL_PREFIX_REPRIME", "LOCAL_BACKGROUND_MAX_DEFER_S",
                    "LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S",
-                   "BACKGROUND_TAG_STRICT", "LOCAL_REPRIME_AT_BOOT_S"]),
+                   "BACKGROUND_TAG_STRICT", "LOCAL_REPRIME_AT_BOOT_S",
+                   "LEARN_BATCH_ENABLED", "LEARN_BATCH_INTERVAL_S",
+                   "LEARN_BATCH_QUIET_S", "LEARN_BATCH_MAX_JOBS"]),
         ("Turn checker", ["TURN_CHECK_MODE", "TURN_CHECK_ESCALATE_MODEL"]),
         ("Background work", ["ENABLE_ORCHESTRATOR", "TEAMS_NUDGE_ENABLED"]),
         ("Spending caps", ["DAILY_BUDGET_USD", "DEEP_AUDIT_BUDGET_USD"]),

@@ -151,18 +151,10 @@ def _format_window(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _llm_extract(window_text: str) -> dict:
-    """Call the small LLM helper that learn_from_turn already uses so we
-    share the AI_BACKEND / CLAUDE_MODEL config. Returns the parsed JSON
-    object on success, or an empty dict on any failure."""
-    b = _get_bobert()
-    if b is None:
-        return {}
-    quick = getattr(b, "_llm_quick", None)
-    if not callable(quick):
-        return {}
-
-    system = (
+def _extract_system() -> str:
+    """The extractor's instructions (shared by the direct and the batched
+    call)."""
+    return (
         "You extract long-term memory items from a multimodal observation "
         "window. The user has been working at a PC; the input below is a "
         "mixed stream of microphone speech (mic), PC audio output "
@@ -183,13 +175,30 @@ def _llm_extract(window_text: str) -> dict:
         "- If nothing meaningful was observed, return empty lists.\n"
     )
 
+
+def _llm_extract(window_text: str) -> dict:
+    """Call the small LLM helper that learn_from_turn already uses so we
+    share the AI_BACKEND / CLAUDE_MODEL config. Returns the parsed JSON
+    object on success, or an empty dict on any failure."""
+    b = _get_bobert()
+    if b is None:
+        return {}
+    quick = getattr(b, "_llm_quick", None)
+    if not callable(quick):
+        return {}
+
     try:
-        raw = quick(system, window_text, max_tokens=500)
+        raw = quick(_extract_system(), window_text, max_tokens=500)
     except Exception as e:
         print(f"  [ambient-extract] LLM call failed: {e}")
         return {}
+    return _parse_extract(raw)
 
-    if not raw:
+
+def _parse_extract(raw) -> dict:
+    """The extractor's JSON object out of a (possibly noisy) reply; {} when
+    there is none."""
+    if not raw or not isinstance(raw, str):
         return {}
     m = re.search(r"\{[\s\S]*\}", raw)
     if not m:
@@ -262,10 +271,12 @@ def _append_extract_log(entry: dict) -> None:
         print(f"  [ambient-extract] log rotate failed: {e}")
 
 
-def _run_once() -> dict:
-    """One full extraction pass. Returns a summary dict for logging."""
+def _prepare_pass() -> "tuple[dict, str]":
+    """Read the ambient logs and build one pass's summary skeleton and the
+    window text to extract from. An empty window means there is nothing to
+    send (the no-data / owner-only / guest-mode paths have already logged
+    their summary)."""
     global _last_run_at, _runs_total
-    global _facts_added_total, _projects_added_total, _last_error
 
     batch = int(_get_config("AMBIENT_EXTRACT_BATCH", 50))
     batch = max(5, min(500, batch))
@@ -296,7 +307,7 @@ def _run_once() -> dict:
             _last_run_at = time.time()
             _runs_total += 1
         _append_extract_log(summary)
-        return summary
+        return summary, ""
 
     window_text = _format_window(merged)
     # Owner-only learning (core/learn_gate.py): none of this overheard stream
@@ -315,9 +326,14 @@ def _run_once() -> dict:
             _last_run_at = time.time()
             _runs_total += 1
         _append_extract_log(summary)
-        return summary
+        return summary, ""
+    return summary, window_text
 
-    extracted = _llm_extract(window_text)
+
+def _finish_pass(summary: dict, extracted: dict) -> dict:
+    """Merge one pass's extraction into memory and log its summary."""
+    global _last_run_at, _runs_total
+    global _facts_added_total, _projects_added_total, _last_error
     facts, projs = _merge_into_memory(extracted)
 
     summary["facts_added"]     = facts
@@ -335,6 +351,61 @@ def _run_once() -> dict:
     return summary
 
 
+def _run_once() -> dict:
+    """One full extraction pass. Returns a summary dict for logging."""
+    summary, window_text = _prepare_pass()
+    if not window_text:
+        return summary
+    return _finish_pass(summary, _llm_extract(window_text))
+
+
+_batch_job_waiting = [False]    # a pass is queued for the next learning batch
+
+
+def _run_once_batched() -> bool:
+    """The periodic pass, folded into the next learning batch
+    (core/learn_batch.py, LEARN_BATCH_ENABLED): the window is read now, the
+    extraction call is queued with the other small learning jobs and the
+    merge happens when the batch answers. True when the pass was queued or
+    needed no call; False = batching is off (or refused), run it the old way.
+    At most one pass waits at a time, so a long conversation cannot stack
+    stale windows."""
+    b = _get_bobert()
+    submit = getattr(b, "learn_batch_submit_text", None) if b else None
+    if not callable(submit):
+        return False
+    with _lock:
+        if _batch_job_waiting[0]:
+            return True
+    on = getattr(b, "_learn_batch_on", None)
+    if callable(on) and not on():
+        return False
+    summary, window_text = _prepare_pass()
+    if not window_text:
+        return True
+
+    def _apply(text) -> None:
+        try:
+            _finish_pass(summary, _parse_extract(text))
+        finally:
+            with _lock:
+                _batch_job_waiting[0] = False
+
+    with _lock:
+        _batch_job_waiting[0] = True
+    queued = False
+    try:
+        queued = bool(submit("ambient-extract", _extract_system(),
+                             window_text, 500, _apply))
+    finally:
+        if not queued:
+            with _lock:
+                _batch_job_waiting[0] = False
+    if not queued:
+        _finish_pass(summary, _llm_extract(window_text))
+    return True
+
+
 def _loop() -> None:
     global _last_error
     interval = float(_get_config("AMBIENT_EXTRACT_INTERVAL_S", 300.0))
@@ -348,9 +419,12 @@ def _loop() -> None:
             # prefix mid-chat. Stopping the daemon ends the wait at once. The
             # on-demand ambient_extract_now action is the owner's and never
             # waits. See core/local_traffic.py.
-            with _local_traffic.background_work(
-                    "ambient-extract", cancel=_stop_evt.is_set):
-                _run_once()
+            # With batched learning on the pass is queued instead and goes
+            # out with the other small learning jobs when he is quiet.
+            if not _run_once_batched():
+                with _local_traffic.background_work(
+                        "ambient-extract", cancel=_stop_evt.is_set):
+                    _run_once()
         except Exception as e:
             _last_error = f"extraction failed: {e}"
             print(f"  [ambient-extract] {_last_error}")

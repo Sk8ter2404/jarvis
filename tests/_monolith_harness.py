@@ -882,6 +882,13 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         _saved_primed = getattr(bc, "PLAYBACK_PRIMED_STREAM", None)
         if _saved_primed is not None:
             bc.PLAYBACK_PRIMED_STREAM = False
+        # Batched ambient learning (2026-10-12) ships ON: learning jobs wait
+        # for a quiet minute on a batcher thread. Every test runs with it OFF
+        # (each job runs inline, as before); a learn-batch test turns it on
+        # with its own fakes. Restored below.
+        _saved_learn_batch = getattr(bc, "LEARN_BATCH_ENABLED", None)
+        if _saved_learn_batch is not None:
+            bc.LEARN_BATCH_ENABLED = False
         # Start clean too, not only end clean: anything that ran before the
         # first monolith test (an import-time Kinect pump, a light-tier test)
         # may have left history in the process-wide camera gate.
@@ -903,6 +910,8 @@ class MonolithGlobalsTestCase(unittest.TestCase):
                 bc.PLAYBACK_KEEPER = _saved_keeper
             if _saved_primed is not None:
                 bc.PLAYBACK_PRIMED_STREAM = _saved_primed
+            if _saved_learn_batch is not None:
+                bc.LEARN_BATCH_ENABLED = _saved_learn_batch
             try:
                 bc._playback_keeper.set_enabled(False)
             except Exception:
