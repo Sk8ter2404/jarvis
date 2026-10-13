@@ -114,9 +114,11 @@ _DISCOVERY_TIMEOUT_SEC = 45.0
 # Live-LAN discovery sources — each is a brand controller skill exposing the
 # uniform `list_devices()` API. The catalog is built from these PLUS the Alexa
 # fetch, so a dead Alexa cookie can no longer leave the catalog empty forever.
-_LAN_SOURCES = ("sh_kasa", "sh_tuya", "sh_govee", "sh_hue")
+_LAN_SOURCES = ("sh_kasa", "sh_tuya", "sh_govee", "sh_hue",
+                "sh_magichome")
 _LAN_SOURCE_LABELS = {"sh_kasa": "Kasa", "sh_tuya": "Tuya",
-                      "sh_govee": "Govee", "sh_hue": "Hue"}
+                      "sh_govee": "Govee", "sh_hue": "Hue",
+                      "sh_magichome": "Magic Home"}
 # Bounds for the LAN phase (voice dispatch thread — must never wedge). The
 # per-source ceiling covers the worst internal budgets (kasa 5s UDP broadcast,
 # govee 1.5s LAN + 6s cloud, hue 4s meethue + 3s bridge connect, tuya ~0);
@@ -140,6 +142,9 @@ _BRAND_TO_SKILL = {
     "tapo":         "sh_kasa",
     "lifx":         "sh_lifx",
     "govee":        "sh_govee",
+    "magic home":   "sh_magichome",
+    "magichome":    "sh_magichome",
+    "flux":         "sh_magichome",
     "ecobee":       "sh_ecobee",
     "nest":         "sh_nest",
     "google nest":  "sh_nest",

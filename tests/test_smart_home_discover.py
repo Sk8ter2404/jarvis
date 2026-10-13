@@ -125,6 +125,7 @@ def _all_sources(kasa=None, tuya=None, govee=None, hue=None):
         else _fake_source("skill_sh_govee", []),
         "skill_sh_hue": hue if hue is not None
         else _fake_source("skill_sh_hue", []),
+        "skill_sh_magichome": _fake_source("skill_sh_magichome", []),
     }
 
 
@@ -242,7 +243,8 @@ def _lan_status_ok(kasa=5, tuya=0, govee=0, hue=0):
     return {"sh_kasa": {"ok": True, "count": kasa},
             "sh_tuya": {"ok": True, "count": tuya},
             "sh_govee": {"ok": True, "count": govee},
-            "sh_hue": {"ok": True, "count": hue}}
+            "sh_hue": {"ok": True, "count": hue},
+            "sh_magichome": {"ok": True, "count": 0}}
 
 
 class BuildCatalogV2Tests(_DiscoverTestBase):
@@ -412,7 +414,7 @@ class WipeGuardVoiceTests(_DiscoverTestBase):
         before = open(d._CATALOG_PATH, "rb").read()
         mods = {name: _fake_source(name, []) for name in
                 ("skill_sh_kasa", "skill_sh_tuya", "skill_sh_govee",
-                 "skill_sh_hue")}
+                 "skill_sh_hue", "skill_sh_magichome")}
         with mock.patch.object(d, "_alexapy", return_value=None), \
              mock.patch.object(d, "_scan_lan_arp", return_value=[]), \
              mock.patch.object(d, "_say"), \

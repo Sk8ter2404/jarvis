@@ -473,8 +473,9 @@ Every briefing below is one skill, `skills/daily_briefing/` (merged 2026-10-12 f
 
 ### Category 18: Smart home & network
 
-- **Smart-home router** — natural-language control routed to whichever brand skill owns the device (Hue, Govee, LIFX, Kasa/Tapo, Tuya/Smart Life, Ecobee, Nest, Ring).
+- **Smart-home router** — natural-language control routed to whichever brand skill owns the device (Hue, Govee, LIFX, Kasa/Tapo, Tuya/Smart Life, Magic Home, Ecobee, Nest, Ring).
   - "turn off the office light", "dim the bedroom lamps to 30%", "set the living room thermostat to 72"
+  - Magic Home / Flux LED strips are driven directly over the LAN (no cloud, `MAGICHOME_ENABLED` knob, default on); success is reported only when a status read-back matches, otherwise the router falls back to Alexa.
   - Actions: `smart_home_control` / `control_smart_home` / `control_device` / `control_light` / `control_plug`, `smart_home_router_status` ("why did that light not respond"), `refresh_smart_home_router`
 - **Discovery and catalog** — Alexa + LAN discovery builds `data/smart_home_devices.json`; the one-time Alexa sign-in is the phone-app style OAuth device registration (`python -m skills.smart_home_discover`, or `... reauth`): you sign in on Amazon's own page, JARVIS keeps only a saved refresh token (`data/alexa_oauth.json`) and scrubs secrets from every log line; "list my smart-home devices" reads that catalog back (plainly when it is empty).
   - "discover my smart-home devices", "list my smart-home devices", "forget my Alexa login"
