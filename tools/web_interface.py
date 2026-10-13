@@ -4107,12 +4107,13 @@ _DASHBOARD_PAGE = r"""<!doctype html>
   form { display:flex; gap:8px; margin-top:14px; }
   input[type=text] { flex:1; min-width:0; background:#04070c; border:1px solid var(--edge);
            color:var(--text); border-radius:8px; padding:11px 12px; font:inherit; }
-  input[type=text]:focus { outline:none; border-color:var(--cyan); box-shadow:0 0 0 1px var(--cyan-dim); }
+  input[type=text]:focus { border-color:var(--cyan); box-shadow:0 0 0 1px var(--cyan-dim); }
   button { background:var(--cyan-dim); color:#eafcff; border:1px solid var(--cyan);
             border-radius:8px; padding:0 18px; min-height:36px; font:inherit; cursor:pointer; }
   button:hover { background:var(--cyan); color:#04222b; }
   button:disabled { opacity:.5; cursor:default; }
-  button:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid var(--cyan); outline-offset:2px; }
+  button:focus-visible, input:focus-visible, select:focus-visible, .lrow .nm:focus-visible { outline:2px solid var(--cyan); outline-offset:2px; }
+  ::placeholder { color:var(--muted); opacity:1; }
   button.danger { background:transparent; color:var(--bad); border-color:#a33; }
   button.danger:hover { background:#a33; color:#fff; }
   button.on { background:var(--cyan); color:#04222b; }
@@ -4128,7 +4129,7 @@ _DASHBOARD_PAGE = r"""<!doctype html>
   /* Auto-refresh toggle in the header — a small inline checkbox + label. */
   .toggle { display:inline-flex; align-items:center; gap:6px; color:var(--muted);
             font-size:12px; cursor:pointer; user-select:none; }
-  .toggle input { accent-color:var(--cyan); cursor:pointer; }
+  .toggle input { accent-color:var(--cyan); cursor:pointer; min-width:24px; min-height:24px; }
   #reply { margin-top:10px; color:#eafcff; min-height:1.4em; white-space:pre-wrap; }
   .muted { color:var(--muted); }
   .sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
@@ -4165,9 +4166,9 @@ _DASHBOARD_PAGE = r"""<!doctype html>
   .srow .ctl input[type=text], .srow .ctl input[type=number], .srow .ctl input[type=password], .srow .ctl select {
             background:#04070c; border:1px solid var(--edge); color:var(--text);
             border-radius:8px; padding:8px 10px; font:inherit; min-width:0; width:200px; max-width:100%; }
-  .srow .ctl input:focus, .srow .ctl select:focus { outline:none;
+  .srow .ctl input:focus, .srow .ctl select:focus {
             border-color:var(--cyan); box-shadow:0 0 0 1px var(--cyan-dim); }
-  .srow .ctl input[type=checkbox] { width:18px; height:18px;
+  .srow .ctl input[type=checkbox] { width:24px; height:24px;
             accent-color:var(--cyan); cursor:pointer; }
   .srow .save { padding:7px 12px; font-size:12px; }
   .srow .saved { color:var(--good); font-size:12px; min-width:1em; }
@@ -4193,7 +4194,7 @@ _DASHBOARD_PAGE = r"""<!doctype html>
   .search { width:100%; background:#04070c; border:1px solid var(--edge);
           color:var(--text); border-radius:8px; padding:10px 12px; font:inherit;
           margin-bottom:10px; }
-  .search:focus { outline:none; border-color:var(--cyan);
+  .search:focus { border-color:var(--cyan);
           box-shadow:0 0 0 1px var(--cyan-dim); }
   /* A scrollable list panel (Actions / Memory facts / episodes). */
   .listbox { background:#04070c; border:1px solid var(--edge); border-radius:8px;
@@ -4335,17 +4336,17 @@ _DASHBOARD_PAGE = r"""<!doctype html>
   <!-- ── LIVE VIEW: status strip / standby banner / controls / quick actions /
        log / command box ──────────────────────────────────────────────────── -->
   <section id="viewLive" class="view">
-    <div class="strip" id="strip" aria-label="Status"></div>
+    <div class="strip" id="strip" role="group" aria-label="Status"></div>
     <div class="banner" id="standbyBanner" hidden role="status">
       <span id="standbyText">JARVIS is in standby: a typed command is ignored unless it starts with “JARVIS”.</span>
       <button type="button" id="standbyWake">Wake him</button>
     </div>
     <!-- The tray control plane (POST /api/control → tray_commands.json): works
          in standby and without the LLM. Restart asks first. -->
-    <div class="controls" id="controls" aria-label="Controls"></div>
+    <div class="controls" id="controls" role="group" aria-label="Controls"></div>
     <!-- Quick-action buttons are injected here from the QUICK_ACTIONS array below,
          so presets are edited in ONE data-driven place (no per-button markup). -->
-    <div class="actions" id="actions" aria-label="Quick commands"></div>
+    <div class="actions" id="actions" role="group" aria-label="Quick commands"></div>
     <div class="logbar">
       <label class="toggle" title="Hide [kinect-preview], [vad] timeout and [air-mouse] chatter">
         <input id="noiseToggle" type="checkbox" checked> hide noise
@@ -4414,7 +4415,7 @@ _DASHBOARD_PAGE = r"""<!doctype html>
       <div id="tlCount" class="count" role="status">loading timeline…</div>
       <button id="tlRefresh" type="button">Refresh</button>
     </div>
-    <div id="tlList" class="listbox" aria-label="Recent turns"></div>
+    <div id="tlList" class="listbox" role="region" aria-label="Recent turns"></div>
   </section>
 
   <!-- ── PROACTIVE VIEW (GET /api/proactive) ──────────────────────────────
@@ -4462,7 +4463,7 @@ _DASHBOARD_PAGE = r"""<!doctype html>
   </section>
   <!-- Skill panel views (core/web_panels.py) are appended here at load. -->
 </div>
-<div id="estopDock" hidden aria-label="Emergency stops"></div>
+<div id="estopDock" hidden role="group" aria-label="Emergency stops"></div>
 <script>
 const TOKEN = __JARVIS_TOKEN_JSON__;
 function hdr() { const h = {'Content-Type':'application/json'}; if (TOKEN) h['X-Auth-Token']=TOKEN; return h; }
@@ -5189,7 +5190,10 @@ function renderActions(filter) {
     const row=document.createElement('div'); row.className='lrow';
     const nm=document.createElement('div'); nm.className='nm'; nm.textContent=a.name;
     nm.title='Click to edit in the Live command box';
-    nm.addEventListener('click', () => { textIn.value=a.name; showView('live'); textIn.focus(); });
+    nm.setAttribute('role','button'); nm.tabIndex=0;
+    const pick = () => { textIn.value=a.name; showView('live'); textIn.focus(); };
+    nm.addEventListener('click', pick);
+    nm.addEventListener('keydown', (ev) => { if (ev.key==='Enter' || ev.key===' ') { ev.preventDefault(); pick(); } });
     const chip=document.createElement('span'); chip.className=speakChipClass(a.spoken);
     chip.textContent=a.spoken;
     row.appendChild(nm); row.appendChild(chip);
