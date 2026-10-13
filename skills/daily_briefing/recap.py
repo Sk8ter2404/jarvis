@@ -29,7 +29,7 @@ Actions added:
                    Returns the recap text (which is also enqueued for spoken
                    delivery).
 
-Scheduler behaviour mirrors skills/evening_briefing.py:
+Scheduler behaviour mirrors skills/daily_briefing/evening.py:
   * Background thread polls every 60 seconds.
   * Fires at HH:MM with persistence in `daily_recap_state.json` so it
     doesn't re-fire on restart.
@@ -57,7 +57,7 @@ from collections import Counter
 
 from core.atomic_io import _atomic_write_json
 
-_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _STATE_FILE   = os.path.join(_PROJECT_DIR, "daily_recap_state.json")
 _LOGS_DIR     = os.path.join(_PROJECT_DIR, "logs")

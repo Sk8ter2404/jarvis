@@ -16,7 +16,7 @@ Actions added:
   evening_briefing  -- manually trigger the briefing. Returns the briefing
                        text (which is also enqueued for spoken delivery).
 
-Scheduler behaviour mirrors skills/daily_briefing.py:
+Scheduler behaviour mirrors skills/daily_briefing/__init__.py:
   * Background thread polls every 60 seconds.
   * When local time crosses HH:MM AND the briefing hasn't fired today, it
     waits up to EVENING_BRIEFING_WAIT_MINUTES for the user to appear in
@@ -48,7 +48,10 @@ from collections import Counter
 
 from core.atomic_io import _atomic_write_json
 
-_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# This module lives in the skills/daily_briefing package: the skills folder (where the
+# sibling skills briefing_sources, ms_graph, weather_briefing ... live) is one level up.
+_SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _STATE_FILE   = os.path.join(_PROJECT_DIR, "evening_briefing_state.json")
 _LOGS_DIR     = os.path.join(_PROJECT_DIR, "logs")
@@ -717,10 +720,10 @@ def _fetch_news() -> str:
     """Pull the news_briefing module's headline paragraph, or '' if it's
     unavailable / disabled / every feed failed."""
     try:
-        from . import news_briefing  # type: ignore
+        from . import news as news_briefing  # type: ignore
     except Exception:
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, _SKILLS_DIR)
             import news_briefing  # type: ignore
         except Exception as e:
             print(f"  [evening] news_briefing unavailable: {e}")
@@ -740,7 +743,7 @@ def _fetch_tomorrow_umbrella() -> str:
         from . import weather_briefing  # type: ignore
     except Exception:
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, _SKILLS_DIR)
             import weather_briefing  # type: ignore
         except Exception as e:
             print(f"  [evening] weather_briefing unavailable: {e}")

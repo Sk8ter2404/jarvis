@@ -189,7 +189,7 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(ia.normalize_mode("off"), "off")
         self.assertEqual(ia.normalize_mode("shadow"), "shadow")
         for junk in (None, "", "yes", 1, True):
-            self.assertEqual(ia.normalize_mode(junk), "shadow")
+            self.assertEqual(ia.normalize_mode(junk), "off")
 
 
 class SpokenLineTests(unittest.TestCase):
@@ -322,7 +322,7 @@ class WiringTests(unittest.TestCase):
                 if isinstance(n, ast.Assign) and len(n.targets) == 1
                 and isinstance(n.targets[0], ast.Name)
                 and n.targets[0].id.startswith("INSTANT_ACTIONS_")}
-        self.assertEqual(lits["INSTANT_ACTIONS_MODE"], "shadow")
+        self.assertEqual(lits["INSTANT_ACTIONS_MODE"], "off")
         self.assertEqual(set(lits["INSTANT_ACTIONS_ALLOW"]), ia.RULE_ACTIONS)
 
     def test_every_allowed_name_is_a_registered_action(self):
@@ -341,12 +341,12 @@ class WiringTests(unittest.TestCase):
         sw = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(sw)
         row = sw.SCHEMA["INSTANT_ACTIONS_MODE"]
-        self.assertEqual(row["default"], "shadow")
+        self.assertEqual(row["default"], "off")
         self.assertEqual(list(row["choices"]), list(ia.MODES))
         self.assertIn("INSTANT_ACTIONS_MODE", sw.persisted_keys())
         with open(os.path.join(_ROOT, "tools", "user_settings.example.json"),
                   encoding="utf-8") as fh:
-            self.assertEqual(json.load(fh)["INSTANT_ACTIONS_MODE"], "shadow")
+            self.assertEqual(json.load(fh)["INSTANT_ACTIONS_MODE"], "off")
 
     def test_the_log_is_git_ignored(self):
         with open(os.path.join(_ROOT, ".gitignore"), encoding="utf-8") as fh:

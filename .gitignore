@@ -36,6 +36,8 @@ jarvis.lock
 jarvis_staging.lock
 *.singleton.lock
 .overnight_active
+# Runtime state: the upgrade-announcement signature the monolith writes.
+.last_upgrade_announced
 .jarvis_watcher_state
 
 # ─── Credentials & tokens (never commit) ───────────────────────────────────

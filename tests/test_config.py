@@ -62,17 +62,20 @@ class EnvDrivenTests(unittest.TestCase):
         self.assertEqual(mod.BAMBU_ACCESS_CODE, "")
         self.assertEqual(mod.BAMBU_SERIAL, "")
 
-    def test_smart_turn_mode_reads_env_and_ships_shadow(self):
+    def test_smart_turn_mode_reads_env_and_ships_off(self):
         # Speed plan R7: JARVIS_SMART_TURN picks off / shadow / on (any case,
-        # stray spaces); unset or blank is the shipped 'shadow'.
+        # stray spaces); unset or blank is the shipped 'off' (2026-10-12: nobody
+        # read the shadow log lines, so the diagnostic is opt-in).
         mod = self._reload_with_env(JARVIS_SMART_TURN=" On ")
         self.assertEqual(mod.SMART_TURN_MODE, "on")
         mod = self._reload_with_env(JARVIS_SMART_TURN="")
+        self.assertEqual(mod.SMART_TURN_MODE, "off")
+        mod = self._reload_with_env(JARVIS_SMART_TURN="shadow")
         self.assertEqual(mod.SMART_TURN_MODE, "shadow")
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("JARVIS_SMART_TURN", None)
             mod = importlib.reload(config)
-        self.assertEqual(mod.SMART_TURN_MODE, "shadow")
+        self.assertEqual(mod.SMART_TURN_MODE, "off")
 
     def test_env_only_secrets_are_never_applied_from_settings(self):
         # user_settings.json must NOT be able to override the env-only BAMBU

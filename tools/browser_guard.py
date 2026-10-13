@@ -15,7 +15,7 @@ Grepping ``tests/`` for ``webbrowser.open`` finds almost nothing, because the
 tests do not call it directly — they call PRODUCTION code that calls it
 (``core/actions.py:73`` ``webbrowser.open(url)``, the Apple Music launch path in
 ``bobert_companion._open_url_in_browser``, ``skills/youtube_search.py``,
-``skills/morning_handoff.py``, ``tray.py``'s ``os.startfile`` menu items, …).
+``skills/daily_briefing/handoff.py``, ``tray.py``'s ``os.startfile`` menu items, …).
 Per-call-site test patches are therefore NOT the fix. The fix is one
 process-wide interception, installed before a single test is imported.
 

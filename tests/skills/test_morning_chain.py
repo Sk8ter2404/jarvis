@@ -1,4 +1,4 @@
-"""Logic tests for skills/morning_chain.py.
+"""Logic tests for skills/daily_briefing/chain.py.
 
 The chain is the single controller that picks ONE of arrival/handoff/briefing
 per wake event. Tests cover the pure selection precedence (config by_weekday →
@@ -14,7 +14,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part
 
 
 class _LoopBreak(BaseException):
@@ -24,7 +24,7 @@ class _LoopBreak(BaseException):
 
 class MorningChainTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_chain")
+        self.mod, self.actions = load_briefing_part("chain")
 
     # ── _normalize_skill (pure) ──────────────────────────────────────────
     def test_normalize_strips_prefix_and_validates(self):
@@ -146,64 +146,53 @@ class MorningChainTests(unittest.TestCase):
     def test_arrival_v2_fired_today_true_when_v2_briefed(self):
         # morning_arrival_v2 is NOT in SKILL_NAMES; the chain must still see its
         # same-day fire (via this helper) so the two can't double-brief.
-        fake_v2 = types.ModuleType("skill_morning_arrival_v2")
+        fake_v2 = types.ModuleType("skill_daily_briefing.arrival_v2")
         fake_v2._already_fired_today = lambda: True
-        with mock.patch.dict(sys.modules, {"skill_morning_arrival_v2": fake_v2}):
+        with mock.patch.dict(sys.modules, {"skill_daily_briefing.arrival_v2": fake_v2}):
             self.assertTrue(self.mod._arrival_v2_fired_today())
 
     def test_arrival_v2_fired_today_false_when_v2_idle(self):
-        fake_v2 = types.ModuleType("skill_morning_arrival_v2")
+        fake_v2 = types.ModuleType("skill_daily_briefing.arrival_v2")
         fake_v2._already_fired_today = lambda: False
-        with mock.patch.dict(sys.modules, {"skill_morning_arrival_v2": fake_v2}):
+        with mock.patch.dict(sys.modules, {"skill_daily_briefing.arrival_v2": fake_v2}):
             self.assertFalse(self.mod._arrival_v2_fired_today())
 
     def test_arrival_v2_fired_today_defensive_on_error(self):
         # A broken v2 must never block a chain decision -> swallowed as False.
-        fake_v2 = types.ModuleType("skill_morning_arrival_v2")
+        fake_v2 = types.ModuleType("skill_daily_briefing.arrival_v2")
 
         def _boom():
             raise RuntimeError("v2 broke")
 
         fake_v2._already_fired_today = _boom
-        with mock.patch.dict(sys.modules, {"skill_morning_arrival_v2": fake_v2}):
+        with mock.patch.dict(sys.modules, {"skill_daily_briefing.arrival_v2": fake_v2}):
             self.assertFalse(self.mod._arrival_v2_fired_today())
 
 
 class MorningChainImportSkillTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_chain")
+        self.mod, self.actions = load_briefing_part("chain")
 
-    def test_import_via_skills_package(self):
-        sentinel = types.ModuleType("skills.morning_arrival")
-        with mock.patch.object(self.mod.importlib, "import_module",
-                               return_value=sentinel) as imp:
-            got = self.mod._import_skill("arrival")
-        self.assertIs(got, sentinel)
-        imp.assert_called_once_with("skills.morning_arrival")
+    def test_import_resolves_each_pick_to_its_package_part(self):
+        # The three picks live in sibling parts of the daily_briefing package
+        # (the briefing pick is light.py): the SAME instance the loader
+        # registered, never a second copy imported off the skills path.
+        for short, part in (("arrival", "arrival"), ("handoff", "handoff"),
+                            ("briefing", "light")):
+            sentinel = types.ModuleType(f"skill_daily_briefing.{part}")
+            with mock.patch.dict(sys.modules,
+                                 {f"skill_daily_briefing.{part}": sentinel}):
+                self.assertIs(self.mod._import_skill(short), sentinel, short)
 
-    def test_import_falls_back_to_bare_name(self):
-        sentinel = types.ModuleType("morning_handoff")
-
-        def _imp(name):
-            if name == "skills.morning_handoff":
-                raise ImportError("no skills pkg here")
-            if name == "morning_handoff":
-                return sentinel
-            raise AssertionError(f"unexpected import {name}")
-        with mock.patch.object(self.mod.importlib, "import_module",
-                               side_effect=_imp):
-            got = self.mod._import_skill("handoff")
-        self.assertIs(got, sentinel)
-
-    def test_import_both_paths_fail_returns_none(self):
-        with mock.patch.object(self.mod.importlib, "import_module",
+    def test_import_failure_returns_none(self):
+        with mock.patch.object(self.mod._common, "part",
                                side_effect=ImportError("nope")):
             self.assertIsNone(self.mod._import_skill("briefing"))
 
 
 class MorningChainInvokeSkillTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_chain")
+        self.mod, self.actions = load_briefing_part("chain")
 
     def test_invoke_returns_false_when_import_none(self):
         with mock.patch.object(self.mod, "_import_skill", return_value=None):
@@ -244,7 +233,7 @@ class MorningChainWatcherTests(unittest.TestCase):
     raises _LoopBreak to exit after the iteration(s) under test."""
 
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_chain")
+        self.mod, self.actions = load_briefing_part("chain")
         self._saved_bc = sys.modules.get("bobert_companion")
         self.addCleanup(self._restore)
 
@@ -398,7 +387,7 @@ class MorningChainOneBriefingTests(unittest.TestCase):
     TODAY = "2026-06-02"
 
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_chain")
+        self.mod, _ = load_briefing_part("chain")
         saved = sys.modules.get("bobert_companion")
         self.addCleanup(lambda: sys.modules.__setitem__("bobert_companion", saved)
                         if saved is not None else sys.modules.pop("bobert_companion", None))
@@ -510,7 +499,7 @@ class InvokeSkillDeclineTests(unittest.TestCase):
     sentinel, so a silence-gate decline no longer marks the day dispatched and
     skips the briefing."""
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_chain")
+        self.mod, _ = load_briefing_part("chain")
 
     def _invoke_with_fire(self, fire_fn, short="arrival"):
         fake = types.ModuleType("fake_chain_skill")
@@ -538,7 +527,7 @@ class InvokeSkillDeclineTests(unittest.TestCase):
 
 class MorningChainRegisterTests(unittest.TestCase):
     def test_register_adds_pick_action(self):
-        mod, actions = load_skill_isolated("morning_chain")
+        mod, actions = load_briefing_part("chain")
         self.assertIn("morning_chain_pick", actions)
 
 

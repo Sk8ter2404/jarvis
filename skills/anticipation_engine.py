@@ -158,7 +158,7 @@ def _enqueue_speech(message: str, offer: bool = False) -> None:
     (import-time / unit tests). Going through proactive_announce restores the
     shared-lock serialization, the focus / DND gate, and the 50-entry cap that a
     bare local write silently bypasses. Mirrors the exact pattern in
-    skills/wellness.py and skills/daily_recap.py so every co-writer of
+    skills/wellness.py and skills/daily_briefing/recap.py so every co-writer of
     pending_speech.json funnels through the same path. 2026-07-08.
     """
     try:

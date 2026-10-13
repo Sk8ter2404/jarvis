@@ -1,4 +1,4 @@
-"""Logic tests for skills/daily_briefing.py.
+"""Logic tests for skills/daily_briefing/__init__.py.
 
 Covers the briefing-text assembly (time phrase + weather/meeting/bambu extras,
 "nothing remarkable" empty path), the weather/meeting formatters that sit on
@@ -17,7 +17,7 @@ import time
 import unittest
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part
 
 _SENTINEL = object()
 
@@ -70,7 +70,7 @@ class _LoopBreak(BaseException):
 
 class DailyBriefingTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_briefing")
+        self.mod, self.actions = load_briefing_part("daily")
 
     # ── _format_time_phrase (pure) ───────────────────────────────────────
     def test_format_time_phrase(self):
@@ -226,7 +226,7 @@ class DailyBriefingTests(unittest.TestCase):
 
     # ── daily_briefing action ────────────────────────────────────────────
     def test_action_returns_and_enqueues(self):
-        mod, actions = load_skill_isolated("daily_briefing")
+        mod, actions = load_briefing_part("daily")
         with mock.patch.object(mod, "_build_briefing", return_value="Good morning, sir. test."), \
              mock.patch.object(mod, "_enqueue_speech") as enq, \
              mock.patch.object(mod, "_save_last_fired_date") as save:
@@ -236,7 +236,7 @@ class DailyBriefingTests(unittest.TestCase):
         save.assert_called_once()
 
     def test_action_handles_exception(self):
-        mod, actions = load_skill_isolated("daily_briefing")
+        mod, actions = load_briefing_part("daily")
         with mock.patch.object(mod, "_build_briefing", side_effect=RuntimeError("boom")):
             out = actions["daily_briefing"]("")
         self.assertIn("failed", out.lower())
@@ -245,7 +245,7 @@ class DailyBriefingTests(unittest.TestCase):
 class DailyEnqueueTests(unittest.TestCase):
     """_enqueue_speech — announcer path + atomic-write fallback variants."""
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_briefing")
+        self.mod, self.actions = load_briefing_part("daily")
 
     def test_enqueue_uses_bc_announcer(self):
         bc = types.ModuleType("bobert_companion")
@@ -310,7 +310,7 @@ class DailyEnqueueTests(unittest.TestCase):
 
 class DailyConfigStateTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_briefing")
+        self.mod, self.actions = load_briefing_part("daily")
 
     def test_read_config_from_bc(self):
         bc = types.ModuleType("bobert_companion")
@@ -399,7 +399,7 @@ class DailyConfigStateTests(unittest.TestCase):
 
 class DailyBriefingSourcesTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_briefing")
+        self.mod, self.actions = load_briefing_part("daily")
 
     def test_briefing_sources_relative_import(self):
         fake = types.ModuleType("briefing_sources")
@@ -425,7 +425,7 @@ class DailyBriefingSourcesTests(unittest.TestCase):
 
 class DailyWeatherMeetingEdgeTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_briefing")
+        self.mod, self.actions = load_briefing_part("daily")
 
     def test_fetch_weather_no_desc(self):
         # 20 C stored → 68 F spoken (20*9/5+32 = 68).
@@ -483,7 +483,7 @@ class DailyWeatherMeetingEdgeTests(unittest.TestCase):
 class DailyBambuBranchTests(unittest.TestCase):
     """Remaining _bambu_status branches."""
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_briefing")
+        self.mod, self.actions = load_briefing_part("daily")
 
     def _monitor(self, state, *, lock=None, strip=lambda s: "file", strip_raises=False):
         fake = types.ModuleType("skill_bambu_monitor")
@@ -616,7 +616,7 @@ class DailyBambuBranchTests(unittest.TestCase):
 
 class DailyUserAtDeskBranchTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_briefing")
+        self.mod, self.actions = load_briefing_part("daily")
 
     def test_no_snapshot_function(self):
         fake = types.ModuleType("skill_face_tracker")   # no _snapshot_state
@@ -656,7 +656,7 @@ class DailySchedulerTests(unittest.TestCase):
     """_wait_for_presence + _fire_briefing + _scheduler_loop gating, mirroring
     the proven single-iteration driver from test_evening_briefing.py."""
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_briefing")
+        self.mod, self.actions = load_briefing_part("daily")
 
     # ── _wait_for_presence ────────────────────────────────────────────────
     def test_wait_for_presence_none_returns_false_fast(self):
@@ -847,26 +847,26 @@ class DailySchedulerTests(unittest.TestCase):
 
 class DailyRegisterTests(unittest.TestCase):
     def test_register_enabled_starts_thread(self):
-        mod, _ = load_skill_isolated("daily_briefing", register=False)
+        mod, _ = load_briefing_part("daily", register=False)
         actions: dict = {}
         with mock.patch.object(mod, "_read_config",
                                return_value={"enabled": True, "hour": 8,
                                              "minute": 0, "wait_min": 30}), \
              mock.patch.object(mod.threading, "Thread") as Thread:
-            mod.register(actions)
+            mod._register_daily(actions)
         self.assertIn("daily_briefing", actions)
         Thread.assert_called_once()
         self.assertTrue(Thread.call_args.kwargs.get("daemon"))
         Thread.return_value.start.assert_called_once()
 
     def test_register_disabled_skips_thread(self):
-        mod, _ = load_skill_isolated("daily_briefing", register=False)
+        mod, _ = load_briefing_part("daily", register=False)
         actions: dict = {}
         with mock.patch.object(mod, "_read_config",
                                return_value={"enabled": False, "hour": 8,
                                              "minute": 0, "wait_min": 30}), \
              mock.patch.object(mod.threading, "Thread") as Thread:
-            mod.register(actions)
+            mod._register_daily(actions)
         self.assertIn("daily_briefing", actions)   # action still registered
         Thread.assert_not_called()
 
@@ -881,10 +881,10 @@ class DailyOneMorningBriefingTests(unittest.TestCase):
     _run_one_iteration = DailySchedulerTests._run_one_iteration
 
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_briefing")
+        self.mod, self.actions = load_briefing_part("daily")
 
     def _fake_v2(self, fired):
-        v2 = types.ModuleType("skill_morning_arrival_v2")
+        v2 = types.ModuleType("skill_daily_briefing.arrival_v2")
         v2._already_fired_today = lambda: fired
         return v2
 
@@ -902,8 +902,8 @@ class DailyOneMorningBriefingTests(unittest.TestCase):
 
     def test_stands_down_when_arrival_v2_already_briefed(self):
         fire, save = mock.MagicMock(), mock.MagicMock()
-        with inject_modules(skill_morning_arrival_v2=self._fake_v2(True),
-                            skill_morning_chain=None):
+        with inject_modules(**{"skill_daily_briefing.arrival_v2": self._fake_v2(True),
+                             "skill_daily_briefing.chain": None}):
             now = self._iteration(
                 fire, save,
                 _other_morning_briefing_fired_today=self.mod._other_morning_briefing_fired_today)
@@ -919,20 +919,22 @@ class DailyOneMorningBriefingTests(unittest.TestCase):
 
     def test_still_fires_when_nothing_briefed(self):
         fire, save = mock.MagicMock(), mock.MagicMock()
-        with inject_modules(skill_morning_arrival_v2=self._fake_v2(False),
-                            skill_morning_chain=None):
+        with inject_modules(**{"skill_daily_briefing.arrival_v2": self._fake_v2(False),
+                             "skill_daily_briefing.chain": None}):
             self._iteration(
                 fire, save,
                 _other_morning_briefing_fired_today=self.mod._other_morning_briefing_fired_today)
         fire.assert_called_once_with("user-present")
 
     def test_chain_flags_count_too(self):
-        mc = types.ModuleType("skill_morning_chain")
+        mc = types.ModuleType("skill_daily_briefing.chain")
         mc.SKILL_NAMES = ("arrival", "handoff", "briefing")
         mc._skill_already_fired_today = lambda n: n == "handoff"
-        with inject_modules(skill_morning_arrival_v2=None, skill_morning_chain=mc):
+        with inject_modules(**{"skill_daily_briefing.arrival_v2": None,
+                               "skill_daily_briefing.chain": mc}):
             self.assertTrue(self.mod._other_morning_briefing_fired_today())
-        with inject_modules(skill_morning_arrival_v2=None, skill_morning_chain=None):
+        with inject_modules(**{"skill_daily_briefing.arrival_v2": None,
+                               "skill_daily_briefing.chain": None}):
             self.assertFalse(self.mod._other_morning_briefing_fired_today())
 
     def test_owner_heard_only_for_present_or_manual_fires(self):

@@ -281,8 +281,8 @@ class ShippedDefaultsAreOwnerIdenticalTests(_BothFeaturesBase):
                     "FILLER_DUCK_HOLD", "PROCESSING_FILLER_SKIP_PLEASANTRIES",
                     "PROCESSING_FILLER_LATE_START_S"):
             self._p(bc, key, lits[key])
-        self.assertEqual(lits["INSTANT_ACTIONS_MODE"], "shadow")
-        self.assertEqual(lits["TURN_CHECK_MODE"], "shadow")
+        self.assertEqual(lits["INSTANT_ACTIONS_MODE"], "off")
+        self.assertEqual(lits["TURN_CHECK_MODE"], "off")
         for text, reply, followups in self.SCENARIOS:
             with self.subTest(text=text):
                 shipped = self._scenario(

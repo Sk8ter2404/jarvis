@@ -306,12 +306,12 @@ class OffModeTests(_InstantBase):
 
 class DefaultModeTests(_InstantBase):
 
-    def test_an_unknown_mode_value_is_shadow(self):
+    def test_an_unknown_mode_value_is_off(self):
         self._p(self.bc, "INSTANT_ACTIONS_MODE", "sometimes", create=True)
-        self.assertEqual(self.bc._instant_actions_mode(), "shadow")
+        self.assertEqual(self.bc._instant_actions_mode(), "off")
         out = self._run("pause the music")
         self.llm.assert_called_once()
-        self.assertIn("[instant] would run pause_music", out)
+        self.assertNotIn("[instant]", out)
 
     def test_the_log_path_is_the_staging_aware_data_dir(self):
         with mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": self.tmpdir}):

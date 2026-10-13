@@ -58,7 +58,8 @@ if _PROJECT not in sys.path:
 from tests._monolith_harness import (  # noqa: E402
     MonolithGlobalsTestCase, requires_monolith,
 )
-from tests._skill_harness import load_skill_isolated  # noqa: E402
+from tests._skill_harness import (load_briefing_part,  # noqa: E402
+                                  load_skill_isolated)
 
 
 class _Resp:
@@ -166,7 +167,16 @@ class _Base(MonolithGlobalsTestCase):
         self.assertNotIn("error", out, out.get("error"))
         return out.get("value"), log.getvalue()
 
+    # The briefings are parts of the one daily_briefing skill (2026-10-12).
+    _BRIEFING_PARTS = {"evening_briefing": "evening",
+                       "morning_briefing": "light",
+                       "morning_handoff": "handoff"}
+
     def _skill(self, name):
+        part = self._BRIEFING_PARTS.get(name)
+        if part is not None:
+            mod, _ = load_briefing_part(part, register=False)
+            return mod
         mod, _ = load_skill_isolated(name, register=False)
         return mod
 

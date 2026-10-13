@@ -4,7 +4,7 @@ Phase 2 of the modularisation refactor (2026-05-29). All mutable
 runtime state that used to live as top-level globals in
 bobert_companion.py now lives here. The parent module does
 `from core.state import *` so existing references like
-`bobert_companion._sleep_mode[0]` (used by skills/morning_chain.py,
+`bobert_companion._sleep_mode[0]` (used by skills/daily_briefing/chain.py,
 skills/anticipation_*, skills/wellness.py, skills/screen_watch.py)
 keep resolving — wildcard imports rebind every name in `__all__`
 into bobert_companion's namespace.
@@ -94,7 +94,7 @@ _overnight_run_now = threading.Event()
 _wake_history: list[float] = []
 
 # ISO date string of the most recent wake (or None). Wrapped in a
-# 1-element list because skills/morning_chain.py runs a background
+# 1-element list because skills/daily_briefing/chain.py runs a background
 # watcher thread that polls bc._last_wake_date[0] every
 # WATCH_POLL_SECONDS to detect the day's first wake event. The list
 # wrapper enforces a mutable-reference-sharing contract between this

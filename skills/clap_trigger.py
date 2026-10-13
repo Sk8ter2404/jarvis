@@ -7,7 +7,7 @@ click-versus-clap test is close to the line for some sounds (a mechanical
 key's multi-part click, a pen tap), so a false double clap must cost a line,
 never the desk. Once the owner has heard it answer only his claps, "clap
 trigger runs the morning setup" (clap_trigger_routine) or Settings switches the
-routine to the morning workspace setup (skills/morning_handoff.py's
+routine to the morning workspace setup (skills/daily_briefing/handoff.py's
 predictive_morning_setup — Chrome with Apple Music, Teams, the master volume)
 or the morning briefing.
 

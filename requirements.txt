@@ -133,7 +133,7 @@ paho-mqtt
 #     python -m skills.ms_graph --auth
 msal
 
-# News briefing skill — RSS / Atom feed parser used by skills/news_briefing.py
+# News briefing skill — RSS / Atom feed parser used by skills/daily_briefing/news.py
 # and pulled into morning_briefing/evening_briefing. Optional: the skill falls
 # back to a stdlib ElementTree parser if feedparser isn't installed, but
 # feedparser handles malformed feeds more robustly.

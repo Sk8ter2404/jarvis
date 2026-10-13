@@ -27,7 +27,7 @@ across conversations.
   an in-character "JARVIS" persona and tone-aware delivery.
 - **PC control** — open apps and URLs, search, take screenshots, click/type, focus
   windows, run code snippets.
-- **~95 skills** (auto-loaded from `skills/`), including: morning/evening
+- **~90 skills** (auto-loaded from `skills/`), including: morning/evening
   briefings, weather & news, timers & reminders, a notification triage engine,
   smart-home control (Hue, Kasa, LIFX, Govee, Nest, Ecobee, …), Bambu Lab
   3D-printer monitoring, Microsoft Teams/email helpers, OBS control, pattern

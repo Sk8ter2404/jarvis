@@ -37,8 +37,8 @@ self-upgrade safety) have the clearest gaps.
 the tray overhaul + standalone Settings GUI, the M3 self-upgrade safety gates, an
 **update checker** (boot nudge + the `check for updates` action), an **update
 wizard**, a first-run **setup wizard**, an automatic **PII pre-commit guard**, and
-M2 Phase 2 groundwork — the in-process **message bus** (`core/message_bus.py`,
-unwired) — plus the **M1 native-audio-service scaffold** (`native/jarvis-audio/`,
+M2 Phase 2 groundwork (the in-process message bus and its wire format were
+built, never wired, and removed 2026-10-12; `git log` has them) — plus the **M1 native-audio-service scaffold** (`native/jarvis-audio/`,
 Rust: the IPC protocol + a buildable service skeleton, cargo-tested; capture /
 wake / VAD next). (Heading range above: 1.1 → 1.6.)
 
@@ -76,8 +76,8 @@ shape for a file an LLM rewrites daily.
   rebinds cluster-by-cluster via the `core/actions._bc()` extraction seam.
 - The typed skill seam (`core/services.py`) is wired: the loader injects it
   into every skill as `services`, and two skills use it so far. Built, not
-  yet wired: the in-process bus (`core/message_bus.py`) and its
-  cross-process wire format (`core/bus_transport.py`).
+  yet wired: the in-process bus and its cross-process wire format were
+  removed 2026-10-12 as unused (recoverable from git history).
 
 ### M3 · Trustworthy self-evolution  ◐  ([PR: feat/safe-self-upgrade])
 The pipeline edits its own 101K-LOC brain unattended; the safety gaps were the

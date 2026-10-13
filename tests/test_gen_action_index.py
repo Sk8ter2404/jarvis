@@ -46,7 +46,7 @@ def _read(path):
 
 def _skill_sources():
     return (glob.glob(os.path.join(_PROJECT, "skills", "*.py"))
-            + glob.glob(os.path.join(_PROJECT, "skills", "*", "__init__.py")))
+            + glob.glob(os.path.join(_PROJECT, "skills", "*", "*.py")))
 
 
 class ScannerFormsTests(unittest.TestCase):

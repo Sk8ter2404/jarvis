@@ -207,6 +207,22 @@ class DenylistTests(unittest.TestCase):
         # browser tab on the page it saved.
         self.assertIn("build_website", smoke._DENYLIST_NAMES)
 
+    def test_the_handoff_workspace_actions_are_never_swept(self):
+        # morning_handoff became the handoff part of the daily_briefing
+        # package (2026-10-12). Its workspace actions arrange real windows, so
+        # they stay out of the sweep; the other parts' actions are not caught.
+        def handler(_=""):
+            return ""
+
+        handler.__module__ = "skill_daily_briefing.handoff"
+        self.assertTrue(smoke._spawns_desktop_windows(
+            "predictive_morning_setup", handler))
+        self.assertTrue(smoke._spawns_desktop_windows(
+            "setup_workspace", handler))
+        handler.__module__ = "skill_daily_briefing.news"
+        self.assertFalse(smoke._spawns_desktop_windows(
+            "news_briefing", handler))
+
 
 if __name__ == "__main__":
     unittest.main()

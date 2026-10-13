@@ -5,8 +5,8 @@ Fetches headlines from a configurable list of RSS feeds (tech, world, local
 weather alerts by default), optionally summarises each in one sentence via
 the Claude backend, and returns a JARVIS-style spoken briefing.
 
-Designed to be pulled into skills/morning_briefing.py and
-skills/evening_briefing.py — turning the one-line weather greeting into an
+Designed to be pulled into skills/daily_briefing/light.py and
+skills/daily_briefing/evening.py — turning the one-line weather greeting into an
 actual morning/evening intelligence briefing.
 
 Actions registered:
@@ -45,7 +45,7 @@ import urllib.error
 import urllib.request
 from xml.etree import ElementTree as ET
 
-_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 
 # Ensure the project root is importable so `core.atomic_io` resolves whether

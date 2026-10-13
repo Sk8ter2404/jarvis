@@ -131,11 +131,14 @@ _DENYLIST_NAMES = {
 # they only close/query windows.
 _DENYLIST_MODULES = ("holographic_overlay", "dossier", "suit_up",
                      "night_owl_mode",
-                     # morning_handoff's workspace actions ARRANGE REAL
-                     # WINDOWS via win32 (launch apps, move/minimize,
-                     # volume) — the 2026-07-11 sweep minimized the live
-                     # JARVIS HUD through this path.
-                     "morning_handoff",
+                     # the daily briefing's handoff part (was the
+                     # morning_handoff skill): its workspace actions ARRANGE
+                     # REAL WINDOWS via win32 (launch apps, move/minimize,
+                     # volume) - the 2026-07-11 sweep minimized the live
+                     # JARVIS HUD through this path. Matched on the part's
+                     # module name, so the briefings in the other parts are
+                     # not swept out with it.
+                     "daily_briefing.handoff",
                      # every youtube_search action opens a real browser tab
                      "youtube_search",
                      # show_globe / globe_pin open the holographic globe
