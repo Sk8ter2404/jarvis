@@ -17,8 +17,23 @@ GESTURE → ACTION MAP
                SPOKEN yes; a raised hand is a stretch or a hand on the head as
                often as it is a signal, and it can be anyone the Kinect sees.
                With something pending it reminds the owner to say yes.
-  SWIPE      → "never mind": interrupt any current TTS and clear a pending
-               confirmation. The stop/cancel path.
+  SWIPE      → "never mind" when there is something to dismiss (interrupt
+               current TTS, clear a pending confirmation); otherwise (2026-10-12)
+               next / previous track via the media keys (KINECT_SWIPE_MODE
+               "media", the default; "desktop" switches virtual desktops;
+               "dismiss" keeps only the never-mind; "off" ignores swipes).
+               A swipe to the owner's right is "next".
+  TWO_HAND_X → both wrists crossed in front of the upper chest, held ~0.8 s, once
+               per pose: close the focused window (KINECT_TWO_HAND_CLOSE_ENABLED)
+               under close_window's safety rules (never a terminal, JARVIS's own
+               window, the shell or a fullscreen window; a browser closes only its
+               active tab; not while the real mouse/keyboard is in use).
+  POINT      → one arm held out aimed steady with the Kinect two-finger "lasso"
+               hand state (KINECT_POINT_MONITOR_ENABLED): pick the monitor it
+               points at - move the cursor there and/or focus its top window
+               (KINECT_POINT_MONITOR_ACTION).
+Every recognised gesture logs a "[gesture] <name> ..." line so the unused ones can
+be dropped later.
 
 EVERYTHING is opt-in + safe:
   • The whole loop is gated by core.config.KINECT_GESTURES_ENABLED (default
@@ -308,18 +323,321 @@ def _speak(bc, text: str) -> None:
         pass
 
 
-# Map each recognizer gesture name onto its handler. Swipe-left and swipe-right
-# both dismiss (direction is irrelevant for "never mind").
-def _dispatch(bc, gesture: str) -> None:
+# ─── new gestures (2026-10-12): swipe = track / desktop, X = close, point = monitor
+# Every recognised gesture logs one "[gesture] <name> ..." line (plus one outcome
+# line for the acting ones) so the gestures that never get used can be dropped.
+
+_SWIPE_MODES = ("media", "desktop", "dismiss", "off")
+_ACTION_BLOCK_INPUT_S = 1.5       # real mouse/keyboard this recently -> don't act
+_last_point_monitor: dict = {"monitor": None, "ts": 0.0}
+
+
+def _cfg_str(name: str, default: str) -> str:
+    try:
+        from core import config as _cfg
+        return str(getattr(_cfg, name, default) or default).strip().lower()
+    except Exception:
+        return default
+
+
+def _cfg_float(name: str, default: float) -> float:
+    try:
+        from core import config as _cfg
+        return float(getattr(_cfg, name, default))
+    except Exception:
+        return default
+
+
+def _swipe_mode() -> str:
+    mode = _cfg_str("KINECT_SWIPE_MODE", "media")
+    return mode if mode in _SWIPE_MODES else "media"
+
+
+def _enabled_gestures() -> frozenset:
+    """The gesture names the recognizer may fire right now, from the per-gesture
+    settings (read live). WAVE and RAISE_HAND have no switch of their own."""
+    kg = _recognizer_module()
+    if kg is None:
+        return frozenset()
+    on = {kg.WAVE, kg.RAISE_HAND}
+    if _swipe_mode() != "off":
+        on.update((kg.SWIPE_LEFT, kg.SWIPE_RIGHT))
+    if _cfg_flag("KINECT_TWO_HAND_CLOSE_ENABLED", True):
+        on.add(kg.TWO_HAND_X)
+    if _cfg_flag("KINECT_POINT_MONITOR_ENABLED", True):
+        on.add(kg.POINT)
+    return frozenset(on)
+
+
+def _log_gesture(gesture: str, msg: str = "") -> None:
+    print(f"  [gesture] {gesture}" + (f" {msg}" if msg else ""))
+
+
+def _air_mouse_skill():
+    return sys.modules.get("skill_kinect_air_mouse")
+
+
+def _real_input_recent() -> bool:
+    """The owner is on the real mouse/keyboard (the air-mouse's own yield
+    watcher). False when it is unavailable. NEVER raises."""
+    try:
+        fn = getattr(_air_mouse_skill(), "real_input_recent", None)
+        return bool(fn(_ACTION_BLOCK_INPUT_S)) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _per_app_blocked() -> bool:
+    """A fullscreen game / video the air-mouse stands down over is in front.
+    False when unknown. NEVER raises."""
+    try:
+        fn = getattr(_air_mouse_skill(), "_per_app_disabled", None)
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _press_hotkey(bc, *keys) -> bool:
+    try:
+        getter = getattr(bc, "_get_pyautogui", None)
+        pag = getter() if callable(getter) else None
+        if pag is None:
+            return False
+        guard = getattr(bc, "_ui_safe", None)
+        if callable(guard):
+            guard(pag, pag.hotkey, *keys)
+        else:
+            pag.hotkey(*keys)
+        return True
+    except Exception as e:
+        print(f"  [gesture] hotkey {'+'.join(keys)} failed: {e}")
+        return False
+
+
+def _media_step(bc, forward: bool) -> str:
+    """Next / previous track through the SAME action the voice commands use."""
+    name = "_act_media_next" if forward else "_act_media_prev"
+    fn = getattr(bc, name, None)    # the monolith re-exports core.actions' _act_*
+    if not callable(fn):
+        return "no media action available"
+    try:
+        return str(fn("") or "sent")
+    except Exception as e:
+        return f"failed: {e}"
+
+
+def _do_swipe_action(bc, gesture: str) -> None:
+    """SWIPE -> (1) 'never mind' when there is speech to stop or a confirmation to
+    cancel, else (2) next / previous track (KINECT_SWIPE_MODE 'media', default) or
+    the next / previous virtual desktop ('desktop'). Facing the sensor, a swipe to
+    the owner's right is 'next'. 'dismiss' keeps only the old never-mind."""
+    mode = _swipe_mode()
+    if mode == "off":
+        _log_gesture(gesture, "-> ignored (KINECT_SWIPE_MODE=off)")
+        return
+    if _do_swipe(bc):
+        _log_gesture(gesture, "-> never mind (stopped speech / cancelled a pending yes)")
+        return
+    if mode == "dismiss":
+        _log_gesture(gesture, "-> nothing to dismiss")
+        return
+    kg = _recognizer_module()
+    forward = gesture == getattr(kg, "SWIPE_RIGHT", "swipe_right")
+    if mode == "desktop":
+        ok = _press_hotkey(bc, "ctrl", "win", "right" if forward else "left")
+        _log_gesture(gesture, "-> desktop " + ("right" if forward else "left")
+                     + ("" if ok else " (key press failed)"))
+        return
+    res = _media_step(bc, forward)
+    _log_gesture(gesture, "-> " + ("next" if forward else "previous")
+                 + f" track ({res})")
+
+
+def _focused_window():
+    """The foreground window as a pygetwindow object, or None."""
+    try:
+        import pygetwindow as gw
+        return gw.getActiveWindow()
+    except Exception:
+        return None
+
+
+def _is_fullscreen(w) -> bool:
+    """The window covers a whole monitor exactly (a fullscreen game / video, not
+    a merely maximised app)."""
+    try:
+        from core import config as _cfg
+        rect = (int(w.left), int(w.top), int(w.width), int(w.height))
+        return any(tuple(int(v) for v in tuple(r)[:4]) == rect
+                   for r in dict(getattr(_cfg, "MONITORS", {}) or {}).values())
+    except Exception:
+        return False
+
+
+def _do_close_focused(bc) -> str:
+    """TWO_HAND_X -> close the focused window, under close_window's safety rules
+    (core.actions): JARVIS's own and the shell's windows, anything FORBIDDEN_TARGETS
+    names and any console / terminal are refused; a browser window closes only its
+    active tab; everything else gets the X-button close (WM_CLOSE: an app may ask
+    to save, never a kill). Also refused while JARVIS is dormant, while the real
+    mouse/keyboard is in use, and over a fullscreen window. Returns the outcome."""
+    kg = _recognizer_module()
+    name = getattr(kg, "TWO_HAND_X", "two_hand_x")
+
+    def _out(msg: str, say: str = "") -> str:
+        _log_gesture(name, "-> " + msg)
+        if say:
+            _speak(bc, say)
+        return msg
+
+    try:
+        if _in_standby(bc):
+            return _out("ignored: JARVIS is dormant")
+        if _real_input_recent():
+            return _out("ignored: the real mouse/keyboard is in use")
+        w = _focused_window()
+        if w is None:
+            return _out("no focused window")
+        title = str(getattr(w, "title", "") or "")
+        from core import actions as act
+        if not act._window_scope.user_windows([w]):
+            return _out(f"refused: {title!r} is the desktop or one of JARVIS's own windows")
+        forbidden = [str(t).lower() for t in (getattr(bc, "FORBIDDEN_TARGETS", ()) or ()) if t]
+        if any(t in title.lower() for t in forbidden):
+            return _out(f"refused: {title!r} may be the window running JARVIS")
+        if act._is_terminal_window(w):
+            return _out(f"refused: {title!r} is a terminal",
+                        "I won't close a terminal with a gesture, sir.")
+        if _is_fullscreen(w) or _per_app_blocked():
+            return _out(f"refused: {title!r} is fullscreen",
+                        "That one is fullscreen, sir; I'll leave it.")
+        label = act._app_label(title)
+        page = act._browser_page_title(bc, title)
+        if page is not None:
+            ok = act._close_browser_tab(bc, w)
+            if ok:
+                return _out(f"closed the active tab of {label!r}", "Closed that tab, sir.")
+            return _out(f"could not reach the active tab of {label!r}")
+        outcome = act._send_close(w)
+        if outcome == "closed":
+            return _out(f"closed {title!r}", f"Closed {label}, sir.")
+        if outcome == "denied":
+            return _out(f"denied: {title!r} runs as administrator",
+                        f"{label} runs as administrator, sir; Windows won't let me close it.")
+        return _out(f"close failed for {title!r}")
+    except Exception as e:
+        return _out(f"error: {e}")
+
+
+def _monitor_rects() -> dict:
+    try:
+        from core import config as _cfg
+        return dict(getattr(_cfg, "MONITORS", {}) or {})
+    except Exception:
+        return {}
+
+
+def _set_cursor_pos(x: int, y: int) -> bool:
+    """Move the OS cursor (virtual-desktop pixels, negative allowed)."""
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.SetCursorPos(int(x), int(y)))
+    except Exception:
+        return False
+
+
+def _focus_top_window_on(monitor: str) -> str:
+    """Bring the top-most window of the owner's on `monitor` to the front.
+    Returns its title, or '' when there is none / it would not come forward."""
+    try:
+        import pygetwindow as gw
+        from core import actions as act
+        for w in act._window_scope.user_windows(gw.getAllWindows()):
+            if getattr(w, "isMinimized", False) is True:
+                continue
+            if not act._on_monitor(w, monitor):
+                continue
+            title = str(getattr(w, "title", "") or "")
+            try:
+                w.activate()
+            except Exception:
+                return ""
+            return title
+    except Exception:
+        pass
+    return ""
+
+
+def get_last_point_monitor() -> dict:
+    """{'monitor': name|None, 'ts': monotonic} of the monitor the last POINT
+    picked (a copy)."""
+    return dict(_last_point_monitor)
+
+
+def _do_point(bc, detail: "dict | None") -> str:
+    """POINT -> pick the monitor the arm is aimed at: move the cursor to its
+    centre and/or bring its top window forward (KINECT_POINT_MONITOR_ACTION).
+    Skipped while JARVIS is dormant or the real mouse/keyboard is in use."""
+    kg = _recognizer_module()
+    name = getattr(kg, "POINT", "point")
+    detail = detail or {}
+    try:
+        az = float(detail.get("azimuth_deg", 0.0))
+        el = float(detail.get("elevation_deg", 0.0))
+    except (TypeError, ValueError):
+        _log_gesture(name, "-> no aim")
+        return "no aim"
+    monitors = _monitor_rects()
+    mon = (kg.monitor_for_aim(az, el, monitors,
+                              _cfg_float("KINECT_POINT_MONITOR_BIN_DEG",
+                                         kg.POINT_MONITOR_BIN_DEG))
+           if kg is not None else None)
+    aim = f"(azimuth {az:+.0f} deg, elevation {el:+.0f} deg)"
+    if mon is None:
+        _log_gesture(name, f"-> no monitor layout {aim}")
+        return "no monitor"
+    if _in_standby(bc):
+        _log_gesture(name, f"-> {mon}: ignored, JARVIS is dormant {aim}")
+        return "dormant"
+    if _real_input_recent():
+        _log_gesture(name, f"-> {mon}: ignored, the real mouse/keyboard is in use {aim}")
+        return "input"
+    action = _cfg_str("KINECT_POINT_MONITOR_ACTION", "cursor")
+    did = []
+    if action in ("cursor", "both"):
+        x, y, w, h = (int(v) for v in tuple(monitors[mon])[:4])
+        if _set_cursor_pos(x + w // 2, y + h // 2):
+            did.append("cursor moved")
+        else:
+            did.append("cursor move failed")
+    if action in ("focus", "both"):
+        title = _focus_top_window_on(mon)
+        did.append(f"focused {title!r}" if title else "no window to focus")
+    _last_point_monitor["monitor"] = mon
+    _last_point_monitor["ts"] = time.monotonic()
+    _log_gesture(name, f"-> {mon} monitor: {', '.join(did) or 'picked'} {aim}")
+    return mon
+
+
+# Map each recognizer gesture name onto its handler. A swipe is the "never mind"
+# when there is something to dismiss, else track / desktop navigation.
+def _dispatch(bc, gesture: str, detail: "dict | None" = None) -> None:
     kg = _recognizer_module()
     if kg is None:
         return
+    _log_gesture(gesture, "recognised")
     if gesture == kg.WAVE:
         _do_wave(bc)
     elif gesture == kg.RAISE_HAND:
         _do_raise_hand(bc)
     elif gesture in (kg.SWIPE_LEFT, kg.SWIPE_RIGHT):
-        _do_swipe(bc)
+        _do_swipe_action(bc, gesture)
+    elif gesture == kg.TWO_HAND_X:
+        if _cfg_flag("KINECT_TWO_HAND_CLOSE_ENABLED", True):
+            _do_close_focused(bc)
+    elif gesture == kg.POINT:
+        if _cfg_flag("KINECT_POINT_MONITOR_ENABLED", True):
+            _do_point(bc, detail)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -344,6 +662,8 @@ _GESTURE_LABELS = {
     "raise_hand": "RAISE HAND",
     "swipe_left": "SWIPE",
     "swipe_right": "SWIPE",
+    "two_hand_x": "CLOSE",
+    "point": "POINT",
 }
 
 
@@ -515,6 +835,17 @@ def _poll_once(rec, bc) -> str | None:
         bodies = _owner_bodies(kb)
     except Exception:
         return None
+    # Narrow the recognizer to the gestures whose settings are on (read live), so a
+    # switched-off gesture neither fires nor burns the shared cooldown.
+    try:
+        set_enabled = getattr(rec, "set_enabled", None)
+        if callable(set_enabled):
+            set_enabled(_enabled_gestures())
+        set_lasso = getattr(rec, "set_require_lasso", None)
+        if callable(set_lasso):
+            set_lasso(_cfg_flag("KINECT_POINT_REQUIRE_LASSO", True))
+    except Exception:
+        pass
     try:
         gesture = rec.update(bodies)
     except Exception:
@@ -533,7 +864,8 @@ def _poll_once(rec, bc) -> str | None:
     if bc is None:
         return gesture
     try:
-        _dispatch(bc, gesture)
+        detail = getattr(rec, "last_detail", None)
+        _dispatch(bc, gesture, detail if isinstance(detail, dict) else None)
     except Exception as e:   # pragma: no cover - defensive: dispatch swallows internally
         print(f"  [gestures] dispatch error: {e}")
     return gesture
@@ -616,7 +948,7 @@ def gesture_status(_: str = "") -> str:
     view. 'what gestures can you see' / 'is gesture control on'."""
     enabled = _cfg_flag("KINECT_GESTURES_ENABLED")
     in_view = _body_in_view()
-    gestures = "wave to wake me, or swipe to cancel"
+    gestures = "wave to wake me, swipe to skip a track or cancel"
     if not enabled:
         return ("Gesture control is off, sir — say 'turn on gesture control' to "
                 f"enable it. Once on, you can {gestures}.")

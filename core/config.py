@@ -1754,8 +1754,10 @@ KINECT_GAZE_ENABLED = False
 # KINECT_GESTURES_ENABLED — when True, a background poller reads the Kinect
 #   skeleton stream (~18 Hz) and maps discrete gestures to actions: WAVE wakes
 #   JARVIS from standby and a SWIPE dismisses/cancels (stop speech + clear the
-#   pending confirmation). RAISE_HAND never confirms (2026-10-01: a stretch or
-#   a guest's raised hand ran destructive actions) - it only reminds you that a
+#   pending confirmation) or, when nothing is pending, skips a track (see
+#   KINECT_SWIPE_MODE, KINECT_TWO_HAND_CLOSE_ENABLED,
+#   KINECT_POINT_MONITOR_ENABLED). RAISE_HAND never confirms (2026-10-01: a
+#   stretch or a guest's raised hand ran destructive actions) - it only reminds you that a
 #   pending action needs a spoken "yes". Off by default; never runs in
 #   staging/test. See
 #   audio/kinect_gestures.py (recognizer) + skills/kinect_gestures.py (wiring).
@@ -1853,6 +1855,10 @@ AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC = 0.15
 #   it. ~120 s. 0 restores the old latch-forever behaviour.
 AIR_MOUSE_ARM_TIMEOUT_SEC = 120.0
 # ─── PASSIVE ACQUIRE REACH CONJUNCT (2026-09-04) ──────────────────────────────
+# 2026-10-12: ALL THREE bars below now default to 0 (OFF). The owner no longer
+# wants to push an arm OUT to take the cursor: the passive gate is a hand raised
+# above the shoulder + an OPEN palm + a brief hold (+ facing + still). Set a bar
+# above 0 to bring that half of the conjunct back.
 # The PASSIVE gate's other tests (open palm, facing, still) are all satisfied MORE
 # easily by someone sitting motionless than by someone reaching, so a raised hand
 # above the shoulder line was effectively the ONLY requirement — and any relaxed
@@ -1865,16 +1871,16 @@ AIR_MOUSE_ARM_TIMEOUT_SEC = 120.0
 #   position-independent (the same gesture measures less forward reach the farther
 #   away the owner sits). RAISE if a resting posture still takes the cursor; LOWER
 #   if a genuine reach fails to; 0 disables the forward half.
-AIR_MOUSE_ENGAGE_REACH_RATIO = 0.50
+AIR_MOUSE_ENGAGE_REACH_RATIO = 0.0
 # AIR_MOUSE_ENGAGE_REACH_M — absolute forward-reach fallback in metres, used only
 #   when no shoulder span / torso height is measurable this frame.
-AIR_MOUSE_ENGAGE_REACH_M = 0.20
+AIR_MOUSE_ENGAGE_REACH_M = 0.0
 # AIR_MOUSE_ENGAGE_STRAIGHT — arm straightness (shoulder→hand chord ÷ arm length,
 #   0..1) required to engage. A pure ratio of the owner's own arm, so it is immune
 #   to distance AND to torso lean — unlike forward reach, whose spine reference
 #   shifts when he sits back. A reach extends the elbow; a resting arm is folded.
 #   0 disables the elbow half.
-AIR_MOUSE_ENGAGE_STRAIGHT = 0.85
+AIR_MOUSE_ENGAGE_STRAIGHT = 0.0
 # AIR_MOUSE_GRIP_CLOSE_FRAMES — LEGACY, used only when the bridge has no shared
 #   hand stabiliser; the live press rule is KINECT_GRIP_CLOSE_SEC +
 #   KINECT_GRIP_CLOSE_MIN_VOTES below (High-confidence REAL frames, not polls).
@@ -2093,6 +2099,40 @@ KINECT_SNAPSHOT_STALE_SEC = 0.60
 #   down can't fire a SWIPE (which cancels speech and a pending confirmation).
 #   0.5 s.
 KINECT_GESTURE_RELEASE_MUTE_SEC = 0.5
+# ─── Per-gesture settings (2026-10-12; all need KINECT_GESTURES_ENABLED) ─────
+# Every recognised gesture is logged as "[gesture] <name> ..." so the unused ones
+# can be dropped later. Each gesture below has its OWN switch.
+# KINECT_SWIPE_MODE — what a swipe does. Facing the sensor, a swipe to YOUR right
+#   is "next" and to your left is "previous".
+#     "media"   (default) next / previous track (the media keys)
+#     "desktop" switch virtual desktop right / left (Win+Ctrl+Arrow)
+#     "dismiss" the old "never mind" only (stop speech, clear a pending yes)
+#     "off"     swipes are ignored
+#   In "media" and "desktop" a swipe made while JARVIS is speaking, or while a
+#   confirmation is pending, is still the "never mind" and does nothing else.
+KINECT_SWIPE_MODE = "media"
+# KINECT_TWO_HAND_CLOSE_ENABLED — hold both wrists CROSSED in front of the upper
+#   chest (an X) for ~0.8 s to close the focused window, once per pose. Same
+#   safety rules as the close_window action: the window gets the X-button close
+#   (an app may ask to save), a browser window closes only its active tab, and a
+#   terminal, JARVIS's own window, the desktop/taskbar and a fullscreen window are
+#   never closed. Ignored while the real mouse/keyboard is in use. True.
+KINECT_TWO_HAND_CLOSE_ENABLED = True
+# KINECT_POINT_MONITOR_ENABLED — hold one arm out, pointing with two fingers (the
+#   Kinect "lasso" hand state), at a monitor for ~0.8 s to pick it.
+KINECT_POINT_MONITOR_ENABLED = True
+# KINECT_POINT_MONITOR_ACTION — what picking a monitor does: "cursor" (default,
+#   move the mouse pointer to the middle of that monitor), "focus" (bring the top
+#   window on that monitor to the front) or "both".
+KINECT_POINT_MONITOR_ACTION = "cursor"
+# KINECT_POINT_REQUIRE_LASSO — the point must read the Kinect two-finger "lasso"
+#   hand state. True (default): a reach for the keyboard can never pick a monitor.
+#   False: any arm held out and aimed steady counts (the lasso read is flaky).
+KINECT_POINT_REQUIRE_LASSO = True
+# KINECT_POINT_MONITOR_BIN_DEG — how wide, in degrees of arm swing, one monitor
+#   in the row is. 24 puts three side-by-side monitors at left < -12 deg < middle
+#   < +12 deg < right, matching the gaze mapping. Widen if you must swing too far.
+KINECT_POINT_MONITOR_BIN_DEG = 24.0
 # KINECT_GREET_ON_ENTRY — when True (and presence is enabled), JARVIS speaks a
 #   brief varied greeting when you enter a room that had been empty for a while.
 #   Hard rate-limited (≤ once/min) and skipped mid-conversation. Off by default.
