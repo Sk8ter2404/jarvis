@@ -23,8 +23,20 @@ file is the live wiring around them:
   • exposes is_tv_on() — the public predicate _ambient_media_is_playing() OR's in;
   • voice actions to calibrate the region, report status, and toggle the flag.
 
-EVERYTHING is opt-in + safe (mirrors skills/kinect_pointing.py):
-  • Gated by core.config.TV_DETECT_ENABLED (default False), re-read each call so a
+2026-10-12 - ON BY DEFAULT, SAMPLED IN THE BACKGROUND, LOGGED
+  The detector used to be asked only when an utterance reached the ambient gate
+  or the clap gate, so it never held enough fresh readings (it needs 3 lit,
+  moving frames inside 8 s) and could not reach ON; and the "previous frame" of
+  a sparse call could be minutes old, so a person moving between two far-apart
+  samples read as flicker. Now a daemon thread (started by register()) samples
+  the cached frame about once a second while TV_DETECT_ENABLED is on, drops a
+  previous frame older than PREV_FRAME_MAX_AGE_S, and logs every change of
+  verdict and every loss/return of the camera feed with the numbers it saw
+  ("[tv-detect] TV ON (luma 118, motion 9.4, 4/5 frames)"). The thread only
+  reads a cached array: it opens no camera and never blocks the voice loop.
+
+EVERYTHING is safe (mirrors skills/kinect_pointing.py):
+  • Gated by core.config.TV_DETECT_ENABLED (default True since 2026-10-12), re-read each call so a
     Settings/voice toggle takes effect with no restart. With it off, is_tv_on()
     is always False and NO frame is ever read.
   • PURELY a suppression signal: it can only veto ambient learning, never trigger
@@ -47,6 +59,7 @@ Voice actions:
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -59,6 +72,14 @@ import time
 # called from the ambient gate which itself fires per overheard utterance, so we
 # rate-limit the actual pixel work here rather than recompute every call.
 POLL_MIN_INTERVAL_S = 1.0
+# The background sampler's cadence while enabled / while disabled (a live
+# "turn on tv detection" is noticed within this long).
+SAMPLER_INTERVAL_S = 1.0
+SAMPLER_IDLE_INTERVAL_S = 5.0
+# A previous frame older than this is not a basis for a temporal delta (the
+# poller was not running, or the camera fed nothing): the delta of two frames
+# minutes apart measures the room changing, not a screen flickering.
+PREV_FRAME_MAX_AGE_S = 5.0
 # Calibration: sample a few frames to confirm the camera is actually feeding
 # (we don't auto-find the TV rectangle — the owner frames it; v1 stores the WHOLE
 # current frame as the region, which is the safe default, and the rectangle is
@@ -82,8 +103,17 @@ def _detect_module():
 
 
 def _bc():
-    """Live monolith module (main or by-name), or None."""
-    return sys.modules.get("__main__") or sys.modules.get("bobert_companion")
+    """Live monolith module (main or by-name), or None. Whichever candidate
+    actually carries the camera frame cache wins, so a stray __main__ (a test
+    runner, a launcher) is never mistaken for the monolith."""
+    cands = (sys.modules.get("bobert_companion"), sys.modules.get("__main__"))
+    for m in cands:
+        if m is not None and hasattr(m, "_camera_latest_frame"):
+            return m
+    for m in cands:
+        if m is not None:
+            return m
+    return None
 
 
 def _cfg_flag(name: str, default: bool = False) -> bool:
@@ -121,7 +151,13 @@ def _store():
 _decider_lock = threading.Lock()
 _decider = None              # audio.tv_detect.TVDecider, lazily built
 _prev_frame = [None]         # list-box: the previous sampled frame (for delta)
+_prev_frame_at = [0.0]       # list-box: monotonic ts the previous frame was sampled
 _last_poll = [0.0]           # list-box: monotonic ts of the last pixel sample
+_last_reading = {"brightness": None, "delta": None, "at": 0.0}
+_feed_ok = [None]            # camera feed state last logged: True / False / None
+_verdict_logged = [False]    # TV verdict last logged
+_sampler = [None]            # the background sampler Thread
+_sampler_stop = [threading.Event()]
 
 
 def _get_decider():
@@ -186,12 +222,50 @@ def _snapshot_primary_frame():
     return frame, age
 
 
+def _note_feed(ok: bool, why: str = "") -> None:
+    """Log the camera feed appearing / disappearing, once per change."""
+    if _feed_ok[0] is ok:
+        return
+    _feed_ok[0] = ok
+    if ok:
+        print("  [tv-detect] camera frames available - watching for a lit, "
+              "moving screen")
+    else:
+        print(f"  [tv-detect] no usable camera frame ({why or 'none cached'})"
+              " - cannot see a TV until one is feeding")
+
+
+def _note_verdict(decider) -> None:
+    """Log a change of the TV verdict with the numbers behind it."""
+    try:
+        on = bool(decider.is_on(now=time.time()))
+    except Exception:
+        return
+    if on == _verdict_logged[0]:
+        return
+    _verdict_logged[0] = on
+    b, d = _last_reading["brightness"], _last_reading["delta"]
+    try:
+        dbg = decider.debug_state(time.time())
+        evidence = f"{dbg['qualifying']}/{dbg['fresh_readings']} frames"
+    except Exception:
+        evidence = "?"
+    nums = (f"luma {b:.0f}, motion {d:.1f}, " if b is not None and d is not None
+            else "")
+    if on:
+        print(f"  [tv-detect] TV ON ({nums}{evidence}) - ambient learning and "
+              f"double-clap are held off while it plays")
+    else:
+        print(f"  [tv-detect] TV OFF ({nums}{evidence})")
+
+
 def _poll_once(now_fn=None) -> None:
     """Sample the cached frame at most once per POLL_MIN_INTERVAL_S, compute its
     brightness + temporal delta vs the previous sample over the calibrated
-    region, and feed the reading to the decider. Best-effort + silent — any error
+    region, and feed the reading to the decider. Best-effort - any error
     leaves the decider untouched (a gap reads as a non-qualifying frame as it
-    ages out). Holds _decider_lock for the (cheap) update. `now_fn` defaults to
+    ages out); changes of the verdict and of the camera feed are logged. Holds
+    _decider_lock for the (cheap) update. `now_fn` defaults to
     ``time.monotonic`` resolved AT CALL TIME (not bound as a default) so a test
     can patch the module clock and have it honoured here."""
     td = _detect_module()
@@ -204,12 +278,16 @@ def _poll_once(now_fn=None) -> None:
             return
         _last_poll[0] = now
         frame, age = _snapshot_primary_frame()
-        # No frame, or a stale one (camera stopped feeding) → record a
+        # No frame, or a stale one (camera stopped feeding) -> record a
         # non-qualifying reading so a frozen last-frame can't latch the verdict.
         if frame is None or (age is not None and age > td.READING_MAX_AGE_S):
+            _note_feed(False, "stale" if frame is not None else "")
             decider.observe(None, None)
             _prev_frame[0] = None
+            _last_reading.update(brightness=None, delta=None, at=time.time())
+            _note_verdict(decider)
             return
+        _note_feed(True)
         region = None
         store = _store()
         if store is not None:
@@ -219,9 +297,52 @@ def _poll_once(now_fn=None) -> None:
                 region = None
         brightness = td.frame_brightness(frame, region)
         prev = _prev_frame[0]
+        if prev is not None and (now - _prev_frame_at[0]) > PREV_FRAME_MAX_AGE_S:
+            prev = None             # too old to measure flicker against
         delta = td.frame_temporal_delta(prev, frame, region) if prev is not None else None
         decider.observe(brightness, delta)
         _prev_frame[0] = frame
+        _prev_frame_at[0] = now
+        _last_reading.update(brightness=brightness, delta=delta, at=time.time())
+        _note_verdict(decider)
+
+
+def _sampler_loop(stop: threading.Event) -> None:
+    """Keep the decider fed: one cheap cached-frame sample a second while
+    TV detection is on. Never raises; ends when `stop` is set."""
+    while not stop.is_set():
+        try:
+            if _detect_enabled():
+                _poll_once()
+                stop.wait(SAMPLER_INTERVAL_S)
+                continue
+        except Exception as exc:    # pragma: no cover - defensive
+            print(f"  [tv-detect] sampler error {type(exc).__name__}: {exc}")
+        stop.wait(SAMPLER_IDLE_INTERVAL_S)
+
+
+def start_sampler() -> bool:
+    """Start the background sampler (idempotent). False if already running."""
+    t = _sampler[0]
+    if t is not None and t.is_alive():
+        return False
+    evt = threading.Event()
+    _sampler_stop[0] = evt
+    t = threading.Thread(target=_sampler_loop, args=(evt,), daemon=True,
+                         name="tv-detect-sampler")
+    _sampler[0] = t
+    t.start()
+    return True
+
+
+def stop_sampler() -> None:
+    _sampler_stop[0].set()
+    _sampler[0] = None
+
+
+def _sampler_alive() -> bool:
+    t = _sampler[0]
+    return t is not None and t.is_alive()
 
 
 def is_tv_on() -> bool:
@@ -373,12 +494,19 @@ def tv_detect_status(_: str = "") -> str:
         return (f"TV detection is on and watching {region_note}, sir, but I'm not "
                 "getting any camera frames at the moment.")
     seeing = is_tv_on()
+    b, d = _last_reading["brightness"], _last_reading["delta"]
+    nums = (f" (brightness {b:.0f}, motion {d:.1f}; I need at least "
+            f"{td.BRIGHTNESS_ON_MIN:.0f} and {td.TEMPORAL_DELTA_ON_MIN:.1f})"
+            if b is not None and d is not None else "")
+    sampler = ("" if _sampler_alive() else
+               " My background sampler is not running, so the reading is only "
+               "as fresh as the last question.")
     if seeing:
-        return (f"TV detection is on, sir — and right now I DO see a lit, moving "
-                f"screen ({region_note}), so I'll hold off learning from the room "
-                "audio.")
-    return (f"TV detection is on and watching {region_note}, sir — and right now I "
-            "do not see a TV on.")
+        return (f"TV detection is on, sir - and right now I DO see a lit, moving "
+                f"screen ({region_note}){nums}, so I'll hold off learning from "
+                "the room audio and ignore double claps." + sampler)
+    return (f"TV detection is on and watching {region_note}, sir - and right now I "
+            f"do not see a TV on{nums}." + sampler)
 
 
 def tv_detect_on(_: str = "") -> str:
@@ -392,6 +520,10 @@ def tv_detect_on(_: str = "") -> str:
                 "while a camera frames the TV for a tighter focus.")
     if already:
         return "TV detection is already on, sir." + cal_note
+    try:
+        start_sampler()
+    except Exception:
+        pass
     msg = ("TV detection on, sir — I'll use a lit, flickering screen as another "
            "reason not to learn from the TV.")
     if not persisted:
@@ -424,5 +556,15 @@ def register(actions):
     actions["tv_status"]           = tv_detect_status
     actions["tv_detect_on"]        = tv_detect_on
     actions["tv_detect_off"]       = tv_detect_off
+    # The sampler runs from boot (and idles while the flag is off, so a live
+    # "turn on tv detection" needs no restart). It only reads the cached camera
+    # frame; staging has no camera of its own, so it stays out of there.
+    started = False
+    if not os.environ.get("JARVIS_STAGING"):
+        try:
+            started = start_sampler()
+        except Exception as exc:
+            print(f"  [tv-detect] sampler failed to start: {exc}")
     print("  [tv-detect] camera TV-on detector actions registered "
-          "(opt-in via TV_DETECT_ENABLED, off by default)")
+          f"(TV_DETECT_ENABLED={'on' if _detect_enabled() else 'off'}"
+          f"{', sampling the camera cache' if started else ''})")

@@ -7,7 +7,7 @@ or pattern_memory, this skill works directly off the pattern_learning snapshot
 the broad/precise predictions into anticipatory speech at relevant times.
 
 Two surfacing modes:
-  • Precise-clock predictions (e.g. "the user checks Teams at 09:15 ± 5 min daily")
+  • Precise-clock predictions (e.g. "the user checks the printer at 09:15 ± 5 min daily")
     are surfaced with LEAD TIME — when the predicted moment is within
     ANTICIPATION_BRIEFING_LEAD_MINUTES of the current clock, JARVIS volunteers a
     line like "Sam sync in 12 minutes, sir — shall I pull up your last
@@ -368,7 +368,6 @@ def _compose_briefing_line(p: dict) -> str:
 
     # Spec examples:
     #   "Shall I queue your usual, sir? Your favourite artist, by the look of recent patterns."
-    #   "Sam sync in 12 minutes, sir — shall I pull up your last conversation?"
     if action in ("play_music", "resume_music", "youtube_play",
                   "spotify", "apple_music"):
         if arg:
@@ -378,27 +377,6 @@ def _compose_briefing_line(p: dict) -> str:
                 f"{artist}, by the look of recent patterns."
             )
         return "Shall I queue your usual playlist, sir? It is about that time."
-
-    if action == "check_teams":
-        # Contact name from common_arg gives the spec's headline line.
-        if arg and lead > 0:
-            who = _titlecase(arg)
-            return (
-                f"{who} sync in {lead} minute{'s' if lead != 1 else ''}, sir "
-                f"— shall I pull up your last conversation?"
-            )
-        if arg:
-            who = _titlecase(arg)
-            return (
-                f"Your {who} sync is upon us, sir "
-                f"— shall I pull up your last conversation?"
-            )
-        if lead > 0:
-            return (
-                f"Teams sync in {lead} minute{'s' if lead != 1 else ''}, sir "
-                f"— shall I pull up your most recent thread?"
-            )
-        return "You usually check Teams about now, sir — shall I take a look?"
 
     if action == "morning_briefing":
         if lead > 0:

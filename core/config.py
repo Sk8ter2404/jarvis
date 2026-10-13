@@ -1325,16 +1325,6 @@ INSTANT_ACTIONS_ALLOW = [
     "smart_home_control", "pause_print",
 ]
 
-# ─── Teams unread-message nudger (skills/teams_nudge.py) ──────────────────
-# The background loop screenshots the screen every 10 minutes and asks the
-# vision model whether Teams shows an unread badge. Off by default
-# (2026-09-29): it never worked reliably for the owner, it cost a full-screen
-# vision call on the shared local model, and a mis-read once produced a
-# garbage spoken nudge. The on-demand check_teams action still works when
-# asked. Set true in user_settings.json to bring the loop back; applies on the
-# next start.
-TEAMS_NUDGE_ENABLED = False
-
 # ─── Night quieting (core/night_quiet.py) ────────────────────────────────
 # NIGHT_QUIET_ENABLED — the master switch for everything that changes how
 # JARVIS sounds at night because of the CLOCK alone: the 'hushed_late' voice
@@ -1401,8 +1391,9 @@ SAMPLE_RATE   = 16000              # mic capture sample rate (Hz)
 #   nothing else loud around them run the clap routine. It listens through the
 #   main loop's mic fan-out (add_record_tap) — never a second stream — so it
 #   only hears while JARVIS is listening, never while he speaks (his own
-#   playback is gated out too), never on staging. Off by default; "turn on the
-#   clap trigger" / "clap trigger off" toggle it live and persist it.
+#   playback is gated out too), never on staging. ON by default since
+#   2026-10-12 (owner decision; the default routine is only "You rang, sir?");
+#   "clap trigger off" / "turn on the clap trigger" toggle it live and persist it.
 # CLAP_TRIGGER_ACTION — what a double clap runs. Default "acknowledge" = just
 #   "You rang, sir?" (2026-10-02 review: a mechanical key's click can pass for a
 #   clap, so until you have heard it answer only your claps a false trigger
@@ -1414,13 +1405,13 @@ SAMPLE_RATE   = 16000              # mic capture sample rate (Hz)
 # CLAP_TRIGGER_WAKE — "clap to wake": a double clap while asleep / in standby
 #   wakes JARVIS and runs the routine. Off = claps are ignored while asleep.
 #   Claps are ignored during the quiet hours (PHONE_PING_QUIET_START-END), in
-#   focus mode, in game mode, and while music, a video or anything else is
-#   playing on the speakers.
+#   focus mode, in game mode, while the camera sees the TV on, and while music,
+#   a video or anything else is playing on the speakers.
 # CLAP_TRIGGER_COOLDOWN_S — minimum gap between two routines.
 # CLAP_TRIGGER_MIN_PEAK — how loud a clap must be at the mic (peak sample,
 #   0..1 full scale). Lower it if "clap trigger status" says your claps peak
 #   below it; raise it if knocks across the room fire it.
-CLAP_TRIGGER_ENABLED = False
+CLAP_TRIGGER_ENABLED = True
 CLAP_TRIGGER_ACTION = "acknowledge"
 CLAP_TRIGGER_WAKE = False
 CLAP_TRIGGER_COOLDOWN_S = 60.0
@@ -2060,7 +2051,7 @@ KINECT_POSTURE_NUDGE = False
 KINECT_GUARD_ENABLED = False
 
 
-# ─── Camera-based "is the TV on?" detector (ambient-suppression, opt-in) ─
+# ─── Camera-based "is the TV on?" detector (suppression signal) ─────────
 # TV_DETECT_ENABLED — when True, a lightweight background detector periodically
 #   samples the cached face-tracking camera frame and decides whether a TV/
 #   monitor screen is visibly ON — a bright, FLICKERING (high frame-to-frame
@@ -2073,12 +2064,14 @@ KINECT_GUARD_ENABLED = False
 #   learning, never trigger anything — and reads a frame the face-tracker already
 #   captured (no extra camera open). Calibrate the rectangle once with "calibrate
 #   the tv region" (stored normalised in a SEPARATE gitignored data/tv_region.json
-#   via JARVIS_TV_REGION_PATH — never user_settings.json). OFF by default; with it
-#   off NO frame is read and ambient suppression is byte-identical to today.
+#   via JARVIS_TV_REGION_PATH — never user_settings.json). ON by default since
+#   2026-10-12: a daemon sampler reads the cached frame about once a second and
+#   logs every TV ON/OFF change with its numbers ("[tv-detect] ..."); the verdict
+#   also holds the double-clap trigger off. With it off NO frame is read.
 #   Staging-safe (never drives anything regardless). Voice: 'turn on/off tv
 #   detection', 'tv detection status', 'calibrate the tv region'. See
 #   audio/tv_detect.py (pure stats + region store) + skills/tv_detect.py (wiring).
-TV_DETECT_ENABLED = False
+TV_DETECT_ENABLED = True
 
 
 # ─── Face recognition (identity, opt-in; all default off) ──────────────
@@ -2615,6 +2608,18 @@ STANDBY_WHISPER_PREFER_GPU        = False
 _ENV_ONLY_KEYS = frozenset({"BAMBU_PRINTER_IP", "BAMBU_ACCESS_CODE", "BAMBU_SERIAL"})
 
 
+# ─── Amazon order tracker (skills/amazon_order_tracker.py) ──────────────────
+# AMAZON_TRACKING_ENABLED - polls the mailbox every 15 minutes for Amazon
+#   shipment mail and announces shipped / out for delivery / delivered / delayed.
+#   ON by default since 2026-10-12 because with no mailbox sign-in it does
+#   nothing at all: the poller idles, nothing is spoken at boot, and "check my
+#   orders" answers "I need a Google sign-in first, sir". The sign-in is a
+#   one-time READ-ONLY Gmail grant made from a terminal:
+#       python -m skills.amazon_order_tracker --auth-gmail
+#   (needs gmail_credentials.json, the OAuth client file, at the project root).
+#   Moved here from bobert_companion.py so it can be switched in Settings.
+AMAZON_TRACKING_ENABLED = True
+
 # ─── Game low-power mode (skills/game_mode.py) ─────────────────────────────
 # JARVIS gets out of the way while a game runs: the local brain is repointed at
 # a SMALLER tag (in process only — nothing here is persisted, so any restart
@@ -2628,8 +2633,29 @@ _ENV_ONLY_KEYS = frozenset({"BAMBU_PRINTER_IP", "BAMBU_ACCESS_CODE", "BAMBU_SERI
 # undeclared setting is silently dropped and the owner's saved value never
 # reaches the runtime. That is this project's defining bug class.
 #
-# OFF by default — the mode is enabled live, deliberately, not by shipping it on.
-GAME_MODE_ENABLED = False
+# ON by default (2026-10-12, owner decision): the watcher starts at boot and the
+# mode engages by itself when a game holds the foreground. Set false to use it
+# by voice only ('game mode on' / 'low power mode').
+GAME_MODE_ENABLED = True
+# Also recognise a fullscreen game that is NOT in GAME_MODE_PROCESS_HINTS
+# (2026-10-12): the foreground window must cover its whole monitor, must not be
+# a browser / media player / meeting / remote-desktop / office app, and its
+# executable must live under one of GAME_MODE_PATH_MARKERS (a game-store
+# library folder). An unrecognised fullscreen app is only logged, never treated
+# as a game; 'treat this as a game' adds it for the session.
+GAME_MODE_DETECT_FULLSCREEN = True
+GAME_MODE_PATH_MARKERS = [
+    "\\steamapps\\common\\", "\\epic games\\", "\\riot games\\",
+    "\\gog galaxy\\games\\", "\\gog games\\", "\\xboxgames\\",
+    "\\battle.net\\", "\\blizzard\\", "\\ubisoft game launcher\\games\\",
+    "\\ea games\\", "\\origin games\\", "\\rockstar games\\", "\\games\\",
+]
+# While game mode is engaged JARVIS stays quiet (2026-10-12): unsolicited
+# speech (proactive remarks, queued status lines, nudges) is held in the speech
+# queue, in order, and spoken after the game as one short "Earlier, sir"
+# recap. Your own timers / reminders, the guard-mode alert and urgent lines
+# (a print failure) are still spoken, and anything you say to him is answered.
+GAME_MODE_QUIET = True
 # EXACT executable basenames, lower-case. NOT substrings: measured live
 # 2026-09-04 there are four Fortnite processes at once (FortniteBootstrapper,
 # FortniteLauncher, FortniteClient-Win64-Shipping_EAC_EOS, and the real

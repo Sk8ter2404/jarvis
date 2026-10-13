@@ -494,7 +494,7 @@ class ReviewPowerClaimTests(unittest.TestCase):
                  "ambient_listen_stop"),
                 ("Going offline now, sir. Phone bridge paused.",
                  "pause_phone_bridge"),
-                ("I've powered down the stream, sir.", "obs_stop_recording"),
+                ("I've powered down the stream, sir.", "stream_stop"),
                 ("Powering down the workshop HUD, sir.", "hide_workshop_hud"),
                 ("Powering down the pipeline, sir.", "stop_pipeline")):
             with self.subTest(reply=reply):

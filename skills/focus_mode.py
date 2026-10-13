@@ -3,7 +3,7 @@ Focus mode / do-not-disturb — HOLD unsolicited announcements, RECAP on resume.
 ─────────────────────────────────────────────────────────────────────────────
 
 The owner works long heads-down stretches and wants JARVIS to stop volunteering
-things (print milestones, weather, Teams nudges, timer reminders, self-diag…)
+things (print milestones, weather, timer reminders, self-diag…)
 while he's concentrating — then, when he resumes, hear a quick RECAP of what he
 missed. He never wants his OWN commands silenced: wake-word + direct command
 replies must keep working the whole time.

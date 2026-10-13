@@ -4,11 +4,9 @@ Morning handoff skill for JARVIS.
 A single seamless morning briefing that chains:
   1. Weather (briefing_sources.get_weather_data)
   2. Calendar + unread mail (ms_graph)
-  3. Microsoft Teams unread — called out specifically when a configured VIP
-     (JARVIS_VIP_NAME) is the sender
-  4. Overnight Bambu print status (bambu_monitor state)
-  5. Overnight news headlines (news_briefing.get_news_text)
-  6. "Anything else I should know, sir?" sign-off
+  3. Overnight Bambu print status (bambu_monitor state)
+  4. Overnight news headlines (news_briefing.get_news_text)
+  5. "Anything else I should know, sir?" sign-off
 
 Modelled on the MCU JARVIS "Good morning, sir, it's 7 AM" opener — one
 continuous handoff rather than several separately triggered briefings.
@@ -253,42 +251,6 @@ def _section_calendar() -> str:
     if not parts:
         return ""
     return "From Outlook: " + "; ".join(parts) + "."
-
-
-def _section_teams_vip() -> str:
-    """Single-line callout for Teams unread, with extra emphasis when the
-    configured VIP (JARVIS_VIP_NAME) is the visible sender. Empty when
-    nothing unread or vision is offline."""
-    tn = _import_skill("teams_nudge")
-    if not tn:
-        return ""
-    try:
-        has_unread, count, sender = tn._ask_vision_for_teams_state()
-    except Exception as e:
-        print(f"  [handoff] teams: {e}")
-        return ""
-    if not has_unread:
-        return ""
-
-    sender = (sender or "").strip()
-    sender_l = sender.lower()
-    vip_name = os.getenv("JARVIS_VIP_NAME", "").strip()
-    vip = bool(vip_name) and vip_name.lower() in sender_l
-
-    if vip:
-        if count <= 1:
-            return f"You have a message on Teams from {sender}, sir."
-        return (f"You have {count} unread messages on Teams, sir — "
-                f"including one from {sender}.")
-
-    if count == 1:
-        if sender:
-            return f"One unread message on Teams from {sender}, sir."
-        return "One unread message on Teams, sir."
-    head = f"{count} unread messages on Teams, sir."
-    if sender:
-        head = f"{head} The latest is from {sender}."
-    return head
 
 
 def _section_print() -> str:
@@ -668,7 +630,6 @@ def _build_handoff(setup_line: str = "") -> str:
         sections.append(setup_line)
     for fn in (_section_weather,
                _section_calendar,
-               _section_teams_vip,
                _section_print,
                _section_news):
         try:
@@ -747,8 +708,8 @@ def _fire_from_chain(reason: str = "morning_chain") -> str:
     Manual triggers ("morning handoff") still bypass via force=True.
 
     Speed plan R5 (2026-10-02 review): this runs on the morning-chain thread
-    and its sections run one after another with no deadline, so the Teams
-    screenshot read and the headline summaries are background work for the
+    and its sections run one after another with no deadline, so the
+    headline summaries are background work for the
     one-slot local model. Opt-in: with BACKGROUND_TAG_STRICT on it first
     waits (bounded) for a quiet moment -- BEFORE the opener's clock time and
     the screenshot are taken, and before _fire_handoff's own same-day

@@ -52,7 +52,7 @@ class PatternLearningHelperTests(unittest.TestCase):
 
     def test_verb_for_known_and_fallback(self):
         self.assertEqual(self.mod._verb_for("play_music"), "plays music")
-        self.assertEqual(self.mod._verb_for("check_teams"), "checks Teams")
+        self.assertEqual(self.mod._verb_for("check_print"), "checks the printer")
         # Unknown action → generic verb derived from the name.
         self.assertEqual(self.mod._verb_for("do_thing"), "runs do thing")
 
@@ -93,7 +93,7 @@ class PatternLearningHelperTests(unittest.TestCase):
 
     def test_compose_offer_line_generic_uses_offer(self):
         out = self.mod._compose_offer_line(
-            {"action": "check_teams", "offer": "Shall I check Teams, sir?"})
+            {"action": "check_print", "offer": "Shall I check Teams, sir?"})
         self.assertEqual(out, "Shall I check Teams, sir?")
 
     def test_compose_offer_line_drops_offer_invented_from_action_name(self):
@@ -137,7 +137,7 @@ class PatternLearningAggregateTests(unittest.TestCase):
                 f.write(json.dumps(e) + "\n")
 
     def _synthetic_21_days(self):
-        """play_music on ~80% of weekdays 9-11am; check_teams daily ~09:15."""
+        """play_music on ~80% of weekdays 9-11am; check_print daily ~09:15."""
         fake = []
         base = time.time() - 21 * 86400
         for day in range(21):
@@ -152,7 +152,7 @@ class PatternLearningAggregateTests(unittest.TestCase):
                              "action": "play_music", "arg": "michael jackson"})
             fake.append({"ts": ts, "date": date, "dow": dow, "wd": wd,
                          "hour": 9, "min": 13 + (day % 5),
-                         "action": "check_teams", "arg": ""})
+                         "action": "check_print", "arg": ""})
         return fake
 
     def test_aggregate_empty_log(self):
@@ -178,10 +178,10 @@ class PatternLearningAggregateTests(unittest.TestCase):
         # Argument is carried so the offer can say "your usual <arg> mix".
         self.assertEqual(music["common_arg"], "michael jackson")
 
-        # Precise: check_teams at 09:15 ± a few minutes.
-        teams = next((p for p in snap["precise"] if p["action"] == "check_teams"),
+        # Precise: check_print at 09:15 ± a few minutes.
+        teams = next((p for p in snap["precise"] if p["action"] == "check_print"),
                      None)
-        self.assertIsNotNone(teams, "expected a precise check_teams prediction")
+        self.assertIsNotNone(teams, "expected a precise check_print prediction")
         self.assertEqual(teams["center_clock"], "09:15")
         self.assertLessEqual(teams["tolerance_min"], 12)
         self.assertGreaterEqual(teams["ratio"], 0.6)
@@ -210,7 +210,7 @@ class PatternLearningAggregateTests(unittest.TestCase):
                        "label": "L"}],
             "precise": [{"key": "p1", "type": "precise", "center_minute": 555,
                          "tolerance_min": 5, "ratio": 0.9,
-                         "action": "check_teams", "offer": "y", "label": "L2"}],
+                         "action": "check_print", "offer": "y", "label": "L2"}],
         }
         # Wednesday 09:15 — both the broad window and precise center match.
         with mock.patch.object(self.mod.time, "localtime",
@@ -218,7 +218,7 @@ class PatternLearningAggregateTests(unittest.TestCase):
             matches = self.mod.predictions_for_now(snap)
         actions = [m["action"] for m in matches]
         self.assertIn("play_music", actions)
-        self.assertIn("check_teams", actions)
+        self.assertIn("check_print", actions)
         # Precise sorts before broad (more specific first).
         self.assertEqual(matches[0]["type"], "precise")
 
@@ -237,9 +237,9 @@ class PatternLearningAggregateTests(unittest.TestCase):
         snap = {
             "generated_at": time.time(), "events": 50, "days_span": 21.0,
             "broad": [], "precise": [
-                {"key": "precise|check_teams|09:15", "type": "precise",
+                {"key": "precise|check_print|09:15", "type": "precise",
                  "center_minute": 555, "tolerance_min": 5, "ratio": 0.9,
-                 "action": "check_teams",
+                 "action": "check_print",
                  "offer": "Shall I check Teams, sir?", "label": "L"}],
         }
         self.mod._atomic_write_json(self.aggp, snap)
@@ -375,7 +375,7 @@ class _TempDataBase(unittest.TestCase):
             for e in events:
                 f.write(json.dumps(e) + "\n")
 
-    def _event(self, ts, action="check_teams", arg="", hour=9, minute=15,
+    def _event(self, ts, action="check_print", arg="", hour=9, minute=15,
                wd=2, date=None):
         lt = time.localtime(ts)
         return {
@@ -420,14 +420,14 @@ class LogEventTests(_TempDataBase):
     def test_log_event_debounces_identical_back_to_back(self):
         t = [1_700_000_000.0]
         with mock.patch.object(self.mod.time, "time", lambda: t[0]):
-            self.mod.log_event("check_teams", "")
+            self.mod.log_event("check_print", "")
             # Same key, within DEBOUNCE_SECONDS → dropped.
             t[0] += self.mod.DEBOUNCE_SECONDS / 2.0
-            self.mod.log_event("check_teams", "")
+            self.mod.log_event("check_print", "")
             self.assertEqual(len(self.mod._load_events()), 1)
             # Past the debounce window → accepted.
             t[0] += self.mod.DEBOUNCE_SECONDS + 0.1
-            self.mod.log_event("check_teams", "")
+            self.mod.log_event("check_print", "")
         self.assertEqual(len(self.mod._load_events()), 2)
 
     def test_log_event_different_arg_not_debounced(self):
@@ -446,7 +446,7 @@ class LogEventTests(_TempDataBase):
         # open() raising for the JSONL append must not propagate.
         with mock.patch.object(self.mod, "open", side_effect=OSError("nope"),
                                create=True):
-            self.mod.log_event("check_teams", "")  # returns without raising
+            self.mod.log_event("check_print", "")  # returns without raising
         # Nothing was logged.
         self.assertEqual(self.mod._load_events(), [])
 
@@ -456,7 +456,7 @@ class LogEventTests(_TempDataBase):
         self.mod._writes_since_rotate[0] = 199
         with mock.patch.object(self.mod, "_maybe_rotate") as rot, \
              mock.patch.object(self.mod, "_prune_sqlite_events") as prune:
-            self.mod.log_event("check_teams", "")
+            self.mod.log_event("check_print", "")
         rot.assert_called_once()
         prune.assert_called_once()
         self.assertEqual(self.mod._writes_since_rotate[0], 0)
@@ -465,7 +465,7 @@ class LogEventTests(_TempDataBase):
         # A broken SQLite connection must not stop the JSONL append.
         with mock.patch.object(self.mod, "_connect_db",
                                side_effect=RuntimeError("db down")):
-            self.mod.log_event("check_teams", "")
+            self.mod.log_event("check_print", "")
         self.assertEqual(len(self.mod._load_events()), 1)
 
 
@@ -550,7 +550,7 @@ class SqliteStoreTests(_TempDataBase):
 
     def test_backfill_replays_jsonl_into_empty_sqlite(self):
         base = 1_700_000_000.0
-        self._write_jsonl([self._event(base + i, action="check_teams")
+        self._write_jsonl([self._event(base + i, action="check_print")
                            for i in range(4)])
         inserted = self.mod._backfill_sqlite_from_jsonl_if_empty()
         self.assertEqual(inserted, 4)
@@ -563,7 +563,7 @@ class SqliteStoreTests(_TempDataBase):
         self.assertEqual(self.mod._backfill_sqlite_from_jsonl_if_empty(), 0)
 
     def test_backfill_noop_when_events_table_populated(self):
-        self.mod.log_event("check_teams", "")   # seeds one SQLite row
+        self.mod.log_event("check_print", "")   # seeds one SQLite row
         self.mod._backfill_done.clear()          # pretend we haven't backfilled
         self._write_jsonl([self._event(1.0), self._event(2.0)])
         # Table already has a row → COUNT>0 path → nothing replayed.
@@ -598,7 +598,7 @@ class SqliteStoreTests(_TempDataBase):
         self.assertEqual(kept, {6.0, 7.0, 8.0, 9.0})
 
     def test_prune_sqlite_events_noop_under_cap(self):
-        self.mod.log_event("check_teams", "")
+        self.mod.log_event("check_print", "")
         self.mod._prune_sqlite_events(max_rows=100)
         self.assertEqual(self._db_count(), 1)
 
@@ -747,9 +747,9 @@ class WeeklyLabelOfferTests(unittest.TestCase):
         out = self.mod._cluster_offer(4, 20, "play_music", "")
         self.assertIn("playlist", out.lower())
 
-    def test_cluster_offer_check_teams(self):
-        out = self.mod._cluster_offer(0, 8, "check_teams", "")
-        self.assertIn("Teams", out)
+    def test_cluster_offer_check_print(self):
+        out = self.mod._cluster_offer(0, 8, "check_print", "")
+        self.assertIn("printer", out)
         self.assertIn("Monday", out)
 
     def test_cluster_offer_morning_and_evening_briefing(self):
@@ -822,11 +822,11 @@ class LoaderResilienceTests(_TempDataBase):
         snap = {
             "broad": [
                 {"type": "broad", "bucket": "weekday", "hour_window": [9, 11],
-                 "ratio": 0.9, "action": "check_teams", "offer": "Keyless",
+                 "ratio": 0.9, "action": "check_print", "offer": "Keyless",
                  "label": "L"},   # no 'key' → skipped
-                {"key": "broad|check_teams|weekday|9-11", "type": "broad",
+                {"key": "broad|check_print|weekday|9-11", "type": "broad",
                  "bucket": "weekday", "hour_window": [9, 11], "ratio": 0.8,
-                 "action": "check_teams", "offer": "Shall I check Teams, sir?",
+                 "action": "check_print", "offer": "Shall I check Teams, sir?",
                  "label": "L2"},
             ],
             "precise": [],
@@ -893,7 +893,7 @@ class PredictionsForNowBranchTests(unittest.TestCase):
 # ─── aggregate() deeper branches (precise rejection paths) ────────────────
 class AggregatePreciseBranchTests(_TempDataBase):
     def test_precise_rejected_when_spread_too_wide(self):
-        # check_teams fires daily but minutes are scattered across the hour, so
+        # check_print fires daily but minutes are scattered across the hour, so
         # stddev > STDDEV_THRESHOLD_MIN → no precise prediction.
         base = time.time() - 14 * 86400
         events = []
@@ -904,10 +904,10 @@ class AggregatePreciseBranchTests(_TempDataBase):
                 "ts": ts, "date": time.strftime("%Y-%m-%d", lt),
                 "dow": time.strftime("%A", lt), "wd": lt.tm_wday,
                 "hour": 9, "min": (day * 7) % 60,    # wide spread
-                "action": "check_teams", "arg": ""})
+                "action": "check_print", "arg": ""})
         self._write_jsonl(events)
         snap = self.mod.aggregate()
-        self.assertFalse(any(p["action"] == "check_teams"
+        self.assertFalse(any(p["action"] == "check_print"
                              for p in snap["precise"]))
 
     def test_precise_rejected_when_ratio_below_threshold(self):
@@ -921,13 +921,13 @@ class AggregatePreciseBranchTests(_TempDataBase):
             # A daily "anchor" action on EVERY day so active-day count is high.
             events.append({"ts": ts, "date": d, "dow": "", "wd": lt.tm_wday,
                            "hour": 12, "min": 0, "action": "anchor", "arg": ""})
-            if day % 2 == 0:   # check_teams only every other day
+            if day % 2 == 0:   # check_print only every other day
                 events.append({"ts": ts, "date": d, "dow": "", "wd": lt.tm_wday,
-                               "hour": 9, "min": 15, "action": "check_teams",
+                               "hour": 9, "min": 15, "action": "check_print",
                                "arg": ""})
         self._write_jsonl(events)
         snap = self.mod.aggregate()
-        self.assertFalse(any(p["action"] == "check_teams"
+        self.assertFalse(any(p["action"] == "check_print"
                              for p in snap["precise"]))
 
     def test_aggregate_skips_events_with_bad_fields(self):
@@ -1029,9 +1029,9 @@ class WeeklyDigestActionTests(_TempDataBase):
 
     def test_pattern_offer_now_bypasses_throttle(self):
         snap = {"broad": [], "precise": [
-            {"key": "precise|check_teams|09:15", "type": "precise",
+            {"key": "precise|check_print|09:15", "type": "precise",
              "center_minute": 555, "tolerance_min": 5, "ratio": 0.9,
-             "action": "check_teams", "offer": "Shall I check Teams, sir?",
+             "action": "check_print", "offer": "Shall I check Teams, sir?",
              "label": "L"}]}
         self.mod._atomic_write_json(self.aggp, snap)
         with mock.patch.object(self.mod.time, "localtime",
@@ -1240,7 +1240,7 @@ class EdgeBranchTests(_TempDataBase):
             self.assertEqual(win["hour_window"], [22, 24])
 
     def test_aggregate_precise_skips_event_with_bad_minute(self):
-        # Build a clean precise cluster for "check_teams", plus one stray row
+        # Build a clean precise cluster for "check_print", plus one stray row
         # for the SAME action with an out-of-range minute that the precise loop
         # must skip (covers the per-event guard inside the precise pass).
         events = []
@@ -1250,16 +1250,16 @@ class EdgeBranchTests(_TempDataBase):
             lt = time.localtime(ts)
             d = time.strftime("%Y-%m-%d", lt)
             events.append({"ts": ts, "date": d, "dow": "", "wd": lt.tm_wday,
-                           "hour": 9, "min": 15, "action": "check_teams",
+                           "hour": 9, "min": 15, "action": "check_print",
                            "arg": ""})
         # Stray bad-minute row (min=99) — survives broad guards? No: skipped in
         # both passes. Its job is to exercise the precise-loop minute guard.
         events.append({"ts": base, "date": "2026-01-01", "dow": "", "wd": 0,
-                       "hour": 9, "min": 99, "action": "check_teams", "arg": ""})
+                       "hour": 9, "min": 99, "action": "check_print", "arg": ""})
         self._write_jsonl(events)
         snap = self.mod.aggregate()
         teams = next((p for p in snap["precise"]
-                      if p["action"] == "check_teams"), None)
+                      if p["action"] == "check_print"), None)
         self.assertIsNotNone(teams)
         # The bad-minute row was excluded from the cluster math.
         self.assertEqual(teams["center_clock"], "09:15")
@@ -1276,17 +1276,17 @@ class EdgeBranchTests(_TempDataBase):
             d = time.strftime("%Y-%m-%d", lt)
             events.append({"ts": ts, "date": d, "dow": "", "wd": lt.tm_wday,
                            "hour": 12, "min": 0, "action": "anchor", "arg": ""})
-        # check_teams: 6 occurrences but only on 2 distinct days.
+        # check_print: 6 occurrences but only on 2 distinct days.
         for i in range(6):
             day = i % 2          # only days 0 and 1
             ts = base + day * 86400
             d = time.strftime("%Y-%m-%d", time.localtime(ts))
             events.append({"ts": ts, "date": d, "dow": "", "wd": 0,
-                           "hour": 9, "min": 15, "action": "check_teams",
+                           "hour": 9, "min": 15, "action": "check_print",
                            "arg": ""})
         self._write_jsonl(events)
         snap = self.mod.aggregate()
-        self.assertFalse(any(p["action"] == "check_teams"
+        self.assertFalse(any(p["action"] == "check_print"
                              for p in snap["precise"]))
 
     def test_aggregate_precise_rejected_when_few_active_days(self):
@@ -1299,7 +1299,7 @@ class EdgeBranchTests(_TempDataBase):
             d = time.strftime("%Y-%m-%d", time.localtime(ts))
             for _ in range(2):     # ensure >= MIN_OCCURRENCES_PRECISE total
                 events.append({"ts": ts, "date": d, "dow": "", "wd": 0,
-                               "hour": 9, "min": 15, "action": "check_teams",
+                               "hour": 9, "min": 15, "action": "check_print",
                                "arg": ""})
         self._write_jsonl(events)
         snap = self.mod.aggregate()
@@ -1428,7 +1428,7 @@ class SqliteErrorPathTests(_TempDataBase):
     def test_backfill_skips_unserialisable_row_but_commits_rest(self):
         # One JSONL row makes the INSERT raise (per-row try/except → continue);
         # the others still backfill and the transaction commits.
-        good = [self._event(1_700_000_000.0 + i, action="check_teams")
+        good = [self._event(1_700_000_000.0 + i, action="check_print")
                 for i in range(3)]
         self._write_jsonl(good)
         real_conn = self.mod._connect_db
@@ -1693,16 +1693,16 @@ class AggregatePreciseNonIntGuardTests(_TempDataBase):
             ts = base + day * 86400
             d = time.strftime("%Y-%m-%d", time.localtime(ts))
             events.append({"ts": ts, "date": d, "dow": "", "wd": 0,
-                           "hour": 9, "min": 15, "action": "check_teams",
+                           "hour": 9, "min": 15, "action": "check_print",
                            "arg": ""})
         # Non-int hour for the SAME action → skipped by the precise guard.
         events.append({"ts": base, "date": "2026-02-02", "dow": "", "wd": 0,
-                       "hour": "nine", "min": 15, "action": "check_teams",
+                       "hour": "nine", "min": 15, "action": "check_print",
                        "arg": ""})
         self._write_jsonl(events)
         snap = self.mod.aggregate()
         teams = next((p for p in snap["precise"]
-                      if p["action"] == "check_teams"), None)
+                      if p["action"] == "check_print"), None)
         self.assertIsNotNone(teams)
         self.assertEqual(teams["center_clock"], "09:15")
 

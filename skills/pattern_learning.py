@@ -8,7 +8,7 @@ This module focuses on ACTION events — what JARVIS actually did — and
 produces two prediction shapes the spec asks for:
 
   • Broad-window  "the user plays music between 9-11am on weekdays 78% of the time"
-  • Precise-clock "the user checks Teams at 09:15 ± 5 min daily"
+  • Precise-clock "the user checks the printer at 09:15 ± 5 min daily"
 
 Storage:
   data/usage_patterns.jsonl              — append-only event log (legacy /
@@ -119,7 +119,6 @@ _ACTION_VERB = {
     "disney_plus":     ("opens Disney+",          "Disney+, sir?"),
     "hulu":            ("opens Hulu",             "Hulu, sir?"),
     "max":             ("opens Max",              "Max, sir?"),
-    "check_teams":     ("checks Teams",           "You usually check Teams around now, sir — shall I take a look?"),
     "check_credits":   ("checks credits",         "Shall I check the credits balance, sir?"),
     "check_system":    ("runs a systems check",   "Shall I run a systems check, sir?"),
     "check_print":     ("checks the printer",     "Shall I check the printer, sir?"),
@@ -841,9 +840,6 @@ def _cluster_offer(dow: int, hour_start: int, action: str,
                     f"window is upon us. Shall I queue it?")
         return ("Sir, this is normally when you settle into music. "
                 "Shall I queue your usual playlist?")
-    if action == "check_teams":
-        return (f"Sir, you typically check Teams around {band} on {day}s — "
-                f"shall I take a look?")
     if action == "morning_briefing":
         return f"Sir, your usual {day} morning briefing — shall I deliver it?"
     if action == "evening_briefing":
@@ -1205,10 +1201,10 @@ if __name__ == "__main__":  # pragma: no cover - manual offline smoke test entry
             fake.append({"ts": day_ts, "iso": "", "date": date, "dow": dow,
                          "wd": wd, "hour": h, "min": 17,
                          "action": "play_music", "arg": "michael jackson"})
-        # check_teams at 09:15 ± 5 min daily
+        # check_print at 09:15 ± 5 min daily
         fake.append({"ts": day_ts, "iso": "", "date": date, "dow": dow,
                      "wd": wd, "hour": 9, "min": 13 + (day % 5),
-                     "action": "check_teams", "arg": ""})
+                     "action": "check_print", "arg": ""})
     # Write to a temp jsonl, point _LOG_FILE at it, aggregate, restore.
     tmpfd, tmppath = tempfile.mkstemp(suffix=".jsonl")
     os.close(tmpfd)

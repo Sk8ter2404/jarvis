@@ -101,6 +101,7 @@ class _Base(unittest.TestCase):
 
     SETTINGS = {
         "GAME_MODE_ENABLED": False,          # never autostart the watcher here
+        "GAME_MODE_DETECT_FULLSCREEN": False,  # never probe the real desktop
         "GAME_MODE_PROCESS_HINTS": [GAME],
         "GAME_MODE_BRAIN": SMALL,
         "GAME_MODE_POLL_SECONDS": 5.0,
@@ -121,15 +122,17 @@ class _Base(unittest.TestCase):
         imp.start()
         self.addCleanup(imp.stop)
 
-        mod, actions = load_skill_isolated("game_mode")
-        self.mod, self.actions = mod, actions
-
         cfg = dict(self.SETTINGS)
         cfg.update(settings or {})
         # _cfg reads the monolith first, so pinning the values onto the fake bc
-        # exercises the real lookup path rather than stubbing _cfg away.
+        # exercises the real lookup path rather than stubbing _cfg away. They
+        # go on BEFORE the skill loads: register() reads GAME_MODE_ENABLED at
+        # load time, and the shipped default is now True (watcher autostart).
         for k, v in cfg.items():
             setattr(self.bc, k, v)
+
+        mod, actions = load_skill_isolated("game_mode")
+        self.mod, self.actions = mod, actions
 
         # --- outward-facing primitives, all stubbed ---
         self.samples = [vram, after_vram]
@@ -796,9 +799,9 @@ class TestWiring(_Base):
         self.assertEqual(missing, [],
                          f"undeclared in core/config.py, silently dropped: {missing}")
 
-    def test_not_enabled_by_default(self):
+    def test_enabled_by_default(self):
         import core.config as cfg
-        self.assertFalse(cfg.GAME_MODE_ENABLED)
+        self.assertTrue(cfg.GAME_MODE_ENABLED)
 
     def test_watcher_does_not_autostart_when_disabled(self):
         mod, _ = self._load()

@@ -1795,7 +1795,7 @@ def _config_value(key: str, default):
 
 
 # Sentinel distinguishing "core.config has NO such constant" (a GUI-only key
-# like OBS_HOST_HINT, or bare CI where core.config can't import) from a
+# like HUE_BRIDGE_IP_HINT, or bare CI where core.config can't import) from a
 # constant whose value is legitimately falsy. build_settings_schema passes it
 # as _config_value's default so those two cases route differently.
 _NO_CONSTANT = object()
@@ -1857,7 +1857,7 @@ def build_settings_schema(settings_path: str | None = None) -> dict:
         constant — honest that the running loop lags the file until a restart;
       • key ABSENT from the file, live constant exists → that constant (the
         value the currently-running loop is using);
-      • neither (a GUI-only key like OBS_HOST_HINT with no core.config
+      • neither (a GUI-only key like HUE_BRIDGE_IP_HINT with no core.config
         constant, or bare CI where core.config can't import) → the schema
         default.
     We overlay ONLY file-present keys — NOT settings_window.load_settings(),
@@ -2227,10 +2227,6 @@ PROACTIVE_FEATURES = (
              "local vision model (the brain's GPU) to describe the screen",
      "applies": "restart",
      "how": "started at boot when on; ambient_screen_stop stops it now"},
-    {"key": "TEAMS_NUDGE_ENABLED", "name": "Teams nudger",
-     "what": "Every 10 minutes, reads the screen and says when Teams shows "
-             "unread messages",
-     "applies": "restart", "how": "its thread is started at boot"},
     {"key": "PROCESSING_FILLER_ENABLED", "name": "Processing filler",
      "what": "Says a short 'just a moment' line when a spoken reply is slow",
      "applies": "restart",
@@ -2281,8 +2277,8 @@ PROACTIVE_FEATURES = (
      "what": "Runs the self-upgrade pipeline by itself while the PC is idle",
      "applies": "restart", "how": "checked once at boot"},
     {"key": "GAME_MODE_ENABLED", "name": "Game-mode watcher",
-     "what": "Swaps to the smaller game brain by itself while a listed game "
-             "is in front",
+     "what": "Swaps to the smaller game brain and goes quiet by itself while "
+             "a game is in front",
      "applies": "restart",
      "how": "the watcher is started at boot; 'game mode on' works by voice"},
     {"key": "AUDIO_AUTOSWITCH_ENABLED", "name": "Headset auto-switch",
@@ -2350,8 +2346,9 @@ PROACTIVE_FEATURES = (
              "ahead",
      "applies": "code", "how": "a constant in bobert_companion.py"},
     {"key": "AMAZON_TRACKING_ENABLED", "name": "Order announcer",
-     "what": "Announces shipping-status changes it finds in the mailbox",
-     "applies": "code", "how": "a constant in bobert_companion.py"},
+     "what": "Announces shipping-status changes it finds in the mailbox "
+             "(needs the one-time read-only Google sign-in)",
+     "applies": "restart", "how": "its poller is started at boot"},
     {"key": "LEARN_EVERY_TURN", "name": "Learn from every turn",
      "what": "Extracts facts from each conversation turn in the background",
      "applies": "code", "how": "a constant in bobert_companion.py"},

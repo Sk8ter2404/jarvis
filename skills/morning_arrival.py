@@ -447,17 +447,14 @@ def _section_print_phrase() -> str:
 def _section_teams_phrase() -> str:
     """Teams notification phrase. Tries a vision pass that asks Claude to
     extract the top 3 sender names from the Teams sidebar — this is more
-    informative than just an unread count for the arrival cold-open. Falls
-    back to teams_nudge's plain unread-count detector when the top-3 pass
-    times out, can't parse, or returns NONE.
+    informative than just an unread count for the arrival cold-open. Empty
+    when the pass times out, can't parse, or returns NONE.
 
     Result examples (in priority order):
       'three new Teams chats from Alex, Sam, and Pat'
       'two new Teams chats from Alex and Sam'
       'one new Teams chat from Alex'
-      '3 unread Teams messages including one from Alex'   (fallback)
-      '2 unread Teams messages'                            (fallback)
-      ''                                                   (nothing unread)
+      ''                                       (nothing unread)
     """
     senders = _teams_top_senders_via_vision()
     if senders:
@@ -468,35 +465,15 @@ def _section_teams_phrase() -> str:
             return f"two new Teams chats from {senders[0]} and {senders[1]}"
         return (f"three new Teams chats from "
                 f"{senders[0]}, {senders[1]}, and {senders[2]}")
-
-    # Fallback to teams_nudge's existing unread-count detector.
-    tn = _import_skill("teams_nudge")
-    if not tn:
-        return ""
-    try:
-        has_unread, count, sender = tn._ask_vision_for_teams_state()
-    except Exception as e:
-        print(f"  [arrival] teams vision lookup failed: {e}")
-        return ""
-    if not has_unread or count <= 0:
-        return ""
-    sender = (sender or "").strip()
-    if count == 1:
-        if sender:
-            return f"one unread Teams message from {sender}"
-        return "one unread Teams message"
-    if sender:
-        return f"{count} unread Teams messages including one from {sender}"
-    return f"{count} unread Teams messages"
+    return ""
 
 
 def _teams_top_senders_via_vision() -> list[str]:
     """Ask Claude to read the top 3 unread Teams sidebar chats and return
-    the sender names. Returns [] on any failure — caller falls back to the
-    plain unread-count detector.
+    the sender names. Returns [] on any failure.
 
     Re-uses bobert_companion.take_all_monitor_screenshots +
-    ask_vision_multi (same plumbing teams_nudge uses) instead of bringing
+    ask_vision_multi instead of bringing
     in new dependencies. The prompt is deliberately strict about output
     format so a hand-wavy vision reply doesn't corrupt the briefing.
     """

@@ -190,7 +190,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Morning briefing** — day and date, weather, pending task count, unread mail count (when Microsoft Graph is signed in), and a dry remark after a late night.
   - "morning briefing", "run the briefing again"
   - Action: `morning_briefing`
-- **Morning handoff** — the chained version: weather → calendar/unread mail → Teams unread → overnight print → news → "anything else, sir?"
+- **Morning handoff** — the chained version: weather → calendar/unread mail → overnight print → news → "anything else, sir?"
   - "catch me up", "morning handoff"
   - Action: `morning_handoff`
 - **Workspace setup** — opens Chrome with Apple Music, Teams, and Bambu Studio when an overnight print ran; focuses the middle monitor; drops master volume to ~30%.
@@ -317,7 +317,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 
 ### Category 11: Focus / workshop / night-owl / game modes
 
-- **Focus mode (hold and recap)** — `skills/focus_mode.py` holds every unsolicited announcement until you resume, then recaps what was held. It chains `skills/dnd_focus_mode.py`, which mutes Windows toasts, sets Teams to Do Not Disturb, pauses banter/wellness/Teams nudges and shortens replies; critical alerts (print failure, timers) still fire.
+- **Focus mode (hold and recap)** — `skills/focus_mode.py` holds every unsolicited announcement until you resume, then recaps what was held. It chains `skills/dnd_focus_mode.py`, which mutes Windows toasts, sets Teams to Do Not Disturb, pauses banter/wellness nudges and shortens replies; critical alerts (print failure, timers) still fire.
   - "focus mode for 90 minutes", "I'm back, what did I miss", "am I still in focus mode", "end focus mode"
   - Actions: `focus_mode_on` / `do_not_disturb` / `quiet_mode`, `focus_mode_off` / `resume`, `whats_missed`, `focus_mode`, `end_focus_mode`, `focus_mode_status`
 - **Workshop mode (auto-engaged)** — fires when Bambu Studio / Fusion 360 / SolidWorks / FreeCAD / OnShape / Blender / OpenSCAD / Orca / Prusa / Cura appears: TTS at 70% volume, single-sentence replies, a print-status line if one is mid-flight, and focus mode for an hour (released when the app closes).
@@ -326,17 +326,11 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Night-owl mode** — softer, quieter TTS, holographic overlay dimmed to ~40%, non-critical nudges muted; critical alerts (print failure, timers) still fire. Auto 23:00–06:00 when both `NIGHT_OWL_AUTO` and the master switch `NIGHT_QUIET_ENABLED` are on (both ship on); with either off it engages only on request. Releases at 06:00 or on "good morning".
   - "night owl mode", "end night owl mode", "is night owl mode on"
   - Actions: `night_owl_on` / `night_owl_mode` / `enable_night_owl`, `night_owl_off` / `end_night_owl` / `disable_night_owl`, `good_morning`, `night_owl_status`
-- **Game mode** — frees VRAM/RAM for a running game by moving to a smaller local brain; never mutes JARVIS. The automatic game watcher is off by default - setting `GAME_MODE_ENABLED`; the voice commands always work.
+- **Game mode** — while a game runs JARVIS goes low-power and quiet: it moves to a smaller local brain (and unloads the big one), pauses the camera / gesture / ambient extras, makes no unsolicited remarks and holds queued status lines until the game ends (then one short "Earlier, sir" recap; your timers, the guard alert and urgent print failures still speak, and anything you say to him is answered). The watcher is on by default - setting `GAME_MODE_ENABLED` - and recognises the listed game plus any fullscreen game that runs from a game-library folder (`GAME_MODE_DETECT_FULLSCREEN`, `GAME_MODE_PATH_MARKERS`; browsers, video players and meeting apps never count); `GAME_MODE_QUIET` turns the quiet half off. The voice commands always work.
   - "divert power", "normal power", "treat this as a game"
   - Actions: `game_mode_on` / `low_power_mode`, `game_mode_off` / `full_power` / `normal_power`, `game_mode_status`, `game_mode_learn_this`
 
-### Category 12: Microsoft Teams integration
-
-- **Teams unread check** — an on-demand vision sweep of all monitors for Teams unread badges. A background nudger can run every 10 minutes with a 30-min snooze (off by default - setting `TEAMS_NUDGE_ENABLED`).
-  - "check Teams", "do I have any Teams messages"
-  - Action: `check_teams`
-
-### Category 13: Timers, reminders & schedules
+### Category 12: Timers, reminders & schedules
 
 - **Set / list / cancel timers** — a spoken "Reminder, sir — <message>" when it fires. "List timers" answers only from the timer store; "cancel timer" with no number cancels the soonest, "cancel all timers" clears them.
   - "set a timer for 5 minutes to check the oven", "remind me in an hour to stretch", "cancel timer 3"
@@ -345,7 +339,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - "every morning at 8 give me the briefing", "tomorrow at 9am open Bambu Studio", "when the print finishes, tell me"
   - Actions: `schedule_recurring` / `schedule_cron`, `schedule_once`, `schedule_when` / `when_condition`, `list_schedules`, `cancel_schedule` / `remove_schedule`, `run_schedule` / `fire_schedule`, `schedule_status`
 
-### Category 14: Self-management & learning
+### Category 13: Self-management & learning
 
 - **AI brain selection** — which local model serves turns (switched live, persisted) and which route chat takes (see Overview).
   - "what model are you using", "use the fast one", "use local only", "use the cloud model"
@@ -394,13 +388,13 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - "MCP status", "list MCP tools"
   - Actions: `mcp_status`, `mcp_list_tools`, `mcp_call`, `mcp_reload`
 
-### Category 15: REPO Robot project tracker
+### Category 14: REPO Robot project tracker
 
 - **Robot status / blockers / next step** — reads `data/repo_robot_state.json` (next step, blockers, parts on order, last firmware flash) + `jarvis_todo.md` + recent logs.
   - "where is the robot build at", "what's blocking the robot", "what's next on the robot"
   - Actions: `robot_status`, `robot_blocker`, `next_robot_step`
 
-### Category 16: Ambient audio, listening modes & wake word
+### Category 15: Ambient audio, listening modes & wake word
 
 - **Wake-word mode** (off by default - setting `REQUIRE_WAKE_MODE`) — Alexa-style: require "JARVIS" near the start of every command while a TV or other audio plays (see "How to invoke" for the rule). The OS media session and the room-music detector already gate automatically; this is the manual switch.
   - "require the wake word", "turn off wake word mode", "is wake word mode on"
@@ -408,7 +402,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Media voice gate** (on by default - setting `MEDIA_VOICE_GATE_ENABLED`) — while another app on the PC is producing sound, a mic turn whose voice scores below `MEDIA_VOICE_GATE_REJECT_BELOW` (0.45) against the enrolled owner voiceprint is dropped, so a video saying "Jarvis, …" cannot command him (`core/media_gate.py`). A short media control ("pause", "next song", "turn it down"), a stop word, typed turns and guest mode always pass; with nobody enrolled the turn is allowed and logged.
 - **Standby audio detector** — spectral classifier on raw mic chunks plus a whisper-tiny lyric-detection loop; sets the "music currently playing" state so a wake word buried in a lyric won't flip JARVIS out of standby (`AMBIENT_MUSIC_REFUSE_WAKE`).
   - Action: `audio_music_status` (a read-back not yet taught to the voice prompt)
-- **Double-clap trigger** (off by default - setting `CLAP_TRIGGER_ENABLED`) — two sharp claps ~0.15–0.7 s apart, with nothing else loud around them, run the clap routine (`CLAP_TRIGGER_ACTION`): at first just "You rang, sir?" (a mechanical key's click can pass for a clap, so listen for false triggers first), then — by voice or in Settings — the morning workspace setup or the morning briefing. Nothing else can run on a clap (an allow-list). Listens through the main loop's microphone fan-out (never a second stream); 60 s cool-down; never while JARVIS is speaking, during the quiet hours (23:00–07:00), in focus or game mode, while music, a video or anything else plays on the speakers, or on staging; asleep only with "clap to wake" (`CLAP_TRIGGER_WAKE`). Speech, beats, typing, knocks, glass taps and doors are rejected by the detector (`core/clap_detector.py`).
+- **Double-clap trigger** (on by default - setting `CLAP_TRIGGER_ENABLED`) — two sharp claps ~0.15–0.7 s apart, with nothing else loud around them, run the clap routine (`CLAP_TRIGGER_ACTION`): at first just "You rang, sir?" (a mechanical key's click can pass for a clap, so listen for false triggers first), then — by voice or in Settings — the morning workspace setup or the morning briefing. Nothing else can run on a clap (an allow-list). Listens through the main loop's microphone fan-out (never a second stream); 60 s cool-down; never while JARVIS is speaking, during the quiet hours (23:00–07:00), in focus or game mode, while the camera sees the TV on, while music, a video or anything else plays on the speakers, or on staging; asleep only with "clap to wake" (`CLAP_TRIGGER_WAKE`). Speech, beats, typing, knocks, glass taps and doors are rejected by the detector (`core/clap_detector.py`).
   - "turn on the clap trigger", "clap trigger off", "is the clap trigger on", "clap trigger runs the morning setup", "clap trigger just answers"
   - Actions: `clap_trigger_on`, `clap_trigger_off`, `clap_trigger_status`, `clap_trigger_routine`
   - Skill: `skills/clap_trigger.py`; Settings: Hearing tab → Double-clap trigger
@@ -418,11 +412,11 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **Ambient listening (multimodal)** (off by default - settings `AMBIENT_LISTEN_ENABLED`, `AMBIENT_SCREEN_ENABLED`) — passive mic transcription sharing the main loop's mic, optional WASAPI system-audio capture and periodic screen snapshots described by the local VLM (sensitive windows skipped), all feeding the fact extractor. With `AMBIENT_STT_YIELD` (off by default) the ambient daemons hold their batches while you are talking to JARVIS so your own transcription never waits behind them.
   - "are you listening in the background" → `ambient_listen_status`
   - Switching it: the tray's **Ambient Mode** toggle, or `ambient_mode` / `ambient_mode_on` / `ambient_mode_off`, `ambient_listen_start` / `ambient_listen_stop`, `ambient_audio_start` / `ambient_audio_stop`, `ambient_screen_start` / `ambient_screen_stop`, `ambient_full_start` / `ambient_full_stop`, `ambient_mic_only` (registered, not yet taught to the voice prompt)
-- **TV detection** (off by default - setting `TV_DETECT_ENABLED`) — a camera check for a bright, flickering TV that adds a visual veto to ambient learning.
+- **TV detection** (on by default - setting `TV_DETECT_ENABLED`) — a camera check for a bright, flickering TV that adds a visual veto to ambient learning and to the double-clap trigger. A background sampler reads the cached camera frame about once a second and logs every TV ON / OFF change with its numbers (`[tv-detect]` lines).
   - "turn on TV detection", "is the TV on", "calibrate the TV region"
   - Actions: `tv_detect_on`, `tv_detect_off`, `tv_detect_status` / `tv_status`, `calibrate_tv_region` / `tv_calibrate`
 
-### Category 17: Voice, speaker ID & speech output
+### Category 16: Voice, speaker ID & speech output
 
 - **Wake-word detector (barge-in)** — `skills/wake_listener.py` runs an openWakeWord / Porcupine hotword detector in the background (autostart off by default - setting `WAKE_WORD_AUTOSTART`). While it runs, saying "JARVIS" over him cuts his speech (`BARGE_IN_ENABLED`; see "Special voice patterns").
   - "start listening for the wake word", "stop the hotword", "wake listener status"
@@ -439,7 +433,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - Actions: `set_voice_profile` / `use_voice_profile` / `switch_voice_profile`, `list_voice_profiles`, `voice_clone_status`, `disable_voice_clone` / `voice_clone_off` / `stop_voice_clone`
 - **Settings-only voice features** — `VOICE_MODE = realtime` (streaming pipeline; needs RealtimeSTT, RealtimeTTS and PyAudio, else falls back to turn-based; `turn_based` by default), `STT_HOTWORDS` / `STT_REPLACEMENTS` (names Whisper should expect, fixes for words it mishears; the wake words are never hotwords and an echo of the hint list is dropped), `FOLLOWUP_WINDOW_S` (follow-ups skip the wake word for N seconds; 0 by default), the processing filler (see "Special voice patterns"), and the self-echo, known-device and Whisper-noise filters (all on).
 
-### Category 18: Face recognition & Kinect
+### Category 17: Face recognition & Kinect
 
 - **Face recognition** (off by default - setting `FACE_ID_ENABLED`) — enroll faces from the webcams and say who is in front of them right now; identity questions are always a live camera look, never memory.
   - "learn my face", "who's at the desk", "is face recognition on"
@@ -467,7 +461,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - Actions: `point_control_on` / `point_control_off`, `point_calibrate`, `point_control`, `list_point_targets`, `forget_point_target`, `point_status`
 - **Two-hand window resize** — raise both hands to grab the focused window; spread to grow, pinch to shrink, slide to move (`skills/kinect_two_hand.py`, needs the Kinect on; no voice commands).
 
-### Category 19: Smart home & network
+### Category 18: Smart home & network
 
 - **Smart-home router** — natural-language control routed to whichever brand skill owns the device (Hue, Govee, LIFX, Kasa/Tapo, Tuya/Smart Life, Ecobee, Nest, Ring).
   - "turn off the office light", "dim the bedroom lamps to 30%", "set the living room thermostat to 72"
@@ -481,7 +475,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - "who's on the wifi", "is the Pi online", "network usage", "turn off guest wifi"
   - Actions: `who_is_on_wifi`, `is_device_online` / `device_online`, `bandwidth_hogs`, `deco_topology`, `deco_status`, `deco_refresh`, `kick_guest_network` / `disable_guest_network`, `enable_guest_network`
 
-### Category 20: Browser agent
+### Category 19: Browser agent
 
 - **Sandboxed browser automation** (Playwright + browser-use, separate profile from your everyday browser; needs `ANTHROPIC_API_KEY`).
   - "use the browser to find the cheapest flight to Tokyo next Friday" → `browser_task`
@@ -491,12 +485,12 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - "fill that form in with my name and email" → `fill_form` (stops short of submitting)
   - "how's the browser doing", "stop the browser", "open theverge.com in your browser" → `browser_status`, `browser_stop`, `browser_open`; also `browser_screenshot`, `browser_reset_profile` (wipes the agent's logins; confirm first)
 
-### Category 21: Mail, phone & notifications
+### Category 20: Mail, phone & notifications
 
 - **Email triage** — Gmail and Outlook (Microsoft Graph): unread roll-call, read a thread, categorise the inbox, a spoken inbox briefing, and drafted replies that send only on "send". On a local-only install it never sends mail to Claude (`core/cloud_gate.py`).
   - "check my email", "reply to that email", "send that draft", "archive that email"
   - Actions: `list_unread`, `read_email` / `read_thread`, `triage_inbox`, `email_briefing`, `draft_reply`, `confirm_pending_draft` / `send_draft`, `discard_draft`, `edit_pending_draft`, `archive_email`, `email_triage_status`
-- **Amazon order tracker** — reads order-update emails (the poller is off by default - setting `AMAZON_TRACKING_ENABLED`).
+- **Amazon order tracker** — reads order-update emails through its own read-only Gmail sign-in (`python -m skills.amazon_order_tracker --auth-gmail`, once, from a terminal). Until then it does nothing and "check my orders" says "I need a Google sign-in first, sir". The first look at the mailbox is silent; after that it announces shipped / out for delivery / delivered / delayed. Setting `AMAZON_TRACKING_ENABLED`.
   - "where's my Amazon order", "what was delivered this week"
   - Actions: `check_orders`, `recent_delivery`, `amazon_tracking_status`
 - **Windows notification triage** — captures toasts, applies your rules, reads back recent ones.
@@ -513,19 +507,16 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - "is the outbound gate armed"
   - Actions: `draft_preview_gate_status` / `outbound_gate_status`
 
-### Category 22: Creative & tool integrations
+### Category 21: Creative & tool integrations
 
 - **Website builder** (`skills/site_builder.py`) — "build a website for <business>" looks the business up, writes one complete, self-contained HTML page (no JavaScript) in the background — on Claude when the cloud is allowed, otherwise on the local model — saves it under the data folder's `sites/<name>/index.html`, announces it and opens it. It never publishes anything or contacts the business.
   - "build a website for Blue Door Bakery", "make a landing page for Blue Door Bakery in Springfield"
   - Action: `build_website`
-- **OBS Studio** — start/stop/pause recording, switch scenes, toggle a source's mute (OBS WebSocket).
-  - "start recording", "switch to gameplay scene", "mute the mic in OBS"
-  - Actions: `obs_start_recording`, `obs_stop_recording`, `obs_pause_recording`, `obs_switch_scene`, `obs_toggle_mute`
 - **Image generation** (off by default - setting `IMAGE_GEN_BACKEND`, `"off"`) — local SDXL-Turbo / ComfyUI.
   - "make me a picture of a Mars colony at sunset"
   - Actions: `generate_image`, `make_picture`
 
-### Category 23: Web dashboard & settings
+### Category 22: Web dashboard & settings
 
 - **Web dashboard** (`tools/web_interface.py`, served by `skills/web_interface.py`; off by default - setting `WEB_INTERFACE_ENABLED`) — binds 127.0.0.1 and refuses a non-local bind without a token. Views:
   - **Live** — status strip, standby banner, tray controls (including the pinned wake-word switch), quick-action buttons, log tail, typed command box.
@@ -538,7 +529,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - Actions: `web_interface_on`, `web_interface_off`, `web_interface_status`
 - **Settings window** (`tools/settings_window.py`) — 151 settings in seven tabs (Voice, Hearing & Mic, AI & Models, Cameras & Kinect, Privacy, Integrations, Advanced) plus integration status rows; the dashboard's Settings view renders the same schema. Values persist to `data/user_settings.json` (gitignored). A saved file can add confirmation keywords and screenshot-blocklist entries but never remove the shipped ones.
 
-### Category 24: Conversation modes, instant answers & command chaining
+### Category 23: Conversation modes, instant answers & command chaining
 
 - **Conversation modes** — Controlled (only exact, deterministically matched commands), Smart (default: the model chooses actions), Agent (plan → execute → critique → report, with a deeper follow-up loop). Persisted across restarts.
   - "agent mode", "controlled mode", "what mode are you in"
@@ -551,7 +542,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 - **"It" with nothing to mean** — "turn it off" with no device, media or recent line for "it" to refer to gets a question instead of a guess (`core/pronoun_switch.py`); the action-name corrector never maps a guessed name onto a destructive or self-terminating action, nor onto the opposite of what you asked (`core/action_risk.py`, `command_autocorrect.py`).
 - **Replay** — "do that again" / "replay that" → `replay_last_action` (non-destructive actions only).
 
-### Category 25: Talking-device companion (generic support)
+### Category 24: Talking-device companion (generic support)
 
 A desk robot companion over Wi-Fi is driven by a private skill that is not in this repo. The public tree supplies what any talking-device skill builds on:
 
@@ -559,10 +550,10 @@ A desk robot companion over Wi-Fi is driven by a private skill that is not in th
 - **Utterance routes** — a skill can claim an exact request ("talk to the <device> about pizza") before the model; `SKILL_ROUTES_ENABLED` turns routes off.
 - **After-reply hooks** (`register_after_reply`) — a skill sees each owner turn's reply after it is spoken (for example to let the device react).
 - **Known-device speech filter** (`core/device_speech_filter.py`, `DEVICE_SPEECH_FILTER_ENABLED`) — lines a device is known to say (phrase lists in the gitignored `data/device_phrases/`) never command JARVIS and are never learned; owner confirmations and stop words always get through.
-- **Phone pings** — a device skill can ask for one (`skill_utils["ping_phone"]`, `PHONE_PING_ROBOT`); see Category 21.
+- **Phone pings** — a device skill can ask for one (`skill_utils["ping_phone"]`, `PHONE_PING_ROBOT`); see Category 20.
 - **Dashboard panels** (`core/web_panels.py`) — a skill declares a panel with live state, controls and a pinned emergency stop.
 
-### Category 26: Speech recognition, speed work & turn telemetry
+### Category 25: Speech recognition, speed work & turn telemetry
 
 The "speed plan" work: each new engine ships off or in a log-only shadow mode and is judged by the per-turn timing line before it is switched on. The telemetry, the local prompt cache and answer-first are on.
 
@@ -594,7 +585,7 @@ The "speed plan" work: each new engine ships off or in a log-only shadow mode an
 - **Workshop auto-engagement** — opening any CAD/slicer app drops TTS volume 30%, shortens replies and engages focus mode for an hour (released when the app closes).
 - **Session resume greeting** — a restart within 18 h of the last session (but not within 15 minutes of it) offers to pick the thread back up.
 - **Promises ("I'll let you know when…")** — skills register a deferred announcement via `skill_utils["make_promise"]` (e.g. "tell me when the print finishes"); list or cancel them by voice.
-- **Phone pings** — when you are away from the desk, what needs you goes to your phone instead (Category 21).
+- **Phone pings** — when you are away from the desk, what needs you goes to your phone instead (Category 20).
 - **Processing filler** (off by default - setting `PROCESSING_FILLER_ENABLED`) — "Just a moment, sir." while a slow voice turn thinks; Kokoro backend only.
 
 ---

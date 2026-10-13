@@ -11,13 +11,13 @@ replaced the one-slot cache:
   _llm_quick<_worker   (learn)     pe=2682/393     <- evicts
   _call_llm                        pe=12549/2189   <- cold again
   [reprime] 2588 pe=12399                          <- idle re-prime ...
-  [local-vision] served via ...    (Teams nudger)  <- ... evicted 9 s later
+  [local-vision] served via ...    (a vision tick) <- ... evicted 9 s later
   _call_llm                        pe=12639/2181   <- cold
 
 WHAT THESE TESTS PIN
 ====================
 1. A TAGGED background local call (learn_from_turn, the ambient extractor /
-   judge / screen observer, the Teams nudger, the session checkpoint, the LTM
+   judge / screen observer, the session checkpoint, the LTM
    reflector) waits while the owner is in a conversation on the local route,
    bounded by LOCAL_BACKGROUND_MAX_DEFER_S (0 = off); an owner call and the
    main thread never wait; the cloud route never waits.

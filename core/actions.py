@@ -4799,7 +4799,7 @@ _VISION_CHAT_GUARD = (
     " Ignore chat and assistant windows (the Claude app, the JARVIS console, "
     "terminals) unless the question is about them.")
 # A question ABOUT a chat / messaging / terminal window keeps the note out
-# (the Teams nudger asks about Teams' chat sidebar). Not "jarvis" (review
+# (e.g. a question about the Teams chat sidebar). Not "jarvis" (review
 # 2026-10-02): in wake-word mode nearly every owner question starts "Jarvis,
 # ...", which dropped the note from exactly the looks live vision answered
 # from the chat window ("the JARVIS console" still counts, via "console").

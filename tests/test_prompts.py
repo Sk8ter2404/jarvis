@@ -214,20 +214,17 @@ class AirMousePromptHonestyTests(unittest.TestCase):
         self.assertIn("reach a hand out toward the Kinect", PC_CONTROL_PROMPT)
 
 
-class TeamsSectionHonestyTests(unittest.TestCase):
-    """The tracked prompt must not teach the gitignored screener's actions, and
-    its header must not promise a VIP screener the shipped tree cannot provide
-    (the only tracked handler under it is check_teams — the vision-based unread
-    sweep in skills/teams_nudge.py)."""
+class TeamsSectionRemovedTests(unittest.TestCase):
+    """The Teams unread nudger was removed (2026-10-12): the tracked prompt must
+    not advertise it, and must not teach the gitignored screener's actions."""
 
     def test_screener_actions_are_not_in_the_tracked_prompt(self):
         for name in ("answer_call", "decline_call", "vip_priority_handler"):
             self.assertNotIn(name, PC_CONTROL_PROMPT)
 
-    def test_header_describes_what_ships(self):
-        self.assertNotIn("TEAMS CALL SCREENING", PC_CONTROL_PROMPT)
-        self.assertIn("MICROSOFT TEAMS", PC_CONTROL_PROMPT)
-        self.assertIn("check_teams", PC_CONTROL_PROMPT)
+    def test_nudger_is_gone_from_the_prompt(self):
+        self.assertNotIn("MICROSOFT TEAMS", PC_CONTROL_PROMPT)
+        self.assertNotIn("check_teams", PC_CONTROL_PROMPT)
 
 
 class OvernightUpgradePromptHonestyTests(unittest.TestCase):

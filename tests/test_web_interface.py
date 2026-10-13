@@ -1223,7 +1223,7 @@ class RenderCapDisclosureTests(_ServerBase):
 
 class GuiOnlyKeyRoundTripTests(unittest.TestCase):
     """2026-07-21 fix: keys with NO core.config constant (the GUI-only
-    connection hints OBS_HOST_HINT / OBS_PORT_HINT / HUE_BRIDGE_IP_HINT) always
+    connection hint HUE_BRIDGE_IP_HINT) always
     rendered blank in the web panel — build_settings_schema sourced every value
     from core.config, so a successful save could never redisplay. Saved values
     must now round-trip from the file."""
@@ -1232,9 +1232,7 @@ class GuiOnlyKeyRoundTripTests(unittest.TestCase):
         # The card's exact failure: save a hint, re-build the payload, see it.
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "user_settings.json")
-            wanted = {"OBS_HOST_HINT": "localhost",
-                      "OBS_PORT_HINT": "4455",
-                      "HUE_BRIDGE_IP_HINT": "192.168.1.50"}
+            wanted = {"HUE_BRIDGE_IP_HINT": "192.168.1.50"}
             wi._write_settings(wanted, p)
             by_name = {it["name"]: it
                        for it in wi.build_settings_schema(p)["settings"]}
@@ -1257,9 +1255,9 @@ class GuiOnlyKeyRoundTripTests(unittest.TestCase):
                     and sw.SCHEMA[k].get("type") != "status"
                     and k not in wi._SECRET_SETTING_KEYS
                     and not hasattr(core_config, k)]
-        # The three hint keys are the known members; an empty derivation would
+        # The hint key is the known member; an empty derivation would
         # mean this invariant tests nothing.
-        for known in ("OBS_HOST_HINT", "OBS_PORT_HINT", "HUE_BRIDGE_IP_HINT"):
+        for known in ("HUE_BRIDGE_IP_HINT",):
             self.assertIn(known, gui_only)
 
         def _distinct(spec, i):

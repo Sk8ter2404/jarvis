@@ -34,7 +34,7 @@ WHAT THIS MODULE HOLDS (stdlib only, so the CI-light tier covers it)
 SPEED PLAN R5 (2026-10-02): THE CALLERS TAGGED LATER
 ====================================================
 The first tags (learn_from_turn, the ambient extractor / judge / screen
-observer, the Teams nudger, the session checkpoint, the LTM reflector) wait
+observer, the session checkpoint, the LTM reflector) wait
 for real. The background callers found untagged afterwards (the notification
 classifier, Chappie's daemon, the credits monitor, the scheduled evening
 briefing, the morning chain's briefing / handoff) are tagged

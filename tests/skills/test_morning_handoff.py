@@ -162,32 +162,6 @@ class MorningHandoffTests(unittest.TestCase):
         with mock.patch.object(self.mod, "_import_skill", return_value=ms):
             self.assertEqual(self.mod._section_calendar(), "")
 
-    # ── _section_teams_vip ───────────────────────────────────────────────
-    def test_teams_vip_emphasis(self):
-        # VIP emphasis fires only when the configured JARVIS_VIP_NAME is the
-        # visible sender.
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.return_value = (True, 2, "Sam Industries")
-        with mock.patch.dict(os.environ, {"JARVIS_VIP_NAME": "Sam"}), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            out = self.mod._section_teams_vip()
-        self.assertIn("Sam Industries", out)
-        self.assertIn("2 unread messages", out)
-
-    def test_teams_single_non_vip(self):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.return_value = (True, 1, "Alex")
-        with mock.patch.dict(os.environ, {"JARVIS_VIP_NAME": "Sam"}), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            out = self.mod._section_teams_vip()
-        self.assertEqual(out, "One unread message on Teams from Alex, sir.")
-
-    def test_teams_nothing_unread(self):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.return_value = (False, 0, "")
-        with mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            self.assertEqual(self.mod._section_teams_vip(), "")
-
     # ── _section_print ───────────────────────────────────────────────────
     def test_section_print_finished(self):
         bm = mock.MagicMock()
@@ -215,7 +189,6 @@ class MorningHandoffTests(unittest.TestCase):
     def test_build_handoff_chains_sections(self):
         with mock.patch.object(self.mod, "_section_weather", return_value="64 degrees and clear."), \
              mock.patch.object(self.mod, "_section_calendar", return_value="From Outlook: 1 unread email."), \
-             mock.patch.object(self.mod, "_section_teams_vip", return_value=""), \
              mock.patch.object(self.mod, "_section_print", return_value=""), \
              mock.patch.object(self.mod, "_section_news", return_value="Today's headlines, sir. X."):
             out = self.mod._build_handoff(setup_line="Workshop is yours, sir.")
@@ -230,7 +203,6 @@ class MorningHandoffTests(unittest.TestCase):
         boom = mock.MagicMock(side_effect=RuntimeError("boom"), __name__="_section_weather")
         with mock.patch.object(self.mod, "_section_weather", boom), \
              mock.patch.object(self.mod, "_section_calendar", return_value=""), \
-             mock.patch.object(self.mod, "_section_teams_vip", return_value=""), \
              mock.patch.object(self.mod, "_section_print", return_value=""), \
              mock.patch.object(self.mod, "_section_news", return_value=""):
             out = self.mod._build_handoff()
@@ -497,85 +469,6 @@ class SectionCalendarTests(unittest.TestCase):
         with mock.patch.object(self.mod, "_import_skill", return_value=ms):
             out = self.mod._section_calendar()
         self.assertEqual(out, "From Outlook: 3 unread emails.")
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# _section_teams_vip — VIP detection (present / absent / empty env)
-# ─────────────────────────────────────────────────────────────────────────
-class SectionTeamsVipTests(unittest.TestCase):
-    def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
-
-    def _tn(self, state):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.return_value = state
-        return tn
-
-    def test_degraded_when_no_teams_nudge(self):
-        with mock.patch.object(self.mod, "_import_skill", return_value=None):
-            self.assertEqual(self.mod._section_teams_vip(), "")
-
-    def test_vision_raises_returns_blank(self):
-        tn = mock.MagicMock()
-        tn._ask_vision_for_teams_state.side_effect = RuntimeError("blind")
-        with mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            self.assertEqual(self.mod._section_teams_vip(), "")
-
-    def test_vip_single_message(self):
-        tn = self._tn((True, 1, "Sam Industries"))
-        with mock.patch.dict(os.environ, {"JARVIS_VIP_NAME": "Sam"}), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            out = self.mod._section_teams_vip()
-        self.assertEqual(out, "You have a message on Teams from Sam Industries, sir.")
-
-    def test_vip_multiple_messages(self):
-        tn = self._tn((True, 4, "Sam"))
-        with mock.patch.dict(os.environ, {"JARVIS_VIP_NAME": "Sam"}), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            out = self.mod._section_teams_vip()
-        self.assertIn("4 unread messages on Teams, sir", out)
-        self.assertIn("including one from Sam", out)
-
-    def test_vip_env_empty_falls_through_to_generic(self):
-        # JARVIS_VIP_NAME unset → vip=False even though sender present.
-        tn = self._tn((True, 2, "Sam"))
-        env_no_vip = {k: v for k, v in os.environ.items() if k != "JARVIS_VIP_NAME"}
-        with mock.patch.dict(os.environ, env_no_vip, clear=True), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            out = self.mod._section_teams_vip()
-        # Generic multi-message wording, NOT the VIP "sir — including" phrasing.
-        self.assertIn("2 unread messages on Teams, sir.", out)
-        self.assertIn("The latest is from Sam.", out)
-        self.assertNotIn("including one from", out)
-
-    def test_vip_name_not_in_sender_uses_generic(self):
-        tn = self._tn((True, 1, "Alex"))
-        with mock.patch.dict(os.environ, {"JARVIS_VIP_NAME": "Sam"}), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            out = self.mod._section_teams_vip()
-        self.assertEqual(out, "One unread message on Teams from Alex, sir.")
-
-    def test_single_message_no_sender(self):
-        tn = self._tn((True, 1, ""))
-        with mock.patch.dict(os.environ, {"JARVIS_VIP_NAME": "Sam"}), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            self.assertEqual(self.mod._section_teams_vip(),
-                             "One unread message on Teams, sir.")
-
-    def test_multi_message_no_sender(self):
-        tn = self._tn((True, 3, ""))
-        with mock.patch.dict(os.environ, {"JARVIS_VIP_NAME": "Sam"}), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            out = self.mod._section_teams_vip()
-        self.assertEqual(out, "3 unread messages on Teams, sir.")
-
-    def test_whitespace_only_vip_env_is_not_vip(self):
-        # vip_name strips to "" → bool(vip_name) is False, generic path.
-        tn = self._tn((True, 1, "Sam"))
-        with mock.patch.dict(os.environ, {"JARVIS_VIP_NAME": "   "}), \
-             mock.patch.object(self.mod, "_import_skill", return_value=tn):
-            out = self.mod._section_teams_vip()
-        self.assertEqual(out, "One unread message on Teams from Sam, sir.")
 
 
 # ─────────────────────────────────────────────────────────────────────────

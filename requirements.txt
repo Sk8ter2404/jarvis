@@ -120,13 +120,6 @@ psutil
 # Bambu H2D printer monitor skill — MQTT client for the printer's local API
 paho-mqtt
 
-# OBS Studio voice control skill — WebSocket client for OBS 28+ (v5 protocol,
-# ws://127.0.0.1:4455). OPTIONAL: the skill registers cleanly without it and
-# tells the user to install it on first call. Set OBS_PASSWORD env var to
-# match Tools → WebSocket Server Settings.
-# Uncomment to install:
-# obs-websocket-py
-
 # Microsoft Graph (skills/ms_graph.py) — calendar + unread-mail count for the
 # morning briefing & HUD card. Replaces the Outlook COM lookup that broke
 # whenever Outlook desktop wasn't running. Auth via device-code flow:
