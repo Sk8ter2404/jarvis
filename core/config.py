@@ -1477,6 +1477,22 @@ PHONE_PING_AWAY_MIN = 10.0
 PHONE_PING_CONFIRM_AFTER_MIN = 2.0
 
 
+# ─── Discord bridge (core/discord_bridge.py, skills/phone_bridge.py) ────
+# JARVIS DMs you on Discord and you DM the bot to talk to him (each DM is
+# handled like a typed command and answered in the same DM). The bot token and
+# YOUR Discord user id come ONLY from the environment (DISCORD_BOT_TOKEN,
+# DISCORD_OWNER_ID), never from this file; with either missing everything
+# here is inert. Only DMs from your id are acted on. Walk-through:
+# docs/DISCORD_SETUP.md.
+# DISCORD_ENABLED — master switch for sending AND listening.
+# DISCORD_INBOUND — listen for your DMs (off = alerts out only).
+# DISCORD_NTFY_FALLBACK_ONLY — alerts go to Discord first and ntfy only when
+#   the Discord send fails. Off = send to both.
+DISCORD_ENABLED = True
+DISCORD_INBOUND = True
+DISCORD_NTFY_FALLBACK_ONLY = True
+
+
 # ─── Capture auto-gain (quiet-mic normalization before Whisper) ────────
 # CONSERVATIVE input normalization applied to the recorded float32 buffer
 # right BEFORE faster-whisper sees it, on BOTH the normal turn and the

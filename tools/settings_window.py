@@ -1874,13 +1874,36 @@ SCHEMA: dict[str, dict] = {
     },
     "_status_phone": {
         "tab": "integrations", "label": "Phone bridge / push", "type": "status",
-        "secret_env": ["TELEGRAM_BOT_TOKEN", "NTFY_TOPIC", "PUSHOVER_TOKEN"],
-        "help": "PRESENT if any one channel (Telegram / ntfy / Pushover) is set.",
+        "secret_env": ["DISCORD_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "NTFY_TOPIC",
+                       "PUSHOVER_TOKEN"],
+        "help": "PRESENT if any one channel (Discord / Telegram / ntfy / "
+                "Pushover) is set.",
         "match": "any",
     },
     # Phone pings (core/phone_ping.py): read live on every ping, so a change
     # here applies at once. "turn off / on phone pings" by voice saves
     # PHONE_PING_ENABLED.
+    "DISCORD_ENABLED": {
+        "tab": "integrations", "label": "Discord: DM me and take my DMs",
+        "type": "bool", "default": True,
+        "help": "Alerts arrive as Discord DMs and you can DM the bot to talk "
+                "to JARVIS. Does nothing until DISCORD_BOT_TOKEN and "
+                "DISCORD_OWNER_ID are set in your environment (never saved "
+                "here). Only DMs from your own id are obeyed. See "
+                "docs/DISCORD_SETUP.md.",
+    },
+    "DISCORD_INBOUND": {
+        "tab": "integrations", "label": "Discord: listen for my DMs",
+        "type": "bool", "default": True,
+        "help": "Off = Discord is send-only (alerts out, nothing read). "
+                "Applies at the next JARVIS start.",
+    },
+    "DISCORD_NTFY_FALLBACK_ONLY": {
+        "tab": "integrations", "label": "Discord first, ntfy only as backup",
+        "type": "bool", "default": True,
+        "help": "Alerts go to Discord and ntfy is used only when the Discord "
+                "send fails. Off = every alert goes to both.",
+    },
     "PHONE_PING_ENABLED": {
         "tab": "integrations", "label": "Ping my phone when something needs me",
         "type": "bool", "default": True,
@@ -2359,7 +2382,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                          "_status_azure_tts", "_status_elevenlabs",
                          "_status_bambu", "_status_govee", "_status_hue",
                          "_status_obs", "_status_deco", "_status_phone"]),
-        ("Phone pings", ["PHONE_PING_ENABLED", "PHONE_PING_PRINT",
+        ("Phone pings", ["DISCORD_ENABLED", "DISCORD_INBOUND",
+                         "DISCORD_NTFY_FALLBACK_ONLY", "PHONE_PING_ENABLED", "PHONE_PING_PRINT",
                          "PHONE_PING_CONFIRM", "PHONE_PING_SECURITY",
                          "PHONE_PING_ROBOT", "PHONE_PING_SUMMARY",
                          "PHONE_PING_SUMMARY_TIME", "PHONE_PING_MAX_PER_HOUR",

@@ -1,9 +1,18 @@
 """
 Phone bridge — push to / pull from the user's mobile phone.
 
-Closes the "JARVIS only works when I'm at my desk" gap. Three pluggable
+Closes the "JARVIS only works when I'm at my desk" gap. Four pluggable
 backends, configured via env vars; the skill registers cleanly even when
 none are configured and every action reports the precise setup hint.
+
+  Discord (two-way, the primary phone channel; core/discord_bridge.py):
+    DISCORD_BOT_TOKEN   — the bot token from the Discord developer portal
+    DISCORD_OWNER_ID    — the owner's numeric Discord user id
+    Alerts arrive as DMs from the bot; ntfy is only the FALLBACK, used when
+    the Discord send fails (DISCORD_NTFY_FALLBACK_ONLY=False sends both).
+    The owner DMs the bot and each DM is handled like a typed command, the
+    reply coming back in the same DM. ONLY the owner's id may command it.
+    See docs/DISCORD_SETUP.md.
 
   Telegram (two-way, primary, free):
     TELEGRAM_BOT_TOKEN  — get from @BotFather on Telegram
@@ -139,6 +148,15 @@ except Exception as _dc_err:
     _log.warning("[phone] draft_confirm unavailable (%s); pushes will "
                  "fail-closed unless confirm=False is passed explicitly",
                  _dc_err)
+
+# Discord two-way bridge (core/discord_bridge.py). Stdlib + requests for the
+# outbound half, `websockets` (imported lazily) for the DM listener.
+try:
+    from core import discord_bridge as _discord
+except Exception as _dc2_err:   # pragma: no cover - core is in-tree
+    _discord = None  # type: ignore[assignment]
+    _log.warning("[phone] core.discord_bridge unavailable (%s); no Discord",
+                 _dc2_err)
 
 # Proactive-ping policy (core/phone_ping.py). Stdlib-only; None only if core
 # itself is broken, and then every ping action says so.
@@ -285,6 +303,15 @@ def _telegram_configured() -> bool:
     return bool(_telegram_token())
 
 
+def _discord_configured() -> bool:
+    """DISCORD_BOT_TOKEN + DISCORD_OWNER_ID set (and DISCORD_ENABLED on)."""
+    try:
+        return bool(_discord is not None and _cfg("DISCORD_ENABLED", True)
+                    and _discord.configured())
+    except Exception:
+        return False
+
+
 def _ntfy_configured() -> bool:
     topic, _host = _ntfy_config()
     return bool(topic)
@@ -296,20 +323,24 @@ def _pushover_configured() -> bool:
 
 
 def any_backend_configured() -> bool:
-    return _telegram_configured() or _ntfy_configured() or _pushover_configured()
+    return (_discord_configured() or _telegram_configured()
+            or _ntfy_configured() or _pushover_configured())
 
 
 def can_push_unsolicited() -> bool:
     """True when at least one backend can message the owner WITHOUT him
     writing first: Telegram only with a TELEGRAM_USER_ID to send to (a token
     alone can only reply), ntfy or Pushover whenever set."""
-    return ((_telegram_configured() and bool(_telegram_whitelist()))
+    return (_discord_configured()
+            or (_telegram_configured() and bool(_telegram_whitelist()))
             or _ntfy_configured() or _pushover_configured())
 
 
 def configured_backend_names() -> list[str]:
     """The backends a proactive ping would go out on, in send order."""
     names = []
+    if _discord_configured():
+        names.append("discord")
     if _telegram_configured() and _telegram_whitelist():
         names.append("telegram")
     if _ntfy_configured():
@@ -382,6 +413,25 @@ def _send_telegram(message: str, *, chat_id: int | None = None) -> bool:
                 _status["last_error"] = f"telegram: {e}"
             ok_all = False
     return ok_all
+
+
+def _send_discord(message: str, *, title: str = "", priority: str = "normal") -> bool:
+    """DM the owner on Discord. A title other than the default and an
+    urgent / high priority are folded into the text (Discord DMs have neither
+    field)."""
+    if not _discord_configured():
+        return False
+    body = message
+    if title and title.strip().upper() != "JARVIS":
+        body = f"**{title.strip()}**\n{body}"
+    if priority in ("high", "urgent"):
+        body = f"**[{priority.upper()}]** {body}"
+    ok = _discord.send_dm(body)
+    if not ok:
+        with _state_lock:
+            _status["last_error"] = "discord: " + str(
+                _discord.status().get("last_error") or "send failed")
+    return ok
 
 
 def _send_ntfy(message: str, *, title: str = "", priority: str = "normal") -> bool:
@@ -480,14 +530,15 @@ def push_to_phone(message: str,
       - ntfy maps it to its 5-level scale.
       - Pushover urgent triggers the retry/expire flow that re-pings
         until the user acknowledges.
+      - Discord folds high / urgent into a bold tag at the front of the DM.
       - Telegram has no priority concept (every message arrives equally);
         the field is accepted but ignored on that backend.
 
     `source` is just a tag used in the console fallback log so it's
     obvious which skill produced the push when no backend is configured.
 
-    `title` is used only by ntfy + Pushover (Telegram has no title field
-    on plain text messages).
+    `title` is used by ntfy + Pushover (and shown bold by Discord when it is
+    not the default); Telegram has no title field on plain text messages.
 
     `backends` restricts the broadcast to a subset (e.g.
     ['ntfy', 'pushover']) when a skill wants a specific delivery
@@ -533,11 +584,21 @@ def push_to_phone(message: str,
     def _want(name: str) -> bool:
         return not requested or name in requested
 
+    # Discord first. ntfy is the backup: with no explicit `backends` list it
+    # is skipped when the Discord DM went through (and used when it did not).
+    if _want("discord") and _discord_configured():
+        results["discord"] = _send_discord(message, title=title,
+                                           priority=priority)
+
     if _want("telegram") and _telegram_configured():
         results["telegram"] = _send_telegram(message)
 
     if _want("ntfy") and _ntfy_configured():
-        results["ntfy"] = _send_ntfy(message, title=title, priority=priority)
+        _ntfy_is_backup = (not requested and results.get("discord") is True
+                           and bool(_cfg("DISCORD_NTFY_FALLBACK_ONLY", True)))
+        if not _ntfy_is_backup:
+            results["ntfy"] = _send_ntfy(message, title=title,
+                                         priority=priority)
 
     if _want("pushover") and _pushover_configured():
         results["pushover"] = _send_pushover(message, title=title, priority=priority)
@@ -711,6 +772,8 @@ def _dispatch_remote(text: str) -> str:
 
 def _help_text() -> str:
     backends_present = []
+    if _discord_configured():
+        backends_present.append("discord")
     if _telegram_configured():
         backends_present.append("telegram")
     if _ntfy_configured():
@@ -932,6 +995,62 @@ def _start_polling_thread() -> None:
     _polling_thread[0] = th
 
 
+# ─── Inbound: Discord DM listener (core/discord_bridge.py) ──────────────
+
+_discord_client: list[Any] = [None]
+
+
+def _discord_handle(text: str) -> str:
+    """One owner DM -> one reply. Same pipeline as a Telegram text (chain ->
+    single intent -> stateless LLM), minus /pause and /resume: those stop
+    the Telegram poller and mean nothing here."""
+    text = (text or "").strip()
+    if text.startswith("/"):
+        cmd = text.partition(" ")[0].lower().lstrip("/")
+        if cmd in ("pause", "resume"):
+            return ("Pausing is a desk command, sir - say 'pause phone "
+                    "bridge' there.")
+        return _handle_slash(text)
+    return _dispatch_remote(text)
+
+
+def _discord_listener_blocked() -> str:
+    """Why the DM listener must not start in this process ('' = it may).
+    A staging / test instance with the same bot token would answer every DM
+    twice."""
+    try:
+        if _phone_ping is not None:
+            why = _phone_ping._live_blocked()
+            if why:
+                return why
+    except Exception:
+        pass
+    if os.environ.get("JARVIS_STAGING", "").strip() == "1"             or "--staging" in sys.argv:
+        return "staging"
+    if os.environ.get("JARVIS_TEST_MODE", "").strip() == "1":
+        return "test mode"
+    return ""
+
+
+def _start_discord_listener() -> bool:
+    """Start the Discord DM listener (own thread + event loop, never on the
+    voice loop). Idempotent. False when it did not start."""
+    if not _discord_configured():
+        return False
+    if not bool(_cfg("DISCORD_INBOUND", True)):
+        print("  [discord] DM listener off (DISCORD_INBOUND)")
+        return False
+    why = _discord_listener_blocked()
+    if why:
+        print(f"  [discord] DM listener not started ({why} instance)")
+        return False
+    c = _discord_client[0]
+    if c is None:
+        c = _discord.GatewayClient(_discord_handle)
+        _discord_client[0] = c
+    return bool(c.start())
+
+
 # ─── Action handlers ────────────────────────────────────────────────────
 
 def _format_priority_arg(arg: str) -> tuple[str, str]:
@@ -964,9 +1083,10 @@ def notify_phone(arg: str) -> str:
         return ("Pass the message to send, sir — e.g. 'notify phone print "
                 "finished' or '!urgent build is red'.")
     if not any_backend_configured():
-        return ("No phone backends configured, sir. Set TELEGRAM_BOT_TOKEN + "
-                "TELEGRAM_USER_ID, or NTFY_TOPIC, or PUSHOVER_TOKEN + "
-                "PUSHOVER_USER, then reload.")
+        return ("No phone backends configured, sir. Set DISCORD_BOT_TOKEN + "
+                "DISCORD_OWNER_ID, or TELEGRAM_BOT_TOKEN + TELEGRAM_USER_ID, "
+                "or NTFY_TOPIC, or PUSHOVER_TOKEN + PUSHOVER_USER, then "
+                "reload.")
     results = push_to_phone(message, priority=priority, source="voice")
     if results is None:
         # The read-back was denied (or never confirmed) — a deliberate
@@ -985,6 +1105,13 @@ def notify_phone(arg: str) -> str:
 
 def phone_bridge_status(_: str = "") -> str:
     bits: list[str] = []
+
+    if _discord_configured():
+        ds = _discord.status()
+        bits.append("discord (" + ("listening" if ds.get("connected")
+                                   else "not connected") + ")")
+    else:
+        bits.append("discord: no")
 
     if _telegram_configured():
         wl = _telegram_whitelist()
@@ -1017,6 +1144,13 @@ def phone_bridge_status(_: str = "") -> str:
 
 def list_phone_backends(_: str = "") -> str:
     lines = []
+    if _discord_configured():
+        ds = _discord.status()
+        lines.append("discord: configured, owner-only DMs, "
+                     + ("listening" if ds.get("connected") else "not connected"))
+    else:
+        lines.append("discord: NOT configured (set DISCORD_BOT_TOKEN + "
+                     "DISCORD_OWNER_ID)")
     if _telegram_configured():
         wl = sorted(_telegram_whitelist())
         wl_str = ", ".join(str(x) for x in wl) if wl else "(none — no inbound)"
@@ -1114,7 +1248,9 @@ _SETUP_STEPS = (
     "get your numeric user ID, and add it as TELEGRAM_USER_ID. Four: open a "
     "chat with your new bot and press Start, so it's allowed to message you. "
     "Five: restart me, then say 'send a test ping'. If you'd rather not use "
-    "Telegram, an ntfy topic in NTFY_TOPIC works for one-way pings."
+    "Telegram, an ntfy topic in NTFY_TOPIC works for one-way pings. A "
+    "Discord bot also works and is two-way: set DISCORD_BOT_TOKEN and "
+    "DISCORD_OWNER_ID, the steps are in the Discord setup guide in my docs folder."
 )
 
 _SETUP_NEEDS_USER_ID = (
@@ -1384,9 +1520,12 @@ def register(actions):
 
     # Kick off the inbound long-poll only when a Telegram token is set.
     _start_polling_thread()
+    _start_discord_listener()
     _attach_pings()
 
     configured = []
+    if _discord_configured():
+        configured.append("discord")
     if _telegram_configured():
         configured.append("telegram")
     if _ntfy_configured():
@@ -1397,5 +1536,6 @@ def register(actions):
         print(f"  [phone] phone_bridge ready — backends: {', '.join(configured)}")
     else:
         print("  [phone] phone_bridge loaded — no backends configured "
-              "(set TELEGRAM_BOT_TOKEN + TELEGRAM_USER_ID, NTFY_TOPIC, or "
-              "PUSHOVER_TOKEN + PUSHOVER_USER)")
+              "(set DISCORD_BOT_TOKEN + DISCORD_OWNER_ID, TELEGRAM_BOT_TOKEN + "
+              "TELEGRAM_USER_ID, NTFY_TOPIC, or PUSHOVER_TOKEN + "
+              "PUSHOVER_USER)")

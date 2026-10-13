@@ -242,8 +242,18 @@ winrt-Windows.Media.Control==3.2.1; sys_platform == "win32"
 #   • ntfy (one-way push, no account): set NTFY_TOPIC; install the free
 #       ntfy app on your phone and subscribe to ntfy.sh/<topic>.
 #   • Pushover (one-way push, paid): set PUSHOVER_TOKEN + PUSHOVER_USER.
+#   • Discord (two-way, the primary phone channel; core/discord_bridge.py):
+#       set DISCORD_BOT_TOKEN and DISCORD_OWNER_ID (env vars only, never the
+#       settings file). Alerts arrive as DMs from the bot with ntfy as the
+#       fallback; DMs from the owner's id are run as typed commands. NOT
+#       discord.py: the gateway client is ~400 lines over `requests` plus the
+#       `websockets` package below, so no event-loop-owning framework.
+#       Setup walk-through: docs/DISCORD_SETUP.md.
 # Override the stateless LLM model used to answer phone questions via
 # PHONE_BRIDGE_MODEL (default mirrors bobert_companion.CLAUDE_MODEL).
+
+websockets>=12         # Discord gateway client (core/discord_bridge.py); optional,
+                       # imported lazily only when DISCORD_BOT_TOKEN is set
 
 # YouTube direct-URL resolver (skills/youtube_search.py). OPTIONAL.
 # Lets JARVIS resolve a search query to the canonical
