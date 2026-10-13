@@ -33,7 +33,8 @@ class CloudFallbackSelfKnowledgeTests(MonolithGlobalsTestCase):
         before = [dict(m) for m in msgs]
         seen = {}
 
-        def _cloud(system, messages, max_tokens=500):
+        def _cloud(system, messages, max_tokens=500, **_kw):
+            # **_kw: the real _claude_oneshot takes boost= (CLOUD_BOOST_UNTIL)
             seen["msgs"] = messages
             return "I am JARVIS, sir."
         with mock.patch.object(bc, "_call_local_llm", return_value=None), \

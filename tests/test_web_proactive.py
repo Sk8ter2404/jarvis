@@ -71,6 +71,9 @@ _BOOL_FLAG = re.compile(r"^([A-Z][A-Z0-9_]*)\s*=\s*(?:True|False)\b", re.M)
 # Matches of the grep that are NOT a behaviour of their own, and why.
 _RETIRED = "a retired overlay, superseded by the unified HUD (forced off)"
 NOT_PROACTIVE = {
+    "AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA": "a condition on audio auto-switch "
+                                           "(its row): waits while media "
+                                           "plays, starts nothing",
     "AMBIENT_LEARNING_FORCE_LOCAL": "picks the model ambient learning uses",
     "AMBIENT_MUSIC_REFUSE_WAKE": "a wake-word filter",
     "AMBIENT_STT_YIELD": "scheduling inside ambient listening",
