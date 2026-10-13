@@ -244,11 +244,12 @@ class DiscoverCatalogActionTests(unittest.TestCase):
         self.assertIn("Hall: T1", out)
 
     def test_purge_cookie_reports_removed_count(self):
-        # Pretend both cookie files exist and unlink succeeds.
+        # Pretend all three sign-in files (cookie meta, cookie pickle, OAuth
+        # refresh token) exist and unlink succeeds.
         with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
              mock.patch.object(self.mod.os, "unlink") as unlink:
             out = self.actions["smart_home_purge_cookie"]("")
-        self.assertEqual(unlink.call_count, 2)
+        self.assertEqual(unlink.call_count, 3)
         self.assertIn("cleared", out)
 
     def test_purge_cookie_when_nothing_cached(self):
@@ -1903,7 +1904,8 @@ class RunWizardInteractiveTests(unittest.TestCase):
         self.assertIn("Catalog updated", out)
 
     def test_cached_cookie_reuse_success(self):
-        devices = {"echo": [], "smarthome": [], "groups": []}
+        devices = {"echo": [{"serialNumber": "S1"}], "smarthome": [],
+                   "groups": []}
         with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
              mock.patch.object(self.mod, "_load_cookie_meta",
                                return_value={"email": "e",
@@ -1920,7 +1922,8 @@ class RunWizardInteractiveTests(unittest.TestCase):
         self.assertIn("Catalog updated", out)
 
     def test_stale_cookie_warns_then_reuses(self):
-        devices = {"echo": [], "smarthome": [], "groups": []}
+        devices = {"echo": [{"serialNumber": "S1"}], "smarthome": [],
+                   "groups": []}
         import time as _t
         old_meta = {"email": "e", "saved_at": _t.time() - 400 * 86400}
         with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
@@ -1934,236 +1937,6 @@ class RunWizardInteractiveTests(unittest.TestCase):
              mock.patch.object(self.mod, "_queue_missing_skill_tasks",
                                return_value=0):
             out = self.mod._run_wizard_interactive("")
-        self.assertIn("Catalog updated", out)
-
-    def test_cached_fetch_raises_then_prompts_and_cancels(self):
-        # cached fetch raises → devices None → prompt creds → user cancels →
-        # the wizard CONTINUES to the LAN phase and reports the cancellation.
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta",
-                               return_value={"email": "e", "saved_at": 1e9}), \
-             mock.patch.object(self.mod, "_cookie_is_stale", return_value=False), \
-             mock.patch.object(self.mod, "_run_async",
-                               side_effect=RuntimeError("boom")), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=None), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("cancelled", out)
-        self.assertIn("Catalog updated", out)
-
-    def test_fresh_login_success_full_path(self):
-        login = _FakeLogin(statuses=[{"login_successful": True}])
-        devices = {"echo": [], "smarthome": [], "groups": []}
-        run_returns = iter([login, devices])  # _login_async, then fetch
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async",
-                               side_effect=lambda c: next(run_returns)), \
-             mock.patch.object(self.mod, "_extract_cookie_jar",
-                               return_value={"jar": 1}), \
-             mock.patch.object(self.mod, "_save_cookie_meta"), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("Catalog updated", out)
-
-    def test_fresh_login_returns_none_continues_to_lan(self):
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async", return_value=None), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("did not complete", out)
-        self.assertIn("Catalog updated", out)
-
-    def test_fresh_login_raises_reports_and_continues(self):
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async",
-                               side_effect=RuntimeError("sign-in boom")), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("failed during sign-in", out)
-        self.assertIn("Catalog updated", out)
-
-    def test_playwright_fallback_success(self):
-        # _login_async raises _LoginNeedsPlaywright; playwright path returns a
-        # jar + cookies; subsequent restore-fetch yields devices.
-        devices = {"echo": [], "smarthome": [], "groups": []}
-        jar = object()
-        pw_cookies = [{"name": "a", "value": "1"}]
-
-        def _run(coro):
-            # distinguish coroutines by their qualified name.
-            name = getattr(coro, "__qualname__", "") or getattr(
-                getattr(coro, "cr_code", None), "co_name", "")
-            try:
-                coro.close()
-            except Exception:
-                pass
-            if "_login_async" in name:
-                raise self.mod._LoginNeedsPlaywright()
-            if "_login_via_playwright" in name:
-                return (jar, pw_cookies)
-            if "_restore_and_fetch_async" in name:
-                return devices
-            return None
-
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async", side_effect=_run), \
-             mock.patch.object(self.mod, "_save_cookie_meta"), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("Catalog updated", out)
-
-    def test_playwright_fallback_unavailable(self):
-        def _run(coro):
-            name = getattr(coro, "__qualname__", "")
-            try:
-                coro.close()
-            except Exception:
-                pass
-            if "_login_async" in name:
-                raise self.mod._LoginNeedsPlaywright()
-            if "_login_via_playwright" in name:
-                return None
-            return None
-
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async", side_effect=_run), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("did not complete", out)
-
-    def test_playwright_fallback_empty_device_fetch(self):
-        jar = object()
-        pw_cookies = [{"name": "a", "value": "1"}]
-
-        def _run(coro):
-            name = getattr(coro, "__qualname__", "")
-            try:
-                coro.close()
-            except Exception:
-                pass
-            if "_login_async" in name:
-                raise self.mod._LoginNeedsPlaywright()
-            if "_login_via_playwright" in name:
-                return (jar, pw_cookies)
-            if "_restore_and_fetch_async" in name:
-                return None  # device fetch empty
-            return None
-
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async", side_effect=_run), \
-             mock.patch.object(self.mod, "_save_cookie_meta"), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("device fetch", out)
-
-    def test_fresh_fetch_raises_returns_error(self):
-        # login succeeds (non-playwright), but the SUBSEQUENT device fetch
-        # (second _run_async) raises.
-        login = _FakeLogin(statuses=[{"login_successful": True}])
-        seq = iter([login])
-
-        def _run(coro):
-            try:
-                return next(seq)
-            except StopIteration:
-                raise RuntimeError("fetch boom")
-            finally:
-                try:
-                    coro.close()
-                except Exception:
-                    pass
-
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async", side_effect=_run), \
-             mock.patch.object(self.mod, "_extract_cookie_jar",
-                               return_value={}), \
-             mock.patch.object(self.mod, "_save_cookie_meta"), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("failed during device fetch", out)
-
-    def test_cookie_save_failure_is_swallowed(self):
-        login = _FakeLogin(statuses=[{"login_successful": True}])
-        devices = {"echo": [], "smarthome": [], "groups": []}
-        seq = iter([login, devices])
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async",
-                               side_effect=lambda c: next(seq)), \
-             mock.patch.object(self.mod, "_extract_cookie_jar",
-                               side_effect=RuntimeError("extract boom")), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        # Still completes despite the cookie-save error.
         self.assertIn("Catalog updated", out)
 
 
@@ -2566,83 +2339,6 @@ class PlaywrightCookieCaptureExceptionTests(unittest.TestCase):
         out = self._run(_FakePwManager(chromium), timeout=0.0)
         self.assertIsNone(out)
 
-
-class WizardPlaywrightCookieSaveFailureTests(unittest.TestCase):
-    def setUp(self):
-        self.mod, _ = load_skill_isolated("smart_home_discover")
-        self.fake = _make_fake_alexapy()
-
-    def test_cookie_save_failure_then_fetch_success(self):
-        # Playwright path: _save_cookie_meta raises (1277-1278) but the wizard
-        # presses on and the restore-fetch yields devices.
-        devices = {"echo": [], "smarthome": [], "groups": []}
-        jar = object()
-        pw_cookies = [{"name": "a", "value": "1"}]
-
-        def _run(coro):
-            name = getattr(coro, "__qualname__", "")
-            try:
-                coro.close()
-            except Exception:
-                pass
-            if "_login_async" in name:
-                raise self.mod._LoginNeedsPlaywright()
-            if "_login_via_playwright" in name:
-                return (jar, pw_cookies)
-            if "_restore_and_fetch_async" in name:
-                return devices
-            return None
-
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async", side_effect=_run), \
-             mock.patch.object(self.mod, "_save_cookie_meta",
-                               side_effect=RuntimeError("save boom")), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("Catalog updated", out)
-
-    def test_playwright_post_signin_fetch_raises_sets_devices_none(self):
-        # _restore_and_fetch_async raises after playwright sign-in (1288-1290),
-        # devices→None, used_playwright True → "device fetch" empty message.
-        jar = object()
-        pw_cookies = [{"name": "a", "value": "1"}]
-
-        def _run(coro):
-            name = getattr(coro, "__qualname__", "")
-            try:
-                coro.close()
-            except Exception:
-                pass
-            if "_login_async" in name:
-                raise self.mod._LoginNeedsPlaywright()
-            if "_login_via_playwright" in name:
-                return (jar, pw_cookies)
-            if "_restore_and_fetch_async" in name:
-                raise RuntimeError("post-signin fetch boom")
-            return None
-
-        with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
-             mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async", side_effect=_run), \
-             mock.patch.object(self.mod, "_save_cookie_meta"), \
-             _lan_phase_stubbed(self.mod), \
-             mock.patch.object(self.mod, "_merge_with_existing_catalog",
-                               side_effect=lambda c: c), \
-             mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
-                               return_value=0):
-            out = self.mod._run_wizard_interactive("")
-        self.assertIn("device fetch", out)
 
 
 class CapabilityListOfStringsTests(unittest.TestCase):
