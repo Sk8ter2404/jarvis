@@ -2441,7 +2441,8 @@ class FinalStaleDuplicateSweepTests(unittest.TestCase):
         with open(os.path.join(_PROJECT, "core", "smart_home_router.py"),
                   encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn("_run(_go(), timeout=", src)
+        self.assertIn("_router_run(_go(login), _ALEXA_CALL_TIMEOUT_S)", src)
+        self.assertRegex(src, r"_ALEXA_CALL_TIMEOUT_S\s*=\s*\d")
 
     def test_two_hand_overlay_writes_atomically(self):
         # #23: both overlay writes must go through the temp-file+os.replace

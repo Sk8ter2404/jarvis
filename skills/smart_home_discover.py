@@ -1411,6 +1411,37 @@ async def _oauth_restore_and_fetch_async() -> dict | None:
         await _close_login(login)
 
 
+async def _oauth_login_async() -> Any:
+    """Restore the saved OAuth sign-in and hand back the LOGGED-IN, still-open
+    AlexaLogin (2026-10-13; the smart-home router drives devices with it).
+    Must run inside the event loop the caller will keep USING the login on:
+    the aiohttp session binds to the loop that created it, so the caller owns
+    that loop and the login's lifetime (close it with _close_login). None when
+    there is no saved sign-in or Amazon refused it. Never deletes the saved
+    file; never prints a token."""
+    if _alexapy() is None:
+        return None
+    rec = _load_oauth()
+    if rec is None:
+        return None
+    identity = rec.get("identity") or _OAUTH_IDENTITY
+    oauth = {k: rec[k] for k in _OAUTH_RESTORE_KEYS if rec.get(k) is not None}
+    login = _construct_login(identity, "", oauth=oauth,
+                             uuid=rec.get("uuid"), oauth_login=True)
+    if login is None:
+        return None
+    try:
+        if not await _oauth_refresh_session(login):
+            await _close_login(login)
+            return None
+        _save_oauth(login, identity)        # the access token / expiry moved
+        return login
+    except Exception as e:
+        print(f"  [sh-discover] saved Alexa sign-in failed: {_redact(e)}")
+        await _close_login(login)
+        return None
+
+
 async def _oauth_signin_and_fetch_async(
     timeout_seconds: float = _OAUTH_SIGNIN_TIMEOUT_S,
 ) -> dict | None:
@@ -2221,6 +2252,43 @@ async def _restore_and_fetch_async() -> dict | None:
         except Exception:
             pass
     return await _fetch_devices_async(login)
+
+
+async def _cookie_login_async() -> Any:
+    """Legacy cookie-pickle sign-in as an open AlexaLogin, built on the
+    CURRENT running loop (see _oauth_login_async). None when there is no
+    usable cached cookie."""
+    if _alexapy() is None:
+        return None
+    cookies = _load_cookie_pickle_safe()
+    if cookies is None:
+        return None
+    meta = _load_cookie_meta() or {}
+    login = _construct_login(meta.get("email") or "", "")
+    if login is None:
+        return None
+    authed = False
+    try:
+        await login.login(cookies=cookies)
+        authed = bool(dict(getattr(login, "status", {}) or {})
+                      .get("login_successful"))
+    except TypeError:
+        pass                                # older alexapy: no cookies kwarg
+    except Exception as e:
+        print(f"  [sh-discover] cookie login() failed: {_redact(e)}")
+    if not authed:
+        for attr in ("_cookies", "cookies"):
+            if hasattr(login, attr):
+                try:
+                    setattr(login, attr, cookies)
+                except Exception:
+                    pass
+        if hasattr(login, "reset"):
+            try:
+                await login.reset()
+            except Exception:
+                pass
+    return login
 
 
 def _devices_usable(devices: dict | None) -> bool:

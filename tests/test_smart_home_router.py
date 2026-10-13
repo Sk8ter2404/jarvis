@@ -667,8 +667,11 @@ class AlexaLoginTests(_RouterTestBase):
 
     def test_restore_login_success_is_cached(self):
         login_obj = object()
+
+        async def _oauth():
+            return login_obj
         disc = types.ModuleType("skills.smart_home_discover")
-        disc._restore_login_from_cookie = lambda: login_obj
+        disc._oauth_login_async = _oauth
         with _inject_modules(**{"skills.smart_home_discover": disc}):
             out = router._alexa_login()
         self.assertIs(out, login_obj)
@@ -676,10 +679,11 @@ class AlexaLoginTests(_RouterTestBase):
             self.assertIs(router._state["alexapy_login"], login_obj)
 
     def test_restore_login_raises_caches_failed(self):
-        def boom():
+        async def boom():
             raise RuntimeError("cookie expired")
         disc = types.ModuleType("skills.smart_home_discover")
-        disc._restore_login_from_cookie = boom
+        disc._oauth_login_async = boom
+        disc._cookie_login_async = boom
         with _inject_modules(**{"skills.smart_home_discover": disc}):
             out = router._alexa_login()
         self.assertIsNone(out)
@@ -687,8 +691,11 @@ class AlexaLoginTests(_RouterTestBase):
             self.assertEqual(router._state["alexapy_login"], "_failed")
 
     def test_restore_login_returns_none_caches_failed(self):
+        async def _none():
+            return None
         disc = types.ModuleType("skills.smart_home_discover")
-        disc._restore_login_from_cookie = lambda: None
+        disc._oauth_login_async = _none
+        disc._cookie_login_async = _none
         with _inject_modules(**{"skills.smart_home_discover": disc}):
             self.assertIsNone(router._alexa_login())
         with router._state_lock:
@@ -729,19 +736,6 @@ class AlexaSetStateTests(_RouterTestBase):
              _inject_modules(alexapy=alexapy):
             out = router._alexa_set_state(self._device(), {"on": True})
         self.assertIn("AlexaAPI missing", out["error"])
-
-    def test_runner_unavailable(self):
-        # alexapy + AlexaAPI present, but importing the async runner fails.
-        alexapy = types.ModuleType("alexapy")
-        alexapy.AlexaAPI = types.SimpleNamespace(
-            set_light_state=lambda *a, **k: None)
-        disc = types.ModuleType("skills.smart_home_discover")
-        # Deliberately omit `_run_async` so `from ... import _run_async` raises.
-        with mock.patch.object(router, "_alexa_login", return_value=object()), \
-             _inject_modules(alexapy=alexapy,
-                             **{"skills.smart_home_discover": disc}):
-            out = router._alexa_set_state(self._device(), {"on": True})
-        self.assertIn("asyncio runner unavailable", out["error"])
 
     def test_happy_on(self):
         calls = {}
@@ -853,14 +847,12 @@ class AlexaSetStateTests(_RouterTestBase):
         alexapy.AlexaAPI = types.SimpleNamespace(
             set_light_state=_set_light_state)
 
-        def _boom_runner(coro):
+        def _boom_runner(coro, timeout):
             coro.close()   # avoid 'coroutine never awaited' warning
             raise RuntimeError("loop already running")
-        disc = types.ModuleType("skills.smart_home_discover")
-        disc._run_async = _boom_runner
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
-             _inject_modules(alexapy=alexapy,
-                             **{"skills.smart_home_discover": disc}):
+             mock.patch.object(router, "_router_run", _boom_runner), \
+             _inject_modules(alexapy=alexapy):
             out = router._alexa_set_state(self._device(), {"on": True})
         self.assertIn("alexa fallback runner failed", out["error"])
 

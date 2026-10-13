@@ -552,6 +552,38 @@ class RestoreTests(_FakeLoginBase):
         self.assertIsNotNone(self.mod._load_oauth())     # never deleted
         self.assertTrue(FakeOAuthLogin.instances[-1].closed)
 
+    def test_login_async_returns_the_open_logged_in_login(self):
+        # 2026-10-13: the router drives devices with this login, on a loop it
+        # owns - so it must come back OPEN (not closed) and built in the
+        # running loop.
+        self._save_fake_oauth()
+        with captured_stdout():
+            lg = run(self._login_and_loop())
+        login, loop, running = lg
+        self.assertIs(login.built_in_loop, running)
+        self.assertFalse(login.closed)
+        self.assertEqual(login.calls, ["refresh_access_token",
+                                       "exchange_token_for_cookies",
+                                       "get_csrf", "finalize_login"])
+        self.assertEqual(self.mod._load_oauth()["access_token"],
+                         "Atza|FAKE-REFRESHED-ACCESS")
+
+    async def _login_and_loop(self):
+        login = await self.mod._oauth_login_async()
+        return login, None, asyncio.get_running_loop()
+
+    def test_login_async_refused_refresh_closes_and_returns_none(self):
+        self._save_fake_oauth()
+        FakeOAuthLogin.refresh_ok = False
+        with captured_stdout():
+            self.assertIsNone(run(self.mod._oauth_login_async()))
+        self.assertIsNotNone(self.mod._load_oauth())
+        self.assertTrue(FakeOAuthLogin.instances[-1].closed)
+
+    def test_login_async_without_a_saved_file_builds_nothing(self):
+        self.assertIsNone(run(self.mod._oauth_login_async()))
+        self.assertEqual(FakeOAuthLogin.instances, [])
+
     def test_refused_cookie_exchange_returns_none(self):
         self._save_fake_oauth()
         FakeOAuthLogin.exchange_ok = False
