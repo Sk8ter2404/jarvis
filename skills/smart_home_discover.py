@@ -153,6 +153,7 @@ _BRAND_TO_SKILL = {
     "smartlife":    "sh_tuya",
     "smart life":   "sh_tuya",
     "tuya":         "sh_tuya",
+    "broadlink":    "sh_broadlink",
 }
 
 # OUI prefixes (upper, no separators) for the LAN cross-reference.

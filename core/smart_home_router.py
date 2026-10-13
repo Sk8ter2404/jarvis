@@ -91,6 +91,7 @@ _BRAND_TO_SKILL = {
     "smartlife":    "sh_tuya",
     "smart life":   "sh_tuya",
     "tuya":         "sh_tuya",
+    "broadlink":    "sh_broadlink",
 }
 
 # Coarse rgb tuples used when the user names a color. Keyed by the lowercase
