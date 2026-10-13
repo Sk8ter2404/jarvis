@@ -540,7 +540,7 @@ class CallSiteAuditTests(unittest.TestCase):
             "core/orchestrator.py": {"plan", "quick", "compose"},
             "core/diagnostic_daemons.py": {"deep"},
             "skills/email_triage.py": {"classify", "compose"},
-            "skills/news_briefing.py": {"quick"},
+            "skills/daily_briefing/news.py": {"quick"},
             "skills/notification_triage.py": {"classify"},
             "skills/phone_bridge.py": {"voice"},
             "skills/self_diagnostic.py": {"ping"},

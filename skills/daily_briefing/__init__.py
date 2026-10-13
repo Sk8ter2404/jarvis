@@ -1,7 +1,31 @@
 """
-Daily briefing skill for JARVIS.
+Daily briefing skill for JARVIS - the ONE skill behind every briefing.
 
-Fires once per day at a configurable local clock time (default 08:00) and
+This package replaced ten separate skills (2026-10-12): the 08:00 daily
+briefing below, and as parts beside it the whole morning family and the
+evening ones. Every spoken line and every action name is unchanged; what is
+gone is ten skills that found one another by guessing module names (and, when
+the guess missed, importing a second copy with empty state).
+
+  __init__.py   the 08:00 daily briefing (this file); register() loads the rest
+  chain.py      picks ONE morning briefing per day on the first wake
+                (the old morning_chain; action morning_chain_pick)
+  arrival.py    the MCU cold-open after 6 h of silence (morning_arrival,
+                arrival_briefing)
+  arrival_v2.py presence-triggered 60 s briefing (morning_arrival_v2,
+                arrival_briefing_v2)
+  handoff.py    the chained handoff + workspace setup (morning_handoff,
+                predictive_morning_setup, setup_workspace, workspace_setup)
+  light.py      the short morning briefing (morning_briefing)
+  evening.py    the 22:00 end-of-day briefing (evening_briefing)
+  recap.py      the 22:30 spoken recap of the day (daily_recap)
+  news.py       the RSS headlines the others pull in (news_briefing)
+  _common.py    how a part finds a sibling
+
+Weather stays its own skill (skills/weather_briefing.py): forecasts are asked
+for on their own ("will it rain"), not only inside a briefing.
+
+The daily briefing itself fires once per day at a configurable local clock time (default 08:00) and
 delivers a proactive JARVIS-style briefing covering:
   • Current local time
   • Outdoor weather (wttr.in, geolocated by IP)
@@ -43,7 +67,12 @@ import time
 
 from core.atomic_io import _atomic_write_json
 
-_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from . import _common  # noqa: E402
+
+_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# This module lives in the skills/daily_briefing package: the skills folder (where the
+# sibling skills briefing_sources, ms_graph, weather_briefing ... live) is one level up.
+_SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _STATE_FILE   = os.path.join(_PROJECT_DIR, "daily_briefing_state.json")
 
@@ -160,7 +189,7 @@ def _briefing_sources():
         return briefing_sources  # pragma: no cover - reached only when loaded as a package (skills.daily_briefing); the live/test flat loader uses the import-by-name fallback below
     except Exception:
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, _SKILLS_DIR)
             import briefing_sources  # type: ignore
             return briefing_sources
         except Exception as e:
@@ -372,18 +401,17 @@ def _other_morning_briefing_fired_today() -> bool:
     down for each other — but this 08:00 briefing was never part of that
     contract, so a morning at the desk got "Good morning" twice (logs
     2026-09-29: v2 at 06:00, this at 08:00). Read through the LIVE modules
-    the same way v2 and the chain read each other ('skill_<name>'); False on
+    the same way v2 and the chain read each other (the sibling parts of this package); False on
     any failure, so a broken sibling can never silence this briefing."""
     try:
-        v2 = sys.modules.get("skill_morning_arrival_v2")
-        if v2 is not None and v2._already_fired_today():
+        v2 = _common.part(__package__, "arrival_v2")
+        if v2._already_fired_today():
             return True
     except Exception:
         pass
     try:
-        mc = sys.modules.get("skill_morning_chain")
-        if mc is not None and any(mc._skill_already_fired_today(n)
-                                  for n in mc.SKILL_NAMES):
+        mc = _common.part(__package__, "chain")
+        if any(mc._skill_already_fired_today(n) for n in mc.SKILL_NAMES):
             return True
     except Exception:
         pass
@@ -518,7 +546,7 @@ def _scheduler_loop() -> None:
 
 # ─── action registration ─────────────────────────────────────────────────
 
-def register(actions):
+def _register_daily(actions):
     def daily_briefing(_: str = "") -> str:
         try:
             text = _build_briefing()
@@ -542,3 +570,23 @@ def register(actions):
         f"{cfg['hour']:02d}:{cfg['minute']:02d} "
         f"(wait up to {cfg['wait_min']} min for user presence)"
     )
+
+
+# The parts, in the order their old skills used to load. news first: the
+# morning and evening parts pull headlines from it when they compose.
+_PARTS = ("news", "recap", "evening", "arrival", "arrival_v2", "light",
+          "chain", "handoff")
+
+
+def register(actions):
+    """Register the daily briefing and every part. A part that fails to load
+    or register is reported and skipped - one broken briefing never takes the
+    others down (each was a separate skill with that property before)."""
+    _register_daily(actions)
+    for name in _PARTS:
+        try:
+            part = _common.part(__package__, name)
+            part.register(actions)
+        except Exception as e:
+            print(f"  [daily_briefing] part '{name}' failed to register: "
+                  f"{type(e).__name__}: {e}")

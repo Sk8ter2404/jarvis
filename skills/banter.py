@@ -466,7 +466,7 @@ def _detect_music_while_music(entries: list[dict]) -> dict | None:
 
 def _ordinal(n: int) -> str:
     """1 -> '1st', 2 -> '2nd', 3 -> '3rd', 11 -> '11th', 22 -> '22nd'.
-    Same rule as skills/morning_handoff._ordinal."""
+    Same rule as skills/daily_briefing/handoff._ordinal."""
     if 10 <= n % 100 <= 20:
         return f"{n}th"
     return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"

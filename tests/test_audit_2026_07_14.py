@@ -1758,8 +1758,9 @@ class GenActionIndexCoversPackagesAndAliasesTests(unittest.TestCase):
 
     def test_globs_include_package_inits(self):
         src = self._src()
-        self.assertIn('"skills", "*", "__init__.py"', src,
-                      "must glob package skills' __init__.py, not only *.py")
+        self.assertIn('"skills", "*", "*.py"', src,
+                      "must glob every file of a package skill (its __init__.py "
+                      "and its parts), not only the flat skills/*.py")
 
     def test_alias_form_resolves_to_target_factory(self):
         # #45's alias form, now handled by the shared scanner

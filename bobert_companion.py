@@ -900,16 +900,14 @@ except Exception:          # pragma: no cover - an older bridge without the hook
 # — the default — the bridge never opens the sensor.)
 _kinect_bridge.set_enabled(KINECT_ENABLED)
 
-# Bambu H2D corner overlay — RETIRED 2026-05-30. The unified HUD
-# (hud/jarvis_unified_hud.py) now shows live print progress + ETA inline, so
-# the standalone corner widget is redundant and was COLLIDING with the unified
-# HUD on the top monitor. Forced False here because this local assignment runs
-# AFTER `from core.config import *` and would otherwise override the config
-# flag of the same name. Flip back to True only if you want the separate
-# corner widget again. Still available on demand via `bambu overlay on`.
-BAMBU_OVERLAY_AUTO_WHILE_PRINTING = False
+# Bambu H2D corner overlay — RETIRED 2026-05-30 (the unified HUD shows live
+# print progress + ETA inline). BAMBU_OVERLAY_AUTO_WHILE_PRINTING lives only in
+# core/config.py, default False. It used to be pinned False again HERE, after
+# `from core.config import *`, which silently overrode any user_settings.json
+# value (a stale duplicate, removed 2026-10-12). Still available on demand via
+# `bambu overlay on`.
 
-# Daily briefing — skills/daily_briefing.py fires once per day at this local
+# Daily briefing — skills/daily_briefing/__init__.py fires once per day at this local
 # clock time and delivers a JARVIS-style summary (time, weather, first Teams
 # meeting if Outlook is available, Bambu print status). If the user is at the
 # desk (via face_tracker), the briefing fires immediately; otherwise it waits
@@ -956,7 +954,7 @@ MS_GRAPH_SCOPES    = ["Calendars.Read", "Mail.Read"]
 # available without starting the background poller.
 AMAZON_TRACKING_ENABLED = False
 
-# Evening briefing — skills/evening_briefing.py fires once per day at this
+# Evening briefing — skills/daily_briefing/evening.py fires once per day at this
 # local clock time (default 22:00) with an end-of-day summary: voice
 # interaction count, tasks completed today, Bambu print status, tomorrow's
 # weather/calendar preview, plus one dry observation drawn from today's
@@ -979,7 +977,7 @@ WEATHER_LOOKAHEAD_HOURS           = 2      # proactive alert window
 WEATHER_SIGNIFICANT_TEMP_DROP_C   = 5      # °C drop within window
 WEATHER_ALERT_COOLDOWN_HOURS      = 4      # per-alert-class cooldown
 
-# Daily recap -- skills/daily_recap.py fires once per day at this local clock
+# Daily recap -- skills/daily_briefing/recap.py fires once per day at this local clock
 # time (default 22:30) with a JARVIS-style end-of-day summary synthesised from
 # the pattern_learning JSONL, today's session logs, Teams events, and
 # bambu_monitor state ("Sir, today you spent 2 hours 40 minutes in Bambu
@@ -991,7 +989,7 @@ DAILY_RECAP_ENABLED           = True
 DAILY_RECAP_HOUR              = 22    # 24-hour clock, local time
 DAILY_RECAP_MINUTE            = 30
 
-# News briefing — skills/news_briefing.py fetches headlines from a configurable
+# News briefing — skills/daily_briefing/news.py fetches headlines from a configurable
 # RSS feed list, optionally summarises each in one sentence via the Claude
 # backend, and is pulled into the morning + evening briefings to turn the
 # one-line weather greeting into an actual intelligence briefing.
@@ -1638,7 +1636,7 @@ def _append_turn(user: str, assistant: str) -> None:
 # turn) at the moment of wake-event detection, BEFORE the greeting bumps
 # last_speech_time (2026-10-01: measured from the owner's last accepted turn,
 # _last_owner_turn_at, when there is one this process). Consumers (e.g.
-# skills/morning_arrival's 6-hour silence gate) read [0] to measure the gap from the user's last interaction without
+# skills/daily_briefing/arrival's 6-hour silence gate) read [0] to measure the gap from the user's last interaction without
 # being clobbered by JARVIS's own greeting reply. Same list-of-one wrapper
 # convention as _last_wake_date so the cross-thread read stays atomic
 # without a lock — see the WHY comment above _last_wake_date if you're
@@ -24069,7 +24067,7 @@ def _note_owner_turn() -> None:
 
 
 # The first accepted owner turn AT OR AFTER this local hour is the day's wake
-# event (B096, 2026-10-01). It is skills/morning_chain.CHAIN_START_HOUR: a turn
+# event (B096, 2026-10-01). It is skills/daily_briefing/chain.CHAIN_START_HOUR: a turn
 # before the chain's window is the tail of last night, and stamping it would
 # have the chain brief an empty room at 06:00 while he sleeps.
 _OWNER_TURN_WAKE_FROM_HOUR = 6
@@ -38086,7 +38084,7 @@ def _pick_wake_variety(from_standby: bool, wake_text: str = "") -> tuple[str, fl
 
 def _note_wake_event(now: float | None = None, today: str | None = None) -> None:
     """Record a wake event: the pre-wake silence snapshot and today's date in
-    _last_wake_date, the morning chain's trigger (skills/morning_chain.py).
+    _last_wake_date, the morning chain's trigger (skills/daily_briefing/chain.py).
 
     The ONE bookkeeping path for every wake source -- the standby wake
     (context_aware_greeting), the tray force_wake, and the day's first
@@ -38095,7 +38093,7 @@ def _note_wake_event(now: float | None = None, today: str | None = None) -> None
     morning_arrival's 6-hour gate fell back to the live last_speech_time,
     failed, and the chain re-picked arrival every 5 s until 08:00.
 
-    Call it BEFORE JARVIS replies: skills/morning_arrival reads
+    Call it BEFORE JARVIS replies: skills/daily_briefing/arrival reads
     _pre_wake_silence_seconds[0] for its 6-hour overnight gate, and reading
     last_speech_time directly would always be ~0 by the time the morning
     chain dispatch loop fires (the wake greeting is already speaking).

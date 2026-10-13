@@ -1,7 +1,7 @@
 """Monolith-tier regressions for B096 (2026-10-01): the morning chain never
 auto-fired under the owner's settings.
 
-skills/morning_chain.py dispatches the day's morning briefing when
+skills/daily_briefing/chain.py dispatches the day's morning briefing when
 bobert_companion._last_wake_date[0] turns to today inside 06:00-12:00. That
 cell was stamped only by the standby wake (context_aware_greeting) and the
 tray force_wake. The owner runs with START_IN_STANDBY off and never sleeps
@@ -31,7 +31,7 @@ import unittest
 from unittest import mock
 
 from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith, shift_monotonic
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part, load_skill_isolated
 
 
 class _LoopBreak(BaseException):
@@ -248,7 +248,7 @@ class ChainEndToEndTests(_Base):
         bc._turn_in_progress[0] = False        # that turn has been answered
         bc._sleep_mode[0] = False              # ...and JARVIS is awake
 
-        chain, _ = load_skill_isolated("morning_chain")
+        chain, _ = load_briefing_part("chain")
         invoked = []
         with mock.patch.object(chain.importlib, "import_module", return_value=bc), \
              mock.patch.object(chain.time, "strftime", return_value="2026-06-01"), \
@@ -267,7 +267,7 @@ class ChainEndToEndTests(_Base):
 
         # ...and arrival's 6-hour gate reads the overnight gap from the
         # snapshot, not the ~0 s since JARVIS last spoke.
-        arrival, _ = load_skill_isolated("morning_arrival")
+        arrival, _ = load_briefing_part("arrival")
         with mock.patch.object(arrival.importlib, "import_module",
                                return_value=bc):
             hours = arrival._silence_hours_since_last_speech()

@@ -126,7 +126,7 @@ class ReturnDrainTests(unittest.TestCase):
         self.assertEqual((dropped, folded), ([], []))
 
     def test_every_briefing_source_is_kept_whole(self):
-        # The morning arrival cold-open (skills/morning_arrival, source
+        # The morning arrival cold-open (skills/daily_briefing/arrival, source
         # "arrival") is a briefing like the others, never a recap fragment.
         for src in ("morning", "arrival", "evening", "daily", "news",
                     "handoff", "recap"):

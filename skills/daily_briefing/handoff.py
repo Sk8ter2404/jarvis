@@ -26,7 +26,7 @@ Actions added:
                                 also be invoked verbally.
 
 Auto-trigger:
-  Driven by skills/morning_chain.py — a single controller polls
+  Driven by skills/daily_briefing/chain.py — a single controller polls
   bobert_companion._last_wake_date for the day's first wake event and picks
   ONE of {morning_arrival, morning_handoff, morning_briefing} to dispatch
   based on day-of-week / DEFAULT_MORNING_SKILL / time-of-day. When the chain
@@ -45,7 +45,15 @@ import time
 
 from core.atomic_io import _atomic_write_json
 
-_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+try:
+    from . import _common
+except ImportError:   # loaded by file path with no package (a smoke run)
+    _common = None
+
+_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# This module lives in the skills/daily_briefing package: the skills folder (where the
+# sibling skills briefing_sources, ms_graph, weather_briefing ... live) is one level up.
+_SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _STATE_FILE   = os.path.join(_PROJECT_DIR, "morning_handoff_state.json")
 
@@ -144,7 +152,7 @@ def _save_state(state: dict) -> None:
 
 def _handoff_already_fired_today() -> bool:
     """True if the handoff has already fired today. Mirrors
-    skills/morning_briefing._briefing_already_fired_today so the auto-trigger
+    skills/daily_briefing/light._briefing_already_fired_today so the auto-trigger
     can be cheaply suppressed at register time and we don't spawn a watcher
     thread that would do nothing all day. Also re-checked inside
     _fire_handoff so a manual trigger + watcher race can't double-fire."""
@@ -163,6 +171,13 @@ def _import_skill(name: str):
     empty, so print/presence info would silently read nothing. Match
     daily_briefing / evening_briefing and prefer the already-registered
     module."""
+    if name == "news_briefing":
+        # The news briefing is a part of this package now (skills/daily_briefing/
+        # news.py), not a skill of its own: hand back the loaded part.
+        try:
+            return _common.part(__package__, "news")
+        except Exception:
+            return None
     live = sys.modules.get(f"skill_{name}")
     if live is not None:
         return live
@@ -171,7 +186,7 @@ def _import_skill(name: str):
     except Exception:
         pass
     try:
-        skills_dir = os.path.dirname(os.path.abspath(__file__))
+        skills_dir = _SKILLS_DIR
         if skills_dir not in sys.path:
             sys.path.insert(0, skills_dir)
         return importlib.import_module(name)
@@ -741,7 +756,7 @@ def _wait_for_quiet() -> str:
 
 
 def _fire_from_chain(reason: str = "morning_chain") -> str:
-    """Auto-trigger entry called by skills/morning_chain.py once it has
+    """Auto-trigger entry called by skills/daily_briefing/chain.py once it has
     decided handoff is today's pick. Preserves the original watcher's
     TOCTOU-safe pattern verbatim: pre-check → delay → re-check → fire.
     Manual triggers ("morning handoff") still bypass via force=True.
@@ -794,4 +809,4 @@ def register(actions):
     actions["setup_workspace"]          = predictive_morning_setup  # natural alias
     actions["workspace_setup"]          = predictive_morning_setup  # natural alias
 
-    # Auto-trigger is owned by skills/morning_chain.py — no per-skill watcher.
+    # Auto-trigger is owned by skills/daily_briefing/chain.py — no per-skill watcher.

@@ -1,4 +1,4 @@
-"""Logic tests for skills/morning_arrival_v2.py.
+"""Logic tests for skills/daily_briefing/arrival_v2.py.
 
 v2 is presence-gated. Tests cover the morning-window check, the six data-source
 section formatters (weather / teams / news intro-strip / print / deliveries /
@@ -28,7 +28,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part
 
 
 _SENTINEL = object()
@@ -65,7 +65,7 @@ def _fake_mod(name="fake", **attrs):
 
 class MorningArrivalV2Tests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_arrival_v2")
+        self.mod, self.actions = load_briefing_part("arrival_v2")
         self.addCleanup(lambda: self.mod._presence_first_seen_at.__setitem__(0, 0.0))
         # A suppressed arrival still MARKS today as fired (_mark_fired), and
         # _STATE_FILE is the LIVE project-root morning_arrival_v2_state.json:
@@ -241,13 +241,13 @@ class MorningArrivalV2Tests(unittest.TestCase):
 
     # ── manual action ────────────────────────────────────────────────────
     def test_action_returns_text(self):
-        mod, actions = load_skill_isolated("morning_arrival_v2")
+        mod, actions = load_briefing_part("arrival_v2")
         with mock.patch.object(mod, "_fire_arrival", return_value="[intent:briefing] Good morning."):
             out = actions["morning_arrival_v2"]("")
         self.assertIn("Good morning", out)
 
     def test_action_no_content(self):
-        mod, actions = load_skill_isolated("morning_arrival_v2")
+        mod, actions = load_briefing_part("arrival_v2")
         with mock.patch.object(mod, "_fire_arrival", return_value=""):
             out = actions["morning_arrival_v2"]("")
         self.assertIn("no content", out.lower())
@@ -414,7 +414,7 @@ class MorningArrivalV2Tests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class ImportSkillTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival_v2")
+        self.mod, _ = load_briefing_part("arrival_v2")
 
     def test_prefers_live_registered_module(self):
         live = _fake_mod("skill_face_tracker", marker="LIVE")
@@ -422,14 +422,18 @@ class ImportSkillTests(unittest.TestCase):
             out = self.mod._import_skill("face_tracker")
         self.assertIs(out, live)
 
-    def test_falls_back_to_skills_package_import(self):
-        target = _fake_mod("skills.news_briefing", marker="PKG")
-        with inject_modules(skill_news_briefing=None):
-            with mock.patch.object(self.mod.importlib, "import_module",
-                                   return_value=target) as imp:
-                out = self.mod._import_skill("news_briefing")
+    def test_news_briefing_is_the_news_part_of_this_package(self):
+        # news_briefing is no longer a skill of its own: the name resolves to
+        # the sibling part (the same instance the loader registered).
+        target = _fake_mod("skill_daily_briefing.news", marker="PART")
+        with inject_modules(**{"skill_daily_briefing.news": target}):
+            out = self.mod._import_skill("news_briefing")
         self.assertIs(out, target)
-        imp.assert_called_once_with("skills.news_briefing")
+
+    def test_news_part_missing_returns_none(self):
+        with mock.patch.object(self.mod._common, "part",
+                               side_effect=ImportError("gone")):
+            self.assertIsNone(self.mod._import_skill("news_briefing"))
 
     def test_absolute_fallback_when_package_import_fails(self):
         target = _fake_mod("bambu_monitor", marker="ABS")
@@ -458,7 +462,7 @@ class ImportSkillTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class EnqueueSpeechTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival_v2")
+        self.mod, _ = load_briefing_part("arrival_v2")
         self.tmp = tempfile.mkdtemp(prefix="arrv2_speech_")
         self.addCleanup(lambda: _rmtree(self.tmp))
         # _enqueue_speech derives the queue path from _PROJECT_DIR; redirect it.
@@ -505,7 +509,7 @@ class EnqueueSpeechTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class StateIOTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival_v2")
+        self.mod, _ = load_briefing_part("arrival_v2")
         self.tmp = tempfile.mkdtemp(prefix="arrv2_state_")
         self.addCleanup(lambda: _rmtree(self.tmp))
         self.state = os.path.join(self.tmp, "state.json")
@@ -552,37 +556,35 @@ class StateIOTests(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# _chain_morning_briefing_fired_today (skill_morning_chain faked)
+# _chain_morning_briefing_fired_today (the chain part faked)
 # ─────────────────────────────────────────────────────────────────────────
 class ChainFiredTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival_v2")
+        self.mod, _ = load_briefing_part("arrival_v2")
 
     def test_returns_true_when_any_chain_skill_fired(self):
         mc = _fake_mod("skill_morning_chain",
                        SKILL_NAMES=("arrival", "handoff", "briefing"),
                        _skill_already_fired_today=lambda n: n == "briefing")
-        with inject_modules(skill_morning_chain=mc):
+        with inject_modules(**{"skill_daily_briefing.chain": mc}):
             self.assertTrue(self.mod._chain_morning_briefing_fired_today())
 
     def test_returns_false_when_none_fired(self):
         mc = _fake_mod("skill_morning_chain",
                        SKILL_NAMES=("arrival", "handoff", "briefing"),
                        _skill_already_fired_today=lambda n: False)
-        with inject_modules(skill_morning_chain=mc):
+        with inject_modules(**{"skill_daily_briefing.chain": mc}):
             self.assertFalse(self.mod._chain_morning_briefing_fired_today())
 
     def test_returns_false_when_chain_not_importable(self):
-        def _imp(name, *a, **k):
-            raise ImportError("no chain")
-        with inject_modules(skill_morning_chain=None):
-            with mock.patch.object(self.mod.importlib, "import_module", side_effect=_imp):
-                self.assertFalse(self.mod._chain_morning_briefing_fired_today())
+        with mock.patch.object(self.mod._common, "part",
+                               side_effect=ImportError("no chain")):
+            self.assertFalse(self.mod._chain_morning_briefing_fired_today())
 
     def test_returns_false_when_checker_missing(self):
         mc = _fake_mod("skill_morning_chain", SKILL_NAMES=("arrival",))
         # no _skill_already_fired_today attr
-        with inject_modules(skill_morning_chain=mc):
+        with inject_modules(**{"skill_daily_briefing.chain": mc}):
             self.assertFalse(self.mod._chain_morning_briefing_fired_today())
 
     def test_returns_false_when_checker_raises(self):
@@ -590,7 +592,7 @@ class ChainFiredTests(unittest.TestCase):
             raise RuntimeError("flag read error")
         mc = _fake_mod("skill_morning_chain", SKILL_NAMES=("arrival",),
                        _skill_already_fired_today=_boom)
-        with inject_modules(skill_morning_chain=mc):
+        with inject_modules(**{"skill_daily_briefing.chain": mc}):
             self.assertFalse(self.mod._chain_morning_briefing_fired_today())
 
 
@@ -599,7 +601,7 @@ class ChainFiredTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class PresenceTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival_v2")
+        self.mod, _ = load_briefing_part("arrival_v2")
         self.addCleanup(lambda: self.mod._presence_first_seen_at.__setitem__(0, 0.0))
 
     def test_face_state_uses_snapshot_fn(self):
@@ -701,7 +703,7 @@ class PresenceTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class SectionPrintTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival_v2")
+        self.mod, _ = load_briefing_part("arrival_v2")
         # Point the on-disk bambu state at a temp path so the file fallback
         # never reads the real overlay file.
         self.tmp = tempfile.mkdtemp(prefix="arrv2_bambu_")
@@ -886,7 +888,7 @@ class SectionPrintTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class GatherAndFireTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_arrival_v2")
+        self.mod, self.actions = load_briefing_part("arrival_v2")
         self.addCleanup(lambda: self.mod._presence_first_seen_at.__setitem__(0, 0.0))
         # Hermetic: the daily-briefing stand-down (2026-10-01) reads the live
         # daily_briefing state through sys.modules; these tests don't drive it.
@@ -1018,7 +1020,7 @@ class GatherAndFireTests(unittest.TestCase):
         fire.assert_called_once_with("chain")
 
     def test_action_handles_exception(self):
-        mod, actions = load_skill_isolated("morning_arrival_v2")
+        mod, actions = load_briefing_part("arrival_v2")
         with mock.patch.object(mod, "_fire_arrival", side_effect=RuntimeError("kaboom")):
             out = actions["morning_arrival_v2"]("")
         self.assertIn("failed", out.lower())
@@ -1026,7 +1028,7 @@ class GatherAndFireTests(unittest.TestCase):
     def test_register_binds_both_action_aliases(self):
         actions = {}
         # Thread.start is neutered by the harness, so register() returns cleanly.
-        mod, actions = load_skill_isolated("morning_arrival_v2", actions=actions)
+        mod, actions = load_briefing_part("arrival_v2", actions=actions)
         self.assertIn("morning_arrival_v2", actions)
         self.assertIn("arrival_briefing_v2", actions)
         self.assertIs(actions["morning_arrival_v2"], actions["arrival_briefing_v2"])
@@ -1038,7 +1040,7 @@ class DailyBriefingStandDownTests(unittest.TestCase):
     not greet him a second time."""
 
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival_v2")
+        self.mod, _ = load_briefing_part("arrival_v2")
 
     def _fire(self, heard):
         db = types.ModuleType("skill_daily_briefing")
@@ -1076,7 +1078,7 @@ class DailyBriefingStandDownTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class WatcherTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival_v2")
+        self.mod, _ = load_briefing_part("arrival_v2")
         self.addCleanup(lambda: self.mod._presence_first_seen_at.__setitem__(0, 0.0))
 
     def _run_one_loop(self):
@@ -1194,9 +1196,9 @@ class MorningArrivalV2ImportGuardTests(unittest.TestCase):
     def test_path_bootstrap_inserts_project_root(self):
         # Re-exec the source with the project root removed from sys.path so the
         # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard runs.
-        mod, _ = load_skill_isolated("morning_arrival_v2")
+        mod, _ = load_briefing_part("arrival_v2")
         path = mod.__file__
-        proj = os.path.dirname(os.path.dirname(path))
+        proj = os.path.dirname(os.path.dirname(os.path.dirname(path)))
         spec = importlib.util.spec_from_file_location("ma_v2_reexec", path)
         m = importlib.util.module_from_spec(spec)
         m.skill_utils = {}

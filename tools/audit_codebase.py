@@ -235,10 +235,10 @@ _INTERNAL_ONLY_ACTIONS: set[str] = {
     "configure_printer", # alias for setup_printer (the canonical voice action is setup_printer, documented in PC_CONTROL_PROMPT)
     "first_time_printer_setup", # alias for setup_printer (the canonical voice action is setup_printer, documented in PC_CONTROL_PROMPT)
     "setup_bambu",       # alias for setup_printer (the canonical voice action is setup_printer, documented in PC_CONTROL_PROMPT) — registered in skills/bambu_setup.py:585
-    "setup_workspace",   # natural alias for predictive_morning_setup (the canonical voice action is predictive_morning_setup, documented in PC_CONTROL_PROMPT with the example 'JARVIS, set up my workspace' → [ACTION: predictive_morning_setup]) — registered in skills/morning_handoff.py:742
-    "workspace_setup",   # noun-order natural alias for predictive_morning_setup (the canonical voice action is predictive_morning_setup, documented in PC_CONTROL_PROMPT with the example 'JARVIS, set up my workspace' → [ACTION: predictive_morning_setup]) — registered in skills/morning_handoff.py:743 alongside setup_workspace (both wired to the same predictive_morning_setup handler; same pattern as setup_workspace above)
-    "daily_briefing",    # background-scheduled by skills/daily_briefing.py (fires once per day at DAILY_BRIEFING_HOUR:MINUTE) — not a voice action
-    "evening_briefing",  # background-scheduled by skills/evening_briefing.py (fires once per day at EVENING_BRIEFING_HOUR:MINUTE) — not a voice action
+    "setup_workspace",   # natural alias for predictive_morning_setup (the canonical voice action is predictive_morning_setup, documented in PC_CONTROL_PROMPT with the example 'JARVIS, set up my workspace' → [ACTION: predictive_morning_setup]) — registered in skills/daily_briefing/handoff.py
+    "workspace_setup",   # noun-order natural alias for predictive_morning_setup (the canonical voice action is predictive_morning_setup, documented in PC_CONTROL_PROMPT with the example 'JARVIS, set up my workspace' → [ACTION: predictive_morning_setup]) — registered in skills/daily_briefing/handoff.py alongside setup_workspace (both wired to the same predictive_morning_setup handler; same pattern as setup_workspace above)
+    "daily_briefing",    # background-scheduled by skills/daily_briefing/__init__.py (fires once per day at DAILY_BRIEFING_HOUR:MINUTE) — not a voice action
+    "evening_briefing",  # background-scheduled by skills/daily_briefing/evening.py (fires once per day at EVENING_BRIEFING_HOUR:MINUTE) — not a voice action
     "disable_night_owl", # alias for night_owl_off (the canonical voice action is night_owl_off, registered in skills/night_owl_mode.py)
     "enable_night_owl",  # alias for night_owl_on (the canonical voice action exposed to the LLM is night_owl_mode, registered in skills/night_owl_mode.py)
     "end_night_owl",     # alias for night_owl_off (registered as an explicit alias in skills/night_owl_mode.py)
@@ -2936,11 +2936,14 @@ def main() -> int:
     # The old check only matched files whose parent dir == "skills", so every
     # PACKAGE skill (holographic_overlay/…) was skipped — its registered actions
     # then looked "documented but not registered" (spurious prompt-drift P1s).
+    # A package skill that is split into parts (skills/daily_briefing/) registers
+    # from the parts too: every non-underscore file of a package counts.
     skill_files = [
         f for f in files
         if os.path.dirname(f).endswith("skills")
-        or (os.path.basename(f) == "__init__.py"
-            and os.path.basename(os.path.dirname(os.path.dirname(f))) == "skills")
+        or (os.path.basename(os.path.dirname(os.path.dirname(f))) == "skills"
+            and (os.path.basename(f) == "__init__.py"
+                 or not os.path.basename(f).startswith("_")))
     ]
 
     # Collect bobert_companion ACTIONS dict + per-skill action names. Used by

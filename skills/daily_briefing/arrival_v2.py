@@ -1,8 +1,8 @@
 """
 morning_arrival_v2 — presence-triggered morning briefing for JARVIS.
 
-Companion to skills/morning_arrival.py. Where v1 fires on the first wake
-event of the day (via skills/morning_chain.py), v2 gates on actual face
+Companion to skills/daily_briefing/arrival.py. Where v1 fires on the first wake
+event of the day (via skills/daily_briefing/chain.py), v2 gates on actual face
 presence: it waits until the face_tracker confirms the user has been in
 frame for SUSTAINED_PRESENCE_SECONDS, then delivers ONE 60-second briefing
 chaining six overnight-relevant sources:
@@ -23,7 +23,7 @@ Trigger paths:
   • Background daemon thread polls skills.face_tracker._state for sustained
     face-visible frames inside ARRIVAL_START_HOUR..ARRIVAL_END_HOUR local.
   • Public action "morning_arrival_v2" (manual force=True).
-  • _fire_from_chain(reason) — entry for skills/morning_chain.py once
+  • _fire_from_chain(reason) — entry for skills/daily_briefing/chain.py once
     extended to know about the v2 variant.
 
 Same-day suppression is persisted to morning_arrival_v2_state.json via
@@ -45,7 +45,15 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
-_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+try:
+    from . import _common
+except ImportError:   # loaded by file path with no package (a smoke run)
+    _common = None
+
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# This module lives in the skills/daily_briefing package: the skills folder (where the
+# sibling skills briefing_sources, ms_graph, weather_briefing ... live) is one level up.
+_SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_DIR not in sys.path:
     sys.path.insert(0, _PROJECT_DIR)
 
@@ -111,6 +119,13 @@ def _import_skill(name: str):
     empty, so presence/print info would silently read nothing. Match
     daily_briefing / evening_briefing and prefer the already-registered
     module."""
+    if name == "news_briefing":
+        # The news briefing is a part of this package now (skills/daily_briefing/
+        # news.py), not a skill of its own: hand back the loaded part.
+        try:
+            return _common.part(__package__, "news")
+        except Exception:
+            return None
     live = sys.modules.get(f"skill_{name}")
     if live is not None:
         return live
@@ -119,7 +134,7 @@ def _import_skill(name: str):
     except Exception:
         pass
     try:
-        skills_dir = os.path.dirname(os.path.abspath(__file__))
+        skills_dir = _SKILLS_DIR
         if skills_dir not in sys.path:
             sys.path.insert(0, skills_dir)
         return importlib.import_module(name)
@@ -197,14 +212,9 @@ def _chain_morning_briefing_fired_today() -> bool:
     preserves the chain-disabled case: if nothing else fires today, none of
     those flags will be set, so this returns False and v2 still works."""
     try:
-        mc = sys.modules.get("skill_morning_chain")
-        if mc is None:
-            mc = importlib.import_module("skills.morning_chain")
+        mc = _common.part(__package__, "chain")
     except Exception:
-        try:
-            mc = importlib.import_module("morning_chain")
-        except Exception:
-            return False
+        return False
     checker = getattr(mc, "_skill_already_fired_today", None)
     names = getattr(mc, "SKILL_NAMES", None)
     if not callable(checker) or not names:
@@ -223,7 +233,7 @@ def _daily_briefing_heard_today() -> bool:
     A daily fire into an empty room does not count. False on any failure,
     including daily_briefing not being loaded."""
     try:
-        db = sys.modules.get("skill_daily_briefing")
+        db = _common.package(__package__)
         fn = getattr(db, "owner_heard_briefing_today", None) if db else None
         return bool(fn()) if callable(fn) else False
     except Exception:
@@ -665,7 +675,7 @@ def _fire_arrival(reason: str, *, force: bool = False) -> str:
 
 
 def _fire_from_chain(reason: str = "morning_chain_v2") -> str:
-    """Entry called by skills/morning_chain.py once it knows about v2. The
+    """Entry called by skills/daily_briefing/chain.py once it knows about v2. The
     chain's existing same-day-suppression and TOCTOU pattern applies — we
     just bail re-entrantly if the day's already covered."""
     if _already_fired_today():

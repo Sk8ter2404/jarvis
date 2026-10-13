@@ -2251,6 +2251,15 @@ HOLO_WORKSHOP_AUTO_ON_THINK       = False   # compact rotating arc-reactor canva
 WORKSHOP_HUD_AUTO_LAUNCH          = False   # top-right CPU/RAM/bambu widget
 WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH = False  # top-center Stark print panel
 BAMBU_OVERLAY_AUTO_WHILE_PRINTING = False   # top-right bambu corner overlay
+# These three were read by skills/holographic_overlay (getattr default False) but
+# never defined here, and _apply_user_settings only applies keys that exist in
+# this module, so no user_settings.json could ever switch them on. Defined now
+# (2026-10-12), same retired group, same default: the unified HUD shows the same
+# data. The on-demand voice commands (holo_hud_v2, status_ring_v2,
+# arc_reactor_status) work regardless.
+HOLO_HUD_V2_AUTO_LAUNCH           = False   # holo HUD v2 (reactor + transcript)
+HOLO_ARC_REACTOR_STATUS_AUTO_LAUNCH = False  # four-quadrant CPU/RAM/GPU/NET ring
+HOLO_STARK_STATUS_RING_AUTO_LAUNCH = False  # top-centre Stark status ring
 
 # ── Bambu chamber-camera HUD (hud/bambu_camera_hud.py) ──────────────────
 # Master switch for the live printer-camera surface. When True, JARVIS can

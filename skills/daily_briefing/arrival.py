@@ -14,7 +14,7 @@ Actions added:
                         text (also queued for spoken delivery).
 
 Auto-trigger:
-  Driven by skills/morning_chain.py — a single controller polls
+  Driven by skills/daily_briefing/chain.py — a single controller polls
   bobert_companion._last_wake_date for the day's first wake event and picks
   ONE of {morning_arrival, morning_handoff, morning_briefing} to dispatch
   based on day-of-week / DEFAULT_MORNING_SKILL / time-of-day. When the chain
@@ -42,7 +42,15 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 from core.atomic_io import _atomic_write_json
 
-_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+try:
+    from . import _common
+except ImportError:   # loaded by file path with no package (a smoke run)
+    _common = None
+
+_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# This module lives in the skills/daily_briefing package: the skills folder (where the
+# sibling skills briefing_sources, ms_graph, weather_briefing ... live) is one level up.
+_SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _STATE_FILE   = os.path.join(_PROJECT_DIR, "morning_arrival_state.json")
 _UPGRADE_LOG  = os.path.join(_PROJECT_DIR, "upgrade_stream.log")
@@ -108,6 +116,13 @@ def _import_skill(name: str):
     SECOND, fresh copy whose _state is empty, so this briefing would read
     nothing. Match daily_briefing / evening_briefing and prefer the
     already-registered module."""
+    if name == "news_briefing":
+        # The news briefing is a part of this package now (skills/daily_briefing/
+        # news.py), not a skill of its own: hand back the loaded part.
+        try:
+            return _common.part(__package__, "news")
+        except Exception:
+            return None
     live = sys.modules.get(f"skill_{name}")
     if live is not None:
         return live
@@ -116,7 +131,7 @@ def _import_skill(name: str):
     except Exception:
         pass
     try:
-        skills_dir = os.path.dirname(os.path.abspath(__file__))
+        skills_dir = _SKILLS_DIR
         if skills_dir not in sys.path:
             sys.path.insert(0, skills_dir)
         return importlib.import_module(name)
@@ -823,7 +838,7 @@ def _fire_arrival(reason: str, *, force: bool = False) -> str:
 # ─── chain entry point ───────────────────────────────────────────────────
 
 def _fire_from_chain(reason: str = "morning_chain") -> str:
-    """Auto-trigger entry called by skills/morning_chain.py once it has
+    """Auto-trigger entry called by skills/daily_briefing/chain.py once it has
     decided arrival is today's pick. Preserves the original watcher's
     TOCTOU-safe pattern verbatim: pre-check → delay → re-check → fire.
 
@@ -864,4 +879,4 @@ def register(actions):
     actions["morning_arrival"] = morning_arrival
     actions["arrival_briefing"] = morning_arrival  # natural alias
 
-    # Auto-trigger is owned by skills/morning_chain.py — no per-skill watcher.
+    # Auto-trigger is owned by skills/daily_briefing/chain.py — no per-skill watcher.

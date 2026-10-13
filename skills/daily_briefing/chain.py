@@ -70,11 +70,15 @@ from __future__ import annotations
 import importlib
 import json
 import os
-import sys
 import threading
 import time
 
-_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+try:
+    from . import _common
+except ImportError:   # loaded by file path with no package (a smoke run)
+    _common = None
+
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CONFIG_FILE = os.path.join(_PROJECT_DIR, "morning_chain_config.json")
 
 # Morning window — first wake whose local hour falls in [start, end) drives
@@ -93,10 +97,18 @@ TOD_HANDOFF_UNTIL_HOUR = 10
 
 SKILL_NAMES = ("arrival", "handoff", "briefing")
 
+# The legacy skill names, kept for the log lines and the manual action names.
 _SKILL_MODULE_MAP = {
     "arrival":  "morning_arrival",
     "handoff":  "morning_handoff",
     "briefing": "morning_briefing",
+}
+
+# The part of the daily_briefing package that holds each one.
+_SKILL_PART_MAP = {
+    "arrival":  "arrival",
+    "handoff":  "handoff",
+    "briefing": "light",
 }
 
 # Each skill's on-disk same-day flag. The chain reads these directly rather
@@ -189,7 +201,7 @@ def _skill_already_fired_today(short_name: str) -> bool:
 
 
 def _arrival_v2_fired_today() -> bool:
-    """True if skills/morning_arrival_v2's presence-watcher already briefed
+    """True if skills/daily_briefing/arrival_v2's presence-watcher already briefed
     today. v2 is NOT one of the chain's SKILL_NAMES (it runs its own watcher),
     so without this the chain can't see a v2 fire and the two double-brief. This
     is the mirror of v2's _chain_morning_briefing_fired_today(): v2 stands down
@@ -198,14 +210,7 @@ def _arrival_v2_fired_today() -> bool:
     and defensive -- returns False on any failure so it can never block a chain
     decision."""
     try:
-        import sys
-        import importlib as _il
-        v2 = sys.modules.get("skill_morning_arrival_v2")
-        if v2 is None:
-            try:
-                v2 = _il.import_module("skills.morning_arrival_v2")
-            except Exception:
-                v2 = _il.import_module("morning_arrival_v2")
+        v2 = _common.part(__package__, "arrival_v2")
         return bool(v2._already_fired_today())
     except Exception:
         return False
@@ -219,7 +224,7 @@ def _daily_briefing_heard_today() -> bool:
     could not fire (B096). Read through the live module like v2 does; False on
     any failure, so a broken daily_briefing can never block a chain decision."""
     try:
-        db = sys.modules.get("skill_daily_briefing")
+        db = _common.package(__package__)
         fn = getattr(db, "owner_heard_briefing_today", None) if db else None
         return bool(fn()) if callable(fn) else False
     except Exception:
@@ -269,16 +274,11 @@ def _jarvis_asleep(bc) -> bool:
 # ─── skill dispatch ──────────────────────────────────────────────────────
 
 def _import_skill(short_name: str):
+    """The package part that holds short_name's morning briefing (the same
+    instance the loader registered, never a second copy)."""
     mod_name = _SKILL_MODULE_MAP[short_name]
     try:
-        return importlib.import_module(f"skills.{mod_name}")
-    except Exception:
-        pass
-    try:
-        skills_dir = os.path.dirname(os.path.abspath(__file__))
-        if skills_dir not in sys.path:
-            sys.path.insert(0, skills_dir)
-        return importlib.import_module(mod_name)
+        return _common.part(__package__, _SKILL_PART_MAP[short_name])
     except Exception as e:
         print(f"  [morning-chain] can't import {mod_name}: {e}")
         return None

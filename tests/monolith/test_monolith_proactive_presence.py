@@ -594,7 +594,8 @@ class PresenceConsumersTests(_Base):
         super().setUp()
         import sys
         import numpy as np
-        from tests._skill_harness import load_skill_isolated
+        from tests._skill_harness import (load_briefing_part,
+                                           load_skill_isolated)
         bc = self.bc
         self.np = np
         self._p(bc, "CAMERAS", [dict(self.CAM)])
@@ -605,7 +606,7 @@ class PresenceConsumersTests(_Base):
         bc.last_face_seen = 0.0
         saved = {k: sys.modules.get(k) for k in (
             "skill_face_tracker", "skill_wellness", "skill_daily_briefing",
-            "skill_morning_arrival_v2")}
+            "skill_daily_briefing.arrival_v2")}
 
         def _restore_modules():
             for k, v in saved.items():
@@ -616,8 +617,8 @@ class PresenceConsumersTests(_Base):
         self.addCleanup(_restore_modules)
         self.ft, _ = load_skill_isolated("face_tracker")
         self.well, _ = load_skill_isolated("wellness")
-        self.brief, _ = load_skill_isolated("daily_briefing")
-        self.arrive, _ = load_skill_isolated("morning_arrival_v2")
+        self.brief, _ = load_briefing_part("daily")
+        self.arrive, _ = load_briefing_part("arrival_v2")
         ft = self.ft
         self._p(ft, "_read_kinect_presence", return_value=None)
         self._p(ft, "_kinect_gaze_monitor", return_value=None)

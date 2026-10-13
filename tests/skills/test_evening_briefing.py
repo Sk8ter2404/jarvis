@@ -1,4 +1,4 @@
-"""Logic tests for skills/evening_briefing.py.
+"""Logic tests for skills/daily_briefing/evening.py.
 
 Covers the pure text helpers (tomorrow-weather phrasing, count humaniser,
 wttr/Open-Meteo parsers, the session-log pattern scanner + dry observation),
@@ -34,7 +34,7 @@ import unittest
 from collections import Counter
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part
 
 _SENTINEL = object()
 
@@ -57,12 +57,12 @@ def _fake_bc():
 
 
 def _load(register=True):
-    """Load skills/evening_briefing in isolation with a fake bobert_companion
+    """Load skills/daily_briefing/evening in isolation with a fake bobert_companion
     present for the duration of ``register()`` (the harness neuters the
     scheduler thread). Returns ``(module, actions)``. The fake bc is removed
     again on return, so each test installs its own bc where it needs one."""
     with mock.patch.dict(sys.modules, {"bobert_companion": _fake_bc()}):
-        return load_skill_isolated("evening_briefing", register=register)
+        return load_briefing_part("evening", register=register)
 
 
 @contextlib.contextmanager

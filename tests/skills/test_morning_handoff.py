@@ -1,4 +1,4 @@
-"""Logic tests for skills/morning_handoff.py.
+"""Logic tests for skills/daily_briefing/handoff.py.
 
 Covers the chained-briefing sections (weather / calendar+mail / Teams-VIP
 callout / print / news) with sibling skills mocked, the ordinal helper, the
@@ -21,7 +21,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part
 
 
 _SENTINEL = object()
@@ -116,7 +116,7 @@ def block_import(*names):
 
 class MorningHandoffTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_handoff")
+        self.mod, self.actions = load_briefing_part("handoff")
 
     # ── _ordinal (pure) ──────────────────────────────────────────────────
     def test_ordinal(self):
@@ -313,13 +313,13 @@ class MorningHandoffTests(unittest.TestCase):
 
     # ── registered actions ───────────────────────────────────────────────
     def test_action_morning_handoff(self):
-        mod, actions = load_skill_isolated("morning_handoff")
+        mod, actions = load_briefing_part("handoff")
         with mock.patch.object(mod, "_fire_handoff", return_value="[intent:briefing] Good morning."):
             out = actions["morning_handoff"]("")
         self.assertIn("Good morning", out)
 
     def test_action_predictive_setup_aliases(self):
-        mod, actions = load_skill_isolated("morning_handoff")
+        mod, actions = load_briefing_part("handoff")
         # All three aliases bind to the same predictive setup.
         for name in ("predictive_morning_setup", "setup_workspace", "workspace_setup"):
             self.assertIn(name, actions)
@@ -328,14 +328,14 @@ class MorningHandoffTests(unittest.TestCase):
         self.assertEqual(out, "Workshop is yours, sir.")
 
     def test_action_predictive_setup_no_op_message(self):
-        mod, actions = load_skill_isolated("morning_handoff")
+        mod, actions = load_briefing_part("handoff")
         with mock.patch.object(mod, "_predictive_morning_setup", return_value=""):
             out = actions["predictive_morning_setup"]("")
         self.assertIn("already in order", out.lower())
 
     # ── registered-action failure paths ──────────────────────────────────
     def test_action_morning_handoff_swallows_exception(self):
-        mod, actions = load_skill_isolated("morning_handoff")
+        mod, actions = load_briefing_part("handoff")
         with mock.patch.object(mod, "_fire_handoff",
                                side_effect=RuntimeError("kaboom")):
             out = actions["morning_handoff"]("")
@@ -343,7 +343,7 @@ class MorningHandoffTests(unittest.TestCase):
         self.assertIn("kaboom", out)
 
     def test_action_predictive_setup_swallows_exception(self):
-        mod, actions = load_skill_isolated("morning_handoff")
+        mod, actions = load_briefing_part("handoff")
         with mock.patch.object(mod, "_predictive_morning_setup",
                                side_effect=RuntimeError("nope")):
             out = actions["predictive_morning_setup"]("")
@@ -356,7 +356,7 @@ class MorningHandoffTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class SectionWeatherTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     def _weather(self, data):
         bs = mock.MagicMock()
@@ -413,7 +413,7 @@ class SectionWeatherTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class SectionCalendarTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     def test_degraded_when_no_graph(self):
         with mock.patch.object(self.mod, "_import_skill", return_value=None):
@@ -504,7 +504,7 @@ class SectionCalendarTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class SectionTeamsVipTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     def _tn(self, state):
         tn = mock.MagicMock()
@@ -583,7 +583,7 @@ class SectionTeamsVipTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class SectionPrintTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     def _bm(self, state, strip=None, fmt=None):
         bm = mock.MagicMock()
@@ -698,7 +698,7 @@ class SectionPrintTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class SectionNewsTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     def test_degraded_when_no_news(self):
         with mock.patch.object(self.mod, "_import_skill", return_value=None):
@@ -728,7 +728,7 @@ class SectionNewsTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class ImportSkillTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     def test_prefers_live_registered_module(self):
         sentinel = types.ModuleType("skill_fakelive")
@@ -755,7 +755,7 @@ class ImportSkillTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class SpeechAndStateTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
         self.tmp = tempfile.mkdtemp(prefix="handoff_test_")
         self.addCleanup(self._cleanup)
         self.queue = os.path.join(self.tmp, "pending_speech.json")
@@ -902,7 +902,7 @@ class SpeechAndStateTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class FireHandoffTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     def test_force_fires_even_if_already_fired(self):
         saved = {}
@@ -1024,7 +1024,7 @@ class FireHandoffTests(unittest.TestCase):
 
     def test_manual_handoff_is_not_background_work(self):
         from core import local_traffic as lt
-        mod, actions = load_skill_isolated("morning_handoff")
+        mod, actions = load_briefing_part("handoff")
         seen = []
 
         def _fire(reason, force=False):
@@ -1040,7 +1040,7 @@ class FireHandoffTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class OvernightPrintPhraseTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     def _bm_finished(self, summary):
         bm = mock.MagicMock()
@@ -1169,7 +1169,7 @@ class OvernightPrintPhraseTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class MorningPatternAppsTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     def test_no_pattern_learning_returns_empty_set(self):
         with mock.patch.object(self.mod, "_import_skill", return_value=None):
@@ -1227,7 +1227,7 @@ class MorningPatternAppsTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class PredictivePrimitiveTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     # ── _set_master_volume ───────────────────────────────────────────────
     def test_set_master_volume_missing_pycaw_returns_false(self):
@@ -1479,7 +1479,7 @@ class PredictivePrimitiveTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class PredictiveSetupAssemblyTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_handoff")
+        self.mod, _ = load_briefing_part("handoff")
 
     @contextlib.contextmanager
     def _stub(self, *, pattern=None, print_phrase=("", False),

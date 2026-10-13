@@ -1,4 +1,4 @@
-"""Logic tests for skills/news_briefing.py.
+"""Logic tests for skills/daily_briefing/news.py.
 
 Covers the pure RSS/Atom plumbing (HTML stripping, stdlib feed parsing, config
 normalisation, round-robin headline gathering) and the briefing assembly with
@@ -16,7 +16,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part
 
 _SENTINEL = object()
 
@@ -78,7 +78,7 @@ class _FakeResp:
 
 class NewsBriefingTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("news_briefing")
+        self.mod, self.actions = load_briefing_part("news")
 
     # ── _strip_html (pure) ───────────────────────────────────────────────
     def test_strip_html_tags_and_entities(self):
@@ -221,7 +221,7 @@ class NewsBriefingTests(unittest.TestCase):
 
 class NewsConfigTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("news_briefing")
+        self.mod, self.actions = load_briefing_part("news")
 
     def test_config_returns_default_when_bc_unimportable(self):
         with mock.patch.object(self.mod.importlib, "import_module",
@@ -256,7 +256,7 @@ class NewsFeedparserParseTests(unittest.TestCase):
     """_parse_with_feedparser with a fake feedparser injected (the real one is
     on CI, but we control the parse result and avoid any network)."""
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("news_briefing")
+        self.mod, self.actions = load_briefing_part("news")
 
     def _fake_feedparser(self, entries, parse_raises=False):
         fp = types.ModuleType("feedparser")
@@ -309,7 +309,7 @@ class NewsFeedparserParseTests(unittest.TestCase):
 class NewsStdlibContentTests(unittest.TestCase):
     """Atom <content> path + child.itertext() fallback in _parse_with_stdlib."""
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("news_briefing")
+        self.mod, self.actions = load_briefing_part("news")
 
     def test_atom_content_with_nested_html(self):
         # <content> begins with a child element (no direct text) so the parser
@@ -339,7 +339,7 @@ class NewsStdlibContentTests(unittest.TestCase):
 class NewsFetchTests(unittest.TestCase):
     """_fetch_feed (urllib mocked) + _fetch_feed_cached TTL/stale logic."""
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("news_briefing")
+        self.mod, self.actions = load_briefing_part("news")
         # Start every fetch test from an empty in-process cache and restore it.
         self._saved_cache = dict(self.mod._feed_cache)
         self.mod._feed_cache.clear()
@@ -433,7 +433,7 @@ class NewsSummarizeTests(unittest.TestCase):
     """_summarize_via_llm — Claude primary path (fake anthropic) + local
     fallback + cleaning + degradation. No real network/LLM."""
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("news_briefing")
+        self.mod, self.actions = load_briefing_part("news")
         # The backend's cloud gate (core.cloud_gate, 2026-10-01) is pinned
         # open: these tests pick the path with the stand-in's AI_BACKEND, and
         # a real bobert_companion left in sys.modules by a monolith test would
@@ -546,7 +546,7 @@ class NewsAssemblyTests(unittest.TestCase):
     """_gather_headlines edge cases + get_news_text with summarize on, plus the
     no-feeds short-circuit and the empty-sentence guard."""
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("news_briefing")
+        self.mod, self.actions = load_briefing_part("news")
 
     def test_gather_stops_when_all_feeds_empty(self):
         cfg = {"feeds": [{"name": "a", "url": "ua"}, {"name": "b", "url": "ub"}],
@@ -623,7 +623,7 @@ class NewsAssemblyTests(unittest.TestCase):
 class NewsEnqueueTests(unittest.TestCase):
     """_enqueue_speech — announcer path + atomic-write fallback variants."""
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("news_briefing")
+        self.mod, self.actions = load_briefing_part("news")
 
     def test_enqueue_uses_bc_announcer(self):
         bc = types.ModuleType("bobert_companion")
@@ -730,7 +730,7 @@ class NewsEnqueueTests(unittest.TestCase):
 
 class NewsRegisterTests(unittest.TestCase):
     def test_register_enabled_adds_action(self):
-        mod, _ = load_skill_isolated("news_briefing", register=False)
+        mod, _ = load_briefing_part("news", register=False)
         actions: dict = {}
         cfg = {"enabled": True, "feeds": [{"name": "", "url": "x"}], "count": 3,
                "summarize": True, "ttl": 0, "timeout": 1.0}
@@ -739,7 +739,7 @@ class NewsRegisterTests(unittest.TestCase):
         self.assertIn("news_briefing", actions)
 
     def test_register_disabled_still_adds_action(self):
-        mod, _ = load_skill_isolated("news_briefing", register=False)
+        mod, _ = load_briefing_part("news", register=False)
         actions: dict = {}
         cfg = {"enabled": False, "feeds": [], "count": 3, "summarize": True,
                "ttl": 0, "timeout": 1.0}
@@ -750,7 +750,7 @@ class NewsRegisterTests(unittest.TestCase):
     def test_action_enqueues_real_path(self):
         # End-to-end action with get_news_text stubbed and enqueue going through
         # the announcer (no file written).
-        mod, actions = load_skill_isolated("news_briefing")
+        mod, actions = load_briefing_part("news")
         bc = types.ModuleType("bobert_companion")
         sent = []
         bc.proactive_announce = lambda msg, source=None: sent.append(msg)
@@ -764,7 +764,7 @@ class NewsRegisterTests(unittest.TestCase):
 
 class NewsBriefingImportGuardTests(unittest.TestCase):
     def test_path_bootstrap_inserts_project_root(self):
-        mod, _ = load_skill_isolated("news_briefing")
+        mod, _ = load_briefing_part("news")
         path = mod.__file__
         proj = os.path.dirname(os.path.dirname(path))
         spec = importlib.util.spec_from_file_location("news_reexec", path)

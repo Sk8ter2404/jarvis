@@ -23,7 +23,7 @@ import core.actions as A
 import core.config as cfg
 import core.model_catalog as mc
 import core.orchestrator as orch
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part, load_skill_isolated
 from tools import settings_window as sw
 
 
@@ -227,7 +227,7 @@ class OtherSkillsCloudGateTests(unittest.TestCase):
         return out, anth
 
     def test_news_summary_stays_local_with_chat_routed_local(self):
-        mod, _ = load_skill_isolated("news_briefing")
+        mod, _ = load_briefing_part("news")
         # AI_BACKEND is "claude" on the stand-in: the old check passed.
         out, anth = self._with(False, "Local summary.",
                                lambda: mod._summarize_via_llm("Title", "d"))

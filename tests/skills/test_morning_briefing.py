@@ -1,4 +1,4 @@
-"""Logic tests for skills/morning_briefing.py.
+"""Logic tests for skills/daily_briefing/light.py.
 
 Covers the pure helpers (ordinal, pending-task count, weather phrase, bed-time
 remark, Outlook summary timeout wrapper), the full _build_briefing assembly
@@ -21,7 +21,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part
 
 
 _SENTINEL = object()
@@ -64,7 +64,7 @@ def _fake_source(**attrs):
 
 class MorningBriefingTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_briefing")
+        self.mod, self.actions = load_briefing_part("light")
 
     # ── _ordinal (pure) ──────────────────────────────────────────────────
     def test_ordinal(self):
@@ -98,7 +98,7 @@ class MorningBriefingTests(unittest.TestCase):
         import sys
         # _fetch_weather does `from . import briefing_sources` first; inject a
         # package-style module name so that import resolves to our fake.
-        with mock.patch.dict(sys.modules, {"skill_morning_briefing.briefing_sources": fake_bs,
+        with mock.patch.dict(sys.modules, {"skill_daily_briefing.briefing_sources": fake_bs,
                                            "briefing_sources": fake_bs}):
             out = self.mod._fetch_weather()
         self.assertIn("64 degrees and overcast", out)
@@ -109,7 +109,7 @@ class MorningBriefingTests(unittest.TestCase):
         fake_bs = mock.MagicMock()
         fake_bs.get_weather_data.return_value = None
         import sys
-        with mock.patch.dict(sys.modules, {"skill_morning_briefing.briefing_sources": fake_bs,
+        with mock.patch.dict(sys.modules, {"skill_daily_briefing.briefing_sources": fake_bs,
                                            "briefing_sources": fake_bs}):
             self.assertEqual(self.mod._fetch_weather(), "")
 
@@ -122,7 +122,7 @@ class MorningBriefingTests(unittest.TestCase):
         fake_bs = mock.MagicMock()
         fake_bs.get_weather_data.return_value = {"temp_c": 24, "desc": "clear", "source": "wttr"}
         import sys
-        with mock.patch.dict(sys.modules, {"skill_morning_briefing.briefing_sources": fake_bs,
+        with mock.patch.dict(sys.modules, {"skill_daily_briefing.briefing_sources": fake_bs,
                                            "briefing_sources": fake_bs}):
             out = self.mod._fetch_weather()
         self.assertIn("75 degrees", out)
@@ -237,7 +237,7 @@ class MorningBriefingTests(unittest.TestCase):
 
     # ── morning_briefing action ──────────────────────────────────────────
     def test_action_builds_and_marks(self):
-        mod, actions = load_skill_isolated("morning_briefing")
+        mod, actions = load_briefing_part("light")
         with mock.patch.object(mod, "_build_briefing", return_value="Good morning, sir."), \
              mock.patch.object(mod, "_show_card_safe"), \
              mock.patch.object(mod, "_mark_briefing_fired_today") as mark:
@@ -246,7 +246,7 @@ class MorningBriefingTests(unittest.TestCase):
         mark.assert_called_once()
 
     def test_action_handles_exception(self):
-        mod, actions = load_skill_isolated("morning_briefing")
+        mod, actions = load_briefing_part("light")
         with mock.patch.object(mod, "_build_briefing", side_effect=RuntimeError("boom")):
             out = actions["morning_briefing"]("")
         self.assertIn("failed", out.lower())
@@ -257,10 +257,10 @@ class MorningBriefingTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class FetchWeatherTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_briefing")
+        self.mod, _ = load_briefing_part("light")
 
     def _with_bs(self, bs):
-        return inject_modules(**{"skill_morning_briefing.briefing_sources": bs,
+        return inject_modules(**{"skill_daily_briefing.briefing_sources": bs,
                                  "briefing_sources": bs})
 
     def test_weather_no_desc_uses_outside_phrase(self):
@@ -287,7 +287,7 @@ class FetchWeatherTests(unittest.TestCase):
         # Both the package-relative and absolute import fail → the helper logs
         # and returns "" without raising (and crucially never reaches the real
         # briefing_sources, which would hit the network).
-        with inject_modules(**{"skill_morning_briefing.briefing_sources": None,
+        with inject_modules(**{"skill_daily_briefing.briefing_sources": None,
                                "briefing_sources": None}), \
              mock.patch("builtins.__import__",
                         side_effect=_block_import("briefing_sources")):
@@ -304,7 +304,7 @@ class FetchWeatherTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class EnqueueSpeechTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_briefing")
+        self.mod, _ = load_briefing_part("light")
         self.tmp = tempfile.mkdtemp(prefix="mbrief_speech_")
         self.addCleanup(self._cleanup)
         self.queue = os.path.join(self.tmp, "pending_speech.json")
@@ -376,7 +376,7 @@ class EnqueueSpeechTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class ShowCardTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_briefing")
+        self.mod, _ = load_briefing_part("light")
 
     def test_show_card_calls_hud(self):
         seen = []
@@ -412,7 +412,7 @@ class ShowCardTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class OutlookSummaryBlockingTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_briefing")
+        self.mod, _ = load_briefing_part("light")
 
     def _with_ms(self, ms):
         return inject_modules(**{"skill_morning_briefing.ms_graph": ms,
@@ -504,7 +504,7 @@ class OutlookSummaryBlockingTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class BedRemarkTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_briefing")
+        self.mod, _ = load_briefing_part("light")
 
     def test_remark_without_memory_file(self):
         # Regression: bobert_memory.json is NOT required — the signal is the
@@ -546,10 +546,15 @@ class BedRemarkTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class SourceHelperTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_briefing")
+        self.mod, _ = load_briefing_part("light")
 
     def _inject(self, modname, mod):
-        return inject_modules(**{f"skill_morning_briefing.{modname}": mod, modname: mod})
+        # The news briefing is a part of the same package now (news.py); the
+        # other sources are separate skills found via the skills folder.
+        if modname == "news_briefing":
+            return inject_modules(**{"skill_daily_briefing.news": mod,
+                                     modname: mod})
+        return inject_modules(**{f"skill_daily_briefing.{modname}": mod, modname: mod})
 
     # ── _fetch_news ──────────────────────────────────────────────────────
     def test_fetch_news_returns_text(self):
@@ -565,7 +570,7 @@ class SourceHelperTests(unittest.TestCase):
             self.assertEqual(self.mod._fetch_news(), "")
 
     def test_fetch_news_module_unavailable_blank(self):
-        with inject_modules(**{"skill_morning_briefing.news_briefing": None,
+        with inject_modules(**{"skill_daily_briefing.news": None,
                                "news_briefing": None}), \
              mock.patch("builtins.__import__",
                         side_effect=_block_import("news_briefing")):
@@ -622,7 +627,7 @@ class SourceHelperTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class BuildAndFireTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_briefing")
+        self.mod, _ = load_briefing_part("light")
 
     def _all_sources(self, **over):
         base = dict(_fetch_weather="", _count_pending_tasks=0, _bed_remark="",
@@ -741,7 +746,7 @@ class BuildAndFireTests(unittest.TestCase):
 
     def test_manual_briefing_is_not_background_work(self):
         from core import local_traffic as lt
-        mod, actions = load_skill_isolated("morning_briefing")
+        mod, actions = load_briefing_part("light")
         seen = []
 
         def _build():

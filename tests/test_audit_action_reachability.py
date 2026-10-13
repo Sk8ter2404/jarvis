@@ -202,7 +202,7 @@ def _registration_sources() -> list[str]:
     return ([os.path.join(_PROJECT_ROOT, _MONOLITH_REL)]
             + sorted(glob.glob(os.path.join(_PROJECT_ROOT, "skills", "*.py")))
             + sorted(glob.glob(os.path.join(_PROJECT_ROOT, "skills", "*",
-                                            "__init__.py")))
+                                            "*.py")))
             + sorted(glob.glob(os.path.join(_PROJECT_ROOT, "core", "*.py"))))
 
 

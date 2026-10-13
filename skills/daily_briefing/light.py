@@ -6,7 +6,7 @@ Actions:
                        text (also spoken).
 
 Auto-trigger:
-  Driven by skills/morning_chain.py — a single controller polls
+  Driven by skills/daily_briefing/chain.py — a single controller polls
   bobert_companion._last_wake_date for the day's first wake event and picks
   ONE of {morning_arrival, morning_handoff, morning_briefing} to dispatch
   based on day-of-week / DEFAULT_MORNING_SKILL / time-of-day. When the chain
@@ -32,7 +32,10 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 from core.atomic_io import _atomic_write_json
 
-_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# This module lives in the skills/daily_briefing package: the skills folder (where the
+# sibling skills briefing_sources, ms_graph, weather_briefing ... live) is one level up.
+_SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _MEMORY_FILE  = os.path.join(_PROJECT_DIR, "bobert_memory.json")
 _TODO_FILE    = os.path.join(_PROJECT_DIR, "jarvis_todo.md")
@@ -141,7 +144,7 @@ def _fetch_weather() -> str:
         from . import briefing_sources  # type: ignore
     except Exception:
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, _SKILLS_DIR)
             import briefing_sources  # type: ignore
         except Exception as e:
             print(f"  [morning] briefing_sources unavailable: {e}")
@@ -176,7 +179,7 @@ def _outlook_summary_blocking() -> str:
         from . import ms_graph                          # type: ignore
     except Exception:
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, _SKILLS_DIR)
             import ms_graph                             # type: ignore
         except Exception:
             return ""
@@ -283,10 +286,10 @@ def _fetch_news() -> str:
     """Pull the news_briefing module's headline paragraph, or '' if it's
     unavailable / disabled / every feed failed."""
     try:
-        from . import news_briefing  # type: ignore
+        from . import news as news_briefing  # type: ignore
     except Exception:
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, _SKILLS_DIR)
             import news_briefing  # type: ignore
         except Exception as e:
             print(f"  [morning] news_briefing unavailable: {e}")
@@ -306,7 +309,7 @@ def _fetch_umbrella_alert() -> str:
         from . import weather_briefing  # type: ignore
     except Exception:
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, _SKILLS_DIR)
             import weather_briefing  # type: ignore
         except Exception as e:
             print(f"  [morning] weather_briefing unavailable: {e}")
@@ -326,7 +329,7 @@ def _fetch_robot_volunteer() -> str:
         from . import repo_robot  # type: ignore
     except Exception:
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, _SKILLS_DIR)
             import repo_robot  # type: ignore
         except Exception:
             return ""
@@ -453,7 +456,7 @@ def _wait_for_quiet() -> str:
 
 
 def _fire_from_chain(reason: str = "morning_chain") -> None:
-    """Auto-trigger entry called by skills/morning_chain.py once it has
+    """Auto-trigger entry called by skills/daily_briefing/chain.py once it has
     decided briefing is today's pick. Preserves the original watcher's
     TOCTOU-safe pattern verbatim: pre-check → delay → re-check → fire.
     Manual triggers ("morning briefing") still bypass via force=True.
@@ -489,4 +492,4 @@ def register(actions):
 
     actions["morning_briefing"] = morning_briefing
 
-    # Auto-trigger is owned by skills/morning_chain.py — no per-skill watcher.
+    # Auto-trigger is owned by skills/daily_briefing/chain.py — no per-skill watcher.

@@ -265,7 +265,7 @@ def _act_next_robot_step(_: str = "") -> str:
 
 # ── morning briefing volunteer ───────────────────────────────────────────
 def get_morning_volunteer_text() -> str:
-    """Called by skills/morning_briefing.py. Returns a one-line JARVIS-style
+    """Called by skills/daily_briefing/light.py. Returns a one-line JARVIS-style
     remark when there's actionable robot progress to flag, otherwise ''.
 
     Triggers:

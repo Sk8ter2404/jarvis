@@ -191,6 +191,41 @@ def load_skill_isolated(name, *, utils=None, actions=None, register=True,
     return mod, actions
 
 
+def load_briefing_part(part, *, utils=None, actions=None, register=True,
+                       neuter_threads=True, capture_output=True,
+                       skip_if_missing_dep=True):
+    """Import ONE part of the skills/daily_briefing package in isolation
+    ('chain', 'arrival', 'arrival_v2', 'handoff', 'light',
+    'evening', 'recap', 'news') and, with register=True, call
+    only THAT part's register(actions) - the package hub, which would
+    register every briefing, is not run. Returns (part_module, actions).
+
+    Each call re-execs the package and the parts fresh, like
+    load_skill_isolated: stale skill_daily_briefing.* modules from an
+    earlier test are dropped first so patched state cannot leak."""
+    for key in [k for k in sys.modules
+                if k == "skill_daily_briefing"
+                or k.startswith("skill_daily_briefing.")]:
+        sys.modules.pop(key, None)
+    load_skill_isolated("daily_briefing", utils=utils, register=False,
+                        neuter_threads=neuter_threads,
+                        capture_output=capture_output,
+                        skip_if_missing_dep=skip_if_missing_dep)
+    actions = {} if actions is None else actions
+    threads_cm = no_background_threads() if neuter_threads         else contextlib.nullcontext()
+    out_cm = contextlib.redirect_stdout(io.StringIO()) if capture_output         else contextlib.nullcontext()
+    with threads_cm, out_cm:
+        if part == "daily":
+            mod = sys.modules["skill_daily_briefing"]
+            if register:
+                mod._register_daily(actions)
+        else:
+            mod = importlib.import_module(f"skill_daily_briefing.{part}")
+            if register and hasattr(mod, "register"):
+                mod.register(actions)
+    return mod, actions
+
+
 def list_skill_names():
     """Every loadable skill name — flat ``.py`` modules and package dirs with
     an ``__init__.py`` — excluding ``_``-prefixed and ``__pycache__`` (matches

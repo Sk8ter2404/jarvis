@@ -186,7 +186,9 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
 
 ### Category 7: Briefings & daily intelligence
 
-- **One morning opener per day** — `skills/morning_chain.py` waits for the day's first wake between 06:00 and 12:00 — a standby wake, the tray's wake, or simply the day's first spoken turn from 06:00 on — and fires exactly one of morning arrival, morning handoff or morning briefing (by config, `DEFAULT_MORNING_SKILL`, or time of day). `morning_chain_pick` reports which it would choose.
+Every briefing below is one skill, `skills/daily_briefing/` (merged 2026-10-12 from nine separate skills; the actions and what JARVIS says are unchanged). The weather forecasts stay in `skills/weather_briefing.py`.
+
+- **One morning opener per day** — `skills/daily_briefing/chain.py` waits for the day's first wake between 06:00 and 12:00 — a standby wake, the tray's wake, or simply the day's first spoken turn from 06:00 on — and fires exactly one of morning arrival, morning handoff or morning briefing (by config, `DEFAULT_MORNING_SKILL`, or time of day). `morning_chain_pick` reports which it would choose.
 - **Morning briefing** — day and date, weather, pending task count, unread mail count (when Microsoft Graph is signed in), and a dry remark after a late night.
   - "morning briefing", "run the briefing again"
   - Action: `morning_briefing`
@@ -273,6 +275,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - "show me the globe", "put the globe on the left monitor", "show me where Tokyo is", "clear the pins", "hide the globe"
   - Actions: `show_globe`, `hide_globe`, `globe_pin`, `globe_clear`
 - **Bambu overlays** (`hud/bambu_h2d_overlay.py`, `hud/workshop_print_monitor.py`, `hud/bambu_camera_hud.py`) — see Category 6.
+- **How the HUD windows above are wired (decision 2026-10-12)** — the globe is a separate thing (a map with pins) and does not replace any of them. The unified HUD is the one that runs at boot and already shows their data (state, CPU/RAM/GPU/NET, print progress, weather, calendar, transcript), so every window the holographic overlay skill (`skills/holographic_overlay/`) can open is **on demand only**: each auto-launch switch is defined in `core/config.py` and is `False`. They stay because something uses them: the suit-up cinematic opens the fullscreen overlay itself (`skills/suit_up.py`), and `hud/bambu_camera_hud.py` is the only printer-camera panel (`HUD_BAMBU_CAMERA`, on; `BAMBU_CAMERA_AUTO_WHILE_PRINTING` shows it while a print runs). To have one open by itself, set its switch to `true` in `data/user_settings.json` and restart: `HOLOGRAPHIC_OVERLAY_AUTO_LAUNCH` (fullscreen reactor), `HOLO_WORKSHOP_AUTO_ON_THINK` (corner reactor while thinking or speaking), `WORKSHOP_HUD_AUTO_LAUNCH` (top-right power/CPU/RAM/print panel), `WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH` (top-centre print panel), `BAMBU_OVERLAY_AUTO_WHILE_PRINTING` (corner print widget), `HOLO_HUD_V2_AUTO_LAUNCH`, `HOLO_ARC_REACTOR_STATUS_AUTO_LAUNCH`, `HOLO_STARK_STATUS_RING_AUTO_LAUNCH`. The last three could not be set from `user_settings.json` before this date (they were read but never defined in `core/config.py`).
 - **Air cursor** (`hud/jarvis_air_cursor.py`) and **reticle** (`hud/jarvis_reticle.py`) — draw the Kinect hand cursor(s) and click targets during UI automation. No voice commands.
 - **Suit-up sequence** — a 6–8 s boot cinematic with a system readout and "Welcome back, sir." Fires once per day on the first warm restart; on demand any time.
   - "suit up", "boot sequence"

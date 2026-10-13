@@ -1,4 +1,4 @@
-"""Logic tests for skills/morning_arrival.py.
+"""Logic tests for skills/daily_briefing/arrival.py.
 
 Covers the data-section formatters (time, weather C→F, first-meeting phrasing),
 the "Three things require your attention" clause builder, full briefing
@@ -38,7 +38,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part
 
 
 def _rmtree(path):
@@ -56,7 +56,7 @@ def _rmtree(path):
 
 class MorningArrivalTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_arrival")
+        self.mod, self.actions = load_briefing_part("arrival")
 
     # ── _section_time_phrase (pure) ──────────────────────────────────────
     def test_section_time_phrase_format(self):
@@ -244,7 +244,7 @@ class MorningArrivalTests(unittest.TestCase):
 
     # ── morning_arrival action ───────────────────────────────────────────
     def test_action_returns_built_text(self):
-        mod, actions = load_skill_isolated("morning_arrival")
+        mod, actions = load_briefing_part("arrival")
         with mock.patch.object(mod, "_build_briefing", return_value="[intent:briefing] Good morning."), \
              mock.patch.object(mod, "_enqueue_speech"), \
              mock.patch.object(mod, "_mark_fired"):
@@ -252,7 +252,7 @@ class MorningArrivalTests(unittest.TestCase):
         self.assertIn("Good morning", out)
 
     def test_action_no_content_message(self):
-        mod, actions = load_skill_isolated("morning_arrival")
+        mod, actions = load_briefing_part("arrival")
         with mock.patch.object(mod, "_build_briefing", return_value=""), \
              mock.patch.object(mod, "_enqueue_speech"), \
              mock.patch.object(mod, "_mark_fired"):
@@ -265,7 +265,7 @@ class MorningArrivalTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class ImportAndEnqueueTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     # ── _import_skill resolution order ───────────────────────────────────
     def test_import_skill_prefers_live_registered(self):
@@ -377,7 +377,7 @@ class StateFileTests(unittest.TestCase):
     file so the atomic-write path executes without touching the project's
     morning_arrival_state.json."""
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
         self.tmp = tempfile.mkdtemp(prefix="arrival_state_")
         self.state_file = os.path.join(self.tmp, "morning_arrival_state.json")
         self._orig_state_file = self.mod._STATE_FILE
@@ -436,7 +436,7 @@ class StateFileTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class SilenceHoursTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     def test_returns_none_when_bobert_unreachable(self):
         with mock.patch.object(self.mod.importlib, "import_module",
@@ -487,7 +487,7 @@ class SilenceHoursTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class TeamsPhraseTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     # ── _section_teams_phrase via the vision top-3 path ──────────────────
     def test_one_sender(self):
@@ -574,7 +574,7 @@ class TeamsVisionParserTests(unittest.TestCase):
     """_teams_top_senders_via_vision: drive bobert_companion's screenshot +
     vision plumbing through a fake and assert the strict-format parser."""
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     def _bc(self, *, answer="", images=("img",), take=True, ask=True,
             take_raises=False, ask_raises=False):
@@ -693,7 +693,7 @@ class PrintPhraseTests(unittest.TestCase):
     _NOW = 1_700_000_000.0
 
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
         # Freeze the skill's clock for all age math in this section.
         self._time_patch = mock.patch.object(self.mod.time, "time",
                                               return_value=self._NOW)
@@ -854,7 +854,7 @@ class PrintPhraseTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class HeadlineSectionTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     def _nb(self, *, enabled=True, feeds=True, summarize=False,
             headlines=None, summary="summarised line"):
@@ -920,7 +920,7 @@ class HeadlineSectionTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class WeatherEdgeTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     def test_temp_only_when_desc_blank(self):
         bs = mock.MagicMock()
@@ -955,7 +955,7 @@ class WeatherEdgeTests(unittest.TestCase):
 
 class MeetingPhraseTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     def _ms(self, meeting):
         ms = mock.MagicMock()
@@ -1058,7 +1058,7 @@ class MeetingPhraseTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class MergeCountTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     def test_out_of_window_loop_ignored(self):
         # An old loop-start (epoch 0) is out of window → its iterations skipped.
@@ -1158,7 +1158,7 @@ class MergeCountTests(unittest.TestCase):
 
 class AnomalyEdgeTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     def _read(self, payload):
         return (mock.patch.object(self.mod.os.path, "exists", return_value=True),
@@ -1289,7 +1289,7 @@ class AnomalyEdgeTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class GatherSectionsTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     def test_collects_all_sections(self):
         # Patch every section formatter to a fast deterministic stub so the
@@ -1364,7 +1364,7 @@ class GatherSectionsTests(unittest.TestCase):
 
 class ComposeWithinBudgetTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("morning_arrival")
+        self.mod, _ = load_briefing_part("arrival")
 
     def test_returns_untrimmed_when_under_budget(self):
         parts = {"time": "7 AM", "weather": "", "meeting": "", "claude": "",
@@ -1417,7 +1417,7 @@ class ComposeWithinBudgetTests(unittest.TestCase):
 
 class FirePathTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("morning_arrival")
+        self.mod, self.actions = load_briefing_part("arrival")
 
     def test_fire_arrival_suppressed_when_already_fired(self):
         with mock.patch.object(self.mod, "_arrival_already_fired_today",
@@ -1498,7 +1498,7 @@ class FirePathTests(unittest.TestCase):
         self.assertIs(self.actions["morning_arrival"], self.actions["arrival_briefing"])
 
     def test_action_handles_internal_exception(self):
-        mod, actions = load_skill_isolated("morning_arrival")
+        mod, actions = load_briefing_part("arrival")
         with mock.patch.object(mod, "_fire_arrival",
                                side_effect=RuntimeError("kaboom")):
             out = actions["morning_arrival"]("")

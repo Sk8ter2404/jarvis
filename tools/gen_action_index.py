@@ -128,10 +128,12 @@ def publishable_sources(paths, root, tracked=None):
 def _skill_and_core_sources(root):
     # PACKAGE SKILLS (2026-07-14 audit). `skills/*.py` misses PACKAGE skills whose
     # registration lives in skills/<name>/__init__.py (e.g. holographic_overlay) — a
-    # whole package's actions rendered with `?` locations. Add the package inits.
+    # whole package's actions rendered with `?` locations. Add the package files:
+    # a package skill that grows parts (skills/daily_briefing/) registers from
+    # the parts, not only from __init__.py.
     return (
         glob.glob(os.path.join(root, "skills", "*.py"))
-        + glob.glob(os.path.join(root, "skills", "*", "__init__.py"))
+        + glob.glob(os.path.join(root, "skills", "*", "*.py"))
         + glob.glob(os.path.join(root, "core", "*.py"))
     )
 
@@ -259,7 +261,7 @@ def collect_rows(root=ROOT, tracked=None):
     for p in [mono_path] + keep(
             glob.glob(os.path.join(root, "core", "*.py"))
             + glob.glob(os.path.join(root, "skills", "*.py"))
-            + glob.glob(os.path.join(root, "skills", "*", "__init__.py"))):
+            + glob.glob(os.path.join(root, "skills", "*", "*.py"))):
         base = _rel(p, root)
         for ln, line in enumerate(read(p).splitlines(), 1):
             dm = re.match(r'\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', line)

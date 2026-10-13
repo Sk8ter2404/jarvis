@@ -1,4 +1,4 @@
-"""Logic tests for skills/daily_recap.py.
+"""Logic tests for skills/daily_briefing/recap.py.
 
 Covers the pure formatting helpers (app-name normaliser, number word, duration
 formatter, title-caser), the session-log miner's regex extraction, the
@@ -23,7 +23,7 @@ import unittest
 from collections import Counter
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_briefing_part
 
 
 def _empty_report(**over):
@@ -38,7 +38,7 @@ def _empty_report(**over):
 
 class DailyRecapTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("daily_recap")
+        self.mod, self.actions = load_briefing_part("recap")
 
     # ── _normalize_app_name (pure) ───────────────────────────────────────
     def test_normalize_app_name(self):
@@ -208,7 +208,7 @@ class DailyRecapTests(unittest.TestCase):
 
     # ── daily_recap action ───────────────────────────────────────────────
     def test_action_returns_and_enqueues(self):
-        mod, actions = load_skill_isolated("daily_recap")
+        mod, actions = load_briefing_part("recap")
         with mock.patch.object(mod, "_build_recap", return_value="[intent:briefing] Sir, today..."), \
              mock.patch.object(mod, "_enqueue_speech") as enq, \
              mock.patch.object(mod, "_show_card_safe"), \
@@ -218,7 +218,7 @@ class DailyRecapTests(unittest.TestCase):
         enq.assert_called_once()
 
     def test_action_handles_exception(self):
-        mod, actions = load_skill_isolated("daily_recap")
+        mod, actions = load_briefing_part("recap")
         with mock.patch.object(mod, "_build_recap", side_effect=RuntimeError("boom")):
             out = actions["daily_recap"]("")
         self.assertIn("failed", out.lower())
@@ -226,7 +226,7 @@ class DailyRecapTests(unittest.TestCase):
 
 class EnqueueSpeechTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     def test_enqueue_routes_through_bobert_announcer(self):
         bc = mock.MagicMock()
@@ -296,7 +296,7 @@ class EnqueueSpeechTests(unittest.TestCase):
 
 class ConfigAndStateTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     def test_read_config_from_bobert(self):
         bc = mock.MagicMock()
@@ -343,7 +343,7 @@ class ConfigAndStateTests(unittest.TestCase):
 
 class TodaysReadersTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     def test_todays_log_paths_globs_sorted(self):
         with mock.patch.object(self.mod.glob, "glob",
@@ -388,7 +388,7 @@ class ScanSessionLogsDeepTests(unittest.TestCase):
     branches of the miner that the headline test doesn't reach."""
 
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     def test_launch_app_open_url_and_dwell_and_failed_print(self):
         log = (
@@ -421,7 +421,7 @@ class ScanSessionLogsDeepTests(unittest.TestCase):
 
 class SupplementEdgeTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     def test_supplement_noop_when_no_events(self):
         rpt = _empty_report()
@@ -455,7 +455,7 @@ class RecapCountsEachActionOnceTests(unittest.TestCase):
         {"action": "see_screen", "arg": ""}]
 
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     def _scanned_report(self):
         with mock.patch.object(self.mod, "_todays_log_paths", return_value=["s.log"]), \
@@ -502,7 +502,7 @@ class RecapCountsEachActionOnceTests(unittest.TestCase):
 
 class BambuCrossSkillTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     def test_bambu_now_uses_lock_when_present(self):
         fake = mock.MagicMock()
@@ -559,7 +559,7 @@ class BuildRecapBranchTests(unittest.TestCase):
             return self.mod._build_recap()
 
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     def test_music_generic_count_when_no_dominant_title(self):
         # 4 plays spread over 4 distinct titles → no title >= max(2,2)=2, so the
@@ -652,7 +652,7 @@ class BuildRecapBranchTests(unittest.TestCase):
 
 class CardAndFireTests(unittest.TestCase):
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     def test_show_card_safe_calls_hud(self):
         hud = mock.MagicMock()
@@ -691,7 +691,7 @@ class CardAndFireTests(unittest.TestCase):
 
 class RegisterTests(unittest.TestCase):
     def test_register_disabled_skips_scheduler(self):
-        mod, _ = load_skill_isolated("daily_recap", register=False)
+        mod, _ = load_briefing_part("recap", register=False)
         actions = {}
         import threading as _thr
         with mock.patch.object(mod, "_read_config",
@@ -702,7 +702,7 @@ class RegisterTests(unittest.TestCase):
         start.assert_not_called()
 
     def test_register_enabled_starts_scheduler(self):
-        mod, _ = load_skill_isolated("daily_recap", register=False)
+        mod, _ = load_briefing_part("recap", register=False)
         actions = {}
         import threading as _thr
         started = {"v": False}
@@ -721,7 +721,7 @@ class SchedulerLoopTests(unittest.TestCase):
     the daemon ever blocking. INITIAL_DELAY sleep is call #1."""
 
     def setUp(self):
-        self.mod, _ = load_skill_isolated("daily_recap")
+        self.mod, _ = load_briefing_part("recap")
 
     @staticmethod
     def _sleep_breaking_at(calls, n):
