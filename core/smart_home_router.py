@@ -40,6 +40,8 @@ rather than raising.
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import datetime
 import importlib
 import json
@@ -120,7 +122,9 @@ _state: dict[str, Any] = {
     "loaded_at":    0.0,         # monotonic time
     "modules":      {},          # skill_name → imported module
     "missing_logged": set(),     # brands we already TODO'd this session
-    "alexapy_login": None,       # restored alexapy login (lazy)
+    "alexapy_login": None,       # restored alexapy login (lazy) or "_failed"
+    "alexapy_login_loop": None,  # the router loop that login lives on
+    "alexapy_failed_sig": None,  # sign-in file signature when "_failed" was set
 }
 
 
@@ -136,7 +140,10 @@ def _load_catalog_raw() -> dict | None:
 
 
 def _ensure_catalog(force: bool = False) -> dict | None:
-    """Return the in-memory catalog, reloading from disk if stale."""
+    """Return the in-memory catalog, reloading from disk if stale. Stale =
+    older than _CATALOG_TTL_SECS, so a discovery run that rewrites the catalog
+    on disk is picked up within seconds with no JARVIS restart (checked
+    2026-10-13)."""
     with _state_lock:
         cat = _state["catalog"]
         age = time.monotonic() - _state["loaded_at"]
@@ -659,29 +666,203 @@ def _action_to_kwargs(action: dict) -> dict[str, Any]:
 
 
 # ── Alexa fallback ──────────────────────────────────────────────────
-def _alexa_login() -> Any:
-    """Lazy-restore the alexapy login from the cached cookie. Cached for
-    the lifetime of the process; if the cookie is bad we don't keep
-    re-trying it on every command."""
-    with _state_lock:
-        cached = _state.get("alexapy_login")
-        if cached is not None:
-            return cached if cached != "_failed" else None
+# The alexapy / aiohttp session is bound to the event loop that CREATED it
+# (Python 3.14), so the router owns ONE long-lived loop on a daemon thread:
+# the login is built on it and every Alexa command runs on it, so the same
+# session is reused across commands (no per-command sign-in round trip, and no
+# cross-loop breakage). Coroutines are submitted with
+# run_coroutine_threadsafe and a bounded wait, so a stalled Amazon endpoint can
+# never wedge the voice dispatch thread.
+_loop_lock = threading.Lock()
+_loop_box: dict[str, Any] = {"loop": None, "thread": None}
+_login_build_lock = threading.Lock()
+_ALEXA_BUILD_TIMEOUT_S = 20.0
+_ALEXA_CALL_TIMEOUT_S = 8.0
+_REAUTH_CMD = "python -m skills.smart_home_discover reauth"
+_NOT_SIGNED_IN = ("not signed in to Alexa - run `" + _REAUTH_CMD + "` "
+                  "to sign in again")
+
+
+def _router_loop() -> asyncio.AbstractEventLoop:
+    """The router's long-lived event loop (created lazily; recreated if its
+    thread ever died)."""
+    with _loop_lock:
+        loop, th = _loop_box["loop"], _loop_box["thread"]
+        if loop is not None and th is not None and th.is_alive() \
+                and not loop.is_closed():
+            return loop
+        loop = asyncio.new_event_loop()
+        started = threading.Event()
+
+        def _runner() -> None:
+            asyncio.set_event_loop(loop)
+            loop.call_soon(started.set)
+            try:
+                loop.run_forever()
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        th = threading.Thread(target=_runner, name="sh-router-loop",
+                              daemon=True)
+        th.start()
+        started.wait(5.0)
+        _loop_box["loop"], _loop_box["thread"] = loop, th
+        return loop
+
+
+def _router_run(coro: Any, timeout: float) -> Any:
+    """Run `coro` on the router loop and wait at most `timeout` seconds.
+    Raises TimeoutError (the coroutine is cancelled) or the coroutine's own
+    exception."""
+    fut = asyncio.run_coroutine_threadsafe(coro, _router_loop())
+    try:
+        return fut.result(timeout)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
+        raise TimeoutError(f"alexa call timed out after {timeout:.0f}s")
+
+
+def _signin_sig() -> tuple:
+    """(mtime_ns, size) of each saved sign-in file. A NEW sign-in (the owner
+    re-ran reauth) changes it, which clears the "_failed" sentinel."""
+    sig: list = []
     try:
         from skills import smart_home_discover as _sh  # type: ignore
-    except Exception as e:
-        print(f"  [sh-router] alexa fallback unavailable: {e}")
-        with _state_lock:
-            _state["alexapy_login"] = "_failed"
-        return None
+        paths = [_sh._oauth_path(), getattr(_sh, "_COOKIE_PICKLE_PATH", "")]
+    except Exception:
+        paths = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+            sig.append((st.st_mtime_ns, st.st_size))
+        except (OSError, TypeError, ValueError):
+            sig.append(None)
+    return tuple(sig)
+
+
+async def _build_login_async() -> Any:
+    """Sign in on the router loop: saved OAuth first, legacy cookie second,
+    None when neither works."""
+    from skills import smart_home_discover as _sh  # type: ignore
+    for name in ("_oauth_login_async", "_cookie_login_async"):
+        fn = getattr(_sh, name, None)
+        if fn is None:
+            continue
+        try:
+            login = await fn()
+        except Exception as e:
+            print(f"  [sh-router] alexa {name.strip('_')} failed: {e}")
+            login = None
+        if login is not None:
+            return login
+    return None
+
+
+def _close_login_quietly(login: Any) -> None:
+    """Release a dropped login's connector on its own loop. Never raises."""
     try:
-        login = _sh._restore_login_from_cookie()
-    except Exception as e:
-        print(f"  [sh-router] alexa fallback login failed: {e}")
-        login = None
+        if login is None or isinstance(login, str):
+            return
+        from skills import smart_home_discover as _sh  # type: ignore
+        closer = getattr(_sh, "_close_login", None)
+        if closer is None:
+            return
+        _router_run(closer(login), 5.0)
+    except Exception:
+        pass
+
+
+def _drop_login(login: Any = None, *, failed: bool = False) -> None:
+    """Forget the cached login (only if it is still `login`, when given), and
+    optionally park the "_failed" sentinel stamped with the current sign-in
+    file signature."""
     with _state_lock:
-        _state["alexapy_login"] = login if login is not None else "_failed"
-    return login
+        cur = _state.get("alexapy_login")
+        if login is not None and cur is not login:
+            return
+        _state["alexapy_login"] = "_failed" if failed else None
+        _state["alexapy_login_loop"] = None
+        _state["alexapy_failed_sig"] = _signin_sig() if failed else None
+    _close_login_quietly(cur)
+
+
+def _alexa_login() -> Any:
+    """The Alexa login, built on the router loop: OAuth sign-in first, legacy
+    cookie second, None when neither works. Cached for the process so the same
+    session is reused across commands. A failure parks a "_failed" sentinel
+    (so a bad sign-in isn't retried on every command) that a NEW sign-in file
+    clears without restarting JARVIS."""
+    with _state_lock:
+        cached = _state.get("alexapy_login")
+        if cached == "_failed":
+            sig = _state.get("alexapy_failed_sig")
+            if sig is None or sig == _signin_sig():
+                return None
+            _state["alexapy_login"] = cached = None     # fresh sign-in file
+            _state["alexapy_failed_sig"] = None
+        if cached is not None:
+            lp = _state.get("alexapy_login_loop")
+            with _loop_lock:
+                cur_loop = _loop_box["loop"]
+            if lp is None or lp is cur_loop:
+                return cached
+            _state["alexapy_login"] = None              # built on a dead loop
+    with _login_build_lock:
+        with _state_lock:                               # a racer may have won
+            cached = _state.get("alexapy_login")
+            if cached not in (None, "_failed"):
+                return cached
+        try:
+            from skills import smart_home_discover as _sh
+            del _sh
+        except Exception as e:
+            print(f"  [sh-router] alexa fallback unavailable: {e}")
+            _drop_login(failed=True)
+            return None
+        try:
+            login = _router_run(_build_login_async(), _ALEXA_BUILD_TIMEOUT_S)
+        except Exception as e:
+            print(f"  [sh-router] alexa fallback login failed: {e}")
+            login = None
+        if login is None:
+            _drop_login(failed=True)
+            return None
+        with _state_lock:
+            _state["alexapy_login"] = login
+            _state["alexapy_login_loop"] = _loop_box["loop"]
+            _state["alexapy_failed_sig"] = None
+        return login
+
+
+_AUTH_WORDS = ("401", "403", "unauthor", "forbidden", "expired", "not logged",
+               "login", "csrf", "session", "token", "auth")
+
+
+def _looks_like_auth_failure(login: Any, resp: Any = None,
+                             exc: BaseException | None = None) -> bool:
+    """True when a failed Alexa call looks like a dead / expired session (so
+    one fresh sign-in + retry is worth it), as opposed to Amazon refusing the
+    command itself. alexapy returns None / non-JSON on a rejected session."""
+    try:
+        if exc is not None:
+            return any(w in f"{type(exc).__name__} {exc}".lower()
+                       for w in _AUTH_WORDS)
+        status = getattr(login, "status", None)
+        if isinstance(status, dict) and status.get("login_successful") is False:
+            return True
+        if not isinstance(resp, dict):
+            return True
+        errors = resp.get("errors") or []
+        if errors:
+            e = errors[0] if isinstance(errors[0], dict) else {"code": errors[0]}
+            text = f"{e.get('code', '')} {e.get('message', '')}".lower()
+            return any(w in text for w in _AUTH_WORDS)
+    except Exception:
+        pass
+    return False
 
 
 def _phoenix_failure(resp: Any) -> str | None:
@@ -711,7 +892,8 @@ def _phoenix_failure(resp: Any) -> str | None:
 
 def _alexa_set_state(device: dict, kwargs: dict) -> dict:
     """Last-resort: drive the device through Alexa's smart-home graph using
-    the cached cookie. Power on/off and brightness go through
+    the saved Alexa sign-in (OAuth first, legacy cookie second; see
+    _alexa_login). Power on/off and brightness go through
     AlexaAPI.set_light_state — the static control call alexapy 1.29.22 really
     has (A50, 2026-10-02: the old set_appliance_state exists in no installed
     alexapy, so this whole path was dead). A scene entity gets the same turnOn.
@@ -723,7 +905,7 @@ def _alexa_set_state(device: dict, kwargs: dict) -> dict:
         return {"error": "no alexa entity id on device"}
     login = _alexa_login()
     if login is None:
-        return {"error": "alexa fallback unavailable (no cookie / alexapy)"}
+        return {"error": "alexa fallback unavailable (" + _NOT_SIGNED_IN + ")"}
     try:
         import alexapy  # type: ignore
     except Exception as e:
@@ -741,40 +923,50 @@ def _alexa_set_state(device: dict, kwargs: dict) -> dict:
     if target is None and "brightness" in kwargs:
         target = "ON"
 
-    # alexapy is async; reuse the discover skill's runner so we don't
-    # repeat the event-loop dance here.
-    try:
-        from skills.smart_home_discover import _run_async as _run  # type: ignore
-    except Exception:
-        return {"error": "asyncio runner unavailable"}
-
     # "Set to 50%" is spoken on success, so a level must really be sent.
     brightness = kwargs.get("brightness") if target == "ON" else None
 
-    async def _go() -> dict:
+    async def _go(lg: Any) -> dict:
         try:
             setter = getattr(AlexaAPI, "set_light_state", None)
             if target and callable(setter):
                 resp = await setter(
-                    login, entity_id, power_on=(target == "ON"),
+                    lg, entity_id, power_on=(target == "ON"),
                     brightness=None if brightness is None else int(brightness))
                 why = _phoenix_failure(resp)
                 if why:
-                    return {"error": why}
+                    return {"error": why,
+                            "_auth": _looks_like_auth_failure(lg, resp)}
                 out = {"ok": True, "path": "alexa", "set": target}
                 if brightness is not None:
                     out["brightness"] = int(brightness)
                 return out
             return {"error": "no compatible alexapy call available"}
         except Exception as e:
-            return {"error": f"alexa call failed: {e}"}
+            return {"error": f"alexa call failed: {e}",
+                    "_auth": _looks_like_auth_failure(lg, exc=e)}
 
-    try:
-        # Bounded so a stalled Amazon endpoint can't wedge the voice dispatch
-        # thread (2026-07-14 bug-hunt #12).
-        return _run(_go(), timeout=8.0)
-    except Exception as e:
-        return {"error": f"alexa fallback runner failed: {e}"}
+    # Runs on the router's own long-lived loop - the one the login's aiohttp
+    # session was created on - bounded so a stalled Amazon endpoint can't
+    # wedge the voice dispatch thread (2026-07-14 bug-hunt #12). A dead /
+    # expired session (401-ish) drops the cached login ONCE and retries on a
+    # fresh sign-in; a second failure is reported, never retried again.
+    for attempt in (0, 1):
+        try:
+            result = _router_run(_go(login), _ALEXA_CALL_TIMEOUT_S)
+        except Exception as e:
+            return {"error": f"alexa fallback runner failed: {e}"}
+        if "error" not in result or not result.pop("_auth", False):
+            result.pop("_auth", None)
+            return result
+        _drop_login(login, failed=(attempt == 1))
+        if attempt == 1:
+            break
+        login = _alexa_login()
+        if login is None:
+            return {"error": "alexa fallback unavailable (" + _NOT_SIGNED_IN
+                             + "); " + result["error"]}
+    return {"error": result["error"] + " (after one fresh sign-in)"}
 
 
 # ── one-device dispatch ─────────────────────────────────────────────
@@ -1251,7 +1443,11 @@ def refresh_smart_home_router(_: str = "") -> str:
         _state["catalog"]      = None
         _state["loaded_at"]    = 0.0
         _state["modules"]      = {}
+        old_login = _state.get("alexapy_login")
         _state["alexapy_login"] = None
+        _state["alexapy_login_loop"] = None
+        _state["alexapy_failed_sig"] = None
+    _close_login_quietly(old_login)
     cat = _ensure_catalog(force=True)
     if cat is None:
         return "No catalog on disk yet, sir."
