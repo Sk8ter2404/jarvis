@@ -20,7 +20,6 @@ import json
 import os
 import sys
 import time
-import types
 import unittest
 from unittest import mock
 

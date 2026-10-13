@@ -33,7 +33,7 @@ import unittest
 from unittest import mock
 
 from tests.skills.test_amazon_order_tracker import (
-    AmazonTestBase, _FakeGmailService, _fake_email_triage, inject_modules)
+    AmazonTestBase, _FakeGmailService, _fake_email_triage)
 from tests._skill_harness import load_skill_isolated
 
 READONLY = "https://www.googleapis.com/auth/gmail.readonly"

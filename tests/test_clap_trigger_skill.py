@@ -984,7 +984,7 @@ class TvAndMusicTests(_Base):
     def test_a_real_double_clap_in_a_quiet_room_still_fires(self):
         # The same pipeline, same settings: the veto layers do not eat the
         # feature.
-        bc = self._run_through_the_tap(_scene([1.5, 1.8]))
+        self._run_through_the_tap(_scene([1.5, 1.8]))
         self.assertEqual(len(self.setup_calls), 1)
         self.assertEqual(self.mod.status_snapshot()["fired"], 1)
 

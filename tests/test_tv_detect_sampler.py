@@ -19,12 +19,9 @@ import contextlib
 import io
 import os
 import sys
-import threading
 import types
 import unittest
 from unittest import mock
-
-import numpy as np
 
 from audio import tv_detect as td
 from tests._skill_harness import load_skill_isolated

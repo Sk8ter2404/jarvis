@@ -8,7 +8,6 @@ reads the owner's screen, calls a model, speaks, or writes his settings.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import tempfile
 import time
