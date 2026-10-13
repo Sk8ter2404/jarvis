@@ -479,9 +479,13 @@ AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC = 0.15  # ARMED: short engage hold (relaxed ga
 # ONE number here not read directly off the recorded telemetry (the log line
 # records absolute reach only, never the scale), so it is deliberately set at the
 # permissive end — nudge it up if a resting posture still takes the cursor.
-AIR_MOUSE_ENGAGE_REACH_RATIO = 0.50  # PASSIVE: forward reach ÷ body scale
-AIR_MOUSE_ENGAGE_REACH_M = 0.20      # PASSIVE: …absolute fallback (no body scale)
-AIR_MOUSE_ENGAGE_STRAIGHT = 0.85     # PASSIVE: …with the elbow this extended
+# 2026-10-12: ALL THREE bars below default to 0.0 = OFF. The owner no longer wants
+# to push an arm OUT to take the cursor; the passive gate is now just: hand raised
+# above the shoulder + an OPEN palm + a brief hold (+ facing + still). The
+# _reach_ok machinery stays so a bar > 0 (core.config / user settings) restores it.
+AIR_MOUSE_ENGAGE_REACH_RATIO = 0.0   # PASSIVE: forward reach ÷ body scale (0 = OFF, 2026-10-12)
+AIR_MOUSE_ENGAGE_REACH_M = 0.0       # PASSIVE: …absolute fallback (0 = OFF)
+AIR_MOUSE_ENGAGE_STRAIGHT = 0.0      # PASSIVE: …elbow-extension bar (0 = OFF)
 
 # ARMED auto-expiry. air_mouse_arm() used to latch the relaxed (height-only,
 # 0.15 s) gate ON for the REST OF THE SESSION — nothing ever cleared it but an

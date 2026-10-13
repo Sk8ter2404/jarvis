@@ -4234,11 +4234,18 @@ class SeatedFalseEngageRegressionTests(_Base):
         j = _relaxed_arm_joints(side)
         return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
 
-    def _ctrl(self, mod, clk):
+    # 2026-10-12: the reach conjunct is OFF by default (all three bars 0) - the
+    # owner no longer has to push an arm out. The conjunct is still there behind
+    # these legacy bars, and the tests below pin that it still works when asked.
+    LEGACY_REACH_BARS = dict(engage_reach_ratio=0.50, engage_reach_m=0.20,
+                             engage_straight=0.85)
+
+    def _ctrl(self, mod, clk, bars=None):
         """A LIVE-policy controller: engage_debounce_frames and the grip close bar
-        are left UNPINNED, so this exercises exactly what the poller builds."""
+        are left UNPINNED, so this exercises exactly what the poller builds. `bars`
+        optionally switches the (default-off) reach conjunct back on."""
         return mod.AirMouseController(mod.ReachBox(2560, 1440), grace_sec=0.0,
-                                      clock=clk)
+                                      clock=clk, **(bars or {}))
 
     def _sit_still(self, mod, c, clk, posture, seconds=6.0, grip="open"):
         """Hold one posture perfectly still, facing the sensor, for `seconds` of
@@ -4259,7 +4266,7 @@ class SeatedFalseEngageRegressionTests(_Base):
         engaged on exactly this and the log recorded engaged=True 34 times."""
         mod = self._load()
         clk = _FakeClock(100.0)
-        c = self._ctrl(mod, clk)
+        c = self._ctrl(mod, clk, self.LEGACY_REACH_BARS)
         d = self._sit_still(mod, c, clk, self.COUCH_BENT)
         self.assertFalse(c.engaged, "a relaxed seated posture took the cursor")
         self.assertIsNone(d.cursor, "SetCursorPos would have been called")
@@ -4272,7 +4279,7 @@ class SeatedFalseEngageRegressionTests(_Base):
         the live engine never had it. The forward half of the conjunct covers it."""
         mod = self._load()
         clk = _FakeClock(100.0)
-        c = self._ctrl(mod, clk)
+        c = self._ctrl(mod, clk, self.LEGACY_REACH_BARS)
         self._sit_still(mod, c, clk, self.STRETCH)
         self.assertFalse(c.engaged, "an overhead stretch took the cursor")
 
@@ -4282,7 +4289,7 @@ class SeatedFalseEngageRegressionTests(_Base):
         in; the forward half is what rejects it."""
         mod = self._load()
         clk = _FakeClock(100.0)
-        c = self._ctrl(mod, clk)
+        c = self._ctrl(mod, clk, self.LEGACY_REACH_BARS)
         self._sit_still(mod, c, clk, self.ARM_BEHIND)
         self.assertFalse(c.engaged, "an arm resting behind the body took the cursor")
 
@@ -4293,11 +4300,55 @@ class SeatedFalseEngageRegressionTests(_Base):
         could be satisfied by simply breaking the feature."""
         mod = self._load()
         clk = _FakeClock(100.0)
-        c = self._ctrl(mod, clk)
+        c = self._ctrl(mod, clk, self.LEGACY_REACH_BARS)
         d = self._sit_still(mod, c, clk, self.REAL_REACH, seconds=1.0)
         self.assertTrue(c.engaged, "a deliberate reach no longer takes the cursor")
         self.assertIsNotNone(d.cursor)
         self.assertEqual(d.overlay, "track")
+
+    # ── 2026-10-12: NO arm-out requirement by default ────────────────────────
+    def test_default_reach_bars_are_off(self):
+        """The shipped defaults (module constants AND core.config) are 0 = off."""
+        mod = self._load()
+        self.assertEqual(mod.AIR_MOUSE_ENGAGE_REACH_RATIO, 0.0)
+        self.assertEqual(mod.AIR_MOUSE_ENGAGE_REACH_M, 0.0)
+        self.assertEqual(mod.AIR_MOUSE_ENGAGE_STRAIGHT, 0.0)
+        from core import config as cfg
+        self.assertEqual(cfg.AIR_MOUSE_ENGAGE_REACH_RATIO, 0.0)
+        self.assertEqual(cfg.AIR_MOUSE_ENGAGE_REACH_M, 0.0)
+        self.assertEqual(cfg.AIR_MOUSE_ENGAGE_STRAIGHT, 0.0)
+
+    def test_raised_open_palm_with_folded_arm_engages_after_the_hold(self):
+        """Hand above the shoulder + open palm + a brief hold takes the cursor even
+        with the elbow folded and the hand NOT out in front (no reach needed)."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        self._sit_still(mod, c, clk, self.COUCH_BENT, seconds=1.0)
+        self.assertTrue(c.engaged, "a raised open palm no longer takes the cursor")
+
+    def test_no_reach_still_needs_the_hold(self):
+        """A fraction of a second of the pose is not enough: the brief hold stays."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        self._sit_still(mod, c, clk, self.COUCH_BENT, seconds=0.1)
+        self.assertFalse(c.engaged, "engaged before the hold elapsed")
+
+    def test_no_reach_still_needs_an_open_palm(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        self._sit_still(mod, c, clk, self.COUCH_BENT, seconds=3.0, grip="closed")
+        self.assertFalse(c.engaged, "a closed hand took the cursor")
+
+    def test_no_reach_still_needs_the_hand_above_the_shoulder(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        low = dict(lift=-0.30, forward=0.40, straight=0.95)   # reaching, but low
+        self._sit_still(mod, c, clk, low, seconds=3.0)
+        self.assertFalse(c.engaged, "a hand below the shoulder took the cursor")
 
     def test_NEGATIVE_CONTROL_reach_engages_within_a_second(self):
         """Responsiveness guard: the deliberate reach must be taken shortly after

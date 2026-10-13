@@ -40,6 +40,7 @@ A joint's tracking_state is 0 not-tracked, 1 inferred, 2 tracked.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Callable, Optional
 
@@ -49,8 +50,10 @@ WAVE = "wave"
 RAISE_HAND = "raise_hand"
 SWIPE_LEFT = "swipe_left"
 SWIPE_RIGHT = "swipe_right"
+TWO_HAND_X = "two_hand_x"      # both wrists crossed in front of the chest (held)
+POINT = "point"                # one arm held out, two-finger point, aimed steady
 
-ALL_GESTURES = (WAVE, RAISE_HAND, SWIPE_LEFT, SWIPE_RIGHT)
+ALL_GESTURES = (WAVE, RAISE_HAND, SWIPE_LEFT, SWIPE_RIGHT, TWO_HAND_X, POINT)
 
 
 # ─── tunable thresholds (named so they're adjustable + test-visible) ───────
@@ -83,6 +86,43 @@ SWIPE_ABOVE_WAIST_M = 0.0          # hand.y above spine_base.y by ≥ this (m)
 # gesture) for this long, so one physical wave can't machine-gun the action.
 COOLDOWN_SECONDS = 2.0
 
+# TWO_HAND_X (2026-10-12) - both wrists CROSSED in front of the upper chest and
+# held: the "stop / close this" sign. Chosen because it is the one two-hand pose
+# that clears every other Kinect mode: it sits BELOW the air-mouse's raise line
+# (a hand above the shoulder + open palm takes the cursor in 0.3 s, which would
+# pre-empt any overhead two-hand sign), it is not a pinch-to-resize grab (both
+# hands up, fists), and a relaxed pose never makes it. The one that LOOKS like it
+# is FOLDED ARMS (a TV-watching rest), so the pose also demands the hands be at
+# the upper chest (not at the biceps) AND pushed forward of the torso - folded
+# arms hug the body. Fires ONCE per pose: the arms must come apart before it can
+# fire again, so holding the sign can never close a second window.
+X_HOLD_SECONDS = 0.8               # unbroken hold before it fires
+X_GAP_TOLERANCE_SECONDS = 0.2      # a tracking blip this short does not restart the hold
+X_REARM_ABSENT_SECONDS = 0.5       # pose must be gone this long before it can fire again
+X_MIN_CROSS_M = 0.06               # each wrist this far past the other (x), at least
+X_MAX_HAND_GAP_M = 0.45            # |x| gap between the hands: they are together
+X_MAX_HAND_DY_M = 0.25             # hands at about the same height
+X_MIN_FORWARD_M = 0.18             # each hand this far in FRONT of the shoulder line (z)
+X_MAX_BELOW_SHOULDER_M = 0.20      # hands no lower than this under the shoulder line
+X_MAX_ABOVE_SHOULDER_M = 0.05      # ...and not above it (that is the air-mouse's raise)
+X_MIN_SHOULDER_SPAN_M = 0.15       # shoulders must be measurable to know "crossed"
+
+# POINT (2026-10-12) - one arm held out toward the screens with the Kinect's
+# two-finger "Lasso" hand state, aimed steady. The recognizer only reports the AIM
+# (azimuth / elevation); mapping that to a monitor is monitor_for_aim() below.
+POINT_DWELL_SECONDS = 0.8          # aim must stay put this long
+POINT_GAP_TOLERANCE_SECONDS = 0.3  # Lasso flickers; a blip this short keeps the hold
+POINT_STEADY_AZIMUTH_DEG = 8.0     # max azimuth spread across the dwell
+POINT_STEADY_ELEVATION_DEG = 10.0  # max elevation spread across the dwell
+POINT_MIN_FORWARD_M = 0.25         # hand this far in front of the shoulder (z)
+POINT_MIN_EXTENSION_M = 0.45       # shoulder->hand distance (arm is out, not folded)
+POINT_MIN_ELEVATION_DEG = -25.0    # aim no lower than this (a desk reach is lower)
+POINT_MAX_ELEVATION_DEG = 70.0
+POINT_REARM_ABSENT_SECONDS = 0.6   # arm down this long -> a new point can fire
+POINT_REAIM_DEG = 12.0             # ...or swing the aim this far to pick another monitor
+POINT_MONITOR_BIN_DEG = 24.0       # azimuth width of one monitor in a row
+POINT_TOP_ELEVATION_DEG = 28.0     # aimed this high -> the monitor stacked ABOVE the row
+
 
 def _joint_ok(j: Optional[tuple]) -> bool:
     """True when a (x, y, z, state) joint tuple is present and tracked."""
@@ -92,6 +132,127 @@ def _joint_ok(j: Optional[tuple]) -> bool:
         return int(j[3]) >= MIN_TRACKING_STATE
     except Exception:
         return False
+
+
+def _xyz(j: Optional[tuple]) -> Optional[tuple]:
+    """(x, y, z) of a tracked, finite, non-zero-fill joint, else None."""
+    if not _joint_ok(j):
+        return None
+    try:
+        x, y, z = float(j[0]), float(j[1]), float(j[2])
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        return None
+    if x == 0.0 and y == 0.0 and z == 0.0:     # NotTracked zero-fill
+        return None
+    return (x, y, z)
+
+
+def two_hand_x_pose(body: Any) -> bool:
+    """True when this body holds the crossed-wrists sign THIS frame (see the
+    TWO_HAND_X notes). Orientation-agnostic: "crossed" is judged against the
+    shoulders' own left/right order, so it holds whichever way the stream is
+    mirrored. FAILS CLOSED on any missing joint. PURE; never raises."""
+    try:
+        joints = (body or {}).get("joints") or {}
+        hl = _xyz(joints.get("hand_left"))
+        hr = _xyz(joints.get("hand_right"))
+        sl = _xyz(joints.get("shoulder_left"))
+        sr = _xyz(joints.get("shoulder_right"))
+        if hl is None or hr is None or sl is None or sr is None:
+            return False
+        span = sr[0] - sl[0]
+        if abs(span) < X_MIN_SHOULDER_SPAN_M:
+            return False
+        sign = 1.0 if span > 0 else -1.0
+        # Wrists crossed: the right hand has moved past the left one.
+        if (hr[0] - hl[0]) * sign > -X_MIN_CROSS_M:
+            return False
+        if abs(hr[0] - hl[0]) > X_MAX_HAND_GAP_M:
+            return False
+        if abs(hr[1] - hl[1]) > X_MAX_HAND_DY_M:
+            return False
+        shoulder_y = (sl[1] + sr[1]) / 2.0
+        shoulder_z = (sl[2] + sr[2]) / 2.0
+        for h in (hl, hr):
+            dy = h[1] - shoulder_y
+            if dy < -X_MAX_BELOW_SHOULDER_M or dy > X_MAX_ABOVE_SHOULDER_M:
+                return False
+            if (shoulder_z - h[2]) < X_MIN_FORWARD_M:    # z grows away from the sensor
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def point_aim(body: Any, require_lasso: bool = True) -> Optional[dict]:
+    """The aim of a held-out, pointing arm on this body THIS frame, or None.
+
+    Returns {"side", "azimuth_deg", "elevation_deg", "extension_m"}. Azimuth is
+    the sideways angle of the shoulder->hand ray measured from straight at the
+    sensor (+ = the owner's right, the same +x the air-mouse maps to the larger
+    cursor x); elevation is the upward angle of that ray. With require_lasso the
+    hand must also read the Kinect's two-finger "lasso" state, which an air-mouse
+    open palm and a fist both are not - that is what keeps a reach for the
+    keyboard (or the air-mouse raise) from reading as a point. PURE; never raises."""
+    try:
+        if not isinstance(body, dict):
+            return None
+        joints = body.get("joints") or {}
+        best = None
+        for side in ("right", "left"):
+            if require_lasso and str(body.get(f"hand_{side}") or "").lower() != "lasso":
+                continue
+            sh = _xyz(joints.get(f"shoulder_{side}"))
+            hd = _xyz(joints.get(f"hand_{side}"))
+            if sh is None or hd is None:
+                continue
+            dx, dy = hd[0] - sh[0], hd[1] - sh[1]
+            fwd = sh[2] - hd[2]                       # z grows away from the sensor
+            ext = math.sqrt(dx * dx + dy * dy + fwd * fwd)
+            if fwd < POINT_MIN_FORWARD_M or ext < POINT_MIN_EXTENSION_M:
+                continue
+            elev = math.degrees(math.atan2(dy, math.hypot(dx, fwd)))
+            if not (POINT_MIN_ELEVATION_DEG <= elev <= POINT_MAX_ELEVATION_DEG):
+                continue
+            cand = {"side": side, "azimuth_deg": math.degrees(math.atan2(dx, fwd)),
+                    "elevation_deg": elev, "extension_m": ext}
+            if best is None or ext > best["extension_m"]:
+                best = cand
+        return best
+    except Exception:
+        return None
+
+
+def monitor_for_aim(azimuth_deg: float, elevation_deg: float, monitors: Any,
+                    bin_deg: float = POINT_MONITOR_BIN_DEG) -> Optional[str]:
+    """The monitor a pointing aim lands on, from the {name: (x, y, w, h)} layout
+    (core.config.MONITORS shape), or None when the layout is empty. Aimed high
+    (POINT_TOP_ELEVATION_DEG) picks the monitor stacked ABOVE the row if there is
+    one; otherwise the row (left to right by x) is split into `bin_deg`-wide
+    azimuth bins centred on straight ahead, the outer bins taking everything
+    beyond them. No per-desk calibration. PURE; never raises."""
+    try:
+        rects = []
+        for name, r in dict(monitors or {}).items():
+            x, y, w, h = (float(v) for v in tuple(r)[:4])
+            if w > 0 and h > 0:
+                rects.append((str(name), x + w / 2.0, y + h / 2.0, h))
+        if not rects:
+            return None
+        median_cy = sorted(r[2] for r in rects)[len(rects) // 2]
+        above = [r for r in rects if r[2] < median_cy - r[3] / 2.0]
+        row = [r for r in rects if r not in above] or rects
+        if above and elevation_deg >= POINT_TOP_ELEVATION_DEG:
+            return min(above, key=lambda r: r[2])[0]
+        row.sort(key=lambda r: r[1])
+        n = len(row)
+        width = float(bin_deg) if bin_deg and bin_deg > 0 else POINT_MONITOR_BIN_DEG
+        idx = int(math.floor(float(azimuth_deg) / width + n / 2.0))
+        return row[max(0, min(n - 1, idx))][0]
+    except Exception:
+        return None
 
 
 def _nearest_body(bodies: Any) -> Optional[dict]:
@@ -157,6 +318,25 @@ class GestureRecognizer:
         self._hist: list[dict] = []
         self._last_fire_at: float = 0.0
         self._last_gesture: Optional[str] = None
+        # Which gestures are live (None = all). The skill narrows this from its
+        # per-gesture settings each tick so a gesture that is switched off neither
+        # fires nor burns the shared cooldown.
+        self._enabled: Optional[frozenset] = None
+        # POINT needs the Kinect's two-finger Lasso state unless the owner turned
+        # that requirement off (the skill sets it from KINECT_POINT_REQUIRE_LASSO).
+        self._require_lasso: bool = True
+        # Extra facts about the gesture that last fired (POINT: azimuth /
+        # elevation). {} for gestures that carry none.
+        self.last_detail: dict = {}
+        # TWO_HAND_X hold state (see X_HOLD_SECONDS).
+        self._x_since: Optional[float] = None
+        self._x_last_pose: float = 0.0
+        self._x_absent_since: Optional[float] = None
+        self._x_armed: bool = False
+        # POINT hold state: [(t, azimuth, elevation, side)] of the unbroken aim.
+        self._point_hist: list[tuple] = []
+        self._point_absent_since: Optional[float] = None
+        self._point_fired_az: Optional[float] = None
 
     # ── public API ────────────────────────────────────────────────────────
     def update(self, bodies: Any) -> Optional[str]:
@@ -168,10 +348,30 @@ class GestureRecognizer:
             return None
 
     def reset(self) -> None:
-        """Drop all history + cooldown (used on disable / between tests)."""
+        """Drop all history + cooldown (used on disable / between tests). The
+        crossed-wrists and point detectors come back DISARMED: the pose must be
+        seen to lapse once before either can fire, so a sign that was already held
+        when the air-mouse / two-hand mode let go can never fire on release."""
         self._hist.clear()
         self._last_fire_at = 0.0
         self._last_gesture = None
+        self.last_detail = {}
+        self._x_since = None
+        self._x_absent_since = None
+        self._x_armed = False
+        self._point_hist.clear()
+        self._point_absent_since = None
+        self._point_fired_az = None
+
+    def set_enabled(self, gestures: Any) -> None:
+        """Restrict recognition to these gesture names (None = every gesture)."""
+        self._enabled = None if gestures is None else frozenset(gestures)
+
+    def set_require_lasso(self, on: bool) -> None:
+        self._require_lasso = bool(on)
+
+    def is_enabled(self, gesture: str) -> bool:
+        return self._enabled is None or gesture in self._enabled
 
     @property
     def last_gesture(self) -> Optional[str]:
@@ -234,8 +434,33 @@ class GestureRecognizer:
         cutoff = now - HISTORY_SECONDS
         self._hist = [s for s in self._hist if s["t"] >= cutoff]
 
+        self.last_detail = {}
         if body is None:
+            self._x_since = None
+            self._point_hist.clear()
             return None
+        # The two-handed / pointing poses are tracked on EVERY frame (their holds
+        # must see the pose lapse to re-arm), but only fire outside the cooldown.
+        x_pose = self._track_two_hand_x(body, now)
+        point_fire = self._track_point(body, now)
+        if x_pose:
+            # Hands together in front of the chest: no single-hand detector may
+            # read the arms' travel into the sign as a swipe / wave.
+            self._hist.clear()
+            if (self._x_armed and self._x_since is not None
+                    and now - self._x_since >= X_HOLD_SECONDS
+                    and not self.in_cooldown(now)):
+                self._x_armed = False
+                self._x_since = None
+                self._fire(TWO_HAND_X, now)
+                return TWO_HAND_X
+            return None
+        if point_fire is not None and not self.in_cooldown(now):
+            self._point_fired_az = point_fire["azimuth_deg"]
+            self._point_hist.clear()
+            self._fire(POINT, now)
+            self.last_detail = dict(point_fire)
+            return POINT
         sample = self._sample_hand(body)
         if sample is None:
             return None
@@ -262,10 +487,74 @@ class GestureRecognizer:
                          self._detect_wave,
                          self._detect_swipe):
             gesture = detector(now)
-            if gesture:
+            if gesture and self.is_enabled(gesture):
                 self._fire(gesture, now)
                 return gesture
         return None
+
+    def _track_two_hand_x(self, body: dict, now: float) -> bool:
+        """Advance the crossed-wrists hold state for this frame; True while the
+        sign is held (and the gesture is enabled). Re-arms once the pose has been
+        gone X_REARM_ABSENT_SECONDS."""
+        pose = self.is_enabled(TWO_HAND_X) and two_hand_x_pose(body)
+        if pose:
+            self._x_absent_since = None
+            self._x_last_pose = now
+            if self._x_since is None:
+                self._x_since = now
+            return True
+        if self._x_absent_since is None:
+            self._x_absent_since = now
+        if now - self._x_last_pose > X_GAP_TOLERANCE_SECONDS:
+            self._x_since = None
+        if now - self._x_absent_since >= X_REARM_ABSENT_SECONDS:
+            self._x_armed = True
+        return False
+
+    def _track_point(self, body: dict, now: float) -> Optional[dict]:
+        """Advance the point hold state; return the settled aim
+        ({side, azimuth_deg, elevation_deg, extension_m}) once the arm has been
+        held steady for POINT_DWELL_SECONDS, else None. One fire per point: the
+        arm must come down POINT_REARM_ABSENT_SECONDS, or swing POINT_REAIM_DEG to
+        another monitor, before it can fire again."""
+        aim = (point_aim(body, require_lasso=self._require_lasso)
+               if self.is_enabled(POINT) else None)
+        if aim is None:
+            if self._point_absent_since is None:
+                self._point_absent_since = now
+            if (self._point_hist
+                    and now - self._point_hist[-1][0] > POINT_GAP_TOLERANCE_SECONDS):
+                self._point_hist.clear()
+            if now - self._point_absent_since >= POINT_REARM_ABSENT_SECONDS:
+                self._point_fired_az = None
+            return None
+        self._point_absent_since = None
+        if self._point_hist and (
+                self._point_hist[-1][3] != aim["side"]
+                or now - self._point_hist[-1][0] > POINT_GAP_TOLERANCE_SECONDS):
+            self._point_hist.clear()
+        self._point_hist.append((now, aim["azimuth_deg"], aim["elevation_deg"],
+                                 aim["side"]))
+        if len(self._point_hist) < 3:
+            return None
+        if now - self._point_hist[0][0] < POINT_DWELL_SECONDS:
+            return None
+        azs = [h[1] for h in self._point_hist]
+        els = [h[2] for h in self._point_hist]
+        if (max(azs) - min(azs) > POINT_STEADY_AZIMUTH_DEG
+                or max(els) - min(els) > POINT_STEADY_ELEVATION_DEG):
+            # Not steady: keep only the newest dwell's worth so a settled aim can
+            # still complete after a swing.
+            lo = now - POINT_DWELL_SECONDS
+            self._point_hist = [h for h in self._point_hist if h[0] >= lo]
+            return None
+        mean_az = sum(azs) / len(azs)
+        if (self._point_fired_az is not None
+                and abs(mean_az - self._point_fired_az) < POINT_REAIM_DEG):
+            return None
+        return {"side": aim["side"], "azimuth_deg": mean_az,
+                "elevation_deg": sum(els) / len(els),
+                "extension_m": aim["extension_m"]}
 
     def _fire(self, gesture: str, now: float) -> None:
         self._last_fire_at = now
