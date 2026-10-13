@@ -4,9 +4,9 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.187
+- Version: v2.0.188
 - Live since: 2026-10-12
-- Latest change: v2.0.187 (10-12): two-way chat bot, shopping and reminders lists, optional screen comments, air-mouse and gesture fixes, batched learning, privacy guards, cleanup.
+- Latest change: v2.0.188 (10-12): test lint fix after v2.0.187 (two-way chat bot, shopping and reminders lists, optional screen comments, gesture fixes, batched learning, privacy guards, cleanup).
 
 ## In progress
 
@@ -72,6 +72,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.188 (2026-10-12): Test-only lint fix: clears the unused imports and one unused variable that made the GitHub CI lint step fail on v2.0.187. No change to the running code.
 - v2.0.187 (2026-10-12): Two-way chat bot for alerts and commands; a shopping list and a separate reminders list (reminders with no time never land in the developer queue); optional comments about what is on screen; easier air-mouse engage and useful Kinect gestures; batched background learning; game mode, TV and clap tweaks plus an order tracker; privacy guards on test data; repo cleanup (one daily briefing skill).
 - v2.0.186 (2026-10-12): Alexa sign-in rebuilt on the phone-app style OAuth device registration (sign in once, saved token, the real smart-home device list, no session secrets in logs); audio auto-switch waits while media plays; CLOUD_BOOST_UNTIL sends hard turns and screen reading to Claude until a date; PROMPT_SLIM_MODE keeps the cached brain prompt smaller.
 - v2.0.185 (2026-10-12): Public status docs on GitHub: docs/STATUS.md and docs/RELEASE_HISTORY.md, generated from the master sheet with all personal data stripped. No code change; the running JARVIS code is the same as v2.0.184.
@@ -81,6 +82,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.181 (2026-10-05): a named close closes that app (not "what I opened"), close-all keeps the running app and says when a title alone kept a window, "you forgot X" closes X, a misheard keep/close name gets "did you mean ...?", JARVIS never clicks or types on a sign-in page unless ...
 - v2.0.180 (2026-10-04): fixes the v2.0.179 native abort - the CUDA driver starts before ctranslate2 again, and every CTranslate2 CUDA build, decode and free runs on one never-exiting host thread (a short-lived self-check thread exiting with CTranslate2 CUDA state aborted the ...
 - v2.0.179 (2026-10-04): one voice per reply (the clone never switches mid-reply, a sentence prepared ahead waits until it is needed, a long first line is split at a clause, misses cool down instead of switching the clone off for the session), steady Kinect hand tracking (one shared ...
-- v2.0.178 (2026-10-03): the cloned JARVIS voice runs from its own GPU server with Kokoro covering any line it misses (off until switched on), and "close all windows except X" really closes the rest - never JARVIS's own HUD/Reticle or the Windows shell, asks first above five, never ...
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
