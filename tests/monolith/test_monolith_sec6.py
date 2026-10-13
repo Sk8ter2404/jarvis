@@ -2354,7 +2354,12 @@ class SpeakPendingTests(SectionSixBase):
                                    side_effect=RuntimeError("tts dead")):
                 # Must swallow the TTS failure and not propagate.
                 self.bc._speak_pending()
-            self.assertFalse(os.path.exists(path))
+            # The line was NOT delivered, so it stays owed (2026-10-13, item 37):
+            # back on the live queue with its attempt count, retried next pass.
+            with open(path, encoding="utf-8") as f:
+                kept = json.load(f)
+            self.assertEqual([e["message"] for e in kept], ["boom"])
+            self.assertEqual(kept[0]["_tries"], 1)
 
     # ── orphaned .consuming recovery (2026-07-21 audit: "queue files are
     #    never recovered") ────────────────────────────────────────────────────
