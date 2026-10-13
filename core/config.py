@@ -817,7 +817,7 @@ FOLLOWUP_WINDOW_S = 0.0
 
 # Owner speech vocabulary (core/stt_vocab.py). STT_HOTWORDS: comma-separated names
 # Whisper should expect (faster-whisper "hotwords"). STT_REPLACEMENTS: phrases Whisper
-# keeps mishearing -> what was said ({"a cello": "Accelo"}), whole words, every
+# keeps mishearing -> what was said ({"a cello": "Zorblat"}), whole words, every
 # transcript. SITE_SHORTCUTS: {"name": "https://..."} so "open <name>" (also on a
 # monitor) opens that page. All empty by default; set in user_settings.json.
 # STT_HOTWORDS also applies LIVE: an edit to user_settings.json after start reaches
@@ -1544,16 +1544,14 @@ MIC_SILENT_WARN_SECONDS = 30.0
 # unplugged). Omit "name" to keep the historical pure-index behaviour. Set it to
 # the owner's two webcams so a re-plug keeps tracking the right one.
 CAMERAS = [
-    # 2026-07-13: the LEFT webcam is now an eMeet C960 — the owner swapped out
-    # the Logi C270 (it had been dropping off the USB bus; the C960 replaced it
-    # while chasing camera flicker). Kinect sits under the centre monitor and is
-    # handled separately (KINECT_AS_CAMERA/presence; never grab index 1, that's
-    # the Kinect colour stream). VERIFIED live DirectShow order (pygrabber):
-    # 0=USB 2.0 Camera, 1=Kinect V2 Video Sensor, 2=HD Webcam eMeet C960. The
-    # "name" drives live resolution (USB replugs re-shuffle indices); these
-    # indices are only the fallback.
-    {"index": 2, "label": "Left webcam (left monitor)",          "name": "emeet c960",    "primary": True,  "look_x": 0.5,  "look_y": 0.5},
-    {"index": 0, "label": "Right webcam (top of right monitor)", "name": "usb 2.0 camera", "primary": False, "look_x": 0.85, "look_y": 0.5},
+    # Shipped default: one generic webcam at the first capture index. Set the
+    # real list in data/user_settings.json (CAMERAS) - give each entry a "name"
+    # (lower-case substring of its DirectShow name) so a USB re-plug that
+    # shuffles the indices still resolves to the right device; the "index" is
+    # only the fallback when the name does not resolve. Kinect is handled
+    # separately (KINECT_AS_CAMERA/presence) and is not listed here.
+    # `python bobert_companion.py --list-cameras` prints the names and indices.
+    {"index": 0, "label": "Webcam", "primary": True, "look_x": 0.5, "look_y": 0.5},
 ]
 
 # CAMERA_BACKEND — which OpenCV capture backend actually opens a camera:
@@ -1563,8 +1561,8 @@ CAMERAS = [
 #
 # DirectShow LEAKS. Measured on this rig 2026-09-05, 25 open/read/release
 # cycles per figure, each in a fresh process, 1280x720 requested:
-#     eMeet C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
-#     eMeet C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
+#     Example Webcam C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
+#     Example Webcam C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
 #     USB 2.0 Cam  CAP_DSHOW  +4.55 OS threads  +479 handles  per cycle
 #     USB 2.0 Cam  CAP_MSMF   -0.18 OS threads    +1.06       per cycle
 # The DirectShow threads are owned by mfksproxy.dll and are never reclaimed —
@@ -1573,8 +1571,8 @@ CAMERAS = [
 # and +0 under Media Foundation, so index sweeps pay it too.
 #
 # The indices below are still DIRECTSHOW indices: the two backends enumerate
-# DIFFERENT lists (DirectShow 0=USB 2.0 Camera 1=Kinect 2=eMeet 3=OBS Virtual
-# Camera; Media Foundation 0=Kinect 1=USB 2.0 Camera 2=eMeet, no OBS at all),
+# DIFFERENT lists (DirectShow 0=USB 2.0 Camera 1=Kinect 2=ExampleCam 3=OBS Virtual
+# Camera; Media Foundation 0=Kinect 1=USB 2.0 Camera 2=ExampleCam, no OBS at all),
 # so core/camera_backend.py TRANSLATES at open time — by device NAME where
 # CAMERAS supplies one. Do NOT hand a raw CAMERAS index to CAP_MSMF; on this
 # rig that repoints index 0 from the USB webcam to the Kinect.
@@ -2273,14 +2271,14 @@ BAMBU_CAMERA_AUTO_WHILE_PRINTING = False
 
 
 # ─── Auto-switch default audio on headset power (audio/audio_switch.py) ──
-# A USB-dongle wireless headset (e.g. a CORSAIR VOID ELITE) keeps its dongle
+# A USB-dongle wireless headset (e.g. a ExampleBrand ELITE) keeps its dongle
 # plugged in whether the headset is ON or off, so plug/unplug detection misses
 # the power state.
 #
 # CORRECTED 2026-09-05. The sentence that stood here until now said "Windows
 # flips the headset's audio ENDPOINT Active<->NotPresent instead; this watcher
 # polls that". That is FALSE and was never measured. Measured 2026-09-04 with
-# the CORSAIR VOID ELITE POWERED OFF, Windows reported BOTH of its endpoints
+# the ExampleBrand ELITE POWERED OFF, Windows reported BOTH of its endpoints
 # Status=OK / Active, because the endpoint belongs to the DONGLE. The watcher
 # reads the dongle's Corsair vendor HID report (audio/void_link.py) instead,
 # which is three-valued (on / off / genuinely unknown), and unknown HOLDS.
@@ -2294,7 +2292,7 @@ BAMBU_CAMERA_AUTO_WHILE_PRINTING = False
 # Opt-in. HEADSET/FALLBACK are case-insensitive substrings of the Windows
 # device friendly name (see `python -m audio.audio_switch --list`).
 AUDIO_AUTOSWITCH_ENABLED  = os.getenv("JARVIS_AUDIO_AUTOSWITCH", "").lower() in ("1", "true", "yes", "on")
-AUDIO_AUTOSWITCH_HEADSET  = os.getenv("JARVIS_AUDIO_HEADSET", "")    # e.g. "CORSAIR VOID ELITE"
+AUDIO_AUTOSWITCH_HEADSET  = os.getenv("JARVIS_AUDIO_HEADSET", "")    # e.g. "ExampleBrand ELITE"
 AUDIO_AUTOSWITCH_FALLBACK = os.getenv("JARVIS_AUDIO_FALLBACK", "")   # e.g. "Realtek USB2.0 Audio"
 
 
@@ -2341,7 +2339,7 @@ AUDIO_AUTOSWITCH_MIC = os.getenv("JARVIS_AUDIO_MIC_FOLLOW", "").lower() in ("1",
 # rewritten to eliminate. Blank = the input half has nothing to fall back to
 # and will say so loudly rather than move the microphone somewhere unverified.
 # Check a candidate with `python -m audio.audio_switch --list-mics`.
-AUDIO_AUTOSWITCH_MIC_FALLBACK = os.getenv("JARVIS_AUDIO_MIC_FALLBACK", "")  # e.g. "Blue Snowball"
+AUDIO_AUTOSWITCH_MIC_FALLBACK = os.getenv("JARVIS_AUDIO_MIC_FALLBACK", "")  # e.g. "Example Desk Mic"
 
 # How long the SELECTED headset microphone may produce literal digital silence,
 # while the capture loop is demonstrably running, before the watcher moves off

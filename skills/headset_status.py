@@ -16,7 +16,7 @@ to `audio_autoswitch_status`, whose answer is built on
     NotPresent/Unplugged).
 
 That sentence is FALSE for this headset and had never been checked. With the
-headset powered OFF, both CORSAIR VOID ELITE endpoints still report
+headset powered OFF, both ExampleBrand ELITE endpoints still report
 Status=OK / state Active, because what Windows enumerates is the DONGLE, and
 the dongle is plugged in either way. So "is my headset on" was answered by a
 detector that structurally cannot tell — the exact bug class this project keeps
@@ -34,8 +34,8 @@ WHAT I MEASURED MYSELF (2026-09-04, this agent, headset powered ON)
     is_headset_on() -> True, battery_percent() -> 88       0.005 s
 
     audio_switch.list_render(), same moment, headset ON:
-        Active | {0.0.0.0000 | Headset Earphone (CORSAIR VOID ELITE ...)
-        Active | {0.0.1.0000 | Headset Microphone (CORSAIR VOID ELITE ...)
+        Active | {0.0.0.0000 | Headset Earphone (ExampleBrand ELITE ...)
+        Active | {0.0.1.0000 | Headset Microphone (ExampleBrand ELITE ...)
         find_active('VOID ELITE') -> matched the earphone endpoint
 
   HONEST LIMIT ON THAT: the headset was ON for my whole session, so I measured

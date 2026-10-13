@@ -59,7 +59,7 @@ def _fp(devices=(("usb#vid_1&pid_1&mi_00", b"\x01" * 8),),
 # pygrabber): list position IS the cv2 CAP_DSHOW index.
 _RIG_NAMES = ["USB 2.0 Camera", "Kinect V2 Video Sensor",
               "HD Webcam eMeet C960", "OBS Virtual Camera"]
-# The same devices after a USB re-enumeration moved the eMeet to index 0.
+# The same devices after a USB re-enumeration moved the ExampleCam to index 0.
 _RIG_NAMES_SHUFFLED = ["HD Webcam eMeet C960", "USB 2.0 Camera",
                        "Kinect V2 Video Sensor", "OBS Virtual Camera"]
 

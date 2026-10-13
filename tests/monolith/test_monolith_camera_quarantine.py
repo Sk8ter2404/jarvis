@@ -296,6 +296,23 @@ class ProducerWatchdogTests(MonolithGlobalsTestCase):
         self.assertFalse(t.is_alive())
 
 
+# The two-webcam layout these tests were written against (index 2 = left and
+# PRIMARY, index 0 = right). The shipped CAMERAS default is now a single generic
+# webcam, so pin the layout here instead of inheriting the default.
+_TWO_CAMERAS = [
+    {"index": 2, "label": "Left webcam", "name": "example webcam",
+     "primary": True, "look_x": 0.5, "look_y": 0.5},
+    {"index": 0, "label": "Right webcam", "name": "usb 2.0 camera",
+     "primary": False, "look_x": 0.85, "look_y": 0.5},
+]
+
+
+def _pin_two_cameras(test):
+    p = mock.patch.object(test.bc, "CAMERAS", [dict(c) for c in _TWO_CAMERAS])
+    p.start()
+    test.addCleanup(p.stop)
+
+
 @requires_monolith
 class CameraQuarantineTests(MonolithGlobalsTestCase):
     """PRIORITY 2: a camera that keeps needing rescue gets benched, on a
@@ -304,6 +321,9 @@ class CameraQuarantineTests(MonolithGlobalsTestCase):
     @classmethod
     def setUpClass(cls):
         cls.bc = load_monolith()
+
+    def setUp(self):
+        _pin_two_cameras(self)
 
     def test_two_strikes_do_not_bench_a_camera(self):
         """A blip must survive. The measured cadence gives a sick camera a
@@ -569,6 +589,7 @@ class SickCameraDoesNotStopTheOthersTests(MonolithGlobalsTestCase):
         cls.bc = load_monolith()
 
     def setUp(self):
+        _pin_two_cameras(self)
         import numpy as np
         self.np = np
         self.left_frame = np.full((8, 8, 3), 11, dtype=np.uint8)

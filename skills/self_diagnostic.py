@@ -897,7 +897,7 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5,
                 # opening a fresh one. This used to double as a "did we fail to
                 # claim the device?" probe on the strength of DirectShow
                 # refusing a second open — that inference DOES NOT HOLD on
-                # MSMF. Measured 2026-09-05 with one process holding the eMeet
+                # MSMF. Measured 2026-09-05 with one process holding the ExampleCam
                 # and reading it: a DirectShow contender got isOpened() ==
                 # False in 0.65 s, while an MSMF contender got isOpened() ==
                 # True, set(W/H) == True, read 1280x720 back out of get(), and
@@ -1147,8 +1147,8 @@ def _translate_camera_index(cfg_idx, name: str, backend: str):
     index this device is", never as "not owned" — see the fail-closed branch in
     _probe_webcam_locked. Translation is by NAME, never by arithmetic on the
     configured integer: the two backends enumerate different device lists
-    (DirectShow 0=USB 2.0 Camera 1=Kinect 2=eMeet 3=OBS Virtual Camera; Media
-    Foundation 0=Kinect 1=USB 2.0 Camera 2=eMeet, with no OBS entry at all),
+    (DirectShow 0=USB 2.0 Camera 1=Kinect 2=ExampleCam 3=OBS Virtual Camera; Media
+    Foundation 0=Kinect 1=USB 2.0 Camera 2=ExampleCam, with no OBS entry at all),
     which is the whole reason core/camera_backend.py exists."""
     try:
         if backend == "dshow":
@@ -1423,8 +1423,8 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
     #    getBackendName() == 'MSMF'. The winning index was then handed to
     #    _attempt_camera_wake(), which opened it with cv2.CAP_DSHOW. The two
     #    backends enumerate DIFFERENT device lists (Media Foundation
-    #    0=Kinect 1=USB 2.0 Camera 2=eMeet; DirectShow 0=USB 2.0 Camera
-    #    1=Kinect 2=eMeet), so "index 0" meant the Kinect to the scan and the
+    #    0=Kinect 1=USB 2.0 Camera 2=ExampleCam; DirectShow 0=USB 2.0 Camera
+    #    1=Kinect 2=ExampleCam), so "index 0" meant the Kinect to the scan and the
     #    USB webcam to the wake. The probe diagnosed one device and then
     #    tried to revive a different one.
     # 2. OPENED IS NOT WORKING. The scan accepted the first index that merely
@@ -1492,7 +1492,7 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
             # and the two spaces disagree (the owner's right webcam is
             # DirectShow 0 and Media Foundation 1). The CAMERAS index goes
             # alongside under its own name rather than silently overloading
-            # this one — on this rig the eMeet happens to be 2 in BOTH lists,
+            # this one — on this rig the ExampleCam happens to be 2 in BOTH lists,
             # which is exactly the coincidence that would hide the mix-up.
             details["index"]          = best["probe_index"]
             details["config_index"]   = best["config_index"]

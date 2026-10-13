@@ -1,4 +1,4 @@
-"""Tests for audio.void_link — "is the CORSAIR VOID ELITE headset powered ON?"
+"""Tests for audio.void_link — "is the ExampleBrand ELITE headset powered ON?"
 
 EVERY FIXTURE IN THIS FILE IS A REAL CAPTURED BYTE STRING, not an invention.
 They come from the 2026-09-04 poller run (one sample/second, changes only)

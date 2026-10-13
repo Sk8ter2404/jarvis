@@ -3794,11 +3794,20 @@ class RefreshDevicesNonHeadsetSwitchTests(_MonolithSec2Base):
 #         at all.
 #  …and the outage that motivated it: PREFERRED_INPUT_DEVICES pinned "CORSAIR",
 #  the powered-off headset still enumerated and still passed
-#  check_input_settings, so it won every re-pick while the live Blue Snowball
+#  check_input_settings, so it won every re-pick while the live Example Desk Mic
 #  sat at the Windows default — JARVIS was deaf for 90 minutes (2026-08-20).
 #
 #  Deterministic: no real device is opened or enumerated anywhere below.
 # ───────────────────────────────────────────────────────────────────────────
+def _pin_alias_settings(test):
+    """Point the headset / desk-mic alias settings at the fixture devices."""
+    for name, val in (("AUDIO_AUTOSWITCH_HEADSET", "CORSAIR VOID ELITE"),
+                      ("AUDIO_AUTOSWITCH_MIC_FALLBACK", "Blue Snowball")):
+        p = mock.patch.object(test.bc, name, val, create=True)
+        p.start()
+        test.addCleanup(p.stop)
+
+
 class _FollowTheDefaultFixtures:
     """Stub fixtures shared by the follow-the-default test classes.
 
@@ -3814,6 +3823,10 @@ class _FollowTheDefaultFixtures:
     HEADPHONES = "Headphones (CORSAIR VOID ELITE Wireless Gaming Dongle)"
 
     def setUp(self):
+        # Spoken aliases are built from the owner's settings at call time (the
+        # shipped code carries no device names), so pin them for these tests
+        # instead of inheriting whatever the host's settings file holds.
+        _pin_alias_settings(self)
         self._saved_cache = dict(self.bc._device_cache)
 
     def tearDown(self):
@@ -4227,7 +4240,7 @@ class FollowTheDefaultDeviceTests(_FollowTheDefaultFixtures, _MonolithSec2Base):
         self._refresh(self._sd([self.SNOWBALL, self.SPEAKERS, self.CORSAIR],
                                2, 1), announced=announced)
         # …then it powers off: gone from the enumeration entirely, and Windows
-        # falls back to the Snowball.
+        # falls back to the desk mic.
         self._refresh(self._sd([self.SNOWBALL, self.SPEAKERS], 0, 1),
                       announced=announced)
         self.assertEqual(len(announced), 1, announced)
@@ -4239,7 +4252,7 @@ class FollowTheDefaultDeviceTests(_FollowTheDefaultFixtures, _MonolithSec2Base):
         announced = []
         self._refresh(self._sd([self.SNOWBALL, self.SPEAKERS], 0, 1),
                       announced=announced)
-        # The Snowball is unplugged; the headset takes over as default mic.
+        # The desk mic is unplugged; the headset takes over as default mic.
         self._refresh(self._sd([self.CORSAIR, self.SPEAKERS], 0, 1),
                       announced=announced)
         self.assertEqual(len(announced), 1, announced)
@@ -4575,6 +4588,10 @@ class FriendlyDeviceNameSpokenAliasTests(_MonolithSec2Base):
     """The announcement reads _friendly_device_name OUT LOUD, so the owner's
     three real endpoints must come out speakable."""
 
+    def setUp(self):
+        super().setUp()
+        _pin_alias_settings(self)
+
     def test_corsair_headset_alias(self):
         self.assertEqual(
             self.bc._friendly_device_name(
@@ -4624,7 +4641,7 @@ class FriendlyDeviceNameSpokenAliasTests(_MonolithSec2Base):
     def test_mme_truncated_description_keeps_the_brand(self):
         # MME cuts descriptions at 31 chars — closing paren and all. Real names
         # off this box: 'Speakers (DualSense Wireless Co', 'Headset Earphone
-        # (CORSAIR VOID '.
+        # (ExampleBrand VOID '.
         self.assertEqual(
             self.bc._friendly_device_name("Speakers (DualSense Wireless Co"),
             "DualSense Wireless Co")

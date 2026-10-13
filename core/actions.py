@@ -72,7 +72,7 @@ def _apple_music_app():
 
 def _site_shortcut_url(name: str) -> "str | None":
     """SITE_SHORTCUTS (core/stt_vocab.py, 2026-10-01): the URL for a spoken site
-    name ("accelo"), read live from core.config; None when unset or no match."""
+    name ("zorblat"), read live from core.config; None when unset or no match."""
     try:
         from core import config as _cfg
         from core import stt_vocab as _sv
@@ -1143,7 +1143,7 @@ def _apple_music_web_url() -> str:
 
 
 def _act_launch_app(name: str) -> str:
-    # A named site shortcut ("open Accelo") is a page, not a program.
+    # A named site shortcut ("open Zorblat") is a page, not a program.
     shortcut = _site_shortcut_url(name)
     if shortcut:
         return _act_open_url(shortcut)

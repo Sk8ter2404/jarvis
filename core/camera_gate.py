@@ -267,7 +267,7 @@ IN_FLIGHT_STALE_S = 60.0
 # polls presence (the Media Foundation device list: measured free), and once
 # the device is back it must stay listed this long before it is reopened -
 # the hub it came back through has just re-enumerated, and a stream START is
-# what tripped the resets (16 of 37 eMeet-class starts reset the hub within
+# what tripped the resets (16 of 37 ExampleCam-class starts reset the hub within
 # 6 s; the reset rate spiked in the first 2 s after a start).
 ABSENT_POLL_S = 3.0
 ABSENT_SETTLE_S = 15.0

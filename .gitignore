@@ -85,6 +85,8 @@ skills/vip_boss_mode.py
 skills/vip_intercept.py
 skills/trip_planner.py
 skills/teams_screener.py
+tests/skills/test_vip_intercept.py
+tests/skills/test_teams_screener.py
 
 # --- Gitignored local extensions for dev tooling (owner-specific PII patterns
 #     + internal action names; keeps real values out of the shipped scanners) -
@@ -174,3 +176,17 @@ _audit_final_findings.json
 
 # Kokoro TTS model weights (large binaries, fetched from official release)
 models/kokoro/
+
+# --- Runtime / layout state files (never ship)
+.jarvis_root
+.last_upgrade_announced
+
+# --- Screenshots under tools/ are never shipped (desktop captures leak
+#     taskbar/app/hardware detail); the explicit allow-list is the HUD set.
+tools/*.png
+!tools/corner.png
+!tools/hud_check.png
+!tools/hud_live.png
+!tools/hud_now.png
+!tools/hud_wide.png
+!tools/unified_hud_preview.png

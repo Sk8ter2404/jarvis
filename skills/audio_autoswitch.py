@@ -8,7 +8,7 @@ the background watcher at boot when enabled.
 
 EVERY power question here goes through `audio_switch.headset_powered()`, which
 is THREE-VALUED (True / False / None). It does NOT use `find_active()` for
-that: measured 2026-09-04, a CORSAIR VOID ELITE that is POWERED OFF still
+that: measured 2026-09-04, a ExampleBrand ELITE that is POWERED OFF still
 reports both endpoints as Active, so the endpoint check answers "on" forever.
 `find_active()` is still used to RESOLVE a device id once a decision is made —
 that part of it was never wrong.
@@ -55,7 +55,7 @@ PROMPT_EXAMPLES = (
     "  use_desk_mic / switch_to_desk_mic\n"
     "                       - listen on the DESK microphone instead. Fire on\n"
     "                         'use my desk mic', 'switch to the desk mic',\n"
-    "                         'stop using the headset mic', 'use the Snowball'.\n"
+    "                         'stop using the headset mic', 'use the desk mic'.\n"
     "  which_mic_is_active  - report WHICH recording device is selected and\n"
     "                         whether anything is overriding the choice. Fire\n"
     "                         on 'which mic is active', 'which microphone are\n"
@@ -134,11 +134,11 @@ def _capture_sentence(name: str) -> str:
     evidence. set_default_capture() moves the WINDOWS default recording
     endpoint, and on this machine that is NOT what bobert_companion records
     from: PREFERRED_INPUT_DEVICES is live in data/user_settings.json
-    (['Blue Snowball', 'eMeet C960', 'CORSAIR VOID']), _pick_device matches the
-    Snowball on every pass, and the one branch that reads the default endpoint
+    (['Example Desk Mic', 'Example Webcam C960', 'ExampleBrand VOID']), _pick_device matches the
+    desk mic on every pass, and the one branch that reads the default endpoint
     therefore never runs. Replayed read-only against the live PortAudio list
     2026-09-05: _pick_device(..., want_input=True) -> (6, 'Microphone (Blue
-    Snowball )'). So "Listening on the headset, sir" was a spoken claim about a
+    desk mic )'). So "Listening on the headset, sir" was a spoken claim about a
     state nobody had checked - said in direct answer to an order, which is the
     worst possible place to say it.
 
@@ -149,7 +149,7 @@ def _capture_sentence(name: str) -> str:
     What the hedged sentence deliberately does NOT say is "I am not recording
     from it". That would be a fresh unverified claim in the other direction:
     when the preferred list happens to name the very device just selected (his
-    desk mic IS the Blue Snowball, the first entry), he really is being heard
+    desk mic IS the Example Desk Mic, the first entry), he really is being heard
     on it. All capture_override() establishes is WHICH RULE DECIDES, so that is
     the only thing asserted. Proving a microphone is actually producing audio
     needs signal - the VAD's peak RMS, where a dead device reads exactly 0.0000

@@ -695,7 +695,7 @@ class ResolveWebcamNamesTests(MonolithGlobalsTestCase):
     # _resolve_webcam_indices_by_name(); the slot→needle derivation is a
     # DIFFERENT unit. The fixture used to spell the live rig ("Fullhan
     # Webcam"), which coupled it to whatever webcam was plugged in that month:
-    # when the owner retired the C270 for an eMeet C960 on 2026-07-13 and
+    # when the owner retired the C270 for an Example Webcam C960 on 2026-07-13 and
     # core/config.py's CAMERAS name became "emeet c960", no enumerated device
     # contained the left needle any more, the slot resolved to None, and both
     # tests failed. That is the SAME stale-duplicate class

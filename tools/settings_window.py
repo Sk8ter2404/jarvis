@@ -1082,7 +1082,7 @@ SCHEMA: dict[str, dict] = {
     "AUDIO_AUTOSWITCH_HEADSET": {
         "tab": "hearing", "label": "Headset name (part of it)", "type": "str",
         "default": "",
-        "help": "Part of the headset's Windows device name, e.g. CORSAIR VOID "
+        "help": "Part of the headset's Windows device name, e.g. ExampleBrand "
                 "ELITE. List candidates with: python -m audio.audio_switch "
                 "--list",
     },

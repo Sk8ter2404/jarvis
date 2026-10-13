@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install JARVIS's git hooks — currently a pre-commit PII/secret guard.
+"""Install JARVIS's git hooks — pre-commit, commit-msg and pre-push PII/secret guards.
 
 Run once per clone (the hook itself lives under .git/, which git never tracks):
 
@@ -63,6 +63,47 @@ exit 0
 """
 
 
+# commit-msg: scans the message AND the author/committer identity git is about
+# to record (the 2026-10-05 leak was a personal e-mail in the author field of two
+# commits made from a shell with no repo-local user.email).
+COMMIT_MSG_HOOK = """#!/bin/sh
+# JARVIS commit-msg guard (installed by tools/install_git_hooks.py).
+python tools/check_no_pii.py --commit-msg "$1"
+code=$?
+if [ "$code" -eq 127 ]; then
+  echo "[commit-msg] WARNING: python not found - identity scan SKIPPED." 1>&2
+  exit 0
+fi
+if [ "$code" -ne 0 ]; then
+  echo "[commit-msg] BLOCKED: commit identity/message failed the PII gate." 1>&2
+  exit 1
+fi
+exit 0
+"""
+
+# pre-push: the last line of defence for commits that skipped the other hooks
+# (made with --no-verify, in another clone, or by an agent). Scans every pushed
+# commit's author, committer and message.
+PRE_PUSH_HOOK = """#!/bin/sh
+# JARVIS pre-push guard (installed by tools/install_git_hooks.py).
+python tools/check_no_pii.py --pre-push
+code=$?
+if [ "$code" -eq 127 ]; then
+  echo "[pre-push] WARNING: python not found - metadata scan SKIPPED." 1>&2
+  exit 0
+fi
+if [ "$code" -ne 0 ]; then
+  echo "[pre-push] BLOCKED: a commit being pushed carries personal data in its" 1>&2
+  echo "[pre-push] author/committer identity or message (see above)." 1>&2
+  exit 1
+fi
+exit 0
+"""
+
+_HOOKS = (("pre-commit", PRE_COMMIT_HOOK), ("commit-msg", COMMIT_MSG_HOOK),
+          ("pre-push", PRE_PUSH_HOOK))
+
+
 def hooks_dir() -> str:
     """Resolve the real hooks directory, honouring core.hooksPath and worktrees
     by asking git directly; falls back to ``<root>/.git/hooks`` if git can't be
@@ -90,17 +131,19 @@ def install(target_dir: str | None = None) -> str | None:
         print(f"[install-hooks] could not create {hooks}: {e}")
         return None
     dest = os.path.join(hooks, "pre-commit")
-    try:
-        # newline="" + explicit \n in the string => LF endings on every OS.
-        with open(dest, "w", encoding="utf-8", newline="") as f:
-            f.write(PRE_COMMIT_HOOK)
-    except OSError as e:
-        print(f"[install-hooks] could not write {dest}: {e}")
-        return None
-    try:
-        os.chmod(dest, 0o755)  # real on POSIX; harmless on Windows
-    except OSError:
-        pass
+    for name, body in _HOOKS:
+        path = os.path.join(hooks, name)
+        try:
+            # newline="" + LF line feeds in the string => LF on every OS.
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(body)
+        except OSError as e:
+            print(f"[install-hooks] could not write {path}: {e}")
+            return None
+        try:
+            os.chmod(path, 0o755)  # real on POSIX; harmless on Windows
+        except OSError:
+            pass
     return dest
 
 
@@ -108,9 +151,11 @@ def main() -> int:
     dest = install()
     if dest is None:
         return 1
-    print(f"[install-hooks] installed pre-commit guard -> {dest}")
-    print("[install-hooks] runs tools/check_no_pii.py and blocks commits with "
-          "HARD PII/secret findings.")
+    print(f"[install-hooks] installed pre-commit, commit-msg and pre-push "
+          f"guards -> {os.path.dirname(dest)}")
+    print("[install-hooks] they run tools/check_no_pii.py and block commits and "
+          "pushes with HARD PII/secret findings (file contents, commit "
+          "identity, commit messages).")
     return 0
 
 

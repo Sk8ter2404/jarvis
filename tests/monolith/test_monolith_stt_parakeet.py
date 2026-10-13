@@ -295,10 +295,10 @@ class R6PrimaryTests(_Base):
     def test_replacements_then_parakeets_own(self):
         bc = self.bc
         self._p(bc, "_stt_alt", _FakeEngine(text="open a cello please"))
-        self._p(bc, "STT_REPLACEMENTS", {"a cello": "Accelo"})
-        self._p(bc, "STT_REPLACEMENTS_PARAKEET", {"Accelo please": "Accelo"})
+        self._p(bc, "STT_REPLACEMENTS", {"a cello": "Zorblat"})
+        self._p(bc, "STT_REPLACEMENTS_PARAKEET", {"Zorblat please": "Zorblat"})
         text, _conf = bc._transcribe_capture(self.audio)
-        self.assertEqual(text, "open Accelo")
+        self.assertEqual(text, "open Zorblat")
 
     def test_rescue_on_a_lost_wake_word_in_wake_mode(self):
         bc = self.bc

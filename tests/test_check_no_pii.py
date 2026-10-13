@@ -297,13 +297,25 @@ class WalkTextFilesTests(unittest.TestCase):
         self.assertEqual(names, ["a.py", "b.txt"])
 
     def test_skips_binary_extensions(self):
+        # Pure-asset binaries (fonts, ...) are not listed; review-worthy ones
+        # (images, archives, documents) ARE listed since 2026-10-12 so the
+        # binary-review rule can see them - they are still never read as text.
         self._touch("keep.py")
-        self._touch("drop.png")
-        self._touch("drop.zip")
+        self._touch("drop.ttf")
+        self._touch("drop.pyc")
         found = [os.path.basename(p) for p in cnp._walk_text_files(self.root)]
         self.assertIn("keep.py", found)
-        self.assertNotIn("drop.png", found)
-        self.assertNotIn("drop.zip", found)
+        self.assertNotIn("drop.ttf", found)
+        self.assertNotIn("drop.pyc", found)
+
+    def test_review_binaries_are_listed_but_never_read_as_text(self):
+        self._touch("shot.png")
+        self._touch("pack.zip")
+        found = [os.path.basename(p) for p in cnp._walk_text_files(self.root)]
+        self.assertIn("shot.png", found)
+        self.assertIn("pack.zip", found)
+        for p in cnp._walk_text_files(self.root):
+            self.assertEqual(cnp._scan_file(p, cnp.HARD), [])
 
     def test_prunes_excluded_dirs(self):
         self._touch("real.py")

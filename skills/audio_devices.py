@@ -74,8 +74,8 @@ def _bc():
 
 
 def _friendly(raw: Optional[str]) -> Optional[str]:
-    """Speakable form of a device name ('Microphone (Blue Snowball )' -> 'the
-    Blue Snowball'), falling back to the raw name. Never raises."""
+    """Speakable form of a device name ('Microphone (Example Desk Mic )' -> 'the
+    Example Desk Mic'), falling back to the raw name. Never raises."""
     # A whitespace-only name is as useless as an empty one — speaking
     # "I'm listening on    , sir" is worse than admitting we don't know.
     if not raw or not raw.strip() or raw.strip().lower() == _UNKNOWN:

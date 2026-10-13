@@ -28,13 +28,13 @@ require_frame=1.0; 3 cycles per camera, 12 s per phase)::
 
                     producer reads BEFORE     DURING            AFTER (released)
     USB 2.0 Camera  208 ok /   0 fail    1 ok / 210 fail     0 ok / 239 fail
-    eMeet C960      211 ok /   0 fail    1 ok / 211 fail     0 ok / 239 fail
+    Example Webcam C960      211 ok /   0 fail    1 ok / 211 fail     0 ok / 239 fail
 
 The second MSMF open is GRANTED - it satisfies ``require_frame``, so the
 prove-a-frame guard does not catch it - takes the stream, and RELEASING it does
 not give the stream back. Only a producer release+reopen recovers, which is
 exactly the ``read failure #25 … woke via release+reopen`` pair in the logs.
-And it is not a sick-camera effect: the healthy eMeet died identically.
+And it is not a sick-camera effect: the healthy ExampleCam died identically.
 ``core/camera_backend.py``'s "both backends leave the HOLDER undisturbed" was
 measured CROSS-PROCESS; in-process is the opposite.
 

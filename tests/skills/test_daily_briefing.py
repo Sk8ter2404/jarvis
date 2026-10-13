@@ -474,7 +474,7 @@ class DailyWeatherMeetingEdgeTests(unittest.TestCase):
         bs = mock.MagicMock()
         bs.get_first_meeting_data.return_value = {
             "start": datetime.datetime(2026, 6, 2, 10, 30),
-            "organizer": "boss@corp.com", "subject": "Sync"}
+            "organizer": "boss@example.com", "subject": "Sync"}
         with mock.patch.object(self.mod, "_briefing_sources", return_value=bs):
             out = self.mod._first_meeting_today()
         self.assertNotIn("with", out)

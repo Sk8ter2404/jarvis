@@ -8,8 +8,8 @@ WHY THIS MODULE EXISTS
 2026-09-05, 25 open/read/release cycles per figure, each in a fresh process,
 1280x720 requested, 30 reads per cycle:
 
-    eMeet C960   CAP_DSHOW   +4.58 OS threads  +479 handles   per cycle
-    eMeet C960   CAP_MSMF    -0.21 OS threads    +0.97 handles per cycle
+    Example Webcam C960   CAP_DSHOW   +4.58 OS threads  +479 handles   per cycle
+    Example Webcam C960   CAP_MSMF    -0.21 OS threads    +0.97 handles per cycle
     USB 2.0 Cam  CAP_DSHOW   +4.55 OS threads  +479 handles   per cycle
     USB 2.0 Cam  CAP_MSMF    -0.18 OS threads    +1.06 handles per cycle
 
@@ -24,15 +24,15 @@ THE TRAP: THE TWO BACKENDS DO NOT AGREE ON WHAT AN INDEX MEANS
 Enumerated on this rig 2026-09-05 (pygrabber for DirectShow,
 MFEnumDeviceSources for Media Foundation — the exact calls OpenCV subscripts):
 
-    DirectShow  0=USB 2.0 Camera  1=Kinect V2 Video Sensor  2=eMeet C960  3=OBS Virtual Camera
-    MediaFdn.   0=Kinect V2 Video Sensor  1=USB 2.0 Camera  2=eMeet C960
+    DirectShow  0=USB 2.0 Camera  1=Kinect V2 Video Sensor  2=Example Webcam C960  3=OBS Virtual Camera
+    MediaFdn.   0=Kinect V2 Video Sensor  1=USB 2.0 Camera  2=Example Webcam C960
 
 They are NOT the same list and NOT the same length: OBS Virtual Camera has no
 Media Foundation presence at all. Swapping the backend constant at a call site
 WITHOUT translating the index therefore silently repoints index 0 from the USB
 webcam to the Kinect. Confirmed empirically as well as by enumeration: probing
 each (backend, index) pair with resolutions only one device on this rig
-supports (2592x1944 → USB 2.0 Camera only; 1280x960 → eMeet only; a single
+supports (2592x1944 → USB 2.0 Camera only; 1280x960 → ExampleCam only; a single
 fixed 1920x1080 YUY2 format → Kinect only) reproduces exactly that mapping.
 
 So: this module translates, and it translates BY NAME, which is also the only
@@ -55,7 +55,7 @@ site, not two.
 ────────────────────────────────────────────────────────────────────────────
 THE OTHER TRAP: MSMF "OPENS" A CAMERA SOMEONE ELSE IS HOLDING
 ────────────────────────────────────────────────────────────────────────────
-Measured 2026-09-05, one process holding the eMeet and reading, a second
+Measured 2026-09-05, one process holding the ExampleCam and reading, a second
 process then opening the same device:
 
     contender CAP_DSHOW : isOpened() == False after 0.65 s      (honest refusal)
