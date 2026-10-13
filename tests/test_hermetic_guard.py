@@ -67,14 +67,39 @@ def _source(path: str) -> str:
 
 @contextlib.contextmanager
 def _ledger_restored():
-    """Keep this file's own (deliberate) refusals out of the run's report."""
+    """Keep this file's own (deliberate) refusals out of the run's report.
+
+    Also puts ``sys.modules['bobert_companion']`` right again. The tests
+    re-run under this guard (monolith-absent / staging-order / the fixed
+    offenders) pin the absent sentinel, plant a stand-in or ``pop`` the
+    monolith and, run singly, never undo it (no setUpModule/tearDownModule
+    pair around them). Left behind, the monolith the harness cached is no
+    longer what ``import bobert_companion`` returns: core.actions then
+    re-imports a SECOND copy, and every later monolith test patches one
+    module while the code under test reads the other ('no previous action to
+    replay', lost screen texts)."""
     with hg._lock:
         saved = list(hg._refusals)
+    before = sys.modules.get(_MONOLITH, _ABSENT)
     try:
         yield
     finally:
         with hg._lock:
             hg._refusals[:] = saved
+        _restore_monolith(before)
+
+
+def _restore_monolith(before):
+    """What the entry was; when nothing was loaded then, the module the
+    monolith harness has cached since (so a later import finds the SAME
+    object the tests patch), else no entry."""
+    if before is _ABSENT:
+        from tests import _monolith_harness
+        before = getattr(_monolith_harness, "_bc", None) or _ABSENT
+    if before is _ABSENT:
+        sys.modules.pop(_MONOLITH, None)
+    else:
+        sys.modules[_MONOLITH] = before
 
 
 class _Armed(unittest.TestCase):
