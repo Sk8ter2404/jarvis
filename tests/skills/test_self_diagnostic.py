@@ -2340,6 +2340,58 @@ class BambuProbeTests(_ProbeTestBase):
         self.assertTrue(r["ok"])
         self.assertIn("offline", r["details"]["skipped"])
 
+    def _live_bm(self, **st):
+        bm = types.ModuleType("skill_bambu_monitor")
+        bm.is_printer_offline = lambda: False
+        base = {"monitor_running": True, "ever_connected": True,
+                "state": "connected", "failures": 0, "age_s": 120.0,
+                "reason": "", "hint": "", "kind": ""}
+        base.update(st)
+        bm.connection_status = lambda: dict(base)
+        return bm
+
+    def _bc192(self):
+        return types.SimpleNamespace(BAMBU_PRINTER_IP="192.0.2.10",
+                                     BAMBU_ACCESS_CODE="code", BAMBU_SERIAL="ser")
+
+    def test_live_monitor_connected_passes_without_direct_connect(self):
+        bm = self._live_bm()
+        direct = mock.Mock(side_effect=AssertionError("direct connect"))
+        mq = self._mqtt(connect_rc=5)
+        mq["paho.mqtt.client"].Client = direct
+        with mock.patch.object(self.mod, "_bc", return_value=self._bc192()), \
+             inject_modules(**{"skill_bambu_monitor": bm}), \
+             inject_modules(**mq):
+            r = self.mod._probe_bambu()
+        direct.assert_not_called()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["details"]["via"], "live monitor")
+        self.assertEqual(r["details"]["state"], "connected")
+
+    def test_live_monitor_disconnected_after_connect_reports_monitor(self):
+        bm = self._live_bm(state="disconnected", failures=2,
+                           reason="connection reset")
+        direct = mock.Mock(side_effect=AssertionError("direct connect"))
+        mq = self._mqtt(connect_rc=0)
+        mq["paho.mqtt.client"].Client = direct
+        with mock.patch.object(self.mod, "_bc", return_value=self._bc192()), \
+             inject_modules(**{"skill_bambu_monitor": bm}), \
+             inject_modules(**mq):
+            r = self.mod._probe_bambu()
+        direct.assert_not_called()
+        self.assertFalse(r["ok"])
+        self.assertIn("disconnected", r["error"])
+        self.assertIn("connection reset", r["error"])
+
+    def test_monitor_never_connected_past_grace_fails(self):
+        bm = self._live_bm(ever_connected=False, state="failed", failures=3,
+                           reason="timed out")
+        with mock.patch.object(self.mod, "_bc", return_value=self._bc192()), \
+             inject_modules(**{"skill_bambu_monitor": bm}):
+            r = self.mod._probe_bambu()
+        self.assertFalse(r["ok"])
+        self.assertIn("no MQTT session", r["error"])
+
     def test_paho_missing(self):
         bc = types.SimpleNamespace(BAMBU_PRINTER_IP="1.2.3.4",
                                    BAMBU_ACCESS_CODE="code", BAMBU_SERIAL="ser")
