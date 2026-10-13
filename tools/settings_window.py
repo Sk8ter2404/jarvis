@@ -1954,6 +1954,28 @@ SCHEMA: dict[str, dict] = {
         "choices": ["07:00", "07:30", "08:00", "21:00", "22:00"],
         "help": "Local time. Morning (07:30) or nightly (22:00).",
     },
+    "HOURS_REMINDER_ENABLED": {
+        "tab": "integrations", "label": "Monday timesheet-hours reminder",
+        "type": "bool", "default": True,
+        "help": "Pay periods run Monday to Sunday, two weeks at a time. On "
+                "the Monday a period ends, JARVIS says 'time to put in your "
+                "hours' for those two weeks. Off = no reminder ('is it hours "
+                "week?' still answers). Applies on the next start.",
+    },
+    "HOURS_REMINDER_ANCHOR": {
+        "tab": "integrations", "label": "Pay period start (any one Monday)",
+        "type": "str", "default": "2026-09-28", "nonblank": True,
+        "help": "YYYY-MM-DD: the first day of any one pay period. Every "
+                "period is a whole number of 14-day steps from it, so one "
+                "known start is all JARVIS needs. Applies on the next start.",
+    },
+    "HOURS_REMINDER_TIME": {
+        "tab": "integrations", "label": "Hours reminder time (HH:MM)",
+        "type": "combo", "default": "09:00", "nonblank": True,
+        "choices": ["08:00", "09:00", "10:00", "12:00", "17:00"],
+        "help": "Local time of the Monday reminder. Applies on the next "
+                "start.",
+    },
     "PHONE_PING_MAX_PER_HOUR": {
         "tab": "integrations", "label": "Most pings in an hour",
         "type": "int", "default": 6, "max": 60,
@@ -2393,6 +2415,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                          "PHONE_PING_QUIET_START", "PHONE_PING_QUIET_END",
                          "PHONE_PING_AWAY_MIN",
                          "PHONE_PING_CONFIRM_AFTER_MIN"]),
+        ("Reminders", ["HOURS_REMINDER_ENABLED", "HOURS_REMINDER_ANCHOR",
+                       "HOURS_REMINDER_TIME"]),
         ("Media", ["STREAMING_AUTO_FULLSCREEN"]),
         ("Notes (not read by JARVIS)", ["OBS_HOST_HINT", "OBS_PORT_HINT",
                                         "HUE_BRIDGE_IP_HINT"]),

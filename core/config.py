@@ -1377,6 +1377,22 @@ NIGHT_QUIET_ENABLED = True
 # user_settings.json; applies to the next prompt build.
 HUMOR_MODE = "dry"
 
+# ─── Timesheet-hours reminder (skills/hours_reminder.py) ─────────────────
+# Pay periods run Monday-Sunday, two weeks at a time, and the hours for a
+# period can only be entered once it has ended. On the Monday a period ends
+# JARVIS says "time to put in your hours for <Monday> to <Sunday>", and
+# "is it hours week?" / "when do I put in my hours" are answered from the same
+# calendar.
+# HOURS_REMINDER_ENABLED — False = no Monday reminder (the questions still
+#   answer). Applies on the next start.
+# HOURS_REMINDER_ANCHOR — "YYYY-MM-DD": the first day (a Monday) of ANY one
+#   pay period; every period is a whole number of 14-day steps from it. A
+#   date that is not a Monday counts as the Monday of its own week.
+# HOURS_REMINDER_TIME — "HH:MM" local time of the Monday reminder.
+HOURS_REMINDER_ENABLED = True
+HOURS_REMINDER_ANCHOR = "2026-09-28"
+HOURS_REMINDER_TIME = "09:00"
+
 # ─── Night-owl mode (skills/night_owl_mode.py) ───────────────────────────
 # NIGHT_OWL_AUTO — at 23:00 JARVIS switches night-owl mode on by himself
 # until 06:00: a voice about 15% quieter and about 5% slower, replies kept to

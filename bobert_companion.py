@@ -21689,6 +21689,8 @@ def _local_cheatsheet() -> str:
         "  [ACTION: youtube, <search>]      <- search-only: just opens results\n"
         "  [ACTION: apple_music, <query>]  [ACTION: disney_plus, <title>]  [ACTION: hulu, <title>]\n"
         "  [ACTION: set_timer, 5 minutes]   (or '5 minutes for tea')   [ACTION: list_timers]   [ACTION: cancel_timer]  (no arg cancels the running one)\n"
+        "  [ACTION: add_reminder, <what>]   a reminder with NO time ('remind me to buy milk'): shopping list if it is a purchase, else the to-do list. NEVER a timer, NEVER an invented duration.\n"
+        "  [ACTION: show_shopping_list]  [ACTION: add_shopping_item, <items>]  [ACTION: remove_shopping_item, <item>]  [ACTION: clear_shopping_list]  [ACTION: hours_status]   'is it hours week'\n"
         "  [ACTION: see_screen]  or  [ACTION: see_screen, middle]   look at the screen & describe it\n"
         "  [ACTION: find_on_screen, <thing>]   [ACTION: recall_screen]\n"
         "  [ACTION: kinect_status]   'kinect status' / 'is the kinect working'   (Xbox Kinect; honest if it's off/absent)\n"
@@ -32035,7 +32037,7 @@ def _last_queued_task_line(max_age_s: float = WARM_RESTART_WINDOW_SECONDS) -> st
     matches = re.findall(r'^- \[ \].*$', content, flags=re.M)
     _INTERNAL_TASK = re.compile(
         r'\[\s*(anomaly|regression|self-?heal|self-?diag|deep-?audit|'
-        r'overnight|auto|pipeline|diag)\b', re.IGNORECASE)
+        r'overnight|auto|pipeline|diag|reminder)\b', re.IGNORECASE)
     _STAMP = re.compile(r'^- \[ \]\s*\*\*(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}:\d{2}))?')
     now = time.time()
     for line in reversed(matches):
@@ -46905,6 +46907,12 @@ def _run_voice_shortcuts(text: str) -> bool:
         return True
     if _run_timer_list_shortcut(text):
         return True
+    # "is it hours week" and the shopping list / untimed reminders
+    # (2026-10-12): answered by the real action, never a timer or a guess.
+    if _run_hours_shortcut(text):
+        return True
+    if _run_untimed_reminder_shortcut(text):
+        return True
     if _run_audio_check_shortcut(text):
         return True
 
@@ -47118,6 +47126,38 @@ def _run_timer_list_shortcut(text: str) -> bool:
     return _run_action_shortcut(
         text, "timers", _fast_paths.is_timer_list_request, ("list_timers",),
         empty_reply="I could not read the timer list just now, sir.")
+
+
+def _run_hours_shortcut(text: str) -> bool:
+    """"is it hours week" / "when do I put in my hours" -> hours_status, with
+    no LLM (2026-10-12): the answer is the pay-period calendar
+    (core/hours_calendar.py), not the model's guess. No hours skill loaded ->
+    False, so the LLM answers. Never raises."""
+    from core import hours_calendar as _hc
+    return _run_action_shortcut(
+        text, "hours", _hc.is_hours_question, ("hours_status",),
+        empty_reply="I couldn't read the pay-period calendar just now, sir.")
+
+
+def _run_untimed_reminder_shortcut(text: str) -> bool:
+    """A whole-utterance shopping-list request or a reminder that names NO
+    time, with no LLM (2026-10-12): "remind me to buy milk" -> the shopping
+    list, "remind me to call the dentist" -> the to-do list, "what's on my
+    shopping list" / "take milk off the shopping list" / "clear the shopping
+    list" -> the list actions. A reminder that names a time never matches
+    (core/untimed_reminders.match returns None), so timers and schedules are
+    untouched. The reply says where the item went. Never raises."""
+    try:
+        from core import untimed_reminders as _ur
+        intent = _ur.match(text)
+    except Exception:
+        return False
+    if intent is None:
+        return False
+    return _run_action_shortcut(
+        text, "untimed-reminder", lambda _t: True, (intent.action,),
+        empty_reply="I couldn't update that list just now, sir.",
+        arg=intent.arg)
 
 
 def _run_audio_check_shortcut(text: str) -> bool:
