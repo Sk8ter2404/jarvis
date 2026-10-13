@@ -17,12 +17,21 @@ router (`core/smart_home_router.py`, research-4b) which dispatches
 per-brand direct API calls without ongoing Alexa dependency.
 
 The FIRST Amazon sign-in is a one-time console wizard (run
-`python -m skills.smart_home_discover`); it caches the cookie at
-`data/alexa_cookie.json` (metadata) plus `data/alexa_cookie.pickle`
-(the alexapy-format jar) — subsequent runs reuse the cookie until it
-expires. The voice action never blocks on a terminal: without a cached
-cookie it still runs the LAN phase and reports the Alexa source as
-unavailable.
+`python -m skills.smart_home_discover`, or `... reauth` to force a new one).
+It opens a browser at Amazon's phone-app OAuth page (alexapy's
+`AlexaLogin(oauth_login=True).start_url`), the owner signs in there
+(password / CAPTCHA / 2FA never touch JARVIS), and the authorization code
+Amazon redirects back with registers JARVIS as an Alexa device. The refresh
+token is saved to `data/alexa_oauth.json` — later runs restore from it with no
+browser. The pre-2026-10 cookie cache (`data/alexa_cookie.json` +
+`data/alexa_cookie.pickle`) is still tried as a fallback. The voice action
+never blocks on a terminal: without a cached sign-in it still runs the LAN
+phase and reports the Alexa source as unavailable.
+
+Smart-home appliances (lights, fans, plugs, thermostats, cameras...) come
+from `AlexaAPI.get_network_details`; `get_devices` is only the Echo hardware.
+Secrets (cookie jars, tokens) are scrubbed from every log line by
+`_redact` / `_install_log_redaction`.
 
 Registered actions
 ------------------
@@ -57,6 +66,7 @@ import datetime
 import getpass
 import importlib
 import json
+import logging
 import os
 import pickle
 import re
@@ -66,6 +76,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 from typing import Any
 
 
@@ -83,6 +94,11 @@ _COOKIE_JSON_PATH   = os.path.join(_DATA_DIR, "alexa_cookie.json")
 _COOKIE_PICKLE_PATH = os.path.join(_DATA_DIR, "alexa_cookie.pickle")
 _CATALOG_PATH       = os.path.join(_DATA_DIR, "smart_home_devices.json")
 _TODO_PATH          = os.path.join(_PROJECT_DIR, "jarvis_todo.md")
+# Alexa OAuth device-registration material (access/refresh token, mac_dms,
+# PKCE verifier, device uuid). SECRET; `data/*` is gitignored. The path is
+# resolved at call time from _DATA_DIR (see _oauth_path) so a test or staging
+# redirect of _DATA_DIR can never touch the owner's live file.
+_OAUTH_FILE_NAME    = "alexa_oauth.json"
 
 # Cookie freshness — Amazon cookies last ~1 year, but we warn here so
 # the user can refresh proactively rather than discovering an expired
@@ -174,11 +190,157 @@ _CAPABILITY_TAGS = {
 }
 
 
+# ── secret redaction (2026-10-12) ───────────────────────────────────
+# SECURITY BUG (owner-reported): when a cookie login failed, alexapy's
+# `_catch_all_exceptions` logged WARNING "...(args, kwargs)..." with the FULL
+# requests cookie jar repr (live Amazon session tokens) and JARVIS tees
+# stderr into logs/session_*.log. Everything below keeps secrets out of any log:
+#   * _redact()               pure text scrubber (jars, Cookie reprs, Atza|...
+#                             tokens, named session / OAuth values),
+#   * _RedactingFilter        logging.Filter applying it to a record,
+#   * _install_log_redaction  idempotently hangs the filter on the "alexapy"
+#                             logger tree, every root / alexapy handler and the
+#                             logging.lastResort stderr handler, AND wraps the
+#                             LogRecord factory for alexapy / aiohttp records.
+#                             Logger-level filters do NOT apply to child
+#                             loggers ("alexapy.helpers") and alexapy's loggers
+#                             are created lazily at import, so the factory is
+#                             the part that actually guarantees coverage.
+# Every print() in this module that can carry an exception from alexapy goes
+# through _redact() as well.
+_REDACTED = "[REDACTED]"
+_SECRET_NAMES = (
+    "openid.oa2.authorization_code", "openid.oa2.access_token",
+    "authorization_code", "code_verifier", "code_challenge",
+    "access_token", "refresh_token", "mac_dms", "id_token",
+    "sess-at-main", "sess-at-acbus", "at-main", "at-acbus", "x-main",
+    "x-acbus", "ubid-main", "ubid-acbus", "session-token", "session-id-time",
+    "session-id", "sst-main", "lc-main", "csrf-token", "csrf_token", "csrf",
+)
+_NAMED_SECRET_RE = re.compile(
+    r"(?P<name>(?<![\w.-])(?:"
+    + "|".join(re.escape(n) for n in sorted(_SECRET_NAMES, key=len, reverse=True))
+    + r")(?![\w-]))"
+    r"""(?P<sep>["']?\s*[:=]\s*)(?P<q>["']?)(?P<val>(?!\[REDACTED\])[^\s"',;&>)\]}]+)""",
+    re.IGNORECASE)
+_REDACT_RULES: tuple = (
+    # whole jar repr: <RequestsCookieJar[<Cookie a=b for .x/>, ...]>
+    (re.compile(r"<?RequestsCookieJar\[.*?\]>", re.DOTALL),
+     "<RequestsCookieJar[" + _REDACTED + "]>"),
+    # truncated / unterminated jar: redact the rest of the line
+    (re.compile(r"RequestsCookieJar\[(?!\[REDACTED\])[^\n]*"),
+     "RequestsCookieJar[" + _REDACTED + "]"),
+    # aiohttp / http.cookiejar reprs
+    (re.compile(r"<Cookie\s+([^=\s>]+)=\S*(\s+for\s)"),
+     r"<Cookie \1=" + _REDACTED + r"\2"),
+    (re.compile(r"""(\bvalue\s*=\s*)(['"]).*?\2"""),
+     r"\1'" + _REDACTED + "'"),
+    # raw Cookie / Set-Cookie / Authorization headers
+    (re.compile(r"(?i)\b((?:Set-)?Cookie|Authorization)(\s*:\s*)[^\r\n]+"),
+     r"\1\2" + _REDACTED),
+    # name=value / "name": "value" for the known session + OAuth secrets
+    (_NAMED_SECRET_RE, r"\g<name>\g<sep>\g<q>" + _REDACTED),
+    # Amazon access / refresh token shapes, wherever else they appear
+    (re.compile(r"\bAt(?:za|nr|n)\|[^\s\"',;)>\]}]+"), _REDACTED),
+)
+
+
+def _redact(text: Any) -> str:
+    """Return `text` with cookie jars and token / session values replaced by
+    [REDACTED]. Pure, never raises."""
+    try:
+        out = text if isinstance(text, str) else str(text)
+        for rx, repl in _REDACT_RULES:
+            out = rx.sub(repl, out)
+        return out
+    except Exception:
+        return _REDACTED
+
+
+class _RedactingFilter(logging.Filter):
+    """logging.Filter that scrubs secrets out of a record (message, args and
+    any attached traceback) before any handler formats it. Always passes the
+    record through: it redacts, it never drops."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = str(record.msg)
+            clean = _redact(msg)
+            if clean != msg:
+                record.msg = clean
+                record.args = ()
+            if record.exc_info and not record.exc_text:
+                try:
+                    record.exc_text = logging.Formatter().formatException(
+                        record.exc_info)
+                except Exception:
+                    pass
+            if record.exc_text:
+                record.exc_text = _redact(record.exc_text)
+        except Exception:
+            pass
+        return True
+
+
+_REDACT_LOGGER_PREFIXES = ("alexapy", "aiohttp")
+
+
+def _install_log_redaction() -> None:
+    """Idempotently route every alexapy / aiohttp log record through
+    _RedactingFilter (see the block comment above). Safe to call repeatedly;
+    never raises."""
+    try:
+        flt = getattr(logging, "_jarvis_alexa_redactor", None)
+        if flt is None:
+            flt = _RedactingFilter()
+            logging._jarvis_alexa_redactor = flt        # type: ignore[attr-defined]
+            prev_factory = logging.getLogRecordFactory()
+
+            def _factory(*a: Any, **kw: Any) -> logging.LogRecord:
+                rec = prev_factory(*a, **kw)
+                try:
+                    if str(rec.name).startswith(_REDACT_LOGGER_PREFIXES):
+                        flt.filter(rec)
+                except Exception:
+                    pass
+                return rec
+
+            logging.setLogRecordFactory(_factory)
+        # Loggers: the parent plus every child that already exists.
+        names = ["alexapy"] + [
+            n for n in list(logging.root.manager.loggerDict)
+            if str(n).startswith("alexapy.")]
+        for n in names:
+            lg = logging.getLogger(n)
+            if flt not in lg.filters:
+                lg.addFilter(flt)
+            for h in lg.handlers:
+                if flt not in h.filters:
+                    h.addFilter(flt)
+        # Handlers: root's, plus the last-resort stderr handler that prints
+        # WARNING+ when nothing else is configured (the path of the leak).
+        handlers = list(logging.root.handlers)
+        if logging.lastResort is not None:
+            handlers.append(logging.lastResort)
+        for h in handlers:
+            if flt not in h.filters:
+                h.addFilter(flt)
+    except Exception:
+        pass
+
+
+_install_log_redaction()
+
+
 # ── lazy alexapy import ─────────────────────────────────────────────
 def _alexapy():
     """Lazy import so a missing alexapy install can't crash skill loading."""
     try:
         import alexapy  # type: ignore
+        _install_log_redaction()    # its child loggers exist now
         return alexapy
     except Exception as e:
         print(f"  [sh-discover] alexapy not installed ({e}); "
@@ -448,7 +610,8 @@ def _capability_tags(raw_caps: Any) -> list[str]:
     elif isinstance(raw_caps, list):
         for item in raw_caps:
             if isinstance(item, dict):
-                iface = item.get("interface") or item.get("namespace") or ""
+                iface = (item.get("interface") or item.get("namespace")
+                         or item.get("interfaceName") or "")
                 tag = _CAPABILITY_TAGS.get(iface)
                 if tag:
                     tags.append(tag)
@@ -506,24 +669,53 @@ def _run_async(coro, timeout: float | None = None):
 
 
 # ── alexapy interaction ─────────────────────────────────────────────
-def _construct_login(email: str, password: str) -> Any:
+def _construct_login(email: str, password: str, *, oauth: dict | None = None,
+                     uuid: str | None = None,
+                     oauth_login: bool | None = None) -> Any:
     """Build an AlexaLogin, tolerating API drift between alexapy versions.
     Newer versions accept a callable for `outputpath`; older versions
-    want a directory path string."""
+    want a directory path string.
+
+    `oauth` / `uuid` / `oauth_login` (2026-10-12) are the device-registration
+    extras: `oauth` is the dict AlexaLogin restores its tokens from
+    (access_token, refresh_token, mac_dms, expires_in, code_verifier,
+    code_challenge, authorization_code), `uuid` is the stable device serial the
+    registration was made under (the PKCE `deviceid` derives from it), and
+    `oauth_login=True` selects the phone-app OAuth start_url. Left unset the
+    constructor call is byte-for-byte what it always was. MUST be called from
+    inside a running event loop (the aiohttp session binds to it)."""
     alexapy = _alexapy()
     if alexapy is None:
         return None
     AlexaLogin = alexapy.AlexaLogin
 
-    def _out(txt: str) -> None:
-        print(f"  [sh-discover/alexapy] {txt}")
+    def _out(name: str) -> str:
+        # alexapy's `outputpath` is a PATH BUILDER, not a log sink: it calls
+        # outputpath(".storage/alexa_media.<email>.pickle") and string-methods
+        # the RESULT. The old callback printed and returned None, so
+        # finalize_login's eager `self._cookiefile[0].replace(...)` raised
+        # "'NoneType' object has no attribute 'replace'" and every login died
+        # at the very last step (and each construct printed the account email
+        # into the log). Return a real path under a directory we deliberately
+        # never create: alexapy's own cookie-file save then fails quietly
+        # (OSError, swallowed) instead of writing a second copy of the session
+        # to disk — our persistence is data/alexa_oauth.json.
+        return os.path.join(_DATA_DIR, "alexapy", str(name))
+
+    extra: dict[str, Any] = {}
+    if oauth:
+        extra["oauth"] = dict(oauth)
+    if uuid:
+        extra["uuid"] = uuid
+    if oauth_login is not None:
+        extra["oauth_login"] = bool(oauth_login)
 
     candidates = (
         dict(url="amazon.com", email=email, password=password,
-             outputpath=_out, debug=False),
+             outputpath=_out, debug=False, **extra),
         dict(url="amazon.com", email=email, password=password,
-             outputpath=_DATA_DIR, debug=False),
-        dict(url="amazon.com", email=email, password=password),
+             outputpath=_DATA_DIR, debug=False, **extra),
+        dict(url="amazon.com", email=email, password=password, **extra),
     )
     last_err: Exception | None = None
     for kwargs in candidates:
@@ -535,7 +727,7 @@ def _construct_login(email: str, password: str) -> Any:
         except Exception as e:
             last_err = e
             break
-    print(f"  [sh-discover] could not construct AlexaLogin: {last_err}")
+    print(f"  [sh-discover] could not construct AlexaLogin: {_redact(last_err)}")
     return None
 
 
@@ -625,7 +817,13 @@ async def _login_async(email: str, password: str) -> Any:
     raise _LoginNeedsPlaywright()
 
 
-# ── Playwright fallback ─────────────────────────────────────────────
+# ── Playwright fallback (RETIRED 2026-10-12) ────────────────────────
+# RETIRED: nothing in the wizard calls `_login_via_playwright` any more. It
+# signs in through the alexa.amazon.com web app, which Amazon shut down; the
+# cookies it captures never carry an Alexa session. The live sign-in is the
+# OAuth flow further down (`_oauth_signin_and_fetch_async`). Kept, with the
+# URL below, only so its tests and any out-of-tree caller keep working.
+#
 # alexapy 1.29.22 can't parse Amazon's current OAuth login response and
 # bails with an empty status dict. The fallback drives a real Chromium
 # window so the user can sign in manually (CAPTCHA + 2FA included);
@@ -684,6 +882,34 @@ def _convert_playwright_cookies(pw_cookies: list[dict]) -> Any:
     return jar
 
 
+async def _launch_headed_browser(pw: Any) -> Any:
+    """Launch a HEADED browser for an interactive Amazon sign-in, or None.
+
+    Prefers the user's installed Google Chrome (channel="chrome"):
+    Playwright's BUNDLED Chromium throws "spawn UNKNOWN" on some Windows
+    setups, while the system Chrome the user runs daily launches cleanly.
+    Chain: Chrome -> bundled Chromium -> Edge so this works across machines.
+    2026-05-30; hoisted into a helper 2026-10-12 so the OAuth sign-in shares it."""
+    browser = None
+    launch_errs: list[str] = []
+    for chan in ("chrome", None, "msedge"):
+        try:
+            if chan is None:
+                browser = await pw.chromium.launch(headless=False)
+            else:
+                browser = await pw.chromium.launch(headless=False, channel=chan)
+            print(f"  [sh-discover] Sign-in browser: "
+                  f"{chan or 'bundled chromium'}.")
+            break
+        except Exception as le:
+            launch_errs.append(f"{chan or 'bundled'}: {le}")
+            browser = None
+    if browser is None:
+        print("  [sh-discover] Could not launch any headed browser for "
+              "sign-in:\n      " + "\n      ".join(launch_errs))
+    return browser
+
+
 async def _login_via_playwright(
     email: str,
     timeout_seconds: float = _PLAYWRIGHT_LOGIN_TIMEOUT_S,
@@ -712,29 +938,8 @@ async def _login_via_playwright(
 
     try:
         async with async_playwright() as pw:
-            # Prefer the user's installed Google Chrome (channel="chrome").
-            # Playwright's BUNDLED Chromium throws "spawn UNKNOWN" on some
-            # Windows setups; the system Chrome the user runs daily launches
-            # cleanly. Try Chrome -> bundled Chromium -> Edge so this works
-            # across machines. 2026-05-30.
-            browser = None
-            _launch_errs = []
-            for _chan in ("chrome", None, "msedge"):
-                try:
-                    if _chan is None:
-                        browser = await pw.chromium.launch(headless=False)
-                    else:
-                        browser = await pw.chromium.launch(
-                            headless=False, channel=_chan)
-                    print(f"  [sh-discover] Sign-in browser: "
-                          f"{_chan or 'bundled chromium'}.")
-                    break
-                except Exception as _le:
-                    _launch_errs.append(f"{_chan or 'bundled'}: {_le}")
-                    browser = None
+            browser = await _launch_headed_browser(pw)
             if browser is None:
-                print("  [sh-discover] Could not launch any headed browser for "
-                      "sign-in:\n      " + "\n      ".join(_launch_errs))
                 return None
             try:
                 context = await browser.new_context()
@@ -796,31 +1001,19 @@ async def _login_via_playwright(
     return (jar, pw_cookies)
 
 
-def _build_login_from_playwright_cookies(email: str,
-                                         pw_cookies: list[dict]) -> Any:
-    """Best-effort: construct a fresh AlexaLogin and inject the
-    Playwright-captured cookies into its aiohttp session so the
-    immediate `_fetch_devices_async()` call has a populated jar.
-
-    Returns None if alexapy isn't installed or the injection fails —
-    the wizard then completes without an in-process device fetch, but
-    the cookie pickle is still cached so future runs can re-use it via
-    `_restore_login_from_cookie()`."""
-    alexapy = _alexapy()
-    if alexapy is None:
-        return None
-    login = _construct_login(email, "")
-    if login is None:
-        return None
+def _inject_pw_cookies(login: Any, pw_cookies: list[dict]) -> bool:
+    """Copy Playwright-captured cookies into `login`'s aiohttp cookie jar.
+    True when the jar was reachable (individual bad cookies are skipped);
+    False if the session / jar is missing or injection blew up."""
     try:
         from http.cookies import SimpleCookie
         from yarl import URL as YURL
         session = getattr(login, "_session", None) or getattr(login, "session", None)
         if session is None:
-            return None
+            return False
         jar = getattr(session, "cookie_jar", None)
         if jar is None:
-            return None
+            return False
         for c in pw_cookies:
             try:
                 name = c.get("name") or ""
@@ -843,7 +1036,29 @@ def _build_login_from_playwright_cookies(email: str,
             except Exception:
                 continue
     except Exception as e:
-        print(f"  [sh-discover] Cookie injection into alexapy session failed: {e}")
+        print(f"  [sh-discover] Cookie injection into alexapy session failed: "
+              f"{_redact(e)}")
+        return False
+    return True
+
+
+def _build_login_from_playwright_cookies(email: str,
+                                         pw_cookies: list[dict]) -> Any:
+    """Best-effort: construct a fresh AlexaLogin and inject the
+    Playwright-captured cookies into its aiohttp session so the
+    immediate `_fetch_devices_async()` call has a populated jar.
+
+    Returns None if alexapy isn't installed or the injection fails —
+    the wizard then completes without an in-process device fetch, but
+    the cookie pickle is still cached so future runs can re-use it via
+    `_restore_login_from_cookie()`."""
+    alexapy = _alexapy()
+    if alexapy is None:
+        return None
+    login = _construct_login(email, "")
+    if login is None:
+        return None
+    if not _inject_pw_cookies(login, pw_cookies):
         return None
     return login
 
@@ -858,10 +1073,404 @@ class _PlaywrightLoginShim:
         self.status = {"login_successful": True, "playwright": True}
 
 
+# ── OAuth device-registration sign-in (2026-10-12) ──────────────────
+# WHY: the old fallback signed in through the RETIRED alexa.amazon.com web app
+# (assoc_handle=amzn_dp_project_dee). Amazon shut that app down, so the browser
+# only yielded plain www.amazon.com cookies with no Alexa csrf, alexapy's
+# login(cookies=...) then died with "'NoneType' object has no attribute
+# 'replace'" and the devices call bounced to /ap/signin: zero Alexa devices.
+#
+# NOW: the flow the Alexa phone app (and alexapy's own HA config-flow proxy)
+# uses. AlexaLogin(oauth_login=True).start_url is an /ap/register page tied to
+# a PKCE challenge + a device id. The owner signs in there (password, CAPTCHA,
+# 2FA all in the real browser; the password never touches JARVIS). Amazon then
+# redirects to /ap/maplanding?openid.oa2.authorization_code=<code>. We take
+# the code, set login.authorization_code, and run alexapy's own post-maplanding
+# sequence (AlexaLogin.test_loggedin): get_tokens (register this "device" with
+# the code + code_verifier -> access / refresh token + mac_dms) ->
+# register_capabilities -> exchange_token_for_cookies -> get_csrf -> identity
+# check -> finalize_login (status login_successful). The refresh token is then
+# persisted to data/alexa_oauth.json so the owner signs in ONCE: later runs
+# restore from it with no browser.
+_OAUTH_SIGNIN_TIMEOUT_S = 300.0     # 5 min: password + CAPTCHA + 2FA
+# AlexaLogin only runs its "signed-in email == this email" check when the
+# identity contains an '@'. We never ask for the email (the owner types it into
+# Amazon's own page), so use a label without one: the check is skipped and a
+# mistyped / different-from-expected address can't fail the sign-in.
+_OAUTH_IDENTITY = "jarvis-owner"
+_OAUTH_CODE_PARAM = "openid.oa2.authorization_code"
+_MAPLANDING_PATH = "/ap/maplanding"
+# The login attributes AlexaLogin(oauth=...) restores (alexalogin.py __init__).
+_OAUTH_RESTORE_KEYS = ("access_token", "refresh_token", "mac_dms", "expires_in",
+                       "code_verifier", "code_challenge", "authorization_code")
+_REAUTH_HINT = "python -m skills.smart_home_discover reauth"
+
+
+def _oauth_path() -> str:
+    """Where the OAuth material lives; follows the CURRENT _DATA_DIR."""
+    return os.path.join(_DATA_DIR, _OAUTH_FILE_NAME)
+
+
+def _save_oauth(login: Any, identity: str = _OAUTH_IDENTITY) -> bool:
+    """Persist everything AlexaLogin needs to restore a registered device.
+    Never prints a value. Returns False (and writes nothing) when the login
+    holds no refresh token, i.e. there is nothing restorable."""
+    refresh = getattr(login, "refresh_token", None)
+    if not refresh:
+        return False
+    rec: dict[str, Any] = {
+        "version": 1,
+        "identity": identity,
+        "saved_at": time.time(),
+        "saved_at_iso": datetime.datetime.now(datetime.timezone.utc)
+                        .replace(tzinfo=None).isoformat() + "Z",
+        "uuid": getattr(login, "uuid", None),
+        "deviceid": getattr(login, "deviceid", None),
+    }
+    for key in _OAUTH_RESTORE_KEYS:
+        val = getattr(login, key, None)
+        if val is not None:
+            rec[key] = val
+    try:
+        _atomic_write_json(_oauth_path(), rec)
+    except Exception as e:
+        print(f"  [sh-discover] could not save the Alexa sign-in: {_redact(e)}")
+        return False
+    return True
+
+
+def _load_oauth() -> dict | None:
+    """The saved OAuth record, or None when absent / unreadable / unusable
+    (no refresh token)."""
+    path = _oauth_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(rec, dict):
+        return None
+    if not isinstance(rec.get("refresh_token"), str) or not rec["refresh_token"]:
+        return None
+    return rec
+
+
+def _authorized_amazon_url(url: str) -> urllib.parse.SplitResult | None:
+    """Parsed `url` iff it is an https amazon.com page (the only place the
+    OAuth redirect may come from), else None."""
+    try:
+        u = urllib.parse.urlsplit(str(url or ""))
+        host = (u.hostname or "").lower()
+        if u.scheme == "https" and (host == "amazon.com"
+                                    or host.endswith(".amazon.com")):
+            return u
+    except Exception:
+        pass
+    return None
+
+
+def _authorization_code_from_url(url: str) -> str | None:
+    """The `openid.oa2.authorization_code` carried by an amazon.com URL, or
+    None. Host-checked so a page we don't trust can't feed us a code."""
+    u = _authorized_amazon_url(url)
+    if u is None:
+        return None
+    vals = urllib.parse.parse_qs(u.query).get(_OAUTH_CODE_PARAM) or []
+    code = (vals[0] if vals else "").strip()
+    if not code or len(code) > 2048 or re.search(r"\s", code):
+        return None
+    return code
+
+
+def _is_maplanding_url(url: str) -> bool:
+    u = _authorized_amazon_url(url)
+    return u is not None and u.path.rstrip("/") == _MAPLANDING_PATH
+
+
+async def _close_login(login: Any) -> None:
+    """Release the login's aiohttp connector. Never raises."""
+    close = getattr(login, "close", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except Exception:
+        pass
+
+
+async def _browser_oauth_code(
+    start_url: str,
+    timeout_seconds: float = _OAUTH_SIGNIN_TIMEOUT_S,
+) -> tuple[str, list[dict]] | None:
+    """Open a HEADED browser at the OAuth `start_url` and wait for Amazon's
+    redirect to /ap/maplanding. Returns (authorization_code, browser_cookies)
+    or None on every failure: Playwright missing, no launchable browser, page
+    won't load, timeout, window closed first, or a landing without a code
+    (sign-in cancelled / refused). Every outcome prints a plain reason; the
+    code and cookies are never printed."""
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        print(f"  [sh-discover] Playwright not available ({e}); install "
+              "with `pip install playwright` to sign in.")
+        return None
+
+    print()
+    print("  [sh-discover] Opening a browser window so you can sign in to Amazon.")
+    print("                Sign in normally (password, CAPTCHA, 2FA); JARVIS")
+    print("                never sees your password. When Amazon finishes it")
+    print("                lands on a mostly-blank page and this window closes.")
+    print(f"                Timeout: {int(timeout_seconds)}s.")
+    print()
+
+    seen: dict[str, Any] = {"code": None, "landed": False}
+
+    def _see(url: str) -> None:
+        if seen["code"]:
+            return
+        code = _authorization_code_from_url(url)
+        if code:
+            seen["code"] = code
+        elif _is_maplanding_url(url):
+            seen["landed"] = True
+
+    reason = "timeout"
+    pw_cookies: list[dict] = []
+    try:
+        async with async_playwright() as pw:
+            browser = await _launch_headed_browser(pw)
+            if browser is None:
+                return None
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+                # Catch the redirect from navigation events too, not only the
+                # poll below: maplanding is a transit page and a slow poll
+                # could otherwise miss the URL that carries the code.
+                for evt, attr in (("framenavigated", "url"), ("request", "url")):
+                    try:
+                        page.on(evt, lambda obj, _a=attr: _see(
+                            str(getattr(obj, _a, "") or "")))
+                    except Exception:
+                        pass
+                try:
+                    await page.goto(start_url)
+                except Exception as e:
+                    if not seen["code"]:
+                        print("  [sh-discover] Failed to load the Amazon "
+                              f"sign-in page: {_redact(e)}")
+                        return None
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + timeout_seconds
+                while True:
+                    try:
+                        _see(page.url or "")
+                    except Exception:
+                        pass
+                    if seen["code"]:
+                        reason = "ok"
+                        break
+                    if seen["landed"]:
+                        reason = "landed_without_code"
+                        break
+                    try:
+                        closed = bool(page.is_closed())
+                    except Exception:
+                        closed = True
+                    if closed:
+                        reason = "closed"
+                        break
+                    if loop.time() > deadline:
+                        reason = "timeout"
+                        break
+                    await asyncio.sleep(1.0)
+                if reason == "ok":
+                    try:
+                        pw_cookies = await context.cookies()
+                    except Exception:
+                        pw_cookies = []
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        if not seen["code"]:
+            print(f"  [sh-discover] Browser sign-in failed: {_redact(e)}")
+            return None
+        reason = "ok"
+    if reason == "ok" and seen["code"]:
+        print("  [sh-discover] Amazon sign-in finished; registering this "
+              "JARVIS as an Alexa device.")
+        return (seen["code"], list(pw_cookies or []))
+    msgs = {
+        "timeout": "Sign-in timed out before Amazon finished.",
+        "closed": ("The sign-in window was closed before Amazon finished; "
+                   "nothing was saved."),
+        "landed_without_code": ("Amazon ended the sign-in without granting "
+                                "access (cancelled or refused); nothing was "
+                                "saved."),
+    }
+    print("  [sh-discover] " + msgs.get(reason, "Sign-in did not complete."))
+    return None
+
+
+async def _complete_oauth_login(login: Any,
+                                pw_cookies: list[dict] | None = None) -> bool:
+    """Run alexapy's own post-maplanding sequence on a login whose
+    `authorization_code` is set. AlexaLogin.test_loggedin() is that sequence:
+    get_tokens -> register_capabilities -> exchange_token_for_cookies ->
+    get_csrf -> /api/users/me identity check -> check_domain ->
+    finalize_login. True only when it succeeded AND the login reports
+    login_successful."""
+    if pw_cookies:
+        # alexapy's own proxy flow copies the browser's cookies into the
+        # login session before registering; mirror it (best-effort).
+        _inject_pw_cookies(login, pw_cookies)
+    try:
+        ok = bool(await login.test_loggedin())
+    except Exception as e:
+        print(f"  [sh-discover] Alexa device registration raised: {_redact(e)}")
+        return False
+    status = dict(getattr(login, "status", None) or {})
+    if ok and status.get("login_successful"):
+        return True
+    if not getattr(login, "refresh_token", None):
+        print("  [sh-discover] Amazon did not register the device "
+              "(no refresh token came back).")
+    else:
+        print("  [sh-discover] Registered, but the Alexa session could not be "
+              "verified.")
+    return False
+
+
+async def _oauth_refresh_session(login: Any) -> bool:
+    """Rebuild a working session from a restored refresh token: refresh the
+    access token, exchange the refresh token for fresh Alexa cookies, find the
+    csrf cookie, and mark the login successful. The first two are required;
+    a missing csrf only costs write calls, not the device listing."""
+    if not getattr(login, "refresh_token", None):
+        return False
+    if not await login.refresh_access_token():
+        print("  [sh-discover] Amazon refused the saved sign-in (token "
+              "refresh failed).")
+        return False
+    if not await login.exchange_token_for_cookies():
+        print("  [sh-discover] Amazon would not exchange the saved sign-in "
+              "for session cookies.")
+        return False
+    try:
+        csrf_ok = bool(await login.get_csrf())
+    except Exception:
+        csrf_ok = False
+    if not csrf_ok:
+        print("  [sh-discover] No Alexa csrf token found; device listing may "
+              "still work, controlling devices may not.")
+    fin = getattr(login, "finalize_login", None)
+    try:
+        if fin is None:
+            raise AttributeError("finalize_login")
+        await fin()
+    except Exception:
+        login.status = {"login_successful": True}
+    if not dict(getattr(login, "status", None) or {}).get("login_successful"):
+        login.status = {"login_successful": True}
+    return True
+
+
+async def _oauth_restore_and_fetch_async() -> dict | None:
+    """Restore the saved OAuth sign-in and fetch the device catalog, all in
+    ONE running event loop (the Python 3.14 rule; see
+    _restore_and_fetch_async). Returns the raw device dict, or None when there
+    is no saved sign-in or Amazon refused it (the caller then falls back to
+    the legacy cookie pickle, then to a browser sign-in). Never deletes the
+    saved file: a transient network failure must not cost the owner his
+    sign-in."""
+    if _alexapy() is None:
+        return None
+    rec = _load_oauth()
+    if rec is None:
+        return None
+    identity = rec.get("identity") or _OAUTH_IDENTITY
+    oauth = {k: rec[k] for k in _OAUTH_RESTORE_KEYS if rec.get(k) is not None}
+    login = _construct_login(identity, "", oauth=oauth,
+                             uuid=rec.get("uuid"), oauth_login=True)
+    if login is None:
+        return None
+    try:
+        if not await _oauth_refresh_session(login):
+            return None
+        _save_oauth(login, identity)        # the access token / expiry moved
+        return await _fetch_devices_async(login)
+    except Exception as e:
+        print(f"  [sh-discover] saved Alexa sign-in failed: {_redact(e)}")
+        return None
+    finally:
+        await _close_login(login)
+
+
+async def _oauth_signin_and_fetch_async(
+    timeout_seconds: float = _OAUTH_SIGNIN_TIMEOUT_S,
+) -> dict | None:
+    """Interactive first sign-in: browser -> authorization code -> device
+    registration -> persist -> fetch devices, ALL in one running event loop.
+    Returns the raw device dict, or None if the owner didn't finish (or
+    Amazon refused)."""
+    if _alexapy() is None:
+        return None
+    login = _construct_login(_OAUTH_IDENTITY, "", oauth_login=True)
+    if login is None:
+        return None
+    try:
+        got = await _browser_oauth_code(str(login.start_url), timeout_seconds)
+        if got is None:
+            return None
+        code, pw_cookies = got
+        login.authorization_code = code
+        if not await _complete_oauth_login(login, pw_cookies):
+            return None
+        if _save_oauth(login):
+            print("  [sh-discover] Saved the Alexa sign-in to "
+                  f"data/{_OAUTH_FILE_NAME} - you will not need to sign "
+                  "in again.")
+        return await _fetch_devices_async(login)
+    except Exception as e:
+        print(f"  [sh-discover] Alexa sign-in failed: {_redact(e)}")
+        return None
+    finally:
+        await _close_login(login)
+
+
+async def _restore_any_and_fetch_async() -> dict | None:
+    """Cached-sign-in restore in priority order: (1) the OAuth refresh token
+    (data/alexa_oauth.json), then (2) the legacy cookie pickle. None when
+    neither is usable."""
+    if _load_oauth() is not None:
+        try:
+            devices = await _oauth_restore_and_fetch_async()
+        except Exception as e:
+            print(f"  [sh-discover] saved Alexa sign-in failed: {_redact(e)}")
+            devices = None
+        if devices is not None:
+            return devices
+    return await _restore_and_fetch_async()
+
+
 async def _fetch_devices_async(login: Any) -> dict:
     """Best-effort fetch of every device list alexapy exposes. Each call
     is wrapped individually because alexapy's API surface drifts and an
-    older install may be missing one of these methods."""
+    older install may be missing one of these methods.
+
+    Smart-home appliances (lights, fans, plugs, thermostats, cameras, ...)
+    come from `AlexaAPI.get_network_details` (alexapy >= 1.29: the Alexa
+    GraphQL `endpoints` list, one `legacyAppliance` dict each - applianceId,
+    entityId, friendlyName, manufacturerName, modelName, capabilities,
+    applianceTypes). `get_devices` is ONLY the Echo / Fire TV hardware list:
+    the pre-2026-10-12 code looked for get_smarthome_devices / get_appliances,
+    which no alexapy has ever shipped, so the smart-home list was always empty.
+    The old names stay as fallbacks for other alexapy builds."""
     alexapy = _alexapy()
     if alexapy is None or login is None:
         return {}
@@ -872,21 +1481,39 @@ async def _fetch_devices_async(login: Any) -> dict:
         if hasattr(AlexaAPI, "get_devices"):
             out["echo"] = await AlexaAPI.get_devices(login) or []
     except Exception as e:
-        print(f"  [sh-discover] get_devices failed: {e}")
-    try:
-        if hasattr(AlexaAPI, "get_smarthome_devices"):
-            out["smarthome"] = await AlexaAPI.get_smarthome_devices(login) or []
-        elif hasattr(AlexaAPI, "get_appliances"):
-            out["smarthome"] = await AlexaAPI.get_appliances(login) or []
-    except Exception as e:
-        print(f"  [sh-discover] get_smarthome_devices failed: {e}")
+        print(f"  [sh-discover] get_devices failed: {_redact(e)}")
+    for name in ("get_network_details", "get_smarthome_devices",
+                 "get_appliances"):
+        fn = getattr(AlexaAPI, name, None)
+        if not callable(fn):
+            continue
+        try:
+            got = await fn(login) or []
+        except Exception as e:
+            print(f"  [sh-discover] {name} failed: {_redact(e)}")
+            continue
+        if got:
+            out["smarthome"] = got
+            break
+    if not out["smarthome"] and callable(getattr(AlexaAPI, "get_devices_gql", None)):
+        # get_network_details is get_devices_gql + unwrapping `legacyAppliance`;
+        # try the raw query if only the wrapper failed.
+        try:
+            raw = await AlexaAPI.get_devices_gql(login) or []
+            out["smarthome"] = [
+                el["legacyAppliance"] for el in raw
+                if isinstance(el, dict)
+                and isinstance(el.get("legacyAppliance"), dict)]
+        except Exception as e:
+            print(f"  [sh-discover] get_devices_gql failed: {_redact(e)}")
+    # alexapy has no smart-home GROUP listing; kept for builds that do.
     try:
         if hasattr(AlexaAPI, "get_smarthome_groups"):
             out["groups"] = await AlexaAPI.get_smarthome_groups(login) or []
         elif hasattr(AlexaAPI, "get_groups"):
             out["groups"] = await AlexaAPI.get_groups(login) or []
     except Exception as e:
-        print(f"  [sh-discover] get_smarthome_groups failed: {e}")
+        print(f"  [sh-discover] get_smarthome_groups failed: {_redact(e)}")
     return out
 
 
@@ -937,6 +1564,15 @@ def _entity_type(caps: list[str], brand: str, entity: dict) -> str:
         return "camera"
     if "scene" in caps:
         return "scene"
+    # Amazon's own appliance classification (GraphQL `legacyAppliance`) beats
+    # the brand guess below: a SmartLife FAN has the same on/off capability as
+    # a plug but must not be filed as one.
+    atypes = [str(t).upper() for t in (entity.get("applianceTypes") or [])
+              if isinstance(t, str)]
+    for amazon_type, our_type in (("LIGHT", "light"), ("FAN", "fan"),
+                                  ("SMARTPLUG", "plug")):
+        if amazon_type in atypes:
+            return our_type
     lighty = any(t in caps for t in ("color", "color_temperature", "dim"))
     if lighty:
         return "light"
@@ -949,6 +1585,14 @@ def _entity_type(caps: list[str], brand: str, entity: dict) -> str:
     cats = entity.get("displayCategories")
     if isinstance(cats, list) and cats:
         return str(cats[0]).lower()
+    # GraphQL `legacyAppliance` rows (alexapy get_network_details) carry
+    # applianceTypes instead, e.g. ["LIGHT"] or ["ALEXA_VOICE_ENABLED"].
+    types = entity.get("applianceTypes")
+    if isinstance(types, list):
+        for t in types:
+            t = str(t).lower()
+            if t and t not in ("alexa_voice_enabled", "other"):
+                return t
     return "unknown"
 
 
@@ -1133,7 +1777,7 @@ def _alexa_status_from_devices(devices: dict | None) -> dict:
         return {"ok": True, "count": n}
     return {"ok": False, "count": 0, "console": True,
             "error": ("the device fetch returned no devices — the cached "
-                      "cookie may be expired")}
+                      "Amazon sign-in may be expired")}
 
 
 def _dedupe_key(rec: dict) -> tuple[str, str]:
@@ -1375,11 +2019,13 @@ def _alexa_voice_phase(force_refresh: bool) -> tuple[dict | None, dict]:
                       "error": ("alexapy is not installed — Alexa discovery "
                                 "is offline (pip install alexapy)")}
     meta = _load_cookie_meta()
-    if not meta or not os.path.exists(_COOKIE_PICKLE_PATH):
+    if (_load_oauth() is None
+            and (not meta or not os.path.exists(_COOKIE_PICKLE_PATH))):
         return None, {"ok": False, "count": 0, "console": True,
                       "error": "no cached Amazon sign-in"}
     try:
-        devices = _run_async(_restore_and_fetch_async(),
+        # OAuth refresh token first, legacy cookie pickle second.
+        devices = _run_async(_restore_any_and_fetch_async(),
                              timeout=_DISCOVERY_TIMEOUT_SEC)
     except TimeoutError:
         # 2026-07-08: a stalled Amazon endpoint must not wedge the voice
@@ -1387,9 +2033,10 @@ def _alexa_voice_phase(force_refresh: bool) -> tuple[dict | None, dict]:
         return None, {"ok": False, "count": 0, "console": False,
                       "error": "timed out talking to Amazon"}
     except Exception as e:
-        print(f"  [sh-discover] fetch traceback:\n{traceback.format_exc()}")
+        print(f"  [sh-discover] fetch traceback:\n"
+              f"{_redact(traceback.format_exc())}")
         return None, {"ok": False, "count": 0, "console": False,
-                      "error": f"the device fetch failed ({e})"}
+                      "error": f"the device fetch failed ({_redact(e)})"}
     if devices is None:
         return None, {"ok": False, "count": 0, "console": True,
                       "error": "the cached sign-in was unusable"}
@@ -1556,7 +2203,7 @@ async def _restore_and_fetch_async() -> dict | None:
         # Older alexapy: login() has no cookies kwarg.
         pass
     except Exception as e:
-        print(f"  [sh-discover] cookie login() failed: {e}")
+        print(f"  [sh-discover] cookie login() failed: {_redact(e)}")
     if not authed:
         for attr in ("_cookies", "cookies"):
             if hasattr(login, attr):
@@ -1576,103 +2223,69 @@ async def _restore_and_fetch_async() -> dict | None:
     return await _fetch_devices_async(login)
 
 
+def _devices_usable(devices: dict | None) -> bool:
+    """A restored sign-in only counts if the fetch actually returned
+    something. alexapy swallows a dead session into empty lists, and an empty
+    dict must not be mistaken for "signed in, zero devices" - that would skip
+    the browser sign-in the owner needs."""
+    if not isinstance(devices, dict):
+        return False
+    return bool(devices.get("smarthome") or devices.get("echo"))
+
+
 def _wizard_alexa_phase(force_refresh: bool) -> tuple[dict | None, dict]:
-    """Interactive-console Alexa phase of the wizard: cached-cookie reuse,
-    else credential prompt + alexapy login + Playwright fallback. Returns
-    (devices_or_None, status) and NEVER aborts the wizard — a cancelled or
-    failed Amazon sign-in is recorded honestly so the LAN phase still runs
-    and the CLI wizard can land a LAN-only catalog."""
-    login = None
+    """Interactive-console Alexa phase of the wizard. Order (2026-10-12):
+
+      1. saved OAuth refresh token (data/alexa_oauth.json) - no browser,
+      2. legacy cookie pickle (data/alexa_cookie.pickle) - kept as a fallback,
+      3. BROWSER sign-in through Amazon's phone-app OAuth page (the only way
+         to get a first / new sign-in; replaces the retired alexa.amazon.com
+         web sign-in and the email+password prompt, which Amazon's current
+         login no longer lets alexapy drive).
+
+    `force_refresh` (the `reauth` CLI word) skips 1 and 2. Returns
+    (devices_or_None, status) and NEVER aborts the wizard: a cancelled or
+    failed Amazon sign-in is recorded honestly so the LAN phase still runs and
+    the CLI wizard can land a LAN-only catalog."""
     devices = None
     meta = _load_cookie_meta()
-    if meta and not force_refresh:
-        if _cookie_is_stale(meta):
+    if not force_refresh and (_load_oauth() is not None or meta):
+        if meta and _load_oauth() is None and _cookie_is_stale(meta):
             age = int((time.time() - meta.get("saved_at", 0)) / 86400)
             print(f"  [sh-discover] cached cookie is {age} days old "
                   "— a refresh may be needed soon.")
-        # Build the login AND fetch the catalog in ONE event loop (Py3.14
-        # needs the alexapy/aiohttp session created + used on the same
-        # running loop). This reuses the cached cookie — no re-sign-in.
+        # Restore AND fetch in ONE event loop (Py3.14: the alexapy / aiohttp
+        # session must be created and used on the same running loop).
         try:
-            devices = _run_async(_restore_and_fetch_async())
+            devices = _run_async(_restore_any_and_fetch_async(),
+                                 timeout=_DISCOVERY_TIMEOUT_SEC * 2)
         except Exception as e:
-            print(f"  [sh-discover] cached-cookie fetch failed: {e}")
+            print(f"  [sh-discover] cached sign-in failed: {_redact(e)}")
+            devices = None
+        if devices is not None and not _devices_usable(devices):
+            print("  [sh-discover] The cached Amazon sign-in came back with "
+                  "no devices; a fresh sign-in is needed.")
             devices = None
         if devices is not None:
             print("  [sh-discover] Reused cached Amazon login — no fresh "
                   "sign-in needed.")
 
-    creds_email = (meta or {}).get("email", "")
     if devices is None:
-        creds = _prompt_credentials()
-        if creds is None:
-            return None, {"ok": False, "count": 0, "console": False,
-                          "error": ("Amazon sign-in cancelled — no "
-                                    "credentials provided")}
-        creds_email = creds[0]
-        used_playwright = False
         try:
-            login = _run_async(_login_async(*creds))
-        except _LoginNeedsPlaywright:
-            # alexapy 1.29.22 can't parse Amazon's current login
-            # response. Drive Chromium directly so the user can sign
-            # in and we can capture the session cookies.
-            pw_result = _run_async(_login_via_playwright(creds_email))
-            if pw_result is None:
-                return None, {"ok": False, "count": 0, "console": False,
-                              "error": ("Amazon sign-in did not complete "
-                                        "(Playwright fallback unavailable "
-                                        "or cancelled)")}
-            jar, raw_pw_cookies = pw_result
-            shim = _PlaywrightLoginShim(creds_email, jar)
-            try:
-                _save_cookie_meta(creds_email, dict(shim.status), jar)
-            except Exception as e:
-                print(f"  [sh-discover] cookie save failed: {e}")
-            used_playwright = True
-            # The cookie pickle is now saved — enumerate via the SAME
-            # single-loop path the cached case uses (construct + login +
-            # fetch all inside one event loop). Avoids the old
-            # "no running event loop" failure from building the AlexaLogin
-            # outside a loop, so the user gets devices immediately instead
-            # of a "please re-run" message.
-            try:
-                devices = _run_async(_restore_and_fetch_async())
-            except Exception as e:
-                print(f"  [sh-discover] post-signin fetch failed: {e}")
-                devices = None
-            login = None
+            devices = _run_async(
+                _oauth_signin_and_fetch_async(),
+                timeout=_OAUTH_SIGNIN_TIMEOUT_S + 120.0)
         except Exception as e:
-            print(f"  [sh-discover] login traceback:\n{traceback.format_exc()}")
+            print(f"  [sh-discover] sign-in traceback:\n"
+                  f"{_redact(traceback.format_exc())}")
             return None, {"ok": False, "count": 0, "console": False,
-                          "error": f"failed during sign-in ({e})"}
-        if used_playwright and devices is None:
+                          "error": f"failed during sign-in ({_redact(e)})"}
+        if devices is None:
             return None, {"ok": False, "count": 0, "console": False,
-                          "error": ("the device fetch came back empty after "
-                                    "sign-in — the cached Alexa cookie may "
-                                    "not be scoped correctly (cookies at "
-                                    + os.path.relpath(_COOKIE_JSON_PATH,
-                                                      _PROJECT_DIR) + ")")}
-        if login is None and not used_playwright:
-            return None, {"ok": False, "count": 0, "console": False,
-                          "error": "Amazon sign-in did not complete"}
-        if not used_playwright:
-            try:
-                jar = _extract_cookie_jar(login)
-                _save_cookie_meta(creds_email,
-                                  dict(login.status or {}), jar)
-            except Exception as e:
-                print(f"  [sh-discover] cookie save failed: {e}")
-
-    if devices is None:
-        # Fresh sign-in path only — the cached path already fetched above.
-        print("  [sh-discover] Signed in. Enumerating devices.")
-        try:
-            devices = _run_async(_fetch_devices_async(login))
-        except Exception as e:
-            print(f"  [sh-discover] fetch traceback:\n{traceback.format_exc()}")
-            return None, {"ok": False, "count": 0, "console": False,
-                          "error": f"failed during device fetch ({e})"}
+                          "error": ("Amazon sign-in did not complete "
+                                    "(cancelled, timed out, or no browser "
+                                    "available) - re-run `" + _REAUTH_HINT
+                                    + "` to try again")}
     return devices, _alexa_status_from_devices(devices)
 
 
@@ -1736,10 +2349,10 @@ def smart_home_catalog(_: str = "") -> str:
 
 
 def smart_home_purge_cookie(_: str = "") -> str:
-    """Remove the cached Alexa cookie so the next wizard run does a
-    fresh interactive sign-in."""
+    """Remove the cached Alexa sign-in (OAuth refresh token + legacy cookie)
+    so the next wizard run does a fresh interactive browser sign-in."""
     removed = 0
-    for p in (_COOKIE_JSON_PATH, _COOKIE_PICKLE_PATH):
+    for p in (_COOKIE_JSON_PATH, _COOKIE_PICKLE_PATH, _oauth_path()):
         try:
             if os.path.exists(p):
                 os.unlink(p)
