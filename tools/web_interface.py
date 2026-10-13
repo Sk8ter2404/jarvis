@@ -1200,6 +1200,12 @@ def _status_flags(hud: dict) -> dict:
         # boot): JARVIS answers but remembers nothing. None = not published.
         "guest_mode": (bool(hud["guest_mode"])
                        if "guest_mode" in hud else None),
+        # Screen memory / screen comments as the running loop has them
+        # (published on every start / stop / flip). None = not published.
+        "screen_memory": (bool(hud["screen_memory"])
+                          if "screen_memory" in hud else None),
+        "screen_remarks": (bool(hud["screen_remarks"])
+                           if "screen_remarks" in hud else None),
     }
 
 
@@ -1396,7 +1402,9 @@ TRAY_WEB_COMMANDS = ("force_wake", "enter_standby", "mute_tts_toggle",
                      "guest_mode_on", "guest_mode_off",
                      # Screen memory (2026-10-05): on/off for this run, and
                      # "pause 15 minutes" (core.screen_memory).
-                     "screen_memory_toggle", "screen_memory_pause")
+                     "screen_memory_toggle", "screen_memory_pause",
+                     # Screen comments (2026-10-12): the remark switch.
+                     "screen_remarks_toggle")
 _TRAY_CONFIRM = frozenset({"restart"})
 DEFAULT_TRAY_COMMANDS_PATH = os.path.join(PROJECT_DIR, "tray_commands.json")
 
@@ -2219,9 +2227,17 @@ PROACTIVE_FEATURES = (
              "of window titles, page addresses and page text, read when the "
              "screen changes",
      "applies": "restart",
-     "how": "started at boot; 'stop watching' / 'you can watch again', the "
-            "tray, or ambient_screen_start / ambient_screen_stop switch it "
-            "now"},
+     "how": "started at boot; 'stop watching' / 'start watching', the "
+            "tray, the dashboard button, or ambient_screen_start / "
+            "ambient_screen_stop switch it now"},
+    {"key": "SCREEN_REMARKS_ENABLED", "name": "Screen comments",
+     "what": "With screen memory on, at most one short dry remark per 15 "
+             "minutes about a video you just started, built only from the "
+             "title JARVIS actually read; never in calls, games, private "
+             "pages or while anyone is speaking",
+     "applies": "restart",
+     "how": "read live by the watcher; 'stop commenting' / 'start "
+            "commenting', the tray or the dashboard button switch it now"},
     {"key": "AMBIENT_SCREEN_VLM_ENABLED", "name": "Screen descriptions (AI)",
      "what": "The older screen watcher: on every changed minute it asks the "
              "local vision model (the brain's GPU) to describe the screen",
@@ -4568,6 +4584,8 @@ const CONTROLS = [
   {cmd:'mute_tts_toggle',      label:(s) => (s && s.tts_muted) ? 'Unmute voice' : 'Mute voice', on:(s) => s && s.tts_muted},
   {cmd:'mic_mute_toggle',      label:(s) => (s && s.mic_muted) ? 'Unmute mic' : 'Mute mic', on:(s) => s && s.mic_muted},
   {cmd:'pause_daemons_toggle', label:(s) => (s && s.daemons_paused) ? 'Resume daemons' : 'Pause daemons', on:(s) => s && s.daemons_paused},
+  {cmd:'screen_memory_toggle', label:(s) => (s && s.screen_memory) ? 'Screen memory: on' : 'Screen memory: off', on:(s) => s && s.screen_memory, show:(s) => !s || s.screen_memory !== null},
+  {cmd:'screen_remarks_toggle', label:(s) => (s && s.screen_remarks) ? 'Screen comments: on' : 'Screen comments: off', on:(s) => s && s.screen_remarks, show:(s) => !s || s.screen_remarks !== null},
   {cmd:'guest_mode_on',        label:() => 'Guest mode', show:(s) => !s || !s.guest_mode},
   {cmd:'guest_mode_off',       label:() => 'End guest mode', on:() => true, show:(s) => s && s.guest_mode},
   {cmd:'restart',              label:() => 'Restart JARVIS', danger:true,

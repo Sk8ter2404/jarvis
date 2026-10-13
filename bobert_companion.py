@@ -5496,6 +5496,9 @@ def _screen_memory_tray(cmd: str, entry: dict) -> str:
             on = False
         else:
             on = _sw.start()
+        # The switch is the setting (2026-10-12): saved, so it survives a
+        # restart and the Settings window shows the truth.
+        _persist_screen_setting("AMBIENT_SCREEN_ENABLED", bool(on))
         return ("Screen memory on, sir - text only." if on
                 else "Screen memory off, sir.")
     except Exception as _e:
@@ -5678,6 +5681,12 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         # Screen memory (core.screen_memory, 2026-10-05): on/off for this run
         # and "pause 15 min" - text only, no AI calls.
         result = _screen_memory_tray(cmd, entry)
+        _publish_tray_result(str(entry.get("rid") or ""), cmd, result)
+        print(f"  [tray] {cmd} -> {result}")
+    elif cmd == "screen_remarks_toggle":
+        # Screen comments (core.screen_remarks, 2026-10-12): the same flip as
+        # "stop / start commenting" - live, saved, and published to the HUD.
+        result = _screen_remarks_tray(cmd)
         _publish_tray_result(str(entry.get("rid") or ""), cmd, result)
         print(f"  [tray] {cmd} -> {result}")
     elif cmd == "mic_mute_toggle":
@@ -32847,6 +32856,96 @@ def _publish_screen_memory_state(on) -> None:
         pass
 
 
+def _publish_screen_remarks_state(on) -> None:
+    """hud_state.screen_remarks for the tray / dashboard checkmark. Never
+    raises."""
+    try:
+        _write_hud_state(screen_remarks=bool(on))
+    except Exception:
+        pass
+
+
+def _screen_remark_busy() -> str:
+    """Why JARVIS must not volunteer a screen remark right now ("" = a good
+    moment). Called from the screen-remarks thread: plain reads of the loop's
+    flags only, never a lock. Never raises (a failure holds the remark)."""
+    try:
+        label = str(_current_state_label[0] or "").lower()
+        if label == "listening":          # recording the owner's speech
+            return "the owner is speaking"
+        if label in ("speaking", "thinking"):
+            return f"JARVIS is {label}"
+        if _sleep_mode[0] or _standby_mode[0] or label in ("standby", "sleep"):
+            return "standby"
+        if _mic_muted[0]:
+            return "the mic is muted"
+        if _tts_muted[0]:
+            return "the voice is muted"
+        if _guest_mode.is_on():
+            return "guest mode is on"
+        if _turn_in_progress[0] or _utterance_in_progress[0]:
+            return "the owner is speaking"
+        if _dialogue_active[0] or _speech_hold_active():
+            return "a dialogue is open"
+        if _pending_confirmation or _open_offer_pending():
+            return "a question is waiting"
+        if focus_mode_active():
+            return "focus mode"
+        if time.monotonic() - float(_last_owner_turn_at[0] or 0.0) < 20.0                 and _last_owner_turn_at[0]:
+            return "the owner just spoke"
+        if _voice_mood_response is not None:
+            with _memory_lock:
+                if _voice_mood_response.is_stress_suppression_active(
+                        load_memory()):
+                    return "the owner sounds stressed"
+        return ""
+    except Exception:
+        return "state check failed"
+
+
+def _screen_remark_llm(addendum: str, user: str) -> str:
+    """One local-brain call for a screen remark: the compact cache-stable
+    system prompt the owner's own turns use (the persona), plus the remark
+    instructions. Waits behind the owner's conversation like every other
+    background one-shot. Never raises ("" on failure)."""
+    try:
+        base = _system_prompt
+        if _llm_quick_goes_local():
+            base = _local_stable_system_prompt(base) or base
+        with _lt.background_work("screen-remark"):
+            return _llm_quick(system=base + addendum, user=user,
+                              max_tokens=80) or ""
+    except Exception as _e:
+        print(f"  [screen-remark] generation failed: {type(_e).__name__}")
+        return ""
+
+
+def _screen_remark_announce(text: str) -> bool:
+    """Queue the remark through the proactive speech queue (spoken at a turn
+    boundary, held while he is away or the room is talking, dropped quietly
+    if it goes stale)."""
+    return bool(proactive_announce(text, source="screen_remark"))
+
+
+def _persist_screen_setting(key: str, value) -> bool:
+    """Live config + user_settings.json for one screen toggle. Never
+    raises."""
+    try:
+        from core import screen_remarks as _sr
+        return _sr.persist_setting(key, value)
+    except Exception:
+        return False
+
+
+def _screen_remarks_tray(cmd: str) -> str:
+    """The tray / dashboard screen-comments switch. Never raises."""
+    try:
+        from core import screen_remarks as _sr
+        return _sr.set_enabled(not _sr.is_enabled())
+    except Exception as _e:
+        return f"Screen comments control failed: {type(_e).__name__}"
+
+
 def _screen_vision_boot() -> None:
     """Wire the screen-vision modules at boot. Never raises."""
     try:
@@ -32862,6 +32961,16 @@ def _screen_vision_boot() -> None:
         _sw.set_state_publisher(_publish_screen_memory_state)
     except Exception as _e:
         print(f"  [screen-vision] boot wiring failed: {_e}")
+    # Screen comments (2026-10-12, core/screen_remarks.py): an occasional
+    # grounded remark about the video he just started. Its own thread; it
+    # gates itself on SCREEN_REMARKS_ENABLED and on screen memory running.
+    try:
+        from core import screen_remarks as _sr
+        _sr.set_state_publisher(_publish_screen_remarks_state)
+        _sr.start(announce=_screen_remark_announce, llm=_screen_remark_llm,
+                  busy=_screen_remark_busy)
+    except Exception as _e:
+        print(f"  [screen-remark] boot wiring failed: {_e}")
 
 
 def _start_focus_tracker() -> None:

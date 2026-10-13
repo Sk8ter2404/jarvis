@@ -380,7 +380,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "SCREEN MEMORY": [
         "stop watching", "watch my screen", "watching my screen",
         "watch again", "are you watching", "screen memory", "don't watch",
-        "dont watch", "forget what you saw",
+        "dont watch", "forget what you saw", "start watching",
+        "stop commenting", "start commenting", "comment less",
+        "comment more", "screen comments",
         "what was i looking at", "what was i watching",
     ],
     # 2026-10-05: "tell Claude ..." - a note for the developer, never a web

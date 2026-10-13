@@ -3879,15 +3879,34 @@ def _act_note_for_claude(args: str = "") -> str:
 
 def _act_screen_memory(args: str = "") -> str:
     """screen_memory, pause [N] | unpause | status | exclude_this |
-    exclude <app> - the continuous screen memory's controls (core.
-    screen_memory)."""
+    exclude <app> | remarks off|on|less|more|status - the continuous screen
+    memory's controls (core.screen_memory) and its occasional comments (core.
+    screen_remarks)."""
     from core import screen_memory as _sw
     a = " ".join(str(args or "").split())
     low = a.lower()
+    if low.startswith("remarks"):
+        from core import screen_remarks as _sr
+        op = low[len("remarks"):].strip()
+        if op in ("off", "stop"):
+            return _sr.set_enabled(False)
+        if op in ("on", "start"):
+            return _sr.set_enabled(True)
+        if op in ("less", "more"):
+            return _sr.adjust_rate(op)
+        return _sr.status_line()
     m = re.match(r"^(?:pause|stop)(?:\s+(\d+(?:\.\d+)?))?", low)
     if m:
         return _sw.pause(float(m.group(1)) if m.group(1) else None)
     if low.startswith(("unpause", "resume", "start", "again", "on")):
+        # "start watching" also turns screen memory back ON when it was
+        # switched off (tray, Settings or voice), and saves that.
+        if not _sw.is_running():
+            from core import screen_remarks as _sr
+            if _sw.start():
+                _sr.persist_setting("AMBIENT_SCREEN_ENABLED", True)
+                return _sw.unpause()
+            return ("I can't start watching here, sir, but I've noted it.")
         return _sw.unpause()
     if low.startswith(("status", "are you")):
         return _sw.status_line()

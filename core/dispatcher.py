@@ -190,7 +190,9 @@ def youtube_play_route(utterance) -> str | None:
 #                                               -> click_on_screen, scene:previous
 #   * "tell Claude to ..." (a developer note)   -> note_for_claude, <note>
 #   * "stop watching (for N minutes)" / "don't watch this" / "you can watch
-#     again" / "are you watching?"              -> screen_memory, ...
+#     again" / "start watching" / "are you watching?" -> screen_memory, ...
+#   * "stop / start commenting", "comment less / more"
+#                                               -> screen_memory, remarks <op>
 #   * "forget the last hour of what you saw"    -> forget_screen, <span>
 #   * a WHOLE "click that X" / "play that X video" (no second command)
 #                                               -> click_on_screen, <X>
@@ -236,6 +238,9 @@ def screen_route(utterance, state=None) -> str | None:
         cmd = _or.screen_memory_command(utterance)
         if cmd:
             op = cmd["op"]
+            if op.startswith("remarks_"):
+                # Screen comments (core.screen_remarks): "stop commenting".
+                return f"[ACTION: screen_memory, remarks {op[8:]}]"
             bare = not re.search(r"\b(?:screens?|monitors?)\b",
                                  _or.clean(utterance), re.IGNORECASE)
             if op == "pause":

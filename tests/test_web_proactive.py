@@ -203,7 +203,8 @@ class RowTruthTests(unittest.TestCase):
                     if wi._proactive_settable(f, sw.SCHEMA)]
         # 18: + AMBIENT_SCREEN_VLM_ENABLED (2026-10-05, the old vision-model
         # screen loop split off AMBIENT_SCREEN_ENABLED / screen memory)
-        self.assertEqual(len(settable), 18)
+        # 19: + SCREEN_REMARKS_ENABLED (2026-10-12, screen comments)
+        self.assertEqual(len(settable), 19)
         for key in settable:
             self.assertEqual(sw.SCHEMA[key]["type"], "bool", key)
             self.assertIn(key, sw.persisted_keys())

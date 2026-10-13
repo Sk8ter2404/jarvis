@@ -492,6 +492,40 @@ _WATCH_STATUS_RE = re.compile(
     r"(?:what'?s|what\s+is)\s+(?:the\s+)?screen\s+(?:memory|watching)\s+status|"
     r"screen\s+(?:memory|watch(?:ing|er)?)\s+status)"
     r"(?:\s+(?:right\s+now|now|sir|jarvis))*\??$", re.IGNORECASE)
+# Screen COMMENTS (core.screen_remarks): "stop commenting", "start commenting",
+# "comment less / more". Whole-utterance only.
+_COMMENT_THING = (r"(?:\s+(?:on|about)\s+(?:what\s+i(?:'m|\s+am)?\s+watch(?:ing)?|"
+                  r"what\s+i\s+watch|my\s+(?:screens?|videos?|shows?)|"
+                  r"the\s+(?:screens?|videos?)|videos?|it|that|things))?")
+_COMMENT_TAIL = r"(?:\s+(?:please|sir|jarvis|for\s+now|now|again))*$"
+_REMARKS_OFF_RE = re.compile(
+    r"^(?:(?:please\s+)?(?:stop|quit|cease)\s+(?:the\s+)?(?:commenting|"
+    r"making\s+comments|commentary|remarking|screen\s+(?:comments?|remarks?))"
+    + _COMMENT_THING + r"|(?:don'?t|do\s+not)\s+comment"
+    r"(?:\s+(?:on|about)\s+(?:what\s+i(?:'m|\s+am)?\s+watch(?:ing)?|"
+    r"my\s+(?:screens?|videos?|shows?)|the\s+(?:screens?|videos?)|videos?))?|"
+    r"no\s+more\s+(?:screen\s+)?(?:comments?|commentary|remarks?)"
+    r"(?:\s+(?:on|about)\s+(?:my\s+(?:screens?|videos?)|what\s+i\s+watch))?|"
+    r"turn\s+off\s+(?:the\s+)?screen\s+(?:comments?|remarks?|commentary))"
+    + _COMMENT_TAIL, re.IGNORECASE)
+_REMARKS_ON_RE = re.compile(
+    r"^(?:(?:please\s+)?(?:start|resume|begin|go\s+back\s+to|keep)\s+"
+    r"(?:the\s+)?(?:commenting|making\s+comments|commentary|remarking|"
+    r"screen\s+(?:comments?|remarks?))" + _COMMENT_THING + r"|"
+    r"you\s+can\s+(?:comment|remark)(?:\s+(?:on|about)\s+(?:my\s+(?:screens?|"
+    r"videos?)|what\s+i(?:'m|\s+am)?\s+watch(?:ing)?))?(?:\s+again)?|"
+    r"comment\s+(?:on|about)\s+what\s+i(?:'m|\s+am)?\s+watch(?:ing)?|"
+    r"turn\s+on\s+(?:the\s+)?screen\s+(?:comments?|remarks?|commentary))"
+    + _COMMENT_TAIL, re.IGNORECASE)
+_REMARKS_RATE_RE = re.compile(
+    r"^(?:(?:comment|remark)\s+(?P<d>less|more)(?:\s+often)?|"
+    r"(?P<f>fewer|more)\s+(?:screen\s+)?(?:comments|remarks)|"
+    r"(?:stop\s+commenting|stop\s+remarking)\s+so\s+(?:much|often))"
+    + _COMMENT_TAIL, re.IGNORECASE)
+_REMARKS_STATUS_RE = re.compile(
+    r"^(?:are\s+you\s+(?:still\s+)?commenting(?:\s+on\s+(?:my|the)\s+"
+    r"(?:screens?|videos?))?|screen\s+(?:comments?|remarks?)\s+status)"
+    r"(?:\s+(?:right\s+now|now|sir|jarvis))*\??$", re.IGNORECASE)
 # Words after "don't watch" that are not app names.
 _NOT_APPS = frozenset({"this", "that", "it", "me", "my", "the", "screen",
                        "screens", "anything", "everything", "out", "tv",
@@ -502,12 +536,24 @@ _NOT_APPS = frozenset({"this", "that", "it", "me", "my", "the", "screen",
 def screen_memory_command(text) -> "dict | None":
     """{"op": "pause", "minutes": N|None} / {"op": "resume"} /
     {"op": "status"} / {"op": "exclude_this"} / {"op": "exclude_app",
-    "app": name}, or None. Never raises."""
+    "app": name} / {"op": "remarks_off"} / {"op": "remarks_on"} /
+    {"op": "remarks_less"} / {"op": "remarks_more"} / {"op": "remarks_status"},
+    or None. Never raises."""
     try:
         s = clean(text)
         if not s:
             return None
         low = s.lower()
+        if _REMARKS_OFF_RE.match(low):
+            return {"op": "remarks_off"}
+        if _REMARKS_ON_RE.match(low):
+            return {"op": "remarks_on"}
+        m = _REMARKS_RATE_RE.match(low)
+        if m:
+            d = (m.group("d") or m.group("f") or "less").lower()
+            return {"op": "remarks_more" if d == "more" else "remarks_less"}
+        if _REMARKS_STATUS_RE.match(low):
+            return {"op": "remarks_status"}
         if _WATCH_THIS_RE.match(low):
             return {"op": "exclude_this"}
         m = _WATCH_PAUSE_RE.match(low)

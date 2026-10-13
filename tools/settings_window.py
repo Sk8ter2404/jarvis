@@ -1660,14 +1660,47 @@ SCHEMA: dict[str, dict] = {
     },
     "AMBIENT_SCREEN_ENABLED": {
         "tab": "privacy", "label": "Screen memory (text only)", "type": "bool",
-        "default": False,
+        "default": True,
         "help": "Screen memory — text only, no AI calls. JARVIS keeps a "
                 "timestamped record of window titles, page addresses and page "
                 "text (read when the screen changes) so he can answer 'what "
                 "was I looking at'. No pictures are stored, nothing leaves "
                 "this PC, private / sign-in windows are skipped, and it "
                 "pauses for games. Say 'stop watching' or 'don't watch this' "
-                "any time. Applies on the next start.",
+                "any time ('start watching' turns it back on); the tray menu "
+                "and the web dashboard switch it too. Applies on the next "
+                "start.",
+    },
+    "SCREEN_REMARKS_ENABLED": {
+        "tab": "privacy", "label": "Comment on what I'm watching",
+        "type": "bool", "default": True,
+        "help": "With screen memory on, JARVIS may make ONE short dry remark "
+                "about a video you have just started, using only the title "
+                "and text he actually read. At most one per 15 minutes by "
+                "default; never while either of you is speaking, in a call, "
+                "in a full-screen game, on a private / sign-in / incognito "
+                "page, in guest or focus mode or at night. Say 'stop "
+                "commenting' / 'start commenting' any time; the tray menu "
+                "and the web dashboard switch it too. Applies at once.",
+    },
+    "SCREEN_REMARKS_MIN_GAP_S": {
+        "tab": "privacy", "label": "Comments: at most one per (s)",
+        "type": "int", "default": 900, "min": 300, "max": 7200,
+        "help": "The least time between two screen remarks (900 = 15 min). "
+                "'Comment less' / 'comment more' double / halve it.",
+    },
+    "SCREEN_REMARKS_DWELL_S": {
+        "tab": "privacy", "label": "Comments: watched for (s)",
+        "type": "float", "default": 25.0, "min": 5, "max": 300,
+        "help": "How long a video must stay in front before he may remark "
+                "on it, so a quick tab flick never earns a comment.",
+    },
+    "SCREEN_REMARKS_PAGES": {
+        "tab": "privacy", "label": "Comments: also on web pages",
+        "type": "bool", "default": False,
+        "help": "Also remark on ordinary web pages and articles, not only "
+                "videos. Mail, chat, school, work and banking sites never "
+                "get a remark either way.",
     },
     "AMBIENT_SCREEN_VLM_ENABLED": {
         "tab": "privacy", "label": "Old screen watcher (vision model)",
@@ -2342,6 +2375,9 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                            "CLICK_ROUTE_ENABLED", "CLICK_VERIFY_TIMEOUT_S",
                            "VISION_GROUNDING_FORMAT", "VLM_MAX_IMAGE_TOKENS",
                            "SCREEN_OCR_BACKEND"]),
+        ("Screen comments", ["SCREEN_REMARKS_ENABLED",
+                             "SCREEN_REMARKS_MIN_GAP_S",
+                             "SCREEN_REMARKS_DWELL_S", "SCREEN_REMARKS_PAGES"]),
         ("Screen memory", ["SCREEN_MEMORY_INTERVAL_S",
                            "SCREEN_MEMORY_CPU_PAUSE_PCT",
                            "SCREEN_MEMORY_MAX_CORE_PCT", "SCREEN_TIMELINE_DAYS",

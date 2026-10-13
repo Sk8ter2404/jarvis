@@ -2,7 +2,9 @@
 tools/settings_window.py SCHEMA, tools/user_settings.example.json, and the
 consuming module's own fallback), each has a real consumer outside the
 config / settings / tests files, and the defaults are what was shipped
-(AMBIENT_SCREEN_ENABLED stays False in code; the owner turns it on).
+(AMBIENT_SCREEN_ENABLED ships ON since 2026-10-12, with the screen comments
+switch SCREEN_REMARKS_ENABLED; both are off-switchable from the tray, Settings,
+the dashboard and by voice).
 
     python -m unittest tests.test_screen_vision_settings
 """
@@ -26,7 +28,9 @@ KEYS = {
     "SCREEN_UIA_ENABLED": True, "SCREEN_UIA_NONBROWSER": "on_demand",
     "VLM_MAX_IMAGE_TOKENS": 960, "VISION_GROUNDING_FORMAT": "box2d",
     "CLICK_VERIFY_TIMEOUT_S": 2.5, "CLICK_ROUTE_ENABLED": True,
-    "SCREEN_OCR_BACKEND": "auto", "AMBIENT_SCREEN_ENABLED": False,
+    "SCREEN_OCR_BACKEND": "auto", "AMBIENT_SCREEN_ENABLED": True,
+    "SCREEN_REMARKS_ENABLED": True, "SCREEN_REMARKS_MIN_GAP_S": 900,
+    "SCREEN_REMARKS_DWELL_S": 25.0, "SCREEN_REMARKS_PAGES": False,
     "AMBIENT_SCREEN_VLM_ENABLED": False, "SCREEN_MEMORY_INTERVAL_S": 5.0,
     "SCREEN_MEMORY_CPU_PAUSE_PCT": 60.0, "SCREEN_MEMORY_MAX_CORE_PCT": 1.0,
     "SCREEN_TIMELINE_DAYS": 7.0, "SCREEN_TIMELINE_MAX_MB": 200.0,
@@ -93,7 +97,7 @@ class FourCopiesTests(unittest.TestCase):
             "vision_trace.py", "screen_memory.py", "screen_timeline.py",
             "grounded_click.py", "screen_ocr.py", "vision_grounding.py",
             "screen_privacy.py", "dev_notes.py", "screen_digest.py",
-            "actions.py")]
+            "screen_remarks.py", "actions.py")]
         bad = []
         for fp in files:
             with open(fp, encoding="utf-8") as f:
@@ -152,7 +156,7 @@ class StructuralTests(unittest.TestCase):
                 "core.vision_trace", "core.screen_timeline", "core.dev_notes",
                 "core.screen_scope", "core.uia_host", "core.screen_text",
                 "core.screen_ocr", "core.grounded_click", "core.screen_digest",
-                "core.screen_memory"]
+                "core.screen_memory", "core.screen_remarks"]
         code = ("import sys; " + "; ".join(f"import {m}" for m in mods)
                 + "; heavy=[m for m in ('numpy','cv2','torch','comtypes',"
                 "'PIL','mss','requests','bobert_companion') if m in "

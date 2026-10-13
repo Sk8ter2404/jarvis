@@ -396,12 +396,14 @@ CREDITS_CHECK_BACKEND = "auto"
 #   change). NO AI / vision calls, no stored images, no GPU, <= 1% of one CPU
 #   core (self-governed); pauses for games, a locked screen, a busy CPU and
 #   "stop watching". Kept 7 days / 200 MB in data/screen_timeline.db.
-#   False by default (privacy); the owner turns it on.
+#   ON by default since 2026-10-12 (the owner asked for it; it is text only,
+#   local, skips private / sign-in windows and has a tray / settings /
+#   dashboard / voice off switch). Set False to keep it off.
 # AMBIENT_SCREEN_VLM_ENABLED — the OLD screen loop (skills/ambient_listen):
 #   a vision-model call on every changed minute, on the GPU the brain uses.
 #   False; it no longer rides on AMBIENT_SCREEN_ENABLED.
 AMBIENT_LISTEN_ENABLED = False
-AMBIENT_SCREEN_ENABLED = False
+AMBIENT_SCREEN_ENABLED = True
 AMBIENT_SCREEN_VLM_ENABLED = False
 # AMBIENT_STT_YIELD — the ambient mic and system-audio daemons hold a batch
 #   back (instead of transcribing it) while you are speaking to JARVIS, so
@@ -475,6 +477,25 @@ SCREEN_OCR_BACKEND = "auto"
 SCREEN_MEMORY_INTERVAL_S = 5.0
 SCREEN_MEMORY_CPU_PAUSE_PCT = 60.0
 SCREEN_MEMORY_MAX_CORE_PCT = 1.0
+# SCREEN REMARKS (2026-10-12; core/screen_remarks.py): with screen memory on,
+# JARVIS may make ONE short dry-wit remark about the video the owner has just
+# started (a "new item" he has watched for SCREEN_REMARKS_DWELL_S), built only
+# from the title / text screen memory actually read. Never while either of
+# you is speaking, in a call or meeting, in a full-screen game, on a private /
+# sign-in / incognito / adult page, in guest or focus mode, during night-quiet
+# hours or while "stop watching" is in force. Voice: "stop commenting" /
+# "start commenting" / "comment less" / "comment more"; also the tray, the
+# Settings window and the web dashboard.
+# SCREEN_REMARKS_ENABLED     — the switch (live: read on every check).
+# SCREEN_REMARKS_MIN_GAP_S   — at most one remark per this many seconds
+#   (900 = 15 min; 300..7200).
+# SCREEN_REMARKS_DWELL_S     — how long an item must stay in front first.
+# SCREEN_REMARKS_PAGES       — also remark on ordinary web pages / articles
+#   (default False: videos only; mail, chat, school and work sites never).
+SCREEN_REMARKS_ENABLED = True
+SCREEN_REMARKS_MIN_GAP_S = 900
+SCREEN_REMARKS_DWELL_S = 25.0
+SCREEN_REMARKS_PAGES = False
 # The screen timeline's retention.
 SCREEN_TIMELINE_DAYS = 7.0
 SCREEN_TIMELINE_MAX_MB = 200.0
