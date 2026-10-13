@@ -13599,6 +13599,39 @@ def _mark_speech_spoken(message: str) -> None:
         _recent_spoken_messages[message] = time.time()
 
 
+def _decode_queue_list(raw: str):
+    """Decode a JSON-array queue file's text, keeping every INTACT record of
+    an array torn mid-write (a crash/disk-full cut inside a record). A clean
+    file decodes exactly as before (raw_decode); a damaged one loses only the
+    cut record and what follows it, not the whole queue. Raises ValueError
+    when nothing at all is recoverable."""
+    dec = json.JSONDecoder()
+    try:
+        return dec.raw_decode(raw)[0]
+    except ValueError:
+        pass
+    if not raw.startswith("["):
+        raise ValueError("not a JSON array")
+    out: list = []
+    i = 1
+    n = len(raw)
+    while i < n:
+        while i < n and raw[i] in " \t\r\n,":
+            i += 1
+        if i >= n or raw[i] == "]":
+            break
+        try:
+            obj, i = dec.raw_decode(raw, i)
+        except ValueError:
+            break
+        out.append(obj)
+    if not out:
+        raise ValueError("no intact record")
+    print(f"  [pending] damaged queue file - salvaged {len(out)} intact "
+          f"record(s)")
+    return out
+
+
 # Serialises concurrent writers of pending_speech.json (see proactive_announce).
 _pending_speech_lock = threading.Lock()
 
@@ -13871,7 +13904,7 @@ def proactive_announce(message: str, source: str = "skill",
                     raw = f.read().strip()
                 if raw:
                     try:
-                        decoded, _ = json.JSONDecoder().raw_decode(raw)
+                        decoded = _decode_queue_list(raw)
                         if isinstance(decoded, list):
                             data = decoded
                     except Exception:
@@ -46194,7 +46227,7 @@ def _recover_orphaned_queue_snapshot(queue_path: str, tag: str) -> bool:
             return False
         with open(consume_path, "r", encoding="utf-8") as f:
             orphan_raw = f.read().strip()
-        orphan_items = (json.JSONDecoder().raw_decode(orphan_raw)[0]
+        orphan_items = (_decode_queue_list(orphan_raw)
                         if orphan_raw else [])
         if not isinstance(orphan_items, list):
             orphan_items = []
@@ -46380,6 +46413,10 @@ def _inject_log_tag() -> str:
 # one. Kept well under _MAIN_LOOP_HEARTBEAT_TIMEOUT (60s) so a pass that trips
 # the budget still leaves headroom for the utterance already in flight.
 _PENDING_DRAIN_BUDGET_S = 25.0
+# A queued line whose speech raises is kept for the next pass this many
+# attempts in all, then dropped (a permanently failing line must not wedge
+# the queue).
+_PENDING_SPEAK_MAX_TRIES = 3
 
 
 def _requeue_pending_speech(items: list) -> bool:
@@ -46617,7 +46654,7 @@ def _speak_pending(only_sources=None):
             except Exception: pass
             return False
         try:
-            items, _ = json.JSONDecoder().raw_decode(raw)
+            items = _decode_queue_list(raw)
         except Exception:
             # Unrecoverable JSON — drop the snapshot and move on.
             print(f"  [pending] corrupt speech queue — deleting")
@@ -46750,10 +46787,22 @@ def _speak_pending(only_sources=None):
             if "?" in msg or item.get("offer") is True:
                 _note_spoken_question(msg)
         except Exception as _spe:
-            # Don't let one bad TTS attempt nuke the main loop. Print and
-            # continue to the next reminder. The snapshot is gone (we
-            # already renamed), so this one is lost — but JARVIS stays up.
-            print(f"  [pending] speak failed for reminder: {_spe}")
+            # Don't let one bad TTS attempt nuke the main loop: print and
+            # continue to the next reminder. The failed line was NOT
+            # delivered, so keep it owed (in queue order) for a later pass -
+            # up to _PENDING_SPEAK_MAX_TRIES attempts, so a line that can
+            # never be spoken cannot wedge the queue forever.
+            _tries = int(item.get("_tries") or 0) + 1
+            if _tries < _PENDING_SPEAK_MAX_TRIES:
+                print(f"  [pending] speak failed for reminder "
+                      f"(try {_tries}, kept for the next pass): {_spe}")
+                _kept = dict(item)
+                _kept["_tries"] = _tries
+                back.append(_kept)
+                seen_in_batch.discard(_dkey)
+            else:
+                print(f"  [pending] speak failed for reminder "
+                      f"(try {_tries}, giving up): {_spe}")
         # Progress (see CRASH-SAFE PROGRESS above): this line is finished.
         _rewrite_queue_snapshot(consume_path, back + items[_pos + 1:])
     # Budget tripped: put the un-spoken tail back BEFORE dropping the
