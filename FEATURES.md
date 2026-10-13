@@ -481,6 +481,7 @@ Every briefing below is one skill, `skills/daily_briefing/` (merged 2026-10-12 f
   - Actions: `discover_smart_home`, `list_smart_home_devices`, `forget_alexa_login`
 - **Per-brand lists and setup** — "list my Hue lights", "list my Tuya plugs", "authorize Ecobee", "set the Hue bridge IP"
   - Actions: `hue_list_devices`, `govee_list_devices`, `lifx_list_devices`, `kasa_list_devices`, `tuya_list_devices`, `ecobee_list_devices`, `nest_list_devices`, `ring_list_devices`, `hue_set_bridge_ip`, `hue_retry_connect`, `ecobee_request_pin`, `ecobee_authorize`, `ecobee_complete_setup`, `nest_authorize`, `ring_authorize`
+  - **BroadLink RM Pro (direct, no cloud)** — `skills/sh_broadlink.py` blasts IR/RF codes over the LAN for BroadLink-brand catalog devices; JARVIS learns each code once from your real remote (`data/broadlink_codes.json`), and until a code is learned the Alexa scene keeps working as the fallback. A single toggle code is reported honestly as "sent the toggle code", never as a known state. Actions: `broadlink_learn` ("learn the stereo remote code"), `broadlink_list`, `broadlink_forget`
 - **Deco mesh network** — who is on the Wi-Fi, single-device presence, bandwidth hogs, topology, guest network.
   - "who's on the wifi", "is the Pi online", "network usage", "turn off guest wifi"
   - Actions: `who_is_on_wifi`, `is_device_online` / `device_online`, `bandwidth_hogs`, `deco_topology`, `deco_status`, `deco_refresh`, `kick_guest_network` / `disable_guest_network`, `enable_guest_network`

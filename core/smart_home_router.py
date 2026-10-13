@@ -80,6 +80,7 @@ _BRAND_TO_SKILL = {
     "nest":         "sh_nest",
     "google nest":  "sh_nest",
     "ring":         "sh_ring",
+    "broadlink":    "sh_broadlink",
 }
 
 # Coarse rgb tuples used when the user names a color. Keyed by the lowercase
