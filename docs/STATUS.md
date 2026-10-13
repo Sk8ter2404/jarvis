@@ -4,20 +4,18 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.186
+- Version: v2.0.187
 - Live since: 2026-10-12
-- Latest change: v2.0.186 (10-12): Alexa sign-in fix (sign in once), real smart-home device list, no secrets in logs; audio switch waits during media; Cloud Boost; slimmer brain prompt.
+- Latest change: v2.0.187 (10-12): two-way chat bot, shopping and reminders lists, optional screen comments, air-mouse and gesture fixes, batched learning, privacy guards, cleanup.
 
 ## In progress
 
+- Smart home control without the voice assistant cloud: direct control of local plugs and lights, doorbell announcements, IR remote
 - Echo-cancellation tuning for hearing over videos
 - Pinch-to-click calibration for Kinect hand tracking
-- Screen memory and remarks about what is on screen (built, off by default)
 - Per-camera flap counter
 - Boot proof and long live diagnostics
 - Speed plan: enabling each speed feature one at a time with before and after measurements
-- Next release: media-aware audio switching, an optional boost that sends hard turns to a cloud model, privacy fixes, and a slimmer brain prompt
-- Planned: a two-way chat bot for alerts, a shopping list for reminders, easier air-mouse engage, useful Kinect gestures, batched background learning, and repo cleanup of unused code
 
 ## Roadmap
 
@@ -74,6 +72,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.187 (2026-10-12): Two-way chat bot for alerts and commands; a shopping list and a separate reminders list (reminders with no time never land in the developer queue); optional comments about what is on screen; easier air-mouse engage and useful Kinect gestures; batched background learning; game mode, TV and clap tweaks plus an order tracker; privacy guards on test data; repo cleanup (one daily briefing skill).
 - v2.0.186 (2026-10-12): Alexa sign-in rebuilt on the phone-app style OAuth device registration (sign in once, saved token, the real smart-home device list, no session secrets in logs); audio auto-switch waits while media plays; CLOUD_BOOST_UNTIL sends hard turns and screen reading to Claude until a date; PROMPT_SLIM_MODE keeps the cached brain prompt smaller.
 - v2.0.185 (2026-10-12): Public status docs on GitHub: docs/STATUS.md and docs/RELEASE_HISTORY.md, generated from the master sheet with all personal data stripped. No code change; the running JARVIS code is the same as v2.0.184.
 - v2.0.184 (2026-10-12): JARVIS only announces a finished print he actually watched run (no "print complete" for a print finished while he was off, none when a new print's name arrives before the printer leaves FINISH, no replay after a restart, a stale queued finish line is ...
@@ -83,6 +82,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.180 (2026-10-04): fixes the v2.0.179 native abort - the CUDA driver starts before ctranslate2 again, and every CTranslate2 CUDA build, decode and free runs on one never-exiting host thread (a short-lived self-check thread exiting with CTranslate2 CUDA state aborted the ...
 - v2.0.179 (2026-10-04): one voice per reply (the clone never switches mid-reply, a sentence prepared ahead waits until it is needed, a long first line is split at a clause, misses cool down instead of switching the clone off for the session), steady Kinect hand tracking (one shared ...
 - v2.0.178 (2026-10-03): the cloned JARVIS voice runs from its own GPU server with Kokoro covering any line it misses (off until switched on), and "close all windows except X" really closes the rest - never JARVIS's own HUD/Reticle or the Windows shell, asks first above five, never ...
-- v2.0.177 (2026-10-02): a yes to JARVIS's own offer carries it out, slow apps are moved when their window appears, streaming search uses verified links and stops at a sign-in wall, 'close that' closes only what he opened, fresh 'diagnostic status', facts remember who said them + ...
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
