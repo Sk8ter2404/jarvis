@@ -736,8 +736,12 @@ def register(actions: dict) -> None:
     actions["kasa_list"]         = kasa_list
     actions["tplink_list"]       = kasa_list
     # Voice control for the discovered plugs (no Alexa needed).
-    actions["smart_home_control"] = smart_home_control
+    # NOT registered here: "smart_home_control" / "control_device". Those names
+    # belong to core.smart_home_router (the per-brand router), which reaches
+    # this handler itself via _live_lan_fallback. Registering them here too
+    # made the winner depend on skill-file load order (stale-duplicate class);
+    # tests/test_skill_action_uniqueness.py now pins one owner per action name.
+    actions["kasa_smart_home_control"] = smart_home_control
     actions["kasa_control"]       = smart_home_control
-    actions["control_device"]     = smart_home_control
     actions["control_plug"]       = smart_home_control
     actions["control_light"]      = smart_home_control
