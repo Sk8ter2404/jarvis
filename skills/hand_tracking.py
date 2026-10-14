@@ -390,6 +390,34 @@ def _hand_tracking_on(_: str = "") -> str:
             f"never touches your cursor.{menu} Say 'hand tracking off' to stop it.")
 
 
+def _stop_air_mouse() -> bool:
+    """'Hand tracking off' means everything that watches his hands (10-13: "turn
+    off hand tracking ... I think that's what's stealing your mouse"), so a
+    running Kinect air mouse is stopped too. True when it was on and is now
+    off. Never raises."""
+    if not bool(_cfg("KINECT_AIR_MOUSE_ENABLED", False)):
+        return False
+    fn = _registry().get("air_mouse_off")
+    if not callable(fn):
+        return False
+    try:
+        fn("")
+    except Exception:
+        return False
+    return not bool(_cfg("KINECT_AIR_MOUSE_ENABLED", False))
+
+
+def _still_on_tail() -> str:
+    """Honest close: name any Kinect hand feature still on, else say nothing
+    is watching his hands."""
+    others = [name for key, name in (("KINECT_GESTURES_ENABLED", "Kinect gestures"),
+                                     ("KINECT_POINT_CONTROL_ENABLED", "point control"))
+              if bool(_cfg(key, False))]
+    if not others:
+        return " Nothing is watching your hands."
+    return " " + " and ".join(others) + (" is" if len(others) == 1 else " are") + " still on."
+
+
 def _hand_tracking_off(_: str = "") -> str:
     _holo["owned"] = False
     _holo["idle_since"] = None
@@ -399,11 +427,15 @@ def _hand_tracking_off(_: str = "") -> str:
     if la is not None:
         la.stop()
     _set_runtime(False)
-    if not was_on:
+    mouse = _stop_air_mouse()
+    if not was_on and not mouse:
         return "Hand tracking was already off, sir."
     boot = (" It's still set to start at boot." if bool(_cfg("HAND_TRACKING_ENABLED", False))
             else "")
-    return "Hand tracking is off, sir. Nothing is watching your hands." + boot
+    if not was_on:
+        return "The air mouse is off, sir." + _still_on_tail()
+    return ("Hand tracking is off, sir." + (" The air mouse is off too." if mouse else "")
+            + _still_on_tail() + boot)
 
 
 def status_text() -> str:

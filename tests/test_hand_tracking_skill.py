@@ -265,7 +265,10 @@ class _ActionBase(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         q = mock.patch.multiple(config, HAND_TRACKING_ENABLED=False,
-                                HAND_MENU_ENABLED=False, HAND_TRACK_CAMERA="primary")
+                                HAND_MENU_ENABLED=False, HAND_TRACK_CAMERA="primary",
+                                KINECT_AIR_MOUSE_ENABLED=False,
+                                KINECT_GESTURES_ENABLED=False,
+                                KINECT_POINT_CONTROL_ENABLED=False)
         q.start()
         self.addCleanup(q.stop)
 
@@ -395,4 +398,51 @@ class HologramOwnershipTests(_ActionBase):
         self.assertTrue(ht._holo_watch_step(195.0, False))       # 45 s gone
         self.assertEqual(self.la.stopped, 1)
         self.assertFalse(ht._holo_watch_step(300.0, False))      # nothing left
+
+
+class OffStopsTheAirMouseTests(_ActionBase):
+    """'Hand tracking off' = nothing watches his hands: the cursor-taking
+    Kinect air mouse is stopped too, and anything still on is named."""
+
+    def setUp(self):
+        super().setUp()
+        self.mouse_calls = []
+
+        def air_mouse_off(_=""):
+            self.mouse_calls.append(1)
+            config.KINECT_AIR_MOUSE_ENABLED = False
+            return "Air mouse off, sir."
+        p = mock.patch.object(ht, "_registry", return_value={"air_mouse_off": air_mouse_off})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_off_also_stops_a_running_air_mouse(self):
+        ht._hand_tracking_on()
+        config.KINECT_AIR_MOUSE_ENABLED = True
+        out = ht._hand_tracking_off()
+        self.assertEqual(self.mouse_calls, [1])
+        self.assertIn("The air mouse is off too.", out)
+        self.assertIn("Nothing is watching your hands.", out)
+
+    def test_air_mouse_alone_is_stopped_and_said(self):
+        config.KINECT_AIR_MOUSE_ENABLED = True
+        out = ht._hand_tracking_off()
+        self.assertEqual(out, "The air mouse is off, sir. Nothing is watching your hands.")
+
+    def test_air_mouse_left_alone_when_off(self):
+        ht._hand_tracking_on()
+        out = ht._hand_tracking_off()
+        self.assertEqual(self.mouse_calls, [])
+        self.assertNotIn("air mouse", out)
+
+    def test_other_kinect_hand_features_are_named_not_hidden(self):
+        ht._hand_tracking_on()
+        config.KINECT_GESTURES_ENABLED = True
+        out = ht._hand_tracking_off()
+        self.assertIn("Kinect gestures is still on.", out)
+        self.assertNotIn("Nothing is watching", out)
+        config.KINECT_POINT_CONTROL_ENABLED = True
+        ht._hand_tracking_on()
+        self.assertIn("Kinect gestures and point control are still on.",
+                      ht._hand_tracking_off())
 

@@ -1,5 +1,6 @@
 """Live fixes of 2026-10-09 (logs session_2026-10-09_17-49-22 and the
-2026-10-05 session): hand tracking routes to the air mouse, a singular
+2026-10-05 session): hand tracking routes without the brain (to the
+MediaPipe tracker since 2026-10-14, no longer the air mouse), a singular
 "close that ... window" closes one window, a misheard "you two" is YouTube
 only inside an open / close / play command, a website name opens in the
 browser, and the boot warm-up gets a longer budget after a cold server start.
@@ -21,10 +22,10 @@ class HandTrackingRouteTests(unittest.TestCase):
         for t in ("Jarvis, turn on hand tracking.", "enable hand tracking",
                   "hand tracking on", "turn hand tracking on please",
                   "switch on the hand tracking"):
-            self.assertEqual(r(t), "[ACTION: air_mouse_on]", t)
+            self.assertEqual(r(t), "[ACTION: hand_tracking_on]", t)
         for t in ("turn off hand tracking", "disable hand tracking",
                   "hand tracking off", "stop the hand tracking"):
-            self.assertEqual(r(t), "[ACTION: air_mouse_off]", t)
+            self.assertEqual(r(t), "[ACTION: hand_tracking_off]", t)
 
     def test_questions_and_compound_stay_with_the_brain(self):
         from core.dispatcher import hand_tracking_route as r
@@ -121,8 +122,11 @@ class ReviewFixTests(unittest.TestCase):
         for t in ("turn up hand tracking", "pause hand tracking",
                   "hand tracking enabled", "hand tracking disabled"):
             self.assertIsNone(h(t), t)
-        self.assertEqual(h("turn on hand tracking"), "[ACTION: air_mouse_on]")
-        self.assertEqual(h("hand tracking off"), "[ACTION: air_mouse_off]")
+        self.assertEqual(h("turn on hand tracking"), "[ACTION: hand_tracking_on]")
+        self.assertEqual(h("hand tracking off"), "[ACTION: hand_tracking_off]")
+        # the cursor-taking air mouse is never reached through "hand tracking"
+        for t in ("turn on hand tracking", "enable hand tracking", "hand tracking on"):
+            self.assertNotIn("air_mouse", h(t), t)
 
     def test_gmail_dot_com_and_twitch_app(self):
         from core.actions import _website_name_url as w

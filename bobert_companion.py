@@ -35515,8 +35515,10 @@ def _utterance_route_reply(text: str) -> "str | None":
     if _wk_m and _wk_m.group(1) in ACTIONS:
         print(f"  [route] all windows except -> {_wk_m.group(1)}")
         return _wk_tok
-    # BUILT-IN route (2026-10-09): "turn on / off hand tracking" is the air
-    # mouse (live 18:02:58 the brain said it could not do hand tracking).
+    # BUILT-IN route (2026-10-09): "turn on / off hand tracking" without the
+    # brain (live 18:02:58 it said it could not do hand tracking). Since
+    # 2026-10-14 it is the MediaPipe tracker (hand_tracking_on / off), NOT the
+    # cursor-taking air mouse - see core/dispatcher.hand_tracking_route.
     try:
         from core.dispatcher import hand_tracking_route as _ht_route
         _ht_tok = _ht_route(text)

@@ -529,13 +529,17 @@ def forgot_close_target(utterance) -> str | None:
         return None
 
 
-# ── "turn on hand tracking" (2026-10-09) ────────────────────────────────────
+# ── "turn on hand tracking" (2026-10-09; target changed 2026-10-14) ─────────
 # Live 18:02:58 "turn on hand tracking" was answered "I can't do hand
-# tracking"; "turn on air mouse" at 18:03:39 worked. Hand tracking IS the air
-# mouse (skills/kinect_air_mouse.py), so a WHOLE on/off request for it routes
-# there without the brain: turn / switch / enable / disable / start / stop,
-# or "hand tracking on / off". A question ("is hand tracking on?") or any
-# other words riding along stay with the model.
+# tracking", so a WHOLE on/off request routes without the brain: turn /
+# switch / enable / disable / start / stop, or "hand tracking on / off". A
+# question ("is hand tracking on?") or any other words riding along stay with
+# the model. Until 2026-10-14 it went to the Kinect AIR MOUSE, which takes the
+# real cursor - the owner turned that off on 10-13 because it kept stealing the
+# mouse. Since hand tracking v2 it means the MediaPipe tracker
+# (skills/hand_tracking.py: hand_tracking_on / off), which never moves the
+# cursor; "hand tracking off" there also stops the air mouse. The air mouse
+# keeps its own words ("air mouse on").
 _HT_NAME = r"(?:the\s+)?(?:my\s+)?hand[\s-]*track(?:ing|er)(?:\s+(?:mode|feature))?"
 _HT_ON_RE = re.compile(
     r"^(?:(?:turn|switch|flip|put)\s+on\s+" + _HT_NAME
@@ -555,8 +559,9 @@ _HT_POLITE_RE = re.compile(
 
 
 def hand_tracking_route(utterance) -> str | None:
-    """``"[ACTION: air_mouse_on]"`` / ``"[ACTION: air_mouse_off]"`` for a
-    whole "turn on / off hand tracking" request, else None. Never raises."""
+    """``"[ACTION: hand_tracking_on]"`` / ``"[ACTION: hand_tracking_off]"``
+    for a whole "turn on / off hand tracking" request, else None. Never
+    raises."""
     try:
         if not isinstance(utterance, str) or not utterance.strip():
             return None
@@ -566,9 +571,9 @@ def hand_tracking_route(utterance) -> str | None:
         s = " ".join(_strip(_HT_POLITE_RE.sub("", s)).split())
         s = " ".join(_HT_POLITE_RE.sub("", s).split())
         if _HT_ON_RE.match(s):
-            return "[ACTION: air_mouse_on]"
+            return "[ACTION: hand_tracking_on]"
         if _HT_OFF_RE.match(s):
-            return "[ACTION: air_mouse_off]"
+            return "[ACTION: hand_tracking_off]"
         return None
     except Exception:
         return None
