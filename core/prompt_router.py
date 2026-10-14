@@ -541,6 +541,8 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "are you alright", "are you all right", "is everything ok",
         "is everything okay",
     ],
+    "WEEKLY SCORE": ["weekly score", "success score", "how did you do",
+                     "how have you done", "your score this week"],
     "STABILITY GATE": ["stability", "safe to upgrade", "stability gate"],
     # 2026-09-29: bare "wake word" used to live here, so every WAKE-WORD MODE
     # turn ('turn off wake word mode', 'require the wake word') also shipped

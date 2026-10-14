@@ -27,16 +27,16 @@
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 730 |
+| Total registered actions (incl. aliases) | 733 |
 | — monolith `ACTIONS` dict | 156 |
-| — skill / core registered | 574 |
-| tested | 671 |
-| **untested** (no test names it) | 59 |
-| spoken note: VERBATIM | 378 |
+| — skill / core registered | 577 |
+| tested | 672 |
+| **untested** (no test names it) | 61 |
+| spoken note: VERBATIM | 381 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
 | **no spoken note** (neither) | 273 |
-| no `prompts.py` example | 521 |
+| no `prompts.py` example | 524 |
 
 A result with no spoken note is correct for side-effect actions but is the recurring
 "logged but never voiced" bug for read-outs — see the audit that seeded the 2026-07
@@ -322,6 +322,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `hotkey` | `core/actions.py:3999` | neither | — | yes |
 | `hours_reminder_fire` | `skills/hours_reminder.py:235` | neither | — | yes |
 | `hours_status` | `skills/hours_reminder.py:232` | **VERBATIM** | — | yes |
+| `how_did_you_do` | `skills/weekly_score.py:20` | **VERBATIM** | — | no |
 | `how_is_the_print` | `skills/bambu_monitor.py:1411` | *INFORMATIVE* | yes | yes |
 | `how_much_battery_headset` | `skills/headset_status.py:370` | **VERBATIM** | — | yes |
 | `hud_off` | `skills/holographic_overlay/__init__.py:339` | neither | — | yes |
@@ -652,6 +653,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `stop_pipeline` | `core/actions.py:4031` | neither | — | yes |
 | `stop_voice_clone` | `skills/voice_clone.py:244` | **VERBATIM** | — | yes |
 | `streaming_search` | `core/actions.py:3567` | **VERBATIM** | yes | yes |
+| `success_score` | `skills/weekly_score.py:20` | **VERBATIM** | — | no |
 | `suit_diagnostics` | `skills/status_panel.py:511` | **VERBATIM** | — | yes |
 | `suit_up` | `skills/suit_up.py:361` | neither | yes | yes |
 | `suit_up_sequence` | `skills/suit_up.py:361` | neither | — | yes |
@@ -725,6 +727,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `weekly_digest` | `skills/pattern_learning.py:1114` | **VERBATIM** | — | yes |
 | `weekly_digest_now` | `skills/weekly_digest_briefing.py:483` | neither | — | yes |
 | `weekly_digest_status` | `skills/weekly_digest_briefing.py:501` | **VERBATIM** | yes | yes |
+| `weekly_score` | `skills/weekly_score.py:20` | **VERBATIM** | — | yes |
 | `wellness_status` | `skills/wellness.py:371` | **VERBATIM** | yes | yes |
 | `what_audio_devices` | `skills/audio_devices.py:314` | **VERBATIM** | — | yes |
 | `what_changed` | `core/actions.py:5864` | **VERBATIM** | — | yes |
