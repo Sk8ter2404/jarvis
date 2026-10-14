@@ -707,6 +707,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # "list" (now generic -- " list" also matched " listener")
         "list my hue", "list my tuya", "list my govee", "list my kasa",
         "list my lifx", "list my plugs",
+        # 2026-10-14: the BroadLink remote hub and Magic Home LEDs
+        "remote code", "remote codes", "learn the remote", "broadlink",
+        "magic home", "list my led",
     ],
     "WAKE-WORD MODE": [
         "wake word mode", "wake-word mode", "require my name", "require your name",
