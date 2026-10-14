@@ -41,8 +41,8 @@ is parked on. It dumps a SECOND time after a short grace, because two identical
 dumps prove "wedged" while two different ones prove "pathologically slow", and
 those want different fixes. Then it hard-exits.
 
-WHY ``os._exit`` AND NOT AN EXCEPTION
--------------------------------------
+WHY A PROCESS KILL AND NOT AN EXCEPTION
+---------------------------------------
 The main thread is, by definition, blocked. A blocked thread is usually blocked
 inside a C call (``Event.wait()``, ``Thread.join()``, ``socket.recv()``,
 ``lock.acquire()``) and CPython cannot interrupt that from outside: an async
@@ -51,6 +51,23 @@ target returns to the bytecode loop, which is exactly what is not happening.
 ``sys.exit`` from this thread would only end this thread. Killing the process is
 the only move that actually works, so the value has to be extracted BEFORE the
 kill — hence dump-then-exit rather than exit-and-hope.
+
+WHY ``TerminateProcess`` AND NOT ``os._exit`` (2026-10-13)
+----------------------------------------------------------
+On Windows ``os._exit`` is CRT ``_exit`` -> ``ExitProcess``, which takes the
+loader lock and runs every loaded DLL's DLL_PROCESS_DETACH before the process
+may die. The heavy tier loads CTranslate2/CUDA, WinRT and COM, and any of them
+can wedge that walk. The v2.0.191 release gate (started 2026-10-13 09:15:57)
+tripped this watchdog, printed both dumps and "exiting 3" at 09:43:39 — and the
+python.exe was still alive ~26 h later: flat CPU, 5,520 MB private, the parent
+wrapper blocked on it the whole time. A ``Stop-Process`` by PID (i.e.
+``TerminateProcess(h, -1)``; the wrapper logged EXIT=4294967295) ended it at
+once. So the watchdog now exits the same way — ``TerminateProcess`` on its own
+pseudo-handle, which skips DLL notification entirely — and keeps ``os._exit``
+only as the fallback (non-Windows, or a refused kill). The monolith's
+``_hard_exit`` has used this primitive since 2026-07-12 for the same reason;
+it cannot be reused here because this module must import on the bare CI
+runner, and its call-time ``sys.platform`` check would read the ci-sim fake.
 
 CALIBRATION (measured on this box, 2026-09-04)
 ----------------------------------------------
@@ -106,9 +123,70 @@ _state: dict = {"armed": False, "thread": None, "stop": None,
                 "per_phase": 0.0, "total": 0.0, "run_start": 0.0}
 _lock = threading.Lock()
 
+# The clock and the grace sleep are bound ONCE, at import, so nothing the suite
+# patches can reach them. tests/_monolith_harness.shift_monotonic moves
+# time.monotonic 30 days ahead for a test, and this thread used to read the
+# patched global: the 2026-10-14 gate log has "phase exceeded 120s (2.592e+06
+# elapsed)" on a test that had just started. That one stood down at the
+# recheck; a shifted test still running 5 s later would have been KILLED, and
+# a patched time.sleep would have shrunk the grace window to nothing.
+_monotonic = time.monotonic
+_sleep = time.sleep
+
+
+def _bind_kernel32():
+    """kernel32 with TerminateProcess declared, or None off Windows.
+
+    Called once, at import — NOT when the watchdog fires. tools/
+    run_tests_ci_sim.py deletes ``ctypes.WinDLL``/``ctypes.windll`` and sets
+    ``sys.platform = "linux"`` after it has armed this watchdog, so a lookup
+    made at fire time would miss on the very Windows box it has to kill. A
+    private WinDLL (the tools/mem_guard.py idiom), not the shared
+    ``ctypes.windll.kernel32``: declaring the prototypes there would change
+    them for every other caller, and a test that patches ``ctypes.windll``
+    could not reach the kill either way."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # HANDLE, not the default c_int: the pseudo-handle is pointer-sized.
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetCurrentProcess.argtypes = []
+        k32.TerminateProcess.restype = wintypes.BOOL
+        k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        return k32
+    except Exception:
+        return None
+
+
+_k32 = _bind_kernel32()
+# The fallback, bound here so _hard_exit owns the only reference to it.
+_os_exit = os._exit
+
+
+def _hard_exit(code: int) -> None:
+    """End the process unconditionally. TerminateProcess first — it never
+    returns on success — then os._exit for a host without it or a kill the
+    kernel refused. Never flushes a Python stream on the way out: a wedged
+    main thread can be holding that stream's buffer lock, and waiting for it
+    would turn the kill back into a hang."""
+    k32 = _k32
+    if k32 is not None:
+        try:
+            k32.TerminateProcess(k32.GetCurrentProcess(), code)
+        except Exception:
+            pass
+    _os_exit(code)
+
+
+def _exit_via() -> str:
+    """For the 'exiting' line, so a log says which kill was attempted."""
+    return "TerminateProcess" if _k32 is not None else "os._exit"
+
+
 # Indirection so the unit tests can prove the fire path without killing the
 # process running them. Never reassigned outside tests.
-_exit = os._exit
+_exit = _hard_exit
 
 
 def _fmt(value: float) -> str:
@@ -205,7 +283,7 @@ def _fire(reason: str, recheck=None) -> bool:
     _write(fd, "\n[test-watchdog] second dump in %ss — identical stacks mean "
                "WEDGED, different stacks mean pathologically SLOW.\n"
                % _fmt(DUMP_GRACE_S))
-    time.sleep(DUMP_GRACE_S)
+    _sleep(DUMP_GRACE_S)
     if recheck is not None:
         try:
             still_stuck = bool(recheck())
@@ -217,7 +295,9 @@ def _fire(reason: str, recheck=None) -> bool:
                        "above is still worth reading.\n")
             return False
     _dump(fd)
-    _write(fd, "\n[test-watchdog] exiting %d\n" % EXIT_CODE)
+    # The message is already in the OS (os.write, no Python buffer), so the
+    # kill cannot lose it. "exiting N" stays a prefix for anything grepping it.
+    _write(fd, "\n[test-watchdog] exiting %d via %s\n" % (EXIT_CODE, _exit_via()))
     _exit(EXIT_CODE)
     return True
 
@@ -228,7 +308,7 @@ def _blown(stop: threading.Event) -> str | None:
     out from under it can never kill a run it no longer belongs to."""
     if _state.get("stop") is not stop:
         return None
-    return _expired(time.monotonic(), label=_cell[0], started=_cell[1],
+    return _expired(_monotonic(), label=_cell[0], started=_cell[1],
                     per_phase=_state["per_phase"], total=_state["total"],
                     run_start=_state["run_start"])
 
@@ -260,7 +340,7 @@ def _watch(stop: threading.Event) -> None:
 def note(label: str) -> None:
     """Start a new phase. Cheap enough to call around every single test."""
     _cell[0] = label
-    _cell[1] = time.monotonic()
+    _cell[1] = _monotonic()
 
 
 def arm(*, per_phase_s: float | None = None,
@@ -280,7 +360,7 @@ def arm(*, per_phase_s: float | None = None,
                         DEFAULT_TOTAL_S if total_s is None else total_s)
         _state["per_phase"] = per_phase
         _state["total"] = total
-        _state["run_start"] = time.monotonic()
+        _state["run_start"] = _monotonic()
         note(_LABEL_DISCOVERY)
         if not (per_phase or total):
             print("[test-watchdog] DISABLED — this run has no time ceiling",

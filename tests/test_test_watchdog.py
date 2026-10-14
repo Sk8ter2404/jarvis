@@ -16,14 +16,19 @@ a runner is a watchdog that will not be there the next time it is needed (the
 same shape as tests/test_mem_guard.py's runner scan, deliberately).
 
 Everything here is deterministic: the fire path is exercised through an injected
-``_exit`` and a zeroed dump grace, so no test in this file can ever kill the
-process running it, and no test here sleeps for a real budget.
+``_exit`` (or, below the exit, a fake kernel32 plus an injected ``_os_exit``)
+and a zeroed dump grace, so no test in this file can ever kill the process
+running it, and no test here sleeps for a real budget. The two real-process
+tests kill a CHILD interpreter, never this one.
 """
 from __future__ import annotations
 
 import ast
 import io
 import os
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -220,6 +225,217 @@ class FireTests(_WatchdogBase):
         with mock.patch.object(tw.faulthandler, "dump_traceback",
                                side_effect=RuntimeError("boom")):
             tw._dump(2)
+
+
+# ── the kill itself: TerminateProcess, os._exit only as the fallback ─────────
+class _Landed(BaseException):
+    """What a real TerminateProcess(GetCurrentProcess()) does: never return.
+    BaseException so _hard_exit's ``except Exception`` cannot swallow it."""
+
+
+class _FakeKernel32:
+    """The seam: the kernel32 object _bind_kernel32 hands the module. One step
+    above the kernel, so a test sees exactly the call that would kill."""
+
+    PSEUDO_HANDLE = -1          # what GetCurrentProcess() really returns
+
+    def __init__(self, *, lands=True, raises=None):
+        self.lands = lands
+        self.raises = raises
+        self.calls: list = []
+
+    def GetCurrentProcess(self):
+        self.calls.append(("GetCurrentProcess",))
+        return self.PSEUDO_HANDLE
+
+    def TerminateProcess(self, handle, code):
+        self.calls.append(("TerminateProcess", handle, code))
+        if self.raises is not None:
+            raise self.raises
+        if self.lands:
+            raise _Landed(code)
+        return 0                # FALSE: the kernel refused the kill
+
+
+class HardExitTests(_WatchdogBase):
+    """2026-10-13: the v2.0.191 gate printed "exiting 3" at 09:43:39 and its
+    python.exe was still alive ~26 h later — os._exit is ExitProcess, which
+    can wedge in DLL detach under the loader lock. These pin the replacement:
+    TerminateProcess on our own pseudo-handle, os._exit only as the fallback."""
+
+    def _hard_exit(self, k32):
+        fallback: list = []
+        with mock.patch.object(tw, "_k32", k32), \
+             mock.patch.object(tw, "_os_exit", fallback.append):
+            try:
+                tw._hard_exit(tw.EXIT_CODE)
+                landed = False
+            except _Landed:
+                landed = True
+        return landed, fallback
+
+    def test_the_watchdogs_exit_is_the_hard_exit_not_a_raw_os_exit(self):
+        self.assertIs(tw._exit, tw._hard_exit,
+                      "the fire path must end in _hard_exit — a bare os._exit "
+                      "here is the 26-hour zombie of 2026-10-13")
+
+    def test_it_terminates_the_current_process_with_the_exit_code(self):
+        k32 = _FakeKernel32()
+        landed, fallback = self._hard_exit(k32)
+        self.assertTrue(landed, "TerminateProcess was never called")
+        self.assertEqual(k32.calls, [
+            ("GetCurrentProcess",),
+            ("TerminateProcess", _FakeKernel32.PSEUDO_HANDLE, tw.EXIT_CODE)])
+        self.assertEqual(fallback, [],
+                         "os._exit ran although TerminateProcess had landed")
+
+    def test_a_refused_kill_falls_back_to_os_exit(self):
+        k32 = _FakeKernel32(lands=False)
+        landed, fallback = self._hard_exit(k32)
+        self.assertFalse(landed)
+        self.assertEqual(k32.calls[-1][0], "TerminateProcess",
+                         "the fallback must come AFTER the hard kill was tried")
+        self.assertEqual(fallback, [tw.EXIT_CODE])
+
+    def test_a_raising_kernel32_still_falls_back_to_os_exit(self):
+        k32 = _FakeKernel32(raises=OSError("access denied"))
+        landed, fallback = self._hard_exit(k32)
+        self.assertFalse(landed)
+        self.assertEqual(fallback, [tw.EXIT_CODE],
+                         "an exception on the kill path must never leave the "
+                         "process alive")
+
+    def test_no_kernel32_means_os_exit(self):
+        landed, fallback = self._hard_exit(None)
+        self.assertFalse(landed)
+        self.assertEqual(fallback, [tw.EXIT_CODE])
+
+    def test_a_blown_budget_reaches_terminate_process(self):
+        """The whole fire path, NOT patching _exit: dump, dump, then the kill
+        at the kernel32 seam. This is the call the 2026-10-13 run never made."""
+        k32 = _FakeKernel32()
+        fallback: list = []
+        with mock.patch.object(tw, "_k32", k32), \
+             mock.patch.object(tw, "_os_exit", fallback.append), \
+             mock.patch.object(tw, "DUMP_GRACE_S", 0.0), \
+             mock.patch.object(tw, "_dump"), \
+             mock.patch.object(tw, "_write") as write:
+            with self.assertRaises(_Landed):
+                tw._fire("phase exceeded 1s: test tests.foo.test_bar",
+                         lambda: True)
+        self.assertIn(("TerminateProcess", _FakeKernel32.PSEUDO_HANDLE,
+                       tw.EXIT_CODE), k32.calls)
+        self.assertEqual(fallback, [])
+        said = " ".join(str(c.args[1]) for c in write.call_args_list
+                        if len(c.args) > 1)
+        self.assertIn("exiting %d via TerminateProcess" % tw.EXIT_CODE, said,
+                      "the log must say which kill was attempted")
+
+    @unittest.skipUnless(os.name == "nt", "TerminateProcess is Windows-only")
+    def test_kernel32_is_bound_with_pointer_sized_handles(self):
+        # os.name, not sys.platform: ci-sim fakes the latter after this module
+        # bound kernel32, which is exactly why the binding happens at import.
+        from ctypes import wintypes
+        self.assertIsNotNone(tw._k32, "no hard kill available on Windows")
+        self.assertIs(tw._k32.GetCurrentProcess.restype, wintypes.HANDLE)
+        self.assertEqual(list(tw._k32.TerminateProcess.argtypes),
+                         [wintypes.HANDLE, wintypes.UINT])
+
+    def test_the_only_os_exit_left_is_the_fallback_binding(self):
+        """Structural: one ``os._exit`` reference in the module, and it is the
+        ``_os_exit = os._exit`` binding _hard_exit falls back to."""
+        tree = ast.parse(_source(os.path.join(_TOOLS_DIR, "test_watchdog.py")))
+        uses = [n for n in ast.walk(tree)
+                if isinstance(n, ast.Attribute) and n.attr == "_exit"
+                and isinstance(n.value, ast.Name) and n.value.id == "os"]
+        self.assertEqual(len(uses), 1, "a raw os._exit crept back in")
+        binding = [n for n in tree.body if isinstance(n, ast.Assign)
+                   and n.value is uses[0]]
+        self.assertEqual([t.id for t in binding[0].targets] if binding else [],
+                         ["_os_exit"])
+
+
+class RealProcessExitTests(unittest.TestCase):
+    """End to end in a CHILD interpreter: arm with a 0.2 s budget, wedge the
+    main thread, and require the process to be gone with EXIT_CODE.
+
+    Bounded the 11e way (memory: subprocess.run's timeout is not a bound on
+    Windows): output to a file, never a pipe, then Popen.wait(timeout)."""
+
+    _CHILD = "\n".join((
+        "import os, sys, threading",
+        "sys.path.insert(0, sys.argv[1])",
+        "wedge = threading.Event()",
+        "if sys.argv[2] == 'wedged-os-exit':",
+        "    def _never_returns(code):",
+        "        os.write(1, b'os._exit reached\\n')",
+        "        wedge.wait()",
+        "    os._exit = _never_returns",
+        "from tools import test_watchdog as tw",
+        "tw.DUMP_GRACE_S = 0.0",
+        "tw.arm(per_phase_s=0.2, total_s=0.0)",
+        "wedge.wait()",
+    ))
+
+    def _run_child(self, mode: str):
+        env = {k: v for k, v in os.environ.items()
+               if k not in (tw.PER_PHASE_ENV, tw.TOTAL_ENV)}
+        with tempfile.TemporaryFile() as out:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", self._CHILD, _PROJECT_ROOT, mode],
+                cwd=_PROJECT_ROOT, env=env, stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT)
+            try:
+                rc = proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+                rc = None
+            out.seek(0)
+            text = out.read().decode("utf-8", "replace")
+        return rc, text
+
+    def test_a_wedged_run_really_dies_with_the_exit_code(self):
+        rc, text = self._run_child("plain")
+        self.assertEqual(rc, tw.EXIT_CODE,
+                         "the watchdog fired but the process did not end with "
+                         "EXIT_CODE (None = still alive after 60 s):\n" + text[-2000:])
+
+    @unittest.skipUnless(os.name == "nt", "the ExitProcess wedge is Windows-only")
+    def test_it_dies_even_when_os_exit_would_never_return(self):
+        """The 2026-10-13 shape: os._exit hangs (here a stand-in that never
+        returns, installed before the import). The old watchdog printed
+        'exiting 3', reached it and wedged; this one must not reach it."""
+        rc, text = self._run_child("wedged-os-exit")
+        self.assertNotIn("os._exit reached", text,
+                         "TerminateProcess did not land; it fell through to the "
+                         "os._exit that wedged the v2.0.191 gate")
+        self.assertEqual(rc, tw.EXIT_CODE, text[-2000:])
+
+
+class ClockIsolationTests(_WatchdogBase):
+    """tests/_monolith_harness.shift_monotonic moves time.monotonic 30 days
+    ahead for a test. The 2026-10-14 gate log shows the watchdog reading that
+    patched clock: 'phase exceeded 120s (2.592e+06 elapsed)' on a test that
+    had only just started."""
+
+    def test_a_test_that_shifts_the_clock_cannot_trip_the_watchdog(self):
+        stop = threading.Event()
+        tw._state.update({"stop": stop, "per_phase": 120.0, "total": 900.0,
+                          "run_start": time.monotonic()})
+        tw.note("test tests.x.ShiftedClockTests.test_y")
+        real = time.monotonic
+        with mock.patch.object(time, "monotonic",
+                               lambda: real() + 30 * 86400.0):
+            self.assertIsNone(tw._blown(stop))
+
+    def test_a_patched_sleep_cannot_shrink_the_grace_window(self):
+        with mock.patch.object(time, "sleep") as patched_sleep, \
+             mock.patch.object(tw, "DUMP_GRACE_S", 0.0), \
+             mock.patch.object(tw, "_exit", lambda code: None), \
+             mock.patch.object(tw, "_dump"), mock.patch.object(tw, "_write"):
+            tw._fire("phase exceeded 1s: test x", lambda: True)
+        patched_sleep.assert_not_called()
 
 
 # ── arm / disarm ────────────────────────────────────────────────────────────
