@@ -247,7 +247,7 @@ class ListenerTests(unittest.TestCase):
             self.assertEqual(ht._ws_url(), "ws://127.0.0.1:8793")
 
 
-class ActionTests(unittest.TestCase):
+class _ActionBase(unittest.TestCase):
     def setUp(self):
         self.la = FakeLauncher()
         for target, kw in ((ht, {"_launcher": lambda: self.la}),):
@@ -269,6 +269,8 @@ class ActionTests(unittest.TestCase):
         q.start()
         self.addCleanup(q.stop)
 
+
+class ActionTests(_ActionBase):
     def test_on_starts_the_tracker_and_the_listener(self):
         out = ht._hand_tracking_on()
         self.assertIn("Hand tracking is on", out)
@@ -333,3 +335,64 @@ class ActionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HologramOwnershipTests(_ActionBase):
+    """The hologram starts the tracker when it isn't running and stops only a
+    tracker IT started (by voice close, or its window gone 45 s); a tracker
+    the owner turned on is never stopped by the hologram."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ht, "_start_holo_watch")
+        self.watch = p.start()
+        self.addCleanup(p.stop)
+        ht._holo.update(owned=False, idle_since=None)
+        self.addCleanup(lambda: ht._holo.update(owned=False, idle_since=None))
+
+    def test_hologram_starts_the_tracker_and_owns_it(self):
+        ok, msg = ht.ensure_for_holo()
+        self.assertTrue(ok)
+        self.assertEqual(self.la.started, 1)
+        self.assertTrue(ht._holo["owned"])
+        self.watch.assert_called_once()
+        self.assertTrue(ht.release_for_holo())
+        self.assertEqual(self.la.stopped, 1)
+        self.assertFalse(config.HAND_TRACKING_ENABLED)
+
+    def test_hologram_never_stops_the_owners_tracker(self):
+        ht._hand_tracking_on()
+        ok, msg = ht.ensure_for_holo()
+        self.assertEqual((ok, msg), (True, "already running"))
+        self.assertFalse(ht._holo["owned"])
+        self.assertFalse(ht.release_for_holo())
+        self.assertEqual(self.la.stopped, 0)
+
+    def test_owner_turning_it_on_takes_it_over(self):
+        ht.ensure_for_holo()
+        ht._hand_tracking_on()
+        self.assertFalse(ht._holo["owned"])
+        self.assertFalse(ht.release_for_holo())
+        self.assertEqual(self.la.stopped, 0)
+
+    def test_a_failed_start_owns_nothing(self):
+        self.la._start = (False, "the tracker's Python isn't installed")
+        ok, msg = ht.ensure_for_holo()
+        self.assertFalse(ok)
+        self.assertIn("Python", msg)
+        self.assertFalse(ht._holo["owned"])
+        self.watch.assert_not_called()
+
+    def test_window_gone_45_s_stops_it_and_a_live_window_resets_the_clock(self):
+        ht.ensure_for_holo()
+        ht._holo["idle_since"] = None
+        self.assertFalse(ht._holo_watch_step(100.0, False))      # starts the clock
+        self.assertFalse(ht._holo_watch_step(140.0, False))      # 40 s: not yet
+        self.assertFalse(ht._holo_watch_step(141.0, True))       # window back
+        self.assertIsNone(ht._holo["idle_since"])
+        self.assertFalse(ht._holo_watch_step(150.0, False))
+        self.assertFalse(ht._holo_watch_step(190.0, False))
+        self.assertTrue(ht._holo_watch_step(195.0, False))       # 45 s gone
+        self.assertEqual(self.la.stopped, 1)
+        self.assertFalse(ht._holo_watch_step(300.0, False))      # nothing left
+

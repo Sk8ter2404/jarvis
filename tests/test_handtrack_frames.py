@@ -82,21 +82,23 @@ class WriterTests(unittest.TestCase):
         self.assertIsNone(self.w._shm)                    # no segment even created
         hf.publish_frame({"primary": True}, self.frame(), setting="primary")  # no raise
 
-    def test_publish_round_trip_resizes_to_640x480(self):
+    def test_publish_round_trip_keeps_the_aspect(self):
+        # 1280x720 (16:9) -> 640x360, NOT stretched to 640x480: a stretched
+        # frame squeezes every hand ~25 % narrower and skews finger angles.
         self.heartbeat()
         src = self.frame(77)
         self.assertTrue(self.w.publish(src))
         shm = self.attach()
         head = hf.unpack_header(shm.buf)
         self.assertEqual((head["seq"], head["width"], head["height"], head["channels"]),
-                         (1, 640, 480, 3))
+                         (1, 640, 360, 3))
         self.assertEqual(head["seq_begin"], head["seq"])
         got = hf.read_frame(shm.buf, 0)
         self.assertIsNotNone(got)
         seq, ts, frame = got
         self.assertEqual(seq, 1)
-        self.assertEqual(frame.shape, (480, 640, 3))
-        want = cv2.resize(src, (640, 480), interpolation=cv2.INTER_AREA)
+        self.assertEqual(frame.shape, (360, 640, 3))
+        want = cv2.resize(src, (640, 360), interpolation=cv2.INTER_AREA)
         self.assertTrue((frame == want).all())
         self.assertAlmostEqual(ts / 1000.0, self.wall[0], delta=1.0)
         self.assertIsNone(hf.read_frame(shm.buf, 1))      # no new frame yet
@@ -119,6 +121,32 @@ class WriterTests(unittest.TestCase):
         self.assertTrue(self.w.publish(src))
         shm = self.attach()
         self.assertTrue((hf.read_frame(shm.buf, 0)[2] == src).all())
+
+    def test_fit_size(self):
+        self.assertEqual(hf.fit_size(1280, 720), (640, 360))
+        self.assertEqual(hf.fit_size(1920, 1080), (640, 360))
+        self.assertEqual(hf.fit_size(640, 480), (640, 480))
+        self.assertEqual(hf.fit_size(1024, 1024), (480, 480))
+        self.assertEqual(hf.fit_size(320, 240), (320, 240))      # never enlarged
+        self.assertEqual(hf.fit_size(0, 0), (640, 480))
+
+    def test_size_can_change_between_frames(self):
+        self.heartbeat()
+        self.assertTrue(self.w.publish(self.frame(5)))            # 16:9
+        self.clock.t += 0.05
+        self.assertTrue(self.w.publish(self.frame(6, 640, 480)))  # 4:3
+        shm = self.attach()
+        seq, _ts, frame = hf.read_frame(shm.buf, 1)
+        self.assertEqual((seq, frame.shape), (2, (480, 640, 3)))
+        self.assertEqual(int(frame[200, 200, 0]), 6)
+
+    def test_oversized_header_is_rejected(self):
+        self.heartbeat()
+        self.w.publish(self.frame())
+        shm = self.attach()
+        import struct
+        struct.pack_into("<II", shm.buf, hf.OFF_WH, 800, 600)
+        self.assertIsNone(hf.read_frame(shm.buf, 0))
 
     def test_torn_frame_is_rejected(self):
         self.heartbeat()

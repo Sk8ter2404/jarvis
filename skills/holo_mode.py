@@ -189,6 +189,36 @@ def _off_line() -> str:
 
 
 # --- actions ------------------------------------------------------------------
+def _tracker():
+    """The LOADED hand_tracking skill (it owns the tracker service), or None."""
+    return sys.modules.get("skill_hand_tracking")
+
+
+def _ensure_tracker() -> str:
+    """Start the hand tracker for the hologram when it isn't running (the
+    owner asked for the hologram, which needs the camera). Returns "" or a
+    short honest note to add to the reply. Never raises."""
+    trk = _tracker()
+    if trk is None or not hasattr(trk, "ensure_for_holo"):
+        return " Hand tracking isn't loaded, so it won't see your hands."
+    try:
+        ok, msg = trk.ensure_for_holo()
+    except Exception as e:                        # pragma: no cover - defensive
+        ok, msg = False, type(e).__name__
+    if ok:
+        return ""
+    return f" Hand tracking couldn't start ({msg}), so it won't see your hands."
+
+
+def _release_tracker() -> None:
+    trk = _tracker()
+    if trk is not None and hasattr(trk, "release_for_holo"):
+        try:
+            trk.release_for_holo()
+        except Exception:                         # pragma: no cover - defensive
+            pass
+
+
 def holo_mode_on(arg: str = "") -> str:
     if not _enabled():
         return _off_line()
@@ -196,15 +226,16 @@ def holo_mode_on(arg: str = "") -> str:
     st = holo_web.STATE
     if _opening():
         return "It's still coming up, sir."
+    note = _ensure_tracker()
     if st.page_alive:
         if st.mode != mode:
             st.push_command("mode", mode)
-            return "Switched the hologram view, sir."
-        return "Holo mode is already up, sir."
+            return "Switched the hologram view, sir." + note
+        return "Holo mode is already up, sir." + note
     ok, why = _open_page(mode)
     if not ok:
         return why
-    return "Hand menu up, sir." if mode == "desktop" else "Holo mode up, sir."
+    return ("Hand menu up, sir." if mode == "desktop" else "Holo mode up, sir.") + note
 
 
 def hand_menu(arg: str = "") -> str:
@@ -219,6 +250,7 @@ def holo_mode_off(arg: str = "") -> str:
         return "Holo mode isn't up, sir."
     st.push_command("close")
     st.set_on(False)
+    _release_tracker()
     return "Holo mode closed, sir."
 
 

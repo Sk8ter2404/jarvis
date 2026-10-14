@@ -176,7 +176,11 @@ class HoloActionTests(unittest.TestCase):
             mock.patch.object(holo_mode, "_launch_window",
                               side_effect=lambda u: self.opened.append(u) or True),
             mock.patch.object(holo_mode, "_enabled", return_value=True),
+            mock.patch.object(holo_mode, "_tracker", side_effect=lambda: self.trk),
         ]
+        self.trk = mock.Mock()
+        self.trk.ensure_for_holo.return_value = (True, "started")
+        self.trk.release_for_holo.return_value = True
         for p in self._patches:
             p.start()
         holo_mode._last_open[0] = 0.0
@@ -199,6 +203,28 @@ class HoloActionTests(unittest.TestCase):
         self.assertEqual(holo_mode.hand_menu(), "Hand menu up, sir.")
         self.assertEqual(self.opened, ["http://127.0.0.1:8766/holo?mode=desktop"])
         self.assertEqual(self.state.mode, "desktop")
+
+    def test_the_hologram_starts_the_hand_tracker(self):
+        holo_mode.holo_mode_on()
+        self.trk.ensure_for_holo.assert_called_once()
+        holo_mode.hand_menu()                     # already opening: no second start
+        self.assertEqual(self.trk.ensure_for_holo.call_count, 1)
+
+    def test_a_tracker_that_cannot_start_is_said(self):
+        self.trk.ensure_for_holo.return_value = (False, "the hand model file isn't downloaded")
+        out = holo_mode.holo_mode_on()
+        self.assertTrue(out.startswith("Holo mode up, sir."))
+        self.assertIn("couldn't start (the hand model file isn't downloaded)", out)
+        self.assertIn("won't see your hands", out)
+
+    def test_no_hand_tracking_skill_is_said(self):
+        self.trk = None
+        self.assertIn("isn't loaded", holo_mode.holo_mode_on())
+
+    def test_closing_the_hologram_releases_the_tracker(self):
+        self._page_up()
+        self.assertEqual(holo_mode.holo_mode_off(), "Holo mode closed, sir.")
+        self.trk.release_for_holo.assert_called_once()
 
     def test_mode_words(self):
         for arg, mode in (("desktop", "desktop"), ("hand menu", "desktop"),

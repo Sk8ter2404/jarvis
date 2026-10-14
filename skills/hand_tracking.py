@@ -294,7 +294,90 @@ def start_tracking() -> tuple:
     return ok, msg
 
 
+# ── the hologram's own use of the tracker ───────────────────────────────
+# "Open up the hologram" needs the camera, so holo_mode_on (skills/holo_mode.py)
+# starts the tracker when it isn't running. Only a tracker the HOLOGRAM started
+# is stopped again when the hologram closes - by voice, or when its window has
+# been gone for HOLO_IDLE_STOP_S. One the owner turned on ("hand tracking on" or
+# the boot setting) stays his: the hologram never turns it off.
+HOLO_IDLE_STOP_S = 45.0
+HOLO_WATCH_EVERY_S = 5.0
+_holo = {"owned": False, "idle_since": None, "watch": None}
+
+
+def _holo_page_alive() -> bool:
+    try:
+        from core import holo_web
+        return bool(holo_web.STATE.page_alive)
+    except Exception:
+        return False
+
+
+def ensure_for_holo() -> tuple:
+    """(ok, message): the hologram is opening - make sure the tracker runs.
+    Never raises."""
+    la = _launcher()
+    if la is not None and la.running():
+        return True, "already running"
+    ok, msg = start_tracking()
+    if ok and msg != "already running":
+        _holo["owned"] = True
+        _holo["idle_since"] = time.monotonic()   # grace while the window opens
+        _start_holo_watch()
+    return ok, msg
+
+
+def release_for_holo() -> bool:
+    """The hologram closed: stop the tracker only if the hologram started it.
+    True when it was stopped."""
+    if not _holo["owned"]:
+        return False
+    _holo["owned"] = False
+    _holo["idle_since"] = None
+    _stop_listener()
+    la = _launcher()
+    if la is not None:
+        la.stop()
+    _set_runtime(False)
+    print(f"{LOG} hologram closed - stopped the tracker it started")
+    return True
+
+
+def _holo_watch_step(now: float, page_alive: bool) -> bool:
+    """One check of a hologram-owned tracker: True when it was stopped because
+    the hologram window has been gone for HOLO_IDLE_STOP_S."""
+    if not _holo["owned"]:
+        return False
+    if page_alive:
+        _holo["idle_since"] = None
+        return False
+    if _holo["idle_since"] is None:
+        _holo["idle_since"] = now
+        return False
+    if now - _holo["idle_since"] >= HOLO_IDLE_STOP_S:
+        return release_for_holo()
+    return False
+
+
+def _start_holo_watch() -> None:
+    t = _holo.get("watch")
+    if t is not None and t.is_alive():
+        return
+
+    def _loop():
+        while _holo["owned"]:
+            time.sleep(HOLO_WATCH_EVERY_S)
+            try:
+                _holo_watch_step(time.monotonic(), _holo_page_alive())
+            except Exception:
+                pass
+    t = threading.Thread(target=_loop, name="holo-tracker-watch", daemon=True)
+    _holo["watch"] = t
+    t.start()
+
+
 def _hand_tracking_on(_: str = "") -> str:
+    _holo["owned"] = False                 # the owner asked: it is his now
     ok, msg = start_tracking()
     if not ok:
         return f"I couldn't start hand tracking, sir: {msg}."
@@ -308,6 +391,8 @@ def _hand_tracking_on(_: str = "") -> str:
 
 
 def _hand_tracking_off(_: str = "") -> str:
+    _holo["owned"] = False
+    _holo["idle_since"] = None
     la = _launcher()
     was_on = bool(la is not None and (la.running() or la.wanted()))
     _stop_listener()

@@ -272,6 +272,7 @@ class Tracker:
         self.landmarker = None
         self.started = time.time()
         self.fps = 0.0
+        self._last_wh = (self.frames.WIDTH, self.frames.HEIGHT)
         self.processed = 0
         self.hands_now = 0
         self._last_beat = 0.0
@@ -418,18 +419,19 @@ class Tracker:
         if (not self._empty_sent and self._last_frame_at
                 and now - self._last_frame_at > 0.5):
             self._empty_sent = True
-            _infos, events = self.engine.update(now, [], self.frames.WIDTH,
-                                                self.frames.HEIGHT)
+            W, H = self._last_wh
+            _infos, events = self.engine.update(now, [], W, H)
             self.hands_now = 0
             self.hub.broadcast(json.dumps(
-                hands_message(int(time.time() * 1000), 0, self.frames.WIDTH,
-                              self.frames.HEIGHT, []), separators=(",", ":")))
+                hands_message(int(time.time() * 1000), 0, W, H, []),
+                separators=(",", ":")))
             for ev in events:
                 self.hub.broadcast(json.dumps(ev, separators=(",", ":")))
 
     def _process(self, seq: int, ts_ms: int, frame) -> None:
         cv2, mp = self._cv2, self._mp
-        W, H = self.frames.WIDTH, self.frames.HEIGHT
+        H, W = frame.shape[:2]                  # the frame's real size (aspect kept)
+        self._last_wh = (W, H)
         mirrored = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)

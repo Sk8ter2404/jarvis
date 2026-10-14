@@ -54,6 +54,10 @@ from typing import Optional, Tuple
 
 SHM_NAME = "jarvis_handtrack_frame"
 MAGIC = b"JVHT0001"
+# The segment holds up to WIDTH x HEIGHT; each frame is scaled to FIT inside
+# it keeping its own shape (a 16:9 webcam -> 640x360), and the header carries
+# the real width/height. Stretching 16:9 into 4:3 squeezed every hand ~25 %
+# narrower, which skews the finger angles the gestures are measured with.
 WIDTH = 640
 HEIGHT = 480
 CHANNELS = 3
@@ -65,6 +69,7 @@ TOTAL_SIZE = HEADER_SIZE + FRAME_BYTES
 _HEAD_FMT = "<8sQQIIIIQ"
 _HEAD_BYTES = struct.calcsize(_HEAD_FMT)          # 48
 OFF_SEQ = 8
+OFF_WH = 24                    # width, height (u32 each)
 OFF_SEQ_BEGIN = 40
 
 ALIVE_MAX_AGE_S = 3.0          # tracker heartbeat older than this = inactive
@@ -121,6 +126,18 @@ def unpack_header(buf) -> Optional[dict]:
             "channels": ch, "seq_begin": begin}
 
 
+def fit_size(w: int, h: int) -> Tuple[int, int]:
+    """(width, height) of a ``w`` x ``h`` frame scaled to fit WIDTH x HEIGHT
+    with its aspect kept; never enlarged; even numbers (JPEG-friendly)."""
+    w, h = int(w), int(h)
+    if w <= 0 or h <= 0:
+        return WIDTH, HEIGHT
+    scale = min(WIDTH / w, HEIGHT / h, 1.0)
+    tw = max(2, min(WIDTH, int(round(w * scale)) // 2 * 2))
+    th = max(2, min(HEIGHT, int(round(h * scale)) // 2 * 2))
+    return tw, th
+
+
 def _frame_matches(frame) -> bool:
     try:
         return (frame is not None and frame.ndim == 3 and frame.shape[2] == CHANNELS
@@ -161,7 +178,8 @@ class HandTrackFrames:
         self._shm_factory = shm_factory          # tests: a fake segment type
         self._shm_name = shm_name
         self._shm = None
-        self._view = None                        # numpy (H, W, 3) view of the pixels
+        self._view = None                        # numpy view of the pixels (current size)
+        self._view_wh = (0, 0)
         self._seq = 0
         self._active = False
         self._next_check = 0.0
@@ -212,12 +230,23 @@ class HandTrackFrames:
         buf[:HEADER_SIZE] = pack_header(self._seq, 0)
         self._view = np.ndarray((HEIGHT, WIDTH, CHANNELS), dtype=np.uint8,
                                 buffer=buf, offset=HEADER_SIZE)
+        self._view_wh = (WIDTH, HEIGHT)
         return True
+
+    def _view_for(self, tw: int, th: int):
+        """A (th, tw, 3) view at the start of the pixel area (cached by size)."""
+        if self._view_wh != (tw, th):
+            import numpy as np
+            self._view = np.ndarray((th, tw, CHANNELS), dtype=np.uint8,
+                                    buffer=self._shm.buf, offset=HEADER_SIZE)
+            self._view_wh = (tw, th)
+        return self._view
 
     def close(self) -> None:
         """Release the segment (the OS frees it once the tracker lets go too)."""
         view, shm = self._view, self._shm
         self._view = None
+        self._view_wh = (0, 0)
         self._shm = None
         del view
         if shm is not None:
@@ -248,17 +277,19 @@ class HandTrackFrames:
             self._open()
             import cv2
             h, w = frame.shape[:2]
-            if (w, h) != (WIDTH, HEIGHT):
-                small = cv2.resize(frame, (WIDTH, HEIGHT),
-                                   interpolation=cv2.INTER_AREA)
+            tw, th = fit_size(w, h)
+            if (w, h) != (tw, th):
+                small = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_AREA)
             else:
                 small = frame
             buf = self._shm.buf
             ts = int(self._wall() * 1000)
             nxt = self._seq + 1
-            # seqlock: announce the write, copy, then publish the new seq.
+            # seqlock: announce the write, copy pixels + size, then publish the
+            # new seq (a reader that sees seq_begin != seq skips the frame).
             struct.pack_into("<Q", buf, OFF_SEQ_BEGIN, nxt)
-            self._view[:, :, :] = small
+            self._view_for(tw, th)[:, :, :] = small
+            struct.pack_into("<II", buf, OFF_WH, tw, th)
             struct.pack_into("<QQ", buf, OFF_SEQ, nxt, ts)   # seq then timestamp
             self._seq = nxt
             self._last_pub = now
@@ -321,7 +352,8 @@ def read_frame(buf, last_seq: int = 0) -> Optional[Tuple[int, int, "object"]]:
     if hdr is None or hdr["seq"] == last_seq or hdr["seq"] == 0:
         return None
     w, h, c = hdr["width"], hdr["height"], hdr["channels"]
-    if (w, h, c) != (WIDTH, HEIGHT, CHANNELS) or hdr["seq_begin"] != hdr["seq"]:
+    if (not (0 < w <= WIDTH and 0 < h <= HEIGHT) or c != CHANNELS
+            or hdr["seq_begin"] != hdr["seq"]):
         return None
     view = np.ndarray((h, w, c), dtype=np.uint8, buffer=buf, offset=HEADER_SIZE)
     frame = view.copy()
