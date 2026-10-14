@@ -579,6 +579,75 @@ def hand_tracking_route(utterance) -> str | None:
         return None
 
 
+# ── the hologram window (2026-10-14) ────────────────────────────────────────
+# The owner: "if I do want the hologram thing, I can say hey open up the
+# hologram thing and it'll open up my camera". Whole open / close / hand-menu
+# requests route without the brain. The older holographic OVERLAY keeps its own
+# words ("holographic overlay", "the holo HUD") and "hologram" is never them.
+# "Show me the arc reactor", "explode it" and "put it back together" are the
+# hologram's ONLY while its window is up: otherwise "show the arc reactor" stays
+# the compact corner canvas (arc_reactor) the brain already knows, and a stray
+# "explode it" is left to the brain - a camera window never opens on a guess.
+_HOLO_NAME = r"(?:the\s+|my\s+)?hologram(?:\s+(?:thing|mode|view|window))?"
+_HOLO_ON_RE = re.compile(
+    r"^(?:(?:open|bring|pull|fire|put)\s+up\s+" + _HOLO_NAME
+    + r"|(?:open|show(?:\s+me)?|start|launch|activate|load)\s+" + _HOLO_NAME
+    + r"|(?:turn|switch)\s+on\s+" + _HOLO_NAME
+    + r"|(?:turn|switch)\s+" + _HOLO_NAME + r"\s+on"
+    + r"|" + _HOLO_NAME + r"\s+on)$", re.IGNORECASE)
+_HOLO_OFF_RE = re.compile(
+    r"^(?:(?:close|hide|dismiss|kill|exit|stop|end)\s+" + _HOLO_NAME
+    + r"|(?:turn|switch|shut)\s+off\s+" + _HOLO_NAME
+    + r"|(?:turn|switch|shut)\s+" + _HOLO_NAME + r"\s+(?:off|down)"
+    + r"|shut\s+down\s+" + _HOLO_NAME
+    + r"|" + _HOLO_NAME + r"\s+off)$", re.IGNORECASE)
+_HAND_MENU_RE = re.compile(
+    r"^(?:(?:(?:open|bring|pull)\s+up|open|show(?:\s+me)?)\s+)?(?:the\s+|my\s+)?"
+    r"hand\s+menu$", re.IGNORECASE)
+_HOLO_REACTOR_RE = re.compile(
+    r"^(?:(?:show|give|bring|pull|put|spawn|load)(?:\s+(?:me|up))?\s+)?(?:the\s+|an\s+|a\s+)?"
+    r"arc\s+reactor(?:\s+(?:up|back))?$", re.IGNORECASE)
+_HOLO_EXPLODE_RE = re.compile(
+    r"^(?:explode|blow\s+up|blow\s+apart|break\s+apart)\s+(?:it|that|the\s+(?:arc\s+)?reactor)"
+    r"|^(?:explode|blow\s+it\s+(?:up|apart))$", re.IGNORECASE)
+_HOLO_ASSEMBLE_RE = re.compile(
+    r"^(?:put\s+(?:it|that|the\s+(?:arc\s+)?reactor)\s+back\s+together"
+    r"|reassemble(?:\s+(?:it|that|the\s+(?:arc\s+)?reactor))?"
+    r"|(?:re)?build\s+it|assemble\s+(?:it|that))$", re.IGNORECASE)
+
+
+def holo_route(utterance, holo_up: bool = False) -> str | None:
+    """The hologram window's action token for a WHOLE request, else None:
+    open / close the hologram and the hand menu always; the arc reactor,
+    explode and reassemble only while the window is up (``holo_up``).
+    Never raises."""
+    try:
+        if not isinstance(utterance, str) or not utterance.strip():
+            return None
+        s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
+        s = _strip_lead_filler(s)
+        s = " ".join(_strip(s).split())
+        s = " ".join(_strip(_HT_POLITE_RE.sub("", s)).split())
+        s = " ".join(_HT_POLITE_RE.sub("", s).split())
+        if _HOLO_ON_RE.match(s):
+            return "[ACTION: holo_mode_on]"
+        if _HOLO_OFF_RE.match(s):
+            return "[ACTION: holo_mode_off]"
+        if _HAND_MENU_RE.match(s):
+            return "[ACTION: hand_menu]"
+        if not holo_up:
+            return None
+        if _HOLO_REACTOR_RE.match(s):
+            return "[ACTION: holo_show, arc reactor]"
+        if _HOLO_EXPLODE_RE.match(s):
+            return "[ACTION: holo_explode]"
+        if _HOLO_ASSEMBLE_RE.match(s):
+            return "[ACTION: holo_assemble]"
+        return None
+    except Exception:
+        return None
+
+
 # Map common spoken units to seconds (used by both timer and focus rules).
 _UNIT_SECONDS = {
     "second": 1, "seconds": 1, "sec": 1, "secs": 1,

@@ -321,6 +321,16 @@ def _setting() -> str:
         return "primary"
 
 
+def is_hand_camera(cam: dict, setting: Optional[str] = None) -> bool:
+    """True when ``cam`` is the camera HAND_TRACK_CAMERA names."""
+    which = _setting() if setting is None else setting
+    side = ""
+    if str(which).strip().lower() in ("left", "right"):
+        from core import camera_tiles
+        side = camera_tiles.percam_side(cam)
+    return camera_matches(which, cam, side)
+
+
 def publish_frame(cam: dict, frame, setting: Optional[str] = None) -> None:
     """The ONE call the camera loop makes per good frame: if the tracker is
     alive and ``cam`` is the camera HAND_TRACK_CAMERA names, hand it the
@@ -329,15 +339,47 @@ def publish_frame(cam: dict, frame, setting: Optional[str] = None) -> None:
         if not WRITER.active():
             WRITER.publish(None)          # lets an idle segment close itself
             return
-        which = _setting() if setting is None else setting
-        side = ""
-        if str(which).strip().lower() in ("left", "right"):
-            from core import camera_tiles
-            side = camera_tiles.percam_side(cam)
-        if camera_matches(which, cam, side):
+        if is_hand_camera(cam, setting):
             WRITER.publish(frame)
     except Exception:
         pass
+
+
+# ── burst reads (2026-10-14) ────────────────────────────────────────────
+# Live on v2.0.194 the tracker got 5.8 fps: the face loop's own pace (one
+# read, a Haar face pass and a 50 ms nap per pass) on a ~30 fps camera. A
+# point-flick needs 3+ samples inside 0.18 s, so it could never fire. While
+# the tracker is alive, the loop now keeps reading THE TRACKER'S camera for
+# BURST_S right after its normal read - same thread, same capture handle, so
+# never a second reader - and hands every frame over. Face detection then runs
+# once on the newest frame, so face tracking keeps (about) its own cadence.
+BURST_S = 0.15
+
+
+def burst(cap, cam: dict, frame, beat=None, setting: Optional[str] = None,
+          budget_s: float = BURST_S, clock=time.monotonic):
+    """(newest_frame, extra_frames). While the tracker is alive and ``cam``
+    is its camera, read ``cap`` for up to ``budget_s`` and publish each good
+    frame. Stops at the first failed read (the loop's normal failure handling
+    sees the camera on its next pass). With no tracker: one cheap check and
+    ``(frame, 0)``. Never raises."""
+    n = 0
+    try:
+        if cap is None or not WRITER.active() or not is_hand_camera(cam, setting):
+            return frame, 0
+        end = clock() + budget_s
+        while clock() < end:
+            if beat is not None:
+                beat()
+            ret, f = cap.read()
+            if not ret or not _frame_matches(f):
+                break
+            WRITER.publish(f)
+            frame = f
+            n += 1
+    except Exception:
+        pass
+    return frame, n
 
 
 # ── reader half (the tracker service; also used by tests) ───────────────

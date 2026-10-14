@@ -398,6 +398,56 @@ class HoloPromptTests(unittest.TestCase):
                 self.assertIn(action, pr.turn_pc_block(q, self.FULL))
 
 
+class HoloVoiceRouteTests(unittest.TestCase):
+    """core/dispatcher.holo_route: whole hologram requests skip the brain; the
+    arc reactor / explode / reassemble words are the hologram's only while its
+    window is up, so a camera window never opens on a guess."""
+
+    def setUp(self):
+        from core.dispatcher import holo_route
+        self.r = holo_route
+
+    def test_open_close_and_hand_menu_always_route(self):
+        for t in ("Jarvis, open up the hologram thing.", "open the hologram",
+                  "bring up the hologram", "show me the hologram", "hologram on",
+                  "turn on the hologram please", "start hologram mode"):
+            self.assertEqual(self.r(t), "[ACTION: holo_mode_on]", t)
+        for t in ("close the hologram", "hologram off", "turn off the hologram",
+                  "hide the hologram window", "shut down the hologram"):
+            self.assertEqual(self.r(t), "[ACTION: holo_mode_off]", t)
+        for t in ("hand menu", "bring up the hand menu", "open my hand menu",
+                  "show me the hand menu"):
+            self.assertEqual(self.r(t), "[ACTION: hand_menu]", t)
+
+    def test_reactor_words_belong_to_the_hologram_only_while_it_is_up(self):
+        for t in ("show me the arc reactor", "arc reactor", "explode it",
+                  "put it back together", "reassemble it"):
+            self.assertIsNone(self.r(t, holo_up=False), t)
+        self.assertEqual(self.r("show me the arc reactor", holo_up=True),
+                         "[ACTION: holo_show, arc reactor]")
+        self.assertEqual(self.r("spawn the arc reactor", holo_up=True),
+                         "[ACTION: holo_show, arc reactor]")
+        for t in ("explode it", "blow it apart", "explode the arc reactor"):
+            self.assertEqual(self.r(t, holo_up=True), "[ACTION: holo_explode]", t)
+        for t in ("put it back together", "reassemble it", "rebuild it",
+                  "put the reactor back together"):
+            self.assertEqual(self.r(t, holo_up=True), "[ACTION: holo_assemble]", t)
+
+    def test_the_old_overlay_and_other_requests_stay_with_the_brain(self):
+        for t in ("show the holographic overlay", "bring up the holo",
+                  "what is a hologram", "open up the hologram and play music",
+                  "is the hologram on", "hide the arc reactor", "", None, 42):
+            self.assertIsNone(self.r(t, holo_up=True), t)
+
+    def test_the_route_is_wired_after_the_hand_tracking_route(self):
+        with open(os.path.join(_ROOT, "bobert_companion.py"), encoding="utf-8") as f:
+            src = f.read()
+        i = src.index("from core.dispatcher import hand_tracking_route as _ht_route")
+        j = src.index("from core.dispatcher import holo_route as _holo_route")
+        self.assertLess(i, j)
+        self.assertIn("holo_up=bool(_holo_web.STATE.page_alive)", src[j:j + 300])
+
+
 # --- the page's static contract ----------------------------------------------
 class HoloPageContractTests(unittest.TestCase):
     PAGE_FILES = ("holo.html", "holo.js", "gestures.js", "reactor.js",

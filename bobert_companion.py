@@ -12708,6 +12708,7 @@ def _face_tracking_thread_body():
             #   preview_fallback  - (cam, frame) of a HEALTHY non-primary that
             #                       produced a real frame this iteration.
             primary_published = False
+            _ht_burst_ran = False           # hand-tracker burst read this pass
             preview_fallback: tuple[dict, "np.ndarray"] | None = None
 
             now_loop = time.time()
@@ -13114,6 +13115,16 @@ def _face_tracking_thread_body():
                 # compare. It never raises and never touches the capture handle.
                 if not _black:
                     _handtrack_frames.publish_frame(cam, frame)
+                    # BURST (2026-10-14): while the tracker is alive, keep
+                    # reading ITS camera ~0.15 s and hand every frame over
+                    # (live: the tracker got only this loop's ~6 fps). Same
+                    # thread and handle; detection below runs on the newest
+                    # frame. No tracker -> one cheap check, frame unchanged.
+                    frame, _ht_n = _handtrack_frames.burst(
+                        c, cam, frame,
+                        beat=lambda: _face_track_beat(f"hand burst camera {cam['index']}"))
+                    if _ht_n:
+                        _ht_burst_ran = True
                 # Per-camera preview: EVERY webcam publishes its own tile (the
                 # web Camera tab shows each eye individually); the primary-only
                 # composite below is unchanged. Same enable gate + throttle
@@ -13262,7 +13273,8 @@ def _face_tracking_thread_body():
                 _last_sent_x = _smooth_x
                 _last_sent_y = _smooth_y
 
-            time.sleep(0.05)
+            if not _ht_burst_ran:       # a burst already paced this pass
+                time.sleep(0.05)
         except Exception:
             logging.exception("[face-track] error in tracking loop iteration")
             time.sleep(0.1)
@@ -35528,6 +35540,20 @@ def _utterance_route_reply(text: str) -> "str | None":
     if _ht_m and _ht_m.group(1) in ACTIONS:
         print(f"  [route] hand tracking -> {_ht_m.group(1)}")
         return _ht_tok
+    # BUILT-IN route (2026-10-14): the hologram window - "open up the hologram",
+    # "close the hologram", "hand menu" always; "show me the arc reactor",
+    # "explode it", "put it back together" only while its window is up (else
+    # the arc reactor stays the corner canvas) - core/dispatcher.holo_route.
+    try:
+        from core.dispatcher import holo_route as _holo_route
+        from core import holo_web as _holo_web
+        _hl_tok = _holo_route(text, holo_up=bool(_holo_web.STATE.page_alive))
+    except Exception:
+        _hl_tok = None
+    _hl_m = _ROUTE_TOKEN_RE.match(_hl_tok) if _hl_tok else None
+    if _hl_m and _hl_m.group(1) in ACTIONS:
+        print(f"  [route] hologram -> {_hl_m.group(1)}")
+        return _hl_tok
     # BUILT-IN routes (2026-10-05): a NAMED close and "you forgot X" after a
     # bulk close -> close_window (_named_close_route_reply).
     _nc_tok = _named_close_route_reply(text)

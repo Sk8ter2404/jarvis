@@ -246,7 +246,97 @@ class CameraMatchTests(unittest.TestCase):
             cm.assert_not_called()
 
 
+class FakeCap:
+    """read() -> (True, frame) and advances the fake clock one camera frame."""
+    def __init__(self, clock, frames, dt=1 / 30, fail_after=None, boom=False):
+        self.clock, self.frames, self.dt = clock, frames, dt
+        self.fail_after, self.boom = fail_after, boom
+        self.reads = 0
+
+    def read(self):
+        if self.boom:
+            raise RuntimeError("driver hiccup")
+        self.reads += 1
+        self.clock.t += self.dt
+        if self.fail_after is not None and self.reads > self.fail_after:
+            return False, None
+        return True, self.frames[min(self.reads - 1, len(self.frames) - 1)]
+
+
+@unittest.skipIf(np is None, "needs numpy")
+class BurstTests(unittest.TestCase):
+    """While the tracker is alive the camera loop keeps reading the tracker's
+    camera ~0.15 s per pass (live v2.0.194: only 5.8 fps reached it)."""
+    CAM = {"index": 0, "primary": True}
+
+    def setUp(self):
+        self.clock = Clock()
+        self.frames = [np.full((4, 4, 3), i, np.uint8) for i in range(1, 40)]
+        p = mock.patch.object(hf.WRITER, "publish")
+        self.pub = p.start()
+        self.addCleanup(p.stop)
+
+    def _active(self, on=True):
+        p = mock.patch.object(hf.WRITER, "active", return_value=on)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_reads_the_camera_for_the_budget_and_publishes_each_frame(self):
+        self._active()
+        cap = FakeCap(self.clock, self.frames)
+        beats = []
+        first = np.zeros((4, 4, 3), np.uint8)
+        newest, n = hf.burst(cap, self.CAM, first, beat=lambda: beats.append(1),
+                             setting="primary", clock=self.clock)
+        self.assertEqual(n, cap.reads)
+        self.assertGreaterEqual(n, 4)                    # 0.15 s of a 30 fps camera
+        self.assertLessEqual(n, 6)
+        self.assertEqual(self.pub.call_count, n)
+        self.assertIs(newest, self.frames[n - 1])        # detection gets the newest
+        self.assertEqual(len(beats), n)                  # the loop watchdog stays fed
+
+    def test_no_tracker_means_no_extra_reads(self):
+        self._active(False)
+        cap = FakeCap(self.clock, self.frames)
+        first = np.zeros((4, 4, 3), np.uint8)
+        self.assertEqual(hf.burst(cap, self.CAM, first, setting="primary",
+                                  clock=self.clock), (first, 0))
+        self.assertEqual(cap.reads, 0)
+
+    def test_other_cameras_are_left_alone(self):
+        self._active()
+        cap = FakeCap(self.clock, self.frames)
+        other = {"index": 2, "primary": False, "label": "Left webcam"}
+        self.assertEqual(hf.burst(cap, other, "F", setting="primary",
+                                  clock=self.clock)[1], 0)
+        self.assertEqual(cap.reads, 0)
+
+    def test_a_failed_read_ends_the_burst(self):
+        self._active()
+        cap = FakeCap(self.clock, self.frames, fail_after=2)
+        newest, n = hf.burst(cap, self.CAM, "F", setting="primary", clock=self.clock)
+        self.assertEqual((n, cap.reads), (2, 3))
+        self.assertIs(newest, self.frames[1])
+
+    def test_never_raises(self):
+        self._active()
+        cap = FakeCap(self.clock, self.frames, boom=True)
+        self.assertEqual(hf.burst(cap, self.CAM, "F", setting="primary",
+                                  clock=self.clock), ("F", 0))
+        self.assertEqual(hf.burst(None, self.CAM, "F", setting="primary"), ("F", 0))
+
+
 class MonolithHookTests(unittest.TestCase):
+    def test_the_burst_follows_the_publish_and_skips_the_nap(self):
+        with open(os.path.join(_ROOT, "bobert_companion.py"), encoding="utf-8") as f:
+            src = f.read()
+        i = src.index("_handtrack_frames.publish_frame(cam, frame)")
+        j = src.index("_handtrack_frames.burst(", i)
+        self.assertLess(j - i, 800)
+        self.assertEqual(src.count("_handtrack_frames.burst("), 1)
+        self.assertIn("if not _ht_burst_ran:", src)
+        self.assertEqual(src.count("_ht_burst_ran = False"), 1)
+
     def test_one_guarded_call_in_the_camera_loop(self):
         with open(os.path.join(_ROOT, "bobert_companion.py"), encoding="utf-8") as f:
             src = f.read()
