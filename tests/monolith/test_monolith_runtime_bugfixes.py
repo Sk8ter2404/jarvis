@@ -2238,10 +2238,6 @@ class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
             "'search' is a bare-verb alias of the informative 'web_search'; "
             "left unrouted deliberately so a naked 'search' does not force a "
             "follow-up round-trip.",
-        ("skills/sh_kasa.py", "smart_home_control"):
-            "control_light / control_plug / kasa_control are side-effect "
-            "control aliases; the routed smart_home_control / control_device "
-            "pair carries the spoken confirmation for the family.",
         ("skills/trip_planner.py", "_action_status"):
             # Names elided on purpose: this skill is gitignored precisely
             # because its action names embed a one-off personal event, and this
