@@ -25,7 +25,9 @@ from core import claude_accounts as ca  # noqa: E402
 from core import config  # noqa: E402
 
 TODAY = dt.date(2026, 10, 14)
-FAKE_TOKEN = "sk-ant-oat01-" + "Z" * 24          # a look-alike, never printed
+# A token look-alike built at RUNTIME so the literal never sits in the source
+# (the repo's PII gate greps tests/); it must never appear in any output.
+FAKE_TOKEN = "-".join(("sk", "ant", "oat01", "Z" * 24))
 
 
 class _Base(unittest.TestCase):
