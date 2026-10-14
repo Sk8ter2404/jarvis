@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.198 (2026-10-14)
+
+Claude Code jobs can run on a second Claude subscription first. With a last-day date set, every Claude Code job JARVIS starts (upgrade loop, multi-agent pipeline, dry audit, overnight ideas) runs on a second Claude Code profile - its own sign-in folder - through that date, and on the main account whenever the second one is at its 5-hour or weekly limit, switching back when the limit resets. The sign-in stays inside Claude Code's own folder; JARVIS never reads or stores a token. The upgrade pipeline also recognises Claude Code's current limit wording again.
+
 ## v2.0.197 (2026-10-14)
 
 Test tooling only (no change to the running code): the GitHub CI job's time limit goes from 20 to 40 minutes. The job runs the whole suite twice (plain, then with coverage) and had grown to the edge; v2.0.196's run passed its tests and was cut off mid-coverage at exactly 20 minutes.
