@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.191 (2026-10-14)
+
+Direct smart-home control on the home network, with the voice-assistant cloud only as the fallback: Smart Life / Tuya lights and switches (the right on/off and brightness data points, confirmed by reading the device back), Magic Home LED controllers (on/off, brightness, colour, confirmed), and the BroadLink IR/RF hub (learns each remote button once by voice, then sends it locally; honest about toggle codes). Router and discovery brand tables are pinned to agree.
+
 ## v2.0.190 (2026-10-13)
 
 Smart-home commands that go through the voice assistant cloud now use the saved phone-app style sign-in (the old cookie is only a fallback), keep one connection open across commands instead of signing in each time, retry once on an expired session, report success only when the cloud confirms it, and pick up a new sign-in or a rewritten device list without a restart.

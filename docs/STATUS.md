@@ -4,9 +4,9 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.190
-- Live since: 2026-10-13
-- Latest change: v2.0.190 (10-13): smart-home commands through Alexa use the saved sign-in, one open connection, honest results.
+- Version: v2.0.191
+- Live since: 2026-10-14
+- Latest change: v2.0.191 (10-14): direct smart-home control for Smart Life lights, Magic Home LEDs and the BroadLink remote hub, Alexa only as fallback.
 
 ## In progress
 
@@ -62,6 +62,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.191 (2026-10-14): Direct smart-home control on the home network, with the voice-assistant cloud only as the fallback: Smart Life / Tuya lights and switches (the right on/off and brightness data points, confirmed by reading the device back), Magic Home LED controllers (on/off, brightness, colour, confirmed), and the BroadLink IR/RF hub (learns each remote button once by voice, then sends it locally; honest about toggle codes). Router and discovery brand tables are pinned to agree.
 - v2.0.190 (2026-10-13): Smart-home commands that go through the voice assistant cloud now use the saved phone-app style sign-in (the old cookie is only a fallback), keep one connection open across commands instead of signing in each time, retry once on an expired session, report success only when the cloud confirms it, and pick up a new sign-in or a rewritten device list without a restart.
 - v2.0.189 (2026-10-13): Queued speech can no longer be lost: a line whose speech fails is retried (up to 3 tries) and a queue file cut off mid-write keeps every intact line. The printer self-check reads the live monitor instead of opening a second connection (no more false FAILED). Cameras that drop off USB and come back are counted per camera with one 'check its cable' line. The last four open July-audit findings are fixed (overnight yes is answered, empty speech no longer clears another line's voice style, the local action list follows new actions, wake-word pause drops leftover audio). Dashboard accessibility fixes, an up-to-date FEATURES.md, and a test-order leak fixed.
 - v2.0.188 (2026-10-12): Test-only lint fix: clears the unused imports and one unused variable that made the GitHub CI lint step fail on v2.0.187. No change to the running code.
@@ -71,6 +72,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.184 (2026-10-12): JARVIS only announces a finished print he actually watched run (no "print complete" for a print finished while he was off, none when a new print's name arrives before the printer leaves FINISH, no replay after a restart, a stale queued finish line is ...
 - v2.0.183 (2026-10-09): "turn on/off hand tracking" works, "close that window" closes one, "u2"/"you two" means YouTube only inside open/close/play commands, a bare website name opens the site (no exe launch), the cold-start warm-up message tells the truth; "why can't I hear X" runs ...
 - v2.0.182 (2026-10-09): JARVIS shuts down when asked in plain words ("shut down, no overnight protocol", "yes, that is what I want") and still never on someone else's words; screen vision rebuilt (reads real buttons and links through UI Automation, OCR as backup, checks every click ...
-- v2.0.181 (2026-10-05): a named close closes that app (not "what I opened"), close-all keeps the running app and says when a title alone kept a window, "you forgot X" closes X, a misheard keep/close name gets "did you mean ...?", JARVIS never clicks or types on a sign-in page unless ...
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
