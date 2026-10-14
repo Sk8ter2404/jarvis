@@ -1139,6 +1139,15 @@ MUSIC_GATE_MODE            = "off"
 #   AUDIO_DUCKING_LEVEL for at most 8 s while he speaks.
 # WAKE_BARGEIN_MODE   'on' = saying "Jarvis" / "stop" over his own speech
 #   stops it (needs MIC_BUS_MODE and the pre-gate).
+# MEDIA_AEC_DRM_FALLBACK  protected video (HBO / Netflix) is silent in the
+#   loopback, so the canceller has no reference ("reference MISSING" in the
+#   log) while the speakers play loud. When the reference is missing AND
+#   media is known to play (media session / playback meter), 'on' = the
+#   wake duck applies to a confirmed wake even with WAKE_DUCK_MODE off, and
+#   the pre-gate threshold rises 0.10; both end 5 s after either clears.
+#   'shadow' = the same state change is logged ("[aec-fallback] ..." with
+#   the playing app's id, never the title) and nothing changes. Needs
+#   MEDIA_AEC_MODE 'shadow' or 'on' (that is what opens the loopback).
 WAKE_REANCHOR_MODE         = "shadow"
 WAKE_PREGATE_MODE          = "off"
 WAKE_PREGATE_THRESHOLD     = 0.15
@@ -1147,6 +1156,7 @@ MEDIA_AEC_MODE             = "off"
 WAKE_LOOPBACK_VETO         = "shadow"
 WAKE_DUCK_MODE             = "off"
 WAKE_BARGEIN_MODE          = "off"
+MEDIA_AEC_DRM_FALLBACK     = "shadow"
 # Constants, not in the Settings GUI. MEDIA_SEGMENT_S: with the bus on and
 # the echo not cancelled, a capture over media is cut every this many
 # seconds and the next starts 2 s earlier from the ring (0 = never).

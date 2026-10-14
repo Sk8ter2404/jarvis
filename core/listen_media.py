@@ -38,6 +38,9 @@ THE STAGES (each behind its own setting; see core/config.py)
   D1  WAKE_PREGATE_MODE 'on': the wake word starts the capture (PregateTrigger).
   D2  WAKE_LOOPBACK_VETO: a wake the video itself said is vetoed (vetoed_by).
   D3  WAKE_DUCK_MODE: media ducked after a confirmed wake.
+  E1  MEDIA_AEC_DRM_FALLBACK: the canceller's reference is missing (DRM
+      video) while media plays -> the wake duck and a stricter pre-gate
+      threshold stand in (DrmFallback; 2026-10-14).
   D4  owner-voice score of every confirmed cut (shadow, scores only).
 
 Everything logged here is numbers only - never a word that was heard.
@@ -95,6 +98,11 @@ SCORE_HISTORY_S = 30.0        # how long a score track remembers
 COUNTER_WINDOW_S = 60.0
 AMBIENT_MATCH_S = 10.0        # an ambient wake hit with no main turn this
                               # long after it counts as "main dropped"
+DRM_CLEAR_S = 5.0             # E1: the DRM fallback stays on this long after
+                              # the missing reference / the media clears
+DRM_STRICT_BUMP = 0.10        # E1: the pre-gate threshold rises this much
+                              # while the fallback is on
+DRM_APP_FALLBACK = "an unidentified app"
 
 
 # The shipped defaults of every listening-over-media setting - the ONE
@@ -111,13 +119,15 @@ DEFAULTS = {
     "MEDIA_AEC_MODE": "off",            # C1: 'shadow' after OD-2
     "WAKE_LOOPBACK_VETO": "shadow",     # D2 (needs the loopback)
     "WAKE_DUCK_MODE": "off",            # D3: OD-5
+    "MEDIA_AEC_DRM_FALLBACK": "shadow",  # E1: log-only until he flips it on
     "WAKE_BARGEIN_MODE": "off",         # D5: OD-7
     "MEDIA_SEGMENT_S": 12.0,            # B2 (0 = off)
     "MEDIA_AEC_BACKEND": "nlms",        # C3's 'windows_comms' is OD-4
 }
 OWNER_FACING = ("WAKE_REANCHOR_MODE", "WAKE_PREGATE_MODE",
                 "WAKE_PREGATE_THRESHOLD", "MIC_BUS_MODE", "MEDIA_AEC_MODE",
-                "WAKE_LOOPBACK_VETO", "WAKE_DUCK_MODE", "WAKE_BARGEIN_MODE")
+                "WAKE_LOOPBACK_VETO", "WAKE_DUCK_MODE", "WAKE_BARGEIN_MODE",
+                "MEDIA_AEC_DRM_FALLBACK")
 
 
 def mode3(value, default: str = "off") -> str:
@@ -320,8 +330,11 @@ class PregateTrigger:
     stream would have made at each of SHADOW_THRESHOLDS. Thread-safe."""
 
     def __init__(self, threshold: float = DEFAULT_THRESHOLD,
-                 rate_per_min: int = PREGATE_RATE_PER_MIN):
+                 rate_per_min: int = PREGATE_RATE_PER_MIN, strict=None):
         self.threshold = threshold_setting(threshold)
+        # E1: a callable returning an extra threshold (0.0 = none), read at
+        # every frame - the DRM fallback's stricter gate (never raises here).
+        self._strict = strict
         self._rate = int(rate_per_min)
         self._mu = threading.Lock()
         self._last_trigger = None
@@ -339,6 +352,11 @@ class PregateTrigger:
         thr = self.threshold
         if self._bump_until is not None and now < self._bump_until:
             thr += PREGATE_BUMP
+        if self._strict is not None:
+            try:
+                thr += max(0.0, float(self._strict()))
+            except Exception:
+                pass
         return min(1.0, thr)
 
     def offer(self, t: float, score: float) -> bool:
@@ -379,6 +397,67 @@ class PregateTrigger:
 
 
 # ── the per-minute listening line (spec §8 canary) ────────────────────────
+
+
+def drm_app_label(source) -> str:
+    """The playing app's name for a log line: the ``app`` of a media-session
+    snapshot (or a bare name), reduced to a short plain label. Never the
+    title or artist of what plays (privacy) - only ``app`` is ever read.
+    Never raises."""
+    try:
+        name = source.get("app") if isinstance(source, dict) else source
+        name = "".join(ch for ch in str(name or "")
+                       if ch.isalnum() or ch in " ._-").strip()[:32]
+    except Exception:
+        name = ""
+    return name or DRM_APP_FALLBACK
+
+
+class DrmFallback:
+    """E1: the state of the DRM fallback. Engaged while the canceller's
+    reference is MISSING and media is known to be PLAYING (both must hold);
+    disengaged once either has been clear for ``clear_s`` (a track gap or a
+    flicker of the meter never flaps it). ``update`` returns "engage" /
+    "disengage" on a state change, else None - the caller logs once per
+    change. The app name is asked for (``app_fn``) only on engage. Thread-
+    safe; ``clock`` is injectable."""
+
+    def __init__(self, clear_s: float = DRM_CLEAR_S, clock=time.monotonic):
+        self._clear_s = float(clear_s)
+        self._clock = clock
+        self._mu = threading.Lock()
+        self.engaged = False
+        self.app = ""
+        self._clear_since = None
+
+    def reset(self) -> None:
+        with self._mu:
+            self.engaged, self.app, self._clear_since = False, "", None
+
+    def update(self, ref_missing, playing, app_fn=None) -> "str | None":
+        now = self._clock()
+        both = bool(ref_missing) and bool(playing)
+        with self._mu:
+            if both:
+                self._clear_since = None
+                if self.engaged:
+                    return None
+                try:
+                    label = drm_app_label(app_fn() if app_fn else None)
+                except Exception:
+                    label = DRM_APP_FALLBACK
+                self.engaged, self.app = True, label
+                return "engage"
+            if not self.engaged:
+                return None
+            if self._clear_since is None:
+                self._clear_since = now
+            if now - self._clear_since >= self._clear_s:
+                self.engaged, self.app, self._clear_since = False, "", None
+                return "disengage"
+            return None
+
+
 class MinuteCounter:
     """What the listening lane did in each minute that had media, as ONE log
     line (numbers only). Kinds are free-form counters; ``gauge`` keeps the

@@ -37034,6 +37034,7 @@ _listen_lock = threading.Lock()
 _aec_backend_said = [False]
 _aec_ref_missing = [False]          # media plays, the loopback hears nothing
 _aec_ref_quiet_since = [None]
+_drm_fallback = _lm.DrmFallback()   # E1: reference missing while media plays
 _aec_tts_device_checked = [False]
 
 
@@ -37081,6 +37082,11 @@ def _veto_mode() -> str:
 def _duck_mode() -> str:
     return _lm.mode2(globals().get("WAKE_DUCK_MODE",
                                     _lm.DEFAULTS["WAKE_DUCK_MODE"]))
+
+
+def _drm_mode() -> str:
+    return _lm.mode3(globals().get("MEDIA_AEC_DRM_FALLBACK",
+                                    _lm.DEFAULTS["MEDIA_AEC_DRM_FALLBACK"]))
 
 
 def _bus_mode_on() -> bool:
@@ -37332,6 +37338,53 @@ def _media_aec_effective() -> bool:
         return False
 
 
+def _drm_fallback_acting() -> bool:
+    """MEDIA_AEC_DRM_FALLBACK 'on' AND the fallback is engaged (reference
+    missing while media plays). Never raises."""
+    try:
+        return _drm_mode() == "on" and bool(_drm_fallback.engaged)
+    except Exception:
+        return False
+
+
+def _drm_strict_bump() -> float:
+    """The pre-gate's extra threshold while the DRM fallback acts."""
+    return _lm.DRM_STRICT_BUMP if _drm_fallback_acting() else 0.0
+
+
+def _drm_app_name() -> str:
+    """The media session's app id (core/media_now_playing 'app'), nothing
+    else - never the title or artist of what plays. Never raises."""
+    try:
+        from core.media_now_playing import get_now_playing
+        return _lm.drm_app_label(get_now_playing())
+    except Exception:
+        return _lm.DRM_APP_FALLBACK
+
+
+def _drm_fallback_update(ref_missing: bool, playing: bool) -> None:
+    """E1: feed the fallback the two facts; one log line per state change
+    ('shadow' logs and changes nothing, 'off' never engages). Never
+    raises."""
+    try:
+        mode = _drm_mode()
+        if mode == "off":
+            _drm_fallback.reset()
+            return
+        change = _drm_fallback.update(ref_missing, playing, _drm_app_name)
+        if change == "engage":
+            print(f"  [aec-fallback] "
+                  + ("" if mode == "on" else "shadow: ")
+                  + f"reference missing while {_drm_fallback.app} plays - "
+                  + ("ducking/strict gate on" if mode == "on"
+                     else "ducking/strict gate would be on"))
+        elif change == "disengage":
+            print("  [aec-fallback] reference back or media stopped - "
+                  "ducking/strict gate off")
+    except Exception:
+        pass
+
+
 def _media_aec_check_reference() -> None:
     """Failure mode 7 / 9: media plays (the meter) but the loopback hears
     nothing for 5 s - protected (DRM) playback, an exclusive-mode app, the
@@ -37342,6 +37395,7 @@ def _media_aec_check_reference() -> None:
     try:
         lb = _loopback_obj[0]
         if lb is None or not lb.running:
+            _drm_fallback_update(False, False)
             return
         if not _aec_tts_device_checked[0] and lb.endpoint:
             _aec_tts_device_checked[0] = True
@@ -37376,6 +37430,7 @@ def _media_aec_check_reference() -> None:
             if _aec_ref_missing[0] and not quiet:
                 _aec_ref_missing[0] = False
                 print("  [media-aec] the loopback hears the PC's audio again")
+        _drm_fallback_update(_aec_ref_missing[0], playing)
     except Exception:
         pass
 
@@ -37635,7 +37690,8 @@ def _pregate_get():
                 if pg is None:
                     pg = _wake_pregate_mod.PregateWorker(
                         "mic", track=_lm.ScoreTrack(),
-                        trigger=_lm.PregateTrigger(_pregate_threshold()),
+                        trigger=_lm.PregateTrigger(
+                            _pregate_threshold(), strict=_drm_strict_bump),
                         on_trigger=_pregate_on_trigger,
                         active=lambda: (_pregate_mode() != "off"
                                         or _bargein_bus_on()))
@@ -37948,7 +38004,7 @@ def _wake_duck_start() -> None:
     in between) or by an independent DUCK_CAP_S timer, whichever is first.
     Never with the output on a headset. Never raises."""
     try:
-        if _duck_mode() != "on":
+        if _duck_mode() != "on" and not _drm_fallback_acting():
             return
         lb = _loopback_obj[0]
         if lb is not None and _lm.output_is_headset(

@@ -1050,6 +1050,17 @@ SCHEMA: dict[str, dict] = {
                 "apps drop to the ducking level for at most 8 s while you "
                 "finish the command. Applies on the next start.",
     },
+    "MEDIA_AEC_DRM_FALLBACK": {
+        "tab": "hearing", "label": "Protected video: no echo reference",
+        "type": "enum", "choices": ["off", "shadow", "on"],
+        "default": "shadow",
+        "help": "HBO / Netflix video is silent to the echo canceller, so it "
+                "cannot cancel it. When that is detected while media plays: "
+                "on = other apps duck after 'Jarvis' and the detector "
+                "needs a clearer 'Jarvis'; shadow = logged only. Needs "
+                "'Cancel what the PC is playing' (shadow or on). Applies "
+                "on the next start.",
+    },
     "WAKE_BARGEIN_MODE": {
         "tab": "hearing", "label": "Interrupt him by voice",
         "type": "enum", "choices": ["off", "on"], "default": "off",
@@ -2402,7 +2413,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Listening over videos", ["WAKE_REANCHOR_MODE", "WAKE_PREGATE_MODE",
                                    "WAKE_PREGATE_THRESHOLD", "MIC_BUS_MODE",
                                    "MEDIA_AEC_MODE", "WAKE_LOOPBACK_VETO",
-                                   "WAKE_DUCK_MODE", "WAKE_BARGEIN_MODE"]),
+                                   "WAKE_DUCK_MODE", "WAKE_BARGEIN_MODE",
+                                   "MEDIA_AEC_DRM_FALLBACK"]),
         ("What he ignores", ["SELF_ECHO_FILTER_ENABLED", "SELF_ECHO_WINDOW_S",
                              "SELF_ECHO_TAIL_S", "NOISE_FILTER_ENABLED",
                              "DEVICE_SPEECH_FILTER_ENABLED",
