@@ -36,7 +36,7 @@
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
 | **no spoken note** (neither) | 272 |
-| no `prompts.py` example | 521 |
+| no `prompts.py` example | 520 |
 
 A result with no spoken note is correct for side-effect actions but is the recurring
 "logged but never voiced" bug for read-outs — see the audit that seeded the 2026-07
@@ -359,7 +359,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `learn_guest` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
 | `learn_my_face` | `skills/face_id.py:220` | **VERBATIM** | — | yes |
 | `learn_my_voice` | `skills/enroll_voice.py:312` | **VERBATIM** | — | yes |
-| `learn_remote_code` | `skills/sh_broadlink.py:314` | **VERBATIM** | — | yes |
+| `learn_remote_code` | `skills/sh_broadlink.py:314` | **VERBATIM** | yes | yes |
 | `learn_their_face` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
 | `lifx_list` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |
 | `lifx_list_devices` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |
