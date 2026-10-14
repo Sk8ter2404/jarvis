@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.192 (2026-10-14)
+
+A weekly success score ('how did you do this week': turns, answer rate, median response time, failing actions, from this PC's logs only). The smart-home command now has exactly one owner (a duplicate registration that only lost by alphabetical load order is gone) and a test fails if any action is ever registered twice. An echo-cancellation fallback for protected video audio (ducks and tightens the wake gate when the echo reference is missing while media plays), shipped log-only.
+
 ## v2.0.191 (2026-10-14)
 
 Direct smart-home control on the home network, with the voice-assistant cloud only as the fallback: Smart Life / Tuya lights and switches (the right on/off and brightness data points, confirmed by reading the device back), Magic Home LED controllers (on/off, brightness, colour, confirmed), and the BroadLink IR/RF hub (learns each remote button once by voice, then sends it locally; honest about toggle codes). Router and discovery brand tables are pinned to agree.
