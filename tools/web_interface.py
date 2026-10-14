@@ -118,6 +118,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core import camera_tiles as _camera_tiles
+from core import holo_web as _holo_web
 
 # ── Optional Flask probe (informational only — we NEVER route through it) ───
 # Documented in the module header: Flask is present in this env for the AirTag
@@ -3359,7 +3360,8 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    def _send_bytes(self, data: bytes, content_type: str, code: int = 200) -> None:
+    def _send_bytes(self, data: bytes, content_type: str, code: int = 200,
+                    headers: tuple = ()) -> None:
         """Send a raw binary body (e.g. the camera preview JPEG). Mirrors
         _send_html/_send_json but for arbitrary bytes, with no-store caching so a
         stale frame is never served from a browser cache."""
@@ -3367,6 +3369,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in headers:
+            self.send_header(k, v)
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -3541,6 +3545,25 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authorized(query, is_page=True):
                 return self._unauthorized()
             return self._send_html(_dashboard_html(cfg.get("token", "")))
+
+        # Holo mode (core/holo_web.py, hud/holo/): the hand-tracked hologram page,
+        # its four static files, and the ~300 ms poll the voice actions talk
+        # through. The page gets its own CSP (three.js from jsdelivr, the tracker
+        # service on loopback :8793) because the dashboard's is 'self'-only.
+        if path == "/holo" or path.startswith("/holo/"):
+            if not self._authorized(query, is_page=True):
+                return self._unauthorized()
+            asset = _holo_web.asset_for(path, cfg.get("token", ""))
+            if asset is None:
+                return self._send_json({"error": "not found"}, code=404)
+            return self._send_bytes(
+                asset[0], asset[1],
+                headers=(("Content-Security-Policy", _holo_web.HOLO_CSP),))
+
+        if path == "/api/holo/state":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            return self._send_json(_holo_web.state_payload(query))
 
         if path == "/api/status":
             if not self._authorized(query, is_page=False):

@@ -2373,6 +2373,15 @@ WEB_INTERFACE_ENABLED = False       # master switch — server only starts when 
 WEB_INTERFACE_PORT    = 8766        # TCP port (8443 is the AirTag tracker — do NOT reuse)
 WEB_INTERFACE_BIND    = "127.0.0.1" # bind address; non-local REQUIRES a token
 WEB_INTERFACE_TOKEN   = ""          # shared secret; MANDATORY for a non-local bind
+# HOLO_MODE_ENABLED — the hand-tracked hologram page (skills/holo_mode.py,
+# tools/holo_web.py, hud/holo/): webcam + MediaPipe hand landmarks + a three.js
+# arc reactor you can pinch, move, spin and explode, served by the web
+# interface at /holo. True only means the voice actions exist; it does NOTHING
+# until asked ("holo mode"), and it never moves the Windows cursor or sends any
+# OS input (the page only draws). Opens http://127.0.0.1:<WEB_INTERFACE_PORT>/holo
+# and starts the web interface first if it is down. False: every holo_* action
+# answers that it is off.
+HOLO_MODE_ENABLED = True
 # DASHBOARD_SHOW_TRANSCRIPTS — the dashboard's "What JARVIS did" timeline shows
 # what was SAID on each turn (the owner's words, JARVIS's reply) only when this
 # is True AND the browser is on this PC (a loopback request). A LAN client never
