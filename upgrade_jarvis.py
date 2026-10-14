@@ -36,8 +36,10 @@ Pipeline model knobs (env vars, optional):
 
 Requires:
     - `claude` CLI installed and on PATH (Claude Code)
-    - A Claude Max subscription — the pipeline strips ANTHROPIC_API_KEY and
-      runs Claude Code on the Max plan, NOT on metered API credits.
+    - A Claude subscription — the pipeline strips ANTHROPIC_API_KEY and
+      runs Claude Code on a subscription, NOT on metered API credits.
+      core/claude_accounts.py picks which one per call (CLAUDE_PRO_FIRST_UNTIL:
+      a second Pro profile first while it lasts, Max on its limits).
 """
 
 import json
@@ -1174,7 +1176,8 @@ def spawn_claude_code(tasks: list[str], claude_path: str,
 
     try:
         # Strip ANTHROPIC_API_KEY from the spawned env so Claude Code bills
-        # to the Max subscription rather than API credits.
+        # to a subscription rather than API credits. The driver picks the
+        # profile per call (core/claude_accounts.py).
         env = os.environ.copy()
         env.pop("ANTHROPIC_API_KEY", None)
 
@@ -1355,7 +1358,32 @@ def count_pending():
     except Exception:
         return 0
 
+# Which Claude subscription runs each call (core/claude_accounts, 2026-10-14):
+# the owner's Pro account first while it lasts, Max when Pro refuses (its
+# 5-hour / weekly limit, or signed out). Without the module: as before.
+try:
+    sys.path.insert(0, PROJECT_DIR)
+    from core import claude_accounts as ACCT
+except Exception:
+    ACCT = None
+
 def run_one_claude_call():
+    if ACCT is None:
+        return _claude_call(None)[0]
+    profile, why = ACCT.choose()
+    emit(f"{GRAY}[account] {'Pro' if profile == ACCT.PRO else 'Max'}: {why}{RESET}")
+    rc, refused = _claude_call(profile)
+    if profile == ACCT.PRO and refused is not None:
+        _until, msg = ACCT.note_pro_refusal(refused[0], refused[1])
+        emit(f"{YELLOW}[account] {msg}{RESET}")
+        rc, _refused = _claude_call(ACCT.MAX)
+    return rc
+
+def _claude_call(profile):
+    """(returncode, refused): refused = (limit, signed_out) when the profile
+    REFUSED the work (the call failed on a limit or a missing sign-in), else
+    None. A limit event on a call that still finished (Claude Code moved to
+    another model) is not a refusal - re-running it would repeat the task."""
     cmd = [
         CLAUDE_PATH, "--print", "--verbose",
         "--output-format", "stream-json",
@@ -1363,6 +1391,7 @@ def run_one_claude_call():
         "--dangerously-skip-permissions",
         PROMPT,
     ]
+    env = ACCT.env_for(profile) if (ACCT is not None and profile) else None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1373,14 +1402,16 @@ def run_one_claude_call():
             errors="replace",
             bufsize=1,
             cwd=PROJECT_DIR,
+            env=env,
         )
     except FileNotFoundError as e:
         emit(f"{RED}[loop] claude binary not found at {CLAUDE_PATH}: {e}{RESET}")
-        return 127
+        return 127, None
     except Exception as e:
         emit(f"{RED}[loop] failed to spawn claude: {e}{RESET}")
-        return 1
+        return 1, None
     assert proc.stdout is not None
+    limit, signed_out, result_error = None, False, False
     # Watchdog: a hung `claude --print` child (network stall, stuck stream, no
     # EOF) would otherwise block the read loop AND proc.wait() forever, freezing
     # the whole upgrade loop with JARVIS already killed. Kill the child past a
@@ -1402,21 +1433,34 @@ def run_one_claude_call():
             if not stripped:
                 continue
             try:
-                out = _fmt(json.loads(stripped))
-                if out:
-                    emit(out)
+                evt = json.loads(stripped)
             except json.JSONDecodeError:
                 # Non-JSON line (likely a stderr message merged in). Surface it
                 # so a silently-broken invocation isn't invisible.
                 emit(f"  [?]     {line[:160]}")
+                if ACCT is not None:
+                    limit = limit or ACCT.limit_from_text(stripped)
+                    signed_out = signed_out or ACCT.signed_out_text(stripped)
+                continue
+            if ACCT is not None and isinstance(evt, dict):
+                limit = limit or ACCT.limit_from_event(evt)
+                if evt.get("type") == "result" and evt.get("is_error"):
+                    result_error = True
+            out = _fmt(evt)
+            if out:
+                emit(out)
         proc.wait()
     finally:
         _timer.cancel()
     if _killed.is_set():
         emit(f"{RED}[loop] claude call exceeded {_CALL_TIMEOUT_S}s — killed to "
              f"unblock the upgrade loop.{RESET}")
-        return 124
-    return proc.returncode
+        return 124, None
+    rc = proc.returncode
+    failed = rc != 0 or result_error
+    if failed and (limit is not None or signed_out):
+        return rc, (limit, bool(signed_out and limit is None))
+    return rc, None
 
 def main():
     # Self-delete the rendered driver tempfile so %TEMP% doesn't accumulate
@@ -1586,9 +1630,12 @@ def spawn_claude_dry_audit(tasks: list[str], claude_path: str) -> subprocess.Pop
         f.write(log_line)
 
     try:
-        # Strip ANTHROPIC_API_KEY so Claude Code bills to the Max subscription.
+        # Strip ANTHROPIC_API_KEY so Claude Code bills to a subscription.
         env = os.environ.copy()
         env.pop("ANTHROPIC_API_KEY", None)
+        # The call goes through tools/claude_account_run.py (2026-10-14): the
+        # owner's Pro account first while it lasts, Max when Pro is at a limit.
+        runner = os.path.join(PROJECT_DIR, "tools", "claude_account_run.py")
 
         # Single Claude invocation — no loop, no skip-permissions flag.
         # Tee-Object captures the report to a markdown file alongside stdout.
@@ -1600,7 +1647,8 @@ def spawn_claude_dry_audit(tasks: list[str], claude_path: str) -> subprocess.Pop
             f"Write-Host 'Report will be saved to:' -ForegroundColor DarkGray; "
             f"Write-Host '  {report_path}' -ForegroundColor DarkGray; "
             f"Write-Host ''; "
-            f"& '{claude_path}' --print --verbose '{safe_prompt}' "
+            f"& '{sys.executable}' '{runner}' '{claude_path}' --print --verbose "
+            f"'{safe_prompt}' "
             f"| Tee-Object -FilePath '{report_path}'; "
             f"Write-Host ''; "
             f"if ($LASTEXITCODE -eq 0) {{ "

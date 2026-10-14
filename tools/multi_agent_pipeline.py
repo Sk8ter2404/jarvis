@@ -107,6 +107,14 @@ _RATE_LIMIT_NEEDLES: tuple[str, ...] = (
     "rate limit exceeded",
     "you have been rate limited",
     "anthropic rate limit",
+    # Claude Code 2.1.x words a subscription limit "You've hit your session
+    # limit · resets 9pm" (also weekly / Opus / Sonnet / usage) - none of the
+    # needles above matched it (2026-10-14).
+    "hit your session limit",
+    "hit your weekly limit",
+    "hit your opus limit",
+    "hit your sonnet limit",
+    "hit your usage limit",
 )
 
 
@@ -385,6 +393,16 @@ def _strip_json(raw: str) -> str:
     return raw[start:]
 
 
+def _claude_accounts():
+    """core.claude_accounts (Pro-first profile choice), or None when it can't
+    be imported - then the call runs as before, on the default profile."""
+    try:
+        from core import claude_accounts
+        return claude_accounts
+    except Exception:
+        return None
+
+
 def _invoke_claude(
     *,
     prompt: str,
@@ -415,20 +433,20 @@ def _invoke_claude(
     cmd.append(prompt)
 
     env = os.environ.copy()
-    # Bill to Max subscription, not API credits.
+    # Bill to a Claude subscription, not API credits. core/claude_accounts
+    # also picks the profile: the owner's Pro account first while it lasts,
+    # Max whenever Pro is at its 5-hour / weekly limit (2026-10-14).
     env.pop("ANTHROPIC_API_KEY", None)
+    acct = _claude_accounts()
 
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=project_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_s,
-        )
+        run_kw = dict(cwd=project_dir, capture_output=True, text=True,
+                      encoding="utf-8", errors="replace", timeout=timeout_s)
+        if acct is not None:
+            result = acct.run(cmd, env=env, runner=subprocess.run,
+                              log=lambda m: print(f"  {m}", flush=True), **run_kw)
+        else:
+            result = subprocess.run(cmd, env=env, **run_kw)
     except subprocess.TimeoutExpired as exc:
         return (124, exc.stdout or "", f"timeout after {timeout_s}s")
     except FileNotFoundError as exc:

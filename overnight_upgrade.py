@@ -624,6 +624,16 @@ def _generate_ideas_via_api(system_block: str, user_block: str) -> list[str]:
     return _parse_ideas_response(raw)
 
 
+def _claude_accounts():
+    """core.claude_accounts (Pro-first profile choice), or None when it can't
+    be imported - then the CLI runs as before, on the default profile."""
+    try:
+        from core import claude_accounts
+        return claude_accounts
+    except Exception:
+        return None
+
+
 def _generate_ideas(memory_summary: str, features: str, logs: str) -> list[str]:
     """The core creative engine. Asks Claude (Code CLI → Anthropic API fallback)
     to think like a JARVIS developer who knows the user, the Iron Man character,
@@ -657,18 +667,26 @@ def _generate_ideas(memory_summary: str, features: str, logs: str) -> list[str]:
                 _log(f"  [ideas] waiting {_wait//60}m before retry (attempt {_attempt+1})…")
                 time.sleep(_wait)
 
+            # NOTE: `--no-markdown` was REMOVED — Claude Code CLI rejects it
+            # ("error: unknown option '--no-markdown'") which caused every
+            # cycle to fail silently with rc=1. Markdown in the response is
+            # harmless because we extract the JSON array via regex /
+            # raw_decode anyway.
+            _run_kw = dict(
+                capture_output=True, text=True, timeout=300,
+                encoding="utf-8", cwd=PROJECT_DIR,
+                creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+            )
             try:
-                result = subprocess.run(
-                    # NOTE: `--no-markdown` was REMOVED — Claude Code CLI
-                    # rejects it ("error: unknown option '--no-markdown'")
-                    # which caused every cycle to fail silently with rc=1.
-                    # Markdown in the response is harmless because we extract
-                    # the JSON array via regex / raw_decode anyway.
-                    _cli_cmd,
-                    capture_output=True, text=True, timeout=300,
-                    encoding="utf-8", cwd=PROJECT_DIR, env=_env,
-                    creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
-                )
+                # core/claude_accounts picks the profile (2026-10-14): the
+                # owner's Pro account first while it lasts, Max as soon as Pro
+                # is at its limit - so the waits below only ever wait on Max.
+                _acct = _claude_accounts()
+                if _acct is not None:
+                    result = _acct.run(_cli_cmd, env=_env, runner=subprocess.run,
+                                       log=lambda m: _log(f"  [ideas] {m}"), **_run_kw)
+                else:
+                    result = subprocess.run(_cli_cmd, env=_env, **_run_kw)
             except subprocess.TimeoutExpired:
                 _log(f"  [ideas] CLI timed out on attempt {_attempt+1} — retrying")
                 continue

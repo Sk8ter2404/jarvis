@@ -2648,6 +2648,21 @@ APPLE_MUSIC_KEEP_OPEN = False
 APPLE_MUSIC_PLAYLIST_LINKS: dict = {}
 
 
+# ─── Which Claude subscription runs JARVIS's Claude Code jobs (2026-10-14) ──
+# core/claude_accounts.py. Every Claude Code job JARVIS spawns (upgrade loop,
+# multi-agent pipeline, dry audit, overnight ideas) bills a signed-in Claude
+# subscription, never API credits. With a date here, jobs run on a SECOND
+# Claude Code profile first - its own config folder, signed in once by the
+# owner - through that date (inclusive), and on the default profile whenever
+# that one is at its 5-hour or weekly limit (back to it when the limit
+# resets). Empty = off: the default profile only, as before.
+#   CLAUDE_PRO_FIRST_UNTIL  "YYYY-MM-DD", the second account's last day.
+#   CLAUDE_PRO_CONFIG_DIR   its Claude Code config folder ("" = ~/.claude-pro).
+# The sign-in lives in that folder; JARVIS never reads or stores a token.
+CLAUDE_PRO_FIRST_UNTIL = ""
+CLAUDE_PRO_CONFIG_DIR = ""
+
+
 # ─── Overnight self-improvement engine ─────────────────────────────────
 # OVERNIGHT_UPGRADE_ENABLED = True means the background thread polls
 # for idle + gap thresholds and fires the upgrade pipeline on its own.

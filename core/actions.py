@@ -6757,7 +6757,9 @@ def _act_upgrade(_: str = "") -> str:
     # can watch the work — and the window stays open even if the script errors.
     try:
         project_dir = os.path.dirname(os.path.abspath(bc.__file__))
-        # Strip ANTHROPIC_API_KEY so Claude Code bills to Max, not API credits.
+        # Strip ANTHROPIC_API_KEY so Claude Code bills to a subscription, not
+        # API credits; upgrade_jarvis.py's driver picks which one per call
+        # (core/claude_accounts.py: the Pro account first, Max on its limits).
         ps_cmd = (
             f"$env:ANTHROPIC_API_KEY=''; "
             f"cd '{project_dir}'; "

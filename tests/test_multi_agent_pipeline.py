@@ -117,6 +117,16 @@ class _PipeBase(unittest.TestCase):
                   "JARVIS_PIPELINE_FORCE_CONTINUE_AFTER_REGRESSION"):
             os.environ.pop(k, None)
 
+        # The Claude-account choice (core/claude_accounts) reads the owner's
+        # settings and the live state file: pin it to the default profile so
+        # these tests see one call per invocation on any machine
+        # (tests/test_claude_accounts.py covers the Pro-first path).
+        from core import claude_accounts as _ca
+        self._acct = mock.patch.object(_ca, "choose",
+                                       return_value=(_ca.MAX, "pinned by the test"))
+        self._acct.start()
+        self.addCleanup(self._acct.stop)
+
     def _restore_consts(self):
         for a, v in self._saved.items():
             setattr(P, a, v)
