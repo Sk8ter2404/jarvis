@@ -35,6 +35,7 @@ SPEAK_VERBATIM_ACTIONS = (
 )
 
 OPEN_COOLDOWN_S = 10.0
+LOW_FPS = 15.0                       # status mentions the light below this
 HOLO_ACTION = "holo_mode_on"
 HOLO_ARG = "desktop"
 LOG = "  [hand-track]"
@@ -465,8 +466,13 @@ def status_text() -> str:
             else "I can see one hand" if hands == 1 else "I can see both hands")
     menu = ("; the palm-hold menu is on" if bool(_cfg("HAND_MENU_ENABLED", False))
             else "")
+    # Live 2026-10-14: the webcam (30 fps capable) gave ~12-15 in room light -
+    # auto-exposure slows the sensor when the scene is dim. Say so when it
+    # shows, since quick gestures (the flick, the clap) get harder below that.
+    slow = ("; that's on the slow side - more light on your hands lets the "
+            "webcam run faster" if 0 < fps < LOW_FPS else "")
     return (f"Hand tracking is on, sir: {seen}, tracking at {fps:.0f} frames a "
-            f"second from the {cam} camera{menu}.")
+            f"second from the {cam} camera{slow}{menu}.")
 
 
 def _hand_tracking_status(_: str = "") -> str:

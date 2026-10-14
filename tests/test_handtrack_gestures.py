@@ -317,6 +317,52 @@ class FlickTests(unittest.TestCase):
         self.assertGreaterEqual(names(ev).count("point_flick"), 1)
 
 
+class LowFrameRateFlickTests(unittest.TestCase):
+    """Live 2026-10-14: the owner's webcam gave ~12 fps in room light, with
+    ~0.1 s gaps while JARVIS's face pass runs. A real flick must still fire
+    there; jitter and slow swings must not."""
+
+    def seq_at(self, fps, angles, settle_s=0.6, start=-20.0, gap_after=None, gap_s=0.0):
+        dt = 1.0 / fps
+        seq, t = [], 0.0
+        for _ in range(int(settle_s * fps)):
+            seq.append((t, [make_hand("point", angle=start)]))
+            t += dt
+        for i, a in enumerate(angles):
+            seq.append((t, [make_hand("point", angle=a)]))
+            t += dt + (gap_s if gap_after is not None and i == gap_after else 0.0)
+        for _ in range(int(0.5 * fps)):
+            seq.append((t, [make_hand("point", angle=angles[-1])]))
+            t += dt
+        return run(hg.GestureEngine(), seq)[0]
+
+    def test_a_flick_between_two_frames_at_10_fps_fires_once(self):
+        # 0.1 s frames: a 0.18 s window holds 2 samples, so "3 samples" never fired
+        ev = self.seq_at(10, [40.0])                        # 60 deg in one frame
+        self.assertEqual(names(ev), ["point_flick"])
+        self.assertGreater(ev[0]["value"], hg.FLICK_OMEGA_DEG_S)
+
+    def test_a_flick_across_a_face_pass_gap_fires(self):
+        # 15 fps bursts with a 0.15 s hole where JARVIS's face pass runs
+        ev = self.seq_at(15, [0.0, 60.0], gap_after=0, gap_s=0.15)
+        self.assertEqual(names(ev), ["point_flick"])
+
+    def test_jitter_at_12_fps_is_not_a_flick(self):
+        wobble = [-20 + (8 if i % 2 else -8) for i in range(12)]
+        self.assertEqual(self.seq_at(12, wobble), [])
+
+    def test_a_slow_swing_at_12_fps_is_not_a_flick(self):
+        slow = [-20 + 6 * (i + 1) for i in range(12)]      # 72 deg over 1 s
+        self.assertEqual(self.seq_at(12, slow), [])
+
+    def test_30_fps_keeps_the_three_sample_rule(self):
+        eng = hg.GestureEngine()
+        seq = [(i / 30.0, [make_hand("point", angle=-20)]) for i in range(20)]
+        ev, _ = run(eng, seq)
+        tr = eng._tracks[0]
+        self.assertLess(tr.dt_ema, hg.FLICK_SLOW_FRAME_S)
+
+
 class TwoHandTests(unittest.TestCase):
     @staticmethod
     def pair(kind, d_hs, t_list=None, hs=100.0, k2=None):

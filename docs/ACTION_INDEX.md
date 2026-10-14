@@ -291,9 +291,9 @@ One row per action, sorted by name; aliases share their handler's location.
 | `hand_menu` | `skills/holo_mode.py:241` | **VERBATIM** | — | yes |
 | `hand_mouse_off` | `skills/kinect_air_mouse.py:4024` | **VERBATIM** | — | yes |
 | `hand_mouse_on` | `skills/kinect_air_mouse.py:3998` | **VERBATIM** | — | yes |
-| `hand_tracking_off` | `skills/hand_tracking.py:421` | **VERBATIM** | yes | yes |
-| `hand_tracking_on` | `skills/hand_tracking.py:379` | **VERBATIM** | yes | yes |
-| `hand_tracking_status` | `skills/hand_tracking.py:472` | **VERBATIM** | yes | yes |
+| `hand_tracking_off` | `skills/hand_tracking.py:422` | **VERBATIM** | yes | yes |
+| `hand_tracking_on` | `skills/hand_tracking.py:380` | **VERBATIM** | yes | yes |
+| `hand_tracking_status` | `skills/hand_tracking.py:478` | **VERBATIM** | yes | yes |
 | `hardware_sensors` | `skills/hardware_sensors.py:20` | **VERBATIM** | yes | yes |
 | `headset_battery` | `skills/headset_status.py:370` | **VERBATIM** | yes | yes |
 | `headset_battery_level` | `skills/headset_status.py:370` | **VERBATIM** | — | yes |

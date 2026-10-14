@@ -322,6 +322,11 @@ class ActionTests(_ActionBase):
         s = ht._hand_tracking_status()
         self.assertIn("can't see any hands", s)
         self.assertIn("30 frames", s)
+        self.assertNotIn("more light", s)
+        self.la.hb["fps"] = 11.6                  # live 10-14 in room light
+        s = ht._hand_tracking_status()
+        self.assertIn("12 frames", s)
+        self.assertIn("more light on your hands", s)
         self.la.hb["hands"] = 2
         self.assertIn("both hands", ht._hand_tracking_status())
         self.la.hb["age_s"] = 20

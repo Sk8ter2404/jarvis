@@ -57,6 +57,10 @@ EVENTS  (each fires once, then needs the gesture to end before it can re-arm)
                  >= 30 deg within 0.18 s at >= 220 deg/s. value = signed
                  angular speed in deg/s (positive = clockwise on screen, i.e.
                  an upward finger swinging to the right). Cooldown 0.7 s.
+                 At a low frame rate (the owner's webcam gives ~12-15 fps in
+                 room light) the window widens to 2.5 frame intervals (at most
+                 0.35 s) and 2 samples are enough; the 30 deg / 220 deg/s bar
+                 is unchanged, so jitter still cannot fire it.
     explode      (a) two fists, apart-speed >= 4 hs/s and >= 1.2 hs wider in
                  0.4 s; or (b) two hands held together (<= 1.6 hs apart for
                  >= 0.3 s) then parting at >= 4 hs/s within 0.45 s. Never
@@ -114,6 +118,12 @@ FLICK_WINDOW_S = 0.18
 FLICK_SWEEP_DEG = 30.0
 FLICK_OMEGA_DEG_S = 220.0
 FLICK_COOLDOWN_S = 0.7
+# Low frame rates (live 2026-10-14: 12 fps from the owner's webcam in room
+# light, with ~0.1 s gaps while JARVIS's face pass runs). A 0.18 s window then
+# holds 2 samples at best and "3 samples" never fires.
+FLICK_WINDOW_FRAMES = 2.5        # window = max(FLICK_WINDOW_S, this x frame interval)
+FLICK_WINDOW_MAX_S = 0.35
+FLICK_SLOW_FRAME_S = 0.05        # slower than 20 fps -> 2 samples suffice
 
 PAIR_WINDOW_S = 0.4
 EXPLODE_RATE_HS_S = 4.0
@@ -190,6 +200,7 @@ class _Track:
         # flick
         self.flick_hist: deque = deque()  # (t, angle_deg)
         self.flick_until = 0.0
+        self.dt_ema = 0.0                 # smoothed frame interval (s)
         self.last_info: dict = {}
 
 
@@ -334,6 +345,9 @@ class GestureEngine:
     def _step_track(self, tr: _Track, t: float, a: dict, hd: dict,
                     w: int, h: int, events: list) -> None:
         tr.side = hd.get("side", tr.side)
+        if t > tr.last_t:
+            d = min(t - tr.last_t, 0.5)
+            tr.dt_ema = d if tr.dt_ema <= 0 else 0.8 * tr.dt_ema + 0.2 * d
         tr.last_t = t
         tr.hs = a["hs"] if tr.hs <= 0 else 0.7 * tr.hs + 0.3 * a["hs"]
         tr.palm = a["palm"]
@@ -473,9 +487,12 @@ class GestureEngine:
             prev = tr.flick_hist[-1][1]
             ang = prev + _wrap_deg(ang - prev)
         tr.flick_hist.append((t, ang))
-        while tr.flick_hist and t - tr.flick_hist[0][0] > FLICK_WINDOW_S:
+        window = min(FLICK_WINDOW_MAX_S,
+                     max(FLICK_WINDOW_S, FLICK_WINDOW_FRAMES * tr.dt_ema))
+        while tr.flick_hist and t - tr.flick_hist[0][0] > window:
             tr.flick_hist.popleft()
-        if len(tr.flick_hist) < 3 or t < tr.flick_until:
+        need = 2 if tr.dt_ema >= FLICK_SLOW_FRAME_S else 3
+        if len(tr.flick_hist) < need or t < tr.flick_until:
             return
         t0, a0 = tr.flick_hist[0]
         dt = t - t0
