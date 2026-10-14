@@ -585,6 +585,7 @@ def _restore_monolith_pristine(bc) -> None:
     try:
         bc._listen_counter = bc._lm.MinuteCounter()
         bc._ambient_match = bc._lm.AmbientMatch()
+        bc._drm_fallback = bc._lm.DrmFallback()
     except Exception:
         pass
     # R1 tail probe (2026-10-01): a probe thread left by one test would make

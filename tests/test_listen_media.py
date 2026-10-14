@@ -403,5 +403,86 @@ class RealCaptureGuardTests(unittest.TestCase):
                 hg._refusals[:] = saved
 
 
+# ── E1: the DRM fallback's state machine (2026-10-14) ─────────────────────
+class DrmFallbackTests(unittest.TestCase):
+
+    def setUp(self):
+        self.t = [100.0]
+        self.fb = lm.DrmFallback(clear_s=5.0, clock=lambda: self.t[0])
+        self.asked = []
+
+    def _app(self):
+        self.asked.append(1)
+        return {"app": "Chrome", "title": "Some Show S1E4", "artist": "X"}
+
+    def test_engages_only_with_a_missing_reference_and_playing_media(self):
+        self.assertIsNone(self.fb.update(True, False, self._app))
+        self.assertIsNone(self.fb.update(False, True, self._app))
+        self.assertIsNone(self.fb.update(False, False, self._app))
+        self.assertFalse(self.fb.engaged)
+        self.assertEqual(self.asked, [], "the app is asked only on engage")
+        self.assertEqual(self.fb.update(True, True, self._app), "engage")
+        self.assertTrue(self.fb.engaged)
+        self.assertEqual(self.fb.app, "Chrome")
+        self.assertIsNone(self.fb.update(True, True, self._app),
+                          "one change, one signal")
+        self.assertEqual(len(self.asked), 1)
+
+    def test_disengages_when_the_media_stops_or_the_reference_returns(self):
+        for ref, playing in ((True, False), (False, True)):
+            self.t[0] = 100.0
+            fb = lm.DrmFallback(clear_s=5.0, clock=lambda: self.t[0])
+            fb.update(True, True, self._app)
+            self.assertIsNone(fb.update(ref, playing), "held through a gap")
+            self.assertTrue(fb.engaged)
+            self.t[0] += 4.9
+            self.assertIsNone(fb.update(ref, playing))
+            self.t[0] += 0.2
+            self.assertEqual(fb.update(ref, playing), "disengage")
+            self.assertFalse(fb.engaged)
+            self.assertEqual(fb.app, "")
+
+    def test_a_flicker_inside_the_hold_restarts_the_clear_clock(self):
+        self.fb.update(True, True, self._app)
+        self.fb.update(True, False)
+        self.t[0] += 3.0
+        self.assertIsNone(self.fb.update(True, True), "back: still engaged")
+        self.t[0] += 3.0
+        self.assertIsNone(self.fb.update(True, False),
+                          "the clear clock restarted")
+        self.assertTrue(self.fb.engaged)
+
+    def test_the_label_is_the_app_never_the_title(self):
+        self.assertEqual(lm.drm_app_label(
+            {"app": "Chrome", "title": "Secret", "artist": "A"}), "Chrome")
+        self.assertEqual(lm.drm_app_label(None), lm.DRM_APP_FALLBACK)
+        self.assertEqual(lm.drm_app_label({"title": "Secret"}),
+                         lm.DRM_APP_FALLBACK)
+        self.assertEqual(lm.drm_app_label("x" * 100), "x" * 32)
+        self.assertNotIn("\n", lm.drm_app_label("Ch\nrome"))
+
+        def boom():
+            raise OSError("smtc")
+
+        fb = lm.DrmFallback(clock=lambda: 0.0)
+        fb.update(True, True, boom)
+        self.assertEqual(fb.app, lm.DRM_APP_FALLBACK, "a failed read engages")
+
+    def test_the_pregate_threshold_rises_only_while_strict(self):
+        bump = [0.0]
+        trig = lm.PregateTrigger(0.15, strict=lambda: bump[0])
+        self.assertAlmostEqual(trig.effective_threshold(0.0), 0.15)
+        self.assertTrue(trig.offer(1.0, 0.20))
+        bump[0] = lm.DRM_STRICT_BUMP
+        self.assertAlmostEqual(trig.effective_threshold(5.0),
+                               0.15 + lm.DRM_STRICT_BUMP)
+        self.assertFalse(trig.offer(5.0, 0.20), "0.20 no longer enough")
+        self.assertTrue(trig.offer(8.0, 0.30))
+        bump[0] = 0.0
+        self.assertTrue(trig.offer(12.0, 0.20))
+        bad = lm.PregateTrigger(0.15, strict=lambda: 1 / 0)
+        self.assertAlmostEqual(bad.effective_threshold(0.0), 0.15)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,7 @@
   "WAKE_LOOPBACK_VETO": "shadow",
   "WAKE_DUCK_MODE": "off",
   "WAKE_BARGEIN_MODE": "off",
+  "MEDIA_AEC_DRM_FALLBACK": "shadow",
   "WHISPER_MODEL_CUDA": "large-v3-turbo",
   "SPEAKER_INDEX": null,
   "PREFERRED_OUTPUT_DEVICES": [],

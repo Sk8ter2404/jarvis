@@ -869,5 +869,150 @@ class MediaTestAndLogTests(_Base):
         self.assertIsNone(bc._loopback_obj[0])
 
 
+# ── E1: the DRM fallback wiring (MEDIA_AEC_DRM_FALLBACK, 2026-10-14) ──────
+@requires_monolith
+class DrmFallbackWiringTests(_Base):
+    """Fake loopback reference, fake SMTC, fake clock; nothing is played or
+    recorded and no device is touched."""
+
+    TITLE = "Secret Show Title"
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self.quiet = [True]
+        self.playing = [True]
+        self.clock = [1000.0]
+        quiet, test = self.quiet, self
+
+        class Loop:
+            running = True
+            endpoint = "Speakers (ACME USB Audio)"
+            n_written = 16000
+
+            def rms_recent(self, seconds=1.0):
+                return 0.0 if quiet[0] else 0.02
+
+            def age_s(self):
+                return 0.01
+
+        self._p(bc, "_loopback_obj", [Loop()])
+        self._p(bc, "MEDIA_AEC_MODE", "on", create=True)
+        self._p(bc, "WAKE_DUCK_MODE", "off", create=True)
+        self._p(bc, "_pc_media_playing",
+                lambda refresh=True: test.playing[0])
+        import core.media_now_playing as mnp
+        self._p(mnp, "get_now_playing", lambda: {
+            "app": "Chrome", "title": self.TITLE, "artist": "Someone",
+            "status": "playing", "playing": True})
+        bc._drm_fallback = bc._lm.DrmFallback(clear_s=5.0,
+                                              clock=lambda: test.clock[0])
+        bc._aec_tts_device_checked[0] = True
+        self.ducker = mock.Mock()
+        self.ducker.hold.return_value = True
+        self._p(bc, "_audio_ducker", self.ducker)
+
+    def _tick(self, n=1):
+        """The minute tick's reference check, n times; the 5 s quiet clock
+        is already run out."""
+        bc = self.bc
+        with mock.patch("builtins.print") as p:
+            for _ in range(n):
+                if self.quiet[0] and self.playing[0]:
+                    bc._aec_ref_quiet_since[0] = time.monotonic() - 6.0
+                bc._media_aec_check_reference()
+        return " ".join(str(c.args[0]) for c in p.call_args_list)
+
+    def _engage(self, mode):
+        self._p(self.bc, "MEDIA_AEC_DRM_FALLBACK", mode, create=True)
+        return self._tick(2)
+
+    def test_default_is_shadow(self):
+        from core import config as cfg
+        self.assertEqual(cfg.MEDIA_AEC_DRM_FALLBACK, "shadow")
+        self.assertEqual(self.bc._drm_mode(), "shadow")
+
+    def test_shadow_logs_once_and_changes_nothing(self):
+        bc = self.bc
+        out = self._engage("shadow")
+        self.assertTrue(bc._aec_ref_missing[0])
+        self.assertIn("[aec-fallback] shadow: reference missing while "
+                      "Chrome plays", out)
+        self.assertNotIn(self.TITLE, out)
+        self.assertEqual(self._tick(3).count("[aec-fallback]"), 0, "once")
+        self.assertFalse(bc._drm_fallback_acting())
+        self.assertEqual(bc._drm_strict_bump(), 0.0)
+        bc._wake_duck_start()
+        self.ducker.hold.assert_not_called()
+
+    def test_on_ducks_and_tightens_the_gate_and_names_only_the_app(self):
+        bc = self.bc
+        out = self._engage("on")
+        self.assertIn("[aec-fallback] reference missing while Chrome plays "
+                      "- ducking/strict gate on", out)
+        for word in (self.TITLE, "Someone", "Secret"):
+            self.assertNotIn(word, out)
+        self.assertTrue(bc._drm_fallback_acting())
+        self.assertEqual(bc._drm_strict_bump(), bc._lm.DRM_STRICT_BUMP)
+        trig = bc._lm.PregateTrigger(0.15, strict=bc._drm_strict_bump)
+        self.assertAlmostEqual(trig.effective_threshold(0.0),
+                               0.15 + bc._lm.DRM_STRICT_BUMP)
+        bc._wake_duck_start()        # WAKE_DUCK_MODE is off: the fallback
+        self.ducker.hold.assert_called_once()
+        bc._wake_duck_end()
+
+    def test_it_clears_when_the_reference_comes_back(self):
+        bc = self.bc
+        self._engage("on")
+        self.quiet[0] = False
+        self.assertEqual(self._tick().count("[aec-fallback]"), 0, "held")
+        self.assertTrue(bc._drm_fallback_acting())
+        self.clock[0] += 6.0
+        out = self._tick()
+        self.assertIn("[aec-fallback] reference back or media stopped - "
+                      "ducking/strict gate off", out)
+        self.assertFalse(bc._drm_fallback_acting())
+        self.assertEqual(bc._drm_strict_bump(), 0.0)
+        bc._wake_duck_start()
+        self.ducker.hold.assert_not_called()
+
+    def test_it_clears_when_the_media_stops(self):
+        bc = self.bc
+        self._engage("on")
+        self.playing[0] = False
+        self._tick()
+        self.clock[0] += 6.0
+        out = self._tick()
+        self.assertIn("ducking/strict gate off", out)
+        self.assertFalse(bc._drm_fallback_acting())
+
+    def test_never_engages_without_both_conditions(self):
+        bc = self.bc
+        self._p(bc, "MEDIA_AEC_DRM_FALLBACK", "on", create=True)
+        self.playing[0] = False                  # silent loopback, no media
+        self.assertEqual(self._tick(3).count("[aec-fallback]"), 0)
+        self.playing[0] = True
+        self.quiet[0] = False                    # media + a live reference
+        self.assertEqual(self._tick(3).count("[aec-fallback]"), 0)
+        self.assertFalse(bc._drm_fallback.engaged)
+
+    def test_off_never_engages(self):
+        bc = self.bc
+        out = self._engage("off")
+        self.assertTrue(bc._aec_ref_missing[0], "the old flag still works")
+        self.assertNotIn("[aec-fallback]", out)
+        self.assertFalse(bc._drm_fallback.engaged)
+        self.assertFalse(bc._drm_fallback_acting())
+
+    def test_a_stopped_loopback_clears_it(self):
+        bc = self.bc
+        self._engage("on")
+        bc._loopback_obj[0].running = False
+        self._tick()
+        self.clock[0] += 6.0
+        self._tick()
+        self.assertFalse(bc._drm_fallback.engaged)
+
+
 if __name__ == "__main__":
     unittest.main()
