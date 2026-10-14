@@ -4,9 +4,9 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.195
+- Version: v2.0.196
 - Live since: 2026-10-14
-- Latest change: v2.0.195 (10-14): the hand tracker gets the camera's full frame rate; hologram voice commands route directly (arc reactor words only while the hologram is open).
+- Latest change: v2.0.196 (10-14): the flick gesture adapts to the webcam's real frame rate; status mentions low light.
 
 ## In progress
 
@@ -62,6 +62,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.196 (2026-10-14): The point-and-flick gesture works at the webcam's real frame rate. Live on v2.0.195 the tracker got about 12 frames a second: the webcam can do 30 but slows itself in room light, and frames arrive in short bursts. The flick now adapts its time window to the measured frame rate (the speed and angle bar is unchanged, so jitter and slow swings still never count). 'Is hand tracking on' mentions when more light would help.
 - v2.0.195 (2026-10-14): The hand tracker now gets the camera's full frame rate: live on v2.0.194 it received only about 6 frames a second (the face-tracking loop's own pace), too few for a quick flick. While the tracker runs, the camera loop keeps reading the tracker's camera for a moment after each normal read and hands every frame over; face tracking keeps its cadence, and nothing changes while the tracker is off. Voice: 'open up the hologram', 'close the hologram' and 'hand menu' work without the language model; 'show me the arc reactor', 'explode it' and 'put it back together' go to the hologram only while it is open, so a plain 'show the arc reactor' stays the small corner reactor.
 - v2.0.194 (2026-10-14): Hand tracking v2, phase 1: a separate MediaPipe hand tracker (21 points per finger-level hand, about 29 frames a second) reads the camera frames JARVIS already captures, and a hologram window (a three.js arc reactor) is driven by it: pinch and hold for the menu, a fist to move, point and flick to spin, two fists apart to explode it into labelled parts, pinch a part and hold it for its info, clap to rebuild. Two views: a solid dark 'hand menu' with no camera picture, and 'open up the hologram' with the mirrored camera behind it. The hologram starts the tracker it needs and stops it when closed. 'Hand tracking on' now means this tracker, which never moves the cursor (it used to switch on the Kinect air mouse); 'hand tracking off' also stops the air mouse. All of it is off until asked for.
 - v2.0.193 (2026-10-14): Test tooling only (no change to the running code): the test watchdog's kill now really ends a wedged test run on Windows (TerminateProcess instead of os._exit, which could hang on leftover CUDA/COM threads - one run sat 26 hours), tests can no longer fake its clock, and a new gate wrapper ends a test run that outlives the watchdog.
@@ -71,6 +72,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.189 (2026-10-13): Queued speech can no longer be lost: a line whose speech fails is retried (up to 3 tries) and a queue file cut off mid-write keeps every intact line. The printer self-check reads the live monitor instead of opening a second connection (no more false FAILED). Cameras that drop off USB and come back are counted per camera with one 'check its cable' line. The last four open July-audit findings are fixed (overnight yes is answered, empty speech no longer clears another line's voice style, the local action list follows new actions, wake-word pause drops leftover audio). Dashboard accessibility fixes, an up-to-date FEATURES.md, and a test-order leak fixed.
 - v2.0.188 (2026-10-12): Test-only lint fix: clears the unused imports and one unused variable that made the GitHub CI lint step fail on v2.0.187. No change to the running code.
 - v2.0.187 (2026-10-12): Two-way chat bot for alerts and commands; a shopping list and a separate reminders list (reminders with no time never land in the developer queue); optional comments about what is on screen; easier air-mouse engage and useful Kinect gestures; batched background learning; game mode, TV and clap tweaks plus an order tracker; privacy guards on test data; repo cleanup (one daily briefing skill).
-- v2.0.186 (2026-10-12): Alexa sign-in rebuilt on the phone-app style OAuth device registration (sign in once, saved token, the real smart-home device list, no session secrets in logs); audio auto-switch waits while media plays; CLOUD_BOOST_UNTIL sends hard turns and screen reading to Claude until a date; PROMPT_SLIM_MODE keeps the cached brain prompt smaller.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
