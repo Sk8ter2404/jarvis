@@ -115,9 +115,19 @@ class BudgetTests(_WatchdogBase):
         # 20-minute job timeout so the watchdog always reports first.
         self.assertGreaterEqual(tw.DEFAULT_PER_PHASE_S, 60.0)
         self.assertGreaterEqual(tw.DEFAULT_TOTAL_S, 600.0)
-        self.assertLess(tw.DEFAULT_TOTAL_S, 20 * 60,
+        # Read the job timeout from ci.yml itself (it was raised 20 -> 40 on
+        # 2026-10-14 when the two-run job outgrew 20 minutes).
+        with open(os.path.join(_PROJECT_ROOT, ".github", "workflows", "ci.yml"),
+                  encoding="utf-8") as f:
+            minutes = [int(line.split(":", 1)[1]) for line in f
+                       if line.strip().startswith("timeout-minutes:")]
+        self.assertEqual(len(minutes), 1, minutes)
+        self.assertLess(tw.DEFAULT_TOTAL_S, minutes[0] * 60,
                         "the whole-run budget must fire before ci.yml's "
-                        "timeout-minutes: 20 kills the job with no diagnosis")
+                        "timeout-minutes kills the job with no diagnosis")
+        self.assertGreaterEqual(minutes[0], 30,
+                                "the job runs the suite twice (unit + coverage); "
+                                "20 minutes stopped being enough on 2026-10-14")
 
 
 # ── the trigger decision ────────────────────────────────────────────────────

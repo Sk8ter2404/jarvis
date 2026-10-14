@@ -20,7 +20,11 @@ on:
 jobs:
   light-tier:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20 -> 40 (2026-10-14): the job runs the suite twice (unit, then coverage)
+    # and had grown to ~19.5 min; v2.0.196's run passed its unit step and was
+    # killed mid-coverage at exactly 20:00. Each run's own watchdog budget
+    # (tools/test_watchdog.py) still fires well before this.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:

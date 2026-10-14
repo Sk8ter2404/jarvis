@@ -8,7 +8,7 @@ came back EXIT 124: it never finished. All three CI gates had already printed
 OK, so the stall was inside the test run itself — and the run produced NOTHING
 that said where. unittest emits its dots as it goes, but a hang leaves no
 summary line, no traceback and no test id, so the only thing an exit-124 tells
-you is "somewhere in 15,000 tests". ci.yml's ``timeout-minutes: 20`` is the same
+you is "somewhere in 15,000 tests". ci.yml's ``timeout-minutes`` (20 then; 40 since 2026-10-14) is the same
 shape one level up: it kills the job and tells you nothing either.
 
 The reason nothing fired is that the ONLY bound the runners had was
