@@ -316,6 +316,13 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "GLOBE": [
         "globe", "show me where", "pin", "on the map", "world map",
     ],
+    # skills/holo_mode.py (2026-10-14). "explode it" / "back together" are the
+    # voice side of the gestures; bare "explode" / "assemble" stay out so a
+    # build or shopping turn never drags the section in.
+    "HOLO MODE": [
+        "holo", "hologram", "hand menu", "arc reactor", "explode it",
+        "put it back together", "back together", "reassemble",
+    ],
     "SUIT-UP CINEMATIC": ["suit up", "suit-up", "boot sequence", "cinematic"],
     "TASK QUEUE": [
         "task queue", "queue this", "offload", "claude code", "add a task",

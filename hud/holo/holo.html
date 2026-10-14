@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS Holo</title>
+<style>
+  :root { --cy: #39d7ff; --cy2: #8fefff; --bg: #02070d; --dim: rgba(57,215,255,.55); }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
+    color: var(--cy2); font: 13px/1.35 "Segoe UI", system-ui, sans-serif; user-select: none; }
+  /* desktop mode: solid dark HUD, never see-through */
+  body.desktop #bg { display: none; }
+  body.desktop { background:
+    radial-gradient(ellipse at 50% 45%, #07202e 0%, #03101a 55%, #02070d 100%); }
+  body.desktop::before { content: ""; position: fixed; inset: 0; pointer-events: none;
+    background-image:
+      linear-gradient(rgba(57,215,255,.07) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(57,215,255,.07) 1px, transparent 1px);
+    background-size: 64px 64px; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  #bg.bw { filter: grayscale(1) contrast(1.15); }
+  #fx { pointer-events: none; }
+  #labels { position: fixed; inset: 0; pointer-events: none; }
+  .lbl { position: absolute; transform: translate(12px, -50%); white-space: nowrap;
+    padding: 1px 7px; border: 1px solid var(--dim); background: rgba(2,12,20,.72);
+    color: var(--cy2); font-size: 11px; letter-spacing: .04em; }
+  .lbl.info { white-space: normal; width: 260px; font-size: 13px; padding: 8px 10px;
+    border-color: var(--cy); box-shadow: 0 0 18px rgba(57,215,255,.35); }
+  .lbl.info b { display: block; color: #fff; letter-spacing: .08em; margin-bottom: 3px; }
+  #corners i { position: fixed; width: 34px; height: 34px; border: 2px solid var(--cy);
+    opacity: .7; pointer-events: none; }
+  #corners i:nth-child(1) { left: 14px; top: 14px; border-right: 0; border-bottom: 0; }
+  #corners i:nth-child(2) { right: 14px; top: 14px; border-left: 0; border-bottom: 0; }
+  #corners i:nth-child(3) { left: 14px; bottom: 14px; border-right: 0; border-top: 0; }
+  #corners i:nth-child(4) { right: 14px; bottom: 14px; border-left: 0; border-top: 0; }
+  #top { position: fixed; left: 28px; top: 20px; right: 28px; display: flex; gap: 14px;
+    align-items: center; letter-spacing: .18em; font-size: 12px; pointer-events: none; }
+  #top .title { color: #fff; font-weight: 600; }
+  .chip { padding: 2px 9px; border: 1px solid var(--dim); letter-spacing: .08em; font-size: 11px; }
+  .chip.ok { color: #7dffb0; border-color: #3fbf7a; }
+  .chip.bad { color: #ffb36b; border-color: #c27b2e; }
+  #legend { position: fixed; left: 28px; bottom: 24px; font-size: 11.5px; color: var(--dim);
+    line-height: 1.55; pointer-events: none; }
+  #legend b { color: var(--cy2); font-weight: 600; }
+  #hint { position: fixed; left: 0; right: 0; top: 64px; text-align: center; font-size: 15px;
+    letter-spacing: .14em; color: var(--cy2); text-shadow: 0 0 12px rgba(57,215,255,.6);
+    pointer-events: none; transition: opacity .6s; }
+  #dbg { position: fixed; right: 28px; bottom: 24px; text-align: right; font: 11px/1.4 Consolas, monospace;
+    color: var(--dim); white-space: pre; pointer-events: none; }
+  #menu { position: fixed; left: 0; top: 0; width: 0; height: 0; display: none; }
+  #menu .ring { position: absolute; left: -150px; top: -150px; width: 300px; height: 300px;
+    border: 1px dashed var(--dim); border-radius: 50%; }
+  #menu button { position: absolute; width: 124px; height: 124px; margin: -62px 0 0 -62px;
+    border-radius: 50%; border: 2px solid var(--cy); background: rgba(3,18,28,.88);
+    color: var(--cy2); font: 600 13px "Segoe UI", sans-serif; letter-spacing: .08em; cursor: pointer;
+    box-shadow: 0 0 22px rgba(57,215,255,.35); pointer-events: auto; }
+  #menu button:hover, #menu button.hot { background: rgba(57,215,255,.28); color: #fff; }
+  #menu button[disabled] { opacity: .45; cursor: default; border-style: dashed; }
+  #menu small { display: block; font-weight: 400; font-size: 10px; letter-spacing: .04em; opacity: .8; }
+  #closed { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    background: var(--bg); letter-spacing: .3em; font-size: 18px; }
+  #err { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); display: none;
+    max-width: 560px; padding: 16px 20px; border: 1px solid #c27b2e; background: rgba(20,10,2,.9);
+    color: #ffd2a1; }
+</style>
+</head>
+<body class="desktop">
+<canvas id="bg"></canvas>
+<canvas id="gl"></canvas>
+<canvas id="fx"></canvas>
+<div id="labels"></div>
+<div id="corners"><i></i><i></i><i></i><i></i></div>
+<div id="top">
+  <span class="title">JARVIS &nbsp;HOLO</span>
+  <span class="chip" id="chip-mode">DESKTOP</span>
+  <span class="chip bad" id="chip-trk">TRACKER: CONNECTING</span>
+  <span class="chip" id="chip-fake" style="display:none">FAKE HANDS</span>
+</div>
+<div id="hint"></div>
+<div id="legend"></div>
+<div id="dbg"></div>
+<div id="menu"><div class="ring"></div></div>
+<div id="closed">HOLO MODE CLOSED</div>
+<div id="err"></div>
+<script>window.JARVIS_TOKEN = __JARVIS_TOKEN__;</script>
+<script type="module" src="/holo/holo.js"></script>
+</body>
+</html>

@@ -27,16 +27,16 @@
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 733 |
+| Total registered actions (incl. aliases) | 739 |
 | — monolith `ACTIONS` dict | 156 |
-| — skill / core registered | 577 |
-| tested | 672 |
+| — skill / core registered | 583 |
+| tested | 678 |
 | **untested** (no test names it) | 61 |
-| spoken note: VERBATIM | 381 |
+| spoken note: VERBATIM | 387 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
 | **no spoken note** (neither) | 273 |
-| no `prompts.py` example | 524 |
+| no `prompts.py` example | 525 |
 
 A result with no spoken note is correct for side-effect actions but is the recurring
 "logged but never voiced" bug for read-outs — see the audit that seeded the 2026-07
@@ -288,6 +288,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `guest_mode_off` | `bobert_companion.py:34428` | neither | yes | yes |
 | `guest_mode_on` | `bobert_companion.py:34428` | neither | yes | yes |
 | `guest_mode_status` | `bobert_companion.py:34503` | **VERBATIM** | yes | yes |
+| `hand_menu` | `skills/holo_mode.py:210` | **VERBATIM** | — | yes |
 | `hand_mouse_off` | `skills/kinect_air_mouse.py:4024` | **VERBATIM** | — | yes |
 | `hand_mouse_on` | `skills/kinect_air_mouse.py:3998` | **VERBATIM** | — | yes |
 | `hardware_sensors` | `skills/hardware_sensors.py:20` | **VERBATIM** | yes | yes |
@@ -308,11 +309,16 @@ One row per action, sorted by name; aliases share their handler's location.
 | `hide_status_ring_v2` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
 | `hide_workshop_hud` | `skills/holographic_overlay/__init__.py:1161` | neither | — | yes |
 | `hide_workshop_print_monitor` | `skills/holographic_overlay/__init__.py:1416` | neither | — | yes |
+| `holo_assemble` | `skills/holo_mode.py:267` | **VERBATIM** | yes | yes |
+| `holo_explode` | `skills/holo_mode.py:255` | **VERBATIM** | yes | yes |
 | `holo_hud_v2` | `skills/holographic_overlay/__init__.py:1543` | neither | — | yes |
 | `holo_hud_v2_off` | `skills/holographic_overlay/__init__.py:1538` | neither | — | yes |
 | `holo_hud_v2_on` | `skills/holographic_overlay/__init__.py:1533` | neither | — | yes |
 | `holo_hud_v2_status` | `skills/holographic_overlay/__init__.py:1549` | **VERBATIM** | — | yes |
 | `holo_hud_v2_toggle` | `skills/holographic_overlay/__init__.py:1543` | neither | — | yes |
+| `holo_mode_off` | `skills/holo_mode.py:214` | **VERBATIM** | yes | yes |
+| `holo_mode_on` | `skills/holo_mode.py:192` | **VERBATIM** | yes | yes |
+| `holo_show` | `skills/holo_mode.py:225` | **VERBATIM** | yes | yes |
 | `holo_workshop` | `skills/holographic_overlay/__init__.py:493` | neither | — | yes |
 | `holo_workshop_canvas` | `skills/holographic_overlay/__init__.py:493` | neither | — | yes |
 | `holographic_hud_v2` | `skills/holographic_overlay/__init__.py:1543` | neither | — | yes |
