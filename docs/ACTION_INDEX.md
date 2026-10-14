@@ -70,9 +70,9 @@ One row per action, sorted by name; aliases share their handler's location.
 | `ambient_extract_stop` | `skills/ambient_multimodal_extract.py:452` | neither | — | yes |
 | `ambient_full_start` | `skills/ambient_listen.py:2063` | neither | — | yes |
 | `ambient_full_stop` | `skills/ambient_listen.py:2072` | neither | — | yes |
-| `ambient_learning_mode` | `bobert_companion.py:38679` | neither | — | yes |
-| `ambient_learning_mode_off` | `bobert_companion.py:38679` | neither | — | yes |
-| `ambient_learning_mode_on` | `bobert_companion.py:38679` | neither | — | yes |
+| `ambient_learning_mode` | `bobert_companion.py:38735` | neither | — | yes |
+| `ambient_learning_mode_off` | `bobert_companion.py:38735` | neither | — | yes |
+| `ambient_learning_mode_on` | `bobert_companion.py:38735` | neither | — | yes |
 | `ambient_listen_start` | `skills/ambient_listen.py:1882` | neither | — | yes |
 | `ambient_listen_status` | `skills/ambient_listen.py:2092` | **VERBATIM** | yes | yes |
 | `ambient_listen_stop` | `skills/ambient_listen.py:1911` | neither | — | yes |
@@ -197,7 +197,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `device_online` | `skills/network_deco.py:729` | **VERBATIM** | — | yes |
 | `diagnostic_daemon_status` | `core/diagnostic_daemons.py:1629` | **VERBATIM** | — | yes |
 | `diagnostic_history` | `skills/self_diagnostic.py:4704` | **VERBATIM** | — | yes |
-| `diagnostic_status` | `bobert_companion.py:47512` | **VERBATIM** | yes | yes |
+| `diagnostic_status` | `bobert_companion.py:47568` | **VERBATIM** | yes | yes |
 | `disable_guest_network` | `skills/network_deco.py:819` | neither | — | yes |
 | `disable_night_owl` | `skills/night_owl_mode.py:502` | neither | — | yes |
 | `disable_voice_clone` | `skills/voice_clone.py:244` | **VERBATIM** | yes | yes |
@@ -226,10 +226,10 @@ One row per action, sorted by name; aliases share their handler's location.
 | `enroll_voice` | `skills/enroll_voice.py:312` | **VERBATIM** | yes | yes |
 | `enroll_xtts_sample` | `skills/custom_voice.py:526` | neither | — | yes |
 | `enrolled_voices` | `skills/enroll_voice.py:359` | **VERBATIM** | — | yes |
-| `enter_ambient_learning` | `bobert_companion.py:38679` | neither | — | yes |
+| `enter_ambient_learning` | `bobert_companion.py:38735` | neither | — | yes |
 | `eval_python` | `skills/code_executor.py:395` | *INFORMATIVE* | — | yes |
 | `evening_briefing` | `skills/daily_briefing/evening.py:963` | neither | yes | yes |
-| `exit_ambient_learning` | `bobert_companion.py:38679` | neither | — | yes |
+| `exit_ambient_learning` | `bobert_companion.py:38735` | neither | — | yes |
 | `exit_jarvis` | `core/actions.py:7107` | neither | — | yes |
 | `export_memory` | `core/actions.py:3491` | neither | yes | yes |
 | `face_id_status` | `skills/face_id.py:380` | **VERBATIM** | — | yes |
@@ -713,8 +713,8 @@ One row per action, sorted by name; aliases share their handler's location.
 | `wake_listener_start` | `skills/wake_listener.py:484` | neither | yes | yes |
 | `wake_listener_status` | `skills/wake_listener.py:519` | **VERBATIM** | — | yes |
 | `wake_listener_stop` | `skills/wake_listener.py:505` | neither | — | yes |
-| `wake_resume_answer_then_quiet` | `bobert_companion.py:38715` | neither | — | yes |
-| `wake_resume_stay_talkative` | `bobert_companion.py:38715` | neither | — | yes |
+| `wake_resume_answer_then_quiet` | `bobert_companion.py:38771` | neither | — | yes |
+| `wake_resume_stay_talkative` | `bobert_companion.py:38771` | neither | — | yes |
 | `wake_word_mode_off` | `bobert_companion.py:34362` | neither | — | yes |
 | `wake_word_mode_on` | `bobert_companion.py:34362` | neither | — | yes |
 | `wake_word_mode_status` | `bobert_companion.py:34412` | **VERBATIM** | — | yes |
