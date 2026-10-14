@@ -6490,6 +6490,7 @@ def _hud_camera_preview_downscale(frame: "np.ndarray", width: int) -> "np.ndarra
 # The key vocabulary and the side rule live in core/camera_tiles.py since
 # 2026-09-30: the web dashboard used to carry its OWN copy of this tuple.
 from core import camera_tiles as _camera_tiles  # noqa: E402
+from core import handtrack_frames as _handtrack_frames  # noqa: E402
 _HUD_PERCAM_PREVIEW_KEYS = _camera_tiles.PREVIEW_KEYS
 _hud_percam_last_write: dict[str, float] = {}
 # Keys this process has written since the last cleanup - the per-camera twin
@@ -13106,6 +13107,13 @@ def _face_tracking_thread_body():
                                               _bright, now_loop)
                 elif _black_run_ended:
                     _note_black_camera_frames_ended(cam["label"], cam["index"])
+                # HAND TRACKER hand-off (2026-10-14): while the tracker service
+                # is alive (its heartbeat file is fresh) the configured camera's
+                # frame is copied, at 640x480, into the "jarvis_handtrack_frame"
+                # shared-memory segment. With no tracker this is one monotonic
+                # compare. It never raises and never touches the capture handle.
+                if not _black:
+                    _handtrack_frames.publish_frame(cam, frame)
                 # Per-camera preview: EVERY webcam publishes its own tile (the
                 # web Camera tab shows each eye individually); the primary-only
                 # composite below is unchanged. Same enable gate + throttle

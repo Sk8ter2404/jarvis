@@ -1543,6 +1543,30 @@ SCHEMA: dict[str, dict] = {
                 "On = start it at boot; 'air control on' by voice starts it "
                 "for one session either way.",
     },
+    "HAND_TRACKING_ENABLED": {
+        "tab": "cameras", "label": "Hand tracking (MediaPipe) on at boot",
+        "type": "bool", "default": False,
+        "help": "Run the hand tracker: a separate process reads the camera "
+                "frames JARVIS already captures and finds your hands for the "
+                "holo window. Never moves the cursor. Off = nothing runs. "
+                "'Hand tracking on' by voice starts it for one session "
+                "either way.",
+    },
+    "HAND_MENU_ENABLED": {
+        "tab": "cameras", "label": "Open palm held up opens the hand menu",
+        "type": "bool", "default": False,
+        "help": "With hand tracking on: hold an open palm, fingers spread, "
+                "facing the camera for about a second and a half to open the "
+                "desktop holo window. At most once every 10 s; never in game "
+                "mode, over a fullscreen app or in a call.",
+    },
+    "HAND_TRACK_CAMERA": {
+        "tab": "cameras", "label": "Camera the hand tracker reads",
+        "type": "str", "default": "primary",
+        "help": "'primary' (the primary webcam), 'left' or 'right' (a webcam "
+                "entry by its preview name) or a camera index such as 0. "
+                "Applies at once.",
+    },
     "KINECT_ENABLED": {
         "tab": "cameras", "label": "Kinect sensor (master switch)",
         "type": "bool", "default": False,
@@ -2448,6 +2472,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                      "CAMERA_CULPRIT_WINDOW_S", "CAMERA_CULPRIT_THRESHOLD",
                      "CAMERA_DIES_ON_OPEN_RETRY_S", "CAMERA_OPEN_MIN_GAP_S",
                      "TV_DETECT_ENABLED"]),
+        ("Hand tracking", ["HAND_TRACKING_ENABLED", "HAND_MENU_ENABLED",
+                           "HAND_TRACK_CAMERA"]),
         ("Kinect", ["KINECT_ENABLED", "KINECT_AS_CAMERA",
                     "KINECT_PRESENCE_ENABLED", "KINECT_PRESENCE_STANDBY",
                     "KINECT_PRESENCE_WAKE", "KINECT_GREET_ON_ENTRY",

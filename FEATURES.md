@@ -470,6 +470,9 @@ Every briefing below is one skill, `skills/daily_briefing/` (merged 2026-10-12 f
   - "calibrate pointing for the desk lamp", "turn that on", "what can I point at"
   - Actions: `point_control_on` / `point_control_off`, `point_calibrate`, `point_control`, `list_point_targets`, `forget_point_target`, `point_status`
 - **Two-hand window resize** — raise both hands to grab the focused window; spread to grow, pinch to shrink, slide to move (`skills/kinect_two_hand.py`, needs the Kinect on; no voice commands).
+- **Hand tracking (MediaPipe)** (off by default - settings `HAND_TRACKING_ENABLED`, `HAND_MENU_ENABLED`, `HAND_TRACK_CAMERA`) — a separate tracker process (its own venv, `tools/hand_tracker_service.py`) reads the frames JARVIS already captures from a webcam (shared memory, only while it runs) and serves hands plus gestures (palm hold, pinch, fist grab, point flick, clap, explode) on `ws://127.0.0.1:8793` for the holo page. With the menu setting on, an open palm held facing the camera for about 1.5 s opens the desktop holo window (at most once per 10 s; never in game mode, over a fullscreen app or in a call). Never moves the cursor or sends OS input.
+  - "turn on hand tracking", "stop tracking my hands", "can you see my hands"
+  - Actions: `hand_tracking_on`, `hand_tracking_off`, `hand_tracking_status`
 
 ### Category 18: Smart home & network
 

@@ -2008,6 +2008,31 @@ KINECT_HAND_MIRROR = True
 #   off). See skills/kinect_two_hand.py (+ skills/kinect_air_mouse.set_two_hand_active
 #   / two_hand_active for the hand-off, hud/jarvis_air_cursor.py for the reticles).
 KINECT_TWO_HAND_ENABLED = True
+# ─── HAND TRACKING v2 (2026-10-14, MediaPipe) ────────────────────────────────
+# A separate tracker process (tools/hand_tracker_service.py, run with its OWN
+# venv: MediaPipe pulls OpenCV 5, which must not enter JARVIS's environment)
+# reads the camera frames JARVIS already captures (core/handtrack_frames.py,
+# shared memory "jarvis_handtrack_frame") and serves hands + gestures on
+# ws://127.0.0.1:8793 for the holo page. JARVIS starts and stops it
+# (core/hand_tracker_launcher.py); it never outlives JARVIS. It never moves the
+# cursor or sends OS input. OFF by default - "hand tracking on" by voice turns
+# it on for the session, this setting at every boot.
+#   HAND_TRACKING_ENABLED  start the tracker at boot / keep it running.
+#   HAND_MENU_ENABLED      an open palm held ~1.5 s facing the camera opens the
+#                          desktop holo window (at most once per 10 s; never in
+#                          game mode, over a fullscreen app or in a call).
+#   HAND_TRACK_CAMERA      which camera feeds it: "primary" (the primary
+#                          webcam), "left" / "right" (the preview key of a
+#                          webcam entry in CAMERAS) or a camera index ("0").
+#   HAND_TRACK_PYTHON / HAND_TRACK_MODEL / HAND_TRACK_PORT  where the tracker
+#                          venv's python, the HandLandmarker .task file and the
+#                          websocket port are.
+HAND_TRACKING_ENABLED = False
+HAND_MENU_ENABLED = False
+HAND_TRACK_CAMERA = "primary"
+HAND_TRACK_PYTHON = r"C:\JARVIS-models\handtrack\venv\Scripts\python.exe"
+HAND_TRACK_MODEL = r"C:\JARVIS-models\handtrack\hand_landmarker.task"
+HAND_TRACK_PORT = 8793
 # ─── KINECT HAND STABILISER (2026-10-04, "hand tracking is unstable") ─────────
 # One shared stabiliser (audio/kinect_stabilizer.py) runs ONCE per real Kinect
 # body frame inside the bridge pump; the air-mouse, two-hand, gestures and

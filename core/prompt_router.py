@@ -701,6 +701,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "forget that line", "that line sounded", "redo that line",
         "bad take",
     ],
+    "HAND TRACKING": [
+        "hand tracking", "track my hands", "tracking my hands", "watch my hands",
+        "see my hands", "my hands", "hand menu", "hand tracker", "palm hold",
+        "stop watching my hands",
+    ],
     "SMART HOME — PER-BRAND LIST": [
         "smart device",
         "list my lights", "list plugs", "which lights", "hue list", "govee list",
