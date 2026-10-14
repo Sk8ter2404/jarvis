@@ -176,10 +176,10 @@ export class FakeHands {
       { at: 1.5, ev: { name: "palm_hold", side: "Right", pos: [0.46, 0.55] } },
       { at: 4.2, ev: { name: "fist_grab", side: "Right", pos: c } },
       { at: 6.8, ev: { name: "fist_release", side: "Right", pos: this._grabC || c } },
-      { at: 7.6, ev: { name: "point_flick", side: "Right", pos: [c[0] + 0.15, c[1] + 0.2], value: 2.4 } },
-      { at: 9.4, ev: { name: "point_flick", side: "Right", pos: [c[0] - 0.15, c[1] + 0.2], value: -2.2 } },
+      { at: 7.6, ev: { name: "point_flick", side: "Right", pos: [c[0] + 0.15, c[1] + 0.2], value: 420 } },
+      { at: 9.4, ev: { name: "point_flick", side: "Right", pos: [c[0] - 0.15, c[1] + 0.2], value: -380 } },
       { at: 10.8, ev: { name: "explode", side: "both", pos: [0.5, 0.55] } },
-      { at: 11.9, ev: { name: "pinch_part", side: "Right", pos: part } },
+      { at: 11.9, ev: { name: "pinch_start", side: "Right", pos: part } },
       { at: 14.9, ev: { name: "clap", side: "both", pos: [0.5, 0.62] } },
     ];
   }

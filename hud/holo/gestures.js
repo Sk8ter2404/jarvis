@@ -8,7 +8,7 @@
 //     {"type":"hands", "hands":[{id, side, lm[21][x,y,z], state, pinch, palm, palm_facing}]}
 //     {"type":"gesture", name, side, pos:[x,y], value?}
 //   names: palm_hold pinch_hold fist_grab fist_release point_flick explode
-//          clap pinch_part
+//          clap pinch_start pinch_end (pinch_part = older alias of pinch_start)
 //   This module decides what the SCENE does with them (the "router"), plus the
 //   small pieces of math the scene needs. Coordinates are normalized 0..1,
 //   already mirrored for display by the service.
@@ -35,11 +35,13 @@ export const T = Object.freeze({
   // reactor centre (plus a floor in px so a small reactor is still catchable).
   GRAB_RADII: 1.8,
   GRAB_MIN_PX: 200,
-  // Point-and-flick: service sends the index tip's sideways speed in image
-  // widths per second (+ = to the right on screen). Spin gain turns it into
-  // rad/s; clamped so one flick cannot make an unreadable blur.
-  FLICK_MIN: 0.8,
-  SPIN_GAIN: 3.2,
+  // Point-and-flick: the service (tools/handtrack_gestures.py) sends the
+  // wrist->index-tip direction's angular speed in deg/s (+ = clockwise on
+  // screen, an upward finger swinging right) and only fires at >= 220 deg/s.
+  // SPIN_GAIN turns deg/s into rad/s 1:1; clamped so one flick cannot make an
+  // unreadable blur.
+  FLICK_MIN: 200,
+  SPIN_GAIN: Math.PI / 180,
   SPIN_MAX: 14,
   SPIN_DAMP_PER_S: 1.6,            // omega *= exp(-k t)
   // Exploded: pinch a part to pull it out, hold it this long for its info.
@@ -249,6 +251,12 @@ export class GestureRouter {
         }
         break;
 
+      // The service sends plain pinch_start / pinch_end; it does not know the
+      // scene, so "is there a part under the pinch" is decided here. Release
+      // of a pulled part comes from the continuous hand state (update()).
+      case "pinch_end":
+        break;
+      case "pinch_start":
       case "pinch_part": {
         if (!sc.exploded || this.pulled) break;
         const part = sc.partAt(pos.x, pos.y);

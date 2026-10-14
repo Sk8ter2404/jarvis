@@ -57,8 +57,8 @@ const TESTS = [
     near(nx, 0, 1e-6); near(ny, 0, 1e-6);
   }],
   ["flick -> spin: deadband, clamp, sign, damping", () => {
-    eq(flickToSpin(0.1), 0);
-    if (!(flickToSpin(2) > 0 && flickToSpin(-2) < 0)) throw new Error("sign");
+    eq(flickToSpin(90), 0);
+    if (!(flickToSpin(300) > 0 && flickToSpin(-300) < 0)) throw new Error("sign");
     eq(flickToSpin(1000), T.SPIN_MAX);
     const w = dampSpin(10, 1);
     if (!(w < 10 && w > 0)) throw new Error("damp");
@@ -106,9 +106,9 @@ const TESTS = [
   }],
   ["point_flick spins both ways; a tiny flick is ignored", () => {
     const s = new MockScene(), r = new GestureRouter(s);
-    r.onGesture({ name: "point_flick", value: 2.4 });
-    r.onGesture({ name: "point_flick", value: -2.4 });
-    r.onGesture({ name: "point_flick", value: 0.2 });
+    r.onGesture({ name: "point_flick", value: 420 });
+    r.onGesture({ name: "point_flick", value: -420 });
+    r.onGesture({ name: "point_flick", value: 120 });
     eq(s.count("spin"), 2);
     if (!(s.calls[0][1] > 0 && s.calls[1][1] < 0)) throw new Error("direction");
   }],
@@ -124,10 +124,10 @@ const TESTS = [
     r.onGesture({ name: "explode" });               // inside the lock after assemble
     eq(s.exploded, false, "explode inside lock");
   }],
-  ["pinch_part pulls a part, info appears after the hold, release lets go", () => {
+  ["pinch_start on a part pulls it, info appears after the hold, release lets go", () => {
     const s = new MockScene(), r = new GestureRouter(s);
     s.exploded = true;
-    r.onGesture({ name: "pinch_part", side: "Right", pos: [0.5, 0.5] });
+    r.onGesture({ name: "pinch_start", side: "Right", pos: [0.5, 0.5] });
     eq(s.count("pull"), 1);
     const h = hand("Right", "pinch");
     for (let i = 0; i < 20; i++) r.update([h], 0.03);   // 0.6 s: no info yet
@@ -168,7 +168,7 @@ const TESTS = [
         } else if (m.type === "gesture") names.add(m.name);
       }
     }
-    for (const n of ["palm_hold", "fist_grab", "fist_release", "point_flick", "explode", "pinch_part", "clap"]) {
+    for (const n of ["palm_hold", "fist_grab", "fist_release", "point_flick", "explode", "pinch_start", "clap"]) {
       if (!names.has(n)) throw new Error("missing " + n);
     }
   }],

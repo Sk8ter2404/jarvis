@@ -7,7 +7,8 @@
 //   /holo?mode=camera    the tracker's mirrored camera frames behind the scene
 //   /holo?fake=1         built-in scripted hands + gestures (no service needed)
 //   /holo?selftest=1     run the pure-module self tests and show the result
-//   other params: ws=<url> debug=1 mirror=0 (frames already mirrored)
+//   other params: ws=<url> debug=1 mirror=1 (flip the frames again; the
+//   service already sends them mirrored, matching the mirrored landmarks)
 //
 // Pinned libraries (exact versions; no runtime installs, no floating tags):
 //   three.js 0.160.0  https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js
@@ -51,7 +52,7 @@ if (qs.get("selftest") === "1") {
 // state
 // ---------------------------------------------------------------------------
 let mode = (qs.get("mode") === "camera") ? "camera" : "desktop";
-let mirrorFrame = qs.get("mirror") !== "0";
+let mirrorFrame = qs.get("mirror") === "1";
 let bw = false, showLabels = true, debug = qs.get("debug") === "1";
 let W = innerWidth, H = innerHeight;
 let aspect = 4 / 3;
