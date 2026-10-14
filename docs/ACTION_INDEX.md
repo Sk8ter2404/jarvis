@@ -27,15 +27,15 @@
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 729 |
+| Total registered actions (incl. aliases) | 730 |
 | — monolith `ACTIONS` dict | 156 |
-| — skill / core registered | 573 |
-| tested | 670 |
+| — skill / core registered | 574 |
+| tested | 671 |
 | **untested** (no test names it) | 59 |
 | spoken note: VERBATIM | 378 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
-| **no spoken note** (neither) | 272 |
+| **no spoken note** (neither) | 273 |
 | no `prompts.py` example | 521 |
 
 A result with no spoken note is correct for side-effect actions but is the recurring
@@ -345,6 +345,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `kasa_control` | `core/smart_home_router.py:1132` | neither | — | no |
 | `kasa_list` | `skills/sh_kasa.py:501` | *INFORMATIVE* | — | yes |
 | `kasa_list_devices` | `skills/sh_kasa.py:501` | *INFORMATIVE* | — | no |
+| `kasa_smart_home_control` | `core/smart_home_router.py:1132` | neither | — | yes |
 | `keep_music_open` | `skills/itunes_library.py:343` | **VERBATIM** | yes | yes |
 | `kick_guest_network` | `skills/network_deco.py:819` | neither | yes | yes |
 | `kinect_look` | `skills/kinect_vision.py:181` | *INFORMATIVE* | — | yes |
@@ -359,7 +360,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `learn_guest` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
 | `learn_my_face` | `skills/face_id.py:220` | **VERBATIM** | — | yes |
 | `learn_my_voice` | `skills/enroll_voice.py:312` | **VERBATIM** | — | yes |
-| `learn_remote_code` | `skills/sh_broadlink.py:314` | **VERBATIM** | — | yes |
+| `learn_remote_code` | `skills/sh_broadlink.py:314` | **VERBATIM** | yes | yes |
 | `learn_their_face` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
 | `lifx_list` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |
 | `lifx_list_devices` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |

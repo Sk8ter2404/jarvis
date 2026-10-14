@@ -206,13 +206,13 @@ class KasaSmartHomeControlTests(unittest.TestCase):
         ]
 
     def test_empty_request_prompts(self):
-        out = self.actions["smart_home_control"]("")
+        out = self.actions["kasa_smart_home_control"]("")
         self.assertIn("control", out.lower())
 
     def test_no_devices_message(self):
         with mock.patch.object(self.mod, "list_devices", return_value=[]), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None):
-            out = self.actions["smart_home_control"]("turn on entry light")
+            out = self.actions["kasa_smart_home_control"]("turn on entry light")
         self.assertIn("don't see any", out.lower())
 
     def test_turn_on_named_device_dispatches_on_true(self):
@@ -220,7 +220,7 @@ class KasaSmartHomeControlTests(unittest.TestCase):
         with mock.patch.object(self.mod, "list_devices", return_value=self._devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "set_state", set_state):
-            out = self.actions["smart_home_control"]("turn on the entry light")
+            out = self.actions["kasa_smart_home_control"]("turn on the entry light")
         # Matched 'Entry Light', dispatched on=True.
         self.assertIn("entry light on", out.lower())
         self.assertIn("done", out.lower())
@@ -235,7 +235,7 @@ class KasaSmartHomeControlTests(unittest.TestCase):
         with mock.patch.object(self.mod, "list_devices", return_value=devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "set_state", set_state):
-            self.actions["smart_home_control"]("turn on the office")
+            self.actions["kasa_smart_home_control"]("turn on the office")
         _args, kwargs = set_state.call_args
         self.assertEqual(kwargs.get("on"), True)
 
@@ -246,7 +246,7 @@ class KasaSmartHomeControlTests(unittest.TestCase):
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "get_state", get_state), \
              mock.patch.object(self.mod, "set_state", set_state):
-            out = self.actions["smart_home_control"]("toggle dining room")
+            out = self.actions["kasa_smart_home_control"]("toggle dining room")
         # Was off → toggled on.
         _args, kwargs = set_state.call_args
         self.assertEqual(kwargs.get("on"), True)
@@ -261,7 +261,7 @@ class KasaSmartHomeControlTests(unittest.TestCase):
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "get_state", get_state), \
              mock.patch.object(self.mod, "set_state", set_state):
-            out = self.actions["smart_home_control"]("status of the dining room")
+            out = self.actions["kasa_smart_home_control"]("status of the dining room")
         self.assertIn("status", out.lower())
         self.assertIn("dining room is on", out.lower())
         set_state.assert_not_called()  # a status query must not write state
@@ -271,7 +271,7 @@ class KasaSmartHomeControlTests(unittest.TestCase):
         with mock.patch.object(self.mod, "list_devices", return_value=self._devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "set_state", set_state):
-            out = self.actions["smart_home_control"]("turn off all the lights")
+            out = self.actions["kasa_smart_home_control"]("turn off all the lights")
         # Both devices addressed.
         self.assertEqual(set_state.call_count, 2)
         self.assertIn("entry light off", out.lower())
@@ -829,7 +829,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
         with mock.patch.object(self.mod, "list_devices",
                                side_effect=RuntimeError("scan boom")), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None):
-            out = self.actions["smart_home_control"]("turn on lamp")
+            out = self.actions["kasa_smart_home_control"]("turn on lamp")
         self.assertIn("don't see any", out.lower())
 
     def test_tuya_devices_merged_and_routed(self):
@@ -843,7 +843,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
         with mock.patch.object(self.mod, "list_devices", return_value=[]), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=tuya), \
              mock.patch.object(self.mod, "set_state", kasa_set):
-            out = self.actions["smart_home_control"]("turn on tuya lamp")
+            out = self.actions["kasa_smart_home_control"]("turn on tuya lamp")
         self.assertIn("tuya lamp on", out.lower())
         tuya.set_state.assert_called_once()
         kasa_set.assert_not_called()
@@ -856,7 +856,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
         with mock.patch.object(self.mod, "list_devices", return_value=kasa_devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=tuya), \
              mock.patch.object(self.mod, "set_state", kasa_set):
-            out = self.actions["smart_home_control"]("turn on entry")
+            out = self.actions["kasa_smart_home_control"]("turn on entry")
         self.assertIn("entry on", out.lower())
 
     def test_word_overlap_fallback_matches_best(self):
@@ -867,7 +867,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
         with mock.patch.object(self.mod, "list_devices", return_value=devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "set_state", kasa_set):
-            out = self.actions["smart_home_control"]("turn on the bedroom please")
+            out = self.actions["kasa_smart_home_control"]("turn on the bedroom please")
         self.assertIn("master bedroom on", out.lower())
 
     def test_no_match_lists_controllable_devices(self):
@@ -876,7 +876,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
         devs = [{"name": "Garage", "lan_ip": "10.0.0.5"}]
         with mock.patch.object(self.mod, "list_devices", return_value=devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None):
-            out = self.actions["smart_home_control"]("toggle xyzzy")
+            out = self.actions["kasa_smart_home_control"]("toggle xyzzy")
         self.assertIn("not sure which", out.lower())
         self.assertIn("Garage", out)
 
@@ -888,7 +888,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "set_state",
                                return_value={"error": "device offline"}):
-            out = self.actions["smart_home_control"]("turn on entry")
+            out = self.actions["kasa_smart_home_control"]("turn on entry")
         low = out.lower()
         self.assertFalse(low.startswith("done, sir"))
         self.assertIn("that didn", low)
@@ -907,7 +907,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
         with mock.patch.object(self.mod, "list_devices", return_value=devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "set_state", side_effect=_set):
-            out = self.actions["smart_home_control"]("turn off all the lights")
+            out = self.actions["kasa_smart_home_control"]("turn off all the lights")
         low = out.lower()
         self.assertFalse(low.startswith("done, sir"))
         self.assertIn("partly done", low)
@@ -925,7 +925,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
         with mock.patch.object(self.mod, "list_devices", return_value=devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "set_state", return_value=res):
-            out = self.actions["smart_home_control"]("turn on entry")
+            out = self.actions["kasa_smart_home_control"]("turn on entry")
         self.assertFalse(out.lower().startswith("done, sir"))
         self.assertIn("not dimmable", out)
 
@@ -939,7 +939,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
              mock.patch.object(self.mod, "get_state",
                                return_value={"error": "kasa state read failed"}), \
              mock.patch.object(self.mod, "set_state", set_state):
-            out = self.actions["smart_home_control"]("toggle entry")
+            out = self.actions["kasa_smart_home_control"]("toggle entry")
         set_state.assert_not_called()
         low = out.lower()
         self.assertIn("read state", low)
@@ -951,7 +951,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "get_state",
                                return_value={"error": "kasa state read failed: boom"}):
-            out = self.actions["smart_home_control"]("status of the dining room")
+            out = self.actions["kasa_smart_home_control"]("status of the dining room")
         low = out.lower()
         self.assertIn("status unknown", low)
         self.assertNotIn("is off", low)
@@ -972,7 +972,7 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "_CONTROL_BUDGET_SECS", 0.05), \
              mock.patch.object(self.mod, "set_state", side_effect=_slow) as ss:
-            out = self.actions["smart_home_control"]("turn off all the lights")
+            out = self.actions["kasa_smart_home_control"]("turn off all the lights")
         self.assertEqual(ss.call_count, 1)          # second never attempted
         low = out.lower()
         self.assertFalse(low.startswith("done, sir"))
@@ -1193,7 +1193,7 @@ class KasaPartialSuccessTests(_KasaBase):
         with mock.patch.object(self.mod, "list_devices", return_value=devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "set_state", return_value=partial):
-            out = self.actions["smart_home_control"]("turn on the entry light")
+            out = self.actions["kasa_smart_home_control"]("turn on the entry light")
         low = out.lower()
         self.assertNotIn("that didn't work", low)
         self.assertIn("entry light on", low)
@@ -1254,7 +1254,7 @@ class KasaTurnBudgetClampTests(_KasaBase):
     def test_the_deadline_is_cleared_after_a_control_turn(self):
         with mock.patch.object(self.mod, "list_devices", return_value=[]), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None):
-            self.actions["smart_home_control"]("turn on the lamp")
+            self.actions["kasa_smart_home_control"]("turn on the lamp")
         self.assertIsNone(self.mod._turn_deadline_remaining(),
                           "a stale deadline would throttle the next, "
                           "unbudgeted call")
@@ -1263,7 +1263,7 @@ class KasaTurnBudgetClampTests(_KasaBase):
         with mock.patch.object(self.mod, "_smart_home_control",
                                side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
-                self.actions["smart_home_control"]("turn on the lamp")
+                self.actions["kasa_smart_home_control"]("turn on the lamp")
         self.assertIsNone(self.mod._turn_deadline_remaining())
 
 
@@ -1283,7 +1283,7 @@ class KasaStatusBranchWordingTests(_KasaBase):
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "_CONTROL_BUDGET_SECS", 0.05), \
              mock.patch.object(self.mod, "get_state", side_effect=_slow):
-            return self.actions["smart_home_control"]("are all the lights on?")
+            return self.actions["kasa_smart_home_control"]("are all the lights on?")
 
     def test_a_partial_status_answer_carries_no_failure_marker(self):
         from core.failure_markers import FAILURE_MARKERS
@@ -1310,7 +1310,7 @@ class KasaStatusBranchWordingTests(_KasaBase):
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "_CONTROL_BUDGET_SECS", 0.05), \
              mock.patch.object(self.mod, "set_state", side_effect=_slow):
-            out = self.actions["smart_home_control"]("turn off all the lights")
+            out = self.actions["kasa_smart_home_control"]("turn off all the lights")
         low = out.lower()
         self.assertIn("1 not attempted", low)
         self.assertTrue([m for m in FAILURE_MARKERS if m.lower() in low],
