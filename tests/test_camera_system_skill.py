@@ -372,7 +372,7 @@ class LookAroundTests(CameraSystemBase):
         seen = {"pngs": [], "questions": []}
         answers = list(answers)
 
-        def _ask(question, png):
+        def _ask(question, png, **_kw):
             seen["questions"].append(question)
             seen["pngs"].append(png)
             return answers.pop(0) if answers else ""
@@ -575,7 +575,7 @@ class NoLeakTests(CameraSystemBase):
                                         "ts": 0.0})
         seen = {"pngs": []}
 
-        def _ask(q, p):
+        def _ask(q, p, **_kw):
             seen["pngs"].append(p)
             return "[local-vision] ok"
         utils = make_fake_skill_utils(ask_vision=mock.MagicMock(side_effect=_ask))

@@ -986,7 +986,8 @@ def _classify_local(system: str, prompt: str) -> str | None:
         with _background_work("notification-triage",
                               max_defer_s=LLM_LOCAL_MAX_DEFER_S):
             local = call(system, [{"role": "user", "content": prompt}],
-                         max_tokens=8)
+                         max_tokens=8, caller="notification_triage",
+                         background=True)
         return _parse_verdict(local) if local else None
     except Exception as e:
         _log.debug("[triage] local classifier failed: %s", e)
@@ -1010,6 +1011,7 @@ def _classify_claude(system: str, prompt: str) -> str | None:
         client = anthropic.Anthropic()
         msg = llm_client.create_message(
             client, purpose="classify",
+            caller="notification_triage", background=True,
             model=model,
             max_tokens=8,
             system=system,

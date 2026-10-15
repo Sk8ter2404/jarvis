@@ -996,7 +996,7 @@ class LearnFromTurnTests(_MonolithTestBase):
         # load_memory() instead, same as the prompt-rebuild Timer fix.
         captured = []
 
-        def fake_llm(system, user, max_tokens=250):
+        def fake_llm(system, user, max_tokens=250, **_kw):
             captured.append(system)
             return "no json"       # stop before merge; we only want the prompt
 
@@ -1025,7 +1025,7 @@ class LearnFromTurnTests(_MonolithTestBase):
         # two turns has to show up in the second turn's extractor prompt.
         captured = []
 
-        def fake_llm(system, user, max_tokens=250):
+        def fake_llm(system, user, max_tokens=250, **_kw):
             captured.append(system)
             return "no json"
 
@@ -2922,7 +2922,7 @@ class SessionCheckpointThreadTests(_MonolithTestBase):
             hist.append({"role": "assistant", "content": f"reply {i:02d}"})
         recorded, prompts = [], []
 
-        def _llm(system=None, user=None, max_tokens=None):
+        def _llm(system=None, user=None, max_tokens=None, **_kw):
             prompts.append(user or "")
             return ["First part of the day.", "The whole session."][
                 len(prompts) - 1]
@@ -4093,7 +4093,7 @@ class StreamingTtsTests(_MonolithTestBase):
             client, spoken,
             extra_patches=[mock.patch.object(
                 self.bc, "_local_fallback_or",
-                lambda _sys, msg: "Local brain answering, sir.")])
+                lambda _sys, msg, **_kw: "Local brain answering, sir.")])
         self.assertEqual(calls, {"stream": 1, "complete": 0})
         self.assertEqual(reply, "Local brain answering, sir.")
 

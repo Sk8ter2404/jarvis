@@ -531,7 +531,7 @@ class TeamsVisionParserTests(unittest.TestCase):
                 return list(images)
             ns.take_all_monitor_screenshots = _take
         if ask:
-            def _ask(prompt, imgs):
+            def _ask(prompt, imgs, **_kw):
                 if ask_raises:
                     raise RuntimeError("vision boom")
                 return answer

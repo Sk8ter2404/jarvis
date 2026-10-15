@@ -1148,7 +1148,7 @@ class SeeScreenBudgetResetTests(SectionSixBase):
         self._p(bc, "screenshot_privacy_block_reason", lambda: None)
         self._p(bc, "_parse_monitor_prefix", lambda q: (None, q))
         self._p(bc, "take_all_monitor_screenshots", lambda: {"m": b"PNG"})
-        self._p(bc, "ask_vision_multi", lambda q, imgs: "a desktop")
+        self._p(bc, "ask_vision_multi", lambda q, imgs, **_kw: "a desktop")
         self._p(bc, "_push_screen_context", lambda *a, **k: None)
         self._with_action("see_screen", A._act_see_screen, informative=True)
 
@@ -1251,7 +1251,7 @@ class GetFollowupResponseTests(SectionSixBase):
 
         captured = {}
 
-        def _fake_local(sys_prompt, messages, max_tokens=400):
+        def _fake_local(sys_prompt, messages, max_tokens=400, **_kw):
             captured["msgs"] = messages
             captured["max_tokens"] = max_tokens
             return "Local follow-up, sir."
@@ -1394,7 +1394,7 @@ class GetFollowupResponseTests(SectionSixBase):
 
         seen = {}
 
-        def _fake_local(sys_prompt, messages, max_tokens=400):
+        def _fake_local(sys_prompt, messages, max_tokens=400, **_kw):
             seen["sys"] = sys_prompt
             seen["msgs"] = messages
             return "local rescue, sir."
@@ -1425,7 +1425,7 @@ class GetFollowupResponseTests(SectionSixBase):
 
         seen = {}
 
-        def _fake_local(sys_prompt, messages, max_tokens=400):
+        def _fake_local(sys_prompt, messages, max_tokens=400, **_kw):
             seen["sys"] = sys_prompt
             seen["msgs"] = messages
             return "Local follow-up, sir."
@@ -3192,7 +3192,7 @@ class GetFollowupResponseExtraTests(SectionSixBase):
         bc = self.bc
         captured = {}
 
-        def _bounded(model, messages):
+        def _bounded(model, messages, **_kw):
             captured["model"] = model
             captured["messages"] = messages
             return {"message": {"content": "ollama follow-up"}}

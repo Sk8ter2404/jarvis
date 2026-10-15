@@ -57,7 +57,7 @@ class CloudFallbackSelfKnowledgeTests(MonolithGlobalsTestCase):
         msgs = self._msgs()
         seen = {}
 
-        def _local(system, messages, max_tokens=500):
+        def _local(system, messages, max_tokens=500, **_kw):
             seen["msgs"] = messages
             return "Local answer, sir."
         with mock.patch.object(bc, "_call_local_llm", side_effect=_local), \

@@ -350,7 +350,8 @@ class ResolverHelperTests(unittest.TestCase):
         with mock.patch.object(self.mod, "_bobert", return_value=bc):
             out = self.mod._call_local_vision("q", [b"png"], max_tokens=42)
         self.assertEqual(out, "answer")
-        bc._call_local_vision.assert_called_once_with("q", [b"png"], max_tokens=42)
+        bc._call_local_vision.assert_called_once_with(
+            "q", [b"png"], max_tokens=42, caller="")
 
     def test_call_local_vision_none_when_no_bobert(self):
         with mock.patch.object(self.mod, "_bobert", return_value=None):
@@ -442,8 +443,9 @@ class DescribePushContextTests(unittest.TestCase):
         bc = _fake_bc()
         captured = {}
 
-        def _call(prompt, pngs, max_tokens=600):
+        def _call(prompt, pngs, max_tokens=600, **_kw):
             captured["prompt"] = prompt
+            captured["caller"] = _kw.get("caller")
             return "ok"
 
         with _quiet(), \
@@ -453,6 +455,7 @@ class DescribePushContextTests(unittest.TestCase):
              mock.patch.object(self.mod, "_call_local_vision", side_effect=_call):
             self.actions["local_describe_screen"]("")
         self.assertIn("Describe in detail", captured["prompt"])
+        self.assertEqual(captured["caller"], "local_vision")
 
 
 # ── _find_click_target_local two-pass coordinate refinement ───────────────

@@ -41,7 +41,7 @@ class _Fake:
         self.calls = []
         self.reply = lambda system, user, mt: ""
 
-    def __call__(self, system, user, max_tokens=200):
+    def __call__(self, system, user, max_tokens=200, **_kw):
         self.calls.append((system, user, max_tokens))
         return self.reply(system, user, max_tokens)
 

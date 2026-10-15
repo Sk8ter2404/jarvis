@@ -188,7 +188,8 @@ def _llm_extract(window_text: str) -> dict:
         return {}
 
     try:
-        raw = quick(_extract_system(), window_text, max_tokens=500)
+        raw = quick(_extract_system(), window_text, max_tokens=500,
+                    caller="ambient_extractor", background=True)
     except Exception as e:
         print(f"  [ambient-extract] LLM call failed: {e}")
         return {}

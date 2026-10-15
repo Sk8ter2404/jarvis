@@ -591,6 +591,7 @@ def _generate_ideas_via_api(system_block: str, user_block: str) -> list[str]:
         # the SDK sizes the non-streaming timeout from max_tokens (600 s here).
         msg = llm_client.create_message(
             client, purpose="deep",
+            caller="overnight_ideas", background=True,
             model=IDEAS_API_MODEL,
             max_tokens=4096,
             system=system_block,

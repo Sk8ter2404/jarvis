@@ -479,7 +479,8 @@ class Backend:
         if bc is None:
             return None
         try:
-            return bc._call_local_vision(prompt, [png], max_tokens=80)
+            return bc._call_local_vision(prompt, [png], max_tokens=80,
+                                         caller="grounded_click")
         except Exception:
             return None
 

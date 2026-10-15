@@ -844,6 +844,7 @@ def _call_anthropic_auditor(prompt: str) -> str | None:
         # models (thinking counts toward max_tokens).
         resp = llm_client.create_message(
             client, purpose="deep",
+            caller="diag_deep_audit", background=True,
             model=DEEP_AUDIT_MODEL,
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],

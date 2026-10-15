@@ -256,7 +256,7 @@ class ReadTimeGroundingTests(MonolithGlobalsTestCase):
     def test_proactive_comment_no_longer_raises_learned_topics(self):
         seen = {}
 
-        def fake_quick(system, user, max_tokens=120):
+        def fake_quick(system, user, max_tokens=120, **_kw):
             seen["system"] = system
             return "A check-in, sir."
         with mock.patch.object(self.bc, "_llm_quick", side_effect=fake_quick):

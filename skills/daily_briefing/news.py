@@ -317,6 +317,7 @@ def _summarize_via_llm(title: str, description: str) -> str:
             # models (a 120-token cap can be eaten by thinking).
             msg = llm_client.create_message(
                 anthropic.Anthropic(), purpose="quick",
+                caller="briefing_headline_summary", background=True,
                 model=model,
                 max_tokens=120,
                 system=_SUMMARY_SYSTEM,
@@ -332,7 +333,9 @@ def _summarize_via_llm(title: str, description: str) -> str:
     # shape; on None we keep the degraded raw-title fallback.
     try:
         local = bc._call_local_llm(
-            _SUMMARY_SYSTEM, [{"role": "user", "content": user_text}], max_tokens=120)
+            _SUMMARY_SYSTEM, [{"role": "user", "content": user_text}],
+            max_tokens=120, caller="briefing_headline_summary",
+            background=True)
         if local:
             return _clean(local)
     except Exception as e:

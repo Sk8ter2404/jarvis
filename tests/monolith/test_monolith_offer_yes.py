@@ -91,7 +91,7 @@ class _OfferBase(_Base):
         cell.clear()
         self.addCleanup(lambda: (cell.clear(), cell.extend(saved)))
 
-    def _model(self, _system, messages):
+    def _model(self, _system, messages, **_kw):
         self.now[0] += 1.0                        # the model takes a moment
         last = messages[-1]["content"]
         self.prompts.append(last)

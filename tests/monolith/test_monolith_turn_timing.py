@@ -579,8 +579,10 @@ class TurnLineTests(_Base):
         self.assertEqual(d["turn_ctx_chars"], m.group(2))
         self.assertGreaterEqual(int(d["turn_ctx_chars"]), 1234)
         self.assertGreater(int(d["sys_chars"]), 0)
-        self.assertIn("caller=_local_then_cloud_or_honest<_call_llm@"
-                      f"{self.owner.name}", self.out.getvalue())
+        # 2026-10-15: the turn DECLARES its caller (core.local_traffic), and
+        # the served-via line prints the declared name; an undeclared call
+        # (test_wrapper_caller_names_its_caller) still gets the frame tag.
+        self.assertIn("caller=voice_turn", self.out.getvalue())
 
     def test_filtered_turn_is_dropped_at_the_next_loop_top(self):
         bc = self.bc

@@ -4706,6 +4706,7 @@ def _act_latency_benchmark(_: str = "") -> str:
                 system="Reply with exactly the word 'pong' and nothing else.",
                 user="ping",
                 max_tokens=8,
+                caller="latency_benchmark",
             )
             ms = (time.time() - t0) * 1000
             backend, model = _live_backend_and_model()
@@ -4956,7 +4957,8 @@ def _page_wall_result(answer, opened, bc=None, png=None) -> str:
             return ""
         if not _ss.wall_kind(answer):
             return ""
-        kind = _ss.parse_wall_verdict(bc.ask_vision(_ss.wall_question(key), png))
+        kind = _ss.parse_wall_verdict(bc.ask_vision(
+            _ss.wall_question(key), png, caller="streaming_signin_check"))
         if kind not in ("sign_in", "error"):
             return ""
         print(f"  [vision] {_ss.service_name(key)} page is a {kind} wall - "
@@ -5027,7 +5029,7 @@ def _see_screen_focused_window(bc, q: str):
         return None
     print("  [vision] Capturing the focused window (full resolution)...",
           flush=True)
-    result = bc.ask_vision(q, png)
+    result = bc.ask_vision(q, png, caller="see_screen")
     print(f"  [vision] Got answer ({len(result)} chars)", flush=True)
     bc._push_screen_context(_SEE_SCREEN_WINDOW_LABEL, q, result,
                             {_SEE_SCREEN_WINDOW_LABEL: png})
@@ -5202,7 +5204,7 @@ def _act_see_screen(question: str) -> str:
             f"  [vision] Asking Claude about {', '.join(images.keys())}...",
             flush=True,
         )
-        result = bc.ask_vision_multi(q, images)
+        result = bc.ask_vision_multi(q, images, caller="see_screen")
         print(f"  [vision] Got answer ({len(result)} chars)", flush=True)
         bc._push_screen_context(None, q, result, images)
         return result
@@ -5212,7 +5214,7 @@ def _act_see_screen(question: str) -> str:
     if png is None:
         return "could not capture screen"
     print("  [vision] Asking Claude (this takes a few seconds)...", flush=True)
-    result = bc.ask_vision(_with_chat_guard(q), png)
+    result = bc.ask_vision(_with_chat_guard(q), png, caller="see_screen")
     print(f"  [vision] Got answer ({len(result)} chars)", flush=True)
     bc._push_screen_context(monitor, q, result, {monitor: png})
     if _about_opened:
@@ -5442,7 +5444,7 @@ def _act_see_user(camera_hint: str = "") -> str:
         "in the background."
     )
     print("  [vision] Analyzing user image...", flush=True)
-    result = bc.ask_vision(question, png_bytes)
+    result = bc.ask_vision(question, png_bytes, caller="see_user")
     print("  [vision] Got description", flush=True)
     if frame_age is not None and frame_age > 5.0:
         note = (f"(note: camera {best_idx} frame is {frame_age:.1f}s old; "
@@ -5552,7 +5554,7 @@ def _act_which_monitor(_: str = "") -> str:
         "Look at this person's head and eyes. Are they looking STRAIGHT FORWARD "
         "at the camera level, looking UPWARD (head tilted up, eyes looking high), "
         "or looking DOWNWARD? Reply with exactly one word: UP, FORWARD, or DOWN.",
-        buf.tobytes(),
+        buf.tobytes(), caller="which_monitor",
     )
     answer_upper = answer.upper()
     if "UP" in answer_upper:
@@ -5652,7 +5654,8 @@ def _summarise_current_conversation(bc, texts: tuple) -> str:
         "sentence. No preamble, no bullet points, no closing question."
     )
     try:
-        reply = (bc._llm_quick(system=system, user=context, max_tokens=220)
+        reply = (bc._llm_quick(system=system, user=context, max_tokens=220,
+                                 caller="conversation_summary")
                  or "").strip()
     except Exception as e:
         return f"conversation summary LLM call failed: {e}"
@@ -5774,7 +5777,8 @@ def _act_session_memory_recall(args: str = "") -> str:
     )
     user_msg = f"User asked: {query!r}\n\nSession summaries (newest first):\n{context_block}"
     try:
-        reply = bc._llm_quick(system=system, user=user_msg, max_tokens=200)
+        reply = bc._llm_quick(system=system, user=user_msg, max_tokens=200,
+                              caller="session_memory_recall")
         reply = reply.strip()
     except Exception as e:
         return f"session recall LLM call failed: {e}"
@@ -5848,10 +5852,13 @@ def _act_recall_screen(question: str) -> str:
                   f"({age_str})", flush=True)
             if len(images) == 1:
                 ans = bc.ask_vision(f"This is a cached screenshot from "
-                                    f"{age_str}. {q}", next(iter(images.values())))
+                                    f"{age_str}. {q}",
+                                    next(iter(images.values())),
+                                    caller="recall_screen")
             else:
                 ans = bc.ask_vision_multi(f"These screenshots are cached from "
-                                          f"{age_str}. {q}", images)
+                                          f"{age_str}. {q}", images,
+                                          caller="recall_screen")
             return (f"From a reduced snapshot {int(age)} s ago (only how it "
                     f"looked, not what it was called): {ans}")
     from core import screen_timeline as _tl
@@ -5961,7 +5968,8 @@ def _act_read_changelog(args: str = "") -> str:
         )
         user = f"Changelog content:\n\n{combined[:8000]}"
         try:
-            summary = (bc._llm_quick(system, user, max_tokens=300) or "").strip()
+            summary = (bc._llm_quick(system, user, max_tokens=300,
+                                     caller="changelog_summary") or "").strip()
         except Exception as e:
             return f"could not summarise the changelog: {e}"
         if not summary:
@@ -6719,7 +6727,8 @@ def _act_create_skill(args: str) -> str:
 
     print(f"\n  [skill] Generating new skill '{name}'...")
     try:
-        code = bc._llm_quick(system=system_prompt, user=desc, max_tokens=1500)
+        code = bc._llm_quick(system=system_prompt, user=desc, max_tokens=1500,
+                             caller="skill_generator")
     except Exception as e:
         return f"skill generation failed: {e}"
 

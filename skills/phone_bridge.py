@@ -672,7 +672,7 @@ def _llm_fallback(text: str) -> str | None:
             # "voice": a reply the owner reads on his phone - effort low + a
             # max_tokens floor on the 5.x thinking models.
             msg = llm_client.create_message(
-                client, purpose="voice",
+                client, purpose="voice", caller="phone_reply",
                 model=model,
                 max_tokens=_LLM_MAX_TOKENS,
                 system=sys_prompt,
@@ -688,7 +688,8 @@ def _llm_fallback(text: str) -> str | None:
     # Local-Ollama fallback (Claude capped / unavailable / no API key).
     try:
         bc = sys.modules.get("bobert_companion") or importlib.import_module("bobert_companion")
-        local = bc._call_local_llm(sys_prompt, [{"role": "user", "content": text}], max_tokens=_LLM_MAX_TOKENS)
+        local = bc._call_local_llm(sys_prompt, [{"role": "user", "content": text}],
+                                  max_tokens=_LLM_MAX_TOKENS, caller="phone_reply")
         if local:
             return local.strip() or None
     except Exception as e:

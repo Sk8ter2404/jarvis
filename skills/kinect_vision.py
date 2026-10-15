@@ -211,7 +211,7 @@ def kinect_look(question: str = "") -> str:
         return ("I have the Kinect image, sir, but vision isn't wired up to "
                 "describe it.")
     try:
-        answer = ask(q, png)
+        answer = ask(q, png, caller="kinect_look")
     except Exception as e:
         return f"Looking through the Kinect, sir — but vision failed: {e}"
     answer = (answer or "").strip()

@@ -980,10 +980,12 @@ class ClassifyWithLLMTests(_IsolatedTriageBase):
         from core import local_traffic as lt
         seen = []
 
-        def _local(system, messages, max_tokens=500):
+        def _local(system, messages, max_tokens=500, **_kw):
             job = lt.current_job()
             seen.append(None if job is None else
                         (job.tag, job.opt_in, job.max_defer_s))
+            self.assertEqual(_kw, {"caller": "notification_triage",
+                                   "background": True})
             return "urgent"
         bc = types.ModuleType("bobert_companion")
         bc._call_local_llm = _local

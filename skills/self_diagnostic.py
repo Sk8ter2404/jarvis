@@ -3010,7 +3010,7 @@ def _probe_claude_api() -> dict:
         # "ping": effort low on the 5.x models, the 1-token cap kept (the
         # reply is never read - only whether the API answered).
         llm_client.create_message(
-            client, purpose="ping",
+            client, purpose="ping", caller="self_diag_ping", background=True,
             model=model,
             max_tokens=1,
             messages=[{"role": "user", "content": "ping"}],

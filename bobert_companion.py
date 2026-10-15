@@ -2628,14 +2628,17 @@ def _anthropic_client(timeout: float | None = None,
     )
 
 
-def _claude_create(purpose: str, client=None, **kwargs):
+def _claude_create(purpose: str, client=None, *, caller: str = "",
+                   background: "bool | None" = None, **kwargs):
     """The ONE place this file sends a DIRECT Claude request (the
     ``_llm_client.complete`` / ``stream_text`` paths are shaped inside
     core.llm_client): ``messages.create`` through core.llm_client's per-model
     shaping (effort / max_tokens floor for the 5.x thinking models, sampling
     params stripped where rejected — see core.llm_client.request_options).
     ``purpose`` is one of core.llm_client.PURPOSES; ``client`` defaults to
-    _anthropic_client().
+    _anthropic_client(). ``caller`` / ``background`` say WHO is asking and
+    whether it is background work (core.local_traffic, "who is calling the
+    brain"); tests/test_brain_caller_tags.py fails a call that omits caller=.
 
     Imports core.llm_client locally on purpose: the module-level ``_llm_client``
     alias is the optional high-level wrapper (tests swap it for fakes or None
@@ -2644,7 +2647,8 @@ def _claude_create(purpose: str, client=None, **kwargs):
     from core import llm_client as _lc
     if client is None:
         client = _anthropic_client()
-    return _lc.create_message(client, purpose=purpose, **kwargs)
+    return _lc.create_message(client, purpose=purpose, caller=caller,
+                              background=background, **kwargs)
 
 
 def _claude_reply_text(msg) -> str:
@@ -2699,8 +2703,14 @@ def _bg_local_slot(applies: bool = True):
     return _lt.slot() if applies else _cl.nullcontext()
 
 
-def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
+def _llm_quick(system: str, user: str, max_tokens: int = 200, *,
+               caller: str = "", background: "bool | None" = None) -> str:
     """One-shot LLM call for memory extraction / proactive comments.
+
+    ``caller`` names who is asking and ``background`` says whether it is
+    background work (learning, summaries, remarks); a background caller on a
+    thread with no background job becomes one (core.local_traffic.call_scope),
+    so its local call passes the same gate as every hand-tagged job.
 
     Falls back to the local Ollama model when the Claude API is
     unavailable (monthly usage cap / quota / network) so background
@@ -2716,6 +2726,13 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
     # the local model (the one-slot cache the next turn needs). Untagged
     # callers (the owner's actions) and the main thread never wait. The
     # cloud-first branch's local FALLBACK is gated inside _call_local_llm.
+    with _lt.call_scope(caller, background) as (_cn, _cb):
+        return _llm_quick_impl(system, user, max_tokens, _cn, _cb)
+
+
+def _llm_quick_impl(system: str, user: str, max_tokens: int,
+                    caller: str, background: bool) -> str:
+    """_llm_quick's body, inside its call scope (see there)."""
     with _bg_local_slot(_llm_quick_goes_local()):
         from core.config import AMBIENT_LEARNING_FORCE_LOCAL, model_route
         if AMBIENT_LEARNING_FORCE_LOCAL or model_route("ambient") == "local":
@@ -2725,7 +2742,8 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
             # wedged/blocked runner isn't a silent every-turn no-op. SAC-specific
             # when we have evidence the runner was blocked this boot.
             local = _call_local_llm(
-                system, [{"role": "user", "content": user}], max_tokens=max_tokens)
+                system, [{"role": "user", "content": user}],
+                max_tokens=max_tokens, caller=caller, background=background)
             if local:
                 return local
             if _sac_blocked_local_recently():
@@ -2739,7 +2757,7 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
             import anthropic
             try:
                 msg = _claude_create(
-                    "quick",
+                    "quick", caller=caller, background=background,
                     model=CLAUDE_MODEL, max_tokens=max_tokens,
                     system=system,
                     messages=[{"role": "user", "content": user}],
@@ -2750,7 +2768,8 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
                 # model so learning doesn't stall while the cap is active.
                 local = _call_local_llm(
                     system, [{"role": "user", "content": user}],
-                    max_tokens=max_tokens,
+                    max_tokens=max_tokens, caller=caller,
+                    background=background,
                 )
                 if local:
                     return local
@@ -2772,12 +2791,14 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
                         {"role": "system", "content": system},
                         {"role": "user",   "content": user},
                     ],
+                    caller=caller, background=background,
                 )
                 return resp["message"]["content"]
             except Exception as e:
                 local = _call_local_llm(
                     system, [{"role": "user", "content": user}],
-                    max_tokens=max_tokens,
+                    max_tokens=max_tokens, caller=caller,
+                    background=background,
                 )
                 if local:
                     return local
@@ -3314,7 +3335,9 @@ def _learn_worker() -> None:
                             print(f"  [learn] extracting {len(batch)} "
                                   f"queued turns in one call")
                         system, user, max_tokens = _learn_prompt(batch)
-                        text = _llm_quick(system, user, max_tokens=max_tokens)
+                        text = _llm_quick(system, user, max_tokens=max_tokens,
+                                          caller="learn_from_turn",
+                                          background=True)
                     _learn_apply(text or "", batch, epoch=batch_epoch)
                 except Exception as e:
                     # Log to console (which logs to file too) but don't break
@@ -3375,7 +3398,8 @@ def _learn_batch_llm(system: str, user: str, max_tokens: int = 200) -> str:
     """The one request a batch makes: tagged background work, so it also
     passes the background gate (core/local_traffic.py) before the POST."""
     with _lt.background_work("learn-batch"):
-        return _llm_quick(system, user, max_tokens=max_tokens)
+        return _llm_quick(system, user, max_tokens=max_tokens,
+                          caller="learn_batch", background=True)
 
 
 def _learn_batcher() -> "_learn_batch_mod.LearnBatcher":
@@ -3615,7 +3639,8 @@ def _ambient_content_is_media(snippet: str) -> bool:
         # conversation (never on the main thread) -- see core/local_traffic.py.
         with _lt.background_work("ambient-learn"):
             out = _call_local_llm(
-                system, [{"role": "user", "content": user}], max_tokens=4)
+                system, [{"role": "user", "content": user}], max_tokens=4,
+                caller="ambient_media_judge", background=True)
         if not out:
             # Local judge unavailable/empty — fail open (treat as not-media so
             # real conversation still learns). Logged by the caller's decision.
@@ -4370,13 +4395,14 @@ def _session_summary_update(pending, *, record: bool = True) -> str:
                     "most two sentences, main topics in order. Just the "
                     "summary, nothing else."),
             user=f"Summary so far: {running}\n\nNew turns:\n{transcript}",
-            max_tokens=120,
+            max_tokens=120, caller="session_checkpoint", background=True,
         )
     else:
         text = _llm_quick(
             system=("Summarise this conversation in ONE sentence. Just the "
                     "sentence, nothing else."),
             user=transcript, max_tokens=80,
+            caller="session_checkpoint", background=True,
         )
     summary = (text or "").strip().split("\n")[0].strip()
     if summary and (_is_secret_fact(summary)
@@ -16350,7 +16376,8 @@ def generate_proactive_comment(now: float | None = None) -> str:
                  + " / ".join(f"'{r}'" for r in recent[-4:]) + ".")
     user += ")"
     try:
-        text = _llm_quick(system=system, user=user, max_tokens=120)
+        text = _llm_quick(system=system, user=user, max_tokens=120,
+                          caller="proactive_remark", background=True)
         line = text.strip().split("\n")[0]
     except Exception as e:
         print(f"  [proactive] generation failed: {e}")
@@ -16647,17 +16674,23 @@ def _tt_stats(r):
         return None
 
 
-def _served_via_suffix(stats) -> str:
+def _served_via_suffix(stats, declared=None) -> str:
     """'pe=<count>/<ms> ev=<count> caller=<tag>' for a "[local-llm] served
     via" line. Called ONLY from _call_local_llm's body, so frame 2 is whoever
     asked for the call (a background _llm_quick names its own caller too).
+    `declared` is the (caller, background) the call declared: a declared
+    name replaces the frame guess, and ' bg' marks background work.
     Never raises."""
+    bg = False
     try:
-        caller = _tt_mod.caller_tag(sys._getframe(2))
+        if declared and declared[0] != _lt.UNTAGGED:
+            caller, bg = declared[0], bool(declared[1])
+        else:
+            caller = _tt_mod.caller_tag(sys._getframe(2))
     except Exception:
         caller = "?"
     try:
-        return _tt_mod.served_via_suffix(stats, caller)
+        return _tt_mod.served_via_suffix(stats, caller) + (" bg" if bg else "")
     except Exception:
         return "pe=?/? ev=?"
 
@@ -21122,7 +21155,18 @@ _RequestsTimeout = requests.Timeout
 _OLLAMA_CHAT_TIMEOUT_S = 60.0
 
 
-def _ollama_chat_bounded(model, messages):
+def _ollama_resp_dict(resp) -> dict:
+    """An ollama.Client.chat() reply as a plain dict (it is a dict-like
+    ChatResponse), for token counts. {} on any doubt. Never raises."""
+    try:
+        return {"prompt_eval_count": resp["prompt_eval_count"],
+                "eval_count": resp["eval_count"]}
+    except Exception:
+        return {}
+
+
+def _ollama_chat_bounded(model, messages, *, caller: str = "",
+                         background: "bool | None" = None):
     """`ollama.chat`, but bounded by a wall-clock timeout so a wedged runner
     raises (httpx TimeoutException) instead of blocking the voice loop forever.
 
@@ -21144,10 +21188,13 @@ def _ollama_chat_bounded(model, messages):
     import ollama
     from core.ollama_opts import chat_options as _chat_options
     client = ollama.Client(host=LOCAL_LLM_BASE_URL, timeout=_OLLAMA_CHAT_TIMEOUT_S)
-    return client.chat(
-        model=model, messages=messages,
-        options=_chat_options(model, extra={"num_ctx": _local_num_ctx(model)}),
-        keep_alive=_local_keep_alive())
+    with _lt.call_scope(caller, background) as (_cn, _cb), _lt.slot():
+        resp = client.chat(
+            model=model, messages=messages,
+            options=_chat_options(model, extra={"num_ctx": _local_num_ctx(model)}),
+            keep_alive=_local_keep_alive())
+        _lt.note_call(_cn, _cb, "local", _local_usage(_ollama_resp_dict(resp)))
+    return resp
 
 
 def _llm_brain_is_remote() -> bool:
@@ -22258,19 +22305,40 @@ _LOCAL_EMPTY_FAILOVER_AFTER = 2
 
 def _local_failover_allowed() -> bool:
     """May _call_local_llm fail over to a DIFFERENT model after an empty
-    reply? Only on the main loop (the owner's turn), and only once the brain
-    returned empty _LOCAL_EMPTY_FAILOVER_AFTER times in a row. Never
-    raises (False)."""
+    reply? Only on the main loop (the owner's turn, never a background call
+    made from it), and only once the brain returned empty
+    _LOCAL_EMPTY_FAILOVER_AFTER times in a row. Never raises (False)."""
     try:
         return (threading.current_thread() is threading.main_thread()
+                and _lt.current_job() is None
                 and _local_empty_streak[0] >= _LOCAL_EMPTY_FAILOVER_AFTER)
     except Exception:
         return False
 
 
-def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str | None:
+def _local_usage(stats_or_body) -> dict:
+    """{input, output} token counts from Ollama's counters (a turn_timing stats
+    dict, or a raw /api/chat JSON body) for the per-caller ledger. {} when the
+    response carried none. Never raises."""
+    try:
+        d = stats_or_body if isinstance(stats_or_body, dict) else {}
+        pe = d.get("prompt_eval_count")
+        ev = d.get("eval_count")
+        return {"input": pe if isinstance(pe, int) else 0,
+                "output": ev if isinstance(ev, int) else 0}
+    except Exception:
+        return {}
+
+
+def _call_local_llm(system: str, messages: list, max_tokens: int = 500, *,
+                    caller: str = "",
+                    background: "bool | None" = None) -> str | None:
     """POST to Ollama /api/chat. Returns the assistant text or None on any
-    failure (no Ollama running, no model pulled, HTTP error, timeout)."""
+    failure (no Ollama running, no model pulled, HTTP error, timeout).
+
+    ``caller`` / ``background``: who is asking and whether it is background
+    work (core.local_traffic). A background call from a thread with no
+    background job becomes one around its POST, so it passes the same gate."""
     if not LOCAL_LLM_FALLBACK:
         return None
     if not _ollama_alive():
@@ -22397,19 +22465,21 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     # through. Afterwards a request made outside a turn schedules the idle
     # re-prime: it just replaced Ollama's one-slot cache. An UNTAGGED call
     # from another thread mid-turn is named in the log (speed plan R5c).
-    _note_untagged_local_call("chat", sys._getframe(1))
+    _note_untagged_local_call("chat", sys._getframe(1), caller)
+    _declared = _lt.resolve_caller(caller, background)
     try:
-        with _lt.slot():
+        with _lt.call_scope(*_declared) as (_cn, _cb), _lt.slot():
             text, kind = _generate(model)
             if kind != "empty":
                 _local_empty_streak[0] = 0
             if kind == "ok":
                 print(f"  [local-llm] served via {model} "
-                      f"{_served_via_suffix(_gen_stats[0])}")
+                      f"{_served_via_suffix(_gen_stats[0], _declared if caller else None)}")
                 _note_brain_response(_gen_stats[0], model, sys_prompt)
                 _note_prompt_window(sys_prompt, messages, _gen_stats[0],
                                     model)
                 _note_turn_brain("local", model)
+                _lt.note_call(_cn, _cb, "local", _local_usage(_gen_stats[0]))
                 return text
             if kind == "empty":
                 # 200-OK-but-EMPTY = the model ran but a broken quant / template
@@ -22444,8 +22514,10 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
                         _RESOLVED_LOCAL_LLM_MODEL[0] = alt
                         _local_empty_streak[0] = 0
                         print(f"  [local-llm] served via {alt} (failed over from {model}) "
-                              f"{_served_via_suffix(_gen_stats[0])}")
+                              f"{_served_via_suffix(_gen_stats[0], _declared if caller else None)}")
                         _note_turn_brain("local", alt)
+                        _lt.note_call(_cn, _cb, "local",
+                                      _local_usage(_gen_stats[0]))
                         return text2
                     print(f"  [local-llm] failover model `{alt}` returned {kind2} too "
                           f"— treating local as unavailable")
@@ -22455,10 +22527,12 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             _after_local_post()
 
 
-def _local_fallback_or(sys_prompt: str, default_reply: str) -> str:
+def _local_fallback_or(sys_prompt: str, default_reply: str, *,
+                       caller: str = "") -> str:
     """Try the local LLM; on success prepend `[local] `, else return the
     cloud-side error message untouched."""
-    text = _call_local_llm(sys_prompt, conversation_history)
+    text = _call_local_llm(sys_prompt, conversation_history,
+                           caller=caller)
     if not text:
         return default_reply
     # Deliberately NO "[local]" prefix on the reply — it was being spoken
@@ -22580,7 +22654,8 @@ def _cloud_boost_on() -> bool:
 def _claude_oneshot(system: "str | list", messages: list,
                     max_tokens: int = 500,
                     model: str | None = None,
-                    boost: bool = False) -> str | None:
+                    boost: bool = False, caller: str = "",
+                    background: "bool | None" = None) -> str | None:
     """Single Claude completion used as the cloud fallback when the LOCAL model
     fails on a 'local'-routed turn. Returns the text, or None if the cloud is
     unreachable / errors (caller then emits the honest both-down message).
@@ -22600,10 +22675,11 @@ def _claude_oneshot(system: "str | list", messages: list,
                 model=model, max_tokens=max_tokens,
                 system=system, messages=messages,
                 timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
+                caller=caller, background=background,
             )
         else:
             msg = _claude_create(
-                "voice",
+                "voice", caller=caller, background=background,
                 model=model, max_tokens=max_tokens,
                 system=system, messages=messages,
             )
@@ -22654,7 +22730,8 @@ def _self_knowledge_for_cloud(messages: list) -> list:
 
 def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
                                 max_tokens: int = 500,
-                                hard: bool = False) -> str:
+                                hard: bool = False,
+                                caller: str = "") -> str:
     """LOCAL-routed turn with honest resilience. Try the local model; if it
     can't answer this turn, fall back to Claude when reachable; if neither
     works, return an honest sentence (never a fabricated answer).
@@ -22673,11 +22750,13 @@ def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
             # CLOUD_BOOST_UNTIL: a hard turn goes to Claude first; if the
             # cloud cannot answer, the local model below still does.
             _hc = _claude_oneshot(sys_prompt, _self_knowledge_for_cloud(messages),
-                                  max_tokens=max_tokens, boost=True)
+                                  max_tokens=max_tokens, boost=True,
+                                  caller=caller)
             if _hc:
                 print("  [cloud-boost] hard turn answered by Claude")
                 return _hc
-        text = _call_local_llm(sys_prompt, messages, max_tokens=max_tokens)
+        text = _call_local_llm(sys_prompt, messages, max_tokens=max_tokens,
+                               caller=caller)
         if text:
             t = text.lstrip()
             if t.startswith("[local]"):
@@ -22686,7 +22765,8 @@ def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
         # Local didn't answer. Prefer the cloud if we can reach it - told
         # it is the cloud answering (_self_knowledge_for_cloud).
         cloud = _claude_oneshot(sys_prompt, _self_knowledge_for_cloud(messages),
-                                max_tokens=max_tokens, boost=_boost)
+                                max_tokens=max_tokens, boost=_boost,
+                                caller=caller)
         if cloud:
             if _sac_blocked_local_recently():
                 print("  [local-llm] SAC blocked the local runner this boot — "
@@ -22782,6 +22862,7 @@ def _warm_up_local_llm_async() -> None:
                           "after a cold server start - trying once more")
             dt = time.monotonic() - t0
             if r.ok:
+                _lt.note_call("boot_warmup", True, "local")
                 print(f"  [local-llm] warm-up OK — `{model}` generated in "
                       f"{dt:.1f}s and is now resident (num_ctx="
                       f"{_local_num_ctx(model)})")
@@ -23000,14 +23081,16 @@ def _fit_images_for_vlm(png_images) -> list:
 
 
 def _call_local_vision(question: str, png_images: list[bytes],
-                       max_tokens: int = 600) -> str | None:
+                       max_tokens: int = 600, *, caller: str = "",
+                       background: "bool | None" = None) -> str | None:
     """_call_local_vision_raw, recorded into the current vision-trace step
     (core.vision_trace, owner-approved 2026-10-05) when an owner-turn step
     is open: the prompt, the images as sent, the raw answer, the time. A
     background caller (no step) is not traced."""
     t0 = time.monotonic()
     imgs = _fit_images_for_vlm(png_images)
-    ans = _call_local_vision_raw(question, imgs, max_tokens)
+    ans = _call_local_vision_raw(question, imgs, max_tokens,
+                                 caller=caller, background=background)
     _trace_vision_call(question, imgs, ans or "",
                        (time.monotonic() - t0) * 1000)
     return ans
@@ -23046,7 +23129,8 @@ def _trace_vision_call(question, images, answer, ms, cloud=False) -> None:
 
 
 def _call_local_vision_raw(question: str, png_images: list[bytes],
-                           max_tokens: int = 600) -> str | None:
+                           max_tokens: int = 600, *, caller: str = "",
+                           background: "bool | None" = None) -> str | None:
     """POST a vision request to Ollama's /api/chat with one or more PNGs.
 
     Returns the assistant text on success, or None if local vision is
@@ -23141,7 +23225,7 @@ def _call_local_vision_raw(question: str, png_images: list[bytes],
     # here, the one chokepoint (2026-10-05). The vision trace records the
     # images EXACTLY as sent.
     try:
-        with _lt.slot():
+        with _lt.call_scope(caller, background) as (_cn, _cb), _lt.slot():
             try:
                 b64_images = [base64.standard_b64encode(p).decode("utf-8") for p in png_images]
                 payload = {
@@ -23221,7 +23305,9 @@ def _call_local_vision_raw(question: str, png_images: list[bytes],
                 if not text:
                     print(f"  [local-vision] empty content; done_reason={body.get('done_reason')!r}")
                     return None
-                print(f"  [local-vision] served via {LOCAL_VISION_MODEL}")
+                print(f"  [local-vision] served via {LOCAL_VISION_MODEL}"
+                      + (f" {_lt.caller_label(_cn, _cb)}" if caller else ""))
+                _lt.note_call(_cn, _cb, "local", _local_usage(body))
                 _vision_wedge_note_ok()
                 return text
             except requests.RequestException as _e:
@@ -23496,7 +23582,7 @@ def _ltm_boot_warm() -> None:
                         user="\n".join(
                             f"{m.get('role', '')}: {m.get('text', '')}"
                             for m in (ctx or [])),
-                        max_tokens=120,
+                        max_tokens=120, caller="ltm_reflect", background=True,
                     )
             ltm.set_reflector_llm(_ltm_reflector_llm)
             # ...and apply what it settles to the prompt's own fact list.
@@ -25077,6 +25163,7 @@ def _post_prime(payload: dict) -> tuple:
         if not r.ok:
             return (False, ms, -1, None, f"status={r.status_code}")
         stats = _tt_stats(r)
+        _lt.note_call("idle_reprime", True, "local", _local_usage(stats))
         try:
             pe = int((r.json() or {}).get("prompt_eval_count"))
         except Exception:
@@ -25512,17 +25599,22 @@ background_local_work = _lt.background_work
 _untagged_local_seen: set = set()
 _UNTAGGED_LOCAL_SEEN_MAX = 64
 _UNTAGGED_LOCAL_WRAPPERS = frozenset(_tt_mod.LLM_WRAPPERS | {
-    "ask_vision", "ask_vision_multi", "_local_multi_fallback",
+    "_llm_quick_impl", "ask_vision", "ask_vision_multi", "_local_multi_fallback",
     "_call_local_vision", "_llm", "<lambda>"})
 _UNTAGGED_LOCAL_DIGITS = re.compile(r"\d+")
 
 
-def _note_untagged_local_call(kind: str, frame=None) -> str | None:
+def _note_untagged_local_call(kind: str, frame=None,
+                              caller: str = "") -> str | None:
     """Log (once per caller) a `kind` ('chat' / 'vision' / 'complete') local
     call that the gate cannot hold although the owner is mid-sentence or
     mid-turn. `frame` is the frame that asked for the call. Returns the
-    caller tag when it logged, else None. Never raises."""
+    caller tag when it logged, else None. A call that DECLARED its caller
+    (`caller=`, core.local_traffic) is named already and never logged here.
+    Never raises."""
     try:
+        if caller:
+            return None
         if (_lt.current_job() is not None
                 or threading.current_thread() is threading.main_thread()):
             return None
@@ -25531,16 +25623,16 @@ def _note_untagged_local_call(kind: str, frame=None) -> str | None:
         reason = _background_defer_reason()
         if reason not in _lt.HARD_REASONS:
             return None
-        caller = (_tt_mod.caller_tag(frame, wrappers=_UNTAGGED_LOCAL_WRAPPERS)
-                  if frame is not None else "?")
-        key = f"{kind}:" + _UNTAGGED_LOCAL_DIGITS.sub("N", caller)
+        who = (_tt_mod.caller_tag(frame, wrappers=_UNTAGGED_LOCAL_WRAPPERS)
+               if frame is not None else "?")
+        key = f"{kind}:" + _UNTAGGED_LOCAL_DIGITS.sub("N", who)
         if (key in _untagged_local_seen
                 or len(_untagged_local_seen) >= _UNTAGGED_LOCAL_SEEN_MAX):
             return None
         _untagged_local_seen.add(key)
         print(f"  [bg-local] untagged {kind} call during the owner's "
-              f"{reason}: caller={caller}")
-        return caller
+              f"{reason}: caller={who}")
+        return who
     except Exception:
         return None
 
@@ -25936,9 +26028,11 @@ def _call_llm(user_text: str) -> str:
             except Exception:
                 _hard_turn = False
             reply = (_local_then_cloud_or_honest(sys_prompt_now, _fitted,
-                                                 hard=True)
+                                                 hard=True,
+                                                 caller="voice_turn")
                      if _hard_turn else
-                     _local_then_cloud_or_honest(sys_prompt_now, _fitted))
+                     _local_then_cloud_or_honest(sys_prompt_now, _fitted,
+                                                 caller="voice_turn"))
         finally:
             _owner_chat_call.active = False
     elif AI_BACKEND == "claude":
@@ -25960,6 +26054,7 @@ def _call_llm(user_text: str) -> str:
                             system=_sys_param, messages=conversation_history,
                             timeout=_ANTHROPIC_TIMEOUT_S,
                             on_delta=_flush_buf.feed, purpose="voice",
+                            caller="voice_turn",
                         )
                     except Exception as _stream_err:
                         # Stream failed mid-flight (network blip, SDK quirk).
@@ -25989,6 +26084,7 @@ def _call_llm(user_text: str) -> str:
                             model=CLAUDE_MODEL, max_tokens=500,
                             system=_sys_param, messages=conversation_history,
                             timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
+                            caller="voice_turn",
                         )
                     else:
                         # Let the early sentences finish before the caller
@@ -26002,10 +26098,11 @@ def _call_llm(user_text: str) -> str:
                         model=CLAUDE_MODEL, max_tokens=500,
                         system=_sys_param, messages=conversation_history,
                         timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
+                        caller="voice_turn",
                     )
             else:
                 msg = _claude_create(
-                    "voice",
+                    "voice", caller="voice_turn",
                     model=CLAUDE_MODEL, max_tokens=500,
                     system=_sys_param,
                     messages=conversation_history,
@@ -26022,6 +26119,7 @@ def _call_llm(user_text: str) -> str:
                     "I'm afraid my API credits have run out, sir. "
                     "Please top up the balance at console.anthropic.com "
                     "to bring me back online.",
+                    caller="voice_turn",
                 )
             elif ("usage limit" in _s or "regain access" in _s
                   or "monthly limit" in _s or "spend limit" in _s
@@ -26031,6 +26129,7 @@ def _call_llm(user_text: str) -> str:
                     sys_prompt_now,
                     "I've reached the monthly API usage limit, sir. "
                     "Access will be restored automatically once the limit resets.",
+                    caller="voice_turn",
                 )
             else:
                 # Unrecognised 4xx — the cloud API is unavailable for this
@@ -26039,22 +26138,26 @@ def _call_llm(user_text: str) -> str:
                 reply = _local_fallback_or(
                     sys_prompt_now,
                     f"API request rejected (400): {_e}",
+                    caller="voice_turn",
                 )
         except anthropic.RateLimitError:
             reply = _local_fallback_or(
                 sys_prompt_now,
                 "I'm being rate-limited by the API, sir — "
                 "please give it a moment and try again.",
+                caller="voice_turn",
             )
         except anthropic.APIStatusError as _e:
             reply = _local_fallback_or(
                 sys_prompt_now,
                 f"API error {_e.status_code}: {_e.message}",
+                caller="voice_turn",
             )
         except Exception as _e:
             reply = _local_fallback_or(
                 sys_prompt_now,
                 f"Unexpected LLM error: {_e}",
+                caller="voice_turn",
             )
 
     elif AI_BACKEND == "ollama":
@@ -26075,6 +26178,7 @@ def _call_llm(user_text: str) -> str:
             resp = _ollama_chat_bounded(
                 _ollama_model,
                 [{"role": "system", "content": sys_prompt_now}] + conversation_history,
+                caller="voice_turn",
             )
             reply = resp["message"]["content"]
             _note_turn_brain("local", _ollama_model)
@@ -26092,6 +26196,7 @@ def _call_llm(user_text: str) -> str:
                 sys_prompt_now,
                 "I'm afraid my local model isn't responding, sir — "
                 "Ollama may be down. Please check it and try again.",
+                caller="voice_turn",
             )
 
     else:
@@ -28446,7 +28551,8 @@ _VISION_MODEL_RETIRED_REPLY = (
     "SCREEN_VISION_MODEL to a current model, or route vision to local)")
 
 
-def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
+def ask_vision(question: str, png_bytes: bytes | None = None, *,
+               caller: str = "", background: "bool | None" = None) -> str:
     """Send a screenshot to Claude with a question, return its answer.
 
     If the Claude vision call fails (rate-limit, credit exhausted, network,
@@ -28471,12 +28577,14 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
     from core.config import model_route
     _vboost = _cloud_boost_on()     # CLOUD_BOOST_UNTIL: screen reading -> Claude
     if model_route("vision") == "local" and not _vboost:
-        local = _call_local_vision(question, [png_bytes])
+        local = _call_local_vision(question, [png_bytes], caller=caller,
+                                 background=background)
         return f"[local-vision] {local}" if local else "(local vision unavailable — Ollama not reachable)"
 
     # Cloud-disabled path: jump straight to the local VLM.
     if AI_BACKEND != "claude" and not _vboost:
-        local = _call_local_vision(question, [png_bytes])
+        local = _call_local_vision(question, [png_bytes], caller=caller,
+                                 background=background)
         if local:
             return f"[local-vision] {local}"
         return "(screen vision requires Claude backend or a local VLM via Ollama)"
@@ -28492,7 +28600,8 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
     try:
         import anthropic
     except Exception:
-        local = _call_local_vision(question, [png_bytes])
+        local = _call_local_vision(question, [png_bytes], caller=caller,
+                                 background=background)
         if local:
             return f"[local-vision] {local}"
         return "(screen vision requires the anthropic SDK or a local VLM via Ollama)"
@@ -28501,7 +28610,7 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
         b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
         _t0_cloud = time.monotonic()
         msg = _claude_create(
-            "vision",
+            "vision", caller=caller, background=background,
             model=SCREEN_VISION_MODEL, max_tokens=500,
             messages=[{
                 "role": "user",
@@ -28521,20 +28630,23 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
         # 4xx/5xx from Claude (rate limit, credit exhausted, server error,
         # auth) — exactly the case the local VLM fallback was built for.
         print(f"  [vision] Claude API {e.status_code} → local VLM fallback")
-        local = _call_local_vision(question, [png_bytes])
+        local = _call_local_vision(question, [png_bytes], caller=caller,
+                                 background=background)
         if local:
             return f"[local-vision] {local}"
         return f"(vision failed: HTTP {e.status_code})"
     except (anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
         print(f"  [vision] Claude API unreachable ({type(e).__name__}) → local VLM fallback")
-        local = _call_local_vision(question, [png_bytes])
+        local = _call_local_vision(question, [png_bytes], caller=caller,
+                                 background=background)
         if local:
             return f"[local-vision] {local}"
         return f"(vision failed: {e})"
     except _RetiredModelError:
         # SCREEN_VISION_MODEL is known-retired this session (logged once by
         # core.claude_model_guard): straight to the local VLM, no new line.
-        local = _call_local_vision(question, [png_bytes])
+        local = _call_local_vision(question, [png_bytes], caller=caller,
+                                 background=background)
         if local:
             return f"[local-vision] {local}"
         return _VISION_MODEL_RETIRED_REPLY
@@ -28547,7 +28659,8 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
         # paths do. 2026-05-30 audit.
         print(f"  [vision] Claude vision failed "
               f"({type(e).__name__}: {e}) → local VLM fallback")
-        local = _call_local_vision(question, [png_bytes])
+        local = _call_local_vision(question, [png_bytes], caller=caller,
+                                 background=background)
         if local:
             return f"[local-vision] {local}"
         return f"(vision failed: {type(e).__name__})"
@@ -28567,13 +28680,16 @@ def take_all_monitor_screenshots(max_dim: int = 1024) -> dict[str, bytes]:
     return out
 
 
-def ask_vision_multi(question: str, images: dict[str, bytes]) -> str:
+def ask_vision_multi(question: str, images: dict[str, bytes], *,
+                     caller: str = "",
+                     background: "bool | None" = None) -> str:
     """_ask_vision_multi_raw, with every "Image #N" in the answer rewritten
     to the monitor image N is ("the MIDDLE monitor") - S4, 2026-10-02: live,
     local vision named "Image #4 (TOP monitor)" for a page and "the MIDDLE
     monitor" for the same page a round later, so the follow-up rounds now see
     ONE naming (core.monitor_geometry.canonical_monitor_refs)."""
-    answer = _ask_vision_multi_raw(question, images)
+    answer = _ask_vision_multi_raw(question, images, caller=caller,
+                                   background=background)
     try:
         return _monitor_geometry.canonical_monitor_refs(
             answer, list((images or {}).keys()))
@@ -28603,7 +28719,9 @@ def _vision_multi_intro(question: str, names) -> str:
     return intro if about_chat else intro + " " + _VISION_MULTI_CHAT_NOTE
 
 
-def _ask_vision_multi_raw(question: str, images: dict[str, bytes]) -> str:
+def _ask_vision_multi_raw(question: str, images: dict[str, bytes], *,
+                          caller: str = "",
+                          background: "bool | None" = None) -> str:
     """Send several labelled screenshots to Claude in a single message and
     return its answer. Each image is preceded by a text block naming the
     monitor it came from, so the model can refer to them in its answer.
@@ -28627,7 +28745,8 @@ def _ask_vision_multi_raw(question: str, images: dict[str, bytes]) -> str:
         pngs  = [images[n] for n in names]
         prompt = (f"{_vision_multi_intro(question, names)}\n\n"
                   f"Question: {question}")
-        text = _call_local_vision(prompt, pngs, max_tokens=900)
+        text = _call_local_vision(prompt, pngs, max_tokens=900,
+                                 caller=caller, background=background)
         return f"[local-vision] {text}" if text else None
 
     from core.config import model_route
@@ -28671,7 +28790,7 @@ def _ask_vision_multi_raw(question: str, images: dict[str, bytes]) -> str:
 
         _t0_cloud = time.monotonic()
         msg = _claude_create(
-            "vision",
+            "vision", caller=caller, background=background,
             model=SCREEN_VISION_MODEL, max_tokens=800,
             messages=[{"role": "user", "content": content}],
         )
@@ -28724,7 +28843,8 @@ def _query_vision_for_coords(description: str, png_bytes: bytes, w: int, h: int)
         f"Format: X,Y    (e.g. 432,718)\n"
         f"If the element isn't visible, reply: NOT_FOUND"
     )
-    answer = ask_vision(prompt, png_bytes).strip()
+    answer = ask_vision(prompt, png_bytes,
+                        caller="vision_click_target").strip()
     if "NOT_FOUND" in answer.upper():
         return None
     # The model is told to reply with ONLY the coordinates, so do NOT mine an
@@ -30649,7 +30769,7 @@ def _streaming_verify_playback(verify_question: str,
     png = take_screenshot(monitor)
     if png is None:
         return False, "could not capture screen"
-    answer = ask_vision(verify_question, png)
+    answer = ask_vision(verify_question, png, caller="streaming_verify")
     return _vision_answer_is_yes(answer), answer
 
 
@@ -31114,7 +31234,8 @@ def _streaming_page_wall(cfg: dict, service_key: str) -> str:
         if png is None:
             return ""
         verdict = _streaming_search.parse_wall_verdict(
-            ask_vision(_streaming_search.wall_question(service_key), png))
+            ask_vision(_streaming_search.wall_question(service_key), png,
+                       caller="streaming_signin_check"))
         if verdict not in ("sign_in", "error"):
             return ""
         from core.failure_markers import TERMINAL_FAILURE_PREFIX
@@ -33573,7 +33694,8 @@ def _screen_remark_llm(addendum: str, user: str) -> str:
             base = _local_stable_system_prompt(base) or base
         with _lt.background_work("screen-remark"):
             return _llm_quick(system=base + addendum, user=user,
-                              max_tokens=80) or ""
+                              max_tokens=80, caller="screen_remark",
+                              background=True) or ""
     except Exception as _e:
         print(f"  [screen-remark] generation failed: {type(_e).__name__}")
         return ""
@@ -33806,7 +33928,7 @@ def maybe_glance_response(user_text: str) -> str | None:
     _vis_result: list = [None]
     def _vis_worker():
         try:
-            _vis_result[0] = ask_vision(q, png)
+            _vis_result[0] = ask_vision(q, png, caller="glance_vision")
         except Exception:
             logging.exception("[glance] ask_vision worker raised")
     _vis_thread = threading.Thread(target=_vis_worker, daemon=True)
@@ -42573,7 +42695,8 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
             if _fitted is None:
                 return _FOLLOWUP_TOO_LONG_REPLY
             return _local_then_cloud_or_honest(_local_sys, _fitted,
-                                               max_tokens=400)
+                                               max_tokens=400,
+                                               caller="voice_followup")
         except Exception:
             # Unexpected raise on the local path (it has its own no-propagate
             # wrapper, so this is belt-and-braces): fall through to the backend
@@ -42594,9 +42717,10 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
                     model=CLAUDE_MODEL, max_tokens=400,
                     system=_sys_param, messages=msgs,
                     timeout=_ANTHROPIC_TIMEOUT_S, purpose="voice",
+                    caller="voice_followup",
                 )
             msg = _claude_create(
-                "voice",
+                "voice", caller="voice_followup",
                 model=CLAUDE_MODEL, max_tokens=400,
                 system=_sys_param, messages=msgs,
             )
@@ -42608,7 +42732,8 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
             # Bounded (see _ollama_chat_bounded): a wedged runner raises into the
             # `except` below, which already falls back to _call_local_llm / "".
             # Resolve, don't trust the retired OLLAMA_MODEL default (see above).
-            resp = _ollama_chat_bounded(_get_local_llm_model(), msgs)
+            resp = _ollama_chat_bounded(_get_local_llm_model(), msgs,
+                                        caller="voice_followup")
             return resp["message"]["content"]
     except Exception as e:
         # Cloud unavailable (e.g. the monthly usage cap) — keep the action
@@ -42617,7 +42742,7 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         local = _call_local_llm(
             sys_prompt_now,
             list(conversation_history) + [{"role": "user", "content": extra}],
-            max_tokens=400,
+            max_tokens=400, caller="voice_followup",
         )
         if local:
             return local
@@ -45271,7 +45396,8 @@ def _local_complete(system: str, messages: list, *, max_tokens: int = 220,
                     repeat_penalty: float | None = None,
                     json_schema: dict | None = None,
                     local_only: bool = True,
-                    timeout_s: float = 8.0) -> str | None:
+                    timeout_s: float = 8.0, caller: str = "",
+                    background: "bool | None" = None) -> str | None:
     """One plain completion from the local model for a skill: ``system`` is
     sent AS IS (no local-mode directive, no cheatsheet swap, no search guard,
     no [turn-timing] marks), with the given sampling options on top of the
@@ -45279,8 +45405,10 @@ def _local_complete(system: str, messages: list, *, max_tokens: int = 220,
     reused) and, with ``json_schema``, Ollama's structured ``format``. An
     HTTP 400 retries once without ``format`` (an older Ollama). With
     ``local_only`` it refuses (None) unless the base URL is loopback and the
-    model is not a cloud tag. Untagged (owner-initiated) under the traffic
-    gate; afterwards the usual re-prime bookkeeping. Returns the text or
+    model is not a cloud tag. Under the traffic gate as the caller it
+    declares (untagged and foreground by default: owner-initiated; a skill's
+    background use passes ``background=True``); afterwards the usual re-prime
+    bookkeeping. Returns the text or
     None; never raises."""
     did_post = False
     try:
@@ -45311,8 +45439,8 @@ def _local_complete(system: str, messages: list, *, max_tokens: int = 220,
             payload["format"] = json_schema
         t = max(1.0, float(timeout_s))
         timeout = (min(5.0, t), t)
-        _note_untagged_local_call("complete", sys._getframe(1))
-        with _lt.slot():
+        _note_untagged_local_call("complete", sys._getframe(1), caller)
+        with _lt.call_scope(caller, background) as (_cn, _cb), _lt.slot():
             did_post = True
             with _lt.TRACKER.track():
                 r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat",
@@ -45328,8 +45456,10 @@ def _local_complete(system: str, messages: list, *, max_tokens: int = 220,
             if not r.ok:
                 print(f"  [local-complete] HTTP {r.status_code}")
                 return None
-            text = ((r.json().get("message") or {}).get("content")
-                    or "").strip()
+            _j = r.json()
+            text = ((_j.get("message") or {}).get("content") or "").strip()
+            if text:
+                _lt.note_call(_cn, _cb, "local", _local_usage(_j))
             return text or None
     except _RequestsTimeout:
         print(f"  [local-complete] timed out after {float(timeout_s):.0f}s")
@@ -45938,7 +46068,7 @@ def _preflight_api_key(timeout_sec: float = 10.0) -> tuple[bool, str]:
             # "is Claude up?" take three times longer to answer "no".
             client = _anthropic_client(timeout=timeout_sec, max_retries=0)
             _claude_create(
-                "ping", client,
+                "ping", client, caller="claude_ping", background=True,
                 model=CLAUDE_MODEL,
                 max_tokens=1,
                 messages=[{"role": "user", "content": "."}],
@@ -49108,7 +49238,8 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
         system = _cached_system_param(_system_prompt
                                       + _turn_check_retry_note(verdict))
         retry = _claude_oneshot(system, _self_knowledge_for_cloud(msgs),
-                                max_tokens=500, model=model)
+                                max_tokens=500, model=model,
+                                caller="turn_check_retry")
         if not (isinstance(retry, str) and retry.strip()):
             print(f"  [turn-check] the {model} retry returned nothing - the "
                   f"local reply stands")
@@ -50712,7 +50843,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                         f"Latest changelog entry:\n\n{_latest_entry[:8000]}"
                     )
                     try:
-                        _summary = (_llm_quick(_system, _user, max_tokens=300) or "").strip()
+                        _summary = (_llm_quick(_system, _user, max_tokens=300,
+                                               caller="boot_changelog_summary",
+                                               background=True) or "").strip()
                     except Exception as _le:
                         print(f"  [changelog] LLM summarise failed: {_le}")
                 if _summary:
