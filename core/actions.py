@@ -370,13 +370,43 @@ def _streaming_url_fix(url: str, bare_names: bool = True) -> "tuple[str, str]":
         return url, ""
 
 
+def _webbrowser_open(url: str):
+    """webbrowser.open, plus the placement every other browser launch gets.
+
+    open_url / web_search / youtube called webbrowser.open bare, so when no
+    browser was running the new window opened where the browser last was -
+    sometimes off the right edge of the right monitor, unreachable (todo
+    2026-07-06). The monolith already pulls a window JARVIS just opened onto
+    the nearest work area (_place_new_browser_window_async ->
+    _ensure_window_visible_maximized, all four edges): reuse it. It moves only
+    a window whose handle is NEW since the snapshot taken here, so a URL that
+    becomes a tab in his existing window moves nothing. Without a loaded
+    monolith this is plain webbrowser.open. Never raises from the placement."""
+    bc = _loaded_bc()
+    before = None
+    activate = True
+    if bc is not None:
+        try:
+            before = bc._window_handles_snapshot()
+            activate = not bc._focus_steal_guard_active()
+        except Exception:
+            before = None
+    opened = webbrowser.open(url)
+    if before is not None:
+        try:
+            bc._place_new_browser_window_async(before, activate=activate)
+        except Exception:
+            pass
+    return opened
+
+
 def _act_open_url(url: str) -> str:
     url = _site_shortcut_url(url) or url
     url, _fix_note = _streaming_url_fix(url)
     if not (url.startswith(("http://", "https://")) or _is_data_dir_page(url)):
         url = "https://" + url
     _before = _foreground_snapshot()
-    webbrowser.open(url)
+    _webbrowser_open(url)
     # Wait (bounded, up to _OPEN_WAIT_S) until the page is in front and
     # named, instead of a blind 3 s sleep; the result says where it opened
     # and what it is, so the next round needs no screenshot (2026-10-05).
@@ -399,7 +429,7 @@ def _act_web_search(query: str) -> str:
         yt_url = bc._extract_youtube_url_from_search(query)
         if yt_url:
             _before = _foreground_snapshot()
-            webbrowser.open(yt_url)
+            _webbrowser_open(yt_url)
             _await_opened_page(yt_url, _before)
             return (
                 f"opened {yt_url} (extracted from Google results for '{query}') — "
@@ -409,7 +439,7 @@ def _act_web_search(query: str) -> str:
 
     url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
     _before = _foreground_snapshot()
-    webbrowser.open(url)
+    _webbrowser_open(url)
     _found = _await_opened_page(url, _before)
     _note_browser_tab_open("web_search", url, _before,
                            page=_found[:3] if _found else None)
@@ -428,7 +458,7 @@ def _act_youtube(query: str) -> str:
     action via the streaming auto-play pipeline (route through
     _act_play_streaming)."""
     url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
-    webbrowser.open(url)
+    _webbrowser_open(url)
     return f"searching YouTube for {query}"
 
 
