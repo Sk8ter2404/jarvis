@@ -349,8 +349,11 @@ class DeviceSelectionTests(unittest.TestCase):
     honoured and VRAM-checked, degrading to None when too full."""
 
     def test_unset_knob_uses_cuda_when_available(self):
+        # _free_vram_ok pinned: the unset knob is VRAM-gated, and the real gate
+        # reads the live card (a busy GPU would make this return None).
         with mock.patch.object(vc, "_cfg_device", return_value=""), \
-             mock.patch.object(vc, "_cuda_available", return_value=True):
+             mock.patch.object(vc, "_cuda_available", return_value=True), \
+             mock.patch.object(vc, "_free_vram_ok", return_value=True):
             self.assertEqual(vc._resolve_device(), "cuda")
 
     def test_unset_knob_uses_cpu_when_no_cuda(self):

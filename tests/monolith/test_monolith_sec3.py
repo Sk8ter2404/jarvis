@@ -3899,10 +3899,15 @@ class EnsureWhisperOpenaiCudaFallbackTests(MonolithGlobalsTestCase):
             return real_import(name, *a, **k)
         fake_whisper = mock.Mock()
         fake_whisper.load_model.side_effect = _load
+        # Pin the VRAM plan + driver pre-init: the real ones read the live GPU,
+        # and a busy/small card flips the load to CPU before the CUDA arm runs.
         with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
                 mock.patch.object(self.bc, "_resolve_whisper_device",
                                   return_value="cuda"), \
                 mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "_whisper_cuda_plan",
+                                  return_value=("float16", False, "test card")), \
+                mock.patch.object(self.bc, "_cuda_driver_first"), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3"), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "base"), \
                 mock.patch("builtins.__import__", side_effect=fake_import), \
@@ -3930,10 +3935,15 @@ class EnsureWhisperOpenaiCudaFallbackTests(MonolithGlobalsTestCase):
             return real_import(name, *a, **k)
         fake_whisper = mock.Mock()
         fake_whisper.load_model.side_effect = _load
+        # Pin the VRAM plan + driver pre-init: the real ones read the live GPU,
+        # and a busy/small card flips the load to CPU before the CUDA arm runs.
         with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
                 mock.patch.object(self.bc, "_resolve_whisper_device",
                                   return_value="cuda"), \
                 mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "_whisper_cuda_plan",
+                                  return_value=("float16", False, "test card")), \
+                mock.patch.object(self.bc, "_cuda_driver_first"), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3"), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "base"), \
                 mock.patch("builtins.__import__", side_effect=fake_import), \
@@ -5492,10 +5502,15 @@ class EnsureWhisperRaiseArmTests(MonolithGlobalsTestCase):
             return good
         fake_fw = mock.Mock()
         fake_fw.WhisperModel = mock.Mock(side_effect=_wm)
+        # Pin the VRAM plan + driver pre-init: the real ones read the live GPU,
+        # and a busy/small card flips the load to CPU before the CUDA arm runs.
         with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
                 mock.patch.object(self.bc, "_resolve_whisper_device",
                                   return_value="cuda"), \
                 mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "_whisper_cuda_plan",
+                                  return_value=("float16", False, "test card")), \
+                mock.patch.object(self.bc, "_cuda_driver_first"), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3"), \
                 mock.patch.dict(sys.modules, {"faster_whisper": fake_fw}):
             self.bc._ensure_whisper()
