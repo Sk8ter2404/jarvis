@@ -1375,7 +1375,10 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         # the frame-cache / detection / tracking-math body (not just the empty
         # early-return). No real device - the thread is watchdog-bounded.
         import numpy as np
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        # Mid-grey, NOT zeros: an all-black frame is deliberately not cached as
+        # live (_CAMERA_BLACK_FRAME_LEVEL), so a zeros frame only "worked" when
+        # an earlier test happened to leave the brightness check neutered.
+        frame = np.full((720, 1280, 3), 128, dtype=np.uint8)
         cap = mock.Mock()
         cap.isOpened.return_value = True
         cap.get.return_value = 1280
@@ -1420,7 +1423,7 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         so callers can assert whether the preview was written/removed and
         whether the HEAVY detection ran. One good primary frame, then stop."""
         import numpy as np
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame = np.full((720, 1280, 3), 128, dtype=np.uint8)
         cap = mock.Mock()
         cap.isOpened.return_value = True
         cap.get.return_value = 1280
@@ -1518,7 +1521,7 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         # frame for see_user, back off with time.sleep(0.5), and continue -
         # then exit cleanly when _face_track_stop fires.
         import numpy as np
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame = np.full((720, 1280, 3), 128, dtype=np.uint8)
         cap = mock.Mock()
         cap.isOpened.return_value = True
         cap.get.return_value = 1280
