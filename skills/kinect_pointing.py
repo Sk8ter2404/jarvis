@@ -87,17 +87,7 @@ def _pointing_module():
         return None
 
 
-def _bridge():
-    """Live kinect_bridge module, or None. Prefer the instance the monolith
-    already imported; fall back to a direct import (mirrors kinect_gestures)."""
-    mod = sys.modules.get("audio.kinect_bridge")
-    if mod is not None:
-        return mod
-    try:
-        from audio import kinect_bridge as _kb
-        return _kb
-    except Exception:
-        return None
+from core.skill_probe import _bridge  # noqa: E402
 
 
 def _bc():

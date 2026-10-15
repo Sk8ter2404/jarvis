@@ -113,17 +113,7 @@ def _dpapi_encrypt(plaintext: str) -> str | None:
         return None
 
 
-def _dpapi_decrypt(b64: str) -> str | None:
-    """Decrypt DPAPI base64 ciphertext back to plaintext, or None on failure."""
-    if not b64:
-        return None
-    try:
-        import win32crypt
-        blob = _base64.b64decode(b64.encode("ascii"))
-        _desc, data = win32crypt.CryptUnprotectData(blob, None, None, None, 0)
-        return data.decode("utf-8")
-    except Exception:
-        return None
+from core.skill_probe import _dpapi_decrypt  # noqa: E402
 
 
 def _load_token() -> dict | None:

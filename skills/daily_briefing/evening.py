@@ -487,27 +487,7 @@ def _bambu_status() -> str:
 
 # --- face tracker presence (cross-skill read) ----------------------------
 
-def _user_at_desk():
-    """Return True if face_tracker has recently seen the user, False if it
-    has seen 'away', or None if face_tracker isn't loaded / has no data."""
-    mod = sys.modules.get("skill_face_tracker")
-    if mod is None:
-        return None
-    snap_func = getattr(mod, "_snapshot_state", None)
-    if snap_func is None:
-        return None
-    try:
-        snap = snap_func()
-    except Exception:
-        return None
-    if not snap.get("last_sample_at"):
-        return None
-    monitor = snap.get("current_monitor")
-    if monitor in ("left", "right", "middle_or_top"):
-        return True
-    if monitor == "away":
-        return False
-    return None
+from core.skill_probe import _user_at_desk  # noqa: E402
 
 
 # --- session log scraping ------------------------------------------------
