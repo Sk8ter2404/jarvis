@@ -360,18 +360,25 @@ _YES_RE = re.compile(r"^(?:yes|yeah|yep|yup|sure|please|do\s+it|go\s+ahead|"
                      r"jarvis|do\s+it))*$", re.IGNORECASE)
 
 
-def pending_choice_answer(text, options, *, allow_yes: bool = False):
+def pending_choice_answer(text, options, *, allow_yes: bool = False,
+                          hard_yes: bool = False):
     """The 0-based index of the option ``text`` picks among ``options``
     (dicts with "label" and "rect" [x, y, w, h], in the order JARVIS named
     them), else None. "the second one", "number two", "the top one", "the
     MrBeast one" (a phrase unique to one option), and - only when
-    ``allow_yes`` and exactly one option was offered - "yes". Never
-    raises."""
+    ``allow_yes`` and exactly one option was offered - "yes". ``hard_yes``
+    (core.send_guard's hard stop before send / pay / delete ...): ONLY an
+    explicit yes ("yes", "yes, send it", "go ahead", "do it") answers it -
+    not "please", "right", "that one" or a bare "one". Never raises."""
     try:
         s = clean(text).lower()
         opts = list(options or ())
         if not s or not opts:
             return None
+        if hard_yes:
+            from core import send_guard as _sg
+            return 0 if (allow_yes and len(opts) == 1
+                         and _sg.is_yes_answer(s)) else None
         m = _PICK_RE.match(s)
         if m:
             n = _PICK_ORD.get(m.group("o").lower())

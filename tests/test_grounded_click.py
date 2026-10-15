@@ -218,9 +218,11 @@ class GuardTests(_Base):
         r = G.run("the delete key button", said="click the red one at the end",
                   backend=b)
         self.assertEqual(r.outcome, G.ASKED, r.text)
-        self.assertIn("shall I press it", r.text)
+        self.assertIn("deletes something", r.text)   # core.send_guard's line
+        self.assertIn("yes, delete it", r.text)
         self.assertEqual(b.clicks, [])
         self.assertTrue(G.pending_choice()["allow_yes"])
+        self.assertTrue(G.pending_choice()["hard"])
 
 
 class VerifyTests(_Base):

@@ -55,13 +55,14 @@ from core import onscreen_refs as _refs
 from core import screen_privacy as _priv
 from core import screen_resolve as _R
 from core import screen_scope as _scope
+from core import send_guard as _sg
 from core import vision_trace as _vt
 
 __all__ = [
     "Result", "Backend", "run", "run_bounded", "undo", "pick",
     "freeze_scene", "freeze_scene_async", "scene_match", "pending_choice",
     "clear_pending", "last_ui_action", "note_ui_action", "recent_scenes",
-    "forget_scenes", "reset_state", "safe_label",
+    "forget_scenes", "reset_state", "safe_label", "hold_key", "guard_point",
     "VERIFIED", "NAVIGATED", "NO_CHANGE", "CHANGED_WRONG", "NOT_FOUND",
     "AMBIGUOUS", "TIMED_OUT",
     "ALREADY_PLAYING", "REFUSED_AUTH", "REFUSED_PRIVATE", "ASKED", "FAILED",
@@ -97,10 +98,6 @@ BUDGET_VISION_S = 12.0
 CROSS_WINDOW_LEAD = 0.15
 _POLL_S = 0.15
 
-_DESTRUCTIVE_RE = re.compile(
-    r"\b(send|delete|remove|buy|pay|purchase|confirm|unsubscribe|sign\s*out|"
-    r"log\s*out|place\s+order|checkout|check\s+out|discard|erase|format|"
-    r"uninstall|transfer)\b", re.IGNORECASE)
 _VISUAL_RE = re.compile(
     r"\b(red|blue|green|yellow|orange|purple|pink|black|white|grey|gray|"
     r"gold|silver|colou?r(?:ed)?|picture|image|photo|logo|icon\s+of|"
@@ -1560,6 +1557,20 @@ def _timeline(source, w, text, url="") -> None:
         pass
 
 
+def _hard_stop_kind(cand, w, cands, label) -> str:
+    """core.send_guard's class for the control ``cand`` (its name, UIA role
+    and automation id, the controls around it and the window's title), or
+    "". Never raises."""
+    try:
+        el = cand.get("el")
+        near = _sg.nearby_texts(cand["rect"], cands, label)
+        near.append(str(_g(w, "title", "") or ""))
+        return _sg.classify(label, cand.get("type") or "",
+                            getattr(el, "auto_id", "") or "", near)
+    except Exception:
+        return ""
+
+
 def _guarded_click(cand, w, snap, cands, said, desc, tier, b, dl, st, *,
                    others=(), confirmed=False, grid_hit=False) -> Result:
     """The single chokepoint every description click goes through (SPEC
@@ -1615,16 +1626,21 @@ def _guarded_click(cand, w, snap, cands, said, desc, tier, b, dl, st, *,
         return Result(f"REFUSED: '{label}' looks like an attempt to close the "
                       "terminal or Python process running me.", FAILED,
                       label=label, failed=True)
-    # 4. destructive hold
-    m = _DESTRUCTIVE_RE.search(label)
-    if m and not confirmed:
-        verb = m.group(1).split()[0].lower()
-        if not re.search(r"\b" + re.escape(verb), str(said or "").lower()):
+    # 4. hard stop (core.send_guard): send / submit / post / publish / pay /
+    # buy / transfer / delete / accept terms / sign are NEVER pressed on the
+    # strength of a request alone - the owner's spoken yes to this very
+    # question is the only way through (pick() -> confirmed), one yes = one
+    # click. His earlier words ("click Send") do not waive it.
+    if not confirmed:
+        kind = _hard_stop_kind(cand, w, cands, label)
+        if kind:
             opt = _option_dict(w, cand, cands)
-            _set_pending([opt], said, desc, kind="confirm", allow_yes=True)
-            st.finish(ASKED, evidence=f"destructive: {verb}")
-            return Result(f"That's the {_q(label)} button on {_mon(mon)}, sir "
-                          "— shall I press it?", ASKED, label=label,
+            _set_pending([opt], said, desc, kind="confirm", allow_yes=True,
+                         hard=True, hold=kind)
+            st.finish(ASKED, evidence=f"hard stop: {kind}")
+            print(f"  [click] hard stop ({kind}): not clicking until the "
+                  "owner says yes", flush=True)
+            return Result(_sg.hold_line(kind), ASKED, label=label,
                           monitor=mon or "")
     # 5. point, off-viewport, hit test
     rect = tuple(float(v) for v in cand["rect"])
@@ -1646,10 +1662,14 @@ def _guarded_click(cand, w, snap, cands, said, desc, tier, b, dl, st, *,
     st.set(precheck=hit)
     if hit == "covered":
         opt = _option_dict(w, cand, cands)
-        _set_pending([opt], said, desc, kind="bring_forward", allow_yes=True)
+        # A hard-stop yes carries to bringing the same control forward (one
+        # action, one yes): the question says it will press it.
+        _set_pending([opt], said, desc, kind="bring_forward", allow_yes=True,
+                     confirmed=bool(confirmed))
         st.finish(ASKED, evidence=f"covered by {extra!r}")
         return Result(f"{_q(label)} is behind {_q(extra or 'another window')}, "
-                      "sir — shall I bring it forward?", ASKED,
+                      "sir — shall I bring it forward"
+                      + (" and press it?" if confirmed else "?"), ASKED,
                       label=label, monitor=mon or "")
     if hit == "mismatch" and not (el is not None and el.invokable):
         st.finish(ASKED, evidence="hit test: something else under the point")
@@ -2192,6 +2212,10 @@ def pick(n, said="", backend=None, deadline=None) -> Result:
             st.finish(VERIFIED if href else FAILED, evidence=out[:120])
             return Result(f"Opening {_q(opt['label'])}, sir.", VERIFIED,
                           label=opt["label"])
+        if p["kind"] == "press_key":
+            return _pick_key(opt, b, dl, st)
+        if p["kind"] == "point_click":
+            return _pick_point(opt, b, dl, st)
         if p["kind"] == "bring_forward":
             b.focus(opt.get("hwnd"))
             b.sleep(0.35)
@@ -2203,8 +2227,120 @@ def pick(n, said="", backend=None, deadline=None) -> Result:
         win, snap, cand, cands = found
         return _guarded_click(cand, win, snap, cands, p.get("said") or said,
                               p.get("referent") or opt["label"], "pick", b,
-                              dl, st, confirmed=(p["kind"] == "confirm"),
+                              dl, st,
+                              confirmed=(p["kind"] == "confirm"
+                                         or bool(p.get("confirmed"))),
                               grid_hit=bool(_R.video_cards(_R.prepare(cands))))
+
+
+def _acting_allowed(dl) -> bool:
+    """True (and the run marked as having acted) unless the budget ran out
+    or the caller gave up - the check _guarded_click makes before acting."""
+    with _lock:
+        if dl.expired():
+            return False
+        dl.acted = ("a key", "")
+        return True
+
+
+def hold_key(value, said="", backend=None) -> Result:
+    """Enter (or Ctrl+Enter) would send a message: press nothing, ask. The
+    owner's yes answers it (pick -> _pick_key): ONE yes = ONE press, only
+    while the same window is still in front. Never raises."""
+    line = Result(_sg.hold_line(_sg.SEND, "press"), ASKED, label="Enter")
+    try:
+        b = _backend(backend)
+        keys = [k.strip().lower()
+                for k in re.split(r"[+\s,]+", str(value or "")) if k.strip()]
+        hwnd = b.foreground()
+        title = ""
+        try:
+            title = (b.window_title(hwnd) or "") if hwnd else ""
+        except Exception:
+            title = ""
+        opt = {"label": "Enter", "rect": [], "keys": keys, "hwnd": hwnd,
+               "window_title": title}
+        _set_pending([opt], said, "enter", kind="press_key", allow_yes=True,
+                     hard=True, hold=_sg.SEND)
+        print("  [click] hard stop (send): not pressing Enter until the "
+              "owner says yes", flush=True)
+    except Exception:
+        pass
+    return line
+
+
+def _pick_key(opt, b, dl, st) -> Result:
+    keys = list(opt.get("keys") or ["enter"])
+    want = opt.get("hwnd")
+    now = b.foreground()
+    if want and now and int(want) != int(now):
+        st.finish(NOT_FOUND, evidence="the window in front changed")
+        return Result("The window in front has changed, sir, so I pressed "
+                      "nothing.", NOT_FOUND, label="Enter")
+    if not _acting_allowed(dl):
+        st.finish(FAILED, evidence="out of time before acting")
+        return Result("That took too long, sir - I pressed nothing.",
+                      NOT_FOUND, label="Enter", tier=TIMED_OUT)
+    try:
+        b.hotkey(*keys)
+    except Exception as e:
+        st.finish(FAILED, evidence=str(e)[:120])
+        return Result(str(e) or "The key press failed, sir.", FAILED,
+                      label="Enter", failed=True)
+    st.finish(VERIFIED, evidence="pressed on the owner's yes")
+    return Result("Done, sir - I pressed Enter.", VERIFIED, label="Enter")
+
+
+def guard_point(x, y, said="", backend=None) -> "Optional[Result]":
+    """A coordinate click is about to land: when UI Automation says the
+    control under (x, y) is a send / submit / pay ... one (core.send_guard),
+    press nothing and ask (the owner's yes -> _pick_point). None when the
+    point is an ordinary control or nothing can be told. Never raises."""
+    try:
+        b = _backend(backend)
+        el = b.element_at(int(x), int(y))
+        if not el:
+            return None
+        name = " ".join(str(el.get("name") or "").split())
+        title = ""
+        try:
+            title = b.window_title(el.get("root_hwnd")) or ""
+        except Exception:
+            title = ""
+        kind = _sg.classify(name, el.get("ctype") or "", "", [title])
+        if not kind:
+            return None
+        opt = {"label": name, "rect": list(el.get("rect") or []),
+               "x": int(x), "y": int(y), "hwnd": el.get("root_hwnd"),
+               "type": el.get("ctype")}
+        _set_pending([opt], said, name, kind="point_click", allow_yes=True,
+                     hard=True, hold=kind)
+        print(f"  [click] hard stop ({kind}): not clicking ({int(x)},"
+              f"{int(y)}) until the owner says yes", flush=True)
+        return Result(_sg.hold_line(kind), ASKED, label=name)
+    except Exception:
+        return None
+
+
+def _pick_point(opt, b, dl, st) -> Result:
+    x, y, label = opt.get("x"), opt.get("y"), opt.get("label") or "that"
+    el = b.element_at(int(x), int(y))
+    if not el or _R.squash(str(el.get("name") or "")) != _R.squash(label):
+        st.finish(NOT_FOUND, evidence="the control moved")
+        return Result(f"{_q(label)} isn't under that spot any more, sir, so "
+                      "I clicked nothing.", NOT_FOUND, label=label)
+    if not _acting_allowed(dl):
+        st.finish(FAILED, evidence="out of time before acting")
+        return Result("That took too long, sir - I clicked nothing.",
+                      NOT_FOUND, label=label, tier=TIMED_OUT)
+    try:
+        b.click(int(x), int(y))
+    except Exception as e:
+        st.finish(FAILED, evidence=str(e)[:120])
+        return Result(str(e) or "Click failed, sir.", FAILED, label=label,
+                      failed=True)
+    st.finish(VERIFIED, evidence="clicked on the owner's yes")
+    return Result(f"Done, sir - clicked {_q(label)}.", VERIFIED, label=label)
 
 
 def _scene_before(ts) -> Optional[dict]:

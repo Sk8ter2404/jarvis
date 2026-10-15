@@ -219,7 +219,8 @@ def screen_route(utterance, state=None) -> str | None:
         p = st.get("pending")
         if p and click_ok:
             idx = _or.pending_choice_answer(utterance, p.get("options") or (),
-                                            allow_yes=bool(st.get("allow_yes")))
+                                            allow_yes=bool(st.get("allow_yes")),
+                                            hard_yes=bool(p.get("hard")))
             if idx is not None:
                 return f"[ACTION: click_on_screen, pick:{idx + 1}]"
         if st.get("recent_ui") or p:
