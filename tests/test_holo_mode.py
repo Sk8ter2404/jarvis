@@ -24,7 +24,7 @@ _ROOT = os.path.dirname(_HERE)
 _HOLO_DIR = os.path.join(_ROOT, "hud", "holo")
 
 ACTIONS = ("hand_menu", "holo_mode_on", "holo_mode_off", "holo_show",
-           "holo_explode", "holo_assemble")
+           "holo_explode", "holo_assemble", "holo_quest")
 
 
 class _Clock:

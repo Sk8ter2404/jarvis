@@ -603,6 +603,13 @@ _HOLO_KINECT_TAIL_RE = re.compile(
     r"\s+(?:with|using|on|from|via|in)\s+(?:the\s+|my\s+)?(?:xbox\s+)?kinect"
     r"(?:\s+(?:camera|sensor|depth))?(?:\s+(?:and\s+)?(?:with\s+)?depth)?$", re.IGNORECASE)
 _HOLO_KINECT_ADJ_RE = re.compile(r"\bkinect\s+(?=hologram\b)", re.IGNORECASE)
+# "open the hologram ON THE QUEST" (2026-10-15, Phase 3): the WebXR page for the
+# headset. Only a Quest / headset tail (or "the Quest hologram") on an open
+# request routes to holo_quest; nothing opens on this PC.
+_HOLO_QUEST_TAIL_RE = re.compile(
+    r"\s+(?:on|in|to|for|with|using|through|via)\s+(?:the\s+|my\s+)?(?:meta\s+|oculus\s+)?"
+    r"(?:quest(?:\s*(?:3s?|2|pro))?|(?:vr\s+|ar\s+)?headset)$", re.IGNORECASE)
+_HOLO_QUEST_ADJ_RE = re.compile(r"\b(?:meta\s+|oculus\s+)?quest(?:\s*(?:3s?|2|pro))?\s+(?=hologram\b)", re.IGNORECASE)
 _HOLO_OFF_RE = re.compile(
     r"^(?:(?:close|hide|dismiss|kill|exit|stop|end)\s+" + _HOLO_NAME
     + r"|(?:turn|switch|shut)\s+off\s+" + _HOLO_NAME
@@ -637,6 +644,11 @@ def holo_route(utterance, holo_up: bool = False) -> str | None:
         s = " ".join(_strip(s).split())
         s = " ".join(_strip(_HT_POLITE_RE.sub("", s)).split())
         s = " ".join(_HT_POLITE_RE.sub("", s).split())
+        qst = _HOLO_QUEST_TAIL_RE.search(s)
+        if qst is not None and _HOLO_ON_RE.match(s[:qst.start()]):
+            return "[ACTION: holo_quest]"
+        if _HOLO_QUEST_ADJ_RE.search(s) and _HOLO_ON_RE.match(_HOLO_QUEST_ADJ_RE.sub("", s)):
+            return "[ACTION: holo_quest]"
         kin = _HOLO_KINECT_TAIL_RE.search(s)
         if kin is not None and _HOLO_ON_RE.match(s[:kin.start()]):
             return "[ACTION: holo_mode_on, kinect]"

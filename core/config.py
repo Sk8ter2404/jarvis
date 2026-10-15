@@ -2455,6 +2455,15 @@ HOLO_MODE_ENABLED = True
 # out of the list (and refused with a 413 if asked for directly).
 HOLO_MODEL_DIRS = []
 HOLO_MODEL_MAX_MB = 64
+# HOLO_XR_HINT_HOST — the hologram on a Quest 3 (page /holo/xr, WebXR). WebXR only
+# runs on HTTPS or localhost, so over plain http the page shows instructions
+# instead of a dead button. Set this to the LAN name you put a certificate on
+# (e.g. a Cloudflare-issued one) and the instructions name it and the voice
+# ("open the hologram on the Quest") gives https://<name>/holo/xr as the address.
+# "" (default): the instructions stay generic. It changes NOTHING about what the
+# web interface binds to: exposing it on the LAN (WEB_INTERFACE_BIND + a token)
+# stays your call.
+HOLO_XR_HINT_HOST = ""
 # DASHBOARD_SHOW_TRANSCRIPTS — the dashboard's "What JARVIS did" timeline shows
 # what was SAID on each turn (the owner's words, JARVIS's reply) only when this
 # is True AND the browser is on this PC (a loopback request). A LAN client never

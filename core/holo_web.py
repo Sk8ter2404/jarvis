@@ -17,6 +17,13 @@ WHAT THIS IS
     * notices whether a page is actually open (the poll is its heartbeat), so
       "explode it" with no page up can say so instead of lying.
 
+PHASE 3 (Quest 3): ``/holo/xr`` is the same hologram as a WebXR page for the
+headset's browser (hud/holo/xr.js). The headset's own hand tracking replaces the
+tracker service, so that page opens no WebSocket and gets a narrower CSP
+(``HOLO_XR_CSP``). WebXR needs HTTPS (or localhost); the page says so itself
+and names the owner's LAN name from ``HOLO_XR_HINT_HOST`` (``xr_hint_host``).
+This module does not change what the web interface binds to.
+
 WHAT IT MUST NEVER DO
   Move the Windows cursor or send any OS input. The page only draws; hand
   tracking for it lives in the browser and never reaches the air-mouse code.
@@ -81,9 +88,18 @@ _ASSETS = {
     "/holo/models.js": ("models.js", "text/javascript; charset=utf-8"),
     "/holo/fakehands.js": ("fakehands.js", "text/javascript; charset=utf-8"),
     "/holo/selftest.js": ("selftest.js", "text/javascript; charset=utf-8"),
+    # Phase 3: the same hologram in the Quest 3's browser (WebXR). Its own page,
+    # its own CSP (no tracker WebSocket: the headset's hand tracking replaces it).
+    "/holo/xr": ("xr.html", "text/html; charset=utf-8"),
+    "/holo/xr.js": ("xr.js", "text/javascript; charset=utf-8"),
+    "/holo/xrgestures.js": ("xrgestures.js", "text/javascript; charset=utf-8"),
+    "/holo/xrfake.js": ("xrfake.js", "text/javascript; charset=utf-8"),
 }
 
 _TOKEN_SLOT = "__JARVIS_TOKEN__"
+_XR_HOST_SLOT = "__JARVIS_XR_HOST__"
+# The pages that carry the token (and, for the XR page, the LAN-name hint).
+_PAGES = ("/holo", "/holo/xr")
 
 # The dashboard's CSP is 'self'-only; this page must also load three.js from
 # jsdelivr and talk to the tracker service on loopback port 8793. Nothing else
@@ -99,6 +115,25 @@ HOLO_CSP = (
     "worker-src 'self' blob:; "
     "frame-ancestors 'none'; base-uri 'none'; object-src 'none'; "
     "form-action 'self'")
+
+# The XR page opens NO WebSocket (the headset's own hands replace the tracker
+# service) and talks to nothing but its own origin and the pinned CDN. ``blob:``
+# is only for the glTF / 3MF loaders' embedded textures (controller models,
+# coloured 3MFs); it is not a host.
+HOLO_XR_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self' https://cdn.jsdelivr.net blob:; "
+    "worker-src 'self' blob:; "
+    "frame-ancestors 'none'; base-uri 'none'; object-src 'none'; "
+    "form-action 'self'")
+
+
+def csp_for(path: str) -> str:
+    """The Content-Security-Policy for a published /holo path."""
+    return HOLO_XR_CSP if path == "/holo/xr" else HOLO_CSP
 
 
 class HoloState:
@@ -246,10 +281,29 @@ def asset_for(path: str, token: str = ""):
             data = fh.read()
     except OSError:
         return None
-    if path == "/holo":
+    if path in _PAGES:
         tok = json.dumps(token or "").replace("</", "<\\/")
-        data = data.decode("utf-8").replace(_TOKEN_SLOT, tok, 1).encode("utf-8")
+        text = data.decode("utf-8").replace(_TOKEN_SLOT, tok, 1)
+        if path == "/holo/xr":
+            host = json.dumps(xr_hint_host()).replace("</", "<\\/")
+            text = text.replace(_XR_HOST_SLOT, host, 1)
+        data = text.encode("utf-8")
     return data, ctype
+
+
+# A LAN name for the secure-address hint on the XR page (HOLO_XR_HINT_HOST). The
+# page shows it in a sentence (text only, never a link); still, only a plain host
+# name (letters, digits, dots, hyphens, an optional :port) is ever passed on.
+_HOST_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*(?::\d{1,5})?$")
+
+
+def xr_hint_host(value=None) -> str:
+    """HOLO_XR_HINT_HOST, or "" when it is unset or not a plain host name."""
+    v = _cfg("HOLO_XR_HINT_HOST", "") if value is None else value
+    v = str(v or "").strip()
+    return v if _HOST_RE.match(v) else ""
 
 
 # ---------------------------------------------------------------------------

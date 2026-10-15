@@ -27,7 +27,7 @@ HOLO_MODE_ENABLED (core/config.py) False -> every action says it is off.
 
 Voice actions (each returns ONE finished sentence, spoken verbatim):
   hand_menu, holo_mode_on [desktop|camera|kinect], holo_mode_off,
-  holo_show [model], holo_explode, holo_assemble
+  holo_show [model], holo_explode, holo_assemble, holo_quest
 
 KINECT + DEPTH (Phase 2, core/handtrack_depth.py): "open up the hologram with the
 Kinect" is holo_mode_on with the word "kinect". It opens the page in camera mode
@@ -41,6 +41,14 @@ permanent, a plain "open the hologram" is the Kinect one. The page hides the
 hologram behind anything nearer than it and lets a fist push / pull it in depth,
 only while the depth plane is really flowing; hand_tracking_status says whether
 it is.
+
+QUEST 3 (Phase 3, hud/holo/xr.js, page /holo/xr): the same hologram as a WebXR page
+in the headset's browser; its own hand tracking replaces the webcam tracker. WebXR
+needs HTTPS (or localhost), so "open the hologram on the Quest" (holo_quest) opens
+NO window on the PC: with HOLO_XR_HINT_HOST unset it says the headset needs the
+owner's pick first (a certificate for a LAN name, or Quest developer mode + adb
+reverse) and, once he set that LAN name, gives the address to open. It changes
+nothing about what the web interface binds to.
 
 holo_show also shows the owner's OWN models (.stl / .3mf / .obj in
 data/holo_models or the HOLO_MODEL_DIRS folders, see core/holo_web.py): the
@@ -57,7 +65,8 @@ import time
 from core import holo_web
 
 SPEAK_VERBATIM_ACTIONS = ("hand_menu", "holo_mode_on", "holo_mode_off",
-                          "holo_show", "holo_explode", "holo_assemble")
+                          "holo_show", "holo_explode", "holo_assemble",
+                          "holo_quest")
 
 # Injected by the skill loader before exec_module (pyflakes-visible definition).
 skill_utils = globals().get("skill_utils", {})
@@ -405,7 +414,29 @@ def holo_assemble(arg: str = "") -> str:
     return "Putting it back together, sir."
 
 
+def holo_quest(arg: str = "") -> str:
+    """"Open the hologram on the Quest": the page is /holo/xr and runs IN the
+    headset, so nothing opens on this PC. WebXR needs a secure address, which is
+    the owner's choice (HOLO_XR_HINT_HOST names the LAN name he put a certificate
+    on); until he has made it the reply says so instead of handing out an address
+    that cannot work. Never raises, never changes any setting."""
+    if not _enabled():
+        return _off_line()
+    host = holo_web.xr_hint_host()
+    if not host:
+        port = _server_up()[2] or int(_cfg("WEB_INTERFACE_PORT", 8766) or 8766)
+        return ("The headset needs a secure address first, sir - a certificate for a "
+                "LAN name, or Quest developer mode with an adb tunnel and then "
+                f"http://localhost:{port}/holo/xr on the Quest. Your call; once a LAN "
+                "name is in my settings I'll read out its address.")
+    ok, _h, _p, why = _ensure_server()
+    if not ok:
+        return why
+    return f"On the Quest, open https://{host}/holo/xr, sir."
+
+
 def register(actions: dict):
+    actions["holo_quest"] = holo_quest
     actions["holo_mode_on"] = holo_mode_on
     actions["holo_mode_off"] = holo_mode_off
     actions["hand_menu"] = hand_menu

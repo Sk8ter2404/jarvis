@@ -13,6 +13,13 @@ import {
   formatSizeMm, uniqueNames, splitParts, fitModel, explodeDir, findModel, pageOf,
   TARGET_RADIUS, MODELS_PER_PAGE,
 } from "./models.js";
+import {
+  X, XRGestureRouter, ApartDetector, ClapDetector, PokeGate, pinchState,
+  pinchPoint as xrPinchPoint,
+  palmCenter, scaleFromDistance, quatFromVectors, quatMul, quatRotate, placeInFront,
+  panelBasis, pokeHit, dist3, add3,
+} from "./xrgestures.js";
+import { FakeXRHands, makeXRHand } from "./xrfake.js";
 
 class MockScene {
   constructor() {
@@ -398,6 +405,329 @@ TESTS.push(
     for (const v of [700, 1400, 2600]) if (!vals.has(v)) throw new Error("missing " + v);
     eq(new FakeHands({}).depthPlane(1), null, "no depth unless asked");
     eq("z" in new FakeHands({}).step(5.0)[0].hands[0], false, "no z unless asked");
+  }],
+);
+
+// ---------------------------------------------------------------------------
+// Phase 3: the Quest 3 / WebXR page (xrgestures.js, xrfake.js) - pure math plus a
+// mock target; xr.js itself needs a headset (or /holo/xr?fake=1).
+// ---------------------------------------------------------------------------
+class MockXRTarget {
+  constructor() {
+    this.pos = [0, 1.2, -0.5]; this.s = 1; this.q = [0, 0, 0, 1];
+    this.exploded = false; this.calls = []; this.snap = null;
+    this.part = { name: "Core", info: "i" };
+    this.infoShown = null; this.pulled = null; this.pullAt = null; this.noSphere = false;
+  }
+  sphere() { return this.noSphere ? null : { c: this.pos.slice(), r: (this.exploded ? 0.28 : 0.14) * this.s }; }
+  position() { return this.pos.slice(); }
+  getScale() { return this.s; }
+  grabMove(p) { this.pos = p.slice(); this.calls.push(["grabMove"]); }
+  grabEnd() { this.calls.push(["grabEnd"]); }
+  twoBegin() { this.snap = { pos: this.pos.slice(), s: this.s, q: this.q.slice() }; this.calls.push(["twoBegin"]); }
+  twoMove(m) {
+    this.pos = m.pos.slice(); this.s = m.scale; this.q = quatMul(m.rot, this.snap.q);
+    this.maxS = Math.max(this.maxS || 0, this.s); this.calls.push(["twoMove"]);
+  }
+  twoEnd(revert) {
+    if (revert && this.snap) { this.pos = this.snap.pos; this.s = this.snap.s; this.q = this.snap.q; }
+    this.snap = null; this.calls.push(["twoEnd", revert]);
+  }
+  explode() { this.exploded = true; this.calls.push(["explode"]); }
+  assemble() { this.exploded = false; this.calls.push(["assemble"]); }
+  corePos() { return add3(this.pos, [0.2, 0.05, 0]); }
+  partAt(p) { return dist3(p, this.corePos()) <= 0.03 * this.s + X.PART_MARGIN_M ? this.part : null; }
+  pullPart(part) { this.pulled = part; this.calls.push(["pull", part.name]); }
+  movePart(part, p) { this.pullAt = p; this.calls.push(["movePart"]); }
+  releasePart(part) { this.pulled = null; this.calls.push(["release", part.name]); }
+  showInfo(part) { this.infoShown = part ? part.name : null; this.calls.push(["info", this.infoShown]); }
+  count(n) { return this.calls.filter(c => c[0] === n).length; }
+}
+
+const DT = 1 / 72;                                   // the Quest's hand-tracking rate
+// A hand whose thumb and index tips are `gap` apart around `at`.
+function xh(at, gap, palmOff = [0, -0.02, 0.08]) {
+  const h = makeXRHand(add3(at, palmOff), at, false);
+  h.joints["thumb-tip"] = add3(at, [-gap / 2, 0, 0]);
+  h.joints["index-finger-tip"] = add3(at, [gap / 2, 0, 0]);
+  return h;
+}
+const openH = at => xh(at, 0.075), pin = at => xh(at, 0.008);
+// Run `n` frames; f(i, u) -> {left, right}; u = 0..1 through the run.
+function drive(r, n, f) {
+  for (let i = 0; i < n; i++) {
+    const h = f(i, n <= 1 ? 1 : i / (n - 1));
+    r.update({ left: h.left || null, right: h.right || null }, DT);
+  }
+}
+const sec = s => Math.round(s / DT);
+const lerp3 = (a, b, u) => [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u];
+const C0 = [0, 1.2, -0.5];
+const vclose = (a, b, e, msg) => { for (let i = 0; i < 3; i++) near(a[i], b[i], e, (msg || "") + "[" + i + "]"); };
+const pair = (wl, wr, z = 0, y = 0) => ({ left: add3(C0, [-wl, y, z]), right: add3(C0, [wr, y, z]) });
+
+TESTS.push(
+  ["xr: thresholds are sane", () => {
+    if (!(X.PINCH_ON_M < X.PINCH_OFF_M)) throw new Error("hysteresis band");
+    if (!(X.SCALE_MIN < 1 && X.SCALE_MAX > 1)) throw new Error("scale limits");
+    if (!(X.INFO_HOLD_S >= 0.5 && X.INFO_HOLD_S <= 2)) throw new Error("info hold");
+    if (!(X.APART_SPEED_MPS > 0.5 && X.CLAP_SPEED_MPS >= X.APART_SPEED_MPS)) throw new Error("speeds");
+  }],
+  ["xr: quaternion helpers rotate vectors the way they claim", () => {
+    const q = quatFromVectors([1, 0, 0], [0, 1, 0]);
+    vclose(quatRotate(q, [1, 0, 0]), [0, 1, 0], 1e-9, "x->y");
+    vclose(quatRotate(q, [0, 0, 1]), [0, 0, 1], 1e-9, "axis z fixed");
+    const flip = quatFromVectors([0, 0, 1], [0, 0, -1]);
+    vclose(quatRotate(flip, [0, 0, 1]), [0, 0, -1], 1e-9, "180 deg");
+    vclose(quatRotate(quatFromVectors([0, 1, 0], [0, 1, 0]), [1, 2, 3]), [1, 2, 3], 1e-9, "identity");
+    const a = quatFromVectors([1, 0, 0], [0, 1, 0]), b = quatFromVectors([0, 1, 0], [0, 0, 1]);
+    vclose(quatRotate(quatMul(b, a), [1, 0, 0]), [0, 0, 1], 1e-9, "b after a");
+    const yaw90 = [0, Math.sin(Math.PI / 4), 0, Math.cos(Math.PI / 4)];
+    vclose(quatRotate(yaw90, [0, 0, -1]), [-1, 0, 0], 1e-9, "yaw +90 turns -z toward -x");
+  }],
+  ["xr: pinch has hysteresis (on <= 2.0 cm, off >= 3.2 cm)", () => {
+    eq(pinchState(false, 0.019), true);
+    eq(pinchState(false, 0.025), false, "between: stays open");
+    eq(pinchState(true, 0.025), true, "between: stays pinched");
+    eq(pinchState(true, 0.033), false);
+    near(dist3(xrPinchPoint(openH(C0)), C0), 0, 1e-12);
+    vclose(palmCenter(makeXRHand([0, 1, 0], [0, 1, -0.1], false)), [0, 1, 0], 1e-12, "palm");
+  }],
+  ["xr: scale follows hand distance and clamps", () => {
+    near(scaleFromDistance(1, 0.2, 0.4), 2, 1e-9);
+    eq(scaleFromDistance(1, 0.2, 99), X.SCALE_MAX);
+    eq(scaleFromDistance(1, 0.2, 0.0001), X.SCALE_MIN);
+    eq(scaleFromDistance(1.5, 0, 0.3), 1.5, "no start distance: unchanged");
+  }],
+  ["xr: the hologram appears 0.5 m ahead at chest height, from the horizontal facing", () => {
+    vclose(placeInFront([0, 1.6, 0], [0, 0, 0, 1]), [0, 1.3, -0.5], 1e-9, "facing -z");
+    const yaw90 = [0, Math.sin(Math.PI / 4), 0, Math.cos(Math.PI / 4)];       // faces -x
+    vclose(placeInFront([1, 1.6, 2], yaw90), [0.5, 1.3, 2], 1e-9, "facing -x");
+    const pitchDown = [Math.sin(-Math.PI / 4), 0, 0, Math.cos(-Math.PI / 4)]; // looking at the floor
+    vclose(placeInFront([0, 1.6, 0], pitchDown), [0, 1.3, -0.5], 1e-9, "looking down: still ahead");
+    const pitchUp = [Math.sin(Math.PI / 4), 0, 0, Math.cos(Math.PI / 4)];     // looking at the ceiling
+    vclose(placeInFront([0, 1.6, 0], pitchUp), [0, 1.3, -0.5], 1e-9, "looking up: still ahead");
+  }],
+  ["xr: a pinch near the object grabs and follows without a snap; release lets go", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    const at = add3(C0, [0.05, 0, 0]), to = add3(at, [0.2, 0.1, -0.1]);
+    drive(r, 5, () => ({ right: openH(at) }));
+    eq(t.count("grabMove"), 0, "an open hand does nothing");
+    drive(r, 1, () => ({ right: pin(at) }));
+    eq(r.mode.kind, "grab");
+    drive(r, sec(0.5), (i, u) => ({ right: pin(lerp3(at, to, u)) }));
+    vclose(t.pos, add3(C0, [0.2, 0.1, -0.1]), 0.005, "the object kept its offset to the hand");
+    drive(r, 3, () => ({ right: openH(to) }));
+    eq(r.mode, null); eq(t.count("grabEnd"), 1);
+  }],
+  ["xr: a pinch far away, or one that drifts onto the object, never grabs", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    const far = add3(C0, [0.6, 0, 0]);
+    drive(r, 4, () => ({ right: pin(far) }));
+    drive(r, sec(0.4), (i, u) => ({ right: pin(lerp3(far, C0, u)) }));     // keeps pinching, moves onto it
+    eq(r.mode, null); eq(t.count("grabMove"), 0);
+    drive(r, 3, () => ({ right: openH(C0) }));                             // lets go, pinches again on it
+    drive(r, 2, () => ({ right: pin(C0) }));
+    eq(r.mode.kind, "grab");
+  }],
+  ["xr: pinch jitter inside the hysteresis band does not drop the grab", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    drive(r, 2, () => ({ right: pin(C0) }));
+    eq(r.mode.kind, "grab");
+    drive(r, 40, i => ({ right: xh(C0, i % 2 ? 0.028 : 0.012) }));       // wobbles between on and off
+    eq(r.mode.kind, "grab"); eq(t.count("grabEnd"), 0);
+  }],
+  ["xr: a short tracking dropout keeps the grab; a long one drops it", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    drive(r, 2, () => ({ right: pin(C0) }));
+    drive(r, sec(0.1), () => ({}));                                       // 0.1 s with no hand
+    drive(r, 2, () => ({ right: pin(C0) }));
+    eq(t.count("grabEnd"), 0, "kept");
+    drive(r, sec(0.3), () => ({}));
+    eq(t.count("grabEnd"), 1, "dropped");
+  }],
+  ["xr: nothing on screen means nothing to grab", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    t.noSphere = true;
+    drive(r, 5, () => ({ right: pin(C0) }));
+    eq(r.mode, null);
+  }],
+  ["xr: two hands scale with their distance, rotate with their vector, hold the object between them", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    const both = p => ({ left: pin(p.left), right: pin(p.right) });
+    drive(r, 2, () => both(pair(0.09, 0.09)));
+    eq(r.mode.kind, "two");
+    drive(r, sec(2), (i, u) => both(pair(0.09 + 0.09 * u, 0.09 + 0.09 * u)));
+    near(t.s, 2, 0.01, "twice the distance, twice the size");
+    eq(t.count("explode"), 0, "a slow spread is a scale, not an explode");
+    // now turn the pair 90 deg about the vertical axis (right hand toward the user)
+    drive(r, sec(2), (i, u) => {
+      const a = u * Math.PI / 2, w = 0.18;
+      return { left: pin(add3(C0, [-w * Math.cos(a), 0, w * Math.sin(a)])), right: pin(add3(C0, [w * Math.cos(a), 0, -w * Math.sin(a)])) };
+    });
+    vclose(quatRotate(t.q, [1, 0, 0]), [0, 0, -1], 0.02, "the object turned with the hands");
+    near(t.s, 2, 0.01, "turning does not change the size");
+    drive(r, sec(0.3), () => ({}));                                       // both hands gone for good
+    eq(t.count("twoEnd"), 1);
+  }],
+  ["xr: two-hand scale clamps", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    const both = p => ({ left: pin(p.left), right: pin(p.right) });
+    drive(r, 2, () => both(pair(0.09, 0.09)));
+    drive(r, sec(20), (i, u) => both(pair(0.09 + 0.9 * u, 0.09 + 0.9 * u)));
+    eq(t.s, X.SCALE_MAX);
+    drive(r, sec(20), (i, u) => both(pair(0.99 - 0.98 * u, 0.99 - 0.98 * u)));
+    eq(t.s, X.SCALE_MIN);
+  }],
+  ["xr: one hand letting go of a two-hand hold hands the object to the other", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    drive(r, 2, () => ({ left: pin(pair(0.09, 0.09).left), right: pin(pair(0.09, 0.09).right) }));
+    eq(r.mode.kind, "two");
+    drive(r, sec(0.3), () => ({ right: pin(pair(0.09, 0.09).right) }));   // the left hand is gone
+    eq(r.mode && r.mode.kind, "grab", "the other hand keeps holding it");
+    eq(t.count("twoEnd"), 1);
+  }],
+  ["xr: pulling both pinching hands apart FAST explodes (and undoes the scale it looked like)", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    const both = p => ({ left: pin(p.left), right: pin(p.right) });
+    drive(r, 3, () => both(pair(0.07, 0.07)));
+    drive(r, sec(0.3), (i, u) => both(pair(0.07 + 0.3 * u, 0.07 + 0.3 * u)));
+    eq(t.count("explode"), 1); eq(t.exploded, true);
+    eq(t.s, 1, "the fast pull did not leave the size changed");
+    if (!(t.maxS < 1.3)) throw new Error("the yank swelled the model before it exploded (max " + t.maxS + ")");
+    eq(r.mode.kind, "wait");
+    drive(r, sec(0.5), () => both(pair(0.4, 0.4)));
+    eq(t.count("explode"), 1, "holding the pinch does not explode again");
+  }],
+  ["xr: once exploded, a fast pull is just a scale (no second explode)", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    const both = p => ({ left: pin(p.left), right: pin(p.right) });
+    t.exploded = true;
+    drive(r, 3, () => both(pair(0.09, 0.09)));
+    drive(r, sec(0.3), (i, u) => both(pair(0.09 + 0.3 * u, 0.09 + 0.3 * u)));
+    eq(t.count("explode"), 0);
+    if (!(t.s > 2)) throw new Error("expected a bigger object, got " + t.s);
+  }],
+  ["xr: apart detector - slow spreads and short jumps do not fire", () => {
+    const d = new ApartDetector();
+    let fired = false;
+    for (let i = 0; i < 200; i++) if (d.update(i * DT, 0.1 + 0.3 * i * DT)) fired = true;     // 0.3 m/s
+    eq(fired, false, "slow");
+    const d2 = new ApartDetector();
+    for (let i = 0; i < 20; i++) if (d2.update(i * DT, 0.1 + (i > 10 ? 0.04 : 0))) fired = true;
+    eq(fired, false, "4 cm");
+    const d3 = new ApartDetector();
+    for (let i = 0; i < 40 && !fired; i++) fired = d3.update(i * DT, 0.1 + 1.5 * i * DT);      // 1.5 m/s
+    eq(fired, true, "fast");
+  }],
+  ["xr: a clap (palms meet fast) assembles an exploded model, only that", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    const hands = w => ({ left: openH(add3(C0, [-w, 0, 0.2])), right: openH(add3(C0, [w, 0, 0.2])) });
+    t.exploded = true;
+    drive(r, sec(0.5), () => hands(0.3));
+    drive(r, sec(0.2), (i, u) => hands(0.3 - 0.27 * u));
+    eq(t.count("assemble"), 1); eq(t.exploded, false);
+    // not exploded: a clap changes nothing
+    drive(r, sec(1.5), () => hands(0.3));
+    drive(r, sec(0.2), (i, u) => hands(0.3 - 0.27 * u));
+    eq(t.count("assemble"), 1);
+  }],
+  ["xr: bringing the hands together slowly, or while pinching, is not a clap", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    const hands = (w, f) => ({ left: f(add3(C0, [-w, 0, 0.2])), right: f(add3(C0, [w, 0, 0.2])) });
+    t.exploded = true;
+    drive(r, sec(2), (i, u) => hands(0.3 - 0.27 * u, openH));
+    eq(t.count("assemble"), 0, "slow");
+    const t2 = new MockXRTarget(), r2 = new XRGestureRouter(t2);
+    t2.exploded = true;
+    drive(r2, sec(0.5), () => hands(0.6, pin));
+    drive(r2, sec(0.2), (i, u) => hands(0.6 - 0.57 * u, pin));
+    eq(t2.count("assemble"), 0, "pinching hands meeting");
+  }],
+  ["xr: hands that vanish at contact still count as the clap", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    const hands = w => ({ left: openH(add3(C0, [-w, 0, 0.2])), right: openH(add3(C0, [w, 0, 0.2])) });
+    t.exploded = true;
+    drive(r, sec(0.5), () => hands(0.3));
+    drive(r, sec(0.1), (i, u) => hands(0.3 - 0.22 * u));
+    drive(r, 3, () => ({}));                                              // both lost at contact
+    eq(t.count("assemble"), 1);
+  }],
+  ["xr: the clap detector has a cooldown", () => {
+    const c = new ClapDetector();
+    let n = 0;
+    for (let k = 0; k < 2; k++) {
+      for (let i = 0; i <= 14; i++) if (c.update(k * 0.4 + i * DT, 0.5 - 0.46 * i / 14)) n++;
+    }
+    eq(n, 1);
+  }],
+  ["xr: exploded, a pinch picks a part; holding still ~1 s shows its info; moving hides it", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    t.exploded = true;
+    const pc = t.corePos();
+    drive(r, 3, () => ({ right: pin(pc) }));
+    eq(r.mode.kind, "part"); eq(t.pulled.name, "Core");
+    drive(r, sec(0.8), () => ({ right: pin(pc) }));
+    eq(t.infoShown, null, "not yet");
+    drive(r, sec(0.4), () => ({ right: pin(pc) }));
+    eq(t.infoShown, "Core", "after about a second");
+    drive(r, sec(0.2), (i, u) => ({ right: pin(add3(pc, [0.3 * u, 0, 0])) }));       // yank it away
+    eq(t.infoShown, null, "moving hides the card");
+    vclose(t.pullAt, add3(pc, [0.3, 0, 0]), 0.01, "the part followed the hand");
+    drive(r, 3, () => ({ right: openH(pc) }));
+    eq(t.pulled, null); eq(t.count("release"), 1);
+    eq(r.mode, null);
+  }],
+  ["xr: assembling by voice while a part is held lets it go", () => {
+    const t = new MockXRTarget(), r = new XRGestureRouter(t);
+    t.exploded = true;
+    drive(r, 3, () => ({ right: pin(t.corePos()) }));
+    eq(r.mode.kind, "part");
+    t.exploded = false;
+    drive(r, 2, () => ({ right: pin(t.corePos()) }));
+    eq(r.mode, null); eq(t.count("release"), 1);
+  }],
+  ["xr: a poke presses a shelf panel once per touch and re-arms on pulling back", () => {
+    const c = [0, 1.2, -0.5], head = [0, 1.5, 0.3];
+    const basis = panelBasis(c, head), panel = { c, hw: 0.085, hh: 0.025 };
+    vclose(basis.n, [0, 0, 1], 1e-9, "faces the viewer"); vclose(basis.right, [1, 0, 0], 1e-9, "viewer's right");
+    const at = (x, y, z) => add3(c, [x, y, z]);
+    eq(pokeHit(at(0.02, 0.01, 0.005), panel, basis).hit, true);
+    eq(pokeHit(at(0.12, 0, 0.005), panel, basis).hit, false, "beside it");
+    eq(pokeHit(at(0, 0.05, 0.005), panel, basis).hit, false, "above it");
+    eq(pokeHit(at(0, 0, 0.05), panel, basis).hit, false, "5 cm in front: not touching");
+    eq(pokeHit(at(0, 0, -0.06), panel, basis).hit, false, "far behind it");
+    const g = new PokeGate(), fire = p => { const h = pokeHit(p, panel, basis); return g.update(h.hit, h.depth, h.inside); };
+    eq(fire(at(0, 0, 0.005)), true, "contact");
+    eq(fire(at(0, 0, -0.01)), false, "still in: no repeat");
+    eq(fire(at(0, 0, 0.03)), false, "pulled back a little: still disarmed");
+    eq(fire(at(0, 0, 0.08)), false, "fully back: re-armed");
+    eq(fire(at(0, 0, 0.005)), true, "second touch");
+  }],
+  ["xr: the scripted fake hands drive grab, scale, explode, part info and clap end to end", () => {
+    const t = new MockXRTarget(), seen = [];
+    const r = new XRGestureRouter(t, { log: m => seen.push(m) });
+    const f = new FakeXRHands({
+      sphere: () => t.sphere(), exploded: () => t.exploded,
+      partCenter: () => (t.exploded ? t.corePos() : null),
+    });
+    let maxS = 0, wrapped = false;
+    for (let i = 0; i < sec(45) && !wrapped; i++) {
+      const h = f.step(DT);
+      r.update({ left: h.left, right: h.right }, DT);
+      maxS = Math.max(maxS, t.s);
+      if (f.i === 0 && i > 100) wrapped = true;
+    }
+    const order = ["grab right", "two-hand", "explode", "part Core", "info Core", "clap"];
+    let from = 0;
+    for (const want of order) {
+      const k = seen.indexOf(want, from);
+      if (k < 0) throw new Error("never saw '" + want + "' in order; saw " + seen.join(", "));
+      from = k + 1;
+    }
+    if (!(maxS > 1.5)) throw new Error("the two-hand spread should have scaled it (max " + maxS + ")");
+    eq(t.exploded, false, "the clap put it back together");
+    eq(wrapped, true, "the script finished a loop");
   }],
 );
 

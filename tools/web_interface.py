@@ -3550,6 +3550,8 @@ class _Handler(BaseHTTPRequestHandler):
         # its four static files, and the ~300 ms poll the voice actions talk
         # through. The page gets its own CSP (three.js from jsdelivr, the tracker
         # service on loopback :8793) because the dashboard's is 'self'-only.
+        # /holo/xr is the Quest 3 (WebXR) page: same token rules, a CSP without
+        # the tracker socket (core/holo_web.csp_for).
         if path.startswith("/holo/model/"):
             # One of the owner's own models (core/holo_web.model_response: the id
             # is looked up in the configured folders, never turned into a path).
@@ -3571,7 +3573,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "not found"}, code=404)
             return self._send_bytes(
                 asset[0], asset[1],
-                headers=(("Content-Security-Policy", _holo_web.HOLO_CSP),))
+                headers=(("Content-Security-Policy", _holo_web.csp_for(path)),))
 
         if path == "/api/holo/models":
             if not self._authorized(query, is_page=False):

@@ -1578,6 +1578,15 @@ SCHEMA: dict[str, dict] = {
                 "Kinect master switch. 'Open the hologram with the Kinect' "
                 "turns it on for one session.",
     },
+    "HOLO_XR_HINT_HOST": {
+        "tab": "cameras", "label": "LAN name for the Quest hologram page",
+        "type": "str", "default": "",
+        "help": "The hologram runs in a Quest 3's browser at /holo/xr, but "
+                "WebXR needs a secure (https) address. Put the LAN name you "
+                "put a certificate on here and the page and the voice name it. "
+                "Blank = generic instructions. Does not change what the web "
+                "interface listens on.",
+    },
     "KINECT_ENABLED": {
         "tab": "cameras", "label": "Kinect sensor (master switch)",
         "type": "bool", "default": False,
@@ -2484,7 +2493,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                      "CAMERA_DIES_ON_OPEN_RETRY_S", "CAMERA_OPEN_MIN_GAP_S",
                      "TV_DETECT_ENABLED"]),
         ("Hand tracking", ["HAND_TRACKING_ENABLED", "HAND_MENU_ENABLED",
-                           "HAND_TRACK_CAMERA", "HOLO_DEPTH_ENABLED"]),
+                           "HAND_TRACK_CAMERA", "HOLO_DEPTH_ENABLED",
+                           "HOLO_XR_HINT_HOST"]),
         ("Kinect", ["KINECT_ENABLED", "KINECT_AS_CAMERA",
                     "KINECT_PRESENCE_ENABLED", "KINECT_PRESENCE_STANDBY",
                     "KINECT_PRESENCE_WAKE", "KINECT_GREET_ON_ENTRY",

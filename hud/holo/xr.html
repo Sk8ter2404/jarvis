@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS Holo XR</title>
+<style>
+  :root { --cy: #39d7ff; --cy2: #8fefff; --bg: #02070d; --dim: rgba(57,215,255,.55); }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--cy2);
+    font: 16px/1.5 "Segoe UI", system-ui, sans-serif; }
+  body { background: radial-gradient(ellipse at 50% 30%, #07202e 0%, #03101a 55%, #02070d 100%); }
+  canvas#gl { position: fixed; inset: 0; width: 100%; height: 100%; display: none; }
+  body.preview canvas#gl { display: block; }
+  main { position: relative; max-width: 720px; margin: 0 auto; padding: 28px 20px 40px; }
+  body.preview main { max-width: 380px; margin: 0; padding: 14px; background: rgba(2,12,20,.72); }
+  h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: .2em; color: #fff; font-weight: 600; }
+  .sub { margin: 0 0 18px; color: var(--dim); letter-spacing: .06em; font-size: 13px; }
+  .chip { display: inline-block; padding: 2px 10px; margin: 0 6px 6px 0; border: 1px solid var(--dim);
+    font-size: 12px; letter-spacing: .08em; }
+  .chip.ok { color: #7dffb0; border-color: #3fbf7a; }
+  .chip.bad { color: #ffb36b; border-color: #c27b2e; }
+  button#enter { display: none; margin: 14px 0; padding: 14px 34px; border: 2px solid var(--cy);
+    background: rgba(3,18,28,.88); color: #fff; font: 600 18px "Segoe UI", sans-serif; letter-spacing: .12em;
+    cursor: pointer; box-shadow: 0 0 22px rgba(57,215,255,.35); }
+  button#enter:hover { background: rgba(57,215,255,.28); }
+  button#enter[disabled] { opacity: .5; cursor: default; }
+  .box { margin: 14px 0; padding: 12px 16px; border: 1px solid var(--dim); background: rgba(2,12,20,.6); }
+  .box.warn { border-color: #c27b2e; color: #ffd2a1; background: rgba(20,10,2,.7); }
+  .box p { margin: 6px 0; }
+  code { padding: 1px 6px; background: rgba(57,215,255,.12); color: #fff; font: 14px Consolas, monospace; }
+  ul.legend { margin: 8px 0 0; padding-left: 20px; color: var(--dim); font-size: 14px; }
+  ul.legend b { color: var(--cy2); font-weight: 600; }
+  #msg { margin: 10px 0; min-height: 1.5em; color: var(--cy2); letter-spacing: .04em; }
+  #fakebar { display: none; }
+  body.fake #fakebar { display: inline-block; }
+  body.preview .box { display: none; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<main>
+  <h1>JARVIS &nbsp;HOLO &nbsp;XR</h1>
+  <p class="sub">The same hologram in your headset. Your own hands, passthrough, no camera and no PC window.</p>
+  <div>
+    <span class="chip" id="chip-secure">CHECKING</span>
+    <span class="chip" id="chip-xr">XR: CHECKING</span>
+    <span class="chip" id="chip-models" style="display:none">MODELS: ...</span>
+    <span class="chip ok" id="fakebar">FAKE HANDS</span>
+  </div>
+  <button id="enter" type="button">ENTER AR</button>
+  <div id="msg"></div>
+
+  <div class="box warn" id="insecure" style="display:none">
+    <p><b>The headset needs a secure address.</b> WebXR only runs on HTTPS (or on <code>localhost</code>);
+    this page was opened over plain http, so the headset browser has switched it off.</p>
+    <p id="optA"></p>
+    <p id="optB"></p>
+  </div>
+  <div class="box warn" id="noxr" style="display:none"></div>
+
+  <div class="box">
+    <b>Hands</b>
+    <ul class="legend">
+      <li><b>PINCH</b> (thumb tip to index tip) near the hologram: grab it and move it in 3D.</li>
+      <li><b>TWO-HAND PINCH</b>: move your hands apart or together to scale it, turn them to rotate it.</li>
+      <li><b>PULL BOTH PINCHING HANDS APART FAST</b>: it explodes into its named parts.</li>
+      <li>Exploded: <b>PINCH A PART</b> to pull it out; <b>HOLD ABOUT A SECOND</b> for its name and size.</li>
+      <li><b>CLAP</b> (palms meet fast): it assembles again.</li>
+      <li><b>POKE</b> a name on the shelf at its left to swap the model.</li>
+    </ul>
+  </div>
+</main>
+<script>window.JARVIS_TOKEN = __JARVIS_TOKEN__; window.JARVIS_XR_HOST = __JARVIS_XR_HOST__;</script>
+<!-- The model loaders and the WebXR helpers (three/examples/jsm) import "three" by bare
+     name; this maps it to the ONE pinned build xr.js loads, so the page has a single THREE.
+     Must precede every module script. -->
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}
+</script>
+<script type="module" src="/holo/xr.js"></script>
+</body>
+</html>

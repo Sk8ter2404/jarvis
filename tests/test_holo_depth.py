@@ -358,9 +358,12 @@ class PageContractTests(unittest.TestCase):
         self.assertIn("this.depth", fk)
         self.assertIn("fake=1&depth=1", _read("holo.js"))
 
+    # Phase 3 (the Quest page) has its own files and its own contract: tests/test_holo_xr.py.
+    XR_FILES = ("xr.html", "xr.js", "xrgestures.js", "xrfake.js")
+
     def test_every_served_file_is_still_a_listed_page_file(self):
         served = {f for f, _ in holo_web._ASSETS.values()}
-        self.assertEqual(served, set(self.PAGE_FILES))
+        self.assertEqual(served, set(self.PAGE_FILES) | set(self.XR_FILES))
 
 
 class StatusTests(unittest.TestCase):

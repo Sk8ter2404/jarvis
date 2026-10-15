@@ -36,6 +36,7 @@
   "HAND_MENU_ENABLED": false,
   "HAND_TRACK_CAMERA": "primary",
   "HOLO_DEPTH_ENABLED": false,
+  "HOLO_XR_HINT_HOST": "",
   "AUDIO_PROCESSING_ENABLED": true,
   "AUDIO_ECHO_CANCEL": true,
   "AUDIO_NOISE_SUPPRESS": true,

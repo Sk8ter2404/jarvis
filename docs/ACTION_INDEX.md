@@ -27,12 +27,12 @@
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 743 |
+| Total registered actions (incl. aliases) | 744 |
 | — monolith `ACTIONS` dict | 156 |
-| — skill / core registered | 587 |
-| tested | 682 |
+| — skill / core registered | 588 |
+| tested | 683 |
 | **untested** (no test names it) | 61 |
-| spoken note: VERBATIM | 391 |
+| spoken note: VERBATIM | 392 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
 | **no spoken note** (neither) | 273 |
@@ -288,7 +288,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `guest_mode_off` | `bobert_companion.py:34729` | neither | yes | yes |
 | `guest_mode_on` | `bobert_companion.py:34729` | neither | yes | yes |
 | `guest_mode_status` | `bobert_companion.py:34804` | **VERBATIM** | yes | yes |
-| `hand_menu` | `skills/holo_mode.py:304` | **VERBATIM** | — | yes |
+| `hand_menu` | `skills/holo_mode.py:313` | **VERBATIM** | — | yes |
 | `hand_mouse_off` | `skills/hand_tracking.py:698` | **VERBATIM** | — | yes |
 | `hand_mouse_on` | `skills/hand_tracking.py:674` | **VERBATIM** | yes | yes |
 | `hand_mouse_status` | `skills/hand_tracking.py:727` | **VERBATIM** | — | yes |
@@ -313,16 +313,17 @@ One row per action, sorted by name; aliases share their handler's location.
 | `hide_status_ring_v2` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
 | `hide_workshop_hud` | `skills/holographic_overlay/__init__.py:1161` | neither | — | yes |
 | `hide_workshop_print_monitor` | `skills/holographic_overlay/__init__.py:1416` | neither | — | yes |
-| `holo_assemble` | `skills/holo_mode.py:396` | **VERBATIM** | yes | yes |
-| `holo_explode` | `skills/holo_mode.py:382` | **VERBATIM** | yes | yes |
+| `holo_assemble` | `skills/holo_mode.py:405` | **VERBATIM** | yes | yes |
+| `holo_explode` | `skills/holo_mode.py:391` | **VERBATIM** | yes | yes |
 | `holo_hud_v2` | `skills/holographic_overlay/__init__.py:1543` | neither | — | yes |
 | `holo_hud_v2_off` | `skills/holographic_overlay/__init__.py:1538` | neither | — | yes |
 | `holo_hud_v2_on` | `skills/holographic_overlay/__init__.py:1533` | neither | — | yes |
 | `holo_hud_v2_status` | `skills/holographic_overlay/__init__.py:1549` | **VERBATIM** | — | yes |
 | `holo_hud_v2_toggle` | `skills/holographic_overlay/__init__.py:1543` | neither | — | yes |
-| `holo_mode_off` | `skills/holo_mode.py:308` | **VERBATIM** | yes | yes |
-| `holo_mode_on` | `skills/holo_mode.py:272` | **VERBATIM** | yes | yes |
-| `holo_show` | `skills/holo_mode.py:352` | **VERBATIM** | yes | yes |
+| `holo_mode_off` | `skills/holo_mode.py:317` | **VERBATIM** | yes | yes |
+| `holo_mode_on` | `skills/holo_mode.py:281` | **VERBATIM** | yes | yes |
+| `holo_quest` | `skills/holo_mode.py:417` | **VERBATIM** | yes | yes |
+| `holo_show` | `skills/holo_mode.py:361` | **VERBATIM** | yes | yes |
 | `holo_workshop` | `skills/holographic_overlay/__init__.py:493` | neither | — | yes |
 | `holo_workshop_canvas` | `skills/holographic_overlay/__init__.py:493` | neither | — | yes |
 | `holographic_hud_v2` | `skills/holographic_overlay/__init__.py:1543` | neither | — | yes |
@@ -378,7 +379,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `list_emails` | `skills/email_triage.py:1076` | *INFORMATIVE* | — | no |
 | `list_enrolled_faces` | `skills/face_id.py:439` | **VERBATIM** | — | yes |
 | `list_enrolled_voices` | `skills/enroll_voice.py:359` | **VERBATIM** | — | yes |
-| `list_models` | `core/holo_web.py:376` | **VERBATIM** | yes | yes |
+| `list_models` | `core/holo_web.py:430` | **VERBATIM** | yes | yes |
 | `list_notification_rules` | `skills/notification_triage.py:1557` | **VERBATIM** | — | yes |
 | `list_pending_drafts` | `skills/email_triage.py:1221` | **VERBATIM** | — | yes |
 | `list_phone_backends` | `skills/phone_bridge.py:1146` | **VERBATIM** | — | yes |
