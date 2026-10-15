@@ -716,8 +716,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # also loads AIR-MOUSE and AIR CONTROL, which is deliberate (see below).
         "hand mouse", "pinch mouse", "pinch to click",
         # 2026-10-15: Kinect depth for the hologram (hand_tracking_status says
-        # whether it is flowing).
-        "kinect depth", "hologram depth", "the depth working",
+        # whether it is flowing). Not bare "kinect depth": that belongs to the
+        # KINECT DEPTH SENSOR section, and pulling this one in too pushed a
+        # many-topic turn over the prompt budget. Status phrasings only.
+        "hologram depth", "the depth working", "kinect depth on",
+        "kinect depth working", "kinect depth flowing",
     ],
     "SMART HOME — PER-BRAND LIST": [
         "smart device",
