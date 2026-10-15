@@ -1016,7 +1016,7 @@ NOISE_FILTER_ENABLED = True
 # slot) takes 'cuda:1' and the 1650 becomes 'cuda:2'. To keep a model on the
 # 1650 whatever is added, use 'listen' with LISTEN_GPU = its UUID or '1650'.
 WHISPER_DEVICE      = "auto"            # "auto" | "cuda" | "cuda:N" | "cpu" | "listen"
-WHISPER_MODEL_CUDA  = "large-v3-turbo"  # ~3.1 GB VRAM, 8x faster than large-v3
+WHISPER_MODEL_CUDA  = "large-v3-turbo"  # ~1.5 GB VRAM (the ~3.1 GB figure is the non-turbo large-v3), 8x faster
 WHISPER_MODEL_CPU   = "small"           # CPU-friendly default when no GPU
 
 # Speed plan R11 - decode knobs for the owner's turns (faster-whisper path).
