@@ -79,3 +79,26 @@ def _replace_with_retry(src: str, dst: str) -> None:
             time.sleep(delay)
     # Final attempt — let any exception propagate so callers can log it.
     os.replace(src, dst)
+
+
+def _atomic_write_json_plain(path: str, payload: Any, *, ensure_ascii: bool = True) -> None:
+    """Minimal atomic JSON write (indent=2): mkstemp sibling + os.replace.
+
+    Canonical home of the four verbatim copies that skills/apple_music_intel,
+    pattern_learning, briefing_sources and ms_graph used to carry. Unlike
+    `_atomic_write_json` it does NOT fsync, retry the replace, or absolutise
+    the path - kept byte-for-byte so those callers behave exactly as before.
+    Raises on failure after removing the tempfile.
+    """
+    dir_ = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=ensure_ascii)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise

@@ -159,20 +159,12 @@ def _ensure_data_dir() -> None:
         pass
 
 
+from core.atomic_io import _atomic_write_json_plain  # noqa: E402
+
+
 def _atomic_write_json(path: str, payload) -> None:
     _ensure_data_dir()
-    dir_ = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
-        raise
+    _atomic_write_json_plain(path, payload, ensure_ascii=False)
 
 
 def _append_jsonl(path: str, entry: dict) -> None:

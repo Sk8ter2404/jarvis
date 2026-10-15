@@ -32,7 +32,6 @@ import importlib
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -74,17 +73,7 @@ def _config(name: str, default):
     return getattr(bc, name, default)
 
 
-def _atomic_write_json(path: str, payload: dict) -> None:
-    dir_ = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        try: os.unlink(tmp)
-        except Exception: pass
-        raise
+from core.atomic_io import _atomic_write_json_plain as _atomic_write_json  # noqa: E402
 
 
 # ─── token encryption at rest (Windows DPAPI) ────────────────────────────
