@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.203 (2026-10-15)
+
+Hologram phase 2, off by default: 'open the hologram with the Kinect' uses the Kinect's colour camera for hand tracking and its depth sensor so the hologram hides behind your real hands when they are in front of it, and a fist pushed toward or pulled away from the sensor moves it nearer or farther. It reads the Kinect only through JARVIS's existing connection. A new test fails if any module ever defines the same function twice (a scan found no stale duplicates today).
+
 ## v2.0.202 (2026-10-15)
 
 Fixes from the self-upgrade queue review: the local brain adopts a better model once it finishes downloading (checked at most every 5 minutes, between turns); turning the workshop hologram off hides it so 'on' brings it back; web pages opened by 'open', 'search' and 'YouTube' land on a monitor instead of off-screen; a stale memory note corrected. Three queued items were already fixed and one was not a bug.
