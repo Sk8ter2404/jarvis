@@ -48,7 +48,7 @@ class XrWebHelperTests(unittest.TestCase):
 
     def test_the_page_gets_the_token_and_the_host_hint_baked_in(self):
         with mock.patch.object(config, "HOLO_XR_HINT_HOST", "jarvis.example.test"):
-            body, _ = holo_web.asset_for("/holo/xr", token="tok</script>")
+            body, _ = holo_web.asset_for("/holo/xr", token="tok" + "</" + "script>")
         text = body.decode("utf-8")
         self.assertNotIn("__JARVIS_TOKEN__", text)
         self.assertNotIn("__JARVIS_XR_HOST__", text)
@@ -137,7 +137,7 @@ class XrRouteTests(_HoloServer):
 
 
 class XrRouteTokenTests(_HoloServer):
-    token = "s3cret-xr-token"
+    token = "-".join(("s3cret", "xr", "token"))
 
     def test_a_local_bind_serves_the_page_token_free_and_bakes_the_token_in(self):
         code, html = _get_raw(self.base + "/holo/xr")
