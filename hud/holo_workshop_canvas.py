@@ -223,6 +223,19 @@ class WorkshopCanvas:
         except Exception:
             pass
 
+    def _set_visible(self, show: bool) -> None:
+        """Show/hide the window without destroying it. Only touches Tk on a
+        real change (the poll runs every tick)."""
+        try:
+            hidden = self.root.state() == "withdrawn"
+            if show and hidden:
+                self.root.deiconify()
+                self.root.attributes("-topmost", True)
+            elif not show and not hidden:
+                self.root.withdraw()
+        except Exception:
+            pass
+
     # ─── helpers ────────────────────────────────────────────────────────
     def _bbox(self, r):
         return (self.cx - r, self.cy - r, self.cx + r, self.cy + r)
@@ -326,10 +339,13 @@ class WorkshopCanvas:
         force_visible = bool(workshop.get("force_visible", False))
 
         if mode == "off" and not force_visible:
-            # The skill asked us to hide. Tkinter doesn't have a great
-            # 'invisible but still polling' state, so we just shutdown.
-            self._on_close()
+            # The skill asked us to hide. WITHDRAW the window and keep the
+            # poll loop alive: destroying it made "off" one-way (a later
+            # {"mode": "on"} had no canvas left to re-show, B7). The skill's
+            # own off still terminates the process; this is the file-only path.
+            self._set_visible(False)
             return
+        self._set_visible(True)
 
         jarvis_state = (state.get("state") or "Idle").lower()
         # Guard the float parses so a non-numeric value can't escape this
