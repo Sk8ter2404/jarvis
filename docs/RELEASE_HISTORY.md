@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.200 (2026-10-15)
+
+Hand mouse (air mouse v2) on the new hand tracker, off by default: a deliberate pinch held still takes the cursor, a quick pinch clicks, a second held pinch drags, an open palm or the hand leaving lets go, and it never engages in games, fullscreen apps or calls. Every brain call now says who is calling and whether it is a live answer or background work (a test fails on any untagged call). The wake-word listener follows the current microphone when the default input changes. Old session logs are compressed into an archive instead of deleted. The every-action sweep counts its own sandbox blocks separately from real crashes. Fixes a Linux-only test failure from v2.0.199.
+
 ## v2.0.199 (2026-10-15)
 
 A hard stop before irreversible clicks: when screen control is about to click a button that sends, submits, posts, publishes, pays, buys, transfers, deletes or accepts terms - or press Enter in a message box that would send - it asks first and acts only on an explicit yes for that one action. The hologram can show your own 3D models (STL, 3MF, OBJ from chosen folders): a 3MF's objects become named parts that explode and show their size, and "show me the <model>" picks one by name. Model files are served only by id from the configured folders.
