@@ -29,6 +29,7 @@ import math
 import os
 import queue
 import sys
+import time
 import types
 import unittest
 from unittest import mock
@@ -965,6 +966,222 @@ class DeviceProviderTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertFalse(d._open_stream())
         self.assertEqual(attempts, [9])
+
+
+# ──────────────────────────────────────────────────────────────────────
+# the follower - a live stream moves when the current mic moves (2026-10-15)
+# ──────────────────────────────────────────────────────────────────────
+class FollowCurrentMicTests(unittest.TestCase):
+    """The provider was asked only at OPEN. When the Windows default input
+    moved without a PortAudio teardown the live wake stream stayed on the old
+    mic. The follower re-asks the provider and swaps the stream, off the
+    audio callback thread. Fakes only: no real device is ever opened."""
+
+    def setUp(self):
+        FakeInputStream.instances.clear()
+        self.current = {"mic": 3}
+
+    def _live(self, provider=None, device=None, **kw):
+        d = ww.WakeWordDetector(
+            engine="openwakeword", device=device,
+            device_provider=provider or (lambda: self.current["mic"]),
+            follow_interval_s=0, **kw)
+        self.assertTrue(d._open_stream())
+        d._running = True
+        return d
+
+    def _tick(self, d, sd):
+        with inject_modules(sounddevice=sd), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            moved = d._follow_tick()
+        return moved, out.getvalue()
+
+    def test_default_input_change_reopens_once_on_the_new_device(self):
+        sd = make_fake_sd()
+        with inject_modules(sounddevice=sd):
+            d = self._live()
+        first = FakeInputStream.instances[0]
+        self.current["mic"] = 8
+        moved, out = self._tick(d, sd)
+        self.assertTrue(moved)
+        self.assertEqual([s.device for s in FakeInputStream.instances], [3, 8])
+        self.assertTrue(first.stopped)
+        self.assertIs(d._stream, FakeInputStream.instances[1])
+        self.assertEqual(d.device, 8)
+        self.assertIn("[wake] input changed: 3 -> 8", out)
+        # nothing moved since: no second re-open, no second line
+        moved, out = self._tick(d, sd)
+        self.assertFalse(moved)
+        self.assertEqual(len(FakeInputStream.instances), 2)
+        self.assertNotIn("input changed", out)
+
+    def test_explicit_pinned_device_is_kept(self):
+        sd = make_fake_sd()
+        with inject_modules(sounddevice=sd):
+            d = self._live(provider=lambda: 5, device=5)
+        for _ in range(3):
+            moved, _out = self._tick(d, sd)
+            self.assertFalse(moved)
+        self.assertEqual([s.device for s in FakeInputStream.instances], [5])
+
+    def test_default_that_portaudio_already_resolved_is_not_a_change(self):
+        # Opened on device=None; PortAudio resolved it to index 3, which is
+        # also what the provider now names: same mic, no re-open.
+        sd = make_fake_sd()
+        self.current["mic"] = None
+        with inject_modules(sounddevice=sd):
+            d = self._live()
+        FakeInputStream.instances[0].device = 3
+        self.current["mic"] = 3
+        moved, _out = self._tick(d, sd)
+        self.assertFalse(moved)
+        self.assertEqual(len(FakeInputStream.instances), 1)
+
+    def test_never_reopens_mid_utterance(self):
+        sd = make_fake_sd()
+        with inject_modules(sounddevice=sd):
+            d = self._live()
+        self.current["mic"] = 8
+        # (a) a wake just fired: the command is being captured
+        d._last_fire_ts = time.time()
+        self.assertFalse(self._tick(d, sd)[0])
+        d._last_fire_ts = 0.0
+        # (b) a foreground capture is reading the stream through a tap
+        cap = queue.Queue()
+        d.add_tap(cap)
+        self.assertFalse(self._tick(d, sd)[0])
+        self.assertEqual(len(FakeInputStream.instances), 1)
+        # a background listener (voice-ID buffer) does not block the follow
+        d.remove_tap(cap)
+        bg = queue.Queue()
+        d.add_tap(bg)
+        d.mark_tap_passive(bg)
+        self.assertTrue(self._tick(d, sd)[0])
+        self.assertEqual([s.device for s in FakeInputStream.instances], [3, 8])
+
+    def test_utterance_starting_while_the_new_stream_opens_cancels_the_swap(self):
+        holder = {}
+
+        class _Slow(FakeInputStream):
+            def start(self):
+                super().start()
+                if self.device == 8:
+                    holder["d"]._last_fire_ts = time.time()   # wake fires now
+
+        sd = make_fake_sd(stream_cls=_Slow)
+        with inject_modules(sounddevice=sd):
+            d = self._live()
+        holder["d"] = d
+        old = d._stream
+        self.current["mic"] = 8
+        self.assertFalse(self._tick(d, sd)[0])
+        self.assertIs(d._stream, old)
+        self.assertEqual(d.device, 3)
+        self.assertFalse(old.stopped)
+        self.assertTrue(FakeInputStream.instances[-1].stopped)
+
+    def test_failing_open_keeps_the_old_stream_and_retries_later(self):
+        attempts: list = []
+
+        class _Picky(FakeInputStream):
+            allow = False
+
+            def __init__(self, **kw):
+                attempts.append(kw["device"])
+                if kw["device"] == 8 and not _Picky.allow:
+                    raise RuntimeError("Error querying device 8")
+                super().__init__(**kw)
+
+        sd = make_fake_sd(stream_cls=_Picky)
+        with inject_modules(sounddevice=sd):
+            d = self._live()
+        old = d._stream
+        self.current["mic"] = 8
+        moved, out = self._tick(d, sd)
+        self.assertFalse(moved)
+        self.assertIs(d._stream, old)
+        self.assertFalse(old.stopped)
+        self.assertEqual(d.device, 3)
+        self.assertIn("would not open", out)
+        self.assertIn("keeping 3", out)
+        # inside the retry window: not hammered
+        self.assertFalse(self._tick(d, sd)[0])
+        self.assertEqual(attempts, [3, 8])
+        # later: the device opens now, and the swap happens
+        _Picky.allow = True
+        d._follow_fail = (8, time.monotonic() - ww.FOLLOW_RETRY_SECS - 1)
+        self.assertTrue(self._tick(d, sd)[0])
+        self.assertEqual(d.device, 8)
+        self.assertTrue(old.stopped)
+
+    def test_no_exception_escapes(self):
+        sd = make_fake_sd()
+        with inject_modules(sounddevice=sd):
+            d = self._live()
+
+        def _boom():
+            raise RuntimeError("enumeration died")
+        d.device_provider = _boom
+        self.assertFalse(self._tick(d, sd)[0])
+        self.assertIs(d._stream, FakeInputStream.instances[0])
+        # a stream whose stop() blows up cannot raise into the loop either
+        self.current["mic"] = 8
+        d.device_provider = lambda: self.current["mic"]
+        d._stream.stop = mock.Mock(side_effect=RuntimeError("stop died"))
+        self.assertTrue(self._tick(d, sd)[0])
+        # and an unexpected failure inside the pass is contained
+        with mock.patch.object(d, "_follow_tick_inner",
+                               side_effect=ValueError("x")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(d._follow_tick())
+        self.assertIn("input follow failed", out.getvalue())
+
+    def test_paused_stopped_or_lock_held_does_nothing(self):
+        sd = make_fake_sd()
+        with inject_modules(sounddevice=sd):
+            d = self._live()
+        self.current["mic"] = 8
+        d._paused = True
+        self.assertFalse(self._tick(d, sd)[0])
+        d._paused = False
+        d._stop_flag.set()
+        self.assertFalse(self._tick(d, sd)[0])
+        d._stop_flag.clear()
+        with d._pause_lock:          # the host's device refresh is mid-pause
+            self.assertFalse(self._tick(d, sd)[0])
+        self.assertEqual(len(FakeInputStream.instances), 1)
+
+    def test_old_stream_frames_are_dropped_after_a_swap(self):
+        sd = make_fake_sd()
+        with inject_modules(sounddevice=sd):
+            d = self._live()
+        old = d._stream
+        self.current["mic"] = 8
+        self.assertTrue(self._tick(d, sd)[0])
+        seen = queue.Queue()
+        d.add_tap(seen)
+        old.feed(np.ones(160, dtype=np.float32))        # late old callback
+        self.assertTrue(seen.empty())
+        FakeInputStream.instances[1].feed(np.ones(160, dtype=np.float32))
+        self.assertFalse(seen.empty())
+
+    def test_follower_thread_runs_only_with_a_provider_and_ends_on_stop(self):
+        sd = make_fake_sd()
+        with inject_modules(sounddevice=sd), \
+                mock.patch.object(ww.WakeWordDetector, "_init_openwakeword"):
+            plain = ww.WakeWordDetector(engine="openwakeword")
+            self.assertTrue(plain.start())
+            self.assertIsNone(plain._follower)
+            plain.stop()
+            d = ww.WakeWordDetector(engine="openwakeword",
+                                    device_provider=lambda: 3,
+                                    follow_interval_s=0.01)
+            self.assertTrue(d.start())
+            t = d._follower
+            self.assertTrue(t is not None and t.is_alive())
+            d.stop()
+            t.join(timeout=2.0)
+            self.assertFalse(t.is_alive())
 
 
 # ──────────────────────────────────────────────────────────────────────

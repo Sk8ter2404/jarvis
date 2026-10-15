@@ -202,6 +202,11 @@ def _start_voice_tap(det) -> None:
     _voice_buffer_stop = threading.Event()
     try:
         det.add_tap(_voice_audio_tap)
+        # A background listener, not a capture: it must not hold off the
+        # detector following a mic change (core.wake_word follower).
+        _mark = getattr(det, "mark_tap_passive", None)
+        if callable(_mark):
+            _mark(_voice_audio_tap)
     except Exception as e:
         print(f"  [wake-listener] add_tap failed: {e}")
         _voice_audio_tap = None
