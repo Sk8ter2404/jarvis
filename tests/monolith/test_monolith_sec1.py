@@ -3136,6 +3136,64 @@ class CleanupOldLogsEdgeTests(_MonolithTestBase):
             self.bc._cleanup_old_logs()  # must not raise
 
 
+class CleanupOldLogsArchiveTests(_MonolithTestBase):
+    """2026-10-15: logs past LOG_KEEP_COUNT are gzipped into
+    logs/session_archive/ (content and mtime kept), never just deleted; only
+    the archive's OLDEST files go once it passes LOG_ARCHIVE_MAX_BYTES."""
+
+    def _make(self, d, n):
+        paths = []
+        for i in range(n):
+            p = os.path.join(d, f"session_{i}.log")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(f"line {i}\n" * 50)
+            os.utime(p, (1000 + i, 1000 + i))
+            paths.append(p)
+        return paths
+
+    def test_old_logs_are_archived_with_content_and_mtime(self):
+        import gzip
+        d = tempfile.mkdtemp()
+        keep = self.bc.LOG_KEEP_COUNT
+        paths = self._make(d, keep + 2)
+        with mock.patch.object(self.bc, "LOGS_DIR", d):
+            self.bc._cleanup_old_logs()
+        arch = os.path.join(d, self.bc.LOG_ARCHIVE_DIRNAME)
+        for i in (0, 1):
+            gz = os.path.join(arch, f"session_{i}.log.gz")
+            self.assertTrue(os.path.isfile(gz))
+            self.assertFalse(os.path.exists(paths[i]))
+            with gzip.open(gz, "rt", encoding="utf-8") as f:
+                self.assertEqual(f.read(), f"line {i}\n" * 50)
+            self.assertAlmostEqual(os.path.getmtime(gz), 1000 + i, delta=2)
+        self.assertTrue(os.path.exists(paths[2]))
+        self.assertFalse(any(f.endswith(".part") for f in os.listdir(arch)))
+
+    def test_a_failed_archive_keeps_the_original(self):
+        d = tempfile.mkdtemp()
+        keep = self.bc.LOG_KEEP_COUNT
+        paths = self._make(d, keep + 1)
+        with mock.patch.object(self.bc, "LOGS_DIR", d), \
+             mock.patch.object(self.bc, "_archive_log", return_value=False):
+            self.bc._cleanup_old_logs()
+        self.assertTrue(os.path.exists(paths[0]))
+
+    def test_archive_over_the_cap_drops_its_oldest_files(self):
+        d = tempfile.mkdtemp()
+        arch = os.path.join(d, self.bc.LOG_ARCHIVE_DIRNAME)
+        os.makedirs(arch)
+        for i in range(4):
+            p = os.path.join(arch, f"session_{i}.log.gz")
+            with open(p, "wb") as f:
+                f.write(b"x" * 100)
+            os.utime(p, (2000 + i, 2000 + i))
+        with mock.patch.object(self.bc, "LOGS_DIR", d), \
+             mock.patch.object(self.bc, "LOG_ARCHIVE_MAX_BYTES", 250):
+            self.bc._trim_log_archive()
+        left = sorted(os.listdir(arch))
+        self.assertEqual(left, ["session_2.log.gz", "session_3.log.gz"])
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  setup_logging — installed excepthook body + faulthandler failure arm
 # ──────────────────────────────────────────────────────────────────────────

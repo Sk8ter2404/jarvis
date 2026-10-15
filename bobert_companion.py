@@ -1392,7 +1392,15 @@ MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bobert_m
 # later debugging. Console output is unchanged.
 LOGGING_ENABLED   = True
 LOGS_DIR          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-LOG_KEEP_COUNT    = 50    # delete oldest beyond this
+LOG_KEEP_COUNT    = 50    # newest kept as plain .log; older ones are ARCHIVED
+# 2026-10-15: older logs used to be DELETED beyond LOG_KEEP_COUNT, which left
+# no history to measure anything against (a latency before/after check found
+# nothing older than ~12 days) and broke the owner's "clean up = tidy, never
+# delete" rule. They are now gzipped into logs/session_archive/ (a session log
+# shrinks ~10x), keeping years of boots; only past LOG_ARCHIVE_MAX_BYTES are
+# the OLDEST archives removed.
+LOG_ARCHIVE_DIRNAME   = "session_archive"
+LOG_ARCHIVE_MAX_BYTES = 2 * 1024 ** 3
 
 # ──────────────────────────────────────────────────────────────────────────
 #  BLUE / GREEN deployment — staging mode isolation
@@ -4595,9 +4603,61 @@ def _cleanup_old_logs():
             (os.path.join(LOGS_DIR, f) for f in os.listdir(LOGS_DIR) if f.endswith(".log")),
             key=os.path.getmtime,
         )
+        archived = False
         for old in logs[:-LOG_KEEP_COUNT]:
-            try: os.unlink(old)
-            except Exception: pass
+            try:
+                if _archive_log(old):
+                    os.unlink(old)          # only once the .gz copy is complete
+                    archived = True
+            except Exception:
+                pass
+        if archived:
+            _trim_log_archive()
+    except Exception:
+        pass
+
+
+def _archive_log(path: str) -> bool:
+    """gzip ``path`` into LOGS_DIR/LOG_ARCHIVE_DIRNAME/<name>.gz, keeping its
+    mtime. True only when the compressed copy was written in full (the
+    caller then removes the plain file); never raises."""
+    import gzip
+    import shutil
+    try:
+        arch = os.path.join(LOGS_DIR, LOG_ARCHIVE_DIRNAME)
+        os.makedirs(arch, exist_ok=True)
+        dest = os.path.join(arch, os.path.basename(path) + ".gz")
+        tmp = dest + ".part"
+        st = os.stat(path)
+        with open(path, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as gz:
+            shutil.copyfileobj(src, gz)
+        if os.path.getsize(tmp) <= 0 and st.st_size > 0:
+            os.unlink(tmp)
+            return False
+        os.replace(tmp, dest)
+        os.utime(dest, (st.st_atime, st.st_mtime))
+        return True
+    except Exception:
+        return False
+
+
+def _trim_log_archive() -> None:
+    """Keep the archive under LOG_ARCHIVE_MAX_BYTES by removing its OLDEST
+    files. Never raises."""
+    try:
+        arch = os.path.join(LOGS_DIR, LOG_ARCHIVE_DIRNAME)
+        files = sorted((os.path.join(arch, f) for f in os.listdir(arch)
+                        if f.endswith(".gz")), key=os.path.getmtime)
+        total = sum(os.path.getsize(f) for f in files)
+        for f in files:
+            if total <= LOG_ARCHIVE_MAX_BYTES:
+                break
+            try:
+                size = os.path.getsize(f)
+                os.unlink(f)
+                total -= size
+            except Exception:
+                pass
     except Exception:
         pass
 
