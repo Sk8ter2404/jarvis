@@ -93,16 +93,7 @@ _state_lock = threading.Lock()
 
 # ─── config ──────────────────────────────────────────────────────────────
 
-def _clamp(v, lo, hi):
-    try:
-        v = type(lo)(v)
-    except Exception:
-        return lo
-    if v < lo:
-        return lo
-    if v > hi:
-        return hi
-    return v
+from core.text_fmt import _clamp  # noqa: E402
 
 
 def _read_config() -> dict:

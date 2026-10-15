@@ -61,10 +61,7 @@ _JOKE_REQUEST_RE = re.compile(
     r"|^(?:a\s+|another\s+)?jokes?(?:\s+please)?[.!?]*$")
 
 
-def _norm(text: str) -> str:
-    t = re.sub(r"\[[^\]]*\]", " ", str(text or ""))
-    t = t.replace("’", "'").replace("‘", "'")
-    return re.sub(r"\s+", " ", t).strip().lower()
+from core.advice_fallback import _norm  # noqa: E402
 
 
 def is_joke_request(user_text: str) -> bool:

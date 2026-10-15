@@ -91,16 +91,7 @@ _state_lock  = threading.Lock()
 
 # ─── config ──────────────────────────────────────────────────────────────
 
-def _clamp(v, lo, hi):
-    try:
-        v = type(lo)(v)
-    except Exception:
-        return lo
-    if v < lo:
-        return lo
-    if v > hi:
-        return hi
-    return v
+from core.text_fmt import _clamp  # noqa: E402
 
 
 def _read_config() -> dict:
@@ -324,16 +315,7 @@ def _select_predictions(snapshot: dict, cfg: dict) -> list[dict]:
 
 # ─── composing the spoken line ───────────────────────────────────────────
 
-def _titlecase(s: str) -> str:
-    small = {"and", "or", "of", "the", "in", "on", "for", "to", "a", "an"}
-    parts = (s or "").split()
-    out = []
-    for i, w in enumerate(parts):
-        if i > 0 and w in small:
-            out.append(w)
-        else:
-            out.append(w[:1].upper() + w[1:])
-    return " ".join(out)
+from core.text_fmt import _titlecase  # noqa: E402
 
 
 def _compose_briefing_line(p: dict) -> str:

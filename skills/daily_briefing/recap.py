@@ -515,16 +515,7 @@ def _format_duration_minutes(minutes: int) -> str:
     return f"{h} hour{'s' if h != 1 else ''} {m} minute{'s' if m != 1 else ''}"
 
 
-def _titlecase(s: str) -> str:
-    small = {"and", "or", "of", "the", "in", "on", "for", "to", "a", "an"}
-    parts = (s or "").split()
-    out = []
-    for i, w in enumerate(parts):
-        if i > 0 and w in small:
-            out.append(w)
-        else:
-            out.append(w[:1].upper() + w[1:])
-    return " ".join(out)
+from core.text_fmt import _titlecase  # noqa: E402
 
 
 def _count_tasks_completed_today() -> int:

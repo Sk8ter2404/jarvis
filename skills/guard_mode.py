@@ -762,15 +762,7 @@ def _available_camera_count() -> int:
         return 0
 
 
-def _format_seconds(s: float) -> str:
-    s = int(round(s))
-    if s < 60:
-        return f"{s} second{'s' if s != 1 else ''}"
-    m, sec = divmod(s, 60)
-    if m < 60:
-        return f"{m} minute{'s' if m != 1 else ''}"
-    h, m = divmod(m, 60)
-    return f"{h} hour{'s' if h != 1 else ''} {m} minute{'s' if m != 1 else ''}"
+from core.text_fmt import _format_seconds  # noqa: E402
 
 
 # ─── registration ────────────────────────────────────────────────────────
