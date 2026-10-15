@@ -232,20 +232,7 @@ def _save_state(state: dict) -> None:
 
 # ─── environment inspection ──────────────────────────────────────────────
 
-def _all_window_titles() -> list[str]:
-    try:
-        import pygetwindow as gw   # type: ignore
-    except Exception:
-        return []
-    out: list[str] = []
-    try:
-        for w in gw.getAllWindows():
-            t = getattr(w, "title", "") or ""
-            if t.strip():
-                out.append(t)
-    except Exception:
-        pass
-    return out
+from core.win_env import _all_window_titles  # noqa: E402
 
 
 def _focused_window_title() -> str:
@@ -272,18 +259,7 @@ def _is_in_call() -> bool:
     return False
 
 
-def _is_sleep_or_standby() -> bool:
-    bc = sys.modules.get("bobert_companion")
-    if bc is None:
-        return False
-    try:
-        if getattr(bc, "_sleep_mode")[0]:
-            return True
-        if getattr(bc, "_standby_mode")[0]:
-            return True
-    except Exception:
-        return False
-    return False
+from core.win_env import _is_sleep_or_standby  # noqa: E402
 
 
 def _user_at_desk() -> bool | None:
