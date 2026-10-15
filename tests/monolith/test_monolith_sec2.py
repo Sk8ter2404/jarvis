@@ -1151,6 +1151,8 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
 
     def setUp(self):
         bc = self.bc
+        self._preview_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._preview_tmp.cleanup)
         # -- hardware firewall ------------------------------------------------
         # Started here rather than as per-test `with` blocks so EVERY test in
         # the class is covered, including any added later; addCleanup unwinds
@@ -1164,6 +1166,16 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
                 # Resolving to the same static index keeps the opener quiet.
                 mock.patch.object(bc, "_dshow_name_to_index",
                                   side_effect=lambda _name: self.CAM["index"]),
+                # Per-camera preview tiles go to a temp folder: run alone while
+                # a live JARVIS had written data/.hud_camera_preview_right.jpg,
+                # the loop's camera-off cleanup tried to delete the LIVE file
+                # and the live-data guard failed 3 tests (2026-10-15). Run ALONE
+                # beside a live JARVIS, 3 tests still find no good frame (they
+                # pass in the full suite) - an open order dependency, not this.
+                mock.patch.object(bc, "_hud_percam_preview_file",
+                                  lambda key: os.path.join(
+                                      self._preview_tmp.name,
+                                      f".hud_camera_preview_{key}.jpg")),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
