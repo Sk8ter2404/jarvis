@@ -84,6 +84,12 @@ _SKIP_DIRS = frozenset({
     "camera_previews", "memory", "tts", "Robot Project", ".claude",
 })
 
+# Exception classes raised by tools/hermetic_guard when it REFUSES a real-world
+# reach; matched by name so the sweep never imports the guard module itself.
+_SANDBOX_GUARD_ERRORS = frozenset({
+    "InputGuardError", "ScreenGuardError", "ProbeGuardError", "NetworkGuardError",
+})
+
 # Handlers that must NOT be invoked from a sweep: process control, state
 # wipes, spawning long-lived subprocesses/threads that outlive the harness,
 # or blocking interactive flows. Names, not handlers — aliases resolve to the
@@ -435,7 +441,7 @@ def _child(argv: list) -> int:
                 if name in _DENYLIST_NAMES}
 
     results = {"ok": [], "honest_fail": [], "empty": [], "crash": [],
-               "skipped": []}
+               "skipped": [], "sandbox_blocked": []}
     t_start = time.time()
     for name in sorted(actions):
         fn = actions[name]
@@ -459,7 +465,14 @@ def _child(argv: list) -> int:
             if dt > 20:
                 print(f"  SLOW {name}: {dt:.0f}s", flush=True)
         except Exception as e:
-            results["crash"].append(f"{name}: {type(e).__name__}: {e}")
+            # The sandbox's OWN guards (tools/hermetic_guard: real keyboard /
+            # mouse, screen, probes, network) refusing a reach is the sandbox
+            # working, not a handler bug: 2026-10-15 the media / volume keys
+            # were 7 of 7 "crashes". Kept apart so a real crash stands out.
+            if type(e).__name__ in _SANDBOX_GUARD_ERRORS:
+                results["sandbox_blocked"].append(f"{name}: {type(e).__name__}")
+            else:
+                results["crash"].append(f"{name}: {type(e).__name__}: {e}")
 
     escapes = _real_tree_escapes(real_root)
     results["blocked_real_tree_writes"] = [
@@ -472,6 +485,8 @@ def _child(argv: list) -> int:
           f"(hardware/creds absent on harness — returned an error STRING)")
     print(f"  empty:        {len(results['empty'])}")
     print(f"  skipped:      {len(results['skipped'])} (destructive/denylist)")
+    print(f"  sandbox-blocked: {len(results['sandbox_blocked'])} "
+          f"(a hermetic guard refused a real keyboard/screen/probe/network reach)")
     print(f"  CRASH:        {len(results['crash'])}")
     print(f"  real-tree writes blocked: {len(escapes)}")
     for c in results["crash"]:
