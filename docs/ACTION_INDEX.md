@@ -27,12 +27,12 @@
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 742 |
+| Total registered actions (incl. aliases) | 743 |
 | — monolith `ACTIONS` dict | 156 |
-| — skill / core registered | 586 |
-| tested | 681 |
+| — skill / core registered | 587 |
+| tested | 682 |
 | **untested** (no test names it) | 61 |
-| spoken note: VERBATIM | 390 |
+| spoken note: VERBATIM | 391 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
 | **no spoken note** (neither) | 273 |
@@ -55,11 +55,11 @@ One row per action, sorted by name; aliases share their handler's location.
 | `air_control_off` | `skills/air_control.py:405` | **VERBATIM** | yes | yes |
 | `air_control_on` | `skills/air_control.py:385` | **VERBATIM** | yes | yes |
 | `air_control_status` | `skills/air_control.py:414` | **VERBATIM** | yes | yes |
-| `air_mouse_arm` | `skills/kinect_air_mouse.py:3998` | **VERBATIM** | yes | yes |
-| `air_mouse_disarm` | `skills/kinect_air_mouse.py:4024` | **VERBATIM** | yes | yes |
-| `air_mouse_off` | `skills/kinect_air_mouse.py:3957` | **VERBATIM** | — | yes |
-| `air_mouse_on` | `skills/kinect_air_mouse.py:3937` | **VERBATIM** | — | yes |
-| `air_mouse_status` | `skills/kinect_air_mouse.py:3977` | **VERBATIM** | — | yes |
+| `air_mouse_arm` | `skills/kinect_air_mouse.py:4040` | **VERBATIM** | yes | yes |
+| `air_mouse_disarm` | `skills/kinect_air_mouse.py:4069` | **VERBATIM** | yes | yes |
+| `air_mouse_off` | `skills/kinect_air_mouse.py:3993` | **VERBATIM** | — | yes |
+| `air_mouse_on` | `skills/kinect_air_mouse.py:3970` | **VERBATIM** | — | yes |
+| `air_mouse_status` | `skills/kinect_air_mouse.py:4016` | **VERBATIM** | — | yes |
 | `amazon_orders` | `skills/amazon_order_tracker.py:979` | *INFORMATIVE* | — | yes |
 | `amazon_tracking_status` | `skills/amazon_order_tracker.py:1041` | **VERBATIM** | — | yes |
 | `ambient_audio_start` | `skills/ambient_listen.py:1932` | neither | — | yes |
@@ -139,7 +139,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `build_website` | `skills/site_builder.py:389` | **VERBATIM** | yes | yes |
 | `calendar_next` | `skills/ms_graph.py:796` | **VERBATIM** | — | yes |
 | `calendar_today` | `skills/ms_graph.py:796` | **VERBATIM** | yes | yes |
-| `calibrate_air_mouse` | `skills/kinect_air_mouse.py:4047` | **VERBATIM** | — | yes |
+| `calibrate_air_mouse` | `skills/kinect_air_mouse.py:4095` | **VERBATIM** | — | yes |
 | `calibrate_gaze` | `skills/face_tracker.py:1518` | **VERBATIM** | — | no |
 | `calibrate_pointing` | `skills/kinect_pointing.py:376` | **VERBATIM** | — | no |
 | `calibrate_tv_region` | `skills/tv_detect.py:427` | **VERBATIM** | — | yes |
@@ -272,7 +272,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `gestures_off` | `skills/kinect_gestures.py:989` | **VERBATIM** | — | yes |
 | `gestures_on` | `skills/kinect_gestures.py:965` | **VERBATIM** | — | yes |
 | `get_time` | `core/actions.py:435` | *INFORMATIVE* | — | yes |
-| `give_me_the_cursor` | `skills/kinect_air_mouse.py:3998` | **VERBATIM** | — | yes |
+| `give_me_the_cursor` | `skills/kinect_air_mouse.py:4040` | **VERBATIM** | — | yes |
 | `globe_clear` | `skills/globe.py:362` | neither | yes | yes |
 | `globe_pin` | `skills/globe.py:327` | neither | yes | yes |
 | `good_morning` | `skills/night_owl_mode.py:505` | **VERBATIM** | — | yes |
@@ -289,11 +289,12 @@ One row per action, sorted by name; aliases share their handler's location.
 | `guest_mode_on` | `bobert_companion.py:34448` | neither | yes | yes |
 | `guest_mode_status` | `bobert_companion.py:34523` | **VERBATIM** | yes | yes |
 | `hand_menu` | `skills/holo_mode.py:250` | **VERBATIM** | — | yes |
-| `hand_mouse_off` | `skills/kinect_air_mouse.py:4024` | **VERBATIM** | — | yes |
-| `hand_mouse_on` | `skills/kinect_air_mouse.py:3998` | **VERBATIM** | — | yes |
-| `hand_tracking_off` | `skills/hand_tracking.py:422` | **VERBATIM** | yes | yes |
-| `hand_tracking_on` | `skills/hand_tracking.py:380` | **VERBATIM** | yes | yes |
-| `hand_tracking_status` | `skills/hand_tracking.py:478` | **VERBATIM** | yes | yes |
+| `hand_mouse_off` | `skills/hand_tracking.py:656` | **VERBATIM** | — | yes |
+| `hand_mouse_on` | `skills/hand_tracking.py:632` | **VERBATIM** | yes | yes |
+| `hand_mouse_status` | `skills/hand_tracking.py:685` | **VERBATIM** | — | yes |
+| `hand_tracking_off` | `skills/hand_tracking.py:565` | **VERBATIM** | yes | yes |
+| `hand_tracking_on` | `skills/hand_tracking.py:523` | **VERBATIM** | yes | yes |
+| `hand_tracking_status` | `skills/hand_tracking.py:625` | **VERBATIM** | yes | yes |
 | `hardware_sensors` | `skills/hardware_sensors.py:20` | **VERBATIM** | yes | yes |
 | `headset_battery` | `skills/headset_status.py:370` | **VERBATIM** | yes | yes |
 | `headset_battery_level` | `skills/headset_status.py:370` | **VERBATIM** | — | yes |
@@ -422,8 +423,8 @@ One row per action, sorted by name; aliases share their handler's location.
 | `morning_chain_pick` | `skills/daily_briefing/chain.py:419` | neither | — | yes |
 | `morning_handoff` | `skills/daily_briefing/handoff.py:746` | neither | yes | yes |
 | `morning_tabs` | `skills/_example_skill.py:19` | neither | — | no |
-| `mouse_control_off` | `skills/kinect_air_mouse.py:4024` | **VERBATIM** | — | yes |
-| `mouse_control_on` | `skills/kinect_air_mouse.py:3998` | **VERBATIM** | — | yes |
+| `mouse_control_off` | `skills/kinect_air_mouse.py:4069` | **VERBATIM** | — | yes |
+| `mouse_control_on` | `skills/kinect_air_mouse.py:4040` | **VERBATIM** | — | yes |
 | `move_window_to_monitor` | `core/actions.py:6602` | neither | yes | yes |
 | `ms_graph_calendar` | `skills/ms_graph.py:796` | **VERBATIM** | — | yes |
 | `music_aggregate` | `skills/apple_music_intel.py:906` | **VERBATIM** | — | yes |
@@ -531,7 +532,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `refresh_network` | `skills/network_deco.py:857` | **VERBATIM** | — | yes |
 | `refresh_smart_home` | `skills/smart_home_discover.py:2094` | neither | — | yes |
 | `refresh_smart_home_router` | `core/smart_home_router.py:1451` | neither | — | yes |
-| `release_the_cursor` | `skills/kinect_air_mouse.py:4024` | **VERBATIM** | — | yes |
+| `release_the_cursor` | `skills/kinect_air_mouse.py:4069` | **VERBATIM** | — | yes |
 | `reload_skills` | `core/actions.py:3436` | neither | — | yes |
 | `remember_my_face` | `skills/face_id.py:220` | **VERBATIM** | — | yes |
 | `remember_their_face` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
@@ -676,7 +677,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `system_check` | `skills/self_diagnostic.py:4467` | **VERBATIM** | yes | yes |
 | `system_pulse` | `skills/system_pulse.py:933` | **VERBATIM** | yes | yes |
 | `system_status` | `skills/status_panel.py:511` | **VERBATIM** | — | yes |
-| `take_the_cursor` | `skills/kinect_air_mouse.py:3998` | **VERBATIM** | — | yes |
+| `take_the_cursor` | `skills/kinect_air_mouse.py:4040` | **VERBATIM** | — | yes |
 | `test_each_skill` | `core/actions.py:4463` | neither | yes | yes |
 | `test_mic` | `core/actions.py:829` | neither | yes | yes |
 | `test_tts` | `core/actions.py:833` | neither | yes | yes |

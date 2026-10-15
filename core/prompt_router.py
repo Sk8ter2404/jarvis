@@ -712,6 +712,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "hand tracking", "track my hands", "tracking my hands", "watch my hands",
         "see my hands", "my hands", "hand menu", "hand tracker", "palm hold",
         "stop watching my hands",
+        # 2026-10-15: the hand mouse (hand_mouse_on / off / status). "hand mouse"
+        # also loads AIR-MOUSE and AIR CONTROL, which is deliberate (see below).
+        "hand mouse", "pinch mouse", "pinch to click",
     ],
     "SMART HOME — PER-BRAND LIST": [
         "smart device",

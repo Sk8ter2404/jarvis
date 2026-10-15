@@ -2033,6 +2033,37 @@ HAND_TRACK_CAMERA = "primary"
 HAND_TRACK_PYTHON = r"C:\JARVIS-models\handtrack\venv\Scripts\python.exe"
 HAND_TRACK_MODEL = r"C:\JARVIS-models\handtrack\hand_landmarker.task"
 HAND_TRACK_PORT = 8793
+# ─── HAND MOUSE / AIR MOUSE v2 (2026-10-15) ─────────────────────────────────
+# Drive the cursor with a pinch, seen by the webcam hand tracker above (so it
+# needs the tracker running). OFF by default; the owner turned the Kinect air
+# mouse off on 2026-10-13 because it kept stealing the cursor, so this one only
+# engages on a deliberate gesture. core/hand_mouse.py has the full contract.
+#   HAND_MOUSE_ENABLED  True = on whenever the tracker is (boot start included).
+#                       "hand mouse on" / "hand mouse off" flip it for the session.
+#                       Engage = pinch held still ~0.6 s (never in game mode,
+#                       over a fullscreen app or in a call); tap = left click;
+#                       second pinch held = drag; open palm held still 0.4 s,
+#                       hand out of view 1 s, tracker stop, or moving the real
+#                       mouse = let go.
+#   AIR_MOUSE_ENGINE    "kinect" (default) | "hands": which engine the existing
+#                       "air mouse on / off / status" (and "take the cursor")
+#                       voice words drive. "hands" -> the hand mouse above; the
+#                       Kinect air mouse is then left alone.
+#   HAND_MOUSE_BOX      the central part of the camera view that maps to the
+#                       whole screen: (left, top, right, bottom), 0-1 of the
+#                       mirrored frame.
+#   HAND_MOUSE_SCREEN_RECT  None = the primary monitor. Another monitor:
+#                       (left, top, width, height) in virtual-desktop pixels,
+#                       e.g. (-1920, 0, 1920, 1080) for one left of the primary.
+#   HAND_MOUSE_PALM_RELEASE_S  how long a still open palm must be held to let go
+#                       (0.4; 0 turns the open-palm release off).
+#   HAND_MOUSE_CUE_SOUND  a short beep on engage / disengage (no popups).
+HAND_MOUSE_ENABLED = False
+AIR_MOUSE_ENGINE = "kinect"
+HAND_MOUSE_BOX = (0.20, 0.15, 0.80, 0.75)
+HAND_MOUSE_SCREEN_RECT = None
+HAND_MOUSE_PALM_RELEASE_S = 0.4
+HAND_MOUSE_CUE_SOUND = True
 # ─── KINECT HAND STABILISER (2026-10-04, "hand tracking is unstable") ─────────
 # One shared stabiliser (audio/kinect_stabilizer.py) runs ONCE per real Kinect
 # body frame inside the bridge pump; the air-mouse, two-hand, gestures and

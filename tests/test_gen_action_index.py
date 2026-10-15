@@ -295,7 +295,7 @@ class SkillCompletenessInvariant(unittest.TestCase):
                           "dict-plus-loop registration lost again")
         air = set(RS.scan_file(
             os.path.join(_PROJECT, "skills", "kinect_air_mouse.py")))
-        for name in ("mouse_control_on", "hand_mouse_off"):
+        for name in ("mouse_control_on", "release_the_cursor"):
             self.assertIn(name, air, "tuple-alias-loop registration lost again")
 
 

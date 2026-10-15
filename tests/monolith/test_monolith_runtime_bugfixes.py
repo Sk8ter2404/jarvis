@@ -1215,10 +1215,11 @@ class AirMouseFamilyVoicedTests(MonolithGlobalsTestCase):
         rs = _load_registration_scan()
         regs = rs.scan_file(os.path.join(_ROOT, "skills", "kinect_air_mouse.py"))
         # Sanity: the scanner parsed both direct assigns and the alias loops
-        # (13 names at HEAD); an empty/partial scan must not vacuously pass.
+        # (11 names at HEAD - hand_mouse_on/off moved to skills/hand_tracking.py
+        # on 2026-10-15); an empty/partial scan must not vacuously pass.
         self.assertIn("air_mouse_on", regs)
         self.assertIn("take_the_cursor", regs)      # from an alias-tuple loop
-        self.assertGreaterEqual(len(regs), 13)
+        self.assertGreaterEqual(len(regs), 11)
         missing = sorted(n for n in regs
                          if n not in self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
         self.assertEqual(

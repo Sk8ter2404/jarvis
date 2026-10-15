@@ -200,8 +200,9 @@ class SafetyTests(unittest.TestCase):
             actions = {}
             ht.register(actions)
         boot.assert_not_called()
-        self.assertEqual(sorted(actions), ["hand_tracking_off", "hand_tracking_on",
-                                           "hand_tracking_status"])
+        self.assertEqual(sorted(actions), ["hand_mouse_off", "hand_mouse_on",
+                                           "hand_mouse_status", "hand_tracking_off",
+                                           "hand_tracking_on", "hand_tracking_status"])
 
     def test_register_starts_the_tracker_when_the_setting_is_on(self):
         with mock.patch.object(config, "HAND_TRACKING_ENABLED", True), \
@@ -212,7 +213,8 @@ class SafetyTests(unittest.TestCase):
     def test_verbatim_speak_set_matches_the_actions(self):
         self.assertEqual(set(ht.SPEAK_VERBATIM_ACTIONS),
                          {"hand_tracking_on", "hand_tracking_off",
-                          "hand_tracking_status"})
+                          "hand_tracking_status", "hand_mouse_on",
+                          "hand_mouse_off", "hand_mouse_status"})
 
 
 class ListenerTests(unittest.TestCase):
