@@ -55,6 +55,7 @@ P_HASFOCUS, P_PASSWORD, P_OFFSCREEN = 30008, 30019, 30022
 P_FRAMEWORK, P_INVOKE_AVAIL, P_VALUE = 30024, 30031, 30045
 P_TOGGLE_STATE, P_SELECTED = 30086, 30079
 P_HEADING = 30173
+P_AUTOID = 30011
 # pattern ids
 PAT_INVOKE, PAT_VALUE, PAT_SELITEM = 10000, 10002, 10010
 PAT_TOGGLE, PAT_SCROLLITEM, PAT_LEGACY = 10015, 10017, 10018
@@ -90,6 +91,7 @@ class El(NamedTuple):
     heading_level: int = 0
     in_document: bool = True   # inside the page (not the browser's toolbar)
     ref: tuple = ()            # (snapshot id, index) - host-side handle
+    auto_id: str = ""          # UIA AutomationId ("btnSend"), for core.send_guard
 
 
 class Snapshot(NamedTuple):
@@ -160,7 +162,7 @@ def _clip(r, w):
 def _cache_request(uia):
     cr = uia.CreateCacheRequest()
     for pid in (P_NAME, P_CTYPE, P_RECT, P_PASSWORD, P_OFFSCREEN, P_FRAMEWORK,
-                P_INVOKE_AVAIL):
+                P_INVOKE_AVAIL, P_AUTOID):
         cr.AddProperty(pid)
     return cr
 
@@ -281,7 +283,8 @@ def _snapshot_once(hwnd, win_rect, title, process, pid, monitor, budget_ms,
                 r = _clip(r, wr)
                 if r is None:
                     continue
-            items.append((e, ct, name, r, pw, inv))
+            aid = str(_cached(e, P_AUTOID) or "")[:60]
+            items.append((e, ct, name, r, pw, inv, aid))
         els = []
         # Link addresses are the only per-element cross-process reads (the
         # rest came back cached in one call): ONE call each (the Value
@@ -291,7 +294,7 @@ def _snapshot_once(hwnd, win_rect, title, process, pid, monitor, budget_ms,
         # the host's wedge line). A click reads its own target's address
         # on demand (href_of) when this skipped it.
         href_until = t0 + max(0.05, budget_ms / 1000.0) * 0.5
-        for idx, (e, ct, name, r, pw, inv) in enumerate(items):
+        for idx, (e, ct, name, r, pw, inv, aid) in enumerate(items):
             in_doc = bool(doc_rect and r[1] >= doc_rect[1] - 1
                           and r[0] >= doc_rect[0] - 1)
             href = ""
@@ -304,7 +307,8 @@ def _snapshot_once(hwnd, win_rect, title, process, pid, monitor, budget_ms,
             els.append(El(name=" ".join(name.split()),
                           ctype=CT_NAMES.get(ct, str(ct)), rect=r,
                           href=href, is_password=pw, invokable=inv,
-                          in_document=in_doc, ref=(sid, len(keep) - 1)))
+                          in_document=in_doc, ref=(sid, len(keep) - 1),
+                          auto_id=aid))
         _snaps[sid] = keep
         while len(_snaps) > _KEEP_SNAPSHOTS:
             _snaps.popitem(last=False)

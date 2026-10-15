@@ -368,6 +368,18 @@ def local_click_target_by_description(description: str) -> str:
         print(f"  [local-vision] grounded click unavailable ({e}); falling "
               "back to the pixel search", flush=True)
 
+    # The pixel search below has no control to read, only the owner's words:
+    # a send / submit / pay ... click is not made on those alone
+    # (core.send_guard; the grounded path asks and waits for his yes).
+    try:
+        from core import send_guard as _sg
+        if _sg.classify_description(description):
+            return (f"I haven't clicked '{description}', sir - it looks like "
+                    "a send, submit or pay button, and I can only ask "
+                    "before pressing one when I can read the screen.")
+    except Exception:
+        pass
+
     target = f" on {monitor} monitor" if monitor else ""
     print(f"  [local-vision] 📸 Looking for '{description}'{target}…", flush=True)
     coords = _find_click_target_local(description, monitor=monitor)

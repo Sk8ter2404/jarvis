@@ -1072,6 +1072,11 @@ def _act_press(key: str) -> str:
     refusal = _input_auth_refusal(bc, "press", key)
     if refusal:
         return refusal
+    # Never Enter into a message box that would send it on a bare request
+    # (core.send_guard): ask first, press on his yes.
+    held = _send_key_hold(bc, key)
+    if held:
+        return held
     try:
         bc.ui_press(key.strip().lower())
     except bc.UIFailsafeError as e:
@@ -3611,6 +3616,12 @@ def _act_click(args: str) -> str:
     if m:
         x, y = int(m.group(1)), int(m.group(2))
         button = m.group(3) or "left"
+        # A coordinate click on a send / submit / pay ... control is held for
+        # the owner's yes too (core.send_guard via core.grounded_click).
+        if button == "left":
+            held = _point_click_hold(bc, x, y)
+            if held:
+                return held
         try:
             bc.ui_click(x, y, button)
         except bc.UIFailsafeError as e:
@@ -3760,6 +3771,39 @@ def _input_auth_refusal(bc, kind: str, value: str) -> str:
             _note_auth_refusal(bc, "typing" if kind == "type"
                                else "pressing that key", why)
         return line
+    except Exception:
+        return ""
+
+
+def _send_key_hold(bc, key: str) -> str:
+    """The TERMINAL question (core.send_guard.hold_line) when ``key`` is an
+    Enter that would send a message - a chat or mail compose in front, or
+    this turn's look at the screen saw a message box - and nothing was
+    pressed; "" when the key may go ahead. The pending question is the click
+    flow's own (core.grounded_click.hold_key): the owner's yes presses it
+    once. Never raises."""
+    try:
+        from core import grounded_click as _gc
+        from core import send_guard as _sg
+        ctx = _auth_context(bc)
+        if not _sg.enter_would_send(key, ctx["titles"], ctx["screen_texts"]):
+            return ""
+        r = _gc.hold_key(key, said=ctx["owner_text"])
+        print("  [send-guard] not pressing Enter: it would send a message",
+              flush=True)
+        return r.text
+    except Exception:
+        return ""
+
+
+def _point_click_hold(bc, x: int, y: int) -> str:
+    """The TERMINAL question when the control under (x, y) is a send /
+    submit / pay ... one (core.grounded_click.guard_point); "" otherwise.
+    Never raises."""
+    try:
+        from core import grounded_click as _gc
+        r = _gc.guard_point(x, y, said=_seam_str(bc, "_turn_user_text"))
+        return r.text if r is not None else ""
     except Exception:
         return ""
 
@@ -4003,6 +4047,9 @@ def _act_hotkey(args: str) -> str:
         bc, "hotkey", "+".join(k for k in keys if isinstance(k, str)))
     if refusal:
         return refusal
+    held = _send_key_hold(bc, "+".join(k for k in keys if isinstance(k, str)))
+    if held:
+        return held
     # Refuse alt+f4 if the currently focused window is our host process
     if set(keys) == {"alt", "f4"}:
         try:
