@@ -21551,6 +21551,122 @@ def _local_think_param(model: str):
     return None
 
 
+def _ollama_installed_tags() -> list[str]:
+    """Names Ollama's /api/tags lists, or [] when it is unreachable. Never raises."""
+    try:
+        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=_ollama_probe_timeout())
+        installed = [m.get("name", "") for m in r.json().get("models", [])] if r.ok else []
+    except Exception:
+        installed = []
+    return [n for n in installed if n]
+
+
+def _local_llm_user_pick() -> str:
+    """The owner's persisted chat-model pick (Settings GUI / voice set_model,
+    restored onto LOCAL_LLM_MODEL at boot), or "" when LOCAL_LLM_MODEL is still
+    the shipped default. "User-set" = differs from the shipped default captured
+    ONCE in core.config BEFORE overrides (never hard-code the tag here —
+    stale-duplicate bug class). 2026-07-21 audit."""
+    try:
+        from core import config as _cfg
+        _shipped = getattr(_cfg, "_SHIPPED_LOCAL_LLM_MODEL", LOCAL_LLM_MODEL)
+    except Exception:
+        _shipped = LOCAL_LLM_MODEL
+    user_pick = (LOCAL_LLM_MODEL or "").strip()
+    return user_pick if user_pick and user_pick != _shipped else ""
+
+
+def _select_local_llm_from_installed(installed: list[str]) -> tuple[str, str]:
+    """Steps 2-4 of _get_local_llm_model over a NON-EMPTY installed list ->
+    (tag, how), how in "user" | "chain" | "first". An uninstalled saved pick
+    falls through to the preference chain so a box whose saved tag was removed
+    still boots onto a working brain."""
+    installed_set = set(installed)
+    user_pick = _local_llm_user_pick()
+    if user_pick:
+        if user_pick in installed_set:
+            return user_pick, "user"
+        base = user_pick.split(":", 1)[0]
+        pick = next((n for n in installed if n.split(":", 1)[0] == base), None)
+        if pick:
+            return pick, "user"
+    for pref in _LOCAL_LLM_PREFERENCE:
+        if pref in installed_set:
+            return pref, "chain"
+        base = pref.split(":", 1)[0]
+        pick = next((n for n in installed if n.split(":", 1)[0] == base), None)
+        if pick:
+            return pick, "chain"
+    return installed[0], "first"
+
+
+def _local_llm_pref_rank(tag: str) -> int:
+    """Index of `tag` in _LOCAL_LLM_PREFERENCE (exact match first, then bare
+    base name); len(chain) when off-list. Lower = more preferred."""
+    t = tag or ""
+    if t in _LOCAL_LLM_PREFERENCE:
+        return _LOCAL_LLM_PREFERENCE.index(t)
+    base = t.split(":", 1)[0]
+    for i, pref in enumerate(_LOCAL_LLM_PREFERENCE):
+        if pref.split(":", 1)[0] == base:
+            return i
+    return len(_LOCAL_LLM_PREFERENCE)
+
+
+# Which tag _get_local_llm_model cached by its OWN automatic choice (chain /
+# first-available). The cache is upgradeable only while it still equals this:
+# the env override, the owner's saved pick, a voice/tray switch, a game-mode
+# swap and the empty-reply failover all write a different tag and so pin it.
+_LOCAL_LLM_AUTO_PICK: list[str | None] = [None]
+_LOCAL_LLM_RECHECK_S = 300.0     # at most one /api/tags re-check per 5 min
+_local_llm_recheck_at: list[float] = [0.0]
+
+
+def _refresh_local_llm_model(now: float | None = None) -> str | None:
+    """Adopt a BETTER installed brain than the one cached at first resolve.
+
+    _get_local_llm_model caches the first installed pick for the process, so a
+    preferred model that finished its background pull later (the 26B arriving
+    after the 12B was chosen) was never used until restart. Call this at a
+    TURN BOUNDARY (_run_llm_dispatch start) - never mid-turn. Cheap: nothing
+    happens unless the cache is the resolver's own automatic pick and it is
+    not already the top preference (or the owner's saved pick may have
+    finished downloading); then at most one /api/tags probe per
+    _LOCAL_LLM_RECHECK_S. Vision follows the chat tag by the shared lockstep
+    rule, live only. Returns the newly adopted tag, else None. Never raises."""
+    try:
+        cached = _RESOLVED_LOCAL_LLM_MODEL[0]
+        if not cached or cached != _LOCAL_LLM_AUTO_PICK[0]:
+            return None
+        if _local_llm_pref_rank(cached) == 0 and not _local_llm_user_pick():
+            return None
+        t = time.monotonic() if now is None else now
+        if t - _local_llm_recheck_at[0] < _LOCAL_LLM_RECHECK_S:
+            return None
+        _local_llm_recheck_at[0] = t
+        installed = _ollama_installed_tags()
+        if not installed:
+            return None
+        pick, how = _select_local_llm_from_installed(installed)
+        if pick == cached:
+            return None
+        if how != "user" and _local_llm_pref_rank(pick) >= _local_llm_pref_rank(cached):
+            return None
+        _RESOLVED_LOCAL_LLM_MODEL[0] = pick
+        _LOCAL_LLM_AUTO_PICK[0] = None if how == "user" else pick
+        print(f"  [local-llm] better model now installed - switching `{cached}` -> `{pick}`")
+        try:
+            from skills.model_picker import _sync_vision_to_chat
+            _sync_vision_to_chat(cached, pick, persist=False,
+                                 bc=sys.modules.get(__name__))
+        except Exception:
+            pass
+        _log_gpu_state(pick)
+        return pick
+    except Exception:
+        return None
+
+
 def _get_local_llm_model() -> str:
     """Resolve which Ollama tag the local-LLM fallback should target.
 
@@ -21576,7 +21692,9 @@ def _get_local_llm_model() -> str:
 
     The selection is cached in _RESOLVED_LOCAL_LLM_MODEL once a real
     installed model (or the env override) is found, so the 'model
-    selected' log line fires exactly once per process.
+    selected' log line fires exactly once per process. An AUTOMATIC pick
+    (steps 3-4) is upgraded later, at a turn boundary, by
+    _refresh_local_llm_model when a better model finishes downloading.
     """
     cached = _RESOLVED_LOCAL_LLM_MODEL[0]
     if cached:
@@ -21585,58 +21703,25 @@ def _get_local_llm_model() -> str:
     override = (os.environ.get("JARVIS_LOCAL_LLM_MODEL") or "").strip()
     if override:
         _RESOLVED_LOCAL_LLM_MODEL[0] = override
+        _LOCAL_LLM_AUTO_PICK[0] = None
         print(f"  [local-llm] model selected via JARVIS_LOCAL_LLM_MODEL: `{override}`")
         _log_gpu_state(override)
         return override
 
-    try:
-        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=_ollama_probe_timeout())
-        installed = [m.get("name", "") for m in r.json().get("models", [])] if r.ok else []
-    except Exception:
-        installed = []
-    installed = [n for n in installed if n]
-
+    installed = _ollama_installed_tags()
     if installed:
-        installed_set = set(installed)
-        # 2. The owner's persisted pick (Settings GUI / voice set_model, both
-        # land in user_settings.json and are restored onto LOCAL_LLM_MODEL by
-        # core.config._apply_user_settings at boot). "User-set" = differs from
-        # the shipped default, captured ONCE in core.config BEFORE overrides
-        # (never hard-code the tag here — stale-duplicate bug class). Only an
-        # INSTALLED pick is honoured; an uninstalled one falls through to the
-        # preference chain so a box whose saved tag was removed still boots
-        # onto a working brain. 2026-07-21 audit.
-        try:
-            from core import config as _cfg
-            _shipped = getattr(_cfg, "_SHIPPED_LOCAL_LLM_MODEL", LOCAL_LLM_MODEL)
-        except Exception:
-            _shipped = LOCAL_LLM_MODEL
-        user_pick = (LOCAL_LLM_MODEL or "").strip()
-        if user_pick and user_pick != _shipped:
-            if user_pick in installed_set:
-                pick = user_pick
-            else:
-                base = user_pick.split(":", 1)[0]
-                pick = next((n for n in installed if n.split(":", 1)[0] == base), None)
-            if pick:
-                _RESOLVED_LOCAL_LLM_MODEL[0] = pick
-                print(f"  [local-llm] model selected from user settings: `{pick}`")
-                _log_gpu_state(pick)
-                return pick
-        for pref in _LOCAL_LLM_PREFERENCE:
-            if pref in installed_set:
-                pick = pref
-            else:
-                base = pref.split(":", 1)[0]
-                pick = next((n for n in installed if n.split(":", 1)[0] == base), None)
-            if pick:
-                _RESOLVED_LOCAL_LLM_MODEL[0] = pick
-                print(f"  [local-llm] model selected from preference chain: `{pick}`")
-                _log_gpu_state(pick)
-                return pick
-        pick = installed[0]
+        pick, how = _select_local_llm_from_installed(installed)
         _RESOLVED_LOCAL_LLM_MODEL[0] = pick
-        print(f"  [local-llm] no preferred model installed — using first available: `{pick}`")
+        # Only the automatic picks may be upgraded later by
+        # _refresh_local_llm_model; the owner's saved pick is final.
+        _LOCAL_LLM_AUTO_PICK[0] = None if how == "user" else pick
+        _local_llm_recheck_at[0] = time.monotonic()
+        if how == "user":
+            print(f"  [local-llm] model selected from user settings: `{pick}`")
+        elif how == "chain":
+            print(f"  [local-llm] model selected from preference chain: `{pick}`")
+        else:
+            print(f"  [local-llm] no preferred model installed — using first available: `{pick}`")
         _log_gpu_state(pick)
         return pick
 
@@ -49464,6 +49549,9 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
     # Turn grounding ledger for the claim validators: the owner's utterance and
     # every action that runs successfully during this turn (first reply AND
     # follow-up rounds). Closed in the finally so it never outlives the turn.
+    # Turn boundary: adopt a better local brain that finished downloading since
+    # the first resolve (throttled, total; see _refresh_local_llm_model).
+    _refresh_local_llm_model()
     _tg_prev = _begin_turn_grounding(text)
     # PLAYBACK_KEEPER: the answer is on its way — hold the speaker from now
     # (the brain call and the render give the keeper's open its head start)
