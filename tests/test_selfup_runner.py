@@ -629,6 +629,8 @@ class RunLevelTests(_Case):
         self.assertIn("nothing to run", f({"attempted": 0}))
         self.assertIn("2 of 2 tasks failed", f({"attempted": 2, "done": [], "failed": [1, 2]}))
         self.assertIn("could not start", f({"error": "no origin/main"}))
+        self.assertIn("all 2 tasks were skipped",
+                      f({"attempted": 2, "done": [], "failed": [], "skipped": [1, 2]}))
         two = {"attempted": 2, "done": [1, 2], "failed": [],
                "gate": {"ok": True, "tests_ok": True}}
         self.assertEqual(f(two), "The upgrade branch is ready for review, sir: "

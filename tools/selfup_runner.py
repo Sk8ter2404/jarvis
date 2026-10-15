@@ -360,6 +360,9 @@ def spoken_summary(r: dict[str, Any]) -> str:
         return "The approved upgrade queue has nothing to run, sir."
     done, failed = len(r.get("done", [])), len(r.get("failed", []))
     stopped = " I stopped early on a Claude usage limit." if r.get("stopped") == "limit" else ""
+    if not done and not failed:
+        return (f"The upgrade run finished with no changes, sir: all "
+                f"{r['attempted']} tasks were skipped.{stopped}")
     if not done:
         return (f"The upgrade run finished with no changes, sir: "
                 f"{failed} of {r['attempted']} tasks failed.{stopped}")
