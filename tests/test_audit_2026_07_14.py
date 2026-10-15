@@ -238,23 +238,19 @@ class ReleaseNativeResourcesTests(unittest.TestCase):
 
 
 class UpgradeExitPathTests(unittest.TestCase):
-    """Finding #7: _act_upgrade was the LAST os._exit in the tree — no native
-    release, no singleton release, no clean flag, and the loader-lock deadlock
-    that turns the process into an unkillable VRAM-pinning corpse."""
+    """Finding #7 (the LAST raw os._exit, in _act_upgrade) is gone for good:
+    since 2026-10-15 _act_upgrade does not exit, restart or tear down JARVIS at
+    all - the safe self-upgrade runs in a separate git worktree and JARVIS
+    stays up. The hardened teardown (_hard_exit_via_bc + native release +
+    singleton release) still guards the shutdown/restart paths."""
 
-    def test_upgrade_source_has_no_raw_os_exit(self):
+    def test_upgrade_source_has_no_exit_path_at_all(self):
         import inspect
         src = inspect.getsource(A._act_upgrade)
-        # Strip comments — the fix's own explanation names the old call.
         code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
-        self.assertNotIn("os._exit", code,
-                         "the upgrade path must exit via _hard_exit_via_bc "
-                         "(TerminateProcess), never a raw os._exit")
-        self.assertIn("_hard_exit_via_bc", code)
-        self.assertIn("_release_native_resources", code)
-        # clean=True: upgrade_jarvis.py relaunches JARVIS, so the watchdog
-        # must NOT also resurrect it (that would double-boot).
-        self.assertIn("clean=True", code)
+        for forbidden in ("os._exit", "_hard_exit", "_release_native_resources",
+                          "_release_singleton", "clean=True"):
+            self.assertNotIn(forbidden, code)
 
 
 class YoutubeSearchClosesTabNotWindowTests(unittest.TestCase):

@@ -180,12 +180,14 @@ class TrayResultTests(_Base):
         self.assertEqual(self._results(), [])
 
     def test_run_upgrade_now_while_upgrades_are_off(self):
-        # The tray path end to end: trigger_overnight -> the real
-        # _act_start_overnight_upgrade. It must not sleep JARVIS or arm the
-        # 8 h flag, and the refusal is shown to the owner.
+        # The tray path end to end: trigger_overnight -> the real _act_upgrade.
+        # With upgrades off it must not sleep JARVIS, arm the 8 h flag or
+        # spawn anything, and the refusal is shown to the owner.
         bc = self.bc
         flag = os.path.join(self.tmp, ".overnight_active")
         self._p(bc, "OVERNIGHT_UPGRADE_ENABLED", False)
+        import core.config as _cfg      # _act_upgrade reads the config flag
+        self._p(_cfg, "OVERNIGHT_UPGRADE_ENABLED", False)
         self._p(bc, "OVERNIGHT_FLAG_FILE", flag)
         self._p(bc, "_write_hud_state")
         sleep = bc._sleep_mode

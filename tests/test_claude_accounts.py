@@ -284,23 +284,12 @@ class SpawnSiteTests(unittest.TestCase):
         with open(os.path.join(_ROOT, rel), encoding="utf-8") as f:
             return f.read()
 
-    def test_the_loop_driver_template_compiles_and_picks_a_profile(self):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "upgrade_jarvis_under_test", os.path.join(_ROOT, "upgrade_jarvis.py"))
+    def test_the_retired_loop_drivers_are_gone(self):
+        # The old driver templates spawned `claude` with the blanket permission
+        # bypass against the live tree; the safe runner replaced them.
         src = self.read("upgrade_jarvis.py")
-        start = src.index("_LOOP_DRIVER_TEMPLATE = r'''") + len("_LOOP_DRIVER_TEMPLATE = r'''")
-        tpl = src[start:src.index("'''", start)]
-        rendered = (tpl.replace("__PROJECT_DIR__", repr(_ROOT))
-                    .replace("__CLAUDE_PATH__", repr("claude"))
-                    .replace("__PROMPT__", repr("p"))
-                    .replace("__STREAM_LOG__", repr("x.log"))
-                    .replace("__MAX_ITER__", "1").replace("__TASK_COUNT__", "1"))
-        compile(rendered, "loop_driver", "exec")
-        self.assertIn("ACCT.choose()", rendered)
-        self.assertIn("env=env,", rendered)
-        self.assertIn("ACCT.note_pro_refusal(", rendered)
-        self.assertIsNotNone(spec)
+        self.assertNotIn("_LOOP_DRIVER_TEMPLATE", src)
+        self.assertNotIn("def spawn_claude_code", src)
 
     def test_pipeline_overnight_and_dry_audit_use_it(self):
         self.assertIn("acct.run(cmd, env=env, runner=subprocess.run",

@@ -125,6 +125,11 @@ def guess_protected(name: str) -> bool:
 # pushback-gated. bobert_companion._FIRE_AND_EXIT_ACTIONS is this set, and
 # core.prompt_router never lets a section that documents one ride a short
 # follow-up's history - the ONE list, so the three cannot drift.
+#
+# 2026-10-15: "upgrade" no longer ends the process (the safe self-upgrade works
+# in a separate git worktree and JARVIS stays up). It stays in this set on
+# purpose: that is what makes a model-emitted upgrade ASK first, and a run
+# costs real Claude usage.
 SELF_TERMINATING_ACTIONS = frozenset({
     "start_overnight_upgrade",
     "upgrade",
@@ -691,8 +696,9 @@ _SELF_TERMINATION_QUESTIONS = {
     "shutdown": ("That would shut me down completely, sir. Say yes if that "
                  "is what you want."),
     "restart": "That would restart me, sir. Say yes to go ahead.",
-    "upgrade": ("That would start an upgrade and take me offline for it, "
-                "sir. Say yes to go ahead."),
+    "upgrade": ("That would start an upgrade run on the approved queue, sir. "
+                "I stay up while it works in a separate copy of the code. "
+                "Say yes to go ahead."),
     "overnight": ("That would put me into overnight standby, sir. Say yes "
                   "to go ahead."),
 }

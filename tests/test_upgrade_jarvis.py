@@ -1019,69 +1019,6 @@ class FindClaudeCliTests(_UpgBase):
             self.assertIsNone(U.find_claude_cli())
 
 
-# ═══════════════════════════ spawn_claude_code ════════════════════════════
-
-
-class SpawnClaudeCodeTests(_UpgBase):
-    def setUp(self):
-        super().setUp()
-        _FakePopen.instances = []
-
-    def _spawn(self, single_stage=False):
-        with mock.patch.object(U.subprocess, "Popen", _FakePopen):
-            return U.spawn_claude_code(["task one", "task two"],
-                                       r"C:\bin\claude.exe",
-                                       single_stage=single_stage)
-
-    def test_returns_popen_handle(self):
-        proc = self._spawn()
-        self.assertIsInstance(proc, _FakePopen)
-
-    def test_renders_pipeline_template_by_default(self):
-        self._spawn(single_stage=False)
-        # driver tempfile was written and passed to Popen as argv[1]
-        argv = _FakePopen.instances[0].cmd
-        drv = argv[2]
-        with open(drv, encoding="utf-8") as f:
-            src = f.read()
-        self.assertIn("run_pipeline_loop_driver", src)
-        os.unlink(drv)
-
-    def test_renders_single_stage_template(self):
-        self._spawn(single_stage=True)
-        drv = _FakePopen.instances[0].cmd[2]
-        with open(drv, encoding="utf-8") as f:
-            src = f.read()
-        self.assertIn("run_one_claude_call", src)
-        # sentinel substitution happened — no raw sentinels remain
-        self.assertNotIn("__PROJECT_DIR__", src)
-        self.assertNotIn("__MAX_ITER__", src)
-        os.unlink(drv)
-
-    def test_strips_api_key_from_env(self):
-        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-secret"}):
-            self._spawn()
-        env = _FakePopen.instances[0].kwargs["env"]
-        self.assertNotIn("ANTHROPIC_API_KEY", env)
-        drv = _FakePopen.instances[0].cmd[2]
-        if os.path.exists(drv):
-            os.unlink(drv)
-
-    def test_writes_upgrade_log_line(self):
-        self._spawn()
-        self.assertTrue(self.exists("upgrade_log.txt"))
-        self.assertIn("Spawning Claude Code LOOP", self.read("upgrade_log.txt"))
-        drv = _FakePopen.instances[0].cmd[2]
-        if os.path.exists(drv):
-            os.unlink(drv)
-
-    def test_popen_exception_returns_none(self):
-        with mock.patch.object(U.subprocess, "Popen",
-                               side_effect=OSError("spawn fail")):
-            out = U.spawn_claude_code(["t"], r"C:\bin\claude.exe")
-        self.assertIsNone(out)
-
-
 # ═════════════════════════ spawn_claude_dry_audit ═════════════════════════
 
 
@@ -1636,9 +1573,13 @@ class MainEntryTests(_UpgBase):
              mock.patch("sys.stdout", out):
             try:
                 U.main()
-            except SystemExit:
-                pass
+            except SystemExit as exc:
+                self.exit_code = exc.code
         return out.getvalue()
+
+    def setUp(self):
+        super().setUp()
+        self.exit_code = None
 
     def test_force_trigger_gate(self):
         with mock.patch.object(U, "_stability_gate",
@@ -1655,12 +1596,13 @@ class MainEntryTests(_UpgBase):
         bg.assert_called_once()
         self.assertIn("verdict=OK", txt)
 
-    def test_no_tasks_exits_early(self):
-        self.write("jarvis_todo.md", "- [x] all done\n")
-        with mock.patch.object(U, "find_claude_cli") as fc:
-            txt = self._run_main(["upgrade_jarvis.py"])
-        self.assertIn("Nothing to upgrade", txt)
-        fc.assert_not_called()
+    def test_blue_green_dispatch_failure_exits_nonzero(self):
+        with mock.patch.object(U, "run_blue_green_handoff",
+                               return_value={"ok": False,
+                                             "stage_failed": "smoke"}):
+            txt = self._run_main(["upgrade_jarvis.py", "--blue-green"])
+        self.assertIn("verdict=FAIL", txt)
+        self.assertEqual(self.exit_code, 1)
 
     def test_dry_audit_skips_backup_and_kill(self):
         self.write("jarvis_todo.md", "- [ ] task one\n")
@@ -1682,270 +1624,75 @@ class MainEntryTests(_UpgBase):
             txt = self._run_main(["upgrade_jarvis.py", "--dry-audit"])
         self.assertIn("Failed", txt)
 
-    def test_autonomous_no_relaunch(self):
-        self.write("jarvis_todo.md", "- [ ] task one\n")
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase",
-                               return_value=os.path.join(self.tmp, "bk")), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=1), \
-             mock.patch.object(U, "spawn_claude_code",
-                               return_value=_FakePopen(["x"])) as spawn:
-            txt = self._run_main(["upgrade_jarvis.py"])
-        spawn.assert_called_once()
-        self.assertIn("manually run", txt)
+    def test_dry_audit_with_an_empty_queue_exits_early(self):
+        self.write("jarvis_todo.md", "- [x] all done\n")
+        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"):
+            txt = self._run_main(["upgrade_jarvis.py", "--dry-audit"])
+        self.assertIn("Nothing to upgrade", txt)
 
-    def test_autonomous_spawn_failure_aborts(self):
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase",
-                               return_value=os.path.join(self.tmp, "bk")), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code", return_value=None):
-            txt = self._run_main(["upgrade_jarvis.py"])
-        self.assertIn("Aborting", txt)
+    # -- the default run is the SAFE runner, never the live-tree machinery --
+    def _fake_runner(self, result=None):
+        fake = mock.Mock()
+        fake.run.return_value = result or {"done": [], "failed": []}
+        return fake
 
-    def test_relaunch_success_path(self):
-        self.write("jarvis_todo.md", "- [ ] task one\n")
-        self.write("bobert_companion.py", "print('ok')\n")   # valid syntax
-        proc = _FakePopen(["x"])
+    def test_default_run_delegates_to_the_safe_runner_and_touches_nothing_live(self):
+        fake = self._fake_runner()
         with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase",
-                               return_value=os.path.join(self.tmp, "bk")), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code", return_value=proc), \
-             mock.patch.object(U.subprocess, "run",
-                               return_value=_FakeCompleted(returncode=0)), \
-             mock.patch.object(U, "_append_changelog_entry"), \
-             mock.patch.object(U, "_revert_to_snapshot",
-                               return_value=(True, "ok")), \
+             mock.patch.dict(sys.modules, {"tools.selfup_runner": fake}), \
+             mock.patch("tools.selfup_runner", fake, create=True), \
+             mock.patch.object(U, "backup_codebase") as backup, \
+             mock.patch.object(U, "kill_running_jarvis") as kill, \
+             mock.patch.object(U, "relaunch_jarvis") as relaunch, \
+             mock.patch.object(U.subprocess, "Popen") as popen:
+            self._run_main(["upgrade_jarvis.py"])
+        fake.run.assert_called_once_with(project_dir=U.PROJECT_DIR,
+                                         claude_path=r"C:\claude.exe")
+        backup.assert_not_called()
+        kill.assert_not_called()
+        relaunch.assert_not_called()
+        popen.assert_not_called()
+        self.assertEqual(self.exit_code, 0)
+
+    def test_default_run_exit_code_follows_the_runner(self):
+        fake = self._fake_runner({"error": "no origin/main"})
+        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
+             mock.patch.dict(sys.modules, {"tools.selfup_runner": fake}), \
+             mock.patch("tools.selfup_runner", fake, create=True):
+            self._run_main(["upgrade_jarvis.py"])
+        self.assertEqual(self.exit_code, 1)
+
+    def test_retired_flags_are_ignored_with_a_notice(self):
+        fake = self._fake_runner()
+        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
+             mock.patch.dict(sys.modules, {"tools.selfup_runner": fake}), \
+             mock.patch("tools.selfup_runner", fake, create=True), \
              mock.patch.object(U, "relaunch_jarvis") as relaunch:
-            txt = self._run_main(["upgrade_jarvis.py", "--relaunch"])
-        relaunch.assert_called_once()
-        self.assertIn("JARVIS relaunched", txt)
-        # summary file written
-        self.assertTrue(self.exists(".last_upgrade_summary.json"))
+            txt = self._run_main(["upgrade_jarvis.py", "--relaunch", "--single-stage"])
+        relaunch.assert_not_called()
+        fake.run.assert_called_once()
+        self.assertIn("--relaunch no longer exists", txt)
+        self.assertIn("--single-stage no longer exists", txt)
 
-    def test_relaunch_syntax_fail_triggers_revert(self):
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        self.write("bobert_companion.py", "def broken(\n")   # invalid syntax
-        proc = _FakePopen(["x"])
-        backup = os.path.join(self.tmp, "bk")
-        os.makedirs(backup, exist_ok=True)
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase", return_value=backup), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code", return_value=proc), \
-             mock.patch.object(U, "_append_changelog_entry"), \
-             mock.patch.object(U, "_revert_to_snapshot",
-                               return_value=(True, "reverted")) as revert, \
-             mock.patch.object(U, "relaunch_jarvis"):
-            txt = self._run_main(["upgrade_jarvis.py", "--relaunch"])
-        # real py_compile runs against the broken file -> syntax_errors -> revert
-        revert.assert_called_once_with(backup)
-        self.assertIn("Syntax check FAILED", txt)
-
-    def test_fallback_no_claude_cli(self):
-        self.write("jarvis_todo.md", "- [ ] task one\n")
+    def test_no_claude_cli_stops_without_touching_anything(self):
         with mock.patch.object(U, "find_claude_cli", return_value=None), \
-             mock.patch.object(U, "backup_codebase",
-                               return_value=os.path.join(self.tmp, "bk")), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U.subprocess, "Popen", _FakePopen), \
-             mock.patch.object(U.os, "startfile", create=True) as startfile, \
-             mock.patch("builtins.input", return_value=""):
+             mock.patch.object(U, "kill_running_jarvis") as kill, \
+             mock.patch.object(U.subprocess, "Popen") as popen:
             txt = self._run_main(["upgrade_jarvis.py"])
-        self.assertIn("Falling back to manual handoff", txt)
-        startfile.assert_called_once()
+        kill.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("`claude` CLI not found", txt)
+        self.assertEqual(self.exit_code, 127)
 
-    def _run_relaunch_with_auditor(self, audit_rc, report=None):
-        """Drive the --relaunch path with a present auditor script and a given
-        auditor returncode/report. Returns captured stdout."""
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        self.write("bobert_companion.py", "print('ok')\n")
-        self.write(os.path.join("tools", "audit_codebase.py"), "# auditor\n")
-        if report is not None:
-            self.write("audit_report.json", report)
-        proc = _FakePopen(["x"])
-        backup = os.path.join(self.tmp, "bk")
-        os.makedirs(backup, exist_ok=True)
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase", return_value=backup), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code", return_value=proc), \
-             mock.patch.object(U.subprocess, "run",
-                               return_value=_FakeCompleted(returncode=audit_rc)), \
-             mock.patch.object(U, "_append_changelog_entry"), \
-             mock.patch.object(U, "relaunch_jarvis"):
-            return self._run_main(["upgrade_jarvis.py", "--relaunch"])
-
-    def test_audit_clean_rc0(self):
-        txt = self._run_relaunch_with_auditor(0)
-        self.assertIn("Audit: CLEAN", txt)
-
-    def test_audit_warn_rc2(self):
-        txt = self._run_relaunch_with_auditor(
-            2, json.dumps({"summary": {"p0": 0, "p1": 4, "p2": 0}}))
-        self.assertIn("Audit: WARN", txt)
-        self.assertIn("4 P1", txt)
-
-    def test_audit_info_rc3(self):
-        txt = self._run_relaunch_with_auditor(
-            3, json.dumps({"summary": {"p0": 0, "p1": 0, "p2": 7}}))
-        self.assertIn("Audit: INFO", txt)
-
-    def test_audit_skipped_other_rc(self):
-        txt = self._run_relaunch_with_auditor(-5)
-        self.assertIn("Audit: skipped", txt)
-
-    def test_audit_bad_report_json_swallowed(self):
-        # report exists but is invalid JSON -> parse except swallowed, still OK
-        txt = self._run_relaunch_with_auditor(0, "{not valid json")
-        self.assertIn("Audit: CLEAN", txt)
-
-    def test_single_stage_mode_banner(self):
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        with mock.patch.object(U, "find_claude_cli", return_value=None), \
-             mock.patch.object(U, "backup_codebase",
-                               return_value=os.path.join(self.tmp, "bk")), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U.subprocess, "Popen", _FakePopen), \
-             mock.patch.object(U.os, "startfile", create=True), \
-             mock.patch("builtins.input", return_value=""):
-            txt = self._run_main(["upgrade_jarvis.py", "--single-stage"])
-        self.assertIn("SINGLE-STAGE mode", txt)
-
-    def test_relaunch_runs_auditor_p0_warning(self):
-        # tools/audit_codebase.py present + report with P0 findings exercises
-        # the auditor block AND the post-upgrade P0-warning relaunch branch.
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        self.write("bobert_companion.py", "print('ok')\n")
-        self.write(os.path.join("tools", "audit_codebase.py"), "# auditor\n")
-        self.write("audit_report.json",
-                   json.dumps({"summary": {"p0": 2, "p1": 1, "p2": 0}}))
-        proc = _FakePopen(["x"])
-        backup = os.path.join(self.tmp, "bk")
-        os.makedirs(backup, exist_ok=True)
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase", return_value=backup), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code", return_value=proc), \
-             mock.patch.object(U.subprocess, "run",
-                               return_value=_FakeCompleted(returncode=1)), \
-             mock.patch.object(U, "_append_changelog_entry"), \
-             mock.patch.object(U, "relaunch_jarvis") as relaunch:
-            txt = self._run_main(["upgrade_jarvis.py", "--relaunch"])
-        self.assertIn("Audit: FAIL", txt)
-        self.assertIn("2 P0 finding", txt)
-        # syntax was valid, so it still relaunches despite the P0
-        relaunch.assert_called_once()
-
-    def test_relaunch_auditor_timeout(self):
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        self.write("bobert_companion.py", "print('ok')\n")
-        self.write(os.path.join("tools", "audit_codebase.py"), "# auditor\n")
-        proc = _FakePopen(["x"])
-        backup = os.path.join(self.tmp, "bk")
-        os.makedirs(backup, exist_ok=True)
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase", return_value=backup), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code", return_value=proc), \
-             mock.patch.object(U.subprocess, "run",
-                               side_effect=subprocess.TimeoutExpired("audit", 120)), \
-             mock.patch.object(U, "_append_changelog_entry"), \
-             mock.patch.object(U, "relaunch_jarvis"):
-            txt = self._run_main(["upgrade_jarvis.py", "--relaunch"])
-        self.assertIn("[audit] timed out", txt)
-
-    def test_relaunch_summary_write_failure_swallowed(self):
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        self.write("bobert_companion.py", "print('ok')\n")
-        proc = _FakePopen(["x"])
-        backup = os.path.join(self.tmp, "bk")
-        os.makedirs(backup, exist_ok=True)
-        real_open = open
-
-        def open_blowup(path, *a, **k):
-            if str(path) == U.UPGRADE_SUMMARY_FILE:
-                raise OSError("disk full")
-            return real_open(path, *a, **k)
-
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase", return_value=backup), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code", return_value=proc), \
-             mock.patch.object(U.subprocess, "run",
-                               return_value=_FakeCompleted(returncode=0)), \
-             mock.patch.object(U, "_append_changelog_entry"), \
-             mock.patch.object(U, "relaunch_jarvis"), \
-             mock.patch("builtins.open", side_effect=open_blowup):
-            txt = self._run_main(["upgrade_jarvis.py", "--relaunch"])
-        self.assertIn("Couldn't write upgrade summary", txt)
-
-    def test_relaunch_syntax_fail_revert_exception_swallowed(self):
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        self.write("bobert_companion.py", "def broken(\n")
-        proc = _FakePopen(["x"])
-        backup = os.path.join(self.tmp, "bk")
-        os.makedirs(backup, exist_ok=True)
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase", return_value=backup), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code", return_value=proc), \
-             mock.patch.object(U, "_append_changelog_entry"), \
-             mock.patch.object(U, "_revert_to_snapshot",
-                               side_effect=RuntimeError("revert blew up")), \
-             mock.patch.object(U, "relaunch_jarvis"):
-            txt = self._run_main(["upgrade_jarvis.py", "--relaunch"])
-        self.assertIn("Revert FAILED", txt)
-
-    def test_relaunch_keyboard_interrupt(self):
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        self.write("bobert_companion.py", "print('ok')\n")
-        proc = _FakePopen(["x"])
-        # proc.wait raises KeyboardInterrupt -> the main() handler prints
-        proc.wait = mock.Mock(side_effect=KeyboardInterrupt())
-        backup = os.path.join(self.tmp, "bk")
-        os.makedirs(backup, exist_ok=True)
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase", return_value=backup), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code", return_value=proc):
-            txt = self._run_main(["upgrade_jarvis.py", "--relaunch"])
-        self.assertIn("Interrupted", txt)
-
-    def test_blue_green_dispatch_failure_exits_nonzero(self):
-        with mock.patch.object(U, "run_blue_green_handoff",
-                               return_value={"ok": False,
-                                             "stage_failed": "smoke"}):
-            txt = self._run_main(["upgrade_jarvis.py", "--blue-green"])
-        self.assertIn("verdict=FAIL", txt)
-
-    def test_fallback_clipboard_failure_prints_payload(self):
-        self.write("jarvis_todo.md", "- [ ] task one\n")
-        with mock.patch.object(U, "find_claude_cli", return_value=None), \
-             mock.patch.object(U, "backup_codebase",
-                               return_value=os.path.join(self.tmp, "bk")), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U.subprocess, "Popen", side_effect=OSError("noclip")), \
-             mock.patch.object(U.os, "startfile", create=True), \
-             mock.patch("builtins.input", return_value=""):
-            txt = self._run_main(["upgrade_jarvis.py"])
-        self.assertIn("Paste this manually", txt)
-
-    def test_fallback_startfile_failure_and_eof(self):
-        # editor-open failure prints the error; input() EOFError is swallowed.
-        self.write("jarvis_todo.md", "- [ ] task one\n")
-        with mock.patch.object(U, "find_claude_cli", return_value=None), \
-             mock.patch.object(U, "backup_codebase",
-                               return_value=os.path.join(self.tmp, "bk")), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U.subprocess, "Popen", _FakePopen), \
-             mock.patch.object(U.os, "startfile", create=True,
-                               side_effect=OSError("no editor")), \
-             mock.patch("builtins.input", side_effect=EOFError()):
-            txt = self._run_main(["upgrade_jarvis.py"])
-        self.assertIn("Could not open editor", txt)
+    def test_the_live_tree_helpers_are_unreachable_from_the_default_flow(self):
+        import inspect
+        src = inspect.getsource(U._main_body)
+        for name in ("kill_running_jarvis", "relaunch_jarvis", "backup_codebase",
+                     "spawn_claude_code", "_append_changelog_entry"):
+            self.assertNotIn(name, src)
+        self.assertFalse(hasattr(U, "spawn_claude_code"))
+        self.assertFalse(hasattr(U, "_LOOP_DRIVER_TEMPLATE"))
+        self.assertFalse(hasattr(U, "_PIPELINE_LOOP_DRIVER_TEMPLATE"))
 
 
 class _NoReconfigStream(io.StringIO):
@@ -2223,6 +1970,10 @@ class MarkerIsLiveTests(_MarkerBase):
 
 
 class MainMarkerIntegrationTests(_MarkerBase):
+    """Only the owner-typed live-tree flags (--blue-green, --force-trigger-gate-now)
+    stop/start JARVIS, so only they hold the watchdog marker. The default run
+    works in a separate git worktree and never touches the live JARVIS."""
+
     def _run_main(self, argv):
         out = io.StringIO()
         with mock.patch.object(sys, "argv", argv), \
@@ -2233,53 +1984,53 @@ class MainMarkerIntegrationTests(_MarkerBase):
                 pass
         return out.getvalue()
 
-    def test_marker_is_held_across_the_whole_run_then_cleared(self):
-        # THE regression: while Claude Code is rewriting the tree the marker
-        # must be on disk, and it must be gone once the run ends.
-        self.write("jarvis_todo.md", "- [ ] task one\n")
+    def test_marker_is_held_across_the_whole_handoff_then_cleared(self):
         seen = {}
 
-        def _spawn(*a, **k):
+        def _handoff(*a, **k):
             seen["marker_present"] = os.path.exists(self.marker)
             seen["pid"] = self.read_marker()["pid"]
-            return _FakePopen(["x"])
+            return {"ok": True, "stage_failed": None}
 
-        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase",
-                               return_value=os.path.join(self.tmp, "bk")), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=1), \
-             mock.patch.object(U, "spawn_claude_code", side_effect=_spawn):
-            self._run_main(["upgrade_jarvis.py"])
+        with mock.patch.object(U, "run_blue_green_handoff", side_effect=_handoff):
+            self._run_main(["upgrade_jarvis.py", "--blue-green"])
         self.assertTrue(seen["marker_present"])
         self.assertEqual(seen["pid"], os.getpid())
         self.assertFalse(os.path.exists(self.marker))
 
-    def test_marker_is_up_before_the_first_mutating_step(self):
-        # backup_codebase() / kill_running_jarvis() are the first things that
-        # touch the machine — the marker must precede BOTH.
-        self.write("jarvis_todo.md", "- [ ] task one\n")
-        order = []
+    def test_the_forced_gate_holds_the_marker_too(self):
+        seen = {}
 
-        with mock.patch.object(U, "find_claude_cli", return_value=None), \
-             mock.patch.object(
-                 U, "backup_codebase",
-                 side_effect=lambda: (order.append(os.path.exists(self.marker)),
-                                      os.path.join(self.tmp, "bk"))[1]), \
-             mock.patch.object(
-                 U, "kill_running_jarvis",
-                 side_effect=lambda: (order.append(os.path.exists(self.marker)),
-                                      0)[1]), \
-             mock.patch.object(U.subprocess, "Popen", _FakePopen), \
-             mock.patch.object(U.os, "startfile", create=True), \
-             mock.patch("builtins.input", return_value=""):
+        def _gate(**k):
+            seen["marker_present"] = os.path.exists(self.marker)
+            return {"verdict": "PASS", "ok": True, "details": ""}
+
+        with mock.patch.object(U, "_stability_gate", side_effect=_gate):
+            self._run_main(["upgrade_jarvis.py", "--force-trigger-gate-now"])
+        self.assertTrue(seen["marker_present"])
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_the_default_run_does_not_park_the_watchdog(self):
+        # It never stops JARVIS, so the resurrection net must stay armed.
+        fake = mock.Mock()
+        fake.run.return_value = {"done": [], "failed": []}
+        seen = {}
+
+        def _run(**k):
+            seen["marker_present"] = os.path.exists(self.marker)
+            return {"done": [], "failed": []}
+
+        fake.run.side_effect = _run
+        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
+             mock.patch.dict(sys.modules, {"tools.selfup_runner": fake}), \
+             mock.patch("tools.selfup_runner", fake, create=True):
             self._run_main(["upgrade_jarvis.py"])
-        self.assertEqual(order, [True, True])
+        self.assertFalse(seen["marker_present"])
 
     def test_marker_is_cleared_even_when_main_raises(self):
-        self.write("jarvis_todo.md", "- [ ] t\n")
-        with mock.patch.object(U, "backup_codebase",
+        with mock.patch.object(U, "run_blue_green_handoff",
                                side_effect=RuntimeError("disk full")):
-            with mock.patch.object(sys, "argv", ["upgrade_jarvis.py"]), \
+            with mock.patch.object(sys, "argv", ["upgrade_jarvis.py", "--blue-green"]), \
                  mock.patch("sys.stdout", io.StringIO()):
                 with self.assertRaises(RuntimeError):
                     U.main()
@@ -2306,17 +2057,12 @@ class MainMarkerIntegrationTests(_MarkerBase):
             self._run_main(["upgrade_jarvis.py", "--blue-green"])
         self.assertFalse(os.path.exists(self.marker))
 
-    def test_a_failed_marker_write_never_aborts_the_upgrade(self):
-        self.write("jarvis_todo.md", "- [ ] task one\n")
+    def test_a_failed_marker_write_never_aborts_the_handoff(self):
         with mock.patch.object(U, "_write_upgrade_marker", return_value=False), \
-             mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
-             mock.patch.object(U, "backup_codebase",
-                               return_value=os.path.join(self.tmp, "bk")), \
-             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
-             mock.patch.object(U, "spawn_claude_code",
-                               return_value=_FakePopen(["x"])) as spawn:
-            txt = self._run_main(["upgrade_jarvis.py"])
-        spawn.assert_called_once()
+             mock.patch.object(U, "run_blue_green_handoff",
+                               return_value={"ok": True, "stage_failed": None}) as bg:
+            txt = self._run_main(["upgrade_jarvis.py", "--blue-green"])
+        bg.assert_called_once()
         self.assertIn("COULD NOT WRITE", txt)
 
 

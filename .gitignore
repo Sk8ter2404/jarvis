@@ -144,6 +144,7 @@ _prompt_drift_*.txt
 overnight_log.txt
 upgrade_log.txt
 jarvis_todo.md
+jarvis_todo_proposed.md
 # Owner-local scratch named by audit P0-4 (2026-06-06): `_mine_*` mining files
 # and the voice-command test log. tools/auto_publish.py stages any NEW file git
 # does not ignore, so .gitignore is what keeps these out of a public PR.

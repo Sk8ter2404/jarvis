@@ -1455,9 +1455,9 @@ def _on_screen_memory_pause(icon, item):
     _send_command("screen_memory_pause", arg="15")
 
 def _on_force_upgrade(icon, item):
-    """Spec verb 'force upgrade now' — kick the overnight engine. The item is
-    greyed out while overnight upgrades are switched off; the monolith refuses
-    too (it used to put JARVIS to sleep for an upgrade that never ran)."""
+    """Spec verb 'force upgrade now' - an explicit request for ONE safe upgrade
+    run (separate git worktree, approved queue; JARVIS stays up). The item is
+    greyed out while upgrades are switched off; the monolith refuses too."""
     if not _upgrades_enabled():
         _notify("Overnight upgrades are switched off, so there is nothing to "
                 "run.", "JARVIS — Run Upgrade Now")

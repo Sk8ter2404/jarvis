@@ -4079,8 +4079,8 @@ def _act_stop_pipeline(_: str = "") -> str:
     """Quiet the overnight engine. Clears the pending immediate-fire flag,
     drops sleep mode, and removes the on-disk overnight flag so the engine
     won't re-arm on the next boot. Does NOT kill an in-progress upgrade
-    subprocess — once upgrade_jarvis.py is running it owns the process
-    lifecycle; the most we can do here is stop new cycles from starting."""
+    subprocess - once tools/selfup_runner.py is running it owns the process
+    lifecycle; the most we can do here is stop new idea cycles from starting."""
     bc = _bc()
     cleared = False
     try:
@@ -5983,15 +5983,13 @@ def _act_read_changelog(args: str = "") -> str:
 # ─── Overnight engine kick (Phase 4J) ──────────────────────────────────
 
 def _act_start_overnight_upgrade(_: str = "") -> str:
-    """Trigger the built-in overnight upgrade engine immediately.
-    Sets the run-now flag so the background thread skips the idle wait and
-    starts generating improvements straight away. Also enters sleep mode.
+    """Goodnight / "overnight": enter sleep mode and ask the idea engine for
+    one round of PROPOSALS (jarvis_todo_proposed.md). This never starts an
+    upgrade run - that takes an explicit `upgrade` request (_act_upgrade) on
+    the approved queue.
 
-    Writes a persistence flag (.overnight_active) so the engine keeps
-    re-triggering across JARVIS restarts for the next OVERNIGHT_MODE_HOURS
-    hours — important because each completed upgrade kills + relaunches
-    JARVIS, and a fresh process wouldn't otherwise know it's still
-    overnight time."""
+    Writes a persistence flag (.overnight_active) so sleep mode survives a
+    JARVIS restart for the next OVERNIGHT_MODE_HOURS hours."""
     bc = _bc()
     from core.config import OVERNIGHT_MODE_HOURS
     # Switched off (OVERNIGHT_UPGRADE_ENABLED = False): the engine thread is
@@ -6027,8 +6025,9 @@ def _act_start_overnight_upgrade(_: str = "") -> str:
         print(f"  [overnight] couldn't write persistence flag: {_e}")
 
     return (
-        "On it, sir. I'll start generating improvements right away "
-        "and stand by quietly — say 'JARVIS' when you need me again."
+        "On it, sir. I'll draft some improvement ideas for you to review in "
+        "the morning, and stand by quietly — nothing gets changed without "
+        "your say-so. Say 'JARVIS' when you need me again."
     )
 
 
@@ -6765,106 +6764,97 @@ def _act_create_skill(args: str) -> str:
 
 # ─── Upgrade pipeline kickoff (Phase 4K) ───────────────────────────────
 
-def _act_upgrade(_: str = "") -> str:
-    """Hand off pending queue items to Claude Code for implementation.
-    Spawns upgrade_jarvis.py which kills JARVIS, runs Claude Code on the
-    queue, and relaunches JARVIS with the new code.
+def _selfup_runner_path(bc) -> str:
+    """tools/selfup_runner.py next to the monolith, or "" when it is missing."""
+    path = os.path.join(os.path.dirname(os.path.abspath(bc.__file__)),
+                        "tools", "selfup_runner.py")
+    return path if os.path.exists(path) else ""
 
-    Guarded by OVERNIGHT_UPGRADE_ENABLED so a stray voice approval ('go
-    ahead', 'do it', 'give it a shot') after an unrelated 'upgrade'
-    mention can't accidentally bounce JARVIS into a pipeline. To run
-    upgrades, re-enable with 'start overnight upgrade' or flip the
-    config flag and bounce."""
-    import logging
+
+def _selfup_spoken_line(report_dir: str, started_at: float) -> str:
+    """The one-sentence verdict the runner left in latest.json for THIS run
+    (written after ``started_at``), or an honest fallback."""
+    path = os.path.join(report_dir, "latest.json")
+    try:
+        if os.path.getmtime(path) >= started_at - 2:
+            with open(path, "r", encoding="utf-8") as f:
+                line = str(json.load(f).get("spoken") or "").strip()
+            if line:
+                return line
+    except (OSError, ValueError):
+        pass
+    return "The upgrade run ended without leaving a report, sir. Check data/selfup_reports."
+
+
+def _act_upgrade(_: str = "") -> str:
+    """Start ONE safe self-upgrade run because the owner asked for it (voice
+    "upgrade" - which keeps its confirmation question - or the tray's Run
+    Upgrade Now). Nothing else starts a run.
+
+    tools/selfup_runner.py works in a separate git worktree off origin/main on
+    the owner-approved queue (jarvis_todo.md), locks Claude Code down, makes
+    one commit per task, runs the real test gate and leaves the branch for
+    review: no VERSION bump, no push, no tag. JARVIS is NOT stopped, restarted
+    or booted for a test - he stays up and says one sentence when it ends.
+
+    Guarded by OVERNIGHT_UPGRADE_ENABLED (False by default)."""
     import threading
     bc = _bc()
     from core.config import OVERNIGHT_UPGRADE_ENABLED
     if not OVERNIGHT_UPGRADE_ENABLED:
-        return ("Upgrades are disabled, sir. Say 'start overnight upgrade' "
-                "to enable, or flip OVERNIGHT_UPGRADE_ENABLED in config.")
-    # Find upgrade_jarvis.py — search upward from bobert_companion's __file__.
-    search_dir = os.path.dirname(os.path.abspath(bc.__file__))
-    upgrade_script = None
-    for _ in range(4):
-        candidate = os.path.join(search_dir, "upgrade_jarvis.py")
-        if os.path.exists(candidate):
-            upgrade_script = candidate
-            break
-        parent = os.path.dirname(search_dir)
-        if parent == search_dir:
-            break
-        search_dir = parent
-    if upgrade_script is None:
-        return ("upgrade_jarvis.py not found anywhere near my script. "
-                "Looked starting from " + os.path.abspath(bc.__file__))
+        return ("Upgrades are switched off, sir (OVERNIGHT_UPGRADE_ENABLED), "
+                "so I have not started anything.")
+    runner = _selfup_runner_path(bc)
+    if not runner:
+        return ("tools/selfup_runner.py not found next to my script. "
+                "Looked in " + os.path.dirname(os.path.abspath(bc.__file__)))
+    project_dir = os.path.dirname(os.path.abspath(bc.__file__))
+    report_dir = os.path.join(project_dir, "data", "selfup_reports")
 
-    pending = 0
-    if os.path.exists(bc.TODO_FILE):
-        try:
-            with open(bc.TODO_FILE, "r", encoding="utf-8") as f:
-                pending = sum(1 for line in f if line.strip().startswith("- [ ]"))
-        except Exception:
-            pass
-
+    try:
+        from tools import selfup_runner as _sr
+        pending = len(_sr.approved_tasks(bc.TODO_FILE))
+        running = _sr.is_running(report_dir)
+    except Exception as e:
+        return f"could not read the approved queue: {e}"
+    if running:
+        return "An upgrade run is already in progress, sir. I will tell you when it ends."
     if pending == 0:
         return "queue is empty - nothing to upgrade right now"
 
-    # Spawn upgrade pipeline in a new visible PowerShell window so the user
-    # can watch the work — and the window stays open even if the script errors.
+    started_at = time.time()
     try:
-        project_dir = os.path.dirname(os.path.abspath(bc.__file__))
-        # Strip ANTHROPIC_API_KEY so Claude Code bills to a subscription, not
-        # API credits; upgrade_jarvis.py's driver picks which one per call
-        # (core/claude_accounts.py: the Pro account first, Max on its limits).
-        ps_cmd = (
-            f"$env:ANTHROPIC_API_KEY=''; "
-            f"cd '{project_dir}'; "
-            f"Write-Host '=== JARVIS UPGRADE PIPELINE ===' -ForegroundColor Cyan; "
-            f"python '{upgrade_script}' --relaunch"
-        )
+        os.makedirs(report_dir, exist_ok=True)
+        log_path = os.path.join(report_dir, "run_" + time.strftime("%Y%m%d-%H%M%S") + ".log")
         _env = os.environ.copy()
-        _env.pop("ANTHROPIC_API_KEY", None)
-        subprocess.Popen(
-            ["powershell", "-Command", ps_cmd],
-            creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
-            env=_env,
-            close_fds=True,
-        )
+        _env.pop("ANTHROPIC_API_KEY", None)   # bill a subscription, not API credit
+        with open(log_path, "ab") as _log:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", runner],
+                cwd=project_dir, env=_env, close_fds=True,
+                stdin=subprocess.DEVNULL, stdout=_log, stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                if sys.platform == "win32" else 0,
+            )
     except Exception as e:
         return f"failed to spawn upgrade: {e}"
 
-    def _self_exit():
-        # The LAST os._exit in the tree (2026-07-14 audit). Everything else was
-        # converted in v2.0.51/57: os._exit → ExitProcess walks
-        # DLL_PROCESS_DETACH under the loader lock, a thread parked in the CUDA
-        # driver holds it, and the process becomes a kernel-stuck "terminating
-        # forever" corpse that pins ~5GB of VRAM and its handles until Windows
-        # reboots. This path ALSO skipped the native release, the web socket,
-        # and the singleton — so the upgrade's relaunched JARVIS would boot into
-        # a held :8766 and a held singleton. Same hardened sequence the restart
-        # uses. clean=True: upgrade_jarvis.py relaunches JARVIS itself, so the
-        # watchdog must NOT also resurrect us (that would double-boot).
+    def _announce():
         try:
-            time.sleep(3.0)
-            _fs = threading.Timer(30.0, _hard_exit_via_bc, args=(bc, 0, True))
-            _fs.daemon = True
-            _fs.start()
-            _stop_web_interface_quietly()
-            try:
-                bc._release_singleton()
-            except Exception as e:
-                print(f"  [upgrade] singleton release failed: {e}")
-            _release_native_resources(bc)
-            time.sleep(1.0)
+            proc.wait()
+            line = _selfup_spoken_line(report_dir, started_at)
         except Exception:
-            logging.exception("_self_exit teardown failed")
-        _hard_exit_via_bc(bc, 0, clean=True)
-    threading.Thread(target=_self_exit, daemon=True).start()
+            line = "The upgrade run stopped unexpectedly, sir. Check data/selfup_reports."
+        try:
+            bc._speak(line)
+        except Exception:
+            print(f"  [upgrade] {line}")
+    threading.Thread(target=_announce, daemon=True).start()
 
     return (
-        f"upgrade initiated for {pending} pending task(s) - "
-        f"I'll shut down so Claude Code can take over. "
-        f"A new window will open showing the work, and I'll relaunch automatically when done."
+        f"upgrade started for {pending} approved task(s), sir. It works in a "
+        f"separate copy of the code, so I stay up; nothing ships until you've "
+        f"reviewed the branch. I'll tell you when it's done."
     )
 
 

@@ -883,6 +883,16 @@ class ShellCommandLineTests(unittest.TestCase):
         with self.assertRaises(live_data_guard.LiveDataGuardError):
             subprocess.Popen(["powershell", "-Command", ps_cmd])
 
+    def test_the_safe_runner_spawn_shape_is_blocked(self):
+        """core/actions._act_upgrade now spawns `python -u tools/selfup_runner.py`
+        (no shell). It is a launcher of the self-upgrade, so a test that reaches
+        it for real must be refused - aimed at a tempdir copy of the name."""
+        if not live_data_guard._INSTALLED:
+            self.skipTest("live-data guard not installed")
+        fake = os.path.join(tempfile.gettempdir(), "tools", "selfup_runner.py")
+        with self.assertRaises(live_data_guard.LiveDataGuardError):
+            subprocess.Popen([sys.executable, "-u", fake])
+
     # ── the anti-false-positive half, which is what makes the above safe ─────
     def test_a_prompt_positional_argument_is_still_not_tokenised(self):
         """tests/test_multi_agent_pipeline.py hands the claude CLI multi-line

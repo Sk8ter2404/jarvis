@@ -1,42 +1,41 @@
 #!/usr/bin/env python3
 """
-JARVIS Upgrade Pipeline
-─────────────────────────
-Invoked by JARVIS's `upgrade` action or run manually.
+JARVIS Upgrade entry point (SAFE design, 2026-10-15)
+────────────────────────────────────────────────────
+Started only when the owner asks (the `upgrade` action / tray "Run Upgrade
+Now") - never by an idle timer. The work itself lives in tools/selfup_runner.py:
 
-Flow:
-1. Snapshot current code into backups/<timestamp>/ (last 5 kept)
-2. Read all unticked items from jarvis_todo.md
-3. Kill any running JARVIS instance
-4. Spawn Claude Code CLI (--print --dangerously-skip-permissions) in a
-   new visible PowerShell window with the pending queue as the prompt;
-   Claude Code exits automatically when the work is done.
-5. After it exits, this script runs a final py_compile sweep of every
-   touched file, writes .last_upgrade_summary.json so the next JARVIS
-   start can announce what changed, and (if --relaunch) launches JARVIS.
+1. Create a fresh git worktree off origin/main (branch auto/selfup-<stamp>).
+2. Take the owner-approved tasks from jarvis_todo.md ([self-heal] / [anomaly]
+   lines are skipped; jarvis_todo_proposed.md is never read).
+3. For each task: planner (read-only) -> implementer (locked-down Claude Code,
+   edits only the worktree) -> reviewer (read-only) -> headless compile smoke
+   -> ONE git commit, or a git revert.
+4. Run the real gate once (tools/gate_run.py + tools/run_tests.py with a
+   1800 s budget, then tools/check_no_pii.py) and write a report under
+   data/selfup_reports/.
+The live checkout is never edited and the live JARVIS is never killed,
+relaunched or booted. No VERSION bump, no push, no tag: the branch waits for
+a normal release session.
 
 Manual usage:
-    python upgrade_jarvis.py                # multi-agent pipeline (default).
-                                            # 4 stages per task: planner →
-                                            # implementer → reviewer → tester.
-    python upgrade_jarvis.py --relaunch     # auto-relaunch JARVIS after upgrade
+    python upgrade_jarvis.py                # the safe run above
     python upgrade_jarvis.py --dry-audit    # read-only preview of what Claude would do
-                                            # (no changes, no backup, no JARVIS kill)
-    python upgrade_jarvis.py --single-stage # legacy fallback: one Claude invocation
-                                            # per task, no review/test gates. Faster
-                                            # and cheaper but no regression guards —
-                                            # for emergencies only.
+                                            # (no changes, no worktree)
+    python upgrade_jarvis.py --blue-green   # owner-typed zero-downtime handoff of
+                                            # code ALREADY on disk (stops/starts JARVIS)
+    python upgrade_jarvis.py --force-trigger-gate-now   # one-shot stability gate
 
 Pipeline model knobs (env vars, optional):
     JARVIS_PIPELINE_PLANNER_MODEL       default "haiku"
     JARVIS_PIPELINE_IMPLEMENTER_MODEL   default "opus"
     JARVIS_PIPELINE_REVIEWER_MODEL      default "sonnet"
-    JARVIS_PIPELINE_TESTER_WAIT_S       default 90
-    JARVIS_PIPELINE_SKIP_TESTER         "1" to skip the tester stage (debug)
+    JARVIS_PIPELINE_MAX_USD             default 25 (per-run cost cap)
+    JARVIS_SELFUP_MAX_TASKS             default 5
 
 Requires:
     - `claude` CLI installed and on PATH (Claude Code)
-    - A Claude subscription — the pipeline strips ANTHROPIC_API_KEY and
+    - A Claude subscription - the pipeline strips ANTHROPIC_API_KEY and
       runs Claude Code on a subscription, NOT on metered API credits.
       core/claude_accounts.py picks which one per call (CLAUDE_PRO_FIRST_UNTIL:
       a second Pro profile first while it lasts, Max on its limits).
@@ -113,6 +112,12 @@ def _gate_config() -> tuple[int, int, bool]:
 # tweaking the env var between pipeline runs) without re-importing.
 
 # ═════════════ Upgrade-in-progress marker (watchdog handshake) ════════════
+# UPDATE 2026-10-15: the default run (tools/selfup_runner.py) works in a
+# separate git worktree and never stops or boots JARVIS, so it holds no marker;
+# only the owner-typed --blue-green / --force-trigger-gate-now flags do. The
+# history below describes the retired live-tree run and is kept for the lease
+# design, which those flags still use.
+#
 # WHY THIS EXISTS (H-7, 2026-08-20).
 # tools/jarvis_watchdog.py resurrects JARVIS whenever it sees "no
 # bobert_companion process AND no data/clean_shutdown.flag". That is exactly
@@ -1107,494 +1112,6 @@ def find_claude_cli() -> str | None:
     return None
 
 
-def spawn_claude_code(tasks: list[str], claude_path: str,
-                      single_stage: bool = False) -> subprocess.Popen | None:
-    """Launch a Python loop driver in a new visible console.
-
-    Two driver flavors:
-
-    • Multi-agent pipeline (DEFAULT) — each iteration runs the 4-stage
-      pipeline (planner → implementer → reviewer → tester) from
-      tools/multi_agent_pipeline.py. The driver tempfile is thin: it just
-      sets sys.path and calls run_pipeline_loop_driver(). All the
-      orchestration lives in the module so it stays grep-able and testable.
-
-    • Single-stage (legacy, --single-stage) — each iteration invokes
-      `claude --print` ONCE to implement one task and exit, then the loop
-      re-reads jarvis_todo.md and fires another invocation. No review or
-      test gates. Faster and cheaper, but a bad change can ship straight to
-      bobert_companion.py with no checks. Kept for emergencies.
-
-    Why the loop in both modes? `--print` is one-shot. Without the loop, a
-    15-task queue would only get the first 1-3 tasks done before Claude
-    Code exited. The loop guarantees the queue drains fully (or until the
-    safety cap is hit).
-
-    Why a Python driver instead of a PowerShell wrapper? The old
-    PowerShell-hosted pipe (`claude ... | python -u pp.py`) printed nothing
-    inside CREATE_NEW_CONSOLE windows — PS pipe buffering across the new-
-    console boundary swallowed every stream-json event until claude exited.
-    The driver does the pipe in pure Python via subprocess.Popen.stdout
-    (line-buffered, byte-passthrough) so events render in real time, and
-    additionally tees every line to upgrade_stream.log so the user can
-    `Get-Content -Wait` from any other window if the visible one breaks
-    again."""
-    # Hard safety cap. The driver loop also exits early when the queue is
-    # empty AND when no progress is made for several iterations, so this just
-    # needs to be high enough that a legitimately-growing queue (e.g. the
-    # auditor appending findings mid-run) can still drain. Was 25 — that
-    # silently capped audit-fix runs at 25 iterations even when the queue
-    # held 400+ tasks.
-    MAX_ITER = max(len(tasks) * 2 + 50, 1000)
-
-    # Per-iteration prompt: do ONE task, mark it done, exit. No multi-task
-    # plan, no codebase review at the end — the loop handles batching.
-    per_task_prompt = (
-        f"You are upgrading the JARVIS PC companion at {PROJECT_DIR}. "
-        f"Read jarvis_todo.md and find the FIRST line that starts with '- [ ]' "
-        f"(an unchecked task). Implement that ONE task end-to-end:\n"
-        f"  1. Make the code changes the task describes.\n"
-        f"  2. Run python -m py_compile on every file you touched. Fix any errors.\n"
-        f"  3. Edit jarvis_todo.md to change '- [ ]' to '- [x]' on that task's line, "
-        f"and append a ' ✓ DONE — <one-line note>' summary of what you did.\n"
-        f"  4. Exit. Do NOT try to handle more than one task in this invocation — "
-        f"a wrapper loop will call you again for the next task.\n"
-        f"If there are no unchecked tasks left, just print 'QUEUE EMPTY' and exit. "
-        f"If a task is hardware-dependent or genuinely impossible (e.g. 'check that "
-        f"the cables are plugged in'), tick it off with a note explaining why it "
-        f"can't be auto-fixed."
-    )
-
-    mode_label = "SINGLE-STAGE (legacy)" if single_stage else "MULTI-AGENT pipeline"
-    log_line = (
-        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Spawning Claude Code LOOP "
-        f"[{mode_label}] ({len(tasks)} task(s), max {MAX_ITER} iterations) "
-        f"via {claude_path}\n"
-    )
-    with open(UPGRADE_LOG, "a", encoding="utf-8") as f:
-        f.write(log_line)
-
-    try:
-        # Strip ANTHROPIC_API_KEY from the spawned env so Claude Code bills
-        # to a subscription rather than API credits. The driver picks the
-        # profile per call (core/claude_accounts.py).
-        env = os.environ.copy()
-        env.pop("ANTHROPIC_API_KEY", None)
-
-        # Render the driver template to a tempfile. Sentinel substitution
-        # (not str.format) so we don't fight Python brace-escaping with the
-        # f-strings and dict literals in the template body.
-        import tempfile
-        if single_stage:
-            template = _LOOP_DRIVER_TEMPLATE
-            suffix = "_jarvis_upgrade_loop.py"
-        else:
-            template = _PIPELINE_LOOP_DRIVER_TEMPLATE
-            suffix = "_jarvis_pipeline_loop.py"
-        driver_src = (template
-            .replace("__PROJECT_DIR__",  repr(PROJECT_DIR))
-            .replace("__CLAUDE_PATH__",  repr(claude_path))
-            .replace("__PROMPT__",       repr(per_task_prompt))
-            .replace("__STREAM_LOG__",   repr(UPGRADE_STREAM_LOG))
-            .replace("__MAX_ITER__",     str(MAX_ITER))
-            .replace("__TASK_COUNT__",   str(len(tasks)))
-        )
-        drv_fd, drv_path = tempfile.mkstemp(suffix=suffix, text=True)
-        with os.fdopen(drv_fd, "w", encoding="utf-8") as _df:
-            _df.write(driver_src)
-
-        # Spawn the driver in its own console window. -u keeps stdout line-
-        # buffered. CREATE_NEW_CONSOLE gives it a visible terminal on Windows.
-        proc = subprocess.Popen(
-            [sys.executable, "-u", drv_path],
-            creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
-            env=env,
-            cwd=PROJECT_DIR,
-            close_fds=True,
-        )
-        return proc
-    except Exception as e:
-        print(f"Failed to launch Claude Code: {e}")
-        return None
-
-
-# ───────────────── Upgrade-loop driver (rendered to tempfile) ─────────────────
-# This template is rendered with sentinel substitution and written to a temp
-# .py file that gets spawned in its own console window. Doing the
-# claude→pretty-printer pipe inside one Python process (via Popen.stdout)
-# bypasses the PowerShell pipe-buffering bug that made the spawned window
-# go silent. The driver also tees every rendered line to upgrade_stream.log
-# so the user can `Get-Content -Wait` it from any other window — guarantees
-# visibility even if the new console itself is broken.
-_LOOP_DRIVER_TEMPLATE = r'''#!/usr/bin/env python3
-"""JARVIS upgrade loop driver (spawned by upgrade_jarvis.py).
-
-Loops up to MAX_ITER times: counts unchecked tasks, runs `claude --print`
-as a subprocess, reads its stream-json stdout line-by-line, pretty-prints
-each event to both console AND a log file. Doing the pipe in pure Python
-sidesteps the PowerShell pipe-buffering issue that made the spawned loop
-window silent.
-"""
-import json, os, re, subprocess, sys, threading, time
-
-PROJECT_DIR = __PROJECT_DIR__
-CLAUDE_PATH = __CLAUDE_PATH__
-PROMPT      = __PROMPT__
-STREAM_LOG  = __STREAM_LOG__
-MAX_ITER    = __MAX_ITER__
-TASK_COUNT  = __TASK_COUNT__
-
-TODO_FILE = os.path.join(PROJECT_DIR, "jarvis_todo.md")
-
-# Enable ANSI escape sequences on Windows 10+ consoles so colors render.
-if os.name == "nt":
-    try:
-        import ctypes
-        _k32 = ctypes.windll.kernel32
-        _k32.SetConsoleMode(_k32.GetStdHandle(-11), 7)
-    except Exception:
-        pass
-
-CYAN   = "\x1b[36m"
-YELLOW = "\x1b[33m"
-GREEN  = "\x1b[32m"
-RED    = "\x1b[31m"
-GRAY   = "\x1b[90m"
-RESET  = "\x1b[0m"
-
-_log_fp = open(STREAM_LOG, "a", encoding="utf-8", buffering=1)
-_log_fp.write(
-    "\n=== upgrade loop started "
-    + time.strftime("%Y-%m-%d %H:%M:%S")
-    + " ===\n"
-)
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-def emit(s):
-    """Write to console (flushed) and append plain-text copy to STREAM_LOG."""
-    print(s, flush=True)
-    _log_fp.write(_ANSI_RE.sub("", s) + "\n")
-    _log_fp.flush()
-
-def _fmt_tool_use(c):
-    name = c.get("name", "?")
-    inp = c.get("input", {}) or {}
-    if name == "Read":      return f"  [read]  {inp.get('file_path','')}"
-    if name == "Edit":      return f"  [edit]  {inp.get('file_path','')}"
-    if name == "Write":     return f"  [write] {inp.get('file_path','')}"
-    if name == "Bash":      return f"  [bash]  {(inp.get('command','') or '')[:120]}"
-    if name == "Grep":      return f"  [grep]  {(inp.get('pattern','') or '')[:80]}"
-    if name == "Glob":      return f"  [glob]  {inp.get('pattern','')}"
-    if name == "TodoWrite": return f"  [todo]  {len(inp.get('todos', []))} item(s)"
-    return f"  [tool]  {name}"
-
-def _fmt(e):
-    t = e.get("type", "?")
-
-    if t == "assistant":
-        msg = e.get("message", {})
-        lines = []
-        for c in msg.get("content", []):
-            ct = c.get("type")
-            if ct == "tool_use":
-                lines.append(_fmt_tool_use(c))
-            elif ct == "text":
-                tx = (c.get("text", "") or "").strip()
-                if tx:
-                    lines.append(f"  [say]   {tx[:240]}")
-        return "\n".join(lines)
-
-    if t == "user":
-        msg = e.get("message", {})
-        for c in msg.get("content", []):
-            if c.get("type") == "tool_result":
-                out = c.get("content", "")
-                if isinstance(out, list):
-                    out = " ".join(b.get("text","") for b in out if isinstance(b, dict))
-                # BUG FIX: `splitlines()[0]` raised IndexError on tool_results
-                # whose joined text was empty or whitespace-only (e.g. some
-                # ToolSearch responses). Take the first non-empty line, or
-                # skip the event entirely if there is none.
-                _lines = (str(out) or "").strip().splitlines()
-                _first = next((ln for ln in _lines if ln.strip()), "")
-                if _first:
-                    return f"          {_first[:120]}"
-        return ""
-
-    if t == "stream_event":
-        ev = e.get("event", {}) or {}
-        if ev.get("type") == "content_block_start":
-            cb = ev.get("content_block", {}) or {}
-            if cb.get("type") == "tool_use":
-                return _fmt_tool_use(cb)
-        return ""
-
-    if t == "result":
-        ms   = e.get("duration_ms", 0)
-        cost = e.get("total_cost_usd", 0)
-        return f"  [done]  {e.get('subtype','?')} in {ms/1000:.1f}s, ${cost:.4f}"
-
-    if t == "system":
-        if e.get("subtype") == "init":
-            sid = (e.get("session_id", "?") or "?")[:8]
-            return f"  [init]  session {sid} model={e.get('model','?')}"
-        return ""
-
-    if t == "rate_limit_event":
-        info = e.get("rate_limit_info", {}) or {}
-        if info.get("status") != "allowed":
-            return (
-                f"  [!]     rate limit: {info.get('status','?')} "
-                f"reason={info.get('overageDisabledReason','?')}"
-            )
-        return ""
-
-    return ""
-
-def count_pending():
-    try:
-        with open(TODO_FILE, "r", encoding="utf-8") as f:
-            return len(re.findall(r"^- \[ \]", f.read(), re.MULTILINE))
-    except Exception:
-        return 0
-
-# Which Claude subscription runs each call (core/claude_accounts, 2026-10-14):
-# the owner's Pro account first while it lasts, Max when Pro refuses (its
-# 5-hour / weekly limit, or signed out). Without the module: as before.
-try:
-    sys.path.insert(0, PROJECT_DIR)
-    from core import claude_accounts as ACCT
-except Exception:
-    ACCT = None
-
-def run_one_claude_call():
-    if ACCT is None:
-        return _claude_call(None)[0]
-    profile, why = ACCT.choose()
-    emit(f"{GRAY}[account] {'Pro' if profile == ACCT.PRO else 'Max'}: {why}{RESET}")
-    rc, refused = _claude_call(profile)
-    if profile == ACCT.PRO and refused is not None:
-        _until, msg = ACCT.note_pro_refusal(refused[0], refused[1])
-        emit(f"{YELLOW}[account] {msg}{RESET}")
-        rc, _refused = _claude_call(ACCT.MAX)
-    return rc
-
-def _claude_call(profile):
-    """(returncode, refused): refused = (limit, signed_out) when the profile
-    REFUSED the work (the call failed on a limit or a missing sign-in), else
-    None. A limit event on a call that still finished (Claude Code moved to
-    another model) is not a refusal - re-running it would repeat the task."""
-    cmd = [
-        CLAUDE_PATH, "--print", "--verbose",
-        "--output-format", "stream-json",
-        "--include-partial-messages",
-        "--dangerously-skip-permissions",
-        PROMPT,
-    ]
-    env = ACCT.env_for(profile) if (ACCT is not None and profile) else None
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            cwd=PROJECT_DIR,
-            env=env,
-        )
-    except FileNotFoundError as e:
-        emit(f"{RED}[loop] claude binary not found at {CLAUDE_PATH}: {e}{RESET}")
-        return 127, None
-    except Exception as e:
-        emit(f"{RED}[loop] failed to spawn claude: {e}{RESET}")
-        return 1, None
-    assert proc.stdout is not None
-    limit, signed_out, result_error = None, False, False
-    # Watchdog: a hung `claude --print` child (network stall, stuck stream, no
-    # EOF) would otherwise block the read loop AND proc.wait() forever, freezing
-    # the whole upgrade loop with JARVIS already killed. Kill the child past a
-    # hard wall-clock deadline so the loop drains EOF and returns a failure code.
-    _CALL_TIMEOUT_S = 3600  # 1h backstop — a single task call should never approach this
-    _killed = threading.Event()
-    def _watchdog():
-        try:
-            proc.kill()
-        finally:
-            _killed.set()
-    _timer = threading.Timer(_CALL_TIMEOUT_S, _watchdog)
-    _timer.daemon = True
-    _timer.start()
-    try:
-        for raw in proc.stdout:
-            line = raw.rstrip("\n").rstrip("\r")
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                evt = json.loads(stripped)
-            except json.JSONDecodeError:
-                # Non-JSON line (likely a stderr message merged in). Surface it
-                # so a silently-broken invocation isn't invisible.
-                emit(f"  [?]     {line[:160]}")
-                if ACCT is not None:
-                    limit = limit or ACCT.limit_from_text(stripped)
-                    signed_out = signed_out or ACCT.signed_out_text(stripped)
-                continue
-            if ACCT is not None and isinstance(evt, dict):
-                limit = limit or ACCT.limit_from_event(evt)
-                if evt.get("type") == "result" and evt.get("is_error"):
-                    result_error = True
-            out = _fmt(evt)
-            if out:
-                emit(out)
-        proc.wait()
-    finally:
-        _timer.cancel()
-    if _killed.is_set():
-        emit(f"{RED}[loop] claude call exceeded {_CALL_TIMEOUT_S}s — killed to "
-             f"unblock the upgrade loop.{RESET}")
-        return 124, None
-    rc = proc.returncode
-    failed = rc != 0 or result_error
-    if failed and (limit is not None or signed_out):
-        return rc, (limit, bool(signed_out and limit is None))
-    return rc, None
-
-def main():
-    # Self-delete the rendered driver tempfile so %TEMP% doesn't accumulate
-    # one *_jarvis_upgrade_loop.py per upgrade cycle. CPython reads .py source
-    # files at compile time and closes the handle before main() runs, so the
-    # unlink succeeds even on Windows. Wrapped in try/except: if it ever does
-    # fail (e.g. AV scanner holding the handle), continue silently rather than
-    # crash the loop driver.
-    try:
-        os.unlink(sys.argv[0])
-    except OSError:
-        pass
-
-    emit(
-        f"{CYAN}=== JARVIS UPGRADE: {TASK_COUNT} task(s), looping "
-        f"(max {MAX_ITER} iterations) ==={RESET}"
-    )
-    emit(f"{GRAY}Live log: {STREAM_LOG}{RESET}")
-    emit(
-        f'{GRAY}Tail from any other window with: '
-        f'Get-Content -Wait "{STREAM_LOG}"{RESET}'
-    )
-
-    # Loop with two guards:
-    #   (1) Stop early when queue empty (normal success path).
-    #   (2) No-progress watchdog: if the unchecked count fails to drop for
-    #       NO_PROGRESS_LIMIT consecutive iterations, something is stuck —
-    #       give up rather than burn cycles in a no-op.
-    NO_PROGRESS_LIMIT = 5
-    no_progress = 0
-    last_pending = None
-    for i in range(1, MAX_ITER + 1):
-        pending = count_pending()
-        if pending == 0:
-            emit("")
-            emit(f"{GREEN}[loop] queue empty — all tasks done{RESET}")
-            break
-        if last_pending is not None and pending >= last_pending:
-            no_progress += 1
-            if no_progress >= NO_PROGRESS_LIMIT:
-                emit("")
-                emit(
-                    f"{RED}[loop] no queue progress for "
-                    f"{NO_PROGRESS_LIMIT} iterations — stopping{RESET}"
-                )
-                break
-        else:
-            no_progress = 0
-        last_pending = pending
-        emit("")
-        emit(
-            f"{YELLOW}[loop] iteration {i} of {MAX_ITER} — "
-            f"{pending} task(s) remain{RESET}"
-        )
-        rc = run_one_claude_call()
-        if rc != 0:
-            emit(f"{RED}[loop] Claude exited code {rc} — stopping{RESET}")
-            break
-
-    emit("")
-    emit(f"{YELLOW}Verifying syntax...{RESET}")
-    rc = subprocess.run(
-        [sys.executable, "-m", "py_compile", "bobert_companion.py"],
-        cwd=PROJECT_DIR,
-    ).returncode
-    if rc == 0:
-        emit(f"{GREEN}bobert_companion.py: OK{RESET}")
-    else:
-        emit(f"{RED}SYNTAX ERROR in bobert_companion.py — check above!{RESET}")
-    emit(f"{GREEN}Upgrade complete.{RESET}")
-
-    try:
-        _log_fp.close()
-    except Exception:
-        pass
-
-    time.sleep(5)
-
-if __name__ == "__main__":
-    main()
-'''
-
-
-# ─────────── Multi-agent pipeline driver (rendered to tempfile) ───────────
-# Thin wrapper: all orchestration lives in tools/multi_agent_pipeline.py.
-# Keeping the driver itself small makes the per-iteration logic easy to
-# read/modify in the module file rather than buried in an f-string template.
-_PIPELINE_LOOP_DRIVER_TEMPLATE = r'''#!/usr/bin/env python3
-"""JARVIS multi-agent upgrade loop driver (spawned by upgrade_jarvis.py).
-
-Each iteration runs the 4-stage pipeline on the first unchecked task:
-    planner (cheap, read-only) → implementer (Opus, writes) →
-    reviewer (sonnet, read-only) → tester (boot smoke test).
-"""
-import os, sys, time
-
-PROJECT_DIR = __PROJECT_DIR__
-CLAUDE_PATH = __CLAUDE_PATH__
-STREAM_LOG  = __STREAM_LOG__
-MAX_ITER    = __MAX_ITER__
-TASK_COUNT  = __TASK_COUNT__
-
-# Self-delete the rendered tempfile so %TEMP% doesn't accumulate one per
-# upgrade. CPython reads/closes the .py source before main() runs, so the
-# unlink is safe on Windows.
-try:
-    os.unlink(sys.argv[0])
-except OSError:
-    pass
-
-sys.path.insert(0, PROJECT_DIR)
-try:
-    from tools.multi_agent_pipeline import run_pipeline_loop_driver
-except Exception as exc:
-    print(f"[pipeline-driver] failed to import multi_agent_pipeline: {exc!r}")
-    print(f"[pipeline-driver] PROJECT_DIR={PROJECT_DIR}")
-    time.sleep(10)
-    sys.exit(2)
-
-rc = run_pipeline_loop_driver(
-    project_dir=PROJECT_DIR,
-    claude_path=CLAUDE_PATH,
-    stream_log=STREAM_LOG,
-    max_iter=MAX_ITER,
-    task_count=TASK_COUNT,
-)
-
-# Pause so the user can read the final summary in the spawned console
-# before it closes.
-time.sleep(5)
-sys.exit(rc)
-'''
-
-
 def spawn_claude_dry_audit(tasks: list[str], claude_path: str) -> subprocess.Popen | None:
     """Launch Claude Code in --print mode WITHOUT --dangerously-skip-permissions
     to produce a read-only audit/code-review report on the pending queue.
@@ -2034,34 +1551,32 @@ def run_blue_green_handoff(timeout_boot_s: float = 60.0,
                         "new_prod_heartbeat": False}}
 
 
+# Flags that still reach LIVE-tree machinery (a staging handoff / a one-shot
+# gate). They are owner-typed maintenance commands - JARVIS's voice, tray and
+# idle paths never start them - and they are the only runs that stop or
+# relaunch JARVIS, so they alone hold the upgrade-in-progress marker.
+_LIVE_MAINTENANCE_FLAGS = ("--blue-green", "--force-trigger-gate-now")
+
+
 def main():
-    """Thin wrapper that holds the upgrade-in-progress marker for the WHOLE run.
-
-    The marker goes up BEFORE the first mutating step (backup / JARVIS kill /
-    Claude Code spawn) and comes down in a finally — including the blue-green
-    branch's sys.exit(0), since SystemExit still unwinds a with-block. Without
-    it the watchdog resurrects JARVIS from half-written source every 5 minutes
-    for the length of the run; see the marker block above for the full trace.
-
-    --dry-audit is genuinely read-only (no backup, no kill, no writes) and is
-    deliberately NOT covered: parking the resurrection net for a read-only
-    preview would make the marker mean something it does not mean."""
-    if "--dry-audit" in sys.argv:
+    """The upgrade-in-progress marker (see above) parks the watchdog so it does
+    not resurrect JARVIS from half-written source while a run has him stopped.
+    The default run no longer stops JARVIS (it works in a separate git
+    worktree), so only the live maintenance flags hold the marker; --dry-audit
+    is read-only and deliberately NOT covered either."""
+    if not any(f in sys.argv for f in _LIVE_MAINTENANCE_FLAGS):
         return _main_body()
     with upgrade_in_progress():
         return _main_body()
 
 
 def _main_body():
-    auto_relaunch = "--relaunch" in sys.argv
-    dry_audit     = "--dry-audit" in sys.argv
-    single_stage  = "--single-stage" in sys.argv
-    blue_green    = "--blue-green" in sys.argv
+    dry_audit = "--dry-audit" in sys.argv
 
     # --force-trigger-gate-now: run a one-shot stability gate immediately and
     # exit. Used for the verify step in the task spec: deliberately break a
     # file, run this flag, and watch the gate catch + auto-revert + queue a
-    # regression task. No backup/kill ceremony — the gate's smoke test
+    # regression task. No backup/kill ceremony - the gate's smoke test
     # handles boot lifecycle.
     if "--force-trigger-gate-now" in sys.argv:
         print("=== STABILITY GATE: forced one-shot ===")
@@ -2084,39 +1599,28 @@ def _main_body():
               f"stage_failed={result.get('stage_failed')}")
         sys.exit(0 if result["ok"] else 1)
 
-    print(f"=== JARVIS Upgrade Pipeline ===")
-    if dry_audit:
-        print("(DRY AUDIT mode — read-only preview, no changes will be made)")
-    elif single_stage:
-        print("(SINGLE-STAGE mode — legacy one-call-per-task, no review/test gates)")
-    else:
-        print("(MULTI-AGENT mode — planner → implementer → reviewer → tester per task)")
+    for gone in ("--relaunch", "--single-stage"):
+        if gone in sys.argv:
+            print(f"({gone} no longer exists: an upgrade run works in a separate "
+                  f"git worktree, never edits or restarts the live JARVIS, and "
+                  f"always runs the review + test gates.)")
 
-    tasks = get_pending_tasks()
-    print(f"Pending tasks in queue: {len(tasks)}")
-    for t in tasks:
-        print(f"  - {t[:90]}")
-
-    if not tasks:
-        print("\nNothing to upgrade. Exiting.")
-        return
-
-    if not dry_audit:
-        # Snapshot current code before anything changes
-        backup_path = backup_codebase()
-        print(f"\nBackup saved → {backup_path}")
-
-        killed = kill_running_jarvis()
-        print(f"Stopped {killed} running JARVIS process(es).")
-        time.sleep(2)
-    else:
-        # Dry-audit is read-only — no backup needed and no reason to disturb
-        # any running JARVIS instance.
-        print("\nSkipping backup + JARVIS-kill (dry-audit is read-only).")
-
+    print("=== JARVIS Upgrade Pipeline ===")
     claude_path = find_claude_cli()
-    if claude_path and dry_audit:
-        # ---- Mode C: Dry audit — read-only review, no changes ----
+
+    if dry_audit:
+        # Read-only preview of the approved queue: no worktree, no changes.
+        print("(DRY AUDIT mode - read-only preview, no changes will be made)")
+        tasks = get_pending_tasks()
+        print(f"Pending tasks in queue: {len(tasks)}")
+        for t in tasks:
+            print(f"  - {t[:90]}")
+        if not tasks:
+            print("\nNothing to upgrade. Exiting.")
+            return
+        if not claude_path:
+            print("`claude` CLI not found - cannot run the audit.")
+            return
         print(f"Found Claude Code at: {claude_path}")
         print("Launching DRY AUDIT in a new window...")
         proc = spawn_claude_dry_audit(tasks, claude_path)
@@ -2127,201 +1631,16 @@ def _main_body():
         print("The report will be saved to dry_audit_<timestamp>.md in the project root.")
         return
 
-    if claude_path:
-        # ---- Mode A: Autonomous via `claude` CLI ----
-        print(f"Found Claude Code at: {claude_path}")
-        print("Launching Claude Code in a new window...")
-        proc = spawn_claude_code(tasks, claude_path, single_stage=single_stage)
-        if proc is None:
-            print("Failed. Aborting.")
-            return
-
-        if auto_relaunch:
-            print(f"\nWaiting for Claude Code (PID {proc.pid}) to finish...")
-            try:
-                proc.wait()
-                print("\nClaude Code finished. Running syntax check...")
-                time.sleep(1)
-
-                # ── Syntax check all key files ───────────────────────────────
-                import py_compile, glob as _glob
-                syntax_errors: list[str] = []
-                _files = (
-                    [SCRIPT]
-                    + _glob.glob(os.path.join(PROJECT_DIR, "skills", "*.py"))
-                    + _glob.glob(os.path.join(PROJECT_DIR, "hud", "*.py"))
-                    # core/ and tools/ are edited by the pipeline AND imported
-                    # by bobert_companion at startup (`from core.* import *`), so
-                    # a syntax error there bricks the boot just as surely as one
-                    # in the entry point. Without compiling them, syntax_ok is a
-                    # false green and the relaunch gate ships un-importable code.
-                    # Recurse so package subdirs are covered.
-                    + _glob.glob(os.path.join(PROJECT_DIR, "core", "**", "*.py"),
-                                 recursive=True)
-                    + _glob.glob(os.path.join(PROJECT_DIR, "tools", "**", "*.py"),
-                                 recursive=True)
-                )
-                for _f in _files:
-                    try:
-                        py_compile.compile(_f, doraise=True)
-                    except py_compile.PyCompileError as _ce:
-                        syntax_errors.append(os.path.basename(_f) + ": " + str(_ce))
-                syntax_ok = len(syntax_errors) == 0
-                if syntax_ok:
-                    print(f"  Syntax: OK ({len(_files)} files clean)")
-                else:
-                    print(f"  Syntax ERRORS ({len(syntax_errors)}):")
-                    for _e in syntax_errors:
-                        print(f"    {_e}")
-
-                # ── Codebase auditor (post-upgrade gate) ─────────────────────
-                # Runs tools/audit_codebase.py and surfaces any new P0/P1
-                # findings before relaunch. Exit codes:
-                #   0 = clean, 1 = P0, 2 = P1, 3 = only P2.
-                audit_p0 = 0
-                audit_p1 = 0
-                audit_p2 = 0
-                audit_script = os.path.join(PROJECT_DIR, "tools", "audit_codebase.py")
-                if os.path.exists(audit_script):
-                    print("\nRunning codebase auditor...")
-                    try:
-                        rc = subprocess.run(
-                            [sys.executable, audit_script, "--quiet"],
-                            cwd=PROJECT_DIR, timeout=120,
-                        ).returncode
-                    except subprocess.TimeoutExpired:
-                        rc = -1
-                        print("  [audit] timed out after 120s — skipping")
-                    report_path = os.path.join(PROJECT_DIR, "audit_report.json")
-                    if os.path.exists(report_path):
-                        try:
-                            with open(report_path, "r", encoding="utf-8") as _rf:
-                                _audit = json.load(_rf)
-                            audit_p0 = _audit.get("summary", {}).get("p0", 0)
-                            audit_p1 = _audit.get("summary", {}).get("p1", 0)
-                            audit_p2 = _audit.get("summary", {}).get("p2", 0)
-                        except Exception:
-                            pass
-                    if rc == 0:
-                        print(f"  Audit: CLEAN (0 findings)")
-                    elif rc == 1:
-                        print(f"  Audit: FAIL — {audit_p0} P0 finding(s); see audit_report.md")
-                    elif rc == 2:
-                        print(f"  Audit: WARN — {audit_p1} P1 finding(s); see audit_report.md")
-                    elif rc == 3:
-                        print(f"  Audit: INFO — {audit_p2} P2 finding(s); see audit_report.md")
-                    else:
-                        print(f"  Audit: skipped (rc={rc})")
-
-                # ── Write summary so JARVIS announces changes on next start ──
-                try:
-                    with open(UPGRADE_SUMMARY_FILE, "w", encoding="utf-8") as _sf:
-                        json.dump({
-                            "upgraded_at": time.strftime("%H:%M"),
-                            "tasks":       tasks,
-                            "syntax_ok":   syntax_ok,
-                            "syntax_errors": syntax_errors[:3],
-                            "audit_p0":    audit_p0,
-                            "audit_p1":    audit_p1,
-                            "audit_p2":    audit_p2,
-                        }, _sf, indent=2)
-                    print(f"  Upgrade summary written → {UPGRADE_SUMMARY_FILE}")
-                except Exception as _we:
-                    print(f"  Couldn't write upgrade summary: {_we}")
-
-                # ── Append a versioned changelog entry ───────────────────────
-                _append_changelog_entry(
-                    tasks_before=tasks,
-                    syntax_ok=syntax_ok,
-                    audit_p0=audit_p0,
-                    audit_p1=audit_p1,
-                    audit_p2=audit_p2,
-                )
-
-                # ── Relaunch gate ────────────────────────────────────────────
-                # NEVER bring JARVIS back up on syntactically broken source — it
-                # would crash on import and brick the assistant until a manual
-                # fix. A failed syntax check reverts to the pre-upgrade snapshot
-                # (backup_path, taken before the run) and relaunches THAT
-                # known-good code, so JARVIS always comes back alive. This makes
-                # the changelog's own "review backups before relaunch" note
-                # (previously advisory only) actually enforcing, and mirrors the
-                # stability gate's revert-on-fail contract. A P0 audit finding on
-                # otherwise-valid syntax is surfaced loudly but does not auto-
-                # revert a working upgrade (the auditor can false-positive, and
-                # the pre-upgrade tree may carry the same pre-existing finding).
-                if not syntax_ok:
-                    print(f"\n⚠  Syntax check FAILED ({len(syntax_errors)} file(s)) — "
-                          f"NOT relaunching broken code. Reverting to pre-upgrade backup…")
-                    try:
-                        revert_ok, revert_log = _revert_to_snapshot(backup_path)
-                        print(f"  Revert {'OK' if revert_ok else 'FAILED'}: {revert_log[:200]}")
-                    except Exception as _re:
-                        print(f"  Revert FAILED: {_re} — JARVIS source may be broken; "
-                              f"restore manually from {backup_path}")
-                elif audit_p0:
-                    print(f"\n⚠  Auditor flagged {audit_p0} P0 finding(s) post-upgrade — "
-                          f"relaunching (syntax is valid) but review audit_report.md.")
-
-                print("\nRelaunching JARVIS...")
-                time.sleep(2)
-                relaunch_jarvis()
-                print("JARVIS relaunched.")
-            except KeyboardInterrupt:
-                print("\nInterrupted - JARVIS not relaunched.")
-        else:
-            print("\nWhen Claude Code finishes, manually run:")
-            print(f"  python {os.path.basename(SCRIPT)}")
-        return
-
-    # ---- Mode B: Fallback — copy tasks to clipboard, open todo file ----
-    print("\n⚠  `claude` CLI not found anywhere.")
-    print("Falling back to manual handoff mode:")
-    print("  1. Copying the pending tasks to your clipboard")
-    print("  2. Opening jarvis_todo.md in your editor")
-    print("  3. Paste them into your Claude Code chat (Cursor/VS Code/web)")
-    print("  4. Tell Claude Code to implement them and tick them off")
-    print("  5. Manually relaunch JARVIS when done\n")
-
-    # Build a clipboard payload
-    task_block = "\n".join(f"- [ ] {t}" for t in tasks)
-    clipboard_text = (
-        f"Hey Claude Code — please implement these pending tasks for the JARVIS PC companion at "
-        f"{PROJECT_DIR}. Main script is bobert_companion.py. Read jarvis_todo.md for full context. "
-        f"Tick items off as you complete them.\n\n"
-        f"Pending tasks:\n{task_block}"
-    )
-
-    # Copy to Windows clipboard via PowerShell (no extra deps)
-    try:
-        ps = subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command", "$input | Set-Clipboard"],
-            stdin=subprocess.PIPE, text=True, close_fds=True,
-        )
-        ps.communicate(clipboard_text)
-        print("  ✓ Copied to clipboard")
-    except Exception as e:
-        print(f"  ✗ Could not copy to clipboard: {e}")
-        print("\n--- Paste this manually into Claude Code: ---")
-        print(clipboard_text)
-        print("---")
-
-    # Open todo file in default editor
-    try:
-        os.startfile(TODO_FILE)
-        print(f"  ✓ Opened {TODO_FILE}")
-    except Exception as e:
-        print(f"  ✗ Could not open editor: {e}")
-
-    print("\nWhen Claude Code is done, relaunch JARVIS manually:")
-    print(f"  python bobert_companion.py")
-    print("\nOr install the `claude` CLI for full autonomy:")
-    print("  https://docs.claude.com/en/docs/claude-code")
-    print("\n(Press Enter to close this window)")
-    try:
-        input()
-    except EOFError:
-        pass
+    # ---- The run: request-only, isolated worktree, locked-down Claude ----
+    # tools/selfup_runner.py owns everything (worktree, one commit per task,
+    # the real gate, the report). Nothing here touches the live tree.
+    if not claude_path:
+        print("`claude` CLI not found - nothing can be upgraded. Install Claude "
+              "Code (https://docs.claude.com/en/docs/claude-code) and re-run.")
+        sys.exit(127)
+    from tools import selfup_runner
+    result = selfup_runner.run(project_dir=PROJECT_DIR, claude_path=claude_path)
+    sys.exit(1 if result.get("error") else 0)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entrypoint; never run under unittest

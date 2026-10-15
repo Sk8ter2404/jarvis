@@ -1812,10 +1812,12 @@ class TrayDispatchTests(_MonolithTestBase):
         mrestart.assert_called_once()
 
     def test_trigger_overnight_calls_action(self):
-        with mock.patch.object(self.bc,
-                               "_act_start_overnight_upgrade") as mover:
+        # "Run Upgrade Now" is an explicit request: ONE safe upgrade run
+        # (_act_upgrade), not the goodnight standby action.
+        with mock.patch.object(self.bc, "_act_upgrade") as mupgrade,              mock.patch.object(self.bc, "_act_start_overnight_upgrade") as mover:
             self.bc._dispatch_tray_command("trigger_overnight", {})
-        mover.assert_called_once()
+        mupgrade.assert_called_once()
+        mover.assert_not_called()
 
     def test_each_audio_subtoggle_flips_its_flag(self):
         for cmd, attr in [
@@ -3798,7 +3800,7 @@ class DispatchTrayCommandEdgeTests(_MonolithTestBase):
             self.bc._dispatch_tray_command("restart", {})  # except 2597-2598
 
     def test_trigger_overnight_action_failure_swallowed(self):
-        with mock.patch.object(self.bc, "_act_start_overnight_upgrade",
+        with mock.patch.object(self.bc, "_act_upgrade",
                                side_effect=RuntimeError("overnight boom")):
             self.bc._dispatch_tray_command("trigger_overnight", {})  # 2602-2603
 

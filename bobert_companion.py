@@ -5910,12 +5910,15 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
     # hardened and this one rotted. Removed — the branch above is the only
     # tray-restart path.
     elif cmd == "trigger_overnight":
-        print("  [tray] trigger_overnight — starting overnight engine")
+        # "Run Upgrade Now" is an explicit owner request: start ONE safe run
+        # (separate git worktree, approved queue). Redesigned 2026-10-15; it
+        # used to enter sleep mode and kick the overnight engine.
+        print("  [tray] trigger_overnight — starting a safe upgrade run")
         try:
-            _out = _act_start_overnight_upgrade()
+            _out = _act_upgrade()
         except Exception as e:
-            _out = f"The overnight engine failed to start: {e}"
-            print(f"  [tray] overnight action failed: {e}")
+            _out = f"The upgrade failed to start: {e}"
+            print(f"  [tray] upgrade action failed: {e}")
         _publish_tray_result(entry.get("rid"), cmd, _out)
     elif cmd == "audio_processing_toggle":
         _audio_master_enabled[0] = not _audio_master_enabled[0]
@@ -45682,10 +45685,14 @@ def _release_singleton():
 
 
 def _overnight_upgrade_thread():  # pragma: no cover - background daemon (while-True self-improvement engine; never invoked outside a Thread)
-    """Background thread: runs the self-improvement engine inside JARVIS.
+    """Background thread: the self-improvement IDEA engine inside JARVIS.
     Every OVERNIGHT_CYCLE_GAP_HOURS (minimum), if JARVIS has been idle for
-    OVERNIGHT_IDLE_MINUTES, asks Claude to invent improvements, writes them
-    to jarvis_todo.md, and fires the upgrade pipeline."""
+    OVERNIGHT_IDLE_MINUTES (or he said goodnight), asks Claude to invent
+    improvements and writes them to jarvis_todo_proposed.md. It NEVER edits
+    the approved queue (jarvis_todo.md) and NEVER starts an upgrade run: a
+    run starts only when the owner asks for one (_act_upgrade, tray Run
+    Upgrade Now), on the approved queue, in a separate git worktree
+    (tools/selfup_runner.py). Redesigned 2026-10-15 after the safety audit."""
     import importlib
     _log_prefix = "  [overnight]"
     last_cycle_at = 0.0
@@ -45706,8 +45713,8 @@ def _overnight_upgrade_thread():  # pragma: no cover - background daemon (while-
           f"(idle={OVERNIGHT_IDLE_MINUTES}min, gap={OVERNIGHT_CYCLE_GAP_HOURS}h)")
 
     # Persistence resume: if the user said "goodnight" in a previous session
-    # and the flag hasn't expired, re-arm the engine immediately so overnight
-    # mode survives the kill+relaunch cycles that upgrades cause.
+    # and the flag hasn't expired, re-arm sleep mode and an idea cycle
+    # immediately so overnight mode survives a restart.
     try:
         if os.path.exists(OVERNIGHT_FLAG_FILE):
             _expiry = None
@@ -45747,20 +45754,19 @@ def _overnight_upgrade_thread():  # pragma: no cover - background daemon (while-
             force = _overnight_run_now.is_set()
             if force:
                 _overnight_run_now.clear()
-                print(f"{_log_prefix} triggered immediately (user requested)")
+                print(f"{_log_prefix} idea cycle requested (goodnight / overnight)")
             else:
                 if not _enough_gap():
                     continue
                 if not _is_idle():
                     continue
 
-            print(f"{_log_prefix} {'immediate' if force else 'idle threshold reached'} — starting improvement cycle")
-            # Note: last_cycle_at is NOT updated here. It's only updated when
-            # the cycle actually does work (fires an upgrade). Failed cycles
-            # (Max throttled, no ideas) fall through to retry on the next 60s
-            # poll instead of waiting OVERNIGHT_CYCLE_GAP_HOURS.
+            # Throttle EVERY attempt (success or not): a failed cycle (Max
+            # throttled, CLI silent) used to retry on each 60 s poll.
+            last_cycle_at = time.time()
+            print(f"{_log_prefix} {'requested' if force else 'idle threshold reached'}"
+                  f" - generating improvement PROPOSALS (nothing will run)")
 
-            # Import overnight_upgrade for idea generation (reuse its helpers)
             try:
                 spec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          "overnight_upgrade.py")
@@ -45772,121 +45778,22 @@ def _overnight_upgrade_thread():  # pragma: no cover - background daemon (while-
                 print(f"{_log_prefix} failed to load overnight_upgrade: {e}")
                 continue
 
-            # ── Phase 1: implement any existing pending tasks first ──────────
-            pending = ou._count_pending_tasks()
-            if pending > 0:
-                print(f"{_log_prefix} {pending} pending task(s) in jarvis_todo.md — running upgrade first")
+            if ou._count_open_proposals() >= ou.MAX_OPEN_PROPOSALS:
+                print(f"{_log_prefix} proposals file already holds "
+                      f"{ou.MAX_OPEN_PROPOSALS}+ unreviewed ideas - not adding more")
+                continue
 
-                if not force and not _is_idle():
-                    print(f"{_log_prefix} user became active — deferring upgrade")
-                    continue
-
-                # Capture task descriptions before upgrade_jarvis.py runs so
-                # JARVIS can announce them on the next startup.
-                try:
-                    try:
-                        with open(TODO_FILE, encoding="utf-8") as _tf:
-                            _pending_tasks = re.findall(
-                                r"^- \[ \] (.+)$", _tf.read(), re.MULTILINE)
-                    except Exception:
-                        _pending_tasks = []
-                    with open(UPGRADE_SUMMARY_FILE, "w", encoding="utf-8") as _sf:
-                        json.dump({
-                            "upgraded_at": time.strftime("%H:%M"),
-                            "tasks": _pending_tasks,
-                            "syntax_ok": True,   # upgrade_jarvis.py updates this
-                        }, _sf, indent=2)
-                except Exception as _e:
-                    print(f"{_log_prefix} couldn't write summary: {_e}")
-
-                # ── Pipeline singleton guard ─────────────────────────────────
-                # Permanent fix for the duplicate-pipeline race observed on
-                # 2026-05-29 (Pipeline A: 41992-44316-49124, Pipeline B:
-                # 13176-48228-44452 — both writing to the same code files).
-                # The race happens when upgrade_jarvis.py --relaunch spawns a
-                # fresh JARVIS mid-cycle and that JARVIS's own overnight thread
-                # sees the .overnight_active flag and fires a second pipeline.
-                # Scan for any running upgrade_jarvis.py; if found, skip.
-                try:
-                    _ps_existing = []
-                    try:
-                        import psutil as _psutil
-                        for _proc in _psutil.process_iter(
-                                attrs=["pid", "name", "cmdline"]):
-                            try:
-                                _cl = " ".join(_proc.info.get("cmdline") or [])
-                                if "upgrade_jarvis.py" in _cl and _proc.info["pid"] != os.getpid():
-                                    _ps_existing.append(_proc.info["pid"])
-                            except (_psutil.NoSuchProcess, _psutil.AccessDenied):
-                                continue
-                    except ImportError:
-                        # psutil unavailable — fall through and risk the race
-                        # rather than blocking the engine forever.
-                        pass
-                    if _ps_existing:
-                        print(f"{_log_prefix} pipeline already running "
-                              f"(PIDs {_ps_existing}) — skipping this cycle "
-                              f"to prevent duplicate-pipeline race")
-                        continue
-                except Exception as _sg_e:
-                    print(f"{_log_prefix} singleton guard error: {_sg_e}")
-                    # Don't block on the guard failing — just log + proceed
-
-                print(f"{_log_prefix} triggering upgrade pipeline for {pending} existing task(s)…")
-                last_cycle_at = time.time()   # success — start the gap timer
-                _act_upgrade()
-                continue   # JARVIS shuts down here; new session handles Phase 2
-
-            # ── Phase 2: no pending tasks — generate fresh ideas ────────────
-            print(f"{_log_prefix} no pending tasks — generating new improvement ideas…")
-            memory_summary = ou._read_memory_summary()
-            features       = ou._read_codebase_features()
-            logs           = ou._read_logs_tail()
-
-            ideas = ou._generate_ideas(memory_summary, features, logs)
+            ideas = ou._generate_ideas(ou._read_memory_summary(),
+                                       ou._read_codebase_features(),
+                                       ou._read_logs_tail())
             print(f"{_log_prefix} {len(ideas)} idea(s) generated")
             for i, idea in enumerate(ideas, 1):
                 print(f"{_log_prefix}   [{i}] {idea[:100]}")
-
-            if not ideas:
-                # Idea generation failed (Max throttled, CLI silent, etc.).
-                # Don't update last_cycle_at — fall through to retry on the
-                # next 60s poll. If we were force-triggered, re-arm the event
-                # so retries persist instead of dying after one failure.
-                print(f"{_log_prefix} no ideas (likely throttled) — will retry on next poll")
-                if force:
-                    _overnight_run_now.set()
-                continue
-
-            written = ou._append_tasks(ideas)
-            print(f"{_log_prefix} {written} new task(s) written to jarvis_todo.md")
-
-            if written == 0:
-                print(f"{_log_prefix} all duplicates — skipping upgrade")
-                if force:
-                    _overnight_run_now.set()
-                continue
-
-            # Final activity check before firing upgrade
-            if not force and not _is_idle():
-                print(f"{_log_prefix} user became active mid-cycle — deferring upgrade")
-                continue
-
-            try:
-                with open(UPGRADE_SUMMARY_FILE, "w", encoding="utf-8") as _sf:
-                    json.dump({
-                        # Consistent with Phase 1 + upgrade_jarvis.py — short time-only
-                        # form so the spoken announcement reads naturally ("ran at 03:45").
-                        "upgraded_at": time.strftime("%H:%M"),
-                        "tasks":       ideas[:8],
-                        "syntax_ok":   True,   # upgrade_jarvis.py overwrites with the real result
-                    }, _sf, indent=2)
-            except Exception as _e:
-                print(f"{_log_prefix} couldn't write summary: {_e}")
-
-            print(f"{_log_prefix} triggering upgrade pipeline for {written} new task(s)…")
-            last_cycle_at = time.time()   # success — start the gap timer
-            _act_upgrade()
+            if ideas:
+                written = ou._append_tasks(ideas)
+                print(f"{_log_prefix} {written} proposal(s) written to "
+                      f"jarvis_todo_proposed.md (approve by moving lines into "
+                      f"jarvis_todo.md, then ask for the upgrade)")
 
         except Exception as e:
             print(f"{_log_prefix} error in cycle: {e}")

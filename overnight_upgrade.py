@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-JARVIS Overnight Upgrade Engine
+JARVIS Overnight IDEA Engine (proposals only)
 ─────────────────────────────────────────────────────────────────────────────
 Runs in a background window. When JARVIS has been idle for
 IDLE_THRESHOLD_MINUTES, this engine:
 
   1. Reads the user's memory profile + recent session logs + the codebase
   2. Asks Claude to think like a JARVIS developer: what would make this
-     meaningfully better? New features, personality, UI, capabilities —
+     meaningfully better? New features, personality, UI, capabilities -
      not just bug-fixing. It knows the Iron Man JARVIS character and learns
      from what the user actually uses and asks for.
-  3. Appends the ideas as tasks to jarvis_todo.md
-  4. Runs upgrade_jarvis.py --relaunch so Claude Code implements them
-  5. Waits, repeats
+  3. Appends the ideas to jarvis_todo_proposed.md - the PROPOSALS file.
+  4. Stops. It never touches jarvis_todo.md (the approved queue) and never
+     starts an upgrade run: only the owner's explicit "upgrade" request does
+     (tools/selfup_runner.py), and only on lines he moved into the queue.
 
 Usage:
     python overnight_upgrade.py            # start the watch loop
     python overnight_upgrade.py --now      # run one cycle immediately
-    python overnight_upgrade.py --dry-run  # print ideas only, don't upgrade
+    python overnight_upgrade.py --dry-run  # print ideas only, write nothing
 
 Config: edit the constants below.
 ─────────────────────────────────────────────────────────────────────────────
@@ -49,7 +50,8 @@ MAX_LOG_CHARS           = 6000   # chars to read per log (tail — most recent)
 OVERNIGHT_START_HOUR    = 0      # 0 = no time restriction — runs any time of day
 OVERNIGHT_END_HOUR      = 0      # set both to 0 to always allow; close the window to stop
 POLL_INTERVAL           = 300    # seconds between idle checks (5 min)
-MAX_IDEAS_PER_CYCLE     = 8      # don't flood the queue
+MAX_IDEAS_PER_CYCLE     = 8      # don't flood the proposals file
+MAX_OPEN_PROPOSALS      = 40     # stop generating while this many await review
 DRY_RUN                 = "--dry-run" in sys.argv
 # Model for the Anthropic-API fallback of idea generation (used only when the
 # Claude Code CLI fails). An unattended, non-latency-bound deep job, so it runs
@@ -62,10 +64,10 @@ IDEAS_API_MODEL         = "claude-opus-5-5"
 
 PROJECT_DIR    = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR       = os.path.join(PROJECT_DIR, "logs")
-TODO_FILE      = os.path.join(PROJECT_DIR, "jarvis_todo.md")
+TODO_FILE      = os.path.join(PROJECT_DIR, "jarvis_todo.md")          # approved queue: read-only here
+PROPOSED_FILE  = os.path.join(PROJECT_DIR, "jarvis_todo_proposed.md")  # where ideas go
 MEMORY_FILE    = os.path.join(PROJECT_DIR, "bobert_memory.json")
 MAIN_SCRIPT    = os.path.join(PROJECT_DIR, "bobert_companion.py")
-UPGRADE_SCRIPT = os.path.join(PROJECT_DIR, "upgrade_jarvis.py")
 OVERNIGHT_LOG  = os.path.join(PROJECT_DIR, "overnight_log.txt")
 LOCK_FILE      = os.path.join(PROJECT_DIR, "jarvis.lock")
 STATE_FILE     = os.path.join(PROJECT_DIR, ".overnight_state.json")
@@ -392,19 +394,30 @@ def _read_logs_tail() -> str:
 
 
 def _read_existing_todo_tasks() -> set[str]:
-    """Return lowercased text of all existing todo tasks (to avoid duplicates)."""
-    if not os.path.exists(TODO_FILE):
-        return set()
+    """Return lowercased text of every task already in the approved queue OR
+    the proposals file (to avoid duplicates)."""
+    tasks = set()
+    for path in (TODO_FILE, PROPOSED_FILE):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+            for m in re.finditer(r"^- \[.?\] (?:\*\*[^*]+\*\* (?:\[overnight\] )?— )?(.+)$",
+                                 content, re.MULTILINE):
+                tasks.add(m.group(1).strip().lower())
+        except Exception:
+            continue
+    return tasks
+
+
+def _count_open_proposals() -> int:
+    """Unreviewed '- [ ]' lines in jarvis_todo_proposed.md."""
     try:
-        with open(TODO_FILE, encoding="utf-8") as f:
-            content = f.read()
-        tasks = set()
-        for m in re.finditer(r"^- \[.?\] (?:\*\*[^*]+\*\* (?:\[overnight\] )?— )?(.+)$",
-                             content, re.MULTILINE):
-            tasks.add(m.group(1).strip().lower())
-        return tasks
-    except Exception:
-        return set()
+        with open(PROPOSED_FILE, encoding="utf-8") as f:
+            return len(re.findall(r"^- \[ \]", f.read(), re.MULTILINE))
+    except OSError:
+        return 0
 
 
 def _count_pending_tasks() -> int:
@@ -748,7 +761,9 @@ def _generate_ideas(memory_summary: str, features: str, logs: str) -> list[str]:
 # ── todo management ──────────────────────────────────────────────────────────
 
 def _append_tasks(tasks: list[str]) -> int:
-    """Write new tasks to jarvis_todo.md. Returns count written."""
+    """Write new ideas to jarvis_todo_proposed.md - NEVER to the approved
+    queue (jarvis_todo.md). The owner promotes a line by moving it there.
+    Returns count written."""
     if not tasks:
         return 0
 
@@ -757,22 +772,22 @@ def _append_tasks(tasks: list[str]) -> int:
     written = 0
 
     # Create file with header if it doesn't exist
-    if not os.path.exists(TODO_FILE):
-        with open(TODO_FILE, "w", encoding="utf-8") as f:
+    if not os.path.exists(PROPOSED_FILE):
+        with open(PROPOSED_FILE, "w", encoding="utf-8") as f:
             f.write(
-                "# JARVIS Task Queue\n\n"
-                "Things the user wants Claude Code to build, fix, or investigate later.\n"
-                "Tick items as you complete them; archive when the file gets big.\n\n"
+                "# JARVIS Proposed Tasks (NOT approved)\n\n"
+                "Ideas JARVIS generated on its own. Nothing here runs. To approve one,\n"
+                "move its line into jarvis_todo.md; delete the ones you don't want.\n\n"
             )
 
-    with open(TODO_FILE, "a", encoding="utf-8") as f:
+    with open(PROPOSED_FILE, "a", encoding="utf-8") as f:
         for task in tasks:
             task = task.strip()
             if not task:
                 continue
             # Simple duplicate check
             if task.lower() in existing:
-                _log(f"  [todo] skip duplicate: {task[:70]}")
+                _log(f"  [proposals] skip duplicate: {task[:70]}")
                 continue
             f.write(f"- [ ] **{ts}** [overnight] — {task}\n")
             existing.add(task.lower())
@@ -781,50 +796,19 @@ def _append_tasks(tasks: list[str]) -> int:
     return written
 
 
-# ── upgrade pipeline ─────────────────────────────────────────────────────────
-
-def _run_upgrade(task_count: int) -> bool:
-    if not os.path.exists(UPGRADE_SCRIPT):
-        _log(f"  [upgrade] upgrade_jarvis.py not found")
-        return False
-
-    # Pass the API key via env dict — never embed it in the command string
-    # where it would show up in process lists, logs, or shell history.
-    env = os.environ.copy()
-    api_key = _get_api_key()
-    if api_key:
-        env["ANTHROPIC_API_KEY"] = api_key
-
-    ps_cmd = (
-        f"cd '{PROJECT_DIR}'; "
-        f"Write-Host '=== JARVIS OVERNIGHT UPGRADE ({task_count} tasks) ===' "
-        f"-ForegroundColor Magenta; "
-        f"python '{UPGRADE_SCRIPT}' --relaunch"
-    )
-    try:
-        # No -NoExit: when upgrade_jarvis.py finishes the window closes
-        # cleanly. The user shouldn't have to manually close anything.
-        proc = subprocess.Popen(
-            ["powershell", "-Command", ps_cmd],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-            env=env,
-            close_fds=True,
-        )
-        _log(f"  [upgrade] spawned (PID {proc.pid}), waiting…")
-        proc.wait()
-        _log(f"  [upgrade] done (exit {proc.returncode})")
-        return True
-    except Exception as e:
-        _log(f"  [upgrade] spawn failed: {e}")
-        return False
-
-
 # ── main cycle ───────────────────────────────────────────────────────────────
 
 def run_one_cycle():
-    """Full upgrade cycle: gather context → generate ideas → write tasks → upgrade."""
+    """One idea cycle: gather context -> generate ideas -> write PROPOSALS.
+    Never edits the approved queue and never starts an upgrade run."""
     _log("═" * 60)
-    _log("Overnight upgrade cycle starting")
+    _log("Overnight idea cycle starting")
+
+    open_n = _count_open_proposals()
+    if open_n >= MAX_OPEN_PROPOSALS:
+        _log(f"  {open_n} proposal(s) still await review in jarvis_todo_proposed.md "
+             f"(cap {MAX_OPEN_PROPOSALS}) - not generating more")
+        return False
 
     _log("  Reading user memory…")
     memory_summary = _read_memory_summary()
@@ -843,23 +827,17 @@ def run_one_cycle():
         _log(f"    [{i}] {idea[:100]}")
 
     if not ideas:
-        _log("  No ideas generated — skipping upgrade")
+        _log("  No ideas generated")
         return False
 
     if DRY_RUN:
-        _log("  [DRY RUN] Would append tasks and run upgrade. Stopping here.")
+        _log("  [DRY RUN] Would append proposals. Stopping here.")
         return True
 
     written = _append_tasks(ideas)
-    _log(f"  Appended {written} new task(s) to jarvis_todo.md")
-
-    if written == 0:
-        _log("  All ideas were duplicates — skipping upgrade run")
-        return False
-
-    _log(f"  Launching upgrade pipeline for {written} new task(s)…")
-    _run_upgrade(written)
-    return True
+    _log(f"  Wrote {written} new proposal(s) to jarvis_todo_proposed.md "
+         f"(nothing runs until the owner approves and asks)")
+    return written > 0
 
 
 def watch_loop():
@@ -906,22 +884,12 @@ def watch_loop():
                 _save_state(state)   # persist a breaker auto-reset if it happened
                 _log("Waiting: " + "; ".join(skip))
             else:
-                cycle_start = time.time()
                 did_work = run_one_cycle()
                 state["last_cycle_at"] = time.time()
                 if did_work:
                     state["cycles_run"] = state.get("cycles_run", 0) + 1
-                    # Judge the upgrade and update the breaker. A reverted /
-                    # P0-shipping upgrade counts as a failure; trip after
-                    # MAX_CONSECUTIVE_FAILURES so we stop churning on it.
-                    outcome = _last_upgrade_productive(cycle_start)
-                    _record_cycle_outcome(state, outcome, time.time())
-                    if state.get("breaker_tripped_at"):
-                        _log(f"  ⚠ CIRCUIT BREAKER TRIPPED: "
-                             f"{state.get('consecutive_failures', 0)} consecutive "
-                             f"failed upgrades. Pausing upgrades for "
-                             f"{BREAKER_COOLDOWN_HOURS:.0f}h — clear with "
-                             f"--reset-breaker.")
+                # The breaker (consecutive failed UPGRADES) no longer has an
+                # input: this engine only writes proposals, it starts no run.
                 _save_state(state)
                 _log(f"Cycle complete. Total cycles run: {state['cycles_run']}")
 

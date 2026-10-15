@@ -2703,12 +2703,14 @@ CLAUDE_PRO_CONFIG_DIR = ""
 
 
 # ─── Overnight self-improvement engine ─────────────────────────────────
-# OVERNIGHT_UPGRADE_ENABLED = True means the background thread polls
-# for idle + gap thresholds and fires the upgrade pipeline on its own.
-# Flip to False to disable the auto-fire — manual `upgrade` actions are
-# also gated against this flag (queued task 2026-05-29 11:25).
+# OVERNIGHT_UPGRADE_ENABLED = True starts the background IDEA thread (it polls
+# for idle + gap thresholds and writes proposals to jarvis_todo_proposed.md -
+# it never runs an upgrade on its own) and lets the owner's explicit `upgrade`
+# request / tray "Run Upgrade Now" start a SAFE run (separate git worktree, the
+# approved queue in jarvis_todo.md, one commit per task, branch left for
+# review: tools/selfup_runner.py). False = both are off. Redesigned 2026-10-15.
 OVERNIGHT_UPGRADE_ENABLED  = False  # PAUSED 2026-05-30 pending post-fix stabilization (was True)
-OVERNIGHT_IDLE_MINUTES     = 30    # minutes of silence before a cycle fires
+OVERNIGHT_IDLE_MINUTES     = 30    # minutes of silence before an idea cycle fires
 OVERNIGHT_CYCLE_GAP_HOURS  = 0.5   # minimum hours between cycles
 OVERNIGHT_MODE_HOURS       = 8     # how long .overnight_active persists
 

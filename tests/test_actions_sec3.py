@@ -44,6 +44,7 @@ numpy is left intact (it is never imported here).
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import sys
 import tempfile
@@ -2640,9 +2641,13 @@ class StartOvernightUpgradeTests(unittest.TestCase):
             bc._sleep_mode = [False]
             bc.OVERNIGHT_FLAG_FILE = flag
             with _patch_bc(bc), \
-                    mock.patch.object(A.time, "time", return_value=1000.0):
+                    mock.patch.object(A.time, "time", return_value=1000.0), \
+                    mock.patch.object(A.subprocess, "Popen") as popen:
                 out = A._act_start_overnight_upgrade()
-            self.assertIn("start generating improvements right away", out)
+            # goodnight = standby + an idea cycle (proposals). It starts NO run.
+            popen.assert_not_called()
+            self.assertIn("draft some improvement ideas", out)
+            self.assertIn("nothing gets changed without your say-so", out)
             bc._overnight_run_now.set.assert_called_once()
             self.assertTrue(bc._sleep_mode[0])
             # Flag file written with the expiry epoch.
@@ -2661,7 +2666,7 @@ class StartOvernightUpgradeTests(unittest.TestCase):
         with _patch_bc(bc):
             out = A._act_start_overnight_upgrade()
         # Still returns the success line; the engine was armed regardless.
-        self.assertIn("start generating improvements", out)
+        self.assertIn("draft some improvement ideas", out)
         bc._overnight_run_now.set.assert_called_once()
 
 
@@ -3207,78 +3212,93 @@ class CreateSkillTests(unittest.TestCase):
 # _act_upgrade
 # ===========================================================================
 class UpgradeTests(unittest.TestCase):
+    """_act_upgrade starts ONE safe run (tools/selfup_runner.py, a separate git
+    worktree) on request. It never exits, restarts or kills JARVIS."""
+
+    @staticmethod
+    def _tree(td, todo_text):
+        os.makedirs(os.path.join(td, "tools"), exist_ok=True)
+        with open(os.path.join(td, "tools", "selfup_runner.py"), "w",
+                  encoding="utf-8") as f:
+            f.write("# stub\n")
+        todo = os.path.join(td, "todo.md")
+        with open(todo, "w", encoding="utf-8") as f:
+            f.write(todo_text)
+        bc = _base_bc(td)
+        bc.TODO_FILE = todo
+        return bc
+
     def test_disabled_by_config(self):
         bc = _base_bc()
         with _patch_bc(bc), \
-                mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", False):
+                mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", False), \
+                mock.patch.object(A.subprocess, "Popen") as popen:
             out = A._act_upgrade()
-        self.assertIn("Upgrades are disabled, sir", out)
+        self.assertIn("Upgrades are switched off, sir", out)
+        popen.assert_not_called()
 
-    def test_upgrade_script_not_found(self):
-        # __file__ points at a tempdir with no upgrade_jarvis.py up the tree.
+    def test_runner_script_not_found(self):
         with tempfile.TemporaryDirectory() as td:
-            sub = os.path.join(td, "a", "b", "c", "d", "e")
-            os.makedirs(sub)
-            bc = _base_bc(sub)
+            bc = _base_bc(td)               # no tools/selfup_runner.py here
             with _patch_bc(bc), \
                     mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True):
                 out = A._act_upgrade()
-            self.assertIn("upgrade_jarvis.py not found", out)
+            self.assertIn("selfup_runner.py not found", out)
 
     def test_empty_queue(self):
         with tempfile.TemporaryDirectory() as td:
-            with open(os.path.join(td, "upgrade_jarvis.py"), "w",
-                      encoding="utf-8") as f:
-                f.write("# stub\n")
-            todo = os.path.join(td, "todo.md")
-            with open(todo, "w", encoding="utf-8") as f:
-                f.write("- [x] already done\n")  # no open items
-            bc = _base_bc(td)
-            bc.TODO_FILE = todo
+            bc = self._tree(td, "- [x] already done\n")      # no open items
             with _patch_bc(bc), \
-                    mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True):
+                    mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
+                    mock.patch.object(A.subprocess, "Popen") as popen:
                 out = A._act_upgrade()
             self.assertEqual(out, "queue is empty - nothing to upgrade right now")
+            popen.assert_not_called()
 
-    def test_spawns_pipeline_and_self_exits(self):
+    def test_machine_written_lines_do_not_count_as_approved_work(self):
         with tempfile.TemporaryDirectory() as td:
-            with open(os.path.join(td, "upgrade_jarvis.py"), "w",
-                      encoding="utf-8") as f:
-                f.write("# stub\n")
-            todo = os.path.join(td, "todo.md")
-            with open(todo, "w", encoding="utf-8") as f:
-                f.write("- [ ] task one\n- [ ] task two\n- [x] done\n")
-            bc = _base_bc(td)
-            bc.TODO_FILE = todo
+            bc = self._tree(td, "- [ ] **[anomaly]** loop stuck\n- [ ] [self-heal] x\n")
+            with _patch_bc(bc), \
+                    mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
+                    mock.patch.object(A.subprocess, "Popen") as popen:
+                out = A._act_upgrade()
+            self.assertEqual(out, "queue is empty - nothing to upgrade right now")
+            popen.assert_not_called()
 
-            # Capture the self-exit thread WITHOUT running its os._exit body.
+    def test_spawns_the_runner_and_jarvis_stays_up(self):
+        with tempfile.TemporaryDirectory() as td:
+            bc = self._tree(td, "- [ ] task one\n- [ ] task two\n- [x] done\n")
+
             class _NoopThread:
                 def __init__(self, *a, **k):
-                    self._target = k.get("target")
+                    pass
+
                 def start(self):
                     pass
 
             with _patch_bc(bc), \
                     mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
+                    mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "x"}), \
                     mock.patch.object(A.subprocess, "Popen") as popen, \
                     mock.patch("threading.Thread", _NoopThread):
                 out = A._act_upgrade()
-            self.assertIn("upgrade initiated for 2 pending task(s)", out)
+            self.assertIn("upgrade started for 2 approved task(s)", out)
             popen.assert_called_once()
-            # ANTHROPIC_API_KEY scrubbed from the child env.
-            env = popen.call_args.kwargs["env"]
-            self.assertNotIn("ANTHROPIC_API_KEY", env)
+            cmd = popen.call_args.args[0]
+            self.assertEqual(cmd[0], sys.executable)
+            self.assertEqual(os.path.basename(cmd[-1]), "selfup_runner.py")
+            self.assertEqual(popen.call_args.kwargs["cwd"], td)
+            self.assertNotIn("ANTHROPIC_API_KEY", popen.call_args.kwargs["env"])
+            # no window, output into the run log under data/selfup_reports
+            self.assertEqual(popen.call_args.kwargs["stderr"], A.subprocess.STDOUT)
+            self.assertTrue(os.path.isdir(os.path.join(td, "data", "selfup_reports")))
+            # JARVIS is NOT stopped, restarted or exited
+            bc._hard_exit.assert_not_called()
+            bc._release_singleton.assert_not_called()
 
     def test_spawn_failure_reported(self):
         with tempfile.TemporaryDirectory() as td:
-            with open(os.path.join(td, "upgrade_jarvis.py"), "w",
-                      encoding="utf-8") as f:
-                f.write("# stub\n")
-            todo = os.path.join(td, "todo.md")
-            with open(todo, "w", encoding="utf-8") as f:
-                f.write("- [ ] task\n")
-            bc = _base_bc(td)
-            bc.TODO_FILE = todo
+            bc = self._tree(td, "- [ ] task\n")
             with _patch_bc(bc), \
                     mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
                     mock.patch.object(A.subprocess, "Popen",
@@ -3286,22 +3306,26 @@ class UpgradeTests(unittest.TestCase):
                 out = A._act_upgrade()
             self.assertTrue(out.startswith("failed to spawn upgrade: spawn fail"))
 
-    def test_pending_count_read_failure_treated_as_zero(self):
-        # If opening/reading TODO_FILE raises, the except swallows it and
-        # pending stays 0 → "queue is empty" (covers the count except branch).
+    def test_a_run_already_in_progress_is_not_doubled(self):
         with tempfile.TemporaryDirectory() as td:
-            with open(os.path.join(td, "upgrade_jarvis.py"), "w",
-                      encoding="utf-8") as f:
-                f.write("# stub\n")
-            todo = os.path.join(td, "todo.md")
-            with open(todo, "w", encoding="utf-8") as f:
-                f.write("- [ ] task one\n")
-            bc = _base_bc(td)
-            bc.TODO_FILE = todo
+            bc = self._tree(td, "- [ ] task\n")
+            from tools import selfup_runner as sr
+            with _patch_bc(bc), \
+                    mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
+                    mock.patch.object(sr, "is_running", return_value=True), \
+                    mock.patch.object(A.subprocess, "Popen") as popen:
+                out = A._act_upgrade()
+            self.assertIn("already in progress", out)
+            popen.assert_not_called()
+
+    def test_pending_count_read_failure_treated_as_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            bc = self._tree(td, "- [ ] task one\n")
+            todo = bc.TODO_FILE
             real_open = open
 
             def boom_open(path, *a, **k):
-                if os.path.abspath(path) == os.path.abspath(todo):
+                if os.path.abspath(str(path)) == os.path.abspath(todo):
                     raise OSError("read denied")
                 return real_open(path, *a, **k)
 
@@ -3311,111 +3335,52 @@ class UpgradeTests(unittest.TestCase):
                 out = A._act_upgrade()
             self.assertEqual(out, "queue is empty - nothing to upgrade right now")
 
-    def test_self_exit_closure_calls_os_exit(self):
-        # Drive the _self_exit daemon closure: capture the thread target, then
-        # run it with time.sleep + os._exit mocked.
-        with tempfile.TemporaryDirectory() as td:
-            with open(os.path.join(td, "upgrade_jarvis.py"), "w",
-                      encoding="utf-8") as f:
-                f.write("# stub\n")
-            todo = os.path.join(td, "todo.md")
-            with open(todo, "w", encoding="utf-8") as f:
-                f.write("- [ ] task\n")
-            bc = _base_bc(td)
-            bc.TODO_FILE = todo
-            captured = {}
+    def _announce(self, td, latest_json):
+        """Run the completion watcher thread's body and return what was said."""
+        bc = self._tree(td, "- [ ] task\n")
+        captured = {}
 
-            def capture_thread(target=None, daemon=None):
-                captured["target"] = target
-                return mock.Mock()
+        def capture_thread(target=None, daemon=None):
+            captured["target"] = target
+            return mock.Mock()
 
-            with _patch_bc(bc), \
-                    mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
-                    mock.patch.object(A.subprocess, "Popen"), \
-                    mock.patch("threading.Thread", side_effect=capture_thread):
-                A._act_upgrade()
-            # Now exercise the captured _self_exit body. 2026-07-14: this path
-            # used to call a raw os._exit — the LAST one in the tree, and the
-            # exact immortal-zombie route v2.0.51/57 removed everywhere else
-            # (ExitProcess deadlocks on the loader lock behind a CUDA-parked
-            # thread; the process corpses with ~5GB VRAM pinned until reboot).
-            # It also skipped the native release, the web socket and the
-            # singleton, so the upgrade's relaunched JARVIS met a held :8766
-            # and a held singleton. It now runs the hardened teardown.
-            bc._hard_exit.side_effect = SystemExit
-            with mock.patch.object(A.time, "sleep"), \
-                    mock.patch("threading.Timer"), \
-                    mock.patch.object(A, "_release_native_resources") as rel, \
-                    mock.patch.object(A, "_stop_web_interface_quietly") as web:
-                with self.assertRaises(SystemExit):
-                    captured["target"]()
-            web.assert_called_once()
-            rel.assert_called_once()
-            bc._release_singleton.assert_called_once()
-            # clean=True — upgrade_jarvis.py relaunches JARVIS itself, so the
-            # watchdog must NOT also resurrect it (that would double-boot).
-            bc._hard_exit.assert_called_once_with(0, clean=True)
-
-    def test_self_exit_closure_exits_even_on_teardown_error(self):
-        # If anything in the teardown raises, the closure STILL hard-exits.
-        with tempfile.TemporaryDirectory() as td:
-            with open(os.path.join(td, "upgrade_jarvis.py"), "w",
-                      encoding="utf-8") as f:
-                f.write("# stub\n")
-            todo = os.path.join(td, "todo.md")
-            with open(todo, "w", encoding="utf-8") as f:
-                f.write("- [ ] task\n")
-            bc = _base_bc(td)
-            bc.TODO_FILE = todo
-            captured = {}
-
-            def capture_thread(target=None, daemon=None):
-                captured["target"] = target
-                return mock.Mock()
-
-            with _patch_bc(bc), \
-                    mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
-                    mock.patch.object(A.subprocess, "Popen"), \
-                    mock.patch("threading.Thread", side_effect=capture_thread):
-                A._act_upgrade()
-            bc._hard_exit.side_effect = SystemExit
-            with mock.patch.object(A.time, "sleep",
-                                   side_effect=RuntimeError("clock boom")), \
-                    mock.patch("threading.Timer"), \
-                    mock.patch("builtins.print"):
-                with self.assertRaises(SystemExit):
-                    captured["target"]()
-            bc._hard_exit.assert_called_once_with(0, clean=True)
-
-    def test_upward_search_stops_at_filesystem_root(self):
-        # When upgrade_jarvis.py is nowhere up the tree, the loop walks up
-        # until parent == search_dir (filesystem root) and breaks → not found.
-        # Patch os.path.exists to always say "no upgrade script" and
-        # os.path.dirname to bottom out (parent == search_dir) quickly.
-        bc = _base_bc()
-        real_exists = os.path.exists
-
-        def no_upgrade(path):
-            if path.endswith("upgrade_jarvis.py"):
-                return False
-            return real_exists(path)
-
-        # dirname that bottoms out: returns the same path once at "root".
-        seq = ["/level1", "/", "/"]
-        it = iter(seq)
-
-        def fake_dirname(p):
-            try:
-                return next(it)
-            except StopIteration:
-                return "/"
-
+        proc = mock.Mock()
         with _patch_bc(bc), \
                 mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
-                mock.patch.object(A.os.path, "exists", side_effect=no_upgrade), \
-                mock.patch.object(A.os.path, "dirname", side_effect=fake_dirname):
-            out = A._act_upgrade()
-        self.assertIn("upgrade_jarvis.py not found", out)
+                mock.patch.object(A.subprocess, "Popen", return_value=proc), \
+                mock.patch("threading.Thread", side_effect=capture_thread):
+            A._act_upgrade()
+        if latest_json is not None:
+            rd = os.path.join(td, "data", "selfup_reports")
+            os.makedirs(rd, exist_ok=True)
+            with open(os.path.join(rd, "latest.json"), "w", encoding="utf-8") as f:
+                json.dump(latest_json, f)
+        captured["target"]()
+        proc.wait.assert_called_once()
+        return bc._speak
+
+    def test_jarvis_says_the_runners_one_sentence_when_it_ends(self):
+        with tempfile.TemporaryDirectory() as td:
+            line = ("The upgrade branch is ready for review, sir: 3 tasks done, "
+                    "tests passed.")
+            speak = self._announce(td, {"spoken": line})
+            speak.assert_called_once_with(line)
+
+    def test_a_run_that_left_no_report_is_not_called_a_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            speak = self._announce(td, None)
+            said = speak.call_args.args[0]
+            self.assertIn("without leaving a report", said)
+            self.assertNotIn("ready for review", said)
+
+    def test_upgrade_source_never_exits_or_restarts_the_process(self):
+        import inspect
+        src = inspect.getsource(A._act_upgrade)
+        code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
+        for forbidden in ("os._exit", "_hard_exit", "_release_singleton",
+                          "_release_native_resources", "upgrade_jarvis.py",
+                          "--relaunch", "powershell"):
+            self.assertNotIn(forbidden, code)
 
 
 # ===========================================================================

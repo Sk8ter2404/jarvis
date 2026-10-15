@@ -251,7 +251,8 @@ _BOOT_SCRIPTS = frozenset({
     "staging_instance.py",
     # ── these LAUNCH one, one process further out ──
     "stability_smoke_test.py",   # _launch_jarvis() -> powershell -File _boot_jarvis.ps1
-    "multi_agent_pipeline.py",   # _run_tester() -> python stability_smoke_test.py
+    "multi_agent_pipeline.py",   # stage library of the self-upgrade runner (no launcher left)
+    "selfup_runner.py",          # tools/selfup_runner.py: the safe run core/actions._act_upgrade spawns
     "bounce_jarvis.py",
     "staging_integration.py",
     "staging_inject_smoke.py",
