@@ -74,6 +74,12 @@ COOLDOWN_SECS = 1.5                 # min gap between two wake events
 EVENTS_QUEUE_MAX = 64               # bound on the events queue; the real
                                     # caller drains via on_detect, so this
                                     # only guards a polling caller that lags
+FOLLOW_INTERVAL_SECS = 4.0          # how often the follower asks the device
+                                    # provider whether the mic moved
+FOLLOW_BUSY_AFTER_FIRE_SECS = 20.0  # a wake just fired: the owner's command is
+                                    # being captured - never re-open under it
+FOLLOW_RETRY_SECS = 30.0            # wait before retrying a device that would
+                                    # not open (the old stream keeps running)
 MAX_BUFFER_FRAMES = 50              # hard cap on _buf size (in frames) to
                                     # avoid unbounded growth if _on_frame
                                     # raises and the drain loop exits early
@@ -187,6 +193,7 @@ class WakeWordDetector:
         on_detect: Optional[Callable[[dict], None]] = None,
         use_silero_vad: bool = False,
         device_provider: Optional[Callable[[], Optional[int]]] = None,
+        follow_interval_s: float = FOLLOW_INTERVAL_SECS,
     ) -> None:
         self.engine = (engine or "off").lower().strip()
         self.wake_words = list(wake_words or DEFAULT_WAKE_WORDS)
@@ -199,6 +206,16 @@ class WakeWordDetector:
         # Asked for the input device at EVERY stream open (2026-10-02, see
         # _open_stream). None = always open on ``device``, as before.
         self.device_provider = device_provider
+        # With a provider a small follower thread re-asks it every
+        # ``follow_interval_s`` while the stream is live and moves the stream
+        # when the answer changed (2026-10-15). 0 = never follow (open-time
+        # resolution only, as before).
+        self.follow_interval_s = float(follow_interval_s or 0.0)
+        self._follower: Optional[threading.Thread] = None
+        self._follow_fail: Optional[tuple] = None   # (target, monotonic ts)
+        # Bumped on every stream swap: a callback of an older generation
+        # drops its frames, so two streams never splice into one buffer.
+        self._gen = 0
 
         # 2026-07-08: bound the events queue so a caller that only uses
         # on_detect (the real path) can't let this grow without limit.
@@ -232,6 +249,9 @@ class WakeWordDetector:
         # WASAPI rejects concurrent opens on the same device.
         self._taps: list["queue.Queue[np.ndarray]"] = []
         self._taps_lock = threading.Lock()
+        # Taps that only listen in the background (the voice-ID rolling
+        # buffer): they do not mean a capture is in progress.
+        self._passive_taps: list["queue.Queue[np.ndarray]"] = []
 
     # ── public api ────────────────────────────────────────────────────
     def is_running(self) -> bool:
@@ -254,10 +274,21 @@ class WakeWordDetector:
             if q not in self._taps:
                 self._taps.append(q)
 
+    def mark_tap_passive(self, q: "queue.Queue[np.ndarray]") -> None:
+        """Declare a registered tap a background listener: it never counts as
+        'someone is capturing', so it does not hold off a mic follow."""
+        with self._taps_lock:
+            if q not in self._passive_taps:
+                self._passive_taps.append(q)
+
     def remove_tap(self, q: "queue.Queue[np.ndarray]") -> None:
         with self._taps_lock:
             try:
                 self._taps.remove(q)
+            except ValueError:
+                pass
+            try:
+                self._passive_taps.remove(q)
             except ValueError:
                 pass
 
@@ -296,22 +327,19 @@ class WakeWordDetector:
         self._running = True
         print(f"  [wake-word] listening on {self.engine} for "
               f"{self.wake_words} (threshold={self.threshold:.2f})")
+        self._start_follower()
         return True
 
-    def _open_stream(self) -> bool:
-        """Open and start the persistent InputStream. Returns True on success.
-        Used by both start() (initial open) and resume() (after pause for a
-        PortAudio device refresh)."""
-        try:
-            import sounddevice as sd
-        except ImportError:
-            print("  [wake-word] sounddevice missing; cannot open mic")
-            return False
-
+    def _make_callback(self, gen: int):
+        """The PortAudio callback for one stream generation. A callback whose
+        generation is no longer current (its stream was swapped out by the
+        follower) drops its frames, so two streams never splice."""
         frame_size = int(self.sample_rate * DEFAULT_FRAME_MS / 1000)
         max_buf_samples = frame_size * MAX_BUFFER_FRAMES
 
         def _cb(indata, frames, time_info, status):  # noqa: ARG001
+            if gen != self._gen:
+                return
             if status:
                 # PortAudio status flags (overflows, etc.) — log once per
                 # event class via repr() so we don't spam.
@@ -347,6 +375,21 @@ class WakeWordDetector:
                     # loop — that would let _buf grow without bound on the
                     # next callback.
                     print(f"  [wake-word] _on_frame raised: {e!r}")
+        return _cb
+
+    def _open_stream(self) -> bool:
+        """Open and start the persistent InputStream. Returns True on success.
+        Used by both start() (initial open) and resume() (after pause for a
+        PortAudio device refresh)."""
+        try:
+            import sounddevice as sd
+        except ImportError:
+            print("  [wake-word] sounddevice missing; cannot open mic")
+            return False
+
+        frame_size = int(self.sample_rate * DEFAULT_FRAME_MS / 1000)
+        self._gen += 1
+        _cb = self._make_callback(self._gen)
 
         # The mic is resolved at EVERY open when the owner passed a provider
         # (2026-10-02): start() and the resume() after a PortAudio device
@@ -441,6 +484,130 @@ class WakeWordDetector:
             print("  [wake-word] resume failed; detector stopped — "
                   "call wake_listener_start to retry")
             return False
+
+    # ── follow the current mic ───────────────────────────────────────
+    # 2026-10-15. The provider is asked at every OPEN (above), but a live
+    # stream keeps the device it opened on: when the Windows default input
+    # moves WITHOUT a PortAudio teardown (bobert_companion._refresh_devices
+    # adopts a Stream Deck / headset flip from the existing enumeration and
+    # only pauses this detector on the destructive reinit path), the wake
+    # stream kept listening on the old mic until restart. The follower asks
+    # the provider every ``follow_interval_s`` on its own thread (the
+    # provider may take the host's device lock, which the PortAudio callback
+    # must never wait on) and moves the stream when the answer changed. It
+    # opens the NEW stream first and swaps only if that worked, so a failing
+    # open keeps the old stream; an explicit pin is just a provider that
+    # keeps answering the same device, so it is never moved.
+    def _start_follower(self) -> None:
+        if (self.device_provider is None or self.follow_interval_s <= 0
+                or (self._follower is not None and self._follower.is_alive())):
+            return
+        t = threading.Thread(target=self._follow_loop, name="wake-word-follow",
+                             daemon=True)
+        self._follower = t
+        t.start()
+
+    def _follow_loop(self) -> None:
+        while not self._stop_flag.wait(self.follow_interval_s):
+            self._follow_tick()
+
+    def _capture_in_progress(self) -> bool:
+        """The owner is mid-utterance: a wake fired moments ago (the command
+        is being captured) or a foreground tap is reading this stream."""
+        if (time.time() - self._last_fire_ts) < FOLLOW_BUSY_AFTER_FIRE_SECS:
+            return True
+        with self._taps_lock:
+            return any(t not in self._passive_taps for t in self._taps)
+
+    @staticmethod
+    def _device_label(sd, idx) -> str:
+        if idx is None:
+            return "system default"
+        try:
+            return f"{idx} ({sd.query_devices(idx)['name']})"
+        except Exception:
+            return str(idx)
+
+    def _follow_tick(self) -> bool:
+        """One follower pass. True = the stream moved to a new device.
+        Never raises."""
+        try:
+            return self._follow_tick_inner()
+        except Exception as e:
+            print(f"  [wake-word] input follow failed: {e!r}")
+            return False
+
+    def _follow_tick_inner(self) -> bool:
+        if (self.device_provider is None or not self._running
+                or self._paused or self._stop_flag.is_set()):
+            return False
+        try:
+            target = self.device_provider()
+        except Exception:
+            return False            # keep the current stream
+        if target == self.device:
+            self._follow_fail = None
+            return False
+        if target is not None and getattr(self._stream, "device", None) == target:
+            # Opened on "the default" and PortAudio already resolved that to
+            # this very index: same mic, nothing to move.
+            self.device = target
+            return False
+        failed = self._follow_fail
+        if (failed is not None and failed[0] == target
+                and time.monotonic() - failed[1] < FOLLOW_RETRY_SECS):
+            return False
+        if self._capture_in_progress():
+            return False            # try again next tick, after the utterance
+        try:
+            import sounddevice as sd
+        except ImportError:
+            return False
+        # Never wait behind pause()/resume() (the host's device refresh holds
+        # this lock across its PortAudio teardown): skip, try next tick.
+        if not self._pause_lock.acquire(blocking=False):
+            return False
+        try:
+            if (not self._running or self._paused or self._stop_flag.is_set()
+                    or self._stream is None):
+                return False
+            old_dev = self.device
+            gen = self._gen + 1
+            frame_size = int(self.sample_rate * DEFAULT_FRAME_MS / 1000)
+            new = None
+            try:
+                new = sd.InputStream(
+                    samplerate=self.sample_rate, channels=1, dtype="float32",
+                    blocksize=frame_size, device=target,
+                    callback=self._make_callback(gen))
+                new.start()
+            except Exception as e:
+                self._follow_fail = (target, time.monotonic())
+                print(f"  [wake-word] input {self._device_label(sd, target)} "
+                      f"would not open ({e}); keeping "
+                      f"{self._device_label(sd, old_dev)}, retrying later")
+                if new is not None:
+                    _safe_close_stream(new)
+                return False
+            # The utterance check again: opening can take a while.
+            if (self._capture_in_progress() or self._stop_flag.is_set()
+                    or not self._running or self._paused):
+                _safe_close_stream(new)
+                return False
+            old = self._stream
+            self._gen = gen          # the old callback now drops its frames
+            self._stream = new
+            self.device = target
+            self._follow_fail = None
+            self._buf = np.zeros(0, dtype=np.float32)
+            self._porcupine_leftover = np.zeros(0, dtype=np.int16)
+            _safe_close_stream(old)
+            print(f"  [wake] input changed: "
+                  f"{self._device_label(sd, old_dev)} -> "
+                  f"{self._device_label(sd, target)}")
+            return True
+        finally:
+            self._pause_lock.release()
 
     # ── engine init ──────────────────────────────────────────────────
     def _init_openwakeword(self) -> None:

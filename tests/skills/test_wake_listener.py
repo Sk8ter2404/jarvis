@@ -834,6 +834,15 @@ class VoiceTapTests(unittest.TestCase):
         self.assertIn(self.mod._voice_audio_tap, det.taps)
         self.assertGreaterEqual(self.mod._voice_buffer_capacity_frames, 8)
 
+    def test_start_voice_tap_marks_the_tap_passive(self):
+        # The permanent voice-ID tap is a background listener: it must not
+        # count as a capture and hold off the detector following a mic change.
+        det = FakeDetector()
+        det.passive = []
+        det.mark_tap_passive = det.passive.append
+        self.mod._start_voice_tap(det)
+        self.assertEqual(det.passive, [self.mod._voice_audio_tap])
+
     def test_start_voice_tap_idempotent(self):
         det = FakeDetector()
         self.mod._start_voice_tap(det)
