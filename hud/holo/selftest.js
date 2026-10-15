@@ -6,6 +6,10 @@ import {
 } from "./gestures.js";
 import { FakeHands, makeLandmarks, LOOP_S } from "./fakehands.js";
 import {
+  D, parseDepthMessage, isDepthMessage, occlusionMask, maskCoverage, medianDepthM,
+  defaultHoloZ, spawnZ, sizeAtDistance, PushPull,
+} from "./depth.js";
+import {
   formatSizeMm, uniqueNames, splitParts, fitModel, explodeDir, findModel, pageOf,
   TARGET_RADIUS, MODELS_PER_PAGE,
 } from "./models.js";
@@ -32,6 +36,9 @@ class MockScene {
   movePart(p, x, y) { this.calls.push(["move", p.name, Math.round(x), Math.round(y)]); }
   releasePart(p) { this.calls.push(["release", p.name]); }
   showInfo(p) { this.calls.push(["info", p ? p.name : null]); }
+  beginPushPull(z) { this.calls.push(["ppBegin", z]); }
+  pushPull(z, dt) { this.calls.push(["pp", z, dt]); }
+  endPushPull() { this.calls.push(["ppEnd"]); }
   count(name) { return this.calls.filter(c => c[0] === name).length; }
 }
 
@@ -232,6 +239,167 @@ const TESTS = [
     eq(pageOf([], 0).items.length, 0);
   }],
 ];
+
+// ---- Kinect depth (Phase 2) -------------------------------------------------
+// A wire message exactly as core/handtrack_depth.py pack_wire() lays it out.
+function wireMessage(w, h, mm, { seq = 7, flags = 1, version = 1, magic = "JVDP" } = {}) {
+  const buf = new ArrayBuffer(D.HEADER + w * h * 2);
+  const dv = new DataView(buf);
+  for (let i = 0; i < 4; i++) dv.setUint8(i, magic.charCodeAt(i));
+  dv.setUint8(4, version); dv.setUint8(5, flags);
+  dv.setUint16(6, w, true); dv.setUint16(8, h, true);
+  dv.setBigUint64(12, BigInt(seq), true);
+  dv.setUint16(20, 500, true); dv.setUint16(22, 4500, true);
+  for (let i = 0; i < w * h; i++) dv.setUint16(D.HEADER + i * 2, mm[i], true);
+  return buf;
+}
+function planeOf(w, h, fill, boxes = []) {
+  const mm = new Uint16Array(w * h).fill(fill);
+  for (const [x0, y0, x1, y1, v] of boxes) {
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) mm[y * w + x] = v;
+  }
+  return mm;
+}
+
+TESTS.push(
+  ["depth wire message parses; wrong magic / version / length are refused", () => {
+    const mm = planeOf(4, 3, 1234);
+    const p = parseDepthMessage(wireMessage(4, 3, mm));
+    eq(p.w, 4); eq(p.h, 3); eq(p.seq, 7); eq(p.mirrored, true);
+    eq(p.nearMm, 500); eq(p.farMm, 4500); eq(p.mm[5], 1234); eq(p.mm.length, 12);
+    eq(parseDepthMessage(wireMessage(4, 3, mm, { magic: "JVDX" })), null, "magic");
+    eq(parseDepthMessage(wireMessage(4, 3, mm, { version: 2 })), null, "version");
+    eq(parseDepthMessage(wireMessage(4, 3, mm).slice(0, 40)), null, "short");
+    eq(parseDepthMessage(null), null);
+    eq(parseDepthMessage(new ArrayBuffer(10)), null);
+  }],
+  ["isDepthMessage tells a depth plane from a JPEG", () => {
+    eq(isDepthMessage(wireMessage(2, 2, planeOf(2, 2, 900))), true);
+    const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0]).buffer;
+    eq(isDepthMessage(jpeg), false);
+    eq(isDepthMessage(new ArrayBuffer(2)), false);
+  }],
+  ["occlusion: only what is nearer than the hologram hides it; unknown never does", () => {
+    const w = 10, h = 8;
+    const mm = planeOf(w, h, 3000, [
+      [1, 1, 4, 4, 700],            // nearer than the hologram -> hides
+      [6, 1, 9, 4, 1800],           // behind the hologram -> shows
+      [1, 5, 4, 8, 0],              // unknown -> shows
+    ]);
+    const m = occlusionMask(mm, w, h, 1.0);
+    eq(m[2 * w + 2], 255, "nearer pixel hides");
+    eq(m[2 * w + 7], 0, "farther pixel shows");
+    eq(m[6 * w + 2], 0, "unknown shows");
+    eq(m[7 * w + 9], 0, "background shows");
+    near(maskCoverage(m), 9 / (w * h), 1e-9, "3x3 block");
+  }],
+  ["occlusion: the margin and single-pixel noise are respected", () => {
+    const w = 8, h = 6;
+    const lim = Math.round((1.0 - D.OCCLUDE_MARGIN_M) * 1000);
+    const at = v => occlusionMask(planeOf(w, h, 3000, [[2, 2, 4, 4, v]]), w, h, 1.0)[2 * w + 2];
+    eq(at(lim - 1), 255, "just inside the margin hides");
+    eq(at(lim), 0, "at the margin shows");
+    eq(at(lim + 20), 0, "level with the hologram shows");
+    const lone = occlusionMask(planeOf(w, h, 3000, [[3, 3, 4, 4, 600]]), w, h, 1.0);
+    eq(maskCoverage(lone), 0, "an isolated pixel is noise");
+    const pair = occlusionMask(planeOf(w, h, 3000, [[3, 3, 5, 4, 600]]), w, h, 1.0);
+    eq(maskCoverage(pair) > 0, true, "two neighbours are an object");
+    // moving the hologram nearer stops the same object hiding it
+    eq(occlusionMask(planeOf(w, h, 3000, [[2, 2, 4, 4, 900]]), w, h, 0.8)[2 * w + 2], 0, "now behind");
+  }],
+  ["palm depth: median of a window, unknown ignored, too few samples = null", () => {
+    const w = 20, h = 10;
+    const mm = planeOf(w, h, 0, [[8, 4, 13, 7, 800]]);
+    near(medianDepthM(mm, w, h, 0.5, 0.5), 0.8, 1e-9);
+    eq(medianDepthM(mm, w, h, 0.05, 0.05), null, "all unknown");
+    mm[5 * w + 10] = 900; mm[5 * w + 11] = 700;                       // outliers do not move a median
+    near(medianDepthM(mm, w, h, 0.5, 0.5), 0.8, 1e-9);
+    eq(medianDepthM(mm, w, h, 1.5, 0.5), null, "outside the picture");
+  }],
+  ["hologram distance: spawn in front of the hand, default in front of the nearest 10 %", () => {
+    near(spawnZ(0.8), 0.8 - D.SPAWN_IN_FRONT_M, 1e-9);
+    eq(spawnZ(null), D.HOLO_Z_DEFAULT);
+    eq(spawnZ(0.1), D.HOLO_Z_MIN, "clamped near");
+    eq(spawnZ(9), D.HOLO_Z_MAX, "clamped far");
+    const mm = planeOf(20, 10, 2600, [[0, 6, 20, 10, 1200]]);          // 40 % of the view is a person at 1.2 m
+    near(defaultHoloZ(mm), 1.1, 1e-9);
+    eq(defaultHoloZ(new Uint16Array(200)), D.HOLO_Z_DEFAULT, "no depth: default");
+  }],
+  ["size follows perspective and is clamped", () => {
+    eq(sizeAtDistance(1, 1), 1);
+    near(sizeAtDistance(1, 0.5), 2, 1e-9);
+    near(sizeAtDistance(1, 2), D.SIZE_MIN, 1e-9);
+    eq(sizeAtDistance(1, 0.1), D.SIZE_MAX);
+    eq(sizeAtDistance(1, 0), 1, "no distance, no change");
+  }],
+  ["push/pull: a fist moving toward the sensor brings the hologram nearer and bigger", () => {
+    const p = new PushPull();
+    eq(p.begin(null, 1.0), false, "no hand depth, no grab");
+    eq(p.begin(0.9, 1.0), true);
+    let z = 1.0;
+    for (let i = 0; i < 90; i++) z = p.update(0.6, 0.033);            // hand 0.30 m nearer, held 3 s
+    near(z, 1.0 - (0.30 - D.PUSH_DEADBAND_M), 0.01, "nearer by the travel minus the dead band");
+    if (!(sizeAtDistance(1.0, z) > 1.3)) throw new Error("bigger when nearer");
+    for (let i = 0; i < 150; i++) z = p.update(1.4, 0.033);           // pulled 0.5 m past the start
+    near(z, 1.0 + (0.5 - D.PUSH_DEADBAND_M), 0.01, "farther");
+    if (!(sizeAtDistance(1.0, z) < 0.8)) throw new Error("smaller when farther");
+    eq(p.update(null, 0.033), z, "no depth this frame: hold");
+    p.end();
+    eq(p.update(0.1, 0.033), z, "inactive: no change");
+  }],
+  ["push/pull: jitter inside the dead band does nothing; limits hold", () => {
+    const p = new PushPull();
+    p.begin(0.9, 1.0);
+    let z = 1.0;
+    for (let i = 0; i < 60; i++) z = p.update(0.9 + 0.01 * Math.sin(i), 0.033);
+    eq(z, 1.0, "centimetre jitter");
+    for (let i = 0; i < 300; i++) z = p.update(0.3, 0.033);
+    eq(z, D.HOLO_Z_MIN, "never nearer than the minimum");
+    for (let i = 0; i < 600; i++) z = p.update(4.5, 0.033);
+    eq(z, D.HOLO_Z_MAX, "never farther than the maximum");
+  }],
+  ["router: a fist with depth begins, drives and ends push/pull; without depth it never does", () => {
+    const s = new MockScene(), r = new GestureRouter(s);
+    r.onGesture({ name: "fist_grab", side: "Right", pos: [0.5, 0.5] });
+    r.update([hand("Right", "fist", { z: 0.9 })], 0.03);
+    r.update([hand("Right", "fist", { z: 0.7 })], 0.03);
+    eq(s.count("ppBegin"), 1); eq(s.count("pp"), 1);
+    eq(s.calls.filter(c => c[0] === "pp").pop()[1], 0.7);
+    r.onGesture({ name: "fist_release", side: "Right" });
+    eq(s.count("ppEnd"), 1);
+    const s2 = new MockScene(), r2 = new GestureRouter(s2);
+    r2.onGesture({ name: "fist_grab", side: "Right", pos: [0.5, 0.5] });
+    r2.update([hand("Right", "fist")], 0.03);                        // no "z" key at all
+    r2.update([hand("Right", "fist", { z: null })], 0.03);
+    r2.onGesture({ name: "fist_release", side: "Right" });
+    eq(s2.count("ppBegin") + s2.count("pp") + s2.count("ppEnd"), 0, "no depth, no push/pull");
+  }],
+  ["router: opening the hand ends push/pull; a scene without the hooks is untouched", () => {
+    const s = new MockScene(), r = new GestureRouter(s);
+    r.onGesture({ name: "fist_grab", side: "Right", pos: [0.5, 0.5] });
+    r.update([hand("Right", "fist", { z: 0.9 })], 0.03);
+    r.update([hand("Right", "open", { z: 0.9 })], 0.3);              // let go without fist_release
+    eq(s.count("ppEnd"), 1);
+    const bare = new MockScene();
+    bare.beginPushPull = bare.pushPull = bare.endPushPull = undefined;
+    const rb = new GestureRouter(bare);
+    rb.onGesture({ name: "fist_grab", side: "Right", pos: [0.5, 0.5] });
+    rb.update([hand("Right", "fist", { z: 0.9 })], 0.03);
+    rb.onGesture({ name: "fist_release", side: "Right" });
+    eq(rb.grab, null);
+  }],
+  ["fake Kinect: hands carry z, the plane has a near blob over a far wall", () => {
+    const f = new FakeHands({}, { depth: true });
+    const msgs = f.step(5.0).filter(m => m.type === "hands");
+    eq(typeof msgs[0].hands[0].z, "number");
+    const plane = f.depthPlane(5.0);
+    eq(plane.w, 160); eq(plane.h, 90); eq(plane.mm.length, 160 * 90);
+    const vals = new Set(plane.mm);
+    for (const v of [700, 1400, 2600]) if (!vals.has(v)) throw new Error("missing " + v);
+    eq(new FakeHands({}).depthPlane(1), null, "no depth unless asked");
+    eq("z" in new FakeHands({}).step(5.0)[0].hands[0], false, "no z unless asked");
+  }],
+);
 
 export function runSelfTests() {
   return TESTS.map(([name, fn]) => {

@@ -8,9 +8,10 @@ WHAT THIS IS
   (tools/hand_tracker_service.py, ws://127.0.0.1:8793), because Windows lets
   only one process hold the webcam and JARVIS already does. Two modes, one
   page: ``desktop`` (solid dark HUD, no camera picture) and ``camera`` (the
-  tracker's mirrored frames behind the scene). JARVIS only does three things
+  tracker's mirrored frames behind the scene; with ``depth`` the Kinect's depth
+  plane too, for occlusion and push/pull). JARVIS only does three things
   for the page:
-    * serves the page and its four static files (``asset_for``),
+    * serves the page and its static files (``asset_for``),
     * keeps a tiny command queue the voice actions write to and the page polls
       every ~300 ms (``push_command`` / ``state_payload``),
     * notices whether a page is actually open (the poll is its heartbeat), so
@@ -65,7 +66,7 @@ ALIVE_S = 4.0
 # number; the page asks for everything after the last one it applied.
 MAX_COMMANDS = 16
 
-COMMANDS = ("show", "explode", "assemble", "close", "mode")
+COMMANDS = ("show", "explode", "assemble", "close", "mode", "depth")
 
 _HOLO_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hud", "holo")
@@ -75,6 +76,7 @@ _ASSETS = {
     "/holo": ("holo.html", "text/html; charset=utf-8"),
     "/holo/holo.js": ("holo.js", "text/javascript; charset=utf-8"),
     "/holo/gestures.js": ("gestures.js", "text/javascript; charset=utf-8"),
+    "/holo/depth.js": ("depth.js", "text/javascript; charset=utf-8"),
     "/holo/reactor.js": ("reactor.js", "text/javascript; charset=utf-8"),
     "/holo/models.js": ("models.js", "text/javascript; charset=utf-8"),
     "/holo/fakehands.js": ("fakehands.js", "text/javascript; charset=utf-8"),
@@ -109,6 +111,8 @@ class HoloState:
         self._lock = threading.Lock()
         self.on = False
         self.mode = DEFAULT_MODE    # desktop | camera
+        self.depth = False          # camera mode with Kinect depth (occlusion, push/pull)
+        self.opened_at = None       # when set_on(True) last ran (the opening grace)
         self.model = ""             # model to show when a page loads
         self.seq = 0
         self.commands: list = []    # [{"seq", "cmd", "arg"}]
@@ -118,13 +122,19 @@ class HoloState:
         self.parts = 0              # parts of what is on screen (0 = unknown)
 
     # -- writes (the voice actions) ------------------------------------------
-    def set_on(self, on: bool, model: str = "", mode: str = "") -> None:
+    def set_on(self, on: bool, model: str = "", mode: str = "",
+               depth=None) -> None:
         with self._lock:
             self.on = bool(on)
             self.model = model if on else ""
+            if on:
+                self.opened_at = self._clock()
             if on and mode in MODES:
                 self.mode = mode
+            if on and depth is not None:
+                self.depth = bool(depth)
             if not on:
+                self.depth = False
                 self.shown = ""
                 self.exploded = False
                 self.parts = 0
@@ -142,8 +152,11 @@ class HoloState:
             elif cmd == "close":
                 self.on = False
                 self.model = ""
+                self.depth = False
             elif cmd == "mode" and arg in MODES:
                 self.mode = arg
+            elif cmd == "depth":
+                self.depth = arg in ("1", "on", "true")
             return self.seq
 
     # -- the page's heartbeat -------------------------------------------------
@@ -163,12 +176,27 @@ class HoloState:
             return (self._last_poll is not None
                     and self._clock() - self._last_poll < ALIVE_S)
 
+    def kinect_session(self, grace_s: float = 10.0) -> bool:
+        """True while a hologram that asked for the Kinect + depth is up: the
+        page is polling, or it was opened under ``grace_s`` ago and has not
+        polled yet. core/handtrack_depth.py uses this to pick the Kinect as the
+        tracker's camera for exactly as long as that hologram lives."""
+        with self._lock:
+            if not (self.on and self.depth):
+                return False
+            if (self._last_poll is not None
+                    and self._clock() - self._last_poll < ALIVE_S):
+                return True
+            return (self.opened_at is not None
+                    and self._clock() - self.opened_at < grace_s)
+
     # -- the poll payload -----------------------------------------------------
     def payload(self, seen: int = 0) -> dict:
         with self._lock:
             return {
                 "on": self.on,
                 "mode": self.mode,
+                "depth": self.depth,
                 "model": self.model,
                 "seq": self.seq,
                 "commands": [c for c in self.commands if c["seq"] > seen],

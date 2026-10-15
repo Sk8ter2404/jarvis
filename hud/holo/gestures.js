@@ -27,6 +27,10 @@
 //   scene.explode() / scene.assemble()
 //   scene.partAt(x, y) -> part|null                nearest part to a px point (exploded only)
 //   scene.pullPart(part) / movePart(part, x, y) / releasePart(part) / showInfo(part|null)
+//   OPTIONAL (Kinect depth; a scene without them just has no push/pull):
+//   scene.beginPushPull(handZ) / pushPull(handZ, dt) / endPushPull()
+//                                                  a fist holds the hologram and the
+//                                                  hand has a depth ("z", metres)
 //
 // NEVER moves the OS cursor or sends OS input - nothing here can.
 
@@ -152,10 +156,17 @@ export class GestureRouter {
       // for T.PINCH_RELEASE_S lets go even if fist_release never arrives.
       if (h && h.state === "fist") this.grab.lostS = 0;
       else this.grab.lostS = (this.grab.lostS || 0) + dt;
-      if (!h || this.grab.lostS >= T.PINCH_RELEASE_S) { this.grab = null; }
+      if (!h || this.grab.lostS >= T.PINCH_RELEASE_S) { this._endGrab(); }
       else if (h.palm && h.state === "fist") {
         const p = sc.toScreen(h.palm[0], h.palm[1]);
         sc.setReactorTarget(p.x, p.y);
+        // Push / pull: the fist's depth (the tracker's "z", metres) moves the
+        // hologram toward / away from the sensor. The first depth the grab sees
+        // is its baseline.
+        if (typeof h.z === "number" && h.z > 0 && sc.beginPushPull && sc.pushPull) {
+          if (!this.grab.pp) { this.grab.pp = true; sc.beginPushPull(h.z); }
+          else sc.pushPull(h.z, dt);
+        }
       }
     }
 
@@ -226,7 +237,7 @@ export class GestureRouter {
         break;
       }
       case "fist_release":
-        this.grab = null;
+        this._endGrab();
         break;
 
       case "point_flick": {
@@ -271,6 +282,13 @@ export class GestureRouter {
       default:
         this.log("unknown gesture " + ev.name);
     }
+  }
+
+  // Let go of a fist grab (and end its push / pull if one began).
+  _endGrab() {
+    const g = this.grab;
+    this.grab = null;
+    if (g && g.pp && this.scene.endPushPull) this.scene.endPushPull();
   }
 
   _dropPulled() {

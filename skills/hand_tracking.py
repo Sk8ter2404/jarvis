@@ -76,6 +76,40 @@ def _set_runtime(enabled: bool) -> None:
         pass
 
 
+def _kinect_feed():
+    """core.handtrack_depth's status (Kinect colour / depth hand-off), or {}."""
+    try:
+        from core import handtrack_depth
+        return handtrack_depth.feed_status() or {}
+    except Exception:
+        return {}
+
+
+def _camera_name() -> str:
+    """The camera the tracker reads, as it should be spoken: "kinect" while the
+    Kinect is selected (setting, or a Kinect hologram that is up), else the
+    configured value."""
+    try:
+        from core import handtrack_frames
+        cam = handtrack_frames._setting()
+    except Exception:
+        cam = str(_cfg("HAND_TRACK_CAMERA", "primary") or "primary")
+    return "Kinect" if str(cam).strip().lower().startswith("kinect") else str(cam)
+
+
+def _kinect_depth_phrase(hb: dict) -> str:
+    """For the Kinect camera: whether DEPTH is really flowing (the tracker's own
+    heartbeat says it sees a fresh plane), or why not. "" for any other camera."""
+    fs = _kinect_feed()
+    if not fs.get("selected"):
+        return ""
+    if not fs.get("depth_wanted"):
+        return ", colour only (depth is off)"
+    if hb.get("depth"):
+        return ", with depth"
+    return ", but depth isn't flowing yet"
+
+
 def _launcher():
     try:
         from core import hand_tracker_launcher
@@ -525,7 +559,7 @@ def _hand_tracking_on(_: str = "") -> str:
     ok, msg = start_tracking()
     if not ok:
         return f"I couldn't start hand tracking, sir: {msg}."
-    cam = str(_cfg("HAND_TRACK_CAMERA", "primary") or "primary")
+    cam = _camera_name()
     if msg == "already running":
         return "Hand tracking is already on, sir."
     menu = (" An open palm held up opens the hand menu." if bool(_cfg("HAND_MENU_ENABLED", False))
@@ -599,14 +633,21 @@ def status_text() -> str:
         return ("Hand tracking is on but the tracker kept stopping, sir, so "
                 "I gave up on it. Say 'hand tracking on' to try again.")
     hb = la.heartbeat()
-    cam = str(_cfg("HAND_TRACK_CAMERA", "primary") or "primary")
+    cam = _camera_name()
     if not la.running():
         return "Hand tracking is starting up, sir."
     if hb is None or hb.get("age_s", 99) > 4:
         return "The hand tracker is loading, sir; it isn't answering yet."
     if not hb.get("attached"):
+        why = ""
+        if cam == "Kinect":
+            fs = _kinect_feed()
+            if fs.get("reason") == "kinect not open":
+                why = " - the Kinect isn't open (it may be off in settings)"
+            elif fs.get("last_error"):
+                why = " - the Kinect hand-off hit an error"
         return (f"The hand tracker is up, sir, but it isn't getting frames from "
-                f"the {cam} camera yet.")
+                f"the {cam} camera yet{why}.")
     hands = int(hb.get("hands", 0) or 0)
     fps = float(hb.get("fps", 0.0) or 0.0)
     seen = ("I can't see any hands" if hands == 0
@@ -618,8 +659,9 @@ def status_text() -> str:
     # shows, since quick gestures (the flick, the clap) get harder below that.
     slow = ("; that's on the slow side - more light on your hands lets the "
             "webcam run faster" if 0 < fps < LOW_FPS else "")
+    depth = _kinect_depth_phrase(hb) if cam == "Kinect" else ""
     return (f"Hand tracking is on, sir: {seen}, tracking at {fps:.0f} frames a "
-            f"second from the {cam} camera{slow}{menu}.")
+            f"second from the {cam} camera{depth}{slow}{menu}.")
 
 
 def _hand_tracking_status(_: str = "") -> str:

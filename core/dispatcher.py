@@ -596,6 +596,13 @@ _HOLO_ON_RE = re.compile(
     + r"|(?:turn|switch)\s+on\s+" + _HOLO_NAME
     + r"|(?:turn|switch)\s+" + _HOLO_NAME + r"\s+on"
     + r"|" + _HOLO_NAME + r"\s+on)$", re.IGNORECASE)
+# "open up the hologram WITH THE KINECT" (2026-10-15, Phase 2): the same open
+# request plus a Kinect tail (or "the Kinect hologram") routes to holo_mode_on
+# with the argument "kinect" - Kinect colour + depth for as long as it is up.
+_HOLO_KINECT_TAIL_RE = re.compile(
+    r"\s+(?:with|using|on|from|via|in)\s+(?:the\s+|my\s+)?(?:xbox\s+)?kinect"
+    r"(?:\s+(?:camera|sensor|depth))?(?:\s+(?:and\s+)?(?:with\s+)?depth)?$", re.IGNORECASE)
+_HOLO_KINECT_ADJ_RE = re.compile(r"\bkinect\s+(?=hologram\b)", re.IGNORECASE)
 _HOLO_OFF_RE = re.compile(
     r"^(?:(?:close|hide|dismiss|kill|exit|stop|end)\s+" + _HOLO_NAME
     + r"|(?:turn|switch|shut)\s+off\s+" + _HOLO_NAME
@@ -630,6 +637,11 @@ def holo_route(utterance, holo_up: bool = False) -> str | None:
         s = " ".join(_strip(s).split())
         s = " ".join(_strip(_HT_POLITE_RE.sub("", s)).split())
         s = " ".join(_HT_POLITE_RE.sub("", s).split())
+        kin = _HOLO_KINECT_TAIL_RE.search(s)
+        if kin is not None and _HOLO_ON_RE.match(s[:kin.start()]):
+            return "[ACTION: holo_mode_on, kinect]"
+        if _HOLO_KINECT_ADJ_RE.search(s) and _HOLO_ON_RE.match(_HOLO_KINECT_ADJ_RE.sub("", s)):
+            return "[ACTION: holo_mode_on, kinect]"
         if _HOLO_ON_RE.match(s):
             return "[ACTION: holo_mode_on]"
         if _HOLO_OFF_RE.match(s):

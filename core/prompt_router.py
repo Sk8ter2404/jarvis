@@ -715,6 +715,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # 2026-10-15: the hand mouse (hand_mouse_on / off / status). "hand mouse"
         # also loads AIR-MOUSE and AIR CONTROL, which is deliberate (see below).
         "hand mouse", "pinch mouse", "pinch to click",
+        # 2026-10-15: Kinect depth for the hologram (hand_tracking_status says
+        # whether it is flowing).
+        "kinect depth", "hologram depth", "the depth working",
     ],
     "SMART HOME — PER-BRAND LIST": [
         "smart device",

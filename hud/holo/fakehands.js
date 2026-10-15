@@ -108,8 +108,13 @@ function handAtPalm(side, state, px, py) {
 
 export class FakeHands {
   // probe: {menuItemNorm(i)->[x,y]|null, partNorm(name)->[x,y]|null, reactorNorm()->[x,y]|null}
-  constructor(probe = {}) {
+  // opts.depth: also fake the Kinect - every hand carries "z" (the fist phase
+  // pushes toward the sensor then pulls back) and depthPlane(t) gives a 160x90
+  // plane (wall 2.6 m, a torso band 1.4 m, a blob drifting past at 0.7 m).
+  constructor(probe = {}, opts = {}) {
     this.probe = probe;
+    this.depth = !!opts.depth;
+    this._planeSeq = 0;
     this.t = 0;
     this.seq = 0;
     this._fired = new Set();
@@ -184,6 +189,30 @@ export class FakeHands {
     ];
   }
 
+  // Fake hand depth in metres for script time t (the fist phase is 4.2-6.8 s).
+  handZ(t) {
+    if (t >= 4.2 && t < 6.8) return 0.85 - 0.25 * Math.sin(((t - 4.2) / 2.6) * Math.PI * 2);
+    return 0.85;
+  }
+
+  // A fake depth plane {w, h, seq, mm} for absolute time `now`; null unless opts.depth.
+  depthPlane(now) {
+    if (!this.depth) return null;
+    const w = 160, h = 90, mm = new Uint16Array(w * h);
+    const bx = 0.5 + 0.28 * Math.sin(now * 0.5), by = 0.5;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let v = 2600;
+        if (y > h * 0.72) v = 1400;                                   // torso band
+        const dx = (x / w - bx) * (w / h), dy = y / h - by;
+        if (dx * dx + dy * dy < 0.012) v = 700;                       // something passing in front
+        mm[y * w + x] = v;
+      }
+    }
+    this._planeSeq += 1;
+    return { w, h, seq: this._planeSeq, mm };
+  }
+
   // Advance to absolute time `now` (seconds). Returns the messages due.
   step(now) {
     const loop = Math.floor(now / LOOP_S);
@@ -191,6 +220,7 @@ export class FakeHands {
     const t = now - loop * LOOP_S;
     const out = [];
     const hands = this._hands(t);
+    if (this.depth) for (const hd of hands) hd.z = this.handZ(t);
     this.seq += 1;
     out.push({ type: "hands", t: Math.round(now * 1000), seq: this.seq, w: 640, h: 480, hands });
     for (const e of this._events(t)) {

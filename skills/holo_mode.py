@@ -26,8 +26,21 @@ NEVER moves the Windows cursor or sends OS input; the page only draws.
 HOLO_MODE_ENABLED (core/config.py) False -> every action says it is off.
 
 Voice actions (each returns ONE finished sentence, spoken verbatim):
-  hand_menu, holo_mode_on [desktop|camera], holo_mode_off, holo_show [model],
-  holo_explode, holo_assemble
+  hand_menu, holo_mode_on [desktop|camera|kinect], holo_mode_off,
+  holo_show [model], holo_explode, holo_assemble
+
+KINECT + DEPTH (Phase 2, core/handtrack_depth.py): "open up the hologram with the
+Kinect" is holo_mode_on with the word "kinect". It opens the page in camera mode
+with depth (STATE.depth); for as long as that hologram is up, JARVIS publishes the
+Kinect colour camera (and the registered depth plane) to the hand tracker instead
+of a webcam - no setting is changed, so closing the hologram (or its window) just
+ends it. It needs the Kinect bridge to be on (KINECT_ENABLED is the owner's
+privacy switch and is never flipped here: with it off the hologram opens on the
+webcam and says so). With HAND_TRACK_CAMERA = "kinect" and HOLO_DEPTH_ENABLED made
+permanent, a plain "open the hologram" is the Kinect one. The page hides the
+hologram behind anything nearer than it and lets a fist push / pull it in depth,
+only while the depth plane is really flowing; hand_tracking_status says whether
+it is.
 
 holo_show also shows the owner's OWN models (.stl / .3mf / .obj in
 data/holo_models or the HOLO_MODEL_DIRS folders, see core/holo_web.py): the
@@ -165,6 +178,34 @@ def _norm_model(arg: str) -> str:
     return a.strip()
 
 
+def _wants_kinect(arg: str) -> bool:
+    return "kinect" in (arg or "").lower()
+
+
+def _kinect_enabled() -> bool:
+    """Is the Kinect bridge switched on (KINECT_ENABLED)? A pure flag read."""
+    try:
+        from audio import kinect_bridge
+        return bool(kinect_bridge.get_enabled())
+    except Exception:
+        return bool(_cfg("KINECT_ENABLED", False))
+
+
+def _kinect_refusal() -> str:
+    """"" when the Kinect can be used, else the honest reason it cannot."""
+    if _kinect_enabled():
+        return ""
+    return ("The Kinect is switched off in my settings, sir, so this one is on "
+            "the webcam.")
+
+
+def _kinect_page() -> bool:
+    """True when the owner made Kinect + depth permanent (HAND_TRACK_CAMERA =
+    "kinect" and HOLO_DEPTH_ENABLED), so even a plain request is the Kinect one."""
+    return (str(_cfg("HAND_TRACK_CAMERA", "primary") or "").strip().lower() == "kinect"
+            and bool(_cfg("HOLO_DEPTH_ENABLED", False)) and _kinect_enabled())
+
+
 def _norm_mode(arg: str, default: str) -> str:
     a = (arg or "").strip().lower()
     for word, mode in _MODE_WORDS.items():
@@ -173,13 +214,13 @@ def _norm_mode(arg: str, default: str) -> str:
     return default
 
 
-def _open_page(mode: str, model: str = ""):
+def _open_page(mode: str, model: str = "", depth: bool = False):
     """Start the server if needed and open the window. Returns (ok, why)."""
     ok, host, port, why = _ensure_server()
     if not ok:
         return False, why
-    holo_web.STATE.set_on(True, model=model, mode=mode)
-    url = f"http://{host}:{port}/holo?mode={mode}"
+    holo_web.STATE.set_on(True, model=model, mode=mode, depth=depth)
+    url = f"http://{host}:{port}/holo?mode={mode}" + ("&depth=1" if depth else "")
     if not _launch_window(url):
         holo_web.STATE.set_on(False)
         return False, "I couldn't open a browser window for it, sir."
@@ -231,20 +272,33 @@ def _release_tracker() -> None:
 def holo_mode_on(arg: str = "") -> str:
     if not _enabled():
         return _off_line()
-    mode = _norm_mode(arg, "camera")
+    asked = _wants_kinect(arg)
+    mode = "camera" if asked else _norm_mode(arg, "camera")
     st = holo_web.STATE
     if _opening():
         return "It's still coming up, sir."
+    refusal = _kinect_refusal() if asked else ""
+    kinect_note = f" {refusal}" if refusal else ""
+    depth = mode == "camera" and ((asked and not refusal) or (not asked and _kinect_page()))
     note = _ensure_tracker()
     if st.page_alive:
+        if depth and asked:
+            st.push_command("depth", "1")
+            if st.mode != mode:
+                st.push_command("mode", mode)
+            return "Switched the hologram to the Kinect, sir." + note
         if st.mode != mode:
             st.push_command("mode", mode)
-            return "Switched the hologram view, sir." + note
-        return "Holo mode is already up, sir." + note
-    ok, why = _open_page(mode)
+            return "Switched the hologram view, sir." + note + kinect_note
+        return "Holo mode is already up, sir." + note + kinect_note
+    ok, why = _open_page(mode, depth=depth)
     if not ok:
         return why
-    return ("Hand menu up, sir." if mode == "desktop" else "Holo mode up, sir.") + note
+    if depth:
+        return ("Holo mode up on the Kinect, sir. Depth comes on once it is "
+                "streaming." + note)
+    return (("Hand menu up, sir." if mode == "desktop" else "Holo mode up, sir.")
+            + note + kinect_note)
 
 
 def hand_menu(arg: str = "") -> str:

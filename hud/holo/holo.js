@@ -7,6 +7,10 @@
 //   /holo?mode=camera    the tracker's mirrored camera frames behind the scene
 //   /holo?fake=1         built-in scripted hands + gestures (no service needed)
 //   /holo?selftest=1     run the pure-module self tests and show the result
+//   /holo?mode=camera&depth=1   camera mode with Kinect DEPTH (when the tracker
+//                        relays a depth plane): things nearer than the hologram
+//                        hide it, and a fist can push / pull it in depth
+//   /holo?fake=1&depth=1 also fakes a depth plane and hand depths (no Kinect)
 //   other params: ws=<url> debug=1 mirror=1 (flip the frames again; the
 //   service already sends them mirrored, matching the mirrored landmarks)
 //
@@ -17,6 +21,10 @@
 import {
   T, GestureRouter, mapToScreen, mapFromScreen, dampSpin, followStep, palmSize,
 } from "/holo/gestures.js";
+import {
+  D, parseDepthMessage, isDepthMessage, occlusionMask, defaultHoloZ, spawnZ,
+  sizeAtDistance, PushPull,
+} from "/holo/depth.js";
 import { Reactor, REACTOR_NAME } from "/holo/reactor.js";
 import { fetchModelList, findModel, loadOwnModel, pageOf, formatSizeMm } from "/holo/models.js";
 
@@ -67,6 +75,18 @@ let ws = null, wsTimer = 0;
 let frameBitmap = null, decoding = false;
 let seenSeq = null;                    // first poll just syncs; never replays old commands
 
+// Kinect depth (Phase 2). Everything here is inert unless the page was asked for
+// depth AND the tracker is actually relaying a plane (depthOn()).
+let wantDepth = qs.get("depth") === "1";
+let depthPlane = null, depthAt = 0;    // newest {w, h, seq, mm} and when it arrived (ms)
+let maskDirty = false, maskZ = 0;      // the occlusion mask needs a rebuild
+let holoZ = D.HOLO_Z_DEFAULT;          // the hologram's distance from the sensor (m)
+let holoZRef = D.HOLO_Z_DEFAULT;       // the distance it was spawned at (size 1)
+let zAnchored = false;
+const pp = new PushPull();
+const depthOn = () => wantDepth && mode === "camera" && depthPlane !== null &&
+  (performance.now() - depthAt) < D.STALE_MS;
+
 const URLS = { tracker: qs.get("ws") || TRACKER_URL_DEFAULT };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +104,7 @@ const glCanvas = $("gl");
 const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
 renderer.setClearColor(0x000000, 0);
+renderer.autoClear = false;             // frame() clears once, then draws the scene and the occlusion mask
 const sceneGL = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 10, 6000);
 const CAM_Z = 1300;
@@ -99,9 +120,64 @@ let cur = reactor;                      // what is on screen: the reactor or one
 let shownName = "";                     // its name as the voice knows it
 let loadToken = 0;                      // newest load wins
 
+// ---- occlusion mask (depth) ------------------------------------------------
+// One extra full-frame quad, drawn AFTER the scene, that multiplies what the
+// scene drew by (1 - mask): where the Kinect sees something nearer than the
+// hologram the hologram's pixels become transparent (the canvas is
+// premultiplied-alpha, so this really erases them). Unknown depth leaves the
+// hologram alone. The mask texture is the 160x90 plane, filtered linearly.
+const maskScene = new THREE.Scene();
+const maskCam = new THREE.OrthographicCamera(0, 1, 1, 0, -1, 1);   // pixel space, y up
+const maskMat = new THREE.ShaderMaterial({
+  uniforms: { mask: { value: null }, uFlip: { value: 0 } },
+  vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+  fragmentShader: "uniform sampler2D mask; uniform float uFlip; varying vec2 vUv; " +
+    "void main() { float u = uFlip > 0.5 ? 1.0 - vUv.x : vUv.x; " +
+    "float m = texture2D(mask, vec2(u, 1.0 - vUv.y)).r; gl_FragColor = vec4(0.0, 0.0, 0.0, m); }",
+  transparent: true, depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending,
+  blendEquation: THREE.AddEquation, blendSrc: THREE.ZeroFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
+  blendEquationAlpha: THREE.AddEquation, blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
+});
+const maskQuad = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), maskMat);
+maskQuad.frustumCulled = false;
+maskScene.add(maskQuad);
+let maskTex = null, maskBuf = null;
+
+function ensureMask(w, h) {
+  if (maskTex && maskTex.image.width === w && maskTex.image.height === h) return;
+  if (maskTex) maskTex.dispose();
+  maskBuf = new Uint8Array(w * h);
+  maskTex = new THREE.DataTexture(maskBuf, w, h, THREE.RedFormat, THREE.UnsignedByteType);
+  maskTex.minFilter = maskTex.magFilter = THREE.LinearFilter;
+  maskTex.unpackAlignment = 1;
+  maskTex.needsUpdate = true;
+  maskMat.uniforms.mask.value = maskTex;
+  maskDirty = true;
+}
+
+// Draw the mask over the scene when depth is flowing and something is on screen.
+function drawOcclusion() {
+  if (!depthOn() || !scene.reactorVisible) return;
+  const { w, h, mm } = depthPlane;
+  ensureMask(w, h);
+  if (maskDirty || Math.abs(holoZ - maskZ) > 0.005) {
+    occlusionMask(mm, w, h, holoZ, maskBuf);
+    maskTex.needsUpdate = true;
+    maskDirty = false; maskZ = holoZ;
+  }
+  const p0 = mapToScreen(0, 0, W, H, "camera", aspect), p1 = mapToScreen(1, 1, W, H, "camera", aspect);
+  maskQuad.scale.set(p1.x - p0.x, p1.y - p0.y, 1);
+  maskQuad.position.set((p0.x + p1.x) / 2, H - (p0.y + p1.y) / 2, 0);
+  maskMat.uniforms.uFlip.value = mirrorFrame ? 1 : 0;
+  renderer.render(maskScene, maskCam);
+}
+
 function resize() {
   W = innerWidth; H = innerHeight;
   renderer.setSize(W, H, false);
+  maskCam.left = 0; maskCam.right = W; maskCam.top = H; maskCam.bottom = 0;
+  maskCam.updateProjectionMatrix();
   camera.aspect = W / H;
   camera.fov = 2 * Math.atan(H / 2 / CAM_Z) * 180 / Math.PI;   // z=0 plane: 1 unit = 1 px
   camera.position.set(0, 0, CAM_Z);
@@ -121,6 +197,8 @@ const rs = {
   ry: 0.45, rx: -0.38,                  // orientation
 };
 const baseR = () => Math.min(W, H) * 0.17;
+// Perspective size from the hologram's distance (1 unless depth is flowing).
+const depthSize = () => (depthOn() ? sizeAtDistance(holoZRef, holoZ) : 1);
 const toWorld = (px, py, z = 0) => new THREE.Vector3(px - W / 2, H / 2 - py, z);
 const labelEls = new Map();
 let infoEl = null;
@@ -142,11 +220,15 @@ const scene = {
   exploded: false,
   menuOpen: false,
   get scale() { return rs.scale; },
-  reactorScreen() { return { x: rs.x, y: rs.y, r: baseR() * rs.scale }; },
+  reactorScreen() { return { x: rs.x, y: rs.y, r: baseR() * rs.scale * depthSize() }; },
   toScreen,
   setReactorTarget(x, y) { rs.tx = x; rs.ty = y; },
   setScale(s) { rs.scale = s; },
   addSpin(wy, wx) { rs.wy += wy; rs.wx += wx; },
+  // Push / pull (needs depth): the fist's depth moves the hologram's distance.
+  beginPushPull(z) { if (depthOn()) pp.begin(z, holoZ); },
+  pushPull(z, dt) { if (depthOn() && pp.active) holoZ = pp.update(z, dt); },
+  endPushPull() { pp.end(); },
 
   openMenu(x, y) {
     menuPos = clampMenu(x, y, 160);
@@ -339,6 +421,31 @@ function activate(obj, name, x, y) {
   for (const p of cur.parts) { p.pull = null; p.pullBack = false; p.mesh.position.copy(p.rest); }
   scene.reactorVisible = true;
   cur.group.visible = true;
+  pp.end();
+  zAnchored = false;
+  anchorZ(x, y);
+}
+
+// Where the hologram floats: just in front of the hand that spawned it, else a
+// little in front of the nearest thing the Kinect sees. Retried every frame
+// until depth is flowing (a voice-opened hologram can appear before the first
+// plane); with no depth it stays at the default and nothing depends on it.
+function anchorZ(x, y) {
+  if (zAnchored || !depthOn()) return;
+  let z = null;
+  if (x != null) {
+    let best = Infinity;
+    for (const h of latestHands) {
+      if (typeof h.z !== "number" || !(h.z > 0) || !h.palm) continue;
+      const p = toScreen(h.palm[0], h.palm[1]);
+      const d = Math.hypot(p.x - x, p.y - y);
+      if (d < best && d < 0.35 * Math.min(W, H)) { best = d; z = h.z; }
+    }
+  }
+  holoZ = (z !== null) ? spawnZ(z) : defaultHoloZ(depthPlane.mm);
+  holoZRef = holoZ;
+  zAnchored = true;
+  maskDirty = true;
 }
 
 async function showOwnModel(query, x, y) {
@@ -377,11 +484,15 @@ function setMode(m) {
   $("chip-mode").textContent = m === "desktop" ? "DESKTOP" : "CAMERA";
   subscribeFrames();
   updateLegend();
+  updateDepthChip(true);
 }
 
 function subscribeFrames() {
   if (ws && ws.readyState === 1) {
-    try { ws.send(JSON.stringify({ type: "subscribe", frames: mode === "camera" })); } catch (_) { /* socket closing */ }
+    try {
+      ws.send(JSON.stringify({ type: "subscribe", frames: mode === "camera",
+        depth: wantDepth && mode === "camera" }));
+    } catch (_) { /* socket closing */ }
   }
 }
 
@@ -426,6 +537,29 @@ function onTrackerMessage(msg) {
     router.onGesture(msg);
   }
 }
+function onDepthPlane(p) {
+  depthPlane = p; depthAt = performance.now(); maskDirty = true;
+}
+function setWantDepth(on) {
+  if (wantDepth === !!on) return;
+  wantDepth = !!on;
+  if (!wantDepth) { depthPlane = null; pp.end(); }
+  subscribeFrames();
+  updateDepthChip(true);
+  updateLegend();
+}
+let chipAt = 0;
+function updateDepthChip(force) {
+  const now = performance.now();
+  if (!force && now - chipAt < 400) return;
+  chipAt = now;
+  const c = $("chip-depth");
+  if (!wantDepth || mode !== "camera") { c.style.display = "none"; return; }
+  c.style.display = "";
+  const on = depthOn();
+  c.textContent = on ? "DEPTH: ON  " + holoZ.toFixed(2) + " m" : "DEPTH: WAITING FOR THE KINECT";
+  c.className = "chip " + (on ? "ok" : "bad");
+}
 function setTracker(ok) {
   trackerOk = ok;
   const c = $("chip-trk");
@@ -440,7 +574,7 @@ function connectTracker() {
   } catch (e) {
     setTracker(false); wsTimer = setTimeout(connectTracker, 2500); return;
   }
-  ws.binaryType = "blob";
+  ws.binaryType = "arraybuffer";
   ws.onopen = () => { setTracker(true); subscribeFrames(); };
   ws.onclose = () => { setTracker(false); latestHands = []; if (!closed) wsTimer = setTimeout(connectTracker, 2500); };
   ws.onerror = () => { try { ws.close(); } catch (_) { /* already closed */ } };
@@ -448,9 +582,13 @@ function connectTracker() {
     if (typeof ev.data === "string") {
       let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
       onTrackerMessage(msg);
+    } else if (isDepthMessage(ev.data)) {               // "JVDP": a depth plane, not a JPEG
+      const p = parseDepthMessage(ev.data);
+      if (p) onDepthPlane(p);
     } else if (mode === "camera" && !decoding) {
       decoding = true;
-      createImageBitmap(ev.data).then(bm => { frameBitmap = bm; }).catch(() => {}).finally(() => { decoding = false; });
+      createImageBitmap(new Blob([ev.data], { type: "image/jpeg" }))
+        .then(bm => { frameBitmap = bm; }).catch(() => {}).finally(() => { decoding = false; });
     }
   };
 }
@@ -470,13 +608,17 @@ async function startFake() {
       return mapFromScreen(s.x, s.y, W, H, mode, aspect);
     },
     reactorNorm: () => scene.reactorVisible ? mapFromScreen(rs.x, rs.y, W, H, mode, aspect) : null,
-  });
+  }, { depth: wantDepth });
   fakeT0 = performance.now();
   $("chip-fake").style.display = "";
   setTracker(true);
   $("chip-trk").textContent = "TRACKER: FAKE";
   setInterval(() => {
     for (const m of fake.step((performance.now() - fakeT0) / 1000)) onTrackerMessage(m);
+    if (wantDepth) {
+      const p = fake.depthPlane((performance.now() - fakeT0) / 1000);
+      if (p) onDepthPlane(p);
+    }
   }, 33);
 }
 
@@ -489,6 +631,7 @@ function applyCommand(c) {
     case "explode": if (scene.reactorVisible) scene.explode(); break;
     case "assemble": if (scene.reactorVisible) scene.assemble(); break;
     case "mode": setMode(c.arg); break;
+    case "depth": setWantDepth(c.arg === "1" || c.arg === "on" || c.arg === "true"); break;
     case "close": closeHolo(); break;
   }
 }
@@ -510,6 +653,7 @@ async function pollState() {
       // first contact: adopt, never replay. A model already requested spawns.
       seenSeq = d.seq;
       if (!qs.get("mode") && (d.mode === "camera" || d.mode === "desktop")) setMode(d.mode);
+      if (!qs.has("depth") && d.depth) setWantDepth(true);
       if (d.model) scene.spawn(d.model);
       return;
     }
@@ -611,7 +755,8 @@ function updateLegend() {
     "<b>2 FISTS APART</b> / <b>PALMS TOGETHER THEN APART</b> / <b>TWIST A FIST</b> explode",
     "exploded: <b>PINCH</b> a part to pull it out, hold for info &nbsp; <b>CLAP</b> assemble &nbsp; <b>2 PINCHES</b> scale",
     "keys: <b>E</b> explode &nbsp;<b>C</b> camera/desktop &nbsp;<b>B</b> b&amp;w &nbsp;<b>F</b> mirror &nbsp;<b>L</b> labels &nbsp;<b>D</b> debug &nbsp;<b>R</b> reactor",
-  ].join("<br>");
+  ].concat(wantDepth ? ["depth: <b>FIST + HAND TOWARD / AWAY</b> pushes / pulls the hologram &nbsp; <b>ANYTHING NEARER</b> hides it"] : [])
+    .join("<br>");
 }
 
 // ---------------------------------------------------------------------------
@@ -651,7 +796,8 @@ function frame(now) {
     const idle = (Math.abs(rs.wy) < 0.4) ? 0.25 : 0;
     rs.ry += (rs.wy + idle) * dt;
     rs.rx += rs.wx * dt;
-    const s = baseR() * rs.scale;
+    anchorZ(null, null);                 // depth just started flowing: place the hologram
+    const s = baseR() * rs.scale * depthSize();
     const g = cur.group;
     g.position.copy(toWorld(rs.x, rs.y, 0));
     g.scale.setScalar(s);
@@ -659,8 +805,11 @@ function frame(now) {
     cur.step(dt, t);
   }
   drawBackground();
+  renderer.clear();
   renderer.render(sceneGL, camera);
+  drawOcclusion();
   drawHands();
+  updateDepthChip(false);
   updateLabels();
   if (debug) {
     const sm = router.summary();
@@ -682,4 +831,10 @@ if (FAKE) startFake();
 setInterval(pollState, 300);
 pollState();
 requestAnimationFrame(frame);
-window.__holo = { scene, router, reactor, rs, get cur() { return cur; } };   // debugging handle (page-local)
+window.__holo = {
+  scene, router, reactor, rs, get cur() { return cur; },
+  depth: {                                // depth debugging: inject a plane, read/set the distance
+    inject: onDepthPlane, on: depthOn,
+    get z() { return holoZ; }, set z(v) { holoZ = v; holoZRef = v; zAnchored = true; maskDirty = true; },
+  },
+};   // debugging handle (page-local)

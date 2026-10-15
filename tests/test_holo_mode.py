@@ -124,7 +124,7 @@ class HoloRouteTests(_HoloServer):
         self.assertIn("frame-ancestors 'none'", csp)
 
     def test_static_files_served_and_nothing_else(self):
-        for name in ("holo.js", "gestures.js", "reactor.js", "models.js",
+        for name in ("holo.js", "gestures.js", "depth.js", "reactor.js", "models.js",
                      "fakehands.js", "selftest.js"):
             code, text = _get_raw(self.base + "/holo/" + name)
             self.assertEqual(code, 200, name)
@@ -453,8 +453,8 @@ class HoloVoiceRouteTests(unittest.TestCase):
 
 # --- the page's static contract ----------------------------------------------
 class HoloPageContractTests(unittest.TestCase):
-    PAGE_FILES = ("holo.html", "holo.js", "gestures.js", "reactor.js", "models.js",
-                  "fakehands.js", "selftest.js")
+    PAGE_FILES = ("holo.html", "holo.js", "gestures.js", "depth.js", "reactor.js",
+                  "models.js", "fakehands.js", "selftest.js")
 
     def test_every_served_file_exists_and_every_file_is_served(self):
         for path, (fname, _ct) in holo_web._ASSETS.items():
