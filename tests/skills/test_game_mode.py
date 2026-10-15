@@ -1074,10 +1074,22 @@ class TestNeverEnablesWhatHeTurnedOff(_Base):
                 f"game_mode's config-flag lever is still required")
 
             # 3. the OFF action's first real statement is a bare early return.
+            #    (v2.0.200: air_mouse_off may first hand the call to the hand
+            #    mouse when AIR_MOUSE_ENGINE="hands" - that routing must come
+            #    first, or "air mouse off" would answer "already off" and leave
+            #    the hand mouse running. It is stepped over here; the Kinect
+            #    already-off gate must still be the next statement.)
+            def _is_engine_routing(s):
+                if isinstance(s, ast.Assign) and isinstance(s.value, ast.Call):
+                    return getattr(s.value.func, "id", None) == "_hands_engine_reply"
+                return (isinstance(s, ast.If)
+                        and any(isinstance(n, ast.Name) and n.id == "routed"
+                                for n in ast.walk(s.test)))
             body = [s for s in fns[off_name].body
                     if not (isinstance(s, ast.Expr)
                             and isinstance(s.value, ast.Constant)
-                            and isinstance(s.value.value, str))]
+                            and isinstance(s.value.value, str))
+                    and not _is_engine_routing(s)]
             self.assertIsInstance(
                 body[0], ast.If,
                 f"{fname}:{off_name} no longer opens with the already-off gate")

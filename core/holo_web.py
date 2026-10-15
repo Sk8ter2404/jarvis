@@ -292,8 +292,10 @@ def model_id_for(real_path: str) -> str:
 
 
 def display_name(filename: str) -> str:
-    """'Tiger_Pendant-FAST.3mf' -> 'Tiger Pendant-FAST'."""
-    stem = os.path.splitext(os.path.basename(filename))[0]
+    """'Tiger_Pendant-FAST.3mf' -> 'Tiger Pendant-FAST'. Splits on BOTH path
+    separators: os.path.basename on Linux keeps a Windows path whole (GitHub
+    CI on v2.0.199 got 'C:\\x\\Tiger Pendant FAST')."""
+    stem = os.path.splitext(re.split(r"[\\/]", str(filename))[-1])[0]
     stem = " ".join(stem.replace("_", " ").split())
     return stem[:60] or "model"
 
