@@ -511,8 +511,9 @@ class ChappieLLMTests(unittest.TestCase):
         bc = types.ModuleType("bobert_companion")
         seen = {}
 
-        def _local(system, messages, max_tokens=600):
+        def _local(system, messages, max_tokens=600, **_kw):
             seen["system"] = system
+            seen["kw"] = _kw
             seen["messages"] = messages
             seen["max_tokens"] = max_tokens
             return "  local answer  "
@@ -523,6 +524,8 @@ class ChappieLLMTests(unittest.TestCase):
         self.assertEqual(seen["system"], "SYS")
         self.assertEqual(seen["messages"], [{"role": "user", "content": "USER"}])
         self.assertEqual(seen["max_tokens"], 222)
+        # the brain caller tag (2026-10-15): the daemon is background
+        self.assertEqual(seen["kw"], {"caller": "chappie", "background": True})
 
     def test_llm_returns_empty_on_failure(self):
         bc = types.ModuleType("bobert_companion")
@@ -542,7 +545,7 @@ class ChappieLLMTests(unittest.TestCase):
         from core import local_traffic as lt
         seen = []
 
-        def _local(system, messages, max_tokens=600):
+        def _local(system, messages, max_tokens=600, **_kw):
             job = lt.current_job()
             seen.append(None if job is None else (job.tag, job.opt_in))
             return "ok"

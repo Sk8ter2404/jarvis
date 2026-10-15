@@ -1669,7 +1669,9 @@ def _summarize_screen_via_vlm(png_bytes: bytes) -> Optional[dict]:
     try:
         call_local = getattr(b, "_call_local_vision", None)
         if callable(call_local):
-            text = call_local(prompt, [png_bytes], max_tokens=400)
+            text = call_local(prompt, [png_bytes], max_tokens=400,
+                              caller="ambient_screen_observer",
+                              background=True)
             if text:
                 _vision_budget_charge(_VISION_COST_LOCAL_USD)
     except Exception as e:
@@ -1684,7 +1686,8 @@ def _summarize_screen_via_vlm(png_bytes: bytes) -> Optional[dict]:
         try:
             ask = getattr(b, "ask_vision", None)
             if callable(ask):
-                text = ask(prompt, png_bytes)
+                text = ask(prompt, png_bytes, caller="ambient_screen_observer",
+                           background=True)
                 if text:
                     _vision_budget_charge(_VISION_COST_CLOUD_USD)
         except Exception as e:

@@ -1103,7 +1103,7 @@ class CallLlmTrimsLeadingAssistantTests(MonolithGlobalsTestCase):
         ]
         captured = {}
 
-        def _spy(_sys_prompt, hist):
+        def _spy(_sys_prompt, hist, **_kw):
             captured["first_role"] = hist[0]["role"] if hist else None
             return "acknowledged"
 

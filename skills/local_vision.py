@@ -85,14 +85,16 @@ def _take_all_monitor_screenshots() -> dict:
     return {}
 
 
-def _call_local_vision(question: str, png_images: list, max_tokens: int = 600):
+def _call_local_vision(question: str, png_images: list, max_tokens: int = 600,
+                       caller: str = ""):
     """Call into bobert_companion._call_local_vision so we share the
     Ollama-alive check, background-pull logic, and `[local-vision]`
     print tag with the core fallback path."""
     b = _bobert()
     if b is None or not hasattr(b, "_call_local_vision"):
         return None
-    return b._call_local_vision(question, png_images, max_tokens=max_tokens)
+    return b._call_local_vision(question, png_images, max_tokens=max_tokens,
+                                caller=caller)
 
 
 def _missing_local_vision_msg() -> str:
@@ -147,7 +149,8 @@ def local_describe_screen(question: str = "") -> str:
             f"Question: {q}"
         )
         print(f"  [local-vision] 👁  Asking local VLM about {', '.join(names)}…", flush=True)
-        text = _call_local_vision(prompt, pngs, max_tokens=900)
+        text = _call_local_vision(prompt, pngs, max_tokens=900,
+                                 caller="local_vision")
         if not text:
             return _missing_local_vision_msg()
         result = f"[local-vision] {text}"
@@ -164,7 +167,7 @@ def local_describe_screen(question: str = "") -> str:
     if png is None:
         return "could not capture screen"
     print("  [local-vision] 👁  Asking local VLM…", flush=True)
-    text = _call_local_vision(q, [png])
+    text = _call_local_vision(q, [png], caller="local_vision")
     if not text:
         return _missing_local_vision_msg()
     result = f"[local-vision] {text}"
@@ -191,7 +194,8 @@ def _local_query_coords(description: str, png_bytes: bytes,
         f"Format: X,Y    (e.g. 432,718)\n"
         f"If the element isn't visible, reply: NOT_FOUND"
     )
-    answer = _call_local_vision(prompt, [png_bytes], max_tokens=64) or ""
+    answer = _call_local_vision(prompt, [png_bytes], max_tokens=64,
+                                caller="vision_click_target") or ""
     if "NOT_FOUND" in answer.upper():
         return None
     # The shared tolerant parser (core.vision_grounding, 2026-10-05): a clean

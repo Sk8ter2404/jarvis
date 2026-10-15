@@ -498,7 +498,7 @@ class TokenAwareBudgetTests(_Base):
         self._p(bc, "AI_BACKEND", "claude")
         seen = {}
 
-        def _quick(system, user, max_tokens=200):
+        def _quick(system, user, max_tokens=200, **_kw):
             seen["system"] = system
             return ""
         self._p(bc, "_llm_quick", side_effect=_quick)

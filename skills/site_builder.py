@@ -210,7 +210,7 @@ def _generate_cloud(system: str, user: str) -> Optional[str]:
             model=SITE_BUILDER_MODEL, system=system,
             messages=[{"role": "user", "content": user}],
             max_tokens=CLOUD_MAX_TOKENS, timeout=CLOUD_TIMEOUT_S,
-            purpose="deep")
+            purpose="deep", caller="site_builder")
     except Exception as e:
         print(f"  [site-builder] cloud generation failed: {type(e).__name__}")
         return None
@@ -222,7 +222,8 @@ def _generate_local(system: str, user: str) -> Optional[str]:
         return None
     try:
         return fn(system, [{"role": "user", "content": user}],
-                  max_tokens=LOCAL_MAX_TOKENS, timeout_s=LOCAL_TIMEOUT_S)
+                  max_tokens=LOCAL_MAX_TOKENS, timeout_s=LOCAL_TIMEOUT_S,
+                  caller="site_builder")
     except Exception as e:
         print(f"  [site-builder] local generation failed: {type(e).__name__}")
         return None

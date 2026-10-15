@@ -61,6 +61,8 @@ import re
 import threading
 from typing import Any, Callable, Optional, Sequence
 
+from core import local_traffic as _lt
+
 # Mirror of bobert_companion._ANTHROPIC_TIMEOUT_S. Kept here so the default
 # lives with the client; callers may override per-call.
 DEFAULT_TIMEOUT_S: float = 30.0
@@ -323,15 +325,30 @@ def _note_model_ok(model: Any) -> None:
         pass
 
 
-def create_message(client: Any, *, purpose: str = "voice", **kwargs: Any) -> Any:
+def create_message(client: Any, *, purpose: str = "voice", caller: str = "",
+                   background: Optional[bool] = None, **kwargs: Any) -> Any:
     """``client.messages.create`` with the per-model request shaping applied.
     Returns the raw Message; read it with ``response_text``. The reply's token
     usage is added to ``session_usage``.
+
+    ``caller`` names who is asking (a stable snake_case name) and
+    ``background`` says whether this is background work rather than the
+    owner's live turn; both are bookkeeping only and never reach the SDK. They
+    feed ``core.local_traffic.CALLS`` (cost per caller) and the ``[llm]``
+    log line. A background caller on a thread with no background job becomes
+    one (core.local_traffic.call_scope), so anything it does next on the local
+    model passes the same gate as every other tagged job.
 
     Retired-model guard (see above): a model Anthropic already answered
     not_found for is swapped for its configured successor, or the call raises
     ``RetiredModelError`` without touching the network; a fresh not_found is
     retried once on the successor when one is configured, else re-raised."""
+    with _lt.call_scope(caller, background) as (c_name, c_bg):
+        return _create_message(client, purpose, c_name, c_bg, kwargs)
+
+
+def _create_message(client: Any, purpose: str, caller: str, bg: bool,
+                    kwargs: dict) -> Any:
     model = kwargs.get("model")
     where = f"a {purpose!r} call"
     use = _guarded_model(model, where)
@@ -351,15 +368,18 @@ def create_message(client: Any, *, purpose: str = "voice", **kwargs: Any) -> Any
             kwargs = dict(kwargs, model=succ)
     _note_model_ok(kwargs.get("model"))
     _record_session_usage(kwargs.get("model"), msg)
+    _record_caller(caller, bg, msg)
     return msg
 
 
-def stream_message(client: Any, *, purpose: str = "voice", **kwargs: Any) -> Any:
+def stream_message(client: Any, *, purpose: str = "voice", caller: str = "",
+                   background: Optional[bool] = None, **kwargs: Any) -> Any:
     """``client.messages.stream`` (a context manager) with the per-model
     request shaping applied. A model already known to be gone is swapped for
     its successor or raises ``RetiredModelError`` here (see create_message);
     stream_text notes a fresh not_found, since the request is only sent when
-    the context is entered."""
+    the context is entered. ``caller`` / ``background`` are accepted for symmetry
+    with create_message and dropped here (stream_text does the bookkeeping)."""
     model = kwargs.get("model")
     use = _guarded_model(model, f"a {purpose!r} call")
     if use != model:
@@ -448,6 +468,8 @@ def complete(
     max_tokens: int = 500,
     timeout: float = DEFAULT_TIMEOUT_S,
     purpose: str = "voice",
+    caller: str = "",
+    background: Optional[bool] = None,
 ) -> str:
     """Blocking completion. Returns the reply text (``response_text``).
 
@@ -466,8 +488,10 @@ def complete(
     }
     if system is not None:
         kwargs["system"] = system
-    msg = create_message(_client(timeout), purpose=purpose, **kwargs)
-    _log_cache_usage(getattr(msg, "usage", None))
+    with _lt.call_scope(caller, background) as (c_name, c_bg):
+        msg = create_message(_client(timeout), purpose=purpose, caller=c_name,
+                             background=c_bg, **kwargs)
+        _log_cache_usage(getattr(msg, "usage", None), c_name, c_bg)
     return response_text(msg)
 
 
@@ -480,6 +504,8 @@ def stream_text(
     timeout: float = DEFAULT_TIMEOUT_S,
     on_delta: Optional[Callable[[str], None]] = None,
     purpose: str = "voice",
+    caller: str = "",
+    background: Optional[bool] = None,
 ) -> str:
     """Streaming completion. Accumulates and returns the full text, invoking
     `on_delta(chunk)` for each text chunk as it arrives.
@@ -504,8 +530,10 @@ def stream_text(
     where = f"a {purpose!r} call"
     used = _guarded_model(model, where)
     kwargs["model"] = used
+    c_name, c_bg = _lt.resolve_caller(caller, background)
     try:
-        with stream_message(_client(timeout), purpose=purpose, **kwargs) as stream:
+        with stream_message(_client(timeout), purpose=purpose, caller=c_name,
+                            background=c_bg, **kwargs) as stream:
             for chunk in stream.text_stream:
                 parts.append(chunk)
                 if on_delta is not None:
@@ -515,7 +543,7 @@ def stream_text(
                         pass
             try:
                 final = stream.get_final_message()
-                _log_cache_usage(getattr(final, "usage", None))
+                _log_cache_usage(getattr(final, "usage", None), c_name, c_bg)
                 _record_session_usage(used, final)
             except Exception:
                 final = None   # telemetry only — never let it taint a good stream
@@ -526,6 +554,7 @@ def stream_text(
         _note_if_not_found(used, e, where)
         raise
     _note_model_ok(used)
+    _record_caller(c_name, c_bg, final)
     if final is not None:
         _check_refusal(final)
     if not parts:
@@ -544,7 +573,8 @@ def stream_text(
 last_usage: dict = {}
 
 
-def _log_cache_usage(usage: Any) -> None:
+def _log_cache_usage(usage: Any, caller: str = "",
+                     background: Optional[bool] = None) -> None:
     if usage is None:
         return
     try:
@@ -554,8 +584,9 @@ def _log_cache_usage(usage: Any) -> None:
         out = getattr(usage, "output_tokens", None) or 0
         last_usage.update(cache_read=read, cache_creation=made,
                           input=raw, output=out)
+        tail = (f" {_lt.caller_label(caller, background)}" if caller else "")
         print(f"  [llm] tokens in={raw} out={out} "
-              f"cache_read={read} cache_write={made}")
+              f"cache_read={read} cache_write={made}{tail}")
     except Exception:
         pass
 
@@ -604,6 +635,28 @@ def _record_session_usage(model: Any, msg: Any) -> None:
         llm_usage.note_usage()
     except Exception:
         pass
+
+
+def _record_caller(caller: str, background: bool, msg: Any) -> None:
+    """Add one finished cloud call to the per-caller ledger
+    (core.local_traffic.CALLS). Telemetry only: never raises, and a reply
+    with no integer token counts still counts as a call."""
+    try:
+        usage = getattr(msg, "usage", None)
+        counts = {}
+        for key, attr in _USAGE_FIELDS:
+            v = getattr(usage, attr, None)
+            ok = isinstance(v, int) and not isinstance(v, bool) and v > 0
+            counts[key] = v if ok else 0
+        _lt.note_call(caller, background, "cloud", counts)
+    except Exception:
+        pass
+
+
+def caller_usage_snapshot() -> dict:
+    """Per-caller totals of every brain call this process made (cloud AND
+    local), foreground vs background: ``core.local_traffic.CALLS``."""
+    return _lt.CALLS.snapshot()
 
 
 def session_usage_snapshot() -> dict:

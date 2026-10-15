@@ -331,7 +331,7 @@ class BackgroundCallerTagTests(_Base):
         bc = self.bc
         seen = []
 
-        def _fake(system, messages, max_tokens=500):
+        def _fake(system, messages, max_tokens=500, **_kw):
             job = bc._lt.current_job()
             seen.append(job.tag if job else None)
             return "PERSON"

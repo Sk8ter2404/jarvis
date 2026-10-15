@@ -520,7 +520,8 @@ def _teams_top_senders_via_vision() -> list[str]:
         "no unread sidebar entries. Do NOT add any explanation."
     )
     try:
-        answer = ask(prompt, images)
+        answer = ask(prompt, images, caller="arrival_teams_scan",
+                     background=True)
     except Exception:
         return []
     if not isinstance(answer, str):

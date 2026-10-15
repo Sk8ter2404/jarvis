@@ -158,8 +158,9 @@ class LookTests(KinectSkillBase):
     def test_look_routes_png_through_ask_vision(self):
         seen = {}
 
-        def _ask(question, png):
+        def _ask(question, png, **_kw):
             seen["question"] = question
+            seen["caller"] = _kw.get("caller")
             seen["png"] = png
             return "a tidy desk and one person"
         utils = make_fake_skill_utils(ask_vision=mock.MagicMock(side_effect=_ask))
@@ -170,12 +171,13 @@ class LookTests(KinectSkillBase):
         self.assertIn("a tidy desk", out)
         self.assertEqual(seen["png"], b"\x89PNG-XYZ")
         self.assertEqual(seen["question"], "who is here")
+        self.assertEqual(seen["caller"], "kinect_look")
 
     def test_look_default_question_when_blank(self):
         captured = {}
         utils = make_fake_skill_utils(
             ask_vision=mock.MagicMock(
-                side_effect=lambda q, p: captured.setdefault("q", q) or "ok"))
+                side_effect=lambda q, p, **_kw: captured.setdefault("q", q) or "ok"))
         actions = self._load(_fake_bridge(), utils=utils)
         actions["kinect_look"]("")
         self.assertIn("room", captured["q"].lower())

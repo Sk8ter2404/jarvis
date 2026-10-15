@@ -456,7 +456,7 @@ class VisionLabelTests(_StreamingBase):
     def test_local_route_labels_names_and_the_chat_note(self):
         seen = {}
 
-        def _local(prompt, pngs, max_tokens=600):
+        def _local(prompt, pngs, max_tokens=600, **_kw):
             seen["prompt"], seen["n"] = prompt, len(pngs)
             return "The page is on Image #2 (TOP)."
         with mock.patch("core.config.model_route", return_value="local"), \
@@ -498,7 +498,7 @@ class VisionLabelTests(_StreamingBase):
         seen = {}
         with mock.patch("core.config.model_route", return_value="local"), \
                 mock.patch.object(self.bc, "_call_local_vision",
-                                  side_effect=lambda p, i, max_tokens=600:
+                                  side_effect=lambda p, i, max_tokens=600, **_kw:
                                   seen.setdefault("p", p) and "ok"):
             self.bc.ask_vision_multi(
                 'The owner asked: "Jarvis, what does the page say?". Answer '
@@ -509,7 +509,7 @@ class VisionLabelTests(_StreamingBase):
         seen = {}
         with mock.patch("core.config.model_route", return_value="local"), \
                 mock.patch.object(self.bc, "_call_local_vision",
-                                  side_effect=lambda p, i, max_tokens=600:
+                                  side_effect=lambda p, i, max_tokens=600, **_kw:
                                   seen.setdefault("p", p) and "ok"):
             self.bc.ask_vision_multi("What does the Teams chat say?", self._images())
         self.assertNotIn("Ignore chat", seen["p"])

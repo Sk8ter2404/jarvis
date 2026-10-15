@@ -210,7 +210,8 @@ def _llm(system: str, user: str, max_tokens: int = 600) -> str:
         bc = sys.modules.get("bobert_companion") or importlib.import_module("bobert_companion")
         with _background_work("chappie"):
             out = bc._call_local_llm(system, [{"role": "user", "content": user}],
-                                     max_tokens=max_tokens)
+                                     max_tokens=max_tokens, caller="chappie",
+                                     background=True)
         return (out or "").strip()
     except Exception as e:
         print(f"  [chappie] llm call failed: {e}")

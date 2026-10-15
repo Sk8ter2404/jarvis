@@ -892,7 +892,7 @@ def look_around(_: str = "") -> str:
     answered_local = 0   # how many vantages the FREE local VLM actually answered
     for label, png in frames:
         try:
-            answer = ask(_LOOK_PROMPT, png)
+            answer = ask(_LOOK_PROMPT, png, caller="camera_look")
         except Exception:
             answer = ""
         answer = (answer or "").strip()

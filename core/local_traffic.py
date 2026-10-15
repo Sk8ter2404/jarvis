@@ -137,6 +137,149 @@ def current_job():
     return getattr(_tls, "job", None)
 
 
+# ── who is calling the brain (caller tags, 2026-10-15) ────────────────────
+# EVERY call into the brain -- the local model through Ollama, or Claude
+# through core.llm_client -- declares WHO is calling (`caller=`, a stable
+# snake_case name) and, when it is not the default, whether the call is
+# BACKGROUND (`background=True`: learning, summaries, nightly jobs, proactive
+# remarks, audits...) rather than FOREGROUND (answering the owner, or doing
+# what he just asked). There is no second mechanism: a background call is a
+# `background_work` job. The client layer wraps its work in `call_scope`,
+# which enters `background_work(caller, opt_in=True)` when the call is
+# background and the thread has no job yet, so a declared-background call
+# reaches the SAME gate (`slot`) and the same shadow / strict switch
+# (BACKGROUND_TAG_STRICT) the hand-wrapped jobs use; a thread that is already
+# inside a `background_work` job is background without saying so, and keeps
+# its outer tag as the fallback caller name. tests/test_brain_caller_tags.py
+# fails any brain call that omits `caller=`.
+UNTAGGED = "untagged"
+
+
+def clean_caller(caller) -> str:
+    """One whitespace-free token (same rule as a job tag) or UNTAGGED."""
+    try:
+        t = "_".join(str(caller or "").split())
+    except Exception:
+        t = ""
+    return t[:48] or UNTAGGED
+
+
+def resolve_caller(caller="", background=None) -> tuple:
+    """(caller name, is_background) for one brain call.
+
+    `background` None means "ask the thread": background when the calling
+    thread is inside a background_work job. An explicit True / False wins. The
+    name is `caller`, else the enclosing job's tag, else UNTAGGED. Never
+    raises."""
+    try:
+        job = current_job()
+        name = clean_caller(caller) if caller else (
+            clean_caller(job.tag) if job is not None else UNTAGGED)
+        bg = (job is not None) if background is None else bool(background)
+        return name, bg
+    except Exception:
+        return UNTAGGED, False
+
+
+@contextlib.contextmanager
+def call_scope(caller="", background=None):
+    """Wrap ONE brain call: yields (caller name, is_background). A background
+    call from a thread with no job runs as background_work(name, opt_in=True),
+    so it passes the gate exactly like every other tagged job (it waits only
+    while BACKGROUND_TAG_STRICT is on; otherwise it runs at once and the gate
+    logs once that it would have waited). Foreground calls, and calls already
+    inside a job, are untouched."""
+    name, bg = resolve_caller(caller, background)
+    if bg and current_job() is None:
+        with background_work(name, opt_in=True):
+            yield name, True
+        return
+    yield name, bg
+
+
+class CallLedger:
+    """Per-caller totals of this process's brain calls, so a later report can
+    show cost per caller and the foreground / background split. Counts only
+    (never prompt or reply text). Bounded: past MAX_CALLERS new names fold into
+    'other'. Thread-safe; never raises."""
+
+    MAX_CALLERS = 96
+    FIELDS = ("calls", "input", "output", "cache_read", "cache_write")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._rows: dict = {}
+
+    @staticmethod
+    def _n(v) -> int:
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+    def note(self, caller, background, route, usage=None) -> None:
+        """One finished call. `route` is 'cloud' or 'local'; `usage` is an
+        optional dict of input / output / cache_read / cache_write tokens."""
+        try:
+            name = clean_caller(caller)
+            bg = bool(background)
+            with self._lock:
+                key = (name, bg)
+                if key not in self._rows and len(self._rows) >= self.MAX_CALLERS:
+                    key = ("other", bg)
+                row = self._rows.get(key)
+                if row is None:
+                    row = {"route": {}, **dict.fromkeys(self.FIELDS, 0)}
+                    self._rows[key] = row
+                row["calls"] += 1
+                r = route if route in ("cloud", "local") else "other"
+                row["route"][r] = row["route"].get(r, 0) + 1
+                for f in self.FIELDS[1:]:
+                    row[f] += self._n((usage or {}).get(f))
+        except Exception:
+            pass
+
+    def snapshot(self) -> dict:
+        """{caller: {"background": bool, "calls", "input", ... , "route": {..}}}.
+        A name seen both ways keeps one row per side, the background one under
+        '<name>' + ' [bg]'."""
+        with self._lock:
+            out = {}
+            for (name, bg), row in self._rows.items():
+                key = f"{name} [bg]" if bg and (name, False) in self._rows else name
+                out[key] = {"background": bg, **{k: (dict(v) if isinstance(v, dict) else v)
+                                                 for k, v in row.items()}}
+            return out
+
+    def totals(self) -> dict:
+        """{"foreground": {...}, "background": {...}} summed over callers."""
+        out = {"foreground": dict.fromkeys(self.FIELDS, 0),
+               "background": dict.fromkeys(self.FIELDS, 0)}
+        with self._lock:
+            for (_name, bg), row in self._rows.items():
+                side = out["background" if bg else "foreground"]
+                for f in self.FIELDS:
+                    side[f] += row[f]
+        return out
+
+    def reset(self) -> None:
+        with self._lock:
+            self._rows.clear()
+
+
+CALLS = CallLedger()
+
+
+def note_call(caller, background, route, usage=None) -> None:
+    """Record one finished brain call in the process-wide ledger."""
+    CALLS.note(caller, background, route, usage)
+
+
+def caller_label(caller, background) -> str:
+    """'caller=<name> fg|bg' for a log line. Never raises."""
+    try:
+        return f"caller={clean_caller(caller)} {'bg' if background else 'fg'}"
+    except Exception:
+        return "caller=? fg"
+
+
 def _is_main_thread() -> bool:
     try:
         return threading.current_thread() is threading.main_thread()

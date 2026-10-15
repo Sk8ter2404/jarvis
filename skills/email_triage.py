@@ -898,7 +898,7 @@ def _triage_message(msg: dict) -> str | None:
             from core import llm_client
             client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
             resp = llm_client.create_message(
-                client, purpose="classify",
+                client, purpose="classify", caller="email_triage",
                 model=_claude_model(),
                 max_tokens=8,
                 system=_triage_system,
@@ -917,7 +917,8 @@ def _triage_message(msg: dict) -> str | None:
     # Local-Ollama fallback (Claude capped / unavailable / no API key).
     try:
         bc = sys.modules.get("bobert_companion") or importlib.import_module("bobert_companion")
-        local = bc._call_local_llm(_triage_system, [{"role": "user", "content": prompt}], max_tokens=8)
+        local = bc._call_local_llm(_triage_system, [{"role": "user", "content": prompt}],
+                                  max_tokens=8, caller="email_triage")
         if local:
             verdict = _parse_verdict(local)
             if verdict:
@@ -979,7 +980,7 @@ def _generate_draft_reply(thread: dict, user_instructions: str = "") -> str | No
             from core import llm_client
             client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
             resp = llm_client.create_message(
-                client, purpose="compose",
+                client, purpose="compose", caller="email_draft",
                 model=_claude_model(),
                 max_tokens=600,
                 system=_draft_system,
@@ -996,7 +997,8 @@ def _generate_draft_reply(thread: dict, user_instructions: str = "") -> str | No
     # Local-Ollama fallback (Claude capped / unavailable / no API key).
     try:
         bc = sys.modules.get("bobert_companion") or importlib.import_module("bobert_companion")
-        local = bc._call_local_llm(_draft_system, [{"role": "user", "content": prompt}], max_tokens=600)
+        local = bc._call_local_llm(_draft_system, [{"role": "user", "content": prompt}],
+                                  max_tokens=600, caller="email_draft")
         if local:
             return _finish_draft(local)
     except Exception as e:

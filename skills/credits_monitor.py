@@ -160,7 +160,8 @@ def _ask_local_vision(bc, question: str, png: bytes) -> str:
     Never calls Claude. Honours SCREEN_VISION_ENABLED like ask_vision."""
     if not getattr(bc, "SCREEN_VISION_ENABLED", True):
         return "(screen vision is disabled — set SCREEN_VISION_ENABLED = True)"
-    local = bc._call_local_vision(question, [png])
+    local = bc._call_local_vision(question, [png], caller="credits_monitor",
+                                  background=True)
     if local:
         return f"[local-vision] {local}"
     return ("(local vision unavailable — CREDITS_CHECK_BACKEND is local; turn "
@@ -201,7 +202,8 @@ def _read_credits_via_vision():
         if _credits_backend() == "local":
             answer = _ask_local_vision(bc, question, png).strip()
         else:
-            answer = bc.ask_vision(question, png).strip()
+            answer = bc.ask_vision(question, png, caller="credits_monitor",
+                                   background=True).strip()
     except Exception as e:
         answer = f"vision_failed: {e}"
 

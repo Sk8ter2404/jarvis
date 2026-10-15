@@ -224,8 +224,13 @@ def _claude_call(
     max_tokens: int = 600,
     timeout_s: float | None = None,
     purpose: str = "quick",
+    caller: str = "",
 ) -> str:
     """One-shot Claude messages.create. Returns assistant text or raises.
+
+    ``caller`` names the stage for the per-caller ledger (core.local_traffic);
+    every orchestrator stage runs for a request the owner made, so none of
+    them is background.
 
     ``purpose`` is the core.llm_client tuning for this stage — "plan" for the
     planner, "quick" for a worker, "compose" for the merger — which sets effort
@@ -247,7 +252,8 @@ def _claude_call(
         # The SDK accepts a per-request `timeout`. Older versions ignore it
         # silently rather than raise.
         kwargs["timeout"] = timeout_s
-    msg = llm_client.create_message(client, purpose=purpose, **kwargs)
+    msg = llm_client.create_message(client, purpose=purpose, caller=caller,
+                                    background=False, **kwargs)
     return llm_client.response_text(msg).strip()
 
 
@@ -270,8 +276,12 @@ def _ollama_call(
     user: str,
     base_url: str = "http://127.0.0.1:11434",
     timeout_s: float = 30.0,
+    caller: str = "",
 ) -> str:
     """One-shot Ollama /api/chat. Returns assistant text or raises.
+
+    ``caller`` names the stage for the per-caller ledger (core.local_traffic);
+    like _claude_call, never background.
 
     `options` is NOT optional even though Ollama accepts the request without
     it. Ollama keys a loaded runner by (model, options), so a call that omits
@@ -308,6 +318,13 @@ def _ollama_call(
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         body = resp.read().decode("utf-8", errors="replace")
     data = json.loads(body)
+    try:
+        from core import local_traffic as _lt
+        _lt.note_call(caller, False, "local", {
+            "input": data.get("prompt_eval_count"),
+            "output": data.get("eval_count")})
+    except Exception:
+        pass
     return str(data.get("message", {}).get("content", "")).strip()
 
 
@@ -460,6 +477,7 @@ def plan_decomposition(
             max_tokens=600,
             timeout_s=timeout_s,
             purpose="plan",
+            caller="orchestrator_plan",
         )
     except Exception as e:
         # A local-only turn is the normal path there, not a failure.
@@ -475,6 +493,7 @@ def plan_decomposition(
                     user,
                     base_url=local_base_url,
                     timeout_s=timeout_s,
+                    caller="orchestrator_plan",
                 )
                 _log.info("orchestrator: planner fell back to ollama %s", ollama_model)
             except Exception as e2:
@@ -638,6 +657,7 @@ def _run_worker_sync(
                 model_id, system, worker_user,
                 base_url=local_base_url,
                 timeout_s=timeout_s,
+                caller="orchestrator_worker",
             )
         else:
             try:
@@ -648,6 +668,7 @@ def _run_worker_sync(
                     max_tokens=600,
                     timeout_s=timeout_s,
                     purpose="quick",
+                    caller="orchestrator_worker",
                 )
             except Exception as claude_err:
                 # Claude down/capped — retry once on a local Ollama model if
@@ -659,6 +680,7 @@ def _run_worker_sync(
                         ollama_model, system, worker_user,
                         base_url=local_base_url,
                         timeout_s=timeout_s,
+                        caller="orchestrator_worker",
                     )
                     model_id = ollama_model
                     _log.info(
@@ -822,6 +844,7 @@ def merge_results(
             max_tokens=500,
             timeout_s=timeout_s,
             purpose="compose",
+            caller="orchestrator_merge",
         )
     except Exception as e:
         (_log.info if isinstance(e, _QUIET_CLOUD_SKIPS) else _log.warning)(
@@ -836,6 +859,7 @@ def merge_results(
                     user,
                     base_url=local_base_url,
                     timeout_s=timeout_s,
+                    caller="orchestrator_merge",
                 )
                 if merged:
                     _log.info("orchestrator: merger fell back to ollama %s", ollama_model)

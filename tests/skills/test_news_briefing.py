@@ -530,8 +530,10 @@ class NewsSummarizeTests(unittest.TestCase):
         bc.AI_BACKEND = "ollama"
         captured = {}
 
-        def _local(system, messages, max_tokens=120):
+        def _local(system, messages, max_tokens=120, **_kw):
             captured["content"] = messages[0]["content"]
+            captured["caller"] = _kw.get("caller")
+            captured["background"] = _kw.get("background")
             return "ok."
         bc._call_local_llm = _local
         long_desc = "x" * 1000
@@ -540,6 +542,9 @@ class NewsSummarizeTests(unittest.TestCase):
         # 500-char cap + the "Description: " prefix; never the full 1000.
         self.assertLess(len(captured["content"]), 600)
         self.assertIn("Title", captured["content"])
+        # the brain caller tag (2026-10-15): a scheduled briefing is background
+        self.assertEqual(captured["caller"], "briefing_headline_summary")
+        self.assertIs(captured["background"], True)
 
 
 class NewsAssemblyTests(unittest.TestCase):
