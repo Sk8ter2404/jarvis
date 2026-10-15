@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.199 (2026-10-15)
+
+A hard stop before irreversible clicks: when screen control is about to click a button that sends, submits, posts, publishes, pays, buys, transfers, deletes or accepts terms - or press Enter in a message box that would send - it asks first and acts only on an explicit yes for that one action. The hologram can show your own 3D models (STL, 3MF, OBJ from chosen folders): a 3MF's objects become named parts that explode and show their size, and "show me the <model>" picks one by name. Model files are served only by id from the configured folders.
+
 ## v2.0.198 (2026-10-14)
 
 Claude Code jobs can run on a second Claude subscription first. With a last-day date set, every Claude Code job JARVIS starts (upgrade loop, multi-agent pipeline, dry audit, overnight ideas) runs on a second Claude Code profile - its own sign-in folder - through that date, and on the main account whenever the second one is at its 5-hour or weekly limit, switching back when the limit resets. The sign-in stays inside Claude Code's own folder; JARVIS never reads or stores a token. The upgrade pipeline also recognises Claude Code's current limit wording again.
