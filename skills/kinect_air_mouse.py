@@ -3933,9 +3933,45 @@ def _hand_in_view() -> Optional[bool]:
         return None
 
 
+# ─── AIR_MOUSE_ENGINE routing (2026-10-15) ───────────────────────────────────
+# AIR_MOUSE_ENGINE = "kinect" (default) | "hands". With "hands" the voice words
+# for the air mouse (on / off / status, plus arm / disarm) drive the webcam HAND
+# MOUSE (skills/hand_tracking.py: hand_mouse_on / off / status) instead of the
+# Kinect one. The action names stay registered ONCE, here; this just hands the
+# call to the hand-mouse action found in the live registry. With "kinect" (the
+# default) nothing below runs and every function behaves exactly as before.
+def _engine_is_hands() -> bool:
+    try:
+        from core import config as _cfg
+        return str(getattr(_cfg, "AIR_MOUSE_ENGINE", "kinect")).strip().lower() == "hands"
+    except Exception:
+        return False
+
+
+def _hands_engine_reply(hand_action: str) -> Optional[str]:
+    """None when the engine is "kinect" (the caller carries on, unchanged);
+    otherwise the hand-mouse action's reply. Never falls back to the Kinect:
+    in "hands" mode a missing hand mouse is reported, not replaced by the
+    cursor-taking air mouse. Never raises."""
+    if not _engine_is_hands():
+        return None
+    try:
+        bobert = sys.modules.get("bobert_companion") or sys.modules.get("__main__")
+        reg = getattr(bobert, "ACTIONS", None)
+        fn = reg.get(hand_action) if isinstance(reg, dict) else None
+        if callable(fn):
+            return str(fn(""))
+    except Exception as e:
+        return f"The hand mouse hit a snag, sir: {type(e).__name__}."
+    return "The hand mouse isn't loaded, sir, so I left the air mouse alone."
+
+
 # ─── actions ─────────────────────────────────────────────────────────────
 def air_mouse_on(_: str = "") -> str:
     """Turn the air-mouse on (live + persisted)."""
+    routed = _hands_engine_reply("hand_mouse_on")
+    if routed is not None:
+        return routed
     if _cfg_flag("KINECT_AIR_MOUSE_ENABLED"):
         already = "The air-mouse is already on, sir."
     else:
@@ -3957,6 +3993,9 @@ def air_mouse_on(_: str = "") -> str:
 def air_mouse_off(_: str = "") -> str:
     """Turn the air-mouse off (live + persisted). Also clears the overlay so the
     reticle disappears immediately."""
+    routed = _hands_engine_reply("hand_mouse_off")
+    if routed is not None:
+        return routed
     if not _cfg_flag("KINECT_AIR_MOUSE_ENABLED"):
         return "The air-mouse is already off, sir."
     persisted = _set_enabled(False)
@@ -3977,6 +4016,9 @@ def air_mouse_off(_: str = "") -> str:
 def air_mouse_status(_: str = "") -> str:
     """Report whether the air-mouse is on + whether a hand is in view.
     'is the air-mouse on' / 'air-mouse status'."""
+    routed = _hands_engine_reply("hand_mouse_status")
+    if routed is not None:
+        return routed
     enabled = _cfg_flag("KINECT_AIR_MOUSE_ENABLED")
     how = ("raise a hand above your shoulder to take the cursor, close your left "
            "hand to left-click or your right hand to right-click, hold to drag, "
@@ -4001,7 +4043,10 @@ def air_mouse_arm_action(_: str = "") -> str:
     short hold; no open-palm/facing/still/dwell required). Also ensures the feature
     is ON (an explicit "take the cursor" IS consent) so a raised hand actually
     drives. 'mouse control on' / 'take the cursor' / 'give me the cursor' /
-    'hand mouse on'. NEVER raises out."""
+    NEVER raises out."""
+    routed = _hands_engine_reply("hand_mouse_on")
+    if routed is not None:
+        return routed
     air_mouse_arm()
     # Arming implies wanting control now — make sure the master flag is on so a
     # raised hand actually moves the cursor (mirrors air_control_on's consent
@@ -4027,7 +4072,10 @@ def air_mouse_disarm_action(_: str = "") -> str:
     the cursor. This does NOT turn the feature off (that's 'air-mouse off'); it
     just makes engaging deliberate again. Also releases any held button + clears
     the reticle so nothing is stranded. 'mouse control off' / 'release the cursor' /
-    'hand mouse off'. NEVER raises out."""
+    NEVER raises out."""
+    routed = _hands_engine_reply("hand_mouse_off")
+    if routed is not None:
+        return routed
     air_mouse_disarm()
     # Let go of anything currently held so disarming can't strand a button, and
     # hide the reticle promptly.
@@ -4111,10 +4159,11 @@ def register(actions):
     # (and the off variants) resolves to arm/disarm.
     actions["air_mouse_arm"] = air_mouse_arm_action
     actions["air_mouse_disarm"] = air_mouse_disarm_action
-    for alias in ("mouse_control_on", "take_the_cursor", "give_me_the_cursor",
-                  "hand_mouse_on"):
+    # hand_mouse_on / hand_mouse_off were aliases here until 2026-10-15; they now
+    # belong to the webcam hand mouse (skills/hand_tracking.py) - ONE owner each.
+    for alias in ("mouse_control_on", "take_the_cursor", "give_me_the_cursor"):
         actions[alias] = air_mouse_arm_action
-    for alias in ("mouse_control_off", "release_the_cursor", "hand_mouse_off"):
+    for alias in ("mouse_control_off", "release_the_cursor"):
         actions[alias] = air_mouse_disarm_action
 
     # Guard against duplicate pollers on skill reload (same OS-thread-name check

@@ -17,6 +17,16 @@ spread, facing the camera, held ~1.5 s) opens the DESKTOP holo window - only
 when HAND_MENU_ENABLED is on, at most once per 10 s, and never in game mode,
 over a fullscreen app or in a call. It never moves the cursor or sends OS input.
 
+The HAND MOUSE (2026-10-15, core/hand_mouse.py) lives here too:
+  hand_mouse_on / hand_mouse_off / hand_mouse_status - drive the cursor with a
+  pinch (hold still to engage, tap = click, second pinch held = drag, open palm
+  = let go). OFF by default (HAND_MOUSE_ENABLED); "on" starts the tracker if it
+  is not running; "hand tracking off" stops it too. Only while it is enabled does
+  the listener parse the tracker's "hands" messages (30/s) - off, they are
+  dropped unread, exactly as before. AIR_MOUSE_ENGINE = "hands" makes the
+  existing air_mouse_on/off/status words route here (the routing lives in
+  skills/kinect_air_mouse.py, which keeps the only registration of those names).
+
 The window is opened through the holo skill's `holo_mode_on` action with the
 argument "desktop". That action belongs to the holo page work; until it exists
 the trigger logs one line and does nothing - `set_open_hook()` is the clearly
@@ -32,6 +42,7 @@ from typing import Callable, Optional
 
 SPEAK_VERBATIM_ACTIONS = (
     "hand_tracking_on", "hand_tracking_off", "hand_tracking_status",
+    "hand_mouse_on", "hand_mouse_off", "hand_mouse_status",
 )
 
 OPEN_COOLDOWN_S = 10.0
@@ -44,6 +55,8 @@ _state = {"last_open": -1e9, "opens": 0, "last_event": "", "last_event_at": 0.0,
           "last_block": "", "warned_missing": False, "listening": False}
 _open_hook: list = [None]            # optional replacement for the holo action
 _listener: list = [None]
+_mouse: list = [None]                # the core.hand_mouse.HandMouse, built on first use
+_mouse_output_factory: list = [None]  # tests inject a fake; None = the real Windows one
 
 
 # ── config ────────────────────────────────────────────────────────────────
@@ -84,6 +97,95 @@ def set_open_hook(fn: Optional[Callable[[], object]]) -> None:
     """Replace the 'open the desktop holo window' call (None = use the
     holo_mode_on action)."""
     _open_hook[0] = fn
+
+
+# ── the hand mouse (core/hand_mouse.py) ───────────────────────────────────
+def set_mouse_output_factory(fn: Optional[Callable[[], object]]) -> None:
+    """Replace how the hand mouse reaches the OS (None = the real Windows
+    layer in core/hand_mouse.py). Tests always set a fake; nothing else should."""
+    _mouse_output_factory[0] = fn
+    _mouse[0] = None
+
+
+def _mouse_cue(kind: str, reason: str) -> None:
+    """Short audible cue on engage / disengage (a log line is printed by the
+    state machine). No popups. Off with HAND_MOUSE_CUE_SOUND = False."""
+    if not bool(_cfg("HAND_MOUSE_CUE_SOUND", True)):
+        return
+
+    def _beep():
+        try:
+            import winsound
+            winsound.Beep(1040 if kind == "engage" else 520, 70)
+        except Exception:
+            pass
+    threading.Thread(target=_beep, name="hand-mouse-cue", daemon=True).start()
+
+
+def _get_mouse():
+    """The HandMouse, created on first use. None if it cannot be built."""
+    if _mouse[0] is not None:
+        return _mouse[0]
+    try:
+        from core import hand_mouse
+        factory = _mouse_output_factory[0] or hand_mouse.WindowsMouse
+        _mouse[0] = hand_mouse.HandMouse(
+            factory(), blocker=blocked_reason, cue=_mouse_cue,
+            params=hand_mouse.Params.from_config(_cfg))
+    except Exception as e:
+        print(f"{LOG} hand mouse unavailable: {type(e).__name__}: {e}")
+        _mouse[0] = None
+    return _mouse[0]
+
+
+def _mouse_enabled() -> bool:
+    m = _mouse[0]
+    return m is not None and bool(m.enabled)
+
+
+def _mouse_hands(msg: dict) -> None:
+    m = _mouse[0]
+    if m is not None:
+        m.on_hands(msg)
+
+
+def _mouse_idle() -> None:
+    m = _mouse[0]
+    if m is not None and m.enabled:
+        m.tick()
+
+
+def _mouse_tracker_gone() -> None:
+    m = _mouse[0]
+    if m is not None:
+        m.on_tracker_stopped()
+
+
+def _set_mouse_runtime(on: bool) -> None:
+    try:
+        from core import config
+        config.HAND_MOUSE_ENABLED = bool(on)
+    except Exception:
+        pass
+
+
+def _sync_mouse() -> None:
+    """Make the hand mouse's enabled flag follow HAND_MOUSE_ENABLED once the
+    tracker is up (boot setting). Builds it only if the flag is on."""
+    if bool(_cfg("HAND_MOUSE_ENABLED", False)):
+        m = _get_mouse()
+        if m is not None:
+            m.set_enabled(True)
+
+
+def _stop_hand_mouse() -> bool:
+    """Turn the hand mouse off and let go of everything. True if it was on."""
+    was = bool(_cfg("HAND_MOUSE_ENABLED", False)) or _mouse_enabled()
+    _set_mouse_runtime(False)
+    m = _mouse[0]
+    if m is not None:
+        m.set_enabled(False)
+    return was
 
 
 # ── what must stop the palm-hold trigger ──────────────────────────────────
@@ -152,6 +254,8 @@ def handle_gesture(ev: dict, now: Optional[float] = None) -> str:
         now = time.monotonic() if now is None else now
         _state["last_event"] = name
         _state["last_event_at"] = time.time()
+        if name == "pinch_hold" and _mouse_enabled():
+            _mouse[0].on_gesture(ev, now)      # engage the hand mouse (if allowed)
         if name != "palm_hold":
             return "ignored: not a palm hold"
         if not bool(_cfg("HAND_MENU_ENABLED", False)):
@@ -187,10 +291,20 @@ class GestureListener:
     handle_gesture(). Reconnects with a short backoff while it is wanted."""
 
     def __init__(self, url: str, connect: Optional[Callable] = None,
-                 on_event: Callable[[dict], object] = handle_gesture):
+                 on_event: Callable[[dict], object] = handle_gesture,
+                 on_hands: Optional[Callable[[dict], object]] = None,
+                 wants_hands: Optional[Callable[[], bool]] = None,
+                 on_idle: Optional[Callable[[], object]] = None,
+                 on_disconnect: Optional[Callable[[], object]] = None):
         self.url = url
         self._connect = connect
         self._on_event = on_event
+        # The hand mouse's hooks. "hands" messages (30/s) are parsed ONLY when
+        # on_hands is set AND wants_hands() is true - otherwise dropped unread.
+        self._on_hands = on_hands
+        self._wants_hands = wants_hands
+        self._on_idle = on_idle
+        self._on_disconnect = on_disconnect
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.connected = False
@@ -228,6 +342,7 @@ class GestureListener:
                 pass
             finally:
                 self.connected = False
+                self._call(self._on_disconnect)
                 try:
                     ws.close()
                 except Exception:
@@ -241,12 +356,36 @@ class GestureListener:
             try:
                 msg = ws.recv(timeout=1.0)
             except TimeoutError:
+                self._call(self._on_idle)
                 continue
             self.feed(msg)
 
+    @staticmethod
+    def _call(fn) -> None:
+        if fn is not None:
+            try:
+                fn()
+            except Exception:
+                pass
+
     def feed(self, msg) -> None:
-        if not isinstance(msg, str) or not msg.startswith('{"type":"gesture"'):
-            return            # hands messages (30/s) are not parsed here
+        if not isinstance(msg, str):
+            return
+        if msg.startswith('{"type":"hands"'):
+            # 30/s: parsed only for the hand mouse, and only while it is on.
+            if self._on_hands is None or self._wants_hands is None:
+                return
+            try:
+                if not self._wants_hands():
+                    return
+                data = json.loads(msg)
+                if isinstance(data, dict):
+                    self._on_hands(data)
+            except Exception:
+                pass
+            return
+        if not msg.startswith('{"type":"gesture"'):
+            return
         try:
             ev = json.loads(msg)
         except Exception:
@@ -261,7 +400,9 @@ def _ws_url() -> str:
 
 def _ensure_listener() -> None:
     if _listener[0] is None:
-        _listener[0] = GestureListener(_ws_url())
+        _listener[0] = GestureListener(
+            _ws_url(), on_hands=_mouse_hands, wants_hands=_mouse_enabled,
+            on_idle=_mouse_idle, on_disconnect=_mouse_tracker_gone)
     _listener[0].start()
     _state["listening"] = True
 
@@ -270,6 +411,7 @@ def _stop_listener() -> None:
     if _listener[0] is not None:
         _listener[0].stop()
     _state["listening"] = False
+    _mouse_tracker_gone()              # the tracker is going: let go of the mouse
 
 
 # ── actions ───────────────────────────────────────────────────────────────
@@ -292,6 +434,7 @@ def start_tracking() -> tuple:
     if ok:
         _set_runtime(True)
         _ensure_listener()
+        _sync_mouse()
     return ok, msg
 
 
@@ -424,18 +567,22 @@ def _hand_tracking_off(_: str = "") -> str:
     _holo["idle_since"] = None
     la = _launcher()
     was_on = bool(la is not None and (la.running() or la.wanted()))
+    hand_mouse = _stop_hand_mouse()
     _stop_listener()
     if la is not None:
         la.stop()
     _set_runtime(False)
     mouse = _stop_air_mouse()
-    if not was_on and not mouse:
+    if not was_on and not mouse and not hand_mouse:
         return "Hand tracking was already off, sir."
     boot = (" It's still set to start at boot." if bool(_cfg("HAND_TRACKING_ENABLED", False))
             else "")
     if not was_on:
-        return "The air mouse is off, sir." + _still_on_tail()
-    return ("Hand tracking is off, sir." + (" The air mouse is off too." if mouse else "")
+        return ("The hand mouse is off, sir." if hand_mouse
+                else "The air mouse is off, sir.") + _still_on_tail()
+    return ("Hand tracking is off, sir."
+            + (" The hand mouse is off too." if hand_mouse else "")
+            + (" The air mouse is off too." if mouse else "")
             + _still_on_tail() + boot)
 
 
@@ -482,6 +629,66 @@ def _hand_tracking_status(_: str = "") -> str:
         return f"I couldn't read the hand tracker's status, sir: {type(e).__name__}."
 
 
+def _hand_mouse_on(_: str = "") -> str:
+    _holo["owned"] = False                 # the owner asked: the tracker is his now
+    already = bool(_cfg("HAND_MOUSE_ENABLED", False)) and _mouse_enabled()
+    la = _launcher()
+    if la is None or not la.running():
+        ok, msg = start_tracking()
+        if not ok:
+            return f"I couldn't start the hand mouse, sir: {msg}."
+    _ensure_listener()
+    _set_mouse_runtime(True)
+    m = _get_mouse()
+    if m is None:
+        _set_mouse_runtime(False)
+        return "I couldn't set up the hand mouse, sir."
+    m.set_enabled(True)
+    if already:
+        return "The hand mouse is already on, sir."
+    why = blocked_reason()
+    tail = f" It won't take the cursor while {why}." if why else ""
+    return ("Hand mouse on, sir. Hold a pinch still for a moment to take the "
+            "cursor, tap to click, pinch and hold to drag, and hold an open palm "
+            "to let go. Say 'hand mouse off' to stop it." + tail)
+
+
+def _hand_mouse_off(_: str = "") -> str:
+    if not _stop_hand_mouse():
+        return "The hand mouse is already off, sir."
+    la = _launcher()
+    left = (" Hand tracking is still on; say 'hand tracking off' to stop it."
+            if la is not None and la.running() else "")
+    return "Hand mouse off, sir. I've let go of the cursor." + left
+
+
+def hand_mouse_status_text() -> str:
+    m = _mouse[0]
+    if not (bool(_cfg("HAND_MOUSE_ENABLED", False)) and m is not None and m.enabled):
+        return "The hand mouse is off, sir."
+    la = _launcher()
+    if la is None or not la.running():
+        return "The hand mouse is on, sir, but the hand tracker isn't running."
+    st = m.status()
+    if st["phase"] == "idle":
+        why = blocked_reason()
+        if why:
+            return f"The hand mouse is on, sir, but it won't take the cursor while {why}."
+        return "The hand mouse is on, sir. Hold a pinch still to take the cursor."
+    if st["pressed"]:
+        return "The hand mouse has the cursor, sir, and the button is held for a drag."
+    if st["phase"] == "engaging":
+        return "The hand mouse is engaged, sir. Let go of the pinch and move."
+    return "The hand mouse has the cursor, sir. Open your palm to let go."
+
+
+def _hand_mouse_status(_: str = "") -> str:
+    try:
+        return hand_mouse_status_text()
+    except Exception as e:
+        return f"I couldn't read the hand mouse status, sir: {type(e).__name__}."
+
+
 def start_at_boot() -> None:
     """Start the tracker when HAND_TRACKING_ENABLED is on. Runs on a daemon
     thread: it only spawns a process, but nothing here may delay boot."""
@@ -499,5 +706,8 @@ def register(actions: dict) -> None:
     actions["hand_tracking_on"] = _hand_tracking_on
     actions["hand_tracking_off"] = _hand_tracking_off
     actions["hand_tracking_status"] = _hand_tracking_status
-    if bool(_cfg("HAND_TRACKING_ENABLED", False)):
+    actions["hand_mouse_on"] = _hand_mouse_on
+    actions["hand_mouse_off"] = _hand_mouse_off
+    actions["hand_mouse_status"] = _hand_mouse_status
+    if bool(_cfg("HAND_TRACKING_ENABLED", False)) or bool(_cfg("HAND_MOUSE_ENABLED", False)):
         start_at_boot()

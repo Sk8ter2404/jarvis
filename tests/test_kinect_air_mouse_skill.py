@@ -4030,11 +4030,13 @@ class RegisterTests(_Base):
 
     def test_register_wires_arm_disarm_aliases(self):
         mod, actions = load_skill_isolated("kinect_air_mouse", register=True)
-        for alias in ("mouse_control_on", "take_the_cursor", "give_me_the_cursor",
-                      "hand_mouse_on"):
+        for alias in ("mouse_control_on", "take_the_cursor", "give_me_the_cursor"):
             self.assertIs(actions[alias], actions["air_mouse_arm"])
-        for alias in ("mouse_control_off", "release_the_cursor", "hand_mouse_off"):
+        for alias in ("mouse_control_off", "release_the_cursor"):
             self.assertIs(actions[alias], actions["air_mouse_disarm"])
+        # hand_mouse_on / off belong to the webcam hand mouse now (2026-10-15)
+        self.assertNotIn("hand_mouse_on", actions)
+        self.assertNotIn("hand_mouse_off", actions)
 
 
 # ══════════════════════════════════════════════════════════════════════════
