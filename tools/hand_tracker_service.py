@@ -26,9 +26,17 @@ PROTOCOL  (JSON text frames, ~30/s while frames arrive)
   {"type":"gesture","name":...,"side":"Left|Right|both","pos":[x,y],"value"?}
       names: palm_hold pinch_start pinch_end pinch_hold fist_grab fist_release
              point_flick explode clap   (see tools/handtrack_gestures.py)
-  Client -> service: {"type":"subscribe","frames":true|false}. Subscribed
-  clients also receive binary WebSocket messages: JPEG (quality 70) of the
-  mirrored 640x480 frame, at most 30/s.
+  Client -> service: {"type":"subscribe","frames":true|false,"depth":true|false}
+  (each key optional: an absent key leaves that subscription as it was).
+  Clients subscribed to frames also receive binary WebSocket messages: JPEG
+  (quality 70) of the mirrored frame, at most 30/s (starts FF D8).
+  KINECT DEPTH (Phase 2, only when JARVIS publishes a depth plane, see
+  core/handtrack_depth.py): clients subscribed to depth receive one binary
+  message per new plane, magic "JVDP", 24-byte header + uint16 mm plane,
+  mirrored like the picture (layout in core/handtrack_depth.py). And while a
+  fresh plane exists every "hands" message gets "depth":true and each hand a
+  "z": the palm's median depth in metres (null when the palm has no valid
+  depth: out of 0.5-4.5 m range or shadowed). No plane, no "z" keys at all.
 
 LIFECYCLE
   * Binds 127.0.0.1 only (--host must be a loopback address) and accepts
@@ -99,6 +107,21 @@ def _parent_watch():
 _PARENT_WATCH = _parent_watch()
 
 
+def _load_depth_module():
+    """core/handtrack_depth.py by path: the depth segment + wire layout and the
+    median sampler live there only. None when it cannot be loaded (the tracker
+    then simply has no depth)."""
+    path = os.path.join(ROOT, "core", "handtrack_depth.py")
+    try:
+        spec = importlib.util.spec_from_file_location("handtrack_depth_reader", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["handtrack_depth_reader"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -138,9 +161,13 @@ def file_age(path: Optional[str]) -> Optional[float]:
         return None
 
 
-def hands_message(ts_ms: int, seq: int, w: int, h: int, hands: list) -> dict:
-    return {"type": "hands", "t": ts_ms, "seq": seq, "w": w, "h": h,
-            "hands": hands}
+def hands_message(ts_ms: int, seq: int, w: int, h: int, hands: list,
+                  depth: bool = False) -> dict:
+    msg = {"type": "hands", "t": ts_ms, "seq": seq, "w": w, "h": h,
+           "hands": hands}
+    if depth:
+        msg["depth"] = True            # a fresh depth plane exists: hands carry "z"
+    return msg
 
 
 def hand_payload(info: dict, lm, world) -> dict:
@@ -161,7 +188,7 @@ class Hub:
     def __init__(self, host: str, port: int):
         self.host, self.port = host, port
         self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.clients: dict = {}          # ws -> {"q": Queue, "frames": bool}
+        self.clients: dict = {}          # ws -> {"q": Queue, "frames": bool, "depth": bool}
         self._ready = threading.Event()
         self._stop: Optional[asyncio.Event] = None
         self.error: Optional[str] = None
@@ -198,7 +225,7 @@ class Hub:
         self._thread.join(timeout=3.0)
 
     async def _handler(self, ws) -> None:
-        state = {"q": asyncio.Queue(maxsize=8), "frames": False}
+        state = {"q": asyncio.Queue(maxsize=8), "frames": False, "depth": False}
         self.clients[ws] = state
         log(f"client connected ({len(self.clients)})")
         if self.last_hands_text:
@@ -213,13 +240,23 @@ class Hub:
                 except Exception:
                     continue
                 if isinstance(data, dict) and data.get("type") == "subscribe":
-                    state["frames"] = bool(data.get("frames"))
+                    self.apply_subscribe(state, data)
         except Exception:
             pass
         finally:
             sender.cancel()
             self.clients.pop(ws, None)
             log(f"client left ({len(self.clients)})")
+
+    @staticmethod
+    def apply_subscribe(state: dict, data: dict) -> None:
+        """{"type":"subscribe","frames":bool,"depth":bool}: each key is optional.
+        An absent key leaves that subscription as it was, except that a bare
+        subscribe (neither key) still means frames off, as it always did."""
+        if "frames" in data or "depth" not in data:
+            state["frames"] = bool(data.get("frames"))
+        if "depth" in data:
+            state["depth"] = bool(data.get("depth"))
 
     @staticmethod
     async def _sender(ws, q) -> None:
@@ -234,20 +271,24 @@ class Hub:
     def wants_frames(self) -> bool:
         return any(c["frames"] for c in list(self.clients.values()))
 
+    def wants_depth(self) -> bool:
+        return any(c.get("depth") for c in list(self.clients.values()))
+
     def client_count(self) -> int:
         return len(self.clients)
 
-    def broadcast(self, text: Optional[str] = None, jpeg: Optional[bytes] = None) -> None:
+    def broadcast(self, text: Optional[str] = None, jpeg: Optional[bytes] = None,
+                  depth: Optional[bytes] = None) -> None:
         if self.loop is None:
             return
         if text is not None and text.startswith('{"type":"hands"'):
             self.last_hands_text = text
-        self.loop.call_soon_threadsafe(self._fanout, text, jpeg)
+        self.loop.call_soon_threadsafe(self._fanout, text, jpeg, depth)
 
-    def _fanout(self, text, jpeg) -> None:
+    def _fanout(self, text, jpeg, depth=None) -> None:
         for state in list(self.clients.values()):
-            for item, only_frames in ((text, False), (jpeg, True)):
-                if item is None or (only_frames and not state["frames"]):
+            for item, only in ((text, None), (jpeg, "frames"), (depth, "depth")):
+                if item is None or (only is not None and not state.get(only)):
                     continue
                 q = state["q"]
                 if q.full():
@@ -265,6 +306,7 @@ class Tracker:
     def __init__(self, args):
         self.args = args
         self.frames = _load_frames_module()
+        self.depthmod = _load_depth_module()
         self.engine = hg.GestureEngine(invert_palm=args.invert_palm)
         self.hub = Hub(args.host, args.port)
         self.stop = threading.Event()
@@ -286,6 +328,16 @@ class Tracker:
         self._fps_n = 0
         self._cv2 = None
         self._mp = None
+        # Kinect depth (Phase 2): the plane is mirrored once per new plane so it
+        # lines up with the mirrored picture and landmarks.
+        self.depth_shm = None
+        self._last_depth_attach_try = 0.0
+        self._depth_seq = 0
+        self._depth_plane = None          # mirrored (h, w) uint16 mm, or None
+        self._depth_color_seq = 0
+        self._depth_ts_ms = 0
+        self._depth_relayed = 0
+        self._wall = time.time
 
     # ── setup ───────────────────────────────────────────────────────────
     def load_model(self) -> None:
@@ -323,6 +375,61 @@ class Tracker:
             log(f"shared memory attach failed: {type(e).__name__}: {e}")
             self.shm = None
 
+    def _attach_depth(self) -> None:
+        now = time.monotonic()
+        if (self.depthmod is None or self.depth_shm is not None
+                or now - self._last_depth_attach_try < 1.0):
+            return
+        self._last_depth_attach_try = now
+        try:
+            from multiprocessing import shared_memory
+            self.depth_shm = shared_memory.SharedMemory(name=self.args.depth_shm_name)
+            log(f"attached to depth segment {self.args.depth_shm_name}")
+        except FileNotFoundError:
+            self.depth_shm = None
+        except Exception as e:
+            log(f"depth segment attach failed: {type(e).__name__}: {e}")
+            self.depth_shm = None
+
+    def _poll_depth(self) -> None:
+        """Take a NEW depth plane from the segment (if any), mirror it, relay it
+        to the clients that subscribed to depth. Never raises."""
+        try:
+            self._attach_depth()
+            if self.depth_shm is None:
+                return
+            got = self.depthmod.read_depth(self.depth_shm.buf, self._depth_seq)
+            if got is None:
+                return
+            import numpy as np
+            seq, color_seq, ts_ms, plane = got
+            self._depth_seq = seq
+            self._depth_plane = np.ascontiguousarray(plane[:, ::-1])
+            self._depth_color_seq = color_seq
+            self._depth_ts_ms = ts_ms
+            if self.hub.wants_depth():
+                self.hub.broadcast(depth=self.depthmod.pack_wire(
+                    self._depth_plane, color_seq, mirrored=True))
+                self._depth_relayed += 1
+        except Exception as e:
+            log(f"depth poll failed: {type(e).__name__}: {e}")
+
+    def depth_fresh(self) -> bool:
+        """True while the newest plane is younger than the module's
+        FRESH_DEPTH_S (wall clock: JARVIS stamps it, same machine)."""
+        if self._depth_plane is None or self.depthmod is None:
+            return False
+        age_ms = self._wall() * 1000.0 - self._depth_ts_ms
+        return age_ms <= self.depthmod.FRESH_DEPTH_S * 1000.0
+
+    def _hand_z(self, palm) -> Optional[float]:
+        """Palm depth in metres: median of a 5x5 window of the plane, or None."""
+        try:
+            return self.depthmod.sample_median_m(self._depth_plane,
+                                                 float(palm[0]), float(palm[1]))
+        except Exception:
+            return None
+
     # ── lifecycle ───────────────────────────────────────────────────────
     def _beat(self, now: float) -> None:
         if now - self._last_beat < 1.0 or not self.args.alive:
@@ -332,6 +439,7 @@ class Tracker:
                   "fps": round(self.fps, 1), "frames": self.processed,
                   "hands": self.hands_now, "clients": self.hub.client_count(),
                   "attached": self.shm is not None, "port": self.args.port,
+                  "depth": self.depth_fresh(),
                   "up_s": round(time.time() - self.started, 1)}
         try:
             os.makedirs(os.path.dirname(self.args.alive) or ".", exist_ok=True)
@@ -394,6 +502,7 @@ class Tracker:
                     reason = gone
                     break
                 self._attach()
+                self._poll_depth()
                 got = None
                 if self.shm is not None:
                     got = self.frames.read_frame(self.shm.buf, last_seq)
@@ -455,10 +564,15 @@ class Tracker:
         infos, events = self.engine.update(now, raw, W, H)
         payload = [hand_payload(info, hd["lm"], hd["world"])
                    for info, hd in zip(infos, raw) if info["id"] >= 0]
+        has_depth = self.depth_fresh()
+        if has_depth:
+            for hp in payload:
+                hp["z"] = self._hand_z(hp["palm"])
         self.hands_now = len(payload)
         self._empty_sent = not payload
-        self.hub.broadcast(json.dumps(hands_message(ts_ms, seq, W, H, payload),
-                                      separators=(",", ":")))
+        self.hub.broadcast(json.dumps(
+            hands_message(ts_ms, seq, W, H, payload, depth=has_depth),
+            separators=(",", ":")))
         for ev in events:
             log(f"gesture {ev['name']} {ev['side']} {ev['pos']}"
                 + (f" {ev['value']}" if 'value' in ev else ""))
@@ -484,11 +598,12 @@ class Tracker:
                 self.landmarker.close()
             except Exception:
                 pass
-        if self.shm is not None:
-            try:
-                self.shm.close()
-            except Exception:
-                pass
+        for seg in (self.shm, self.depth_shm):
+            if seg is not None:
+                try:
+                    seg.close()
+                except Exception:
+                    pass
         if self.args.alive:
             try:
                 os.remove(self.args.alive)
@@ -502,6 +617,8 @@ def parse_args(argv=None):
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--shm-name", default="jarvis_handtrack_frame")
+    p.add_argument("--depth-shm-name", default="jarvis_handtrack_depth",
+                   help="Kinect depth plane segment (optional; absent = no depth)")
     p.add_argument("--alive", default=os.path.join(ROOT, "data", ".handtrack_alive"),
                    help="heartbeat file this service refreshes (JARVIS's frame "
                         "publisher runs only while it is fresh)")

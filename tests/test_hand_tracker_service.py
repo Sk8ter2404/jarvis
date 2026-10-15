@@ -30,17 +30,24 @@ class FakeHub:
     def __init__(self):
         self.texts = []
         self.jpegs = []
+        self.depths = []
         self.frames_wanted = False
+        self.depth_wanted = False
         self.clients = 0
 
-    def broadcast(self, text=None, jpeg=None):
+    def broadcast(self, text=None, jpeg=None, depth=None):
         if text is not None:
             self.texts.append(json.loads(text))
         if jpeg is not None:
             self.jpegs.append(jpeg)
+        if depth is not None:
+            self.depths.append(depth)
 
     def wants_frames(self):
         return self.frames_wanted
+
+    def wants_depth(self):
+        return self.depth_wanted
 
     def client_count(self):
         return self.clients
@@ -183,6 +190,150 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(self.hub.texts[-1]["hands"], [])
 
 
+class FakeDepthShm:
+    def __init__(self, buf):
+        self.buf = buf
+
+    def close(self):
+        pass
+
+
+@unittest.skipIf(cv2 is None, "needs numpy + cv2")
+class DepthTests(unittest.TestCase):
+    """Kinect depth (Phase 2): the tracker relays the registered plane to clients
+    that subscribed to it and gives each hand a palm depth "z". Fake segment, fake
+    clock; the plane is built with the writer half of core/handtrack_depth.py."""
+
+    def setUp(self):
+        from core import handtrack_depth as hd
+        from tests.test_handtrack_depth import FakeShm
+        self.hd = hd
+        self.dir = tempfile.TemporaryDirectory()
+        self.args = svc.parse_args(["--alive", os.path.join(self.dir.name, "alive.json")])
+        self.t = svc.Tracker(self.args)
+        self.hub = FakeHub()
+        self.t.hub = self.hub
+        self.lm = FakeLandmarker()
+        self.t.landmarker = self.lm
+        self.t._cv2, self.t._mp = cv2, FakeMp
+        self.frame = np.zeros((360, 640, 3), np.uint8)
+        self.writer = hd.DepthWriter(shm_factory=FakeShm)
+        self.now_s = [1_700_000_000.0]
+        self.t._wall = lambda: self.now_s[0]
+        self.writer._wall = lambda: self.now_s[0]
+        self.writer._open()
+        self.t.depth_shm = FakeDepthShm(self.writer._shm.buf)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def plane(self, fill=0, boxes=()):
+        p = np.full((90, 160), fill, np.uint16)
+        for (y0, y1, x0, x1, v) in boxes:
+            p[y0:y1, x0:x1] = v
+        return p
+
+    def send(self, plane, color_seq=1):
+        self.assertTrue(self.writer.publish(plane, color_seq, self.hd.METHOD_NOMINAL))
+        self.t._poll_depth()
+
+    def process(self, seq=1):
+        self.t._process(seq, int(self.now_s[0] * 1000), self.frame)
+
+    def test_the_plane_is_mirrored_and_relayed_only_to_depth_subscribers(self):
+        left_wall = self.plane(3000, [(0, 90, 0, 20, 700)])          # something nearer, on the LEFT
+        self.send(left_wall)
+        self.assertEqual(self.hub.depths, [])                          # nobody subscribed
+        self.hub.depth_wanted = True
+        self.send(left_wall, color_seq=2)
+        self.assertEqual(len(self.hub.depths), 1)
+        msg = self.hd.unpack_wire(self.hub.depths[0])
+        self.assertEqual((msg["width"], msg["height"], msg["seq"]), (160, 90, 2))
+        self.assertTrue(msg["mirrored"])
+        self.assertEqual(int(msg["plane"][45, 0]), 3000)              # the blob is on the RIGHT now,
+        self.assertEqual(int(msg["plane"][45, 159]), 700)             # like the mirrored picture
+        self.assertEqual(msg["near_mm"], 500)
+        self.assertEqual(msg["far_mm"], 4500)
+
+    def test_one_message_per_new_plane(self):
+        self.hub.depth_wanted = True
+        self.send(self.plane(2000))
+        self.t._poll_depth()
+        self.t._poll_depth()
+        self.assertEqual(len(self.hub.depths), 1)
+        self.send(self.plane(2100))
+        self.assertEqual(len(self.hub.depths), 2)
+
+    def test_hands_carry_z_when_depth_is_fresh(self):
+        self.lm.hands = [make_hand("open", side="Right", cx=320, cy=180)]
+        self.process(1)
+        h0 = self.hub.texts[-1]
+        self.assertNotIn("depth", h0)                                  # no plane yet: no z keys at all
+        self.assertNotIn("z", h0["hands"][0])
+        self.send(self.plane(2000, [(0, 90, 0, 160, 800)]))
+        self.process(2)
+        msg = self.hub.texts[-1]
+        self.assertTrue(msg["depth"])
+        z = msg["hands"][0]["z"]
+        self.assertAlmostEqual(z, 0.8, places=3)
+
+    def test_palm_z_is_sampled_where_the_palm_is_in_mirrored_space(self):
+        # the palm sits near the picture's RIGHT edge once mirrored
+        self.lm.hands = [make_hand("open", side="Right", cx=0.9 * 640, cy=180)]
+        self.process(1)
+        px = self.hub.texts[-1]["hands"][0]["palm"][0]
+        self.assertGreater(px, 0.8)
+        near_right = self.plane(2500, [(0, 90, 0, 40, 600)])           # raw: blob on the LEFT
+        self.send(near_right)                                          # mirrored: on the RIGHT
+        self.process(2)
+        self.assertAlmostEqual(self.hub.texts[-1]["hands"][0]["z"], 0.6, places=3)
+
+    def test_unknown_palm_depth_is_null_not_zero(self):
+        self.lm.hands = [make_hand("open", side="Right", cx=320, cy=180)]
+        self.send(self.plane(0))                                       # plane of unknown depth
+        self.process(1)
+        msg = self.hub.texts[-1]
+        self.assertTrue(msg["depth"])
+        self.assertIsNone(msg["hands"][0]["z"])
+
+    def test_a_stale_plane_stops_the_z_keys(self):
+        self.lm.hands = [make_hand("open", side="Right", cx=320, cy=180)]
+        self.send(self.plane(1000))
+        self.assertTrue(self.t.depth_fresh())
+        self.now_s[0] += self.hd.FRESH_DEPTH_S + 0.1
+        self.assertFalse(self.t.depth_fresh())
+        self.process(1)
+        self.assertNotIn("z", self.hub.texts[-1]["hands"][0])
+        self.assertNotIn("depth", self.hub.texts[-1])
+
+    def test_depth_never_breaks_the_colour_path(self):
+        self.lm.hands = [make_hand("open", side="Right", cx=320, cy=180)]
+        self.t.depth_shm = FakeDepthShm(memoryview(bytearray(10)))     # garbage segment
+        self.t._poll_depth()                                           # no raise
+        self.process(1)
+        self.assertEqual(len(self.hub.texts[-1]["hands"]), 1)
+        self.t.depthmod = None                                         # module failed to load
+        self.t.depth_shm = None
+        self.t._poll_depth()
+        self.process(2)
+        self.assertEqual(len(self.hub.texts[-1]["hands"]), 1)
+
+    def test_heartbeat_says_whether_depth_is_flowing(self):
+        self.t._beat(10.0)
+        with open(self.t.args.alive, encoding="utf-8") as f:
+            self.assertFalse(json.load(f)["depth"])
+        self.send(self.plane(1000))
+        self.t._last_beat = 0.0
+        self.t._beat(20.0)
+        with open(self.t.args.alive, encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["depth"])
+
+    def test_the_depth_segment_name_is_an_argument_with_a_default(self):
+        self.assertEqual(svc.parse_args([]).depth_shm_name, "jarvis_handtrack_depth")
+        self.assertEqual(svc.parse_args(["--depth-shm-name", "x"]).depth_shm_name, "x")
+        self.assertEqual(self.hd.DEPTH_SHM_NAME, "jarvis_handtrack_depth")
+
+
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -311,6 +462,36 @@ class HubTests(unittest.TestCase):
             self.assertTrue(svc.ORIGIN_RE.match(o), o)
         for o in bad:
             self.assertFalse(svc.ORIGIN_RE.match(o), o)
+
+    def test_depth_goes_only_to_depth_subscribers(self):
+        hub = svc.Hub("127.0.0.1", 0)
+        a = {"q": asyncio.Queue(maxsize=4), "frames": True, "depth": False}
+        b = {"q": asyncio.Queue(maxsize=4), "frames": False, "depth": True}
+        old = {"q": asyncio.Queue(maxsize=4), "frames": True}          # a pre-depth client state
+        hub.clients = {"a": a, "b": b, "c": old}
+        hub._fanout(None, None, b"JVDP-plane")
+        self.assertTrue(a["q"].empty())
+        self.assertTrue(old["q"].empty())
+        self.assertEqual(b["q"].get_nowait(), b"JVDP-plane")
+        hub._fanout(None, b"JPEG")                                     # old call shape still works
+        self.assertEqual(a["q"].get_nowait(), b"JPEG")
+        self.assertTrue(b["q"].empty())
+        self.assertTrue(hub.wants_depth())
+        b["depth"] = False
+        self.assertFalse(hub.wants_depth())
+
+    def test_subscribe_keys_are_independent(self):
+        st = {"frames": False, "depth": False}
+        svc.Hub.apply_subscribe(st, {"type": "subscribe", "frames": True})
+        self.assertEqual(st, {"frames": True, "depth": False})
+        svc.Hub.apply_subscribe(st, {"type": "subscribe", "depth": True})
+        self.assertEqual(st, {"frames": True, "depth": True})         # frames untouched
+        svc.Hub.apply_subscribe(st, {"type": "subscribe", "frames": False, "depth": True})
+        self.assertEqual(st, {"frames": False, "depth": True})
+        svc.Hub.apply_subscribe(st, {"type": "subscribe"})             # a bare subscribe: frames off, as ever
+        self.assertEqual(st["frames"], False)
+        svc.Hub.apply_subscribe(st, {"type": "subscribe", "depth": False, "frames": True})
+        self.assertEqual(st, {"frames": True, "depth": False})
 
     def test_last_hands_message_is_replayed_to_new_clients(self):
         hub = svc.Hub("127.0.0.1", 0)

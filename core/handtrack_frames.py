@@ -153,6 +153,9 @@ def camera_matches(setting: str, cam: dict, side: str = "") -> bool:
     preview key of the entry (core.camera_tiles.percam_side); a digit string
     -> the camera index. Anything else (e.g. "kinect", not published by this
     loop) matches nothing, so the status action can say so honestly.
+    "kinect" is published by core/handtrack_depth.py (Phase 2) from the Kinect
+    bridge's own colour frames, never from a CAMERAS entry, so it still matches
+    no webcam here - which is what keeps a webcam frame out of that segment.
     """
     key = str(setting or "primary").strip().lower()
     try:
@@ -316,9 +319,16 @@ WRITER = HandTrackFrames()
 def _setting() -> str:
     try:
         from core import config
-        return str(getattr(config, "HAND_TRACK_CAMERA", "primary") or "primary")
+        cfg = str(getattr(config, "HAND_TRACK_CAMERA", "primary") or "primary")
     except Exception:
         return "primary"
+    try:
+        # A Kinect hologram (voice: "...with the Kinect") borrows the tracker's
+        # camera for as long as it is up: no webcam frame may be mixed in.
+        from core import handtrack_depth
+        return handtrack_depth.effective_camera_setting(cfg)
+    except Exception:
+        return cfg
 
 
 def is_hand_camera(cam: dict, setting: Optional[str] = None) -> bool:

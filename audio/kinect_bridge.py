@@ -1242,6 +1242,24 @@ def get_color_bgr(require_new: bool = True):
         return None
 
 
+def frame_clock(stream: str) -> Optional[float]:
+    """The runtime's own arrival clock for "color" or "depth" (the value
+    ``_frame_time_advanced`` compares), or None. A pure attribute read: it
+    opens nothing, consumes no frame and takes no lock, so a poller can ask "is
+    this a NEW frame?" before paying for the 8 MB copy (core/handtrack_depth,
+    2026-10-15). NEVER raises."""
+    if stream not in ("color", "depth"):
+        return None
+    try:
+        rt = _runtime[0]
+        if rt is None:
+            return None
+        v = getattr(rt, f"_last_{stream}_frame_time", None)
+        return None if v is None else float(v)
+    except Exception:   # pragma: no cover - defensive: odd runtime attr
+        return None
+
+
 def get_color_png():
     """Latest color frame encoded as PNG bytes (for ask_vision), or None."""
     bgr = get_color_bgr()

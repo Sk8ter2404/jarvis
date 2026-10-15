@@ -1564,8 +1564,19 @@ SCHEMA: dict[str, dict] = {
         "tab": "cameras", "label": "Camera the hand tracker reads",
         "type": "str", "default": "primary",
         "help": "'primary' (the primary webcam), 'left' or 'right' (a webcam "
-                "entry by its preview name) or a camera index such as 0. "
-                "Applies at once.",
+                "entry by its preview name), a camera index such as 0, or "
+                "'kinect' (the Kinect's colour camera; needs the Kinect "
+                "master switch below). Applies at once.",
+    },
+    "HOLO_DEPTH_ENABLED": {
+        "tab": "cameras", "label": "Hologram depth from the Kinect",
+        "type": "bool", "default": False,
+        "help": "With the hand tracker reading the Kinect, also send a small "
+                "depth picture so the hologram hides behind nearer real "
+                "objects and a fist can push and pull it toward and away from "
+                "the sensor. Off = colour only. Needs 'kinect' above and the "
+                "Kinect master switch. 'Open the hologram with the Kinect' "
+                "turns it on for one session.",
     },
     "KINECT_ENABLED": {
         "tab": "cameras", "label": "Kinect sensor (master switch)",
@@ -2473,7 +2484,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                      "CAMERA_DIES_ON_OPEN_RETRY_S", "CAMERA_OPEN_MIN_GAP_S",
                      "TV_DETECT_ENABLED"]),
         ("Hand tracking", ["HAND_TRACKING_ENABLED", "HAND_MENU_ENABLED",
-                           "HAND_TRACK_CAMERA"]),
+                           "HAND_TRACK_CAMERA", "HOLO_DEPTH_ENABLED"]),
         ("Kinect", ["KINECT_ENABLED", "KINECT_AS_CAMERA",
                     "KINECT_PRESENCE_ENABLED", "KINECT_PRESENCE_STANDBY",
                     "KINECT_PRESENCE_WAKE", "KINECT_GREET_ON_ENTRY",

@@ -6580,6 +6580,7 @@ def _hud_camera_preview_downscale(frame: "np.ndarray", width: int) -> "np.ndarra
 # 2026-09-30: the web dashboard used to carry its OWN copy of this tuple.
 from core import camera_tiles as _camera_tiles  # noqa: E402
 from core import handtrack_frames as _handtrack_frames  # noqa: E402
+from core import handtrack_depth as _handtrack_depth  # noqa: E402
 _HUD_PERCAM_PREVIEW_KEYS = _camera_tiles.PREVIEW_KEYS
 _hud_percam_last_write: dict[str, float] = {}
 # Keys this process has written since the last cleanup - the per-camera twin
@@ -12781,6 +12782,16 @@ def _face_tracking_thread_body():
                 # them here on entry to ANY composite-stopping state; the helper's
                 # flag guard makes it fire once, not every frame.
                 _release_side_tile_webcams_if_open()
+
+            # HAND TRACKER <- KINECT (2026-10-15, off by default). With
+            # HAND_TRACK_CAMERA = "kinect" and the tracker alive, hand it the
+            # Kinect COLOUR frame (and, with HOLO_DEPTH_ENABLED, a registered
+            # depth plane) from the bridge's own accessors - the same
+            # get_color_bgr(require_new=False) the preview composite below
+            # uses, on THIS thread, never from the Kinect pump. At most ~15
+            # frames/s, a no-op for any other setting, never raises.
+            if not camera_off:
+                _handtrack_depth.publish_kinect()
 
             # Read all cameras, run face detection on each
             primary_face = None

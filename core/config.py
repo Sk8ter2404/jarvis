@@ -2023,13 +2023,22 @@ KINECT_TWO_HAND_ENABLED = True
 #                          game mode, over a fullscreen app or in a call).
 #   HAND_TRACK_CAMERA      which camera feeds it: "primary" (the primary
 #                          webcam), "left" / "right" (the preview key of a
-#                          webcam entry in CAMERAS) or a camera index ("0").
+#                          webcam entry in CAMERAS), a camera index ("0") or
+#                          "kinect" (the Kinect v2 COLOUR stream, published by
+#                          the face-tracking loop from the frames the bridge
+#                          already holds; needs KINECT_ENABLED; core/
+#                          handtrack_depth.py). Applies at once.
+#   HOLO_DEPTH_ENABLED     with "kinect" selected: also publish a 160x90 depth
+#                          plane registered to that colour frame so the /holo
+#                          page can hide the hologram behind nearer real objects
+#                          and push / pull it with a fist. OFF by default.
 #   HAND_TRACK_PYTHON / HAND_TRACK_MODEL / HAND_TRACK_PORT  where the tracker
 #                          venv's python, the HandLandmarker .task file and the
 #                          websocket port are.
 HAND_TRACKING_ENABLED = False
 HAND_MENU_ENABLED = False
 HAND_TRACK_CAMERA = "primary"
+HOLO_DEPTH_ENABLED = False
 HAND_TRACK_PYTHON = r"C:\JARVIS-models\handtrack\venv\Scripts\python.exe"
 HAND_TRACK_MODEL = r"C:\JARVIS-models\handtrack\hand_landmarker.task"
 HAND_TRACK_PORT = 8793
