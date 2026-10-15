@@ -28,6 +28,11 @@ HOLO_MODE_ENABLED (core/config.py) False -> every action says it is off.
 Voice actions (each returns ONE finished sentence, spoken verbatim):
   hand_menu, holo_mode_on [desktop|camera], holo_mode_off, holo_show [model],
   holo_explode, holo_assemble
+
+holo_show also shows the owner's OWN models (.stl / .3mf / .obj in
+data/holo_models or the HOLO_MODEL_DIRS folders, see core/holo_web.py): the
+name is matched fuzzily against the file names; an unknown name is answered
+with a few that exist, and with no models at all, with where to put them.
 """
 from __future__ import annotations
 
@@ -153,6 +158,10 @@ def _norm_model(arg: str) -> str:
     for junk in ("the ", "a ", "an ", "my "):
         if a.startswith(junk):
             a = a[len(junk):]
+    for tail in (" in the hologram", " in the holo", " in the hand menu",
+                 " in holo mode", " please", " model", " file"):
+        if a.endswith(tail):
+            a = a[:-len(tail)]
     return a.strip()
 
 
@@ -254,13 +263,45 @@ def holo_mode_off(arg: str = "") -> str:
     return "Holo mode closed, sir."
 
 
+def _own_models() -> list:
+    """The owner's own models (core.holo_web.list_models); [] on any trouble."""
+    try:
+        return list(holo_web.list_models())
+    except Exception as e:                        # pragma: no cover - defensive
+        print(f"  [holo] model listing failed: {type(e).__name__}")
+        return []
+
+
+def _resolve_model(query: str, models: list):
+    """(name to show, "" | spoken refusal). The built-in arc reactor is always
+    a candidate; a model of his with the exact same name wins over it."""
+    if not query:
+        return DEFAULT_MODEL, ""
+    cands = [{"name": DEFAULT_MODEL, "type": "builtin"}] + list(models)
+    hit = holo_web.match_model(query, cands)
+    if hit is None and query in ("reactor", "the reactor"):
+        hit = cands[0]
+    if hit is not None:
+        return hit["name"], ""
+    if not models:
+        return "", ("I can't find any of your models, sir - put .stl, .3mf or .obj "
+                    "files in data/holo_models or add a folder to HOLO_MODEL_DIRS.")
+    names = []
+    for m in models:
+        if m["name"] not in names:
+            names.append(m["name"])
+    few = names[:3]
+    listed = (", ".join(few[:-1]) + " and " + few[-1]) if len(few) > 1 else few[0]
+    return "", f"I don't have a model called {query}, sir - I do have {listed}."
+
+
 def holo_show(arg: str = "") -> str:
     if not _enabled():
         return _off_line()
-    model = _norm_model(arg) or DEFAULT_MODEL
-    if model not in holo_web.MODELS:
-        return (f"I only have the {DEFAULT_MODEL} so far, sir - your own "
-                f"models are still to come.")
+    query = _norm_model(arg)
+    model, refusal = _resolve_model(query, _own_models() if query else [])
+    if refusal:
+        return refusal
     st = holo_web.STATE
     if _opening():
         st.push_command("show", model)
@@ -290,6 +331,8 @@ def holo_explode(arg: str = "") -> str:
     why = _need_model()
     if why:
         return why
+    if holo_web.STATE.parts == 1:
+        return "It's a single piece, sir, so there's nothing to explode."
     if holo_web.STATE.exploded:
         return "It's already apart, sir."
     holo_web.STATE.push_command("explode")

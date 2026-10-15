@@ -2407,6 +2407,14 @@ WEB_INTERFACE_TOKEN   = ""          # shared secret; MANDATORY for a non-local b
 # and starts the web interface first if it is down. False: every holo_* action
 # answers that it is off.
 HOLO_MODE_ENABLED = True
+# HOLO_MODEL_DIRS — extra folders whose .stl / .3mf / .obj files the hologram can
+# show as the owner's OWN models ("show me the tiger pendant in the hologram").
+# data/holo_models is always searched too (created on first use; data/ is
+# git-ignored). Searched two folders deep; nothing outside these folders is ever
+# served. Empty: only data/holo_models. HOLO_MODEL_MAX_MB: a larger file is left
+# out of the list (and refused with a 413 if asked for directly).
+HOLO_MODEL_DIRS = []
+HOLO_MODEL_MAX_MB = 64
 # DASHBOARD_SHOW_TRANSCRIPTS — the dashboard's "What JARVIS did" timeline shows
 # what was SAID on each turn (the owner's words, JARVIS's reply) only when this
 # is True AND the browser is on this PC (a loopback request). A LAN client never

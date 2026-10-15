@@ -12,10 +12,13 @@
 //
 // Pinned libraries (exact versions; no runtime installs, no floating tags):
 //   three.js 0.160.0  https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js
+//   plus its STL / 3MF / OBJ loaders (same version, see models.js) for the owner's
+//   own models; holo.html's import map maps "three" to the build above.
 import {
   T, GestureRouter, mapToScreen, mapFromScreen, dampSpin, followStep, palmSize,
 } from "/holo/gestures.js";
 import { Reactor, REACTOR_NAME } from "/holo/reactor.js";
+import { fetchModelList, findModel, loadOwnModel, pageOf, formatSizeMm } from "/holo/models.js";
 
 const THREE_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const TRACKER_URL_DEFAULT = "ws://127.0.0.1:8793";
@@ -92,6 +95,9 @@ sceneGL.add(key);
 const reactor = new Reactor(THREE);
 reactor.group.visible = false;
 sceneGL.add(reactor.group);
+let cur = reactor;                      // what is on screen: the reactor or one of his models
+let shownName = "";                     // its name as the voice knows it
+let loadToken = 0;                      // newest load wins
 
 function resize() {
   W = innerWidth; H = innerHeight;
@@ -118,12 +124,12 @@ const baseR = () => Math.min(W, H) * 0.17;
 const toWorld = (px, py, z = 0) => new THREE.Vector3(px - W / 2, H / 2 - py, z);
 const labelEls = new Map();
 let infoEl = null;
-let menuPos = { x: 0, y: 0 }, menuTimer = 0;
+let menuPos = { x: 0, y: 0 }, menuTimer = 0, hintTimer = 0;
 
 function toScreen(nx, ny) { return mapToScreen(nx, ny, W, H, mode, aspect); }
 
 function projectPart(part) {
-  reactor.group.updateMatrixWorld(true);
+  cur.group.updateMatrixWorld(true);
   const v = new THREE.Vector3();
   part.mesh.getWorldPosition(v);
   const wz = v.z;
@@ -143,13 +149,14 @@ const scene = {
   addSpin(wy, wx) { rs.wy += wy; rs.wx += wx; },
 
   openMenu(x, y) {
-    menuPos = { x: Math.max(160, Math.min(W - 160, x)), y: Math.max(160, Math.min(H - 160, y)) };
+    menuPos = clampMenu(x, y, 160);
+    renderRootMenu();
     const m = $("menu");
     m.style.left = menuPos.x + "px"; m.style.top = menuPos.y + "px";
     m.style.display = "block";
     scene.menuOpen = true;
     clearTimeout(menuTimer);
-    menuTimer = setTimeout(() => scene.closeMenu(), 9000);
+    menuTimer = setTimeout(() => scene.closeMenu(), 12000);
     setHint("POINT AT AN ITEM AND PINCH");
   },
   closeMenu() {
@@ -161,7 +168,8 @@ const scene = {
   menuItems() {
     return [...document.querySelectorAll("#menu button")].map(b => {
       const r = b.getBoundingClientRect();
-      return { el: b, model: b.dataset.model, disabled: b.disabled, x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      return { el: b, model: b.dataset.model, id: b.dataset.id || "", disabled: b.disabled,
+        x: r.left + r.width / 2, y: r.top + r.height / 2 };
     });
   },
   menuItemAt(x, y) {
@@ -173,29 +181,39 @@ const scene = {
     return best;
   },
   chooseMenuItem(item) {
-    if (item.disabled) { setHint("COMING SOON"); return; }
+    if (item.disabled) {
+      setHint(item.model === "__models" ? "NO MODELS YET - ADD .STL .3MF .OBJ FILES TO data/holo_models" : "NOT AVAILABLE");
+      return;
+    }
+    clearTimeout(menuTimer);
+    menuTimer = setTimeout(() => scene.closeMenu(), 12000);
+    if (item.model === "__models") { renderModelMenu(0); return; }
+    if (item.model === "__more") { renderModelMenu(menuView.page + 1); return; }
+    if (item.model === "__back") { renderRootMenu(); return; }
     scene.closeMenu();
-    scene.spawn(item.model, menuPos.x, menuPos.y);
+    scene.spawn(item.id ? "id:" + item.id : item.model, menuPos.x, menuPos.y);
   },
   spawn(model, x, y) {
-    if (String(model).toLowerCase() !== REACTOR_NAME) { setHint("UNKNOWN MODEL"); return false; }
-    const c = (x == null) ? { x: W / 2, y: H / 2 } : { x, y };
-    rs.x = rs.tx = c.x; rs.y = rs.ty = c.y;
-    rs.scale = 1; rs.wy = rs.wx = 0;
-    scene.exploded = false; reactor.setExploded(false); reactor.e = 0;
-    for (const p of reactor.parts) { p.pull = null; p.mesh.position.copy(p.rest); }
-    scene.reactorVisible = true;
-    reactor.group.visible = true;
-    setHint("");
+    const name = String(model || "");
+    if (name.toLowerCase() === REACTOR_NAME) {
+      loadToken++;
+      activate(reactor, REACTOR_NAME, x, y);
+      setHint("");
+      return true;
+    }
+    showOwnModel(name, x, y);          // async: the list, the file, the parse
     return true;
   },
-  explode() { scene.exploded = true; reactor.setExploded(true); },
-  assemble() { scene.exploded = false; reactor.setExploded(false); scene.showInfo(null); },
+  explode() {
+    if (cur.parts.length < 2) { flashHint("ONE PART - NOTHING TO EXPLODE", 3500); return; }
+    scene.exploded = true; cur.setExploded(true);
+  },
+  assemble() { scene.exploded = false; cur.setExploded(false); scene.showInfo(null); },
 
   partAt(x, y) {
     if (!scene.reactorVisible) return null;
     let best = null, bd = T.PART_PICK_PX * Math.max(1, rs.scale * 0.8);
-    for (const p of reactor.parts) {
+    for (const p of cur.parts) {
       const s = projectPart(p);
       const d = Math.hypot(s.x - x, s.y - y);
       if (d < bd) { bd = d; best = p; }
@@ -209,8 +227,8 @@ const scene = {
   },
   movePart(part, x, y) {
     if (!part.pull) return;
-    reactor.group.updateMatrixWorld(true);
-    part.pull.local = reactor.group.worldToLocal(toWorld(x, y, (part.pullZ || 0) + 120));
+    cur.group.updateMatrixWorld(true);
+    part.pull.local = cur.group.worldToLocal(toWorld(x, y, (part.pullZ || 0) + 120));
   },
   releasePart(part) { part.pull = null; part.pullBack = true; },
   showInfo(part) {
@@ -231,26 +249,123 @@ const router = new GestureRouter(scene, { log: m => { lastGesture = m; } });
 // ---------------------------------------------------------------------------
 // menu DOM (mouse works too)
 // ---------------------------------------------------------------------------
-(function buildMenu() {
-  const m = $("menu");
-  const items = [
-    { label: "ARC REACTOR", sub: "procedural", model: REACTOR_NAME, ang: -90, off: false },
-    { label: "MY MODELS", sub: "coming soon", model: "my models", ang: 30, off: true },
-  ];
-  for (const it of items) {
-    const b = document.createElement("button");
-    b.dataset.model = it.model;
-    b.disabled = it.off;
-    b.innerHTML = it.label + "<small>" + it.sub + "</small>";
-    const a = it.ang * Math.PI / 180;
-    b.style.left = Math.cos(a) * 150 + "px";
-    b.style.top = Math.sin(a) * 150 + "px";
-    b.addEventListener("click", () => scene.chooseMenuItem(scene.menuItems().find(x => x.el === b)));
-    m.appendChild(b);
-  }
-})();
+let menuView = { kind: "root", page: 0, list: [] };
+let modelCache = { t: 0, list: [] };
+const authHeaders = () => (TOKEN ? { "X-Auth-Token": TOKEN } : {});
 
-function setHint(t) { $("hint").textContent = t; }
+// The owner's models, from the server (cached for a few seconds).
+async function modelList(force = false) {
+  if (!force && performance.now() - modelCache.t < 4000) return modelCache.list;
+  const list = await fetchModelList(authHeaders());
+  modelCache = { t: performance.now(), list };
+  return list;
+}
+
+function clampMenu(x, y, m) {
+  const mx = Math.min(m, W / 2), my = Math.min(m, H / 2);
+  return { x: Math.max(mx, Math.min(W - mx, x)), y: Math.max(my, Math.min(H - my, y)) };
+}
+
+function addMenuButton(m, { label, sub, model, id, off, ang, radius, small }) {
+  const b = document.createElement("button");
+  b.dataset.model = model;
+  if (id) b.dataset.id = id;
+  b.disabled = !!off;
+  if (small) b.classList.add("sm");
+  b.appendChild(document.createTextNode(label));          // textContent only: file names are not HTML
+  if (sub) { const s = document.createElement("small"); s.textContent = sub; b.appendChild(s); }
+  const a = ang * Math.PI / 180;
+  b.style.left = Math.cos(a) * radius + "px";
+  b.style.top = Math.sin(a) * radius + "px";
+  b.addEventListener("click", () => scene.chooseMenuItem(scene.menuItems().find(x => x.el === b)));
+  m.appendChild(b);
+  return b;
+}
+
+function resetMenu(big) {
+  const m = $("menu");
+  for (const b of [...m.querySelectorAll("button")]) b.remove();
+  m.querySelector(".ring").classList.toggle("big", !!big);
+  m.style.left = menuPos.x + "px"; m.style.top = menuPos.y + "px";
+  return m;
+}
+
+function renderRootMenu() {
+  menuView = { kind: "root", page: 0, list: [] };
+  menuPos = clampMenu(menuPos.x, menuPos.y, 160);
+  const m = resetMenu(false), r = 150;
+  addMenuButton(m, { label: "ARC REACTOR", sub: "procedural", model: REACTOR_NAME, ang: -90, radius: r });
+  const mine = addMenuButton(m, { label: "MY MODELS", sub: "looking...", model: "__models", ang: 30, radius: r, off: true });
+  modelList(true).then(list => {
+    if (menuView.kind !== "root" || !mine.isConnected) return;
+    mine.disabled = list.length === 0;
+    mine.lastChild.textContent = list.length ? list.length + (list.length === 1 ? " model" : " models") : "none yet";
+  }).catch(() => { if (mine.isConnected) mine.lastChild.textContent = "unavailable"; });
+}
+
+async function renderModelMenu(page) {
+  let list = [];
+  try { list = await modelList(true); } catch (e) { flashHint("COULD NOT LIST MODELS", 3500); return; }
+  if (!list.length) { renderRootMenu(); setHint("NO MODELS YET - ADD .STL .3MF .OBJ FILES TO data/holo_models"); return; }
+  const pg = pageOf(list, page);
+  menuView = { kind: "models", page: pg.page, list };
+  menuPos = clampMenu(menuPos.x, menuPos.y, 310);
+  const m = resetMenu(true);
+  const n = pg.items.length + 1 + (pg.more ? 1 : 0), R = 235;
+  const angAt = i => -90 + (360 / n) * i;
+  pg.items.forEach((it, i) => addMenuButton(m, {
+    label: it.name, sub: it.type.toUpperCase(), model: it.name, id: it.id, ang: angAt(i), radius: R, small: true }));
+  if (pg.more) addMenuButton(m, { label: "MORE", sub: "page " + (pg.page + 1) + "/" + pg.pages, model: "__more",
+    ang: angAt(pg.items.length), radius: R, small: true });
+  addMenuButton(m, { label: "BACK", model: "__back", ang: angAt(n - 1), radius: R, small: true });
+  setHint("POINT AT A MODEL AND PINCH");
+}
+
+// Put `obj` (the reactor or a HoloModel) on screen at (x, y), fresh.
+function activate(obj, name, x, y) {
+  if (cur !== obj) {
+    cur.group.visible = false;
+    if (cur !== reactor) { sceneGL.remove(cur.group); cur.dispose(); }
+    if (obj !== reactor) sceneGL.add(obj.group);
+  }
+  cur = obj;
+  shownName = name;
+  clearLabels();
+  scene.showInfo(null);
+  const c = (x == null) ? { x: W / 2, y: H / 2 } : { x, y };
+  rs.x = rs.tx = c.x; rs.y = rs.ty = c.y;
+  rs.scale = 1; rs.wy = rs.wx = 0;
+  scene.exploded = false; cur.setExploded(false); cur.e = 0;
+  for (const p of cur.parts) { p.pull = null; p.pullBack = false; p.mesh.position.copy(p.rest); }
+  scene.reactorVisible = true;
+  cur.group.visible = true;
+}
+
+async function showOwnModel(query, x, y) {
+  const tok = ++loadToken;
+  setHint("LOADING " + String(query).replace(/^id:/i, "").toUpperCase());
+  try {
+    const entry = findModel(await modelList(true), query);
+    if (tok !== loadToken) return;
+    if (!entry) { flashHint("NO MODEL CALLED " + String(query).toUpperCase(), 4500); return; }
+    const model = await loadOwnModel(THREE, entry, authHeaders());
+    if (tok !== loadToken) { model.dispose(); return; }
+    activate(model, entry.name, x, y);
+    const n = model.parts.length;
+    flashHint(entry.name.toUpperCase() + "   " + formatSizeMm(...model.sizeMm) + "   " +
+      (n === 1 ? "1 PART" : n + " PARTS"), 6000);
+  } catch (e) {
+    if (tok === loadToken) flashHint("COULD NOT LOAD " + String(query).toUpperCase() + ": " + (e && e.message || e), 6000);
+  }
+}
+
+function clearLabels() {
+  for (const el of labelEls.values()) el.remove();
+  labelEls.clear();
+}
+
+function setHint(t) { clearTimeout(hintTimer); $("hint").textContent = t; }
+function flashHint(t, ms) { setHint(t); hintTimer = setTimeout(() => { $("hint").textContent = ""; }, ms); }
 
 // ---------------------------------------------------------------------------
 // camera frames + background
@@ -349,7 +464,7 @@ async function startFake() {
       return it ? mapFromScreen(it.x, it.y, W, H, mode, aspect) : null;
     },
     partNorm: name => {
-      const p = reactor.partByName(name);
+      const p = cur.partByName(name);
       if (!p || !scene.reactorVisible) return null;
       const s = projectPart(p);
       return mapFromScreen(s.x, s.y, W, H, mode, aspect);
@@ -383,8 +498,9 @@ async function pollState() {
   try {
     const q = new URLSearchParams({
       seen: String(seenSeq == null ? 0 : seenSeq),
-      shown: scene.reactorVisible ? REACTOR_NAME : "",
+      shown: scene.reactorVisible ? shownName : "",
       exploded: scene.exploded ? "1" : "0",
+      parts: String(scene.reactorVisible ? cur.parts.length : 0),
     });
     const headers = TOKEN ? { "X-Auth-Token": TOKEN } : {};
     const r = await fetch("/api/holo/state?" + q, { headers, cache: "no-store" });
@@ -469,8 +585,8 @@ function drawHands() {
 
 function updateLabels() {
   const want = new Set();
-  if (scene.reactorVisible && showLabels && reactor.e > 0.5) {
-    for (const p of reactor.parts) {
+  if (scene.reactorVisible && showLabels && cur.e > 0.5) {
+    for (const p of cur.parts) {
       let el = labelEls.get(p.name);
       if (!el) {
         el = document.createElement("div"); el.className = "lbl";
@@ -484,7 +600,7 @@ function updateLabels() {
   }
   for (const [n, el] of labelEls) if (!want.has(n)) el.style.display = "none";
   if (infoEl) {
-    const p = reactor.partByName(infoEl.dataset.part);
+    const p = cur.partByName(infoEl.dataset.part);
     if (p) { const s = projectPart(p); infoEl.style.left = s.x + 18 + "px"; infoEl.style.top = s.y + "px"; }
   }
 }
@@ -536,11 +652,11 @@ function frame(now) {
     rs.ry += (rs.wy + idle) * dt;
     rs.rx += rs.wx * dt;
     const s = baseR() * rs.scale;
-    const g = reactor.group;
+    const g = cur.group;
     g.position.copy(toWorld(rs.x, rs.y, 0));
     g.scale.setScalar(s);
     g.rotation.set(rs.rx + Math.sin(t * 0.7) * 0.03, rs.ry, 0);
-    reactor.step(dt, t);
+    cur.step(dt, t);
   }
   drawBackground();
   renderer.render(sceneGL, camera);
@@ -566,4 +682,4 @@ if (FAKE) startFake();
 setInterval(pollState, 300);
 pollState();
 requestAnimationFrame(frame);
-window.__holo = { scene, router, reactor, rs };   // debugging handle (page-local)
+window.__holo = { scene, router, reactor, rs, get cur() { return cur; } };   // debugging handle (page-local)

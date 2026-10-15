@@ -124,8 +124,8 @@ class HoloRouteTests(_HoloServer):
         self.assertIn("frame-ancestors 'none'", csp)
 
     def test_static_files_served_and_nothing_else(self):
-        for name in ("holo.js", "gestures.js", "reactor.js", "fakehands.js",
-                     "selftest.js"):
+        for name in ("holo.js", "gestures.js", "reactor.js", "models.js",
+                     "fakehands.js", "selftest.js"):
             code, text = _get_raw(self.base + "/holo/" + name)
             self.assertEqual(code, 200, name)
             self.assertGreater(len(text), 500, name)
@@ -171,6 +171,7 @@ class HoloActionTests(unittest.TestCase):
         self.opened = []
         self._patches = [
             mock.patch.object(holo_web, "STATE", self.state),
+            mock.patch.object(holo_web, "list_models", return_value=[]),
             mock.patch.object(holo_mode, "_ensure_server",
                               return_value=(True, "127.0.0.1", 8766, "")),
             mock.patch.object(holo_mode, "_launch_window",
@@ -268,8 +269,10 @@ class HoloActionTests(unittest.TestCase):
         self.assertEqual(self.state.payload(0)["commands"][-1]["cmd"], "assemble")
 
     def test_show_unknown_model_is_honest(self):
-        out = holo_mode.holo_show("tiger pendant")
-        self.assertIn("only have the arc reactor", out)
+        with mock.patch.object(holo_web, "list_models", return_value=[]):
+            out = holo_mode.holo_show("tiger pendant")
+        self.assertIn("can't find any of your models", out)
+        self.assertIn("data/holo_models", out)
         self.assertEqual(self.opened, [])
         self.assertEqual(self.state.payload(0)["commands"], [])
 
@@ -450,7 +453,7 @@ class HoloVoiceRouteTests(unittest.TestCase):
 
 # --- the page's static contract ----------------------------------------------
 class HoloPageContractTests(unittest.TestCase):
-    PAGE_FILES = ("holo.html", "holo.js", "gestures.js", "reactor.js",
+    PAGE_FILES = ("holo.html", "holo.js", "gestures.js", "reactor.js", "models.js",
                   "fakehands.js", "selftest.js")
 
     def test_every_served_file_exists_and_every_file_is_served(self):

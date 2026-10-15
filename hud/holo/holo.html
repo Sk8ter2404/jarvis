@@ -56,6 +56,9 @@
     color: var(--cy2); font: 600 13px "Segoe UI", sans-serif; letter-spacing: .08em; cursor: pointer;
     box-shadow: 0 0 22px rgba(57,215,255,.35); pointer-events: auto; }
   #menu button:hover, #menu button.hot { background: rgba(57,215,255,.28); color: #fff; }
+  #menu button.sm { width: 100px; height: 100px; margin: -50px 0 0 -50px; font-size: 11px;
+    padding: 4px; overflow: hidden; line-height: 1.2; word-break: break-word; }
+  #menu .ring.big { left: -250px; top: -250px; width: 500px; height: 500px; }
   #menu button[disabled] { opacity: .45; cursor: default; border-style: dashed; }
   #menu small { display: block; font-weight: 400; font-size: 10px; letter-spacing: .04em; opacity: .8; }
   #closed { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
@@ -84,6 +87,12 @@
 <div id="closed">HOLO MODE CLOSED</div>
 <div id="err"></div>
 <script>window.JARVIS_TOKEN = __JARVIS_TOKEN__;</script>
+<!-- The model loaders (three/examples/jsm) import "three" by bare name; this maps it to
+     the ONE pinned build holo.js loads, so the page has a single THREE. Must precede
+     every module script. -->
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}
+</script>
 <script type="module" src="/holo/holo.js"></script>
 </body>
 </html>

@@ -30,6 +30,33 @@ function glowTexture(THREE) {
   return new THREE.CanvasTexture(c);
 }
 
+// Shared by the reactor and the owner's own models (models.js): animate `host.e`
+// toward exploded/assembled and move every part (host = {exploded, e, parts}).
+// A part held by a pinch follows its hand; a released one eases home.
+export function stepParts(THREE, host, dt, t) {
+  const target = host.exploded ? 1 : 0;
+  // critically-damped-ish ease; explode is a snap, assemble a pull-in
+  const k = 1 - Math.exp(-dt * (host.exploded ? 5.5 : 7));
+  host.e += (target - host.e) * k;
+  if (Math.abs(host.e - target) < 1e-3) host.e = target;
+  const tmp = new THREE.Vector3();
+  for (const p of host.parts) {
+    if (p.pull) {
+      // being held: follow the pinch point (given in this group's local space)
+      p.mesh.position.lerp(p.pull.local, 1 - Math.exp(-dt * 18));
+      continue;
+    }
+    tmp.copy(p.dir).multiplyScalar(p.dist * host.e).add(p.rest);
+    if (host.e > 0.02) {
+      // gentle hover + own-axis tumble while exploded
+      tmp.z += Math.sin(t * 1.3 + p.rest.x * 3 + p.rest.y * 2) * 0.04 * host.e;
+      p.mesh.rotation.y += p.spin * dt * host.e;
+    }
+    p.mesh.position.lerp(tmp, p.pullBack ? 1 - Math.exp(-dt * 9) : 1);
+    if (p.pullBack && p.mesh.position.distanceTo(tmp) < 0.02) p.pullBack = false;
+  }
+}
+
 export class Reactor {
   constructor(THREE) {
     this.THREE = THREE;
@@ -121,28 +148,7 @@ export class Reactor {
   setExploded(on) { this.exploded = !!on; }
 
   step(dt, t) {
-    const target = this.exploded ? 1 : 0;
-    // critically-damped-ish ease; explode is a snap, assemble a pull-in
-    const k = 1 - Math.exp(-dt * (this.exploded ? 5.5 : 7));
-    this.e += (target - this.e) * k;
-    if (Math.abs(this.e - target) < 1e-3) this.e = target;
-    const THREE = this.THREE;
-    const tmp = new THREE.Vector3();
-    for (const p of this.parts) {
-      if (p.pull) {
-        // being held: follow the pinch point (given in this group's local space)
-        p.mesh.position.lerp(p.pull.local, 1 - Math.exp(-dt * 18));
-        continue;
-      }
-      tmp.copy(p.dir).multiplyScalar(p.dist * this.e).add(p.rest);
-      if (this.e > 0.02) {
-        // gentle hover + own-axis tumble while exploded
-        tmp.z += Math.sin(t * 1.3 + p.rest.x * 3 + p.rest.y * 2) * 0.04 * this.e;
-        p.mesh.rotation.y += p.spin * dt * this.e;
-      }
-      p.mesh.position.lerp(tmp, p.pullBack ? 1 - Math.exp(-dt * 9) : 1);
-      if (p.pullBack && p.mesh.position.distanceTo(tmp) < 0.02) p.pullBack = false;
-    }
+    stepParts(this.THREE, this, dt, t);
     const core = this.parts.find(p => p.name === "Core");
     if (core && core.glow) {
       const pulse = 0.92 + 0.08 * Math.sin(t * 3.1);

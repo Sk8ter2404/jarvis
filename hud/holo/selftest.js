@@ -5,6 +5,10 @@ import {
   twoHandScale, pinchPoint, palmSize,
 } from "./gestures.js";
 import { FakeHands, makeLandmarks, LOOP_S } from "./fakehands.js";
+import {
+  formatSizeMm, uniqueNames, splitParts, fitModel, explodeDir, findModel, pageOf,
+  TARGET_RADIUS, MODELS_PER_PAGE,
+} from "./models.js";
 
 class MockScene {
   constructor() {
@@ -171,6 +175,61 @@ const TESTS = [
     for (const n of ["palm_hold", "fist_grab", "fist_release", "point_flick", "explode", "pinch_start", "clap"]) {
       if (!names.has(n)) throw new Error("missing " + n);
     }
+  }],
+  ["model sizes print in mm with sensible decimals", () => {
+    eq(formatSizeMm(24, 18.52, 3.2), "24.0 x 18.5 x 3.2 mm");
+    eq(formatSizeMm(120.4, 5, 0.04), "120 x 5.0 x 0.0 mm");
+  }],
+  ["part names: blanks get numbers, repeats get a suffix", () => {
+    const n = uniqueNames(["Body", "", "Body", "Lid", "Body"]);
+    eq(n.join("|"), "Body|Part 02|Body 2|Lid|Body 3");
+  }],
+  ["splitParts: 3MF objects / components become parts, one object stays one", () => {
+    const mesh = () => ({ isMesh: true, children: [] });
+    const grp = (...k) => ({ children: k });
+    const a = grp(mesh()), b = grp(mesh()), c = grp(mesh(), mesh());
+    eq(splitParts(grp(a, b, c)).length, 3, "three build items");
+    eq(splitParts(grp(c))[0], c, "one object with two meshes is one part");
+    const composite = grp(a, b);                       // one build item made of components
+    eq(splitParts(grp(composite)).length, 2, "components");
+    eq(splitParts(grp(grp(grp(a, b)))).length, 2, "wrapper groups are looked through");
+    const m1 = mesh();
+    eq(splitParts(m1)[0], m1, "bare mesh (STL)");
+    const obj = grp(mesh(), mesh(), mesh());
+    eq(splitParts(obj).length, 1, "several meshes stay one object by default");
+    eq(splitParts(obj, { meshesAreParts: true }).length, 3, "OBJ objects are parts");
+  }],
+  ["fitModel centres the box and scales its half-diagonal to the reactor", () => {
+    const f = fitModel([0, 0, 0], [100, 0, 0]);
+    near(f.center[0], 50, 1e-9); near(f.radius, 50, 1e-9); near(f.scale, TARGET_RADIUS / 50, 1e-9);
+    eq(fitModel([1, 1, 1], [1, 1, 1]).scale, 1, "degenerate box");
+    const g = fitModel([-5, -5, -5], [5, 5, 5]);
+    near(g.radius * g.scale, TARGET_RADIUS, 1e-9);
+  }],
+  ["explodeDir points away from the centre, centre parts go front/back", () => {
+    const e = explodeDir([2, 0, 0], 0);
+    if (!(e.dir[0] > 0.9 && e.dist > 0)) throw new Error("outward");
+    near(Math.hypot(...e.dir), 1, 1e-9, "unit");
+    eq(explodeDir([0, 0, 0], 0).dir[2], 1);
+    eq(explodeDir([0, 0, 0], 1).dir[2], -1);
+  }],
+  ["findModel: id, exact name, unique prefix; ambiguity and junk give null", () => {
+    const L = [{ id: "aaaaaaaaaaaa", name: "Tiger Pendant" }, { id: "bbbbbbbbbbbb", name: "Tiger Stand" },
+      { id: "cccccccccccc", name: "Gear" }];
+    eq(findModel(L, "id:bbbbbbbbbbbb").name, "Tiger Stand");
+    eq(findModel(L, "tiger pendant").id, "aaaaaaaaaaaa");
+    eq(findModel(L, "gea").name, "Gear");
+    eq(findModel(L, "tiger"), null, "ambiguous");
+    eq(findModel(L, "nope"), null);
+    eq(findModel(L, ""), null);
+    eq(findModel(null, "gear"), null);
+  }],
+  ["pageOf pages the model picker", () => {
+    const L = Array.from({ length: MODELS_PER_PAGE + 2 }, (_, i) => ({ id: String(i) }));
+    const p0 = pageOf(L, 0), p1 = pageOf(L, 5);
+    eq(p0.items.length, MODELS_PER_PAGE); eq(p0.more, true); eq(p0.pages, 2);
+    eq(p1.page, 1); eq(p1.items.length, 2); eq(p1.more, false);
+    eq(pageOf([], 0).items.length, 0);
   }],
 ];
 

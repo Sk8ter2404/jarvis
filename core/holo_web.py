@@ -20,20 +20,39 @@ WHAT IT MUST NEVER DO
   Move the Windows cursor or send any OS input. The page only draws; hand
   tracking for it lives in the browser and never reaches the air-mouse code.
 
-PURE: stdlib only, no I/O beyond reading the page files, no threads except one
-lock. The skill (skills/holo_mode.py) and the web handler share this module's
+The owner's OWN models: STL / 3MF / OBJ files from ``data/holo_models`` plus any
+folders in ``HOLO_MODEL_DIRS`` are listed (``list_models``) and served one by one
+at ``/holo/model/<id>`` (``model_response``). The id is a hash of the file's real
+path and is only ever looked up in a fresh scan of the configured folders, so a
+URL can never name an arbitrary file.
+
+PURE: stdlib only, no I/O beyond reading the page files and scanning the model
+folders, no threads except one lock. The skill (skills/holo_mode.py) and the web handler share this module's
 single ``STATE``; tests build their own ``HoloState``.
 """
 from __future__ import annotations
 
+import difflib
+import hashlib
 import json
 import os
+import re
 import threading
 import time
 
-# Models the page can build. Only the procedural arc reactor exists so far;
-# "my models" (the owner's own CAD files) is phase 2.
+# The built-in procedural model. The owner's own files (see list_models) come
+# on top of it.
 MODELS = ("arc reactor",)
+
+# Own models: extension -> kind. Nothing else is ever listed or served.
+MODEL_EXTS = {".stl": "stl", ".3mf": "3mf", ".obj": "obj"}
+MODEL_CONTENT_TYPES = {"stl": "model/stl", "3mf": "model/3mf", "obj": "model/obj"}
+MODEL_MAX_DEPTH = 2          # folders below a model folder that are searched
+MODEL_MAX_FILES = 400        # most models ever listed
+DEFAULT_MODEL_MAX_MB = 64
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BUILTIN_MODEL_DIR = os.path.join(_REPO_ROOT, "data", "holo_models")
+_MODEL_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 MODES = ("desktop", "camera")
 DEFAULT_MODE = "camera"
@@ -57,6 +76,7 @@ _ASSETS = {
     "/holo/holo.js": ("holo.js", "text/javascript; charset=utf-8"),
     "/holo/gestures.js": ("gestures.js", "text/javascript; charset=utf-8"),
     "/holo/reactor.js": ("reactor.js", "text/javascript; charset=utf-8"),
+    "/holo/models.js": ("models.js", "text/javascript; charset=utf-8"),
     "/holo/fakehands.js": ("fakehands.js", "text/javascript; charset=utf-8"),
     "/holo/selftest.js": ("selftest.js", "text/javascript; charset=utf-8"),
 }
@@ -95,6 +115,7 @@ class HoloState:
         self._last_poll = None
         self.shown = ""             # what the page says is on screen
         self.exploded = False
+        self.parts = 0              # parts of what is on screen (0 = unknown)
 
     # -- writes (the voice actions) ------------------------------------------
     def set_on(self, on: bool, model: str = "", mode: str = "") -> None:
@@ -106,6 +127,7 @@ class HoloState:
             if not on:
                 self.shown = ""
                 self.exploded = False
+                self.parts = 0
 
     def push_command(self, cmd: str, arg: str = "") -> int:
         """Queue one command for the page; returns its sequence number."""
@@ -125,13 +147,15 @@ class HoloState:
             return self.seq
 
     # -- the page's heartbeat -------------------------------------------------
-    def heartbeat(self, shown=None, exploded=None) -> None:
+    def heartbeat(self, shown=None, exploded=None, parts=None) -> None:
         with self._lock:
             self._last_poll = self._clock()
             if shown is not None:
-                self.shown = str(shown)[:40]
+                self.shown = str(shown)[:60]
             if exploded is not None:
                 self.exploded = bool(exploded)
+            if parts is not None:
+                self.parts = max(0, min(int(parts), 9999))
 
     @property
     def page_alive(self) -> bool:
@@ -150,6 +174,7 @@ class HoloState:
                 "commands": [c for c in self.commands if c["seq"] > seen],
                 "shown": self.shown,
                 "exploded": self.exploded,
+                "parts": self.parts,
             }
 
 
@@ -173,14 +198,16 @@ def state_payload(query: dict, state: HoloState = None) -> dict:
         v = query.get(k)
         return v[0] if v else None
     exploded = one("exploded")
+    parts = one("parts")
     st.heartbeat(shown=one("shown"),
-                 exploded=None if exploded is None else exploded == "1")
+                 exploded=None if exploded is None else exploded == "1",
+                 parts=None if parts is None else _int(parts, 0))
     return st.payload(seen=_int(one("seen"), 0))
 
 
 def asset_for(path: str, token: str = ""):
     """(body bytes, content type) for a published holo path, or None when the
-    path is not one of the five known files or the file is missing. The page
+    path is not one of the known files or the file is missing. The page
     gets the web-interface token baked in, exactly like the dashboard."""
     spec = _ASSETS.get(path)
     if spec is None:
@@ -195,3 +222,229 @@ def asset_for(path: str, token: str = ""):
         tok = json.dumps(token or "").replace("</", "<\\/")
         data = data.decode("utf-8").replace(_TOKEN_SLOT, tok, 1).encode("utf-8")
     return data, ctype
+
+
+# ---------------------------------------------------------------------------
+# the owner's own models
+# ---------------------------------------------------------------------------
+def _cfg(name: str, default):
+    try:
+        from core import config as _c
+        return getattr(_c, name, default)
+    except Exception:
+        return default
+
+
+def model_max_bytes(max_mb=None) -> int:
+    """The size cap in bytes (HOLO_MODEL_MAX_MB, default 64)."""
+    mb = _cfg("HOLO_MODEL_MAX_MB", DEFAULT_MODEL_MAX_MB) if max_mb is None else max_mb
+    try:
+        mb = float(mb)
+    except (TypeError, ValueError):
+        mb = DEFAULT_MODEL_MAX_MB
+    if mb <= 0:
+        mb = DEFAULT_MODEL_MAX_MB
+    return int(mb * 1024 * 1024)
+
+
+def model_dirs(extra=None, builtin=None, create: bool = True) -> list:
+    """The folders models are searched in, as real (resolved) paths: the built-in
+    ``data/holo_models`` (created lazily) first, then HOLO_MODEL_DIRS. Folders
+    that do not exist are skipped; duplicates collapse."""
+    if extra is None:
+        extra = _cfg("HOLO_MODEL_DIRS", [])
+    if isinstance(extra, (str, os.PathLike)):
+        extra = [extra]
+    bi = BUILTIN_MODEL_DIR if builtin is None else builtin
+    if create and bi:
+        try:
+            os.makedirs(bi, exist_ok=True)
+        except OSError:
+            pass
+    out, seen = [], set()
+    for d in [bi] + list(extra or []):
+        if not isinstance(d, (str, os.PathLike)) or not str(d).strip():
+            continue
+        try:
+            real = os.path.realpath(os.path.expanduser(str(d)))
+        except (OSError, ValueError):
+            continue
+        key = os.path.normcase(real)
+        if key in seen or not os.path.isdir(real):
+            continue
+        seen.add(key)
+        out.append(real)
+    return out
+
+
+def _inside(real_path: str, real_root: str) -> bool:
+    try:
+        rp, rr = os.path.normcase(real_path), os.path.normcase(real_root)
+        return os.path.commonpath([rp, rr]) == rr and rp != rr
+    except ValueError:                      # different drives
+        return False
+
+
+def model_id_for(real_path: str) -> str:
+    """Stable id: the same file always gets the same id."""
+    key = os.path.normcase(os.path.realpath(real_path))
+    return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def display_name(filename: str) -> str:
+    """'Tiger_Pendant-FAST.3mf' -> 'Tiger Pendant-FAST'."""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    stem = " ".join(stem.replace("_", " ").split())
+    return stem[:60] or "model"
+
+
+def _scan(dirs, max_bytes: int) -> list:
+    """Every model file under ``dirs`` (at most MODEL_MAX_DEPTH folders deep),
+    as dicts with the real path and a ``too_big`` flag. Order is stable."""
+    found = []
+
+    def walk(root, cur, depth):
+        try:
+            with os.scandir(cur) as it:
+                entries = sorted(it, key=lambda e: e.name.lower())
+        except OSError:
+            return
+        for e in entries:
+            if len(found) >= MODEL_MAX_FILES:
+                return
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if depth < MODEL_MAX_DEPTH:
+                        walk(root, e.path, depth + 1)
+                    continue
+                ext = os.path.splitext(e.name)[1].lower()
+                kind = MODEL_EXTS.get(ext)
+                if kind is None or not e.is_file():
+                    continue
+                real = os.path.realpath(e.path)
+                if not _inside(real, root):         # a link pointing outside
+                    continue
+                size = os.path.getsize(real)
+            except OSError:
+                continue
+            if size <= 0:
+                continue
+            found.append({"id": model_id_for(real), "name": display_name(e.name),
+                          "type": kind, "size": size, "path": real,
+                          "too_big": size > max_bytes})
+
+    for root in dirs:
+        walk(root, root, 0)
+    seen, out = set(), []
+    for m in found:                                  # one entry per real file
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            out.append(m)
+    return out
+
+
+def list_models(extra_dirs=None, builtin_dir=None, max_mb=None) -> list:
+    """The models the page and the voice can show: [{id, name, type, size}],
+    sorted by name (3MF before STL before OBJ for the same name). Files over
+    the size cap are left out."""
+    cap = model_max_bytes(max_mb)
+    order = {"3mf": 0, "stl": 1, "obj": 2}
+    rows = [m for m in _scan(model_dirs(extra_dirs, builtin_dir), cap)
+            if not m["too_big"]]
+    rows.sort(key=lambda m: (m["name"].lower(), order.get(m["type"], 9), m["id"]))
+    return [{"id": m["id"], "name": m["name"], "type": m["type"], "size": m["size"]}
+            for m in rows]
+
+
+def models_payload(extra_dirs=None, builtin_dir=None, max_mb=None) -> dict:
+    """The body of GET /api/holo/models."""
+    return {"models": list_models(extra_dirs, builtin_dir, max_mb),
+            "max_mb": round(model_max_bytes(max_mb) / (1024 * 1024), 1),
+            "folder": "data/holo_models"}
+
+
+def model_response(model_id: str, extra_dirs=None, builtin_dir=None, max_mb=None):
+    """(status, body, content type) for GET /holo/model/<id>. ``body`` is the
+    file's bytes on 200, else a small dict for the JSON error. The id is only
+    ever looked up in a fresh scan of the configured folders; nothing from the
+    URL becomes a path. 404 for an unknown id, 413 over the size cap."""
+    if not isinstance(model_id, str) or not _MODEL_ID_RE.match(model_id):
+        return 404, {"error": "not found"}, "application/json"
+    cap = model_max_bytes(max_mb)
+    dirs = model_dirs(extra_dirs, builtin_dir, create=False)
+    hit = next((m for m in _scan(dirs, cap) if m["id"] == model_id), None)
+    if hit is None:
+        return 404, {"error": "not found"}, "application/json"
+    real = os.path.realpath(hit["path"])
+    if (not any(_inside(real, d) for d in dirs)
+            or os.path.splitext(real)[1].lower() not in MODEL_EXTS):
+        return 404, {"error": "not found"}, "application/json"
+    if hit["too_big"]:
+        return 413, {"error": "model is over the size cap",
+                     "max_mb": round(cap / (1024 * 1024), 1)}, "application/json"
+    try:
+        with open(real, "rb") as fh:
+            if os.fstat(fh.fileno()).st_size > cap:
+                return 413, {"error": "model is over the size cap"}, "application/json"
+            data = fh.read(cap + 1)
+    except OSError:
+        return 404, {"error": "not found"}, "application/json"
+    if len(data) > cap:
+        return 413, {"error": "model is over the size cap"}, "application/json"
+    return 200, data, MODEL_CONTENT_TYPES[hit["type"]]
+
+
+# -- fuzzy name matching (the voice: "show me the tiger pendant") ----------------
+_FILLER = frozenset(("the", "a", "an", "my", "of", "model", "file"))
+
+
+def _words(text: str) -> list:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).split()
+
+
+def _spoken_words(text: str) -> list:
+    """Like _words, minus filler a speaker adds ("the tiger model")."""
+    w = [x for x in _words(text) if x not in _FILLER]
+    return w or _words(text)
+
+
+def _word_sim(q: str, n: str) -> float:
+    if q == n:
+        return 1.0
+    if len(q) >= 3 and n.startswith(q):
+        return 0.95
+    r = difflib.SequenceMatcher(None, q, n).ratio()
+    return r if r >= 0.75 else 0.0
+
+
+def match_score(query: str, name: str) -> float:
+    """0..1 - how well a spoken name fits a model name."""
+    q, n = _spoken_words(query), _words(name)
+    if not q or not n:
+        return 0.0
+    if q == n:
+        return 1.0
+    sims = [max(_word_sim(w, x) for x in n) for w in q]
+    best = 0.0
+    if all(s > 0 for s in sims):
+        covered = {x for w in q for x in n if _word_sim(w, x) > 0}
+        best = 0.6 * (sum(sims) / len(sims)) + 0.4 * (len(covered) / len(n))
+    whole = difflib.SequenceMatcher(None, " ".join(q), " ".join(n)).ratio()
+    if whole >= 0.8:
+        best = max(best, whole)
+    return best
+
+
+def match_model(query: str, entries, threshold: float = 0.55):
+    """The best entry (a dict with a ``name``) for a spoken name, or None.
+    Ties go to the 3MF (it has parts), then the shorter name."""
+    order = {"3mf": 0, "stl": 1, "obj": 2}
+    best, best_key = None, None
+    for e in entries or []:
+        sc = match_score(query, e.get("name", ""))
+        if sc < threshold:
+            continue
+        key = (-round(sc, 3), order.get(e.get("type"), 9), len(e.get("name", "")))
+        if best_key is None or key < best_key:
+            best, best_key = e, key
+    return best
