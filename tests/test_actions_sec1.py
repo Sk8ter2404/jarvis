@@ -77,7 +77,11 @@ class OpenUrlTests(unittest.TestCase):
         # 2026-10-05: a bounded poll (A._OPEN_POLL_S) instead of a blind 3 s
         # sleep - and with nothing new coming to the front it gives up after
         # A._OPEN_NOTHING_NEW_S, well inside A._OPEN_WAIT_S.
+        # _loaded_bc -> None: with the monolith loaded (a full-suite pass) the
+        # launch also starts the window-placement daemon, whose own polling
+        # sleeps would land in this patched time.sleep.
         with mock.patch.object(A.webbrowser, "open"), \
+                mock.patch.object(A, "_loaded_bc", return_value=None), \
                 mock.patch.object(A.time, "sleep") as msleep:
             out = A._act_open_url("example.com")
         self.assertTrue(msleep.call_args_list)
