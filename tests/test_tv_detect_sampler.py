@@ -44,6 +44,10 @@ class _Base(_SkillBase):
         printed log."""
         step = step or (mod.POLL_MIN_INTERVAL_S + 0.01)
         clock = [1000.0]
+        # The decider stamps readings with the wall clock: advance it with the
+        # monotonic one (from real now, so the readings stay fresh afterwards)
+        # so the verdict dwell can expire inside one drive.
+        wall0 = mod.time.time()
         feed = list(frames)
         stop = mock.MagicMock()
         n = [0]
@@ -63,6 +67,8 @@ class _Base(_SkillBase):
         self._set_frame(bc, 0, feed[0])
         buf = io.StringIO()
         with mock.patch.object(mod.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(mod.time, "time",
+                                  lambda: wall0 + (clock[0] - 1000.0)), \
                 contextlib.redirect_stdout(buf):
             mod._sampler_loop(stop)
         return buf.getvalue()
@@ -74,7 +80,7 @@ class SamplerFeedsTheDecider(_Base):
         self._patch_flag(True)
         bc = self._fake_bc({0: _bright_noisy_frame(seed=0)})
         log = self._drive(mod, bc, [_bright_noisy_frame(seed=i)
-                                    for i in range(td.ON_QUALIFYING_FRAMES + 3)])
+                                    for i in range(td.WHOLE_FRAME_ON_FRAMES + 3)])
         self.assertTrue(mod.is_tv_on())
         self.assertEqual(log.count("[tv-detect] TV ON"), 1, log)
         self.assertIn("luma", log)
@@ -85,8 +91,10 @@ class SamplerFeedsTheDecider(_Base):
         mod = self._load()
         self._patch_flag(True)
         bc = self._fake_bc({0: _bright_noisy_frame(seed=0)})
-        frames = ([_bright_noisy_frame(seed=i) for i in range(6)]
-                  + [_dark_static_frame()] * 8)
+        frames = ([_bright_noisy_frame(seed=i)
+                   for i in range(td.WHOLE_FRAME_ON_FRAMES + 2)]
+                  + [_dark_static_frame()] * (td.WHOLE_FRAME_WINDOW
+                                              + int(td.VERDICT_MIN_DWELL_S) + 2))
         log = self._drive(mod, bc, frames)
         self.assertFalse(mod.is_tv_on())
         self.assertEqual(log.count("[tv-detect] TV ON"), 1, log)
@@ -253,7 +261,7 @@ class StatusAndSeams(_Base):
         clock = [1000.0]
         with mock.patch.object(mod.time, "monotonic", lambda: clock[0]), \
                 contextlib.redirect_stdout(io.StringIO()):
-            for i in range(td.ON_QUALIFYING_FRAMES + 2):
+            for i in range(td.WHOLE_FRAME_ON_FRAMES + 2):
                 self._set_frame(bc, 0, _bright_noisy_frame(seed=i + 1))
                 clock[0] += 1.1
                 mod._poll_once()

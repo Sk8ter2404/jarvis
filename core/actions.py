@@ -6108,7 +6108,12 @@ def _split_monitor_args(args: str, monitor_first: bool) -> "tuple[str | None, st
     return key, other
 
 
-_YOUTUBE_SEARCH_RE = re.compile(r"^(?:youtube|you tube)\s+(?:for\s+)?(.+)$", re.IGNORECASE)
+# The separator may be a comma or colon: the brain writes the youtube ACTION's
+# own syntax inside open_on_monitor (live 2026-10-15 21:45: "left | youtube,
+# lo-fi hip hop radio" missed the old whitespace-only form and Windows was
+# asked to run a program called "youtube, lo-fi hip hop radio").
+_YOUTUBE_SEARCH_RE = re.compile(
+    r"^(?:youtube|you tube)(?:\s*[,:]\s*|\s+)(?:for\s+)?(.+)$", re.IGNORECASE)
 
 
 # Seconds open_on_monitor waits for a fresh window whose title MATCHES the

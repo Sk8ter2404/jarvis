@@ -205,6 +205,40 @@ class PlayPlaylistTests(unittest.TestCase):
             out = M.play_playlist("road trip")
         self.assertIn("iTunes isn't running", out)
 
+    # Live 2026-10-15 21:20: "shuffle Skrillex" -> play_playlist -> Apple
+    # Music had no playlist by that name -> nothing played. A name the owner
+    # never called a playlist is then played as a music request.
+    _NOT_FOUND = ("opened Apple Music Library > Playlists, but couldn't find a "
+                  "playlist named 'Skrillex' — you may need to scroll to it")
+
+    def test_no_such_playlist_plays_the_name_as_music(self):
+        with _patch_client(None, "iTunes isn't running, sir."), \
+                mock.patch.object(M, "_apple_music_fallback",
+                                  return_value=self._NOT_FOUND), \
+                mock.patch.object(M, "_play_as_music_request",
+                                  return_value="playing 'Skrillex' on Apple Music") as pm:
+            out = M.play_playlist("shuffle Skrillex")
+        pm.assert_called_once_with("Skrillex")
+        self.assertIn("no playlist called 'Skrillex'", out)
+        self.assertIn("playing 'Skrillex' on Apple Music", out)
+
+    def test_asked_for_a_playlist_stays_an_honest_not_found(self):
+        with _patch_client(None, "iTunes isn't running, sir."), \
+                mock.patch.object(M, "_apple_music_fallback",
+                                  return_value=self._NOT_FOUND), \
+                mock.patch.object(M, "_play_as_music_request") as pm:
+            out = M.play_playlist("my Skrillex playlist")
+        pm.assert_not_called()
+        self.assertEqual(out, self._NOT_FOUND)
+
+    def test_music_fallback_unreachable_keeps_the_not_found_line(self):
+        with _patch_client(None, "iTunes isn't running, sir."), \
+                mock.patch.object(M, "_apple_music_fallback",
+                                  return_value=self._NOT_FOUND), \
+                mock.patch.object(M, "_play_as_music_request", return_value=None):
+            out = M.play_playlist("shuffle Skrillex")
+        self.assertEqual(out, self._NOT_FOUND)
+
     def test_play_error_is_graceful(self):
         boom = _ExplodingPlaylist("Boom", kind=2, special=0)
         with _patch_client(_FakeApp([boom])):

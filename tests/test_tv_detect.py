@@ -332,7 +332,8 @@ class IsTvOnTests(_SkillBase):
         clock = [1000.0]
         with mock.patch.object(mod.time, "monotonic", lambda: clock[0]):
             result = False
-            for i in range(td.ON_QUALIFYING_FRAMES + 2):
+            # Uncalibrated -> the sustained whole-frame profile (2026-10-15).
+            for i in range(td.WHOLE_FRAME_ON_FRAMES + 2):
                 self._set_frame(bc, 0, _bright_noisy_frame(seed=i + 1))
                 clock[0] += mod.POLL_MIN_INTERVAL_S + 0.01
                 result = mod.is_tv_on()
@@ -383,7 +384,7 @@ class IsTvOnTests(_SkillBase):
         clock = [4000.0]
         with mock.patch.object(mod.time, "monotonic", lambda: clock[0]):
             result = False
-            for i in range(td.ON_QUALIFYING_FRAMES + 2):
+            for i in range(td.WHOLE_FRAME_ON_FRAMES + 2):
                 self._set_frame(bc, 0, _bright_noisy_frame(seed=i + 1))
                 clock[0] += mod.POLL_MIN_INTERVAL_S + 0.01
                 result = mod.is_tv_on()

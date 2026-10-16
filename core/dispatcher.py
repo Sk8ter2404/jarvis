@@ -174,6 +174,72 @@ def youtube_play_route(utterance) -> str | None:
         return None
 
 
+# ── The search action on a PLAY request (2026-10-15) ──────────────────────
+# Live 21:21:52 "Jarvis, play it on YouTube instead. It's broken on Apple
+# Music." - "it" keeps the request away from youtube_play_route (only the
+# model can resolve "it"), and the model, whose prompt that turn did not carry
+# the youtube / youtube_play grammar ("[router-miss] youtube indexed"), chose
+# the SEARCH action twice: the results page opened and nothing played. The
+# monolith's action runner asks THIS whether the turn's own words ask to PLAY;
+# if so a [ACTION: youtube, <X>] runs as youtube_play with the model's
+# resolved <X>. Asking to search / find / show / look stays a search, and so
+# does a reference to something already on screen (the screen route's job).
+_YT_PLAY_INTENT_RE = re.compile(
+    r"\b(?:play|plays|playing|put\b.*?\bon|listen\s+to|shuffle|start)\b",
+    re.IGNORECASE)
+_YT_SEARCH_INTENT_RE = re.compile(
+    r"\b(?:search|searches|searching|find|look\s+up|look\s+for|results?|"
+    r"show\s+me|pull\s+up|browse|list)\b", re.IGNORECASE)
+_YT_ONSCREEN_RE = re.compile(
+    r"\b(?:that|this)\s+(?:one|video|clip|song)\b|\bthe\s+one\s+(?:on|that)\b",
+    re.IGNORECASE)
+
+
+def youtube_search_means_play(utterance) -> bool:
+    """True when the owner's utterance asks to PLAY something and not to
+    search, so the model's ``youtube`` (search-only) action should run as
+    ``youtube_play``. Never raises; False on anything unexpected."""
+    try:
+        if not isinstance(utterance, str) or not utterance.strip():
+            return False
+        s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
+        if _YT_SEARCH_INTENT_RE.search(s) or _YT_ONSCREEN_RE.search(s):
+            return False
+        return bool(_YT_PLAY_INTENT_RE.search(s))
+    except Exception:
+        return False
+
+
+# ── "Delete / close that website" = the tab in front (2026-10-15) ─────────
+# Live 22:06:25 "Jarvis, delete that website." while a YouTube video played:
+# the model read "delete" as a click on a Delete BUTTON (click_on_screen,
+# delete), the send/delete hard stop asked for a yes, and "I give you
+# permission, go ahead and delete it" planned the same click again. The owner
+# meant the browser tab. The monolith closes the tab in FRONT through
+# close_window when THIS claims the whole utterance; anything longer ("delete
+# that website from my bookmarks") stays with the model.
+_CLOSE_TAB_RE = re.compile(
+    r"^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?"
+    r"(?:delete|remove|close|close\s+out|get\s+rid\s+of|kill|exit|shut)\s+"
+    r"(?:out\s+)?(?:of\s+)?(?:that|this|the)\s+(?:current\s+)?"
+    r"(?:website|web\s*site|site|web\s*page|page|tab)"
+    r"(?:\s+(?:please|for\s+me|now|already))?$", re.IGNORECASE)
+
+
+def close_front_tab_route(utterance) -> bool:
+    """True when the WHOLE utterance asks to delete / close "that website /
+    page / tab" - the browser tab in front. Never raises."""
+    try:
+        if not isinstance(utterance, str) or not utterance.strip():
+            return False
+        s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
+        s = _strip_lead_filler(s)
+        s = " ".join(_strip(s).split())
+        return bool(_CLOSE_TAB_RE.match(s))
+    except Exception:
+        return False
+
+
 # ── Screen routes (2026-10-05) ────────────────────────────────────────────
 # The monolith's _utterance_route_reply asks THIS first (before the YouTube
 # route): pure text over core.onscreen_refs, with the moment's state passed

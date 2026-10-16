@@ -167,6 +167,26 @@ class LedgerFeedTests(_Base):
         self.assertEqual((e.via, e.hwnd, e.kind, e.monitor),
                          ("open_on_monitor", 0x200, "window", "middle"))
 
+    def test_the_youtube_action_syntax_inside_open_on_monitor_is_a_search(self):
+        # Live 2026-10-15 21:45: "left | youtube, lo-fi hip hop radio" was
+        # launched as a PROGRAM (WinError 2). The comma form is a search.
+        new = _Win("results - YouTube" + SUFFIX, 0x201)
+        new.restore = new.moveTo = new.maximize = lambda *a: None
+        state = {"n": 0}
+
+        def _all():
+            state["n"] += 1
+            return [] if state["n"] == 1 else [new]
+        sys.modules["pygetwindow"].getAllWindows = _all
+        self.bc._open_url_new_window.return_value = True
+        with mock.patch.object(A, "_act_launch_app") as la, \
+                mock.patch.object(A.time, "time", _clock()):
+            A._act_open_on_monitor("main | youtube, lo-fi hip hop radio")
+        la.assert_not_called()
+        url = self.bc._open_url_new_window.call_args[0][0]
+        self.assertEqual(
+            url, "https://www.youtube.com/results?search_query=lo-fi+hip+hop+radio")
+
     def test_open_url_records_the_tab_that_came_to_the_front(self):
         before = (0x10, "Inbox - Mail", (0, 0, 800, 600))
         # The title names the site it opened (see _title_fits_url).

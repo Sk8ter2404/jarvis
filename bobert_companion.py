@@ -47,6 +47,13 @@ import codecs, os, sys, subprocess, threading, time
 # setdefault: an explicit environment choice wins.
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
+# No Hugging Face progress bars in the session log (2026-10-15): the session
+# log is a file, so every tqdm refresh of transformers' "Loading weights" bar
+# became its own line - about 400 per model load, ~15% of a day's log lines.
+# transformers ties its bars to this huggingface_hub switch; it must be set
+# before either library is imported. setdefault: an explicit choice wins.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 # Make stdout/stderr UTF-8 so JARVIS's non-ASCII output (─, ≥, →, em-dashes,
 # etc.) never raises UnicodeEncodeError on a legacy cp1252 Windows console — a
 # tester may run `python bobert_companion.py` in a raw console rather than the
@@ -30963,6 +30970,26 @@ def _streaming_apply_play_strategy(
         # only selects a song row, a double-click starts it playing.
         ui_double_click(row_coords[0], row_coords[1])
         return True, f"double-clicked highlighted track row at {row_coords}"
+    if strategy == "track_row_or_play":
+        # A FRESH resolved track page (2026-10-15, live 21:21: vision never
+        # found the highlighted row, the plan held only that and "recheck",
+        # so nothing ever pressed play - "couldn't confirm it after 4
+        # attempts"). The row first (the specific song); else the page's big
+        # Play button (its album, from the top); else SPACE - safe ONLY
+        # because this page was just opened and is never already playing,
+        # and only when playback can be confirmed (NEVER TOGGLE BLIND).
+        ok, desc = _streaming_apply_play_strategy(
+            "highlighted_row", cfg, result_coords)
+        if ok:
+            return ok, desc
+        ok2, desc2 = _streaming_apply_play_strategy(
+            "play_button", cfg, result_coords)
+        if ok2:
+            return True, f"{desc2} (the song's row wasn't visible)"
+        if not _streaming_confirmation_possible(cfg):
+            return False, f"{desc}; {desc2}"
+        ok3, desc3 = _streaming_apply_play_strategy("space", cfg, result_coords)
+        return ok3, f"{desc3} (neither the song's row nor a play button was visible)"
     if strategy == "play_button":
         play_coords = _streaming_find_with_retry(
             cfg["play_hint"], attempts=2, wait_between=1.5, monitor=vm
@@ -31559,7 +31586,10 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
             # the slow vision-confirm caught up. So: double-click ONCE, then
             # just WAIT+recheck (no re-click) up to twice, and only re-click as
             # a last resort if it never confirms. Kills the restart flicker.
-            "play_strategies": ["highlighted_row", "recheck", "recheck", "highlighted_row"],
+            # The FIRST step falls back to the page's Play button, then SPACE
+            # (track_row_or_play, 2026-10-15): with the row alone, a row vision
+            # could not see meant nothing was ever pressed.
+            "play_strategies": ["track_row_or_play", "recheck", "recheck", "highlighted_row"],
             "verify_attempts": 4,
             "verify_wait": 3.5,
             # We just opened a FRESH track page (the reuse-one-tab close+open),
@@ -35770,6 +35800,19 @@ def _utterance_route_reply(text: str) -> "str | None":
     _scr_tok = _screen_route_reply(text)
     if _scr_tok:
         return _scr_tok
+    # "Delete / close that website" = the browser tab in FRONT (2026-10-15,
+    # live 22:06: the model clicked at a 'delete' button instead, twice).
+    # Only when the window in front IS a browser; else the model keeps it.
+    try:
+        from core.dispatcher import close_front_tab_route as _ct_route
+        if "close_window" in ACTIONS and _ct_route(text):
+            _page = _front_browser_page()
+            if _page:
+                print("  [route] close that website -> close_window "
+                      "(the tab in front)")
+                return f"[ACTION: close_window, {_page}]"
+    except Exception:
+        pass
     try:
         from core.dispatcher import youtube_play_route as _yt_route
         _yt_tok = _yt_route(text) if "youtube_play" in ACTIONS else None
@@ -41960,6 +42003,47 @@ def _click_alias(name: str, arg: str) -> str:
     return name
 
 
+def _front_browser_page() -> str | None:
+    """The page part of the FOREGROUND window's title when that window is a
+    browser ("Home - YouTube" for "Home - YouTube - Google Chrome"), made safe
+    as a close_window argument: no '[' / ']' (they would end the action
+    token) and nothing after a '|' (close_window reads "<title> | <monitor>";
+    the part before it still matches the tab). None otherwise. Never raises."""
+    try:
+        _h, title, _r = _read_focused_window()
+        t = _strip_bidi_and_nbsp(title or "")
+        low = t.lower()
+        for suf in _BROWSER_CHROME_SUFFIXES:
+            if low.endswith(suf):
+                page = t[: len(t) - len(suf)].split("|", 1)[0]
+                page = page.replace("[", " ").replace("]", " ")
+                page = " ".join(page.split())
+                return page or None
+    except Exception:
+        pass
+    return None
+
+
+def _youtube_play_alias(name: str, arg: str) -> str:
+    """``youtube_play`` for the model's YouTube SEARCH when this turn's own
+    words asked to PLAY (core.dispatcher.youtube_search_means_play; live
+    2026-10-15 21:21: "play it on YouTube instead" ran the search action
+    twice and nothing played). Only while "youtube" is still the built-in
+    search and youtube_play is registered. ``name`` otherwise. Never
+    raises."""
+    try:
+        if (name == "youtube" and arg and "youtube_play" in ACTIONS
+                and ACTIONS.get("youtube") is _act_youtube):
+            from core.dispatcher import youtube_search_means_play
+            if youtube_search_means_play(_last_user_text[0] or ""):
+                print("  [route] youtube search -> youtube_play "
+                      "(this turn asked to play it)")
+                return "youtube_play"
+    except Exception:
+        pass
+    return name
+
+
 # The actions a brain picks for "that video" when it does not know the
 # thing is already on screen (live 00:28:23: youtube_play).
 _ONSCREEN_REWRITE_ACTIONS = frozenset({"youtube_play", "youtube", "open_url",
@@ -42158,6 +42242,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         # (2026-10-05): find by name, guard, click, verify - spoken word for
         # word. A coordinate click stays the silent "click".
         name = _click_alias(name, arg)
+        name = _youtube_play_alias(name, arg)
         fn   = ACTIONS.get(name)
         _log_router_miss(name, fn is not None)
         if fn is None and _cmd_autocorrect is not None:

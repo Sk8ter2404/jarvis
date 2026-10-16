@@ -35,6 +35,14 @@ file is the live wiring around them:
   ("[tv-detect] TV ON (luma 118, motion 9.4, 4/5 frames)"). The thread only
   reads a cached array: it opens no camera and never blocks the voice loop.
 
+2026-10-15 - SUSTAINED EVIDENCE WHILE UNCALIBRATED
+  Uncalibrated, the detector watches the whole webcam view, where a person
+  moving at the desk looks like a playing screen for a few seconds at a time:
+  it flipped 513 times in 162 minutes. Until a TV rectangle is calibrated the
+  decider now asks for 12 of the last 15 readings and holds every verdict at
+  least 20 s (audio.tv_detect.decider_for); calibrating switches to the fast
+  3-of-5 window on the next reading.
+
 EVERYTHING is safe (mirrors skills/kinect_pointing.py):
   • Gated by core.config.TV_DETECT_ENABLED (default True since 2026-10-12), re-read each call so a
     Settings/voice toggle takes effect with no restart. With it off, is_tv_on()
@@ -161,8 +169,10 @@ _sampler_stop = [threading.Event()]
 
 
 def _get_decider():
-    """The module-level TVDecider, built lazily from the pure module. None if the
-    detector module isn't importable."""
+    """The module-level TVDecider, built lazily from the pure module for the
+    current calibration (audio.tv_detect.decider_for: a sustained whole-frame
+    profile until a TV rectangle is calibrated). None if the detector module
+    isn't importable."""
     global _decider
     if _decider is not None:
         return _decider
@@ -170,7 +180,14 @@ def _get_decider():
     if td is None:
         return None
     try:
-        _decider = td.TVDecider()
+        store = _store()
+        calibrated = False
+        if store is not None:
+            try:
+                calibrated = bool(store.is_calibrated())
+            except Exception:
+                calibrated = False
+        _decider = td.decider_for(calibrated)
     except Exception:
         _decider = None
     return _decider
@@ -457,11 +474,14 @@ def calibrate_tv_region(_: str = "") -> str:
     if not store.put_region(0.0, 0.0, 1.0, 1.0):
         return ("I saw the camera, sir, but couldn't save the TV region to disk.")
     # A fresh region invalidates the rolling history (it was measuring the old
-    # crop) — reset so the next readings build evidence on the new region.
+    # crop) and changes the profile (a calibrated crop gets the fast window) —
+    # drop the decider so the next reading builds a new one on the new region.
+    global _decider
     with _decider_lock:
-        d = _get_decider()
-        if d is not None:
-            d.reset()
+        if _decider is not None:
+            _decider.reset()
+        _decider = None
+        _verdict_logged[0] = False
         _prev_frame[0] = None
         _last_poll[0] = 0.0
     return ("Calibrated, sir — I'll watch the whole camera view for a lit, "

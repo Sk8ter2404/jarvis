@@ -752,8 +752,42 @@ def _act_play_unheard(arg: str = "") -> str:
         return f"unheard search failed: {e}"
 
 
+# Words a vibe request may carry besides a day / part of day ("play my usual
+# friday night vibe"). Anything else is a NAME (2026-10-15).
+_VIBE_FILLER = frozenset({
+    "now", "current", "today", "my", "usual", "the", "a", "an", "some",
+    "something", "music", "song", "songs", "vibe", "vibes", "play", "put",
+    "on", "for", "in", "this", "it", "me", "us", "of", "to", "please",
+    "kind", "type", "mood", "regular", "normal", "typical", "like",
+})
+
+
+def _vibe_request_names_music(arg: str) -> bool:
+    """True when `arg` carries words that are not a day, a part of day or
+    vibe filler - a song / artist / album name the brain routed here, e.g.
+    'bad girl' (live 2026-10-15: play_vibe answered 'no strong Thursday
+    evening pattern yet' to a request for one specific song)."""
+    tokens = [t for t in re.split(r"[\s,_\-]+", (arg or "").lower().strip()) if t]
+    return any(t not in _DAYS and t not in _DAY_ALIASES and t not in _PARTS
+               and t not in _VIBE_FILLER for t in tokens)
+
+
 def _act_play_vibe(arg: str = "") -> str:
-    """Play the dominant artist for a given (day, part-of-day) slot."""
+    """Play the dominant artist for a given (day, part-of-day) slot. An
+    argument that names music instead of a slot is played as that request
+    (the play_music action), never answered with a slot pattern."""
+    if _vibe_request_names_music(arg):
+        bc = _bobert()
+        play = getattr(bc, "_act_play_music", None) if bc is not None else None
+        if play is None:
+            try:
+                from core.actions import _act_play_music as play
+            except Exception:
+                play = None
+        if play is not None:
+            print(f"  [vibe] '{arg.strip()[:60]}' names music, not a time "
+                  f"slot - playing it as a request")
+            return play(arg.strip())
     day, part = _parse_vibe_slot(arg)
     top = _top_artist_for_slot(day, part)
     if top is None:

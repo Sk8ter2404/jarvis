@@ -112,6 +112,26 @@ READING_MAX_AGE_S = 8.0
 # on thin evidence). One frame alone also can't produce a temporal delta.
 MIN_FRAMES_FOR_DECISION = 2
 
+# Whole-frame (uncalibrated) profile + verdict dwell (2026-10-15). The live
+# log showed an uncalibrated detector flipping 513 times in 162 minutes
+# (median 10 s apart, luma flat at ~68, motion swinging 3-16): over the WHOLE
+# webcam view a person moving at the desk reads as "bright and changing" for
+# a few seconds at a time, which the 3-of-5 window turned into TV ON / TV OFF
+# every few seconds - and a clap counted as TV motion, holding off the
+# double-clap. A playing screen changes continuously and a person in bursts,
+# so with no calibrated TV rectangle the decider asks for SUSTAINED evidence
+# (12 of the last 15 one-second readings), and any verdict holds at least
+# VERDICT_MIN_DWELL_S before it may flip back. A calibrated region keeps the
+# fast 3-of-5 window (the crop already leaves the room out) plus the dwell.
+WHOLE_FRAME_WINDOW = 15
+WHOLE_FRAME_ON_FRAMES = 12
+WHOLE_FRAME_OFF_FRAMES = 4
+# The window spans ~15 s at one reading a second, so readings must stay
+# fresh that long (the live skill still records a frozen camera as
+# non-qualifying readings, so this cannot latch a stale verdict).
+WHOLE_FRAME_MAX_AGE_S = 20.0
+VERDICT_MIN_DWELL_S = 20.0
+
 
 # ─── per-frame statistics (pure; numpy only — NO cv2) ──────────────────────
 def _as_luma(frame: Any) -> "Optional[_np.ndarray]":
@@ -240,15 +260,20 @@ class TVDecider:
                  off_frames: int = OFF_QUALIFYING_FRAMES,
                  max_age_s: float = READING_MAX_AGE_S,
                  bright_min: float = BRIGHTNESS_ON_MIN,
-                 delta_min: float = TEMPORAL_DELTA_ON_MIN) -> None:
+                 delta_min: float = TEMPORAL_DELTA_ON_MIN,
+                 min_dwell_s: float = 0.0) -> None:
         self.window = max(1, int(window))
         self.on_frames = max(1, int(on_frames))
         self.off_frames = max(0, int(off_frames))
         self.max_age_s = float(max_age_s)
         self.bright_min = float(bright_min)
         self.delta_min = float(delta_min)
+        # A verdict holds at least this long before the evidence may flip it
+        # back (0 = no hold). Losing the camera still drops to OFF at once.
+        self.min_dwell_s = max(0.0, float(min_dwell_s))
         self._readings: list[tuple[bool, float]] = []   # (qualifies, ts)
         self._on = False
+        self._changed_at: Optional[float] = None   # ts of the last flip
 
     def observe(self, brightness: Optional[float],
                 temporal_delta: Optional[float],
@@ -273,16 +298,27 @@ class TVDecider:
     def _reevaluate(self, now: float) -> None:
         fresh = self._fresh(now)
         if len(fresh) < MIN_FRAMES_FOR_DECISION:
-            # Not enough recent evidence to assert anything — fail safe to OFF.
+            # Not enough recent evidence to assert anything — fail safe to OFF
+            # (the dwell never holds a verdict the camera can't back).
+            if self._on:
+                self._changed_at = now
             self._on = False
             return
         qualifying = sum(1 for q in fresh if q)
+        want = self._on
         if not self._on:
             if qualifying >= self.on_frames:
-                self._on = True
+                want = True
         else:
             if qualifying <= self.off_frames:
-                self._on = False
+                want = False
+        if want == self._on:
+            return
+        if (self.min_dwell_s > 0.0 and self._changed_at is not None
+                and (now - self._changed_at) < self.min_dwell_s):
+            return                  # flipped too recently: hold the verdict
+        self._on = want
+        self._changed_at = now
 
     def is_on(self, now: Optional[float] = None) -> bool:
         """The current latched verdict. Passing ``now`` lets a caller (or test)
@@ -295,6 +331,7 @@ class TVDecider:
     def reset(self) -> None:
         self._readings.clear()
         self._on = False
+        self._changed_at = None
 
     def debug_state(self, now: Optional[float] = None) -> dict:
         """A small dict of the current evidence — for status reporting / logs."""
@@ -307,7 +344,22 @@ class TVDecider:
             "window": self.window,
             "on_frames": self.on_frames,
             "off_frames": self.off_frames,
+            "min_dwell_s": self.min_dwell_s,
         }
+
+
+def decider_for(calibrated: bool) -> TVDecider:
+    """The live decider for the current calibration: the fast 3-of-5 window
+    when a TV rectangle is calibrated, the sustained whole-frame profile when
+    the detector watches the whole camera view; both hold a verdict for
+    VERDICT_MIN_DWELL_S (see WHOLE_FRAME_WINDOW for why)."""
+    if calibrated:
+        return TVDecider(min_dwell_s=VERDICT_MIN_DWELL_S)
+    return TVDecider(window=WHOLE_FRAME_WINDOW,
+                     on_frames=WHOLE_FRAME_ON_FRAMES,
+                     off_frames=WHOLE_FRAME_OFF_FRAMES,
+                     max_age_s=WHOLE_FRAME_MAX_AGE_S,
+                     min_dwell_s=VERDICT_MIN_DWELL_S)
 
 
 # ─── calibration store (gitignored json, atomic write) ─────────────────────

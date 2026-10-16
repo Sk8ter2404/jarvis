@@ -1040,6 +1040,24 @@ class AppleMusicDataTests(unittest.TestCase):
             out = self.actions["play_vibe"]("friday evening")
         self.assertIn("can't reach a player", out)
 
+    # 2026-10-15 live: play_vibe got a SONG name and answered "I don't have a
+    # strong thursday evening pattern yet". A name is played as a request.
+    def test_play_vibe_with_a_song_name_plays_that_request(self):
+        bc = mock.MagicMock()
+        bc._act_play_music.return_value = "Playing Bad Girl on Apple Music, sir."
+        with mock.patch.object(self.mod, "_bobert", return_value=bc):
+            out = self.actions["play_vibe"]("bad girl")
+        bc._act_play_music.assert_called_once_with("bad girl")
+        self.assertNotIn("pattern", out)
+        self.assertIn("Bad Girl", out)
+
+    def test_slot_words_and_filler_are_not_a_song_name(self):
+        for arg in ("", "now", "friday night", "my usual friday evening vibe",
+                    "something for the morning", "tues breakfast", "tonight"):
+            self.assertFalse(self.mod._vibe_request_names_music(arg), arg)
+        for arg in ("bad girl", "skrillex", "friday night lights"):
+            self.assertTrue(self.mod._vibe_request_names_music(arg), arg)
+
     # ── skip_track ───────────────────────────────────────────────────────
     def test_skip_track_records_and_skips_media_key(self):
         # No current track; sampling returns one. media_next is the fallback.

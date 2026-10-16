@@ -32,6 +32,7 @@ exception that could crash the action dispatcher.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 from audio import itunes_bridge
@@ -133,6 +134,41 @@ def _apple_music_fallback(query: str) -> str | None:
     return None
 
 
+# The apple_music playlist flow's "no such playlist in your library" line.
+_PLAYLIST_NOT_FOUND_RE = re.compile(r"couldn.t find a playlist", re.IGNORECASE)
+
+
+def _play_as_music_request(query: str) -> str | None:
+    """The monolith's `play_music` action for `query` (song / artist /
+    album on Apple Music), or None when it isn't reachable. Never raises."""
+    try:
+        bc = sys.modules.get("__main__") or sys.modules.get("bobert_companion")
+        actions = getattr(bc, "ACTIONS", None)
+        if actions and "play_music" in actions:
+            result = actions["play_music"](query)
+            return result if isinstance(result, str) else None
+    except Exception:
+        return None
+    return None
+
+
+def _not_a_playlist_then_music(arg: str, name_q: str, fb: str | None) -> str | None:
+    """When the Apple Music fallback found NO playlist by that name and the
+    owner never said "playlist", the name was an artist / song: play it as a
+    music request (live 2026-10-15 21:20: "shuffle Skrillex" -> no playlist
+    named 'Skrillex' -> a Google search, and nothing played). None when that
+    does not apply or play_music is unreachable."""
+    if not fb or not _PLAYLIST_NOT_FOUND_RE.search(fb):
+        return None
+    if "playlist" in (arg or "").lower():
+        return None                      # he asked for a playlist: be honest
+    alt = _play_as_music_request(name_q)
+    if not alt:
+        return None
+    return (f"There's no playlist called '{name_q}' in your library, sir, "
+            f"so I played it as music instead: {alt}")
+
+
 def play_playlist(arg: str) -> str:
     name_q, shuffle = _strip_shuffle(arg)
     if not name_q:
@@ -151,6 +187,9 @@ def play_playlist(arg: str) -> str:
         # from its big Play OR Shuffle button (whichever vision finds), so on
         # this route shuffle is best-effort; the right playlist is not.
         fb = _apple_music_fallback(name_q + " playlist")
+        alt = _not_a_playlist_then_music(arg, name_q, fb)
+        if alt:
+            return alt
         if fb:
             return fb
         return err or "iTunes isn't reachable right now, sir."
@@ -165,6 +204,9 @@ def play_playlist(arg: str) -> str:
         # "playlist" in the query so the search targets a playlist, not a song
         # - and END on it (no " shuffle"), see the branch above (2026-10-01).
         fb = _apple_music_fallback(name_q + " playlist")
+        alt = _not_a_playlist_then_music(arg, name_q, fb)
+        if alt:
+            return alt
         if fb:
             return fb
         return f"I couldn't find a playlist called '{name_q}', sir."

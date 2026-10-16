@@ -120,6 +120,35 @@ class CudaOrderTests(_Base):
         self.assertLess(setdefault_line, first_heavy)
 
 
+class NoHubProgressBarTests(_Base):
+    """2026-10-15: every refresh of transformers' 'Loading weights' bar was a
+    line in the session log (~400 per load). The switch must be on, and set
+    before any top-level import of the Hugging Face libraries."""
+
+    def test_progress_bars_are_off(self):
+        self.assertEqual(os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS"), "1")
+
+    def test_set_before_any_hugging_face_import(self):
+        path = inspect.getsourcefile(self.bc)
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        hf = ("transformers", "sentence_transformers", "huggingface_hub")
+        setdefault_line = first_hf = None
+        for node in tree.body:
+            src = ast.unparse(node)
+            if (setdefault_line is None and "HF_HUB_DISABLE_PROGRESS_BARS" in src
+                    and "setdefault" in src):
+                setdefault_line = node.lineno
+            names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                     else [node.module or ""] if isinstance(node, ast.ImportFrom)
+                     else [])
+            if first_hf is None and any(n.split(".")[0] in hf for n in names):
+                first_hf = node.lineno
+        self.assertIsNotNone(setdefault_line)
+        if first_hf is not None:
+            self.assertLess(setdefault_line, first_hf)
+
+
 class NoBrainCardContextTests(_Base):
     """Everything a session runs to place or probe a listening model, against
     a torch that records each CUDA context it would open and a Resemblyzer
