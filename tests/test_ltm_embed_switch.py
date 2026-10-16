@@ -865,7 +865,11 @@ class ReflectorTests(_SwitchBase):
         self.seed_legacy(("User has a dog", "User has a dog named Rex",
                           "User drinks tea"))
         self.switch_and_build()
-        with mock.patch.object(ltm, "_cosine_sim", lambda a, b: 0.99):
+        # Any model whose profile is NOT calibrated (voyage is since
+        # 2026-10-16): exact duplicates only.
+        with mock.patch.dict(ltm._EMBED_PROFILES["voyage-4-nano"],
+                             {"reflector_calibrated": False}), \
+                mock.patch.object(ltm, "_cosine_sim", lambda a, b: 0.99):
             summary = ltm.reflect_and_consolidate()
         self.assertEqual(summary["duplicates_removed"], 0)
         self.assertEqual(len(ltm._facts), 3)
@@ -876,6 +880,36 @@ class ReflectorTests(_SwitchBase):
         with mock.patch.object(ltm, "_cosine_sim", lambda a, b: 0.99):
             summary = ltm.reflect_and_consolidate()
         self.assertEqual(summary["duplicates_removed"], 1)
+
+    # 2026-10-16: voyage-4-nano carries its own calibrated thresholds.
+    def test_voyage_uses_its_own_duplicate_threshold(self):
+        self.seed_legacy(("User has a dog", "User has a dog named Rex"))
+        self.switch_and_build()
+        self.assertEqual(ltm._reflector_thresholds(), (0.97, 0.50))
+        # 0.95 would be a bge duplicate; on voyage it is a related fact.
+        with mock.patch.object(ltm, "_cosine_sim", lambda a, b: 0.95):
+            summary = ltm.reflect_and_consolidate()
+        self.assertEqual(summary["duplicates_removed"], 0)
+        self.assertEqual(len(ltm._facts), 2)
+        with mock.patch.object(ltm, "_cosine_sim", lambda a, b: 0.975):
+            summary = ltm.reflect_and_consolidate()
+        self.assertEqual(summary["duplicates_removed"], 1)
+
+    def test_voyage_contradiction_band_reaches_the_adjudicator(self):
+        self.seed_legacy(("User has a dog", "User has a cat"))
+        self.switch_and_build()
+        asked = []
+        llm = lambda prompt, msgs: (asked.append(msgs), "KEEP")[1]
+        # 0.55: below bge's 0.6 band, inside voyage's 0.50 one.
+        with mock.patch.object(ltm, "_cosine_sim", lambda a, b: 0.55):
+            ltm.reflect_and_consolidate(llm_call=llm)
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(len(ltm._facts), 2)        # KEEP: both stay
+
+    def test_the_default_model_reads_the_module_values_live(self):
+        with mock.patch.object(ltm, "REFLECTOR_DUP_SIM", 0.8), \
+                mock.patch.object(ltm, "REFLECTOR_CONTRA_MIN_SIM", 0.4):
+            self.assertEqual(ltm._reflector_thresholds(), (0.8, 0.4))
 
 
 if __name__ == "__main__":

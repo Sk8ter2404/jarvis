@@ -199,13 +199,22 @@ class SetupAndGateTests(_Base):
         self.assertIs(kw["gate_fn"], bc._clone_seed_gate)
         self.assertIs(kw["abort_fn"], bc._clone_seed_abort)
 
+    @staticmethod
+    def _long_ago(seconds):
+        """A monotonic stamp `seconds` ago, but never at or before boot:
+        Windows' time.monotonic() counts from boot, so in the first 15
+        minutes after a restart "now - 900" is <= 0, which the gate reads as
+        "booting" (2026-10-16: the suite ran 13 minutes after a Windows
+        Update restart and both seed-gate tests failed). The gate only needs
+        QUIET_S (60 s) of quiet."""
+        return max(time.monotonic() - seconds, 1e-3)
+
     def _quiet_room(self):
         bc = self.bc
-        now = time.monotonic()
         for name in ("_last_convo_activity", "_last_owner_turn_at",
                      "_last_owner_voice_at"):
-            self._p(bc, name, [now - 600.0])
-        self._p(bc, "_main_loop_started_at", [now - 900.0])
+            self._p(bc, name, [self._long_ago(600.0)])
+        self._p(bc, "_main_loop_started_at", [self._long_ago(900.0)])
         self._p(bc, "_turn_in_progress", [False])
         self._p(bc, "_utterance_in_progress", [False])
         self._p(bc, "_filler_on_device", [False])
@@ -231,13 +240,13 @@ class SetupAndGateTests(_Base):
             self.assertTrue(bc._clone_seed_abort())
         bc._last_owner_turn_at[0] = time.monotonic() - 10.0
         self.assertEqual(bc._clone_seed_gate(), "owner active")
-        bc._last_owner_turn_at[0] = time.monotonic() - 600.0
+        bc._last_owner_turn_at[0] = self._long_ago(600.0)
         self._p(bc, "last_speech_time", time.time() - 2.0)
         self.assertEqual(bc._clone_seed_gate(), "just spoke")
         self._p(bc, "last_speech_time", time.time() - 600.0)
         bc._main_loop_started_at[0] = 0.0
         self.assertEqual(bc._clone_seed_gate(), "booting")
-        bc._main_loop_started_at[0] = time.monotonic() - 900.0
+        bc._main_loop_started_at[0] = self._long_ago(900.0)
         self.rest_clone()
         self.assertEqual(bc._clone_seed_gate(), "clone not speaking")
 

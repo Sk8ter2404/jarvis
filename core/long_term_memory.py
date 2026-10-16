@@ -155,6 +155,10 @@ HYBRID_SPARSE_W   = 1.0 - HYBRID_DENSE_W
 
 # Reflector tunables.
 REFLECTOR_DUP_SIM = 0.92    # cosine sim above which two facts are duplicates
+# Lower edge of the contradiction band [REFLECTOR_CONTRA_MIN_SIM, dup): pairs
+# this similar go to the LLM adjudicator. Both are bge-small values; another
+# embedder carries its own calibrated pair in its profile (2026-10-16).
+REFLECTOR_CONTRA_MIN_SIM = 0.6
 REFLECTOR_RUN_EVERY_TURNS = 50
 # Cap the O(n^2) pairwise dedupe so a large fact store doesn't stall the
 # reflector for seconds on every run. Above this many facts we only consider
@@ -222,10 +226,15 @@ _EMBED_PROFILES: dict[str, dict] = {
         # The A/B ran it on the CPU: no VRAM taken from the local brain. An
         # explicit LTM_EMBED_DEVICE still wins.
         "device":       "cpu",
-        # Its cosine range was never measured against REFLECTOR_DUP_SIM, and
-        # that threshold DELETES facts: until it is calibrated, the reflector
-        # removes exact duplicates only on this model.
-        "reflector_calibrated": False,
+        # Calibrated 2026-10-16 on the owner's 236 facts (all 27,730 pairs,
+        # both models, numbers only): voyage spreads wider than bge (median
+        # 0.43 vs 0.53, max 0.968 vs 0.914; rank correlation 0.63). No pair
+        # reached bge's 0.92, so bge deleted nothing; 0.97 keeps that (above
+        # every pair today) while a restatement of a fact still goes. The
+        # contradiction band's 0.6 is bge's 78th percentile, voyage's 0.50.
+        "reflector_calibrated": True,
+        "dup_sim":              0.97,
+        "contra_min_sim":       0.50,
     },
 }
 # Accepted spellings of MEMORY_EMBED_MODEL (compared lower-cased).
@@ -632,6 +641,18 @@ def _dims_ok(vec) -> bool:
         return len(vec) == _index_dim
     except Exception:
         return False
+
+
+def _reflector_thresholds() -> tuple[float, float]:
+    """(duplicate similarity, contradiction-band lower edge) for the live
+    index's model: its profile's calibrated pair, else the module values
+    (bge-small's), read live so a test or tuner that sets REFLECTOR_DUP_SIM
+    still governs the default model."""
+    prof = _EMBED_PROFILES.get(_index_profile_key) or {}
+    dup = prof.get("dup_sim")
+    lo = prof.get("contra_min_sim")
+    return (float(dup) if dup is not None else float(REFLECTOR_DUP_SIM),
+            float(lo) if lo is not None else float(REFLECTOR_CONTRA_MIN_SIM))
 
 
 def _reflector_semantic_ok() -> bool:
@@ -2086,7 +2107,8 @@ def reflect_and_consolidate(
                 _rebuild_bm25_locked()
         return summary
 
-    # ── pairwise scan
+    # ── pairwise scan (thresholds of the model that embedded `vecs`)
+    dup_sim, contra_min = _reflector_thresholds()
     to_delete: set[str] = set()
     reasons: dict[str, str] = {}    # fid -> why it is deleted (for the log)
     # Decisions for the sink: a condemned / merged-away fid -> the fid that
@@ -2112,7 +2134,7 @@ def reflect_and_consolidate(
                 continue
             sim = _cosine_sim(vecs[i], vecs[j])
             summary["checked_pairs"] += 1
-            if sim >= REFLECTOR_DUP_SIM:
+            if sim >= dup_sim:
                 # near-dup: drop the older one -- unless the older one is a
                 # trusted fact and the newer is not (2026-10-01): migrated and
                 # backfilled facts are ALWAYS the older side, and a newer
@@ -2136,7 +2158,7 @@ def reflect_and_consolidate(
                 if len(to_delete) > _before:
                     summary["duplicates_removed"] += 1
                 continue
-            if 0.6 <= sim < REFLECTOR_DUP_SIM and llm_call is not None:
+            if contra_min <= sim < dup_sim and llm_call is not None:
                 # Bound the per-run LLM work — beyond the cap, remaining
                 # mid-band pairs simply wait for a later run instead of
                 # stalling the serial ltm-queue worker. (2026-07-21 #39)
