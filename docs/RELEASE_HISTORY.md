@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.206 (2026-10-15)
+
+Test-only (no change to the running code): the last hardware-dependent test now fakes the Windows default microphone, so the full suite passes completely on this PC (25,111 of 25,111) - which the safe self-upgrade's gate needs.
+
 ## v2.0.205 (2026-10-15)
 
 Code health, no behaviour change: helper functions that existed as identical copies in several skills (window titles, sleep/standby checks, desk presence, Kinect bridge lookup, protected-data decryption, small text formatters, a JSON writer) now live once in shared modules, so a future fix lands everywhere at once.

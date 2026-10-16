@@ -4,9 +4,9 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.205
+- Version: v2.0.206
 - Live since: 2026-10-15
-- Latest change: v2.0.205 (10-15): shared helpers instead of copies (no behaviour change).
+- Latest change: v2.0.206 (10-15): the full test suite passes completely on this PC (test-only).
 
 ## In progress
 
@@ -60,6 +60,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.206 (2026-10-15): Test-only (no change to the running code): the last hardware-dependent test now fakes the Windows default microphone, so the full suite passes completely on this PC (25,111 of 25,111) - which the safe self-upgrade's gate needs.
 - v2.0.205 (2026-10-15): Code health, no behaviour change: helper functions that existed as identical copies in several skills (window titles, sleep/standby checks, desk presence, Kinect bridge lookup, protected-data decryption, small text formatters, a JSON writer) now live once in shared modules, so a future fix lands everywhere at once.
 - v2.0.204 (2026-10-15): Hologram phase 3, ready for a headset: a mixed-reality page (/holo/xr) for the Quest 3 browser with passthrough and the headset's own hand tracking - pinch to grab and move the reactor or your own models in 3D, two hands to scale and turn, pull apart to explode, clap to rebuild, pinch-and-hold a part for its name and size. It needs a secure address to run on the headset; until one is set up the page explains the two ways to get one, and 'open the hologram on the Quest' says the same.
 - v2.0.203 (2026-10-15): Hologram phase 2, off by default: 'open the hologram with the Kinect' uses the Kinect's colour camera for hand tracking and its depth sensor so the hologram hides behind your real hands when they are in front of it, and a fist pushed toward or pulled away from the sensor moves it nearer or farther. It reads the Kinect only through JARVIS's existing connection. A new test fails if any module ever defines the same function twice (a scan found no stale duplicates today).
@@ -69,6 +70,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.199 (2026-10-15): A hard stop before irreversible clicks: when screen control is about to click a button that sends, submits, posts, publishes, pays, buys, transfers, deletes or accepts terms - or press Enter in a message box that would send - it asks first and acts only on an explicit yes for that one action. The hologram can show your own 3D models (STL, 3MF, OBJ from chosen folders): a 3MF's objects become named parts that explode and show their size, and "show me the <model>" picks one by name. Model files are served only by id from the configured folders.
 - v2.0.198 (2026-10-14): Claude Code jobs can run on a second Claude subscription first. With a last-day date set, every Claude Code job JARVIS starts (upgrade loop, multi-agent pipeline, dry audit, overnight ideas) runs on a second Claude Code profile - its own sign-in folder - through that date, and on the main account whenever the second one is at its 5-hour or weekly limit, switching back when the limit resets. The sign-in stays inside Claude Code's own folder; JARVIS never reads or stores a token. The upgrade pipeline also recognises Claude Code's current limit wording again.
 - v2.0.197 (2026-10-14): Test tooling only (no change to the running code): the GitHub CI job's time limit goes from 20 to 40 minutes. The job runs the whole suite twice (plain, then with coverage) and had grown to the edge; v2.0.196's run passed its tests and was cut off mid-coverage at exactly 20 minutes.
-- v2.0.196 (2026-10-14): The point-and-flick gesture works at the webcam's real frame rate. Live on v2.0.195 the tracker got about 12 frames a second: the webcam can do 30 but slows itself in room light, and frames arrive in short bursts. The flick now adapts its time window to the measured frame rate (the speed and angle bar is unchanged, so jitter and slow swings still never count). 'Is hand tracking on' mentions when more light would help.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
