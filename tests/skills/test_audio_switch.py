@@ -1218,8 +1218,14 @@ class MicDeafSafetyTests(unittest.TestCase):
         reports honestly, and that the output half's exception still
         propagates to _run() unchanged rather than being swallowed."""
         sw = _mic_sw()
+        # default_capture() is pinned: unpinned it reads the REAL Windows default
+        # recording device through pycaw. On a PC where that works and is not the
+        # headset, the input half returns silently ("not the dead headset"),
+        # logs nothing, and the test failed for a reason unrelated to the code.
+        # None = "Windows would not name it", the honest path CI already takes.
         with mock.patch.object(A, "headset_powered", return_value=False), \
              mock.patch.object(A, "list_render", side_effect=RuntimeError("COM died")), \
+             mock.patch.object(A, "default_capture", return_value=None), \
              mock.patch.object(A, "set_default_capture") as setc, \
              mock.patch.object(A, "set_default_render") as setr, \
              mock.patch.object(A, "_log") as log:
