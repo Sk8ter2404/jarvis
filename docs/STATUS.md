@@ -6,7 +6,7 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 - Version: v2.0.208
 - Live since: 2026-10-16
-- Latest change: v2.0.208 (10-16): memory clean-up calibrated for the new search model.
+- Latest change: v2.0.209 (10-16): Kinect hand tracking no longer runs backwards (applies at the next restart).
 
 ## In progress
 
@@ -58,6 +58,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.209 (2026-10-16): Hand tracking on the Kinect no longer runs backwards: the Kinect's mirrored picture (and its depth map) is flipped back once before the hand tracker sees it.
 - v2.0.208 (2026-10-16): Memory clean-up calibrated for the new memory search model: duplicate and 'might contradict' checks use cut-offs measured on your own facts (0.97 / 0.50 on voyage-4-nano), so the contradiction check works again and nothing is deleted that the old model would have kept.
 - v2.0.207 (2026-10-15): Fixes from tonight's log review: playing an artist works again (no such playlist -> played as music; the Apple Music song page now presses its Play button or Space when the song row can't be seen; 'play it on YouTube' plays instead of only searching), 'YouTube, <search>' on a monitor no longer runs as a program, a song name sent to the vibe action is played, 'delete / close that website' closes the tab in front, the TV detector stops flickering on people moving at the desk (sustained evidence until a TV area is calibrated, 20 s hold), and no Hugging Face progress bars in the log.
 - v2.0.206 (2026-10-15): Test-only (no change to the running code): the last hardware-dependent test now fakes the Windows default microphone, so the full suite passes completely on this PC (25,111 of 25,111) - which the safe self-upgrade's gate needs.
@@ -67,6 +68,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.202 (2026-10-15): Fixes from the self-upgrade queue review: the local brain adopts a better model once it finishes downloading (checked at most every 5 minutes, between turns); turning the workshop hologram off hides it so 'on' brings it back; web pages opened by 'open', 'search' and 'YouTube' land on a monitor instead of off-screen; a stale memory note corrected. Three queued items were already fixed and one was not a bug.
 - v2.0.201 (2026-10-15): The self-upgrade is rebuilt to be safe (still switched off). It runs only when asked, in a separate git worktree off the published code, never touching or restarting the running JARVIS. The editing step cannot push, tag, merge or change data files; the planning and review steps are read-only. Each task is its own commit, a failing task is reverted, the full test suite and the privacy check run at the end, and the result is a branch plus a report for review - nothing ships without a normal release. Overnight ideas go to a proposals file, never straight into the work queue.
 - v2.0.200 (2026-10-15): Hand mouse (air mouse v2) on the new hand tracker, off by default: a deliberate pinch held still takes the cursor, a quick pinch clicks, a second held pinch drags, an open palm or the hand leaving lets go, and it never engages in games, fullscreen apps or calls. Every brain call now says who is calling and whether it is a live answer or background work (a test fails on any untagged call). The wake-word listener follows the current microphone when the default input changes. Old session logs are compressed into an archive instead of deleted. The every-action sweep counts its own sandbox blocks separately from real crashes. Fixes a Linux-only test failure from v2.0.199.
-- v2.0.199 (2026-10-15): A hard stop before irreversible clicks: when screen control is about to click a button that sends, submits, posts, publishes, pays, buys, transfers, deletes or accepts terms - or press Enter in a message box that would send - it asks first and acts only on an explicit yes for that one action. The hologram can show your own 3D models (STL, 3MF, OBJ from chosen folders): a 3MF's objects become named parts that explode and show their size, and "show me the <model>" picks one by name. Model files are served only by id from the configured folders.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).

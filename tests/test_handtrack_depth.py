@@ -533,6 +533,45 @@ class FeedGateTests(unittest.TestCase):
 
 
 @unittest.skipIf(np is None, "needs numpy")
+@unittest.skipIf(np is None, "needs numpy")
+class FeedOrientationTests(unittest.TestCase):
+    """Live 2026-10-16: the Kinect v2 colour image arrives MIRRORED and the
+    tracker mirrors every frame once more, so the hand mouse ran backwards
+    (hand right, cursor left). The feed publishes the TRUE orientation."""
+
+    def test_the_colour_frame_is_published_un_mirrored(self):
+        feed, br, fr, _dw, _ = make_feed()
+        frame = np.zeros((1080, 1920, 3), np.uint8)
+        frame[:, 0] = 255                       # a marker on the bridge's LEFT edge
+        br.color = frame
+        self.assertEqual(feed.step(), "")
+        pub = fr.published[0]
+        self.assertEqual(pub.shape, (1080, 1920, 3))
+        self.assertTrue((pub[:, -1] == 255).all())   # now on the RIGHT edge
+        self.assertFalse(pub[:, 0].any())
+        self.assertTrue(pub.flags["C_CONTIGUOUS"])
+        self.assertTrue((frame[:, 0] == 255).all())  # the bridge's frame untouched
+
+    def test_the_depth_plane_flips_with_its_colour_frame(self):
+        feed, _br, _fr, dw, _ = make_feed(depth=True)
+        plane = np.zeros((hd.OUT_H, hd.OUT_W), np.uint16)
+        plane[:, 0] = 1234
+        with mock.patch.object(hd, "register_depth", return_value=plane):
+            feed.step()
+        _seq, _cseq, _ts, got = hd.read_depth(dw._shm.buf, 0)
+        self.assertTrue((got[:, -1] == 1234).all())
+        self.assertFalse(got[:, 0].any())
+
+    def test_an_un_mirrored_bridge_can_switch_it_off(self):
+        feed, br, fr, _dw, _ = make_feed()
+        frame = np.zeros((1080, 1920, 3), np.uint8)
+        frame[:, 0] = 255
+        br.color = frame
+        with mock.patch.object(hd, "KINECT_COLOR_MIRRORED", False):
+            feed.step()
+        self.assertTrue((fr.published[0][:, 0] == 255).all())
+
+
 class FeedDepthTests(unittest.TestCase):
     def test_depth_is_registered_to_the_colour_frame_it_follows(self):
         feed, br, fr, dw, _ = make_feed(depth=True)

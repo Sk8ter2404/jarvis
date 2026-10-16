@@ -38,7 +38,9 @@ THE DEPTH SEGMENT  (name ``jarvis_handtrack_depth``; little-endian)
 
 The plane covers EXACTLY the published colour frame (same field of view, same
 orientation, not mirrored): plane pixel (i, j) is the nearest valid depth that
-falls inside the colour pixels (i/w, j/h) of the frame.
+falls inside the colour pixels (i/w, j/h) of the frame. Both are the sensor's
+TRUE orientation: the SDK's mirrored colour image and the plane registered to
+it are flipped back together before publishing (KINECT_COLOR_MIRRORED).
 
 REGISTRATION  (depth 512x424 -> colour frame)
 ---------------------------------------------
@@ -121,6 +123,15 @@ OFF_COLOR_SEQ = 48
 
 MAX_FPS = 15.0
 MIN_GAP_S = 0.06                  # ~16 fps ceiling; the loop's own pace (~12-15) rules
+# The Kinect v2 colour image arrives MIRRORED (the SDK's own orientation, as
+# the depth image does), while the published frame must be the sensor's TRUE
+# orientation, like a webcam's: the tracker mirrors every frame once for its
+# mirror-view landmarks. Live 2026-10-16 (first test on the Kinect): with
+# both flips the hand mouse ran backwards - hand right, cursor left. The
+# colour frame and the depth plane registered to it are flipped back here,
+# once, so they stay aligned. Only this hand-tracking feed: face ID, the
+# room scan and the other Kinect readers keep the bridge's frames untouched.
+KINECT_COLOR_MIRRORED = True
 IDLE_CLOSE_S = 60.0
 ERROR_BACKOFF_S = 5.0
 FIT_RETRY_S = 30.0
@@ -568,6 +579,8 @@ class KinectFeed:
         frame = kb.get_color_bgr(require_new=False)
         if frame is None:
             return self._note("no colour frame")
+        if KINECT_COLOR_MIRRORED:
+            frame = frame[:, ::-1].copy()        # back to the true orientation
         if not wr.publish(frame):
             return self._note("writer declined")
         self._last_pub = now
@@ -584,6 +597,8 @@ class KinectFeed:
             return
         calib = self.calibration(kb, now)
         plane = register_depth(depth, calib)
+        if KINECT_COLOR_MIRRORED and plane is not None:
+            plane = plane[:, ::-1].copy()        # flipped with its colour frame
         if self.depth_writer.publish(plane, color_seq, calib.method):
             self.depth_frames += 1
             self.last_depth_at = now
