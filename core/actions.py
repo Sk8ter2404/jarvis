@@ -274,10 +274,30 @@ def _opened_line(url: str, found, note: str = "") -> str:
             f"'{title or found[1]}'")
 
 
+# The search page's own controls are links too (live 2026-10-17: the "top
+# results" for an AA-to-C battery search were Google's doodle "WNBA Finals
+# 2026" and its header links - the owner's Google Account link, with his
+# name and email, sat among them). Results start below Google's "Search
+# Results" heading; on a page without it, these names are never results.
+_RESULTS_ANCHOR_RE = re.compile(r"^(?:search results|results)$", re.IGNORECASE)
+# Distinctive control names match as a prefix ("Google Account: <name>");
+# the short tab names only as the WHOLE name, so a result titled "All about
+# AA batteries" or "News on ..." is never dropped.
+_SEARCH_CHROME_RE = re.compile(
+    r"^(?:google account|google apps|search by (?:voice|image)|"
+    r"skip to main content|accessibility (?:help|feedback)|search labs)\b"
+    r"|^(?:sign in|ai mode|clear|share|all|images|videos|short videos|"
+    r"shopping|news|maps|books|flights|finance|forums|web|more|tools|"
+    r"all filters\.?|more filters|settings|privacy|terms|feedback)$"
+    r"|filter\.\s*(?:not )?selected\.?$", re.IGNORECASE)
+
+
 def _search_results_line(found) -> str:
     """The first result headings (<= 5, <= 600 chars) of the search page in
-    window ``found`` - privacy-gated, through UI Automation. "" when they
-    can't be read. Never raises."""
+    window ``found`` - privacy-gated, through UI Automation. Only links below
+    the page's "Search Results" heading when it has one, never the search
+    page's own controls, never a name carrying an email address. "" when
+    they can't be read. Never raises."""
     try:
         if found is None:
             return ""
@@ -291,12 +311,20 @@ def _search_results_line(found) -> str:
                             budget_ms=500, want_hrefs=False)
         if snap is None or snap.has_password:
             return ""
+        els = sorted(snap.elements, key=lambda e: (e.rect[1], e.rect[0]))
+        anchor_y = next((e.rect[1] for e in els
+                         if e.in_document and _RESULTS_ANCHOR_RE.match(
+                             (e.name or "").strip())), None)
         heads = []
-        for e in sorted(snap.elements, key=lambda e: (e.rect[1], e.rect[0])):
+        for e in els:
+            name = (e.name or "").strip()
             if (e.in_document and e.ctype == "Hyperlink"
-                    and 12 <= len(e.name) <= 160 and e.rect[3] <= 60
-                    and e.name not in heads):
-                heads.append(e.name)
+                    and 12 <= len(name) <= 160 and e.rect[3] <= 60
+                    and (anchor_y is None or e.rect[1] > anchor_y)
+                    and not _SEARCH_CHROME_RE.search(name)
+                    and "@" not in name
+                    and name not in heads):
+                heads.append(name)
             if len(heads) >= 5:
                 break
         out = ", ".join(f'"{h}"' for h in heads)

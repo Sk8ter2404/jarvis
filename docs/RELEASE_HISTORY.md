@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.211 (2026-10-18)
+
+Web search's 'top results' are real results: only links below the page's 'Search Results' heading, never Google's own controls (the doodle, search by voice, filter chips) and never a link carrying an email address (the owner's Google Account link was among them).
+
 ## v2.0.210 (2026-10-17)
 
 Shutting down in wake-word mode works: after 'shut down' asks about the overnight protocol, your next sentence counts without saying 'Jarvis' (once), a heard 'now' / 'know' / 'nah' means no, and a garbled one- or two-word answer is asked once more instead of cancelled. Also: 'I've opened the search' is no longer blocked as a made-up claim when a search really just ran.

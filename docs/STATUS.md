@@ -4,9 +4,9 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.208
-- Live since: 2026-10-16
-- Latest change: v2.0.210 (10-17): shutdown answers work in wake-word mode; search claim false-alarm fixed.
+- Version: v2.0.210
+- Live since: 2026-10-18
+- Latest change: v2.0.211 (10-18): web search 'top results' read the real results.
 
 ## In progress
 
@@ -26,9 +26,10 @@ Open, planned and idea items. Wording is generic on purpose.
 - Stop the robot repeating the same jokes. In progress.
 - Turn checker: retry a bad local answer on Claude. In progress.
 
-### Planned next (1)
+### Planned next (2)
 
 - Kinect sees ghost skeletons. Planned next.
+- Echo-cancel reference drops data (55,000 warnings a night). Planned next.
 
 ### Ideas (23)
 
@@ -58,6 +59,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.211 (2026-10-18): Web search's 'top results' are real results: only links below the page's 'Search Results' heading, never Google's own controls (the doodle, search by voice, filter chips) and never a link carrying an email address (the owner's Google Account link was among them).
 - v2.0.210 (2026-10-17): Shutting down in wake-word mode works: after 'shut down' asks about the overnight protocol, your next sentence counts without saying 'Jarvis' (once), a heard 'now' / 'know' / 'nah' means no, and a garbled one- or two-word answer is asked once more instead of cancelled. Also: 'I've opened the search' is no longer blocked as a made-up claim when a search really just ran.
 - v2.0.209 (2026-10-16): Hand tracking on the Kinect no longer runs backwards: the Kinect's mirrored picture (and its depth map) is flipped back once before the hand tracker sees it.
 - v2.0.208 (2026-10-16): Memory clean-up calibrated for the new memory search model: duplicate and 'might contradict' checks use cut-offs measured on your own facts (0.97 / 0.50 on voyage-4-nano), so the contradiction check works again and nothing is deleted that the old model would have kept.
@@ -67,6 +69,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.204 (2026-10-15): Hologram phase 3, ready for a headset: a mixed-reality page (/holo/xr) for the Quest 3 browser with passthrough and the headset's own hand tracking - pinch to grab and move the reactor or your own models in 3D, two hands to scale and turn, pull apart to explode, clap to rebuild, pinch-and-hold a part for its name and size. It needs a secure address to run on the headset; until one is set up the page explains the two ways to get one, and 'open the hologram on the Quest' says the same.
 - v2.0.203 (2026-10-15): Hologram phase 2, off by default: 'open the hologram with the Kinect' uses the Kinect's colour camera for hand tracking and its depth sensor so the hologram hides behind your real hands when they are in front of it, and a fist pushed toward or pulled away from the sensor moves it nearer or farther. It reads the Kinect only through JARVIS's existing connection. A new test fails if any module ever defines the same function twice (a scan found no stale duplicates today).
 - v2.0.202 (2026-10-15): Fixes from the self-upgrade queue review: the local brain adopts a better model once it finishes downloading (checked at most every 5 minutes, between turns); turning the workshop hologram off hides it so 'on' brings it back; web pages opened by 'open', 'search' and 'YouTube' land on a monitor instead of off-screen; a stale memory note corrected. Three queued items were already fixed and one was not a bug.
-- v2.0.201 (2026-10-15): The self-upgrade is rebuilt to be safe (still switched off). It runs only when asked, in a separate git worktree off the published code, never touching or restarting the running JARVIS. The editing step cannot push, tag, merge or change data files; the planning and review steps are read-only. Each task is its own commit, a failing task is reverted, the full test suite and the privacy check run at the end, and the result is a branch plus a report for review - nothing ships without a normal release. Overnight ideas go to a proposals file, never straight into the work queue.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
