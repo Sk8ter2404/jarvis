@@ -120,8 +120,14 @@ class OwnHelperProcessTests(unittest.TestCase):
         root = S._PROJECT_ROOT
         self.assertTrue(S._is_own_helper("pythonw.exe", r"C:\Python\pythonw.exe"))
         self.assertTrue(S._is_own_helper("python.exe", r"D:\venv\python.exe"))
-        self.assertTrue(S._is_own_helper("tool.exe", root + r"\bin\tool.exe"))
-        self.assertTrue(S._is_own_helper("srv.exe", root + r"-models\x\srv.exe"))
+        # os.path.join, never a hard-coded backslash: GitHub CI runs on Linux
+        # (v2.0.212's CI went red on exactly these two lines).
+        self.assertTrue(S._is_own_helper(
+            "tool.exe", os.path.join(root, "bin", "tool.exe")))
+        self.assertTrue(S._is_own_helper(
+            "srv.exe", os.path.join(root + "-models", "x", "srv.exe")))
+        self.assertFalse(S._is_own_helper(
+            "srv.exe", os.path.join(root + "-other", "srv.exe")))
 
     def test_a_browser_or_app_he_launched_is_the_owners(self):
         from core import screen_scope as S
