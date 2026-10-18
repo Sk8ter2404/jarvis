@@ -771,6 +771,22 @@ def _calculate_claim(core, progressive, perfect, future, narration):
     return None
 
 
+# "I've opened the search on your middle monitor" after web_search ran (live
+# 2026-10-17 16:54: withheld as unverified, so the model searched a second
+# time) reads back what the search itself did: it opened the results page.
+# Only a clause whose OBJECT is the search counts - "Opening the first result
+# now" after a search is still a claim, because the search opens no result.
+_SEARCH_OBJECT_RE = re.compile(
+    r"\b(?:the|a|your|that|those)\s+(?:google\s+|web\s+)?search"
+    r"(?:\s+(?:results?|page))?\b|\b(?:the|your)\s+(?:search\s+)?results\s+page\b")
+
+
+def _opened_the_search(fam: str, core: str, ran: set) -> bool:
+    """True when an "open" claim names the search a search action just ran."""
+    return (fam == "open" and "search" in ran
+            and bool(_SEARCH_OBJECT_RE.search(_norm(core))))
+
+
 def _ran_tokens(ran_actions: Iterable[str]) -> set[str]:
     tokens: set[str] = set()
     for n in ran_actions or ():
@@ -935,7 +951,8 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
         if claim:
             fam, phrase = claim
             tokens = _family_tokens(fam)
-            if not (tokens & ran or ("*" in tokens and any_ran)):
+            if not (tokens & ran or ("*" in tokens and any_ran)
+                    or _opened_the_search(fam, core, ran)):
                 return phrase.strip()
             content.append(core)     # a grounded summary of a real result
             continue

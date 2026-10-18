@@ -180,6 +180,23 @@ class AcknowledgementTests(unittest.TestCase):
 # ════════════════════════════════════════════════════════════════════════════
 #  follow-up rounds: a claim that reads back this turn's result is grounded
 # ════════════════════════════════════════════════════════════════════════════
+class SearchGroundsOpenedTests(unittest.TestCase):
+    """Live 2026-10-17 16:54: web_search opened Google on the middle monitor,
+    and "I've opened the search on your middle monitor" was withheld as an
+    unverified claim, so the model searched a second time."""
+
+    def test_a_search_that_ran_grounds_opened(self):
+        self.assertIsNone(cv.find_unverified_claim(
+            "I've opened the search on your middle monitor, sir. Shall I run "
+            "a screen scan to read the results to you?",
+            ran_actions=["web_search"]))
+
+    def test_without_the_search_it_is_still_a_claim(self):
+        self.assertIsNotNone(cv.find_unverified_claim(
+            "I've opened the search on your middle monitor, sir.",
+            ran_actions=[]))
+
+
 class GroundingTests(unittest.TestCase):
     CMD = "play some jazz"
 

@@ -6,7 +6,7 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 - Version: v2.0.208
 - Live since: 2026-10-16
-- Latest change: v2.0.209 (10-16): Kinect hand tracking no longer runs backwards (applies at the next restart).
+- Latest change: v2.0.210 (10-17): shutdown answers work in wake-word mode; search claim false-alarm fixed.
 
 ## In progress
 
@@ -58,6 +58,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.210 (2026-10-17): Shutting down in wake-word mode works: after 'shut down' asks about the overnight protocol, your next sentence counts without saying 'Jarvis' (once), a heard 'now' / 'know' / 'nah' means no, and a garbled one- or two-word answer is asked once more instead of cancelled. Also: 'I've opened the search' is no longer blocked as a made-up claim when a search really just ran.
 - v2.0.209 (2026-10-16): Hand tracking on the Kinect no longer runs backwards: the Kinect's mirrored picture (and its depth map) is flipped back once before the hand tracker sees it.
 - v2.0.208 (2026-10-16): Memory clean-up calibrated for the new memory search model: duplicate and 'might contradict' checks use cut-offs measured on your own facts (0.97 / 0.50 on voyage-4-nano), so the contradiction check works again and nothing is deleted that the old model would have kept.
 - v2.0.207 (2026-10-15): Fixes from tonight's log review: playing an artist works again (no such playlist -> played as music; the Apple Music song page now presses its Play button or Space when the song row can't be seen; 'play it on YouTube' plays instead of only searching), 'YouTube, <search>' on a monitor no longer runs as a program, a song name sent to the vibe action is played, 'delete / close that website' closes the tab in front, the TV detector stops flickering on people moving at the desk (sustained evidence until a TV area is calibrated, 20 s hold), and no Hugging Face progress bars in the log.
@@ -67,6 +68,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.203 (2026-10-15): Hologram phase 2, off by default: 'open the hologram with the Kinect' uses the Kinect's colour camera for hand tracking and its depth sensor so the hologram hides behind your real hands when they are in front of it, and a fist pushed toward or pulled away from the sensor moves it nearer or farther. It reads the Kinect only through JARVIS's existing connection. A new test fails if any module ever defines the same function twice (a scan found no stale duplicates today).
 - v2.0.202 (2026-10-15): Fixes from the self-upgrade queue review: the local brain adopts a better model once it finishes downloading (checked at most every 5 minutes, between turns); turning the workshop hologram off hides it so 'on' brings it back; web pages opened by 'open', 'search' and 'YouTube' land on a monitor instead of off-screen; a stale memory note corrected. Three queued items were already fixed and one was not a bug.
 - v2.0.201 (2026-10-15): The self-upgrade is rebuilt to be safe (still switched off). It runs only when asked, in a separate git worktree off the published code, never touching or restarting the running JARVIS. The editing step cannot push, tag, merge or change data files; the planning and review steps are read-only. Each task is its own commit, a failing task is reverted, the full test suite and the privacy check run at the end, and the result is a branch plus a report for review - nothing ships without a normal release. Overnight ideas go to a proposals file, never straight into the work queue.
-- v2.0.200 (2026-10-15): Hand mouse (air mouse v2) on the new hand tracker, off by default: a deliberate pinch held still takes the cursor, a quick pinch clicks, a second held pinch drags, an open palm or the hand leaving lets go, and it never engages in games, fullscreen apps or calls. Every brain call now says who is calling and whether it is a live answer or background work (a test fails on any untagged call). The wake-word listener follows the current microphone when the default input changes. Old session logs are compressed into an archive instead of deleted. The every-action sweep counts its own sandbox blocks separately from real crashes. Fixes a Linux-only test failure from v2.0.199.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).

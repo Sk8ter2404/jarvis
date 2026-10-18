@@ -33058,11 +33058,37 @@ def _check_and_arm_shutdown_prompt(text: str) -> bool:
     if not _action_risk.asked_for_self_termination("shutdown_jarvis", text):
         return False
     _shutdown_prompt_pending["armed"] = True
+    _shutdown_prompt_pending["reasked"] = False
     _shutdown_prompt_pending["expires_at"] = time.time() + SHUTDOWN_PROMPT_TIMEOUT_S
     print(f"  [shutdown] prompt armed for {SHUTDOWN_PROMPT_TIMEOUT_S:.0f}s "
           f"(trigger: '{tl}')")
     _speak("Would you like to start the overnight protocol first, sir? Yes or no.")
+    _shutdown_admit_reply()
     return True
+
+
+# One-word answers to the overnight question that are a "no" said or heard
+# badly (live 2026-10-17 21:38: "Jarvis, no" was transcribed "Jarvis Jarvis
+# now"; the prompt read "now" as unrelated, said "Shutdown cancelled." and
+# handed it to the brain, which re-ran an earlier web search). To THIS
+# question each one means a full shutdown either way - a misheard no, or
+# "(shut down) now".
+_SHUTDOWN_NO_SOUNDALIKES = frozenset({
+    "now", "know", "noh", "nah", "naw", "no now", "now now", "know know",
+})
+
+
+def _shutdown_admit_reply() -> None:
+    """Let the owner's NEXT utterance answer the overnight question without
+    the wake word (live 2026-10-17: in wake-word mode his bare "no" after
+    the question was thrown away as overheard audio). The same one-shot
+    admit the standby greeting uses: the next mic turn takes it, wake-led or
+    not, so a TV cannot hold it open; it lapses with the prompt. Never
+    raises."""
+    try:
+        _standby_greet_admit_until[0] = time.time() + SHUTDOWN_PROMPT_TIMEOUT_S
+    except Exception:
+        pass
 
 
 def _handle_shutdown_prompt(text: str) -> bool:
@@ -33141,6 +33167,13 @@ def _handle_shutdown_prompt(text: str) -> bool:
         except Exception as _e:
             print(f"  [shutdown] reinforced shutdown failed: {_e}")
         return True
+    if tl in _SHUTDOWN_NO_SOUNDALIKES:
+        print(f"  [shutdown] '{tl}' read as a no (a misheard no, or 'now') "
+              f"— full shutdown")
+        try: _act_shutdown_jarvis()
+        except Exception as _e:
+            print(f"  [shutdown] _act_shutdown_jarvis failed: {_e}")
+        return True
     # Check NO first so "no overnight" doesn't match YES's "overnight" substring.
     _no_phrase = next((p for p in SHUTDOWN_PROMPT_NO_PHRASES
                        if tl == p or tl.startswith(p + " ")), None)
@@ -33188,6 +33221,22 @@ def _handle_shutdown_prompt(text: str) -> bool:
         if isinstance(_overnight_out, str) and _overnight_out.strip():
             try: _speak(_overnight_out)
             except Exception: pass
+        return True
+    # A one- or two-word reply that is neither a yes nor a no is a garbled
+    # answer, not a new request (live 2026-10-17): ask ONCE more and keep
+    # listening without the wake word, instead of cancelling and handing the
+    # fragment to the brain. Anything longer is a real request and goes
+    # through as before.
+    if (tl and len(tl.split()) <= 2
+            and not _shutdown_prompt_pending.get("reasked")):
+        _shutdown_prompt_pending["armed"] = True
+        _shutdown_prompt_pending["reasked"] = True
+        _shutdown_prompt_pending["expires_at"] = (time.time()
+                                                  + SHUTDOWN_PROMPT_TIMEOUT_S)
+        print(f"  [shutdown] unclear reply ('{tl}') — asking once more")
+        try: _speak("Sorry, sir. The overnight protocol first? Yes or no.")
+        except Exception: pass
+        _shutdown_admit_reply()
         return True
     # Unrelated speech — cancel the prompt and let the original utterance
     # fall through to normal LLM routing so the user isn't stuck waiting.
