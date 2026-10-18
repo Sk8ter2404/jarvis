@@ -639,6 +639,18 @@ _CLAUDE_NOTE_DIRECT_RE = re.compile(
     r"(?:note|message)(?:\s+(?:for|to)\s+claude)?|"
     r"(?:note|message)\s+(?:for|to)\s+claude)\b[\s:,]*(?P<rest>.*)$",
     re.IGNORECASE)
+# "...  Pass that over to Claude as well." (live 2026-10-18 12:09: "I want you
+# to be able to do all this stuff that I'm saying. Pass that over to Claude as
+# well." got "I'll ensure the context is fully integrated" and NOTHING was
+# noted). The note is what came BEFORE the hand-off; the note records the
+# session-log position, so "that" can be read back in context.
+_CLAUDE_PASS_RE = re.compile(
+    r"\b(?:pass|send|forward|hand|give|relay)\s+"
+    r"(?:that|this|it|them|those|these|all\s+(?:of\s+)?(?:that|this))\s+"
+    r"(?:over\s+|along\s+|on\s+)?to\s+claude\b"
+    r"(?:\s+(?:as\s+well|too|also))?[\s.!?]*$", re.IGNORECASE)
+_PASS_REFERS_BACK = ("what I asked just before this (the session log at this "
+                     "note has the conversation)")
 _TASK_VERB_RE = re.compile(
     r"\b(?:research|fix|fixes|fixing|look\s+into|work\s+on|improve|change|add|"
     r"make|build|learn|study|investigate|figure\s+out|debug|update|check|"
@@ -679,6 +691,12 @@ def claude_note(text) -> "str | None":
         s = clean(text)
         if not s or _CLAUDE_EXCLUDE_RE.search(s) or _ASK_QUESTION_RE.match(s):
             return None
+        m = _CLAUDE_PASS_RE.search(s)
+        if m:
+            before = s[:m.start()].strip(" ,.;:!?")
+            before = re.sub(r"^(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*",
+                            "", before, flags=re.IGNORECASE).strip()
+            return before or _PASS_REFERS_BACK
         m = _CLAUDE_NOTE_DIRECT_RE.search(s)
         if m:
             rest = m.group("rest").strip(" :,.")

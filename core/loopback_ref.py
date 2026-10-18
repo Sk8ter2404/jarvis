@@ -51,6 +51,16 @@ import numpy as np
 SAMPLE_RATE = 16000
 RING_S = 30.0
 PACKET = 160                    # 10 ms at 16 kHz
+# The Windows capture BUFFER the soundcard recorder asks for (2026-10-18).
+# soundcard turns `blocksize` straight into the WASAPI buffer duration, and it
+# was PACKET: a 10 ms buffer, so any stall over 10 ms on this reader thread
+# overflowed it. A night's log held 27,593 "data discontinuity in recording"
+# warnings (about 46 a minute), each one audio the reference silently LOST -
+# the echo canceller's timeline slipped (its delay estimate swung by hundreds
+# of ms, median echo reduction 4 dB). 200 ms of headroom; reads stay PACKET.
+RECORDER_BUFFER_FRAMES = 3200
+# A capture gap that still happens is counted and logged at most this often.
+GAP_REPORT_EVERY_S = 300.0
 RESOLVE_EVERY_S = 5.0
 TIMEBASE_WINDOW_S = 10.0
 BACKOFF_MIN_S, BACKOFF_MAX_S = 0.5, 5.0
@@ -100,7 +110,7 @@ class _SoundcardSource:
 
     def __enter__(self):
         self._rec = self._mic.recorder(samplerate=SAMPLE_RATE, channels=2,
-                                       blocksize=PACKET)
+                                       blocksize=RECORDER_BUFFER_FRAMES)
         self._rec.__enter__()
         return self
 
@@ -178,6 +188,37 @@ def _default_sources():
     return (_SoundcardSource, _PyAudioWPatchSource)
 
 
+# soundcard reports each lost stretch of capture with a warning it forces to
+# print EVERY time (warnings.simplefilter('always', ...)), on the thread that
+# called record() - here, the reader thread. This hook counts those warnings
+# instead of printing two log lines each, so the reader can mark the gap.
+_DISCONTINUITY_TEXT = "data discontinuity in recording"
+_DISCONTINUITIES = [0]
+_ORIG_SHOWWARNING = [None]
+
+
+def _showwarning_hook(message, category, filename, lineno, file=None,
+                      line=None):
+    if _DISCONTINUITY_TEXT in str(message):
+        _DISCONTINUITIES[0] += 1
+        return
+    orig = _ORIG_SHOWWARNING[0]
+    if orig is not None:
+        orig(message, category, filename, lineno, file, line)
+
+
+def _install_discontinuity_counter() -> None:
+    """Route soundcard's discontinuity warnings to the counter (once).
+    Every other warning is shown exactly as before. Never raises."""
+    try:
+        import warnings
+        if warnings.showwarning is not _showwarning_hook:
+            _ORIG_SHOWWARNING[0] = warnings.showwarning
+            warnings.showwarning = _showwarning_hook
+    except Exception:
+        pass
+
+
 class LoopbackReference:
     """The ring of what the PC played (16 kHz mono float32, RAM only).
 
@@ -207,6 +248,8 @@ class LoopbackReference:
         self._thread_lock = threading.Lock()
         self.failures = 0
         self.opens = 0
+        self.capture_gaps = 0          # lost stretches of capture (see above)
+        self._gaps_reported = 0
         self._fallback_at = None          # last pyaudiowpatch try (monotonic)
         self._episode_logged = False
         self.last_error = ""
@@ -340,7 +383,8 @@ class LoopbackReference:
         return {"running": self.running, "backend": self.backend,
                 "endpoint": self.endpoint, "n_written": self.n_written,
                 "gap_seq": self.gap_seq, "opens": self.opens,
-                "failures": self.failures, "age_s": self.age_s(),
+                "failures": self.failures, "capture_gaps": self.capture_gaps,
+                "age_s": self.age_s(),
                 "last_error": self.last_error}
 
     def _say(self, line: str) -> None:
@@ -375,7 +419,9 @@ class LoopbackReference:
     def _loop(self) -> None:
         # The real sources only (a test's fake sources import nothing).
         _com_init_mta(import_soundcard=self._sources is None)
+        _install_discontinuity_counter()
         backoff = BACKOFF_MIN_S
+        next_report = time.monotonic() + GAP_REPORT_EVERY_S
         while not self._stop:
             if not self._run.wait(timeout=0.2):
                 continue
@@ -394,10 +440,27 @@ class LoopbackReference:
                     backoff = BACKOFF_MIN_S
                     next_check = time.monotonic() + RESOLVE_EVERY_S
                     while self._run.is_set():
+                        lost_before = _DISCONTINUITIES[0]
                         x = src.read(PACKET)
                         a = np.asarray(x, np.float32)
                         mono = a.mean(axis=1) if a.ndim == 2 else a.reshape(-1)
+                        if _DISCONTINUITIES[0] != lost_before:
+                            # Audio was lost before this packet: restart the
+                            # time base so the canceller re-anchors, instead
+                            # of carrying a silent slip.
+                            self.capture_gaps += 1
+                            self.mark_gap()
                         self.write(mono, float(self._clock()))
+                        if time.monotonic() >= next_report:
+                            next_report = time.monotonic() + GAP_REPORT_EVERY_S
+                            new = self.capture_gaps - self._gaps_reported
+                            if new > 0:
+                                self._gaps_reported = self.capture_gaps
+                                self._say(f"  [loopback] {new} capture gap(s) "
+                                          f"in the last "
+                                          f"{GAP_REPORT_EVERY_S / 60:.0f} min "
+                                          f"(the echo canceller re-anchors at "
+                                          f"each)")
                         if time.monotonic() >= next_check:
                             next_check = time.monotonic() + RESOLVE_EVERY_S
                             try:

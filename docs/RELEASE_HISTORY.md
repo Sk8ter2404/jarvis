@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.212 (2026-10-18)
+
+Fixes from the 10-18 log review: JARVIS sees and clicks windows of a browser or app he opened himself (Chrome started by him was hidden from his clicks); the echo canceller's copy of the PC's audio gets a 200 ms buffer instead of 10 ms and marks any gap (55,000 lost-audio warnings a night); a failed shell command is reported as failed, not 'As you wish'; 'pass that over to Claude' leaves a real note.
+
 ## v2.0.211 (2026-10-18)
 
 Web search's 'top results' are real results: only links below the page's 'Search Results' heading, never Google's own controls (the doodle, search by voice, filter chips) and never a link carrying an email address (the owner's Google Account link was among them).

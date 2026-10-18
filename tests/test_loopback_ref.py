@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -239,3 +240,77 @@ class ReaderThreadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CaptureGapTests(unittest.TestCase):
+    """2026-10-18: a night's log held 27,593 soundcard "data discontinuity in
+    recording" warnings - the reader asked Windows for a 10 ms buffer (the
+    recorder's blocksize), so every stall over 10 ms lost audio the echo
+    canceller's timeline never learned about."""
+
+    def setUp(self):
+        FakeSource.opened = []
+        self._saved = (lr._DISCONTINUITIES[0], lr.RESOLVE_EVERY_S,
+                       lr.GAP_REPORT_EVERY_S)
+        lr.RESOLVE_EVERY_S = 0.05
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        lr._DISCONTINUITIES[0], lr.RESOLVE_EVERY_S, lr.GAP_REPORT_EVERY_S = self._saved
+
+    def _wait(self, cond, timeout=3.0):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if cond():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_the_recorder_asks_for_200_ms_of_buffer(self):
+        self.assertEqual(lr.RECORDER_BUFFER_FRAMES, 3200)
+        self.assertEqual(lr.RECORDER_BUFFER_FRAMES / lr.SAMPLE_RATE, 0.2)
+        seen = {}
+
+        class Mic:
+            def recorder(self, samplerate, channels, blocksize):
+                seen["blocksize"] = blocksize
+                rec = mock.MagicMock()
+                return rec
+        src = lr._SoundcardSource.__new__(lr._SoundcardSource)
+        src._mic, src._rec = Mic(), None
+        src.__enter__()
+        self.assertEqual(seen["blocksize"], lr.RECORDER_BUFFER_FRAMES)
+
+    def test_the_hook_counts_the_discontinuity_and_shows_the_rest(self):
+        shown = []
+        with mock.patch.object(lr, "_ORIG_SHOWWARNING",
+                               [lambda *a, **k: shown.append(str(a[0]))]):
+            before = lr._DISCONTINUITIES[0]
+            lr._showwarning_hook("data discontinuity in recording",
+                                 RuntimeWarning, "x.py", 1)
+            lr._showwarning_hook("something else", RuntimeWarning, "x.py", 2)
+        self.assertEqual(lr._DISCONTINUITIES[0], before + 1)
+        self.assertEqual(shown, ["something else"])
+
+    def test_lost_audio_marks_a_gap_and_is_reported_not_spammed(self):
+        lr.GAP_REPORT_EVERY_S = 0.2
+
+        class LossySource(FakeSource):
+            n = 0
+
+            def read(self, n):
+                LossySource.n += 1
+                if LossySource.n in (5, 6, 7):
+                    lr._DISCONTINUITIES[0] += 1     # what the hook does
+                return super().read(n)
+
+        logs = []
+        ref = lr.LoopbackReference(sources=[LossySource], log=logs.append)
+        self.addCleanup(ref.shutdown)
+        ref.start()
+        self.assertTrue(self._wait(lambda: ref.capture_gaps == 3))
+        self.assertGreaterEqual(ref.gap_seq, 4)          # open + 3 gaps
+        self.assertTrue(self._wait(
+            lambda: any("3 capture gap(s)" in l for l in logs)))
+        self.assertEqual(sum("capture gap" in l for l in logs), 1)
+        self.assertEqual(ref.status()["capture_gaps"], 3)

@@ -1783,6 +1783,19 @@ class RunShellTests(unittest.TestCase):
             out = A._act_run_shell("dosomething")
         self.assertIn("exit code: 1", out)
         self.assertIn("stderr:\nbad cmd", out)
+        # 2026-10-16 live: a failed shell move was acknowledged as done. The
+        # result must read as a failure to core.failure_markers.
+        from core.failure_markers import FAILURE_MARKERS
+        self.assertTrue(any(m in out.lower() for m in FAILURE_MARKERS), out)
+
+    def test_a_clean_exit_is_not_a_failure(self):
+        bc = self._bc()
+        result = types.SimpleNamespace(returncode=0, stdout="moved 1 file", stderr="")
+        with _patch_bc(bc), \
+                mock.patch.object(A.subprocess, "run", return_value=result):
+            out = A._act_run_shell("dosomething")
+        from core.failure_markers import FAILURE_MARKERS
+        self.assertFalse(any(m in out.lower() for m in FAILURE_MARKERS), out)
 
     def test_no_output(self):
         bc = self._bc()

@@ -4,9 +4,9 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.210
+- Version: v2.0.212
 - Live since: 2026-10-18
-- Latest change: v2.0.211 (10-18): web search 'top results' read the real results.
+- Latest change: v2.0.212 (10-18): log-review fixes - sees his own-launched browser, echo-cancel capture buffer, honest shell failures, pass-to-Claude notes.
 
 ## In progress
 
@@ -20,16 +20,16 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 Open, planned and idea items. Wording is generic on purpose.
 
-### In progress (3)
+### In progress (4)
 
 - Prepare the answer while 'processing' plays. In progress.
 - Stop the robot repeating the same jokes. In progress.
 - Turn checker: retry a bad local answer on Claude. In progress.
+- Echo-cancel reference drops data (55,000 warnings a night). In progress.
 
-### Planned next (2)
+### Planned next (1)
 
 - Kinect sees ghost skeletons. Planned next.
-- Echo-cancel reference drops data (55,000 warnings a night). Planned next.
 
 ### Ideas (23)
 
@@ -59,6 +59,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.212 (2026-10-18): Fixes from the 10-18 log review: JARVIS sees and clicks windows of a browser or app he opened himself (Chrome started by him was hidden from his clicks); the echo canceller's copy of the PC's audio gets a 200 ms buffer instead of 10 ms and marks any gap (55,000 lost-audio warnings a night); a failed shell command is reported as failed, not 'As you wish'; 'pass that over to Claude' leaves a real note.
 - v2.0.211 (2026-10-18): Web search's 'top results' are real results: only links below the page's 'Search Results' heading, never Google's own controls (the doodle, search by voice, filter chips) and never a link carrying an email address (the owner's Google Account link was among them).
 - v2.0.210 (2026-10-17): Shutting down in wake-word mode works: after 'shut down' asks about the overnight protocol, your next sentence counts without saying 'Jarvis' (once), a heard 'now' / 'know' / 'nah' means no, and a garbled one- or two-word answer is asked once more instead of cancelled. Also: 'I've opened the search' is no longer blocked as a made-up claim when a search really just ran.
 - v2.0.209 (2026-10-16): Hand tracking on the Kinect no longer runs backwards: the Kinect's mirrored picture (and its depth map) is flipped back once before the hand tracker sees it.
@@ -68,6 +69,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.205 (2026-10-15): Code health, no behaviour change: helper functions that existed as identical copies in several skills (window titles, sleep/standby checks, desk presence, Kinect bridge lookup, protected-data decryption, small text formatters, a JSON writer) now live once in shared modules, so a future fix lands everywhere at once.
 - v2.0.204 (2026-10-15): Hologram phase 3, ready for a headset: a mixed-reality page (/holo/xr) for the Quest 3 browser with passthrough and the headset's own hand tracking - pinch to grab and move the reactor or your own models in 3D, two hands to scale and turn, pull apart to explode, clap to rebuild, pinch-and-hold a part for its name and size. It needs a secure address to run on the headset; until one is set up the page explains the two ways to get one, and 'open the hologram on the Quest' says the same.
 - v2.0.203 (2026-10-15): Hologram phase 2, off by default: 'open the hologram with the Kinect' uses the Kinect's colour camera for hand tracking and its depth sensor so the hologram hides behind your real hands when they are in front of it, and a fist pushed toward or pulled away from the sensor moves it nearer or farther. It reads the Kinect only through JARVIS's existing connection. A new test fails if any module ever defines the same function twice (a scan found no stale duplicates today).
-- v2.0.202 (2026-10-15): Fixes from the self-upgrade queue review: the local brain adopts a better model once it finishes downloading (checked at most every 5 minutes, between turns); turning the workshop hologram off hides it so 'on' brings it back; web pages opened by 'open', 'search' and 'YouTube' land on a monitor instead of off-screen; a stale memory note corrected. Three queued items were already fixed and one was not a bug.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).

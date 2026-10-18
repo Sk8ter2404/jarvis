@@ -108,3 +108,48 @@ class ScopeTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnHelperProcessTests(unittest.TestCase):
+    """Live 2026-10-18 12:30: Chrome was not running, so open_on_monitor's
+    `chrome.exe --new-window <url>` made the whole browser a child of JARVIS
+    and every Chrome window was hidden from clicks as "one of JARVIS's own"."""
+
+    def test_python_helpers_and_project_executables_are_his(self):
+        from core import screen_scope as S
+        root = S._PROJECT_ROOT
+        self.assertTrue(S._is_own_helper("pythonw.exe", r"C:\Python\pythonw.exe"))
+        self.assertTrue(S._is_own_helper("python.exe", r"D:\venv\python.exe"))
+        self.assertTrue(S._is_own_helper("tool.exe", root + r"\bin\tool.exe"))
+        self.assertTrue(S._is_own_helper("srv.exe", root + r"-models\x\srv.exe"))
+
+    def test_a_browser_or_app_he_launched_is_the_owners(self):
+        from core import screen_scope as S
+        for name, exe in (("chrome.exe", r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                          ("msedge.exe", r"C:\Program Files (x86)\Microsoft\Edge\msedge.exe"),
+                          ("notepad.exe", r"C:\Windows\System32\notepad.exe"),
+                          ("", "")):
+            with self.subTest(name=name):
+                self.assertFalse(S._is_own_helper(name, exe))
+
+    def test_jarvis_pids_drops_a_launched_browser(self):
+        from unittest import mock
+        from core import screen_scope as S
+
+        class P:
+            def __init__(self, pid, name, exe):
+                self.pid, self._n, self._e = pid, name, exe
+            def name(self): return self._n
+            def exe(self): return self._e
+
+        kids = [P(11, "pythonw.exe", r"C:\Py\pythonw.exe"),
+                P(12, "chrome.exe", r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                P(13, "chrome.exe", r"C:\Program Files\Google\Chrome\Application\chrome.exe")]
+        fake = mock.MagicMock()
+        fake.Process.return_value.children.return_value = kids
+        with mock.patch.dict("sys.modules", {"psutil": fake}), \
+                mock.patch.dict(S._pid_cache, {"at": 0.0, "pids": frozenset()}):
+            pids = S.jarvis_pids()
+        self.assertIn(11, pids)
+        self.assertNotIn(12, pids)
+        self.assertNotIn(13, pids)

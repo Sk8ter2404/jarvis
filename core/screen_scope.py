@@ -85,9 +85,36 @@ def _g(win, key, default=None):
     return getattr(win, key, default)
 
 
+# JARVIS's own helper processes are Python (the HUD's Qt subprocesses, the
+# reticle, the settings window, the voice and hand-tracker servers) or live
+# under the project folder. Everything ELSE he starts is the owner's: live
+# 2026-10-18 12:30, Chrome was not running, so open_on_monitor's
+# `chrome.exe --new-window <url>` made the WHOLE browser a child of JARVIS,
+# and every Chrome window was dropped from screen vision and clicks as "one
+# of JARVIS's own" ("I don't see a window I may look in on the left monitor").
+_OWN_EXE_NAMES = frozenset({"python.exe", "pythonw.exe", "py.exe", "pyw.exe"})
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _is_own_helper(name: str, exe: str) -> bool:
+    """True for a descendant that is one of JARVIS's own helpers (Python, or
+    an executable under the project folder or its "-models" sibling); a
+    browser or an app he launched for the owner is not. Never raises."""
+    try:
+        if (name or "").lower() in _OWN_EXE_NAMES:
+            return True
+        low = os.path.normcase(exe or "")
+        root = os.path.normcase(_PROJECT_ROOT)
+        return bool(low) and (low.startswith(root + os.sep)
+                              or low.startswith(root + "-models" + os.sep))
+    except Exception:
+        return False
+
+
 def jarvis_pids() -> frozenset:
-    """This process and every descendant (HUD Qt subprocesses, the reticle,
-    the settings window), cached 30 s."""
+    """This process and its descendant HELPERS (HUD Qt subprocesses, the
+    reticle, the settings window, the voice / hand-tracker servers), cached
+    30 s. A browser or app JARVIS launched is the owner's, never his own."""
     now = time.time()
     with _lock:
         if now - _pid_cache["at"] < 30 and _pid_cache["pids"]:
@@ -96,7 +123,12 @@ def jarvis_pids() -> frozenset:
     try:
         import psutil
         for c in psutil.Process(os.getpid()).children(recursive=True):
-            pids.add(c.pid)
+            try:
+                name, exe = c.name(), c.exe()
+            except Exception:
+                name, exe = "", ""
+            if _is_own_helper(name, exe):
+                pids.add(c.pid)
     except Exception:
         pass
     out = frozenset(pids)

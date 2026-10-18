@@ -5440,7 +5440,12 @@ def _act_run_shell(command: str) -> str:
     if len(err) > bc.RUN_SHELL_OUTPUT_MAX_CHARS:
         err = err[:bc.RUN_SHELL_OUTPUT_MAX_CHARS] + f"\n...(truncated, {len(result.stderr)} chars total)"
 
-    parts = [f"exit code: {result.returncode}"]
+    # A non-zero exit is a FAILED command (live 2026-10-16 11:12: a guessed
+    # 'move "resume.docx" ...' exited 1 and JARVIS only said "As you wish.").
+    # "failed" is a core.failure_markers marker, so the acknowledgement is
+    # dropped and the follow-up round tells the owner it did not work.
+    parts = [f"exit code: {result.returncode}" if result.returncode == 0
+             else f"run_shell failed (exit code: {result.returncode})"]
     if out:
         parts.append(f"stdout:\n{out}")
     if err:

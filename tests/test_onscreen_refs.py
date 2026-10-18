@@ -173,6 +173,27 @@ class RecallAndWatchTests(unittest.TestCase):
 
 
 class ClaudeNoteTests(unittest.TestCase):
+    # 2026-10-18 12:09 live: "...Pass that over to Claude as well." was
+    # answered with an empty promise and nothing was noted.
+    def test_pass_that_to_claude_notes_what_came_before(self):
+        note = O.claude_note("Jarvis, I want you to be able to do all this "
+                             "stuff that I'm saying. Pass that over to Claude "
+                             "as well.")
+        self.assertEqual(note, "I want you to be able to do all this stuff "
+                               "that I'm saying")
+
+    def test_a_bare_hand_off_still_makes_a_note(self):
+        for said in ("Jarvis, pass that to Claude.", "send this to Claude too",
+                     "forward all of that to Claude"):
+            with self.subTest(said=said):
+                note = O.claude_note(said)
+                self.assertTrue(note)
+                self.assertIn("session log", note)
+
+    def test_the_hand_off_rules_keep_their_exclusions(self):
+        self.assertIsNone(O.claude_note("pass that to Claude Code"))
+        self.assertIsNone(O.claude_note("what are my Claude credits? pass that to Claude"))
+
     def test_both_live_utterances_are_notes(self):
         n1 = O.claude_note(LIVE_NOTE_1)
         self.assertTrue(n1 and "research" in n1, n1)
