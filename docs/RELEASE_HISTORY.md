@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.220 (2026-10-19)
+
+JARVIS watches the home server (read-only): 'how's the server?' answers from a fresh check (services answering; over SSH the array state, disabled disks, and a rebuild/parity check with percent and time left), and a 5-minute check announces once when it goes down, comes back, reports a disabled disk or finishes a rebuild. Plus 'how's the Backblaze backup?' from Backblaze's own status files.
+
 ## v2.0.219 (2026-10-19)
 
 OpenCV stays off the graphics card in every thread: the face tracker threw 'OpenCL CL_OUT_OF_RESOURCES' (86 times in 40 minutes) because cv2.ocl.setUseOpenCL(False) only covers the thread that calls it (measured: main thread off, others on). OPENCV_OPENCL_RUNTIME=disabled is now set before OpenCV loads, so the Haar cascades run on the CPU everywhere, as the original comment intended.

@@ -289,6 +289,16 @@ PEER_HANDOFF_SSH = ""
 PEER_HANDOFF_NAME = ""
 HANDOFF_RESUME_WHEN_PEER_STOPS = False
 
+# ─── Home server watch (skills/server_watch.py, 2026-10-19) ────────────
+# READ-ONLY: JARVIS checks whether the home server answers and, with
+# SERVER_WATCH_SSH, reads its array state with one `mdcmd status`. Nothing on
+# the server is ever changed. SERVER_WATCH_HOST "" (default) = off; set it in
+# data/user_settings.json (the address stays out of git).
+SERVER_WATCH_HOST = ""
+SERVER_WATCH_NAME = "server"
+SERVER_WATCH_SSH = ""
+SERVER_WATCH_POLL_S = 300.0
+
 # ─── Local prompt-prefix stability (2026-09-29) ────────────────────────
 # The local model re-evaluates the WHOLE prompt (~3 s for ~12k tokens,
 # measured) whenever the system prompt changes between turns; an unchanged
