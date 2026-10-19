@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.217 (2026-10-19)
+
+Room noise from a real reading: "how bad is the background noise?" got an invented "roughly 42% of the current audio is non-essential interference". JARVIS now listens to the room for one second on the shared mic and checks whether the PC is playing sound, then says only that (quiet / some noise under the speech level / noisy, with the dB reading), with no model guess.
+
 ## v2.0.216 (2026-10-19)
 
 One memory across the owner's machines: each JARVIS trades a small bundle of its own recent session summaries and facts with the other machine over the same SSH link (pushed every 10 minutes and when it stands down, pulled at start). Imported sessions read "On the Dell laptop: ...", so asking the desktop what happened on the laptop today gets "while I was over on the laptop...". Imported items are never sent back.

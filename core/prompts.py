@@ -1131,6 +1131,8 @@ PC_CONTROL_PROMPT = (
     "    audio_check, <his words> READS volume, mute, output device and each\n"
     "    app's mixer level: 'why can't I hear my video' / 'is it muted'.\n"
     "    Never state a volume or other level nothing read this turn.\n"
+    "    room_noise READS the room: one second on the mic + whether the PC is\n"
+    "    playing: 'how bad is the background noise' / 'is it noisy in here'.\n"
     # A REAL section header (column 0, all-caps, trailing colon) on purpose.
     # 2026-09-04: this block first shipped as an indented sub-heading, which
     # made split_pc_control fold it into MUSIC CONTROLS — so asking about a

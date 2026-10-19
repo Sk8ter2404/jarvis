@@ -34974,6 +34974,25 @@ def _act_where_learned(_: str = "") -> str:
     return f"\"{text}\": {how}, sir.{tail}"
 
 
+def _act_room_noise(arg: str = "") -> str:
+    """"How bad is the background noise?" from a READING (core/room_noise.py,
+    2026-10-19): one second of the room through the shared mic tap plus
+    whether the PC is making sound (JARVIS's own processes left out). Live
+    10:45 the model answered "roughly 42% ... interference" - a number
+    nothing measured."""
+    from core import room_noise as _rn
+    from core import media_gate as _mg
+
+    def _peak():
+        try:
+            from core import screen_scope as _ss
+            own = _ss.jarvis_pids()
+        except Exception:
+            own = (os.getpid(),)
+        return _mg.pc_audio_peak(exclude_pids=own)
+    return _rn.room_noise(get_mic_buffer, _peak)
+
+
 def _act_audio_check(arg: str = "") -> str:
     """READ the sound state - master volume, mute, output device and each
     app's own mixer level - and say only what was read (core/audio_check.py,
@@ -35141,6 +35160,7 @@ ACTIONS = {
     # READ the sound state (volume, mute, output device, per-app mixer) -
     # "why can't I hear X" / "is it muted". Read-only. 2026-10-09.
     "audio_check":     _act_audio_check,
+    "room_noise":      _act_room_noise,
     # Replay the most recent non-destructive action ('do that again', etc.)
     "replay_last_action": _act_replay_last_action,
     # Changelog + version info ('what's new', 'show changelog', 'what version are you on')
@@ -39593,6 +39613,8 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # spoken when the brain asks for it ("check the audio", or the
     # _ungrounded_reading retry), not only on the shortcut.
     "audio_check",
+    # The room-noise READING (core/room_noise.py, 2026-10-19): same reason.
+    "room_noise",
     # Status / info READ-OUTS — each returns a finished, user-facing sentence the
     # user explicitly asked for. Without this they were logged but NEVER VOICED
     # (only the generic "Of course, sir" preamble was spoken) — owner caught this
@@ -47771,6 +47793,8 @@ def _run_voice_shortcuts(text: str) -> bool:
         return True
     if _run_audio_check_shortcut(text):
         return True
+    if _run_room_noise_shortcut(text):
+        return True
 
     # "Jarvis, turn it off" with nothing for "it" to mean (2026-10-01): ask,
     # never let the model guess. See _run_pronoun_switch_shortcut.
@@ -48014,6 +48038,18 @@ def _run_untimed_reminder_shortcut(text: str) -> bool:
         text, "untimed-reminder", lambda _t: True, (intent.action,),
         empty_reply="I couldn't update that list just now, sir.",
         arg=intent.arg)
+
+
+def _run_room_noise_shortcut(text: str) -> bool:
+    """"How bad is the background noise?" / "is it noisy in here" ->
+    room_noise's READING (one second of the room + whether the PC is playing),
+    with no LLM (2026-10-19; live 10:45 the model invented "roughly 42% of the
+    current audio is non-essential interference"). Recognition is
+    core.room_noise.is_room_noise_question. Never raises."""
+    from core import room_noise as _rn
+    return _run_action_shortcut(
+        text, "room-noise", _rn.is_room_noise_question, ("room_noise",),
+        empty_reply="I couldn't take a reading of the room just now, sir.")
 
 
 def _run_audio_check_shortcut(text: str) -> bool:

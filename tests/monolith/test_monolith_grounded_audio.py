@@ -184,5 +184,42 @@ class BrainRequestedAudioCheckIsSpokenTests(_Base):
         self.assertIn(AUDIO_READ, self.spoken)
 
 
+ROOM_USER = "Jarvis, how bad is the background noise?"
+ROOM_READ = ("It's quiet in here, sir, about -60 dB on the mic over the last "
+             "second, and nothing's playing on the PC.")
+
+
+class RoomNoiseRouteTests(_Base):
+    """Live 2026-10-19 10:45: "roughly 42% of the current audio is
+    non-essential interference" - a level nothing measured."""
+
+    def test_room_noise_is_registered_and_spoken_verbatim(self):
+        self.assertIn("room_noise", self.bc.ACTIONS)
+        self.assertIn("room_noise", self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+
+    def test_live_question_is_answered_by_the_reading(self):
+        self._stub("room_noise", ROOM_READ)
+        self._p(self.bc, "FAST_PATHS_ENABLED", True)
+        self.assertTrue(self._quiet(self.bc._run_room_noise_shortcut, ROOM_USER))
+        self.assertEqual(len(self.calls["room_noise"]), 1)
+        self.assertEqual(self.spoken, [ROOM_READ])
+
+    def test_a_noise_command_is_not_routed(self):
+        self._stub("room_noise", ROOM_READ)
+        self._p(self.bc, "FAST_PATHS_ENABLED", True)
+        self.assertFalse(self._quiet(self.bc._run_room_noise_shortcut,
+                                     "play some white noise"))
+        self.assertEqual(self.calls["room_noise"], [])
+
+    def test_the_action_measures_through_the_shared_mic(self):
+        bc = self.bc
+        import numpy as np
+        self._p(bc, "get_mic_buffer", lambda s, sample_rate=None: np.full(100, 0.001))
+        with mock.patch("core.media_gate.pc_audio_peak", return_value=0.0):
+            out = bc._act_room_noise("")
+        self.assertTrue(out.startswith("It's quiet in here, sir"))
+        self.assertNotIn("%", out)
+
+
 if __name__ == "__main__":
     unittest.main()
