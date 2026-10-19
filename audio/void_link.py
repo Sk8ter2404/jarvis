@@ -45,6 +45,13 @@ THE ONLY INTERPRETATIONS THE DATA SUPPORTS
   reply[0] == 0x64  -> the reply is valid (it echoes the 0x64 in the request).
                        Anything else is garbage -> UNKNOWN, never a parse.
   reply[4] == 0x01  -> link UP   (appeared exactly at link-up, 20:21:37)
+  reply[4] == 0x02  -> link UP (seen at 10-13% battery and rising - low battery
+                       or charging; the meaning past 'up' is not known). MEASURED 2026-10-19 11:14: 15 of
+                       15 samples 64000ab102 / 64000aa102 while the owner was
+                       wearing and using the headset ("the headset is on
+                       though. I'm using it right now", 10:46), battery byte
+                       0x0a = 10%. As UNKNOWN it held the last state, which was
+                       OFF, so JARVIS kept saying the headset was off.
   reply[4] == 0x00  -> link DOWN
   reply[4] == other -> UNKNOWN. Not observed; not guessed.
   battery_pct = reply[2] & 0x7F, and ONLY meaningful while the link is up.
@@ -138,6 +145,7 @@ REPLY_MAGIC = 0x64          # reply[0] echoes this when the reply is real
 REPLY_MIN_LEN = 5           # every observed reply was exactly 5 bytes
 
 LINK_BYTE = 4               # reply[4]: 0x01 up, 0x00 down
+LINK_UP_BYTES = (0x01, 0x02)  # 0x02 = up, seen at 10-13% battery (measured 2026-10-19)
 BATTERY_BYTE = 2            # reply[2] & 0x7F, only while the link is up
 BATTERY_MASK = 0x7F
 
@@ -583,7 +591,7 @@ def parse_reply(reply: bytes | None) -> tuple[str, int | None]:
             return LINK_UNKNOWN, None
 
         link = reply[LINK_BYTE]
-        if link == 0x01:
+        if link in LINK_UP_BYTES:
             raw = reply[BATTERY_BYTE] & BATTERY_MASK
             return LINK_ON, (raw if raw else None)
         if link == 0x00:
@@ -604,14 +612,32 @@ def probe_once() -> tuple[str, int | None]:
     exchange, including its known ability to lie mid-handshake. NEVER raises.
     """
     try:
-        return parse_reply(_raw_sample())
+        raw = _raw_sample()
+        _last_raw[0] = raw
+        return parse_reply(raw)
     except Exception:
         return LINK_UNKNOWN, None
+
+
+# The reply probe_once() last read - only for VoidLink's change log line.
+_last_raw: list = [None]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Debounced view (hard-won behaviours 1 and 2)
 # ═══════════════════════════════════════════════════════════════════════════
+def _note_change(old: str, new: str, raw) -> None:
+    """One log line per debounced change, with the dongle's raw reply, so a
+    state the capture never covered can be read straight from the session log
+    (2026-10-19: the 0x02 low-battery link was found only by a manual probe).
+    Never raises."""
+    try:
+        print(f"  [void-link] headset link {old} -> {new} "
+              f"(dongle reply {raw.hex() if raw else 'none'})")
+    except Exception:
+        pass
+
+
 class VoidLink:
     """Debounced headset link state with memory.
 
@@ -678,6 +704,7 @@ class VoidLink:
             sampled, battery = probe_once()
         except Exception:
             sampled, battery = LINK_UNKNOWN, None
+        raw = _last_raw[0]
 
         with self._lock:
             if sampled == LINK_UNKNOWN:
@@ -702,6 +729,7 @@ class VoidLink:
                 self._pending_count = 1
 
             if self._pending_count >= self._debounce:
+                _note_change(self._state, sampled, raw)
                 self._state = sampled
                 self._battery = battery if sampled == LINK_ON else None
                 self._pending = None

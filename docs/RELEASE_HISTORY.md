@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.218 (2026-10-19)
+
+The VOID headset is no longer called off while you wear it: at 10-13% battery its dongle reports link byte 0x02, a value never seen before; JARVIS read it as unknown and held a stale 'off' (and moved the mic to the desk mic). 0x02 now counts as on (measured 15 of 15 samples with the headset in use), and every on/off change logs the dongle's raw reply.
+
 ## v2.0.217 (2026-10-19)
 
 Room noise from a real reading: "how bad is the background noise?" got an invented "roughly 42% of the current audio is non-essential interference". JARVIS now listens to the room for one second on the shared mic and checks whether the PC is playing sound, then says only that (quiet / some noise under the speech level / noisy, with the dB reading), with no model guess.

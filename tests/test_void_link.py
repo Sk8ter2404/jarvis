@@ -150,10 +150,24 @@ class ParseCapturedRepliesTests(unittest.TestCase):
         self.assertEqual(vl.parse_reply(bytes.fromhex("ff00dea101")),
                          (vl.LINK_UNKNOWN, None))
 
+    def test_low_battery_link_byte_is_on(self):
+        """MEASURED 2026-10-19 11:14 with the owner wearing and using the
+        headset: byte[4] = 0x02 on 15 of 15 samples, battery byte 0x0a (10%).
+        As UNKNOWN it held a stale OFF ("the headset is off" while in use)."""
+        for raw in ("64000ab102", "64000aa102"):
+            with self.subTest(raw=raw):
+                self.assertEqual(vl.parse_reply(bytes.fromhex(raw)), (vl.LINK_ON, 10))
+
+    def test_a_held_off_clears_once_the_low_battery_link_is_seen(self):
+        link = vl.VoidLink(debounce=2)
+        with _feed([bytes.fromhex(h) for h in ("6400003300", "6400003300", "64000ab102", "64000ab102")]):
+            states = [link.state()[0] for _ in range(4)]
+        self.assertEqual(states, [vl.LINK_UNKNOWN, vl.LINK_OFF, vl.LINK_OFF, vl.LINK_ON])
+
     def test_unobserved_link_byte_is_unknown(self):
-        """Only 0x00 and 0x01 were ever seen in byte[4]. Anything else is
-        reported as unknown rather than lumped in with either."""
-        for link in (0x02, 0x7F, 0xFF):
+        """Only 0x00, 0x01 and 0x02 have been seen in byte[4]. Anything else
+        is reported as unknown rather than lumped in with either."""
+        for link in (0x03, 0x7F, 0xFF):
             with self.subTest(link=link):
                 reply = bytes([0x64, 0x00, 0xde, 0xa1, link])
                 self.assertEqual(vl.parse_reply(reply), (vl.LINK_UNKNOWN, None))
