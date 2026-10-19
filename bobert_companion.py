@@ -54,6 +54,16 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 # before either library is imported. setdefault: an explicit choice wins.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
+# OpenCV's GPU (OpenCL) path off for EVERY thread (2026-10-19). The
+# cv2.ocl.setUseOpenCL(False) after `import cv2` below is PER-THREAD in OpenCV
+# 4 (measured: main thread False, any other thread still True), so the face
+# tracker's own thread kept running the Haar cascade through OpenCL and threw
+# "OpenCL error CL_OUT_OF_RESOURCES" from detectMultiScale (live 12:01, 12:03).
+# This switch is read once when cv2 loads and covers the whole process, and
+# the helper processes JARVIS starts inherit it. setdefault: an explicit
+# choice wins.
+os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
+
 # Make stdout/stderr UTF-8 so JARVIS's non-ASCII output (─, ≥, →, em-dashes,
 # etc.) never raises UnicodeEncodeError on a legacy cp1252 Windows console — a
 # tester may run `python bobert_companion.py` in a raw console rather than the
@@ -430,7 +440,8 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import cv2
-# Disable OpenCV's GPU OpenCL (T-API) path once, process-wide. On a 24GB 3090
+# Disable OpenCV's GPU OpenCL (T-API) path for THIS thread (the call is per-thread
+# in OpenCV 4; OPENCV_OPENCL_RUNTIME near the top covers every thread). On a 24GB 3090
 # the OpenCL allocator fights the ~21GB Ollama model and throws a storm of
 # CL_OUT_OF_RESOURCES / CL_INVALID_COMMAND_QUEUE errors from the vision loop.
 # The Haar cascades run fine on CPU, so force CPU and skip the contention.

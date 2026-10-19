@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.219 (2026-10-19)
+
+OpenCV stays off the graphics card in every thread: the face tracker threw 'OpenCL CL_OUT_OF_RESOURCES' (86 times in 40 minutes) because cv2.ocl.setUseOpenCL(False) only covers the thread that calls it (measured: main thread off, others on). OPENCV_OPENCL_RUNTIME=disabled is now set before OpenCV loads, so the Haar cascades run on the CPU everywhere, as the original comment intended.
+
 ## v2.0.218 (2026-10-19)
 
 The VOID headset is no longer called off while you wear it: at 10-13% battery its dongle reports link byte 0x02, a value never seen before; JARVIS read it as unknown and held a stale 'off' (and moved the mic to the desk mic). 0x02 now counts as on (measured 15 of 15 samples with the headset in use), and every on/off change logs the dongle's raw reply.

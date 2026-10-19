@@ -120,6 +120,33 @@ class CudaOrderTests(_Base):
         self.assertLess(setdefault_line, first_heavy)
 
 
+class OpenCvOpenClOffEverywhereTests(_Base):
+    """2026-10-19: cv2.ocl.setUseOpenCL(False) is PER-THREAD in OpenCV 4
+    (measured: main False, another thread True), so the face tracker's thread
+    still ran the Haar cascade through OpenCL and threw CL_OUT_OF_RESOURCES.
+    OPENCV_OPENCL_RUNTIME=disabled, set before cv2 loads, covers every thread."""
+
+    def test_opencl_runtime_is_disabled(self):
+        self.assertEqual(os.environ.get("OPENCV_OPENCL_RUNTIME"), "disabled")
+
+    def test_set_before_the_top_level_cv2_import(self):
+        path = inspect.getsourcefile(self.bc)
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        setdefault_line = first_cv2 = None
+        for node in tree.body:
+            src = ast.unparse(node)
+            if (setdefault_line is None and "OPENCV_OPENCL_RUNTIME" in src
+                    and "setdefault" in src):
+                setdefault_line = node.lineno
+            if (first_cv2 is None and isinstance(node, ast.Import)
+                    and any(a.name.split(".")[0] == "cv2" for a in node.names)):
+                first_cv2 = node.lineno
+        self.assertIsNotNone(setdefault_line)
+        self.assertIsNotNone(first_cv2)
+        self.assertLess(setdefault_line, first_cv2)
+
+
 class NoHubProgressBarTests(_Base):
     """2026-10-15: every refresh of transformers' 'Loading weights' bar was a
     line in the session log (~400 per load). The switch must be on, and set

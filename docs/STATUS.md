@@ -4,7 +4,7 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.214
+- Version: v2.0.219
 - Live since: 2026-10-19
 - Latest change: v2.0.213 (10-18): test-only fix for Linux CI.
 
@@ -58,6 +58,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.219 (2026-10-19): OpenCV stays off the graphics card in every thread: the face tracker threw 'OpenCL CL_OUT_OF_RESOURCES' (86 times in 40 minutes) because cv2.ocl.setUseOpenCL(False) only covers the thread that calls it (measured: main thread off, others on). OPENCV_OPENCL_RUNTIME=disabled is now set before OpenCV loads, so the Haar cascades run on the CPU everywhere, as the original comment intended.
 - v2.0.218 (2026-10-19): The VOID headset is no longer called off while you wear it: at 10-13% battery its dongle reports link byte 0x02, a value never seen before; JARVIS read it as unknown and held a stale 'off' (and moved the mic to the desk mic). 0x02 now counts as on (measured 15 of 15 samples with the headset in use), and every on/off change logs the dongle's raw reply.
 - v2.0.217 (2026-10-19): Room noise from a real reading: "how bad is the background noise?" got an invented "roughly 42% of the current audio is non-essential interference". JARVIS now listens to the room for one second on the shared mic and checks whether the PC is playing sound, then says only that (quiet / some noise under the speech level / noisy, with the dB reading), with no model guess.
 - v2.0.216 (2026-10-19): One memory across the owner's machines: each JARVIS trades a small bundle of its own recent session summaries and facts with the other machine over the same SSH link (pushed every 10 minutes and when it stands down, pulled at start). Imported sessions read "On the Dell laptop: ...", so asking the desktop what happened on the laptop today gets "while I was over on the laptop...". Imported items are never sent back.
@@ -67,6 +68,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.212 (2026-10-18): Fixes from the 10-18 log review: JARVIS sees and clicks windows of a browser or app he opened himself (Chrome started by him was hidden from his clicks); the echo canceller's copy of the PC's audio gets a 200 ms buffer instead of 10 ms and marks any gap (55,000 lost-audio warnings a night); a failed shell command is reported as failed, not 'As you wish'; 'pass that over to Claude' leaves a real note.
 - v2.0.211 (2026-10-18): Web search's 'top results' are real results: only links below the page's 'Search Results' heading, never Google's own controls (the doodle, search by voice, filter chips) and never a link carrying an email address (the owner's Google Account link was among them).
 - v2.0.210 (2026-10-17): Shutting down in wake-word mode works: after 'shut down' asks about the overnight protocol, your next sentence counts without saying 'Jarvis' (once), a heard 'now' / 'know' / 'nah' means no, and a garbled one- or two-word answer is asked once more instead of cancelled. Also: 'I've opened the search' is no longer blocked as a made-up claim when a search really just ran.
-- v2.0.209 (2026-10-16): Hand tracking on the Kinect no longer runs backwards: the Kinect's mirrored picture (and its depth map) is flipped back once before the hand tracker sees it.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
