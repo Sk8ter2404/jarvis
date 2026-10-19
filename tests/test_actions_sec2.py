@@ -386,6 +386,53 @@ class LaunchAppTests(_BaseActTest):
             out = A._act_launch_app("x")
         self.assertIn("could not launch x", out)
 
+    # Live 2026-10-19 07:23: "open Teams on the top monitor" -> "could not
+    # launch Microsoft Teams: [WinError 2]" with the new (MSIX) Teams
+    # installed. A Start-menu app launches by its AppUserModelID.
+    _APPS = (("Microsoft Teams", "MSTeams_8wekyb3d8bbwe!MSTeams"),
+             ("Microsoft Edge", "MSEdge"),
+             ("Outlook", "Microsoft.OutlookForWindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows"),
+             ("Outlook (classic)", "Microsoft.Office.OUTLOOK.EXE.15"))
+
+    def _launch_with_start_apps(self, name):
+        self.bc._resolve_known_app.return_value = None
+        with mock.patch.object(A.shutil, "which", return_value=None), \
+             mock.patch.object(A.sys, "platform", "win32"), \
+             mock.patch.object(A.os, "startfile", create=True,
+                               side_effect=FileNotFoundError(2, "not found")), \
+             mock.patch.object(A, "_start_apps", return_value=self._APPS), \
+             mock.patch.object(A.subprocess, "Popen") as popen:
+            return A._act_launch_app(name), popen
+
+    def test_store_app_launches_by_app_id_when_startfile_fails(self):
+        out, popen = self._launch_with_start_apps("Microsoft Teams")
+        popen.assert_called_once_with(
+            ["explorer.exe", "shell:AppsFolder\\MSTeams_8wekyb3d8bbwe!MSTeams"],
+            close_fds=True)
+        self.assertEqual(out, "launched Microsoft Teams")
+
+    def test_unknown_app_still_reports_the_failure(self):
+        out, popen = self._launch_with_start_apps("zorblat")
+        popen.assert_not_called()
+        self.assertIn("could not launch zorblat", out)
+
+    def test_start_app_matching_never_guesses(self):
+        apps = self._APPS
+        self.assertEqual(A._start_app_id("teams", apps), "MSTeams_8wekyb3d8bbwe!MSTeams")
+        self.assertEqual(A._start_app_id("the Teams app", apps), "MSTeams_8wekyb3d8bbwe!MSTeams")
+        # An exact name beats the longer "Outlook (classic)".
+        self.assertTrue(A._start_app_id("outlook", apps).startswith("Microsoft.OutlookForWindows"))
+        self.assertEqual(A._start_app_id("outlook classic", apps), "Microsoft.Office.OUTLOOK.EXE.15")
+        self.assertIsNone(A._start_app_id("microsoft", apps))   # Teams or Edge
+        self.assertIsNone(A._start_app_id("zorblat", apps))
+        self.assertIsNone(A._start_app_id("", apps))
+
+    def test_start_apps_never_read_under_tests(self):
+        with mock.patch.object(A.sys, "platform", "win32"), \
+             mock.patch.object(A.subprocess, "run") as run:
+            self.assertEqual(A._start_apps(), ())
+        run.assert_not_called()
+
 
 # ── _act_pause_music / _act_resume_music ─────────────────────────────────────
 # Classic iTunes COM is DEAD. With the Windows media session (SMTC) available

@@ -1240,7 +1240,78 @@ def _act_launch_app(name: str) -> str:
             subprocess.Popen([name], close_fds=True)
         return f"launched {name}"
     except Exception as e:
+        # 3) A Start-menu (Store / MSIX) app - the new Teams, the new
+        #    Outlook - has no exe on PATH and no name os.startfile resolves
+        #    (live 2026-10-19: "could not launch Microsoft Teams: [WinError
+        #    2]" with Teams installed). It launches by its AppUserModelID.
+        if not exe and sys.platform == "win32":
+            app_id = _start_app_id(name)
+            if app_id:
+                try:
+                    subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + app_id],
+                                     close_fds=True)
+                    return f"launched {name}"
+                except Exception:
+                    pass
         return f"could not launch {name}: {e}"
+
+
+# Start-menu apps (what Get-StartApps lists): name -> AppUserModelID.
+# Read once per 10 minutes - the PowerShell call takes about a second.
+_START_APPS_TTL_S = 600.0
+_start_apps_cache: dict = {"at": 0.0, "apps": ()}
+
+
+def _start_apps() -> tuple:
+    """(name, app_id) pairs for the Start-menu apps, cached. () off Windows,
+    under tests (JARVIS_NO_SCREEN_READ, set by tests/__init__.py: a test never
+    reads the real machine) and on any error."""
+    if sys.platform != "win32" or os.environ.get("JARVIS_NO_SCREEN_READ") == "1":
+        return ()
+    now = time.monotonic()
+    if _start_apps_cache["apps"] and now - _start_apps_cache["at"] < _START_APPS_TTL_S:
+        return _start_apps_cache["apps"]
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        rows = json.loads(out or "[]")
+        if isinstance(rows, dict):
+            rows = [rows]
+        apps = tuple((str(r.get("Name") or ""), str(r.get("AppID") or ""))
+                     for r in rows if r.get("Name") and r.get("AppID"))
+    except Exception:
+        return ()
+    _start_apps_cache.update(at=now, apps=apps)
+    return apps
+
+
+def _app_key(s: str) -> str:
+    s = re.sub(r"\s+", " ", (s or "").strip().lower())
+    s = re.sub(r"^the ", "", s)
+    return re.sub(r" app$", "", s)
+
+
+def _start_app_id(name: str, apps=None) -> str | None:
+    """The AppUserModelID of the ONE Start-menu app `name` means: an exact
+    name first ("outlook" -> Outlook, not "Outlook (classic)"), else the only
+    app whose name holds every spoken word ("teams" -> Microsoft Teams).
+    None when nothing or more than one app fits - never a guess."""
+    key = _app_key(name)
+    if not key:
+        return None
+    apps = _start_apps() if apps is None else apps
+    exact = [aid for n, aid in apps if _app_key(n) == key]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+    words = key.split()
+    hits = [aid for n, aid in apps
+            if all(re.search(r"\b" + re.escape(w) + r"\b", n.lower()) for w in words)]
+    return hits[0] if len(hits) == 1 else None
 
 
 # ─── Music pause/resume/now-playing — media keys, COM is dead (Phase 4D) ─
