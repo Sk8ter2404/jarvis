@@ -4,8 +4,8 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.212
-- Live since: 2026-10-18
+- Version: v2.0.214
+- Live since: 2026-10-19
 - Latest change: v2.0.213 (10-18): test-only fix for Linux CI.
 
 ## In progress
@@ -58,6 +58,8 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.215 (2026-10-19): One JARVIS at a time across the owner's machines: JARVIS starting on one machine asks the other machine's copy to stand down over SSH (it says "Handing over to the Dell laptop, sir" and shuts down cleanly), so the laptop gets the desktop's GPU to itself. With the desktop's resume setting on, the desktop boots JARVIS again by itself once the laptop's copy stops (quit there, or the laptop unreachable for about 3 minutes). Off until each machine's private settings name the other.
+- v2.0.214 (2026-10-19): Store apps open by voice: "open Teams on the top monitor" failed with "could not launch Microsoft Teams" because the new Teams (and new Outlook, Notepad) are Microsoft Store apps with no program file to start by name. JARVIS now looks the app up in the Start menu list and launches it by its app ID, only when exactly one app fits the name.
 - v2.0.213 (2026-10-18): Test-only (no change to the running code): v2.0.212's new own-helper test built Windows-style paths, which failed on GitHub's Linux CI; it now uses os.path.join.
 - v2.0.212 (2026-10-18): Fixes from the 10-18 log review: JARVIS sees and clicks windows of a browser or app he opened himself (Chrome started by him was hidden from his clicks); the echo canceller's copy of the PC's audio gets a 200 ms buffer instead of 10 ms and marks any gap (55,000 lost-audio warnings a night); a failed shell command is reported as failed, not 'As you wish'; 'pass that over to Claude' leaves a real note.
 - v2.0.211 (2026-10-18): Web search's 'top results' are real results: only links below the page's 'Search Results' heading, never Google's own controls (the doodle, search by voice, filter chips) and never a link carrying an email address (the owner's Google Account link was among them).
@@ -66,7 +68,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.208 (2026-10-16): Memory clean-up calibrated for the new memory search model: duplicate and 'might contradict' checks use cut-offs measured on your own facts (0.97 / 0.50 on voyage-4-nano), so the contradiction check works again and nothing is deleted that the old model would have kept.
 - v2.0.207 (2026-10-15): Fixes from tonight's log review: playing an artist works again (no such playlist -> played as music; the Apple Music song page now presses its Play button or Space when the song row can't be seen; 'play it on YouTube' plays instead of only searching), 'YouTube, <search>' on a monitor no longer runs as a program, a song name sent to the vibe action is played, 'delete / close that website' closes the tab in front, the TV detector stops flickering on people moving at the desk (sustained evidence until a TV area is calibrated, 20 s hold), and no Hugging Face progress bars in the log.
 - v2.0.206 (2026-10-15): Test-only (no change to the running code): the last hardware-dependent test now fakes the Windows default microphone, so the full suite passes completely on this PC (25,111 of 25,111) - which the safe self-upgrade's gate needs.
-- v2.0.205 (2026-10-15): Code health, no behaviour change: helper functions that existed as identical copies in several skills (window titles, sleep/standby checks, desk presence, Kinect bridge lookup, protected-data decryption, small text formatters, a JSON writer) now live once in shared modules, so a future fix lands everywhere at once.
-- v2.0.204 (2026-10-15): Hologram phase 3, ready for a headset: a mixed-reality page (/holo/xr) for the Quest 3 browser with passthrough and the headset's own hand tracking - pinch to grab and move the reactor or your own models in 3D, two hands to scale and turn, pull apart to explode, clap to rebuild, pinch-and-hold a part for its name and size. It needs a secure address to run on the headset; until one is set up the page explains the two ways to get one, and 'open the hologram on the Quest' says the same.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).

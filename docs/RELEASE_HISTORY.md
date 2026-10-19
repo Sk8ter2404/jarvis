@@ -2,6 +2,14 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.215 (2026-10-19)
+
+One JARVIS at a time across the owner's machines: JARVIS starting on one machine asks the other machine's copy to stand down over SSH (it says "Handing over to the Dell laptop, sir" and shuts down cleanly), so the laptop gets the desktop's GPU to itself. With the desktop's resume setting on, the desktop boots JARVIS again by itself once the laptop's copy stops (quit there, or the laptop unreachable for about 3 minutes). Off until each machine's private settings name the other.
+
+## v2.0.214 (2026-10-19)
+
+Store apps open by voice: "open Teams on the top monitor" failed with "could not launch Microsoft Teams" because the new Teams (and new Outlook, Notepad) are Microsoft Store apps with no program file to start by name. JARVIS now looks the app up in the Start menu list and launches it by its app ID, only when exactly one app fits the name.
+
 ## v2.0.213 (2026-10-18)
 
 Test-only (no change to the running code): v2.0.212's new own-helper test built Windows-style paths, which failed on GitHub's Linux CI; it now uses os.path.join.

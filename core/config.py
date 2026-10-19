@@ -274,6 +274,21 @@ _SHIPPED_LOCAL_LLM_MODEL = LOCAL_LLM_MODEL
 # to every other 11434 reference in the tree.
 LOCAL_LLM_BASE_URL = "http://127.0.0.1:11434"
 
+# ─── One JARVIS across the owner's machines (2026-10-19) ───────────────
+# The laptop is only a body: its brain is the desktop's GPU (the setting
+# above, pointed over Tailscale), so two running copies fight over one card
+# and both answer "Jarvis". See core/peer_handoff.py.
+# PEER_HANDOFF_SSH — "user@host" of the OTHER machine; JARVIS starting here
+#   asks the JARVIS there to stand down. "" (default) = off. Set only in
+#   data/user_settings.json: the peer's address is private, never in git.
+# PEER_HANDOFF_NAME — what to call that machine out loud ("laptop").
+# HANDOFF_RESUME_WHEN_PEER_STOPS — this machine boots JARVIS again by itself
+#   once the other machine's copy stops (laptop shut, asleep, JARVIS quit),
+#   but only when it stood down for it. The desktop's setting, not the laptop's.
+PEER_HANDOFF_SSH = ""
+PEER_HANDOFF_NAME = ""
+HANDOFF_RESUME_WHEN_PEER_STOPS = False
+
 # ─── Local prompt-prefix stability (2026-09-29) ────────────────────────
 # The local model re-evaluates the WHOLE prompt (~3 s for ~12k tokens,
 # measured) whenever the system prompt changes between turns; an unchanged

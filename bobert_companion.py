@@ -50594,6 +50594,15 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     except Exception as _e:
         print(f"  [diag-daemons] startup failed: {_e}")
 
+    # One JARVIS at a time across the owner's machines (2026-10-19): ask the
+    # other machine's copy to stand down, and stand down when it asks.
+    # Off unless PEER_HANDOFF_SSH is set. See core/peer_handoff.py.
+    try:
+        from core import peer_handoff as _peer_handoff
+        _peer_handoff.start(lambda reason: ACTIONS["shutdown_jarvis"](reason))
+    except Exception as _e:
+        print(f"  [handoff] startup failed: {_e}")
+
     # Restore the four tray-toggle preferences from the last shutdown so
     # the user's mute / ambient / pause / debug choices survive a restart.
     # Each handler that flips one of these cells already writes hud_state

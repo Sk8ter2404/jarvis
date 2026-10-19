@@ -7302,7 +7302,9 @@ def _act_shutdown_jarvis(_: str = "") -> str:
     _filler_teardown_via_bc(bc, "shutdown")
 
     try:
-        line = random.choice(bc.SHUTDOWN_GOODBYE_LINES)
+        from core import peer_handoff as _peer_handoff
+        line = (_peer_handoff.goodbye_for(_)
+                or random.choice(bc.SHUTDOWN_GOODBYE_LINES))
         bc._speak(line)
     except Exception as _e:
         print(f"  [shutdown_jarvis] goodbye TTS failed: {_e}")
