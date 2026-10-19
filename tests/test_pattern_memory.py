@@ -241,5 +241,53 @@ class AppNameForTitleTests(unittest.TestCase):
             self.assertEqual(pattern_memory._get_active_app(), "Chrome")
 
 
+class PeerSessionMergeTests(unittest.TestCase):
+    """2026-10-19: the other machine's session summaries are folded in
+    (core/peer_memory.py) so "what did we do on the laptop today" works on
+    the desktop; this machine's own rows are never touched."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.sessions = os.path.join(self._tmp.name, "session_summaries.json")
+        for name, path in (("_SESSION_FILE", self.sessions), ("_MEM_DIR", self._tmp.name)):
+            p = mock.patch.object(pattern_memory, name, path)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _read(self):
+        with open(self.sessions, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _peer(self, iso, summary, ts):
+        return {"iso_start": iso, "ts": ts, "summary": summary,
+                "from_peer": "Dell laptop", "location": "Dell laptop"}
+
+    def test_peer_rows_are_added_then_updated_never_duplicated(self):
+        t = time.time()
+        pattern_memory.record_session_summary("Here: tuned the fans.", start_ts=t - 7200, end_ts=t - 3600)
+        n = pattern_memory.merge_peer_sessions([self._peer("2026-10-19T09:00:00", "On the Dell laptop: homework.", t - 1800)])
+        self.assertEqual(n, 1)
+        n = pattern_memory.merge_peer_sessions([self._peer("2026-10-19T09:00:00", "On the Dell laptop: homework, then Teams.", t - 600)])
+        self.assertEqual(n, 1)
+        self.assertEqual(pattern_memory.merge_peer_sessions([self._peer("2026-10-19T09:00:00", "On the Dell laptop: homework, then Teams.", t - 600)]), 0)
+        rows = self._read()
+        self.assertEqual([r["summary"] for r in rows],
+                         ["Here: tuned the fans.", "On the Dell laptop: homework, then Teams."])
+
+    def test_rows_without_a_peer_or_summary_are_refused(self):
+        self.assertEqual(pattern_memory.merge_peer_sessions(
+            [{"iso_start": "x", "summary": "s"}, {"iso_start": "y", "from_peer": "p", "summary": ""}, None]), 0)
+        self.assertFalse(os.path.exists(self.sessions))
+
+    def test_an_own_checkpoint_never_replaces_a_peer_row_with_the_same_start(self):
+        t = time.time()
+        iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t - 3600))
+        pattern_memory.merge_peer_sessions([self._peer(iso, "On the Dell laptop: x", t - 1800)])
+        pattern_memory.record_session_summary("Here: y", start_ts=t - 3600, end_ts=t)
+        self.assertEqual(sorted(r["summary"] for r in self._read()),
+                         ["Here: y", "On the Dell laptop: x"])
+
+
 if __name__ == "__main__":
     unittest.main()

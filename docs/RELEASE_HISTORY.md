@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.216 (2026-10-19)
+
+One memory across the owner's machines: each JARVIS trades a small bundle of its own recent session summaries and facts with the other machine over the same SSH link (pushed every 10 minutes and when it stands down, pulled at start). Imported sessions read "On the Dell laptop: ...", so asking the desktop what happened on the laptop today gets "while I was over on the laptop...". Imported items are never sent back.
+
 ## v2.0.215 (2026-10-19)
 
 One JARVIS at a time across the owner's machines: JARVIS starting on one machine asks the other machine's copy to stand down over SSH (it says "Handing over to the Dell laptop, sir" and shuts down cleanly), so the laptop gets the desktop's GPU to itself. With the desktop's resume setting on, the desktop boots JARVIS again by itself once the laptop's copy stops (quit there, or the laptop unreachable for about 3 minutes). Off until each machine's private settings name the other.

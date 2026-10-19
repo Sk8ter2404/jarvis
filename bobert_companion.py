@@ -4497,6 +4497,25 @@ def _forget_live_conversation(cutoff: float | None = None) -> int:
     return n
 
 
+def _handoff_stand_down(reason: str):
+    """Peer handoff (core/peer_handoff.py, 2026-10-19): the other machine's
+    JARVIS took over. Save this session's summary and send this machine's
+    memory there first (core/peer_memory.py), so it can say what happened
+    here, then shut down the normal way."""
+    try:
+        _pending = _session_summary_pending()
+        if _pending is not None:
+            _session_summary_update(_pending)
+    except Exception as _e:
+        print(f"  [handoff] final session summary failed: {_e}")
+    try:
+        from core import peer_memory as _peer_memory
+        _peer_memory.sync_out()
+    except Exception as _e:
+        print(f"  [handoff] memory hand-over failed: {_e}")
+    return ACTIONS["shutdown_jarvis"](reason)
+
+
 def _session_summary_checkpoint_thread():
     """Background daemon: periodically write a one-sentence session summary so
     the recall index survives an unclean exit. Skips work when the conversation
@@ -50599,7 +50618,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # Off unless PEER_HANDOFF_SSH is set. See core/peer_handoff.py.
     try:
         from core import peer_handoff as _peer_handoff
-        _peer_handoff.start(lambda reason: ACTIONS["shutdown_jarvis"](reason))
+        from core import peer_memory as _peer_memory
+        _peer_handoff.start(_handoff_stand_down)
+        # One memory too: trade session summaries + facts with the other
+        # machine, so either copy can say what happened on the other one.
+        _peer_memory.start()
     except Exception as _e:
         print(f"  [handoff] startup failed: {_e}")
 

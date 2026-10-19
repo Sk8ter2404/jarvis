@@ -32,7 +32,7 @@ $safe = ($From -replace '[^A-Za-z0-9 _-]', '')
 
 if (@(Get-Jarvis).Count -eq 0) { 'not running'; exit 0 }
 
-$deadline = (Get-Date).AddSeconds(45)
+$deadline = (Get-Date).AddSeconds(90)   # memory hand-over + graceful teardown
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 2
     if (@(Get-Jarvis).Count -eq 0) { 'stood down'; exit 0 }

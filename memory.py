@@ -830,9 +830,40 @@ def record_session_summary(summary: str,
         # Replace any existing entry for THIS session (same iso_start) so
         # repeated checkpoints update one row instead of stacking duplicates.
         entries = [e for e in entries
-                   if e.get("iso_start") != iso_start]
+                   if e.get("iso_start") != iso_start or e.get("from_peer")]
         entries.append(entry)
         _save_sessions_file(entries)
+
+
+def merge_peer_sessions(entries: list[dict]) -> int:
+    """Fold the OTHER machine's session summaries into this index
+    (core/peer_memory.py, 2026-10-19). Keyed by (iso_start, from_peer): a
+    peer session that grew since the last import replaces its earlier row;
+    this machine's own rows are never touched. Returns rows added/changed."""
+    changed = 0
+    with _session_lock:
+        cur = _load_sessions_file()
+        index = {(e.get("iso_start"), e.get("from_peer")): i
+                 for i, e in enumerate(cur) if e.get("from_peer")}
+        for e in entries or []:
+            if not (isinstance(e, dict) and e.get("from_peer")
+                    and e.get("iso_start") and e.get("summary")):
+                continue
+            key = (e["iso_start"], e["from_peer"])
+            if key in index:
+                if cur[index[key]].get("summary") != e.get("summary"):
+                    cur[index[key]] = e
+                    changed += 1
+            else:
+                index[key] = len(cur)
+                cur.append(e)
+                changed += 1
+        if changed:
+            # Oldest first, like the file: the MAX_SESSION_ENTRIES cap keeps
+            # the newest rows.
+            cur.sort(key=lambda x: _summary_end_ts(x) or 0.0)
+            _save_sessions_file(cur)
+    return changed
 
 
 def _summary_end_ts(entry: dict) -> float | None:
