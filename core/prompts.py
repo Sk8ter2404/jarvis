@@ -2837,6 +2837,7 @@ PC_CONTROL_PROMPT = (
     "SMART HOME — PER-BRAND LIST (each brand has its own short list/setup action):\n"
     "  Lights: hue_list, govee_list, lifx_list, kasa_list, tplink_list, magichome_list_devices\n"
     "  Plugs: tuya_list, smart_life_list  — list LAN Tuya / Smart-Life plugs\n"
+    "  smart_home_account — which app account / login the Tuya-Smart Life devices are on\n"
     "  Remote hub (BroadLink IR/RF): learn_remote_code (arg = the button's name; sir presses that\n"
     "    remote button at the hub when asked), list_remote_codes, forget_remote_code (arg = name).\n"
     "    Aliases: broadlink_learn, broadlink_list, broadlink_forget. Learn ONLY when sir asks.\n"

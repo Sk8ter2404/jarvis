@@ -27,16 +27,16 @@
 
 | metric | count |
 |---|---|
-| Total registered actions (incl. aliases) | 745 |
+| Total registered actions (incl. aliases) | 748 |
 | — monolith `ACTIONS` dict | 157 |
-| — skill / core registered | 588 |
-| tested | 684 |
-| **untested** (no test names it) | 61 |
-| spoken note: VERBATIM | 393 |
+| — skill / core registered | 591 |
+| tested | 686 |
+| **untested** (no test names it) | 62 |
+| spoken note: VERBATIM | 396 |
 | spoken note: INFORMATIVE | 79 |
 | spoken note: SELF-VOICED | 0 |
 | **no spoken note** (neither) | 273 |
-| no `prompts.py` example | 527 |
+| no `prompts.py` example | 530 |
 
 A result with no spoken note is correct for side-effect actions but is the recurring
 "logged but never voiced" bug for read-outs — see the audit that seeded the 2026-07
@@ -109,6 +109,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `audio_check` | `bobert_companion.py:35007` | **VERBATIM** | — | yes |
 | `audio_devices` | `skills/audio_devices.py:314` | **VERBATIM** | yes | yes |
 | `audio_music_status` | `skills/standby_audio_detect.py:692` | **VERBATIM** | — | yes |
+| `backblaze_status` | `skills/backblaze_status.py:105` | **VERBATIM** | — | yes |
 | `bambu_camera` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
 | `bambu_camera_off` | `skills/holographic_overlay/__init__.py:1012` | neither | — | no |
 | `bambu_camera_on` | `skills/holographic_overlay/__init__.py:1005` | neither | — | no |
@@ -586,6 +587,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `self_diagnostic` | `skills/self_diagnostic.py:4467` | **VERBATIM** | — | yes |
 | `send_draft` | `skills/email_triage.py:1169` | **VERBATIM** | — | yes |
 | `send_pending_draft` | `skills/email_triage.py:1169` | **VERBATIM** | — | yes |
+| `server_status` | `skills/server_watch.py:289` | **VERBATIM** | — | yes |
 | `session_memory_recall` | `core/actions.py:5801` | **VERBATIM** | yes | yes |
 | `session_resume` | `core/actions.py:930` | neither | — | no |
 | `set_active_speaker` | `skills/enroll_voice.py:385` | **VERBATIM** | — | yes |
@@ -630,6 +632,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `silent_learning_on` | `core/actions.py:3426` | neither | — | no |
 | `situational_awareness` | `skills/camera_system.py:651` | **VERBATIM** | — | yes |
 | `skip_track` | `skills/apple_music_intel.py:825` | **VERBATIM** | yes | yes |
+| `smart_home_account` | `skills/sh_tuya.py:311` | **VERBATIM** | — | no |
 | `smart_home_catalog` | `skills/smart_home_discover.py:2409` | **VERBATIM** | — | yes |
 | `smart_home_control` | `core/smart_home_router.py:1132` | **VERBATIM** | yes | yes |
 | `smart_home_devices` | `core/smart_home_router.py:1411` | **VERBATIM** | — | yes |

@@ -32,7 +32,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-SPEAK_VERBATIM_ACTIONS = ("server_status", "is_the_server_up", "check_server")
+SPEAK_VERBATIM_ACTIONS = ("server_status",)
 
 PORTS = ((22, "SSH"), (443, "the web front end"), (32400, "Plex"), (53, "DNS"))
 CONNECT_TIMEOUT_S = 1.5
@@ -348,8 +348,6 @@ def _route(text):
 
 def register(actions):
     actions["server_status"] = server_status
-    actions["is_the_server_up"] = server_status
-    actions["check_server"] = server_status
     try:
         su = globals().get("skill_utils") or {}
         reg = su.get("register_utterance_route") if isinstance(su, dict) else None

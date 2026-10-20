@@ -15,7 +15,7 @@ import os
 import re
 import time
 
-SPEAK_VERBATIM_ACTIONS = ("backblaze_status", "backup_status", "how_is_the_backup")
+SPEAK_VERBATIM_ACTIONS = ("backblaze_status",)
 
 REPORTS = r"C:\ProgramData\Backblaze\bzdata\bzreports"
 
@@ -110,5 +110,3 @@ def backblaze_status(_: str = "") -> str:
 
 def register(actions):
     actions["backblaze_status"] = backblaze_status
-    actions["backup_status"] = backblaze_status
-    actions["how_is_the_backup"] = backblaze_status

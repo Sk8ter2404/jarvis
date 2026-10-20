@@ -144,7 +144,7 @@ class RouteAndRegisterTests(unittest.TestCase):
         actions = {}
         with mock.patch.object(W.threading, "Thread") as thread:
             W.register(actions)
-        for a in ("server_status", "is_the_server_up", "check_server"):
+        for a in ("server_status",):
             self.assertIn(a, actions)
         thread.assert_not_called()
 

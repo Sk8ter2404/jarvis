@@ -52,7 +52,7 @@ class BackblazeTests(unittest.TestCase):
     def test_registered(self):
         actions = {}
         B.register(actions)
-        for a in ("backblaze_status", "backup_status", "how_is_the_backup"):
+        for a in ("backblaze_status",):
             self.assertIn(a, actions)
 
 

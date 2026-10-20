@@ -240,3 +240,105 @@ def register(actions: dict) -> None:
     actions["tuya_list"]         = tuya_list
     actions["tuya_list_devices"] = tuya_list
     actions["smart_life_list"]   = tuya_list
+    actions["smart_home_account"] = smart_home_account
+    try:
+        su = globals().get("skill_utils") or {}
+        reg = su.get("register_utterance_route") if isinstance(su, dict) else None
+        if callable(reg):
+            reg(_account_route, "smart home account")
+    except Exception:
+        pass
+
+
+# ── "which account are my smart devices on?" (2026-10-19) ──────────────
+# Live 10-18 21:57 the owner asked which login his Tuya devices use; the model
+# said it had "no way to check". The JARVIS Tuya project's app link answers it:
+# the linked user's uid (data/tuya_wizard/tuya-raw.json) and Tuya's own
+# /v1.0/users/{uid}/infos (the project's keys, data/tuya_wizard/tinytuya.json,
+# never printed). The link was made with the Smart Life app on 2026-10-13.
+# Spoken: only the last 4 digits of a phone login.
+import re as _re
+import time as _time
+
+SPEAK_VERBATIM_ACTIONS = ("smart_home_account",)
+LINKED_APP = "Smart Life"
+_WIZARD_DIR = os.path.join(_DATA_DIR, "tuya_wizard")
+_ACCOUNT_TTL_S = 6 * 3600.0
+_account_cache: dict = {"at": 0.0, "info": None}
+
+
+def _linked_uid(path: str | None = None) -> str:
+    try:
+        with open(path or os.path.join(_WIZARD_DIR, "tuya-raw.json"), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        for d in raw.get("result") or []:
+            if isinstance(d, dict) and d.get("uid"):
+                return str(d["uid"])
+    except Exception:
+        pass
+    return ""
+
+
+def _cloud_account(uid: str, cloud=None):
+    """Tuya's user record for `uid`, or None. Never raises."""
+    try:
+        if cloud is None:
+            tt = _tt()
+            cfg_path = os.path.join(_WIZARD_DIR, "tinytuya.json")
+            if tt is None or not os.path.exists(cfg_path):
+                return None
+            cloud = tt.Cloud(configFile=cfg_path)
+        r = cloud.cloudrequest(f"/v1.0/users/{uid}/infos")
+        return r.get("result") if isinstance(r, dict) and r.get("success") else None
+    except Exception:
+        return None
+
+
+def describe_account(info, n_devices: int) -> str:
+    if not info:
+        return ("I couldn't reach Tuya to check the account just now, sir. Your devices "
+                f"were linked from the {LINKED_APP} app.")
+    login = str(info.get("username") or info.get("mobile") or info.get("email") or "")
+    if "@" in login:
+        how = f"the email {login}"
+    else:
+        digits = _re.sub(r"\D", "", login)
+        how = f"your phone number ending {digits[-4:]}" if len(digits) >= 4 else "a login I can't read"
+    since = ""
+    try:
+        since = " (an account from " + _time.strftime("%B %Y", _time.localtime(int(info["create_time"]))) + ")"
+    except Exception:
+        pass
+    count = f"Your {n_devices} Tuya device{'' if n_devices == 1 else 's'} are" if n_devices else "Your Tuya devices are"
+    if n_devices == 1:
+        count = "Your Tuya device is"
+    return (f"{count} in the {LINKED_APP} app, sir, signed in with {how}{since}. "
+            f"The Tuya Smart app is a separate account, so they won't show up there.")
+
+
+def smart_home_account(_: str = "", cloud=None, uid: str | None = None) -> str:
+    uid = _linked_uid() if uid is None else uid
+    if not uid:
+        return ("I don't have a linked Tuya account on file, sir - the Tuya setup "
+                "hasn't been run on this PC.")
+    now = _time.time()
+    if cloud is None and _account_cache["info"] and now - _account_cache["at"] < _ACCOUNT_TTL_S:
+        info = _account_cache["info"]
+    else:
+        info = _cloud_account(uid, cloud)
+        if info:
+            _account_cache.update(at=now, info=info)
+    return describe_account(info, len(_all_devices()))
+
+
+_ACCOUNT_RE = _re.compile(r"\b(account|login|log ?in|sign(ed)? ?in|username)\b", _re.I)
+_SMART_RE = _re.compile(r"\b(tuya|2 ?ua|smart ?life|smart (home|devices?|plugs?|lights?|fans?|lamps?))\b", _re.I)
+_NOT_ACCOUNT_RE = _re.compile(r"\b(add|create|delete|remove|sign out|log ?out|link|unlink|reset)\b", _re.I)
+
+
+def _account_route(text):
+    t = str(text or "")
+    if (len(t) <= 160 and _ACCOUNT_RE.search(t) and _SMART_RE.search(t)
+            and not _NOT_ACCOUNT_RE.search(t)):
+        return "[ACTION: smart_home_account]"
+    return None
