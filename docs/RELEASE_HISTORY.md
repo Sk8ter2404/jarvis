@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.229 (2026-10-20)
+
+Test-only fix for GitHub CI: v2.0.228's new two-hand test imported a module it never used, which the pyflakes lint step rejects (the local suite does not run pyflakes). No change to JARVIS itself.
+
 ## v2.0.228 (2026-10-20)
 
 The webcam hand mouse catches up with the Kinect one: a steady frame pump feeds the hand tracker at the camera's own rate (it was getting clumps between ~6 fps face-detection passes - the lag), the on-screen reticle, fist-drag scrolling, a two-fist grab that moves / resizes the window under your hands (HAND_TWO_HAND_ENABLED, off by default), and no false triggers: minimum tracker score and hand size, a settle time for a new hand, poses confirmed over several frames, no engage right after you type or move the mouse, the cursor locked to your hand. The HUD camera preview runs ~15 fps while the tracker runs and the HUD reads it every 33 ms.

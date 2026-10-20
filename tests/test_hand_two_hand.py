@@ -18,7 +18,6 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from core import config  # noqa: E402
-from core import hand_mouse as hm  # noqa: E402
 from core import hand_two_hand as h2  # noqa: E402
 from tests.test_hand_mouse import FakeLauncher, FakeMouse, ht, hand, msg  # noqa: E402
 
