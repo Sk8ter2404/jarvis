@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.227 (2026-10-20)
+
+JARVIS moves between your machines as one copy. Every setting that isn't tied to the hardware is now shared: a change on the desktop or the Dell reaches the other one (newest change wins; cameras, Kinect, hands, monitors, audio devices, mic levels, folders and tunnels stay per machine), and a machine boots already matching the other. At a handoff the conversation in progress travels too - 'Picking up where we left off on the desktop, sir.' - and a version difference between the two is logged. Also: a brain reached through a tunnel on the laptop is treated as remote, so the Dell's boot no longer starts its own empty Ollama and waits ~90 s.
+
 ## v2.0.226 (2026-10-20)
 
 A device renamed in Alexa, Tuya or Kasa now gets its new name in JARVIS: the catalog merge kept any stored name, so the first name discovery ever saw stuck for good. Each device now also records the name and controller that discovery gave it, so a name you edited by hand still survives, but a rename at the source arrives on the next discovery.

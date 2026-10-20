@@ -65,9 +65,13 @@ def peer_bundle_path(host: str) -> str:
     return os.path.join(_DATA, f"peer_memory_from_{_safe_host(host)}.json")
 
 
-def build_bundle(sessions, facts, now=None, host=None) -> dict:
+def build_bundle(sessions, facts, now=None, host=None, settings=None,
+                 version=None, conversation=None) -> dict:
     """This machine's OWN memory only: anything imported from the peer is
-    left out, so nothing echoes back."""
+    left out, so nothing echoes back. Since 2026-10-20 ("JARVIS jumping from
+    one machine to another like an identical copy") it also carries this
+    machine's shared-settings ledger (core/peer_settings.py), its VERSION,
+    and - only in the hand-over push - the conversation in progress."""
     now = time.time() if now is None else now
     s_cut, f_cut = now - SESSION_DAYS * 86400, now - FACT_DAYS * 86400
     own_sessions = [s for s in sessions or []
@@ -79,8 +83,59 @@ def build_bundle(sessions, facts, now=None, host=None) -> dict:
                  if isinstance(f, dict) and f.get("text") and _owner_said(f)
                  and not str(f.get("source") or "").startswith(_FACT_SOURCE)
                  and _num(f.get("created_at")) >= f_cut]
-    return {"host": host or _host(), "written_at": now,
-            "sessions": own_sessions, "facts": own_facts}
+    bundle = {"host": host or _host(), "written_at": now,
+              "sessions": own_sessions, "facts": own_facts}
+    if settings:
+        bundle["settings"] = settings
+    if version:
+        bundle["version"] = str(version)
+    turns = conversation_turns(conversation)
+    if turns:
+        bundle["conversation"] = {"at": now, "turns": turns}
+    return bundle
+
+
+# The conversation in progress travels with a handoff: the last turns, as
+# plain text (images and tool blocks dropped), each capped.
+CONVERSATION_TURNS = 12
+CONVERSATION_MAX_CHARS = 1200
+# The arriving copy takes the conversation only when the hand-over is fresh.
+CONVERSATION_FRESH_S = 900.0
+
+
+def _turn_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(b.get("text") or "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def conversation_turns(history) -> list:
+    """The last CONVERSATION_TURNS user / assistant messages of ``history``
+    as {"role", "content"} with text content only."""
+    out = []
+    for m in list(history or [])[-CONVERSATION_TURNS:]:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            continue
+        text = _turn_text(m.get("content")).strip()
+        if text:
+            out.append({"role": m["role"],
+                        "content": text[:CONVERSATION_MAX_CHARS]})
+    return out
+
+
+def handed_over_conversation(bundle, now=None) -> list:
+    """The turns a FRESH hand-over bundle carries ([] when there are none or
+    the bundle is older than CONVERSATION_FRESH_S)."""
+    now = time.time() if now is None else now
+    conv = (bundle or {}).get("conversation") if isinstance(bundle, dict) else None
+    if not isinstance(conv, dict):
+        return []
+    if now - _num(conv.get("at")) > CONVERSATION_FRESH_S:
+        return []
+    return conversation_turns(conv.get("turns"))
 
 
 def _num(v) -> float:
@@ -181,9 +236,11 @@ def _save_marks(marks: dict, path: str = IMPORT_MARKS) -> None:
 
 
 def import_bundle(path: str, name: str, merge_sessions, add_fact,
-                  marks: dict) -> tuple:
+                  marks: dict, apply_settings=None) -> tuple:
     """Fold one peer bundle into this machine's memory once per version of
-    it. (sessions merged, facts added) - (0, 0) when already imported."""
+    it. (sessions merged, facts added) - (0, 0) when already imported.
+    ``apply_settings(ledger)`` (optional) merges the bundle's shared
+    settings into this machine's settings file."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             bundle = json.load(f)
@@ -206,25 +263,73 @@ def import_bundle(path: str, name: str, merge_sessions, add_fact,
             n_facts += 1
         except Exception:
             pass
+    if apply_settings is not None and isinstance(bundle.get("settings"), dict):
+        try:
+            apply_settings(bundle["settings"])
+        except Exception:
+            pass
     marks[key] = written
     return (n_sessions, n_facts)
 
 
-def _own_bundle() -> dict:
+def arrival_handover(data_dir: str = _DATA, now=None) -> dict:
+    """What the copy that just stood down handed this one: its pushed bundle
+    (data/peer_memory_from_<peer>.json, written before it exited). {"turns":
+    [...], "age_s": seconds since the hand-over, "version": its VERSION,
+    "host": its name}, or {} when there is no fresh hand-over. Never raises."""
+    import glob
+    try:
+        now = time.time() if now is None else now
+        best = None
+        for path in glob.glob(os.path.join(data_dir, "peer_memory_from_*.json")):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    b = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(b, dict) or _safe_host(b.get("host") or "") == _safe_host(_host()):
+                continue
+            if best is None or _num(b.get("written_at")) > _num(best.get("written_at")):
+                best = b
+        if not best:
+            return {}
+        turns = handed_over_conversation(best, now=now)
+        if not turns:
+            return {}
+        return {"turns": turns,
+                "age_s": max(0.0, now - _num((best.get("conversation") or {}).get("at"))),
+                "version": str(best.get("version") or ""),
+                "host": str(best.get("host") or "")}
+    except Exception:
+        return {}
+
+
+def own_version() -> str:
+    try:
+        with open(os.path.join(_ROOT, "VERSION"), "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _own_bundle(conversation=None) -> dict:
     import memory as _pm
     from core import long_term_memory as _ltm
+    from core import peer_settings as _peer_settings
     with _pm._session_lock:
         sessions = list(_pm._load_sessions_file())
     try:
         facts = _ltm.list_facts()
     except Exception:
         facts = []
-    return build_bundle(sessions, facts)
+    return build_bundle(sessions, facts, settings=_peer_settings.load_ledger(),
+                        version=own_version(), conversation=conversation)
 
 
-def sync_out(log=print) -> bool:
-    """Write this machine's bundle and push it to the peer (if it is on)."""
-    if not write_self_bundle(_own_bundle()):
+def sync_out(log=print, conversation=None) -> bool:
+    """Write this machine's bundle and push it to the peer (if it is on).
+    ``conversation`` (the hand-over push only): the chat in progress."""
+    if not write_self_bundle(_own_bundle(conversation)):
         return False
     ok = push(_handoff.peer_target())
     if ok:
@@ -236,13 +341,20 @@ def import_all(marks: dict, log=print) -> int:
     import glob
     import memory as _pm
     from core import long_term_memory as _ltm
+    from core import peer_settings as _peer_settings
     name = _handoff.peer_name()
     own = os.path.basename(peer_bundle_path(_host()))
     total = 0
+
+    def _settings(ledger):
+        # Applies at this machine's next start, like any settings change.
+        _peer_settings.apply_peer_ledger(ledger, log=log)
+
     for path in glob.glob(os.path.join(_DATA, "peer_memory_from_*.json")):
         if os.path.basename(path) == own:
             continue
-        s, f = import_bundle(path, name, _pm.merge_peer_sessions, _ltm.add_fact, marks)
+        s, f = import_bundle(path, name, _pm.merge_peer_sessions, _ltm.add_fact,
+                             marks, apply_settings=_settings)
         if s or f:
             log(f"  [peer-memory] from the {name}: {s} session(s), {f} fact(s)")
             total += s + f

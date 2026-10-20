@@ -191,5 +191,28 @@ class StartTests(_Cfg):
         self.assertTrue(all(c.kwargs.get("daemon") for c in thread.call_args_list))
 
 
+
+class ArrivalTests(_Cfg):
+    """2026-10-20: after the peer stood down, the arriving copy picks up what
+    it handed over; any other outcome (not running, unreachable) does not."""
+
+    def test_arrival_runs_only_after_a_real_stand_down(self):
+        for outcome, expect in (("stood down", 1), ("not running", 0),
+                                ("unreachable (exit 255)", 0)):
+            with self.subTest(outcome=outcome):
+                calls = []
+                with mock.patch.object(H, "ask_peer_to_stand_down", return_value=outcome):
+                    self.assertEqual(H._ask_then_arrive(lambda: calls.append(1),
+                                                        log=lambda m: None), outcome)
+                self.assertEqual(len(calls), expect)
+
+    def test_a_failing_arrival_is_logged_not_raised(self):
+        logs = []
+        def boom():
+            raise RuntimeError("nope")
+        with mock.patch.object(H, "ask_peer_to_stand_down", return_value="stood down"):
+            H._ask_then_arrive(boom, log=logs.append)
+        self.assertTrue(any("arrival hand-over failed" in m for m in logs))
+
 if __name__ == "__main__":
     unittest.main()

@@ -3102,6 +3102,16 @@ def _apply_user_settings() -> None:
     path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "data", "user_settings.json")
+    # One set of settings across the owner's machines (2026-10-20): take the
+    # other machine's newer SHARED settings from the bundle already on this
+    # disk before the file is read, so this copy boots matching it. Local
+    # files only; off without a handoff partner. core/peer_settings.py.
+    try:
+        from core import peer_settings as _peer_settings
+        if path == _peer_settings.SETTINGS_PATH:
+            _peer_settings.apply_pending(log=print)
+    except Exception:
+        pass
     try:
         if not os.path.exists(path):
             return

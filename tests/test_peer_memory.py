@@ -165,5 +165,65 @@ class SwitchTests(unittest.TestCase):
         thread.assert_not_called()
 
 
+
+class HandoverTests(unittest.TestCase):
+    """2026-10-20: the hand-over carries the settings ledger, the VERSION and
+    (only in the stand-down push) the conversation in progress."""
+
+    def test_the_bundle_carries_settings_version_and_a_text_only_conversation(self):
+        history = [{"role": "user", "content": "Jarvis, what's on my calendar?"},
+                   {"role": "assistant", "content": [{"type": "text", "text": "Nothing today, sir."},
+                                                     {"type": "image", "source": {}}]},
+                   {"role": "system", "content": "never travels"},
+                   {"role": "user", "content": "x" * 5000}]
+        b = M.build_bundle([], [], now=NOW, host="DESK",
+                           settings={"HUMOR_MODE": {"v": "sarcastic", "t": NOW}},
+                           version="2.0.227", conversation=history)
+        self.assertEqual(b["settings"]["HUMOR_MODE"]["v"], "sarcastic")
+        self.assertEqual(b["version"], "2.0.227")
+        turns = b["conversation"]["turns"]
+        self.assertEqual([t["role"] for t in turns], ["user", "assistant", "user"])
+        self.assertEqual(turns[1]["content"], "Nothing today, sir.")
+        self.assertEqual(len(turns[2]["content"]), M.CONVERSATION_MAX_CHARS)
+        self.assertNotIn("conversation", M.build_bundle([], [], now=NOW, host="DESK"))
+
+    def test_only_a_fresh_hand_over_is_taken(self):
+        b = M.build_bundle([], [], now=NOW, host="DESK",
+                           conversation=[{"role": "user", "content": "hi"}])
+        self.assertEqual(len(M.handed_over_conversation(b, now=NOW + 60)), 1)
+        self.assertEqual(M.handed_over_conversation(b, now=NOW + M.CONVERSATION_FRESH_S + 1), [])
+        self.assertEqual(M.handed_over_conversation(None, now=NOW), [])
+
+    def test_arrival_takes_the_newest_peer_bundle_never_its_own(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        def put(name, host, at, text):
+            b = M.build_bundle([], [], now=at, host=host,
+                               conversation=[{"role": "user", "content": text}], version="2.0.1")
+            with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+                json.dump(b, f)
+        put("peer_memory_from_DESK.json", "DESK", NOW - 30, "desk words")
+        put("peer_memory_from_ME.json", "ME", NOW - 5, "my own words")
+        with mock.patch.object(M, "_host", return_value="ME"):
+            got = M.arrival_handover(d, now=NOW)
+        self.assertEqual(got["turns"][0]["content"], "desk words")
+        self.assertEqual(got["host"], "DESK")
+        self.assertEqual(got["version"], "2.0.1")
+        self.assertAlmostEqual(got["age_s"], 30.0)
+        self.assertEqual(M.arrival_handover(os.path.join(d, "missing"), now=NOW), {})
+
+    def test_import_hands_the_settings_to_the_applier_once(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "peer_memory_from_DESK.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(M.build_bundle([], [], now=NOW, host="DESK",
+                                     settings={"HUMOR_MODE": {"v": "dry", "t": NOW}}), f)
+        seen, marks = [], {}
+        for _ in range(2):
+            M.import_bundle(path, "desktop", lambda e: 0, lambda *a, **k: None,
+                            marks, apply_settings=seen.append)
+        self.assertEqual(seen, [{"HUMOR_MODE": {"v": "dry", "t": NOW}}])
+
 if __name__ == "__main__":
     unittest.main()

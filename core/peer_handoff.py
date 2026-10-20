@@ -178,13 +178,29 @@ def watch(started_at: float, on_stand_down, stop: threading.Event,
 _stop = threading.Event()
 
 
-def start(on_stand_down, log=print) -> bool:
+def _ask_then_arrive(on_arrival, log=print) -> str:
+    """Ask the peer to stand down; when it did ("stood down"), it has pushed
+    its memory and the conversation in progress before exiting, so
+    ``on_arrival()`` can pick them up (2026-10-20, "JARVIS jumping from one
+    machine to another like an identical copy")."""
+    result = ask_peer_to_stand_down(log=log)
+    if result == "stood down" and on_arrival is not None:
+        try:
+            on_arrival()
+        except Exception as e:
+            log(f"  [handoff] arrival hand-over failed: {e}")
+    return result
+
+
+def start(on_stand_down, log=print, on_arrival=None) -> bool:
     """Boot hook: ask the peer to stand down (background) and watch for the
-    peer asking the same of this instance. False when the feature is off."""
+    peer asking the same of this instance. ``on_arrival`` (optional) runs
+    after the peer stood down. False when the feature is off."""
     if not enabled():
         return False
     started_at = process_started_at()
-    threading.Thread(target=ask_peer_to_stand_down, kwargs={"log": log},
+    threading.Thread(target=_ask_then_arrive, args=(on_arrival,),
+                     kwargs={"log": log},
                      name="peer-handoff-ask", daemon=True).start()
     threading.Thread(target=watch, args=(started_at, on_stand_down, _stop),
                      kwargs={"log": log}, name="peer-handoff-watch",

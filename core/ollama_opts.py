@@ -64,25 +64,34 @@ _SIZE_RE = re.compile(r"(?<![a-z0-9])(\d+)b\b")
 # (a static test fails if a probe pins a literal timeout again).
 PROBE_TIMEOUT_LOCAL_S = 2
 PROBE_TIMEOUT_REMOTE_S = 8
+# Ollama's own port. A loopback URL on any OTHER explicit port is a forward to
+# another machine (2026-10-20: the Dell reaches the desktop's brain through an
+# SSH tunnel on 127.0.0.1:21434; read as local, the boot started the laptop's
+# empty Ollama, reaped it as "wedged" and waited ~90 s before the tunnel rose).
+OLLAMA_PORT = 11434
 
 
 def endpoint_is_remote(base_url) -> bool:
     """True when ``base_url`` points OFF this machine.
 
     Loopback is the whole 127.0.0.0/8 block, ``localhost``, ``::1`` and the
-    wildcard ``0.0.0.0``. Anything unparseable returns False: treating junk as
-    local keeps the pre-existing behaviour (short probe, local self-heal allowed)
-    instead of inventing a remote brain. Never raises."""
+    wildcard ``0.0.0.0`` - on Ollama's own port or no port. A loopback URL on
+    another explicit port is a tunnel to another machine, so it is remote.
+    Anything unparseable returns False: treating junk as local keeps the
+    pre-existing behaviour (short probe, local self-heal allowed) instead of
+    inventing a remote brain. Never raises."""
     try:
         s = str(base_url or "").strip()
         if not s:
             return False
-        host = urlsplit(s if "//" in s else "//" + s).hostname
+        parts = urlsplit(s if "//" in s else "//" + s)
+        host = parts.hostname
         if not host:
             return False
         host = host.lower()
         if host in ("localhost", "::1", "0.0.0.0") or host.startswith("127."):
-            return False
+            port = parts.port
+            return bool(port) and port != OLLAMA_PORT
         return True
     except Exception:
         return False

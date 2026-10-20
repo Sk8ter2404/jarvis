@@ -4521,10 +4521,46 @@ def _handoff_stand_down(reason: str):
         print(f"  [handoff] final session summary failed: {_e}")
     try:
         from core import peer_memory as _peer_memory
-        _peer_memory.sync_out()
+        # The conversation in progress goes too (2026-10-20, "like JARVIS
+        # jumping from one machine to another"): _handoff_arrived picks it up.
+        _peer_memory.sync_out(conversation=list(conversation_history))
     except Exception as _e:
         print(f"  [handoff] memory hand-over failed: {_e}")
     return ACTIONS["shutdown_jarvis"](reason)
+
+
+# A hand-over this fresh was a live conversation: say so when picking it up.
+_HANDOFF_PICKUP_SPEAK_S = 300.0
+
+
+def _handoff_arrived():
+    """The other machine's copy just stood down for this one
+    (core/peer_handoff.start's on_arrival). Take the conversation it handed
+    over into conversation_history, so a follow-up ("and the other one?")
+    still has its context, and say where it left off when it was live.
+    A version difference between the two copies is logged. Never raises."""
+    try:
+        from core import peer_handoff as _peer_handoff
+        from core import peer_memory as _peer_memory
+        got = _peer_memory.arrival_handover()
+        name = _peer_handoff.peer_name()
+        mine = _peer_memory.own_version()
+        if got.get("version") and mine and got["version"] != mine:
+            print(f"  [handoff] version differs: the {name} runs "
+                  f"v{got['version']}, this machine v{mine}")
+        turns = got.get("turns") or []
+        if not turns:
+            return
+        if len(conversation_history) > 2:
+            return          # a conversation already started here
+        conversation_history[:0] = turns
+        _trim_conversation_history()
+        print(f"  [handoff] picked up {len(turns)} message(s) of the "
+              f"conversation from the {name}")
+        if float(got.get("age_s") or 1e9) <= _HANDOFF_PICKUP_SPEAK_S:
+            _speak(f"Picking up where we left off on the {name}, sir.")
+    except Exception as _e:
+        print(f"  [handoff] picking up the conversation failed: {_e}")
 
 
 def _session_summary_checkpoint_thread():
@@ -50737,7 +50773,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     try:
         from core import peer_handoff as _peer_handoff
         from core import peer_memory as _peer_memory
-        _peer_handoff.start(_handoff_stand_down)
+        _peer_handoff.start(_handoff_stand_down, on_arrival=_handoff_arrived)
         # One memory too: trade session summaries + facts with the other
         # machine, so either copy can say what happened on the other one.
         _peer_memory.start()

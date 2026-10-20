@@ -76,6 +76,17 @@ class EndpointLocalityTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertFalse(ollama_opts.endpoint_is_remote(bad))
 
+    def test_a_loopback_tunnel_port_is_remote(self):
+        # 2026-10-20: the Dell's brain is the desktop's, through an SSH tunnel
+        # on 127.0.0.1:21434. Read as local, the boot started (and reaped) the
+        # laptop's own empty Ollama and waited ~90 s for the tunnel.
+        for url in ("http://127.0.0.1:21434", "http://localhost:21434/",
+                    "127.0.0.1:21434"):
+            with self.subTest(url=url):
+                self.assertTrue(ollama_opts.endpoint_is_remote(url))
+        self.assertFalse(ollama_opts.endpoint_is_remote("http://127.0.0.1:11434"))
+        self.assertFalse(ollama_opts.endpoint_is_remote("http://localhost"))
+
     def test_remote_timeout_is_longer_than_local(self):
         self.assertGreater(ollama_opts.PROBE_TIMEOUT_REMOTE_S,
                            ollama_opts.PROBE_TIMEOUT_LOCAL_S)
