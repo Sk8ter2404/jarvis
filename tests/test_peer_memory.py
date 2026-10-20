@@ -35,16 +35,24 @@ class BundleTests(unittest.TestCase):
             {"ts": NOW - 40 * 86400, "iso_start": "c", "summary": "old"},
             {"ts": NOW, "iso_start": "d", "summary": ""},
         ]
+        owner = {"speaker": "owner", "source": "voice"}
         facts = [
-            {"text": "the owner's Teams is the new MSIX app", "created_at": NOW - 60, "tags": ["pc"]},
-            {"text": "from the laptop", "created_at": NOW - 60, "source": "peer:laptop"},
-            {"text": "ancient", "created_at": NOW - 90 * 86400},
+            {"text": "the owner's Teams is the new MSIX app", "created_at": NOW - 60, "tags": ["pc"],
+             "provenance": owner},
+            {"text": "from the laptop", "created_at": NOW - 60, "source": "peer:laptop",
+             "provenance": owner},
+            {"text": "ancient", "created_at": NOW - 90 * 86400, "provenance": owner},
+            # 10-06 on the Dell: overheard in a classroom, speaker unknown.
+            {"text": "a classmate's plan", "created_at": NOW - 60,
+             "provenance": {"speaker": "unknown", "source": "ambient"}},
+            {"text": "no provenance at all", "created_at": NOW - 60},
         ]
         b = M.build_bundle(sessions, facts, now=NOW, host="DESK")
         self.assertEqual(b["host"], "DESK")
         self.assertEqual([s["iso_start"] for s in b["sessions"]], ["a"])
         self.assertEqual([f["text"] for f in b["facts"]], ["the owner's Teams is the new MSIX app"])
         self.assertEqual(b["facts"][0]["tags"], ["pc"])
+        self.assertEqual(b["facts"][0]["speaker"], "owner")
 
 
 class PeerEntryTests(unittest.TestCase):
@@ -69,7 +77,7 @@ class ImportTests(unittest.TestCase):
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump({"host": "DELL", "written_at": written_at,
                        "sessions": [{"iso_start": "s1", "ts": NOW, "summary": "Did homework."}],
-                       "facts": [{"text": t, "tags": []} for t in facts]}, f)
+                       "facts": [{"text": t, "tags": [], "speaker": "owner"} for t in facts]}, f)
 
     def test_each_version_of_a_bundle_is_imported_once(self):
         merged, added, marks = [], [], {}
@@ -85,6 +93,18 @@ class ImportTests(unittest.TestCase):
         # A newer version: imported.
         self._bundle(NOW + 600)
         self.assertEqual(M.import_bundle(self.path, "Dell laptop", merge, add, marks), (1, 1))
+
+    def test_facts_not_said_by_the_owner_are_never_imported(self):
+        # An older copy's bundle carries no speaker; a newer one names it.
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"host": "DELL", "written_at": NOW, "sessions": [],
+                       "facts": [{"text": "a classmate's plan"},
+                                 {"text": "overheard", "speaker": "unknown"},
+                                 {"text": "the owner's own", "speaker": "owner"}]}, f)
+        added = []
+        M.import_bundle(self.path, "Dell laptop", lambda e: 0,
+                        lambda text, **kw: added.append(text), {})
+        self.assertEqual(added, ["the owner's own"])
 
     def test_a_broken_bundle_or_failing_fact_never_raises(self):
         with open(self.path, "w") as f:

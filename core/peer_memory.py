@@ -40,6 +40,17 @@ IMPORT_EVERY_S = 60.0
 SESSION_DAYS = 14
 FACT_DAYS = 30
 _FACT_SOURCE = "peer:"
+# Only facts the owner himself said cross between machines (2026-10-19). The
+# Dell had AMBIENT_LEARN_FROM_EVERYONE on: 43 facts overheard in a classroom on
+# 10-06 carry provenance speaker "unknown", and its first push would have
+# landed them on the desktop. The bundle names the speaker; the importer
+# takes only "owner", so an older copy's bundle (no speaker) shares sessions
+# but no facts.
+OWNER = "owner"
+
+
+def _owner_said(fact: dict) -> bool:
+    return (fact.get("provenance") or {}).get("speaker") == OWNER
 
 
 def _host() -> str:
@@ -63,9 +74,9 @@ def build_bundle(sessions, facts, now=None, host=None) -> dict:
                     if isinstance(s, dict) and not s.get("from_peer")
                     and s.get("summary") and _num(s.get("ts")) >= s_cut]
     own_facts = [{"text": f.get("text"), "tags": list(f.get("tags") or []),
-                  "created_at": f.get("created_at")}
+                  "created_at": f.get("created_at"), "speaker": OWNER}
                  for f in facts or []
-                 if isinstance(f, dict) and f.get("text")
+                 if isinstance(f, dict) and f.get("text") and _owner_said(f)
                  and not str(f.get("source") or "").startswith(_FACT_SOURCE)
                  and _num(f.get("created_at")) >= f_cut]
     return {"host": host or _host(), "written_at": now,
@@ -188,7 +199,7 @@ def import_bundle(path: str, name: str, merge_sessions, add_fact,
     n_facts = 0
     for fact in bundle.get("facts") or []:
         text = str((fact or {}).get("text") or "").strip()
-        if not text:
+        if not text or (fact or {}).get("speaker") != OWNER:
             continue
         try:
             add_fact(text, source=_FACT_SOURCE + name, tags=fact.get("tags") or [])

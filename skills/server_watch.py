@@ -339,9 +339,20 @@ _NOT_RE = re.compile(r"\b(minecraft|discord|game|voice|clone|web ?server|mod|"
                      r"modshit|jarvis'?s? server|test server)\b", re.I)
 
 
+# "how long until that data rebuild's done?" (live 19:38) names no server.
+_REBUILD_RE = re.compile(
+    r"\b(how long|how far|how much longer|when|is|has|what'?s|whats|progress|status)\b.{0,40}?"
+    r"\b(rebuild|parity( check| sync)?|data rebuild|array)\b", re.I)
+_REBUILD_NOT_RE = re.compile(r"\b(website|site|app|project|index|cache|model|plan)\b", re.I)
+
+
 def _route(text):
     t = str(text or "")
-    if len(t) <= 120 and _ROUTE_RE.search(t) and not _NOT_RE.search(t):
+    if len(t) > 120:
+        return None
+    if _ROUTE_RE.search(t) and not _NOT_RE.search(t):
+        return "[ACTION: server_status]"
+    if host() and _REBUILD_RE.search(t) and not (_NOT_RE.search(t) or _REBUILD_NOT_RE.search(t)):
         return "[ACTION: server_status]"
     return None
 

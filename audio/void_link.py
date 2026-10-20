@@ -52,7 +52,16 @@ THE ONLY INTERPRETATIONS THE DATA SUPPORTS
                        though. I'm using it right now", 10:46), battery byte
                        0x0a = 10%. As UNKNOWN it held the last state, which was
                        OFF, so JARVIS kept saying the headset was off.
-  reply[4] == 0x00  -> link DOWN
+  reply[4] == 0x05  -> link UP, charging. MEASURED 2026-10-19: 6400c5b105 at
+                       11:48 and 640064b105 at 19:34 with the headset switched
+                       on and plugged in (owner confirmed, 19:3x); switched OFF
+                       but still plugged in it reads 6400003400 = 0x00 (19:35),
+                       so 0x05 is never a charging headset that is off. As
+                       UNKNOWN it held the microphone on a headset he was not
+                       wearing (19:17-19:31, digital silence) and kept the
+                       deaf-mic rescue, which runs only for a headset believed
+                       ON, from ever firing.
+  reply[4] == 0x00  -> link DOWN (also: off while charging)
   reply[4] == other -> UNKNOWN. Not observed; not guessed.
   battery_pct = reply[2] & 0x7F, and ONLY meaningful while the link is up.
                 0xde -> 94, 0xdc -> 92, 0xe0 -> 96: a plausible draining pack.
@@ -145,7 +154,7 @@ REPLY_MAGIC = 0x64          # reply[0] echoes this when the reply is real
 REPLY_MIN_LEN = 5           # every observed reply was exactly 5 bytes
 
 LINK_BYTE = 4               # reply[4]: 0x01 up, 0x00 down
-LINK_UP_BYTES = (0x01, 0x02)  # 0x02 = up, seen at 10-13% battery (measured 2026-10-19)
+LINK_UP_BYTES = (0x01, 0x02, 0x05)  # 0x02 up at 10-13% battery, 0x05 up + charging (measured 2026-10-19)
 BATTERY_BYTE = 2            # reply[2] & 0x7F, only while the link is up
 BATTERY_MASK = 0x7F
 

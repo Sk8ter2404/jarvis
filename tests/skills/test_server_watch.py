@@ -140,6 +140,19 @@ class RouteAndRegisterTests(unittest.TestCase):
             with self.subTest(t=t):
                 self.assertIsNone(W._route(t))
 
+    def test_rebuild_questions_route_when_a_server_is_watched(self):
+        from core import config as cfg
+        with mock.patch.object(cfg, "SERVER_WATCH_HOST", "nas.example", create=True):
+            for t in ("Jarvis, how long until that data rebuild's done?",
+                      "how far along is the parity check", "is the rebuild finished"):
+                with self.subTest(t=t):
+                    self.assertEqual(W._route(t), "[ACTION: server_status]")
+            for t in ("rebuild the website", "how long until the index rebuild is done"):
+                with self.subTest(t=t):
+                    self.assertIsNone(W._route(t))
+        with mock.patch.object(cfg, "SERVER_WATCH_HOST", "", create=True):
+            self.assertIsNone(W._route("how long until the rebuild is done"))
+
     def test_registered_actions_and_no_thread_under_tests(self):
         actions = {}
         with mock.patch.object(W.threading, "Thread") as thread:

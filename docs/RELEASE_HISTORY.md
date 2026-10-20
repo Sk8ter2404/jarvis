@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.222 (2026-10-20)
+
+Stops answering the room TV (camera sees the TV on + a full 30 s capture of nonstop sound + a voice that isn't clearly his -> dropped, with a spoken 'couldn't tell that was you'); the voice server restarts itself after 3 CUDA-error renders (a GPU driver reset left it broken); the headset's charging status (0x05) counts as on, so the deaf-mic rescue can run; rebuild/parity questions go to the server skill; only facts the owner said himself are shared or imported between the machines.
+
 ## v2.0.221 (2026-10-19)
 
 'Which account are my smart devices on?' is answered from Tuya itself: the JARVIS project's linked user and Tuya's user record give 'Your 7 Tuya devices are in the Smart Life app, signed in with your phone number ending 6707 (an account from March 2019); the Tuya Smart app is a separate account.' Only the last 4 digits are spoken. Also fixes v2.0.220's red GitHub check: the new skills' unused alias names are gone.

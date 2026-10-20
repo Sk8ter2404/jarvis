@@ -1597,3 +1597,84 @@ class FastConnectTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelfHealTests(unittest.TestCase):
+    """2026-10-19 11:59: a graphics-driver reset left the server answering
+    /health 200 while EVERY render failed 500 {"error": "RuntimeError: CUDA
+    error: unknown error"}; JARVIS spoke Kokoro until it was restarted by hand.
+    No server or thread is real here."""
+
+    def setUp(self):
+        from core import clone_voice_client as cvc
+        self.cvc = cvc
+        self.logs = []
+        self.now = [1000.0]
+        self.c = cvc.CloneVoiceClient(log=self.logs.append, clock=lambda: self.now[0],
+                                      sleep=lambda s: None)
+        self.c._start_kwargs = {"url": "http://127.0.0.1:8767", "cmd": "x",
+                                "profile": "jarvis", "log_path": None, "on_ready": None}
+
+        class _SyncThread:
+            def __init__(self, target, args=(), name="", daemon=True):
+                self.target, self.args = target, args
+
+            def start(self):
+                self.target(*self.args)
+        self.c._heal_thread_factory = _SyncThread
+        # Each patch is stopped on its own: mock.patch.stopall() would also stop
+        # the suite-wide guards other tests rely on (it did: 10 screenshot
+        # tests later in the run lost their fakes).
+        self.stop = self._patch("stop_server", return_value=True)
+        self.health = self._patch("_health", return_value=(None, {}))
+        self.start = self._patch("start", return_value="ready")
+
+    def _patch(self, name, **kw):
+        p = mock.patch.object(self.c, name, **kw)
+        m = p.start()
+        self.addCleanup(p.stop)
+        return m
+
+    def _fail(self, gpu=True, n=1):
+        for _ in range(n):
+            self.c._failed("http 500", self.now[0], True, {}, gpu_error=gpu)
+
+    def test_three_cuda_errors_in_a_row_restart_the_server_once(self):
+        self._fail(n=2)
+        self.stop.assert_not_called()
+        self._fail()
+        self.stop.assert_called_once()
+        self.start.assert_called_once_with(**self.c._start_kwargs)
+        self.assertTrue(any("restarting the voice server" in ln for ln in self.logs))
+        self.assertEqual(self.c._server_errors, 0)
+        self.assertFalse(self.c._healing)
+
+    def test_other_server_errors_never_restart_it(self):
+        self._fail(gpu=False, n=6)
+        self.stop.assert_not_called()
+
+    def test_a_good_render_resets_the_count(self):
+        self._fail(n=2)
+        self.c._succeeded()
+        self._fail(n=2)
+        self.stop.assert_not_called()
+
+    def test_at_most_one_restart_per_gap(self):
+        self._fail(n=3)
+        self.now[0] += 60.0
+        self._fail(n=3)
+        self.assertEqual(self.stop.call_count, 1)
+        self.now[0] += self.cvc.HEAL_MIN_GAP_S
+        self._fail(n=3)
+        self.assertEqual(self.stop.call_count, 2)
+
+    def test_no_restart_before_start_ever_ran(self):
+        self.c._start_kwargs = None
+        self._fail(n=3)
+        self.stop.assert_not_called()
+
+    def test_the_500_body_travels_with_the_status(self):
+        e = self.cvc._HttpStatus(500, b'{"error": "RuntimeError: CUDA error: unknown error"}')
+        self.assertEqual(e.code, 500)
+        self.assertIn(b"cuda error", e.body.lower())
+        self.assertEqual(self.cvc._HttpStatus(503).body, b"")

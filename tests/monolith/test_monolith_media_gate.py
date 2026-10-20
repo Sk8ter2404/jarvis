@@ -405,3 +405,60 @@ class WiringTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+TV_LINE = ("Jarvis, you will worry too much. I show you, sir, my concern "
+           "algorithms are well within reason.")
+
+
+class RoomTvGateTests(_Base):
+    """Live 2026-10-19 12:53: a video on the ROOM TV (not PC audio, so the
+    media gate never looked) said "Jarvis, you worry too much..." - a 30.8 s
+    capture scoring 0.53 - and JARVIS answered it."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self.long = np.zeros(int(16000 * 30.8), dtype=np.float32)
+        bc._last_capture_audio = self.long
+        for p in (mock.patch.object(bc, "ROOM_TV_GATE_ENABLED", True, create=True),
+                  mock.patch.object(bc, "ROOM_TV_GATE_REJECT_BELOW", 0.60, create=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _tv(self, on=True):
+        return mock.patch.object(self.bc, "_room_tv_seen", return_value=on)
+
+    def test_live_replay_is_dropped(self):
+        with self._tv():
+            drop, lines, _ = self._gate(TV_LINE, peak=0.0,
+                                        vid=_FakeVoiceId("owner", 0.53))
+        self.assertTrue(drop)
+        self.assertTrue(any("[tv-gate]" in ln and "voice 0.53" in ln for ln in lines), lines)
+        self.assertFalse(any("worry" in ln for ln in lines))      # never the words
+
+    def test_his_own_voice_close_to_the_mic_passes_on_its_leading_speech(self):
+        # His "Jarvis, ..." loud at the start, the TV under the rest.
+        audio = np.zeros(int(16000 * 30.8), dtype=np.float32)
+        audio[16000:16000 * 3] = 0.3
+        audio[16000 * 4:] = 0.05
+        self.bc._last_capture_audio = audio
+        with self._tv():
+            drop, _, _ = self._gate("Jarvis, pause the TV", peak=0.0,
+                                    vid=_FakeVoiceId("owner", 0.50, short=("owner", 0.66)))
+        self.assertFalse(drop)
+
+    def test_tv_off_short_capture_stop_word_and_no_voice_id_all_pass(self):
+        with self._tv(on=False):
+            self.assertFalse(self._gate(TV_LINE, peak=0.0, vid=_FakeVoiceId("owner", 0.40))[0])
+        with self._tv():
+            self.bc._last_capture_audio = np.zeros(16000 * 8, dtype=np.float32)
+            self.assertFalse(self._gate(TV_LINE, peak=0.0, vid=_FakeVoiceId("owner", 0.40))[0])
+            self.bc._last_capture_audio = self.long
+            self.assertFalse(self._gate("Jarvis, stop", peak=0.0, vid=_FakeVoiceId("owner", 0.40))[0])
+            self.assertFalse(self._gate(TV_LINE, peak=0.0,
+                                        vid=_FakeVoiceId("owner", 0.40, available=False))[0])
+
+    def test_switch_off_restores_the_old_behaviour(self):
+        with self._tv(), mock.patch.object(self.bc, "ROOM_TV_GATE_ENABLED", False, create=True):
+            self.assertFalse(self._gate(TV_LINE, peak=0.0, vid=_FakeVoiceId("owner", 0.40))[0])

@@ -164,10 +164,19 @@ class ParseCapturedRepliesTests(unittest.TestCase):
             states = [link.state()[0] for _ in range(4)]
         self.assertEqual(states, [vl.LINK_UNKNOWN, vl.LINK_OFF, vl.LINK_OFF, vl.LINK_ON])
 
+    def test_charging_link_byte_is_on_and_off_while_charging_is_off(self):
+        """MEASURED 2026-10-19 with the headset switched on and plugged in:
+        6400c5b105 (11:48) and 640064b105 (19:34); switched off but still
+        plugged in: 6400003400 (19:35). Battery byte & 0x7F: 0xc5 -> 69,
+        0x64 -> 100."""
+        self.assertEqual(vl.parse_reply(bytes.fromhex("6400c5b105")), (vl.LINK_ON, 69))
+        self.assertEqual(vl.parse_reply(bytes.fromhex("640064b105")), (vl.LINK_ON, 100))
+        self.assertEqual(vl.parse_reply(bytes.fromhex("6400003400")), (vl.LINK_OFF, None))
+
     def test_unobserved_link_byte_is_unknown(self):
-        """Only 0x00, 0x01 and 0x02 have been seen in byte[4]. Anything else
-        is reported as unknown rather than lumped in with either."""
-        for link in (0x03, 0x7F, 0xFF):
+        """Only 0x00, 0x01, 0x02 and 0x05 have been seen in byte[4].
+        Anything else is reported as unknown rather than lumped in with either."""
+        for link in (0x03, 0x04, 0x7F, 0xFF):
             with self.subTest(link=link):
                 reply = bytes([0x64, 0x00, 0xde, 0xa1, link])
                 self.assertEqual(vl.parse_reply(reply), (vl.LINK_UNKNOWN, None))

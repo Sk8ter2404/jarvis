@@ -155,6 +155,16 @@ MAX_FAILURES = 3
 # over once the clone has run COOLDOWN_MAX_S without one.
 COOLDOWN_BASE_S = 300.0
 COOLDOWN_MAX_S = 1800.0
+# Self-heal (2026-10-19): a graphics-driver reset (11:59, 11 TDR events) left
+# the server alive with a broken CUDA context - /health answered 200 while
+# EVERY render failed "CUDA error: unknown error" (http 500, ~5 ms), so the
+# cool-down only ever rested a server that could not recover. After
+# HEAL_AFTER_SERVER_ERRORS http 500s in a row the client asks the server to
+# stop (POST /shutdown), waits for it to go, and starts it again exactly as
+# boot does; at most once per HEAL_MIN_GAP_S. Owner's go: 2026-10-19.
+HEAL_AFTER_SERVER_ERRORS = 3
+HEAL_MIN_GAP_S = 900.0
+HEAL_STOP_WAIT_S = 30.0
 # A line rendered ahead must be back this long before it is needed: the
 # hand-off to the player, and a Kokoro render if the clone still misses.
 # (Not with ``hold``: the reply already speaks in the clone, so a short pause
@@ -586,6 +596,13 @@ class CloneVoiceClient:
         self._server_sha = ""
         self._server_pid = None
         self._fails = 0
+        # Self-heal state (HEAL_*): server errors in a row, whether a restart
+        # is running, when the last one began, and start()'s own arguments.
+        self._server_errors = 0
+        self._healing = False
+        self._last_heal_at = float("-inf")
+        self._start_kwargs: Optional[dict] = None
+        self._heal_thread_factory = threading.Thread
         # The cool-down: when it ends, how many have run back to back (the
         # doubling), when the last one ended (the doubling's reset), and the
         # probation after it (one counted miss rests the clone again).
@@ -996,6 +1013,8 @@ class CloneVoiceClient:
         with self._mu:
             self._status = "starting"
             self._profile = str(profile or "")
+            self._start_kwargs = {"url": url, "cmd": cmd, "profile": profile,
+                                  "log_path": log_path, "on_ready": on_ready}
         spawned = False
         try:
             hp = parse_url(url)
@@ -1340,7 +1359,7 @@ class CloneVoiceClient:
             code, headers, data = self._request("POST", "/tts", body, wait_s,
                                                 cancel=cancel)
             if code != 200:
-                raise _HttpStatus(code)
+                raise _HttpStatus(code, data)
             pcm16, sr = decode_wav_pcm16(data)
             audio = finish_audio(pcm16.astype(np.float32) / 32768.0, sr)
             if audio is None:
@@ -1361,7 +1380,10 @@ class CloneVoiceClient:
             return self._failed("timed out", t0, critical and bool(count),
                                 info)
         except _HttpStatus as e:
-            return self._failed(f"http {e.code}", t0, bool(count), info)
+            gpu = (int(e.code or 0) >= 500
+                   and b"cuda error" in bytes(e.body or b"").lower())
+            return self._failed(f"http {e.code}", t0, bool(count), info,
+                                gpu_error=gpu)
         except Exception as e:
             return self._failed(f"error ({type(e).__name__}: {e})", t0,
                                 bool(count), info)
@@ -1393,10 +1415,11 @@ class CloneVoiceClient:
     def _succeeded(self) -> None:
         with self._mu:
             self._fails = 0
+            self._server_errors = 0
             self._probation = False
 
     def _failed(self, reason: str, t0: float, critical: bool = True,
-                info: Optional[dict] = None) -> Outcome:
+                info: Optional[dict] = None, gpu_error: bool = False) -> Outcome:
         """A failed render. Only a latency-critical one counts toward the
         cool-down; MAX_FAILURES of them in a row start it -- or ONE on
         probation, right after a cool-down -- with one log line. A failure
@@ -1432,8 +1455,59 @@ class CloneVoiceClient:
             self._log(f"  [clone-voice] {what} (last: {reason}); the clone "
                       f"voice rests for {rest_s / 60.0:.0f} min and Kokoro "
                       f"speaks until then")
+        self._maybe_heal(gpu_error, now)
         return Outcome(reason=reason, ms=ms, counted=bool(critical),
                        **(info or {}))
+
+    def _maybe_heal(self, gpu_error: bool, now: float) -> bool:
+        """Count a render the server refused with a CUDA error (its 500 body
+        reads "RuntimeError: CUDA error: ..."); after HEAL_AFTER_SERVER_ERRORS
+        in a row start one restart of the server (see HEAL_*). Any other
+        failure is not counted. True when this call started it. Never raises."""
+        try:
+            with self._mu:
+                if not gpu_error:
+                    return False
+                self._server_errors += 1
+                if (self._server_errors < HEAL_AFTER_SERVER_ERRORS
+                        or self._healing or not self._start_kwargs
+                        or now - self._last_heal_at < HEAL_MIN_GAP_S):
+                    return False
+                self._healing = True
+                self._last_heal_at = now
+                n = self._server_errors
+                kwargs = dict(self._start_kwargs)
+            self._log(f"  [clone-voice] {n} lines in a row failed with a CUDA "
+                      f"error (a graphics-driver reset leaves the server unable "
+                      f"to render); restarting the voice server")
+            self._heal_thread_factory(target=self._heal, args=(kwargs,),
+                                      name="clone-voice-heal", daemon=True).start()
+            return True
+        except Exception:
+            with self._mu:
+                self._healing = False
+            return False
+
+    def _heal(self, kwargs: dict) -> None:
+        """Stop the broken server, wait (bounded) for it to go, start it again
+        the way boot does. Never raises."""
+        try:
+            self.stop_server()
+            deadline = self._clock() + HEAL_STOP_WAIT_S
+            while self._clock() < deadline:
+                code, _info = self._health(1.0)
+                if code is None:
+                    break
+                self._sleep(1.0)
+            with self._mu:
+                self._status = "starting"
+            self.start(**kwargs)
+        except Exception as e:
+            self._log(f"  [clone-voice] restart failed ({type(e).__name__}: {e})")
+        finally:
+            with self._mu:
+                self._healing = False
+                self._server_errors = 0
 
     # ── cache ────────────────────────────────────────────────────────────
     @staticmethod
@@ -2082,9 +2156,10 @@ def _fast_connect(host: str, port: int, timeout_s: float):
 
 
 class _HttpStatus(Exception):
-    def __init__(self, code):
+    def __init__(self, code, body=b""):
         super().__init__(f"http {code}")
         self.code = code
+        self.body = body if isinstance(body, (bytes, bytearray)) else b""
 
 
 class _Cancelled(Exception):

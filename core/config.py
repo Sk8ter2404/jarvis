@@ -941,6 +941,19 @@ MEDIA_VOICE_GATE_ENABLED = True
 MEDIA_VOICE_GATE_PEAK = 0.01
 MEDIA_VOICE_GATE_REJECT_BELOW = 0.45
 
+# Room-TV gate (2026-10-19, owner: "stop answering the TV"). Live 12:53 a video
+# on the ROOM TV said "Jarvis, you worry too much..." and was answered: the TV
+# is not PC audio, so the media gate above never looked, and its voice scored
+# 0.53 - above that gate's 0.45 floor. What set it apart: the camera's TV
+# detector saw the TV on AND the capture ran the full MAX_RECORDING_SECS of
+# nonstop sound (a command ends when he stops talking). With both, a turn is
+# dropped (with the media gate's spoken cue) unless the whole capture or its
+# leading speech scores at least ROOM_TV_GATE_REJECT_BELOW against an enrolled
+# voice (his own voice close to the mic scores ~0.65). Stop words, guest mode
+# and typed turns always pass.
+ROOM_TV_GATE_ENABLED = True
+ROOM_TV_GATE_REJECT_BELOW = 0.60
+
 # Known-device speech filter (core/device_speech_filter.py). When True, an
 # utterance that matches a line a known device speaks (phrase lists in the
 # gitignored data/device_phrases/*.json) is ignored before the wake gate, the

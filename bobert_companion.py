@@ -37125,6 +37125,58 @@ def _owner_voice_over_media(audio, sr: int,
         return _learn_gate_mod.UNAVAILABLE, 0.0, ""
 
 
+def _room_tv_seen() -> bool:
+    """The camera's TV detector positively sees the room TV on (fail-safe:
+    False on any problem; see skills/tv_detect.is_tv_on)."""
+    try:
+        mod = sys.modules.get("skill_tv_detect")
+        return bool(mod is not None and mod.is_tv_on())
+    except Exception:
+        return False
+
+
+def _room_tv_gate(text: str, audio, sr: int) -> bool:
+    """True = DROP this mic turn (ROOM_TV_GATE_*, core/config.py): the room
+    TV is on, the capture ran the full MAX_RECORDING_SECS of nonstop sound,
+    and neither the whole capture nor its leading speech scores at least
+    ROOM_TV_GATE_REJECT_BELOW against an enrolled voice. Live 2026-10-19
+    12:53 a video on the TV saying "Jarvis, you worry too much..." (30.8 s,
+    voice 0.53) was answered. A stop word and guest mode pass; voice-ID
+    unavailable passes. Logs numbers only. Never raises (fails OPEN)."""
+    try:
+        if not ROOM_TV_GATE_ENABLED or audio is None or sr <= 0:
+            return False
+        secs = len(audio) / float(sr)
+        if secs < float(MAX_RECORDING_SECS) - 1.0 or not _room_tv_seen():
+            return False
+        try:
+            from core import device_speech_filter as _dsf
+            if _dsf.has_stop_word(text):
+                return False
+        except Exception:
+            pass
+        if _media_guest_mode():
+            return False
+        floor = float(ROOM_TV_GATE_REJECT_BELOW)
+        voice, score = _learn_voice_verdict(audio, sr, reject_below=floor,
+                                            any_enrolled=True)
+        if voice != _learn_gate_mod.NOT_OWNER:
+            return False          # owner / unsure / voice-ID unavailable
+        lead = _media_gate.leading_speech_window(audio, sr)
+        if lead is not None:
+            v2, s2 = _learn_voice_verdict(lead, sr, reject_below=floor,
+                                          any_enrolled=True)
+            if v2 != _learn_gate_mod.NOT_OWNER:
+                return False
+            score = max(float(score or 0.0), float(s2 or 0.0))
+        print(f"  [tv-gate] room TV on, {secs:.0f} s of nonstop sound and not "
+              f"the owner's voice (voice {float(score or 0.0):.2f}) - dropped "
+              f"({len(text or '')} chars)")
+        return True
+    except Exception:
+        return False
+
+
 def _media_voice_gate(text: str, injected: bool = False) -> bool:
     """True when the caller must DROP this mic turn: the PC was playing audio
     for the capture and the voice is confidently not the owner's (under
@@ -37143,7 +37195,8 @@ def _media_voice_gate(text: str, injected: bool = False) -> bool:
         smtc = _smtc_media_playing() if peak is None else False
         if not _media_gate.audio_playing(peak, smtc,
                                          threshold=float(MEDIA_VOICE_GATE_PEAK)):
-            return False
+            # Nothing on the PC - but the ROOM TV may be (2026-10-19).
+            return _room_tv_gate(text, audio, sr)
         meter = (f"peak {float(peak):.2f}" if peak is not None
                  else "meter unreadable, media session playing")
         try:

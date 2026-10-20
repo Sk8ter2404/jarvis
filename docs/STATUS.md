@@ -4,7 +4,7 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.220
+- Version: v2.0.221
 - Live since: 2026-10-19
 - Latest change: v2.0.213 (10-18): test-only fix for Linux CI.
 
@@ -58,6 +58,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.222 (2026-10-20): Stops answering the room TV (camera sees the TV on + a full 30 s capture of nonstop sound + a voice that isn't clearly his -> dropped, with a spoken 'couldn't tell that was you'); the voice server restarts itself after 3 CUDA-error renders (a GPU driver reset left it broken); the headset's charging status (0x05) counts as on, so the deaf-mic rescue can run; rebuild/parity questions go to the server skill; only facts the owner said himself are shared or imported between the machines.
 - v2.0.221 (2026-10-19): 'Which account are my smart devices on?' is answered from Tuya itself: the JARVIS project's linked user and Tuya's user record give 'Your 7 Tuya devices are in the Smart Life app, signed in with your phone number ending 6707 (an account from March 2019); the Tuya Smart app is a separate account.' Only the last 4 digits are spoken. Also fixes v2.0.220's red GitHub check: the new skills' unused alias names are gone.
 - v2.0.220 (2026-10-19): JARVIS watches the home server (read-only): 'how's the server?' answers from a fresh check (services answering; over SSH the array state, disabled disks, and a rebuild/parity check with percent and time left), and a 5-minute check announces once when it goes down, comes back, reports a disabled disk or finishes a rebuild. Plus 'how's the Backblaze backup?' from Backblaze's own status files.
 - v2.0.219 (2026-10-19): OpenCV stays off the graphics card in every thread: the face tracker threw 'OpenCL CL_OUT_OF_RESOURCES' (86 times in 40 minutes) because cv2.ocl.setUseOpenCL(False) only covers the thread that calls it (measured: main thread off, others on). OPENCV_OPENCL_RUNTIME=disabled is now set before OpenCV loads, so the Haar cascades run on the CPU everywhere, as the original comment intended.
@@ -67,6 +68,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.215 (2026-10-19): One JARVIS at a time across the owner's machines: JARVIS starting on one machine asks the other machine's copy to stand down over SSH (it says "Handing over to the Dell laptop, sir" and shuts down cleanly), so the laptop gets the desktop's GPU to itself. With the desktop's resume setting on, the desktop boots JARVIS again by itself once the laptop's copy stops (quit there, or the laptop unreachable for about 3 minutes). Off until each machine's private settings name the other.
 - v2.0.214 (2026-10-19): Store apps open by voice: "open Teams on the top monitor" failed with "could not launch Microsoft Teams" because the new Teams (and new Outlook, Notepad) are Microsoft Store apps with no program file to start by name. JARVIS now looks the app up in the Start menu list and launches it by its app ID, only when exactly one app fits the name.
 - v2.0.213 (2026-10-18): Test-only (no change to the running code): v2.0.212's new own-helper test built Windows-style paths, which failed on GitHub's Linux CI; it now uses os.path.join.
-- v2.0.212 (2026-10-18): Fixes from the 10-18 log review: JARVIS sees and clicks windows of a browser or app he opened himself (Chrome started by him was hidden from his clicks); the echo canceller's copy of the PC's audio gets a 200 ms buffer instead of 10 ms and marks any gap (55,000 lost-audio warnings a night); a failed shell command is reported as failed, not 'As you wish'; 'pass that over to Claude' leaves a real note.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
