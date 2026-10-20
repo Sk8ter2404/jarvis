@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.225 (2026-10-20)
+
+Stops the made-up numbers at the source. His personality rules TOLD him to put a number on everything ('Tag the certainty with a percentage or probability whenever you can', with sample lines like 'A 78% probability' and 'CPU at 34%, RAM at 61%' that he copied with new numbers); now a number comes only from a reading this turn, and confidence is said in words. The number checker also learns CPU, memory, GPU, time left, percent done and percentages on a confidence; a guess written before a reading that the same reply runs ("CPU at 12%" then system_pulse) is dropped quietly so only the real reading is spoken.
+
 ## v2.0.224 (2026-10-20)
 
 The action router hands the brain the right instructions more often (measured on 50 real bad turns: 27 -> 34 of 39 expected actions, +17 prompt tokens a turn on average): 'how bad is the background noise', 'dampen the audio', 'anything to do for school tonight', 'what's linked to my Tuya account', 'it's downloading something' and rebuild / parity questions now reach room_noise, volume_down, calendar_today, smart_home_account, the bandwidth actions and server_status. An embedding-search router was tried and lost (30 of 39 for ~1,400 extra tokens).

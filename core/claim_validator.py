@@ -83,8 +83,10 @@ find_ungrounded_reading / drop_ungrounded_readings hold back a different
 fabrication: a volume / brightness / battery / temperature NUMBER stated as a
 present reading that no action result, sensor line or context this turn
 supplied ("I'm afraid the volume is currently set to 20%, sir." while only
-system_pulse ran). They read every reply, with or without action tokens -
-see the section at the end of this module.
+system_pulse ran). Since 2026-10-20 also CPU / memory / GPU, a time left,
+a percent through / done, and a percentage put on a confidence ("95%
+certain", "a 78% probability"). They read every reply, with or without
+action tokens - see the section at the end of this module.
 
 Pure: no I/O, no monolith import, stdlib ``re`` only, so it is testable on the
 light-deps CI runner (tests/test_claim_validator.py).
@@ -102,6 +104,7 @@ __all__ = [
     "find_unverified_claim",
     "is_progress_only",
     "looks_like_question",
+    "reading_was_read",
     "strip_ack_preface",
 ]
 
@@ -1103,7 +1106,26 @@ _RD_NOUN = {
     "brightness": r"(?:brightness)",
     "battery": r"(?:battery(?:\s+(?:level|life|charge))?|charge\s+level)",
     "temperature": r"(?:temperature|temp)",
+    # 2026-10-20 brain test set (c037, c038): "CPU at 12%, RAM at 44% - all
+    # nominal, sir. [ACTION: system_pulse]", written before the result
+    # (real: CPU 48 %, memory 81 %) - the persona prompt's own example line
+    # with new numbers.
+    "cpu": r"(?:cpu|processor)(?:\s+(?:usage|load|use))?",
+    "memory": r"(?:ram|memory)(?:\s+(?:usage|use))?",
+    "gpu": r"(?:gpu|graphics\s+card)(?:\s+(?:usage|load|use))?",
+    # Percent-only (_RD_PCT_ONLY). c001 "running at 100% capacity", c002
+    # "95% certain", c003 "A 78% probability" (the prompt's example, word for
+    # word): a confidence nothing measured. A weather "chance of rain" is
+    # not one (_RD_NOT_SENSOR_AFTER).
+    "confidence": (r"(?:certain|certainty|sure|confident|confidence|"
+                   r"probability|chances?|likelihood|odds|capacity)"),
+    # "You're 73% through" / "47 percent done" with no print or job read.
+    "progress": r"(?:through|done|complete|completed|finished|progress)",
 }
+# Families whose number must carry a percent unit: "the stadium's capacity
+# is 70,000" and "the match is 2-1" are facts, not readings.
+_RD_PCT_ONLY = frozenset({"confidence", "progress"})
+_RD_PCT_UNIT = r"(?:\s*%|\s*percent\b|\s+per\s*cent\b)"
 _RD_COP = (r"(?:'s|\s+is|\s+was|\s+are|\s+reads|\s+sits|\s+stands|\s+shows|"
            r"\s+remains|\s+stays|\s+has(?:\s+got)?|"
            r"\s+(?:looks|appears|seems)\s+to\s+be)")
@@ -1115,10 +1137,14 @@ _RD_QUAL = r"(?:(?:about|around|roughly|approximately|a\s+mere|nearly)\s+)?"
 
 
 def _rd_compile(fam: str):
+    if fam == "time_left":
+        return _RD_TIME_RES
     noun = (r"\b" + _RD_NOUN[fam] + r"\b(?:\s+(?:outside|inside|outdoors|"
             r"indoors|here|in\s+here|out\s+there|today|tonight))?")
     num_tail = (r"(?P<n>" + _RD_NUM + r")(?:" + _RD_UNIT + r"|" + _RD_END
                 + r")")
+    if fam in _RD_PCT_ONLY:
+        num_tail = r"(?P<n>" + _RD_NUM + r")" + _RD_PCT_UNIT
     return (
         # "the volume is currently set to 20%" / "battery's at 45 percent"
         re.compile(noun + _RD_COP + r"\s+" + _RD_ADV + _RD_SET
@@ -1127,12 +1153,28 @@ def _rd_compile(fam: str):
         re.compile(noun + r"\s+(?:at|sitting\s+at|down\s+to|up\s+to)\s+"
                    + _RD_QUAL + num_tail),
         # "20% volume" / "45 percent battery"
-        re.compile(r"(?P<n>" + _RD_NUM + r")" + _RD_UNIT + r"\s+(?:of\s+)?"
-                   r"(?:your\s+|the\s+)?" + noun),
+        re.compile(r"(?P<n>" + _RD_NUM + r")"
+                   + (_RD_PCT_UNIT if fam in _RD_PCT_ONLY else _RD_UNIT)
+                   + r"\s+(?:of\s+)?(?:your\s+|the\s+)?" + noun),
     )
 
 
-_RD_COMPILED = tuple((fam, _rd_compile(fam)) for fam in _RD_NOUN)
+# Time left (2026-10-20 brain test set, c033: "roughly 12 minutes remaining"
+# on the server rebuild with nothing read): "12 minutes remaining", "about 2
+# hours left", "time remaining: 14 minutes", "ETA 20 minutes". Not "I left
+# 10 minutes ago" or "it takes 2 hours". The same three-slot shape as
+# _rd_compile; the third (number-first, whole-sentence scope) never matches.
+_RD_TIME_UNIT = r"(?:minutes?|mins?|hours?|hrs?|seconds?|secs?)"
+_RD_TIME_RES = (
+    re.compile(r"(?P<n>" + _RD_NUM + r")\s+(?:more\s+)?" + _RD_TIME_UNIT
+               + r"\s+(?:remaining|left|to\s+go)\b"),
+    re.compile(r"\b(?:time\s+remaining|time\s+left|remaining|eta)\b\W+"
+               r"(?:is\s+)?" + _RD_QUAL + r"(?P<n>" + _RD_NUM + r")\s*"
+               + _RD_TIME_UNIT + r"\b"),
+    re.compile(r"(?!x)x"),
+)
+_RD_COMPILED = tuple((fam, _rd_compile(fam))
+                     for fam in list(_RD_NOUN) + ["time_left"])
 # A sentence that is advice, a condition or a hypothetical, not a reading.
 _RD_NOT_STATE_RE = re.compile(
     r"\b(?:if|when|whenever|unless|once|until|should|would|could|might|"
@@ -1185,11 +1227,20 @@ _RD_KW_RES = {
     "battery": r"(?:batt\w*|charg\w*|plugged)",
     "temperature": r"(?:temp\w*|weather|forecast|thermostat|outside|"
                    r"indoors?|room)",
+    "cpu": r"(?:cpu|processor)",
+    "memory": r"(?:ram|memory|mem)",
+    "gpu": r"(?:gpu|vram|graphics)",
+    "confidence": (r"(?:certain\w*|sure|confiden\w*|probab\w*|chances?|"
+                   r"likelihood|odds|capacity)"),
+    "progress": r"(?:through|done|complete\w*|finished|progress)",
 }
+# "running" / "usage" / "load": system_pulse's own "GPU running at 31
+# percent" and "CPU usage 48%".
 _RD_CONNECT = (r"(?:is|was|are|at|to|set|now|currently|level|levels|master|"
                r"system|output|scalar|of|sitting|reading|reads|holding|"
                r"stays|remains|still|only|about|around|approximately|"
-               r"roughly|just|life|charge|'s|its|own|mixer|in|the)")
+               r"roughly|just|life|charge|'s|its|own|mixer|in|the|running|"
+               r"usage|load|utilization|used)")
 _RD_ATTACH_RES = {
     fam: (
         re.compile(r"\b" + kw + r"\b(?:\W+" + _RD_CONNECT + r"\b){0,4}"
@@ -1199,6 +1250,13 @@ _RD_ATTACH_RES = {
     )
     for fam, kw in _RD_KW_RES.items()
 }
+# A time left is grounded by the same number carrying a time unit anywhere
+# in a clause ("about 3 hours left", "remaining 47 min", "ETA 2h 15m"): the
+# unit IS the keyword, as for a temperature.
+_RD_ATTACH_RES["time_left"] = (
+    re.compile(r"(?P<n>" + _RD_NUM + r")\s*(?:more\s+)?(?:minutes?|mins?|"
+               r"hours?|hrs?|seconds?|secs?|h\b|m\b|s\b)"),
+)
 _RD_TEMP_UNIT_RE = re.compile(
     r"(?P<n>\d{1,3}(?:\.\d+)?|" + _RD_WORD_NUM + r")\s*(?:°\s*[cf]?|"
     r"degrees?\b|[cf]\b)")
@@ -1246,11 +1304,20 @@ _RD_NOT_SENSOR_BEFORE = {
         r"\b(?:trading|sales|search|traffic|call|order|transaction|data|"
         r"shipping|production|stock|share|market|trade|ticket|email|"
         r"message|loan|deal|book|series)\s+volume\b"),
+    # "battery at 80% capacity", "memory at 90% capacity": that thing's own
+    # reading (its family checks the number), not a confidence.
+    "confidence": re.compile(
+        r"\b(?:batter(?:y|ies)|disk|drive|storage|tank|cache|buffer|memory|"
+        r"ram|cpu|gpu|processor)\b"),
 }
 _RD_NOT_SENSOR_AFTER = {
     "battery": re.compile(
         r"^\s*(?:of\s+(?:its|the|their|your)\s+(?:original\s+|design\s+|"
         r"full\s+)?)?(?:health|capacity|wear|design\s+capacity)\b"),
+    # A forecast's "90% chance of rain" is the weather's number.
+    "confidence": re.compile(
+        r"^\s*(?:of\s+)?(?:rain|snow|showers?|storms?|thunderstorms?|"
+        r"precipitation|sleet|hail|flurries)\b"),
 }
 
 
@@ -1322,3 +1389,20 @@ def drop_ungrounded_readings(text: str, *, grounding: Iterable[str] = (),
         return " ".join(kept).strip(), flagged
     except Exception:
         return text, []
+
+def reading_was_read(phrase: str, grounding: Iterable[str] = ()) -> bool:
+    """True when an action result in ``grounding`` read the same KIND of
+    reading ``phrase`` (a find_ungrounded_reading hit) states, with another
+    number: the reply guessed before the result that reads it existed, and
+    that result is what gets spoken, so the guess can simply go. False for a
+    kind nothing read ("the volume is at 20%" after system_pulse, which
+    never reads the volume: that one needs the retry). Never raises."""
+    try:
+        low = _norm(phrase).lower()
+        fams = [fam for fam, rxs in _RD_COMPILED
+                if any(rx.search(low) for rx in rxs)]
+        texts = [str(g) for g in (grounding or ()) if g]
+        return bool(fams) and all(
+            any(_rd_attached_values(f, g) for g in texts) for f in fams)
+    except Exception:
+        return False

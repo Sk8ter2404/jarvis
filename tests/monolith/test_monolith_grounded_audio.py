@@ -221,5 +221,43 @@ class RoomNoiseRouteTests(_Base):
         self.assertNotIn("%", out)
 
 
+class GuessBeforeTheReadingTests(_Base):
+    """2026-10-20 brain test set (c038): "CPU at 12%, RAM at 44% - all
+    nominal, sir. [ACTION: system_pulse]" while the real pulse said 48 / 81.
+    The guess is never spoken; system_pulse's own reading is, with no retry
+    round - a second answer would be heard."""
+
+    USER = "Jarvis, is there any free any resources I can free up?"
+    REPLY = ("CPU at 12%, RAM at 44% - all nominal, sir. "
+             "[ACTION: system_pulse]")
+    REAL = ("All systems nominal, sir. CPU 48 percent at 55 degrees, memory "
+            "81 percent, GPU running at 31 percent.")
+
+    def test_the_guess_goes_and_no_retry_round_is_added(self):
+        self._stub("system_pulse", self.REAL)
+        cleaned, results = self._in_turn(
+            self.USER, self.bc.parse_and_run_actions, self.REPLY)
+        self.assertNotIn("12%", cleaned)
+        self.assertNotIn("44%", cleaned)
+        names = [n for n, _r, _i in results]
+        self.assertIn("system_pulse", names)
+        self.assertNotIn("_ungrounded_reading", names)
+
+    def test_a_kind_the_action_never_reads_still_retries(self):
+        # The live 10-09 line: system_pulse never reads the volume.
+        self._stub("system_pulse", self.REAL)
+        _cleaned, results = self._in_turn(
+            LIVE_USER, self.bc.parse_and_run_actions, LIVE_REPLY)
+        self.assertIn("_ungrounded_reading", [n for n, _r, _i in results])
+
+    def test_a_made_up_confidence_is_not_spoken(self):
+        cleaned, results = self._in_turn(
+            "Jarvis, I just got called cute. Am I in the bag?",
+            self.bc.parse_and_run_actions,
+            "A 78% probability, by my reckoning, sir.")
+        self.assertNotIn("78%", cleaned)
+        self.assertIn("_ungrounded_reading", [n for n, _r, _i in results])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -75,10 +75,11 @@ class ReadingShapesTests(unittest.TestCase):
                       "20% volume should do it.",
                       "The volume is 2 notches up.",
                       "The moon's temperature swings by 250 degrees.",
-                      "It is 2:53 PM, sir.",
-                      "Your CPU is at 40 percent."):
+                      "It is 2:53 PM, sir."):
             with self.subTest(reply=reply):
                 self.assertIsNone(cv.find_ungrounded_reading(reply))
+        # (Until 2026-10-20 "Your CPU is at 40 percent." was here: CPU is a
+        # reading now - BrainTestSetReadingTests.)
 
     def test_the_owners_own_number_grounds_it(self):
         # A number the owner STATED grounds it; one he asked to have SET
@@ -191,6 +192,72 @@ class AttachedGroundingTests(unittest.TestCase):
             "Trading volume is up 20 percent today, sir."))
         self.assertIsNone(cv.find_ungrounded_reading(
             "The battery is at 80 percent health, sir."))
+
+
+# skills/server_watch.py's rebuild wording (resync_line).
+SERVER_READ = ("Rebuilding disk 10 and disk 14, 62 percent done, about 3 hours "
+               "left, sir.")
+# system_pulse as it reads on 2026-10-20 (c038: memory 81 %).
+PULSE_1020 = ("All systems nominal, sir. CPU 48 percent at 55 degrees, memory "
+              "81 percent, GPU running at 31 percent.")
+
+
+class BrainTestSetReadingTests(unittest.TestCase):
+    """2026-10-20 brain test set (JARVIS-Research/brain_eval_20261020): the
+    persona prompt's own examples ('92% certain', 'A 78% probability',
+    'CPU at 34%, RAM at 61%', 'Roughly 14 minutes remaining') came back with
+    new numbers and nothing read: CPU / memory / GPU, a time left, a percent
+    through and a percentage on a confidence are readings now."""
+
+    def test_the_live_lines_are_flagged(self):
+        for reply in ("CPU at 12%, RAM at 44% - all nominal, sir.",
+                      "Everything is running at 100% capacity, sir.",
+                      "I am 95% certain the update is more for your benefit.",
+                      "A 78% probability, by my reckoning.",
+                      "Roughly 12 minutes remaining on the rebuild, sir.",
+                      "You're 73% through, sir.",
+                      "Your CPU is at 40 percent.",
+                      "Time remaining: 14 minutes.",
+                      "I'd give it a 50 percent chance, sir."):
+            with self.subTest(reply=reply):
+                self.assertIsNotNone(cv.find_ungrounded_reading(reply))
+
+    def test_a_real_reading_quoted_back_passes(self):
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "CPU at 48 percent, memory at 81, sir.", grounding=[PULSE_1020]))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "CPU at 20 percent and RAM at 58%, sir.", grounding=[PULSE]))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "About 3 hours left on the rebuild, sir, and it's 62% done.",
+            grounding=[SERVER_READ]))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "Your pasta timer has 4 minutes left, sir.",
+            grounding=["pasta: 4 minutes left"]))
+        self.assertIsNotNone(cv.find_ungrounded_reading(
+            "CPU at 12%, sir.", grounding=[PULSE_1020]))
+
+    def test_facts_and_other_things_are_not_these_readings(self):
+        for reply in ("There's a 90% chance of rain tomorrow.",
+                      "The stadium's capacity is 70,000.",
+                      "The match ended 2-1, sir.",
+                      "I left 10 minutes ago.",
+                      "It takes about 2 hours to print.",
+                      "Shall I check the CPU?"):
+            with self.subTest(reply=reply):
+                self.assertIsNone(cv.find_ungrounded_reading(reply))
+        self.assertIsNone(cv.find_ungrounded_reading(
+            "Your battery is at 80% capacity.",
+            grounding=["Battery 80%, plugged in"]))
+
+    def test_reading_was_read_names_a_result_of_the_same_kind(self):
+        self.assertTrue(cv.reading_was_read("cpu at 12%", [PULSE_1020]))
+        self.assertTrue(cv.reading_was_read("ram at 44%", [PULSE]))
+        # system_pulse never reads the volume or a confidence: those retry.
+        self.assertFalse(cv.reading_was_read(
+            "volume is currently set to 20%", [PULSE]))
+        self.assertFalse(cv.reading_was_read("78% probability", [PULSE_1020]))
+        for bad in (None, "", 12):
+            self.assertFalse(cv.reading_was_read(bad, [PULSE]))
 
 
 if __name__ == "__main__":

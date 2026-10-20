@@ -42821,13 +42821,25 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         except Exception as _rd_err:
             print(f"  [validation] reading check failed: {_rd_err}")
             _kept, _invented = cleaned, []
-    if _invented:
+    # 2026-10-20 brain test set (c037, c038): "CPU at 12%, RAM at 44% - all
+    # nominal, sir. [ACTION: system_pulse]" - the guess was written before
+    # the result that reads those very numbers, and that result is what gets
+    # spoken: the guess just goes, with no retry round (a second answer).
+    if _invented and all(_claim_validator.reading_was_read(_p, _grounding)
+                         for _p in _invented):
+        print(f"  [validation] dropped '{_invented[0]}': written before the "
+              "result that reads it")
+        cleaned = _kept
+    elif _invented:
         warn = (
             f"reply stated '{_invented[0]}' but nothing this turn read that "
-            "value - it was NOT spoken. Only state a volume, brightness, "
-            "battery or temperature number an action result gave you: run "
-            "the action that reads it (audio_check for the sound and "
-            "volume) or say you can't tell from here")
+            "value - it was NOT spoken. Only state a reading (volume, "
+            "brightness, battery, temperature, CPU, memory, GPU, time left, "
+            "percent done) an action result gave you: run the action that "
+            "reads it (audio_check for the sound and volume, system_pulse "
+            "for the PC) or say you can't tell from here. Never put a "
+            "made-up percentage on a confidence or a chance - say it in "
+            "words")
         print(f"  [validation] {warn}")
         results.append(("_ungrounded_reading", warn, True))
         cleaned = _kept
@@ -42924,10 +42936,12 @@ def _followup_extra(action_results) -> str:
         "finish the chain — don't stop mid-task and don't re-narrate the "
         "promise without backing it with a real action token.\n"
         "- If a result is from [_ungrounded_reading], your previous reply "
-        "stated a volume, brightness, battery or temperature number that "
-        "nothing had read; the owner did not hear it. Emit the action that "
-        "reads it ([ACTION: audio_check] for sound or volume) or say plainly "
-        "you can't tell from here - never repeat or guess the number.\n"
+        "stated a number (a reading, a time left, a percent done, or a "
+        "percentage on a confidence) that nothing had read; the owner did "
+        "not hear it. Emit the action that reads it ([ACTION: audio_check] "
+        "for sound or volume, [ACTION: system_pulse] for the PC) or say "
+        "plainly you can't tell from here - never repeat or guess the "
+        "number, and give a confidence in words.\n"
         + ("- If click or find says not found or lists candidates, ask sir "
            "which one, naming them; never search, open or play something "
            "else instead.\n" if _screen_target_stuck(action_results) else
