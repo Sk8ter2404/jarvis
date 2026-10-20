@@ -2477,6 +2477,41 @@ _system_prompt_head = [""]
 _system_prompt_blocks: list = [{}]
 
 
+def _instance_context_line() -> str:
+    """The system prompt's "which machine am I" line. With a handoff partner
+    (core/peer_handoff) JARVIS is ONE copy that moves between the owner's
+    machines (2026-10-20 live, on the desktop: "I've never quite made myself
+    at home in the Dell, sir" right after a day on the Dell, then "a bit of a
+    squeeze in this laptop" - the old line said "there may be other versions
+    of you running in other rooms", and never named this machine). The
+    imported "On the <peer>: ..." summaries are framed as his own time there.
+    MACHINE_NAME (machine-local) names this machine. Stable within a run.
+    Never raises."""
+    try:
+        from core import peer_handoff as _ph
+        peer = _ph.peer_name() if _ph.enabled() else ""
+    except Exception:
+        peer = ""
+    try:
+        import core.config as _cfg
+        me = str(getattr(_cfg, "MACHINE_NAME", "") or "").strip()
+    except Exception:
+        me = ""
+    if peer:
+        here = f"the {me}" if me else "this machine"
+        return (
+            f"\n\nContext: you are ONE JARVIS that moves between sir's "
+            f"machines. Right now you are running on {here}. When sir "
+            f"starts you on the {peer} you move there - the same you, with the "
+            f"same memory - and come back here when it stops. Summaries "
+            f"marked 'On the {peer}' are your own time there. Never say you "
+            f"are on the {peer} while you run on {here}.")
+    return (
+        f"\n\nContext: you are currently the {LOCATION} instance — there may "
+        f"be other versions of you running in other rooms, sharing the same "
+        f"memory.")
+
+
 def build_system_prompt(memory: dict) -> str:
     # STABLE CORE first, everything memory-derived second. The prompt is one
     # concatenated string as always, but _system_prompt_stable_len records the
@@ -2530,11 +2565,7 @@ def build_system_prompt(memory: dict) -> str:
 
     # Which instance this is never changes within a run, so it stays in the
     # stable head (the day / conversation count moved to the very end).
-    prompt += (
-        f"\n\nContext: you are currently the {LOCATION} instance — there may "
-        f"be other versions of you running in other rooms, sharing the same "
-        f"memory."
-    )
+    prompt += _instance_context_line()
 
     # ── stable head / learned tail boundary (2026-10-04) ───────────────────
     # Everything above is byte-identical between rebuilds (it changes only

@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.230 (2026-10-20)
+
+JARVIS knows he is one copy that moves between your machines. On the desktop right after a day on the Dell he said 'I've never quite made myself at home in the Dell, sir' and then 'a bit of a squeeze in this laptop': his prompt said 'there may be other versions of you running in other rooms' and never named the machine. With a handoff partner he is now told he is ONE JARVIS, which machine he is running on (new machine-local MACHINE_NAME: desktop / Dell laptop), and that 'On the Dell laptop' memories are his own time there.
+
 ## v2.0.229 (2026-10-20)
 
 Test-only fix for GitHub CI: v2.0.228's new two-hand test imported a module it never used, which the pyflakes lint step rejects (the local suite does not run pyflakes). No change to JARVIS itself.

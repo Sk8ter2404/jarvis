@@ -36,6 +36,7 @@ class SharedKeyTests(unittest.TestCase):
                   "VOICE_CLONE_SERVER_CMD", "PEER_HANDOFF_SSH",
                   "HANDOFF_RESUME_WHEN_PEER_STOPS", "SERVER_WATCH_HOST",
                   "WEB_INTERFACE_TOKEN", "MICROPHONE_INDEX", "AMBIENT_SCREEN_ENABLED",
+                  "MACHINE_NAME",
                   "SOME_API_KEY", "_private", "lowercase_key", ""):
             with self.subTest(k=k):
                 self.assertFalse(S.is_shared(k))

@@ -4,7 +4,7 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.227
+- Version: v2.0.229
 - Live since: 2026-10-20
 - Latest change: v2.0.213 (10-18): test-only fix for Linux CI.
 
@@ -58,6 +58,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v2.0.230 (2026-10-20): JARVIS knows he is one copy that moves between your machines. On the desktop right after a day on the Dell he said 'I've never quite made myself at home in the Dell, sir' and then 'a bit of a squeeze in this laptop': his prompt said 'there may be other versions of you running in other rooms' and never named the machine. With a handoff partner he is now told he is ONE JARVIS, which machine he is running on (new machine-local MACHINE_NAME: desktop / Dell laptop), and that 'On the Dell laptop' memories are his own time there.
 - v2.0.229 (2026-10-20): Test-only fix for GitHub CI: v2.0.228's new two-hand test imported a module it never used, which the pyflakes lint step rejects (the local suite does not run pyflakes). No change to JARVIS itself.
 - v2.0.228 (2026-10-20): The webcam hand mouse catches up with the Kinect one: a steady frame pump feeds the hand tracker at the camera's own rate (it was getting clumps between ~6 fps face-detection passes - the lag), the on-screen reticle, fist-drag scrolling, a two-fist grab that moves / resizes the window under your hands (HAND_TWO_HAND_ENABLED, off by default), and no false triggers: minimum tracker score and hand size, a settle time for a new hand, poses confirmed over several frames, no engage right after you type or move the mouse, the cursor locked to your hand. The HUD camera preview runs ~15 fps while the tracker runs and the HUD reads it every 33 ms.
 - v2.0.227 (2026-10-20): JARVIS moves between your machines as one copy. Every setting that isn't tied to the hardware is now shared: a change on the desktop or the Dell reaches the other one (newest change wins; cameras, Kinect, hands, monitors, audio devices, mic levels, folders and tunnels stay per machine), and a machine boots already matching the other. At a handoff the conversation in progress travels too - 'Picking up where we left off on the desktop, sir.' - and a version difference between the two is logged. Also: a brain reached through a tunnel on the laptop is treated as remote, so the Dell's boot no longer starts its own empty Ollama and waits ~90 s.
@@ -67,6 +68,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.223 (2026-10-20): Echo cancelling waits for a late PC-audio reference (up to 0.25 s while the loopback is alive): the 10-19 room recording showed the reference arriving >= ~58 ms after the echo, so the canceller had been cancelling against silence (simulated 4.6 -> ~17 dB). And the Claude safety net now works with local-first settings: a turn the checker catches is redone once on Claude Sonnet 5.5 while the Claude boost is on (TURN_CHECK_MODE on).
 - v2.0.222 (2026-10-20): Stops answering the room TV (camera sees the TV on + a full 30 s capture of nonstop sound + a voice that isn't clearly his -> dropped, with a spoken 'couldn't tell that was you'); the voice server restarts itself after 3 CUDA-error renders (a GPU driver reset left it broken); the headset's charging status (0x05) counts as on, so the deaf-mic rescue can run; rebuild/parity questions go to the server skill; only facts the owner said himself are shared or imported between the machines.
 - v2.0.221 (2026-10-19): 'Which account are my smart devices on?' is answered from Tuya itself: the JARVIS project's linked user and Tuya's user record give 'Your 7 Tuya devices are in the Smart Life app, signed in with your phone number ending 6707 (an account from March 2019); the Tuya Smart app is a separate account.' Only the last 4 digits are spoken. Also fixes v2.0.220's red GitHub check: the new skills' unused alias names are gone.
-- v2.0.220 (2026-10-19): JARVIS watches the home server (read-only): 'how's the server?' answers from a fresh check (services answering; over SSH the array state, disabled disks, and a rebuild/parity check with percent and time left), and a 5-minute check announces once when it goes down, comes back, reports a disabled disk or finishes a rebuild. Plus 'how's the Backblaze backup?' from Backblaze's own status files.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).

@@ -69,5 +69,34 @@ class HandoffArrivalTests(MonolithGlobalsTestCase):
         self.assertIn("version differs", out)
 
 
+@requires_monolith
+class InstanceLineTests(MonolithGlobalsTestCase):
+    """2026-10-20 live on the desktop, right after a day on the Dell: "I've
+    never quite made myself at home in the Dell, sir", then "a bit of a
+    squeeze in this laptop". The prompt said "there may be other versions of
+    you running in other rooms" and never named this machine."""
+
+    def _line(self, enabled, peer="Dell laptop", me="desktop"):
+        from core import config as cfg
+        from core import peer_handoff
+        with mock.patch.object(peer_handoff, "enabled", return_value=enabled), \
+                mock.patch.object(peer_handoff, "peer_name", return_value=peer), \
+                mock.patch.object(cfg, "MACHINE_NAME", me, create=True):
+            return self.bc._instance_context_line()
+
+    def test_with_a_partner_he_is_one_jarvis_on_this_machine(self):
+        line = self._line(True)
+        self.assertIn("ONE JARVIS that moves between sir's machines", line)
+        self.assertIn("running on the desktop.", line)
+        self.assertIn("'On the Dell laptop' are your own time there", line)
+        self.assertNotIn("other versions of you", line)
+        self.assertIn("running on this machine.", self._line(True, me=""))
+
+    def test_without_a_partner_the_old_line_stays(self):
+        line = self._line(False)
+        self.assertIn("other versions of you running in other rooms", line)
+        self.assertNotIn("ONE JARVIS", line)
+
+
 if __name__ == "__main__":
     unittest.main()

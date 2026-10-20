@@ -22,6 +22,12 @@ import os
 # ─── Location / device role ────────────────────────────────────────────
 # Used by multiple skills to gate behaviour by physical location.
 LOCATION   = "desk"            # e.g. "desk", "bedroom", "office", "laptop"
+# MACHINE_NAME - what this machine is called when JARVIS moves between the
+#   owner's machines (core/peer_handoff): "desktop", "Dell laptop". It names
+#   the machine in the system prompt ("Right now you are running on the
+#   desktop"). Machine-local: never shared by core/peer_settings. Blank =
+#   "this machine".
+MACHINE_NAME = ""
 
 
 # ─── User identity ─────────────────────────────────────────────────────
