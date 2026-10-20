@@ -1856,3 +1856,38 @@ class SelfKnowledgeRoutingPrecisionTests(unittest.TestCase):
                   "compare yourself to other JARVIS-like assistants"):
             with self.subTest(u=u):
                 self.assertTrue(self._routed(u))
+
+
+class BrainTestSetRoutingTests(unittest.TestCase):
+    """2026-10-20 brain test set (JARVIS-Research/brain_eval_20261020): real
+    owner turns whose action existed and was documented, but no keyword
+    routed its instructions, so the brain said it couldn't or guessed. The
+    keyword router supplied 27 of the 39 expected actions; these took it to
+    34 (the rest are self-terminating follow-ups, routed on purpose only by
+    the owner's own words)."""
+
+    CASES = (
+        ("Jarvis, how bad is the background noise?", "room_noise"),
+        ("Yes, try to dampen the audio if you can.", "volume_down"),
+        ("Jarvis, do I have anything to do for school tonight?",
+         "calendar_today"),
+        ("Jarvis, what do you have linked to my Tuya account?",
+         "smart_home_account"),
+        ("Jarvis is downloading something. I don't know what he's "
+         "downloading.", "whats_using_bandwidth"),
+        ("who is on the wifi", "who_is_on_the_wifi"),
+    )
+
+    def test_the_real_turns_get_their_actions_instructions(self):
+        for u, action in self.CASES:
+            with self.subTest(u=u):
+                self.assertTrue(_names_in(pr.turn_pc_block(u, FULL), action))
+
+    def test_unrelated_turns_stay_unrouted(self):
+        _core, sections = pr.split_pc_control(FULL)
+        for u, name in (("what's the weather tomorrow", "DECO MESH NETWORK"),
+                        ("thanks, that sounds good", "MUSIC CONTROLS"),
+                        ("tell me a joke", "CALENDAR"),
+                        ("turn on the lamp", "SMART HOME — PER-BRAND LIST")):
+            with self.subTest(u=u):
+                self.assertNotIn(name, pr.select_sections(u, sections)[0])

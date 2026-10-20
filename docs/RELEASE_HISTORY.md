@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.224 (2026-10-20)
+
+The action router hands the brain the right instructions more often (measured on 50 real bad turns: 27 -> 34 of 39 expected actions, +17 prompt tokens a turn on average): 'how bad is the background noise', 'dampen the audio', 'anything to do for school tonight', 'what's linked to my Tuya account', 'it's downloading something' and rebuild / parity questions now reach room_noise, volume_down, calendar_today, smart_home_account, the bandwidth actions and server_status. An embedding-search router was tried and lost (30 of 39 for ~1,400 extra tokens).
+
 ## v2.0.223 (2026-10-20)
 
 Echo cancelling waits for a late PC-audio reference (up to 0.25 s while the loopback is alive): the 10-19 room recording showed the reference arriving >= ~58 ms after the echo, so the canceller had been cancelling against silence (simulated 4.6 -> ~17 dB). And the Claude safety net now works with local-first settings: a turn the checker catches is redone once on Claude Sonnet 5.5 while the Claude boost is on (TURN_CHECK_MODE on).

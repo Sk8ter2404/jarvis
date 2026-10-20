@@ -153,6 +153,20 @@ class RouteAndRegisterTests(unittest.TestCase):
         with mock.patch.object(cfg, "SERVER_WATCH_HOST", "", create=True):
             self.assertIsNone(W._route("how long until the rebuild is done"))
 
+    def test_rebuild_wording_routes_the_prompt_examples_to_the_brain(self):
+        # 2026-10-20 brain test set (c033, c037): a rebuild question the
+        # route above does not catch still reached the brain without the
+        # server_status grammar, so it guessed. The examples' own quoted
+        # triggers are what core.prompt_router routes on.
+        from core import prompt_router as pr
+        parts = [("server_watch", W.PROMPT_EXAMPLES.strip())]
+        for t in ("Jarvis, how is the rebuild looking? Is it healthy?",
+                  "Jarvis, how long until that data rebuild's done?",
+                  "how far along is the parity check"):
+            with self.subTest(t=t):
+                self.assertEqual(len(pr.select_skill_examples(t, parts)), 1)
+        self.assertEqual(pr.select_skill_examples("play some jazz", parts), [])
+
     def test_registered_actions_and_no_thread_under_tests(self):
         actions = {}
         with mock.patch.object(W.threading, "Thread") as thread:

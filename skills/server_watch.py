@@ -44,8 +44,12 @@ PROMPT_EXAMPLES = (
     "HOME SERVER (skills/server_watch.py - READ-ONLY, never changes the server):\n"
     "  server_status - is the home server up, which of its services answer, and\n"
     "                  (when it can read it) the array state and disabled disks.\n"
-    "                  Fire on 'how's the server', 'is the server up', 'is unraid\n"
-    "                  online', 'check the server', 'any disks down'.\n"
+    # No apostrophe inside a quoted trigger: core.prompt_router pairs the
+    # single quotes to find them, and "how's" shifted every pair after it.
+    "                  Fire on 'how is the server', 'is the server up', 'is unraid\n"
+    "                  online', 'check the server', 'any disks down',\n"
+    "                  'how is the rebuild going', 'parity check', 'is the array\n"
+    "                  ok' (it reads the rebuild's percent and time left).\n"
     "  'is the server up' -> [ACTION: server_status]\n"
 )
 

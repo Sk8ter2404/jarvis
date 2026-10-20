@@ -187,6 +187,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # object only: a bare "sound" would ride every "sounds good".
         "kill the sound", "cut the sound", "kill the audio", "cut the audio",
         "kill the volume", "turn off the sound", "turn the sound off",
+        # 2026-10-20 brain test set (c031, c048): room_noise's own trigger
+        # 'how bad is the background noise' and 'dampen the audio' (his yes
+        # to a volume_down offer) routed nothing, so he said he couldn't.
+        "background noise", "noisy", "noise level", "dampen",
     ],
     "AUDIO OUTPUT DEVICE": [
         "headset", "headphones", "speakers", "output device", "switch audio",
@@ -528,7 +532,15 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "amazon", "order", "package", "delivery", "tracking", "my orders",
         "where's my package", "wheres my package",
     ],
-    "DECO MESH NETWORK": ["deco", "mesh", "router"],
+    "DECO MESH NETWORK": [
+        "deco", "mesh", "router",
+        # 2026-10-20 brain test set (c011): "it's downloading something, I
+        # don't know what" got system_pulse - the bandwidth actions' own
+        # triggers ('who is hogging bandwidth', 'who is on the wifi') had no
+        # keyword here.
+        "bandwidth", "hogging", "downloading", "internet usage", "wifi",
+        "wi-fi", "guest network",
+    ],
     "NOTIFICATION TRIAGE": ["notification", "notifications", "alerts", "my alerts"],
     "PHONE BRIDGE": ["phone bridge", "my phone"],
     # Proactive phone pings (core/phone_ping.py). The header word "phone"
@@ -659,6 +671,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "CALENDAR": [
         "calendar", "schedule", "my meetings", "appointment", "agenda",
         "meetings today", "meetings this week", "what meetings", "on my calendar",
+        # 2026-10-20 brain test set (c008): 'do I have anything to do for
+        # school tonight' routed nothing and got an invented answer.
+        "anything to do", "anything due", "for school", "what's due",
     ],
     "WEATHER BRIEFING": [
         "weather", "forecast", "is it going to rain", "raining", "sunny",
@@ -733,6 +748,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # 2026-10-14: the BroadLink remote hub and Magic Home LEDs
         "remote code", "remote codes", "learn the remote", "broadlink",
         "magic home", "list my led",
+        # 2026-10-20 brain test set (c023): 'what do you have linked to my
+        # Tuya account' got "I have no way to check" - smart_home_account
+        # lives here and only "list my tuya" routed it.
+        "tuya", "smart life",
     ],
     "WAKE-WORD MODE": [
         "wake word mode", "wake-word mode", "require my name", "require your name",
