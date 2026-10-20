@@ -336,6 +336,128 @@ class MergeByDeviceIdTests(_DiscoverTestBase):
         self.assertEqual(merged["devices"][0]["lan_ip"], "10.0.0.9")
 
 
+# ── source rename vs hand edit (name / controller_skill) ────────────────────
+def _alexa_rec(name, *, eid="ent-lamp", brand="Tuya"):
+    ent = {"entityId": eid, "manufacturerName": brand,
+           "capabilities": [{"interface": "Alexa.PowerController"}]}
+    if name is not None:
+        ent["friendlyName"] = name
+    return d._entity_to_record(ent, [], [], [])
+
+
+class SourceRenameVsHandEditTests(_DiscoverTestBase):
+    """2026-10-19: the merge kept ANY stored name, so once a device was
+    discovered a rename in Alexa / Tuya / Kasa never reached JARVIS. A stored
+    name now survives only when it differs from what discovery produced last
+    time (a real hand edit)."""
+
+    def _rediscover(self, fresh_rec):
+        merged = d._merge_with_existing_catalog(
+            {"device_count": 1, "devices": [fresh_rec]})
+        self._write_catalog(merged)
+        return merged["devices"][0]
+
+    def test_records_carry_what_discovery_produced(self):
+        rec = _alexa_rec("Desk Lamp")
+        self.assertEqual(rec["discovered_name"], "Desk Lamp")
+        self.assertEqual(rec["discovered_controller_skill"], "sh_tuya")
+        lan = d._lan_record("sh_kasa", {"name": "porch plug"}, [])
+        self.assertEqual(lan["discovered_name"], "porch plug")
+        self.assertEqual(lan["discovered_controller_skill"], "sh_kasa")
+
+    def test_source_rename_arrives(self):
+        self._write_catalog({"device_count": 1,
+                             "devices": [_alexa_rec("Desk Lamp")]})
+        with mock.patch("builtins.print"):
+            dev = self._rediscover(_alexa_rec("Bedside Lamp"))
+        self.assertEqual(dev["name"], "Bedside Lamp")
+        self.assertEqual(dev["discovered_name"], "Bedside Lamp")
+
+    def test_source_rename_arrives_for_a_lan_record(self):
+        arp = [{"ip": "192.0.2.60", "mac": "AA:BB:CC:DD:EE:60"}]
+        plug = {"brand": "TP-Link", "type": "plug",
+                "capabilities": ["on_off"], "lan_ip": "192.0.2.60"}
+        self._write_catalog({"device_count": 1, "devices": [
+            d._lan_record("sh_kasa", dict(plug, name="entry light"), arp)]})
+        with mock.patch("builtins.print"):
+            dev = self._rediscover(
+                d._lan_record("sh_kasa", dict(plug, name="porch light"), arp))
+        self.assertEqual(dev["name"], "porch light")
+
+    def test_catalog_saved_before_the_copy_existed_takes_the_source_name(self):
+        # Every catalog on disk before this fix: no discovered_name, so the
+        # stored name can't be proven a hand edit and must not pin forever.
+        self._write_catalog({"device_count": 1, "devices": [
+            {"alexa_entity_id": "ent-lamp", "name": "Desk Lamp",
+             "controller_skill": "sh_tuya", "lan_ip": "", "lan_mac": ""}]})
+        with mock.patch("builtins.print"):
+            dev = self._rediscover(_alexa_rec("Bedside Lamp"))
+        self.assertEqual(dev["name"], "Bedside Lamp")
+        self.assertEqual(dev["discovered_name"], "Bedside Lamp")
+
+    def test_hand_edited_name_survives_source_renames_and_reruns(self):
+        stored = _alexa_rec("Desk Lamp")
+        stored["name"] = "reading light"            # his hand edit
+        self._write_catalog({"device_count": 1, "devices": [stored]})
+        dev = self._rediscover(_alexa_rec("Desk Lamp"))
+        self.assertEqual(dev["name"], "reading light")
+        # The source renames: the hand edit still wins, and the copy tracks
+        # the source, so the edit stays provable on every later run.
+        dev = self._rediscover(_alexa_rec("Bedside Lamp"))
+        self.assertEqual(dev["name"], "reading light")
+        self.assertEqual(dev["discovered_name"], "Bedside Lamp")
+        dev = self._rediscover(_alexa_rec("Bedside Lamp"))
+        self.assertEqual(dev["name"], "reading light")
+
+    def test_blanking_a_hand_edit_follows_the_source_again(self):
+        stored = _alexa_rec("Desk Lamp")
+        stored["name"] = ""
+        self._write_catalog({"device_count": 1, "devices": [stored]})
+        dev = self._rediscover(_alexa_rec("Bedside Lamp"))
+        self.assertEqual(dev["name"], "Bedside Lamp")
+
+    def test_source_with_no_name_keeps_stored_name_without_pinning_it(self):
+        self._write_catalog({"device_count": 1,
+                             "devices": [_alexa_rec("Desk Lamp")]})
+        dev = self._rediscover(_alexa_rec(None))     # "(unnamed)" this run
+        self.assertEqual(dev["name"], "Desk Lamp")
+        self.assertEqual(dev["discovered_name"], "Desk Lamp")
+        with mock.patch("builtins.print"):
+            dev = self._rediscover(_alexa_rec("Bedside Lamp"))
+        self.assertEqual(dev["name"], "Bedside Lamp")   # not pinned
+
+    def test_controller_follows_a_brand_remap_but_hand_override_survives(self):
+        # Not edited: the stored controller is what discovery produced, so a
+        # brand -> skill change (code or source) reaches the catalog.
+        self._write_catalog({"device_count": 1,
+                             "devices": [_alexa_rec("Desk Lamp")]})
+        with mock.patch.dict(d._BRAND_TO_SKILL, {"tuya": "sh_new"}):
+            dev = self._rediscover(_alexa_rec("Desk Lamp"))
+        self.assertEqual(dev["controller_skill"], "sh_new")
+        # Hand override on an unmapped brand survives, before and after the
+        # brand gets a mapping of its own.
+        stored = _alexa_rec("Garage Plug", eid="ent-plug", brand="Acme")
+        self.assertIsNone(stored["controller_skill"])
+        stored["controller_skill"] = "sh_kasa"      # his hand edit
+        self._write_catalog({"device_count": 1, "devices": [stored]})
+        dev = self._rediscover(
+            _alexa_rec("Garage Plug", eid="ent-plug", brand="Acme"))
+        self.assertEqual(dev["controller_skill"], "sh_kasa")
+        with mock.patch.dict(d._BRAND_TO_SKILL, {"acme": "sh_acme"}):
+            dev = self._rediscover(
+                _alexa_rec("Garage Plug", eid="ent-plug", brand="Acme"))
+        self.assertEqual(dev["controller_skill"], "sh_kasa")
+
+    def test_rename_is_logged_ascii_safe(self):
+        self._write_catalog({"device_count": 1,
+                             "devices": [_alexa_rec("Desk Lamp")]})
+        with mock.patch("builtins.print") as p:
+            self._rediscover(_alexa_rec("Lamp \U0001f4a1"))
+        line = " ".join(str(c.args[0]) for c in p.call_args_list)
+        self.assertIn("renamed at the source", line)
+        line.encode("ascii")        # raises if the emoji leaked through
+
+
 # ── voice action end-to-end (no cookie / cookie timeout) ────────────────────
 class VoiceActionEndToEndTests(_DiscoverTestBase):
     def _run(self, arg="", *, tuya_secret=False, run_async=None):

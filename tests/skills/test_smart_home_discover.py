@@ -525,10 +525,14 @@ class MergeCatalogTests(unittest.TestCase):
             self.assertIs(self.mod._merge_with_existing_catalog(fresh), fresh)
 
     def test_existing_user_overrides_preserved(self):
+        # name/controller_skill differ from what discovery produced last time
+        # (the discovered_* copies), so they are provable hand edits.
         with _TmpPaths(self.mod):
             existing = {"devices": [
                 {"alexa_entity_id": "e1", "name": "User Renamed",
-                 "controller_skill": "sh_custom", "lan_ip": "10.0.0.9",
+                 "discovered_name": "Fresh Name",
+                 "controller_skill": "sh_custom",
+                 "discovered_controller_skill": None, "lan_ip": "10.0.0.9",
                  "lan_mac": "AA:BB:CC:DD:EE:FF"},
             ]}
             self.mod._save_catalog(existing)
@@ -556,7 +560,8 @@ class MergeCatalogTests(unittest.TestCase):
     def test_fresh_device_missing_entity_id_skipped(self):
         with _TmpPaths(self.mod):
             self.mod._save_catalog({"devices": [
-                {"alexa_entity_id": "e1", "name": "Keep"}]})
+                {"alexa_entity_id": "e1", "name": "Keep",
+                 "discovered_name": "Fresh"}]})     # a hand edit
             fresh = {"devices": [
                 {"name": "no id"},  # skipped (no eid)
                 {"alexa_entity_id": "e1", "name": "Fresh"},

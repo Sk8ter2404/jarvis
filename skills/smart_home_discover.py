@@ -445,22 +445,63 @@ def _load_catalog() -> dict | None:
 
 
 # Fields that the user may hand-edit in data/smart_home_devices.json.
-# A re-run of the wizard preserves any non-empty existing value for these
-# fields, so a manual rename or controller override survives. All other
-# fields are refreshed from the live discovery. EXCEPTION: for a record the
-# LIVE LAN scan just produced (`source` starts with "lan:"), the fresh
+# A re-run of the wizard keeps a hand edit to any of them (a manual rename or
+# controller override — for those two see `_DISCOVERED_FIELDS` below). All
+# other fields are refreshed from the live discovery. EXCEPTION: for a record
+# the LIVE LAN scan just produced (`source` starts with "lan:"), the fresh
 # `lan_ip`/`lan_mac` win — a scan answer is ground truth and DHCP moves IPs,
 # so preserving a stale manual address would break direct control.
 _USER_OVERRIDE_FIELDS = ("name", "controller_skill", "lan_ip", "lan_mac")
+
+# `name` and `controller_skill` are ALSO produced by every discovery run, so
+# a stored value alone can't tell a hand edit from last run's answer — which
+# pinned the first name forever and a rename in Alexa / Tuya / Kasa never
+# reached JARVIS (found 2026-10-19 on a Tuya lamp seen via Alexa). Each record
+# therefore carries what discovery produced next to it: a stored value that
+# differs from its `discovered_*` copy is a hand edit and survives; one that
+# matches follows the source. A record saved before the copy existed follows
+# the source too — no copy means no way to prove a hand edit.
+_DISCOVERED_FIELDS = {"name": "discovered_name",
+                      "controller_skill": "discovered_controller_skill"}
+
+# What a source returns when it has no real value: `_entity_to_record` /
+# `_lan_record` fall back to "(unnamed)", an unmapped brand gives None.
+_NO_VALUE = (None, "", [], "(unnamed)")
+
+
+def _merge_discovered_field(rec: dict, prev: dict, field: str,
+                            discovered: str) -> None:
+    """Settle one `_DISCOVERED_FIELDS` field of fresh `rec` against the
+    stored `prev` (see the comment on `_DISCOVERED_FIELDS`)."""
+    old = prev.get(field)
+    if old in _NO_VALUE:
+        return
+    if rec.get(field) in _NO_VALUE:
+        # The source gave nothing this run (no friendlyName, unmapped brand):
+        # keep the stored value AND its discovered copy, so one bad answer
+        # neither blanks the device nor makes the stored value look edited.
+        rec[field] = old
+        if discovered in prev:
+            rec[discovered] = prev[discovered]
+        else:
+            rec.pop(discovered, None)
+        return
+    if discovered in prev and old != prev[discovered]:
+        rec[field] = old                # a real hand edit survives
+    elif field == "name" and old != rec[field]:
+        # !a: a device name with an emoji must not raise on a cp1252 console.
+        print(f"  [sh-discover] renamed at the source: "
+              f"{old!a} -> {rec[field]!a}")
 
 
 def _merge_with_existing_catalog(fresh: dict) -> dict:
     """Merge a freshly-built catalog with the existing on-disk catalog,
     preserving user overrides to the fields listed in
-    `_USER_OVERRIDE_FIELDS`. Devices are matched by `alexa_entity_id`
-    (Alexa records) or `device_id` (LAN records); devices absent from the
-    existing file are kept as-is from `fresh`, and devices absent from
-    `fresh` (i.e. removed at the source) are dropped."""
+    `_USER_OVERRIDE_FIELDS` (`name`/`controller_skill` only when they are
+    real hand edits — see `_DISCOVERED_FIELDS`). Devices are matched by
+    `alexa_entity_id` (Alexa records) or `device_id` (LAN records); devices
+    absent from the existing file are kept as-is from `fresh`, and devices
+    absent from `fresh` (i.e. removed at the source) are dropped."""
     existing = _load_catalog()
     if not existing or not isinstance(existing.get("devices"), list):
         return fresh
@@ -481,6 +522,9 @@ def _merge_with_existing_catalog(fresh: dict) -> dict:
             continue
         fresh_is_lan = str(d.get("source") or "").startswith("lan:")
         for k in _USER_OVERRIDE_FIELDS:
+            if k in _DISCOVERED_FIELDS:
+                _merge_discovered_field(d, prev, k, _DISCOVERED_FIELDS[k])
+                continue
             if fresh_is_lan and k in ("lan_ip", "lan_mac"):
                 continue    # live scan wins for addresses (see comment above)
             old = prev.get(k)
@@ -1683,6 +1727,10 @@ def _entity_to_record(entity: dict, echos: list[dict],
         "lan_ip": lan[0] if lan else "",
         "lan_mac": lan[1] if lan else "",
         "controller_skill": controller,
+        # What discovery produced, so the merge can tell a hand edit of
+        # name/controller_skill from a rename at the source.
+        "discovered_name": name,
+        "discovered_controller_skill": controller,
     }
 
 
@@ -1730,6 +1778,8 @@ def _lan_record(source: str, dev: dict, arp_table: list[dict]) -> dict:
     rec["alexa_room"] = ""
     rec["alexa_groups"] = []
     rec["controller_skill"] = source
+    rec["discovered_name"] = name                # see _DISCOVERED_FIELDS
+    rec["discovered_controller_skill"] = source
     rec["source"] = f"lan:{source}"
     mac = ""
     for row in arp_table:

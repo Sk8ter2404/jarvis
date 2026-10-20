@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.226 (2026-10-20)
+
+A device renamed in Alexa, Tuya or Kasa now gets its new name in JARVIS: the catalog merge kept any stored name, so the first name discovery ever saw stuck for good. Each device now also records the name and controller that discovery gave it, so a name you edited by hand still survives, but a rename at the source arrives on the next discovery.
+
 ## v2.0.225 (2026-10-20)
 
 Stops the made-up numbers at the source. His personality rules TOLD him to put a number on everything ('Tag the certainty with a percentage or probability whenever you can', with sample lines like 'A 78% probability' and 'CPU at 34%, RAM at 61%' that he copied with new numbers); now a number comes only from a reading this turn, and confidence is said in words. The number checker also learns CPU, memory, GPU, time left, percent done and percentages on a confidence; a guess written before a reading that the same reply runs ("CPU at 12%" then system_pulse) is dropped quietly so only the real reading is spoken.
