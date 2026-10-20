@@ -862,6 +862,21 @@ MEDIA_AEC_DRIFT_WINDOW_S = 120.0
 MEDIA_AEC_MAX_LAG_S = 0.400         # GCC searches the echo up to this late
 MEDIA_AEC_MAX_LEAD_S = 0.200        # ... and this early
 MEDIA_AEC_REF_ACTIVE_RMS = 1e-4     # quieter reference = silence
+# How long a block may wait for a reference that has not been written yet
+# (2026-10-19 room recording, offline replay of this class): live, the
+# loopback reaches the canceller >= ~58 ms after the echo is already in the
+# mic, so with the old fixed 60 ms wait every late block was cancelled
+# against zeros - ERLE 0.9-4.6 dB, a -27.8 ms "delay" and a garbage drift,
+# exactly the live log. Waiting up to MEDIA_AEC_REF_WAIT_S while the
+# reference stream is ALIVE (written within MEDIA_AEC_REF_ALIVE_S of the
+# block's mic stamp) gave 16.8-17.5 dB with the reference 132-200 ms late,
+# and 17.1 dB on time. Runs on the mic bus's own DSP thread (the audio
+# callback only queues, CALLBACK_QUEUE_MAX ~16 s), so the cost is that
+# frames reach listeners up to this much later while media plays. An idle
+# reference (nothing playing) keeps the short wait, so silence never stalls.
+MEDIA_AEC_REF_WAIT_S = 0.25
+MEDIA_AEC_REF_WAIT_IDLE_S = 0.06
+MEDIA_AEC_REF_ALIVE_S = 0.5
 MEDIA_AEC_DIVERGE_DB = 3.0
 MEDIA_AEC_DIVERGE_S = 1.0
 MEDIA_AEC_POOR_ERLE_DB = 10.0
@@ -1219,6 +1234,20 @@ class MediaEchoCanceller:
         self.stats["sessions"] += 1
         return True
 
+    def _ref_wait_s(self) -> float:
+        """MEDIA_AEC_REF_WAIT_S while the reference stream is alive but late
+        (its last write within MEDIA_AEC_REF_ALIVE_S of this block's mic
+        stamp), else MEDIA_AEC_REF_WAIT_IDLE_S. Never raises."""
+        try:
+            last = getattr(self.ref, "_last_write", None)
+            now = self._last_t
+            if last is not None and now is not None and \
+                    float(now) - float(last) <= MEDIA_AEC_REF_ALIVE_S:
+                return float(MEDIA_AEC_REF_WAIT_S)
+        except Exception:
+            pass
+        return float(MEDIA_AEC_REF_WAIT_IDLE_S)
+
     def _ref_block(self, k0: int, n: int):
         """The aligned reference for session samples [k0, k0+n): an array,
         "late" (not written yet, even after a short wait) or None (gone from
@@ -1236,7 +1265,7 @@ class MediaEchoCanceller:
             wait = getattr(ref, "wait_for", None)
             if callable(wait):
                 try:
-                    wait(i1 + 1, 0.06)
+                    wait(i1 + 1, self._ref_wait_s())
                 except Exception:
                     pass
             if i1 + 1 > int(getattr(ref, "n_written", 0)):

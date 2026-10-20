@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.223 (2026-10-20)
+
+Echo cancelling waits for a late PC-audio reference (up to 0.25 s while the loopback is alive): the 10-19 room recording showed the reference arriving >= ~58 ms after the echo, so the canceller had been cancelling against silence (simulated 4.6 -> ~17 dB). And the Claude safety net now works with local-first settings: a turn the checker catches is redone once on Claude Sonnet 5.5 while the Claude boost is on (TURN_CHECK_MODE on).
+
 ## v2.0.222 (2026-10-20)
 
 Stops answering the room TV (camera sees the TV on + a full 30 s capture of nonstop sound + a voice that isn't clearly his -> dropped, with a spoken 'couldn't tell that was you'); the voice server restarts itself after 3 CUDA-error renders (a GPU driver reset left it broken); the headset's charging status (0x05) counts as on, so the deaf-mic rescue can run; rebuild/parity questions go to the server skill; only facts the owner said himself are shared or imported between the machines.

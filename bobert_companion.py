@@ -49555,7 +49555,7 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
                                       + _turn_check_retry_note(verdict))
         retry = _claude_oneshot(system, _self_knowledge_for_cloud(msgs),
                                 max_tokens=500, model=model,
-                                caller="turn_check_retry")
+                                caller="turn_check_retry", boost=True)
         if not (isinstance(retry, str) and retry.strip()):
             print(f"  [turn-check] the {model} retry returned nothing - the "
                   f"local reply stands")
@@ -49768,7 +49768,11 @@ def _turn_check_after_chain(user_text, chain_texts, chain_results, *,
     kwargs = dict(
         asked=held or bool(_pending_autocorrect_choice),
         needs_confirmation=bool(_pending_confirmation) or confirm_held,
-        cloud_allowed=bool(_chat_cloud_allowed()),
+        # The Claude boost (CLOUD_BOOST_UNTIL) also allows the retry
+        # (2026-10-20, owner's 'full brain plan'): with AI_BACKEND 'ollama'
+        # and chat routed local, _chat_cloud_allowed() is always False, so
+        # TURN_CHECK_MODE 'on' could never retry anything.
+        cloud_allowed=bool(_chat_cloud_allowed() or _cloud_boost_on()),
         out=sys.stdout, log_path_fn=_turn_check_log_path,
         close_line=close_line, barge_seq0=barge_seq0)
     args = (mode, user_text, list(chain_texts or ()), results,

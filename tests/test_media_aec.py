@@ -377,3 +377,45 @@ class ReopenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LateReferenceWaitTests(unittest.TestCase):
+    """2026-10-19 room recording, replayed offline: live the loopback reaches
+    the canceller >= ~58 ms after the echo; with the old fixed 60 ms wait every
+    late block was cancelled against zeros (ERLE 0.9-4.6 dB). While the
+    reference stream is alive it may now wait MEDIA_AEC_REF_WAIT_S."""
+
+    class _LateRef(FakeRef):
+        def __init__(self, x, written, last_write):
+            super().__init__(x)
+            self.n_written = written
+            self._last_write = last_write
+            self.waits = []
+
+        def wait_for(self, index, timeout):
+            self.waits.append(timeout)
+            return False
+
+    def _aec(self, last_write, now):
+        ref = self._LateRef(np.zeros(SR * 4), written=SR, last_write=last_write)
+        aec = ap.MediaEchoCanceller(ref, SR)
+        aec._last_t = now
+        return aec, ref
+
+    def test_an_alive_but_late_reference_gets_the_long_wait(self):
+        aec, ref = self._aec(last_write=10.0, now=10.2)
+        self.assertEqual(aec._ref_wait_s(), ap.MEDIA_AEC_REF_WAIT_S)
+        self.assertEqual(aec._ref_block(SR * 2, ap.MEDIA_AEC_BLOCK), "late")
+        self.assertEqual(ref.waits, [ap.MEDIA_AEC_REF_WAIT_S])
+
+    def test_an_idle_reference_keeps_the_short_wait(self):
+        aec, _ = self._aec(last_write=10.0, now=12.0)       # nothing for 2 s
+        self.assertEqual(aec._ref_wait_s(), ap.MEDIA_AEC_REF_WAIT_IDLE_S)
+        aec, _ = self._aec(last_write=None, now=12.0)       # never written
+        self.assertEqual(aec._ref_wait_s(), ap.MEDIA_AEC_REF_WAIT_IDLE_S)
+        aec, _ = self._aec(last_write=10.0, now=None)       # no mic stamp yet
+        self.assertEqual(aec._ref_wait_s(), ap.MEDIA_AEC_REF_WAIT_IDLE_S)
+
+    def test_the_long_wait_stays_bounded(self):
+        self.assertLessEqual(ap.MEDIA_AEC_REF_WAIT_S, 0.3)
+        self.assertLess(ap.MEDIA_AEC_REF_WAIT_IDLE_S, ap.MEDIA_AEC_REF_WAIT_S)

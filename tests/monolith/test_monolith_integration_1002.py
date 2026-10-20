@@ -527,3 +527,29 @@ class HarnessForgetsTheBatchStateTests(MonolithGlobalsTestCase):
 
 if __name__ == "__main__":   # pragma: no cover
     unittest.main()
+
+
+class TurnCheckRetryUnderTheClaudeBoostTests(ShadowInstantWithTurnCheckOnTests):
+    """2026-10-20: the owner runs AI_BACKEND 'ollama' with chat routed local,
+    so _chat_cloud_allowed() is always False and TURN_CHECK_MODE 'on' could
+    never retry. The Claude boost (CLOUD_BOOST_UNTIL) now allows it, and the
+    retry asks _claude_oneshot for the boost path."""
+
+    def setUp(self):
+        super().setUp()
+        self.cloud.return_value = False
+        self._p(self.bc, "_cloud_boost_on", return_value=True)
+
+    def test_the_retry_runs_on_the_boost_path(self):
+        self.llm.return_value = "Right away, sir."     # no token
+        self.oneshot.return_value = "[ACTION: volume_up] Volume up, sir."
+        self._run("volume up")
+        self.assertEqual(self.oneshot.call_count, 1)
+        self.assertIs(self.oneshot.call_args.kwargs.get("boost"), True)
+        self.assertEqual(self.calls["volume_up"], [""])
+
+    def test_no_boost_and_no_cloud_means_no_retry(self):
+        self.bc._cloud_boost_on.return_value = False
+        self.llm.return_value = "Right away, sir."
+        self._run("volume up")
+        self.oneshot.assert_not_called()
