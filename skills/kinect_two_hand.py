@@ -840,8 +840,37 @@ def _foreground_target_rect() -> "tuple[object, Optional[Rect]]":
     """(hwnd, Rect) for the current foreground window when it's a grabbable target,
     else (hwnd, None). Win32 only; (0, None) off Windows / on error. NEVER raises.
     This is the GRAB-time capture of what's under the hands."""
+    return _target_rect_for(_get_foreground_hwnd())
+
+
+_GA_ROOT = 2
+_OWN_OVERLAY_TITLE = "JARVIS Air Cursor"     # hud/jarvis_air_cursor.py's windows
+
+
+def _target_rect_at(x: float, y: float) -> "tuple[object, Optional[Rect]]":
+    """(hwnd, Rect) for the top-level window UNDER screen point (x, y) when it
+    is a grabbable target, else (hwnd, None) - the webcam two-hand grab
+    (core/hand_two_hand.py) takes the window between the hands, not the
+    foreground one. Same skip-list as the foreground grab, plus the reticle
+    overlay itself. Win32 only; (0, None) on error. NEVER raises."""
     try:
-        hwnd = _get_foreground_hwnd()
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        pt = wintypes.POINT(int(round(x)), int(round(y)))
+        child = u.WindowFromPoint(pt)
+        hwnd = int(u.GetAncestor(child, _GA_ROOT) or child or 0)
+        if _window_title(hwnd).startswith(_OWN_OVERLAY_TITLE):
+            return hwnd, None
+        return _target_rect_for(hwnd)
+    except Exception:
+        return 0, None
+
+
+def _target_rect_for(hwnd) -> "tuple[object, Optional[Rect]]":
+    """(hwnd, Rect) when ``hwnd`` is a grabbable top-level window, else
+    (hwnd, None). NEVER raises."""
+    try:
         if not hwnd:
             return 0, None
         cls = _window_class_name(hwnd)
@@ -921,7 +950,8 @@ def _atomic_write_overlay_json(path: str, data: dict) -> None:
                 pass
 
 
-def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
+def _publish_two_hand_overlay(decision: "TwoHandDecision",
+                              edge: "Optional[list]" = None) -> None:
     """Publish the TWO hands' screen points + the resize state to the air-cursor
     overlay's state file so the HUD draws two reticle circles (BLUE while engaged,
     PURPLE while actively resizing a window). Reuses the air-mouse's
@@ -933,7 +963,13 @@ def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
          "two_hand": True,
          "hands": [{"x": int, "y": int}, {"x": int, "y": int}],
          "resizing": bool,
-         "color": "purple"|"blue"}"""
+         "color": "purple"|"blue"}
+
+    ``edge`` is the caller's own one-element "last frame was active" flag
+    (default: this poller's). The webcam two-hand grab (core/hand_two_hand.py)
+    passes its own, so the two publishers never clear each other's frames."""
+    if edge is None:
+        edge = _two_hand_overlay_was_active
     am = _air_mouse_mod()
     if am is None:
         return
@@ -947,12 +983,12 @@ def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
             # nothing, so we don't fight the air-mouse's ~30 Hz writes and
             # strobe the reticle. The air-mouse's next single-hand frame
             # overwrites this cleared frame within a tick.
-            if _two_hand_overlay_was_active[0]:
+            if edge[0]:
                 data = {"visible": False, "two_hand": False, "ts": time.time()}
                 _atomic_write_overlay_json(path, data)
-                _two_hand_overlay_was_active[0] = False
+                edge[0] = False
             return
-        _two_hand_overlay_was_active[0] = True
+        edge[0] = True
         (lx, ly), (rx, ry) = hands
         color = "purple" if decision.resizing else "blue"
         data = {

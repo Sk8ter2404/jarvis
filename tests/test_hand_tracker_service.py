@@ -126,7 +126,11 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(len(msg["hands"]), 1)
         h = msg["hands"][0]
         self.assertEqual(sorted(h), sorted(["id", "side", "score", "lm", "world",
-                                            "state", "pinch", "palm", "palm_facing"]))
+                                            "state", "pinch", "palm", "palm_facing",
+                                            "size", "ok"]))
+        # 2026-10-20 recognition: size over the frame height, ok = may trigger
+        self.assertAlmostEqual(h["size"], 100.0 / 480, delta=0.03)
+        self.assertIsInstance(h["ok"], bool)
         self.assertEqual(h["side"], "Right")
         self.assertAlmostEqual(h["score"], 0.93)
         self.assertEqual((len(h["lm"]), len(h["lm"][0])), (21, 3))

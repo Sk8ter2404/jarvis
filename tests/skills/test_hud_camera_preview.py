@@ -194,11 +194,11 @@ class _FakePixmap:
 class UnifiedHudCameraTickTests(unittest.TestCase):
     """Cadence + change-detection contract for the dedicated fast camera tick.
 
-    The smoothness fix gives the preview tile its OWN ~13 fps timer, decoupled
-    from the 500 ms HUD state poll, and makes ``_refresh_camera_preview`` report
-    whether the displayed frame changed so that fast tick repaints ONLY on a new
-    frame (and skips the JPEG decode when the file's mtime is unchanged). These
-    tests pin that cadence and that change/skip contract.
+    The smoothness fix gives the preview tile its OWN ~30 Hz timer (~13 fps
+    until 2026-10-20), decoupled from the 500 ms HUD state poll, and makes
+    ``_refresh_camera_preview`` report whether the displayed frame changed so
+    that fast tick repaints ONLY on a new frame (and skips the JPEG decode
+    when the file's mtime is unchanged). These tests pin that cadence and that change/skip contract.
 
     ``_refresh_camera_preview`` only ever touches ``self.cam_preview`` and
     ``self._cam_preview_mtime``, so we invoke it as an unbound method against a
@@ -251,16 +251,18 @@ class UnifiedHudCameraTickTests(unittest.TestCase):
         self.assertTrue(hasattr(self.mod, "CAMERA_TICK_MS"))
         self.assertLess(self.mod.CAMERA_TICK_MS, self.mod.TICK_MS)
 
-    def test_camera_tick_is_in_the_target_12_to_15_fps_band(self):
-        # ~66-80 ms per the brief (12-15 fps). Pin the band so a future edit that
-        # quietly slows it back toward the 500 ms poll (choppy again) or spikes it
-        # to a wasteful rate is caught.
+    def test_camera_tick_is_in_the_target_25_to_30_hz_band(self):
+        # 2026-10-20: 33-40 ms (25-30 Hz), at least twice the ~15 fps the writer
+        # reaches while the hand tracker's frame pump runs, so each new frame is
+        # shown within one tick (a 75 ms poll of a 67 ms stream showed frames
+        # unevenly). Pin the band so a future edit that slows it back toward
+        # the old 75 ms (uneven again) or spikes it to a wasteful rate is caught.
         ms = self.mod.CAMERA_TICK_MS
-        self.assertGreaterEqual(ms, 66)
-        self.assertLessEqual(ms, 80)
+        self.assertGreaterEqual(ms, 33)
+        self.assertLessEqual(ms, 40)
         fps = 1000.0 / ms
-        self.assertGreaterEqual(fps, 12.0)
-        self.assertLessEqual(fps, 15.2)
+        self.assertGreaterEqual(fps, 25.0)
+        self.assertLessEqual(fps, 30.5)
 
     def test_state_poll_cadence_unchanged(self):
         # The rest of the HUD stays on the cheap 500 ms loop — the smoothness fix

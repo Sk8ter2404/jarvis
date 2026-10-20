@@ -17,7 +17,9 @@ INPUT (per frame)
              frame does not skew them).
     -> (infos, events)
       infos   one dict per input hand: {"id", "side", "score", "state", "pinch",
-              "palm": [x, y], "palm_facing"} (the service adds lm / world).
+              "palm": [x, y], "palm_facing", "size", "ok"} (the service adds
+              lm / world). size = hs / frame height; ok = the hand may fire
+              trigger events (see RECOGNITION).
       events  [{"type": "gesture", "name", "side", "pos": [x, y], "value"?}]
 
 UNITS
@@ -40,6 +42,17 @@ HAND STATES (with hysteresis; a state change must also persist STATE_DEBOUNCE_S)
         for a mirrored "Right" hand the palm faces the camera when the cross
         product is positive (index MCP left of the pinky MCP with fingers up),
         for "Left" when it is negative. Needs |cross| >= 0.20 hs^2 (not edge-on).
+
+RECOGNITION (2026-10-20, owner: "I don't want false triggers" - typing,
+talking with his hands, a classmate's hand in frame)
+    A hand may fire the TRIGGER events (palm_hold, pinch_hold, point_flick)
+    only while it is "ok": handedness score >= EVENT_MIN_SCORE_ON (0.80) and
+    size >= EVENT_MIN_SIZE_ON (0.10 of the frame height) to become ok, kept
+    down to EVENT_MIN_SCORE_OFF (0.60) / EVENT_MIN_SIZE_OFF (0.075)
+    (hysteresis), and in view for EVENT_SETTLE_S (0.4 s). A palm hold's clock
+    only runs while the hand is ok. State transitions (pinch_start/end,
+    fist_grab/release) and the two-hand clap / explode are not gated: the
+    holo page pairs them.
 
 EVENTS  (each fires once, then needs the gesture to end before it can re-arm)
     palm_hold    open palm facing the camera, fingers spread, held PALM_HOLD_S
@@ -102,6 +115,12 @@ SPREAD_ON_DEG, SPREAD_OFF_DEG = 20.0, 14.0
 FACING_MIN_CROSS = 0.20
 STATE_DEBOUNCE_S = 0.10
 TRACK_DROP_S = 0.25
+
+# Recognition (see RECOGNITION). Size = hs / frame height: the owner at a
+# laptop webcam (~0.6 m) is ~0.15-0.20, ~1.2 m away ~0.09, 2 m back ~0.05.
+EVENT_MIN_SCORE_ON, EVENT_MIN_SCORE_OFF = 0.80, 0.60
+EVENT_MIN_SIZE_ON, EVENT_MIN_SIZE_OFF = 0.10, 0.075
+EVENT_SETTLE_S = 0.40
 
 PALM_HOLD_S = 1.5
 PALM_STILL_WINDOW_S = 0.6
@@ -201,6 +220,7 @@ class _Track:
         self.flick_hist: deque = deque()  # (t, angle_deg)
         self.flick_until = 0.0
         self.dt_ema = 0.0                 # smoothed frame interval (s)
+        self.ok = False                   # may fire trigger events (RECOGNITION)
         self.last_info: dict = {}
 
 
@@ -240,7 +260,8 @@ class GestureEngine:
                 infos.append({"id": -1, "side": hd.get("side", ""),
                               "score": float(hd.get("score", 0.0) or 0.0),
                               "state": "unknown", "pinch": 0.0,
-                              "palm": [0.0, 0.0], "palm_facing": False})
+                              "palm": [0.0, 0.0], "palm_facing": False,
+                              "size": 0.0, "ok": False})
                 continue
             seen.add(tr.id)
             self._step_track(tr, t, a, hd, w, h, events)
@@ -351,6 +372,14 @@ class GestureEngine:
         tr.last_t = t
         tr.hs = a["hs"] if tr.hs <= 0 else 0.7 * tr.hs + 0.3 * a["hs"]
         tr.palm = a["palm"]
+        # RECOGNITION: score + size with hysteresis (entering is stricter)
+        score = float(hd.get("score", 0.0) or 0.0)
+        size = tr.hs / max(1, h)
+        if tr.ok:
+            tr.ok = score >= EVENT_MIN_SCORE_OFF and size >= EVENT_MIN_SIZE_OFF
+        else:
+            tr.ok = score >= EVENT_MIN_SCORE_ON and size >= EVENT_MIN_SIZE_ON
+        settled = tr.ok and t - tr.first_t >= EVENT_SETTLE_S
         # finger flags with hysteresis
         for i, r in enumerate(a["ratios"]):
             if r > EXT_ON:
@@ -397,7 +426,8 @@ class GestureEngine:
                         "score": float(hd.get("score", 0.0) or 0.0),
                         "state": tr.state, "pinch": shown,
                         "palm": [round(palm_n[0], 4), round(palm_n[1], 4)],
-                        "palm_facing": bool(a["facing"])}
+                        "palm_facing": bool(a["facing"]),
+                        "size": round(size, 4), "ok": bool(settled)}
         tr.grab_pos = tuple(palm_n)
 
         # ---- pinch start / end / hold
@@ -414,8 +444,9 @@ class GestureEngine:
             events.append(self._ev("pinch_end", tr.side, pinch_n, w, h))
         if tr.pinch_on:
             tr.pinch_hist.append((t, a["pinch_pt"][0], a["pinch_pt"][1]))
-            held = t - (tr.pinch_since or t)
-            if (not tr.pinch_hold_fired and held >= PINCH_HOLD_S
+            # (`is None`, not `or`: a pinch that began at t == 0.0 is a pinch)
+            held = t - (t if tr.pinch_since is None else tr.pinch_since)
+            if (not tr.pinch_hold_fired and held >= PINCH_HOLD_S and settled
                     and _span([(x, y) for _, x, y in tr.pinch_hist])
                     <= PINCH_HOLD_SPAN_HS * tr.hs):
                 tr.pinch_hold_fired = True
@@ -435,10 +466,10 @@ class GestureEngine:
 
         # ---- point flick
         self._step_flick(tr, t, a, palm_n, w, h, events,
-                         point_flags and not pinch_now)
+                         point_flags and not pinch_now, settled)
 
     def _step_palm_hold(self, tr, t, a, palm_n, w, h, events):
-        base = tr.state == "open" and a["facing"] and tr.spread_ok
+        base = tr.state == "open" and a["facing"] and tr.spread_ok and tr.ok
         if not base:
             if tr.hold_bad_since is None:
                 tr.hold_bad_since = t
@@ -475,7 +506,8 @@ class GestureEngine:
             events.append(self._ev("palm_hold", tr.side, palm_n, w, h,
                                    round(t - tr.hold_start, 2)))
 
-    def _step_flick(self, tr, t, a, palm_n, w, h, events, pointing):
+    def _step_flick(self, tr, t, a, palm_n, w, h, events, pointing,
+                    settled=True):
         if not pointing:
             # a pause of the posture ends the sweep
             if tr.flick_hist and t - tr.flick_hist[-1][0] > 0.12:
@@ -500,7 +532,8 @@ class GestureEngine:
         if dt <= 0.03:
             return
         omega = sweep / dt
-        if abs(sweep) >= FLICK_SWEEP_DEG and abs(omega) >= FLICK_OMEGA_DEG_S:
+        if (settled and abs(sweep) >= FLICK_SWEEP_DEG
+                and abs(omega) >= FLICK_OMEGA_DEG_S):
             tr.flick_until = t + FLICK_COOLDOWN_S
             tr.flick_hist.clear()
             tip_n = palm_n

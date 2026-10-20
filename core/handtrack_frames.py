@@ -38,7 +38,9 @@ IDLE_CLOSE_S without a tracker.
 
 ``publish_frame()`` is the single entry point the camera loop calls. It NEVER
 raises and never touches the camera: it only reads the numpy frame it is
-given.
+given. While the tracker is alive the loop also asks ``PUMP.serve()`` for its
+camera's frames (the steady-frames reader, see FramePump): that is the only
+code here that reads a capture handle, and only the one the loop hands it.
 
 Stdlib + numpy + cv2 (all already in JARVIS's environment; cv2 and numpy are
 imported lazily so importing this module costs nothing). The tracker venv
@@ -49,8 +51,9 @@ from __future__ import annotations
 
 import os
 import struct
+import threading
 import time
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 SHM_NAME = "jarvis_handtrack_frame"
 MAGIC = b"JVHT0001"
@@ -190,6 +193,10 @@ class HandTrackFrames:
         self._inactive_since = 0.0
         self._frames = 0
         self._last_error = ""
+        # publish() can be called from the face loop AND from the frame pump's
+        # reader thread (FramePump below): one writer at a time, so two copies
+        # can never interleave inside the seqlock.
+        self._pub_lock = threading.Lock()
 
     # ── is anyone listening? ────────────────────────────────────────────
     def active(self) -> bool:
@@ -266,6 +273,10 @@ class HandTrackFrames:
     def publish(self, frame) -> bool:
         """Publish ``frame`` (BGR uint8, any size) if the tracker is alive.
         Returns True when a frame was written. Never raises."""
+        with self._pub_lock:
+            return self._publish(frame)
+
+    def _publish(self, frame) -> bool:
         try:
             if not self.active():
                 if (self._shm is not None and self._inactive_since
@@ -390,6 +401,214 @@ def burst(cap, cam: dict, frame, beat=None, setting: Optional[str] = None,
     except Exception:
         pass
     return frame, n
+
+
+# ── steady frames: the frame pump (2026-10-20) ──────────────────────────
+# Live on the Dell (v2.0.226) the burst above still left the hand cursor
+# laggy: the tracker got ~18 frames/s, but in CLUMPS - ~0.15 s of reads, then
+# a hole while the loop ran face detection, previews and the other cameras.
+# The pump replaces the burst while the tracker is alive: ONE daemon thread
+# reads the tracker's camera at the camera's own rate and publishes every
+# frame, and the face loop takes the newest frame from it INSTEAD of calling
+# cap.read() itself. Face detection keeps its own (slower) cadence.
+#
+# THE HANDLE DISCIPLINE (Windows MSMF: one handle per device, owned by the
+# face loop) is unchanged:
+#   * the pump never opens and never releases a capture. It only reads the
+#     handle the face loop passes to serve(), and only from its one thread;
+#   * while the reader runs on a handle, the face loop does NOT read it
+#     (serve() returning None is the promise that no reader is on it);
+#   * every release goes through detach() first (the monolith's
+#     _release_capture_guarded calls it), which stops the reader and waits for
+#     its in-flight read() to return - so a handle is never released while
+#     another thread is inside read() on it;
+#   * the reader takes no lock, exactly like the face loop's own reads (a
+#     blocking read under _camera_io_lock is the documented whole-subsystem
+#     hang).
+# With no tracker, serve() is one attribute test plus WRITER.active() (one
+# monotonic compare) and returns None: the loop reads exactly as before.
+PUMP_WAIT_S = 1.0               # the face loop waits at most this for a NEW frame
+PUMP_REARM_S = 1.0              # after the reader's failed read, the loop reads itself this long
+PUMP_MIN_READ_GAP_S = 1.0 / 60  # backstop for a capture whose read() never blocks
+PUMP_JOIN_WARN_S = 2.0          # detach() says so when a read keeps it waiting this long
+
+
+class FramePump:
+    """The paced reader for the tracker's camera. One instance (``PUMP``)."""
+
+    def __init__(self, writer=None, clock=time.monotonic, log=None):
+        self._writer = writer          # None = the module's WRITER, looked up per call
+        self._clock = clock
+        self._log = log or (lambda s: print(f"  [handtrack] {s}"))
+        self._cond = threading.Condition(threading.Lock())
+        self._cap = None               # the handle the reader is bound to
+        self._thread: Optional[threading.Thread] = None
+        self._stop: Optional[threading.Event] = None
+        self._alive = False            # reader thread still looping
+        self._failed = False           # it ended on a failed read
+        self._frame = None
+        self._seq = 0                  # frames read on the current binding
+        self._served = 0               # newest seq handed to the face loop
+        self._rearm_at = 0.0
+        self.reads = 0                 # lifetime counters (status / tests)
+        self.starts = 0
+        # Optional hooks, set once by the monolith:
+        #   accept(frame) -> bool   publish this frame to the tracker? (black check)
+        #   on_frame(cam, frame)    runs on the reader thread for every good frame
+        #                           (the HUD preview follows the steady frames)
+        self.accept: Optional[Callable] = None
+        self.on_frame: Optional[Callable] = None
+
+    def _w(self):
+        return self._writer if self._writer is not None else WRITER
+
+    def bound(self) -> bool:
+        return self._cap is not None
+
+    # ── the face loop's side ────────────────────────────────────────────
+    def serve(self, cap, cam: dict, setting: Optional[str] = None,
+              pumpable: bool = True):
+        """Called by the face loop INSTEAD of ``cap.read()``.
+
+        None  -> the pump does not serve this read: the caller reads ``cap``
+                 itself, exactly as before (and no reader is on ``cap``).
+        (ret, frame) -> the newest frame the reader got since the last call,
+                 or (False, None) when it failed / none came in PUMP_WAIT_S.
+        Never raises."""
+        try:
+            if self._cap is None and (cap is None or not self._w().active()):
+                return None                       # no tracker: the common path
+            alive = self._w().active()
+            want = (cap is not None and pumpable and alive
+                    and is_hand_camera(cam, setting))
+            if not want:
+                if self._cap is not None and (self._cap is cap or not alive):
+                    self.detach(self._cap)
+                return None
+            if self._cap is not None and self._cap is not cap:
+                self.detach(self._cap)            # the loop reopened this camera
+            if self._cap is None:
+                if self._clock() < self._rearm_at:
+                    return None                   # after a failure: the loop reads
+                self._start(cap, cam)
+            return self._next()
+        except Exception:
+            try:
+                self.detach(cap)
+            except Exception:
+                pass
+            return None
+
+    def _start(self, cap, cam) -> None:
+        stop = threading.Event()
+        with self._cond:
+            self._cap, self._stop = cap, stop
+            self._alive, self._failed = True, False
+            self._frame, self._seq, self._served = None, 0, 0
+        t = threading.Thread(target=self._run, args=(cap, cam, stop),
+                             name="handtrack-frame-pump", daemon=True)
+        self._thread = t
+        self.starts += 1
+        t.start()
+
+    def _next(self):
+        # Real time on purpose (the waits are real): self._clock only decides
+        # the re-arm back-off, which tests drive with a fake clock.
+        deadline = time.monotonic() + PUMP_WAIT_S
+        with self._cond:
+            while self._seq <= self._served and self._alive:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False, None            # nothing new in PUMP_WAIT_S
+                self._cond.wait(min(left, 0.1))
+            if self._seq > self._served:
+                self._served = self._seq
+                return True, self._frame
+            failed = self._failed
+        # The reader has ended (a failed read): hand the loop that failure once,
+        # then let it read the camera itself for PUMP_REARM_S.
+        self.detach(self._cap)
+        if failed:
+            self._rearm_at = self._clock() + PUMP_REARM_S
+        return False, None
+
+    def detach(self, cap=None) -> bool:
+        """Stop the reader (only if it is on ``cap``; None = whatever it is on)
+        and wait for its in-flight read to return. True when it was bound.
+        Must run before the handle is released. Never raises."""
+        try:
+            with self._cond:
+                if self._cap is None or (cap is not None and self._cap is not cap):
+                    return False
+                t, stop = self._thread, self._stop
+            if stop is not None:
+                stop.set()
+            if t is not None and t is not threading.current_thread():
+                t0 = time.monotonic()
+                warned = False
+                while t.is_alive():
+                    t.join(0.25)
+                    if not warned and time.monotonic() - t0 > PUMP_JOIN_WARN_S:
+                        warned = True
+                        self._log("waiting for the frame pump's camera read to "
+                                  "return before the camera is let go")
+            with self._cond:
+                self._cap = None
+                self._thread = None
+                self._stop = None
+                self._alive = False
+                self._frame = None
+            return True
+        except Exception:
+            return False
+
+    # ── the reader thread ───────────────────────────────────────────────
+    def _run(self, cap, cam, stop) -> None:
+        failed = False
+        try:
+            while not stop.is_set():
+                t0 = time.monotonic()
+                try:
+                    ret, f = cap.read()
+                except Exception:
+                    ret, f = False, None
+                self.reads += 1
+                if stop.is_set():
+                    break
+                if not ret or not _frame_matches(f):
+                    failed = True
+                    break
+                with self._cond:
+                    self._frame = f
+                    self._seq += 1
+                    self._cond.notify_all()
+                try:
+                    if self.accept is None or self.accept(f):
+                        self._w().publish(f)
+                except Exception:
+                    pass
+                hook = self.on_frame
+                if hook is not None:
+                    try:
+                        hook(cam, f)
+                    except Exception:
+                        pass
+                gap = time.monotonic() - t0
+                if gap < PUMP_MIN_READ_GAP_S:
+                    stop.wait(PUMP_MIN_READ_GAP_S - gap)
+        finally:
+            with self._cond:
+                self._alive = False
+                self._failed = failed
+                self._cond.notify_all()
+
+    def status(self) -> dict:
+        return {"bound": self._cap is not None, "alive": self._alive,
+                "reads": self.reads, "starts": self.starts,
+                "failed": self._failed}
+
+
+PUMP = FramePump()
 
 
 # ── reader half (the tracker service; also used by tests) ───────────────

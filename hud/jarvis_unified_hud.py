@@ -109,9 +109,15 @@ TICK_MS = 500                 # cheap data refresh + repaint cadence
 # state poll, so the live mirror looks smooth instead of stepping at 2 fps. Only
 # the preview JPEG is re-read + the widget repainted on this tick (and only when
 # the frame actually changed — see _refresh_camera_preview's return value), so
-# the rest of the HUD state stays on the cheap TICK_MS loop. 75 ms ≈ 13.3 fps,
-# comfortably above the writer's ~0.15 s (~6-7 fps) cadence so we never starve it.
-CAMERA_TICK_MS = 75           # camera-preview-only refresh cadence (~13 fps)
+# the rest of the HUD state stays on the cheap TICK_MS loop.
+# 2026-10-20 (owner: "the camera feed looks laggy / jittery"): 33 ms (~30 Hz).
+# While the hand tracker runs, the writer follows the camera's steady frames at
+# up to ~15 fps (bobert_companion._HUD_CAM_PREVIEW_PUMP_GAP); a 75 ms poll of a
+# 67 ms stream showed each frame 0-75 ms late, so frames landed unevenly. At
+# 33 ms each new frame is picked up within one tick. Still one stat() per tick
+# when the file is unchanged (the decode is skipped on an unchanged mtime) and
+# nothing at all while the HUD is hidden.
+CAMERA_TICK_MS = 33           # camera-preview-only refresh cadence (~30 Hz poll)
 SLOW_REFRESH_S = 600.0        # weather/calendar refresh cadence (background)
 GPU_CACHE_SECONDS = 1.0       # utilization swings 0→100→0 fast; a long cache aliases it
 
@@ -595,7 +601,7 @@ class UnifiedHud(QWidget):
         self.timer.start()
 
         # Dedicated fast tick for JUST the camera-preview tile, so the live
-        # mirror is smooth without dragging the whole HUD up to 13 fps. It only
+        # mirror is smooth without dragging the whole HUD up to that rate. It only
         # re-reads the preview JPEG (decode skipped unless its mtime changed) and
         # repaints when the frame actually changed — the rest of the HUD state
         # stays on the cheap TICK_MS loop above.

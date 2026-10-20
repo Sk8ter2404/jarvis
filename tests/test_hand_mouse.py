@@ -31,6 +31,7 @@ sys.modules["skill_hand_tracking_mouse_under_test"] = ht
 _spec.loader.exec_module(ht)
 
 SCREEN = (0, 0, 1920, 1080)
+_REAL_PER_APP_BLOCKED = ht._per_app_blocked     # before any test patches it
 
 
 # ── fakes and builders ─────────────────────────────────────────────────────
@@ -46,6 +47,14 @@ class FakeMouse(hm.MouseOutput):
 
     def button(self, down):
         self.events.append(("down",) if down else ("up",))
+
+    def wheel(self, delta):
+        self.events.append(("wheel", delta))
+
+    def idle_s(self):
+        return self.idle
+
+    idle = None                      # seconds since real input (None = unknown)
 
     def position(self):
         return self.override if self.override is not None else self.pos
@@ -63,11 +72,17 @@ class FakeMouse(hm.MouseOutput):
 
 
 def hand(side="Right", state="unknown", pt=(0.5, 0.45), palm=None,
-         facing=False, score=0.9):
+         facing=False, score=0.9, size=0.16, hid=0):
+    """A tracker hand. ``size`` = hand size over the frame height (the wrist
+    sits ``size`` below the middle-finger MCP, as in a 640x480 frame)."""
     lm = [[0.5, 0.5, 0.0] for _ in range(21)]
+    lm[hm.MIDDLE_MCP] = [pt[0], pt[1] + 0.04, 0.0]
+    lm[hm.WRIST] = [pt[0], pt[1] + 0.04 + size, 0.0]
+    lm[hm.INDEX_MCP] = [pt[0] - 0.02, pt[1] + 0.045, 0.0]
+    lm[hm.PINKY_MCP] = [pt[0] + 0.02, pt[1] + 0.05, 0.0]
     lm[hm.THUMB_TIP] = [pt[0] - 0.01, pt[1], 0.0]
     lm[hm.INDEX_TIP] = [pt[0] + 0.01, pt[1], 0.0]
-    return {"id": 0, "side": side, "score": score, "lm": lm, "state": state,
+    return {"id": hid, "side": side, "score": score, "lm": lm, "state": state,
             "pinch": 1.0 if state == "pinch" else 0.0,
             "palm": list(palm or pt), "palm_facing": facing}
 
@@ -528,6 +543,7 @@ class _SkillBase(unittest.TestCase):
                 (ht, "_game_mode_active", lambda: False),
                 (ht, "_fullscreen_app", lambda: False),
                 (ht, "_in_call", lambda: False),
+                (ht, "_per_app_blocked", lambda: False),
                 (ht, "_staging", lambda: False)):
             p = mock.patch.object(target, name, val)
             p.start()
@@ -707,6 +723,117 @@ class SkillBlockTests(_SkillBase):
             "ignored: hand menu is off")
 
 
+    def test_an_app_on_the_air_mouse_disable_list_blocks_engaging(self):
+        m, _, res = self._try(_per_app_blocked=lambda: True)
+        self.assertEqual(res, "ignored: an app on the air-mouse disable list is in front")
+        self.assertFalse(m.engaged())
+
+    def test_the_palm_menu_does_not_use_the_per_app_list(self):
+        with mock.patch.object(ht, "_per_app_blocked", lambda: True):
+            self.assertEqual(ht.blocked_reason(), "")
+            self.assertIn("disable list", ht.mouse_blocked_reason())
+
+    def test_per_app_reads_the_air_mouses_own_check(self):
+        fake = types.SimpleNamespace(_per_app_disabled=lambda: True)
+        with mock.patch.object(ht, "_air_mouse_mod", return_value=fake):
+            self.assertTrue(_REAL_PER_APP_BLOCKED())
+        with mock.patch.object(ht, "_air_mouse_mod", return_value=None):
+            self.assertFalse(_REAL_PER_APP_BLOCKED())
+
+
+class FakeSink:
+    def __init__(self):
+        self.calls = []
+
+    def show(self, ret):
+        self.calls.append(("show", ret["state"], ret["x"], ret["y"]))
+
+    def clear(self):
+        self.calls.append(("clear",))
+
+    def shutdown(self):
+        self.calls.append(("shutdown",))
+
+
+class ReticleSkillTests(_SkillBase):
+    """TASK 2: the webcam hand mouse shows the Kinect air mouse's reticle."""
+
+    def setUp(self):
+        super().setUp()
+        self.sink = FakeSink()
+        ht.set_reticle_sink(self.sink)
+        self.addCleanup(ht.set_reticle_sink, None)
+
+    def test_no_real_overlay_with_a_fake_mouse_or_in_staging(self):
+        ht.set_reticle_sink(None)
+        self.assertIsNone(ht._get_reticle_sink())             # fake output = a test
+        with mock.patch.object(ht, "_mouse_output_factory", [None]):
+            self.assertIsInstance(ht._get_reticle_sink(), ht._OverlaySink)
+            with mock.patch.object(ht, "_staging", lambda: True):
+                self.assertIsNone(ht._get_reticle_sink())
+            with mock.patch.object(config, "HAND_MOUSE_RETICLE", False, create=True):
+                self.assertIsNone(ht._get_reticle_sink())
+
+    def test_engage_follow_grab_and_hide(self):
+        ht._hand_mouse_on("")
+        m = ht._mouse[0]
+        t = 5000.0
+        for i in range(10):
+            m.on_hands(msg(hand(state="pinch")), t + i * 0.07)
+            ht._publish_reticle(t + i * 0.07)
+        self.assertEqual(self.sink.calls, [])                 # idle: nothing drawn
+        m.on_gesture({"name": "pinch_hold", "side": "Right"}, t + 0.7)
+        ht._publish_reticle(t + 0.7)
+        self.assertEqual(self.sink.calls[-1][:2], ("show", "prime"))
+        for i in range(1, 8):
+            m.on_hands(msg(hand(state="unknown", pt=(0.5 + 0.02 * i, 0.45))),
+                       t + 0.7 + 0.07 * i)
+            ht._publish_reticle(t + 0.7 + 0.07 * i)
+        last = self.sink.calls[-1]
+        self.assertEqual(last[:2], ("show", "track"))
+        self.assertEqual((last[2], last[3]), self.fake_out.pos)   # at the cursor
+        n = len(self.sink.calls)
+        ht._publish_reticle(t + 1.25)                         # unchanged, < keep-alive
+        self.assertEqual(len(self.sink.calls), n)
+        ht._publish_reticle(t + 1.6)                          # keep-alive rewrite
+        self.assertEqual(len(self.sink.calls), n + 1)
+        m.disengage("test")
+        ht._publish_reticle(t + 1.7)
+        ht._publish_reticle(t + 1.8)
+        self.assertEqual(self.sink.calls[-1], ("clear",))
+        self.assertEqual(self.sink.calls.count(("clear",)), 1)   # hidden once
+
+    def test_hand_mouse_off_shuts_the_overlay(self):
+        ht._hand_mouse_on("")
+        ht._hand_mouse_off("")
+        self.assertEqual(self.sink.calls[-1], ("shutdown",))
+
+    def test_overlay_sink_reuses_the_air_mouse_helpers(self):
+        am = mock.Mock()
+        am.AirMouseDecision = lambda *a: ("D",) + a
+        am._overlay_alive.return_value = False
+        with mock.patch.object(ht, "_air_mouse_mod", return_value=am):
+            ht._OverlaySink().show({"state": "track", "x": 10, "y": 20})
+            d, visible = am._publish_overlay_state.call_args.args
+            self.assertEqual((d[1], d[4], visible), ((10, 20), "track", True))
+            am._spawn_overlay.assert_called_once()
+            ht._OverlaySink().show({"state": "prime", "x": 10, "y": 20})
+            self.assertEqual(am._publish_overlay_state.call_args.kwargs["prime_xy"],
+                             (10, 20))
+            with mock.patch.object(config, "KINECT_AIR_MOUSE_ENABLED", True):
+                ht._OverlaySink().shutdown()
+                am._shutdown_overlay.assert_not_called()   # the Kinect uses it
+            ht._OverlaySink().shutdown()
+            am._shutdown_overlay.assert_called_once()
+
+    def test_quiet_while_two_hand_owns_the_overlay(self):
+        ht._hand_mouse_on("")
+        m, t, _ = self.feed_pinch_and_engage()
+        with mock.patch.object(ht, "_two_hand_active", lambda: True):
+            ht._publish_reticle(t)
+        self.assertEqual(self.sink.calls, [])
+
+
 class ListenerTests(_SkillBase):
     HANDS = json.dumps(msg(hand()), separators=(",", ":"))
 
@@ -760,7 +887,14 @@ class ListenerTests(_SkillBase):
 
     def test_the_real_listener_is_wired_to_the_mouse(self):
         src = _read("skills", "hand_tracking.py")
-        self.assertIn("wants_hands=_mouse_enabled", src)
+        self.assertIn("wants_hands=_wants_hands", src)
+        # hands are parsed for the hand mouse or the two-hand grab, nothing else
+        with mock.patch.object(ht, "_mouse_enabled", return_value=False), \
+             mock.patch.object(ht, "_two_hand_enabled", return_value=False):
+            self.assertFalse(ht._wants_hands())
+        with mock.patch.object(ht, "_mouse_enabled", return_value=False), \
+             mock.patch.object(ht, "_two_hand_enabled", return_value=True):
+            self.assertTrue(ht._wants_hands())
 
 
 # ── AIR_MOUSE_ENGINE routing in the Kinect skill ───────────────────────────
@@ -834,6 +968,264 @@ class EngineRoutingTests(unittest.TestCase):
 
 
 # ── safety: the real OS layer is isolated ──────────────────────────────────
+# ── recognition: no false triggers (2026-10-20) ────────────────────────────
+class RecognitionTests(unittest.TestCase):
+    """Owner, testing in a classroom: "I don't want false triggers". Typing,
+    talking with his hands, a classmate's hand in frame must never take the
+    cursor, click, drag or scroll."""
+
+    def test_a_small_far_hand_never_engages(self):
+        r = Rig()
+        r.run(1.0, state="pinch", size=0.06)            # a classmate 2 m back
+        self.assertTrue(r.hold_event().startswith("ignored: hand too small"))
+        self.assertEqual(r.m.phase, hm.IDLE)
+
+    def test_a_low_confidence_hand_never_engages(self):
+        r = Rig()
+        r.run(1.0, state="pinch", score=0.7)
+        self.assertTrue(r.hold_event().startswith("ignored: hand too small"))
+
+    def test_size_and_score_have_hysteresis(self):
+        r = Rig()
+        r.engage()
+        r.run(0.5, state="unknown", size=0.085, score=0.65)   # under ON, over OFF
+        self.assertEqual(r.m.phase, hm.ENGAGED)
+        moves = len(r.out.moves)
+        r.run(0.3, state="unknown", pt=(0.6, 0.5), size=0.085, score=0.65)
+        self.assertGreater(len(r.out.moves), moves)            # still driving
+        r.run(1.2, state="unknown", pt=(0.4, 0.5), size=0.05)  # under OFF
+        self.assertEqual(r.m.phase, hm.IDLE)                   # = gone
+        # ... and coming back at the in-between size is not enough to engage
+        r2 = Rig()
+        r2.run(1.0, state="pinch", size=0.085)
+        self.assertTrue(r2.hold_event().startswith("ignored"))
+
+    def test_a_hand_that_just_arrived_is_ignored(self):
+        r = Rig()
+        r.run(0.2, state="pinch")                      # in view for 0.2 s only
+        self.assertTrue(r.hold_event().startswith("ignored: hand too small, unsure or just arrived"))
+        r.run(0.5, state="pinch")
+        self.assertEqual(r.hold_event(), "engaged")
+
+    def test_a_flickered_pinch_frame_does_not_engage(self):
+        r = Rig()
+        r.run(1.0, state="unknown")
+        r.frame(state="pinch")                         # one stray pinch frame
+        self.assertTrue(r.hold_event().startswith("ignored"))
+
+    def test_engage_needs_the_pinch_confirmed_here_too(self):
+        r = Rig()
+        r.run(1.0, state="unknown")
+        r.run(0.2, state="pinch")                      # confirmed only ~0.07 s ago
+        self.assertEqual(r.hold_event(), "ignored: pinch not held long enough")
+
+    def test_typing_or_mouse_use_blocks_engaging(self):
+        r = Rig()
+        r.out.idle = 0.3                               # a key 0.3 s ago
+        r.run(0.7, state="pinch")
+        self.assertEqual(r.hold_event(), "ignored: you are using the keyboard or mouse")
+        r.out.idle = 2.0
+        self.assertEqual(r.hold_event(), "engaged")
+
+    def test_moving_the_real_mouse_suppresses_re_engaging(self):
+        r = Rig()
+        r.engage()
+        r.out.override = (50, 50)
+        r.run(0.3, state="unknown", pt=(0.6, 0.5))
+        self.assertIn("moved the mouse", r.m.last_reason)
+        r.out.override = None
+        r.run(0.7, state="pinch", pt=(0.6, 0.5))
+        self.assertEqual(r.hold_event(), "ignored: you are using the keyboard or mouse")
+        r.run(0.6, state="pinch", pt=(0.6, 0.5))       # > input_quiet_s later
+        self.assertEqual(r.hold_event(), "engaged")
+
+    def test_a_one_frame_pinch_is_no_click(self):
+        r = Rig()
+        r.engage()
+        r.run(0.4, state="unknown")
+        r.frame(state="pinch")
+        r.run(0.5, state="unknown")
+        self.assertEqual(r.out.buttons, [])
+        self.assertEqual(r.m.clicks, 0)
+
+    def test_debounce_scales_with_the_frame_rate(self):
+        for fps, frames_needed in ((15, 3), (30, 4)):
+            c = hm._Confirm()
+            t = 0.0
+            c.update("unknown", t, 0.1, 2)
+            n = 0
+            while c.stable != "pinch":
+                t += 1.0 / fps
+                n += 1
+                c.update("pinch", t, 0.1, 2)
+            self.assertEqual(n, frames_needed, fps)
+
+    def test_another_hand_never_takes_over(self):
+        r = Rig()
+        r.engage()
+        r.run(0.3, state="unknown", pt=(0.5, 0.45))
+        n = len(r.out.moves)
+        # the owner's hand vanishes; a NEW right hand (new track id) appears
+        # across the frame: it is not the owner's, so nothing follows it
+        r.run(0.6, state="unknown", pt=(0.25, 0.7), hid=1)
+        self.assertEqual(len(r.out.moves), n)
+        r.run(0.6, state="unknown", pt=(0.25, 0.7), hid=1)
+        self.assertEqual(r.m.phase, hm.IDLE)            # gone > hand_gone_s
+        self.assertIn("left the view", r.m.last_reason)
+
+    def test_the_owners_hand_coming_back_where_it_left_is_adopted(self):
+        r = Rig()
+        r.engage()
+        r.run(0.3, state="unknown", pt=(0.5, 0.45))
+        for _ in range(6):                              # 0.4 s dropout
+            r.empty()
+        r.run(0.5, state="unknown", pt=(0.52, 0.46), hid=1)
+        self.assertEqual(r.m.phase, hm.ENGAGED)
+        n = len(r.out.moves)
+        r.run(0.4, state="unknown", pt=(0.65, 0.5), hid=1)
+        self.assertGreater(len(r.out.moves), n)
+
+    def test_params_from_config_recognition_knobs(self):
+        p = hm.Params.from_config(lambda n, d: {
+            "HAND_MOUSE_MIN_SCORE": 0.9, "HAND_MOUSE_MIN_HAND_SIZE": 0.08,
+            "HAND_MOUSE_SETTLE_S": 0.6, "HAND_MOUSE_INPUT_QUIET_S": 2.0,
+            "HAND_MOUSE_SCROLL_ENABLED": False}.get(n, d))
+        self.assertEqual((p.min_score_on, p.min_size_on, p.settle_s,
+                          p.input_quiet_s, p.scroll_enabled),
+                         (0.9, 0.08, 0.6, 2.0, False))
+        self.assertLess(p.min_size_off, p.min_size_on)  # exit stays looser
+        self.assertLess(p.min_score_off, p.min_score_on)
+        d = hm.Params()
+        self.assertLess(d.min_score_off, d.min_score_on)
+        self.assertLess(d.min_size_off, d.min_size_on)
+
+
+# ── scroll (2026-10-20) ────────────────────────────────────────────────────
+class ScrollTests(unittest.TestCase):
+    def _fist_at(self, r, secs, y, **kw):
+        r.run(secs, state="fist", palm=(0.5, y), pt=(0.5, y), **kw)
+
+    def wheels(self, r):
+        return [e[1] for e in r.out.events if e[0] == "wheel"]
+
+    def test_fist_moved_down_scrolls_up_like_grabbing_the_page(self):
+        r = Rig()
+        r.engage()
+        r.run(0.3, state="unknown", pt=(0.5, 0.45))
+        self._fist_at(r, 0.5, 0.45)                     # close + hold: nothing yet
+        self.assertEqual(self.wheels(r), [])
+        self.assertEqual(r.m.sub, hm.SCROLL)
+        n = len(r.out.moves)
+        for i in range(1, 16):                          # move the fist down 0.6 hs
+            self._fist_at(r, 1 / 15, 0.45 + 0.0064 * i)
+        w = self.wheels(r)
+        self.assertTrue(w)
+        self.assertTrue(all(d > 0 for d in w))          # hand down = wheel up (natural)
+        want = (0.6 - hm.Params().scroll_deadzone_hs) * hm.Params().scroll_gain
+        self.assertAlmostEqual(sum(w), want, delta=0.25 * want)
+        self.assertEqual(len(r.out.moves), n)           # the cursor stayed put
+        self.assertEqual(r.out.buttons, [])             # never a click
+
+    def test_up_scrolls_down_and_the_rate_is_capped(self):
+        r = Rig()
+        r.engage()
+        self._fist_at(r, 0.5, 0.45)
+        self._fist_at(r, 0.4, 0.15)                     # a big fast jump up
+        w = self.wheels(r)
+        self.assertTrue(all(d < 0 for d in w))
+        cap = hm.Params().scroll_max_rate
+        self.assertLessEqual(-sum(w), cap * 0.4 + 50)   # <= max rate x time
+
+    def test_dead_zone_and_opening_the_hand_stops(self):
+        r = Rig()
+        r.engage()
+        self._fist_at(r, 0.5, 0.45)
+        self._fist_at(r, 0.5, 0.47)                     # 0.12 hs: inside the dead zone
+        self.assertEqual(self.wheels(r), [])
+        r.run(0.3, state="unknown", pt=(0.5, 0.47))
+        self.assertEqual(r.m.sub, hm.FREE)
+        self._fist_at(r, 0.1, 0.8)                      # a fist flash: no scroll
+        self.assertEqual(self.wheels(r), [])
+
+    def test_a_quick_fist_is_not_a_scroll(self):
+        r = Rig()
+        r.engage()
+        self._fist_at(r, 0.2, 0.45)                     # confirmed, but < hold
+        self.assertNotEqual(r.m.sub, hm.SCROLL)
+        r.run(0.3, state="unknown")
+        self.assertEqual(r.m.scrolls, 0)
+
+    def test_never_while_idle_or_with_two_hands(self):
+        r = Rig()
+        self._fist_at(r, 1.0, 0.45)
+        self._fist_at(r, 0.5, 0.75)
+        self.assertEqual(self.wheels(r), [])            # not engaged: nothing
+        r.engage()
+        for _ in range(int(0.8 * r.fps)):               # a second usable hand
+            r.t += 1.0 / r.fps
+            r.m.on_hands(msg(hand(state="fist", palm=(0.5, 0.45)),
+                             hand(side="Left", state="fist", pt=(0.3, 0.45))), r.t)
+        self.assertEqual(r.m.scrolls, 0)
+
+    def test_scroll_can_be_turned_off(self):
+        r = Rig(params=hm.Params(scroll_enabled=False))
+        r.engage()
+        self._fist_at(r, 0.5, 0.45)
+        self._fist_at(r, 0.5, 0.75)
+        self.assertEqual(self.wheels(r), [])
+
+    def test_after_scrolling_the_cursor_does_not_jump(self):
+        r = Rig()
+        r.engage()
+        r.run(0.3, state="unknown", pt=(0.5, 0.45))
+        pos = r.out.pos
+        self._fist_at(r, 0.5, 0.45)
+        self._fist_at(r, 0.5, 0.65)
+        r.run(0.4, state="unknown", pt=(0.5, 0.65))
+        self.assertLess(abs(r.out.pos[1] - pos[1]), 40)
+
+
+# ── reticle state and the two-hand stand-down ──────────────────────────────
+class ReticleTests(unittest.TestCase):
+    def test_states_follow_the_phase(self):
+        r = Rig()
+        self.assertEqual(r.m.reticle()["state"], "hidden")
+        self.assertFalse(r.m.reticle()["visible"])
+        r.run(0.65, state="pinch")
+        r.hold_event()
+        ret = r.m.reticle()
+        self.assertEqual((ret["state"], ret["visible"]), ("prime", True))
+        self.assertEqual((ret["x"], ret["y"]), r.out.pos)    # where the cursor is
+        r.run(0.3, state="pinch")
+        r.run(0.3, state="unknown", pt=(0.6, 0.5))
+        ret = r.m.reticle()
+        self.assertEqual(ret["state"], "track")
+        self.assertEqual((ret["x"], ret["y"]), r.out.pos)
+        r.run(0.3, state="pinch", pt=(0.6, 0.5))
+        self.assertEqual(r.m.reticle()["state"], "grab")
+        r.m.disengage("x")
+        self.assertEqual(r.m.reticle()["state"], "hidden")
+
+
+class TwoHandStandDownTests(unittest.TestCase):
+    def test_two_hand_mode_disengages_and_blocks_engaging(self):
+        on = [False]
+        r = Rig()
+        r.m.two_hand = lambda: on[0]
+        r.engage()
+        r.run(0.2, state="unknown")
+        r.run(0.7, state="pinch")                       # dragging
+        self.assertTrue(r.m.button_down())
+        on[0] = True
+        r.frame(state="pinch")
+        self.assertEqual(r.m.phase, hm.IDLE)
+        self.assertFalse(r.m.button_down())
+        self.assertEqual(r.out.buttons, ["down", "up"])
+        self.assertIn("two-hand", r.m.last_reason)
+        r.run(0.7, state="pinch")
+        self.assertEqual(r.hold_event(), "ignored: two-hand mode")
+
+
 class SafetyTests(unittest.TestCase):
     def test_importing_the_module_touches_no_windows_api(self):
         src = _read("core", "hand_mouse.py")

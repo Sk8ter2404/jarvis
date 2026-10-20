@@ -6601,6 +6601,17 @@ _HUD_CAM_PREVIEW_WIDTH    = 240     # downscaled preview width (px); height keep
 _HUD_CAM_PREVIEW_MIN_GAP  = 0.15    # min seconds between writes (~6-7 fps cap)
 _HUD_CAM_PREVIEW_JPEG_Q   = 70      # JPEG quality 0-100 (small file, good enough)
 _HUD_CAM_PREVIEW_STALE_S  = 2.0     # HUD treats a file older than this as "off"
+# STEADY PREVIEW (2026-10-20, "the camera feed looks laggy"). While the hand
+# tracker's frame pump runs (core/handtrack_frames.FramePump), the tracker's
+# camera is read at its own rate on the pump's thread, and its preview tiles
+# are written from there - evenly, at most every _HUD_CAM_PREVIEW_PUMP_GAP -
+# instead of from the ~6 fps face loop. Same file, same atomic replace, same
+# removal contract; the face loop's own 0.15 s cap is unchanged (with no
+# tracker nothing about the preview changes).
+_HUD_CAM_PREVIEW_PUMP_GAP = 1.0 / 15  # ~15 fps, only for frames from the pump
+# The pump thread and the face loop can both write preview files now: one
+# writer at a time (the .tmp name is shared per file). Uncontended = ~free.
+_hud_preview_write_lock = threading.RLock()
 _hud_cam_preview_last_write = [0.0]  # list-box so the loop can mutate without `global`
 _hud_cam_preview_file_present = [False]  # have we written the file since last cleanup?
 
@@ -6676,16 +6687,26 @@ def _percam_side(cam: dict) -> str:
     return _camera_tiles.percam_side(cam)
 
 
-def _hud_percam_preview_write(key: str, frame: "np.ndarray", now: float) -> bool:
+def _hud_percam_preview_write(key: str, frame: "np.ndarray", now: float,
+                              min_gap: "float | None" = None) -> bool:
     """Per-camera sibling of _hud_camera_preview_write: same downscale, JPEG
     quality, atomic replace and ~6-7 fps throttle, but each key has its OWN
     throttle clock so three cameras never starve each other. Same removal
     contract too: _hud_percam_preview_remove_all() deletes these files when
     the camera is off, the preview is disabled, and when the producer starts
-    or stops. Never raises."""
+    or stops. ``min_gap`` overrides the throttle (the frame pump passes
+    _HUD_CAM_PREVIEW_PUMP_GAP). Never raises."""
     if frame is None or key not in _HUD_PERCAM_PREVIEW_KEYS:
         return False
-    if (now - _hud_percam_last_write.get(key, 0.0)) < _HUD_CAM_PREVIEW_MIN_GAP:
+    with _hud_preview_write_lock:
+        return _hud_percam_preview_write_locked(
+            key, frame, now,
+            _HUD_CAM_PREVIEW_MIN_GAP if min_gap is None else float(min_gap))
+
+
+def _hud_percam_preview_write_locked(key: str, frame: "np.ndarray", now: float,
+                                     min_gap: float) -> bool:
+    if (now - _hud_percam_last_write.get(key, 0.0)) < min_gap:
         return False
     path = _hud_percam_preview_file(key)
     try:
@@ -6738,16 +6759,26 @@ def _hud_percam_preview_remove_all(force: bool = False) -> None:
     _hud_percam_present.clear()
 
 
-def _hud_camera_preview_write(frame: "np.ndarray", now: float) -> bool:
+def _hud_camera_preview_write(frame: "np.ndarray", now: float,
+                              min_gap: "float | None" = None) -> bool:
     """Encode ``frame`` (BGR, as cv2 hands it to us) to a small JPEG and atomically
     replace the single preview file the HUD reads. Throttled to ~6-7 fps via
-    _HUD_CAM_PREVIEW_MIN_GAP. Returns True iff a frame was written this call.
+    _HUD_CAM_PREVIEW_MIN_GAP (``min_gap`` overrides it: the frame pump passes
+    _HUD_CAM_PREVIEW_PUMP_GAP). Returns True iff a frame was written this call.
 
     Never raises into the face-tracking loop — any encode / disk error is
     swallowed (the HUD's stale-file guard then shows the placeholder)."""
     if frame is None:
         return False
-    if (now - _hud_cam_preview_last_write[0]) < _HUD_CAM_PREVIEW_MIN_GAP:
+    with _hud_preview_write_lock:
+        return _hud_camera_preview_write_locked(
+            frame, now,
+            _HUD_CAM_PREVIEW_MIN_GAP if min_gap is None else float(min_gap))
+
+
+def _hud_camera_preview_write_locked(frame: "np.ndarray", now: float,
+                                     min_gap: float) -> bool:
+    if (now - _hud_cam_preview_last_write[0]) < min_gap:
         return False
     try:
         small = _hud_camera_preview_downscale(frame, _HUD_CAM_PREVIEW_WIDTH)
@@ -11108,6 +11139,15 @@ def _release_capture_guarded(cap, idx, label: str = "",
     the very next release wedged the producer a second time. NEVER raises."""
     if cap is None:
         return True
+    # STEADY FRAMES (2026-10-20): if the hand tracker's frame pump is reading
+    # this handle, stop it and wait for its in-flight read() to return FIRST -
+    # a handle is never released while another thread is inside read() on it.
+    # One identity compare for every other handle. Outside the camera lock on
+    # purpose: the pump's reads never take it.
+    try:
+        _handtrack_frames.PUMP.detach(cap)
+    except Exception:
+        logging.exception("[face-track] frame pump detach before release")
     timeout = _CAMERA_IO_LOCK_TIMEOUT_S if timeout is None else timeout
     got = False
     try:
@@ -12502,6 +12542,48 @@ _face_track_caps: list = [None]
 _face_track_open_verdict: dict = {"refused": None}
 
 
+# ── STEADY FRAMES for the hand tracker (2026-10-20) ─────────────────────────
+# While the tracker is alive, the producer asks core/handtrack_frames.PUMP for
+# the tracker camera's frame instead of reading it (see the read site in
+# _face_tracking_thread_body): the pump's one reader thread reads THAT handle at
+# the camera's own rate and publishes every frame, so the tracker gets them
+# evenly instead of in clumps between face passes. These two hooks run on the
+# pump's thread. Neither touches a capture handle.
+def _ht_pump_frame_ok(frame) -> bool:
+    """Hand this frame to the tracker? Not a black one - the same rule as the
+    producer's own `if not _black:` hand-off. Never raises."""
+    try:
+        b = _webcam_frame_brightness(frame)
+        return b is None or b >= _CAMERA_BLACK_FRAME_LEVEL
+    except Exception:
+        return True
+
+
+def _ht_pump_preview(cam: dict, frame) -> None:
+    """The HUD preview follows the steady frames: the tracker camera's own tile,
+    and the shared tile when it is the primary and the Kinect composite is not
+    driving it (the composite stays on the producer thread - it opens the side
+    tiles). Evenly, at most every _HUD_CAM_PREVIEW_PUMP_GAP. Same gates as the
+    producer's writes: nothing while the camera is off or the preview is
+    disabled. Never raises."""
+    try:
+        if (_face_track_camera_off.is_set() or bool(_standby_mode[0])
+                or not _hud_camera_preview_enabled()):
+            return
+        now = time.time()
+        _hud_percam_preview_write(_percam_side(cam), frame, now,
+                                  min_gap=_HUD_CAM_PREVIEW_PUMP_GAP)
+        if cam.get("primary") and not _hud_kinect_skeleton_overlay_enabled():
+            _hud_camera_preview_write(frame, now,
+                                      min_gap=_HUD_CAM_PREVIEW_PUMP_GAP)
+    except Exception:
+        pass
+
+
+_handtrack_frames.PUMP.accept = _ht_pump_frame_ok
+_handtrack_frames.PUMP.on_frame = _ht_pump_preview
+
+
 def _face_tracking_thread():
     """SUPERVISOR around the real producer loop (_face_tracking_thread_body).
 
@@ -12943,7 +13025,21 @@ def _face_tracking_thread_body():
 
                 _face_track_beat(f"read camera {cam['index']}")
                 _read_t0 = time.perf_counter()
-                ret, frame = c.read()
+                # STEADY FRAMES (2026-10-20): while the hand tracker is alive,
+                # ITS camera is read by the frame pump's one thread at the
+                # camera's own rate (every frame published to the tracker), and
+                # this loop takes the newest frame from it instead of reading.
+                # None = not served (no tracker, another camera, a Kinect slot,
+                # the re-arm after a failed pump read): read exactly as before -
+                # and None also promises no pump thread is on this handle.
+                _ht_served = _handtrack_frames.PUMP.serve(
+                    c, cam, pumpable=not (cam.get("type") == "kinect"
+                                          or (KINECT_AS_CAMERA
+                                              and not cam.get("name"))))
+                if _ht_served is None:
+                    ret, frame = c.read()
+                else:
+                    ret, frame = _ht_served
                 _read_ms = (time.perf_counter() - _read_t0) * 1000.0
                 with _camera_state_lock:
                     _camera_read_ms[cam["index"]] = _read_ms
@@ -13242,6 +13338,10 @@ def _face_tracking_thread_body():
                         continue
                 entry["fails"] = 0
                 entry["drop_noted"] = False
+                # This frame came from the frame pump (not from a wake reopen's
+                # own read, which leaves `frame` pointing at its frame).
+                _ht_pumped = (_ht_served is not None and bool(_ht_served[0])
+                              and frame is _ht_served[1])
                 _note_camera_read_attempt(cam["index"], ok=True)
                 # A real frame is the only proof of health there is - the sick
                 # camera OPENED fine every 10 s and still delivered nothing, so
@@ -13286,7 +13386,9 @@ def _face_tracking_thread_body():
                 # frame is copied, at 640x480, into the "jarvis_handtrack_frame"
                 # shared-memory segment. With no tracker this is one monotonic
                 # compare. It never raises and never touches the capture handle.
-                if not _black:
+                # A pump-served frame was already handed over on the pump's
+                # thread (and the burst would read the handle under it).
+                if not _black and not _ht_pumped:
                     _handtrack_frames.publish_frame(cam, frame)
                     # BURST (2026-10-14): while the tracker is alive, keep
                     # reading ITS camera ~0.15 s and hand every frame over
@@ -13302,7 +13404,10 @@ def _face_tracking_thread_body():
                 # web Camera tab shows each eye individually); the primary-only
                 # composite below is unchanged. Same enable gate + throttle
                 # family as the main preview. 2026-07-10.
-                if not camera_off and _hud_camera_preview_enabled():
+                # A pump-served camera's tile is written by the pump's thread
+                # (_ht_pump_preview: evenly, from every frame), not from here.
+                if (not camera_off and _hud_camera_preview_enabled()
+                        and not _ht_pumped):
                     _hud_percam_preview_write(_percam_side(cam), frame, now_loop)
                 # Remember the first HEALTHY non-primary frame of this
                 # iteration. It is what the post-loop keep-alive publishes to
@@ -13335,7 +13440,14 @@ def _face_tracking_thread_body():
                     # the Kinect is streaming; it returns False when off/no
                     # frame, so we fall back to the plain primary-webcam mirror
                     # and the HUD tile is never left blank.
-                    if not _hud_kinect_preview_write(now_loop):
+                    if (_ht_pumped
+                            and not _hud_kinect_skeleton_overlay_enabled()):
+                        # The pump's thread writes it (_ht_pump_preview). Still
+                        # let go of composite side tiles the overlay held, as
+                        # _hud_kinect_preview_write does on its on->off edge
+                        # (flag-guarded: a no-op once released).
+                        _release_side_tile_webcams_if_open()
+                    elif not _hud_kinect_preview_write(now_loop):
                         _hud_camera_preview_write(frame, now_loop)
                     primary_published = True
                 if paused:

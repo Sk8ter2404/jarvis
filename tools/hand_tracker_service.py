@@ -22,7 +22,9 @@ PROTOCOL  (JSON text frames, ~30/s while frames arrive)
   {"type":"hands","t":ms,"seq":n,"w":640,"h":480,"hands":[{"id":0,
     "side":"Left"|"Right","score":0-1,"lm":[[x,y,z]*21 normalised, mirrored],
     "world":[[x,y,z]*21 metres],"state":"open|fist|pinch|point|unknown",
-    "pinch":0-1,"palm":[x,y],"palm_facing":bool}]}
+    "pinch":0-1,"palm":[x,y],"palm_facing":bool,"size":hs/height,"ok":bool}]}
+      (size / ok, 2026-10-20: the hand's size over the frame height, and whether
+      it may fire trigger events - tools/handtrack_gestures.py RECOGNITION)
   {"type":"gesture","name":...,"side":"Left|Right|both","pos":[x,y],"value"?}
       names: palm_hold pinch_start pinch_end pinch_hold fist_grab fist_release
              point_flick explode clap   (see tools/handtrack_gestures.py)
@@ -179,6 +181,7 @@ def hand_payload(info: dict, lm, world) -> dict:
         "world": [[round(p[0], 4), round(p[1], 4), round(p[2], 4)] for p in world],
         "state": info["state"], "pinch": info["pinch"],
         "palm": info["palm"], "palm_facing": info["palm_facing"],
+        "size": info.get("size", 0.0), "ok": bool(info.get("ok", False)),
     }
 
 

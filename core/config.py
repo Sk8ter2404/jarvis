@@ -2105,12 +2105,38 @@ HAND_TRACK_PORT = 8793
 #   HAND_MOUSE_PALM_RELEASE_S  how long a still open palm must be held to let go
 #                       (0.4; 0 turns the open-palm release off).
 #   HAND_MOUSE_CUE_SOUND  a short beep on engage / disengage (no popups).
+# 2026-10-20 (webcam hand mouse catches up with the Kinect air mouse; owner:
+# "I also need a way to scroll", "I don't want false triggers"):
+#   HAND_MOUSE_RETICLE  show the Kinect air mouse's on-screen reticle at the
+#                       hand-mouse cursor (hud/jarvis_air_cursor.py) while it is
+#                       engaged. Never in staging.
+#   HAND_MOUSE_SCROLL_ENABLED  while engaged, a FIST held 0.2 s then moved up /
+#                       down scrolls the page under the cursor (it follows the
+#                       hand like grabbing it); open the hand to stop.
+#   HAND_TWO_HAND_ENABLED  (AIR_MOUSE_ENGINE = "hands" only) two FISTS held
+#                       0.5 s grab the window between the hands: move both to
+#                       move it, spread / close them to resize, open a hand to
+#                       let go (core/hand_two_hand.py). OFF until the owner
+#                       turns it on. The single-hand cursor stands down meanwhile.
+#   Recognition (core/hand_mouse.py Params; every gesture, both engines' webcam
+#   features): a hand counts only at tracker score >= HAND_MOUSE_MIN_SCORE and
+#   size >= HAND_MOUSE_MIN_HAND_SIZE (hand size / frame height; 0.10 ~ 1.2 m from
+#   a laptop webcam - lower it to use the mouse from farther away), after being
+#   in view HAND_MOUSE_SETTLE_S; no engage within HAND_MOUSE_INPUT_QUIET_S of
+#   keyboard / mouse use. (Staying-usable thresholds are 3/4 of these.)
 HAND_MOUSE_ENABLED = False
 AIR_MOUSE_ENGINE = "kinect"
 HAND_MOUSE_BOX = (0.20, 0.15, 0.80, 0.75)
 HAND_MOUSE_SCREEN_RECT = None
 HAND_MOUSE_PALM_RELEASE_S = 0.4
 HAND_MOUSE_CUE_SOUND = True
+HAND_MOUSE_RETICLE = True
+HAND_MOUSE_SCROLL_ENABLED = True
+HAND_TWO_HAND_ENABLED = False
+HAND_MOUSE_MIN_SCORE = 0.80
+HAND_MOUSE_MIN_HAND_SIZE = 0.10
+HAND_MOUSE_SETTLE_S = 0.40
+HAND_MOUSE_INPUT_QUIET_S = 1.0
 # ─── KINECT HAND STABILISER (2026-10-04, "hand tracking is unstable") ─────────
 # One shared stabiliser (audio/kinect_stabilizer.py) runs ONCE per real Kinect
 # body frame inside the bridge pump; the air-mouse, two-hand, gestures and

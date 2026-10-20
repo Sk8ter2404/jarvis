@@ -456,5 +456,100 @@ class TwoHandTests(unittest.TestCase):
         self.assertNotEqual(ids["Left"], ids["Right"])
 
 
+class RecognitionTests(unittest.TestCase):
+    """2026-10-20 (owner, in a classroom: "I don't want false triggers"): a
+    small / far hand, an unsure detection, or a hand that has only just come
+    into view never fires palm_hold, pinch_hold or point_flick."""
+
+    def _palm(self, seconds, **kw):
+        rnd = random.Random(5)
+        return frames(seconds, lambda i, t: [make_hand(
+            "open", cx=320 + rnd.uniform(-1.5, 1.5), cy=240 + rnd.uniform(-1.5, 1.5),
+            **kw)])
+
+    def test_a_small_far_hand_fires_nothing(self):
+        # hs 30 px of a 480 px frame = 0.06: a classmate a few metres back
+        ev, infos = run(hg.GestureEngine(), self._palm(4.0, hs=30.0))
+        self.assertEqual([e for e in ev if e["name"] == "palm_hold"], [])
+        self.assertFalse(infos[0]["ok"])
+        seq = frames(2.0, lambda i, t: [make_hand("pinch", hs=30.0)])
+        ev, _ = run(hg.GestureEngine(), seq)
+        self.assertNotIn("pinch_hold", names(ev))
+        self.assertIn("pinch_start", names(ev))         # states still reported
+
+    def test_an_unsure_detection_fires_nothing(self):
+        ev, _ = run(hg.GestureEngine(), self._palm(4.0, score=0.7))
+        self.assertEqual(names(ev), [])
+
+    def test_size_and_score_hysteresis(self):
+        eng = hg.GestureEngine()
+        seq = frames(1.0, lambda i, t: [make_hand("open", hs=100.0)])
+        _, infos = run(eng, seq)
+        self.assertTrue(infos[0]["ok"])
+        # shrinking to 0.085 (between OFF and ON) keeps it ok ...
+        _, infos = run(eng, [(1.0 + t, h) for t, h in frames(
+            0.5, lambda i, t: [make_hand("open", hs=41.0, score=0.65)])])
+        self.assertTrue(infos[0]["ok"])
+        # ... below OFF it is not
+        _, infos = run(eng, [(1.5 + t, h) for t, h in frames(
+            0.6, lambda i, t: [make_hand("open", hs=30.0)])])
+        self.assertFalse(infos[0]["ok"])
+        self.assertAlmostEqual(infos[0]["size"], 30.0 / H, delta=0.01)
+
+    def test_a_hand_that_just_arrived_does_not_flick(self):
+        # pointing and flicking from the first frame (a hand swinging into view)
+        seq = [(i * DT, [make_hand("point", angle=-20 + 10 * i)]) for i in range(6)]
+        ev, _ = run(hg.GestureEngine(), seq)
+        self.assertNotIn("point_flick", names(ev))
+
+    def test_a_settled_hand_still_flicks_and_pinch_holds(self):
+        self.assertEqual(names(FlickTests().sweep(50.0, 0.15)), ["point_flick"])
+        seq = frames(1.0, lambda i, t: [make_hand("pinch")])
+        ev, _ = run(hg.GestureEngine(), seq)
+        self.assertEqual(names(ev), ["pinch_start", "pinch_hold"])
+
+
+class PalmHoldAtWebcamRatesTests(unittest.TestCase):
+    """TASK 4 (2026-10-20): the open-palm hand menu never fired in the owner's
+    Dell test. With the steady frames (core/handtrack_frames.FramePump) the
+    tracker runs at 12-20 fps; the hold-still thresholds must be reachable
+    there with real tracking noise, on a 16:9 frame (640x360) and with the old
+    clumpy delivery too. (They are: no threshold needed changing.)"""
+
+    def _hold(self, fps, jitter_px=3.0, angle_jitter=4.0, h=480, hs=80.0,
+              clumpy=False, seconds=4.0):
+        global H
+        rnd = random.Random(11)
+        old_h, H = H, h                         # make_hand normalises by H
+        try:
+            eng = hg.GestureEngine()
+            ev, t, i = [], 0.0, 0
+            while t < seconds:
+                hand = make_hand("open", cx=320 + rnd.gauss(0, jitter_px),
+                                 cy=h / 2 + rnd.gauss(0, jitter_px),
+                                 hs=hs * (1 + rnd.gauss(0, 0.03)),
+                                 angle=rnd.gauss(0, angle_jitter))
+                ev.extend(eng.update(t, [hand], W, h)[1])
+                i += 1
+                t += ((1 / 30) if i % 5 else 0.17) if clumpy else 1.0 / fps
+        finally:
+            H = old_h
+        return [e for e in ev if e["name"] == "palm_hold"]
+
+    def test_fires_at_12_15_18_20_fps(self):
+        for fps in (12, 15, 18, 20):
+            self.assertEqual(len(self._hold(fps)), 1, fps)
+
+    def test_fires_on_a_16_9_frame(self):
+        for fps in (15, 20):
+            self.assertEqual(len(self._hold(fps, h=360, hs=70.0)), 1, fps)
+
+    def test_fires_with_the_old_clumpy_delivery(self):
+        self.assertEqual(len(self._hold(0, clumpy=True)), 1)
+
+    def test_still_needs_about_one_and_a_half_seconds(self):
+        self.assertEqual(self._hold(15, seconds=1.4), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,21 @@ The HAND MOUSE (2026-10-15, core/hand_mouse.py) lives here too:
   existing air_mouse_on/off/status words route here (the routing lives in
   skills/kinect_air_mouse.py, which keeps the only registration of those names).
 
+2026-10-20 additions, all through the same listener:
+  RETICLE   while the hand mouse has the cursor, the Kinect air mouse's reticle
+            overlay (hud/jarvis_air_cursor.py) shows it: its state file is
+            written with skills/kinect_air_mouse's own writer and the overlay
+            spawned with its own helper (only while the hand mouse is on, never
+            in staging, never with a fake mouse output - i.e. never in tests;
+            HAND_MOUSE_RETICLE). "hand mouse off" hides it and closes the
+            overlay unless the Kinect air mouse is using it.
+  TWO HANDS core/hand_two_hand.py: two fists grab the window between them,
+            move it, spread / close to resize (HAND_TWO_HAND_ENABLED, default
+            off, AIR_MOUSE_ENGINE = "hands" only). The hand mouse stands down
+            while it is active.
+  The hand mouse also stands down over an app on the air mouse's per-app
+  disable list (AIR_MOUSE_PER_APP_DISABLE / AIR_MOUSE_DISABLED_APP_HINTS).
+
 The window is opened through the holo skill's `holo_mode_on` action with the
 argument "desktop". That action belongs to the holo page work; until it exists
 the trigger logs one line and does nothing - `set_open_hook()` is the clearly
@@ -57,6 +72,12 @@ _open_hook: list = [None]            # optional replacement for the holo action
 _listener: list = [None]
 _mouse: list = [None]                # the core.hand_mouse.HandMouse, built on first use
 _mouse_output_factory: list = [None]  # tests inject a fake; None = the real Windows one
+_two_hand: list = [None]             # the core.hand_two_hand.TwoHandGrab, built on first use
+_two_hand_backend_factory: list = [None]  # tests inject a fake; None = the real windows
+_reticle_sink: list = [None]         # tests inject a fake; None = the real overlay (live only)
+_reticle_state = {"last": None, "at": 0.0}
+RETICLE_KEEPALIVE_S = 0.25           # rewrite this often while shown (the overlay hides
+                                     # a state older than its STATE_STALE_HIDE_S, 0.6 s)
 
 
 # ── config ────────────────────────────────────────────────────────────────
@@ -164,8 +185,9 @@ def _get_mouse():
         from core import hand_mouse
         factory = _mouse_output_factory[0] or hand_mouse.WindowsMouse
         _mouse[0] = hand_mouse.HandMouse(
-            factory(), blocker=blocked_reason, cue=_mouse_cue,
-            params=hand_mouse.Params.from_config(_cfg))
+            factory(), blocker=mouse_blocked_reason, cue=_mouse_cue,
+            params=hand_mouse.Params.from_config(_cfg),
+            two_hand=_two_hand_active)
     except Exception as e:
         print(f"{LOG} hand mouse unavailable: {type(e).__name__}: {e}")
         _mouse[0] = None
@@ -177,22 +199,230 @@ def _mouse_enabled() -> bool:
     return m is not None and bool(m.enabled)
 
 
+def _wants_hands() -> bool:
+    """Parse the tracker's "hands" messages at all? Only for the hand mouse or
+    the two-hand grab; otherwise they are dropped unread, as before."""
+    return _mouse_enabled() or _two_hand_enabled()
+
+
 def _mouse_hands(msg: dict) -> None:
+    """One "hands" message: the two-hand grab first (so the cursor knows to
+    stand down on this very frame), then the hand mouse, then its reticle."""
+    if _two_hand_enabled():
+        g = _get_two_hand()
+        if g is not None:
+            g.on_hands(msg)
+    elif _two_hand[0] is not None:
+        _stop_two_hand()
     m = _mouse[0]
     if m is not None:
         m.on_hands(msg)
+    _publish_reticle()
 
 
 def _mouse_idle() -> None:
     m = _mouse[0]
     if m is not None and m.enabled:
         m.tick()
+    _publish_reticle()
 
 
 def _mouse_tracker_gone() -> None:
     m = _mouse[0]
     if m is not None:
         m.on_tracker_stopped()
+    _stop_two_hand()
+    _publish_reticle()
+
+
+# ── the per-app stand-down (the air mouse's list) ─────────────────────────
+def _per_app_blocked() -> bool:
+    """The foreground app is on the air mouse's disable list
+    (AIR_MOUSE_PER_APP_DISABLE / AIR_MOUSE_DISABLED_APP_HINTS, read live by
+    skills/kinect_air_mouse._per_app_disabled). Never raises."""
+    try:
+        am = _air_mouse_mod()
+        fn = getattr(am, "_per_app_disabled", None) if am is not None else None
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def mouse_blocked_reason() -> str:
+    """Why the hand mouse (cursor, clicks, scroll) must not act ('' = it may):
+    the palm-menu blockers plus the air mouse's per-app disable list."""
+    why = blocked_reason()
+    if why:
+        return why
+    if _per_app_blocked():
+        return "an app on the air-mouse disable list is in front"
+    return ""
+
+
+def _air_mouse_mod():
+    """skills/kinect_air_mouse.py (the loaded skill instance when there is one)."""
+    mod = sys.modules.get("skill_kinect_air_mouse")
+    if mod is not None:
+        return mod
+    try:
+        import importlib
+        return importlib.import_module("skills.kinect_air_mouse")
+    except Exception:
+        return None
+
+
+# ── the reticle (the Kinect air mouse's overlay, 2026-10-20) ──────────────
+class _OverlaySink:
+    """Draws the hand mouse's cursor with the Kinect air mouse's reticle:
+    its state-file writer, its overlay spawn, its shutdown - nothing copied."""
+
+    def show(self, ret: dict) -> None:
+        am = _air_mouse_mod()
+        if am is None:
+            return
+        xy = (int(ret["x"]), int(ret["y"]))
+        if ret["state"] == "prime":
+            # engaged, the engaging pinch not yet opened: a full priming ring
+            d = am.AirMouseDecision(None, None, None, "hidden", None, "closed", 1.0)
+            am._publish_overlay_state(d, True, prime_xy=xy)
+        else:
+            d = am.AirMouseDecision(xy, None, None, ret["state"], None,
+                                    "closed" if ret["state"] == "grab" else "open")
+            am._publish_overlay_state(d, True)
+        if not am._overlay_alive():
+            am._spawn_overlay()
+
+    def clear(self) -> None:
+        am = _air_mouse_mod()
+        if am is not None:
+            am._clear_overlay_state()
+
+    def shutdown(self) -> None:
+        am = _air_mouse_mod()
+        if am is None:
+            return
+        am._clear_overlay_state()
+        if not bool(_cfg("KINECT_AIR_MOUSE_ENABLED", False)):
+            am._shutdown_overlay()          # the Kinect air mouse is not using it
+
+
+def set_reticle_sink(sink) -> None:
+    """Replace the reticle output (tests). None = the real overlay, which is
+    used only live: never in staging and never with a fake mouse output."""
+    _reticle_sink[0] = sink
+    _reticle_state["last"] = None
+
+
+def _get_reticle_sink():
+    if _reticle_sink[0] is not None:
+        return _reticle_sink[0]
+    if (_mouse_output_factory[0] is not None or _staging()
+            or not bool(_cfg("HAND_MOUSE_RETICLE", True))):
+        return None
+    return _OverlaySink()
+
+
+def _publish_reticle(now: Optional[float] = None) -> None:
+    """Show / move / hide the reticle after a message. Writes only on a change
+    (or every RETICLE_KEEPALIVE_S while shown), and hides it once. Stays quiet
+    while the two-hand grab owns the overlay (dual reticles). Never raises."""
+    try:
+        if _two_hand_active():
+            _reticle_state["last"] = None
+            return
+        sink = _get_reticle_sink()
+        if sink is None:
+            return
+        now = time.monotonic() if now is None else now
+        m = _mouse[0]
+        ret = m.reticle() if m is not None else {"visible": False}
+        last = _reticle_state["last"]
+        if not ret.get("visible"):
+            if last is not None and last[0]:
+                sink.clear()
+                _reticle_state["last"] = (False,)
+            return
+        key = (True, ret["x"], ret["y"], ret["state"])
+        if key != last or now - _reticle_state["at"] >= RETICLE_KEEPALIVE_S:
+            sink.show(ret)
+            _reticle_state["last"] = key
+            _reticle_state["at"] = now
+    except Exception:
+        pass
+
+
+def _shutdown_reticle() -> None:
+    try:
+        sink = _get_reticle_sink()
+        if sink is not None:
+            sink.shutdown()
+    except Exception:
+        pass
+    _reticle_state["last"] = None
+
+
+# ── the two-hand window grab (core/hand_two_hand.py, 2026-10-20) ──────────
+def _two_hand_enabled() -> bool:
+    """HAND_TWO_HAND_ENABLED, with AIR_MOUSE_ENGINE = "hands", never in staging."""
+    if not bool(_cfg("HAND_TWO_HAND_ENABLED", False)):
+        return False
+    if str(_cfg("AIR_MOUSE_ENGINE", "kinect") or "").strip().lower() != "hands":
+        return False
+    return not _staging()
+
+
+def set_two_hand_backend_factory(fn: Optional[Callable[[], object]]) -> None:
+    """Replace the two-hand grab's window / overlay layer (tests). None = the
+    real one (skills/kinect_two_hand.py), used only with the real mouse output."""
+    _two_hand_backend_factory[0] = fn
+    _two_hand[0] = None
+
+
+def _recent_input() -> bool:
+    m = _mouse[0]
+    try:
+        idle = m.out.idle_s() if m is not None else None
+        quiet = m.p.input_quiet_s if m is not None else 1.0
+        return idle is not None and idle < quiet
+    except Exception:
+        return False
+
+
+def _get_two_hand():
+    if _two_hand[0] is not None:
+        return _two_hand[0]
+    try:
+        from core import hand_mouse, hand_two_hand
+        if _two_hand_backend_factory[0] is not None:
+            win = _two_hand_backend_factory[0]()
+        elif _mouse_output_factory[0] is not None:
+            return None                     # a fake mouse = a test: no real windows
+        else:
+            win = hand_two_hand.WindowsBackend()
+        _two_hand[0] = hand_two_hand.TwoHandGrab(
+            win, params=hand_mouse.Params.from_config(_cfg),
+            blocker=mouse_blocked_reason, recent_input=_recent_input)
+    except Exception as e:
+        print(f"{LOG} two-hand grab unavailable: {type(e).__name__}: {e}")
+        _two_hand[0] = None
+    return _two_hand[0]
+
+
+def _two_hand_active() -> bool:
+    g = _two_hand[0]
+    try:
+        return g is not None and g.active()
+    except Exception:
+        return False
+
+
+def _stop_two_hand() -> None:
+    g = _two_hand[0]
+    if g is not None:
+        try:
+            g.stop()
+        except Exception:
+            pass
 
 
 def _set_mouse_runtime(on: bool) -> None:
@@ -219,6 +449,8 @@ def _stop_hand_mouse() -> bool:
     m = _mouse[0]
     if m is not None:
         m.set_enabled(False)
+    if was:
+        _shutdown_reticle()
     return was
 
 
@@ -435,7 +667,7 @@ def _ws_url() -> str:
 def _ensure_listener() -> None:
     if _listener[0] is None:
         _listener[0] = GestureListener(
-            _ws_url(), on_hands=_mouse_hands, wants_hands=_mouse_enabled,
+            _ws_url(), on_hands=_mouse_hands, wants_hands=_wants_hands,
             on_idle=_mouse_idle, on_disconnect=_mouse_tracker_gone)
     _listener[0].start()
     _state["listening"] = True
@@ -690,9 +922,11 @@ def _hand_mouse_on(_: str = "") -> str:
         return "The hand mouse is already on, sir."
     why = blocked_reason()
     tail = f" It won't take the cursor while {why}." if why else ""
+    scroll = (" make a fist and move it up or down to scroll,"
+              if bool(_cfg("HAND_MOUSE_SCROLL_ENABLED", True)) else "")
     return ("Hand mouse on, sir. Hold a pinch still for a moment to take the "
-            "cursor, tap to click, pinch and hold to drag, and hold an open palm "
-            "to let go. Say 'hand mouse off' to stop it." + tail)
+            "cursor, tap to click, pinch and hold to drag," + scroll + " and hold "
+            "an open palm to let go. Say 'hand mouse off' to stop it." + tail)
 
 
 def _hand_mouse_off(_: str = "") -> str:
