@@ -4765,6 +4765,12 @@ class _TimestampedTee:
             self.console.flush()
         except Exception:
             pass
+        # Turn trace: count a shadow "would ..." / validator line into the
+        # open turn's record (TURN_TRACE; a cheap early-out, never raises).
+        try:
+            _turn_trace_observe(msg)
+        except Exception:
+            pass
         # File: prepend timestamp at the start of every line
         try:
             for ch in msg:
@@ -17076,11 +17082,64 @@ _turn_timing = _tt_mod.TurnTiming()
 
 
 def _tt(op: str, *args, **kwargs):
-    """Call one _turn_timing method; swallow anything. Never raises."""
+    """Call one _turn_timing method; swallow anything. Never raises.
+    The turn trace (TURN_TRACE, core/turn_trace.py) rides the same calls: a
+    begin opens its collector, the emit that prints the turn's
+    [turn-timing] line hands that line to it."""
     try:
-        return getattr(_turn_timing, op)(*args, **kwargs)
+        res = getattr(_turn_timing, op)(*args, **kwargs)
     except Exception:
         return None
+    if op in _TURN_TRACE_OPS:
+        _turn_trace_hook(op, res, args)
+    return res
+
+
+_TURN_TRACE_OPS = ("begin", "begin_voice", "emit")
+
+
+def _turn_trace_on() -> bool:
+    try:
+        return bool(globals().get("TURN_TRACE", True))
+    except Exception:
+        return False
+
+
+def _turn_trace_hook(op: str, res, args) -> None:
+    """begin / begin_voice -> open the trace collector; emit -> commit the
+    turn's record from its [turn-timing] line. Never raises."""
+    try:
+        if not _turn_trace_on():
+            return
+        from core import turn_trace as _ttr
+        if op == "emit":
+            _ttr.commit(res, str(args[0]) if args else "ok")
+        else:
+            _ttr.begin()
+    except Exception:
+        pass
+
+
+def _turn_trace_observe(msg) -> None:
+    """The log tee's hook: one chunk of printed text (see
+    core.turn_trace.observe). Never raises."""
+    try:
+        if msg and "[" in msg and _turn_trace_on():
+            from core import turn_trace as _ttr
+            _ttr.observe(msg)
+    except Exception:
+        pass
+
+
+def _turn_trace_call(fn: str, *args, **kwargs) -> None:
+    """One core.turn_trace note_* call for the open turn; nothing when
+    TURN_TRACE is off. Never raises."""
+    try:
+        if _turn_trace_on():
+            from core import turn_trace as _ttr
+            getattr(_ttr, fn)(*args, **kwargs)
+    except Exception:
+        pass
 
 
 def _tt_stats(r):
@@ -17716,6 +17775,7 @@ _TURN_FLAG_KEYS = (
     "FILE_MOVE_ENABLED",
     "LINK_READER_ENABLED",
     "AGENT_DESK_ENABLED", "AGENT_DESK_ANNOUNCE",
+    "TURN_TRACE",
 )
 
 
@@ -26796,6 +26856,9 @@ def _call_llm(user_text: str) -> str:
                     _turn_ctx = (_turn_ctx + "\n" + _skill_txt
                                  if _turn_ctx else _skill_txt)
             _stable_split = True
+            # Turn trace: the routed section names (headers only).
+            _turn_trace_call("note_sections", [
+                h for (h, _b) in _pr.split_turn_block(_turn_ctx)])
         except Exception as _pr_err:
             print(f"  [prompt-router] stable split failed ({_pr_err}); "
                   f"full prompt")
@@ -51527,6 +51590,12 @@ def _run_llm_dispatch_body(text: str) -> str:
     # the history the moment the chain ends, so the per-turn cloud-prompt cost
     # can't creep with chain depth.
     _trim_conversation_history()
+    # Turn trace (TURN_TRACE): what ran, whether it failed, why the chain
+    # stopped. Names and ok/fail only; the record is written by the
+    # [turn-timing] emit in _run_llm_dispatch's finally.
+    _turn_trace_call("note_chain", reply, _chain_results, _chain_cut,
+                     _followup_rounds, failed=_is_failure)
+    _turn_trace_call("note_model", _local_budget_tag())
     return reply
 
 
@@ -52765,6 +52834,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 if _maybe_orchestrate(text):
                     continue
 
+                # Turn trace: the owner's words + how they arrived, for every
+                # path below (shortcut, glance, route, brain).
+                _turn_trace_call("note_text", text, _learn_channel(
+                    True, _injected_text is not None))
                 if _run_voice_shortcuts(text):
                     _tt("emit", "shortcut")
                     continue
