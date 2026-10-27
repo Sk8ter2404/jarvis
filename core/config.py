@@ -520,6 +520,11 @@ VISION_TRACE_MAX_MB = 300
 # page addresses) for clicks, "what's on my screen" and screen memory. The
 # kill switch: False stops EVERY UI Automation read (core.uia_host).
 SCREEN_UIA_ENABLED = True
+# ARG_FIXES (v3 W05) - bool. True: grounded_click._clean_desc strips "that/the/
+# this", "for me", "on the X monitor" and the "that says," wrapper from a click
+# target, and open_on_monitor accepts "secondary/second/other" when exactly two
+# monitors exist. False: the old behaviour, unchanged.
+ARG_FIXES = True
 # UI Automation on NON-browser windows: "off" | "on_demand" (the window in
 # front, or the app the owner's words name) | "always". Electron apps may
 # switch to screen-reader mode when read.

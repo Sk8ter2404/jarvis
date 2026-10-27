@@ -376,7 +376,7 @@ class AskAndPickTests(_Base):
         b = self.desk(home)
         r = G.run("the dragon video", said="click the dragon video", backend=b)
         self.assertEqual(r.outcome, G.NOT_FOUND)
-        self.assertIn("I don't see 'the dragon video'", r.text)
+        self.assertIn("I don't see 'dragon video'", r.text)
         self.assertIn("On screen:", r.text)
         self.assertEqual(b.clicks, [])
 
