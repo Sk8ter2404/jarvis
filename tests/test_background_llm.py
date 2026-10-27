@@ -2,9 +2,10 @@
 background brain on a second (CPU-only) Ollama.
 
 Pins: unset URL = main brain; only allowlisted background callers go remote;
-owner-facing callers never do; the payload has no GPU options and a pinned
-num_ctx; failures raise RemoteFailure and arm the 60 s health memo; loopback
-URLs in the new code use 127.0.0.1.
+owner-facing callers never do; the payload carries sampling knobs only (no
+num_ctx / num_thread / GPU options / keep_alive: any of them would reload the
+CPU host's model or override its residency); failures raise RemoteFailure and
+arm the 60 s health memo; loopback URLs in the new code use 127.0.0.1.
 """
 from __future__ import annotations
 
@@ -18,7 +19,6 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from core import background_llm as bgl  # noqa: E402
-from core import ollama_opts  # noqa: E402
 
 URL = "http://203.0.113.9:11434"
 
@@ -127,12 +127,19 @@ class SettingsCleaningTests(unittest.TestCase):
 
 
 class PayloadTests(unittest.TestCase):
-    def test_no_gpu_options_and_num_ctx_pinned(self):
+    def test_sampling_knobs_only(self):
+        """The CPU host serves one pre-configured model (num_thread baked into
+        its Modelfile, context set server-side). A per-request num_ctx or
+        num_thread would reload 6.6 GB on a CPU box, and keep_alive would
+        override the server's 24 h residency, so none of them is sent."""
         p = bgl.build_payload("gemma4:e4b", "sys", [{"role": "user",
                               "content": "hi"}], 120, think=False)
         opts = p["options"]
-        self.assertEqual(opts["num_ctx"], ollama_opts.local_num_ctx("gemma4:e4b"))
+        for runner_key in ("num_ctx", "num_thread", "num_gpu", "main_gpu"):
+            self.assertNotIn(runner_key, opts)
+        self.assertNotIn("keep_alive", p)
         self.assertEqual(opts["num_predict"], 120)
+        self.assertEqual(opts["temperature"], 0.4)
         for k in opts:
             self.assertNotIn("gpu", k.lower())
         self.assertNotIn("main_gpu", p)
@@ -163,7 +170,8 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(body["eval_count"], 3)
         self.assertEqual(seen["url"], URL + "/api/chat")
         self.assertEqual(seen["timeout"], (bgl.CONNECT_TIMEOUT_S, 90.0))
-        self.assertIn("num_ctx", seen["json"]["options"])
+        self.assertNotIn("num_ctx", seen["json"]["options"])
+        self.assertNotIn("keep_alive", seen["json"])
         self.assertFalse(bgl.HEALTH.is_down())
 
     def test_connection_error_and_timeout_raise_and_arm_memo(self):
@@ -206,6 +214,39 @@ class SourceHygieneTests(unittest.TestCase):
             lines = fh.read().splitlines()
         self.assertEqual([ln for ln in lines
                           if re.search(r"https?://localhost", ln)], [])
+
+
+class SyncSummaryAndWindowTests(unittest.TestCase):
+    def test_stay_on_main_pins_this_thread_only(self):
+        """The summary taken at shutdown / peer hand-off is waited on by the
+        owner: inside stay_on_main() it stays on the main brain even with a
+        URL set; outside (and on other threads) routing is unchanged."""
+        import threading
+        memo = bgl.HealthMemo()
+        self.assertEqual(bgl.route(URL, "session_checkpoint", True, memo),
+                         "remote")
+        other = {}
+        with bgl.stay_on_main():
+            with bgl.stay_on_main():   # re-entrant
+                self.assertEqual(
+                    bgl.route(URL, "session_checkpoint", True, memo), "main")
+            self.assertEqual(
+                bgl.route(URL, "session_checkpoint", True, memo), "main")
+            th = threading.Thread(target=lambda: other.update(
+                r=bgl.route(URL, "session_checkpoint", True, memo)))
+            th.start()
+            th.join()
+        self.assertEqual(other["r"], "remote")
+        self.assertFalse(bgl.pinned_to_main())
+        self.assertEqual(bgl.route(URL, "session_checkpoint", True, memo),
+                         "remote")
+
+    def test_clean_num_ctx(self):
+        self.assertEqual(bgl.clean_num_ctx(None), bgl.DEFAULT_NUM_CTX)
+        self.assertEqual(bgl.clean_num_ctx("x"), bgl.DEFAULT_NUM_CTX)
+        self.assertEqual(bgl.clean_num_ctx(100), bgl.DEFAULT_NUM_CTX)
+        self.assertEqual(bgl.clean_num_ctx(4096), 4096)
+        self.assertEqual(bgl.DEFAULT_NUM_CTX, 8192)
 
 
 if __name__ == "__main__":

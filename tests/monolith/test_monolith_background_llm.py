@@ -3,7 +3,7 @@ background (CPU) Ollama when BACKGROUND_LLM_BASE_URL is set.
 
 Pins: unset = the main brain exactly as before (no remote POST); background +
 allowlisted caller + URL = remote POST to that URL with the BACKGROUND model,
-no GPU options, num_ctx pinned; owner-facing callers and foreground calls
+no GPU options, no num_ctx / keep_alive (the CPU host's settings win); owner-facing callers and foreground calls
 never go remote; ConnectionError / timeout / 5xx fall back to the main brain
 (no lost learning); the health memo stops a dead host costing a timeout per
 job; every text-brain background=True caller in the tree is classified.
@@ -108,10 +108,47 @@ class BackgroundRemoteRoutingTests(MonolithGlobalsTestCase):
         self.assertEqual(self._urls(), [URL + "/api/chat"])
         _u, payload, timeout = self.posts[0]
         self.assertEqual(payload["model"], "gemma4:e4b")
-        self.assertIn("num_ctx", payload["options"])
+        self.assertNotIn("num_ctx", payload["options"])
+        self.assertNotIn("keep_alive", payload)
         self.assertNotIn("main_gpu", payload["options"])
         self.assertNotIn("main_gpu", payload)
         self.assertEqual(timeout[1], 120.0)
+
+    def test_prompt_over_the_remote_window_stays_main(self):
+        """The remote window is server-side (8192 on the Unraid box) and never
+        sent; a prompt that would overflow it stays on the main brain rather
+        than being silently truncated there."""
+        self._wire()
+        self._p(self.bc, "BACKGROUND_LLM_NUM_CTX", 1024, create=True)
+        big = [{"role": "user", "content": "word " * 4000}]
+        self.assertEqual(self.bc._call_local_llm(
+            "You extract facts.", big, max_tokens=50,
+            caller="learn_batch", background=True), "main answer")
+        self.assertTrue(all(u.startswith(MAIN) for u in self._urls()))
+
+    def test_stay_on_main_keeps_a_checkpoint_local(self):
+        """Shutdown / hand-off summaries run inside stay_on_main(): the same
+        session_checkpoint caller that goes remote periodically stays on the
+        main brain there."""
+        self._wire()
+        with self.bgl.stay_on_main():
+            self.assertEqual(self._call("session_checkpoint", True),
+                             "main answer")
+        self.assertTrue(all(u.startswith(MAIN) for u in self._urls()))
+        self.posts.clear()
+        self.assertEqual(self._call("session_checkpoint", True),
+                         "remote answer")
+
+    def test_shutdown_and_handoff_summaries_are_pinned(self):
+        """Both owner-waits call sites wrap _session_summary_update in
+        stay_on_main() (source pin: the two functions are not unit-drivable
+        without a full session)."""
+        import inspect
+        for fn in (self.bc.save_session_to_memory,
+                   self.bc._handoff_stand_down):
+            src = inspect.getsource(fn)
+            i = src.index("_session_summary_update(")
+            self.assertIn("stay_on_main()", src[max(0, i - 300):i], fn.__name__)
 
     def test_every_allowlisted_caller_goes_remote(self):
         self._wire()

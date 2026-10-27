@@ -4333,8 +4333,12 @@ def save_session_to_memory(memory: dict):
     print("\nSummarising session…")
     try:
         if _pending is not None:
-            summary = (_session_summary_update(_pending, record=False)
-                       or _session_running_summary[0])
+            # v3 W13: the owner is waiting on this one (shutdown): never
+            # behind the slow background (CPU) brain.
+            from core import background_llm as _bgl
+            with _bgl.stay_on_main():
+                summary = (_session_summary_update(_pending, record=False)
+                           or _session_running_summary[0])
         else:
             summary = _session_running_summary[0]
         if summary:
@@ -4554,7 +4558,10 @@ def _handoff_stand_down(reason: str):
     try:
         _pending = _session_summary_pending()
         if _pending is not None:
-            _session_summary_update(_pending)
+            # v3 W13: the hand-off waits on this summary: main brain only.
+            from core import background_llm as _bgl
+            with _bgl.stay_on_main():
+                _session_summary_update(_pending)
     except Exception as _e:
         print(f"  [handoff] final session summary failed: {_e}")
     try:
@@ -17569,6 +17576,7 @@ _TURN_FLAG_KEYS = (
     "BACKGROUND_LLM_BASE_URL",
     "BACKGROUND_LLM_MODEL",
     "BACKGROUND_LLM_TIMEOUT_S",
+    "BACKGROUND_LLM_NUM_CTX",
     "BACKGROUND_TAG_STRICT", "STT_ENGINE", "STT_SHADOW", "SMART_TURN_MODE",
     "SMART_TURN_THRESHOLD", "WHISPER_TEMPERATURES", "WHISPER_BEAM_SIZE",
     "PROCESSING_FILLER_SOFT_CUT", "LOCAL_PROMPT_PROFILE",
@@ -22738,6 +22746,14 @@ def _background_remote_try(system: str, messages: list, max_tokens: int,
                                    model_tag=_model, log=False)
         if not getattr(_fit, "fits", True):
             return None     # too big for the remote window: main brain
+        # The remote server's window is set server-side (never sent) and is
+        # smaller than the main brain's: a prompt that would overflow it
+        # stays on the main brain instead of being silently truncated there.
+        if _prompt_budget.estimate_chat_tokens(_sys, list(_fit)) > \
+                _prompt_budget.budget_for(
+                    _bgl.clean_num_ctx(globals().get("BACKGROUND_LLM_NUM_CTX")),
+                    max_tokens):
+            return None
         try:
             text, body = _bgl.chat(
                 _url, _model, _sys, list(_fit), max_tokens,

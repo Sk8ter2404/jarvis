@@ -22,9 +22,14 @@ and falls back to the main brain, so no learning is lost.
   is SPOKEN right away (``OWNER_FACING_CALLERS`` documents the known ones) must
   never wait on a CPU box, and a new caller defaults to the main brain until
   somebody decides it can wait.
-* The remote host is CPU-only: the payload carries no ``main_gpu``/GPU
-  options. ``num_ctx`` is still pinned through ``core.ollama_opts`` (Ollama
-  keys a runner on its options; a tree-wide test enforces the pin).
+* The remote host is CPU-only and serves ONE pre-configured model (on the
+  owner's Unraid box: ``gemma4-e4b-cpu6``, gemma4:e4b with num_thread 6 baked
+  into its Modelfile, context 8192 server-side). The payload therefore carries
+  NO ``num_ctx``, ``num_thread``, GPU option or ``keep_alive``: Ollama keys a
+  runner on its options, so any per-request difference would reload 6.6 GB on
+  a CPU host, and the server's own 24 h keep-alive must win. Prompts are
+  budgeted against ``BACKGROUND_LLM_NUM_CTX`` (8192) before sending; one that
+  would not fit stays on the main brain.
 * Loopback URLs use 127.0.0.1, never ``localhost`` (Windows resolves ::1
   first: a 2 s tax per request).
 """
@@ -38,16 +43,19 @@ try:
 except Exception:  # pragma: no cover - requests is a hard dependency elsewhere
     _requests = None
 
-from core import ollama_opts
-
 DEFAULT_MODEL = "gemma4:e4b"
 DEFAULT_TIMEOUT_S = 120.0
+# The remote server's context window (set server-side, never sent).
+DEFAULT_NUM_CTX = 8192
 # After a failure, skip the remote host for this long so a dead server costs
 # one timeout per window, not one per job.
 HEALTH_MEMO_S = 60.0
 # A CPU box that is only reached for background jobs: a short connect budget.
 CONNECT_TIMEOUT_S = 5.0
-KEEP_ALIVE = "30m"
+# Sampling knobs only: none of these key an Ollama runner, so they never
+# force a reload on the remote host.
+SAMPLING = {"temperature": 0.4, "top_p": 0.9, "repeat_penalty": 1.05,
+            "top_k": 40}
 
 # Background callers whose result is NOT spoken and is not latency-bound.
 # Census of every background=True caller that reaches _call_local_llm
@@ -101,6 +109,30 @@ class HealthMemo:
 
 HEALTH = HealthMemo()
 
+# Calls made inside ``stay_on_main()`` on this thread never go remote. Used
+# where the OWNER waits on a background-tagged job: the session summary taken
+# at shutdown and at a peer hand-off (the periodic checkpoint still goes
+# remote). Thread-local, because _llm_quick runs the call on the caller's
+# own thread.
+_PIN = threading.local()
+
+
+class stay_on_main:
+    """Context manager: background calls on this thread stay on the main
+    brain while it is active. Re-entrant."""
+
+    def __enter__(self):
+        _PIN.depth = getattr(_PIN, "depth", 0) + 1
+        return self
+
+    def __exit__(self, *_exc):
+        _PIN.depth = max(0, getattr(_PIN, "depth", 1) - 1)
+        return False
+
+
+def pinned_to_main() -> bool:
+    return getattr(_PIN, "depth", 0) > 0
+
 
 def clean_base_url(value) -> str:
     """The configured URL without trailing slashes; "" when unset/not text."""
@@ -124,13 +156,22 @@ def clean_timeout(value) -> float:
     return t
 
 
+def clean_num_ctx(value) -> int:
+    """The remote window used for budgeting; DEFAULT_NUM_CTX when unset/bad."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_NUM_CTX
+    return n if n >= 1024 else DEFAULT_NUM_CTX
+
+
 def route(base_url, caller: str, background: bool, health: HealthMemo = None) -> str:
     """"remote" or "main" for one call. "remote" needs ALL of: a configured
     URL, a background call, an allowlisted (not owner-facing) caller, and a
     remote host not memoised as down."""
     if not clean_base_url(base_url):
         return "main"
-    if not background:
+    if not background or pinned_to_main():
         return "main"
     name = str(caller or "")
     if name in OWNER_FACING_CALLERS or name not in REMOTE_OK_CALLERS:
@@ -142,18 +183,17 @@ def route(base_url, caller: str, background: bool, health: HealthMemo = None) ->
 
 def build_payload(model: str, system: str, messages: list, max_tokens: int,
                   think=None) -> dict:
-    """The /api/chat body for the remote CPU host: the same sampling knobs as
-    the main brain, num_ctx pinned through core.ollama_opts.chat_options, and
-    NO GPU options (``main_gpu`` etc. are meaningless on a CPU-only host)."""
-    options = ollama_opts.chat_options(
-        model, num_predict=max_tokens, temperature=0.4,
-        extra={"top_p": 0.9, "repeat_penalty": 1.05, "top_k": 40})
+    """The /api/chat body for the remote CPU host: the main brain's sampling
+    knobs and num_predict ONLY. No num_ctx / num_thread / GPU options and no
+    keep_alive (see the module docstring: any of them would reload the model
+    or override the server's residency)."""
+    options = dict(SAMPLING)
+    options["num_predict"] = max_tokens
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}] + list(messages),
         "stream": False,
         "options": options,
-        "keep_alive": KEEP_ALIVE,
     }
     if think is not None:
         payload["think"] = think

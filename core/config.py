@@ -3052,6 +3052,10 @@ LOCAL_KEEP_ALIVE = "20m"
 BACKGROUND_LLM_BASE_URL = ""
 BACKGROUND_LLM_MODEL = "gemma4:e4b"
 BACKGROUND_LLM_TIMEOUT_S = 120
+# BACKGROUND_LLM_NUM_CTX: that host's context window, set SERVER-side (never
+# sent: a per-request num_ctx would reload the model on a CPU box). Prompts
+# larger than it stay on the main brain.
+BACKGROUND_LLM_NUM_CTX = 8192
 # Re-ping the small model this often so it does not evict on Ollama's clock.
 # `keep_alive: "20m"` is HARDCODED in the chat payload (bobert_companion.py:
 # 11148), so a long keep_alive cannot be pinned from outside — but the refresh
