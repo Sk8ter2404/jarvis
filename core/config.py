@@ -305,6 +305,20 @@ SERVER_WATCH_NAME = "server"
 SERVER_WATCH_SSH = ""
 SERVER_WATCH_POLL_S = 300.0
 
+# ─── Agent desk (skills/agent_desk.py, v3 W19) ─────────────────────────
+# "What are my agents doing / anything waiting on me?" JARVIS READS the Agent
+# Office (the owner's live view of every Claude chat) with one GET of
+# AGENT_OFFICE_URL/api/state (2 s timeout); no Claude Code hook, nothing
+# written. Office text is spoken only, never run as an action.
+# AGENT_DESK_ENABLED — registers the agents_status action. AGENT_DESK_ANNOUNCE
+# — also say one line when a NEW chat starts waiting on you (debounced, held
+# in the PHONE_PING quiet hours; needs a restart to start the poll).
+# AGENT_OFFICE_URL is per machine (use 127.0.0.1, never "localhost").
+AGENT_DESK_ENABLED = True
+AGENT_DESK_ANNOUNCE = False
+AGENT_DESK_POLL_S = 60.0
+AGENT_OFFICE_URL = "http://127.0.0.1:8795"
+
 # ─── Local prompt-prefix stability (2026-09-29) ────────────────────────
 # The local model re-evaluates the WHOLE prompt (~3 s for ~12k tokens,
 # measured) whenever the system prompt changes between turns; an unchanged
