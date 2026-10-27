@@ -484,6 +484,9 @@ from core import pronoun_switch as _pronoun_switch  # noqa: E402
 # Exact invented-name -> real-name table, consulted before the fuzzy layer
 # when ACTION_ALIASES is on (v3 W04, see _runner in parse_and_run_actions).
 from core import action_aliases as _action_aliases  # noqa: E402
+# Action-fit guard (v3 W11): a real, allowed action that misfits the owner's
+# words (ACTION_FIT_MODE; see _action_fit_refusal and _runner).
+from core import action_fit as _action_fit  # noqa: E402
 _AUTOCORRECT_THRESHOLD = 0.75
 # When two candidates both clear the threshold and sit within this gap of
 # each other, the dispatcher asks 'did you mean X or Y' instead of silently
@@ -17672,6 +17675,8 @@ _TURN_FLAG_KEYS = (
     "SPEECH_PLAN_HEAD_HOLD",
     # v3 W04: exact alias table + autocorrect verb-clash guard + labels.
     "ACTION_ALIASES",
+    # v3 W11: 'shadow' logs / 'on' refuses an action that misfits his words.
+    "ACTION_FIT_MODE",
     # Reserved for later batches (absent until they ship):
     "AMBIENT_STT_YIELD", "PROCESSING_FILLER_PRERENDER",
     "PROCESSING_FILLER_LATE_START_S", "PROCESSING_FILLER_SKIP_PLEASANTRIES",
@@ -40941,7 +40946,11 @@ def _begin_turn_grounding(user_text: str):
     """Open a fresh ledger for one dispatch; returns the previous frame so a
     nested dispatch on the same thread restores it (_end_turn_grounding)."""
     prev = getattr(_turn_grounding, "frame", None)
-    _turn_grounding.frame = {"user_text": str(user_text or ""), "ran": set()}
+    _turn_grounding.frame = {"user_text": str(user_text or ""), "ran": set(),
+                             # when this turn began: the action-fit guard
+                             # (v3 W11) reads the previous turn's actions as
+                             # the replay history entries before it.
+                             "t0": time.time()}
     if prev is None:
         _turn_grounding.last_ran = frozenset()
     # "click that X" / "the one on screen": read the windows NOW (text only,
@@ -43048,6 +43057,73 @@ def _youtube_play_alias(name: str, arg: str) -> str:
     return name
 
 
+# ── Action-fit guard (v3 W11, 2026-10-27; ACTION_FIT_MODE) ────────────────
+# A real, allowed, safe action that does not fit what the owner said ran with
+# no gate and its result was spoken: c006 "get out of the way" -> game_mode_on
+# (brain swap, cameras stopped), c030 "turn on all smart home devices" ->
+# list_smart_home_devices, c032 the same which_mic_is_active again right after
+# "the headset is on though". core.action_fit.check judges the final name
+# (after the alias step and the autocorrect) once every confirmation /
+# pushback / self-termination gate has passed it, right before the handler.
+# 'shadow' (the default) only logs; 'on' records a "refused (action-fit)"
+# result and does not run the handler, so the follow-up round chooses again.
+_ACTION_FIT_PRIOR_WINDOW_S = 120.0
+
+
+def _action_fit_mode() -> str:
+    """ACTION_FIT_MODE normalised to 'off' | 'shadow' | 'on'; anything else
+    reads as 'off'. Never raises."""
+    try:
+        return _action_fit.normalise_mode(
+            globals().get("ACTION_FIT_MODE", "off"))
+    except Exception:
+        return "off"
+
+
+def _action_fit_prior_actions() -> list:
+    """(name, arg) pairs that ran on the owner's previous turn: the replay
+    history entries from the 2 minutes before this turn began. [] outside a
+    turn or when the turn start is unknown. Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        t0 = float((frame or {}).get("t0") or 0.0)
+        if not t0:
+            return []
+        with _action_history_lock:
+            hist = list(_action_history)
+        return _action_fit.prior_from_history(
+            hist, t0, _ACTION_FIT_PRIOR_WINDOW_S)
+    except Exception:
+        return []
+
+
+def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
+    """The 'on'-mode failure result for an action that misfits the owner's
+    words this turn, else None. 'shadow' logs "[action-fit] would block"
+    and returns None; 'off' and a dispatch with no owner words (a proactive
+    remark) return None without checking. Never raises."""
+    try:
+        mode = _action_fit_mode()
+        if mode == "off":
+            return None
+        user_text = _turn_user_text()
+        if not user_text:
+            return None
+        reason = _action_fit.check(user_text, name, arg,
+                                   _action_fit_prior_actions(), reply_names)
+        if not reason:
+            return None
+        shown = f"{name}({arg})" if arg else name
+        if mode != "on":
+            print(f"  [action-fit] would block {shown}: {reason}")
+            return None
+        print(f"  [action-fit] blocked {shown}: {reason}")
+        return _action_fit.failure_result(reason)
+    except Exception as _e:
+        print(f"  [action-fit] check failed: {type(_e).__name__}")
+        return None
+
+
 def _action_aliases_on() -> bool:
     """ACTION_ALIASES (core.config; v3 W04): the exact alias table, the
     autocorrect verb-clash guard and the spoken friendly labels. A missing
@@ -43289,6 +43365,13 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         except Exception as _e:
             print(f"  [mission_narration] intro failed: {_e}")
 
+    # Action-fit guard (v3 W11): every action name in this reply, so a lookup
+    # written beside the action that does the job is not judged alone.
+    _fit_on = _action_fit_mode() != "off"
+    _fit_reply_names = (tuple(m.group(1).strip().lower()
+                              for m in _ACTION_RE.finditer(reply))
+                        if _fit_on else ())
+
     def _runner(match):
         name = match.group(1).strip().lower()
         arg  = (match.group(2) or "").strip()
@@ -43490,6 +43573,16 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             print(f"  [pushback] {reason} → '{objection}'")
             results.append((name, f"⚠  PUSHBACK: {objection}", False))
             return ""
+
+        # Action-fit guard (v3 W11, ACTION_FIT_MODE): the final name, after
+        # the alias step, the autocorrect and every gate above, against the
+        # owner's words. 'shadow' only logs; 'on' does not run a misfit and
+        # records a "refused" result so the follow-up round chooses again.
+        if _fit_on:
+            _misfit = _action_fit_refusal(name, arg, _fit_reply_names)
+            if _misfit:
+                results.append((name, _misfit, False))
+                return ""
 
         if _narrate:
             _narration_step[0] += 1

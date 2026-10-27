@@ -1572,6 +1572,27 @@ ACTION_ALIASES = True
 # False: the name table only, as in v2.0.231.
 THINK_CAPABILITY_PROBE = True
 
+# ─── Action-fit guard (v3 W11, 2026-10-27; core/action_fit.py) ───────────
+# A real, allowed action that does not fit what sir asked: game_mode_on for
+# "get out of the way", list_smart_home_devices for "turn on all smart home
+# devices", the same which_mic_is_active again right after "the headset is
+# on though". Three rules (core.action_fit.check): a list / status action
+# for an on / off / set / dim command; a game-mode swap with no game / mode /
+# play / power word; a read-only check repeated after an owner correction.
+# Checked in _runner after the alias step and after every confirmation /
+# pushback / self-termination gate (none of them changes), right before the
+# handler runs.
+#   ACTION_FIT_MODE  'off'    the old behaviour, byte for byte;
+#                    'shadow' (default) the action runs; each misfit is
+#                             logged as "[action-fit] would block ...";
+#                    'on'     the action does not run; its result is
+#                             "refused (action-fit): not run - ..." so the
+#                             follow-up round chooses again.
+#                    Any other value reads as 'off'.
+# Flip to 'on' after 50+ live turns of shadow lines with no false flag.
+# Set via user_settings.json; applies on the next start.
+ACTION_FIT_MODE = "shadow"
+
 # ─── Prompt v3 core (v3 overhaul W03, 2026-10-27) ────────────────────────
 # PROMPT_DIRECTIVE_V3 (bool): the wording of the prompt rules the local
 # model obeys, as one switch. True: an [ACTION] token is a REQUEST, not a
