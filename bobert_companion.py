@@ -25111,6 +25111,23 @@ def _prompt_slim_on() -> bool:
 # prompt, so "what's using my bandwidth" / "search my files" never found them.
 _ROUTED_V3_INDEX_KEEP = ("search_my_files", "whats_using_bandwidth")
 
+# v3 W25: _slim_local_system_prompt / _canon_index_kwargs keep their quiet
+# fallback (the full layout, or the old index) but say so ONCE per process -
+# a silent fallback would ship a ~9k-larger prompt with nothing in the log.
+_SLIM_FALLBACK_LOGGED = [False]
+
+
+def _log_slim_fallback(exc) -> None:
+    """One "[prompt] slim layout failed" line per process. Never raises."""
+    try:
+        if _SLIM_FALLBACK_LOGGED[0]:
+            return
+        _SLIM_FALLBACK_LOGGED[0] = True
+        print(f"  [prompt] slim layout failed: {exc} - using the full layout")
+    except Exception:
+        pass
+
+
 def _canon_index_kwargs() -> dict:
     """v3 W12 (PROMPT_INDEX_CANON): the canonical-index arguments of
     prompt_router.slim_stable_pc_block - the hidden near-duplicate names
@@ -25124,7 +25141,8 @@ def _canon_index_kwargs() -> dict:
         from core import prompt_router as _pr
         return {"hide": dict(_aa.HIDDEN_DUPLICATES),
                 "collapse": _pr.COLLAPSED_ROWS}
-    except Exception:
+    except Exception as exc:
+        _log_slim_fallback(exc)
         return {}
 
 
@@ -25192,7 +25210,8 @@ def _slim_local_system_prompt(base: str) -> str | None:
             if text and text in out:
                 out = out.replace(text, "", 1)
         return out
-    except Exception:
+    except Exception as exc:
+        _log_slim_fallback(exc)
         return None
 
 

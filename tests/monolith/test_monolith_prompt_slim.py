@@ -394,5 +394,56 @@ class OffModeTests(_Base):
         self.assertNotIn("ACTION INDEX", expected)
 
 
+class FallbackLogTests(_Base):
+    """v3 W25: the slim layout's quiet fallback is logged once per process,
+    and the slim stable prompt at the 3.0.0 defaults carries no full-layout
+    index header."""
+
+    def _off_layout(self):
+        bc = self.bc
+        from core import prompt_router as pr
+        return bc._system_prompt.replace(
+            bc.PC_CONTROL_PROMPT,
+            bc._LOCAL_NEVER_GUESS_GUARD + "\n"
+            + pr.stable_pc_block(bc.PC_CONTROL_PROMPT), 1)
+
+    def test_a_forced_failure_logs_once_and_still_returns_a_prompt(self):
+        bc = self.bc
+        self._p(bc, "_SLIM_FALLBACK_LOGGED", [False])
+        self._p(bc, "_slim_stable_pc", side_effect=RuntimeError("boom"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            first = bc._local_stable_system_prompt()
+            second = bc._local_stable_system_prompt()
+            # The other guarded step failing too adds no second line.
+            with mock.patch.object(bc, "PROMPT_INDEX_CANON", True),                     mock.patch("core.action_aliases.HIDDEN_DUPLICATES", 5):
+                self.assertEqual(bc._canon_index_kwargs(), {})
+        line = ("[prompt] slim layout failed: boom - using the full layout")
+        self.assertEqual(out.getvalue().count("[prompt] slim layout failed"),
+                         1, out.getvalue())
+        self.assertIn(line, out.getvalue())
+        self.assertEqual(first, self._off_layout())
+        self.assertEqual(second, first)
+
+    def test_the_slim_stable_prompt_has_no_full_layout_index(self):
+        bc = self.bc
+        import core.config as cfg
+        for name in ("PROMPT_DIRECTIVE_V3", "PROMPT_ROUTED_V3",
+                     "PROMPT_INDEX_CANON"):
+            # Default ON since 3.0.0 (fair prompt gate, PLAN.md).
+            self.assertIs(getattr(cfg, name), True, name)
+            self.assertIs(getattr(bc, name), True, name)
+        self._p(bc, "_SLIM_FALLBACK_LOGGED", [False])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            slim = bc._local_stable_system_prompt()
+            sent = self._sys(self._turn("play some music"))
+        self.assertNotIn("slim layout failed", out.getvalue())
+        self.assertIn("ACTION INDEX", slim)
+        for text in (slim, sent):
+            self.assertNotIn("CAPABILITY INDEX", text)
+            self.assertNotIn("ADDITIONAL SKILL ACTIONS", text)
+
+
 if __name__ == "__main__":
     unittest.main()
