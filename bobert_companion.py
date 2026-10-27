@@ -4083,6 +4083,10 @@ _DESTRUCTIVE_REPLAY_ACTIONS = frozenset({
     "forget_screen",
     "forget_voice_line",
     "clear_tasks",
+    # A file move (v3 W15, skills/file_move.py) waits on a spoken yes every
+    # time; "do that again" never moves a second file unasked.
+    "move_file",
+    "undo_last_move",
     # run_python family: arbitrary-code execution. Never silently re-fire via
     # "do that again" or a fuzzy-typo disambiguation — force the user to
     # re-issue it so it re-routes through the run_python AST gate in
@@ -17709,6 +17713,7 @@ _TURN_FLAG_KEYS = (
     "PROMPT_INDEX_CANON",
     "SHUTDOWN_TWO_SENTENCE_ASK",
     "THINK_CAPABILITY_PROBE",
+    "FILE_MOVE_ENABLED",
 )
 
 
@@ -41648,6 +41653,11 @@ def _detect_preemptive_hallucination(
 # "yes" that wake-word mode drops - so the song / search / reminder never ran
 # (2026-10-01).
 _CONFIRM_FREE_TEXT_ACTIONS = frozenset(MUSIC_ACTION_NAMES) | {"web_search", "set_timer"}
+# A file move ALWAYS asks its own question naming the file and both folders
+# (_jarvis_pushback -> skills/file_move.py), and only that question's yes can
+# run it; the generic keyword prompt would get in front of it for a file name
+# like "payslip" or "transfer form" and its yes would then move nothing.
+_CONFIRM_FREE_TEXT_ACTIONS = _CONFIRM_FREE_TEXT_ACTIONS | {"move_file", "undo_last_move"}
 
 
 def _needs_confirmation(name: str, arg: str) -> bool:
@@ -42023,6 +42033,32 @@ def _scan_python_for_danger(code: str) -> str | None:
     return None
 
 
+_FILE_MOVE_CONFIRM_ACTIONS = frozenset({"move_file", "undo_last_move"})
+
+
+def _file_move_question(name: str, arg: str) -> tuple | None:
+    """(question, reason, queued_arg) from skills/file_move.py's
+    confirm_question, or None when the skill is not loaded or has nothing to
+    ask. queued_arg is the request plus the plan's one-shot nonce (the
+    did-you-mean third element): only the yes to THIS question carries it,
+    so only that yes can run the plan. A skill answer without one still
+    asks, but its yes then finds no plan and moves nothing. Never raises."""
+    try:
+        mod = sys.modules.get("skill_file_move")
+        fn = getattr(mod, "confirm_question", None) if mod else None
+        if not callable(fn):
+            return None
+        got = fn(name, arg or "")
+        if (isinstance(got, tuple) and len(got) >= 2
+                and isinstance(got[0], str) and got[0].strip()):
+            if len(got) > 2 and isinstance(got[2], str) and got[2].strip():
+                return (got[0], str(got[1]), got[2])
+            return (got[0], str(got[1]))
+    except Exception as _fme:
+        print(f"  [file-move] question failed: {_fme}")
+    return None
+
+
 def _jarvis_pushback(name: str, arg: str) -> tuple | None:
     """Return (objection_line, reason) if this action deserves an in-character
     objection before running. None means proceed without confirmation. The
@@ -42072,6 +42108,15 @@ def _jarvis_pushback(name: str, arg: str) -> tuple | None:
         _dym = _close_name_question(nm, arg)
         if _dym is not None:
             return _dym
+
+    # A file move (v3 W15, skills/file_move.py) ALWAYS waits on a spoken yes,
+    # so it asks with PUSHBACK_ENABLED off too. The skill builds the question
+    # (the file and both folders) and holds the plan the yes runs; without
+    # that plan the action moves nothing. None = nothing to ask: the request
+    # did not resolve (not found / refused / which-one), and the action
+    # itself then says why - moving nothing.
+    if nm in _FILE_MOVE_CONFIRM_ACTIONS:
+        return _file_move_question(nm, arg)
 
     if not PUSHBACK_ENABLED:
         return None

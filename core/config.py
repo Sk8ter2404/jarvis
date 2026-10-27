@@ -305,6 +305,13 @@ SERVER_WATCH_NAME = "server"
 SERVER_WATCH_SSH = ""
 SERVER_WATCH_POLL_S = 300.0
 
+# ─── File moves (skills/file_move.py, v3 W15) ──────────────────────────
+# move_file / undo_last_move: move ONE file between the owner's folders (the
+# user profile and D:\Nextcloud), only after a spoken yes, never overwriting
+# and never deleting. False = neither action is registered (today's
+# behaviour: no file-move action at all).
+FILE_MOVE_ENABLED = True
+
 # ─── Local prompt-prefix stability (2026-09-29) ────────────────────────
 # The local model re-evaluates the WHOLE prompt (~3 s for ~12k tokens,
 # measured) whenever the system prompt changes between turns; an unchanged
