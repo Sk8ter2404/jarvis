@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v2.0.231 (2026-10-26)
+
+Fixes from tonight's live log: habit offers no longer announce a wrong time ('Around this time on Mondays, sir' instead of 'It's Monday 7 PM' at 8 PM); 'play X on YouTube on the left monitor' plays it and moves it there instead of opening a search page; 'play my song from earlier / play that again' replays your last music or video request instead of searching for a song called 'Earlier'; 'tell Claude to ...', '..., or tell Claude to do it' and 'pass it over to Claude' save a note for Claude instead of 'I can't' and a web search.
+
 ## v2.0.230 (2026-10-20)
 
 JARVIS knows he is one copy that moves between your machines. On the desktop right after a day on the Dell he said 'I've never quite made myself at home in the Dell, sir' and then 'a bit of a squeeze in this laptop': his prompt said 'there may be other versions of you running in other rooms' and never named the machine. With a handoff partner he is now told he is ONE JARVIS, which machine he is running on (new machine-local MACHINE_NAME: desktop / Dell laptop), and that 'On the Dell laptop' memories are his own time there.

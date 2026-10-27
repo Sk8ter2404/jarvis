@@ -619,10 +619,14 @@ def _phrase_for(pattern: dict) -> str:
     hour   = pattern.get("hour", -1)
     ratio  = pattern.get("ratio", 0.0)
 
-    # When we have a representative hour, prefer the more specific
-    # "It's Friday 9 PM, sir" phrasing over the bucket-only fallback.
-    hour_str = _format_hour_12h(hour) if isinstance(hour, int) else ""
-    when = f"{dow} {hour_str}" if hour_str else f"{dow} {label}"
+    # The pattern's hour is when the habit USUALLY happens, not the time now:
+    # live 2026-10-26 20:04 (a Monday) "It's Monday 7 PM, sir - you usually
+    # ask me to check the screen around now" -> "Jarvis, it's not 7 p.m.".
+    # The offer names the habit ("around this time on Mondays"), never a
+    # clock time; the bucket ("on Monday evenings") when no hour is known.
+    hour_known = isinstance(hour, int) and 0 <= hour <= 23
+    when = (f"Around this time on {dow}s" if hour_known
+            else f"On {dow} {label}s")
 
     # Very high confidence collapses to the spec's "shall I queue the usual?"
     # — only kicks in for play patterns, since "the usual" implies media.
@@ -630,21 +634,21 @@ def _phrase_for(pattern: dict) -> str:
 
     if cat == "play" and target:
         if usual:
-            return f"It's {when}, sir — shall I queue the usual?"
-        return (f"It's {when}, sir — shall I queue the "
-                f"{_title(target)} essentials?")
+            return f"{when}, sir, you like the usual. Shall I queue it?"
+        return (f"{when}, sir, you usually put on {_title(target)}. "
+                f"Shall I queue the essentials?")
     if cat == "open" and target:
-        return (f"It's {when}, sir — shall I open {_title(target)} "
-                f"for you?")
+        return (f"{when}, sir, you usually open {_title(target)}. "
+                f"Shall I open it for you?")
     if cat == "search" and target:
-        return (f"It's {when}, sir — would you like me to pull up "
-                f"{_title(target)}?")
+        return (f"{when}, sir, you usually look up {_title(target)}. "
+                f"Would you like me to pull it up?")
     if cat == "screen":
-        return (f"It's {when}, sir — you usually ask me to check "
-                f"the screen around now. Shall I take a look?")
+        return (f"{when}, sir, you usually ask me to check the screen. "
+                f"Shall I take a look?")
     if cat == "timer":
-        return (f"It's {when}, sir — you usually set a timer around "
-                f"now. Shall I start one?")
+        return (f"{when}, sir, you usually set a timer. "
+                f"Shall I start one?")
     if cat == "app_usage" and target:
         # 'You typically check Teams around now — anything I should peek at?'
         return (f"You typically check {target} around now, sir — "

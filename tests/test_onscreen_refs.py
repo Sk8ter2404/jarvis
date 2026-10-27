@@ -200,6 +200,21 @@ class ClaudeNoteTests(unittest.TestCase):
         n2 = O.claude_note(LIVE_NOTE_2)
         self.assertTrue(n2 and "watch" in n2, n2)
 
+    def test_the_hours_hand_off_is_a_note(self):
+        # Live 2026-10-26 20:06-20:07: "I can't do that, sir", then a
+        # web_search for "how to log hours for work" - nothing was noted.
+        self.assertEqual(O.claude_note("Jarvis, go ahead and put my hours in "
+                                       "for me, or tell Claude to do it."),
+                         "put my hours in for me")
+        self.assertTrue(O.claude_note("Jarvis passed it over to Claude. It "
+                                      "already knows how."))
+        self.assertEqual(O.claude_note("tell Claude to put my hours in"),
+                         "put my hours in")
+        # Still not notes: a greeting, a question or a job for the cloud brain.
+        for t in ("tell Claude hi", "ask Claude what time it is in Tokyo",
+                  "have Claude review my essay"):
+            self.assertIsNone(O.claude_note(t), t)
+
     def test_other_shapes(self):
         self.assertEqual(O.claude_note("leave Claude a note: the click is off"),
                          "the click is off")

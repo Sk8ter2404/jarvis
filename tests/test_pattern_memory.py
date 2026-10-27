@@ -289,5 +289,33 @@ class PeerSessionMergeTests(unittest.TestCase):
                          ["Here: y", "On the Dell laptop: x"])
 
 
+class HabitOfferWordingTests(unittest.TestCase):
+    """Live 2026-10-26 20:04 (a Monday): "It's Monday 7 PM, sir - you
+    usually ask me to check the screen around now" -> "Jarvis, it's not 7
+    p.m.". The pattern's hour is when the habit usually happens; the offer
+    names the habit and never states a clock time."""
+
+    def _phrase(self, **kw):
+        p = {"category": "screen", "target": "", "dow": "Monday",
+             "bucket": "evening", "hour": 19, "ratio": 0.5}
+        p.update(kw)
+        return pattern_memory._phrase_for(p)
+
+    def test_no_offer_states_a_clock_time(self):
+        for cat, target in (("screen", ""), ("timer", ""), ("play", "jazz"),
+                            ("open", "teams"), ("search", "the news")):
+            with self.subTest(cat=cat):
+                line = self._phrase(category=cat, target=target)
+                self.assertTrue(line.startswith("Around this time on Mondays, sir"), line)
+                self.assertNotIn("7 PM", line)
+                self.assertNotIn("It's", line)
+
+    def test_without_an_hour_it_names_the_part_of_the_day(self):
+        line = self._phrase(hour=-1)
+        self.assertTrue(line.startswith("On Monday evenings, sir"), line)
+
+    def test_the_question_survives_for_his_answer(self):
+        self.assertTrue(self._phrase().endswith("Shall I take a look?"))
+
 if __name__ == "__main__":
     unittest.main()

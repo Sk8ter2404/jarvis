@@ -144,18 +144,34 @@ _YT_VAGUE_OBJECTS = frozenset({
     "this video", "this song",
 })
 _YT_ROUTE_MAX_ARG = 150
+# A trailing monitor (live 2026-10-26 20:05, "Jarvis play famous last words on
+# YouTube on the left monitor"): the route did not claim it, and the model
+# followed WINDOW MANAGEMENT's search example - open_on_monitor with a YouTube
+# SEARCH - so the results page opened and nothing played. Now: play it, then
+# move its window to that monitor (move_window_to_monitor, title "youtube").
+_YT_MONITOR_TAIL_RE = re.compile(
+    r"\s+(?:on|to)\s+(?:the\s+|my\s+)?(left|right|middle|center|centre|top|"
+    r"bottom|main|primary|second|other)(?:\s+(?:monitor|screen|display))?$",
+    re.IGNORECASE)
 
 
 def youtube_play_route(utterance) -> str | None:
     """``"[ACTION: youtube_play, <X>]"`` for a whole "play <X> on YouTube"
     request (Whisper's "plays" and a leading wake word / "can you" / "please"
-    included), else None. Never raises."""
+    included), else None. "... on YouTube on the left monitor" adds
+    ``[ACTION: move_window_to_monitor, youtube | left]`` after it. Never
+    raises."""
     try:
         if not isinstance(utterance, str) or not utterance.strip():
             return None
         s = _YT_WAKE_LEAD_RE.sub("", utterance, count=1)
         s = _strip_lead_filler(s)
         s = " ".join(_strip(s).split())
+        monitor = ""
+        mon = _YT_MONITOR_TAIL_RE.search(s)
+        if mon:
+            monitor = mon.group(1).lower()
+            s = s[:mon.start()].rstrip(" ,")
         m = _YT_PLAY_RE.match(s)
         if not m:
             return None
@@ -169,6 +185,9 @@ def youtube_play_route(utterance) -> str | None:
                 or len(query) > _YT_ROUTE_MAX_ARG
                 or any(c in query for c in "[]\r\n")):
             return None
+        if monitor:
+            return (f"[ACTION: youtube_play, {query}] "
+                    f"[ACTION: move_window_to_monitor, youtube | {monitor}]")
         return f"[ACTION: youtube_play, {query}]"
     except Exception:
         return None

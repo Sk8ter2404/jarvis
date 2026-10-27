@@ -4190,6 +4190,13 @@ def record_action_history(action_name: str, arg: str, result: str) -> None:
     """
     if _is_draft_send(action_name):
         return
+    # "Play my song from earlier" (2026-10-26): the last media REQUEST is kept
+    # apart from this 5-deep deque, which screenshots and searches flush.
+    try:
+        from core import media_recall as _media_recall
+        _media_recall.record(action_name, arg)
+    except Exception:
+        pass
     with _action_history_lock:
         _action_history.append({
             "action": action_name,
@@ -36099,6 +36106,16 @@ def _utterance_route_reply(text: str) -> "str | None":
     if _yt_tok:
         print("  [route] play on YouTube -> youtube_play")
         return _yt_tok
+    # "Play my song from earlier" (live 2026-10-26 20:08: the brain played a
+    # track literally titled "Earlier"): the last media request, replayed.
+    try:
+        from core import media_recall as _media_recall
+        _mr_tok = _media_recall.recall_route(text)
+    except Exception:
+        _mr_tok = None
+    if _mr_tok:
+        print(f"  [route] the song from earlier -> {_mr_tok[:80]}")
+        return _mr_tok
     # BUILT-IN route (S2, 2026-10-02): a whole "find / play <title> on
     # <service>" request -> play_streaming / streaming_search with the
     # VERIFIED links (core/streaming_search.py). Live 16:13:15 the budget

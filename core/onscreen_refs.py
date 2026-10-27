@@ -644,13 +644,24 @@ _CLAUDE_NOTE_DIRECT_RE = re.compile(
 # well." got "I'll ensure the context is fully integrated" and NOTHING was
 # noted). The note is what came BEFORE the hand-off; the note records the
 # session-log position, so "that" can be read back in context.
+# Live 2026-10-26 20:07: "Jarvis passed it over to Claude. It already knows
+# how." (Whisper's "passed" for "pass", and a sentence after it) ran a
+# web_search instead: the past-tense verbs and a trailing sentence count too.
 _CLAUDE_PASS_RE = re.compile(
-    r"\b(?:pass|send|forward|hand|give|relay)\s+"
+    r"\b(?:pass|passed|send|sent|forward|forwarded|hand|handed|give|gave|"
+    r"relay|relayed)\s+"
     r"(?:that|this|it|them|those|these|all\s+(?:of\s+)?(?:that|this))\s+"
     r"(?:over\s+|along\s+|on\s+)?to\s+claude\b"
-    r"(?:\s+(?:as\s+well|too|also))?[\s.!?]*$", re.IGNORECASE)
+    r"(?:\s+(?:as\s+well|too|also))?(?:[\s.!?]*$|[.!?]\s+.*$)", re.IGNORECASE)
 _PASS_REFERS_BACK = ("what I asked just before this (the session log at this "
                      "note has the conversation)")
+# "Put my hours in for me, or tell Claude to DO IT" (live 2026-10-26 20:06):
+# the task is the clause before the hand-off.
+_CLAUDE_DO_IT_RE = re.compile(
+    r"^(?:do|handle|take\s+care\s+of|deal\s+with|sort\s+out)\s+"
+    r"(?:it|that|this|them)\b[\s.!?]*$", re.IGNORECASE)
+_BEFORE_TELL_RE = re.compile(
+    r"[\s,;:-]*(?:\b(?:or|and|so|then)\s+)?(?:just\s+)?$", re.IGNORECASE)
 _TASK_VERB_RE = re.compile(
     r"\b(?:research|fix|fixes|fixing|look\s+into|work\s+on|improve|change|add|"
     r"make|build|learn|study|investigate|figure\s+out|debug|update|check|"
@@ -704,8 +715,12 @@ def claude_note(text) -> "str | None":
         m = _CLAUDE_NOTE_RE.search(s)
         if not m:
             return None
-        rest = m.group("rest").strip(" :,.")
-        rest = re.sub(r"^(?:to|that|about)\s+", "", rest, flags=re.IGNORECASE)
+        raw = m.group("rest").strip(" :,.")
+        # "tell Claude TO <x>" is an instruction for Claude whatever <x> is
+        # (2026-10-26: "tell Claude to put my hours in" was no note because
+        # hours are not about JARVIS). "tell Claude hi" still is not.
+        told_to = bool(re.match(r"to\s+", raw, re.IGNORECASE))
+        rest = re.sub(r"^(?:to|that|about)\s+", "", raw, flags=re.IGNORECASE)
         rest = re.sub(r"^(?:go\s+ahead\s+and\s+|go\s+and\s+|please\s+)+", "",
                       rest, flags=re.IGNORECASE)
         if not rest:
@@ -715,7 +730,16 @@ def claude_note(text) -> "str | None":
             # Claude asked to DO something: a developer note only when it
             # is about JARVIS or his workings.
             return rest if _DEV_TOPIC_RE.search(rest) else None
-        if _TASK_VERB_RE.search(rest) or _ABOUT_JARVIS_RE.search(rest):
+        if _CLAUDE_DO_IT_RE.match(rest):
+            # "..., or tell Claude to do it": the task came first.
+            before = _BEFORE_TELL_RE.sub("", s[:m.start()]).strip(" ,.;:!?")
+            before = re.sub(r"^(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*",
+                            "", before, flags=re.IGNORECASE).strip()
+            before = re.sub(r"^(?:go\s+ahead\s+and\s+|please\s+)+", "", before,
+                            flags=re.IGNORECASE).strip()
+            return before or _PASS_REFERS_BACK
+        if (told_to or _TASK_VERB_RE.search(rest)
+                or _ABOUT_JARVIS_RE.search(rest)):
             return rest
     except Exception:
         return None

@@ -70,12 +70,29 @@ class YouTubePlayRouteTests(unittest.TestCase):
                 "play lofi beats",                         # no service named
                 "play lofi beats on Spotify",              # another service
                 "play lofi beats on YouTube Music",        # another service
-                "play lofi beats on youtube on the left monitor",  # extra clause
+                "play lofi beats on youtube on the kitchen monitor",  # unknown
+                "play it on youtube on the left monitor",  # vague object
                 "open youtube",
                 "",
                 None):
             with self.subTest(text=text):
                 self.assertIsNone(_route(text))
+
+    def test_a_monitor_at_the_end_plays_then_moves_the_window(self):
+        # Live 2026-10-26 20:05: this went to the model, which opened a
+        # YouTube SEARCH on the left monitor and nothing played.
+        move = "[ACTION: move_window_to_monitor, youtube | {}]"
+        for text, query, mon in (
+                ("Jarvis play famous last words on YouTube on the left monitor.",
+                 "famous last words", "left"),
+                ("play lofi beats on youtube on my top screen", "lofi beats", "top"),
+                ("put on chill music on youtube to the main display",
+                 "chill music", "main"),
+                ("play lofi beats on youtube on the middle", "lofi beats", "middle")):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    _route(text),
+                    f"[ACTION: youtube_play, {query}] " + move.format(mon))
 
     def test_route_token_is_well_formed_and_bounded(self):
         token = _route("play " + "x" * 400 + " on youtube")
