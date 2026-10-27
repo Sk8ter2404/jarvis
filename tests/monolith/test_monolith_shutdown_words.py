@@ -382,8 +382,11 @@ class ReviewRoutingTests(_Base):
             "Shut down? No updates?", "Shut down. Not updating.",
             "Jarvis, power off, no updates.",
             "Jarvis, shut down without updating?",
-            "Jarvis, shut down without updating.",
-            "Jarvis, shut down. No, overnight protocol."))
+            "Jarvis, shut down without updating."))
+        # "Jarvis, shut down. No, overnight protocol." moved (v3 W08): it
+        # now ASKS the overnight question (never shuts down at once), and
+        # with SHUTDOWN_TWO_SENTENCE_ASK off still goes to the model -
+        # tests/monolith/test_monolith_shutdown_two_sentence.py.
 
     def test_the_overnight_protocol_by_name_starts_it(self):
         self._expect("A", "OVERNIGHT", (
