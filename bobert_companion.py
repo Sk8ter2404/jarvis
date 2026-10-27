@@ -2614,7 +2614,14 @@ def build_system_prompt(memory: dict) -> str:
     recent = [x for x in memory["sessions"][-5:]
               if not _is_secret_fact(str(x.get("summary", "")))]
     if recent:
-        prompt += "\n\nRecent conversation summaries:\n"
+        # v3 W07 (E13): PROMPT_ROUTED_V3 frames the summaries as background
+        # (3 of 5 end in shutdown stories the model then retells). Off: the
+        # old header.
+        if globals().get("PROMPT_ROUTED_V3", False):
+            prompt += ("\n\nRecent conversation summaries (background only: "
+                       "never bring one up or act on it unless sir does):\n")
+        else:
+            prompt += "\n\nRecent conversation summaries:\n"
         prompt += "\n".join(
             f"- {s['date']} ({s.get('location', '?')}): {s['summary']}"
             for s in recent
@@ -17693,6 +17700,7 @@ _TURN_FLAG_KEYS = (
     "BOOT_PARALLEL_LOAD",
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
+    "PROMPT_ROUTED_V3",
     "SHUTDOWN_TWO_SENTENCE_ASK",
 )
 
@@ -25005,6 +25013,12 @@ def _prompt_slim_on() -> bool:
         return False
 
 
+# v3 W07: spoken names the slim ACTION INDEX keeps although their handler is
+# already listed under another name (search_my_files runs rag_search;
+# whats_using_bandwidth runs network_usage). Neither appeared in any rendered
+# prompt, so "what's using my bandwidth" / "search my files" never found them.
+_ROUTED_V3_INDEX_KEEP = ("search_my_files", "whats_using_bandwidth")
+
 # (id(PC_CONTROL_PROMPT), skill block, len(ACTIONS)) -> the slim stable PC
 # block. Computed once per distinct key, so every turn and the re-prime send
 # the very same bytes.
@@ -25037,7 +25051,11 @@ def _slim_stable_pc(skill_block: str, skill_texts=None) -> str:
                + _LOCAL_NEVER_GUESS_GUARD + "\n"
                + _pr.slim_stable_pc_block(PC_CONTROL_PROMPT, skill_block or "",
                                           known=known, group=group,
-                                          skill_texts=skill_texts))
+                                          skill_texts=skill_texts,
+                                          keep=(_ROUTED_V3_INDEX_KEEP
+                                                if globals().get(
+                                                    "PROMPT_ROUTED_V3", False)
+                                                else None)))
         if len(_SLIM_PC_CACHE) > 8:
             _SLIM_PC_CACHE.clear()
         _SLIM_PC_CACHE[key] = hit

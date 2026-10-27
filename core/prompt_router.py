@@ -1821,7 +1821,7 @@ def split_skill_examples(block: str,
 
 def slim_stable_pc_block(pc_control: str, skill_block: str = "",
                          known=None, exclude=None, group=None,
-                         skill_texts=None) -> str:
+                         skill_texts=None, keep=None) -> str:
     """The SLIM byte-stable PC block: the core preamble + the always-on
     sections (as stable_pc_block) + an ACTION INDEX naming every action the
     full PC_CONTROL text and ``skill_block`` document, under the capability
@@ -1832,7 +1832,10 @@ def slim_stable_pc_block(pc_control: str, skill_block: str = "",
     alias of a name already listed or in the head runs the very same code,
     so it is left out. ``skill_texts``: see split_skill_examples. Every
     section header is listed, with or without actions, so no capability
-    vanishes. Pure function of its inputs. Never raises: a fault falls back to
+    vanishes. ``keep`` (optional names; v3 W07): spoken names that stay in the
+    index even though they share a handler with a name already listed (an
+    alias the model is taught to say, e.g. search_my_files). Pure function of
+    its inputs. Never raises: a fault falls back to
     stable_pc_block."""
     try:
         excl = set(SELF_TERMINATING_ACTIONS if exclude is None else exclude)
@@ -1843,6 +1846,7 @@ def slim_stable_pc_block(pc_control: str, skill_block: str = "",
         always = [b for h, b in sections if h.strip().upper() in pinned]
         head_text = "\n".join([core] + always)
         group = group or {}
+        keep = frozenset(keep or ())
         listed = set(documented_actions(head_text, known)) | excl
         handlers = {group[n] for n in listed if n in group}
         rows: List[str] = []
@@ -1852,7 +1856,8 @@ def slim_stable_pc_block(pc_control: str, skill_block: str = "",
         for name, body in groups:
             acts = []
             for a in documented_actions(body, known):
-                if a in listed or (a in group and group[a] in handlers):
+                if a in listed or (a in group and group[a] in handlers
+                                   and a not in keep):
                     continue
                 acts.append(a)
                 listed.add(a)

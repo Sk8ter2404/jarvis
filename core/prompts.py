@@ -3283,3 +3283,65 @@ PC_CONTROL_PROMPT = (
     "SHUTDOWN ALIASES (all route to the same graceful power-down as shutdown_jarvis):\n"
     "  Aliases: exit_jarvis, quit_jarvis, turn_off_jarvis, power_off_jarvis, shut_down\n"
 )
+
+
+# ─── Prompt v3 routed sections (v3 overhaul W07) ─────────────────────────
+# PROMPT_ROUTED_V3 (core/config.py) fixes wrong-but-registered choices the
+# routed sections themselves teach (report 06, E11): a whole noun phrase as a
+# click target, "turn on all ..." read as a list request, open_url with a
+# guessed address, a monitor PLAY taught as a search, "pause the video" sent
+# to a track skip, "read the results" sent to screenshot. Like the W03 swaps
+# these are exact text swaps applied once at import: off, every byte is as
+# before; a swap whose old text is missing is skipped
+# (tests/test_prompt_routed_v3.py fails instead).
+
+
+def _routed_v3_on() -> bool:
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "PROMPT_ROUTED_V3", False))
+    except Exception:
+        return False
+
+
+_ROUTED_V3_SWAPS = (
+    # BASIC open_url: a URL sir said, or a site you are certain of.
+    ("                                  play_streaming / streaming_search)\n",
+     "                                  play_streaming / streaming_search)\n"
+     "                                  Only a URL sir said or a site you are\n"
+     "                                  certain of; otherwise web_search.\n"),
+    # MULTI-MONITOR: lead with PLAY versus SEARCH.
+    ("MULTI-MONITOR APP LAUNCHING:\n",
+     "MULTI-MONITOR APP LAUNCHING:\n"
+     "  PLAY on a monitor = youtube_play, then move_window_to_monitor.\n"
+     "  A SEARCH on a monitor = open_on_monitor, <monitor> | youtube <query>\n"
+     "  (plays nothing).\n"),
+    # UI AUTOMATION: short click targets.
+    ("    'click that MrBeast video'   → [ACTION: click, the MrBeast video]\n",
+     "    'click that MrBeast video'   → [ACTION: click, MrBeast video]\n"),
+    ("    asks which one, stop: sir answers.\n",
+     "    asks which one, stop: sir answers.\n"
+     "    Target = the distinctive words only: drop 'that', 'the', 'for me'\n"
+     "    and any 'on the X monitor'.\n"),
+    # SMART HOME: the verb decides.
+    ("    white', 'turn off all the lights'.\n",
+     "    white', 'turn off all the lights', 'turn on all the smart home\n"
+     "    devices'.\n"
+     "    The verb decides: turn on / off / dim / set = smart_home_control;\n"
+     "    only 'what / list ... do I have' is a list request.\n"),
+    # MUSIC + VIDEO PLAYBACK: pause is a pause, never a track skip.
+    ("    explicit 'press the play/pause key' request only — never a fallback.\n",
+     "    explicit 'press the play/pause key' request only — never a fallback.\n"
+     "    'pause the video' / 'pause it' → [ACTION: pause_music]; media_prev\n"
+     "    and media_next are track skips, never a pause.\n"),
+    # SCREEN VISION: reading results is see_screen.
+    ("never pass a file name to see_screen.\n\n",
+     "never pass a file name to see_screen.\n"
+     "    'read the results' / 'is the video playing' → [ACTION: see_screen,\n"
+     "    <that question>], never screenshot.\n\n"),
+)
+
+# Pre-W07 text, kept whole: the off path (and tests) read this.
+PC_CONTROL_PROMPT_V2 = PC_CONTROL_PROMPT
+if _routed_v3_on():
+    PC_CONTROL_PROMPT = _apply_swaps(PC_CONTROL_PROMPT, _ROUTED_V3_SWAPS)

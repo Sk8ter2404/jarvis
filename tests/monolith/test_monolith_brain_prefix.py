@@ -178,7 +178,7 @@ class PromptLayoutTests(_Base):
         self.assertTrue(prompt.startswith(head))
         tail = prompt[len(head):]
         marks = ["What you know about your owner:", "Projects picked up",
-                 "Recent conversation summaries:", "Topics picked up",
+                 "Recent conversation summaries", "Topics picked up",
                  "you've known your owner for"]
         at = [tail.find(m) for m in marks]
         self.assertNotIn(-1, at, tail[:400])
