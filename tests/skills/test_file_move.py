@@ -84,9 +84,11 @@ def _quiet(fn, *a, **k):
 
 
 def ask_and_yes(name, arg):
-    """The confirm path in miniature: the dry run, then the action."""
+    """The confirm path in miniature: the dry run, then the action called
+    with the argument the question queued (the request + the plan's nonce)."""
     q = _quiet(FM.confirm_question, name, arg)
-    res = _quiet(FM.move_file if name == "move_file" else FM.undo_last_move, arg)
+    res = _quiet(FM.move_file if name == "move_file" else FM.undo_last_move,
+                 q[2] if q else arg)
     return q, res
 
 
@@ -301,7 +303,7 @@ class MoveTests(unittest.TestCase):
 
     def test_question_names_file_and_both_folders(self):
         self.p.dl("Sample CV Resume.pdf")
-        q, _why = _quiet(FM.confirm_question, "move_file", "my resume to documents")
+        q = _quiet(FM.confirm_question, "move_file", "my resume to documents")[0]
         self.assertEqual(q, "Move 'Sample CV Resume.pdf' from Downloads to Documents, sir?")
 
     def test_dry_run_touches_nothing(self):
@@ -328,10 +330,10 @@ class MoveTests(unittest.TestCase):
 
     def test_a_stale_plan_moves_nothing(self):
         src = self.p.dl("resume.pdf")
-        _quiet(FM.confirm_question, "move_file", "resume to documents")
+        q = _quiet(FM.confirm_question, "move_file", "resume to documents")
         for plan in FM._plans.values():
             plan["at"] -= FM.PLAN_TTL_S + 1
-        res = _quiet(FM.move_file, "resume to documents")
+        res = _quiet(FM.move_file, q[2])
         self.assertIn("after you've said yes", res)
         self.assertTrue(os.path.isfile(src))
 
@@ -350,19 +352,19 @@ class MoveTests(unittest.TestCase):
 
     def test_name_taken_after_the_question_moves_nothing(self):
         src = self.p.dl("resume.pdf")
-        _quiet(FM.confirm_question, "move_file", "resume to documents")
+        q = _quiet(FM.confirm_question, "move_file", "resume to documents")
         self.p.file("Documents", "resume.pdf", data=b"arrived")
-        res = _quiet(FM.move_file, "resume to documents")
+        res = _quiet(FM.move_file, q[2])
         self.assertTrue(res.startswith(T))
         self.assertIn("already in Documents", res)
         self.assertTrue(os.path.isfile(src))
 
     def test_file_changed_after_the_question_moves_nothing(self):
         src = self.p.dl("resume.pdf")
-        _quiet(FM.confirm_question, "move_file", "resume to documents")
+        q = _quiet(FM.confirm_question, "move_file", "resume to documents")
         with open(src, "ab") as f:
             f.write(b"more")
-        res = _quiet(FM.move_file, "resume to documents")
+        res = _quiet(FM.move_file, q[2])
         self.assertIn("changed since I asked", res)
         self.assertTrue(os.path.isfile(src))
 
@@ -393,9 +395,9 @@ class MoveTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows sharing rules")
     def test_open_file_fails_and_says_so(self):
         src = self.p.dl("resume.pdf")
-        _quiet(FM.confirm_question, "move_file", "resume to documents")
+        q = _quiet(FM.confirm_question, "move_file", "resume to documents")
         with open(src, "rb"):
-            res = _quiet(FM.move_file, "resume to documents")
+            res = _quiet(FM.move_file, q[2])
         self.assertTrue(res.startswith(T), res)
         self.assertIn("open or locked by another program", res)
         self.assertTrue(os.path.isfile(src))
@@ -441,6 +443,111 @@ class MoveTests(unittest.TestCase):
         self.assertIn("wrong size", FM.verify(a, b, 6))
         os.remove(a)
         self.assertEqual(FM.verify(a, b, 5), "")
+
+
+class OneShotPlanTests(unittest.TestCase):
+    """Safety review 2026-10-27: a plan runs only from the yes to the question
+    that made it - once, within PLAN_TTL_S - and a failed or newer dry run
+    for the same request never leaves an older plan armed."""
+
+    def setUp(self):
+        self.p = FakeProfile(self)
+        self.src = self.p.dl("Sample CV Resume.pdf")
+        self.docs = self.p.known["documents"]
+
+    def _ask(self, arg="resume to documents"):
+        return _quiet(FM.confirm_question, "move_file", arg)
+
+    def test_question_hands_back_a_nonce_argument(self):
+        q = self._ask()
+        req, nonce = FM.split_nonce(q[2])
+        self.assertEqual(req, "resume to documents")
+        self.assertRegex(nonce, r"^[0-9a-f]{32}$")
+        self.assertEqual(FM.split_nonce("resume to documents"),
+                         ("resume to documents", ""))
+
+    def test_plan_ttl_is_within_the_confirm_queue_ttl(self):
+        self.assertLessEqual(FM.PLAN_TTL_S, 45.0)
+
+    def test_a_plain_argument_never_picks_up_the_plan(self):
+        q = self._ask()
+        res = _quiet(FM.move_file, "resume to documents")
+        self.assertIn("after you've said yes", res)
+        self.assertTrue(os.path.isfile(self.src))
+        self.assertEqual(os.listdir(self.docs), [])
+        # ...and it did not use the plan up: the real yes still works.
+        self.assertTrue(_quiet(FM.move_file, q[2]).startswith("Done, sir"))
+
+    def test_a_plan_runs_once(self):
+        q = self._ask()
+        self.assertTrue(_quiet(FM.move_file, q[2]).startswith("Done, sir"))
+        self.assertEqual(FM._plans, {})
+        again = self.p.dl("Sample CV Resume.pdf", data=b"a new one")
+        res = _quiet(FM.move_file, q[2])
+        self.assertNotIn("Done, sir", res)
+        self.assertTrue(os.path.isfile(again))
+        self.assertEqual(os.listdir(self.docs), ["Sample CV Resume.pdf"])
+
+    def test_a_forged_or_foreign_nonce_runs_nothing(self):
+        self._ask()
+        res = _quiet(FM.move_file, "resume to documents" + FM.PLAN_TAG + "0" * 32)
+        self.assertIn("after you've said yes", res)
+        q = self._ask()
+        res = _quiet(FM.undo_last_move, FM.PLAN_TAG + FM.split_nonce(q[2])[1])
+        self.assertTrue(res.startswith(T))
+        self.assertTrue(os.path.isfile(self.src))
+
+    def test_a_failed_second_dry_run_disarms_the_first_plan(self):
+        # The reviewer's case: asked, then the request turned ambiguous.
+        q = self._ask()
+        self.p.dl("Resume old.docx")
+        self.assertIsNone(self._ask())
+        self.assertEqual(FM._plans, {})
+        res = _quiet(FM.move_file, q[2])
+        self.assertTrue(res.endswith("Which one, sir?"), res)
+        self.assertTrue(os.path.isfile(self.src))
+        self.assertEqual(os.listdir(self.docs), [])
+
+    def test_a_raising_second_dry_run_disarms_the_first_plan(self):
+        q = self._ask()
+        with mock.patch.object(FM, "plan_move", side_effect=OSError("D: busy")):
+            self.assertIsNone(self._ask())
+        self.assertEqual(FM._plans, {})
+        self.assertIn("after you've said yes", _quiet(FM.move_file, q[2]))
+        self.assertTrue(os.path.isfile(self.src))
+
+    def test_a_newer_question_replaces_the_older_plan(self):
+        q1 = self._ask()
+        q2 = self._ask("Resume  to Documents")   # same request (case/space)
+        self.assertIn("after you've said yes", _quiet(FM.move_file, q1[2]))
+        self.assertTrue(os.path.isfile(self.src))
+        self.assertTrue(_quiet(FM.move_file, q2[2]).startswith("Done, sir"))
+
+    def test_other_requests_keep_their_plans(self):
+        other = self.p.dl("invoice.pdf")
+        q1 = self._ask()
+        q2 = self._ask("invoice to the desktop")
+        self.assertTrue(_quiet(FM.move_file, q1[2]).startswith("Done, sir"))
+        self.assertTrue(_quiet(FM.move_file, q2[2]).startswith("Done, sir"))
+        self.assertFalse(os.path.exists(other))
+
+    def test_a_nonce_argument_given_to_the_dry_run_is_ignored(self):
+        q1 = self._ask()
+        q2 = self._ask(q1[2])
+        self.assertEqual(FM.split_nonce(q2[2])[0], "resume to documents")
+        self.assertIn("after you've said yes", _quiet(FM.move_file, q1[2]))
+        self.assertTrue(os.path.isfile(self.src))
+
+    def test_undo_plan_is_disarmed_by_a_failed_second_dry_run(self):
+        ask_and_yes("move_file", "resume to documents")
+        q = _quiet(FM.confirm_question, "undo_last_move", "")
+        self.assertIsNotNone(q)
+        with mock.patch.object(FM, "plan_undo", return_value=(None, "busy, sir.")):
+            self.assertIsNone(_quiet(FM.confirm_question, "undo_last_move", ""))
+        res = _quiet(FM.undo_last_move, q[2])
+        self.assertTrue(res.startswith(T), res)
+        self.assertFalse(os.path.exists(self.src))
+        self.assertTrue(os.path.isfile(os.path.join(self.docs, "Sample CV Resume.pdf")))
 
 
 class JournalAndUndoTests(unittest.TestCase):

@@ -72,8 +72,13 @@ class FileMoveConfirmTests(_Base):
         said = " ".join(self.spoken)
         self.assertIn(QUESTION, said)
         self.assertNotIn("Right away", said)
-        self.assertEqual(list(self.bc._pending_confirmation),
-                         [("move_file", "my resume to documents")])
+        # The queued argument is the request plus the plan's one-shot nonce:
+        # only this question's yes carries it (safety review 2026-10-27).
+        [(nm, queued)] = list(self.bc._pending_confirmation)
+        self.assertEqual(nm, "move_file")
+        req, nonce = FM.split_nonce(queued)
+        self.assertEqual(req, "my resume to documents")
+        self.assertTrue(nonce)
         self.spoken.clear()
         self.assertTrue(self._yes())
         self.assertFalse(os.path.exists(self.src))
@@ -118,6 +123,50 @@ class FileMoveConfirmTests(_Base):
         self.assertIn("I couldn't find a file called 'taxes' in your folders, sir.",
                       " ".join(self.spoken))
         self.assertTrue(os.path.isfile(self.src))
+
+    # ── safety review 2026-10-27: a leftover plan never runs without a yes ──
+    def _nothing_moved(self):
+        self.assertTrue(os.path.isfile(self.src), "the file moved with no yes")
+        self.assertFalse(os.path.exists(self.dest))
+        self.assertNotIn("Done", " ".join(self.spoken))
+
+    def test_no_then_an_ambiguous_reask_moves_nothing(self):
+        # The reviewer's repro: ask, 'No.', a second resume appears, the same
+        # ask again. The second dry run finds two files (no question), the
+        # dispatcher runs move_file with the plain argument - and the first
+        # plan used to be picked up and the file moved with no yes.
+        self._dispatch(ASK, REPLY)
+        self.assertTrue(self._yes("No."))
+        self.fp.dl("Resume old.docx")
+        self.spoken.clear()
+        self._dispatch(ASK, REPLY)
+        self._nothing_moved()
+        self.assertEqual(list(self.bc._pending_confirmation), [])
+        self.assertEqual(FM._plans, {})
+        self.assertIn("Which one, sir?", " ".join(self.spoken))
+
+    def test_a_failing_redispatch_before_the_yes_moves_nothing(self):
+        # Asked; before the owner answers, the same action is dispatched
+        # again and its dry run fails (D: contention / an exception). That
+        # call must not run the armed plan, and the plan must not survive
+        # for the original yes either.
+        self._dispatch(ASK, REPLY)
+        self.spoken.clear()
+        with mock.patch.object(FM, "plan_move", side_effect=OSError("D: busy")):
+            self._dispatch(ASK, REPLY)
+        self._nothing_moved()
+        self.assertEqual(FM._plans, {})
+        self._yes()
+        self._nothing_moved()
+
+    def test_a_plain_argument_dispatch_never_runs_the_plan(self):
+        # Web /api/action, the tray or a follow-up round call the action with
+        # the plain request: the armed plan is not theirs to run.
+        self._dispatch(ASK, REPLY)
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = self._actions["move_file"]("my resume to documents")
+        self.assertIn("after you've said yes", res)
+        self._nothing_moved()
 
     def test_undo_goes_through_the_same_yes(self):
         self._dispatch(ASK, REPLY)

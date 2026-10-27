@@ -32,8 +32,14 @@ SAFETY (each one has a test):
   * A SPOKEN YES, through JARVIS's own confirm queue: bobert_companion.
     _jarvis_pushback asks confirm_question() below for the question (the file
     and both folders) and queues the action on _pending_confirmation; the yes
-    runs it. confirm_question() leaves a PLAN; the action only ever executes a
-    fresh plan, so a path that skips the question moves nothing.
+    runs it. confirm_question() leaves a ONE-SHOT PLAN keyed by an
+    unguessable nonce and hands the nonce back as the argument to queue
+    (arg + PLAN_TAG + uuid4). The action runs a plan ONLY when it is called
+    with that nonce - i.e. from the queued question's yes - and only once,
+    within PLAN_TTL_S. A plain-argument call (a re-dispatch, a follow-up
+    round, the web /api/action, the tray) never picks up a plan, and every
+    new dry run for the same request disarms any older plan first, so a
+    failed or newer dry run can never leave an old plan armed.
   * Every move is journalled in data/file_moves.json (core.atomic_io).
 """
 from __future__ import annotations
@@ -44,6 +50,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 
 skill_utils = globals().get("skill_utils", {})
 
@@ -63,7 +70,12 @@ PROMPT_EXAMPLES = (
 NEXTCLOUD_ROOT = r"D:\Nextcloud"
 JOURNAL_NAME = "file_moves.json"
 JOURNAL_KEEP = 50
-PLAN_TTL_S = 120.0
+# A plan lives no longer than the confirm queue it belongs to
+# (bobert_companion.CONFIRMATION_TTL_S = 45 s).
+PLAN_TTL_S = 45.0
+# Joins the request to the plan's nonce in the queued argument. U+2063
+# (INVISIBLE SEPARATOR) never comes out of speech-to-text or the brain.
+PLAN_TAG = "⁣plan="
 SEARCH_MAX_DEPTH = 4
 SEARCH_MAX_ENTRIES = 60000
 SEARCH_MAX_S = 4.0
@@ -561,8 +573,17 @@ def _join(items: list) -> str:
 
 
 # ── plans (the dry run the yes executes) ─────────────────────────────────
+def split_nonce(arg: str):
+    """(request, nonce) - nonce '' when the argument carries none."""
+    arg = arg or ""
+    if PLAN_TAG not in arg:
+        return arg, ""
+    req, _sep, nonce = arg.rpartition(PLAN_TAG)
+    return req, nonce.strip()
+
+
 def _key(name: str, arg: str) -> tuple:
-    return (name, " ".join((arg or "").lower().split()))
+    return (name, " ".join(split_nonce(arg)[0].lower().split()))
 
 
 def _fingerprint(p: str):
@@ -637,23 +658,43 @@ def confirm_question(name: str, arg: str = ""):
     reason) and a stored plan the confirmed action will execute, or None when
     there is nothing to ask (the action then says what went wrong)."""
     nm = (name or "").strip().lower()
+    if nm not in ("move_file", "undo_last_move"):
+        return None
+    arg = split_nonce(arg)[0]
+    key = _key(nm, arg)
+    # Disarm FIRST: a new dry run for this request - whatever it finds -
+    # never leaves an older plan for it armed.
+    _disarm(key)
     try:
         if nm == "move_file":
             plan, _why = plan_move(arg)
-        elif nm == "undo_last_move":
-            plan, _why = plan_undo()
         else:
-            return None
+            plan, _why = plan_undo()
     except Exception as e:
         print(f"  [file-move] dry run failed: {e}")
+        _disarm(key)
         return None
     if plan is None:
         with _lock:
-            _failures[_key(nm, arg)] = (_why, time.monotonic())
+            _failures[key] = (_why, time.monotonic())
+        _disarm(key)
         return None
+    nonce = uuid.uuid4().hex
+    plan["name"] = nm
+    plan["key"] = key
     with _lock:
-        _plans[_key(nm, arg)] = plan
-    return question_for(plan), f"{nm}: {plan['src']} -> {plan['dest_dir']}"
+        _plans[nonce] = plan
+    return (question_for(plan), f"{nm}: {plan['src']} -> {plan['dest_dir']}",
+            f"{arg}{PLAN_TAG}{nonce}")
+
+
+def _disarm(key: tuple) -> None:
+    """Drop every plan for this request, and every lapsed plan."""
+    now = time.monotonic()
+    with _lock:
+        for n in [n for n, p in _plans.items()
+                  if p.get("key") == key or now - p.get("at", 0.0) > PLAN_TTL_S]:
+            _plans.pop(n, None)
 
 
 def _recent_failure(name: str, arg: str):
@@ -666,10 +707,15 @@ def _recent_failure(name: str, arg: str):
     return None
 
 
-def _take_plan(name: str, arg: str):
+def _take_plan(name: str, nonce: str):
+    """The plan the queued question's yes carries (one-shot), or None. A
+    call without the nonce never gets one."""
+    if not nonce:
+        return None
     with _lock:
-        plan = _plans.pop(_key(name, arg), None)
-    if plan and time.monotonic() - plan["at"] <= PLAN_TTL_S:
+        plan = _plans.pop(nonce, None)
+    if (plan and plan.get("name") == name
+            and time.monotonic() - plan["at"] <= PLAN_TTL_S):
         return plan
     return None
 
@@ -841,7 +887,8 @@ _NO_YES = ("I only move files after you've said yes to my question, sir. "
 
 
 def move_file(arg: str = "") -> str:
-    plan = _take_plan("move_file", arg)
+    arg, nonce = split_nonce(arg)
+    plan = _take_plan("move_file", nonce)
     if plan is None:
         why = _recent_failure("move_file", arg)
         fresh = None
@@ -854,7 +901,8 @@ def move_file(arg: str = "") -> str:
 
 
 def undo_last_move(arg: str = "") -> str:
-    plan = _take_plan("undo_last_move", arg)
+    arg, nonce = split_nonce(arg)
+    plan = _take_plan("undo_last_move", nonce)
     if plan is None:
         why = _recent_failure("undo_last_move", arg)
         fresh = None

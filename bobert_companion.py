@@ -41446,8 +41446,12 @@ _FILE_MOVE_CONFIRM_ACTIONS = frozenset({"move_file", "undo_last_move"})
 
 
 def _file_move_question(name: str, arg: str) -> tuple | None:
-    """(question, reason) from skills/file_move.py's confirm_question, or
-    None when the skill is not loaded or has nothing to ask. Never raises."""
+    """(question, reason, queued_arg) from skills/file_move.py's
+    confirm_question, or None when the skill is not loaded or has nothing to
+    ask. queued_arg is the request plus the plan's one-shot nonce (the
+    did-you-mean third element): only the yes to THIS question carries it,
+    so only that yes can run the plan. A skill answer without one still
+    asks, but its yes then finds no plan and moves nothing. Never raises."""
     try:
         mod = sys.modules.get("skill_file_move")
         fn = getattr(mod, "confirm_question", None) if mod else None
@@ -41456,6 +41460,8 @@ def _file_move_question(name: str, arg: str) -> tuple | None:
         got = fn(name, arg or "")
         if (isinstance(got, tuple) and len(got) >= 2
                 and isinstance(got[0], str) and got[0].strip()):
+            if len(got) > 2 and isinstance(got[2], str) and got[2].strip():
+                return (got[0], str(got[1]), got[2])
             return (got[0], str(got[1]))
     except Exception as _fme:
         print(f"  [file-move] question failed: {_fme}")
