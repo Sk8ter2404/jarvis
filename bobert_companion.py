@@ -42409,6 +42409,43 @@ def _action_aliases_on() -> bool:
         return False
 
 
+def _apply_action_aliases(reply: str) -> str:
+    """``reply`` with every [ACTION: <invented>, arg] tag that has an exact
+    row in core.action_aliases renamed to its real action, so the
+    reply-level gates that match on tag names (_enforce_close_then_open,
+    _enforce_named_close, _enforce_onscreen_reference) see the real name:
+    [ACTION: play_video, that video] must still become a click on the video
+    already on screen, and [ACTION: open_app, Spotify] in a "close that and
+    open Spotify" turn must still get close_last_opened before it (review
+    2026-10-27). Only the name changes; the argument and the text around it
+    stay byte-for-byte. Unchanged when ACTION_ALIASES is off. The same step
+    in _runner stays as a backstop. Never raises."""
+    try:
+        if not reply or not _action_aliases_on():
+            return reply
+        out, last, changed = [], 0, False
+        for m in _ACTION_RE.finditer(reply):
+            src = m.group(1).strip().lower()
+            if src in ACTIONS:
+                continue
+            target = _action_aliases.alias_for(
+                src, (m.group(2) or "").strip(), ACTIONS)
+            if not target:
+                continue
+            print(f"  [alias] {src} -> {target}")
+            out.append(reply[last:m.start(1)])
+            out.append(target)
+            last = m.end(1)
+            changed = True
+        if not changed:
+            return reply
+        out.append(reply[last:])
+        return "".join(out)
+    except Exception as _e:
+        print(f"  [alias] reply-level rewrite failed: {type(_e).__name__}")
+        return reply
+
+
 # The actions a brain picks for "that video" when it does not know the
 # thing is already on screen (live 00:28:23: youtube_play).
 _ONSCREEN_REWRITE_ACTIONS = frozenset({"youtube_play", "youtube", "open_url",
@@ -42550,6 +42587,9 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # "Close that and open X instead" (S1, 2026-10-02) - see
     # _enforce_close_then_open: the close of what JARVIS opened last runs
     # BEFORE the open, even when the brain wrote only the open.
+    # (v3 W04: invented names with an exact alias row are renamed first, so
+    # these gates see open_app as launch_app and play_video as youtube_play.)
+    reply = _apply_action_aliases(reply)
     reply = _enforce_close_then_open(reply)
     # ... and the other direction (2026-10-05): a close the owner NAMED is
     # close_window, never close_last_opened (_enforce_named_close).
@@ -42613,7 +42653,9 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             # Exact invented-name table (v3 W04, core/action_aliases.py):
             # read_screen -> see_screen, pause -> media_playpause, ... No
             # scoring; every row targets a safe action, and every gate below
-            # still runs on the rewritten name.
+            # still runs on the rewritten name. Backstop only: the reply-level
+            # pass (_apply_action_aliases) already renamed the tags before the
+            # close-then-open / named-close / on-screen gates.
             _alias = _action_aliases.alias_for(name, arg, ACTIONS)
             if _alias:
                 print(f"  [alias] {name} -> {_alias}")

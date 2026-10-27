@@ -117,6 +117,71 @@ class AliasRewriteTests(_Base):
 
 
 @requires_monolith
+class ReplyLevelGateTests(_Base):
+    """Review 2026-10-27: the alias runs at REPLY level before the gates
+    that match on tag names, so an invented open / play name still gets the
+    close-then-open and on-screen rewrites its real name would get."""
+
+    def setUp(self):
+        super().setUp()
+        self.order: list = []
+        self.click = mock.Mock(return_value="clicked it")
+        self.acts["click_on_screen"] = self.click
+        self.acts["close_last_opened"] = mock.Mock(
+            side_effect=lambda *a, **k: self.order.append("close") or "closed")
+        self.acts["launch_app"] = mock.Mock(
+            side_effect=lambda arg="", *a, **k: (
+                self.order.append(f"launch:{arg}") or f"launched {arg}"))
+        from core import grounded_click
+        self.scene = self._p(grounded_click, "scene_match", return_value={
+            "status": "ok", "score": 0.92, "monitor": "middle"})
+        self._p(grounded_click, "freeze_scene", return_value=None)
+
+    def test_play_video_on_screen_becomes_a_click(self):
+        # Live 00:28:23 shape with an invented name: the video IS on screen.
+        _c, results = self._dispatch(
+            "[ACTION: play_video, that MrBeast video]",
+            user_text="play that MrBeast video")
+        self.click.assert_called_once_with("that MrBeast video")
+        self.yt.assert_not_called()
+        self.assertIn("[alias] play_video -> youtube_play", self.log)
+        self.assertIn("[onscreen-rewrite] youtube_play -> click_on_screen",
+                      self.log)
+
+    def test_play_video_with_nothing_on_screen_still_plays(self):
+        self.scene.return_value = {"status": "none", "score": 0.0}
+        self._dispatch("[ACTION: play_video, that MrBeast video]",
+                       user_text="play that MrBeast video")
+        self.yt.assert_called_once_with("that MrBeast video")
+        self.click.assert_not_called()
+
+    def test_open_app_in_close_then_open_closes_first(self):
+        self._dispatch("Right away, sir. [ACTION: open_app, Spotify]",
+                       user_text="close that and open Spotify")
+        self.assertEqual(self.order, ["close", "launch:Spotify"])
+        self.assertIn("[alias] open_app -> launch_app", self.log)
+
+    def test_off_leaves_the_reply_untouched(self):
+        with mock.patch.object(self.bc, "ACTION_ALIASES", False):
+            self.assertEqual(
+                self.bc._apply_action_aliases("[ACTION: open_app, Spotify]"),
+                "[ACTION: open_app, Spotify]")
+        self._dispatch("[ACTION: open_app, Spotify]",
+                       user_text="close that and open Spotify", aliases=False)
+        self.assertNotIn("[alias]", self.log)
+        self.assertNotIn("launch:Spotify", self.order)
+
+    def test_only_the_name_changes(self):
+        self._p(self.bc, "ACTION_ALIASES", True)
+        reply = ("Here, sir. [ACTION:  open_app , Spotify ] then "
+                 "[ACTION: get_time] and [ACTION: pause]")
+        self.assertEqual(
+            self.bc._apply_action_aliases(reply),
+            "Here, sir. [ACTION:  launch_app , Spotify ] then "
+            "[ACTION: get_time] and [ACTION: media_playpause]")
+
+
+@requires_monolith
 class VerbClashDispatchTests(_Base):
     def test_send_email_no_longer_reads_mail(self):
         _c, results = self._dispatch("[ACTION: send_email, to bob]",
