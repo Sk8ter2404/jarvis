@@ -181,6 +181,18 @@ class AliasForTests(unittest.TestCase):
         self.assertEqual(aa.alias_for(" Toggle_Mute ", "", self.REG),
                          "volume_mute")
 
+    def test_mute_music_is_mute_not_pause(self):
+        # The fuzzy layer used to send mute_music to pause_music; the W04
+        # verb-clash guard refuses that guess (mute vs pause), so the exact
+        # row is what keeps "mute the music" working: mute is the literal ask.
+        self.assertEqual(aa.ALIASES.get("mute_music"), "volume_mute")
+        self.assertEqual(aa.alias_for("mute_music", "", self.REG),
+                         "volume_mute")
+        self.assertIsNone(aa.alias_for("mute_music", "", {"pause_music": 1}))
+        import command_autocorrect as ca
+        self.assertTrue(ca._verb_clash("mute_music", "pause_music"))
+        self.assertFalse(ca._verb_clash("mute_music", "volume_mute"))
+
     def test_registered_name_wins(self):
         reg = dict(self.REG, read_screen=1)
         self.assertIsNone(aa.alias_for("read_screen", "", reg))

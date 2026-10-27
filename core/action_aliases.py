@@ -69,6 +69,12 @@ ALIASES: dict[str, str] = {
     "mute": "volume_mute",
     "mute_volume": "volume_mute",
     "toggle_mute": "volume_mute",         # fuzzy: toggle_hud (wrong)
+    # "mute the music": the literal ask is mute. volume_mute sets the system
+    # mute ON (idempotent; volume_unmute undoes it). Not pause_music (a
+    # different job: the old silent autocorrect, now refused by the verb-clash
+    # guard, so with no row the turn went unanswered) and not media_playpause
+    # (a toggle that would RESUME paused music).
+    "mute_music": "volume_mute",
     "pause": "media_playpause",
     "pause_video": "media_playpause",
     "pause_playback": "media_playpause",
