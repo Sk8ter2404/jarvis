@@ -48,6 +48,7 @@ Log lines (numbers and tags only, never prompt or speech text):
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 
@@ -106,38 +107,88 @@ def _clean_tag(tag) -> str:
     return t[:32] or "job"
 
 
+def _job_id(value):
+    """A job id the model wrote: 3, "3", "JOB 3", "job_3", "Job #3" -> 3;
+    anything else -> None. (The small Unraid model writes "JOB 3"; the old
+    int() rejected it and every job of the batch counted as failed.)"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    m = _JOB_ID_RE.match(str(value or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def _output_text(val):
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return str(val)
+
+
+def _rows_one_by_one(s: str) -> list:
+    """(id, output) for every '"id": N, "output": <value>' in ``s``, each
+    value decoded on its own. Rescues a reply whose OUTER JSON is broken:
+    gemma4:26b regularly drops one closing brace at the very end of a packed
+    reply, which made the whole reply unparseable and failed 452 of 708 packed
+    jobs in the 2026-10-16..26 live logs (each then retried, then sent alone:
+    2-3x the background calls, each evicting the voice brain's prompt)."""
+    rows = []
+    dec = json.JSONDecoder()
+    for m in _ROW_RE.finditer(s):
+        try:
+            val, _end = dec.raw_decode(s, m.end())
+        except ValueError:
+            continue
+        rows.append((m.group(1), val))
+    return rows
+
+
+_JOB_ID_RE = re.compile(r"(?:job\s*[#_-]?\s*)?(\d+)\Z", re.IGNORECASE)
+_ROW_RE = re.compile(
+    r'"id"\s*:\s*("[^"\n]{1,20}"|\d+)\s*,\s*"output"\s*:\s*')
+
+
 def parse_results(text, ids) -> dict:
     """{job id: output text} from a packed reply. Never raises; ids missing
-    from the reply (or with a null output) are simply absent."""
+    from the reply (or with a null output) are simply absent.
+
+    The whole reply is decoded first. When that fails or misses ids, each
+    '"id": N, "output": ...' entry is decoded on its own (see
+    _rows_one_by_one), so one malformed bracket no longer loses every job.
+    Ids are accepted as 3, "3" or "JOB 3"."""
     out: dict = {}
+    wanted = set(ids)
+
+    def take(raw_id, val) -> None:
+        jid = _job_id(raw_id.strip('"') if isinstance(raw_id, str)
+                      and raw_id.startswith('"') else raw_id)
+        if jid is None or jid not in wanted or jid in out:
+            return
+        txt = _output_text(val)
+        if txt is not None:
+            out[jid] = txt
+
+    s = text if isinstance(text, str) else ""
     try:
-        s = text if isinstance(text, str) else ""
         start = s.find("{")
         if start < 0:
             return out
-        data, _ = json.JSONDecoder().raw_decode(s, start)
+        try:
+            data, _ = json.JSONDecoder().raw_decode(s, start)
+        except ValueError:
+            data = None
         rows = data.get("results") if isinstance(data, dict) else None
-        if not isinstance(rows, list):
-            return out
-        wanted = set(ids)
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                jid = int(row.get("id"))
-            except Exception:
-                continue
-            if jid not in wanted or jid in out:
-                continue
-            val = row.get("output")
-            if val is None:
-                continue
-            if isinstance(val, str):
-                out[jid] = val
-            elif isinstance(val, (dict, list)):
-                out[jid] = json.dumps(val, ensure_ascii=False)
-            else:
-                out[jid] = str(val)
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    take(row.get("id"), row.get("output"))
+        if wanted - set(out):
+            for raw_id, val in _rows_one_by_one(s):
+                take(raw_id, val)
     except Exception:
         return out
     return out

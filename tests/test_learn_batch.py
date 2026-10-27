@@ -223,6 +223,48 @@ class PackingTests(unittest.TestCase):
         self.assertEqual(lb.parse_results("no json", [1]), {})
         self.assertEqual(lb.parse_results(None, [1]), {})
 
+    def test_parse_results_survives_gemmas_dropped_closing_brace(self):
+        """gemma4:26b's real packed reply (2026-10-27): the LAST row's closing
+        brace is missing, so the whole reply fails to decode. Every row must
+        still come back (452 of 708 live packed jobs failed on this)."""
+        text = ('{"results": [{"id": 1, "output": {"new_facts": ["The user\'s '
+                'sister\'s name is Kayla."], "new_projects": [], "topic": '
+                '"Sister"}}, {"id": 2, "output": {"new_facts": [], '
+                '"new_projects": [], "topic": "Volume"}}, {"id": 3, "output": '
+                '{"new_facts": [], "new_projects": [], "topic": "Spotify"}]}')
+        with self.assertRaises(ValueError):
+            json.loads(text)
+        out = lb.parse_results(text, [1, 2, 3])
+        self.assertEqual(sorted(out), [1, 2, 3])
+        self.assertEqual(json.loads(out[1])["new_facts"],
+                         ["The user's sister's name is Kayla."])
+        self.assertEqual(json.loads(out[3])["topic"], "Spotify")
+
+    def test_parse_results_accepts_job_n_ids(self):
+        """The Unraid CPU model (gemma4-e4b-cpu6) writes "JOB 1"; ids also
+        arrive as "1", "job_2" or "Job #3". Bools and junk never count."""
+        text = json.dumps({"results": [
+            {"id": "JOB 1", "output": "{\"new_facts\": []}"},
+            {"id": "job_2", "output": "MEDIA"},
+            {"id": "Job #3", "output": "PERSON"},
+            {"id": "4", "output": "X"},
+            {"id": True, "output": "bool id"},
+            {"id": "JOB one", "output": "junk id"},
+        ]})
+        out = lb.parse_results(text, [1, 2, 3, 4, 5])
+        self.assertEqual(out, {1: '{"new_facts": []}', 2: "MEDIA",
+                               3: "PERSON", 4: "X"})
+
+    def test_parse_results_keeps_first_answer_and_wanted_ids_only(self):
+        # A valid reply with a duplicate id and a stray id: first wins, the
+        # stray is ignored; the row-by-row rescue adds nothing new.
+        text = ('{"results": [{"id": 1, "output": "A"}, {"id": 1, "output": '
+                '"B"}, {"id": 7, "output": "stray"}]}')
+        self.assertEqual(lb.parse_results(text, [1, 2]), {1: "A"})
+        # Truncated mid-row: the complete rows survive, the cut one does not.
+        cut = '{"results": [{"id": 1, "output": "A"}, {"id": 2, "output": "B'
+        self.assertEqual(lb.parse_results(cut, [1, 2]), {1: "A"})
+
     def test_size_cap_spills_the_rest_to_the_next_flush(self):
         b, clock, llm, _s, _logs = _make(max_chars=1000)
         spilled = []
