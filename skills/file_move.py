@@ -638,6 +638,16 @@ def plan_move(arg: str):
 
 
 def plan_undo():
+    stuck = _newest_stranded()
+    if stuck is not None:
+        # The newest row is a move that never finished: undoing the OLDER
+        # move behind it would quietly act on the wrong file. Say where the
+        # stranded copy is and touch nothing.
+        tmp = stuck.get("temp", "") or "an unknown place"
+        name = os.path.basename(stuck.get("dest", "") or stuck.get("src", "")) or "the file"
+        return None, (f"The last move didn't finish, sir: '{name}' is stranded as a "
+                      f"temporary copy at {tmp}. I can't undo that one automatically, "
+                      "so I've left every file as it is.")
     entry = _last_entry()
     if entry is None:
         return None, "I haven't moved any files to undo, sir."
@@ -897,6 +907,16 @@ def _last_entry():
         for m in reversed(_journal_load()):
             if not m.get("undone") and m.get("kind", "move") == "move":
                 return m
+    return None
+
+
+def _newest_stranded():
+    """The newest journal row when it is a 'stranded' one (a move that removed
+    its source but left only the temp copy), else None."""
+    with _lock:
+        moves = _journal_load()
+    if moves and moves[-1].get("kind") == "stranded":
+        return moves[-1]
     return None
 
 

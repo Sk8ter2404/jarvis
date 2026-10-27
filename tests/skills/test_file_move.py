@@ -707,6 +707,42 @@ class JournalAndUndoTests(unittest.TestCase):
         with open(os.path.join(self.p.known["downloads"], "resume.pdf"), "rb") as f:
             self.assertEqual(f.read(), b"newer")
 
+    def test_a_newest_stranded_row_stops_undo_without_touching_files(self):
+        # v3 W15 left-open item: an older, finished move sits behind a
+        # stranded one. "Undo the last move" must not quietly undo the older
+        # move; it names the stranded temp copy and moves nothing.
+        older_src = self.p.dl("notes.txt", data=b"n" * 5)
+        ask_and_yes("move_file", "notes to documents")
+        older_dest = os.path.join(self.p.known["documents"], "notes.txt")
+        self.assertTrue(os.path.isfile(older_dest))
+        src = self.p.dl("resume.pdf", data=b"r" * 77)
+        docs = os.path.join(self.p.nc, "Documents")
+        tmp = os.path.join(docs, ".resume.pdf.jarvis-moving")
+        real_rename = os.rename
+
+        def rename(a, b):
+            if os.path.basename(a).endswith(".jarvis-moving"):
+                raise PermissionError(13, "Access is denied")
+            return real_rename(a, b)
+
+        with mock.patch.object(FM, "_same_drive", return_value=False),                 mock.patch.object(FM.os, "rename", side_effect=rename):
+            ask_and_yes("move_file", "resume to nextcloud documents")
+        self.assertEqual([m["kind"] for m in self.p.journal()],
+                         ["move", "stranded"])
+        before = self.p.journal()
+        self.assertIsNone(_quiet(FM.confirm_question, "undo_last_move", ""))
+        with mock.patch.object(FM, "safe_move") as mv:
+            res = _quiet(FM.undo_last_move, "")
+        mv.assert_not_called()
+        self.assertTrue(res.startswith(T))
+        self.assertIn(tmp, res)
+        self.assertIn("can't undo that one automatically", res)
+        self.assertTrue(os.path.isfile(older_dest))
+        self.assertFalse(os.path.exists(older_src))
+        self.assertEqual(os.path.getsize(tmp), 77)
+        self.assertFalse(os.path.exists(src))
+        self.assertEqual(self.p.journal(), before)
+
     def test_no_journal_means_nothing_to_undo(self):
         self.assertIsNone(_quiet(FM.confirm_question, "undo_last_move", ""))
 
