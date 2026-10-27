@@ -490,6 +490,48 @@ class MoveTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(src))
         self.assertEqual(os.listdir(os.path.join(self.p.nc, "Documents")), [])
 
+    def test_cross_drive_rename_failure_after_removal_is_journalled(self):
+        # The copy checked out and the source was removed, then the temp
+        # copy could not take its name: the file now exists ONLY as
+        # ".<name>.jarvis-moving". The journal must point at it and the
+        # owner hears exactly where it is.
+        src = self.p.dl("resume.pdf", data=b"r" * 77)
+        docs = os.path.join(self.p.nc, "Documents")
+        tmp = os.path.join(docs, ".resume.pdf.jarvis-moving")
+        real_rename = os.rename
+
+        def rename(a, b):
+            if os.path.basename(a).endswith(".jarvis-moving"):
+                raise PermissionError(13, "Access is denied")
+            return real_rename(a, b)
+
+        with mock.patch.object(FM, "_same_drive", return_value=False), \
+                mock.patch.object(FM.os, "rename", side_effect=rename):
+            _q, res = ask_and_yes("move_file", "resume to nextcloud documents")
+        self.assertTrue(res.startswith(T))
+        self.assertIn("'.resume.pdf.jarvis-moving'", res)
+        self.assertIn(tmp, res)
+        self.assertFalse(os.path.exists(src))
+        self.assertEqual(os.path.getsize(tmp), 77)
+        (entry,) = self.p.journal()
+        self.assertEqual(entry["kind"], "stranded")
+        self.assertEqual(entry["temp"], tmp)
+        self.assertEqual(entry["src"], src)
+        self.assertEqual(entry["dest"], os.path.join(docs, "resume.pdf"))
+        self.assertEqual(entry["size"], 77)
+        # A stranded row is never what "undo the last move" picks up.
+        self.assertIsNone(FM._last_entry())
+
+    def test_a_failure_that_kept_the_source_writes_no_journal_row(self):
+        src = self.p.dl("resume.pdf", data=b"k" * 10)
+        with mock.patch.object(FM, "_same_drive", return_value=False), \
+                mock.patch.object(FM.os, "remove",
+                                  side_effect=PermissionError(13, "locked")):
+            _q, res = ask_and_yes("move_file", "resume to nextcloud documents")
+        self.assertIn("open or locked", res)
+        self.assertTrue(os.path.isfile(src))
+        self.assertFalse(os.path.exists(os.path.join(self.p.data, "file_moves.json")))
+
     def test_success_only_after_verify(self):
         self.p.dl("resume.pdf")
         with mock.patch.object(FM, "verify", return_value="'resume.pdf' is the wrong size"):

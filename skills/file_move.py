@@ -768,7 +768,7 @@ def safe_move(src: str, dest: str) -> str:
         except OSError as e:
             if getattr(e, "winerror", None) != 17:   # 17 = not the same device
                 return f"Windows wouldn't move '{name}', sir: {e.strerror or e}."
-    tmp = os.path.join(os.path.dirname(dest), f".{name}.jarvis-moving")
+    tmp = _temp_path(src, dest)
     if os.path.lexists(tmp):
         return f"A leftover temp file is in the way in {folder_label(os.path.dirname(dest))}, sir."
     try:
@@ -796,6 +796,23 @@ def safe_move(src: str, dest: str) -> str:
     except OSError as e:
         return (f"'{name}' was copied but I couldn't give it its name, sir: it's in "
                 f"{folder_label(os.path.dirname(dest))} as '{os.path.basename(tmp)}' ({e}).")
+    return ""
+
+
+def _temp_path(src: str, dest: str) -> str:
+    """Where a cross-drive move keeps its copy until the rename."""
+    return os.path.join(os.path.dirname(dest), f".{os.path.basename(src)}.jarvis-moving")
+
+
+def _stranded_temp(src: str, dest: str) -> str:
+    """The temp copy a cross-drive move left behind after it had already
+    removed the source (the final rename failed), or ''."""
+    tmp = _temp_path(src, dest)
+    try:
+        if not os.path.lexists(src) and not os.path.lexists(dest) and os.path.isfile(tmp):
+            return tmp
+    except OSError:
+        pass
     return ""
 
 
@@ -838,6 +855,11 @@ def _execute(plan: dict) -> str:
     dest = os.path.join(dest_dir, plan["final"])
     err = safe_move(src, dest)
     if err:
+        tmp = _stranded_temp(src, dest)
+        if tmp:
+            # The source is gone and the file only exists as the temp copy:
+            # note where it is, so it is never lost track of.
+            err += _journal_stranded(plan, dest, tmp)
         return TERMINAL + err
     bad = verify(src, dest, plan["size"])
     if bad:
@@ -899,6 +921,24 @@ def _journal_record(plan: dict, dest: str) -> str:
     except Exception as e:
         print(f"  [file-move] journal write failed: {e}")
         return " I wasn't able to note it down, though, so undo won't know about it."
+
+
+def _journal_stranded(plan: dict, dest: str, tmp: str) -> str:
+    """Journal a cross-drive move that removed the source but could not
+    rename its temp copy: kind 'stranded', ``temp`` = the full path of the
+    file as it now exists. Never undone automatically (_last_entry only
+    takes 'move' rows). Returns the sentence to add to the owner's line."""
+    try:
+        with _lock:
+            moves = _journal_load()
+            moves.append({"kind": "stranded", "at": time.time(), "src": plan["src"],
+                          "dest": dest, "temp": tmp, "size": plan["size"],
+                          "move_kind": plan.get("kind", "move")})
+            _journal_save(moves)
+        return f" I've noted it in the move journal; the full path is {tmp}."
+    except Exception as e:
+        print(f"  [file-move] journal write failed: {e}")
+        return f" I couldn't note it in the move journal; the full path is {tmp}."
 
 
 # ── actions ──────────────────────────────────────────────────────────────
