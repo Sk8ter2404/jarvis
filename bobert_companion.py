@@ -41993,7 +41993,11 @@ def _head_hold_apply(cleaned: str, results, hold_at, ran_before,
             pending_lookup=not _head_hold_lookup_back(ran_before),
             user_text=_turn_user_text(), ran_before=ran_before,
             grounding_before=grounding_before, held_name=held,
-            held_failed=held_failed, whole=deferred)
+            held_failed=held_failed, whole=deferred,
+            # This reply's other actions have run by the time the head is
+            # spoken and ground its claims (review 2026-10-27); refusals
+            # ground nothing.
+            failed_names=_failed_or_refused_actions(results))
         if not dropped:
             return cleaned
         # The log names the sentence by its place, never its words (the

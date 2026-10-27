@@ -164,6 +164,39 @@ class OnTests(_HeadBase):
         self.assertEqual(cleaned, "It appears you'd like it louder, sir.")
         self.assertNotIn("[head-hold]", printed)
 
+    def test_a_claim_another_action_of_the_reply_grounds_is_kept(self):
+        # Review 2026-10-27: open_app ran before the held look, so the
+        # confirmation is true and stays (in shadow: no "would drop" line).
+        self.bc.ACTIONS["open_app"] = lambda a="": "Opened chrome"
+        self.bc.ACTIONS["see_screen"] = lambda a="": "A browser window."
+        self._open_turn()
+        cleaned, results, printed = self._parse(
+            "I've opened Chrome, sir. [ACTION: open_app, chrome] "
+            "[ACTION: see_screen]")
+        self.assertEqual([n for n, _r, _i in results],
+                         ["open_app", "see_screen"])
+        self.assertEqual(cleaned, "I've opened Chrome, sir.")
+        self.assertNotIn("[head-hold]", printed)
+
+    def test_a_check_clause_progress_line_is_kept(self):
+        self.bc.ACTIONS["see_screen"] = lambda a="": "A browser window."
+        self._open_turn()
+        cleaned, _r, printed = self._parse(
+            "Let me see what your screen is showing, sir. "
+            "[ACTION: see_screen]")
+        self.assertEqual(cleaned,
+                         "Let me see what your screen is showing, sir.")
+        self.assertNotIn("[head-hold]", printed)
+
+    def test_an_offer_of_another_step_is_kept(self):
+        self.bc.ACTIONS["see_screen"] = lambda a="": "A browser window."
+        self._open_turn()
+        head = ("Pulling it up now. If you'd like, I can also check the "
+                "weather?")
+        cleaned, _r, printed = self._parse(head + " [ACTION: see_screen]")
+        self.assertEqual(cleaned, head)
+        self.assertNotIn("[head-hold]", printed)
+
     def test_outside_a_turn_nothing_changes(self):
         self.bc._turn_grounding.frame = None
         cleaned, _r, printed = self._parse(_R_200540)

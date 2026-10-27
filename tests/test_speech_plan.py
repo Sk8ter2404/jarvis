@@ -196,6 +196,96 @@ class KeepTests(unittest.TestCase):
         self.assertEqual([w for _s, w in dropped], ["reading"])
 
 
+class ReviewFixTests(unittest.TestCase):
+    """Independent review 2026-10-27."""
+
+    def test_a_claim_grounded_by_another_action_of_this_reply_is_kept(self):
+        results = [("open_app", "Opened chrome", False),
+                   ("see_screen", "A browser window.", True)]
+        for head in ("I've opened Chrome for you, sir.",
+                     "Done, sir.", "Closed the tab, sir.",
+                     "I've muted the audio, sir."):
+            with self.subTest(head=head):
+                name = {"Closed the tab, sir.": "close_tab",
+                        "I've muted the audio, sir.": "mute"}.get(
+                            head, "open_app")
+                res = [(name, results[0][1], False), results[1]]
+                kept, dropped = sp.hold_head(head, results=res,
+                                             held_name="see_screen")
+                self.assertIs(kept, head)
+                self.assertEqual(dropped, [])
+
+    def test_a_reading_grounded_by_another_action_of_this_reply_is_kept(self):
+        head = "The volume is now at 40%, sir."
+        kept, dropped = sp.hold_head(
+            head, held_name="see_screen", pending_lookup=False,
+            results=[("set_volume", "Volume set to 40%", False),
+                     ("see_screen", "A player.", True)])
+        self.assertIs(kept, head)
+        self.assertEqual(dropped, [])
+
+    def test_a_failed_or_refused_other_action_grounds_nothing(self):
+        head = "I've opened Chrome for you, sir."
+        _kept, dropped = sp.hold_head(
+            head, held_name="see_screen",
+            results=[("open_app", "Error: open_app failed", False),
+                     ("see_screen", "A browser.", True)])
+        self.assertEqual([w for _s, w in dropped], ["claim"])
+        _kept, dropped = sp.hold_head(
+            head, held_name="see_screen", failed_names=["open_app"],
+            results=[("open_app", "I'd rather not, sir.", False),
+                     ("see_screen", "A browser.", True)])
+        self.assertEqual([w for _s, w in dropped], ["claim"])
+
+    def test_the_held_action_itself_still_grounds_nothing(self):
+        kept, dropped = _hold("Done, sir.", "hand_mouse_off",
+                              "Hand mouse off, sir.")
+        self.assertEqual(dropped, [("Done, sir.", "claim")])
+
+    def test_a_finding_verb_inside_a_check_clause_is_progress(self):
+        for head in ("Let me see what your screen is showing, sir.",
+                     "Let me check if the video seems to be playing.",
+                     "Checking whether it appears to be running, sir.",
+                     "One moment while I check what it looks like, sir.",
+                     "Taking a look at what the monitor is showing now.",
+                     "I can see to that right away, sir."):
+            with self.subTest(head=head):
+                kept, dropped = _hold(head, "see_screen", "A text editor.")
+                self.assertIs(kept, head)
+                self.assertEqual(dropped, [])
+
+    def test_a_finding_after_a_check_clause_is_still_a_finding(self):
+        for head in ("Let me see what it shows — it appears the video "
+                     "hasn't loaded.",
+                     "Let me check, sir. It appears the video hasn't loaded.",
+                     "I can see the video is paused, sir."):
+            with self.subTest(head=head):
+                _kept, dropped = _hold(head, "see_screen", "A player.")
+                self.assertIn("finding", [w for _s, w in dropped])
+
+    def test_an_offer_of_another_step_is_kept(self):
+        for head in ("Pulling it up now. If you'd like, I can also check the "
+                     "weather?",
+                     "Shall I check the weather as well, sir?",
+                     "Shall I check the weather, sir?",
+                     "Would you like me to open Spotify afterwards?"):
+            with self.subTest(head=head):
+                kept, dropped = _hold(head, "see_screen", "A browser.")
+                self.assertIs(kept, head)
+                self.assertEqual(dropped, [])
+
+    def test_an_offer_of_the_held_action_is_still_moot(self):
+        for head, held in (("Shall I run the numbers, sir?", "system_pulse"),
+                           ("Shall I run the numbers, sir?", "server_status"),
+                           ("Shall I take a look, sir?", "see_screen"),
+                           ("Would you like me to check the screen?",
+                            "see_screen"),
+                           ("Shall I check it for you, sir?", "gpu_usage")):
+            with self.subTest(head=head, held=held):
+                _kept, dropped = _hold(head, held, "ok")
+                self.assertEqual([w for _s, w in dropped], ["moot offer"])
+
+
 class WholeProseTests(unittest.TestCase):
     """An AMBIGUOUS / UNCLEAR autocorrect deferral: nothing ran."""
 
