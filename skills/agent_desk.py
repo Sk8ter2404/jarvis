@@ -47,7 +47,9 @@ SEEN_KEEP = 200
 NOT_RUNNING = "The Agent Office isn't running, sir."
 UNREADABLE = "The Agent Office answered with something I couldn't read, sir."
 
-_PROMPT_TEXT = (
+# A plain literal at module level: tests/test_audit_action_reachability.py
+# reads it with ast (it never imports the skill); cleared below when off.
+PROMPT_EXAMPLES = (
     "AGENT DESK (skills/agent_desk.py - READ-ONLY, reads the Agent Office):\n"
     "  agents_status - what the owner's Claude chats and agents are doing: how\n"
     "                  many are working or waiting, who is waiting on him and\n"
@@ -93,7 +95,6 @@ def announce_on() -> bool:
 # about an action that is not registered. The skill loader ignores "" / ().
 # (A plain literal first, then cleared: tests read the literal from source.)
 INFORMATIVE_ACTIONS = ("agents_status",)
-PROMPT_EXAMPLES = _PROMPT_TEXT
 if not enabled():
     INFORMATIVE_ACTIONS = ()
     PROMPT_EXAMPLES = ""
