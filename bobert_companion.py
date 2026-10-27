@@ -17694,6 +17694,7 @@ _TURN_FLAG_KEYS = (
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
     "SHUTDOWN_TWO_SENTENCE_ASK",
+    "THINK_CAPABILITY_PROBE",
 )
 
 
@@ -22090,7 +22091,7 @@ def _local_num_ctx(model: str) -> int:
     return _canonical(model)
 
 
-def _local_think_param(model: str):
+def _local_think_param(model: str, base_url=None):
     """Ollama `think` parameter for thinking-capable model families.
 
     Voice latency: a thinking block adds SECONDS before the first spoken word
@@ -22103,7 +22104,16 @@ def _local_think_param(model: str):
              "low"  → minimal reasoning (gpt-oss can't fully disable, only dial)
              None   → OMIT the param (pure-instruct models like qwen2.5 /
                       llama3.x — sending `think` to a non-thinking model is a
-                      400 from Ollama)."""
+                      400 from Ollama).
+
+    The name table above is the fast path. v3 W16 (THINK_CAPABILITY_PROBE): a
+    family NOT in it is asked once per (server, model) what it can do
+    (core.ollama_opts.model_can_think -> /api/show `capabilities`); "thinking"
+    there -> False (a thinking-by-default model otherwise burns its whole
+    token budget reasoning and returns an EMPTY reply), no "thinking" or any
+    probe failure -> None, today's answer. ``base_url`` is the server the model
+    runs on (default LOCAL_LLM_BASE_URL; the background endpoint passes its
+    own). THINK_CAPABILITY_PROBE False: the table only."""
     tag = (model or "").lower()
     if tag.startswith("gpt-oss"):
         return "low"
@@ -22111,6 +22121,13 @@ def _local_think_param(model: str):
         # qwen3 prefix also covers qwen3.5 / qwen3.6 tags.
         if tag.startswith(fam):
             return False
+    if tag and globals().get("THINK_CAPABILITY_PROBE", False):
+        try:
+            from core.ollama_opts import model_can_think as _can_think
+            if _can_think(model, base_url or globals().get("LOCAL_LLM_BASE_URL")):
+                return False
+        except Exception:
+            pass
     return None
 
 
@@ -23123,7 +23140,7 @@ def _background_remote_try(system: str, messages: list, max_tokens: int,
             text, body = _bgl.chat(
                 _url, _model, _sys, list(_fit), max_tokens,
                 _bgl.clean_timeout(globals().get("BACKGROUND_LLM_TIMEOUT_S")),
-                think=_local_think_param(_model))
+                think=_local_think_param(_model, _url))
         except _bgl.RemoteFailure as _e:
             print(f"  [bg-llm] remote failed ({_e}) - using the main brain")
             return None

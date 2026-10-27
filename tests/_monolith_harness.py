@@ -890,6 +890,13 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         _saved_learn_batch = getattr(bc, "LEARN_BATCH_ENABLED", None)
         if _saved_learn_batch is not None:
             bc.LEARN_BATCH_ENABLED = False
+        # The think-capability probe (v3 W16) ships ON and asks the Ollama
+        # server for an unknown model family. Every test runs with it OFF (the
+        # name table only, no socket); the probe tests turn it on with a faked
+        # probe. Restored below.
+        _saved_think_probe = getattr(bc, "THINK_CAPABILITY_PROBE", None)
+        if _saved_think_probe is not None:
+            bc.THINK_CAPABILITY_PROBE = False
         # Start clean too, not only end clean: anything that ran before the
         # first monolith test (an import-time Kinect pump, a light-tier test)
         # may have left history in the process-wide camera gate.
@@ -913,6 +920,8 @@ class MonolithGlobalsTestCase(unittest.TestCase):
                 bc.PLAYBACK_PRIMED_STREAM = _saved_primed
             if _saved_learn_batch is not None:
                 bc.LEARN_BATCH_ENABLED = _saved_learn_batch
+            if _saved_think_probe is not None:
+                bc.THINK_CAPABILITY_PROBE = _saved_think_probe
             try:
                 bc._playback_keeper.set_enabled(False)
             except Exception:

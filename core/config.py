@@ -1558,6 +1558,20 @@ SPEECH_HYGIENE = True
 # (self-termination, confirmation, pushback) still runs on the new name.
 ACTION_ALIASES = True
 
+# ─── Think parameter from the model's own capabilities (v3 W16) ──────────
+# THINK_CAPABILITY_PROBE — True: _local_think_param keeps its name table
+# (qwen3 / gemma4 / deepseek-r1 / magistral -> False, gpt-oss -> "low") as the
+# fast path, and for any OTHER model asks the server once (/api/show, cached per
+# server+model, the probe timeout from core.ollama_opts) whether its
+# `capabilities` include "thinking"; if so `think: false` is sent so a
+# thinking-by-default model (bonsai-2, nemotron-3.5-bolt) does not spend its
+# whole token budget reasoning and return an EMPTY reply. A model without
+# "thinking" (llama3.1, qwen2.5) still gets no param (a `think` on it is an
+# Ollama 400), and any probe failure keeps that answer. Also covers the
+# background endpoint's model (BACKGROUND_LLM_MODEL).
+# False: the name table only, as in v2.0.231.
+THINK_CAPABILITY_PROBE = True
+
 # ─── Prompt v3 core (v3 overhaul W03, 2026-10-27) ────────────────────────
 # PROMPT_DIRECTIVE_V3 (bool): the wording of the prompt rules the local
 # model obeys, as one switch. True: an [ACTION] token is a REQUEST, not a
