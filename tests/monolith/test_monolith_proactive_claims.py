@@ -90,3 +90,13 @@ class ProactiveClaimTests(_Base):
         self.assertTrue(f([], "I've taken the liberty of pulling up your "
                              "schedule."))
         self.assertTrue(f([], "I checked the weather, sir."))
+
+    def test_words_starting_with_i_are_not_claims(self):
+        f = self.bc._proactive_first_person_claim
+        self.assertFalse(f([], "Iran's news is heavy today."))
+        self.assertFalse(f([], "Irun is a town in Spain."))
+        self.assertFalse(f([], "Iset and Iopened are not words."))
+        self.assertTrue(f([], "I've pulled up your schedule."))
+        self.assertTrue(f([], "I pulled up your schedule."))
+        self.assertTrue(f([], "I have checked the weather."))
+        self.assertTrue(f([], "Ive checked the weather."))

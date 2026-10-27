@@ -46085,7 +46085,7 @@ def _local_complete(system: str, messages: list, *, max_tokens: int = 220,
 
 
 _PROACTIVE_FIRST_PERSON_RE = re.compile(
-    r"\b(?:i\s*(?:'|\u2019)?\s*ve|i\s+have|i\s+took|i\s+(?:just\s+)?"
+    r"\b(?:i(?:\s*(?:'|\u2019)\s*|\s*)ve\b|i\s+have|i\s+took|i\s+(?:just\s+)?"
     r"(?:pulled|checked|prepared|opened|ran|set|queued|started|made)|"
     r"taken\s+the\s+liberty|i\s*(?:'|\u2019)\s*(?:ll|m)\s+(?:go\s+)?"
     r"(?:ahead|pulling|checking))\b", re.I)
@@ -46095,7 +46095,7 @@ _PROACTIVE_FIRST_PERSON_RE = re.compile(
 # up your schedule" (10-18, 10-19), so a first-person action claim in the
 # prose is enough. "I've noticed ..." is an observation and stays.
 _PROACTIVE_CLAIM_TEXT_RE = re.compile(
-    r"\btaken\s+the\s+liberty\b|\bi\s*(?:'|\u2019)?\s*(?:ve\s+|have\s+)?"
+    r"\btaken\s+the\s+liberty\b|\bi(?:\s*(?:'|\u2019)\s*ve\s+|ve\s+|\s+have\s+|\s+)"
     r"(?:just\s+)?(?:pulled|checked|prepared|opened|queued|started|loaded|"
     r"reviewed|ran|run|set\s+up|looked\s+up)\b(?!\s*(?:nothing|no\b))",
     re.I)
