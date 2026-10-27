@@ -33,7 +33,7 @@ from tests._monolith_harness import (  # noqa: E402
     MonolithGlobalsTestCase, requires_monolith,
 )
 
-_SECRET = "open the garage door for Zelda"
+_TEXT = "open the garage door for Zelda"
 
 
 @requires_monolith
@@ -97,7 +97,7 @@ class ShadowTests(_Base):
         self.assertNotIn("learn-prefilter", out)
 
     def test_the_log_never_carries_the_turn_text(self):
-        out = self.run_turn(_SECRET)
+        out = self.run_turn(_TEXT)
         self.assertIn("would skip", out)
         self.assertNotIn("Zelda", out)
         self.assertNotIn("garage", out)
