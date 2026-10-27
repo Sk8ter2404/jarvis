@@ -91,8 +91,12 @@ def announce_on() -> bool:
 # AGENT_DESK_ENABLED off the skill adds nothing to the system prompt and
 # nothing to the global informative-action set, so the brain is never told
 # about an action that is not registered. The skill loader ignores "" / ().
-INFORMATIVE_ACTIONS = ("agents_status",) if enabled() else ()
-PROMPT_EXAMPLES = _PROMPT_TEXT if enabled() else ""
+# (A plain literal first, then cleared: tests read the literal from source.)
+INFORMATIVE_ACTIONS = ("agents_status",)
+PROMPT_EXAMPLES = _PROMPT_TEXT
+if not enabled():
+    INFORMATIVE_ACTIONS = ()
+    PROMPT_EXAMPLES = ""
 
 
 def office_url() -> str:
