@@ -697,7 +697,50 @@ def _clean_desc(desc) -> str:
     s = " ".join(str(desc or "").split())
     s = s.strip(" .")
     s = re.sub(r"[\"“”]", "", s)
+    if _arg_fixes_on():
+        s = _strip_target_wrappers(s)
     return s
+
+
+# W05 (v3): the brain passes the whole noun phrase ("that Omnitrix video for
+# me", "that video that says, Can I find ..."); the resolver wants the
+# distinctive words only.
+_LEAD_DET_RE = re.compile(r"^(?:that|the|this|those|these)\s+", re.IGNORECASE)
+_SAYS_RE = re.compile(
+    r"^(?:(?:video|link|button|tab|page|result|one)\s+)?(?:that|which)\s+"
+    r"(?:says|said|reads|read|is called|is titled|is named)\s*[,:]?\s*(.+)$",
+    re.IGNORECASE)
+_TRAIL_FOR_ME_RE = re.compile(r"\s*,?\s+for me\s*$", re.IGNORECASE)
+
+
+def _arg_fixes_on() -> bool:
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "ARG_FIXES", True))
+    except Exception:
+        return False
+
+
+def _strip_target_wrappers(s: str) -> str:
+    """Strip leading that/the/this, the "that says," wrapper, a trailing
+    "for me". The "video" noun and any "on the X monitor" stay: the resolver
+    and the scope parser read them. Never empties the target."""
+    cur = s
+    for _ in range(3):
+        prev = cur
+        cur = _TRAIL_FOR_ME_RE.sub("", cur).strip()
+        m = _SAYS_RE.match(cur)
+        if m and m.group(1).strip():
+            cur = m.group(1).strip()
+        else:
+            m = _LEAD_DET_RE.match(cur)
+            if m and cur[m.end():].strip():
+                rest = cur[m.end():].strip()
+                m2 = _SAYS_RE.match(rest)
+                cur = m2.group(1).strip() if m2 and m2.group(1).strip() else rest
+        if cur == prev:
+            break
+    return cur.strip(" .,") or s
 
 
 def _kind_of(cand, grid_hit: bool) -> str:

@@ -6172,6 +6172,8 @@ def _act_start_overnight_upgrade(_: str = "") -> str:
 # "main" / "primary" mean the Windows primary display: the one at the origin.
 _MONITOR_FILLER_RE = re.compile(r"\b(?:the|my|monitor|screen|display)\b")
 _PRIMARY_MONITOR_WORDS = ("main", "primary", "center", "centre")
+_OTHER_MONITOR_WORDS = ("secondary", "second", "other", "other one",
+                        "the other one", "second one", "another")
 
 
 def _resolve_monitor(name) -> "str | None":
@@ -6184,7 +6186,21 @@ def _resolve_monitor(name) -> "str | None":
         for key, rect in MONITORS.items():
             if tuple(rect[:2]) == (0, 0):
                 return key
+    if s in _OTHER_MONITOR_WORDS and _arg_fixes_on():
+        # W05 (v3): "secondary" / "the other one" -> the one non-primary
+        # monitor, only when exactly one exists (3+ stays unknown).
+        others = [k for k, r in MONITORS.items() if tuple(r[:2]) != (0, 0)]
+        if len(others) == 1 and len(MONITORS) == 2:
+            return others[0]
     return None
+
+
+def _arg_fixes_on() -> bool:
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "ARG_FIXES", True))
+    except Exception:
+        return False
 
 
 def _split_monitor_args(args: str, monitor_first: bool) -> "tuple[str | None, str]":
