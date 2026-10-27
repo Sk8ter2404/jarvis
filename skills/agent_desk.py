@@ -36,8 +36,6 @@ import threading
 import time
 import urllib.request
 
-INFORMATIVE_ACTIONS = ("agents_status",)
-
 DEFAULT_URL = "http://127.0.0.1:8795"
 STATE_PATH = "/api/state"
 TIMEOUT_S = 2.0
@@ -49,7 +47,7 @@ SEEN_KEEP = 200
 NOT_RUNNING = "The Agent Office isn't running, sir."
 UNREADABLE = "The Agent Office answered with something I couldn't read, sir."
 
-PROMPT_EXAMPLES = (
+_PROMPT_TEXT = (
     "AGENT DESK (skills/agent_desk.py - READ-ONLY, reads the Agent Office):\n"
     "  agents_status - what the owner's Claude chats and agents are doing: how\n"
     "                  many are working or waiting, who is waiting on him and\n"
@@ -89,6 +87,14 @@ def announce_on() -> bool:
     return bool(_cfg("AGENT_DESK_ANNOUNCE", False))
 
 
+# Declared only while the feature is on (read once, at import): with
+# AGENT_DESK_ENABLED off the skill adds nothing to the system prompt and
+# nothing to the global informative-action set, so the brain is never told
+# about an action that is not registered. The skill loader ignores "" / ().
+INFORMATIVE_ACTIONS = ("agents_status",) if enabled() else ()
+PROMPT_EXAMPLES = _PROMPT_TEXT if enabled() else ""
+
+
 def office_url() -> str:
     u = str(_cfg("AGENT_OFFICE_URL", DEFAULT_URL) or "").strip().rstrip("/")
     return u if re.match(r"^https?://[A-Za-z0-9._:\[\]-]+$", u) else DEFAULT_URL
@@ -125,6 +131,37 @@ def read_state(fetch=None):
 _ACTION_RE = re.compile(r"(?i)\baction\b\s*:?")
 _KEEP_RE = re.compile(r"[^A-Za-z0-9 .,'&/+_#:%$-]")
 
+# core.failure_markers substrings make the monolith treat an action RESULT as a
+# failed action (failure follow-up, re-prompt, the failure branch of a chain).
+# A chat called "Fix failed build" must not turn a correct answer into one, so
+# marker words in outside text are reworded before they are spoken.
+_DEFANG = (
+    (r"could\s+not", "cannot"), (r"couldn['’]t", "cannot"),
+    (r"can['’]t", "cannot"), (r"didn['’]t", "did not"),
+    (r"wouldn['’]t", "would not"),
+    (r"failed", "fail"), (r"refused", "declined"),
+    (r"no\s+tracks\s+found", "no tracks"),
+    (r"no\s+window\s+matching", "no window"),
+    (r"unknown(?=\s)", "unrecognised"), (r"format:", "format -"),
+)
+_DEFANG_RES = tuple((re.compile(p, re.I), r) for p, r in _DEFANG)
+
+
+def defang(text: str) -> str:
+    """Reword every core.failure_markers substring out of ``text`` (case-
+    insensitive, idempotent). Whatever the table misses is dropped outright,
+    so no marker survives even if the marker list grows."""
+    s = str(text)
+    for rx, rep in _DEFANG_RES:
+        s = rx.sub(rep, s)
+    try:
+        from core.failure_markers import FAILURE_MARKERS
+        for m in FAILURE_MARKERS:
+            s = re.sub(re.escape(m), " ", s, flags=re.I)
+    except Exception:
+        pass
+    return s
+
 
 def _scrub(text: str) -> str:
     try:
@@ -146,6 +183,7 @@ def clean(text, limit: int = 40, head_only: bool = False) -> str:
         s = re.split(r"\s[-\u2013\u2014]+\s", s, maxsplit=1)[0]
     s = _ACTION_RE.sub(" ", s)
     s = _KEEP_RE.sub(" ", s)
+    s = defang(s)
     s = re.sub(r"\s+", " ", s).strip(" -_:.,")
     if len(s) > limit:
         s = s[:limit].rsplit(" ", 1)[0].rstrip(" -_:.,") or s[:limit]
@@ -273,8 +311,8 @@ def describe(state: dict, focus_waiting: bool = False, now=None) -> str:
         wsent = _waiting_sentence(waits, now)
         alarms = _alarm_sentence(state)
         if focus_waiting:
-            return " ".join(x for x in (wsent or "Nothing is waiting on you, sir.",
-                                        alarms) if x)
+            return defang(" ".join(x for x in (
+                wsent or "Nothing is waiting on you, sir.", alarms) if x))
         if not sessions:
             first = "I don't see any Claude chats in the office, sir."
         else:
@@ -289,7 +327,8 @@ def describe(state: dict, focus_waiting: bool = False, now=None) -> str:
             if subs:
                 first += f", with {_n(subs, 'sub-agent', 'sub-agents')} running"
             first += ", sir."
-        return " ".join(x for x in (first, wsent, alarms) if x)
+        # defang again: words from two pieces can meet across a join
+        return defang(" ".join(x for x in (first, wsent, alarms) if x))
     except Exception:
         return UNREADABLE
 
