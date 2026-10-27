@@ -1131,6 +1131,28 @@ PARAKEET_THREADS           = 8
 PARAKEET_CONF_ANCHORS: list = []
 STT_REPLACEMENTS_PARAKEET: dict = {}
 
+# ─── Boot: dependency check + Whisper load off the critical path (v3 W10) ──
+# BOOT_PARALLEL_LOAD: False (default) = today's boot order, unchanged: the
+#   Whisper model loads on the boot thread and check_dependencies() imports
+#   every requirements.txt package before the greeting.
+#   True →
+#     * the dependency check does a fast find_spec pass on the boot thread
+#       (a package that is not installed is still named, and spoken, before
+#       the greeting, in the same words), then the full import check runs on
+#       a daemon thread once the main loop starts ("Listening"); a package
+#       that is installed but fails to import is reported then (spoken via
+#       the proactive queue, same words);
+#     * with STT_ENGINE = 'parakeet' only: the CUDA driver still starts on
+#       the boot thread first, then Whisper loads on a daemon thread under
+#       _stt_lock. Until it is ready a Parakeet -> Whisper rescue is skipped
+#       ("[stt] rescue skipped (whisper loading)") and ambient listening
+#       waits for the lock. With STT_ENGINE = 'whisper' Whisper still loads
+#       on the boot thread;
+#     * faster_whisper's per-decode INFO log lines are silenced (its logger
+#       is set to WARNING; they were 41% of the session log).
+#   Changes apply on the next start.
+BOOT_PARALLEL_LOAD         = False
+
 # ─── Where the listening models run (core/listen_devices.py, 2026-10-04) ──
 # PARAKEET_DEVICE / SMART_TURN_DEVICE / VOICE_ID_DEVICE: 'cpu' | 'listen' |
 #   'cuda:N' (Whisper's is WHISPER_DEVICE above). 'listen' = the card

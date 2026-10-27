@@ -17683,6 +17683,7 @@ _TURN_FLAG_KEYS = (
     "ARG_FIXES",
     "PROACTIVE_NO_ACTION_CLAIMS",
     "LEARN_PREFILTER",
+    "BOOT_PARALLEL_LOAD",
 )
 
 
@@ -18231,11 +18232,21 @@ def _parakeet_head_speech(audio, preroll=_PREROLL_FROM_STASH
 def _parakeet_rescue(text: str, audio) -> str:
     """core/stt_parakeet.rescue_reason with the live wake gates
     (_parakeet_wake_lost) and the Silero head check (_parakeet_head_speech,
-    the tail probe's detector)."""
-    return _stt_parakeet.rescue_reason(
+    the tail probe's detector).
+
+    BOOT_PARALLEL_LOAD (v3 W10): while the boot's background Whisper load
+    is still running, a rescue is skipped ('' = keep Parakeet's text) with
+    one "[stt] rescue skipped (whisper loading)" line, instead of the turn
+    waiting out the load on _stt_lock. The flag is never set with the
+    setting off, so this returns exactly the reason as before."""
+    why = _stt_parakeet.rescue_reason(
         text,
         wake_lost=_parakeet_wake_lost,
         head_speech=lambda: _parakeet_head_speech(audio))
+    if why and _whisper_bg_loading():
+        print(f"  [stt] rescue skipped (whisper loading): {why}")
+        return ""
+    return why
 
 
 _parakeet_primary = _stt_parakeet.Primary(
@@ -21038,6 +21049,102 @@ def _ensure_whisper_locked():
     print(f"openai-whisper '{model}' ready on {device}.\n")
 
 
+# ── BOOT_PARALLEL_LOAD (v3 W10): Whisper off the boot thread ──────────────
+# With Parakeet primary (STT_ENGINE='parakeet') Whisper only serves ambient
+# listening and the Parakeet -> Whisper rescues, yet its load (the
+# faster_whisper import alone is 12.6 s, ~33 s under boot contention) sat on
+# the boot thread. With the setting on, the boot thread still starts the CUDA
+# driver FIRST (v2.0.180: before ANY ctranslate2 import), then _ensure_whisper
+# runs on a daemon thread - under _stt_lock, as every load does, so ambient
+# transcribe() calls simply wait for it, and a CUDA model is still built on
+# the ct2-host thread (_ct2_host.run_for). While it loads, _parakeet_rescue
+# skips a rescue. A load that fails here is retried lazily by the next
+# transcribe(), exactly as a failed boot load would have been.
+_whisper_bg = {"loading": False, "thread": None, "t0": None}
+
+
+def _boot_parallel_load_on() -> bool:
+    """BOOT_PARALLEL_LOAD, read live (True / 'on' / 'true' / '1' / 'yes').
+    Never raises; anything else is off."""
+    try:
+        v = globals().get("BOOT_PARALLEL_LOAD", False)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "on", "yes")
+        return False
+    except Exception:
+        return False
+
+
+def _whisper_bg_loading() -> bool:
+    """True while the boot's background Whisper load runs. Never raises."""
+    try:
+        return bool(_whisper_bg.get("loading"))
+    except Exception:
+        return False
+
+
+def _quiet_faster_whisper_log() -> None:
+    """faster_whisper logs INFO lines on every decode ("Processing audio
+    with duration ...", the VAD summary): 41% of the session log. Keep its
+    WARNING and above. Never raises."""
+    try:
+        import logging as _logging
+        _logging.getLogger("faster_whisper").setLevel(_logging.WARNING)
+    except Exception:
+        pass
+
+
+def _boot_whisper_worker() -> None:
+    """The background Whisper load. Never raises; always clears the flag."""
+    t0 = time.monotonic()
+    try:
+        _ensure_whisper()
+        if _stt is not None:
+            print(f"  [boot] whisper ready in the background "
+                  f"({time.monotonic() - t0:.1f} s)")
+        else:
+            print("  [boot] background whisper load left no model "
+                  "(the next transcribe retries)")
+    except Exception as e:
+        print(f"  [boot] background whisper load failed "
+              f"({type(e).__name__}: {e}); the next transcribe retries")
+    finally:
+        _whisper_bg["loading"] = False
+
+
+def _boot_whisper_start() -> bool:
+    """main()'s boot Whisper load with BOOT_PARALLEL_LOAD. False = load it
+    on the boot thread as before (the setting is off, Whisper is the
+    primary engine, or the thread could not start); True = it is loading on
+    a daemon thread. Never raises."""
+    if not _boot_parallel_load_on():
+        return False
+    _quiet_faster_whisper_log()
+    if _stt_r6_route() != "primary" or _stt is not None:
+        return False
+    # The CUDA driver starts on THIS (the boot) thread before the worker can
+    # import ctranslate2 / faster_whisper (v2.0.180). Idempotent.
+    _cuda_driver_first()
+    _whisper_bg["loading"] = True
+    _whisper_bg["t0"] = time.monotonic()
+    try:
+        t = threading.Thread(target=_boot_whisper_worker, daemon=True,
+                             name="boot-whisper")
+        _whisper_bg["thread"] = t
+        t.start()
+    except Exception as e:
+        _whisper_bg["loading"] = False
+        _whisper_bg["thread"] = None
+        print(f"  [boot] whisper thread could not start ({e}); "
+              f"loading on the boot thread")
+        return False
+    print("  [boot] whisper loading in the background (parakeet is primary; "
+          "rescues skip until it is ready)")
+    return True
+
+
 # Map pip distribution name → (import module name, JARVIS-style feature note for
 # the spoken alert). If the import module differs from the pip name, the lookup
 # falls back to the pip name itself. Features listed here generate a one-line
@@ -21115,6 +21222,16 @@ def check_dependencies() -> list[str]:
         print("  [dep-check] all requirements.txt packages importable.")
         return missing
 
+    _dep_report_missing(missing)
+    return missing
+
+
+def _dep_report_missing(missing: list, say=None) -> None:
+    """check_dependencies()'s report for a non-empty ``missing``: the
+    WARNING lines, the pip-install line and the one-line spoken alert.
+    ``say`` None = _speak() + a conversation_history entry (the boot
+    thread, as always); otherwise ``say(alert)`` (the BOOT_PARALLEL_LOAD
+    background check queues it with proactive_announce)."""
     print(f"  [dep-check] WARNING: {len(missing)} package(s) from requirements.txt "
           f"are missing from the active environment:")
     for pkg in missing:
@@ -21136,12 +21253,103 @@ def check_dependencies() -> list[str]:
             extra = "" if len(feature_msgs) <= 2 else f", and {len(feature_msgs) - 2} more"
             alert = f"Sir, a few things are offline: {parts}{extra}."
         try:
-            _speak(alert)
-            conversation_history.append({"role": "assistant", "content": alert})
+            if say is None:
+                _speak(alert)
+                conversation_history.append({"role": "assistant", "content": alert})
+            else:
+                say(alert)
         except Exception as e:
             print(f"  [dep-check] spoken alert failed: {e}")
 
+
+# ── BOOT_PARALLEL_LOAD (v3 W10): the dependency check in two passes ───────
+# The full check imports every requirements.txt package (torch, faster_whisper,
+# cv2, PyQt6 ...): ~7 s on the boot thread. The fast pass only asks the import
+# system whether each top-level module can be FOUND (importlib.util.find_spec:
+# no module body runs; a dotted name imports its small parent packages), so a
+# package that is not installed is still named - and spoken, in the same words
+# - before the greeting. The full import check then runs on a daemon thread
+# once the main loop starts and reports only what the fast pass missed (a
+# package that is installed but broken).
+def _dep_missing_fast(pkgs: list) -> list:
+    """The pip names in ``pkgs`` whose import module cannot be found. Never
+    imports a module body; never raises."""
+    import importlib.util as _ilu
+    missing: list = []
+    for pkg in pkgs:
+        mod = _DEP_IMPORT_NAME.get(pkg, pkg.replace("-", "_"))
+        try:
+            found = _ilu.find_spec(mod) is not None
+        except Exception:
+            found = False
+        if not found:
+            missing.append(pkg)
     return missing
+
+
+def check_dependencies_fast() -> list:
+    """BOOT_PARALLEL_LOAD's boot-thread pass: check_dependencies() with
+    find_spec in place of an import. Same report and spoken alert for what
+    it finds; returns the missing pip names."""
+    req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+    pkgs = _parse_requirements(req_path)
+    missing = _dep_missing_fast(pkgs)
+    if not missing:
+        print("  [dep-check] fast pass: all requirements.txt packages found "
+              "(full import check runs once listening).")
+        return missing
+    _dep_report_missing(missing)
+    return missing
+
+
+_dep_full_thread = [None]
+
+
+def _dep_check_full_worker(already) -> None:
+    """The full import check, off the boot thread. Reports (and queues the
+    spoken alert for) only the packages the fast pass did not already name.
+    Never raises."""
+    try:
+        import importlib
+        req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "requirements.txt")
+        pkgs = _parse_requirements(req_path)
+        missing: list = []
+        for pkg in pkgs:
+            mod = _DEP_IMPORT_NAME.get(pkg, pkg.replace("-", "_"))
+            try:
+                importlib.import_module(mod)
+            except Exception:
+                missing.append(pkg)
+        seen = set(already or ())
+        new = [p for p in missing if p not in seen]
+        if not missing:
+            print("  [dep-check] all requirements.txt packages importable.")
+            return
+        if not new:
+            return
+        _dep_report_missing(
+            new, say=lambda a: proactive_announce(a, source="dep-check"))
+    except Exception as e:
+        print(f"  [dep-check] background check failed: {e}")
+
+
+def _dep_check_full_start(already) -> "threading.Thread | None":
+    """Start _dep_check_full_worker on a daemon thread (once). Never
+    raises; returns the thread or None."""
+    try:
+        t = _dep_full_thread[0]
+        if t is not None:
+            return t
+        t = threading.Thread(target=_dep_check_full_worker,
+                             args=(list(already or ()),),
+                             daemon=True, name="dep-check-full")
+        _dep_full_thread[0] = t
+        t.start()
+        return t
+    except Exception as e:
+        print(f"  [dep-check] background check could not start: {e}")
+        return None
 
 
 def transcribe(audio: np.ndarray) -> tuple[str, dict]:
@@ -51061,7 +51269,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # consent, the fast-decode check, quiet-time seeding): one log line.
     _clone_cache_setup()
 
-    _ensure_whisper()   # load now so first user utterance isn't delayed
+    # BOOT_PARALLEL_LOAD (v3 W10): with Parakeet primary the load runs on a
+    # daemon thread instead (_boot_whisper_start; the CUDA driver still
+    # starts on this thread first). Off / Whisper primary: unchanged.
+    if not _boot_whisper_start():
+        _ensure_whisper()   # load now so first user utterance isn't delayed
     # Speed plan R1 (2026-10-01): the optional model warm-ups registered via
     # _register_boot_warmer start here, in ONE daemon that never blocks boot
     # (one "[warm] <name> ok|failed" line each), and the latency flags this
@@ -51077,8 +51289,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # Runs AFTER whisper is loaded (so the model-load output isn't tangled
     # with the dep warnings) and BEFORE the spoken greeting (so the alert
     # is the first thing the user hears if something's broken).
+    # BOOT_PARALLEL_LOAD (v3 W10): a find_spec pass here; the full import
+    # check starts on a daemon thread with the main loop (below).
+    _dep_parallel = _boot_parallel_load_on()
     try:
-        _missing_deps = check_dependencies()
+        if _dep_parallel:
+            _missing_deps = check_dependencies_fast()
+        else:
+            _missing_deps = check_dependencies()
     except Exception as _e:
         print(f"  [dep-check] check failed: {_e}")
         _missing_deps = []
@@ -51105,6 +51323,8 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     robot_str = f"robot @ {ROBOT_IP}:{ROBOT_PORT}" if ROBOT_ENABLED else "VOICE-ONLY (no robot)"
     print(f"\nJ.A.R.V.I.S.  —  [{LOCATION}]  —  {robot_str}")
     _stt_label = f"{_stt_model_name or WHISPER_MODEL} ({_stt_device or 'cpu'})"
+    if _whisper_bg_loading():
+        _stt_label = _stt_label.split(" (", 1)[0] + " (loading in the background)"
     print(f"AI: {AI_BACKEND}  |  TTS: {_boot_tts_label()}  |  STT: whisper-{_stt_label}")
     print(f"Mic:      {get_current_mic_name()}")
     print(f"Speakers: {get_current_speaker_name()}")
@@ -51667,6 +51887,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # Listening over media (2026-10-05): the wake pre-gate (A3) and the
         # echo canceller's loopback (C1) start now when their modes are on.
         _listen_media_boot()
+        # BOOT_PARALLEL_LOAD (v3 W10): the full dependency import check,
+        # now that boot is done (only what the fast pass missed is reported).
+        if _dep_parallel:
+            _dep_check_full_start(_missing_deps)
         while True:
             try:
                 if _blue_green_loop_tick():
