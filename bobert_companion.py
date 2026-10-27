@@ -481,6 +481,9 @@ except Exception:  # pragma: no cover - defensive fallback when an optional modu
 # referent question (_run_pronoun_switch_shortcut).
 from core import action_risk as _action_risk  # noqa: E402
 from core import pronoun_switch as _pronoun_switch  # noqa: E402
+# Exact invented-name -> real-name table, consulted before the fuzzy layer
+# when ACTION_ALIASES is on (v3 W04, see _runner in parse_and_run_actions).
+from core import action_aliases as _action_aliases  # noqa: E402
 _AUTOCORRECT_THRESHOLD = 0.75
 # When two candidates both clear the threshold and sit within this gap of
 # each other, the dispatcher asks 'did you mean X or Y' instead of silently
@@ -17667,6 +17670,8 @@ _TURN_FLAG_KEYS = (
     "INSTANT_ACTIONS_MODE",
     # v3 W02: 'shadow' logs / 'on' drops a guessed head before a held result.
     "SPEECH_PLAN_HEAD_HOLD",
+    # v3 W04: exact alias table + autocorrect verb-clash guard + labels.
+    "ACTION_ALIASES",
     # Reserved for later batches (absent until they ship):
     "AMBIENT_STT_YIELD", "PROCESSING_FILLER_PRERENDER",
     "PROCESSING_FILLER_LATE_START_S", "PROCESSING_FILLER_SKIP_PLEASANTRIES",
@@ -42937,6 +42942,53 @@ def _youtube_play_alias(name: str, arg: str) -> str:
     return name
 
 
+def _action_aliases_on() -> bool:
+    """ACTION_ALIASES (core.config; v3 W04): the exact alias table, the
+    autocorrect verb-clash guard and the spoken friendly labels. A missing
+    or broken value is off - the v2.0.231 path."""
+    try:
+        return globals().get("ACTION_ALIASES", False) is True
+    except Exception:
+        return False
+
+
+def _apply_action_aliases(reply: str) -> str:
+    """``reply`` with every [ACTION: <invented>, arg] tag that has an exact
+    row in core.action_aliases renamed to its real action, so the
+    reply-level gates that match on tag names (_enforce_close_then_open,
+    _enforce_named_close, _enforce_onscreen_reference) see the real name:
+    [ACTION: play_video, that video] must still become a click on the video
+    already on screen, and [ACTION: open_app, Spotify] in a "close that and
+    open Spotify" turn must still get close_last_opened before it (review
+    2026-10-27). Only the name changes; the argument and the text around it
+    stay byte-for-byte. Unchanged when ACTION_ALIASES is off. The same step
+    in _runner stays as a backstop. Never raises."""
+    try:
+        if not reply or not _action_aliases_on():
+            return reply
+        out, last, changed = [], 0, False
+        for m in _ACTION_RE.finditer(reply):
+            src = m.group(1).strip().lower()
+            if src in ACTIONS:
+                continue
+            target = _action_aliases.alias_for(
+                src, (m.group(2) or "").strip(), ACTIONS)
+            if not target:
+                continue
+            print(f"  [alias] {src} -> {target}")
+            out.append(reply[last:m.start(1)])
+            out.append(target)
+            last = m.end(1)
+            changed = True
+        if not changed:
+            return reply
+        out.append(reply[last:])
+        return "".join(out)
+    except Exception as _e:
+        print(f"  [alias] reply-level rewrite failed: {type(_e).__name__}")
+        return reply
+
+
 # The actions a brain picks for "that video" when it does not know the
 # thing is already on screen (live 00:28:23: youtube_play).
 _ONSCREEN_REWRITE_ACTIONS = frozenset({"youtube_play", "youtube", "open_url",
@@ -43078,6 +43130,9 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # "Close that and open X instead" (S1, 2026-10-02) - see
     # _enforce_close_then_open: the close of what JARVIS opened last runs
     # BEFORE the open, even when the brain wrote only the open.
+    # (v3 W04: invented names with an exact alias row are renamed first, so
+    # these gates see open_app as launch_app and play_video as youtube_play.)
+    reply = _apply_action_aliases(reply)
     reply = _enforce_close_then_open(reply)
     # ... and the other direction (2026-10-05): a close the owner NAMED is
     # close_window, never close_last_opened (_enforce_named_close).
@@ -43136,6 +43191,18 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         # word. A coordinate click stays the silent "click".
         name = _click_alias(name, arg)
         name = _youtube_play_alias(name, arg)
+        _aliases_on = _action_aliases_on()
+        if _aliases_on and name not in ACTIONS:
+            # Exact invented-name table (v3 W04, core/action_aliases.py):
+            # read_screen -> see_screen, pause -> media_playpause, ... No
+            # scoring; every row targets a safe action, and every gate below
+            # still runs on the rewritten name. Backstop only: the reply-level
+            # pass (_apply_action_aliases) already renamed the tags before the
+            # close-then-open / named-close / on-screen gates.
+            _alias = _action_aliases.alias_for(name, arg, ACTIONS)
+            if _alias:
+                print(f"  [alias] {name} -> {_alias}")
+                name = _alias
         fn   = ACTIONS.get(name)
         _log_router_miss(name, fn is not None)
         if fn is None and _cmd_autocorrect is not None:
@@ -43158,12 +43225,23 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             #                (2026-10-01: an invented 'shutdown' for "turn it
             #                off" was routed to shutdown_jarvis)
             try:
-                choice = _cmd_autocorrect.autocorrect_command_choice(
-                    name, ACTIONS.keys(),
-                    threshold=_AUTOCORRECT_THRESHOLD,
-                    ambiguity_gap=_AUTOCORRECT_AMBIG_GAP,
-                    protected=_autocorrect_protected,
-                )
+                if _aliases_on:
+                    # + the verb-clash guard: a silent route that would
+                    # change the job (send_email -> read_email) is "none".
+                    choice = _cmd_autocorrect.autocorrect_command_choice(
+                        name, ACTIONS.keys(),
+                        threshold=_AUTOCORRECT_THRESHOLD,
+                        ambiguity_gap=_AUTOCORRECT_AMBIG_GAP,
+                        protected=_autocorrect_protected,
+                        verb_clash=True,
+                    )
+                else:
+                    choice = _cmd_autocorrect.autocorrect_command_choice(
+                        name, ACTIONS.keys(),
+                        threshold=_AUTOCORRECT_THRESHOLD,
+                        ambiguity_gap=_AUTOCORRECT_AMBIG_GAP,
+                        protected=_autocorrect_protected,
+                    )
             except Exception as _e:
                 print(f"  [autocorrect] scoring failed for {name!r}: {_e}")
                 choice = {"status": "none", "primary": None, "secondary": None}
@@ -43191,7 +43269,11 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                 best, conf = primary
                 print(f"  [autocorrect] {name!r} -> {best!r} (conf={conf:.2f})")
                 try:
-                    _speak(f"Interpreting that as `{best}`, sir.")
+                    if _aliases_on:
+                        _speak(f"Interpreting that as "
+                               f"{_action_aliases.friendly_label(best)}, sir.")
+                    else:
+                        _speak(f"Interpreting that as `{best}`, sir.")
                 except Exception as _e:
                     print(f"  [autocorrect] confirmation TTS failed: {_e}")
                 name = best
@@ -43210,7 +43292,12 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                     "original": name,
                 })
                 try:
-                    _speak(f"Did you mean `{a}` or `{b}`, sir?")
+                    if _aliases_on:
+                        _speak(f"Did you mean "
+                               f"{_action_aliases.friendly_label(a)} or "
+                               f"{_action_aliases.friendly_label(b)}, sir?")
+                    else:
+                        _speak(f"Did you mean `{a}` or `{b}`, sir?")
                 except Exception as _e:
                     print(f"  [autocorrect] disambig TTS failed: {_e}")
                 results.append(
@@ -43221,8 +43308,13 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                 return ""
             else:
                 best_seen = primary[1] if primary else 0.0
-                print(f"  [autocorrect] no match for {name!r} "
-                      f"(best conf={best_seen:.2f})")
+                if choice.get("clash"):
+                    print(f"  [autocorrect] {name!r} -> {primary[0]!r} "
+                          f"(conf={best_seen:.2f}) would change the job "
+                          f"(verb clash) - not routed")
+                else:
+                    print(f"  [autocorrect] no match for {name!r} "
+                          f"(best conf={best_seen:.2f})")
         if fn is None:
             results.append((name, f"unknown action: {name}", False))
             return ""
@@ -50494,7 +50586,9 @@ def _turn_check_judge(mode, user_text, chain_texts, chain_results,
     ran = _turn_check_ran(chain_results)
     verdict = _turn_checker.check_turn(
         user_text, " ".join(str(t or "") for t in chain_texts or ()),
-        emitted, ran, registered, asked_question=True if asked else None)
+        emitted, ran, registered, asked_question=True if asked else None,
+        # v3 W04: score made-up names the way _runner now does.
+        **({"verb_clash": True} if _action_aliases_on() else {}))
     would = _turn_checker.should_escalate(
         verdict, cloud_allowed=cloud_allowed,
         already_escalated=bool(getattr(_turn_check_tls, "escalating", False)),

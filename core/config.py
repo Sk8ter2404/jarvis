@@ -1530,6 +1530,20 @@ INSTANT_ACTIONS_ALLOW = [
 # False restores the old behaviour exactly. Applies on the next start.
 SPEECH_HYGIENE = True
 
+# ─── Action aliases (v3 W04, 2026-10-27; core/action_aliases.py) ─────────
+# ACTION_ALIASES — True: an invented action name the model emits that has a
+# row in core/action_aliases.ALIASES (read_screen -> see_screen, pause ->
+# media_playpause, open_app -> launch_app, ...) is rewritten EXACTLY before
+# the fuzzy autocorrect runs ("[alias] x -> y" in the log); the autocorrect's
+# silent route is refused when it would change the job (send_email ->
+# read_email, quit -> quiet_mode, play_video -> play_vibe: the verb-clash
+# guard, command_autocorrect._verb_clash), so it takes the "unknown action"
+# path instead; and the "Interpreting that as ..." / "Did you mean ... ?"
+# lines say the action in words, not as a backticked internal name.
+# False: the v2.0.231 path, unchanged. Every gate after the rewrite
+# (self-termination, confirmation, pushback) still runs on the new name.
+ACTION_ALIASES = True
+
 # ─── Night quieting (core/night_quiet.py) ────────────────────────────────
 # NIGHT_QUIET_ENABLED — the master switch for everything that changes how
 # JARVIS sounds at night because of the CLOCK alone: the 'hushed_late' voice

@@ -201,12 +201,20 @@ def _names(names: Optional[Iterable[str]]) -> set[str]:
     return out
 
 
-def _unresolved(name: str, registered: set[str]) -> bool:
+def _unresolved(name: str, registered: set[str],
+                verb_clash: bool = False) -> bool:
     """True when autocorrect would leave ``name`` as an unknown action. When
-    scoring fails the answer is "resolved": not sure means not flagged."""
+    scoring fails the answer is "resolved": not sure means not flagged.
+    ``verb_clash``: the runtime's ACTION_ALIASES guard (v3 W04) is on, so a
+    route that would change the job counts as unresolved, as it does live."""
     try:
-        choice = _autocorrect.autocorrect_command_choice(
-            name, sorted(registered), use_embeddings=False)
+        if verb_clash:
+            choice = _autocorrect.autocorrect_command_choice(
+                name, sorted(registered), use_embeddings=False,
+                verb_clash=True)
+        else:
+            choice = _autocorrect.autocorrect_command_choice(
+                name, sorted(registered), use_embeddings=False)
     except Exception:
         return False
     return choice.get("status") == "none"
@@ -239,7 +247,8 @@ def _commanded_action(user_text: str, registered: set[str]) -> Optional[str]:
 def check_turn(user_text: str, reply_text: str,
                actions_emitted: Iterable[str], actions_ran: Iterable[str],
                registered_actions: Iterable[str], *,
-               asked_question: Optional[bool] = None) -> Verdict:
+               asked_question: Optional[bool] = None,
+               verb_clash: bool = False) -> Verdict:
     """Judge one finished turn.
 
     ``user_text``          the owner's utterance.
@@ -256,6 +265,8 @@ def check_turn(user_text: str, reply_text: str,
     ``asked_question``     True when the turn asked the owner something (e.g.
                            the runtime's own "Did you mean X or Y?"); None
                            reads it from the reply.
+    ``verb_clash``         the runtime's ACTION_ALIASES verb-clash guard is
+                           on (v3 W04): False scores exactly as before.
     """
     registered = _names(registered_actions)
     emitted = _names(actions_emitted)
@@ -272,7 +283,8 @@ def check_turn(user_text: str, reply_text: str,
 
     unknown = sorted(emitted - registered) if registered else []
     if unknown and not (ran - emitted):
-        made_up = [n for n in unknown if _unresolved(n, registered)]
+        made_up = [n for n in unknown
+                   if _unresolved(n, registered, verb_clash)]
         if made_up:
             if ran:
                 return Verdict(
