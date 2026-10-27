@@ -143,6 +143,89 @@ def alias_for(name: str, arg: str, registered) -> "str | None":
         return None
 
 
+# ─── Hidden duplicates (v3 overhaul W12, PROMPT_INDEX_CANON) ─────────────
+# Registered actions that do (nearly) the same job as a canonical one. Unlike
+# ALIASES these are REAL names: they stay in ACTIONS, keep their core.action_risk
+# tier, stay in the INFORMATIVE / VERBATIM sets, and still run when the model
+# says them - nothing is ever rewritten. They are only left out of the ACTION
+# INDEX in the prompt (core.prompt_router.slim_stable_pc_block ``hide``), so
+# the model sees one name per job: 8 pause / next names, 11 play / video
+# names, 12 smart-home list names, ``list_schedule`` beside ``list_schedules``
+# and so on. A name is hidden only while its canonical name is visible in the
+# prompt (the head grammar or a listed row); otherwise it stays listed.
+# hidden name -> the canonical name the model should say instead.
+# Pinned by tests/test_prompt_index_canon.py: every key and value is
+# registered, no value is itself hidden, no key is in NEVER_ALIAS /
+# SELF_TERMINATING_ACTIONS / CONFIRM tier, and a hidden name's risk tier
+# equals its canonical's or is stricter.
+HIDDEN_DUPLICATES: dict[str, str] = {
+    # Raw media keys beside the media-session actions (pause the video ->
+    # media_prev was the c013 failure).
+    "media_next": "next_song",
+    "media_prev": "previous_song",
+    "media_playpause": "pause_music",
+    "music_status": "now_playing",
+    # One generic streaming action takes "<service>|<title>".
+    "prime_video": "play_streaming",
+    "netflix": "play_streaming",
+    "disney_plus": "play_streaming",
+    "hulu": "play_streaming",
+    "max": "play_streaming",
+    "spotify": "play_streaming",
+    # One smart-home list instead of one per brand.
+    "hue_list_devices": "list_smart_home_devices",
+    "govee_list_devices": "list_smart_home_devices",
+    "lifx_list_devices": "list_smart_home_devices",
+    "kasa_list_devices": "list_smart_home_devices",
+    "ecobee_list_devices": "list_smart_home_devices",
+    "nest_list_devices": "list_smart_home_devices",
+    "ring_list_devices": "list_smart_home_devices",
+    "magichome_list_devices": "list_smart_home_devices",
+    "tuya_list": "list_smart_home_devices",
+    # Status and health.
+    "check_system": "system_pulse",
+    "system_check": "run_diagnostic",
+    "diagnostic_daemon_status": "diagnostic_status",
+    "last_diagnostic_run": "diagnostic_history",
+    "last_gate_result": "gate_status",
+    "which_mic_is_active": "current_mic",
+    "is_printer_online": "is_device_online",
+    "bandwidth_hogs": "network_usage",
+    # Schedules: `list_schedule` and `list_schedules` were both listed.
+    "list_schedule": "list_schedules",
+    "schedule_status": "list_schedules",
+    "fire_schedule": "run_schedule",
+    # Focus mode.
+    "focus_mode_on": "focus_mode",
+    "focus_mode_off": "end_focus_mode",
+    # Overlays and HUD toggles beside their show / hide pairs.
+    "toggle_hud": "show_hud",
+    "toggle_holographic_overlay": "show_holographic_overlay",
+    "bambu_overlay_toggle": "bambu_overlay_on",
+    "stark_status_ring": "arc_reactor_status",
+    "arc_reactor_status_status": "holographic_status",
+    "stark_status_ring_status": "holographic_status",
+    # Briefings: three names dispatched the same morning briefing.
+    "morning_arrival": "morning_briefing",
+    "morning_handoff": "morning_briefing",
+    # Hand features: the _mouse_ and _tracking_ twins.
+    "hand_mouse_off": "hand_tracking_off",
+    "hand_mouse_status": "hand_tracking_status",
+    # Wrappers of the same call.
+    "make_picture": "generate_image",
+    "rag_search_quiet": "rag_search",
+}
+
+
+def hidden_duplicate_of(name: str) -> "str | None":
+    """The canonical name a hidden duplicate stands for, or None. Pure data
+    lookup: it never rewrites a name (the hidden name still runs as itself)."""
+    try:
+        return HIDDEN_DUPLICATES.get((name or "").strip().lower())
+    except Exception:
+        return None
+
+
 # Short words said as letters, so a label reads the way the owner says it.
 _LABEL_WORDS = {
     "hud": "HUD", "url": "URL", "tv": "TV", "pc": "PC", "cpu": "CPU",

@@ -487,6 +487,42 @@ if _prompt_v3_on():
     BASE_SYSTEM_PROMPT = _apply_swaps(BASE_SYSTEM_PROMPT, _BASE_V3_SWAPS)
 
 
+# ─── Prompt diet (v3 overhaul W12) ───────────────────────────────────────
+# PROMPT_INDEX_CANON (core/config.py) cuts the "Signature phrases" list: the
+# 20-line SIGNATURE PHRASE POOL above it and mcu_phrases' phrasebook (injected
+# into the system prompt) already carry the same lines, so the persona read
+# the phrase lists three times. Everything from the "Signature phrases"
+# heading up to the "Minimal acknowledgements" bullet goes; that bullet (and
+# its "These are deliberate deadpan replies" sentence, which
+# tests/test_processing_filler.py parses) stays. Read once at import; off,
+# every byte is as before. A drifted literal (a marker missing) leaves the
+# text untouched, and tests/test_prompt_index_canon.py fails instead.
+_SIGNATURE_BLOCK_START = "Signature phrases — use these"
+_SIGNATURE_BLOCK_END = "  Minimal acknowledgements (single-word"
+
+
+def _canon_on() -> bool:
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "PROMPT_INDEX_CANON", False))
+    except Exception:
+        return False
+
+
+def _strip_signature_block(text: str) -> str:
+    """``text`` without the "Signature phrases" block (see above); the very
+    text when either marker is missing or out of order."""
+    a = text.find(_SIGNATURE_BLOCK_START)
+    b = text.find(_SIGNATURE_BLOCK_END)
+    if a < 0 or b < 0 or b <= a:
+        return text
+    return text[:a] + text[b:]
+
+
+if _canon_on():
+    BASE_SYSTEM_PROMPT = _strip_signature_block(BASE_SYSTEM_PROMPT)
+
+
 # HUMOR_MODE == "sarcastic" (core/config.py): this block goes in right after
 # the dry-wit few-shot examples, and the [wry] frequency sentence is swapped.
 # Module-level constants, so the prompt prefix is byte-stable within a session

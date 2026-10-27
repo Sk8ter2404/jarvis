@@ -1819,9 +1819,67 @@ def split_skill_examples(block: str,
         return [("SKILL ACTIONS", block)]
 
 
+# ─── Canonical index (v3 overhaul W12, PROMPT_INDEX_CANON) ───────────────
+# Rare or setup capabilities whose index rows collapse into one line per
+# label: only the capability names are listed, not their actions. The full
+# section (or skill example) with the exact action names and arguments rides
+# the turn that names the capability, so each header must route from its own
+# words; tests/test_prompt_index_canon.py proves it for every header here.
+# A header that appears twice in the prompt is never listed (a collapse is by
+# header). Data only; the monolith passes it when the setting is on.
+_COLLAPSED_NOTE = (
+    "ROUTED ON REQUEST (no action names listed: name the capability and its "
+    "exact actions arrive with the user's message; never guess them):")
+
+COLLAPSED_ROWS = (
+    ("SENSORS AND CAMERAS", (
+        "FACE RECOGNITION", "KINECT DEPTH SENSOR", "POINT-TO-CONTROL",
+        "AIR-MOUSE", "AIR CONTROL", "KINECT GAZE TRACKING",
+        "TV DETECTION", "HAND TRACKING", "HOLO MODE", "GLOBE")),
+    ("SETUP, ACCOUNTS AND TOOLS", (
+        "SMART HOME DISCOVERY", "SMART HOME — PER-BRAND LIST",
+        "LOCAL MODEL SELECTION", "TTS BACKEND SWITCHING",
+        "LOCAL VOICE CLONE", "CUSTOM TTS / XTTS", "WEB INTERFACE",
+        "PHONE NOTIFICATIONS", "NOTIFICATION TRIAGE", "PHONE BRIDGE",
+        "PHONE PINGS", "AMAZON ORDER TRACKER",
+        "CODE EXECUTOR", "WEBSITE BUILDER", "AUDIO OUTPUT DEVICE",
+        "MCP TOOLS", "MCP", "VOICE ENROLLMENT / SPEAKER ID",
+        "CHANGELOG / VERSION", "MEMORY MAINTENANCE", "EMAIL TRIAGE",
+        "AUDIO INPUT DEVICE")),
+    ("STATUS AND DIAGNOSTICS", (
+        "STATUS READ-BACKS", "SUIT DIAGNOSTICS", "SELF-TEST PROBES",
+        "STABILITY GATE", "WEEKLY SCORE", "PATTERN LEARNING",
+        "REPO ROBOT PROJECT", "CLAUDE CREDITS", "PROVENANCE",
+        "SELF DIAGNOSTIC")),
+    ("MODES AND PREFERENCES", (
+        "GUARD MODE", "GAME LOW-POWER MODE", "CLAP TRIGGER", "GUEST MODE",
+        "AMBIENT-LEARNING MODE", "WAKE LISTENER", "BARGE-IN",
+        "SUIT-UP CINEMATIC", "NIGHT-OWL MODE", "WAKE-WORD MODE",
+        "TASTE-AWARE MUSIC")),
+)
+
+
+def _active_hidden(hide, known, excl, head_names, shown) -> frozenset:
+    """The hidden-duplicate names that are really left out of the rows: a
+    name is hidden only when it is registered (in ``known``), never in
+    ``excl`` and its canonical name is VISIBLE - named in the head
+    (``head_names``) or shown in a row of a first pass that hid nothing
+    (``shown``). A canonical that is itself hidden never counts. Never
+    raises."""
+    try:
+        if not hide or not known:
+            return frozenset()
+        visible = (set(head_names) | set(shown)) - set(hide) - set(excl)
+        return frozenset(h for h, c in hide.items()
+                         if h in known and h not in excl and c in visible)
+    except Exception:
+        return frozenset()
+
+
 def slim_stable_pc_block(pc_control: str, skill_block: str = "",
                          known=None, exclude=None, group=None,
-                         skill_texts=None, keep=None) -> str:
+                         skill_texts=None, keep=None, hide=None,
+                         collapse=None) -> str:
     """The SLIM byte-stable PC block: the core preamble + the always-on
     sections (as stable_pc_block) + an ACTION INDEX naming every action the
     full PC_CONTROL text and ``skill_block`` document, under the capability
@@ -1834,8 +1892,15 @@ def slim_stable_pc_block(pc_control: str, skill_block: str = "",
     section header is listed, with or without actions, so no capability
     vanishes. ``keep`` (optional names; v3 W07): spoken names that stay in the
     index even though they share a handler with a name already listed (an
-    alias the model is taught to say, e.g. search_my_files). Pure function of
-    its inputs. Never raises: a fault falls back to
+    alias the model is taught to say, e.g. search_my_files). ``hide`` (v3
+    W12; dict hidden name -> canonical name, core.action_aliases
+    HIDDEN_DUPLICATES): a registered near-duplicate is left out of the rows
+    while its canonical name is visible (in the head or a listed row); it is
+    never removed from anywhere else, and a name whose canonical is not
+    visible stays listed. ``collapse`` (v3 W12; ``((label, (header, ...)),
+    ...)``, see COLLAPSED_ROWS): the rows of those headers are replaced by
+    one line per label that names the capabilities, not their actions. Pure
+    function of its inputs. Never raises: a fault falls back to
     stable_pc_block."""
     try:
         excl = set(SELF_TERMINATING_ACTIONS if exclude is None else exclude)
@@ -1849,21 +1914,49 @@ def slim_stable_pc_block(pc_control: str, skill_block: str = "",
         keep = frozenset(keep or ())
         listed = set(documented_actions(head_text, known)) | excl
         handlers = {group[n] for n in listed if n in group}
-        rows: List[str] = []
         groups = [(h.strip(), b) for h, b in sections
                   if h.strip().upper() not in pinned]
         groups += split_skill_examples(skill_block, skill_texts)
-        for name, body in groups:
-            acts = []
-            for a in documented_actions(body, known):
-                if a in listed or (a in group and group[a] in handlers
-                                   and a not in keep):
+        collapsed: dict = {}
+        for _label, _headers in (collapse or ()):
+            for _h in _headers:
+                collapsed[_h.strip().upper()] = _label
+
+        def build(hidden):
+            lst, hnd = set(listed), set(handlers)
+            out_rows: List[str] = []
+            folded: dict = {}
+            shown: set = set()
+            for name, body in groups:
+                if name.strip().upper() in collapsed:
+                    folded.setdefault(collapsed[name.strip().upper()],
+                                      []).append(name)
                     continue
-                acts.append(a)
-                listed.add(a)
-                if a in group:
-                    handlers.add(group[a])
-            rows.append(name + (": " + ", ".join(acts) if acts else ""))
+                acts = []
+                for a in documented_actions(body, known):
+                    if a in hidden:
+                        continue
+                    if a in lst or (a in group and group[a] in hnd
+                                    and a not in keep):
+                        continue
+                    acts.append(a)
+                    lst.add(a)
+                    if a in group:
+                        hnd.add(group[a])
+                shown.update(acts)
+                out_rows.append(name + (": " + ", ".join(acts)
+                                        if acts else ""))
+            return out_rows, folded, shown
+
+        rows, folded, shown = build(frozenset())
+        hidden = _active_hidden(hide, known, excl, listed, shown)
+        if hidden:
+            rows, folded, shown = build(hidden)
+        if folded:
+            rows.append(_COLLAPSED_NOTE)
+            for label, _headers in (collapse or ()):
+                if folded.get(label):
+                    rows.append(label + ": " + "; ".join(folded[label]))
         return (head_text + _ACTION_INDEX_HEADER + "\n".join(rows))
     except Exception:
         return stable_pc_block(pc_control)

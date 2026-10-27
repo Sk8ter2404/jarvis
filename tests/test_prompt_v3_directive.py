@@ -50,7 +50,7 @@ class SwapTableTests(unittest.TestCase):
         with mock.patch.object(prompts, "_prompt_v3_on", return_value=False):
             self.assertEqual(
                 prompts._apply_swaps("abc", ()), "abc")
-        if not prompts._prompt_v3_on():
+        if not prompts._prompt_v3_on() and not prompts._canon_on():
             self.assertIs(prompts.BASE_SYSTEM_PROMPT,
                           prompts.BASE_SYSTEM_PROMPT_V2)
             self.assertIs(prompts.PC_CONTROL_SAFETY_RULES,

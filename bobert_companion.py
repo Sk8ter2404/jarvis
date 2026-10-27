@@ -17701,6 +17701,7 @@ _TURN_FLAG_KEYS = (
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
     "PROMPT_ROUTED_V3",
+    "PROMPT_INDEX_CANON",
     "SHUTDOWN_TWO_SENTENCE_ASK",
 )
 
@@ -25019,6 +25020,23 @@ def _prompt_slim_on() -> bool:
 # prompt, so "what's using my bandwidth" / "search my files" never found them.
 _ROUTED_V3_INDEX_KEEP = ("search_my_files", "whats_using_bandwidth")
 
+def _canon_index_kwargs() -> dict:
+    """v3 W12 (PROMPT_INDEX_CANON): the canonical-index arguments of
+    prompt_router.slim_stable_pc_block - the hidden near-duplicate names
+    (core.action_aliases.HIDDEN_DUPLICATES, still registered and runnable)
+    and the rare / setup rows to fold into routed lines. {} when the setting
+    is off (the old index, byte for byte). Never raises."""
+    try:
+        if not globals().get("PROMPT_INDEX_CANON", False):
+            return {}
+        from core import action_aliases as _aa
+        from core import prompt_router as _pr
+        return {"hide": dict(_aa.HIDDEN_DUPLICATES),
+                "collapse": _pr.COLLAPSED_ROWS}
+    except Exception:
+        return {}
+
+
 # (id(PC_CONTROL_PROMPT), skill block, len(ACTIONS)) -> the slim stable PC
 # block. Computed once per distinct key, so every turn and the re-prime send
 # the very same bytes.
@@ -25055,7 +25073,8 @@ def _slim_stable_pc(skill_block: str, skill_texts=None) -> str:
                                           keep=(_ROUTED_V3_INDEX_KEEP
                                                 if globals().get(
                                                     "PROMPT_ROUTED_V3", False)
-                                                else None)))
+                                                else None),
+                                          **_canon_index_kwargs()))
         if len(_SLIM_PC_CACHE) > 8:
             _SLIM_PC_CACHE.clear()
         _SLIM_PC_CACHE[key] = hit
