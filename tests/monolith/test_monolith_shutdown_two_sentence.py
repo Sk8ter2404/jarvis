@@ -120,6 +120,26 @@ class TwoSentenceShutdownTests(_Base):
         self.shutdown.assert_called_once()
         self.assertNotIn(QUESTION, self.spoken)
 
+    def test_a_held_shutdown_is_replaced_by_the_question(self):
+        # Review 2026-10-27: the model's shutdown held for a yes stayed
+        # queued, so "Yes." started the overnight protocol and a second
+        # "Yes." ran the stale shutdown_jarvis.
+        for said in (SAID_1019, "Jarvis, shut down. No, overnight protocol."):
+            with self.subTest(said=said):
+                self._fresh()
+                self._hold_shutdown()
+                self.assertEqual(self._route(said),
+                                 "_check_and_arm_shutdown_prompt")
+                self.assertEqual(self.bc._pending_confirmation, [])
+                self.assertEqual(self.spoken, [QUESTION])
+                self.assertEqual(self._route("Yes."),
+                                 "_handle_shutdown_prompt")
+                self.overnight.assert_called_once()
+                self._route("Yes.")
+                self.shutdown.assert_not_called()
+                self.overnight.assert_called_once()
+                self.assertEqual(self.bc._pending_confirmation, [])
+
     def test_the_setting_is_logged_with_the_turn_flags(self):
         self.assertIn("SHUTDOWN_TWO_SENTENCE_ASK", self.bc._TURN_FLAG_KEYS)
 

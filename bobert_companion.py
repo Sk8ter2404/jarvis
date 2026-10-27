@@ -33282,6 +33282,20 @@ def _check_and_arm_shutdown_prompt(text: str) -> bool:
         if _two_sentence:
             print("  [shutdown] two-sentence shutdown + overnight clause "
                   "— asking the overnight question")
+            # The overnight question REPLACES a shutdown the model queued for
+            # a yes (review 2026-10-27): left queued, a "Yes." to the question
+            # started the overnight protocol and a second "Yes." then ran the
+            # stale shutdown_jarvis, powering JARVIS off mid-protocol. Both
+            # answers to the question still go through its own handler.
+            try:
+                if _held_shutdown_pending():
+                    _n_held = len(_pending_confirmation)
+                    _pending_confirmation.clear()
+                    _pending_confirmation_at[0] = 0.0
+                    print(f"  [shutdown] dropped {_n_held} held shutdown "
+                          f"action(s) — the overnight question replaces it")
+            except Exception:
+                pass
     if not _two_sentence:
         if not tl or len(tl.split()) > 6:
             return False
