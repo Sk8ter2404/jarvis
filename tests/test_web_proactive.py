@@ -92,6 +92,9 @@ NOT_PROACTIVE = {
                                    "wake word",
     "PROACTIVE_REQUIRE_FACE": "a condition on proactive comments",
     "PROACTIVE_REQUIRE_OWNER_VOICE": "a condition on proactive comments",
+    "PROACTIVE_NO_ACTION_CLAIMS": "a condition on proactive comments (v3 "
+                                  "W06): drops a remark that claims it did "
+                                  "something; starts nothing",
     "PRESENCE_HOLD_ENABLED": "a condition on queued proactive lines: they "
                              "wait while he is away or the room is talking",
     "NEWS_BRIEFING_ENABLED": "headlines inside the morning / evening "
