@@ -154,6 +154,14 @@ def alias_for(name: str, arg: str, registered) -> "str | None":
 # and so on. A name is hidden only while its canonical name is visible in the
 # prompt (the head grammar or a listed row); otherwise it stays listed.
 # hidden name -> the canonical name the model should say instead.
+# A pair is listed only when the canonical name does the hidden name's whole
+# job. Reviewed OUT (not near-duplicates): schedule_status (scheduler health,
+# not the job list), is_printer_online (no-arg printer check), the toggle_*
+# names (flip, not set), morning_arrival / morning_handoff (own builders;
+# handoff also opens apps), the stark / arc ring statuses (other HUDs),
+# hand_mouse_* (mouse only), last_diagnostic_run (raw JSON) and
+# rag_search_quiet (machine block for Claude). The test pins that each
+# remaining pair shares a handler or sits on a reasoned allow-list.
 # Pinned by tests/test_prompt_index_canon.py: every key and value is
 # registered, no value is itself hidden, no key is in NEVER_ALIAS /
 # SELF_TERMINATING_ACTIONS / CONFIRM tier, and a hidden name's risk tier
@@ -186,34 +194,17 @@ HIDDEN_DUPLICATES: dict[str, str] = {
     "check_system": "system_pulse",
     "system_check": "run_diagnostic",
     "diagnostic_daemon_status": "diagnostic_status",
-    "last_diagnostic_run": "diagnostic_history",
     "last_gate_result": "gate_status",
     "which_mic_is_active": "current_mic",
-    "is_printer_online": "is_device_online",
     "bandwidth_hogs": "network_usage",
     # Schedules: `list_schedule` and `list_schedules` were both listed.
     "list_schedule": "list_schedules",
-    "schedule_status": "list_schedules",
     "fire_schedule": "run_schedule",
     # Focus mode.
     "focus_mode_on": "focus_mode",
     "focus_mode_off": "end_focus_mode",
-    # Overlays and HUD toggles beside their show / hide pairs.
-    "toggle_hud": "show_hud",
-    "toggle_holographic_overlay": "show_holographic_overlay",
-    "bambu_overlay_toggle": "bambu_overlay_on",
-    "stark_status_ring": "arc_reactor_status",
-    "arc_reactor_status_status": "holographic_status",
-    "stark_status_ring_status": "holographic_status",
-    # Briefings: three names dispatched the same morning briefing.
-    "morning_arrival": "morning_briefing",
-    "morning_handoff": "morning_briefing",
-    # Hand features: the _mouse_ and _tracking_ twins.
-    "hand_mouse_off": "hand_tracking_off",
-    "hand_mouse_status": "hand_tracking_status",
-    # Wrappers of the same call.
+    # Wrappers of the same call (make_picture just calls generate_image).
     "make_picture": "generate_image",
-    "rag_search_quiet": "rag_search",
 }
 
 

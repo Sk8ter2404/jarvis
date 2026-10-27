@@ -499,6 +499,15 @@ if _prompt_v3_on():
 # text untouched, and tests/test_prompt_index_canon.py fails instead.
 _SIGNATURE_BLOCK_START = "Signature phrases — use these"
 _SIGNATURE_BLOCK_END = "  Minimal acknowledgements (single-word"
+# The block also carried two behavioural guards (the 2026-10-01
+# completed-work-claim incident; mcu_phrases.py relies on the first), so the
+# cut keeps them as one line. Pinned by SignatureBlockTests.
+_SIGNATURE_GUARD = (
+    "  Status / working lines ('Running the numbers now.', 'Calculating, "
+    "sir.', 'Stand by.', 'Projecting...') go ONLY in a reply whose [ACTION:] "
+    "token does that work - never as a stand-in for an answer; never claim a "
+    "calculation, search or comparison you did not run. Bad news always "
+    "leads with 'I'm afraid'.\n")
 
 
 def _canon_on() -> bool:
@@ -510,13 +519,14 @@ def _canon_on() -> bool:
 
 
 def _strip_signature_block(text: str) -> str:
-    """``text`` without the "Signature phrases" block (see above); the very
-    text when either marker is missing or out of order."""
+    """``text`` without the "Signature phrases" block (see above) but with
+    the one-line _SIGNATURE_GUARD in its place; the very text when either
+    marker is missing or out of order."""
     a = text.find(_SIGNATURE_BLOCK_START)
     b = text.find(_SIGNATURE_BLOCK_END)
     if a < 0 or b < 0 or b <= a:
         return text
-    return text[:a] + text[b:]
+    return text[:a] + _SIGNATURE_GUARD + text[b:]
 
 
 if _canon_on():

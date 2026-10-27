@@ -1827,35 +1827,34 @@ def split_skill_examples(block: str,
 # words; tests/test_prompt_index_canon.py proves it for every header here.
 # A header that appears twice in the prompt is never listed (a collapse is by
 # header). Data only; the monolith passes it when the setting is on.
+# Review (W12): a row is folded only when EVERY phrase its section quotes
+# routes back to a section documenting its actions
+# (CollapsedRowsRouteTests). Not folded, because their phrases do not route:
+# LOCAL MODEL SELECTION, TASTE-AWARE MUSIC, CHANGELOG / VERSION, PHONE
+# NOTIFICATIONS, WEB INTERFACE (hosts hardware_sensors, check_budget),
+# MEMORY MAINTENANCE, EMAIL TRIAGE, SMART HOME, FACE RECOGNITION, KINECT
+# DEPTH SENSOR, POINT-TO-CONTROL, HOLO MODE, GUARD MODE and others.
 _COLLAPSED_NOTE = (
     "ROUTED ON REQUEST (no action names listed: name the capability and its "
     "exact actions arrive with the user's message; never guess them):")
 
 COLLAPSED_ROWS = (
     ("SENSORS AND CAMERAS", (
-        "FACE RECOGNITION", "KINECT DEPTH SENSOR", "POINT-TO-CONTROL",
         "AIR-MOUSE", "AIR CONTROL", "KINECT GAZE TRACKING",
-        "TV DETECTION", "HAND TRACKING", "HOLO MODE", "GLOBE")),
+        "TV DETECTION", "HAND TRACKING", "GLOBE")),
     ("SETUP, ACCOUNTS AND TOOLS", (
-        "SMART HOME DISCOVERY", "SMART HOME — PER-BRAND LIST",
-        "LOCAL MODEL SELECTION", "TTS BACKEND SWITCHING",
-        "LOCAL VOICE CLONE", "CUSTOM TTS / XTTS", "WEB INTERFACE",
-        "PHONE NOTIFICATIONS", "NOTIFICATION TRIAGE", "PHONE BRIDGE",
-        "PHONE PINGS", "AMAZON ORDER TRACKER",
+        "TTS BACKEND SWITCHING", "LOCAL VOICE CLONE",
+        "NOTIFICATION TRIAGE", "PHONE BRIDGE", "PHONE PINGS",
         "CODE EXECUTOR", "WEBSITE BUILDER", "AUDIO OUTPUT DEVICE",
-        "MCP TOOLS", "MCP", "VOICE ENROLLMENT / SPEAKER ID",
-        "CHANGELOG / VERSION", "MEMORY MAINTENANCE", "EMAIL TRIAGE",
-        "AUDIO INPUT DEVICE")),
+        "MCP TOOLS", "MCP", "AUDIO INPUT DEVICE")),
     ("STATUS AND DIAGNOSTICS", (
-        "STATUS READ-BACKS", "SUIT DIAGNOSTICS", "SELF-TEST PROBES",
-        "STABILITY GATE", "WEEKLY SCORE", "PATTERN LEARNING",
-        "REPO ROBOT PROJECT", "CLAUDE CREDITS", "PROVENANCE",
-        "SELF DIAGNOSTIC")),
+        "STATUS READ-BACKS", "SELF-TEST PROBES",
+        "STABILITY GATE", "WEEKLY SCORE",
+        "REPO ROBOT PROJECT", "CLAUDE CREDITS", "PROVENANCE")),
     ("MODES AND PREFERENCES", (
-        "GUARD MODE", "GAME LOW-POWER MODE", "CLAP TRIGGER", "GUEST MODE",
+        "GAME LOW-POWER MODE", "CLAP TRIGGER", "GUEST MODE",
         "AMBIENT-LEARNING MODE", "WAKE LISTENER", "BARGE-IN",
-        "SUIT-UP CINEMATIC", "NIGHT-OWL MODE", "WAKE-WORD MODE",
-        "TASTE-AWARE MUSIC")),
+        "SUIT-UP CINEMATIC", "WAKE-WORD MODE")),
 )
 
 

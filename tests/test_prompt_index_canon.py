@@ -110,9 +110,10 @@ class HiddenDuplicatesTableTests(unittest.TestCase):
         self.assertIn("next_song", reg)
 
     def test_the_table_is_a_real_diet(self):
-        # PLAN W12: about 60 near-duplicate names hidden; the verified table
-        # must stay in that league, not shrink to a token gesture.
-        self.assertGreaterEqual(len(aa.HIDDEN_DUPLICATES), 40)
+        # PLAN W12 aimed at about 60 names; the review pass removed every
+        # pair whose canonical name could not do the hidden name's job, so
+        # the verified table is smaller, but still a real diet.
+        self.assertGreaterEqual(len(aa.HIDDEN_DUPLICATES), 28)
 
     def test_rows_are_lower_snake_case(self):
         for hid, canon in aa.HIDDEN_DUPLICATES.items():
@@ -156,6 +157,75 @@ class HiddenDuplicatesTableTests(unittest.TestCase):
         for hid, canon in aa.HIDDEN_DUPLICATES.items():
             with self.subTest(hidden=hid, canonical=canon):
                 self.assertEqual(_tier(hid), _tier(canon))
+
+    # Pairs whose handlers are different functions but where the canonical
+    # name demonstrably covers the hidden name's output. Every other pair must
+    # share one handler (same registration file and symbol).
+    REVIEWED_PAIRS = {
+        "media_next": "raw media key; next_song is the media-session skip",
+        "media_prev": "raw media key; previous_song is the media-session back",
+        "media_playpause": "raw media key; pause_music toggles the session",
+        "music_status": "now_playing reads the same session",
+        "prime_video": "wrapper: play_streaming takes 'prime|title'",
+        "netflix": "wrapper: play_streaming takes 'netflix|title'",
+        "disney_plus": "wrapper: play_streaming takes 'disney|title'",
+        "hulu": "wrapper: play_streaming takes 'hulu|title'",
+        "max": "wrapper: play_streaming takes 'max|title'",
+        "spotify": "wrapper: play_streaming takes 'spotify|title'",
+        "hue_list_devices": "list_smart_home_devices lists every brand",
+        "govee_list_devices": "list_smart_home_devices lists every brand",
+        "lifx_list_devices": "list_smart_home_devices lists every brand",
+        "kasa_list_devices": "list_smart_home_devices lists every brand",
+        "ecobee_list_devices": "list_smart_home_devices lists every brand",
+        "nest_list_devices": "list_smart_home_devices lists every brand",
+        "ring_list_devices": "list_smart_home_devices lists every brand",
+        "magichome_list_devices": "list_smart_home_devices lists every brand",
+        "tuya_list": "list_smart_home_devices lists every brand",
+        "check_system": "both speak the machine's CPU / RAM / disk posture",
+        "system_check": "self_diagnostic registers run_diagnostic under both",
+        "diagnostic_daemon_status": "diagnostic_status falls back to the "
+                                    "daemon counters (owner's 2026-10-02 call)",
+        "last_gate_result": "same skill, same last-gate record",
+        "which_mic_is_active": "current_mic names the live mic and the "
+                               "preferred-mic override",
+        "focus_mode_on": "focus_mode_on is the chained base of focus_mode",
+        "focus_mode_off": "focus_mode_off is the chained base of "
+                          "end_focus_mode",
+        "make_picture": "one-line wrapper: return generate_image(prompt)",
+    }
+
+    def test_each_pair_shares_a_handler_or_is_reviewed(self):
+        reg = _registry()
+        for hid, canon in aa.HIDDEN_DUPLICATES.items():
+            with self.subTest(hidden=hid, canonical=canon):
+                if reg[hid] == reg[canon]:
+                    continue
+                self.assertIn(hid, self.REVIEWED_PAIRS,
+                              "a hidden name whose handler differs from its "
+                              "canonical's must be reviewed: the canonical "
+                              "must do the hidden name's whole job")
+                self.assertTrue(self.REVIEWED_PAIRS[hid].strip())
+
+    def test_the_reviewed_list_has_no_stale_or_needless_rows(self):
+        reg = _registry()
+        for hid in self.REVIEWED_PAIRS:
+            with self.subTest(hidden=hid):
+                self.assertIn(hid, aa.HIDDEN_DUPLICATES)
+                self.assertNotEqual(reg[hid],
+                                    reg[aa.HIDDEN_DUPLICATES[hid]],
+                                    "same handler: needs no review row")
+
+    def test_pairs_the_review_found_different_stay_out(self):
+        # Each of these has a handler that does a different job from the
+        # canonical name the table once gave it.
+        for n in ("schedule_status", "is_printer_online", "morning_handoff",
+                  "morning_arrival", "toggle_hud", "toggle_holographic_overlay",
+                  "bambu_overlay_toggle", "stark_status_ring",
+                  "arc_reactor_status_status", "stark_status_ring_status",
+                  "hand_mouse_off", "hand_mouse_status",
+                  "last_diagnostic_run", "rag_search_quiet"):
+            with self.subTest(name=n):
+                self.assertNotIn(n, aa.HIDDEN_DUPLICATES)
 
     def test_hidden_duplicate_of_is_a_plain_lookup(self):
         self.assertEqual(aa.hidden_duplicate_of("media_next"), "next_song")
@@ -310,6 +380,7 @@ class CollapsedRowsRouteTests(unittest.TestCase):
         cls.pc_headers = [h.strip() for h, _ in cls.sections]
         cls.parts = _skill_parts()
         cls.headers = [h for _label, hs in pr.COLLAPSED_ROWS for h in hs]
+        cls.known = set(_registry())
 
     def test_labels_and_headers_are_unique(self):
         labels = [label for label, _ in pr.COLLAPSED_ROWS]
@@ -318,7 +389,7 @@ class CollapsedRowsRouteTests(unittest.TestCase):
         self.assertLessEqual(len(labels), 6, "a few routed lines, not a wall")
 
     def test_enough_rows_fold_to_matter(self):
-        self.assertGreaterEqual(len(self.headers), 39)
+        self.assertGreaterEqual(len(self.headers), 30)
 
     def test_every_header_exists_in_the_prompt(self):
         names = set(self.pc_headers) | {n for n, _ in self.parts}
@@ -345,6 +416,95 @@ class CollapsedRowsRouteTests(unittest.TestCase):
                     self.assertIn(text, pr.select_skill_examples(q,
                                                                  self.parts))
 
+    # ── the rule itself: the section's own phrases must route ────────────
+    # A folded section's action names leave the index, so every phrase the
+    # prompt quotes for it (a trigger, an example, an in-row "say ..." list)
+    # must bring back a section that documents one of its actions. Quotes
+    # that are NOT something the owner says (the model's own spoken line, an
+    # argument value) are exempt, each with its reason.
+    _NOT_OWNER_PHRASES = {
+        "GLOBE": {"lat, lon": "argument form of globe_pin"},
+        "STATUS READ-BACKS": {"find out": "verb in an instruction"},
+        "CLAUDE CREDITS": {"one moment": "the model's spoken line"},
+        "CLAP TRIGGER": {
+            "You rang, sir?": "the model's spoken line",
+            "morning setup": "argument of clap_trigger_routine",
+            "morning briefing": "argument of clap_trigger_routine"},
+        "SUIT-UP CINEMATIC": {"Welcome back, sir": "the model's spoken line"},
+    }
+    _PHRASE = re.compile(r"(?<![\w])'([^'\n]{3,90}?)'(?![\w])")
+
+    @classmethod
+    def _routed_actions(cls, phrase):
+        """Action names documented by every PC section and skill example that
+        ``phrase`` (as the owner's whole message) routes to."""
+        inc, _ = pr.select_sections(phrase, cls.sections)
+        bodies = {h.strip(): b for h, b in cls.sections}
+        texts = [bodies.get(h.strip(), "") for h in inc]
+        texts += pr.select_skill_examples(phrase, cls.parts)
+        return set(pr.documented_actions(" ".join(texts), cls.known))
+
+    @classmethod
+    def _folded_texts(cls):
+        """[(header, text)] of every folded PC section and skill part."""
+        out = [(h.strip(), b) for h, b in cls.sections
+               if h.strip() in cls.headers]
+        out += [(n, t) for n, t in cls.parts if n in cls.headers]
+        return out
+
+    def test_every_quoted_phrase_of_a_folded_section_routes_back(self):
+        checked = 0
+        for h, text in self._folded_texts():
+            own = set(pr.documented_actions(text, self.known))
+            exempt = self._NOT_OWNER_PHRASES.get(h, {})
+            flat = re.sub(r"\s+", " ", text)
+            for m in self._PHRASE.finditer(flat):
+                p = m.group(1).strip()
+                if ("[ACTION" in p or "→" in p or "<" in p
+                        or len(p.split()) < 2 or p in exempt):
+                    continue
+                checked += 1
+                with self.subTest(header=h, phrase=p):
+                    self.assertTrue(
+                        self._routed_actions(p) & own,
+                        "folds the index row but the phrase routes to no "
+                        "section that documents any of its actions: un-fold "
+                        "it (COLLAPSED_ROWS) or fix the routing")
+        self.assertGreater(checked, 100, "the phrase scan went blind")
+
+    def test_every_example_line_routes_to_its_own_action(self):
+        # "'phrase' -> [ACTION: name ...]": the routed prompt must document
+        # exactly that name, not just a sibling.
+        seen = 0
+        for h, text in self._folded_texts():
+            for ln in text.split("\n"):
+                if "→" not in ln and "->" not in ln:
+                    continue
+                left, _, right = ln.replace("->", "→").partition("→")
+                names = pr.documented_actions(right)
+                if not names:
+                    continue
+                for m in self._PHRASE.finditer(left):
+                    p = m.group(1).strip()
+                    if "<" in p or len(p.split()) < 2:
+                        continue
+                    seen += 1
+                    with self.subTest(header=h, phrase=p, action=names[0]):
+                        self.assertIn(names[0], self._routed_actions(p))
+        self.assertGreater(seen, 30, "the example scan went blind")
+
+    def test_the_sections_the_review_found_unreachable_stay_unfolded(self):
+        # Their trigger phrases ("what's the GPU temp", "use the cloud",
+        # "go back to auto", "switch to the 32B", "play my Friday night
+        # vibe", "what's new", "what did I miss") do not route back, and
+        # WEB INTERFACE hosts hardware_sensors / check_budget.
+        for h in ("LOCAL MODEL SELECTION", "TASTE-AWARE MUSIC",
+                  "CHANGELOG / VERSION", "PHONE NOTIFICATIONS",
+                  "WEB INTERFACE", "SUIT DIAGNOSTICS", "SELF DIAGNOSTIC",
+                  "MEMORY MAINTENANCE", "GUARD MODE", "FACE RECOGNITION"):
+            with self.subTest(header=h):
+                self.assertNotIn(h, self.headers)
+
     def test_no_collapsed_section_documents_a_self_terminating_action(self):
         bodies = {h.strip(): b for h, b in self.sections}
         for h in self.headers:
@@ -362,7 +522,7 @@ class CollapsedRowsRouteTests(unittest.TestCase):
         plain = pr.slim_stable_pc_block(prompts.PC_CONTROL_PROMPT)
         folded = pr.slim_stable_pc_block(prompts.PC_CONTROL_PROMPT,
                                          collapse=pr.COLLAPSED_ROWS)
-        self.assertLess(len(folded), len(plain) - 1500)
+        self.assertLess(len(folded), len(plain) - 800)
         for h in self.headers:
             if h in self.pc_headers:
                 with self.subTest(header=h):
@@ -383,12 +543,25 @@ class SignatureBlockTests(unittest.TestCase):
         cut = prompts._strip_signature_block(self.V2)
         a = self.V2.index(prompts._SIGNATURE_BLOCK_START)
         b = self.V2.index(prompts._SIGNATURE_BLOCK_END)
-        self.assertEqual(cut, self.V2[:a] + self.V2[b:])
-        self.assertGreaterEqual(len(self.V2) - len(cut), 2000)
+        self.assertEqual(cut, self.V2[:a] + prompts._SIGNATURE_GUARD
+                         + self.V2[b:])
+        self.assertGreaterEqual(len(self.V2) - len(cut), 1800)
         self.assertNotIn("Signature phrases", cut)
         self.assertNotIn("  Acknowledgements: 'Very good, sir.'", cut)
         self.assertNotIn("Pushback / disagreement:", cut)
         self.assertNotIn("Initiative: 'I've taken the liberty of...'", cut)
+
+    def test_the_status_and_concern_guards_survive_the_cut(self):
+        cut = prompts._strip_signature_block(self.V2)
+        self.assertIn("ONLY in a reply whose [ACTION:] token does that work",
+                      cut)
+        self.assertIn("never as a stand-in for an answer", cut)
+        self.assertIn("never claim a calculation, search or comparison you "
+                      "did not run", cut)
+        self.assertIn("always leads with 'I'm afraid'", cut)
+        # and the untouched text has the very guard the cut keeps
+        self.assertIn("ONLY in a reply whose [ACTION:] token does that work",
+                      self.V2)
 
     def test_the_minimal_acknowledgements_span_stays(self):
         cut = prompts._strip_signature_block(self.V2)
