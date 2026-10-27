@@ -214,7 +214,14 @@ class BudgetTests(_Base):
         msgs = p["messages"]
         est = self.bc._prompt_budget.estimate_chat_tokens(msgs[0]["content"],
                                                           msgs[1:])
-        self.assertLess(est, 15000)
+        # PROMPT_INDEX_CANON (default ON since 3.0.0, fair prompt gate in
+        # PLAN.md) takes the STREAMING SERVICES rows out of the stable head;
+        # this turn names netflix and hulu, so they ride it (~1.5k tokens)
+        # while every other turn's head is ~600 tokens smaller. Off: < 15000.
+        limit = 16000 if getattr(self.bc, "PROMPT_INDEX_CANON", False) else 15000
+        self.assertLess(est, limit)
+        self.assertLess(est, self.bc._prompt_budget.budget_for(
+            self.bc._local_num_ctx("gemma-test"), 500))
 
 
 class NameableTests(_Base):

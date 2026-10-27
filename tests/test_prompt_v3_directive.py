@@ -3,7 +3,7 @@
 One bool setting swaps a handful of prompt passages (report 06, E1-E3 and
 E5-E10):
 
-  * OFF (the default until the brain harness gate passes): the previous text,
+  * OFF (the default before 3.0.0's fair prompt gate): the previous text,
     byte for byte - core/prompts.py is only ever changed by exact swaps and
     the old directive survives as _LOCAL_MODE_DIRECTIVE_V2;
   * ON: an [ACTION] token is a REQUEST (rule 3 loses its "unless you emitted
@@ -148,9 +148,10 @@ class DirectiveTests(MonolithGlobalsTestCase):
                 else bc._LOCAL_MODE_DIRECTIVE_V2)
         self.assertEqual(bc._LOCAL_MODE_DIRECTIVE, want)
 
-    def test_default_is_off_in_the_shipped_config(self):
+    def test_default_is_on_in_the_shipped_config(self):
+        # Default ON since 3.0.0 (fair prompt gate, PLAN.md: golden 90.1% -> 94.0%).
         import core.config as cfg
-        self.assertIn("PROMPT_DIRECTIVE_V3 = False",
+        self.assertIn("PROMPT_DIRECTIVE_V3 = True",
                       open(cfg.__file__, encoding="utf-8").read())
 
     def test_v3_rule_three_is_a_request_not_a_result(self):

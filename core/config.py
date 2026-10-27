@@ -1665,11 +1665,15 @@ LOOP_GUARD_MODE = "shadow"
 # looks down the ACTION INDEX before saying "I can't" / "no way to check";
 # the few-shot examples carry their tokens and no invented figures; the
 # guard header gets its blank line; the print-status example names
-# how_is_the_print. False (default until the brain harness gate passes):
-# the previous text, byte for byte (bobert_companion._LOCAL_MODE_DIRECTIVE_V2
-# and core/prompts.py with its v3 swaps skipped). Read once at import, so a
+# how_is_the_print. False: the previous text, byte for byte
+# (bobert_companion._LOCAL_MODE_DIRECTIVE_V2 and core/prompts.py with its v3
+# swaps skipped). Read once at import, so a
 # flip applies on the next start; the stable prefix then prefills cold once.
-PROMPT_DIRECTIVE_V3 = False
+# Default ON since 3.0.0: the fair prompt gate (PLAN.md "FAIR PROMPT GATE
+# RESULT", gemma4:26b, 134 items, seeds 42/43/44) with all three prompt
+# flags on: mean golden 90.1% -> 94.0%, better on all 3 seeds, unverified
+# claims 3 -> 0, stable prompt 43,875 -> 40,815 chars.
+PROMPT_DIRECTIVE_V3 = True
 
 # ─── Prompt v3 routed sections (v3 overhaul W07, 2026-10-27) ─────────────
 # PROMPT_ROUTED_V3 (bool): fixes the wrong-but-registered choices the prompt
@@ -1680,10 +1684,13 @@ PROMPT_DIRECTIVE_V3 = False
 # teaching line each for "pause the video" and "read the results"; the ACTION
 # INDEX names search_my_files and whats_using_bandwidth (they were dropped as
 # aliases of rag_search / network_usage); the session-summaries block is
-# framed as background. False (default until the brain harness gate passes):
-# the previous text, byte for byte. Read once at import, so a flip applies on
-# the next start.
-PROMPT_ROUTED_V3 = False
+# framed as background. False: the previous text, byte for byte. Read once
+# at import, so a flip applies on the next start.
+# Default ON since 3.0.0: the fair prompt gate (PLAN.md "FAIR PROMPT GATE
+# RESULT", gemma4:26b, 134 items, seeds 42/43/44) with all three prompt
+# flags on: mean golden 90.1% -> 94.0%, better on all 3 seeds, unverified
+# claims 3 -> 0, stable prompt 43,875 -> 40,815 chars.
+PROMPT_ROUTED_V3 = True
 
 # ─── Prompt diet and canonical index (v3 overhaul W12, 2026-10-27) ───────
 # PROMPT_INDEX_CANON (bool): the stable prompt was 45.5k characters: the
@@ -1698,10 +1705,14 @@ PROMPT_ROUTED_V3 = False
 # registered, keep their risk tiers and still run when the model says them,
 # they are only not listed; (3) rare / setup capability lines collapse into a
 # few routed lines that name the capability, not each action (the full lines
-# arrive with the turn that names it). False (default until the brain harness
-# gate passes): the previous prompt, byte for byte. Read once at import, so a
+# arrive with the turn that names it). False: the previous prompt, byte for
+# byte. Read once at import, so a
 # flip applies on the next start; the stable prefix then prefills cold once.
-PROMPT_INDEX_CANON = False
+# Default ON since 3.0.0: the fair prompt gate (PLAN.md "FAIR PROMPT GATE
+# RESULT", gemma4:26b, 134 items, seeds 42/43/44) with all three prompt
+# flags on: mean golden 90.1% -> 94.0%, better on all 3 seeds, unverified
+# claims 3 -> 0, stable prompt 43,875 -> 40,815 chars.
+PROMPT_INDEX_CANON = True
 
 # ─── Night quieting (core/night_quiet.py) ────────────────────────────────
 # NIGHT_QUIET_ENABLED — the master switch for everything that changes how

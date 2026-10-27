@@ -106,8 +106,14 @@ class PersonaCopyTests(unittest.TestCase):
         for line in persona.JARVIS_SIGNATURE_PHRASES:
             self.assertIn(line, pool)
         # a quoted example that lives ONLY in the base prompt
-        self.assertIn("Will that be all, sir? Or shall I add it to the running "
-                      "list?", pool)
+        self.assertIn("I'm afraid the build failed, sir.", pool)
+        # PROMPT_INDEX_CANON (default ON since 3.0.0, fair prompt gate in
+        # PLAN.md) cuts the "Signature phrases" block, so its lines are no
+        # longer shown to the model; off, they are and the pool has them.
+        from core import prompts
+        if prompts._SIGNATURE_BLOCK_START in prompts.BASE_SYSTEM_PROMPT:
+            self.assertIn("Will that be all, sir? Or shall I add it to the "
+                          "running list?", pool)
         # the retired live offender stays caught
         self.assertIn(LIVE_LINE, pool)
 
@@ -147,7 +153,12 @@ class PersonaPoolIsTimeNeutralTests(unittest.TestCase):
         from core import prompts
         quoted = pg.quoted_examples(prompts.BASE_SYSTEM_PROMPT)
         self.assertGreater(len(quoted), 40)
-        self.assertIn("You seem rather determined, sir.", quoted)
+        # "You seem rather determined, sir." lived in the "Signature phrases"
+        # block, which PROMPT_INDEX_CANON (default ON since 3.0.0, fair prompt
+        # gate in PLAN.md) cuts; these two survive in both layouts.
+        if prompts._SIGNATURE_BLOCK_START in prompts.BASE_SYSTEM_PROMPT:
+            self.assertIn("You seem rather determined, sir.", quoted)
+        self.assertIn("I'm afraid the build failed, sir.", quoted)
         self.assertIn("I'm afraid that's inadvisable, sir.", quoted)
 
 

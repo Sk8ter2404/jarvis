@@ -2,7 +2,7 @@
 
 One bool setting shrinks the stable prompt without taking any action away:
 
-  * OFF (the default until the brain harness gate passes): the previous
+  * OFF (the default before 3.0.0's fair prompt gate): the previous
     prompt, byte for byte - BASE_SYSTEM_PROMPT_V2 is the untouched persona
     and slim_stable_pc_block() with no ``hide`` / ``collapse`` is the old
     index;
@@ -593,19 +593,21 @@ class SignatureBlockTests(unittest.TestCase):
                    + prompts._SIGNATURE_BLOCK_START)
         self.assertEqual(prompts._strip_signature_block(swapped), swapped)
 
-    def test_off_the_live_text_keeps_the_block(self):
-        # The shipped default is off: the live persona still has the block.
+    def test_on_the_live_text_drops_the_block(self):
+        # Default ON since 3.0.0 (fair prompt gate, PLAN.md: golden 90.1% -> 94.0%):
+        # the live persona no longer carries the block.
         import core.config as cfg
-        if getattr(cfg, "PROMPT_INDEX_CANON", False):
-            self.skipTest("setting is on in this checkout")
-        self.assertIn(prompts._SIGNATURE_BLOCK_START,
-                      prompts.BASE_SYSTEM_PROMPT)
+        if not getattr(cfg, "PROMPT_INDEX_CANON", False):
+            self.skipTest("setting is off in this checkout")
+        self.assertNotIn(prompts._SIGNATURE_BLOCK_START,
+                         prompts.BASE_SYSTEM_PROMPT)
 
 
 class ConfigTests(unittest.TestCase):
-    def test_default_is_off_in_the_shipped_config(self):
+    def test_default_is_on_in_the_shipped_config(self):
+        # Default ON since 3.0.0 (fair prompt gate, PLAN.md: golden 90.1% -> 94.0%).
         import core.config as cfg
-        self.assertIn("PROMPT_INDEX_CANON = False",
+        self.assertIn("PROMPT_INDEX_CANON = True",
                       open(cfg.__file__, encoding="utf-8").read())
 
     def test_the_setting_is_a_bool(self):

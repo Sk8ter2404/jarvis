@@ -479,6 +479,11 @@ class ReviewTurnPathTests(_Base):
         self._p(bc, "_prev_owner_turn_at", [0.0])
         self.assertIsNone(bc._routing_history())
         # ...and the live turn: an old print chat lends "Pause it." nothing.
+        # The stable prompt is the 3.0.0 default's size (fair prompt gate,
+        # PLAN.md: 40,815 chars with the three prompt flags ON), not the
+        # 2.0.x overflow size: at 49,482 plus the longer v3 directive the
+        # budget, not the recency rule, would drop the inherited section.
+        self._big_system_prompt(stable_chars=40815)
         self.posted.clear()
         self._p(bc, "_prev_owner_turn_at", [_time.monotonic() - 600.0])
         payload, _out = self._turn("Pause it.", hist)

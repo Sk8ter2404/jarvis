@@ -3,7 +3,7 @@
 One bool setting fixes wrong-but-registered choices the routed prompt
 sections taught (report 06, E11 + E13, plus the index gap):
 
-  * OFF (the default until the brain harness gate passes): the previous
+  * OFF (the default before 3.0.0's fair prompt gate): the previous
     text, byte for byte - PC_CONTROL_PROMPT is only ever changed by exact
     swaps and the old text survives as PC_CONTROL_PROMPT_V2; the index and
     the session-summaries header are the old ones;
@@ -176,9 +176,10 @@ class SlimIndexKeepTests(unittest.TestCase):
 
 @requires_monolith
 class MonolithTests(MonolithGlobalsTestCase):
-    def test_default_is_off_in_the_shipped_config(self):
+    def test_default_is_on_in_the_shipped_config(self):
+        # Default ON since 3.0.0 (fair prompt gate, PLAN.md: golden 90.1% -> 94.0%).
         import core.config as cfg
-        self.assertIn("PROMPT_ROUTED_V3 = False",
+        self.assertIn("PROMPT_ROUTED_V3 = True",
                       open(cfg.__file__, encoding="utf-8").read())
 
     def test_setting_is_a_turn_flag_key_on_its_own_line(self):
