@@ -1440,6 +1440,13 @@ FAST_PATHS_ENABLED = True
 # narrow core/instant_actions.RULE_ACTIONS (a name no rule produces is
 # ignored). Set via user_settings.json; applies on the next start.
 INSTANT_ACTIONS_MODE = "off"
+
+# PROACTIVE_NO_ACTION_CLAIMS (v3 W06): a proactive remark runs nothing, so it
+# must not claim it did. True = the remark prompt says so, and a remark whose
+# unverified-claim phrase is first person ("I've taken the liberty of pulling
+# up your schedule") is logged and dropped instead of voiced; passive
+# observations still speak. False = the old behaviour, byte for byte.
+PROACTIVE_NO_ACTION_CLAIMS = True
 INSTANT_ACTIONS_ALLOW = [
     "volume_up", "volume_down", "volume_mute", "volume_unmute",
     "pause_music", "resume_music", "next_song", "previous_song",
