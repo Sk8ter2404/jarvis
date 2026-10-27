@@ -17572,6 +17572,7 @@ _TURN_FLAG_KEYS = (
     "LOCAL_TURN_CTX_IN_HISTORY", "SENTENCE_TTS_MIN_CHARS",
     "SENTENCE_TTS_LOOKAHEAD_MERGE", "LOCAL_STREAMING_TTS",
     "TTS_OUTPUT_LATENCY", "PLAYBACK_KEEPER", "PLAYBACK_PRIMED_STREAM",
+    "PROMPT_DIRECTIVE_V3",
 )
 
 
@@ -22285,7 +22286,7 @@ def _ollama_pull_async(model: str) -> None:
 # the runtime logs produced "claims it did X without doing it", verbose
 # rambling, and unsolicited moralising. Appended at the FINAL (most-salient)
 # position of the system prompt on every local call. 2026-05-30.
-_LOCAL_MODE_DIRECTIVE = (
+_LOCAL_MODE_DIRECTIVE_V2 = (
     "\n\n----------\n"
     "YOU ARE RUNNING ON THE LOCAL MODEL. Obey these rules EXACTLY:\n"
     "1. To DO anything on the computer (play music, set a timer, open an "
@@ -22314,6 +22315,53 @@ _LOCAL_MODE_DIRECTIVE = (
     "address the user as 'sir'.\n"
     "----------\n"
 )
+
+
+# v3 overhaul W03 (PROMPT_DIRECTIVE_V3): the same directive with three rules
+# rewritten. Built from the old text by exact swaps, so everything else stays
+# byte for byte; a swap that no longer finds its text leaves that rule as it
+# was (tests/test_prompt_v3_directive.py fails loudly instead).
+_DIRECTIVE_V3_SWAPS = (
+    # Rule 2: search when the fact is volatile (report 06, E6).
+    ("sentence with NO token (e.g. 'Three hundred ninety-one, sir.').\n",
+     "sentence with NO token (e.g. 'Three hundred ninety-one, sir.'). But "
+     "SEARCH ([ACTION: web_search, ...], then read the result) when sir says "
+     "look up, search, read up on, find out or hunt down, or when the answer "
+     "is current or product-specific: prices, specs and ranges of a named "
+     "model, release notes, news, scores, opening hours. Never state such a "
+     "figure from memory.\n"),
+    # Rule 3: a token is a request, not a result (E1).
+    ("3. NEVER claim you have completed, queued, started, paused, resumed, or "
+     "'taken the liberty of' something unless you emitted its [ACTION: ...] "
+     "token in THIS reply. If you cannot do it, say so plainly in one sentence.\n",
+     "3. An [ACTION: ...] token is a REQUEST, not a result: it can fail or be "
+     "held for sir's 'yes'. In a reply that carries a token say only what you "
+     "are starting ('On it, sir.'), never 'done', 'opened', 'moved', "
+     "'switched' or 'I've taken the liberty of'; report success only once the "
+     "result has come back to you. If the token reads or looks something up "
+     "(status, list, search, screen, check), write NOTHING after it - no "
+     "figure, no summary. If nothing in the ACTION INDEX fits, say so in one "
+     "sentence; but look down the index first: 'I can't' about something it "
+     "lists is an error.\n"),
+    # Rule 6: the print-status action's visible name (E10).
+    ("(e.g. [ACTION: print_status])", "(e.g. [ACTION: how_is_the_print])"),
+)
+
+
+def _directive_v3(old: str) -> str:
+    out = old
+    for _a, _b in _DIRECTIVE_V3_SWAPS:
+        out = out.replace(_a, _b, 1)
+    return out
+
+
+_LOCAL_MODE_DIRECTIVE_V3 = _directive_v3(_LOCAL_MODE_DIRECTIVE_V2)
+# Read once at import (the knob changes on a restart, so the cached prefix
+# stays stable within a run). Tests that pin the directive compare against
+# this name.
+_LOCAL_MODE_DIRECTIVE = (
+    _LOCAL_MODE_DIRECTIVE_V3 if globals().get("PROMPT_DIRECTIVE_V3", False)
+    else _LOCAL_MODE_DIRECTIVE_V2)
 
 
 # (number of registered actions, cheatsheet text) or None. Keyed on the action
@@ -24584,7 +24632,11 @@ def _slim_stable_pc(skill_block: str, skill_texts=None) -> str:
     hit = _SLIM_PC_CACHE.get(key)
     if hit is None:
         from core import prompt_router as _pr
-        hit = (_LOCAL_NEVER_GUESS_GUARD + "\n"
+        # v3 W03 (E8): the guard's first line used to glue onto whatever
+        # precedes the slimmed block; PROMPT_DIRECTIVE_V3 puts a blank line
+        # in front of it. Off: the old bytes.
+        hit = (("\n\n" if globals().get("PROMPT_DIRECTIVE_V3", False) else "")
+               + _LOCAL_NEVER_GUESS_GUARD + "\n"
                + _pr.slim_stable_pc_block(PC_CONTROL_PROMPT, skill_block or "",
                                           known=known, group=group,
                                           skill_texts=skill_texts))
