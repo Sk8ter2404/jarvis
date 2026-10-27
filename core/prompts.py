@@ -34,6 +34,110 @@ from core.persona import (
 )
 
 _SIGNATURE_POOL_BLOCK = render_signature_phrase_pool()
+
+# ─── Prompt v3 core (v3 overhaul W03) ────────────────────────────────────
+# PROMPT_DIRECTIVE_V3 (core/config.py) rewrites a few passages of the persona
+# and safety text so the prompt stops teaching the failures the validators
+# then fight: an [ACTION] token is a REQUEST (no "done" before the result is
+# in), the few-shot examples carry their tokens and no invented figures,
+# questions never sit beside a token, and "I've no way to check that" is only
+# for a subject the action list does not cover. The shipped literals below
+# are NOT edited: the v3 text is produced from them by exact swaps, once, at
+# import (a knob that changes on a restart). Off, every byte is as before. A
+# swap whose old text is missing is skipped (tests/test_prompt_v3_directive.py
+# fails instead, so a drifted literal is caught in CI, not silently).
+
+
+def _prompt_v3_on() -> bool:
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "PROMPT_DIRECTIVE_V3", False))
+    except Exception:
+        return False
+
+
+def _apply_swaps(text: str, swaps) -> str:
+    for old, new in swaps:
+        text = text.replace(old, new, 1)
+    return text
+
+
+_BASE_V3_SWAPS = (
+    # E2: stance 1 stops teaching "Done, sir." before the result.
+    ("task acknowledged or done. Open with an acknowledgement ('Very good, "
+     "sir.' / 'On it, sir.' / 'Done, sir.' / 'Right away, sir.'). One "
+     "sentence.",
+     "task acknowledged ('On it, sir.' / 'Right away, sir.' / 'Very good, "
+     "sir.'). 'Done, sir.' only in a reply with no token, after the result "
+     "is in. One sentence."),
+    # E2: the liberty example is a result-in line, never beside its token.
+    ("'I've taken the liberty of muting your microphone, sir — there was "
+     "music in the room.'",
+     "'I've taken the liberty of muting your microphone, sir — there was "
+     "music in the room.' (only once its result is in; beside the token "
+     "itself say 'On it, sir.')"),
+    # E2: the adjacent-fact example opens with an acknowledgement.
+    ("'Done, sir. Also, the print's nearly through by its own estimate",
+     "'On it, sir. Also, the print's nearly through by its own estimate"),
+    # E3: few-shot bodies carry tokens and no invented numbers (header kept).
+    ("  Example 1 — sir asks JARVIS to restart the build at 3:47 AM after a "
+     "long debug session.\n"
+     "    Sir: 'Restart the build, would you?'\n"
+     "    JARVIS: '[intent:dry_wit] Are you quite sure, sir? It is nearly 4 "
+     "AM, and you've rebuilt this twice in the last hour. Very well — "
+     "restarting now.'\n"
+     "  Example 2 — sir asks for the disk usage.\n"
+     "    Sir: 'How's the disk looking?'\n"
+     "    JARVIS: '[intent:dry_wit] 94% full, sir — a trifle awkward. Also, "
+     "your downloads folder accounts for rather a lot of it.'\n"
+     "  Example 3 — sir announces an obviously bad idea.\n"
+     "    Sir: 'I'm just going to delete the migrations and rerun them.'\n"
+     "    JARVIS: '[intent:dry_wit] A bold choice, sir. I'll note that for "
+     "posterity — and stand by to restore from backup, as one does.'\n",
+     "  Example 1 — sir asks JARVIS to open a game at 3:47 AM.\n"
+     "    Sir: 'Open Fortnite.' (turn context: it is 3:47 AM)\n"
+     "    JARVIS: '[intent:dry_wit] It is nearly 4 AM, sir. Very well. "
+     "[ACTION: launch_app, Fortnite]'\n"
+     "  Example 2 — sir asks for the disk usage. The look-up token ends the "
+     "reply; the figure comes only in the next round.\n"
+     "    Sir: 'How's the disk looking?'\n"
+     "    JARVIS: '[intent:briefing] One moment, sir. [ACTION: system_pulse]'\n"
+     "    (next round, with the reading in hand) JARVIS: '[intent:dry_wit] "
+     "94% full, sir — a trifle awkward.'\n"
+     "  Example 3 — sir announces an obviously bad idea.\n"
+     "    Sir: 'I'm just going to delete the migrations and rerun them.'\n"
+     "    JARVIS: '[intent:dry_wit] A bold choice, sir. I'll note that for "
+     "posterity.'\n"
+     "  Example 4 — a plain action request.\n"
+     "    Sir: 'Play Michael Jackson.'\n"
+     "    JARVIS: '[intent:confirmation] Right away, sir. [ACTION: "
+     "play_music, Michael Jackson]'\n"),
+    # E5: questions never beside a token (one line, every named phrase kept).
+    ("use a neutral opener ('Very good, sir.' / 'Certainly, sir.' / "
+     "'Of course, sir.') or none.\n",
+     "use a neutral opener ('Very good, sir.' / 'Certainly, sir.' / "
+     "'Of course, sir.') or none. 'Shall I run the numbers' and 'Are you "
+     "quite sure' are QUESTIONS for sir: never write one beside an [ACTION] "
+     "token, and never ask permission for what you can simply do.\n"),
+    # E5: "A bold choice" only for a risky announcement.
+    ("('A bold choice, sir.' / 'I'll note that for posterity.')",
+     "('A bold choice, sir.' only when sir announces a risky choice - never "
+     "after 'yes', thanks or a command / 'I'll note that for posterity.')"),
+    # E9: the ten tag words, once, at the start.
+    ("Unrecognised tags also fall back to neutral — pick from the list "
+     "above.",
+     "Use ONLY the ten words above (not 'observation' or 'concern'), "
+     "exactly once, at the very start - never a second tag later in the "
+     "reply."),
+)
+
+_SAFETY_V3_SWAPS = (
+    # E7: "no way to check" only after the index has been read.
+    ("  • Say plainly you cannot check it: ",
+     "  • ONLY after looking down the action list above and finding no "
+     "capability that fits the subject, say plainly you cannot check it: "),
+)
+
 _TONE_MODULATION_BLOCK = render_tone_modulation_block()
 
 # The two CLOCK-ONLY rules in the stress-detection section below: the hour as
@@ -377,6 +481,11 @@ BASE_SYSTEM_PROMPT = (
     "every line is wry the cadence stops being funny."
 )
 
+# Pre-v3 text, kept whole: the off path (and tests) read this.
+BASE_SYSTEM_PROMPT_V2 = BASE_SYSTEM_PROMPT
+if _prompt_v3_on():
+    BASE_SYSTEM_PROMPT = _apply_swaps(BASE_SYSTEM_PROMPT, _BASE_V3_SWAPS)
+
 
 # HUMOR_MODE == "sarcastic" (core/config.py): this block goes in right after
 # the dry-wit few-shot examples, and the [wry] frequency sentence is swapped.
@@ -517,6 +626,11 @@ PC_CONTROL_SAFETY_RULES = (
     "a close name for the RIGHT subject is corrected for you. The wrong "
     "subject is the only thing you must never send.\n\n"
 )
+
+PC_CONTROL_SAFETY_RULES_V2 = PC_CONTROL_SAFETY_RULES
+if _prompt_v3_on():
+    PC_CONTROL_SAFETY_RULES = _apply_swaps(
+        PC_CONTROL_SAFETY_RULES, _SAFETY_V3_SWAPS)
 
 
 # ─── SELF-KNOWLEDGE (2026-10-01) ────────────────────────────────────────

@@ -1544,6 +1544,20 @@ SPEECH_HYGIENE = True
 # (self-termination, confirmation, pushback) still runs on the new name.
 ACTION_ALIASES = True
 
+# ─── Prompt v3 core (v3 overhaul W03, 2026-10-27) ────────────────────────
+# PROMPT_DIRECTIVE_V3 (bool): the wording of the prompt rules the local
+# model obeys, as one switch. True: an [ACTION] token is a REQUEST, not a
+# result (nothing after a reading token, no "done" before the result is
+# in); the model SEARCHES when a fact is volatile or sir says look up; it
+# looks down the ACTION INDEX before saying "I can't" / "no way to check";
+# the few-shot examples carry their tokens and no invented figures; the
+# guard header gets its blank line; the print-status example names
+# how_is_the_print. False (default until the brain harness gate passes):
+# the previous text, byte for byte (bobert_companion._LOCAL_MODE_DIRECTIVE_V2
+# and core/prompts.py with its v3 swaps skipped). Read once at import, so a
+# flip applies on the next start; the stable prefix then prefills cold once.
+PROMPT_DIRECTIVE_V3 = False
+
 # ─── Night quieting (core/night_quiet.py) ────────────────────────────────
 # NIGHT_QUIET_ENABLED — the master switch for everything that changes how
 # JARVIS sounds at night because of the CLOCK alone: the 'hushed_late' voice
