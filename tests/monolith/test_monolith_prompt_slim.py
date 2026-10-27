@@ -162,7 +162,11 @@ class PrefixStabilityTests(_Base):
         self.assertGreaterEqual(self._tok(shared), _MIN_SHARED_TOKENS)
         head = self.bc._local_prompt_head(self._sys(a))
         self.assertTrue(head and self._sys(a).startswith(head))
-        self.assertGreaterEqual(self._tok(head), _MIN_SHARED_TOKENS)
+        # v3 W12 (PROMPT_INDEX_CANON) cuts ~2.3k chars of persona phrase
+        # lists out of the head on purpose: the floor drops with it.
+        floor = _MIN_SHARED_TOKENS - (
+            1000 if getattr(self.bc, "PROMPT_INDEX_CANON", False) else 0)
+        self.assertGreaterEqual(self._tok(head), floor)
 
     def test_learning_a_fact_or_topic_leaves_the_local_prompt_alone(self):
         bc = self.bc
@@ -231,6 +235,19 @@ class NameableTests(_Base):
         missing = [a for a in documented
                    if a not in SELF_TERMINATING_ACTIONS
                    and not _word_in(a, slim) and handler(a) not in present]
+        if getattr(bc, "PROMPT_INDEX_CANON", False):
+            # v3 W12: a hidden duplicate stays registered but is not listed,
+            # and a collapsed capability is named by its header (its actions
+            # arrive with the routed section). tests/test_prompt_index_canon
+            # proves both; here they are simply not "missing".
+            from core import action_aliases as _aa
+            _core, _secs = pr.split_pc_control(bc.PC_CONTROL_PROMPT)
+            _fold = {h.upper() for _l, hs in pr.COLLAPSED_ROWS for h in hs}
+            _routed = set(pr.documented_actions(
+                " ".join(b for h, b in _secs if h.strip().upper() in _fold),
+                set(bc.ACTIONS)))
+            missing = [a for a in missing
+                       if a not in _aa.HIDDEN_DUPLICATES and a not in _routed]
         self.assertEqual(missing, [])
         for a in SELF_TERMINATING_ACTIONS:
             idx = slim[slim.find("ACTION INDEX"):]

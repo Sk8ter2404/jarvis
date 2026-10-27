@@ -1607,6 +1607,38 @@ ACTION_FIT_MODE = "shadow"
 # flip applies on the next start; the stable prefix then prefills cold once.
 PROMPT_DIRECTIVE_V3 = False
 
+# ─── Prompt v3 routed sections (v3 overhaul W07, 2026-10-27) ─────────────
+# PROMPT_ROUTED_V3 (bool): fixes the wrong-but-registered choices the prompt
+# itself teaches. True: click targets are the distinctive words only (UI
+# AUTOMATION); "the verb decides" and "turn on all ..." in SMART HOME;
+# open_url only for a URL sir said or a site you are sure of; the MULTI-MONITOR
+# section leads with PLAY = youtube_play then move_window_to_monitor; one
+# teaching line each for "pause the video" and "read the results"; the ACTION
+# INDEX names search_my_files and whats_using_bandwidth (they were dropped as
+# aliases of rag_search / network_usage); the session-summaries block is
+# framed as background. False (default until the brain harness gate passes):
+# the previous text, byte for byte. Read once at import, so a flip applies on
+# the next start.
+PROMPT_ROUTED_V3 = False
+
+# ─── Prompt diet and canonical index (v3 overhaul W12, 2026-10-27) ───────
+# PROMPT_INDEX_CANON (bool): the stable prompt was 45.5k characters: the
+# "Signature phrases" list repeated what the 20-line pool and the phrasebook
+# already carry, the ACTION INDEX named every near-duplicate (8 pause / next
+# names, 11 play / video, 12 smart-home lists, `list_schedule` next to
+# `list_schedules`, ...) and ~39 rare or setup lines, and voice turns reached
+# 15.5k of 16.4k tokens, so the prompt-budget dropped long-term memory five
+# times. True: (1) the "Signature phrases" block is cut (the "Minimal
+# acknowledgements" lines stay); (2) the ACTION INDEX shows one visible name
+# per job - the duplicates in core/action_aliases.HIDDEN_DUPLICATES stay
+# registered, keep their risk tiers and still run when the model says them,
+# they are only not listed; (3) rare / setup capability lines collapse into a
+# few routed lines that name the capability, not each action (the full lines
+# arrive with the turn that names it). False (default until the brain harness
+# gate passes): the previous prompt, byte for byte. Read once at import, so a
+# flip applies on the next start; the stable prefix then prefills cold once.
+PROMPT_INDEX_CANON = False
+
 # ─── Night quieting (core/night_quiet.py) ────────────────────────────────
 # NIGHT_QUIET_ENABLED — the master switch for everything that changes how
 # JARVIS sounds at night because of the CLOCK alone: the 'hushed_late' voice

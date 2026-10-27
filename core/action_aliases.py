@@ -143,6 +143,80 @@ def alias_for(name: str, arg: str, registered) -> "str | None":
         return None
 
 
+# ─── Hidden duplicates (v3 overhaul W12, PROMPT_INDEX_CANON) ─────────────
+# Registered actions that do (nearly) the same job as a canonical one. Unlike
+# ALIASES these are REAL names: they stay in ACTIONS, keep their core.action_risk
+# tier, stay in the INFORMATIVE / VERBATIM sets, and still run when the model
+# says them - nothing is ever rewritten. They are only left out of the ACTION
+# INDEX in the prompt (core.prompt_router.slim_stable_pc_block ``hide``), so
+# the model sees one name per job: 8 pause / next names, 11 play / video
+# names, 12 smart-home list names, ``list_schedule`` beside ``list_schedules``
+# and so on. A name is hidden only while its canonical name is visible in the
+# prompt (the head grammar or a listed row); otherwise it stays listed.
+# hidden name -> the canonical name the model should say instead.
+# A pair is listed only when the canonical name does the hidden name's whole
+# job. Reviewed OUT (not near-duplicates): schedule_status (scheduler health,
+# not the job list), is_printer_online (no-arg printer check), the toggle_*
+# names (flip, not set), morning_arrival / morning_handoff (own builders;
+# handoff also opens apps), the stark / arc ring statuses (other HUDs),
+# hand_mouse_* (mouse only), last_diagnostic_run (raw JSON) and
+# rag_search_quiet (machine block for Claude). The test pins that each
+# remaining pair shares a handler or sits on a reasoned allow-list.
+# Pinned by tests/test_prompt_index_canon.py: every key and value is
+# registered, no value is itself hidden, no key is in NEVER_ALIAS /
+# SELF_TERMINATING_ACTIONS / CONFIRM tier, and a hidden name's risk tier
+# equals its canonical's or is stricter.
+HIDDEN_DUPLICATES: dict[str, str] = {
+    # Raw media keys beside the media-session actions (pause the video ->
+    # media_prev was the c013 failure).
+    "media_next": "next_song",
+    "media_prev": "previous_song",
+    "media_playpause": "pause_music",
+    "music_status": "now_playing",
+    # One generic streaming action takes "<service>|<title>".
+    "prime_video": "play_streaming",
+    "netflix": "play_streaming",
+    "disney_plus": "play_streaming",
+    "hulu": "play_streaming",
+    "max": "play_streaming",
+    "spotify": "play_streaming",
+    # One smart-home list instead of one per brand.
+    "hue_list_devices": "list_smart_home_devices",
+    "govee_list_devices": "list_smart_home_devices",
+    "lifx_list_devices": "list_smart_home_devices",
+    "kasa_list_devices": "list_smart_home_devices",
+    "ecobee_list_devices": "list_smart_home_devices",
+    "nest_list_devices": "list_smart_home_devices",
+    "ring_list_devices": "list_smart_home_devices",
+    "magichome_list_devices": "list_smart_home_devices",
+    "tuya_list": "list_smart_home_devices",
+    # Status and health.
+    "check_system": "system_pulse",
+    "system_check": "run_diagnostic",
+    "diagnostic_daemon_status": "diagnostic_status",
+    "last_gate_result": "gate_status",
+    "which_mic_is_active": "current_mic",
+    "bandwidth_hogs": "network_usage",
+    # Schedules: `list_schedule` and `list_schedules` were both listed.
+    "list_schedule": "list_schedules",
+    "fire_schedule": "run_schedule",
+    # Focus mode.
+    "focus_mode_on": "focus_mode",
+    "focus_mode_off": "end_focus_mode",
+    # Wrappers of the same call (make_picture just calls generate_image).
+    "make_picture": "generate_image",
+}
+
+
+def hidden_duplicate_of(name: str) -> "str | None":
+    """The canonical name a hidden duplicate stands for, or None. Pure data
+    lookup: it never rewrites a name (the hidden name still runs as itself)."""
+    try:
+        return HIDDEN_DUPLICATES.get((name or "").strip().lower())
+    except Exception:
+        return None
+
+
 # Short words said as letters, so a label reads the way the owner says it.
 _LABEL_WORDS = {
     "hud": "HUD", "url": "URL", "tv": "TV", "pc": "PC", "cpu": "CPU",

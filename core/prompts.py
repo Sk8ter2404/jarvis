@@ -487,6 +487,52 @@ if _prompt_v3_on():
     BASE_SYSTEM_PROMPT = _apply_swaps(BASE_SYSTEM_PROMPT, _BASE_V3_SWAPS)
 
 
+# ─── Prompt diet (v3 overhaul W12) ───────────────────────────────────────
+# PROMPT_INDEX_CANON (core/config.py) cuts the "Signature phrases" list: the
+# 20-line SIGNATURE PHRASE POOL above it and mcu_phrases' phrasebook (injected
+# into the system prompt) already carry the same lines, so the persona read
+# the phrase lists three times. Everything from the "Signature phrases"
+# heading up to the "Minimal acknowledgements" bullet goes; that bullet (and
+# its "These are deliberate deadpan replies" sentence, which
+# tests/test_processing_filler.py parses) stays. Read once at import; off,
+# every byte is as before. A drifted literal (a marker missing) leaves the
+# text untouched, and tests/test_prompt_index_canon.py fails instead.
+_SIGNATURE_BLOCK_START = "Signature phrases — use these"
+_SIGNATURE_BLOCK_END = "  Minimal acknowledgements (single-word"
+# The block also carried two behavioural guards (the 2026-10-01
+# completed-work-claim incident; mcu_phrases.py relies on the first), so the
+# cut keeps them as one line. Pinned by SignatureBlockTests.
+_SIGNATURE_GUARD = (
+    "  Status / working lines ('Running the numbers now.', 'Calculating, "
+    "sir.', 'Stand by.', 'Projecting...') go ONLY in a reply whose [ACTION:] "
+    "token does that work - never as a stand-in for an answer; never claim a "
+    "calculation, search or comparison you did not run. Bad news always "
+    "leads with 'I'm afraid'.\n")
+
+
+def _canon_on() -> bool:
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "PROMPT_INDEX_CANON", False))
+    except Exception:
+        return False
+
+
+def _strip_signature_block(text: str) -> str:
+    """``text`` without the "Signature phrases" block (see above) but with
+    the one-line _SIGNATURE_GUARD in its place; the very text when either
+    marker is missing or out of order."""
+    a = text.find(_SIGNATURE_BLOCK_START)
+    b = text.find(_SIGNATURE_BLOCK_END)
+    if a < 0 or b < 0 or b <= a:
+        return text
+    return text[:a] + _SIGNATURE_GUARD + text[b:]
+
+
+if _canon_on():
+    BASE_SYSTEM_PROMPT = _strip_signature_block(BASE_SYSTEM_PROMPT)
+
+
 # HUMOR_MODE == "sarcastic" (core/config.py): this block goes in right after
 # the dry-wit few-shot examples, and the [wry] frequency sentence is swapped.
 # Module-level constants, so the prompt prefix is byte-stable within a session
@@ -3283,3 +3329,65 @@ PC_CONTROL_PROMPT = (
     "SHUTDOWN ALIASES (all route to the same graceful power-down as shutdown_jarvis):\n"
     "  Aliases: exit_jarvis, quit_jarvis, turn_off_jarvis, power_off_jarvis, shut_down\n"
 )
+
+
+# ─── Prompt v3 routed sections (v3 overhaul W07) ─────────────────────────
+# PROMPT_ROUTED_V3 (core/config.py) fixes wrong-but-registered choices the
+# routed sections themselves teach (report 06, E11): a whole noun phrase as a
+# click target, "turn on all ..." read as a list request, open_url with a
+# guessed address, a monitor PLAY taught as a search, "pause the video" sent
+# to a track skip, "read the results" sent to screenshot. Like the W03 swaps
+# these are exact text swaps applied once at import: off, every byte is as
+# before; a swap whose old text is missing is skipped
+# (tests/test_prompt_routed_v3.py fails instead).
+
+
+def _routed_v3_on() -> bool:
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "PROMPT_ROUTED_V3", False))
+    except Exception:
+        return False
+
+
+_ROUTED_V3_SWAPS = (
+    # BASIC open_url: a URL sir said, or a site you are certain of.
+    ("                                  play_streaming / streaming_search)\n",
+     "                                  play_streaming / streaming_search)\n"
+     "                                  Only a URL sir said or a site you are\n"
+     "                                  certain of; otherwise web_search.\n"),
+    # MULTI-MONITOR: lead with PLAY versus SEARCH.
+    ("MULTI-MONITOR APP LAUNCHING:\n",
+     "MULTI-MONITOR APP LAUNCHING:\n"
+     "  PLAY on a monitor = youtube_play, then move_window_to_monitor.\n"
+     "  A SEARCH on a monitor = open_on_monitor, <monitor> | youtube <query>\n"
+     "  (plays nothing).\n"),
+    # UI AUTOMATION: short click targets.
+    ("    'click that MrBeast video'   → [ACTION: click, the MrBeast video]\n",
+     "    'click that MrBeast video'   → [ACTION: click, MrBeast video]\n"),
+    ("    asks which one, stop: sir answers.\n",
+     "    asks which one, stop: sir answers.\n"
+     "    Target = the distinctive words only: drop 'that', 'the', 'for me'\n"
+     "    and any 'on the X monitor'.\n"),
+    # SMART HOME: the verb decides.
+    ("    white', 'turn off all the lights'.\n",
+     "    white', 'turn off all the lights', 'turn on all the smart home\n"
+     "    devices'.\n"
+     "    The verb decides: turn on / off / dim / set = smart_home_control;\n"
+     "    only 'what / list ... do I have' is a list request.\n"),
+    # MUSIC + VIDEO PLAYBACK: pause is a pause, never a track skip.
+    ("    explicit 'press the play/pause key' request only — never a fallback.\n",
+     "    explicit 'press the play/pause key' request only — never a fallback.\n"
+     "    'pause the video' / 'pause it' → [ACTION: pause_music]; media_prev\n"
+     "    and media_next are track skips, never a pause.\n"),
+    # SCREEN VISION: reading results is see_screen.
+    ("never pass a file name to see_screen.\n\n",
+     "never pass a file name to see_screen.\n"
+     "    'read the results' / 'is the video playing' → [ACTION: see_screen,\n"
+     "    <that question>], never screenshot.\n\n"),
+)
+
+# Pre-W07 text, kept whole: the off path (and tests) read this.
+PC_CONTROL_PROMPT_V2 = PC_CONTROL_PROMPT
+if _routed_v3_on():
+    PC_CONTROL_PROMPT = _apply_swaps(PC_CONTROL_PROMPT, _ROUTED_V3_SWAPS)
