@@ -93,6 +93,15 @@ _STRONG_KEEP = re.compile(
 
 _NAME_STATED = re.compile(r"\bcall me\b|\bmy name(?:'s| is| was)\b", re.I)
 
+# A polite request to be told a fact ("can you remember that I'm vegan",
+# "will you remember my wife's name is Anna") hands JARVIS something to
+# keep even though it opens like a question. It needs that/this or a
+# first-person word right after the verb, so "can you remember what I said"
+# and "do you remember ..." stay skips.
+_POLITE_REMEMBER = re.compile(
+    r"^(?:can|could|will|would) you (?:please )?(?:remember|keep in mind|note)"
+    r"\s+(?:(?:that|this)\b|i\b|i'm\b|i've\b|i'll\b|my\b|our\b)", re.I)
+
 # Corrections of what JARVIS did / said / heard.
 _CORRECTION = re.compile(
     r"\bi meant\b|\bi said\b|\bthat'?s (?:not|wrong|incorrect|not right)\b|"
@@ -199,7 +208,8 @@ def _decide(user_msg, ai_reply, ran_actions) -> tuple:
     if _STRONG_KEEP.search(low):
         # "do you remember ..." / "what's my name" ask JARVIS for something;
         # only a stated name or "call me" still counts inside a question.
-        if not question_led or _NAME_STATED.search(low):
+        if (not question_led or _NAME_STATED.search(low)
+                or _POLITE_REMEMBER.match(low)):
             return True, "explicit"
     try:
         reply = (ai_reply or "").lower()
