@@ -172,6 +172,80 @@ class EarlyHoldTests(unittest.TestCase):
                                        "what time is it"))
 
 
+class UnearnedBoldChoiceTests(unittest.TestCase):
+    """v3 W01: "A bold choice" answers a choice the owner stated, nothing else."""
+
+    CASES = {
+        # id: (owner's words, raw reply, what is left)
+        "chat-02": ("Jarvis, honestly, does pineapple belong on pizza?",
+                    "[intent:dry_wit] [wry] A bold choice, if I may say so, "
+                    "sir. I'd wager most Italians would have a collective "
+                    "aneurysm at the thought.",
+                    "[intent:dry_wit] [wry] I'd wager most Italians would "
+                    "have a collective aneurysm at the thought."),
+        "c046": ("Jarvis, you will worry too much. Try to find me.",
+                 "[intent:amused] A bold choice, if I may say so, sir. I'll "
+                 "leave your digital invisibility to you, then.",
+                 "[intent:amused] I'll leave your digital invisibility to "
+                 "you, then."),
+        "c045": ("yes",
+                 "[intent:amused] A bold choice, if I may say so, sir. I "
+                 "shall prepare the blackout curtains accordingly.",
+                 "[intent:amused] I shall prepare the blackout curtains "
+                 "accordingly."),
+    }
+
+    def test_replies_lose_the_opener(self):
+        for name, (user, raw, want) in self.CASES.items():
+            with self.subTest(name=name):
+                self.assertEqual(af.strip_unearned_bold_choice(raw, user),
+                                 want)
+
+    def test_c012_a_bare_opener_before_an_action_becomes_empty(self):
+        out = af.strip_unearned_bold_choice(
+            "[intent:amused] A bold choice, sir.",
+            "Jarvis, turn on a video on YouTube on the left monitor.")
+        self.assertEqual(out, "")
+
+    def test_a_stated_choice_keeps_it(self):
+        for user in ("I'm going to delete the migrations",
+                     "I'm gonna skip class", "I think I'll sell the truck",
+                     "I decided to quit", "let's wipe the drive",
+                     "I'll just reinstall windows", "I’m going to try it"):
+            with self.subTest(user=user):
+                reply = ("[intent:dry_wit] A bold choice, if I may say so, "
+                         "sir. Proceed with care.")
+                self.assertEqual(af.strip_unearned_bold_choice(reply, user),
+                                 reply)
+
+    def test_only_a_leading_opener_is_touched(self):
+        reply = "Noted, sir. A bold choice, as it happens."
+        self.assertEqual(af.strip_unearned_bold_choice(reply, "hello"), reply)
+        self.assertEqual(af.strip_unearned_bold_choice("", "x"), "")
+        self.assertEqual(af.strip_unearned_bold_choice("Fine.", ""), "Fine.")
+
+    def test_opener_variants(self):
+        for opener in ("A bold choice.", "A bold choice, sir.",
+                       "A bold choice, if I may.", "A bold choice, sir:",
+                       "a bold choice, if I may say so, sir!"):
+            with self.subTest(opener=opener):
+                self.assertEqual(
+                    af.strip_unearned_bold_choice(opener + " The answer is 4.",
+                                                  "what is 2 + 2"),
+                    "The answer is 4.")
+
+    def test_a_sentence_that_merely_starts_the_same_way_is_kept(self):
+        reply = ("[intent:dry_wit] A bold choice to question the hardware, "
+                 "sir. It is perfectly normal.")
+        self.assertEqual(af.strip_unearned_bold_choice(reply, "Is that normal?"),
+                         reply)
+
+    def test_the_persona_pool_is_unchanged(self):
+        from core import persona
+        self.assertIn("A bold choice, if I may say so, sir.",
+                      persona.render_signature_phrase_pool())
+
+
 class SuggestionPoolTests(unittest.TestCase):
     def test_every_meal_has_several_short_generic_lines(self):
         for meal, lines in af.MEAL_SUGGESTIONS.items():

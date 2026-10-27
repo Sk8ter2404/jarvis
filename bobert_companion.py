@@ -17684,6 +17684,7 @@ _TURN_FLAG_KEYS = (
     "PROACTIVE_NO_ACTION_CLAIMS",
     "LEARN_PREFILTER",
     "BOOT_PARALLEL_LOAD",
+    "SPEECH_HYGIENE",
 )
 
 
@@ -24792,6 +24793,14 @@ class _SentenceFlushBuffer:
             if _advice_fallback.early_hold(piece, _turn_user_text()):
                 self._stopped = True
                 return True
+            # v3 W01: an "A bold choice, sir." the owner's words do not earn
+            # is dropped from the final text (_run_llm_dispatch_body); hold
+            # it here too so the stream does not voice it first.
+            if (globals().get("SPEECH_HYGIENE", True)
+                    and _advice_fallback.unearned_bold_opener(
+                        piece, _turn_user_text())):
+                self._stopped = True
+                return True
         except Exception:
             self._stopped = True   # fail closed: don't early-speak
             return True
@@ -27083,6 +27092,13 @@ def _parse_intent_tag(text: str) -> tuple[str | None, str]:
     stripped = text[m.end():]
     if raw in _INTENT_PRESETS:
         return raw, stripped
+    # v3 W01: "concern" / "observation" name no preset; route them to one
+    # that exists (core/speech_hygiene.INTENT_ALIASES) instead of dropping
+    # the prosody. Off with SPEECH_HYGIENE.
+    if globals().get("SPEECH_HYGIENE", True):
+        alias = _speech_hygiene.INTENT_ALIASES.get(raw)
+        if alias in _INTENT_PRESETS:
+            return alias, stripped
     return None, stripped
 
 # _USER_TONE_TTS (user-tone→preset map), the text-keyword classifier
@@ -40787,6 +40803,7 @@ from core import claim_validator as _claim_validator  # noqa: E402
 from core import units as _units  # noqa: E402
 from core import joke_fallback as _joke_fallback  # noqa: E402
 from core import advice_fallback as _advice_fallback  # noqa: E402
+from core import speech_hygiene as _speech_hygiene  # noqa: E402
 
 
 # ── Turn grounding ledger (2026-09-29) ──────────────────────────────────────
@@ -41370,6 +41387,13 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
 ]
 
 
+# The first weather_briefing pattern: a bare "<n> degrees <unit>" (v3 W01
+# gives it its own cue rule in _detect_preemptive_hallucination).
+_WEATHER_BARE_UNIT_RE = next(
+    (_rx for _rx, _an, _d in _PREEMPTIVE_HALLUCINATION_PATTERNS
+     if _an == "weather_briefing"), None)
+
+
 # Matches one or more LEADING bracket metadata tags — [intent:confirmation],
 # [mood:dry], [wry], etc. — so the hallucination interceptor can scan the actual
 # PROSE (its patterns anchor to the prose start with ^).
@@ -41429,11 +41453,26 @@ def _detect_preemptive_hallucination(
                            and not _units.may_be_weather_request(user_text)))
     except Exception:
         _conversion = False
+    _hygiene = bool(globals().get("SPEECH_HYGIENE", True))
     for regex, action_name, desc in _PREEMPTIVE_HALLUCINATION_PATTERNS:
         if _conversion and action_name == "weather_briefing":
             continue
         if not regex.search(scan):
             continue
+        # v3 W01: a nozzle / PETG / oven / CPU temperature is not the weather
+        # (replay web-04, p-temp-print*), and a bare "64 degrees" needs a
+        # weather cue in the reply or a temperature ask in the owner's words.
+        if _hygiene and action_name == "weather_briefing":
+            try:
+                if _speech_hygiene.device_temperature_skip(user_text, scan):
+                    continue
+                if (regex is _WEATHER_BARE_UNIT_RE
+                        and _speech_hygiene.bare_unit_needs_cue(
+                            scan, user_text,
+                            _units.may_be_weather_request(user_text))):
+                    continue
+            except Exception:
+                pass
         if action_name and action_name in ACTIONS:
             if is_grounded is not None and is_grounded(action_name):
                 continue
@@ -44587,9 +44626,17 @@ def _strip_markdown_for_speech(text: str) -> str:
     emits when reading back task descriptions, upgrade summaries, or other
     file content — NOT the [intent:xxx] / [wry] markers, which are handled
     separately before this runs. Also normalises currency amounts to spoken
-    words so '$8.18' isn't read as a clock time."""
+    words so '$8.18' isn't read as a clock time.
+
+    v3 W01 (SPEECH_HYGIENE): a [intent:x] / [mood:x] / [wry] left in the
+    MIDDLE of a reply (only a leading tag is parsed off) is removed first,
+    before the snake_case rule turns "[intent:bad_news]" into words."""
     if not text:
         return text
+    if globals().get("SPEECH_HYGIENE", True):
+        text = _speech_hygiene.strip_stray_tags(text)
+        if not text:
+            return text
     # Currency → spoken money BEFORE other subs so "$8.18" becomes
     # "8 dollars and 18 cents" and never reaches TTS as the time "eight eighteen".
     text = _currency_to_words(text)
@@ -50610,6 +50657,20 @@ def _run_llm_dispatch_body(text: str) -> str:
     # Applied BEFORE the quip layer so a quip attaches to the unspoken tail.
     _full_spoken = spoken_text
     spoken_text = _strip_stream_spoken_prefix(spoken_text)
+    # v3 W01: "A bold choice, if I may say so, sir." answering nothing the
+    # owner chose (a question, a number, a "yes") is dropped from the final
+    # text, for the action and the no-action reply alike. Nothing already
+    # voiced early is touched (the stream holds the opener back).
+    if (spoken_text and not _stream_spoken_prefix[0]
+            and globals().get("SPEECH_HYGIENE", True)):
+        _bold_out = _advice_fallback.strip_unearned_bold_choice(
+            spoken_text, text)
+        if not _bold_out and not action_results:
+            _bold_out = spoken_text     # a bare reply: never go silent on it
+        if _bold_out != spoken_text:
+            print("  [speech-hygiene] dropped an unearned \"A bold choice\" "
+                  "opener")
+            spoken_text = _bold_out
     # Self-voiced actions (a device dialogue) already said everything: no
     # prose, answer-first, quip, verbatim result or follow-up for this reply.
     _self_voiced_only = _all_self_voiced(action_results)

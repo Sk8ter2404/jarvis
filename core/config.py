@@ -1497,6 +1497,19 @@ INSTANT_ACTIONS_ALLOW = [
     "smart_home_control", "pause_print",
 ]
 
+# ─── Spoken-text hygiene (core/speech_hygiene.py, v3 W01) ───────────────
+# SPEECH_HYGIENE (bool, default True): small fixes to what the owner hears.
+#   - a mid-reply [intent:x] / [mood:x] / [wry] is removed before synthesis
+#     (only a LEADING tag was parsed; the rest was read out as words), and
+#     the intent names "concern" / "observation" route to an existing preset;
+#   - the weather-from-memory injector no longer runs weather_briefing on a
+#     printer / appliance / CPU temperature, and a bare "64 degrees" needs a
+#     weather cue in the reply or a temperature ask in the owner's words;
+#   - a leading "A bold choice, ..." is dropped unless the owner's words state
+#     a plan or choice for it to answer.
+# False restores the old behaviour exactly. Applies on the next start.
+SPEECH_HYGIENE = True
+
 # ─── Night quieting (core/night_quiet.py) ────────────────────────────────
 # NIGHT_QUIET_ENABLED — the master switch for everything that changes how
 # JARVIS sounds at night because of the CLOCK alone: the 'hushed_late' voice
