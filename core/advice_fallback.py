@@ -247,6 +247,72 @@ def strip_misfit_opener(reply: str, user_text: str) -> Optional[str]:
         return None
 
 
+# The owner's words state a plan or a choice: only then does "A bold choice"
+# answer something (v3 W01). The plan's list (going to / gonna / I think I'll /
+# decided / let's / I'll just) plus the plain "I'm <verb>ing ..." plan the
+# existing flush tests use ("I'm painting the garage orange").
+_STATED_CHOICE_RE = re.compile(
+    r"\bi\s*['\u2019]?m\s+(?:going\s+to|gonna|going\s+with|thinking\s+of)\b"
+    r"|\bi\s*['\u2019]?m\s+[a-z]+ing\b"
+    r"|\bi\s+(?:want\s+to|plan\s+to|chose|choose|picked)\b"
+    r"|\bi\s+am\s+(?:going\s+to|gonna)\b"
+    r"|\bim\s+(?:going\s+to|gonna)\b"
+    r"|\bi\s+think\s+i['\u2019]?ll\b"
+    r"|\bi['\u2019]?ve\s+decided\b|\bi\s+decided\b"
+    r"|\blet['\u2019]?s\b|\blets\b"
+    r"|\bi['\u2019]?ll\s+(?:just|go|have|take|get|do|try|order|make|"
+    r"pick|use)\b"
+    r"|\bi\s+will\s+(?:just|go|have|take|get|do|try|order|make|pick|use)\b",
+    re.I)
+
+
+def states_a_choice(user_text: str) -> bool:
+    """True when the owner's words state a plan or a choice."""
+    try:
+        return bool(_STATED_CHOICE_RE.search(str(user_text or "")))
+    except Exception:
+        return True
+
+
+def unearned_bold_opener(reply: str, user_text: str) -> bool:
+    """True when ``reply`` OPENS with "A bold choice[, if I may say so][, sir]"
+    and the owner's words state no plan or choice for it to answer."""
+    try:
+        if not reply or states_a_choice(user_text):
+            return False
+        tags = _TAG_RE.match(reply)
+        body = reply[len(tags.group(0)):] if tags else reply
+        m = _MISFIT_OPENER_RE.match(body)
+        # A standalone phrase only: "A bold choice to question the hardware"
+        # is a sentence that happens to start the same way, not the tic.
+        return bool(m and re.search(r"[,.;:!—–-]\s*$", m.group(0)))
+    except Exception:
+        return False
+
+
+def strip_unearned_bold_choice(reply: str, user_text: str) -> str:
+    """``reply`` without a leading "A bold choice, ..." the owner's words do
+    not earn (live 10-16 11:09, 10-19 20:28, 10-20 09:34: the line answered a
+    question, a number, a "yes"). Leading [tags] are kept. A reply that is
+    ONLY the opener becomes "" - the caller decides whether saying nothing
+    is right (it is when an action ran; it is not for a bare reply). Never
+    raises."""
+    try:
+        if not unearned_bold_opener(reply, user_text):
+            return reply
+        tags = _TAG_RE.match(reply)
+        head = tags.group(0) if tags else ""
+        body = reply[len(head):]
+        m = _MISFIT_OPENER_RE.match(body)
+        rest = body[m.end():].strip()
+        if not rest or not re.search(r"\w", rest):
+            return ""
+        rest = rest[0].upper() + rest[1:]
+        return head + rest
+    except Exception:
+        return reply
+
+
 def early_hold(piece: str, user_text: str) -> bool:
     """True when a streamed opening sentence must NOT be voiced early because
     apply() may replace or trim it once the whole reply is in."""

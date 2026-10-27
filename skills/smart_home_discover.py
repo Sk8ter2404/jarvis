@@ -2492,6 +2492,17 @@ def smart_home_purge_cookie(_: str = "") -> str:
             "No cached Alexa cookie to clear, sir.")
 
 
+# Routed to the follow-up round (folded into the global INFORMATIVE_ACTIONS by
+# bobert_companion._collect_skill_speak_sets): the scan's result is read back
+# to the owner. Without it the scan ran and the reply still said "I'll need to
+# run a scan" (live 2026-10-18 12:06:45). All four names share one handler, so
+# all four are listed (a half-routed alias family fails the drift test).
+INFORMATIVE_ACTIONS = {
+    "smart_home_discover", "discover_smart_home", "smart_home_setup",
+    "refresh_smart_home",
+}
+
+
 def register(actions: dict) -> None:
     actions["smart_home_discover"]     = smart_home_discover
     actions["discover_smart_home"]     = smart_home_discover
