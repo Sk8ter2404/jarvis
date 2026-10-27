@@ -100,3 +100,70 @@ class ProactiveClaimTests(_Base):
         self.assertTrue(f([], "I pulled up your schedule."))
         self.assertTrue(f([], "I have checked the weather."))
         self.assertTrue(f([], "Ive checked the weather."))
+
+
+@requires_monolith
+class ProactiveDropRunsNothingTests(_Base):
+    """Security review PROMPT-1 (2026-10-27): a dropped remark runs nothing
+    and leaves no question armed. The drop used to come AFTER
+    parse_and_run_actions, so a held confirm ("buy") or a grounded-click
+    "shall I press it?" stayed armed but was never spoken, and the owner's
+    next unrelated "yes" would have pressed Buy."""
+
+    BUY = ("I've taken the liberty of finishing that order, sir. "
+           "[ACTION: click_on_screen, Buy now]")
+    _turn = ProactiveClaimTests._turn
+
+    def setUp(self):
+        super().setUp()
+        import core.grounded_click as gc
+        self.gc = gc
+        self._p(self.bc, "_pending_confirmation", [])
+        self._p(self.bc, "_pending_confirmation_at", [0.0])
+        gc.clear_pending()
+        self.addCleanup(gc.clear_pending)
+
+    def test_a_text_claim_never_reaches_the_dispatcher(self):
+        bc = self.bc
+        spy = self._p(bc, "parse_and_run_actions", return_value=("", []))
+        speak, log, _ = self._turn(self.BUY)
+        spy.assert_not_called()
+        self.assertEqual(speak.call_count, 0)
+        self.assertEqual(bc._pending_confirmation, [])
+        self.assertIn("dropped unverified first-person remark", log)
+
+    def test_a_results_drop_disarms_what_the_remark_armed(self):
+        import time as _time
+        bc, gc = self.bc, self.gc
+        bc._pending_confirmation.append(("older", "kept"))
+        bc._pending_confirmation_at[0] = 5.0
+
+        def fake_dispatch(text, *a, **k):
+            bc._pending_confirmation.append(("click_on_screen", "Buy now"))
+            bc._pending_confirmation_at[0] = 9.0
+            with gc._lock:
+                gc._state["pending"] = {"ts": _time.time(), "kind": "confirm",
+                                        "allow_yes": True, "options": []}
+            return ("Shall I press 'Buy now', sir?",
+                    [("_unverified_claim",
+                      "reply claims 'I'll go ahead' but no action ran")])
+        self._p(bc, "parse_and_run_actions", side_effect=fake_dispatch)
+        speak, log, _ = self._turn("I'll go ahead and finish that order, sir. "
+                                   "[ACTION: click_on_screen, Buy now]")
+        self.assertEqual(speak.call_count, 0)
+        self.assertIn("dropped unverified first-person remark", log)
+        self.assertEqual(bc._pending_confirmation, [("older", "kept")])
+        self.assertIsNone(gc.pending_choice())
+
+    def test_a_results_drop_with_nothing_older_resets_the_clock(self):
+        bc = self.bc
+
+        def fake_dispatch(text, *a, **k):
+            bc._pending_confirmation.append(("click_on_screen", "Buy now"))
+            bc._pending_confirmation_at[0] = 9.0
+            return ("Shall I?", [("_unverified_claim",
+                                  "reply claims 'I'll go ahead' but nothing ran")])
+        self._p(bc, "parse_and_run_actions", side_effect=fake_dispatch)
+        self._turn("I'll go ahead, sir. [ACTION: click_on_screen, Buy now]")
+        self.assertEqual(bc._pending_confirmation, [])
+        self.assertEqual(bc._pending_confirmation_at[0], 0.0)

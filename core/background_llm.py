@@ -35,8 +35,10 @@ and falls back to the main brain, so no learning is lost.
 """
 from __future__ import annotations
 
+import ipaddress
 import threading
 import time
+from urllib.parse import urlsplit
 
 try:
     import requests as _requests
@@ -141,6 +143,38 @@ def clean_base_url(value) -> str:
     return value.strip().rstrip("/")
 
 
+# The Tailscale CGNAT range 100.64/10, built from its integer form.
+_TAILNET = ipaddress.ip_network((0x64400000, 10))
+
+
+def url_allowed(base_url) -> bool:
+    """True when the background host may receive memory / conversation /
+    room text (security review NET-3, 2026-10-27): https to any host, or
+    plain http ONLY to loopback, a Tailscale 100.64/10 address or a
+    *.ts.net name (WireGuard-encrypted). A LAN or foreign host over plain
+    http is refused, so a sniffing or spoofing device on the LAN (or a
+    stranger's .52 on a foreign Deco network) never gets that text."""
+    url = clean_base_url(base_url)
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if parts.scheme == "https":
+        return True
+    if parts.scheme != "http":
+        return False
+    if host == "localhost" or host.endswith(".ts.net"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or (ip.version == 4 and ip in _TAILNET)
+
+
 def clean_model(value) -> str:
     s = value.strip() if isinstance(value, str) else ""
     return s or DEFAULT_MODEL
@@ -169,7 +203,7 @@ def route(base_url, caller: str, background: bool, health: HealthMemo = None) ->
     """"remote" or "main" for one call. "remote" needs ALL of: a configured
     URL, a background call, an allowlisted (not owner-facing) caller, and a
     remote host not memoised as down."""
-    if not clean_base_url(base_url):
+    if not clean_base_url(base_url) or not url_allowed(base_url):
         return "main"
     if not background or pinned_to_main():
         return "main"
@@ -200,26 +234,54 @@ def build_payload(model: str, system: str, messages: list, max_tokens: int,
     return payload
 
 
+_SESSION = []
+_SESSION_LOCK = threading.Lock()
+
+
+def _session():
+    """One shared requests.Session with trust_env off: no HTTP(S)_PROXY,
+    Windows system proxy or .netrc ever carries the payload (NET-5)."""
+    if _requests is None:
+        return None
+    with _SESSION_LOCK:
+        if not _SESSION or _SESSION[0][0] is not _requests:
+            sess = _requests.Session()
+            sess.trust_env = False
+            _SESSION[:] = [(_requests, sess)]
+        return _SESSION[0][1]
+
+
 def chat(base_url: str, model: str, system: str, messages: list,
          max_tokens: int, timeout_s: float, think=None, post=None):
     """POST one /api/chat to the remote host. Returns (text, body_dict).
     Raises RemoteFailure on a connection error, timeout, non-2xx or empty
     reply; the health memo is updated either way."""
-    poster = post or (_requests.post if _requests is not None else None)
+    if not url_allowed(base_url):
+        raise RemoteFailure("background host refused: plain http off the tailnet")
+    if post is not None:
+        poster = post
+    else:
+        sess = _session()
+        poster = sess.post if sess is not None else None
     if poster is None:
         raise RemoteFailure("requests unavailable")
     payload = build_payload(model, system, messages, max_tokens, think=think)
     url = clean_base_url(base_url) + "/api/chat"
     try:
+        # Never follow a redirect: a 307/308 would re-POST the whole body to
+        # wherever Location says (NET-5).
         r = poster(url, json=payload,
-                   timeout=(CONNECT_TIMEOUT_S, clean_timeout(timeout_s)))
+                   timeout=(CONNECT_TIMEOUT_S, clean_timeout(timeout_s)),
+                   allow_redirects=False)
     except Exception as e:
         HEALTH.note_failure()
         raise RemoteFailure(f"{type(e).__name__}: {e}") from e
     status = getattr(r, "status_code", 200)
-    if not getattr(r, "ok", 200 <= status < 300):
-        if status >= 500:
-            HEALTH.note_failure()
+    # Any non-2xx (a 3xx, a 404 for a missing model, a 400) arms the memo, so
+    # the next jobs go to the main brain instead of re-sending the full
+    # payload (NET-5). requests counts a 3xx as .ok, so the status decides.
+    if not (200 <= status < 300) or not getattr(r, "ok", True):
+        HEALTH.note_failure()
         raise RemoteFailure(f"HTTP {status}")
     try:
         body = r.json()

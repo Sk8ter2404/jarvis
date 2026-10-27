@@ -308,8 +308,12 @@ class RegisterTests(_Fresh):
             D.register({})
         th.assert_called_once()
 
-    def test_declared_informative_and_prompted(self):
-        self.assertEqual(tuple(D.INFORMATIVE_ACTIONS), ("agents_status",))
+    def test_declared_verbatim_never_informative_and_prompted(self):
+        """Security review NET-2 (2026-10-27): Office text (written by Claude
+        agents, or any loopback process) is spoken word for word and never
+        goes to the follow-up brain, whose reply runs actions."""
+        self.assertEqual(tuple(D.SPEAK_VERBATIM_ACTIONS), ("agents_status",))
+        self.assertEqual(tuple(getattr(D, "INFORMATIVE_ACTIONS", ())), ())
         self.assertIn("[ACTION: agents_status]", D.PROMPT_EXAMPLES)
         self.assertIn("anything waiting on me", D.PROMPT_EXAMPLES)
 
@@ -321,14 +325,14 @@ class RegisterTests(_Fresh):
         try:
             with mock.patch.object(cfg, "AGENT_DESK_ENABLED", False, create=True):
                 mod = importlib.reload(sys.modules[name])
-                self.assertEqual(tuple(mod.INFORMATIVE_ACTIONS), ())
+                self.assertEqual(tuple(mod.SPEAK_VERBATIM_ACTIONS), ())
                 self.assertEqual(mod.PROMPT_EXAMPLES, "")
                 acts = {}
                 mod.register(acts)
                 self.assertEqual(acts, {})
         finally:
             importlib.reload(sys.modules[name])
-        self.assertEqual(tuple(D.INFORMATIVE_ACTIONS), ("agents_status",))
+        self.assertEqual(tuple(D.SPEAK_VERBATIM_ACTIONS), ("agents_status",))
         self.assertIn("agents_status", D.PROMPT_EXAMPLES)
 
     def test_defaults_in_config(self):

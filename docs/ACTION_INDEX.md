@@ -32,8 +32,8 @@
 | — skill / core registered | 595 |
 | tested | 715 |
 | **untested** (no test names it) | 37 |
-| spoken note: VERBATIM | 399 |
-| spoken note: INFORMATIVE | 84 |
+| spoken note: VERBATIM | 400 |
+| spoken note: INFORMATIVE | 83 |
 | spoken note: SELF-VOICED | 0 |
 | **no spoken note** (neither) | 269 |
 | no `prompts.py` example | 532 |
@@ -52,7 +52,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `add_notification_rule` | `skills/notification_triage.py:1566` | **VERBATIM** | — | yes |
 | `add_reminder` | `skills/shopping_list.py:104` | **VERBATIM** | yes | yes |
 | `add_shopping_item` | `skills/shopping_list.py:46` | **VERBATIM** | yes | yes |
-| `agents_status` | `skills/agent_desk.py:344` | *INFORMATIVE* | — | yes |
+| `agents_status` | `skills/agent_desk.py:349` | **VERBATIM** | — | yes |
 | `air_control_off` | `skills/air_control.py:405` | **VERBATIM** | yes | yes |
 | `air_control_on` | `skills/air_control.py:385` | **VERBATIM** | yes | yes |
 | `air_control_status` | `skills/air_control.py:414` | **VERBATIM** | yes | yes |
@@ -428,7 +428,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `morning_tabs` | `skills/_example_skill.py:19` | neither | — | yes |
 | `mouse_control_off` | `skills/kinect_air_mouse.py:4059` | **VERBATIM** | — | yes |
 | `mouse_control_on` | `skills/kinect_air_mouse.py:4030` | **VERBATIM** | — | yes |
-| `move_file` | `skills/file_move.py:969` | **VERBATIM** | — | yes |
+| `move_file` | `skills/file_move.py:1011` | **VERBATIM** | — | yes |
 | `move_window_to_monitor` | `core/actions.py:6764` | neither | yes | yes |
 | `ms_graph_calendar` | `skills/ms_graph.py:775` | **VERBATIM** | — | yes |
 | `music_aggregate` | `skills/apple_music_intel.py:932` | **VERBATIM** | — | yes |
@@ -525,7 +525,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `rag_status` | `skills/personal_rag.py:211` | **VERBATIM** | — | yes |
 | `read_changelog` | `core/actions.py:6052` | **VERBATIM** | yes | yes |
 | `read_email` | `skills/email_triage.py:1099` | *INFORMATIVE* | — | yes |
-| `read_link` | `skills/link_reader.py:919` | **VERBATIM** | — | yes |
+| `read_link` | `skills/link_reader.py:953` | **VERBATIM** | — | yes |
 | `read_message` | `skills/email_triage.py:1099` | *INFORMATIVE* | — | no |
 | `read_thread` | `skills/email_triage.py:1099` | *INFORMATIVE* | — | yes |
 | `recall_screen` | `core/actions.py:5967` | *INFORMATIVE* | yes | yes |
@@ -707,7 +707,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `tv_status` | `skills/tv_detect.py:492` | **VERBATIM** | — | yes |
 | `type` | `core/actions.py:3326` | neither | yes | yes |
 | `undo_click` | `core/actions.py:4019` | **VERBATIM** | yes | yes |
-| `undo_last_move` | `skills/file_move.py:983` | **VERBATIM** | — | yes |
+| `undo_last_move` | `skills/file_move.py:1025` | **VERBATIM** | — | yes |
 | `unread_email` | `skills/email_triage.py:1076` | *INFORMATIVE* | — | yes |
 | `unread_emails` | `skills/email_triage.py:1076` | *INFORMATIVE* | — | no |
 | `upgrade` | `core/actions.py:6944` | neither | — | yes |

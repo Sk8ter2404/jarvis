@@ -472,7 +472,7 @@ class MoveTests(unittest.TestCase):
         src = self.p.dl("resume.pdf", data=b"y" * 999)
         with mock.patch.object(FM, "_same_drive", return_value=False):
             q, res = ask_and_yes("move_file", "resume to nextcloud documents")
-        self.assertEqual(res, "Done, sir - 'resume.pdf' is now in Documents.")
+        self.assertEqual(res, "Done, sir - 'resume.pdf' is now in Documents in Nextcloud.")
         dest = os.path.join(self.p.nc, "Documents", "resume.pdf")
         self.assertEqual(os.path.getsize(dest), 999)
         self.assertFalse(os.path.exists(src))

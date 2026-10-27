@@ -72,6 +72,8 @@ class LinkReaderDispatchTests(_Base):
         self._p(G, "safe_get", lambda *a, **k: self.fetch(*a, **k))
 
     def _turn(self, arg="https://example.com/c"):
+        # The owner gave the link (NET-1: a link he never gave is not read).
+        self._p(self.bc, "_last_user_text", ["read %s" % arg])
         printed = self._run("One moment, sir. [ACTION: read_link, %s]" % arg,
                             text="what does this say")
         return printed

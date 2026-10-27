@@ -118,7 +118,7 @@ class SchemaTests(_Base):
         tt.note_text("second", "voice")
         rec = tt.commit(LINE.replace("kind=voice", "kind=inject"), "ok")
         self.assertEqual(rec["channel"], "web")
-        self.assertEqual(rec["you"], "first")
+        self.assertEqual(rec["you_chars"], len("first"))
 
     def test_shadow_line_with_no_turn_open_rides_with_next_turn(self):
         tt.observe("  [learn-prefilter] would skip (command)")
@@ -154,6 +154,7 @@ class SchemaTests(_Base):
         tt.begin()
         rec = tt.commit(LINE, "ok")
         self.assertNotIn("you", rec)
+        self.assertNotIn("you_chars", rec)
         self.assertNotIn("actions", rec)
 
     def test_garbage_inputs_never_raise(self):
@@ -186,13 +187,12 @@ class WriterTests(_Base):
     def test_timer_flush_writes_append_only_json_lines(self):
         for n in range(3):
             tt.begin()
-            tt.note_text(f"turn {n}", "voice")
+            tt.note_text("turn" + "!" * n, "voice")
             tt.commit(LINE, "ok")
         _delay, fn = self.timers.calls[0]
         fn()    # the timer fires
         recs = self.records()
-        self.assertEqual([r["you"] for r in recs],
-                         ["turn 0", "turn 1", "turn 2"])
+        self.assertEqual([r["you_chars"] for r in recs], [4, 5, 6])
         self.assertEqual(len(self.files()), 1)
         tt.begin()
         tt.note_text("turn 3", "voice")
@@ -209,8 +209,30 @@ class WriterTests(_Base):
         tt.flush()
         rec = self.records()[0]
         self.assertNotIn(secret, json.dumps(rec))
-        self.assertLessEqual(len(rec.get("reply", "")), tt.TEXT_MAX)
-        self.assertEqual(len(rec["reply"]), tt.TEXT_MAX)
+        self.assertNotIn("reply", rec)
+        self.assertGreater(rec["reply_chars"], tt.TEXT_MAX)
+
+    def test_spoken_codes_are_never_stored(self):
+        """Security review DAR-1 (2026-10-27): the scrubber misses PINs and
+        door / alarm / verification codes, and nothing reads the text, so the
+        trace keeps lengths only, never the owner's words or the reply."""
+        for said in ("the garage code is 4829", "remember my bank PIN 4829",
+                     "my social is 123 45 6789", "my pin is four eight two nine"):
+            tt.begin()
+            tt.note_text(said, "voice")
+            tt.note_chain("Noted, sir: " + said, [])
+            rec = tt.commit(LINE, "ok")
+            self.assertNotIn("you", rec)
+            self.assertNotIn("reply", rec)
+            self.assertEqual(rec["you_chars"], len(said))
+        tt.flush()
+        with open(os.path.join(self.dir, self.files()[0]), encoding="utf-8") as fh:
+            body = fh.read()
+        for needle in ("4829", "6789", "four eight", "garage", "PIN"):
+            self.assertNotIn(needle, body)
+        for rec in self.records():
+            self.assertNotIn("you", rec)
+            self.assertNotIn("reply", rec)
 
     def test_text_that_still_reads_like_a_credential_is_not_stored(self):
         tt.begin()

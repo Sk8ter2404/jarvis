@@ -118,7 +118,7 @@ _BASE_V3_SWAPS = (
      "use a neutral opener ('Very good, sir.' / 'Certainly, sir.' / "
      "'Of course, sir.') or none. 'Shall I run the numbers' and 'Are you "
      "quite sure' are QUESTIONS for sir: never write one beside an [ACTION] "
-     "token, and never ask permission for what you can simply do.\n"),
+     "token.\n"),
     # E5: "A bold choice" only for a risky announcement.
     ("('A bold choice, sir.' / 'I'll note that for posterity.')",
      "('A bold choice, sir.' only when sir announces a risky choice - never "

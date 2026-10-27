@@ -138,13 +138,19 @@ def _rows_one_by_one(s: str) -> list:
     2-3x the background calls, each evicting the voice brain's prompt)."""
     rows = []
     dec = json.JSONDecoder()
-    for m in _ROW_RE.finditer(s):
+    pos = 0
+    while True:
+        m = _ROW_RE.search(s, pos)
+        if m is None:
+            return rows
         try:
-            val, _end = dec.raw_decode(s, m.end())
+            val, pos = dec.raw_decode(s, m.end())
         except ValueError:
+            pos = m.end()
             continue
+        # The scan resumes AFTER the decoded value, so a row written inside
+        # another job's output is never read as a row (security review LB-1).
         rows.append((m.group(1), val))
-    return rows
 
 
 _JOB_ID_RE = re.compile(r"(?:job\s*[#_-]?\s*)?(\d+)\Z", re.IGNORECASE)
@@ -182,13 +188,25 @@ def parse_results(text, ids) -> dict:
         except ValueError:
             data = None
         rows = data.get("results") if isinstance(data, dict) else None
+        present = set()
         if isinstance(rows, list):
             for row in rows:
                 if isinstance(row, dict):
+                    present.add(_job_id(row.get("id")))
                     take(row.get("id"), row.get("output"))
-        if wanted - set(out):
-            for raw_id, val in _rows_one_by_one(s):
-                take(raw_id, val)
+        # The rescue only fills ids the whole decode never saw (an id present
+        # with a null output stays absent), and an id with more than one
+        # candidate row is left out to retry alone: never pick the first of
+        # several (security review LB-1).
+        if wanted - set(out) - present:
+            cands = [(_job_id(r.strip('"') if isinstance(r, str) else r), v)
+                     for r, v in _rows_one_by_one(s)]
+            counts: dict = {}
+            for jid, _v in cands:
+                counts[jid] = counts.get(jid, 0) + 1
+            for jid, val in cands:
+                if jid not in present and counts.get(jid) == 1:
+                    take(jid, val)
     except Exception:
         return out
     return out

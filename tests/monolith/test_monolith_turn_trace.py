@@ -79,7 +79,8 @@ class TurnTraceWiringTests(MonolithGlobalsTestCase):
         self.assertEqual(rec["kind"], "inject")
         self.assertEqual(rec["channel"], "typed")
         self.assertEqual(rec["outcome"], "ok")
-        self.assertEqual(rec["you"], "open chrome")
+        self.assertEqual(rec["you_chars"], len("open chrome"))
+        self.assertNotIn("you", rec)
         self.assertIn("end", rec["stages"])
 
     def test_begin_voice_opens_the_collector_too(self):

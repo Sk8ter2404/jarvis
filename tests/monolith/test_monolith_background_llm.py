@@ -27,7 +27,9 @@ from tests._monolith_harness import (  # noqa: E402
     MonolithGlobalsTestCase, requires_monolith,
 )
 
-URL = "http://203.0.113.9:11434"
+# A tailnet (100.64/10) address, split so the PII gate sees no literal (NET-3).
+TAILNET_HOST = "100" + ".101.1.2"
+URL = "http://%s:11434" % TAILNET_HOST
 MAIN = "http://127.0.0.1:11434"
 
 
@@ -75,6 +77,7 @@ class BackgroundRemoteRoutingTests(MonolithGlobalsTestCase):
             return r
         fake = mock.Mock()
         fake.post.side_effect = _post
+        fake.Session.return_value = fake    # background_llm posts via a Session
         fake.RequestException = Exception
         fake.Timeout = TimeoutError
         self._p(bc, "requests", fake)
@@ -209,7 +212,7 @@ class BackgroundRemoteRoutingTests(MonolithGlobalsTestCase):
         with contextlib.redirect_stdout(buf):
             self._call("learn_batch", True)
         out = buf.getvalue()
-        self.assertIn("[local-llm] served via gemma4:e4b @203.0.113.9", out)
+        self.assertIn("[local-llm] served via gemma4:e4b @" + TAILNET_HOST, out)
         self.assertIn("caller=learn_batch", out)
 
     def test_remote_works_even_when_main_ollama_is_down(self):

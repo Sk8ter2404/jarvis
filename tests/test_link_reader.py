@@ -9,6 +9,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -132,6 +134,12 @@ class _Env(unittest.TestCase):
         q = mock.patch.object(L, "_ytdlp_argv", lambda: ["yt-dlp"])
         q.start()
         self.addCleanup(q.stop)
+        if not getattr(self, "real_provenance", False):
+            # Every class below is about fetching and voicing a link the
+            # owner gave; ProvenanceTests checks where the link came from.
+            q = mock.patch.object(L, "_owner_supplied", lambda url: True, create=True)
+            q.start()
+            self.addCleanup(q.stop)
 
 
 class VttTests(unittest.TestCase):
@@ -620,6 +628,51 @@ class FollowUpTests(_Env):
         self.clip = "https://example.com/p"
         read("")
         self.assertEqual(self.get.call_count, 1)
+
+
+class ProvenanceTests(_Env):
+    """Security review NET-1 (2026-10-27): read_link fetches a link the brain
+    wrote only when the owner gave it (his words, the clipboard or the open
+    tab), so injected text in a follow-up round cannot make a silent GET that
+    carries his data out."""
+
+    real_provenance = True
+
+    def setUp(self):
+        super().setUp()
+        self.get = mock.Mock(return_value=fetched(HTML.encode()))
+        self.bc = types.ModuleType("bobert_companion")
+        self.bc._last_user_text = ["what time is it"]
+        q = mock.patch.dict(sys.modules, {"bobert_companion": self.bc})
+        q.start()
+        self.addCleanup(q.stop)
+
+    def test_an_injected_link_is_never_fetched(self):
+        out = L.read_link("https://x.tld/r?m=secret")
+        self.get.assert_not_called()
+        self.assertTrue(out.startswith(TERMINAL_FAILURE_PREFIX), out)
+        # a look-alike of a host he did say is not his either
+        self.bc._last_user_text = ["read example.com for me"]
+        L.read_link("https://ample.com/r?m=secret")
+        L.read_link("https://example.com.evil.tld/r")
+        self.get.assert_not_called()
+
+    def test_a_link_he_said_is_fetched(self):
+        self.bc._last_user_text = ["read https://x.tld/r?m=secret please"]
+        self.assertEqual(read("https://x.tld/r?m=secret"),
+                         "It is a short summary of the text.")
+        self.get.assert_called_once()
+        self.bc._last_user_text = ["what does www.Example.com say about cables"]
+        read("https://example.com/cables")
+        self.assertEqual(self.get.call_count, 2)
+
+    def test_a_link_on_the_clipboard_or_in_the_tab_is_his(self):
+        self.clip = "https://clip.example.org/a"
+        read("https://clip.example.org/a")
+        self.clip = ""
+        self.tab = "https://tab.example.org/b"
+        read("https://tab.example.org/other")
+        self.assertEqual(self.get.call_count, 2)
 
 
 class InjectionTests(_Env):

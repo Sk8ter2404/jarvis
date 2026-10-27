@@ -107,6 +107,18 @@ class SwapTableTests(unittest.TestCase):
         self.assertIn("QUESTIONS for sir", rule)
         self.assertIn("beside an [ACTION] token", rule)
 
+    def test_opener_rule_never_argues_against_ask_first(self):
+        """Security review PROMPT-3 (2026-10-27): the persona line must not
+        contradict the kept SAFETY rule 'If unsure ..., ASK FIRST'."""
+        v3 = self._v3_base()
+        self.assertNotIn("never ask permission for what you can simply do", v3)
+        safety = prompts._apply_swaps(prompts.PC_CONTROL_SAFETY_RULES_V2,
+                                      prompts._SAFETY_V3_SWAPS)
+        self.assertIn("ASK FIRST", safety)
+        with mock.patch.object(prompts, "_prompt_v3_on", return_value=True):
+            self.assertNotIn("never ask permission for what you can simply do",
+                             prompts.base_system_prompt())
+
     def test_intent_tag_lines(self):
         v3 = self._v3_base()
         self.assertIn("only when sir announces a risky choice", v3)

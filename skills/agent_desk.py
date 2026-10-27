@@ -22,8 +22,11 @@ transcripts, so JARVIS asks it.
 Everything that comes out of the Office (session names, activity, needs_braden
 text, alarm text) is DATA from outside JARVIS. It is scrubbed (credential
 shapes), stripped of emoji and of every bracket / "ACTION" token, clipped, and
-only ever SPOKEN. It never reaches parse_and_run_actions and never starts an
-action. No hook design from reel 7's agent-floor is ported, so no credit line
+only ever SPOKEN: agents_status is a SPEAK_VERBATIM action, so describe()'s
+finished sentences are voiced word for word and never go to the follow-up
+brain, whose reply parse_and_run_actions would run (security review NET-2,
+2026-10-27; it used to be INFORMATIVE, which did hand the text to that round).
+It never starts an action. No hook design from reel 7's agent-floor is ported, so no credit line
 is owed here.
 """
 from __future__ import annotations
@@ -91,12 +94,14 @@ def announce_on() -> bool:
 
 # Declared only while the feature is on (read once, at import): with
 # AGENT_DESK_ENABLED off the skill adds nothing to the system prompt and
-# nothing to the global informative-action set, so the brain is never told
+# nothing to the global speak-verbatim set, so the brain is never told
 # about an action that is not registered. The skill loader ignores "" / ().
 # (A plain literal first, then cleared: tests read the literal from source.)
-INFORMATIVE_ACTIONS = ("agents_status",)
+# VERBATIM, never INFORMATIVE: Office text is outside data and must not reach
+# the action-running follow-up round (NET-2).
+SPEAK_VERBATIM_ACTIONS = ("agents_status",)
 if not enabled():
-    INFORMATIVE_ACTIONS = ()
+    SPEAK_VERBATIM_ACTIONS = ()
     PROMPT_EXAMPLES = ""
 
 

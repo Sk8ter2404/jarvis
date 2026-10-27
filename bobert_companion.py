@@ -47197,11 +47197,37 @@ def _do_proactive_turn(memory: dict):
     # Proactive comment is its own intent (no follow-up loop) — give it a fresh
     # budget so the cap is enforced independently of the last voice turn.
     _reset_see_screen_budget()
+    # Security review PROMPT-1 (2026-10-27): a remark the text check drops is
+    # dropped BEFORE dispatch, so it runs nothing and arms no question that
+    # would never be spoken (the owner's next unrelated "yes" would answer it).
+    _drop_claims = PROACTIVE_NO_ACTION_CLAIMS
+    if _drop_claims and _proactive_first_person_claim((), text):
+        print("  [proactive] dropped unverified first-person remark")
+        set_state("idle")
+        resume_face_tracking()
+        return
+    _n_held = len(_pending_confirmation)
+    _held_at = _pending_confirmation_at[0]
+    try:
+        import core.grounded_click as _gc_mod
+        _gc_before = _gc_mod.pending_choice()
+    except Exception:
+        _gc_mod = _gc_before = None
     spoken, _proactive_results = parse_and_run_actions(text)
-    if PROACTIVE_NO_ACTION_CLAIMS and _proactive_first_person_claim(
+    if _drop_claims and _proactive_first_person_claim(
             _proactive_results, text):
         # v3 W06: nothing ran, so "I've pulled up your schedule" is a lie.
         # The attempt already counted for pacing (_proactive_last_attempt_at).
+        # The question is never voiced, so disarm whatever this dispatch armed.
+        del _pending_confirmation[_n_held:]
+        _pending_confirmation_at[0] = _held_at if _pending_confirmation else 0.0
+        try:
+            if _gc_mod is not None:
+                _gc_after = _gc_mod.pending_choice()
+                if _gc_after is not None and _gc_after is not _gc_before:
+                    _gc_mod.clear_pending()
+        except Exception:
+            pass
         print("  [proactive] dropped unverified first-person remark")
         set_state("idle")
         resume_face_tracking()

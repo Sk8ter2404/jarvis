@@ -13,8 +13,8 @@ One record (keys with no value are left out; every string is scrubbed)::
      "channel": "voice",              # voice | typed | web (how the owner spoke)
      "kind": "voice",                 # the [turn-timing] kind
      "outcome": "ok",                 # ok | error | shortcut
-     "you": "open chrome",            # the owner's words, scrubbed, <= 200 chars
-     "reply": "Opening Chrome, sir.", # first 200 chars of the reply, scrubbed
+     "you_chars": 11,                 # LENGTH of the owner's words (never the text)
+     "reply_chars": 20,               # LENGTH of the reply (never the text)
      "sections": ["Browser", "Media"],  # routed prompt sections
      "actions": [{"n": "open_app", "ok": true}, ...],
      "cut": "no new progress",        # why the follow-up chain stopped
@@ -33,13 +33,14 @@ llm_post, actions = actions_done - llm_done; first_play / audible / end are ms
 from the turn's t0 (the VAD break for a spoken turn).
 
 PRIVACY. The file is local, never shared with the peer machine (only settings
-are) and not part of any Discord / phone path. It holds the owner's words only
-the way the session log already does (first 200 chars, secrets redacted by
-core.phone_ping.scrub; text that still reads like a credential is dropped,
-not stored) and the first 200 characters of the reply. Text that comes from
-outside JARVIS (a web page, a caption, the Agent Office API) is never stored
-here and nothing read back from this file can start an action: the file is
-only ever read by tools/turn_trace_report.py.
+are) and not part of any Discord / phone path. It holds NO free text: neither
+the owner's words nor the reply, only their lengths (security review DAR-1,
+2026-10-27: the scrubber missed spoken PINs and door / alarm / verification
+codes, and tools/turn_trace_report.py never read either field). Action names,
+section headers, validator / shadow tags and timings are all it keeps, so
+outside text (a web page, a caption, the Agent Office API) never lands here
+and nothing read back from this file can start an action: the file is only
+ever read by tools/turn_trace_report.py.
 
 Writes are debounced and run on a daemon timer, never on the voice thread:
 ``commit`` appends the finished record to a bounded queue and schedules ONE
@@ -149,14 +150,10 @@ def _raw(text) -> str:
 
 
 def _finalize(rec: dict) -> dict:
-    """Scrub the two free-text fields of a queued record (writer thread)."""
-    for key in ("you", "reply"):
-        if key in rec:
-            clean = scrub_text(rec[key])
-            if clean:
-                rec[key] = clean
-            else:
-                del rec[key]
+    """Last line of defence on the writer thread: a queued record never
+    carries the owner's words or the reply (DAR-1), only their lengths."""
+    rec.pop("you", None)
+    rec.pop("reply", None)
     return rec
 
 
@@ -324,7 +321,12 @@ def build_record(line: str, outcome: str, collected: dict,
     rec["channel"] = collected.get("channel") or (
         "voice" if kind == "voice" else "typed")
     rec["outcome"] = outcome or kv.get("outcome") or ""
-    for key in ("you", "reply", "sections", "actions", "cut", "rounds",
+    # Lengths only, never the text (DAR-1).
+    for key in ("you", "reply"):
+        val = collected.get(key)
+        if val:
+            rec[key + "_chars"] = len(val)
+    for key in ("sections", "actions", "cut", "rounds",
                 "validators", "shadow", "model"):
         val = collected.get(key)
         if val:

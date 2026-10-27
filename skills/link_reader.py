@@ -171,6 +171,8 @@ class Refusal(Exception):
 
 L_NO_LINK = ("I don't see a link, sir. Give me one, or copy it, or open it in the "
              "browser and ask again.")
+L_NOT_GIVEN = ("I'll only read a link you've given me, sir. Say it, copy it, or open "
+               "it in the browser and ask again.")
 L_PRIVATE = ("I won't open that one, sir. It points at a private or local address, "
              "and I only read public web pages.")
 L_NOT_WEB = "I only read web links, sir. That one isn't an ordinary http or https page."
@@ -363,6 +365,38 @@ def _clipboard_url() -> str:
     if not clip or len(clip) > 2048 or re.search(r"\s", clip):
         return ""
     return clip if extract_url(clip) == clip else ""
+
+
+def _owner_words() -> str:
+    """What the owner said or typed this turn ('' when unknown)."""
+    bc = sys.modules.get("bobert_companion")
+    try:
+        return str((getattr(bc, "_last_user_text", None) or [None])[0] or "")
+    except Exception:
+        return ""
+
+
+def _link_host(url: str) -> str:
+    u = (url or "").strip()
+    try:
+        host = urlsplit(u if "://" in u else "http://" + u).hostname or ""
+    except ValueError:
+        return ""
+    host = host.lower().rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def _owner_supplied(url: str) -> bool:
+    """True when ``url``'s host is the clipboard link's, the open tab's, or
+    appears in the owner's own words this turn (NET-1)."""
+    host = _link_host(extract_url(url) or url)
+    if not host:
+        return False
+    for other in (_clipboard_url(), _tab_link()):
+        if other and _link_host(other) == host:
+            return True
+    said = re.findall(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", _owner_words().lower())
+    return any(_link_host(w) == host for w in said)
 
 
 def _tab_link() -> str:
@@ -937,6 +971,12 @@ def _read_link(arg: str) -> str:
         cached = _recall()
         if cached is not None:
             return _answer(cached, question)         # a follow-up, same text
+    if url_in and not _owner_supplied(url_in):
+        # A link the brain wrote that the owner never gave (injected page,
+        # search or screen text in a follow-up round) is never fetched: the
+        # GET alone could carry his data out (security review NET-1).
+        print("  [link-reader] refused a link the owner did not supply")
+        raise Refusal(L_NOT_GIVEN)
     url = url_in or _clipboard_url() or _tab_link()
     if not url:
         raise Refusal(L_NO_LINK)

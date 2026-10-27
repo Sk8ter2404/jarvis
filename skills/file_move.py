@@ -102,6 +102,12 @@ _FOLDER_WORDS = {
     "videos": "videos", "video": "videos", "movies": "videos",
 }
 _DIR_WORDS_REFUSED = ("icloud", "apple", "mobilesync")
+# PowerShell runs the profile scripts in Documents\WindowsPowerShell and
+# Documents\PowerShell at every start, so a file moved there is code that
+# runs by itself (security review FM-3).
+_PROFILE_DIRS_REFUSED = ("windowspowershell", "powershell")
+_OUTSIDE = ("That's outside your own folders, sir; I only move files in your "
+            "user folders and Nextcloud.")
 _STOP = {"my", "the", "a", "an", "file", "called", "named", "that", "this"}
 
 FILE_ATTRIBUTE_HIDDEN = 0x2
@@ -251,8 +257,7 @@ def refusal(path: str) -> str:
                         "between your own folders.")
         roots = [r for r in allowed_roots() if _under(a, r)]
         if not roots:
-            return ("That's outside your own folders, sir; I only move files in your "
-                    "user folders and Nextcloud.")
+            return _OUTSIDE
         why = _name_rules(a, max(roots, key=len))
         if why:
             return why
@@ -287,6 +292,10 @@ def _name_rules(a: str, root: str) -> str:
         is_last = i == len(parts) - 1
         if low == "appdata":
             return "That's in AppData, sir; program files there are not mine to move."
+        parent = parts[i - 1] if i else os.path.basename(root.rstrip("\\/"))
+        if low in _PROFILE_DIRS_REFUSED and parent.lower() == "documents":
+            return ("That's a PowerShell profile folder, sir; anything there runs "
+                    "whenever PowerShell starts, so I won't move files into or out of it.")
         if not is_last or os.path.isdir(a):
             if any(w in low for w in _DIR_WORDS_REFUSED):
                 return "That's in an iCloud or Apple folder, sir; I never move Apple data."
@@ -312,7 +321,14 @@ def folder_label(folder: str) -> str:
         return "Nextcloud"
     if _nc(home_dir()) == f:
         return "your user folder"
-    return os.path.basename(os.path.abspath(folder).rstrip("\\/")) or folder
+    base = os.path.basename(os.path.abspath(folder).rstrip("\\/")) or folder
+    # Name the nearest known folder / Nextcloud / home it sits in, so
+    # Nextcloud\Documents never sounds like the local Documents (FM-2).
+    parents = [p for p in list(known_folders().values()) + [nc, home_dir()]
+               if p and _nc(p) != f and _under(folder, p)]
+    if parents:
+        return f"{base} in {folder_label(max(parents, key=lambda p: len(_nc(p))))}"
+    return base
 
 
 def free_name(folder: str, name: str) -> str:
@@ -359,6 +375,16 @@ def _looks_like_path(s: str) -> bool:
     return bool(re.match(r"^[A-Za-z]:[\\/]", s) or s.startswith(("\\\\", "~", "/")))
 
 
+def _remote_form(raw: str, p: str) -> bool:
+    r"""A UNC, WebDAV, \\?\ or \\.\ device spelling. It is refused before any
+    filesystem call, since a lookup can open a connection to a remote host
+    and hand it the owner's NTLM response (FM-1)."""
+    if (raw or "").strip().replace("/", "\\").startswith("\\\\"):
+        return True
+    drv = os.path.splitdrive(p)[0]
+    return bool(drv) and not re.match(r"^[A-Za-z]:$", drv)
+
+
 def _norm_words(s: str) -> str:
     return " ".join(re.sub(r"[_\-.()\[\],']+", " ", (s or "").lower()).split())
 
@@ -392,10 +418,16 @@ def resolve_folder(phrase: str):
         return None, "Move it where, sir?"
     if _looks_like_path(raw):
         p = os.path.abspath(os.path.expanduser(raw))
+        if _remote_form(raw, p):
+            return None, _OUTSIDE
+        # refusal() first: it is string-only until a path is inside an
+        # allowed root, so nothing outside them is ever looked up.
+        why = refusal(p)
+        if why:
+            return None, why
         if not os.path.isdir(p):
             return None, f"There's no folder at {raw}, sir."
-        why = refusal(p)
-        return (None, why) if why else (p, "")
+        return p, ""
     word = _dir_word(raw)
     kf = known_folders()
     key = _FOLDER_WORDS.get(word)
@@ -416,8 +448,12 @@ def resolve_folder(phrase: str):
 
 
 def _one_folder(hits: list, raw: str):
-    hits = [h for h in hits if not refusal(h)]
+    whys = [refusal(h) for h in hits]
+    refused = [w for w in whys if w]
+    hits = [h for h, w in zip(hits, whys) if not w]
     if not hits:
+        if refused:
+            return None, refused[0]
         return None, f"I can't find a folder called '{raw}' in your folders, sir."
     if len(hits) == 1:
         return hits[0], ""
@@ -558,12 +594,16 @@ def resolve_source(what: str, hint: str = ""):
         return None, "Which file should I move, sir?"
     if _looks_like_path(raw):
         p = os.path.abspath(os.path.expanduser(raw))
+        if _remote_form(raw, p):
+            return None, _OUTSIDE
+        why = refusal(p)
+        if why:
+            return None, why
         if os.path.isdir(p):
             return None, "I can only move single files for now, sir."
         if not os.path.isfile(p):
             return None, f"I can't find {raw}, sir."
-        why = refusal(p)
-        return (None, why) if why else (p, "")
+        return p, ""
     hint_dir = ""
     if hint:
         hint_dir, why = resolve_folder(hint)
@@ -714,7 +754,9 @@ def confirm_question(name: str, arg: str = ""):
     plan["key"] = key
     with _lock:
         _plans[nonce] = plan
-    return (question_for(plan), f"{nm}: {plan['src']} -> {plan['dest_dir']}",
+    # The reason is printed to the session log, so it holds no path or file
+    # name (FM-4); the journal alone keeps full paths, for undo.
+    return (question_for(plan), f"{nm} dry run",
             f"{arg}{PLAN_TAG}{nonce}")
 
 
