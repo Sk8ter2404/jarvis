@@ -626,7 +626,10 @@ def fetch_web(url: str) -> Doc:
         raise Refusal("That site sent the page %s-compressed, sir, which I don't "
                       "unpack." % re.sub(r"[^a-z0-9-]", "", enc)[:12])
     if ct and not any(ct.startswith(t) for t in url_guard.TEXT_TYPES):
-        raise Refusal("That link is a %s file, sir, not a page I can read." % ct)
+        # The server's Content-Type is outside text: never voice it verbatim.
+        if re.fullmatch(r"[a-z0-9.+-]{1,30}/[a-z0-9.+-]{1,40}", ct):
+            raise Refusal("That link is a %s file, sir, not a page I can read." % ct)
+        raise Refusal("That link is not a page I can read, sir.")
     raw = _decode_body(res.body, res.headers.get("content-type", ""))
     if ct in ("text/plain", "application/json", "application/xml", "text/xml",
               "text/markdown", "text/csv", "text/vtt"):
@@ -859,14 +862,18 @@ def defuse_failure_words(text: str) -> str:
         s = s.replace(ap, "\u2019")
     for mk in FAILURE_MARKERS:               # whatever is left: break the phrase up
         k = mk.lower()
-        i = s.lower().find(k)
-        while i >= 0:
-            if " " in k.strip():
-                seg = s[i:i + len(k)].replace(" ", "\u00a0")
-            else:
-                seg = s[i] + "\u00ad" + s[i + 1:i + len(k)]
-            s = s[:i] + seg + s[i + len(k):]
-            i = s.lower().find(k)
+        if not k:
+            continue
+        # Match on s itself (never index s with positions found in s.lower():
+        # lower() can change the length, e.g. U+0130) and never rescan output.
+        if " " in k.strip():
+            def _brk(m):
+                return m.group(0).replace(" ", " ")
+        else:
+            def _brk(m):
+                g = m.group(0)
+                return g[:1] + "­" + g[1:]
+        s = re.sub(re.escape(k), _brk, s, flags=re.I)
     return s
 
 

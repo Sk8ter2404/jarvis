@@ -49,6 +49,7 @@ import ipaddress
 import re
 import socket
 import ssl
+import threading
 import time
 from typing import Callable, NamedTuple, Optional
 from urllib.parse import urljoin, urlsplit
@@ -294,11 +295,38 @@ def _open_pinned(t: Target, ip: str, headers: dict, deadline: float,
     if left <= 0:
         raise FetchError("timed out", "timeout")
     sock = None
+    cell: list = [None]                       # the socket the watchdog must cut
+    expired = threading.Event()
+
+    def _cut():
+        # Wall-clock deadline: a per-recv timeout cannot stop a server that
+        # trickles one byte at a time (slowloris), so cut the socket itself.
+        expired.set()
+        s_ = cell[0]
+        if s_ is not None:
+            try:
+                s_.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                s_.close()
+            except Exception:
+                pass
+
+    timer = threading.Timer(max(0.05, left), _cut)
+    timer.daemon = True
+    timer.start()
     try:
         sock = socket.create_connection((ip, t.port), timeout=max(0.2, left))
+        cell[0] = sock
+        if expired.is_set():
+            raise FetchError("timed out", "timeout")
         if t.scheme == "https":
             ctx = ssl.create_default_context()
-            sock = ctx.wrap_socket(sock, server_hostname=t.host)
+            sock = ctx.wrap_socket(sock, server_hostname=t.host,
+                                   do_handshake_on_connect=False)
+            cell[0] = sock
+            sock.do_handshake()
         conn = http.client.HTTPConnection(t.host, t.port)
         conn.sock = sock                      # already connected, to the checked IP
         conn.request("GET", t.target, headers=headers)
@@ -312,10 +340,12 @@ def _open_pinned(t: Target, ip: str, headers: dict, deadline: float,
         truncated = False
         while True:
             left = deadline - clock()
-            if left <= 0:
+            if left <= 0 or expired.is_set():
                 raise FetchError("timed out", "timeout")
             sock.settimeout(max(0.2, left))
             chunk = resp.read(65536)
+            if expired.is_set():              # the cut socket reads as EOF
+                raise FetchError("timed out", "timeout")
             if not chunk:
                 break
             total += len(chunk)
@@ -330,13 +360,20 @@ def _open_pinned(t: Target, ip: str, headers: dict, deadline: float,
     except socket.timeout:
         raise FetchError("timed out", "timeout") from None
     except ssl.SSLError as e:
+        if expired.is_set():
+            raise FetchError("timed out", "timeout") from None
         raise FetchError("the site's certificate or TLS failed (%s)" % type(e).__name__,
                          "tls") from None
     except (OSError, http.client.HTTPException) as e:
+        if expired.is_set():
+            raise FetchError("timed out", "timeout") from None
         raise FetchError("could not connect (%s)" % type(e).__name__, "connect") from None
     finally:
+        timer.cancel()
         try:
-            if sock is not None:
+            if cell[0] is not None:
+                cell[0].close()
+            elif sock is not None:
                 sock.close()
         except Exception:
             pass

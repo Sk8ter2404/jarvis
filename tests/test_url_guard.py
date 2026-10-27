@@ -399,13 +399,76 @@ class RealOpenerTests(unittest.TestCase):
             self._get(b"HTTP/1.1 200 OK\r\n\r\n", timeout=0.4, hold=3.0)
         self.assertEqual(cm.exception.code, "timeout")
 
+    def test_a_trickling_server_is_cut_at_the_wall_clock_deadline(self):
+        """One byte every 0.2 s must not outlast a 1 s whole-fetch timeout."""
+        import time as _t
+
+        def trickle(body_phase):
+            a, b = socket.socketpair()
+            stop = threading.Event()
+
+            def run():
+                try:
+                    b.settimeout(2)
+                    data = b""
+                    while b"\r\n\r\n" not in data:
+                        data += b.recv(4096)
+                    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                            b"Content-Length: 100000\r\n\r\n")
+                    if body_phase:
+                        b.sendall(head)
+                        head = b""
+                    i = 0
+                    while i < 100 and not stop.is_set():
+                        if head:
+                            b.sendall(head[i:i + 1])
+                            i += 1
+                            if i >= len(head):
+                                head = b""
+                                i = 0
+                        else:
+                            b.sendall(b"x")
+                            i += 1
+                        _t.sleep(0.2)
+                except OSError:
+                    pass
+                finally:
+                    b.close()
+            th = threading.Thread(target=run, daemon=True)
+            th.start()
+            return a, stop, th
+
+        for body_phase in (False, True):
+            a, stop, th = trickle(body_phase)
+            r = _dns({"example.com": [PUBLIC]})
+            t0 = _t.monotonic()
+            try:
+                with mock.patch("socket.create_connection", lambda addr, timeout=None: a):
+                    with self.assertRaises(G.FetchError) as cm:
+                        G.safe_get("http://example.com/", resolver=r, timeout=1.0)
+            finally:
+                stop.set()
+            self.assertEqual(cm.exception.code, "timeout")
+            self.assertLess(_t.monotonic() - t0, 2.5, "body_phase=%s" % body_phase)
+
     def test_https_names_the_host_for_sni_and_verification(self):
         a, b = socket.socketpair()
         resp = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok")
         srv = _FakeServer(b, resp)
         srv.start()
         ctx = mock.Mock()
-        ctx.wrap_socket.side_effect = lambda s, server_hostname=None: s
+
+        class _Tls:                       # a socket that also has do_handshake
+            def __init__(self, s):
+                self._s = s
+
+            def do_handshake(self):
+                pass
+
+            def __getattr__(self, name):
+                return getattr(self._s, name)
+
+        ctx.wrap_socket.side_effect = lambda s, server_hostname=None, **kw: _Tls(s)
         r = _dns({"example.com": [PUBLIC]})
         with mock.patch("socket.create_connection", lambda addr, timeout=None: a), \
                 mock.patch("ssl.create_default_context", return_value=ctx):
