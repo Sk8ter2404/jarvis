@@ -487,6 +487,7 @@ from core import action_aliases as _action_aliases  # noqa: E402
 # Action-fit guard (v3 W11): a real, allowed action that misfits the owner's
 # words (ACTION_FIT_MODE; see _action_fit_refusal and _runner).
 from core import action_fit as _action_fit  # noqa: E402
+from core import loop_guard as _loop_guard  # noqa: E402
 _AUTOCORRECT_THRESHOLD = 0.75
 # When two candidates both clear the threshold and sit within this gap of
 # each other, the dispatcher asks 'did you mean X or Y' instead of silently
@@ -17776,6 +17777,7 @@ _TURN_FLAG_KEYS = (
     "LINK_READER_ENABLED",
     "AGENT_DESK_ENABLED", "AGENT_DESK_ANNOUNCE",
     "TURN_TRACE",
+    "LOOP_GUARD_MODE",
 )
 
 
@@ -41096,6 +41098,11 @@ def _note_turn_action_ran(name: str, result, arg: str = "") -> None:
         frame = getattr(_turn_grounding, "frame", None)
         if frame is None:
             return
+        # Every call in order, failed or not (v3 W21: core.loop_guard reads
+        # them between follow-up rounds).
+        _calls = frame.setdefault("calls", [])
+        _calls.append((str(name or ""), str(arg or "")[:300]))
+        del _calls[:-200]
         # The action that just ran may have fed its look itself (core.
         # actions._note_screen_look marks the frame): then it is recorded
         # once, not twice (review 2026-10-09: two entries per look halved
@@ -42798,6 +42805,35 @@ _CLOSE_OUT_GENERIC = "I'm afraid I couldn't finish that one, sir."
 # the chain stops before the round that would read it back - so the close-out
 # is spoken even when earlier rounds said something of substance.
 _CUT_REPEATED_FAILURE = "repeating failure"
+# The cut LOOP_GUARD_MODE='on' makes (v3 W21, core/loop_guard.py). Like the
+# repeated failure, the round that tripped it was never read back, so the
+# close-out is spoken even when an earlier round said something.
+_CUT_PING_PONG = "ping-pong"
+
+
+def _loop_guard_mode() -> str:
+    """LOOP_GUARD_MODE as 'off' | 'shadow' | 'on'. Never raises."""
+    try:
+        return _loop_guard.normalise_mode(globals().get("LOOP_GUARD_MODE", "off"))
+    except Exception:
+        return "off"
+
+
+def _loop_guard_feed(guard, seen: int):
+    """Feed ``guard`` every call this owner turn recorded after the first
+    ``seen`` of them. Returns (first reason or None, new ``seen``). Outside a
+    turn nothing is recorded, so nothing is judged. Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        calls = list(frame.get("calls") or []) if frame else []
+        seen = min(int(seen), len(calls))
+        reason = None
+        for (n, a) in calls[seen:]:
+            r = guard.check(n, a)
+            reason = reason or r
+        return reason, len(calls)
+    except Exception:
+        return None, seen
 
 
 def _says_something(text) -> bool:
@@ -42819,7 +42855,8 @@ def _chain_close_out_line(*, cut: str, rounds: int, spoke_substance: bool,
     try:
         if barged or not cut or rounds < 1:
             return ""
-        if spoke_substance and cut != _CUT_REPEATED_FAILURE:
+        if spoke_substance and cut not in (_CUT_REPEATED_FAILURE,
+                                           _CUT_PING_PONG):
             return ""
         if any(_once_per_turn_kind(n) for n in _turn_actions_ran()):
             return _CLOSE_OUT_WEB
@@ -51377,6 +51414,12 @@ def _run_llm_dispatch_body(text: str) -> str:
     # round that ran nothing ends the chain on its words alone - see the
     # "ended on a promise" close-out below.
     _last_round_ran = None
+    # v3 W21: ping-pong / repeat / screen-look budget across this chain's
+    # calls (core.loop_guard); one verdict is logged per turn in shadow.
+    _lg_mode = _loop_guard_mode()
+    _lg_guard = _loop_guard.LoopGuard() if _lg_mode != "off" else None
+    _lg_seen = 0
+    _lg_warned = False
     for depth in range(_max_followup):
         # A TERMINAL failure (2026-10-02, core.failure_markers: "Task Manager
         # runs as administrator, sir; Windows won't let me close it from
@@ -51477,6 +51520,18 @@ def _run_llm_dispatch_body(text: str) -> str:
         if _terminal_actions & _chain_seen:  # pragma: no cover - dead branch: the sole terminal action (check_credits) is also in _loop_actions, so the loop-detect break above always fires first
             print(f"  [follow-up] terminal action already ran — stopping")
             break
+        # v3 W21: alternation (A, B, A, B), the same call a third time and
+        # screen-look budget. Extends the guards above, which stay as they
+        # were; 'shadow' only logs, once per turn.
+        if _lg_guard is not None:
+            _lg_reason, _lg_seen = _loop_guard_feed(_lg_guard, _lg_seen)
+            if _lg_reason and _lg_mode == "on":
+                print(f"  [loop-guard] stopping the chain ({_lg_reason})")
+                _chain_cut = _CUT_PING_PONG
+                break
+            if _lg_reason and not _lg_warned:
+                _lg_warned = True
+                print(f"  [loop-guard] would stop ({_lg_reason})")
         _chain_seen |= {n for n, _ in informative}
         print(f"  Reading results (depth {depth+1})…")
         _heartbeat()   # follow-up LLM call can be slow on local — keep watchdog fresh
