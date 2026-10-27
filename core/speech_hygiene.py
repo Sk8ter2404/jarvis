@@ -64,7 +64,7 @@ INTENT_ALIASES = {
 # A device or material the temperature belongs to. Whole words only, so
 # "grilling" / "printing"-style weather chatter is judged on its own cues.
 _DEVICE_RE = re.compile(
-    r"\b(?:nozzle|hot\s?end|hotend|heated\s+bed|(?:print\s+|build\s+)?bed|"
+    r"\b(?:nozzle|hot\s?end|hotend|(?:heated|print|build)\s+bed|"
     r"filament|pla|petg|abs|tpu|asa|print(?:s|ed|ing|er|ers)?|h2d|"
     r"oven|grill|fridge|refrigerator|freezer|cpu|gpu)\b",
     re.IGNORECASE)
@@ -75,6 +75,49 @@ def mentions_device(text: str) -> bool:
     chip whose temperature is not the weather."""
     try:
         return bool(_DEVICE_RE.search(str(text or "")))
+    except Exception:
+        return False
+
+
+# The owner is plainly asking about the weather: a device word in the same
+# breath ("is it good to fire up the grill", "before I go to bed") does not
+# make it a device temperature. Deliberately narrow: "what temperature should
+# I print PETG at" must NOT match.
+_WEATHER_ASK_RE = re.compile(
+    r"\b(?:weather|forecast|outside|outdoors?|rain(?:ing|y)?|sunny)\b",
+    re.IGNORECASE)
+
+# Words in a REPLY that make a device word incidental ("72 and sunny, good
+# grilling weather").
+_STRICT_WEATHER_CUE_RE = re.compile(
+    r"\b(?:outside|outdoors?|sunny|cloudy|forecast|weather)\b",
+    re.IGNORECASE)
+
+
+def is_explicit_weather_ask(text: str) -> bool:
+    try:
+        return bool(_WEATHER_ASK_RE.search(str(text or "")))
+    except Exception:
+        return False
+
+
+def reply_has_strict_weather_cue(text: str) -> bool:
+    try:
+        return bool(_STRICT_WEATHER_CUE_RE.search(str(text or "")))
+    except Exception:
+        return False
+
+
+def device_temperature_skip(user_text: str, reply: str) -> bool:
+    """True when a temperature in ``reply`` belongs to a device / material and
+    so is not the weather. An explicit weather ask in the owner's words, or a
+    strict weather cue in the reply, keeps the weather reading."""
+    try:
+        if is_explicit_weather_ask(user_text):
+            return False
+        if mentions_device(user_text):
+            return True
+        return mentions_device(reply) and not reply_has_strict_weather_cue(reply)
     except Exception:
         return False
 

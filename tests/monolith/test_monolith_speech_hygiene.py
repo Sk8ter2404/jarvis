@@ -69,6 +69,28 @@ class WeatherInjectHygieneTests(_Base):
                 out = self.det(reply, "what's it like outside")
                 self.assertEqual(out[:2], ("inject", "weather_briefing"))
 
+    def test_explicit_weather_ask_with_a_device_word_still_injects(self):
+        sunny = "It's 72 degrees Fahrenheit and sunny, sir."
+        for user in ("what's the weather, is it good to fire up the grill?",
+                     "what's the weather before I go to bed",
+                     "what's the temperature outside, will my print be ok?",
+                     "what's the forecast, should I print outside"):
+            with self.subTest(user=user):
+                out = self.det(sunny, user)
+                self.assertEqual(out[:2], ("inject", "weather_briefing"))
+        # a bare "bed" is not a device; a reply with a weather cue keeps it
+        out = self.det("It's 72 degrees Fahrenheit, sir.",
+                       "how warm is it before bed")
+        self.assertEqual(out[:2], ("inject", "weather_briefing"))
+        out = self.det("72 degrees and sunny, good for the grill, sir.", "")
+        self.assertEqual(out[:2], ("inject", "weather_briefing"))
+
+    def test_print_bed_is_still_a_device(self):
+        self.assertIsNone(self.det("About 60 degrees Celsius, sir.",
+                                   "how hot is the heated bed"))
+        self.assertIsNone(self.det("About 60 degrees Celsius, sir.",
+                                   "how hot is the print bed"))
+
     def test_bare_unit_needs_a_cue_or_a_weather_ask(self):
         bare = "That comes to 37.8 degrees Celsius, sir."
         # owner words unknown: the old behaviour stands

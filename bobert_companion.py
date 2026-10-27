@@ -41071,8 +41071,7 @@ def _detect_preemptive_hallucination(
         # weather cue in the reply or a temperature ask in the owner's words.
         if _hygiene and action_name == "weather_briefing":
             try:
-                if (_speech_hygiene.mentions_device(user_text)
-                        or _speech_hygiene.mentions_device(scan)):
+                if _speech_hygiene.device_temperature_skip(user_text, scan):
                     continue
                 if (regex is _WEATHER_BARE_UNIT_RE
                         and _speech_hygiene.bare_unit_needs_cue(
