@@ -312,6 +312,19 @@ SERVER_WATCH_POLL_S = 300.0
 # behaviour: no file-move action at all).
 FILE_MOVE_ENABLED = True
 
+# ─── Link reader (v3 overhaul W18, skills/link_reader.py, 2026-10-27) ─────
+# LINK_READER_ENABLED (bool, default OFF; off = the read_link action is not
+# registered): "what does this say / what's this video about" for a YouTube,
+# Reddit or web link given aloud, on the clipboard or in the focused tab.
+# JARVIS fetches the real text with core/url_guard.py (http(s) only; loopback,
+# the home LAN, Tailscale 100.64/10, link-local, CGNAT and
+# their IPv6 equivalents refused; the resolved IP of EVERY redirect hop is
+# re-checked and the connection is pinned to the checked IP; 5 MB and 15 s
+# caps; no cookies, no login, a plain User-Agent) and the LOCAL brain
+# summarises it as DATA - a page's own words never reach the action parser.
+# YouTube goes through yt-dlp --skip-download (captions only). Read at load.
+LINK_READER_ENABLED = False
+
 # ─── Local prompt-prefix stability (2026-09-29) ────────────────────────
 # The local model re-evaluates the WHOLE prompt (~3 s for ~12k tokens,
 # measured) whenever the system prompt changes between turns; an unchanged
