@@ -1,0 +1,4011 @@
+{
+ "about": "Live owner voice turns that ran at least one action (C:/JARVIS/logs session logs 2026-09/10, read-only, extracted 2026-10-27 for v3 W11). actions = what ran this turn; prior = what ran on the previous owner turn. Arguments are replaced by opaque ids (equal text = equal id) so rule 3's same-argument test still works with no content. wrong = the brain_eval case id for the turns the owner flagged as wrong actions; every other action here is treated as fitting. Owner-identifying words (tools/check_no_pii patterns) are replaced by [x].",
+ "turns": [
+  {
+   "id": "2026-10-12_15-24-53@15:29:57",
+   "utterance": "Jarvis remind me that I need to buy some more black and white ABS",
+   "actions": [
+    [
+     "set_timer",
+     "arg1"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-12_15-24-53@15:33:21",
+   "utterance": "Jarvis, open Accelo on the left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg2"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-12_15-24-53@15:37:47",
+   "utterance": "Jarvis, remind me in one minute to check the printer, and when you confirm it say exactly this: Yes, sir, I set the reminder. You'll ignore it, but it's set.",
+   "actions": [
+    [
+     "set_timer",
+     "arg3"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-12_21-27-37@21:29:04",
+   "utterance": "Jarvis booted back up and it still has a flashing screen, like you're viewing my screen. I need Fortnite opened up.",
+   "actions": [
+    [
+     "launch_app",
+     "arg4"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-13_08-55-44@09:02:16",
+   "utterance": "Jarvis switched the headset.",
+   "actions": [
+    [
+     "use_headset",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-14_13-28-58@14:09:01",
+   "utterance": "Jarvis, get out of the way for just a second.",
+   "actions": [
+    [
+     "game_mode_on",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": "c006"
+  },
+  {
+   "id": "2026-10-14_13-28-58@14:09:58",
+   "utterance": "Jarvis, I'm done gaming.",
+   "actions": [
+    [
+     "game_mode_off",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:14:22",
+   "utterance": "Jarvis, ask the [x] what he thinks about pussy.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg5"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:15:00",
+   "utterance": "Jarvis, ask [x] what he thinks about vagina.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg6"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg5"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:19:59",
+   "utterance": "Jarvis, play um bad bitch music. I don't fucking know.",
+   "actions": [
+    [
+     "play_vibe",
+     "arg7"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:20:16",
+   "utterance": "Jarvis, play some Skrillex. Shuffle all songs by Skrillex.",
+   "actions": [
+    [
+     "play_playlist",
+     "arg8"
+    ],
+    [
+     "web_search",
+     "arg9"
+    ]
+   ],
+   "prior": [
+    [
+     "play_vibe",
+     "arg7"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:20:57",
+   "utterance": "Jarvis, you're not playing shit. What the fuck? Where's my goddamn music, bitch?",
+   "actions": [
+    [
+     "music_status",
+     ""
+    ],
+    [
+     "play_music",
+     "arg10"
+    ]
+   ],
+   "prior": [
+    [
+     "play_playlist",
+     "arg8"
+    ],
+    [
+     "web_search",
+     "arg9"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:21:52",
+   "utterance": "Jarvis, play it on YouTube instead. It's broken on Apple Music.",
+   "actions": [
+    [
+     "youtube",
+     "arg10"
+    ]
+   ],
+   "prior": [
+    [
+     "music_status",
+     ""
+    ],
+    [
+     "play_music",
+     "arg10"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:22:39",
+   "utterance": "Jarvis, you never started playing music.",
+   "actions": [
+    [
+     "youtube",
+     "arg10"
+    ]
+   ],
+   "prior": [
+    [
+     "youtube",
+     "arg10"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:43:51",
+   "utterance": "Jarvis is downloading something. I don't know what he's downloading.",
+   "actions": [
+    [
+     "system_pulse",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "youtube",
+     "arg10"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:44:50",
+   "utterance": "Jarvis, turn the volume down to twenty percent.",
+   "actions": [
+    [
+     "set_volume",
+     "arg11"
+    ]
+   ],
+   "prior": [
+    [
+     "system_pulse",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:44:56",
+   "utterance": "Jarvis, actually make it 30.",
+   "actions": [
+    [
+     "set_volume",
+     "arg12"
+    ]
+   ],
+   "prior": [
+    [
+     "set_volume",
+     "arg11"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:45:05",
+   "utterance": "Jarvis, turn on a video on YouTube that you think I might like on the left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg13"
+    ],
+    [
+     "web_search",
+     "arg14"
+    ]
+   ],
+   "prior": [
+    [
+     "set_volume",
+     "arg12"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:46:14",
+   "utterance": "Jarvis, pause the video.",
+   "actions": [
+    [
+     "media_prev",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg13"
+    ],
+    [
+     "web_search",
+     "arg14"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_19-03-31@21:46:29",
+   "utterance": "Jarvis, you didn't pause it.",
+   "actions": [
+    [
+     "media_playpause",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "media_prev",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_21-46-43@22:01:17",
+   "utterance": "Jarvis open you to his homepage.",
+   "actions": [
+    [
+     "build_website",
+     "arg15"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_21-46-43@22:01:38",
+   "utterance": "Jarvis YouTube home page.",
+   "actions": [
+    [
+     "open_url",
+     "arg16"
+    ]
+   ],
+   "prior": [
+    [
+     "build_website",
+     "arg15"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_21-46-43@22:03:17",
+   "utterance": "Jarvis, click that Omnitrix video for me.",
+   "actions": [
+    [
+     "click_on_screen",
+     "arg17"
+    ]
+   ],
+   "prior": [
+    [
+     "open_url",
+     "arg16"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-15_21-46-43@22:03:40",
+   "utterance": "Jarvis is on the middle monitor.",
+   "actions": [
+    [
+     "click_on_screen",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "click_on_screen",
+     "arg17"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-16_09-34-18@09:41:02",
+   "utterance": "hand tracking on",
+   "actions": [
+    [
+     "hand_tracking_on",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-16_09-34-18@09:41:21",
+   "utterance": "hand mouse on",
+   "actions": [
+    [
+     "hand_mouse_on",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "hand_tracking_on",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-16_09-49-12@10:14:58",
+   "utterance": "hand mouse off",
+   "actions": [
+    [
+     "hand_mouse_off",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-16_09-49-12@10:15:08",
+   "utterance": "hand tracking off",
+   "actions": [
+    [
+     "hand_tracking_off",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "hand_mouse_off",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-16_10-16-54@11:12:04",
+   "utterance": "Jarvis, go ahead and take my resume to documents folder.",
+   "actions": [
+    [
+     "run_shell",
+     "arg18"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-16_10-16-54@16:54:21",
+   "utterance": "Jarvis find the model for AA battery to C battery converter on Google.",
+   "actions": [
+    [
+     "web_search",
+     "arg19"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-16_10-16-54@21:38:31",
+   "utterance": "Jarvis Jarvis now.",
+   "actions": [
+    [
+     "web_search",
+     "arg19"
+    ],
+    [
+     "recall_screen",
+     ""
+    ],
+    [
+     "see_screen",
+     "arg20"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-18_11-55-48@12:06:44",
+   "utterance": "Jarvis, what do you have linked to my Tuya account?",
+   "actions": [
+    [
+     "smart_home_discover",
+     "arg21"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-18_11-55-48@12:08:18",
+   "utterance": "Jarvis, go ahead and do so.",
+   "actions": [
+    [
+     "system_pulse",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-18_11-55-48@12:29:10",
+   "utterance": "Jarvis opened YouTube on the left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg22"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-18_11-55-48@12:29:52",
+   "utterance": "Jarvis, go ahead and click on that video that says, Can I find the rare daddy bear?",
+   "actions": [
+    [
+     "click_on_screen",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg22"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-18_11-55-48@12:30:26",
+   "utterance": "Jarvis, it's on the left monitor left monitor.",
+   "actions": [
+    [
+     "click_on_screen",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "click_on_screen",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-18_13-03-12@21:57:28",
+   "utterance": "Jarvis, send that over to Claude.",
+   "actions": [
+    [
+     "note_for_claude",
+     "arg23"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-18_13-03-12@07:22:46",
+   "utterance": "Jarvis open Accelo on the left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg2"
+    ]
+   ],
+   "prior": [
+    [
+     "note_for_claude",
+     "arg23"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-18_13-03-12@07:23:12",
+   "utterance": "Jarvis open teams on the top monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg24"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg2"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_07-47-12@08:25:53",
+   "utterance": "Jarvis, turn off the lamp.",
+   "actions": [
+    [
+     "smart_home_control",
+     "arg25"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_07-47-12@08:26:21",
+   "utterance": "Jarvis, turn on the lamp.",
+   "actions": [
+    [
+     "smart_home_control",
+     "arg26"
+    ]
+   ],
+   "prior": [
+    [
+     "smart_home_control",
+     "arg25"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_07-47-12@08:26:46",
+   "utterance": "Jarvis, turn my fan on.",
+   "actions": [
+    [
+     "smart_home_control",
+     "arg27"
+    ]
+   ],
+   "prior": [
+    [
+     "smart_home_control",
+     "arg26"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_07-47-12@08:27:01",
+   "utterance": "Jarvis, turn on all smart home devices.",
+   "actions": [
+    [
+     "list_smart_home_devices",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "smart_home_control",
+     "arg27"
+    ]
+   ],
+   "wrong": "c030"
+  },
+  {
+   "id": "2026-10-19_10-29-26@10:45:50",
+   "utterance": "Jarvis switched the headset.",
+   "actions": [
+    [
+     "use_headset",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_10-29-26@10:46:09",
+   "utterance": "Jarvis, can you hear me on the [x] or what? Are you listening in the headset?",
+   "actions": [
+    [
+     "which_mic_is_active",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "use_headset",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_10-29-26@10:46:36",
+   "utterance": "Jarvis, the headset is on though. I'm using it right now.",
+   "actions": [
+    [
+     "which_mic_is_active",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "which_mic_is_active",
+     ""
+    ]
+   ],
+   "wrong": "c032"
+  },
+  {
+   "id": "2026-10-19_18-29-13@18:30:21",
+   "utterance": "Jarvis, how is the server doing?",
+   "actions": [
+    [
+     "server_status",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:37:48",
+   "utterance": "Jarvis, read all unread notifications.",
+   "actions": [
+    [
+     "recent_notifications_summary",
+     "arg11"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:38:05",
+   "utterance": "Jarvis, check my monitor on the left screen. Unraid has a bunch of notifications.",
+   "actions": [
+    [
+     "see_screen",
+     "arg28"
+    ]
+   ],
+   "prior": [
+    [
+     "recent_notifications_summary",
+     "arg11"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:38:50",
+   "utterance": "Jarvis Disc tiny should be brand new.",
+   "actions": [
+    [
+     "web_search",
+     "arg29"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:39:13",
+   "utterance": "Jarvis, I meant to say this 10 is still new. I just put it in.",
+   "actions": [
+    [
+     "web_search",
+     "arg29"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ]
+   ],
+   "prior": [
+    [
+     "web_search",
+     "arg29"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:39:45",
+   "utterance": "Jarvis changed the lamp to red.",
+   "actions": [
+    [
+     "smart_home_control",
+     "arg31"
+    ]
+   ],
+   "prior": [
+    [
+     "web_search",
+     "arg29"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ],
+    [
+     "see_screen",
+     "arg30"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:40:22",
+   "utterance": "Jarvis, how is the rebuild looking? Is it healthy?",
+   "actions": [
+    [
+     "check_system",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "smart_home_control",
+     "arg31"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:41:04",
+   "utterance": "Jarvis, is there any free any resources I can free up?",
+   "actions": [
+    [
+     "system_pulse",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "check_system",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:42:24",
+   "utterance": "Jarvis, do some research on lidar modules for the senior project.",
+   "actions": [
+    [
+     "web_search",
+     "arg32"
+    ],
+    [
+     "see_screen",
+     "arg33"
+    ]
+   ],
+   "prior": [
+    [
+     "system_pulse",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:42:49",
+   "utterance": "Jarvis, I need 360.",
+   "actions": [
+    [
+     "web_search",
+     "arg34"
+    ],
+    [
+     "see_screen",
+     "arg33"
+    ]
+   ],
+   "prior": [
+    [
+     "web_search",
+     "arg32"
+    ],
+    [
+     "see_screen",
+     "arg33"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:43:14",
+   "utterance": "Jarvis, how far can those things scan? I need a pretty good range.",
+   "actions": [
+    [
+     "web_search",
+     "arg35"
+    ],
+    [
+     "see_screen",
+     "arg33"
+    ]
+   ],
+   "prior": [
+    [
+     "web_search",
+     "arg34"
+    ],
+    [
+     "see_screen",
+     "arg33"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:44:38",
+   "utterance": "Jarvis, I need something cheap that will do good for hallway mapping.",
+   "actions": [
+    [
+     "web_search",
+     "arg36"
+    ],
+    [
+     "see_screen",
+     "arg33"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:45:34",
+   "utterance": "Jarvis, how much does that run me?",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg37"
+    ],
+    [
+     "open_on_monitor",
+     "arg37"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:46:35",
+   "utterance": "Jarvis, close all of that out for me.",
+   "actions": [
+    [
+     "close_all_windows_except",
+     ""
+    ],
+    [
+     "close_all_windows_except",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:46:44",
+   "utterance": "Jarvis close all chrome windows.",
+   "actions": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "prior": [
+    [
+     "close_all_windows_except",
+     ""
+    ],
+    [
+     "close_all_windows_except",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:47:04",
+   "utterance": "Jarvis open YouTube on the main monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg39"
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@19:57:45",
+   "utterance": "Jarvis, how's the server looking?",
+   "actions": [
+    [
+     "server_status",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg39"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-19_19-37-13@20:02:25",
+   "utterance": "Jarvis, what is the Chase credit card interest rate?",
+   "actions": [
+    [
+     "web_search",
+     "arg40"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-20_09-25-34@09:30:17",
+   "utterance": "Jarvis, they're just replacing the flooring. Jarvis, they're just replacing the flooring. Jarvis, which mic are you using?",
+   "actions": [
+    [
+     "which_mic_is_active",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-20_09-25-34@09:33:44",
+   "utterance": "headset more noise cancelling.",
+   "actions": [
+    [
+     "use_headset_mic",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-26_20-02-43@20:05:21",
+   "utterance": "Jarvis play famous last words on YouTube on the left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg41"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-26_20-02-43@20:05:39",
+   "utterance": "Jarvis, it's not playing",
+   "actions": [
+    [
+     "screenshot",
+     ""
+    ],
+    [
+     "local_describe_screen",
+     ""
+    ],
+    [
+     "click_on_screen",
+     "arg42"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg41"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-26_20-02-43@20:07:14",
+   "utterance": "Jarvis passed it over to Claude. It already knows how.",
+   "actions": [
+    [
+     "web_search",
+     "arg43"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-26_20-02-43@20:08:10",
+   "utterance": "Jarvis, just play my damn song from earlier.",
+   "actions": [
+    [
+     "play_music",
+     "arg44"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_10-22-12@10:27:33",
+   "utterance": "Jarvis, what time is it?",
+   "actions": [
+    [
+     "get_time",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_10-22-12@10:27:54",
+   "utterance": "Jarvis, how's my printer doing?",
+   "actions": [
+    [
+     "how_is_the_print",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "get_time",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_10-22-12@10:28:18",
+   "utterance": "Jarvis, do some diagnostics on that.",
+   "actions": [
+    [
+     "system_check",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "how_is_the_print",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_11-54-31@11:57:29",
+   "utterance": "Jarvis closed all windows except for Claude.",
+   "actions": [
+    [
+     "list_windows",
+     ""
+    ],
+    [
+     "close_window",
+     "arg45"
+    ],
+    [
+     "close_window",
+     "arg45"
+    ],
+    [
+     "close_window",
+     "arg45"
+    ],
+    [
+     "close_window",
+     "arg45"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_11-54-31@12:00:09",
+   "utterance": "Jarvis had been at close.",
+   "actions": [
+    [
+     "close_window",
+     "arg46"
+    ],
+    [
+     "see_screen",
+     "arg47"
+    ],
+    [
+     "close_window",
+     "arg46"
+    ],
+    [
+     "see_screen",
+     "arg47"
+    ],
+    [
+     "close_window",
+     "arg46"
+    ],
+    [
+     "see_screen",
+     "arg47"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_13-21-59@14:47:11",
+   "utterance": "Jarvis, open Accelo on left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg2"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_13-21-59@14:47:51",
+   "utterance": "Jarvis opened teams on the top monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg24"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg2"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_13-21-59@14:48:37",
+   "utterance": "Jarvis, open teams on the top monitor.",
+   "actions": [
+    [
+     "move_window_to_monitor",
+     "arg48"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_16-07-04@16:08:26",
+   "utterance": "Jarvis, what version are you running?",
+   "actions": [
+    [
+     "version_info",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_16-07-04@16:12:36",
+   "utterance": "Jarvis put Rick and Morty on the main monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg49"
+    ]
+   ],
+   "prior": [
+    [
+     "version_info",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_16-07-04@16:12:51",
+   "utterance": "Jarvis, close that and open up HBO Max instead. That's where you need to watch Rick and Morty at.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg50"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg49"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_16-07-04@16:13:15",
+   "utterance": "Jarvis, try again. Find Rick and Morty on HBO Max and start and resume playing.",
+   "actions": [
+    [
+     "open_url",
+     "arg51"
+    ],
+    [
+     "see_screen",
+     "arg51"
+    ],
+    [
+     "see_screen",
+     "arg51"
+    ],
+    [
+     "web_search",
+     "arg52"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg50"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_16-07-04@16:14:01",
+   "utterance": "Jarvis continued.",
+   "actions": [
+    [
+     "see_screen",
+     ""
+    ],
+    [
+     "see_screen",
+     ""
+    ],
+    [
+     "see_screen",
+     ""
+    ],
+    [
+     "click",
+     "arg53"
+    ],
+    [
+     "click",
+     "arg53"
+    ],
+    [
+     "see_screen",
+     ""
+    ],
+    [
+     "see_screen",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "open_url",
+     "arg51"
+    ],
+    [
+     "see_screen",
+     "arg51"
+    ],
+    [
+     "see_screen",
+     "arg51"
+    ],
+    [
+     "web_search",
+     "arg52"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_16-07-04@16:17:02",
+   "utterance": "Jarvis, I want to watch Rick and Morty on the main monitor on HBO Max.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg54"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     ""
+    ],
+    [
+     "see_screen",
+     ""
+    ],
+    [
+     "see_screen",
+     ""
+    ],
+    [
+     "click",
+     "arg53"
+    ],
+    [
+     "click",
+     "arg53"
+    ],
+    [
+     "see_screen",
+     ""
+    ],
+    [
+     "see_screen",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_16-07-04@17:40:56",
+   "utterance": "Jarvis, close all windows except for clogged.",
+   "actions": [
+    [
+     "close_window",
+     "arg55"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg54"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_16-07-04@17:41:57",
+   "utterance": "Jarvis play ghosting stuff on YouTube on the main monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg56"
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     "arg55"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_16-07-04@17:42:09",
+   "utterance": "Jarvis, you didn't click the video.",
+   "actions": [
+    [
+     "click",
+     "arg57"
+    ],
+    [
+     "see_screen",
+     "arg58"
+    ],
+    [
+     "move_window_to_monitor",
+     "arg59"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg56"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@15:47:35",
+   "utterance": "Jarvis, what version are you running?",
+   "actions": [
+    [
+     "version_info",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@16:51:59",
+   "utterance": "Jarvis placements for licks on the left monitor on YouTube.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg60"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@17:22:21",
+   "utterance": "Jarvis close all windows except for Claude.",
+   "actions": [
+    [
+     "list_windows",
+     ""
+    ],
+    [
+     "minimize_window",
+     "arg61"
+    ],
+    [
+     "minimize_window",
+     "arg61"
+    ],
+    [
+     "minimize_window",
+     "arg61"
+    ],
+    [
+     "minimize_window",
+     "arg61"
+    ],
+    [
+     "minimize_window",
+     "arg61"
+    ],
+    [
+     "minimize_window",
+     "arg61"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg60"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@17:24:03",
+   "utterance": "Jarvis plays Skrillig Essentials on YouTube. Go ahead and click on the best video.",
+   "actions": [
+    [
+     "youtube",
+     "arg62"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@17:25:37",
+   "utterance": "Jarvis close that Chrome window.",
+   "actions": [
+    [
+     "close_window",
+     "arg63"
+    ]
+   ],
+   "prior": [
+    [
+     "youtube",
+     "arg62"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@17:25:56",
+   "utterance": "Jarvis, why is my hand tracking not working?",
+   "actions": [
+    [
+     "whats_broken",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     "arg63"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@17:26:49",
+   "utterance": "Jarvis, it was working fine, and I don't know what's going on. It should be working. It's plugged directly into the computer. The power supply is brand new.",
+   "actions": [
+    [
+     "whats_broken",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "whats_broken",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@17:27:30",
+   "utterance": "Jarvis, should we go ahead and update the 26H2?",
+   "actions": [
+    [
+     "web_search",
+     "arg64"
+    ],
+    [
+     "see_screen",
+     "arg65"
+    ]
+   ],
+   "prior": [
+    [
+     "whats_broken",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@17:28:37",
+   "utterance": "Jarvis, I'm about to go take a shower, see what you can do to fix it while I'm gone.",
+   "actions": [
+    [
+     "whats_broken",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@17:29:07",
+   "utterance": "Jarvis, go ahead and tell that claw chat to get the voice up and running properly and see if you can do anything about the cameras.",
+   "actions": [
+    [
+     "whats_broken",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "whats_broken",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-02_20-28-17@17:29:27",
+   "utterance": "Jarvis, watch over everybody.",
+   "actions": [
+    [
+     "whats_broken",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "whats_broken",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_13-09-42@13:12:51",
+   "utterance": "Jarvis, what's the weather today?",
+   "actions": [
+    [
+     "weather_briefing",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_13-09-42@13:16:51",
+   "utterance": "Jarvis, what's new?",
+   "actions": [
+    [
+     "read_changelog",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "weather_briefing",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_13-09-42@13:20:32",
+   "utterance": "Jarvis plays acrylics on YouTube.",
+   "actions": [
+    [
+     "youtube_play",
+     "arg66"
+    ]
+   ],
+   "prior": [
+    [
+     "read_changelog",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_13-09-42@13:20:54",
+   "utterance": "Jarvis plays Skrillix on YouTube.",
+   "actions": [
+    [
+     "youtube_play",
+     "arg67"
+    ]
+   ],
+   "prior": [
+    [
+     "youtube_play",
+     "arg66"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_13-09-42@13:21:45",
+   "utterance": "Jarvis paused the music.",
+   "actions": [
+    [
+     "pause_music",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "youtube_play",
+     "arg67"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_13-09-42@13:22:06",
+   "utterance": "Jarvis play my name as Skrylix on YouTube.",
+   "actions": [
+    [
+     "youtube_play",
+     "arg68"
+    ]
+   ],
+   "prior": [
+    [
+     "pause_music",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_13-09-42@13:22:58",
+   "utterance": "Jarvis, close window.",
+   "actions": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "youtube_play",
+     "arg68"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_13-09-42@13:24:49",
+   "utterance": "Jarvis, play some Michael Jackson on YouTube.",
+   "actions": [
+    [
+     "youtube_play",
+     "arg69"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_23-13-00@00:13:40",
+   "utterance": "Jarvis Check Claude Bret Cl Claude Credit Balance.",
+   "actions": [
+    [
+     "check_credits",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-04_23-13-00@00:14:07",
+   "utterance": "Jarvis, pull up that page so I can sign in for you.",
+   "actions": [
+    [
+     "open_url",
+     "arg70"
+    ],
+    [
+     "see_screen",
+     "arg70"
+    ],
+    [
+     "click",
+     "arg71"
+    ],
+    [
+     "see_screen",
+     "arg70"
+    ]
+   ],
+   "prior": [
+    [
+     "check_credits",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:24:10",
+   "utterance": "Jarvis, close that window for me, though, media player.",
+   "actions": [
+    [
+     "close_window",
+     "arg72"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:24:21",
+   "utterance": "Jarvis, go ahead and close out File Explorer 2.",
+   "actions": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     "arg72"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:24:33",
+   "utterance": "Jarvis, close file explorer.",
+   "actions": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:24:46",
+   "utterance": "Jarvis Close File Explorer.",
+   "actions": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:25:02",
+   "utterance": "Jarvis close everything except for Claw.",
+   "actions": [
+    [
+     "close_all_windows_except",
+     "arg73"
+    ]
+   ],
+   "prior": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:25:12",
+   "utterance": "Jarvis close everything except for Claude.",
+   "actions": [
+    [
+     "close_all_windows_except",
+     "arg74"
+    ]
+   ],
+   "prior": [
+    [
+     "close_all_windows_except",
+     "arg73"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:25:26",
+   "utterance": "Jarvis, you forgot Google Chrome.",
+   "actions": [
+    [
+     "close_all_windows_except",
+     "arg75"
+    ]
+   ],
+   "prior": [
+    [
+     "close_all_windows_except",
+     "arg74"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:25:42",
+   "utterance": "Jarvis close Google Chrome.",
+   "actions": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "close_all_windows_except",
+     "arg75"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:26:22",
+   "utterance": "Jarvis, turn off wake word mode.",
+   "actions": [
+    [
+     "wake_word_mode_off",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:27:56",
+   "utterance": "Open YouTube.",
+   "actions": [
+    [
+     "open_url",
+     "arg16"
+    ],
+    [
+     "see_screen",
+     "arg16"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:28:23",
+   "utterance": "Jarvis, go ahead and click that Mr. Beast video and then go back into what's it called? Wakeward mode.",
+   "actions": [
+    [
+     "youtube_play",
+     "arg76"
+    ],
+    [
+     "wake_word_mode_on",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "open_url",
+     "arg16"
+    ],
+    [
+     "see_screen",
+     "arg16"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:29:48",
+   "utterance": "Jarvis, I wanted the one that was on screen at the time.",
+   "actions": [
+    [
+     "recall_screen",
+     "arg77"
+    ],
+    [
+     "find_on_screen",
+     "arg78"
+    ],
+    [
+     "see_screen",
+     "arg79"
+    ],
+    [
+     "click",
+     "arg80"
+    ],
+    [
+     "see_screen",
+     "arg79"
+    ],
+    [
+     "click",
+     "arg80"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:30:42",
+   "utterance": "Jarvis, also tell Claude to go ahead and go and do some research on the screen visioning. Your screen vision protocol, it's not working properly. You're not able to see things, you're not thinking properly.",
+   "actions": [
+    [
+     "web_search",
+     "arg81"
+    ],
+    [
+     "see_screen",
+     "arg82"
+    ]
+   ],
+   "prior": [
+    [
+     "recall_screen",
+     "arg77"
+    ],
+    [
+     "find_on_screen",
+     "arg78"
+    ],
+    [
+     "see_screen",
+     "arg79"
+    ],
+    [
+     "click",
+     "arg80"
+    ],
+    [
+     "see_screen",
+     "arg79"
+    ],
+    [
+     "click",
+     "arg80"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:32:06",
+   "utterance": "Jarvis, go ahead and close that chrome window.",
+   "actions": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "prior": [
+    [
+     "web_search",
+     "arg81"
+    ],
+    [
+     "see_screen",
+     "arg82"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:32:14",
+   "utterance": "Jarvis opening you two back up.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg83"
+    ],
+    [
+     "open_on_monitor",
+     "arg83"
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:32:48",
+   "utterance": "Jarvis, tell Claude that I want it to be able to watch everything that it does too, that what you can see, so it can see what you see, that way it can learn.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg84"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg83"
+    ],
+    [
+     "open_on_monitor",
+     "arg83"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:35:57",
+   "utterance": "Jarvis, close that Chrome window and open up a YouTube one.",
+   "actions": [
+    [
+     "close_window",
+     "arg38"
+    ],
+    [
+     "open_on_monitor",
+     "arg85"
+    ],
+    [
+     "open_url",
+     "arg16"
+    ],
+    [
+     "see_screen",
+     "arg86"
+    ],
+    [
+     "see_screen",
+     "arg86"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg84"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:49:23",
+   "utterance": "Jarvis, talk to Butterbott about iPhones.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg87"
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     "arg38"
+    ],
+    [
+     "open_on_monitor",
+     "arg85"
+    ],
+    [
+     "open_url",
+     "arg16"
+    ],
+    [
+     "see_screen",
+     "arg86"
+    ],
+    [
+     "see_screen",
+     "arg86"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:49:41",
+   "utterance": "Jarvis talked to Butterbutt about iPhones.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg88"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg87"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:49:52",
+   "utterance": "Jarvis talked to [x].",
+   "actions": [
+    [
+     "butterbot_banter",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg88"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:50:18",
+   "utterance": "Jarvis, do that again.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg88"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:50:59",
+   "utterance": "Jarvis talked to [x] about Iron Man.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg89"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg88"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:51:38",
+   "utterance": "Jarvis, talk to Butterbutt about Tony Stark.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg90"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg89"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:52:07",
+   "utterance": "Jarvis talked to [x] about Tony Stark.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg91"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg90"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:52:39",
+   "utterance": "Jarvis talked to [x] about the arc reactor that Tony Stark built.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg92"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg91"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:53:06",
+   "utterance": "Jarvis, you got cut off there. Go ahead and try that again.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg88"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg92"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@00:53:34",
+   "utterance": "Jarvis, you got cut off there. Go ahead and finish that exam.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg88"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg88"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@01:44:01",
+   "utterance": "Jarvis, turn off hand trackings.",
+   "actions": [
+    [
+     "gaze_tracking_off",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg88"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@01:45:27",
+   "utterance": "Jarvis, see if you can figure out how to turn the screen brightness down on the left longer.",
+   "actions": [
+    [
+     "see_screen",
+     "arg93"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@01:45:49",
+   "utterance": "Jarvis, is there no way to do it through the Windows Command Center?",
+   "actions": [
+    [
+     "web_search",
+     "arg94"
+    ],
+    [
+     "see_screen",
+     "arg95"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     "arg93"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@01:46:29",
+   "utterance": "Jarvis putting closed that stab out.",
+   "actions": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "web_search",
+     "arg94"
+    ],
+    [
+     "see_screen",
+     "arg95"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_00-21-55@01:48:04",
+   "utterance": "Jarvis, see if there's any fully 3D printable, like autonomous WALIs that I can print. Like, I want to make a WALLI that's got full-all motors and everything.",
+   "actions": [
+    [
+     "web_search",
+     "arg96"
+    ],
+    [
+     "see_screen",
+     "arg97"
+    ]
+   ],
+   "prior": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@08:19:55",
+   "utterance": "Jarvis Morning Briefing.",
+   "actions": [
+    [
+     "daily_briefing",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@08:20:39",
+   "utterance": "Jarvis, what's in my calendar today?",
+   "actions": [
+    [
+     "calendar_today",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "daily_briefing",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:33:45",
+   "utterance": "Jarvis, what's new?",
+   "actions": [
+    [
+     "read_changelog",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:35:21",
+   "utterance": "Jarvis close Chrome.",
+   "actions": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:36:24",
+   "utterance": "Jarvis open armory crate.",
+   "actions": [
+    [
+     "open_url",
+     "arg98"
+    ],
+    [
+     "see_screen",
+     "arg98"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:38:33",
+   "utterance": "Jarvis, can you go download Armory Crate for me?",
+   "actions": [
+    [
+     "open_url",
+     "arg99"
+    ],
+    [
+     "see_screen",
+     "arg99"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:40:34",
+   "utterance": "Jarvis, I can't even read this shit. How am I supposed to click English?",
+   "actions": [
+    [
+     "see_screen",
+     "arg100"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:45:33",
+   "utterance": "Jarvis, what is this window on screen?",
+   "actions": [
+    [
+     "see_screen",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:46:12",
+   "utterance": "Jarvis, open Claud back up.",
+   "actions": [
+    [
+     "launch_app",
+     "arg74"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:46:31",
+   "utterance": "Jarvis, move the armory crate window to the left monitor.",
+   "actions": [
+    [
+     "move_window_to_monitor",
+     "arg101"
+    ]
+   ],
+   "prior": [
+    [
+     "launch_app",
+     "arg74"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:46:52",
+   "utterance": "Jarvis, open a solo on the left monitor and then move armor crate to the right one.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg102"
+    ],
+    [
+     "move_window_to_monitor",
+     "arg103"
+    ]
+   ],
+   "prior": [
+    [
+     "move_window_to_monitor",
+     "arg101"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:47:06",
+   "utterance": "Jarvis, I said Accelo.",
+   "actions": [
+    [
+     "launch_app",
+     "arg104"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg102"
+    ],
+    [
+     "move_window_to_monitor",
+     "arg103"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:47:25",
+   "utterance": "Jarvis put teams on the top monitor.",
+   "actions": [
+    [
+     "move_window_to_monitor",
+     "arg48"
+    ]
+   ],
+   "prior": [
+    [
+     "launch_app",
+     "arg104"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:47:38",
+   "utterance": "Jarvis open teams on the top monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg24"
+    ]
+   ],
+   "prior": [
+    [
+     "move_window_to_monitor",
+     "arg48"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@13:48:07",
+   "utterance": "Jarvis put YouTube on the main monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg85"
+    ],
+    [
+     "open_url",
+     "arg16"
+    ],
+    [
+     "see_screen",
+     "arg105"
+    ],
+    [
+     "see_screen",
+     "arg105"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg24"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@19:48:38",
+   "utterance": "Jarvis, how's the printer doing?",
+   "actions": [
+    [
+     "how_is_the_print",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@19:49:37",
+   "utterance": "Jarvis, open up Outlook for me.",
+   "actions": [
+    [
+     "launch_app",
+     "arg106"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@19:50:23",
+   "utterance": "Jarvis, remind me that exercise 4.1 through 4.3 is due Saturday the 17th, and rough draft paper is due Saturday the 10th.",
+   "actions": [
+    [
+     "set_timer",
+     "arg107"
+    ],
+    [
+     "set_timer",
+     "arg107"
+    ]
+   ],
+   "prior": [
+    [
+     "launch_app",
+     "arg106"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@19:52:08",
+   "utterance": "Jarvis, close up from",
+   "actions": [
+    [
+     "close_window",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@19:52:21",
+   "utterance": "Jarvis close Chrome.",
+   "actions": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@19:53:09",
+   "utterance": "Jarvis, is this board that I'm using the Z790-F?",
+   "actions": [
+    [
+     "web_search",
+     "arg108"
+    ],
+    [
+     "see_screen",
+     "arg109"
+    ],
+    [
+     "see_screen",
+     "arg109"
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@19:53:38",
+   "utterance": "Jarvis, that's not the top monitor, that's the left monitor.",
+   "actions": [
+    [
+     "see_screen",
+     "arg110"
+    ],
+    [
+     "see_screen",
+     "arg110"
+    ]
+   ],
+   "prior": [
+    [
+     "web_search",
+     "arg108"
+    ],
+    [
+     "see_screen",
+     "arg109"
+    ],
+    [
+     "see_screen",
+     "arg109"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@19:54:54",
+   "utterance": "Jarvis played ghosts and stuff on the top monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg111"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     "arg110"
+    ],
+    [
+     "see_screen",
+     "arg110"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@19:59:24",
+   "utterance": "Jarvis Paws Music Jarvis Paws Music",
+   "actions": [
+    [
+     "play_music",
+     "arg112"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg111"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@20:00:14",
+   "utterance": "Jarvis, look at Armory Crate. Why does it say no devices detected?",
+   "actions": [
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ]
+   ],
+   "prior": [
+    [
+     "play_music",
+     "arg112"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@20:01:02",
+   "utterance": "Jarvis, see if you can figure out what's going on with our Marikrade. Do I need drivers or something?",
+   "actions": [
+    [
+     "see_screen",
+     "arg113"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@20:01:18",
+   "utterance": "Jarvis, go ahead and run those.",
+   "actions": [
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     "arg113"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_05-10-01@20:01:52",
+   "utterance": "Jarvis, can you show me them?",
+   "actions": [
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ],
+    [
+     "see_screen",
+     "arg113"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:16:52",
+   "utterance": "Jarvis, turn on Iron Man 1 on the main screen.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg114"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:17:28",
+   "utterance": "Jarvis, Iron Man 1 is on Disney Plus. Close that YouTube box. Contact us quick. Fading. Jardine. Fading. I might have just had a heart attack. That almost I almost didn't make it. Preparing.",
+   "actions": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg114"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:17:42",
+   "utterance": "Jarvis open Ironman 1 on Disney Plus.",
+   "actions": [
+    [
+     "open_url",
+     "arg115"
+    ],
+    [
+     "see_screen",
+     "arg116"
+    ],
+    [
+     "streaming_search",
+     "arg117"
+    ]
+   ],
+   "prior": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:18:39",
+   "utterance": "Jarvis, I have it pulled up. Look at the link so you can learn.",
+   "actions": [
+    [
+     "see_screen",
+     "arg116"
+    ],
+    [
+     "move_window_to_monitor",
+     "arg118"
+    ],
+    [
+     "see_screen",
+     "arg116"
+    ],
+    [
+     "move_window_to_monitor",
+     "arg118"
+    ]
+   ],
+   "prior": [
+    [
+     "open_url",
+     "arg115"
+    ],
+    [
+     "see_screen",
+     "arg116"
+    ],
+    [
+     "streaming_search",
+     "arg117"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:19:02",
+   "utterance": "Jarvis, look at the main screen.",
+   "actions": [
+    [
+     "see_screen",
+     "arg119"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     "arg116"
+    ],
+    [
+     "move_window_to_monitor",
+     "arg118"
+    ],
+    [
+     "see_screen",
+     "arg116"
+    ],
+    [
+     "move_window_to_monitor",
+     "arg118"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:19:31",
+   "utterance": "Jarvis, that's not the main screen.",
+   "actions": [
+    [
+     "see_screen",
+     "arg119"
+    ],
+    [
+     "see_screen",
+     "arg119"
+    ],
+    [
+     "see_screen",
+     "arg119"
+    ],
+    [
+     "see_screen",
+     "arg119"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     "arg119"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:20:00",
+   "utterance": "Jarvis at the Chrome window.",
+   "actions": [
+    [
+     "focus_window",
+     "arg63"
+    ]
+   ],
+   "prior": [
+    [
+     "see_screen",
+     "arg119"
+    ],
+    [
+     "see_screen",
+     "arg119"
+    ],
+    [
+     "see_screen",
+     "arg119"
+    ],
+    [
+     "see_screen",
+     "arg119"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:43:19",
+   "utterance": "Jarvis, turn off hand tracking. Oh, God.",
+   "actions": [
+    [
+     "gaze_tracking_off",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "focus_window",
+     "arg63"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:45:41",
+   "utterance": "Jarvis, go ahead and do that.",
+   "actions": [
+    [
+     "project_status",
+     "arg120"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:46:36",
+   "utterance": "Jarvis asked [x] about Stanky Booty.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg121"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:47:04",
+   "utterance": "Jarvis asked Buttermut about wet coochie.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg122"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg121"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:48:11",
+   "utterance": "Jarvis asked [x] about Stanky Booty.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg121"
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg122"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@20:51:25",
+   "utterance": "Jarvis asked Betterbot about Wet Coochie.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg122"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@21:08:24",
+   "utterance": "Jarvis, how is the [x] doing?",
+   "actions": [
+    [
+     "butterbot_report",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_banter",
+     "arg122"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@21:49:11",
+   "utterance": "Jarvis, turn off air mouse.",
+   "actions": [
+    [
+     "air_mouse_off",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "butterbot_report",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@21:55:27",
+   "utterance": "Jarvis, make him talk.",
+   "actions": [
+    [
+     "butterbot_speak",
+     "arg123"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@21:55:54",
+   "utterance": "Jarvis, make them talk.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg124"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@21:56:34",
+   "utterance": "Jarvis, make the butterbut talk.",
+   "actions": [
+    [
+     "butterbot_speak",
+     "arg123"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@21:57:42",
+   "utterance": "Jarvis, you and the [x] have a conversation.",
+   "actions": [
+    [
+     "butterbot_banter",
+     "arg124"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:05:16",
+   "utterance": "Jarvis, place the Michael Jackson on the main monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg125"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:05:32",
+   "utterance": "Jarvis, close that Chrome window.",
+   "actions": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg125"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:05:42",
+   "utterance": "Jarvis, place a Michael Jackson, smooth criminal of Main Munder.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg126"
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:06:25",
+   "utterance": "Jarvis plays Relics on the left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg127"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:06:39",
+   "utterance": "Jarvis playing my name is Sprilligs on the left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg128"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg127"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:06:46",
+   "utterance": "Jarvis, close that window.",
+   "actions": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg128"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:06:52",
+   "utterance": "Jarvis, open up Google Chrome.",
+   "actions": [
+    [
+     "launch_app",
+     "arg38"
+    ]
+   ],
+   "prior": [
+    [
+     "close_last_opened",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:06:58",
+   "utterance": "Jarvis, open up Outlook.",
+   "actions": [
+    [
+     "launch_app",
+     "arg106"
+    ]
+   ],
+   "prior": [
+    [
+     "launch_app",
+     "arg38"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:07:04",
+   "utterance": "Jarvis, how's my printer doing?",
+   "actions": [
+    [
+     "how_is_the_print",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "launch_app",
+     "arg106"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:08:53",
+   "utterance": "Jarvis open Disney Plus on the left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg129"
+    ],
+    [
+     "open_url",
+     "arg130"
+    ],
+    [
+     "see_screen",
+     "arg131"
+    ],
+    [
+     "see_screen",
+     "arg131"
+    ],
+    [
+     "open_on_monitor",
+     "arg129"
+    ]
+   ],
+   "prior": [
+    [
+     "how_is_the_print",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:09:44",
+   "utterance": "Jarvis open flex on the left monitor.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg132"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg129"
+    ],
+    [
+     "open_url",
+     "arg130"
+    ],
+    [
+     "see_screen",
+     "arg131"
+    ],
+    [
+     "see_screen",
+     "arg131"
+    ],
+    [
+     "open_on_monitor",
+     "arg129"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@22:10:15",
+   "utterance": "Jarvis Plex dot com like P.",
+   "actions": [
+    [
+     "open_on_monitor",
+     "arg133"
+    ]
+   ],
+   "prior": [
+    [
+     "open_on_monitor",
+     "arg132"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@02:51:32",
+   "utterance": "Jarvis, can you take a look at my health data, maybe? You don't do that right now.",
+   "actions": [
+    [
+     "check_system",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@02:52:53",
+   "utterance": "Jarvis, is there not a way that I can just share it from my phone to you?",
+   "actions": [
+    [
+     "phone_setup_help",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@02:54:09",
+   "utterance": "Jarvis, there's a whole bunch of skills that need my sign in or something like that or you need my connection somehow or some way. Is there anything that you can list off off the top of your head?",
+   "actions": [
+    [
+     "list_skills",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@02:54:39",
+   "utterance": "Jarvis, what's left to set up? I need to reconnect the printer, don't I?",
+   "actions": [
+    [
+     "printer_online",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "list_skills",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@02:55:16",
+   "utterance": "Jarvis, when did the printer reconnect?",
+   "actions": [
+    [
+     "printer_online",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-05_20-14-05@02:55:38",
+   "utterance": "Jarvis, I already served that IP address.",
+   "actions": [
+    [
+     "network_usage",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "printer_online",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@04:00:08",
+   "utterance": "Jarvis, how is the printer?",
+   "actions": [
+    [
+     "how_is_the_print",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@04:31:45",
+   "utterance": "Jarvis now.",
+   "actions": [
+    [
+     "launch_app",
+     "arg15"
+    ]
+   ],
+   "prior": [
+    [
+     "how_is_the_print",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@09:34:06",
+   "utterance": "Jarvis, when did the printer finish?",
+   "actions": [
+    [
+     "get_time",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "launch_app",
+     "arg15"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:41:06",
+   "utterance": "Jarvis, I'm heading the class.",
+   "actions": [
+    [
+     "get_time",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:41:28",
+   "utterance": "Jarvis, I have to leave for class now, it starts at eleven-thirty.",
+   "actions": [
+    [
+     "get_time",
+     ""
+    ],
+    [
+     "get_time",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "get_time",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:41:42",
+   "utterance": "Jarvis, get the suit ready.",
+   "actions": [
+    [
+     "suit_up",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "get_time",
+     ""
+    ],
+    [
+     "get_time",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:42:42",
+   "utterance": "Jarvis, play some sprulettes.",
+   "actions": [
+    [
+     "play_playlist",
+     "arg134"
+    ]
+   ],
+   "prior": [
+    [
+     "suit_up",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:43:23",
+   "utterance": "Jarvis, play some skills.",
+   "actions": [
+    [
+     "list_playlists",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "play_playlist",
+     "arg134"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:43:46",
+   "utterance": "Jarvis, close all windows. I'm heading out.",
+   "actions": [
+    [
+     "close_all_windows_except",
+     "arg135"
+    ]
+   ],
+   "prior": [
+    [
+     "list_playlists",
+     ""
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:43:57",
+   "utterance": "Jarvis, close all apps.",
+   "actions": [
+    [
+     "close_all_windows_except",
+     "arg135"
+    ]
+   ],
+   "prior": [
+    [
+     "close_all_windows_except",
+     "arg135"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:44:06",
+   "utterance": "Jarvis close Chrome.",
+   "actions": [
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "prior": [
+    [
+     "close_all_windows_except",
+     "arg135"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:44:22",
+   "utterance": "Jarvis close teams.",
+   "actions": [
+    [
+     "close_window",
+     "arg136"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:44:29",
+   "utterance": "Jarvis Close Chrome.",
+   "actions": [
+    [
+     "close_window",
+     "arg38"
+    ],
+    [
+     "close_window",
+     "arg38"
+    ]
+   ],
+   "prior": [
+    [
+     "close_window",
+     "arg136"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-06_03-58-40@10:44:58",
+   "utterance": "Jarvis, why is my ram so high?",
+   "actions": [
+    [
+     "check_system",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-09_17-49-22@17:53:29",
+   "utterance": "Jarvis volume twenty percent.",
+   "actions": [
+    [
+     "set_volume",
+     "arg11"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-09_17-49-22@17:53:39",
+   "utterance": "Jarvis, why can't I hear my YouTube video?",
+   "actions": [
+    [
+     "system_pulse",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "set_volume",
+     "arg11"
+    ]
+   ],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-09_17-49-22@18:03:39",
+   "utterance": "Jarvis, turn on air mouse. I don't want to ask what it's for. Can I ask like what's kind of conditioned or you don't have to answer that? No, yeah, it's fine. Jarvis, turn on air mouse. Cystic fibrosis is a lifelong condition that makes it hard to breathe and there's no cure for it. Does it affect their life?",
+   "actions": [
+    [
+     "air_mouse_on",
+     ""
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-09_18-32-24@21:21:38",
+   "utterance": "Jarvis, can you open Fortnite for me?",
+   "actions": [
+    [
+     "launch_app",
+     "arg4"
+    ]
+   ],
+   "prior": [],
+   "wrong": null
+  },
+  {
+   "id": "2026-10-09_18-32-24@21:21:54",
+   "utterance": "Jarvis, go ahead and shut down for me. Don't start overnight protocol.",
+   "actions": [
+    [
+     "shutdown_jarvis",
+     ""
+    ]
+   ],
+   "prior": [
+    [
+     "launch_app",
+     "arg4"
+    ]
+   ],
+   "wrong": null
+  }
+ ]
+}
