@@ -577,6 +577,45 @@ def shutdown_declining_overnight(text, *, alone_ok: bool = False) -> bool:
         return False
 
 
+# The second sentence of "Shut down. No overnight protocol." (live
+# 2026-10-19 20:26:04, W08): nothing but the overnight protocol, with or
+# without a no / with / without in front. Words only (_clean_words).
+_OVERNIGHT_CLAUSE_RE = re.compile(
+    r"^" + _WAKE + r"(?:(?:and|but|so|just|please|um|uh)\s+)*"
+    r"(?:(?:no|with\s+no|with|without|with\s+out)\s+)?(?:the\s+)?"
+    r"over\s*night(?:\s+protocols?)?"
+    r"(?:\s+(?:please|sir|jarvis|thanks|thank\s+you))*$")
+
+
+def shutdown_with_overnight_clause(text) -> bool:
+    """True when ``text`` is exactly TWO sentences - no question mark,
+    nothing quoted - where one sentence alone asks JARVIS to shut down
+    (asked_for_self_termination) and the other is only an overnight-protocol
+    clause: "Jarvis, shut down. No overnight protocol." (live 2026-10-19),
+    "Shut down. No, overnight protocol.", "Shut down. Without the overnight
+    protocol." The two readings ("no overnight protocol" / "no - overnight
+    protocol") mean opposite things, so the caller ASKS the overnight
+    question and never shuts down on this alone. shutdown_declining_overnight
+    and _one_request are untouched (they still reject two sentences). Never
+    raises; a fault is False."""
+    try:
+        raw = str(text or "")
+        if "?" in raw or _QUOTED_RE.search(raw):
+            return False
+        parts = [p for p in re.split(r"[.!;…]+", raw)
+                 if _clean_words(p).strip()]
+        if len(parts) != 2:
+            return False
+        a_cmd = asked_for_self_termination("shutdown_jarvis", parts[0])
+        b_cmd = asked_for_self_termination("shutdown_jarvis", parts[1])
+        if a_cmd == b_cmd:
+            return False
+        clause = parts[1] if a_cmd else parts[0]
+        return bool(_OVERNIGHT_CLAUSE_RE.match(_clean_words(clause).strip()))
+    except Exception:
+        return False
+
+
 def accepts_overnight(text) -> bool:
     """True when ``text``, in reply to "Would you like to start the overnight
     protocol first?", says yes to the overnight protocol by name: "Yes,

@@ -1488,6 +1488,20 @@ CLOUD_BOOST_UNTIL = ""
 # user_settings.json; applies on the next start.
 FAST_PATHS_ENABLED = True
 
+# ─── Two-sentence shutdown asks the overnight question (v3 W08) ─────────
+# "Jarvis, shut down. No overnight protocol." (live 2026-10-19 20:26:04) is
+# two sentences, so the one-request shutdown grammar rejects it on purpose
+# ("No, overnight protocol." could mean the opposite) and it went to the
+# model, which claimed a shutdown it never ran. When True, exactly two
+# sentences - one a shutdown of JARVIS, the other only an overnight-protocol
+# clause - arm the existing overnight prompt and ask its question
+# (core/action_risk.shutdown_with_overnight_clause). It NEVER shuts down on
+# its own: the existing yes/no handler answers the next reply. Skipped while
+# the overnight prompt was open moments ago (its own answer stays its own).
+# False = exactly the old routing (the phrase goes to the model). Set via
+# user_settings.json; applies on the next start.
+SHUTDOWN_TWO_SENTENCE_ASK = True
+
 # ─── Instant actions (core/instant_actions.py, 2026-10-02) ──────────────
 # A basic command — volume up / down / mute / unmute, pause / resume / next /
 # previous track, lights on / off, pause the print — matched by anchored,

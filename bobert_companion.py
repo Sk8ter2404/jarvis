@@ -17693,6 +17693,7 @@ _TURN_FLAG_KEYS = (
     "BOOT_PARALLEL_LOAD",
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
+    "SHUTDOWN_TWO_SENTENCE_ASK",
 )
 
 
@@ -33717,18 +33718,54 @@ def _check_and_arm_shutdown_prompt(text: str) -> bool:
             print(f"  [shutdown] _act_shutdown_jarvis failed: {_e}")
         return True
     tl = text.strip().lower()
-    if not tl or len(tl.split()) > 6:
-        return False
-    if not any(p in tl for p in SHUTDOWN_TRIGGER_PHRASES):
-        return False
-    # Only when the owner means JARVIS (audit A28, rechecked 2026-10-02): the
-    # bare "shut down" / "power off" also sit inside device commands - "shut
-    # down the computer", "power off the tv", "shut down chrome" - and armed
-    # this prompt instead of running, after which a plain "No." powered
-    # JARVIS off. The dispatcher's own self-termination test decides: a
-    # shutdown verb with no object, or with JARVIS as it.
-    if not _action_risk.asked_for_self_termination("shutdown_jarvis", text):
-        return False
+    # Two sentences, a shutdown and an overnight clause (live 2026-10-19
+    # 20:26:04, v3 W08): "Jarvis, shut down. No overnight protocol." went to
+    # the model, which claimed a shutdown it never ran. Both readings ("no
+    # overnight protocol" / "no - overnight protocol") are answered by the
+    # existing question, so it ASKS, never shuts down. Not while the prompt
+    # was open moments ago: _handle_shutdown_prompt just answered or
+    # cancelled it (it clears "armed" only), and re-asking would override
+    # that answer.
+    _two_sentence = False
+    if SHUTDOWN_TWO_SENTENCE_ASK:
+        try:
+            _two_sentence = (
+                float(_shutdown_prompt_pending.get("expires_at") or 0.0)
+                <= time.time()
+                and _action_risk.shutdown_with_overnight_clause(text))
+        except Exception:
+            _two_sentence = False
+        if _two_sentence:
+            print("  [shutdown] two-sentence shutdown + overnight clause "
+                  "— asking the overnight question")
+            # The overnight question REPLACES a shutdown the model queued for
+            # a yes (review 2026-10-27): left queued, a "Yes." to the question
+            # started the overnight protocol and a second "Yes." then ran the
+            # stale shutdown_jarvis, powering JARVIS off mid-protocol. Both
+            # answers to the question still go through its own handler.
+            try:
+                if _held_shutdown_pending():
+                    _n_held = len(_pending_confirmation)
+                    _pending_confirmation.clear()
+                    _pending_confirmation_at[0] = 0.0
+                    print(f"  [shutdown] dropped {_n_held} held shutdown "
+                          f"action(s) — the overnight question replaces it")
+            except Exception:
+                pass
+    if not _two_sentence:
+        if not tl or len(tl.split()) > 6:
+            return False
+        if not any(p in tl for p in SHUTDOWN_TRIGGER_PHRASES):
+            return False
+        # Only when the owner means JARVIS (audit A28, rechecked 2026-10-02):
+        # the bare "shut down" / "power off" also sit inside device commands
+        # - "shut down the computer", "power off the tv", "shut down chrome"
+        # - and armed this prompt instead of running, after which a plain
+        # "No." powered JARVIS off. The dispatcher's own self-termination
+        # test decides: a shutdown verb with no object, or with JARVIS as it.
+        if not _action_risk.asked_for_self_termination("shutdown_jarvis",
+                                                       text):
+            return False
     _shutdown_prompt_pending["armed"] = True
     _shutdown_prompt_pending["reasked"] = False
     _shutdown_prompt_pending["expires_at"] = time.time() + SHUTDOWN_PROMPT_TIMEOUT_S
