@@ -103,12 +103,27 @@ _MODE_WORD_RE = re.compile(
     r"memory|vram|ram|come back|fortnite|minecraft|steam)\b", re.I)
 
 # ── Rule 3: an owner correction ─────────────────────────────────────────────
+# The plan's words only (no / that's not / wrong / I said), plus what c032
+# needs: "though" closing a clause ("the headset is on though."), the owner
+# contradicting the answer. Bare still / already / actually are NOT here:
+# "is the download still running?" or "actually, what time is it?" ask for
+# a fresh reading, they correct nothing.
 _CORRECTION_RE = re.compile(
     r"^(?:no|nope|nah|negative)\b"
     r"|\bno,"
-    r"|\b(?:that'?s|that is|it'?s|it is|thats|that was)\s+not\b"
-    r"|\bwrong\b|\bi said\b|\bi meant\b|\bnot what i\b|\bi told you\b"
-    r"|\bthough\b|\bactually\b|\balready\b|\bstill\b", re.I)
+    r"|\b(?:that'?s|that is|thats|that was)\s+not\b"
+    r"|\bwrong\b|\bi said\b"
+    r"|\bthough\s*(?:[.!;,]|$)", re.I)
+# Words that ask for a fresh reading: never rule 3, whatever else he said.
+_RECHECK_RE = re.compile(
+    r"\bagain\b|\bre-?check|\brefresh|\bre-?run\b|\bone more time\b", re.I)
+
+
+def _asks_fresh_reading(text: str) -> bool:
+    """True when the owner asks for the reading again: a re-check word, or
+    the turn ends on a question ("is it still up?", "is it working now?")."""
+    body = text.strip().rstrip(" .!\"'")
+    return bool(_RECHECK_RE.search(body)) or body.endswith("?")
 
 
 def _norm(text) -> str:
@@ -133,8 +148,12 @@ def owner_command(user_text) -> Optional[str]:
 
 
 def is_correction(user_text) -> bool:
-    """True when the owner's words correct what JARVIS just did."""
-    return _CORRECTION_RE.search(_strip_opener(user_text)) is not None
+    """True when the owner's words correct what JARVIS just did (and do not
+    ask for a fresh reading: "no, check again" is a re-check)."""
+    body = _strip_opener(user_text)
+    if _asks_fresh_reading(body):
+        return False
+    return _CORRECTION_RE.search(body) is not None
 
 
 def _pairs(actions) -> list:

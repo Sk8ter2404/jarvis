@@ -202,6 +202,48 @@ class RuleEdgeTests(unittest.TestCase):
             "Jarvis, which mic is active?", "which_mic_is_active", "",
             [("which_mic_is_active", "")]))
 
+    def test_fresh_reading_asks_are_not_corrections(self):
+        # Review W11 #1: polling questions and explicit re-checks want a
+        # fresh reading; the same action with the same argument must pass.
+        cases = (
+            ("No, check again.", "which_mic_is_active", ""),
+            ("I plugged it in already, check again", "which_mic_is_active",
+             ""),
+            ("Is the download still running?", "check_download_status", ""),
+            ("Is the server still up?", "check_server_status", ""),
+            ("I already restarted it, is it working now?",
+             "check_server_status", ""),
+            ("What's the CPU at now? Still high?", "system_pulse", ""),
+            ("Actually, what time is it?", "get_time", ""),
+            ("Refresh it, I already fixed it", "get_weather", ""),
+            ("No, re-check the mic.", "which_mic_is_active", ""),
+            ("That's not right, run it one more time.", "system_pulse", ""),
+        )
+        for text, name, arg in cases:
+            for said in (text, "Jarvis, " + text):
+                with self.subTest(said=said):
+                    self.assertFalse(af.is_correction(said))
+                    self.assertIsNone(af.check(said, name, arg,
+                                               [(name, arg)], [name]))
+
+    def test_bare_still_already_actually_are_not_corrections(self):
+        for said in ("It's still loading.", "I already plugged it in.",
+                     "Actually the headset is on.", "Though it's late, ok.",
+                     "It's not a big deal."):
+            with self.subTest(said=said):
+                self.assertFalse(af.is_correction(said))
+
+    def test_plan_correction_words_still_flag(self):
+        for said in ("No, the headset.", "Nope.", "That's not it.",
+                     "Wrong mic.", "I said the headset.",
+                     "The headset is on though.", "It's on though, I'm "
+                     "using it right now."):
+            with self.subTest(said=said):
+                self.assertTrue(af.is_correction("Jarvis, " + said))
+                self.assertIsNotNone(af.check(
+                    "Jarvis, " + said, "which_mic_is_active", "",
+                    [("which_mic_is_active", "")], ["which_mic_is_active"]))
+
     def test_repeat_needs_the_previous_turn(self):
         self.assertIsNone(af.check(
             "Jarvis, no, the headset.", "which_mic_is_active", "", []))
