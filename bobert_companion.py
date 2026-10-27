@@ -17566,6 +17566,9 @@ _TURN_FLAG_KEYS = (
     "PROCESSING_FILLER_LATE_START_S", "PROCESSING_FILLER_SKIP_PLEASANTRIES",
     "FILLER_DUCK_HOLD", "KOKORO_PERSISTENT_PHONEMIZER", "KOKORO_RENDER_CACHE",
     "KOKORO_RENDER_CACHE_PERSIST", "OLLAMA_SERVER_LOG", "LOCAL_NUM_CTX",
+    "BACKGROUND_LLM_BASE_URL",
+    "BACKGROUND_LLM_MODEL",
+    "BACKGROUND_LLM_TIMEOUT_S",
     "BACKGROUND_TAG_STRICT", "STT_ENGINE", "STT_SHADOW", "SMART_TURN_MODE",
     "SMART_TURN_THRESHOLD", "WHISPER_TEMPERATURES", "WHISPER_BEAM_SIZE",
     "PROCESSING_FILLER_SOFT_CUT", "LOCAL_PROMPT_PROFILE",
@@ -22712,6 +22715,53 @@ def _local_usage(stats_or_body) -> dict:
         return {}
 
 
+def _background_remote_try(system: str, messages: list, max_tokens: int,
+                           caller: str, background) -> "str | None":
+    """v3 W13: the reply from the background (CPU) Ollama, or None to carry
+    on with the main brain. None when BACKGROUND_LLM_BASE_URL is unset (the
+    default), the call is not background, the caller is not on
+    core.background_llm.REMOTE_OK_CALLERS (owner-facing callers never are),
+    the host is memoised down, or the remote call fails (logged). Never
+    raises."""
+    try:
+        _url = globals().get("BACKGROUND_LLM_BASE_URL")
+        if not (isinstance(_url, str) and _url.strip()):
+            return None
+        from core import background_llm as _bgl
+        _name, _is_bg = _lt.resolve_caller(caller, background)
+        if _bgl.route(_url, _name, _is_bg) != "remote":
+            return None
+        _model = _bgl.clean_model(globals().get("BACKGROUND_LLM_MODEL"))
+        _sys, _msgs = _local_chat_prompt(system, list(messages))
+        _fit = _fit_local_messages(_sys, list(_msgs), (),
+                                   max_tokens=max_tokens, where="bg-remote",
+                                   model_tag=_model, log=False)
+        if not getattr(_fit, "fits", True):
+            return None     # too big for the remote window: main brain
+        try:
+            text, body = _bgl.chat(
+                _url, _model, _sys, list(_fit), max_tokens,
+                _bgl.clean_timeout(globals().get("BACKGROUND_LLM_TIMEOUT_S")),
+                think=_local_think_param(_model))
+        except _bgl.RemoteFailure as _e:
+            print(f"  [bg-llm] remote failed ({_e}) - using the main brain")
+            return None
+        _usage = _local_usage(body)
+        try:
+            _lt.note_call(_name, True, "local", _usage)
+        except Exception:
+            pass
+        _host = _bgl.clean_base_url(_url).split("//")[-1]
+        print(f"  [local-llm] served via {_model} @{_host} (remote) "
+              f"caller={_name} bg pe={body.get('prompt_eval_count', '?')} "
+              f"ev={body.get('eval_count', '?')}")
+        return text
+    except Exception as _e:
+        print(f"  [bg-llm] remote failed ({type(_e).__name__}: {_e}) - "
+              f"using the main brain")
+        return None
+
+
 def _call_local_llm(system: str, messages: list, max_tokens: int = 500, *,
                     caller: str = "",
                     background: "bool | None" = None) -> str | None:
@@ -22723,6 +22773,13 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500, *,
     background job becomes one around its POST, so it passes the same gate."""
     if not LOCAL_LLM_FALLBACK:
         return None
+    # v3 W13: an allowlisted background job goes to the second (CPU) Ollama
+    # when BACKGROUND_LLM_BASE_URL is set, so it cannot evict the voice
+    # brain's cached prompt. "" (default): this returns None at once.
+    _bg_text = _background_remote_try(system, messages, max_tokens,
+                                      caller, background)
+    if _bg_text:
+        return _bg_text
     if not _ollama_alive():
         _ollama_selfheal_async()   # mid-session death: restart in background
         _ollama_install_async()    # (no-op when the binary is present+installed)
