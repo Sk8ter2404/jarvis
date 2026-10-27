@@ -1,0 +1,163 @@
+"""Exact alias table for invented action names (v3 W04, 2026-10-27).
+
+The model sometimes names an action that does not exist: ``read_screen``,
+``pause``, ``volume_set``, ``open_app``. The fuzzy corrector
+(command_autocorrect.py) then guesses, and some of its guesses are wrong
+and silent: play_video -> play_vibe (0.94), toggle_mute -> toggle_hud (0.82),
+open_app -> open_url (0.76) - JARVIS-Research/v3_overhaul_20261027/
+05_action_vocabulary.md section 4. Most invented names have one obvious real
+action, so this table maps them EXACTLY, with no scoring, before the fuzzy
+layer runs (bobert_companion.parse_and_run_actions._runner, logged as
+``[alias] x -> y``).
+
+Rules for every row (pinned by tests/test_action_aliases.py):
+  * the source is NOT a registered action - a real name always wins, and
+    _runner only looks here when ACTIONS has no such name;
+  * the target IS registered;
+  * the target is SAFE: never self-terminating (core.action_risk
+    SELF_TERMINATING_ACTIONS), never _autocorrect_protected, never
+    CONFIRM-tier, never destructive. The rewritten name still goes through
+    every gate after it (self-termination, confirmation, pushback), exactly
+    as if the model had named it;
+  * nothing in NEVER_ALIAS / NEVER_ALIAS_PREFIXES is ever a source: sends,
+    deletes, money, shutdown / exit / restart, close-all, file moves, shell.
+
+Pure data plus two pure helpers; no imports from the monolith. Behind the
+``ACTION_ALIASES`` setting (core/config.py); off = the old path, untouched.
+"""
+from __future__ import annotations
+
+import re
+
+# invented name -> registered canonical name. SAFE rows only. Each target was
+# checked against the registration scan of v2.0.231 (tools/registration_scan).
+ALIASES: dict[str, str] = {
+    # The screen: "read the results" means look at the live screen.
+    # (Live 10-19 19:44:48: read_screen -> "Did you mean recall_screen or
+    # read_thread?")
+    "read_screen": "see_screen",
+    "read_the_screen": "see_screen",
+    "read_page": "see_screen",
+    "read_results": "see_screen",
+    "take_screenshot": "screenshot",
+    "screenshot_screen": "screenshot",
+    "screen_capture": "screenshot",       # fuzzy: screen_history (wrong)
+    "capture_screen": "screenshot",
+    "describe_screen": "local_describe_screen",
+    "look_at_screen": "local_describe_screen",
+    # Windows
+    "list_windows_all": "list_windows",
+    "show_windows": "list_windows",
+    "show_window": "focus_window",
+    "bring_back_window": "focus_window",
+    # Read-only status
+    "network_scan": "network_usage",
+    "check_network": "network_usage",
+    "connection_status": "network_usage",
+    "list_devices": "list_smart_home_devices",
+    "list_smart_devices": "list_smart_home_devices",
+    "smart_home_list_devices": "list_smart_home_devices",
+    "check_server": "server_status",
+    "server_check": "server_status",
+    "homeserver_status": "server_status",
+    "check_cpu": "system_pulse",
+    "system_info": "system_pulse",
+    "check_system_health": "system_pulse",
+    # Sound and media
+    "volume_set": "set_volume",           # fuzzy: volume_mute vs volume_up
+    "set_the_volume": "set_volume",
+    "mute": "volume_mute",
+    "mute_volume": "volume_mute",
+    "toggle_mute": "volume_mute",         # fuzzy: toggle_hud (wrong)
+    "pause": "media_playpause",
+    "pause_video": "media_playpause",
+    "pause_playback": "media_playpause",
+    "stop_music": "pause_music",
+    "play_video": "youtube_play",         # fuzzy: play_vibe 0.94 (wrong)
+    # Browser and apps (browser_open is a REAL action: skills/browser_agent)
+    "open_browser": "open_url",
+    "open_website": "open_url",
+    "web_open": "open_url",
+    "open_app": "launch_app",             # fuzzy: open_url (wrong)
+    "open_application": "launch_app",
+    "start_app": "launch_app",
+    "launch": "launch_app",
+    # Clicks (_click_alias already covers a described "click")
+    "click_element": "click_on_screen",
+    "click_screen": "click_on_screen",
+    "click_button": "click_on_screen",
+}
+
+# Targets that only make sense with an argument: with none the alias does not
+# apply and the name takes today's path (an empty youtube_play / open_url /
+# launch_app would only fail, or play something unasked).
+NEEDS_ARG = frozenset({
+    "youtube_play", "open_url", "launch_app", "focus_window",
+    "click_on_screen", "set_volume",
+})
+
+# Never aliased, whatever a future row says (05_action_vocabulary.md section
+# 6, NEVER rows). These keep today's path: blocked + a question, or
+# "unknown action".
+NEVER_ALIAS = frozenset({
+    "send_email", "send", "send_money", "transfer", "transfer_funds",
+    "shutdown", "shutdown_pc", "shut_down", "exit", "quit", "power_off",
+    "turn_off", "restart", "restart_pc", "reboot", "sleep_pc", "hibernate",
+    "close_all_windows", "close_everything", "close_all", "close_all_apps",
+    "move_file", "copy_file", "organize_files", "open_file",
+    "delete", "delete_folder", "delete_folder_contents", "delete_window",
+    "remove_file", "run_shell", "run_code", "type", "lock", "sleep",
+})
+NEVER_ALIAS_PREFIXES = (
+    "send_", "delete_", "remove_", "wipe_", "format_", "erase_", "pay_",
+    "buy_", "purchase", "checkout", "transfer", "kill_", "shutdown",
+    "shut_", "restart", "reboot", "exit", "quit", "power_off", "turn_off",
+    "close_all", "move_", "copy_", "run_", "reset_", "forget_", "uninstall",
+)
+
+
+def is_never_alias(name: str) -> bool:
+    """True when ``name`` must never be rewritten by this table."""
+    n = (name or "").strip().lower()
+    return n in NEVER_ALIAS or n.startswith(NEVER_ALIAS_PREFIXES)
+
+
+def alias_for(name: str, arg: str, registered) -> "str | None":
+    """The canonical action for an invented ``name``, or None.
+
+    None when ``name`` is registered (a real name always wins), has no row,
+    is a NEVER name, the target is not registered (a skill that did not
+    load), or the target needs an argument and ``arg`` is empty. Never
+    raises: any fault is None (today's path)."""
+    try:
+        n = (name or "").strip().lower()
+        if not n or n in registered or is_never_alias(n):
+            return None
+        target = ALIASES.get(n)
+        if not target or target not in registered:
+            return None
+        if target in NEEDS_ARG and not str(arg or "").strip():
+            return None
+        return target
+    except Exception:
+        return None
+
+
+# Short words said as letters, so a label reads the way the owner says it.
+_LABEL_WORDS = {
+    "hud": "HUD", "url": "URL", "tv": "TV", "pc": "PC", "cpu": "CPU",
+    "gpu": "GPU", "obs": "OBS", "dmx": "DMX", "ups": "UPS", "vip": "VIP",
+    "ip": "IP", "usb": "USB", "rgb": "RGB", "ai": "AI",
+}
+
+
+def friendly_label(name: str) -> str:
+    """An action name as words for speech: ``recall_screen`` -> "recall
+    screen", ``toggle_hud`` -> "toggle HUD". No backticks, no underscores.
+    The words stay the name's own, so the owner can answer a "did you mean"
+    by saying them (_resolve_autocorrect_choice matches the name with its
+    underscores as spaces)."""
+    words = [w for w in re.split(r"[_\s\-]+", str(name or "").strip()) if w]
+    if not words:
+        return "that"
+    return " ".join(_LABEL_WORDS.get(w.lower(), w.lower()) for w in words)

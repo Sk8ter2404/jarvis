@@ -453,6 +453,65 @@ def _polarity_clash(unknown: str, candidate: str) -> bool:
     return False
 
 
+# ── Verb clash (v3 W04, 2026-10-27) ──────────────────────────────────────
+# A silent route may not change the JOB the model named. Offline replay
+# (JARVIS-Research/v3_overhaul_20261027/05_action_vocabulary.md section 4):
+# send_email -> read_email 0.82 and quit -> quiet_mode 0.80 change the verb;
+# play_video -> play_vibe 0.94, toggle_mute -> toggle_hud 0.82 and
+# open_app -> open_url 0.76 keep the verb but change what it acts on. Verbs
+# in one class are near-synonyms (show_windows -> list_windows is the same
+# job); two classes are two jobs. Filler verbs (start, stop, enable, turn,
+# ...) are dropped before the first verb is read - _polarity_clash owns those.
+_VERB_CLASSES = (
+    frozenset({"send", "reply", "forward", "compose", "draft", "write",
+               "email", "text", "message", "post", "share"}),
+    frozenset({"read", "check", "get", "show", "list", "see", "view", "look",
+               "recall", "describe", "find", "search", "fetch", "scan",
+               "query", "watch"}),
+    frozenset({"play"}),
+    frozenset({"open", "launch", "run"}),
+    frozenset({"quit", "exit", "close", "kill", "terminate", "shutdown"}),
+    frozenset({"quiet", "mute", "silence", "hush"}),
+    frozenset({"toggle", "switch"}),
+    frozenset({"set", "change", "adjust"}),
+    frozenset({"pause", "resume"}),
+)
+_VERB_CLASS_OF = {v: i for i, cls in enumerate(_VERB_CLASSES) for v in cls}
+# Objects closer than this are the same thing misspelt ("see_scren").
+_OBJECT_MATCH = 0.75
+
+
+def _verb_clash(unknown: str, candidate: str) -> bool:
+    """True when routing ``unknown`` to ``candidate`` would change the job:
+    both lead with known verbs from different classes (send/read,
+    quit/quiet), or both lead with the same known verb and what follows
+    shares no word (play_video/play_vibe, open_app/open_url). A name that
+    does not lead with a known verb never clashes, and neither does one with
+    nothing after its verb."""
+    tu, tc = _tokens(unknown), _tokens(candidate)
+    if not tu or not tc:
+        return False
+    cu, cc = _VERB_CLASS_OF.get(tu[0]), _VERB_CLASS_OF.get(tc[0])
+    if cu is None or cc is None:
+        return False
+    if cu != cc:
+        return True
+    if tu[0] != tc[0]:
+        return False                    # synonyms: show_x / list_x
+    ru, rc = tu[1:], tc[1:]
+    if not ru or not rc:
+        return False
+    return not any(_same_object(a, b) for a in ru for b in rc)
+
+
+def _same_object(a: str, b: str) -> bool:
+    """One word misspelt or cut short: "scren"/"screen", "ap"/"app"."""
+    if _lev_ratio(a, b) >= _OBJECT_MATCH or _levenshtein(a, b) <= 1:
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 2 and long_.startswith(short)
+
+
 def _protected_predicate(protected):
     """``protected`` (None, a collection of names, or a ``name -> bool``
     callable) as a predicate that FAILS SAFE: a predicate that raises counts
@@ -566,9 +625,13 @@ def autocorrect_command_choice(
     *,
     use_embeddings: bool = True,
     protected=None,
+    verb_clash: bool = False,
 ) -> dict:
     """Pick between silent route, disambiguation prompt, no-match and (with
-    ``protected``) blocked."""
+    ``protected``) blocked. With ``verb_clash`` a silent route whose pick
+    changes the job (_verb_clash) comes back "none" instead, with
+    ``clash`` = the refused (name, score); False keeps the old result
+    exactly."""
     is_protected = _protected_predicate(protected)
     if is_protected is None:
         top = autocorrect_command_topk(
@@ -599,6 +662,9 @@ def autocorrect_command_choice(
             and (top1[1] - top2[1]) <= ambiguity_gap
             and top2[0] != top1[0]):
         return {"status": "ambiguous", "primary": top1, "secondary": top2}
+    if verb_clash and _verb_clash(unknown, top1[0]):
+        return {"status": "none", "primary": top1, "secondary": None,
+                "clash": top1}
     return {"status": "silent", "primary": top1, "secondary": None}
 
 
