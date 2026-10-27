@@ -1558,6 +1558,22 @@ SPEECH_HYGIENE = True
 # (self-termination, confirmation, pushback) still runs on the new name.
 ACTION_ALIASES = True
 
+# --- Chain loop guard (v3 W21, 2026-10-27; core/loop_guard.py) ---------
+# LOOP_GUARD_MODE - the follow-up loop already stops a chain on a repeated
+# failure, "no new progress" and a once-per-chain action coming round again.
+# This adds what those miss: ping-pong (web_search, see_screen, web_search,
+# see_screen ... live 2026-10-19: 6 calls in 35 s), the same action + argument
+# a third time, and more than 3 screen looks in one chain. Click / type /
+# press / scroll steps are exempt (filling a form is not a loop).
+#   'off'    the old behaviour, byte for byte;
+#   'shadow' (default) nothing changes; the verdict is logged once per turn
+#            as "[loop-guard] would stop (ping-pong web_search/see_screen)";
+#   'on'     the chain stops there (cut "ping-pong") and the usual honest
+#            close-out line is spoken.
+# Any other value reads as 'off'. Never touches confirmation, action_risk or
+# shutdown. Applies on the next start.
+LOOP_GUARD_MODE = "shadow"
+
 # ─── Prompt v3 core (v3 overhaul W03, 2026-10-27) ────────────────────────
 # PROMPT_DIRECTIVE_V3 (bool): the wording of the prompt rules the local
 # model obeys, as one switch. True: an [ACTION] token is a REQUEST, not a
