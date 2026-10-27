@@ -78,6 +78,10 @@ class FakeProfile:
             return json.load(f)["moves"]
 
 
+def _norm(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
 def _quiet(fn, *a, **k):
     with contextlib.redirect_stdout(io.StringIO()):
         return fn(*a, **k)
@@ -254,6 +258,64 @@ class RefusalInProfileTests(unittest.TestCase):
         f = self.p.file("AppData", "Roaming", "app", "a.txt")
         self.assertIn("AppData", FM.refusal(f))
         self.assertIn("AppData", FM.resolve_source(f)[1])
+
+    @staticmethod
+    def _short_name(path: str) -> str:
+        """The 8.3 short spelling of ``path`` (Windows), or '' when the
+        volume does not make short names."""
+        if os.name != "nt":
+            return ""
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+        return buf.value if 0 < n < len(buf) else ""
+
+    def test_refused_folders_by_their_8_3_short_names(self):
+        # A real short name from the filesystem (GetShortPathNameW). "AppData"
+        # itself fits 8.3 and has none, so the long refused names are used:
+        # MobileSync -> MOBILE~1 (Apple rule), .hidden_stuff -> HIDDEN~1
+        # (dot-name rule). Only the folder under the profile is shortened.
+        for parts, want in ((("Documents", "MobileSync", "c.plist"),
+                             "never move Apple data"),
+                            ((".hidden_stuff", "d.txt"), "hidden or system")):
+            with self.subTest(parts=parts):
+                f = self.p.file(*parts)
+                folder = os.path.dirname(f)
+                short_base = os.path.basename(self._short_name(folder))
+                if not short_base or short_base == os.path.basename(folder):
+                    self.skipTest("this volume makes no 8.3 short names")
+                spelled = os.path.join(os.path.dirname(folder), short_base,
+                                       parts[-1])
+                self.assertTrue(os.path.isfile(spelled))
+                self.assertIn(want, FM.refusal(spelled))
+
+    def test_rules_run_on_the_realpath_too(self):
+        # A spelling whose own components look fine but whose real path is
+        # in AppData / an Apple folder / hidden (8.3 name, mocked here so it
+        # runs on any filesystem).
+        cases = (
+            (("AppData", "Roaming", "b.txt"), "AppData"),
+            (("Apple", "MobileSync", "c.plist"), "never move Apple data"),
+            ((".hidden", "d.txt"), "hidden or system"),
+        )
+        for parts, want in cases:
+            with self.subTest(parts=parts):
+                real = self.p.file(*parts)
+                alias = os.path.join(self.p.home, "Downloads", "ALIAS~1", parts[-1])
+                with mock.patch.object(FM.os.path, "realpath",
+                                       side_effect=lambda p, *a, **k: real
+                                       if _norm(p) == _norm(alias) else p):
+                    self.assertIn(want, FM.refusal(alias))
+        plain = self.p.dl("fine.txt")
+        self.assertEqual(FM.refusal(plain), "")
+
+    def test_realpath_into_a_refused_prefix(self):
+        alias = os.path.join(self.p.home, "Downloads", "SYS~1", "x.txt")
+        real = os.path.join(self.p.sys, "x.txt")
+        with mock.patch.object(FM.os.path, "realpath",
+                               side_effect=lambda p, *a, **k: real
+                               if _norm(p) == _norm(alias) else p):
+            self.assertIn("system or JARVIS folder", FM.refusal(alias))
 
     def test_icloud_and_apple_folders(self):
         for parts in (("iCloudDrive", "a.txt"), ("iCloud Photos", "Photos", "b.jpg"),

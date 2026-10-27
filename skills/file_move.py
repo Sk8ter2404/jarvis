@@ -253,32 +253,52 @@ def refusal(path: str) -> str:
         if not roots:
             return ("That's outside your own folders, sir; I only move files in your "
                     "user folders and Nextcloud.")
-        root = max(roots, key=len)
-        rel = os.path.relpath(a, root)
-        parts = [] if rel == "." else rel.split(os.sep)
-        for i, part in enumerate(parts):
-            low = part.lower()
-            is_last = i == len(parts) - 1
-            if low == "appdata":
-                return "That's in AppData, sir; program files there are not mine to move."
-            if not is_last or os.path.isdir(a):
-                if any(w in low for w in _DIR_WORDS_REFUSED):
-                    return "That's in an iCloud or Apple folder, sir; I never move Apple data."
-        cur = root
-        for part in parts:
-            cur = os.path.join(cur, part)
-            if _is_link(cur):
-                return ("That path goes through a junction or shortcut folder, sir; "
-                        "I won't move anything there.")
-            if _hidden_or_system(cur):
-                return "That's a hidden or system item, sir; I leave those alone."
+        why = _name_rules(a, max(roots, key=len))
+        if why:
+            return why
+        # The same rules on the REAL path: os.path.realpath resolves an 8.3
+        # short name (C:\Users\x\APPDAT~1 is AppData) and any link the
+        # walk above could not see, so a short or aliased spelling never slips
+        # past the AppData / Apple / hidden / link rules.
         real = os.path.realpath(a)
         if _nc(real) != _nc(a):
-            if not any(_under(real, r) for r in allowed_roots()):
+            for pre in refused_prefixes():
+                if _under(real, pre):
+                    return ("That's in a system or JARVIS folder, sir; I only move "
+                            "files between your own folders.")
+            real_roots = [r for r in allowed_roots() if _under(real, r)]
+            if not real_roots:
                 return "That really lives outside your own folders, sir."
+            why = _name_rules(real, max(real_roots, key=len))
+            if why:
+                return why
         return ""
     except Exception as e:   # pragma: no cover - defensive
         return f"I couldn't check that path safely, sir ({e})."
+
+
+def _name_rules(a: str, root: str) -> str:
+    """The AppData / iCloud-Apple / link / hidden rules for ``a`` below its
+    allowed ``root``; '' when none applies."""
+    rel = os.path.relpath(a, root)
+    parts = [] if rel == "." else rel.split(os.sep)
+    for i, part in enumerate(parts):
+        low = part.lower()
+        is_last = i == len(parts) - 1
+        if low == "appdata":
+            return "That's in AppData, sir; program files there are not mine to move."
+        if not is_last or os.path.isdir(a):
+            if any(w in low for w in _DIR_WORDS_REFUSED):
+                return "That's in an iCloud or Apple folder, sir; I never move Apple data."
+    cur = root
+    for part in parts:
+        cur = os.path.join(cur, part)
+        if _is_link(cur):
+            return ("That path goes through a junction or shortcut folder, sir; "
+                    "I won't move anything there.")
+        if _hidden_or_system(cur):
+            return "That's a hidden or system item, sir; I leave those alone."
+    return ""
 
 
 # ── speech helpers ───────────────────────────────────────────────────────
