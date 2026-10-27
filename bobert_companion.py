@@ -17561,6 +17561,8 @@ _TURN_FLAG_KEYS = (
     # 'on' answers a basic command with no LLM call (_instant_action_for):
     # the biggest per-turn latency switch of the 2026-10-02 batch.
     "INSTANT_ACTIONS_MODE",
+    # v3 W02: 'shadow' logs / 'on' drops a guessed head before a held result.
+    "SPEECH_PLAN_HEAD_HOLD",
     # Reserved for later batches (absent until they ship):
     "AMBIENT_STT_YIELD", "PROCESSING_FILLER_PRERENDER",
     "PROCESSING_FILLER_LATE_START_S", "PROCESSING_FILLER_SKIP_PLEASANTRIES",
@@ -41911,6 +41913,111 @@ def _result_hold_cut(reply: str, cleaned: str, cut: int, name: str) -> str:
         return cleaned
 
 
+# ── Head hold (v3 W02, 2026-10-27; SPEECH_PLAN_HEAD_HOLD) ───────────────────
+# Result hold keeps only the prose BEFORE a held token, but that head was
+# never judged. Live 10-26 20:05:48 "I've taken a look at the screen, sir -
+# it appears the video hasn't loaded" was voiced before local_describe_screen
+# ran (and was wrong); 20:05:40 "I've no way to check ..." before the check
+# ran; 10-19 19:41:05 "Shall I run the numbers, sir?" while system_pulse ran.
+# core.speech_plan.hold_head drops a head sentence that claims, reads, finds,
+# disowns the very check, or offers the action that ran - the follow-up round
+# or the verbatim read-out says the real thing. Only inside an owner turn
+# (the proactive path has no follow-up round), never over text the cloud
+# stream already voiced, and on any fault the text is kept. 'shadow' (the
+# default) only logs "[head-hold] would drop ...".
+_HEAD_HOLD_MODES = ("off", "shadow", "on")
+# Look-ups whose result says only that they ran (a file path, a page opened):
+# a later "it appears ..." is still a guess. web_search / open_url and their
+# aliases are matched through _once_per_turn_kind.
+_HEAD_HOLD_PREP_ACTIONS = ("screenshot",)
+
+
+def _head_hold_mode() -> str:
+    """SPEECH_PLAN_HEAD_HOLD normalised to 'off' | 'shadow' | 'on'; anything
+    else reads as 'off'. Never raises."""
+    try:
+        mode = str(globals().get("SPEECH_PLAN_HEAD_HOLD", "off")).strip().lower()
+    except Exception:
+        return "off"
+    return mode if mode in _HEAD_HOLD_MODES else "off"
+
+
+def _head_hold_lookup_back(ran_before) -> bool:
+    """True when a look-up whose result describes something (an informative
+    or verbatim read-out, a look at the screen) ran this turn BEFORE the
+    reply being judged - the reply may then be reading it back. Never
+    raises."""
+    try:
+        for n in ran_before or ():
+            n = str(n or "").strip().lower()
+            if (not n or _once_per_turn_kind(n)
+                    or _same_handler_as(n, _HEAD_HOLD_PREP_ACTIONS)):
+                continue
+            if (n in INFORMATIVE_ACTIONS or n in SPEAK_RESULT_VERBATIM_ACTIONS
+                    or _is_screen_look_action(n)):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _head_hold_apply(cleaned: str, results, hold_at, ran_before,
+                     grounding_before, mode: str) -> str:
+    """``cleaned`` with core.speech_plan.hold_head applied: when a held
+    result will speak (``hold_at``) or an AMBIGUOUS / UNCLEAR autocorrect
+    result deferred the reply (then over all the prose; questions stay).
+    'shadow' logs and returns ``cleaned`` unchanged. On any fault, or outside
+    an owner turn, or once the cloud stream voiced part of the reply, the
+    text is returned unchanged. Never raises."""
+    try:
+        if not cleaned or mode not in ("shadow", "on"):
+            return cleaned
+        if getattr(_turn_grounding, "frame", None) is None:
+            return cleaned
+        if _stream_spoken_prefix[0]:
+            return cleaned
+        deferred = any(
+            isinstance(r, str) and r.startswith(("⚠  AMBIGUOUS:", "⚠  UNCLEAR:"))
+            for (_n, r, _i) in results)
+        if not hold_at and not deferred:
+            return cleaned
+        held = "" if deferred else str(hold_at[0][1] or "").strip().lower()
+        held_failed = True
+        if held:
+            mine = [e for e in results
+                    if str(e[0] or "").strip().lower() == held][:1]
+            held_failed = bool(_failed_or_refused_actions(mine))
+        from core import speech_plan as _sp
+        kept, dropped = _sp.hold_head(
+            cleaned, results=results,
+            pending_lookup=not _head_hold_lookup_back(ran_before),
+            user_text=_turn_user_text(), ran_before=ran_before,
+            grounding_before=grounding_before, held_name=held,
+            held_failed=held_failed, whole=deferred)
+        if not dropped:
+            return cleaned
+        # The log names the sentence by its place, never its words (the
+        # reply itself is in the session log), as result-hold does.
+        where = (f"[ACTION: {held}]" if held
+                 else "an autocorrect question")
+        sents = _sp.split_sentences(cleaned)
+        for sentence, why in dropped:
+            words = len(re.sub(r"\[[^\]\n]*\]", " ", sentence).split())
+            place = next((f"sentence {i + 1}/{len(sents)}"
+                          for i, s in enumerate(sents)
+                          if s.endswith(sentence)), "a sentence")
+            verb = "would drop" if mode == "shadow" else "not speaking"
+            print(f"  [head-hold] {verb} {place} ({words} word(s)) written "
+                  f"before {where} - {why}")
+        return cleaned if mode == "shadow" else kept
+    except Exception as _e:
+        try:
+            print(f"  [head-hold] skipped ({type(_e).__name__})")
+        except Exception:
+            pass
+        return cleaned
+
+
 # ── One web page per look-up (NEW #6, 2026-10-01) ───────────────────────────
 # Live 2026-10-01 21:00:41: the fifth follow-up round re-ran the IDENTICAL
 # web_search of 20:59:13 and a second Google tab opened. The follow-up loop's
@@ -42895,10 +43002,19 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                 _hold_at.append((match.start(), _held))
         return out
 
+    # Head hold (v3 W02): what this turn had read BEFORE this reply's actions
+    # run - see _head_hold_apply. Nothing is read when the setting is off.
+    _head_mode = _head_hold_mode()
+    _head_grounding = (_turn_grounding_texts() if _head_mode != "off"
+                       else [])
     cleaned = _ACTION_RE.sub(_runner_holding, reply).strip()
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     if _hold_at:
         cleaned = _result_hold_cut(reply, cleaned, *_hold_at[0])
+    if _head_mode != "off":
+        cleaned = _head_hold_apply(cleaned, results, _hold_at,
+                                   _ran_before_reply, _head_grounding,
+                                   _head_mode)
 
     # list_timers ran: its verbatim line from the timer store is the answer,
     # so the model's own account of the timers is not voiced (2026-10-01 —

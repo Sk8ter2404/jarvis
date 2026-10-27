@@ -1404,6 +1404,26 @@ SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
 TURN_CHECK_MODE = "off"
 TURN_CHECK_ESCALATE_MODEL = "claude-sonnet-5-5"
 
+# ─── Head hold (core/speech_plan.py, v3 W02, 2026-10-27) ─────────────────
+# The prose a reply writes BEFORE an action token whose result will still
+# speak (an informative look-up, a verbatim read-out, a failed action) was
+# always voiced, guesses included: "it appears the video hasn't loaded"
+# before the screen was read, "I've no way to check" before the check ran,
+# "Shall I run the numbers, sir?" while they ran. hold_head judges each of
+# those sentences and drops claims, readings, findings (only while no
+# look-up result has come back this turn), inabilities the same reply
+# contradicts and offers for the action that ran. Acknowledgements, progress
+# lines and questions are kept. Owner turns only; never text already voiced.
+#   SPEECH_PLAN_HEAD_HOLD  'off'    the old behaviour, byte for byte;
+#                          'shadow' (default) nothing changes, each sentence
+#                                   it WOULD drop is logged as
+#                                   "[head-hold] would drop ...";
+#                          'on'     those sentences are not spoken (the full
+#                                   reply stays in conversation_history).
+#                          Any other value reads as 'off'.
+# Set via user_settings.json; applies on the next start.
+SPEECH_PLAN_HEAD_HOLD = "shadow"
+
 # ─── Time-boxed Claude boost (core/cloud_boost.py, 2026-10-12) ───────────
 # CLOUD_BOOST_UNTIL — an ISO date ("2026-11-05"). Through the end of that day
 #   HARD questions (an explicit "think hard"/"look it up"/"step by step" ask,
