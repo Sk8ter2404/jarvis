@@ -263,9 +263,11 @@ class RefusalInProfileTests(unittest.TestCase):
     def _short_name(path: str) -> str:
         """The 8.3 short spelling of ``path`` (Windows), or '' when the
         volume does not make short names."""
-        if os.name != "nt":
-            return ""
         import ctypes
+        # ctypes.windll, not os.name: the ci-sim keeps os.name == "nt" but
+        # removes windll (as on Linux CI), so the guard must test windll itself.
+        if os.name != "nt" or not hasattr(ctypes, "windll"):
+            return ""
         buf = ctypes.create_unicode_buffer(1024)
         n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
         return buf.value if 0 < n < len(buf) else ""
@@ -336,8 +338,9 @@ class RefusalInProfileTests(unittest.TestCase):
         dot = self.p.dl(".secret.txt")
         self.assertIn("hidden or system", FM.refusal(dot))
         f = self.p.dl("plain.txt")
-        if os.name == "nt":
-            import ctypes
+        import ctypes
+        # Same guard as _short_name: windll is absent on Linux CI / ci-sim.
+        if os.name == "nt" and hasattr(ctypes, "windll"):
             ctypes.windll.kernel32.SetFileAttributesW(f, FM.FILE_ATTRIBUTE_HIDDEN)
             self.addCleanup(ctypes.windll.kernel32.SetFileAttributesW, f, 0x80)
             self.assertIn("hidden or system", FM.refusal(f))
