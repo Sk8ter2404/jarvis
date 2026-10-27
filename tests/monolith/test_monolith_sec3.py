@@ -1328,9 +1328,50 @@ class LocalThinkParamTests(MonolithGlobalsTestCase):
         self.assertEqual(self.bc._local_think_param("gpt-oss:20b"), "low")
 
     def test_pure_instruct_models_omit_param(self):
-        for tag in ("qwen2.5:14b-instruct-q5_K_M", "llama3.1:8b-instruct-q5_K_M",
-                    "qwen2.5vl:7b", "mistral-small3.2:latest", "", None):
-            self.assertIsNone(self.bc._local_think_param(tag), tag)
+        # Hermetic: the probe (v3 W16) must not reach a real Ollama here.
+        with mock.patch("core.ollama_opts.model_can_think", return_value=False):
+            for tag in ("qwen2.5:14b-instruct-q5_K_M", "llama3.1:8b-instruct-q5_K_M",
+                        "qwen2.5vl:7b", "mistral-small3.2:latest", "", None):
+                self.assertIsNone(self.bc._local_think_param(tag), tag)
+
+    # v3 W16: unknown families are asked what they can do.
+    def _think(self, tag, url=None, **kw):
+        with mock.patch.object(self.bc, "THINK_CAPABILITY_PROBE", True, create=True):
+            return self.bc._local_think_param(tag, url) if url else                 self.bc._local_think_param(tag)
+
+    def test_table_entries_never_probe(self):
+        with mock.patch("core.ollama_opts.model_can_think") as probe:
+            for tag, want in (("qwen3.6:27b", False), ("gemma4:26b", False),
+                              ("deepseek-r1:14b", False), ("magistral:24b", False),
+                              ("gpt-oss:20b", "low")):
+                self.assertEqual(self._think(tag), want, tag)
+        probe.assert_not_called()
+
+    def test_unknown_family_with_thinking_capability_disables_thinking(self):
+        with mock.patch("core.ollama_opts.model_can_think", return_value=True) as probe:
+            self.assertIs(self._think("bonsai-2:27b"), False)
+            self.assertIs(self._think("nemotron-3.5-bolt:latest", "http://brain.example:11434"), False)
+        self.assertEqual(probe.call_args_list[1].args[1], "http://brain.example:11434")
+        self.assertEqual(probe.call_args_list[0].args[1], self.bc.LOCAL_LLM_BASE_URL)
+
+    def test_unknown_family_without_thinking_or_failed_probe_omits(self):
+        for ans in (False, None):
+            with mock.patch("core.ollama_opts.model_can_think", return_value=ans):
+                self.assertIsNone(self._think("llama3.1:8b"))
+        with mock.patch("core.ollama_opts.model_can_think", side_effect=RuntimeError):
+            self.assertIsNone(self._think("llama3.1:8b"))
+
+    def test_probe_setting_off_is_the_name_table_only(self):
+        with mock.patch("core.ollama_opts.model_can_think", return_value=True) as probe:
+            with mock.patch.object(self.bc, "THINK_CAPABILITY_PROBE", False, create=True):
+                self.assertIsNone(self.bc._local_think_param("bonsai-2:27b"))
+        probe.assert_not_called()
+
+    def test_background_endpoint_passes_its_own_url(self):
+        import inspect
+        src = inspect.getsource(self.bc)
+        self.assertIn("think=_local_think_param(_model, _url)", src)
+        self.assertIn('"THINK_CAPABILITY_PROBE"', src)
 
 
 # ===========================================================================

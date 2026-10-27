@@ -388,3 +388,68 @@ def chat_options(model: str, *, num_predict: int | None = None,
     if extra:
         opts.update(extra)
     return opts
+
+
+# ── Thinking capability (v3 W16, 2026-10-27; THINK_CAPABILITY_PROBE) ────────
+# `_local_think_param` knows a handful of families by NAME. Any other family
+# used to get None = the `think` param omitted = the model's own default, and a
+# thinking-by-default model (bonsai-2 = qwen35, nemotron-3.5-bolt) then spent
+# its whole token budget reasoning and returned an EMPTY reply on 23-29 of 134
+# eval items. Omitting stays right for a NON-thinking model (a `think` sent to
+# one is an Ollama 400), so for an unknown family ask the server what the model
+# can do: /api/show lists "thinking" in `capabilities` for exactly the ones that
+# accept the param.
+THINK_PROBE_RETRY_S = 60.0   # a failed probe is retried after this long
+
+_think_probe_cache: dict = {}   # (base_url, model) -> (bool | None, expires_at)
+
+
+def _probe_url(base_url) -> str:
+    """``base_url`` without trailing slashes, ``localhost`` spelled 127.0.0.1
+    (Windows resolves ::1 first: a 2 s tax per request). "" when unusable."""
+    if not isinstance(base_url, str) or not base_url.strip():
+        return ""
+    url = base_url.strip().rstrip("/")
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() == "localhost":
+        url = url.replace(parts.netloc, parts.netloc.lower().replace(
+            "localhost", "127.0.0.1", 1), 1)
+    return url
+
+
+def model_can_think(model, base_url, *, post=None, clock=None):
+    """True / False when the server says whether ``model`` supports thinking
+    (``"thinking"`` in /api/show ``capabilities``); None when it cannot be told
+    (no model, no URL, unreachable, HTTP error, malformed reply). One probe per
+    (base_url, model): an answer is kept for the session, a failure only for
+    THINK_PROBE_RETRY_S so a server that was down at the first call is asked
+    again later without a probe on every turn. Never raises."""
+    try:
+        tag = (model or "").strip() if isinstance(model, str) else ""
+        url = _probe_url(base_url)
+        if not tag or not url:
+            return None
+        import time as _time
+        now = (clock or _time.monotonic)()
+        key = (url, tag)
+        hit = _think_probe_cache.get(key)
+        if hit is not None and (hit[0] is not None or now < hit[1]):
+            return hit[0]
+        answer = None
+        try:
+            if post is None:
+                import requests as _requests
+                post = _requests.post
+            r = post(url + "/api/show", json={"model": tag},
+                     timeout=probe_timeout(url))
+            status = getattr(r, "status_code", 200)
+            if getattr(r, "ok", 200 <= status < 300):
+                caps = (r.json() or {}).get("capabilities")
+                if isinstance(caps, list):
+                    answer = "thinking" in caps
+        except Exception:
+            answer = None
+        _think_probe_cache[key] = (answer, now + THINK_PROBE_RETRY_S)
+        return answer
+    except Exception:
+        return None
