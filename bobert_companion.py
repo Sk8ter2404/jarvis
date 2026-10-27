@@ -3016,6 +3016,69 @@ def _learn_invalidate(cutoff_wall: float | None = None) -> int:
     return dropped
 
 
+# -- Learn pre-filter (LEARN_PREFILTER, v3 W09, core/learn_prefilter.py) --
+# Most owner turns (commands, thanks, questions) cannot teach the extractor
+# anything, yet each one rode a background request that pushes the owner's
+# cached prompt out of the one local-model slot. 'shadow' (default) only logs
+# what 'on' would skip; 'off' is the old behaviour. Overheard speech
+# (owner_directed False) is never judged here: the ambient path keeps its gates.
+from core import learn_prefilter as _learn_prefilter_mod  # noqa: E402
+
+
+def _learn_prefilter_mode() -> str:
+    """LEARN_PREFILTER as 'off' | 'shadow' | 'on', read at call time.
+    Anything unrecognised is 'off'. Never raises."""
+    try:
+        return _learn_prefilter_mod.normalize_mode(
+            globals().get("LEARN_PREFILTER", "off"))
+    except Exception:
+        return "off"
+
+
+def _learn_prefilter_ran(owner_directed: bool):
+    """The names of the actions the owner turn that just finished ran (sorted
+    list), for the pre-filter; None when the pre-filter is off or the turn is
+    overheard speech. Never raises."""
+    try:
+        if not owner_directed or _learn_prefilter_mode() == "off":
+            return None
+        return sorted(getattr(_turn_grounding, "last_ran", None) or ())
+    except Exception:
+        return None
+
+
+def _learn_origin_ran(origin: dict, ran) -> dict:
+    """``origin`` with the turn's ran-action names under "ran" (in memory
+    only, like the rest of the origin); unchanged when ``ran`` is None."""
+    if ran is not None and isinstance(origin, dict):
+        origin["ran"] = ran
+    return origin
+
+
+def _learn_prefilter_allows(turn: tuple) -> bool:
+    """False when the pre-filter is 'on' and this owner turn cannot teach;
+    'shadow' logs "[learn-prefilter] would skip (<why>)" and allows it. Only
+    an owner-directed turn is judged. Logs a fixed reason, never the text.
+    Never raises (any error allows the turn)."""
+    try:
+        mode = _learn_prefilter_mode()
+        if mode == "off" or len(turn) < 3 or not turn[2]:
+            return True
+        origin = turn[5] if len(turn) > 5 and isinstance(turn[5], dict) \
+            else {}
+        ok, why = _learn_prefilter_mod.decide(
+            turn[0], turn[1], origin.get("ran") or ())
+        if ok:
+            return True
+        if mode == "shadow":
+            print(f"  [learn-prefilter] would skip ({why})")
+            return True
+        print(f"  [learn-prefilter] skipped ({why})")
+        return False
+    except Exception:
+        return True
+
+
 def _learn_enqueue_current(turn: tuple, epoch) -> bool:
     """_learn_enqueue, unless the turn was queued before a memory wipe
     (``epoch`` older than _learn_epoch). The check and the enqueue share
@@ -3024,6 +3087,8 @@ def _learn_enqueue_current(turn: tuple, epoch) -> bool:
     with _memory_lock:
         if epoch is not None and epoch != _learn_epoch[0]:
             print("  [learn] not learning a turn from before a memory wipe")
+            return False
+        if not _learn_prefilter_allows(turn):
             return False
         _learn_enqueue(turn)
     return True
@@ -3159,14 +3224,18 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
     ep = _learn_epoch[0] if epoch is None else epoch
     if channel is None:
         channel = _learn_channel(bool(owner_directed), bool(injected))
+    _pf_ran = _learn_prefilter_ran(bool(owner_directed))
     if LEARN_ONLY_FROM_OWNER:
         _learn_gate_submit(("turn", time.monotonic(), user_msg, ai_reply,
                             bool(owner_directed), conf, bool(injected),
                             bool(wake), audio, sample_rate, voice, ep,
-                            _learn_origin(user_msg, channel)))
+                            _learn_origin_ran(
+                                _learn_origin(user_msg, channel), _pf_ran)))
         return
     _learn_enqueue_current((user_msg, ai_reply, bool(owner_directed), conf,
-                            voice, _learn_origin(user_msg, channel, voice)),
+                            voice, _learn_origin_ran(
+                                _learn_origin(user_msg, channel, voice),
+                                _pf_ran)),
                            ep)
 
 
@@ -3806,6 +3875,28 @@ def _ambient_should_learn_text(snippet: str, conf=None,
         return True
 
 
+def _ambient_owner_fragment_skip(snippet: str) -> bool:
+    """LEARN_PREFILTER: an owner-voice line too short to carry anything
+    (below the voice-ID-unavailable path's own length floor) is dropped
+    BEFORE the content judge's local-LLM call. 'shadow' only logs; 'off'
+    (the old order) never skips. Never raises."""
+    try:
+        mode = _learn_prefilter_mode()
+        if mode == "off":
+            return False
+        if (len(snippet) >= _AMBIENT_LEARN_MIN_CHARS
+                and len(snippet.split()) >= _AMBIENT_LEARN_MIN_WORDS):
+            return False
+        if mode == "shadow":
+            print("  [learn-prefilter] would skip (ambient fragment)")
+            return False
+        print("  [ambient-learn] skipped: low-information fragment "
+              f"(owner voice) ({len(snippet)} chars)")
+        return True
+    except Exception:
+        return False
+
+
 def _ambient_learn_from_gated(text: str, memory: dict,
                               audio=None, sample_rate: int = 0,
                               conf=None, peak_rms: float = 0.0) -> None:
@@ -3881,6 +3972,9 @@ def _ambient_learn_from_gated(text: str, memory: dict,
                 # content judge before ingesting, so a low-confidence Whisper
                 # hallucination or a media line (even one a voiceprint spuriously
                 # matched) is never learned.
+                if _ambient_owner_fragment_skip(snippet):
+                    return
+
                 def _ingest_owner():
                     # Overheard (not addressed to JARVIS): facts only — never
                     # a topic or project (core/topic_hygiene.py rule 1). The
@@ -17588,6 +17682,7 @@ _TURN_FLAG_KEYS = (
     "TTS_OUTPUT_LATENCY", "PLAYBACK_KEEPER", "PLAYBACK_PRIMED_STREAM",
     "ARG_FIXES",
     "PROACTIVE_NO_ACTION_CLAIMS",
+    "LEARN_PREFILTER",
 )
 
 
@@ -40509,6 +40604,8 @@ def _begin_turn_grounding(user_text: str):
     nested dispatch on the same thread restores it (_end_turn_grounding)."""
     prev = getattr(_turn_grounding, "frame", None)
     _turn_grounding.frame = {"user_text": str(user_text or ""), "ran": set()}
+    if prev is None:
+        _turn_grounding.last_ran = frozenset()
     # "click that X" / "the one on screen": read the windows NOW (text only,
     # off this thread) so the click and the rewrite guard see the screen as
     # it was when he spoke (core.grounded_click.freeze_scene, 2026-10-05).
@@ -40524,6 +40621,16 @@ def _begin_turn_grounding(user_text: str):
 
 
 def _end_turn_grounding(prev) -> None:
+    if prev is None:
+        # The outermost dispatch is over: keep the names of the actions that
+        # ran, for the learn pre-filter (core/learn_prefilter.py), which is
+        # asked right after the dispatch on this same thread.
+        try:
+            _fr = getattr(_turn_grounding, "frame", None)
+            _turn_grounding.last_ran = frozenset(_fr["ran"]) if _fr \
+                else frozenset()
+        except Exception:
+            _turn_grounding.last_ran = frozenset()
     _turn_grounding.frame = prev
 
 
