@@ -385,6 +385,23 @@ LEARN_BATCH_INTERVAL_S = 300.0
 LEARN_BATCH_QUIET_S = 90.0
 LEARN_BATCH_MAX_JOBS = 20
 
+# LEARN_PREFILTER (v3 W09) — which of YOUR turns are sent to the background
+# memory extractor at all. Most turns ("open Chrome", "thanks", "what time is
+# it", "pause the music") cannot teach it anything, yet each one used to ride
+# the next extraction request, and every request pushes your cached prompt out
+# of the one local-model slot (the next reply then re-reads it, +2 to +4 s).
+# core/learn_prefilter.py keeps anything that states something about you
+# ("I'm ...", "I like ...", "my ... is ...", "remember ...", "call me ...",
+# preferences, corrections) and skips commands, thanks, questions to JARVIS and
+# one-to-three-word turns. Overheard speech keeps its own gates.
+#   'off'    — every turn is queued as before.
+#   'shadow' — (default) logs "[learn-prefilter] would skip (<why>)" and
+#              changes nothing; measure, then switch to 'on'.
+#   'on'     — a skipped turn is never queued for extraction (a batch whose
+#              turns were all skipped is not sent).
+# Changes apply on the next start.
+LEARN_PREFILTER = "shadow"
+
 # When True, every ambient/background one-shot LLM call (memory extraction,
 # proactive comments, the ambient extractor — everything routed through
 # `_llm_quick`) runs on the LOCAL model ONLY and never touches Claude, so
