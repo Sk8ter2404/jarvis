@@ -16664,6 +16664,9 @@ def generate_proactive_comment(now: float | None = None) -> str:
         "Keep it to ONE sentence. Do not start with 'Hey' or any greeting. "
         "Sound natural, like you just thought of it."
     )
+    if PROACTIVE_NO_ACTION_CLAIMS:
+        system += (" You have run nothing: never say you did, checked, "
+                   "pulled up or prepared anything.")
     clock = time.strftime("%I:%M %p", lt).lstrip("0")
     recent = list(_proactive_recent)
     user = (f"(Local time: {clock}, {_proactive_guard.day_part(lt.tm_hour)}. "
@@ -17573,6 +17576,7 @@ _TURN_FLAG_KEYS = (
     "SENTENCE_TTS_LOOKAHEAD_MERGE", "LOCAL_STREAMING_TTS",
     "TTS_OUTPUT_LATENCY", "PLAYBACK_KEEPER", "PLAYBACK_PRIMED_STREAM",
     "ARG_FIXES",
+    "PROACTIVE_NO_ACTION_CLAIMS",
 )
 
 
@@ -46081,6 +46085,43 @@ def _local_complete(system: str, messages: list, *, max_tokens: int = 220,
             _after_local_post()
 
 
+_PROACTIVE_FIRST_PERSON_RE = re.compile(
+    r"\b(?:i(?:\s*(?:'|\u2019)\s*|\s*)ve\b|i\s+have|i\s+took|i\s+(?:just\s+)?"
+    r"(?:pulled|checked|prepared|opened|ran|set|queued|started|made)|"
+    r"taken\s+the\s+liberty|i\s*(?:'|\u2019)\s*(?:ll|m)\s+(?:go\s+)?"
+    r"(?:ahead|pulling|checking))\b", re.I)
+
+
+# The remark text itself: the validator misses "taken the liberty of pulling
+# up your schedule" (10-18, 10-19), so a first-person action claim in the
+# prose is enough. "I've noticed ..." is an observation and stays.
+_PROACTIVE_CLAIM_TEXT_RE = re.compile(
+    r"\btaken\s+the\s+liberty\b|\bi(?:\s*(?:'|\u2019)\s*ve\s+|ve\s+|\s+have\s+|\s+)"
+    r"(?:just\s+)?(?:pulled|checked|prepared|opened|queued|started|loaded|"
+    r"reviewed|ran|run|set\s+up|looked\s+up)\b(?!\s*(?:nothing|no\b))",
+    re.I)
+
+
+def _proactive_first_person_claim(results, text: str = "") -> bool:
+    """True when parse_and_run_actions flagged the remark as an unverified
+    execution claim AND the matched phrase is first person, or the remark
+    text itself claims a first-person action. Passive observations ("your
+    print job has been completed") return False."""
+    try:
+        if text and _PROACTIVE_CLAIM_TEXT_RE.search(str(text)):
+            return True
+        for r in results or ():
+            if r[0] != "_unverified_claim":
+                continue
+            m = re.search(r"reply claims '(.*?)' but", str(r[1]), re.S)
+            phrase = m.group(1) if m else ""
+            if _PROACTIVE_FIRST_PERSON_RE.search(phrase):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _do_proactive_turn(memory: dict):
     """Generate and speak a JARVIS-style spontaneous comment."""
     pause_face_tracking()
@@ -46108,6 +46149,14 @@ def _do_proactive_turn(memory: dict):
     # budget so the cap is enforced independently of the last voice turn.
     _reset_see_screen_budget()
     spoken, _proactive_results = parse_and_run_actions(text)
+    if PROACTIVE_NO_ACTION_CLAIMS and _proactive_first_person_claim(
+            _proactive_results, text):
+        # v3 W06: nothing ran, so "I've pulled up your schedule" is a lie.
+        # The attempt already counted for pacing (_proactive_last_attempt_at).
+        print("  [proactive] dropped unverified first-person remark")
+        set_state("idle")
+        resume_face_tracking()
+        return
     # A self-voiced action has already spoken; never voice its result again.
     _proactive_results = [r for r in _proactive_results
                           if not _self_voiced_did_talk(r[0], r[1])]
