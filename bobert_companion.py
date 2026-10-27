@@ -52440,13 +52440,15 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # Arm the presence hold on queued proactive speech (starts the
         # physical-input watcher; see _presence_watch_start).
         _presence_watch_start()
+        # BOOT_PARALLEL_LOAD (v3 W10): the full dependency import check,
+        # now that boot is done (only what the fast pass missed is reported).
+        # Kept ABOVE _listen_media_boot(): that call stays the statement right
+        # before the main loop (test_monolith_listen_media_review).
+        if _dep_parallel:
+            _dep_check_full_start(_missing_deps)
         # Listening over media (2026-10-05): the wake pre-gate (A3) and the
         # echo canceller's loopback (C1) start now when their modes are on.
         _listen_media_boot()
-        # BOOT_PARALLEL_LOAD (v3 W10): the full dependency import check,
-        # now that boot is done (only what the fast pass missed is reported).
-        if _dep_parallel:
-            _dep_check_full_start(_missing_deps)
         while True:
             try:
                 if _blue_green_loop_tick():

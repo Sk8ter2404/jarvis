@@ -396,9 +396,16 @@ class BootOrderStaticTests(_Base):
         self.assertIn("        _ensure_whisper()   # load now so first user "
                       "utterance isn't delayed", src)
         self.assertIn("            _missing_deps = check_dependencies()", src)
-        self.assertIn("        if _dep_parallel:\n"
-                      "            _dep_check_full_start(_missing_deps)\n"
-                      "        while True:", src.replace("\r\n", "\n"))
+        # The full check starts once boot is done, just ahead of the
+        # listening-mode build, which stays the statement right before the
+        # main loop (test_monolith_listen_media_review).
+        self.assertRegex(
+            src.replace("\r\n", "\n"),
+            r"        if _dep_parallel:\n"
+            r"            _dep_check_full_start\(_missing_deps\)\n"
+            r"(?:        #[^\n]*\n)*"
+            r"        _listen_media_boot\(\)\n"
+            r"        while True:")
 
 
 if __name__ == "__main__":
