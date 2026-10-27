@@ -1502,6 +1502,20 @@ FAST_PATHS_ENABLED = True
 # user_settings.json; applies on the next start.
 SHUTDOWN_TWO_SENTENCE_ASK = True
 
+# ─── Turn trace (core/turn_trace.py, v3 W20) ────────────────────────────
+# One JSON line per owner turn in data/turns/turns-YYYY-MM-DD.jsonl (kept
+# 30 days, rotated by size): the owner's words (first 200 chars, secrets
+# redacted), the routed sections, the actions run and whether each failed,
+# why a chain stopped, the validators and the shadow-mode "would ..." lines
+# that fired, the model, the prefill state and the stage latencies. It is
+# what tools/turn_trace_report.py reads, so a shadow setting is judged from
+# one file instead of regex over session logs. Append-only, local, written
+# off the voice thread, and never shared with the other machine (LOCAL_KEYS).
+#   TURN_TRACE  True  (default) record every turn;
+#               False nothing is collected or written.
+# Set via user_settings.json; applies on the next start.
+TURN_TRACE = True
+
 # ─── Instant actions (core/instant_actions.py, 2026-10-02) ──────────────
 # A basic command — volume up / down / mute / unmute, pause / resume / next /
 # previous track, lights on / off, pause the print — matched by anchored,

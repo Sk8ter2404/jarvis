@@ -890,6 +890,12 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         _saved_learn_batch = getattr(bc, "LEARN_BATCH_ENABLED", None)
         if _saved_learn_batch is not None:
             bc.LEARN_BATCH_ENABLED = False
+        # The turn trace (v3 W20) ships ON: it schedules a debounced writer
+        # timer per finished turn. Every test runs with it OFF; a turn-trace
+        # test turns it on with its own throwaway data dir. Restored below.
+        _saved_turn_trace = getattr(bc, "TURN_TRACE", None)
+        if _saved_turn_trace is not None:
+            bc.TURN_TRACE = False
         # Start clean too, not only end clean: anything that ran before the
         # first monolith test (an import-time Kinect pump, a light-tier test)
         # may have left history in the process-wide camera gate.
@@ -913,6 +919,8 @@ class MonolithGlobalsTestCase(unittest.TestCase):
                 bc.PLAYBACK_PRIMED_STREAM = _saved_primed
             if _saved_learn_batch is not None:
                 bc.LEARN_BATCH_ENABLED = _saved_learn_batch
+            if _saved_turn_trace is not None:
+                bc.TURN_TRACE = _saved_turn_trace
             try:
                 bc._playback_keeper.set_enabled(False)
             except Exception:
