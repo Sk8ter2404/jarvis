@@ -718,6 +718,29 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("[ACTION: move_file, resume to documents]", FM.PROMPT_EXAMPLES)
         self.assertIn("[ACTION: undo_last_move]", FM.PROMPT_EXAMPLES)
 
+    def test_prompt_examples_route_on_their_trigger_phrases(self):
+        # The slim prompt routes a skill's examples in on the words of its
+        # header and its 'quoted' trigger phrases. A stray apostrophe
+        # ("owner's") shifted the quote pairs so 'take the invoice ...' was
+        # never read as a phrase.
+        import re
+        from core import prompt_router as pr
+        quoted = re.findall(r"'([^']{2,80})'", FM.PROMPT_EXAMPLES)
+        self.assertEqual([" ".join(q.split()) for q in quoted],
+                         ["<file> to <folder>", "move my resume to documents",
+                          "take the invoice from downloads to the desktop",
+                          "undo that move", "put it back"])
+        other = "WEATHER (skills/weather.py):\n  weather_now - fire on 'rain today'"
+        texts = [FM.PROMPT_EXAMPLES.strip(), other]
+        parts = pr.split_skill_examples(
+            "\n\nADDITIONAL SKILL ACTIONS (x):\n" + "\n".join(texts), texts)
+        for said in ("move my resume to documents",
+                     "take the invoice from downloads to the desktop",
+                     "undo that move", "put it back"):
+            with self.subTest(said=said):
+                self.assertEqual(pr.select_skill_examples(said, parts),
+                                 [FM.PROMPT_EXAMPLES.strip()])
+
     def test_setting_off_registers_nothing(self):
         actions = {}
         with mock.patch.object(FM, "_cfg", return_value=False):

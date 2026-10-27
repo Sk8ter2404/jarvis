@@ -58,7 +58,7 @@ SPEAK_VERBATIM_ACTIONS = ("move_file", "undo_last_move")
 
 PROMPT_EXAMPLES = (
     "FILE MOVES (skills/file_move.py - JARVIS asks before every move):\n"
-    "  move_file      - move ONE file between the owner's folders. Arg is\n"
+    "  move_file      - move ONE file between his own folders. Arg is\n"
     "                   '<file> to <folder>'. Fire on 'move my resume to\n"
     "                   documents', 'take the invoice from downloads to the\n"
     "                   desktop'. -> [ACTION: move_file, resume to documents]\n"
