@@ -239,13 +239,13 @@ class DefuseTerminationTests(unittest.TestCase):
     def test_dotted_capital_i_before_a_marker_terminates_and_breaks_it(self):
         for n in (1, 5, 6, 40):
             for phrase in ("could not open", "no window matching x", "no tracks found"):
-                t = "İ" * n + " it " + phrase
+                t = "\u0130" * n + " it " + phrase
                 out = self._run(t)
                 self.assertNotIn(phrase.split(" ", 1)[0] + " " + phrase.split(" ", 2)[1],
                                  out.lower())
-                self.assertIn(" ", out)
-        self.assertEqual(self._run("İ it could not open"),
-                         "İ it could not open")
+                self.assertIn("\u00a0", out)
+        self.assertEqual(self._run("\u0130 it could not open"),
+                         "\u0130 it could\u00a0not open")
 
 
 class ArgumentTests(unittest.TestCase):
