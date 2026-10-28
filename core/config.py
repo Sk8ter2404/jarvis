@@ -2046,6 +2046,16 @@ CAMERA_DIES_ON_OPEN_RETRY_S = 1800.0
 #   probe, self-diagnostic, side tiles, Kinect bridge) never open the same
 #   device less than this far apart. 0 disables the gap.
 CAMERA_OPEN_MIN_GAP_S       = 10.0
+# FACE_TRACK_IDLE_AFTER_S / FACE_TRACK_IDLE_HZ — the face detector's idle
+#   cadence (2026-10-28). The Haar cascade passes cost ~1 CPU-second per
+#   1280x720 frame with nobody in it (measured: 3.5 of the process's 4.1
+#   idle cores were this, at night, owner asleep). Once no camera has seen a
+#   face for FACE_TRACK_IDLE_AFTER_S the detector runs FACE_TRACK_IDLE_HZ
+#   times a second on each camera instead of on every frame; the first hit restores every-
+#   frame detection. Camera reads and the HUD preview are unchanged. 0 for
+#   either value = never back off (today's behaviour).
+FACE_TRACK_IDLE_AFTER_S     = 15.0
+FACE_TRACK_IDLE_HZ          = 1.0
 
 # Processes that commonly hold exclusive locks on webcams. If the probe
 # finds zero cameras, we scan for these and surface them so the user
