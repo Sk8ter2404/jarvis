@@ -6738,6 +6738,96 @@ _face_detect_last: list = [None]
 _face_presence_trackers: dict = {}
 _face_presence_fp: dict = {}
 
+# ── IDLE DETECTION CADENCE (2026-10-28) ──────────────────────────────────
+# Measured live 2026-10-28 ~01:15 (owner asleep, room quiet, 18 STT decodes
+# in 30 min): the process held 4.1 cores, and by thread start address 3.0 of
+# them were OpenCV's Concurrency workers (31 threads at 0.05-0.15 core) plus
+# 0.5 the face-track thread itself. That is _detect_face: on a 1280x720
+# night frame equalizeHist turns sensor noise into full-range texture, so
+# all four cascade passes run and cost ~1 CPU-second a frame (offline, this
+# box: 1.38 CPU-s at the default 32 threads, 100 ms wall), ~20 times a
+# second, with nobody there. It is work, not a wait policy: the Silero
+# stream at its 64 ms cadence measured 0.01-0.02 core under every variant
+# (defaults, KMP_BLOCKTIME=0/1, OMP_WAIT_POLICY=PASSIVE, torch 1 thread;
+# ORT already runs intra-op 1 with spinning off), and cv2.setNumThreads
+# 32->8->4->1 only moved a frame 1.38->1.30->1.18->0.90 CPU-s while slowing
+# it 100->220->370->915 ms. So the saving is cadence: after
+# FACE_TRACK_IDLE_AFTER_S without a face on any camera, the detector runs
+# FACE_TRACK_IDLE_HZ times a second per camera (default 1.0 -> ~0.7-1 core
+# idle per open camera, down ~3 cores with the one camera open today)
+# until a hit restores every-frame detection. The camera read,
+# the HUD preview and the hand-tracking burst are untouched; re-acquisition
+# after a long absence lags by at most one idle interval.
+# "seen" is shared (a face on ANY camera keeps every camera at full rate);
+# "ran" is per camera index, so with several cameras each one still gets its
+# idle-rate look (one shared "ran" let the first camera in the loop starve
+# the rest: it marked the slot and every later camera that pass was skipped).
+_face_detect_idle: dict = {"seen": None, "ran": {}}   # producer thread only
+
+
+def _face_detect_due(now: float, state: "dict | None" = None,
+                     idle_after: "float | None" = None,
+                     idle_hz: "float | None" = None, *,
+                     key=None) -> bool:
+    """True when _detect_face should run on this frame. Every frame while a
+    face was seen within `idle_after` s (or never backed off: either value
+    <= 0); once idle, only when `1/idle_hz` s have passed since the last
+    run. `state["seen"]` None = no hit since boot: the clock starts at the
+    first call, so a camera that opens to an empty room still gets
+    `idle_after` s of every-frame detection. `key` = the camera index: when
+    `state["ran"]` is a dict the idle interval is kept per camera. Pure (the
+    state dict is the only thing it touches); never raises."""
+    st = _face_detect_idle if state is None else state
+    try:
+        after = float(FACE_TRACK_IDLE_AFTER_S if idle_after is None
+                      else idle_after)
+        hz = float(FACE_TRACK_IDLE_HZ if idle_hz is None else idle_hz)
+    except Exception:
+        return True
+    if after <= 0 or hz <= 0:
+        return True
+    seen = st.get("seen")
+    if seen is None:
+        st["seen"] = seen = float(now)
+    if now - seen < after:
+        return True
+    ran = st.get("ran")
+    try:
+        last = float((ran.get(key) if isinstance(ran, dict) else ran) or 0.0)
+    except Exception:
+        return True
+    if now - last >= 1.0 / hz:
+        return True
+    return False
+
+
+def _face_detect_mark(now: float, hit: bool,
+                      state: "dict | None" = None, *, key=None) -> None:
+    """Record that the detector ran at `now` (on camera `key`); a `hit` on
+    any camera restores every-frame detection. Never raises."""
+    st = _face_detect_idle if state is None else state
+    ran = st.get("ran")
+    if isinstance(ran, dict):
+        ran[key] = float(now)
+    else:
+        st["ran"] = float(now)
+    if hit:
+        st["seen"] = float(now)
+
+
+def _face_detect_policy_line() -> str:
+    """The boot line for the idle cadence (one line, numbers only)."""
+    try:
+        after, hz = float(FACE_TRACK_IDLE_AFTER_S), float(FACE_TRACK_IDLE_HZ)
+    except Exception:
+        after, hz = 0.0, 0.0
+    if after <= 0 or hz <= 0:
+        return ("[cpu] face-detect cadence: every frame, no idle back-off "
+                "(FACE_TRACK_IDLE_AFTER_S / FACE_TRACK_IDLE_HZ <= 0)")
+    return (f"[cpu] face-detect cadence: every frame while a face is seen; "
+            f"{hz:g} Hz per camera after {after:g} s without one (each detection ~1 "
+            f"CPU-s at 1280x720; measured 3.5 idle cores before this)")
+
 # Per-camera awareness — used by where_is_user / see_user actions so Bobert
 # can tell which monitor you're facing, and by the face_tracker skill (and
 # through it wellness, the briefings' presence wait and morning arrival).
@@ -12810,6 +12900,7 @@ def _face_tracking_thread_body():
     SNAP     = 0.18   # side-cam snap-to-direction smoothness
     DRIFT    = 0.015  # drift back to centre when no face
     MIN_MOVE = 0.02
+    print(f"  {_face_detect_policy_line()}")
     # If c.read() returns False this many times in a row, the capture is
     # presumed wedged (Teams stole the cam, USB hub flickered, DirectShow
     # driver returned half-init Mat headers). Release and reopen instead of
@@ -13620,8 +13711,17 @@ def _face_tracking_thread_body():
                     # the tile live, so the HUD never shows 'CAMERA OFF' merely
                     # because JARVIS is listening or speaking.
                     continue
+                # IDLE CADENCE (2026-10-28, see _face_detect_due): nobody
+                # seen for FACE_TRACK_IDLE_AFTER_S -> the ~1 CPU-s detection
+                # runs FACE_TRACK_IDLE_HZ times a second, not every frame.
+                # A skipped frame is "no face this frame" for the eyes and
+                # nothing for presence (which only counts frames the
+                # detector ran on).
+                if not _face_detect_due(now_loop, key=cam["index"]):
+                    continue
                 try:
                     face = _detect_face(frame)
+                    _face_detect_mark(now_loop, bool(face), key=cam["index"])
                 except cv2.error:
                     # An OpenCV-internal failure (e.g. an OpenCL/GPU hiccup, or a
                     # malformed frame) used to unwind the whole tracking thread
