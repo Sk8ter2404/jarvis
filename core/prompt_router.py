@@ -687,6 +687,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "wellness", "focus block", "take a break", "break reminder",
         "focus session", "pomodoro", "stretch reminder", "posture",
     ],
+    # v3.0.3 armB: the predicate (is_release_timing_request) handles the
+    # question shapes; these catch the plain phrases around them.
+    "RELEASE TIMING": ["release date", "time to watch", "out yet",
+                       "come out yet", "premiere date"],
     "CALENDAR": [
         "calendar", "schedule", "my meetings", "appointment", "agenda",
         "meetings today", "meetings this week", "what meetings", "on my calendar",
@@ -969,6 +973,9 @@ _GENERIC_HEADER_WORDS = frozenset({
     # Clapton" and "clap along" ("clap") and "trigger the alarm" ("trigger")
     # into the clap-trigger grammar. Its keyword phrases route it instead.
     "clap", "trigger",
+    # Heads RELEASE TIMING, routed by its predicate: "release the cursor"
+    # (AIR CONTROL) and "timing" alone must not load it.
+    "release", "timing",
 })
 
 # Sections always kept even with no keyword hit. Deliberately MINIMAL: only
@@ -1107,6 +1114,82 @@ def _developer_note_request(user_text: str) -> bool:
         return False
 
 
+# ── Release-timing questions (v3.0.3 armB) ───────────────────────────────
+# "Is it time to watch Vision Quest yet?" is a question for the web, but the
+# TITLE word "vision" routed SCREEN VISION + LOCAL VISION (and "Music Man"
+# the music sections, "Light of the Seven" SMART HOME), so the model looked
+# at the screen. A release-timing question now (a) loads RELEASE TIMING (the
+# web_search example) and (b) hides its own TITLE from keyword / header-word
+# routing. Only the title is masked: "is it out yet on my screen" still
+# routes SCREEN VISION by "screen", and a calendar question never has this
+# shape ("is it time for my meeting" has no "to watch").
+_REL_NEW = r"(?:the )?(?:(?:new|latest|next|upcoming) )?"
+_REL_OF = (r"(?:(?:season|episode|film|movie|game|trailer|album|book|show|"
+           r"series|update)s?(?: \d+)? (?:of|for) )?")
+_REL_TITLE = r"(?P<t>[^?!.,]+?)"
+_REL_OUT = (r"(?:come|comes|coming|came) out|premiere[sd]?|release[sd]?|"
+            r"released|drop(?:s|ped|ping)?|be out|be released|air|airs|debut"
+            r"|launch(?:es|ed)?|streaming")
+_RELEASE_TIMING_RES = (
+    re.compile(r"\bis it (?:time|ready) to (?:watch|play|binge|start|read|"
+               r"stream) " + _REL_NEW + _REL_TITLE + r"(?: yet)?\W*$"),
+    re.compile(r"\b(?:is|are|was|were) " + _REL_NEW + _REL_OF + _REL_TITLE
+               + r" (?:out|released|available|streaming|up) yet\b"),
+    re.compile(r"\bhas " + _REL_NEW + _REL_OF + _REL_TITLE
+               + r" (?:come out|been released|dropped|released|premiered|"
+               r"aired) yet\b"),
+    re.compile(r"\bdid " + _REL_NEW + _REL_OF + _REL_TITLE
+               + r" (?:" + _REL_OUT + r")\b"),
+    re.compile(r"\bwhen (?:does|do|is|will|did|are) " + _REL_NEW + _REL_OF
+               + _REL_TITLE + r" (?:" + _REL_OUT + r")\b"),
+    re.compile(r"\brelease dates? (?:of|for) " + _REL_NEW + _REL_TITLE
+               + r"\W*$"),
+    re.compile(r"\b(?:what(?:'s| is)|when(?:'s| is)) " + _REL_NEW + _REL_TITLE
+               + r" release date\b"),
+)
+_REL_PRONOUNS = frozenset({"it", "that", "this", "they", "he", "she", "there"})
+
+
+def release_timing_title(user_text: str) -> str:
+    """The title named by a release-timing question ("is it time to watch
+    Vision Quest yet" -> "vision quest"), or "" when ``user_text`` is not
+    one. A bare pronoun ("is it out yet") is a release question with no
+    title: returns " " (truthy, nothing to mask). Never raises."""
+    try:
+        low = " ".join((user_text or "").lower().split())
+        if not low:
+            return ""
+        low = _SK_WAKE_LEAD_RE.sub("", low).strip()
+        for rx in _RELEASE_TIMING_RES:
+            m = rx.search(low)
+            if not m:
+                continue
+            title = m.group("t").strip(" '\"")
+            if not title or title in _REL_PRONOUNS:
+                return " "
+            return title
+        return ""
+    except Exception:
+        return ""
+
+
+def is_release_timing_request(user_text: str) -> bool:
+    return bool(release_timing_title(user_text))
+
+
+def _mask_release_title(part: str) -> str:
+    """``part`` with a release question's TITLE blanked out, so a word in the
+    title never routes a section (see above). Unchanged for any other turn."""
+    title = release_timing_title(part)
+    if not title.strip():
+        return part
+    out = re.sub(re.escape(title), " ", part, flags=re.IGNORECASE)
+    # "time to WATCH x yet" is not a play request either (MUSIC CONTROLS
+    # carries "watch").
+    return re.sub(r"\b(is it (?:time|ready) to) \w+", r"\1", out,
+                  flags=re.IGNORECASE)
+
+
 _PREDICATE_ROUTES = {
     "PYTHON SANDBOX": is_arithmetic_request,
     "SELF-KNOWLEDGE": is_self_knowledge_request,
@@ -1119,6 +1202,7 @@ _PREDICATE_ROUTES = {
     "SCREEN VISION": _onscreen_refs.is_screen_recall_request,
     "SCREEN MEMORY": _screen_memory_request,
     "DEVELOPER NOTES": _developer_note_request,
+    "RELEASE TIMING": is_release_timing_request,
 }
 
 # Short keywords ("tv", "ram", "hot", "mic", "bed", "lan") may only take
@@ -1399,7 +1483,7 @@ def documents_self_terminating_action(body: str) -> bool:
 def _match_sections(parts: List[str], sections: List[Tuple[str, str]]) -> set:
     """Names of the sections ``parts`` (one or more turns' text, matched as
     separate lines) route to, the always-on set included."""
-    user_text = "\n".join(parts)
+    user_text = "\n".join(_mask_release_title(p) for p in parts)
     low = " " + (user_text or "").lower() + " "
     neutral = (_CONVERSION_NEUTRAL_KEYWORDS
                if any(is_unit_conversion_request(p) for p in parts)
