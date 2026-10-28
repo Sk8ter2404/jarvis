@@ -33,6 +33,18 @@ class _Base(unittest.TestCase):
         self.mod._next_id[0] = 1
 
     def tearDown(self):
+        # test_a_real_timer_is_untouched arms a REAL 5-minute threading.Timer;
+        # clearing the dict alone left the thread alive, and 300 s later, mid
+        # suite, its _fire re-imported the monolith from a background thread
+        # (the ci-sim "LEAKED THREAD IMPORTED THE MONOLITH" note, every run
+        # since 2026-10-12). Cancel before forgetting.
+        for timer, _msg, _fire_at in list(self.mod._timers.values()):
+            timer.cancel()
+            # cancel() sets the event the thread waits on, so it exits at once
+            # without firing; join proves it is gone rather than hoping.
+            if timer.is_alive():
+                timer.join(5)
+                self.assertFalse(timer.is_alive(), "timer thread outlived tearDown")
         self.mod._timers.clear()
         if self._saved is None:
             os.environ.pop("JARVIS_DATA_DIR", None)
