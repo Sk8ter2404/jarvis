@@ -42803,6 +42803,26 @@ def _once_per_turn_refusal(name, arg, ran_before, ran_here) -> str:
     return ""
 
 
+def _screen_read_refusal(name) -> str:
+    """The refusal result for a third see_screen / read_screen (or an alias
+    with see_screen's handler) in one owner turn, or "" to let it run
+    (core.loop_guard.screen_read_refusal has the rule and why it is enforced
+    while the rest of W21 is shadow; LOOP_GUARD_MODE='off' turns it off).
+    Outside a turn nothing is refused. Never raises."""
+    try:
+        if _loop_guard_mode() == "off":
+            return ""
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is None:
+            return ""
+        see = ACTIONS.get("see_screen")
+        return _loop_guard.screen_read_refusal(
+            name, list(frame.get("calls") or ()),
+            is_read=lambda n: see is not None and ACTIONS.get(n) is see)
+    except Exception:
+        return ""
+
+
 # ── Honest close-out (NEW #6, 2026-10-01) ───────────────────────────────────
 # Live 2026-10-01 21:00:50: after five follow-up rounds the loop guard stopped
 # the chain; the last thing said was "I'm running the numbers now, sir; I'll
@@ -43741,6 +43761,15 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             print(f"  [action] {name}: {_again}")
             results.append((name, _again, False))
             return ""
+        # A third screen read in one turn (live 2026-10-27 20:41:30-36:
+        # see_screen, read_screen, read_screen on the same page) - see
+        # _screen_read_refusal.
+        _reread = _screen_read_refusal(name)
+        if _reread:
+            print(f"  [loop-guard] {name}: third screen read this turn - "
+                  f"refused")
+            results.append((name, _reread, False))
+            return ""
 
         if _needs_confirmation(name, arg):
             _queue_pending_confirmation(name, arg)
@@ -44086,6 +44115,35 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         results.append(("_ungrounded_reading", warn, True))
         cleaned = _kept
 
+    # Facts read off the screen (live 2026-10-27 20:41:16): after a look at
+    # the screen EARLIER this turn, a sentence stating a release /
+    # availability fact, a date, or a number in such a sentence must be in
+    # what this turn read or the owner's words - else it is not spoken and
+    # the follow-up round quotes the page or says it can't tell
+    # (core.claim_validator.find_ungrounded_screen_fact has the rules). A
+    # guess written before THIS reply's own read is result-hold's.
+    if (cleaned and getattr(_turn_grounding, "frame", None) is not None
+            and any(_is_screen_look_action(_n) for _n in _ran_before_reply)):
+        try:
+            _sf_ground = _turn_grounding_texts() + [
+                str(_r) for (_n, _r, _i) in results
+                if not str(_n).startswith("_")]
+            _sf_kept, _sf_bad = _claim_validator.drop_ungrounded_screen_facts(
+                cleaned, grounding=_sf_ground, user_text=_turn_user_text())
+        except Exception as _sf_err:
+            print(f"  [validation] screen-fact check failed: {_sf_err}")
+            _sf_kept, _sf_bad = cleaned, []
+        if _sf_bad:
+            warn = (
+                f"reply stated '{_sf_bad[0]}' but nothing read this turn "
+                "says so - it was NOT spoken. Say only what the page you "
+                "read says, in its own words (quote the headline), or say "
+                "plainly the page doesn't tell you; never add a date, a "
+                "release or a number it does not show")
+            print(f"  [validation] {warn}")
+            results.append(("_ungrounded_screen_fact", warn, True))
+            cleaned = _sf_kept
+
     # When mission narration fired, the per-step cues replaced the LLM's
     # prose. Drop the cleaned text so the main loop doesn't immediately
     # re-speak whatever narration the LLM also tried to inline.
@@ -44184,6 +44242,11 @@ def _followup_extra(action_results) -> str:
         "for sound or volume, [ACTION: system_pulse] for the PC) or say "
         "plainly you can't tell from here - never repeat or guess the "
         "number, and give a confidence in words.\n"
+        "- If a result is from [_ungrounded_screen_fact], your previous "
+        "reply stated a date, a release or a number the page you read does "
+        "not show; the owner did not hear it. Quote what the page says "
+        "(its headline, word for word) or say it doesn't say - no new "
+        "action, no guess.\n"
         + ("- If click or find says not found or lists candidates, ask sir "
            "which one, naming them; never search, open or play something "
            "else instead.\n" if _screen_target_stuck(action_results) else
@@ -51558,7 +51621,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         _loop_actions = {"open_url", "web_search", "check_credits",
                          "_unverified_claim", "_dropped_step",
                          "_preemptive_hallucinated_claim",
-                         "_ungrounded_reading"}
+                         "_ungrounded_reading", "_ungrounded_screen_fact"}
         # check_credits is also terminal — once it returns a balance,
         # there's nothing left to do but report it. Stop after the
         # first follow-up that reports the balance.

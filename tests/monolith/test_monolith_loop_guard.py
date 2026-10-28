@@ -50,8 +50,13 @@ class LoopGuardChainTests(_Base):
         self.assertIn("(ping-pong list_windows/see_screen)", printed)
         self.assertNotIn("[loop-guard] stopping", printed)
         self.assertNotIn("[close-out]", printed)
-        # the chain ran exactly as before: every bounce was made
-        self.assertEqual(len(self.calls["see_screen"]), 3)
+        # the chain ran as before - every bounce was made - except the third
+        # screen read of the turn, which the one ENFORCED rule refuses before
+        # it runs (v3.0.1, core.loop_guard.screen_read_refusal; live
+        # 2026-10-27 20:41:30-36).
+        self.assertEqual(len(self.calls["see_screen"]), 2)
+        self.assertIn("[loop-guard] see_screen: third screen read this turn "
+                      "- refused", printed)
         self.assertEqual(len(self.calls["list_windows"]), 4)
 
     def test_on_stops_the_chain_and_says_so(self):
