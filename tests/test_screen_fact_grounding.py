@@ -67,6 +67,81 @@ class LiveReplyTests(unittest.TestCase):
         self.assertEqual(bad, ["released", "dropped"])
 
 
+# The search's own echo ("opened Google search for '... release date'") puts
+# a release word in the grounding, so the first sentence falls only on
+# 'yesterday' and its tail ("It seems they dropped earlier than expected.")
+# used to be judged alone - grounded release word, no date, no number - and
+# voiced (replay v3-live-1027-screenfact-ungrounded-tail).
+SEARCH_ECHO = ("opened Google search for 'Example Show episodes 5 and 6 "
+               "release date' on the left monitor — top results: \"Go to "
+               "Google Home\"")
+EMPTY_PAGE = ("Read from the screen's own text (exact titles; quote them, "
+              "invent nothing):\n[left] Chrome — 'Example Show episodes 5 "
+              "and 6 release date - Google Search'\nGo to Google Home\nAll "
+              "Images Videos News\nSign in")
+
+
+class DroppedClaimTailTests(unittest.TestCase):
+    def _drop(self, text):
+        return cv.drop_ungrounded_screen_facts(
+            text, grounding=[SEARCH_ECHO, EMPTY_PAGE], user_text=LIVE_USER)
+
+    def test_tail_that_only_continues_the_dropped_claim_goes_with_it(self):
+        kept, bad = self._drop(LIVE_REPLY)
+        self.assertEqual(kept, "")
+        self.assertEqual(bad, ["yesterday", "dropped"])
+
+    def test_tail_shapes(self):
+        head = "[intent:briefing] Episodes five and six came out yesterday. "
+        for tail in ("They're out now, sir.",
+                     "It's available already.",
+                     "That dropped a touch early.",
+                     "And they released early, sir."):
+            with self.subTest(tail=tail):
+                kept, bad = self._drop(head + tail)
+                self.assertEqual(kept, "", tail)
+                self.assertEqual(bad[0], "yesterday")
+                self.assertEqual(len(bad), 2, bad)
+
+    def test_tail_without_a_release_word_is_kept(self):
+        kept, bad = self._drop("[intent:briefing] Episodes five and six "
+                               "came out yesterday. It seems a good one, sir.")
+        self.assertEqual(kept, "It seems a good one, sir.")
+        self.assertEqual(bad, ["yesterday"])
+
+    def test_tail_with_its_own_fact_is_judged_on_its_own(self):
+        text = ("[intent:briefing] Episodes five and six came out yesterday. "
+                "They premiere on November 4, sir.")
+        kept, bad = cv.drop_ungrounded_screen_facts(
+            text, grounding=[SEARCH_ECHO, "Premiere date: Nov 4, 2026"],
+            user_text=LIVE_USER)
+        self.assertEqual(kept, "They premiere on November 4, sir.")
+        self.assertEqual(bad, ["yesterday"])
+        kept, bad = self._drop(text)
+        self.assertEqual(kept, "")
+        self.assertEqual(bad, ["yesterday", "november"])
+
+    def test_hedged_tail_is_kept(self):
+        kept, bad = self._drop("[intent:briefing] Episodes five and six came "
+                               "out yesterday. I can't tell whether they "
+                               "dropped early, sir.")
+        self.assertEqual(kept, "I can't tell whether they dropped early, sir.")
+        self.assertEqual(bad, ["yesterday"])
+
+    def test_no_tail_rule_without_a_dropped_sentence_before_it(self):
+        text = ("[intent:briefing] The page lists the release schedule, sir. "
+                "It seems they dropped earlier than expected.")
+        self.assertEqual(self._drop(text), (text, []))
+
+    def test_only_the_sentence_right_after_the_drop_is_a_tail(self):
+        kept, bad = self._drop("[intent:briefing] Episodes five and six came "
+                               "out yesterday. The page is open on the left. "
+                               "They dropped early, sir.")
+        self.assertEqual(kept, "The page is open on the left. They dropped "
+                               "early, sir.")
+        self.assertEqual(bad, ["yesterday"])
+
+
 class RuleTests(unittest.TestCase):
     def _bad(self, text, page=LIVE_PAGE, user=LIVE_USER):
         return cv.find_ungrounded_screen_fact(text, grounding=[page],

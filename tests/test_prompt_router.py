@@ -1944,3 +1944,86 @@ class BrainTestSetRoutingTests(unittest.TestCase):
                         ("turn on the lamp", "SMART HOME — PER-BRAND LIST")):
             with self.subTest(u=u):
                 self.assertNotIn(name, pr.select_sections(u, sections)[0])
+
+
+class ReleaseTimingRoutingTests(unittest.TestCase):
+    """v3.0.3 armB: 'is it time to watch Vision Quest yet' is a web question;
+    the TITLE word 'vision' used to route SCREEN VISION + LOCAL VISION (and
+    'Music Man' the music sections), so the model looked at the screen."""
+
+    TITLE_PHRASES = (
+        ("Is it time to watch Vision Quest yet?", "vision"),
+        ("is the new Music Man movie out yet", "music"),
+        ("when does Light of the Seven premiere", "light"),
+        ("did the new episode of Vision Quest drop", "vision"),
+        ("when does the new season of Music City come out", "music"),
+        ("what's the Vision Quest release date", "vision"),
+        ("release date of Light Of The Seven", "light"),
+        ("has Vision Quest come out yet", "vision"),
+        ("Jarvis, is Vision Quest out yet?", "vision"),
+    )
+    BLOCKED = ("SCREEN VISION", "LOCAL VISION", "MUSIC CONTROLS",
+               "MUSIC + VIDEO PLAYBACK", "TASTE-AWARE MUSIC", "SMART HOME",
+               "CALENDAR")
+
+    def _routed(self, u, history=None):
+        _core, sections = pr.split_pc_control(FULL)
+        return set(pr.select_sections(u, sections, history)[0])
+
+    def test_release_question_loads_the_web_search_example(self):
+        _core, sections = pr.split_pc_control(FULL)
+        body = dict((h.strip(), b) for h, b in sections)["RELEASE TIMING"]
+        self.assertIn("web_search", body)
+        for u, _w in self.TITLE_PHRASES:
+            with self.subTest(u=u):
+                self.assertIn("RELEASE TIMING", self._routed(u))
+
+    def test_title_word_does_not_pull_screen_music_or_lights(self):
+        for u, _w in self.TITLE_PHRASES:
+            got = self._routed(u)
+            for name in self.BLOCKED:
+                with self.subTest(u=u, name=name):
+                    self.assertNotIn(name, got)
+
+    def test_title_words_still_route_when_not_a_release_question(self):
+        self.assertIn("SMART HOME", self._routed("turn on the light"))
+        self.assertIn("MUSIC CONTROLS", self._routed("play some music"))
+        self.assertIn("SCREEN VISION", self._routed("what's on my screen"))
+        self.assertIn("LOCAL VISION", self._routed("use local vision"))
+        self.assertNotIn("RELEASE TIMING", self._routed("play Vision Quest"))
+
+    def test_screen_words_outside_the_title_still_route(self):
+        self.assertIn("SCREEN VISION",
+                      self._routed("is Vision Quest out yet, look at my screen"))
+
+    def test_calendar_questions_do_not_change(self):
+        for u, want in (("what's on my calendar", True),
+                        ("when is my next appointment", True),
+                        ("what meetings do I have today", True),
+                        ("is it time for my meeting", False),
+                        ("what's on my schedule tomorrow", True)):
+            got = self._routed(u)
+            with self.subTest(u=u):
+                self.assertNotIn("RELEASE TIMING", got)
+                self.assertEqual("CALENDAR" in got, want)
+
+    def test_other_phrases_never_load_it(self):
+        for u in ("release the cursor", "what's the timing on the print",
+                  "when does my meeting start", "is the printer done yet",
+                  "what time is it", "is it time to go to bed",
+                  "open Discord", "lights off"):
+            with self.subTest(u=u):
+                self.assertNotIn("RELEASE TIMING", self._routed(u))
+
+    def test_title_extraction(self):
+        t = pr.release_timing_title
+        self.assertEqual(t("Is it time to watch Vision Quest yet?"),
+                         "vision quest")
+        self.assertEqual(t("did the new episode of Severance drop"),
+                         "severance")
+        self.assertEqual(t("when does Light of the Seven premiere"),
+                         "light of the seven")
+        self.assertEqual(t("is it out yet").strip(), "")
+        self.assertTrue(pr.is_release_timing_request("is it out yet"))
+        self.assertEqual(t(""), "")
+        self.assertEqual(t(None), "")

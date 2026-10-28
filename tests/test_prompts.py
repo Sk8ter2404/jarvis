@@ -274,5 +274,36 @@ class MediaTransportPromptTests(unittest.TestCase):
         self.assertIn("never retry with the", PC_CONTROL_PROMPT)
 
 
+class NotARequestCarveOutTests(unittest.TestCase):
+    """v3.0.3 armA: words that are not a request get a clarifying line and
+    no token - never a promise ('On it') the reply cannot keep."""
+
+    def _head(self):
+        return PC_CONTROL_PROMPT.split("Format: [ACTION:", 1)[0]
+
+    def test_non_request_asks_what_he_meant(self):
+        head = self._head()
+        self.assertIn("what would you like?", head)
+        self.assertIn("NO token", head)
+
+    def test_promises_are_named_as_forbidden(self):
+        head = self._head()
+        for phrase in ("On it", "Right away", "Certainly"):
+            self.assertIn(phrase, head)
+        self.assertIn("Never answer such words with", head)
+
+    def test_short_commands_still_act(self):
+        head = self._head()
+        for cmd in ("'pause'", "'next song'", "'lights off'",
+                    "'open Discord'", "'play Thriller'"):
+            self.assertIn(cmd, head)
+        self.assertIn("IS a request: act on it", head)
+
+    def test_carve_out_stays_in_the_always_on_preamble(self):
+        # Before the first routed section, so every turn sees it.
+        self.assertLess(PC_CONTROL_PROMPT.index("what would you like?"),
+                        PC_CONTROL_PROMPT.index("BASIC actions:"))
+
+
 if __name__ == "__main__":
     unittest.main()
