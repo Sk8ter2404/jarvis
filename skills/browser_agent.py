@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import threading
 import time
@@ -770,10 +771,49 @@ def _truncate(s: str, n: int = 1200) -> str:
     return s if len(s) <= n else s[: n - 12] + "... (truncated)"
 
 
+# A bare hand-off is no browser task (live 2026-10-28 15:58: [ACTION:
+# browser_task, pass over to Clog] - the STT's "Clog" for "Claude" - searched
+# DuckDuckGo for "Clog" for ~47 s, then asked what "Clog" was). With no
+# content of its own ("pass over to <name>", "send it to <name> for me") the
+# agent cannot know what "it" is, so ask at once instead of browsing.
+_BARE_HANDOFF_RE = re.compile(
+    r"^(?:(?:no|ok|okay|just|please|jarvis)[\s,]+)*"
+    r"(?:pass|passed|send|sent|forward|forwarded|hand|handed|give|gave|"
+    r"relay|relayed)\s+"
+    r"(?:(?:that|this|it|them|those|these|everything)\s+)?"
+    r"(?:over\s+|along\s+|on\s+)?to\s+"
+    r"(?P<name>[\w'.-]+(?:\s+[\w'.-]+)?)"
+    r"(?:[\s,]+(?:as\s+well|too|also|for\s+me|please|now))*[\s.!?]*$",
+    re.IGNORECASE)
+_HANDOFF_COURTESY_RE = re.compile(
+    r"(?:\s+(?:as\s+well|too|also|for\s+me|please|now))+$", re.IGNORECASE)
+
+
+def _handoff_guard(task: str) -> str | None:
+    """The clarifying question for a task that is only a hand-off with no
+    content ("pass over to Clog"), else None. Never raises (fails open)."""
+    try:
+        m = _BARE_HANDOFF_RE.match(" ".join(str(task or "").split()))
+        if not m:
+            return None
+        name = _HANDOFF_COURTESY_RE.sub("", m.group("name")).strip(" .,!?")
+        if name.lower() == "claude":
+            return ("A browser can't hand anything to Claude, sir. Say "
+                    "\"pass that over to Claude\" and I'll leave the note.")
+        return (f"I'm not sure who '{name}' is, sir, and a browser can't "
+                "hand anything over. If you meant Claude, say \"pass that "
+                "over to Claude\" and I'll leave the note.")
+    except Exception:
+        return None
+
+
 def _action_browser_task(arg: str = "") -> str:
     task = (arg or "").strip()
     if not task:
         return "Give me a task, sir — e.g. 'book me a haircut Friday afternoon'."
+    asked = _handoff_guard(task)
+    if asked:
+        return asked
     if not is_available():
         return _install_hint()
     blocked = _ssrf_guard(task)

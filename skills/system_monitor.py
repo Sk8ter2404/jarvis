@@ -313,7 +313,27 @@ def _network_rates(window_seconds: float = 1.0) -> tuple[float, float]:
     return down, up
 
 
-def _build_report() -> str:
+def _ram_users_sentence(ram_pct: float, arg: str = "") -> str:
+    """Live 2026-10-28 15:59:28: "Jarvis, why is the ram so high?" at 92 %.
+    The SYSTEM HEALTH turn block teaches check_system, whose report named
+    only the CPU offender. At RAM_ALERT_PCT or over, or when his words (or
+    the action argument) ask about ram/memory, name the biggest memory users
+    via the LOADED system_pulse skill (its _memory_users /
+    _memory_users_sentence - not a copy, so there is one implementation).
+    Pulse not loaded -> "". Never raises."""
+    try:
+        pulse = sys.modules.get("skill_system_pulse")
+        if pulse is None:
+            return ""
+        said = f"{pulse._turn_words()} {arg if isinstance(arg, str) else ''}"
+        if not (ram_pct >= RAM_ALERT_PCT or pulse._asks_about_memory(said)):
+            return ""
+        return pulse._memory_users_sentence(pulse._memory_users()) or ""
+    except Exception:
+        return ""
+
+
+def _build_report(arg: str = "") -> str:
     if not _HAS_PSUTIL:
         return ("System monitor requires the psutil package — run "
                 "pip install psutil and restart me.")
@@ -356,6 +376,9 @@ def _build_report() -> str:
             cpu_ram += ". Most of that is my own speech recognition"
         else:
             cpu_ram += f". {_spoken_process_name(primary)} is the primary offender"
+    users = _ram_users_sentence(vm.percent, arg)
+    if users:
+        cpu_ram += ". " + users.rstrip(".")
 
     # Sentence 3 — disk + network
     extras = []
@@ -459,9 +482,9 @@ def _monitor_loop():
 
 
 def register(actions):
-    def check_system(_: str = "") -> str:
+    def check_system(arg: str = "") -> str:
         try:
-            return _build_report()
+            return _build_report(arg)
         except Exception as e:
             return f"system check failed: {e}"
 

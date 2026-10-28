@@ -151,6 +151,57 @@ class SystemMonitorReportTests(unittest.TestCase):
         self.assertIn("network at 99 down, 9 up", out)
 
 
+class SystemMonitorRamUsersTests(unittest.TestCase):
+    """Live 2026-10-28 15:59:28: "Jarvis, why is the ram so high?" at 92 %.
+    The routed SYSTEM HEALTH block teaches check_system, which named only the
+    CPU offender ("Chrome is, as usual, the primary offender"). Driven through
+    actions["check_system"], with the real system_pulse skill loaded beside
+    it (its memory-users code is reused, not copied)."""
+    LIVE_SAID = "Jarvis, why is the ram so high?"
+    _GB = 1024 ** 3
+
+    def setUp(self):
+        self.pulse, _ = load_skill_isolated("system_pulse")
+        self.mod, self.actions = load_skill_isolated("system_monitor")
+        g = self._GB
+        self.procs = [(9001, "llama-server.exe", 8.0 * g),
+                      (9002, "claude.exe", 6.7 * g),
+                      (9003, "chrome.exe", 4.5 * g),
+                      (9004, "bztransmit.exe", 4.2 * g)]
+
+    def _check(self, ram_pct, said="", arg=""):
+        fake = mock.MagicMock()
+        fake.cpu_percent.return_value = 38
+        fake.virtual_memory.return_value = _VM(ram_pct, 29.0)
+        fake.disk_usage.return_value = _Disk(300.0, 1000.0)
+        with mock.patch.object(self.mod, "_HAS_PSUTIL", True),              mock.patch.object(self.mod, "psutil", fake),              mock.patch.object(self.mod, "_top_processes",
+                               return_value=[("chrome.exe", 20.0)]),              mock.patch.object(self.mod, "_network_rates",
+                               return_value=(0.0, 0.0)),              mock.patch.object(self.pulse, "_turn_words", return_value=said),              mock.patch.object(self.pulse, "_read_process_memory",
+                               return_value=list(self.procs)):
+            return self.actions["check_system"](arg)
+
+    def test_live_92_percent_names_the_memory_users(self):
+        out = self._check(92, self.LIVE_SAID)
+        self.assertIn("The biggest memory users are my local brain model at "
+                      "8 gigabytes, Claude at 6.5 and Chrome at 4.5. C drive",
+                      out)
+        self.assertNotIn("..", out)
+
+    def test_over_the_alert_without_asking_still_names_them(self):
+        out = self._check(92, "status report")
+        self.assertIn("The biggest memory users are", out)
+
+    def test_asked_about_memory_below_the_alert(self):
+        out = self._check(80, "what is using all my memory")
+        self.assertIn("The biggest memory users are", out)
+
+    def test_normal_ram_not_asked_is_unchanged(self):
+        out = self._check(50, "how is the system")
+        self.assertNotIn("memory users", out)
+        self.assertIn("Chrome is, as usual, the primary offender. C drive",
+                      out)
+
+
 class SystemMonitorDegradationTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("system_monitor")

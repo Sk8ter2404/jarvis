@@ -1694,5 +1694,320 @@ class PulseLiveGpuAlertTests(unittest.TestCase):
         self.assertIn("proactive=True", src)
 
 
+
+# ─── the asked-for pulse at high RAM (live 2026-10-28 15:59:28) ──────────
+_GB = 1024 ** 3
+
+
+def _live_procs_1559(own_pid):
+    """The 15:59 memory users, grouped totals as measured (working set, GB):
+    llama-server 8.0 (1), claude 6.7 (34), chrome 4.5 (27), pythonw 4.3 (4,
+    JARVIS's own bobert_companion among them), bztransmit 4.2 (1),
+    msedgewebview2 3.0 (53), python 2.3 (3), bambu-studio 1.8 (1). The
+    per-pid split inside a group was not logged; it is spread evenly here, and
+    JARVIS's share of pythonw (2.6 of the 4.3) is an assumption."""
+    rows = [(9001, "llama-server.exe", 8.0 * _GB),
+            (9002, "bztransmit.exe", 4.2 * _GB),
+            (9003, "bambu-studio.exe", 1.8 * _GB),
+            (own_pid, "pythonw.exe", 2.6 * _GB)]
+    pid = 10_000
+
+    def spread(name, n, total_gb):
+        nonlocal pid
+        for _ in range(n):
+            pid += 1
+            rows.append((pid, name, total_gb / n * _GB))
+
+    spread("claude.exe", 34, 6.7)
+    spread("chrome.exe", 27, 4.5)
+    spread("pythonw.exe", 3, 1.7)
+    spread("msedgewebview2.exe", 53, 3.0)
+    spread("python.exe", 3, 2.3)
+    return rows
+
+
+class PulseAskedAtHighRamTests(unittest.TestCase):
+    """Live 2026-10-28: 15:59:11 system_monitor said "Sir, memory usage is at
+    92 percent. Things may start swapping shortly."; 15:59:28 "Jarvis, why is
+    the ram so high?" -> [ACTION: system_pulse] -> LIVE_OLD_LINE: the pulse's
+    own RAM_ABNORMAL_PCT (88) was crossed, it still opened "nominal", and it
+    never said why. Each test goes through actions["system_pulse"], the
+    entry the live turn ran, serving the pulse from the HUD cache as live."""
+
+    LIVE_QUESTION = "Jarvis, why is the ram so high?"
+    LIVE_PULSE = {"cpu_pct": 38.0, "cpu_temp_c": 60.0, "ram_pct": 92.0,
+                  "gpu_util_pct": 8.0, "disk_free_gb": 500.0,
+                  "active_apps": 12}
+    LIVE_OLD_LINE = ("All systems nominal, sir. CPU 38 percent at 60 degrees, "
+                     "memory 92 percent, GPU running at 8 percent, 12 windows "
+                     "open.")
+    LIVE_USERS = ("The biggest memory users are my local brain model at 8 "
+                  "gigabytes, Claude at 6.5 and Chrome at 4.5.")
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+        self.reads = 0
+
+    def _ask(self, pulse, said="", procs=None, arg=""):
+        rows = _live_procs_1559(os.getpid()) if procs is None else procs
+
+        def _read():
+            self.reads += 1
+            return list(rows)
+
+        with self.mod._pulse_cache_lock:
+            self.mod._pulse_cache = {"pulse": dict(pulse), "ts": time.time()}
+        with mock.patch.object(self.mod, "_turn_words", return_value=said), \
+             mock.patch.object(self.mod, "_read_process_memory",
+                               side_effect=_read), \
+             mock.patch.object(self.mod, "_gather_pulse",
+                               side_effect=AssertionError("cache is fresh")):
+            return self.actions["system_pulse"](arg)
+
+    def test_the_live_old_line_was_the_nominal_one(self):
+        # The fixture IS the live reading: rendered the old way it is the
+        # line he heard (the plain _format_report the action used to return).
+        self.assertTrue(self.mod._format_report(dict(self.LIVE_PULSE))
+                        .startswith(self.LIVE_OLD_LINE))
+
+    def test_the_live_question_opens_with_memory_and_says_why(self):
+        out = self._ask(self.LIVE_PULSE, self.LIVE_QUESTION)
+        self.assertNotIn("nominal", out)
+        self.assertEqual(
+            out,
+            "Memory at 92 percent, sir — getting tight. " + self.LIVE_USERS +
+            " CPU 38 percent at 60 degrees, GPU running at 8 percent, 12 "
+            "windows open. Anything further?")
+        self.assertEqual(out.count("92 percent"), 1)
+
+    def test_a_plain_status_report_at_92_percent_still_says_why(self):
+        # The default: whenever the pulse reports high RAM it names the users,
+        # whatever words picked system_pulse.
+        out = self._ask(self.LIVE_PULSE, "status report")
+        self.assertTrue(out.startswith("Memory at 92 percent, sir"), out)
+        self.assertIn(self.LIVE_USERS, out)
+
+    def test_outside_a_turn_the_reading_still_leads(self):
+        out = self._ask(self.LIVE_PULSE, "")
+        self.assertFalse(out.startswith("All systems nominal"), out)
+        self.assertIn("my local brain model at 8 gigabytes", out)
+
+    def test_a_normal_pulse_is_still_nominal_and_reads_no_processes(self):
+        out = self._ask({"cpu_pct": 12.0, "ram_pct": 41.0,
+                         "gpu_util_pct": 8.0, "active_apps": 9}, "status report")
+        self.assertTrue(out.startswith("All systems nominal, sir."), out)
+        self.assertNotIn("memory user", out)
+        self.assertEqual(self.reads, 0)
+
+    def test_what_is_using_my_memory_below_the_threshold(self):
+        out = self._ask(dict(self.LIVE_PULSE, ram_pct=80.0),
+                        "what's using all my memory")
+        self.assertTrue(out.startswith("All systems nominal, sir."), out)
+        self.assertIn("memory 80 percent, GPU running at 8 percent, 12 windows "
+                      "open. " + self.LIVE_USERS + " Anything further?", out)
+
+    def test_the_action_argument_counts_as_asking(self):
+        out = self._ask(dict(self.LIVE_PULSE, ram_pct=70.0), "", arg="memory")
+        self.assertIn(self.LIVE_USERS, out)
+
+    def test_high_cpu_asked_for_opens_with_the_cpu(self):
+        out = self._ask({"cpu_pct": 97.0, "ram_pct": 50.0, "active_apps": 3},
+                        "how are the systems")
+        self.assertTrue(out.startswith("Slight problem, sir — CPU at 97 "
+                                       "percent."), out)
+        self.assertEqual(out.count("97 percent"), 1)
+        self.assertTrue(out.endswith("Anything further?"))
+
+    def test_asked_about_memory_the_memory_leads_over_the_cpu(self):
+        out = self._ask(dict(self.LIVE_PULSE, cpu_pct=97.0),
+                        self.LIVE_QUESTION)
+        self.assertTrue(out.startswith("Memory at 92 percent, sir"), out)
+        self.assertIn("CPU 97 percent", out)
+
+    def test_not_asked_the_cpu_leads_and_the_users_follow_the_readings(self):
+        out = self._ask(dict(self.LIVE_PULSE, cpu_pct=97.0), "status report")
+        self.assertTrue(out.startswith("Slight problem, sir — CPU at 97"), out)
+        self.assertIn("Memory 92 percent, GPU running at 8 percent, 12 windows "
+                      "open. " + self.LIVE_USERS, out)
+
+    def test_low_credits_alone_lead_the_asked_for_pulse(self):
+        out = self._ask({"cpu_pct": 10.0, "ram_pct": 30.0,
+                         "credits_dollars": 3.0}, "status report")
+        self.assertTrue(out.startswith("Heads up, sir — Anthropic credit "
+                                       "balance is at only $3.00."), out)
+        self.assertEqual(out.count("$3.00"), 1)
+        self.assertNotIn("nominal", out)
+
+    def test_a_pc_reading_leads_before_news(self):
+        out = self._ask(dict(self.LIVE_PULSE, credits_dollars=3.0),
+                        "status report")
+        self.assertTrue(out.startswith("Memory at 92 percent"), out)
+        self.assertIn("$3.00", out)
+
+    def test_no_abnormal_asked_for_pulse_opens_nominal(self):
+        # Goal 1 across every reason _abnormal_reasons knows, except 'gpu'
+        # (test_asked_for_pulse_never_leads_with_gpu_pinned).
+        cases = [{"cpu_pct": 99.0}, {"ram_pct": 95.0}, {"disk_free_gb": 5.0},
+                 {"battery_pct": 9.0, "battery_plugged": False},
+                 {"bambu": {"gcode_state": "FAILED"}}, {"credits_dollars": 1.0},
+                 {"net_down_kbps": 90_000.0}]
+        for pulse in cases:
+            with self.subTest(pulse=pulse):
+                out = self._ask(pulse, "status report")
+                self.assertNotIn("nominal", out)
+                self.assertTrue(out.endswith("Anything further?"), out)
+
+    def test_asked_for_pulse_never_leads_with_gpu_pinned(self):
+        # 09-29/10-02: "GPU pinned at 99 percent" was JARVIS's own model
+        # answering the very turn. An asked-for pulse keeps the 3.0.4 body
+        # wording and never opens with the gpu reason, nor puts it ahead of
+        # the memory answer.
+        for pulse, said in (
+                (dict(cpu_pct=22.0, ram_pct=71.0, gpu_util_pct=99.0,
+                      cpu_temp_c=55.0, disk_free_gb=300.0, active_apps=9),
+                 "Jarvis how is the system"),
+                (dict(cpu_pct=22.0, ram_pct=80.0, gpu_util_pct=99.0,
+                      cpu_temp_c=55.0, disk_free_gb=300.0, active_apps=9),
+                 "why is my ram so high"),
+                (dict(cpu_pct=22.0, ram_pct=71.0, gpu_temp_c=90.0,
+                      disk_free_gb=300.0, active_apps=9), "status report")):
+            with self.subTest(pulse=pulse, said=said):
+                out = self._ask(pulse, said)
+                self.assertNotIn("GPU pinned", out)
+                self.assertNotIn("rather hot", out)
+                self.assertTrue(out.startswith("All systems nominal, sir."),
+                                out)
+                if "gpu_util_pct" in pulse:
+                    self.assertIn("GPU working hard at 99 percent", out)
+                self.assertTrue(out.endswith("Anything further?"), out)
+
+    def test_the_proactive_line_is_unchanged_and_reads_no_processes(self):
+        key, lead = self.mod._abnormal_reasons(self.LIVE_PULSE)[0]
+        with mock.patch.object(self.mod, "_read_process_memory",
+                               side_effect=AssertionError("proactive read")):
+            line = self.mod._format_report(dict(self.LIVE_PULSE), lead=lead,
+                                           lead_key=key, proactive=True)
+        self.assertEqual(line, "Memory at 92 percent, sir — getting tight. "
+                               "CPU 38 percent at 60 degrees, GPU running at 8 "
+                               "percent, 12 windows open.")
+
+
+class PulseMemoryUsersTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+
+    def test_live_users_grouped_by_app_biggest_first(self):
+        users = self.mod._memory_users(_live_procs_1559(4242), own_pid=4242,
+                                       top=8)
+        names = [u[0] for u in users]
+        self.assertEqual(names[:3], ["my local brain model", "Claude",
+                                     "Chrome"])
+        got = dict(users)
+        self.assertAlmostEqual(got["Claude"], 6.7, places=6)
+        self.assertAlmostEqual(got["Backblaze"], 4.2, places=6)
+        self.assertAlmostEqual(got["Edge web views"], 3.0, places=6)
+        self.assertAlmostEqual(got["my own process"], 2.6, places=6)
+        # The other pythonw processes and python.exe are one "Python".
+        self.assertAlmostEqual(got["Python"], 1.7 + 2.3, places=6)
+        self.assertAlmostEqual(got["Bambu Studio"], 1.8, places=6)
+        self.assertEqual(len(self.mod._memory_users(
+            _live_procs_1559(4242), own_pid=4242)), 3)
+
+    def test_symptoms_small_apps_and_garbage_are_left_out(self):
+        rows = [(1, "Memory Compression", 6 * _GB), (0, "", 9 * _GB),
+                (4, "System", 2 * _GB), (5, "tiny.exe", 0.4 * _GB),
+                (6, "SomeTool.exe", 2 * _GB), (7, "weird", "x"), ("bad",),
+                None, (8, "notepad++.exe", 1.5 * _GB)]
+        self.assertEqual(self.mod._memory_users(rows, own_pid=99),
+                         [("SomeTool", 2.0), ("Notepad++", 1.5)])
+
+    def test_never_raises(self):
+        self.assertEqual(self.mod._memory_users(object(), own_pid=1), [])
+        with mock.patch.object(self.mod, "_read_process_memory",
+                               side_effect=RuntimeError("boom")):
+            self.assertEqual(self.mod._memory_users(), [])
+
+    def test_spoken_sizes(self):
+        cases = {8.0: "8", 6.7: "6.5", 4.5: "4.5", 4.2: "4", 9.8: "10",
+                 12.4: "12", 1.1: "1"}
+        for gb, want in cases.items():
+            with self.subTest(gb=gb):
+                self.assertEqual(self.mod._speak_gb(gb), want)
+
+    def test_sentences(self):
+        s = self.mod._memory_users_sentence
+        self.assertEqual(s([]), "")
+        self.assertEqual(s([("Chrome", 1.1)]),
+                         "The biggest memory user is Chrome at 1 gigabyte.")
+        self.assertEqual(s([("Chrome", 5.0), ("Claude", 3.0)]),
+                         "The biggest memory users are Chrome at 5 gigabytes "
+                         "and Claude at 3.")
+
+    def test_psutil_path_skips_unreadable_processes(self):
+        mod = self.mod
+        mi = types.SimpleNamespace(rss=3 * _GB)
+        good = types.SimpleNamespace(pid=11, info={"name": "chrome.exe",
+                                                    "memory_info": mi})
+        denied = types.SimpleNamespace(pid=12, info={"name": "svchost.exe",
+                                                      "memory_info": None})
+
+        class _Gone:
+            pid = 13
+
+            @property
+            def info(self):
+                raise mod.psutil.NoSuchProcess(13)
+
+        with mock.patch.object(mod.psutil, "process_iter",
+                               return_value=[good, denied, _Gone()]):
+            self.assertEqual(mod._psutil_process_memory(),
+                             [(11, "chrome.exe", 3 * _GB)])
+        with mock.patch.object(mod.psutil, "process_iter",
+                               side_effect=RuntimeError("boom")):
+            self.assertEqual(mod._psutil_process_memory(), [])
+        with mock.patch.object(mod, "_HAS_PSUTIL", False):
+            self.assertEqual(mod._psutil_process_memory(), [])
+
+    def test_falls_back_to_psutil_without_the_nt_table(self):
+        rows = [(1, "chrome.exe", _GB)]
+        with mock.patch.object(self.mod, "_nt_process_memory",
+                               return_value=None), \
+             mock.patch.object(self.mod, "_psutil_process_memory",
+                               return_value=rows):
+            self.assertEqual(self.mod._read_process_memory(), rows)
+
+    @unittest.skipUnless(sys.platform == "win32", "NT process table")
+    def test_nt_table_matches_psutil_for_this_process(self):
+        import psutil
+        rows = self.mod._nt_process_memory()
+        self.assertTrue(rows)
+        mine = [r for r in rows if r[0] == os.getpid()]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(mine[0][1].lower(),
+                         psutil.Process().name().lower())
+        rss = psutil.Process().memory_info().rss
+        self.assertLess(abs(mine[0][2] - rss), max(32 * 1024 * 1024, rss // 5))
+
+    def test_nt_table_off_windows_is_none(self):
+        with mock.patch.object(self.mod.sys, "platform", "linux"):
+            self.assertIsNone(self.mod._nt_process_memory())
+
+    def test_turn_words_reads_the_monolith_and_never_raises(self):
+        fake = types.ModuleType("fake_main")
+        fake._turn_user_text = lambda: "  why is the ram so high?  "
+        with mock.patch.dict(sys.modules, {"__main__": fake}):
+            self.assertEqual(self.mod._turn_words(), "why is the ram so high?")
+        broken = types.ModuleType("broken_main")
+        with mock.patch.dict(sys.modules, {"__main__": broken,
+                                           "bobert_companion": broken}):
+            self.assertEqual(self.mod._turn_words(), "")
+
+    def test_asks_about_memory(self):
+        for said in ("Jarvis, why is the ram so high?",
+                     "what's using all my memory", "RAM usage?"):
+            self.assertTrue(self.mod._asks_about_memory(said), said)
+        for said in ("status report", "how's the gram of salt", "", None):
+            self.assertFalse(self.mod._asks_about_memory(said), said)
+
 if __name__ == "__main__":
     unittest.main()

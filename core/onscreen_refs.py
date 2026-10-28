@@ -647,21 +647,69 @@ _CLAUDE_NOTE_DIRECT_RE = re.compile(
 # Live 2026-10-26 20:07: "Jarvis passed it over to Claude. It already knows
 # how." (Whisper's "passed" for "pass", and a sentence after it) ran a
 # web_search instead: the past-tense verbs and a trailing sentence count too.
+# Live 2026-10-28 15:58: "No, just pass over to Clog for me." (Parakeet's
+# "Clog" for "Claude", no object pronoun, a "for me" tail) matched nothing:
+# the brain sent [ACTION: browser_task, pass over to Clog] and the browser
+# agent searched DuckDuckGo for "Clog" for ~47 s. The object is optional now,
+# a courtesy tail (for me / please / now / as well / too) may follow, and
+# the STT's own mishearings of "Claude" count, but ONLY here, as the last
+# word of the hand-off frame. Each was heard for "Claude" in the owner's
+# logs (2026-10-02..10-28: clog x1 in this very hand-off, claw x2, clawed x2,
+# claud x1). NOT "cloud": no log has Claude heard that way, and "send it /
+# upload that / back it up to the cloud" (Nextcloud, iCloud) is his real
+# meaning. Not "clogged" either (a real word for a 3D-printer nozzle; its one
+# sighting was a window name, not a hand-off). "The nozzle is about to clog"
+# / "clear the clog" have no hand-off verb, so they never reach the frame.
+_CLAUDE_HEARD_AS = r"(?:claude|clog|claw|clawed|claud)"
 _CLAUDE_PASS_RE = re.compile(
     r"\b(?:pass|passed|send|sent|forward|forwarded|hand|handed|give|gave|"
     r"relay|relayed)\s+"
-    r"(?:that|this|it|them|those|these|all\s+(?:of\s+)?(?:that|this))\s+"
-    r"(?:over\s+|along\s+|on\s+)?to\s+claude\b"
-    r"(?:\s+(?:as\s+well|too|also))?(?:[\s.!?]*$|[.!?]\s+.*$)", re.IGNORECASE)
+    r"(?:(?P<obj>that|this|it|them|those|these|everything|"
+    r"all\s+(?:of\s+)?(?:that|this))\s+)?"
+    r"(?:over\s+|along\s+|on\s+)?to\s+" + _CLAUDE_HEARD_AS + r"\b"
+    r"(?:[\s,]+(?:as\s+well|too|also|for\s+me|please|now|right\s+now|"
+    r"instead|then|sir|jarvis))*"
+    r"(?:[\s.!?]*$|[.!?]\s+.*$)", re.IGNORECASE)
 _PASS_REFERS_BACK = ("what I asked just before this (the session log at this "
                      "note has the conversation)")
+# What may stand before the hand-off and still say nothing of its own: "No,
+# just pass over to Claude" is the hand-off of the PREVIOUS request, not a
+# note reading "No, just" (2026-10-28).
+_PASS_FILLER_RE = re.compile(
+    r"^(?:(?:no|nope|nah|yes|yeah|yep|ok|okay|actually|just|instead|well|um|"
+    r"uh|so|and|or|then|now|please|sir|jarvis|hey|rather|also|can\s+you|"
+    r"could\s+you|would\s+you|will\s+you|go\s+ahead\s+and)[\s,.;:!?-]*)*$",
+    re.IGNORECASE)
+# "What did you send to Claude?" / "Have you passed it to Claude?" ask about a
+# hand-off; they are not one. Review 2026-10-28: once the object went optional,
+# "What gets sent to Claude?", "Is it sent to Claude?", "Do you send everything
+# to Claude?" and "Can I send to Claude?" became notes reading "What gets" /
+# "Is it" / "Do you" / "Can I". A passive word right before the verb, or
+# do / should / may + a pronoun, asks too. "Can / could / will / would YOU
+# pass it to Claude" stays a request.
+_PASS_ASKED_RE = re.compile(
+    r"(?:\b(?:did|didn't|have|haven't|has|hasn't|had|was|were|what|why|who|"
+    r"how|when|where|do|does|don't|doesn't|should|shall|may|might)\s+"
+    r"(?:you|i|we|he|it|jarvis)"
+    r"|\b(?:can|could|will|would)\s+(?:i|we|he|it|jarvis)"
+    r"|\b(?:is|was|were|are|be|been|being|get|gets|got))"
+    r"(?:\s+(?:just|already|ever|really|actually|all|always))?\s*$",
+    re.IGNORECASE)
+# With no object ("pass over to Claude") the hand-off is claimed only when it
+# opens the turn, follows filler, or follows a finished clause or "or (just)".
+# Review 2026-10-28: "I'm looking forward to Claude." noted "I'm looking".
+_PASS_CLAUSE_END_RE = re.compile(
+    r"(?:[.!?]|\b(?:or|and)(?:\s+just)?)[\s,]*$", re.IGNORECASE)
 # "Put my hours in for me, or tell Claude to DO IT" (live 2026-10-26 20:06):
 # the task is the clause before the hand-off.
 _CLAUDE_DO_IT_RE = re.compile(
     r"^(?:do|handle|take\s+care\s+of|deal\s+with|sort\s+out)\s+"
     r"(?:it|that|this|them)\b[\s.!?]*$", re.IGNORECASE)
+# "and then" / "so then" go together (review 2026-10-28: "Research the bug
+# and then pass it to Claude" noted "Research the bug and").
 _BEFORE_TELL_RE = re.compile(
-    r"[\s,;:-]*(?:\b(?:or|and|so|then)\s+)?(?:just\s+)?$", re.IGNORECASE)
+    r"[\s,;:-]*(?:\b(?:or|and|so)\s+)?(?:\bthen\s+)?(?:just\s+)?$",
+    re.IGNORECASE)
 _TASK_VERB_RE = re.compile(
     r"\b(?:research|fix|fixes|fixing|look\s+into|work\s+on|improve|change|add|"
     r"make|build|learn|study|investigate|figure\s+out|debug|update|check|"
@@ -703,10 +751,20 @@ def claude_note(text) -> "str | None":
         if not s or _CLAUDE_EXCLUDE_RE.search(s) or _ASK_QUESTION_RE.match(s):
             return None
         m = _CLAUDE_PASS_RE.search(s)
+        if m and _PASS_ASKED_RE.search(s[:m.start()]):
+            return None
         if m:
             before = s[:m.start()].strip(" ,.;:!?")
             before = re.sub(r"^(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*",
                             "", before, flags=re.IGNORECASE).strip()
+            if _PASS_FILLER_RE.match(before):
+                return _PASS_REFERS_BACK
+            if not m.group("obj") and not _PASS_CLAUSE_END_RE.search(
+                    s[:m.start()]):
+                return None
+            # "Find the manual, or just pass it to Claude": the note is the
+            # task, without its "or just".
+            before = _BEFORE_TELL_RE.sub("", before + " ").strip(" ,.;:!?")
             return before or _PASS_REFERS_BACK
         m = _CLAUDE_NOTE_DIRECT_RE.search(s)
         if m:

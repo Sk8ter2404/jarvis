@@ -242,6 +242,107 @@ class ClaudeNoteTests(unittest.TestCase):
                 self.assertFalse(pred(t), t)
 
 
+# Live 2026-10-28 15:58 (session_2026-10-28_12-55-29.log): JARVIS had just
+# asked "shall I read them to you?" about a manual search; Parakeet heard
+# "Claude" as "Clog" and the brain sent [ACTION: browser_task, pass over to
+# Clog] - ~47 s of DuckDuckGo-ing "Clog", then "'Clog' is a bit too vague".
+LIVE_HANDOFF = "No, just pass over to Clog for me."
+LIVE_HANDOFF_BRAIN = "[ACTION: browser_task, pass over to Clog]"
+
+
+class ClaudeHandOffPhrasingTests(unittest.TestCase):
+    """Through core.dispatcher.screen_route, the route the live turn asks
+    before the brain (bobert_companion._utterance_route_reply ->
+    _screen_route_reply -> screen_route -> claude_note)."""
+    REFERS_BACK = f"[ACTION: note_for_claude, {O._PASS_REFERS_BACK}]"
+    HANDOFFS = (
+        LIVE_HANDOFF, "No, just pass over to Claude for me.",
+        "just pass it over to Claude for me", "hand this to Claude please",
+        "send that over to Claude now", "pass it on to Claude for me please",
+        # the shapes that already worked keep working
+        "Pass it over to Claude.", "pass that over to Claude as well.",
+        "Jarvis, pass that to Claude.", "send this to Claude too",
+        "forward all of that to Claude",
+        # the STT's other hearings of "Claude" in his logs, in the frame
+        "hand it over to clawed", "send that to Claw please",
+        "pass it along to Claud",
+    )
+
+    def test_the_owners_hand_offs_refer_back_to_the_last_request(self):
+        for said in self.HANDOFFS:
+            with self.subTest(said=said):
+                self.assertEqual(screen_route(said, {}), self.REFERS_BACK)
+
+    def test_a_task_before_the_hand_off_is_the_note(self):
+        self.assertEqual(O.claude_note("Find the original manual, or just pass "
+                                       "it over to Claude for me."),
+                         "Find the original manual")
+        self.assertEqual(O.claude_note(
+            "Jarvis, I want you to be able to do all this stuff that I'm "
+            "saying. Pass that over to Claude as well."),
+            "I want you to be able to do all this stuff that I'm saying")
+        # Review 2026-10-28: "and then" left a dangling "and" in the note.
+        for said in ("Research the bug and then pass it to Claude.",
+                     "Research the bug, and then send it to Claude."):
+            with self.subTest(said=said):
+                self.assertEqual(O.claude_note(said), "Research the bug")
+                self.assertEqual(screen_route(said, {}),
+                                 "[ACTION: note_for_claude, Research the bug]")
+
+    def test_his_printer_and_cloud_words_keep_their_meaning(self):
+        # He 3D-prints (nozzle clogs) and uses Nextcloud / iCloud: outside the
+        # hand-off frame these are never notes for Claude.
+        for said in ("the nozzle is about to clog", "clear the clog",
+                     "is it clogged", "is the hotend clogged again",
+                     "give it time to clog", "the nozzle keeps starting to clog",
+                     "send it to the cloud", "upload that to the cloud",
+                     "back it up to the cloud", "send it to cloud",
+                     "pass it over to the cloud", "save this to iCloud",
+                     "sync it to Nextcloud", "send it to clogged"):
+            with self.subTest(said=said):
+                self.assertIsNone(O.claude_note(said))
+                self.assertIsNone(screen_route(said, {}))
+
+    def test_asking_about_a_hand_off_is_not_one(self):
+        for said in ("what did you send to Claude?",
+                     "have you passed it to Claude", "did you pass that to "
+                     "Claude?", "pass that to Claude Code"):
+            with self.subTest(said=said):
+                self.assertIsNone(O.claude_note(said))
+
+    # Review 2026-10-28: with the object optional these became notes reading
+    # "What gets" / "Is it" / "Do you" / "I'm looking" before the brain ran.
+    LIVE_NOT_HANDOFFS = (
+        "What gets sent to Claude?", "Is it sent to Claude?",
+        "That was sent to Claude.", "Can I send to Claude?",
+        "It was already sent to Claude.", "Which ones were sent to Claude?",
+        "Do you send everything to Claude?", "How much do you send to Claude?",
+        "Show me what was sent to Claude.", "I'm looking forward to Claude.",
+    )
+
+    def test_questions_and_statements_about_claude_stay_with_the_brain(self):
+        for said in self.LIVE_NOT_HANDOFFS:
+            with self.subTest(said=said):
+                self.assertIsNone(screen_route(said, {}))
+
+    def test_requests_and_finished_clauses_still_hand_off(self):
+        for said in ("Can you pass that over to Claude?",
+                     "Could you just send it to Claude please",
+                     "Jarvis, pass over to Claude."):
+            with self.subTest(said=said):
+                self.assertEqual(screen_route(said, {}), self.REFERS_BACK)
+        self.assertEqual(screen_route("Find the manual. Pass over to Claude.",
+                                      {}),
+                         "[ACTION: note_for_claude, Find the manual]")
+        self.assertEqual(screen_route("Find the manual, or just pass over to "
+                                      "Claude for me.", {}),
+                         "[ACTION: note_for_claude, Find the manual]")
+
+    def test_the_router_gate_sees_the_live_hand_off(self):
+        self.assertTrue(PR._developer_note_request(LIVE_HANDOFF))
+        self.assertFalse(PR._developer_note_request("clear the clog"))
+
+
 class ScreenRouteTests(unittest.TestCase):
     def test_whole_click_request(self):
         self.assertEqual(screen_route("click that MrBeast video", {}),

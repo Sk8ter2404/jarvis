@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.5 (2026-10-28)
+
+'Pass it over to Claude' and the RAM answer, from this afternoon's live log. At 15:58 'No, just pass over to Clog for me' was misheard and matched nothing, so a browser robot searched the web for 'Clog' for 47 seconds. The hand-off now needs no 'it', allows 'for me', 'please' or 'now' at the end, and accepts the speech-to-text's own mishearings of Claude (clog, claw, clawed, claud) only inside the hand-off phrase, so nozzle clogs and 'send it to the cloud' keep their meaning. Questions about a hand-off ('what did you send to Claude?') are no longer taken as one, and a bare hand-off that still reaches the browser robot gets a quick question instead of a web search. 'Why is the RAM so high?' no longer answers 'All systems nominal' at 92 percent: an asked-for system report opens with the reading that is out of line and names the biggest memory users (for example: my local brain model at 8 gigabytes, Claude at 6.5 and Chrome at 4.5); JARVIS's own GPU use is not reported as a problem, and the PC check names the memory users too.
+
 ## v3.0.4 (2026-10-28)
 
 Morning greeting and printer speech, from today's live log. The morning greeting no longer opens with the Amazon tracker's sign-in command ('Good morning, sir. I need a Google sign-in first, sir. Run python -m ...'); every arrival since 10-13 had. With the mailbox unreadable it says nothing about orders, and any briefing section that reads like setup instructions is left out. The print heads-up no longer says 'past UNKNOWN prints around this size have failed 33% of the time': with neither the material nor the size known there is no heads-up, and materials are said properly ('PLA plus', 'of about 220 layers'). A print failure or a low credit balance is said alone, without 'CPU 38 percent ... 12 windows open' behind it.

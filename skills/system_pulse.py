@@ -6,7 +6,10 @@ Actions:
                   GPU utilization, disk free, network throughput, battery,
                   system uptime, active-window count, Bambu print status, and
                   Anthropic credit balance, then renders a JARVIS-cadence
-                  sentence ending with "Anything further?".
+                  sentence ending with "Anything further?". An abnormal
+                  reading leads instead of "All systems nominal", and high
+                  (or asked-about) memory names the biggest memory users
+                  (_on_demand_report, live 2026-10-28 15:59:28).
 
 Proactive thread:
   Every PULSE_PROACTIVE_INTERVAL_SECONDS (default 15 min) the same readings
@@ -37,6 +40,7 @@ Why not just reuse skills/system_monitor?
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -502,17 +506,22 @@ def _fmt_bambu(b: dict) -> str:
 
 
 def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
-                   proactive: bool = False) -> str:
+                   proactive: bool = False, mem_users: list | None = None) -> str:
     """Render the JARVIS-cadence pulse sentence. If `lead` is non-empty, it
     replaces the default 'All systems nominal' opener (used when an
-    abnormality forced the proactive announcement).
+    abnormality forced the proactive announcement, and by _on_demand_report
+    when an asked-for pulse has an abnormal reading).
 
     `lead_key` (an _abnormal_reasons key) names the metric the lead already
     states; the body then leaves that metric out instead of saying it twice
     ("GPU pinned at 100 percent ... GPU working hard at 100 percent").
     `proactive` drops the closing "Anything further?": an unprompted line must
     not end with a question nobody asked for (in wake-word mode it cannot be
-    answered, and the drain records it in the conversation as one)."""
+    answered, and the drain records it in the conversation as one).
+    `mem_users` ([(spoken name, GB)] from _memory_users) adds the sentence
+    naming the biggest memory users: straight after a memory lead (it is the
+    answer to "why"), else after the readings. None/empty: no sentence (the
+    proactive path never passes it, so its lines are unchanged)."""
     cpu = pulse.get("cpu_pct", 0.0)
     ram = pulse.get("ram_pct", 0.0)
     gpu_util = pulse.get("gpu_util_pct")
@@ -562,6 +571,12 @@ def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
         tail_pieces.append(f"Anthropic credit balance: ${credits:.2f}.")
     tail = " " + " ".join(tail_pieces) if tail_pieces else ""
     closer = "" if proactive else " Anything further?"
+
+    users = _memory_users_sentence(mem_users) if mem_users else ""
+    if users and said == "ram":
+        opener = f"{opener} {users}"
+    elif users:
+        middle = f"{middle} {users}" if middle else users
 
     return " ".join(f"{opener} {middle}{tail}{closer}".split())
 
@@ -654,6 +669,301 @@ def _abnormal_reasons(pulse: dict) -> list[tuple[str, str]]:
         peak = max(down, up) / 1024
         reasons.append(("network", f"Notable network activity, sir — sustained {peak:.0f} megabytes per second."))
     return reasons
+
+
+# ─── the asked-for pulse, and who is using the memory (2026-10-28) ───────
+# Live 2026-10-28 15:59:11 system_monitor said "Sir, memory usage is at 92
+# percent. Things may start swapping shortly." At 15:59:28 "Jarvis, why is the
+# ram so high?" -> [ACTION: system_pulse] -> "All systems nominal, sir. CPU 38
+# percent at 60 degrees, memory 92 percent, GPU running at 8 percent, 12
+# windows open. ..." - 92 % is over this pulse's own RAM_ABNORMAL_PCT, yet the
+# asked-for report opened "nominal" (only the proactive path passed a lead) and
+# never said why. The real users then, grouped by app (working set): the
+# local model's llama-server 8.0 GB, claude 6.7, chrome 4.5, pythonw 4.3
+# (JARVIS itself among them), bztransmit (Backblaze) 4.2, msedgewebview2 3.0.
+# Now an asked-for pulse opens with its first abnormal reading, worded as the
+# proactive line is, and a high (or asked-about) memory reading names the top
+# users. check_system is a hidden duplicate of system_pulse in the prompt
+# index (core/action_aliases.HIDDEN_DUPLICATES) and the preemptive "memory is
+# at N%" claim injects system_pulse, so every RAM question ends up here.
+MEM_USERS_TOP    = 3       # name at most this many apps
+MEM_USER_MIN_GB  = 1.0     # an app under a gigabyte does not explain high RAM
+
+# The owner's words (or the action's argument) ask about the memory itself:
+# then the users are named even under RAM_ABNORMAL_PCT ("what's using all my
+# memory" at 80 %).
+_ASKS_ABOUT_MEMORY_RE = re.compile(r"\b(?:ram|memory)\b", re.IGNORECASE)
+
+# Image stem (lower-case, no ".exe") -> how he would say it, GROUPED by app
+# (27 chrome.exe processes are one "Chrome"). Plural group names on purpose
+# ("Edge web views"): this names an app's whole footprint, unlike
+# system_monitor._FRIENDLY_PROCESS_NAMES, which names ONE CPU culprit.
+_MEM_APP_NAMES = {
+    # Ollama's model runner = JARVIS's own local brain (gemma4:26b live).
+    "llama-server": "my local brain model",
+    "llama_server": "my local brain model",
+    "ollama": "my local brain model",
+    "ollama_llama_server": "my local brain model",
+    "claude": "Claude",
+    "chrome": "Chrome",
+    "msedge": "Edge",
+    "msedgewebview2": "Edge web views",
+    "firefox": "Firefox",
+    "bztransmit": "Backblaze",
+    "bztransmit64": "Backblaze",
+    "bzserv": "Backblaze",
+    "bzbui": "Backblaze",
+    "bzfilelist": "Backblaze",
+    "bambu-studio": "Bambu Studio",
+    "bambustudio": "Bambu Studio",
+    "python": "Python",
+    "pythonw": "Python",
+    "code": "VS Code",
+    "explorer": "File Explorer",
+    "dwm": "the desktop compositor",
+    "msmpeng": "Windows Defender",
+    "searchindexer": "Windows Search",
+    "vmmem": "the WSL virtual machine",
+    "vmmemwsl": "the WSL virtual machine",
+    "obs64": "OBS",
+    "discord": "Discord",
+    "steamwebhelper": "Steam",
+    "steam": "Steam",
+    "spotify": "Spotify",
+    "nextcloud": "Nextcloud",
+    "onedrive": "OneDrive",
+    "ms-teams": "Teams",
+    "fortniteclient-win64-shipping": "Fortnite",
+}
+_MEM_SELF_NAME = "my own process"
+# Not an app he can do anything about. "Memory Compression" holds OTHER apps'
+# compressed pages - a symptom of the pressure, not a cause; the rest are the
+# kernel's own (pid 0 has no image name).
+_MEM_SKIP = frozenset({"", "memory compression", "system idle process",
+                       "idle", "system", "secure system", "registry"})
+
+
+def _turn_words() -> str:
+    """The owner's words this turn ("" outside a turn, a proactive dispatch,
+    or with no monolith loaded), as skills/face_id.py reads them. Never
+    raises."""
+    try:
+        bc = sys.modules.get("__main__") or sys.modules.get("bobert_companion")
+        said = getattr(bc, "_turn_user_text")()
+    except Exception:
+        return ""
+    return said.strip() if isinstance(said, str) else ""
+
+
+def _asks_about_memory(text: str) -> bool:
+    try:
+        return bool(_ASKS_ABOUT_MEMORY_RE.search(text or ""))
+    except Exception:
+        return False
+
+
+def _nt_process_memory() -> list | None:
+    """[(pid, image_name, working_set_bytes)] for EVERY process from ONE
+    NtQuerySystemInformation(SystemProcessInformation) call (~6 ms), or None
+    when that is unavailable (not 64-bit Windows, an error). psutil cannot be
+    the fast path here: from JARVIS's unelevated process memory_info() is
+    AccessDenied for ~half the processes (services, Backblaze's bztransmit
+    among them), and psutil's fallback re-snapshots the whole system for EACH
+    one - 740 ms for 378 processes measured 2026-10-28, on the voice thread.
+    The struct is winternl.h's SYSTEM_PROCESS_INFORMATION (x64 offsets:
+    ImageName 56, UniqueProcessId 80, WorkingSetSize 144); checked against
+    psutil rss on 381 processes. Never raises."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        import struct
+        if ctypes.sizeof(ctypes.c_void_p) != 8:
+            return None
+        fn = ctypes.WinDLL("ntdll").NtQuerySystemInformation
+        fn.restype = ctypes.c_long
+        fn.argtypes = [ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong,
+                       ctypes.POINTER(ctypes.c_ulong)]
+        size = 1 << 20
+        buf = None
+        for _ in range(6):
+            buf = ctypes.create_string_buffer(size)
+            need = ctypes.c_ulong(0)
+            status = fn(5, buf, size, ctypes.byref(need))   # SystemProcessInformation
+            if status == 0:
+                break
+            if (status & 0xFFFFFFFF) != 0xC0000004:          # not "buffer too small"
+                return None
+            size = max(size * 2, int(need.value) + 65536)
+        else:
+            return None
+        raw = buf.raw
+        base = ctypes.addressof(buf)
+        out: list = []
+        off = 0
+        for _ in range(100_000):
+            if off + 152 > len(raw):
+                break
+            nxt = struct.unpack_from("<I", raw, off)[0]
+            name_len = struct.unpack_from("<H", raw, off + 56)[0]
+            name_ptr = struct.unpack_from("<Q", raw, off + 64)[0]
+            pid = struct.unpack_from("<Q", raw, off + 80)[0]
+            wset = struct.unpack_from("<Q", raw, off + 144)[0]
+            name = ""
+            start = name_ptr - base
+            if name_len and 0 <= start and start + name_len <= len(raw):
+                name = raw[start:start + name_len].decode("utf-16-le", "replace")
+            out.append((int(pid), name, int(wset)))
+            if not nxt:
+                break
+            off += nxt
+        return out or None
+    except Exception:
+        return None
+
+
+def _psutil_process_memory() -> list:
+    """[(pid, name, working_set_bytes)] via psutil (the slow, portable path;
+    processes it cannot read are skipped). [] when unavailable. Never raises."""
+    if not _HAS_PSUTIL:
+        return []
+    out: list = []
+    try:
+        for p in psutil.process_iter(["name", "memory_info"]):
+            try:
+                info = p.info or {}
+                mi = info.get("memory_info")
+                if mi is None:            # AccessDenied -> ad_value None
+                    continue
+                out.append((int(p.pid), str(info.get("name") or ""),
+                            int(mi.rss)))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception:
+                continue
+    except Exception:
+        return out
+    return out
+
+
+def _read_process_memory() -> list:
+    """Every process's (pid, name, working_set_bytes): the one-call NT
+    snapshot, else psutil. Never raises."""
+    rows = _nt_process_memory()
+    return rows if rows else _psutil_process_memory()
+
+
+def _mem_app_name(name: str) -> str:
+    """The spoken app name for a process image, "" for one to leave out."""
+    stem = (name or "").strip()
+    if stem.lower().endswith(".exe"):
+        stem = stem[:-4]
+    key = stem.lower()
+    if key in _MEM_SKIP:
+        return ""
+    if key in _MEM_APP_NAMES:
+        return _MEM_APP_NAMES[key]
+    if stem.islower():
+        stem = stem[:1].upper() + stem[1:]
+    return stem
+
+
+def _memory_users(procs=None, *, own_pid: int | None = None,
+                  top: int = MEM_USERS_TOP) -> list:
+    """[(spoken app name, GB)] for the `top` apps holding the most RAM,
+    biggest first, each at least MEM_USER_MIN_GB. `procs` is an injected
+    [(pid, name, working_set_bytes)] (tests); None reads the live table.
+
+    The metric is the WORKING SET (psutil rss): the pages actually in RAM,
+    which is what the memory percent measures and what Task Manager's Memory
+    column shows. Private bytes is commit - what an app has promised, much of
+    it paged out or never touched (llama-server 26 GB private against 8 GB
+    resident at 15:59) - so it answers "why is the commit charge high", not
+    "why is the RAM high". Summed working sets double-count pages an app's
+    processes share; fine for ranking, and the sizes are spoken rounded.
+    JARVIS's own pid is "my own process", apart from other Python. Never
+    raises."""
+    try:
+        rows = _read_process_memory() if procs is None else procs
+        own = os.getpid() if own_pid is None else int(own_pid)
+        totals: dict = {}
+        for row in rows or ():
+            try:
+                pid, name, wset = int(row[0]), str(row[1] or ""), float(row[2])
+            except Exception:
+                continue
+            label = _MEM_SELF_NAME if pid == own else _mem_app_name(name)
+            if not label or wset <= 0:
+                continue
+            totals[label] = totals.get(label, 0.0) + wset
+        ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+        out = [(label, b / (1024 ** 3)) for label, b in ranked]
+        return [(label, gb) for label, gb in out
+                if gb >= MEM_USER_MIN_GB][:max(0, int(top))]
+    except Exception:
+        return []
+
+
+def _speak_gb(gb: float) -> str:
+    """A size said aloud: the nearest half gigabyte under 10 ("6.5", "8"),
+    whole gigabytes from 10."""
+    if gb >= 9.75:
+        return f"{gb:.0f}"
+    half = round(gb * 2) / 2
+    return f"{half:.0f}" if half == int(half) else f"{half:.1f}"
+
+
+def _memory_users_sentence(users) -> str:
+    """"The biggest memory users are my local brain model at 8 gigabytes,
+    Claude at 6.5 and Chrome at 4.5." ("" for none). Never raises."""
+    try:
+        bits = []
+        for i, (label, gb) in enumerate(users or ()):
+            size = _speak_gb(float(gb))
+            if i == 0:
+                size += " gigabyte" if size == "1" else " gigabytes"
+            bits.append(f"{label} at {size}")
+        if not bits:
+            return ""
+        if len(bits) == 1:
+            return f"The biggest memory user is {bits[0]}."
+        listed = ", ".join(bits[:-1]) + " and " + bits[-1]
+        return f"The biggest memory users are {listed}."
+    except Exception:
+        return ""
+
+
+def _on_demand_report(pulse: dict, said: str = "", *, procs=None,
+                      own_pid: int | None = None) -> str:
+    """The asked-for pulse. With an abnormal reading (by _abnormal_reasons)
+    it opens with that reading's own line instead of "All systems nominal" -
+    a reading of this PC first, the memory one when he asked about memory -
+    and the body leaves that metric out. High RAM, or `said` (his words plus
+    the action argument) asking about memory, adds the biggest memory users.
+    Keeps the closing offer: he asked. Never raises (falls back to the plain
+    report)."""
+    try:
+        # Never the 'gpu' reason: during an asked-for turn JARVIS's own model
+        # is by definition busy (transcribing / answering this very turn), and
+        # "GPU pinned at 99 percent" is the 09-29/10-02 false alarm below. The
+        # body still says "GPU working hard at N percent", as in 3.0.4.
+        reasons = [r for r in _abnormal_reasons(pulse) if r[0] != "gpu"]
+        asked_memory = _asks_about_memory(said)
+        lead_key, lead = "", ""
+        if reasons:
+            by_key = dict(reasons)
+            pc = [r for r in reasons if r[0] not in _NEWS_LEADS]
+            if asked_memory and "ram" in by_key:
+                lead_key, lead = "ram", by_key["ram"]
+            else:
+                lead_key, lead = (pc or reasons)[0]
+        users = None
+        if asked_memory or pulse.get("ram_pct", 0.0) >= RAM_ABNORMAL_PCT:
+            users = _memory_users(procs, own_pid=own_pid)
+        return _format_report(pulse, lead=lead, lead_key=lead_key,
+                              mem_users=users)
+    except Exception:
+        return _format_report(pulse)
 
 
 # ─── JARVIS's own GPU load (2026-09-29) ─────────────────────────────────
@@ -942,7 +1252,7 @@ def _proactive_loop() -> None:
 # ─── action registration ─────────────────────────────────────────────────
 
 def register(actions):
-    def system_pulse(_: str = "") -> str:
+    def system_pulse(arg: str = "") -> str:
         try:
             pulse = None
             with _pulse_cache_lock:
@@ -957,7 +1267,10 @@ def register(actions):
                 # Cache empty/stale (first call before the loop has run) —
                 # fall back to a live gather.
                 pulse = _gather_pulse()
-            return _format_report(pulse)
+            # Not _format_report(pulse): that opened "All systems nominal"
+            # at 92 % memory (live 2026-10-28 15:59:28, see _on_demand_report).
+            said = f"{_turn_words()} {arg if isinstance(arg, str) else ''}"
+            return _on_demand_report(pulse, said)
         except Exception as e:
             return f"system pulse failed: {e}"
 

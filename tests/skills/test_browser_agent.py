@@ -340,6 +340,35 @@ class IntentAndGuardThroughActionsTests(unittest.TestCase):
         self.assertEqual(out, self.mod._SSRF_REFUSAL)
         runner.assert_not_called()   # refused before ever submitting
 
+    def test_a_bare_hand_off_asks_instead_of_browsing(self):
+        # Live 2026-10-28 15:58: [ACTION: browser_task, pass over to Clog]
+        # (the STT's "Clog" for "Claude") DuckDuckGo-ed "Clog" for ~47 s.
+        for task in ("pass over to Clog", "No, just pass over to Clog for me.",
+                     "send it to Claude please", "hand that over to my boss"):
+            with self.subTest(task=task), \
+                 mock.patch.object(self.mod, "is_available", return_value=True), \
+                 mock.patch.object(self.mod, "_ssrf_guard", return_value=None), \
+                 mock.patch.object(self.mod, "_run_task_sync") as runner:
+                out = self.actions["browser_task"](task)
+                runner.assert_not_called()
+                self.assertIn("pass that over to Claude", out)
+        self.assertIn("'Clog'", self.mod._handoff_guard("pass over to Clog"))
+        self.assertNotIn("not sure who",
+                         self.mod._handoff_guard("send it to Claude please"))
+
+    def test_a_real_task_still_browses(self):
+        for task in ("book me a haircut Friday afternoon", "send flowers to mom",
+                     "go to amazon.com and add it to my cart",
+                     "forward this to john@example.com",
+                     "give me directions to the store"):
+            with self.subTest(task=task), \
+                 mock.patch.object(self.mod, "is_available", return_value=True), \
+                 mock.patch.object(self.mod, "_ssrf_guard", return_value=None), \
+                 mock.patch.object(self.mod, "_run_task_sync",
+                                   return_value="done") as runner:
+                self.assertEqual(self.actions["browser_task"](task), "done")
+                runner.assert_called_once()
+
     def test_book_appointment_prefixes_task(self):
         captured = {}
 
