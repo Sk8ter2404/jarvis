@@ -14,7 +14,7 @@ cases):
   * safety-03 "turn it off" -> game_mode_off.
 
 ``check(user_text, name, arg, prior_actions)`` is pure: it returns None when
-the action fits, else a short reason. Three rules only:
+the action fits, else a short reason. Four rules only:
 
   1. A list / status action when the owner gave an on / off / set / dim /
      turn command (and asked for no list or status in the same breath, and
@@ -28,6 +28,12 @@ the action fits, else a short reason. Three rules only:
      "that's not", "wrong", "I said", "... though"). Running a read-only
      check again only repeats the answer he just corrected. A control action
      repeated after a correction is a retry and is never flagged.
+  4. A face look (recognize_face and its aliases) when the owner's words do
+     not ask who someone is, to recognise / see / look at someone, or
+     whether anyone is there. Live 2026-10-27 20:38:11, right after several
+     desk-robot turns, "He does not sound happy." (about the robot) ran
+     recognize_face and "That's you, sir." was spoken. The handler
+     (skills/face_id.whoami) applies the same test live, whatever the mode.
 
 No owner words (a proactive dispatch) never flags. Never raises: any fault
 reads as "fits".
@@ -119,6 +125,41 @@ _RECHECK_RE = re.compile(
     r"\bagain\b|\bre-?check|\brefresh|\bre-?run\b|\bone more time\b", re.I)
 
 
+# ── Rule 4: a face look the owner's words do not ask for ────────────────────
+# recognize_face is a LIVE CAMERA LOOK (the always-on local guard lists it
+# beside "who's here"), so the brain reached for it on a remark about a
+# third person's mood: 2026-10-27 "He does not sound happy." -> "That's you,
+# sir.". It fits only when the owner asks WHO (who / whom / whose), to
+# recognise / identify / see / look at someone or a face, or whether anyone
+# is there / in frame. skills/face_id.whoami calls asks_face_look too.
+FACE_LOOK_ACTIONS = frozenset({
+    "recognize_face", "whoami", "who_am_i", "do_you_recognize_me",
+    "whos_at_the_desk",
+})
+_FACE_LOOK_RE = re.compile(
+    r"\bwho(?:m|se|'?s|'?re)?\b|\brecogni[sz]\w*|\bidentif\w*|\bfaces?\b"
+    r"|\b(?:see|seeing|sees|look at|looking at|spot|know)\s+(?:me|us|him|"
+    r"her|them|anyone|anybody|someone|somebody)\b"
+    r"|\b(?:anyone|anybody|someone|somebody)\b"
+    r"|\b(?:it'?s|that'?s|is it|is that|is this) me\b"
+    r"|\bin (?:the )?frame\b|\bin front of\b|\bcamera\b|\bwebcam\b"
+    # "is my brother here?", "is she at the desk?", and a re-ask right after
+    # a face answer ("try again", "check again").
+    r"|\b(?:is|are)\s+\w+(?:\s+\w+)?\s+(?:here|there|in the room|"
+    r"at (?:the|my) desk)\b|\bagain\b|\bre-?check\b", re.I)
+
+
+def asks_face_look(user_text) -> bool:
+    """True when the owner's words ask for a face look: who someone is, to
+    recognise / see / look at a person or face, or whether anyone is there.
+    "He does not sound happy." and "she seems upset" are not. Never
+    raises."""
+    try:
+        return _FACE_LOOK_RE.search(_norm(user_text)) is not None
+    except Exception:
+        return False
+
+
 def _asks_fresh_reading(text: str) -> bool:
     """True when the owner asks for the reading again: a re-check word, or
     the turn ends on a question ("is it still up?", "is it working now?")."""
@@ -189,6 +230,11 @@ def check(user_text, name, arg="",
             return (f"not run: {nm} swaps the brain and the cameras (game "
                     f"mode), and sir said nothing about a game, a mode or "
                     f"power")
+        # Rule 4: a face look when sir asked nobody's name or face.
+        if nm in FACE_LOOK_ACTIONS and not asks_face_look(text):
+            return (f"not run: {nm} looks through the webcam to say who is "
+                    f"there, and sir asked nothing about who someone is or "
+                    f"a face")
         if not is_status_action(nm):
             return None
         # Rule 1: a list / status action for a command that changes things.

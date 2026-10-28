@@ -325,8 +325,35 @@ def learn_guest(arg: str = "") -> str:
 
 # ─── action: whoami / recognize_face ───────────────────────────────────────
 
+def _turn_words() -> str:
+    """The owner's words this turn ("" outside a turn, a proactive dispatch,
+    or with no monolith loaded). Never raises."""
+    try:
+        said = getattr(_bc(), "_turn_user_text")()
+    except Exception:
+        return ""
+    return said.strip() if isinstance(said, str) else ""
+
+
 def whoami(arg: str = "") -> str:
     """Recognise whoever is in the current primary-webcam frame."""
+    # Only when the owner asked for a face look (2026-10-27, live 20:38:11):
+    # after several desk-robot turns, "He does not sound happy." (about the
+    # robot) ran recognize_face and "That's you, sir." was spoken. A turn
+    # whose words ask nobody's name or face (core.action_fit rule 4, the same
+    # test) skips the camera and returns "": nothing is voiced for it and
+    # the reply's own words stand. No owner words (a proactive or routed
+    # call) still looks.
+    said = _turn_words()
+    if said:
+        try:
+            from core import action_fit as _fit
+            if not _fit.asks_face_look(said):
+                print("  [face-id] whoami skipped: the owner's words ask "
+                      "for no face look", flush=True)
+                return ""
+        except Exception:
+            pass
     gate = _refuse_if_off()
     if gate is not None:
         return gate

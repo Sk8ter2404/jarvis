@@ -17,6 +17,7 @@ stdlib unittest + mock only (no pytest); App-Control-safe.
 """
 from __future__ import annotations
 
+import io
 import threading
 import types
 import unittest
@@ -341,6 +342,45 @@ class WhoamiTests(FaceIdSkillBase):
         _mod, actions = self._load(bc=bc, engine=eng)
         out = actions["whoami"]("")
         self.assertIn("don't see a face", out.lower())
+
+
+# ─── whoami runs only when the owner asked for a face look ─────────────────
+# Live 2026-10-27 20:38:11: after several desk-robot turns, "He does not
+# sound happy." (about the robot) ran recognize_face and "That's you, sir."
+# was spoken. A turn whose words ask nobody's name or face returns "" and
+# never touches the camera; a face ask and a call with no owner words look.
+class WhoamiOwnerWordsTests(FaceIdSkillBase):
+    def _run(self, said, name="recognize_face"):
+        bc = _fake_monolith(frames={0: _Frame()})
+        bc._turn_user_text = lambda: said
+        eng = _fake_engine(recognize=[{"name": "owner", "score": 0.8,
+                                       "bbox": [0, 0, 80, 80]}])
+        calls = []
+        real = eng.recognize
+        eng.recognize = lambda f: (calls.append(f), real(f))[1]
+        _mod, actions = self._load(bc=bc, engine=eng, user_name="")
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            out = actions[name]("")
+        return out, calls
+
+    def test_mood_remarks_never_look(self):
+        for said in ("He does not sound happy.", "she seems upset"):
+            for name in ("recognize_face", "whoami"):
+                out, calls = self._run(said, name)
+                self.assertEqual(out, "", (said, name))
+                self.assertEqual(calls, [], (said, name))
+
+    def test_face_asks_still_look(self):
+        for said in ("who is that?", "do you recognize me?",
+                     "who's at my desk?"):
+            out, calls = self._run(said)
+            self.assertEqual(out, "That's you, sir.", said)
+            self.assertEqual(len(calls), 1, said)
+
+    def test_no_owner_words_still_looks(self):
+        out, calls = self._run("")
+        self.assertEqual(out, "That's you, sir.")
+        self.assertEqual(len(calls), 1)
 
 
 # ─── whoami GROUNDING: live frame is the source of truth, never memory ───────

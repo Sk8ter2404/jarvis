@@ -208,7 +208,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `dismiss_holo` | `skills/holographic_overlay/__init__.py:339` | neither | — | yes |
 | `disney_plus` | `core/actions.py:711` | neither | yes | yes |
 | `do_not_disturb` | `skills/focus_mode.py:298` | **VERBATIM** | — | yes |
-| `do_you_recognize_me` | `skills/face_id.py:328` | **VERBATIM** | — | yes |
+| `do_you_recognize_me` | `skills/face_id.py:338` | **VERBATIM** | — | yes |
 | `dossier` | `skills/dossier.py:666` | neither | yes | yes |
 | `dossier_on` | `skills/dossier.py:666` | neither | — | yes |
 | `draft_preview_gate_status` | `skills/draft_preview_gate.py:227` | **VERBATIM** | — | yes |
@@ -234,7 +234,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `exit_ambient_learning` | `bobert_companion.py:40086` | neither | — | yes |
 | `exit_jarvis` | `core/actions.py:7317` | neither | — | yes |
 | `export_memory` | `core/actions.py:3625` | neither | yes | yes |
-| `face_id_status` | `skills/face_id.py:380` | **VERBATIM** | — | yes |
+| `face_id_status` | `skills/face_id.py:407` | **VERBATIM** | — | yes |
 | `face_track_status` | `skills/face_tracker.py:1417` | **VERBATIM** | — | yes |
 | `file_a_bug` | `core/actions.py:4516` | **VERBATIM** | — | yes |
 | `file_on` | `skills/dossier.py:666` | neither | — | yes |
@@ -250,7 +250,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `focus_window` | `core/actions.py:1640` | neither | — | yes |
 | `force_backup` | `core/actions.py:4238` | neither | — | yes |
 | `forget_alexa_login` | `skills/smart_home_discover.py:2479` | neither | — | yes |
-| `forget_face` | `skills/face_id.py:418` | **VERBATIM** | — | yes |
+| `forget_face` | `skills/face_id.py:445` | **VERBATIM** | — | yes |
 | `forget_gaze_calibration` | `skills/face_tracker.py:1569` | **VERBATIM** | — | yes |
 | `forget_last_hour` | `core/actions.py:4640` | neither | yes | yes |
 | `forget_point_target` | `skills/kinect_pointing.py:434` | **VERBATIM** | — | yes |
@@ -379,7 +379,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `lifx_list` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |
 | `lifx_list_devices` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |
 | `list_emails` | `skills/email_triage.py:1076` | *INFORMATIVE* | — | no |
-| `list_enrolled_faces` | `skills/face_id.py:439` | **VERBATIM** | — | yes |
+| `list_enrolled_faces` | `skills/face_id.py:466` | **VERBATIM** | — | yes |
 | `list_enrolled_voices` | `skills/enroll_voice.py:359` | **VERBATIM** | — | yes |
 | `list_models` | `core/holo_web.py:430` | **VERBATIM** | yes | yes |
 | `list_notification_rules` | `skills/notification_triage.py:1557` | **VERBATIM** | — | yes |
@@ -428,7 +428,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `morning_tabs` | `skills/_example_skill.py:19` | neither | — | yes |
 | `mouse_control_off` | `skills/kinect_air_mouse.py:4059` | **VERBATIM** | — | yes |
 | `mouse_control_on` | `skills/kinect_air_mouse.py:4030` | **VERBATIM** | — | yes |
-| `move_file` | `skills/file_move.py:1011` | **VERBATIM** | — | yes |
+| `move_file` | `skills/file_move.py:1015` | **VERBATIM** | — | yes |
 | `move_window_to_monitor` | `core/actions.py:6771` | neither | yes | yes |
 | `ms_graph_calendar` | `skills/ms_graph.py:775` | **VERBATIM** | — | yes |
 | `music_aggregate` | `skills/apple_music_intel.py:932` | **VERBATIM** | — | yes |
@@ -533,7 +533,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `recent_deliveries` | `skills/amazon_order_tracker.py:1016` | *INFORMATIVE* | — | yes |
 | `recent_delivery` | `skills/amazon_order_tracker.py:1016` | *INFORMATIVE* | — | yes |
 | `recent_notifications_summary` | `skills/notification_triage.py:1602` | *INFORMATIVE* | yes | yes |
-| `recognize_face` | `skills/face_id.py:328` | **VERBATIM** | yes | yes |
+| `recognize_face` | `skills/face_id.py:338` | **VERBATIM** | yes | yes |
 | `refresh_network` | `skills/network_deco.py:847` | **VERBATIM** | — | yes |
 | `refresh_smart_home` | `skills/smart_home_discover.py:2144` | *INFORMATIVE* | — | yes |
 | `refresh_smart_home_router` | `core/smart_home_router.py:1451` | neither | — | yes |
@@ -707,7 +707,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `tv_status` | `skills/tv_detect.py:492` | **VERBATIM** | — | yes |
 | `type` | `core/actions.py:3326` | neither | yes | yes |
 | `undo_click` | `core/actions.py:4019` | **VERBATIM** | yes | yes |
-| `undo_last_move` | `skills/file_move.py:1025` | **VERBATIM** | — | yes |
+| `undo_last_move` | `skills/file_move.py:1029` | **VERBATIM** | — | yes |
 | `unread_email` | `skills/email_triage.py:1076` | *INFORMATIVE* | — | yes |
 | `unread_emails` | `skills/email_triage.py:1076` | *INFORMATIVE* | — | no |
 | `upgrade` | `core/actions.py:6951` | neither | — | yes |
@@ -772,13 +772,13 @@ One row per action, sorted by name; aliases share their handler's location.
 | `which_microphone` | `skills/audio_devices.py:303` | **VERBATIM** | — | yes |
 | `which_monitor` | `core/actions.py:5617` | *INFORMATIVE* | — | yes |
 | `which_speakers` | `skills/audio_devices.py:307` | **VERBATIM** | — | yes |
-| `who_am_i` | `skills/face_id.py:328` | **VERBATIM** | — | yes |
+| `who_am_i` | `skills/face_id.py:338` | **VERBATIM** | — | yes |
 | `who_is_here` | `skills/kinect_vision.py:146` | **VERBATIM** | — | yes |
 | `who_is_on_the_wifi` | `skills/network_deco.py:683` | *INFORMATIVE* | — | yes |
 | `who_is_on_wifi` | `skills/network_deco.py:683` | *INFORMATIVE* | yes | yes |
 | `who_is_talking` | `skills/enroll_voice.py:337` | **VERBATIM** | — | yes |
-| `whoami` | `skills/face_id.py:328` | **VERBATIM** | — | yes |
-| `whos_at_the_desk` | `skills/face_id.py:328` | **VERBATIM** | — | yes |
+| `whoami` | `skills/face_id.py:338` | **VERBATIM** | — | yes |
+| `whos_at_the_desk` | `skills/face_id.py:338` | **VERBATIM** | — | yes |
 | `whos_talking` | `skills/enroll_voice.py:337` | **VERBATIM** | — | yes |
 | `workshop_canvas` | `skills/holographic_overlay/__init__.py:493` | neither | — | yes |
 | `workshop_hud` | `skills/holographic_overlay/__init__.py:1166` | neither | — | yes |

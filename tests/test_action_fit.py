@@ -253,6 +253,42 @@ class RuleEdgeTests(unittest.TestCase):
                                    [object(), (1,)], [None]))
 
 
+class FaceLookTests(unittest.TestCase):
+    """Rule 4 (live 2026-10-27 20:38:11): "He does not sound happy." about
+    the desk robot ran recognize_face and "That's you, sir." was spoken."""
+
+    _REMARKS = ("He does not sound happy.", "she seems upset",
+                "Jarvis, he does not sound happy.", "That sounds great.",
+                "He is not happy with me", "is he okay?", "he looks tired")
+    _ASKS = ("who is that?", "do you recognize me?", "who's at my desk?",
+             "Jarvis, who am I?", "Jarvis, can you see me?",
+             "is anyone there?", "do you know who's in front of the computer?",
+             "do you recognise my face?", "is my brother here?",
+             "is she at the desk?", "am I on camera?", "is that me?",
+             "try again", "who’s at the desk?")
+
+    def test_remarks_flag_every_face_alias(self):
+        for text in self._REMARKS:
+            self.assertFalse(af.asks_face_look(text), text)
+            for nm in sorted(af.FACE_LOOK_ACTIONS):
+                self.assertIsNotNone(af.check(text, nm), (text, nm))
+
+    def test_face_asks_pass(self):
+        for text in self._ASKS:
+            self.assertTrue(af.asks_face_look(text), text)
+            for nm in sorted(af.FACE_LOOK_ACTIONS):
+                self.assertIsNone(af.check(text, nm), (text, nm))
+
+    def test_other_actions_are_not_rule_four(self):
+        self.assertIsNone(af.check("He does not sound happy.", "get_time"))
+        self.assertIsNone(af.check("He does not sound happy.",
+                                   "face_id_status"))
+
+    def test_no_owner_words_never_flags(self):
+        self.assertIsNone(af.check("", "recognize_face"))
+        self.assertFalse(af.asks_face_look(None))
+
+
 class HelperTests(unittest.TestCase):
     def test_normalise_mode(self):
         self.assertEqual(af.normalise_mode("ON"), "on")
