@@ -573,7 +573,7 @@ class SourceHelperTests(unittest.TestCase):
         with inject_modules(**{"skill_daily_briefing.news": None,
                                "news_briefing": None}), \
              mock.patch("builtins.__import__",
-                        side_effect=_block_import("news_briefing")):
+                        side_effect=_block_import("news_briefing", "news")):
             self.assertEqual(self.mod._fetch_news(), "")
 
     # ── _fetch_umbrella_alert ────────────────────────────────────────────
@@ -778,12 +778,18 @@ class BuildAndFireTests(unittest.TestCase):
 
 
 def _block_import(*blocked):
+    """An __import__ that refuses `blocked` top-level modules, and also the package-relative
+    form `from . import <blocked>`: that form finds a sibling module already attached to the
+    package without looking at sys.modules, so a None entry there does not stop it (and the
+    real sibling, such as the news fetcher, would then reach the real network)."""
     real = __import__
 
-    def _imp(name, *a, **k):
+    def _imp(name, globals=None, locals=None, fromlist=(), level=0):
         if name.split(".")[0] in blocked:
             raise ImportError(f"blocked {name}")
-        return real(name, *a, **k)
+        if level and not name and any(f in blocked for f in (fromlist or ())):
+            raise ImportError(f"blocked relative import of {fromlist}")
+        return real(name, globals, locals, fromlist, level)
     return _imp
 
 
