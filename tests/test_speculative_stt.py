@@ -707,6 +707,28 @@ class SpeculativeRealCaptureLoopTests(unittest.TestCase):
             if isinstance(_c, list) and _c:
                 self.addCleanup(_c.__setitem__, 0, _c[0])
 
+        # THE FAKE STREAM HAS NO CLOCK. A real chunk is 64 ms of wall time, so
+        # by the time a SECOND silence run reaches the trip point the first
+        # (stale) worker, whose decode is a few ms in this harness, is long
+        # gone. Here the whole capture is drained in well under one real chunk,
+        # and _spec_stt_should_snapshot refuses to bet while the earlier worker
+        # thread is still alive ("one at a time"). With a busy CPU that thread
+        # had not been scheduled yet, the second snapshot was never taken and
+        # the resume test saw chunks == -1 (v3.0.2 full-suite flake, ~12 % under
+        # 28 busy threads). Retire the previous worker at the decision point,
+        # which is exactly what elapsed real time guarantees in production; no
+        # sleep, no timeout is racing anything.
+        _real_should = bc._spec_stt_should_snapshot
+        self.addCleanup(setattr, bc, "_spec_stt_should_snapshot", _real_should)
+
+        def _should_after_prior_worker_retires(silence_n, spec_at, *a, **k):
+            prior = bc._spec_stt.get("thread")
+            if silence_n == spec_at and prior is not None:
+                prior.join(timeout=20)
+            return _real_should(silence_n, spec_at, *a, **k)
+
+        bc._spec_stt_should_snapshot = _should_after_prior_worker_retires
+
         audio = bc.record_speech(timeout=None)
         t = bc._spec_stt.get("thread")
         if t is not None:
