@@ -303,5 +303,94 @@ class RepetitionNoiseTests(unittest.TestCase):
         self.assertEqual(sf.repetition_reason(12345), "")
 
 
+class PrimaryEmptyTests(unittest.TestCase):
+    """v3.0.0 20:39:40: Parakeet heard no words in a capture taken as the TV
+    came on; Whisper's 'empty' rescue said "Thank you." 14 s after JARVIS
+    spoke, and the reply rule kept it."""
+    OK = {"no_speech_prob": 0.3, "avg_logprob": -0.6}
+
+    def _v(self, text, **kw):
+        args = dict(vad_threshold=0.008, owner_idle_s=18.0,
+                    since_jarvis_s=14.0, jarvis_asked=False)
+        args.update(kw)
+        return sf.hallucination_verdict(text, self.OK, 0.1523, **args)
+
+    def test_the_live_phantom_is_noise(self):
+        self.assertEqual(self._v("Thank you.", primary_heard_nothing=True),
+                         ("noise", "the primary decoder heard no words"))
+
+    def test_without_the_signal_the_reply_is_kept_as_before(self):
+        self.assertEqual(self._v("Thank you.")[0], "reply")
+
+    def test_a_waiting_prompt_still_keeps_the_answer(self):
+        self.assertEqual(self._v("Yeah.", primary_heard_nothing=True,
+                                 since_jarvis_s=None,
+                                 prompt_pending=True)[0], "reply")
+
+    def test_only_hallucination_phrases_are_judged(self):
+        self.assertEqual(self._v("Jarvis, delete that website.",
+                                 primary_heard_nothing=True), ("", ""))
+
+
+class UnclearReasonTests(unittest.TestCase):
+    """v3.0.0 20:41:26: "Enough and awesome." at 1.25x the VAD threshold
+    was web-searched verbatim."""
+    # Real short lines from the session logs (2-4 words, plus the classic
+    # one-word and two-word commands): none may be judged unclear even at
+    # the live line's marginal level.
+    REAL = (
+        "yes", "pause", "next", "lights off", "next song", "volume up",
+        "hand tracking on", "hand tracking off", "hand mouse on",
+        "hand mouse off", "headset more noise cancelling.",
+        "Jarvis switched the headset.", "You're gotten way faster.",
+        "Makes that feel real.", "Jarvis, what's all new?",
+        "Jarvis, pause the video.", "Jarvis, just give up.",
+        "Jarvis, it's not playing", "Jarvis, how's it going?",
+        "Jarvis, delete that website.", "Jarvis, I'm heading out.",
+        "Jarvis, I'm done gaming.", "Jarvis, I need 360.",
+        "Jarvis card mode.", "Jarvis YouTube home page.",
+        "It's so loud, dude.", "I didn't say that.", "I call bullshit.",
+        "He sounds stupider.", "Apparently not.", "stop the music",
+        "turn it down", "good night", "skip this",
+    )
+
+    # Short answers and sized commands that carry no command verb (review
+    # of 3.0.1): a pick, a level, an episode. They must act too.
+    ANSWERS = (
+        "The second one.", "Left one.", "Last one.", "Too loud.",
+        "Way too loud.", "A little brighter.", "Episode five.",
+        "Season two.", "Previous episode.", "Brightness fifty.",
+        "Five minutes.", "All right.",
+    )
+
+    def _r(self, text, peak=0.0100):
+        return sf.unclear_reason(text, peak, vad_threshold=0.008)
+
+    def test_short_answers_and_sized_commands_pass(self):
+        judged = [t for t in self.ANSWERS if self._r(t)]
+        self.assertEqual(judged, [])
+        self.assertTrue(self._r("Enough and awesome."))
+
+    def test_the_live_line_is_unclear(self):
+        why = self._r("Enough and awesome.")
+        self.assertEqual(why, "3 words, none a request or reply word, peak "
+                              "1.25x the VAD threshold")
+        self.assertNotIn("awesome", why)
+
+    def test_real_short_commands_pass_at_the_same_level(self):
+        self.assertEqual([t for t in self.REAL if self._r(t)], [])
+
+    def test_a_clearly_heard_capture_is_never_judged(self):
+        self.assertEqual(self._r("Enough and awesome.", peak=0.0405), "")
+
+    def test_word_count_bounds(self):
+        self.assertEqual(self._r("Awesome."), "")
+        self.assertEqual(self._r("enough and awesome and great stuff"), "")
+
+    def test_bad_input_never_raises(self):
+        self.assertEqual(sf.unclear_reason(None, None, vad_threshold=0), "")
+        self.assertEqual(sf.unclear_reason(123, "x", vad_threshold=0.008), "")
+
+
 if __name__ == "__main__":
     unittest.main()

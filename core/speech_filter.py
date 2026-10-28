@@ -324,7 +324,8 @@ def repetition_reason(text) -> str:
 def hallucination_verdict(text, conf, peak_rms, *, vad_threshold,
                           owner_idle_s=None, since_jarvis_s=None,
                           jarvis_asked=False,
-                          prompt_pending=False) -> tuple[str, str]:
+                          prompt_pending=False,
+                          primary_heard_nothing=False) -> tuple[str, str]:
     """("noise" | "reply" | "", reason) for one mic transcript. See the block
     comments above.
 
@@ -332,7 +333,10 @@ def hallucination_verdict(text, conf, peak_rms, *, vad_threshold,
     this session). ``since_jarvis_s``: seconds since JARVIS's last audible
     line finished (None: none). ``jarvis_asked``: that line asked something.
     ``prompt_pending``: a confirmation / yes-no prompt awaits an answer.
-    Never raises — an internal error returns ("", ""), the old behaviour."""
+    ``primary_heard_nothing``: the primary decoder (Parakeet) found no words
+    in this capture and Whisper's 'empty' rescue produced the text (see
+    PRIMARY_EMPTY below). Never raises — an internal error returns ("", ""),
+    the old behaviour."""
     try:
         # Degenerate repetition is noise whatever the context (22:53:08).
         rep = repetition_reason(text)
@@ -355,6 +359,13 @@ def hallucination_verdict(text, conf, peak_rms, *, vad_threshold,
         owner_recent = idle is not None and idle < NOISE_OWNER_IDLE_S
         jarvis_recent = (since is not None
                          and 0.0 <= since <= NOISE_REPLY_WINDOW_S)
+        # PRIMARY_EMPTY: Parakeet heard no words, Whisper then "heard" a
+        # stock phrase. Outranks the reply context; only a waiting prompt or
+        # a question JARVIS just asked keeps it (a lost "yeah" there costs
+        # more than a phantom).
+        if (primary_heard_nothing and not prompt_pending
+                and not (jarvis_recent and jarvis_asked)):
+            return ("noise", "the primary decoder heard no words")
         if norm in _reply_norms() and owner_recent:
             if jarvis_recent:
                 return ("reply", f"JARVIS spoke {since:.0f} s ago, the owner "
@@ -372,6 +383,124 @@ def hallucination_verdict(text, conf, peak_rms, *, vad_threshold,
         return ("", "")
     except Exception:
         return ("", "")
+
+
+# ── PRIMARY_EMPTY: a stock phrase only Whisper heard (2026-10-27) ───────────
+#
+# THE LIVE INCIDENT (v3.0.0, 20:39:40). The TV had just come on; nobody spoke
+# to JARVIS. Parakeet, the primary decoder, found no words in the capture, so
+# the 'empty' rescue handed the same audio to Whisper, which made it "Thank
+# you." JARVIS had spoken 14 s earlier and the owner 18 s earlier, so the
+# reply rule above kept it, and the owner had to say "I didn't say that."
+# Not a self-echo: no JARVIS audio was playing during the capture.
+#
+# Over every session log on disk, 8 of the 21 Parakeet-empty rescues were
+# "Thank you." and Parakeet itself never produced a hallucination-only phrase
+# once. Two decoders disagreeing, the one that does not hallucinate hearing
+# nothing, is the strongest noise evidence the gate gets, so it outranks the
+# reply context. A waiting confirmation / yes-no prompt still keeps it.
+
+
+# ── Unclear short utterances (2026-10-27) ───────────────────────────────────
+#
+# THE LIVE INCIDENT (v3.0.0, 20:41:26). Right after a search answer, a
+# capture peaking at 1.25x the VAD threshold (barely above the room's own
+# ambient level) came back from Parakeet as "Enough and awesome." The model
+# answered "On it, sir. [ACTION: web_search, enough and awesome]" and read
+# three rounds of results about it.
+#
+# unclear_reason() names a 2-4 word transcript that is BOTH
+#   * heard at a marginal level: peak under NOISE_RMS_MARGIN x the VAD
+#     threshold (the same "only marginally above" measure the noise gate
+#     uses), and
+#   * carries nothing a request or a reply is made of: no word from
+#     SENSE_WORDS (wake word, pronouns, question and helper verbs, negations
+#     and answers, command verbs and particles, media / device nouns,
+#     greetings, every WHISPER_ALWAYS_ACCEPT word), no contraction, no "-ing"
+#     / "-ed" verb form, no digit and no Capitalised name after the first
+#     word.
+# The caller asks the owner to repeat himself instead of acting on it. A
+# clearly heard capture is never judged (the level test comes first), and a
+# one-word line is left to is_valid_speech. Pure; the reason holds numbers
+# only, never a word from the transcript.
+UNCLEAR_MIN_WORDS = 2
+UNCLEAR_MAX_WORDS = 4
+
+SENSE_WORDS = frozenset({
+    # address
+    "jarvis",
+    # pronouns, determiners that point at something
+    "i", "me", "my", "mine", "you", "your", "he", "him", "his", "she", "her",
+    "it", "its", "we", "us", "our", "they", "them", "their", "this", "that",
+    "these", "those", "there", "here",
+    # questions and helper verbs
+    "what", "who", "whom", "whose", "how", "why", "when", "where", "which",
+    "is", "are", "was", "were", "am", "be", "been", "do", "does", "did",
+    "can", "could", "will", "would", "should", "shall", "may", "might",
+    "must", "have", "has", "had", "let", "lets",
+    # negations and answers
+    "not", "never", "nothing", "please", "thanks", "thank", "sorry",
+    # command verbs
+    "turn", "set", "put", "make", "give", "tell", "show", "find", "read",
+    "get", "send", "switch", "move", "call", "look", "launch", "take",
+    "bring", "keep", "add", "remind", "delete", "clear", "dim", "raise",
+    "lower", "increase", "decrease", "need", "want", "try", "say", "go",
+    "come", "leave", "rewind", "forward", "shuffle", "silence",
+    # particles a command ends on
+    "on", "off", "up", "down", "out", "in", "over", "away",
+    # media and devices
+    "lights", "light", "lamp", "music", "song", "songs", "track", "video",
+    "tv", "screen", "monitor", "headset", "speaker", "speakers", "mode",
+    "page", "app", "window", "tab", "alarm", "reminder", "camera", "mic",
+    "microphone", "print", "printer",
+    # greetings
+    "good", "night", "afternoon", "evening",
+    # answers that pick or size something ("the second one", "too loud",
+    # "episode five"): numbers in words, ordinals, sides, levels
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "twenty", "thirty", "forty", "fifty",
+    "sixty", "seventy", "eighty", "ninety", "hundred", "half", "max",
+    "first", "second", "third", "fourth", "fifth", "last", "previous",
+    "left", "right", "both", "all", "too", "loud", "quiet", "bright",
+    "higher", "brighter", "dimmer", "episode", "season", "brightness",
+    "color", "colour", "minute", "minutes", "hour", "hours", "sec",
+}) | frozenset(WHISPER_ALWAYS_ACCEPT)
+
+_SENSE_SUFFIXES = ("ing", "ed")
+
+
+def _sense_word(word: str, position: int) -> bool:
+    w = word.lower()
+    if w in SENSE_WORDS or any(ch.isdigit() for ch in w):
+        return True
+    if "'" in w or "’" in w:
+        return True        # a contraction: "it's", "don't", "I'm"
+    if len(w) >= 5 and w.endswith(_SENSE_SUFFIXES):
+        return True        # a verb form: "tracking", "switched"
+    if position > 0 and word[:1].isupper():
+        return True        # a name Parakeet capitalised mid-line
+    return False
+
+
+def unclear_reason(text, peak_rms, *, vad_threshold) -> str:
+    """Why this transcript is too unclear to act on (numbers only), or "".
+    See the block comment above. Never raises."""
+    try:
+        vad = float(vad_threshold)
+        peak = float(peak_rms or 0.0)
+        if vad <= 0 or peak <= 0 or peak >= vad * NOISE_RMS_MARGIN:
+            return ""
+        words = [w for w in re.findall(r"[\w'’]+", str(text or ""))
+                 if w.strip("'’")]
+        n = len(words)
+        if not (UNCLEAR_MIN_WORDS <= n <= UNCLEAR_MAX_WORDS):
+            return ""
+        if any(_sense_word(w, i) for i, w in enumerate(words)):
+            return ""
+        return (f"{n} words, none a request or reply word, peak "
+                f"{peak / vad:.2f}x the VAD threshold")
+    except Exception:
+        return ""
 
 
 # ── Per-install tuning ──────────────────────────────────────────────────────

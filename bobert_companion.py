@@ -18110,6 +18110,7 @@ def _transcribe_capture(audio):
     primary a speculative Whisper decode is never joined (nor started:
     _spec_stt_should_snapshot) — its text would pre-empt Parakeet's."""
     _tail_probe_start(audio)
+    _last_stt_rescue[0] = ""
     # Speed plan R6 (core/stt_parakeet.py): None with STT_ENGINE='whisper'
     # and STT_SHADOW='' (the defaults) — then exactly transcribe() below.
     _r6 = _stt_r6_route()
@@ -18162,6 +18163,9 @@ from core import stt_parakeet as _stt_parakeet  # noqa: E402
 
 _stt_alt = None                       # the Parakeet engine once loaded
 _parakeet_lock = threading.Lock()     # its load + every decode
+# The last _transcribe_capture's Parakeet rescue reason ('' = none; 'empty' =
+# Parakeet heard no words and Whisper decoded). Read by _noise_verdict.
+_last_stt_rescue = [""]
 _parakeet_latch = _stt_parakeet.Latch()
 
 
@@ -18504,7 +18508,9 @@ def _transcribe_capture_r6(audio, route: str):
     never blocks) — unless the mic was muted meanwhile. The shadow keeps the
     words only of a line the live system acts on (words_kept)."""
     if route == "primary":
-        return _parakeet_primary.run(audio)
+        res = _parakeet_primary.run(audio)
+        _last_stt_rescue[0] = _parakeet_primary.last_rescue
+        return res
     _stt_wait_tls.ms = None
     t0 = time.perf_counter()
     res = transcribe(audio)
@@ -40034,12 +40040,63 @@ def _noise_verdict(text: str, conf, injected: bool = False,
             owner_idle_s=(now - owner_at) if owner_at else None,
             since_jarvis_s=(now - line_at) if line_at else None,
             jarvis_asked=bool(_last_jarvis_line[1]),
-            prompt_pending=_reply_prompt_pending())
+            prompt_pending=_reply_prompt_pending(),
+            # Live v3.0.0 20:39:40: Parakeet heard nothing, Whisper's
+            # rescue said "Thank you." (PRIMARY_EMPTY, core/speech_filter).
+            primary_heard_nothing=(_last_stt_rescue[0] == "empty"))
         if verdict == "noise":
             print(f"  [noise] ignored ({why})")
         return verdict
     except Exception:
         return ""
+
+
+# ── unclear short utterance (core/speech_filter.unclear_reason) ──────────
+# Live v3.0.0 20:41:26: a marginal capture came back as "Enough and awesome."
+# and the model web-searched it verbatim. Such a line is not acted on: in a
+# conversation JARVIS asks once (UNCLEAR_CUE, at most every
+# _UNCLEAR_CUE_GAP_S), otherwise it is dropped. Off with
+# UNCLEAR_UTTERANCE_GATE = False. Numbers-only log.
+UNCLEAR_UTTERANCE_GATE = True
+UNCLEAR_CUE = "Sorry, sir, I didn't catch that."
+_UNCLEAR_CUE_GAP_S = 20.0
+_unclear_cue_at = [0.0]
+
+
+def _unclear_turn(text: str, injected: bool = False,
+                  now: float | None = None) -> bool:
+    """True when this mic turn is too unclear to act on (the caller ends
+    the turn); speaks UNCLEAR_CUE when the owner is in a conversation.
+    Typed / injected turns are never checked. Never raises (False)."""
+    try:
+        if injected or not UNCLEAR_UTTERANCE_GATE:
+            return False
+        why = _speech_filter_mod.unclear_reason(
+            text, _last_recording_peak, vad_threshold=VAD_THRESHOLD)
+        if not why:
+            return False
+        now = time.monotonic() if now is None else float(now)
+        # An answer to a waiting prompt or to a question JARVIS just asked
+        # ("which one, sir?" -> "the green one") is never second-guessed.
+        line_at = float(_last_jarvis_line[0] or 0.0)
+        if _reply_prompt_pending() or (
+                _last_jarvis_line[1] and line_at
+                and 0.0 <= now - line_at
+                <= _speech_filter_mod.NOISE_REPLY_WINDOW_S):
+            return False
+        owner_at = float(_last_owner_turn_at[0] or 0.0)
+        in_convo = bool(owner_at) and (
+            now - owner_at < _speech_filter_mod.NOISE_OWNER_IDLE_S)
+        last = float(_unclear_cue_at[0] or 0.0)
+        ask = in_convo and (last <= 0.0 or now - last >= _UNCLEAR_CUE_GAP_S)
+        print(f"  [unclear] not acting ({why}) — "
+              + ("asking sir to repeat" if ask else "dropped"))
+        if ask:
+            _unclear_cue_at[0] = now
+            _speak(UNCLEAR_CUE)
+        return True
+    except Exception:
+        return False
 
 
 # Standby auto-engage bridge. The background lyric-detection thread in
@@ -52885,6 +52942,13 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # turns only; logs numbers, never the words. _media_voice_gate.
                 if _media_voice_gate(text, _injected_text is not None):
                     _media_gate_drop_cue(text)
+                    set_state("idle")
+                    continue
+
+                # ── UNCLEAR SHORT LINE (core/speech_filter.unclear_reason) ──
+                # Marginal level + no request/reply word: ask, never act
+                # (live v3.0.0 20:41:26). Mic turns only. _unclear_turn.
+                if _unclear_turn(text, _injected_text is not None):
                     set_state("idle")
                     continue
 
