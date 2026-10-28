@@ -320,5 +320,74 @@ class HelperTests(unittest.TestCase):
             self.assertFalse(af.is_status_action(nm), nm)
 
 
+class RemarkRerunTests(unittest.TestCase):
+    """Rule 5 (v3.0.2). Live v3.0.0 20:28:45: "what version are you
+    running?" -> version_info, then "Yay, version 3 is done." ran
+    version_info AGAIN. A remark about the reading JARVIS just gave is
+    answered, not re-run; an ask for the reading still runs."""
+    PRIOR = [("version_info", "")]
+
+    def test_the_live_remark_is_flagged(self):
+        r = af.check("Yay, version 3 is done.", "version_info", "",
+                     self.PRIOR, ["version_info"])
+        self.assertIsNotNone(r)
+        self.assertIn("remarked", r)
+
+    def test_remarks_about_other_readings(self):
+        for text, nm in (
+                ("Nice, that was quick.", "get_time"),
+                ("Oh wow, warm today.", "weather_briefing"),
+                ("Sweet, all green then.", "system_pulse"),
+        ):
+            self.assertIsNotNone(af.check(text, nm, "", [(nm, "")], [nm]),
+                                 text)
+
+    def test_asks_for_the_reading_again_still_run(self):
+        for text in ("Check again.", "What version again?",
+                     "Jarvis, what version are you running?",
+                     "Is it still version 3?", "Tell me the version.",
+                     "Version 3 is done, right?", "Run it again please.",
+                     "Jarvis, read me the version."):
+            self.assertIsNone(af.check(text, "version_info", "",
+                                       self.PRIOR, ["version_info"]), text)
+
+    def test_first_person_plans_are_not_remarks(self):
+        # Live turn 2026-10-06 10:41:28: "I have to leave for class now, it
+        # starts at eleven-thirty." ran get_time after get_time, rightly.
+        text = ("Jarvis, I have to leave for class now, it starts at "
+                "eleven-thirty.")
+        self.assertFalse(af.is_remark(text))
+        self.assertIsNone(af.check(text, "get_time", "", [("get_time", "")],
+                                   ["get_time"]))
+
+    def test_needs_the_same_reading_last_turn(self):
+        self.assertIsNone(af.check("Yay, version 3 is done.", "version_info",
+                                   "", [], ["version_info"]))
+        self.assertIsNone(af.check("Yay, version 3 is done.", "version_info",
+                                   "", [("get_time", "")], ["version_info"]))
+        self.assertIsNone(af.check("Nice.", "system_pulse", "cpu",
+                                   [("system_pulse", "")], ["system_pulse"]))
+
+    def test_control_actions_are_never_rule_five(self):
+        self.assertIsNone(af.check("Yay, lights are on.", "lights_on", "",
+                                   [("lights_on", "")], ["lights_on"]))
+
+    def test_is_remark_edges(self):
+        self.assertTrue(af.is_remark("Yay, version 3 is done."))
+        self.assertTrue(af.is_remark("Jarvis, splendid."))
+        self.assertFalse(af.is_remark(""))
+        self.assertFalse(af.is_remark("what's the time?"))
+        self.assertFalse(af.is_remark("refresh that"))
+        self.assertFalse(af.is_remark("I love it"))
+        # v3.0.2 review: a question word opening a later clause, and
+        # "once more", ask (the recogniser often drops the "?")
+        self.assertFalse(af.is_remark("Yay, what version is that"))
+        self.assertFalse(af.is_remark("Nice. How long has it been up"))
+        self.assertFalse(af.is_remark("Cool, once more"))
+        self.assertTrue(af.is_informative_action("version_info"))
+        self.assertTrue(af.is_informative_action("list_timers"))
+        self.assertFalse(af.is_informative_action("lights_on"))
+
+
 if __name__ == "__main__":
     unittest.main()

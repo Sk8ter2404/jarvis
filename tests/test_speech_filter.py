@@ -363,8 +363,49 @@ class UnclearReasonTests(unittest.TestCase):
         "Five minutes.", "All right.",
     )
 
+    # Short social replies and compliments (v3.0.2): v3.0.1 answered
+    # "Sorry, sir, I didn't catch that" to several of these at a marginal
+    # level. Every one is a clear reply and must pass.
+    SOCIAL = (
+        "Very nice.", "Sounds great.", "Love it.", "Good job.", "Nice one.",
+        "Well done.", "Pretty cool.", "Awesome work.", "Really nice.",
+        "So good.", "Sounds good, man.", "Very very nice.", "Oh nice.",
+        "Perfect, thanks.", "Great stuff, dude.",
+    )
+
+    # Marginal muddles that must STILL be caught: one affect word does not
+    # rescue a line whose other words are nothing.
+    MUDDLES = (
+        "Enough and awesome.", "Nice and bramble.", "Awesome tunnel fog.",
+    )
+
     def _r(self, text, peak=0.0100):
         return sf.unclear_reason(text, peak, vad_threshold=0.008)
+
+    def test_social_replies_pass_at_the_marginal_level(self):
+        self.assertEqual([t for t in self.SOCIAL if self._r(t)], [])
+
+    def test_muddles_with_an_affect_word_are_still_caught(self):
+        for t in self.MUDDLES:
+            why = self._r(t)
+            self.assertTrue(why, t)
+            self.assertNotIn("awesome", why)
+
+    # v3.0.2 review: support words alone (nouns, intensifiers, vocatives)
+    # carry no affect, so a garble built from them is still caught.
+    SUPPORT_ONLY = ("Point touch.", "Dig sorta.", "Shot idea, man.",
+                    "Much stuff.", "Pal, effort.")
+
+    def test_support_words_alone_are_still_caught(self):
+        self.assertEqual([t for t in self.SUPPORT_ONLY if not self._r(t)], [])
+
+    def test_core_words_are_social_words(self):
+        self.assertLessEqual(sf.SOCIAL_CORE_WORDS, sf.SOCIAL_WORDS)
+
+    def test_social_set_is_lower_case_single_words(self):
+        for w in sf.SOCIAL_WORDS:
+            self.assertEqual(w, w.lower().strip())
+            self.assertNotIn(" ", w)
 
     def test_short_answers_and_sized_commands_pass(self):
         judged = [t for t in self.ANSWERS if self._r(t)]

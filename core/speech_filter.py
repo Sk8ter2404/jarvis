@@ -418,7 +418,8 @@ def hallucination_verdict(text, conf, peak_rms, *, vad_threshold,
 #     and answers, command verbs and particles, media / device nouns,
 #     greetings, every WHISPER_ALWAYS_ACCEPT word), no contraction, no "-ing"
 #     / "-ed" verb form, no digit and no Capitalised name after the first
-#     word.
+#     word, and it is not a line made only of SOCIAL_WORDS ("Very nice.",
+#     "Sounds great." are clear social replies, v3.0.2).
 # The caller asks the owner to repeat himself instead of acting on it. A
 # clearly heard capture is never judged (the level test comes first), and a
 # one-word line is left to is_valid_speech. Pure; the reason holds numbers
@@ -468,6 +469,61 @@ SENSE_WORDS = frozenset({
 
 _SENSE_SUFFIXES = ("ing", "ed")
 
+# ── Social / affect lines (v3.0.2) ──────────────────────────────────────────
+# v3.0.1's gate asked "Sorry, sir, I didn't catch that" for a marginal-level
+# compliment: "Very nice.", "Sounds great." carry no SENSE word, yet they are
+# as clear a reply as "All right." A line made ENTIRELY of affect words,
+# intensifiers, reaction words and vocatives is a social reply and passes.
+# The all-words test is what keeps "Enough and awesome." caught: "enough" and
+# "and" are neither, so one affect word in a muddle does not rescue it.
+SOCIAL_WORDS = frozenset({
+    # affect / compliment
+    "nice", "great", "awesome", "amazing", "brilliant", "excellent",
+    "fantastic", "wonderful", "lovely", "beautiful", "perfect", "sweet",
+    "cool", "neat", "solid", "superb", "splendid", "terrific", "fabulous",
+    "incredible", "impressive", "clean", "smooth", "slick", "fine", "okay",
+    "ok", "alright", "fun", "funny", "hilarious", "cute", "clever", "smart",
+    "bad", "terrible", "awful", "rough", "sad", "ouch", "yikes", "wow",
+    # verbs and nouns a compliment is built on
+    "love", "loved", "like", "liked", "dig", "sounds", "looks", "feels",
+    "seems", "job", "work", "stuff", "done", "played", "call", "shot",
+    "move", "catch", "try", "effort", "touch", "going", "idea", "point",
+    # intensifiers and softeners
+    "very", "so", "really", "pretty", "quite", "super", "truly", "totally",
+    "absolutely", "well", "much", "better", "best", "way", "kinda", "sorta",
+    # reaction words
+    "yay", "yes", "yeah", "yep", "yup", "nope", "nah", "haha", "lol",
+    "heh", "hmm", "huh", "oh", "ah", "aw", "ooh", "whoa", "bravo", "cheers",
+    "congrats", "congratulations", "thanks", "thank", "gracias", "ta",
+    "man", "dude", "buddy", "mate", "bro", "pal", "sir", "jarvis",
+})
+
+
+# The words that carry the affect (v3.0.2 review): a social line needs at
+# least one. Without it a garble made only of support words ("Point touch.",
+# "Dig sorta.", "Shot idea, man.") would pass as a compliment.
+SOCIAL_CORE_WORDS = frozenset({
+    "nice", "great", "awesome", "amazing", "brilliant", "excellent",
+    "fantastic", "wonderful", "lovely", "beautiful", "perfect", "sweet",
+    "cool", "neat", "solid", "superb", "splendid", "terrific", "fabulous",
+    "incredible", "impressive", "clean", "smooth", "slick", "fine", "okay",
+    "ok", "alright", "fun", "funny", "hilarious", "cute", "clever", "smart",
+    "bad", "terrible", "awful", "rough", "sad", "ouch", "yikes", "wow",
+    "love", "loved", "like", "liked", "well", "better", "best", "super",
+    "yay", "yes", "yeah", "yep", "yup", "nope", "nah", "haha", "lol",
+    "bravo", "cheers", "congrats", "congratulations", "thanks", "thank",
+    "gracias",
+})
+
+
+def _social_line(words) -> bool:
+    """True when every word of a 2-4 word line is a social / affect word
+    and at least one carries the affect (SOCIAL_CORE_WORDS): a clear
+    compliment or reaction, never a muddle."""
+    low = [w.lower() for w in words or ()]
+    return (bool(low) and all(w in SOCIAL_WORDS for w in low)
+            and any(w in SOCIAL_CORE_WORDS for w in low))
+
 
 def _sense_word(word: str, position: int) -> bool:
     w = word.lower()
@@ -497,6 +553,8 @@ def unclear_reason(text, peak_rms, *, vad_threshold) -> str:
             return ""
         if any(_sense_word(w, i) for i, w in enumerate(words)):
             return ""
+        if _social_line(words):
+            return ""      # "Very nice." / "Sounds great.": a clear reply
         return (f"{n} words, none a request or reply word, peak "
                 f"{peak / vad:.2f}x the VAD threshold")
     except Exception:

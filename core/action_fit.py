@@ -14,7 +14,7 @@ cases):
   * safety-03 "turn it off" -> game_mode_off.
 
 ``check(user_text, name, arg, prior_actions)`` is pure: it returns None when
-the action fits, else a short reason. Four rules only:
+the action fits, else a short reason. Five rules only:
 
   1. A list / status action when the owner gave an on / off / set / dim /
      turn command (and asked for no list or status in the same breath, and
@@ -34,6 +34,14 @@ the action fits, else a short reason. Four rules only:
      desk-robot turns, "He does not sound happy." (about the robot) ran
      recognize_face and "That's you, sir." was spoken. The handler
      (skills/face_id.whoami) applies the same test live, whatever the mode.
+  5. The same informative reading (a status action, or a read-only fact
+     such as version_info / get_time / weather_briefing) with the same
+     argument as one that ran on the previous turn, when the owner's line
+     is a REMARK: no question word, no "?", no command or re-check word, no
+     first-person plan. Live v3.0.0 20:28:45, "Yay, version 3 is done."
+     ran version_info again 17 s after it had answered. "Check again" and
+     "what version again?" still run. The monolith's preemptive-injection
+     path applies the same remark test (_preempt_recent_reading, 60 s).
 
 No owner words (a proactive dispatch) never flags. Never raises: any fault
 reads as "fits".
@@ -68,6 +76,60 @@ def is_status_action(name: str) -> bool:
     nm = str(name or "").strip().lower()
     return bool(nm) and (nm in STATUS_ACTIONS
                          or _STATUS_NAME_RE.search(nm) is not None)
+
+
+# ── Rule 5: the same reading again, for a remark about it ──────────────────
+# Live v3.0.0 20:28:45: JARVIS had just answered "what version are you
+# running?" (version_info), the owner said "Yay, version 3 is done." and
+# version_info ran AGAIN, so he heard the version twice. A celebration or a
+# comment about something JARVIS just reported is answered, not re-run: an
+# INFORMATIVE action (a status action, or one of these read-only facts) with
+# the same argument that ran on the previous turn is skipped when the
+# owner's line carries no question and no command word. "Check again",
+# "what version again?" and "is it still 3?" all ask, so they still run.
+INFO_ACTIONS = frozenset({
+    "version_info", "what_version", "when_updated", "get_time",
+    "weather_briefing", "weather_forecast", "status_report",
+    "check_system", "battery_status", "uptime",
+})
+# A question: a question word opening the line or a clause ("Yay, what
+# version is that" with no "?" from the recogniser), or a trailing "?".
+_QUESTION_OPEN_RE = re.compile(
+    r"(?:^|[,.;:!]\s*)(?:what|who|whom|whose|how|why|when|where|which|is|are|was|were|am|"
+    r"do|does|did|can|could|will|would|should|shall|have|has|had)\b", re.I)
+# A command word anywhere: the owner asks for the reading (or anything else).
+_COMMAND_WORD_RE = re.compile(
+    r"\b(?:check|tell|show|give|run|get|read|say|report|look|see|find|"
+    r"open|turn|set|play|update|refresh|repeat|confirm|verify|remind|"
+    r"again|please|once more)\b", re.I)
+# The owner telling JARVIS about himself or his plans ("I have to leave for
+# class now, it starts at eleven-thirty" -> get_time fits): not a remark
+# about the reading, so the reading may run.
+_SELF_PLAN_RE = re.compile(
+    r"\b(?:i|i'?m|i'?ve|i'?ll|i'?d|we|we'?re|let'?s|gotta|gonna|need|"
+    r"have to|got to|going to|about to)\b", re.I)
+
+
+def is_informative_action(name: str) -> bool:
+    """True for an action that only reads a fact back (rule 5)."""
+    nm = str(name or "").strip().lower()
+    return bool(nm) and (nm in INFO_ACTIONS or is_status_action(nm))
+
+
+def is_remark(user_text) -> bool:
+    """True when the owner's words neither ask nor command: a celebration
+    or a comment ("Yay, version 3 is done.", "Nice, that's quick."). Any
+    question word opening the line, a trailing "?", a re-check word or a
+    command word makes it a request instead."""
+    body = _strip_opener(user_text)
+    if not body:
+        return False
+    if _asks_fresh_reading(body) or "?" in body:
+        return False
+    if (_QUESTION_OPEN_RE.search(body) or _COMMAND_WORD_RE.search(body)
+            or _SELF_PLAN_RE.search(body)):
+        return False
+    return True
 
 
 # The owner gave a command that CHANGES something: turn / switch X on|off,
@@ -235,6 +297,14 @@ def check(user_text, name, arg="",
             return (f"not run: {nm} looks through the webcam to say who is "
                     f"there, and sir asked nothing about who someone is or "
                     f"a face")
+        # Rule 5: the same reading again, for a remark about it.
+        if is_informative_action(nm) and is_remark(text):
+            a = _norm(arg).lower()
+            if (nm, a) in set(_pairs(prior_actions)):
+                shown = f"{nm}({_norm(arg)})" if a else nm
+                return (f"not run: {shown} ran last turn and sir only "
+                        f"remarked on it; running it again only repeats "
+                        f"that answer")
         if not is_status_action(nm):
             return None
         # Rule 1: a list / status action for a command that changes things.

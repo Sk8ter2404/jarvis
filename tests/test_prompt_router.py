@@ -531,6 +531,49 @@ class BrowserAgentRoutingRegressionTests(unittest.TestCase):
     def test_browser_agent_is_a_parsed_section(self):
         self.assertIn("BROWSER AGENT", self.bodies)
 
+    # v3.0.2: brain golden web-04 "read up on drying temperatures for PLA
+    # filament" was answered from memory. Research-style asks must load the
+    # section (so browse_for is in front of the model) and the body must
+    # say they mean GO AND READ, even when the answer is known.
+    RESEARCH = (
+        "jarvis, read up on drying temperatures for pla filament and give "
+        "me the short version",
+        "look into whether petg needs an enclosure",
+        "research the best infill for strength",
+        "read about annealing pla",
+        "dig into why my first layer keeps lifting",
+        "find out about the new bambu firmware",
+    )
+    PLAIN = (
+        "what temperature should i print petg at",
+        "how hot does the nozzle get",
+        "what's the boiling point of water",
+        # v3.0.2 review: research / look-into words that are not a request
+        "who is the researcher behind crispr",
+        "what does the research say about creatine",
+        "look into the camera",
+        "let's dig into this bug in my code",
+    )
+
+    def test_research_asks_load_the_browser_section(self):
+        misses = [q for q in self.RESEARCH
+                  if "BROWSER AGENT" not in pr.select_sections(q, self.sections)[0]]
+        self.assertEqual(misses, [])
+        for q in self.RESEARCH:
+            self.assertIn("browse_for", pr.slim_pc_control(q, FULL), q)
+
+    def test_plain_knowledge_questions_do_not_pull_the_section(self):
+        hits = [q for q in self.PLAIN
+                if "BROWSER AGENT" in pr.select_sections(q, self.sections)[0]]
+        self.assertEqual(hits, [])
+
+    def test_body_says_research_means_go_and_read(self):
+        body = " ".join(self.bodies["BROWSER AGENT"].split())
+        self.assertIn("GO AND READ the web", body)
+        self.assertIn("never a from-memory reply", body)
+        self.assertIn("[ACTION: browse_for, PLA filament drying temperature]",
+                      body)
+
     def test_flagship_examples_load_the_browser_section(self):
         misses = [q for q, _ in self.FLAGSHIP
                   if "BROWSER AGENT" not in pr.select_sections(q, self.sections)[0]]

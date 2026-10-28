@@ -511,6 +511,20 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # in front of the model when he says it.
         "read up", "look up", "search the web", "on the web", "summarise",
         "summarize", "top three results",
+        # browse_for — research-style asks (v3.0.2, brain golden web-04:
+        # "read up on drying temperatures for PLA filament" was answered
+        # from memory). "look into" / "research" / "read about" / "dig into"
+        # ask JARVIS to go and READ, not to recite; without the section the
+        # model has only the index line and recites.
+        # Request shapes only (v3.0.2 review): a bare "research" / "look
+        # into" / "dig into" also took "who is the researcher behind X",
+        # "look into the camera" and "let's dig into this bug".
+        "do some research", "do research", "research the", "research whether",
+        "research if", "research how", "research what", "research which",
+        "research why", "look into whether", "look into why", "look into how",
+        "look into what", "look into which", "look into the best",
+        "dig into why", "dig into how", "dig into whether", "dig into what",
+        "read about", "find out about",
         # book_appointment — "book a" alone missed 'book me a haircut'.
         "book me", "book an", "book the", "appointment", "reservation",
         "reserve a", "reserve me", "make me a booking",

@@ -41485,6 +41485,59 @@ def _preempt_grounded_by(action_name: str) -> str | None:
     return None
 
 
+# Live v3.0.0 20:28:45: "what version are you running?" -> version_info;
+# 17 s later "Yay, version 3 is done." -> the brain answered "Splendid news,
+# sir! I'm on version 3.0.0" with no action, the injector matched 'state the
+# version from memory' and ran version_info AGAIN, so he heard the version
+# twice. A reading JARVIS gave within _PREEMPT_REMARK_WINDOW_S grounds the
+# same fact in a reply to a REMARK (core.action_fit.is_remark: no question,
+# no command word). "Check again" / "what version again?" are asks, so the
+# injector still runs the action for them. The action-fit guard (rule 5)
+# judges the brain's own re-run of the same reading the same way.
+_PREEMPT_REMARK_WINDOW_S = 60.0
+# Never grounded by a recent reading (v3.0.2 review): a forecast follow-up
+# is often elliptical and remark-shaped ("Cool. And tomorrow.") yet asks a
+# DIFFERENT fact, so a from-memory forecast in the reply must still get
+# weather_briefing injected.
+_PREEMPT_REMARK_NEVER = frozenset({"weather_briefing", "weather_forecast"})
+
+
+def _preempt_recent_reading(action_name: str, user_text: str, *,
+                            now: float | None = None,
+                            history=None) -> tuple[str, float] | None:
+    """(name, age_s) of an action in ``action_name``'s grounding group that
+    ran within _PREEMPT_REMARK_WINDOW_S before now, when ``user_text`` is a
+    remark (no question, no command word); else None. Never raises."""
+    try:
+        if not action_name or not _action_fit.is_remark(user_text):
+            return None
+        target = action_name.lower()
+        if (target in _PREEMPT_REMARK_NEVER
+                or not _action_fit.is_informative_action(target)):
+            return None
+        group = _PREEMPT_GROUNDING_GROUPS.get(target, frozenset()) | {target}
+        t = time.time() if now is None else float(now)
+        if history is None:
+            with _action_history_lock:
+                history = list(_action_history)
+        best = None
+        for e in history:
+            try:
+                name = str(e.get("action") or "").lower()
+                at = float(e.get("at") or 0.0)
+            except Exception:
+                continue
+            if name not in group or not at:
+                continue
+            age = t - at
+            if 0.0 <= age <= _PREEMPT_REMARK_WINDOW_S and (
+                    best is None or age < best[1]):
+                best = (name, age)
+        return best
+    except Exception:
+        return None
+
+
 # Preemptive hallucination patterns. The reactive claim check (see
 # core/claim_validator.py) only fires AFTER parse_and_run_actions has finished
 # — meaning TTS has already spoken the LLM's incorrect "switching to ambient
@@ -43628,7 +43681,19 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         _by = _preempt_grounded_by(action_name)
         if _by:
             _grounded_skips.setdefault(action_name, _by)
-        return bool(_by)
+            return True
+        # A remark about a reading JARVIS gave moments ago (v3.0.2): the
+        # reply reads that result back, it does not invent it.
+        _recent = _preempt_recent_reading(action_name, _turn_user_text())
+        if _recent:
+            print(
+                f"  [preemptive_hallucination] claim is grounded by "
+                f"{_recent[0]}, which ran {_recent[1]:.0f} s ago, and sir "
+                f"only remarked on it — not re-injecting "
+                f"[ACTION: {action_name}]"
+            )
+            return True
+        return False
 
     _preempt = _detect_preemptive_hallucination(
         _preempt_scan, is_grounded=_preempt_is_grounded,
