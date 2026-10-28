@@ -240,6 +240,9 @@ _ALARM_WORDS = {
     "clash": ("a file clash", "file clashes"),
     "gpu_contention": ("GPU contention", "GPU contention alarms"),
     "error": ("an error", "errors"),
+    "runaway": ("a runaway agent", "runaway agents"),
+    "needs_braden": ("something waiting on you over an hour",
+                     "things waiting on you over an hour"),
 }
 
 
@@ -296,15 +299,24 @@ def _waiting_sentence(waits: list, now) -> str:
 
 def _alarm_sentence(state: dict) -> str:
     counts: dict = {}
+    first_what: dict = {}
     for a in _items(state.get("alarms")):
         k = str(a.get("kind") or "").strip().lower()
         counts[k] = counts.get(k, 0) + 1
+        if k not in first_what:
+            first_what[k] = clean(a.get("what"), 60)
     if not counts:
         return ""
     bits = []
     for k, c in counts.items():
-        one, many = _ALARM_WORDS.get(k, ("an unrecognised alarm", "unrecognised alarms"))
-        bits.append(one if c == 1 else f"{c} {many}")
+        if k in _ALARM_WORDS:
+            one, many = _ALARM_WORDS[k]
+            bits.append(one if c == 1 else f"{c} {many}")
+        elif c == 1 and first_what.get(k):
+            # a kind the Office added later: say its own (cleaned) description
+            bits.append(first_what[k])
+        else:
+            bits.append("an unrecognised alarm" if c == 1 else f"{c} unrecognised alarms")
     total = sum(counts.values())
     head = "One alarm" if total == 1 else f"{total} alarms"
     return head + ": " + ", ".join(bits) + "."

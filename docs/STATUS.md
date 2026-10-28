@@ -4,8 +4,8 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v2.0.230
-- Live since: 2026-10-20
+- Version: v3.0.0
+- Live since: 2026-10-27
 - Latest change: v2.0.213 (10-18): test-only fix for Linux CI.
 
 ## In progress
@@ -58,6 +58,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v3.0.0 (2026-10-27): Version 3, a full overhaul. A slimmer, clearer prompt (43,875 to 40,815 characters) so he picks the right action more often (94.0% vs 90.1% on the test set; unverified claims 3 to 0). One name per job: near-miss and invented action names map to the real one, and a verb-clash guard keeps mute and pause apart. New 'move this file to ...' and 'undo the last move' (your own folders only; he asks first). Learning works again (packed learning replies were being dropped). Proactive remarks no longer claim actions he didn't take, and 'shut down, no overnight protocol' asks instead of guessing. 'What are my agents doing / anything waiting on me?' reads the Agent Office. Watch-only guards for wrong-but-allowed actions and action ping-pong, plus a per-turn trace report. Off until switched on: link reader, faster boot, background jobs on another computer. A security review found 13 issues; all fixed.
 - v2.0.231 (2026-10-26): Fixes from tonight's live log: habit offers no longer announce a wrong time ('Around this time on Mondays, sir' instead of 'It's Monday 7 PM' at 8 PM); 'play X on YouTube on the left monitor' plays it and moves it there instead of opening a search page; 'play my song from earlier / play that again' replays your last music or video request instead of searching for a song called 'Earlier'; 'tell Claude to ...', '..., or tell Claude to do it' and 'pass it over to Claude' save a note for Claude instead of 'I can't' and a web search.
 - v2.0.230 (2026-10-20): JARVIS knows he is one copy that moves between your machines. On the desktop right after a day on the Dell he said 'I've never quite made myself at home in the Dell, sir' and then 'a bit of a squeeze in this laptop': his prompt said 'there may be other versions of you running in other rooms' and never named the machine. With a handoff partner he is now told he is ONE JARVIS, which machine he is running on (new machine-local MACHINE_NAME: desktop / Dell laptop), and that 'On the Dell laptop' memories are his own time there.
 - v2.0.229 (2026-10-20): Test-only fix for GitHub CI: v2.0.228's new two-hand test imported a module it never used, which the pyflakes lint step rejects (the local suite does not run pyflakes). No change to JARVIS itself.
@@ -67,6 +68,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.225 (2026-10-20): Stops the made-up numbers at the source. His personality rules TOLD him to put a number on everything ('Tag the certainty with a percentage or probability whenever you can', with sample lines like 'A 78% probability' and 'CPU at 34%, RAM at 61%' that he copied with new numbers); now a number comes only from a reading this turn, and confidence is said in words. The number checker also learns CPU, memory, GPU, time left, percent done and percentages on a confidence; a guess written before a reading that the same reply runs ("CPU at 12%" then system_pulse) is dropped quietly so only the real reading is spoken.
 - v2.0.224 (2026-10-20): The action router hands the brain the right instructions more often (measured on 50 real bad turns: 27 -> 34 of 39 expected actions, +17 prompt tokens a turn on average): 'how bad is the background noise', 'dampen the audio', 'anything to do for school tonight', 'what's linked to my Tuya account', 'it's downloading something' and rebuild / parity questions now reach room_noise, volume_down, calendar_today, smart_home_account, the bandwidth actions and server_status. An embedding-search router was tried and lost (30 of 39 for ~1,400 extra tokens).
 - v2.0.223 (2026-10-20): Echo cancelling waits for a late PC-audio reference (up to 0.25 s while the loopback is alive): the 10-19 room recording showed the reference arriving >= ~58 ms after the echo, so the canceller had been cancelling against silence (simulated 4.6 -> ~17 dB). And the Claude safety net now works with local-first settings: a turn the checker catches is redone once on Claude Sonnet 5.5 while the Claude boost is on (TURN_CHECK_MODE on).
-- v2.0.222 (2026-10-20): Stops answering the room TV (camera sees the TV on + a full 30 s capture of nonstop sound + a voice that isn't clearly his -> dropped, with a spoken 'couldn't tell that was you'); the voice server restarts itself after 3 CUDA-error renders (a GPU driver reset left it broken); the headset's charging status (0x05) counts as on, so the deaf-mic rescue can run; rebuild/parity questions go to the server skill; only facts the owner said himself are shared or imported between the machines.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).

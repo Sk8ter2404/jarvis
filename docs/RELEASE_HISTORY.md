@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.0 (2026-10-27)
+
+Version 3, a full overhaul. A slimmer, clearer prompt (43,875 to 40,815 characters) so he picks the right action more often (94.0% vs 90.1% on the test set; unverified claims 3 to 0). One name per job: near-miss and invented action names map to the real one, and a verb-clash guard keeps mute and pause apart. New 'move this file to ...' and 'undo the last move' (your own folders only; he asks first). Learning works again (packed learning replies were being dropped). Proactive remarks no longer claim actions he didn't take, and 'shut down, no overnight protocol' asks instead of guessing. 'What are my agents doing / anything waiting on me?' reads the Agent Office. Watch-only guards for wrong-but-allowed actions and action ping-pong, plus a per-turn trace report. Off until switched on: link reader, faster boot, background jobs on another computer. A security review found 13 issues; all fixed.
+
 ## v2.0.231 (2026-10-26)
 
 Fixes from tonight's live log: habit offers no longer announce a wrong time ('Around this time on Mondays, sir' instead of 'It's Monday 7 PM' at 8 PM); 'play X on YouTube on the left monitor' plays it and moves it there instead of opening a search page; 'play my song from earlier / play that again' replays your last music or video request instead of searching for a song called 'Earlier'; 'tell Claude to ...', '..., or tell Claude to do it' and 'pass it over to Claude' save a note for Claude instead of 'I can't' and a web search.

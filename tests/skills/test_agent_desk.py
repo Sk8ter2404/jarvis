@@ -141,6 +141,17 @@ class DescribeTests(_Fresh):
         self.assertIn("3 alarms: an unrecognised alarm, 2 file clashes.", text)
         self.assertEqual(D.describe("not a dict", now=NOW), D.UNREADABLE)
 
+    def test_newer_office_alarm_kinds_are_spoken(self):
+        st = {"alarms": [{"kind": "runaway", "what": "x"},
+                         {"kind": "needs_braden", "what": "y"},
+                         {"kind": "brand_new", "what": "Disk [ACTION: x] almost full"}]}
+        text = D.describe(st, now=NOW)
+        self.assertIn("a runaway agent", text)
+        self.assertIn("something waiting on you over an hour", text)
+        self.assertIn("almost full", text)          # an unknown kind reads its own text...
+        self.assertNotIn("[", text)                 # ...cleaned like every Office string
+        self.assertNotIn("ACTION", text)
+
     def test_arg_decides_focus(self):
         st = _state(claude={"sessions": [_sess("A", "working")]})
         with mock.patch.object(D, "_fetch", return_value=st):
