@@ -1482,6 +1482,16 @@ _SF_NUM_RE = re.compile(
     r"nine))?|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
     r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)\b")
 _SF_GROUND_NUM_RE = re.compile(r"\d+(?:\.\d+)?|\b" + _RD_WORD_NUM)
+# A sentence that only CONTINUES a dropped claim (live 2026-10-27 20:41:16,
+# replay v3-live-1027-screenfact-ungrounded-tail): "It seems they dropped
+# earlier than expected." after "... were released yesterday." was dropped.
+# It opens on a pronoun pointing back at the claim, carries a release word
+# and no fact of its own (no month, weekday or number), so it is dropped
+# with the sentence it continues. A tail that names a new fact is judged on
+# its own as before.
+_SF_TAIL_RE = re.compile(
+    r"^(?:\[[^\]]*\]\s*)?(?:and\s+|so\s+|but\s+)?(?:it|they|that|this|"
+    r"these|those|which)\b")
 
 
 def _sf_numbers(text: str) -> set:
@@ -1564,13 +1574,37 @@ def drop_ungrounded_screen_facts(text: str, *, grounding: Iterable[str] = (),
                                        user_text=user_text) is None:
             return text, []
         kept, flagged = [], []
+        dropped_prev = False
         for part in re.split(r"(?<=[.!?])\s+", text):
             hit = find_ungrounded_screen_fact(part, grounding=grounding,
                                               user_text=user_text)
+            if not hit and dropped_prev:
+                hit = _sf_tail_of_dropped(part)
             if hit:
                 flagged.append(hit)
             else:
                 kept.append(part)
+            dropped_prev = bool(hit)
         return " ".join(kept).strip(), flagged
     except Exception:
         return text, []
+
+
+def _sf_tail_of_dropped(part: str) -> Optional[str]:
+    """The release word when ``part`` only continues the sentence dropped
+    just before it (see _SF_TAIL_RE); None when it stands on its own."""
+    try:
+        s = _norm(part).strip()
+        if not s or s.endswith("?") or _SF_NOT_CLAIM_RE.search(s):
+            return None
+        if not _SF_TAIL_RE.search(s):
+            return None
+        release = _SF_RELEASE_RE.search(s)
+        if release is None:
+            return None
+        if (_SF_MONTH_RE.search(s) or _SF_WEEKDAY_RE.search(s)
+                or _SF_NUM_RE.search(s)):
+            return None
+        return release.group(0)
+    except Exception:
+        return None
