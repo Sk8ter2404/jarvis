@@ -6057,8 +6057,14 @@ def _act_read_changelog(args: str = "") -> str:
     voice."""
     bc = _bc()
     try:
-        _changelog_path = os.path.join(
-            os.path.dirname(os.path.abspath(bc.__file__)), "CHANGELOG.md")
+        _root = os.path.dirname(os.path.abspath(bc.__file__))
+        # The release history (tracked, one "## vX.Y.Z" entry per release) is
+        # what "what's new" means. CHANGELOG.md is the self-upgrade pipeline's
+        # own log (gitignored, last entry v1.0.17 in 2026-05), so it is only
+        # the fallback - reading it first answered "what's new" with May.
+        _changelog_path = os.path.join(_root, "docs", "RELEASE_HISTORY.md")
+        if not os.path.exists(_changelog_path):
+            _changelog_path = os.path.join(_root, "CHANGELOG.md")
         if not os.path.exists(_changelog_path):
             return "I don't have a changelog file yet, sir."
         with open(_changelog_path, "r", encoding="utf-8") as _cf:
@@ -6091,7 +6097,8 @@ def _act_read_changelog(args: str = "") -> str:
             except Exception:
                 pass
             return ("The latest changelog entry is sizeable, sir — I've "
-                    "opened CHANGELOG.md for you to read in full.")
+                    f"opened {os.path.basename(_changelog_path)} for you to "
+                    "read in full.")
         plural = "entries" if n_entries > 1 else "entry"
         system = (
             "You are J.A.R.V.I.S. Summarise the following CHANGELOG.md "

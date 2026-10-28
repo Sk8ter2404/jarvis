@@ -1304,6 +1304,16 @@ class WordBoundaryKeywordRoutingTests(unittest.TestCase):
             with self.subTest(q=q):
                 self.assertNotIn(wrong, self._inc(q))
 
+    def test_whats_all_new_loads_the_changelog_section(self):
+        # 2026-10-27 live (v3.0.0): "Jarvis, what's all new?" loaded no
+        # changelog section and the brain said it had no way to check.
+        for q in ("Jarvis, what's all new?", "whats new", "what all is new"):
+            with self.subTest(q=q):
+                self.assertIn("CHANGELOG / VERSION", self._inc(q))
+        for q in ("anything new in my email?", "what is new in the news?"):
+            with self.subTest(q=q):
+                self.assertNotIn("CHANGELOG / VERSION", self._inc(q))
+
     def test_word_start_matches_keep_their_suffixes(self):
         for q, want in (("is it printing", "BAMBU 3D PRINTER"),
                         ("is auto switching on", "AUDIO OUTPUT DEVICE"),

@@ -241,7 +241,11 @@ def _hidden_or_system(p: str) -> bool:
 
 def _is_drive_root(p: str) -> bool:
     a = os.path.abspath(p)
-    return os.path.dirname(a) == a
+    if os.path.dirname(a) == a:
+        return True
+    # "C:\" / "D:" as text is a drive root on any OS; on the Linux CI runner
+    # posixpath.abspath turns it into <cwd>/C:\ and the check above misses it.
+    return bool(re.fullmatch(r"[A-Za-z]:[\\/]?", str(p).strip()))
 
 
 def refusal(path: str) -> str:
@@ -249,7 +253,7 @@ def refusal(path: str) -> str:
     in the owner's words; '' when it is allowed. Never raises."""
     try:
         a = os.path.abspath(path)
-        if _is_drive_root(a):
+        if _is_drive_root(path) or _is_drive_root(a):
             return "I won't move anything into or out of a drive's top folder, sir."
         for pre in refused_prefixes():
             if _under(a, pre):

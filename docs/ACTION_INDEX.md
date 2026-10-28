@@ -52,7 +52,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `add_notification_rule` | `skills/notification_triage.py:1566` | **VERBATIM** | — | yes |
 | `add_reminder` | `skills/shopping_list.py:104` | **VERBATIM** | yes | yes |
 | `add_shopping_item` | `skills/shopping_list.py:46` | **VERBATIM** | yes | yes |
-| `agents_status` | `skills/agent_desk.py:349` | **VERBATIM** | — | yes |
+| `agents_status` | `skills/agent_desk.py:361` | **VERBATIM** | — | yes |
 | `air_control_off` | `skills/air_control.py:405` | **VERBATIM** | yes | yes |
 | `air_control_on` | `skills/air_control.py:385` | **VERBATIM** | yes | yes |
 | `air_control_status` | `skills/air_control.py:414` | **VERBATIM** | yes | yes |
@@ -77,9 +77,9 @@ One row per action, sorted by name; aliases share their handler's location.
 | `ambient_listen_start` | `skills/ambient_listen.py:1885` | neither | — | yes |
 | `ambient_listen_status` | `skills/ambient_listen.py:2095` | **VERBATIM** | yes | yes |
 | `ambient_listen_stop` | `skills/ambient_listen.py:1914` | neither | — | yes |
-| `ambient_listening` | `core/actions.py:7606` | neither | — | yes |
+| `ambient_listening` | `core/actions.py:7613` | neither | — | yes |
 | `ambient_mic_only` | `skills/ambient_listen.py:2083` | neither | — | yes |
-| `ambient_mode` | `core/actions.py:7606` | neither | — | yes |
+| `ambient_mode` | `core/actions.py:7613` | neither | — | yes |
 | `ambient_mode_off` | `core/actions.py:3426` | neither | — | yes |
 | `ambient_mode_on` | `core/actions.py:3426` | neither | — | yes |
 | `ambient_screen_start` | `skills/ambient_listen.py:1982` | neither | — | yes |
@@ -153,7 +153,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `cancel_timer` | `skills/timer.py:650` | **VERBATIM** | yes | yes |
 | `categorise_inbox` | `skills/email_triage.py:1240` | **VERBATIM** | — | yes |
 | `categorize_inbox` | `skills/email_triage.py:1240` | **VERBATIM** | — | yes |
-| `chappie_mode` | `core/actions.py:7606` | neither | — | yes |
+| `chappie_mode` | `core/actions.py:7613` | neither | — | yes |
 | `chappie_recall_entity` | `skills/chappie_consciousness.py:570` | **VERBATIM** | — | yes |
 | `chappie_recall_today` | `skills/chappie_consciousness.py:599` | **VERBATIM** | — | yes |
 | `chappie_status` | `skills/chappie_consciousness.py:641` | **VERBATIM** | — | yes |
@@ -169,7 +169,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `clap_trigger_on` | `skills/clap_trigger.py:792` | **VERBATIM** | yes | yes |
 | `clap_trigger_routine` | `skills/clap_trigger.py:866` | **VERBATIM** | yes | yes |
 | `clap_trigger_status` | `skills/clap_trigger.py:824` | **VERBATIM** | yes | yes |
-| `clear_llm_cache` | `core/actions.py:7599` | neither | — | yes |
+| `clear_llm_cache` | `core/actions.py:7606` | neither | — | yes |
 | `clear_reminders_list` | `skills/shopping_list.py:154` | **VERBATIM** | — | yes |
 | `clear_shopping_list` | `skills/shopping_list.py:94` | **VERBATIM** | — | yes |
 | `clear_tasks` | `core/actions.py:901` | neither | yes | yes |
@@ -187,7 +187,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `control_light` | `core/smart_home_router.py:1132` | neither | — | yes |
 | `control_plug` | `core/smart_home_router.py:1132` | neither | — | yes |
 | `control_smart_home` | `core/smart_home_router.py:1132` | **VERBATIM** | — | yes |
-| `create_skill` | `core/actions.py:6831` | neither | yes | yes |
+| `create_skill` | `core/actions.py:6838` | neither | yes | yes |
 | `current_mic` | `skills/audio_devices.py:303` | **VERBATIM** | yes | yes |
 | `current_model` | `skills/model_picker.py:481` | **VERBATIM** | yes | yes |
 | `current_speaker` | `skills/audio_devices.py:307` | **VERBATIM** | — | yes |
@@ -199,7 +199,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `device_online` | `skills/network_deco.py:719` | **VERBATIM** | — | yes |
 | `diagnostic_daemon_status` | `core/diagnostic_daemons.py:1630` | **VERBATIM** | — | yes |
 | `diagnostic_history` | `skills/self_diagnostic.py:4704` | **VERBATIM** | — | yes |
-| `diagnostic_status` | `bobert_companion.py:49347` | **VERBATIM** | yes | yes |
+| `diagnostic_status` | `bobert_companion.py:49373` | **VERBATIM** | yes | yes |
 | `disable_guest_network` | `skills/network_deco.py:809` | neither | — | yes |
 | `disable_night_owl` | `skills/night_owl_mode.py:502` | neither | — | yes |
 | `disable_voice_clone` | `skills/voice_clone.py:244` | **VERBATIM** | yes | yes |
@@ -232,7 +232,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `eval_python` | `skills/code_executor.py:395` | *INFORMATIVE* | — | yes |
 | `evening_briefing` | `skills/daily_briefing/evening.py:943` | neither | yes | yes |
 | `exit_ambient_learning` | `bobert_companion.py:40086` | neither | — | yes |
-| `exit_jarvis` | `core/actions.py:7310` | neither | — | yes |
+| `exit_jarvis` | `core/actions.py:7317` | neither | — | yes |
 | `export_memory` | `core/actions.py:3625` | neither | yes | yes |
 | `face_id_status` | `skills/face_id.py:380` | **VERBATIM** | — | yes |
 | `face_track_status` | `skills/face_tracker.py:1417` | **VERBATIM** | — | yes |
@@ -240,7 +240,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `file_on` | `skills/dossier.py:666` | neither | — | yes |
 | `fill_form` | `skills/browser_agent.py:799` | *INFORMATIVE* | yes | yes |
 | `find_cheapest` | `skills/browser_agent.py:832` | *INFORMATIVE* | yes | yes |
-| `find_on_screen` | `core/actions.py:7580` | *INFORMATIVE* | yes | yes |
+| `find_on_screen` | `core/actions.py:7587` | *INFORMATIVE* | yes | yes |
 | `fire_schedule` | `skills/schedule_manager.py:542` | **VERBATIM** | — | yes |
 | `first_time_printer_setup` | `skills/bambu_setup.py:538` | neither | — | yes |
 | `focus_mode` | `skills/focus_mode.py:298` | **VERBATIM** | yes | yes |
@@ -429,7 +429,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `mouse_control_off` | `skills/kinect_air_mouse.py:4059` | **VERBATIM** | — | yes |
 | `mouse_control_on` | `skills/kinect_air_mouse.py:4030` | **VERBATIM** | — | yes |
 | `move_file` | `skills/file_move.py:1011` | **VERBATIM** | — | yes |
-| `move_window_to_monitor` | `core/actions.py:6764` | neither | yes | yes |
+| `move_window_to_monitor` | `core/actions.py:6771` | neither | yes | yes |
 | `ms_graph_calendar` | `skills/ms_graph.py:775` | **VERBATIM** | — | yes |
 | `music_aggregate` | `skills/apple_music_intel.py:932` | **VERBATIM** | — | yes |
 | `music_history` | `skills/apple_music_intel.py:887` | **VERBATIM** | yes | yes |
@@ -455,7 +455,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `notify_phone` | `skills/phone_bridge.py:1073` | **VERBATIM** | yes | yes |
 | `now_playing` | `core/actions.py:1423` | *INFORMATIVE* | — | yes |
 | `open_apple_music` | `core/actions.py:1485` | neither | yes | yes |
-| `open_on_monitor` | `core/actions.py:6543` | neither | yes | yes |
+| `open_on_monitor` | `core/actions.py:6550` | neither | yes | yes |
 | `open_url` | `core/actions.py:431` | *INFORMATIVE* | — | yes |
 | `outbound_gate_status` | `skills/draft_preview_gate.py:227` | **VERBATIM** | yes | yes |
 | `pattern_aggregate` | `skills/pattern_learning.py:1097` | **VERBATIM** | — | yes |
@@ -487,7 +487,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `point_control_on` | `skills/kinect_pointing.py:529` | **VERBATIM** | — | yes |
 | `point_status` | `skills/kinect_pointing.py:502` | **VERBATIM** | — | yes |
 | `point_targets` | `skills/kinect_pointing.py:411` | **VERBATIM** | — | no |
-| `power_off_jarvis` | `core/actions.py:7310` | neither | — | yes |
+| `power_off_jarvis` | `core/actions.py:7317` | neither | — | yes |
 | `pre_draft_reply` | `skills/email_triage.py:1120` | *INFORMATIVE* | — | yes |
 | `predictive_morning_setup` | `skills/daily_briefing/handoff.py:754` | **VERBATIM** | yes | yes |
 | `press` | `core/actions.py:1126` | neither | — | yes |
@@ -516,7 +516,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `python` | `skills/code_executor.py:395` | *INFORMATIVE* | — | yes |
 | `queue_task` | `core/actions.py:1602` | *INFORMATIVE* | yes | yes |
 | `quiet_mode` | `skills/focus_mode.py:298` | **VERBATIM** | — | yes |
-| `quit_jarvis` | `core/actions.py:7310` | neither | — | yes |
+| `quit_jarvis` | `core/actions.py:7317` | neither | — | yes |
 | `rag_configure` | `skills/personal_rag.py:240` | **VERBATIM** | — | yes |
 | `rag_open_top` | `skills/personal_rag.py:277` | **VERBATIM** | yes | yes |
 | `rag_reindex` | `skills/personal_rag.py:180` | **VERBATIM** | — | yes |
@@ -550,7 +550,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `report_a_bug` | `core/actions.py:4516` | **VERBATIM** | — | yes |
 | `report_bug` | `core/actions.py:4516` | **VERBATIM** | yes | yes |
 | `reset_kernel` | `skills/code_executor.py:408` | neither | — | yes |
-| `reset_llm_cache` | `core/actions.py:7599` | neither | — | yes |
+| `reset_llm_cache` | `core/actions.py:7606` | neither | — | yes |
 | `reset_memory` | `core/actions.py:4324` | neither | yes | yes |
 | `restart` | `core/actions.py:965` | neither | — | yes |
 | `resume` | `core/mic_bus.py:484` | **VERBATIM** | — | yes |
@@ -628,9 +628,9 @@ One row per action, sorted by name; aliases share their handler's location.
 | `show_workshop_hud` | `skills/holographic_overlay/__init__.py:1156` | neither | — | yes |
 | `show_workshop_print_monitor` | `skills/holographic_overlay/__init__.py:1409` | neither | — | yes |
 | `shuffle_library` | `skills/itunes_library.py:252` | **VERBATIM** | yes | yes |
-| `shut_down` | `core/actions.py:7310` | neither | — | yes |
-| `shutdown_jarvis` | `core/actions.py:7310` | neither | — | yes |
-| `silent_learning` | `core/actions.py:7606` | neither | — | yes |
+| `shut_down` | `core/actions.py:7317` | neither | — | yes |
+| `shutdown_jarvis` | `core/actions.py:7317` | neither | — | yes |
+| `silent_learning` | `core/actions.py:7613` | neither | — | yes |
 | `silent_learning_off` | `core/actions.py:3426` | neither | — | yes |
 | `silent_learning_on` | `core/actions.py:3426` | neither | — | yes |
 | `situational_awareness` | `skills/camera_system.py:651` | **VERBATIM** | — | yes |
@@ -653,7 +653,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `stark_status_ring_status` | `skills/holographic_overlay/__init__.py:1826` | **VERBATIM** | yes | yes |
 | `stark_status_ring_toggle` | `skills/holographic_overlay/__init__.py:1820` | neither | — | yes |
 | `start_eavesdropping` | `core/actions.py:3426` | neither | — | yes |
-| `start_overnight_upgrade` | `core/actions.py:6119` | neither | — | yes |
+| `start_overnight_upgrade` | `core/actions.py:6126` | neither | — | yes |
 | `status_hud` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
 | `status_hud_off` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
 | `status_hud_on` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
@@ -675,7 +675,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `suit_diagnostics` | `skills/status_panel.py:511` | **VERBATIM** | — | yes |
 | `suit_up` | `skills/suit_up.py:361` | neither | yes | yes |
 | `suit_up_sequence` | `skills/suit_up.py:361` | neither | — | yes |
-| `switch_llm` | `core/actions.py:7441` | neither | — | yes |
+| `switch_llm` | `core/actions.py:7448` | neither | — | yes |
 | `switch_llm_picker` | `core/actions.py:1044` | neither | — | yes |
 | `switch_to_desk_mic` | `skills/audio_autoswitch.py:299` | **VERBATIM** | — | yes |
 | `switch_to_headset` | `skills/audio_autoswitch.py:223` | **VERBATIM** | — | no |
@@ -697,7 +697,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `tplink_list` | `skills/sh_kasa.py:501` | *INFORMATIVE* | — | no |
 | `triage_inbox` | `skills/email_triage.py:1240` | **VERBATIM** | — | yes |
 | `triage_status` | `skills/notification_triage.py:1531` | **VERBATIM** | — | yes |
-| `turn_off_jarvis` | `core/actions.py:7310` | neither | — | yes |
+| `turn_off_jarvis` | `core/actions.py:7317` | neither | — | yes |
 | `tuya_list` | `skills/sh_tuya.py:224` | *INFORMATIVE* | — | yes |
 | `tuya_list_devices` | `skills/sh_tuya.py:224` | *INFORMATIVE* | — | no |
 | `tv_calibrate` | `skills/tv_detect.py:444` | **VERBATIM** | — | no |
@@ -710,7 +710,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `undo_last_move` | `skills/file_move.py:1025` | **VERBATIM** | — | yes |
 | `unread_email` | `skills/email_triage.py:1076` | *INFORMATIVE* | — | yes |
 | `unread_emails` | `skills/email_triage.py:1076` | *INFORMATIVE* | — | no |
-| `upgrade` | `core/actions.py:6944` | neither | — | yes |
+| `upgrade` | `core/actions.py:6951` | neither | — | yes |
 | `use_desk_mic` | `skills/audio_autoswitch.py:299` | **VERBATIM** | — | yes |
 | `use_headset` | `skills/audio_autoswitch.py:223` | **VERBATIM** | yes | yes |
 | `use_headset_mic` | `skills/audio_autoswitch.py:263` | **VERBATIM** | — | yes |

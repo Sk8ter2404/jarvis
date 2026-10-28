@@ -2507,6 +2507,26 @@ class ReadChangelogTests(unittest.TestCase):
         sys_prompt = bc._llm_quick.call_args[0][0]
         self.assertIn("CHANGELOG.md entry", sys_prompt)
 
+    def test_release_history_wins_over_the_pipeline_changelog(self):
+        # CHANGELOG.md is the self-upgrade pipeline's log (stuck at v1.0.17);
+        # "what's new" must read the tracked release history first.
+        with tempfile.TemporaryDirectory() as td:
+            self._write_changelog(td, "## v1.0.17 — 2026-05-30\n- overnight stuff\n")
+            os.makedirs(os.path.join(td, "docs"))
+            with open(os.path.join(td, "docs", "RELEASE_HISTORY.md"), "w",
+                      encoding="utf-8") as f:
+                f.write("# Release history\n\n## v3.0.0 (2026-10-27)\n\nVersion 3.\n\n"
+                        "## v2.0.231 (2026-10-26)\n\nFixes.\n")
+            bc = _base_bc(td)
+            bc._llm_quick.return_value = "Version 3 is out."
+            with _patch_bc(bc):
+                out = A._act_read_changelog()
+        self.assertEqual(out, "Version 3 is out.")
+        user = bc._llm_quick.call_args[0][1]
+        self.assertIn("## v3.0.0", user)
+        self.assertNotIn("v1.0.17", user)
+        self.assertNotIn("v2.0.231", user)          # only the newest entry
+
     def test_history_request_pulls_three(self):
         with tempfile.TemporaryDirectory() as td:
             self._write_changelog(

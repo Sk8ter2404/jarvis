@@ -405,6 +405,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "CHANGELOG / VERSION": [
         "version", "what's new", "changelog", "update notes", "your version",
         "what changed", "what version",
+        # 2026-10-27 live: "Jarvis, what's all new?" missed every key above
+        # and the brain said it had no way to check.
+        # ("anything new" / "what is new" stay out: "anything new in my
+        # email?" and "what is new in the news?" belong to other sections.)
+        "what's all new", "whats new", "whats all new", "what all is new",
         # 2026-09-06: the big block also owns check_for_updates, model_costs
         # and report_bug, and the list above covered none of them.
         #   'check for updates'  -> selected BAMBU PRINTER LAN CHECK ALIAS (!)
