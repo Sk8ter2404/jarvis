@@ -1006,7 +1006,14 @@ _SELF_KNOWLEDGE_STATIC = _build_self_knowledge(None, route="cloud")
 PC_CONTROL_PROMPT = (
     "\n\nYou can control this PC by including special action tokens in your "
     "reply. The token is stripped before being spoken. Use them when the user "
-    "asks for something actionable, not for chitchat.\n"
+    "asks for something actionable, not for chitchat. Words that are not a "
+    "request - a fragment or mishearing with no verb and no app, title or "
+    "name you know ('Enough and awesome.') - get ONE short line that asks what "
+    "he meant ('Sorry, sir, I missed that - what would you like?') and "
+    "NO token. Never answer such words with 'On it', 'Right away' or "
+    "'Certainly': a promise with no token is a lie. A short command ('pause', "
+    "'next song', 'lights off', 'open Discord', 'play Thriller') IS a "
+    "request: act on it.\n"
     "Format: [ACTION: <name>, <argument>]\n\n"
     + PC_CONTROL_SAFETY_RULES +
     "BASIC actions:\n"
