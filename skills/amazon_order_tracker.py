@@ -380,6 +380,14 @@ def _backend_problem() -> str:
             "I'll watch for your Amazon orders.")
 
 
+def backend_problem() -> str:
+    """'' when the tracker can read mail, else the reason it cannot - the
+    answer it gives when he ASKS, sign-in command and all. A caller that speaks
+    unprompted (the morning briefing, skills/daily_briefing/arrival_v2.py)
+    says nothing about orders when this is non-empty."""
+    return _backend_problem()
+
+
 # ─── State persistence ──────────────────────────────────────────────────
 
 def _empty_state() -> dict:

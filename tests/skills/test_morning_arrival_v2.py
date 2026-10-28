@@ -345,6 +345,39 @@ class MorningArrivalV2Tests(unittest.TestCase):
         with mock.patch.object(self.mod, "_import_skill", return_value=aot):
             self.assertEqual(self.mod._section_deliveries(), "")
 
+    # The live line (session_2026-10-28_03-23-37.log 06:01:26, and every
+    # arrival since 2026-10-13): "Good morning, sir. I need a Google sign-in
+    # first, sir. Run python -m skills.amazon_order_tracker --auth-gmail once".
+    LIVE_SIGN_IN = ("I need a Google sign-in first, sir. Run python -m "
+                    "skills.amazon_order_tracker --auth-gmail once (it asks for "
+                    "read-only Gmail access) and I'll watch for your Amazon "
+                    "orders.")
+
+    def test_section_deliveries_silent_when_the_mailbox_is_unreadable(self):
+        asked = []
+        aot = _fake_mod(backend_problem=lambda: self.LIVE_SIGN_IN,
+                        action_check_orders=lambda _: asked.append(1) or
+                        self.LIVE_SIGN_IN)
+        with mock.patch.object(self.mod, "_import_skill", return_value=aot):
+            self.assertEqual(self.mod._section_deliveries(), "")
+        self.assertEqual(asked, [])      # no mailbox refresh attempted either
+
+    def test_section_deliveries_speaks_orders_when_the_mailbox_reads(self):
+        line = "Amazon, sir: the headphones — shipped, arriving Friday."
+        aot = _fake_mod(backend_problem=lambda: "",
+                        action_check_orders=lambda _: line)
+        with mock.patch.object(self.mod, "_import_skill", return_value=aot):
+            self.assertEqual(self.mod._section_deliveries(), line)
+
+    def test_section_deliveries_problem_check_raising_falls_through(self):
+        def _boom():
+            raise RuntimeError("tracker half-loaded")
+        aot = _fake_mod(backend_problem=_boom,
+                        action_check_orders=lambda _: "Package arriving today.")
+        with mock.patch.object(self.mod, "_import_skill", return_value=aot):
+            self.assertEqual(self.mod._section_deliveries(),
+                             "Package arriving today.")
+
     def test_section_calendar_skill_absent(self):
         with mock.patch.object(self.mod, "_import_skill", return_value=None):
             self.assertEqual(self.mod._section_calendar(), "")
@@ -907,6 +940,37 @@ class GatherAndFireTests(unittest.TestCase):
             out = self.mod._gather_sections()
         self.assertEqual(out, {"weather": "W", "teams": "T", "print": "P",
                                "deliveries": "D", "calendar": "C", "news": "N"})
+
+    def test_gather_sections_leaves_out_setup_instructions(self):
+        # Whatever section it comes from, a setup command is not news.
+        with mock.patch.object(self.mod, "_section_weather",
+                               return_value="Rain after three, sir"), \
+             mock.patch.object(self.mod, "_section_teams", return_value=""), \
+             mock.patch.object(self.mod, "_section_print", return_value=""), \
+             mock.patch.object(self.mod, "_section_deliveries",
+                               return_value="I need a Google sign-in first, "
+                               "sir. Run python -m skills.amazon_order_tracker "
+                               "--auth-gmail once."), \
+             mock.patch.object(self.mod, "_section_calendar", return_value=""), \
+             mock.patch.object(self.mod, "_section_news",
+                               return_value="Run `python -m skills.ms_graph "
+                               "--auth` to authorise Microsoft Graph."), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            parts = self.mod._gather_sections()
+        self.assertEqual(parts["weather"], "Rain after three, sir")
+        self.assertEqual(parts["deliveries"], "")
+        self.assertEqual(parts["news"], "")
+        self.assertIn("section 'deliveries' left out", out.getvalue())
+        text = self.mod._compose_within_budget(parts)
+        self.assertNotIn("python", text.lower())
+        self.assertTrue(text.startswith("[intent:briefing] Good morning, sir."))
+
+    def test_setup_text_guard_leaves_ordinary_news_alone(self):
+        for news in ("Markets rallied -- stocks up two percent.",
+                     "Python 3.15 ships today, sir.",
+                     "A new sign-in rule for banks takes effect."):
+            with self.subTest(news=news):
+                self.assertIsNone(self.mod._SETUP_TEXT_RE.search(news))
 
     def test_gather_sections_crashed_section_maps_blank(self):
         with mock.patch.object(self.mod, "_section_weather",

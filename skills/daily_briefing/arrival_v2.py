@@ -11,7 +11,7 @@ chaining six overnight-relevant sources:
   2. ms_graph.get_teams_unread_count()      (unread Teams chats + top sender)
   3. ms_graph.get_first_meeting("today")    (today's calendar)
   4. bambu_monitor — overnight print completion / current state
-  5. amazon_order_tracker.action_check_orders()
+  5. amazon_order_tracker.action_check_orders()   (only when it can read mail)
   6. news_briefing.get_news_text()          (top 3 headlines)
 
 Each section is gathered in parallel with a per-section hard timeout
@@ -454,10 +454,22 @@ def _section_print() -> str:
 
 
 def _section_deliveries() -> str:
-    """Amazon orders / deliveries summary. '' when nothing is in transit."""
+    """Amazon orders / deliveries summary. '' when nothing is in transit, or
+    when the tracker cannot read mail: its answer then is the one it gives
+    when he ASKS - the sign-in command - and every arrival briefing from
+    2026-10-13 to 10-28 opened with it ("Good morning, sir. I need a Google
+    sign-in first, sir. Run python -m skills.amazon_order_tracker ...")."""
     aot = _import_skill("amazon_order_tracker")
     if aot is None:
         return ""
+    problem_fn = getattr(aot, "backend_problem", None)
+    if callable(problem_fn):
+        try:
+            problem = problem_fn()
+        except Exception:
+            problem = ""
+        if isinstance(problem, str) and problem.strip():
+            return ""
     fn = (getattr(aot, "action_check_orders", None)
           or getattr(aot, "check_orders", None))
     if not callable(fn):
@@ -528,6 +540,14 @@ def _section_calendar() -> str:
 
 # ─── parallel orchestration ─────────────────────────────────────────────
 
+# A skill's answer to a direct question may carry a setup command ("Run python
+# -m skills.amazon_order_tracker --auth-gmail once"). Read out unprompted it is
+# never briefing news, so a section that reads like one is left out.
+_SETUP_TEXT_RE = re.compile(
+    r"\bpython(?:\.exe)?\s+-m\s+\S|(?<!\S)--auth\b|\bsign-in first\b",
+    re.IGNORECASE)
+
+
 def _gather_sections() -> dict:
     """Run all six sections in parallel under SECTION_TIMEOUT_SECONDS each.
     A timeout or exception in any one section maps that section to '' so the
@@ -563,6 +583,11 @@ def _gather_sections() -> dict:
         # Don't join: cancel queued futures and let any still-running section
         # finish on its daemon worker without holding up the briefing.
         ex.shutdown(wait=False, cancel_futures=True)
+    for name, text in results.items():
+        if text and _SETUP_TEXT_RE.search(text):
+            print(f"  [arrival_v2] section '{name}' left out: it reads like "
+                  f"setup instructions, not news")
+            results[name] = ""
     return results
 
 

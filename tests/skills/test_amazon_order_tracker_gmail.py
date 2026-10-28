@@ -161,6 +161,20 @@ class HonestWhenNotSignedIn(_Base):
         self.assertIn("--auth-gmail", out)
         self.assertIn("read-only", out)
 
+    def test_the_public_problem_check_matches_for_unprompted_callers(self):
+        # skills/daily_briefing/arrival_v2.py stays quiet about orders when
+        # this is non-empty (every arrival 2026-10-13..28 opened with the
+        # sign-in command), so it must say the same as the private check.
+        with mock.patch.object(self.mod, "_email_triage", return_value=None), \
+                mock.patch.object(self.mod, "_outlook_configured",
+                                  return_value=False):
+            self.assertEqual(self.mod.backend_problem(),
+                             self.mod._backend_problem())
+            self.assertIn(self.SIGN_IN, self.mod.backend_problem())
+        with mock.patch.object(self.mod, "_outlook_configured",
+                               return_value=True):
+            self.assertEqual(self.mod.backend_problem(), "")
+
     def test_check_orders_says_so_instead_of_claiming_no_orders(self):
         with mock.patch.object(self.mod, "_email_triage", return_value=None), \
                 mock.patch.object(self.mod, "_outlook_configured",

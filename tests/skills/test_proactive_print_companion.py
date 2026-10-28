@@ -868,7 +868,7 @@ class PrintCompanionTransitionTests(PrintCompanionMixin, unittest.TestCase):
             mod._maybe_warn_historical_failure({"filename": "Gear_PLA.3mf",
                                                 "total_layer": 220})
         msg = enq.call_args.args[0]
-        self.assertIn("220-layer", msg)
+        self.assertIn("past PLA prints of about 220 layers have failed", msg)
         self.assertTrue(mod._warned_historical_failure[0])
 
     def test_warn_historical_layer_phrase_when_total_bad(self):
@@ -879,7 +879,53 @@ class PrintCompanionTransitionTests(PrintCompanionMixin, unittest.TestCase):
              mock.patch.object(mod, "_enqueue_speech") as enq:
             mod._maybe_warn_historical_failure({"filename": "Gear_PLA.3mf",
                                                 "total_layer": "bogus"})
-        self.assertIn("this size", enq.call_args.args[0])
+        msg = enq.call_args.args[0]
+        self.assertIn("past PLA prints have failed about 90%", msg)
+        self.assertNotIn("this size", msg)   # a size it does not know
+
+    # Live 2026-10-28 10:20:52 (Bambu Studio's default plate name, no layer
+    # count): "Sir, a heads-up — past UNKNOWN prints around this size have
+    # failed about 33% of the time across 3 attempts."
+    LIVE_STATE = {"filename": "0.2mm layer, 2 walls, 15% infill",
+                  "total_layer": None}
+
+    def test_no_heads_up_when_neither_material_nor_size_is_known(self):
+        mod, _a = self._load()
+        mod._warned_historical_failure[0] = False
+        with mock.patch.object(mod, "_historical_failure_rate",
+                               return_value=(0.33, 3)) as rate, \
+             mock.patch.object(mod, "_enqueue_speech") as enq:
+            mod._maybe_warn_historical_failure(dict(self.LIVE_STATE))
+        enq.assert_not_called()
+        rate.assert_not_called()
+        self.assertFalse(mod._warned_historical_failure[0])
+
+    def test_an_unknown_material_is_never_said(self):
+        mod, _a = self._load()
+        mod._warned_historical_failure[0] = False
+        with mock.patch.object(mod, "_historical_failure_rate",
+                               return_value=(0.5, 4)), \
+             mock.patch.object(mod, "_enqueue_speech") as enq:
+            mod._maybe_warn_historical_failure({"filename": "Bracket.3mf",
+                                                "total_layer": 150})
+        msg = enq.call_args.args[0]
+        self.assertIn("past prints of about 150 layers have failed", msg)
+        self.assertNotIn("unknown", msg.lower())
+
+    def test_material_names_are_said_the_way_people_say_them(self):
+        mod, _a = self._load()
+        for fname, said in (("Gear_PLA+_x.3mf", "PLA plus prints"),
+                            ("Clip_PETG.3mf", "PETG prints"),
+                            ("Vase_silk.3mf", "silk prints")):
+            with self.subTest(fname=fname):
+                mod._warned_historical_failure[0] = False
+                with mock.patch.object(mod, "_historical_failure_rate",
+                                       return_value=(0.5, 4)), \
+                     mock.patch.object(mod, "_enqueue_speech") as enq:
+                    mod._maybe_warn_historical_failure(
+                        {"filename": fname, "total_layer": 120})
+                self.assertIn(f"past {said} of about 120 layers",
+                              enq.call_args.args[0])
 
 
 # ─────────────────────────────────────────────────────────────────────────

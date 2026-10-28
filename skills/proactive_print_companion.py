@@ -511,14 +511,34 @@ def _reset_per_print_state() -> None:
     _vision_samples.clear()
 
 
+# How each _infer_material tag is said; "unknown" is never said at all.
+_MATERIAL_SPOKEN = {
+    "pla": "PLA", "plaplus": "PLA plus", "petg": "PETG", "abs": "ABS",
+    "absplus": "ABS plus", "asa": "ASA", "tpu": "TPU", "nylon": "nylon",
+    "carbon": "carbon-fibre", "wood": "wood-fill", "silk": "silk",
+}
+
+
 def _maybe_warn_historical_failure(state: dict) -> None:
     """At a new-print transition, peek at history for this bucket and
-    warn the user when the failure rate is high enough to be useful."""
+    warn the user when the failure rate is high enough to be useful.
+
+    With neither the material nor the layer count known the bucket is every
+    print JARVIS knew nothing about, not "prints like this one": live on
+    2026-10-28 that gave "past UNKNOWN prints around this size have failed
+    about 33% of the time across 3 attempts" for three unrelated prints, so
+    there is no warning then."""
     if _warned_historical_failure[0]:
         return
     fname    = state.get("filename") or ""
     material = _infer_material(fname)
     total    = state.get("total_layer")
+    try:
+        layers = int(total) if total else 0
+    except (TypeError, ValueError):
+        layers = 0
+    if material == "unknown" and layers <= 0:
+        return
     rate, count = _historical_failure_rate(material, total)
     if count < MIN_HISTORY_FOR_WARNING:
         return
@@ -526,14 +546,14 @@ def _maybe_warn_historical_failure(state: dict) -> None:
         return
     _warned_historical_failure[0] = True
     pct = int(round(rate * 100))
-    try:
-        layer_phrase = f"{int(total)}-layer" if total else "this size"
-    except (TypeError, ValueError):
-        layer_phrase = "this size"
+    spoken = _MATERIAL_SPOKEN.get(material, "")
+    prints = f"{spoken} prints" if spoken else "prints"
+    if layers > 0:
+        prints += f" of about {layers} layers"
     _enqueue_speech(
-        f"Sir, a heads-up — past {material.upper()} prints around "
-        f"{layer_phrase} have failed about {pct}% of the time across "
-        f"{count} attempts. Worth keeping an eye on the first layer."
+        f"Sir, a heads-up — past {prints} have failed about {pct}% of the "
+        f"time across {count} attempts. Worth keeping an eye on the first "
+        f"layer."
     )
 
 

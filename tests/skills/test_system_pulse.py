@@ -1104,6 +1104,55 @@ class PulseLoopTests(unittest.TestCase):
         # Cooldown recorded for the cpu reason.
         self.assertIn("cpu", self.mod._last_abnormal_alert)
 
+    def _one_proactive_pass(self, pulse):
+        sleeps = {"n": 0}
+
+        def _sleep(_):
+            sleeps["n"] += 1
+            if sleeps["n"] >= 2:
+                raise _StopLoop
+
+        said = []
+        with mock.patch.object(self.mod, "_gather_pulse", return_value=pulse), \
+             mock.patch.object(self.mod, "_enqueue_speech",
+                               side_effect=said.append), \
+             mock.patch.object(self.mod.time, "sleep", side_effect=_sleep), \
+             mock.patch.object(self.mod.time, "time", return_value=10_000.0):
+            with self.assertRaises(_StopLoop):
+                self.mod._proactive_loop()
+        return said
+
+    # The live pulse behind 2026-10-28 10:27:53 (memory's own alert had gone
+    # out from system_monitor within the hour, so "ram" was cooling down).
+    LIVE_1027 = {"cpu_pct": 38.0, "cpu_temp_c": 67.0, "ram_pct": 94.0,
+                 "gpu_util_pct": 8.0, "active_apps": 12,
+                 "credits_dollars": 7.10,
+                 "bambu": {"gcode_state": "FAILED"}}
+
+    def test_a_print_failure_is_said_without_the_pc_numbers(self):
+        self.mod._last_abnormal_alert["ram"] = 9_000.0
+        said = self._one_proactive_pass(dict(self.LIVE_1027))
+        self.assertEqual(said, ["I'm afraid the Bambu print has failed, sir."])
+        self.assertIn("bambu_fail", self.mod._last_abnormal_alert)
+
+    def test_news_leads_are_said_together_and_alone(self):
+        self.mod._last_abnormal_alert["ram"] = 9_000.0
+        pulse = dict(self.LIVE_1027, credits_dollars=3.20)
+        said = self._one_proactive_pass(pulse)
+        self.assertEqual(len(said), 1)
+        self.assertTrue(said[0].startswith(
+            "I'm afraid the Bambu print has failed, sir."), said[0])
+        self.assertIn("$3.20", said[0])
+        self.assertNotIn("CPU", said[0])
+        self.assertNotIn("windows open", said[0])
+
+    def test_a_pc_reading_lead_keeps_its_context(self):
+        said = self._one_proactive_pass(dict(self.LIVE_1027, cpu_pct=99.0))
+        self.assertEqual(len(said), 1)
+        self.assertTrue(said[0].startswith("Slight problem, sir — CPU at 99"),
+                        said[0])
+        self.assertIn("windows open", said[0])
+
     def test_proactive_loop_cooldown_suppresses_repeat(self):
         pulse = {"cpu_pct": 99.0}
         sleeps = {"n": 0}

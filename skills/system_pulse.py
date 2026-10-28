@@ -612,6 +612,13 @@ def _format_hud_strip(pulse: dict) -> str:
 
 # ─── abnormality detection ───────────────────────────────────────────────
 
+# Abnormal items that are not readings of this PC. Said alone: live on
+# 2026-10-28 10:27 the print failure came out as "I'm afraid the Bambu print
+# has failed, sir. CPU 38 percent at 67 degrees, memory 94 percent, GPU running
+# at 8 percent, 12 windows open. Anthropic credit balance: $7.10."
+_NEWS_LEADS = frozenset({"bambu_fail", "credits"})
+
+
 def _abnormal_reasons(pulse: dict) -> list[tuple[str, str]]:
     """Return [(key, lead_sentence), ...] for each abnormal reading.
     The key is used for per-reason cooldown so a sustained high-CPU doesn't
@@ -915,8 +922,13 @@ def _proactive_loop() -> None:
                 # Lead the report with the first abnormal item, then drop the
                 # full pulse sentence behind it so the user gets context.
                 key, lead = fresh_reasons[0]
-                message = _format_report(pulse, lead=lead, lead_key=key,
-                                         proactive=True)
+                if key in _NEWS_LEADS:
+                    # ...unless the news is not a reading of this PC: then the
+                    # leads alone, no numbers behind them.
+                    message = " ".join(text for _k, text in fresh_reasons)
+                else:
+                    message = _format_report(pulse, lead=lead, lead_key=key,
+                                             proactive=True)
                 _enqueue_speech(message)
                 with _alert_lock:
                     for k, _ in fresh_reasons:

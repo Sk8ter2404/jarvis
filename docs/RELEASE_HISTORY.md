@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.4 (2026-10-28)
+
+Morning greeting and printer speech, from today's live log. The morning greeting no longer opens with the Amazon tracker's sign-in command ('Good morning, sir. I need a Google sign-in first, sir. Run python -m ...'); every arrival since 10-13 had. With the mailbox unreadable it says nothing about orders, and any briefing section that reads like setup instructions is left out. The print heads-up no longer says 'past UNKNOWN prints around this size have failed 33% of the time': with neither the material nor the size known there is no heads-up, and materials are said properly ('PLA plus', 'of about 220 layers'). A print failure or a low credit balance is said alone, without 'CPU 38 percent ... 12 windows open' behind it.
+
 ## v3.0.3 (2026-10-28)
 
 Smarter and lighter, every change measured on 6 brain-test seeds against v3.0.2. Garbled words ('Enough and awesome') get 'Sorry, sir, I missed that - what would you like?' instead of opening an app (0/6 -> 6/6). 'Is it time to watch <show> yet' / 'is <show> out yet' searches for the release date even when the title has a word like 'Vision' (3/6 -> 6/6). 'Skip this one' plays the next song (0/6 -> 6/6). Overall golden accuracy 92.9% -> 94.4%, unverified claims 1 -> 0, invented actions 9 -> 7. After a screen read, a made-up 'it dropped early' follow-on sentence is dropped along with the claim it continues. Idle CPU: the face detector ran four full passes on every camera frame even with nobody in the room (about 3.5 CPU cores); after 15 s without a face it now checks once a second, and the first face brings back full speed.
