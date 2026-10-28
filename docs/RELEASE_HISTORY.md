@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.3 (2026-10-28)
+
+Smarter and lighter, every change measured on 6 brain-test seeds against v3.0.2. Garbled words ('Enough and awesome') get 'Sorry, sir, I missed that - what would you like?' instead of opening an app (0/6 -> 6/6). 'Is it time to watch <show> yet' / 'is <show> out yet' searches for the release date even when the title has a word like 'Vision' (3/6 -> 6/6). 'Skip this one' plays the next song (0/6 -> 6/6). Overall golden accuracy 92.9% -> 94.4%, unverified claims 1 -> 0, invented actions 9 -> 7. After a screen read, a made-up 'it dropped early' follow-on sentence is dropped along with the claim it continues. Idle CPU: the face detector ran four full passes on every camera frame even with nobody in the room (about 3.5 CPU cores); after 15 s without a face it now checks once a second, and the first face brings back full speed.
+
 ## v3.0.2 (2026-10-28)
 
 Stability. The CI simulator is fully green for the first time (its 3 long-standing failures were simulator gaps, and a test left a real 5-minute timer thread running into later tests). A timing-flaky speech test is fixed (9% failure under heavy CPU load -> 0 in 600 runs). Short compliments ('Very nice', 'Sounds great') no longer get 'Sorry, I didn't catch that', while garbled lines still do. A comment on something he just reported ('Yay, version 3 is done') no longer re-runs the reading. 'Read up on / do some research on X' searches the web; 'look into the camera' does not. The news test no longer touches the network. Tonight's mistakes are now permanent offline checks (169 replay items; 9 brain-test items).
