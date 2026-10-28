@@ -32304,6 +32304,11 @@ def _streaming_open_search(service_key: str, query: str,
     if url == svc.home:
         if not q:
             return f"{svc.name} is open, sir."
+        # Finish the job here instead of handing it back (2026-10-27): open
+        # the site's own search, type the title, press Enter. Any step that
+        # fails falls back to the plain line below.
+        if _streaming_ui_search(cfg, svc, q):
+            return f"{svc.name}'s search for {q} is open, sir."
         line = (f"I don't have a verified search link for {svc.name}, sir, "
                 f"so I've opened its home page - search for {q} there.")
         if home_is_final:
@@ -32311,6 +32316,69 @@ def _streaming_open_search(service_key: str, query: str,
             return TERMINAL_FAILURE_PREFIX + line
         return line
     return f"{svc.name}'s search for {q} is open, sir."
+
+
+def _streaming_fg_is_service(svc) -> bool:
+    """True when the foreground window's title names streaming service
+    ``svc`` ("Search | Disney+ - Google Chrome"). False on any doubt (no
+    win32, no title). Never raises."""
+    try:
+        import win32gui
+        title = (win32gui.GetWindowText(win32gui.GetForegroundWindow())
+                 or "").lower()
+        names = {str(svc.name or "").lower(),
+                 str(svc.key or "").split("_")[0].lower()}
+        return any(len(n) >= 3 and n in title for n in names)
+    except Exception:
+        return False
+
+
+def _streaming_ui_search(cfg: dict, svc, q: str) -> bool:
+    """Search ``q`` through a streaming site's OWN page when it has no
+    verified search link (Disney+): click its search entry (click_on_screen's
+    grounded executor, pinned to the player monitor), type the title, press
+    Enter. True only when all three went through; False on the first step
+    that did not (the caller says so plainly). Live 2026-10-27 the owner did
+    the same by hand: "open Disney Plus and check" opened the home page and
+    stopped. Never raises."""
+    try:
+        from core import streaming_search as _ss
+        target = _ss.ui_search_target(svc.key)
+        if not target or not q:
+            return False
+        from core import actions as _ca
+        from core import grounded_click as _gc
+        mon = cfg.get("vision_monitor")
+        arg = f"monitor:{mon}|{target}" if mon else target
+        r = _gc.run_bounded(arg, said=_ca._turn_said(), mode="click")
+        if getattr(r, "outcome", "") not in (_gc.VERIFIED, _gc.NAVIGATED):
+            print(f"  [streaming-ui-search] {svc.name}: click {target!r} "
+                  f"-> {getattr(r, 'outcome', '?')}", flush=True)
+            return False
+        time.sleep(float(cfg.get("search_open_wait", 1.5)))
+        # Type only into the streaming site itself: the window in front
+        # must be its page (title names the service), never another app
+        # whose own "search" the click may have found or that took focus.
+        if not _streaming_fg_is_service(svc):
+            print(f"  [streaming-ui-search] {svc.name}: the window in front "
+                  f"is not {svc.name} - not typing", flush=True)
+            return False
+        typed = _ca._act_type(q)
+        if not str(typed).startswith("typed:"):
+            print(f"  [streaming-ui-search] {svc.name}: type -> {typed!r}",
+                  flush=True)
+            return False
+        pressed = _ca._act_press("enter")
+        if not str(pressed).startswith("pressed"):
+            print(f"  [streaming-ui-search] {svc.name}: enter -> {pressed!r}",
+                  flush=True)
+            return False
+        print(f"  [streaming-ui-search] {svc.name}: searched {q!r} on its "
+              f"own page", flush=True)
+        return True
+    except Exception as e:
+        print(f"  [streaming-ui-search] skipped: {e}", flush=True)
+        return False
 
 
 def _streaming_auto_play(service_key: str, query: str) -> str:

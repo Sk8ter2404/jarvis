@@ -553,6 +553,68 @@ class TraceAndTimelineTests(_Base):
 
 
 
+class TypedFieldTests(_Base):
+    """Live 2026-10-27 20:43: JARVIS had typed "Vision Quest" into Disney+'s
+    search box; "click Vision Quest" then offered 2 matches - the box itself
+    ('VisionQuest') and the real title tile - and asked."""
+
+    TILE = ("New Episode Badge VisionQuest Disney+ Original Rated TV-14 "
+            "Release Year 2026")
+
+    def _desk(self, with_field=True):
+        home = F.FakeWindow(101, "home_dark", "middle")
+        extra = [F.El(name=self.TILE, ctype="Hyperlink",
+                      rect=(300.0, 400.0, 400.0, 220.0),
+                      href="https://videosite.example/watch/vq",
+                      invokable=True, in_document=True, ref=("x", 9001))]
+        if with_field:
+            extra.append(F.El(name="VisionQuest", ctype="Edit",
+                              rect=(900.0, 100.0, 600.0, 50.0),
+                              in_document=True, ref=("x", 9002)))
+        home.elements_override = extra
+        return self.desk(home)
+
+    def test_the_title_tile_is_clicked_not_the_search_box_it_just_filled(self):
+        G.note_typed("Vision Quest")
+        b = self._desk()
+        r = G.run("Vision Quest", said="click Vision Quest", backend=b)
+        self.assertNotEqual(r.outcome, G.AMBIGUOUS, r.text)
+        self.assertEqual(r.outcome, G.VERIFIED, r.text)
+        self.assertIn("VisionQuest", r.label)
+        self.assertTrue(b.clicks)
+        self.assertGreaterEqual(b.clicks[0][1], 400)       # the tile, not the box
+
+    def test_without_recent_typing_the_two_still_ask(self):
+        b = self._desk()
+        r = G.run("Vision Quest", said="click Vision Quest", backend=b)
+        # the control: its own search box is what gets pressed (or asked)
+        self.assertTrue(r.outcome == G.AMBIGUOUS or r.label == "VisionQuest",
+                        r.text)
+
+    def test_old_typing_is_forgotten(self):
+        G.note_typed("Vision Quest", now=time.time() - G.TYPED_TTL_S - 5)
+        self.assertEqual(G.recent_typed(), "")
+
+    def test_a_lone_match_still_clicks_even_if_it_is_the_typed_field(self):
+        G.note_typed("Vision Quest")
+        home = F.FakeWindow(101, "home_dark", "middle")
+        home.elements_override = [
+            F.El(name="VisionQuest", ctype="Edit",
+                 rect=(900.0, 100.0, 600.0, 50.0), in_document=True,
+                 ref=("x", 9002))]
+        b = self.desk(home)
+        r = G.run("Vision Quest", said="click Vision Quest", backend=b)
+        self.assertNotEqual(r.outcome, G.NOT_FOUND, r.text)
+        self.assertEqual(r.label, "VisionQuest")
+        self.assertTrue(b.clicks)           # pressed: a lone match is not dropped
+
+    def test_drop_typed_fields_keeps_non_edit_candidates(self):
+        c = [{"text": "VisionQuest", "type": "Edit", "rect": [0, 0, 1, 1]},
+             {"text": "Vision Quest", "type": "Hyperlink", "rect": [0, 0, 1, 1]}]
+        kept = G.drop_typed_fields(c, "Vision Quest")
+        self.assertEqual([k["type"] for k in kept], ["Hyperlink"])
+
+
 class NormUrlTests(unittest.TestCase):
     """The address bar shows a local page as "C:/dir/page.html" while its
     link's href is "file:///C:/dir/page.html" - found building the live UIA bench

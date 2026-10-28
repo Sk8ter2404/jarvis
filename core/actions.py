@@ -3345,6 +3345,11 @@ def _act_type(text: str) -> str:
         bc.ui_type(text)
     except bc.UIFailsafeError as e:
         return str(e)
+    try:
+        from core import grounded_click as _gc
+        _gc.note_typed(text)
+    except Exception:
+        pass
     return f"typed: {text[:60]}{'...' if len(text) > 60 else ''}"
 
 
