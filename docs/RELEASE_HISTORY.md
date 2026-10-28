@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.1 (2026-10-27)
+
+Fixes from the first v3 evening. 'What's (all) new' now reads the real release history (it was reading an old upgrade log). 'Is <chat> online / what is <chat> doing' answers about one Agent Office chat by name. Face recognition runs only when you ask who someone is or about a face ('he doesn't sound happy' no longer runs it). The canned 'A bold choice ... I'll note that for posterity' is dropped wherever it is unearned, and each signature line is limited to once per 10 turns and 20 minutes. After a screen read, a date or 'it's out' claim must match what was on the screen; a third unchanged screen read in one turn is refused; 'is it out yet' goes to a web search. Garbled short lines get 'Sorry, I didn't catch that' instead of an action, while short real replies still work. Streaming sites without a search link get searched through their own page (only when that site is the window in front), and his own typed text is never offered as a click target. CI fix: drive roots are recognised on any OS.
+
 ## v3.0.0 (2026-10-27)
 
 Version 3, a full overhaul. A slimmer, clearer prompt (43,875 to 40,815 characters) so he picks the right action more often (94.0% vs 90.1% on the test set; unverified claims 3 to 0). One name per job: near-miss and invented action names map to the real one, and a verb-clash guard keeps mute and pause apart. New 'move this file to ...' and 'undo the last move' (your own folders only; he asks first). Learning works again (packed learning replies were being dropped). Proactive remarks no longer claim actions he didn't take, and 'shut down, no overnight protocol' asks instead of guessing. 'What are my agents doing / anything waiting on me?' reads the Agent Office. Watch-only guards for wrong-but-allowed actions and action ping-pong, plus a per-turn trace report. Off until switched on: link reader, faster boot, background jobs on another computer. A security review found 13 issues; all fixed.
