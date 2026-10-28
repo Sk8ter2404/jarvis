@@ -139,3 +139,66 @@ class LoopGuard:
             if n not in POLL_ACTIONS and not _similar(x, y):
                 return None
         return f"ping-pong {n0}/{n1}"
+
+
+# Screen reads (v3.0.1, live 2026-10-27 20:41:30-36): "Enough and awesome."
+# (misheard) -> web_search, then see_screen, read_screen left, read_screen
+# left - three reads of the same Google page in one turn, each round's reply
+# a guess about it, until the success-repeat break and a close-out. The old
+# per-turn capture cap (SEE_SCREEN_BUDGET_PER_INTENT = 3, in the monolith)
+# never saw them: since 2026-10-05 a reading question is answered from the
+# windows' own text, and that path returns before the cap is counted. This
+# rule is ENFORCED whatever LOOP_GUARD_MODE says (except 'off'): a screen
+# read is read-only and the text read is instant, so refusing the third one
+# has no side effect to get wrong - the reply that asked for it gets a
+# refusal result, the next round answers from the two reads it has, and the
+# follow-up loop's failure-repeat break ends the chain if it asks again. The
+# rest of W21 (repeat, ping-pong, poll budget) stays in shadow: those can cut
+# a real multi-step chain and have no live evidence yet.
+#
+# Only reads with nothing in between that can change the screen count: a
+# click / scroll / type / open between two reads starts a fresh count, so a
+# multi-step chain that checks its work after each step (click, look, click,
+# look, ...) or reads a long page a scroll at a time is never cut. Listing
+# the windows changes nothing, so it does not reset the count (the
+# list_windows / see_screen ping-pong is the same loop).
+SCREEN_READ_ACTIONS = frozenset({"see_screen", "read_screen"})
+SCREEN_NEUTRAL_ACTIONS = frozenset({"list_windows"})
+SCREEN_READ_LIMIT = 2
+
+
+def screen_read_refusal(name, calls, *, is_read=None) -> str:
+    """The refusal result for a screen read that must not run, or "" to let
+    it run. ``calls``: this owner turn's (name, arg) calls so far, in order
+    (the grounding ledger's ``calls``); ``is_read``: optional predicate for
+    names that are a screen read under another spelling (an alias with the
+    same handler). A read is refused once SCREEN_READ_LIMIT reads already
+    ran this turn since the last call that could change the screen (any
+    call that is not a read, not in SCREEN_NEUTRAL_ACTIONS and not an
+    internal '_' result). Never raises (a fault lets the read run)."""
+    try:
+        def _read(n) -> bool:
+            n = _norm_name(n)
+            if n in SCREEN_READ_ACTIONS:
+                return True
+            return bool(is_read and is_read(n))
+        if not _read(name):
+            return ""
+        done = 0
+        for c in (calls or ()):
+            if not c:
+                continue
+            if _read(c[0]):
+                done += 1
+            elif not (_norm_name(c[0]) in SCREEN_NEUTRAL_ACTIONS
+                      or _norm_name(c[0]).startswith("_")):
+                done = 0        # the screen may have changed since
+        if done < SCREEN_READ_LIMIT:
+            return ""
+        return (f"refused: the screen was already read {done} times this "
+                f"turn with nothing changed since - reading it again shows "
+                f"nothing new. Answer sir from "
+                f"what those reads said, quoting the page's own words, or "
+                f"say plainly the screen doesn't tell you.")
+    except Exception:
+        return ""

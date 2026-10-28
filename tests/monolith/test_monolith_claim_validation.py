@@ -43,6 +43,9 @@ class _Base(MonolithGlobalsTestCase):
     def setUp(self):
         super().setUp()
         bc = self.bc
+        # v3.0.1: the persona limiter is process-wide; every test starts fresh.
+        from core import advice_fallback as _af_reset
+        _af_reset.reset_state()
         self.spoken: list[str] = []
         self._p(bc, "_speak",
                 side_effect=lambda t, *a, **k: self.spoken.append(t))

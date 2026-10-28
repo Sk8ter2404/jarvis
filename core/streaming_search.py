@@ -123,6 +123,28 @@ SERVICES: dict = {
         ("disney plus", "disney+", "disneyplus", "disney_plus", "disney")),
 }
 
+# A service with NO verified search link is searched through its own page
+# instead (2026-10-27, live: Disney+ opened its home page and handed the job
+# back, then clicked SEARCH, typed and pressed Enter at the owner's nudge).
+# The words click_on_screen looks for on the HOME page; proven live on
+# Disney+ ("search icon" -> the SEARCH nav entry, which lands on
+# /browse/search with the box already focused). Only a service with
+# ``search is None`` is listed here: the others open the verified URL.
+UI_SEARCH_TARGETS: dict = {"disney_plus": "search icon"}
+
+
+def ui_search_target(key) -> Optional[str]:
+    """What to click on ``key``'s home page to open its own search, for a
+    service with no verified search link; else None. Never raises."""
+    try:
+        svc = service(key)
+        if svc is None or svc.search:
+            return None
+        return UI_SEARCH_TARGETS.get(svc.key)
+    except Exception:
+        return None
+
+
 # Apple TV's storefront prefix (/us/search): the same verified route.
 _STOREFRONT_PATH_RE = re.compile(r"^/[a-z]{2}(?=/)")
 

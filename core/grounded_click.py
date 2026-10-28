@@ -164,7 +164,43 @@ def reset_state() -> None:
     with _lock:
         _scenes.clear()
         _state.update(last_ui=None, pending=None, uia_down_said=False,
-                      last_click_ts=0.0)
+                      last_click_ts=0.0, typed=None)
+
+
+# What JARVIS typed last (text, time): its own words sit in the search box and
+# match the title it is asked to click next (live 2026-10-27: "click Vision
+# Quest" offered the search box holding "VisionQuest" next to the real tile).
+TYPED_TTL_S = 60.0
+
+
+def note_typed(text, now=None) -> None:
+    """Remember the words JARVIS just typed (core.actions._act_type)."""
+    t = " ".join(str(text or "").split())
+    if t:
+        with _lock:
+            _state["typed"] = (t, time.time() if now is None else now)
+
+
+def recent_typed(now=None) -> str:
+    """The words JARVIS typed in the last TYPED_TTL_S seconds, else ''."""
+    with _lock:
+        rec = _state.get("typed")
+    if not rec:
+        return ""
+    return rec[0] if (time.time() if now is None else now) - rec[1] <= TYPED_TTL_S else ""
+
+
+def drop_typed_fields(cands, typed=None) -> list:
+    """``cands`` without the editable text field(s) whose text is what JARVIS
+    typed a moment ago - that is its own typing, not a thing to click. A page
+    title or tile with the same words (a Hyperlink, a Button ...) stays."""
+    typed = recent_typed() if typed is None else typed
+    key = _R.squash(typed)
+    if not key:
+        return list(cands)
+    return [c for c in cands
+            if not (_g(c, "type") in ("Edit", "ComboBox")
+                    and _R.squash(_g(c, "text") or "") == key)]
 
 
 def pending_choice(now=None) -> Optional[dict]:
@@ -2070,6 +2106,14 @@ def _run(desc, model_mon, said, mode, b, dl, st) -> Result:
             unverified.add(hwnd)
         res = (_R.resolve(desc, cands, playing_title=playing_title)
                if cands else {"status": "none"})
+        if cands and res.get("status") in ("ok", "ambiguous"):
+            # Its own typing in the search box is not a candidate (a lone
+            # match still clicks: only re-resolve when another one is left).
+            kept = drop_typed_fields(cands)
+            if len(kept) != len(cands):
+                res2 = _R.resolve(desc, kept, playing_title=playing_title)
+                if res2.get("status") in ("ok", "ambiguous"):
+                    cands, res = kept, res2
         sparse = (snap is None or len(cands) < 10
                   or sum(len(c["text"]) for c in cands) < 150
                   or bool(getattr(snap, "heavy", False)))

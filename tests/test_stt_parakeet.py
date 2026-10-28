@@ -413,6 +413,19 @@ class PrimaryTests(unittest.TestCase):
         self.assertEqual(notes, ["parakeet-rescued"])
         self.assertTrue(any("rescue (empty; 1 of 1" in ln for ln in log))
 
+    def test_last_rescue_names_the_runs_rescue(self):
+        # 2026-10-27 (v3.0.0 20:39:40): the noise gate reads 'empty' as
+        # "Parakeet heard no words" (core/speech_filter PRIMARY_EMPTY).
+        p, w, _log, _n = _primary(lambda a: ("", {"avg_logprob": -10.0}))
+        p.run(self.AUDIO)
+        self.assertEqual(p.last_rescue, "empty")
+        p._decode = lambda a: ("Jarvis, lights on", {})
+        p.run(self.AUDIO)
+        self.assertEqual(p.last_rescue, "", "a stale reason survived a run")
+        q, _w, _l, _m = _primary(lambda a: ("Travis, lights", {}), wake=True)
+        q.run(self.AUDIO)
+        self.assertEqual(q.last_rescue, "no-wake")
+
     def test_the_rescue_fires_on_a_lost_wake_word(self):
         p, w, log, notes = _primary(
             lambda a: ("Travis, what time is it?", {}), wake=True, head=True)

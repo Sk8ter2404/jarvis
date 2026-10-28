@@ -259,5 +259,173 @@ class SuggestionPoolTests(unittest.TestCase):
                                     line)
 
 
+class LiveLine20261027Tests(unittest.TestCase):
+    """v3.0.1: the canned persona line heard three times on 2026-10-27."""
+    L1 = ("[intent:dry_wit] [wry] A bold choice, if I may say so, sir. "
+          "I'll note that for posterity.")
+    U1 = "He sounds stupider."
+    U2 = "Are you sure that upgrade did you any better?"
+    MID = ("[intent:confirmation] It seems to be a mix of synonyms and some "
+           "rather sentimental reminders that you are loved, sir. "
+           "A bold choice, if I may say so.")
+
+    def setUp(self):
+        af.reset_state()
+
+    def test_20_38_both_halves_go_after_the_style_tags(self):
+        # Before: only the opener went, "I'll note that for posterity." stayed.
+        self.assertEqual(af.strip_unearned_bold_choice(self.L1, self.U1), "")
+
+    def test_20_38_a_bare_reply_gets_the_neutral_line_not_the_tic(self):
+        out, notes = af.persona_hygiene(self.L1, self.U1)
+        self.assertEqual(out, "[intent:dry_wit] [wry] Noted, sir.")
+        self.assertTrue(any("unearned" in n for n in notes))
+
+    def test_20_38_second_ask_is_not_the_identical_line(self):
+        a, _ = af.persona_hygiene(self.L1, self.U1)
+        b, _ = af.persona_hygiene(self.L1, self.U2)
+        self.assertNotIn("posterity", a + b)
+        self.assertNotIn("bold choice", (a + b).lower())
+
+    def test_20_41_a_mid_reply_closer_is_dropped(self):
+        out = af.strip_unearned_bold_choice(self.MID, "Enough and awesome.")
+        self.assertNotIn("bold choice", out.lower())
+        self.assertTrue(out.endswith("that you are loved, sir."), out)
+        self.assertTrue(out.startswith("[intent:confirmation] It seems"), out)
+
+    def test_the_tail_goes_only_with_a_dropped_opener(self):
+        reply = "Noted, sir. I'll note that for posterity."
+        self.assertEqual(af.strip_unearned_bold_choice(reply, "hello"), reply)
+
+    def test_a_stated_choice_keeps_both_halves(self):
+        self.assertEqual(af.strip_unearned_bold_choice(
+            self.L1, "I'm going to delete the migrations"), self.L1)
+
+    def test_a_longer_sentence_in_the_middle_is_kept(self):
+        reply = "Fine, sir. A bold choice to question the hardware, sir."
+        self.assertEqual(af.strip_unearned_bold_choice(reply, "hello"), reply)
+
+    def test_action_reply_may_go_silent(self):
+        out, _ = af.persona_hygiene(self.L1, self.U1, action_ran=True)
+        self.assertEqual(out, "")
+
+    def test_opener_in_the_middle_keeps_the_rest(self):
+        out = af.strip_unearned_bold_choice(
+            "Done, sir. A bold choice, sir. The file is saved.", "save it")
+        self.assertEqual(out, "Done, sir. The file is saved.")
+
+
+class SignatureLimiterTests(unittest.TestCase):
+    POST = "I'll note that for posterity."
+    EARNED = "I'm going to delete the migrations"
+
+    def setUp(self):
+        self.st = af.HygieneState()
+
+    def lim(self, reply, user, now, **kw):
+        return af.limit_signature_phrases(reply, user, now=now, state=self.st,
+                                          **kw)
+
+    def test_first_use_is_voiced(self):
+        self.assertEqual(self.lim("Very good. " + self.POST, "u1", 0.0),
+                         "Very good. " + self.POST)
+
+    def test_repeat_inside_the_window_is_dropped(self):
+        self.lim("Very good. " + self.POST, "u1", 0.0)
+        out = self.lim("Right. " + self.POST, "u2", 60.0)
+        self.assertEqual(out, "Right.")
+
+    def test_only_turns_passed_is_not_enough(self):
+        self.lim(self.POST, "u0", 0.0)
+        for i in range(1, 12):
+            self.lim("Ok.", "u%d" % i, 10.0 * i)
+        # 12th turn, but only 130 s on: still held back
+        self.assertEqual(self.lim(self.POST, "u13", 130.0),
+                         af.NEUTRAL_LINE)
+
+    def test_only_time_passed_is_not_enough(self):
+        self.lim(self.POST, "u0", 0.0)
+        self.assertEqual(self.lim(self.POST, "u1", 3600.0), af.NEUTRAL_LINE)
+
+    def test_both_passed_allows_it_again(self):
+        self.lim(self.POST, "u0", 0.0)
+        for i in range(1, 11):
+            self.lim("Ok.", "u%d" % i, float(i))
+        self.assertEqual(self.lim(self.POST, "u11", 1300.0), self.POST)
+
+    def test_same_turn_follow_up_counts_as_a_repeat(self):
+        self.lim("Fine. " + self.POST, "same", 0.0)
+        self.assertEqual(self.lim("Ok. " + self.POST, "same", 5.0), "Ok.")
+
+    def test_nothing_left_becomes_the_neutral_line_after_the_tags(self):
+        self.lim(self.POST, "u1", 0.0)
+        self.assertEqual(
+            self.lim("[intent:dry_wit] [wry] " + self.POST, "u2", 9.0),
+            "[intent:dry_wit] [wry] Noted, sir.")
+
+    def test_nothing_left_with_an_action_is_silence(self):
+        self.lim(self.POST, "u1", 0.0)
+        self.assertEqual(self.lim(self.POST, "u2", 9.0, action_ran=True), "")
+
+    def test_an_earned_bold_choice_is_still_limited(self):
+        reply = "A bold choice, if I may say so, sir. Proceed with care."
+        a, _ = af.persona_hygiene(reply, self.EARNED, state=self.st, now=0.0)
+        b, _ = af.persona_hygiene(reply, self.EARNED + " again", state=self.st,
+                                  now=30.0)
+        self.assertEqual(a, reply)
+        self.assertEqual(b, "Proceed with care.")
+
+    def test_other_signature_lines_share_the_limit(self):
+        for line in ("Well, that escalated quickly, sir.",
+                     "Quite the strategy, sir.", "I do try not to judge, sir.",
+                     "Noted, sir — though I make no promises about the "
+                     "outcome.", "Try not to break anything, sir."):
+            with self.subTest(line=line):
+                st = af.HygieneState()
+                kw = dict(state=st, now=0.0)
+                self.assertEqual(
+                    af.limit_signature_phrases(line, "a", **kw), line)
+                self.assertEqual(
+                    af.limit_signature_phrases(line, "b", **kw),
+                    af.NEUTRAL_LINE)
+
+    def test_a_phrase_inside_a_longer_sentence_is_not_a_signature(self):
+        line = "You mentioned quite the strategy for the rollout, sir."
+        self.lim(line, "a", 0.0)
+        self.assertEqual(self.lim(line, "b", 1.0), line)
+
+
+class DuplicateReplyTests(unittest.TestCase):
+    def test_same_words_to_a_different_utterance_is_logged(self):
+        st = af.HygieneState()
+        line = "I'll note that for posterity, sir."
+        self.assertIsNone(af.note_spoken_reply("He sounds stupider.", line,
+                                               state=st))
+        msg = af.note_spoken_reply(
+            "Are you sure that upgrade did you any better?", line, state=st)
+        self.assertIn("[hygiene]", msg)
+
+    def test_the_same_utterance_twice_is_not_flagged(self):
+        st = af.HygieneState()
+        line = "It is half past nine, sir, as before."
+        af.note_spoken_reply("what time is it", line, state=st)
+        self.assertIsNone(af.note_spoken_reply("What time is it?", line,
+                                               state=st))
+
+    def test_short_acknowledgements_are_ordinary(self):
+        st = af.HygieneState()
+        af.note_spoken_reply("open it", "Done, sir.", state=st)
+        self.assertIsNone(af.note_spoken_reply("close it", "Done, sir.",
+                                               state=st))
+
+    def test_persona_hygiene_reports_it_without_changing_the_text(self):
+        st = af.HygieneState()
+        line = "The forecast is rather grim today, sir."
+        af.persona_hygiene(line, "weather?", state=st)
+        out, notes = af.persona_hygiene(line, "and now?", state=st)
+        self.assertEqual(out, line)
+        self.assertTrue(any(n.startswith("[hygiene]") for n in notes))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -416,6 +416,11 @@ class Primary:
         self._hotwords = hotwords or (lambda: False)
         self._gate = gate
         self._shadow = shadow
+        # The last run()'s rescue reason ('' = Parakeet's text was used, or
+        # Whisper decoded without a Parakeet attempt). 'empty' = Parakeet
+        # heard no words: the noise gate's PRIMARY_EMPTY evidence
+        # (core/speech_filter.py). Read by the same thread right after run().
+        self.last_rescue = ""
         self._log = log
         self._clock = clock
         self._mu = threading.Lock()
@@ -449,6 +454,7 @@ class Primary:
             pass
 
     def run(self, audio):
+        self.last_rescue = ""
         if self.latch.failed:
             self._note_engine("whisper")
             return self._whisper(audio)
@@ -500,6 +506,7 @@ class Primary:
             if line:
                 self._say(line)
             self._note_engine("parakeet-rescued")
+            self.last_rescue = why
             res = self._whisper(audio)
             if verdict == "shadow" and self._shadow is not None:
                 try:

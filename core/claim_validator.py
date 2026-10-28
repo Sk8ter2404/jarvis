@@ -99,8 +99,10 @@ from typing import Iterable, Optional
 __all__ = [
     "asks_owner",
     "drop_ungrounded_readings",
+    "drop_ungrounded_screen_facts",
     "find_completed_claim",
     "find_ungrounded_reading",
+    "find_ungrounded_screen_fact",
     "find_unverified_claim",
     "is_progress_only",
     "looks_like_question",
@@ -1406,3 +1408,169 @@ def reading_was_read(phrase: str, grounding: Iterable[str] = ()) -> bool:
             any(_rd_attached_values(f, g) for g in texts) for f in fams)
     except Exception:
         return False
+
+
+# ── Facts read off the screen (v3.0.1, live 2026-10-27 20:41) ───────────────
+# "do some research and see if it's out yet. The new episode five and six."
+# -> web_search, see_screen (742 chars of the Google page), then "I've found
+# them, sir - episodes five and six were released yesterday. It seems they
+# dropped earlier than expected." That one WAS on the page ("episodes 5 and 6
+# drop earlier than expected 13 hours ago", "Episodes 5 And 6 Release Date
+# ... 1 day ago"), but nothing checked it: find_ungrounded_reading knows only
+# sensor numbers (volume, battery, CPU ...), so a release fact, a date or an
+# episode number after a screen read was spoken on trust. After a look at the
+# screen, a sentence that states a release / availability fact or a date has
+# to have it in what this turn read (or the owner's words):
+#   * a release / availability claim ("released", "out now", "is out",
+#     "available", "dropped", "premiered", "came out", "airs") needs a
+#     release word in the read text;
+#   * a calendar date (a month name, a weekday) needs that month / weekday;
+#     a relative day in a release sentence ("yesterday", "today", "last
+#     night", "tomorrow", "last week") needs it or its "N hours / 1 day ago"
+#     form;
+#   * every number in such a sentence ("episodes five and six", "season 2",
+#     "2026") needs the same number, as digits or a word.
+# Questions, offers, hedges ("I can't tell whether it's out") and conditions
+# ("if it's out ...") state nothing and are left alone. Numbers outside a
+# release / date sentence (a count of windows) are not judged here - narrow
+# on purpose: a false drop costs a whole extra round.
+_SF_RELEASE_RE = re.compile(
+    r"\b(?:releas(?:e|ed|es|ing)\b|came\s+out|comes?\s+out|"
+    r"(?:is|are|was|were|it's|they're|it\s+is|they\s+are)\s+(?:now\s+|"
+    r"already\s+|finally\s+)?(?:out|available|live)\b|out\s+now|"
+    r"now\s+(?:out|available|streaming)|available|dropp(?:ed|ing)|drops|"
+    r"premier(?:ed|es)|air(?:ed|s)|streaming\s+now)")
+_SF_RELEASE_GROUND_RE = re.compile(
+    r"\b(?:releas\w*|drop(?:s|ped|ping)?|out\s+now|out\s+today|available|"
+    r"premier\w*|air(?:s|ed|ing|date)|came\s+out|coming\s+soon|upcoming|"
+    r"launch\w*|now\s+streaming|streaming\s+now|new\s+episodes?)\b")
+_SF_NOT_CLAIM_RE = re.compile(
+    r"\b(?:if|whether|unless|once|shall\s+i|should\s+i|would\s+you|"
+    r"can't\s+(?:tell|see|find|confirm|say)|cannot\s+(?:tell|see|find|"
+    r"confirm|say)|couldn't\s+(?:tell|see|find|confirm)|not\s+sure|"
+    r"no\s+(?:mention|sign|word)|doesn't\s+say|does\s+not\s+say|"
+    r"don't\s+see|do\s+not\s+see|unclear|no\s+idea)\b")
+_SF_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday",
+                "saturday", "sunday")
+# "may" is a month only next to a day number ("May 5", "5 May").
+_SF_MONTH_RE = re.compile(
+    r"\b(?:(?:january|february|march|april|june|july|august|september|"
+    r"october|november|december)|may(?=\s+\d)|(?<=\d\s)may)\b")
+_SF_WEEKDAY_RE = re.compile(r"\b(?:" + "|".join(_SF_WEEKDAYS) + r")\b")
+_SF_AGO_HOURS = r"\d+\s*(?:hours?|hrs?|h|minutes?|mins?|m)\s+ago|just\s+now"
+_SF_RELATIVE = (
+    (re.compile(r"\byesterday\b"),
+     re.compile(r"\byesterday\b|\b(?:1|one|a)\s+day\s+ago\b")),
+    (re.compile(r"\blast\s+night\b"),
+     re.compile(r"\blast\s+night\b|\byesterday\b|\b(?:1|one|a)\s+day\s+ago"
+                r"\b|\b" + _SF_AGO_HOURS)),
+    (re.compile(r"\b(?:today|tonight|this\s+(?:morning|afternoon|evening))"
+                r"\b"),
+     re.compile(r"\b(?:today|tonight|this\s+(?:morning|afternoon|evening))"
+                r"\b|\b" + _SF_AGO_HOURS)),
+    (re.compile(r"\btomorrow\b"), re.compile(r"\btomorrow\b")),
+    (re.compile(r"\blast\s+week\b"),
+     re.compile(r"\blast\s+week\b|\b(?:[2-9]|[1-3]\d)\s+days\s+ago\b|"
+                r"\b(?:1|one|a)\s+weeks?\s+ago\b")),
+    (re.compile(r"\bnext\s+week\b"), re.compile(r"\bnext\s+week\b")),
+)
+# Numbers in a release / date sentence: digits, or a number word other than
+# "one" ("this one", "one moment").
+_SF_NUM_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\b|\b(?:(?:twenty|thirty|forty|fifty|sixty|seventy|"
+    r"eighty|ninety)(?:[\s-](?:one|two|three|four|five|six|seven|eight|"
+    r"nine))?|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)\b")
+_SF_GROUND_NUM_RE = re.compile(r"\d+(?:\.\d+)?|\b" + _RD_WORD_NUM)
+
+
+def _sf_numbers(text: str) -> set:
+    out = set()
+    for m in _SF_GROUND_NUM_RE.finditer(str(text or "").lower()):
+        v = _rd_value(m.group(0))
+        if v is not None:
+            out.add(v)
+    return out
+
+
+def _sf_named_in(word: str, low: str) -> bool:
+    """A month or weekday, or its usual short form, appears in ``low``."""
+    if re.search(r"\b" + word + r"\b", low):
+        return True
+    abbr = "sept?" if word == "september" else word[:3]
+    return bool(re.search(r"\b" + abbr + r"\b", low))
+
+
+def find_ungrounded_screen_fact(text: str, *, grounding: Iterable[str] = (),
+                                user_text: str = "") -> Optional[str]:
+    """The unsupported part when ``text`` - a reply written after this turn
+    read the screen - states a release / availability fact, a date, or a
+    number inside such a sentence that neither ``grounding`` (this turn's
+    action results as text: the screen reads, the search's top results) nor
+    the owner's ``user_text`` carries; None otherwise. Pure; never
+    raises."""
+    try:
+        norm = _norm(text)
+        if not norm:
+            return None
+        ground = " \n ".join(str(g) for g in (grounding or ()) if g).lower()
+        ground = ground.replace("’", "'")
+        owner = _norm(user_text)
+        both = ground + " \n " + owner
+        nums = None
+        for sentence in _SENTENCE_SPLIT_RE.split(norm):
+            s = sentence.strip()
+            if not s or s.endswith("?") or _SF_NOT_CLAIM_RE.search(s):
+                continue
+            release = _SF_RELEASE_RE.search(s)
+            months = [m.group(0) for m in _SF_MONTH_RE.finditer(s)]
+            days = [m.group(0) for m in _SF_WEEKDAY_RE.finditer(s)]
+            if not (release or months or days):
+                continue
+            if release and not _SF_RELEASE_GROUND_RE.search(both):
+                return release.group(0)
+            for word in months + days:
+                if not _sf_named_in(word, both):
+                    return word
+            if release:
+                for said, ok in _SF_RELATIVE:
+                    m = said.search(s)
+                    if m and not ok.search(both):
+                        return m.group(0)
+            for m in _SF_NUM_RE.finditer(s):
+                v = _rd_value(m.group(0))
+                if v is None:
+                    continue
+                if nums is None:
+                    nums = _sf_numbers(both)
+                if not any(abs(v - g) < 0.01 for g in nums):
+                    return m.group(0)
+        return None
+    except Exception:
+        return None
+
+
+def drop_ungrounded_screen_facts(text: str, *, grounding: Iterable[str] = (),
+                                 user_text: str = "") -> tuple:
+    """(``text`` without the sentences find_ungrounded_screen_fact flags,
+    the flagged parts), split as drop_ungrounded_readings splits. Never
+    raises: on a fault ``text`` comes back unchanged with nothing
+    flagged."""
+    try:
+        if not text:
+            return text, []
+        grounding = [str(g) for g in (grounding or ()) if g]
+        if find_ungrounded_screen_fact(text, grounding=grounding,
+                                       user_text=user_text) is None:
+            return text, []
+        kept, flagged = [], []
+        for part in re.split(r"(?<=[.!?])\s+", text):
+            hit = find_ungrounded_screen_fact(part, grounding=grounding,
+                                              user_text=user_text)
+            if hit:
+                flagged.append(hit)
+            else:
+                kept.append(part)
+        return " ".join(kept).strip(), flagged
+    except Exception:
+        return text, []

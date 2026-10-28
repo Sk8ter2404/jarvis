@@ -186,9 +186,10 @@ class StreamingRouteReplayTests(_StreamingBase):
         self.assertEqual(self.bc._normalize_service("Apple TV+"), "apple_tv")
         self.assertEqual(self.bc._normalize_service("hbo max"), "max")
 
-    def _open(self, fn, *args):
+    def _open(self, fn, *args, ui_search=False):
         with mock.patch.object(self.bc, "_open_url_in_browser",
-                               return_value="chrome") as opn, \
+                               return_value="chrome") as opn,                 mock.patch.object(self.bc, "_streaming_ui_search",
+                                  return_value=ui_search), \
                 mock.patch.object(self.bc.time, "sleep"), \
                 mock.patch.object(self.bc, "_window_handles_snapshot",
                                   return_value=set()), \
@@ -206,6 +207,14 @@ class StreamingRouteReplayTests(_StreamingBase):
                          "I don't have a verified search link for Disney+, sir, "
                          "so I've opened its home page - search for Bluey there.")
         self.find.assert_not_called()
+
+    def test_disney_search_is_finished_on_the_page_when_it_works(self):
+        # Live 2026-10-27 20:41: "Open Disney Plus and check" -> [ACTION:
+        # disney_plus, Vision Quest] handed the search back to the owner.
+        out, opn = self._open(self.bc._streaming_auto_play, "disney_plus",
+                              "Vision Quest", ui_search=True)
+        self.assertEqual(opn.call_args[0][0], "https://www.disneyplus.com")
+        self.assertEqual(out, "Disney+'s search for Vision Quest is open, sir.")
 
     def test_streaming_search_opens_the_verified_url(self):
         out, opn = self._open(self.bc._streaming_open_search, "max", "Some Show")
@@ -513,3 +522,95 @@ class VisionLabelTests(_StreamingBase):
                                   seen.setdefault("p", p) and "ok"):
             self.bc.ask_vision_multi("What does the Teams chat say?", self._images())
         self.assertNotIn("Ignore chat", seen["p"])
+
+# ════════════════════════════════════════════════════════════════════════════
+#  S2b - a service with no search link is searched through its own page
+# ════════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class StreamingUiSearchTests(_StreamingBase):
+    def _run(self, click_outcome="verified", typed="typed: Vision Quest",
+             pressed="pressed enter", cfg=None, fg_is_service=True):
+        from core import grounded_click as gc
+        from core import actions as ca
+        calls = []
+
+        def fake_click(arg, said="", mode="click", **kw):
+            calls.append(("click", arg))
+            return gc.Result("Done, sir.", click_outcome)
+
+        def fake_type(t):
+            calls.append(("type", t))
+            return typed
+
+        def fake_press(k):
+            calls.append(("press", k))
+            return pressed
+
+        svc = __import__("core.streaming_search", fromlist=["x"]).service(
+            "disney_plus")
+        with mock.patch.object(gc, "run_bounded", side_effect=fake_click),                 mock.patch.object(ca, "_act_type", side_effect=fake_type),                 mock.patch.object(ca, "_act_press", side_effect=fake_press),                 mock.patch.object(self.bc.time, "sleep"),                 mock.patch.object(self.bc, "_streaming_fg_is_service",
+                                  return_value=fg_is_service):
+            ok = self.bc._streaming_ui_search(
+                cfg if cfg is not None else {"vision_monitor": "left"},
+                svc, "Vision Quest")
+        return ok, calls
+
+    def test_open_click_search_type_then_enter_in_one_action(self):
+        ok, calls = self._run()
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("click", "monitor:left|search icon"),
+                                 ("type", "Vision Quest"),
+                                 ("press", "enter")])
+
+    def test_never_types_when_another_window_is_in_front(self):
+        # Review of 3.0.1: the click may land in (or focus may move to)
+        # another app; the title is typed only into the streaming page.
+        ok, calls = self._run(fg_is_service=False)
+        self.assertFalse(ok)
+        self.assertEqual([c[0] for c in calls], ["click"])
+
+    def test_the_foreground_check_reads_the_service_name(self):
+        svc = __import__("core.streaming_search", fromlist=["x"]).service(
+            "disney_plus")
+        import sys, types
+        for title, want in (("Search | Disney+ - Google Chrome", True),
+                            ("Discord", False), ("", False)):
+            fake = types.SimpleNamespace(
+                GetForegroundWindow=lambda: 1,
+                GetWindowText=lambda h, t=title: t)
+            with mock.patch.dict(sys.modules, {"win32gui": fake}):
+                self.assertEqual(self.bc._streaming_fg_is_service(svc), want,
+                                 title)
+
+    def test_a_failed_click_stops_there_and_types_nothing(self):
+        ok, calls = self._run(click_outcome="not_found")
+        self.assertFalse(ok)
+        self.assertEqual([c[0] for c in calls], ["click"])
+
+    def test_a_refused_type_or_enter_is_a_failure(self):
+        ok, calls = self._run(typed="REFUSED: sign-in page")
+        self.assertFalse(ok)
+        self.assertEqual([c[0] for c in calls], ["click", "type"])
+        ok, calls = self._run(pressed="Shall I send that?")
+        self.assertFalse(ok)
+
+    def test_a_service_with_a_verified_link_is_never_ui_searched(self):
+        from core import streaming_search as S
+        self.assertEqual(S.ui_search_target("disney_plus"), "search icon")
+        for key in ("max", "netflix", "hulu", "prime_video", "youtube",
+                    "apple_tv"):
+            self.assertIsNone(S.ui_search_target(key), key)
+
+    def test_the_open_search_falls_back_to_the_message_when_it_fails(self):
+        from core.failure_markers import terminal_failure_text
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome"),                 mock.patch.object(self.bc.time, "sleep"),                 mock.patch.object(self.bc, "_window_handles_snapshot",
+                                  return_value=set()),                 mock.patch.object(self.bc, "_find_browser_window_matching",
+                                  return_value=None),                 mock.patch.object(self.bc, "_streaming_ui_search",
+                                  return_value=False),                 mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND, {}, clear=True):
+            out = self.bc._streaming_auto_play("disney_plus", "Vision Quest")
+        self.assertEqual(terminal_failure_text(out),
+                         "I don't have a verified search link for Disney+, sir, "
+                         "so I've opened its home page - search for Vision "
+                         "Quest there.")
+

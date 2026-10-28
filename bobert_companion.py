@@ -18110,6 +18110,7 @@ def _transcribe_capture(audio):
     primary a speculative Whisper decode is never joined (nor started:
     _spec_stt_should_snapshot) — its text would pre-empt Parakeet's."""
     _tail_probe_start(audio)
+    _last_stt_rescue[0] = ""
     # Speed plan R6 (core/stt_parakeet.py): None with STT_ENGINE='whisper'
     # and STT_SHADOW='' (the defaults) — then exactly transcribe() below.
     _r6 = _stt_r6_route()
@@ -18162,6 +18163,9 @@ from core import stt_parakeet as _stt_parakeet  # noqa: E402
 
 _stt_alt = None                       # the Parakeet engine once loaded
 _parakeet_lock = threading.Lock()     # its load + every decode
+# The last _transcribe_capture's Parakeet rescue reason ('' = none; 'empty' =
+# Parakeet heard no words and Whisper decoded). Read by _noise_verdict.
+_last_stt_rescue = [""]
 _parakeet_latch = _stt_parakeet.Latch()
 
 
@@ -18504,7 +18508,9 @@ def _transcribe_capture_r6(audio, route: str):
     never blocks) — unless the mic was muted meanwhile. The shadow keeps the
     words only of a line the live system acts on (words_kept)."""
     if route == "primary":
-        return _parakeet_primary.run(audio)
+        res = _parakeet_primary.run(audio)
+        _last_stt_rescue[0] = _parakeet_primary.last_rescue
+        return res
     _stt_wait_tls.ms = None
     t0 = time.perf_counter()
     res = transcribe(audio)
@@ -32298,6 +32304,11 @@ def _streaming_open_search(service_key: str, query: str,
     if url == svc.home:
         if not q:
             return f"{svc.name} is open, sir."
+        # Finish the job here instead of handing it back (2026-10-27): open
+        # the site's own search, type the title, press Enter. Any step that
+        # fails falls back to the plain line below.
+        if _streaming_ui_search(cfg, svc, q):
+            return f"{svc.name}'s search for {q} is open, sir."
         line = (f"I don't have a verified search link for {svc.name}, sir, "
                 f"so I've opened its home page - search for {q} there.")
         if home_is_final:
@@ -32305,6 +32316,69 @@ def _streaming_open_search(service_key: str, query: str,
             return TERMINAL_FAILURE_PREFIX + line
         return line
     return f"{svc.name}'s search for {q} is open, sir."
+
+
+def _streaming_fg_is_service(svc) -> bool:
+    """True when the foreground window's title names streaming service
+    ``svc`` ("Search | Disney+ - Google Chrome"). False on any doubt (no
+    win32, no title). Never raises."""
+    try:
+        import win32gui
+        title = (win32gui.GetWindowText(win32gui.GetForegroundWindow())
+                 or "").lower()
+        names = {str(svc.name or "").lower(),
+                 str(svc.key or "").split("_")[0].lower()}
+        return any(len(n) >= 3 and n in title for n in names)
+    except Exception:
+        return False
+
+
+def _streaming_ui_search(cfg: dict, svc, q: str) -> bool:
+    """Search ``q`` through a streaming site's OWN page when it has no
+    verified search link (Disney+): click its search entry (click_on_screen's
+    grounded executor, pinned to the player monitor), type the title, press
+    Enter. True only when all three went through; False on the first step
+    that did not (the caller says so plainly). Live 2026-10-27 the owner did
+    the same by hand: "open Disney Plus and check" opened the home page and
+    stopped. Never raises."""
+    try:
+        from core import streaming_search as _ss
+        target = _ss.ui_search_target(svc.key)
+        if not target or not q:
+            return False
+        from core import actions as _ca
+        from core import grounded_click as _gc
+        mon = cfg.get("vision_monitor")
+        arg = f"monitor:{mon}|{target}" if mon else target
+        r = _gc.run_bounded(arg, said=_ca._turn_said(), mode="click")
+        if getattr(r, "outcome", "") not in (_gc.VERIFIED, _gc.NAVIGATED):
+            print(f"  [streaming-ui-search] {svc.name}: click {target!r} "
+                  f"-> {getattr(r, 'outcome', '?')}", flush=True)
+            return False
+        time.sleep(float(cfg.get("search_open_wait", 1.5)))
+        # Type only into the streaming site itself: the window in front
+        # must be its page (title names the service), never another app
+        # whose own "search" the click may have found or that took focus.
+        if not _streaming_fg_is_service(svc):
+            print(f"  [streaming-ui-search] {svc.name}: the window in front "
+                  f"is not {svc.name} - not typing", flush=True)
+            return False
+        typed = _ca._act_type(q)
+        if not str(typed).startswith("typed:"):
+            print(f"  [streaming-ui-search] {svc.name}: type -> {typed!r}",
+                  flush=True)
+            return False
+        pressed = _ca._act_press("enter")
+        if not str(pressed).startswith("pressed"):
+            print(f"  [streaming-ui-search] {svc.name}: enter -> {pressed!r}",
+                  flush=True)
+            return False
+        print(f"  [streaming-ui-search] {svc.name}: searched {q!r} on its "
+              f"own page", flush=True)
+        return True
+    except Exception as e:
+        print(f"  [streaming-ui-search] skipped: {e}", flush=True)
+        return False
 
 
 def _streaming_auto_play(service_key: str, query: str) -> str:
@@ -40034,12 +40108,63 @@ def _noise_verdict(text: str, conf, injected: bool = False,
             owner_idle_s=(now - owner_at) if owner_at else None,
             since_jarvis_s=(now - line_at) if line_at else None,
             jarvis_asked=bool(_last_jarvis_line[1]),
-            prompt_pending=_reply_prompt_pending())
+            prompt_pending=_reply_prompt_pending(),
+            # Live v3.0.0 20:39:40: Parakeet heard nothing, Whisper's
+            # rescue said "Thank you." (PRIMARY_EMPTY, core/speech_filter).
+            primary_heard_nothing=(_last_stt_rescue[0] == "empty"))
         if verdict == "noise":
             print(f"  [noise] ignored ({why})")
         return verdict
     except Exception:
         return ""
+
+
+# ── unclear short utterance (core/speech_filter.unclear_reason) ──────────
+# Live v3.0.0 20:41:26: a marginal capture came back as "Enough and awesome."
+# and the model web-searched it verbatim. Such a line is not acted on: in a
+# conversation JARVIS asks once (UNCLEAR_CUE, at most every
+# _UNCLEAR_CUE_GAP_S), otherwise it is dropped. Off with
+# UNCLEAR_UTTERANCE_GATE = False. Numbers-only log.
+UNCLEAR_UTTERANCE_GATE = True
+UNCLEAR_CUE = "Sorry, sir, I didn't catch that."
+_UNCLEAR_CUE_GAP_S = 20.0
+_unclear_cue_at = [0.0]
+
+
+def _unclear_turn(text: str, injected: bool = False,
+                  now: float | None = None) -> bool:
+    """True when this mic turn is too unclear to act on (the caller ends
+    the turn); speaks UNCLEAR_CUE when the owner is in a conversation.
+    Typed / injected turns are never checked. Never raises (False)."""
+    try:
+        if injected or not UNCLEAR_UTTERANCE_GATE:
+            return False
+        why = _speech_filter_mod.unclear_reason(
+            text, _last_recording_peak, vad_threshold=VAD_THRESHOLD)
+        if not why:
+            return False
+        now = time.monotonic() if now is None else float(now)
+        # An answer to a waiting prompt or to a question JARVIS just asked
+        # ("which one, sir?" -> "the green one") is never second-guessed.
+        line_at = float(_last_jarvis_line[0] or 0.0)
+        if _reply_prompt_pending() or (
+                _last_jarvis_line[1] and line_at
+                and 0.0 <= now - line_at
+                <= _speech_filter_mod.NOISE_REPLY_WINDOW_S):
+            return False
+        owner_at = float(_last_owner_turn_at[0] or 0.0)
+        in_convo = bool(owner_at) and (
+            now - owner_at < _speech_filter_mod.NOISE_OWNER_IDLE_S)
+        last = float(_unclear_cue_at[0] or 0.0)
+        ask = in_convo and (last <= 0.0 or now - last >= _UNCLEAR_CUE_GAP_S)
+        print(f"  [unclear] not acting ({why}) — "
+              + ("asking sir to repeat" if ask else "dropped"))
+        if ask:
+            _unclear_cue_at[0] = now
+            _speak(UNCLEAR_CUE)
+        return True
+    except Exception:
+        return False
 
 
 # Standby auto-engage bridge. The background lyric-detection thread in
@@ -42803,6 +42928,26 @@ def _once_per_turn_refusal(name, arg, ran_before, ran_here) -> str:
     return ""
 
 
+def _screen_read_refusal(name) -> str:
+    """The refusal result for a third see_screen / read_screen (or an alias
+    with see_screen's handler) in one owner turn, or "" to let it run
+    (core.loop_guard.screen_read_refusal has the rule and why it is enforced
+    while the rest of W21 is shadow; LOOP_GUARD_MODE='off' turns it off).
+    Outside a turn nothing is refused. Never raises."""
+    try:
+        if _loop_guard_mode() == "off":
+            return ""
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is None:
+            return ""
+        see = ACTIONS.get("see_screen")
+        return _loop_guard.screen_read_refusal(
+            name, list(frame.get("calls") or ()),
+            is_read=lambda n: see is not None and ACTIONS.get(n) is see)
+    except Exception:
+        return ""
+
+
 # ── Honest close-out (NEW #6, 2026-10-01) ───────────────────────────────────
 # Live 2026-10-01 21:00:50: after five follow-up rounds the loop guard stopped
 # the chain; the last thing said was "I'm running the numbers now, sir; I'll
@@ -43741,6 +43886,15 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             print(f"  [action] {name}: {_again}")
             results.append((name, _again, False))
             return ""
+        # A third screen read in one turn (live 2026-10-27 20:41:30-36:
+        # see_screen, read_screen, read_screen on the same page) - see
+        # _screen_read_refusal.
+        _reread = _screen_read_refusal(name)
+        if _reread:
+            print(f"  [loop-guard] {name}: third screen read this turn - "
+                  f"refused")
+            results.append((name, _reread, False))
+            return ""
 
         if _needs_confirmation(name, arg):
             _queue_pending_confirmation(name, arg)
@@ -44086,6 +44240,35 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         results.append(("_ungrounded_reading", warn, True))
         cleaned = _kept
 
+    # Facts read off the screen (live 2026-10-27 20:41:16): after a look at
+    # the screen EARLIER this turn, a sentence stating a release /
+    # availability fact, a date, or a number in such a sentence must be in
+    # what this turn read or the owner's words - else it is not spoken and
+    # the follow-up round quotes the page or says it can't tell
+    # (core.claim_validator.find_ungrounded_screen_fact has the rules). A
+    # guess written before THIS reply's own read is result-hold's.
+    if (cleaned and getattr(_turn_grounding, "frame", None) is not None
+            and any(_is_screen_look_action(_n) for _n in _ran_before_reply)):
+        try:
+            _sf_ground = _turn_grounding_texts() + [
+                str(_r) for (_n, _r, _i) in results
+                if not str(_n).startswith("_")]
+            _sf_kept, _sf_bad = _claim_validator.drop_ungrounded_screen_facts(
+                cleaned, grounding=_sf_ground, user_text=_turn_user_text())
+        except Exception as _sf_err:
+            print(f"  [validation] screen-fact check failed: {_sf_err}")
+            _sf_kept, _sf_bad = cleaned, []
+        if _sf_bad:
+            warn = (
+                f"reply stated '{_sf_bad[0]}' but nothing read this turn "
+                "says so - it was NOT spoken. Say only what the page you "
+                "read says, in its own words (quote the headline), or say "
+                "plainly the page doesn't tell you; never add a date, a "
+                "release or a number it does not show")
+            print(f"  [validation] {warn}")
+            results.append(("_ungrounded_screen_fact", warn, True))
+            cleaned = _sf_kept
+
     # When mission narration fired, the per-step cues replaced the LLM's
     # prose. Drop the cleaned text so the main loop doesn't immediately
     # re-speak whatever narration the LLM also tried to inline.
@@ -44184,6 +44367,11 @@ def _followup_extra(action_results) -> str:
         "for sound or volume, [ACTION: system_pulse] for the PC) or say "
         "plainly you can't tell from here - never repeat or guess the "
         "number, and give a confidence in words.\n"
+        "- If a result is from [_ungrounded_screen_fact], your previous "
+        "reply stated a date, a release or a number the page you read does "
+        "not show; the owner did not hear it. Quote what the page says "
+        "(its headline, word for word) or say it doesn't say - no new "
+        "action, no guess.\n"
         + ("- If click or find says not found or lists candidates, ask sir "
            "which one, naming them; never search, open or play something "
            "else instead.\n" if _screen_target_stuck(action_results) else
@@ -51181,6 +51369,20 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
         _after_reply_spoken(text, raised=_tt_outcome != "ok")
 
 
+def _persona_hygiene_apply(spoken: str, user_text: str, action_ran: bool) -> str:
+    """v3.0.1: unearned "A bold choice" out, repeated signature phrases
+    limited, an identical reply to a different utterance logged (all in
+    core/advice_fallback.persona_hygiene). Never raises."""
+    try:
+        out, notes = _advice_fallback.persona_hygiene(
+            spoken, user_text, action_ran=action_ran)
+    except Exception:
+        return spoken
+    for n in notes:
+        print("  " + n)
+    return out
+
+
 def _run_llm_dispatch_body(text: str) -> str:
     """Single-utterance LLM turn: the glance fast-path or a full LLM
     response, execution of any [ACTION:] tokens, then the informative /
@@ -51305,14 +51507,8 @@ def _run_llm_dispatch_body(text: str) -> str:
     # voiced early is touched (the stream holds the opener back).
     if (spoken_text and not _stream_spoken_prefix[0]
             and globals().get("SPEECH_HYGIENE", True)):
-        _bold_out = _advice_fallback.strip_unearned_bold_choice(
-            spoken_text, text)
-        if not _bold_out and not action_results:
-            _bold_out = spoken_text     # a bare reply: never go silent on it
-        if _bold_out != spoken_text:
-            print("  [speech-hygiene] dropped an unearned \"A bold choice\" "
-                  "opener")
-            spoken_text = _bold_out
+        spoken_text = _persona_hygiene_apply(spoken_text, text,
+                                             bool(action_results))
     # Self-voiced actions (a device dialogue) already said everything: no
     # prose, answer-first, quip, verbatim result or follow-up for this reply.
     _self_voiced_only = _all_self_voiced(action_results)
@@ -51550,7 +51746,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         _loop_actions = {"open_url", "web_search", "check_credits",
                          "_unverified_claim", "_dropped_step",
                          "_preemptive_hallucinated_claim",
-                         "_ungrounded_reading"}
+                         "_ungrounded_reading", "_ungrounded_screen_fact"}
         # check_credits is also terminal — once it returns a balance,
         # there's nothing left to do but report it. Stop after the
         # first follow-up that reports the balance.
@@ -51607,6 +51803,12 @@ def _run_llm_dispatch_body(text: str) -> str:
             if _ack_cut:
                 print(f"  [ack-hold] dropped the follow-up's acknowledgement "
                       f"({_ack_cut} words): an action in it failed")
+        # v3.0.1: the follow-up reply gets the same persona hygiene as the
+        # first (live 10-27 20:41: a closing "A bold choice" after a screen
+        # read slipped past because only the first reply was checked).
+        if f_spoken and globals().get("SPEECH_HYGIENE", True):
+            f_spoken = _persona_hygiene_apply(f_spoken, text,
+                                              bool(current_results))
         f_spoken = _apply_quip_layer(f_spoken, current_results)
         # Append follow-up to history so context carries forward
         conversation_history.append({"role": "assistant", "content": followup})
@@ -52808,6 +53010,13 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # turns only; logs numbers, never the words. _media_voice_gate.
                 if _media_voice_gate(text, _injected_text is not None):
                     _media_gate_drop_cue(text)
+                    set_state("idle")
+                    continue
+
+                # ── UNCLEAR SHORT LINE (core/speech_filter.unclear_reason) ──
+                # Marginal level + no request/reply word: ask, never act
+                # (live v3.0.0 20:41:26). Mic turns only. _unclear_turn.
+                if _unclear_turn(text, _injected_text is not None):
                     set_state("idle")
                     continue
 
