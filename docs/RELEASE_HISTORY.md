@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.2 (2026-10-28)
+
+Stability. The CI simulator is fully green for the first time (its 3 long-standing failures were simulator gaps, and a test left a real 5-minute timer thread running into later tests). A timing-flaky speech test is fixed (9% failure under heavy CPU load -> 0 in 600 runs). Short compliments ('Very nice', 'Sounds great') no longer get 'Sorry, I didn't catch that', while garbled lines still do. A comment on something he just reported ('Yay, version 3 is done') no longer re-runs the reading. 'Read up on / do some research on X' searches the web; 'look into the camera' does not. The news test no longer touches the network. Tonight's mistakes are now permanent offline checks (169 replay items; 9 brain-test items).
+
 ## v3.0.1 (2026-10-27)
 
 Fixes from the first v3 evening. 'What's (all) new' now reads the real release history (it was reading an old upgrade log). 'Is <chat> online / what is <chat> doing' answers about one Agent Office chat by name. Face recognition runs only when you ask who someone is or about a face ('he doesn't sound happy' no longer runs it). The canned 'A bold choice ... I'll note that for posterity' is dropped wherever it is unearned, and each signature line is limited to once per 10 turns and 20 minutes. After a screen read, a date or 'it's out' claim must match what was on the screen; a third unchanged screen read in one turn is refused; 'is it out yet' goes to a web search. Garbled short lines get 'Sorry, I didn't catch that' instead of an action, while short real replies still work. Streaming sites without a search link get searched through their own page (only when that site is the window in front), and his own typed text is never offered as a click target. CI fix: drive roots are recognised on any OS.
