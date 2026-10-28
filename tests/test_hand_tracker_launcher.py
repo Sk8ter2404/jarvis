@@ -88,8 +88,11 @@ class LauncherTests(unittest.TestCase):
         kw = self.procs[0].kw
         self.assertEqual(kw["stdin"], __import__("subprocess").DEVNULL)
         self.assertNotIn("PYTHONPATH", kw["env"])
-        if os.name == "nt":
-            import subprocess
+        # Guard on the real capability, not just os.name: ci-sim leaves os.name
+        # "nt" but strips subprocess.CREATE_NO_WINDOW to look like Linux, where
+        # the product's nt branch never runs at all.
+        import subprocess
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
             self.assertTrue(kw["creationflags"] & subprocess.CREATE_NO_WINDOW)
         self.assertTrue(os.path.exists(self.life))          # the lifeline exists
 

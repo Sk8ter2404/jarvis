@@ -345,7 +345,12 @@ class HardExitTests(_WatchdogBase):
     def test_kernel32_is_bound_with_pointer_sized_handles(self):
         # os.name, not sys.platform: ci-sim fakes the latter after this module
         # bound kernel32, which is exactly why the binding happens at import.
-        from ctypes import wintypes
+        try:
+            from ctypes import wintypes
+        except ImportError:
+            # ci-sim hides ctypes.wintypes (it models a Linux runner); the
+            # binding itself was made at import, before it did.
+            self.skipTest("ctypes.wintypes is not importable on this runner")
         self.assertIsNotNone(tw._k32, "no hard kill available on Windows")
         self.assertIs(tw._k32.GetCurrentProcess.restype, wintypes.HANDLE)
         self.assertEqual(list(tw._k32.TerminateProcess.argtypes),

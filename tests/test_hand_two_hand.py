@@ -310,6 +310,12 @@ class SkillWiringTests(unittest.TestCase):
 
 class KinectHelperTests(unittest.TestCase):
     def test_window_at_point_skips_the_overlay_and_the_shell(self):
+        try:
+            importlib.import_module("ctypes.wintypes")  # _target_rect_at needs it
+        except ImportError:
+            # ci-sim hides ctypes.wintypes (it models a Linux runner); the
+            # helper degrades to (0, None) there, so there is nothing to pin.
+            self.skipTest("ctypes.wintypes is not importable on this runner")
         with mock.patch.object(kt, "_window_title", return_value="JARVIS Air Cursor"):
             fake_user32 = mock.Mock()
             with mock.patch("ctypes.windll", create=True) as wd:
