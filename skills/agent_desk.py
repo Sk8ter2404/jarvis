@@ -8,11 +8,13 @@ spec in its SPEC.md, "State JSON"): one GET of AGENT_OFFICE_URL + /api/state,
 and ~/.claude/settings.json is never touched - the Office already watches the
 transcripts, so JARVIS asks it.
 
-  * agents_status (INFORMATIVE) - at most three short sentences: how many chats
-    are working or waiting, who is waiting on the owner and since when, and any
-    alarms. "anything waiting on me" (arg "waiting") narrows it to the
-    needs_braden list. The Office not running answers "The Agent Office isn't
-    running, sir."
+  * agents_status (SPEAK_VERBATIM) - at most three short sentences: how many
+    chats are working or waiting, who is waiting on the owner and since when,
+    and any alarms. "anything waiting on me" (arg "waiting") narrows it to the
+    needs_braden list. Any other arg is a chat's NAME (3.0.1, live 2026-10-27
+    "is Ultron online?" got "I can't confirm that"): that one chat's status,
+    how long and its activity; no match says so, then the overall summary.
+    The Office not running answers "The Agent Office isn't running, sir."
   * Optional proactive line (AGENT_DESK_ANNOUNCE, default off): a NEW
     needs_braden item is announced once through proactive_announce - debounced
     (it must still be there on the next poll, one line per GAP_S, at most four
@@ -59,12 +61,20 @@ PROMPT_EXAMPLES = (
     "                  since when, and any alarms. Add 'waiting' to narrow it\n"
     # No apostrophe inside a quoted trigger: core.prompt_router pairs the
     # single quotes to find them.
-    "                  to what needs him. Fire on 'what are my agents doing',\n"
-    "                  'how are my agents', 'status of my chats', 'which chats\n"
-    "                  are working', 'anything waiting on me', 'is any chat\n"
-    "                  waiting on me', 'do any agents need me'.\n"
+    "                  to what needs him, or the NAME of a chat to answer about that\n"
+    "                  one chat (working, idle, waiting on him or offline, for\n"
+    "                  how long, and its activity). The chats are his own\n"
+    "                  (Ultron is one); never say you cannot check them. Fire\n"
+    "                  on 'what are my agents doing', 'how are my agents',\n"
+    "                  'status of my chats', 'which chats are working',\n"
+    "                  'anything waiting on me', 'is any chat waiting on me',\n"
+    "                  'do any agents need me', 'is the agent office up',\n"
+    "                  'is Ultron online', 'is the Ops hub working'.\n"
     "  'what are my agents doing' -> [ACTION: agents_status]\n"
     "  'anything waiting on me' -> [ACTION: agents_status, waiting]\n"
+    "  'is Ultron online?' -> [ACTION: agents_status, Ultron]\n"
+    "  'what is Ultron doing?' -> [ACTION: agents_status, Ultron]\n"
+    "  'is the Ops hub working?' -> [ACTION: agents_status, Ops hub]\n"
 )
 
 _lock = threading.Lock()
@@ -358,12 +368,99 @@ def describe(state: dict, focus_waiting: bool = False, now=None) -> str:
 _FOCUS_RE = re.compile(r"(?i)\b(wait|waiting|need|needs|me|mine|attention)\b")
 
 
+_STATUS_WORDS = {
+    "working": "working",
+    "idle": "idle",
+    "waiting_braden": "waiting on you",
+    "waiting_permission": "waiting on you",
+    "error": "in an error state",
+}
+# Words that ask about the whole office, not one chat.
+_GENERIC_NAMES = frozenset((
+    "agent", "agents", "chat", "chats", "all", "everything", "everyone",
+    "status", "office", "the office", "agent office", "session", "sessions"))
+
+
+def _query_name(arg) -> str:
+    q = clean(arg, 40)
+    q = re.sub(r"(?i)^(the|my|all|all my|all the)\s+", "", q)
+    q = re.sub(r"(?i)\s+(chats?|sessions?|agents?)$", "", q)
+    # Nothing left but punctuation ("!!") would match every chat as a part.
+    if q.lower() in _GENERIC_NAMES or len(_norm(q)) < 2:
+        return ""
+    return q
+
+
+def _norm(text) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
+def _find_chats(state: dict, query: str) -> list:
+    """The chats whose cleaned name or its head before the dash is ``query``
+    (case-insensitive); if none is an exact match, those that contain it as
+    whole words. ``[(display name, session)]``."""
+    query = _norm(query)
+    exact, partial = [], []
+    rx = re.compile(r"(?<![a-z0-9])" + re.escape(query) + r"(?![a-z0-9])")
+    claude = state.get("claude") if isinstance(state.get("claude"), dict) else {}
+    for s in _items(claude.get("sessions")):
+        head = clean(s.get("name"), 40, head_only=True)
+        full = clean(s.get("name"), 80)
+        hl, fl = _norm(head), _norm(full)
+        shown = head or full or "a chat"
+        if query in (hl, fl):
+            exact.append((shown, s))
+        elif rx.search(hl) or rx.search(fl):
+            partial.append((shown, s))
+    return (exact or partial)
+
+
+def _chat_phrase(session: dict, now) -> str:
+    """"online and working for 12 minutes" / "offline" for one chat."""
+    status = str(session.get("status") or "").strip().lower()
+    since = since_phrase(session.get("since"), now)
+    if status == "offline":
+        return ("offline " + since).strip()
+    word = _STATUS_WORDS.get(status) or clean(status.replace("_", " "), 30)
+    return ("online and " + word + (" " + since if since else "")
+            if word else "online" + (" " + since if since else ""))
+
+
+def describe_chat(state: dict, query: str, now=None) -> str:
+    """One or two sentences about the chat called ``query``; the overall
+    summary after a sentence saying so when none matches. Never raises."""
+    try:
+        now = time.time() if now is None else now
+        hits = _find_chats(state, query)
+        if not hits:
+            return defang(f"I don't see a chat called {clean(query, 40)} in the "
+                          f"office, sir. " + describe(state, now=now))
+        if len(hits) == 1:
+            name, s = hits[0]
+            line = f"{name} is {_chat_phrase(s, now)}, sir."
+            act = clean(s.get("activity"), 70)
+            if act and str(s.get("status") or "").strip().lower() != "offline":
+                line += f" Activity: {act}."
+            return defang(line)
+        bits = [f"{n} is {_chat_phrase(s, now)}" for n, s in hits[:3]]
+        more = len(hits) - len(bits)
+        tail = f", and {more} more" if more > 0 else ""
+        return defang(f"{len(hits)} chats match {clean(query, 40)}: "
+                      + "; ".join(bits) + tail + ".")
+    except Exception:
+        return UNREADABLE
+
+
 def agents_status(arg: str = "") -> str:
     state, err = read_state()
     if err == "down":
         return NOT_RUNNING
     if err or state is None:
         return UNREADABLE
+    if not _FOCUS_RE.search(str(arg or "")):
+        query = _query_name(arg)
+        if query:
+            return describe_chat(state, query)
     return describe(state, focus_waiting=bool(_FOCUS_RE.search(str(arg or ""))))
 
 

@@ -52,7 +52,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `add_notification_rule` | `skills/notification_triage.py:1566` | **VERBATIM** | — | yes |
 | `add_reminder` | `skills/shopping_list.py:104` | **VERBATIM** | yes | yes |
 | `add_shopping_item` | `skills/shopping_list.py:46` | **VERBATIM** | yes | yes |
-| `agents_status` | `skills/agent_desk.py:361` | **VERBATIM** | — | yes |
+| `agents_status` | `skills/agent_desk.py:454` | **VERBATIM** | — | yes |
 | `air_control_off` | `skills/air_control.py:405` | **VERBATIM** | yes | yes |
 | `air_control_on` | `skills/air_control.py:385` | **VERBATIM** | yes | yes |
 | `air_control_status` | `skills/air_control.py:414` | **VERBATIM** | yes | yes |
