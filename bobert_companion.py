@@ -51181,6 +51181,20 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
         _after_reply_spoken(text, raised=_tt_outcome != "ok")
 
 
+def _persona_hygiene_apply(spoken: str, user_text: str, action_ran: bool) -> str:
+    """v3.0.1: unearned "A bold choice" out, repeated signature phrases
+    limited, an identical reply to a different utterance logged (all in
+    core/advice_fallback.persona_hygiene). Never raises."""
+    try:
+        out, notes = _advice_fallback.persona_hygiene(
+            spoken, user_text, action_ran=action_ran)
+    except Exception:
+        return spoken
+    for n in notes:
+        print("  " + n)
+    return out
+
+
 def _run_llm_dispatch_body(text: str) -> str:
     """Single-utterance LLM turn: the glance fast-path or a full LLM
     response, execution of any [ACTION:] tokens, then the informative /
@@ -51305,14 +51319,8 @@ def _run_llm_dispatch_body(text: str) -> str:
     # voiced early is touched (the stream holds the opener back).
     if (spoken_text and not _stream_spoken_prefix[0]
             and globals().get("SPEECH_HYGIENE", True)):
-        _bold_out = _advice_fallback.strip_unearned_bold_choice(
-            spoken_text, text)
-        if not _bold_out and not action_results:
-            _bold_out = spoken_text     # a bare reply: never go silent on it
-        if _bold_out != spoken_text:
-            print("  [speech-hygiene] dropped an unearned \"A bold choice\" "
-                  "opener")
-            spoken_text = _bold_out
+        spoken_text = _persona_hygiene_apply(spoken_text, text,
+                                             bool(action_results))
     # Self-voiced actions (a device dialogue) already said everything: no
     # prose, answer-first, quip, verbatim result or follow-up for this reply.
     _self_voiced_only = _all_self_voiced(action_results)
@@ -51607,6 +51615,12 @@ def _run_llm_dispatch_body(text: str) -> str:
             if _ack_cut:
                 print(f"  [ack-hold] dropped the follow-up's acknowledgement "
                       f"({_ack_cut} words): an action in it failed")
+        # v3.0.1: the follow-up reply gets the same persona hygiene as the
+        # first (live 10-27 20:41: a closing "A bold choice" after a screen
+        # read slipped past because only the first reply was checked).
+        if f_spoken and globals().get("SPEECH_HYGIENE", True):
+            f_spoken = _persona_hygiene_apply(f_spoken, text,
+                                              bool(current_results))
         f_spoken = _apply_quip_layer(f_spoken, current_results)
         # Append follow-up to history so context carries forward
         conversation_history.append({"role": "assistant", "content": followup})

@@ -40,6 +40,7 @@ from __future__ import annotations
 import datetime as _dt
 import random
 import re
+import time
 from typing import Optional
 
 __all__ = ["MEAL_SUGGESTIONS", "meal_of_request", "is_advice_request",
@@ -290,14 +291,72 @@ def unearned_bold_opener(reply: str, user_text: str) -> bool:
         return False
 
 
-def strip_unearned_bold_choice(reply: str, user_text: str) -> str:
-    """``reply`` without a leading "A bold choice, ..." the owner's words do
-    not earn (live 10-16 11:09, 10-19 20:28, 10-20 09:34: the line answered a
-    question, a number, a "yes"). Leading [tags] are kept. A reply that is
-    ONLY the opener becomes "" - the caller decides whether saying nothing
-    is right (it is when an action ran; it is not for a bare reply). Never
-    raises."""
+_SENT_SPLIT_RE = re.compile(r"((?<=[.!?])\s+)")
+_LEAD_BRACKETS_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)*")
+_BOLD_CORE = (r"a\s+bold\s+choice(?:\s*,?\s*if\s+i\s+may(?:\s+say\s+so)?)?"
+              r"(?:\s*,?\s*sir)?")
+# A WHOLE sentence that is only the tic (a longer sentence that happens to
+# start the same way - "A bold choice, as it happens." - is not it).
+_BOLD_SENTENCE_RE = re.compile(r"^" + _BOLD_CORE + r"\s*[.!]+$", re.I)
+_POSTERITY_SENTENCE_RE = re.compile(
+    r"^i'll\s+note\s+(?:that|it)\s+for\s+posterity(?:\s*,?\s*sir)?"
+    r"\s*[.!]+$", re.I)
+
+
+def _remove_sentences(text: str, drop) -> tuple:
+    """``text`` without the sentences ``drop(body, prev_dropped)`` accepts.
+    Leading [tags] of a dropped sentence stay; the sentence after a dropped
+    FIRST sentence is re-capitalised; nothing left to say gives "". Returns
+    (new text, anything dropped). Never raises."""
     try:
+        pieces = _SENT_SPLIT_RE.split(text)
+        out: list = []
+        dropped_any = prev = False
+        kept_any = False
+        for i in range(0, len(pieces), 2):
+            piece = pieces[i]
+            sep = pieces[i + 1] if i + 1 < len(pieces) else ""
+            lead = _LEAD_BRACKETS_RE.match(piece).group(0)
+            body = piece[len(lead):]
+            if body.strip() and drop(body.strip().replace("’", "'"), prev):
+                dropped_any = prev = True
+                out.append(lead)
+                continue
+            if dropped_any and not kept_any and body[:1].isalpha():
+                body = body[0].upper() + body[1:]
+            kept_any = kept_any or bool(body.strip())
+            prev = False
+            out.append(lead + body + sep)
+        if not dropped_any:
+            return text, False
+        res = "".join(out).rstrip() if kept_any else ""
+        if not re.search(r"\w", _TAG_RE.sub("", res)):
+            res = ""
+        return res, True
+    except Exception:
+        return text, False
+
+
+def strip_unearned_bold_choice(reply: str, user_text: str) -> str:
+    """``reply`` without a "A bold choice, ..." sentence the owner's words do
+    not earn (live 10-16 11:09, 10-19 20:28, 10-20 09:34: the line answered a
+    question, a number, a "yes"). v3.0.1: ANYWHERE in the reply, not just
+    first (live 10-27 20:41: "... sir. A bold choice, if I may say so."
+    closed a screen read), and the "I'll note that for posterity." that
+    rides on it goes too (live 10-27 20:38: the opener was dropped, the tail
+    stayed and was voiced twice). Leading [tags] are kept. A reply that is
+    ONLY the opener becomes "" - the caller decides whether saying nothing
+    is right (it is when an action ran). Never raises."""
+    try:
+        if not reply or states_a_choice(user_text):
+            return reply
+        out, dropped = _remove_sentences(
+            reply, lambda b, prev: bool(_BOLD_SENTENCE_RE.match(b)) or (
+                prev and bool(_POSTERITY_SENTENCE_RE.match(b))))
+        if dropped:
+            if not out:
+                return ""
+            reply = out
         if not unearned_bold_opener(reply, user_text):
             return reply
         tags = _TAG_RE.match(reply)
@@ -311,6 +370,167 @@ def strip_unearned_bold_choice(reply: str, user_text: str) -> str:
         return head + rest
     except Exception:
         return reply
+
+
+# --- v3.0.1: signature-phrase limiter -------------------------------------
+# The owner's standing decision on the persona's stock lines is "keep but
+# limit": each is voiced at most once per LIMIT_TURNS owner turns AND
+# LIMIT_SECONDS (whichever is longer), so a line stays a treat, not a tic.
+LIMIT_TURNS = 10
+LIMIT_SECONDS = 20 * 60
+NEUTRAL_LINE = "Noted, sir."
+
+_SIGNATURE_BODIES = (
+    ("bold_choice", _BOLD_CORE),
+    ("posterity", r"i'll\s+note\s+(?:that|it)\s+for\s+posterity"
+                  r"(?:\s*,?\s*sir)?"),
+    ("reconsidered", r"shall\s+i\s+add\s+that\s+to\s+the\s+list\s+of\s+things"
+                     r"\s+you've\s+reconsidered(?:\s*,?\s*sir)?"),
+    ("escalated", r"well,?\s+that\s+escalated\s+quickly(?:\s*,?\s*sir)?"),
+    ("quite_strategy", r"quite\s+the\s+strategy(?:\s*,?\s*sir)?"),
+    ("not_judge", r"i\s+do\s+try\s+not\s+to\s+judge(?:\s*,?\s*sir)?"),
+    ("no_promises", r"noted,?\s+sir\s*[—–-]+\s*though\s+i\s+make"
+                    r"\s+no\s+promises\s+about\s+the\s+outcome"),
+    ("break_anything", r"try\s+not\s+to\s+break\s+anything(?:\s*,?\s*sir)?"),
+    ("hope_strategy", r"hope\s+is,?\s+as\s+ever,?\s+not\s+a\s+strategy"),
+    ("recovery_image", r"i'll\s+keep\s+the\s+recovery\s+image\s+warm"),
+)
+SIGNATURE_PHRASES = tuple(
+    (key, re.compile(r"^" + body + r"\s*[.!?]*$", re.I))
+    for key, body in _SIGNATURE_BODIES)
+
+
+def signature_key(sentence: str) -> Optional[str]:
+    """The signature-phrase key a WHOLE sentence is, else None."""
+    try:
+        s = str(sentence or "").strip().replace("’", "'")
+        for key, rx in SIGNATURE_PHRASES:
+            if rx.match(s):
+                return key
+    except Exception:
+        pass
+    return None
+
+
+class HygieneState:
+    """In-process memory for the limiter and the duplicate-reply check."""
+
+    def __init__(self) -> None:
+        self.turn = 0
+        self.last_user: Optional[str] = None
+        self.voiced: dict = {}
+        self.last_spoken: Optional[str] = None
+        self.last_spoken_user: Optional[str] = None
+
+    def note_turn(self, user_text: str) -> int:
+        u = _norm(user_text)
+        if u != self.last_user:
+            self.turn += 1
+            self.last_user = u
+        return self.turn
+
+
+_STATE = HygieneState()
+
+
+def reset_state() -> None:
+    """Forget the limiter and duplicate-reply memory (tests, new session)."""
+    global _STATE
+    _STATE = HygieneState()
+
+
+def limit_signature_phrases(reply: str, user_text: str = "", *,
+                            action_ran: bool = False,
+                            now: Optional[float] = None,
+                            state: Optional[HygieneState] = None) -> str:
+    """``reply`` with a signature phrase dropped when it was voiced too
+    recently (see LIMIT_TURNS / LIMIT_SECONDS), recording the ones it lets
+    through. A reply left with nothing becomes NEUTRAL_LINE (after its
+    leading [tags]) - or "" when an action ran and speaks for itself. Never
+    raises."""
+    try:
+        st = state or _STATE
+        if not reply:
+            return reply
+        turn = st.note_turn(user_text)
+        t = time.monotonic() if now is None else now
+
+        def _drop(body: str, prev: bool) -> bool:
+            key = signature_key(body)
+            if not key:
+                return False
+            seen = st.voiced.get(key)
+            if seen and not (turn - seen[0] >= LIMIT_TURNS
+                             and t - seen[1] >= LIMIT_SECONDS):
+                return True
+            st.voiced[key] = (turn, t)
+            return False
+
+        out, dropped = _remove_sentences(reply, _drop)
+        if not dropped:
+            return reply
+        if out:
+            return out
+        if action_ran:
+            return ""
+        tags = _TAG_RE.match(reply)
+        return (tags.group(0) if tags else "") + NEUTRAL_LINE
+    except Exception:
+        return reply
+
+
+def _cmp(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9' ]+", " ", _norm(text)).split())
+
+
+def note_spoken_reply(user_text: str, spoken: str, *,
+                      state: Optional[HygieneState] = None) -> Optional[str]:
+    """A log line when ``spoken`` is word-for-word the previous spoken reply
+    to a DIFFERENT owner utterance (a bug signal: a canned or stale reply);
+    None otherwise. Records both. Replies under five words ("Done, sir.")
+    are ordinary repeats and ignored. Never raises."""
+    try:
+        st = state or _STATE
+        s, u = _cmp(spoken), _cmp(user_text)
+        msg = None
+        if (len(s.split()) >= 5 and s == st.last_spoken
+                and u != st.last_spoken_user):
+            msg = ("[hygiene] identical reply to a different utterance "
+                   f"({s[:60]!r}): canned or stale?")
+        if s:
+            st.last_spoken, st.last_spoken_user = s, u
+        return msg
+    except Exception:
+        return None
+
+
+def persona_hygiene(spoken: str, user_text: str, *, action_ran: bool = False,
+                    now: Optional[float] = None,
+                    state: Optional[HygieneState] = None) -> tuple:
+    """The one call the monolith makes on a reply about to be voiced:
+    unearned "A bold choice" out, signature phrases limited, duplicate reply
+    flagged. Returns (text to speak, log lines). Never raises."""
+    notes: list = []
+    try:
+        out = strip_unearned_bold_choice(spoken, user_text)
+        if out != spoken:
+            notes.append('[speech-hygiene] dropped an unearned "A bold '
+                         'choice" opener')
+            if not out and not action_ran:
+                tags = _TAG_RE.match(spoken)
+                out = (tags.group(0) if tags else "") + NEUTRAL_LINE
+        lim = limit_signature_phrases(out, user_text, action_ran=action_ran,
+                                      now=now, state=state)
+        if lim != out:
+            notes.append("[speech-hygiene] dropped a signature phrase "
+                         "voiced too recently")
+            out = lim
+        dup = note_spoken_reply(user_text, out, state=state)
+        if dup:
+            notes.append(dup)
+        return out, notes
+    except Exception:
+        return spoken, notes
 
 
 def early_hold(piece: str, user_text: str) -> bool:

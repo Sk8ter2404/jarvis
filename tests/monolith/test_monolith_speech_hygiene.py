@@ -153,9 +153,10 @@ class BoldChoiceDispatchTests(_Base):
         self.assertEqual(self.spoken, [reply])
 
     def test_a_bare_opener_is_never_turned_into_silence(self):
+        # v3.0.1: the neutral line, not the unearned opener, fills the gap.
         reply = "[intent:dry_wit] A bold choice, if I may say so, sir."
         self._dispatch("yes", reply)
-        self.assertEqual(self.spoken, [reply])
+        self.assertEqual(self.spoken, ["[intent:dry_wit] Noted, sir."])
 
     def test_action_reply_loses_the_opener_too(self):
         self._stub("open_on_monitor", "ok")
@@ -213,6 +214,69 @@ class BoldChoiceFlushHoldTests(_Base):
             spoken = self._feed("does pineapple belong on pizza",
                                 ["A bold choice, sir. ", "Hm. ", "tail"])
         self.assertEqual(spoken[0], "A bold choice, sir.")
+
+
+@requires_monolith
+class CannedPersonaLineLiveTests(_Base):
+    """v3.0.1, live 2026-10-27: the same "A bold choice ... I'll note that
+    for posterity." answered two different remarks, then closed a screen read."""
+    LIVE = ("[intent:dry_wit] [wry] A bold choice, if I may say so, sir. "
+            "I'll note that for posterity.")
+
+    def _dispatch_logged(self, user, first, followups=()):
+        import contextlib
+        import io
+        bc = self.bc
+        self._p(bc, "get_response_with_animation", return_value=first)
+        self.gfr = self._p(bc, "get_followup_response",
+                           side_effect=list(followups) + [None] * 8)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bc._run_llm_dispatch(user)
+        return buf.getvalue()
+
+    def test_two_remarks_never_get_the_tic_nor_an_identical_line(self):
+        self._dispatch("He sounds stupider.", self.LIVE)
+        self._dispatch("Are you sure that upgrade did you any better?",
+                       self.LIVE)
+        joined = " ".join(self.spoken).lower()
+        self.assertNotIn("posterity", joined)
+        self.assertNotIn("bold choice", joined)
+        self.assertEqual(len(self.spoken), 2)
+
+    def test_the_follow_up_reply_loses_a_closing_bold_choice(self):
+        self._stub("see_screen", "Chrome - enough and awesome")
+        self._dispatch(
+            "Enough and awesome.",
+            "[intent:confirmation] On it, sir. [ACTION: see_screen]",
+            ["[intent:confirmation] It seems to be a mix of synonyms and "
+             "sentimental reminders that you are loved, sir. A bold choice, "
+             "if I may say so."])
+        joined = " ".join(self.spoken)
+        self.assertIn("you are loved, sir.", joined)
+        self.assertNotIn("bold choice", joined.lower())
+
+    def test_a_repeat_of_a_signature_line_is_limited_across_turns(self):
+        self._dispatch("what is two plus two",
+                       "Four, sir. Quite the strategy, sir.")
+        self._dispatch("and three plus three",
+                       "Six, sir. Quite the strategy, sir.")
+        self.assertEqual(self.spoken, ["Four, sir. Quite the strategy, sir.",
+                                       "Six, sir."])
+
+    def test_an_identical_reply_to_a_different_utterance_is_logged(self):
+        line = "The forecast is rather grim today, sir."
+        self._dispatch_logged("weather please", line)
+        out = self._dispatch_logged("and the weather now", line)
+        self.assertIn("[hygiene] identical reply to a different utterance",
+                      out)
+        self.assertEqual(self.spoken, [line, line])
+
+    def test_setting_off_is_the_old_behaviour(self):
+        with mock.patch.object(self.bc, "SPEECH_HYGIENE", False):
+            self._dispatch("He sounds stupider.", self.LIVE)
+            self._dispatch("Is it better?", self.LIVE)
+        self.assertEqual(self.spoken, [self.LIVE, self.LIVE])
 
 
 if __name__ == "__main__":
