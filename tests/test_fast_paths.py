@@ -824,5 +824,72 @@ class CapabilityQuestionTests(unittest.TestCase):
                 self.assertTrue(any(f'"{n}"' in src for n in names), names)
 
 
+class MemoryQuestionTests(unittest.TestCase):
+    """v3.0.7: an explicit question about this PC's RAM is answered by the
+    loaded system_pulse skill's memory_answer before the LLM (live
+    2026-10-28 18:53 "Why is the RAM so high?" at 82 % came back "All
+    systems nominal"). The skill is faked here; the real one is driven in
+    tests/monolith/test_monolith_v307_ram_why.py."""
+
+    ASKS = ("Why is the RAM so high?", "Jarvis, what's using all my memory?",
+            "why is memory so high", "What is eating my RAM?",
+            "why's my ram usage so high",
+            "Hey Jarvis, why is the memory usage so high right now?",
+            "what's taking up all the ram", "which apps are using the most memory",
+            "what is using so much ram", "why is my memory at 90 percent",
+            "why am I using so much memory", "what are the biggest memory users",
+            "who is hogging my RAM", "why is my RAM so high, sir?")
+    NOT = ("how's the computer doing?", "why is your memory so bad",
+           "clear your memory", "what's in your memory",
+           "why is the video memory so high", "why is the GPU memory so high",
+           "what is using my GPU", "what do you remember", "status report",
+           "why is the cpu so high", "how much ram do I have",
+           "what is using all my memory and why is chrome open",
+           "why is the ram so high on the server", "", None, 42)
+
+    def setUp(self):
+        import sys
+        import types
+        self.calls = []
+        fake = types.ModuleType("skill_system_pulse")
+        fake.memory_answer = lambda said: (self.calls.append(said)
+                                           or self.reply)
+        self.reply = "Memory at 82 percent, sir. The biggest memory user is X."
+        prev = sys.modules.get("skill_system_pulse")
+        sys.modules["skill_system_pulse"] = fake
+
+        def _restore():
+            if prev is None:
+                sys.modules.pop("skill_system_pulse", None)
+            else:
+                sys.modules["skill_system_pulse"] = prev
+        self.addCleanup(_restore)
+
+    def test_grammar(self):
+        for text in self.ASKS:
+            with self.subTest(text=text):
+                self.assertTrue(fp.is_memory_question(text))
+        for text in self.NOT:
+            with self.subTest(text=text):
+                self.assertFalse(fp.is_memory_question(text))
+
+    def test_match_answers_from_the_skill(self):
+        hit = fp.match("Why is the RAM so high?", now=TUE)
+        self.assertEqual(hit, fp.FastAnswer("memory-users", self.reply))
+        self.assertEqual(self.calls, ["Why is the RAM so high?"])
+
+    def test_no_answer_falls_through(self):
+        self.reply = ""
+        self.assertIsNone(fp.match("Why is the RAM so high?", now=TUE))
+        import sys
+        sys.modules.pop("skill_system_pulse", None)
+        self.assertIsNone(fp.match("Why is the RAM so high?", now=TUE))
+
+    def test_other_questions_never_read_the_skill(self):
+        for text in self.NOT[:6]:
+            fp.match(text, now=TUE)
+        self.assertEqual(self.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

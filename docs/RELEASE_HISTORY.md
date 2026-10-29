@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.7 (2026-10-28)
+
+Three fixes from tonight's live log. 'Why is the RAM so high?' or 'what's using all my memory?' is answered at once with the number and the biggest memory users, even below the high mark, and JARVIS's own thinking on the GPU is said as such. In the follow-up window after he answers, a voice that does not clearly match the owner no longer keeps the window open, and its remarks that are not a command or a question for JARVIS are ignored, so he stops replying to other people in the room. A spoken 'I've noted that' when no note was made is replaced with an honest 'I haven't made a note of that, sir.'
+
 ## v3.0.6 (2026-10-28)
 
 Honesty, routing and the server, from today's log review and live test. Plain timers no longer get a made-up 'check the oven' label, stock lines that claim work ('I'll note that for posterity') are gone, and when a chain of steps ends on a promise he did not keep, JARVIS now says so. Ideas and suggestions are answered in words instead of opening a web search, and no tool names are spoken. 'Can you open it up?' with nothing to open gets 'Open what, sir?'; developer to-dos ('we need to give the robot more voice lines') become notes for Claude; a flat 'I've no way to check that' offers the nearest read-only action or a note. 'How long is left on that timer?' and 'what can you do?' answer instantly, 'what's new' starts with the version, and his own GPU load while thinking is called that. The server watch also reads disk errors and temperatures, the UPS on-battery status and stopped server apps, read-only with fixed commands. Audio heard while the PC plays media, with an unsure voice, no longer keeps the follow-up window open. YouTube on a named monitor no longer searches for the monitor words.

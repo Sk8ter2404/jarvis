@@ -1807,8 +1807,20 @@ class PulseAskedAtHighRamTests(unittest.TestCase):
         self.assertEqual(self.reads, 0)
 
     def test_what_is_using_my_memory_below_the_threshold(self):
+        # v3.0.7: asked about memory, the memory reading leads even under
+        # RAM_ABNORMAL_PCT, and the users follow it (not "nominal" first).
         out = self._ask(dict(self.LIVE_PULSE, ram_pct=80.0),
                         "what's using all my memory")
+        self.assertEqual(
+            out, "Memory at 80 percent, sir. " + self.LIVE_USERS + " CPU 38 "
+                 "percent at 60 degrees, GPU running at 8 percent, 12 windows "
+                 "open. Anything further?")
+
+    def test_memory_answer_flag_off_is_the_306_order(self):
+        with mock.patch("core.config.SYSTEM_PULSE_MEMORY_ANSWER", False,
+                        create=True):
+            out = self._ask(dict(self.LIVE_PULSE, ram_pct=80.0),
+                            "what's using all my memory")
         self.assertTrue(out.startswith("All systems nominal, sir."), out)
         self.assertIn("memory 80 percent, GPU running at 8 percent, 12 windows "
                       "open. " + self.LIVE_USERS + " Anything further?", out)
@@ -1998,6 +2010,198 @@ class PulseAskedAtHighRamTests(unittest.TestCase):
         self.assertEqual(line, "Memory at 92 percent, sir — getting tight. "
                                "CPU 38 percent at 60 degrees, GPU running at 8 "
                                "percent, 12 windows open.")
+
+
+class PulseWhyIsRamHighTests(unittest.TestCase):
+    """v3.0.7 G1/G1b. Live 2026-10-28 18:53 "Why is the RAM so high?" at 82 %
+    (under RAM_ABNORMAL_PCT 88) -> [ACTION: system_pulse] opened with the
+    all-nominal line, left the GPU load (the local model answering this very
+    turn) unexplained, and put any memory users at the very end. Driven
+    through actions["system_pulse"] (the LLM route) and memory_answer (the
+    pre-LLM fast path, core/fast_paths.py). Readings are neutral fixtures at
+    the live percentages."""
+
+    QUESTION = "Why is the RAM so high?"
+    PULSE = {"cpu_pct": 51.0, "cpu_temp_c": 61.0, "ram_pct": 82.0,
+             "gpu_util_pct": 100.0, "disk_free_gb": 500.0, "active_apps": 8}
+    # The plain report (the 3.0.5 shape) for PULSE.
+    LIVE_OLD = ("All systems nominal, sir. CPU 51 percent at 61 degrees, "
+                "memory 82 percent, GPU working hard at 100 percent, 8 windows "
+                "open.")
+    USERS = ("The biggest memory users are my local brain model at 8 "
+             "gigabytes, Claude at 6.5 and Chrome at 4.5.")
+    MINE = "The GPU's busy at 100 percent - that's me thinking."
+    OURS = [("llama-server.exe", 4242, 90, 0)]
+    GAME = [("fortniteclient-win64-shipping.exe", 9001, 95, 0)]
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+        self.gpu_rows = self.OURS
+        self.own = True
+        self.rows = _live_procs_1559(os.getpid())
+
+    def _patches(self, said):
+        with self.mod._pulse_cache_lock:
+            self.mod._pulse_cache = {"pulse": dict(self.PULSE),
+                                     "ts": time.time()}
+        return (
+            mock.patch.object(self.mod, "_turn_words", return_value=said),
+            mock.patch.object(self.mod, "_read_process_memory",
+                              side_effect=lambda: list(self.rows)),
+            mock.patch.object(self.mod, "_gpu_busy_processes",
+                              side_effect=lambda: self.gpu_rows),
+            mock.patch.object(self.mod, "_own_inference_recent",
+                              side_effect=lambda *a: self.own),
+            mock.patch.object(self.mod, "_gather_pulse",
+                              side_effect=AssertionError("cache is fresh")))
+
+    def _run(self, fn, said):
+        p = self._patches(said)
+        with p[0], p[1], p[2], p[3], p[4]:
+            return fn()
+
+    def _action(self, said=QUESTION, arg=""):
+        return self._run(lambda: self.actions["system_pulse"](arg), said)
+
+    def _answer(self, said=QUESTION):
+        return self._run(lambda: self.mod.memory_answer(said), "")
+
+    def test_fixture_is_the_live_old_line(self):
+        self.assertTrue(self.mod._format_report(dict(self.PULSE))
+                        .startswith(self.LIVE_OLD))
+
+    def test_llm_route_says_the_number_then_the_users_then_me_thinking(self):
+        out = self._action()
+        self.assertEqual(
+            out, "Memory at 82 percent, sir. " + self.USERS + " CPU 51 percent "
+                 "at 61 degrees, 8 windows open. " + self.MINE +
+                 " Anything further?")
+        self.assertNotIn("nominal", out)
+        self.assertNotIn("working hard", out)
+
+    def test_fast_path_answer_is_short_and_plain(self):
+        self.assertEqual(self._answer(),
+                         "Memory at 82 percent, sir. " + self.USERS + " " +
+                         self.MINE)
+
+    def test_fast_path_over_the_mark_says_getting_tight(self):
+        self.PULSE = dict(self.PULSE, ram_pct=93.0)
+        out = self._answer()
+        self.assertTrue(out.startswith(
+            "Memory at 93 percent, sir — getting tight. " + self.USERS), out)
+
+    def test_someone_elses_gpu_is_left_out_of_the_memory_answer(self):
+        for rows, own, label in ((self.GAME, True, "game"),
+                                 (self.GAME + self.OURS, True, "game + model"),
+                                 (None, True, "no reading"),
+                                 (self.OURS, False, "not recent")):
+            with self.subTest(label):
+                self.gpu_rows, self.own = rows, own
+                out = self._answer()
+                self.assertEqual(out, "Memory at 82 percent, sir. " +
+                                 self.USERS)
+
+    def test_a_quiet_gpu_is_not_mentioned(self):
+        self.PULSE = dict(self.PULSE, gpu_util_pct=40.0)
+        self.assertNotIn("GPU", self._answer())
+
+    def test_no_big_user_is_said_honestly(self):
+        self.rows = [(9001, "chrome.exe", 0.4 * _GB)]
+        self.assertEqual(self._answer(), "Memory at 82 percent, sir. " +
+                         self.mod._MEM_USERS_NONE + " " + self.MINE)
+
+    def test_no_reading_is_no_answer(self):
+        self.PULSE = dict(self.PULSE, ram_pct=0.0)
+        self.assertEqual(self._answer(), "")
+
+    def test_memory_answer_flag_off_is_no_answer(self):
+        with mock.patch("core.config.SYSTEM_PULSE_MEMORY_ANSWER", False,
+                        create=True):
+            self.assertEqual(self._answer(), "")
+            self.assertTrue(self._action().startswith(self.LIVE_OLD[:26]))
+
+    def test_gpu_flag_off_drops_me_thinking(self):
+        with mock.patch("core.config.SYSTEM_PULSE_GPU_EXPLAINED", False,
+                        create=True):
+            self.assertEqual(self._answer(), "Memory at 82 percent, sir. " +
+                             self.USERS)
+
+    def test_hows_the_computer_doing_is_unchanged(self):
+        # The 3.0.6 asked-for pulse: nominal, GPU said as mine, no users.
+        out = self._action("Jarvis, how's the computer doing?")
+        self.assertEqual(
+            out, "All systems nominal, sir. CPU 51 percent at 61 degrees, "
+                 "memory 82 percent, 8 windows open. " + self.MINE +
+                 " Anything further?")
+
+
+class PulseMemoryWordOverridesLeadTests(PulseWhyIsRamHighTests):
+    """v3.0.7 review: a memory word in the turn must not hide an abnormal
+    CPU/disk/battery reading, and a video-memory question is not a system-RAM
+    one. Driven through actions["system_pulse"] (the LLM route) with the
+    inherited fixtures."""
+
+    CPU_PULSE = {"cpu_pct": 97.0, "ram_pct": 60.0, "gpu_util_pct": 40.0,
+                 "disk_free_gb": 500.0, "active_apps": 8}
+
+    def _with(self, pulse, said, flag=True):
+        self.PULSE = pulse
+        self.rows = [(9001, "chrome.exe", 3 * 1024 ** 3)]
+        with mock.patch("core.config.SYSTEM_PULSE_MEMORY_ANSWER", flag,
+                        create=True):
+            return self._action(said)
+
+    def test_cpu_alert_still_leads_a_memory_leak_question(self):
+        out = self._with(self.CPU_PULSE,
+                         "why is the CPU so high, is it a memory leak?")
+        self.assertTrue(out.startswith(
+            "Slight problem, sir — CPU at 97 percent. Memory at 60 "
+            "percent, sir. The biggest memory user is Chrome"), out)
+        # The CPU and memory readings are each said once.
+        self.assertEqual(out.count("CPU"), 1, out)
+        self.assertNotIn("memory 60 percent", out)
+
+    def test_flag_off_cpu_alert_still_leads(self):
+        out = self._with(self.CPU_PULSE,
+                         "why is the CPU so high, is it a memory leak?",
+                         flag=False)
+        self.assertTrue(out.startswith(
+            "Slight problem, sir — CPU at 97 percent."), out)
+
+    def test_disk_alert_leads_a_ram_question(self):
+        pulse = dict(self.CPU_PULSE, cpu_pct=30.0, disk_free_gb=8.0)
+        out = self._with(pulse, "why is the ram so high")
+        self.assertTrue(out.startswith(
+            "I'm afraid the C drive is down to 8 gigs free. Memory at 60 "
+            "percent, sir."), out)
+
+    def test_no_other_alert_the_memory_line_still_leads(self):
+        pulse = dict(self.CPU_PULSE, cpu_pct=30.0)
+        out = self._with(pulse, "why is the ram so high")
+        self.assertTrue(out.startswith(
+            "Memory at 60 percent, sir. The biggest memory user is Chrome"),
+            out)
+
+    def test_video_memory_question_is_not_a_system_ram_answer(self):
+        pulse = dict(self.CPU_PULSE, cpu_pct=30.0)
+        for said in ("why is my gpu memory so high", "how full is my vram",
+                     "is the memory on my graphics card full"):
+            out = self._with(pulse, said)
+            self.assertFalse(out.startswith("Memory at 60"), (said, out))
+            self.assertNotIn("biggest memory user", out, said)
+        # Video memory beside a plain RAM word still asks about RAM.
+        out = self._with(pulse, "is it my ram or my gpu memory")
+        self.assertTrue(out.startswith("Memory at 60 percent, sir."), out)
+
+    def test_asks_about_memory_video_memory(self):
+        for said in ("why is my gpu memory so high", "vram usage",
+                     "what is using my video ram"):
+            self.assertFalse(self.mod._asks_about_memory(said), said)
+        with mock.patch("core.config.SYSTEM_PULSE_MEMORY_ANSWER", False,
+                        create=True):
+            self.assertTrue(self.mod._asks_about_memory(
+                "why is my gpu memory so high"))
+        self.assertTrue(self.mod._asks_about_memory("what is eating my ram"))
 
 
 class PulseMemoryUsersTests(unittest.TestCase):

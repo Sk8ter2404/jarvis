@@ -979,6 +979,20 @@ FOLLOWUP_WINDOW_S = 0.0
 # original deadline and the next line needs "Jarvis". False = the old
 # behaviour (every admitted line extends). Wake-word turns are unchanged.
 FOLLOWUP_MEDIA_NO_EXTEND = True
+# FOLLOWUP_UNSURE_NO_EXTEND (3.0.7) - the same, with or without PC audio: a
+# no-wake-word follow-up extends the window only when its voice matched an
+# enrolled speaker (or nobody is enrolled), and a line the window admitted
+# that was then dropped unanswered (noise, filter) never extends it. Live
+# 2026-10-28 19:08-19:12 room speech at 0.61-0.67 held the window open with
+# the PC muted. Your own follow-up still runs; the window just closes on its
+# deadline and the next line needs "Jarvis". False = the 3.0.6 behaviour.
+FOLLOWUP_UNSURE_NO_EXTEND = True
+# FOLLOWUP_UNSURE_COMMANDS_ONLY (3.0.7) - with the above on, a follow-up in an
+# unconfirmed voice that is neither a command nor a question to JARVIS
+# (an imperative first, a "?", a wh-word, "I need you to", the name, a media
+# control) is dropped silently, unless JARVIS just asked a question or a
+# prompt waits for your answer. False = such lines are answered as before.
+FOLLOWUP_UNSURE_COMMANDS_ONLY = True
 
 # Owner speech vocabulary (core/stt_vocab.py). STT_HOTWORDS: comma-separated names
 # Whisper should expect (faster-whisper "hotwords"). STT_REPLACEMENTS: phrases Whisper
@@ -1563,6 +1577,19 @@ WHATS_NEW_VERSION_FIRST = True
 # untouched). False: the 3.0.5 wording exactly.
 SYSTEM_PULSE_GPU_EXPLAINED = True
 
+# SYSTEM_PULSE_MEMORY_ANSWER (bool, v3.0.7, skills/system_pulse.py
+# memory_answer / _on_demand_report, core/fast_paths.py, skills/
+# system_monitor.py): live 2026-10-28 18:53 "Why is the RAM so high?" at 82 %
+# (under the 88 % abnormal mark) opened with the all-nominal line, the GPU
+# (JARVIS's own inference) unexplained, and any memory users last.
+# True (default): an explicit memory question ("why is the RAM so high", "what's
+# using all my memory") is answered before the LLM with the percent, the
+# biggest memory users and, when the GPU load is JARVIS's own, "that's me
+# thinking"; a system_pulse / check_system reply to a memory question opens
+# with the memory reading, never "nominal". False: the 3.0.6 path exactly
+# (the model answers; the pulse opens as before).
+SYSTEM_PULSE_MEMORY_ANSWER = True
+
 # ─── Two-sentence shutdown asks the overnight question (v3 W08) ─────────
 # "Jarvis, shut down. No overnight protocol." (live 2026-10-19 20:26:04) is
 # two sentences, so the one-request shutdown grammar rejects it on purpose
@@ -1708,6 +1735,17 @@ LOOP_GUARD_MODE = "shadow"
 # narrows a label and speaks one honest line where a promise hung. False:
 # the old rule exactly. Applies on the next start.
 CHAIN_PROMISE_CHECK = True
+
+# NOTE_CLAIM_CHECK (bool, v3.0.7, core/claim_validator.find_note_claim) - live
+# 2026-10-28 19:12: a remark not meant for JARVIS got "Certainly, sir. I've
+# noted that for your presentation." and nothing was noted. True (default):
+# during your turn a sentence saying JARVIS noted / remembered / saved
+# something or added it to a list is not spoken unless a note, memory, list
+# or save action really ran this turn (or you asked him to remember it); when
+# nothing else is left he says plainly he hasn't (e.g. "I haven't made a note
+# of that, sir."). A bare "Noted, sir." is untouched, and so is a true claim.
+# False: such sentences are spoken as before. Applies on the next start.
+NOTE_CLAIM_CHECK = True
 
 # ─── Routing fixes (v3.0.6, 2026-10-28 human test + misroutes report) ─────
 # TIMER_LABEL_GROUNDING (skills/timer.py grounded_label): live 2026-10-28

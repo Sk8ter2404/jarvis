@@ -88,6 +88,15 @@ a percent through / done, and a percentage put on a confidence ("95%
 certain", "a 78% probability"). They read every reply, with or without
 action tokens - see the section at the end of this module.
 
+NOTE / REMEMBER CLAIMS (3.0.7)
+==============================
+find_note_claim / drop_note_claims catch "I've noted that for your
+presentation" / "I'll remember that" / "I've added it to your list" /
+"Saved, sir." when no note, memory, list or save action ran this turn - with
+or without an action token in the reply (a played song notes nothing). A
+bare "Noted, sir." is an acknowledgement and is left alone. See the last
+section of this module.
+
 Pure: no I/O, no monolith import, stdlib ``re`` only, so it is testable on the
 light-deps CI runner (tests/test_claim_validator.py).
 """
@@ -97,15 +106,19 @@ import re
 from typing import Iterable, Optional
 
 __all__ = [
+    "NOTE_CLAIM_HONEST_LINES",
     "asks_owner",
+    "drop_note_claims",
     "drop_ungrounded_readings",
     "drop_ungrounded_screen_facts",
     "find_completed_claim",
+    "find_note_claim",
     "find_ungrounded_reading",
     "find_ungrounded_screen_fact",
     "find_unverified_claim",
     "is_progress_only",
     "looks_like_question",
+    "note_claim_honest_line",
     "reading_was_read",
     "strip_ack_preface",
 ]
@@ -1608,3 +1621,517 @@ def _sf_tail_of_dropped(part: str) -> Optional[str]:
         return release.group(0)
     except Exception:
         return None
+
+
+# ── note / remember / list / save claims (3.0.7) ────────────────────────────
+# Live 2026-10-28 19:12 (3.0.5): room speech reached the brain inside the
+# follow-up window and the reply was "Certainly, sir. I've noted that for your
+# presentation." - no note, memory, list or file action ran, so the claim was
+# false. Nothing above caught it: the verb families have no note / remember
+# member, find_unverified_claim only reads replies with no [ACTION:] token,
+# and "noted" is a courtesy lead-in (a bare "Noted, sir." means "understood").
+#
+# find_note_claim: a sentence where JARVIS says he has noted, remembered,
+# saved or added something - or will do so now - when nothing this turn did
+# it. Four kinds, each grounded by its own actions (a token of the action
+# name, as for the verb families - never "any action ran", because a played
+# song does not note anything):
+#   * note     - "I've noted that", "noted for your presentation", "I've made
+#                a note of it", "I'll note that down", "jotted down", "logged"
+#   * remember - "I'll remember that", "I'll keep that in mind", "I won't
+#                forget", "committed to memory", "a mental note"
+#   * list     - "I've added it to your list", "added to your reminders",
+#                "I'll put that on your to-do list"
+#   * save     - "I've saved it", "Saved, sir.", "it has been saved"
+# The owner's own words ground the note and remember kinds when he handed
+# JARVIS something to keep ("remember ...", "don't forget ...", "call me
+# ...", "I prefer ..."): the background memory extractor keeps exactly
+# those turns. A plain statement about himself ("I'm off to the gym at six")
+# grounds the remember kind alone ("I'll keep that in mind"). They never
+# ground the list kind, nor a save with a destination ("saved it to your
+# desktop") - a list item or a file is an action or it did not happen. A bare
+# "I've saved that" over a hand-over is the extractor's own save, and a claim
+# whose target is memory ("added that to my memory", "Saved to memory") is a
+# remember claim whatever the verb. Actions ground a claim only when they
+# are on the allow-list of writers for its kind (_NC_WRITERS): a read-only
+# or opposite action that shares a word (show_shopping_list, calendar_today,
+# forget_face) grounds nothing.
+# Never a claim: a bare "Noted, sir." / "Duly noted." (an acknowledgement),
+# a question, an offer ("I can add it to your list if you'd like", "shall I
+# note that?"), a negation ("I haven't saved it"), a dated report ("I noted
+# it earlier"), an observation ("I noted that your CPU was high"), advice
+# ("you could add it to your calendar"), or any reply when the owner asked
+# whether something was noted / saved (answered from the conversation).
+# drop_note_claims removes the sentences that carry one; when nothing of
+# substance is left the caller speaks note_claim_honest_line instead.
+# Pure, never raises; the switch (NOTE_CLAIM_CHECK) lives in the monolith.
+
+_NC_PRON = (r"(?:it|that|this|them|those|these|everything|"
+            r"all\s+of\s+(?:it|that|this|them))")
+# What may follow a noted / logged / saved + object for the clause to still
+# be a claim: the end of the clause or a word that attaches it ("down",
+# "for your presentation", "in your notes"), never a new clause ("I noted
+# that your CPU was high").
+_NC_TAIL = (r"(?=\s*(?:[,.!;:…]|$)|\s+(?:down|away|for|in|on|under|as|to|"
+            r"into|onto|against|with|sir|now|already|too|here|there|"
+            r"safely)\b)")
+# "noted the following: <report>" introduces content; it is no object.
+_NC_OBJ = (r"(?:\s+(?:" + _NC_PRON + r"|(?:the|your|my|this|that|those|these)"
+           r"\s+(?!(?:following|below|above|next)\b)[a-z'-]+))?")
+_NC_ADV = (r"(?:(?:just|already|also|duly|now|quickly|safely|gone\s+ahead\s+"
+           r"and|went\s+ahead\s+and)\s+)*")
+_NC_I_PERFECT = r"\bi(?:'ve|\s+have)?\s+" + _NC_ADV
+_NC_I_FUTURE = (r"\b(?:i'?ll|i\s+will|i\s+shall|let\s+me|i'?m\s+going\s+to|"
+                r"i\s+am\s+going\s+to)\s+(?:(?:just|also|quickly|certainly|"
+                r"definitely|be\s+sure\s+to|make\s+sure\s+to|go\s+ahead\s+and)"
+                r"\s+)*")
+_NC_I_PROGRESSIVE = r"\b(?:i'?m|i\s+am)\s+(?:(?:now|just|already)\s+)*"
+_NC_CONTAINER = (r"(?:list|notes?|reminders?|queue|to-?do(?:\s+list)?|agenda|"
+                 r"calendar|schedule|memory|memories|file|log|tasks?|records?|"
+                 r"journal|diary|notebook|notepad)")
+_NC_TO_CONTAINER = (r"(?:\s+[a-z'-]+){0,5}?\s+(?:to|on|onto|in|into)\s+"
+                    r"(?:your|the|my)\s+(?:[a-z'-]+\s+){0,2}?"
+                    + _NC_CONTAINER + r"\b")
+# "logged" / "logging" is a note unless it is a sign-in ("logged you in").
+_NC_LOG_NOT = (r"(?!\s+(?:you\s+)?(?:in|out|off|on|into)\b"
+               r"(?!\s+(?:your|the|my)\b))")
+
+_NC_NOTE_V = (r"(?:noted|logged" + _NC_LOG_NOT + r"|recorded|filed)" + _NC_OBJ
+              + _NC_TAIL +
+              r"|(?:jotted|written|wrote|scribbled|put)(?:\s+" + _NC_PRON
+              + r")?\s+down\b(?!\s+to\b)"
+              r"|(?:made|taken|took)\s+(?:a\s+)?(?:quick\s+|careful\s+)?"
+              r"notes?\b")
+_NC_NOTE_BASE = (r"(?:note|log" + _NC_LOG_NOT + r"|record|file)\s+" + _NC_PRON
+                 + r"(?:\s+down|\s+away)?" + _NC_TAIL +
+                 r"|note\s+down\b"
+                 r"|(?:jot|write|put|scribble)\s+(?:" + _NC_PRON + r"\s+)?"
+                 r"down\b(?!\s+to\b)"
+                 r"|(?:make|take)\s+(?:a\s+)?(?:quick\s+|careful\s+)?notes?\b")
+_NC_NOTE_GER = (r"(?:noting|logging" + _NC_LOG_NOT + r"|recording|filing)\s+"
+                r"(?:" + _NC_PRON + r"\b|down\b)"
+                r"|(?:jotting|writing|scribbling|putting)\s+(?:" + _NC_PRON +
+                r"\s+)?down\b(?!\s+to\b)"
+                r"|(?:making|taking)\s+(?:a\s+)?(?:quick\s+|careful\s+)?"
+                r"notes?\b")
+_NC_REMEMBER_BASE = (r"remember\s+(?:" + _NC_PRON + r"|your\b|you\b|to\b)"
+                     r"|remember(?=\s*(?:[,.!;…]|$|sir\b))"
+                     r"|(?:keep|bear|hold)\s+(?:" + _NC_PRON + r"\s+)?"
+                     r"in\s+mind\b"
+                     r"|commit\s+(?:" + _NC_PRON + r"\s+)?to\s+memory\b"
+                     r"|memori[sz]e\s+" + _NC_PRON + r"\b"
+                     r"|make\s+a\s+mental\s+note\b")
+_NC_REMEMBER_DONE = (r"(?:committed|stored|filed)\s+(?:" + _NC_PRON +
+                     r"\s+)?(?:to|in)\s+(?:my\s+)?memory\b"
+                     r"|made\s+a\s+mental\s+note\b"
+                     r"|memori[sz]ed\s+" + _NC_PRON + r"\b"
+                     r"|filed\s+(?:" + _NC_PRON + r"\s+)?away\b"
+                     r"|tucked\s+(?:" + _NC_PRON + r"\s+)?away\b")
+_NC_LIST_V = r"(?:added|put|popped|stuck|pinned)" + _NC_TO_CONTAINER
+_NC_LIST_BASE = r"(?:add|put|pop|stick|pin)" + _NC_TO_CONTAINER
+_NC_LIST_GER = r"(?:adding|putting|popping|sticking|pinning)" + _NC_TO_CONTAINER
+_NC_SAVE_V = r"(?:saved|stored|stashed|bookmarked)" + _NC_OBJ + _NC_TAIL
+_NC_SAVE_BASE = (r"(?:save|store|stash|bookmark)\s+(?:" + _NC_PRON +
+                 r"|(?:the|your)\s+[a-z'-]+)" + _NC_TAIL)
+_NC_SAVE_GER = (r"(?:saving|storing|stashing|bookmarking)\s+(?:" + _NC_PRON +
+                r"|(?:the|your)\s+[a-z'-]+)" + _NC_TAIL)
+_NC_LIBERTY = (r"\bi(?:'ve|\s+have)?\s+(?:just\s+)?(?:taken|took)\s+the\s+"
+               r"liberty\s+of\s+")
+
+# (kind, compiled) - first-person forms, searched anywhere in a clause.
+_NC_FORMS = (
+    ("note", re.compile(_NC_I_PERFECT + r"(?:" + _NC_NOTE_V + r")")),
+    ("note", re.compile(_NC_I_FUTURE + r"(?:" + _NC_NOTE_BASE + r")")),
+    ("note", re.compile(_NC_I_PROGRESSIVE + r"(?:" + _NC_NOTE_GER + r")")),
+    ("note", re.compile(_NC_LIBERTY + r"(?:" + _NC_NOTE_GER + r")")),
+    ("remember", re.compile(_NC_I_FUTURE + r"(?:" + _NC_REMEMBER_BASE + r")")),
+    ("remember", re.compile(
+        r"\bi\s*(?:won'?t|will\s+not|shan'?t|shall\s+not|'?ll\s+not)\s+"
+        r"(?:ever\s+)?forget\b")),
+    ("remember", re.compile(_NC_I_PERFECT + r"(?:" + _NC_REMEMBER_DONE + r")")),
+    ("list", re.compile(_NC_I_PERFECT + r"(?:" + _NC_LIST_V + r")")),
+    ("list", re.compile(_NC_I_FUTURE + r"(?:" + _NC_LIST_BASE + r")")),
+    ("list", re.compile(_NC_I_PROGRESSIVE + r"(?:" + _NC_LIST_GER + r")")),
+    ("list", re.compile(_NC_LIBERTY + r"(?:" + _NC_LIST_GER + r")")),
+    ("save", re.compile(_NC_I_PERFECT + r"(?:" + _NC_SAVE_V + r")")),
+    ("save", re.compile(_NC_I_FUTURE + r"(?:" + _NC_SAVE_BASE + r")")),
+    ("save", re.compile(_NC_I_PROGRESSIVE + r"(?:" + _NC_SAVE_GER + r")")),
+    ("save", re.compile(_NC_LIBERTY + r"(?:" + _NC_SAVE_GER + r")")),
+)
+# Passive: "<pronoun / short subject> has been noted / saved / added to your
+# list", "is now saved", "consider it noted".
+_NC_PASSIVE_AUX = (r"(?:(?:\s+(?:has|have)|'s|'ve)\s+(?:now\s+|just\s+|all\s+)*"
+                   r"been\s+|(?:\s+(?:is|are)|'s|'re)\s+now\s+|"
+                   r"\s+(?:was|were)\s+(?:successfully|just)\s+)"
+                   r"(?:(?:duly|safely|now|all|successfully)\s+)*")
+_NC_PASSIVE_SUBJ = (r"\b(?:it|that|this|they|those|these|everything|"
+                    r"(?:the|your|my)\s+[a-z'-]+(?:\s+[a-z'-]+)?)")
+_NC_PASSIVE = (
+    ("note", re.compile(_NC_PASSIVE_SUBJ + _NC_PASSIVE_AUX +
+                        r"(?:noted|logged" + _NC_LOG_NOT + r"|recorded|"
+                        r"jotted\s+down|written\s+down)\b")),
+    ("remember", re.compile(_NC_PASSIVE_SUBJ + _NC_PASSIVE_AUX +
+                            r"(?:committed|stored)\s+(?:to|in)\s+(?:my\s+)?"
+                            r"memory\b")),
+    ("list", re.compile(_NC_PASSIVE_SUBJ + _NC_PASSIVE_AUX + r"(?:added|put)"
+                        + _NC_TO_CONTAINER)),
+    ("save", re.compile(_NC_PASSIVE_SUBJ + _NC_PASSIVE_AUX +
+                        r"(?:saved|stored|stashed|bookmarked)\b")),
+    ("note", re.compile(r"\bconsider\s+(?:it|that|this)\s+(?:duly\s+)?"
+                        r"(?:noted|logged|recorded)\b")),
+    ("save", re.compile(r"\bconsider\s+(?:it|that|this)\s+saved\b")),
+)
+# Clause-initial narration ("Noted for your presentation.", "Saved, sir.",
+# "Added to your list.", "Jotted down."). A bare "noted" is the
+# acknowledgement and never matches: it needs an object or an attachment.
+_NC_SIR = r"(?:\s*,?\s*sir\s*,?)?"
+_NC_NARRATION = (
+    ("note", re.compile(
+        r"^noted" + _NC_SIR + r"(?:\s+" + _NC_PRON + r")?"
+        r"(?:\s+down\b|\s+(?:for|in|on|under|as|against)\s+"
+        r"(?!what\b|now\b|once\b|the\s+moment\b)[a-z][a-z'-]*)"
+        r"|^noted\s+" + _NC_PRON + r"(?=\s*(?:[,.!;…]|$|sir\b))")),
+    ("note", re.compile(
+        r"^(?:jotted|written|scribbled|put)\s+(?:" + _NC_PRON + r"\s+)?down\b"
+        r"(?!\s+to\b)"
+        r"|^logged" + _NC_LOG_NOT + _NC_SIR + r"(?=\s*(?:[,.!;…]|$)|\s+(?:"
+        + _NC_PRON + r"|for|in|under|as)\b)"
+        r"|^(?:made|making)\s+a\s+(?:quick\s+)?note\b"
+        r"|^(?:" + _NC_NOTE_GER + r")")),
+    ("remember", re.compile(
+        r"^(?:committed|committing)\s+(?:" + _NC_PRON + r"\s+)?to\s+memory\b"
+        r"|^(?:filed|tucked)\s+(?:" + _NC_PRON + r"\s+)?away\b")),
+    ("list", re.compile(r"^(?:added|adding|putting|popped|popping)"
+                        + _NC_TO_CONTAINER)),
+    ("save", re.compile(
+        r"^saved" + _NC_SIR + r"(?=\s*(?:[,.!;…]|$)|\s+(?:" + _NC_PRON +
+        r"|for|to|in|under|as|safely)\b)"
+        r"|^(?:" + _NC_SAVE_GER + r")")),
+)
+# Which actions really write what a claim says (an explicit allow-list per
+# kind plus the registered aliases - never a token intersection: a name like
+# show_shopping_list, calendar_today, list_timers, browser_task or
+# forget_face shares a word with a claim and writes nothing of the kind).
+_NC_REMINDER_WRITERS = frozenset({
+    "add_reminder", "add_shopping_item", "queue_task", "schedule_once",
+    "schedule_recurring", "schedule_when", "schedule_cron"})
+_NC_NOTE_WRITERS = frozenset({
+    "note_for_claude", "queue_task", "report_bug", "report_a_bug",
+    "log_a_bug", "file_a_bug"}) | _NC_REMINDER_WRITERS
+_NC_PERSON_WRITERS = frozenset({
+    "enroll_face", "learn_my_face", "remember_my_face", "learn_guest",
+    "remember_their_face", "remember_this_person", "learn_their_face",
+    "enroll_voice", "learn_my_voice", "enroll_xtts_sample",
+    "set_voice_profile"})
+_NC_WRITERS: dict[str, frozenset[str]] = {
+    "note": _NC_NOTE_WRITERS,
+    "remember": (frozenset({"note_for_claude", "add_reminder",
+                            "game_mode_learn_this"}) | _NC_PERSON_WRITERS),
+    "list": _NC_REMINDER_WRITERS | frozenset({"note_for_claude"}),
+    "save": (frozenset({
+        "screenshot", "take_screenshot", "screenshot_screen",
+        "screen_capture", "capture_screen", "export_memory",
+        "note_for_claude", "draft_reply", "pre_draft_reply",
+        "edit_pending_draft"}) | _NC_REMINDER_WRITERS),
+}
+
+
+def _nc_ran_names(ran_actions: Iterable[str]) -> frozenset:
+    """The lower-cased action names that ran (whole names, no tokens)."""
+    return frozenset(str(n).strip().lower() for n in (ran_actions or ())
+                     if n)
+
+
+# The owner handed JARVIS something to keep (the shapes the background memory
+# extractor keeps - core/learn_prefilter's strong-keep and preference rules):
+# grounds the note and remember kinds only.
+_NC_OWNER_KEEP_RE = re.compile(
+    r"\bremember\b|\bdon'?t\s+forget\b|\bdo\s+not\s+forget\b|\bcall\s+me\b|"
+    r"\bmy\s+name(?:'s|\s+is)\b|\bfrom\s+now\s+on\b|"
+    r"\bkeep\s+(?:that\s+|this\s+|it\s+)?in\s+mind\b|"
+    r"\bbear\s+(?:that|this|it)\s+in\s+mind\b|\bfor\s+the\s+record\b|"
+    r"\bnote\s+that\b|\bmake\s+a\s+mental\s+note\b|\bmemori[sz]e\b")
+_NC_OWNER_PREF_RE = re.compile(
+    r"^(?:(?:and|but|so|well|yeah|yes|also|oh|um|uh|actually|honestly)[\s,]+)*"
+    r"i(?:'m|\s+am)?\s+(?:really\s+|also\s+|still\s+|just\s+)?"
+    r"(?:like|love|hate|prefer|enjoy|dislike|allergic|can'?t\s+stand|"
+    r"don'?t\s+like|do\s+not\s+like|don'?t\s+eat|never\s+eat|always)\b")
+_NC_OWNER_QUESTION_LED_RE = re.compile(
+    r"^(?:what|what's|whats|when|where|who|why|how|which|is|are|was|were|do|"
+    r"does|did|has|have|had)\b")
+_NC_POLITE_REMEMBER_RE = re.compile(
+    r"^(?:can|could|will|would)\s+you\s+(?:please\s+)?(?:remember|keep\s+in\s+"
+    r"mind|note)\s+(?:(?:that|this)\b|i\b|i'm\b|my\b|our\b)")
+# The owner asking whether something was noted / saved: the reply answers
+# from the conversation ("Yes, sir, I added it to your list at noon").
+_NC_OWNER_ASKS_RE = re.compile(
+    r"\b(?:not(?:e|ed|es)|sav(?:e|ed)|remember(?:ed)?|add(?:ed)?|list|"
+    r"log(?:ged)?|writ(?:e|ten)|wrote|jot(?:ted)?|record(?:ed)?|"
+    r"stor(?:e|ed)|forg[eo]t)\b")
+# A dated report of an earlier note is not a claim about this turn.
+_NC_DATED_RE = re.compile(
+    r"\b(?:earlier|yesterday|ago|previously|last\s+(?:night|week|month|time)|"
+    r"this\s+(?:morning|afternoon)|before\s+you\s+asked|at\s+the\s+time)\b")
+
+NOTE_CLAIM_HONEST_LINES: dict[str, str] = {
+    "note": "I haven't made a note of that, sir.",
+    "remember": "I haven't stored that anywhere, sir.",
+    "list": "I haven't added that to any list, sir.",
+    "save": "I haven't saved anything, sir.",
+}
+
+
+# A first-person statement about himself ("I'm off to the gym", "my sister
+# visits on Sunday") is a turn the memory extractor reads too, so "I'll keep
+# that in mind" over it is not false - but it never earns "I've noted that"
+# (no note exists). "I'll get to the next slide" is neither.
+_NC_OWNER_STATE_RE = re.compile(
+    r"^(?:(?:and|but|so|well|yeah|yes|also|oh|um|uh|actually|honestly)[\s,]+)*"
+    r"(?:i'm|im|i\s+am|i\s+was|i've|ive|i\s+have|i\s+had|i\s+got|i'll\s+be|"
+    r"i\s+will\s+be|i\s+always|i\s+never|i\s+usually|we\s+have|we're|"
+    r"we\s+are|my)\b"
+    r"(?!\s+(?:a\s+|an\s+|one\s+|another\s+)?(?:question|request|problem|back|"
+    r"here|ready|done|sorry|fine|ok|okay|trying|going\s+to\s+(?:ask|say|tell)|"
+    r"asking|wondering|about\s+to)\b)")
+# "save_bare": a save claim with no destination ("I've saved that") over a
+# turn the memory extractor keeps is true - the extractor saves it.
+_NC_KEEP_ALL = frozenset({"note", "remember", "save_bare"})
+_NC_KEEP_REMEMBER = frozenset({"remember"})
+
+
+def _nc_owner_keeps(user_text: str) -> frozenset:
+    """The claim kinds the owner's own turn grounds: note and remember when
+    he hands JARVIS something to keep, remember alone for a statement about
+    himself, none otherwise (falsy)."""
+    t = _Q_FILLER_RE.sub("", _norm(user_text)).strip()
+    if not t:
+        return frozenset()
+    if _NC_POLITE_REMEMBER_RE.match(t):
+        return _NC_KEEP_ALL
+    if _NC_OWNER_QUESTION_LED_RE.match(t):
+        return frozenset()
+    if _NC_OWNER_KEEP_RE.search(t) or _NC_OWNER_PREF_RE.match(t):
+        return _NC_KEEP_ALL
+    if _NC_OWNER_STATE_RE.match(t):
+        return _NC_KEEP_REMEMBER
+    return frozenset()
+
+
+def _nc_owner_asks(user_text: str) -> bool:
+    """True when the owner's turn asks whether something was noted / saved."""
+    t = _norm(user_text)
+    if not t or not _NC_OWNER_ASKS_RE.search(t):
+        return False
+    return _owner_asks_status(t)
+
+
+# The courtesy lead-ins without "noted": here "Noted for your presentation"
+# must keep its first word.
+_NC_LEADIN_RE = re.compile(_LEADIN_RE.pattern.replace("perfect|noted|",
+                                                       "perfect|"))
+
+
+def _nc_strip_leadins(core: str) -> str:
+    prev = None
+    while prev != core:
+        prev = core
+        m = _NC_LEADIN_RE.match(core)
+        if m and m.end() > 0:
+            core = core[m.end():].lstrip(" ,")
+    return core
+
+
+# A claim whose target is JARVIS's memory is a remember claim whatever the
+# verb ("Saved to memory", "added that to my memory", "stored in memory").
+_NC_MEMORY_TARGET_RE = re.compile(
+    r"\b(?:to|in|into|onto)\s+(?:(?:my|your|the)\s+)?(?:long[- ]term\s+)?"
+    r"memor(?:y|ies)\b")
+# Somewhere other than memory the claim says it put the thing ("to your
+# desktop", "in your notes"): then a bare owner hand-over grounds nothing.
+_NC_DESTINATION_RE = re.compile(
+    r"\b(?:to|onto|into|in|on|at|as|under)\s+"
+    r"(?:your|the|my|a|an)\s+(?!(?:long[- ]term\s+)?memor)")
+
+
+def _nc_memory_kind(kind: str, core: str) -> str:
+    if kind in ("save", "list") and _NC_MEMORY_TARGET_RE.search(core):
+        return "remember"
+    return kind
+
+
+def _nc_clause_claim(clause: str) -> Optional[tuple[str, str]]:
+    """(kind, matched text) for a note / remember / list / save claim in one
+    normalised clause, else None."""
+    core = clause.strip()
+    if not core or core.endswith("?") or _OFFER_RE.search(core):
+        return None
+    if _NC_DATED_RE.search(core):
+        return None
+    for kind, rx in _NC_FORMS + _NC_PASSIVE:
+        m = rx.search(core)
+        if m:
+            return _nc_memory_kind(kind, core), m.group(0).strip()
+    for part in [core] + core.split(",")[1:]:
+        part = _nc_strip_leadins(part.strip(" ,"))
+        for kind, rx in _NC_NARRATION:
+            m = rx.match(part)
+            if m:
+                return (_nc_memory_kind(kind, core),
+                        m.group(0).strip(" ,"))
+    return None
+
+
+def _nc_sentence_claim(sentence: str, ran: set, owner_keeps: frozenset
+                       ) -> Optional[tuple[str, str]]:
+    """(kind, phrase) for the first ungrounded claim in one sentence.
+    ``owner_keeps``: the kinds the owner's turn grounds (_nc_owner_keeps)."""
+    s = _norm(sentence)
+    if not s:
+        return None
+    is_question = s.rstrip().endswith("?")
+    for clause in _CLAUSE_SPLIT_RE.split(s):
+        clause = clause.strip()
+        if is_question and clause and not clause.endswith("?"):
+            clause = clause.rstrip(".!") + "?"
+        got = _nc_clause_claim(clause)
+        if not got:
+            continue
+        kind, _phrase = got
+        if _NC_WRITERS[kind] & ran:
+            continue
+        if kind in owner_keeps:
+            continue
+        if (kind == "save" and "save_bare" in owner_keeps
+                and not _NC_DESTINATION_RE.search(clause)):
+            continue
+        return got
+    return None
+
+
+def _nc_first(text: str, ran_actions, user_text: str
+              ) -> Optional[tuple[str, str]]:
+    if not text or not str(text).strip() or _nc_owner_asks(user_text):
+        return None
+    ran = _nc_ran_names(ran_actions)
+    keeps = _nc_owner_keeps(user_text)
+    for sentence in _SENTENCE_SPLIT_RE.split(str(text)):
+        got = _nc_sentence_claim(sentence, ran, keeps)
+        if got:
+            return got
+    return None
+
+
+def find_note_claim(text: str, *, ran_actions: Iterable[str] = (),
+                    user_text: str = "") -> Optional[str]:
+    """The phrase when ``text`` says JARVIS noted / remembered / added /
+    saved something (or is doing it now) and nothing this turn did it - see
+    the section comment above. ``ran_actions``: names of the actions that
+    ran successfully this turn, the reply's own included. None otherwise.
+    Never raises."""
+    try:
+        got = _nc_first(text, ran_actions, user_text)
+        return got[1] if got else None
+    except Exception:
+        return None
+
+
+def note_claim_honest_line(text: str, *, ran_actions: Iterable[str] = (),
+                           user_text: str = "") -> str:
+    """The honest line for the first ungrounded note-type claim in ``text``
+    ("I haven't made a note of that, sir."); the note line when none is
+    found. Never raises."""
+    try:
+        got = _nc_first(text, ran_actions, user_text)
+        kind = got[0] if got else "note"
+    except Exception:
+        kind = "note"
+    return NOTE_CLAIM_HONEST_LINES.get(kind, NOTE_CLAIM_HONEST_LINES["note"])
+
+
+_NC_CLAUSE_SPLIT_KEEP_RE = re.compile("(" + _CLAUSE_SPLIT_RE.pattern + ")")
+_NC_END_PUNCT_RE = re.compile(r"[.!?…]$")
+
+
+def _nc_without_claim_clauses(sentence: str, ran: frozenset,
+                              keeps: frozenset) -> str:
+    """``sentence`` minus its claim clauses when another clause of it says
+    something of substance ("I've noted the following, sir: memory is at 82
+    percent."), else "" (the whole sentence goes, as before). The kept
+    clauses keep their own punctuation; the first is re-capitalised."""
+    pieces = _NC_CLAUSE_SPLIT_KEEP_RE.split(sentence.strip())
+    # pieces: clause, sep, clause, sep, ..., clause
+    clauses = pieces[0::2]
+    seps = pieces[1::2]
+    if len(clauses) < 2:
+        return ""
+    keep = []
+    for i, c in enumerate(clauses):
+        if not c.strip():
+            continue
+        if _nc_sentence_claim(c, ran, keeps) is None:
+            keep.append(i)
+    if not keep or not any(
+            _substantive(_strip_leadins(_norm(clauses[i]))) for i in keep):
+        return ""
+    out = ""
+    prev = None
+    for i in keep:
+        if prev is None:
+            out = clauses[i].strip()
+        else:
+            sep = seps[i - 1] if prev == i - 1 else "; "
+            out += sep + clauses[i].strip()
+        prev = i
+    out = out.strip()
+    if out[:1].isalpha():
+        out = out[0].upper() + out[1:]
+    if not _NC_END_PUNCT_RE.search(out):
+        out += "."
+    return out
+
+
+_NC_LEAD_TAGS_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)*")
+_NC_PIECE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|\n+")
+
+
+def drop_note_claims(text: str, *, ran_actions: Iterable[str] = (),
+                     user_text: str = "") -> tuple[str, list]:
+    """(``text`` without the sentences that carry an ungrounded note-type
+    claim, [the claim phrases]). Leading [tags] are kept; a kept sentence
+    after a dropped first one is re-capitalised. When what is left says
+    nothing of substance (only courtesy - "Certainly, sir.") the kept text is
+    "" and the caller speaks note_claim_honest_line. ``text`` unchanged and
+    [] when there is no such claim. Never raises."""
+    try:
+        if _nc_first(text, ran_actions, user_text) is None:
+            return text, []
+        ran = _nc_ran_names(ran_actions)
+        keeps = _nc_owner_keeps(user_text)
+        src = str(text)
+        lead = _NC_LEAD_TAGS_RE.match(src).group(0)
+        kept: list = []
+        flagged: list = []
+        for part in _NC_PIECE_SPLIT_RE.split(src[len(lead):]):
+            if not part or not part.strip():
+                continue
+            got = _nc_sentence_claim(part, ran, keeps)
+            if got:
+                flagged.append(got[1])
+                rest = _nc_without_claim_clauses(part, ran, keeps)
+                if rest:
+                    kept.append(rest)
+            else:
+                kept.append(part.strip())
+        if not flagged:
+            return text, []
+        substance = any(
+            _substantive(_strip_leadins(c.strip()))
+            for k in kept for c in _CLAUSE_SPLIT_RE.split(_norm(k)))
+        if not substance:
+            return "", flagged
+        if kept[0][:1].isalpha():
+            kept[0] = kept[0][0].upper() + kept[0][1:]
+        out = " ".join(kept).strip()
+        return ((lead.strip() + " " + out) if lead.strip() else out), flagged
+    except Exception:
+        return text, []

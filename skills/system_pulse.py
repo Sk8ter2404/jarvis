@@ -9,7 +9,18 @@ Actions:
                   sentence ending with "Anything further?". An abnormal
                   reading leads instead of "All systems nominal", and high
                   (or asked-about) memory names the biggest memory users
-                  (_on_demand_report, live 2026-10-28 15:59:28).
+                  (_on_demand_report, live 2026-10-28 15:59:28). Asked
+                  about memory, it opens with the memory reading itself,
+                  never "All systems nominal" (v3.0.7,
+                  SYSTEM_PULSE_MEMORY_ANSWER).
+
+Fast-path answer (v3.0.7):
+  memory_answer(said) is the short spoken answer to an explicit memory
+  question ("why is the RAM so high?", "what's using all my memory?"): the
+  percent, then the biggest memory users, then - only when the GPU load is
+  JARVIS's own - "that's me thinking". core/fast_paths.py calls it before
+  the LLM; "" means "no answer here" (setting off, no reading) and the turn
+  goes to the model as before.
 
 Proactive thread:
   Every PULSE_PROACTIVE_INTERVAL_SECONDS (default 15 min) the same readings
@@ -507,7 +518,7 @@ def _fmt_bambu(b: dict) -> str:
 
 def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
                    proactive: bool = False, mem_users: list | None = None,
-                   gpu_mine: bool = False) -> str:
+                   gpu_mine: bool = False, also_said: tuple = ()) -> str:
     """Render the JARVIS-cadence pulse sentence. If `lead` is non-empty, it
     replaces the default 'All systems nominal' opener (used when an
     abnormality forced the proactive announcement, and by _on_demand_report
@@ -527,7 +538,11 @@ def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
     is JARVIS's own inference, so it leaves the list of readings and is said
     as such in its own sentence ("The GPU's busy at 97 percent - that's me
     thinking.") instead of an unexplained "GPU working hard at 97 percent"
-    behind "All systems nominal"."""
+    behind "All systems nominal".
+    `also_said` (keys, v3.0.7): further metrics the lead states after the
+    `lead_key` one (a CPU lead followed by the memory sentence); the body
+    leaves them out too, and the memory users follow the lead when "ram" is
+    among them."""
     cpu = pulse.get("cpu_pct", 0.0)
     ram = pulse.get("ram_pct", 0.0)
     gpu_util = pulse.get("gpu_util_pct")
@@ -547,15 +562,13 @@ def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
                 if cpu_temp is not None else f"CPU {cpu:.0f} percent")
     if said != "cpu":
         parts.append(cpu_part)
-    if said != "ram":
+    if said != "ram" and "ram" not in also_said:
         parts.append(f"memory {ram:.0f} percent")
     mine_line = ""
     if said == "gpu":
         pass
-    elif gpu_mine and gpu_util is not None:
-        mine_line = f"The GPU's busy at {gpu_util:.0f} percent - that's me thinking."
-    elif gpu_mine and gpu_temp is not None:
-        mine_line = f"The GPU's warm at {gpu_temp:.0f} degrees - that's me thinking."
+    elif gpu_mine and (gpu_util is not None or gpu_temp is not None):
+        mine_line = _gpu_mine_line(pulse)
     elif gpu_util is not None:
         verb = "working hard at" if gpu_util >= GPU_UTIL_ABNORMAL_PCT else "running at"
         parts.append(f"GPU {verb} {gpu_util:.0f} percent")
@@ -586,7 +599,7 @@ def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
     closer = "" if proactive else " Anything further?"
 
     users = _memory_users_sentence(mem_users) if mem_users else ""
-    if users and said == "ram":
+    if users and (said == "ram" or "ram" in also_said):
         opener = f"{opener} {users}"
     elif users:
         middle = f"{middle} {users}" if middle else users
@@ -655,7 +668,7 @@ def _abnormal_reasons(pulse: dict) -> list[tuple[str, str]]:
     if pulse.get("cpu_pct", 0.0) >= CPU_ABNORMAL_PCT:
         reasons.append(("cpu", f"Slight problem, sir — CPU at {pulse['cpu_pct']:.0f} percent."))
     if pulse.get("ram_pct", 0.0) >= RAM_ABNORMAL_PCT:
-        reasons.append(("ram", f"Memory at {pulse['ram_pct']:.0f} percent, sir — getting tight."))
+        reasons.append(("ram", _memory_lead(pulse["ram_pct"])))
     if 0 < pulse.get("disk_free_gb", 999.0) < DISK_FREE_ABNORMAL_GB:
         reasons.append(("disk", f"I'm afraid the C drive is down to {pulse['disk_free_gb']:.0f} gigs free."))
     gpu_util = pulse.get("gpu_util_pct")
@@ -706,6 +719,17 @@ MEM_USER_MIN_GB  = 1.0     # an app under a gigabyte does not explain high RAM
 # then the users are named even under RAM_ABNORMAL_PCT ("what's using all my
 # memory" at 80 %).
 _ASKS_ABOUT_MEMORY_RE = re.compile(r"\b(?:ram|memory)\b", re.IGNORECASE)
+
+# v3.0.7 review: video memory is not system RAM. These phrasings are removed
+# before the search above (SYSTEM_PULSE_MEMORY_ANSWER on), so "why is my gpu
+# memory so high" is not answered with the system-RAM reading. A plain
+# "ram"/"memory" left over ("is it my ram or my gpu memory") still counts.
+_VIDEO_MEMORY_RE = re.compile(
+    r"\b(?:gpu|video|graphics?|vid|dedicated|shared\s+gpu)\s+(?:ram|memory)\b"
+    r"|\bv[\s-]?ram\b"
+    r"|\b(?:ram|memory)\s+(?:on|of|in)\s+(?:the|my|this|our)\s+"
+    r"(?:gpu|graphics(?:\s+card)?|video(?:\s+card)?)\b",
+    re.IGNORECASE)
 
 # Image stem (lower-case, no ".exe") -> how he would say it, GROUPED by app
 # (27 chrome.exe processes are one "Chrome"). Plural group names on purpose
@@ -769,8 +793,14 @@ def _turn_words() -> str:
 
 
 def _asks_about_memory(text: str) -> bool:
+    """Do his words ask about the system's memory? A video-memory phrasing
+    ("gpu memory", "vram") is not one while SYSTEM_PULSE_MEMORY_ANSWER is on
+    (off = the 3.0.6 bare word search). Never raises."""
     try:
-        return bool(_ASKS_ABOUT_MEMORY_RE.search(text or ""))
+        text = text or ""
+        if _memory_answer_enabled():
+            text = _VIDEO_MEMORY_RE.sub(" ", text)
+        return bool(_ASKS_ABOUT_MEMORY_RE.search(text))
     except Exception:
         return False
 
@@ -966,7 +996,30 @@ def _on_demand_report(pulse: dict, said: str = "", *, procs=None,
         gpu_hit = len(reasons) != len(all_reasons)
         asked_memory = _asks_about_memory(said)
         lead_key, lead = "", ""
-        if reasons:
+        extra_keys: tuple = ()
+        # Another PC reading only outranks the memory lead while the RAM
+        # itself is not abnormal: with RAM over RAM_ABNORMAL_PCT the memory
+        # question IS the abnormal reading (the 3.0.6 order, kept).
+        pc_others = ([] if any(r[0] == "ram" for r in reasons) else
+                     [r for r in reasons
+                      if r[0] not in _NEWS_LEADS and r[0] != "ram"])
+        if asked_memory and _memory_answer_enabled():
+            # v3.0.7 (live 2026-10-28 18:53 "Why is the RAM so high?" at 82 %,
+            # under RAM_ABNORMAL_PCT): the reply opened with the all-nominal
+            # line and any users came last, behind every other reading. He
+            # asked about the memory: its number leads, the users follow it.
+            # Review: unless another reading of this PC is abnormal (CPU,
+            # disk, battery ...): "why is the CPU so high, is it a memory
+            # leak?" must still open with the CPU line, the memory sentence
+            # right after it.
+            mem_line = _memory_lead(pulse.get("ram_pct", 0.0))
+            if pc_others:
+                lead_key, lead = pc_others[0]
+                lead = f"{lead} {mem_line}"
+                extra_keys = ("ram",)
+            else:
+                lead_key, lead = "ram", mem_line
+        elif reasons:
             by_key = dict(reasons)
             pc = [r for r in reasons if r[0] not in _NEWS_LEADS]
             if asked_memory and "ram" in by_key:
@@ -991,8 +1044,7 @@ def _on_demand_report(pulse: dict, said: str = "", *, procs=None,
             # JARVIS. A game among them, nobody busy (the POST is over), or no
             # reading at all -> no cause is claimed; the GPU is just the
             # exception.
-            if ((own_busy or _own_inference_recent)()
-                    and _gpu_load_is_ours(gpu_procs, own_pid=own_pid)):
+            if _gpu_is_mine(own_busy, gpu_procs, own_pid=own_pid):
                 gpu_mine = True
             elif not lead:
                 lead_key, lead = "gpu", _gpu_exception_lead(pulse)
@@ -1000,9 +1052,124 @@ def _on_demand_report(pulse: dict, said: str = "", *, procs=None,
         if asked_memory or pulse.get("ram_pct", 0.0) >= RAM_ABNORMAL_PCT:
             users = _memory_users(procs, own_pid=own_pid)
         return _format_report(pulse, lead=lead, lead_key=lead_key,
-                              mem_users=users, gpu_mine=gpu_mine)
+                              mem_users=users, gpu_mine=gpu_mine,
+                              also_said=extra_keys)
     except Exception:
         return _format_report(pulse)
+
+
+def _memory_lead(ram_pct) -> str:
+    """The memory reading said plainly: "Memory at 82 percent, sir." and, at
+    RAM_ABNORMAL_PCT or over, the proactive wording "Memory at 92 percent,
+    sir — getting tight." (one string for both paths). Never raises."""
+    try:
+        ram = float(ram_pct)
+    except Exception:
+        ram = 0.0
+    if ram >= RAM_ABNORMAL_PCT:
+        return f"Memory at {ram:.0f} percent, sir — getting tight."
+    return f"Memory at {ram:.0f} percent, sir."
+
+
+def _memory_answer_enabled() -> bool:
+    """core.config.SYSTEM_PULSE_MEMORY_ANSWER, read live (default True)."""
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "SYSTEM_PULSE_MEMORY_ANSWER", True))
+    except Exception:
+        return True
+
+
+def _gpu_is_mine(own_busy=None, gpu_procs=None, *,
+                 own_pid: int | None = None) -> bool:
+    """Is a high GPU reading JARVIS's own inference? Both checks of review
+    F4: the local model ran within OWN_INFERENCE_GRACE_S AND every busy GPU
+    process is the local model server or JARVIS (_gpu_load_is_ours). Never
+    raises."""
+    try:
+        return bool((own_busy or _own_inference_recent)()
+                    and _gpu_load_is_ours(gpu_procs, own_pid=own_pid))
+    except Exception:
+        return False
+
+
+def _gpu_mine_line(pulse: dict) -> str:
+    """"The GPU's busy at 97 percent - that's me thinking." (or "warm at N
+    degrees" when only the temperature is read); "" with no GPU reading.
+    Pure; never raises."""
+    try:
+        util = pulse.get("gpu_util_pct")
+        if util is not None:
+            return f"The GPU's busy at {util:.0f} percent - that's me thinking."
+        temp = pulse.get("gpu_temp_c")
+        if temp is not None:
+            return f"The GPU's warm at {temp:.0f} degrees - that's me thinking."
+    except Exception:
+        pass
+    return ""
+
+
+def _current_pulse() -> dict:
+    """The HUD loop's pulse when it is at most PULSE_CACHE_MAX_AGE_SECONDS
+    old (no nvidia-smi / net sample on the voice thread), else a live
+    gather (cache empty or stale: the first call before the loop ran)."""
+    pulse = None
+    with _pulse_cache_lock:
+        cached = _pulse_cache
+    if (cached
+            and (time.time() - cached.get("ts", 0.0))
+            <= PULSE_CACHE_MAX_AGE_SECONDS):
+        pulse = cached.get("pulse")
+    if not pulse:
+        pulse = _gather_pulse()
+    return pulse
+
+
+# Said when no app holds MEM_USER_MIN_GB or the process table could not be
+# read: the honest "I can't name one", never a guess.
+_MEM_USERS_NONE = "I can't single out one app holding much of it just now."
+
+
+def memory_answer(said: str = "", *, pulse=None, procs=None,
+                  own_pid: int | None = None, own_busy=None,
+                  gpu_procs=None) -> str:
+    """The spoken answer to an explicit memory question (v3.0.7; the
+    core/fast_paths.py memory grammar calls it before the LLM).
+
+    Live 2026-10-28 18:53 "Why is the RAM so high?" at 82 %, under
+    RAM_ABNORMAL_PCT, went through the model to system_pulse, which opened
+    with the all-nominal line, said JARVIS's own inference load on the GPU
+    as unexplained hard work, and left any memory users to the very end.
+    Now: the percent
+    plainly (_memory_lead), then the biggest users (_memory_users), then,
+    when the GPU is high AND it is JARVIS's own inference (_gpu_is_mine, the
+    F4 rule, under SYSTEM_PULSE_GPU_EXPLAINED), "that's me thinking". A high
+    GPU that is not his own is left out: he asked about memory.
+
+    `said` is his words (unused by the wording today; the caller passes
+    them so a later grammar can); the keyword-only arguments are test seams
+    (None = live). "" when SYSTEM_PULSE_MEMORY_ANSWER is off or there is no
+    memory reading, so the caller falls through to the model. Never
+    raises."""
+    try:
+        if not _memory_answer_enabled():
+            return ""
+        pulse = pulse if pulse is not None else _current_pulse()
+        ram = float((pulse or {}).get("ram_pct") or 0.0)
+        if ram <= 0.0:
+            return ""
+        parts = [_memory_lead(ram)]
+        users = _memory_users(procs, own_pid=own_pid)
+        parts.append(_memory_users_sentence(users) or _MEM_USERS_NONE)
+        gpu_high = any(k == "gpu" for k, _ in _abnormal_reasons(pulse))
+        if (gpu_high and _gpu_explained()
+                and _gpu_is_mine(own_busy, gpu_procs, own_pid=own_pid)):
+            mine = _gpu_mine_line(pulse)
+            if mine:
+                parts.append(mine)
+        return " ".join(p for p in parts if p)
+    except Exception:
+        return ""
 
 
 def _gpu_load_is_ours(gpu_procs=None, *, own_pid: int | None = None) -> bool:
@@ -1332,19 +1499,9 @@ def _proactive_loop() -> None:
 def register(actions):
     def system_pulse(arg: str = "") -> str:
         try:
-            pulse = None
-            with _pulse_cache_lock:
-                cached = _pulse_cache
-            if (cached
-                    and (time.time() - cached.get("ts", 0.0))
-                    <= PULSE_CACHE_MAX_AGE_SECONDS):
-                # Serve the loop's recent pulse instead of re-running
-                # nvidia-smi + a 0.6 s net sample on the main voice thread.
-                pulse = cached.get("pulse")
-            if not pulse:
-                # Cache empty/stale (first call before the loop has run) —
-                # fall back to a live gather.
-                pulse = _gather_pulse()
+            # The loop's recent pulse (no nvidia-smi + 0.6 s net sample on the
+            # main voice thread), else a live gather (_current_pulse).
+            pulse = _current_pulse()
             # Not _format_report(pulse): that opened "All systems nominal"
             # at 92 % memory (live 2026-10-28 15:59:28, see _on_demand_report).
             said = f"{_turn_words()} {arg if isinstance(arg, str) else ''}"

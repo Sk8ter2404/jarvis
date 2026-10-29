@@ -45,7 +45,12 @@ class FollowupMediaTests(_Base):
         self.win = FollowupWindow(20, clock=self.clock)
         for p in (mock.patch.object(self.bc, "_require_wake_runtime", True),
                   mock.patch.object(self.bc, "_followup_window", self.win),
-                  mock.patch.object(self.bc, "_room_tv_gate", return_value=False)):
+                  mock.patch.object(self.bc, "_room_tv_gate", return_value=False),
+                  # This file pins the 3.0.6 media-only rule on its own; the
+                  # 3.0.7 general rule (any unsure voice) is
+                  # test_monolith_followup_unsure.py, which replays 17:28 too.
+                  mock.patch.object(self.bc, "FOLLOWUP_UNSURE_NO_EXTEND", False,
+                                    create=True)):
             p.start()
             self.addCleanup(p.stop)
 

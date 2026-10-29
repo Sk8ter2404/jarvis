@@ -333,6 +333,27 @@ def _ram_users_sentence(ram_pct: float, arg: str = "") -> str:
         return ""
 
 
+def _memory_question_lead(ram_pct: float, arg: str = "") -> str:
+    """v3.0.7: when his words (or the action argument) ask about ram/memory
+    and SYSTEM_PULSE_MEMORY_ANSWER is on, the opener is the memory reading
+    itself - the LOADED system_pulse skill's _memory_lead ("Memory at 82
+    percent, sir.") - instead of "Systems nominal" / "holding up" (live
+    2026-10-28 18:53 the pulse answered "why is the RAM so high?" at 82 %
+    with its all-nominal line; this sibling opens "nominal" under 75 %).
+    "" otherwise (pulse not loaded, setting off, not asked).
+    Never raises."""
+    try:
+        pulse = sys.modules.get("skill_system_pulse")
+        if pulse is None or not pulse._memory_answer_enabled():
+            return ""
+        said = f"{pulse._turn_words()} {arg if isinstance(arg, str) else ''}"
+        if not pulse._asks_about_memory(said):
+            return ""
+        return pulse._memory_lead(ram_pct) or ""
+    except Exception:
+        return ""
+
+
 def _build_report(arg: str = "") -> str:
     if not _HAS_PSUTIL:
         return ("System monitor requires the psutil package — run "
@@ -377,7 +398,18 @@ def _build_report(arg: str = "") -> str:
         else:
             cpu_ram += f". {_spoken_process_name(primary)} is the primary offender"
     users = _ram_users_sentence(vm.percent, arg)
-    if users:
+    mem_lead = _memory_question_lead(vm.percent, arg)
+    if mem_lead:
+        # Asked about memory: the number, then who holds it, then the rest.
+        mem_part = f"{mem_lead} {users}" if users else mem_lead
+        if cpu_pct >= 80:
+            # Review: "why is the CPU so high, is it a memory leak?" - the CPU
+            # is what is working hard, so that opener stays and the memory
+            # sentence follows it instead of replacing it.
+            opener = f"{opener} {mem_part}"
+        else:
+            opener = mem_part
+    elif users:
         cpu_ram += ". " + users.rstrip(".")
 
     # Sentence 3 — disk + network

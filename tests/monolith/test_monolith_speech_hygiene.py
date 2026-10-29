@@ -273,7 +273,12 @@ class CannedPersonaLineLiveTests(_Base):
         self.assertEqual(self.spoken, [line, line])
 
     def test_setting_off_is_the_old_behaviour(self):
-        with mock.patch.object(self.bc, "SPEECH_HYGIENE", False):
+        # v3.0.7: "I'll note that for posterity." with nothing noted is also
+        # NOTE_CLAIM_CHECK's (tests/monolith/test_monolith_note_claims.py),
+        # so the old behaviour needs both switches off.
+        with mock.patch.object(self.bc, "SPEECH_HYGIENE", False), \
+                mock.patch.object(self.bc, "NOTE_CLAIM_CHECK", False,
+                                  create=True):
             self._dispatch("He sounds stupider.", self.LIVE)
             self._dispatch("Is it better?", self.LIVE)
         self.assertEqual(self.spoken, [self.LIVE, self.LIVE])

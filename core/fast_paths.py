@@ -47,6 +47,10 @@ the local model is both slow and unreliable at them (live 2026-09-29):
   * "what can you do (for me)" (v3.0.6): a fixed overview of the real skills
     (capability_reply), each phrase kept only while an action backs it. Live
     2026-10-28 the model claimed "I can manage your schedule".
+  * "why is the RAM so high" / "what's using all my memory" (v3.0.7): the
+    loaded system_pulse skill's memory_answer (the percent, the biggest
+    memory users). The one fast path that reads live state; see
+    is_memory_question.
 
 Recall never returns a recall question itself or a bare wake phrase
 ("Jarvis", "hey Jarvis, wake up"): both are skipped (_skip_for_recall).
@@ -56,7 +60,8 @@ returns a ``FastAnswer(kind, reply)`` or None. The monolith calls it right
 before the LLM dispatch (bobert_companion._run_fast_paths, gated by
 FAST_PATHS_ENABLED) and speaks the reply itself. Every grammar is anchored on
 the whole utterance, so commands and other domains fall through untouched.
-Stdlib only, no I/O, never raises.
+Stdlib only, no I/O (but the memory answer, which the loaded system_pulse
+skill reads), never raises.
 
 The recall helpers are shared with core.actions._act_session_memory_recall so
 the LLM route can never recall the current utterance either.
@@ -73,7 +78,8 @@ from core.date_math import normalize
 class FastAnswer(NamedTuple):
     kind: str    # "owner-name" | "owner-identity" | "last-utterance" |
     #              "first-utterance" | "world-clock" | "time" |
-    #              "arithmetic" | "capabilities" | a date_math kind
+    #              "arithmetic" | "capabilities" | "memory-users" |
+    #              a date_math kind
     reply: str
 
 
@@ -809,6 +815,71 @@ def capability_reply(available=None) -> str:
     return (f"Quite a bit, sir: I can {body}. Ask for any of it by name.")
 
 
+# ── "why is the RAM so high" (v3.0.7) ──────────────────────────────────────
+# Live 2026-10-28 18:53 "Why is the RAM so high?" at 82 % (under the pulse's
+# 88 % abnormal mark) went through the model to system_pulse, which takes no
+# argument from it, and came back opening with the all-nominal line - the
+# question unanswered at the front. An explicit memory question now gets the LOADED system_pulse
+# skill's memory_answer: the percent, the biggest memory users, and "that's
+# me thinking" for JARVIS's own GPU load. Whole utterance only, and only the
+# PC's RAM: "why is your memory so bad", "clear your memory", "what's in your
+# memory" and video / GPU memory never match. The one fast path that reads
+# live state (the pulse's cached reading + one process-table snapshot,
+# ~6 ms); no skill loaded / SYSTEM_PULSE_MEMORY_ANSWER off -> no match.
+_MEM_WORD = r"(?:ram|memory|system memory)(?: usage| use)?"
+_MEM_DET = (r"(?:(?:the|my|our|this|all the|all my)"
+            r"(?: (?:pcs|computers|systems|machines))? )?")
+_MEM_HIGH = (r"(?:(?:so|this|that|really|still|getting|running|always|way) )*"
+             r"(?:high|full|maxed(?: out)?|tight|through the roof|"
+             r"at \d{1,3}(?: percent)?)(?: right)?(?: at the moment)?")
+_MEM_VERB = (r"(?:using(?: up)?|eating(?: up)?|hogging|taking(?: up)?|"
+             r"chewing(?: up| through)?|filling(?: up)?|holding|consuming|"
+             r"gobbling(?: up)?|sucking up|soaking up)")
+_MEM_WHO = (r"(?:what|who|(?:what|which) (?:apps?|programs?|processes?|"
+            r"applications?|things?))")
+_MEM_HOW_MUCH = r"(?:all |so much |the most |most |up |all of |most of )?"
+_MEMORY_Q_RES = tuple(re.compile(p) for p in (
+    rf"why(?:s| is)? {_MEM_DET}{_MEM_WORD} {_MEM_HIGH}",
+    rf"why (?:am i|are we|is (?:the |my |this )?(?:pc|computer|system|machine)"
+    rf"|is it) using so much {_MEM_WORD}",
+    rf"why is so much {_MEM_WORD} (?:being used|used|in use)",
+    rf"{_MEM_WHO} (?:is |are )?{_MEM_VERB} {_MEM_HOW_MUCH}{_MEM_DET}"
+    rf"{_MEM_WORD}",
+    r"what (?:is|are) (?:the )?(?:biggest|top) (?:memory|ram) "
+    r"(?:users?|hogs?|eaters?)",
+))
+
+
+def is_memory_question(text) -> bool:
+    """True for a whole-utterance question about why this PC's RAM is high
+    or what is using it. Never raises."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        t = re.sub(r"\s+", " ", normalize(text)).strip()
+        return len(t) <= 80 and any(rx.fullmatch(t) for rx in _MEMORY_Q_RES)
+    except Exception:
+        return False
+
+
+def memory_users_reply(text) -> Optional[str]:
+    """The loaded system_pulse skill's memory_answer(text) (sys.modules
+    "skill_system_pulse", as skills/system_monitor reads it), or None when
+    the skill is not loaded or has no answer (setting off, no reading).
+    Never raises."""
+    try:
+        import sys as _sys
+        fn = getattr(_sys.modules.get("skill_system_pulse"), "memory_answer",
+                     None)
+        if not callable(fn):
+            return None
+        reply = fn(text)
+        reply = reply.strip() if isinstance(reply, str) else ""
+        return reply or None
+    except Exception:
+        return None
+
+
 def match(text, *, now=None, history=(), owner_name="",
           session_turns=None, session_start_lost=False
           ) -> Optional[FastAnswer]:
@@ -844,6 +915,10 @@ def match(text, *, now=None, history=(), owner_name="",
         if is_capability_question(text):
             return FastAnswer("capabilities",
                               capability_reply(_registered_actions()))
+        if is_memory_question(text):
+            reply = memory_users_reply(text)
+            if reply:
+                return FastAnswer("memory-users", reply)
         if now is not None:
             clock = world_clock.answer(text, now)
             if clock is not None:

@@ -17879,6 +17879,7 @@ _TURN_FLAG_KEYS = (
     "TURN_TRACE",
     "LOOP_GUARD_MODE",
     "CHAIN_PROMISE_CHECK",
+    "NOTE_CLAIM_CHECK",
 )
 
 
@@ -25040,6 +25041,15 @@ class _SentenceFlushBuffer:
             if _claim_validator.find_completed_claim(
                     piece, ran_actions=_turn_actions_ran(),
                     user_text=_turn_user_text()):
+                self._stopped = True
+                return True
+            # "I've noted that for your presentation" (v3.0.7): held so
+            # parse_and_run_actions can drop it once it knows whether a note
+            # / memory / list action ran (NOTE_CLAIM_CHECK).
+            if (globals().get("NOTE_CLAIM_CHECK", True)
+                    and _claim_validator.find_note_claim(
+                        piece, ran_actions=_turn_actions_ran(),
+                        user_text=_turn_user_text())):
                 self._stopped = True
                 return True
             # A volume / battery / temperature number nothing has read yet
@@ -37751,6 +37761,7 @@ _require_wake_runtime = REQUIRE_WAKE_MODE
 # shortly after the user addressed JARVIS need no wake word. Sized by config
 # FOLLOWUP_WINDOW_S; 0 (default) disables it and this gate is unchanged.
 from core.followup_window import FollowupWindow as _FollowupWindow  # noqa: E402
+from core import followup_window as _followup_window_mod  # noqa: E402
 _followup_window = _FollowupWindow(FOLLOWUP_WINDOW_S)
 
 # Standby-wake greeting reply (2026-10-01): a bare "Jarvis" to a sleeping
@@ -37854,11 +37865,11 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
         _greet_reply = _standby_greet_admit_take()
         # A new decision: an earlier turn's window extension can no longer
         # be taken back by the media gate (3.0.6, _followup_media_take_back).
+        # 3.0.7 (FOLLOWUP_UNSURE_NO_EXTEND): an extension the earlier turn
+        # never confirmed - it was dropped after the gate, before an answer
+        # - is taken back instead (_followup_settle_previous).
         # Its own try: a window without the method never changes the verdict.
-        try:
-            _followup_window.forget_admit()
-        except Exception:
-            pass
+        _followup_settle_previous()
         # The decision itself is _bg_refuse_rule (the one copy, which the R6
         # Parakeet rescue and shadow judge also ask); the side effects —
         # admit() extending the follow-up window, note_addressed() opening
@@ -38274,6 +38285,122 @@ def _followup_media_take_back(voice: str) -> None:
         pass
 
 
+# ── unsure-voice follow-ups (3.0.7, core/followup_window.py) ──────────────
+# Live 2026-10-28 19:08-19:12, PC audio muted (so the media rule above never
+# ran): room speech scoring 0.61-0.67 was admitted by the wake-word follow-up
+# window line after line, answered, and each line extended the window. His
+# own commands score as low, so the score cannot refuse a follow-up; it can
+# stop one holding the window open, and a line that is not even shaped like
+# something said to JARVIS can be left unanswered.
+_BG_FOLLOWUP_WHY = "follow-up window"   # _bg_refuse_rule's reason
+
+
+def _followup_unsure_on() -> bool:
+    """FOLLOWUP_UNSURE_NO_EXTEND, read now. Never raises (True)."""
+    try:
+        return bool(globals().get("FOLLOWUP_UNSURE_NO_EXTEND", True))
+    except Exception:
+        return True
+
+
+def _followup_settle_previous() -> None:
+    """The background gate is deciding a NEW turn. The previous admit() was
+    either confirmed (_followup_unsure_gate forgot it once the turn was
+    accepted in a matched voice) or the turn never reached an answer -
+    noise, filter, unclear or media drops - and with FOLLOWUP_UNSURE_NO_EXTEND
+    its extension is taken back now (live 19:09:28-19:09:39: four
+    low-confidence captures each pushed the window 20 s on). Off = the
+    3.0.6 forget. Numbers only. Never raises."""
+    try:
+        if _followup_unsure_on():
+            if _followup_window.take_back_admit():
+                print("  [follow-up] window not extended: the last admitted "
+                      "line was not answered")
+        else:
+            _followup_window.forget_admit()
+    except Exception:
+        pass
+
+
+def _followup_keep_for_reply(why: str = "") -> None:
+    """A drop gate just SPOKE a cue that invites a repeat ("I didn't catch
+    that", the media gate's "say it again"): the next line is the owner's
+    answer to it, so the window the follow-up opened must stay for it
+    instead of being taken back by _followup_settle_previous on the next
+    turn (reviewed 3.0.7: the repeat then needed the wake word). Silent
+    drops are not touched. Off with FOLLOWUP_UNSURE_NO_EXTEND. Never raises."""
+    try:
+        if _followup_unsure_on():
+            _followup_window.forget_admit()
+    except Exception:
+        pass
+
+
+def _followup_reply_expected(now: "float | None" = None) -> bool:
+    """A prompt waits for an answer, or JARVIS's last heard line asked a
+    question within the speech filter's reply window: the next line may be
+    a bare answer ("the left one"). Never raises (False)."""
+    try:
+        if _reply_prompt_pending():
+            return True
+        now = time.monotonic() if now is None else float(now)
+        line_at = float(_last_jarvis_line[0] or 0.0)
+        return bool(_last_jarvis_line[1]) and bool(line_at) and (
+            0.0 <= now - line_at <= _speech_filter_mod.NOISE_REPLY_WINDOW_S)
+    except Exception:
+        return False
+
+
+def _followup_unsure_gate(text: str, bg_why: str, injected: bool = False,
+                          conf=None) -> bool:
+    """True when the caller must DROP this mic turn. Runs once per turn, after
+    every other drop gate and before the turn is used. Only a turn the
+    wake-word follow-up window admitted (``bg_why`` == "follow-up window")
+    is looked at; typed / injected turns never.
+
+    With FOLLOWUP_UNSURE_NO_EXTEND (default on) the turn's voice is checked
+    (core.voice_id, any enrolled speaker counts): a matched voice or no
+    voice-ID keeps the window extension (today's behaviour); UNSURE or
+    NOT_OWNER takes it back (core.followup_window.keeps_extension). Then,
+    with FOLLOWUP_UNSURE_COMMANDS_ONLY (default on), such a turn that is not
+    a command or question to JARVIS (core.followup_window.addressed_form,
+    or a media control) is dropped silently - unless a prompt or JARVIS's
+    own question is waiting for an answer. Logs numbers only. Never raises;
+    any error fails OPEN (False, the extension kept)."""
+    try:
+        if injected or bg_why != _BG_FOLLOWUP_WHY:
+            return False
+        if not _followup_unsure_on():
+            _followup_window.forget_admit()
+            return False
+        audio, sr = _last_capture_audio, int(_last_capture_sr or 0)
+        voice, score = _learn_voice_verdict(audio, sr, any_enrolled=True,
+                                            remember=True)
+        if _followup_window_mod.keeps_extension(voice):
+            _followup_window.forget_admit()      # confirmed: it stays
+            return False
+        if _followup_window.take_back_admit():
+            print(f"  [follow-up] window not extended: voice not confirmed "
+                  f"({voice}, voice {float(score or 0.0):.2f})")
+        if not globals().get("FOLLOWUP_UNSURE_COMMANDS_ONLY", True):
+            return False
+        if _followup_reply_expected():
+            return False
+        if (_followup_window_mod.addressed_form(text)
+                or _media_gate.is_media_control(text)):
+            return False
+        print(f"  [follow-up] dropped: voice not confirmed and not a command "
+              f"or question to JARVIS ({len(text or '')} chars, voice "
+              f"{float(score or 0.0):.2f})")
+        try:
+            _note_room_talk(text, conf)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 # A dropped turn that was addressed to JARVIS gets one short spoken cue, at
 # most once per this many seconds (2026-10-02 review repair): silence left
 # the owner guessing whether he had been heard over his own video.
@@ -38295,6 +38422,7 @@ def _media_gate_drop_cue(text: str) -> None:
         if last > 0.0 and now - last < _MEDIA_DROP_CUE_GAP_S:
             return
         _media_drop_cue_at[0] = now
+        _followup_keep_for_reply()         # "say it again" invites a reply
         _speak(_media_gate.DROP_CUE)
     except Exception:
         pass
@@ -40297,6 +40425,7 @@ def _unclear_turn(text: str, injected: bool = False,
               + ("asking sir to repeat" if ask else "dropped"))
         if ask:
             _unclear_cue_at[0] = now
+            _followup_keep_for_reply()     # his repeat needs no wake word
             _speak(UNCLEAR_CUE)
         return True
     except Exception:
@@ -44495,6 +44624,40 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             print("  [continuation_enforcer] the owner said 'close that and "
                   "open ...' - the open was dropped")
             results.append(("_dropped_step", _open_step, True))
+
+    # Note / remember claims (v3.0.7, live 2026-10-28 19:12): room speech got
+    # "Certainly, sir. I've noted that for your presentation." and no note,
+    # memory or list action ran. The check above only reads replies with no
+    # token and has no note family, so this one reads every reply in an
+    # owner turn: a sentence saying JARVIS noted / remembered / saved
+    # something or added it to a list is dropped unless an action of that
+    # kind ran this turn (core.claim_validator.find_note_claim has the
+    # rules). Nothing left but courtesy: the honest line is spoken instead -
+    # or nothing, when a real action of this reply speaks for itself. No
+    # follow-up round: the honest line is the answer. NOTE_CLAIM_CHECK False
+    # = the old path exactly.
+    if (cleaned and globals().get("NOTE_CLAIM_CHECK", True)
+            and getattr(_turn_grounding, "frame", None) is not None):
+        try:
+            _nc_kept, _nc_bad = _claim_validator.drop_note_claims(
+                cleaned, ran_actions=_turn_actions_ran(),
+                user_text=_turn_user_text())
+            _nc_line = (_claim_validator.note_claim_honest_line(
+                cleaned, ran_actions=_turn_actions_ran(),
+                user_text=_turn_user_text()) if _nc_bad else "")
+        except Exception as _nc_err:
+            print(f"  [validation] note-claim check failed: {_nc_err}")
+            _nc_kept, _nc_bad, _nc_line = cleaned, [], ""
+        if _nc_bad:
+            _nc_real = any(not str(_n).startswith("_")
+                           for (_n, _r, _i) in results)
+            if not _nc_kept and not _nc_real:
+                _nc_kept = _nc_line
+            print(f"  [validation] dropped the claim '{_nc_bad[0]}': no note, "
+                  "memory, list or save action ran this turn"
+                  + (" - said the honest line instead"
+                     if _nc_kept == _nc_line else ""))
+            cleaned = _nc_kept
 
     # Invented readings (live 2026-10-09 17:53): "why can't I hear my
     # YouTube video?" -> "I'm afraid the volume is currently set to 20%,
@@ -53369,6 +53532,17 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # Marginal level + no request/reply word: ask, never act
                 # (live v3.0.0 20:41:26). Mic turns only. _unclear_turn.
                 if _unclear_turn(text, _injected_text is not None):
+                    set_state("idle")
+                    continue
+
+                # ── UNSURE-VOICE FOLLOW-UP (3.0.7, core/followup_window.py) ──
+                # A line the follow-up window admitted in a voice not matched
+                # to an enrolled speaker does not extend the window, and one
+                # that is no command or question to JARVIS is dropped
+                # silently (live 19:08-19:12, room speech at 0.61-0.67).
+                # Numbers-only log. See _followup_unsure_gate.
+                if _followup_unsure_gate(text, _bg_why,
+                                         _injected_text is not None, conf):
                     set_state("idle")
                     continue
 

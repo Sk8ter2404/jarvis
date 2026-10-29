@@ -169,9 +169,9 @@ class SystemMonitorRamUsersTests(unittest.TestCase):
                       (9003, "chrome.exe", 4.5 * g),
                       (9004, "bztransmit.exe", 4.2 * g)]
 
-    def _check(self, ram_pct, said="", arg=""):
+    def _check(self, ram_pct, said="", arg="", cpu=38):
         fake = mock.MagicMock()
-        fake.cpu_percent.return_value = 38
+        fake.cpu_percent.return_value = cpu
         fake.virtual_memory.return_value = _VM(ram_pct, 29.0)
         fake.disk_usage.return_value = _Disk(300.0, 1000.0)
         with mock.patch.object(self.mod, "_HAS_PSUTIL", True),              mock.patch.object(self.mod, "psutil", fake),              mock.patch.object(self.mod, "_top_processes",
@@ -181,11 +181,48 @@ class SystemMonitorRamUsersTests(unittest.TestCase):
             return self.actions["check_system"](arg)
 
     def test_live_92_percent_names_the_memory_users(self):
+        # v3.0.7: asked about memory, the number and the users lead.
         out = self._check(92, self.LIVE_SAID)
-        self.assertIn("The biggest memory users are my local brain model at "
-                      "8 gigabytes, Claude at 6.5 and Chrome at 4.5. C drive",
-                      out)
+        self.assertTrue(out.startswith(
+            "Memory at 92 percent, sir — getting tight. The biggest memory "
+            "users are my local brain model at 8 gigabytes, Claude at 6.5 and "
+            "Chrome at 4.5. CPU at 38 percent"), out)
         self.assertNotIn("..", out)
+
+    def test_v307_asked_below_the_alert_is_never_nominal(self):
+        # Live 2026-10-28 18:53 shape: asked at 70 %, check_system opened
+        # "Systems nominal, sir." (cpu < 50, ram < 75).
+        out = self._check(70, "why is my memory so high")
+        self.assertTrue(out.startswith(
+            "Memory at 70 percent, sir. The biggest memory users are"), out)
+        self.assertNotIn("nominal", out)
+
+    def test_v307_flag_off_is_the_306_report(self):
+        with mock.patch("core.config.SYSTEM_PULSE_MEMORY_ANSWER", False,
+                        create=True):
+            out = self._check(70, "why is my memory so high")
+        self.assertTrue(out.startswith("Systems nominal, sir."), out)
+        self.assertIn("The biggest memory users are", out)
+
+    def test_v307_hot_cpu_keeps_its_opener_for_a_memory_leak_question(self):
+        # Review: a memory word must not replace the "working rather hard"
+        # opener while the CPU is what is hard at work.
+        out = self._check(60, "why is the cpu so high, is it a memory leak?",
+                          cpu=95)
+        self.assertTrue(out.startswith(
+            "Systems are working rather hard at the moment, sir. Memory at "
+            "60 percent, sir. The biggest memory users are"), out)
+        self.assertIn("CPU at 95 percent", out)
+
+    def test_v307_video_memory_question_gets_no_ram_lead(self):
+        out = self._check(60, "why is my gpu memory so high")
+        self.assertTrue(out.startswith("Systems nominal, sir."), out)
+        self.assertNotIn("The biggest memory users", out)
+
+    def test_v307_not_asked_keeps_the_306_opener(self):
+        out = self._check(92, "status report")
+        self.assertTrue(out.startswith(
+            "Systems are working rather hard at the moment, sir."), out)
 
     def test_over_the_alert_without_asking_still_names_them(self):
         out = self._check(92, "status report")
